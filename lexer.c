@@ -101,7 +101,7 @@ static void skip_whitespace(Scanner *s) {
                     /* line comment — skip until newline */
                     while (peek(s) != '\n' && peek(s) != '\0') advance(s);
                 } else if (peek_next(s) == '*') {
-                    /* block comment — skip until */ */
+                    /* block comment — skip until */
                     advance(s); /* skip / */
                     advance(s); /* skip * */
                     while (!(peek(s) == '*' && peek_next(s) == '/')) {
@@ -141,6 +141,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
         if (word_len == 4 && memcmp(word+1, "ing", 3) == 0) return TOK_RING;
         break;
     case 'a':
+        if (word_len == 2 && word[1] == 's') return TOK_AS;
         if (word_len == 3 && memcmp(word+1, "sm", 2) == 0) return TOK_ASM;
         break;
     case 'b':
@@ -292,28 +293,31 @@ static Token scan_number(Scanner *s) {
     /* hex: 0x... */
     if (s->source[start] == '0' && peek(s) == 'x') {
         advance(s); /* skip 'x' */
-        while (is_hex_digit(peek(s))) advance(s);
+        if (!is_hex_digit(peek(s))) {
+            return error_token(s, "expected hex digit after '0x'");
+        }
+        while (is_hex_digit(peek(s)) || peek(s) == '_') advance(s);
         return make_token(s, TOK_NUMBER_INT, start);
     }
 
     /* binary: 0b... */
     if (s->source[start] == '0' && peek(s) == 'b') {
         advance(s); /* skip 'b' */
-        while (peek(s) == '0' || peek(s) == '1') advance(s);
+        if (peek(s) != '0' && peek(s) != '1') {
+            return error_token(s, "expected binary digit after '0b'");
+        }
+        while (peek(s) == '0' || peek(s) == '1' || peek(s) == '_') advance(s);
         return make_token(s, TOK_NUMBER_INT, start);
     }
 
-    /* decimal digits */
-    while (is_digit(peek(s))) advance(s);
-
-    /* check for underscore separator: 1_000_000, 0x4002_0014 */
-    /* handled by allowing _ in number scanning */
+    /* decimal digits with underscore separators */
+    while (is_digit(peek(s)) || peek(s) == '_') advance(s);
 
     /* fractional part: 3.14 */
     if (peek(s) == '.' && is_digit(peek_next(s))) {
         type = TOK_NUMBER_FLOAT;
         advance(s); /* skip '.' */
-        while (is_digit(peek(s))) advance(s);
+        while (is_digit(peek(s)) || peek(s) == '_') advance(s);
     }
 
     return make_token(s, type, start);
@@ -321,11 +325,30 @@ static Token scan_number(Scanner *s) {
 
 /* ---- Scan a string literal ---- */
 
+static bool is_valid_escape(char c) {
+    return c == 'n' || c == 't' || c == 'r' || c == '\\' ||
+           c == '"' || c == '0' || c == 'x';
+}
+
 static Token scan_string(Scanner *s) {
     size_t start = s->pos - 1; /* already consumed opening " */
     while (peek(s) != '"' && peek(s) != '\0') {
         if (peek(s) == '\n') s->line++;
-        if (peek(s) == '\\') advance(s); /* skip escape: \" \n \t etc */
+        if (peek(s) == '\\') {
+            advance(s); /* skip backslash */
+            char esc = peek(s);
+            if (esc == '\0') return error_token(s, "unterminated string");
+            if (!is_valid_escape(esc)) {
+                return error_token(s, "invalid escape sequence in string");
+            }
+            if (esc == 'x') {
+                advance(s); /* skip 'x' */
+                if (!is_hex_digit(peek(s)) || !is_hex_digit(peek_next(s))) {
+                    return error_token(s, "expected two hex digits after '\\x'");
+                }
+                advance(s); /* skip first hex digit */
+            }
+        }
         advance(s);
     }
     if (peek(s) == '\0') {
@@ -333,6 +356,37 @@ static Token scan_string(Scanner *s) {
     }
     advance(s); /* consume closing " */
     return make_token(s, TOK_STRING, start);
+}
+
+/* ---- Scan a character literal ---- */
+
+static Token scan_char(Scanner *s) {
+    size_t start = s->pos - 1; /* already consumed opening ' */
+    if (peek(s) == '\\') {
+        advance(s); /* skip backslash */
+        char esc = peek(s);
+        if (esc == '\0') return error_token(s, "unterminated character literal");
+        if (!is_valid_escape(esc) && esc != '\'') {
+            return error_token(s, "invalid escape sequence in character literal");
+        }
+        if (esc == 'x') {
+            advance(s); /* skip 'x' */
+            if (!is_hex_digit(peek(s)) || !is_hex_digit(peek_next(s))) {
+                return error_token(s, "expected two hex digits after '\\x'");
+            }
+            advance(s); /* skip first hex digit */
+        }
+        advance(s); /* skip escape char or second hex digit */
+    } else if (peek(s) == '\'' || peek(s) == '\0') {
+        return error_token(s, "empty character literal");
+    } else {
+        advance(s); /* skip the character */
+    }
+    if (peek(s) != '\'') {
+        return error_token(s, "unterminated character literal");
+    }
+    advance(s); /* consume closing ' */
+    return make_token(s, TOK_CHAR, start);
 }
 
 /* ---- Main scanner function ---- */
@@ -355,6 +409,9 @@ Token next_token(Scanner *s) {
 
     /* string literal */
     if (c == '"') return scan_string(s);
+
+    /* character literal */
+    if (c == '\'') return scan_char(s);
 
     /* operators and punctuation */
     switch (c) {
@@ -501,10 +558,12 @@ const char *token_type_name(TokenType type) {
     case TOK_ASM: return "asm";
     case TOK_STATIC: return "static";
     case TOK_KEEP: return "keep";
+    case TOK_AS: return "as";
     case TOK_IDENT: return "IDENT";
     case TOK_NUMBER_INT: return "INT";
     case TOK_NUMBER_FLOAT: return "FLOAT";
     case TOK_STRING: return "STRING";
+    case TOK_CHAR: return "CHAR";
     case TOK_LPAREN: return "(";
     case TOK_RPAREN: return ")";
     case TOK_LBRACE: return "{";

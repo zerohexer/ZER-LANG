@@ -36,13 +36,14 @@ typedef enum {
 
     /* === Special keywords === */
     TOK_DEFER, TOK_IMPORT, TOK_VOLATILE, TOK_INTERRUPT,
-    TOK_ASM, TOK_STATIC, TOK_KEEP,
+    TOK_ASM, TOK_STATIC, TOK_KEEP, TOK_AS,
 
     /* === Literals === */
     TOK_IDENT,          /* user identifier */
     TOK_NUMBER_INT,     /* integer literal: 42, 0xFF, 0b1010 */
     TOK_NUMBER_FLOAT,   /* float literal: 3.14 */
     TOK_STRING,         /* "hello" */
+    TOK_CHAR,           /* 'a', '\n', '\x0A' */
 
     /* === Single-character tokens === */
     TOK_LPAREN,         /* ( */

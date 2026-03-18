@@ -392,11 +392,28 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_SLICE: {
+        /* Bit extraction: reg[high..low] on integer → (reg >> low) & mask
+         * Array slicing: buf[start..end] → slice struct */
+        Type *obj_type = checker_get_type(node->slice.object);
+        if (obj_type && type_is_integer(obj_type) &&
+            node->slice.start && node->slice.end) {
+            /* bit extraction: expr[high..low] → (expr >> low) & ((1 << (high-low+1)) - 1) */
+            emit(e, "((");
+            emit_expr(e, node->slice.object);
+            emit(e, " >> ");
+            emit_expr(e, node->slice.end);
+            emit(e, ") & ((1u << (");
+            emit_expr(e, node->slice.start);
+            emit(e, " - ");
+            emit_expr(e, node->slice.end);
+            emit(e, " + 1)) - 1))");
+            break;
+        }
+
         /* buf[start..end] → (_zer_slice_T){ &buf[start], end - start }
          * buf[start..]   → (_zer_slice_T){ &buf[start], buf_len - start }
          * buf[..end]     → (_zer_slice_T){ &buf[0], end } */
         /* For simplicity, emit raw pointer + compute length inline */
-        Type *obj_type = checker_get_type(node->slice.object);
         bool is_u8_slice = obj_type && (
             (obj_type->kind == TYPE_ARRAY && obj_type->array.inner == ty_u8) ||
             (obj_type->kind == TYPE_SLICE && obj_type->slice.inner == ty_u8));
@@ -944,6 +961,9 @@ static void emit_stmt(Emitter *e, Node *node) {
          * For default: else { ... }
          */
         int sw_tmp = e->temp_count++;
+        Type *sw_type = checker_get_type(node->switch_stmt.expr);
+        bool is_union_switch = sw_type && sw_type->kind == TYPE_UNION;
+
         emit_indent(e);
         emit(e, "{\n");
         e->indent++;
@@ -959,6 +979,18 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (arm->is_default) {
                 if (i > 0) emit(e, "else ");
                 emit(e, "/* default */ ");
+            } else if (is_union_switch && arm->is_enum_dot) {
+                /* union switch: check _tag field */
+                if (i > 0) emit(e, "else ");
+                emit(e, "if (");
+                for (int j = 0; j < arm->value_count; j++) {
+                    if (j > 0) emit(e, " || ");
+                    emit(e, "_zer_sw%d._tag == _ZER_%.*s_TAG_%.*s",
+                         sw_tmp,
+                         (int)sw_type->union_type.name_len, sw_type->union_type.name,
+                         (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
+                }
+                emit(e, ") ");
             } else {
                 if (i > 0) emit(e, "else ");
                 emit(e, "if (");
@@ -970,8 +1002,27 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, ") ");
             }
 
-            /* arm body */
-            if (arm->body->kind == NODE_BLOCK) {
+            /* arm body — handle captures for union switch */
+            if (is_union_switch && arm->capture_name && arm->value_count > 0) {
+                emit(e, "{\n");
+                e->indent++;
+                emit_indent(e);
+                /* extract variant from anonymous union */
+                emit(e, "__auto_type %.*s = _zer_sw%d.%.*s;\n",
+                     (int)arm->capture_name_len, arm->capture_name,
+                     sw_tmp,
+                     (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);
+                /* emit body contents */
+                if (arm->body->kind == NODE_BLOCK) {
+                    for (int k = 0; k < arm->body->block.stmt_count; k++)
+                        emit_stmt(e, arm->body->block.stmts[k]);
+                } else {
+                    emit_stmt(e, arm->body);
+                }
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
+            } else if (arm->body->kind == NODE_BLOCK) {
                 emit_stmt(e, arm->body);
             } else {
                 emit(e, "{\n");
@@ -1306,6 +1357,33 @@ void emit_file(Emitter *e, Node *file_node) {
         case NODE_GLOBAL_VAR:
             emit_global_var(e, decl);
             break;
+
+        case NODE_UNION_DECL: {
+            /* tagged union → struct with tag + anonymous union */
+            emit(e, "/* tagged union %.*s */\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            /* tag constants */
+            for (int j = 0; j < decl->union_decl.variant_count; j++) {
+                UnionVariant *v = &decl->union_decl.variants[j];
+                emit(e, "#define _ZER_%.*s_TAG_%.*s %d\n",
+                     (int)decl->union_decl.name_len, decl->union_decl.name,
+                     (int)v->name_len, v->name, j);
+            }
+            emit(e, "struct _zer_union_%.*s {\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "    int32_t _tag;\n");
+            emit(e, "    union {\n");
+            for (int j = 0; j < decl->union_decl.variant_count; j++) {
+                UnionVariant *v = &decl->union_decl.variants[j];
+                Type *vtype = resolve_type_for_emit(e, v->type);
+                emit(e, "        ");
+                emit_type(e, vtype);
+                emit(e, " %.*s;\n", (int)v->name_len, v->name);
+            }
+            emit(e, "    };\n");
+            emit(e, "};\n\n");
+            break;
+        }
 
         case NODE_ENUM_DECL:
             /* emit as #define constants */

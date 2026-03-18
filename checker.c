@@ -947,6 +947,9 @@ static Type *check_expr(Checker *c, Node *node) {
             result = type_slice(c->arena, obj->array.inner);
         } else if (obj->kind == TYPE_SLICE) {
             result = obj; /* slice of slice = same slice type */
+        } else if (type_is_integer(obj)) {
+            /* bit extraction: reg[high..low] → integer result */
+            result = obj;
         } else {
             checker_error(c, node->loc.line,
                 "cannot slice type '%s'", type_name(obj));

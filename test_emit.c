@@ -773,6 +773,72 @@ int main(void) {
         42,
         "@config default value = 42");
 
+    printf("[orelse break/continue]\n");
+    test_compile_and_run(
+        "?u32 nothing() { return null; }\n"
+        "?u32 something() { return 42; }\n"
+        "u32 main() {\n"
+        "    u32 result = 0;\n"
+        "    for (u32 i = 0; i < 5; i += 1) {\n"
+        "        u32 val = nothing() orelse continue;\n"
+        "        result = val;\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        0,
+        "orelse continue skips all iterations");
+
+    test_compile_and_run(
+        "?u32 nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    u32 result = 99;\n"
+        "    while (true) {\n"
+        "        u32 val = nothing() orelse break;\n"
+        "        result = val;\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        99,
+        "orelse break exits loop");
+
+    printf("[volatile]\n");
+    test_compile_only(
+        "void f() {\n"
+        "    volatile u32 x = 0;\n"
+        "    x = 5;\n"
+        "    u32 y = x;\n"
+        "}\n",
+        "volatile variable compiles");
+
+    printf("[bit extraction]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 reg = 0xABCD;\n"
+        "    u32 nibble = reg[7..4];\n"
+        "    return nibble;\n"
+        "}\n",
+        0xC,
+        "0xABCD[7..4] = 0xC");
+
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 val = 0xFF;\n"
+        "    u32 bits = val[3..0];\n"
+        "    return bits;\n"
+        "}\n",
+        0xF,
+        "0xFF[3..0] = 0xF");
+
+    printf("[tagged union]\n");
+    test_compile_only(
+        "struct SensorData { u32 temperature; }\n"
+        "struct Command { u32 code; }\n"
+        "union Message {\n"
+        "    SensorData sensor;\n"
+        "    Command command;\n"
+        "}\n",
+        "tagged union declaration compiles");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

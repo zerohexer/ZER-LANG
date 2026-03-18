@@ -247,6 +247,10 @@ bool type_equals(Type *a, Type *b) {
     /* handle: elem */
     case TYPE_HANDLE:
         return type_equals(a->handle.elem, b->handle.elem);
+
+    /* distinct: nominal — pointer identity (same definition = same type) */
+    case TYPE_DISTINCT:
+        return a == b;
     }
     return false;
 }
@@ -381,6 +385,9 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         pos += snprintf(buf + pos, max - pos, "Handle(");
         pos = type_name_write(t->handle.elem, buf, pos, max);
         return pos + snprintf(buf + pos, max - pos, ")");
+    case TYPE_DISTINCT:
+        return pos + snprintf(buf + pos, max - pos, "%.*s",
+                              (int)t->distinct.name_len, t->distinct.name);
     }
     return pos;
 }

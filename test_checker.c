@@ -329,6 +329,85 @@ static void test_realistic_program(void) {
         "complete program with struct, pool, ring, functions, optionals");
 }
 
+/* ---- New tests for TODOs ---- */
+
+static void test_const_assignment(void) {
+    printf("[const assignment]\n");
+    expect_error(
+        "void f() { const u32 x = 5; x = 10; }",
+        "assign to const rejected");
+    expect_ok(
+        "void f() { u32 x = 5; x = 10; }",
+        "assign to mutable OK");
+}
+
+static void test_non_storable(void) {
+    printf("[non-storable get() result]\n");
+    expect_error(
+        "struct Task { u32 pid; }\n"
+        "Pool(Task, 8) tasks;\n"
+        "void f() {\n"
+        "    Handle(Task) h = tasks.alloc() orelse return;\n"
+        "    *Task ptr = tasks.get(h);\n"
+        "}\n",
+        "store get() result rejected");
+    expect_ok(
+        "struct Task { u32 pid; }\n"
+        "Pool(Task, 8) tasks;\n"
+        "void f() {\n"
+        "    Handle(Task) h = tasks.alloc() orelse return;\n"
+        "    tasks.get(h).pid = 42;\n"
+        "}\n",
+        "inline get() field access OK");
+}
+
+static void test_distinct_typedef(void) {
+    printf("[distinct typedef]\n");
+    expect_ok(
+        "distinct typedef u32 Celsius;\n"
+        "void f() { Celsius c = 25; }",
+        "distinct typedef declaration");
+    expect_error(
+        "distinct typedef u32 Celsius;\n"
+        "distinct typedef u32 Fahrenheit;\n"
+        "void f() { Celsius c = 25; Fahrenheit f = c; }",
+        "distinct types not interchangeable");
+}
+
+static void test_exhaustive_switch(void) {
+    printf("[exhaustive switch]\n");
+    expect_error(
+        "void foo() { }\n"
+        "void f() {\n"
+        "    switch (42) {\n"
+        "        0 => foo(),\n"
+        "    }\n"
+        "}\n",
+        "integer switch without default rejected");
+    expect_ok(
+        "void foo() { }\n"
+        "void bar() { }\n"
+        "void f() {\n"
+        "    switch (42) {\n"
+        "        0 => foo(),\n"
+        "        default => bar(),\n"
+        "    }\n"
+        "}\n",
+        "integer switch with default OK");
+}
+
+static void test_ufcs(void) {
+    printf("[UFCS]\n");
+    expect_ok(
+        "struct Task { u32 pid; }\n"
+        "void run(*Task t) { }\n"
+        "void f() {\n"
+        "    Task task;\n"
+        "    task.run();\n"
+        "}\n",
+        "UFCS: task.run() → run(&task)");
+}
+
 /* ================================================================ */
 
 int main(void) {
@@ -354,6 +433,11 @@ int main(void) {
     test_typedef();
     test_forward_reference();
     test_realistic_program();
+    test_const_assignment();
+    test_non_storable();
+    test_distinct_typedef();
+    test_exhaustive_switch();
+    test_ufcs();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

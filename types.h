@@ -45,6 +45,9 @@ typedef enum {
     TYPE_RING,          /* Ring(T, N) — elem type + count */
     TYPE_ARENA,         /* Arena — no parameters */
     TYPE_HANDLE,        /* Handle(T) — elem type */
+
+    /* distinct typedef */
+    TYPE_DISTINCT,      /* distinct typedef — nominal wrapper around underlying type */
 } TypeKind;
 
 /* ---- Struct field (semantic) ---- */
@@ -126,6 +129,13 @@ struct Type {
 
         /* TYPE_HANDLE */
         struct { Type *elem; } handle;
+
+        /* TYPE_DISTINCT */
+        struct {
+            Type *underlying;
+            const char *name;
+            uint32_t name_len;
+        } distinct;
     };
 
     /* source location for error messages */

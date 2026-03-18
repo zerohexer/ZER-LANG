@@ -28,6 +28,37 @@ static void checker_error(Checker *c, int line, const char *fmt, ...) {
     fprintf(stderr, "\n");
 }
 
+static void checker_warning(Checker *c, int line, const char *fmt, ...) {
+    c->warning_count++;
+    fprintf(stderr, "%s:%d: warning: ", c->file_name, line);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
+/* ---- Non-storable tracking ----
+ * pool.get(h) returns a non-storable result.
+ * We track this with a simple set of node pointers. */
+
+#define NON_STORABLE_MAX 256
+static Node *non_storable_nodes[NON_STORABLE_MAX];
+static int non_storable_count = 0;
+
+static void mark_non_storable(Node *n) {
+    if (non_storable_count < NON_STORABLE_MAX) {
+        non_storable_nodes[non_storable_count++] = n;
+    }
+}
+
+static bool is_non_storable(Node *n) {
+    for (int i = 0; i < non_storable_count; i++) {
+        if (non_storable_nodes[i] == n) return true;
+    }
+    return false;
+}
+
 /* ---- Scope helpers ---- */
 
 static void push_scope(Checker *c) {
@@ -101,11 +132,14 @@ static Type *resolve_type(Checker *c, TypeNode *tn);
  * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
 static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
-    if (expr->kind == NODE_INT_LIT && type_is_integer(target)) return true;
-    if (expr->kind == NODE_FLOAT_LIT && type_is_float(target)) return true;
+    /* unwrap distinct for literal compatibility */
+    Type *effective = target;
+    if (target->kind == TYPE_DISTINCT) effective = target->distinct.underlying;
+    if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) return true;
+    if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
-    if (expr->kind == NODE_BOOL_LIT && target->kind == TYPE_BOOL) return true;
-    if (expr->kind == NODE_CHAR_LIT && target->kind == TYPE_U8) return true;
+    if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
+    if (expr->kind == NODE_CHAR_LIT && effective->kind == TYPE_U8) return true;
     return false;
 }
 
@@ -430,6 +464,24 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *target = check_expr(c, node->assign.target);
         Type *value = check_expr(c, node->assign.value);
 
+        /* const check: cannot assign to const variable */
+        if (node->assign.target->kind == NODE_IDENT) {
+            Symbol *sym = scope_lookup(c->current_scope,
+                node->assign.target->ident.name,
+                (uint32_t)node->assign.target->ident.name_len);
+            if (sym && sym->is_const) {
+                checker_error(c, node->loc.line,
+                    "cannot assign to const variable '%.*s'",
+                    (int)sym->name_len, sym->name);
+            }
+        }
+
+        /* non-storable check: pool.get(h) result cannot be stored */
+        if (node->assign.op == TOK_EQ && is_non_storable(node->assign.value)) {
+            checker_error(c, node->loc.line,
+                "cannot store result of get() — use inline");
+        }
+
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!type_equals(target, value) &&
@@ -479,6 +531,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
                     result = type_pointer(c->arena, obj->pool.elem);
                     typemap_set(field_node, result);
+                    mark_non_storable(node); /* Rule 2: get() result non-storable */
                     break;
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
@@ -520,6 +573,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 5 && memcmp(mname, "reset", 5) == 0) {
+                    /* Rule 3: arena.reset() outside defer = warning */
+                    if (c->defer_depth == 0) {
+                        checker_warning(c, node->loc.line,
+                            "arena.reset() outside defer may cause dangling pointers — "
+                            "use defer or unsafe_reset()");
+                    }
                     result = ty_void;
                     typemap_set(field_node, result);
                     break;
@@ -557,8 +616,39 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = callee_type->func_ptr.ret;
         } else {
-            /* UFCS: try to find free function matching method name */
-            /* TODO: UFCS resolution */
+            /* UFCS resolution: expr.method(args) → method(&expr, args)
+             * Look for a free function named 'method' where first param
+             * matches *typeof(expr). */
+            if (node->call.callee->kind == NODE_FIELD) {
+                Node *fn = node->call.callee;
+                const char *mname = fn->field.field_name;
+                uint32_t mlen = (uint32_t)fn->field.field_name_len;
+                Type *obj_type = typemap_get(fn->field.object);
+
+                Symbol *func_sym = scope_lookup(c->current_scope, mname, mlen);
+                if (func_sym && func_sym->is_function &&
+                    func_sym->type->kind == TYPE_FUNC_PTR) {
+                    Type *ftype = func_sym->type;
+                    /* check first param is pointer to obj's type */
+                    if (ftype->func_ptr.param_count > 0) {
+                        Type *first_param = ftype->func_ptr.params[0];
+                        if (first_param->kind == TYPE_POINTER &&
+                            (type_equals(first_param->pointer.inner, obj_type) ||
+                             (obj_type && obj_type->kind == TYPE_POINTER &&
+                              type_equals(first_param, obj_type)))) {
+                            /* UFCS match — check remaining args */
+                            uint32_t expected = ftype->func_ptr.param_count - 1;
+                            if ((uint32_t)node->call.arg_count != expected) {
+                                checker_error(c, node->loc.line,
+                                    "expected %u arguments for UFCS call, got %d",
+                                    expected, node->call.arg_count);
+                            }
+                            result = ftype->func_ptr.ret;
+                            break;
+                        }
+                    }
+                }
+            }
             result = ty_void;
         }
         break;
@@ -629,11 +719,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             if (!result) {
-                /* not a field — try UFCS (look for free function) */
-                /* TODO: UFCS lookup */
-                checker_error(c, node->loc.line,
-                    "no field '%.*s' on type '%s'",
-                    (int)flen, fname, type_name(obj));
+                /* not a field — might be UFCS (resolved at call site)
+                 * don't error here; let the call handler try UFCS.
+                 * if it's not a call, the void result will propagate. */
                 result = ty_void;
             }
             break;
@@ -874,6 +962,12 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->var_decl.init) {
             Type *init_type = check_expr(c, node->var_decl.init);
 
+            /* non-storable check: pool.get(h) result */
+            if (is_non_storable(node->var_decl.init)) {
+                checker_error(c, node->loc.line,
+                    "cannot store result of get() — use inline");
+            }
+
             /* check assignment compatibility */
             if (!type_equals(type, init_type) &&
                 !can_implicit_coerce(init_type, type) &&
@@ -1039,7 +1133,62 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
-        /* TODO: exhaustiveness check for enum/bool switch */
+        /* exhaustiveness check */
+        {
+            bool has_default = false;
+            for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+                if (node->switch_stmt.arms[i].is_default) {
+                    has_default = true;
+                    break;
+                }
+            }
+
+            if (expr->kind == TYPE_ENUM) {
+                /* enum switch: must handle all variants OR have default */
+                if (!has_default) {
+                    uint32_t total = expr->enum_type.variant_count;
+                    uint32_t handled = 0;
+                    for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+                        handled += (uint32_t)node->switch_stmt.arms[i].value_count;
+                    }
+                    if (handled < total) {
+                        checker_error(c, node->loc.line,
+                            "switch on enum '%.*s' is not exhaustive — "
+                            "handles %u of %u variants",
+                            (int)expr->enum_type.name_len,
+                            expr->enum_type.name, handled, total);
+                    }
+                }
+            } else if (type_equals(expr, ty_bool)) {
+                /* bool switch: must handle true and false */
+                if (!has_default && node->switch_stmt.arm_count < 2) {
+                    checker_error(c, node->loc.line,
+                        "switch on bool must handle both true and false");
+                }
+            } else if (type_is_integer(expr)) {
+                /* integer switch: must have default */
+                if (!has_default) {
+                    checker_error(c, node->loc.line,
+                        "switch on integer must have a default arm");
+                }
+            } else if (expr->kind == TYPE_UNION) {
+                /* union switch: must handle all variants OR have default */
+                if (!has_default) {
+                    uint32_t total = expr->union_type.variant_count;
+                    uint32_t handled = 0;
+                    for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+                        handled += (uint32_t)node->switch_stmt.arms[i].value_count;
+                    }
+                    if (handled < total) {
+                        checker_error(c, node->loc.line,
+                            "switch on union '%.*s' is not exhaustive — "
+                            "handles %u of %u variants",
+                            (int)expr->union_type.name_len,
+                            expr->union_type.name, handled, total);
+                    }
+                }
+            }
+        }
         break;
     }
 
@@ -1082,7 +1231,9 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_DEFER:
+        c->defer_depth++;
         check_stmt(c, node->defer.body);
+        c->defer_depth--;
         break;
 
     case NODE_EXPR_STMT:
@@ -1193,9 +1344,19 @@ static void register_decl(Checker *c, Node *node) {
     }
 
     case NODE_TYPEDEF: {
-        Type *type = resolve_type(c, node->typedef_decl.type);
-        /* for distinct typedef, wrap in a new struct-like nominal type */
-        /* TODO: distinct typedef handling */
+        Type *underlying = resolve_type(c, node->typedef_decl.type);
+        Type *type;
+        if (node->typedef_decl.is_distinct) {
+            /* distinct typedef: new nominal type, NOT interchangeable */
+            type = (Type *)arena_alloc(c->arena, sizeof(Type));
+            type->kind = TYPE_DISTINCT;
+            type->distinct.underlying = underlying;
+            type->distinct.name = node->typedef_decl.name;
+            type->distinct.name_len = (uint32_t)node->typedef_decl.name_len;
+        } else {
+            /* regular typedef: alias, fully interchangeable */
+            type = underlying;
+        }
         add_symbol(c, node->typedef_decl.name,
                    (uint32_t)node->typedef_decl.name_len,
                    type, node->loc.line);

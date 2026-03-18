@@ -22,8 +22,10 @@ typedef struct {
     Scope *current_scope;   /* current scope in traversal */
     const char *file_name;
     int error_count;
+    int warning_count;
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
+    int defer_depth;        /* > 0 when inside a defer block */
 } Checker;
 
 /* ---- API ---- */

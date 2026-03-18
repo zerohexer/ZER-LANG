@@ -348,7 +348,7 @@ if (maybe_num) |*val| {
 }
 ```
 
-**Pattern 3: tagged union switch**
+**Pattern 3: tagged union construction and switch**
 
 ```
 union Message {
@@ -356,6 +356,16 @@ union Message {
     Command command;
 }
 
+CONSTRUCTION — assigning to a variant field sets the tag automatically:
+  Message msg;
+  msg.sensor = read_sensor();    // compiler sets msg._tag = 0 (sensor)
+  msg.command = parse_cmd();     // compiler sets msg._tag = 1 (command)
+
+  // Only ONE variant is active. Assigning a new variant changes the tag.
+  // The compiler inserts: msg._tag = VARIANT_INDEX before the assignment.
+  // Developer writes normal field assignment. Safety is underneath.
+
+SWITCHING — must handle all variants:
 switch (msg) {
     .sensor => |data| {
         // data is SensorData. copy. immutable.
@@ -375,6 +385,10 @@ switch (msg) {
 // 4. type-check arm body in new scope
 // 5. pop scope
 // 6. after all arms: verify exhaustive (all variants handled)
+
+// emitter for construction:
+// msg.sensor = val;
+// → emitted C: msg._tag = _ZER_Message_TAG_sensor; msg.sensor = val;
 ```
 
 **Pattern 4: orelse with value**

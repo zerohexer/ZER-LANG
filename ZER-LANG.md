@@ -1066,15 +1066,23 @@ union Message {
     Ack ack;
 }
 
-// Cannot access wrong variant:
+// CONSTRUCTION — assign to variant field, compiler sets tag automatically:
+Message msg;
+msg.sensor = read_sensor();   // compiler inserts: msg._tag = 0
+
+// Cannot READ wrong variant:
 msg.sensor.temperature;       // COMPILE ERROR: must switch first
 
-// Must switch:
+// Must switch to read:
 switch (msg) {
     .sensor => |data| { process_sensor(data); },
     .command => |cmd| { execute(cmd); },
     .ack => |a| { confirm(a); },
 }
+
+// WRITE is allowed — it changes the active variant:
+msg.command = parse_cmd();    // compiler inserts: msg._tag = 1
+// Now msg is a Command, not a SensorData.
 ```
 
 ---

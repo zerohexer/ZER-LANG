@@ -249,6 +249,31 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_ASSIGN:
+        /* union variant assignment: msg.sensor = val → set tag first */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.target->kind == NODE_FIELD) {
+            Node *obj_node = node->assign.target->field.object;
+            Type *obj_type = checker_get_type(obj_node);
+            if (obj_type && obj_type->kind == TYPE_UNION) {
+                /* find variant index */
+                const char *vname = node->assign.target->field.field_name;
+                uint32_t vlen = (uint32_t)node->assign.target->field.field_name_len;
+                for (uint32_t i = 0; i < obj_type->union_type.variant_count; i++) {
+                    SUVariant *v = &obj_type->union_type.variants[i];
+                    if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0) {
+                        /* emit: obj._tag = TAG_variant, obj.variant = val */
+                        emit(e, "(");
+                        emit_expr(e, obj_node);
+                        emit(e, "._tag = %u, ", i);
+                        emit_expr(e, node->assign.target);
+                        emit(e, " = ");
+                        emit_expr(e, node->assign.value);
+                        emit(e, ")");
+                        goto assign_done;
+                    }
+                }
+            }
+        }
         emit_expr(e, node->assign.target);
         switch (node->assign.op) {
         case TOK_EQ:        emit(e, " = "); break;
@@ -265,6 +290,7 @@ static void emit_expr(Emitter *e, Node *node) {
         default:            emit(e, " = "); break;
         }
         emit_expr(e, node->assign.value);
+        assign_done:
         break;
 
     case NODE_CALL: {
@@ -795,7 +821,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         } else {
             /* ZER auto-zeroes */
             if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
-                         type->kind == TYPE_OPTIONAL)) {
+                         type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION)) {
                 emit(e, " = {0}");
             } else {
                 emit(e, " = 0");
@@ -1274,7 +1300,7 @@ static void emit_global_var(Emitter *e, Node *node) {
     } else {
         /* auto-zero */
         if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
-                     type->kind == TYPE_OPTIONAL)) {
+                     type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION)) {
             emit(e, " = {0}");
         } else {
             emit(e, " = 0");

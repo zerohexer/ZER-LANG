@@ -415,7 +415,11 @@ static void test_union_field_access(void) {
     expect_error(
         "union Msg { u32 sensor; u32 command; }\n"
         "void f(Msg m) { u32 x = m.sensor; }",
-        "direct union field access rejected");
+        "union field READ rejected");
+    expect_ok(
+        "union Msg { u32 sensor; u32 command; }\n"
+        "void f(Msg m) { m.sensor = 5; }",
+        "union field WRITE for construction allowed");
 }
 
 static void test_scope_escape(void) {

@@ -254,7 +254,9 @@ static void test_s12_enum(void) {
 static void test_s12_union(void) {
     printf("[§12 union]\n");
     err("union M { u32 a; u32 b; }\nvoid f(M m) { u32 x = m.a; }",
-        "direct union field REJECT");
+        "union field READ rejected");
+    ok("union M { u32 a; u32 b; }\nvoid f(M m) { m.a = 5; }",
+       "union field WRITE for construction OK");
     ok("union M { u32 a; u32 b; }\n"
        "void f(M m) {\n"
        "    switch (m) {\n"

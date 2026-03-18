@@ -999,16 +999,27 @@ int main(void) {
         "orelse continue in for: 0+1+skip+3+4 = 8");
 
     printf("[union switch runtime routing]\n");
-    /* Union variant construction needs a factory function since
-     * direct field access is blocked by ZER's safety rules */
-    test_compile_only(
+    test_compile_and_run(
         "struct SensorData { u32 temp; }\n"
         "struct Command { u32 code; }\n"
         "union Message {\n"
         "    SensorData sensor;\n"
         "    Command command;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    SensorData sd;\n"
+        "    sd.temp = 42;\n"
+        "    Message msg;\n"
+        "    msg.sensor = sd;\n"
+        "    u32 result = 0;\n"
+        "    switch (msg) {\n"
+        "        .sensor => |data| { result = data.temp; },\n"
+        "        .command => |cmd| { result = cmd.code; },\n"
+        "    }\n"
+        "    return result;\n"
         "}\n",
-        "tagged union declaration compiles with tag + variants");
+        42,
+        "union construct + switch routes to sensor = 42");
 
     printf("[defer inside for loop]\n");
     test_compile_and_run(

@@ -532,7 +532,9 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Assignment ---- */
     case NODE_ASSIGN: {
+        c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
+        c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
         /* const check: cannot assign to const variable */
@@ -891,12 +893,30 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
-        /* union: direct field access forbidden — must switch first */
+        /* union: writing (assignment LHS) is allowed — sets the active variant.
+         * Reading (any other context) requires switch. */
         if (obj->kind == TYPE_UNION) {
-            checker_error(c, node->loc.line,
-                "cannot access union variant '%.*s' directly — must use switch",
-                (int)flen, fname);
-            result = ty_void;
+            if (!c->in_assign_target) {
+                checker_error(c, node->loc.line,
+                    "cannot read union variant '%.*s' directly — must use switch",
+                    (int)flen, fname);
+                result = ty_void;
+                break;
+            }
+            for (uint32_t i = 0; i < obj->union_type.variant_count; i++) {
+                SUVariant *v = &obj->union_type.variants[i];
+                if (v->name_len == flen && memcmp(v->name, fname, flen) == 0) {
+                    result = v->type;
+                    break;
+                }
+            }
+            if (!result) {
+                checker_error(c, node->loc.line,
+                    "no variant '%.*s' in union '%.*s'",
+                    (int)flen, fname,
+                    (int)obj->union_type.name_len, obj->union_type.name);
+                result = ty_void;
+            }
             break;
         }
 

@@ -1,9 +1,9 @@
 # ZER Language Specification
 
 **Full name:** ZEROHEXER (ZER)
-**Status:** Research study / language design complete. Compiler not yet implemented.
+**Status:** Lexer and parser implemented and tested (376 tests). Type checker next.
 **Author:** ZEROHEXER
-**Date:** 2026-03-17
+**Date:** 2026-03-18
 **Goal:** Memory-safe C. No runtime. No LLVM. No excuses. Zero silent memory corruption on every board GCC supports. The compiler does the safety work — the developer writes C-style code.
 
 ---
@@ -2124,10 +2124,10 @@ FULL ARC:
 source.zer
     |
     v
-[LEXER]          tokens          ~1,500 lines
+[LEXER]          tokens          ~560 lines   ✅ DONE
     |
     v
-[PARSER]         AST             ~3,000 lines
+[PARSER]         AST             ~1,200 lines ✅ DONE
     |
     v
 [TYPE CHECKER]   typed AST       ~2,500 lines
@@ -2230,8 +2230,8 @@ MILESTONE ZERO — first successful end-to-end compile:
   This is the "it works" moment. Everything after is expanding coverage.
 
 VERSION 0.1 — ZER runs. safe. no optimization.
-  1. Lexer (tokens)
-  2. Parser (AST — functions, structs, variables, control flow)
+  1. Lexer (tokens)                                              ✅ DONE (218 tests)
+  2. Parser (AST — functions, structs, variables, control flow)  ✅ DONE (158 tests)
   3. Type checker (type representation, coercion rules, symbol table)
      → THIS IS THE HARD PART. Design type system doc BEFORE coding.
      → See Appendix G for honest difficulty assessment.

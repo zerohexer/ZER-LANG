@@ -1,6 +1,6 @@
 # ZER Type System Design — Core Decisions
 
-**Status:** Decisions finalized. Revisit when lexer and parser produce actual AST.
+**Status:** Lexer and parser complete (376 tests). AST shape known. Ready for type checker implementation.
 **Purpose:** The 4 load-bearing decisions that determine the type checker's architecture.
 **Rule:** These are the skeleton. Everything else is muscle added incrementally.
 
@@ -592,9 +592,9 @@ TOTAL type system infrastructure:                 ~1,035 lines
 ## Implementation order
 
 ```
-1. Build lexer → produces tokens
-2. Build parser → produces AST (now you know the concrete shape)
-3. REVISIT THIS DOCUMENT — update decisions based on actual AST
+1. Build lexer → produces tokens                              ✅ DONE (218 tests)
+2. Build parser → produces AST (now you know the concrete shape) ✅ DONE (158 tests)
+3. REVISIT THIS DOCUMENT — update decisions based on actual AST  ✅ AST shape confirmed
 4. Implement Type struct (Decision 1)
 5. Implement Scope + Symbol (Decision 2)
 6. Implement type checker core:

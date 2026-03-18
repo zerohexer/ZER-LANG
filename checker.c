@@ -975,7 +975,8 @@ static Type *check_expr(Checker *c, Node *node) {
             Type *fallback = check_expr(c, node->orelse.fallback);
             /* fallback must match unwrapped type */
             if (!type_equals(unwrapped, fallback) &&
-                !can_implicit_coerce(fallback, unwrapped)) {
+                !can_implicit_coerce(fallback, unwrapped) &&
+                !is_literal_compatible(node->orelse.fallback, unwrapped)) {
                 checker_error(c, node->loc.line,
                     "orelse fallback type '%s' doesn't match '%s'",
                     type_name(fallback), type_name(unwrapped));

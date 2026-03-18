@@ -27,6 +27,13 @@
  *   Handle(T)          → uint32_t (gen << 16 | index)
  * ================================================================ */
 
+/* deferred statement stack */
+#define MAX_DEFERS 64
+typedef struct {
+    Node *stmts[MAX_DEFERS];
+    int count;
+} DeferStack;
+
 typedef struct {
     FILE *out;              /* output file */
     Arena *arena;           /* for temporary allocations */
@@ -34,6 +41,7 @@ typedef struct {
     int indent;             /* current indentation level */
     int temp_count;         /* counter for temporary variable names */
     Type *current_func_ret; /* return type of current function */
+    DeferStack defer_stack; /* current block's deferred statements */
 } Emitter;
 
 /* ---- API ---- */

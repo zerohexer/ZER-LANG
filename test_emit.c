@@ -600,6 +600,48 @@ int main(void) {
     test_orelse_return();
     test_if_unwrap();
 
+    printf("[defer]\n");
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "void increment() { counter += 1; }\n"
+        "void do_work() {\n"
+        "    defer increment();\n"
+        "    defer increment();\n"
+        "    defer increment();\n"
+        "}\n"
+        "u32 main() {\n"
+        "    do_work();\n"
+        "    return counter;\n"
+        "}\n",
+        3,
+        "3 defers executed = counter 3");
+
+    printf("[Pool alloc/get/free]\n");
+    test_compile_and_run(
+        "struct Task { u32 pid; u32 priority; }\n"
+        "Pool(Task, 8) tasks;\n"
+        "u32 main() {\n"
+        "    Handle(Task) h = tasks.alloc() orelse return;\n"
+        "    tasks.get(h).pid = 42;\n"
+        "    u32 pid = tasks.get(h).pid;\n"
+        "    tasks.free(h);\n"
+        "    return pid;\n"
+        "}\n",
+        42,
+        "pool alloc → set pid → get pid → free = 42");
+
+    printf("[Ring push/pop]\n");
+    test_compile_and_run(
+        "Ring(u8, 256) buf;\n"
+        "u32 main() {\n"
+        "    buf.push(42);\n"
+        "    buf.push(99);\n"
+        "    u8 first = buf.pop() orelse 0;\n"
+        "    return first;\n"
+        "}\n",
+        42,
+        "ring push 42,99 → pop = 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

@@ -268,15 +268,108 @@ static void emit_expr(Emitter *e, Node *node) {
         emit_expr(e, node->assign.value);
         break;
 
-    case NODE_CALL:
-        emit_expr(e, node->call.callee);
-        emit(e, "(");
-        for (int i = 0; i < node->call.arg_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_expr(e, node->call.args[i]);
+    case NODE_CALL: {
+        /* intercept builtin method calls: pool.alloc(), pool.get(h), etc. */
+        bool handled = false;
+        if (node->call.callee->kind == NODE_FIELD) {
+            Node *obj_node = node->call.callee->field.object;
+            const char *mname = node->call.callee->field.field_name;
+            uint32_t mlen = (uint32_t)node->call.callee->field.field_name_len;
+
+            /* check if object is a Pool variable by looking up its type */
+            if (obj_node->kind == NODE_IDENT) {
+                Symbol *sym = scope_lookup(e->checker->global_scope,
+                    obj_node->ident.name, (uint32_t)obj_node->ident.name_len);
+                if (sym && sym->type && sym->type->kind == TYPE_POOL) {
+                    Type *pool = sym->type;
+                    const char *pname = obj_node->ident.name;
+                    int plen = (int)obj_node->ident.name_len;
+
+                    if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                        /* pool.alloc() → _zer_pool_alloc(...) wrapped in optional */
+                        int tmp = e->temp_count++;
+                        emit(e, "({uint8_t _zer_aok%d = 0; uint32_t _zer_ah%d = "
+                             "_zer_pool_alloc(%.*s.slots, sizeof(%.*s.slots[0]), "
+                             "%.*s.gen, %.*s.used, %u, &_zer_aok%d); "
+                             "(_zer_opt_u32){_zer_ah%d, _zer_aok%d}; })",
+                             tmp, tmp,
+                             plen, pname, plen, pname,
+                             plen, pname, plen, pname,
+                             pool->pool.count, tmp, tmp, tmp);
+                        handled = true;
+                    } else if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
+                        /* pool.get(h) → cast _zer_pool_get result to elem type */
+                        emit(e, "(*(");
+                        emit_type(e, pool->pool.elem);
+                        emit(e, "*)_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
+                             "sizeof(%.*s.slots[0]), ",
+                             plen, pname, plen, pname, plen, pname, plen, pname);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, ", %u))", pool->pool.count);
+                        handled = true;
+                    } else if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                        /* pool.free(h) */
+                        emit(e, "_zer_pool_free(%.*s.gen, %.*s.used, ",
+                             plen, pname, plen, pname);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, ", %u)", pool->pool.count);
+                        handled = true;
+                    }
+                }
+
+                if (!handled && sym && sym->type && sym->type->kind == TYPE_RING) {
+                    const char *rname = obj_node->ident.name;
+                    int rlen = (int)obj_node->ident.name_len;
+
+                    if (mlen == 4 && memcmp(mname, "push", 4) == 0) {
+                        /* ring.push(val) */
+                        int tmp = e->temp_count++;
+                        emit(e, "({__auto_type _zer_rpv%d = ", tmp);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, "; _zer_ring_push(%.*s.data, &%.*s.head, "
+                             "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); })",
+                             rlen, rname, rlen, rname, rlen, rname,
+                             sym->type->ring.count, tmp, tmp);
+                        handled = true;
+                    } else if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
+                        /* ring.pop() → optional */
+                        /* simplified: return data[tail] if count > 0 */
+                        int tmp = e->temp_count++;
+                        emit(e, "({_zer_opt_u8 _zer_rp%d = {0}; "
+                             "if (%.*s.count > 0) { "
+                             "_zer_rp%d.value = %.*s.data[%.*s.tail]; "
+                             "_zer_rp%d.has_value = 1; "
+                             "%.*s.tail = (%.*s.tail + 1) %% %u; "
+                             "%.*s.count--; } "
+                             "_zer_rp%d; })",
+                             tmp,
+                             rlen, rname,
+                             tmp, rlen, rname, rlen, rname,
+                             tmp,
+                             rlen, rname, rlen, rname, sym->type->ring.count,
+                             rlen, rname,
+                             tmp);
+                        handled = true;
+                    }
+                }
+            }
         }
-        emit(e, ")");
+
+        if (!handled) {
+            /* normal function call */
+            emit_expr(e, node->call.callee);
+            emit(e, "(");
+            for (int i = 0; i < node->call.arg_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_expr(e, node->call.args[i]);
+            }
+            emit(e, ")");
+        }
         break;
+    }
 
     case NODE_FIELD:
         emit_expr(e, node->field.object);
@@ -448,20 +541,37 @@ static void emit_expr(Emitter *e, Node *node) {
  * STATEMENT EMISSION
  * ================================================================ */
 
+/* emit all accumulated defers in reverse order */
+static void emit_defers(Emitter *e) {
+    for (int i = e->defer_stack.count - 1; i >= 0; i--) {
+        emit_stmt(e, e->defer_stack.stmts[i]);
+    }
+}
+
 static void emit_stmt(Emitter *e, Node *node) {
     if (!node) return;
 
     switch (node->kind) {
-    case NODE_BLOCK:
+    case NODE_BLOCK: {
+        /* save defer state for this block scope */
+        DeferStack saved_defers = e->defer_stack;
+        e->defer_stack.count = 0;
+
         emit(e, "{\n");
         e->indent++;
         for (int i = 0; i < node->block.stmt_count; i++) {
             emit_stmt(e, node->block.stmts[i]);
         }
+        /* emit accumulated defers in reverse at block end */
+        emit_defers(e);
         e->indent--;
         emit_indent(e);
         emit(e, "}\n");
+
+        /* restore parent defer state */
+        e->defer_stack = saved_defers;
         break;
+    }
 
     case NODE_VAR_DECL: {
         Type *type = resolve_type_for_emit(e, node->var_decl.type);
@@ -627,6 +737,8 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_RETURN:
+        /* emit defers before return (reverse order) */
+        emit_defers(e);
         emit_indent(e);
         if (node->ret.expr) {
             /* return null from ?T function → return {0, 0} */
@@ -686,14 +798,10 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_DEFER:
-        /* Defer: emit the deferred code at the end of the current block.
-         * For now, emit as a comment + the code inline.
-         * Full defer requires goto-based cleanup which we'll add per-function. */
-        emit_indent(e);
-        emit(e, "/* deferred: */ ");
-        /* We can't easily defer in C99 without goto. For now, just emit inline
-         * with a comment. Real defer codegen needs function-level rewriting. */
-        emit_stmt(e, node->defer.body);
+        /* push onto defer stack — will be emitted at block end in reverse */
+        if (e->defer_stack.count < MAX_DEFERS) {
+            e->defer_stack.stmts[e->defer_stack.count++] = node->defer.body;
+        }
         break;
 
     case NODE_SWITCH: {
@@ -892,6 +1000,28 @@ static void emit_func_decl(Emitter *e, Node *node) {
 static void emit_global_var(Emitter *e, Node *node) {
     Type *type = resolve_type_for_emit(e, node->var_decl.type);
 
+    /* Pool(T, N) → use macro for struct layout */
+    if (type && type->kind == TYPE_POOL) {
+        emit(e, "struct { ");
+        emit_type(e, type->pool.elem);
+        emit(e, " slots[%u]; uint16_t gen[%u]; uint8_t used[%u]; } ",
+             type->pool.count, type->pool.count, type->pool.count);
+        emit(e, "%.*s = {0};\n\n",
+             (int)node->var_decl.name_len, node->var_decl.name);
+        return;
+    }
+
+    /* Ring(T, N) → ring struct */
+    if (type && type->kind == TYPE_RING) {
+        emit(e, "struct { ");
+        emit_type(e, type->ring.elem);
+        emit(e, " data[%u]; uint32_t head; uint32_t tail; uint32_t count; } ",
+             type->ring.count);
+        emit(e, "%.*s = {0};\n\n",
+             (int)node->var_decl.name_len, node->var_decl.name);
+        return;
+    }
+
     if (node->var_decl.is_static) emit(e, "static ");
 
     emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
@@ -901,7 +1031,8 @@ static void emit_global_var(Emitter *e, Node *node) {
         emit_expr(e, node->var_decl.init);
     } else {
         /* auto-zero */
-        if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY)) {
+        if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
+                     type->kind == TYPE_OPTIONAL)) {
             emit(e, " = {0}");
         } else {
             emit(e, " = 0");
@@ -951,6 +1082,69 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "/* ZER slice types */\n");
     emit(e, "typedef struct { uint8_t* ptr; size_t len; } _zer_slice_u8;\n");
     emit(e, "typedef struct { uint32_t* ptr; size_t len; } _zer_slice_u32;\n");
+    emit(e, "\n");
+
+    /* ZER runtime: Pool helper macros */
+    emit(e, "/* ZER Pool runtime */\n");
+    emit(e, "#define _ZER_POOL_DECL(NAME, ELEM_TYPE, CAPACITY) \\\n");
+    emit(e, "    struct { \\\n");
+    emit(e, "        ELEM_TYPE slots[CAPACITY]; \\\n");
+    emit(e, "        uint16_t gen[CAPACITY]; \\\n");
+    emit(e, "        uint8_t used[CAPACITY]; \\\n");
+    emit(e, "    } NAME = {0}\n");
+    emit(e, "\n");
+    emit(e, "static inline uint32_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
+            "uint16_t *gen, uint8_t *used, uint32_t capacity, uint8_t *ok) {\n");
+    emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
+    emit(e, "        if (!used[i]) {\n");
+    emit(e, "            used[i] = 1;\n");
+    emit(e, "            *ok = 1;\n");
+    emit(e, "            return (uint32_t)((gen[i] << 16) | i);\n");
+    emit(e, "        }\n");
+    emit(e, "    }\n");
+    emit(e, "    *ok = 0;\n");
+    emit(e, "    return 0;\n");
+    emit(e, "}\n\n");
+
+    emit(e, "static inline void *_zer_pool_get(void *slots, uint16_t *gen, uint8_t *used, "
+            "size_t slot_size, uint32_t handle, uint32_t capacity) {\n");
+    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
+    emit(e, "    uint16_t h_gen = (uint16_t)(handle >> 16);\n");
+    emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen) {\n");
+    emit(e, "        /* generation mismatch or invalid — trap */\n");
+    emit(e, "        return (void*)0; /* TODO: trap */\n");
+    emit(e, "    }\n");
+    emit(e, "    return (char*)slots + idx * slot_size;\n");
+    emit(e, "}\n\n");
+
+    emit(e, "static inline void _zer_pool_free(uint16_t *gen, uint8_t *used, "
+            "uint32_t handle, uint32_t capacity) {\n");
+    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
+    emit(e, "    if (idx < capacity) {\n");
+    emit(e, "        used[idx] = 0;\n");
+    emit(e, "        gen[idx]++;\n");
+    emit(e, "    }\n");
+    emit(e, "}\n\n");
+
+    /* ZER runtime: Ring helper */
+    emit(e, "/* ZER Ring runtime */\n");
+    emit(e, "#define _ZER_RING_DECL(NAME, ELEM_TYPE, CAPACITY) \\\n");
+    emit(e, "    struct { \\\n");
+    emit(e, "        ELEM_TYPE data[CAPACITY]; \\\n");
+    emit(e, "        uint32_t head; \\\n");
+    emit(e, "        uint32_t tail; \\\n");
+    emit(e, "        uint32_t count; \\\n");
+    emit(e, "        uint32_t capacity; \\\n");
+    emit(e, "    } NAME = { .capacity = CAPACITY }\n");
+    emit(e, "\n");
+
+    emit(e, "static inline void _zer_ring_push(void *ring_data, uint32_t *head, "
+            "uint32_t *count, uint32_t capacity, const void *val, size_t elem_size) {\n");
+    emit(e, "    memcpy((char*)ring_data + (*head) * elem_size, val, elem_size);\n");
+    emit(e, "    *head = (*head + 1) %% capacity;\n");
+    emit(e, "    if (*count < capacity) (*count)++;\n");
+    emit(e, "}\n\n");
+
     emit(e, "\n");
 
     /* emit declarations */

@@ -104,6 +104,7 @@ static Symbol *find_symbol(Checker *c, const char *name, uint32_t name_len, int 
  * We store the resolved Type* for each expression node in a simple
  * hash map keyed by node pointer. This avoids modifying the Node struct. */
 
+/* 4096 slots sufficient for embedded-scale programs; revisit for large codebases */
 #define TYPE_MAP_SIZE 4096
 
 typedef struct {
@@ -1177,9 +1178,11 @@ static void check_stmt(Checker *c, Node *node) {
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
 
-            /* check match values */
-            for (int j = 0; j < arm->value_count; j++) {
-                check_expr(c, arm->values[j]);
+            /* check match values — skip for enum/union dot syntax (.variant) */
+            if (!arm->is_enum_dot) {
+                for (int j = 0; j < arm->value_count; j++) {
+                    check_expr(c, arm->values[j]);
+                }
             }
 
             /* handle capture */

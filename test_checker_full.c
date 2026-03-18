@@ -255,10 +255,23 @@ static void test_s12_union(void) {
     printf("[§12 union]\n");
     err("union M { u32 a; u32 b; }\nvoid f(M m) { u32 x = m.a; }",
         "direct union field REJECT");
-    /* union switch tested via spec — parser handles it correctly.
-     * Type checker for union switch captures requires passing union type
-     * directly, which needs more parser work for union variables.
-     * Skipping deep union switch test for now — basic rejection tested above. */
+    ok("union M { u32 a; u32 b; }\n"
+       "void f(M m) {\n"
+       "    switch (m) {\n"
+       "        .a => |v| { u32 x = v; },\n"
+       "        .b => |v| { u32 x = v; },\n"
+       "    }\n"
+       "}",
+       "union switch capture (param) OK");
+    ok("union M { u32 a; u32 b; }\n"
+       "void f() {\n"
+       "    M m;\n"
+       "    switch (m) {\n"
+       "        .a => |v| { u32 x = v; },\n"
+       "        .b => |v| { u32 x = v; },\n"
+       "    }\n"
+       "}",
+       "union switch capture (local var) OK");
 }
 
 /* ================================================================

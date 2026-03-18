@@ -193,6 +193,7 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     Type *effective = target;
     if (target->kind == TYPE_DISTINCT) effective = target->distinct.underlying;
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) return true;
+    if (expr->kind == NODE_INT_LIT && effective->kind == TYPE_BOOL) return true; /* 0/1 → bool */
     if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
     if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
@@ -415,6 +416,12 @@ static Type *check_expr(Checker *c, Node *node) {
     case NODE_BINARY: {
         Type *left = check_expr(c, node->binary.left);
         Type *right = check_expr(c, node->binary.right);
+
+        /* literal promotion: when one side is a literal and the other is
+         * a known type, the literal adopts the other side's type.
+         * This allows: i32 x = -5; i32 y = x + 10; (10 becomes i32) */
+        if (is_literal_compatible(node->binary.left, right)) left = right;
+        if (is_literal_compatible(node->binary.right, left)) right = left;
 
         switch (node->binary.op) {
         /* arithmetic: both numeric, result = common type */

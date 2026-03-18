@@ -959,6 +959,9 @@ static Type *check_expr(Checker *c, Node *node) {
             result = obj->array.inner;
         } else if (obj->kind == TYPE_SLICE) {
             result = obj->slice.inner;
+        } else if (obj->kind == TYPE_POINTER) {
+            /* pointer indexing: *T[i] → T (same as C pointer arithmetic) */
+            result = obj->pointer.inner;
         } else {
             checker_error(c, node->loc.line,
                 "cannot index type '%s'", type_name(obj));
@@ -1608,9 +1611,23 @@ static void register_decl(Checker *c, Node *node) {
         }
         Type *func_type = type_func_ptr(c->arena, params, pc, ret);
 
-        Symbol *sym = add_symbol(c, node->func_decl.name,
-                                 (uint32_t)node->func_decl.name_len,
-                                 func_type, node->loc.line);
+        /* check for forward declaration → definition pattern */
+        Symbol *existing = scope_lookup_local(c->current_scope,
+            node->func_decl.name, (uint32_t)node->func_decl.name_len);
+        Symbol *sym;
+        if (existing && existing->is_function &&
+            existing->func_node && !existing->func_node->func_decl.body &&
+            node->func_decl.body) {
+            /* forward decl exists, now providing the body — update */
+            sym = existing;
+            sym->func_node = node;
+            sym->type = func_type;
+            sym->line = node->loc.line;
+        } else {
+            sym = add_symbol(c, node->func_decl.name,
+                             (uint32_t)node->func_decl.name_len,
+                             func_type, node->loc.line);
+        }
         if (sym) {
             sym->is_function = true;
             sym->is_static = node->func_decl.is_static;

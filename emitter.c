@@ -554,6 +554,13 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
                 emit_type(e, t);
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT) {
+                /* named type passed as identifier (e.g. @size(MyStruct)) */
+                Symbol *sym = scope_lookup(e->checker->global_scope,
+                    node->intrinsic.args[0]->ident.name,
+                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                if (sym && sym->type) emit_type(e, sym->type);
             }
             emit(e, ")");
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
@@ -856,9 +863,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "return; }\n");
                 }
             } else if (node->var_decl.init->orelse.fallback_is_break) {
-                emit(e, "{ "); emit_defers(e); emit(e, "break; }\n");
+                emit(e, "{ "); emit_defers_from(e, e->loop_defer_base); emit(e, "break; }\n");
             } else {
-                emit(e, "{ "); emit_defers(e); emit(e, "continue; }\n");
+                emit(e, "{ "); emit_defers_from(e, e->loop_defer_base); emit(e, "continue; }\n");
             }
             emit_indent(e);
             emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
@@ -1004,7 +1011,9 @@ static void emit_stmt(Emitter *e, Node *node) {
         }
         break;
 
-    case NODE_FOR:
+    case NODE_FOR: {
+        int saved_loop_base = e->loop_defer_base;
+        e->loop_defer_base = e->defer_stack.count;
         emit_indent(e);
         emit(e, "for (");
         if (node->for_stmt.init) {
@@ -1027,15 +1036,21 @@ static void emit_stmt(Emitter *e, Node *node) {
         if (node->for_stmt.step) emit_expr(e, node->for_stmt.step);
         emit(e, ") ");
         emit_stmt(e, node->for_stmt.body);
+        e->loop_defer_base = saved_loop_base;
         break;
+    }
 
-    case NODE_WHILE:
+    case NODE_WHILE: {
+        int saved_loop_base = e->loop_defer_base;
+        e->loop_defer_base = e->defer_stack.count;
         emit_indent(e);
         emit(e, "while (");
         emit_expr(e, node->while_stmt.cond);
         emit(e, ") ");
         emit_stmt(e, node->while_stmt.body);
+        e->loop_defer_base = saved_loop_base;
         break;
+    }
 
     case NODE_RETURN:
         if (node->ret.expr) emit_bounds_checks(e, node->ret.expr);
@@ -1078,13 +1093,13 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_BREAK:
-        emit_defers(e); /* defers fire before break */
+        emit_defers_from(e, e->loop_defer_base); /* defers in loop scope only */
         emit_indent(e);
         emit(e, "break;\n");
         break;
 
     case NODE_CONTINUE:
-        emit_defers(e); /* defers fire before continue */
+        emit_defers_from(e, e->loop_defer_base); /* defers in loop scope only */
         emit_indent(e);
         emit(e, "continue;\n");
         break;

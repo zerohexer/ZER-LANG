@@ -1160,6 +1160,11 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
             memcpy(n->func_decl.params, params, param_count * sizeof(ParamDecl));
         }
 
+        /* forward declaration: u32 func(u32 n); — no body */
+        if (match(p, TOK_SEMICOLON)) {
+            n->func_decl.body = NULL;
+            return n;
+        }
         n->func_decl.body = parse_block(p);
         return n;
     }

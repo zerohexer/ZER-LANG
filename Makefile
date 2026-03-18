@@ -44,8 +44,11 @@ test_zercheck: test_zercheck.c $(LIB_SRCS)
 test_firmware: test_firmware_patterns.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+test_firmware2: test_firmware_patterns2.c $(LIB_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
+
 # ---- Run all tests ----
-check: test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware
+check: test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware test_firmware2
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -56,6 +59,7 @@ check: test_lexer test_parser test_parser_edge test_checker test_checker_full te
 	./test_emit
 	./test_zercheck
 	./test_firmware
+	./test_firmware2
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)
@@ -78,6 +82,7 @@ clean:
 	      test_emit test_emit.exe \
 	      test_zercheck test_zercheck.exe \
 	      test_firmware test_firmware.exe \
+	      test_firmware2 test_firmware2.exe \
 	      demo_lexer demo_lexer.exe \
 	      _zer_test_out.c _zer_test_out.exe _zer_test_out.o _zer_gcc_err.txt
 

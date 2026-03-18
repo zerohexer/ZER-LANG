@@ -482,6 +482,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 "cannot store result of get() — use inline");
         }
 
+        /* scope escape: storing &local in static/global variable */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.value->kind == NODE_UNARY &&
+            node->assign.value->unary.op == TOK_AMP &&
+            node->assign.value->unary.operand->kind == NODE_IDENT &&
+            node->assign.target->kind == NODE_IDENT) {
+            Symbol *target_sym = scope_lookup(c->current_scope,
+                node->assign.target->ident.name,
+                (uint32_t)node->assign.target->ident.name_len);
+            Symbol *val_sym = scope_lookup(c->current_scope,
+                node->assign.value->unary.operand->ident.name,
+                (uint32_t)node->assign.value->unary.operand->ident.name_len);
+            if (target_sym && val_sym &&
+                target_sym->is_static && !val_sym->is_static) {
+                checker_error(c, node->loc.line,
+                    "cannot store pointer to local '%.*s' in static variable '%.*s'",
+                    (int)val_sym->name_len, val_sym->name,
+                    (int)target_sym->name_len, target_sym->name);
+            }
+        }
+
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!type_equals(target, value) &&
@@ -613,6 +634,38 @@ static Type *check_expr(Checker *c, Node *node) {
                             i + 1, type_name(param), type_name(arg));
                     }
                 }
+
+                /* keep parameter validation: check call arguments */
+                if (node->call.callee->kind == NODE_IDENT) {
+                    Symbol *func_sym = scope_lookup(c->current_scope,
+                        node->call.callee->ident.name,
+                        (uint32_t)node->call.callee->ident.name_len);
+                    if (func_sym && func_sym->func_node &&
+                        func_sym->func_node->kind == NODE_FUNC_DECL) {
+                        Node *fdecl = func_sym->func_node;
+                        for (int i = 0; i < fdecl->func_decl.param_count &&
+                             i < node->call.arg_count; i++) {
+                            if (fdecl->func_decl.params[i].is_keep) {
+                                /* keep param: arg must be static/global, not local */
+                                Node *arg_node = node->call.args[i];
+                                if (arg_node->kind == NODE_UNARY &&
+                                    arg_node->unary.op == TOK_AMP &&
+                                    arg_node->unary.operand->kind == NODE_IDENT) {
+                                    Symbol *arg_sym = scope_lookup(c->current_scope,
+                                        arg_node->unary.operand->ident.name,
+                                        (uint32_t)arg_node->unary.operand->ident.name_len);
+                                    if (arg_sym && !arg_sym->is_static) {
+                                        checker_error(c, node->loc.line,
+                                            "argument %d: local variable '%.*s' cannot "
+                                            "satisfy 'keep' parameter — must be static or global",
+                                            i + 1,
+                                            (int)arg_sym->name_len, arg_sym->name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             result = callee_type->func_ptr.ret;
         } else {
@@ -695,8 +748,13 @@ static Type *check_expr(Checker *c, Node *node) {
                 break;
             }
             if (flen == 5 && memcmp(fname, "alloc", 5) == 0) {
-                /* Arena.alloc(T) → ?*T — type arg resolved later */
-                result = ty_void; /* TODO: resolve type argument */
+                /* Arena.alloc(T) → ?*T */
+                result = ty_void; /* resolved at call site with type arg */
+                break;
+            }
+            if (flen == 11 && memcmp(fname, "alloc_slice", 11) == 0) {
+                /* Arena.alloc_slice(T, n) → ?[]T */
+                result = ty_void; /* resolved at call site with type arg */
                 break;
             }
             if (flen == 5 && memcmp(fname, "reset", 5) == 0) {
@@ -758,9 +816,16 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
+        /* union: direct field access forbidden — must switch first */
+        if (obj->kind == TYPE_UNION) {
+            checker_error(c, node->loc.line,
+                "cannot access union variant '%.*s' directly — must use switch",
+                (int)flen, fname);
+            result = ty_void;
+            break;
+        }
+
         /* fallback: unresolved field access (might be UFCS) */
-        /* For now, don't error — many field accesses are on unresolved types
-         * in early compilation. Return void and let downstream catch it. */
         result = ty_void;
         break;
     }
@@ -916,8 +981,24 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
             }
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
+            /* @cast(T, val) — only valid between distinct typedefs with same underlying */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                if (result->kind != TYPE_DISTINCT) {
+                    checker_error(c, node->loc.line,
+                        "@cast target must be a distinct typedef");
+                }
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = typemap_get(node->intrinsic.args[0]);
+                    if (val_type && val_type->kind == TYPE_DISTINCT &&
+                        result->kind == TYPE_DISTINCT) {
+                        if (!type_equals(val_type->distinct.underlying,
+                                         result->distinct.underlying)) {
+                            checker_error(c, node->loc.line,
+                                "@cast between unrelated distinct types");
+                        }
+                    }
+                }
             } else {
                 result = ty_void;
             }
@@ -1195,6 +1276,21 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_RETURN: {
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
+
+            /* scope escape: return &local → error */
+            if (node->ret.expr->kind == NODE_UNARY &&
+                node->ret.expr->unary.op == TOK_AMP &&
+                node->ret.expr->unary.operand->kind == NODE_IDENT) {
+                const char *vname = node->ret.expr->unary.operand->ident.name;
+                uint32_t vlen = (uint32_t)node->ret.expr->unary.operand->ident.name_len;
+                Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
+                if (sym && !sym->is_static) {
+                    checker_error(c, node->loc.line,
+                        "cannot return pointer to local variable '%.*s'",
+                        (int)vlen, vname);
+                }
+            }
+
             if (c->current_func_ret) {
                 if (!type_equals(c->current_func_ret, ret_type) &&
                     !can_implicit_coerce(ret_type, c->current_func_ret) &&

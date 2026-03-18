@@ -408,6 +408,102 @@ static void test_ufcs(void) {
         "UFCS: task.run() → run(&task)");
 }
 
+/* ---- Audit tests: safety gaps and edge cases ---- */
+
+static void test_union_field_access(void) {
+    printf("[union field access]\n");
+    expect_error(
+        "union Msg { u32 sensor; u32 command; }\n"
+        "void f(Msg m) { u32 x = m.sensor; }",
+        "direct union field access rejected");
+}
+
+static void test_scope_escape(void) {
+    printf("[scope escape]\n");
+    expect_error(
+        "*u32 f() { u32 local = 5; return &local; }",
+        "return &local rejected");
+    expect_ok(
+        "*u32 f() { static u32 global = 5; return &global; }",
+        "return &static OK");
+}
+
+static void test_store_through(void) {
+    printf("[store-through validation]\n");
+    expect_error(
+        "static *u32 global_ptr;\n"
+        "void f() { u32 local = 5; global_ptr = &local; }",
+        "store &local in static rejected");
+}
+
+static void test_keep_validation(void) {
+    printf("[keep parameter validation]\n");
+    expect_error(
+        "void register_cb(keep *u32 ctx) { }\n"
+        "void f() { u32 local = 5; register_cb(&local); }",
+        "pass &local to keep param rejected");
+    expect_ok(
+        "void register_cb(keep *u32 ctx) { }\n"
+        "static u32 global_data = 5;\n"
+        "void f() { register_cb(&global_data); }",
+        "pass &static to keep param OK");
+}
+
+static void test_float_integer_mixing(void) {
+    printf("[float/integer mixing]\n");
+    expect_error(
+        "void f() { u32 a = 1; f32 b = 1.0; u32 c = a + b; }",
+        "u32 + f32 rejected");
+}
+
+static void test_compound_assignment_types(void) {
+    printf("[compound assignment type check]\n");
+    expect_ok(
+        "void f() { u32 x = 5; x += 1; }",
+        "u32 += u32 OK");
+    expect_ok(
+        "void f() { u32 x = 5; x <<= 2; }",
+        "u32 <<= u32 OK");
+}
+
+static void test_void_return_in_nonvoid(void) {
+    printf("[void return in non-void function]\n");
+    expect_error(
+        "u32 f() { return; }",
+        "bare return in u32 function rejected");
+    expect_ok(
+        "?u32 f() { return; }",
+        "bare return in ?u32 function OK (success for ?void)");
+}
+
+static void test_nested_optionals(void) {
+    printf("[nested optionals]\n");
+    expect_ok(
+        "void f() {\n"
+        "    ?u32 inner = 5;\n"
+        "    if (inner) |val| { u32 x = val; }\n"
+        "}\n",
+        "simple optional unwrap");
+}
+
+static void test_const_slice_coercion(void) {
+    printf("[const slice coercion]\n");
+    expect_ok(
+        "void read_only(const []u8 data) { }\n"
+        "void f() {\n"
+        "    u8[256] buf;\n"
+        "    read_only(buf);\n"
+        "}\n",
+        "mutable array → const slice");
+}
+
+static void test_signed_unsigned_rejection(void) {
+    printf("[signed/unsigned rejection]\n");
+    expect_error(
+        "void f() { i32 a = 5; u32 b = a; }",
+        "i32 → u32 implicit rejected");
+}
+
 /* ================================================================ */
 
 int main(void) {
@@ -438,6 +534,16 @@ int main(void) {
     test_distinct_typedef();
     test_exhaustive_switch();
     test_ufcs();
+    test_union_field_access();
+    test_scope_escape();
+    test_store_through();
+    test_keep_validation();
+    test_float_integer_mixing();
+    test_compound_assignment_types();
+    test_void_return_in_nonvoid();
+    test_nested_optionals();
+    test_const_slice_coercion();
+    test_signed_unsigned_rejection();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

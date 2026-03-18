@@ -334,10 +334,12 @@ static void emit_expr(Emitter *e, Node *node) {
                              sym->type->ring.count, tmp, tmp);
                         handled = true;
                     } else if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
-                        /* ring.pop() → optional */
-                        /* simplified: return data[tail] if count > 0 */
+                        /* ring.pop() → optional of elem type */
                         int tmp = e->temp_count++;
-                        emit(e, "({_zer_opt_u8 _zer_rp%d = {0}; "
+                        Type *opt_type = type_optional(e->arena, sym->type->ring.elem);
+                        emit(e, "({");
+                        emit_type(e, opt_type);
+                        emit(e, " _zer_rp%d = {0}; "
                              "if (%.*s.count > 0) { "
                              "_zer_rp%d.value = %.*s.data[%.*s.tail]; "
                              "_zer_rp%d.has_value = 1; "
@@ -390,10 +392,22 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_SLICE: {
-        /* buf[start..end] → pointer arithmetic on the underlying array/slice
-         * For now, emit array pointer + offset for simple array slicing */
-        /* TODO: full slice struct emission */
-        emit(e, "/* slice */(&(");
+        /* buf[start..end] → (_zer_slice_T){ &buf[start], end - start }
+         * buf[start..]   → (_zer_slice_T){ &buf[start], buf_len - start }
+         * buf[..end]     → (_zer_slice_T){ &buf[0], end } */
+        /* For simplicity, emit raw pointer + compute length inline */
+        Type *obj_type = checker_get_type(node->slice.object);
+        bool is_u8_slice = obj_type && (
+            (obj_type->kind == TYPE_ARRAY && obj_type->array.inner == ty_u8) ||
+            (obj_type->kind == TYPE_SLICE && obj_type->slice.inner == ty_u8));
+
+        if (is_u8_slice) {
+            emit(e, "((_zer_slice_u8){ ");
+        } else {
+            emit(e, "((struct { void* ptr; size_t len; }){ ");
+        }
+        /* ptr = &obj[start] */
+        emit(e, "&(");
         emit_expr(e, node->slice.object);
         emit(e, ")[");
         if (node->slice.start) {
@@ -401,7 +415,24 @@ static void emit_expr(Emitter *e, Node *node) {
         } else {
             emit(e, "0");
         }
-        emit(e, "])");
+        emit(e, "], ");
+        /* len = end - start */
+        if (node->slice.end && node->slice.start) {
+            emit(e, "(");
+            emit_expr(e, node->slice.end);
+            emit(e, ") - (");
+            emit_expr(e, node->slice.start);
+            emit(e, ")");
+        } else if (node->slice.end) {
+            emit_expr(e, node->slice.end);
+        } else if (node->slice.start && obj_type && obj_type->kind == TYPE_ARRAY) {
+            emit(e, "%u - (", obj_type->array.size);
+            emit_expr(e, node->slice.start);
+            emit(e, ")");
+        } else {
+            emit(e, "0 /* unknown len */");
+        }
+        emit(e, " })");
         break;
     }
 
@@ -503,16 +534,30 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
-            /* @saturate(val) → clamp to target type range — simplified as cast for now */
-            emit(e, "(");
+            /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
-                emit_type(e, t);
+                int tmp = e->temp_count++;
+                emit(e, "({__auto_type _zer_sat%d = ", tmp);
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "; ");
+                /* clamp: min(max(val, TYPE_MIN), TYPE_MAX) */
+                /* for unsigned targets, just clamp to max */
+                if (type_is_unsigned(t)) {
+                    int w = type_width(t);
+                    if (w == 8) emit(e, "_zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp);
+                    else if (w == 16) emit(e, "_zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp);
+                    else emit(e, "(");
+                    if (w > 16) { emit_type(e, t); emit(e, ")_zer_sat%d", tmp); }
+                } else {
+                    /* signed: just cast for now — full clamp needs min/max per type */
+                    emit(e, "("); emit_type(e, t); emit(e, ")_zer_sat%d", tmp);
+                }
+                emit(e, "; })");
+            } else {
+                emit(e, "0");
             }
-            emit(e, ")(");
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
             /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr) */
             emit(e, "(");
@@ -536,10 +581,52 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "__atomic_thread_fence(__ATOMIC_RELEASE)");
         } else if (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
+        } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
+            /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field)) */
+            emit(e, "((");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")((char*)(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ") - offsetof(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                /* need the struct type without pointer */
+                if (t->kind == TYPE_POINTER)
+                    emit_type(e, t->pointer.inner);
+                else
+                    emit_type(e, t);
+            }
+            emit(e, ", ");
+            if (node->intrinsic.arg_count > 1)
+                emit_expr(e, node->intrinsic.args[1]);
+            emit(e, ")))");
+        } else if (nlen == 6 && memcmp(name, "config", 6) == 0) {
+            /* @config(key, default) → emit the default value */
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[node->intrinsic.arg_count - 1]);
+            else
+                emit(e, "0");
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
-            /* @cstr(buf, slice) — copy slice to buf + null terminate */
-            /* simplified: emit memcpy + null terminator */
-            emit(e, "/* @cstr */0");
+            /* @cstr(buf, slice) → memcpy + null terminate */
+            /* emit inline: ({memcpy(buf, slice.ptr, slice.len); buf[slice.len]=0; buf;}) */
+            int tmp = e->temp_count++;
+            emit(e, "({__auto_type _zer_cs%d = ", tmp);
+            if (node->intrinsic.arg_count > 1)
+                emit_expr(e, node->intrinsic.args[1]);
+            emit(e, "; memcpy(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ", _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp);
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "[_zer_cs%d.len] = 0; (uint8_t*)", tmp);
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "; })");
         } else {
             emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
         }
@@ -982,9 +1069,17 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
             count = (uint32_t)tn->ring.count_expr->int_lit.value;
         return type_ring(e->arena, elem, count);
     }
-    case TYNODE_FUNC_PTR:
-        /* TODO: function pointer type emission */
-        return ty_void;
+    case TYNODE_FUNC_PTR: {
+        Type *ret = resolve_type_for_emit(e, tn->func_ptr.return_type);
+        uint32_t pc = (uint32_t)tn->func_ptr.param_count;
+        Type **params = NULL;
+        if (pc > 0) {
+            params = (Type **)arena_alloc(e->arena, pc * sizeof(Type *));
+            for (uint32_t i = 0; i < pc; i++)
+                params[i] = resolve_type_for_emit(e, tn->func_ptr.param_types[i]);
+        }
+        return type_func_ptr(e->arena, params, pc, ret);
+    }
     default:
         return ty_void;
     }
@@ -995,8 +1090,13 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
  * ================================================================ */
 
 static void emit_struct_decl(Emitter *e, Node *node) {
-    emit(e, "struct _zer_%.*s {\n",
-         (int)node->struct_decl.name_len, node->struct_decl.name);
+    if (node->struct_decl.is_packed) {
+        emit(e, "struct __attribute__((packed)) _zer_%.*s {\n",
+             (int)node->struct_decl.name_len, node->struct_decl.name);
+    } else {
+        emit(e, "struct _zer_%.*s {\n",
+             (int)node->struct_decl.name_len, node->struct_decl.name);
+    }
     e->indent++;
     for (int i = 0; i < node->struct_decl.field_count; i++) {
         FieldDecl *f = &node->struct_decl.fields[i];

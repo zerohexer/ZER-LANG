@@ -733,6 +733,46 @@ int main(void) {
         "}\n",
         "string literal as []u8 compiles");
 
+    printf("[packed struct]\n");
+    test_compile_only(
+        "packed struct Packet {\n"
+        "    u8 id;\n"
+        "    u16 value;\n"
+        "    u8 checksum;\n"
+        "}\n",
+        "packed struct emits __attribute__((packed))");
+
+    printf("[Ring(u32)]\n");
+    test_compile_and_run(
+        "Ring(u32, 16) buf;\n"
+        "u32 main() {\n"
+        "    buf.push(100);\n"
+        "    buf.push(200);\n"
+        "    u32 first = buf.pop() orelse 0;\n"
+        "    return first;\n"
+        "}\n",
+        100,
+        "Ring(u32) push/pop = 100");
+
+    printf("[@saturate]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 big = 1000;\n"
+        "    u8 small = @saturate(u8, big);\n"
+        "    return small;\n"
+        "}\n",
+        255,
+        "@saturate(u8, 1000) = 255");
+
+    printf("[@config]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 val = @config(\"MAX\", 42);\n"
+        "    return val;\n"
+        "}\n",
+        42,
+        "@config default value = 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

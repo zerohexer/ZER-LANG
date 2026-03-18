@@ -635,7 +635,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 for (uint32_t i = 0; i < callee_type->func_ptr.param_count; i++) {
                     Type *param = callee_type->func_ptr.params[i];
                     Type *arg = arg_types[i];
-                    if (!type_equals(param, arg) && !can_implicit_coerce(arg, param)) {
+                    if (!type_equals(param, arg) &&
+                        !can_implicit_coerce(arg, param) &&
+                        !is_literal_compatible(node->call.args[i], param)) {
                         checker_error(c, node->loc.line,
                             "argument %u: expected '%s', got '%s'",
                             i + 1, type_name(param), type_name(arg));

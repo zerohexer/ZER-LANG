@@ -33,6 +33,7 @@ typedef struct {
     Checker *checker;       /* for resolved type info */
     int indent;             /* current indentation level */
     int temp_count;         /* counter for temporary variable names */
+    Type *current_func_ret; /* return type of current function */
 } Emitter;
 
 /* ---- API ---- */

@@ -61,16 +61,39 @@ static void emit_type(Emitter *e, Type *t) {
             emit_type(e, t->optional.inner);
             break;
         }
-        /* ?T → struct { T value; uint8_t has_value; } */
-        emit(e, "struct { ");
-        emit_type(e, t->optional.inner);
-        emit(e, " value; uint8_t has_value; }");
+        /* ?T → named optional typedef */
+        switch (t->optional.inner->kind) {
+        case TYPE_VOID:  emit(e, "_zer_opt_void"); break;
+        case TYPE_U8:    emit(e, "_zer_opt_u8"); break;
+        case TYPE_U16:   emit(e, "_zer_opt_u16"); break;
+        case TYPE_U32:   emit(e, "_zer_opt_u32"); break;
+        case TYPE_U64:   emit(e, "_zer_opt_u64"); break;
+        case TYPE_I8:    emit(e, "_zer_opt_i8"); break;
+        case TYPE_I16:   emit(e, "_zer_opt_i16"); break;
+        case TYPE_I32:   emit(e, "_zer_opt_i32"); break;
+        case TYPE_I64:   emit(e, "_zer_opt_i64"); break;
+        case TYPE_USIZE: emit(e, "_zer_opt_usize"); break;
+        case TYPE_F32:   emit(e, "_zer_opt_f32"); break;
+        case TYPE_F64:   emit(e, "_zer_opt_f64"); break;
+        default:
+            /* fallback: anonymous struct */
+            emit(e, "struct { ");
+            emit_type(e, t->optional.inner);
+            emit(e, " value; uint8_t has_value; }");
+            break;
+        }
         break;
 
     case TYPE_SLICE:
-        emit(e, "struct { ");
-        emit_type(e, t->slice.inner);
-        emit(e, "* ptr; size_t len; }");
+        switch (t->slice.inner->kind) {
+        case TYPE_U8:  emit(e, "_zer_slice_u8"); break;
+        case TYPE_U32: emit(e, "_zer_slice_u32"); break;
+        default:
+            emit(e, "struct { ");
+            emit_type(e, t->slice.inner);
+            emit(e, "* ptr; size_t len; }");
+            break;
+        }
         break;
 
     case TYPE_ARRAY:
@@ -268,34 +291,48 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_SLICE: {
-        /* buf[start..end] → (struct{T*ptr;size_t len;}){obj.ptr+start, end-start}
-         * For arrays: (struct{T*ptr;size_t len;}){&arr[start], end-start} */
-        emit(e, "/* slice */ 0 /* TODO: slice codegen */");
+        /* buf[start..end] → pointer arithmetic on the underlying array/slice
+         * For now, emit array pointer + offset for simple array slicing */
+        /* TODO: full slice struct emission */
+        emit(e, "/* slice */(&(");
+        emit_expr(e, node->slice.object);
+        emit(e, ")[");
+        if (node->slice.start) {
+            emit_expr(e, node->slice.start);
+        } else {
+            emit(e, "0");
+        }
+        emit(e, "])");
         break;
     }
 
     case NODE_ORELSE: {
         /* ?T expr orelse fallback
          *
-         * For ?*T (pointer optional — null sentinel):
-         *   expr ? expr : fallback
-         *
-         * For ?T (value optional — struct with has_value):
-         *   ({__typeof__(expr) _tmp = expr; _tmp.has_value ? _tmp.value : fallback;})
-         *
-         * For orelse return/break/continue:
-         *   handled in statement context, not expression
+         * orelse value:  ({auto _t = expr; _t.has_value ? _t.value : fallback;})
+         * orelse return/break/continue: handled in var_decl emission (statement level)
          */
-        int tmp = e->temp_count++;
-        emit(e, "({__auto_type _zer_tmp%d = ", tmp);
-        emit_expr(e, node->orelse.expr);
-        emit(e, "; _zer_tmp%d.has_value ? _zer_tmp%d.value : ", tmp, tmp);
-        if (node->orelse.fallback) {
-            emit_expr(e, node->orelse.fallback);
+        if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
+            node->orelse.fallback_is_continue) {
+            /* flow control orelse — this should be emitted at statement level.
+             * If we reach here as an expression, just emit the value part. */
+            int tmp = e->temp_count++;
+            emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+            emit_expr(e, node->orelse.expr);
+            emit(e, "; _zer_tmp%d.value; })", tmp);
         } else {
-            emit(e, "0");
+            /* orelse with default value */
+            int tmp = e->temp_count++;
+            emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+            emit_expr(e, node->orelse.expr);
+            emit(e, "; _zer_tmp%d.has_value ? _zer_tmp%d.value : ", tmp, tmp);
+            if (node->orelse.fallback) {
+                emit_expr(e, node->orelse.fallback);
+            } else {
+                emit(e, "0");
+            }
+            emit(e, "; })");
         }
-        emit(e, "; })");
         break;
     }
 
@@ -428,14 +465,69 @@ static void emit_stmt(Emitter *e, Node *node) {
 
     case NODE_VAR_DECL: {
         Type *type = resolve_type_for_emit(e, node->var_decl.type);
+
+        /* Special case: u32 y = x orelse return;
+         * → { auto _t = x; if (!_t.has_value) return; }
+         *   uint32_t y = _t.value; */
+        if (node->var_decl.init && node->var_decl.init->kind == NODE_ORELSE &&
+            (node->var_decl.init->orelse.fallback_is_return ||
+             node->var_decl.init->orelse.fallback_is_break ||
+             node->var_decl.init->orelse.fallback_is_continue)) {
+            int tmp = e->temp_count++;
+            emit_indent(e);
+            emit(e, "__auto_type _zer_or%d = ", tmp);
+            emit_expr(e, node->var_decl.init->orelse.expr);
+            emit(e, ";\n");
+            emit_indent(e);
+            emit(e, "if (!_zer_or%d.has_value) ", tmp);
+            if (node->var_decl.init->orelse.fallback_is_return) {
+                /* return from function — need to return a value for non-void */
+                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                    emit(e, "return 0;\n");
+                } else {
+                    emit(e, "return;\n");
+                }
+            } else if (node->var_decl.init->orelse.fallback_is_break)
+                emit(e, "break;\n");
+            else
+                emit(e, "continue;\n");
+            emit_indent(e);
+            emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
+            emit(e, " = _zer_or%d.value;\n", tmp);
+            break;
+        }
+
+        /* Normal var decl */
         emit_indent(e);
         emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
         if (node->var_decl.init) {
-            emit(e, " = ");
-            emit_expr(e, node->var_decl.init);
+            /* Optional init: null → {0, 0}, value → {val, 1}
+             * But if init is a function call returning ?T, just assign directly */
+            if (type && type->kind == TYPE_OPTIONAL &&
+                type->optional.inner->kind != TYPE_POINTER) {
+                if (node->var_decl.init->kind == NODE_NULL_LIT) {
+                    emit(e, " = { 0, 0 }");
+                } else if (node->var_decl.init->kind == NODE_CALL ||
+                           node->var_decl.init->kind == NODE_ORELSE ||
+                           node->var_decl.init->kind == NODE_IDENT) {
+                    /* might already return ?T — assign directly */
+                    emit(e, " = ");
+                    emit_expr(e, node->var_decl.init);
+                } else {
+                    emit(e, " = (");
+                    emit_type(e, type);
+                    emit(e, "){ ");
+                    emit_expr(e, node->var_decl.init);
+                    emit(e, ", 1 }");
+                }
+            } else {
+                emit(e, " = ");
+                emit_expr(e, node->var_decl.init);
+            }
         } else {
-            /* ZER auto-zeroes: emit = {0} for structs/arrays, = 0 for scalars */
-            if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY)) {
+            /* ZER auto-zeroes */
+            if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
+                         type->kind == TYPE_OPTIONAL)) {
                 emit(e, " = {0}");
             } else {
                 emit(e, " = 0");
@@ -537,11 +629,37 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_RETURN:
         emit_indent(e);
         if (node->ret.expr) {
-            emit(e, "return ");
-            emit_expr(e, node->ret.expr);
-            emit(e, ";\n");
+            /* return null from ?T function → return {0, 0} */
+            if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
+                e->current_func_ret->optional.inner->kind != TYPE_POINTER &&
+                node->ret.expr->kind == NODE_NULL_LIT) {
+                emit(e, "return (");
+                emit_type(e, e->current_func_ret);
+                emit(e, "){ 0, 0 };\n");
+            }
+            /* return value from ?T function → return {value, 1} */
+            else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
+                     e->current_func_ret->optional.inner->kind != TYPE_POINTER &&
+                     node->ret.expr->kind != NODE_NULL_LIT) {
+                emit(e, "return (");
+                emit_type(e, e->current_func_ret);
+                emit(e, "){ ");
+                emit_expr(e, node->ret.expr);
+                emit(e, ", 1 };\n");
+            } else {
+                emit(e, "return ");
+                emit_expr(e, node->ret.expr);
+                emit(e, ";\n");
+            }
         } else {
-            emit(e, "return;\n");
+            /* bare return — for ?void, return {1} (success) */
+            if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL) {
+                emit(e, "return (");
+                emit_type(e, e->current_func_ret);
+                emit(e, "){ 0, 1 };\n");
+            } else {
+                emit(e, "return;\n");
+            }
         }
         break;
 
@@ -762,7 +880,9 @@ static void emit_func_decl(Emitter *e, Node *node) {
     emit(e, ") ");
 
     if (node->func_decl.body) {
+        e->current_func_ret = ret;
         emit_stmt(e, node->func_decl.body);
+        e->current_func_ret = NULL;
     } else {
         emit(e, ";\n");
     }
@@ -809,6 +929,28 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
     emit(e, "#include <string.h>\n");
+    emit(e, "\n");
+
+    /* ZER optional type definitions */
+    emit(e, "/* ZER optional types */\n");
+    emit(e, "typedef struct { uint8_t value; uint8_t has_value; } _zer_opt_u8;\n");
+    emit(e, "typedef struct { uint16_t value; uint8_t has_value; } _zer_opt_u16;\n");
+    emit(e, "typedef struct { uint32_t value; uint8_t has_value; } _zer_opt_u32;\n");
+    emit(e, "typedef struct { uint64_t value; uint8_t has_value; } _zer_opt_u64;\n");
+    emit(e, "typedef struct { int8_t value; uint8_t has_value; } _zer_opt_i8;\n");
+    emit(e, "typedef struct { int16_t value; uint8_t has_value; } _zer_opt_i16;\n");
+    emit(e, "typedef struct { int32_t value; uint8_t has_value; } _zer_opt_i32;\n");
+    emit(e, "typedef struct { int64_t value; uint8_t has_value; } _zer_opt_i64;\n");
+    emit(e, "typedef struct { size_t value; uint8_t has_value; } _zer_opt_usize;\n");
+    emit(e, "typedef struct { float value; uint8_t has_value; } _zer_opt_f32;\n");
+    emit(e, "typedef struct { double value; uint8_t has_value; } _zer_opt_f64;\n");
+    emit(e, "typedef struct { uint8_t has_value; } _zer_opt_void;\n");
+    emit(e, "\n");
+
+    /* ZER slice type */
+    emit(e, "/* ZER slice types */\n");
+    emit(e, "typedef struct { uint8_t* ptr; size_t len; } _zer_slice_u8;\n");
+    emit(e, "typedef struct { uint32_t* ptr; size_t len; } _zer_slice_u32;\n");
     emit(e, "\n");
 
     /* emit declarations */

@@ -488,6 +488,85 @@ static void test_intrinsic_size(void) {
         "@size(u32) = 4");
 }
 
+static void test_optional_type(void) {
+    printf("[optional type ?T]\n");
+    test_compile_and_run(
+        "?u32 maybe_five() {\n"
+        "    return 5;\n"
+        "}\n"
+        "?u32 nothing() {\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 a = maybe_five() orelse 0;\n"
+        "    u32 b = nothing() orelse 99;\n"
+        "    if (a == 5) { return b; }\n"
+        "    return 0;\n"
+        "}\n",
+        99,
+        "?u32 function returns value and null correctly");
+}
+
+static void test_orelse_value(void) {
+    printf("[orelse with value]\n");
+    test_compile_and_run(
+        "?u32 maybe() { return 42; }\n"
+        "?u32 nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    u32 a = maybe() orelse 0;\n"
+        "    u32 b = nothing() orelse 99;\n"
+        "    return a + b;\n"
+        "}\n",
+        141,
+        "42 orelse 0 + null orelse 99 = 141");
+}
+
+static void test_orelse_return(void) {
+    printf("[orelse return]\n");
+    test_compile_and_run(
+        "?u32 nothing() { return null; }\n"
+        "u32 try_get() {\n"
+        "    u32 val = nothing() orelse return;\n"
+        "    return val;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    try_get();\n"
+        "    return 1;\n"
+        "}\n",
+        1,
+        "orelse return exits function");
+}
+
+static void test_if_unwrap(void) {
+    printf("[if-unwrap with capture]\n");
+    test_compile_and_run(
+        "?u32 maybe() { return 42; }\n"
+        "?u32 nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    ?u32 a = maybe();\n"
+        "    u32 result = 0;\n"
+        "    if (a) |val| {\n"
+        "        result = val;\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        42,
+        "if (maybe) |val| captures 42");
+
+    test_compile_and_run(
+        "?u32 nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    ?u32 b = nothing();\n"
+        "    u32 result = 99;\n"
+        "    if (b) |val| {\n"
+        "        result = val;\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        99,
+        "if (null) |val| body skipped");
+}
+
 /* ================================================================ */
 
 int main(void) {
@@ -516,6 +595,10 @@ int main(void) {
     test_global_var();
     test_recursion();
     test_intrinsic_size();
+    test_optional_type();
+    test_orelse_value();
+    test_orelse_return();
+    test_if_unwrap();
 
     /* cleanup temp files */
     remove("_zer_test_out.c");

@@ -1,0 +1,8 @@
+import types_mod;
+
+u32 main() {
+    Config cfg;
+    cfg.baud = 42;
+    cfg.bits = 8;
+    return cfg.baud + cfg.bits;
+}

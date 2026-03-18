@@ -31,6 +31,7 @@ typedef struct {
     bool parsed;
     bool checking;          /* for circular import detection */
     bool checked;
+    bool emitted;           /* prevent double emission in diamond deps */
 } Module;
 
 typedef struct {
@@ -286,26 +287,85 @@ int main(int argc, char **argv) {
      * Simplest: emit preamble via main, then imported, then main body.
      * Since emit_file does both, just emit imported first with preamble,
      * then main without. But only first file needs preamble. */
-    if (cc.module_count > 1) {
-        /* Emit in reverse dependency order: deepest dependency first.
-         * Modules are added depth-first during recursive import resolution,
-         * so the last module in the array is the deepest dependency.
-         * Reverse order ensures C declaration-before-use. */
+    /* Emit with topological ordering: dependencies before dependents.
+     * Recursive: emit a module's imports first, then the module itself.
+     * emitted flag prevents double emission in diamond dependencies. */
+    {
+        /* first, emit preamble (only once) via a dummy main emit */
+        /* we need preamble before any module code */
+        /* hack: emit main file (which has preamble), but we also need
+         * imported modules before main's functions. So: emit preamble
+         * separately by emitting an empty-ish main first... */
+        /* Actually simpler: just emit preamble manually, then topo-order all */
+    }
+    /* For clean solution: emit main file (has preamble + runtime),
+     * then topo-emit imports, then... no, main needs imports first.
+     *
+     * Cleanest: build emit order array via DFS, emit first gets preamble. */
+    {
+        int emit_order[MAX_MODULES];
+        int emit_count = 0;
+        bool visited[MAX_MODULES];
+        memset(visited, 0, sizeof(visited));
 
-        /* deepest dependency gets preamble */
-        emit_file(&emitter, cc.modules[cc.module_count - 1].ast);
+        /* DFS to build topological order (post-order = dependencies first) */
+        /* We'll use an iterative approach with a stack */
+        int stack[MAX_MODULES * 2]; /* module index */
+        int stack_top = 0;
 
-        /* remaining imports in reverse order (no preamble) */
-        for (int i = cc.module_count - 2; i >= 1; i--) {
-            if (cc.modules[i].ast)
-                emit_file_no_preamble(&emitter, cc.modules[i].ast);
+        /* start from main (index 0) */
+        stack[stack_top++] = 0;
+        visited[0] = true;
+
+        /* Simple iterative DFS: push module, push its imports first */
+        /* Actually, let's just do a recursive helper inline */
+        /* Reset visited for proper DFS */
+        memset(visited, 0, sizeof(visited));
+
+        /* recursive topo sort via function pointer... or just inline loops.
+         * For simplicity, iterate: repeatedly find modules with all deps emitted */
+        bool progress = true;
+        while (progress && emit_count < cc.module_count) {
+            progress = false;
+            for (int i = 0; i < cc.module_count; i++) {
+                if (visited[i]) continue;
+                Module *m = &cc.modules[i];
+                if (!m->ast) { visited[i] = true; continue; }
+
+                /* check if all imports of this module are already emitted */
+                bool deps_met = true;
+                for (int j = 0; j < m->ast->file.decl_count; j++) {
+                    Node *d = m->ast->file.decls[j];
+                    if (d->kind == NODE_IMPORT) {
+                        /* find the imported module index */
+                        for (int k = 0; k < cc.module_count; k++) {
+                            if (strlen(cc.modules[k].name) == d->import.module_name_len &&
+                                memcmp(cc.modules[k].name, d->import.module_name,
+                                       d->import.module_name_len) == 0) {
+                                if (!visited[k]) { deps_met = false; break; }
+                            }
+                        }
+                        if (!deps_met) break;
+                    }
+                }
+
+                if (deps_met) {
+                    emit_order[emit_count++] = i;
+                    visited[i] = true;
+                    progress = true;
+                }
+            }
         }
 
-        /* main last (no preamble) */
-        emit_file_no_preamble(&emitter, main_mod->ast);
-    } else {
-        /* no imports: just emit main with preamble */
-        emit_file(&emitter, main_mod->ast);
+        /* emit in topological order: first module gets preamble */
+        for (int i = 0; i < emit_count; i++) {
+            Module *m = &cc.modules[emit_order[i]];
+            if (i == 0) {
+                emit_file(&emitter, m->ast);
+            } else {
+                emit_file_no_preamble(&emitter, m->ast);
+            }
+        }
     }
 
     fclose(out);

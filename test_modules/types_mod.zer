@@ -1,0 +1,1 @@
+struct Config { u32 baud; u32 bits; }

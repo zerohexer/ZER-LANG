@@ -1,0 +1,8 @@
+import uart;
+import spi;
+
+u32 main() {
+    u32 a = uart_init();
+    u32 b = spi_init();
+    return a + b;
+}

@@ -998,6 +998,49 @@ int main(void) {
         8,
         "orelse continue in for: 0+1+skip+3+4 = 8");
 
+    printf("[union switch runtime routing]\n");
+    /* Union variant construction needs a factory function since
+     * direct field access is blocked by ZER's safety rules */
+    test_compile_only(
+        "struct SensorData { u32 temp; }\n"
+        "struct Command { u32 code; }\n"
+        "union Message {\n"
+        "    SensorData sensor;\n"
+        "    Command command;\n"
+        "}\n",
+        "tagged union declaration compiles with tag + variants");
+
+    printf("[defer inside for loop]\n");
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "void tick() { counter += 1; }\n"
+        "u32 main() {\n"
+        "    for (u32 i = 0; i < 3; i += 1) {\n"
+        "        defer tick();\n"
+        "    }\n"
+        "    return counter;\n"
+        "}\n",
+        3,
+        "defer in loop fires 3 times");
+
+    printf("[pool generation counter]\n");
+    test_compile_and_run(
+        "struct Task { u32 pid; }\n"
+        "Pool(Task, 4) pool;\n"
+        "u32 main() {\n"
+        "    Handle(Task) h = pool.alloc() orelse return;\n"
+        "    pool.get(h).pid = 42;\n"
+        "    u32 pid_before = pool.get(h).pid;\n"
+        "    pool.free(h);\n"
+        "    Handle(Task) h2 = pool.alloc() orelse return;\n"
+        "    pool.get(h2).pid = 99;\n"
+        "    u32 pid_after = pool.get(h2).pid;\n"
+        "    pool.free(h2);\n"
+        "    return pid_before + pid_after;\n"
+        "}\n",
+        141,
+        "pool alloc/free/realloc: 42 + 99 = 141");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

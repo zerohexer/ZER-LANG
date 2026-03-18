@@ -47,5 +47,6 @@ typedef struct {
 /* ---- API ---- */
 void emitter_init(Emitter *e, FILE *out, Arena *arena, Checker *checker);
 void emit_file(Emitter *e, Node *file_node);
+void emit_file_no_preamble(Emitter *e, Node *file_node); /* for imported modules */
 
 #endif /* ZER_EMITTER_H */

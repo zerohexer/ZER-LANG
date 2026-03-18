@@ -1684,6 +1684,19 @@ Type *checker_get_type(Node *node) {
     return typemap_get(node);
 }
 
+void checker_register_file(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *decl = file_node->file.decls[i];
+        /* skip imports — they're handled by the compiler driver */
+        if (decl->kind == NODE_IMPORT) continue;
+        /* skip static (module-private) declarations */
+        if (decl->kind == NODE_FUNC_DECL && decl->func_decl.is_static) continue;
+        if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;
+        register_decl(c, decl);
+    }
+}
+
 bool checker_check(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return false;
 

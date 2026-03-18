@@ -1,0 +1,7 @@
+import math;
+
+u32 main() {
+    u32 sum = add(3, 4);
+    u32 product = multiply(5, 6);
+    return sum + product;
+}

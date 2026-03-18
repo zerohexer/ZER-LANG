@@ -31,6 +31,7 @@ typedef struct {
 
 /* ---- API ---- */
 void checker_init(Checker *c, Arena *arena, const char *file_name);
+void checker_register_file(Checker *c, Node *file_node); /* register declarations only */
 bool checker_check(Checker *c, Node *file_node);
 
 /* returns the resolved Type* for an expression node (set during check) */

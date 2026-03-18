@@ -1328,6 +1328,8 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
     emit(e, "#include <string.h>\n");
+    emit(e, "#include <stdio.h>\n");
+    emit(e, "#include <stdlib.h>\n");
     emit(e, "\n");
 
     /* ZER optional type definitions */
@@ -1374,13 +1376,26 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    return 0;\n");
     emit(e, "}\n\n");
 
+    /* ZER trap — called on safety violations (use-after-free, bounds, etc.) */
+    emit(e, "static void _zer_trap(const char *msg, const char *file, int line) {\n");
+    emit(e, "#ifdef __arm__\n");
+    emit(e, "    /* ARM embedded: infinite loop with breakpoint */\n");
+    emit(e, "    (void)msg; (void)file; (void)line;\n");
+    emit(e, "    __asm__ volatile(\"bkpt #0\");\n");
+    emit(e, "    for(;;) {}\n");
+    emit(e, "#else\n");
+    emit(e, "    /* Hosted: print diagnostic and abort */\n");
+    emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
+    emit(e, "    abort();\n");
+    emit(e, "#endif\n");
+    emit(e, "}\n\n");
+
     emit(e, "static inline void *_zer_pool_get(void *slots, uint16_t *gen, uint8_t *used, "
             "size_t slot_size, uint32_t handle, uint32_t capacity) {\n");
     emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
     emit(e, "    uint16_t h_gen = (uint16_t)(handle >> 16);\n");
     emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen) {\n");
-    emit(e, "        /* generation mismatch or invalid — trap */\n");
-    emit(e, "        return (void*)0; /* TODO: trap */\n");
+    emit(e, "        _zer_trap(\"use-after-free: handle generation mismatch\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
     emit(e, "    return (char*)slots + idx * slot_size;\n");
     emit(e, "}\n\n");
@@ -1500,6 +1515,21 @@ void emit_file(Emitter *e, Node *file_node) {
         default:
             emit(e, "/* unhandled decl %s */\n\n", node_kind_name(decl->kind));
             break;
+        }
+    }
+}
+
+void emit_file_no_preamble(Emitter *e, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    emit(e, "\n/* --- imported module --- */\n\n");
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *decl = file_node->file.decls[i];
+        if (decl->kind == NODE_IMPORT) continue;
+        switch (decl->kind) {
+        case NODE_STRUCT_DECL: emit_struct_decl(e, decl); break;
+        case NODE_FUNC_DECL:   emit_func_decl(e, decl); break;
+        case NODE_GLOBAL_VAR:  emit_global_var(e, decl); break;
+        default: break;
         }
     }
 }

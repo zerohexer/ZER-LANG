@@ -941,6 +941,63 @@ int main(void) {
         7,
         "while(true) break at 7");
 
+    printf("[mutable pointer capture |*val|]\n");
+    test_compile_and_run(
+        "?u32 get_val() { return 10; }\n"
+        "u32 main() {\n"
+        "    ?u32 x = get_val();\n"
+        "    if (x) |*v| {\n"
+        "        *v = 99;\n"
+        "        return *v;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        99,
+        "|*val| pointer capture allows mutation");
+
+    printf("[multi-value switch arms]\n");
+    test_compile_and_run(
+        "void noop() { }\n"
+        "u32 main() {\n"
+        "    u32 x = 3;\n"
+        "    u32 result = 0;\n"
+        "    switch (x) {\n"
+        "        0, 1, 2 => result = 10,\n"
+        "        3, 4 => result = 20,\n"
+        "        default => result = 99,\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        20,
+        "3,4 => 20 multi-value arm");
+
+    printf("[@offset]\n");
+    test_compile_and_run(
+        "struct Data { u32 a; u32 b; u32 c; }\n"
+        "usize main() {\n"
+        "    usize off = @offset(Data, b);\n"
+        "    return off;\n"
+        "}\n",
+        4,
+        "@offset(Data, b) = 4 bytes");
+
+    printf("[orelse continue in for]\n");
+    test_compile_and_run(
+        "?u32 maybe(u32 i) {\n"
+        "    if (i == 2) { return null; }\n"
+        "    return i;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 sum = 0;\n"
+        "    for (u32 i = 0; i < 5; i += 1) {\n"
+        "        u32 val = maybe(i) orelse continue;\n"
+        "        sum += val;\n"
+        "    }\n"
+        "    return sum;\n"
+        "}\n",
+        8,
+        "orelse continue in for: 0+1+skip+3+4 = 8");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

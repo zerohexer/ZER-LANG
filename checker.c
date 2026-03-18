@@ -1002,13 +1002,19 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Intrinsic ---- */
     case NODE_INTRINSIC: {
-        /* type-check arguments */
-        for (int i = 0; i < node->intrinsic.arg_count; i++) {
-            check_expr(c, node->intrinsic.args[i]);
-        }
-        /* return type depends on which intrinsic */
         const char *name = node->intrinsic.name;
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
+
+        /* type-check arguments — skip field name args for @offset, @container */
+        bool has_field_arg = (nlen == 6 && memcmp(name, "offset", 6) == 0) ||
+                             (nlen == 9 && memcmp(name, "container", 9) == 0);
+        for (int i = 0; i < node->intrinsic.arg_count; i++) {
+            if (has_field_arg && i == node->intrinsic.arg_count - 1) {
+                /* last arg is a field name — don't look up as variable */
+                continue;
+            }
+            check_expr(c, node->intrinsic.args[i]);
+        }
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
             result = ty_usize;

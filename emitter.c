@@ -520,15 +520,22 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             emit(e, ")");
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
-            /* @offset(T, field) → offsetof(struct _zer_T, field) */
+            /* @offset(T, field) → offsetof(struct _zer_T, field)
+             * Parser puts T as type_arg if it's a keyword type,
+             * or as args[0] if it's a named type (identifier). */
             emit(e, "offsetof(");
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
                 emit_type(e, t);
-            }
-            emit(e, ", ");
-            if (node->intrinsic.arg_count > 0) {
+                emit(e, ", ");
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+            } else if (node->intrinsic.arg_count >= 2) {
+                /* args[0] = type name, args[1] = field name */
+                emit(e, "struct _zer_");
                 emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", ");
+                emit_expr(e, node->intrinsic.args[1]);
             }
             emit(e, ")");
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
@@ -828,6 +835,11 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit_indent(e);
             if (is_ptr_opt) {
                 emit(e, "__auto_type %.*s = _zer_uw%d;\n",
+                     (int)node->if_stmt.capture_name_len,
+                     node->if_stmt.capture_name, tmp);
+            } else if (node->if_stmt.capture_is_ptr) {
+                /* |*val| → pointer to the optional's value field */
+                emit(e, "__auto_type %.*s = &_zer_uw%d.value;\n",
                      (int)node->if_stmt.capture_name_len,
                      node->if_stmt.capture_name, tmp);
             } else {

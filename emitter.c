@@ -349,9 +349,11 @@ static void emit_expr(Emitter *e, Node *node) {
                     int rlen = (int)obj_node->ident.name_len;
 
                     if (mlen == 4 && memcmp(mname, "push", 4) == 0) {
-                        /* ring.push(val) */
+                        /* ring.push(val) — cast to correct element type */
                         int tmp = e->temp_count++;
-                        emit(e, "({__auto_type _zer_rpv%d = ", tmp);
+                        emit(e, "({");
+                        emit_type(e, sym->type->ring.elem);
+                        emit(e, " _zer_rpv%d = ", tmp);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
                         emit(e, "; _zer_ring_push(%.*s.data, &%.*s.head, "
@@ -399,8 +401,15 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_FIELD: {
-        /* check if object is a pointer → use -> instead of . */
+        /* check if object is an enum type → emit _ZER_EnumName_variant */
         Type *obj_type = checker_get_type(node->field.object);
+        if (obj_type && obj_type->kind == TYPE_ENUM) {
+            emit(e, "_ZER_%.*s_%.*s",
+                 (int)obj_type->enum_type.name_len, obj_type->enum_type.name,
+                 (int)node->field.field_name_len, node->field.field_name);
+            break;
+        }
+        /* check if object is a pointer → use -> instead of . */
         emit_expr(e, node->field.object);
         if (obj_type && obj_type->kind == TYPE_POINTER) {
             emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
@@ -773,10 +782,16 @@ static void emit_bounds_checks(Emitter *e, Node *node) {
 }
 
 /* emit all accumulated defers in reverse order */
-static void emit_defers(Emitter *e) {
-    for (int i = e->defer_stack.count - 1; i >= 0; i--) {
+/* emit defers from current count down to 'base' (exclusive) */
+static void emit_defers_from(Emitter *e, int base) {
+    for (int i = e->defer_stack.count - 1; i >= base; i--) {
         emit_stmt(e, e->defer_stack.stmts[i]);
     }
+}
+
+/* emit ALL defers (for return — must fire every scope's defers) */
+static void emit_defers(Emitter *e) {
+    emit_defers_from(e, 0);
 }
 
 static void emit_stmt(Emitter *e, Node *node) {
@@ -784,23 +799,22 @@ static void emit_stmt(Emitter *e, Node *node) {
 
     switch (node->kind) {
     case NODE_BLOCK: {
-        /* save defer state for this block scope */
-        DeferStack saved_defers = e->defer_stack;
-        e->defer_stack.count = 0;
+        /* track where this block's defers start in the stack */
+        int defer_base = e->defer_stack.count;
 
         emit(e, "{\n");
         e->indent++;
         for (int i = 0; i < node->block.stmt_count; i++) {
             emit_stmt(e, node->block.stmts[i]);
         }
-        /* emit accumulated defers in reverse at block end */
-        emit_defers(e);
+        /* emit only THIS block's defers at block end */
+        emit_defers_from(e, defer_base);
         e->indent--;
         emit_indent(e);
         emit(e, "}\n");
 
-        /* restore parent defer state */
-        e->defer_stack = saved_defers;
+        /* pop this block's defers off the stack */
+        e->defer_stack.count = defer_base;
         break;
     }
 
@@ -835,10 +849,11 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "if (!_zer_or%d.has_value) ", tmp);
             }
             if (node->var_decl.init->orelse.fallback_is_return) {
+                emit(e, "{ "); emit_defers(e);
                 if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                    emit(e, "return 0;\n");
+                    emit(e, "return 0; }\n");
                 } else {
-                    emit(e, "return;\n");
+                    emit(e, "return; }\n");
                 }
             } else if (node->var_decl.init->orelse.fallback_is_break) {
                 emit(e, "{ "); emit_defers(e); emit(e, "break; }\n");
@@ -1131,6 +1146,18 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "_zer_sw%d._tag == _ZER_%.*s_TAG_%.*s",
                          sw_tmp,
                          (int)sw_type->union_type.name_len, sw_type->union_type.name,
+                         (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
+                }
+                emit(e, ") ");
+            } else if (!is_union_switch && arm->is_enum_dot && sw_type && sw_type->kind == TYPE_ENUM) {
+                /* enum switch: .idle => ... → if (_sw == _ZER_State_idle) */
+                if (i > 0) emit(e, "else ");
+                emit(e, "if (");
+                for (int j = 0; j < arm->value_count; j++) {
+                    if (j > 0) emit(e, " || ");
+                    emit(e, "_zer_sw%d == _ZER_%.*s_%.*s",
+                         sw_tmp,
+                         (int)sw_type->enum_type.name_len, sw_type->enum_type.name,
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
                 }
                 emit(e, ") ");

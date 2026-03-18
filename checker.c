@@ -893,6 +893,26 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
+        /* enum: State.idle → returns the enum type */
+        if (obj->kind == TYPE_ENUM) {
+            bool found = false;
+            for (uint32_t i = 0; i < obj->enum_type.variant_count; i++) {
+                SEVariant *v = &obj->enum_type.variants[i];
+                if (v->name_len == flen && memcmp(v->name, fname, flen) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                checker_error(c, node->loc.line,
+                    "no variant '%.*s' in enum '%.*s'",
+                    (int)flen, fname,
+                    (int)obj->enum_type.name_len, obj->enum_type.name);
+            }
+            result = obj; /* State.idle has type State */
+            break;
+        }
+
         /* union: writing (assignment LHS) is allowed — sets the active variant.
          * Reading (any other context) requires switch. */
         if (obj->kind == TYPE_UNION) {

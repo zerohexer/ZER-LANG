@@ -1,5 +1,28 @@
 # CLAUDE.md
 
+## First Session Workflow
+
+When starting a new session or lacking context:
+
+1. Read these files FIRST to understand the project:
+   - `CLAUDE.md` (this file) — rules and conventions
+   - `README.md` — what ZER is, how to build/test
+   - `ZER-LANG.md` §26 (Compiler Build Order) — what's done, what's next
+2. Read the relevant header files for whatever you're working on:
+   - `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
+3. Run `make check` to verify everything passes before making changes
+4. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
+
+## Project Architecture
+
+- **zerc** = the compiler binary (`zerc_main.c` + all lib sources)
+- **zer-lsp** = LSP server (`zer_lsp.c` + all lib sources)
+- Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`
+- Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`
+- E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
+- On Windows: use `.\\_zer_test_out.exe` (backslash) to run test binaries from `system()` calls
+- Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
+
 ## Git Rules
 
 - NEVER add Co-Authored-By or any Claude/AI attribution to commits

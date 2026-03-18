@@ -471,6 +471,8 @@ static Node *parse_primary(Parser *p) {
 
 /* ---- Unary expressions ---- */
 
+static Node *parse_postfix(Parser *p, Node *left); /* forward decl */
+
 static Node *parse_unary(Parser *p) {
     /* prefix: - ! ~ * & */
     if (match(p, TOK_MINUS) || match(p, TOK_BANG) || match(p, TOK_TILDE) ||
@@ -481,7 +483,8 @@ static Node *parse_unary(Parser *p) {
         n->unary.operand = parse_unary(p);
         return n;
     }
-    return parse_primary(p);
+    /* parse_primary then postfix (. [] () ) so that &x.field = &(x.field) */
+    return parse_postfix(p, parse_primary(p));
 }
 
 /* ---- Postfix: calls, field access, indexing, slicing ---- */

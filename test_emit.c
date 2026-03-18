@@ -642,6 +642,97 @@ int main(void) {
         42,
         "ring push 42,99 → pop = 42");
 
+    printf("[optional pointer ?*T]\n");
+    test_compile_and_run(
+        "struct Task { u32 pid; }\n"
+        "Task global_task;\n"
+        "?*Task find(bool exists) {\n"
+        "    global_task.pid = 77;\n"
+        "    if (exists) { return &global_task; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    *Task t = find(true) orelse return;\n"
+        "    return t.pid;\n"
+        "}\n",
+        77,
+        "?*Task find → orelse return → t.pid = 77");
+
+    test_compile_and_run(
+        "struct Task { u32 pid; }\n"
+        "?*Task nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    *Task t = nothing() orelse return;\n"
+        "    return t.pid;\n"
+        "}\n",
+        0,
+        "?*Task null → orelse return exits with 0");
+
+    printf("[intrinsic @truncate]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 big = 0x1234;\n"
+        "    u8 small = @truncate(u8, big);\n"
+        "    return small;\n"
+        "}\n",
+        0x34,
+        "@truncate(u8, 0x1234) = 0x34");
+
+    printf("[intrinsic @barrier]\n");
+    test_compile_only(
+        "void f() {\n"
+        "    @barrier();\n"
+        "    @barrier_store();\n"
+        "    @barrier_load();\n"
+        "}\n",
+        "barrier intrinsics compile");
+
+    printf("[static local variables]\n");
+    test_compile_and_run(
+        "u32 counter() {\n"
+        "    static u32 count = 0;\n"
+        "    count += 1;\n"
+        "    return count;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    counter();\n"
+        "    counter();\n"
+        "    return counter();\n"
+        "}\n",
+        3,
+        "static local retains value across calls");
+
+    printf("[division and modulo]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 a = 17;\n"
+        "    u32 b = a / 5;\n"
+        "    u32 c = a % 5;\n"
+        "    return b + c;\n"
+        "}\n",
+        5,
+        "17/5=3, 17%%5=2, 3+2=5");
+
+    printf("[nested struct]\n");
+    test_compile_and_run(
+        "struct Inner { u32 val; }\n"
+        "struct Outer { Inner inner; u32 extra; }\n"
+        "u32 main() {\n"
+        "    Outer o;\n"
+        "    o.inner.val = 10;\n"
+        "    o.extra = 20;\n"
+        "    return o.inner.val + o.extra;\n"
+        "}\n",
+        30,
+        "nested struct field access = 30");
+
+    printf("[string literal]\n");
+    test_compile_only(
+        "void f() {\n"
+        "    []u8 msg = \"hello\";\n"
+        "}\n",
+        "string literal as []u8 compiles");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

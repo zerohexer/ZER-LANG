@@ -179,9 +179,8 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_STRING_LIT:
-        /* emit as compound literal slice: (struct{uint8_t*ptr;size_t len;}){...} */
-        /* for now, emit as C string literal — used in contexts expecting []u8 */
-        emit(e, "((struct { uint8_t* ptr; size_t len; }){ (uint8_t*)\"%.*s\", %zu })",
+        /* emit as _zer_slice_u8 compound literal */
+        emit(e, "((_zer_slice_u8){ (uint8_t*)\"%.*s\", %zu })",
              (int)node->string_lit.length, node->string_lit.value,
              node->string_lit.length);
         break;
@@ -298,8 +297,8 @@ static void emit_expr(Emitter *e, Node *node) {
                              pool->pool.count, tmp, tmp, tmp);
                         handled = true;
                     } else if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
-                        /* pool.get(h) → cast _zer_pool_get result to elem type */
-                        emit(e, "(*(");
+                        /* pool.get(h) → return pointer to slot (not deref) */
+                        emit(e, "((");
                         emit_type(e, pool->pool.elem);
                         emit(e, "*)_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
                              "sizeof(%.*s.slots[0]), ",
@@ -371,10 +370,17 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
     }
 
-    case NODE_FIELD:
+    case NODE_FIELD: {
+        /* check if object is a pointer → use -> instead of . */
+        Type *obj_type = checker_get_type(node->field.object);
         emit_expr(e, node->field.object);
-        emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
+        if (obj_type && obj_type->kind == TYPE_POINTER) {
+            emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
+        } else {
+            emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
+        }
         break;
+    }
 
     case NODE_INDEX:
         emit_expr(e, node->index_expr.object);
@@ -400,25 +406,34 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_ORELSE: {
-        /* ?T expr orelse fallback
-         *
-         * orelse value:  ({auto _t = expr; _t.has_value ? _t.value : fallback;})
-         * orelse return/break/continue: handled in var_decl emission (statement level)
-         */
+        /* Detect if the orelse expression is a pointer optional (?*T)
+         * by checking the type from the checker's type map.
+         * ?*T uses null sentinel → simple ternary
+         * ?T uses struct → .has_value/.value */
+        Type *orelse_type = checker_get_type(node->orelse.expr);
+        bool is_ptr_optional = orelse_type &&
+            orelse_type->kind == TYPE_OPTIONAL &&
+            orelse_type->optional.inner->kind == TYPE_POINTER;
+
         if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
-            /* flow control orelse — this should be emitted at statement level.
-             * If we reach here as an expression, just emit the value part. */
             int tmp = e->temp_count++;
             emit(e, "({__auto_type _zer_tmp%d = ", tmp);
             emit_expr(e, node->orelse.expr);
-            emit(e, "; _zer_tmp%d.value; })", tmp);
+            if (is_ptr_optional) {
+                emit(e, "; _zer_tmp%d; })", tmp);
+            } else {
+                emit(e, "; _zer_tmp%d.value; })", tmp);
+            }
         } else {
-            /* orelse with default value */
             int tmp = e->temp_count++;
             emit(e, "({__auto_type _zer_tmp%d = ", tmp);
             emit_expr(e, node->orelse.expr);
-            emit(e, "; _zer_tmp%d.has_value ? _zer_tmp%d.value : ", tmp, tmp);
+            if (is_ptr_optional) {
+                emit(e, "; _zer_tmp%d ? _zer_tmp%d : ", tmp, tmp);
+            } else {
+                emit(e, "; _zer_tmp%d.has_value ? _zer_tmp%d.value : ", tmp, tmp);
+            }
             if (node->orelse.fallback) {
                 emit_expr(e, node->orelse.fallback);
             } else {
@@ -583,15 +598,23 @@ static void emit_stmt(Emitter *e, Node *node) {
             (node->var_decl.init->orelse.fallback_is_return ||
              node->var_decl.init->orelse.fallback_is_break ||
              node->var_decl.init->orelse.fallback_is_continue)) {
+            Type *or_expr_type = checker_get_type(node->var_decl.init->orelse.expr);
+            bool or_is_ptr = or_expr_type &&
+                or_expr_type->kind == TYPE_OPTIONAL &&
+                or_expr_type->optional.inner->kind == TYPE_POINTER;
+
             int tmp = e->temp_count++;
             emit_indent(e);
             emit(e, "__auto_type _zer_or%d = ", tmp);
             emit_expr(e, node->var_decl.init->orelse.expr);
             emit(e, ";\n");
             emit_indent(e);
-            emit(e, "if (!_zer_or%d.has_value) ", tmp);
+            if (or_is_ptr) {
+                emit(e, "if (!_zer_or%d) ", tmp);
+            } else {
+                emit(e, "if (!_zer_or%d.has_value) ", tmp);
+            }
             if (node->var_decl.init->orelse.fallback_is_return) {
-                /* return from function — need to return a value for non-void */
                 if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                     emit(e, "return 0;\n");
                 } else {
@@ -603,12 +626,17 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "continue;\n");
             emit_indent(e);
             emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
-            emit(e, " = _zer_or%d.value;\n", tmp);
+            if (or_is_ptr) {
+                emit(e, " = _zer_or%d;\n", tmp);
+            } else {
+                emit(e, " = _zer_or%d.value;\n", tmp);
+            }
             break;
         }
 
         /* Normal var decl */
         emit_indent(e);
+        if (node->var_decl.is_static) emit(e, "static ");
         emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
         if (node->var_decl.init) {
             /* Optional init: null → {0, 0}, value → {val, 1}
@@ -650,9 +678,14 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_IF:
         if (node->if_stmt.capture_name) {
             /* if-unwrap: if (maybe) |val| { ... }
-             * → { auto _tmp = maybe; if (_tmp.has_value) { T val = _tmp.value; ... } }
-             * For ?*T: if (_tmp != NULL) { *T val = _tmp; ... } */
+             * ?T (struct): { auto _tmp = maybe; if (_tmp.has_value) { T val = _tmp.value; ... } }
+             * ?*T (ptr):   { auto _tmp = maybe; if (_tmp) { *T val = _tmp; ... } } */
             int tmp = e->temp_count++;
+            Type *cond_type = checker_get_type(node->if_stmt.cond);
+            bool is_ptr_opt = cond_type &&
+                cond_type->kind == TYPE_OPTIONAL &&
+                cond_type->optional.inner->kind == TYPE_POINTER;
+
             emit_indent(e);
             emit(e, "{\n");
             e->indent++;
@@ -661,14 +694,24 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit_expr(e, node->if_stmt.cond);
             emit(e, ";\n");
             emit_indent(e);
-            emit(e, "if (_zer_uw%d.has_value) ", tmp);
+            if (is_ptr_opt) {
+                emit(e, "if (_zer_uw%d) ", tmp);
+            } else {
+                emit(e, "if (_zer_uw%d.has_value) ", tmp);
+            }
             /* inject capture variable into the then body */
             emit(e, "{\n");
             e->indent++;
             emit_indent(e);
-            emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
-                 (int)node->if_stmt.capture_name_len,
-                 node->if_stmt.capture_name, tmp);
+            if (is_ptr_opt) {
+                emit(e, "__auto_type %.*s = _zer_uw%d;\n",
+                     (int)node->if_stmt.capture_name_len,
+                     node->if_stmt.capture_name, tmp);
+            } else {
+                emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
+                     (int)node->if_stmt.capture_name_len,
+                     node->if_stmt.capture_name, tmp);
+            }
             /* emit then body contents (unwrap the block) */
             if (node->if_stmt.then_body->kind == NODE_BLOCK) {
                 for (int i = 0; i < node->if_stmt.then_body->block.stmt_count; i++) {

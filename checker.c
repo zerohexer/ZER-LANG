@@ -565,8 +565,10 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *val_sym = scope_lookup(c->current_scope,
                 node->assign.value->unary.operand->ident.name,
                 (uint32_t)node->assign.value->unary.operand->ident.name_len);
+            bool val_is_global = val_sym &&
+                scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
             if (target_sym && val_sym &&
-                target_sym->is_static && !val_sym->is_static) {
+                target_sym->is_static && !val_sym->is_static && !val_is_global) {
                 checker_error(c, node->loc.line,
                     "cannot store pointer to local '%.*s' in static variable '%.*s'",
                     (int)val_sym->name_len, val_sym->name,
@@ -1360,7 +1362,9 @@ static void check_stmt(Checker *c, Node *node) {
                 const char *vname = node->ret.expr->unary.operand->ident.name;
                 uint32_t vlen = (uint32_t)node->ret.expr->unary.operand->ident.name_len;
                 Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
-                if (sym && !sym->is_static) {
+                /* safe if: static, or in global scope */
+                bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                if (sym && !sym->is_static && !is_global) {
                     checker_error(c, node->loc.line,
                         "cannot return pointer to local variable '%.*s'",
                         (int)vlen, vname);
@@ -1638,6 +1642,10 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
 
     /* init non-storable tracking */
     non_storable_init(arena);
+}
+
+Type *checker_get_type(Node *node) {
+    return typemap_get(node);
 }
 
 bool checker_check(Checker *c, Node *file_node) {

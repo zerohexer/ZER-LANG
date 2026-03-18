@@ -33,6 +33,6 @@ void checker_init(Checker *c, Arena *arena, const char *file_name);
 bool checker_check(Checker *c, Node *file_node);
 
 /* returns the resolved Type* for an expression node (set during check) */
-/* stored in a side table keyed by node pointer */
+Type *checker_get_type(Node *node);
 
 #endif /* ZER_CHECKER_H */

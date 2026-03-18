@@ -53,13 +53,17 @@ check: test_lexer test_parser test_parser_edge test_checker test_checker_full te
 	./test_emit
 	./test_zercheck
 
+# ---- LSP server ----
+zer-lsp: zer_lsp.c $(LIB_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
+
 # ---- Old demo (lexer only) ----
 demo_lexer: main.c lexer.c
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Clean ----
 clean:
-	rm -f zerc zerc.exe *.o \
+	rm -f zerc zerc.exe zer-lsp zer-lsp.exe *.o \
 	      test_lexer test_lexer.exe \
 	      test_parser test_parser.exe \
 	      test_parser_edge test_parser_edge.exe \

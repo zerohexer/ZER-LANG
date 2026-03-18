@@ -1,0 +1,191 @@
+{
+    "name": "ZER",
+    "scopeName": "source.zer",
+    "fileTypes": ["zer"],
+    "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#characters" },
+        { "include": "#numbers" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#builtins" },
+        { "include": "#intrinsics" },
+        { "include": "#constants" },
+        { "include": "#operators" },
+        { "include": "#functions" },
+        { "include": "#identifiers" }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.zer",
+                    "match": "//.*$"
+                },
+                {
+                    "name": "comment.block.zer",
+                    "begin": "/\\*",
+                    "end": "\\*/",
+                    "patterns": [
+                        {
+                            "name": "comment.block.zer",
+                            "begin": "/\\*",
+                            "end": "\\*/"
+                        }
+                    ]
+                }
+            ]
+        },
+        "strings": {
+            "patterns": [
+                {
+                    "name": "string.quoted.double.zer",
+                    "begin": "\"",
+                    "end": "\"",
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.zer",
+                            "match": "\\\\[nrt\\\\\"0]|\\\\x[0-9a-fA-F]{2}"
+                        }
+                    ]
+                }
+            ]
+        },
+        "characters": {
+            "patterns": [
+                {
+                    "name": "string.quoted.single.zer",
+                    "match": "'(?:[^'\\\\]|\\\\[nrt\\\\'0]|\\\\x[0-9a-fA-F]{2})'"
+                }
+            ]
+        },
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.hex.zer",
+                    "match": "\\b0x[0-9a-fA-F_]+\\b"
+                },
+                {
+                    "name": "constant.numeric.binary.zer",
+                    "match": "\\b0b[01_]+\\b"
+                },
+                {
+                    "name": "constant.numeric.float.zer",
+                    "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*\\b"
+                },
+                {
+                    "name": "constant.numeric.integer.zer",
+                    "match": "\\b[0-9][0-9_]*\\b"
+                }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.zer",
+                    "match": "\\b(if|else|for|while|switch|break|continue|return|default|orelse|defer)\\b"
+                },
+                {
+                    "name": "keyword.declaration.zer",
+                    "match": "\\b(struct|packed|enum|union|const|typedef|distinct|import|static|keep|as|volatile|interrupt)\\b"
+                },
+                {
+                    "name": "keyword.other.zer",
+                    "match": "\\b(asm)\\b"
+                }
+            ]
+        },
+        "types": {
+            "patterns": [
+                {
+                    "name": "storage.type.primitive.zer",
+                    "match": "\\b(u8|u16|u32|u64|i8|i16|i32|i64|usize|f32|f64|bool|void|opaque)\\b"
+                }
+            ]
+        },
+        "builtins": {
+            "patterns": [
+                {
+                    "name": "support.type.builtin.zer",
+                    "match": "\\b(Pool|Ring|Arena|Handle)\\b"
+                }
+            ]
+        },
+        "intrinsics": {
+            "patterns": [
+                {
+                    "name": "support.function.intrinsic.zer",
+                    "match": "@(size|truncate|saturate|bitcast|ptrcast|ptrtoint|inttoptr|barrier|config|offset|container)\\b"
+                }
+            ]
+        },
+        "constants": {
+            "patterns": [
+                {
+                    "name": "constant.language.boolean.zer",
+                    "match": "\\b(true|false)\\b"
+                },
+                {
+                    "name": "constant.language.null.zer",
+                    "match": "\\b(null)\\b"
+                }
+            ]
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.comparison.zer",
+                    "match": "(==|!=|<=|>=|<|>)"
+                },
+                {
+                    "name": "keyword.operator.logical.zer",
+                    "match": "(&&|\\|\\||!)"
+                },
+                {
+                    "name": "keyword.operator.assignment.zer",
+                    "match": "(\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|=)"
+                },
+                {
+                    "name": "keyword.operator.arithmetic.zer",
+                    "match": "(\\+|-|\\*|/|%)"
+                },
+                {
+                    "name": "keyword.operator.bitwise.zer",
+                    "match": "(<<|>>|&|\\||\\^|~)"
+                },
+                {
+                    "name": "keyword.operator.range.zer",
+                    "match": "\\.\\."
+                },
+                {
+                    "name": "keyword.operator.arrow.zer",
+                    "match": "=>"
+                },
+                {
+                    "name": "keyword.operator.optional.zer",
+                    "match": "\\?"
+                }
+            ]
+        },
+        "functions": {
+            "patterns": [
+                {
+                    "name": "entity.name.function.zer",
+                    "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+                    "captures": {
+                        "1": { "name": "entity.name.function.zer" }
+                    }
+                }
+            ]
+        },
+        "identifiers": {
+            "patterns": [
+                {
+                    "name": "entity.name.type.zer",
+                    "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b"
+                }
+            ]
+        }
+    }
+}

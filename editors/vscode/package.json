@@ -1,0 +1,54 @@
+{
+    "name": "zer-lang",
+    "displayName": "ZER Language",
+    "description": "Language support for ZER — memory-safe systems programming language",
+    "version": "0.1.0",
+    "publisher": "zerohexer",
+    "license": "Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/zerohexer/ZER-LANG"
+    },
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": ["Programming Languages"],
+    "activationEvents": [
+        "onLanguage:zer"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "languages": [{
+            "id": "zer",
+            "aliases": ["ZER", "zer"],
+            "extensions": [".zer"],
+            "configuration": "./language-configuration.json"
+        }],
+        "grammars": [{
+            "language": "zer",
+            "scopeName": "source.zer",
+            "path": "./syntaxes/zer.tmLanguage.json"
+        }],
+        "configuration": {
+            "title": "ZER Language",
+            "properties": {
+                "zer.lspPath": {
+                    "type": "string",
+                    "default": "zer-lsp",
+                    "description": "Path to the zer-lsp executable"
+                },
+                "zer.lspArgs": {
+                    "type": "array",
+                    "default": [],
+                    "description": "Additional arguments for zer-lsp"
+                }
+            }
+        }
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.0"
+    },
+    "devDependencies": {
+        "vscode": "^1.75.0"
+    }
+}

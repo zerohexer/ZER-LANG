@@ -1,6 +1,6 @@
 # ZER Type System Design — Core Decisions
 
-**Status:** Lexer and parser complete (376 tests). AST shape known. Ready for type checker implementation.
+**Status:** All compiler passes complete and tested (731+ tests). Type system fully implemented.
 **Purpose:** The 4 load-bearing decisions that determine the type checker's architecture.
 **Rule:** These are the skeleton. Everything else is muscle added incrementally.
 
@@ -606,31 +606,28 @@ TOTAL type system infrastructure:                 ~1,035 lines
 ## Implementation order
 
 ```
-1. Build lexer → produces tokens                              ✅ DONE (218 tests)
-2. Build parser → produces AST (now you know the concrete shape) ✅ DONE (158 tests)
-3. REVISIT THIS DOCUMENT — update decisions based on actual AST  ✅ AST shape confirmed
-4. Implement Type struct (Decision 1)
-5. Implement Scope + Symbol (Decision 2)
-6. Implement type checker core:
-   a. primitives (u8, u32, bool, void)
-   b. pointers (*T, ?*T, *opaque)
-   c. slices and arrays ([]T, T[N])
-   d. structs and enums
-   e. optionals (?T) + orelse + |val| captures (Decision 3)
-   f. tagged unions + switch captures
-   g. function pointers
-   h. builtins — Pool/Ring/Arena/Handle (Decision 4)
-7. Implement dataflow pass (handle consumption, scope escape, keep checks)
-8. Implement ZER-CHECK — path-sensitive handle verification
-   → Runs after type checker, before safety passes
-   → Catches handle-in-array UAF, wrong-pool, cross-iteration bugs
-   → Zero false positives via under-approximation (Pulse/ISL technique)
-   → ~470 lines. See zer-check-design.md for full design.
-9. Implement safety passes (bounds insertion, zero insertion)
-10. Implement C emitter
-11. Milestone zero: u32 x = 5; compiles end-to-end through GCC
+1. Build lexer → produces tokens                                ✅ DONE (218 tests)
+2. Build parser → produces AST                                  ✅ DONE (158 tests)
+3. Revisit decisions based on actual AST                        ✅ AST shape confirmed
+4. Implement Type struct (Decision 1)                           ✅ DONE
+5. Implement Scope + Symbol (Decision 2)                        ✅ DONE
+6. Implement type checker core:                                 ✅ DONE (265 tests)
+   a. primitives (u8, u32, bool, void)                          ✅
+   b. pointers (*T, ?*T, *opaque)                               ✅
+   c. slices and arrays ([]T, T[N])                             ✅
+   d. structs and enums                                         ✅
+   e. optionals (?T) + orelse + |val| captures (Decision 3)     ✅
+   f. tagged unions + switch captures                           ✅
+   g. function pointers                                         ✅
+   h. builtins — Pool/Ring/Arena/Handle (Decision 4)            ✅
+7. Dataflow pass (scope escape, keep checks)                    ✅ DONE
+8. ZER-CHECK — path-sensitive handle verification               ✅ DONE (8 tests)
+9. Safety passes (bounds insertion, zero insertion)              ✅ DONE
+10. C emitter (all constructs incl. defer, unions, packed)      ✅ DONE (76 E2E tests)
+11. Module imports (diamond deps, topological sort)             ✅ DONE (6 patterns)
+12. LSP server (diagnostics, hover, go-to-def, completion)      ✅ DONE
 ```
 
 ---
 
-*This document is a PLAN, not a spec. Decisions are finalized but implementation details will be revised when the lexer and parser exist and the actual AST shape is known. The 4 decisions are the skeleton. Everything else is muscle added incrementally.*
+*All decisions implemented. 731+ tests passing. v0.1 shipped.*

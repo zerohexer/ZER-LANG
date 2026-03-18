@@ -1,6 +1,6 @@
 # ZER-CHECK Design — Path-Sensitive Handle Verification
 
-**Status:** Design finalized. Implement after type checker produces typed AST.
+**Status:** Implemented and tested (8 tests). Detects use-after-free, double free, wrong pool.
 **Purpose:** Catch the ~5% of handle safety bugs that escape compile-time type checking.
 **Guarantee:** Zero false positives. Every reported bug has a concrete execution path.
 **Cost:** ~470 lines of C. Read-only compiler pass. Zero runtime overhead.

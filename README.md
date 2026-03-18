@@ -172,14 +172,16 @@ The ZER compiler (`zerc`) is written in C. It emits C code that compiles with an
 ```
 Component              Lines
 ─────────────────────────────
-Lexer                  ~560
-Parser/AST             ~1,200
-Type Checker           ~1,600
-ZER-CHECK              ~300
-C Emitter              ~1,500
-Compiler Driver        ~400
+Lexer                  ~740
+Parser/AST             ~2,200
+Type System            ~700
+Type Checker           ~1,770
+ZER-CHECK              ~460
+C Emitter              ~1,660
+Compiler Driver        ~380
+LSP Server             ~1,370
 ─────────────────────────────
-Total                  ~5,500
+Total                  ~9,300
 ```
 
 Compare: GCC is 15 million lines. Rust compiler is 600K lines. ZER is small enough for one person to maintain.
@@ -199,7 +201,7 @@ Total:              731+ tests, all passing
 
 ## Status
 
-**v0.1 — functional compiler.** Compiles real multi-file ZER programs to C. All safety features implemented. Targets any architecture GCC supports.
+**v0.1 — functional compiler.** Compiles real multi-file ZER programs to C. All safety features implemented (defer, tagged unions, packed structs, bit extraction, bounds checks, handle verification). LSP server for editor integration. Targets any architecture GCC supports.
 
 ## License
 

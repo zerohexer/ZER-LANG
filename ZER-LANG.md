@@ -1,9 +1,9 @@
 # ZER Language Specification
 
 **Full name:** ZEROHEXER (ZER)
-**Status:** Lexer and parser implemented and tested (376 tests). Type checker next.
+**Status:** v0.1 complete — all compiler passes implemented and tested (731+ tests). Compiles multi-file ZER programs to C. LSP server available.
 **Author:** ZEROHEXER
-**Date:** 2026-03-18
+**Date:** 2026-03-19
 **Goal:** Memory-safe C. No runtime. No LLVM. No excuses. Zero silent memory corruption on every board GCC supports. The compiler does the safety work — the developer writes C-style code.
 
 ---
@@ -2192,28 +2192,26 @@ gcc/clang        native binary
 ### Total Compiler Size
 
 ```
-Component                        Lines
------------------------------------------
-Lexer                            ~1,500
-Parser                           ~3,000
-Type checker                     ~2,500
-ZER-CHECK (handle verification)  ~470
-Safety enforcement               ~980
-?T + orelse                      ~100
-Pool/Ring/Arena/Handle codegen   ~200
-@ intrinsics                     ~200
-Defer codegen                    ~100
-Tagged union                     ~200
-Packed struct layout             ~50
-Bit extraction codegen           ~80
-IR generation                    ~2,000
-C emitter                        ~2,000
------------------------------------------
-TOTAL                            ~13,380 lines
+Component                        Lines    Status
+-----------------------------------------------------
+Lexer (lexer.c/h)                  743    ✅ v0.1
+Parser + AST (parser/ast .c/h)   2,207    ✅ v0.1
+Type system (types.c/h)            704    ✅ v0.1
+Type checker (checker.c/h)       1,769    ✅ v0.1
+ZER-CHECK (zercheck.c/h)          457    ✅ v0.1
+C emitter (emitter.c/h)         1,662    ✅ v0.1
+  (includes defer, tagged union, packed struct,
+   bit extraction, Pool/Ring/Arena, intrinsics,
+   orelse, bounds checks — all in one pass)
+Compiler driver (zerc_main.c)      378    ✅ v0.1
+LSP server (zer_lsp.c)          1,371    ✅ v0.1
+-----------------------------------------------------
+TOTAL                            9,291 lines
 
-Bounds check optimization (v0.2+): +500 lines
------------------------------------------
-GRAND TOTAL                      ~13,880 lines
+Bounds check optimization (v0.2): +500 lines
+IR generation (v0.3):           ~2,000 lines
+-----------------------------------------------------
+PROJECTED v0.3 TOTAL            ~11,800 lines
 ```
 
 Compare:
@@ -2237,52 +2235,45 @@ MILESTONE ZERO — first successful end-to-end compile:
   Needs: lexer, parser (minimal), type checker (minimal), C emitter.
   This is the "it works" moment. Everything after is expanding coverage.
 
-VERSION 0.1 — ZER runs. safe. no optimization.
+VERSION 0.1 — ZER runs. safe. complete feature set. ✅ SHIPPED
   1. Lexer (tokens)                                              ✅ DONE (218 tests)
   2. Parser (AST — functions, structs, variables, control flow)  ✅ DONE (158 tests)
-  3. Type checker (type representation, coercion rules, symbol table)
-     → THIS IS THE HARD PART. Design type system doc BEFORE coding.
-     → See Appendix G for honest difficulty assessment.
-  4. ZER-CHECK (path-sensitive handle verification)
-     → Runs after type checker, before safety insertion.
-     → Catches handle-in-array UAF, wrong-pool, cross-iteration bugs.
+  3. Type checker (coercion, scope escape, exhaustive switch)    ✅ DONE (265 tests)
+  4. ZER-CHECK (path-sensitive handle verification)              ✅ DONE (8 tests)
      → Zero false positives via under-approximation (Pulse/ISL technique).
-     → ~470 lines. Ships in v0.1 — catches bugs BEFORE C emission.
-  5. Safety insertion (bounds, zero, null, overflow, casts, switch)
-  6. C emitter (output.c → gcc → binary)
-  7. Test suite (compile ZER programs, verify safety, run on hardware)
-  8. Error messages (clear diagnostics with file:line and context)
+  5. Safety insertion (bounds, zero, null, overflow, casts)      ✅ DONE
+  6. C emitter (all constructs → GCC-compilable C)              ✅ DONE (76 E2E tests)
+  7. Defer codegen (reverse order, works with break/continue)    ✅ DONE
+  8. Tagged union (construction + switch routing)                ✅ DONE
+  9. Packed struct (__attribute__((packed)))                      ✅ DONE
+  10. Bit extraction (reg[7..4])                                 ✅ DONE
+  11. Module imports (diamond deps, topological sort)            ✅ DONE (6 patterns)
+  12. LSP server (diagnostics, hover, go-to-def, completion)    ✅ DONE
+  13. Test suite (731+ tests, all passing)                       ✅ DONE
+
+  ZER is a COMPLETE language. Every feature works.
+  Phase 1 is done. The language is proven.
 
 VERSION 0.2 — faster (bounds check optimization)
-  8. Loop bound proof (i < arr.len → skip check)        ~200 lines
-  9. Hoist checks before loops                           ~200 lines
-  10. Constant index proof (arr[0] → one check)          ~50 lines
-  11. Mask proof (idx & 0xFF → always < 256)             ~50 lines
-
-VERSION 0.3 — complete feature set
-  12. Defer codegen
-  13. Tagged union
-  14. Packed struct
-  15. Bit extraction (reg[7..4])
-
-When 0.3 is done: ZER is a COMPLETE language. Every feature works.
-Phase 1 is done. The language is proven. Everything after is
-replacing the floor underneath — same language, different backend.
+  14. Loop bound proof (i < arr.len → skip check)        ~200 lines
+  15. Hoist checks before loops                           ~200 lines
+  16. Constant index proof (arr[0] → one check)          ~50 lines
+  17. Mask proof (idx & 0xFF → always < 256)             ~50 lines
 ```
 
 ### Phase 2: Own Backends (no GCC for target)
 
 ```
-VERSION 0.4 — first native backend
-  16. IR generation (architecture-independent intermediate form)
-  17. x86_64 backend (your dev machine — dogfood the language here)
-  18. DWARF debug info (gdb support)
+VERSION 0.3 — first native backend
+  18. IR generation (architecture-independent intermediate form)
+  19. x86_64 backend (your dev machine — dogfood the language here)
+  20. DWARF debug info (gdb support)
 
-VERSION 0.5 — embedded targets
-  19. ARM Cortex-M backend (Thumb-2) — most embedded boards
-  20. RISC-V backend (RV32IM) — growing embedded, cleanest ISA
+VERSION 0.4 — embedded targets
+  21. ARM Cortex-M backend (Thumb-2) — most embedded boards
+  22. RISC-V backend (RV32IM) — growing embedded, cleanest ISA
 
-When 0.5 is done: ZER compiles to native binaries for 3 architectures
+When 0.4 is done: ZER compiles to native binaries for 3 architectures
 without GCC. The compiler itself is still written in C.
 The --target=c path remains for all other architectures.
 ```
@@ -2291,9 +2282,9 @@ The --target=c path remains for all other architectures.
 
 ```
 VERSION 1.0 — the Thompson moment
-  21. Rewrite zerc in ZER (zerc.zer replaces zerc.c)
-  22. Compile zerc.zer with phase 2 zerc → new zerc binary
-  23. New zerc compiles itself → verified self-hosting
+  23. Rewrite zerc in ZER (zerc.zer replaces zerc.c)
+  24. Compile zerc.zer with phase 2 zerc → new zerc binary
+  25. New zerc compiles itself → verified self-hosting
 
 When 1.0 is done: ZER is fully independent. No C. No GCC.
 ZER compiles ZER. The bootstrap chain is complete.

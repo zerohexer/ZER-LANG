@@ -1094,6 +1094,74 @@ int main(void) {
         arena_free(&a);
     }
 
+    printf("[combo: defer + orelse continue in for]\n");
+    test_compile_and_run(
+        "u32 cleanup_count = 0;\n"
+        "void cleanup() { cleanup_count += 1; }\n"
+        "?u32 maybe(u32 i) {\n"
+        "    if (i == 1) { return null; }\n"
+        "    return i;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 sum = 0;\n"
+        "    for (u32 i = 0; i < 4; i += 1) {\n"
+        "        defer cleanup();\n"
+        "        u32 val = maybe(i) orelse continue;\n"
+        "        sum += val;\n"
+        "    }\n"
+        "    return sum + cleanup_count;\n"
+        "}\n",
+        9,
+        "defer+orelse+for: sum=0+2+3=5, cleanup=4, total=9");
+
+    printf("[combo: nested orelse 3 levels]\n");
+    test_compile_and_run(
+        "?u32 fail() { return null; }\n"
+        "?u32 also_fail() { return null; }\n"
+        "?u32 succeed() { return 77; }\n"
+        "u32 main() {\n"
+        "    u32 x = fail() orelse also_fail() orelse succeed() orelse 0;\n"
+        "    return x;\n"
+        "}\n",
+        77,
+        "3-level orelse chain: fail→fail→succeed=77");
+
+    printf("[combo: bounds check before function call]\n");
+    test_compile_and_run(
+        "u32 double_it(u32 x) { return x * 2; }\n"
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 5;\n"
+        "    arr[1] = 10;\n"
+        "    u32 result = double_it(arr[0]) + double_it(arr[1]);\n"
+        "    return result;\n"
+        "}\n",
+        30,
+        "bounds check + function call: double(5)+double(10)=30");
+
+    printf("[combo: function pointer call]\n");
+    test_compile_and_run(
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 apply(u32 a, u32 b) {\n"
+        "    return add(a, b);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return apply(10, 20);\n"
+        "}\n",
+        30,
+        "function call through another function = 30");
+
+    printf("[combo: @inttoptr + @ptrtoint roundtrip]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 42;\n"
+        "    usize addr = @ptrtoint(&x);\n"
+        "    *u32 p = @inttoptr(*u32, addr);\n"
+        "    return *p;\n"
+        "}\n",
+        42,
+        "@ptrtoint→@inttoptr roundtrip = 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

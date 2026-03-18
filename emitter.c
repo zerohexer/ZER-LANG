@@ -728,6 +728,13 @@ static void emit_bounds_checks(Emitter *e, Node *node) {
             emit(e, "_zer_bounds_check((size_t)(");
             emit_expr(e, node->index_expr.index);
             emit(e, "), %u, __FILE__, __LINE__);\n", obj_type->array.size);
+        } else if (obj_type && obj_type->kind == TYPE_SLICE) {
+            emit_indent(e);
+            emit(e, "_zer_bounds_check((size_t)(");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "), ");
+            emit_expr(e, node->index_expr.object);
+            emit(e, ".len, __FILE__, __LINE__);\n");
         }
         /* recurse into object too (nested: arr[i][j]) */
         emit_bounds_checks(e, node->index_expr.object);
@@ -833,10 +840,11 @@ static void emit_stmt(Emitter *e, Node *node) {
                 } else {
                     emit(e, "return;\n");
                 }
-            } else if (node->var_decl.init->orelse.fallback_is_break)
-                emit(e, "break;\n");
-            else
-                emit(e, "continue;\n");
+            } else if (node->var_decl.init->orelse.fallback_is_break) {
+                emit(e, "{ "); emit_defers(e); emit(e, "break; }\n");
+            } else {
+                emit(e, "{ "); emit_defers(e); emit(e, "continue; }\n");
+            }
             emit_indent(e);
             emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
             if (or_is_ptr) {
@@ -1055,11 +1063,13 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_BREAK:
+        emit_defers(e); /* defers fire before break */
         emit_indent(e);
         emit(e, "break;\n");
         break;
 
     case NODE_CONTINUE:
+        emit_defers(e); /* defers fire before continue */
         emit_indent(e);
         emit(e, "continue;\n");
         break;

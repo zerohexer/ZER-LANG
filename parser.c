@@ -598,7 +598,7 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
                 n->orelse.fallback = parse_block(p);
             } else {
                 /* orelse value */
-                n->orelse.fallback = parse_precedence(p, PREC_ORELSE + 1);
+                n->orelse.fallback = parse_precedence(p, PREC_ORELSE);
             }
             left = n;
             left = parse_postfix(p, left);

@@ -140,6 +140,13 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
     if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
     if (expr->kind == NODE_CHAR_LIT && effective->kind == TYPE_U8) return true;
+    /* -5 is UNARY(MINUS, INT_LIT) — negative integer literal */
+    if (expr->kind == NODE_UNARY && expr->unary.op == TOK_MINUS) {
+        if (expr->unary.operand->kind == NODE_INT_LIT && type_is_integer(effective))
+            return true;
+        if (expr->unary.operand->kind == NODE_FLOAT_LIT && type_is_float(effective))
+            return true;
+    }
     return false;
 }
 

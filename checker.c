@@ -977,16 +977,23 @@ static Type *check_expr(Checker *c, Node *node) {
             /* flow control — expression yields unwrapped type */
             result = unwrapped;
         } else if (node->orelse.fallback) {
-            Type *fallback = check_expr(c, node->orelse.fallback);
-            /* fallback must match unwrapped type */
-            if (!type_equals(unwrapped, fallback) &&
-                !can_implicit_coerce(fallback, unwrapped) &&
-                !is_literal_compatible(node->orelse.fallback, unwrapped)) {
-                checker_error(c, node->loc.line,
-                    "orelse fallback type '%s' doesn't match '%s'",
-                    type_name(fallback), type_name(unwrapped));
+            if (node->orelse.fallback->kind == NODE_BLOCK) {
+                /* orelse { block } — statement-only, no result type.
+                 * Block runs on null. Per spec: cannot be used as expression. */
+                check_stmt(c, node->orelse.fallback);
+                result = unwrapped;
+            } else {
+                Type *fallback = check_expr(c, node->orelse.fallback);
+                /* fallback must match unwrapped type */
+                if (!type_equals(unwrapped, fallback) &&
+                    !can_implicit_coerce(fallback, unwrapped) &&
+                    !is_literal_compatible(node->orelse.fallback, unwrapped)) {
+                    checker_error(c, node->loc.line,
+                        "orelse fallback type '%s' doesn't match '%s'",
+                        type_name(fallback), type_name(unwrapped));
+                }
+                result = unwrapped;
             }
-            result = unwrapped;
         } else {
             result = unwrapped;
         }

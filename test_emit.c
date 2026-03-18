@@ -839,6 +839,108 @@ int main(void) {
         "}\n",
         "tagged union declaration compiles");
 
+    printf("[@bitcast]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    i32 neg = -1;\n"
+        "    u32 bits = @bitcast(u32, neg);\n"
+        "    if (bits > 0) { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        1,
+        "@bitcast(u32, -1) gives large positive");
+
+    printf("[orelse block]\n");
+    test_compile_and_run(
+        "u32 log_count = 0;\n"
+        "void log_error() { log_count += 1; }\n"
+        "?u32 nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    nothing() orelse { log_error(); };\n"
+        "    return log_count;\n"
+        "}\n",
+        1,
+        "orelse block executes on null");
+
+    printf("[array of structs]\n");
+    test_compile_and_run(
+        "struct Task { u32 pid; u32 priority; }\n"
+        "u32 main() {\n"
+        "    Task[4] tasks;\n"
+        "    tasks[0].pid = 10;\n"
+        "    tasks[1].pid = 20;\n"
+        "    return tasks[0].pid + tasks[1].pid;\n"
+        "}\n",
+        30,
+        "array of structs field access = 30");
+
+    printf("[function returning struct]\n");
+    test_compile_and_run(
+        "struct Point { u32 x; u32 y; }\n"
+        "Point create(u32 x, u32 y) {\n"
+        "    Point p;\n"
+        "    p.x = x;\n"
+        "    p.y = y;\n"
+        "    return p;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    Point p = create(3, 4);\n"
+        "    return p.x + p.y;\n"
+        "}\n",
+        7,
+        "function returning struct = 7");
+
+    printf("[@ptrcast]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 42;\n"
+        "    *u32 p = &x;\n"
+        "    *u8 raw = @ptrcast(*u8, p);\n"
+        "    *u32 back = @ptrcast(*u32, raw);\n"
+        "    return *back;\n"
+        "}\n",
+        42,
+        "@ptrcast round-trip = 42");
+
+    printf("[u64 arithmetic]\n");
+    test_compile_and_run(
+        "u64 main() {\n"
+        "    u64 a = 1000000;\n"
+        "    u64 b = 1000000;\n"
+        "    u64 c = a * b;\n"
+        "    if (c > 999999) { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        1,
+        "u64 large multiplication");
+
+    printf("[else if chain]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 3;\n"
+        "    u32 result = 0;\n"
+        "    if (x == 1) { result = 10; }\n"
+        "    else if (x == 2) { result = 20; }\n"
+        "    else if (x == 3) { result = 30; }\n"
+        "    else { result = 99; }\n"
+        "    return result;\n"
+        "}\n",
+        30,
+        "else if chain x=3 → 30");
+
+    printf("[while true + break]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 count = 0;\n"
+        "    while (true) {\n"
+        "        count += 1;\n"
+        "        if (count >= 7) { break; }\n"
+        "    }\n"
+        "    return count;\n"
+        "}\n",
+        7,
+        "while(true) break at 7");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

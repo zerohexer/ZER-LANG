@@ -473,6 +473,21 @@ static void emit_expr(Emitter *e, Node *node) {
             } else {
                 emit(e, "; _zer_tmp%d.value; })", tmp);
             }
+        } else if (node->orelse.fallback &&
+                   node->orelse.fallback->kind == NODE_BLOCK) {
+            /* orelse { block } — statement-only form
+             * → { auto _t = expr; if (!_t.has_value) { block } } */
+            int tmp = e->temp_count++;
+            emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+            emit_expr(e, node->orelse.expr);
+            emit(e, "; ");
+            if (is_ptr_optional) {
+                emit(e, "if (!_zer_tmp%d) ", tmp);
+            } else {
+                emit(e, "if (!_zer_tmp%d.has_value) ", tmp);
+            }
+            emit_stmt(e, node->orelse.fallback);
+            emit(e, " 0; })");
         } else {
             int tmp = e->temp_count++;
             emit(e, "({__auto_type _zer_tmp%d = ", tmp);
@@ -528,17 +543,21 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, ")");
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
-            /* @bitcast(T, val) → union cast */
-            int tmp = e->temp_count++;
-            emit(e, "({union{__auto_type _in; ");
+            /* @bitcast(T, val) → memcpy type punning (valid C99+GCC) */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                int tmp = e->temp_count++;
+                int tmp2 = e->temp_count++;
+                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "; ");
                 emit_type(e, t);
+                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
+                     tmp, tmp, tmp2, tmp, tmp);
+            } else {
+                emit(e, "0");
             }
-            emit(e, " _out;} _zer_bc%d; _zer_bc%d._in = ", tmp, tmp);
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "; _zer_bc%d._out;})", tmp);
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
             /* @truncate(val) → (T)(val) */
             emit(e, "(");

@@ -40,16 +40,29 @@ static void checker_warning(Checker *c, int line, const char *fmt, ...) {
 
 /* ---- Non-storable tracking ----
  * pool.get(h) returns a non-storable result.
- * We track this with a simple set of node pointers. */
+ * We track this with a dynamic array in the arena — no fixed cap. */
 
-#define NON_STORABLE_MAX 256
-static Node *non_storable_nodes[NON_STORABLE_MAX];
+static Node **non_storable_nodes = NULL;
 static int non_storable_count = 0;
+static int non_storable_capacity = 0;
+static Arena *non_storable_arena = NULL;
+
+static void non_storable_init(Arena *a) {
+    non_storable_arena = a;
+    non_storable_capacity = 64;
+    non_storable_nodes = (Node **)arena_alloc(a, non_storable_capacity * sizeof(Node *));
+    non_storable_count = 0;
+}
 
 static void mark_non_storable(Node *n) {
-    if (non_storable_count < NON_STORABLE_MAX) {
-        non_storable_nodes[non_storable_count++] = n;
+    if (non_storable_count >= non_storable_capacity) {
+        int new_cap = non_storable_capacity * 2;
+        Node **new_arr = (Node **)arena_alloc(non_storable_arena, new_cap * sizeof(Node *));
+        memcpy(new_arr, non_storable_nodes, non_storable_count * sizeof(Node *));
+        non_storable_nodes = new_arr;
+        non_storable_capacity = new_cap;
     }
+    non_storable_nodes[non_storable_count++] = n;
 }
 
 static bool is_non_storable(Node *n) {
@@ -1568,6 +1581,9 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
 
     /* clear type map */
     memset(type_map, 0, sizeof(type_map));
+
+    /* init non-storable tracking */
+    non_storable_init(arena);
 }
 
 bool checker_check(Checker *c, Node *file_node) {

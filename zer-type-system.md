@@ -607,9 +607,14 @@ TOTAL type system infrastructure:                 ~1,035 lines
    g. function pointers
    h. builtins — Pool/Ring/Arena/Handle (Decision 4)
 7. Implement dataflow pass (handle consumption, scope escape, keep checks)
-8. Implement safety passes (bounds insertion, zero insertion)
-9. Implement C emitter
-10. Milestone zero: u32 x = 5; compiles end-to-end through GCC
+8. Implement ZER-CHECK — path-sensitive handle verification
+   → Runs after type checker, before safety passes
+   → Catches handle-in-array UAF, wrong-pool, cross-iteration bugs
+   → Zero false positives via under-approximation (Pulse/ISL technique)
+   → ~470 lines. See zer-check-design.md for full design.
+9. Implement safety passes (bounds insertion, zero insertion)
+10. Implement C emitter
+11. Milestone zero: u32 x = 5; compiles end-to-end through GCC
 ```
 
 ---

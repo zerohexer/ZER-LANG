@@ -1691,7 +1691,88 @@ scratch.unsafe_reset();   // no warning. developer acknowledged the risk.
 
 Compiler cost: ~20 lines. Check if reset() call is inside a defer. Warn if not.
 
-**Coverage summary:**
+**Rule 4: ZER-CHECK — Path-sensitive handle verification.** A read-only compiler pass that runs after type checking, before C emission. Catches the ~5% of handle bugs that Rules 1-3 cannot catch at compile time — specifically handles stored in arrays/structs and cross-pool usage.
+
+Based on Facebook Infer's Pulse analyzer (Incorrectness Separation Logic, O'Hearn 2019). Proven at scale on millions of lines of production code at Meta. Adapted to ZER's specific handle patterns — simpler because ZER only tracks typed handles with fixed-size pools, not arbitrary heap memory.
+
+```
+TECHNIQUE: Typestate tracking with disjunctive path analysis.
+
+Each handle has a state:  UNINITIALIZED → ALIVE → FREED
+Each state tracks:        which pool allocated it, at which line
+
+At branches (if/else):
+  DON'T merge states. Keep both paths separate.
+  Each path represents a REAL execution.
+  Report bug only when a concrete path proves it.
+
+At loops:
+  Bounded unrolling to pool capacity.
+  Pool(Task, 8) → unroll up to 8 iterations.
+  Cross-iteration bugs caught by analyzing iteration N and N+1.
+
+ZERO FALSE POSITIVE GUARANTEE:
+  Under-approximation — only report what you can prove.
+  Every reported bug has a concrete execution path.
+  If analyzer can't determine state → stay silent.
+  Runtime generation counter is the fallback.
+
+ZERO COST TO COMPILED BINARY:
+  ZER-CHECK is a compiler pass, not runtime code.
+  It reads the typed AST, reports errors, doesn't modify anything.
+  If it finds nothing, compilation continues normally.
+  Can be skipped with --no-check for fast iteration.
+```
+
+**What ZER-CHECK catches that Rules 1-3 miss:**
+
+```
+// Bug 1: Handle in array, freed, then accessed
+Handle(Task) handles[4];
+handles[0] = tasks.alloc() orelse return;
+tasks.free(handles[0]);
+tasks.get(handles[0]);        // Rules 1-3: can't track array elements
+                               // ZER-CHECK: traces alloc → free → use. ERROR.
+
+// Bug 2: Wrong pool
+Pool(Task, 8) pool_a;
+Pool(Task, 4) pool_b;
+Handle(Task) h = pool_a.alloc() orelse return;
+pool_b.get(h);                // Rules 1-3: type matches Handle(Task). passes.
+                               // ZER-CHECK: h.pool_id = pool_a, used on pool_b. ERROR.
+
+// Bug 3: Freed in loop, used next iteration
+while (condition) {
+    tasks.get(h);             // iteration 2+: h already freed. BUG.
+    tasks.free(h);
+}                              // ZER-CHECK: unrolls 2 iterations, catches it.
+```
+
+**How ZER-CHECK avoids false positives:**
+
+```
+SITUATION                           WHAT ANALYZER DOES
+------------------------------------------------------------------------
+Freed on all branches, then used    Report error (definite bug)
+Freed on one branch, then used      Report error WITH the specific path
+Can't determine state               Stay silent (runtime trap catches it)
+Handle passed to unknown function   Assume alive (optimistic, never false)
+Loop with unknown bound             Unroll to pool capacity (bounded)
+Different pools on different paths  Mark pool as unknown, don't report
+```
+
+Compiler cost: ~470 lines. Runs in milliseconds on embedded-sized codebases.
+
+```
+Compiler pipeline position:
+
+  source.zer → LEXER → PARSER → TYPE CHECKER → ZER-CHECK → C EMITTER
+                                                    ↑
+                                              read-only pass
+                                              ~470 lines
+```
+
+**Coverage summary (updated with ZER-CHECK):**
 
 ```
 SCENARIO                        CAUGHT AT
@@ -1699,9 +1780,15 @@ SCENARIO                        CAUGHT AT
 Handle used after free          compile time (Rule 1)
 Raw pointer from get() stored   compile time (Rule 2)
 Arena pointer after reset       compile time (Rule 3)
-Handle in array after free      runtime (generation counter)
+Handle in array after free      compile time (ZER-CHECK)
+Wrong pool usage                compile time (ZER-CHECK)
+Cross-iteration handle reuse    compile time (ZER-CHECK)
 Silent corruption               never. impossible.
 ```
+
+With ZER-CHECK, compile-time safety coverage increases from ~95% to ~99%.
+The remaining ~1% (deeply indirect handle aliasing through multiple function
+calls) falls to runtime generation counter traps. Still zero silent corruption.
 
 #### What Pool Compiles To
 
@@ -2046,6 +2133,13 @@ source.zer
 [TYPE CHECKER]   typed AST       ~2,500 lines
     |
     v
+[ZER-CHECK]      verified AST    ~470 lines
+  path-sensitive handle verification
+  wrong-pool detection
+  cross-iteration use-after-free
+  zero false positives (under-approximation)
+    |
+    v
 [SAFETY]         checked AST     ~980 lines
   bounds insertion
   zero insertion
@@ -2095,6 +2189,7 @@ Component                        Lines
 Lexer                            ~1,500
 Parser                           ~3,000
 Type checker                     ~2,500
+ZER-CHECK (handle verification)  ~470
 Safety enforcement               ~980
 ?T + orelse                      ~100
 Pool/Ring/Arena/Handle codegen   ~200
@@ -2106,11 +2201,11 @@ Bit extraction codegen           ~80
 IR generation                    ~2,000
 C emitter                        ~2,000
 -----------------------------------------
-TOTAL                            ~12,910 lines
+TOTAL                            ~13,380 lines
 
 Bounds check optimization (v0.2+): +500 lines
 -----------------------------------------
-GRAND TOTAL                      ~13,410 lines
+GRAND TOTAL                      ~13,880 lines
 ```
 
 Compare:
@@ -2120,7 +2215,7 @@ Compare:
 - Go compiler: ~500,000 lines
 - Zig compiler: ~100,000 lines
 - TCC (Tiny C Compiler): ~25,000 lines
-- **ZER compiler: ~13,500 lines**
+- **ZER compiler: ~13,900 lines**
 
 ---
 
@@ -2140,10 +2235,15 @@ VERSION 0.1 — ZER runs. safe. no optimization.
   3. Type checker (type representation, coercion rules, symbol table)
      → THIS IS THE HARD PART. Design type system doc BEFORE coding.
      → See Appendix G for honest difficulty assessment.
-  4. Safety insertion (bounds, zero, null, overflow, casts, switch)
-  5. C emitter (output.c → gcc → binary)
-  6. Test suite (compile ZER programs, verify safety, run on hardware)
-  7. Error messages (clear diagnostics with file:line and context)
+  4. ZER-CHECK (path-sensitive handle verification)
+     → Runs after type checker, before safety insertion.
+     → Catches handle-in-array UAF, wrong-pool, cross-iteration bugs.
+     → Zero false positives via under-approximation (Pulse/ISL technique).
+     → ~470 lines. Ships in v0.1 — catches bugs BEFORE C emission.
+  5. Safety insertion (bounds, zero, null, overflow, casts, switch)
+  6. C emitter (output.c → gcc → binary)
+  7. Test suite (compile ZER programs, verify safety, run on hardware)
+  8. Error messages (clear diagnostics with file:line and context)
 
 VERSION 0.2 — faster (bounds check optimization)
   8. Loop bound proof (i < arr.len → skip check)        ~200 lines
@@ -2262,10 +2362,10 @@ Pool(T, N) and Ring(T, N) look like generics but are builtins — the compiler h
 
 ZER and Rust achieve the SAME guarantee: zero silent memory corruption. The difference is mechanism:
 - Rust catches 100% at compile time via borrow checker + lifetime annotations
-- ZER catches ~95% at compile time, ~5% at runtime trap (generation counter)
+- ZER catches ~99% at compile time (type checker + ZER-CHECK), ~1% at runtime trap (generation counter)
 - Both prevent shipping corrupted firmware
 
-That 5% compile-time difference costs Rust: ~50,000 lines of borrow checker code, lifetime annotations on functions, ownership model, LLVM dependency, 6-12 month learning curve, "fighting the borrow checker." ZER achieves zero silent corruption without any of that.
+That 1% compile-time difference costs Rust: ~50,000 lines of borrow checker code, lifetime annotations on functions, ownership model, LLVM dependency, 6-12 month learning curve, "fighting the borrow checker." ZER-CHECK achieves near-parity with zero false positives using ~470 lines of path-sensitive analysis (based on Facebook Infer's Pulse technique). ZER achieves zero silent corruption without any of that complexity.
 
 Additionally, ZER's compiler performs intraprocedural scope escape and store-through validation — catching the most common use-after-free patterns (returning pointer to local, storing local pointer in global struct) without annotations. Same checks GCC does as warnings, ZER makes them errors. ~100-200 lines of compiler code. Cross-function analysis deferred — that's borrow checker territory.
 

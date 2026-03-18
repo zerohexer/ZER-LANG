@@ -1,0 +1,6 @@
+import gpio;
+
+u32 uart_init() {
+    u32 pin = gpio_read();
+    return pin + 10;
+}

@@ -1,0 +1,3 @@
+u32 gpio_read() {
+    return 7;
+}

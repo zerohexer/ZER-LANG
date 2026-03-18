@@ -1,0 +1,5 @@
+import uart;
+
+u32 main() {
+    return uart_init();
+}

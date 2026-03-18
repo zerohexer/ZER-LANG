@@ -287,14 +287,21 @@ int main(int argc, char **argv) {
      * Since emit_file does both, just emit imported first with preamble,
      * then main without. But only first file needs preamble. */
     if (cc.module_count > 1) {
-        /* has imports: emit first imported module with preamble */
-        emit_file(&emitter, cc.modules[1].ast);
-        /* emit remaining imported modules without preamble */
-        for (int i = 2; i < cc.module_count; i++) {
+        /* Emit in reverse dependency order: deepest dependency first.
+         * Modules are added depth-first during recursive import resolution,
+         * so the last module in the array is the deepest dependency.
+         * Reverse order ensures C declaration-before-use. */
+
+        /* deepest dependency gets preamble */
+        emit_file(&emitter, cc.modules[cc.module_count - 1].ast);
+
+        /* remaining imports in reverse order (no preamble) */
+        for (int i = cc.module_count - 2; i >= 1; i--) {
             if (cc.modules[i].ast)
                 emit_file_no_preamble(&emitter, cc.modules[i].ast);
         }
-        /* emit main without preamble */
+
+        /* main last (no preamble) */
         emit_file_no_preamble(&emitter, main_mod->ast);
     } else {
         /* no imports: just emit main with preamble */

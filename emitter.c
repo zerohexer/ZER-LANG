@@ -267,22 +267,139 @@ static void emit_expr(Emitter *e, Node *node) {
         emit(e, "]");
         break;
 
-    case NODE_SLICE:
-        /* TODO: slice emission — needs runtime struct construction */
-        emit(e, "/* slice */0");
+    case NODE_SLICE: {
+        /* buf[start..end] → (struct{T*ptr;size_t len;}){obj.ptr+start, end-start}
+         * For arrays: (struct{T*ptr;size_t len;}){&arr[start], end-start} */
+        emit(e, "/* slice */ 0 /* TODO: slice codegen */");
         break;
+    }
 
-    case NODE_ORELSE:
-        /* TODO: full orelse emission */
-        /* for now, handle simple orelse value */
-        emit(e, "/* orelse */");
+    case NODE_ORELSE: {
+        /* ?T expr orelse fallback
+         *
+         * For ?*T (pointer optional — null sentinel):
+         *   expr ? expr : fallback
+         *
+         * For ?T (value optional — struct with has_value):
+         *   ({__typeof__(expr) _tmp = expr; _tmp.has_value ? _tmp.value : fallback;})
+         *
+         * For orelse return/break/continue:
+         *   handled in statement context, not expression
+         */
+        int tmp = e->temp_count++;
+        emit(e, "({__auto_type _zer_tmp%d = ", tmp);
         emit_expr(e, node->orelse.expr);
+        emit(e, "; _zer_tmp%d.has_value ? _zer_tmp%d.value : ", tmp, tmp);
+        if (node->orelse.fallback) {
+            emit_expr(e, node->orelse.fallback);
+        } else {
+            emit(e, "0");
+        }
+        emit(e, "; })");
         break;
+    }
 
-    case NODE_INTRINSIC:
-        /* TODO: intrinsic emission */
-        emit(e, "/* @%.*s */0", (int)node->intrinsic.name_len, node->intrinsic.name);
+    case NODE_INTRINSIC: {
+        const char *name = node->intrinsic.name;
+        uint32_t nlen = (uint32_t)node->intrinsic.name_len;
+
+        if (nlen == 4 && memcmp(name, "size", 4) == 0) {
+            /* @size(T) → sizeof(T) */
+            emit(e, "sizeof(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")");
+        } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
+            /* @offset(T, field) → offsetof(struct _zer_T, field) */
+            emit(e, "offsetof(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ", ");
+            if (node->intrinsic.arg_count > 0) {
+                emit_expr(e, node->intrinsic.args[0]);
+            }
+            emit(e, ")");
+        } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
+            /* @ptrcast(*T, expr) → (T*)(expr) */
+            emit(e, "(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
+            /* @bitcast(T, val) → union cast */
+            int tmp = e->temp_count++;
+            emit(e, "({union{__auto_type _in; ");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, " _out;} _zer_bc%d; _zer_bc%d._in = ", tmp, tmp);
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "; _zer_bc%d._out;})", tmp);
+        } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
+            /* @truncate(val) → (T)(val) */
+            emit(e, "(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
+            /* @saturate(val) → clamp to target type range — simplified as cast for now */
+            emit(e, "(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
+            /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr) */
+            emit(e, "(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")(uintptr_t)(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
+            /* @ptrtoint(ptr) → (uintptr_t)(ptr) */
+            emit(e, "(uintptr_t)(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 7 && memcmp(name, "barrier", 7) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST)");
+        } else if (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_RELEASE)");
+        } else if (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
+        } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
+            /* @cstr(buf, slice) — copy slice to buf + null terminate */
+            /* simplified: emit memcpy + null terminator */
+            emit(e, "/* @cstr */0");
+        } else {
+            emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
+        }
         break;
+    }
 
     default:
         emit(e, "/* unhandled expr %s */0", node_kind_name(node->kind));
@@ -329,15 +446,58 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_IF:
-        emit_indent(e);
-        emit(e, "if (");
-        emit_expr(e, node->if_stmt.cond);
-        emit(e, ") ");
-        emit_stmt(e, node->if_stmt.then_body);
-        if (node->if_stmt.else_body) {
+        if (node->if_stmt.capture_name) {
+            /* if-unwrap: if (maybe) |val| { ... }
+             * → { auto _tmp = maybe; if (_tmp.has_value) { T val = _tmp.value; ... } }
+             * For ?*T: if (_tmp != NULL) { *T val = _tmp; ... } */
+            int tmp = e->temp_count++;
             emit_indent(e);
-            emit(e, "else ");
-            emit_stmt(e, node->if_stmt.else_body);
+            emit(e, "{\n");
+            e->indent++;
+            emit_indent(e);
+            emit(e, "__auto_type _zer_uw%d = ", tmp);
+            emit_expr(e, node->if_stmt.cond);
+            emit(e, ";\n");
+            emit_indent(e);
+            emit(e, "if (_zer_uw%d.has_value) ", tmp);
+            /* inject capture variable into the then body */
+            emit(e, "{\n");
+            e->indent++;
+            emit_indent(e);
+            emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
+                 (int)node->if_stmt.capture_name_len,
+                 node->if_stmt.capture_name, tmp);
+            /* emit then body contents (unwrap the block) */
+            if (node->if_stmt.then_body->kind == NODE_BLOCK) {
+                for (int i = 0; i < node->if_stmt.then_body->block.stmt_count; i++) {
+                    emit_stmt(e, node->if_stmt.then_body->block.stmts[i]);
+                }
+            } else {
+                emit_stmt(e, node->if_stmt.then_body);
+            }
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}\n");
+            if (node->if_stmt.else_body) {
+                emit_indent(e);
+                emit(e, "else ");
+                emit_stmt(e, node->if_stmt.else_body);
+            }
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}\n");
+        } else {
+            /* regular if */
+            emit_indent(e);
+            emit(e, "if (");
+            emit_expr(e, node->if_stmt.cond);
+            emit(e, ") ");
+            emit_stmt(e, node->if_stmt.then_body);
+            if (node->if_stmt.else_body) {
+                emit_indent(e);
+                emit(e, "else ");
+                emit_stmt(e, node->if_stmt.else_body);
+            }
         }
         break;
 
@@ -408,16 +568,70 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_DEFER:
-        /* TODO: defer requires goto-based cleanup or scope tracking */
+        /* Defer: emit the deferred code at the end of the current block.
+         * For now, emit as a comment + the code inline.
+         * Full defer requires goto-based cleanup which we'll add per-function. */
         emit_indent(e);
-        emit(e, "/* defer — TODO */\n");
+        emit(e, "/* deferred: */ ");
+        /* We can't easily defer in C99 without goto. For now, just emit inline
+         * with a comment. Real defer codegen needs function-level rewriting. */
+        emit_stmt(e, node->defer.body);
         break;
 
-    case NODE_SWITCH:
-        /* TODO: switch emission with ZER's => syntax → C switch/if chain */
+    case NODE_SWITCH: {
+        /* ZER switch with => arms → C if/else chain
+         * switch (expr) { .a => ..., .b => ..., default => ... }
+         * → { auto _sw = expr; if (_sw == a) { ... } else if (_sw == b) { ... } else { ... } }
+         *
+         * For enum dot syntax: .idle => ... → if (_sw == ENUM_idle) ...
+         * For integer values: 0 => ... → if (_sw == 0) ...
+         * For default: else { ... }
+         */
+        int sw_tmp = e->temp_count++;
         emit_indent(e);
-        emit(e, "/* switch — TODO */\n");
+        emit(e, "{\n");
+        e->indent++;
+        emit_indent(e);
+        emit(e, "__auto_type _zer_sw%d = ", sw_tmp);
+        emit_expr(e, node->switch_stmt.expr);
+        emit(e, ";\n");
+
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            SwitchArm *arm = &node->switch_stmt.arms[i];
+            emit_indent(e);
+
+            if (arm->is_default) {
+                if (i > 0) emit(e, "else ");
+                emit(e, "/* default */ ");
+            } else {
+                if (i > 0) emit(e, "else ");
+                emit(e, "if (");
+                for (int j = 0; j < arm->value_count; j++) {
+                    if (j > 0) emit(e, " || ");
+                    emit(e, "_zer_sw%d == ", sw_tmp);
+                    emit_expr(e, arm->values[j]);
+                }
+                emit(e, ") ");
+            }
+
+            /* arm body */
+            if (arm->body->kind == NODE_BLOCK) {
+                emit_stmt(e, arm->body);
+            } else {
+                emit(e, "{\n");
+                e->indent++;
+                emit_stmt(e, arm->body);
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
+            }
+        }
+
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
         break;
+    }
 
     default:
         emit_indent(e);

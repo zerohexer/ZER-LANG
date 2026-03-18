@@ -948,12 +948,12 @@ int main(void) {
         "    ?u32 x = get_val();\n"
         "    if (x) |*v| {\n"
         "        *v = 99;\n"
-        "        return *v;\n"
         "    }\n"
-        "    return 0;\n"
+        "    u32 result = x orelse 0;\n"
+        "    return result;\n"
         "}\n",
         99,
-        "|*val| pointer capture allows mutation");
+        "|*val| modifies original optional value");
 
     printf("[multi-value switch arms]\n");
     test_compile_and_run(

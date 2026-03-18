@@ -808,8 +808,12 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_IF:
         if (node->if_stmt.capture_name) {
             /* if-unwrap: if (maybe) |val| { ... }
-             * ?T (struct): { auto _tmp = maybe; if (_tmp.has_value) { T val = _tmp.value; ... } }
-             * ?*T (ptr):   { auto _tmp = maybe; if (_tmp) { *T val = _tmp; ... } } */
+             * |val|  → copy of unwrapped value (immutable)
+             * |*val| → pointer to ORIGINAL optional's value (mutable)
+             *
+             * For |val|:  { auto _tmp = expr; if (_tmp.has_value) { auto val = _tmp.value; ... } }
+             * For |*val|: { auto *_ptr = &expr; if (_ptr->has_value) { auto val = &_ptr->value; ... } }
+             * ?*T (ptr): { auto _tmp = expr; if (_tmp) { auto val = _tmp; ... } } */
             int tmp = e->temp_count++;
             Type *cond_type = checker_get_type(node->if_stmt.cond);
             bool is_ptr_opt = cond_type &&
@@ -819,33 +823,46 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit_indent(e);
             emit(e, "{\n");
             e->indent++;
-            emit_indent(e);
-            emit(e, "__auto_type _zer_uw%d = ", tmp);
-            emit_expr(e, node->if_stmt.cond);
-            emit(e, ";\n");
-            emit_indent(e);
-            if (is_ptr_opt) {
-                emit(e, "if (_zer_uw%d) ", tmp);
-            } else {
-                emit(e, "if (_zer_uw%d.has_value) ", tmp);
-            }
-            /* inject capture variable into the then body */
-            emit(e, "{\n");
-            e->indent++;
-            emit_indent(e);
-            if (is_ptr_opt) {
-                emit(e, "__auto_type %.*s = _zer_uw%d;\n",
-                     (int)node->if_stmt.capture_name_len,
-                     node->if_stmt.capture_name, tmp);
-            } else if (node->if_stmt.capture_is_ptr) {
-                /* |*val| → pointer to the optional's value field */
-                emit(e, "__auto_type %.*s = &_zer_uw%d.value;\n",
+
+            if (node->if_stmt.capture_is_ptr && !is_ptr_opt) {
+                /* |*val| on struct optional — need pointer to original */
+                emit_indent(e);
+                emit_type(e, cond_type);
+                emit(e, " *_zer_uwp%d = &(", tmp);
+                emit_expr(e, node->if_stmt.cond);
+                emit(e, ");\n");
+                emit_indent(e);
+                emit(e, "if (_zer_uwp%d->has_value) ", tmp);
+                emit(e, "{\n");
+                e->indent++;
+                emit_indent(e);
+                emit(e, "__auto_type %.*s = &_zer_uwp%d->value;\n",
                      (int)node->if_stmt.capture_name_len,
                      node->if_stmt.capture_name, tmp);
             } else {
-                emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
-                     (int)node->if_stmt.capture_name_len,
-                     node->if_stmt.capture_name, tmp);
+                /* |val| or ?*T — use copy */
+                emit_indent(e);
+                emit(e, "__auto_type _zer_uw%d = ", tmp);
+                emit_expr(e, node->if_stmt.cond);
+                emit(e, ";\n");
+                emit_indent(e);
+                if (is_ptr_opt) {
+                    emit(e, "if (_zer_uw%d) ", tmp);
+                } else {
+                    emit(e, "if (_zer_uw%d.has_value) ", tmp);
+                }
+                emit(e, "{\n");
+                e->indent++;
+                emit_indent(e);
+                if (is_ptr_opt) {
+                    emit(e, "__auto_type %.*s = _zer_uw%d;\n",
+                         (int)node->if_stmt.capture_name_len,
+                         node->if_stmt.capture_name, tmp);
+                } else {
+                    emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
+                         (int)node->if_stmt.capture_name_len,
+                         node->if_stmt.capture_name, tmp);
+                }
             }
             /* emit then body contents (unwrap the block) */
             if (node->if_stmt.then_body->kind == NODE_BLOCK) {

@@ -104,33 +104,76 @@ static Symbol *find_symbol(Checker *c, const char *name, uint32_t name_len, int 
  * We store the resolved Type* for each expression node in a simple
  * hash map keyed by node pointer. This avoids modifying the Node struct. */
 
-/* 4096 slots sufficient for embedded-scale programs; revisit for large codebases */
-#define TYPE_MAP_SIZE 4096
+/* ---- Dynamic type map: open-addressing hash, grows when >70% full ---- */
 
 typedef struct {
     Node *key;
     Type *type;
 } TypeMapEntry;
 
-static TypeMapEntry type_map[TYPE_MAP_SIZE];
+static TypeMapEntry *type_map = NULL;
+static uint32_t type_map_size = 0;
+static uint32_t type_map_count = 0;
+static Arena *type_map_arena = NULL;
+
+#define TYPE_MAP_INIT_SIZE 4096
+
+static void typemap_init(Arena *a) {
+    type_map_arena = a;
+    type_map_size = TYPE_MAP_INIT_SIZE;
+    type_map = (TypeMapEntry *)arena_alloc(a, type_map_size * sizeof(TypeMapEntry));
+    type_map_count = 0;
+}
+
+static void typemap_grow(void) {
+    uint32_t old_size = type_map_size;
+    TypeMapEntry *old_map = type_map;
+    type_map_size = old_size * 2;
+    type_map = (TypeMapEntry *)arena_alloc(type_map_arena,
+        type_map_size * sizeof(TypeMapEntry));
+    type_map_count = 0;
+    /* rehash all existing entries */
+    for (uint32_t i = 0; i < old_size; i++) {
+        if (old_map[i].key) {
+            uint32_t idx = ((uintptr_t)old_map[i].key >> 3) % type_map_size;
+            for (uint32_t j = 0; j < type_map_size; j++) {
+                uint32_t slot = (idx + j) % type_map_size;
+                if (!type_map[slot].key) {
+                    type_map[slot] = old_map[i];
+                    type_map_count++;
+                    break;
+                }
+            }
+        }
+    }
+}
 
 static void typemap_set(Node *node, Type *type) {
-    uint32_t idx = ((uintptr_t)node >> 3) % TYPE_MAP_SIZE;
-    for (uint32_t i = 0; i < TYPE_MAP_SIZE; i++) {
-        uint32_t slot = (idx + i) % TYPE_MAP_SIZE;
-        if (!type_map[slot].key || type_map[slot].key == node) {
+    /* grow at 70% load to keep collisions low */
+    if (type_map_count * 10 > type_map_size * 7) {
+        typemap_grow();
+    }
+    uint32_t idx = ((uintptr_t)node >> 3) % type_map_size;
+    for (uint32_t i = 0; i < type_map_size; i++) {
+        uint32_t slot = (idx + i) % type_map_size;
+        if (!type_map[slot].key) {
             type_map[slot].key = node;
+            type_map[slot].type = type;
+            type_map_count++;
+            return;
+        }
+        if (type_map[slot].key == node) {
             type_map[slot].type = type;
             return;
         }
     }
-    /* map full — should not happen for reasonable programs */
 }
 
 static Type *typemap_get(Node *node) {
-    uint32_t idx = ((uintptr_t)node >> 3) % TYPE_MAP_SIZE;
-    for (uint32_t i = 0; i < TYPE_MAP_SIZE; i++) {
-        uint32_t slot = (idx + i) % TYPE_MAP_SIZE;
+    if (!type_map) return NULL;
+    uint32_t idx = ((uintptr_t)node >> 3) % type_map_size;
+    for (uint32_t i = 0; i < type_map_size; i++) {
+        uint32_t slot = (idx + i) % type_map_size;
         if (type_map[slot].key == node) return type_map[slot].type;
         if (!type_map[slot].key) return NULL;
     }
@@ -1582,8 +1625,8 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     c->global_scope = scope_new(arena, NULL);
     c->current_scope = c->global_scope;
 
-    /* clear type map */
-    memset(type_map, 0, sizeof(type_map));
+    /* init dynamic type map */
+    typemap_init(arena);
 
     /* init non-storable tracking */
     non_storable_init(arena);

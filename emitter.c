@@ -411,6 +411,8 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_INDEX:
+        /* Bounds check emitted at statement level (emit_stmt), not here.
+         * Expression-level check breaks C lvalue rules on assignment LHS. */
         emit_expr(e, node->index_expr.object);
         emit(e, "[");
         emit_expr(e, node->index_expr.index);
@@ -712,6 +714,57 @@ static void emit_expr(Emitter *e, Node *node) {
  * STATEMENT EMISSION
  * ================================================================ */
 
+/* ---- Bounds check insertion (statement level) ----
+ * Walk an expression tree, find all NODE_INDEX on arrays,
+ * emit _zer_bounds_check() for each BEFORE the statement. */
+
+static void emit_bounds_checks(Emitter *e, Node *node) {
+    if (!node) return;
+
+    if (node->kind == NODE_INDEX) {
+        Type *obj_type = checker_get_type(node->index_expr.object);
+        if (obj_type && obj_type->kind == TYPE_ARRAY && obj_type->array.size > 0) {
+            emit_indent(e);
+            emit(e, "_zer_bounds_check((size_t)(");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "), %u, __FILE__, __LINE__);\n", obj_type->array.size);
+        }
+        /* recurse into object too (nested: arr[i][j]) */
+        emit_bounds_checks(e, node->index_expr.object);
+        emit_bounds_checks(e, node->index_expr.index);
+        return;
+    }
+
+    /* recurse into subexpressions */
+    switch (node->kind) {
+    case NODE_BINARY:
+        emit_bounds_checks(e, node->binary.left);
+        emit_bounds_checks(e, node->binary.right);
+        break;
+    case NODE_UNARY:
+        emit_bounds_checks(e, node->unary.operand);
+        break;
+    case NODE_ASSIGN:
+        emit_bounds_checks(e, node->assign.target);
+        emit_bounds_checks(e, node->assign.value);
+        break;
+    case NODE_CALL:
+        emit_bounds_checks(e, node->call.callee);
+        for (int i = 0; i < node->call.arg_count; i++)
+            emit_bounds_checks(e, node->call.args[i]);
+        break;
+    case NODE_FIELD:
+        emit_bounds_checks(e, node->field.object);
+        break;
+    case NODE_ORELSE:
+        emit_bounds_checks(e, node->orelse.expr);
+        if (node->orelse.fallback) emit_bounds_checks(e, node->orelse.fallback);
+        break;
+    default:
+        break;
+    }
+}
+
 /* emit all accumulated defers in reverse order */
 static void emit_defers(Emitter *e) {
     for (int i = e->defer_stack.count - 1; i >= 0; i--) {
@@ -746,6 +799,10 @@ static void emit_stmt(Emitter *e, Node *node) {
 
     case NODE_VAR_DECL: {
         Type *type = resolve_type_for_emit(e, node->var_decl.type);
+
+        /* bounds checks for initializer */
+        if (node->var_decl.init)
+            emit_bounds_checks(e, node->var_decl.init);
 
         /* Special case: u32 y = x orelse return;
          * → { auto _t = x; if (!_t.has_value) return; }
@@ -958,6 +1015,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_RETURN:
+        if (node->ret.expr) emit_bounds_checks(e, node->ret.expr);
         /* emit defers before return (reverse order) */
         emit_defers(e);
         emit_indent(e);
@@ -1007,6 +1065,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_EXPR_STMT:
+        emit_bounds_checks(e, node->expr_stmt.expr);
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");
@@ -1388,6 +1447,12 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
     emit(e, "    abort();\n");
     emit(e, "#endif\n");
+    emit(e, "}\n\n");
+
+    /* bounds check helper — works in comma expressions (LHS and RHS safe) */
+    emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "
+            "const char *file, int line) {\n");
+    emit(e, "    if (idx >= len) _zer_trap(\"array index out of bounds\", file, line);\n");
     emit(e, "}\n\n");
 
     emit(e, "static inline void *_zer_pool_get(void *slots, uint16_t *gen, uint8_t *used, "

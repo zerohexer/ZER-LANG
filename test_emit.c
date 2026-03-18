@@ -1052,6 +1052,48 @@ int main(void) {
         141,
         "pool alloc/free/realloc: 42 + 99 = 141");
 
+    printf("[bounds check — valid access]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 10;\n"
+        "    arr[3] = 40;\n"
+        "    return arr[0] + arr[3];\n"
+        "}\n",
+        50,
+        "valid array access passes bounds check = 50");
+
+    printf("[bounds check — out of bounds traps]\n");
+    /* out-of-bounds access should abort (non-zero exit) */
+    {
+        tests_run++;
+        Arena a; arena_init(&a, 128*1024);
+        if (zer_to_c(
+            "u32 main() {\n"
+            "    u32[4] arr;\n"
+            "    arr[10] = 99;\n"
+            "    return 0;\n"
+            "}\n", "_zer_test_out.c")) {
+            int gcc = system("gcc -std=c99 -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt");
+            if (gcc == 0) {
+                int run = system(".\\_zer_test_out.exe");
+                if (run != 0) {
+                    tests_passed++; /* non-zero exit = trap fired */
+                } else {
+                    printf("  FAIL: bounds check — out of bounds should trap\n");
+                    tests_failed++;
+                }
+            } else {
+                printf("  FAIL: bounds check — GCC compilation failed\n");
+                tests_failed++;
+            }
+        } else {
+            printf("  FAIL: bounds check — ZER compilation failed\n");
+            tests_failed++;
+        }
+        arena_free(&a);
+    }
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

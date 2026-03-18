@@ -111,12 +111,11 @@ static Module *find_or_create_module(Compiler *cc, const char *name, size_t name
 
 /* parse a module (recursively resolves imports) */
 static bool parse_module(Compiler *cc, Module *m) {
-    if (m->parsed) return true;
-
     if (m->checking) {
-        fprintf(stderr, "error: circular import detected: '%s'\n", m->name);
+        fprintf(stderr, "error: circular import detected: '%s' imports itself (directly or indirectly)\n", m->name);
         return false;
     }
+    if (m->parsed) return true;
     m->checking = true;
 
     /* read source */
@@ -138,7 +137,7 @@ static bool parse_module(Compiler *cc, Module *m) {
     }
 
     m->parsed = true;
-    m->checking = false;
+    /* keep checking=true until imports resolved (circular detection) */
 
     /* resolve imports in this module */
     for (int i = 0; i < m->ast->file.decl_count; i++) {
@@ -152,6 +151,7 @@ static bool parse_module(Compiler *cc, Module *m) {
         }
     }
 
+    m->checking = false; /* imports resolved, safe to clear */
     return true;
 }
 
@@ -236,6 +236,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     main_mod->parsed = true;
+    main_mod->checking = true; /* for circular import detection */
 
     /* resolve imports */
     for (int i = 0; i < main_mod->ast->file.decl_count; i++) {

@@ -1070,11 +1070,20 @@ static void emit_stmt(Emitter *e, Node *node) {
             else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
                      e->current_func_ret->optional.inner->kind != TYPE_POINTER &&
                      node->ret.expr->kind != NODE_NULL_LIT) {
-                emit(e, "return (");
-                emit_type(e, e->current_func_ret);
-                emit(e, "){ ");
-                emit_expr(e, node->ret.expr);
-                emit(e, ", 1 };\n");
+                /* check if expr already has the optional type (e.g. return ring.pop()) */
+                Type *expr_type = checker_get_type(node->ret.expr);
+                if (expr_type && type_equals(expr_type, e->current_func_ret)) {
+                    /* already optional — return directly, no wrapping */
+                    emit(e, "return ");
+                    emit_expr(e, node->ret.expr);
+                    emit(e, ";\n");
+                } else {
+                    emit(e, "return (");
+                    emit_type(e, e->current_func_ret);
+                    emit(e, "){ ");
+                    emit_expr(e, node->ret.expr);
+                    emit(e, ", 1 };\n");
+                }
             } else {
                 emit(e, "return ");
                 emit_expr(e, node->ret.expr);

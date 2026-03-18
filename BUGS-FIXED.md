@@ -82,3 +82,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** `emit_defers()` emitted from index 0 (all defers). Break should only emit defers within the loop scope.
 - **Fix:** Added `loop_defer_base` to Emitter. Loops save/restore it. Break/continue use `emit_defers_from(e, e->loop_defer_base)` instead of `emit_defers(e)`. Return still emits all.
 - **Test:** `test_firmware_patterns2.c` — inner break + outer defer
+
+---
+
+## Round 3 — Firmware Pattern Stress Tests (2026-03-19)
+
+### BUG-013: `return ring.pop()` from `?u8` function double-wraps optional
+- **Symptom:** `?u8 uart_recv() { return rx_buf.pop(); }` emits `return (_zer_opt_u8){ <already_opt>, 1 }` — GCC error
+- **Root cause:** Emitter always wraps return value in `{expr, 1}` for `?T` functions, even when expr is already `?T`
+- **Fix:** Check if return expr's type already matches function return type via `checker_get_type` + `type_equals`. If so, return directly without wrapping.
+- **Test:** `test_firmware_patterns3.c` — UART loopback with ring.pop() return

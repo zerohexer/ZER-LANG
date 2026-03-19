@@ -294,7 +294,29 @@ static void emit_expr(Emitter *e, Node *node) {
         case TOK_RSHIFTEQ:  emit(e, " >>= "); break;
         default:            emit(e, " = "); break;
         }
-        emit_expr(e, node->assign.value);
+        /* T → ?T wrap: if target is optional and value isn't, wrap in {value, 1} */
+        Type *tgt_type = checker_get_type(node->assign.target);
+        Type *val_type = checker_get_type(node->assign.value);
+        if (node->assign.op == TOK_EQ && tgt_type && val_type &&
+            tgt_type->kind == TYPE_OPTIONAL &&
+            tgt_type->optional.inner->kind != TYPE_POINTER &&
+            val_type->kind != TYPE_OPTIONAL &&
+            node->assign.value->kind != NODE_NULL_LIT) {
+            emit(e, "(");
+            emit_type(e, tgt_type);
+            emit(e, "){ ");
+            emit_expr(e, node->assign.value);
+            emit(e, ", 1 }");
+        } else if (node->assign.op == TOK_EQ && tgt_type &&
+                   tgt_type->kind == TYPE_OPTIONAL &&
+                   tgt_type->optional.inner->kind != TYPE_POINTER &&
+                   node->assign.value->kind == NODE_NULL_LIT) {
+            emit(e, "(");
+            emit_type(e, tgt_type);
+            emit(e, "){ 0, 0 }");
+        } else {
+            emit_expr(e, node->assign.value);
+        }
         assign_done:
         break;
 

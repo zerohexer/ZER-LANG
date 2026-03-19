@@ -21,7 +21,7 @@
  *   5. Emit C
  * ================================================================ */
 
-#define MAX_MODULES 64
+#define MAX_MODULES 256
 
 typedef struct {
     const char *name;       /* module name (e.g., "uart") */

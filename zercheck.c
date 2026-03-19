@@ -70,7 +70,7 @@ static int find_pool_id(ZerCheck *zc, const char *name, uint32_t name_len) {
 static int register_pool(ZerCheck *zc, const char *name, uint32_t name_len) {
     int id = find_pool_id(zc, name, name_len);
     if (id >= 0) return id;
-    if (zc->pool_count >= 16) return -1;
+    if (zc->pool_count >= 64) return -1;
     id = zc->pool_count;
     zc->pools[zc->pool_count].name = name;
     zc->pools[zc->pool_count].name_len = name_len;

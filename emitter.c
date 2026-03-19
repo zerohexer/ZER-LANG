@@ -1130,6 +1130,8 @@ static void emit_stmt(Emitter *e, Node *node) {
         /* push onto defer stack — will be emitted at block end in reverse */
         if (e->defer_stack.count < MAX_DEFERS) {
             e->defer_stack.stmts[e->defer_stack.count++] = node->defer.body;
+        } else {
+            fprintf(stderr, "error: too many defers in scope (max %d)\n", MAX_DEFERS);
         }
         break;
 

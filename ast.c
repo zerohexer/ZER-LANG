@@ -15,7 +15,9 @@ void arena_init(Arena *a, size_t capacity) {
         fprintf(stderr, "error: arena allocation failed (%zu bytes)\n", capacity);
         exit(1);
     }
-    a->used = 0;
+    /* first 8 bytes = chain pointer (NULL for first block) */
+    *(char **)a->buf = NULL;
+    a->used = 8;
     a->capacity = capacity;
 }
 
@@ -23,9 +25,20 @@ void *arena_alloc(Arena *a, size_t size) {
     /* align to 8 bytes */
     size = (size + 7) & ~(size_t)7;
     if (a->used + size > a->capacity) {
-        fprintf(stderr, "error: arena out of memory (%zu / %zu)\n",
-                a->used + size, a->capacity);
-        exit(1);
+        /* Cannot realloc — would invalidate all pointers into the arena.
+         * Allocate a new block. Chain the old block via first 8 bytes of new block. */
+        size_t new_cap = a->capacity * 2;
+        if (new_cap < size + 16) new_cap = size + 16;
+        char *new_buf = (char *)malloc(new_cap);
+        if (!new_buf) {
+            fprintf(stderr, "error: arena expansion failed (%zu bytes)\n", new_cap);
+            exit(1);
+        }
+        /* store pointer to old block at start of new block (for freeing) */
+        *(char **)new_buf = a->buf;
+        a->buf = new_buf;
+        a->used = 8; /* skip the chain pointer */
+        a->capacity = new_cap;
     }
     void *ptr = a->buf + a->used;
     a->used += size;
@@ -34,7 +47,13 @@ void *arena_alloc(Arena *a, size_t size) {
 }
 
 void arena_free(Arena *a) {
-    free(a->buf);
+    /* walk the chain of blocks and free all */
+    char *block = a->buf;
+    while (block) {
+        char *prev = *(char **)block; /* chain pointer at start */
+        free(block);
+        block = prev;
+    }
     a->buf = NULL;
     a->used = 0;
     a->capacity = 0;

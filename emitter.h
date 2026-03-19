@@ -28,7 +28,7 @@
  * ================================================================ */
 
 /* deferred statement stack */
-#define MAX_DEFERS 64
+#define MAX_DEFERS 256
 typedef struct {
     Node *stmts[MAX_DEFERS];
     int count;

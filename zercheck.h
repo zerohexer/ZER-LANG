@@ -20,8 +20,8 @@
  * See zer-check-design.md for full design rationale.
  * ================================================================ */
 
-#define ZC_MAX_HANDLES 32
-#define ZC_MAX_PATHS 16
+#define ZC_MAX_HANDLES 128
+#define ZC_MAX_PATHS 32
 
 /* handle typestate */
 typedef enum {
@@ -58,7 +58,7 @@ typedef struct {
     int path_count;
 
     /* pool variable registry */
-    struct { const char *name; uint32_t name_len; int id; } pools[16];
+    struct { const char *name; uint32_t name_len; int id; } pools[64];
     int pool_count;
 } ZerCheck;
 

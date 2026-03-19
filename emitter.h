@@ -27,11 +27,11 @@
  *   Handle(T)          → uint32_t (gen << 16 | index)
  * ================================================================ */
 
-/* deferred statement stack */
-#define MAX_DEFERS 256
+/* deferred statement stack — grows dynamically */
 typedef struct {
-    Node *stmts[MAX_DEFERS];
+    Node **stmts;
     int count;
+    int capacity;
 } DeferStack;
 
 typedef struct {

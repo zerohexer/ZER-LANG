@@ -20,9 +20,6 @@
  * See zer-check-design.md for full design rationale.
  * ================================================================ */
 
-#define ZC_MAX_HANDLES 128
-#define ZC_MAX_PATHS 32
-
 /* handle typestate */
 typedef enum {
     HS_UNKNOWN,         /* not yet seen */
@@ -40,11 +37,19 @@ typedef struct {
     int free_line;          /* where freed (if FREED) */
 } HandleInfo;
 
-/* one execution path's view of all handles */
+/* one execution path's view of all handles — dynamic array */
 typedef struct {
-    HandleInfo handles[ZC_MAX_HANDLES];
+    HandleInfo *handles;    /* arena-allocated, grows as needed */
     int handle_count;
+    int handle_capacity;
 } PathState;
+
+/* pool registry entry */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    int id;
+} ZcPool;
 
 /* ZER-CHECK context */
 typedef struct {
@@ -53,13 +58,15 @@ typedef struct {
     const char *file_name;
     int error_count;
 
-    /* disjunctive path states */
-    PathState paths[ZC_MAX_PATHS];
+    /* disjunctive path states — dynamic */
+    PathState *paths;
     int path_count;
+    int path_capacity;
 
-    /* pool variable registry */
-    struct { const char *name; uint32_t name_len; int id; } pools[64];
+    /* pool variable registry — dynamic */
+    ZcPool *pools;
     int pool_count;
+    int pool_capacity;
 } ZerCheck;
 
 /* ---- API ---- */

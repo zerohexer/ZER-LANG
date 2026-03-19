@@ -21,8 +21,6 @@
  *   5. Emit C
  * ================================================================ */
 
-#define MAX_MODULES 256
-
 typedef struct {
     const char *name;       /* module name (e.g., "uart") */
     const char *path;       /* file path (e.g., "uart.zer") */
@@ -35,8 +33,9 @@ typedef struct {
 } Module;
 
 typedef struct {
-    Module modules[MAX_MODULES];
+    Module *modules;        /* dynamic array */
     int module_count;
+    int module_capacity;
     Arena arena;
     const char *source_dir; /* directory of main source file */
 } Compiler;
@@ -85,9 +84,17 @@ static Module *find_or_create_module(Compiler *cc, const char *name, size_t name
         }
     }
 
-    if (cc->module_count >= MAX_MODULES) {
-        fprintf(stderr, "error: too many modules (max %d)\n", MAX_MODULES);
-        return NULL;
+    /* grow modules array if needed */
+    if (cc->module_count >= cc->module_capacity) {
+        int new_cap = cc->module_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        Module *new_mods = (Module *)realloc(cc->modules, new_cap * sizeof(Module));
+        if (!new_mods) {
+            fprintf(stderr, "error: module array realloc failed\n");
+            return NULL;
+        }
+        cc->modules = new_mods;
+        cc->module_capacity = new_cap;
     }
 
     /* create new module */
@@ -211,9 +218,13 @@ int main(int argc, char **argv) {
     char dir_buf[256];
     cc.source_dir = get_dir(input_path, dir_buf, sizeof(dir_buf));
 
+    /* init module array */
+    cc.module_capacity = 16;
+    cc.modules = (Module *)malloc(cc.module_capacity * sizeof(Module));
+    memset(cc.modules, 0, cc.module_capacity * sizeof(Module));
+
     /* create main module */
     Module *main_mod = &cc.modules[cc.module_count++];
-    memset(main_mod, 0, sizeof(Module));
     main_mod->name = "<main>";
     main_mod->path = input_path;
 
@@ -304,24 +315,9 @@ int main(int argc, char **argv) {
      *
      * Cleanest: build emit order array via DFS, emit first gets preamble. */
     {
-        int emit_order[MAX_MODULES];
+        int *emit_order = (int *)malloc(cc.module_count * sizeof(int));
         int emit_count = 0;
-        bool visited[MAX_MODULES];
-        memset(visited, 0, sizeof(visited));
-
-        /* DFS to build topological order (post-order = dependencies first) */
-        /* We'll use an iterative approach with a stack */
-        int stack[MAX_MODULES * 2]; /* module index */
-        int stack_top = 0;
-
-        /* start from main (index 0) */
-        stack[stack_top++] = 0;
-        visited[0] = true;
-
-        /* Simple iterative DFS: push module, push its imports first */
-        /* Actually, let's just do a recursive helper inline */
-        /* Reset visited for proper DFS */
-        memset(visited, 0, sizeof(visited));
+        bool *visited = (bool *)calloc(cc.module_count, sizeof(bool));
 
         /* recursive topo sort via function pointer... or just inline loops.
          * For simplicity, iterate: repeatedly find modules with all deps emitted */
@@ -367,12 +363,15 @@ int main(int argc, char **argv) {
                 emit_file_no_preamble(&emitter, m->ast);
             }
         }
+        free(emit_order);
+        free(visited);
     }
 
     fclose(out);
 
     printf("zerc: %s → %s\n", input_path, output_path);
 
+    free(cc.modules);
     arena_free(&cc.arena);
     return 0;
 }

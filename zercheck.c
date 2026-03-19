@@ -1,17 +1,13 @@
 #include "zercheck.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdarg.h>
 
 /* ================================================================
  * ZER-CHECK Implementation
  *
- * Algorithm:
- *   1. Scan function for Handle variables and Pool declarations
- *   2. Walk statements, track typestate per handle per path
- *   3. At branches (if/else), fork paths
- *   4. Report errors with concrete path info
- *   5. Under-approximate: if unsure, stay silent
+ * All internal arrays are dynamic (malloc/realloc). No fixed limits.
  * ================================================================ */
 
 /* ---- Error reporting ---- */
@@ -28,12 +24,29 @@ static void zc_error(ZerCheck *zc, int line, const char *fmt, ...) {
 
 /* ---- Path state helpers ---- */
 
-static PathState *current_path(ZerCheck *zc) {
-    if (zc->path_count == 0) {
-        zc->path_count = 1;
-        memset(&zc->paths[0], 0, sizeof(PathState));
+static void pathstate_init(PathState *ps) {
+    ps->handles = NULL;
+    ps->handle_count = 0;
+    ps->handle_capacity = 0;
+}
+
+/* deep copy a PathState (allocates new handle array) */
+static PathState pathstate_copy(PathState *src) {
+    PathState dst;
+    dst.handle_count = src->handle_count;
+    dst.handle_capacity = src->handle_count > 0 ? src->handle_count : 4;
+    dst.handles = (HandleInfo *)malloc(dst.handle_capacity * sizeof(HandleInfo));
+    if (src->handle_count > 0) {
+        memcpy(dst.handles, src->handles, src->handle_count * sizeof(HandleInfo));
     }
-    return &zc->paths[0]; /* primary path */
+    return dst;
+}
+
+static void pathstate_free(PathState *ps) {
+    free(ps->handles);
+    ps->handles = NULL;
+    ps->handle_count = 0;
+    ps->handle_capacity = 0;
 }
 
 static HandleInfo *find_handle(PathState *ps, const char *name, uint32_t name_len) {
@@ -47,7 +60,15 @@ static HandleInfo *find_handle(PathState *ps, const char *name, uint32_t name_le
 }
 
 static HandleInfo *add_handle(PathState *ps, const char *name, uint32_t name_len) {
-    if (ps->handle_count >= ZC_MAX_HANDLES) return NULL;
+    if (ps->handle_count >= ps->handle_capacity) {
+        int new_cap = ps->handle_capacity * 2;
+        if (new_cap < 8) new_cap = 8;
+        HandleInfo *new_handles = (HandleInfo *)realloc(ps->handles,
+            new_cap * sizeof(HandleInfo));
+        if (!new_handles) return NULL;
+        ps->handles = new_handles;
+        ps->handle_capacity = new_cap;
+    }
     HandleInfo *h = &ps->handles[ps->handle_count++];
     memset(h, 0, sizeof(HandleInfo));
     h->name = name;
@@ -57,7 +78,8 @@ static HandleInfo *add_handle(PathState *ps, const char *name, uint32_t name_len
     return h;
 }
 
-/* find pool id by variable name */
+/* ---- Pool registry ---- */
+
 static int find_pool_id(ZerCheck *zc, const char *name, uint32_t name_len) {
     for (int i = 0; i < zc->pool_count; i++) {
         if (zc->pools[i].name_len == name_len &&
@@ -70,7 +92,15 @@ static int find_pool_id(ZerCheck *zc, const char *name, uint32_t name_len) {
 static int register_pool(ZerCheck *zc, const char *name, uint32_t name_len) {
     int id = find_pool_id(zc, name, name_len);
     if (id >= 0) return id;
-    if (zc->pool_count >= 64) return -1;
+    if (zc->pool_count >= zc->pool_capacity) {
+        int new_cap = zc->pool_capacity * 2;
+        if (new_cap < 8) new_cap = 8;
+        ZcPool *new_pools = (ZcPool *)realloc(zc->pools,
+            new_cap * sizeof(ZcPool));
+        if (!new_pools) return -1;
+        zc->pools = new_pools;
+        zc->pool_capacity = new_cap;
+    }
     id = zc->pool_count;
     zc->pools[zc->pool_count].name = name;
     zc->pools[zc->pool_count].name_len = name_len;
@@ -149,14 +179,6 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
     const char *vname = var_node->var_decl.name;
     uint32_t vlen = (uint32_t)var_node->var_decl.name_len;
 
-    /* check if this is a Handle type */
-    Type *vtype = NULL;
-    if (var_node->var_decl.type) {
-        /* look up in checker scope */
-        Symbol *sym = scope_lookup(zc->checker->global_scope, vname, vlen);
-        if (sym) vtype = sym->type;
-    }
-
     Node *init = var_node->var_decl.init;
     if (!init) return;
 
@@ -194,7 +216,6 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     switch (node->kind) {
     case NODE_CALL:
         zc_check_call(zc, ps, node);
-        /* recurse into args */
         for (int i = 0; i < node->call.arg_count; i++)
             zc_check_expr(zc, ps, node->call.args[i]);
         break;
@@ -240,15 +261,14 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
     case NODE_IF: {
         /* fork paths at if/else */
-        PathState then_state = *ps;
+        PathState then_state = pathstate_copy(ps);
         zc_check_stmt(zc, &then_state, node->if_stmt.then_body);
 
         if (node->if_stmt.else_body) {
-            PathState else_state = *ps;
+            PathState else_state = pathstate_copy(ps);
             zc_check_stmt(zc, &else_state, node->if_stmt.else_body);
 
-            /* merge: if freed on BOTH paths → definitely freed
-             * if freed on ONE path → maybe freed (flag it) */
+            /* merge: if freed on BOTH paths → definitely freed */
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
@@ -259,50 +279,30 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                         ps->handles[i].state = HS_FREED;
                         ps->handles[i].free_line = th->free_line;
                     } else if (th->state == HS_FREED || eh->state == HS_FREED) {
-                        /* freed on one path — conservatively mark as freed
-                         * to catch use-after-free on that path */
                         ps->handles[i].state = HS_FREED;
                         ps->handles[i].free_line = th->state == HS_FREED ?
                             th->free_line : eh->free_line;
                     }
                 }
             }
-        } else {
-            /* no else — then_state might have freed handles */
-            for (int i = 0; i < then_state.handle_count; i++) {
-                HandleInfo *orig = find_handle(ps, then_state.handles[i].name,
-                                               then_state.handles[i].name_len);
-                if (orig && then_state.handles[i].state == HS_FREED) {
-                    /* freed in then-branch but might not execute — keep alive
-                     * This is under-approximation: don't report unless certain */
-                }
-            }
+            pathstate_free(&else_state);
         }
+        pathstate_free(&then_state);
         break;
     }
 
     case NODE_FOR:
     case NODE_WHILE: {
-        /* analyze loop body once — check for cross-iteration bugs */
         Node *body = (node->kind == NODE_FOR) ?
             node->for_stmt.body : node->while_stmt.body;
 
-        /* save state before loop */
-        PathState pre_loop = *ps;
-
-        /* first iteration */
+        PathState pre_loop = pathstate_copy(ps);
         zc_check_stmt(zc, ps, body);
 
-        /* check: anything freed in body that was alive at loop entry?
-         * If so, second iteration would use-after-free */
         for (int i = 0; i < ps->handle_count; i++) {
             HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
                                           ps->handles[i].name_len);
             if (pre && pre->state == HS_ALIVE && ps->handles[i].state == HS_FREED) {
-                /* handle was alive before loop, freed inside.
-                 * If loop iterates again, it's use-after-free.
-                 * Only report if the handle is USED at the top of the loop body. */
-                /* For now, report a warning */
                 zc_error(zc, ps->handles[i].free_line,
                     "handle '%.*s' freed inside loop — may cause use-after-free "
                     "on next iteration (allocated at line %d)",
@@ -310,6 +310,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                     ps->handles[i].alloc_line);
             }
         }
+        pathstate_free(&pre_loop);
         break;
     }
 
@@ -319,16 +320,14 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         break;
 
     case NODE_DEFER:
-        /* defer bodies run later — don't analyze now */
         break;
 
     case NODE_SWITCH:
-        /* check switch expression */
         zc_check_expr(zc, ps, node->switch_stmt.expr);
-        /* check each arm */
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
-            PathState arm_state = *ps;
+            PathState arm_state = pathstate_copy(ps);
             zc_check_stmt(zc, &arm_state, node->switch_stmt.arms[i].body);
+            pathstate_free(&arm_state);
         }
         break;
 
@@ -342,11 +341,10 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 static void zc_check_function(ZerCheck *zc, Node *func) {
     if (!func->func_decl.body) return;
 
-    /* init path state */
     PathState ps;
-    memset(&ps, 0, sizeof(PathState));
-
+    pathstate_init(&ps);
     zc_check_stmt(zc, &ps, func->func_decl.body);
+    pathstate_free(&ps);
 }
 
 /* ================================================================
@@ -383,6 +381,10 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
             zc_check_function(zc, decl);
         }
     }
+
+    /* cleanup */
+    free(zc->pools);
+    zc->pools = NULL;
 
     return zc->error_count == 0;
 }

@@ -1128,11 +1128,19 @@ static void emit_stmt(Emitter *e, Node *node) {
 
     case NODE_DEFER:
         /* push onto defer stack — will be emitted at block end in reverse */
-        if (e->defer_stack.count < MAX_DEFERS) {
-            e->defer_stack.stmts[e->defer_stack.count++] = node->defer.body;
-        } else {
-            fprintf(stderr, "error: too many defers in scope (max %d)\n", MAX_DEFERS);
+        /* grow defer stack if needed */
+        if (e->defer_stack.count >= e->defer_stack.capacity) {
+            int new_cap = e->defer_stack.capacity * 2;
+            if (new_cap < 16) new_cap = 16;
+            Node **new_stmts = (Node **)malloc(new_cap * sizeof(Node *));
+            if (e->defer_stack.stmts) {
+                memcpy(new_stmts, e->defer_stack.stmts, e->defer_stack.count * sizeof(Node *));
+                free(e->defer_stack.stmts);
+            }
+            e->defer_stack.stmts = new_stmts;
+            e->defer_stack.capacity = new_cap;
         }
+        e->defer_stack.stmts[e->defer_stack.count++] = node->defer.body;
         break;
 
     case NODE_SWITCH: {

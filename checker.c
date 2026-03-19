@@ -239,6 +239,11 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
 
     case TYNODE_OPTIONAL: {
         Type *inner = resolve_type(c, tn->optional.inner);
+        if (inner->kind == TYPE_OPTIONAL) {
+            checker_error(c, tn->loc.line,
+                "nested optional '??T' is not supported");
+            return inner; /* return the inner ?T, not ??T */
+        }
         return type_optional(c->arena, inner);
     }
 

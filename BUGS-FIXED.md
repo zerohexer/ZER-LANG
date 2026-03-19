@@ -165,3 +165,19 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** `checker_register_file` processed modules in order [main, imports...]. Main's function signatures resolved before imported types were in scope.
 - **Fix:** Register imported modules first (loop from index 1), then main module (index 0).
 - **Test:** `ZER-Test/multi/firmware.zer` — uses ErrCode from error.zer in function signature
+
+---
+
+## Edge Case Session (2026-03-19)
+
+### BUG-023: Enum value rejected as array index
+- **Symptom:** `arr[Color.red]` → "array index must be integer, got 'Color'"
+- **Root cause:** `type_is_integer()` didn't include TYPE_ENUM. Enums are i32 internally but weren't recognized as integers.
+- **Fix:** Added TYPE_ENUM to `type_is_integer`, `type_is_signed`, and `type_width` (32-bit signed).
+- **Test:** `ZER-Test/edge_cases.zer` — enum as array index
+
+### BUG-024: `??u32` (nested optional) accepted but emits invalid C
+- **Symptom:** `??u32` compiles but emits anonymous struct wrapping another anonymous struct — GCC rejects
+- **Root cause:** Checker's `resolve_type` for TYNODE_OPTIONAL didn't reject optional-of-optional
+- **Fix:** Added check in resolve_type: if inner type is already TYPE_OPTIONAL, emit error "nested optional '??T' is not supported"
+- **Test:** `ZER-Test/test_opt_opt.zer` — rejected at compile time

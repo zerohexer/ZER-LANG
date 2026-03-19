@@ -105,7 +105,18 @@ If you can't commit (tests failing), stash.
 6. **`make check` immediately after fix**
    841+ tests must pass. If not — revert, re-examine root cause.
 
-7. **Commit before anything else**
+7. **Update BUGS-FIXED.md** with: symptom, root cause, fix, test reference.
+
+8. **Commit before anything else**
+
+### Always Update Docs After Changes
+
+After any bug fix or feature change that passes `make check`:
+- `BUGS-FIXED.md` — add the bug with symptom, root cause, fix, test
+- `README.md` — if test counts, features, or status changed
+- `ZER-LANG.md` — if spec behavior changed
+- `CLAUDE.md` — if workflow or debugging patterns changed
+Never leave doc updates for later. Do it in the same commit.
 
 ### Red Flags — Stop and Revert
 

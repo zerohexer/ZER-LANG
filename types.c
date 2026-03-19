@@ -135,6 +135,7 @@ bool type_is_integer(Type *a) {
     case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64:
     case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
     case TYPE_USIZE:
+    case TYPE_ENUM: /* enums are i32 internally */
         return true;
     default:
         return false;
@@ -144,6 +145,7 @@ bool type_is_integer(Type *a) {
 bool type_is_signed(Type *a) {
     switch (a->kind) {
     case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_ENUM: /* enums are i32 */
         return true;
     default:
         return false;
@@ -171,7 +173,7 @@ int type_width(Type *a) {
     switch (a->kind) {
     case TYPE_U8:  case TYPE_I8:  case TYPE_BOOL: return 8;
     case TYPE_U16: case TYPE_I16: return 16;
-    case TYPE_U32: case TYPE_I32: case TYPE_F32:  return 32;
+    case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_ENUM: return 32;
     case TYPE_U64: case TYPE_I64: case TYPE_F64:  return 64;
     case TYPE_USIZE: return 32; /* 32-bit target default, configurable later */
     default: return 0;

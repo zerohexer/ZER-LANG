@@ -265,8 +265,8 @@ static TypeNode *parse_type(Parser *p) {
 
 typedef enum {
     PREC_NONE,
-    PREC_ORELSE,        /* orelse */
     PREC_ASSIGN,        /* = += -= etc. */
+    PREC_ORELSE,        /* orelse */
     PREC_OR,            /* || */
     PREC_AND,           /* && */
     PREC_BIT_OR,        /* | */
@@ -638,7 +638,7 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
 }
 
 static Node *parse_expression(Parser *p) {
-    return parse_precedence(p, PREC_ORELSE);
+    return parse_precedence(p, PREC_ASSIGN);
 }
 
 /* ================================================================

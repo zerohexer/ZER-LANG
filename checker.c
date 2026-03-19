@@ -1491,7 +1491,8 @@ static void check_stmt(Checker *c, Node *node) {
 static void register_decl(Checker *c, Node *node) {
     switch (node->kind) {
     case NODE_STRUCT_DECL: {
-        /* create struct type and register */
+        /* create struct type — register BEFORE resolving fields
+         * so self-referential structs work: struct Node { ?*Node next; } */
         Type *t = (Type *)arena_alloc(c->arena, sizeof(Type));
         t->kind = TYPE_STRUCT;
         t->struct_type.name = node->struct_decl.name;
@@ -1499,7 +1500,11 @@ static void register_decl(Checker *c, Node *node) {
         t->struct_type.is_packed = node->struct_decl.is_packed;
         t->struct_type.field_count = (uint32_t)node->struct_decl.field_count;
 
-        /* resolve field types */
+        add_symbol(c, node->struct_decl.name,
+                   (uint32_t)node->struct_decl.name_len,
+                   t, node->loc.line);
+
+        /* now resolve field types (self-type is in scope) */
         if (node->struct_decl.field_count > 0) {
             t->struct_type.fields = (SField *)arena_alloc(c->arena,
                 node->struct_decl.field_count * sizeof(SField));
@@ -1512,10 +1517,6 @@ static void register_decl(Checker *c, Node *node) {
                 sf->is_keep = fd->is_keep;
             }
         }
-
-        add_symbol(c, node->struct_decl.name,
-                   (uint32_t)node->struct_decl.name_len,
-                   t, node->loc.line);
         break;
     }
 
@@ -1560,6 +1561,11 @@ static void register_decl(Checker *c, Node *node) {
         t->union_type.name_len = (uint32_t)node->union_decl.name_len;
         t->union_type.variant_count = (uint32_t)node->union_decl.variant_count;
 
+        /* register before resolving variants (same as struct) */
+        add_symbol(c, node->union_decl.name,
+                   (uint32_t)node->union_decl.name_len,
+                   t, node->loc.line);
+
         if (node->union_decl.variant_count > 0) {
             t->union_type.variants = (SUVariant *)arena_alloc(c->arena,
                 node->union_decl.variant_count * sizeof(SUVariant));
@@ -1571,10 +1577,6 @@ static void register_decl(Checker *c, Node *node) {
                 sv->type = resolve_type(c, uv->type);
             }
         }
-
-        add_symbol(c, node->union_decl.name,
-                   (uint32_t)node->union_decl.name_len,
-                   t, node->loc.line);
         break;
     }
 

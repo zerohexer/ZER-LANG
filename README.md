@@ -17,12 +17,10 @@ make check     # run all 841 tests
 ## Usage
 
 ```bash
-# compile a .zer file to C, then build with GCC
-./zerc input.zer -o output.c
-gcc -std=c99 -o program output.c
-
-# or let zerc pick the output name
-./zerc main.zer          # produces main.c
+./zerc input.zer -o output.c       # emit C
+./zerc input.zer --run             # emit C → GCC → run
+./zerc input.zer --lib -o lib.c    # emit without runtime (for C interop)
+gcc -std=c99 -o program output.c   # compile emitted C
 ```
 
 Multi-file with imports:
@@ -32,6 +30,12 @@ Multi-file with imports:
 # zerc resolves all imports automatically
 ./zerc main.zer -o firmware.c
 arm-none-eabi-gcc -std=c99 -o firmware.elf firmware.c
+```
+
+Compile as library (no runtime, for linking into C projects or online judges):
+
+```bash
+./zerc solution.zer --lib -o solution.c
 ```
 
 Link with any C library — the output is plain C:
@@ -188,7 +192,7 @@ Total:                      841 tests, all passing
 
 Additionally tested outside the main suite: 11 OS/kernel programs (hash map, scheduler, memory pool, event queue, TCP state machine, linked list, page allocator, VFS, IPC pipe, network stack, block cache), 5 multi-module programs (cross-module enums, structs, optionals, 5-module diamond imports), and 3 stress tests (5-level nested structs, all integer widths, union pipelines).
 
-22 compiler bugs found and fixed across 6 rounds of testing.
+24 compiler bugs found and fixed across 7 rounds of testing.
 
 ## Editor Support
 

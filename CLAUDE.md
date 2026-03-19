@@ -22,6 +22,8 @@ When starting a new session or lacking context:
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
 - On Windows: use `.\\_zer_test_out.exe` (backslash) to run test binaries from `system()` calls
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
+- Compiler flags: `--run` (compile+execute), `--lib` (no preamble/runtime, for C interop)
+- User-defined struct/enum/union names emit as-is (no `_zer_` prefix). Only internal names are prefixed.
 
 ## Git Rules
 

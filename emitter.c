@@ -438,6 +438,13 @@ static void emit_expr(Emitter *e, Node *node) {
     case NODE_FIELD: {
         /* check if object is an enum type → emit _ZER_EnumName_variant */
         Type *obj_type = checker_get_type(node->field.object);
+        /* fallback for imported modules: typemap may not have the node */
+        if (!obj_type && node->field.object->kind == NODE_IDENT) {
+            Symbol *sym = scope_lookup(e->checker->global_scope,
+                node->field.object->ident.name,
+                (uint32_t)node->field.object->ident.name_len);
+            if (sym) obj_type = sym->type;
+        }
         if (obj_type && obj_type->kind == TYPE_ENUM) {
             emit(e, "_ZER_%.*s_%.*s",
                  (int)obj_type->enum_type.name_len, obj_type->enum_type.name,
@@ -1727,7 +1734,60 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
         if (decl->kind == NODE_IMPORT) continue;
         switch (decl->kind) {
         case NODE_STRUCT_DECL: emit_struct_decl(e, decl); break;
-        case NODE_FUNC_DECL:   emit_func_decl(e, decl); break;
+
+        case NODE_ENUM_DECL:
+            emit(e, "/* enum %.*s */\n",
+                 (int)decl->enum_decl.name_len, decl->enum_decl.name);
+            for (int j = 0; j < decl->enum_decl.variant_count; j++) {
+                EnumVariant *v = &decl->enum_decl.variants[j];
+                emit(e, "#define _ZER_%.*s_%.*s %d\n",
+                     (int)decl->enum_decl.name_len, decl->enum_decl.name,
+                     (int)v->name_len, v->name, j);
+            }
+            emit(e, "\n");
+            break;
+
+        case NODE_UNION_DECL: {
+            emit(e, "/* tagged union %.*s */\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            for (int j = 0; j < decl->union_decl.variant_count; j++) {
+                UnionVariant *v = &decl->union_decl.variants[j];
+                emit(e, "#define _ZER_%.*s_TAG_%.*s %d\n",
+                     (int)decl->union_decl.name_len, decl->union_decl.name,
+                     (int)v->name_len, v->name, j);
+            }
+            emit(e, "struct _zer_union_%.*s {\n    int32_t _tag;\n    union {\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            for (int j = 0; j < decl->union_decl.variant_count; j++) {
+                UnionVariant *v = &decl->union_decl.variants[j];
+                Type *vtype = resolve_type_for_emit(e, v->type);
+                emit(e, "        ");
+                emit_type(e, vtype);
+                emit(e, " %.*s;\n", (int)v->name_len, v->name);
+            }
+            emit(e, "    };\n};\n\n");
+            break;
+        }
+
+        case NODE_FUNC_DECL:
+            /* skip pure extern forward decls (same as emit_file) */
+            if (!decl->func_decl.body) {
+                bool has_def = false;
+                for (int j = i + 1; j < file_node->file.decl_count; j++) {
+                    Node *other = file_node->file.decls[j];
+                    if (other->kind == NODE_FUNC_DECL && other->func_decl.body &&
+                        other->func_decl.name_len == decl->func_decl.name_len &&
+                        memcmp(other->func_decl.name, decl->func_decl.name,
+                               decl->func_decl.name_len) == 0) {
+                        has_def = true;
+                        break;
+                    }
+                }
+                if (!has_def) break;
+            }
+            emit_func_decl(e, decl);
+            break;
+
         case NODE_GLOBAL_VAR:  emit_global_var(e, decl); break;
         default: break;
         }

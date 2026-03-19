@@ -269,17 +269,26 @@ int main(int argc, char **argv) {
     Checker checker;
     checker_init(&checker, &cc.arena, input_path);
 
-    /* register imported module declarations into global scope */
+    /* register imported modules first (so their types are in scope for main) */
+    for (int i = 1; i < cc.module_count; i++) {
+        Module *m = &cc.modules[i];
+        if (m->ast) checker_register_file(&checker, m->ast);
+    }
+    /* register main module last */
+    if (main_mod->ast) checker_register_file(&checker, main_mod->ast);
+
+    /* type-check imported module bodies (declarations already registered) */
     for (int i = 1; i < cc.module_count; i++) {
         Module *m = &cc.modules[i];
         if (m->ast) {
-            checker_register_file(&checker, m->ast);
+            checker_check_bodies(&checker, m->ast);
         }
     }
 
-    /* check main file (imports already in scope) */
-    if (!checker_check(&checker, main_mod->ast)) {
+    /* type-check main file (full check — its decls were registered above) */
+    if (!checker_check_bodies(&checker, main_mod->ast)) {
         fprintf(stderr, "error: type check failed\n");
+        free(cc.modules);
         arena_free(&cc.arena);
         return 1;
     }

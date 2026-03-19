@@ -1736,20 +1736,12 @@ void checker_register_file(Checker *c, Node *file_node) {
     }
 }
 
-bool checker_check(Checker *c, Node *file_node) {
+/* check function bodies only (declarations already registered) */
+bool checker_check_bodies(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return false;
-
-    /* Pass 1: register all top-level declarations */
-    for (int i = 0; i < file_node->file.decl_count; i++) {
-        register_decl(c, file_node->file.decls[i]);
-    }
-
-    /* Pass 2: type-check all function bodies and global initializers */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         check_func_body(c, decl);
-
-        /* check global var initializers */
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
             Type *type = resolve_type(c, decl->var_decl.type);
             Type *init = check_expr(c, decl->var_decl.init);
@@ -1763,6 +1755,17 @@ bool checker_check(Checker *c, Node *file_node) {
             }
         }
     }
-
     return c->error_count == 0;
+}
+
+bool checker_check(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return false;
+
+    /* Pass 1: register all top-level declarations */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        register_decl(c, file_node->file.decls[i]);
+    }
+
+    /* Pass 2: type-check all function bodies and global initializers */
+    return checker_check_bodies(c, file_node);
 }

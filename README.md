@@ -168,26 +168,6 @@ RUNTIME TRAPS catch:      remaining ~1% (generation counter, bounds)
 SILENT CORRUPTION:        0%. impossible. never.
 ```
 
-## Compiler Architecture
-
-The ZER compiler (`zerc`) is written in C. It emits C code that compiles with any GCC version. All internal data structures are dynamic — no fixed limits.
-
-```
-Component              Lines
-─────────────────────────────
-Lexer                  ~740
-Parser/AST             ~2,230
-Type System            ~700
-Type Checker           ~1,800
-ZER-CHECK              ~470
-C Emitter              ~1,780
-Compiler Driver        ~400
-LSP Server             ~1,370
-─────────────────────────────
-Total                  ~9,600
-```
-
-Compare: GCC is 15 million lines. Rust compiler is 600K lines. ZER is small enough for one person to maintain.
 
 ## Tests
 

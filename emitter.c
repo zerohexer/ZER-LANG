@@ -75,6 +75,11 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_USIZE: emit(e, "_zer_opt_usize"); break;
         case TYPE_F32:   emit(e, "_zer_opt_f32"); break;
         case TYPE_F64:   emit(e, "_zer_opt_f64"); break;
+        case TYPE_STRUCT:
+            emit(e, "_zer_opt_%.*s",
+                 (int)t->optional.inner->struct_type.name_len,
+                 t->optional.inner->struct_type.name);
+            break;
         default:
             /* fallback: anonymous struct */
             emit(e, "struct { ");
@@ -865,7 +870,13 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
             if (node->var_decl.init->orelse.fallback_is_return) {
                 emit(e, "{ "); emit_defers(e);
-                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
+                    e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
+                    /* ?T function: return null optional */
+                    emit(e, "return (");
+                    emit_type(e, e->current_func_ret);
+                    emit(e, "){ 0, 0 }; }\n");
+                } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                     emit(e, "return 0; }\n");
                 } else {
                     emit(e, "return; }\n");
@@ -1081,7 +1092,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                 /* check if expr already has the optional type (e.g. return ring.pop()) */
                 Type *expr_type = checker_get_type(node->ret.expr);
                 if (expr_type && type_equals(expr_type, e->current_func_ret)) {
-                    /* already optional — return directly, no wrapping */
+                    /* already optional — return directly */
                     emit(e, "return ");
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
@@ -1369,7 +1380,11 @@ static void emit_struct_decl(Emitter *e, Node *node) {
         emit(e, ";\n");
     }
     e->indent--;
-    emit(e, "};\n\n");
+    emit(e, "};\n");
+    /* emit optional typedef for this struct: _zer_opt_StructName */
+    emit(e, "typedef struct { struct _zer_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n\n",
+         (int)node->struct_decl.name_len, node->struct_decl.name,
+         (int)node->struct_decl.name_len, node->struct_decl.name);
 }
 
 static void emit_func_decl(Emitter *e, Node *node) {

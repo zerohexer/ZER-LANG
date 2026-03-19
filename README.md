@@ -2,7 +2,7 @@
 
 **Systems programming language targeting embedded and low-level development, GCC/C first.**
 
-ZER is memory-safe C. Same syntax, same mental model, same hardware access — but the compiler prevents buffer overflows, use-after-free, null dereferences, and silent memory corruption. No runtime. No LLVM. No borrow checker.
+ZER is memory-safe C. Same syntax, same mental model, same hardware access — but the compiler prevents buffer overflows, use-after-free, null dereferences, and silent memory corruption.
 
 ## Build
 

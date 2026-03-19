@@ -16,6 +16,13 @@
  * - Safety insertion (bounds, zero) — separate pass
  * ================================================================ */
 
+/* Diagnostic entry — collected during checking, read by LSP */
+typedef struct {
+    int line;
+    int severity;       /* 1=error, 2=warning */
+    char message[256];
+} Diagnostic;
+
 typedef struct {
     Arena *arena;           /* arena for type allocations */
     Scope *global_scope;    /* module-level scope */
@@ -27,6 +34,11 @@ typedef struct {
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int defer_depth;        /* > 0 when inside a defer block */
     bool in_assign_target;  /* true when checking LHS of assignment */
+
+    /* diagnostic list — grows dynamically, read by LSP */
+    Diagnostic *diagnostics;
+    int diag_count;
+    int diag_capacity;
 } Checker;
 
 /* ---- API ---- */

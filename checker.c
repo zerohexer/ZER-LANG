@@ -18,10 +18,28 @@
 
 /* ---- Error reporting ---- */
 
+static void checker_add_diag(Checker *c, int line, int severity, const char *fmt, va_list ap) {
+    if (c->diag_count >= c->diag_capacity) {
+        int new_cap = c->diag_capacity * 2;
+        if (new_cap < 32) new_cap = 32;
+        Diagnostic *new_d = (Diagnostic *)realloc(c->diagnostics, new_cap * sizeof(Diagnostic));
+        if (new_d) { c->diagnostics = new_d; c->diag_capacity = new_cap; }
+    }
+    if (c->diag_count < c->diag_capacity) {
+        Diagnostic *d = &c->diagnostics[c->diag_count++];
+        d->line = line;
+        d->severity = severity;
+        vsnprintf(d->message, sizeof(d->message), fmt, ap);
+    }
+}
+
 static void checker_error(Checker *c, int line, const char *fmt, ...) {
     c->error_count++;
-    fprintf(stderr, "%s:%d: error: ", c->file_name, line);
     va_list args;
+    va_start(args, fmt);
+    checker_add_diag(c, line, 1, fmt, args);
+    va_end(args);
+    fprintf(stderr, "%s:%d: error: ", c->file_name, line);
     va_start(args, fmt);
     vfprintf(stderr, fmt, args);
     va_end(args);
@@ -30,8 +48,11 @@ static void checker_error(Checker *c, int line, const char *fmt, ...) {
 
 static void checker_warning(Checker *c, int line, const char *fmt, ...) {
     c->warning_count++;
-    fprintf(stderr, "%s:%d: warning: ", c->file_name, line);
     va_list args;
+    va_start(args, fmt);
+    checker_add_diag(c, line, 2, fmt, args);
+    va_end(args);
+    fprintf(stderr, "%s:%d: warning: ", c->file_name, line);
     va_start(args, fmt);
     vfprintf(stderr, fmt, args);
     va_end(args);

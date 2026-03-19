@@ -538,20 +538,6 @@ static void run_diagnostics(Document *doc) {
     diag_count = 0;
     if (!doc || !doc->text) return;
 
-    /* redirect stderr to capture error messages */
-    fflush(stderr);
-    int saved_stderr = dup(fileno(stderr));
-
-    /* create temp file for stderr capture */
-    FILE *tmp = tmpfile();
-    if (!tmp) {
-        /* tmpfile() may fail on Windows — fallback to explicit temp file */
-        tmp = fopen("_zer_lsp_err.tmp", "w+b");
-    }
-    if (!tmp) { dup2(saved_stderr, fileno(stderr)); close(saved_stderr); return; }
-    dup2(fileno(tmp), fileno(stderr));
-
-    /* ---- Run pipeline ---- */
     Arena arena;
     arena_init(&arena, 256 * 1024);
 
@@ -564,11 +550,36 @@ static void run_diagnostics(Document *doc) {
     parser_init(&parser, &scanner, &arena, fname);
     Node *file_node = parse_file(&parser);
 
+    if (parser.had_error) {
+        /* parser error — add a generic diagnostic */
+        if (diag_count < MAX_DIAGS) {
+            LspDiagnostic *d = &diag_buf[diag_count++];
+            d->line = parser.previous.line > 0 ? parser.previous.line - 1 : 0;
+            d->col = 0;
+            d->severity = 1;
+            snprintf(d->message, sizeof(d->message), "parse error");
+        }
+    }
+
     if (!parser.had_error && file_node) {
         Checker checker;
         checker_init(&checker, &arena, fname);
-        if (checker_check(&checker, file_node)) {
-            /* zercheck pass */
+        checker_check(&checker, file_node);
+
+        /* read diagnostics directly from checker's list */
+        for (int i = 0; i < checker.diag_count && diag_count < MAX_DIAGS; i++) {
+            LspDiagnostic *d = &diag_buf[diag_count++];
+            d->line = checker.diagnostics[i].line > 0 ? checker.diagnostics[i].line - 1 : 0;
+            d->col = 0;
+            d->severity = checker.diagnostics[i].severity;
+            strncpy(d->message, checker.diagnostics[i].message, sizeof(d->message) - 1);
+            d->message[sizeof(d->message) - 1] = '\0';
+        }
+
+        /* free checker diagnostics */
+        free(checker.diagnostics);
+
+        if (checker.error_count == 0) {
             ZerCheck zc;
             zercheck_init(&zc, &checker, &arena, fname);
             zercheck_run(&zc, file_node);
@@ -576,27 +587,6 @@ static void run_diagnostics(Document *doc) {
     }
 
     arena_free(&arena);
-
-    /* ---- Restore stderr, read captured output ---- */
-    fflush(stderr);
-    dup2(saved_stderr, fileno(stderr));
-    close(saved_stderr);
-
-    /* read captured stderr */
-    fseek(tmp, 0, SEEK_END);
-    long err_len = ftell(tmp);
-    fseek(tmp, 0, SEEK_SET);
-
-    if (err_len > 0) {
-        char *err_buf = (char *)malloc((size_t)err_len + 1);
-        size_t rd = fread(err_buf, 1, (size_t)err_len, tmp);
-        err_buf[rd] = '\0';
-        parse_stderr_diagnostics(err_buf);
-        free(err_buf);
-    }
-
-    fclose(tmp);
-    remove("_zer_lsp_err.tmp"); /* no-op if tmpfile() was used */
 }
 
 /* Build and send publishDiagnostics notification */

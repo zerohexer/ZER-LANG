@@ -180,18 +180,18 @@ Parser/AST             ~2,230
 Type System            ~700
 Type Checker           ~1,800
 ZER-CHECK              ~470
-C Emitter              ~1,720
-Compiler Driver        ~380
+C Emitter              ~1,780
+Compiler Driver        ~400
 LSP Server             ~1,370
 ─────────────────────────────
-Total                  ~9,400
+Total                  ~9,600
 ```
 
 Compare: GCC is 15 million lines. Rust compiler is 600K lines. ZER is small enough for one person to maintain.
 
 ## Tests
 
-Stress-tested against real production firmware patterns: MODBUS CRC, CAN bus frames, USB state machines, SPI flash drivers, bootloader flows, RTOS schedulers, I2C sensor drivers, DMA double buffers, and protocol parsers.
+Stress-tested against real production code: MODBUS CRC, CAN bus, USB state machines, SPI flash drivers, bootloaders, RTOS schedulers, I2C sensors, DMA buffers, protocol parsers, hash maps, linked lists, page allocators, VFS, IPC pipes, network stacks, block caches, and multi-module diamond imports.
 
 ```
 Lexer:                      218 tests
@@ -206,7 +206,9 @@ Production Firmware:          14 end-to-end tests
 Total:                      841 tests, all passing
 ```
 
-14 compiler bugs found and fixed during stress testing. Zero bugs found when testing against real production firmware patterns (MODBUS, CAN, USB, SPI, RTOS, bootloader, sensors).
+Additionally tested outside the main suite: 11 OS/kernel programs (hash map, scheduler, memory pool, event queue, TCP state machine, linked list, page allocator, VFS, IPC pipe, network stack, block cache), 5 multi-module programs (cross-module enums, structs, optionals, 5-module diamond imports), and 3 stress tests (5-level nested structs, all integer widths, union pipelines).
+
+22 compiler bugs found and fixed across 6 rounds of testing.
 
 ## Editor Support
 

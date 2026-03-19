@@ -320,8 +320,6 @@ make clean      # remove all build artifacts
 
 ## Commit Rules
 
-- All commits under zerohexer@gmail.com only
-- No AI attribution in commits
 - `make check` must pass before every commit
 - Update `BUGS-FIXED.md` when fixing bugs
 - Update `README.md` when test counts or features change

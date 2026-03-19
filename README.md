@@ -4,15 +4,6 @@
 
 ZER is memory-safe C. Same syntax, same mental model, same hardware access — but the compiler prevents buffer overflows, use-after-free, null dereferences, and silent memory corruption. No runtime. No LLVM. No borrow checker.
 
-```
-Safety spectrum:
-
-  C ----------- ZER -------------------- Rust
-  silent bugs   compile error             compile error
-  UB everywhere or runtime trap           borrow checker
-                never silent              always compile-time
-```
-
 ## Build
 
 Requires GCC (MinGW on Windows, gcc on Linux/Mac):

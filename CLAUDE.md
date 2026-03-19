@@ -118,6 +118,17 @@ If you can't commit (tests failing), stash.
 
 When you see these: `git checkout -- <file>`. Start over with a cleaner hypothesis.
 
+### Anti-Circular Rule
+
+If you've spent more than 3 debug cycles on the same bug without a confirmed root cause:
+1. STOP. Revert all uncommitted changes.
+2. State the bug in ONE sentence: "X returns Y but should return Z."
+3. Add ONE fprintf at the exact decision point.
+4. Run. Read. The output tells you where to look next.
+5. If the output contradicts your hypothesis, your hypothesis is wrong. Form a new one.
+
+The pattern that causes circular debugging: assuming the fix location before confirming the root cause. You end up modifying code that isn't the problem, which creates new symptoms that look like the original bug.
+
 ### The Pointer Auto-Deref Pattern (ZER-specific)
 
 When a field access bug presents:

@@ -184,16 +184,19 @@ static void register_module_decls(Compiler *cc, Checker *checker, Module *m) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: zerc <input.zer> [-o output.c]\n");
+        fprintf(stderr, "Usage: zerc <input.zer> [-o output.c] [--run]\n");
         return 1;
     }
 
     const char *input_path = argv[1];
     const char *output_path = NULL;
+    bool do_run = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (strcmp(argv[i], "--run") == 0) {
+            do_run = true;
         }
     }
 
@@ -370,6 +373,39 @@ int main(int argc, char **argv) {
     fclose(out);
 
     printf("zerc: %s → %s\n", input_path, output_path);
+
+    /* --run: compile with GCC and execute */
+    if (do_run) {
+        /* build exe path: replace .c with .exe (or append .exe) */
+        char exe_path[512];
+        size_t clen = strlen(output_path);
+        if (clen > 2 && strcmp(output_path + clen - 2, ".c") == 0) {
+            memcpy(exe_path, output_path, clen - 2);
+            strcpy(exe_path + clen - 2, ".exe");
+        } else {
+            snprintf(exe_path, sizeof(exe_path), "%s.exe", output_path);
+        }
+
+        char gcc_cmd[1024];
+        snprintf(gcc_cmd, sizeof(gcc_cmd), "gcc -std=c99 -O2 -o \"%s\" \"%s\"",
+                 exe_path, output_path);
+        printf("zerc: %s\n", gcc_cmd);
+        int gcc_ret = system(gcc_cmd);
+        if (gcc_ret != 0) {
+            fprintf(stderr, "zerc: gcc failed\n");
+            free(cc.modules);
+            arena_free(&cc.arena);
+            return 1;
+        }
+
+        char run_cmd[1024];
+        snprintf(run_cmd, sizeof(run_cmd), ".\\\"%s\"", exe_path);
+        printf("zerc: running %s\n", exe_path);
+        int run_ret = system(run_cmd);
+        free(cc.modules);
+        arena_free(&cc.arena);
+        return run_ret;
+    }
 
     free(cc.modules);
     arena_free(&cc.arena);

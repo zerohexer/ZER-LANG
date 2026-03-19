@@ -391,9 +391,17 @@ static void emit_expr(Emitter *e, Node *node) {
             /* normal function call */
             emit_expr(e, node->call.callee);
             emit(e, "(");
+            Type *callee_type = checker_get_type(node->call.callee);
             for (int i = 0; i < node->call.arg_count; i++) {
                 if (i > 0) emit(e, ", ");
+                /* slice→pointer decay: emit .ptr when passing []T to *T */
+                Type *arg_type = checker_get_type(node->call.args[i]);
+                bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
+                    callee_type && callee_type->kind == TYPE_FUNC_PTR &&
+                    (uint32_t)i < callee_type->func_ptr.param_count &&
+                    callee_type->func_ptr.params[i]->kind == TYPE_POINTER;
                 emit_expr(e, node->call.args[i]);
+                if (need_decay) emit(e, ".ptr");
             }
             emit(e, ")");
         }
@@ -1365,6 +1373,7 @@ static void emit_struct_decl(Emitter *e, Node *node) {
 }
 
 static void emit_func_decl(Emitter *e, Node *node) {
+
     Type *ret = resolve_type_for_emit(e, node->func_decl.return_type);
 
     /* static functions */
@@ -1576,6 +1585,24 @@ void emit_file(Emitter *e, Node *file_node) {
             break;
 
         case NODE_FUNC_DECL:
+            /* skip pure extern forward declarations (no body, no definition
+             * in this file) — avoids conflicts with <stdio.h>/<stdlib.h>.
+             * Forward decls that DO have a definition later (mutual recursion)
+             * are emitted as C prototypes. */
+            if (!decl->func_decl.body) {
+                bool has_def = false;
+                for (int j = i + 1; j < file_node->file.decl_count; j++) {
+                    Node *other = file_node->file.decls[j];
+                    if (other->kind == NODE_FUNC_DECL && other->func_decl.body &&
+                        other->func_decl.name_len == decl->func_decl.name_len &&
+                        memcmp(other->func_decl.name, decl->func_decl.name,
+                               decl->func_decl.name_len) == 0) {
+                        has_def = true;
+                        break;
+                    }
+                }
+                if (!has_def) break; /* pure extern — skip */
+            }
             emit_func_decl(e, decl);
             break;
 

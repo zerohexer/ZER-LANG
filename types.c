@@ -321,6 +321,11 @@ bool can_implicit_coerce(Type *from, Type *to) {
         }
     }
 
+    /* slice to pointer: []T → *T (decay, like C array-to-pointer) */
+    if (from->kind == TYPE_SLICE && to->kind == TYPE_POINTER) {
+        return type_equals(from->slice.inner, to->pointer.inner);
+    }
+
     return false;
 }
 

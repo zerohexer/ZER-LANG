@@ -1,0 +1,24 @@
+# Build artifacts
+*.o
+*.exe
+release/
+
+# Editor/IDE
+.idea/
+
+# Test temporaries
+_zer_*
+_e.txt
+_err.txt
+_gap_err.txt
+_int_err.txt
+_int_test.c
+_test.c
+_test_struct_return.c
+
+# VS Code extension
+editors/vscode/node_modules/
+
+# Misc
+hello.c
+hello.exe

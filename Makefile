@@ -73,6 +73,13 @@ check: test_lexer test_parser test_parser_edge test_checker test_checker_full te
 zer-lsp: zer_lsp.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+# ---- Release build (clean binaries in release/) ----
+release: zerc zer-lsp
+	mkdir -p release
+	cp -f zerc release/ 2>/dev/null; cp -f zerc.exe release/ 2>/dev/null; \
+	cp -f zer-lsp release/ 2>/dev/null; cp -f zer-lsp.exe release/ 2>/dev/null; \
+	echo "Release binaries in release/" && echo "Add to PATH: $(CURDIR)/release"
+
 # ---- Old demo (lexer only) ----
 demo_lexer: main.c lexer.c
 	$(CC) $(CFLAGS) -o $@ $^
@@ -95,5 +102,6 @@ clean:
 	      test_production test_production.exe \
 	      demo_lexer demo_lexer.exe \
 	      _zer_test_out.c _zer_test_out.exe _zer_test_out.o _zer_gcc_err.txt
+	rm -rf release
 
-.PHONY: check clean
+.PHONY: check clean release

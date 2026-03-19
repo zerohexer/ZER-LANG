@@ -1561,13 +1561,19 @@ void emit_file(Emitter *e, Node *file_node) {
 
     /* ZER trap — called on safety violations (use-after-free, bounds, etc.) */
     emit(e, "static void _zer_trap(const char *msg, const char *file, int line) {\n");
-    emit(e, "#ifdef __arm__\n");
-    emit(e, "    /* ARM embedded: infinite loop with breakpoint */\n");
+    emit(e, "#if defined(__arm__) || defined(__thumb__)\n");
     emit(e, "    (void)msg; (void)file; (void)line;\n");
-    emit(e, "    __asm__ volatile(\"bkpt #0\");\n");
-    emit(e, "    for(;;) {}\n");
+    emit(e, "    __asm__ volatile(\"bkpt #0\"); for(;;) {}\n");
+    emit(e, "#elif defined(__riscv)\n");
+    emit(e, "    (void)msg; (void)file; (void)line;\n");
+    emit(e, "    __asm__ volatile(\"ebreak\"); for(;;) {}\n");
+    emit(e, "#elif defined(__AVR__)\n");
+    emit(e, "    (void)msg; (void)file; (void)line;\n");
+    emit(e, "    __asm__ volatile(\"break\"); for(;;) {}\n");
+    emit(e, "#elif defined(__x86_64__) || defined(__i386__)\n");
+    emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
+    emit(e, "    __asm__ volatile(\"int3\");\n");
     emit(e, "#else\n");
-    emit(e, "    /* Hosted: print diagnostic and abort */\n");
     emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
     emit(e, "    abort();\n");
     emit(e, "#endif\n");

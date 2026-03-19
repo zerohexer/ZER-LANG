@@ -115,3 +115,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** No implicit coercion from []T to *T. String literals are const []u8.
 - **Fix:** Added []T → *T coercion in `can_implicit_coerce`. Emitter appends `.ptr` at call site when passing slice to pointer param. Pure extern forward declarations (no body) skipped in emission to avoid <stdio.h> conflicts.
 - **Test:** Hello World: `void puts(*u8 s); puts("Hello World");` compiles and runs
+
+---
+
+## OS/Kernel Pattern Session (2026-03-19)
+
+### BUG-017: `orelse return` in `?T` function emitted `return 0` instead of `return (?T){0,0}`
+- **Symptom:** `?u32 task_create() { Handle h = pool.alloc() orelse return; ... }` — GCC error, `return 0` incompatible with `_zer_opt_u32`
+- **Root cause:** Orelse-return emission only checked for void vs non-void. Didn't distinguish `?T` return type needing `{0, 0}`.
+- **Fix:** Added TYPE_OPTIONAL check in orelse-return emission path.
+- **Test:** `ZER-Test/scheduler.zer` — Pool-based task scheduler
+
+### BUG-018: `Ring(Struct).pop()` return causes GCC anonymous struct mismatch
+- **Symptom:** `?Event poll_event() { return event_queue.pop(); }` — GCC error, two anonymous structs with same layout but different types
+- **Root cause:** `?StructName` emitted as anonymous `struct { ... }` everywhere, creating incompatible types for same layout.
+- **Fix:** Named typedef `_zer_opt_StructName` emitted after every struct declaration. `emit_type` for TYPE_OPTIONAL(TYPE_STRUCT) uses the named typedef.
+- **Test:** `ZER-Test/event_queue.zer` — Ring(Event) with enum dispatch
+
+### BUG-019: Assigning `u32` to `?u32` emitted bare value (no optional wrapping)
+- **Symptom:** `?u32 best = null; best = some_value;` — GCC error, assigning `uint32_t` to `_zer_opt_u32`
+- **Root cause:** NODE_ASSIGN emission had no T→?T wrapping logic.
+- **Fix:** Added optional wrapping in NODE_ASSIGN: if target is `?T` and value is `T`, emit `(type){value, 1}`. For null, emit `{0, 0}`.
+- **Test:** `ZER-Test/net_stack.zer` — routing table with `?u32 best_gateway`
+
+---
+
+## Multi-Module Session (2026-03-19)
+
+### BUG-020: Imported module enums/unions not emitted in C output
+- **Symptom:** `DeviceStatus.offline` in imported module → GCC error `'DeviceStatus' undeclared`
+- **Root cause:** `emit_file_no_preamble` only handled NODE_STRUCT_DECL, NODE_FUNC_DECL, NODE_GLOBAL_VAR. Missing NODE_ENUM_DECL (#define constants) and NODE_UNION_DECL.
+- **Fix:** Added enum #define emission, union struct emission, and extern forward-decl skipping to `emit_file_no_preamble`.
+- **Test:** `ZER-Test/multi/driver.zer` — imports device.zer with enum DeviceStatus
+
+### BUG-020.1: Emitter enum value fallback for imported modules
+- **Symptom:** `DeviceStatus.offline` emitted as `DeviceStatus.offline` (invalid C) instead of `_ZER_DeviceStatus_offline` in imported module functions
+- **Root cause:** `checker_get_type(node->field.object)` returned NULL for imported module nodes — typemap had no entries. Enum value detection in NODE_FIELD failed.
+- **Fix:** Added scope_lookup fallback in NODE_FIELD: if checker_get_type returns NULL and object is NODE_IDENT, look up the identifier in global scope.
+- **Test:** `ZER-Test/multi/driver.zer` — enum values in imported module functions
+
+### BUG-021: Imported module function bodies never type-checked
+- **Symptom:** `gpio.mode = mode` in imported function emitted `gpio.mode` (dot) instead of `gpio->mode` (arrow) — pointer auto-deref failed
+- **Root cause:** Only `checker_check` was called on the main file. Imported modules only had `checker_register_file` (declarations only, no function bodies). Typemap had no entries for imported module expressions.
+- **Fix:** Added `checker_check_bodies()` — checks function bodies without re-registering declarations. Called on all imported modules before main.
+- **Test:** `ZER-Test/multi/firmware.zer` — imported HAL functions with pointer params
+
+### BUG-022: Main module registered before imports → types undefined
+- **Symptom:** `ErrCode init_system()` in main file → "undefined type 'ErrCode'" even though error.zer is imported
+- **Root cause:** `checker_register_file` processed modules in order [main, imports...]. Main's function signatures resolved before imported types were in scope.
+- **Fix:** Register imported modules first (loop from index 1), then main module (index 0).
+- **Test:** `ZER-Test/multi/firmware.zer` — uses ErrCode from error.zer in function signature

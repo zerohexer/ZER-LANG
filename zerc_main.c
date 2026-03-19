@@ -385,7 +385,7 @@ int main(int argc, char **argv) {
 
     fclose(out);
 
-    printf("zerc: %s → %s\n", input_path, output_path);
+    printf("zerc: %s -> %s\n", input_path, output_path);
 
     /* --run: compile with GCC and execute */
     if (do_run) {

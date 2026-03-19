@@ -92,3 +92,26 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** Emitter always wraps return value in `{expr, 1}` for `?T` functions, even when expr is already `?T`
 - **Fix:** Check if return expr's type already matches function return type via `checker_get_type` + `type_equals`. If so, return directly without wrapping.
 - **Test:** `test_firmware_patterns3.c` — UART loopback with ring.pop() return
+
+---
+
+## Linked List Session (2026-03-19)
+
+### BUG-014: Self-referential structs fail — "undefined type 'Node'"
+- **Symptom:** `struct Node { ?*Node next; }` — "undefined type 'Node'" on the `?*Node` field
+- **Root cause:** `register_decl` resolved field types BEFORE registering the struct name in scope. So `Node` wasn't in scope when its own field `?*Node` was resolved.
+- **Fix:** Move `add_symbol` BEFORE field type resolution for both structs and unions.
+- **Test:** `ZER-Test/linked_list.zer` — doubly linked list with ?*Node prev/next
+
+### BUG-015: `orelse` precedence lower than `=` — assignment eats the orelse
+- **Symptom:** `current = current.next orelse return` parsed as `(current = current.next) orelse return` instead of `current = (current.next orelse return)`
+- **Root cause:** Precedence table had PREC_ORELSE below PREC_ASSIGN. Assignment consumed `current.next` as its RHS, leaving `orelse return` outside.
+- **Debugging:** Confirmed via targeted debug: auto-deref returned kind=14 (TYPE_OPTIONAL) for `current.next`, but orelse handler received kind=13 (TYPE_POINTER). Typemap overwrite debug showed NO overwrites. This proved the orelse was receiving a different expression (`current` not `current.next`).
+- **Fix:** Swap PREC_ASSIGN and PREC_ORELSE in the precedence enum. Update `parse_expression` to start at PREC_ASSIGN.
+- **Test:** `ZER-Test/test_walk.zer` — linked list traversal with `current = current.next orelse return`
+
+### BUG-016: Slice-to-pointer decay missing for C interop
+- **Symptom:** `void puts(*u8 s); puts("Hello World");` — "expected '*u8', got '*u8'" (string literal is []u8, not *u8)
+- **Root cause:** No implicit coercion from []T to *T. String literals are const []u8.
+- **Fix:** Added []T → *T coercion in `can_implicit_coerce`. Emitter appends `.ptr` at call site when passing slice to pointer param. Pure extern forward declarations (no body) skipped in emission to avoid <stdio.h> conflicts.
+- **Test:** Hello World: `void puts(*u8 s); puts("Hello World");` compiles and runs

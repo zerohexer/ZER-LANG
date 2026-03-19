@@ -73,3 +73,67 @@ Before marking ANY component as "done":
 - If a bug is found, write a test that reproduces it BEFORE fixing
 - All tests must pass before any commit
 - Run `make check` before every push
+
+## Debugging Workflow — ZER Source Code Bugs
+
+### The Rule
+COMMIT before debugging. Always. No exceptions.
+If you can't commit (tests failing), stash.
+`git checkout -- file` reverts EVERYTHING including your fix.
+
+### Correct Workflow
+
+1. **Reproduce first**
+   Write the minimal ZER program that triggers the bug.
+   Smallest possible. One struct. One function. If you can't reproduce in 10 lines, simplify.
+
+2. **State what you expect vs what you get**
+   "current.next should return ?*Node (kind=14) but returns *Node (kind=13)"
+   Not "the orelse is broken somehow."
+
+3. **One debug line, targeted**
+   Add ONE fprintf at the exact decision point. Run. Read output. Remove debug. Fix.
+   Never add multiple debug prints across multiple files.
+
+4. **Confirm root cause before fixing**
+   "kind=13 is_optional=0 on pointer auto-deref path" — confirmed root cause.
+   "I think the typemap might be overwritten" — hypothesis, needs confirmation.
+
+5. **Fix one thing**
+   The fix should be 1-5 lines. If growing beyond that, you're fixing the wrong thing.
+
+6. **`make check` immediately after fix**
+   841+ tests must pass. If not — revert, re-examine root cause.
+
+7. **Commit before anything else**
+
+### Red Flags — Stop and Revert
+
+- Fix growing beyond 10 lines
+- Adding platform-specific ifdefs to fix a type bug
+- Restructuring unrelated code to make the fix work
+- Debug prints spreading across multiple files
+- Circular reasoning ("but it should work because...")
+- More than 2 rounds of debug-without-fix
+
+When you see these: `git checkout -- <file>`. Start over with a cleaner hypothesis.
+
+### The Pointer Auto-Deref Pattern (ZER-specific)
+
+When a field access bug presents:
+- **Value path** (`a.field`): struct field lookup at line ~848
+- **Pointer path** (`ptr.field`): auto-deref then field lookup at line ~878
+Check BOTH paths separately. They have different code and different bugs.
+
+### Prompt Template for Debugging Sessions
+
+When asking Claude to debug a ZER compiler bug:
+
+```
+Here is the minimal ZER program that fails: [paste]
+Here is the exact error: [paste]
+Here is what I expect: [one sentence]
+Here is the relevant compiler code: [paste the ONE function]
+Add one debug print to confirm the root cause.
+Do not restructure. Do not fix yet. Just confirm.
+```

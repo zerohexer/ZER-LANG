@@ -43,6 +43,7 @@ typedef struct {
     Type *current_func_ret; /* return type of current function */
     DeferStack defer_stack; /* current block's deferred statements */
     int loop_defer_base;    /* defer stack base at loop entry (for break/continue) */
+    bool lib_mode;          /* --lib: no prefix on struct names, no preamble */
 } Emitter;
 
 /* ---- API ---- */

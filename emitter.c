@@ -106,7 +106,7 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_STRUCT:
-        emit(e, "struct _zer_%.*s", (int)t->struct_type.name_len, t->struct_type.name);
+        emit(e, "struct %.*s", (int)t->struct_type.name_len, t->struct_type.name);
         break;
 
     case TYPE_ENUM:
@@ -114,7 +114,7 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_UNION:
-        emit(e, "struct _zer_union_%.*s", (int)t->union_type.name_len, t->union_type.name);
+        emit(e, "struct _union_%.*s", (int)t->union_type.name_len, t->union_type.name);
         break;
 
     case TYPE_HANDLE:
@@ -618,7 +618,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->intrinsic.args[0]);
             } else if (node->intrinsic.arg_count >= 2) {
                 /* args[0] = type name, args[1] = field name */
-                emit(e, "struct _zer_");
+                emit(e, "struct ");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
@@ -1394,10 +1394,10 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
 
 static void emit_struct_decl(Emitter *e, Node *node) {
     if (node->struct_decl.is_packed) {
-        emit(e, "struct __attribute__((packed)) _zer_%.*s {\n",
+        emit(e, "struct __attribute__((packed)) %.*s {\n",
              (int)node->struct_decl.name_len, node->struct_decl.name);
     } else {
-        emit(e, "struct _zer_%.*s {\n",
+        emit(e, "struct %.*s {\n",
              (int)node->struct_decl.name_len, node->struct_decl.name);
     }
     e->indent++;
@@ -1410,8 +1410,8 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     }
     e->indent--;
     emit(e, "};\n");
-    /* emit optional typedef for this struct: _zer_opt_StructName */
-    emit(e, "typedef struct { struct _zer_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n\n",
+    /* emit optional typedef for this struct */
+    emit(e, "typedef struct { struct %.*s value; uint8_t has_value; } _zer_opt_%.*s;\n\n",
          (int)node->struct_decl.name_len, node->struct_decl.name,
          (int)node->struct_decl.name_len, node->struct_decl.name);
 }
@@ -1665,7 +1665,7 @@ void emit_file(Emitter *e, Node *file_node) {
                      (int)decl->union_decl.name_len, decl->union_decl.name,
                      (int)v->name_len, v->name, j);
             }
-            emit(e, "struct _zer_union_%.*s {\n",
+            emit(e, "struct _union_%.*s {\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name);
             emit(e, "    int32_t _tag;\n");
             emit(e, "    union {\n");
@@ -1756,7 +1756,7 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
                      (int)decl->union_decl.name_len, decl->union_decl.name,
                      (int)v->name_len, v->name, j);
             }
-            emit(e, "struct _zer_union_%.*s {\n    int32_t _tag;\n    union {\n",
+            emit(e, "struct _union_%.*s {\n    int32_t _tag;\n    union {\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name);
             for (int j = 0; j < decl->union_decl.variant_count; j++) {
                 UnionVariant *v = &decl->union_decl.variants[j];

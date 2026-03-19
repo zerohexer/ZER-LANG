@@ -191,12 +191,15 @@ int main(int argc, char **argv) {
     const char *input_path = argv[1];
     const char *output_path = NULL;
     bool do_run = false;
+    bool no_preamble = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--run") == 0) {
             do_run = true;
+        } else if (strcmp(argv[i], "--lib") == 0) {
+            no_preamble = true;
         }
     }
 
@@ -303,6 +306,7 @@ int main(int argc, char **argv) {
 
     Emitter emitter;
     emitter_init(&emitter, out, &cc.arena, &checker);
+    emitter.lib_mode = no_preamble;
 
     /* emit: preamble (from main) → imported modules → main declarations
      * This ensures imported functions are declared before main uses them. */
@@ -366,10 +370,10 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* emit in topological order: first module gets preamble */
+        /* emit in topological order: first module gets preamble (unless --lib) */
         for (int i = 0; i < emit_count; i++) {
             Module *m = &cc.modules[emit_order[i]];
-            if (i == 0) {
+            if (i == 0 && !no_preamble) {
                 emit_file(&emitter, m->ast);
             } else {
                 emit_file_no_preamble(&emitter, m->ast);

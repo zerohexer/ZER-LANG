@@ -54,7 +54,7 @@ test_production: test_production.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware test_firmware2 test_firmware3 test_production
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware test_firmware2 test_firmware3 test_production
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -68,6 +68,8 @@ check: test_lexer test_parser test_parser_edge test_checker test_checker_full te
 	./test_firmware2
 	./test_firmware3
 	./test_production
+	@echo "=== Module import tests ==="
+	@cd test_modules && ./run_tests.sh
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

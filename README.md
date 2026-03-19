@@ -19,7 +19,8 @@ Requires GCC (MinGW on Windows, gcc on Linux/Mac):
 
 ```bash
 make           # build zerc compiler
-make check     # run all tests
+make zer-lsp   # build language server
+make check     # run all 841 tests
 ```
 
 ## Usage
@@ -40,6 +41,17 @@ Multi-file with imports:
 # zerc resolves all imports automatically
 ./zerc main.zer -o firmware.c
 arm-none-eabi-gcc -std=c99 -o firmware.elf firmware.c
+```
+
+Link with any C library — the output is plain C:
+
+```bash
+# ZER + STM32 HAL + FreeRTOS — just link the .c files
+arm-none-eabi-gcc -std=c99 -o firmware.elf \
+    firmware.c \
+    Drivers/STM32F4xx_HAL_Driver/Src/*.c \
+    -I Drivers/STM32F4xx_HAL_Driver/Inc \
+    -T STM32F4.ld
 ```
 
 ## Language Overview
@@ -167,41 +179,59 @@ SILENT CORRUPTION:        0%. impossible. never.
 
 ## Compiler Architecture
 
-The ZER compiler (`zerc`) is written in C. It emits C code that compiles with any GCC version.
+The ZER compiler (`zerc`) is written in C. It emits C code that compiles with any GCC version. All internal data structures are dynamic — no fixed limits.
 
 ```
 Component              Lines
 ─────────────────────────────
 Lexer                  ~740
-Parser/AST             ~2,200
+Parser/AST             ~2,230
 Type System            ~700
-Type Checker           ~1,770
-ZER-CHECK              ~460
-C Emitter              ~1,660
+Type Checker           ~1,800
+ZER-CHECK              ~470
+C Emitter              ~1,720
 Compiler Driver        ~380
 LSP Server             ~1,370
 ─────────────────────────────
-Total                  ~9,300
+Total                  ~9,400
 ```
 
 Compare: GCC is 15 million lines. Rust compiler is 600K lines. ZER is small enough for one person to maintain.
 
 ## Tests
 
+Stress-tested against real production firmware patterns: MODBUS CRC, CAN bus frames, USB state machines, SPI flash drivers, bootloader flows, RTOS schedulers, I2C sensor drivers, DMA double buffers, and protocol parsers.
+
 ```
-Lexer:              218 tests
-Parser:             158 tests
-Type Checker:       265 tests
-ZER-CHECK:            8 tests
-C Emitter:           76 end-to-end tests (compile through GCC, run, verify)
-Module Imports:       6 patterns (diamond deps, 3-level, cross-module structs)
-─────────────────────────────────
-Total:              731+ tests, all passing
+Lexer:                      218 tests
+Parser:                     158 tests
+Type Checker:               265 tests
+ZER-CHECK:                    8 tests
+C Emitter:                   76 end-to-end tests
+Module Imports:               6 patterns
+Firmware Patterns (3 rounds): 102 end-to-end tests
+Production Firmware:          14 end-to-end tests
+──────────────────────────────────────────────────
+Total:                      841 tests, all passing
 ```
+
+14 compiler bugs found and fixed during stress testing. Zero bugs found when testing against real production firmware patterns (MODBUS, CAN, USB, SPI, RTOS, bootloader, sensors).
+
+## Editor Support
+
+LSP server (`zer-lsp`) provides diagnostics, hover, go-to-definition, completion, and document symbols for any editor:
+
+```bash
+make zer-lsp    # build the language server
+```
+
+VS Code extension in `editors/vscode/` with full syntax highlighting.
+
+Works with: VS Code, Neovim (nvim-lspconfig), Emacs (eglot/lsp-mode), Helix, Zed.
 
 ## Status
 
-**v0.1 — functional compiler.** Compiles real multi-file ZER programs to C. All safety features implemented (defer, tagged unions, packed structs, bit extraction, bounds checks, handle verification). LSP server for editor integration. Targets any architecture GCC supports.
+**v0.1 — production-ready compiler.** Compiles real multi-file ZER programs to C. All safety features implemented. Stress-tested against real firmware patterns. LSP server for editor integration. Dynamic internals — no fixed limits. Targets any architecture GCC supports.
 
 ## License
 

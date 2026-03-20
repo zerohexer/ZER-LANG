@@ -127,9 +127,13 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
     const char *pool_name = obj->ident.name;
     uint32_t plen = (uint32_t)obj->ident.name_len;
 
-    /* check if this is a pool variable */
-    Symbol *sym = scope_lookup(zc->checker->global_scope, pool_name, plen);
-    if (!sym || !sym->type || sym->type->kind != TYPE_POOL) return;
+    /* check if this is a pool variable — try checker type first, then global scope */
+    Type *pool_type = checker_get_type(obj);
+    if (!pool_type) {
+        Symbol *sym = scope_lookup(zc->checker->global_scope, pool_name, plen);
+        if (sym) pool_type = sym->type;
+    }
+    if (!pool_type || pool_type->kind != TYPE_POOL) return;
 
     int pool_id = register_pool(zc, pool_name, plen);
 
@@ -268,24 +272,30 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             PathState else_state = pathstate_copy(ps);
             zc_check_stmt(zc, &else_state, node->if_stmt.else_body);
 
-            /* merge: if freed on BOTH paths → definitely freed */
+            /* merge: only mark freed if freed on BOTH paths (under-approximation) */
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
                 HandleInfo *eh = find_handle(&else_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
-                if (th && eh) {
-                    if (th->state == HS_FREED && eh->state == HS_FREED) {
-                        ps->handles[i].state = HS_FREED;
-                        ps->handles[i].free_line = th->free_line;
-                    } else if (th->state == HS_FREED || eh->state == HS_FREED) {
-                        ps->handles[i].state = HS_FREED;
-                        ps->handles[i].free_line = th->state == HS_FREED ?
-                            th->free_line : eh->free_line;
-                    }
+                if (th && eh && th->state == HS_FREED && eh->state == HS_FREED) {
+                    ps->handles[i].state = HS_FREED;
+                    ps->handles[i].free_line = th->free_line;
                 }
             }
             pathstate_free(&else_state);
+        } else {
+            /* if without else: merge then-state back (under-approximation:
+             * only mark freed if then-path frees, since we might not take it) */
+            for (int i = 0; i < ps->handle_count; i++) {
+                HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
+                                             ps->handles[i].name_len);
+                if (th && th->state == HS_FREED) {
+                    /* conservatively keep as ALIVE — under-approx avoids false positives.
+                     * but check: if handle is used after this if, and then-path freed it,
+                     * we can't catch it without full path analysis. Accept this false negative. */
+                }
+            }
         }
         pathstate_free(&then_state);
         break;
@@ -322,14 +332,45 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_DEFER:
         break;
 
-    case NODE_SWITCH:
+    case NODE_SWITCH: {
         zc_check_expr(zc, ps, node->switch_stmt.expr);
+        /* track which handles are freed in ALL arms (under-approximation) */
+        bool *freed_all = NULL;
+        int *freed_line = NULL;
+        if (ps->handle_count > 0 && node->switch_stmt.arm_count > 0) {
+            freed_all = calloc(ps->handle_count, sizeof(bool));
+            freed_line = calloc(ps->handle_count, sizeof(int));
+            for (int i = 0; i < ps->handle_count; i++) freed_all[i] = true;
+        }
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             PathState arm_state = pathstate_copy(ps);
             zc_check_stmt(zc, &arm_state, node->switch_stmt.arms[i].body);
+            if (freed_all) {
+                for (int j = 0; j < ps->handle_count; j++) {
+                    HandleInfo *ah = find_handle(&arm_state, ps->handles[j].name,
+                                                 ps->handles[j].name_len);
+                    if (!ah || ah->state != HS_FREED) {
+                        freed_all[j] = false;
+                    } else if (i == 0) {
+                        freed_line[j] = ah->free_line;
+                    }
+                }
+            }
             pathstate_free(&arm_state);
         }
+        /* merge: only mark freed if freed in ALL arms */
+        if (freed_all) {
+            for (int j = 0; j < ps->handle_count; j++) {
+                if (freed_all[j]) {
+                    ps->handles[j].state = HS_FREED;
+                    ps->handles[j].free_line = freed_line[j];
+                }
+            }
+            free(freed_all);
+            free(freed_line);
+        }
         break;
+    }
 
     default:
         break;
@@ -374,11 +415,16 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
         }
     }
 
-    /* check each function body */
+    /* check each function and interrupt body */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         if (decl->kind == NODE_FUNC_DECL) {
             zc_check_function(zc, decl);
+        } else if (decl->kind == NODE_INTERRUPT && decl->interrupt.body) {
+            PathState ps;
+            pathstate_init(&ps);
+            zc_check_stmt(zc, &ps, decl->interrupt.body);
+            pathstate_free(&ps);
         }
     }
 

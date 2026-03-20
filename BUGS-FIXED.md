@@ -191,3 +191,73 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** Parser had `/* TODO: function pointer declarations */` at line 1121. AST node `TYNODE_FUNC_PTR`, type system, checker, and emitter all supported function pointers, but the parser never created the node. No call site (struct fields, var decls, parameters, top-level) handled `type (*name)(params...)` syntax.
 - **Fix:** Added `parse_func_ptr_after_ret()` helper. Added function pointer detection at 4 sites: `parse_func_or_var` (global), `parse_var_decl` (local), struct field parsing, and function parameter parsing. Fixed `emit_type_and_name` to emit correct C syntax `ret (*name)(params)`. Added lookahead in statement parser to detect `type (* ...` as var decl.
 - **Test:** `test_emit.c` — 6 E2E tests (local var, reassign, parameter, struct field vtable, global, callback registration). `test_parser_edge.c` — 5 parser tests.
+
+### BUG-026: `arena.alloc(T)` returns `void` instead of `?*T`
+- **Symptom:** `Arena(1024) a; ?*Task t = a.alloc(Task);` — type checker accepts but emitter produces invalid C. `alloc()` resolved to `void` return type, so the optional wrapping was wrong.
+- **Root cause:** Checker's builtin method handler for `alloc` on Arena types returned `ty_void` unconditionally. It didn't resolve the type argument from the call's `NODE_IDENT` arg via `scope_lookup`.
+- **Fix:** Added type resolution in the `alloc` method handler: look up the type name argument via `scope_lookup`, then return `type_optional(type_pointer(sym->type))` — i.e., `?*T`.
+- **Test:** `test_checker_full.c` — arena alloc type resolution
+
+---
+
+## Comprehensive Audit — Bugs 027-035 (2026-03-21)
+
+### BUG-027: `arena.alloc_slice(T, n)` returns `void` instead of `?[]T`
+- **Symptom:** Same class as BUG-026. `alloc_slice` placeholder in NODE_FIELD returned `ty_void`, but no NODE_CALL handler existed to resolve the actual type.
+- **Root cause:** Missing `alloc_slice` handler in checker.c NODE_CALL Arena methods section.
+- **Fix:** Added `alloc_slice` handler: look up type arg via `scope_lookup`, return `type_optional(type_slice(sym->type))`.
+- **Test:** `test_checker_full.c` — arena alloc_slice type resolution
+
+### BUG-028: `type_name()` single static buffer corrupts error messages
+- **Symptom:** `"expected %s, got %s", type_name(a), type_name(b)` prints the same type for both — second call overwrites first buffer.
+- **Root cause:** Single `type_name_buf[256]` used by all calls.
+- **Fix:** Two alternating buffers (`type_name_buf0`, `type_name_buf1`) with a toggle counter.
+- **Test:** Implicit — all checker error messages with two types now display correctly.
+
+### BUG-029: `?void` bare return emits `{ 0, 1 }` for single-field struct
+- **Symptom:** `_zer_opt_void` has only `has_value` field, but `return;` in `?void` function emitted `{ 0, 1 }` (2 initializers). GCC: "excess elements in struct initializer".
+- **Root cause:** Return emission didn't distinguish `?void` from other `?T` types.
+- **Fix:** Check if inner type is `TYPE_VOID` — emit `{ 1 }` for bare return, `{ 0 }` for return null. Also fixed if-unwrap to not access `.value` on `?void`.
+- **Test:** `test_emit.c` — ?void bare return and return null E2E tests
+
+### BUG-030: `?bool` has no named typedef
+- **Symptom:** `?bool` fell to anonymous struct fallback in `emit_type`, causing type mismatch when mixing `?bool` values.
+- **Root cause:** Missing `TYPE_BOOL` case in optional typedef switch.
+- **Fix:** Added `_zer_opt_bool` typedef in preamble and `TYPE_BOOL` case in `emit_type`.
+- **Test:** `test_emit.c` — ?bool function returning and unwrapping
+
+### BUG-031: `@saturate` for signed types was just a C cast (UB)
+- **Symptom:** `@saturate(i8, 200)` emitted `(int8_t)_zer_sat0` — undefined behavior if value out of range.
+- **Root cause:** Signed path had "just cast for now" placeholder.
+- **Fix:** Proper min/max clamping ternaries per signed width (i8: -128..127, i16: -32768..32767, i32: full range). Also fixed unsigned u32/u64 path that had broken control flow.
+- **Test:** `test_emit.c` — @saturate(i8, 200)=127, @saturate(u8, 300)=255
+
+### BUG-032: Optional var init with NODE_IDENT skips wrapping
+- **Symptom:** `?u32 x = some_u32_var;` emitted without `{val, 1}` wrapper — GCC type mismatch.
+- **Root cause:** Emitter assumed NODE_IDENT init "might already be ?T" and skipped wrapping unconditionally.
+- **Fix:** Use `checker_get_type` to check if ident is already optional. If not, wrap it.
+- **Test:** `test_emit.c` — ?u32 from plain u32 var and from optional var
+
+### BUG-033: Float literal `%f` loses precision
+- **Symptom:** `f64 pi = 3.141592653589793;` emitted as `3.141593` (6 decimal places).
+- **Root cause:** `emit(e, "%f", ...)` default precision.
+- **Fix:** Changed to `"%.17g"` for full double round-trip precision.
+- **Test:** `test_emit.c` — f64 precision check
+
+### BUG-034: `emit_type` for TYPE_FUNC_PTR produces incomplete C
+- **Symptom:** Direct `emit_type` call for func ptr emitted `ret (*` with no parameter list or closing paren.
+- **Root cause:** `emit_type` left name and params to caller, but not all callers use `emit_type_and_name`.
+- **Fix:** `emit_type` now emits complete anonymous func ptr type: `ret (*)(params...)`.
+- **Test:** `test_emit.c` — func ptr as parameter compiles correctly
+
+### BUG-035: ZER-CHECK if/else merge false positives
+- **Symptom:** Handle freed on only ONE branch of if/else was marked as FREED — false positive for subsequent use.
+- **Root cause:** Merge condition used `||` (either branch) instead of `&&` (both branches).
+- **Fix:** Only mark freed if freed on BOTH branches (under-approximation per design doc). Also added switch arm merge with ALL-arms-must-free logic. Added NODE_INTERRUPT body checking.
+- **Test:** `test_zercheck.c` — one-branch free OK, both-branch use-after-free detected, switch merge tests
+
+### Pool/Ring scope fix
+- **Symptom:** Pool/Ring builtin method emission only looked up `global_scope`, breaking for local variables.
+- **Root cause:** Emitter and zercheck used `scope_lookup(global_scope, ...)` only.
+- **Fix:** Try `checker_get_type` first (works for any scope), fall back to global_scope.
+- **Test:** Implicit — all existing Pool/Ring tests pass with new lookup path

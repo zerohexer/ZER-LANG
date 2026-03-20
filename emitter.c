@@ -64,6 +64,7 @@ static void emit_type(Emitter *e, Type *t) {
         /* ?T → named optional typedef */
         switch (t->optional.inner->kind) {
         case TYPE_VOID:  emit(e, "_zer_opt_void"); break;
+        case TYPE_BOOL:  emit(e, "_zer_opt_bool"); break;
         case TYPE_U8:    emit(e, "_zer_opt_u8"); break;
         case TYPE_U16:   emit(e, "_zer_opt_u16"); break;
         case TYPE_U32:   emit(e, "_zer_opt_u32"); break;
@@ -138,8 +139,12 @@ static void emit_type(Emitter *e, Type *t) {
 
     case TYPE_FUNC_PTR:
         emit_type(e, t->func_ptr.ret);
-        emit(e, " (*");
-        /* name filled by caller */
+        emit(e, " (*)(");
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, t->func_ptr.params[i]);
+        }
+        emit(e, ")");
         break;
 
     case TYPE_DISTINCT:
@@ -192,7 +197,7 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_FLOAT_LIT:
-        emit(e, "%f", node->float_lit.value);
+        emit(e, "%.17g", node->float_lit.value);
         break;
 
     case NODE_STRING_LIT:
@@ -340,12 +345,17 @@ static void emit_expr(Emitter *e, Node *node) {
             const char *mname = node->call.callee->field.field_name;
             uint32_t mlen = (uint32_t)node->call.callee->field.field_name_len;
 
-            /* check if object is a Pool variable by looking up its type */
+            /* check if object is a Pool variable — try checker type first, then global scope */
             if (obj_node->kind == NODE_IDENT) {
-                Symbol *sym = scope_lookup(e->checker->global_scope,
-                    obj_node->ident.name, (uint32_t)obj_node->ident.name_len);
-                if (sym && sym->type && sym->type->kind == TYPE_POOL) {
-                    Type *pool = sym->type;
+                Type *obj_type = checker_get_type(obj_node);
+                Symbol *sym = NULL;
+                if (!obj_type)  {
+                    sym = scope_lookup(e->checker->global_scope,
+                        obj_node->ident.name, (uint32_t)obj_node->ident.name_len);
+                    if (sym) obj_type = sym->type;
+                }
+                if (obj_type && obj_type->kind == TYPE_POOL) {
+                    Type *pool = obj_type;
                     const char *pname = obj_node->ident.name;
                     int plen = (int)obj_node->ident.name_len;
 
@@ -383,7 +393,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     }
                 }
 
-                if (!handled && sym && sym->type && sym->type->kind == TYPE_RING) {
+                if (!handled && obj_type && obj_type->kind == TYPE_RING) {
                     const char *rname = obj_node->ident.name;
                     int rlen = (int)obj_node->ident.name_len;
 
@@ -391,19 +401,19 @@ static void emit_expr(Emitter *e, Node *node) {
                         /* ring.push(val) — cast to correct element type */
                         int tmp = e->temp_count++;
                         emit(e, "({");
-                        emit_type(e, sym->type->ring.elem);
+                        emit_type(e, obj_type->ring.elem);
                         emit(e, " _zer_rpv%d = ", tmp);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
                         emit(e, "; _zer_ring_push(%.*s.data, &%.*s.head, "
                              "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); })",
                              rlen, rname, rlen, rname, rlen, rname,
-                             sym->type->ring.count, tmp, tmp);
+                             obj_type->ring.count, tmp, tmp);
                         handled = true;
                     } else if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
                         /* ring.pop() → optional of elem type */
                         int tmp = e->temp_count++;
-                        Type *opt_type = type_optional(e->arena, sym->type->ring.elem);
+                        Type *opt_type = type_optional(e->arena, obj_type->ring.elem);
                         emit(e, "({");
                         emit_type(e, opt_type);
                         emit(e, " _zer_rp%d = {0}; "
@@ -417,7 +427,7 @@ static void emit_expr(Emitter *e, Node *node) {
                              rlen, rname,
                              tmp, rlen, rname, rlen, rname,
                              tmp,
-                             rlen, rname, rlen, rname, sym->type->ring.count,
+                             rlen, rname, rlen, rname, obj_type->ring.count,
                              rlen, rname,
                              tmp);
                         handled = true;
@@ -689,11 +699,19 @@ static void emit_expr(Emitter *e, Node *node) {
                     int w = type_width(t);
                     if (w == 8) emit(e, "_zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp);
                     else if (w == 16) emit(e, "_zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp);
-                    else emit(e, "(");
-                    if (w > 16) { emit_type(e, t); emit(e, ")_zer_sat%d", tmp); }
+                    else if (w == 32) emit(e, "_zer_sat%d > 4294967295ULL ? 4294967295U : (uint32_t)_zer_sat%d", tmp, tmp);
+                    else emit(e, "(uint64_t)_zer_sat%d", tmp);
                 } else {
-                    /* signed: just cast for now — full clamp needs min/max per type */
-                    emit(e, "("); emit_type(e, t); emit(e, ")_zer_sat%d", tmp);
+                    /* signed: clamp to [min, max] for target width */
+                    int w = type_width(t);
+                    if (w == 8)
+                        emit(e, "_zer_sat%d < -128 ? -128 : _zer_sat%d > 127 ? 127 : (int8_t)_zer_sat%d", tmp, tmp, tmp);
+                    else if (w == 16)
+                        emit(e, "_zer_sat%d < -32768 ? -32768 : _zer_sat%d > 32767 ? 32767 : (int16_t)_zer_sat%d", tmp, tmp, tmp);
+                    else if (w == 32)
+                        emit(e, "_zer_sat%d < -2147483648LL ? -2147483648LL : _zer_sat%d > 2147483647LL ? 2147483647LL : (int32_t)_zer_sat%d", tmp, tmp, tmp);
+                    else
+                        emit(e, "(int64_t)_zer_sat%d", tmp);
                 }
                 emit(e, "; })");
             } else {
@@ -949,11 +967,23 @@ static void emit_stmt(Emitter *e, Node *node) {
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
                     emit(e, " = { 0, 0 }");
                 } else if (node->var_decl.init->kind == NODE_CALL ||
-                           node->var_decl.init->kind == NODE_ORELSE ||
-                           node->var_decl.init->kind == NODE_IDENT) {
-                    /* might already return ?T — assign directly */
+                           node->var_decl.init->kind == NODE_ORELSE) {
+                    /* call/orelse might already return ?T — assign directly */
                     emit(e, " = ");
                     emit_expr(e, node->var_decl.init);
+                } else if (node->var_decl.init->kind == NODE_IDENT) {
+                    /* check if ident is already ?T or needs wrapping */
+                    Type *init_type = checker_get_type(node->var_decl.init);
+                    if (init_type && init_type->kind == TYPE_OPTIONAL) {
+                        emit(e, " = ");
+                        emit_expr(e, node->var_decl.init);
+                    } else {
+                        emit(e, " = (");
+                        emit_type(e, type);
+                        emit(e, "){ ");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ", 1 }");
+                    }
                 } else {
                     emit(e, " = (");
                     emit_type(e, type);
@@ -1031,6 +1061,12 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "__auto_type %.*s = _zer_uw%d;\n",
                          (int)node->if_stmt.capture_name_len,
                          node->if_stmt.capture_name, tmp);
+                } else if (cond_type && cond_type->kind == TYPE_OPTIONAL &&
+                           cond_type->optional.inner->kind == TYPE_VOID) {
+                    /* ?void has no .value field — capture is just a dummy */
+                    emit(e, "uint8_t %.*s = 1;\n",
+                         (int)node->if_stmt.capture_name_len,
+                         node->if_stmt.capture_name);
                 } else {
                     emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
                          (int)node->if_stmt.capture_name_len,
@@ -1118,13 +1154,17 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit_defers(e);
         emit_indent(e);
         if (node->ret.expr) {
-            /* return null from ?T function → return {0, 0} */
+            /* return null from ?T function → return {0, 0} (or {0} for ?void) */
             if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
                 e->current_func_ret->optional.inner->kind != TYPE_POINTER &&
                 node->ret.expr->kind == NODE_NULL_LIT) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
-                emit(e, "){ 0, 0 };\n");
+                if (e->current_func_ret->optional.inner->kind == TYPE_VOID) {
+                    emit(e, "){ 0 };\n");
+                } else {
+                    emit(e, "){ 0, 0 };\n");
+                }
             }
             /* return value from ?T function → return {value, 1} */
             else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
@@ -1150,11 +1190,15 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, ";\n");
             }
         } else {
-            /* bare return — for ?void, return {1} (success) */
+            /* bare return — for ?void, return {1} (success); for other ?T, return {0,1} */
             if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
-                emit(e, "){ 0, 1 };\n");
+                if (e->current_func_ret->optional.inner->kind == TYPE_VOID) {
+                    emit(e, "){ 1 };\n");
+                } else {
+                    emit(e, "){ 0, 1 };\n");
+                }
             } else {
                 emit(e, "return;\n");
             }
@@ -1529,6 +1573,7 @@ void emit_file(Emitter *e, Node *file_node) {
 
     /* ZER optional type definitions */
     emit(e, "/* ZER optional types */\n");
+    emit(e, "typedef struct { uint8_t value; uint8_t has_value; } _zer_opt_bool;\n");
     emit(e, "typedef struct { uint8_t value; uint8_t has_value; } _zer_opt_u8;\n");
     emit(e, "typedef struct { uint16_t value; uint8_t has_value; } _zer_opt_u16;\n");
     emit(e, "typedef struct { uint32_t value; uint8_t has_value; } _zer_opt_u32;\n");

@@ -721,6 +721,27 @@ static Type *check_expr(Checker *c, Node *node) {
                     typemap_set(field_node, result);
                     break;
                 }
+                if (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0) {
+                    /* Arena.alloc_slice(T, n) → ?[]T */
+                    if (node->call.arg_count >= 1 &&
+                        node->call.args[0]->kind == NODE_IDENT) {
+                        const char *tname = node->call.args[0]->ident.name;
+                        size_t tlen = node->call.args[0]->ident.name_len;
+                        Symbol *sym = scope_lookup(c->current_scope, tname, tlen);
+                        if (sym && sym->type) {
+                            result = type_optional(c->arena,
+                                type_slice(c->arena, sym->type));
+                        } else {
+                            checker_error(c, node->loc.line,
+                                "arena.alloc_slice: unknown type '%.*s'", (int)tlen, tname);
+                            result = ty_void;
+                        }
+                    } else {
+                        result = ty_void;
+                    }
+                    typemap_set(field_node, result);
+                    break;
+                }
                 if (mlen == 12 && memcmp(mname, "unsafe_reset", 12) == 0) {
                     result = ty_void;
                     typemap_set(field_node, result);

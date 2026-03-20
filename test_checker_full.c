@@ -402,6 +402,26 @@ static void test_s22_arena(void) {
     printf("[§22 Arena builtins]\n");
     ok("Arena scratch;\nvoid f() { defer scratch.reset(); }",
        "arena reset inside defer OK (no warning)");
+
+    /* BUG-026: arena.alloc(T) → ?*T */
+    ok("struct Task { u32 id; }\nArena a;\n"
+       "void f() { *Task t = a.alloc(Task) orelse return; t.id = 1; }",
+       "arena.alloc(Task) returns ?*Task — unwrap to *Task OK");
+
+    err("struct Task { u32 id; }\nArena a;\n"
+        "void f() { u32 t = a.alloc(Task) orelse return; }",
+        "arena.alloc(Task) returns ?*Task, assign to u32 REJECT");
+
+    /* BUG-027: arena.alloc_slice(T, n) → ?[]T
+     * Note: uses struct type since primitive keywords (u32 etc.) can't be
+     * passed as arguments — they're keywords, not identifiers */
+    ok("struct Elem { u32 v; }\nArena a;\n"
+       "void f() { []Elem buf = a.alloc_slice(Elem, 10) orelse return; }",
+       "arena.alloc_slice(Elem, 10) returns ?[]Elem — unwrap to []Elem OK");
+
+    err("struct Elem { u32 v; }\nArena a;\n"
+        "void f() { u32 buf = a.alloc_slice(Elem, 10) orelse return; }",
+        "arena.alloc_slice(Elem, 10) returns ?[]Elem, assign to u32 REJECT");
 }
 
 /* ================================================================

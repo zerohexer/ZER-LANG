@@ -335,8 +335,10 @@ bool can_implicit_coerce(Type *from, Type *to) {
  * Type name for error messages
  * ================================================================ */
 
-/* static buffer for type_name — good enough for error messages */
-static char type_name_buf[256];
+/* two alternating buffers so type_name(a), type_name(b) in one printf works */
+static char type_name_buf0[256];
+static char type_name_buf1[256];
+static int type_name_which = 0;
 
 static int type_name_write(Type *t, char *buf, int pos, int max) {
     if (!t || pos >= max - 1) return pos;
@@ -400,9 +402,10 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
 }
 
 const char *type_name(Type *t) {
-    type_name_buf[0] = '\0';
-    type_name_write(t, type_name_buf, 0, sizeof(type_name_buf));
-    return type_name_buf;
+    char *buf = (type_name_which++ & 1) ? type_name_buf1 : type_name_buf0;
+    buf[0] = '\0';
+    type_name_write(t, buf, 0, 256);
+    return buf;
 }
 
 void type_print(Type *t) {

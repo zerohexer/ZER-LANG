@@ -1,17 +1,203 @@
 # CLAUDE.md
 
+## ZER Language — Complete Quick Reference
+
+ZER is memory-safe C. Same syntax, same mental model — but the compiler prevents buffer overflows, use-after-free, null dereferences, and silent memory corruption. Compiles to C, then GCC handles backends.
+
+### Primitive Types
+```
+u8  u16  u32  u64        unsigned integers
+i8  i16  i32  i64        signed integers
+usize                    pointer-width unsigned (hardcoded 32-bit currently)
+f32  f64                 floating point
+bool                     true / false (NOT an integer — no bool↔int coercion)
+void                     return type only, cannot declare void variables
+```
+
+### Compound Types
+```
+u8[256] buf;             fixed array — NOTE: size AFTER type, BEFORE name
+[]u8 data;               slice — {ptr, len} pair, always bounded
+*Task ptr;               pointer — guaranteed non-null
+?*Task maybe;            optional pointer — might be null (null sentinel, zero overhead)
+?u32 result;             optional value — struct { u32 value; u8 has_value; }
+?bool flag;              optional bool — struct { u8 value; u8 has_value; }
+?void status;            optional void — struct { u8 has_value; } (NO value field!)
+*opaque raw;             type-erased pointer (C's void*)
+```
+
+### Builtin Container Types
+```
+Pool(Task, 8) tasks;     fixed-slot allocator — ALWAYS global, E2E works
+Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global, E2E works
+Arena scratch;            bump allocator — checker works, emitter NOT implemented
+Handle(Task) h;          index + generation counter, not a pointer
+```
+
+### CRITICAL Syntax Differences from C
+
+**These cause the most wasted turns in fresh sessions:**
+
+1. **Braces ALWAYS required** for if/else/while/for bodies. No braceless one-liners.
+   ```
+   if (x > 5) { return 1; }      // OK
+   if (x > 5) return 1;           // PARSE ERROR — "expected '{'"
+   ```
+
+2. **No C-style casts.** Use intrinsics instead.
+   ```
+   (u32)x                         // PARSE ERROR
+   @truncate(u32, x)              // OK — explicit truncation
+   @saturate(i8, big)             // OK — clamp to [-128, 127]
+   @bitcast(u32, signed_val)      // OK — reinterpret bits
+   ```
+
+3. **Variable declarations: type before name, no `struct` keyword in usage.**
+   ```
+   struct Task { u32 id; }        // declaration uses 'struct' keyword
+   Task t;                        // usage: just the name, NO 'struct' prefix
+   *Task ptr = &t;                // pointer to Task
+   ```
+
+4. **Array declaration: size between type and name.**
+   ```
+   u8[256] buf;                   // ZER: type[size] name
+   // NOT: u8 buf[256];           // C style — won't work
+   ```
+
+5. **Enum values: dot syntax, not bare names.**
+   ```
+   enum State { idle, running, done }
+   State s = State.idle;          // qualified access
+   switch (s) {
+       .idle => { ... }           // dot-prefixed in switch arms
+       .running => { ... }
+       .done => { ... }
+   }
+   ```
+
+6. **Switch uses `=>` arrows, no fallthrough, no `case` keyword.**
+   ```
+   switch (x) {
+       .a => { ... }              // enum arm
+       .b, .c => { ... }          // multi-value arm
+       default => { ... }         // default arm (required for int switches)
+   }
+   ```
+
+7. **Optional unwrapping: `orelse` and `if |capture|`.**
+   ```
+   u32 val = maybe_func() orelse 0;           // default value
+   u32 val = maybe_func() orelse return;       // propagate failure
+   u32 val = maybe_func() orelse { cleanup(); return; }  // block fallback
+
+   if (maybe_val) |v| { use(v); }             // if-unwrap with capture
+   if (maybe_val) |*v| { v.field = 5; }       // mutable capture (pointer)
+   ```
+
+8. **No `++`/`--` operators.** Use `+= 1` / `-= 1`.
+
+9. **No `malloc`/`free`.** Use Pool, Ring, or Arena builtins.
+
+10. **String literals are `[]u8` (slices), not `char*`.**
+    ```
+    []u8 msg = "Hello";           // slice with .ptr and .len
+    ```
+
+### Intrinsics (@ builtins)
+```
+@size(T)                 sizeof — returns usize
+@truncate(T, val)        keep low bits (big→small)
+@saturate(T, val)        clamp to min/max of T
+@bitcast(T, val)         reinterpret bits (same width required)
+@cast(T, val)            distinct typedef conversion only
+@inttoptr(*T, addr)      integer to pointer
+@ptrtoint(ptr)           pointer to integer (usize)
+@ptrcast(*T, ptr)        pointer type cast
+@barrier()               full memory barrier
+@barrier_store()         store barrier
+@barrier_load()          load barrier
+@offset(T, field)        offsetof
+@container(*T, ptr, f)   container_of
+@trap()                  crash intentionally
+```
+
+### Function Pointers
+```
+u32 (*fn)(u32, u32) = add;              // local variable
+void (*callback)(u32 event);             // global variable
+struct Ops { u32 (*compute)(u32); }      // struct field
+u32 apply(u32 (*op)(u32, u32), x, y);   // parameter
+```
+
+### Defer
+```
+void f() {
+    *u8 buf = alloc();
+    defer free(buf);                     // runs at scope exit, in reverse order
+    if (error) { return; }               // defer fires on ALL return paths
+}
+```
+
+### Hardware Support
+```
+volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);  // MMIO register
+u32 bits = reg[9..8];                               // bit extraction
+interrupt USART1 { handle_rx(); }                    // interrupt handler
+packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
+```
+
+### What ZER Does NOT Have
+- No classes, inheritance, templates, generics
+- No exceptions, try/catch
+- No garbage collector
+- No heap/malloc/free (use Pool/Ring/Arena)
+- No implicit narrowing or sign conversion
+- No undefined behavior (overflow wraps, shift by >=width = 0)
+- No `++`/`--`, no comma operator, no `goto`
+- No C-style casts
+- No header files (use `import`)
+- No preprocessor (#define, #ifdef)
+
+### Safety Guarantees
+| Bug Class | Prevention |
+|---|---|
+| Buffer overflow | Bounds check on every array/slice access |
+| Use-after-free | Handle generation counter + ZER-CHECK |
+| Null dereference | `*T` non-null by default, `?T` requires unwrapping |
+| Uninitialized memory | Everything auto-zeroed |
+| Integer overflow | Wraps (defined), never UB |
+| Silent truncation | Must `@truncate` or `@saturate` explicitly |
+| Missing switch case | Exhaustive check for enums and bools |
+| Dangling pointer | Scope escape analysis |
+
+### Implementation Status
+| Feature | Checker | Emitter (E2E) |
+|---|---|---|
+| All primitives, arrays, slices | Done | Done |
+| Pointers, optionals, structs | Done | Done |
+| Enums, unions, switch | Done | Done |
+| Function pointers | Done | Done |
+| Pool + Handle | Done | Done |
+| Ring | Done | Done |
+| Arena (alloc, alloc_slice, reset) | Done | **NOT DONE** — emits literal method calls |
+| Modules/imports | Done | Done (multi-file) |
+| Intrinsics (@size, @truncate, etc.) | Done | Done |
+| Defer | Done | Done |
+| ZER-CHECK (handle tracking) | Done | N/A (analysis pass) |
+
 ## First Session Workflow
 
 When starting a new session or lacking context:
 
-1. Read these files FIRST to understand the project:
-   - `CLAUDE.md` (this file) — rules and conventions
-   - `README.md` — what ZER is, how to build/test
-   - `ZER-LANG.md` §26 (Compiler Build Order) — what's done, what's next
-2. Read the relevant header files for whatever you're working on:
-   - `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
-3. Run `make check` to verify everything passes before making changes
-4. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
+1. Read `CLAUDE.md` (this file) — has FULL language reference above, rules, conventions
+2. For component-specific work, read the relevant internal docs:
+   - `docs/compiler-internals.md` — how each compiler pass works, key line numbers, common patterns
+   - `BUGS-FIXED.md` — past bugs and their root causes (prevents re-introducing)
+   - `ZER-LANG.md` — full language spec (only if above reference is insufficient)
+3. Read the relevant header files: `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
+4. Run `make check` to verify everything passes before making changes
+5. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
 
 ## Project Architecture
 

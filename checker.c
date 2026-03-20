@@ -690,7 +690,23 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
-                    result = ty_void; /* TODO: type arg */
+                    /* Arena.alloc(T) → ?*T */
+                    if (node->call.arg_count >= 1 &&
+                        node->call.args[0]->kind == NODE_IDENT) {
+                        const char *tname = node->call.args[0]->ident.name;
+                        size_t tlen = node->call.args[0]->ident.name_len;
+                        Symbol *sym = scope_lookup(c->current_scope, tname, tlen);
+                        if (sym && sym->type) {
+                            result = type_optional(c->arena,
+                                type_pointer(c->arena, sym->type));
+                        } else {
+                            checker_error(c, node->loc.line,
+                                "arena.alloc: unknown type '%.*s'", (int)tlen, tname);
+                            result = ty_void;
+                        }
+                    } else {
+                        result = ty_void;
+                    }
                     typemap_set(field_node, result);
                     break;
                 }

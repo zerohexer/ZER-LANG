@@ -11,7 +11,7 @@ Requires GCC (MinGW on Windows, gcc on Linux/Mac):
 ```bash
 make           # build zerc compiler
 make zer-lsp   # build language server
-make check     # run all 841 tests
+make check     # run all 851 tests
 ```
 
 ## Usage
@@ -179,15 +179,15 @@ Stress-tested against real production code: MODBUS CRC, CAN bus, USB state machi
 
 ```
 Lexer:                      218 tests
-Parser:                     158 tests
+Parser:                     162 tests
 Type Checker:               265 tests
 ZER-CHECK:                    8 tests
-C Emitter:                   76 end-to-end tests
+C Emitter:                   81 end-to-end tests
 Module Imports:               6 patterns
 Firmware Patterns (3 rounds): 102 end-to-end tests
 Production Firmware:          14 end-to-end tests
 ──────────────────────────────────────────────────
-Total:                      841 tests, all passing
+Total:                      851 tests, all passing
 ```
 
 Additionally tested outside the main suite: 11 OS/kernel programs (hash map, scheduler, memory pool, event queue, TCP state machine, linked list, page allocator, VFS, IPC pipe, network stack, block cache), 5 multi-module programs (cross-module enums, structs, optionals, 5-module diamond imports), and 3 stress tests (5-level nested structs, all integer widths, union pipelines).

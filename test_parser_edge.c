@@ -255,11 +255,42 @@ static void test_volatile(void) {
 static void test_function_pointers(void) {
     printf("[function pointers]\n");
 
-    /* Function pointer as global variable — complex syntax */
-    /* For now, just check basic function call patterns work */
+    /* global function pointer variable */
     expect_ok(
-        "void f() { callback(42); }",
-        "call through identifier");
+        "u32 (*callback)(u32, u32);",
+        "global function pointer declaration");
+
+    /* function pointer as parameter */
+    expect_ok(
+        "u32 apply(u32 (*op)(u32, u32), u32 x, u32 y) {\n"
+        "    return op(x, y);\n"
+        "}\n",
+        "function pointer parameter");
+
+    /* local function pointer variable */
+    expect_ok(
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "void f() {\n"
+        "    u32 (*fn)(u32, u32) = add;\n"
+        "    fn(1, 2);\n"
+        "}\n",
+        "local function pointer variable");
+
+    /* struct with function pointer field */
+    expect_ok(
+        "struct Ops {\n"
+        "    u32 (*compute)(u32, u32);\n"
+        "    void (*notify)(u32);\n"
+        "}\n",
+        "struct with function pointer fields");
+
+    /* void function pointer */
+    expect_ok(
+        "void (*handler)(u32 event);\n"
+        "void register_cb(void (*cb)(u32 event)) {\n"
+        "    handler = cb;\n"
+        "}\n",
+        "void function pointer + callback registration");
 }
 
 /* ================================================================

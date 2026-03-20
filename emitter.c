@@ -159,6 +159,18 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* function pointer: ret (*name)(param1, param2, ...) */
+    if (t->kind == TYPE_FUNC_PTR) {
+        emit_type(e, t->func_ptr.ret);
+        emit(e, " (*%.*s)(", (int)name_len, name);
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, t->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+
     emit_type(e, t);
     emit(e, " %.*s", (int)name_len, name);
 }

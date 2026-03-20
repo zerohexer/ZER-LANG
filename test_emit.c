@@ -1139,17 +1139,86 @@ int main(void) {
         30,
         "bounds check + function call: double(5)+double(10)=30");
 
-    printf("[combo: function pointer call]\n");
+    printf("[func ptr: local variable]\n");
     test_compile_and_run(
         "u32 add(u32 a, u32 b) { return a + b; }\n"
-        "u32 apply(u32 a, u32 b) {\n"
-        "    return add(a, b);\n"
+        "u32 main() {\n"
+        "    u32 (*fn)(u32, u32) = add;\n"
+        "    return fn(3, 4);\n"
+        "}\n",
+        7,
+        "local function pointer variable: add(3,4)=7");
+
+    printf("[func ptr: reassign]\n");
+    test_compile_and_run(
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 mul(u32 a, u32 b) { return a * b; }\n"
+        "u32 main() {\n"
+        "    u32 (*fn)(u32, u32) = add;\n"
+        "    fn = mul;\n"
+        "    return fn(3, 4);\n"
+        "}\n",
+        12,
+        "reassign function pointer: mul(3,4)=12");
+
+    printf("[func ptr: parameter]\n");
+    test_compile_and_run(
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 apply(u32 (*op)(u32, u32), u32 x, u32 y) {\n"
+        "    return op(x, y);\n"
         "}\n"
         "u32 main() {\n"
-        "    return apply(10, 20);\n"
+        "    return apply(add, 10, 20);\n"
         "}\n",
         30,
-        "function call through another function = 30");
+        "function pointer as parameter: apply(add,10,20)=30");
+
+    printf("[func ptr: struct field (vtable)]\n");
+    test_compile_and_run(
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 mul(u32 a, u32 b) { return a * b; }\n"
+        "struct Ops {\n"
+        "    u32 (*compute)(u32, u32);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    Ops ops;\n"
+        "    ops.compute = add;\n"
+        "    u32 r1 = ops.compute(5, 6);\n"
+        "    ops.compute = mul;\n"
+        "    u32 r2 = ops.compute(5, 6);\n"
+        "    return r1 + r2;\n"
+        "}\n",
+        41,
+        "struct function pointer field: add(5,6)+mul(5,6)=41");
+
+    printf("[func ptr: global variable]\n");
+    test_compile_and_run(
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 (*g_fn)(u32, u32);\n"
+        "u32 main() {\n"
+        "    g_fn = add;\n"
+        "    return g_fn(20, 5);\n"
+        "}\n",
+        25,
+        "global function pointer: g_fn=add, g_fn(20,5)=25");
+
+    printf("[func ptr: callback registration]\n");
+    test_compile_and_run(
+        "void (*saved_cb)(u32 val);\n"
+        "u32 result = 0;\n"
+        "void register_cb(void (*cb)(u32 val)) {\n"
+        "    saved_cb = cb;\n"
+        "}\n"
+        "void my_handler(u32 val) {\n"
+        "    result = val + 10;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    register_cb(my_handler);\n"
+        "    saved_cb(5);\n"
+        "    return result;\n"
+        "}\n",
+        15,
+        "callback registration: handler(5) sets result=15");
 
     printf("[combo: @inttoptr + @ptrtoint roundtrip]\n");
     test_compile_and_run(

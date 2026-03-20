@@ -56,6 +56,10 @@ static void _zer_trap(const char *msg, const char *file, int line) {
 #endif
 }
 
+static inline void _zer_bounds_check(size_t idx, size_t len, const char *file, int line) {
+    if (idx >= len) _zer_trap("array index out of bounds", file, line);
+}
+
 static inline void *_zer_pool_get(void *slots, uint16_t *gen, uint8_t *used, size_t slot_size, uint32_t handle, uint32_t capacity) {
     uint32_t idx = handle & 0xFFFF;
     uint16_t h_gen = (uint16_t)(handle >> 16);
@@ -94,6 +98,7 @@ struct _zer_Config {
     uint32_t baud;
     uint32_t bits;
 };
+typedef struct { struct _zer_Config value; uint8_t has_value; } _zer_opt_Config;
 
 
 /* --- imported module --- */

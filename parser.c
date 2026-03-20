@@ -110,6 +110,69 @@ static Node *parse_block(Parser *p);
 static Node *parse_declaration(Parser *p);
 static TypeNode *parse_type(Parser *p);
 
+/* ---- Function pointer type helper ----
+ * Called when we see '(' '*' after a return type.
+ * Parses: (*name)(param_types...) or (*)(param_types...)
+ * Returns TYNODE_FUNC_PTR with name stored in func_ptr.param_names[0]
+ * if a name was present (for struct fields / var decls).
+ */
+static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
+                                           const char **out_name,
+                                           size_t *out_name_len) {
+    /* already consumed '(' and '*' */
+    const char *name = NULL;
+    size_t name_len = 0;
+
+    /* optional name: (*callback) vs (*) */
+    if (check(p, TOK_IDENT)) {
+        advance(p);
+        name = tok_text(&p->previous);
+        name_len = tok_len(&p->previous);
+    }
+    consume(p, TOK_RPAREN, "expected ')' after function pointer name");
+
+    /* parameter list */
+    consume(p, TOK_LPAREN, "expected '(' for function pointer parameters");
+
+    TypeNode *param_types[32];
+    const char *param_names[32];
+    int param_count = 0;
+
+    if (!check(p, TOK_RPAREN)) {
+        do {
+            if (param_count >= 32) {
+                error(p, "too many function pointer parameters");
+                break;
+            }
+            param_types[param_count] = parse_type(p);
+            /* optional param name */
+            if (check(p, TOK_IDENT)) {
+                advance(p);
+                param_names[param_count] = tok_text(&p->previous);
+            } else {
+                param_names[param_count] = NULL;
+            }
+            param_count++;
+        } while (match(p, TOK_COMMA));
+    }
+    consume(p, TOK_RPAREN, "expected ')' after function pointer parameters");
+
+    TypeNode *t = new_type_node(p, TYNODE_FUNC_PTR);
+    t->func_ptr.return_type = ret_type;
+    t->func_ptr.param_count = param_count;
+    if (param_count > 0) {
+        t->func_ptr.param_types = (TypeNode **)arena_alloc(p->arena, param_count * sizeof(TypeNode *));
+        memcpy(t->func_ptr.param_types, param_types, param_count * sizeof(TypeNode *));
+        t->func_ptr.param_names = (const char **)arena_alloc(p->arena, param_count * sizeof(const char *));
+        memcpy(t->func_ptr.param_names, param_names, param_count * sizeof(const char *));
+    }
+
+    if (out_name) *out_name = name;
+    if (out_name_len) *out_name_len = name_len;
+
+    return t;
+}
+
 /* ================================================================
  * TYPE PARSING
  *
@@ -688,6 +751,32 @@ static void parse_capture(Parser *p, const char **name, size_t *name_len, bool *
 /* variable declaration: type name = expr; or type name; */
 static Node *parse_var_decl(Parser *p, bool is_const, bool is_static, bool is_volatile) {
     TypeNode *type = parse_type(p);
+
+    /* function pointer local: rettype (*name)(params...) */
+    if (check(p, TOK_LPAREN)) {
+        Token saved = p->current;
+        advance(p);
+        if (check(p, TOK_STAR)) {
+            advance(p);
+            const char *fpname = NULL;
+            size_t fpname_len = 0;
+            type = parse_func_ptr_after_ret(p, type, &fpname, &fpname_len);
+            Node *n = new_node(p, NODE_VAR_DECL);
+            n->var_decl.type = type;
+            n->var_decl.name = fpname;
+            n->var_decl.name_len = fpname_len;
+            n->var_decl.is_const = is_const;
+            n->var_decl.is_static = is_static;
+            n->var_decl.is_volatile = is_volatile;
+            if (match(p, TOK_EQ)) {
+                n->var_decl.init = parse_expression(p);
+            }
+            consume(p, TOK_SEMICOLON, "expected ';' after variable declaration");
+            return n;
+        }
+        p->current = saved;
+    }
+
     consume(p, TOK_IDENT, "expected variable name");
 
     Node *n = new_node(p, NODE_VAR_DECL);
@@ -964,8 +1053,19 @@ static Node *parse_statement(Parser *p) {
         TypeNode *try_type = parse_type(p);
         (void)try_type;
 
-        /* if next token is an identifier, this is a var decl */
-        bool is_var_decl = !p->had_error && check(p, TOK_IDENT);
+        /* if next token is an identifier, this is a var decl.
+         * also detect function pointer: type ( * name )( params ) */
+        bool is_func_ptr = false;
+        if (!p->had_error && check(p, TOK_LPAREN)) {
+            /* peek further: ( * means function pointer */
+            Scanner saved2 = *p->scanner;
+            Token saved2_cur = p->current;
+            advance(p); /* consume ( */
+            is_func_ptr = check(p, TOK_STAR);
+            *p->scanner = saved2;
+            p->current = saved2_cur;
+        }
+        bool is_var_decl = !p->had_error && (check(p, TOK_IDENT) || is_func_ptr);
 
         /* restore scanner state completely */
         *p->scanner = saved_scanner;
@@ -1018,7 +1118,29 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
         f->loc.line = p->current.line;
 
         f->is_keep = match(p, TOK_KEEP);
-        f->type = parse_type(p);
+        TypeNode *type = parse_type(p);
+
+        /* function pointer field: rettype (*name)(params...) */
+        if (check(p, TOK_LPAREN)) {
+            Token saved = p->current;
+            advance(p); /* consume '(' */
+            if (check(p, TOK_STAR)) {
+                advance(p); /* consume '*' */
+                const char *fname = NULL;
+                size_t fname_len = 0;
+                type = parse_func_ptr_after_ret(p, type, &fname, &fname_len);
+                f->type = type;
+                f->name = fname;
+                f->name_len = fname_len;
+                if (!fname) error(p, "expected name in function pointer field");
+                consume(p, TOK_SEMICOLON, "expected ';' after field");
+                continue;
+            }
+            /* not a func ptr — backtrack */
+            p->current = saved;
+        }
+
+        f->type = type;
         consume(p, TOK_IDENT, "expected field name");
         f->name = tok_text(&p->previous);
         f->name_len = tok_len(&p->previous);
@@ -1117,8 +1239,33 @@ static Node *parse_union_decl(Parser *p) {
 static Node *parse_func_or_var(Parser *p, bool is_static) {
     TypeNode *type = parse_type(p);
 
-    /* check for function pointer: type (*name)(params) */
-    /* TODO: function pointer declarations */
+    /* function pointer declaration: type (*name)(params...) = expr; */
+    if (check(p, TOK_LPAREN)) {
+        Token saved = p->current;
+        advance(p); /* consume '(' */
+        if (check(p, TOK_STAR)) {
+            advance(p); /* consume '*' */
+            const char *fpname = NULL;
+            size_t fpname_len = 0;
+            TypeNode *fp_type = parse_func_ptr_after_ret(p, type, &fpname, &fpname_len);
+            if (!fpname) {
+                error(p, "expected name in function pointer declaration");
+                return new_node(p, NODE_VAR_DECL);
+            }
+            Node *n = new_node(p, NODE_GLOBAL_VAR);
+            n->var_decl.type = fp_type;
+            n->var_decl.name = fpname;
+            n->var_decl.name_len = fpname_len;
+            n->var_decl.is_static = is_static;
+            if (match(p, TOK_EQ)) {
+                n->var_decl.init = parse_expression(p);
+            }
+            consume(p, TOK_SEMICOLON, "expected ';' after function pointer declaration");
+            return n;
+        }
+        /* not a func ptr — backtrack */
+        p->current = saved;
+    }
 
     consume(p, TOK_IDENT, "expected name");
     const char *name = tok_text(&p->previous);
@@ -1146,9 +1293,28 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
                 param->loc.line = p->current.line;
                 param->is_keep = match(p, TOK_KEEP);
                 param->type = parse_type(p);
+
+                /* function pointer parameter: rettype (*name)(params...) */
+                if (check(p, TOK_LPAREN)) {
+                    Token saved = p->current;
+                    advance(p);
+                    if (check(p, TOK_STAR)) {
+                        advance(p);
+                        const char *fpname = NULL;
+                        size_t fpname_len = 0;
+                        param->type = parse_func_ptr_after_ret(p, param->type, &fpname, &fpname_len);
+                        param->name = fpname;
+                        param->name_len = fpname_len;
+                        if (!fpname) error(p, "expected name in function pointer parameter");
+                        goto param_done;
+                    }
+                    p->current = saved;
+                }
+
                 consume(p, TOK_IDENT, "expected parameter name");
                 param->name = tok_text(&p->previous);
                 param->name_len = tok_len(&p->previous);
+                param_done:;
             } while (match(p, TOK_COMMA));
         }
 

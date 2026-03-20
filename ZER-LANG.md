@@ -1,7 +1,7 @@
 # ZER Language Specification
 
 **Full name:** ZEROHEXER (ZER)
-**Status:** v0.1 complete — all compiler passes implemented and tested (731+ tests). Compiles multi-file ZER programs to C. LSP server available.
+**Status:** v0.1 complete — all compiler passes implemented and tested (851+ tests). Compiles multi-file ZER programs to C. LSP server available.
 **Author:** ZEROHEXER
 **Date:** 2026-03-19
 **Goal:** Memory-safe C. No runtime. No LLVM. No excuses. Zero silent memory corruption on every board GCC supports. The compiler does the safety work — the developer writes C-style code.
@@ -2249,7 +2249,7 @@ VERSION 0.1 — ZER runs. safe. complete feature set. ✅ SHIPPED
   10. Bit extraction (reg[7..4])                                 ✅ DONE
   11. Module imports (diamond deps, topological sort)            ✅ DONE (6 patterns)
   12. LSP server (diagnostics, hover, go-to-def, completion)    ✅ DONE
-  13. Test suite (731+ tests, all passing)                       ✅ DONE
+  13. Test suite (851+ tests, all passing)                       ✅ DONE
 
   ZER is a COMPLETE language. Every feature works.
   Phase 1 is done. The language is proven.

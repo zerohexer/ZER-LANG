@@ -298,3 +298,15 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Symptom:** `@container(*T, ptr, field)` had emitter implementation but no E2E test.
 - **Fix:** Added E2E test: recover `*Node` from `&n.y` using @container, verify field access.
 - **Test:** `test_emit.c` — @container recover Node from field pointer
+
+### BUG-039: Arena alignment uses fixed `sizeof(void*)` instead of type alignment
+- **Symptom:** `arena.alloc(T)` always aligned to pointer width. Types requiring stricter alignment (or smaller types wasting space on lax alignment) not handled.
+- **Root cause:** `_zer_arena_alloc` hardcoded `sizeof(void*)` as alignment.
+- **Fix:** Added `align` parameter to `_zer_arena_alloc()`. Call sites now pass `_Alignof(T)` for natural type alignment. ARM Cortex-M0 unaligned access faults are prevented.
+- **Test:** `test_emit.c` — alloc Byte(u8) then Word(u32), verify Word is accessible (would fault on strict-alignment targets without fix)
+
+### BUG-040: Signed integer overflow is undefined behavior in emitted C
+- **Symptom:** ZER spec says `i32` overflow wraps. But emitted C uses raw `int32_t + int32_t` which is UB in C99. GCC at `-O2` can optimize assuming no signed overflow, breaking ZER's wrapping guarantee.
+- **Root cause:** Emitter outputs plain arithmetic operators without wrapping protection.
+- **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
+- **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128

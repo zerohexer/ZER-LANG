@@ -400,7 +400,8 @@ int main(int argc, char **argv) {
         }
 
         char gcc_cmd[1024];
-        snprintf(gcc_cmd, sizeof(gcc_cmd), "gcc -std=c99 -O2 -o \"%s\" \"%s\"",
+        snprintf(gcc_cmd, sizeof(gcc_cmd),
+                 "gcc -std=c99 -O2 -fwrapv -o \"%s\" \"%s\"",
                  exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);

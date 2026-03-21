@@ -59,7 +59,7 @@ static void test_compile_and_run(const char *zer_source, int expected_exit,
     }
 
     /* step 2: C → binary with GCC */
-    int gcc_ret = system("gcc -std=c99 -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt");
+    int gcc_ret = system("gcc -std=c99 -fwrapv -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt");
     if (gcc_ret != 0) {
         printf("  FAIL: %s — GCC compilation failed\n", test_name);
         /* print gcc errors */
@@ -102,7 +102,7 @@ static void test_compile_only(const char *zer_source, const char *test_name) {
         return;
     }
 
-    int gcc_ret = system("gcc -std=c99 -c -o _zer_test_out.o _zer_test_out.c 2>_zer_gcc_err.txt");
+    int gcc_ret = system("gcc -std=c99 -fwrapv -c -o _zer_test_out.o _zer_test_out.c 2>_zer_gcc_err.txt");
     if (gcc_ret != 0) {
         printf("  FAIL: %s — GCC compilation failed\n", test_name);
         FILE *errf = fopen("_zer_gcc_err.txt", "r");
@@ -1382,6 +1382,38 @@ int main(void) {
         "}\n",
         65,
         "@container: recover Node from &n.y → 10+55=65");
+
+    /* ---- Arena alignment ---- */
+    printf("\n--- Arena alignment ---\n");
+
+    /* Alloc small struct then u32 struct — u32 must be aligned */
+    test_compile_and_run(
+        "struct Byte { u8 b; }\n"
+        "struct Word { u32 val; }\n"
+        "u8[4096] amem;\n"
+        "Arena aa;\n"
+        "u32 main() {\n"
+        "    aa = Arena.over(amem);\n"
+        "    *Byte b = aa.alloc(Byte) orelse return;\n"
+        "    b.b = 0xFF;\n"
+        "    *Word w = aa.alloc(Word) orelse return;\n"
+        "    w.val = 42;\n"
+        "    return w.val;\n"
+        "}\n",
+        42,
+        "arena alignment: Byte then Word — u32 aligned after u8");
+
+    /* ---- Signed overflow wrapping ---- */
+    printf("\n--- Signed overflow wrapping ---\n");
+
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    i8 x = 127;\n"
+        "    x = x + 1;\n"
+        "    return @truncate(u32, @bitcast(u8, x));\n"
+        "}\n",
+        128,
+        "i8 overflow: 127+1 wraps to -128, bitcast to u8 = 128");
 
     /* ---- BUG-028: type_name double buffer ---- */
     /* The bug: type_name() used a single static buffer, so

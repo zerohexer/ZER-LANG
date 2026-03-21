@@ -1384,23 +1384,22 @@ int main(void) {
         "@container: recover Node from &n.y → 10+55=65");
 
     /* ---- BUG-028: type_name double buffer ---- */
-    /* This is a checker error message quality test — we test that both types
-     * appear correctly in error messages. If the single-buffer bug were present,
-     * both would show the same type. We verify by checking that the checker
-     * DOES error (rejects u32→i32) — if the error message were garbled the
-     * checker would still reject, so just confirm rejection works. */
+    /* The bug: type_name() used a single static buffer, so
+     * printf("%s vs %s", type_name(a), type_name(b)) showed "u32 vs u32"
+     * even for u32 vs i32. Fix: two alternating buffers.
+     * Test: verify type_name returns distinct strings for distinct types. */
     printf("\n--- BUG-028: type_name double buffer ---\n");
-
-    printf("[type_name: two distinct types in error message]\n");
-    /* This can't easily be E2E tested (error message content),
-     * but we confirm the checker still catches type mismatches correctly */
-    test_compile_only(
-        "u32 main() {\n"
-        "    u32 a = 5;\n"
-        "    u32 b = a + 10;\n"
-        "    return b;\n"
-        "}\n",
-        "type_name: valid program compiles fine with dual buffer");
+    {
+        const char *n1 = type_name(ty_u32);
+        const char *n2 = type_name(ty_i32);
+        tests_run++;
+        if (n1 != n2 && strcmp(n1, "u32") == 0 && strcmp(n2, "i32") == 0) {
+            tests_passed++;
+        } else {
+            printf("  FAIL: type_name dual buffer — got \"%s\" and \"%s\"\n", n1, n2);
+            tests_failed++;
+        }
+    }
 
     /* ---- BUG-029: ?void bare return ---- */
     printf("\n--- BUG-029: ?void bare return ---\n");

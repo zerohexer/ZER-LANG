@@ -157,16 +157,20 @@ int main(void) {
 
     /* ---- BUG-035: if/else merge — only mark freed if BOTH paths free ---- */
     printf("\n[if/else merge: freed on one branch only → not freed]\n");
+    /* Key regression test: then-branch frees, else doesn't — use after if
+     * must be OK. Old code (|| merge) would false-positive here. */
     ok("struct T { u32 x; }\n"
        "Pool(T, 4) pool;\n"
        "void f(bool cond) {\n"
        "    Handle(T) h = pool.alloc() orelse return;\n"
        "    if (cond) {\n"
        "        pool.free(h);\n"
+       "    } else {\n"
+       "        pool.get(h).x = 1;\n"
        "    }\n"
-       "    /* h might still be alive — under-approx says OK */\n"
+       "    pool.get(h).x = 2;\n"
        "}\n",
-       "one-branch free: no false positive");
+       "one-branch free with else: no false positive on post-if use");
 
     printf("[if/else merge: freed on both branches → use after = error]\n");
     err("struct T { u32 x; }\n"
@@ -198,6 +202,7 @@ int main(void) {
         "all switch arms free then use = error");
 
     printf("[switch merge: freed in some arms → no false positive]\n");
+    /* Key regression test: only one arm frees — use after switch must be OK */
     ok("struct T { u32 x; }\n"
        "Pool(T, 4) pool;\n"
        "enum Mode { a, b }\n"
@@ -207,8 +212,9 @@ int main(void) {
        "        .a => { pool.free(h); }\n"
        "        .b => { }\n"
        "    }\n"
+       "    pool.get(h).x = 1;\n"
        "}\n",
-       "partial switch free: no false positive");
+       "partial switch free: no false positive on post-switch use");
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);

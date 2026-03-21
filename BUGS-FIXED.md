@@ -261,3 +261,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** Emitter and zercheck used `scope_lookup(global_scope, ...)` only.
 - **Fix:** Try `checker_get_type` first (works for any scope), fall back to global_scope.
 - **Test:** Implicit — all existing Pool/Ring tests pass with new lookup path
+
+## Arena E2E + Gap Fixes (2026-03-21)
+
+### Arena E2E emission (feature)
+- **Symptom:** Arena methods (alloc, alloc_slice, over, reset) type-checked but emitter output literal method calls → GCC rejected.
+- **Root cause:** Emitter had no Arena method interception — Pool and Ring had it, Arena didn't.
+- **Fix:** Added `_zer_arena` typedef + `_zer_arena_alloc()` runtime helper in preamble. Added method emission for `Arena.over(buf)`, `arena.alloc(T)`, `arena.alloc_slice(T, n)`, `arena.reset()`, `arena.unsafe_reset()`. Added `TOK_ARENA` in parser expression context. Added "Arena" symbol in checker global scope.
+- **Test:** `test_emit.c` — 5 Arena E2E tests (alloc, alloc_slice, reset, exhaustion, multiple allocs)
+
+### BUG-036: Slice indexing emits `slice[i]` instead of `slice.ptr[i]`
+- **Symptom:** Indexing a `[]T` slice variable emitted `items[0]` — GCC rejected because `items` is a struct, not an array.
+- **Root cause:** `NODE_INDEX` emission in `emit_expr` didn't check if object was a slice type.
+- **Fix:** Added `TYPE_SLICE` check in NODE_INDEX: emit `.ptr` suffix when indexing a slice.
+- **Test:** `test_emit.c` — arena.alloc_slice exercises slice indexing
+
+### BUG-037: Slice `orelse return` unwrap uses anonymous struct incompatible types
+- **Symptom:** `[]Elem items = expr orelse return;` → GCC error: "invalid initializer" — two distinct anonymous structs treated as incompatible.
+- **Root cause:** Var decl orelse unwrap emitted `struct { T* ptr; size_t len; } items = _zer_or0.value;` — GCC treats the anonymous struct in the optional and the declared type as different types.
+- **Fix:** Use `__auto_type` for slice type unwrap to inherit the exact type from the optional's `.value`.
+- **Test:** `test_emit.c` — arena.alloc_slice with orelse return
+
+### BUG-038: `?void orelse return` accesses non-existent `.value` field
+- **Symptom:** `push_checked(x) orelse return;` → GCC error: `_zer_opt_void has no member named 'value'`.
+- **Root cause:** Expression-level NODE_ORELSE handler emitted `_zer_tmp.value` for all non-pointer optionals, but `_zer_opt_void` is `{ has_value }` only — no value field.
+- **Fix:** Added `is_void_optional` check in NODE_ORELSE expression handler. For `?void orelse return/break/continue`, emit inline `if (!has_value) { return; }` instead of extracting `.value`.
+- **Test:** `test_emit.c` — ring.push_checked orelse return
+
+### ring.push_checked() emission (feature)
+- **Symptom:** `ring.push_checked(val)` type-checked as `?void` but emitter had no handler → fell through to generic call emission → GCC rejected.
+- **Root cause:** Missing emitter case for push_checked alongside push and pop.
+- **Fix:** Added `push_checked` handler in Ring method emission block. Checks `count < capacity` before pushing; returns `_zer_opt_void` with `has_value=1` on success, `{0}` on full.
+- **Test:** `test_emit.c` — push_checked success + push_checked full ring returns null
+
+### @container E2E test (test coverage)
+- **Symptom:** `@container(*T, ptr, field)` had emitter implementation but no E2E test.
+- **Fix:** Added E2E test: recover `*Node` from `&n.y` using @container, verify field access.
+- **Test:** `test_emit.c` — @container recover Node from field pointer

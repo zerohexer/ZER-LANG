@@ -1256,9 +1256,132 @@ int main(void) {
         10,
         "func ptr param: apply_twice(inc, 8)=10");
 
-    /* BUG-026/027: arena.alloc and alloc_slice tests are in test_checker_full.c
-     * because Arena method emission (Arena.over, alloc, alloc_slice) is not yet
-     * implemented in the emitter — checker type resolution works correctly */
+    /* ---- Arena E2E tests ---- */
+    printf("\n--- Arena E2E ---\n");
+
+    /* Arena.over + alloc + orelse return */
+    test_compile_and_run(
+        "struct Task { u32 id; u32 prio; }\n"
+        "u8[4096] scratch_mem;\n"
+        "Arena scratch;\n"
+        "u32 main() {\n"
+        "    scratch = Arena.over(scratch_mem);\n"
+        "    *Task t = scratch.alloc(Task) orelse return;\n"
+        "    t.id = 42;\n"
+        "    t.prio = 7;\n"
+        "    return t.id + t.prio;\n"
+        "}\n",
+        49,
+        "arena.alloc(Task): 42+7=49");
+
+    /* Arena.over + alloc_slice + orelse return */
+    test_compile_and_run(
+        "struct Elem { u32 v; }\n"
+        "u8[4096] buf;\n"
+        "Arena a;\n"
+        "u32 main() {\n"
+        "    a = Arena.over(buf);\n"
+        "    []Elem items = a.alloc_slice(Elem, 4) orelse return;\n"
+        "    items[0].v = 10;\n"
+        "    items[1].v = 20;\n"
+        "    items[2].v = 30;\n"
+        "    items[3].v = 40;\n"
+        "    return items[0].v + items[3].v;\n"
+        "}\n",
+        50,
+        "arena.alloc_slice(Elem, 4): 10+40=50");
+
+    /* Arena reset — allocate, reset, re-allocate */
+    test_compile_and_run(
+        "struct Node { u32 val; }\n"
+        "u8[4096] mem;\n"
+        "Arena ar;\n"
+        "u32 main() {\n"
+        "    ar = Arena.over(mem);\n"
+        "    *Node n1 = ar.alloc(Node) orelse return;\n"
+        "    n1.val = 99;\n"
+        "    ar.unsafe_reset();\n"
+        "    *Node n2 = ar.alloc(Node) orelse return;\n"
+        "    return n2.val;\n"
+        "}\n",
+        0,
+        "arena reset + re-alloc: zeroed after reset");
+
+    /* Arena exhaustion — alloc on tiny buffer returns null */
+    test_compile_and_run(
+        "struct Big { u32 a; u32 b; u32 c; u32 d; }\n"
+        "u8[8] tiny;\n"
+        "Arena small;\n"
+        "u32 main() {\n"
+        "    small = Arena.over(tiny);\n"
+        "    ?*Big b = small.alloc(Big);\n"
+        "    if (b) |_p| { return 1; }\n"
+        "    return 42;\n"
+        "}\n",
+        42,
+        "arena exhaustion: alloc fails on tiny buffer");
+
+    /* Multiple allocs from same arena */
+    test_compile_and_run(
+        "struct Pair { u32 x; u32 y; }\n"
+        "u8[4096] pool_mem;\n"
+        "Arena pa;\n"
+        "u32 main() {\n"
+        "    pa = Arena.over(pool_mem);\n"
+        "    *Pair a = pa.alloc(Pair) orelse return;\n"
+        "    *Pair b = pa.alloc(Pair) orelse return;\n"
+        "    a.x = 10;\n"
+        "    a.y = 20;\n"
+        "    b.x = 30;\n"
+        "    b.y = 40;\n"
+        "    return a.x + b.y;\n"
+        "}\n",
+        50,
+        "arena multiple allocs: a.x+b.y=50");
+
+    /* ---- ring.push_checked E2E ---- */
+    printf("\n--- ring.push_checked ---\n");
+
+    /* push_checked succeeds when not full */
+    test_compile_and_run(
+        "Ring(u8, 4) q;\n"
+        "u32 main() {\n"
+        "    q.push_checked(10) orelse return;\n"
+        "    q.push_checked(20) orelse return;\n"
+        "    u8 a = q.pop() orelse return;\n"
+        "    return a;\n"
+        "}\n",
+        10,
+        "ring.push_checked: success returns 10");
+
+    /* push_checked fails when full */
+    test_compile_and_run(
+        "Ring(u8, 2) tiny;\n"
+        "u32 main() {\n"
+        "    tiny.push_checked(1) orelse return;\n"
+        "    tiny.push_checked(2) orelse return;\n"
+        "    ?void r = tiny.push_checked(3);\n"
+        "    if (r) |_v| { return 1; }\n"
+        "    return 42;\n"
+        "}\n",
+        42,
+        "ring.push_checked: full ring returns null");
+
+    /* ---- @container E2E ---- */
+    printf("\n--- @container ---\n");
+
+    test_compile_and_run(
+        "struct Node { u32 x; u32 y; }\n"
+        "u32 main() {\n"
+        "    Node n;\n"
+        "    n.x = 10;\n"
+        "    n.y = 55;\n"
+        "    *u32 yptr = &n.y;\n"
+        "    *Node recovered = @container(*Node, yptr, y);\n"
+        "    return recovered.x + recovered.y;\n"
+        "}\n",
+        65,
+        "@container: recover Node from &n.y → 10+55=65");
 
     /* ---- BUG-028: type_name double buffer ---- */
     /* This is a checker error message quality test — we test that both types

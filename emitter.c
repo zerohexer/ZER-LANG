@@ -123,7 +123,7 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_ARENA:
-        emit(e, "struct _zer_arena");
+        emit(e, "_zer_arena");
         break;
 
     case TYPE_POOL:
@@ -431,6 +431,110 @@ static void emit_expr(Emitter *e, Node *node) {
                              rlen, rname,
                              tmp);
                         handled = true;
+                    } else if (mlen == 12 && memcmp(mname, "push_checked", 12) == 0) {
+                        /* ring.push_checked(val) → ?void (null if full) */
+                        int tmp = e->temp_count++;
+                        emit(e, "({");
+                        emit_type(e, obj_type->ring.elem);
+                        emit(e, " _zer_rpv%d = ", tmp);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, "; _zer_opt_void _zer_rpc%d = {0}; "
+                             "if (%.*s.count < %u) { "
+                             "_zer_ring_push(%.*s.data, &%.*s.head, "
+                             "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); "
+                             "_zer_rpc%d.has_value = 1; } "
+                             "_zer_rpc%d; })",
+                             tmp,
+                             rlen, rname, obj_type->ring.count,
+                             rlen, rname, rlen, rname,
+                             rlen, rname, obj_type->ring.count, tmp, tmp,
+                             tmp,
+                             tmp);
+                        handled = true;
+                    }
+                }
+
+                /* Arena methods */
+                if (!handled && obj_type && obj_type->kind == TYPE_ARENA) {
+                    const char *aname = obj_node->ident.name;
+                    int alen = (int)obj_node->ident.name_len;
+
+                    if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
+                        /* Arena.over(buf) → (_zer_arena){ (uint8_t*)buf, sizeof(buf), 0 }
+                         * or for slices: (_zer_arena){ buf.ptr, buf.len, 0 } */
+                        if (node->call.arg_count > 0) {
+                            Type *arg_type = checker_get_type(node->call.args[0]);
+                            if (arg_type && arg_type->kind == TYPE_SLICE) {
+                                emit(e, "((_zer_arena){ (uint8_t*)");
+                                emit_expr(e, node->call.args[0]);
+                                emit(e, ".ptr, ");
+                                emit_expr(e, node->call.args[0]);
+                                emit(e, ".len, 0 })");
+                            } else {
+                                emit(e, "((_zer_arena){ (uint8_t*)");
+                                emit_expr(e, node->call.args[0]);
+                                emit(e, ", sizeof(");
+                                emit_expr(e, node->call.args[0]);
+                                emit(e, "), 0 })");
+                            }
+                        }
+                        handled = true;
+                    } else if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                        /* arena.alloc(T) → (T*)_zer_arena_alloc(&arena, sizeof(T))
+                         * Returns ?*T — null sentinel (NULL = none) */
+                        if (node->call.arg_count >= 1 &&
+                            node->call.args[0]->kind == NODE_IDENT) {
+                            const char *tname = node->call.args[0]->ident.name;
+                            int tlen = (int)node->call.args[0]->ident.name_len;
+                            /* Look up type to emit correct C name */
+                            Symbol *tsym = scope_lookup(e->checker->global_scope,
+                                tname, (uint32_t)tlen);
+                            if (tsym && tsym->type) {
+                                emit(e, "((");
+                                emit_type(e, tsym->type);
+                                emit(e, "*)_zer_arena_alloc(&%.*s, sizeof(",
+                                     alen, aname);
+                                emit_type(e, tsym->type);
+                                emit(e, ")))");
+                            }
+                        }
+                        handled = true;
+                    } else if (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0) {
+                        /* arena.alloc_slice(T, n) → ?[]T
+                         * Optional slice: { .value = { .ptr, .len }, .has_value } */
+                        if (node->call.arg_count >= 2 &&
+                            node->call.args[0]->kind == NODE_IDENT) {
+                            const char *tname = node->call.args[0]->ident.name;
+                            int tlen = (int)node->call.args[0]->ident.name_len;
+                            Symbol *tsym = scope_lookup(e->checker->global_scope,
+                                tname, (uint32_t)tlen);
+                            if (tsym && tsym->type) {
+                                int tmp = e->temp_count++;
+                                Type *slice_type = type_slice(e->arena, tsym->type);
+                                Type *opt_type = type_optional(e->arena, slice_type);
+                                emit(e, "({ size_t _zer_asn%d = (size_t)", tmp);
+                                emit_expr(e, node->call.args[1]);
+                                emit(e, "; void *_zer_asp%d = _zer_arena_alloc(&%.*s, sizeof(",
+                                     tmp, alen, aname);
+                                emit_type(e, tsym->type);
+                                emit(e, ") * _zer_asn%d); ", tmp);
+                                emit_type(e, opt_type);
+                                emit(e, " _zer_asr%d = {0}; ", tmp);
+                                emit(e, "if (_zer_asp%d) { _zer_asr%d.value.ptr = (", tmp, tmp);
+                                emit_type(e, tsym->type);
+                                emit(e, "*)_zer_asp%d; _zer_asr%d.value.len = _zer_asn%d; "
+                                     "_zer_asr%d.has_value = 1; } ",
+                                     tmp, tmp, tmp, tmp);
+                                emit(e, "_zer_asr%d; })", tmp);
+                            }
+                        }
+                        handled = true;
+                    } else if ((mlen == 5 && memcmp(mname, "reset", 5) == 0) ||
+                               (mlen == 12 && memcmp(mname, "unsafe_reset", 12) == 0)) {
+                        /* arena.reset() / arena.unsafe_reset() → reset offset to 0 */
+                        emit(e, "(%.*s.offset = 0)", alen, aname);
+                        handled = true;
                     }
                 }
             }
@@ -483,14 +587,19 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
     }
 
-    case NODE_INDEX:
+    case NODE_INDEX: {
         /* Bounds check emitted at statement level (emit_stmt), not here.
          * Expression-level check breaks C lvalue rules on assignment LHS. */
+        Type *idx_obj_type = checker_get_type(node->index_expr.object);
         emit_expr(e, node->index_expr.object);
+        if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
+            emit(e, ".ptr");
+        }
         emit(e, "[");
         emit_expr(e, node->index_expr.index);
         emit(e, "]");
         break;
+    }
 
     case NODE_SLICE: {
         /* Bit extraction: reg[high..low] on integer → (reg >> low) & mask
@@ -564,15 +673,48 @@ static void emit_expr(Emitter *e, Node *node) {
             orelse_type->kind == TYPE_OPTIONAL &&
             orelse_type->optional.inner->kind == TYPE_POINTER;
 
+        bool is_void_optional = orelse_type &&
+            orelse_type->kind == TYPE_OPTIONAL &&
+            orelse_type->optional.inner->kind == TYPE_VOID;
+
         if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
-            int tmp = e->temp_count++;
-            emit(e, "({__auto_type _zer_tmp%d = ", tmp);
-            emit_expr(e, node->orelse.expr);
-            if (is_ptr_optional) {
-                emit(e, "; _zer_tmp%d; })", tmp);
+            if (is_void_optional) {
+                /* ?void orelse return/break/continue — no .value to extract,
+                 * just check has_value and branch */
+                int tmp = e->temp_count++;
+                emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+                emit_expr(e, node->orelse.expr);
+                emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
+                if (node->orelse.fallback_is_return) {
+                    if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
+                        e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
+                        emit(e, "return (");
+                        emit_type(e, e->current_func_ret);
+                        if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
+                            emit(e, "){ 0 }; ");
+                        else
+                            emit(e, "){ 0, 0 }; ");
+                    } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                        emit(e, "return 0; ");
+                    } else {
+                        emit(e, "return; ");
+                    }
+                } else if (node->orelse.fallback_is_break) {
+                    emit(e, "break; ");
+                } else {
+                    emit(e, "continue; ");
+                }
+                emit(e, "} (void)0; })");
             } else {
-                emit(e, "; _zer_tmp%d.value; })", tmp);
+                int tmp = e->temp_count++;
+                emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+                emit_expr(e, node->orelse.expr);
+                if (is_ptr_optional) {
+                    emit(e, "; _zer_tmp%d; })", tmp);
+                } else {
+                    emit(e, "; _zer_tmp%d.value; })", tmp);
+                }
             }
         } else if (node->orelse.fallback &&
                    node->orelse.fallback->kind == NODE_BLOCK) {
@@ -946,10 +1088,15 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "{ "); emit_defers_from(e, e->loop_defer_base); emit(e, "continue; }\n");
             }
             emit_indent(e);
-            emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
             if (or_is_ptr) {
+                emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
                 emit(e, " = _zer_or%d;\n", tmp);
+            } else if (type && type->kind == TYPE_SLICE) {
+                /* slice: use __auto_type to avoid anonymous struct incompatibility */
+                emit(e, "__auto_type %.*s = _zer_or%d.value;\n",
+                     (int)node->var_decl.name_len, node->var_decl.name, tmp);
             } else {
+                emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
                 emit(e, " = _zer_or%d.value;\n", tmp);
             }
             break;
@@ -998,7 +1145,8 @@ static void emit_stmt(Emitter *e, Node *node) {
         } else {
             /* ZER auto-zeroes */
             if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
-                         type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION)) {
+                         type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION ||
+                         type->kind == TYPE_ARENA)) {
                 emit(e, " = {0}");
             } else {
                 emit(e, " = 0");
@@ -1529,6 +1677,20 @@ static void emit_global_var(Emitter *e, Node *node) {
         return;
     }
 
+    /* Arena → _zer_arena */
+    if (type && type->kind == TYPE_ARENA) {
+        emit(e, "_zer_arena %.*s",
+             (int)node->var_decl.name_len, node->var_decl.name);
+        if (node->var_decl.init) {
+            emit(e, " = ");
+            emit_expr(e, node->var_decl.init);
+        } else {
+            emit(e, " = {0}");
+        }
+        emit(e, ";\n\n");
+        return;
+    }
+
     if (node->var_decl.is_static) emit(e, "static ");
 
     emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
@@ -1678,6 +1840,19 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    memcpy((char*)ring_data + (*head) * elem_size, val, elem_size);\n");
     emit(e, "    *head = (*head + 1) %% capacity;\n");
     emit(e, "    if (*count < capacity) (*count)++;\n");
+    emit(e, "}\n\n");
+
+    /* ZER runtime: Arena bump allocator */
+    emit(e, "/* ZER Arena runtime */\n");
+    emit(e, "typedef struct { uint8_t *buf; size_t capacity; size_t offset; } _zer_arena;\n\n");
+
+    emit(e, "static inline void *_zer_arena_alloc(_zer_arena *a, size_t size) {\n");
+    emit(e, "    size_t align = sizeof(void*);\n");
+    emit(e, "    size_t off = (a->offset + align - 1) & ~(align - 1);\n");
+    emit(e, "    if (off + size > a->capacity) return (void*)0;\n");
+    emit(e, "    a->offset = off + size;\n");
+    emit(e, "    memset(a->buf + off, 0, size);\n");
+    emit(e, "    return a->buf + off;\n");
     emit(e, "}\n\n");
 
     emit(e, "\n");

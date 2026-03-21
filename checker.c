@@ -1780,6 +1780,9 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
 
     /* init non-storable tracking */
     non_storable_init(arena);
+
+    /* Arena type available in expression context for Arena.over() */
+    scope_add(arena, c->global_scope, "Arena", 5, ty_arena, 0, file_name);
 }
 
 Type *checker_get_type(Node *node) {

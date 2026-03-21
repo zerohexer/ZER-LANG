@@ -180,7 +180,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Function pointers | Done | Done |
 | Pool + Handle | Done | Done |
 | Ring | Done | Done |
-| Arena (alloc, alloc_slice, reset) | Done | **NOT DONE** — emits literal method calls |
+| Arena (alloc, alloc_slice, over, reset) | Done | Done |
 | Modules/imports | Done | Done (multi-file) |
 | Intrinsics (@size, @truncate, etc.) | Done | Done |
 | Defer | Done | Done |

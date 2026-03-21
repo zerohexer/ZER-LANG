@@ -481,6 +481,14 @@ static Node *parse_primary(Parser *p) {
         return n;
     }
 
+    /* Arena in expression context — for Arena.over(...) static method */
+    if (match(p, TOK_ARENA)) {
+        Node *n = new_node(p, NODE_IDENT);
+        n->ident.name = "Arena";
+        n->ident.name_len = 5;
+        return n;
+    }
+
     /* parenthesized expression */
     if (match(p, TOK_LPAREN)) {
         Node *n = parse_expression(p);

@@ -1789,6 +1789,31 @@ int main(void) {
         77,
         "fn returning ?*Item from arena, caller unwraps = 77");
 
+    /* enum switch inside if-unwrap */
+    test_compile_and_run(
+        "enum Status { pending, running, done, failed }\n"
+        "?Status next_status(u32 step) {\n"
+        "    if (step == 0) { return Status.pending; }\n"
+        "    if (step == 1) { return Status.running; }\n"
+        "    if (step == 2) { return Status.done; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 result = 0;\n"
+        "    ?Status s = next_status(2);\n"
+        "    if (s) |st| {\n"
+        "        switch (st) {\n"
+        "            .pending => { result = 1; }\n"
+        "            .running => { result = 2; }\n"
+        "            .done => { result = 42; }\n"
+        "            .failed => { result = 99; }\n"
+        "        }\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        42,
+        "enum switch inside if-unwrap: ?Status done => 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

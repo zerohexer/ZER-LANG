@@ -11,7 +11,7 @@ Requires GCC (MinGW on Windows, gcc on Linux/Mac):
 ```bash
 make           # build zerc compiler
 make zer-lsp   # build language server
-make check     # run all 899 tests + 491 fuzz
+make check     # run all 900 tests + 491 fuzz
 ```
 
 ## Usage
@@ -182,16 +182,16 @@ Lexer:                      218 tests
 Parser:                     162 tests
 Type Checker:               269 tests
 ZER-CHECK:                   17 tests
-C Emitter:                  117 end-to-end tests
+C Emitter:                  118 end-to-end tests
 Module Imports:               6 patterns
 Firmware Patterns (3 rounds): 102 end-to-end tests
 Production Firmware:          14 end-to-end tests
 Parser Fuzz:                 491 adversarial inputs
 ──────────────────────────────────────────────────
-Total:                      899 tests + 491 fuzz, all passing
+Total:                      900 tests + 491 fuzz, all passing
 ```
 
-All 219 end-to-end tests verified at GCC `-O2` — no optimizer-exposed issues.
+All 220 end-to-end tests verified at GCC `-O2` — no optimizer-exposed issues.
 
 Additionally tested outside the main suite: 11 OS/kernel programs (hash map, scheduler, memory pool, event queue, TCP state machine, linked list, page allocator, VFS, IPC pipe, network stack, block cache), 5 multi-module programs (cross-module enums, structs, optionals, 5-module diamond imports), and 3 stress tests (5-level nested structs, all integer widths, union pipelines).
 

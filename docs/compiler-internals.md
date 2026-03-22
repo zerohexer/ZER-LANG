@@ -191,6 +191,10 @@ typedef struct { uint8_t has_value; } _zer_opt_void;
 // Check: .has_value   Unwrap: NOTHING — there is no .value
 // ⚠️ Accessing .value on _zer_opt_void is a GCC error
 
+// ?Status — optional enum (uses _zer_opt_i32 since enums are int32_t)
+// Emits as _zer_opt_i32, NOT anonymous struct
+// ⚠️ BUG-042: Previously fell to anonymous struct default — caused GCC type mismatch
+
 // ?[]T — optional slice (anonymous struct, non-u8/u32)
 struct { struct { T* ptr; size_t len; } value; uint8_t has_value; }
 // ⚠️ Two anonymous structs — can't assign between independently emitted ones
@@ -293,7 +297,7 @@ Path-sensitive handle tracking after type checker, before emitter:
 | `test_checker_full.c` | Full spec coverage | 176 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 117 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 118 |
 | `test_zercheck.c` | Handle tracking | 17 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
@@ -309,7 +313,7 @@ Path-sensitive handle tracking after type checker, before emitter:
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 41 bugs fixed)
+## Common Bug Patterns (from 42 bugs fixed)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)

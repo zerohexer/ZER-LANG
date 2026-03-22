@@ -311,6 +311,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-042: `?Enum` optional emits anonymous struct — GCC type mismatch
+- **Symptom:** `?Status` (optional enum) emits `struct { int32_t value; uint8_t has_value; }` everywhere. Each anonymous struct is a different C type, causing "incompatible types" errors on return and assignment.
+- **Root cause:** `emit_type` TYPE_OPTIONAL handler had no `case TYPE_ENUM:` — fell to `default` anonymous struct fallback.
+- **Fix:** Added `case TYPE_ENUM: emit("_zer_opt_i32");` since enums are int32_t underneath.
+- **Test:** `test_emit.c` — enum switch inside if-unwrap: `?Status` returned from function, unwrapped, switched on
+
 ### BUG-041: Bit extraction `[31..0]` emits `1u << 32` — undefined behavior
 - **Symptom:** Full-width bit extraction `x[31..0]` on u32 emits `(1u << 32)` which is UB (shift equals type width).
 - **Root cause:** Mask formula used `1u` (32-bit) which overflows when shift count reaches 32.

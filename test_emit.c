@@ -1984,6 +1984,29 @@ int main(void) {
         102,
         "enum with gaps: ok=0, warn=100, err=101, fatal=102");
 
+    /* []Struct slice across functions — was anonymous struct mismatch */
+    test_compile_and_run(
+        "struct Pt { u32 x; u32 y; }\n"
+        "u32 sum_pts([]Pt pts) {\n"
+        "    u32 total = 0;\n"
+        "    for (u32 i = 0; i < @truncate(u32, pts.len); i += 1) {\n"
+        "        total += pts[i].x + pts[i].y;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n"
+        "u8[4096] mem;\n"
+        "Arena ar;\n"
+        "u32 main() {\n"
+        "    ar = Arena.over(mem);\n"
+        "    []Pt pts = ar.alloc_slice(Pt, 3) orelse return;\n"
+        "    pts[0].x = 1; pts[0].y = 2;\n"
+        "    pts[1].x = 3; pts[1].y = 4;\n"
+        "    pts[2].x = 5; pts[2].y = 6;\n"
+        "    return sum_pts(pts);\n"
+        "}\n",
+        21,
+        "[]Struct across functions: sum_pts([]Pt) = 1+2+3+4+5+6 = 21");
+
     /* BUG-055: @cast between distinct typedefs */
     test_compile_and_run(
         "distinct typedef u32 Celsius;\n"

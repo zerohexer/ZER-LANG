@@ -114,8 +114,27 @@ static void emit_type(Emitter *e, Type *t) {
 
     case TYPE_SLICE:
         switch (t->slice.inner->kind) {
-        case TYPE_U8:  emit(e, "_zer_slice_u8"); break;
-        case TYPE_U32: emit(e, "_zer_slice_u32"); break;
+        case TYPE_U8:    emit(e, "_zer_slice_u8"); break;
+        case TYPE_U16:   emit(e, "_zer_slice_u16"); break;
+        case TYPE_U32:   emit(e, "_zer_slice_u32"); break;
+        case TYPE_U64:   emit(e, "_zer_slice_u64"); break;
+        case TYPE_I8:    emit(e, "_zer_slice_i8"); break;
+        case TYPE_I16:   emit(e, "_zer_slice_i16"); break;
+        case TYPE_I32:   emit(e, "_zer_slice_i32"); break;
+        case TYPE_I64:   emit(e, "_zer_slice_i64"); break;
+        case TYPE_USIZE: emit(e, "_zer_slice_usize"); break;
+        case TYPE_F32:   emit(e, "_zer_slice_f32"); break;
+        case TYPE_F64:   emit(e, "_zer_slice_f64"); break;
+        case TYPE_STRUCT:
+            emit(e, "_zer_slice_%.*s",
+                 (int)t->slice.inner->struct_type.name_len,
+                 t->slice.inner->struct_type.name);
+            break;
+        case TYPE_UNION:
+            emit(e, "_zer_slice_%.*s",
+                 (int)t->slice.inner->union_type.name_len,
+                 t->slice.inner->union_type.name);
+            break;
         default:
             emit(e, "struct { ");
             emit_type(e, t->slice.inner);
@@ -673,6 +692,12 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "((_zer_slice_u8){ ");
         } else if (is_u32_slice) {
             emit(e, "((_zer_slice_u32){ ");
+        } else if (elem_type && elem_type->kind == TYPE_STRUCT) {
+            emit(e, "((_zer_slice_%.*s){ ",
+                 (int)elem_type->struct_type.name_len, elem_type->struct_type.name);
+        } else if (elem_type && elem_type->kind == TYPE_UNION) {
+            emit(e, "((_zer_slice_%.*s){ ",
+                 (int)elem_type->union_type.name_len, elem_type->union_type.name);
         } else {
             emit(e, "((struct { ");
             if (elem_type) {
@@ -1766,7 +1791,11 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     e->indent--;
     emit(e, "};\n");
     /* emit optional typedef for this struct */
-    emit(e, "typedef struct { struct %.*s value; uint8_t has_value; } _zer_opt_%.*s;\n\n",
+    emit(e, "typedef struct { struct %.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
+         (int)node->struct_decl.name_len, node->struct_decl.name,
+         (int)node->struct_decl.name_len, node->struct_decl.name);
+    /* emit slice typedef for this struct */
+    emit(e, "typedef struct { struct %.*s* ptr; size_t len; } _zer_slice_%.*s;\n\n",
          (int)node->struct_decl.name_len, node->struct_decl.name,
          (int)node->struct_decl.name_len, node->struct_decl.name);
 }
@@ -1919,10 +1948,19 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "typedef struct { uint8_t has_value; } _zer_opt_void;\n");
     emit(e, "\n");
 
-    /* ZER slice type */
+    /* ZER slice types — all primitives */
     emit(e, "/* ZER slice types */\n");
     emit(e, "typedef struct { uint8_t* ptr; size_t len; } _zer_slice_u8;\n");
+    emit(e, "typedef struct { uint16_t* ptr; size_t len; } _zer_slice_u16;\n");
     emit(e, "typedef struct { uint32_t* ptr; size_t len; } _zer_slice_u32;\n");
+    emit(e, "typedef struct { uint64_t* ptr; size_t len; } _zer_slice_u64;\n");
+    emit(e, "typedef struct { int8_t* ptr; size_t len; } _zer_slice_i8;\n");
+    emit(e, "typedef struct { int16_t* ptr; size_t len; } _zer_slice_i16;\n");
+    emit(e, "typedef struct { int32_t* ptr; size_t len; } _zer_slice_i32;\n");
+    emit(e, "typedef struct { int64_t* ptr; size_t len; } _zer_slice_i64;\n");
+    emit(e, "typedef struct { size_t* ptr; size_t len; } _zer_slice_usize;\n");
+    emit(e, "typedef struct { float* ptr; size_t len; } _zer_slice_f32;\n");
+    emit(e, "typedef struct { double* ptr; size_t len; } _zer_slice_f64;\n");
     emit(e, "\n");
 
     /* ZER runtime: Pool helper macros */
@@ -2085,7 +2123,11 @@ void emit_file(Emitter *e, Node *file_node) {
             emit(e, "    };\n");
             emit(e, "};\n");
             /* emit optional typedef for this union */
-            emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n\n",
+            emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name,
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            /* emit slice typedef for this union */
+            emit(e, "typedef struct { struct _union_%.*s* ptr; size_t len; } _zer_slice_%.*s;\n\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name,
                  (int)decl->union_decl.name_len, decl->union_decl.name);
             break;
@@ -2208,7 +2250,13 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
                 emit_type(e, vtype);
                 emit(e, " %.*s;\n", (int)v->name_len, v->name);
             }
-            emit(e, "    };\n};\n\n");
+            emit(e, "    };\n};\n");
+            emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name,
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "typedef struct { struct _union_%.*s* ptr; size_t len; } _zer_slice_%.*s;\n\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name,
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
             break;
         }
 

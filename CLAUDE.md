@@ -30,7 +30,7 @@ u8[256] buf;             fixed array — NOTE: size AFTER type, BEFORE name
 ```
 Pool(Task, 8) tasks;     fixed-slot allocator — ALWAYS global, E2E works
 Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global, E2E works
-Arena scratch;            bump allocator — checker works, emitter NOT implemented
+Arena scratch;            bump allocator — fully implemented (over, alloc, alloc_slice, reset)
 Handle(Task) h;          index + generation counter, not a pointer
 ```
 
@@ -102,6 +102,30 @@ Handle(Task) h;          index + generation counter, not a pointer
 10. **String literals are `[]u8` (slices), not `char*`.**
     ```
     []u8 msg = "Hello";           // slice with .ptr and .len
+    ```
+
+11. **No `else if`.** Nest if inside else block.
+    ```
+    if (a) { ... } else { if (b) { ... } }  // OK
+    if (a) { ... } else if (b) { ... }       // PARSE ERROR
+    ```
+
+12. **`orelse return` is bare — no value.** Return value comes from function's return type.
+    ```
+    *Task t = pool.alloc(Task) orelse return;    // OK — bare return
+    *Task t = pool.alloc(Task) orelse return 1;  // PARSE ERROR
+    ```
+
+13. **`arena.alloc(T)` — T must be a struct/enum name, not a primitive keyword.**
+    ```
+    arena.alloc(Task)           // OK — Task is an identifier
+    arena.alloc(u32)            // PARSE ERROR — u32 is a keyword
+    ```
+
+14. **For loops use `i += 1`, compound init, and C-style structure.**
+    ```
+    for (u32 i = 0; i < 10; i += 1) { ... }   // OK
+    for (u32 i = 0; i < 10; i++) { ... }       // PARSE ERROR — no ++
     ```
 
 ### Intrinsics (@ builtins)

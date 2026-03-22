@@ -1186,7 +1186,10 @@ static void emit_stmt(Emitter *e, Node *node) {
                     /* ?T function: return null optional */
                     emit(e, "return (");
                     emit_type(e, e->current_func_ret);
-                    emit(e, "){ 0, 0 }; }\n");
+                    if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
+                        emit(e, "){ 0 }; }\n");
+                    else
+                        emit(e, "){ 0, 0 }; }\n");
                 } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                     emit(e, "return 0; }\n");
                 } else {
@@ -1594,10 +1597,19 @@ static void emit_stmt(Emitter *e, Node *node) {
                 e->indent++;
                 emit_indent(e);
                 /* extract variant from anonymous union */
-                emit(e, "__auto_type %.*s = _zer_sw%d.%.*s;\n",
-                     (int)arm->capture_name_len, arm->capture_name,
-                     sw_tmp,
-                     (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);
+                if (arm->capture_is_ptr) {
+                    /* mutable capture |*v| — pointer to variant */
+                    emit(e, "__auto_type *%.*s = &_zer_sw%d.%.*s;\n",
+                         (int)arm->capture_name_len, arm->capture_name,
+                         sw_tmp,
+                         (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);
+                } else {
+                    /* immutable capture |v| — value copy */
+                    emit(e, "__auto_type %.*s = _zer_sw%d.%.*s;\n",
+                         (int)arm->capture_name_len, arm->capture_name,
+                         sw_tmp,
+                         (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);
+                }
                 /* emit body contents */
                 if (arm->body->kind == NODE_BLOCK) {
                     for (int k = 0; k < arm->body->block.stmt_count; k++)

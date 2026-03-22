@@ -29,6 +29,8 @@ static void emit_type(Emitter *e, Type *t);
 static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
+static void emit_defers(Emitter *e);
+static void emit_defers_from(Emitter *e, int base);
 
 /* emit array→slice coercion: wraps array expr in slice compound literal */
 static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
@@ -62,6 +64,7 @@ static void emit_type(Emitter *e, Type *t) {
     case TYPE_OPAQUE: emit(e, "void"); break;
 
     case TYPE_POINTER:
+        if (t->pointer.is_volatile) emit(e, "volatile ");
         emit_type(e, t->pointer.inner);
         emit(e, "*");
         break;
@@ -94,6 +97,11 @@ static void emit_type(Emitter *e, Type *t) {
             emit(e, "_zer_opt_%.*s",
                  (int)t->optional.inner->struct_type.name_len,
                  t->optional.inner->struct_type.name);
+            break;
+        case TYPE_UNION:
+            emit(e, "_zer_opt_%.*s",
+                 (int)t->optional.inner->union_type.name_len,
+                 t->optional.inner->union_type.name);
             break;
         default:
             /* fallback: anonymous struct */
@@ -735,7 +743,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "({__auto_type _zer_tmp%d = ", tmp);
                 emit_expr(e, node->orelse.expr);
                 emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
+                /* emit defers before return/break/continue */
                 if (node->orelse.fallback_is_return) {
+                    emit_defers(e);
                     if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
                         e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
                         emit(e, "return (");
@@ -750,8 +760,10 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, "return; ");
                     }
                 } else if (node->orelse.fallback_is_break) {
+                    emit_defers_from(e, e->loop_defer_base);
                     emit(e, "break; ");
                 } else {
+                    emit_defers_from(e, e->loop_defer_base);
                     emit(e, "continue; ");
                 }
                 emit(e, "} (void)0; })");
@@ -765,7 +777,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 } else {
                     emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
                 }
+                /* emit defers before return/break/continue */
                 if (node->orelse.fallback_is_return) {
+                    emit_defers(e);
                     if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
                         e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
                         emit(e, "return (");
@@ -780,8 +794,10 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, "return; ");
                     }
                 } else if (node->orelse.fallback_is_break) {
+                    emit_defers_from(e, e->loop_defer_base);
                     emit(e, "break; ");
                 } else {
+                    emit_defers_from(e, e->loop_defer_base);
                     emit(e, "continue; ");
                 }
                 if (is_ptr_optional) {
@@ -1129,6 +1145,12 @@ static void emit_stmt(Emitter *e, Node *node) {
 
     case NODE_VAR_DECL: {
         Type *type = resolve_type_for_emit(e, node->var_decl.type);
+        /* propagate volatile flag from var-decl to pointer type */
+        if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
+            Type *vp = type_pointer(e->arena, type->pointer.inner);
+            vp->pointer.is_volatile = true;
+            type = vp;
+        }
 
         /* bounds checks for initializer */
         if (node->var_decl.init)
@@ -1664,8 +1686,17 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return ty_void;
     }
     case TYNODE_CONST:
-    case TYNODE_VOLATILE:
         return resolve_type_for_emit(e, tn->qualified.inner);
+    case TYNODE_VOLATILE: {
+        Type *inner = resolve_type_for_emit(e, tn->qualified.inner);
+        /* propagate volatile to pointer type */
+        if (inner && inner->kind == TYPE_POINTER) {
+            Type *vp = type_pointer(e->arena, inner->pointer.inner);
+            vp->pointer.is_volatile = true;
+            return vp;
+        }
+        return inner;
+    }
     case TYNODE_ARENA:
         return ty_arena;
     case TYNODE_OPAQUE:
@@ -1762,6 +1793,12 @@ static void emit_func_decl(Emitter *e, Node *node) {
 
 static void emit_global_var(Emitter *e, Node *node) {
     Type *type = resolve_type_for_emit(e, node->var_decl.type);
+    /* propagate volatile flag from var-decl to pointer type */
+    if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
+        Type *vp = type_pointer(e->arena, type->pointer.inner);
+        vp->pointer.is_volatile = true;
+        type = vp;
+    }
 
     /* Pool(T, N) → use macro for struct layout */
     if (type && type->kind == TYPE_POOL) {
@@ -2034,7 +2071,11 @@ void emit_file(Emitter *e, Node *file_node) {
                 emit(e, " %.*s;\n", (int)v->name_len, v->name);
             }
             emit(e, "    };\n");
-            emit(e, "};\n\n");
+            emit(e, "};\n");
+            /* emit optional typedef for this union */
+            emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name,
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
             break;
         }
 

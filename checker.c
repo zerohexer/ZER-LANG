@@ -349,8 +349,14 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
     }
 
     case TYNODE_VOLATILE: {
-        /* volatile doesn't affect the type system, only codegen */
-        return resolve_type(c, tn->qualified.inner);
+        Type *inner = resolve_type(c, tn->qualified.inner);
+        /* propagate volatile to pointer type for codegen */
+        if (inner && inner->kind == TYPE_POINTER) {
+            Type *vp = type_pointer(c->arena, inner->pointer.inner);
+            vp->pointer.is_volatile = true;
+            return vp;
+        }
+        return inner;
     }
     }
 
@@ -563,15 +569,29 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
-        /* const check: cannot assign to const variable */
-        if (node->assign.target->kind == NODE_IDENT) {
-            Symbol *sym = scope_lookup(c->current_scope,
-                node->assign.target->ident.name,
-                (uint32_t)node->assign.target->ident.name_len);
-            if (sym && sym->is_const) {
-                checker_error(c, node->loc.line,
-                    "cannot assign to const variable '%.*s'",
-                    (int)sym->name_len, sym->name);
+        /* const check: cannot assign to const variable or its fields */
+        {
+            Node *root = node->assign.target;
+            bool through_pointer = false;
+            /* walk field/index chain to find root ident */
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                if (root->kind == NODE_FIELD) {
+                    /* check if object is a pointer (auto-deref) — writing through pointer is OK */
+                    Type *obj_type = checker_get_type(root->field.object);
+                    if (obj_type && obj_type->kind == TYPE_POINTER) through_pointer = true;
+                    root = root->field.object;
+                } else {
+                    root = root->index_expr.object;
+                }
+            }
+            if (root && root->kind == NODE_IDENT && !through_pointer) {
+                Symbol *sym = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (sym && sym->is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign to const variable '%.*s'",
+                        (int)sym->name_len, sym->name);
+                }
             }
         }
 
@@ -618,6 +638,27 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!type_is_numeric(target) || !type_is_numeric(value)) {
                 checker_error(c, node->loc.line,
                     "compound assignment requires numeric types");
+            }
+            /* bitwise compound (&= |= ^= <<= >>=) require integer, not float */
+            if (node->assign.op == TOK_AMPEQ || node->assign.op == TOK_PIPEEQ ||
+                node->assign.op == TOK_CARETEQ || node->assign.op == TOK_LSHIFTEQ ||
+                node->assign.op == TOK_RSHIFTEQ) {
+                if (type_is_float(target) || type_is_float(value)) {
+                    checker_error(c, node->loc.line,
+                        "bitwise compound assignment requires integer types, got '%s'",
+                        type_name(target));
+                }
+            }
+            /* reject narrowing: value wider than target (unless value is a literal) */
+            if (type_is_numeric(target) && type_is_numeric(value) &&
+                !is_literal_compatible(node->assign.value, target)) {
+                int tw = type_width(target);
+                int vw = type_width(value);
+                if (tw > 0 && vw > 0 && vw > tw) {
+                    checker_error(c, node->loc.line,
+                        "compound assignment would narrow '%s' (%d-bit) into '%s' (%d-bit) — use @truncate",
+                        type_name(value), vw, type_name(target), tw);
+                }
             }
         }
         result = target;
@@ -1152,12 +1193,36 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* validate source is numeric (unwrap distinct) */
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    Type *effective = val_type;
+                    if (effective && effective->kind == TYPE_DISTINCT) effective = effective->distinct.underlying;
+                    if (effective && !type_is_numeric(effective)) {
+                        checker_error(c, node->loc.line,
+                            "@truncate requires numeric source, got '%s'", type_name(val_type));
+                    }
+                }
             } else {
                 result = ty_void;
             }
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* validate source is numeric and target is integer */
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    Type *effective = val_type;
+                    if (effective && effective->kind == TYPE_DISTINCT) effective = effective->distinct.underlying;
+                    if (effective && !type_is_numeric(effective)) {
+                        checker_error(c, node->loc.line,
+                            "@saturate requires numeric source, got '%s'", type_name(val_type));
+                    }
+                }
+                if (!type_is_integer(result)) {
+                    checker_error(c, node->loc.line,
+                        "@saturate target must be an integer type, got '%s'", type_name(result));
+                }
             } else {
                 result = ty_void;
             }
@@ -1508,12 +1573,46 @@ static void check_stmt(Checker *c, Node *node) {
                         "switch on integer must have a default arm");
                 }
             } else if (expr->kind == TYPE_UNION) {
-                /* union switch: must handle all variants OR have default */
+                /* validate variant names + exhaustiveness via bitmask */
+                uint32_t total = expr->union_type.variant_count;
+                uint64_t covered = 0;
+                for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+                    SwitchArm *arm = &node->switch_stmt.arms[i];
+                    if (arm->is_default) continue;
+                    for (int v = 0; v < arm->value_count; v++) {
+                        Node *val = arm->values[v];
+                        const char *vname = NULL;
+                        size_t vname_len = 0;
+                        if (val && val->kind == NODE_IDENT) {
+                            vname = val->ident.name;
+                            vname_len = val->ident.name_len;
+                        } else if (val && val->kind == NODE_FIELD) {
+                            vname = val->field.field_name;
+                            vname_len = val->field.field_name_len;
+                        }
+                        if (vname) {
+                            bool found = false;
+                            for (uint32_t vi = 0; vi < total; vi++) {
+                                if (expr->union_type.variants[vi].name_len == (uint32_t)vname_len &&
+                                    memcmp(expr->union_type.variants[vi].name, vname, vname_len) == 0) {
+                                    if (vi < 64) covered |= (1ULL << vi);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                checker_error(c, node->loc.line,
+                                    "no variant '%.*s' in union '%.*s'",
+                                    (int)vname_len, vname,
+                                    (int)expr->union_type.name_len, expr->union_type.name);
+                            }
+                        }
+                    }
+                }
                 if (!has_default) {
-                    uint32_t total = expr->union_type.variant_count;
                     uint32_t handled = 0;
-                    for (int i = 0; i < node->switch_stmt.arm_count; i++) {
-                        handled += (uint32_t)node->switch_stmt.arms[i].value_count;
+                    for (uint32_t b = 0; b < total && b < 64; b++) {
+                        if (covered & (1ULL << b)) handled++;
                     }
                     if (handled < total) {
                         checker_error(c, node->loc.line,

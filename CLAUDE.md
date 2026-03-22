@@ -104,10 +104,10 @@ Handle(Task) h;          index + generation counter, not a pointer
     []u8 msg = "Hello";           // slice with .ptr and .len
     ```
 
-11. **No `else if`.** Nest if inside else block.
+11. **`else if` is supported.** Both forms work:
     ```
-    if (a) { ... } else { if (b) { ... } }  // OK
-    if (a) { ... } else if (b) { ... }       // PARSE ERROR
+    if (a) { ... } else if (b) { ... }       // OK — parsed as nested if
+    if (a) { ... } else { if (b) { ... } }   // OK — same result
     ```
 
 12. **`orelse return` is bare — no value.** Return value comes from function's return type.
@@ -240,7 +240,7 @@ When spawning ANY agent that writes ZER source code (tests, examples, anything),
 ```
 ZER SYNTAX RULES (not C — these differ):
 - No ++ or --. Use += 1, -= 1
-- No else if. Nest: if (a) { } else { if (b) { } }
+- else if supported: if (a) { } else if (b) { } else { }
 - No C-style casts. Use @truncate, @saturate, @bitcast
 - Braces ALWAYS required for if/else/for/while bodies
 - Array decl: u8[256] buf (size between type and name)

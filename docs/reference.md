@@ -251,7 +251,7 @@ Fahrenheit f = @cast(Fahrenheit, c);     // explicit conversion
 
 ### if / else
 
-Braces always required. No `else if` — nest instead.
+Braces always required. `else if` works like C.
 
 ```zer
 if (x > 5) {
@@ -260,11 +260,10 @@ if (x > 5) {
 
 if (a) {
     handle_a();
+} else if (b) {
+    handle_b();
 } else {
-    if (b) {
-        handle_b();
-    } else {
-        handle_neither();
+    handle_neither();
     }
 }
 ```

@@ -559,6 +559,133 @@ static void test_adversarial(void) {
         "different struct types REJECT");
 }
 
+/* ================================================================
+ * NEGATIVE TEST SWEEP — every uncovered checker_error() path
+ * Each test triggers a specific rejection rule that had no test.
+ * ================================================================ */
+static void test_negative_sweep(void) {
+    printf("[negative test sweep — 24 uncovered rejection paths]\n");
+
+    /* 1. redefinition */
+    err("void f() { u32 x = 1; u32 x = 2; }",
+        "redefinition of variable in same scope");
+
+    /* 2. undefined identifier */
+    err("void f() { u32 x = nonexistent; }",
+        "undefined identifier rejected");
+
+    /* 3. undefined type */
+    err("void f() { NoSuchType x; }",
+        "undefined type name rejected");
+
+    /* 4. cannot compare incompatible types */
+    err("void f() { bool b = true; u32 x = 5; bool r = b == x; }",
+        "compare bool == u32 rejected");
+
+    /* 5. unary minus on non-numeric */
+    err("void f() { bool b = true; bool c = -b; }",
+        "unary minus on bool rejected");
+
+    /* 6. bitwise compound on float */
+    err("void f() { f32 x = 1.0; x &= 2; }",
+        "f32 &= rejected (bitwise on float)");
+
+    /* 7. compound narrowing */
+    err("void f() { u8 x = 1; u64 big = 99; x += big; }",
+        "u8 += u64 rejected (narrowing)");
+
+    /* 8. wrong arg type in function call */
+    err("void process(u32 x) { }\n"
+        "void f() { process(true); }",
+        "wrong arg type: bool for u32 rejected");
+
+    /* 9. no field on pointer auto-deref */
+    err("struct Pt { u32 x; }\n"
+        "void f() { *Pt p = &p; u32 y = p.nonexistent; }",
+        "no field on *Struct rejected");
+
+    /* 10. invalid enum variant access */
+    err("enum Color { red, green, blue }\n"
+        "void f() { Color c = Color.purple; }",
+        "nonexistent enum variant rejected");
+
+    /* 11. invalid union variant write */
+    err("struct A { u32 x; }\n"
+        "union U { A a; }\n"
+        "void f() { U u; u.nonexistent.x = 1; }",
+        "nonexistent union variant write rejected");
+
+    /* 12. array index must be integer */
+    err("void f() { u8[4] buf; u8 x = buf[true]; }",
+        "array index with bool rejected");
+
+    /* 13. slice start must be integer */
+    err("void f() { u8[10] buf; []u8 s = buf[true..5]; }",
+        "slice start non-integer rejected");
+
+    /* 14. slice end must be integer */
+    err("void f() { u8[10] buf; []u8 s = buf[0..true]; }",
+        "slice end non-integer rejected");
+
+    /* 15. orelse fallback type mismatch */
+    err("?u32 get() { return null; }\n"
+        "void f() { bool x = get() orelse true; }",
+        "orelse fallback type mismatch rejected");
+
+    /* 16. @bitcast width mismatch */
+    err("void f() { u32 x = 42; i16 y = @bitcast(i16, x); }",
+        "@bitcast mismatched width rejected");
+
+    /* 17. @truncate non-numeric source */
+    err("struct Foo { u32 x; }\n"
+        "void f() { Foo foo; u8 x = @truncate(u8, foo); }",
+        "@truncate on struct rejected");
+
+    /* 18. @saturate non-numeric source */
+    err("struct Bar { u32 v; }\n"
+        "void f() { Bar b; u8 x = @saturate(u8, b); }",
+        "@saturate on struct rejected");
+
+    /* 19. @saturate float target */
+    err("void f() { u32 x = 100; f32 y = @saturate(f32, x); }",
+        "@saturate float target rejected");
+
+    /* 20. @cast non-distinct target */
+    err("void f() { u32 x = 5; u32 y = @cast(u32, x); }",
+        "@cast non-distinct target rejected");
+
+    /* 21. for condition non-bool */
+    err("void f() { for (u32 i = 0; i; i += 1) { } }",
+        "for condition non-bool rejected");
+
+    /* 22. while condition non-bool */
+    err("void f() { u32 x = 1; while (x) { } }",
+        "while condition non-bool rejected");
+
+    /* 23. enum switch not exhaustive */
+    err("enum Dir { north, south, east, west }\n"
+        "void f() { Dir d = Dir.north; switch (d) { .north => { } .south => { } } }",
+        "enum switch non-exhaustive rejected");
+
+    /* 24. union switch not exhaustive */
+    err("struct A { u32 x; }\nstruct B { u32 y; }\n"
+        "union U { A a; B b; }\n"
+        "void f() { U u; u.a.x = 1; switch (u) { .a => |v| { } } }",
+        "union switch non-exhaustive rejected");
+
+    /* 25. union switch invalid variant name */
+    err("struct A { u32 x; }\nstruct B { u32 y; }\n"
+        "union U { A a; B b; }\n"
+        "void f() { U u; u.a.x = 1; switch (u) { .a => |v| { } .typo => |v| { } } }",
+        "union switch invalid variant name rejected");
+
+    /* 26. const field mutation on value capture */
+    err("struct Pt { u32 x; u32 y; }\n"
+        "?Pt make() { Pt p; p.x = 1; p.y = 2; return p; }\n"
+        "void f() { ?Pt opt = make(); if (opt) |pt| { pt.x = 99; } }",
+        "const capture field mutation rejected");
+}
+
 /* ================================================================ */
 
 int main(void) {
@@ -597,6 +724,7 @@ int main(void) {
     test_s16_intrinsics();
     test_interactions();
     test_adversarial();
+    test_negative_sweep();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

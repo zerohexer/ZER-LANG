@@ -2523,34 +2523,26 @@ Ring(u8, config.buf_size);    // COMPILE ERROR: size must be compile-time consta
 // This restriction prevents creeping toward generics.
 ```
 
-### RESOLVED: UFCS — Uniform Function Call Syntax
+### RESOLVED: UFCS — Uniform Function Call Syntax — DROPPED
 
-Added. `t.foo(args)` desugars to `foo(&t, args)`. Zero cost. Not methods. Not OOP. Pure syntactic rewrite. ~200 lines of compiler code.
+<!-- UFCS was spec'd but never implemented in the emitter. Decision: DROP IT.
 
-```
-// Both styles compile to the SAME code:
-run(&t);                      // C style — always works
-t.run();                      // UFCS style — desugars to run(&t)
+Reasons:
+1. ZER's target audience is C developers. They already write uart_write(&port, data)
+   and prefer explicit function calls. UFCS adds implicit behavior they don't want.
+2. The important method-call syntax (pool.alloc(), ring.push(), arena.alloc()) already
+   works because these are compiler-known builtins — not UFCS. The cases that matter
+   are already covered.
+3. UFCS creates ambiguity: is t.foo() a struct field access or a function call? The
+   resolution rules add complexity for zero safety benefit.
+4. Embedded/safety-critical code favors explicit over implicit. Knowing exactly what
+   function is being called matters more than saving a few characters.
+5. C-style calls (func(&obj, args)) work everywhere, are unambiguous, and match what
+   every C developer already knows.
 
-write(&port, data);           // C style
-port.write(data);             // UFCS style — desugars to write(&port, data)
-
-alloc(&tasks);                // C style
-tasks.alloc();                // UFCS style — desugars to alloc(&tasks)
-
-// THE RULE:
-//   x.foo(args)
-//   → compiler looks for fn foo(*typeof(x), args)
-//   → if found: rewrite call to foo(&x, args)
-//   → if not found: check struct field named foo
-//   → if that's not found either: compile error
-//
-// This is what Zig, D, and Nim do. Proven. Zero overhead.
-// C developers can ignore UFCS and write C-style calls.
-// Both work. Both produce identical binaries.
-```
-
-This eliminates the friction of vtable initialization without methods. Linux kernel developers manually initialize function pointer structs AND universally complain about the ergonomics. UFCS gives the readability of methods without any OOP machinery.
+If method syntax is ever needed for user types, function pointers in structs (vtables)
+already provide it — and that pattern is well-understood by C developers.
+-->
 
 ### RESOLVED: Visibility — static for File Scope, Module Qualification for Conflicts
 

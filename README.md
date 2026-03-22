@@ -191,7 +191,7 @@ Parser Fuzz:                 491 adversarial inputs
 Total:                      912 tests + 491 fuzz, all passing
 ```
 
-All 224 end-to-end tests verified at GCC `-O2` — no optimizer-exposed issues.
+All 227 end-to-end tests verified at GCC `-O2` — no optimizer-exposed issues.
 
 Additionally tested outside the main suite: 11 OS/kernel programs (hash map, scheduler, memory pool, event queue, TCP state machine, linked list, page allocator, VFS, IPC pipe, network stack, block cache), 5 multi-module programs (cross-module enums, structs, optionals, 5-module diamond imports), and 3 stress tests (5-level nested structs, all integer widths, union pipelines).
 

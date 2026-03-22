@@ -311,6 +311,96 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-064: `volatile` qualifier completely stripped from emitted C
+- **Symptom:** `volatile *u32 reg = @inttoptr(...)` emits as `uint32_t* reg` — no volatile keyword. GCC optimizes away MMIO reads/writes.
+- **Root cause:** Parser consumes `volatile` as a var-decl flag (`is_volatile`), not as part of the type node. Emitter never checked `is_volatile` to emit the keyword.
+- **Fix:** `emit_global_var` and `emit_stmt(NODE_VAR_DECL)` propagate `is_volatile` to pointer type. `emit_type(TYPE_POINTER)` emits `volatile` prefix when `is_volatile` is set.
+
+### BUG-063: Expression-level `orelse return/break/continue` skips defers
+- **Symptom:** `defer cleanup(); get_val() orelse return;` — cleanup never called because the expression-level orelse handler emits `return` without `emit_defers()`.
+- **Root cause:** Var-decl orelse path had `emit_defers()` but expression-level path in `emit_expr(NODE_ORELSE)` did not.
+- **Fix:** Added `emit_defers()` before return and `emit_defers_from()` before break/continue in both void and non-void expression orelse paths.
+
+### BUG-062: `?UnionType` optional emits anonymous struct — GCC type mismatch
+- **Symptom:** `?Msg` (optional union) emits anonymous `struct { ... }` at each use — incompatible types.
+- **Root cause:** `emit_type(TYPE_OPTIONAL)` had no `case TYPE_UNION:`. Union declarations didn't emit `_zer_opt_UnionName` typedef.
+- **Fix:** Added `case TYPE_UNION:` → `_zer_opt_UnionName`. Added typedef emission after union declarations.
+
+### BUG-061: Compound `u8 += u64` accepted — silent narrowing
+- **Symptom:** Compound assignment didn't check type width compatibility. `u8 += u64` silently truncated.
+- **Root cause:** Compound assignment only checked `type_is_numeric()`, not width compatibility.
+- **Fix:** Added narrowing check (reject when value wider than target), with literal exemption (`u8 += 1` is fine).
+
+### BUG-060: Const capture field mutation bypasses const check
+- **Symptom:** `if (opt) |pt| { pt.x = 99; }` accepted — const-captured struct field modified.
+- **Root cause:** Const check only examined `NODE_IDENT` targets, not field/index chains.
+- **Fix:** Walk field/index chain to root ident, check const. Allow mutation through pointers (auto-deref).
+
+### BUG-059: `@truncate`/`@saturate` accept non-numeric source
+- **Symptom:** `@truncate(u8, some_struct)` accepted — struct passed to truncate.
+- **Root cause:** No source type validation in intrinsic handlers.
+- **Fix:** Validate source is numeric (unwrap distinct types before checking).
+
+### BUG-058: Union switch arm variant names never validated
+- **Symptom:** `.doesnt_exist =>` in union switch accepted — nonexistent variant.
+- **Root cause:** Union switch arms skipped name validation entirely.
+- **Fix:** Validate each arm's variant name against the union's variant list.
+
+### BUG-057: Union switch exhaustiveness counts duplicates
+- **Symptom:** `.sensor, .sensor =>` counts as 2 handled, hiding missing `.command`.
+- **Root cause:** Raw `value_count` sum instead of unique variant tracking.
+- **Fix:** Bitmask-based deduplication (same approach as enum fix BUG-048).
+
+### BUG-056: Bitwise compound `&= |= ^= <<= >>=` accepted on floats
+- **Symptom:** `f32 x = 1.0; x &= 2;` compiles — GCC rejects the emitted C.
+- **Root cause:** Compound assignment only checked `type_is_numeric()`, which includes floats.
+- **Fix:** Added explicit check: bitwise compound ops require integer types.
+
+### BUG-055: `@cast` — parser excluded TOK_IDENT from type_arg
+- **Symptom:** `@cast(Fahrenheit, c)` fails — checker returns ty_void because type_arg is NULL.
+- **Root cause:** Parser's `is_type_token && type != TOK_IDENT` guard excluded all named types from being parsed as type_arg.
+- **Fix:** Added `force_type_arg` for `@cast` intrinsic, allowing TOK_IDENT to be parsed as type.
+
+### BUG-054: Array-to-slice coercion missing at call sites, var-decl, and return
+- **Symptom:** `process(buf)` where buf is `u8[N]` and param is `[]u8` — GCC type mismatch.
+- **Root cause:** Emitter passed raw array pointer instead of wrapping in slice compound literal.
+- **Fix:** Added `emit_array_as_slice()` helper. Applied at 3 sites: call args, var-decl init, return.
+
+### BUG-053: Slice-of-slice missing `.ptr` + open-end slice on slices
+- **Symptom:** `data[1..3]` on a `[]u8` parameter emits `&(data)[1]` — subscript on struct.
+- **Root cause:** Slice emission didn't add `.ptr` for slice-type objects. Open-end `slice[start..]` emitted length `0`.
+- **Fix:** Added `.ptr` when object is TYPE_SLICE. Added `slice.len - start` for open-end on slices.
+
+### BUG-052: `?T orelse return` as expression — guard completely missing
+- **Symptom:** `get_val() orelse return;` emits `({ auto t = expr; t.value; })` — no guard, no return.
+- **Root cause:** Non-void, non-pointer path in expression-level orelse handler extracted `.value` unconditionally.
+- **Fix:** Added `if (!has_value) { return; }` guard with correct return type wrapping.
+
+### BUG-051: `?void` var-decl null init emits wrong initializer
+- **Symptom:** `?void x = null;` (global) emits `= 0` (scalar for struct). Local emits `{ 0, 0 }` (2 fields for 1-field struct).
+- **Root cause:** Global path called `emit_expr(NULL_LIT)` which emits scalar 0. Local path didn't check for TYPE_VOID.
+- **Fix:** Both paths now check `inner == TYPE_VOID` → emit `{ 0 }`.
+
+### BUG-050: `@bitcast` accepts mismatched widths
+- **Symptom:** `@bitcast(i64, u32_val)` accepted — spec requires same width.
+- **Root cause:** No width validation in checker's @bitcast handler.
+- **Fix:** Compare `type_width(target)` vs `type_width(source)`, error if different.
+
+### BUG-049: Bool switch checks arm count, not actual coverage
+- **Symptom:** `switch (x) { true => {} true => {} }` accepted — false never handled.
+- **Root cause:** Checked `arm_count < 2` instead of tracking which values are covered.
+- **Fix:** Track `has_true`/`has_false` flags from actual arm values.
+
+### BUG-048: Enum switch exhaustiveness tricked by duplicate variants
+- **Symptom:** `.idle, .idle =>` counts as 2, masking missing variants.
+- **Root cause:** Raw `value_count` sum instead of unique variant tracking.
+- **Fix:** Bitmask-based deduplication — each variant index tracked as a bit.
+
+### BUG-047: `bool x = 42` accepted — int literal coerces to bool
+- **Symptom:** Integer literal assigned to bool variable without error.
+- **Root cause:** `is_literal_compatible` had `NODE_INT_LIT && TYPE_BOOL → true`.
+- **Fix:** Removed that rule. Only `true`/`false` literals can initialize bool.
+
 ### BUG-046: `@trap()` rejected as unknown intrinsic
 - **Symptom:** `@trap()` fails with "unknown intrinsic '@trap'" at checker.
 - **Root cause:** Checker had no handler for `@trap` — fell to the `else` branch that reports unknown intrinsics.

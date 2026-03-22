@@ -1951,6 +1951,22 @@ int main(void) {
         10,
         "enum explicit values: low=1, med=5, high=10 → switch high = 10");
 
+    /* negative enum values */
+    test_compile_and_run(
+        "enum Code { err = -1, ok = 0, warn = 1 }\n"
+        "u32 main() {\n"
+        "    Code c = Code.err;\n"
+        "    u32 result = 0;\n"
+        "    switch (c) {\n"
+        "        .err => { result = 99; }\n"
+        "        .ok => { result = 0; }\n"
+        "        .warn => { result = 1; }\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        99,
+        "enum negative value: err=-1 → switch .err = 99");
+
     /* enum with gaps: auto-increment after explicit */
     test_compile_and_run(
         "enum Code { ok = 0, warn = 100, err, fatal }\n"

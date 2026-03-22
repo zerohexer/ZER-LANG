@@ -98,5 +98,5 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. Array-to-slice coercion at all emission sites. Volatile emission. No UFCS (dropped).
 **Audit status:** 4 rounds completed, converged to 0 bugs. 26 systematic negative tests covering all checker rejection paths.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
-**Known limitations:** Explicit enum values not yet supported (rejected at parser). Non-u8/u32 slice types use anonymous structs (type mismatch across functions). No native backends (emit-C only).
+**Known limitations:** Non-u8/u32 slice types use anonymous structs (type mismatch across functions). No native backends (emit-C only).
 **Next:** v0.1.0 tag.

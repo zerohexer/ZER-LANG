@@ -2102,6 +2102,11 @@ void emit_file(Emitter *e, Node *file_node) {
                 if (v->value && v->value->kind == NODE_INT_LIT) {
                     val = (int32_t)v->value->int_lit.value;
                     next_val = val + 1;
+                } else if (v->value && v->value->kind == NODE_UNARY &&
+                           v->value->unary.op == TOK_MINUS &&
+                           v->value->unary.operand->kind == NODE_INT_LIT) {
+                    val = -(int32_t)v->value->unary.operand->int_lit.value;
+                    next_val = val + 1;
                 } else {
                     val = next_val++;
                 }
@@ -2168,6 +2173,11 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
                 int32_t val;
                 if (v->value && v->value->kind == NODE_INT_LIT) {
                     val = (int32_t)v->value->int_lit.value;
+                    next_val = val + 1;
+                } else if (v->value && v->value->kind == NODE_UNARY &&
+                           v->value->unary.op == TOK_MINUS &&
+                           v->value->unary.operand->kind == NODE_INT_LIT) {
+                    val = -(int32_t)v->value->unary.operand->int_lit.value;
                     next_val = val + 1;
                 } else {
                     val = next_val++;

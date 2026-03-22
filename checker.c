@@ -1777,6 +1777,11 @@ static void register_decl(Checker *c, Node *node) {
                     /* explicit value — evaluate */
                     if (ev->value->kind == NODE_INT_LIT) {
                         sv->value = (int32_t)ev->value->int_lit.value;
+                    } else if (ev->value->kind == NODE_UNARY &&
+                               ev->value->unary.op == TOK_MINUS &&
+                               ev->value->unary.operand->kind == NODE_INT_LIT) {
+                        /* negative value: -N */
+                        sv->value = -(int32_t)ev->value->unary.operand->int_lit.value;
                     }
                     next_val = sv->value + 1;
                 } else {

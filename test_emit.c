@@ -1935,6 +1935,39 @@ int main(void) {
         30,
         "array→slice coercion at var-decl: u8[3] → []u8 = 30");
 
+    /* BUG-068: enum explicit values */
+    test_compile_and_run(
+        "enum Prio { low = 1, med = 5, high = 10 }\n"
+        "u32 main() {\n"
+        "    Prio p = Prio.high;\n"
+        "    u32 result = 0;\n"
+        "    switch (p) {\n"
+        "        .low => { result = 1; }\n"
+        "        .med => { result = 5; }\n"
+        "        .high => { result = 10; }\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        10,
+        "enum explicit values: low=1, med=5, high=10 → switch high = 10");
+
+    /* enum with gaps: auto-increment after explicit */
+    test_compile_and_run(
+        "enum Code { ok = 0, warn = 100, err, fatal }\n"
+        "u32 main() {\n"
+        "    u32 result = 0;\n"
+        "    Code c = Code.fatal;\n"
+        "    switch (c) {\n"
+        "        .ok => { result = 0; }\n"
+        "        .warn => { result = 100; }\n"
+        "        .err => { result = 101; }\n"
+        "        .fatal => { result = 102; }\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        102,
+        "enum with gaps: ok=0, warn=100, err=101, fatal=102");
+
     /* BUG-055: @cast between distinct typedefs */
     test_compile_and_run(
         "distinct typedef u32 Celsius;\n"

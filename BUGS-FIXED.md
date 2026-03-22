@@ -313,8 +313,9 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ### BUG-068: Explicit enum values (`enum { a = 5 }`) silently emit wrong constants
 - **Symptom:** `enum Prio { low = 1, med = 5, high = 10 }` emits `#define _ZER_Prio_low 0`, `_ZER_Prio_med 1`, `_ZER_Prio_high 2` — uses loop index instead of declared value.
-- **Root cause:** Emitter's enum `#define` loop uses `j` (loop counter) as the value, ignoring `v->value`.
-- **Fix:** Rejected at parser level with "explicit enum values not yet supported" — prevents silent wrong behavior. Proper support deferred to v0.2.
+- **Root cause:** Emitter's enum `#define` loop uses `j` (loop counter) as the value, ignoring `v->value` from the AST. Parser and checker already handled explicit values correctly.
+- **Fix:** Emitter now reads `v->value->int_lit.value` when present, with auto-increment for implicit values after explicit ones. Fixed in both `emit_file` and `emit_file_no_preamble`.
+- **Test:** `test_emit.c` — explicit values (1,5,10) and gaps with auto-increment (0,100,101,102)
 
 ### BUG-067: `*Union` pointer auto-deref returns `ty_void` in checker
 - **Symptom:** `*Msg p = &msg; p.sensor = s;` fails with "cannot assign 'S' to 'void'" — checker doesn't auto-deref pointers to unions.

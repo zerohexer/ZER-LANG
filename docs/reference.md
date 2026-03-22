@@ -193,6 +193,13 @@ switch (s) {
 }
 ```
 
+Explicit values and gaps (like C):
+
+```zer
+enum ErrorCode { ok = 0, warn = 100, err, fatal }
+// ok=0, warn=100, err=101 (auto), fatal=102 (auto)
+```
+
 Enum switches must be exhaustive — missing a variant is a compile error.
 
 ### Tagged Unions

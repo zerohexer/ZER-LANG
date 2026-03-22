@@ -2091,18 +2091,27 @@ void emit_file(Emitter *e, Node *file_node) {
             break;
         }
 
-        case NODE_ENUM_DECL:
-            /* emit as #define constants */
+        case NODE_ENUM_DECL: {
+            /* emit as #define constants — use explicit values if provided */
             emit(e, "/* enum %.*s */\n",
                  (int)decl->enum_decl.name_len, decl->enum_decl.name);
+            int32_t next_val = 0;
             for (int j = 0; j < decl->enum_decl.variant_count; j++) {
                 EnumVariant *v = &decl->enum_decl.variants[j];
+                int32_t val;
+                if (v->value && v->value->kind == NODE_INT_LIT) {
+                    val = (int32_t)v->value->int_lit.value;
+                    next_val = val + 1;
+                } else {
+                    val = next_val++;
+                }
                 emit(e, "#define _ZER_%.*s_%.*s %d\n",
                      (int)decl->enum_decl.name_len, decl->enum_decl.name,
-                     (int)v->name_len, v->name, j);
+                     (int)v->name_len, v->name, val);
             }
             emit(e, "\n");
             break;
+        }
 
         case NODE_IMPORT:
             emit(e, "/* import %.*s — TODO */\n\n",
@@ -2150,17 +2159,26 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
         switch (decl->kind) {
         case NODE_STRUCT_DECL: emit_struct_decl(e, decl); break;
 
-        case NODE_ENUM_DECL:
+        case NODE_ENUM_DECL: {
             emit(e, "/* enum %.*s */\n",
                  (int)decl->enum_decl.name_len, decl->enum_decl.name);
+            int32_t next_val = 0;
             for (int j = 0; j < decl->enum_decl.variant_count; j++) {
                 EnumVariant *v = &decl->enum_decl.variants[j];
+                int32_t val;
+                if (v->value && v->value->kind == NODE_INT_LIT) {
+                    val = (int32_t)v->value->int_lit.value;
+                    next_val = val + 1;
+                } else {
+                    val = next_val++;
+                }
                 emit(e, "#define _ZER_%.*s_%.*s %d\n",
                      (int)decl->enum_decl.name_len, decl->enum_decl.name,
-                     (int)v->name_len, v->name, j);
+                     (int)v->name_len, v->name, val);
             }
             emit(e, "\n");
             break;
+        }
 
         case NODE_UNION_DECL: {
             emit(e, "/* tagged union %.*s */\n",

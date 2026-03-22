@@ -249,6 +249,24 @@ When target type is `?T` and inner is not pointer:
 - `NODE_IDENT` init → check `checker_get_type()`: if already `?T`, assign directly; if plain `T`, wrap as `{ val, 1 }`
 - Other expressions → wrap as `{ val, 1 }`
 
+### Enum Emission
+
+Enums emit as `#define` constants, not C enums:
+
+```c
+// ZER: enum Prio { low = 1, med = 5, high = 10 }
+// Emitted C:
+#define _ZER_Prio_low 1
+#define _ZER_Prio_med 5
+#define _ZER_Prio_high 10
+```
+
+**Pipeline:** Parser stores explicit value in `EnumVariant.value` (NODE_INT_LIT or NULL). Checker resolves to `SEVariant.value` (int32_t) with auto-increment for implicit values. Emitter reads `EnumVariant.value` from AST — if present uses it, otherwise auto-increments.
+
+**Gaps with auto-increment work like C:** `enum Code { ok = 0, warn = 100, err, fatal }` → ok=0, warn=100, err=101, fatal=102.
+
+**Switch emission:** Enum switch emits as `if/else if` chain (not C switch), comparing against `_ZER_EnumName_variant` constants.
+
 ### Naming Conventions in Emitted C
 - User types: as-is (`Task`, `State`, `Packet`)
 - Enum values: `_ZER_EnumName_variant` (e.g., `_ZER_State_idle`)

@@ -364,7 +364,7 @@ If you can't commit (tests failing), stash.
    The fix should be 1-5 lines. If growing beyond that, you're fixing the wrong thing.
 
 6. **`make check` immediately after fix**
-   938+ tests must pass. If not — revert, re-examine root cause.
+   940+ tests must pass. If not — revert, re-examine root cause.
 
 7. **Update BUGS-FIXED.md** with: symptom, root cause, fix, test reference.
 

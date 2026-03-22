@@ -1,0 +1,122 @@
+// ZER on ARM Cortex-M3 — QEMU lm3s6965evb
+//
+// This is a real freestanding firmware. No OS. No libc. No runtime.
+// ZER emits C, arm-none-eabi-gcc cross-compiles to Thumb-2, QEMU runs it.
+//
+// Build: make qemu (from this directory)
+
+// UART0 registers — Stellaris LM3S6965 memory map
+volatile *u32 UART0_DR = @inttoptr(*u32, 0x4000C000);
+volatile *u32 UART0_FR = @inttoptr(*u32, 0x4000C018);
+
+// Send one byte over UART
+void uart_putc(u8 c) {
+    // Wait until TX FIFO is not full (bit 5 of FR)
+    while ((*UART0_FR & 0x20) != 0) { }
+    *UART0_DR = @truncate(u32, c);
+}
+
+// Send a string over UART
+void uart_puts([]u8 s) {
+    for (usize i = 0; i < s.len; i += 1) {
+        uart_putc(s[i]);
+    }
+}
+
+// Print a u32 as decimal
+void uart_print_u32(u32 val) {
+    u8[10] buf;
+    u32 pos = 0;
+    if (val == 0) {
+        uart_putc(48);
+        return;
+    }
+    u32 tmp = val;
+    while (tmp > 0) {
+        buf[pos] = @truncate(u8, (tmp % 10) + 48);
+        pos += 1;
+        tmp = tmp / 10;
+    }
+    // Print in reverse
+    while (pos > 0) {
+        pos -= 1;
+        uart_putc(buf[pos]);
+    }
+}
+
+// Demonstrate ZER safety: bounds-checked array access
+void demo_safety() {
+    u32[4] data;
+    data[0] = 10;
+    data[1] = 20;
+    data[2] = 30;
+    data[3] = 40;
+
+    u32 sum = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        sum += data[i];  // bounds-checked by ZER
+    }
+
+    uart_puts("Array sum (10+20+30+40): ");
+    uart_print_u32(sum);
+    uart_puts("\n");
+}
+
+// Demonstrate ZER optional handling
+?u32 safe_divide(u32 a, u32 b) {
+    if (b == 0) { return null; }
+    return a / b;
+}
+
+void demo_optionals() {
+    u32 result = safe_divide(100, 4) orelse 0;
+    uart_puts("100 / 4 = ");
+    uart_print_u32(result);
+    uart_puts("\n");
+
+    u32 fail = safe_divide(100, 0) orelse 0;
+    uart_puts("100 / 0 = ");
+    uart_print_u32(fail);
+    uart_puts(" (orelse 0 — division by zero caught)\n");
+}
+
+// Demonstrate ZER exhaustive enum switch
+enum State { idle, running, done }
+
+u32 state_value(State s) {
+    u32 result = 0;
+    switch (s) {
+        .idle    => { result = 1; }
+        .running => { result = 2; }
+        .done    => { result = 3; }
+    }
+    return result;
+}
+
+void demo_enums() {
+    uart_puts("State.idle = ");
+    uart_print_u32(state_value(State.idle));
+    uart_puts(", State.running = ");
+    uart_print_u32(state_value(State.running));
+    uart_puts(", State.done = ");
+    uart_print_u32(state_value(State.done));
+    uart_puts("\n");
+}
+
+// Entry point — no OS, no libc, bare metal
+void main() {
+    uart_puts("========================================\n");
+    uart_puts("  ZER-LANG on ARM Cortex-M3 (QEMU)\n");
+    uart_puts("  Memory-safe C. No runtime. No OS.\n");
+    uart_puts("========================================\n\n");
+
+    demo_safety();
+    demo_optionals();
+    demo_enums();
+
+    uart_puts("\nAll demos passed. ZER runs on ARM.\n");
+
+    // Exit QEMU via semihosting-style: write to NVIC AIRCR to reset
+    // Or just halt
+    while (true) { }
+}

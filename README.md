@@ -32,7 +32,7 @@ Multi-file with imports:
 arm-none-eabi-gcc -std=c99 -o firmware.elf firmware.c
 ```
 
-Emit bare C without ZER preamble (`--lib` strips type definitions and runtime helpers — use when embedding into an existing C project):
+Emit bare C without ZER preamble (`--lib` strips runtime helpers like bounds checks and trap handlers — compile-time safety is still fully enforced, but runtime checks must be provided by the host project):
 
 ```bash
 ./zerc module.zer --lib -o module.c

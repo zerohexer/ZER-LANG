@@ -2,15 +2,29 @@
 
 All notable changes to ZER-LANG. Read this to understand project history and current state.
 
-## 2026-03-22 (continued — audit round 4)
+## 2026-03-23
 
-### Bug Fixes (Round 4 — 2 findings)
-- **BUG-067:** `*Union` pointer auto-deref now resolves variant type correctly (was returning ty_void)
-- **BUG-068:** Explicit enum values (`enum { a = 5 }`) now rejected at parser — was silently emitting wrong constants. Proper support deferred to v0.2.
+### Major Features
+- **`?FuncPtr`** — optional function pointers with null sentinel. `?void (*cb)(u32) = null;` works with if-unwrap, orelse, assignment. Zero overhead. `IS_NULL_SENTINEL` macro unifies TYPE_POINTER and TYPE_FUNC_PTR across all emitter paths.
+- **Function pointer `typedef`** — `typedef u32 (*Callback)(u32);` now parses and emits correctly. Enables `[]Callback` slices.
+- **Named slice typedefs for ALL types** — `[]T` no longer uses anonymous structs. Every primitive gets `_zer_slice_T` in preamble. Struct/union declarations emit `_zer_slice_StructName`. Slices work across function boundaries for all types.
+- **`?[]T` optional slice typedefs** — `_zer_opt_slice_T` for all primitives, structs, unions.
+- **Enum explicit values** — `enum { low = 1, med = 5, high = 10 }` now works correctly (was emitting loop index). Negative values (`err = -1`) also work. Auto-increment after explicit values like C.
+- **`else if` confirmed working** — was always implemented in parser, docs incorrectly said it wasn't supported. Fixed all docs.
+
+### Bug Fixes (Rounds 4-5)
+- **BUG-067:** `*Union` pointer auto-deref now resolves variant type correctly
+- **BUG-068:** Enum explicit values — emitter now uses stored value instead of loop index
+- **BUG-069:** All `[]T` slice types now have named typedefs (was anonymous structs breaking across functions)
+- **BUG-070:** `?FuncPtr` now supported with null sentinel (parser unwraps `?` around func ptr)
+- **BUG-071:** Function pointer typedef now parses and emits correctly
 
 ### Audit Convergence
-- Round 1: 12 bugs → Round 2: 9 bugs → Round 3: 2 bugs → Round 4: 0 bugs in working features
-- Compiler is clean across all audited dimensions
+- Round 1: 12 bugs → Round 2: 9 → Round 3: 2 → Round 4: 2 → Round 5: 1
+- Compiler clean across all audited dimensions
+
+### Tests
+- **946 tests + 491 fuzz, all passing**
 
 ## 2026-03-22 (continued — audit rounds 2-3)
 
@@ -93,10 +107,10 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 938 tests + 491 fuzz, all passing. ~9,500 lines. 68 bugs found and fixed.
+**Compiler:** 946 tests + 491 fuzz, all passing. ~10,000 lines. 71 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
-**Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. Array-to-slice coercion at all emission sites. Volatile emission. No UFCS (dropped).
-**Audit status:** 4 rounds completed, converged to 0 bugs. 26 systematic negative tests covering all checker rejection paths.
+**Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
+**Audit status:** 5 rounds completed, converged (12→9→2→2→1). 26 systematic negative tests covering all checker rejection paths.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
-**Known limitations:** Non-u8/u32 slice types use anonymous structs (type mismatch across functions). No native backends (emit-C only).
+**Known limitations:** `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first. No native backends (emit-C only).
 **Next:** v0.1.0 tag.

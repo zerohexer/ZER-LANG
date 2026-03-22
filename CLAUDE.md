@@ -448,13 +448,40 @@ Then verify each finding by reading the actual code at the cited lines. Agents f
 ### For Test Writing
 
 Spawn an agent to write new E2E tests. **MUST include the ZER syntax rules block** from "Spawning Agents" section above. Then verify:
-- ZER syntax is correct (switch arms have braces, no `++`, no `else if`)
+- ZER syntax is correct (switch arms have braces, no `++`)
 - Expected exit codes are mathematically correct
 - Tests actually compile and pass with `make check`
+
+### Multi-Round Audit Protocol
+
+For pre-release auditing, run multiple rounds. Each round gets more targeted as obvious bugs are fixed. The prompt quality matters — here's the pattern that converged from 12 bugs to 1 across 5 rounds:
+
+**Round 1 prompt (broad):**
+- "Read CLAUDE.md, compiler-internals.md, BUGS-FIXED.md, then read checker.c/emitter.c"
+- "Look for: optional handling gaps, slice emission, intrinsic validation, missing error cases"
+- Results: finds obvious gaps (bool coercion, missing handlers)
+
+**Round 2+ prompts (targeted interactions):**
+- List ALL bugs already fixed — "Previous rounds fixed: [list]. Do NOT re-report these."
+- Ask for INTERACTION bugs: "Look for two features combining incorrectly"
+- Give specific combinations to check: "defer + orelse + break in for loop", "volatile + @inttoptr", "?void + orelse return in var-decl path"
+- Say: "If you find ZERO bugs, say CLEAN — that's a valid outcome."
+
+**Key prompt elements that improve agent quality:**
+1. Tell what was ALREADY fixed (prevents re-reporting — agents waste turns on known bugs)
+2. Tell it to check INTERACTIONS, not basic rules (negative test sweep covers those)
+3. Give specific interaction patterns (agents check exactly what you ask)
+4. Allow "CLEAN" as valid output (prevents agents from inventing false positives)
+5. Include the ZER syntax rules block (prevents agents from writing invalid test code)
+
+**Expected convergence:** Round 1: 10+ bugs. Round 2: 5-10. Round 3: 2-3. Round 4+: 0-1. If round 3+ still finds 5+, the checker/emitter has structural issues — stop and refactor.
+
+**After auditing:** Run a systematic negative test sweep — write one test for every `checker_error()` call site that has no test. This closes the gaps permanently so future audits find only interaction bugs.
 
 ### Why This Works
 
 - Agents explore without consuming your main context window
 - Fresh perspective catches blind spots
 - Verification step catches agent mistakes (wrong syntax, false positives)
+- Multi-round convergence proves stability — each round finds fewer bugs
 - You get both breadth (agent exploration) and depth (your verification)

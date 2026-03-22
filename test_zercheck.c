@@ -216,6 +216,66 @@ int main(void) {
        "}\n",
        "partial switch free: no false positive on post-switch use");
 
+    /* ---- Loop + Pool patterns ---- */
+    printf("\n[loop: pool.free inside loop — caught]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    for (u32 i = 0; i < 3; i += 1) {\n"
+        "        pool.free(h);\n"
+        "    }\n"
+        "}\n",
+        "pool.free inside loop — use-after-free on next iteration");
+
+    printf("[loop: alloc+use+free in same iteration — OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    for (u32 i = 0; i < 3; i += 1) {\n"
+       "        Handle(T) h = pool.alloc() orelse return;\n"
+       "        pool.get(h).x = i;\n"
+       "        pool.free(h);\n"
+       "    }\n"
+       "}\n",
+       "alloc+use+free in same iteration — OK");
+
+    printf("[loop: conditional free in loop — not caught]\n");
+    /* NOTE: zercheck under-approximation — conditional free inside
+       loop doesn't propagate freed state outside the loop body */
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f(bool cond) {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    for (u32 i = 0; i < 3; i += 1) {\n"
+       "        if (cond) { pool.free(h); }\n"
+       "    }\n"
+       "    pool.get(h).x = 1;\n"
+       "}\n",
+       "conditional free in loop then use after — not caught (under-approx)");
+
+    printf("[loop: alloc before loop, use in loop, free after — OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    for (u32 i = 0; i < 3; i += 1) {\n"
+       "        pool.get(h).x = i;\n"
+       "    }\n"
+       "    pool.free(h);\n"
+       "}\n",
+       "alloc before loop, use in loop, free after — OK");
+
+    printf("[double free — error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    pool.free(h);\n"
+        "    pool.free(h);\n"
+        "}\n",
+        "double free — error");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

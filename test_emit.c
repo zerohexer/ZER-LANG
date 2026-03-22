@@ -1555,6 +1555,240 @@ int main(void) {
         "u32 main() { return apply(inc, 41); }\n",
         "func ptr as param compiles correctly");
 
+    /* ================================================================
+     * Bit extraction edge cases
+     * ================================================================ */
+    printf("\n--- Bit extraction edge cases ---\n");
+
+    printf("[bit extract: single bit [0..0]]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 0xFF;\n"
+        "    u32 b = x[0..0];\n"
+        "    return b;\n"
+        "}\n",
+        1,
+        "0xFF[0..0] = 1 (single bit)");
+
+    printf("[bit extract: sub-range [7..0] of u32]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 0xDEADBEEF;\n"
+        "    u32 lo = x[7..0];\n"
+        "    return lo;\n"
+        "}\n",
+        239,
+        "0xDEADBEEF[7..0] = 0xEF = 239");
+
+    printf("[bit extract: mid-range [15..8]]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 0x00FF00;\n"
+        "    u32 mid = x[15..8];\n"
+        "    return mid;\n"
+        "}\n",
+        255,
+        "0x00FF00[15..8] = 0xFF = 255");
+
+    /* ================================================================
+     * Defer stress tests
+     * ================================================================ */
+    printf("\n--- Defer stress tests ---\n");
+
+    printf("[defer: multiple defers reverse order]\n");
+    test_compile_and_run(
+        "u32 g = 0;\n"
+        "void set1() { g = 1; }\n"
+        "void set2() { g = 2; }\n"
+        "void set3() { g = 3; }\n"
+        "void work() {\n"
+        "    defer set1();\n"
+        "    defer set2();\n"
+        "    defer set3();\n"
+        "}\n"
+        "u32 main() {\n"
+        "    work();\n"
+        "    return g;\n"
+        "}\n",
+        1,
+        "3 defers in reverse: set3, set2, set1 — g ends at 1");
+
+    printf("[defer: in nested loop with break]\n");
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "void tick() { counter += 1; }\n"
+        "u32 main() {\n"
+        "    for (u32 i = 0; i < 3; i += 1) {\n"
+        "        for (u32 j = 0; j < 5; j += 1) {\n"
+        "            defer tick();\n"
+        "            if (j == 2) { break; }\n"
+        "        }\n"
+        "    }\n"
+        "    return counter;\n"
+        "}\n",
+        9,
+        "defer in inner loop with break at j==2: 3 iters * 3 ticks = 9");
+
+    printf("[defer: inside switch arm]\n");
+    test_compile_and_run(
+        "u32 g = 0;\n"
+        "void bump() { g += 10; }\n"
+        "void noop() { }\n"
+        "u32 route(u32 x) {\n"
+        "    u32 result = 0;\n"
+        "    switch (x) {\n"
+        "        1 => {\n"
+        "            defer bump();\n"
+        "            result = 1;\n"
+        "        },\n"
+        "        2 => {\n"
+        "            defer bump();\n"
+        "            result = 2;\n"
+        "        },\n"
+        "        default => result = 99,\n"
+        "    }\n"
+        "    return result + g;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return route(1);\n"
+        "}\n",
+        11,
+        "defer in switch arm 1: result=1 + g=10 = 11");
+
+    /* ================================================================
+     * Empty-ish struct / edge types
+     * ================================================================ */
+    printf("\n--- Struct and type edge cases ---\n");
+
+    printf("[tiny struct via arena]\n");
+    test_compile_and_run(
+        "struct Tiny { u8 x; }\n"
+        "u8[4096] mem;\n"
+        "Arena ar;\n"
+        "u32 main() {\n"
+        "    ar = Arena.over(mem);\n"
+        "    *Tiny t = ar.alloc(Tiny) orelse return;\n"
+        "    t.x = 42;\n"
+        "    u32 r = @truncate(u32, t.x);\n"
+        "    return r;\n"
+        "}\n",
+        42,
+        "single-field struct Tiny via arena: x = 42");
+
+    printf("[void function with no return]\n");
+    test_compile_and_run(
+        "u32 g = 0;\n"
+        "void side_effect() { g = 42; }\n"
+        "u32 main() {\n"
+        "    side_effect();\n"
+        "    return g;\n"
+        "}\n",
+        42,
+        "void fn sets global, main returns it = 42");
+
+    /* ================================================================
+     * Buffer / array edge cases
+     * ================================================================ */
+    printf("\n--- Buffer / array edge cases ---\n");
+
+    printf("[array element zero init]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8[1] buf;\n"
+        "    buf[0] = 0;\n"
+        "    u32 r = @truncate(u32, buf[0]);\n"
+        "    return r;\n"
+        "}\n",
+        0,
+        "u8[1] buf, set to 0, read back = 0");
+
+    printf("[string literal passed to function]\n");
+    test_compile_only(
+        "void process([]u8 msg) { }\n"
+        "void start() {\n"
+        "    []u8 s = \"hello\";\n"
+        "    process(s);\n"
+        "}\n",
+        "function taking []u8 param, passing string literal");
+
+    /* ================================================================
+     * Switch on larger enum
+     * ================================================================ */
+    printf("\n--- Switch on larger enum ---\n");
+
+    printf("[enum 5 variants, switch all arms]\n");
+    test_compile_and_run(
+        "enum Dir { north, south, east, west, center, }\n"
+        "void noop() { }\n"
+        "u32 main() {\n"
+        "    Dir d = Dir.west;\n"
+        "    u32 result = 0;\n"
+        "    switch (d) {\n"
+        "        Dir.north => result = 1,\n"
+        "        Dir.south => result = 2,\n"
+        "        Dir.east => result = 3,\n"
+        "        Dir.west => result = 4,\n"
+        "        Dir.center => result = 5,\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        4,
+        "enum Dir with 5 variants, switch to west = 4");
+
+    printf("[integer switch with default]\n");
+    test_compile_and_run(
+        "void noop() { }\n"
+        "u32 main() {\n"
+        "    u32 x = 42;\n"
+        "    u32 result = 0;\n"
+        "    switch (x) {\n"
+        "        0 => result = 1,\n"
+        "        1 => result = 2,\n"
+        "        default => result = 99,\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        99,
+        "integer switch, no arm matches, default = 99");
+
+    /* ================================================================
+     * Nested type combinations
+     * ================================================================ */
+    printf("\n--- Nested type combinations ---\n");
+
+    printf("[struct with ?*T field, null path]\n");
+    test_compile_and_run(
+        "struct Node { u32 val; ?*Node next; }\n"
+        "Node a;\n"
+        "u32 main() {\n"
+        "    a.val = 10;\n"
+        "    a.next = null;\n"
+        "    if (a.next) |n| {\n"
+        "        return n.val;\n"
+        "    }\n"
+        "    return a.val;\n"
+        "}\n",
+        10,
+        "struct with ?*Node next=null, fallthrough returns 10");
+
+    printf("[function returning ?*T from arena, caller unwraps]\n");
+    test_compile_and_run(
+        "struct Item { u32 id; }\n"
+        "u8[4096] mem;\n"
+        "Arena ar;\n"
+        "?*Item make_item(u32 id) {\n"
+        "    *Item it = ar.alloc(Item) orelse return;\n"
+        "    it.id = id;\n"
+        "    return it;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    ar = Arena.over(mem);\n"
+        "    *Item p = make_item(77) orelse return;\n"
+        "    return p.id;\n"
+        "}\n",
+        77,
+        "fn returning ?*Item from arena, caller unwraps = 77");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

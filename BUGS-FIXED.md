@@ -310,3 +310,9 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Root cause:** Emitter outputs plain arithmetic operators without wrapping protection.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
+
+### BUG-041: Bit extraction `[31..0]` emits `1u << 32` — undefined behavior
+- **Symptom:** Full-width bit extraction `x[31..0]` on u32 emits `(1u << 32)` which is UB (shift equals type width).
+- **Root cause:** Mask formula used `1u` (32-bit) which overflows when shift count reaches 32.
+- **Fix:** Changed `1u` to `1ull` (64-bit) so shifts up to 63 are safe.
+- **Test:** `test_emit.c` — `[0..0]` single bit, `[7..0]` low byte, `[15..8]` mid-range

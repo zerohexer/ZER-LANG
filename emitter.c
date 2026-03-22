@@ -616,7 +616,7 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->slice.object);
             emit(e, " >> ");
             emit_expr(e, node->slice.end);
-            emit(e, ") & ((1u << (");
+            emit(e, ") & ((1ull << (");
             emit_expr(e, node->slice.start);
             emit(e, " - ");
             emit_expr(e, node->slice.end);

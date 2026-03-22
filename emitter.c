@@ -2323,7 +2323,10 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
             emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name,
                  (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, "typedef struct { struct _union_%.*s* ptr; size_t len; } _zer_slice_%.*s;\n\n",
+            emit(e, "typedef struct { struct _union_%.*s* ptr; size_t len; } _zer_slice_%.*s;\n",
+                 (int)decl->union_decl.name_len, decl->union_decl.name,
+                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "typedef struct { _zer_slice_%.*s value; uint8_t has_value; } _zer_opt_slice_%.*s;\n\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name,
                  (int)decl->union_decl.name_len, decl->union_decl.name);
             break;

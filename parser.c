@@ -1434,6 +1434,32 @@ static Node *parse_declaration(Parser *p) {
     if (match(p, TOK_DISTINCT)) {
         consume(p, TOK_TYPEDEF, "expected 'typedef' after 'distinct'");
         TypeNode *type = parse_type(p);
+        /* function pointer distinct typedef: distinct typedef rettype (*Name)(params); */
+        if (check(p, TOK_LPAREN)) {
+            Token saved = p->current;
+            advance(p);
+            if (check(p, TOK_STAR)) {
+                advance(p);
+                bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
+                TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
+                const char *fpname = NULL;
+                size_t fpname_len = 0;
+                type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
+                if (is_opt_fp) {
+                    TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                    opt->optional.inner = type;
+                    type = opt;
+                }
+                Node *n = new_node(p, NODE_TYPEDEF);
+                n->typedef_decl.type = type;
+                n->typedef_decl.name = fpname;
+                n->typedef_decl.name_len = fpname_len;
+                n->typedef_decl.is_distinct = true;
+                consume(p, TOK_SEMICOLON, "expected ';' after typedef");
+                return n;
+            }
+            p->current = saved;
+        }
         consume(p, TOK_IDENT, "expected type alias name");
         Node *n = new_node(p, NODE_TYPEDEF);
         n->typedef_decl.type = type;

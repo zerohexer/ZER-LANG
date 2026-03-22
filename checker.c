@@ -214,7 +214,7 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     Type *effective = target;
     if (target->kind == TYPE_DISTINCT) effective = target->distinct.underlying;
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) return true;
-    if (expr->kind == NODE_INT_LIT && effective->kind == TYPE_BOOL) return true; /* 0/1 → bool */
+    /* bool is NOT an integer — no int→bool coercion (spec rule) */
     if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
     if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
@@ -1136,6 +1136,16 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* validate same width */
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    int tw = type_width(result);
+                    int vw = type_width(val_type);
+                    if (tw > 0 && vw > 0 && tw != vw) {
+                        checker_error(c, node->loc.line,
+                            "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
+                    }
+                }
             } else {
                 result = ty_void;
             }
@@ -1430,9 +1440,39 @@ static void check_stmt(Checker *c, Node *node) {
                 /* enum switch: must handle all variants OR have default */
                 if (!has_default) {
                     uint32_t total = expr->enum_type.variant_count;
-                    uint32_t handled = 0;
+                    /* track unique variants covered using a bitmask (up to 64 variants) */
+                    uint64_t covered = 0;
                     for (int i = 0; i < node->switch_stmt.arm_count; i++) {
-                        handled += (uint32_t)node->switch_stmt.arms[i].value_count;
+                        SwitchArm *arm = &node->switch_stmt.arms[i];
+                        for (int v = 0; v < arm->value_count; v++) {
+                            Node *val = arm->values[v];
+                            /* get variant name from arm value (dot-prefix or qualified) */
+                            const char *vname = NULL;
+                            size_t vname_len = 0;
+                            if (val && val->kind == NODE_IDENT) {
+                                /* .variant — dot-prefix form */
+                                vname = val->ident.name;
+                                vname_len = val->ident.name_len;
+                            } else if (val && val->kind == NODE_FIELD) {
+                                /* Dir.variant — qualified form */
+                                vname = val->field.field_name;
+                                vname_len = val->field.field_name_len;
+                            }
+                            if (vname) {
+                                for (uint32_t vi = 0; vi < total; vi++) {
+                                    if (expr->enum_type.variants[vi].name_len == vname_len &&
+                                        memcmp(expr->enum_type.variants[vi].name, vname, vname_len) == 0) {
+                                        if (vi < 64) covered |= (1ULL << vi);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    /* count unique bits */
+                    uint32_t handled = 0;
+                    for (uint32_t b = 0; b < total && b < 64; b++) {
+                        if (covered & (1ULL << b)) handled++;
                     }
                     if (handled < total) {
                         checker_error(c, node->loc.line,
@@ -1443,10 +1483,23 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
             } else if (type_equals(expr, ty_bool)) {
-                /* bool switch: must handle true and false */
-                if (!has_default && node->switch_stmt.arm_count < 2) {
-                    checker_error(c, node->loc.line,
-                        "switch on bool must handle both true and false");
+                /* bool switch: must handle both true and false */
+                if (!has_default) {
+                    bool has_true = false, has_false = false;
+                    for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+                        SwitchArm *arm = &node->switch_stmt.arms[i];
+                        for (int v = 0; v < arm->value_count; v++) {
+                            Node *val = arm->values[v];
+                            if (val && val->kind == NODE_BOOL_LIT) {
+                                if (val->bool_lit.value) has_true = true;
+                                else has_false = true;
+                            }
+                        }
+                    }
+                    if (!has_true || !has_false) {
+                        checker_error(c, node->loc.line,
+                            "switch on bool must handle both true and false");
+                    }
                 }
             } else if (type_is_integer(expr)) {
                 /* integer switch: must have default */

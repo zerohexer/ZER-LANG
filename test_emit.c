@@ -1873,6 +1873,44 @@ int main(void) {
         42,
         "@trap() compiles and is conditional: skipped = 42");
 
+    /* BUG-047: ?void var-decl null init — was emitting = 0 for struct */
+    test_compile_and_run(
+        "?void x = null;\n"
+        "u32 main() {\n"
+        "    ?void y = null;\n"
+        "    if (x) |_v| { return 1; }\n"
+        "    if (y) |_v| { return 2; }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "?void var-decl null: global+local init to {0}");
+
+    /* BUG-048: ?T orelse return as expression — guard was missing */
+    test_compile_and_run(
+        "?u32 get_val() { return null; }\n"
+        "u32 main() {\n"
+        "    get_val() orelse return;\n"
+        "    return 1;\n"
+        "}\n",
+        0,
+        "?u32 orelse return as expr: null fires return, exit 0");
+
+    /* BUG-049: slice-of-slice missing .ptr */
+    test_compile_and_run(
+        "u32 do_sub([]u8 sl) {\n"
+        "    []u8 sub = sl[1..4];\n"
+        "    return @truncate(u32, sub[0]) + @truncate(u32, sub[2]);\n"
+        "}\n"
+        "u8[5] g_buf;\n"
+        "u32 main() {\n"
+        "    g_buf[0] = 10; g_buf[1] = 20; g_buf[2] = 30;\n"
+        "    g_buf[3] = 40; g_buf[4] = 50;\n"
+        "    []u8 sl = g_buf[0..5];\n"
+        "    return do_sub(sl);\n"
+        "}\n",
+        60,
+        "slice-of-slice: sl[1..4], sub[0]=20 + sub[2]=40 = 60");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

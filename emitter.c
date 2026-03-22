@@ -653,9 +653,11 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             emit(e, "* ptr; size_t len; }){ ");
         }
-        /* ptr = &obj[start] */
+        /* ptr = &obj[start] or &obj.ptr[start] for slices */
+        bool obj_is_slice = obj_type && obj_type->kind == TYPE_SLICE;
         emit(e, "&(");
         emit_expr(e, node->slice.object);
+        if (obj_is_slice) emit(e, ".ptr");
         emit(e, ")[");
         if (node->slice.start) {
             emit_expr(e, node->slice.start);
@@ -674,6 +676,12 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->slice.end);
         } else if (node->slice.start && obj_type && obj_type->kind == TYPE_ARRAY) {
             emit(e, "%u - (", obj_type->array.size);
+            emit_expr(e, node->slice.start);
+            emit(e, ")");
+        } else if (node->slice.start && obj_is_slice) {
+            emit(e, "(");
+            emit_expr(e, node->slice.object);
+            emit(e, ").len - (");
             emit_expr(e, node->slice.start);
             emit(e, ")");
         } else {
@@ -727,13 +735,38 @@ static void emit_expr(Emitter *e, Node *node) {
                 }
                 emit(e, "} (void)0; })");
             } else {
+                /* ?T (non-void, non-pointer) orelse return/break/continue */
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_tmp%d = ", tmp);
                 emit_expr(e, node->orelse.expr);
                 if (is_ptr_optional) {
-                    emit(e, "; _zer_tmp%d; })", tmp);
+                    emit(e, "; if (!_zer_tmp%d) { ", tmp);
                 } else {
-                    emit(e, "; _zer_tmp%d.value; })", tmp);
+                    emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
+                }
+                if (node->orelse.fallback_is_return) {
+                    if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
+                        e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
+                        emit(e, "return (");
+                        emit_type(e, e->current_func_ret);
+                        if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
+                            emit(e, "){ 0 }; ");
+                        else
+                            emit(e, "){ 0, 0 }; ");
+                    } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                        emit(e, "return 0; ");
+                    } else {
+                        emit(e, "return; ");
+                    }
+                } else if (node->orelse.fallback_is_break) {
+                    emit(e, "break; ");
+                } else {
+                    emit(e, "continue; ");
+                }
+                if (is_ptr_optional) {
+                    emit(e, "} _zer_tmp%d; })", tmp);
+                } else {
+                    emit(e, "} _zer_tmp%d.value; })", tmp);
                 }
             }
         } else if (node->orelse.fallback &&
@@ -950,6 +983,18 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "; })");
+        } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
+            /* @cast(T, val) — distinct typedef conversion, same underlying type */
+            if (node->intrinsic.type_arg && node->intrinsic.arg_count > 0) {
+                emit(e, "((");
+                Type *tgt = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                if (tgt) emit_type(e, tgt);
+                emit(e, ")(");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "))");
+            } else {
+                emit(e, "0");
+            }
         } else {
             emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
         }
@@ -1134,7 +1179,10 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (type && type->kind == TYPE_OPTIONAL &&
                 type->optional.inner->kind != TYPE_POINTER) {
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
-                    emit(e, " = { 0, 0 }");
+                    if (type->optional.inner->kind == TYPE_VOID)
+                        emit(e, " = { 0 }");
+                    else
+                        emit(e, " = { 0, 0 }");
                 } else if (node->var_decl.init->kind == NODE_CALL ||
                            node->var_decl.init->kind == NODE_ORELSE) {
                     /* call/orelse might already return ?T — assign directly */
@@ -1718,8 +1766,18 @@ static void emit_global_var(Emitter *e, Node *node) {
     emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
 
     if (node->var_decl.init) {
-        emit(e, " = ");
-        emit_expr(e, node->var_decl.init);
+        /* optional null init needs struct literal, not scalar 0 */
+        if (type && type->kind == TYPE_OPTIONAL &&
+            type->optional.inner->kind != TYPE_POINTER &&
+            node->var_decl.init->kind == NODE_NULL_LIT) {
+            if (type->optional.inner->kind == TYPE_VOID)
+                emit(e, " = { 0 }");
+            else
+                emit(e, " = { 0, 0 }");
+        } else {
+            emit(e, " = ");
+            emit_expr(e, node->var_decl.init);
+        }
     } else {
         /* auto-zero */
         if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||

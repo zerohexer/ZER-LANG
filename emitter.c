@@ -1960,6 +1960,11 @@ void emit_file(Emitter *e, Node *file_node) {
                  (int)decl->import.module_name_len, decl->import.module_name);
             break;
 
+        case NODE_CINCLUDE:
+            emit(e, "#include \"%.*s\"\n",
+                 (int)decl->cinclude.path_len, decl->cinclude.path);
+            break;
+
         case NODE_INTERRUPT:
             emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void) ",
                  (int)decl->interrupt.name_len, decl->interrupt.name);
@@ -1992,7 +1997,7 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
     emit(e, "\n/* --- imported module --- */\n\n");
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
-        if (decl->kind == NODE_IMPORT) continue;
+        if (decl->kind == NODE_IMPORT || decl->kind == NODE_CINCLUDE) continue;
         switch (decl->kind) {
         case NODE_STRUCT_DECL: emit_struct_decl(e, decl); break;
 

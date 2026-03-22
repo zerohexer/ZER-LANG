@@ -137,6 +137,7 @@ typedef enum {
     NODE_UNION_DECL,        /* union Message { SensorData sensor; ... } */
     NODE_TYPEDEF,           /* typedef u32 Milliseconds; */
     NODE_IMPORT,            /* import uart; */
+    NODE_CINCLUDE,          /* cinclude "header.h"; */
     NODE_INTERRUPT,         /* interrupt USART1 { ... } */
     NODE_GLOBAL_VAR,        /* top-level variable declaration */
 
@@ -289,6 +290,12 @@ struct Node {
             const char *module_name;
             size_t module_name_len;
         } import;
+
+        /* NODE_CINCLUDE: cinclude "header.h"; */
+        struct {
+            const char *path;
+            size_t path_len;
+        } cinclude;
 
         /* NODE_INTERRUPT: interrupt USART1 as "handler_name" { ... } */
         struct {

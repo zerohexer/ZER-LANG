@@ -1369,6 +1369,17 @@ static Node *parse_declaration(Parser *p) {
         return n;
     }
 
+    /* cinclude "header.h"; */
+    if (match(p, TOK_CINCLUDE)) {
+        consume(p, TOK_STRING, "expected string path after 'cinclude'");
+        Node *n = new_node(p, NODE_CINCLUDE);
+        /* strip surrounding quotes from string token */
+        n->cinclude.path = tok_text(&p->previous) + 1;
+        n->cinclude.path_len = tok_len(&p->previous) - 2;
+        consume(p, TOK_SEMICOLON, "expected ';' after cinclude");
+        return n;
+    }
+
     /* struct / packed struct */
     if (match(p, TOK_PACKED)) {
         consume(p, TOK_STRUCT, "expected 'struct' after 'packed'");

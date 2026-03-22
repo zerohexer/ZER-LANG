@@ -35,7 +35,7 @@ typedef enum {
     TOK_POOL, TOK_RING, TOK_ARENA, TOK_HANDLE,
 
     /* === Special keywords === */
-    TOK_DEFER, TOK_IMPORT, TOK_VOLATILE, TOK_INTERRUPT,
+    TOK_DEFER, TOK_IMPORT, TOK_CINCLUDE, TOK_VOLATILE, TOK_INTERRUPT,
     TOK_ASM, TOK_STATIC, TOK_KEEP, TOK_AS,
 
     /* === Literals === */

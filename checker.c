@@ -1719,6 +1719,10 @@ static void register_decl(Checker *c, Node *node) {
         /* TODO: module resolution */
         break;
 
+    case NODE_CINCLUDE:
+        /* C header include — handled by emitter, nothing to check */
+        break;
+
     case NODE_INTERRUPT:
         /* register as a void function */
         /* body checked in pass 2 */
@@ -1796,7 +1800,7 @@ void checker_register_file(Checker *c, Node *file_node) {
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         /* skip imports — they're handled by the compiler driver */
-        if (decl->kind == NODE_IMPORT) continue;
+        if (decl->kind == NODE_IMPORT || decl->kind == NODE_CINCLUDE) continue;
         /* skip static (module-private) declarations */
         if (decl->kind == NODE_FUNC_DECL && decl->func_decl.is_static) continue;
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;

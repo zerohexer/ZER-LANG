@@ -1814,6 +1814,19 @@ int main(void) {
         42,
         "enum switch inside if-unwrap: ?Status done => 42");
 
+    /* cinclude — C header inclusion */
+    test_compile_and_run(
+        "cinclude \"string.h\";\n"
+        "u8[64] buf;\n"
+        "u32 main() {\n"
+        "    buf[0] = 72;\n"
+        "    buf[1] = 105;\n"
+        "    buf[2] = 0;\n"
+        "    return buf[0];\n"
+        "}\n",
+        72,
+        "cinclude: includes C header, uses C types, returns 72");
+
     /* BUG-043: ?void assign null — was emitting { 0, 0 } for 1-field struct */
     test_compile_and_run(
         "?void status;\n"

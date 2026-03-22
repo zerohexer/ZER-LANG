@@ -38,6 +38,16 @@ Compile as library (no runtime, for linking into C projects or online judges):
 ./zerc solution.zer --lib -o solution.c
 ```
 
+Include C headers directly with `cinclude`:
+
+```zer
+cinclude "stm32f4xx_hal.h";   // C header — passed through to GCC
+import uart;                   // ZER module — full safety pipeline
+
+// Call C functions with ZER type safety at the boundary
+void HAL_GPIO_WritePin(*opaque port, u16 pin, u32 state);
+```
+
 Link with any C library — the output is plain C:
 
 ```bash

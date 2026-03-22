@@ -233,6 +233,31 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 
 **Adding new builtin methods:** Copy the Pool/Ring/Arena pattern. Need: checker NODE_CALL handler (return type), emitter interception (C codegen), and E2E test.
 
+## Spawning Agents That Write ZER Code — MANDATORY
+
+When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:
+
+```
+ZER SYNTAX RULES (not C — these differ):
+- No ++ or --. Use += 1, -= 1
+- No else if. Nest: if (a) { } else { if (b) { } }
+- No C-style casts. Use @truncate, @saturate, @bitcast
+- Braces ALWAYS required for if/else/for/while bodies
+- Array decl: u8[256] buf (size between type and name)
+- Pointer: *Task ptr (star before type, not after)
+- Enum access: State.idle (qualified), switch arms: .idle => (dot prefix)
+- Switch uses => arrows, no case keyword, no fallthrough
+- orelse return is BARE — no value: x orelse return (NOT orelse return 1)
+- arena.alloc(T) — T must be struct/enum name, NOT primitive keyword (u32 etc.)
+- For loops: for (u32 i = 0; i < N; i += 1) { }
+- String literals are []u8, not char*
+- bool is NOT an integer — no bool↔int coercion
+- Optional: ?*T (null sentinel), ?T (struct with .value/.has_value), ?void (has_value ONLY, no .value)
+- Unwrap: if (opt) |val| { use(val); }  or  val = opt orelse default;
+```
+
+Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).
+
 ## First Session Workflow
 
 When starting a new session or lacking context:

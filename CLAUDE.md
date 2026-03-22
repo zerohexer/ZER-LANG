@@ -339,20 +339,23 @@ If you can't commit (tests failing), stash.
    The fix should be 1-5 lines. If growing beyond that, you're fixing the wrong thing.
 
 6. **`make check` immediately after fix**
-   870+ tests must pass. If not — revert, re-examine root cause.
+   899+ tests must pass. If not — revert, re-examine root cause.
 
 7. **Update BUGS-FIXED.md** with: symptom, root cause, fix, test reference.
 
 8. **Commit before anything else**
 
-### Always Update Docs After Changes
+### Always Update Docs After Changes — MANDATORY
 
-After any bug fix or feature change that passes `make check`:
-- `BUGS-FIXED.md` — add the bug with symptom, root cause, fix, test
+After any bug fix or feature change that passes `make check`, update ALL relevant docs in the SAME commit. Never leave doc updates for later. Future sessions depend on these being accurate.
+
+- `BUGS-FIXED.md` — add the bug with symptom, root cause, fix, test reference
+- `docs/compiler-internals.md` — if ANY emitter pattern, checker behavior, type handling, builtin method, or preamble changed. This is the primary reference future sessions read. Stale info here causes bugs.
 - `README.md` — if test counts, features, or status changed
 - `ZER-LANG.md` — if spec behavior changed
-- `CLAUDE.md` — if workflow or debugging patterns changed
-Never leave doc updates for later. Do it in the same commit.
+- `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed
+
+**Only update docs after `make check` passes and you have high confidence the change is correct.** Do not update docs for speculative or in-progress work.
 
 ### Red Flags — Stop and Revert
 

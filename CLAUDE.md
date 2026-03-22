@@ -376,6 +376,7 @@ After any bug fix or feature change that passes `make check`, update ALL relevan
 
 - `BUGS-FIXED.md` — add the bug with symptom, root cause, fix, test reference
 - `docs/compiler-internals.md` — if ANY emitter pattern, checker behavior, type handling, builtin method, or preamble changed. This is the primary reference future sessions read. Stale info here causes bugs.
+- `docs/reference.md` — if ANY language feature, syntax, intrinsic, builtin method, or type behavior changed. This is the user-facing language reference. Must reflect what `zerc` actually compiles, not what's spec'd but unimplemented.
 - `README.md` — if test counts, features, or status changed
 - `ZER-LANG.md` — if spec behavior changed
 - `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed

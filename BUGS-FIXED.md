@@ -311,6 +311,21 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-071: Function pointer typedef not supported
+- **Symptom:** `typedef u32 (*Callback)(u32);` fails to parse — parser's typedef path only calls `parse_type()` which doesn't handle function pointer syntax.
+- **Root cause:** typedef declaration parsed return type then expected an ident name, but func ptr names go inside `(*)`.
+- **Fix:** Added `(*` detection in typedef path (same pattern as var-decl/param/field). Emitter uses `emit_type_and_name` for typedef emission.
+
+### BUG-070: `?FuncPtr` not supported — function pointers always nullable
+- **Symptom:** `?void (*cb)(u32)` parsed `?` as wrapping `void` (return type), not the whole function pointer.
+- **Root cause:** Parser's `?` attaches to the next type token, but function pointer declarations have the type split around the name.
+- **Fix:** All 4 func-ptr parse sites (local, global, struct field, param) detect `?T` prefix, unwrap it, parse func ptr with inner return type, then wrap result in TYNODE_OPTIONAL. Emitter uses `IS_NULL_SENTINEL` macro (TYPE_POINTER || TYPE_FUNC_PTR) at every null-sentinel check.
+
+### BUG-069: All `[]T` slice types use anonymous structs — type mismatch across functions
+- **Symptom:** `[]Task` emitted as anonymous `struct { Task* ptr; size_t len; }` — each use creates a different C type, GCC rejects assignments/parameters between them.
+- **Root cause:** Only `[]u8` and `[]u32` had named typedefs. All other slice types used anonymous structs.
+- **Fix:** Added `_zer_slice_T` typedefs for all primitives in preamble. Struct/union declarations emit `_zer_slice_StructName`. `?[]T` also gets `_zer_opt_slice_T` typedefs. `emit_type(TYPE_SLICE)` uses named typedefs for all types.
+
 ### BUG-068: Explicit enum values (`enum { a = 5 }`) silently emit wrong constants
 - **Symptom:** `enum Prio { low = 1, med = 5, high = 10 }` emits `#define _ZER_Prio_low 0`, `_ZER_Prio_med 1`, `_ZER_Prio_high 2` — uses loop index instead of declared value.
 - **Root cause:** Emitter's enum `#define` loop uses `j` (loop counter) as the value, ignoring `v->value` from the AST. Parser and checker already handled explicit values correctly.

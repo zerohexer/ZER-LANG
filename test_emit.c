@@ -2019,6 +2019,76 @@ int main(void) {
         100,
         "@cast(Fahrenheit, celsius): distinct typedef conversion = 100");
 
+    /* ?FuncPtr — optional function pointer with null sentinel */
+    test_compile_and_run(
+        "u32 double_it(u32 x) { return x * 2; }\n"
+        "u32 apply(?u32 (*fn)(u32), u32 val) {\n"
+        "    u32 (*f)(u32) = fn orelse return;\n"
+        "    return f(val);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 a = apply(double_it, 10);\n"
+        "    u32 b = apply(null, 10);\n"
+        "    return a + b;\n"
+        "}\n",
+        20,
+        "?FuncPtr: apply(double_it,10)=20, apply(null,10)=0, sum=20");
+
+    /* function pointer typedef */
+    test_compile_and_run(
+        "typedef u32 (*BinOp)(u32, u32);\n"
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 mul(u32 a, u32 b) { return a * b; }\n"
+        "u32 run(BinOp op, u32 x, u32 y) {\n"
+        "    return op(x, y);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return run(add, 20, 22);\n"
+        "}\n",
+        42,
+        "typedef BinOp: add(20,22) via typedef'd func ptr = 42");
+
+    /* ?FuncPtr in struct field */
+    test_compile_and_run(
+        "struct Device {\n"
+        "    u32 id;\n"
+        "    ?void (*on_event)(u32);\n"
+        "}\n"
+        "u32 g_event = 0;\n"
+        "void handler(u32 e) { g_event = e; }\n"
+        "u32 main() {\n"
+        "    Device d;\n"
+        "    d.id = 1;\n"
+        "    d.on_event = handler;\n"
+        "    if (d.on_event) |cb| { cb(42); }\n"
+        "    return g_event;\n"
+        "}\n",
+        42,
+        "?FuncPtr in struct: optional callback fires, g_event=42");
+
+    /* []Struct slice passed between functions */
+    test_compile_and_run(
+        "struct Item { u32 val; }\n"
+        "u32 sum_items([]Item items) {\n"
+        "    u32 total = 0;\n"
+        "    for (u32 i = 0; i < @truncate(u32, items.len); i += 1) {\n"
+        "        total += items[i].val;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n"
+        "u8[4096] mem;\n"
+        "Arena ar;\n"
+        "u32 main() {\n"
+        "    ar = Arena.over(mem);\n"
+        "    []Item items = ar.alloc_slice(Item, 3) orelse return;\n"
+        "    items[0].val = 10;\n"
+        "    items[1].val = 20;\n"
+        "    items[2].val = 30;\n"
+        "    return sum_items(items);\n"
+        "}\n",
+        60,
+        "[]Struct across functions: alloc→fill→pass→sum = 60");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

@@ -152,6 +152,8 @@ u32 (*fn)(u32, u32) = add;              // local variable
 void (*callback)(u32 event);             // global variable
 struct Ops { u32 (*compute)(u32); }      // struct field
 u32 apply(u32 (*op)(u32, u32), x, y);   // parameter
+?void (*on_event)(u32) = null;           // optional — null sentinel
+typedef u32 (*BinOp)(u32, u32);          // function pointer typedef
 ```
 
 ### Defer
@@ -221,9 +223,14 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - Bare `return;` from `?T` func → `return (opt_type){ 0, 1 };`
 
 **Slice types in emitted C:**
-- `[]T` → `struct { T* ptr; size_t len; }` (anonymous for non-u8/u32, typedef for u8/u32)
+- `[]T` → named typedef `_zer_slice_T` for ALL types (primitives in preamble, struct/union after declaration)
 - Slice indexing: `slice.ptr[i]` — NOT `slice[i]` (emitter must add `.ptr`)
-- Slice orelse unwrap: use `__auto_type` to avoid anonymous struct type mismatch
+- `?[]T` → named typedef `_zer_opt_slice_T` (all types)
+
+**Null-sentinel types (IS_NULL_SENTINEL macro):**
+- `?*T` → plain C pointer (NULL = none). Uses `IS_NULL_SENTINEL` macro.
+- `?FuncPtr` → plain C function pointer (NULL = none). Same macro.
+- **CRITICAL:** Every null-sentinel check in emitter.c uses `IS_NULL_SENTINEL(inner->kind)` — NEVER check `TYPE_POINTER` alone. `TYPE_FUNC_PTR` must always be included.
 
 **Builtin method emission pattern (emitter.c ~line 350-520):**
 1. Check if callee is `NODE_FIELD` with object of type Pool/Ring/Arena
@@ -364,7 +371,7 @@ If you can't commit (tests failing), stash.
    The fix should be 1-5 lines. If growing beyond that, you're fixing the wrong thing.
 
 6. **`make check` immediately after fix**
-   940+ tests must pass. If not — revert, re-examine root cause.
+   946+ tests must pass. If not — revert, re-examine root cause.
 
 7. **Update BUGS-FIXED.md** with: symptom, root cause, fix, test reference.
 

@@ -225,13 +225,23 @@ msg.sensor.temperature;      // COMPILE ERROR — must switch first
 
 ### Function Pointers
 
-Same syntax as C:
+Same syntax as C. Optional function pointers use null sentinel (zero overhead).
 
 ```zer
 u32 (*fn)(u32, u32) = add;                    // local variable
 void (*callback)(u32 event);                   // global variable
 struct Ops { u32 (*compute)(u32); }            // struct field
 u32 apply(u32 (*op)(u32, u32), u32 x, u32 y); // parameter
+?void (*on_event)(u32) = null;                 // optional — null = not set
+typedef u32 (*BinOp)(u32, u32);                // function pointer typedef
+```
+
+Optional function pointers:
+
+```zer
+?void (*callback)(u32) = null;
+callback = my_handler;           // set it
+if (callback) |cb| { cb(42); }  // safe — unwrap before calling
 ```
 
 ### Distinct Types

@@ -488,6 +488,12 @@ static void test_nested_optionals(void) {
         "    if (inner) |val| { u32 x = val; }\n"
         "}\n",
         "simple optional unwrap");
+
+    expect_error(
+        "void f() {\n"
+        "    ??u32 x;\n"
+        "}\n",
+        "nested optional ??T rejected");
 }
 
 static void test_const_slice_coercion(void) {

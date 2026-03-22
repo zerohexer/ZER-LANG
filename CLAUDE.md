@@ -423,3 +423,37 @@ Here is the relevant compiler code: [paste the ONE function]
 Add one debug print to confirm the root cause.
 Do not restructure. Do not fix yet. Just confirm.
 ```
+
+## Agent-Verify Workflow — Bug Hunting & Test Writing
+
+When looking for bugs or writing new tests, use the spawn-then-verify pattern:
+
+### The Pattern
+
+1. **Spawn agent(s)** to audit code or write tests (they act as fresh sessions)
+2. **Verify every finding** yourself before acting — agents make mistakes
+3. **Fix confirmed issues**, reject false positives
+
+### For Bug Hunting
+
+Spawn an agent to audit a specific file (e.g., emitter.c). Tell it to:
+- Read CLAUDE.md and docs/compiler-internals.md first
+- Look for specific bug patterns (optional handling, type emission, intrinsic gaps)
+- Report with exact line numbers, triggering ZER code, wrong C output, expected C output
+- NOT fix anything — just report
+
+Then verify each finding by reading the actual code at the cited lines. Agents find real bugs (e.g., BUG-042 `?Enum` anonymous struct) but also report false positives.
+
+### For Test Writing
+
+Spawn an agent to write new E2E tests. **MUST include the ZER syntax rules block** from "Spawning Agents" section above. Then verify:
+- ZER syntax is correct (switch arms have braces, no `++`, no `else if`)
+- Expected exit codes are mathematically correct
+- Tests actually compile and pass with `make check`
+
+### Why This Works
+
+- Agents explore without consuming your main context window
+- Fresh perspective catches blind spots
+- Verification step catches agent mistakes (wrong syntax, false positives)
+- You get both breadth (agent exploration) and depth (your verification)

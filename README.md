@@ -32,10 +32,10 @@ Multi-file with imports:
 arm-none-eabi-gcc -std=c99 -o firmware.elf firmware.c
 ```
 
-Compile as library (no runtime, for linking into C projects or online judges):
+Emit bare C without ZER preamble (`--lib` strips type definitions and runtime helpers — use when embedding into an existing C project):
 
 ```bash
-./zerc solution.zer --lib -o solution.c
+./zerc module.zer --lib -o module.c
 ```
 
 Include C headers directly with `cinclude`:

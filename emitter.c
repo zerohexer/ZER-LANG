@@ -2253,9 +2253,9 @@ void emit_file(Emitter *e, Node *file_node) {
             {
                 Type *underlying = resolve_type_for_emit(e, decl->typedef_decl.type);
                 emit(e, "typedef ");
-                emit_type(e, underlying);
-                emit(e, " %.*s;\n\n",
-                     (int)decl->typedef_decl.name_len, decl->typedef_decl.name);
+                emit_type_and_name(e, underlying,
+                    decl->typedef_decl.name, decl->typedef_decl.name_len);
+                emit(e, ";\n\n");
             }
             break;
 

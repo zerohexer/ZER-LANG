@@ -30,6 +30,17 @@ static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
 
+/* emit array→slice coercion: wraps array expr in slice compound literal */
+static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
+    emit(e, "((");
+    emit_type(e, slice_type);
+    emit(e, "){ (");
+    emit_type(e, array_type->array.inner);
+    emit(e, "*)");
+    emit_expr(e, array_expr);
+    emit(e, ", %u })", array_type->array.size);
+}
+
 /* emit a C type name for a ZER type */
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
@@ -563,8 +574,18 @@ static void emit_expr(Emitter *e, Node *node) {
                     callee_type && callee_type->kind == TYPE_FUNC_PTR &&
                     (uint32_t)i < callee_type->func_ptr.param_count &&
                     callee_type->func_ptr.params[i]->kind == TYPE_POINTER;
-                emit_expr(e, node->call.args[i]);
-                if (need_decay) emit(e, ".ptr");
+                /* array→slice coercion: wrap T[N] in slice compound literal */
+                bool need_arr_coerce = arg_type && arg_type->kind == TYPE_ARRAY &&
+                    callee_type && callee_type->kind == TYPE_FUNC_PTR &&
+                    (uint32_t)i < callee_type->func_ptr.param_count &&
+                    callee_type->func_ptr.params[i]->kind == TYPE_SLICE;
+                if (need_arr_coerce) {
+                    emit_array_as_slice(e, node->call.args[i], arg_type,
+                                        callee_type->func_ptr.params[i]);
+                } else {
+                    emit_expr(e, node->call.args[i]);
+                    if (need_decay) emit(e, ".ptr");
+                }
             }
             emit(e, ")");
         }
@@ -1209,8 +1230,16 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, ", 1 }");
                 }
             } else {
-                emit(e, " = ");
-                emit_expr(e, node->var_decl.init);
+                /* array→slice coercion at var-decl */
+                Type *init_type = checker_get_type(node->var_decl.init);
+                if (type && type->kind == TYPE_SLICE &&
+                    init_type && init_type->kind == TYPE_ARRAY) {
+                    emit(e, " = ");
+                    emit_array_as_slice(e, node->var_decl.init, init_type, type);
+                } else {
+                    emit(e, " = ");
+                    emit_expr(e, node->var_decl.init);
+                }
             }
         } else {
             /* ZER auto-zeroes */
@@ -1403,9 +1432,18 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, ", 1 };\n");
                 }
             } else {
-                emit(e, "return ");
-                emit_expr(e, node->ret.expr);
-                emit(e, ";\n");
+                /* array→slice coercion on return */
+                Type *expr_type = checker_get_type(node->ret.expr);
+                if (e->current_func_ret && e->current_func_ret->kind == TYPE_SLICE &&
+                    expr_type && expr_type->kind == TYPE_ARRAY) {
+                    emit(e, "return ");
+                    emit_array_as_slice(e, node->ret.expr, expr_type, e->current_func_ret);
+                    emit(e, ";\n");
+                } else {
+                    emit(e, "return ");
+                    emit_expr(e, node->ret.expr);
+                    emit(e, ";\n");
+                }
             }
         } else {
             /* bare return — for ?void, return {1} (success); for other ?T, return {0,1} */

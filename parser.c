@@ -506,7 +506,11 @@ static Node *parse_primary(Parser *p) {
 
         /* collect args — first check for type argument */
         /* intrinsics like @ptrcast(*T, expr) and @size(T) take a type as first arg */
-        if (is_type_token(p->current.type) && p->current.type != TOK_IDENT) {
+        /* @cast always takes a named type (distinct typedef) — allow TOK_IDENT for it */
+        bool force_type_arg = (n->intrinsic.name_len == 4 &&
+                               memcmp(n->intrinsic.name, "cast", 4) == 0);
+        if (is_type_token(p->current.type) &&
+            (p->current.type != TOK_IDENT || force_type_arg)) {
             n->intrinsic.type_arg = parse_type(p);
             if (match(p, TOK_COMMA)) {
                 /* more args after type */

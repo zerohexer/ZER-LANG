@@ -1911,6 +1911,42 @@ int main(void) {
         60,
         "slice-of-slice: sl[1..4], sub[0]=20 + sub[2]=40 = 60");
 
+    /* BUG-054: array→slice coercion at call site */
+    test_compile_and_run(
+        "u32 sum([]u8 data) {\n"
+        "    return @truncate(u32, data[0]) + @truncate(u32, data[1]);\n"
+        "}\n"
+        "u8[4] buf;\n"
+        "u32 main() {\n"
+        "    buf[0] = 30; buf[1] = 12;\n"
+        "    return sum(buf);\n"
+        "}\n",
+        42,
+        "array→slice coercion at call: u8[4] → []u8 param = 42");
+
+    /* BUG-054: array→slice coercion at var-decl */
+    test_compile_and_run(
+        "u8[3] arr;\n"
+        "u32 main() {\n"
+        "    arr[0] = 5; arr[1] = 10; arr[2] = 15;\n"
+        "    []u8 sl = arr;\n"
+        "    return @truncate(u32, sl[0]) + @truncate(u32, sl[1]) + @truncate(u32, sl[2]);\n"
+        "}\n",
+        30,
+        "array→slice coercion at var-decl: u8[3] → []u8 = 30");
+
+    /* BUG-055: @cast between distinct typedefs */
+    test_compile_and_run(
+        "distinct typedef u32 Celsius;\n"
+        "distinct typedef u32 Fahrenheit;\n"
+        "u32 main() {\n"
+        "    Celsius c = 100;\n"
+        "    Fahrenheit f = @cast(Fahrenheit, c);\n"
+        "    return @truncate(u32, f);\n"
+        "}\n",
+        100,
+        "@cast(Fahrenheit, celsius): distinct typedef conversion = 100");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

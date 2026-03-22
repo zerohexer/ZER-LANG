@@ -23,6 +23,10 @@ static void emit(Emitter *e, const char *fmt, ...) {
     va_end(args);
 }
 
+/* null-sentinel check: ?*T and ?FuncPtr both use NULL as none */
+#define IS_NULL_SENTINEL(inner_kind) \
+    ((inner_kind) == TYPE_POINTER || (inner_kind) == TYPE_FUNC_PTR)
+
 /* ---- Type emission ---- */
 
 static void emit_type(Emitter *e, Type *t);
@@ -71,14 +75,10 @@ static void emit_type(Emitter *e, Type *t) {
 
     case TYPE_OPTIONAL:
         /* ?*T → pointer (null sentinel) */
-        if (t->optional.inner->kind == TYPE_POINTER) {
+        if (IS_NULL_SENTINEL(t->optional.inner->kind)) {
             emit_type(e, t->optional.inner);
             break;
         }
-        /* NOTE: ?FuncPtr is not currently supported at the language level.
-         * Function pointers are always nullable (like C). The parser cannot
-         * express ?void(*fn)(u32) because ? attaches to the return type, not
-         * the whole function pointer. This is a v0.2 design task. */
         /* ?T → named optional typedef */
         switch (t->optional.inner->kind) {
         case TYPE_VOID:  emit(e, "_zer_opt_void"); break;
@@ -252,6 +252,19 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* optional function pointer: ?ret (*name)(params) → ret (*name)(params) (null sentinel) */
+    if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_FUNC_PTR) {
+        Type *fp = t->optional.inner;
+        emit_type(e, fp->func_ptr.ret);
+        emit(e, " (*%.*s)(", (int)name_len, name);
+        for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, fp->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+
     emit_type(e, t);
     emit(e, " %.*s", (int)name_len, name);
 }
@@ -392,7 +405,7 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *val_type = checker_get_type(node->assign.value);
         if (node->assign.op == TOK_EQ && tgt_type && val_type &&
             tgt_type->kind == TYPE_OPTIONAL &&
-            tgt_type->optional.inner->kind != TYPE_POINTER &&
+            !IS_NULL_SENTINEL(tgt_type->optional.inner->kind) &&
             val_type->kind != TYPE_OPTIONAL &&
             node->assign.value->kind != NODE_NULL_LIT) {
             emit(e, "(");
@@ -402,7 +415,7 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, ", 1 }");
         } else if (node->assign.op == TOK_EQ && tgt_type &&
                    tgt_type->kind == TYPE_OPTIONAL &&
-                   tgt_type->optional.inner->kind != TYPE_POINTER &&
+                   !IS_NULL_SENTINEL(tgt_type->optional.inner->kind) &&
                    node->assign.value->kind == NODE_NULL_LIT) {
             emit(e, "(");
             emit_type(e, tgt_type);
@@ -788,7 +801,7 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *orelse_type = checker_get_type(node->orelse.expr);
         bool is_ptr_optional = orelse_type &&
             orelse_type->kind == TYPE_OPTIONAL &&
-            orelse_type->optional.inner->kind == TYPE_POINTER;
+            IS_NULL_SENTINEL(orelse_type->optional.inner->kind);
 
         bool is_void_optional = orelse_type &&
             orelse_type->kind == TYPE_OPTIONAL &&
@@ -807,7 +820,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->orelse.fallback_is_return) {
                     emit_defers(e);
                     if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                        e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
+                        !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind)) {
                         emit(e, "return (");
                         emit_type(e, e->current_func_ret);
                         if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
@@ -841,7 +854,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->orelse.fallback_is_return) {
                     emit_defers(e);
                     if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                        e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
+                        !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind)) {
                         emit(e, "return (");
                         emit_type(e, e->current_func_ret);
                         if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
@@ -1226,7 +1239,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             Type *or_expr_type = checker_get_type(node->var_decl.init->orelse.expr);
             bool or_is_ptr = or_expr_type &&
                 or_expr_type->kind == TYPE_OPTIONAL &&
-                or_expr_type->optional.inner->kind == TYPE_POINTER;
+                IS_NULL_SENTINEL(or_expr_type->optional.inner->kind);
 
             int tmp = e->temp_count++;
             emit_indent(e);
@@ -1242,7 +1255,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (node->var_decl.init->orelse.fallback_is_return) {
                 emit(e, "{ "); emit_defers(e);
                 if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                    e->current_func_ret->optional.inner->kind != TYPE_POINTER) {
+                    !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind)) {
                     /* ?T function: return null optional */
                     emit(e, "return (");
                     emit_type(e, e->current_func_ret);
@@ -1283,7 +1296,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             /* Optional init: null → {0, 0}, value → {val, 1}
              * But if init is a function call returning ?T, just assign directly */
             if (type && type->kind == TYPE_OPTIONAL &&
-                type->optional.inner->kind != TYPE_POINTER) {
+                !IS_NULL_SENTINEL(type->optional.inner->kind)) {
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
                     if (type->optional.inner->kind == TYPE_VOID)
                         emit(e, " = { 0 }");
@@ -1353,7 +1366,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             Type *cond_type = checker_get_type(node->if_stmt.cond);
             bool is_ptr_opt = cond_type &&
                 cond_type->kind == TYPE_OPTIONAL &&
-                cond_type->optional.inner->kind == TYPE_POINTER;
+                IS_NULL_SENTINEL(cond_type->optional.inner->kind);
 
             emit_indent(e);
             emit(e, "{\n");
@@ -1488,7 +1501,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         if (node->ret.expr) {
             /* return null from ?T function → return {0, 0} (or {0} for ?void) */
             if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                e->current_func_ret->optional.inner->kind != TYPE_POINTER &&
+                !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind) &&
                 node->ret.expr->kind == NODE_NULL_LIT) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
@@ -1500,7 +1513,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
             /* return value from ?T function → return {value, 1} */
             else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                     e->current_func_ret->optional.inner->kind != TYPE_POINTER &&
+                     !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind) &&
                      node->ret.expr->kind != NODE_NULL_LIT) {
                 /* check if expr already has the optional type (e.g. return ring.pop()) */
                 Type *expr_type = checker_get_type(node->ret.expr);
@@ -1923,7 +1936,7 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (node->var_decl.init) {
         /* optional null init needs struct literal, not scalar 0 */
         if (type && type->kind == TYPE_OPTIONAL &&
-            type->optional.inner->kind != TYPE_POINTER &&
+            !IS_NULL_SENTINEL(type->optional.inner->kind) &&
             node->var_decl.init->kind == NODE_NULL_LIT) {
             if (type->optional.inner->kind == TYPE_VOID)
                 emit(e, " = { 0 }");

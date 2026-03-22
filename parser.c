@@ -764,15 +764,23 @@ static void parse_capture(Parser *p, const char **name, size_t *name_len, bool *
 static Node *parse_var_decl(Parser *p, bool is_const, bool is_static, bool is_volatile) {
     TypeNode *type = parse_type(p);
 
-    /* function pointer local: rettype (*name)(params...) */
+    /* function pointer local: rettype (*name)(params...) or ?rettype (*name)(params...) */
     if (check(p, TOK_LPAREN)) {
         Token saved = p->current;
         advance(p);
         if (check(p, TOK_STAR)) {
             advance(p);
+            /* if type is ?T, unwrap for func ptr return type, wrap result in optional */
+            bool is_optional_fptr = (type->kind == TYNODE_OPTIONAL);
+            TypeNode *ret_type = is_optional_fptr ? type->optional.inner : type;
             const char *fpname = NULL;
             size_t fpname_len = 0;
-            type = parse_func_ptr_after_ret(p, type, &fpname, &fpname_len);
+            type = parse_func_ptr_after_ret(p, ret_type, &fpname, &fpname_len);
+            if (is_optional_fptr) {
+                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                opt->optional.inner = type;
+                type = opt;
+            }
             Node *n = new_node(p, NODE_VAR_DECL);
             n->var_decl.type = type;
             n->var_decl.name = fpname;
@@ -1132,15 +1140,22 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
         f->is_keep = match(p, TOK_KEEP);
         TypeNode *type = parse_type(p);
 
-        /* function pointer field: rettype (*name)(params...) */
+        /* function pointer field: rettype (*name)(params...) or ?rettype (*name)(params...) */
         if (check(p, TOK_LPAREN)) {
             Token saved = p->current;
             advance(p); /* consume '(' */
             if (check(p, TOK_STAR)) {
                 advance(p); /* consume '*' */
+                bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
+                TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
                 const char *fname = NULL;
                 size_t fname_len = 0;
-                type = parse_func_ptr_after_ret(p, type, &fname, &fname_len);
+                type = parse_func_ptr_after_ret(p, fp_ret, &fname, &fname_len);
+                if (is_opt_fp) {
+                    TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                    opt->optional.inner = type;
+                    type = opt;
+                }
                 f->type = type;
                 f->name = fname;
                 f->name_len = fname_len;
@@ -1251,15 +1266,22 @@ static Node *parse_union_decl(Parser *p) {
 static Node *parse_func_or_var(Parser *p, bool is_static) {
     TypeNode *type = parse_type(p);
 
-    /* function pointer declaration: type (*name)(params...) = expr; */
+    /* function pointer declaration: type (*name)(params...) or ?type (*name)(params...) */
     if (check(p, TOK_LPAREN)) {
         Token saved = p->current;
         advance(p); /* consume '(' */
         if (check(p, TOK_STAR)) {
             advance(p); /* consume '*' */
+            bool is_optional_fptr = (type->kind == TYNODE_OPTIONAL);
+            TypeNode *ret_type = is_optional_fptr ? type->optional.inner : type;
             const char *fpname = NULL;
             size_t fpname_len = 0;
-            TypeNode *fp_type = parse_func_ptr_after_ret(p, type, &fpname, &fpname_len);
+            TypeNode *fp_type = parse_func_ptr_after_ret(p, ret_type, &fpname, &fpname_len);
+            if (is_optional_fptr) {
+                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                opt->optional.inner = fp_type;
+                fp_type = opt;
+            }
             if (!fpname) {
                 error(p, "expected name in function pointer declaration");
                 return new_node(p, NODE_VAR_DECL);
@@ -1306,15 +1328,22 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
                 param->is_keep = match(p, TOK_KEEP);
                 param->type = parse_type(p);
 
-                /* function pointer parameter: rettype (*name)(params...) */
+                /* function pointer parameter: rettype (*name)(params...) or ?rettype (*name)(params...) */
                 if (check(p, TOK_LPAREN)) {
                     Token saved = p->current;
                     advance(p);
                     if (check(p, TOK_STAR)) {
                         advance(p);
+                        bool is_opt_fp = (param->type->kind == TYNODE_OPTIONAL);
+                        TypeNode *fp_ret = is_opt_fp ? param->type->optional.inner : param->type;
                         const char *fpname = NULL;
                         size_t fpname_len = 0;
-                        param->type = parse_func_ptr_after_ret(p, param->type, &fpname, &fpname_len);
+                        param->type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
+                        if (is_opt_fp) {
+                            TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                            opt->optional.inner = param->type;
+                            param->type = opt;
+                        }
                         param->name = fpname;
                         param->name_len = fpname_len;
                         if (!fpname) error(p, "expected name in function pointer parameter");

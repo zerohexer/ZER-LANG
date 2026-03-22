@@ -137,24 +137,106 @@ Global hash map: `Node* → Type*`. Set during checking via `typemap_set()`. Rea
 - Slice type typedefs: `_zer_slice_u8`, `_zer_slice_u32`
 - Pool runtime functions: `_zer_pool_alloc`, `_zer_pool_get`, `_zer_pool_free`
 - Ring runtime function: `_zer_ring_push` (pop is inlined)
-- Bounds check trap: `_zer_bounds_fail`
+- Arena runtime: `_zer_arena` typedef, `_zer_arena_alloc(arena*, size, align)` — bump allocator with `_Alignof` alignment
+- Bounds check: `_zer_bounds_check`, `_zer_trap`
 
-### Builtin Method Emission (Pool/Ring)
-The emitter intercepts `obj.method()` calls (line ~335):
-1. Look up object type via `checker_get_type(obj_node)` (falls back to global_scope)
-2. If TYPE_POOL: emit `_zer_pool_alloc(...)`, `_zer_pool_get(...)`, `_zer_pool_free(...)`
-3. If TYPE_RING: emit `_zer_ring_push(...)` or inline pop code
+### Builtin Method Emission (Pool/Ring/Arena)
+The emitter intercepts `obj.method()` calls (line ~350):
+1. Check callee is `NODE_FIELD`, extract object node and method name
+2. Look up object type via `checker_get_type(obj_node)` (falls back to global_scope)
+3. Match type kind → method name → emit inline C
 
-**Arena methods are NOT emitted** — they pass through as literal C (e.g., `a.alloc(Task)`) which GCC rejects. Arena emission is a TODO.
+```c
+// Detection pattern (simplified):
+if (obj_node->kind == NODE_IDENT) {
+    Type *obj_type = checker_get_type(obj_node);
+    if (obj_type && obj_type->kind == TYPE_POOL) {
+        // match method name, emit C, set handled = true
+    }
+}
+```
 
-### Optional Handling
-- `?*T` (pointer optional): null sentinel, emits as plain pointer, check via `if (ptr)`
-- `?T` (value optional): struct with `.value` and `.has_value`, check via `.has_value`
-- `?void`: struct with ONLY `.has_value` (NO `.value` field)
-- Return null from `?T`: emits `{ 0, 0 }` (or `{ 0 }` for `?void`)
-- Bare return from `?T`: emits `{ 0, 1 }` (or `{ 1 }` for `?void`)
-- If-unwrap: `if (expr) |val|` → `{ auto _tmp = expr; if (_tmp.has_value) { auto val = _tmp.value; ... } }`
-- If-unwrap `?void`: capture gets `uint8_t val = 1` (dummy, no `.value` field)
+**Pool methods:**
+- `pool.alloc()` → `({ _zer_opt_u32 r; uint32_t h = _zer_pool_alloc(..., &ok); r = {h, ok}; r; })`
+- `pool.get(h)` → `(*(T*)_zer_pool_get(slots, gen, used, slot_size, h, cap))`
+- `pool.free(h)` → `_zer_pool_free(gen, used, h, cap)`
+
+**Ring methods:**
+- `ring.push(val)` → `({ T tmp = val; _zer_ring_push(data, &head, &count, cap, &tmp, sizeof(tmp)); })`
+- `ring.pop()` → `({ _zer_opt_T r = {0}; if (count > 0) { r.value = data[tail]; r.has_value = 1; tail = (tail+1) % cap; count--; } r; })`
+- `ring.push_checked(val)` → same as push but wrapped: check `count < cap` first, return `_zer_opt_void`
+
+**Arena methods:**
+- `Arena.over(buf)` → `((_zer_arena){ (uint8_t*)buf, sizeof(buf), 0 })` (for arrays) or `{ buf.ptr, buf.len, 0 }` (for slices)
+- `arena.alloc(T)` → `((T*)_zer_arena_alloc(&arena, sizeof(T), _Alignof(T)))` — returns NULL if full, which is `?*T` null sentinel
+- `arena.alloc_slice(T, n)` → statement expression: alloc `sizeof(T)*n`, wrap in `?[]T` struct with `.value.ptr`, `.value.len`, `.has_value`
+- `arena.reset()` / `arena.unsafe_reset()` → `(arena.offset = 0)`
+
+### Optional Type C Representations
+
+**This is the #1 source of emitter bugs. Know these cold:**
+
+```c
+// ?*Task — pointer optional (null sentinel, zero overhead)
+typedef Task* _optional_ptr_task;  // NOT actually typedef'd — just a raw pointer
+// NULL = none, non-NULL = some
+// Check: if (ptr)     Unwrap: just use ptr
+
+// ?u32 — value optional (struct wrapper)
+typedef struct { uint32_t value; uint8_t has_value; } _zer_opt_u32;
+// Check: .has_value   Unwrap: .value
+
+// ?void — void optional (NO value field!)
+typedef struct { uint8_t has_value; } _zer_opt_void;
+// Check: .has_value   Unwrap: NOTHING — there is no .value
+// ⚠️ Accessing .value on _zer_opt_void is a GCC error
+
+// ?[]T — optional slice (anonymous struct, non-u8/u32)
+struct { struct { T* ptr; size_t len; } value; uint8_t has_value; }
+// ⚠️ Two anonymous structs — can't assign between independently emitted ones
+// Fix: use __auto_type for unwrap targets
+```
+
+**Return patterns:**
+```c
+// return null from ?T func:    return (_zer_opt_u32){ 0, 0 };
+// return null from ?void func: return (_zer_opt_void){ 0 };     // ONE field
+// bare return from ?T func:    return (_zer_opt_u32){ 0, 1 };
+// bare return from ?void func: return (_zer_opt_void){ 1 };     // ONE field
+// return value from ?T func:   return (_zer_opt_u32){ val, 1 };
+// return ptr from ?*T func:    return ptr;  // just the pointer, NULL = none
+```
+
+### Slice Emission
+
+```c
+// []u8 → _zer_slice_u8   (typedef'd)
+// []u32 → _zer_slice_u32  (typedef'd)
+// []T (other) → struct { T* ptr; size_t len; }  (anonymous — each emit is a NEW type)
+
+// Slice indexing: items.ptr[i]  — NOT items[i] (items is a struct, not array)
+// Slice orelse unwrap: __auto_type items = _zer_or0.value;  — NOT explicit type
+//   (avoids anonymous struct type mismatch between optional's .value and declared var)
+```
+
+### Orelse Emission
+
+```c
+// u32 x = expr orelse return;  →  (var decl path, emitter.c ~line 998)
+__auto_type _zer_or0 = <expr>;
+if (!_zer_or0.has_value) { return 0; }     // ?T path
+uint32_t x = _zer_or0.value;
+
+// *Task t = expr orelse return;  →  (pointer optional path)
+__auto_type _zer_or0 = <expr>;
+if (!_zer_or0) { return 0; }               // ?*T null check
+Task* t = _zer_or0;
+
+// push_checked(x) orelse return;  →  (?void expression stmt path)
+({__auto_type _zer_tmp0 = <expr>;
+  if (!_zer_tmp0.has_value) { return 0; }   // ?void — NO .value access
+  (void)0; })
+```
 
 ### Var Decl Optional Init
 When target type is `?T` and inner is not pointer:
@@ -171,10 +253,12 @@ When target type is `?T` and inner is not pointer:
 - Temporaries: `_zer_tmp0`, `_zer_uw0` (unwrap), `_zer_or0` (orelse), `_zer_sat0` (saturate)
 - Pool helpers: `_zer_pool_alloc`, `_zer_pool_get`, `_zer_pool_free`
 - Ring helper: `_zer_ring_push`
+- Arena: `_zer_arena` (typedef), `_zer_arena_alloc` (runtime helper)
 
 ### GCC Extensions Used
 - `__auto_type` — C equivalent of `auto` (type inference)
 - `({...})` — statement expressions (GCC/Clang extension)
+- `_Alignof(T)` — type alignment (C11, supported by GCC/Clang)
 - These make the emitted C NOT portable to MSVC
 
 ## ZER-CHECK (zercheck.c) — ~400 lines
@@ -209,12 +293,13 @@ Path-sensitive handle tracking after type checker, before emitter:
 | `test_checker_full.c` | Full spec coverage | 176 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 93 |
-| `test_zercheck.c` | Handle tracking | 12 |
-| `test_firmware_patterns.c` | 3 rounds firmware | 39+41=80 |
-| `test_firmware_patterns2.c` | Round 2 | (in patterns) |
-| `test_firmware_patterns3.c` | Round 3 | (in patterns) |
-| `test_production.c` | Real firmware E2E | 14+22=36? |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 117 |
+| `test_zercheck.c` | Handle tracking | 17 |
+| `test_fuzz.c` | Parser adversarial inputs | 491 |
+| `test_firmware_patterns.c` | Round 1 firmware | 39 |
+| `test_firmware_patterns2.c` | Round 2 firmware | 41 |
+| `test_firmware_patterns3.c` | Round 3 firmware | 22 |
+| `test_production.c` | Production firmware E2E | 14 |
 
 ### Test Helpers
 - `test_emit.c`: `test_compile_and_run(zer_src, expected_exit, name)` — full E2E
@@ -224,7 +309,7 @@ Path-sensitive handle tracking after type checker, before emitter:
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 35 bugs fixed)
+## Common Bug Patterns (from 41 bugs fixed)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)

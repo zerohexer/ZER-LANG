@@ -210,16 +210,38 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Defer | Done | Done |
 | ZER-CHECK (handle tracking) | Done | N/A (analysis pass) |
 
+### Emitter Critical Patterns (causes of most bugs)
+
+**Optional types in emitted C:**
+- `?*T` → plain C pointer (NULL = none, non-NULL = some). No struct wrapper.
+- `?T` (value) → `struct { T value; uint8_t has_value; }`. Check `.has_value`, extract `.value`.
+- `?void` → `struct { uint8_t has_value; }`. **NO `.value` field** — accessing it is a GCC error.
+- Bare `return;` from `?void` func → `return (_zer_opt_void){ 1 };`
+- `return null;` from `?void` func → `return (_zer_opt_void){ 0 };`
+- Bare `return;` from `?T` func → `return (opt_type){ 0, 1 };`
+
+**Slice types in emitted C:**
+- `[]T` → `struct { T* ptr; size_t len; }` (anonymous for non-u8/u32, typedef for u8/u32)
+- Slice indexing: `slice.ptr[i]` — NOT `slice[i]` (emitter must add `.ptr`)
+- Slice orelse unwrap: use `__auto_type` to avoid anonymous struct type mismatch
+
+**Builtin method emission pattern (emitter.c ~line 350-520):**
+1. Check if callee is `NODE_FIELD` with object of type Pool/Ring/Arena
+2. Get object name and method name
+3. Emit inline C code or call to runtime helper
+4. Set `handled = true` to skip normal call emission
+
+**Adding new builtin methods:** Copy the Pool/Ring/Arena pattern. Need: checker NODE_CALL handler (return type), emitter interception (C codegen), and E2E test.
+
 ## First Session Workflow
 
 When starting a new session or lacking context:
 
 1. Read `CLAUDE.md` (this file) — has FULL language reference above, rules, conventions
-2. For component-specific work, read the relevant internal docs:
-   - `docs/compiler-internals.md` — how each compiler pass works, key line numbers, common patterns
-   - `BUGS-FIXED.md` — past bugs and their root causes (prevents re-introducing)
-   - `ZER-LANG.md` — full language spec (only if above reference is insufficient)
-3. Read the relevant header files: `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
+2. **MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
+3. Read `BUGS-FIXED.md` — 41 past bugs with root causes. Prevents re-introducing fixed bugs.
+4. `ZER-LANG.md` — full language spec (only if CLAUDE.md quick reference is insufficient)
+5. Read the relevant header files: `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
 4. Run `make check` to verify everything passes before making changes
 5. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
 

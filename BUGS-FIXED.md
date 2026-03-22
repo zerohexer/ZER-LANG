@@ -311,6 +311,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-066: Var-decl `orelse return` in `?void` function emits `{ 0, 0 }`
+- **Symptom:** `u32 val = get() orelse return;` inside a `?void` function emits `return (_zer_opt_void){ 0, 0 };` — excess initializer for 1-field struct.
+- **Root cause:** Var-decl orelse-return path had no `TYPE_VOID` check (the other 3 paths had it).
+- **Fix:** Added `inner->kind == TYPE_VOID` → `{ 0 }` instead of `{ 0, 0 }`.
+
+### BUG-065: Union switch `|*v|` mutable capture emits value copy
+- **Symptom:** `switch (m) { .sensor => |*v| { v.temp = 99; } }` — mutation silently dropped. Emitted C copies the variant value, mutations go to the copy.
+- **Root cause:** Capture always emitted `__auto_type v = union.field` regardless of `capture_is_ptr`.
+- **Fix:** When `capture_is_ptr`, emit `__auto_type *v = &union.field` instead.
+
 ### BUG-064: `volatile` qualifier completely stripped from emitted C
 - **Symptom:** `volatile *u32 reg = @inttoptr(...)` emits as `uint32_t* reg` — no volatile keyword. GCC optimizes away MMIO reads/writes.
 - **Root cause:** Parser consumes `volatile` as a var-decl flag (`is_volatile`), not as part of the type node. Emitter never checked `is_volatile` to emit the keyword.

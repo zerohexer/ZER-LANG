@@ -2,6 +2,35 @@
 
 All notable changes to ZER-LANG. Read this to understand project history and current state.
 
+## 2026-03-22 (continued — audit rounds 2-3)
+
+### Bug Fixes (Round 2 — 9 bugs)
+- **BUG-056:** Bitwise compound `&= |= ^= <<= >>=` on floats now rejected
+- **BUG-057:** Union switch exhaustiveness now uses bitmask deduplication
+- **BUG-058:** Union switch variant names now validated against union definition
+- **BUG-059:** `@truncate`/`@saturate` now validate source is numeric
+- **BUG-060:** Const check extended to field/index chains (not just direct ident)
+- **BUG-061:** Compound assignment narrowing `u8 += u64` now rejected (literals exempt)
+- **BUG-062:** `?UnionType` now gets `_zer_opt_UnionName` typedef (like structs)
+- **BUG-063:** Expression-level `orelse return/break/continue` now fires defers
+- **BUG-064:** `volatile` qualifier now emitted on pointer types (was completely stripped — critical for MMIO)
+
+### Bug Fixes (Round 3 — 2 bugs)
+- **BUG-065:** Union switch `|*v|` mutable capture now emits pointer, not value copy
+- **BUG-066:** Var-decl `orelse return` in `?void` function now emits `{ 0 }` not `{ 0, 0 }`
+
+### Systematic Negative Test Sweep
+- Added 26 negative tests covering ALL previously-uncovered `checker_error()` paths
+- Every rejection rule in the checker now has at least one test proving it fires
+
+### Research & Implementation
+- **Array-to-slice coercion** — now works at call sites, var-decl, and return (3 emission sites)
+- **`@cast`** — parser fix allows TOK_IDENT as type_arg for @cast intrinsic
+
+### Tests
+- **938 tests + 491 fuzz, all passing**
+- Audit trend: 12 → 9 → 2 bugs per round (converging)
+
 ## 2026-03-22
 
 ### License

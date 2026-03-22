@@ -311,6 +311,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-068: Explicit enum values (`enum { a = 5 }`) silently emit wrong constants
+- **Symptom:** `enum Prio { low = 1, med = 5, high = 10 }` emits `#define _ZER_Prio_low 0`, `_ZER_Prio_med 1`, `_ZER_Prio_high 2` — uses loop index instead of declared value.
+- **Root cause:** Emitter's enum `#define` loop uses `j` (loop counter) as the value, ignoring `v->value`.
+- **Fix:** Rejected at parser level with "explicit enum values not yet supported" — prevents silent wrong behavior. Proper support deferred to v0.2.
+
+### BUG-067: `*Union` pointer auto-deref returns `ty_void` in checker
+- **Symptom:** `*Msg p = &msg; p.sensor = s;` fails with "cannot assign 'S' to 'void'" — checker doesn't auto-deref pointers to unions.
+- **Root cause:** Pointer auto-deref path (line 982) only handled `TYPE_POINTER` where inner is `TYPE_STRUCT`, not `TYPE_UNION`.
+- **Fix:** Added parallel auto-deref block for `TYPE_UNION` inner — looks up variant by name, returns variant type.
+
 ### BUG-066: Var-decl `orelse return` in `?void` function emits `{ 0, 0 }`
 - **Symptom:** `u32 val = get() orelse return;` inside a `?void` function emits `return (_zer_opt_void){ 0, 0 };` — excess initializer for 1-field struct.
 - **Root cause:** Var-decl orelse-return path had no `TYPE_VOID` check (the other 3 paths had it).

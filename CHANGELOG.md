@@ -2,6 +2,16 @@
 
 All notable changes to ZER-LANG. Read this to understand project history and current state.
 
+## 2026-03-22 (continued — audit round 4)
+
+### Bug Fixes (Round 4 — 2 findings)
+- **BUG-067:** `*Union` pointer auto-deref now resolves variant type correctly (was returning ty_void)
+- **BUG-068:** Explicit enum values (`enum { a = 5 }`) now rejected at parser — was silently emitting wrong constants. Proper support deferred to v0.2.
+
+### Audit Convergence
+- Round 1: 12 bugs → Round 2: 9 bugs → Round 3: 2 bugs → Round 4: 0 bugs in working features
+- Compiler is clean across all audited dimensions
+
 ## 2026-03-22 (continued — audit rounds 2-3)
 
 ### Bug Fixes (Round 2 — 9 bugs)
@@ -83,8 +93,10 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 906 tests + 491 fuzz, all passing. ~9,300 lines.
-**License:** GPL v3 + Runtime Exception.
-**Language features:** All core features implemented. `cinclude` for C interop. No UFCS (dropped).
-**Known gaps:** Array-to-slice coercion at var-decl level doesn't emit wrapper. No native backends (emit-C only). No standard library (freestanding by design).
-**Next likely work:** ARM cross-compile demo (QEMU), more CVE demos, v0.1.0 tag.
+**Compiler:** 938 tests + 491 fuzz, all passing. ~9,500 lines. 68 bugs found and fixed.
+**License:** GPL v3 + Runtime Exception (GCC model).
+**Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. Array-to-slice coercion at all emission sites. Volatile emission. No UFCS (dropped).
+**Audit status:** 4 rounds completed, converged to 0 bugs. 26 systematic negative tests covering all checker rejection paths.
+**Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
+**Known limitations:** Explicit enum values not yet supported (rejected at parser). Non-u8/u32 slice types use anonymous structs (type mismatch across functions). No native backends (emit-C only).
+**Next:** v0.1.0 tag.

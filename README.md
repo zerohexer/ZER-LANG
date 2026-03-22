@@ -215,4 +215,12 @@ Works with: VS Code, Neovim (nvim-lspconfig), Emacs (eglot/lsp-mode), Helix, Zed
 
 ## License
 
-Apache License 2.0. Copyright 2026 zerohexer.
+GNU General Public License v3.0 with Runtime Exception.
+
+**zerc (the compiler)** is GPL v3. You cannot take zerc, improve it, and keep those improvements private. Modifications must be released under GPL v3.
+
+**Firmware compiled BY zerc** is yours. No GPL inheritance. Compile proprietary firmware freely. The Runtime Exception covers you.
+
+This is the same model as GCC.
+
+Copyright 2026 ZEROHEXER (zerohexer@gmail.com).

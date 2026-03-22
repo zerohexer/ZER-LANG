@@ -1163,6 +1163,8 @@ static Type *check_expr(Checker *c, Node *node) {
                    (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||
                    (nlen == 12 && memcmp(name, "barrier_load", 12) == 0)) {
             result = ty_void;
+        } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
+            result = ty_void;
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
             result = type_pointer(c->arena, ty_u8);
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {

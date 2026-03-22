@@ -297,7 +297,7 @@ Path-sensitive handle tracking after type checker, before emitter:
 | `test_checker_full.c` | Full spec coverage | 176 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 118 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 122 |
 | `test_zercheck.c` | Handle tracking | 17 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
@@ -313,7 +313,7 @@ Path-sensitive handle tracking after type checker, before emitter:
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 42 bugs fixed)
+## Common Bug Patterns (from 46 bugs fixed)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)

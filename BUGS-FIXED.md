@@ -311,6 +311,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-046: `@trap()` rejected as unknown intrinsic
+- **Symptom:** `@trap()` fails with "unknown intrinsic '@trap'" at checker.
+- **Root cause:** Checker had no handler for `@trap` — fell to the `else` branch that reports unknown intrinsics.
+- **Fix:** Added `@trap` handler in checker (returns `ty_void`) and emitter (emits `_zer_trap("explicit trap", __FILE__, __LINE__)`).
+- **Test:** `test_emit.c` — conditional @trap skipped = 42
+
+### BUG-045: Non-u8/u32 array slicing emits `void*` pointer — type mismatch
+- **Symptom:** `u32[8]` sliced with `arr[0..3]` emits `struct { void* ptr; size_t len; }`, incompatible with `_zer_slice_u32`.
+- **Root cause:** Slice emission only checked for u8, everything else got `void*` and an anonymous struct.
+- **Fix:** Added u32 check → `_zer_slice_u32`. Other types use typed pointer instead of `void*`.
+- **Test:** `test_emit.c` — u32 array slicing arr[0..3] → []u32, sum = 60
+
+### BUG-044: Slice variables auto-zero emits `= 0` instead of `= {0}`
+- **Symptom:** `[]u8 s;` (global or local) emits `_zer_slice_u8 s = 0;` — invalid initializer for struct.
+- **Root cause:** `TYPE_SLICE` missing from the compound-type condition in both local and global auto-zero paths.
+- **Fix:** Added `TYPE_SLICE` to both conditions.
+- **Test:** `test_emit.c` — global+local slice auto-zero, len=0
+
+### BUG-043: `?void` assign null emits `{ 0, 0 }` — excess initializer
+- **Symptom:** `status = null;` where status is `?void` emits `(_zer_opt_void){ 0, 0 }` — 2 initializers for 1-field struct.
+- **Root cause:** Assign-null path didn't special-case `?void` (which has only `has_value`, no `value` field).
+- **Fix:** Check `inner->kind == TYPE_VOID` → emit `{ 0 }` instead of `{ 0, 0 }`.
+- **Test:** `test_emit.c` — ?void assign null, has_value=0
+
 ### BUG-042: `?Enum` optional emits anonymous struct — GCC type mismatch
 - **Symptom:** `?Status` (optional enum) emits `struct { int32_t value; uint8_t has_value; }` everywhere. Each anonymous struct is a different C type, causing "incompatible types" errors on return and assignment.
 - **Root cause:** `emit_type` TYPE_OPTIONAL handler had no `case TYPE_ENUM:` — fell to `default` anonymous struct fallback.

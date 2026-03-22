@@ -1814,6 +1814,52 @@ int main(void) {
         42,
         "enum switch inside if-unwrap: ?Status done => 42");
 
+    /* BUG-043: ?void assign null — was emitting { 0, 0 } for 1-field struct */
+    test_compile_and_run(
+        "?void status;\n"
+        "u32 main() {\n"
+        "    status = null;\n"
+        "    if (status) |_v| { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "?void assign null: no excess initializer, has_value=0");
+
+    /* BUG-044: slice auto-zero — was emitting = 0 for struct types */
+    test_compile_and_run(
+        "[]u8 global_slice;\n"
+        "u32 main() {\n"
+        "    []u8 local_slice;\n"
+        "    u32 g = @truncate(u32, global_slice.len);\n"
+        "    u32 l = @truncate(u32, local_slice.len);\n"
+        "    return g + l;\n"
+        "}\n",
+        0,
+        "slice auto-zero: []u8 global+local init to {0}, len=0");
+
+    /* BUG-045: non-u8/u32 array slicing — was emitting void* ptr */
+    test_compile_and_run(
+        "u32[8] arr;\n"
+        "u32 main() {\n"
+        "    arr[0] = 10;\n"
+        "    arr[1] = 20;\n"
+        "    arr[2] = 30;\n"
+        "    []u32 sl = arr[0..3];\n"
+        "    return sl[0] + sl[1] + sl[2];\n"
+        "}\n",
+        60,
+        "u32 array slicing: arr[0..3] → []u32, sum = 60");
+
+    /* BUG-046: @trap() was rejected as unknown intrinsic */
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    bool should_trap = false;\n"
+        "    if (should_trap) { @trap(); }\n"
+        "    return 42;\n"
+        "}\n",
+        42,
+        "@trap() compiles and is conditional: skipped = 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

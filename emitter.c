@@ -333,7 +333,10 @@ static void emit_expr(Emitter *e, Node *node) {
                    node->assign.value->kind == NODE_NULL_LIT) {
             emit(e, "(");
             emit_type(e, tgt_type);
-            emit(e, "){ 0, 0 }");
+            if (tgt_type->optional.inner->kind == TYPE_VOID)
+                emit(e, "){ 0 }");
+            else
+                emit(e, "){ 0, 0 }");
         } else {
             emit_expr(e, node->assign.value);
         }
@@ -631,14 +634,24 @@ static void emit_expr(Emitter *e, Node *node) {
          * buf[start..]   → (_zer_slice_T){ &buf[start], buf_len - start }
          * buf[..end]     → (_zer_slice_T){ &buf[0], end } */
         /* For simplicity, emit raw pointer + compute length inline */
-        bool is_u8_slice = obj_type && (
-            (obj_type->kind == TYPE_ARRAY && obj_type->array.inner == ty_u8) ||
-            (obj_type->kind == TYPE_SLICE && obj_type->slice.inner == ty_u8));
+        Type *elem_type = obj_type ? (obj_type->kind == TYPE_ARRAY ?
+            obj_type->array.inner : obj_type->kind == TYPE_SLICE ?
+            obj_type->slice.inner : NULL) : NULL;
+        bool is_u8_slice = elem_type && elem_type == ty_u8;
+        bool is_u32_slice = elem_type && elem_type == ty_u32;
 
         if (is_u8_slice) {
             emit(e, "((_zer_slice_u8){ ");
+        } else if (is_u32_slice) {
+            emit(e, "((_zer_slice_u32){ ");
         } else {
-            emit(e, "((struct { void* ptr; size_t len; }){ ");
+            emit(e, "((struct { ");
+            if (elem_type) {
+                emit_type(e, elem_type);
+            } else {
+                emit(e, "void");
+            }
+            emit(e, "* ptr; size_t len; }){ ");
         }
         /* ptr = &obj[start] */
         emit(e, "&(");
@@ -889,6 +902,8 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "__atomic_thread_fence(__ATOMIC_RELEASE)");
         } else if (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
+        } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
+            emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field)) */
             emit(e, "((");
@@ -1153,7 +1168,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             /* ZER auto-zeroes */
             if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
                          type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION ||
-                         type->kind == TYPE_ARENA)) {
+                         type->kind == TYPE_ARENA || type->kind == TYPE_SLICE)) {
                 emit(e, " = {0}");
             } else {
                 emit(e, " = 0");
@@ -1708,7 +1723,8 @@ static void emit_global_var(Emitter *e, Node *node) {
     } else {
         /* auto-zero */
         if (type && (type->kind == TYPE_STRUCT || type->kind == TYPE_ARRAY ||
-                     type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION)) {
+                     type->kind == TYPE_OPTIONAL || type->kind == TYPE_UNION ||
+                     type->kind == TYPE_SLICE)) {
             emit(e, " = {0}");
         } else {
             emit(e, " = 0");

@@ -55,25 +55,36 @@ COMPILER:
 TESTS:
   test_lexer.c            218 lexer unit tests
   test_parser.c           70 parser tests
-  test_parser_edge.c      88 parser edge cases
+  test_parser_edge.c      92 parser edge cases
   test_checker.c          71 type checker tests
-  test_checker_full.c     172 full checker tests
+  test_checker_full.c     176 full checker tests
   test_extra.c            18 extra checker tests
   test_gaps.c             4 gap tests
-  test_emit.c             76 end-to-end tests (ZER → C → GCC → run)
-  test_zercheck.c         8 ZER-CHECK tests
+  test_emit.c             118 end-to-end tests (ZER → C → GCC → run)
+  test_zercheck.c         17 ZER-CHECK tests
+  test_fuzz.c             491 parser fuzz inputs
   test_firmware_patterns.c    39 firmware E2E tests
   test_firmware_patterns2.c   41 firmware E2E tests
   test_firmware_patterns3.c   22 firmware E2E tests
   test_production.c           14 production firmware E2E tests
   test_modules/               Multi-file import tests
 
+DOCS:
+  docs/compiler-internals.md  Emission patterns, optional handling, common bugs
+  docs/CONTRIBUTING.md        This file
+
 SPEC:
   ZER-LANG.md         Full language specification
   zer-type-system.md  Type system design decisions
   zer-check-design.md ZER-CHECK design
-  BUGS-FIXED.md       All 24 bugs found and fixed
+  BUGS-FIXED.md       All 42 bugs found and fixed
 ```
+
+## Before You Start
+
+1. Read `CLAUDE.md` — full language reference, syntax rules, debugging workflow
+2. Read `docs/compiler-internals.md` — emission patterns, optional type C representations, builtin method interception. **Read this before touching emitter.c, checker.c, or types.c.**
+3. Read `BUGS-FIXED.md` — 42 past bugs with root causes. Don't re-introduce them.
 
 ## How to Read the Code
 
@@ -288,7 +299,7 @@ Add positive test (valid code compiles and runs) and negative test (invalid code
 
 ### Step 7: Run `make check`
 
-All 841+ tests must pass. Then commit.
+All 900+ tests must pass. Then commit.
 
 ## How to Fix a Bug
 
@@ -313,7 +324,7 @@ Read `CLAUDE.md` § "Debugging Workflow" for the full process. Summary:
 ```bash
 make            # build zerc compiler
 make zer-lsp    # build language server
-make check      # run all 841 tests + module import tests
+make check      # run all 900 tests + 491 fuzz + module import tests
 make release    # build release binaries in release/
 make clean      # remove all build artifacts
 ```

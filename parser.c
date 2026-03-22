@@ -1194,6 +1194,7 @@ static Node *parse_enum_decl(Parser *p) {
         v->name_len = tok_len(&p->previous);
 
         if (match(p, TOK_EQ)) {
+            error(p, "explicit enum values not yet supported");
             v->value = parse_expression(p);
         }
 

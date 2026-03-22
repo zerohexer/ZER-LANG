@@ -997,6 +997,26 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
+        /* pointer auto-deref for union: ptr.variant = (*ptr).variant */
+        if (obj->kind == TYPE_POINTER && obj->pointer.inner->kind == TYPE_UNION) {
+            Type *inner = obj->pointer.inner;
+            for (uint32_t i = 0; i < inner->union_type.variant_count; i++) {
+                SUVariant *v = &inner->union_type.variants[i];
+                if (v->name_len == flen && memcmp(v->name, fname, flen) == 0) {
+                    result = v->type;
+                    break;
+                }
+            }
+            if (!result) {
+                checker_error(c, node->loc.line,
+                    "no variant '%.*s' in union '%.*s'",
+                    (int)flen, fname,
+                    (int)inner->union_type.name_len, inner->union_type.name);
+                result = ty_void;
+            }
+            break;
+        }
+
         /* enum: State.idle → returns the enum type */
         if (obj->kind == TYPE_ENUM) {
             bool found = false;

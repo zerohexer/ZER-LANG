@@ -75,6 +75,10 @@ static void emit_type(Emitter *e, Type *t) {
             emit_type(e, t->optional.inner);
             break;
         }
+        /* NOTE: ?FuncPtr is not currently supported at the language level.
+         * Function pointers are always nullable (like C). The parser cannot
+         * express ?void(*fn)(u32) because ? attaches to the return type, not
+         * the whole function pointer. This is a v0.2 design task. */
         /* ?T → named optional typedef */
         switch (t->optional.inner->kind) {
         case TYPE_VOID:  emit(e, "_zer_opt_void"); break;

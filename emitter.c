@@ -97,6 +97,9 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_ENUM:
             emit(e, "_zer_opt_i32");  /* enums are int32_t */
             break;
+        case TYPE_HANDLE:
+            emit(e, "_zer_opt_u32");  /* handles are uint32_t */
+            break;
         case TYPE_STRUCT:
             emit(e, "_zer_opt_%.*s",
                  (int)t->optional.inner->struct_type.name_len,

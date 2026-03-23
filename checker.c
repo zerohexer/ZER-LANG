@@ -936,11 +936,9 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = effective_callee->func_ptr.ret;
         } else {
-            /* UFCS dropped from spec — dead code commented out for potential v0.2 revival
-            if (node->call.callee->kind == NODE_FIELD) {
-                ... UFCS resolution code removed ...
-            }
-            */
+            checker_error(c, node->loc.line,
+                "cannot call non-function type '%s'",
+                type_name(effective_callee));
             result = ty_void;
         }
         break;
@@ -1224,6 +1222,13 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         Type *unwrapped = type_unwrap_optional(expr);
+
+        if (node->orelse.fallback_is_break && !c->in_loop) {
+            checker_error(c, node->loc.line, "'orelse break' outside of loop");
+        }
+        if (node->orelse.fallback_is_continue && !c->in_loop) {
+            checker_error(c, node->loc.line, "'orelse continue' outside of loop");
+        }
 
         if (node->orelse.fallback_is_return ||
             node->orelse.fallback_is_break ||

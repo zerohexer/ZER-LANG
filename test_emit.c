@@ -2188,6 +2188,53 @@ int main(void) {
         50,
         "bounds check in for loop body — sum 5+10+15+20=50");
 
+    /* ---- BUG-099: hex escape in char literals ---- */
+    printf("\n[BUG-099: \\x hex escape]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8 a = '\\x0A';\n"
+        "    u8 b = '\\xFF';\n"
+        "    u8 c = '\\x00';\n"
+        "    return @truncate(u32, a) + @truncate(u32, c);\n"
+        "}\n",
+        10,
+        "\\x0A = 10, \\x00 = 0, sum = 10");
+
+    /* ---- BUG-101: bare return in ?*T function ---- */
+    printf("[BUG-101: bare return in ?*T → NULL]\n");
+    test_compile_and_run(
+        "struct Task { u32 id; }\n"
+        "?*Task get_none() { return; }\n"
+        "u32 main() {\n"
+        "    ?*Task t = get_none();\n"
+        "    if (t) |task| { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "bare return in ?*T = none, if-unwrap skipped");
+
+    /* ---- BUG-102: defer in if-unwrap scope ---- */
+    printf("[BUG-102: defer fires at if-unwrap scope exit]\n");
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "void inc() { counter += 1; }\n"
+        "?u32 maybe() { return 42; }\n"
+        "?u32 nothing() { return null; }\n"
+        "u32 main() {\n"
+        "    if (maybe()) |val| {\n"
+        "        defer inc();\n"
+        "        counter += 10;\n"
+        "    }\n"
+        "    u32 after_if = counter;\n"
+        "    if (nothing()) |val| {\n"
+        "        defer inc();\n"
+        "        counter += 100;\n"
+        "    }\n"
+        "    return after_if;\n"
+        "}\n",
+        11,
+        "defer fires inside if-unwrap block, counter=11 before after_if");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

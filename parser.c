@@ -448,6 +448,21 @@ static Node *parse_primary(Parser *p) {
             case '0':  n->char_lit.value = '\0'; break;
             case '\\': n->char_lit.value = '\\'; break;
             case '\'': n->char_lit.value = '\''; break;
+            case 'x': {
+                /* \xNN hex escape — parse two hex digits */
+                uint8_t val = 0;
+                for (int i = 3; i <= 4; i++) {
+                    char ch = text[i];
+                    uint8_t digit;
+                    if (ch >= '0' && ch <= '9') digit = ch - '0';
+                    else if (ch >= 'a' && ch <= 'f') digit = 10 + ch - 'a';
+                    else if (ch >= 'A' && ch <= 'F') digit = 10 + ch - 'A';
+                    else { error(p, "invalid hex digit in \\x escape"); digit = 0; }
+                    val = (val << 4) | digit;
+                }
+                n->char_lit.value = val;
+                break;
+            }
             default:   n->char_lit.value = text[2]; break;
             }
         } else {

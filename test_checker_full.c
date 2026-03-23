@@ -703,6 +703,27 @@ static void test_security_review(void) {
         "    }\n"
         "}\n",
         "union mutation via *ptr in switch arm → error");
+
+    /* BUG-100: orelse break/continue outside loop */
+    err("?u32 get() { return 42; }\n"
+        "u32 main() { u32 x = get() orelse break; return x; }\n",
+        "orelse break outside loop → error");
+    err("?u32 get() { return 42; }\n"
+        "u32 main() { u32 x = get() orelse continue; return x; }\n",
+        "orelse continue outside loop → error");
+    ok("?u32 get() { return 42; }\n"
+       "void f() {\n"
+       "    for (u32 i = 0; i < 1; i += 1) {\n"
+       "        u32 x = get() orelse break;\n"
+       "    }\n"
+       "}\n",
+       "orelse break inside loop (valid)");
+
+    /* BUG-101b: calling non-callable type */
+    err("void main() { u32 x = 5; x(10); }\n",
+        "call non-function u32 → error");
+    err("void main() { bool b = true; b(); }\n",
+        "call non-function bool → error");
 }
 
 /* ================================================================

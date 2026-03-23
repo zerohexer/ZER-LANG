@@ -73,6 +73,36 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-099: `\x` hex escape in char literals stores wrong value
+- **Symptom:** `u8 c = '\x0A';` stores 120 ('x') instead of 10 (0x0A).
+- **Root cause:** `parser.c:444` — escape sequence switch had no `case 'x':` handler. `\xNN` fell to `default:` which stored `text[2]` literally (the character 'x').
+- **Fix:** Added `case 'x':` that parses two hex digits from `text[3..4]`.
+- **Test:** `test_emit.c` — `\x0A` = 10, `\xFF` = 255, `\x00` = 0.
+
+### BUG-100: `orelse break` / `orelse continue` outside loop passes checker
+- **Symptom:** `u32 x = get() orelse break;` at function scope passes checker. GCC rejects: "break statement not within loop or switch".
+- **Root cause:** `checker.c:1228-1230` — orelse fallback_is_break/continue not validated against `c->in_loop`. Standalone `break`/`continue` were validated but orelse variants were not.
+- **Fix:** Added `if (!c->in_loop) checker_error(...)` for both orelse break and orelse continue.
+- **Test:** `test_checker_full.c` — orelse break/continue outside loop → error, inside loop → OK.
+
+### BUG-101: Bare `return;` in `?*T` function emits invalid compound literal
+- **Symptom:** Bare `return;` in `?*Task get_task()` emits `return (struct Task*){ 0, 1 };` — excess elements in scalar initializer.
+- **Root cause:** `emitter.c:1579` — bare return path checked `TYPE_OPTIONAL` without excluding null-sentinel types. `?*T` is a raw pointer (null = none), not a struct.
+- **Fix:** Check `is_null_sentinel()` first: null-sentinel → `return (T*)0;` (none). Struct-wrapper → existing `{ 0, 1 }` path.
+- **Test:** `test_emit.c` — bare return in ?*T = none, if-unwrap skipped.
+
+### BUG-102: Defer inside if-unwrap body fires at wrong scope
+- **Symptom:** `if (maybe()) |val| { defer inc(); counter += 10; }` — defer fires at function exit, not at if-unwrap block exit. `counter` reads 10 instead of 11 after the if block.
+- **Root cause:** `emitter.c:1452-1459` — if-unwrap unwraps the block to inject capture variable, but doesn't save/restore defer stack. Defers accumulate on function-level stack instead of block-level.
+- **Fix:** Save `defer_stack.count` before emitting block, call `emit_defers_from()` after, restore count. Same fix applied to union switch capture arms.
+- **Test:** `test_emit.c` — defer fires inside if-unwrap, counter=11 before after_if.
+
+### BUG-103: Calling non-callable type produces no checker error
+- **Symptom:** `u32 x = 5; x(10);` passes checker silently, emits invalid C.
+- **Root cause:** `checker.c:938-944` — else branch for non-TYPE_FUNC_PTR callee set `result = ty_void` without error. UFCS comment block masked the missing error.
+- **Fix:** Added `checker_error("cannot call non-function type '%s'")`.
+- **Test:** `test_checker_full.c` — call u32, call bool → error.
+
 ### BUG-096: Unknown builtin method names silently return void
 - **Symptom:** `pool.bogus()`, `ring.clear()`, `arena.destroy()` — unrecognized method names on Pool/Ring/Arena types fall through with no error, returning ty_void.
 - **Root cause:** After all known method `if` checks, code fell through to `/* not a builtin */` without an error for builtin types.

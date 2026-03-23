@@ -337,10 +337,10 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 | `test_parser.c` | AST construction | 70 |
 | `test_parser_edge.c` | Edge cases, func ptrs | 92 |
 | `test_checker.c` | Type checking basic | 71 |
-| `test_checker_full.c` | Full spec coverage + security + audit | 216 |
+| `test_checker_full.c` | Full spec coverage + security + audit | 221 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 145 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 148 |
 | `test_zercheck.c` | Handle tracking + aliasing | 20 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
@@ -356,7 +356,7 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 98 bugs fixed, 9 audit rounds + 4 QEMU demos)
+## Common Bug Patterns (from 103 bugs fixed, 10 audit rounds + 4 QEMU demos)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)

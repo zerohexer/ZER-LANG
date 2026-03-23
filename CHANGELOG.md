@@ -18,6 +18,13 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 - **BUG-094:** NODE_CINCLUDE in AST debug — `node_kind_name()` and `ast_print()` now handle NODE_CINCLUDE
 - **BUG-095:** Unchecked fread — `zerc_main.c` now checks return value, returns NULL on short read
 
+### Bug Fixes (Round 10 — interaction audit, 5 bugs)
+- **BUG-099:** `\x` hex escape in char literals now parses hex digits correctly (was storing 'x')
+- **BUG-100:** `orelse break`/`orelse continue` outside loop now rejected at checker
+- **BUG-101:** Bare `return;` in `?*T` function now emits `return (T*)0;` (was invalid compound literal)
+- **BUG-102:** Defer inside if-unwrap body now fires at block scope exit (was deferring to function exit). Same fix for union switch capture arms.
+- **BUG-103:** Calling non-callable type (`u32 x = 5; x(10)`) now produces checker error
+
 ### Gap Fixes (hardening existing checks)
 - **BUG-096:** Unknown builtin method names (pool.bogus, ring.clear, arena.destroy) now error with available method list
 - **BUG-097:** Arena-derived flag propagated through aliases — `q = arena_ptr; global = q` now caught
@@ -155,11 +162,11 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 971 tests + 491 fuzz, all passing. ~10,000 lines. 98 bugs found and fixed.
+**Compiler:** 979 tests + 491 fuzz, all passing. ~10,000 lines. 103 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
 **Safety:** Inline bounds checks (conditions + short-circuit safe). Scope escape via struct fields caught. Union type confusion blocked. ZER-CHECK handles aliasing. Arena lifetime escape detected.
-**Audit status:** 9 rounds completed (12→9→2→2→1→2→CLEAN→6→12). 26 systematic negative tests. 4 QEMU real-program demos.
+**Audit status:** 10 rounds completed (12→9→2→2→1→2→CLEAN→6→12→5). 26 systematic negative tests. 4 QEMU real-program demos.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
 **Known limitations:**
 - `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first.

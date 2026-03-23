@@ -1449,7 +1449,10 @@ static void emit_stmt(Emitter *e, Node *node) {
                          node->if_stmt.capture_name, tmp);
                 }
             }
-            /* emit then body contents (unwrap the block) */
+            /* emit then body contents (unwrap the block).
+             * Track defer scope so defers inside this block fire at block exit,
+             * not at function exit (BUG-102 fix). */
+            int saved_defer_count = e->defer_stack.count;
             if (node->if_stmt.then_body->kind == NODE_BLOCK) {
                 for (int i = 0; i < node->if_stmt.then_body->block.stmt_count; i++) {
                     emit_stmt(e, node->if_stmt.then_body->block.stmts[i]);
@@ -1457,6 +1460,9 @@ static void emit_stmt(Emitter *e, Node *node) {
             } else {
                 emit_stmt(e, node->if_stmt.then_body);
             }
+            /* fire defers accumulated inside this block */
+            emit_defers_from(e, saved_defer_count);
+            e->defer_stack.count = saved_defer_count;
             e->indent--;
             emit_indent(e);
             emit(e, "}\n");
@@ -1575,8 +1581,15 @@ static void emit_stmt(Emitter *e, Node *node) {
                 }
             }
         } else {
-            /* bare return — for ?void, return {1} (success); for other ?T, return {0,1} */
-            if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL) {
+            /* bare return — for ?void, return {1} (success); for other ?T, return {0,1}
+             * For null-sentinel types (?*T, ?FuncPtr), bare return = return NULL (none) */
+            if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
+                is_null_sentinel(e->current_func_ret->optional.inner)) {
+                /* null-sentinel: bare return = none = NULL */
+                emit(e, "return (");
+                emit_type(e, e->current_func_ret->optional.inner);
+                emit(e, ")0;\n");
+            } else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
                 if (e->current_func_ret->optional.inner->kind == TYPE_VOID) {
@@ -1733,13 +1746,16 @@ static void emit_stmt(Emitter *e, Node *node) {
                          sw_tmp,
                          (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);
                 }
-                /* emit body contents */
+                /* emit body contents — track defer scope (BUG-102 fix) */
+                int saved_sw_defer = e->defer_stack.count;
                 if (arm->body->kind == NODE_BLOCK) {
                     for (int k = 0; k < arm->body->block.stmt_count; k++)
                         emit_stmt(e, arm->body->block.stmts[k]);
                 } else {
                     emit_stmt(e, arm->body);
                 }
+                emit_defers_from(e, saved_sw_defer);
+                e->defer_stack.count = saved_sw_defer;
                 e->indent--;
                 emit_indent(e);
                 emit(e, "}\n");

@@ -73,6 +73,31 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-106: `@ptrcast` accepts non-pointer source
+- **Symptom:** `@ptrcast(*u32, 42)` — integer source passes checker, emits cast that GCC silently accepts. Creates pointer from integer with no diagnostic.
+- **Root cause:** No source type validation in checker's @ptrcast handler.
+- **Fix:** Validate source is TYPE_POINTER or TYPE_FUNC_PTR (unwrap distinct first).
+
+### BUG-107: `@inttoptr` accepts non-integer source
+- **Symptom:** `@inttoptr(*u32, some_struct)` — struct source passes checker. GCC rejects.
+- **Root cause:** No source type validation in checker's @inttoptr handler.
+- **Fix:** Validate source `type_is_integer()` (unwrap distinct first).
+
+### BUG-108: `@ptrtoint` accepts non-pointer source
+- **Symptom:** `@ptrtoint(u32_var)` — integer source passes checker, GCC accepts, produces meaningless "address".
+- **Root cause:** No source type validation in checker's @ptrtoint handler.
+- **Fix:** Validate source is TYPE_POINTER or TYPE_FUNC_PTR (unwrap distinct first).
+
+### BUG-109: `@offset` accepts non-existent field
+- **Symptom:** `@offset(S, bogus)` passes checker. GCC rejects with "no member named 'bogus'".
+- **Root cause:** No field existence validation in checker's @offset handler.
+- **Fix:** Resolve struct type, iterate fields, error if field name not found.
+
+### BUG-110: `?[]DistinctType` emits anonymous struct for optional slice
+- **Symptom:** `?[]Score` (where Score is `distinct typedef u32`) emits anonymous struct wrapper instead of `_zer_opt_slice_u32`.
+- **Root cause:** `emit_type(TYPE_OPTIONAL)` TYPE_SLICE case extracts `elem = opt_inner->slice.inner` but doesn't unwrap TYPE_DISTINCT on elem before the switch.
+- **Fix:** Added `if (elem->kind == TYPE_DISTINCT) elem = elem->distinct.underlying;` before switch.
+
 ### BUG-104: `?DistinctType` emits anonymous struct instead of named typedef
 - **Symptom:** `?Vec2` (where Vec2 is `distinct typedef Point`) emits anonymous `struct { struct Point value; uint8_t has_value; }` instead of `_zer_opt_Point`. GCC type mismatch between function return and variable declaration.
 - **Root cause:** `emit_type(TYPE_OPTIONAL)` inner switch dispatches on `t->optional.inner->kind`. When inner is TYPE_DISTINCT, it falls to the anonymous struct default because TYPE_DISTINCT isn't in the switch.

@@ -127,8 +127,9 @@ static void emit_type(Emitter *e, Type *t) {
                  opt_inner->union_type.name);
             break;
         case TYPE_SLICE: {
-            /* ?[]T → _zer_opt_slice_T */
+            /* ?[]T → _zer_opt_slice_T — unwrap distinct on element type */
             Type *elem = opt_inner->slice.inner;
+            if (elem->kind == TYPE_DISTINCT) elem = elem->distinct.underlying;
             switch (elem->kind) {
             case TYPE_U8:    emit(e, "_zer_opt_slice_u8"); break;
             case TYPE_U16:   emit(e, "_zer_opt_slice_u16"); break;

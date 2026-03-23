@@ -2273,6 +2273,25 @@ int main(void) {
         10,
         "[]Distinct: slice of distinct u32 → 10");
 
+    printf("[BUG-110: ?[]DistinctType]\n");
+    test_compile_and_run(
+        "distinct typedef u32 Score;\n"
+        "?[]Score get(bool v) {\n"
+        "    if (v) {\n"
+        "        Score[2] a;\n"
+        "        a[0] = @cast(Score, 77);\n"
+        "        a[1] = @cast(Score, 88);\n"
+        "        return a[0..2];\n"
+        "    }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    []Score s = get(true) orelse return;\n"
+        "    return @cast(u32, s[0]);\n"
+        "}\n",
+        77,
+        "?[]Distinct: optional slice of distinct → 77");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

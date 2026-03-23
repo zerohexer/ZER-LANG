@@ -724,6 +724,22 @@ static void test_security_review(void) {
         "call non-function u32 → error");
     err("void main() { bool b = true; b(); }\n",
         "call non-function bool → error");
+
+    /* intrinsic argument validation */
+    printf("[BUG-106/107/108/109: intrinsic arg validation]\n");
+    err("u32 main() { *u32 p = @ptrcast(*u32, 42); return 0; }\n",
+        "@ptrcast non-pointer source → error");
+    err("struct S { u32 x; }\n"
+        "u32 main() { S s; *u32 p = @inttoptr(*u32, s); return 0; }\n",
+        "@inttoptr struct source → error");
+    err("usize main() { u32 x = 5; return @ptrtoint(x); }\n",
+        "@ptrtoint non-pointer → error");
+    err("struct S { u32 x; u32 y; }\n"
+        "usize main() { return @offset(S, bogus); }\n",
+        "@offset non-existent field → error");
+    ok("struct S { u32 x; u32 y; }\n"
+       "usize f() { return @offset(S, y); }\n",
+       "@offset valid field (OK)");
 }
 
 /* ================================================================

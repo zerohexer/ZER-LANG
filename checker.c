@@ -1278,11 +1278,63 @@ static Type *check_expr(Checker *c, Node *node) {
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
             result = ty_usize;
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
+            /* @offset(T, field) — validate field exists on struct T */
+            {
+                Type *struct_type = NULL;
+                const char *field_name = NULL;
+                uint32_t field_len = 0;
+                if (node->intrinsic.type_arg) {
+                    struct_type = resolve_type(c, node->intrinsic.type_arg);
+                    if (node->intrinsic.arg_count > 0 &&
+                        node->intrinsic.args[0]->kind == NODE_IDENT) {
+                        field_name = node->intrinsic.args[0]->ident.name;
+                        field_len = (uint32_t)node->intrinsic.args[0]->ident.name_len;
+                    }
+                } else if (node->intrinsic.arg_count >= 2 &&
+                           node->intrinsic.args[0]->kind == NODE_IDENT) {
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        node->intrinsic.args[0]->ident.name,
+                        (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                    if (sym) struct_type = sym->type;
+                    if (node->intrinsic.args[1]->kind == NODE_IDENT) {
+                        field_name = node->intrinsic.args[1]->ident.name;
+                        field_len = (uint32_t)node->intrinsic.args[1]->ident.name_len;
+                    }
+                }
+                if (struct_type && struct_type->kind == TYPE_STRUCT && field_name) {
+                    bool found = false;
+                    for (uint32_t fi = 0; fi < struct_type->struct_type.field_count; fi++) {
+                        if (struct_type->struct_type.fields[fi].name_len == field_len &&
+                            memcmp(struct_type->struct_type.fields[fi].name, field_name, field_len) == 0) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        checker_error(c, node->loc.line,
+                            "@offset: struct '%.*s' has no field '%.*s'",
+                            (int)struct_type->struct_type.name_len, struct_type->struct_type.name,
+                            (int)field_len, field_name);
+                    }
+                }
+            }
             result = ty_usize;
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
-            /* @ptrcast(*T, expr) → *T */
+            /* @ptrcast(*T, expr) → *T — source must be a pointer */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = typemap_get(node->intrinsic.args[0]);
+                    if (val_type) {
+                        Type *eff = val_type;
+                        if (eff->kind == TYPE_DISTINCT) eff = eff->distinct.underlying;
+                        if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
+                            checker_error(c, node->loc.line,
+                                "@ptrcast source must be a pointer, got '%s'",
+                                type_name(val_type));
+                        }
+                    }
+                }
             } else {
                 result = ty_void;
             }
@@ -1339,12 +1391,38 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
+            /* @inttoptr(*T, addr) — addr must be an integer */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = typemap_get(node->intrinsic.args[0]);
+                    if (val_type) {
+                        Type *eff = val_type;
+                        if (eff->kind == TYPE_DISTINCT) eff = eff->distinct.underlying;
+                        if (!type_is_integer(eff)) {
+                            checker_error(c, node->loc.line,
+                                "@inttoptr address must be an integer, got '%s'",
+                                type_name(val_type));
+                        }
+                    }
+                }
             } else {
                 result = ty_void;
             }
         } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
+            /* @ptrtoint(ptr) — source must be a pointer */
+            if (node->intrinsic.arg_count > 0) {
+                Type *val_type = typemap_get(node->intrinsic.args[0]);
+                if (val_type) {
+                    Type *eff = val_type;
+                    if (eff->kind == TYPE_DISTINCT) eff = eff->distinct.underlying;
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
+                        checker_error(c, node->loc.line,
+                            "@ptrtoint source must be a pointer, got '%s'",
+                            type_name(val_type));
+                    }
+                }
+            }
             result = ty_usize;
         } else if ((nlen == 7 && memcmp(name, "barrier", 7) == 0) ||
                    (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||

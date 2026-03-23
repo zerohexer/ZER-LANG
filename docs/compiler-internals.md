@@ -278,12 +278,23 @@ Enums emit as `#define` constants, not C enums:
 ### Naming Conventions in Emitted C
 - User types: as-is (`Task`, `State`, `Packet`)
 - Enum values: `_ZER_EnumName_variant` (e.g., `_ZER_State_idle`)
-- Optional typedefs: `_zer_opt_T` (e.g., `_zer_opt_u32`)
-- Struct optional typedefs: `_zer_opt_StructName`
+- Optional typedefs: `_zer_opt_T` (e.g., `_zer_opt_u32`, `_zer_opt_StructName`, `_zer_opt_UnionName`)
+- Slice typedefs: `_zer_slice_T` (all primitives + `_zer_slice_StructName`, `_zer_slice_UnionName`)
+- Optional slice typedefs: `_zer_opt_slice_T` (all primitives + struct/union names)
 - Temporaries: `_zer_tmp0`, `_zer_uw0` (unwrap), `_zer_or0` (orelse), `_zer_sat0` (saturate)
 - Pool helpers: `_zer_pool_alloc`, `_zer_pool_get`, `_zer_pool_free`
 - Ring helper: `_zer_ring_push`
 - Arena: `_zer_arena` (typedef), `_zer_arena_alloc` (runtime helper)
+
+### Function Pointer Handling
+- `?FuncPtr` uses null sentinel (same as `?*T`) — `IS_NULL_SENTINEL` macro
+- `emit_type_and_name` handles TYPE_FUNC_PTR, TYPE_OPTIONAL+FUNC_PTR, TYPE_DISTINCT+FUNC_PTR for name-inside-parens syntax
+- `typedef u32 (*Callback)(u32);` supported in both regular and distinct typedef paths
+- Checker unwraps TYPE_DISTINCT before TYPE_FUNC_PTR dispatch in NODE_CALL
+- Negative enum values: parser produces NODE_UNARY(MINUS, INT_LIT) — checker and emitter both handle this pattern
+
+### Keeping emit_file and emit_file_no_preamble in sync
+Both functions emit struct/union/enum declarations. Every typedef emitted in `emit_file` MUST also be emitted in `emit_file_no_preamble`. Current list per struct: `_zer_opt_`, `_zer_slice_`, `_zer_opt_slice_`. Per union: same three. Missing any causes GCC errors in multi-module projects.
 
 ### GCC Extensions Used
 - `__auto_type` — C equivalent of `auto` (type inference)

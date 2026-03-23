@@ -240,6 +240,30 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 
 **Adding new builtin methods:** Copy the Pool/Ring/Arena pattern. Need: checker NODE_CALL handler (return type), emitter interception (C codegen), and E2E test.
 
+### Critical Patterns That Cause Bugs — READ BEFORE MODIFYING
+
+These patterns caused 74 bugs across 6 audit rounds. A fresh session MUST know them:
+
+**1. `?void` has ONE field, everything else has TWO.**
+Every code path that emits optional null `{ 0, 0 }` MUST check `inner->kind == TYPE_VOID` and emit `{ 0 }` instead. There are 6+ paths: NODE_RETURN, assign null, var-decl null, expression orelse, var-decl orelse, global var. We fixed ALL of them. If you add a new path, check for `?void`.
+
+**2. Never check `TYPE_POINTER` alone for null-sentinel.**
+Always use `IS_NULL_SENTINEL(inner->kind)` which includes `TYPE_FUNC_PTR`. Function pointers are pointers — they use NULL as none. This macro exists in emitter.c line ~27.
+
+**3. `TYPE_DISTINCT` must be unwrapped before type dispatch.**
+The checker and emitter have paths that check `TYPE_FUNC_PTR`, `TYPE_STRUCT`, etc. If the type is wrapped in `TYPE_DISTINCT`, these checks fail silently. Always unwrap: `if (t->kind == TYPE_DISTINCT) t = t->distinct.underlying;`
+
+**4. Named typedefs for EVERY compound type.**
+Anonymous `struct { ... }` in C creates a new type at each use. Slices, optional slices, and optional types for structs/unions/enums ALL need named typedefs (`_zer_slice_T`, `_zer_opt_T`, `_zer_opt_slice_T`). If you add a new compound type, emit its typedef after declaration AND in `emit_file_no_preamble`.
+
+**5. Function pointer syntax — name goes INSIDE `(*)`.**
+`emit_type_and_name` handles this for TYPE_FUNC_PTR, TYPE_OPTIONAL wrapping func ptr, and TYPE_DISTINCT wrapping func ptr. If you add new optional/distinct combinations, check that `emit_type_and_name` handles the name placement.
+
+**6. `emit_file` AND `emit_file_no_preamble` must stay in sync.**
+Every typedef/declaration emitted in `emit_file` for structs/unions/enums MUST also be emitted in `emit_file_no_preamble` (used for imported modules). Missing typedefs in imported modules cause GCC errors.
+
+**7. UFCS is dropped.** Dead code commented out in checker.c. Do not implement or rely on `t.method()` syntax. Builtin methods (Pool/Ring/Arena) work via compiler intrinsics, NOT UFCS.
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

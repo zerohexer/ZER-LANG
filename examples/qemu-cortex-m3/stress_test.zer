@@ -98,10 +98,7 @@ u32 test_tagged_union() {
         .command => |cmd| { modified = cmd.code; }
         .ack => |a| { modified = 0; }
     }
-    // NOTE: mutable capture modifies the switch copy, not the original.
-    // This is a known limitation — switch copies the union value.
-    // modified will be 10 (original), not 99 (copy was modified).
-    check(modified == 10, "tagged union: mutable capture modifies copy, original=10");
+    check(modified == 99, "tagged union mutable capture: code changed to 99");
 
     return result + modified;
 }

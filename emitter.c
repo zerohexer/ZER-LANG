@@ -1638,9 +1638,16 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "{\n");
         e->indent++;
         emit_indent(e);
-        emit(e, "__auto_type _zer_sw%d = ", sw_tmp);
-        emit_expr(e, node->switch_stmt.expr);
-        emit(e, ";\n");
+        if (is_union_switch) {
+            /* union switch: take pointer to original so mutable capture works */
+            emit(e, "__auto_type _zer_swp%d = &(", sw_tmp);
+            emit_expr(e, node->switch_stmt.expr);
+            emit(e, ");\n");
+        } else {
+            emit(e, "__auto_type _zer_sw%d = ", sw_tmp);
+            emit_expr(e, node->switch_stmt.expr);
+            emit(e, ";\n");
+        }
 
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
@@ -1650,12 +1657,12 @@ static void emit_stmt(Emitter *e, Node *node) {
                 if (i > 0) emit(e, "else ");
                 emit(e, "/* default */ ");
             } else if (is_union_switch && arm->is_enum_dot) {
-                /* union switch: check _tag field */
+                /* union switch: check _tag field via pointer */
                 if (i > 0) emit(e, "else ");
                 emit(e, "if (");
                 for (int j = 0; j < arm->value_count; j++) {
                     if (j > 0) emit(e, " || ");
-                    emit(e, "_zer_sw%d._tag == _ZER_%.*s_TAG_%.*s",
+                    emit(e, "_zer_swp%d->_tag == _ZER_%.*s_TAG_%.*s",
                          sw_tmp,
                          (int)sw_type->union_type.name_len, sw_type->union_type.name,
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
@@ -1705,12 +1712,12 @@ static void emit_stmt(Emitter *e, Node *node) {
                     }
                     if (vtype) emit_type(e, vtype);
                     else emit(e, "void");
-                    emit(e, " *%.*s = &_zer_sw%d.%.*s;\n",
+                    emit(e, " *%.*s = &_zer_swp%d->%.*s;\n",
                          (int)arm->capture_name_len, arm->capture_name,
                          sw_tmp, (int)vlen, vname);
                 } else {
-                    /* immutable capture |v| — value copy */
-                    emit(e, "__auto_type %.*s = _zer_sw%d.%.*s;\n",
+                    /* immutable capture |v| — value copy from original */
+                    emit(e, "__auto_type %.*s = _zer_swp%d->%.*s;\n",
                          (int)arm->capture_name_len, arm->capture_name,
                          sw_tmp,
                          (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);

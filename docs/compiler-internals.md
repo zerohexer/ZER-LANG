@@ -293,8 +293,8 @@ Enums emit as `#define` constants, not C enums:
 - Checker unwraps TYPE_DISTINCT before TYPE_FUNC_PTR dispatch in NODE_CALL
 - Negative enum values: parser produces NODE_UNARY(MINUS, INT_LIT) — checker and emitter both handle this pattern
 
-### Known Limitation: Mutable Union Capture
-Switch on a union copies the value into `_zer_sw`. Mutable capture `|*v|` gets a pointer to the copy, not the original. Mutations don't persist. **v0.1.1 fix:** change `__auto_type _zer_sw = expr` to `__auto_type *_zer_sw = &expr` and adjust all variant reads to dereference through the pointer.
+### Union Switch Emission
+Union switch takes a POINTER to the original: `__auto_type *_zer_swp = &(expr)`. Tag checked via `_zer_swp->_tag`. Immutable capture copies: `__auto_type v = _zer_swp->variant`. Mutable capture takes pointer: `Type *v = &_zer_swp->variant`. This ensures `|*v|` modifications persist to the original union.
 
 ### Keeping emit_file and emit_file_no_preamble in sync
 Both functions emit struct/union/enum declarations. Every typedef emitted in `emit_file` MUST also be emitted in `emit_file_no_preamble`. Current list per struct: `_zer_opt_`, `_zer_slice_`, `_zer_opt_slice_`. Per union: same three. Missing any causes GCC errors in multi-module projects.
@@ -353,7 +353,7 @@ Path-sensitive handle tracking after type checker, before emitter:
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 74 bugs fixed)
+## Common Bug Patterns (from 77 bugs fixed)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)

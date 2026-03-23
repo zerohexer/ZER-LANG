@@ -311,6 +311,11 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-077: Mutable union capture `|*v|` modifies copy, not original
+- **Symptom:** `switch (msg) { .command => |*cmd| { cmd.code = 99; } }` — mutation doesn't persist because switch copies the union value.
+- **Root cause:** Union switch emitted `__auto_type _zer_sw = expr` (value copy). Mutable capture's pointer pointed to the copy.
+- **Fix:** Union switch now emits `__auto_type *_zer_swp = &(expr)` (pointer to original). Captures read/write through `_zer_swp->variant`.
+
 ### BUG-074: `TYPE_DISTINCT` not unwrapped for function call dispatch
 - **Symptom:** Calling through a distinct typedef function pointer: `SafeOp op = @cast(SafeOp, add); op(20, 22);` — checker returns `ty_void`, emitter emits wrong C variable declaration syntax.
 - **Root cause:** Checker's NODE_CALL handler and emitter's `emit_type_and_name` + call arg coercion only checked `TYPE_FUNC_PTR`, not `TYPE_DISTINCT` wrapping it.

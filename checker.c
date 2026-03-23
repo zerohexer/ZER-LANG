@@ -854,39 +854,11 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = effective_callee->func_ptr.ret;
         } else {
-            /* UFCS resolution: expr.method(args) → method(&expr, args)
-             * Look for a free function named 'method' where first param
-             * matches *typeof(expr). */
+            /* UFCS dropped from spec — dead code commented out for potential v0.2 revival
             if (node->call.callee->kind == NODE_FIELD) {
-                Node *fn = node->call.callee;
-                const char *mname = fn->field.field_name;
-                uint32_t mlen = (uint32_t)fn->field.field_name_len;
-                Type *obj_type = typemap_get(fn->field.object);
-
-                Symbol *func_sym = scope_lookup(c->current_scope, mname, mlen);
-                if (func_sym && func_sym->is_function &&
-                    func_sym->type->kind == TYPE_FUNC_PTR) {
-                    Type *ftype = func_sym->type;
-                    /* check first param is pointer to obj's type */
-                    if (ftype->func_ptr.param_count > 0) {
-                        Type *first_param = ftype->func_ptr.params[0];
-                        if (first_param->kind == TYPE_POINTER &&
-                            (type_equals(first_param->pointer.inner, obj_type) ||
-                             (obj_type && obj_type->kind == TYPE_POINTER &&
-                              type_equals(first_param, obj_type)))) {
-                            /* UFCS match — check remaining args */
-                            uint32_t expected = ftype->func_ptr.param_count - 1;
-                            if ((uint32_t)node->call.arg_count != expected) {
-                                checker_error(c, node->loc.line,
-                                    "expected %u arguments for UFCS call, got %d",
-                                    expected, node->call.arg_count);
-                            }
-                            result = ftype->func_ptr.ret;
-                            break;
-                        }
-                    }
-                }
+                ... UFCS resolution code removed ...
             }
+            */
             result = ty_void;
         }
         break;
@@ -962,9 +934,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             if (!result) {
-                /* not a field — might be UFCS (resolved at call site)
-                 * don't error here; let the call handler try UFCS.
-                 * if it's not a call, the void result will propagate. */
+                /* unresolved field — UFCS was dropped from spec.
+                 * Returns ty_void which will cause a type error downstream. */
                 result = ty_void;
             }
             break;
@@ -1068,7 +1039,7 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
-        /* fallback: unresolved field access (might be UFCS) */
+        /* fallback: unresolved field access — UFCS dropped from spec */
         result = ty_void;
         break;
     }

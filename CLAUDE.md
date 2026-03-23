@@ -211,6 +211,16 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Intrinsics (@size, @truncate, etc.) | Done | Done |
 | Defer | Done | Done |
 | ZER-CHECK (handle tracking) | Done | N/A (analysis pass) |
+| ?FuncPtr (optional function pointers) | Done | Done (null sentinel) |
+| Function pointer typedef | Done | Done |
+| Distinct typedef (including func ptrs) | Done | Done |
+| cinclude (C header inclusion) | Done | Done |
+| Enum explicit values (incl. negative) | Done | Done |
+| Named slice typedefs (all types) | Done | Done |
+| ?[]T optional slice typedefs | Done | Done |
+| Volatile emission | Done | Done |
+| Array→slice coercion (call/var/return) | Done | Done |
+| Mutable union capture |*v| | Done | Done (pointer to original) |
 
 ### Emitter Critical Patterns (causes of most bugs)
 

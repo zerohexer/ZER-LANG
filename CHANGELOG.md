@@ -23,8 +23,19 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 - Round 1: 12 bugs → Round 2: 9 → Round 3: 2 → Round 4: 2 → Round 5: 1
 - Compiler clean across all audited dimensions
 
+### Bug Fixes (Real-program testing — 3 bugs)
+- **BUG-075:** `?Handle(T)` fell to anonymous struct default. Handle is u32 — added `TYPE_HANDLE -> _zer_opt_u32`.
+- **BUG-076:** Union switch mutable capture `|*v|` emitted `__auto_type *v` which GCC rejects. Fixed: look up actual variant type for pointer declaration.
+- **BUG-077:** Union switch mutable capture `|*v|` modified a copy, not the original. Fixed: switch now takes pointer `__auto_type *_zer_swp = &(expr)` so mutations persist.
+
+### QEMU Demos (4 programs, exercising every feature)
+- **shell.zer** — Task scheduler with Pool+Handle, ?FuncPtr callbacks, exhaustive switch
+- **ringbuf_protocol.zer** — MODBUS-like parser with Ring, enum explicit values, ?FuncCode, CRC, error handling
+- **stress_test.zer** — 18 checks covering tagged union captures, arena+defer loop, packed struct+bit extract, nested if-unwrap, array→slice coercion, distinct typedef, defer+orelse return, 3-level field access, ?FuncPtr callback table, combined arena+union+defer
+- **rtos.zer** — Full cooperative RTOS: Pool tasks, Ring IPC, Arena scratch per tick, tagged union messages, ?FuncPtr entry points, volatile MMIO, 6804 bytes. **Compiled and ran correctly on first try.**
+
 ### Tests
-- **946 tests + 491 fuzz, all passing**
+- **950 tests + 491 fuzz, all passing**
 
 ## 2026-03-22 (continued — audit rounds 2-3)
 
@@ -107,13 +118,13 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 946 tests + 491 fuzz, all passing. ~10,000 lines. 71 bugs found and fixed.
+**Compiler:** 950 tests + 491 fuzz, all passing. ~10,000 lines. 77 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
-**Audit status:** 5 rounds completed, converged (12→9→2→2→1). 26 systematic negative tests covering all checker rejection paths.
+**Audit status:** 7 rounds completed, converged (12→9→2→2→1→2→CLEAN). 26 systematic negative tests. 4 QEMU real-program demos (last 2 found zero bugs).
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
 **Known limitations:**
-- ~~Mutable union capture~~ — **FIXED.** Switch now takes pointer to original. `|*v|` modifies in place.
+- ~~Mutable union capture~~ — **FIXED** (BUG-077). Switch takes pointer to original.
 - `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first.
 - No native backends (emit-C only).
-**Next:** v0.1.0 tag.
+**Next:** Tag v0.1.0 "HeartSafe". Run `make release` then `git tag v0.1.0 && git push origin v0.1.0`.

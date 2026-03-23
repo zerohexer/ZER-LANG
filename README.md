@@ -12,6 +12,7 @@ Requires GCC (MinGW on Windows, gcc on Linux/Mac):
 make           # build zerc compiler
 make zer-lsp   # build language server
 make check     # run all 950 tests + 491 fuzz
+make release   # build release binaries in release/
 ```
 
 ## Usage

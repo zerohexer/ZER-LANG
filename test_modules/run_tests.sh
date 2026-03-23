@@ -26,6 +26,7 @@ run_test main 37
 run_test app 17
 run_test diamond 44
 run_test use_types 50
+run_test use_defs 42
 
 # cleanup
 rm -f _*.c _*.exe

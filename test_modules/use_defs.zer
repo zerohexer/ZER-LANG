@@ -1,0 +1,6 @@
+import defs;
+
+u32 main() {
+    BinOp op = add;
+    return op(20, 22);
+}

@@ -594,6 +594,18 @@ int main(void) {
     test_nested_control_flow();
     test_full_programs();
 
+    /* BUG-084: switch arm with 17+ values must error, not overflow */
+    printf("[BUG-084: switch arm overflow]\n");
+    expect_fail(
+        "void f() {\n"
+        "    u32 x = 5;\n"
+        "    switch (x) {\n"
+        "        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 => { }\n"
+        "        default => { }\n"
+        "    }\n"
+        "}\n",
+        "17 switch arm values exceeds max 16");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

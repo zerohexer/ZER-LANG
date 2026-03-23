@@ -1,0 +1,3 @@
+typedef u32 (*BinOp)(u32, u32);
+
+u32 add(u32 a, u32 b) { return a + b; }

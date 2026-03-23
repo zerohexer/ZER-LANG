@@ -740,6 +740,27 @@ static void test_security_review(void) {
     ok("struct S { u32 x; u32 y; }\n"
        "usize f() { return @offset(S, y); }\n",
        "@offset valid field (OK)");
+
+    /* BUG-092: builtin arg count validation */
+    printf("[BUG-092: builtin wrong arg counts]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) p;\n"
+        "void f() { p.alloc(42); }\n",
+        "pool.alloc(42) — too many args");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) p;\n"
+        "void f() { p.get(); }\n",
+        "pool.get() — missing arg");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) p;\n"
+        "void f() { p.free(); }\n",
+        "pool.free() — missing arg");
+    err("Ring(u8, 16) r;\n"
+        "void f() { r.push(); }\n",
+        "ring.push() — missing arg");
+    err("Ring(u8, 16) r;\n"
+        "void f() { r.pop(42); }\n",
+        "ring.pop(42) — too many args");
 }
 
 /* ================================================================

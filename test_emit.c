@@ -2292,6 +2292,29 @@ int main(void) {
         77,
         "?[]Distinct: optional slice of distinct → 77");
 
+    /* BUG-085: non-u8/u32 slice expression */
+    printf("\n[BUG-085: u16 slice expression]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u16[4] arr;\n"
+        "    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;\n"
+        "    []u16 s = arr[0..4];\n"
+        "    return @truncate(u32, s[2]);\n"
+        "}\n",
+        30,
+        "u16 slice expression with named typedef → 30");
+
+    printf("[BUG-085: i32 slice expression]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    i32[3] arr;\n"
+        "    arr[0] = 10; arr[1] = 20; arr[2] = 30;\n"
+        "    []i32 s = arr[0..3];\n"
+        "    return @bitcast(u32, s[1]);\n"
+        "}\n",
+        20,
+        "i32 slice expression with named typedef → 20");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

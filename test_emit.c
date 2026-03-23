@@ -2102,6 +2102,17 @@ int main(void) {
         42,
         "typedef func ptr as param: MathOp run(add, 20,22) = 42");
 
+    /* distinct typedef function pointer — checker unwraps distinct for call */
+    test_compile_and_run(
+        "distinct typedef u32 (*SafeOp)(u32, u32);\n"
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 main() {\n"
+        "    SafeOp op = @cast(SafeOp, add);\n"
+        "    return op(20, 22);\n"
+        "}\n",
+        42,
+        "distinct typedef func ptr: SafeOp @cast + call = 42");
+
     /* Global ?FuncPtr init null */
     test_compile_and_run(
         "?u32 (*g_transform)(u32) = null;\n"

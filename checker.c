@@ -795,17 +795,21 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* normal function call */
         Type *callee_type = check_expr(c, node->call.callee);
+        /* unwrap distinct typedef for call dispatch */
+        Type *effective_callee = callee_type;
+        if (effective_callee->kind == TYPE_DISTINCT)
+            effective_callee = effective_callee->distinct.underlying;
 
-        if (callee_type->kind == TYPE_FUNC_PTR) {
+        if (effective_callee->kind == TYPE_FUNC_PTR) {
             /* verify arg count */
-            if ((uint32_t)node->call.arg_count != callee_type->func_ptr.param_count) {
+            if ((uint32_t)node->call.arg_count != effective_callee->func_ptr.param_count) {
                 checker_error(c, node->loc.line,
                     "expected %u arguments, got %d",
-                    callee_type->func_ptr.param_count, node->call.arg_count);
+                    effective_callee->func_ptr.param_count, node->call.arg_count);
             } else {
                 /* verify each arg type */
-                for (uint32_t i = 0; i < callee_type->func_ptr.param_count; i++) {
-                    Type *param = callee_type->func_ptr.params[i];
+                for (uint32_t i = 0; i < effective_callee->func_ptr.param_count; i++) {
+                    Type *param = effective_callee->func_ptr.params[i];
                     Type *arg = arg_types[i];
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&
@@ -848,7 +852,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
             }
-            result = callee_type->func_ptr.ret;
+            result = effective_callee->func_ptr.ret;
         } else {
             /* UFCS resolution: expr.method(args) → method(&expr, args)
              * Look for a free function named 'method' where first param

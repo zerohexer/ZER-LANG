@@ -252,6 +252,19 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* distinct function pointer: unwrap distinct to get func ptr for name placement */
+    if (t->kind == TYPE_DISTINCT && t->distinct.underlying->kind == TYPE_FUNC_PTR) {
+        Type *fp = t->distinct.underlying;
+        emit_type(e, fp->func_ptr.ret);
+        emit(e, " (*%.*s)(", (int)name_len, name);
+        for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, fp->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+
     /* optional function pointer: ?ret (*name)(params) → ret (*name)(params) (null sentinel) */
     if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_FUNC_PTR) {
         Type *fp = t->optional.inner;
@@ -643,17 +656,21 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *callee_type = checker_get_type(node->call.callee);
             for (int i = 0; i < node->call.arg_count; i++) {
                 if (i > 0) emit(e, ", ");
+                /* unwrap distinct for callee type */
+                Type *eff_callee = callee_type;
+                if (eff_callee && eff_callee->kind == TYPE_DISTINCT)
+                    eff_callee = eff_callee->distinct.underlying;
                 /* slice→pointer decay: emit .ptr when passing []T to *T */
                 Type *arg_type = checker_get_type(node->call.args[i]);
                 bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
-                    callee_type && callee_type->kind == TYPE_FUNC_PTR &&
-                    (uint32_t)i < callee_type->func_ptr.param_count &&
-                    callee_type->func_ptr.params[i]->kind == TYPE_POINTER;
+                    eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
+                    (uint32_t)i < eff_callee->func_ptr.param_count &&
+                    eff_callee->func_ptr.params[i]->kind == TYPE_POINTER;
                 /* array→slice coercion: wrap T[N] in slice compound literal */
                 bool need_arr_coerce = arg_type && arg_type->kind == TYPE_ARRAY &&
-                    callee_type && callee_type->kind == TYPE_FUNC_PTR &&
-                    (uint32_t)i < callee_type->func_ptr.param_count &&
-                    callee_type->func_ptr.params[i]->kind == TYPE_SLICE;
+                    eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
+                    (uint32_t)i < eff_callee->func_ptr.param_count &&
+                    eff_callee->func_ptr.params[i]->kind == TYPE_SLICE;
                 if (need_arr_coerce) {
                     emit_array_as_slice(e, node->call.args[i], arg_type,
                                         callee_type->func_ptr.params[i]);

@@ -1001,6 +1001,9 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* unwrap distinct for all field access below (struct, enum, union, pointer deref) */
+        obj = type_unwrap_distinct(obj);
+
         /* struct field lookup */
         if (obj->kind == TYPE_STRUCT) {
             for (uint32_t i = 0; i < obj->struct_type.field_count; i++) {
@@ -1033,8 +1036,9 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* pointer auto-deref for field access: ptr.field = (*ptr).field */
-        if (obj->kind == TYPE_POINTER && obj->pointer.inner->kind == TYPE_STRUCT) {
-            Type *inner = obj->pointer.inner;
+        if (obj->kind == TYPE_POINTER &&
+            type_unwrap_distinct(obj->pointer.inner)->kind == TYPE_STRUCT) {
+            Type *inner = type_unwrap_distinct(obj->pointer.inner);
             for (uint32_t i = 0; i < inner->struct_type.field_count; i++) {
                 SField *f = &inner->struct_type.fields[i];
                 if (f->name_len == flen && memcmp(f->name, fname, flen) == 0) {
@@ -1052,7 +1056,8 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* pointer auto-deref for union: ptr.variant = (*ptr).variant */
-        if (obj->kind == TYPE_POINTER && obj->pointer.inner->kind == TYPE_UNION) {
+        if (obj->kind == TYPE_POINTER &&
+            type_unwrap_distinct(obj->pointer.inner)->kind == TYPE_UNION) {
             /* union switch lock applies to pointer auto-deref too */
             if (c->in_assign_target && c->union_switch_var &&
                 node->field.object->kind == NODE_IDENT &&
@@ -1066,7 +1071,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
                 break;
             }
-            Type *inner = obj->pointer.inner;
+            Type *inner = type_unwrap_distinct(obj->pointer.inner);
             for (uint32_t i = 0; i < inner->union_type.variant_count; i++) {
                 SUVariant *v = &inner->union_type.variants[i];
                 if (v->name_len == flen && memcmp(v->name, fname, flen) == 0) {

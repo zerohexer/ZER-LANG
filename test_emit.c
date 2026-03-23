@@ -2331,6 +2331,20 @@ int main(void) {
         60,
         "distinct func ptr + array-to-slice: sum [10,20,30] = 60");
 
+    /* BUG-111/112: distinct struct field access + auto-zero */
+    printf("[BUG-111: distinct struct field access + pointer deref]\n");
+    test_compile_and_run(
+        "struct Task { u32 id; }\n"
+        "distinct typedef Task Job;\n"
+        "Job global_job;\n"
+        "?*Job find_job() { global_job.id = 42; return &global_job; }\n"
+        "u32 main() {\n"
+        "    if (find_job()) |j| { return j.id; }\n"
+        "    return 0;\n"
+        "}\n",
+        42,
+        "distinct struct: field access + ptr deref + global auto-zero → 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

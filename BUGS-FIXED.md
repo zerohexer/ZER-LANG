@@ -73,6 +73,17 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-111: Field access on distinct struct types fails — checker doesn't unwrap distinct
+- **Symptom:** `Job j; j.id` where `Job` is `distinct typedef Task` — "cannot access field 'id' on type 'Job'". Both direct access and pointer auto-deref (`*Job` → field) affected.
+- **Root cause:** Checker NODE_FIELD handler dispatches on `obj->kind` for struct/enum/union/pointer without unwrapping TYPE_DISTINCT first. Distinct structs fall through to "cannot access field" error.
+- **Fix:** Added `obj = type_unwrap_distinct(obj)` before the struct/enum/union/pointer dispatch. Pointer auto-deref inner types also unwrapped with `type_unwrap_distinct(obj->pointer.inner)`.
+- **Test:** `test_emit.c` — distinct struct field access + pointer deref + global auto-zero.
+
+### BUG-112: Global/local auto-zero for distinct compound types emits `= 0` instead of `= {0}`
+- **Symptom:** `Job global_job;` (distinct struct) emits `struct Task global_job = 0;` — GCC error "invalid initializer". Same for local distinct arrays/slices/optionals.
+- **Root cause:** Auto-zero paths check `type->kind == TYPE_STRUCT || TYPE_ARRAY || ...` without unwrapping TYPE_DISTINCT. Distinct wrapping a struct gets `= 0` (scalar) instead of `= {0}` (compound).
+- **Fix:** Added `type_unwrap_distinct()` before the compound-type check in both global and local auto-zero paths.
+
 ### BUG-106: `@ptrcast` accepts non-pointer source
 - **Symptom:** `@ptrcast(*u32, 42)` — integer source passes checker, emits cast that GCC silently accepts. Creates pointer from integer with no diagnostic.
 - **Root cause:** No source type validation in checker's @ptrcast handler.

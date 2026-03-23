@@ -513,6 +513,16 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Union switch emitted `__auto_type _zer_sw = expr` (value copy). Mutable capture's pointer pointed to the copy.
 - **Fix:** Union switch now emits `__auto_type *_zer_swp = &(expr)` (pointer to original). Captures read/write through `_zer_swp->variant`.
 
+### BUG-076: Union switch mutable capture `|*v|` emitted `__auto_type *v` — GCC rejects
+- **Symptom:** `switch (m) { .sensor => |*v| { v.temp = 99; } }` — GCC error: `__auto_type *v` is not valid in this context.
+- **Root cause:** Mutable capture emitted `__auto_type *v = &union.field` — GCC rejects `__auto_type` with pointer declarator in some contexts.
+- **Fix:** Look up actual variant type from union definition, emit `SensorReading *v = &_zer_swp->sensor` instead.
+
+### BUG-075: `?Handle(T)` optional emits anonymous struct — GCC type mismatch
+- **Symptom:** `?Handle(Task) h = pool.alloc() orelse return;` — `?Handle(T)` emits anonymous struct instead of named `_zer_opt_u32`. GCC type mismatch between function return and variable.
+- **Root cause:** `emit_type(TYPE_OPTIONAL)` inner switch had no `case TYPE_HANDLE:`. Handle is u32 internally, fell to anonymous struct default.
+- **Fix:** Added `case TYPE_HANDLE: emit("_zer_opt_u32");`.
+
 ### BUG-074: `TYPE_DISTINCT` not unwrapped for function call dispatch
 - **Symptom:** Calling through a distinct typedef function pointer: `SafeOp op = @cast(SafeOp, add); op(20, 22);` — checker returns `ty_void`, emitter emits wrong C variable declaration syntax.
 - **Root cause:** Checker's NODE_CALL handler and emitter's `emit_type_and_name` + call arg coercion only checked `TYPE_FUNC_PTR`, not `TYPE_DISTINCT` wrapping it.

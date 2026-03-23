@@ -2007,17 +2007,16 @@ int main(void) {
         21,
         "[]Struct across functions: sum_pts([]Pt) = 1+2+3+4+5+6 = 21");
 
-    /* BUG-055: @cast between distinct typedefs */
+    /* BUG-055: @cast wrap/unwrap distinct typedef */
     test_compile_and_run(
         "distinct typedef u32 Celsius;\n"
-        "distinct typedef u32 Fahrenheit;\n"
         "u32 main() {\n"
-        "    Celsius c = 100;\n"
-        "    Fahrenheit f = @cast(Fahrenheit, c);\n"
-        "    return @truncate(u32, f);\n"
+        "    Celsius c = @cast(Celsius, 100);\n"
+        "    u32 raw = @cast(u32, c);\n"
+        "    return raw;\n"
         "}\n",
         100,
-        "@cast(Fahrenheit, celsius): distinct typedef conversion = 100");
+        "@cast wrap u32→Celsius then unwrap Celsius→u32 = 100");
 
     /* ?FuncPtr — optional function pointer with null sentinel */
     test_compile_and_run(
@@ -2134,6 +2133,60 @@ int main(void) {
         "}\n",
         42,
         "global ?FuncPtr = triple, unwrap and call, 14*3 = 42");
+
+    /* ---- BUG-078/079: Inline bounds checks ---- */
+    printf("\n[BUG-078: bounds check in if condition]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;\n"
+        "    u32 i = 2;\n"
+        "    if (arr[i] == 30) { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        1,
+        "bounds check in if condition — valid access i=2");
+
+    printf("[BUG-079: short-circuit && respects bounds]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 10;\n"
+        "    u32 i = 10;\n"
+        "    bool result = (i < 4) && (arr[i] == 42);\n"
+        "    if (result) { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "short-circuit && — i=10, left false, no trap on right");
+
+    printf("[BUG-078: bounds check in while condition]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 99;\n"
+        "    u32 i = 0;\n"
+        "    while (arr[i] < 50) {\n"
+        "        i += 1;\n"
+        "    }\n"
+        "    return i;\n"
+        "}\n",
+        3,
+        "bounds check in while — stops at arr[3]=99, i=3");
+
+    printf("[BUG-078: bounds check in for condition]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 5; arr[1] = 10; arr[2] = 15; arr[3] = 20;\n"
+        "    u32 sum = 0;\n"
+        "    for (u32 i = 0; i < 4; i += 1) {\n"
+        "        sum += arr[i];\n"
+        "    }\n"
+        "    return sum;\n"
+        "}\n",
+        50,
+        "bounds check in for loop body — sum 5+10+15+20=50");
 
     /* cleanup temp files */
     remove("_zer_test_out.c");

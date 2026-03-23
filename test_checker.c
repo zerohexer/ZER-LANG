@@ -397,15 +397,15 @@ static void test_exhaustive_switch(void) {
 }
 
 static void test_ufcs(void) {
-    printf("[UFCS]\n");
-    expect_ok(
+    printf("[UFCS — dropped from spec, must error]\n");
+    expect_error(
         "struct Task { u32 pid; }\n"
         "void run(*Task t) { }\n"
         "void f() {\n"
         "    Task task;\n"
         "    task.run();\n"
         "}\n",
-        "UFCS: task.run() → run(&task)");
+        "UFCS dropped: task.run() on struct without 'run' field → error");
 }
 
 /* ---- Audit tests: safety gaps and edge cases ---- */

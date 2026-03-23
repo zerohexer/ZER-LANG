@@ -155,6 +155,7 @@ struct Symbol {
     bool is_keep;           /* keep parameter — can be stored */
     bool is_const;          /* const qualifier */
     bool is_static;         /* static storage duration */
+    bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
 
     /* for functions */
     bool is_function;

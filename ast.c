@@ -104,6 +104,7 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_INTRINSIC:    return "INTRINSIC";
     case NODE_CAST:         return "CAST";
     case NODE_SIZEOF:       return "SIZEOF";
+    case NODE_CINCLUDE:     return "CINCLUDE";
     }
     return "UNKNOWN";
 }
@@ -238,6 +239,11 @@ void ast_print(Node *node, int depth) {
     case NODE_IMPORT:
         printf("Import '%.*s'\n",
                (int)node->import.module_name_len, node->import.module_name);
+        break;
+
+    case NODE_CINCLUDE:
+        printf("CInclude '%.*s'\n",
+               (int)node->cinclude.path_len, node->cinclude.path);
         break;
 
     case NODE_INTERRUPT:

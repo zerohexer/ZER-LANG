@@ -49,7 +49,12 @@ static char *read_file(const char *path) {
     rewind(f);
     char *buf = (char *)malloc(size + 1);
     if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, size, f);
+    size_t bytes_read = fread(buf, 1, size, f);
+    if (bytes_read != (size_t)size) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
     buf[size] = '\0';
     fclose(f);
     return buf;

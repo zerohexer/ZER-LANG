@@ -925,6 +925,10 @@ static Node *parse_switch_stmt(Parser *p) {
             Node *values[16];
             int val_count = 0;
             do {
+                if (val_count >= 16) {
+                    error(p, "too many values in switch arm (max 16)");
+                    break;
+                }
                 if (match(p, TOK_DOT)) {
                     arm->is_enum_dot = true;
                     consume(p, TOK_IDENT, "expected variant name after '.'");

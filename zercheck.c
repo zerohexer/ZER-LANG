@@ -151,6 +151,16 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
                 }
                 h->state = HS_FREED;
                 h->free_line = node->loc.line;
+                /* propagate freed state to all aliases (same pool + same alloc line) */
+                for (int i = 0; i < ps->handle_count; i++) {
+                    if (&ps->handles[i] != h &&
+                        ps->handles[i].pool_id == h->pool_id &&
+                        ps->handles[i].alloc_line == h->alloc_line &&
+                        ps->handles[i].state == HS_ALIVE) {
+                        ps->handles[i].state = HS_FREED;
+                        ps->handles[i].free_line = node->loc.line;
+                    }
+                }
             }
         }
     }
@@ -212,6 +222,24 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             }
         }
     }
+
+    /* Handle aliasing: Handle(T) alias = existing_handle;
+     * If init is a simple identifier that matches a tracked handle,
+     * register the new variable with the same state and pool. */
+    if (init->kind == NODE_IDENT) {
+        HandleInfo *src = find_handle(ps, init->ident.name,
+            (uint32_t)init->ident.name_len);
+        if (src) {
+            HandleInfo *dst = find_handle(ps, vname, vlen);
+            if (!dst) dst = add_handle(ps, vname, vlen);
+            if (dst) {
+                dst->state = src->state;
+                dst->pool_id = src->pool_id;
+                dst->alloc_line = src->alloc_line;
+                dst->free_line = src->free_line;
+            }
+        }
+    }
 }
 
 static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
@@ -226,6 +254,24 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_ASSIGN:
         zc_check_expr(zc, ps, node->assign.target);
         zc_check_expr(zc, ps, node->assign.value);
+        /* Handle aliasing via assignment: alias = tracked_handle */
+        if (node->assign.target->kind == NODE_IDENT &&
+            node->assign.value->kind == NODE_IDENT) {
+            HandleInfo *src = find_handle(ps, node->assign.value->ident.name,
+                (uint32_t)node->assign.value->ident.name_len);
+            if (src) {
+                const char *tname = node->assign.target->ident.name;
+                uint32_t tlen = (uint32_t)node->assign.target->ident.name_len;
+                HandleInfo *dst = find_handle(ps, tname, tlen);
+                if (!dst) dst = add_handle(ps, tname, tlen);
+                if (dst) {
+                    dst->state = src->state;
+                    dst->pool_id = src->pool_id;
+                    dst->alloc_line = src->alloc_line;
+                    dst->free_line = src->free_line;
+                }
+            }
+        }
         break;
     case NODE_BINARY:
         zc_check_expr(zc, ps, node->binary.left);

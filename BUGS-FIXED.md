@@ -5,6 +5,118 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Round 9 — Agent-Driven Audit (2026-03-23)
+
+Three parallel audit agents (checker, emitter, interaction edge cases) plus code quality review. Found 12 bugs across parser, checker, emitter, AST, and main.
+
+### BUG-084: Parser stack buffer overflow in switch arm values
+- **Symptom:** Switch arm with 17+ comma-separated values overflows `Node *values[16]` stack buffer. Stack corruption, potential crash.
+- **Root cause:** `parser.c:925` — fixed-size array `values[16]` with no bounds check before `values[val_count++]`.
+- **Fix:** Added `if (val_count >= 16) { error(p, "too many values in switch arm (max 16)"); break; }`.
+- **Test:** 18 switch values → clean error, no crash.
+
+### BUG-085: Slice expression uses anonymous struct for most primitive types
+- **Symptom:** `u16[8] arr; []u16 s = arr[0..4];` — GCC error: anonymous `struct { uint16_t* ptr; size_t len; }` incompatible with named `_zer_slice_u16`. Only u8 and u32 used named typedefs.
+- **Root cause:** `emitter.c` NODE_SLICE emission had `if (is_u8_slice)` and `else if (is_u32_slice)` with named typedefs, all others fell to anonymous struct.
+- **Fix:** Switch on elem_type->kind for ALL primitives (u8-u64, i8-i64, usize, f32, f64, bool) mapping to named `_zer_slice_T`.
+- **Test:** `[]u16`, `[]i32` slicing works end-to-end.
+
+### BUG-086: `emit_file_no_preamble` missing NODE_TYPEDEF handler
+- **Symptom:** Typedefs (including function pointer typedefs) in imported modules silently dropped. GCC error: undeclared typedef name.
+- **Root cause:** `emit_file_no_preamble` switch had no `case NODE_TYPEDEF:` — fell to `default: break;`.
+- **Fix:** Added NODE_TYPEDEF case mirroring `emit_file`'s handler.
+
+### BUG-087: `emit_file_no_preamble` missing NODE_INTERRUPT handler
+- **Symptom:** Interrupt handlers in imported modules silently dropped. Missing `__attribute__((interrupt))` function in emitted C.
+- **Root cause:** Same as BUG-086 — no `case NODE_INTERRUPT:` in `emit_file_no_preamble`.
+- **Fix:** Added NODE_INTERRUPT case mirroring `emit_file`'s handler.
+
+### BUG-088: `?DistinctFuncPtr` not treated as null sentinel
+- **Symptom:** `?Handler` (where Handler is `distinct typedef u32 (*)(u32)`) emitted as anonymous struct wrapper `{ value, has_value }` instead of null-sentinel pointer. GCC error on name placement.
+- **Root cause:** `IS_NULL_SENTINEL` macro only checks `TYPE_POINTER || TYPE_FUNC_PTR`, doesn't unwrap `TYPE_DISTINCT`. Also `emit_type_and_name` had no case for `TYPE_OPTIONAL + TYPE_DISTINCT(TYPE_FUNC_PTR)`.
+- **Fix:** Added `is_null_sentinel()` function that unwraps TYPE_DISTINCT before checking. Replaced all `IS_NULL_SENTINEL(t->optional.inner->kind)` with `is_null_sentinel(t->optional.inner)`. Added `?Distinct(FuncPtr)` case to `emit_type_and_name` for correct name-inside-parens.
+- **Test:** `?Op maybe` emits `uint32_t (*maybe)(uint32_t)` — compiles and runs.
+
+### BUG-089: Array-to-slice coercion uses wrong type for TYPE_DISTINCT callees
+- **Symptom:** Calling a distinct function pointer with array argument that needs slice coercion accesses `callee_type->func_ptr.params[i]` on a TYPE_DISTINCT node — undefined behavior (wrong union member).
+- **Root cause:** `emitter.c:679` used `callee_type` instead of `eff_callee` (the unwrapped version).
+- **Fix:** Changed to `eff_callee->func_ptr.params[i]`.
+
+### BUG-090: Missing error for unknown struct field access
+- **Symptom:** `p.nonexistent` on a struct silently returns `ty_void` with no error. Confusing downstream type errors.
+- **Root cause:** `checker.c:977-981` — after struct field loop finds no match, returns `ty_void` without `checker_error()`. Comment says "UFCS fallback" but UFCS was dropped.
+- **Fix:** Added `checker_error("struct 'X' has no field 'Y'")`. Updated UFCS tests to expect error (UFCS was dropped from spec).
+
+### BUG-091: `@cast` validation issues — can't unwrap, cross-distinct allowed
+- **Symptom:** Two bugs: (1) `@cast(u32, celsius_val)` fails — "target must be distinct typedef" even though unwrapping is valid. (2) `@cast(Fahrenheit, celsius_val)` succeeds — cross-distinct cast allowed even though types are unrelated.
+- **Root cause:** Line 1310 required target to be TYPE_DISTINCT (blocks unwrapping). Line 1316-1322 only validated when BOTH are distinct with different underlying types, missing the cross-distinct same-underlying case.
+- **Fix:** Rewrote validation: (1) allow if target is distinct and source matches underlying (wrap). (2) allow if source is distinct and target matches underlying (unwrap). (3) reject cross-distinct unless one directly wraps the other.
+- **Test:** wrap u32→Celsius works, unwrap Celsius→u32 works, Celsius→Fahrenheit errors.
+
+### BUG-092: No argument count validation for Pool/Ring/Arena builtin methods
+- **Symptom:** `pool.alloc(42)`, `pool.free()`, `ring.push()` — wrong arg counts pass checker, produce broken C.
+- **Root cause:** Builtin method handlers set return type without checking `node->call.arg_count`.
+- **Fix:** Added arg count checks for all 10 builtin methods: pool.alloc(0), pool.get(1), pool.free(1), ring.push(1), ring.push_checked(1), ring.pop(0), arena.over(1), arena.alloc(1), arena.alloc_slice(2), arena.reset(0), arena.unsafe_reset(0).
+
+### BUG-093: Fallback to void with no error on field access of non-struct types
+- **Symptom:** `u32 y = x.something` — field access on integer silently returns `ty_void` with no error.
+- **Root cause:** `checker.c:1095-1096` — fallback `result = ty_void; break;` with no `checker_error()`.
+- **Fix:** Added `checker_error("cannot access field 'Y' on type 'T'")`.
+
+### BUG-094: NODE_CINCLUDE missing from AST debug functions
+- **Symptom:** `node_kind_name(NODE_CINCLUDE)` returns "UNKNOWN" in diagnostics/debugging.
+- **Root cause:** `ast.c` `node_kind_name()` and `ast_print()` had no case for NODE_CINCLUDE.
+- **Fix:** Added `case NODE_CINCLUDE: return "CINCLUDE";` and corresponding ast_print handler.
+
+### BUG-095: Unchecked fread return value in zerc_main.c
+- **Symptom:** If file read fails or is short, compiler processes garbage/partial input silently.
+- **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
+- **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
+
+---
+
+## Round 8 — External Security Review (2026-03-23)
+
+Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bugs in bounds checking, scope escape, union safety, handle tracking, and arena lifetimes.
+
+### BUG-078: Bounds checks missing in if/while/for conditions
+- **Symptom:** `if (arr[10] == 42)` on `u32[4]` — no bounds check, reads garbage memory. `while (arr[i] < 50)` loops past array end unchecked.
+- **Root cause:** `emit_bounds_checks()` was a statement-level hoisting function called only from NODE_VAR_DECL, NODE_RETURN, and NODE_EXPR_STMT. NODE_IF, NODE_WHILE, and NODE_FOR never called it, so conditions had zero bounds checking.
+- **Fix:** Replaced statement-level hoisting with inline bounds checks in `emit_expr(NODE_INDEX)` using the comma operator: `(_zer_bounds_check(idx, len, ...), arr)[idx]`. Comma operator preserves lvalue semantics (assignments still work). Inline checks naturally work everywhere expressions appear — conditions, loops, var-decl, return, arguments.
+- **Test:** All 141 E2E tests pass. Verified: `if (arr[10]==42)` traps, `while (arr[i]<50)` traps at OOB.
+
+### BUG-079: Bounds check hoisting breaks short-circuit evaluation (`&&`/`||`)
+- **Symptom:** `bool x = (i < 4) && (arr[i] == 42)` with `i=10` — hoisted bounds check runs unconditionally before the statement, trapping even though `i < 4` is false and `arr[i]` would never execute.
+- **Root cause:** `emit_bounds_checks()` recursed into both sides of `&&`/`||` (`NODE_BINARY`) and emitted all checks before the statement, ignoring C's short-circuit evaluation.
+- **Fix:** Same as BUG-078 — inline bounds checks in `emit_expr(NODE_INDEX)`. The bounds check for `arr[i]` is now inside the right operand of `&&`, so C's short-circuit naturally skips it when the left side is false.
+- **Test:** `(i < 4) && (arr[i] == 42)` with i=10 exits 0 (no trap). Verified correct.
+
+### BUG-080: Scope escape via struct field — `global.ptr = &local` not caught
+- **Symptom:** `global_holder.ptr = &local` compiles without error. Dangling pointer created silently.
+- **Root cause:** Scope escape check at checker.c:609 required `node->assign.target->kind == NODE_IDENT`. Struct field targets (`NODE_FIELD`) and array index targets (`NODE_INDEX`) bypassed the check entirely. Also only checked `is_static` targets, not global-scoped variables.
+- **Fix:** Walk the assignment target chain (NODE_FIELD/NODE_INDEX) to find the root identifier. Check if root is static OR global (via `scope_lookup_local(global_scope)`). Catches `global.ptr = &local`, `arr[0] = &local`, and nested chains.
+- **Test:** `test_checker_full.c` — `global.ptr = &local` error, `global.ptr = &global_val` allowed.
+
+### BUG-081: Union type confusion — variant mutation during mutable switch capture
+- **Symptom:** Inside a `switch (d) { .integer => |*ptr| { d.other = 999; *ptr = 42; } }`, the compiler allows `d.other = 999` which changes the active variant while `ptr` still points to the old variant's memory. Silent type confusion / memory corruption.
+- **Root cause:** The `in_assign_target` flag allowed union variant assignment anywhere (checker.c:1018). No tracking of whether a switch arm was currently holding a mutable capture pointer to the same union.
+- **Fix:** Added `union_switch_var` / `union_switch_var_len` fields to `Checker` struct. Set when entering a union switch arm with capture. In the union field assignment check, if the field object matches the currently-switched-on variable, emit error. Per-variable (mutating a different union is allowed). Saved/restored for nesting.
+- **Test:** `test_checker_full.c` — same-union mutation error, different-union mutation allowed, non-capture arm allowed.
+
+### BUG-082: ZER-CHECK aliasing blindspot — handle copies not tracked
+- **Symptom:** `Handle(T) alias = h1; pool.free(h1); pool.get(alias).x = 5;` — ZER-CHECK produces zero warnings. Static analyzer only tracks handles by variable name string, has no concept of aliasing.
+- **Root cause:** `find_handle()` in zercheck.c does pure string matching. When `alias = h1`, no entry is created for `alias`. Only `pool.alloc()` registers new handles.
+- **Fix:** 1) In `zc_check_var_init`, when init is a simple identifier matching a tracked handle, register the new variable with the same state/pool/alloc_line. 2) In `zc_check_expr(NODE_ASSIGN)`, same for assignment aliasing. 3) When `pool.free(h)` is called, propagate HS_FREED to all handles with the same pool_id + alloc_line (aliases of the same allocation). Independent handles from the same pool are unaffected.
+- **Test:** `test_zercheck.c` — alias use-after-free caught, assignment alias caught, valid alias use allowed, independent handles no false positive.
+
+### BUG-083: Arena pointer lifetime escape — arena-derived pointers stored in globals
+- **Symptom:** `*Data d = arena.alloc(Data) orelse return; global_holder.ptr = d;` compiles cleanly. When the function returns, `d` points to dead stack memory (the arena's buffer). Silent dangling pointer with no compile-time or runtime protection.
+- **Root cause:** `arena.alloc(T)` returns bare `?*T` with no lifetime metadata. The type system does not track that the pointer originated from an arena.
+- **Fix:** Added `is_arena_derived` flag to `Symbol` struct. In the checker's var-decl handler, detect `arena.alloc(T)` / `arena.alloc(T) orelse ...` patterns and mark the resulting variable. In the assignment handler, if an arena-derived variable is being stored in a global/static target (walking field/index chain to root), emit error.
+- **Test:** `test_checker_full.c` — arena ptr to global error, arena ptr local use allowed, arena ptr in local struct allowed.
+
+---
+
 ## Round 1 — Firmware Pattern Stress Tests (2026-03-19)
 
 ### BUG-001: Enum value access `State.idle` fails type-check

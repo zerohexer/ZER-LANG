@@ -188,14 +188,16 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ### Safety Guarantees
 | Bug Class | Prevention |
 |---|---|
-| Buffer overflow | Bounds check on every array/slice access |
-| Use-after-free | Handle generation counter + ZER-CHECK |
+| Buffer overflow | Inline bounds check on every array/slice access (conditions, loops, all expressions) |
+| Use-after-free | Handle generation counter + ZER-CHECK (with alias tracking) |
 | Null dereference | `*T` non-null by default, `?T` requires unwrapping |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
 | Missing switch case | Exhaustive check for enums and bools |
-| Dangling pointer | Scope escape analysis |
+| Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals) |
+| Union type confusion | Cannot mutate union variant during mutable switch capture |
+| Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 
 ### Implementation Status
 | Feature | Checker | Emitter (E2E) |
@@ -232,15 +234,23 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - `return null;` from `?void` func → `return (_zer_opt_void){ 0 };`
 - Bare `return;` from `?T` func → `return (opt_type){ 0, 1 };`
 
+**Bounds checks in emitted C (BUG-078/079 — inline, NOT hoisted):**
+- Array: `(_zer_bounds_check((size_t)(idx), size, __FILE__, __LINE__), arr)[idx]`
+- Slice: `(_zer_bounds_check((size_t)(idx), s.len, __FILE__, __LINE__), s.ptr)[idx]`
+- Comma operator preserves lvalue (assignments work). Inline = works in conditions + respects `&&`/`||` short-circuit.
+- **NEVER hoist bounds checks to statement level.** That breaks short-circuit and misses conditions.
+
 **Slice types in emitted C:**
 - `[]T` → named typedef `_zer_slice_T` for ALL types (primitives in preamble, struct/union after declaration)
-- Slice indexing: `slice.ptr[i]` — NOT `slice[i]` (emitter must add `.ptr`)
+- Slice indexing embedded in bounds check pattern above — `.ptr` added automatically
 - `?[]T` → named typedef `_zer_opt_slice_T` (all types)
 
-**Null-sentinel types (IS_NULL_SENTINEL macro):**
-- `?*T` → plain C pointer (NULL = none). Uses `IS_NULL_SENTINEL` macro.
-- `?FuncPtr` → plain C function pointer (NULL = none). Same macro.
-- **CRITICAL:** Every null-sentinel check in emitter.c uses `IS_NULL_SENTINEL(inner->kind)` — NEVER check `TYPE_POINTER` alone. `TYPE_FUNC_PTR` must always be included.
+**Null-sentinel types (`is_null_sentinel()` function):**
+- `?*T` → plain C pointer (NULL = none).
+- `?FuncPtr` → plain C function pointer (NULL = none).
+- `?DistinctFuncPtr` → also null sentinel (unwraps TYPE_DISTINCT).
+- **CRITICAL:** Use `is_null_sentinel(inner_type)` (function, not macro). It unwraps TYPE_DISTINCT before checking TYPE_POINTER/TYPE_FUNC_PTR. The old `IS_NULL_SENTINEL` macro is kept for backward compat but doesn't handle distinct.
+- `emit_type_and_name` handles name-inside-parens for `TYPE_OPTIONAL + TYPE_DISTINCT(TYPE_FUNC_PTR)`.
 
 **Builtin method emission pattern (emitter.c ~line 350-520):**
 1. Check if callee is `NODE_FIELD` with object of type Pool/Ring/Arena
@@ -257,8 +267,8 @@ These patterns caused 74 bugs across 6 audit rounds. A fresh session MUST know t
 **1. `?void` has ONE field, everything else has TWO.**
 Every code path that emits optional null `{ 0, 0 }` MUST check `inner->kind == TYPE_VOID` and emit `{ 0 }` instead. There are 6+ paths: NODE_RETURN, assign null, var-decl null, expression orelse, var-decl orelse, global var. We fixed ALL of them. If you add a new path, check for `?void`.
 
-**2. Never check `TYPE_POINTER` alone for null-sentinel.**
-Always use `IS_NULL_SENTINEL(inner->kind)` which includes `TYPE_FUNC_PTR`. Function pointers are pointers — they use NULL as none. This macro exists in emitter.c line ~27.
+**2. Use `is_null_sentinel(type)` for null-sentinel checks, not the macro.**
+The `is_null_sentinel()` function in emitter.c unwraps TYPE_DISTINCT before checking TYPE_POINTER/TYPE_FUNC_PTR. The old `IS_NULL_SENTINEL` macro only checks the kind directly and misses distinct wrappers.
 
 **3. `TYPE_DISTINCT` must be unwrapped before type dispatch.**
 The checker and emitter have paths that check `TYPE_FUNC_PTR`, `TYPE_STRUCT`, etc. If the type is wrapped in `TYPE_DISTINCT`, these checks fail silently. Always unwrap: `if (t->kind == TYPE_DISTINCT) t = t->distinct.underlying;`
@@ -273,6 +283,15 @@ Anonymous `struct { ... }` in C creates a new type at each use. Slices, optional
 Every typedef/declaration emitted in `emit_file` for structs/unions/enums MUST also be emitted in `emit_file_no_preamble` (used for imported modules). Missing typedefs in imported modules cause GCC errors.
 
 **7. UFCS is dropped.** Dead code commented out in checker.c. Do not implement or rely on `t.method()` syntax. Builtin methods (Pool/Ring/Arena) work via compiler intrinsics, NOT UFCS.
+
+**8. Scope escape checks must walk field/index chains to root.**
+`global.ptr = &local` has target `NODE_FIELD`, not `NODE_IDENT`. The checker walks through NODE_FIELD/NODE_INDEX to find the root ident, then checks if it's static/global. Same pattern used for arena-derived pointer escape detection.
+
+**9. Union switch arms must lock the switched-on variable.**
+During a union switch arm with capture, `checker.union_switch_var` is set to the switched-on variable name. Any assignment to `var.variant` where `var` matches the lock is a compile error. This prevents type confusion from mutating the active variant while a capture pointer is alive. Lock is saved/restored for nesting.
+
+**10. Arena-derived pointers tracked via `is_arena_derived` flag.**
+When a variable is initialized from `arena.alloc(T)` (including through orelse), the Symbol gets `is_arena_derived = true`. Assigning this variable to a global/static target (walking field/index chain) is a compile error.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

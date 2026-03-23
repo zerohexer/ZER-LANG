@@ -243,7 +243,9 @@ static void test_s12_struct(void) {
        "struct field access OK");
     ok("struct T { u32 x; }\nvoid f(T t) { *T p = &t; p.x = 5; }",
        "pointer auto-deref field OK");
-    /* nonexistent field — currently returns void (UFCS fallback), acceptable */
+    /* nonexistent field — must error (UFCS dropped) */
+    err("struct T { u32 x; }\nvoid f() { T t; t.nonexistent; }",
+        "struct nonexistent field → error");
 }
 
 static void test_s12_enum(void) {
@@ -479,11 +481,11 @@ static void test_interactions(void) {
        "}",
        "struct + pool + return");
 
-    /* UFCS */
-    ok("struct Task { u32 pid; }\n"
-       "void run(*Task t) { }\n"
-       "void f() { Task t; t.run(); }",
-       "UFCS call");
+    /* UFCS dropped — must error */
+    err("struct Task { u32 pid; }\n"
+        "void run(*Task t) { }\n"
+        "void f() { Task t; t.run(); }",
+        "UFCS dropped: struct.method() → error");
 
     /* forward reference + recursion */
     ok("void a() { b(); }\nvoid b() { a(); }", "mutual recursion OK");
@@ -557,6 +559,93 @@ static void test_adversarial(void) {
     err("struct A { u32 x; }\nstruct B { u32 x; }\n"
         "void f() { A a; B b = a; }",
         "different struct types REJECT");
+}
+
+/* ================================================================
+ * SECURITY REVIEW FIXES (BUG-078 through BUG-083)
+ * ================================================================ */
+static void test_security_review(void) {
+    printf("[BUG-080: scope escape via struct field]\n");
+    err("struct H { *u32 ptr; }\n"
+        "H g;\n"
+        "void f() {\n"
+        "    u32 local = 42;\n"
+        "    g.ptr = &local;\n"
+        "}\n",
+        "scope escape: global.field = &local");
+
+    ok("struct H { *u32 ptr; }\n"
+       "H g;\n"
+       "u32 gval = 5;\n"
+       "void f() {\n"
+       "    g.ptr = &gval;\n"
+       "}\n",
+       "scope escape: global.field = &global (valid)");
+
+    printf("[BUG-081: union type confusion]\n");
+    err("union D { u32 a; u32 b; }\n"
+        "void f() {\n"
+        "    D d;\n"
+        "    d.a = 1;\n"
+        "    switch (d) {\n"
+        "        .a => |*ptr| {\n"
+        "            d.b = 2;\n"
+        "        }\n"
+        "        .b => |v| { }\n"
+        "    }\n"
+        "}\n",
+        "union mutation during mutable capture");
+
+    ok("union D { u32 a; u32 b; }\n"
+       "void f() {\n"
+       "    D d1;\n"
+       "    D d2;\n"
+       "    d1.a = 1;\n"
+       "    d2.b = 2;\n"
+       "    switch (d1) {\n"
+       "        .a => |*ptr| {\n"
+       "            d2.b = 99;\n"
+       "        }\n"
+       "        .b => |v| { }\n"
+       "    }\n"
+       "}\n",
+       "union mutation of DIFFERENT union during capture (valid)");
+
+    ok("union D { u32 a; u32 b; }\n"
+       "void f() {\n"
+       "    D d;\n"
+       "    d.a = 1;\n"
+       "    switch (d) {\n"
+       "        .a => {\n"
+       "            d.b = 2;\n"
+       "        }\n"
+       "        .b => { }\n"
+       "    }\n"
+       "}\n",
+       "union mutation in non-capture arm (valid)");
+
+    printf("[BUG-083: arena lifetime escape]\n");
+    err("struct Data { u32 x; }\n"
+        "struct Hold { *Data ptr; }\n"
+        "Hold g;\n"
+        "void f() {\n"
+        "    u8[512] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    defer a.unsafe_reset();\n"
+        "    *Data d = a.alloc(Data) orelse return;\n"
+        "    g.ptr = d;\n"
+        "}\n",
+        "arena ptr escape to global struct field");
+
+    ok("struct Data { u32 x; }\n"
+       "void f() {\n"
+       "    u8[512] buf;\n"
+       "    Arena a = Arena.over(buf);\n"
+       "    defer a.unsafe_reset();\n"
+       "    *Data d = a.alloc(Data) orelse return;\n"
+       "    d.x = 42;\n"
+       "}\n",
+       "arena ptr used locally (valid)");
 }
 
 /* ================================================================
@@ -724,6 +813,7 @@ int main(void) {
     test_s16_intrinsics();
     test_interactions();
     test_adversarial();
+    test_security_review();
     test_negative_sweep();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);

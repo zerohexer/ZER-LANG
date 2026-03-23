@@ -138,7 +138,7 @@ Global hash map: `Node* → Type*`. Set during checking via `typemap_set()`. Rea
 - Pool runtime functions: `_zer_pool_alloc`, `_zer_pool_get`, `_zer_pool_free`
 - Ring runtime function: `_zer_ring_push` (pop is inlined)
 - Arena runtime: `_zer_arena` typedef, `_zer_arena_alloc(arena*, size, align)` — bump allocator with `_Alignof` alignment
-- Bounds check: `_zer_bounds_check`, `_zer_trap`
+- Bounds check: `_zer_bounds_check`, `_zer_trap` — checks are inline in `emit_expr(NODE_INDEX)`, NOT statement-level. Uses comma operator: `(_zer_bounds_check(idx, len, ...), arr)[idx]`. This respects `&&`/`||` short-circuit and works in if/while/for conditions.
 
 ### Builtin Method Emission (Pool/Ring/Arena)
 The emitter intercepts `obj.method()` calls (line ~350):
@@ -317,6 +317,9 @@ Path-sensitive handle tracking after type checker, before emitter:
 ### Handle States
 `HS_UNKNOWN` → `HS_ALIVE` (after alloc) → `HS_FREED` (after free)
 
+### Handle Aliasing (BUG-082 fix)
+When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is registered with the same state, pool_id, and alloc_line as the source. When `pool.free(h)` is called, all handles with the same pool_id + alloc_line are also marked HS_FREED (aliases of the same allocation). Independent handles from the same pool (different alloc_line) are unaffected.
+
 ### Path Merging (under-approximation — zero false positives)
 - **if/else**: mark freed only if freed on BOTH branches
 - **if without else**: keep original state (accept false negatives over false positives)
@@ -334,11 +337,11 @@ Path-sensitive handle tracking after type checker, before emitter:
 | `test_parser.c` | AST construction | 70 |
 | `test_parser_edge.c` | Edge cases, func ptrs | 92 |
 | `test_checker.c` | Type checking basic | 71 |
-| `test_checker_full.c` | Full spec coverage | 176 |
+| `test_checker_full.c` | Full spec coverage + security + audit | 210 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 122 |
-| `test_zercheck.c` | Handle tracking | 17 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 145 |
+| `test_zercheck.c` | Handle tracking + aliasing | 20 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
 | `test_firmware_patterns2.c` | Round 2 firmware | 41 |
@@ -353,12 +356,20 @@ Path-sensitive handle tracking after type checker, before emitter:
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 77 bugs fixed, 7 audit rounds + 4 QEMU demos)
+## Common Bug Patterns (from 95 bugs fixed, 9 audit rounds + 4 QEMU demos)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)
 4. **Parser needs braces** — if/else/for/while bodies are always blocks
 5. **Enum values need `_ZER_` prefix in emitted C** — `State.idle` → `_ZER_State_idle`
 6. **Forward decl then definition** — checker must update existing symbol, not reject as duplicate
+7. **Bounds checks must be inline, not hoisted** — hoisting breaks short-circuit `&&`/`||` and misses conditions. Use comma operator pattern in `emit_expr(NODE_INDEX)`.
+8. **Scope/lifetime checks must walk field/index chains** — `global.ptr = &local` has target `NODE_FIELD`, not `NODE_IDENT`. Walk to root before checking.
+9. **Union switch arms must lock the switched-on variable** — mutation during mutable capture creates type confusion. Track `union_switch_var` in Checker.
+10. **Handle aliasing must propagate freed state** — `alias = h` copies the handle value. Freeing the original must mark all aliases freed (match by pool_id + alloc_line).
+11. **`emit_file` AND `emit_file_no_preamble` must handle ALL declaration types** — NODE_TYPEDEF and NODE_INTERRUPT were missing from no_preamble, silently dropping imported typedefs and interrupt handlers.
+12. **`is_null_sentinel()` must unwrap TYPE_DISTINCT** — `?DistinctFuncPtr` must be treated as null sentinel. Use `is_null_sentinel(type)` function, not `IS_NULL_SENTINEL(kind)` macro.
+13. **NODE_SLICE must use named typedefs for ALL primitives** — not just u8/u32. Anonymous structs create type mismatches with named `_zer_slice_T`.
+14. **Struct field lookup must error on miss** — don't silently return ty_void (old UFCS fallback). Same for field access on non-struct types.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

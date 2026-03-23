@@ -601,26 +601,67 @@ static Type *check_expr(Checker *c, Node *node) {
                 "cannot store result of get() — use inline");
         }
 
-        /* scope escape: storing &local in static/global variable */
+        /* scope escape: storing &local in static/global variable (or field thereof) */
         if (node->assign.op == TOK_EQ &&
             node->assign.value->kind == NODE_UNARY &&
             node->assign.value->unary.op == TOK_AMP &&
-            node->assign.value->unary.operand->kind == NODE_IDENT &&
-            node->assign.target->kind == NODE_IDENT) {
-            Symbol *target_sym = scope_lookup(c->current_scope,
-                node->assign.target->ident.name,
-                (uint32_t)node->assign.target->ident.name_len);
+            node->assign.value->unary.operand->kind == NODE_IDENT) {
+            /* Walk target chain (field/index) to find root identifier */
+            Node *root = node->assign.target;
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                if (root->kind == NODE_FIELD) root = root->field.object;
+                else root = root->index_expr.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                Symbol *target_sym = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                Symbol *val_sym = scope_lookup(c->current_scope,
+                    node->assign.value->unary.operand->ident.name,
+                    (uint32_t)node->assign.value->unary.operand->ident.name_len);
+                bool val_is_global = val_sym &&
+                    scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
+                bool target_is_static = target_sym && target_sym->is_static;
+                bool target_is_global = target_sym &&
+                    scope_lookup_local(c->global_scope, target_sym->name, target_sym->name_len) != NULL;
+                if ((target_is_static || target_is_global) && val_sym &&
+                    !val_sym->is_static && !val_is_global) {
+                    checker_error(c, node->loc.line,
+                        "cannot store pointer to local '%.*s' in static/global variable '%.*s'",
+                        (int)val_sym->name_len, val_sym->name,
+                        (int)target_sym->name_len, target_sym->name);
+                }
+            }
+        }
+
+        /* arena lifetime escape: storing arena-derived pointer in global/static */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.value->kind == NODE_IDENT) {
             Symbol *val_sym = scope_lookup(c->current_scope,
-                node->assign.value->unary.operand->ident.name,
-                (uint32_t)node->assign.value->unary.operand->ident.name_len);
-            bool val_is_global = val_sym &&
-                scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
-            if (target_sym && val_sym &&
-                target_sym->is_static && !val_sym->is_static && !val_is_global) {
-                checker_error(c, node->loc.line,
-                    "cannot store pointer to local '%.*s' in static variable '%.*s'",
-                    (int)val_sym->name_len, val_sym->name,
-                    (int)target_sym->name_len, target_sym->name);
+                node->assign.value->ident.name,
+                (uint32_t)node->assign.value->ident.name_len);
+            if (val_sym && val_sym->is_arena_derived) {
+                /* walk target to find root */
+                Node *root = node->assign.target;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    Symbol *target_sym = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    bool target_is_global = target_sym &&
+                        (target_sym->is_static ||
+                         scope_lookup_local(c->global_scope, target_sym->name,
+                                            target_sym->name_len) != NULL);
+                    if (target_is_global) {
+                        checker_error(c, node->loc.line,
+                            "cannot store arena-derived pointer '%.*s' in "
+                            "global/static variable '%.*s' — pointer will dangle "
+                            "when arena is reset",
+                            (int)val_sym->name_len, val_sym->name,
+                            (int)target_sym->name_len, target_sym->name);
+                    }
+                }
             }
         }
 
@@ -687,17 +728,23 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Pool methods */
             if (obj->kind == TYPE_POOL) {
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "pool.alloc() takes no arguments");
                     result = type_optional(c->arena, type_handle(c->arena, obj->pool.elem));
                     typemap_set(field_node, result);
                     break;
                 }
                 if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "pool.get() takes exactly 1 argument");
                     result = type_pointer(c->arena, obj->pool.elem);
                     typemap_set(field_node, result);
                     mark_non_storable(node); /* Rule 2: get() result non-storable */
                     break;
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "pool.free() takes exactly 1 argument");
                     result = ty_void;
                     typemap_set(field_node, result);
                     break;
@@ -707,16 +754,22 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Ring methods */
             if (obj->kind == TYPE_RING) {
                 if (mlen == 4 && memcmp(mname, "push", 4) == 0) {
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "ring.push() takes exactly 1 argument");
                     result = ty_void;
                     typemap_set(field_node, result);
                     break;
                 }
                 if (mlen == 12 && memcmp(mname, "push_checked", 12) == 0) {
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "ring.push_checked() takes exactly 1 argument");
                     result = type_optional(c->arena, ty_void);
                     typemap_set(field_node, result);
                     break;
                 }
                 if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "ring.pop() takes no arguments");
                     result = type_optional(c->arena, obj->ring.elem);
                     typemap_set(field_node, result);
                     break;
@@ -726,12 +779,16 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Arena methods */
             if (obj->kind == TYPE_ARENA) {
                 if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "Arena.over() takes exactly 1 argument");
                     result = ty_arena;
                     typemap_set(field_node, result);
                     break;
                 }
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
                     /* Arena.alloc(T) → ?*T */
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "arena.alloc() takes exactly 1 argument");
                     if (node->call.arg_count >= 1 &&
                         node->call.args[0]->kind == NODE_IDENT) {
                         const char *tname = node->call.args[0]->ident.name;
@@ -752,6 +809,8 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 5 && memcmp(mname, "reset", 5) == 0) {
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "arena.reset() takes no arguments");
                     /* Rule 3: arena.reset() outside defer = warning */
                     if (c->defer_depth == 0) {
                         checker_warning(c, node->loc.line,
@@ -764,6 +823,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0) {
                     /* Arena.alloc_slice(T, n) → ?[]T */
+                    if (node->call.arg_count != 2)
+                        checker_error(c, node->loc.line, "arena.alloc_slice() takes exactly 2 arguments");
                     if (node->call.arg_count >= 1 &&
                         node->call.args[0]->kind == NODE_IDENT) {
                         const char *tname = node->call.args[0]->ident.name;
@@ -784,6 +845,8 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 12 && memcmp(mname, "unsafe_reset", 12) == 0) {
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "arena.unsafe_reset() takes no arguments");
                     result = ty_void;
                     typemap_set(field_node, result);
                     break;
@@ -934,8 +997,10 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             if (!result) {
-                /* unresolved field — UFCS was dropped from spec.
-                 * Returns ty_void which will cause a type error downstream. */
+                checker_error(c, node->loc.line,
+                    "struct '%.*s' has no field '%.*s'",
+                    (int)obj->struct_type.name_len, obj->struct_type.name,
+                    (int)flen, fname);
                 result = ty_void;
             }
             break;
@@ -1022,6 +1087,18 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
                 break;
             }
+            /* prevent mutating union variant while inside a switch arm on same variable */
+            if (c->union_switch_var && node->field.object->kind == NODE_IDENT &&
+                node->field.object->ident.name_len == c->union_switch_var_len &&
+                memcmp(node->field.object->ident.name, c->union_switch_var,
+                       c->union_switch_var_len) == 0) {
+                checker_error(c, node->loc.line,
+                    "cannot mutate union '%.*s' inside its own switch arm — "
+                    "active capture would become invalid",
+                    (int)c->union_switch_var_len, c->union_switch_var);
+                result = ty_void;
+                break;
+            }
             for (uint32_t i = 0; i < obj->union_type.variant_count; i++) {
                 SUVariant *v = &obj->union_type.variants[i];
                 if (v->name_len == flen && memcmp(v->name, fname, flen) == 0) {
@@ -1039,7 +1116,10 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
-        /* fallback: unresolved field access — UFCS dropped from spec */
+        /* fallback: field access on non-struct/enum/union type */
+        checker_error(c, node->loc.line,
+            "cannot access field '%.*s' on type '%s'",
+            (int)flen, fname, type_name(obj));
         result = ty_void;
         break;
     }
@@ -1251,21 +1331,39 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
             }
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
-            /* @cast(T, val) — only valid between distinct typedefs with same underlying */
+            /* @cast(T, val) — convert between distinct typedef and its underlying type.
+             * Valid: @cast(Celsius, u32_val) — wrap underlying → distinct
+             * Valid: @cast(u32, celsius_val) — unwrap distinct → underlying
+             * Invalid: @cast(Fahrenheit, celsius_val) — cross-distinct */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
-                if (result->kind != TYPE_DISTINCT) {
-                    checker_error(c, node->loc.line,
-                        "@cast target must be a distinct typedef");
-                }
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(node->intrinsic.args[0]);
-                    if (val_type && val_type->kind == TYPE_DISTINCT &&
-                        result->kind == TYPE_DISTINCT) {
-                        if (!type_equals(val_type->distinct.underlying,
-                                         result->distinct.underlying)) {
+                    if (val_type) {
+                        bool tgt_distinct = result->kind == TYPE_DISTINCT;
+                        bool src_distinct = val_type->kind == TYPE_DISTINCT;
+                        if (!tgt_distinct && !src_distinct) {
                             checker_error(c, node->loc.line,
-                                "@cast between unrelated distinct types");
+                                "@cast requires at least one distinct typedef");
+                        } else if (tgt_distinct && src_distinct) {
+                            /* cross-distinct: reject unless one directly wraps the other */
+                            if (!type_equals(val_type, result->distinct.underlying) &&
+                                !type_equals(result, val_type->distinct.underlying)) {
+                                checker_error(c, node->loc.line,
+                                    "@cast between unrelated distinct types");
+                            }
+                        } else if (tgt_distinct) {
+                            /* wrap: source should match target's underlying */
+                            if (!type_equals(val_type, result->distinct.underlying)) {
+                                checker_error(c, node->loc.line,
+                                    "@cast source type does not match distinct's underlying type");
+                            }
+                        } else {
+                            /* unwrap: target should match source's underlying */
+                            if (!type_equals(result, val_type->distinct.underlying)) {
+                                checker_error(c, node->loc.line,
+                                    "@cast target type does not match distinct's underlying type");
+                            }
                         }
                     }
                 }
@@ -1336,6 +1434,25 @@ static void check_stmt(Checker *c, Node *node) {
         if (sym) {
             sym->is_const = node->var_decl.is_const;
             sym->is_static = node->var_decl.is_static;
+
+            /* detect arena-derived pointers: x = arena.alloc(T) orelse ... */
+            if (node->var_decl.init) {
+                Node *alloc_call = node->var_decl.init;
+                if (alloc_call->kind == NODE_ORELSE)
+                    alloc_call = alloc_call->orelse.expr;
+                if (alloc_call && alloc_call->kind == NODE_CALL &&
+                    alloc_call->call.callee->kind == NODE_FIELD) {
+                    Node *obj = alloc_call->call.callee->field.object;
+                    const char *mname = alloc_call->call.callee->field.field_name;
+                    size_t mlen = alloc_call->call.callee->field.field_name_len;
+                    if (obj && mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                        Type *obj_type = checker_get_type(obj);
+                        if (obj_type && obj_type->kind == TYPE_ARENA) {
+                            sym->is_arena_derived = true;
+                        }
+                    }
+                }
+            }
         }
         break;
     }
@@ -1479,7 +1596,17 @@ static void check_stmt(Checker *c, Node *node) {
                     cap_type, arm->loc.line);
                 if (cap) cap->is_const = cap_const;
 
+                /* lock union variable during switch arm to prevent type confusion */
+                const char *saved_union_var = c->union_switch_var;
+                uint32_t saved_union_var_len = c->union_switch_var_len;
+                if (expr->kind == TYPE_UNION &&
+                    node->switch_stmt.expr->kind == NODE_IDENT) {
+                    c->union_switch_var = node->switch_stmt.expr->ident.name;
+                    c->union_switch_var_len = (uint32_t)node->switch_stmt.expr->ident.name_len;
+                }
                 check_stmt(c, arm->body);
+                c->union_switch_var = saved_union_var;
+                c->union_switch_var_len = saved_union_var_len;
                 pop_scope(c);
             } else {
                 check_stmt(c, arm->body);

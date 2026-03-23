@@ -2,6 +2,38 @@
 
 All notable changes to ZER-LANG. Read this to understand project history and current state.
 
+## 2026-03-23 (continued — agent-driven audit, 12 bugs)
+
+### Bug Fixes (Round 9 — Agent Audit)
+- **BUG-084:** Parser stack buffer overflow — `Node *values[16]` in switch arm parsing now bounds-checked
+- **BUG-085:** Slice expression anonymous struct — NODE_SLICE now uses named `_zer_slice_T` for ALL primitive types (was only u8/u32)
+- **BUG-086:** `emit_file_no_preamble` missing NODE_TYPEDEF — typedefs in imported modules now emitted
+- **BUG-087:** `emit_file_no_preamble` missing NODE_INTERRUPT — interrupt handlers in imported modules now emitted
+- **BUG-088:** `?DistinctFuncPtr` not null sentinel — `is_null_sentinel()` function unwraps TYPE_DISTINCT, `emit_type_and_name` handles `?Distinct(FuncPtr)` name placement
+- **BUG-089:** Array-to-slice coercion UB — uses `eff_callee` (unwrapped) instead of `callee_type` for distinct func ptr
+- **BUG-090:** Missing struct field error — `p.nonexistent` now errors instead of silently returning void. UFCS tests updated.
+- **BUG-091:** `@cast` validation — unwrap now works (`@cast(u32, celsius)`), cross-distinct now blocked (`@cast(Fahrenheit, celsius)`)
+- **BUG-092:** Builtin arg count validation — all 11 Pool/Ring/Arena methods now check argument count
+- **BUG-093:** Field access on non-struct — `u32.foo` now errors instead of silently returning void
+- **BUG-094:** NODE_CINCLUDE in AST debug — `node_kind_name()` and `ast_print()` now handle NODE_CINCLUDE
+- **BUG-095:** Unchecked fread — `zerc_main.c` now checks return value, returns NULL on short read
+
+### Tests
+- **965 tests + 491 fuzz, all passing**
+
+## 2026-03-23 (continued — security review fixes)
+
+### Safety Architecture Overhaul (6 bugs from external security review)
+- **BUG-078/079: Inline bounds checks** — Replaced statement-level bounds check hoisting with inline checks using comma operator: `(_zer_bounds_check(idx, len, ...), arr)[idx]`. Fixes two bugs at once: (1) missing checks in if/while/for conditions, (2) short-circuit `&&`/`||` evaluation now respected. Lvalue semantics preserved via array-to-pointer decay.
+- **BUG-080: Scope escape via struct field** — `global.ptr = &local` now caught. Walk assignment target chain (NODE_FIELD/NODE_INDEX) to root identifier. Also catches global-scoped (not just static) targets.
+- **BUG-081: Union type confusion** — Cannot mutate union variant while switch capture pointer is active. Compile-time error prevents silent memory corruption.
+- **BUG-082: ZER-CHECK handle aliasing** — `Handle(T) alias = h1` now tracked. Freeing `h1` propagates to all aliases. Independent handles unaffected (no false positives).
+- **BUG-083: Arena lifetime escape** — `arena.alloc(T)` results marked `is_arena_derived`. Storing in global/static variables is compile-time error.
+
+### Tests
+- **965 tests + 491 fuzz, all passing** (+8 checker security tests, +4 E2E bounds check tests, +3 zercheck alias tests)
+- Zero regressions across all 4 QEMU demos
+
 ## 2026-03-23
 
 ### Major Features
@@ -118,13 +150,13 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 950 tests + 491 fuzz, all passing. ~10,000 lines. 77 bugs found and fixed.
+**Compiler:** 965 tests + 491 fuzz, all passing. ~10,000 lines. 95 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
-**Audit status:** 7 rounds completed, converged (12→9→2→2→1→2→CLEAN). 26 systematic negative tests. 4 QEMU real-program demos (last 2 found zero bugs).
+**Safety:** Inline bounds checks (conditions + short-circuit safe). Scope escape via struct fields caught. Union type confusion blocked. ZER-CHECK handles aliasing. Arena lifetime escape detected.
+**Audit status:** 9 rounds completed (12→9→2→2→1→2→CLEAN→6→12). 26 systematic negative tests. 4 QEMU real-program demos.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
 **Known limitations:**
-- ~~Mutable union capture~~ — **FIXED** (BUG-077). Switch takes pointer to original.
 - `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first.
+- Scope escape / arena escape checks are intraprocedural (no cross-function lifetime analysis).
 - No native backends (emit-C only).
-**Next:** Tag v0.1.0 "HeartSafe". Run `make release` then `git tag v0.1.0 && git push origin v0.1.0`.

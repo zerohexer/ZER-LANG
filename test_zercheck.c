@@ -276,6 +276,41 @@ int main(void) {
         "}\n",
         "double free — error");
 
+    /* ---- Handle aliasing ---- */
+    printf("\n[alias: use-after-free via alias — error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h1 = pool.alloc() orelse return;\n"
+        "    Handle(T) alias = h1;\n"
+        "    pool.free(h1);\n"
+        "    pool.get(alias).x = 5;\n"
+        "}\n",
+        "alias: free h1, use alias — use-after-free");
+
+    printf("[alias: use-after-free via assignment — error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h1 = pool.alloc() orelse return;\n"
+        "    Handle(T) h2 = pool.alloc() orelse return;\n"
+        "    h2 = h1;\n"
+        "    pool.free(h1);\n"
+        "    pool.get(h2).x = 5;\n"
+        "}\n",
+        "alias via assignment: free h1, use h2 — use-after-free");
+
+    printf("[alias: valid alias use — OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T) h1 = pool.alloc() orelse return;\n"
+       "    Handle(T) alias = h1;\n"
+       "    pool.get(alias).x = 5;\n"
+       "    pool.free(h1);\n"
+       "}\n",
+       "alias: use before free — OK");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

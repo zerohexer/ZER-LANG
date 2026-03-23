@@ -23,9 +23,21 @@ static void emit(Emitter *e, const char *fmt, ...) {
     va_end(args);
 }
 
-/* null-sentinel check: ?*T and ?FuncPtr both use NULL as none */
+/* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
+ * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
+static inline bool is_null_sentinel(Type *inner) {
+    if (!inner) return false;
+    if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return true;
+    if (inner->kind == TYPE_DISTINCT) {
+        Type *u = inner->distinct.underlying;
+        return u && (u->kind == TYPE_POINTER || u->kind == TYPE_FUNC_PTR);
+    }
+    return false;
+}
 #define IS_NULL_SENTINEL(inner_kind) \
     ((inner_kind) == TYPE_POINTER || (inner_kind) == TYPE_FUNC_PTR)
+/* NOTE: Use is_null_sentinel(type) for full distinct-aware check.
+ * IS_NULL_SENTINEL macro kept for backward compat where only kind is available. */
 
 /* ---- Type emission ---- */
 
@@ -75,7 +87,7 @@ static void emit_type(Emitter *e, Type *t) {
 
     case TYPE_OPTIONAL:
         /* ?*T → pointer (null sentinel) */
-        if (IS_NULL_SENTINEL(t->optional.inner->kind)) {
+        if (is_null_sentinel(t->optional.inner)) {
             emit_type(e, t->optional.inner);
             break;
         }
@@ -281,6 +293,20 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* optional distinct function pointer: ?DistinctFuncPtr → null sentinel with name inside (*) */
+    if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_DISTINCT &&
+        t->optional.inner->distinct.underlying->kind == TYPE_FUNC_PTR) {
+        Type *fp = t->optional.inner->distinct.underlying;
+        emit_type(e, fp->func_ptr.ret);
+        emit(e, " (*%.*s)(", (int)name_len, name);
+        for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, fp->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+
     emit_type(e, t);
     emit(e, " %.*s", (int)name_len, name);
 }
@@ -421,7 +447,7 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *val_type = checker_get_type(node->assign.value);
         if (node->assign.op == TOK_EQ && tgt_type && val_type &&
             tgt_type->kind == TYPE_OPTIONAL &&
-            !IS_NULL_SENTINEL(tgt_type->optional.inner->kind) &&
+            !is_null_sentinel(tgt_type->optional.inner) &&
             val_type->kind != TYPE_OPTIONAL &&
             node->assign.value->kind != NODE_NULL_LIT) {
             emit(e, "(");
@@ -431,7 +457,7 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, ", 1 }");
         } else if (node->assign.op == TOK_EQ && tgt_type &&
                    tgt_type->kind == TYPE_OPTIONAL &&
-                   !IS_NULL_SENTINEL(tgt_type->optional.inner->kind) &&
+                   !is_null_sentinel(tgt_type->optional.inner) &&
                    node->assign.value->kind == NODE_NULL_LIT) {
             emit(e, "(");
             emit_type(e, tgt_type);
@@ -676,7 +702,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     eff_callee->func_ptr.params[i]->kind == TYPE_SLICE;
                 if (need_arr_coerce) {
                     emit_array_as_slice(e, node->call.args[i], arg_type,
-                                        callee_type->func_ptr.params[i]);
+                                        eff_callee->func_ptr.params[i]);
                 } else {
                     emit_expr(e, node->call.args[i]);
                     if (need_decay) emit(e, ".ptr");
@@ -714,16 +740,37 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_INDEX: {
-        /* Bounds check emitted at statement level (emit_stmt), not here.
-         * Expression-level check breaks C lvalue rules on assignment LHS. */
+        /* Inline bounds check using comma operator:
+         *   array:  (_zer_bounds_check(idx, size, ...), arr)[idx]
+         *   slice:  (_zer_bounds_check(idx, s.len, ...), s.ptr)[idx]
+         * Comma operator preserves lvalue (array decays to pointer).
+         * Inline check respects short-circuit (&&/||) and works in
+         * if/while/for conditions — fixes both hoisting and missing-check bugs. */
         Type *idx_obj_type = checker_get_type(node->index_expr.object);
-        emit_expr(e, node->index_expr.object);
-        if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
-            emit(e, ".ptr");
+        if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY && idx_obj_type->array.size > 0) {
+            emit(e, "(_zer_bounds_check((size_t)(");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "), %u, __FILE__, __LINE__), ", idx_obj_type->array.size);
+            emit_expr(e, node->index_expr.object);
+            emit(e, ")[");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "]");
+        } else if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
+            emit(e, "(_zer_bounds_check((size_t)(");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "), ");
+            emit_expr(e, node->index_expr.object);
+            emit(e, ".len, __FILE__, __LINE__), ");
+            emit_expr(e, node->index_expr.object);
+            emit(e, ".ptr)[");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "]");
+        } else {
+            emit_expr(e, node->index_expr.object);
+            emit(e, "[");
+            emit_expr(e, node->index_expr.index);
+            emit(e, "]");
         }
-        emit(e, "[");
-        emit_expr(e, node->index_expr.index);
-        emit(e, "]");
         break;
     }
 
@@ -753,20 +800,39 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *elem_type = obj_type ? (obj_type->kind == TYPE_ARRAY ?
             obj_type->array.inner : obj_type->kind == TYPE_SLICE ?
             obj_type->slice.inner : NULL) : NULL;
-        bool is_u8_slice = elem_type && elem_type == ty_u8;
-        bool is_u32_slice = elem_type && elem_type == ty_u32;
-
-        if (is_u8_slice) {
-            emit(e, "((_zer_slice_u8){ ");
-        } else if (is_u32_slice) {
-            emit(e, "((_zer_slice_u32){ ");
-        } else if (elem_type && elem_type->kind == TYPE_STRUCT) {
-            emit(e, "((_zer_slice_%.*s){ ",
-                 (int)elem_type->struct_type.name_len, elem_type->struct_type.name);
-        } else if (elem_type && elem_type->kind == TYPE_UNION) {
-            emit(e, "((_zer_slice_%.*s){ ",
-                 (int)elem_type->union_type.name_len, elem_type->union_type.name);
-        } else {
+        /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
+        bool slice_type_emitted = false;
+        if (elem_type) {
+            const char *sname = NULL;
+            switch (elem_type->kind) {
+            case TYPE_U8:    sname = "_zer_slice_u8"; break;
+            case TYPE_U16:   sname = "_zer_slice_u16"; break;
+            case TYPE_U32:   sname = "_zer_slice_u32"; break;
+            case TYPE_U64:   sname = "_zer_slice_u64"; break;
+            case TYPE_I8:    sname = "_zer_slice_i8"; break;
+            case TYPE_I16:   sname = "_zer_slice_i16"; break;
+            case TYPE_I32:   sname = "_zer_slice_i32"; break;
+            case TYPE_I64:   sname = "_zer_slice_i64"; break;
+            case TYPE_USIZE: sname = "_zer_slice_usize"; break;
+            case TYPE_F32:   sname = "_zer_slice_f32"; break;
+            case TYPE_F64:   sname = "_zer_slice_f64"; break;
+            case TYPE_BOOL:  sname = "_zer_slice_u8"; break; /* bool = uint8_t */
+            default: break;
+            }
+            if (sname) {
+                emit(e, "((%s){ ", sname);
+                slice_type_emitted = true;
+            } else if (elem_type->kind == TYPE_STRUCT) {
+                emit(e, "((_zer_slice_%.*s){ ",
+                     (int)elem_type->struct_type.name_len, elem_type->struct_type.name);
+                slice_type_emitted = true;
+            } else if (elem_type->kind == TYPE_UNION) {
+                emit(e, "((_zer_slice_%.*s){ ",
+                     (int)elem_type->union_type.name_len, elem_type->union_type.name);
+                slice_type_emitted = true;
+            }
+        }
+        if (!slice_type_emitted) {
             emit(e, "((struct { ");
             if (elem_type) {
                 emit_type(e, elem_type);
@@ -821,7 +887,7 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *orelse_type = checker_get_type(node->orelse.expr);
         bool is_ptr_optional = orelse_type &&
             orelse_type->kind == TYPE_OPTIONAL &&
-            IS_NULL_SENTINEL(orelse_type->optional.inner->kind);
+            is_null_sentinel(orelse_type->optional.inner);
 
         bool is_void_optional = orelse_type &&
             orelse_type->kind == TYPE_OPTIONAL &&
@@ -840,7 +906,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->orelse.fallback_is_return) {
                     emit_defers(e);
                     if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                        !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind)) {
+                        !is_null_sentinel(e->current_func_ret->optional.inner)) {
                         emit(e, "return (");
                         emit_type(e, e->current_func_ret);
                         if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
@@ -874,7 +940,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->orelse.fallback_is_return) {
                     emit_defers(e);
                     if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                        !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind)) {
+                        !is_null_sentinel(e->current_func_ret->optional.inner)) {
                         emit(e, "return (");
                         emit_type(e, e->current_func_ret);
                         if (e->current_func_ret->optional.inner->kind == TYPE_VOID)
@@ -1141,63 +1207,10 @@ static void emit_expr(Emitter *e, Node *node) {
  * STATEMENT EMISSION
  * ================================================================ */
 
-/* ---- Bounds check insertion (statement level) ----
- * Walk an expression tree, find all NODE_INDEX on arrays,
- * emit _zer_bounds_check() for each BEFORE the statement. */
-
-static void emit_bounds_checks(Emitter *e, Node *node) {
-    if (!node) return;
-
-    if (node->kind == NODE_INDEX) {
-        Type *obj_type = checker_get_type(node->index_expr.object);
-        if (obj_type && obj_type->kind == TYPE_ARRAY && obj_type->array.size > 0) {
-            emit_indent(e);
-            emit(e, "_zer_bounds_check((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, "), %u, __FILE__, __LINE__);\n", obj_type->array.size);
-        } else if (obj_type && obj_type->kind == TYPE_SLICE) {
-            emit_indent(e);
-            emit(e, "_zer_bounds_check((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, "), ");
-            emit_expr(e, node->index_expr.object);
-            emit(e, ".len, __FILE__, __LINE__);\n");
-        }
-        /* recurse into object too (nested: arr[i][j]) */
-        emit_bounds_checks(e, node->index_expr.object);
-        emit_bounds_checks(e, node->index_expr.index);
-        return;
-    }
-
-    /* recurse into subexpressions */
-    switch (node->kind) {
-    case NODE_BINARY:
-        emit_bounds_checks(e, node->binary.left);
-        emit_bounds_checks(e, node->binary.right);
-        break;
-    case NODE_UNARY:
-        emit_bounds_checks(e, node->unary.operand);
-        break;
-    case NODE_ASSIGN:
-        emit_bounds_checks(e, node->assign.target);
-        emit_bounds_checks(e, node->assign.value);
-        break;
-    case NODE_CALL:
-        emit_bounds_checks(e, node->call.callee);
-        for (int i = 0; i < node->call.arg_count; i++)
-            emit_bounds_checks(e, node->call.args[i]);
-        break;
-    case NODE_FIELD:
-        emit_bounds_checks(e, node->field.object);
-        break;
-    case NODE_ORELSE:
-        emit_bounds_checks(e, node->orelse.expr);
-        if (node->orelse.fallback) emit_bounds_checks(e, node->orelse.fallback);
-        break;
-    default:
-        break;
-    }
-}
+/* Bounds checks are now inline in emit_expr(NODE_INDEX) using the comma
+ * operator: (_zer_bounds_check(idx, len, ...), arr)[idx].
+ * This respects short-circuit (&&/||) and works in if/while/for conditions.
+ * The old statement-level emit_bounds_checks() hoisting has been removed. */
 
 /* emit all accumulated defers in reverse order */
 /* emit defers from current count down to 'base' (exclusive) */
@@ -1245,9 +1258,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             type = vp;
         }
 
-        /* bounds checks for initializer */
-        if (node->var_decl.init)
-            emit_bounds_checks(e, node->var_decl.init);
+        /* bounds checks now inline in emit_expr(NODE_INDEX) */
 
         /* Special case: u32 y = x orelse return;
          * → { auto _t = x; if (!_t.has_value) return; }
@@ -1259,7 +1270,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             Type *or_expr_type = checker_get_type(node->var_decl.init->orelse.expr);
             bool or_is_ptr = or_expr_type &&
                 or_expr_type->kind == TYPE_OPTIONAL &&
-                IS_NULL_SENTINEL(or_expr_type->optional.inner->kind);
+                is_null_sentinel(or_expr_type->optional.inner);
 
             int tmp = e->temp_count++;
             emit_indent(e);
@@ -1275,7 +1286,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (node->var_decl.init->orelse.fallback_is_return) {
                 emit(e, "{ "); emit_defers(e);
                 if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                    !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind)) {
+                    !is_null_sentinel(e->current_func_ret->optional.inner)) {
                     /* ?T function: return null optional */
                     emit(e, "return (");
                     emit_type(e, e->current_func_ret);
@@ -1316,7 +1327,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             /* Optional init: null → {0, 0}, value → {val, 1}
              * But if init is a function call returning ?T, just assign directly */
             if (type && type->kind == TYPE_OPTIONAL &&
-                !IS_NULL_SENTINEL(type->optional.inner->kind)) {
+                !is_null_sentinel(type->optional.inner)) {
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
                     if (type->optional.inner->kind == TYPE_VOID)
                         emit(e, " = { 0 }");
@@ -1386,7 +1397,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             Type *cond_type = checker_get_type(node->if_stmt.cond);
             bool is_ptr_opt = cond_type &&
                 cond_type->kind == TYPE_OPTIONAL &&
-                IS_NULL_SENTINEL(cond_type->optional.inner->kind);
+                is_null_sentinel(cond_type->optional.inner);
 
             emit_indent(e);
             emit(e, "{\n");
@@ -1514,14 +1525,14 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_RETURN:
-        if (node->ret.expr) emit_bounds_checks(e, node->ret.expr);
+        /* bounds checks now inline in emit_expr(NODE_INDEX) */
         /* emit defers before return (reverse order) */
         emit_defers(e);
         emit_indent(e);
         if (node->ret.expr) {
             /* return null from ?T function → return {0, 0} (or {0} for ?void) */
             if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind) &&
+                !is_null_sentinel(e->current_func_ret->optional.inner) &&
                 node->ret.expr->kind == NODE_NULL_LIT) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
@@ -1533,7 +1544,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
             /* return value from ?T function → return {value, 1} */
             else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                     !IS_NULL_SENTINEL(e->current_func_ret->optional.inner->kind) &&
+                     !is_null_sentinel(e->current_func_ret->optional.inner) &&
                      node->ret.expr->kind != NODE_NULL_LIT) {
                 /* check if expr already has the optional type (e.g. return ring.pop()) */
                 Type *expr_type = checker_get_type(node->ret.expr);
@@ -1592,7 +1603,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_EXPR_STMT:
-        emit_bounds_checks(e, node->expr_stmt.expr);
+        /* bounds checks now inline in emit_expr(NODE_INDEX) */
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");
@@ -1975,7 +1986,7 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (node->var_decl.init) {
         /* optional null init needs struct literal, not scalar 0 */
         if (type && type->kind == TYPE_OPTIONAL &&
-            !IS_NULL_SENTINEL(type->optional.inner->kind) &&
+            !is_null_sentinel(type->optional.inner) &&
             node->var_decl.init->kind == NODE_NULL_LIT) {
             if (type->optional.inner->kind == TYPE_VOID)
                 emit(e, " = { 0 }");
@@ -2391,6 +2402,26 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
             break;
 
         case NODE_GLOBAL_VAR:  emit_global_var(e, decl); break;
+
+        case NODE_INTERRUPT:
+            emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void) ",
+                 (int)decl->interrupt.name_len, decl->interrupt.name);
+            if (decl->interrupt.body) {
+                emit_stmt(e, decl->interrupt.body);
+            }
+            emit(e, "\n");
+            break;
+
+        case NODE_TYPEDEF:
+            {
+                Type *underlying = resolve_type_for_emit(e, decl->typedef_decl.type);
+                emit(e, "typedef ");
+                emit_type_and_name(e, underlying,
+                    decl->typedef_decl.name, decl->typedef_decl.name_len);
+                emit(e, ";\n\n");
+            }
+            break;
+
         default: break;
         }
     }

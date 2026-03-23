@@ -1,0 +1,4 @@
+import hal;
+u32 main() {
+    return irq_count;
+}

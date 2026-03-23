@@ -2315,6 +2315,22 @@ int main(void) {
         20,
         "i32 slice expression with named typedef → 20");
 
+    /* BUG-089: distinct func ptr + array-to-slice coercion */
+    printf("[BUG-089: distinct func ptr array coerce]\n");
+    test_compile_and_run(
+        "u32 sum3([]u32 d) {\n"
+        "    return d[0] + d[1] + d[2];\n"
+        "}\n"
+        "distinct typedef u32 (*Summer)([]u32);\n"
+        "u32 main() {\n"
+        "    Summer fn = @cast(Summer, sum3);\n"
+        "    u32[3] buf;\n"
+        "    buf[0] = 10; buf[1] = 20; buf[2] = 30;\n"
+        "    return fn(buf);\n"
+        "}\n",
+        60,
+        "distinct func ptr + array-to-slice: sum [10,20,30] = 60");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

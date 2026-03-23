@@ -28,6 +28,16 @@ run_test diamond 44
 run_test use_types 50
 run_test use_defs 42
 
+# BUG-087: imported interrupt — compile-only (interrupt attr is ARM-specific)
+$ZERC use_hal.zer -o _use_hal.c 2>/dev/null
+if [ $? -eq 0 ] && grep -q "USART1_IRQHandler" _use_hal.c; then
+    echo "  use_hal: interrupt handler emitted (compile-only)"
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: use_hal (interrupt handler not emitted)"
+    FAIL=$((FAIL+1))
+fi
+
 # cleanup
 rm -f _*.c _*.exe
 

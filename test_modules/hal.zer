@@ -1,0 +1,5 @@
+u32 irq_count = 0;
+void inc_count() { irq_count += 1; }
+interrupt USART1 {
+    inc_count();
+}

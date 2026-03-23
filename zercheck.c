@@ -441,6 +441,23 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
 
     PathState ps;
     pathstate_init(&ps);
+
+    /* register Handle(T) parameters as alive handles so use-after-free
+     * on parameters is caught within the function body (BUG-117 fix) */
+    for (int i = 0; i < func->func_decl.param_count; i++) {
+        TypeNode *tnode = func->func_decl.params[i].type;
+        if (tnode && tnode->kind == TYNODE_HANDLE) {
+            HandleInfo *h = add_handle(&ps,
+                func->func_decl.params[i].name,
+                (uint32_t)func->func_decl.params[i].name_len);
+            if (h) {
+                h->state = HS_ALIVE;
+                h->pool_id = -1; /* unknown pool — can't validate wrong-pool */
+                h->alloc_line = func->loc.line;
+            }
+        }
+    }
+
     zc_check_stmt(zc, &ps, func->func_decl.body);
     pathstate_free(&ps);
 }

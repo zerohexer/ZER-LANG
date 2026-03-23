@@ -332,6 +332,25 @@ int main(void) {
         "}\n",
         "use-after-free in while condition");
 
+    /* BUG-117: handle parameters tracked */
+    printf("\n[handle param: use-after-free — error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void use_handle(Handle(T) h) {\n"
+        "    pool.free(h);\n"
+        "    pool.get(h).x = 5;\n"
+        "}\n",
+        "handle param: free then use — use-after-free");
+
+    printf("[handle param: valid use — OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void use_handle(Handle(T) h) {\n"
+       "    pool.get(h).x = 5;\n"
+       "    pool.free(h);\n"
+       "}\n",
+       "handle param: use then free — OK");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

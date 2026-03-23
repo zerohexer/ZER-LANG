@@ -73,6 +73,12 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-117: ZER-CHECK misses use-after-free on Handle parameters
+- **Symptom:** `void f(Handle(T) h) { pool.free(h); pool.get(h).x = 5; }` — use-after-free on parameter handle not detected by zercheck.
+- **Root cause:** `zc_check_function` created a fresh PathState but never registered Handle parameters as alive handles. Only `pool.alloc()` results were tracked.
+- **Fix:** Scan function parameters for TYNODE_HANDLE and register them as HS_ALIVE in the PathState before checking the function body. Pool ID set to -1 (unknown — can't validate wrong-pool for params).
+- **Test:** `test_zercheck.c` — handle param free+use → error, handle param use+free → OK.
+
 ### BUG-113: `[]bool` type emission uses anonymous struct instead of `_zer_slice_u8`
 - **Symptom:** `[]bool` parameter emits anonymous `struct { uint8_t* ptr; size_t len; }` but slice expression uses `_zer_slice_u8`. GCC type mismatch.
 - **Root cause:** `emit_type(TYPE_SLICE)` and `emit_type(TYPE_OPTIONAL > TYPE_SLICE)` inner switches missing `case TYPE_BOOL:`.

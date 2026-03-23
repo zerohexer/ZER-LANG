@@ -1691,11 +1691,23 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit_indent(e);
                 /* extract variant from anonymous union */
                 if (arm->capture_is_ptr) {
-                    /* mutable capture |*v| — pointer to variant */
-                    emit(e, "__auto_type *%.*s = &_zer_sw%d.%.*s;\n",
+                    /* mutable capture |*v| — pointer to variant
+                     * Can't use __auto_type * (GCC rejects it) — look up variant type */
+                    const char *vname = arm->values[0]->ident.name;
+                    uint32_t vlen = (uint32_t)arm->values[0]->ident.name_len;
+                    Type *vtype = NULL;
+                    for (uint32_t vi = 0; vi < sw_type->union_type.variant_count; vi++) {
+                        if (sw_type->union_type.variants[vi].name_len == vlen &&
+                            memcmp(sw_type->union_type.variants[vi].name, vname, vlen) == 0) {
+                            vtype = sw_type->union_type.variants[vi].type;
+                            break;
+                        }
+                    }
+                    if (vtype) emit_type(e, vtype);
+                    else emit(e, "void");
+                    emit(e, " *%.*s = &_zer_sw%d.%.*s;\n",
                          (int)arm->capture_name_len, arm->capture_name,
-                         sw_tmp,
-                         (int)arm->values[0]->ident.name_len, arm->values[0]->ident.name);
+                         sw_tmp, (int)vlen, vname);
                 } else {
                     /* immutable capture |v| — value copy */
                     emit(e, "__auto_type %.*s = _zer_sw%d.%.*s;\n",

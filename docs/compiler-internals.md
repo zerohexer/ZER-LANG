@@ -293,6 +293,9 @@ Enums emit as `#define` constants, not C enums:
 - Checker unwraps TYPE_DISTINCT before TYPE_FUNC_PTR dispatch in NODE_CALL
 - Negative enum values: parser produces NODE_UNARY(MINUS, INT_LIT) — checker and emitter both handle this pattern
 
+### Known Limitation: Mutable Union Capture
+Switch on a union copies the value into `_zer_sw`. Mutable capture `|*v|` gets a pointer to the copy, not the original. Mutations don't persist. **v0.1.1 fix:** change `__auto_type _zer_sw = expr` to `__auto_type *_zer_sw = &expr` and adjust all variant reads to dereference through the pointer.
+
 ### Keeping emit_file and emit_file_no_preamble in sync
 Both functions emit struct/union/enum declarations. Every typedef emitted in `emit_file` MUST also be emitted in `emit_file_no_preamble`. Current list per struct: `_zer_opt_`, `_zer_slice_`, `_zer_opt_slice_`. Per union: same three. Missing any causes GCC errors in multi-module projects.
 

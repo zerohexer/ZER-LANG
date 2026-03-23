@@ -112,5 +112,8 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
 **Audit status:** 5 rounds completed, converged (12→9→2→2→1). 26 systematic negative tests covering all checker rejection paths.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
-**Known limitations:** `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first. No native backends (emit-C only).
+**Known limitations:**
+- **Mutable union capture `|*v|` modifies a copy, not the original** — switch copies the union value before dispatch. Mutable captures write to the copy. Fix requires switch to take a reference (`&expr`). Planned for v0.1.1.
+- `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first.
+- No native backends (emit-C only).
 **Next:** v0.1.0 tag.

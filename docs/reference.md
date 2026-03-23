@@ -223,6 +223,8 @@ switch (msg) {
 msg.sensor.temperature;      // COMPILE ERROR — must switch first
 ```
 
+**Known limitation:** Mutable capture `|*v|` modifies a copy of the union, not the original. The switch copies the union value before dispatch. This will be fixed in v0.1.1.
+
 ### Function Pointers
 
 Same syntax as C. Optional function pointers use null sentinel (zero overhead).

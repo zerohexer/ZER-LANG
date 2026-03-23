@@ -73,6 +73,30 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-113: `[]bool` type emission uses anonymous struct instead of `_zer_slice_u8`
+- **Symptom:** `[]bool` parameter emits anonymous `struct { uint8_t* ptr; size_t len; }` but slice expression uses `_zer_slice_u8`. GCC type mismatch.
+- **Root cause:** `emit_type(TYPE_SLICE)` and `emit_type(TYPE_OPTIONAL > TYPE_SLICE)` inner switches missing `case TYPE_BOOL:`.
+- **Fix:** Added `case TYPE_BOOL:` mapping to `_zer_slice_u8` / `_zer_opt_slice_u8` (bool = uint8_t in C).
+- **Test:** `test_emit.c` — `[]bool` param + slice expression, count true values.
+
+### BUG-114: Switch exhaustiveness skipped for distinct typedef over enum/bool/union
+- **Symptom:** `switch (shade) { .red => {} }` where `Shade` is `distinct typedef Color` — non-exhaustive switch passes without error.
+- **Root cause:** Exhaustiveness check dispatches on `expr->kind` without unwrapping TYPE_DISTINCT. Distinct enums/bools/unions skip all exhaustiveness logic.
+- **Fix:** Added `Type *sw_type = type_unwrap_distinct(expr)` before the exhaustiveness dispatch. All checks use `sw_type`.
+- **Test:** `test_checker_full.c` — distinct enum non-exhaustive → error.
+
+### BUG-115: `arena.alloc_slice()` result not tracked as arena-derived
+- **Symptom:** `[]D s = arena.alloc_slice(D, 4) orelse return; global = s;` — alloc_slice result escapes to global without error.
+- **Root cause:** Arena-derived detection only checked `mlen == 5 && "alloc"`, missing `mlen == 11 && "alloc_slice"`.
+- **Fix:** Added `|| (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0)` to the detection condition.
+- **Test:** `test_checker_full.c` — arena.alloc_slice escape to global → error.
+
+### BUG-116: ZER-CHECK misses handle use-after-free in if/while/for conditions
+- **Symptom:** `pool.free(h); if (pool.get(h).x == 5) {}` — use-after-free in condition not detected by zercheck.
+- **Root cause:** `zc_check_stmt` for NODE_IF never called `zc_check_expr` on condition. NODE_FOR/NODE_WHILE never checked init/cond/step.
+- **Fix:** Added `zc_check_expr` calls for: if condition, while condition, for init/cond/step.
+- **Test:** `test_zercheck.c` — use-after-free in if condition and while condition caught.
+
 ### BUG-111: Field access on distinct struct types fails — checker doesn't unwrap distinct
 - **Symptom:** `Job j; j.id` where `Job` is `distinct typedef Task` — "cannot access field 'id' on type 'Job'". Both direct access and pointer auto-deref (`*Job` → field) affected.
 - **Root cause:** Checker NODE_FIELD handler dispatches on `obj->kind` for struct/enum/union/pointer without unwrapping TYPE_DISTINCT first. Distinct structs fall through to "cannot access field" error.

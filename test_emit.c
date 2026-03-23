@@ -2345,6 +2345,24 @@ int main(void) {
         42,
         "distinct struct: field access + ptr deref + global auto-zero → 42");
 
+    /* BUG-113: []bool named typedef */
+    printf("[BUG-113: []bool slice]\n");
+    test_compile_and_run(
+        "u32 count_true([]bool f) {\n"
+        "    u32 c = 0;\n"
+        "    for (usize i = 0; i < f.len; i += 1) {\n"
+        "        if (f[i]) { c += 1; }\n"
+        "    }\n"
+        "    return c;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    bool[4] a;\n"
+        "    a[0] = true; a[1] = false; a[2] = true; a[3] = true;\n"
+        "    return count_true(a[0..4]);\n"
+        "}\n",
+        3,
+        "[]bool param + slice expression → count 3 trues");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

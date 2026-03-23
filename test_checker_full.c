@@ -741,6 +741,29 @@ static void test_security_review(void) {
        "usize f() { return @offset(S, y); }\n",
        "@offset valid field (OK)");
 
+    /* BUG-114: switch exhaustiveness on distinct enum */
+    printf("[BUG-114: switch on distinct enum]\n");
+    err("enum Color { red, green, blue }\n"
+        "distinct typedef Color Shade;\n"
+        "void f() {\n"
+        "    Shade s = @cast(Shade, Color.red);\n"
+        "    switch (s) { .red => { } }\n"
+        "}\n",
+        "distinct enum non-exhaustive → error");
+
+    /* BUG-115: arena.alloc_slice escape */
+    printf("[BUG-115: arena.alloc_slice escape]\n");
+    err("struct D { u32 x; }\n"
+        "[]D g;\n"
+        "void f() {\n"
+        "    u8[1024] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    defer a.unsafe_reset();\n"
+        "    []D s = a.alloc_slice(D, 4) orelse return;\n"
+        "    g = s;\n"
+        "}\n",
+        "arena.alloc_slice escape to global → error");
+
     /* BUG-092: builtin arg count validation */
     printf("[BUG-092: builtin wrong arg counts]\n");
     err("struct T { u32 x; }\n"

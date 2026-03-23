@@ -311,6 +311,27 @@ int main(void) {
        "}\n",
        "alias: use before free — OK");
 
+    /* BUG-113: zercheck must check conditions */
+    printf("\n[zercheck: use-after-free in if condition]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    pool.free(h);\n"
+        "    if (pool.get(h).x == 5) { }\n"
+        "}\n",
+        "use-after-free in if condition");
+
+    printf("[zercheck: use-after-free in while condition]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    pool.free(h);\n"
+        "    while (pool.get(h).x < 10) { }\n"
+        "}\n",
+        "use-after-free in while condition");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

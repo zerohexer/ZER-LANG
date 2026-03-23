@@ -1557,7 +1557,8 @@ static void check_stmt(Checker *c, Node *node) {
                     Node *obj = alloc_call->call.callee->field.object;
                     const char *mname = alloc_call->call.callee->field.field_name;
                     size_t mlen = alloc_call->call.callee->field.field_name_len;
-                    if (obj && mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    if (obj && ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                               (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
                         Type *obj_type = checker_get_type(obj);
                         if (obj_type && obj_type->kind == TYPE_ARENA) {
                             sym->is_arena_derived = true;
@@ -1745,8 +1746,9 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
-        /* exhaustiveness check */
+        /* exhaustiveness check — unwrap distinct for type dispatch */
         {
+            Type *sw_type = type_unwrap_distinct(expr);
             bool has_default = false;
             for (int i = 0; i < node->switch_stmt.arm_count; i++) {
                 if (node->switch_stmt.arms[i].is_default) {
@@ -1755,10 +1757,10 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            if (expr->kind == TYPE_ENUM) {
+            if (sw_type->kind == TYPE_ENUM) {
                 /* enum switch: must handle all variants OR have default */
                 if (!has_default) {
-                    uint32_t total = expr->enum_type.variant_count;
+                    uint32_t total = sw_type->enum_type.variant_count;
                     /* track unique variants covered using a bitmask (up to 64 variants) */
                     uint64_t covered = 0;
                     for (int i = 0; i < node->switch_stmt.arm_count; i++) {
@@ -1779,8 +1781,8 @@ static void check_stmt(Checker *c, Node *node) {
                             }
                             if (vname) {
                                 for (uint32_t vi = 0; vi < total; vi++) {
-                                    if (expr->enum_type.variants[vi].name_len == vname_len &&
-                                        memcmp(expr->enum_type.variants[vi].name, vname, vname_len) == 0) {
+                                    if (sw_type->enum_type.variants[vi].name_len == vname_len &&
+                                        memcmp(sw_type->enum_type.variants[vi].name, vname, vname_len) == 0) {
                                         if (vi < 64) covered |= (1ULL << vi);
                                         break;
                                     }
@@ -1797,11 +1799,11 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "switch on enum '%.*s' is not exhaustive — "
                             "handles %u of %u variants",
-                            (int)expr->enum_type.name_len,
-                            expr->enum_type.name, handled, total);
+                            (int)sw_type->enum_type.name_len,
+                            sw_type->enum_type.name, handled, total);
                     }
                 }
-            } else if (type_equals(expr, ty_bool)) {
+            } else if (type_equals(sw_type, ty_bool)) {
                 /* bool switch: must handle both true and false */
                 if (!has_default) {
                     bool has_true = false, has_false = false;
@@ -1820,15 +1822,15 @@ static void check_stmt(Checker *c, Node *node) {
                             "switch on bool must handle both true and false");
                     }
                 }
-            } else if (type_is_integer(expr)) {
+            } else if (type_is_integer(sw_type)) {
                 /* integer switch: must have default */
                 if (!has_default) {
                     checker_error(c, node->loc.line,
                         "switch on integer must have a default arm");
                 }
-            } else if (expr->kind == TYPE_UNION) {
+            } else if (sw_type->kind == TYPE_UNION) {
                 /* validate variant names + exhaustiveness via bitmask */
-                uint32_t total = expr->union_type.variant_count;
+                uint32_t total = sw_type->union_type.variant_count;
                 uint64_t covered = 0;
                 for (int i = 0; i < node->switch_stmt.arm_count; i++) {
                     SwitchArm *arm = &node->switch_stmt.arms[i];
@@ -1847,8 +1849,8 @@ static void check_stmt(Checker *c, Node *node) {
                         if (vname) {
                             bool found = false;
                             for (uint32_t vi = 0; vi < total; vi++) {
-                                if (expr->union_type.variants[vi].name_len == (uint32_t)vname_len &&
-                                    memcmp(expr->union_type.variants[vi].name, vname, vname_len) == 0) {
+                                if (sw_type->union_type.variants[vi].name_len == (uint32_t)vname_len &&
+                                    memcmp(sw_type->union_type.variants[vi].name, vname, vname_len) == 0) {
                                     if (vi < 64) covered |= (1ULL << vi);
                                     found = true;
                                     break;
@@ -1858,7 +1860,7 @@ static void check_stmt(Checker *c, Node *node) {
                                 checker_error(c, node->loc.line,
                                     "no variant '%.*s' in union '%.*s'",
                                     (int)vname_len, vname,
-                                    (int)expr->union_type.name_len, expr->union_type.name);
+                                    (int)sw_type->union_type.name_len, sw_type->union_type.name);
                             }
                         }
                     }
@@ -1872,8 +1874,8 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "switch on union '%.*s' is not exhaustive — "
                             "handles %u of %u variants",
-                            (int)expr->union_type.name_len,
-                            expr->union_type.name, handled, total);
+                            (int)sw_type->union_type.name_len,
+                            sw_type->union_type.name, handled, total);
                     }
                 }
             }

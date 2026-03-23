@@ -310,6 +310,9 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         break;
 
     case NODE_IF: {
+        /* check condition for handle use-after-free */
+        if (node->if_stmt.cond)
+            zc_check_expr(zc, ps, node->if_stmt.cond);
         /* fork paths at if/else */
         PathState then_state = pathstate_copy(ps);
         zc_check_stmt(zc, &then_state, node->if_stmt.then_body);
@@ -349,6 +352,14 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
     case NODE_FOR:
     case NODE_WHILE: {
+        /* check init/cond/step for handle use-after-free */
+        if (node->kind == NODE_FOR) {
+            if (node->for_stmt.init) zc_check_stmt(zc, ps, node->for_stmt.init);
+            if (node->for_stmt.cond) zc_check_expr(zc, ps, node->for_stmt.cond);
+            if (node->for_stmt.step) zc_check_expr(zc, ps, node->for_stmt.step);
+        } else {
+            if (node->while_stmt.cond) zc_check_expr(zc, ps, node->while_stmt.cond);
+        }
         Node *body = (node->kind == NODE_FOR) ?
             node->for_stmt.body : node->while_stmt.body;
 

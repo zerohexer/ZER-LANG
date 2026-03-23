@@ -128,7 +128,8 @@ static void emit_type(Emitter *e, Type *t) {
             /* ?[]T → _zer_opt_slice_T — unwrap distinct on element type */
             Type *elem = type_unwrap_distinct(opt_inner->slice.inner);
             switch (elem->kind) {
-            case TYPE_U8:    emit(e, "_zer_opt_slice_u8"); break;
+            case TYPE_U8:
+            case TYPE_BOOL:  emit(e, "_zer_opt_slice_u8"); break; /* bool = uint8_t */
             case TYPE_U16:   emit(e, "_zer_opt_slice_u16"); break;
             case TYPE_U32:   emit(e, "_zer_opt_slice_u32"); break;
             case TYPE_U64:   emit(e, "_zer_opt_slice_u64"); break;
@@ -168,7 +169,8 @@ static void emit_type(Emitter *e, Type *t) {
         /* Unwrap TYPE_DISTINCT for named typedef lookup */
         Type *sl_inner = type_unwrap_distinct(t->slice.inner);
         switch (sl_inner->kind) {
-        case TYPE_U8:    emit(e, "_zer_slice_u8"); break;
+        case TYPE_U8:
+        case TYPE_BOOL:  emit(e, "_zer_slice_u8"); break; /* bool = uint8_t */
         case TYPE_U16:   emit(e, "_zer_slice_u16"); break;
         case TYPE_U32:   emit(e, "_zer_slice_u32"); break;
         case TYPE_U64:   emit(e, "_zer_slice_u64"); break;

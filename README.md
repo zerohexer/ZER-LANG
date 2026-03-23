@@ -195,13 +195,13 @@ Lexer:                      218 tests
 Parser:                     162 tests
 Type Checker:               315 tests
 ZER-CHECK:                   20 tests
-C Emitter:                  148 end-to-end tests
+C Emitter:                  151 end-to-end tests
 Module Imports:               6 patterns
 Firmware Patterns (3 rounds): 102 end-to-end tests
 Production Firmware:          14 end-to-end tests
 Parser Fuzz:                 491 adversarial inputs
 ──────────────────────────────────────────────────
-Total:                      979 tests + 491 fuzz, all passing
+Total:                      982 tests + 491 fuzz, all passing
 ```
 
 All 227 end-to-end tests verified at GCC `-O2` — no optimizer-exposed issues.
@@ -230,9 +230,9 @@ ZER compiles to C99 and runs on any target GCC supports.
 
 **Proven against real CVEs:** Heartbleed (CVE-2014-0160) and Baron Samedit (CVE-2021-3156) reproduced side-by-side — C silently leaks memory, ZER traps at the bounds check. See [`examples/cve-demos/`](examples/cve-demos/).
 
-**Multiple exhaustive rounds of systematic auditing.** Each round spawned independent agents to audit the checker and emitter for bugs, then every finding was manually verified against the actual compiler before fixing. Bug count per round: 12 → 9 → 2 → 2 → 1 → 2 → CLEAN → 6 → 12. 103 bugs found and fixed.
+**Multiple exhaustive rounds of systematic auditing.** Each round spawned independent agents to audit the checker and emitter for bugs, then every finding was manually verified against the actual compiler before fixing. Bug count per round: 12 → 9 → 2 → 2 → 1 → 2 → CLEAN → 6 → 12. 105 bugs found and fixed.
 
-**979 tests across 7 dimensions:**
+**982 tests across 7 dimensions:**
 - **Lexer** — 218 tests: every token type, edge cases, error recovery
 - **Parser** — 162 tests: every AST node kind, adversarial inputs
 - **Type Checker** — 315 tests: every type coercion, every rejection rule (26 systematic negative tests + 14 security/audit tests)

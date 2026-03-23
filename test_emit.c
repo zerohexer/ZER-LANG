@@ -2235,6 +2235,44 @@ int main(void) {
         11,
         "defer fires inside if-unwrap block, counter=11 before after_if");
 
+    /* ---- BUG-104/105: TYPE_DISTINCT unwrap in optional/slice emission ---- */
+    printf("\n[BUG-104: ?DistinctStruct uses named typedef]\n");
+    test_compile_and_run(
+        "struct Point { u32 x; u32 y; }\n"
+        "distinct typedef Point Vec2;\n"
+        "?Vec2 maybe_vec() { return null; }\n"
+        "u32 main() {\n"
+        "    ?Vec2 v = maybe_vec();\n"
+        "    if (v) |val| { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "?DistinctStruct: null → if-unwrap skipped → 0");
+
+    printf("[BUG-104: ?Distinct(u32) orelse]\n");
+    test_compile_and_run(
+        "distinct typedef u32 Score;\n"
+        "?Score get_score() { return @cast(Score, 42); }\n"
+        "u32 main() {\n"
+        "    Score s = get_score() orelse return;\n"
+        "    return @cast(u32, s);\n"
+        "}\n",
+        42,
+        "?Distinct orelse return: unwrap Score → 42");
+
+    printf("[BUG-105: []DistinctType slice]\n");
+    test_compile_and_run(
+        "distinct typedef u32 Meters;\n"
+        "u32 main() {\n"
+        "    Meters[4] arr;\n"
+        "    arr[0] = @cast(Meters, 10);\n"
+        "    arr[1] = @cast(Meters, 20);\n"
+        "    []Meters s = arr[0..2];\n"
+        "    return @cast(u32, s[0]);\n"
+        "}\n",
+        10,
+        "[]Distinct: slice of distinct u32 → 10");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-104: `?DistinctType` emits anonymous struct instead of named typedef
+- **Symptom:** `?Vec2` (where Vec2 is `distinct typedef Point`) emits anonymous `struct { struct Point value; uint8_t has_value; }` instead of `_zer_opt_Point`. GCC type mismatch between function return and variable declaration.
+- **Root cause:** `emit_type(TYPE_OPTIONAL)` inner switch dispatches on `t->optional.inner->kind`. When inner is TYPE_DISTINCT, it falls to the anonymous struct default because TYPE_DISTINCT isn't in the switch.
+- **Fix:** Unwrap TYPE_DISTINCT before the switch: `opt_inner = t->optional.inner; if (opt_inner->kind == TYPE_DISTINCT) opt_inner = opt_inner->distinct.underlying;`. All references within the switch use `opt_inner`.
+- **Test:** `test_emit.c` — `?DistinctStruct` returns null, if-unwrap skipped. `?Distinct(u32)` with orelse.
+
+### BUG-105: `[]DistinctType` emits anonymous struct in both emit_type and NODE_SLICE
+- **Symptom:** `[]Meters` (where Meters is `distinct typedef u32`) emits anonymous `struct { uint32_t* ptr; size_t len; }` instead of `_zer_slice_u32`. Same mismatch pattern as BUG-104.
+- **Root cause:** Both `emit_type(TYPE_SLICE)` and NODE_SLICE expression emission dispatch on inner->kind without unwrapping TYPE_DISTINCT.
+- **Fix:** Unwrap TYPE_DISTINCT in both paths: `sl_inner`/`eff_elem` variables unwrap before the switch.
+- **Test:** `test_emit.c` — `[]Distinct` slice expression compiles and runs.
+
 ### BUG-099: `\x` hex escape in char literals stores wrong value
 - **Symptom:** `u8 c = '\x0A';` stores 120 ('x') instead of 10 (0x0A).
 - **Root cause:** `parser.c:444` — escape sequence switch had no `case 'x':` handler. `\xNN` fell to `default:` which stored `text[2]` literally (the character 'x').

@@ -91,8 +91,12 @@ static void emit_type(Emitter *e, Type *t) {
             emit_type(e, t->optional.inner);
             break;
         }
-        /* ?T → named optional typedef */
-        switch (t->optional.inner->kind) {
+        /* ?T → named optional typedef.
+         * Unwrap TYPE_DISTINCT to find the actual type for typedef lookup. */
+        Type *opt_inner = t->optional.inner;
+        if (opt_inner->kind == TYPE_DISTINCT)
+            opt_inner = opt_inner->distinct.underlying;
+        switch (opt_inner->kind) {
         case TYPE_VOID:  emit(e, "_zer_opt_void"); break;
         case TYPE_BOOL:  emit(e, "_zer_opt_bool"); break;
         case TYPE_U8:    emit(e, "_zer_opt_u8"); break;
@@ -114,17 +118,17 @@ static void emit_type(Emitter *e, Type *t) {
             break;
         case TYPE_STRUCT:
             emit(e, "_zer_opt_%.*s",
-                 (int)t->optional.inner->struct_type.name_len,
-                 t->optional.inner->struct_type.name);
+                 (int)opt_inner->struct_type.name_len,
+                 opt_inner->struct_type.name);
             break;
         case TYPE_UNION:
             emit(e, "_zer_opt_%.*s",
-                 (int)t->optional.inner->union_type.name_len,
-                 t->optional.inner->union_type.name);
+                 (int)opt_inner->union_type.name_len,
+                 opt_inner->union_type.name);
             break;
         case TYPE_SLICE: {
             /* ?[]T → _zer_opt_slice_T */
-            Type *elem = t->optional.inner->slice.inner;
+            Type *elem = opt_inner->slice.inner;
             switch (elem->kind) {
             case TYPE_U8:    emit(e, "_zer_opt_slice_u8"); break;
             case TYPE_U16:   emit(e, "_zer_opt_slice_u16"); break;
@@ -147,7 +151,7 @@ static void emit_type(Emitter *e, Type *t) {
                 break;
             default:
                 emit(e, "struct { ");
-                emit_type(e, t->optional.inner);
+                emit_type(e, opt_inner);
                 emit(e, " value; uint8_t has_value; }");
                 break;
             }
@@ -156,14 +160,18 @@ static void emit_type(Emitter *e, Type *t) {
         default:
             /* fallback: anonymous struct — only for ?FuncPtr (extremely rare) */
             emit(e, "struct { ");
-            emit_type(e, t->optional.inner);
+            emit_type(e, opt_inner);
             emit(e, " value; uint8_t has_value; }");
             break;
         }
         break;
 
-    case TYPE_SLICE:
-        switch (t->slice.inner->kind) {
+    case TYPE_SLICE: {
+        /* Unwrap TYPE_DISTINCT for named typedef lookup */
+        Type *sl_inner = t->slice.inner;
+        if (sl_inner->kind == TYPE_DISTINCT)
+            sl_inner = sl_inner->distinct.underlying;
+        switch (sl_inner->kind) {
         case TYPE_U8:    emit(e, "_zer_slice_u8"); break;
         case TYPE_U16:   emit(e, "_zer_slice_u16"); break;
         case TYPE_U32:   emit(e, "_zer_slice_u32"); break;
@@ -177,21 +185,22 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_F64:   emit(e, "_zer_slice_f64"); break;
         case TYPE_STRUCT:
             emit(e, "_zer_slice_%.*s",
-                 (int)t->slice.inner->struct_type.name_len,
-                 t->slice.inner->struct_type.name);
+                 (int)sl_inner->struct_type.name_len,
+                 sl_inner->struct_type.name);
             break;
         case TYPE_UNION:
             emit(e, "_zer_slice_%.*s",
-                 (int)t->slice.inner->union_type.name_len,
-                 t->slice.inner->union_type.name);
+                 (int)sl_inner->union_type.name_len,
+                 sl_inner->union_type.name);
             break;
         default:
             emit(e, "struct { ");
-            emit_type(e, t->slice.inner);
+            emit_type(e, sl_inner);
             emit(e, "* ptr; size_t len; }");
             break;
         }
         break;
+    }
 
     case TYPE_ARRAY:
         emit_type(e, t->array.inner);
@@ -800,11 +809,15 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *elem_type = obj_type ? (obj_type->kind == TYPE_ARRAY ?
             obj_type->array.inner : obj_type->kind == TYPE_SLICE ?
             obj_type->slice.inner : NULL) : NULL;
+        /* Unwrap distinct for named typedef lookup */
+        Type *eff_elem = elem_type;
+        if (eff_elem && eff_elem->kind == TYPE_DISTINCT)
+            eff_elem = eff_elem->distinct.underlying;
         /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
         bool slice_type_emitted = false;
-        if (elem_type) {
+        if (eff_elem) {
             const char *sname = NULL;
-            switch (elem_type->kind) {
+            switch (eff_elem->kind) {
             case TYPE_U8:    sname = "_zer_slice_u8"; break;
             case TYPE_U16:   sname = "_zer_slice_u16"; break;
             case TYPE_U32:   sname = "_zer_slice_u32"; break;
@@ -822,13 +835,13 @@ static void emit_expr(Emitter *e, Node *node) {
             if (sname) {
                 emit(e, "((%s){ ", sname);
                 slice_type_emitted = true;
-            } else if (elem_type->kind == TYPE_STRUCT) {
+            } else if (eff_elem->kind == TYPE_STRUCT) {
                 emit(e, "((_zer_slice_%.*s){ ",
-                     (int)elem_type->struct_type.name_len, elem_type->struct_type.name);
+                     (int)eff_elem->struct_type.name_len, eff_elem->struct_type.name);
                 slice_type_emitted = true;
-            } else if (elem_type->kind == TYPE_UNION) {
+            } else if (eff_elem->kind == TYPE_UNION) {
                 emit(e, "((_zer_slice_%.*s){ ",
-                     (int)elem_type->union_type.name_len, elem_type->union_type.name);
+                     (int)eff_elem->union_type.name_len, eff_elem->union_type.name);
                 slice_type_emitted = true;
             }
         }

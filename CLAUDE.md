@@ -293,8 +293,8 @@ During a union switch arm with capture, `checker.union_switch_var` is set to the
 **10. Arena-derived pointers tracked via `is_arena_derived` flag.**
 When a variable is initialized from `arena.alloc(T)` (including through orelse), the Symbol gets `is_arena_derived = true`. Assigning this variable to a global/static target (walking field/index chain) is a compile error. Flag propagates through aliases (`q = arena_ptr` marks `q` as arena-derived too).
 
-**11. `emit_type` must unwrap TYPE_DISTINCT before inner-type dispatch.**
-`emit_type(TYPE_OPTIONAL)` and `emit_type(TYPE_SLICE)` both have inner switches that map to named typedefs (`_zer_opt_T`, `_zer_slice_T`). If the inner type is TYPE_DISTINCT, it must be unwrapped FIRST or it falls to the anonymous struct default. Use `opt_inner`/`sl_inner` local variables. Same for NODE_SLICE expression emission (`eff_elem`). This was the #1 bug pattern — caused BUG-074, 088, 089, 104, 105.
+**11. Use `type_unwrap_distinct(t)` before any type-kind dispatch.**
+`types.h` provides `type_unwrap_distinct(Type *t)` — returns `t->distinct.underlying` if TYPE_DISTINCT, otherwise `t` unchanged. Call this before ANY `switch (type->kind)` that maps to named typedefs or validates type categories. This was the #1 bug pattern (BUG-074, 088, 089, 104, 105, 110). Never write `if (t->kind == TYPE_DISTINCT) t = t->distinct.underlying;` manually — use the helper.
 
 **12. If-unwrap and switch capture arms must manage their own defer scope.**
 These code paths unwrap the block body to inject capture variables. Without saving/restoring `defer_stack.count`, defers inside the block accumulate at function scope and fire at function exit instead of block exit. Save `defer_base` before emitting block contents, call `emit_defers_from(e, defer_base)` after, restore count.

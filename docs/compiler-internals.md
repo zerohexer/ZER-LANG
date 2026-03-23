@@ -372,6 +372,6 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 13. **NODE_SLICE must use named typedefs for ALL primitives** — not just u8/u32. Anonymous structs create type mismatches with named `_zer_slice_T`.
 14. **Struct field lookup must error on miss** — don't silently return ty_void (old UFCS fallback). Same for field access on non-struct types.
 15. **If-unwrap and switch capture defer scope** — these paths unwrap blocks to inject captures. Must save `defer_stack.count` before, emit `emit_defers_from()` after, then restore count. Without this, defers fire at function exit instead of block exit.
-16. **`emit_type` inner switches must unwrap TYPE_DISTINCT** — both TYPE_OPTIONAL and TYPE_SLICE dispatch on `inner->kind` to find named typedefs. TYPE_DISTINCT wrapping falls to anonymous struct default. Unwrap first: `if (inner->kind == TYPE_DISTINCT) inner = inner->distinct.underlying;`
+16. **Use `type_unwrap_distinct(t)` helper for all type dispatch** — defined in `types.h`. Both TYPE_OPTIONAL and TYPE_SLICE dispatch on `inner->kind` to find named typedefs. TYPE_DISTINCT wrapping falls to anonymous struct default. Always unwrap: `Type *inner = type_unwrap_distinct(t->optional.inner);`. Never write the unwrap manually.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

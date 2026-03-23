@@ -211,8 +211,7 @@ static Type *resolve_type(Checker *c, TypeNode *tn);
 static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
     /* unwrap distinct for literal compatibility */
-    Type *effective = target;
-    if (target->kind == TYPE_DISTINCT) effective = target->distinct.underlying;
+    Type *effective = type_unwrap_distinct(target);
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) return true;
     /* bool is NOT an integer — no int→bool coercion (spec rule) */
     if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
@@ -878,9 +877,7 @@ static Type *check_expr(Checker *c, Node *node) {
         /* normal function call */
         Type *callee_type = check_expr(c, node->call.callee);
         /* unwrap distinct typedef for call dispatch */
-        Type *effective_callee = callee_type;
-        if (effective_callee->kind == TYPE_DISTINCT)
-            effective_callee = effective_callee->distinct.underlying;
+        Type *effective_callee = type_unwrap_distinct(callee_type);
 
         if (effective_callee->kind == TYPE_FUNC_PTR) {
             /* verify arg count */
@@ -1326,8 +1323,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(node->intrinsic.args[0]);
                     if (val_type) {
-                        Type *eff = val_type;
-                        if (eff->kind == TYPE_DISTINCT) eff = eff->distinct.underlying;
+                        Type *eff = type_unwrap_distinct(val_type);
                         if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
                             checker_error(c, node->loc.line,
                                 "@ptrcast source must be a pointer, got '%s'",
@@ -1360,8 +1356,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* validate source is numeric (unwrap distinct) */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
-                    Type *effective = val_type;
-                    if (effective && effective->kind == TYPE_DISTINCT) effective = effective->distinct.underlying;
+                    Type *effective = type_unwrap_distinct(val_type);
                     if (effective && !type_is_numeric(effective)) {
                         checker_error(c, node->loc.line,
                             "@truncate requires numeric source, got '%s'", type_name(val_type));
@@ -1376,8 +1371,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* validate source is numeric and target is integer */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
-                    Type *effective = val_type;
-                    if (effective && effective->kind == TYPE_DISTINCT) effective = effective->distinct.underlying;
+                    Type *effective = type_unwrap_distinct(val_type);
                     if (effective && !type_is_numeric(effective)) {
                         checker_error(c, node->loc.line,
                             "@saturate requires numeric source, got '%s'", type_name(val_type));
@@ -1397,8 +1391,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(node->intrinsic.args[0]);
                     if (val_type) {
-                        Type *eff = val_type;
-                        if (eff->kind == TYPE_DISTINCT) eff = eff->distinct.underlying;
+                        Type *eff = type_unwrap_distinct(val_type);
                         if (!type_is_integer(eff)) {
                             checker_error(c, node->loc.line,
                                 "@inttoptr address must be an integer, got '%s'",
@@ -1414,8 +1407,7 @@ static Type *check_expr(Checker *c, Node *node) {
             if (node->intrinsic.arg_count > 0) {
                 Type *val_type = typemap_get(node->intrinsic.args[0]);
                 if (val_type) {
-                    Type *eff = val_type;
-                    if (eff->kind == TYPE_DISTINCT) eff = eff->distinct.underlying;
+                    Type *eff = type_unwrap_distinct(val_type);
                     if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
                         checker_error(c, node->loc.line,
                             "@ptrtoint source must be a pointer, got '%s'",

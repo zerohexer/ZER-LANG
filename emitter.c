@@ -93,9 +93,7 @@ static void emit_type(Emitter *e, Type *t) {
         }
         /* ?T → named optional typedef.
          * Unwrap TYPE_DISTINCT to find the actual type for typedef lookup. */
-        Type *opt_inner = t->optional.inner;
-        if (opt_inner->kind == TYPE_DISTINCT)
-            opt_inner = opt_inner->distinct.underlying;
+        Type *opt_inner = type_unwrap_distinct(t->optional.inner);
         switch (opt_inner->kind) {
         case TYPE_VOID:  emit(e, "_zer_opt_void"); break;
         case TYPE_BOOL:  emit(e, "_zer_opt_bool"); break;
@@ -128,8 +126,7 @@ static void emit_type(Emitter *e, Type *t) {
             break;
         case TYPE_SLICE: {
             /* ?[]T → _zer_opt_slice_T — unwrap distinct on element type */
-            Type *elem = opt_inner->slice.inner;
-            if (elem->kind == TYPE_DISTINCT) elem = elem->distinct.underlying;
+            Type *elem = type_unwrap_distinct(opt_inner->slice.inner);
             switch (elem->kind) {
             case TYPE_U8:    emit(e, "_zer_opt_slice_u8"); break;
             case TYPE_U16:   emit(e, "_zer_opt_slice_u16"); break;
@@ -169,9 +166,7 @@ static void emit_type(Emitter *e, Type *t) {
 
     case TYPE_SLICE: {
         /* Unwrap TYPE_DISTINCT for named typedef lookup */
-        Type *sl_inner = t->slice.inner;
-        if (sl_inner->kind == TYPE_DISTINCT)
-            sl_inner = sl_inner->distinct.underlying;
+        Type *sl_inner = type_unwrap_distinct(t->slice.inner);
         switch (sl_inner->kind) {
         case TYPE_U8:    emit(e, "_zer_slice_u8"); break;
         case TYPE_U16:   emit(e, "_zer_slice_u16"); break;
@@ -696,9 +691,7 @@ static void emit_expr(Emitter *e, Node *node) {
             for (int i = 0; i < node->call.arg_count; i++) {
                 if (i > 0) emit(e, ", ");
                 /* unwrap distinct for callee type */
-                Type *eff_callee = callee_type;
-                if (eff_callee && eff_callee->kind == TYPE_DISTINCT)
-                    eff_callee = eff_callee->distinct.underlying;
+                Type *eff_callee = type_unwrap_distinct(callee_type);
                 /* slice→pointer decay: emit .ptr when passing []T to *T */
                 Type *arg_type = checker_get_type(node->call.args[i]);
                 bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
@@ -811,9 +804,7 @@ static void emit_expr(Emitter *e, Node *node) {
             obj_type->array.inner : obj_type->kind == TYPE_SLICE ?
             obj_type->slice.inner : NULL) : NULL;
         /* Unwrap distinct for named typedef lookup */
-        Type *eff_elem = elem_type;
-        if (eff_elem && eff_elem->kind == TYPE_DISTINCT)
-            eff_elem = eff_elem->distinct.underlying;
+        Type *eff_elem = type_unwrap_distinct(elem_type);
         /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
         bool slice_type_emitted = false;
         if (eff_elem) {

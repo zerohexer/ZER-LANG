@@ -143,6 +143,14 @@ struct Type {
     uint32_t defined_at_line;
 };
 
+/* Unwrap TYPE_DISTINCT to get the underlying concrete type.
+ * Use this before any switch on type->kind to prevent distinct types
+ * from falling through to default/anonymous-struct paths.
+ * Safe to call on any type — returns the type unchanged if not distinct. */
+static inline Type *type_unwrap_distinct(Type *t) {
+    return (t && t->kind == TYPE_DISTINCT) ? t->distinct.underlying : t;
+}
+
 /* ================================================================
  * Symbol Table — Scope Chain (Decision 2)
  * ================================================================ */

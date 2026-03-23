@@ -646,6 +646,63 @@ static void test_security_review(void) {
        "    d.x = 42;\n"
        "}\n",
        "arena ptr used locally (valid)");
+
+    printf("[gap fixes: builtin method errors, arena alias, union lock via ptr]\n");
+
+    /* unknown builtin methods */
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) p;\n"
+        "void f() { p.bogus(); }\n",
+        "Pool unknown method → error");
+
+    err("Ring(u8, 16) r;\n"
+        "void f() { r.clear(); }\n",
+        "Ring unknown method → error");
+
+    err("void f() {\n"
+        "    u8[64] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    a.destroy();\n"
+        "}\n",
+        "Arena unknown method → error");
+
+    /* arena-derived propagation through alias */
+    err("struct D { u32 x; }\n"
+        "*D g;\n"
+        "void f() {\n"
+        "    u8[512] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    defer a.unsafe_reset();\n"
+        "    *D d = a.alloc(D) orelse return;\n"
+        "    *D q = d;\n"
+        "    g = q;\n"
+        "}\n",
+        "arena alias escape via var-decl → error");
+
+    err("struct D { u32 x; }\n"
+        "*D g;\n"
+        "void f() {\n"
+        "    u8[512] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    defer a.unsafe_reset();\n"
+        "    *D d = a.alloc(D) orelse return;\n"
+        "    *D q = a.alloc(D) orelse return;\n"
+        "    q = d;\n"
+        "    g = q;\n"
+        "}\n",
+        "arena alias escape via assignment → error");
+
+    /* union switch lock via pointer deref */
+    err("union D { u32 a; u32 b; }\n"
+        "void f(*D ptr) {\n"
+        "    switch (*ptr) {\n"
+        "        .a => |*v| {\n"
+        "            ptr.b = 99;\n"
+        "        }\n"
+        "        .b => |v| { }\n"
+        "    }\n"
+        "}\n",
+        "union mutation via *ptr in switch arm → error");
 }
 
 /* ================================================================

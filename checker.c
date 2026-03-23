@@ -661,6 +661,10 @@ static Type *check_expr(Checker *c, Node *node) {
                             (int)val_sym->name_len, val_sym->name,
                             (int)target_sym->name_len, target_sym->name);
                     }
+                    /* propagate arena-derived flag to target (alias tracking) */
+                    if (target_sym && !target_is_global) {
+                        target_sym->is_arena_derived = true;
+                    }
                 }
             }
         }
@@ -749,6 +753,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     typemap_set(field_node, result);
                     break;
                 }
+                checker_error(c, node->loc.line,
+                    "Pool has no method '%.*s' (available: alloc, get, free)",
+                    (int)mlen, mname);
+                result = ty_void;
+                break;
             }
 
             /* Ring methods */
@@ -774,6 +783,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     typemap_set(field_node, result);
                     break;
                 }
+                checker_error(c, node->loc.line,
+                    "Ring has no method '%.*s' (available: push, push_checked, pop)",
+                    (int)mlen, mname);
+                result = ty_void;
+                break;
             }
 
             /* Arena methods */
@@ -851,6 +865,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     typemap_set(field_node, result);
                     break;
                 }
+                checker_error(c, node->loc.line,
+                    "Arena has no method '%.*s' (available: over, alloc, alloc_slice, reset, unsafe_reset)",
+                    (int)mlen, mname);
+                result = ty_void;
+                break;
             }
 
             /* not a builtin — fall through to normal call resolution */
@@ -1039,6 +1058,19 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* pointer auto-deref for union: ptr.variant = (*ptr).variant */
         if (obj->kind == TYPE_POINTER && obj->pointer.inner->kind == TYPE_UNION) {
+            /* union switch lock applies to pointer auto-deref too */
+            if (c->in_assign_target && c->union_switch_var &&
+                node->field.object->kind == NODE_IDENT &&
+                node->field.object->ident.name_len == c->union_switch_var_len &&
+                memcmp(node->field.object->ident.name, c->union_switch_var,
+                       c->union_switch_var_len) == 0) {
+                checker_error(c, node->loc.line,
+                    "cannot mutate union '%.*s' inside its own switch arm — "
+                    "active capture would become invalid",
+                    (int)c->union_switch_var_len, c->union_switch_var);
+                result = ty_void;
+                break;
+            }
             Type *inner = obj->pointer.inner;
             for (uint32_t i = 0; i < inner->union_type.variant_count; i++) {
                 SUVariant *v = &inner->union_type.variants[i];
@@ -1452,6 +1484,15 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
+                /* propagate arena-derived from simple identifier init: q = arena_ptr */
+                if (node->var_decl.init->kind == NODE_IDENT) {
+                    Symbol *src = scope_lookup(c->current_scope,
+                        node->var_decl.init->ident.name,
+                        (uint32_t)node->var_decl.init->ident.name_len);
+                    if (src && src->is_arena_derived) {
+                        sym->is_arena_derived = true;
+                    }
+                }
             }
         }
         break;
@@ -1596,13 +1637,24 @@ static void check_stmt(Checker *c, Node *node) {
                     cap_type, arm->loc.line);
                 if (cap) cap->is_const = cap_const;
 
-                /* lock union variable during switch arm to prevent type confusion */
+                /* lock union variable during switch arm to prevent type confusion.
+                 * Handles: switch (d) and switch (*ptr) where ptr points to union */
                 const char *saved_union_var = c->union_switch_var;
                 uint32_t saved_union_var_len = c->union_switch_var_len;
-                if (expr->kind == TYPE_UNION &&
-                    node->switch_stmt.expr->kind == NODE_IDENT) {
-                    c->union_switch_var = node->switch_stmt.expr->ident.name;
-                    c->union_switch_var_len = (uint32_t)node->switch_stmt.expr->ident.name_len;
+                if (expr->kind == TYPE_UNION) {
+                    Node *sw_expr = node->switch_stmt.expr;
+                    /* direct: switch (d) */
+                    if (sw_expr->kind == NODE_IDENT) {
+                        c->union_switch_var = sw_expr->ident.name;
+                        c->union_switch_var_len = (uint32_t)sw_expr->ident.name_len;
+                    }
+                    /* deref: switch (*ptr) */
+                    else if (sw_expr->kind == NODE_UNARY &&
+                             sw_expr->unary.op == TOK_STAR &&
+                             sw_expr->unary.operand->kind == NODE_IDENT) {
+                        c->union_switch_var = sw_expr->unary.operand->ident.name;
+                        c->union_switch_var_len = (uint32_t)sw_expr->unary.operand->ident.name_len;
+                    }
                 }
                 check_stmt(c, arm->body);
                 c->union_switch_var = saved_union_var;

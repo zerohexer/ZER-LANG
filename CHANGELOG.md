@@ -18,8 +18,13 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 - **BUG-094:** NODE_CINCLUDE in AST debug — `node_kind_name()` and `ast_print()` now handle NODE_CINCLUDE
 - **BUG-095:** Unchecked fread — `zerc_main.c` now checks return value, returns NULL on short read
 
+### Gap Fixes (hardening existing checks)
+- **BUG-096:** Unknown builtin method names (pool.bogus, ring.clear, arena.destroy) now error with available method list
+- **BUG-097:** Arena-derived flag propagated through aliases — `q = arena_ptr; global = q` now caught
+- **BUG-098:** Union switch lock via pointer auto-deref — `switch (*ptr) { .a => |*v| { ptr.b = 99; } }` now caught
+
 ### Tests
-- **965 tests + 491 fuzz, all passing**
+- **971 tests + 491 fuzz, all passing**
 
 ## 2026-03-23 (continued — security review fixes)
 
@@ -150,7 +155,7 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 965 tests + 491 fuzz, all passing. ~10,000 lines. 95 bugs found and fixed.
+**Compiler:** 971 tests + 491 fuzz, all passing. ~10,000 lines. 98 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
 **Safety:** Inline bounds checks (conditions + short-circuit safe). Scope escape via struct fields caught. Union type confusion blocked. ZER-CHECK handles aliasing. Arena lifetime escape detected.

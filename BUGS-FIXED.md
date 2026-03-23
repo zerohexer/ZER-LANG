@@ -73,6 +73,24 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-096: Unknown builtin method names silently return void
+- **Symptom:** `pool.bogus()`, `ring.clear()`, `arena.destroy()` — unrecognized method names on Pool/Ring/Arena types fall through with no error, returning ty_void.
+- **Root cause:** After all known method `if` checks, code fell through to `/* not a builtin */` without an error for builtin types.
+- **Fix:** Added fallback `checker_error("Pool/Ring/Arena has no method 'X' (available: ...)")` after each builtin type's method checks.
+- **Test:** `test_checker_full.c` — Pool/Ring/Arena unknown methods → error.
+
+### BUG-097: Arena-derived flag not propagated through aliases
+- **Symptom:** `*D d = arena.alloc(D) orelse return; *D q = d; global = q;` — `q` not marked arena-derived, escape to global not caught.
+- **Root cause:** `is_arena_derived` flag only set on direct `arena.alloc()` init, not propagated to aliases (var-decl or assignment).
+- **Fix:** Propagate `is_arena_derived` on var-decl init from simple identifier (`*D q = d`) and on assignment (`q = d`).
+- **Test:** `test_checker_full.c` — alias escape via var-decl and assignment both caught; chain `d→q→r→global` caught.
+
+### BUG-098: Union switch lock not applied through pointer auto-deref
+- **Symptom:** `switch (*ptr) { .a => |*v| { ptr.b = 99; } }` — mutation allowed because union switch lock only checked direct union field access path, not pointer auto-deref path.
+- **Root cause:** Union mutation check existed in `TYPE_UNION` field handler but not in `TYPE_POINTER(TYPE_UNION)` auto-deref handler.
+- **Fix:** Added union switch lock check to pointer auto-deref union path. Lock now set for both `switch (d)` and `switch (*ptr)`.
+- **Test:** `test_checker_full.c` — mutation via `*ptr` in switch arm caught.
+
 ---
 
 ## Round 8 — External Security Review (2026-03-23)

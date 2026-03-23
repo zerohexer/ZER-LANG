@@ -335,13 +335,13 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 |---|---|---|
 | `test_lexer.c` | Token scanning | 218 |
 | `test_parser.c` | AST construction | 70 |
-| `test_parser_edge.c` | Edge cases, func ptrs | 92 |
+| `test_parser_edge.c` | Edge cases, func ptrs, overflow | 93 |
 | `test_checker.c` | Type checking basic | 71 |
-| `test_checker_full.c` | Full spec coverage + security + audit | 221 |
+| `test_checker_full.c` | Full spec coverage + security + audit | 233 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 148 |
-| `test_zercheck.c` | Handle tracking + aliasing | 20 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 157 |
+| `test_zercheck.c` | Handle tracking, aliasing, params | 24 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
 | `test_firmware_patterns2.c` | Round 2 firmware | 41 |
@@ -356,7 +356,7 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 - `test_zercheck.c`: `ok(src, name)` — must pass ZER-CHECK
 - `test_zercheck.c`: `err(src, name)` — must fail ZER-CHECK
 
-## Common Bug Patterns (from 103 bugs fixed, 10 audit rounds + 4 QEMU demos)
+## Common Bug Patterns (from 117 bugs fixed, 15 audit rounds + 4 QEMU demos)
 1. **Checker returns `ty_void` for unhandled builtin method** — always check NODE_CALL handler for new methods
 2. **Emitter uses `global_scope` only** — use `checker_get_type()` first for local var support
 3. **Optional emission mismatch** — `?void` has no `.value`, `?*T` uses null sentinel (no struct)
@@ -372,6 +372,8 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 13. **NODE_SLICE must use named typedefs for ALL primitives** — not just u8/u32. Anonymous structs create type mismatches with named `_zer_slice_T`.
 14. **Struct field lookup must error on miss** — don't silently return ty_void (old UFCS fallback). Same for field access on non-struct types.
 15. **If-unwrap and switch capture defer scope** — these paths unwrap blocks to inject captures. Must save `defer_stack.count` before, emit `emit_defers_from()` after, then restore count. Without this, defers fire at function exit instead of block exit.
-16. **Use `type_unwrap_distinct(t)` helper for all type dispatch** — defined in `types.h`. Applies to: emit_type inner switches (optional, slice), NODE_FIELD handler (struct/union/pointer dispatch), auto-zero paths (global + local), intrinsic validation. Always unwrap: `Type *inner = type_unwrap_distinct(t->optional.inner);`. Never write the unwrap manually.
+16. **Use `type_unwrap_distinct(t)` helper for ALL type dispatch** — defined in `types.h`. Applies to: emit_type inner switches (optional, slice, optional-slice element), NODE_FIELD handler (struct/union/pointer dispatch), switch exhaustiveness checks, auto-zero paths (global + local), intrinsic validation, NODE_SLICE expression emission. Always unwrap: `Type *inner = type_unwrap_distinct(t);`. Never write the unwrap manually.
+17. **ZER-CHECK must track Handle parameters** — `zc_check_function` scans params for TYNODE_HANDLE and registers as HS_ALIVE. Without this, use-after-free on param handles goes undetected.
+18. **`[]bool` needs TYPE_BOOL in all slice type switches** — bool = uint8_t, maps to `_zer_slice_u8`. Missing from any emit_type slice switch causes anonymous struct mismatch.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

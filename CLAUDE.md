@@ -291,7 +291,16 @@ Every typedef/declaration emitted in `emit_file` for structs/unions/enums MUST a
 During a union switch arm with capture, `checker.union_switch_var` is set to the switched-on variable name. Any assignment to `var.variant` where `var` matches the lock is a compile error. This prevents type confusion from mutating the active variant while a capture pointer is alive. Lock is saved/restored for nesting.
 
 **10. Arena-derived pointers tracked via `is_arena_derived` flag.**
-When a variable is initialized from `arena.alloc(T)` (including through orelse), the Symbol gets `is_arena_derived = true`. Assigning this variable to a global/static target (walking field/index chain) is a compile error.
+When a variable is initialized from `arena.alloc(T)` (including through orelse), the Symbol gets `is_arena_derived = true`. Assigning this variable to a global/static target (walking field/index chain) is a compile error. Flag propagates through aliases (`q = arena_ptr` marks `q` as arena-derived too).
+
+**11. `emit_type` must unwrap TYPE_DISTINCT before inner-type dispatch.**
+`emit_type(TYPE_OPTIONAL)` and `emit_type(TYPE_SLICE)` both have inner switches that map to named typedefs (`_zer_opt_T`, `_zer_slice_T`). If the inner type is TYPE_DISTINCT, it must be unwrapped FIRST or it falls to the anonymous struct default. Use `opt_inner`/`sl_inner` local variables. Same for NODE_SLICE expression emission (`eff_elem`). This was the #1 bug pattern — caused BUG-074, 088, 089, 104, 105.
+
+**12. If-unwrap and switch capture arms must manage their own defer scope.**
+These code paths unwrap the block body to inject capture variables. Without saving/restoring `defer_stack.count`, defers inside the block accumulate at function scope and fire at function exit instead of block exit. Save `defer_base` before emitting block contents, call `emit_defers_from(e, defer_base)` after, restore count.
+
+**13. `@cast` supports wrap AND unwrap — both directions.**
+`@cast(Celsius, u32_val)` wraps underlying → distinct. `@cast(u32, celsius_val)` unwraps distinct → underlying. Cross-distinct (`@cast(Fahrenheit, celsius_val)`) is rejected. The old code only allowed wrapping (target must be distinct).
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

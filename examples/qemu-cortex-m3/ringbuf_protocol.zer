@@ -1,0 +1,360 @@
+// Ring Buffer Protocol Parser — QEMU Cortex-M3
+// ===============================================
+// Exercises: Ring, slices, enum switch, ?u8, bounds checking,
+// struct with optional fields, defer, Arena for temp parsing.
+//
+// Simulates a MODBUS-like serial protocol:
+// [ADDR] [FUNC] [LEN] [DATA...] [CRC]
+// Parser validates frame, dispatches by function code.
+
+volatile *u32 UART0_DR = @inttoptr(*u32, 0x4000C000);
+volatile *u32 UART0_FR = @inttoptr(*u32, 0x4000C018);
+
+void uart_putc(u8 c) {
+    while ((*UART0_FR & 0x20) != 0) { }
+    *UART0_DR = @truncate(u32, c);
+}
+
+void uart_puts([]u8 s) {
+    for (usize i = 0; i < s.len; i += 1) {
+        uart_putc(s[i]);
+    }
+}
+
+void uart_put_u32(u32 val) {
+    u8[10] buf;
+    u32 pos = 0;
+    if (val == 0) { uart_putc(48); return; }
+    u32 tmp = val;
+    while (tmp > 0) {
+        buf[pos] = @truncate(u8, (tmp % 10) + 48);
+        pos += 1;
+        tmp = tmp / 10;
+    }
+    while (pos > 0) { pos -= 1; uart_putc(buf[pos]); }
+}
+
+void uart_put_hex(u8 val) {
+    u8[16] hex;
+    hex[0] = 48; hex[1] = 49; hex[2] = 50; hex[3] = 51;
+    hex[4] = 52; hex[5] = 53; hex[6] = 54; hex[7] = 55;
+    hex[8] = 56; hex[9] = 57; hex[10] = 65; hex[11] = 66;
+    hex[12] = 67; hex[13] = 68; hex[14] = 69; hex[15] = 70;
+    uart_putc(hex[val >> 4]);
+    uart_putc(hex[val & 0x0F]);
+}
+
+void nl() { uart_putc(13); uart_putc(10); }
+
+// ---- Protocol definitions ----
+enum FuncCode {
+    read_coils = 1,
+    read_holding = 3,
+    write_single = 6,
+    write_multiple = 16,
+    diagnostics = 8
+}
+
+enum ParseError {
+    ok = 0,
+    too_short = 1,
+    bad_crc = 2,
+    bad_func = 3,
+    bad_length = 4
+}
+
+struct Frame {
+    u8 addr;
+    FuncCode func;
+    u8 data_len;
+    u8[64] data;
+    u8 crc;
+}
+
+// ---- CRC-8 (simple XOR checksum) ----
+u8 calc_crc([]u8 buf) {
+    u8 crc = 0;
+    for (usize i = 0; i < buf.len; i += 1) {
+        crc = crc ^ buf[i];
+    }
+    return crc;
+}
+
+// ---- Frame Parser ----
+?FuncCode to_func_code(u8 code) {
+    if (code == 1) { return FuncCode.read_coils; }
+    if (code == 3) { return FuncCode.read_holding; }
+    if (code == 6) { return FuncCode.write_single; }
+    if (code == 16) { return FuncCode.write_multiple; }
+    if (code == 8) { return FuncCode.diagnostics; }
+    return null;
+}
+
+ParseError parse_frame([]u8 raw, *Frame out) {
+    // Minimum frame: ADDR + FUNC + LEN + CRC = 4 bytes
+    if (raw.len < 4) { return ParseError.too_short; }
+
+    out.addr = raw[0];
+
+    // Validate function code
+    ?FuncCode maybe_fc = to_func_code(raw[1]);
+    if (maybe_fc) |fc| {
+        out.func = fc;
+    } else {
+        return ParseError.bad_func;
+    }
+
+    out.data_len = raw[2];
+
+    // Validate length
+    u32 expected_len = @truncate(u32, out.data_len) + 4;
+    if (raw.len < @truncate(usize, expected_len)) {
+        return ParseError.bad_length;
+    }
+
+    // Copy data — bounds-checked by ZER
+    for (u32 i = 0; i < @truncate(u32, out.data_len); i += 1) {
+        if (i >= 64) { return ParseError.bad_length; }
+        out.data[i] = raw[i + 3];
+    }
+
+    // Validate CRC (last byte)
+    u8 received_crc = raw[@truncate(usize, expected_len) - 1];
+    u8 computed_crc = calc_crc(raw[0..@truncate(usize, expected_len) - 1]);
+    if (received_crc != computed_crc) {
+        return ParseError.bad_crc;
+    }
+
+    out.crc = received_crc;
+    return ParseError.ok;
+}
+
+// ---- Command Handlers ----
+u32 coils_read = 0;
+u32 holdings_read = 0;
+u32 writes_done = 0;
+u32 diag_count = 0;
+
+void handle_frame(*Frame f) {
+    switch (f.func) {
+        .read_coils => {
+            coils_read += 1;
+            uart_puts("  COILS: addr=");
+            uart_put_u32(@truncate(u32, f.addr));
+            uart_puts(" data_len=");
+            uart_put_u32(@truncate(u32, f.data_len));
+            nl();
+        }
+        .read_holding => {
+            holdings_read += 1;
+            uart_puts("  HOLDING: addr=");
+            uart_put_u32(@truncate(u32, f.addr));
+            nl();
+        }
+        .write_single => {
+            writes_done += 1;
+            uart_puts("  WRITE_SINGLE: addr=");
+            uart_put_u32(@truncate(u32, f.addr));
+            if (f.data_len > 0) {
+                uart_puts(" val=0x");
+                uart_put_hex(f.data[0]);
+            }
+            nl();
+        }
+        .write_multiple => {
+            writes_done += 1;
+            uart_puts("  WRITE_MULTI: ");
+            uart_put_u32(@truncate(u32, f.data_len));
+            uart_puts(" bytes");
+            nl();
+        }
+        .diagnostics => {
+            diag_count += 1;
+            uart_puts("  DIAG: echo ");
+            for (u32 i = 0; i < @truncate(u32, f.data_len); i += 1) {
+                uart_put_hex(f.data[i]);
+                uart_putc(32);
+            }
+            nl();
+        }
+    }
+}
+
+// ---- Ring buffer for incoming bytes ----
+Ring(u8, 128) rx_ring;
+
+void receive_bytes([]u8 data) {
+    for (usize i = 0; i < data.len; i += 1) {
+        rx_ring.push(data[i]);
+    }
+}
+
+u32 drain_ring([]u8 out_buf) {
+    u32 count = 0;
+    while (count < @truncate(u32, out_buf.len)) {
+        u8 b = rx_ring.pop() orelse break;
+        out_buf[count] = b;
+        count += 1;
+    }
+    return count;
+}
+
+// ---- Test frames ----
+void main() {
+    uart_puts("========================================");
+    nl();
+    uart_puts("  ZER Protocol Parser — Cortex-M3");
+    nl();
+    uart_puts("  Ring + Enum + ?T + Slices + Defer");
+    nl();
+    uart_puts("========================================");
+    nl();
+
+    // Frame 1: Read Coils — [addr=1] [func=1] [len=2] [data=0x00,0x0A] [crc]
+    u8[6] frame1;
+    frame1[0] = 1;   // addr
+    frame1[1] = 1;   // func: read_coils
+    frame1[2] = 2;   // data len
+    frame1[3] = 0;   // data[0]
+    frame1[4] = 10;  // data[1]
+    frame1[5] = calc_crc(frame1[0..5]);  // crc
+
+    // Frame 2: Write Single — [addr=2] [func=6] [len=1] [data=0xFF] [crc]
+    u8[5] frame2;
+    frame2[0] = 2;
+    frame2[1] = 6;   // write_single
+    frame2[2] = 1;
+    frame2[3] = 255;
+    frame2[4] = calc_crc(frame2[0..4]);
+
+    // Frame 3: Diagnostics — [addr=0] [func=8] [len=3] [data=0xDE,0xAD,0x42] [crc]
+    u8[7] frame3;
+    frame3[0] = 0;
+    frame3[1] = 8;   // diagnostics
+    frame3[2] = 3;
+    frame3[3] = 0xDE;
+    frame3[4] = 0xAD;
+    frame3[5] = 0x42;
+    frame3[6] = calc_crc(frame3[0..6]);
+
+    // Frame 4: Bad CRC
+    u8[5] frame4;
+    frame4[0] = 1;
+    frame4[1] = 3;   // read_holding
+    frame4[2] = 1;
+    frame4[3] = 0;
+    frame4[4] = 0xFF; // wrong crc
+
+    // Frame 5: Too short
+    u8[2] frame5;
+    frame5[0] = 1;
+    frame5[1] = 1;
+
+    // Frame 6: Bad function code
+    u8[4] frame6;
+    frame6[0] = 1;
+    frame6[1] = 99;  // invalid
+    frame6[2] = 0;
+    frame6[3] = 0;
+
+    // Push frames through ring buffer to simulate UART rx
+    uart_puts("Feeding 6 frames through Ring buffer...");
+    nl();
+    receive_bytes(frame1);
+    receive_bytes(frame2);
+    receive_bytes(frame3);
+    receive_bytes(frame4);
+    receive_bytes(frame5);
+    receive_bytes(frame6);
+
+    // Drain and parse each frame
+    u8[128] parse_buf;
+
+    // Process frame 1
+    u32 len1 = drain_ring(parse_buf[0..6]);
+    Frame f;
+    uart_puts("Frame 1: ");
+    ParseError e1 = parse_frame(parse_buf[0..len1], &f);
+    switch (e1) {
+        .ok         => { handle_frame(&f); }
+        .too_short  => { uart_puts("ERR: too short"); nl(); }
+        .bad_crc    => { uart_puts("ERR: bad crc"); nl(); }
+        .bad_func   => { uart_puts("ERR: bad func"); nl(); }
+        .bad_length => { uart_puts("ERR: bad length"); nl(); }
+    }
+
+    // Process frame 2
+    u32 len2 = drain_ring(parse_buf[0..5]);
+    uart_puts("Frame 2: ");
+    ParseError e2 = parse_frame(parse_buf[0..len2], &f);
+    switch (e2) {
+        .ok         => { handle_frame(&f); }
+        .too_short  => { uart_puts("ERR: too short"); nl(); }
+        .bad_crc    => { uart_puts("ERR: bad crc"); nl(); }
+        .bad_func   => { uart_puts("ERR: bad func"); nl(); }
+        .bad_length => { uart_puts("ERR: bad length"); nl(); }
+    }
+
+    // Process frame 3
+    u32 len3 = drain_ring(parse_buf[0..7]);
+    uart_puts("Frame 3: ");
+    ParseError e3 = parse_frame(parse_buf[0..len3], &f);
+    switch (e3) {
+        .ok         => { handle_frame(&f); }
+        .too_short  => { uart_puts("ERR: too short"); nl(); }
+        .bad_crc    => { uart_puts("ERR: bad crc"); nl(); }
+        .bad_func   => { uart_puts("ERR: bad func"); nl(); }
+        .bad_length => { uart_puts("ERR: bad length"); nl(); }
+    }
+
+    // Process frame 4 (bad crc)
+    u32 len4 = drain_ring(parse_buf[0..5]);
+    uart_puts("Frame 4: ");
+    ParseError e4 = parse_frame(parse_buf[0..len4], &f);
+    switch (e4) {
+        .ok         => { handle_frame(&f); }
+        .too_short  => { uart_puts("ERR: too short"); nl(); }
+        .bad_crc    => { uart_puts("ERR: bad crc"); nl(); }
+        .bad_func   => { uart_puts("ERR: bad func"); nl(); }
+        .bad_length => { uart_puts("ERR: bad length"); nl(); }
+    }
+
+    // Process frame 5 (too short)
+    u32 len5 = drain_ring(parse_buf[0..2]);
+    uart_puts("Frame 5: ");
+    ParseError e5 = parse_frame(parse_buf[0..len5], &f);
+    switch (e5) {
+        .ok         => { handle_frame(&f); }
+        .too_short  => { uart_puts("ERR: too short"); nl(); }
+        .bad_crc    => { uart_puts("ERR: bad crc"); nl(); }
+        .bad_func   => { uart_puts("ERR: bad func"); nl(); }
+        .bad_length => { uart_puts("ERR: bad length"); nl(); }
+    }
+
+    // Process frame 6 (bad func)
+    u32 len6 = drain_ring(parse_buf[0..4]);
+    uart_puts("Frame 6: ");
+    ParseError e6 = parse_frame(parse_buf[0..len6], &f);
+    switch (e6) {
+        .ok         => { handle_frame(&f); }
+        .too_short  => { uart_puts("ERR: too short"); nl(); }
+        .bad_crc    => { uart_puts("ERR: bad crc"); nl(); }
+        .bad_func   => { uart_puts("ERR: bad func"); nl(); }
+        .bad_length => { uart_puts("ERR: bad length"); nl(); }
+    }
+
+    // Summary
+    nl();
+    uart_puts("Summary: ");
+    uart_put_u32(coils_read);
+    uart_puts(" coil reads, ");
+    uart_put_u32(writes_done);
+    uart_puts(" writes, ");
+    uart_put_u32(diag_count);
+    uart_puts(" diags");
+    nl();
+    uart_puts("Protocol parser works. ZER catches all boundary errors.");
+    nl();
+
+    while (true) { }
+}

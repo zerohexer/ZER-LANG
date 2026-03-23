@@ -3,6 +3,23 @@
 
 extern void main(void);
 
+/* Freestanding stubs — GCC generates calls to these for struct ops */
+void *memcpy(void *dst, const void *src, unsigned int n) {
+    unsigned char *d = dst; const unsigned char *s = src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+void *memset(void *dst, int c, unsigned int n) {
+    unsigned char *d = dst;
+    while (n--) *d++ = (unsigned char)c;
+    return dst;
+}
+int memcmp(const void *a, const void *b, unsigned int n) {
+    const unsigned char *p = a, *q = b;
+    while (n--) { if (*p != *q) return *p - *q; p++; q++; }
+    return 0;
+}
+
 /* Linker-provided symbols */
 extern unsigned int _estack;
 extern unsigned int _sdata, _edata, _sidata;

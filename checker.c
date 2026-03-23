@@ -1603,7 +1603,27 @@ static void check_stmt(Checker *c, Node *node) {
                 Symbol *cap = add_symbol(c, node->if_stmt.capture_name,
                     (uint32_t)node->if_stmt.capture_name_len,
                     cap_type, node->loc.line);
-                if (cap) cap->is_const = cap_const;
+                if (cap) {
+                    cap->is_const = cap_const;
+
+                    /* propagate arena-derived from if-unwrap condition:
+                     * if (arena.alloc(T)) |t| { ... } — t is arena-derived */
+                    Node *cond_expr = node->if_stmt.cond;
+                    if (cond_expr->kind == NODE_CALL &&
+                        cond_expr->call.callee->kind == NODE_FIELD) {
+                        Node *obj = cond_expr->call.callee->field.object;
+                        const char *mname = cond_expr->call.callee->field.field_name;
+                        size_t mlen = cond_expr->call.callee->field.field_name_len;
+                        if (obj) {
+                            Type *obj_type = checker_get_type(obj);
+                            if (obj_type && obj_type->kind == TYPE_ARENA &&
+                                ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                                 (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
+                                cap->is_arena_derived = true;
+                            }
+                        }
+                    }
+                }
 
                 check_stmt(c, node->if_stmt.then_body);
                 pop_scope(c);

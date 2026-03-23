@@ -2276,12 +2276,12 @@ int main(void) {
     printf("[BUG-110: ?[]DistinctType]\n");
     test_compile_and_run(
         "distinct typedef u32 Score;\n"
+        "Score[2] g_scores;\n"
         "?[]Score get(bool v) {\n"
         "    if (v) {\n"
-        "        Score[2] a;\n"
-        "        a[0] = @cast(Score, 77);\n"
-        "        a[1] = @cast(Score, 88);\n"
-        "        return a[0..2];\n"
+        "        g_scores[0] = @cast(Score, 77);\n"
+        "        g_scores[1] = @cast(Score, 88);\n"
+        "        return g_scores[0..2];\n"
         "    }\n"
         "    return null;\n"
         "}\n"

@@ -18,6 +18,10 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 - **BUG-094:** NODE_CINCLUDE in AST debug — `node_kind_name()` and `ast_print()` now handle NODE_CINCLUDE
 - **BUG-095:** Unchecked fread — `zerc_main.c` now checks return value, returns NULL on short read
 
+### Bug Fixes (Round 16 — agent audit R5, 1 bug)
+- **BUG-118:** Arena-derived flag propagated to if-unwrap capture variables — `if (arena.alloc(T)) |t| { global = t; }` now caught
+- Fixed BUG-110 test UB (local array → global array for slice return)
+
 ### Bug Fixes (Round 15 — agent audit R4, 1 bug)
 - **BUG-117:** ZER-CHECK now tracks Handle(T) function parameters — use-after-free on param handles caught
 - BUG X (?FuncPtr call without unwrap) already fixed by BUG-103
@@ -187,11 +191,11 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 1011 tests + 491 fuzz, all passing. ~10,000 lines. 117 bugs found and fixed.
+**Compiler:** 1012 tests + 491 fuzz, all passing. ~10,000 lines. 118 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
 **Safety:** Inline bounds checks (conditions + short-circuit safe). Scope escape via struct fields caught. Union type confusion blocked. ZER-CHECK handles aliasing. Arena lifetime escape detected.
-**Audit status:** 15 rounds completed (12→9→2→2→1→2→CLEAN→6→12→5→2→5→2→4→1). 26 systematic negative tests. 4 QEMU real-program demos.
+**Audit status:** 16 rounds completed (12→9→2→2→1→2→CLEAN→6→12→5→2→5→2→4→1→1). 26 systematic negative tests. 4 QEMU real-program demos.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
 **Known limitations:**
 - `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first.

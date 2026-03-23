@@ -741,6 +741,20 @@ static void test_security_review(void) {
        "usize f() { return @offset(S, y); }\n",
        "@offset valid field (OK)");
 
+    /* BUG-118: arena-derived in if-unwrap capture */
+    printf("[BUG-118: arena if-unwrap capture escape]\n");
+    err("struct Task { u32 id; }\n"
+        "*Task g;\n"
+        "void f() {\n"
+        "    u8[1024] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    defer a.unsafe_reset();\n"
+        "    if (a.alloc(Task)) |t| {\n"
+        "        g = t;\n"
+        "    }\n"
+        "}\n",
+        "arena if-unwrap capture escape to global → error");
+
     /* BUG-114: switch exhaustiveness on distinct enum */
     printf("[BUG-114: switch on distinct enum]\n");
     err("enum Color { red, green, blue }\n"

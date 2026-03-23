@@ -73,6 +73,12 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-118: Arena-derived flag not propagated to if-unwrap capture variables
+- **Symptom:** `if (arena.alloc(Task)) |t| { global = t; }` — escape not caught because capture `t` never gets `is_arena_derived = true`.
+- **Root cause:** If-unwrap creates capture symbol but never checks if the condition expression is an arena.alloc() call.
+- **Fix:** After creating capture symbol, check if `node->if_stmt.cond` is a `arena.alloc()` or `arena.alloc_slice()` call. If so, set `cap->is_arena_derived = true`.
+- **Test:** `test_checker_full.c` — arena if-unwrap capture escape to global → error.
+
 ### BUG-117: ZER-CHECK misses use-after-free on Handle parameters
 - **Symptom:** `void f(Handle(T) h) { pool.free(h); pool.get(h).x = 5; }` — use-after-free on parameter handle not detected by zercheck.
 - **Root cause:** `zc_check_function` created a fresh PathState but never registered Handle parameters as alive handles. Only `pool.alloc()` results were tracked.

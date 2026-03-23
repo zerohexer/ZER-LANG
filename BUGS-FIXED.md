@@ -311,6 +311,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Added `-fwrapv` to GCC invocation in `zerc --run` and test harness. Added compile hint in emitted C preamble. This makes GCC treat signed overflow as two's complement wrapping, matching ZER semantics.
 - **Test:** `test_emit.c` — `i8 x = 127; x = x + 1;` wraps to -128, bitcast to u8 = 128
 
+### BUG-073: `distinct typedef` does not support function pointer syntax
+- **Symptom:** `distinct typedef u32 (*Callback)(u32);` fails to parse — distinct path expects ident immediately after type.
+- **Root cause:** The `distinct` typedef path didn't have the `(*` function pointer detection that the non-distinct path had.
+- **Fix:** Added function pointer detection to distinct typedef path (same pattern as non-distinct).
+
+### BUG-072: Missing `_zer_opt_slice_` typedef for unions in `emit_file_no_preamble`
+- **Symptom:** Imported module defines a union, main module uses `?[]UnionName` — GCC error: undefined `_zer_opt_slice_UnionName`.
+- **Root cause:** `emit_file_no_preamble` emitted `_zer_opt_` and `_zer_slice_` for unions but not `_zer_opt_slice_`. The main `emit_file` path had all three.
+- **Fix:** Added `_zer_opt_slice_UnionName` emission after `_zer_slice_UnionName` in `emit_file_no_preamble`.
+
 ### BUG-071: Function pointer typedef not supported
 - **Symptom:** `typedef u32 (*Callback)(u32);` fails to parse — parser's typedef path only calls `parse_type()` which doesn't handle function pointer syntax.
 - **Root cause:** typedef declaration parsed return type then expected an ident name, but func ptr names go inside `(*)`.

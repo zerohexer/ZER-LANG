@@ -2089,6 +2089,41 @@ int main(void) {
         60,
         "[]Struct across functions: alloc→fill→pass→sum = 60");
 
+    /* BUG-073: typedef function pointer used as parameter type */
+    test_compile_and_run(
+        "typedef u32 (*MathOp)(u32, u32);\n"
+        "u32 add(u32 a, u32 b) { return a + b; }\n"
+        "u32 run(MathOp op, u32 x, u32 y) {\n"
+        "    return op(x, y);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return run(add, 20, 22);\n"
+        "}\n",
+        42,
+        "typedef func ptr as param: MathOp run(add, 20,22) = 42");
+
+    /* Global ?FuncPtr init null */
+    test_compile_and_run(
+        "?u32 (*g_transform)(u32) = null;\n"
+        "u32 double_it(u32 x) { return x * 2; }\n"
+        "u32 main() {\n"
+        "    u32 (*fn)(u32) = g_transform orelse return;\n"
+        "    return fn(5);\n"
+        "}\n",
+        0,
+        "global ?FuncPtr = null, orelse return fires, exit 0");
+
+    /* Global ?FuncPtr init with value */
+    test_compile_and_run(
+        "u32 triple(u32 x) { return x * 3; }\n"
+        "?u32 (*g_op)(u32) = triple;\n"
+        "u32 main() {\n"
+        "    u32 (*fn)(u32) = g_op orelse return;\n"
+        "    return fn(14);\n"
+        "}\n",
+        42,
+        "global ?FuncPtr = triple, unwrap and call, 14*3 = 42");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

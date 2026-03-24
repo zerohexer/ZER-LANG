@@ -2315,6 +2315,19 @@ int main(void) {
         20,
         "i32 slice expression with named typedef → 20");
 
+    /* BUG-132: side-effect index as lvalue */
+    printf("\n[BUG-132: arr[func()] = val lvalue]\n");
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "u32 next() { counter += 1; return counter; }\n"
+        "u32 main() {\n"
+        "    u32[10] arr;\n"
+        "    arr[next()] = 42;\n"
+        "    return arr[1];\n"
+        "}\n",
+        42,
+        "side-effect index lvalue: arr[func()] = 42, counter=1");
+
     /* BUG-121: constant folding for array sizes */
     printf("\n[BUG-121: array size expressions]\n");
     test_compile_and_run(

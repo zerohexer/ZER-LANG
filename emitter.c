@@ -226,10 +226,10 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_POOL:
-        emit(e, "struct _zer_pool_%.*s_%u",
+        emit(e, "struct _zer_pool_%.*s_%llu",
              (int)t->pool.elem->struct_type.name_len,
              t->pool.elem->struct_type.name,
-             t->pool.count);
+             (unsigned long long)t->pool.count);
         break;
 
     case TYPE_RING:
@@ -584,12 +584,12 @@ static void emit_expr(Emitter *e, Node *node) {
                         int tmp = e->temp_count++;
                         emit(e, "({uint8_t _zer_aok%d = 0; uint32_t _zer_ah%d = "
                              "_zer_pool_alloc(%.*s.slots, sizeof(%.*s.slots[0]), "
-                             "%.*s.gen, %.*s.used, %u, &_zer_aok%d); "
+                             "%.*s.gen, %.*s.used, %llu, &_zer_aok%d); "
                              "(_zer_opt_u32){_zer_ah%d, _zer_aok%d}; })",
                              tmp, tmp,
                              plen, pname, plen, pname,
                              plen, pname, plen, pname,
-                             pool->pool.count, tmp, tmp, tmp);
+                             (unsigned long long)pool->pool.count, tmp, tmp, tmp);
                         handled = true;
                     } else if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
                         /* pool.get(h) → return pointer to slot (not deref) */
@@ -600,7 +600,7 @@ static void emit_expr(Emitter *e, Node *node) {
                              plen, pname, plen, pname, plen, pname, plen, pname);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
-                        emit(e, ", %u))", pool->pool.count);
+                        emit(e, ", %llu))", (unsigned long long)pool->pool.count);
                         handled = true;
                     } else if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
                         /* pool.free(h) */
@@ -608,7 +608,7 @@ static void emit_expr(Emitter *e, Node *node) {
                              plen, pname, plen, pname);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
-                        emit(e, ", %u)", pool->pool.count);
+                        emit(e, ", %llu)", (unsigned long long)pool->pool.count);
                         handled = true;
                     }
                 }
@@ -626,9 +626,9 @@ static void emit_expr(Emitter *e, Node *node) {
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
                         emit(e, "; _zer_ring_push(%.*s.data, &%.*s.head, &%.*s.tail, "
-                             "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); })",
+                             "&%.*s.count, %llu, &_zer_rpv%d, sizeof(_zer_rpv%d)); })",
                              rlen, rname, rlen, rname, rlen, rname, rlen, rname,
-                             obj_type->ring.count, tmp, tmp);
+                             (unsigned long long)obj_type->ring.count, tmp, tmp);
                         handled = true;
                     } else if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
                         /* ring.pop() → optional of elem type */
@@ -640,14 +640,14 @@ static void emit_expr(Emitter *e, Node *node) {
                              "if (%.*s.count > 0) { "
                              "_zer_rp%d.value = %.*s.data[%.*s.tail]; "
                              "_zer_rp%d.has_value = 1; "
-                             "%.*s.tail = (%.*s.tail + 1) %% %u; "
+                             "%.*s.tail = (%.*s.tail + 1) %% %llu; "
                              "%.*s.count--; } "
                              "_zer_rp%d; })",
                              tmp,
                              rlen, rname,
                              tmp, rlen, rname, rlen, rname,
                              tmp,
-                             rlen, rname, rlen, rname, obj_type->ring.count,
+                             rlen, rname, rlen, rname, (unsigned long long)obj_type->ring.count,
                              rlen, rname,
                              tmp);
                         handled = true;
@@ -660,15 +660,15 @@ static void emit_expr(Emitter *e, Node *node) {
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
                         emit(e, "; _zer_opt_void _zer_rpc%d = {0}; "
-                             "if (%.*s.count < %u) { "
+                             "if (%.*s.count < %llu) { "
                              "_zer_ring_push(%.*s.data, &%.*s.head, &%.*s.tail, "
-                             "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); "
+                             "&%.*s.count, %llu, &_zer_rpv%d, sizeof(_zer_rpv%d)); "
                              "_zer_rpc%d.has_value = 1; } "
                              "_zer_rpc%d; })",
                              tmp,
-                             rlen, rname, obj_type->ring.count,
+                             rlen, rname, (unsigned long long)obj_type->ring.count,
                              rlen, rname, rlen, rname, rlen, rname,
-                             rlen, rname, obj_type->ring.count, tmp, tmp,
+                             rlen, rname, (unsigned long long)obj_type->ring.count, tmp, tmp,
                              tmp,
                              tmp);
                         handled = true;
@@ -855,15 +855,15 @@ static void emit_expr(Emitter *e, Node *node) {
                 int tmp = e->temp_count++;
                 emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
-                emit(e, "); _zer_bounds_check(_zer_idx%d, %u, __FILE__, __LINE__); &",
-                     tmp, idx_obj_type->array.size);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, %llu, __FILE__, __LINE__); &",
+                     tmp, (unsigned long long)idx_obj_type->array.size);
                 emit_expr(e, node->index_expr.object);
                 emit(e, "[_zer_idx%d]; })", tmp);
             } else {
                 /* Simple index — comma operator, preserves lvalue */
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_expr(e, node->index_expr.index);
-                emit(e, "), %u, __FILE__, __LINE__), ", idx_obj_type->array.size);
+                emit(e, "), %llu, __FILE__, __LINE__), ", (unsigned long long)idx_obj_type->array.size);
                 emit_expr(e, node->index_expr.object);
                 emit(e, ")[");
                 emit_expr(e, node->index_expr.index);
@@ -1077,7 +1077,7 @@ static void emit_expr(Emitter *e, Node *node) {
             } else if (node->slice.end) {
                 emit_expr(e, node->slice.end);
             } else if (node->slice.start && obj_type && obj_type->kind == TYPE_ARRAY) {
-                emit(e, "%u - (", obj_type->array.size);
+                emit(e, "%llu - (", (unsigned long long)obj_type->array.size);
                 emit_expr(e, node->slice.start);
                 emit(e, ")");
             } else if (node->slice.start && obj_is_slice) {
@@ -1391,8 +1391,8 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *buf_type = (node->intrinsic.arg_count > 0) ?
                 checker_get_type(node->intrinsic.args[0]) : NULL;
             if (buf_type && buf_type->kind == TYPE_ARRAY) {
-                emit(e, "; if (_zer_cs%d.len + 1 > %u) ",
-                     tmp, buf_type->array.size);
+                emit(e, "; if (_zer_cs%d.len + 1 > %llu) ",
+                     tmp, (unsigned long long)buf_type->array.size);
                 emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
             } else {
                 emit(e, "; ");
@@ -2241,8 +2241,8 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (type && type->kind == TYPE_POOL) {
         emit(e, "struct { ");
         emit_type(e, type->pool.elem);
-        emit(e, " slots[%u]; uint16_t gen[%u]; uint8_t used[%u]; } ",
-             type->pool.count, type->pool.count, type->pool.count);
+        emit(e, " slots[%llu]; uint16_t gen[%llu]; uint8_t used[%llu]; } ",
+             (unsigned long long)type->pool.count, (unsigned long long)type->pool.count, (unsigned long long)type->pool.count);
         emit(e, "%.*s = {0};\n\n",
              (int)node->var_decl.name_len, node->var_decl.name);
         return;
@@ -2252,8 +2252,8 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (type && type->kind == TYPE_RING) {
         emit(e, "struct { ");
         emit_type(e, type->ring.elem);
-        emit(e, " data[%u]; uint32_t head; uint32_t tail; uint32_t count; } ",
-             type->ring.count);
+        emit(e, " data[%llu]; uint32_t head; uint32_t tail; uint32_t count; } ",
+             (unsigned long long)type->ring.count);
         emit(e, "%.*s = {0};\n\n",
              (int)node->var_decl.name_len, node->var_decl.name);
         return;

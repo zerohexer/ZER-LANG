@@ -334,6 +334,17 @@ TYPE_BOOL must be handled in emit_type(TYPE_SLICE), emit_type(TYPE_OPTIONAL > TY
 **22. Bit extraction full-width uses `~(uint64_t)0` instead of `1ull << 64`.**
 `val[63..0]` would emit `1ull << 64` which is UB. The emitter checks if width >= 64 at compile time (via `eval_const_expr`) and emits safe mask. (BUG-125)
 
+**23. Shift operators use `_zer_shl`/`_zer_shr` macros — spec: shift >= width = 0.**
+ZER spec promises defined behavior for shifts. C has UB for shift >= width. The preamble defines safe macros using GCC statement expressions (single-eval for shift amount). Both `<<`/`>>` and `<<=`/`>>=` use these. Compound shift `x <<= n` emits `x = _zer_shl(x, n)`. (BUG-127)
+
+**24. Bounds check side-effect detection: NODE_CALL AND NODE_ASSIGN.**
+Index expressions with side effects (function calls, assignments) use GCC statement expression for single evaluation. Simple indices (ident, literal) use comma operator for lvalue compatibility. Detection: `kind == NODE_CALL || kind == NODE_ASSIGN`. (BUG-119, BUG-126)
+
+### Known Technical Debt (v0.2)
+- **Double Resolution:** `resolve_type_for_emit()` in emitter.c duplicates `resolve_type()` in checker.c. Any type resolution fix must be applied in BOTH. Mitigation: shared `eval_const_expr()` in ast.h. Proper fix: checker stores resolved Type* on AST nodes via `typemap_set()`, emitter reads via `checker_get_type()`. ~200 lines refactor.
+- **Source Mapping:** Runtime traps show `.c` file lines. Fix: emit `#line N "source.zer"` directives. ~50 lines.
+- **Global Compiler State:** `type_map`, `non_storable_nodes` are static globals. Makes compiler non-thread-safe. Fix: move into Checker/Emitter structs. Same pattern as GCC.
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

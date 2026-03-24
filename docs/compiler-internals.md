@@ -380,5 +380,7 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 21. **Scope escape must check implicit array-to-slice coercion in assignments** — `global_slice = local_array` bypasses `&local` check because no TOK_AMP is involved. Check TYPE_ARRAY value → TYPE_SLICE target with local/global mismatch.
 22. **String literals are const — block assignment to mutable `[]u8`** — Check NODE_STRING_LIT in var-decl and assignment. Only `const []u8` targets allowed. Function args still work (slice struct is copied).
 23. **Bit extraction full-width mask** — `val[63..0]` must NOT emit `1ull << 64` (UB). Check width via `eval_const_expr` on start/end. If >= 64, emit `~(uint64_t)0`.
+24. **Shift operators use `_zer_shl`/`_zer_shr` macros** — ZER spec: shift >= width = 0. C has UB. Macros use GCC statement expression for single-eval. Compound shifts (`<<=`) emit `x = _zer_shl(x, n)`.
+25. **Bounds check side-effect detection** — NODE_CALL AND NODE_ASSIGN both trigger single-eval path (GCC statement expression). All other index expressions use comma operator (lvalue-safe, double-eval OK for pure expressions).
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

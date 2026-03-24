@@ -73,6 +73,12 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-127: Shift by >= width is UB in emitted C — spec promises 0
+- **Symptom:** `u32 x = 1 << 32;` emits raw `1 << 32` which is UB in C. GCC warns. Spec says "shift by >= width returns 0."
+- **Root cause:** Emitter emitted raw `<<` and `>>` for NODE_BINARY shifts, passing C's UB through.
+- **Fix:** Added `_zer_shl`/`_zer_shr` macros to preamble using GCC statement expressions (single-eval for shift amount). NODE_BINARY and compound shift assignments (`<<=`, `>>=`) now use these macros. `(b >= sizeof(a)*8) ? 0 : (a << b)`.
+- **Test:** `1 << 32` = 0, `1 << 4` = 16, `x <<= 32` = 0. No GCC warnings.
+
 ### BUG-126: Bounds check double-eval for assignment-in-index expressions
 - **Symptom:** `arr[i = func()] = 42` — the assignment `i = func()` is evaluated twice (once for bounds check, once for access). Double side effects.
 - **Root cause:** Side-effect detection in NODE_INDEX only checked `NODE_CALL`, not `NODE_ASSIGN`.

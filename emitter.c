@@ -368,31 +368,38 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_BINARY:
-        emit(e, "(");
-        emit_expr(e, node->binary.left);
-        switch (node->binary.op) {
-        case TOK_PLUS:     emit(e, " + "); break;
-        case TOK_MINUS:    emit(e, " - "); break;
-        case TOK_STAR:     emit(e, " * "); break;
-        case TOK_SLASH:    emit(e, " / "); break;
-        case TOK_PERCENT:  emit(e, " %% "); break;
-        case TOK_EQEQ:    emit(e, " == "); break;
-        case TOK_BANGEQ:   emit(e, " != "); break;
-        case TOK_LT:       emit(e, " < "); break;
-        case TOK_GT:       emit(e, " > "); break;
-        case TOK_LTEQ:     emit(e, " <= "); break;
-        case TOK_GTEQ:     emit(e, " >= "); break;
-        case TOK_AMPAMP:   emit(e, " && "); break;
-        case TOK_PIPEPIPE: emit(e, " || "); break;
-        case TOK_AMP:      emit(e, " & "); break;
-        case TOK_PIPE:     emit(e, " | "); break;
-        case TOK_CARET:    emit(e, " ^ "); break;
-        case TOK_LSHIFT:   emit(e, " << "); break;
-        case TOK_RSHIFT:   emit(e, " >> "); break;
-        default:           emit(e, " ? "); break;
+        /* shift operators use safe macros (ZER spec: shift >= width = 0) */
+        if (node->binary.op == TOK_LSHIFT || node->binary.op == TOK_RSHIFT) {
+            emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+            emit_expr(e, node->binary.left);
+            emit(e, ", ");
+            emit_expr(e, node->binary.right);
+            emit(e, ")");
+        } else {
+            emit(e, "(");
+            emit_expr(e, node->binary.left);
+            switch (node->binary.op) {
+            case TOK_PLUS:     emit(e, " + "); break;
+            case TOK_MINUS:    emit(e, " - "); break;
+            case TOK_STAR:     emit(e, " * "); break;
+            case TOK_SLASH:    emit(e, " / "); break;
+            case TOK_PERCENT:  emit(e, " %% "); break;
+            case TOK_EQEQ:    emit(e, " == "); break;
+            case TOK_BANGEQ:   emit(e, " != "); break;
+            case TOK_LT:       emit(e, " < "); break;
+            case TOK_GT:       emit(e, " > "); break;
+            case TOK_LTEQ:     emit(e, " <= "); break;
+            case TOK_GTEQ:     emit(e, " >= "); break;
+            case TOK_AMPAMP:   emit(e, " && "); break;
+            case TOK_PIPEPIPE: emit(e, " || "); break;
+            case TOK_AMP:      emit(e, " & "); break;
+            case TOK_PIPE:     emit(e, " | "); break;
+            case TOK_CARET:    emit(e, " ^ "); break;
+            default:           emit(e, " ? "); break;
+            }
+            emit_expr(e, node->binary.right);
+            emit(e, ")");
         }
-        emit_expr(e, node->binary.right);
-        emit(e, ")");
         break;
 
     case NODE_UNARY:
@@ -434,6 +441,15 @@ static void emit_expr(Emitter *e, Node *node) {
                 }
             }
         }
+        /* compound shift: target <<= n → target = _zer_shl(target, n) */
+        if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
+            emit_expr(e, node->assign.target);
+            emit(e, " = %s(", node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr");
+            emit_expr(e, node->assign.target);
+            emit(e, ", ");
+            emit_expr(e, node->assign.value);
+            emit(e, ")");
+        } else {
         emit_expr(e, node->assign.target);
         switch (node->assign.op) {
         case TOK_EQ:        emit(e, " = "); break;
@@ -445,8 +461,6 @@ static void emit_expr(Emitter *e, Node *node) {
         case TOK_AMPEQ:     emit(e, " &= "); break;
         case TOK_PIPEEQ:    emit(e, " |= "); break;
         case TOK_CARETEQ:   emit(e, " ^= "); break;
-        case TOK_LSHIFTEQ:  emit(e, " <<= "); break;
-        case TOK_RSHIFTEQ:  emit(e, " >>= "); break;
         default:            emit(e, " = "); break;
         }
         /* T → ?T wrap: if target is optional and value isn't, wrap in {value, 1} */
@@ -475,6 +489,7 @@ static void emit_expr(Emitter *e, Node *node) {
         } else {
             emit_expr(e, node->assign.value);
         }
+        } /* close else for compound shift */
         assign_done:
         break;
 
@@ -2190,6 +2205,13 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    abort();\n");
     emit(e, "#endif\n");
     emit(e, "}\n\n");
+
+    /* safe shift — ZER spec: shift by >= width returns 0 (not UB like C).
+     * Uses GCC statement expression to evaluate b exactly once. */
+    emit(e, "#define _zer_shl(a, b) ({ __typeof__(b) _b = (b); "
+            "(_b >= (int)(sizeof(a) * 8)) ? (__typeof__(a))0 : (a) << _b; })\n");
+    emit(e, "#define _zer_shr(a, b) ({ __typeof__(b) _b = (b); "
+            "(_b >= (int)(sizeof(a) * 8)) ? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
     emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "

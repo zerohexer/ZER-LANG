@@ -724,6 +724,16 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-190: missing return in non-void function */
+    err("u32 bad(bool c) { if (c) { return 1; } }",
+        "missing return — if without else REJECT");
+    err("?u32 bad2(bool c) { if (c) { return 1; } }",
+        "missing return — ?u32 function REJECT");
+    ok("u32 good(bool c) { if (c) { return 1; } else { return 0; } }",
+       "all paths return — if/else OK");
+    ok("u32 good2(bool c) { if (c) { return 1; } return 0; }",
+       "all paths return — fallthrough return OK");
+
     /* BUG-182: const array → mutable slice coercion */
     err("void mutate([]u32 s) { s[0] = 0; }\nvoid f() { const u32[4] arr; mutate(arr); }",
         "const array → mutable slice param REJECT");

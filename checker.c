@@ -2616,6 +2616,46 @@ static void register_decl(Checker *c, Node *node) {
  * TOP-LEVEL FUNCTION BODY CHECKING (Pass 2)
  * ================================================================ */
 
+/* check if all control flow paths end in a return statement */
+static bool all_paths_return(Node *node) {
+    if (!node) return false;
+    switch (node->kind) {
+    case NODE_RETURN:
+        return true;
+    case NODE_BLOCK:
+        /* check if any statement in the block guarantees a return */
+        for (int i = node->block.stmt_count - 1; i >= 0; i--) {
+            if (all_paths_return(node->block.stmts[i])) return true;
+            /* if this statement is not a return but is a block/if/switch,
+             * it might still cover all paths */
+        }
+        return false;
+    case NODE_IF:
+        /* both branches must return; else is required */
+        if (!node->if_stmt.else_body) return false;
+        return all_paths_return(node->if_stmt.then_body) &&
+               all_paths_return(node->if_stmt.else_body);
+    case NODE_SWITCH: {
+        /* all arms must return, and switch must be exhaustive (default or all variants) */
+        bool has_default = false;
+        int arm_count = 0;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            if (node->switch_stmt.arms[i].is_default) has_default = true;
+            if (!all_paths_return(node->switch_stmt.arms[i].body)) return false;
+            arm_count++;
+        }
+        /* exhaustive if has default OR has at least one arm (enum/bool switches
+         * are checked for exhaustiveness elsewhere — if we got here, they passed) */
+        return has_default || arm_count > 0;
+    }
+    case NODE_EXPR_STMT:
+        /* orelse return/break in expression statement — check for trap calls etc */
+        return false;
+    default:
+        return false;
+    }
+}
+
 static void check_func_body(Checker *c, Node *node) {
     if (node->kind == NODE_FUNC_DECL && node->func_decl.body) {
         /* resolve return type */
@@ -2635,6 +2675,15 @@ static void check_func_body(Checker *c, Node *node) {
         }
 
         check_stmt(c, node->func_decl.body);
+
+        /* check that all paths return for non-void functions */
+        if (ret && ret->kind != TYPE_VOID &&
+            !all_paths_return(node->func_decl.body)) {
+            checker_error(c, node->loc.line,
+                "not all control flow paths return a value in function '%.*s'",
+                (int)node->func_decl.name_len, node->func_decl.name);
+        }
+
         pop_scope(c);
         c->current_func_ret = NULL;
     }

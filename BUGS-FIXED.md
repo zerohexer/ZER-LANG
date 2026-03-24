@@ -73,6 +73,10 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-190: Missing return in non-void function — undefined behavior
+- **Symptom:** `u32 f(bool c) { if (c) { return 1; } }` — falls off end without returning.
+- **Fix:** `all_paths_return()` recursive check after function body type-checking. Handles NODE_BLOCK, NODE_IF (requires else), NODE_SWITCH (exhaustive), NODE_RETURN.
+
 ### BUG-187: Volatile index double-read in bounds check
 - **Symptom:** `arr[*volatile_ptr]` reads volatile register twice (bounds check + access).
 - **Fix:** Broadened side-effect detection: NODE_UNARY (deref) now triggers single-eval path.

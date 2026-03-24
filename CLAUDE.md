@@ -430,6 +430,9 @@ Struct field emission checks if the field's TypeNode has a TYNODE_VOLATILE wrapp
 **54. Narrow type arithmetic cast: `(uint8_t)(a + b)` for u8/u16/i8/i16.**
 C integer promotion makes `u8 + u8` return `int`. Without cast, wrapping comparison `a + b == 0` fails for `255 + 1`. Emitter checks result type from typemap, casts for types narrower than `int`. (BUG-186)
 
+**55. `all_paths_return()` checks non-void functions for missing returns.**
+Recursive analysis: NODE_RETURN → true, NODE_BLOCK → last stmt, NODE_IF → both branches (requires else), NODE_SWITCH → all arms (exhaustive if passed checker). Called after `check_stmt` on function body for non-void return types. (BUG-190)
+
 ### Known Technical Debt
 - ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
 - ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~

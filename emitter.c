@@ -831,7 +831,8 @@ static void emit_expr(Emitter *e, Node *node) {
         if (obj_type && type_is_integer(obj_type) &&
             node->slice.start && node->slice.end) {
             /* bit extraction: expr[high..low] → (expr >> low) & mask
-             * Use safe mask: if width >= 64, use ~0ULL to avoid 1ull<<64 UB */
+             * Safe mask for both constant and runtime widths:
+             * Use ternary to avoid 1ull<<64 UB when width == 64 */
             {
                 int64_t high = eval_const_expr(node->slice.start);
                 int64_t low = eval_const_expr(node->slice.end);
@@ -841,13 +842,22 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, " >> ");
                 emit_expr(e, node->slice.end);
                 if (width >= 64) {
+                    /* constant full-width — safe mask */
                     emit(e, ") & (~(uint64_t)0))");
+                } else if (width > 0) {
+                    /* constant sub-width — safe, no UB */
+                    emit(e, ") & ((1ull << %lld) - 1))", (long long)width);
                 } else {
-                    emit(e, ") & ((1ull << (");
+                    /* runtime width — use safe ternary */
+                    emit(e, ") & (((");
                     emit_expr(e, node->slice.start);
                     emit(e, " - ");
                     emit_expr(e, node->slice.end);
-                    emit(e, " + 1)) - 1))");
+                    emit(e, " + 1) >= 64) ? ~(uint64_t)0 : ((1ull << (");
+                    emit_expr(e, node->slice.start);
+                    emit(e, " - ");
+                    emit_expr(e, node->slice.end);
+                    emit(e, " + 1)) - 1)))");
                 }
             }
             break;

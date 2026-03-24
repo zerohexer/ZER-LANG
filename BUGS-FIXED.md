@@ -73,6 +73,11 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-128: Runtime bit extraction [63..0] still has UB when indices are variables
+- **Symptom:** `val[hi..lo]` where `hi=63, lo=0` are runtime variables returns 0 instead of full value. BUG-125 only fixed the constant-folded path.
+- **Root cause:** When `eval_const_expr` returns -1 (non-constant), the `else` branch emits raw `1ull << (high - low + 1)` which is UB when width=64.
+- **Fix:** Three paths: (1) constant width >= 64 → `~(uint64_t)0`, (2) constant width < 64 → `(1ull << width) - 1` (precomputed), (3) runtime width → safe ternary `(width >= 64) ? ~0ULL : ((1ull << width) - 1)`.
+
 ### BUG-127: Shift by >= width is UB in emitted C — spec promises 0
 - **Symptom:** `u32 x = 1 << 32;` emits raw `1 << 32` which is UB in C. GCC warns. Spec says "shift by >= width returns 0."
 - **Root cause:** Emitter emitted raw `<<` and `>>` for NODE_BINARY shifts, passing C's UB through.

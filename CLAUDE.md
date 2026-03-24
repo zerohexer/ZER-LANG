@@ -331,8 +331,8 @@ TYPE_BOOL must be handled in emit_type(TYPE_SLICE), emit_type(TYPE_OPTIONAL > TY
 - `global_slice = local_array` → error (BUG-122)
 - All walk field/index chains to find the root identifier.
 
-**22. Bit extraction full-width uses `~(uint64_t)0` instead of `1ull << 64`.**
-`val[63..0]` would emit `1ull << 64` which is UB. The emitter checks if width >= 64 at compile time (via `eval_const_expr`) and emits safe mask. (BUG-125)
+**22. Bit extraction has 3 safe paths for mask generation.**
+Constant width >= 64 → `~(uint64_t)0`. Constant width < 64 → `(1ull << width) - 1` (precomputed). Runtime width (variables) → safe ternary `(width >= 64) ? ~0ULL : ((1ull << width) - 1)`. Never emit raw `1ull << (high - low + 1)` — UB when width == 64. (BUG-125, BUG-128)
 
 **23. Shift operators use `_zer_shl`/`_zer_shr` macros — spec: shift >= width = 0.**
 ZER spec promises defined behavior for shifts. C has UB for shift >= width. The preamble defines safe macros using GCC statement expressions (single-eval for shift amount). Both `<<`/`>>` and `<<=`/`>>=` use these. Compound shift `x <<= n` emits `x = _zer_shl(x, n)`. (BUG-127)

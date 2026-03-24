@@ -1122,6 +1122,22 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-202: orelse &local propagates is_local_derived */
+    err("*u32 bad() { u32 x = 42; ?*u32 m = null; *u32 p = m orelse &x; return p; }",
+        "orelse &local marks local-derived");
+    ok("u32 g = 99;\n"
+       "*u32 ok() { ?*u32 m = null; *u32 p = m orelse &g; return p; }\n"
+       "u32 main() { return *ok(); }",
+       "orelse &global is safe");
+
+    /* BUG-203: slice from local array marks local-derived */
+    err("[]u8 bad() { u8[10] a; []u8 s = a; return s; }",
+        "slice from local array blocked on return");
+    ok("u8[10] g;\n"
+       "[]u8 ok() { []u8 s = g; return s; }\n"
+       "u32 main() { return 0; }",
+       "slice from global array is safe");
+
     /* BUG-200: while(true)+break is NOT a terminator */
     err("u32 bad(bool c) { while (true) { if (c) { break; } return 1; } }",
         "while(true) with break rejected");

@@ -464,6 +464,12 @@ These flags are "sticky" — once set during var-decl, they persist. But `p = &l
 **64. `@size(T)` resolved as compile-time constant in array sizes.**
 `u8[@size(Task)] buffer;` now works. In the checker's TYNODE_ARRAY resolution, when `eval_const_expr` returns -1 and the size expression is `NODE_INTRINSIC` with name "size", resolve the type and compute byte size: primitives via `type_width / 8`, structs via field sum, pointers = 4. The emitter still uses `sizeof(T)` for runtime expressions. (BUG-199)
 
+**67. orelse &local in var-decl propagates is_local_derived.**
+`*u32 p = maybe orelse &local_x;` marks `p` as local-derived. The detection checks both direct `NODE_UNARY/TOK_AMP` AND `NODE_ORELSE` fallback for `&local`. Without this, orelse with local address fallback creates a dangling pointer escape. (BUG-202)
+
+**68. Slice from local array marks is_local_derived.**
+`[]u8 s = local_arr;` where `local_arr` is a local `TYPE_ARRAY` marks `s` as local-derived. The implicit array→slice coercion creates a slice pointing to stack memory. Without this, `return s` returns a dangling slice. Detection: init is `NODE_IDENT` with `TYPE_ARRAY`, target is `TYPE_SLICE`, source is local. (BUG-203)
+
 **66. `type_width`/`type_is_integer`/etc. unwrap TYPE_DISTINCT.**
 All type query functions in `types.c` now call `type_unwrap_distinct(a)` first. Without this, `type_width(distinct u32)` returns 0, breaking `@size(Distinct)` and potentially confusing intrinsic validation. (BUG-201)
 

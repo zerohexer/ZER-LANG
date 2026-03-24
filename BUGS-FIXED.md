@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-203: Slice from local array escapes via variable
+- **Symptom:** `[]u8 s = local_arr; return s;` — returns slice pointing to stack memory. No error.
+- **Root cause:** `is_local_derived` only tracked for pointers (`*T`), not slices (`[]T`). Array→slice coercion creates a slice pointing to local memory but didn't mark the symbol.
+- **Fix:** In var-decl init, when type is `TYPE_SLICE` and init is `NODE_IDENT` with `TYPE_ARRAY`, check if the array is local. If so, set `sym->is_local_derived = true`.
+- **Test:** `test_checker_full.c` — slice from local array blocked, slice from global array safe.
+
+### BUG-202: orelse &local in var-decl init doesn't mark is_local_derived
+- **Symptom:** `*u32 p = maybe orelse &local_x; return p;` — returns dangling pointer. No error.
+- **Root cause:** `&local` detection in var-decl only checked direct `NODE_UNARY/TOK_AMP`, not `NODE_ORELSE` wrapping `&local`.
+- **Fix:** Check both direct `&local` AND orelse fallback `&local` in a loop over address expressions.
+- **Test:** `test_checker_full.c` — orelse &local marks local-derived, orelse &global is safe.
+
 ### BUG-201: `type_width`/`type_is_integer`/etc. don't unwrap TYPE_DISTINCT
 - **Symptom:** `type_width(Meters)` returns 0 for `distinct typedef u32 Meters`. Breaks `@size(Distinct)` (returns 0 → rejected), and could confuse intrinsic validation.
 - **Root cause:** Type query functions in `types.c` dispatch on `a->kind` without unwrapping distinct first.

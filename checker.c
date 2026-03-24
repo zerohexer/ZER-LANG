@@ -1997,22 +1997,55 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
-                /* detect pointer to local: p = &local or p = &local.field */
-                Node *init = node->var_decl.init;
-                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
-                    Node *root = init->unary.operand;
-                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                        if (root->kind == NODE_FIELD) root = root->field.object;
-                        else root = root->index_expr.object;
+                /* detect pointer to local: p = &local or p = &local.field
+                 * BUG-202: also check orelse fallback: p = opt orelse &local */
+                {
+                    Node *init = node->var_decl.init;
+                    /* check both direct &local AND orelse fallback &local */
+                    Node *addr_exprs[2] = { NULL, NULL };
+                    int addr_count = 0;
+                    if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
+                        addr_exprs[addr_count++] = init;
                     }
-                    if (root && root->kind == NODE_IDENT) {
-                        bool is_global = scope_lookup_local(c->global_scope,
-                            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
-                        Symbol *src = scope_lookup(c->current_scope,
-                            root->ident.name, (uint32_t)root->ident.name_len);
-                        if (src && !src->is_static && !is_global) {
-                            sym->is_local_derived = true;
+                    if (init->kind == NODE_ORELSE &&
+                        init->orelse.fallback &&
+                        init->orelse.fallback->kind == NODE_UNARY &&
+                        init->orelse.fallback->unary.op == TOK_AMP) {
+                        addr_exprs[addr_count++] = init->orelse.fallback;
+                    }
+                    for (int ai = 0; ai < addr_count; ai++) {
+                        Node *root = addr_exprs[ai]->unary.operand;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                            if (root->kind == NODE_FIELD) root = root->field.object;
+                            else root = root->index_expr.object;
                         }
+                        if (root && root->kind == NODE_IDENT) {
+                            bool is_global = scope_lookup_local(c->global_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                            Symbol *src = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            if (src && !src->is_static && !is_global) {
+                                sym->is_local_derived = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* BUG-203: slice from local array — mark as local-derived.
+             * []T s = local_array creates a slice pointing to stack memory. */
+            if (node->var_decl.init &&
+                node->var_decl.init->kind == NODE_IDENT &&
+                type && type->kind == TYPE_SLICE) {
+                Type *init_type2 = checker_get_type(node->var_decl.init);
+                if (init_type2 && init_type2->kind == TYPE_ARRAY) {
+                    Symbol *src = scope_lookup(c->current_scope,
+                        node->var_decl.init->ident.name,
+                        (uint32_t)node->var_decl.init->ident.name_len);
+                    bool is_global = src && scope_lookup_local(c->global_scope,
+                        src->name, src->name_len) != NULL;
+                    if (src && !src->is_static && !is_global) {
+                        sym->is_local_derived = true;
                     }
                 }
             }

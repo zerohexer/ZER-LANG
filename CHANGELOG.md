@@ -18,6 +18,11 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 - **BUG-094:** NODE_CINCLUDE in AST debug — `node_kind_name()` and `ast_print()` now handle NODE_CINCLUDE
 - **BUG-095:** Unchecked fread — `zerc_main.c` now checks return value, returns NULL on short read
 
+### Bug Fixes (Round 17 — external review, 2 bugs)
+- **BUG-119:** Bounds check double-evaluates side-effecting index — hybrid approach: statement expression for NODE_CALL indices, comma operator for simple indices
+- **BUG-120:** Return local array as slice now caught — implicit array-to-slice coercion on return creates dangling pointer
+- Gemini claim "pointer arithmetic scaling" verified FALSE — ZER rejects pointer arithmetic entirely
+
 ### Bug Fixes (Round 16 — agent audit R5, 1 bug)
 - **BUG-118:** Arena-derived flag propagated to if-unwrap capture variables — `if (arena.alloc(T)) |t| { global = t; }` now caught
 - Fixed BUG-110 test UB (local array → global array for slice return)
@@ -191,7 +196,7 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 1012 tests + 491 fuzz, all passing. ~10,000 lines. 118 bugs found and fixed.
+**Compiler:** 1015 tests + 491 fuzz, all passing. ~10,000 lines. 120 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
 **Safety:** Inline bounds checks (conditions + short-circuit safe). Scope escape via struct fields caught. Union type confusion blocked. ZER-CHECK handles aliasing. Arena lifetime escape detected.

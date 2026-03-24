@@ -755,6 +755,18 @@ static void test_security_review(void) {
         "}\n",
         "arena if-unwrap capture escape to global → error");
 
+    /* BUG-120: return local array as slice — dangling pointer */
+    printf("[BUG-120: return local array as slice]\n");
+    err("[]u8 f() {\n"
+        "    u8[64] buf;\n"
+        "    buf[0] = 42;\n"
+        "    return buf;\n"
+        "}\n",
+        "return local array as slice → error");
+    ok("u8[64] g_buf;\n"
+       "[]u8 f() { return g_buf; }\n",
+       "return global array as slice (valid)");
+
     /* BUG-114: switch exhaustiveness on distinct enum */
     printf("[BUG-114: switch on distinct enum]\n");
     err("enum Color { red, green, blue }\n"

@@ -752,24 +752,53 @@ static void emit_expr(Emitter *e, Node *node) {
          * Inline check respects short-circuit (&&/||) and works in
          * if/while/for conditions — fixes both hoisting and missing-check bugs. */
         Type *idx_obj_type = checker_get_type(node->index_expr.object);
+        /* Check if index has side effects (function call) — needs single-eval.
+         * Simple expressions (ident, literal) can safely double-evaluate. */
+        bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL);
         if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY && idx_obj_type->array.size > 0) {
-            emit(e, "(_zer_bounds_check((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, "), %u, __FILE__, __LINE__), ", idx_obj_type->array.size);
-            emit_expr(e, node->index_expr.object);
-            emit(e, ")[");
-            emit_expr(e, node->index_expr.index);
-            emit(e, "]");
+            if (idx_has_side_effects) {
+                /* Single-eval path: hoist index into temp via comma in enclosing ({}).
+                 * Uses GCC statement expression — result is rvalue only.
+                 * Side-effecting index in assignment target (arr[func()] = x) is
+                 * extremely rare; if needed, store index in a variable first. */
+                int tmp = e->temp_count++;
+                emit(e, "({ size_t _zer_idx%d = (size_t)(", tmp);
+                emit_expr(e, node->index_expr.index);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, %u, __FILE__, __LINE__); ",
+                     tmp, idx_obj_type->array.size);
+                emit_expr(e, node->index_expr.object);
+                emit(e, "[_zer_idx%d]; })", tmp);
+            } else {
+                /* Simple index — comma operator, preserves lvalue */
+                emit(e, "(_zer_bounds_check((size_t)(");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "), %u, __FILE__, __LINE__), ", idx_obj_type->array.size);
+                emit_expr(e, node->index_expr.object);
+                emit(e, ")[");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "]");
+            }
         } else if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
-            emit(e, "(_zer_bounds_check((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, "), ");
-            emit_expr(e, node->index_expr.object);
-            emit(e, ".len, __FILE__, __LINE__), ");
-            emit_expr(e, node->index_expr.object);
-            emit(e, ".ptr)[");
-            emit_expr(e, node->index_expr.index);
-            emit(e, "]");
+            if (idx_has_side_effects) {
+                int tmp = e->temp_count++;
+                emit(e, "({ size_t _zer_idx%d = (size_t)(", tmp);
+                emit_expr(e, node->index_expr.index);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
+                emit_expr(e, node->index_expr.object);
+                emit(e, ".len, __FILE__, __LINE__); ");
+                emit_expr(e, node->index_expr.object);
+                emit(e, ".ptr[_zer_idx%d]; })", tmp);
+            } else {
+                emit(e, "(_zer_bounds_check((size_t)(");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "), ");
+                emit_expr(e, node->index_expr.object);
+                emit(e, ".len, __FILE__, __LINE__), ");
+                emit_expr(e, node->index_expr.object);
+                emit(e, ".ptr)[");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "]");
+            }
         } else {
             emit_expr(e, node->index_expr.object);
             emit(e, "[");

@@ -2315,6 +2315,21 @@ int main(void) {
         20,
         "i32 slice expression with named typedef → 20");
 
+    /* BUG-119: bounds check single-eval for side-effecting index */
+    printf("[BUG-119: single-eval bounds check]\n");
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "u32 next_idx() { counter += 1; return counter; }\n"
+        "u32 main() {\n"
+        "    u32[10] arr;\n"
+        "    arr[0] = 0; arr[1] = 11; arr[2] = 22;\n"
+        "    counter = 0;\n"
+        "    u32 val = arr[next_idx()];\n"
+        "    return counter;\n"
+        "}\n",
+        1,
+        "func-call index evaluated once, counter=1");
+
     /* BUG-089: distinct func ptr + array-to-slice coercion */
     printf("[BUG-089: distinct func ptr array coerce]\n");
     test_compile_and_run(

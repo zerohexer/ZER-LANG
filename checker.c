@@ -1907,6 +1907,22 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
 
+            /* scope escape: return local array as slice → dangling pointer */
+            if (node->ret.expr->kind == NODE_IDENT &&
+                ret_type && ret_type->kind == TYPE_ARRAY &&
+                c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
+                const char *vname = node->ret.expr->ident.name;
+                uint32_t vlen = (uint32_t)node->ret.expr->ident.name_len;
+                Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
+                bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                if (sym && !sym->is_static && !is_global) {
+                    checker_error(c, node->loc.line,
+                        "cannot return local array '%.*s' as slice — "
+                        "pointer will dangle after function returns",
+                        (int)vlen, vname);
+                }
+            }
+
             /* scope escape: return &local → error */
             if (node->ret.expr->kind == NODE_UNARY &&
                 node->ret.expr->unary.op == TOK_AMP &&

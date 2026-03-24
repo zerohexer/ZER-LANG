@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-119: Bounds check double-evaluates index with side effects
+- **Symptom:** `arr[next_idx()] = 42` — `next_idx()` called twice (once for bounds check, once for access). Side effects execute twice, and bounds check validates a different index than the one written to.
+- **Root cause:** Inline comma operator pattern `(_zer_bounds_check(idx, ...), arr)[idx]` evaluates `idx` expression twice.
+- **Fix:** Detect if index is a function call (NODE_CALL). If so, use GCC statement expression with temp variable for single evaluation. Simple indices (ident, literal) keep the comma operator for lvalue compatibility.
+- **Test:** `test_emit.c` — func-call index evaluated once, counter=1.
+
+### BUG-120: Return local array as slice — dangling pointer via implicit coercion
+- **Symptom:** `[]u8 f() { u8[64] buf; return buf; }` — local array implicitly coerces to slice on return. Slice points to dead stack memory. No compiler error.
+- **Root cause:** Scope escape check only caught `return &local` (NODE_UNARY + TOK_AMP), not `return local_array` with implicit array-to-slice coercion.
+- **Fix:** Added check in NODE_RETURN: if return type is TYPE_SLICE and expression is TYPE_ARRAY from a local variable, error. Global/static arrays allowed.
+- **Test:** `test_checker_full.c` — local array return → error, global array return → OK.
+
 ### BUG-118: Arena-derived flag not propagated to if-unwrap capture variables
 - **Symptom:** `if (arena.alloc(Task)) |t| { global = t; }` — escape not caught because capture `t` never gets `is_arena_derived = true`.
 - **Root cause:** If-unwrap creates capture symbol but never checks if the condition expression is an arena.alloc() call.

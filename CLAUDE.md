@@ -234,11 +234,12 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - `return null;` from `?void` func → `return (_zer_opt_void){ 0 };`
 - Bare `return;` from `?T` func → `return (opt_type){ 0, 1 };`
 
-**Bounds checks in emitted C (BUG-078/079 — inline, NOT hoisted):**
-- Array: `(_zer_bounds_check((size_t)(idx), size, __FILE__, __LINE__), arr)[idx]`
-- Slice: `(_zer_bounds_check((size_t)(idx), s.len, __FILE__, __LINE__), s.ptr)[idx]`
-- Comma operator preserves lvalue (assignments work). Inline = works in conditions + respects `&&`/`||` short-circuit.
+**Bounds checks in emitted C (BUG-078/079/119 — inline, NOT hoisted):**
+- **Simple index** (ident, literal): `(_zer_bounds_check((size_t)(idx), size, ...), arr)[idx]` — comma operator, preserves lvalue.
+- **Side-effecting index** (NODE_CALL): `({ size_t _zer_idxN = (size_t)(idx); _zer_bounds_check(_zer_idxN, size, ...); arr[_zer_idxN]; })` — GCC statement expression, single evaluation, rvalue only.
+- Detection: `node->index_expr.index->kind == NODE_CALL` → single-eval path.
 - **NEVER hoist bounds checks to statement level.** That breaks short-circuit and misses conditions.
+- **NEVER double-evaluate function call indices.** That causes side effects to execute twice.
 
 **Slice types in emitted C:**
 - `[]T` → named typedef `_zer_slice_T` for ALL types (primitives in preamble, struct/union after declaration)

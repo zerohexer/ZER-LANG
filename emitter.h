@@ -45,6 +45,8 @@ typedef struct {
     int loop_defer_base;    /* defer stack base at loop entry (for break/continue) */
     bool lib_mode;          /* --lib: no prefix on struct names, no preamble */
     const char *source_file; /* .zer source file name for #line directives */
+    const char *current_module; /* module name for function/global mangling (NULL = main) */
+    uint32_t current_module_len;
 } Emitter;
 
 /* ---- API ---- */

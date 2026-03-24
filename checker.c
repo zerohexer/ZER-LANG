@@ -345,12 +345,24 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
                     if (w > 0) {
                         val = w / 8;
                     } else if (unwrapped->kind == TYPE_STRUCT) {
-                        /* sum of field sizes (no padding — packed-like) */
+                        /* BUG-219: compute size with natural alignment (like C).
+                         * Packed structs use no padding. */
                         int64_t total = 0;
+                        int max_align = 1;
+                        bool is_packed = unwrapped->struct_type.is_packed;
                         for (uint32_t fi = 0; fi < unwrapped->struct_type.field_count; fi++) {
                             int fw = type_width(unwrapped->struct_type.fields[fi].type);
-                            total += (fw > 0) ? fw / 8 : 4; /* default 4 for pointers etc */
+                            int fbytes = (fw > 0) ? fw / 8 : 4;
+                            int falign = is_packed ? 1 : fbytes;
+                            if (falign > max_align) max_align = falign;
+                            /* align total to field alignment */
+                            if (!is_packed && falign > 1 && (total % falign) != 0)
+                                total += falign - (total % falign);
+                            total += fbytes;
                         }
+                        /* pad struct to multiple of largest alignment */
+                        if (!is_packed && max_align > 1 && (total % max_align) != 0)
+                            total += max_align - (total % max_align);
                         val = total > 0 ? total : -1;
                     } else if (size_of->kind == TYPE_POINTER ||
                                size_of->kind == TYPE_SLICE) {
@@ -2871,6 +2883,9 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_function = true;
             sym->is_static = node->func_decl.is_static;
             sym->func_node = node;
+            /* BUG-218: store module prefix for function name mangling */
+            sym->module_prefix = c->current_module;
+            sym->module_prefix_len = c->current_module_len;
         }
         typemap_set(node, func_type);
         break;
@@ -2893,6 +2908,9 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
+            /* BUG-218: store module prefix for global var name mangling */
+            sym->module_prefix = c->current_module;
+            sym->module_prefix_len = c->current_module_len;
         }
         typemap_set(node, type);
         break;

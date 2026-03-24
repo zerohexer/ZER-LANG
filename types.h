@@ -177,6 +177,10 @@ struct Symbol {
     bool is_function;
     Node *func_node;        /* AST node for function body, if applicable */
 
+    /* module prefix for name mangling (NULL = main module) */
+    const char *module_prefix;
+    uint32_t module_prefix_len;
+
     /* source location */
     const char *file;
     uint32_t line;

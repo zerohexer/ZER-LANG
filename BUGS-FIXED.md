@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-219: @size struct calculation ignores C alignment padding
+- **Symptom:** `struct S { u8 a; u32 b; }` — checker computes @size = 5 (field sum), GCC sizeof = 8 (with alignment).
+- **Root cause:** Constant @size resolution summed field sizes without alignment.
+- **Fix:** Natural alignment: each field aligned to its own size, struct padded to multiple of largest field. Packed structs skip padding.
+- **Test:** Manual — `@size(S)` now matches GCC's sizeof(S).
+
+### BUG-218: Multi-module function/global name collision
+- **Symptom:** Two modules with same function name → GCC "redefinition" error.
+- **Root cause:** Functions and globals emitted with raw names, not mangled with module prefix (types were already mangled).
+- **Fix:** Added `module_prefix` to Symbol struct. Emitter uses `EMIT_MANGLED_NAME` for function declarations. `NODE_IDENT` emission looks up symbol prefix. `emit_global_var` uses mangled name for imported module globals.
+- **Test:** Module test — two modules with `init()` now compile as `mod_a_init` and `mod_b_init`.
+
 ### BUG-217: Compile-time slice bounds check for arrays
 - **Symptom:** `u8[10] arr; []u8 s = arr[0..15];` passes checker. Should be caught at compile time.
 - **Root cause:** BUG-196 added compile-time OOB for indexing but not slicing.

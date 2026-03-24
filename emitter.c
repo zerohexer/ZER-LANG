@@ -39,6 +39,15 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
 #define EMIT_UNION_NAME(e, t)  emit_user_name(e, (t)->union_type.module_prefix, (t)->union_type.module_prefix_len, (t)->union_type.name, (t)->union_type.name_len)
 #define EMIT_ENUM_NAME(e, t)   emit_user_name(e, (t)->enum_type.module_prefix, (t)->enum_type.module_prefix_len, (t)->enum_type.name, (t)->enum_type.name_len)
 
+/* BUG-218: emit function/global var name with module prefix */
+#define EMIT_MANGLED_NAME(e, name, name_len) do { \
+    if ((e)->current_module) { \
+        fprintf((e)->out, "%.*s_%.*s", (int)(e)->current_module_len, (e)->current_module, (int)(name_len), (name)); \
+    } else { \
+        fprintf((e)->out, "%.*s", (int)(name_len), (name)); \
+    } \
+} while(0)
+
 /* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
 static inline bool is_null_sentinel(Type *inner) {
@@ -377,9 +386,19 @@ static void emit_expr(Emitter *e, Node *node) {
         emit(e, "0");
         break;
 
-    case NODE_IDENT:
-        emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
+    case NODE_IDENT: {
+        /* BUG-218: check for module-prefixed function/global names */
+        Symbol *id_sym = scope_lookup(e->checker->global_scope,
+            node->ident.name, (uint32_t)node->ident.name_len);
+        if (id_sym && id_sym->module_prefix && !id_sym->is_static) {
+            emit(e, "%.*s_%.*s",
+                 (int)id_sym->module_prefix_len, id_sym->module_prefix,
+                 (int)node->ident.name_len, node->ident.name);
+        } else {
+            emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
+        }
         break;
+    }
 
     case NODE_BINARY:
         /* division/modulo: trap on zero divisor */
@@ -2453,7 +2472,13 @@ static void emit_func_decl(Emitter *e, Node *node) {
     if (node->func_decl.is_static) emit(e, "static ");
 
     emit_type(e, ret);
-    emit(e, " %.*s(", (int)node->func_decl.name_len, node->func_decl.name);
+    emit(e, " ");
+    if (!node->func_decl.is_static) {
+        EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
+    } else {
+        emit(e, "%.*s", (int)node->func_decl.name_len, node->func_decl.name);
+    }
+    emit(e, "(");
 
     if (node->func_decl.param_count == 0) {
         emit(e, "void");
@@ -2529,7 +2554,16 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
         emit(e, "volatile ");
 
-    emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
+    /* BUG-218: mangle global var names for imported modules */
+    if (e->current_module && !node->var_decl.is_static) {
+        char mangled[256];
+        int mlen = snprintf(mangled, sizeof(mangled), "%.*s_%.*s",
+            (int)e->current_module_len, e->current_module,
+            (int)node->var_decl.name_len, node->var_decl.name);
+        emit_type_and_name(e, type, mangled, mlen);
+    } else {
+        emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
+    }
 
     if (node->var_decl.init) {
         /* optional null init needs struct literal, not scalar 0 */

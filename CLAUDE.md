@@ -518,6 +518,12 @@ C integer promotion makes `~(uint8_t)0xAA` = `0xFFFFFF55`. Emitter wraps narrow 
 **82. Compile-time slice bounds check for arrays.**
 `u8[10] arr; []u8 s = arr[0..15];` — slice end 15 exceeds array size 10. In `NODE_SLICE`, if object is `TYPE_ARRAY` and end/start is a constant, check against `array.size`. Complements BUG-196 (index OOB) for slicing operations. (BUG-217)
 
+**83. Function/global name mangling for multi-module.**
+Imported module functions emit as `module_name` (`mod_a_init`). `module_prefix` stored on Symbol struct (set during `register_decl`). `NODE_IDENT` emission looks up global scope for the symbol's prefix. `EMIT_MANGLED_NAME` macro handles declaration-site mangling. Static functions/globals are NOT mangled (module-private). (BUG-218)
+
+**84. @size struct alignment matches C sizeof.**
+Constant @size resolution now computes with natural alignment: field offset = align(total, field_size), struct padded to multiple of largest field alignment. Packed structs use alignment 1 (no padding). Matches GCC's sizeof exactly. (BUG-219)
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

@@ -383,8 +383,16 @@ int main(int argc, char **argv) {
         /* emit in topological order: first module gets preamble (unless --lib) */
         for (int i = 0; i < emit_count; i++) {
             Module *m = &cc.modules[emit_order[i]];
-            /* update source mapping for current module */
+            /* update source mapping and module context for current module */
             emitter.source_file = m->path;
+            /* main module (index 0) has no prefix; imported modules get their name */
+            if (emit_order[i] == 0) {
+                emitter.current_module = NULL;
+                emitter.current_module_len = 0;
+            } else {
+                emitter.current_module = m->name;
+                emitter.current_module_len = (uint32_t)strlen(m->name);
+            }
             if (i == 0 && !no_preamble) {
                 emit_file(&emitter, m->ast);
             } else {

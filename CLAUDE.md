@@ -449,8 +449,8 @@ Diamond imports (same module imported via two paths) still deduplicate correctly
 **59. `is_local_derived` and `is_arena_derived` must be cleared+recomputed on reassignment.**
 These flags are "sticky" — once set during var-decl, they persist. But `p = &local; p = &global; return p` is safe. On `NODE_ASSIGN` with `op == TOK_EQ`, clear both flags on the target root symbol, then re-derive from the new value: `&local` → set `is_local_derived`, alias of local/arena-derived ident → propagate flag. Without this, false positives reject valid code AND false negatives miss unsafe reassignments (flag only set in var-decl, not assignment). (BUG-194)
 
-**60. `while(true)` and `for(;;)` are terminators in `all_paths_return`.**
-Infinite loops never exit normally — the function either returns inside or runs forever. Both are valid for return analysis. `all_paths_return(NODE_WHILE)` returns `true` when condition is literal `true` (`NODE_BOOL_LIT` with `value == true`). `all_paths_return(NODE_FOR)` returns `true` when condition is NULL (omitted). Without this, `u32 f() { while(true) { if (x) { return 1; } } }` is falsely rejected. (BUG-195)
+**60. `while(true)` and `for(;;)` are terminators in `all_paths_return` — BUT only if no `break`.**
+`all_paths_return(NODE_WHILE)` returns `true` when condition is literal `true` AND body does not contain a `break` targeting this loop (`!contains_break(body)`). Same for `NODE_FOR` with no condition. `contains_break` walks the body recursively but stops at nested loops (their breaks target the inner loop, not ours). Without the break check, `while(true) { if (c) { break; } return 1; }` falsely passes — function falls off end after break. (BUG-195, BUG-200)
 
 **61. Compile-time OOB for constant array index.**
 `u8[10] arr; arr[100] = 1;` is caught at compile time, not just at runtime. In `NODE_INDEX`, if index is `NODE_INT_LIT` and object is `TYPE_ARRAY`, compare `idx_val >= array.size` → error. Runtime bounds checks still fire for variable indices. (BUG-196)
@@ -463,6 +463,9 @@ Infinite loops never exit normally — the function either returns inside or run
 
 **64. `@size(T)` resolved as compile-time constant in array sizes.**
 `u8[@size(Task)] buffer;` now works. In the checker's TYNODE_ARRAY resolution, when `eval_const_expr` returns -1 and the size expression is `NODE_INTRINSIC` with name "size", resolve the type and compute byte size: primitives via `type_width / 8`, structs via field sum, pointers = 4. The emitter still uses `sizeof(T)` for runtime expressions. (BUG-199)
+
+**66. `type_width`/`type_is_integer`/etc. unwrap TYPE_DISTINCT.**
+All type query functions in `types.c` now call `type_unwrap_distinct(a)` first. Without this, `type_width(distinct u32)` returns 0, breaking `@size(Distinct)` and potentially confusing intrinsic validation. (BUG-201)
 
 **65. Duplicate enum variant names rejected.**
 `enum Color { red, green, red }` is caught at checker level (BUG-198). Same pattern as struct field duplicate check (BUG-191). Prevents GCC `#define` redefinition warnings.

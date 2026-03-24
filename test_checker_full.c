@@ -1122,6 +1122,19 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-200: while(true)+break is NOT a terminator */
+    err("u32 bad(bool c) { while (true) { if (c) { break; } return 1; } }",
+        "while(true) with break rejected");
+    ok("u32 good() { while (true) { return 1; } }\n"
+       "u32 main() { return good(); }",
+       "while(true) without break still accepted");
+
+    /* BUG-201: type_width unwraps distinct */
+    ok("distinct typedef u32 Meters;\n"
+       "u8[@size(Meters)] buf;\n"
+       "u32 main() { return 0; }",
+       "@size(distinct u32) = 4 accepted as array size");
+
     /* BUG-198: duplicate enum variant names */
     err("enum Color { red, green, red }\nu32 main() { return 0; }",
         "duplicate enum variant rejected");

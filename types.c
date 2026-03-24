@@ -131,6 +131,7 @@ Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret) {
  * ================================================================ */
 
 bool type_is_integer(Type *a) {
+    a = type_unwrap_distinct(a);
     switch (a->kind) {
     case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64:
     case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
@@ -143,6 +144,7 @@ bool type_is_integer(Type *a) {
 }
 
 bool type_is_signed(Type *a) {
+    a = type_unwrap_distinct(a);
     switch (a->kind) {
     case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
     case TYPE_ENUM: /* enums are i32 */
@@ -153,6 +155,7 @@ bool type_is_signed(Type *a) {
 }
 
 bool type_is_unsigned(Type *a) {
+    a = type_unwrap_distinct(a);
     switch (a->kind) {
     case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
         return true;
@@ -162,6 +165,7 @@ bool type_is_unsigned(Type *a) {
 }
 
 bool type_is_float(Type *a) {
+    a = type_unwrap_distinct(a);
     return a->kind == TYPE_F32 || a->kind == TYPE_F64;
 }
 
@@ -170,6 +174,7 @@ bool type_is_numeric(Type *a) {
 }
 
 int type_width(Type *a) {
+    a = type_unwrap_distinct(a);
     switch (a->kind) {
     case TYPE_U8:  case TYPE_I8:  case TYPE_BOOL: return 8;
     case TYPE_U16: case TYPE_I16: return 16;

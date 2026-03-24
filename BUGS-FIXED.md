@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-201: `type_width`/`type_is_integer`/etc. don't unwrap TYPE_DISTINCT
+- **Symptom:** `type_width(Meters)` returns 0 for `distinct typedef u32 Meters`. Breaks `@size(Distinct)` (returns 0 → rejected), and could confuse intrinsic validation.
+- **Root cause:** Type query functions in `types.c` dispatch on `a->kind` without unwrapping distinct first.
+- **Fix:** Added `a = type_unwrap_distinct(a)` at the top of `type_width`, `type_is_integer`, `type_is_signed`, `type_is_unsigned`, `type_is_float`. Also unwrap in `@size` constant resolution path.
+- **Test:** `test_checker_full.c` — `@size(distinct u32)` = 4 accepted as array size.
+
+### BUG-200: `while(true)` with `break` falsely treated as terminator
+- **Symptom:** `u32 f(bool c) { while(true) { if (c) { break; } return 1; } }` — function falls off end after break. GCC warns "control reaches end of non-void function."
+- **Root cause:** BUG-195 made `while(true)` return `true` in `all_paths_return` unconditionally. But `break` exits the loop, so the function CAN fall through.
+- **Fix:** Added `contains_break(body)` helper that checks for `NODE_BREAK` targeting the current loop (stops at nested loops). `while(true)` is only a terminator when `!contains_break(body)`. Same for `for(;;)`.
+- **Test:** `test_checker_full.c` — while(true)+break rejected, while(true) without break still accepted.
+
 ### BUG-199: `@size(T)` not recognized as compile-time constant in array sizes
 - **Symptom:** `u8[@size(Task)] buffer;` errors "array size must be a compile-time constant."
 - **Root cause:** `eval_const_expr` in `ast.h` handles literals and binary ops but not `NODE_INTRINSIC`. No way to resolve type sizes without checker context.

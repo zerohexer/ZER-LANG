@@ -340,14 +340,15 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
                     if (sym) size_of = sym->type;
                 }
                 if (size_of) {
-                    int w = type_width(size_of);
+                    Type *unwrapped = type_unwrap_distinct(size_of);
+                    int w = type_width(unwrapped);
                     if (w > 0) {
                         val = w / 8;
-                    } else if (size_of->kind == TYPE_STRUCT) {
+                    } else if (unwrapped->kind == TYPE_STRUCT) {
                         /* sum of field sizes (no padding — packed-like) */
                         int64_t total = 0;
-                        for (uint32_t fi = 0; fi < size_of->struct_type.field_count; fi++) {
-                            int fw = type_width(size_of->struct_type.fields[fi].type);
+                        for (uint32_t fi = 0; fi < unwrapped->struct_type.field_count; fi++) {
+                            int fw = type_width(unwrapped->struct_type.fields[fi].type);
                             total += (fw > 0) ? fw / 8 : 4; /* default 4 for pointers etc */
                         }
                         val = total > 0 ? total : -1;
@@ -2780,6 +2781,30 @@ static void register_decl(Checker *c, Node *node) {
  * ================================================================ */
 
 /* check if all control flow paths end in a return statement */
+/* BUG-200: check if a node contains a break that targets the current loop.
+ * Stops recursing into nested loops (their breaks target the inner loop). */
+static bool contains_break(Node *node) {
+    if (!node) return false;
+    switch (node->kind) {
+    case NODE_BREAK: return true;
+    case NODE_WHILE: case NODE_FOR: return false; /* nested loop — break targets it */
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            if (contains_break(node->block.stmts[i])) return true;
+        }
+        return false;
+    case NODE_IF:
+        return contains_break(node->if_stmt.then_body) ||
+               contains_break(node->if_stmt.else_body);
+    case NODE_SWITCH:
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            if (contains_break(node->switch_stmt.arms[i].body)) return true;
+        }
+        return false;
+    default: return false;
+    }
+}
+
 static bool all_paths_return(Node *node) {
     if (!node) return false;
     switch (node->kind) {
@@ -2813,19 +2838,19 @@ static bool all_paths_return(Node *node) {
     }
     case NODE_WHILE:
         /* while(true) is an infinite loop — never exits normally.
-         * It acts as a terminator: the function either returns inside
-         * the loop or runs forever (both valid for return analysis).
-         * Only while(true) qualifies — variable conditions might be false. */
+         * BUT: if the body contains a break, the loop CAN exit,
+         * so it's NOT a terminator. (BUG-200) */
         if (node->while_stmt.cond &&
             node->while_stmt.cond->kind == NODE_BOOL_LIT &&
-            node->while_stmt.cond->bool_lit.value) {
+            node->while_stmt.cond->bool_lit.value &&
+            !contains_break(node->while_stmt.body)) {
             return true;
         }
         return false;
     case NODE_FOR:
         /* for (;;) { ... } — infinite loop with no condition.
-         * Same logic as while(true): never exits normally → terminator. */
-        if (!node->for_stmt.cond) {
+         * Same break check as while(true). (BUG-200) */
+        if (!node->for_stmt.cond && !contains_break(node->for_stmt.body)) {
             return true;
         }
         return false;

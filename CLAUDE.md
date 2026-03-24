@@ -379,6 +379,15 @@ The arena return escape check (`NODE_RETURN` + `is_arena_derived`) must not bloc
 **37. Bit extraction index must be within type width.**
 `u8 val; val[15..0]` reads junk bits. Checker NODE_SLICE validates constant `high` index < `type_width(obj)`. Runtime indices are not checked (would need emitter support). (BUG-154)
 
+**38. `[]T → *T` implicit coercion REMOVED — null safety hole.**
+An empty slice has `ptr = NULL`. Implicit coercion to `*T` (non-null) would allow NULL into a non-null type. Removed from `can_implicit_coerce`. Users must use `.ptr` explicitly. (BUG-162)
+
+**39. `is_local_derived` tracks pointers to local variables.**
+`*u32 p = &x` where `x` is local sets `p.is_local_derived = true`. Propagates through aliases (`q = p`). Return check rejects `is_local_derived` symbols. Same pattern as `is_arena_derived` but for stack pointers. (BUG-163)
+
+**40. Base-object side effects in slice indexing must be hoisted.**
+`get_slice()[0]` emits `get_slice()` twice (bounds check + access). Detect side effects in entire object chain (NODE_CALL/NODE_ASSIGN at any level), hoist slice into `__auto_type _zer_obj` temp. (BUG-164)
+
 ### Known Technical Debt
 - ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
 - ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~

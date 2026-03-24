@@ -65,7 +65,7 @@ TYPE_VOID, TYPE_BOOL, TYPE_U8..TYPE_U64, TYPE_USIZE, TYPE_I8..TYPE_I64, TYPE_F32
 
 ### Key Functions
 - `type_equals(a, b)` — structural equality (note: ignores is_const on pointers)
-- `can_implicit_coerce(from, to)` — allowed implicit conversions: small→big int, T→?T, T[N]→[]T, []T→*T
+- `can_implicit_coerce(from, to)` — allowed implicit conversions: small→big int, T→?T, T[N]→[]T, mut→const slice/ptr
 - `type_is_integer(t)` — includes TYPE_ENUM (enums are i32 internally)
 - `type_width(t)` — bit width (bool=8, usize=32 hardcoded)
 - `type_name(t)` — returns string for error messages. Uses TWO alternating buffers (fixed in BUG-028) so `type_name(a), type_name(b)` works in one printf.
@@ -398,5 +398,8 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 38. **Division/modulo wrapped in zero-check trap** — `/` and `%` emit `({ auto _d = divisor; if (_d == 0) _zer_trap(...); (a / _d); })`. Same for `/=` and `%=`. Single-eval of divisor via GCC statement expression.
 39. **Integer literal range validation** — `is_literal_compatible` checks value fits target: u8 0-255, i8 -128..127, u16 0-65535, etc. Negative literals reject all unsigned types. Without this, GCC silently truncates.
 40. **Bit extraction high index validated against type width** — Checker NODE_SLICE checks constant `high < type_width(obj)`. Prevents reading junk bits beyond the type's bit width.
+41. **`[]T → *T` coercion removed** — Empty slice has `ptr=NULL`, violates `*T` non-null guarantee. Removed from `can_implicit_coerce` in types.c. Use `.ptr` explicitly for C interop.
+42. **`is_local_derived` tracks pointers to locals** — `p = &x` (local) sets `p.is_local_derived`. Propagated through aliases and field/index chains. Return check rejects alongside `is_arena_derived`. Defined in types.h on Symbol struct.
+43. **Base-object side effects in NODE_INDEX** — `get_slice()[0]` hoists slice into `__auto_type _zer_obj` temp when object chain contains NODE_CALL or NODE_ASSIGN. Prevents double-evaluation of side-effecting base objects.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

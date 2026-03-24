@@ -1741,10 +1741,14 @@ static void emit_stmt(Emitter *e, Node *node) {
         e->indent++;
         emit_indent(e);
         if (is_union_switch) {
-            /* union switch: take pointer to original so mutable capture works */
-            emit(e, "__auto_type _zer_swp%d = &(", sw_tmp);
+            /* union switch: hoist into temp, then take pointer.
+             * Direct &(expr) fails for rvalue expressions like function calls.
+             * Can't use __auto_type with * — use __typeof__ instead. */
+            emit(e, "__auto_type _zer_swt%d = ", sw_tmp);
             emit_expr(e, node->switch_stmt.expr);
-            emit(e, ");\n");
+            emit(e, ";\n");
+            emit_indent(e);
+            emit(e, "__typeof__(_zer_swt%d) *_zer_swp%d = &_zer_swt%d;\n", sw_tmp, sw_tmp, sw_tmp);
         } else {
             emit(e, "__auto_type _zer_sw%d = ", sw_tmp);
             emit_expr(e, node->switch_stmt.expr);

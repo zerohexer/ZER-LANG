@@ -346,6 +346,9 @@ Index expressions with side effects (function calls, assignments) use GCC statem
 **26. Side-effect index lvalue: `*({ ...; &arr[_idx]; })` pattern.**
 `arr[func()] = val` needs single-eval AND lvalue. Plain statement expression `({ ...; arr[_idx]; })` is rvalue only. Fix: take address inside, dereference outside: `*({ size_t _i = func(); check(_i); &arr[_i]; })`. (BUG-132)
 
+**27. Union switch hoists expr into temp before `&` — rvalue safe.**
+`switch(get_union())` with capture needs `&(expr)` but rvalue addresses are illegal. Fix: `__auto_type _swt = expr; __typeof__(_swt) *_swp = &_swt;`. Can't use `__auto_type *` (GCC rejects) — must use `__typeof__`. (BUG-134)
+
 ### Known Technical Debt (v0.2)
 - **Double Resolution:** `resolve_type_for_emit()` in emitter.c duplicates `resolve_type()` in checker.c. Any type resolution fix must be applied in BOTH. Mitigation: shared `eval_const_expr()` in ast.h. Proper fix: checker stores resolved Type* on AST nodes via `typemap_set()`, emitter reads via `checker_get_type()`. ~200 lines refactor.
 - **Source Mapping:** Runtime traps show `.c` file lines. Fix: emit `#line N "source.zer"` directives. ~50 lines.

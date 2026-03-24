@@ -349,10 +349,17 @@ Index expressions with side effects (function calls, assignments) use GCC statem
 **27. Union switch hoists expr into temp before `&` — rvalue safe.**
 `switch(get_union())` with capture needs `&(expr)` but rvalue addresses are illegal. Fix: `__auto_type _swt = expr; __typeof__(_swt) *_swp = &_swt;`. Can't use `__auto_type *` (GCC rejects) — must use `__typeof__`. (BUG-134)
 
-### Known Technical Debt (v0.2)
-- **Double Resolution:** `resolve_type_for_emit()` in emitter.c duplicates `resolve_type()` in checker.c. Any type resolution fix must be applied in BOTH. Mitigation: shared `eval_const_expr()` in ast.h. Proper fix: checker stores resolved Type* on AST nodes via `typemap_set()`, emitter reads via `checker_get_type()`. ~200 lines refactor.
-- **Source Mapping:** Runtime traps show `.c` file lines. Fix: emit `#line N "source.zer"` directives. ~50 lines.
+**28. Bare `if(optional)` / `while(optional)` must emit `.has_value` for struct optionals.**
+`if (val)` where val is `?u32` emits `if (val)` in C — but val is a struct. GCC rejects: "used struct type value where scalar is required." The emitter's regular-if and while paths must check `checker_get_type(cond)` — if it's a non-null-sentinel optional, append `.has_value`. The if-unwrap path (`|val|`) already handles this correctly. (BUG-139)
+
+**29. `const` on var declaration must propagate to the Type, not just the Symbol.**
+Parser puts `const` into `node->var_decl.is_const`, NOT into the TypeNode (TYNODE_CONST only wraps when `const` appears inside a type expression like function params). The checker must propagate: in NODE_VAR_DECL and NODE_GLOBAL_VAR, when `is_const` is true and type is slice/pointer, create a const-qualified Type via `type_const_slice()` / `type_const_pointer()`. Without this, `const []u8 msg = "hello"; mutate(msg)` passes because `check_expr(NODE_IDENT)` returns `sym->type` which has `is_const = false`. (BUG-140)
+
+### Known Technical Debt
+- ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
+- ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~
 - **Global Compiler State:** `type_map`, `non_storable_nodes` are static globals. Makes compiler non-thread-safe. Fix: move into Checker/Emitter structs. Same pattern as GCC.
+- **Static vars in imported modules:** `static u32 counter` in a module → "undefined identifier" when used by the module's own functions. Static globals don't register in scope during `checker_register_file`. Not blocking (non-static globals work fine).
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

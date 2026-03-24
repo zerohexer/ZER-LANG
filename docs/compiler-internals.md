@@ -162,7 +162,7 @@ if (obj_node->kind == NODE_IDENT) {
 - `pool.free(h)` → `_zer_pool_free(gen, used, h, cap)`
 
 **Ring methods:**
-- `ring.push(val)` → `({ T tmp = val; _zer_ring_push(data, &head, &count, cap, &tmp, sizeof(tmp)); })`
+- `ring.push(val)` → `({ T tmp = val; _zer_ring_push(data, &head, &tail, &count, cap, &tmp, sizeof(tmp)); })` — tail advances on full (BUG-137)
 - `ring.pop()` → `({ _zer_opt_T r = {0}; if (count > 0) { r.value = data[tail]; r.has_value = 1; tail = (tail+1) % cap; count--; } r; })`
 - `ring.push_checked(val)` → same as push but wrapped: check `count < cap` first, return `_zer_opt_void`
 
@@ -385,5 +385,7 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 27. **Source mapping via `#line` directives** — `emitter.source_file` set per module. Emits `#line N "file.zer"` before each non-block statement. NULL = disabled (for tests).
 24. **Shift operators use `_zer_shl`/`_zer_shr` macros** — ZER spec: shift >= width = 0. C has UB. Macros use GCC statement expression for single-eval. Compound shifts (`<<=`) emit `x = _zer_shl(x, n)`.
 25. **Bounds check side-effect detection** — NODE_CALL AND NODE_ASSIGN both trigger single-eval path (GCC statement expression). All other index expressions use comma operator (lvalue-safe, double-eval OK for pure expressions).
+28. **Bare `if(optional)` / `while(optional)` must emit `.has_value`** — Non-null-sentinel optionals (`?u32`, `?bool`, `?void`) are structs in C. `if (val)` where val is a struct is a GCC error. The emitter's regular-if and while paths must check `checker_get_type(cond)` — if `TYPE_OPTIONAL` and `!is_null_sentinel(inner)`, append `.has_value`. The if-unwrap (`|val|`) path already handles this.
+29. **`const` on var-decl must propagate to the Type** — Parser puts `const` into `var_decl.is_const` (NOT into TYNODE_CONST). The checker must create a const-qualified Type in NODE_VAR_DECL/NODE_GLOBAL_VAR: `type_const_slice()` / `type_const_pointer()`. Without this, `check_expr(NODE_IDENT)` returns a non-const Type, and const→mutable function arg checks don't fire. Function param types ARE wrapped in TYNODE_CONST by the parser (because `parse_type()` handles `const` prefix), so they resolve correctly through `resolve_type(TYNODE_CONST)`.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

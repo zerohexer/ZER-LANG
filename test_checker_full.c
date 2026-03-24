@@ -724,6 +724,17 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-191: duplicate struct field names */
+    err("struct S { u32 x; u32 x; }",
+        "duplicate field 'x' in struct REJECT");
+
+    /* BUG-192: return inside defer */
+    err("u32 f() { defer { return 5; } return 1; }",
+        "return inside defer REJECT");
+
+    err("void f() { while (true) { defer { break; } } }",
+        "break inside defer REJECT");
+
     /* BUG-190: missing return in non-void function */
     err("u32 bad(bool c) { if (c) { return 1; } }",
         "missing return — if without else REJECT");

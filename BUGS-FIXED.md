@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-191: Duplicate struct/union field/variant names not caught
+- **Symptom:** `struct S { u32 x; u32 x; }` passes checker, GCC rejects "duplicate member."
+- **Fix:** Field/variant registration loops check previous names for collision.
+
+### BUG-192: Return/break/continue inside defer — control flow corruption
+- **Symptom:** `defer { return 5; }` crashes compiler or produces invalid control flow.
+- **Fix:** NODE_RETURN, NODE_BREAK, NODE_CONTINUE check `defer_depth > 0` → error.
+
 ### BUG-190: Missing return in non-void function — undefined behavior
 - **Symptom:** `u32 f(bool c) { if (c) { return 1; } }` — falls off end without returning.
 - **Fix:** `all_paths_return()` recursive check after function body type-checking. Handles NODE_BLOCK, NODE_IF (requires else), NODE_SWITCH (exhaustive), NODE_RETURN.

@@ -2239,6 +2239,13 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
+        /* return inside defer is illegal — would corrupt control flow */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'return' inside defer block");
+            break;
+        }
+
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
 
@@ -2379,13 +2386,17 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_BREAK:
-        if (!c->in_loop) {
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line, "cannot use 'break' inside defer block");
+        } else if (!c->in_loop) {
             checker_error(c, node->loc.line, "'break' outside of loop");
         }
         break;
 
     case NODE_CONTINUE:
-        if (!c->in_loop) {
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
+        } else if (!c->in_loop) {
             checker_error(c, node->loc.line, "'continue' outside of loop");
         }
         break;
@@ -2436,6 +2447,16 @@ static void register_decl(Checker *c, Node *node) {
                 node->struct_decl.field_count * sizeof(SField));
             for (int i = 0; i < node->struct_decl.field_count; i++) {
                 FieldDecl *fd = &node->struct_decl.fields[i];
+                /* check for duplicate field names */
+                for (int j = 0; j < i; j++) {
+                    if (node->struct_decl.fields[j].name_len == fd->name_len &&
+                        memcmp(node->struct_decl.fields[j].name, fd->name, fd->name_len) == 0) {
+                        checker_error(c, node->loc.line,
+                            "duplicate field '%.*s' in struct '%.*s'",
+                            (int)fd->name_len, fd->name,
+                            (int)node->struct_decl.name_len, node->struct_decl.name);
+                    }
+                }
                 SField *sf = &t->struct_type.fields[i];
                 sf->name = fd->name;
                 sf->name_len = (uint32_t)fd->name_len;
@@ -2504,6 +2525,16 @@ static void register_decl(Checker *c, Node *node) {
                 node->union_decl.variant_count * sizeof(SUVariant));
             for (int i = 0; i < node->union_decl.variant_count; i++) {
                 UnionVariant *uv = &node->union_decl.variants[i];
+                /* check for duplicate variant names */
+                for (int j = 0; j < i; j++) {
+                    if (node->union_decl.variants[j].name_len == uv->name_len &&
+                        memcmp(node->union_decl.variants[j].name, uv->name, uv->name_len) == 0) {
+                        checker_error(c, node->loc.line,
+                            "duplicate variant '%.*s' in union '%.*s'",
+                            (int)uv->name_len, uv->name,
+                            (int)node->union_decl.name_len, node->union_decl.name);
+                    }
+                }
                 SUVariant *sv = &t->union_type.variants[i];
                 sv->name = uv->name;
                 sv->name_len = (uint32_t)uv->name_len;

@@ -524,6 +524,15 @@ Imported module functions emit as `module_name` (`mod_a_init`). `module_prefix` 
 **84. @size struct alignment matches C sizeof.**
 Constant @size resolution now computes with natural alignment: field offset = align(total, field_size), struct padded to multiple of largest field alignment. Packed structs use alignment 1 (no padding). Matches GCC's sizeof exactly. (BUG-219)
 
+**85. keep parameter rejects local-derived pointers.**
+`store(p)` where `p` has `is_local_derived` and the parameter is `keep` → error. Previous check only caught direct `&local`, not aliased local pointers. (BUG-221)
+
+**86. Recursive `compute_type_size()` for @size constant evaluation.**
+Handles nested structs, arrays, pointers, slices. Computes natural alignment (fields aligned to their size, struct padded to max alignment). Used for all @size constant paths. Fixes `@size(OuterStruct)` mismatch with GCC sizeof. (BUG-220)
+
+**87. Static symbols in imported modules: module-scope only.**
+Statics from imported modules skip `checker_register_file` (global scope) and are registered only during `checker_push_module_scope`. The module scope provides visibility during body checking. The emitter uses global scope with `module_prefix` for name resolution. (BUG-222)
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

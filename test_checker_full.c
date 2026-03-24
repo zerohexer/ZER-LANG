@@ -1122,6 +1122,12 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-221: keep parameter rejects local-derived pointers */
+    err("static Pool(u32, 4) pool;\n"
+        "void store(keep *u32 p) { pool.alloc(); }\n"
+        "void bad() { u32 x = 0; *u32 p = &x; store(p); }",
+        "local-derived ptr to keep param rejected");
+
     /* BUG-217: compile-time slice bounds check */
     err("u32 main() { u8[10] a; []u8 s = a[0..15]; return 0; }",
         "slice end 15 exceeds array size 10");

@@ -73,6 +73,24 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-222: Static variable collision across imported modules
+- **Symptom:** Two modules with `static u32 x` → GCC "redefinition" error.
+- **Root cause:** BUG-213 registered statics in global scope, causing collisions.
+- **Fix:** Statics from imported modules registered only in module scope (not global). Module scope registers statics during `push_module_scope`. Global scope registration adds module_prefix for emitter. Statics also mangled in emitter output.
+- **Known limitation:** Cross-module static name collision in global scope may resolve to wrong symbol. Per-module symbol tables needed for full fix (v2.0).
+
+### BUG-221: keep parameter bypass with local-derived pointers
+- **Symptom:** `*u32 p = &x; store(p)` where `store(keep *u32 p)` — no error. Dangling pointer stored via keep.
+- **Root cause:** keep check only looked for direct `&local`, not `is_local_derived` aliases.
+- **Fix:** In function call keep param check, also reject idents with `is_local_derived` flag.
+- **Test:** `test_checker_full.c` — local-derived ptr to keep param rejected.
+
+### BUG-220: @size recursive computation for nested structs
+- **Symptom:** `struct Outer { Inner inner; u8 flag; }` — @size computed 8 (wrong), should be 16.
+- **Root cause:** `type_width` returns 0 for TYPE_STRUCT. Constant-eval fell back to 4 bytes.
+- **Fix:** Extracted `compute_type_size()` helper — recursively computes struct, array, pointer, slice sizes with natural alignment. Used for all @size constant evaluation.
+- **Test:** Manual — `@size(Outer)` now matches GCC sizeof(Outer) = 16.
+
 ### BUG-219: @size struct calculation ignores C alignment padding
 - **Symptom:** `struct S { u8 a; u32 b; }` — checker computes @size = 5 (field sum), GCC sizeof = 8 (with alignment).
 - **Root cause:** Constant @size resolution summed field sizes without alignment.

@@ -387,10 +387,12 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_IDENT: {
-        /* BUG-218: check for module-prefixed function/global names */
+        /* BUG-218/222: module-aware identifier emission.
+         * Look up in global scope — if found with module_prefix, mangle.
+         * Local vars (params, block-scoped) won't be in global scope → raw name. */
         Symbol *id_sym = scope_lookup(e->checker->global_scope,
             node->ident.name, (uint32_t)node->ident.name_len);
-        if (id_sym && id_sym->module_prefix && !id_sym->is_static) {
+        if (id_sym && id_sym->module_prefix) {
             emit(e, "%.*s_%.*s",
                  (int)id_sym->module_prefix_len, id_sym->module_prefix,
                  (int)node->ident.name_len, node->ident.name);
@@ -2473,11 +2475,7 @@ static void emit_func_decl(Emitter *e, Node *node) {
 
     emit_type(e, ret);
     emit(e, " ");
-    if (!node->func_decl.is_static) {
-        EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
-    } else {
-        emit(e, "%.*s", (int)node->func_decl.name_len, node->func_decl.name);
-    }
+    EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
     emit(e, "(");
 
     if (node->func_decl.param_count == 0) {
@@ -2554,8 +2552,8 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
         emit(e, "volatile ");
 
-    /* BUG-218: mangle global var names for imported modules */
-    if (e->current_module && !node->var_decl.is_static) {
+    /* BUG-218/222: mangle global var names for imported modules (including static) */
+    if (e->current_module) {
         char mangled[256];
         int mlen = snprintf(mangled, sizeof(mangled), "%.*s_%.*s",
             (int)e->current_module_len, e->current_module,

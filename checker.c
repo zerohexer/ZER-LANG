@@ -274,6 +274,54 @@ static bool is_literal_compatible(Node *expr, Type *target) {
  * TYPE RESOLUTION: TypeNode (syntactic) → Type (semantic)
  * ================================================================ */
 
+/* BUG-220: recursive type size computation for @size constant evaluation.
+ * Handles nested structs, arrays, pointers, slices with natural alignment. */
+static int64_t compute_type_size(Type *t) {
+    t = type_unwrap_distinct(t);
+    int w = type_width(t);
+    if (w > 0) return w / 8;
+    if (t->kind == TYPE_POINTER) return type_width(ty_usize) / 8;
+    if (t->kind == TYPE_SLICE) return (type_width(ty_usize) / 8) * 2;
+    if (t->kind == TYPE_ARRAY) {
+        int64_t elem_size = compute_type_size(t->array.inner);
+        return elem_size > 0 ? elem_size * (int64_t)t->array.size : -1;
+    }
+    if (t->kind == TYPE_STRUCT) {
+        int64_t total = 0;
+        int max_align = 1;
+        bool is_packed = t->struct_type.is_packed;
+        for (uint32_t fi = 0; fi < t->struct_type.field_count; fi++) {
+            int64_t fsize = compute_type_size(t->struct_type.fields[fi].type);
+            if (fsize <= 0) fsize = 4; /* fallback for unknown types */
+            int falign = is_packed ? 1 : (int)(fsize > 8 ? 8 : fsize);
+            /* for nested structs, alignment = largest field alignment, capped at 8 */
+            if (t->struct_type.fields[fi].type->kind == TYPE_STRUCT ||
+                t->struct_type.fields[fi].type->kind == TYPE_ARRAY) {
+                /* use the inner struct/array's natural alignment */
+                Type *ft = type_unwrap_distinct(t->struct_type.fields[fi].type);
+                if (ft->kind == TYPE_STRUCT && ft->struct_type.field_count > 0) {
+                    int64_t first_field_size = compute_type_size(ft->struct_type.fields[0].type);
+                    if (first_field_size > 0 && first_field_size <= 8)
+                        falign = (int)first_field_size;
+                    /* find max field alignment */
+                    for (uint32_t k = 0; k < ft->struct_type.field_count; k++) {
+                        int64_t ks = compute_type_size(ft->struct_type.fields[k].type);
+                        if (ks > 0 && ks <= 8 && (int)ks > falign) falign = (int)ks;
+                    }
+                }
+            }
+            if (falign > max_align) max_align = falign;
+            if (!is_packed && falign > 1 && (total % falign) != 0)
+                total += falign - (total % falign);
+            total += fsize;
+        }
+        if (!is_packed && max_align > 1 && (total % max_align) != 0)
+            total += max_align - (total % max_align);
+        return total > 0 ? total : -1;
+    }
+    return -1;
+}
+
 static Type *resolve_type(Checker *c, TypeNode *tn) {
     if (!tn) return ty_void;
 
@@ -345,30 +393,10 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
                     if (w > 0) {
                         val = w / 8;
                     } else if (unwrapped->kind == TYPE_STRUCT) {
-                        /* BUG-219: compute size with natural alignment (like C).
-                         * Packed structs use no padding. */
-                        int64_t total = 0;
-                        int max_align = 1;
-                        bool is_packed = unwrapped->struct_type.is_packed;
-                        for (uint32_t fi = 0; fi < unwrapped->struct_type.field_count; fi++) {
-                            int fw = type_width(unwrapped->struct_type.fields[fi].type);
-                            int fbytes = (fw > 0) ? fw / 8 : 4;
-                            int falign = is_packed ? 1 : fbytes;
-                            if (falign > max_align) max_align = falign;
-                            /* align total to field alignment */
-                            if (!is_packed && falign > 1 && (total % falign) != 0)
-                                total += falign - (total % falign);
-                            total += fbytes;
-                        }
-                        /* pad struct to multiple of largest alignment */
-                        if (!is_packed && max_align > 1 && (total % max_align) != 0)
-                            total += max_align - (total % max_align);
-                        val = total > 0 ? total : -1;
-                    } else if (size_of->kind == TYPE_POINTER ||
-                               size_of->kind == TYPE_SLICE) {
-                        /* pointer/slice size = target pointer width */
-                        val = type_width(ty_usize) / 8;
-                        if (size_of->kind == TYPE_SLICE) val *= 2; /* ptr + len */
+                        val = compute_type_size(unwrapped);
+                    } else {
+                        /* fallback: use recursive compute for any type */
+                        val = compute_type_size(unwrapped);
                     }
                 }
             }
@@ -1278,6 +1306,19 @@ static Type *check_expr(Checker *c, Node *node) {
                                         checker_error(c, node->loc.line,
                                             "argument %d: local variable '%.*s' cannot "
                                             "satisfy 'keep' parameter — must be static or global",
+                                            i + 1,
+                                            (int)arg_sym->name_len, arg_sym->name);
+                                    }
+                                }
+                                /* BUG-221: also reject local-derived pointers */
+                                if (arg_node->kind == NODE_IDENT) {
+                                    Symbol *arg_sym = scope_lookup(c->current_scope,
+                                        arg_node->ident.name,
+                                        (uint32_t)arg_node->ident.name_len);
+                                    if (arg_sym && arg_sym->is_local_derived) {
+                                        checker_error(c, node->loc.line,
+                                            "argument %d: local-derived pointer '%.*s' cannot "
+                                            "satisfy 'keep' parameter — points to stack memory",
                                             i + 1,
                                             (int)arg_sym->name_len, arg_sym->name);
                                     }
@@ -2908,7 +2949,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
-            /* BUG-218: store module prefix for global var name mangling */
+            /* BUG-218/222: store module prefix for name mangling (including static) */
             sym->module_prefix = c->current_module;
             sym->module_prefix_len = c->current_module_len;
         }
@@ -3100,9 +3141,12 @@ void checker_register_file(Checker *c, Node *file_node) {
         Node *decl = file_node->file.decls[i];
         /* skip imports — they're handled by the compiler driver */
         if (decl->kind == NODE_IMPORT || decl->kind == NODE_CINCLUDE) continue;
-        /* BUG-213: register ALL declarations including statics.
-         * Statics must be visible to the module's own functions.
-         * Cross-module visibility is handled by the module scope system. */
+        /* BUG-213/222: skip statics for imported modules (registered in module scope).
+         * Main module (current_module == NULL) registers statics in global scope. */
+        if (c->current_module) {
+            if (decl->kind == NODE_FUNC_DECL && decl->func_decl.is_static) continue;
+            if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;
+        }
         register_decl(c, decl);
     }
 }
@@ -3134,6 +3178,35 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
                 }
                 scope_add(c->arena, c->current_scope, name, name_len,
                           t, decl->loc.line, c->file_name);
+            }
+        }
+        /* BUG-222: register static functions and globals into module scope
+         * AND into global scope (with module prefix for emitter lookup).
+         * Module scope is for checker body-check; global scope is for emitter. */
+        if ((decl->kind == NODE_FUNC_DECL && decl->func_decl.is_static) ||
+            (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static)) {
+            /* register into module scope (for checker body-check) */
+            register_decl(c, decl);
+            /* also register into global scope with MANGLED name for emitter.
+             * This avoids collision between mod_a's static x and mod_b's static x. */
+            Type *st = typemap_get(decl);
+            if (st && c->current_module) {
+                const char *sname = (decl->kind == NODE_FUNC_DECL) ?
+                    decl->func_decl.name : decl->var_decl.name;
+                uint32_t sname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
+                    decl->func_decl.name_len : decl->var_decl.name_len);
+                /* register under original name with module_prefix */
+                Symbol *gs = scope_add(c->arena, c->global_scope,
+                    sname, sname_len, st, decl->loc.line, c->file_name);
+                if (gs) {
+                    gs->module_prefix = c->current_module;
+                    gs->module_prefix_len = c->current_module_len;
+                    gs->is_static = true;
+                    if (decl->kind == NODE_FUNC_DECL) {
+                        gs->is_function = true;
+                        gs->func_node = decl;
+                    }
+                }
             }
         }
     }

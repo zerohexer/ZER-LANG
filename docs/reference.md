@@ -1,7 +1,7 @@
 # ZER Language Reference
 
 **Version:** 0.1 | **Compiler:** `zerc` | **Target:** Any platform GCC supports
-**905 tests + 491 fuzz inputs, all passing**
+**1015 tests + 491 fuzz inputs, all passing**
 
 ---
 
@@ -64,13 +64,16 @@ buf[2..]     // element 2 through end
 buf[..5]     // elements 0-4
 ```
 
-Array-to-slice coercion happens at function call boundaries:
+Array-to-slice coercion happens at function calls, var-decl init, and return:
 
 ```zer
 u8[256] buf;
 void process([]u8 data) { }
 process(buf);                // auto-coerces: { .ptr=buf, .len=256 }
+[]u8 s = buf;                // also coerces at var-decl
 ```
+
+**Safety:** Returning a local array as a slice is a compile error — the slice would dangle after the function returns. Global/static arrays can be returned as slices.
 
 ### Pointers — `*T`
 
@@ -81,12 +84,7 @@ Non-null by default. The compiler guarantees `*T` is never null.
 t.priority = 5;              // safe — guaranteed non-null
 ```
 
-Pointer arithmetic is **byte-level** (not scaled like C):
-
-```zer
-*u8 p = get_ptr();
-*u8 q = p + 10;             // adds exactly 10 bytes
-```
+ZER does **not** support pointer arithmetic. Use array indexing or `@inttoptr`/`@ptrtoint` for address math.
 
 ### Optional Pointers — `?*T`
 
@@ -223,7 +221,7 @@ switch (msg) {
 msg.sensor.temperature;      // COMPILE ERROR — must switch first
 ```
 
-**Known limitation:** Mutable capture `|*v|` modifies a copy of the union, not the original. The switch copies the union value before dispatch. This will be fixed in v0.1.1.
+Mutable capture `|*v|` modifies the original union — the switch takes a pointer to the source (`&(expr)`), not a copy. Mutating the switched-on union's variant inside a capture arm is a compile error (type confusion prevention).
 
 ### Function Pointers
 
@@ -253,8 +251,10 @@ typedef u32 Milliseconds;                // alias — interchangeable with u32
 distinct typedef u32 Celsius;            // distinct — NOT interchangeable
 distinct typedef u32 Fahrenheit;
 
-Fahrenheit f = celsius_val;              // COMPILE ERROR
-Fahrenheit f = @cast(Fahrenheit, c);     // explicit conversion
+Fahrenheit f = celsius_val;              // COMPILE ERROR — distinct types
+Celsius c = @cast(Celsius, 100);         // wrap: u32 → Celsius
+u32 raw = @cast(u32, c);                // unwrap: Celsius → u32
+Fahrenheit f = @cast(Fahrenheit, c);     // COMPILE ERROR — cross-distinct
 ```
 
 ---
@@ -393,7 +393,7 @@ All intrinsics start with `@`.
 | `@truncate(T, val)` | Keep low bits (big → small) | `@truncate(u8, big_u32)` |
 | `@saturate(T, val)` | Clamp to T's min/max | `@saturate(i8, 200)` → 127 |
 | `@bitcast(T, val)` | Reinterpret bits (same width) | `@bitcast(u32, signed_i32)` |
-| `@cast(T, val)` | Distinct typedef conversion | `@cast(Fahrenheit, celsius)` |
+| `@cast(T, val)` | Distinct typedef wrap/unwrap | `@cast(Celsius, u32_val)` or `@cast(u32, celsius_val)` |
 
 ### Pointer Operations
 
@@ -572,6 +572,26 @@ uart_init(9600);             // direct access to exported functions
 
 ## C Interop
 
+### Including C Headers
+
+```zer
+cinclude "stm32f4xx_hal.h";   // C header — passed through to #include in emitted C
+import uart;                   // ZER module — full safety pipeline
+```
+
+### Keep Parameters
+
+Functions that store pointers beyond the call must annotate with `keep`:
+
+```zer
+void register_callback(keep *Handler h) {
+    global_handler = h;        // stores pointer — caller must pass static/global
+}
+
+register_callback(&local_handler);  // COMPILE ERROR — local can't satisfy keep
+register_callback(&global_handler); // OK — global persists
+```
+
 ### Calling C from ZER
 
 ```zer
@@ -633,14 +653,16 @@ zerc module.zer --lib        # no preamble/runtime, for C interop
 
 | Bug Class | How ZER Prevents It |
 |-----------|-------------------|
-| Buffer overflow | Bounds check on every array/slice access |
-| Use-after-free | Handle generation counter + ZER-CHECK |
+| Buffer overflow | Inline bounds check on every array/slice access (conditions, loops, all expressions) |
+| Use-after-free | Handle generation counter + ZER-CHECK (with alias + parameter tracking) |
 | Null dereference | `*T` is non-null by type, `?*T` forces unwrap |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
-| Missing switch case | Exhaustive check for enums and bools |
-| Dangling pointer | Scope escape analysis |
+| Missing switch case | Exhaustive check for enums, bools, and unions (including distinct typedefs) |
+| Dangling pointer | Scope escape analysis (`return &local`, `global.ptr = &local`, `return local_array` as slice) |
+| Union type confusion | Cannot mutate union variant during mutable switch capture |
+| Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 
 ---
 
@@ -651,7 +673,7 @@ zerc module.zer --lib        # no preamble/runtime, for C interop
 ```bash
 make            # build zerc compiler
 make zer-lsp    # build language server
-make check      # run all 905 tests + 491 fuzz
+make check      # run all 1015 tests + 491 fuzz
 make release    # release binaries in release/
 ```
 
@@ -682,7 +704,7 @@ source.zer → Lexer → Parser → AST → Checker → ZER-CHECK → Emitter �
 
 **Memory:** `Pool` `Ring` `Arena` `Handle`
 
-**Special:** `defer` `import` `volatile` `interrupt` `asm` `static` `keep`
+**Special:** `defer` `import` `cinclude` `volatile` `interrupt` `asm` `static` `keep`
 
 ---
 
@@ -698,8 +720,8 @@ source.zer → Lexer → Parser → AST → Checker → ZER-CHECK → Emitter �
 - No C-style casts
 - No header files (use `import`)
 - No preprocessor (#define, #ifdef)
-- No `else if` (nest instead)
 - No `float` switch
+- No pointer arithmetic (`*T + n` is a compile error)
 
 ---
 

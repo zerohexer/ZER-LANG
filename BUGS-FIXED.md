@@ -73,6 +73,48 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-199: `@size(T)` not recognized as compile-time constant in array sizes
+- **Symptom:** `u8[@size(Task)] buffer;` errors "array size must be a compile-time constant."
+- **Root cause:** `eval_const_expr` in `ast.h` handles literals and binary ops but not `NODE_INTRINSIC`. No way to resolve type sizes without checker context.
+- **Fix:** In checker's TYNODE_ARRAY resolution, detect `NODE_INTRINSIC` with name "size" when `eval_const_expr` returns -1. Resolve the type via `type_arg` or named lookup, compute byte size from `type_width / 8` (primitives) or field sum (structs) or 4 (pointers).
+- **Test:** `test_checker_full.c` — `@size(T)` accepted as array size. `test_emit.c` — E2E `@size(Task)` = 8 bytes.
+
+### BUG-198: Duplicate enum variant names not caught
+- **Symptom:** `enum Color { red, green, red }` passes checker. Emitter outputs duplicate `#define` — GCC warns about redefinition.
+- **Root cause:** BUG-191 fixed duplicate struct/union fields but missed enum variants.
+- **Fix:** Added collision check in `NODE_ENUM_DECL` registration loop (same pattern as struct fields).
+- **Test:** `test_checker_full.c` — duplicate enum variant rejected, distinct variants accepted.
+
+### BUG-197: Volatile decay on address-of — `&volatile_var` loses volatile
+- **Symptom:** `volatile u32 x; *u32 p = &x; *p = 1;` — write through `p` can be optimized away because `p` is not volatile.
+- **Root cause:** `TOK_AMP` in checker didn't propagate volatile from Symbol to the resulting pointer type. The pointer lost the volatile qualifier.
+- **Fix:** In `check_expr(NODE_UNARY/TOK_AMP)`, look up operand symbol — if `is_volatile`, set `result->pointer.is_volatile = true`. In var-decl init, block volatile→non-volatile pointer assignment.
+- **Test:** `test_checker_full.c` — non-volatile ptr from volatile rejected, volatile ptr accepted.
+
+### BUG-196b: Switch on struct-optional emits struct==int — GCC error
+- **Symptom:** `switch (?u32 val) { 5 => { ... } }` emits `if (_zer_sw0 == 5)` where `_zer_sw0` is a struct. GCC rejects "invalid operands to binary ==."
+- **Root cause:** Emitter switch fallback compared the full optional struct against integer values. No special handling for struct-based optionals.
+- **Fix:** Detect `is_opt_switch` when expression type is `TYPE_OPTIONAL` with non-null-sentinel inner. Compare `.has_value && .value == X`. Handle captures by extracting `.value`.
+- **Test:** `test_emit.c` — switch on ?u32 matches value, null hits default, capture works.
+
+### BUG-196: Constant array OOB not caught at compile time
+- **Symptom:** `u8[10] arr; arr[100] = 1;` passes checker, traps at runtime. Should be caught at compile time.
+- **Root cause:** Checker `NODE_INDEX` had no constant bounds check — relied entirely on runtime bounds checking in emitted C.
+- **Fix:** In `NODE_INDEX`, if index is `NODE_INT_LIT` and object is `TYPE_ARRAY`, compare `idx_val >= array.size` → error.
+- **Test:** `test_checker_full.c` — index 10 on [10] rejected, index 9 on [10] accepted. `test_emit.c` — compile-time OOB + runtime OOB tests.
+
+### BUG-195: `while(true)` rejected by all_paths_return — false positive
+- **Symptom:** `u32 f() { while (true) { return 1; } }` errors "not all control flow paths return."
+- **Root cause:** `all_paths_return` had no `NODE_WHILE` case — fell to `default: return false`. Infinite loops are terminators (never exit normally), so they satisfy return analysis.
+- **Fix:** Added `NODE_WHILE` case: if condition is literal `true`, return `true`. Same for `NODE_FOR` with no condition.
+- **Test:** `test_checker_full.c` — while(true) with return accepted, with conditional return accepted. `test_emit.c` — E2E while(true) return.
+
+### BUG-194: Sticky `is_local_derived` / `is_arena_derived` — false positives and negatives
+- **Symptom:** `*u32 p = &x; p = &g; return p` → false positive ("cannot return local pointer"). `*u32 p = &g; p = &x; return p` → false negative (unsafe return not caught).
+- **Root cause:** Safety flags only set during `NODE_VAR_DECL` init, never updated or cleared during `NODE_ASSIGN`. Reassignment didn't clear old flags or set new ones.
+- **Fix:** In `NODE_ASSIGN` with `op == TOK_EQ`, clear both flags on target root, then re-derive: `&local` → set `is_local_derived`, alias of local/arena-derived → propagate flag.
+- **Test:** `test_checker_full.c` — reassign clears flag (positive), assign &local sets flag (negative). `test_emit.c` — E2E reassign local-derived to global.
+
 ### BUG-193: Multi-module type name collision — unhelpful error
 - **Symptom:** Two imported modules with same type name → "redefinition" error with no module info.
 - **Fix:** Checker detects cross-module collision and reports: "name collision: 'X' in module 'a' conflicts with 'X' in module 'b' — rename one." Emitter has module-prefix infrastructure ready for future per-module scoping.

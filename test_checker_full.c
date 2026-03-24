@@ -1107,6 +1107,56 @@ static void test_negative_sweep(void) {
         "?Pt make() { Pt p; p.x = 1; p.y = 2; return p; }\n"
         "void f() { ?Pt opt = make(); if (opt) |pt| { pt.x = 99; } }",
         "const capture field mutation rejected");
+
+    /* BUG-194: sticky is_local_derived — reassign to safe value must clear flag */
+    err("u32 g = 99;\n"
+        "*u32 test() { u32 x = 42; *u32 p = &x; return p; }",
+        "return local-derived pointer rejected");
+    ok("u32 g = 99;\n"
+       "*u32 test() { u32 x = 42; *u32 p = &x; p = &g; return p; }\n"
+       "u32 main() { return 0; }",
+       "reassign local-derived to global clears flag");
+
+    /* BUG-194: is_local_derived must be SET during assignment, not just var-decl */
+    err("u32 g = 99;\n"
+        "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
+        "assign &local sets local-derived flag");
+
+    /* BUG-198: duplicate enum variant names */
+    err("enum Color { red, green, red }\nu32 main() { return 0; }",
+        "duplicate enum variant rejected");
+    ok("enum Color { red, green, blue }\nu32 main() { return 0; }",
+       "distinct enum variants accepted");
+
+    /* BUG-199: @size(T) in array size */
+    ok("struct Task { u32 id; u32 priority; }\n"
+       "u8[@size(Task)] buffer;\n"
+       "u32 main() { return 0; }",
+       "@size(T) accepted as array size constant");
+
+    /* BUG-196: compile-time OOB for constant array index */
+    err("u32 main() { u8[10] a; a[10] = 1; return 0; }",
+        "constant index 10 on array[10] rejected");
+    err("u32 main() { u8[4] a; a[100] = 1; return 0; }",
+        "constant index 100 on array[4] rejected");
+    ok("u32 main() { u8[10] a; a[9] = 1; return 0; }",
+       "constant index 9 on array[10] accepted");
+
+    /* BUG-197: volatile pointer decay — &volatile_var to non-volatile ptr */
+    err("volatile u32 x = 0;\n"
+        "void f() { *u32 p = &x; }",
+        "non-volatile ptr from volatile rejected");
+    ok("volatile u32 x = 0;\n"
+       "u32 main() { volatile *u32 p = &x; return 0; }",
+       "volatile ptr from volatile accepted");
+
+    /* BUG-195: while(true) is a terminator for all_paths_return */
+    ok("u32 loop_ret() { while (true) { return 1; } }\n"
+       "u32 main() { return loop_ret(); }",
+       "while(true) with return accepted");
+    ok("u32 loop_if() { while (true) { u32 x = 1; if (x > 0) { return 1; } } }\n"
+       "u32 main() { return loop_if(); }",
+       "while(true) with conditional return accepted");
 }
 
 /* ================================================================ */

@@ -1063,15 +1063,35 @@ int main(void) {
         50,
         "valid array access passes bounds check = 50");
 
-    printf("[bounds check — out of bounds traps]\n");
-    /* out-of-bounds access should abort (non-zero exit) */
+    printf("[bounds check — compile-time OOB rejected (BUG-196)]\n");
+    /* BUG-196: constant OOB is now caught at compile time */
+    {
+        tests_run++;
+        Arena a; arena_init(&a, 128*1024);
+        if (!zer_to_c(
+            "u32 main() {\n"
+            "    u32[4] arr;\n"
+            "    arr[10] = 99;\n"
+            "    return 0;\n"
+            "}\n", "_zer_test_out.c")) {
+            tests_passed++; /* compile error = expected behavior */
+        } else {
+            printf("  FAIL: constant OOB should be compile error\n");
+            tests_failed++;
+        }
+        arena_free(&a);
+    }
+
+    printf("[bounds check — runtime OOB traps]\n");
+    /* variable index OOB still traps at runtime */
     {
         tests_run++;
         Arena a; arena_init(&a, 128*1024);
         if (zer_to_c(
             "u32 main() {\n"
             "    u32[4] arr;\n"
-            "    arr[10] = 99;\n"
+            "    u32 idx = 10;\n"
+            "    arr[idx] = 99;\n"
             "    return 0;\n"
             "}\n", "_zer_test_out.c")) {
             int gcc = system("gcc -std=c99 -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt");
@@ -2593,6 +2613,112 @@ int main(void) {
         "}\n",
         5,
         "10 / 2 = 5 (safe div)");
+
+    /* BUG-195: while(true) all_paths_return */
+    printf("[while(true) return — BUG-195]\n");
+    test_compile_and_run(
+        "u32 find() {\n"
+        "    while (true) {\n"
+        "        return 77;\n"
+        "    }\n"
+        "}\n"
+        "u32 main() { return find(); }\n",
+        77,
+        "while(true) with return accepted");
+
+    test_compile_and_run(
+        "u32 find(u32 n) {\n"
+        "    while (true) {\n"
+        "        if (n > 0) { return n; }\n"
+        "        n += 1;\n"
+        "    }\n"
+        "}\n"
+        "u32 main() { return find(33); }\n",
+        33,
+        "while(true) with conditional return");
+
+    /* BUG-194: sticky safety flags — reassign clears local-derived */
+    printf("[sticky safety flags — BUG-194]\n");
+    test_compile_and_run(
+        "u32 g = 55;\n"
+        "*u32 safe() {\n"
+        "    u32 x = 42;\n"
+        "    *u32 p = &x;\n"
+        "    p = &g;\n"
+        "    return p;\n"
+        "}\n"
+        "u32 main() { return *safe(); }\n",
+        55,
+        "reassign local-derived to global clears flag");
+
+    /* BUG-196b: switch on optional */
+    printf("[switch on optional — BUG-196b]\n");
+    test_compile_and_run(
+        "?u32 maybe_get(u32 x) {\n"
+        "    if (x > 10) { return x; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    ?u32 val = maybe_get(42);\n"
+        "    switch (val) {\n"
+        "        42 => { return 1; }\n"
+        "        default => { return 0; }\n"
+        "    }\n"
+        "}\n",
+        1,
+        "switch on ?u32 matches .value");
+
+    test_compile_and_run(
+        "?u32 maybe_get(u32 x) {\n"
+        "    if (x > 10) { return x; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    ?u32 val = maybe_get(5);\n"
+        "    switch (val) {\n"
+        "        42 => { return 1; }\n"
+        "        default => { return 99; }\n"
+        "    }\n"
+        "}\n",
+        99,
+        "switch on null ?u32 hits default");
+
+    test_compile_and_run(
+        "?u32 maybe_get(u32 x) {\n"
+        "    if (x > 10) { return x; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    ?u32 val = maybe_get(77);\n"
+        "    switch (val) {\n"
+        "        77 => |v| { return v; }\n"
+        "        default => { return 0; }\n"
+        "    }\n"
+        "}\n",
+        77,
+        "switch on ?u32 with capture");
+
+    /* BUG-199: @size(T) as array size */
+    printf("[BUG-199: @size(T) array size]\n");
+    test_compile_and_run(
+        "struct Task { u32 id; u32 priority; }\n"
+        "u8[@size(Task)] buffer;\n"
+        "u32 main() {\n"
+        "    return @truncate(u32, @size(Task));\n"
+        "}\n",
+        8,
+        "@size(Task) = 8 bytes used as array size");
+
+    /* BUG-196: compile-time OOB */
+    printf("[compile-time OOB — BUG-196]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[10] arr;\n"
+        "    arr[9] = 42;\n"
+        "    return arr[9];\n"
+        "}\n",
+        42,
+        "arr[9] on u32[10] — valid boundary access");
 
     /* cleanup temp files */
     remove("_zer_test_out.c");

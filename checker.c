@@ -325,6 +325,37 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
         uint32_t size = 0;
         if (tn->array.size_expr) {
             int64_t val = eval_const_expr(tn->array.size_expr);
+            /* BUG-199: handle @size(T) as compile-time constant */
+            if (val < 0 && tn->array.size_expr->kind == NODE_INTRINSIC &&
+                tn->array.size_expr->intrinsic.name_len == 4 &&
+                memcmp(tn->array.size_expr->intrinsic.name, "size", 4) == 0) {
+                Type *size_of = NULL;
+                if (tn->array.size_expr->intrinsic.type_arg) {
+                    size_of = resolve_type(c, tn->array.size_expr->intrinsic.type_arg);
+                } else if (tn->array.size_expr->intrinsic.arg_count > 0 &&
+                           tn->array.size_expr->intrinsic.args[0]->kind == NODE_IDENT) {
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        tn->array.size_expr->intrinsic.args[0]->ident.name,
+                        (uint32_t)tn->array.size_expr->intrinsic.args[0]->ident.name_len);
+                    if (sym) size_of = sym->type;
+                }
+                if (size_of) {
+                    int w = type_width(size_of);
+                    if (w > 0) {
+                        val = w / 8;
+                    } else if (size_of->kind == TYPE_STRUCT) {
+                        /* sum of field sizes (no padding — packed-like) */
+                        int64_t total = 0;
+                        for (uint32_t fi = 0; fi < size_of->struct_type.field_count; fi++) {
+                            int fw = type_width(size_of->struct_type.fields[fi].type);
+                            total += (fw > 0) ? fw / 8 : 4; /* default 4 for pointers etc */
+                        }
+                        val = total > 0 ? total : -1;
+                    } else if (size_of->kind == TYPE_POINTER) {
+                        val = 4; /* 32-bit pointers */
+                    }
+                }
+            }
             if (val > 0) {
                 size = (uint32_t)val;
             } else if (val == 0) {
@@ -619,6 +650,15 @@ static Type *check_expr(Checker *c, Node *node) {
 
         case TOK_AMP: /* address-of */
             result = type_pointer(c->arena, operand);
+            /* BUG-197: volatile propagation — &volatile_var yields volatile pointer */
+            if (node->unary.operand->kind == NODE_IDENT) {
+                Symbol *sym = scope_lookup(c->current_scope,
+                    node->unary.operand->ident.name,
+                    (uint32_t)node->unary.operand->ident.name_len);
+                if (sym && sym->is_volatile) {
+                    result->pointer.is_volatile = true;
+                }
+            }
             break;
 
         default:
@@ -721,6 +761,47 @@ static Type *check_expr(Checker *c, Node *node) {
                         "cannot store pointer to local '%.*s' in static/global variable '%.*s'",
                         (int)val_sym->name_len, val_sym->name,
                         (int)target_sym->name_len, target_sym->name);
+                }
+            }
+        }
+
+        /* BUG-194: On plain assignment, clear+recompute safety flags on target.
+         * Without this: p = &local; p = &global; return p → false positive.
+         * Also: p = &global; p = &local; return p → false negative. */
+        if (node->assign.op == TOK_EQ) {
+            Node *troot = node->assign.target;
+            while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                else troot = troot->index_expr.object;
+            }
+            if (troot && troot->kind == NODE_IDENT) {
+                Symbol *tsym = scope_lookup(c->current_scope,
+                    troot->ident.name, (uint32_t)troot->ident.name_len);
+                if (tsym) {
+                    /* clear — will be re-set below if new value is unsafe */
+                    tsym->is_local_derived = false;
+                    tsym->is_arena_derived = false;
+                    /* check if new value is &local */
+                    if (node->assign.value->kind == NODE_UNARY &&
+                        node->assign.value->unary.op == TOK_AMP &&
+                        node->assign.value->unary.operand->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            node->assign.value->unary.operand->ident.name,
+                            (uint32_t)node->assign.value->unary.operand->ident.name_len);
+                        bool src_is_global = src && scope_lookup_local(c->global_scope,
+                            src->name, src->name_len) != NULL;
+                        if (src && !src->is_static && !src_is_global) {
+                            tsym->is_local_derived = true;
+                        }
+                    }
+                    /* check if new value is an alias of local/arena-derived */
+                    if (node->assign.value->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            node->assign.value->ident.name,
+                            (uint32_t)node->assign.value->ident.name_len);
+                        if (src && src->is_local_derived) tsym->is_local_derived = true;
+                        if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                    }
                 }
             }
         }
@@ -1384,6 +1465,15 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         if (obj->kind == TYPE_ARRAY) {
+            /* BUG-196: compile-time OOB for constant index */
+            if (node->index_expr.index->kind == NODE_INT_LIT) {
+                uint64_t idx_val = node->index_expr.index->int_lit.value;
+                if (idx_val >= obj->array.size) {
+                    checker_error(c, node->loc.line,
+                        "array index %llu is out of bounds for array of size %llu",
+                        (unsigned long long)idx_val, (unsigned long long)obj->array.size);
+                }
+            }
             result = obj->array.inner;
         } else if (obj->kind == TYPE_SLICE) {
             result = obj->slice.inner;
@@ -1822,6 +1912,16 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot initialize mutable pointer from const — "
                         "would allow writing to read-only memory");
                 }
+                /* BUG-197: volatile pointer → non-volatile drops volatile qualifier.
+                 * &volatile_var yields a volatile pointer (is_volatile on type).
+                 * Target must also be volatile (var_decl.is_volatile or type.is_volatile). */
+                if (type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER &&
+                    init_type->pointer.is_volatile &&
+                    !type->pointer.is_volatile && !node->var_decl.is_volatile) {
+                    checker_error(c, node->loc.line,
+                        "cannot initialize non-volatile pointer from volatile — "
+                        "writes through non-volatile pointer may be optimized away");
+                }
                 if (type->kind == TYPE_SLICE && init_type->kind == TYPE_SLICE &&
                     init_type->slice.is_const && !type->slice.is_const) {
                     checker_error(c, node->loc.line,
@@ -1845,6 +1945,7 @@ static void check_stmt(Checker *c, Node *node) {
                                  type, node->loc.line);
         if (sym) {
             sym->is_const = node->var_decl.is_const;
+            sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
 
             /* detect arena-derived pointers: x = arena.alloc(T) orelse ... */
@@ -2498,6 +2599,16 @@ static void register_decl(Checker *c, Node *node) {
             int32_t next_val = 0;
             for (int i = 0; i < node->enum_decl.variant_count; i++) {
                 EnumVariant *ev = &node->enum_decl.variants[i];
+                /* BUG-198: check for duplicate variant names */
+                for (int j = 0; j < i; j++) {
+                    if (node->enum_decl.variants[j].name_len == ev->name_len &&
+                        memcmp(node->enum_decl.variants[j].name, ev->name, ev->name_len) == 0) {
+                        checker_error(c, node->loc.line,
+                            "duplicate variant '%.*s' in enum '%.*s'",
+                            (int)ev->name_len, ev->name,
+                            (int)node->enum_decl.name_len, node->enum_decl.name);
+                    }
+                }
                 SEVariant *sv = &t->enum_type.variants[i];
                 sv->name = ev->name;
                 sv->name_len = (uint32_t)ev->name_len;
@@ -2639,6 +2750,7 @@ static void register_decl(Checker *c, Node *node) {
                                  type, node->loc.line);
         if (sym) {
             sym->is_const = node->var_decl.is_const;
+            sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
         }
         typemap_set(node, type);
@@ -2699,6 +2811,24 @@ static bool all_paths_return(Node *node) {
          * are checked for exhaustiveness elsewhere — if we got here, they passed) */
         return has_default || arm_count > 0;
     }
+    case NODE_WHILE:
+        /* while(true) is an infinite loop — never exits normally.
+         * It acts as a terminator: the function either returns inside
+         * the loop or runs forever (both valid for return analysis).
+         * Only while(true) qualifies — variable conditions might be false. */
+        if (node->while_stmt.cond &&
+            node->while_stmt.cond->kind == NODE_BOOL_LIT &&
+            node->while_stmt.cond->bool_lit.value) {
+            return true;
+        }
+        return false;
+    case NODE_FOR:
+        /* for (;;) { ... } — infinite loop with no condition.
+         * Same logic as while(true): never exits normally → terminator. */
+        if (!node->for_stmt.cond) {
+            return true;
+        }
+        return false;
     case NODE_EXPR_STMT:
         /* orelse return/break in expression statement — check for trap calls etc */
         return false;

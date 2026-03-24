@@ -446,6 +446,27 @@ Same-named types in different modules (e.g., `struct Config` in both `cfg_a.zer`
 3. **Emitter**: `EMIT_STRUCT_NAME`/`EMIT_UNION_NAME`/`EMIT_ENUM_NAME` macros prepend `module_prefix` — emits `struct cfg_a_Config` vs `struct cfg_b_Config`. All 60+ name emission sites use these macros.
 Diamond imports (same module imported via two paths) still deduplicate correctly. (BUG-193)
 
+**59. `is_local_derived` and `is_arena_derived` must be cleared+recomputed on reassignment.**
+These flags are "sticky" — once set during var-decl, they persist. But `p = &local; p = &global; return p` is safe. On `NODE_ASSIGN` with `op == TOK_EQ`, clear both flags on the target root symbol, then re-derive from the new value: `&local` → set `is_local_derived`, alias of local/arena-derived ident → propagate flag. Without this, false positives reject valid code AND false negatives miss unsafe reassignments (flag only set in var-decl, not assignment). (BUG-194)
+
+**60. `while(true)` and `for(;;)` are terminators in `all_paths_return`.**
+Infinite loops never exit normally — the function either returns inside or runs forever. Both are valid for return analysis. `all_paths_return(NODE_WHILE)` returns `true` when condition is literal `true` (`NODE_BOOL_LIT` with `value == true`). `all_paths_return(NODE_FOR)` returns `true` when condition is NULL (omitted). Without this, `u32 f() { while(true) { if (x) { return 1; } } }` is falsely rejected. (BUG-195)
+
+**61. Compile-time OOB for constant array index.**
+`u8[10] arr; arr[100] = 1;` is caught at compile time, not just at runtime. In `NODE_INDEX`, if index is `NODE_INT_LIT` and object is `TYPE_ARRAY`, compare `idx_val >= array.size` → error. Runtime bounds checks still fire for variable indices. (BUG-196)
+
+**62. Switch on struct-based optionals emits `.has_value && .value == X`.**
+`switch (?u32 val) { 5 => { ... } }` must compare `.value` (not the raw struct). Emitter detects `is_opt_switch` when `TYPE_OPTIONAL` with non-null-sentinel inner. Captures extract `.value` (immutable) or `&.value` (mutable `|*v|`). Null-sentinel optionals (`?*T`, `?FuncPtr`) still use direct comparison. (BUG-196b)
+
+**63. Volatile propagation on address-of (`&volatile_var`).**
+`&x` where `x` has `sym->is_volatile` produces a pointer with `pointer.is_volatile = true`. Assigning this to a non-volatile pointer variable is an error (volatile qualifier dropped → optimizer may eliminate writes). `volatile *u32 p = &x` is allowed because `var_decl.is_volatile` matches. (BUG-197)
+
+**64. `@size(T)` resolved as compile-time constant in array sizes.**
+`u8[@size(Task)] buffer;` now works. In the checker's TYNODE_ARRAY resolution, when `eval_const_expr` returns -1 and the size expression is `NODE_INTRINSIC` with name "size", resolve the type and compute byte size: primitives via `type_width / 8`, structs via field sum, pointers = 4. The emitter still uses `sizeof(T)` for runtime expressions. (BUG-199)
+
+**65. Duplicate enum variant names rejected.**
+`enum Color { red, green, red }` is caught at checker level (BUG-198). Same pattern as struct field duplicate check (BUG-191). Prevents GCC `#define` redefinition warnings.
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

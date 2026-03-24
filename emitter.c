@@ -2000,6 +2000,14 @@ static void emit_stmt(Emitter *e, Node *node) {
         int sw_tmp = e->temp_count++;
         Type *sw_type = checker_get_type(node->switch_stmt.expr);
         bool is_union_switch = sw_type && sw_type->kind == TYPE_UNION;
+        /* BUG-196b: detect struct-based optional in switch */
+        bool is_opt_switch = false;
+        if (sw_type && sw_type->kind == TYPE_OPTIONAL) {
+            Type *inner = sw_type->optional.inner;
+            if (!is_null_sentinel(inner)) {
+                is_opt_switch = true;
+            }
+        }
 
         emit_indent(e);
         emit(e, "{\n");
@@ -2051,6 +2059,17 @@ static void emit_stmt(Emitter *e, Node *node) {
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
                 }
                 emit(e, ") ");
+            } else if (is_opt_switch) {
+                /* optional switch: compare .value (and require .has_value) */
+                if (i > 0) emit(e, "else ");
+                emit(e, "if (");
+                for (int j = 0; j < arm->value_count; j++) {
+                    if (j > 0) emit(e, " || ");
+                    emit(e, "(_zer_sw%d.has_value && _zer_sw%d.value == ", sw_tmp, sw_tmp);
+                    emit_expr(e, arm->values[j]);
+                    emit(e, ")");
+                }
+                emit(e, ") ");
             } else {
                 if (i > 0) emit(e, "else ");
                 emit(e, "if (");
@@ -2062,8 +2081,34 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, ") ");
             }
 
-            /* arm body — handle captures for union switch */
-            if (is_union_switch && arm->capture_name && arm->value_count > 0) {
+            /* arm body — handle captures for optional switch */
+            if (is_opt_switch && arm->capture_name) {
+                emit(e, "{\n");
+                e->indent++;
+                emit_indent(e);
+                /* extract .value from optional */
+                if (arm->capture_is_ptr) {
+                    Type *inner = sw_type->optional.inner;
+                    emit_type(e, inner);
+                    emit(e, " *%.*s = &_zer_sw%d.value;\n",
+                         (int)arm->capture_name_len, arm->capture_name, sw_tmp);
+                } else {
+                    emit(e, "__auto_type %.*s = _zer_sw%d.value;\n",
+                         (int)arm->capture_name_len, arm->capture_name, sw_tmp);
+                }
+                int saved_sw_defer = e->defer_stack.count;
+                if (arm->body->kind == NODE_BLOCK) {
+                    for (int k = 0; k < arm->body->block.stmt_count; k++)
+                        emit_stmt(e, arm->body->block.stmts[k]);
+                } else {
+                    emit_stmt(e, arm->body);
+                }
+                emit_defers_from(e, saved_sw_defer);
+                e->defer_stack.count = saved_sw_defer;
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
+            } else if (is_union_switch && arm->capture_name && arm->value_count > 0) {
                 emit(e, "{\n");
                 e->indent++;
                 emit_indent(e);

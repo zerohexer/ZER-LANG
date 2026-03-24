@@ -168,6 +168,7 @@ struct Symbol {
 
     bool is_keep;           /* keep parameter — can be stored */
     bool is_const;          /* const qualifier */
+    bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
     bool is_static;         /* static storage duration */
     bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */

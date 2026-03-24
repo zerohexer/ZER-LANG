@@ -2647,6 +2647,14 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
             Type *type = resolve_type(c, decl->var_decl.type);
             Type *init = check_expr(c, decl->var_decl.init);
+            /* global initializers must be constant expressions in C */
+            Node *ginit = decl->var_decl.init;
+            if (ginit->kind == NODE_CALL) {
+                checker_error(c, decl->loc.line,
+                    "global variable '%.*s' initializer must be a constant expression — "
+                    "cannot call functions at global scope",
+                    (int)decl->var_decl.name_len, decl->var_decl.name);
+            }
             if (!type_equals(type, init) &&
                 !can_implicit_coerce(init, type) &&
                 !is_literal_compatible(decl->var_decl.init, type)) {

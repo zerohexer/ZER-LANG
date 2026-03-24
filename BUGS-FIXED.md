@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-171: Global variable with non-constant initializer — invalid C
+- **Symptom:** `u32 g = f()` passes checker. GCC rejects: "initializer element is not constant."
+- **Fix:** NODE_GLOBAL_VAR init rejects NODE_CALL expressions.
+
+### BUG-172: NODE_SLICE double-evaluates side-effect base object
+- **Symptom:** `get_slice()[1..]` calls `get_slice()` twice (ptr + len).
+- **Fix:** Detect side effects in object chain, hoist into `__auto_type _zer_so` temp, build slice from temp.
+
 ### BUG-168: Pointer escape via orelse fallback — `return opt orelse &local`
 - **Symptom:** `return opt orelse &x` where `x` is local passes checker. If `opt` is null, returns dangling pointer.
 - **Fix:** NODE_RETURN checks orelse fallback for `&local` pattern (walk field/index chains).

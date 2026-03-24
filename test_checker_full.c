@@ -724,6 +724,10 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-171: global non-constant initializer */
+    err("u32 f() { return 1; }\nu32 g = f();\n",
+        "global var with function call init REJECT");
+
     /* BUG-168: orelse fallback escape */
     err("*u32 leak(?*u32 opt) { u32 x = 42; return opt orelse &x; }",
         "return opt orelse &local REJECT");

@@ -87,7 +87,7 @@ struct Type {
         struct { Type *inner; bool is_const; } slice;
 
         /* TYPE_ARRAY */
-        struct { Type *inner; uint32_t size; } array;
+        struct { Type *inner; uint64_t size; } array;
 
         /* TYPE_STRUCT */
         struct {
@@ -122,10 +122,10 @@ struct Type {
         } func_ptr;
 
         /* TYPE_POOL */
-        struct { Type *elem; uint32_t count; } pool;
+        struct { Type *elem; uint64_t count; } pool;
 
         /* TYPE_RING */
-        struct { Type *elem; uint32_t count; } ring;
+        struct { Type *elem; uint64_t count; } ring;
 
         /* TYPE_HANDLE */
         struct { Type *elem; } handle;
@@ -216,9 +216,9 @@ Type *type_const_pointer(Arena *a, Type *inner);
 Type *type_optional(Arena *a, Type *inner);
 Type *type_slice(Arena *a, Type *inner);
 Type *type_const_slice(Arena *a, Type *inner);
-Type *type_array(Arena *a, Type *inner, uint32_t size);
-Type *type_pool(Arena *a, Type *elem, uint32_t count);
-Type *type_ring(Arena *a, Type *elem, uint32_t count);
+Type *type_array(Arena *a, Type *inner, uint64_t size);
+Type *type_pool(Arena *a, Type *elem, uint64_t count);
+Type *type_ring(Arena *a, Type *elem, uint64_t count);
 Type *type_handle(Arena *a, Type *elem);
 Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret);
 

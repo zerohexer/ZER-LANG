@@ -56,7 +56,7 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
     emit_type(e, array_type->array.inner);
     emit(e, "*)");
     emit_expr(e, array_expr);
-    emit(e, ", %u })", array_type->array.size);
+    emit(e, ", %llu })", (unsigned long long)array_type->array.size);
 }
 
 /* emit a C type name for a ZER type */
@@ -233,7 +233,7 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_RING:
-        emit(e, "struct _zer_ring_%u", t->ring.count);
+        emit(e, "struct _zer_ring_%llu", (unsigned long long)t->ring.count);
         break;
 
     case TYPE_FUNC_PTR:
@@ -259,7 +259,7 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
 
     if (t->kind == TYPE_ARRAY) {
         emit_type(e, t->array.inner);
-        emit(e, " %.*s[%u]", (int)name_len, name, t->array.size);
+        emit(e, " %.*s[%llu]", (int)name_len, name, (unsigned long long)t->array.size);
         return;
     }
 
@@ -959,9 +959,22 @@ static void emit_expr(Emitter *e, Node *node) {
             obj_type->slice.inner : NULL) : NULL;
         /* Unwrap distinct for named typedef lookup */
         Type *eff_elem = type_unwrap_distinct(elem_type);
+        /* detect side effects early — if present, skip normal struct literal */
+        bool slice_obj_side_effect_early = false;
+        if (obj_type && obj_type->kind == TYPE_SLICE) {
+            Node *n = node->slice.object;
+            while (n) {
+                if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
+                    slice_obj_side_effect_early = true; break;
+                }
+                if (n->kind == NODE_FIELD) n = n->field.object;
+                else if (n->kind == NODE_INDEX) n = n->index_expr.object;
+                else break;
+            }
+        }
         /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
         bool slice_type_emitted = false;
-        if (eff_elem) {
+        if (eff_elem && !slice_obj_side_effect_early) {
             const char *sname = NULL;
             switch (eff_elem->kind) {
             case TYPE_U8:    sname = "_zer_slice_u8"; break;
@@ -991,7 +1004,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 slice_type_emitted = true;
             }
         }
-        if (!slice_type_emitted) {
+        if (!slice_type_emitted && !slice_obj_side_effect_early) {
             emit(e, "((struct { ");
             if (elem_type) {
                 emit_type(e, elem_type);
@@ -1000,41 +1013,84 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             emit(e, "* ptr; size_t len; }){ ");
         }
-        /* ptr = &obj[start] or &obj.ptr[start] for slices */
+        /* ptr = &obj[start] or &obj.ptr[start] for slices
+         * Hoist object if it has side effects (func call in chain) */
         bool obj_is_slice = obj_type && obj_type->kind == TYPE_SLICE;
-        emit(e, "&(");
-        emit_expr(e, node->slice.object);
-        if (obj_is_slice) emit(e, ".ptr");
-        emit(e, ")[");
-        if (node->slice.start) {
-            emit_expr(e, node->slice.start);
-        } else {
-            emit(e, "0");
+        bool slice_obj_side_effect = false;
+        {
+            Node *n = node->slice.object;
+            while (n) {
+                if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
+                    slice_obj_side_effect = true; break;
+                }
+                if (n->kind == NODE_FIELD) n = n->field.object;
+                else if (n->kind == NODE_INDEX) n = n->index_expr.object;
+                else break;
+            }
         }
-        emit(e, "], ");
-        /* len = end - start */
-        if (node->slice.end && node->slice.start) {
-            emit(e, "(");
-            emit_expr(e, node->slice.end);
-            emit(e, ") - (");
-            emit_expr(e, node->slice.start);
-            emit(e, ")");
-        } else if (node->slice.end) {
-            emit_expr(e, node->slice.end);
-        } else if (node->slice.start && obj_type && obj_type->kind == TYPE_ARRAY) {
-            emit(e, "%u - (", obj_type->array.size);
-            emit_expr(e, node->slice.start);
-            emit(e, ")");
-        } else if (node->slice.start && obj_is_slice) {
-            emit(e, "(");
+
+        if (slice_obj_side_effect && obj_is_slice) {
+            /* hoist entire object into temp, build slice from temp */
+            int sl_tmp = e->temp_count++;
+            emit(e, "({ __auto_type _zer_so%d = ", sl_tmp);
             emit_expr(e, node->slice.object);
-            emit(e, ").len - (");
-            emit_expr(e, node->slice.start);
-            emit(e, ")");
+            emit(e, "; ");
+            if (slice_type_emitted) { /* re-emit type name for inner struct */ }
+            /* rebuild the slice struct from the temp */
+            emit(e, "(");
+            emit_type(e, type_slice(e->arena, obj_type->slice.inner));
+            emit(e, "){ &(_zer_so%d.ptr)[", sl_tmp);
+            if (node->slice.start) emit_expr(e, node->slice.start);
+            else emit(e, "0");
+            emit(e, "], ");
+            if (node->slice.end && node->slice.start) {
+                emit(e, "("); emit_expr(e, node->slice.end);
+                emit(e, ") - ("); emit_expr(e, node->slice.start); emit(e, ")");
+            } else if (node->slice.end) {
+                emit_expr(e, node->slice.end);
+            } else if (node->slice.start) {
+                emit(e, "_zer_so%d.len - (", sl_tmp);
+                emit_expr(e, node->slice.start); emit(e, ")");
+            } else {
+                emit(e, "_zer_so%d.len", sl_tmp);
+            }
+            emit(e, " }; })");
         } else {
-            emit(e, "0 /* unknown len */");
+            /* normal path — no side effects in object */
+            emit(e, "&(");
+            emit_expr(e, node->slice.object);
+            if (obj_is_slice) emit(e, ".ptr");
+            emit(e, ")[");
+            if (node->slice.start) {
+                emit_expr(e, node->slice.start);
+            } else {
+                emit(e, "0");
+            }
+            emit(e, "], ");
+            /* len = end - start */
+            if (node->slice.end && node->slice.start) {
+                emit(e, "(");
+                emit_expr(e, node->slice.end);
+                emit(e, ") - (");
+                emit_expr(e, node->slice.start);
+                emit(e, ")");
+            } else if (node->slice.end) {
+                emit_expr(e, node->slice.end);
+            } else if (node->slice.start && obj_type && obj_type->kind == TYPE_ARRAY) {
+                emit(e, "%u - (", obj_type->array.size);
+                emit_expr(e, node->slice.start);
+                emit(e, ")");
+            } else if (node->slice.start && obj_is_slice) {
+                emit(e, "(");
+                emit_expr(e, node->slice.object);
+                emit(e, ").len - (");
+                emit_expr(e, node->slice.start);
+                emit(e, ")");
+            } else {
+                emit(e, "0 /* unknown len */");
+            }
+            emit(e, " })");
         }
-        emit(e, " })");
         break;
     }
 

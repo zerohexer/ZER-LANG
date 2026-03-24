@@ -86,7 +86,7 @@ Type *type_const_slice(Arena *a, Type *inner) {
     return t;
 }
 
-Type *type_array(Arena *a, Type *inner, uint32_t size) {
+Type *type_array(Arena *a, Type *inner, uint64_t size) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
     t->kind = TYPE_ARRAY;
     t->array.inner = inner;
@@ -94,7 +94,7 @@ Type *type_array(Arena *a, Type *inner, uint32_t size) {
     return t;
 }
 
-Type *type_pool(Arena *a, Type *elem, uint32_t count) {
+Type *type_pool(Arena *a, Type *elem, uint64_t count) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
     t->kind = TYPE_POOL;
     t->pool.elem = elem;
@@ -102,7 +102,7 @@ Type *type_pool(Arena *a, Type *elem, uint32_t count) {
     return t;
 }
 
-Type *type_ring(Arena *a, Type *elem, uint32_t count) {
+Type *type_ring(Arena *a, Type *elem, uint64_t count) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
     t->kind = TYPE_RING;
     t->ring.elem = elem;
@@ -371,7 +371,7 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         return type_name_write(t->slice.inner, buf, pos, max);
     case TYPE_ARRAY:
         pos = type_name_write(t->array.inner, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, "[%u]", t->array.size);
+        return pos + snprintf(buf + pos, max - pos, "[%llu]", (unsigned long long)t->array.size);
     case TYPE_STRUCT:
         return pos + snprintf(buf + pos, max - pos, "%.*s",
                               (int)t->struct_type.name_len, t->struct_type.name);
@@ -386,11 +386,11 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_POOL:
         pos += snprintf(buf + pos, max - pos, "Pool(");
         pos = type_name_write(t->pool.elem, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, ", %u)", t->pool.count);
+        return pos + snprintf(buf + pos, max - pos, ", %llu)", (unsigned long long)t->pool.count);
     case TYPE_RING:
         pos += snprintf(buf + pos, max - pos, "Ring(");
         pos = type_name_write(t->ring.elem, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, ", %u)", t->ring.count);
+        return pos + snprintf(buf + pos, max - pos, ", %llu)", (unsigned long long)t->ring.count);
     case TYPE_HANDLE:
         pos += snprintf(buf + pos, max - pos, "Handle(");
         pos = type_name_write(t->handle.elem, buf, pos, max);

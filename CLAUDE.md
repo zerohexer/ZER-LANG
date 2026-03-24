@@ -485,6 +485,15 @@ All type query functions in `types.c` now call `type_unwrap_distinct(a)` first. 
 **65. Duplicate enum variant names rejected.**
 `enum Color { red, green, red }` is caught at checker level (BUG-198). Same pattern as struct field duplicate check (BUG-191). Prevents GCC `#define` redefinition warnings.
 
+**72. Sub-slice from local array marks is_local_derived.**
+`[]u8 s = local_arr[1..4];` walks through `NODE_SLICE` to find the object being sliced, then walks field/index chains to the root. If root is a local array, marks `sym->is_local_derived`. BUG-203 only caught `NODE_IDENT` init — this catches `NODE_SLICE` init too. (BUG-207)
+
+**73. `&union_var` blocked inside mutable switch capture arm.**
+Taking the address of the union being switched on creates a pointer alias that bypasses the variant lock (`union_switch_var` name check). Fix: in `check_expr(NODE_UNARY/TOK_AMP)`, if operand matches `union_switch_var`, error. Prevents type confusion via `*Union alias = &msg; alias.other_variant = ...`. (BUG-208)
+
+**74. `@cstr` slice destination gets bounds check.**
+`@cstr(slice_dest, src)` now checks `src.len + 1 > dest.len` before memcpy. For slice destinations, the emitter hoists the full slice into `__auto_type _zer_cd` temp (for `.len`), and uses `.ptr` for the memcpy target. Array destinations already had bounds checks (BUG-152). (BUG-209)
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

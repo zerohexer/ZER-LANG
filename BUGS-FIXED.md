@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-124: String literal assigned to mutable `[]u8` — segfault on write
+- **Symptom:** `[]u8 msg = "hello"; msg[0] = 'H';` — compiles, segfaults at runtime. String literal is in `.rodata` (read-only memory), but mutable slice allows writes.
+- **Root cause:** Checker returned `const []u8` for string literals but `type_equals` ignores const flag on slices, so `[]u8 = const []u8` matched.
+- **Fix:** Added check in var-decl and assignment: if value is NODE_STRING_LIT and target is mutable slice, error. `const []u8 msg = "hello"` still works. String literals as function arguments still work (parameter receives a copy of the slice struct).
+- **Test:** `test_checker_full.c` — mutable slice from string → error, const slice → OK.
+
+### BUG-125: Bit extraction `[63..0]` undefined behavior — `1ull << 64`
+- **Symptom:** `u64_val[63..0]` emits `(1ull << 64) - 1` — shifting by type width is UB in C. GCC warns. Result may be wrong on some platforms.
+- **Root cause:** Bit mask generation `(1ull << (high - low + 1)) - 1` doesn't handle full-width case.
+- **Fix:** Check if width >= 64 at compile time (using `eval_const_expr`). If so, emit `~(uint64_t)0` instead of the shift expression.
+- **Test:** Verified: `val[63..0]` compiles without GCC warning, returns correct value.
+
 ### BUG-121: Array/Pool/Ring size expressions silently evaluate to 0
 - **Symptom:** `u8[4 * 256] buf` emits `uint8_t buf[0]`. `Pool(T, 4 + 4)` creates pool with 0 slots. Any size expression that isn't a bare int literal silently becomes 0.
 - **Root cause:** Both checker and emitter only accepted `NODE_INT_LIT` for size expressions. Binary expressions (`4 * 256`, `512 + 512`) fell through with size=0.

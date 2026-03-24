@@ -502,7 +502,8 @@ static void test_interactions(void) {
 
     /* string literal */
     ok("void f() { const []u8 msg = \"hello\"; }", "string literal OK");
-    ok("void f() { []u8 msg = \"hello\"; }", "string literal to mutable slice OK");
+    err("void f() { []u8 msg = \"hello\"; }",
+        "string literal to mutable slice → error (BUG-124)");
 
     /* void function no return */
     ok("void f() { u32 x = 5; }", "void function no return OK");

@@ -729,9 +729,9 @@ int main(void) {
     printf("[string literal]\n");
     test_compile_only(
         "void f() {\n"
-        "    []u8 msg = \"hello\";\n"
+        "    const []u8 msg = \"hello\";\n"
         "}\n",
-        "string literal as []u8 compiles");
+        "string literal as const []u8 compiles");
 
     printf("[packed struct]\n");
     test_compile_only(
@@ -1706,10 +1706,10 @@ int main(void) {
     test_compile_only(
         "void process([]u8 msg) { }\n"
         "void start() {\n"
-        "    []u8 s = \"hello\";\n"
+        "    const []u8 s = \"hello\";\n"
         "    process(s);\n"
         "}\n",
-        "function taking []u8 param, passing string literal");
+        "function taking []u8 param, passing const string literal");
 
     /* ================================================================
      * Switch on larger enum

@@ -814,16 +814,26 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *obj_type = checker_get_type(node->slice.object);
         if (obj_type && type_is_integer(obj_type) &&
             node->slice.start && node->slice.end) {
-            /* bit extraction: expr[high..low] → (expr >> low) & ((1 << (high-low+1)) - 1) */
-            emit(e, "((");
-            emit_expr(e, node->slice.object);
-            emit(e, " >> ");
-            emit_expr(e, node->slice.end);
-            emit(e, ") & ((1ull << (");
-            emit_expr(e, node->slice.start);
-            emit(e, " - ");
-            emit_expr(e, node->slice.end);
-            emit(e, " + 1)) - 1))");
+            /* bit extraction: expr[high..low] → (expr >> low) & mask
+             * Use safe mask: if width >= 64, use ~0ULL to avoid 1ull<<64 UB */
+            {
+                int64_t high = eval_const_expr(node->slice.start);
+                int64_t low = eval_const_expr(node->slice.end);
+                int64_t width = (high >= 0 && low >= 0) ? high - low + 1 : -1;
+                emit(e, "((");
+                emit_expr(e, node->slice.object);
+                emit(e, " >> ");
+                emit_expr(e, node->slice.end);
+                if (width >= 64) {
+                    emit(e, ") & (~(uint64_t)0))");
+                } else {
+                    emit(e, ") & ((1ull << (");
+                    emit_expr(e, node->slice.start);
+                    emit(e, " - ");
+                    emit_expr(e, node->slice.end);
+                    emit(e, " + 1)) - 1))");
+                }
+            }
             break;
         }
 

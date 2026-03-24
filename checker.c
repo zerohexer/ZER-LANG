@@ -613,6 +613,14 @@ static Type *check_expr(Checker *c, Node *node) {
                 "cannot store result of get() — use inline");
         }
 
+        /* string literal to mutable slice: runtime crash on write */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.value->kind == NODE_STRING_LIT &&
+            target && target->kind == TYPE_SLICE) {
+            checker_error(c, node->loc.line,
+                "string literal is read-only — use 'const []u8' for string storage");
+        }
+
         /* scope escape: storing &local in static/global variable (or field thereof) */
         if (node->assign.op == TOK_EQ &&
             node->assign.value->kind == NODE_UNARY &&
@@ -1573,6 +1581,14 @@ static void check_stmt(Checker *c, Node *node) {
             if (is_non_storable(node->var_decl.init)) {
                 checker_error(c, node->loc.line,
                     "cannot store result of get() — use inline");
+            }
+
+            /* string literal to mutable slice: runtime crash on write.
+             * String literals are const []u8 — only assign to const variables. */
+            if (node->var_decl.init->kind == NODE_STRING_LIT &&
+                type && type->kind == TYPE_SLICE && !node->var_decl.is_const) {
+                checker_error(c, node->loc.line,
+                    "string literal is read-only — use 'const []u8' instead of '[]u8'");
             }
 
             /* check assignment compatibility */

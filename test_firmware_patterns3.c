@@ -501,15 +501,15 @@ static void test_complex_access(void) {
         "}\n",
         0, "chained struct returns: (10,20)+(5,7)=(15,27)=42");
 
-    /* 10d: string literal as slice, use .len */
+    /* 10d: string literal as const slice, use .len */
     test_e2e(
         "u32 main() {\n"
-        "    []u8 msg = \"hello\";\n"
+        "    const []u8 msg = \"hello\";\n"
         "    usize len = msg.len;\n"
         "    if (len == 5) { return 0; }\n"
         "    return 1;\n"
         "}\n",
-        0, "string literal []u8 .len = 5");
+        0, "string literal const []u8 .len = 5");
 }
 
 /* ================================================================ */

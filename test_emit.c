@@ -2525,6 +2525,17 @@ int main(void) {
         "volatile u32 emits volatile keyword");
 
     /* BUG-173: array size uses %llu — verify emission */
+    /* BUG-188: @saturate negative → unsigned = 0 */
+    printf("[@saturate negative → unsigned — BUG-188]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    i32 x = -5;\n"
+        "    u8 y = @saturate(u8, x);\n"
+        "    return @truncate(u32, y);\n"
+        "}\n",
+        0,
+        "@saturate(u8, -5) = 0");
+
     printf("[array size emission — %llu format]\n");
     test_compile_and_run(
         "u32 main() {\n"

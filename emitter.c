@@ -867,8 +867,12 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *idx_obj_type = checker_get_type(node->index_expr.object);
         /* Check if index or object has side effects — needs single-eval.
          * Simple expressions (ident, literal) can safely double-evaluate. */
+        /* detect index expressions with side effects or volatile reads.
+         * NODE_CALL, NODE_ASSIGN: obvious side effects.
+         * NODE_UNARY(deref): volatile pointer deref must not be double-read. */
         bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL ||
-                                      node->index_expr.index->kind == NODE_ASSIGN);
+                                      node->index_expr.index->kind == NODE_ASSIGN ||
+                                      node->index_expr.index->kind == NODE_UNARY);
         /* check if base object has side effects (e.g. get_slice()[0]) */
         bool obj_has_side_effects = false;
         {
@@ -1006,9 +1010,19 @@ static void emit_expr(Emitter *e, Node *node) {
                 else break;
             }
         }
+        /* runtime check: start <= end for variable indices */
+        bool slice_needs_runtime_check = false;
+        if (node->slice.start && node->slice.end && !type_is_integer(obj_type)) {
+            int64_t sv = eval_const_expr(node->slice.start);
+            int64_t ev = eval_const_expr(node->slice.end);
+            if (sv < 0 || ev < 0) slice_needs_runtime_check = true;
+        }
+
         /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
         bool slice_type_emitted = false;
-        if (eff_elem && !slice_obj_side_effect_early) {
+        if (slice_needs_runtime_check && !slice_obj_side_effect_early) {
+            /* skip the normal struct literal — we'll wrap in stmt expr */
+        } else if (eff_elem && !slice_obj_side_effect_early) {
             const char *sname = NULL;
             switch (eff_elem->kind) {
             case TYPE_U8:    sname = "_zer_slice_u8"; break;
@@ -1038,7 +1052,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 slice_type_emitted = true;
             }
         }
-        if (!slice_type_emitted && !slice_obj_side_effect_early) {
+        if (!slice_type_emitted && !slice_obj_side_effect_early && !slice_needs_runtime_check) {
             emit(e, "((struct { ");
             if (elem_type) {
                 emit_type(e, elem_type);
@@ -1089,6 +1103,25 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "_zer_so%d.len", sl_tmp);
             }
             emit(e, " }; })");
+        } else if (slice_needs_runtime_check) {
+            /* runtime check path: wrap entire slice in stmt expr with bounds check */
+            emit(e, "({ if ((size_t)(");
+            emit_expr(e, node->slice.start);
+            emit(e, ") > (size_t)(");
+            emit_expr(e, node->slice.end);
+            emit(e, ")) _zer_trap(\"slice start > end\", __FILE__, __LINE__); (");
+            emit_type(e, type_slice(e->arena, obj_type->kind == TYPE_ARRAY ?
+                obj_type->array.inner : obj_type->slice.inner));
+            emit(e, "){ &(");
+            emit_expr(e, node->slice.object);
+            if (obj_is_slice) emit(e, ".ptr");
+            emit(e, ")[");
+            emit_expr(e, node->slice.start);
+            emit(e, "], (");
+            emit_expr(e, node->slice.end);
+            emit(e, ") - (");
+            emit_expr(e, node->slice.start);
+            emit(e, ") }; })");
         } else {
             /* normal path — no side effects in object */
             emit(e, "&(");
@@ -1336,11 +1369,12 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* clamp: min(max(val, TYPE_MIN), TYPE_MAX) */
                 /* for unsigned targets, just clamp to max */
                 if (type_is_unsigned(t)) {
+                    /* unsigned: clamp to [0, max] — check both bounds for signed source */
                     int w = type_width(t);
-                    if (w == 8) emit(e, "_zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp);
-                    else if (w == 16) emit(e, "_zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp);
-                    else if (w == 32) emit(e, "_zer_sat%d > 4294967295ULL ? 4294967295U : (uint32_t)_zer_sat%d", tmp, tmp);
-                    else emit(e, "(uint64_t)_zer_sat%d", tmp);
+                    if (w == 8) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp, tmp);
+                    else if (w == 16) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp, tmp);
+                    else if (w == 32) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 4294967295ULL ? 4294967295U : (uint32_t)_zer_sat%d", tmp, tmp, tmp);
+                    else emit(e, "_zer_sat%d < 0 ? 0 : (uint64_t)_zer_sat%d", tmp, tmp);
                 } else {
                     /* signed: clamp to [min, max] for target width */
                     int w = type_width(t);

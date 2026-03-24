@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-187: Volatile index double-read in bounds check
+- **Symptom:** `arr[*volatile_ptr]` reads volatile register twice (bounds check + access).
+- **Fix:** Broadened side-effect detection: NODE_UNARY (deref) now triggers single-eval path.
+
+### BUG-188: @saturate negative → unsigned returns wrong value
+- **Symptom:** `@saturate(u8, -5)` returns 251 instead of 0. Only checked upper bound.
+- **Fix:** Unsigned saturation checks both bounds: `val < 0 ? 0 : val > max ? max : (T)val`.
+
+### BUG-189: Runtime slice start > end — buffer overflow
+- **Symptom:** `arr[i..j]` with i > j produces massive `size_t` length. No runtime check.
+- **Fix:** Emitter inserts `if (start > end) _zer_trap(...)` for variable indices.
+
 ### BUG-182: Const array → mutable slice coercion at call site
 - **Symptom:** `const u32[4] arr; mutate(arr)` where `mutate([]u32)` passes. Const array data written through mutable slice.
 - **Fix:** Call site checks if arg is const NODE_IDENT with TYPE_ARRAY coerced to mutable TYPE_SLICE param.

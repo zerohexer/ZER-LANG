@@ -512,6 +512,12 @@ Taking the address of the union being switched on creates a pointer alias that b
 **80. Unary `~` and `-` cast for narrow types (u8/u16/i8/i16).**
 C integer promotion makes `~(uint8_t)0xAA` = `0xFFFFFF55`. Emitter wraps narrow unary results: `(uint8_t)(~a)`. Same pattern as binary arithmetic casting (BUG-186). (BUG-215)
 
+**81. Bit-set assignment uses pointer hoist for single-eval.**
+`reg[7..0] = val` emits `({ __typeof__(obj) *_p = &(obj); *_p = (*_p & ~mask) | ((val << lo) & mask); })`. The `__typeof__` doesn't evaluate its argument in GCC. The `&(obj)` evaluates exactly once. `*_p` reads/writes through the cached pointer. Without this, `regs[next_idx()][3..0] = 5` calls `next_idx()` twice. (BUG-216)
+
+**82. Compile-time slice bounds check for arrays.**
+`u8[10] arr; []u8 s = arr[0..15];` — slice end 15 exceeds array size 10. In `NODE_SLICE`, if object is `TYPE_ARRAY` and end/start is a constant, check against `array.size`. Complements BUG-196 (index OOB) for slicing operations. (BUG-217)
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

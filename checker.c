@@ -621,20 +621,38 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
-        /* const check: cannot assign to const variable or its fields */
+        /* const check: cannot assign to const variable, const pointer target, or fields thereof */
         {
             Node *root = node->assign.target;
             bool through_pointer = false;
+            bool through_const_pointer = false;
             /* walk field/index chain to find root ident */
-            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                if (root->kind == NODE_FIELD) {
-                    /* check if object is a pointer (auto-deref) — writing through pointer is OK */
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX ||
+                            root->kind == NODE_UNARY)) {
+                if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
+                    /* deref: *p = val — check if p's type is const pointer */
+                    Type *ptr_type = checker_get_type(root->unary.operand);
+                    if (ptr_type && ptr_type->kind == TYPE_POINTER && ptr_type->pointer.is_const) {
+                        through_const_pointer = true;
+                    }
+                    through_pointer = true;
+                    root = root->unary.operand;
+                } else if (root->kind == NODE_FIELD) {
+                    /* check if object is a pointer (auto-deref) */
                     Type *obj_type = checker_get_type(root->field.object);
-                    if (obj_type && obj_type->kind == TYPE_POINTER) through_pointer = true;
+                    if (obj_type && obj_type->kind == TYPE_POINTER) {
+                        through_pointer = true;
+                        if (obj_type->pointer.is_const)
+                            through_const_pointer = true;
+                    }
                     root = root->field.object;
                 } else {
                     root = root->index_expr.object;
                 }
+            }
+            if (through_const_pointer) {
+                checker_error(c, node->loc.line,
+                    "cannot write through const pointer — data is read-only");
             }
             if (root && root->kind == NODE_IDENT && !through_pointer) {
                 Symbol *sym = scope_lookup(c->current_scope,
@@ -1366,6 +1384,19 @@ static Type *check_expr(Checker *c, Node *node) {
             Type *end = check_expr(c, node->slice.end);
             if (!type_is_integer(end)) {
                 checker_error(c, node->loc.line, "slice end must be integer");
+            }
+        }
+
+        /* compile-time check: start must be <= end (for array/slice sub-slicing only,
+         * NOT for bit extraction which uses [high..low] where high > low is valid) */
+        if (node->slice.start && node->slice.end &&
+            !type_is_integer(obj)) {
+            int64_t start_val = eval_const_expr(node->slice.start);
+            int64_t end_val = eval_const_expr(node->slice.end);
+            if (start_val >= 0 && end_val >= 0 && start_val > end_val) {
+                checker_error(c, node->loc.line,
+                    "slice start (%lld) is greater than end (%lld)",
+                    (long long)start_val, (long long)end_val);
             }
         }
 

@@ -389,6 +389,25 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->binary.right);
             emit(e, ")");
         } else {
+            /* check if result type is narrower than int — need cast to prevent
+             * C integer promotion from changing wrapping behavior */
+            bool needs_narrow_cast = false;
+            const char *narrow_cast = "";
+            if (node->binary.op == TOK_PLUS || node->binary.op == TOK_MINUS ||
+                node->binary.op == TOK_STAR || node->binary.op == TOK_AMP ||
+                node->binary.op == TOK_PIPE || node->binary.op == TOK_CARET) {
+                Type *res_type = checker_get_type(node);
+                if (res_type) {
+                    switch (res_type->kind) {
+                    case TYPE_U8:  narrow_cast = "(uint8_t)"; needs_narrow_cast = true; break;
+                    case TYPE_I8:  narrow_cast = "(int8_t)"; needs_narrow_cast = true; break;
+                    case TYPE_U16: narrow_cast = "(uint16_t)"; needs_narrow_cast = true; break;
+                    case TYPE_I16: narrow_cast = "(int16_t)"; needs_narrow_cast = true; break;
+                    default: break;
+                    }
+                }
+            }
+            if (needs_narrow_cast) emit(e, "%s", narrow_cast);
             emit(e, "(");
             emit_expr(e, node->binary.left);
             switch (node->binary.op) {
@@ -2386,7 +2405,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    } NAME = {0}\n");
     emit(e, "\n");
     emit(e, "static inline uint32_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
-            "uint16_t *gen, uint8_t *used, uint32_t capacity, uint8_t *ok) {\n");
+            "uint16_t *gen, uint8_t *used, size_t capacity, uint8_t *ok) {\n");
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
     emit(e, "        if (!used[i]) {\n");
     emit(e, "            used[i] = 1;\n");
@@ -2432,7 +2451,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "}\n\n");
 
     emit(e, "static inline void *_zer_pool_get(void *slots, uint16_t *gen, uint8_t *used, "
-            "size_t slot_size, uint32_t handle, uint32_t capacity) {\n");
+            "size_t slot_size, uint32_t handle, size_t capacity) {\n");
     emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
     emit(e, "    uint16_t h_gen = (uint16_t)(handle >> 16);\n");
     emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen) {\n");
@@ -2442,7 +2461,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "}\n\n");
 
     emit(e, "static inline void _zer_pool_free(uint16_t *gen, uint8_t *used, "
-            "uint32_t handle, uint32_t capacity) {\n");
+            "uint32_t handle, size_t capacity) {\n");
     emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
     emit(e, "    if (idx < capacity) {\n");
     emit(e, "        used[idx] = 0;\n");
@@ -2463,7 +2482,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "\n");
 
     emit(e, "static inline void _zer_ring_push(void *ring_data, uint32_t *head, uint32_t *tail, "
-            "uint32_t *count, uint32_t capacity, const void *val, size_t elem_size) {\n");
+            "uint32_t *count, size_t capacity, const void *val, size_t elem_size) {\n");
     emit(e, "    memcpy((char*)ring_data + (*head) * elem_size, val, elem_size);\n");
     emit(e, "    *head = (*head + 1) %% capacity;\n");
     emit(e, "    if (*count < capacity) { (*count)++; }\n");

@@ -73,6 +73,26 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-177: Write through `const *T` pointer not blocked
+- **Symptom:** `*p = 5` where `p` is `const *u32` passes checker. Segfault on .rodata/Flash.
+- **Fix:** Assignment target walk detects const pointer (deref or auto-deref) → error.
+
+### BUG-178: Mutation of struct fields through `const *S` pointer
+- **Symptom:** `p.val = 10` where `p` is `const *S` passes. Same issue as BUG-177 via auto-deref.
+- **Fix:** Same fix — walk detects `through_const_pointer` via field auto-deref path.
+
+### BUG-179: Slice `arr[5..2]` produces corrupt negative length
+- **Symptom:** `arr[5..2]` → len = `2 - 5` = massive unsigned. Buffer overflow on use.
+- **Fix:** Compile-time check for constant start > end (excludes bit extraction `[high..low]`).
+
+### BUG-180: Integer promotion breaks narrow type wrapping semantics
+- **Symptom:** `u8 a = 255; u8 b = 1; if (a + b == 0)` is false — C promotes to int, 256 != 0.
+- **Fix:** Emitter casts arithmetic result to narrow type: `(uint8_t)(a + b)` for u8/u16/i8/i16.
+
+### BUG-181: Runtime helpers use `uint32_t` for capacity — truncates >32-bit sizes
+- **Symptom:** Pool/Ring with >4B capacity silently truncated in preamble functions.
+- **Fix:** Changed `uint32_t capacity` → `size_t capacity` in all preamble runtime helpers.
+
 ### BUG-174: Global array init from variable — invalid C
 - **Symptom:** `u32[4] b = a;` at global scope emits `uint32_t b[4] = a;` — GCC rejects.
 - **Fix:** Checker rejects NODE_IDENT init for TYPE_ARRAY globals.

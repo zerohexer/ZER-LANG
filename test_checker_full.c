@@ -724,6 +724,18 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-177: const pointer deref mutation */
+    err("void f(const *u32 p) { *p = 5; }",
+        "write through const pointer REJECT");
+
+    /* BUG-178: const struct field mutation */
+    err("struct S { u32 val; }\nvoid f(const *S p) { p.val = 10; }",
+        "write through const pointer field REJECT");
+
+    /* BUG-179: slice start > end */
+    err("void f() { u8[10] arr; []u8 s = arr[5..2]; }",
+        "slice start > end REJECT");
+
     /* BUG-174: global array init from variable */
     err("u32[4] a;\nu32[4] b = a;\n",
         "global array init from variable REJECT");

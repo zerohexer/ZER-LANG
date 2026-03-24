@@ -207,7 +207,9 @@ bool type_equals(Type *a, Type *b) {
     case TYPE_OPAQUE: case TYPE_ARENA:
         return true;
 
-    /* pointer/optional/slice: recurse on inner */
+    /* pointer/optional/slice: recurse on inner.
+     * NOTE: const is on the Symbol (variable), not the Type.
+     * type_equals ignores const — use targeted checks for const safety. */
     case TYPE_POINTER:
         return type_equals(a->pointer.inner, b->pointer.inner);
     case TYPE_OPTIONAL:

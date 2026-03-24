@@ -837,27 +837,25 @@ static void emit_expr(Emitter *e, Node *node) {
                 int64_t high = eval_const_expr(node->slice.start);
                 int64_t low = eval_const_expr(node->slice.end);
                 int64_t width = (high >= 0 && low >= 0) ? high - low + 1 : -1;
-                emit(e, "((");
-                emit_expr(e, node->slice.object);
-                emit(e, " >> ");
-                emit_expr(e, node->slice.end);
                 if (width >= 64) {
-                    /* constant full-width — safe mask */
-                    emit(e, ") & (~(uint64_t)0))");
+                    /* constant full-width — just emit the value (mask is all 1s) */
+                    emit_expr(e, node->slice.object);
                 } else if (width > 0) {
-                    /* constant sub-width — safe, no UB */
-                    emit(e, ") & ((1ull << %lld) - 1))", (long long)width);
+                    /* constant — safe, precomputed width */
+                    emit(e, "((");
+                    emit_expr(e, node->slice.object);
+                    emit(e, " >> %lld) & ((1ull << %lld) - 1))", (long long)low, (long long)width);
                 } else {
-                    /* runtime width — use safe ternary */
-                    emit(e, ") & (((");
+                    /* runtime — single-eval: hoist start/end into temps */
+                    int tmp = e->temp_count++;
+                    emit(e, "({ int _zer_hi%d = (int)(", tmp);
                     emit_expr(e, node->slice.start);
-                    emit(e, " - ");
+                    emit(e, "); int _zer_lo%d = (int)(", tmp);
                     emit_expr(e, node->slice.end);
-                    emit(e, " + 1) >= 64) ? ~(uint64_t)0 : ((1ull << (");
-                    emit_expr(e, node->slice.start);
-                    emit(e, " - ");
-                    emit_expr(e, node->slice.end);
-                    emit(e, " + 1)) - 1)))");
+                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((", tmp, tmp, tmp);
+                    emit_expr(e, node->slice.object);
+                    emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                         tmp, tmp, tmp);
                 }
             }
             break;
@@ -1385,6 +1383,10 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (or_is_ptr) {
                 emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
                 emit(e, " = _zer_or%d;\n", tmp);
+            } else if (type && type->kind == TYPE_OPTIONAL &&
+                       type->optional.inner->kind == TYPE_VOID) {
+                /* ?void has no .value — orelse just guards, no variable needed */
+                emit(e, "/* ?void unwrap — no value */\n");
             } else if (type && type->kind == TYPE_SLICE) {
                 /* slice: use __auto_type to avoid anonymous struct incompatibility */
                 emit(e, "__auto_type %.*s = _zer_or%d.value;\n",

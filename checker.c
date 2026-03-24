@@ -1592,6 +1592,20 @@ static void check_stmt(Checker *c, Node *node) {
                     "string literal is read-only — use 'const []u8' instead of '[]u8'");
             }
 
+            /* const slice/pointer → mutable variable: blocked (prevents write to .rodata) */
+            if (!node->var_decl.is_const && node->var_decl.init->kind == NODE_IDENT &&
+                type && (type->kind == TYPE_SLICE || type->kind == TYPE_POINTER)) {
+                Symbol *src = scope_lookup(c->current_scope,
+                    node->var_decl.init->ident.name,
+                    (uint32_t)node->var_decl.init->ident.name_len);
+                if (src && src->is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot initialize mutable '%.*s' from const variable '%.*s'",
+                        (int)node->var_decl.name_len, node->var_decl.name,
+                        (int)src->name_len, src->name);
+                }
+            }
+
             /* check assignment compatibility */
             if (!type_equals(type, init_type) &&
                 !can_implicit_coerce(init_type, type) &&

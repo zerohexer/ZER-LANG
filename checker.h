@@ -50,6 +50,8 @@ void checker_init(Checker *c, Arena *arena, const char *file_name);
 void checker_register_file(Checker *c, Node *file_node); /* register declarations only */
 bool checker_check(Checker *c, Node *file_node);
 bool checker_check_bodies(Checker *c, Node *file_node); /* check bodies only, decls already registered */
+void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with module's own types */
+void checker_pop_module_scope(Checker *c); /* pop module scope */
 
 /* returns the resolved Type* for an expression node (set during check) */
 Type *checker_get_type(Node *node);

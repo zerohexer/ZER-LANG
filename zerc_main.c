@@ -292,13 +292,20 @@ int main(int argc, char **argv) {
     checker.current_module_len = 0;
     if (main_mod->ast) checker_register_file(&checker, main_mod->ast);
 
-    /* type-check imported module bodies (declarations already registered) */
+    /* type-check imported module bodies — each module gets its own scope
+     * so same-named types in different modules resolve correctly */
     for (int i = 1; i < cc.module_count; i++) {
         Module *m = &cc.modules[i];
         if (m->ast) {
+            checker.current_module = m->name;
+            checker.current_module_len = (uint32_t)strlen(m->name);
+            checker_push_module_scope(&checker, m->ast);
             checker_check_bodies(&checker, m->ast);
+            checker_pop_module_scope(&checker);
         }
     }
+    checker.current_module = NULL;
+    checker.current_module_len = 0;
 
     /* type-check main file (full check — its decls were registered above) */
     if (!checker_check_bodies(&checker, main_mod->ast)) {

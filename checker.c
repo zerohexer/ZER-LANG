@@ -117,11 +117,8 @@ static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
             else if (existing->type->kind == TYPE_UNION) existing_mod = existing->type->union_type.module_prefix;
 
             if (existing_mod != c->current_module) {
-                checker_error(c, line,
-                    "name collision: '%.*s' defined in module '%s' conflicts with "
-                    "'%.*s' in module '%s' — rename one to avoid conflict",
-                    (int)name_len, name, c->current_module,
-                    (int)name_len, name, existing_mod ? existing_mod : "main");
+                /* cross-module type collision — allowed, per-module scope resolves it.
+                 * First registration wins in global scope; module scope overrides. */
                 return existing;
             }
         }
@@ -2788,6 +2785,42 @@ void checker_register_file(Checker *c, Node *file_node) {
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;
         register_decl(c, decl);
     }
+}
+
+/* push a module-local scope with the module's own type declarations.
+ * This allows same-named types in different modules — each module sees its own. */
+void checker_push_module_scope(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    push_scope(c);
+    /* re-register this module's struct/union/enum types into the local scope.
+     * This overrides any same-named types from other modules in the global scope. */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *decl = file_node->file.decls[i];
+        if (decl->kind == NODE_STRUCT_DECL || decl->kind == NODE_ENUM_DECL ||
+            decl->kind == NODE_UNION_DECL) {
+            Type *t = typemap_get(decl);
+            if (t) {
+                const char *name = NULL;
+                uint32_t name_len = 0;
+                if (decl->kind == NODE_STRUCT_DECL) {
+                    name = decl->struct_decl.name;
+                    name_len = (uint32_t)decl->struct_decl.name_len;
+                } else if (decl->kind == NODE_ENUM_DECL) {
+                    name = decl->enum_decl.name;
+                    name_len = (uint32_t)decl->enum_decl.name_len;
+                } else {
+                    name = decl->union_decl.name;
+                    name_len = (uint32_t)decl->union_decl.name_len;
+                }
+                scope_add(c->arena, c->current_scope, name, name_len,
+                          t, decl->loc.line, c->file_name);
+            }
+        }
+    }
+}
+
+void checker_pop_module_scope(Checker *c) {
+    pop_scope(c);
 }
 
 /* check function bodies only (declarations already registered) */

@@ -1,0 +1,7 @@
+struct Config { u32 addr; }
+
+u32 get_addr() {
+    Config c;
+    c.addr = 42;
+    return c.addr;
+}

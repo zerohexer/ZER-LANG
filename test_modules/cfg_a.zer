@@ -1,0 +1,7 @@
+struct Config { u32 baud; }
+
+u32 get_baud() {
+    Config c;
+    c.baud = 9600;
+    return c.baud;
+}

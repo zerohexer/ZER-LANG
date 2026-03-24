@@ -1,0 +1,3 @@
+import cfg_a;
+import cfg_b;
+u32 main() { return get_baud() + get_addr(); }

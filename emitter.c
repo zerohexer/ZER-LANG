@@ -1581,13 +1581,23 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *buf_type = (node->intrinsic.arg_count > 0) ?
                 checker_get_type(node->intrinsic.args[0]) : NULL;
             bool dest_is_slice = buf_type && buf_type->kind == TYPE_SLICE;
+            /* BUG-223: check if destination is volatile */
+            bool dest_volatile = false;
+            if (node->intrinsic.arg_count > 0 &&
+                node->intrinsic.args[0]->kind == NODE_IDENT) {
+                Symbol *dsym = scope_lookup(e->checker->global_scope,
+                    node->intrinsic.args[0]->ident.name,
+                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                if (dsym && dsym->is_volatile) dest_volatile = true;
+            }
+            const char *vol = dest_volatile ? "volatile " : "";
             if (dest_is_slice) {
                 /* BUG-209: slice destination — hoist as slice, use .ptr */
                 emit(e, "({ __auto_type _zer_cd%d = ", tmp);
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "; uint8_t *_zer_cb%d = (uint8_t*)_zer_cd%d.ptr", tmp, tmp);
+                emit(e, "; %suint8_t *_zer_cb%d = (%suint8_t*)_zer_cd%d.ptr", vol, tmp, vol, tmp);
             } else {
-                emit(e, "({ uint8_t *_zer_cb%d = (uint8_t*)", tmp);
+                emit(e, "({ %suint8_t *_zer_cb%d = (%suint8_t*)", vol, tmp, vol);
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
             }
@@ -1604,7 +1614,13 @@ static void emit_expr(Emitter *e, Node *node) {
             } else {
                 emit(e, "; ");
             }
-            emit(e, "memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
+            if (dest_volatile) {
+                /* volatile: byte-by-byte copy (memcpy discards volatile qualifier) */
+                emit(e, "for (size_t _i = 0; _i < _zer_cs%d.len; _i++) _zer_cb%d[_i] = _zer_cs%d.ptr[_i]; ",
+                     tmp, tmp, tmp);
+            } else {
+                emit(e, "memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
+            }
             emit(e, "_zer_cb%d[_zer_cs%d.len] = 0; _zer_cb%d; })", tmp, tmp, tmp);
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
             /* @cast(T, val) — distinct typedef conversion, same underlying type */

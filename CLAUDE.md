@@ -321,6 +321,19 @@ Evaluates compile-time integer expressions (+, -, *, /, %, <<, >>, &, |, unary -
 **19. `[]bool` maps to `_zer_slice_u8` / `_zer_opt_slice_u8`.**
 TYPE_BOOL must be handled in emit_type(TYPE_SLICE), emit_type(TYPE_OPTIONAL > TYPE_SLICE), and NODE_SLICE expression emission. Bool is uint8_t in C — uses the same slice typedef as u8.
 
+**20. String literals are `const []u8` — CANNOT assign to mutable `[]u8`.**
+`[]u8 msg = "hello"` is a compile error (BUG-124). String literals live in `.rodata` — writing through a mutable slice segfaults. Use `const []u8 msg = "hello"`. Passing string literals as function arguments still works (parameter receives a slice struct copy, function can read but not write through `.rodata` pointer — this is safe because ZER doesn't allow pointer arithmetic to write past bounds).
+
+**21. Scope escape checks cover BOTH `return` AND assignment paths.**
+- `return &local` → error (BUG original)
+- `return local_array` as slice → error (BUG-120)
+- `global.ptr = &local` → error (BUG-080)
+- `global_slice = local_array` → error (BUG-122)
+- All walk field/index chains to find the root identifier.
+
+**22. Bit extraction full-width uses `~(uint64_t)0` instead of `1ull << 64`.**
+`val[63..0]` would emit `1ull << 64` which is UB. The emitter checks if width >= 64 at compile time (via `eval_const_expr`) and emits safe mask. (BUG-125)
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

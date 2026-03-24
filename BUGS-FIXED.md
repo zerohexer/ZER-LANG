@@ -73,6 +73,12 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-126: Bounds check double-eval for assignment-in-index expressions
+- **Symptom:** `arr[i = func()] = 42` — the assignment `i = func()` is evaluated twice (once for bounds check, once for access). Double side effects.
+- **Root cause:** Side-effect detection in NODE_INDEX only checked `NODE_CALL`, not `NODE_ASSIGN`.
+- **Fix:** Extended check: `idx_has_side_effects = (kind == NODE_CALL || kind == NODE_ASSIGN)`.
+- **Test:** Existing tests pass; verified manually that assignment-in-index uses single-eval path.
+
 ### BUG-124: String literal assigned to mutable `[]u8` — segfault on write
 - **Symptom:** `[]u8 msg = "hello"; msg[0] = 'H';` — compiles, segfaults at runtime. String literal is in `.rodata` (read-only memory), but mutable slice allows writes.
 - **Root cause:** Checker returned `const []u8` for string literals but `type_equals` ignores const flag on slices, so `[]u8 = const []u8` matched.

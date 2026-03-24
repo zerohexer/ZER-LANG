@@ -754,7 +754,8 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *idx_obj_type = checker_get_type(node->index_expr.object);
         /* Check if index has side effects (function call) — needs single-eval.
          * Simple expressions (ident, literal) can safely double-evaluate. */
-        bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL);
+        bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL ||
+                                      node->index_expr.index->kind == NODE_ASSIGN);
         if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY && idx_obj_type->array.size > 0) {
             if (idx_has_side_effects) {
                 /* Single-eval path: hoist index into temp via comma in enclosing ({}).

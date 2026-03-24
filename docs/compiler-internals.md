@@ -378,5 +378,7 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 19. **Emitter's `resolve_type_for_emit` must mirror checker's `resolve_type`** — The emitter re-resolves TypeNodes independently. Any fix to type resolution must be applied in BOTH places. Shared code goes in `ast.h`.
 20. **`eval_const_expr()` in `ast.h` for compile-time sizes** — Array/Pool/Ring sizes support expressions (`4 * 256`, `512 + 512`). Without the constant folder, non-literal sizes silently become 0.
 21. **Scope escape must check implicit array-to-slice coercion in assignments** — `global_slice = local_array` bypasses `&local` check because no TOK_AMP is involved. Check TYPE_ARRAY value → TYPE_SLICE target with local/global mismatch.
+22. **String literals are const — block assignment to mutable `[]u8`** — Check NODE_STRING_LIT in var-decl and assignment. Only `const []u8` targets allowed. Function args still work (slice struct is copied).
+23. **Bit extraction full-width mask** — `val[63..0]` must NOT emit `1ull << 64` (UB). Check width via `eval_const_expr` on start/end. If >= 64, emit `~(uint64_t)0`.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

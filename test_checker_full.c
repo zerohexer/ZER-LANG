@@ -724,6 +724,20 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-168: orelse fallback escape */
+    err("*u32 leak(?*u32 opt) { u32 x = 42; return opt orelse &x; }",
+        "return opt orelse &local REJECT");
+
+    /* BUG-169: division by literal zero */
+    err("void f() { u32 x = 10 / 0; }",
+        "10 / 0 compile-time REJECT");
+    err("void f() { u32 x = 10 %% 0; }",
+        "10 %% 0 compile-time REJECT");
+
+    /* BUG-170: slice/array comparison */
+    err("void f() { u8[4] a; u8[4] b; []u8 sa = a[0..4]; []u8 sb = b[0..4]; if (sa == sb) {} }",
+        "slice == slice REJECT");
+
     /* BUG-165: const laundering via assignment */
     err("void f() { u32 x = 42; const *u32 c = &x; *u32 m; m = c; }",
         "const ptr assign to mutable REJECT");

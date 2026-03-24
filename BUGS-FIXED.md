@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-168: Pointer escape via orelse fallback — `return opt orelse &local`
+- **Symptom:** `return opt orelse &x` where `x` is local passes checker. If `opt` is null, returns dangling pointer.
+- **Fix:** NODE_RETURN checks orelse fallback for `&local` pattern (walk field/index chains).
+
+### BUG-169: Division by literal zero not caught at compile time
+- **Symptom:** `u32 x = 10 / 0` passes checker, traps at runtime. Should be compile error.
+- **Fix:** NODE_BINARY checks `/` and `%` with NODE_INT_LIT right operand == 0.
+
+### BUG-170: Slice/array comparison produces invalid C
+- **Symptom:** `sa == sb` where both are slices emits struct `==` in C. GCC rejects.
+- **Fix:** Checker rejects `==`/`!=` on TYPE_SLICE and TYPE_ARRAY.
+
 ### BUG-165: Const laundering via assignment — `m = const_ptr` passes
 - **Symptom:** `*u32 m; m = const_ptr;` passes because `type_equals` ignores `is_const`.
 - **Fix:** NODE_ASSIGN checks const-to-mutable mismatch for pointers and slices.

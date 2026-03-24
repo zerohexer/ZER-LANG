@@ -503,6 +503,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     type_name(left), type_name(right));
                 result = left;
             } else {
+                /* compile-time division by zero check */
+                if ((node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) &&
+                    node->binary.right->kind == NODE_INT_LIT &&
+                    node->binary.right->int_lit.value == 0) {
+                    checker_error(c, node->loc.line, "division by zero");
+                }
                 result = common_numeric_type(c, left, right, node->loc.line);
             }
             break;
@@ -510,6 +516,14 @@ static Type *check_expr(Checker *c, Node *node) {
         /* comparison: both same type (or coercible), result = bool */
         case TOK_EQEQ: case TOK_BANGEQ:
         case TOK_LT: case TOK_GT: case TOK_LTEQ: case TOK_GTEQ:
+            /* reject slice/array comparison — C compares struct/pointer, not content */
+            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ) &&
+                ((left->kind == TYPE_SLICE || left->kind == TYPE_ARRAY) ||
+                 (right->kind == TYPE_SLICE || right->kind == TYPE_ARRAY))) {
+                checker_error(c, node->loc.line,
+                    "cannot compare '%s' with == — use element-wise comparison",
+                    type_name(left->kind == TYPE_SLICE || left->kind == TYPE_ARRAY ? left : right));
+            }
             if (!type_equals(left, right) &&
                 !can_implicit_coerce(left, right) &&
                 !can_implicit_coerce(right, left)) {
@@ -2264,6 +2278,30 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "cannot return pointer to local variable '%.*s'",
                             (int)vlen, vname);
+                    }
+                }
+            }
+
+            /* scope escape: return opt orelse &local → fallback is local pointer */
+            if (node->ret.expr->kind == NODE_ORELSE &&
+                node->ret.expr->orelse.fallback) {
+                Node *fb = node->ret.expr->orelse.fallback;
+                if (fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP) {
+                    Node *root = fb->unary.operand;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        const char *vname = root->ident.name;
+                        uint32_t vlen = (uint32_t)root->ident.name_len;
+                        bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                        Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
+                        if (sym && !sym->is_static && !is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot return pointer to local variable '%.*s' via orelse fallback",
+                                (int)vlen, vname);
+                        }
                     }
                 }
             }

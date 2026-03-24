@@ -73,6 +73,21 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-226: Float switch allowed (spec violation)
+- **Symptom:** `switch (f32_val) { default => { ... } }` compiles. ZER spec says "switch on float: NOT ALLOWED."
+- **Fix:** Added float check at top of NODE_SWITCH handler.
+- **Test:** `test_checker_full.c` — float switch rejected.
+
+### BUG-225: Pool/Ring assignment produces broken C
+- **Symptom:** `Pool p; Pool q; p = q;` — GCC "incompatible types" (anonymous structs).
+- **Fix:** Reject Pool/Ring assignment in checker — hardware resources are not copyable.
+- **Test:** `test_checker_full.c` — Pool assignment rejected.
+
+### BUG-224: void struct fields and union variants not rejected
+- **Symptom:** `struct S { void x; }` → GCC "field declared void".
+- **Fix:** Check field/variant type after resolve_type — error if TYPE_VOID.
+- **Test:** `test_checker_full.c` — void struct field and void union variant rejected.
+
 ### BUG-223: @cstr loses volatile qualifier on destination
 - **Symptom:** `volatile u8[64] buf; @cstr(buf, slice);` — memcpy discards volatile, GCC may optimize away writes.
 - **Root cause:** Destination always cast to plain `uint8_t*`.

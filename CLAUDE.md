@@ -536,7 +536,17 @@ Statics from imported modules skip `checker_register_file` (global scope) and ar
 **88. Volatile @cstr uses byte-by-byte copy loop.**
 `@cstr(volatile_buf, slice)` emits `volatile uint8_t*` cast and a `for` loop instead of `memcpy`. `memcpy` discards the volatile qualifier — GCC may optimize away writes to hardware registers/DMA buffers. The volatile detection checks `is_volatile` on the destination symbol. (BUG-223)
 
+**89. Void struct fields and union variants rejected.**
+`struct S { void x; }` and `union U { void a; u32 b; }` produce checker errors. Void is for return types only. (BUG-224)
+
+**90. Pool/Ring assignment rejected — hardware resources not copyable.**
+`Pool p; Pool q; p = q;` is an error. Pool/Ring are unique hardware resource containers with internal state (slots, generation counters). Arena is NOT blocked (needs `Arena.over()` init pattern). (BUG-225)
+
+**91. Float switch rejected per spec.**
+`switch (f32_val) { ... }` is an error. ZER spec: "switch on float: NOT ALLOWED." Use if/else for float comparisons. (BUG-226)
+
 ### Design Decisions (NOT bugs — intentional)
+- **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.
 

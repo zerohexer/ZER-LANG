@@ -724,6 +724,15 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-165: const laundering via assignment */
+    err("void f() { u32 x = 42; const *u32 c = &x; *u32 m; m = c; }",
+        "const ptr assign to mutable REJECT");
+
+    /* BUG-166: const laundering via orelse init */
+    err("?const *u32 get() { return null; }\n"
+        "void f() { *u32 m = get() orelse return; }",
+        "const ptr orelse to mutable var REJECT");
+
     /* BUG-162: slice-to-pointer null hole */
     err("void clear(*u8 data) { *data = 0; }\nvoid f() { []u8 empty; clear(empty); }",
         "[]u8 → *u8 coercion REJECT (null hole)");

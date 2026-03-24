@@ -906,19 +906,32 @@ static void emit_expr(Emitter *e, Node *node) {
         Type *obj_type = checker_get_type(node->slice.object);
         if (obj_type && type_is_integer(obj_type) &&
             node->slice.start && node->slice.end) {
-            /* bit extraction: expr[high..low] → (expr >> low) & mask
-             * Safe mask for both constant and runtime widths:
-             * Use ternary to avoid 1ull<<64 UB when width == 64 */
+            /* bit extraction: expr[high..low] → ((unsigned)expr >> low) & mask
+             * Cast to unsigned for signed types (right-shift on signed is impl-defined).
+             * Safe mask for both constant and runtime widths. */
             {
+                /* determine unsigned cast for signed types */
+                bool need_unsigned_cast = type_is_signed(obj_type);
+                const char *ucast = "";
+                if (need_unsigned_cast) {
+                    switch (obj_type->kind) {
+                    case TYPE_I8:  ucast = "(uint8_t)"; break;
+                    case TYPE_I16: ucast = "(uint16_t)"; break;
+                    case TYPE_I32: ucast = "(uint32_t)"; break;
+                    case TYPE_I64: ucast = "(uint64_t)"; break;
+                    default: break;
+                    }
+                }
                 int64_t high = eval_const_expr(node->slice.start);
                 int64_t low = eval_const_expr(node->slice.end);
                 int64_t width = (high >= 0 && low >= 0) ? high - low + 1 : -1;
                 if (width >= 64) {
                     /* constant full-width — just emit the value (mask is all 1s) */
+                    emit(e, "%s", ucast);
                     emit_expr(e, node->slice.object);
                 } else if (width > 0) {
                     /* constant — safe, precomputed width */
-                    emit(e, "((");
+                    emit(e, "((%s", ucast);
                     emit_expr(e, node->slice.object);
                     emit(e, " >> %lld) & ((1ull << %lld) - 1))", (long long)low, (long long)width);
                 } else {
@@ -928,7 +941,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->slice.start);
                     emit(e, "); int _zer_lo%d = (int)(", tmp);
                     emit_expr(e, node->slice.end);
-                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((", tmp, tmp, tmp);
+                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", tmp, tmp, tmp, ucast);
                     emit_expr(e, node->slice.object);
                     emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                          tmp, tmp, tmp, tmp);

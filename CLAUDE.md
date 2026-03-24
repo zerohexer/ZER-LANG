@@ -388,6 +388,12 @@ An empty slice has `ptr = NULL`. Implicit coercion to `*T` (non-null) would allo
 **40. Base-object side effects in slice indexing must be hoisted.**
 `get_slice()[0]` emits `get_slice()` twice (bounds check + access). Detect side effects in entire object chain (NODE_CALL/NODE_ASSIGN at any level), hoist slice into `__auto_type _zer_obj` temp. (BUG-164)
 
+**41. Const checking covers ALL 4 sites: call args, return, assignment, var-decl init.**
+`type_equals` ignores `is_const` by design. Const→mutable must be checked separately at each site where a value flows from one type to another. All 4 are now covered for both pointers and slices. (BUG-140, 157, 165, 166)
+
+**42. Signed bit extraction casts to unsigned before right-shift.**
+Right-shifting negative signed integers is implementation-defined in C (arithmetic vs logical). Emitter casts to unsigned equivalent (`(uint8_t)val`, `(uint16_t)val`, etc.) before the shift to guarantee logical (zero-fill) behavior. (BUG-167)
+
 ### Known Technical Debt
 - ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
 - ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~

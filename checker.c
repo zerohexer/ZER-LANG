@@ -785,6 +785,20 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* const laundering: reject const → mutable assignment for ptr/slice */
+        if (node->assign.op == TOK_EQ && target && value) {
+            if (target->kind == TYPE_POINTER && value->kind == TYPE_POINTER &&
+                value->pointer.is_const && !target->pointer.is_const) {
+                checker_error(c, node->loc.line,
+                    "cannot assign const pointer to mutable — would allow writing to read-only memory");
+            }
+            if (target->kind == TYPE_SLICE && value->kind == TYPE_SLICE &&
+                value->slice.is_const && !target->slice.is_const) {
+                checker_error(c, node->loc.line,
+                    "cannot assign const slice to mutable — would allow writing to read-only memory");
+            }
+        }
+
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!type_equals(target, value) &&
@@ -1723,6 +1737,22 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             /* check assignment compatibility */
+            /* const laundering: reject const → mutable in init */
+            if (type && init_type) {
+                if (type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER &&
+                    init_type->pointer.is_const && !type->pointer.is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot initialize mutable pointer from const — "
+                        "would allow writing to read-only memory");
+                }
+                if (type->kind == TYPE_SLICE && init_type->kind == TYPE_SLICE &&
+                    init_type->slice.is_const && !type->slice.is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot initialize mutable slice from const — "
+                        "would allow writing to read-only memory");
+                }
+            }
+
             if (!type_equals(type, init_type) &&
                 !can_implicit_coerce(init_type, type) &&
                 !is_literal_compatible(node->var_decl.init, type)) {

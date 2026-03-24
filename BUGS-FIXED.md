@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-165: Const laundering via assignment — `m = const_ptr` passes
+- **Symptom:** `*u32 m; m = const_ptr;` passes because `type_equals` ignores `is_const`.
+- **Fix:** NODE_ASSIGN checks const-to-mutable mismatch for pointers and slices.
+
+### BUG-166: Const laundering via orelse init — `*u32 m = ?const_ptr orelse return`
+- **Symptom:** `*u32 m = opt orelse return` where `opt` is `?const *u32` strips const during unwrap.
+- **Fix:** Var-decl init checks const-to-mutable mismatch for pointers and slices.
+
+### BUG-167: Signed bit extraction uses implementation-defined right-shift
+- **Symptom:** `i8 val = -1; val[7..0]` emits `val >> 0` — right-shifting negative signed is impl-defined.
+- **Fix:** Cast to unsigned equivalent before shifting: `(uint8_t)val >> 0`.
+
 ### BUG-162: Slice-to-pointer implicit coercion allows NULL — non-null guarantee broken
 - **Symptom:** `[]u8 empty; clear(empty)` passes, `empty.ptr` is NULL but `*u8` is non-null type.
 - **Fix:** Remove `[]T → *T` implicit coercion from `can_implicit_coerce`. Use `.ptr` explicitly.

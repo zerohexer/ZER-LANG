@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-217: Compile-time slice bounds check for arrays
+- **Symptom:** `u8[10] arr; []u8 s = arr[0..15];` passes checker. Should be caught at compile time.
+- **Root cause:** BUG-196 added compile-time OOB for indexing but not slicing.
+- **Fix:** In NODE_SLICE, if object is TYPE_ARRAY and end/start is a constant, check against `array.size`.
+- **Test:** `test_checker_full.c` — slice end 15 on array[10] rejected.
+
+### BUG-216: Bit-set assignment double-evaluates target
+- **Symptom:** `regs[next_idx()][3..0] = 5` calls `next_idx()` twice — once for read, once for write.
+- **Root cause:** Bit-set emission called `emit_expr(obj)` multiple times.
+- **Fix:** Hoist target address via `__typeof__(obj) *_p = &(obj)`, then use `*_p` for both read and write. `__typeof__` doesn't evaluate in GCC.
+- **Test:** `test_emit.c` — bit-set with side-effecting index, counter = 1.
+
 ### BUG-215: Unary `~` on narrow types (u8/u16) not cast — C integer promotion
 - **Symptom:** `u8 a = 0xAA; if (~a == 0x55)` evaluates to false. C promotes `~(uint8_t)0xAA` to `0xFFFFFF55`.
 - **Root cause:** Emitter wrapped binary operations (BUG-186) but not unary `~` and `-`.

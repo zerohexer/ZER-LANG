@@ -1574,7 +1574,24 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-217: compile-time slice bounds check for arrays */
         if (obj->kind == TYPE_ARRAY) {
+            if (node->slice.end) {
+                int64_t end_val = eval_const_expr(node->slice.end);
+                if (end_val >= 0 && (uint64_t)end_val > obj->array.size) {
+                    checker_error(c, node->loc.line,
+                        "slice end %lld exceeds array size %llu",
+                        (long long)end_val, (unsigned long long)obj->array.size);
+                }
+            }
+            if (node->slice.start) {
+                int64_t start_val = eval_const_expr(node->slice.start);
+                if (start_val >= 0 && (uint64_t)start_val > obj->array.size) {
+                    checker_error(c, node->loc.line,
+                        "slice start %lld exceeds array size %llu",
+                        (long long)start_val, (unsigned long long)obj->array.size);
+                }
+            }
             result = type_slice(c->arena, obj->array.inner);
         } else if (obj->kind == TYPE_SLICE) {
             result = obj; /* slice of slice = same slice type */

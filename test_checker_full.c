@@ -1122,6 +1122,12 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-217: compile-time slice bounds check */
+    err("u32 main() { u8[10] a; []u8 s = a[0..15]; return 0; }",
+        "slice end 15 exceeds array size 10");
+    ok("u32 main() { u8[10] a; a[0] = 1; []u8 s = a[0..10]; return 0; }",
+       "slice end 10 on array[10] accepted (end is exclusive)");
+
     /* BUG-213: static vars visible to own functions */
     ok("static u32 count = 0;\n"
        "void inc() { count += 1; }\n"

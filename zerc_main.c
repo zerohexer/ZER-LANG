@@ -167,24 +167,6 @@ static bool parse_module(Compiler *cc, Module *m) {
     return true;
 }
 
-/* register all declarations from a module into the checker */
-static void register_module_decls(Compiler *cc, Checker *checker, Module *m) {
-    if (m->checked) return;
-    m->checked = true;
-
-    /* first register imports */
-    for (int i = 0; i < m->ast->file.decl_count; i++) {
-        Node *decl = m->ast->file.decls[i];
-        if (decl->kind == NODE_IMPORT) {
-            Module *imported = find_or_create_module(cc,
-                decl->import.module_name, decl->import.module_name_len);
-            if (imported) {
-                register_module_decls(cc, checker, imported);
-            }
-        }
-    }
-}
-
 /* ================================================================ */
 
 int main(int argc, char **argv) {

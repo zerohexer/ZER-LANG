@@ -518,8 +518,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 }
             }
         }
-        /* BUG-210: bit-set assignment: reg[7..0] = 0xFF
-         * → reg = (reg & ~mask) | ((value << low) & mask) */
+        /* BUG-210/216: bit-set assignment: reg[7..0] = 0xFF
+         * → ({ auto *_p = &obj; *_p = (*_p & ~mask) | ((val << lo) & mask); })
+         * Uses pointer hoist for single-eval of target expression. */
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_SLICE) {
             Type *obj_type = checker_get_type(node->assign.target->slice.object);
@@ -527,11 +528,19 @@ static void emit_expr(Emitter *e, Node *node) {
                 Node *obj = node->assign.target->slice.object;
                 Node *hi_node = node->assign.target->slice.start;  /* high bit */
                 Node *lo_node = node->assign.target->slice.end;    /* low bit */
-                /* emit: obj = (obj & ~mask) | ((val << low) & mask)
-                 * where mask = ((1ull << (high - low + 1)) - 1) << low */
+                int btmp = e->temp_count++;
+                /* BUG-216: hoist target address for single-eval.
+                 * Use *({ auto val = obj; auto *p = &val; ... }) pattern
+                 * for simple vars. For indexed/field access, this writes to
+                 * a copy which is OK — the outer assignment handles write-back. */
+                /* __typeof__ does NOT evaluate its argument.
+                 * &(obj) evaluates obj exactly once as an lvalue.
+                 * *_p reads/writes through cached pointer — no re-eval. */
+                emit(e, "({ __typeof__(");
                 emit_expr(e, obj);
-                emit(e, " = (");
+                emit(e, ") *_zer_bp%d = &(", btmp);
                 emit_expr(e, obj);
+                emit(e, "); *_zer_bp%d = (*_zer_bp%d", btmp, btmp);
                 emit(e, " & ~(");
                 /* emit mask: safe for width >= 64 */
                 if (hi_node && lo_node) {
@@ -580,7 +589,7 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, " << %lld", (long long)lo);
                     }
                 }
-                emit(e, "))");
+                emit(e, ")); })");
                 goto assign_done;
             }
         }

@@ -1,0 +1,7 @@
+import common;
+
+u32 drv_b_send() {
+    Packet p;
+    p.id = 20;
+    return p.id;
+}

@@ -376,6 +376,14 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (emit_count < cc.module_count) {
+            fprintf(stderr, "error: circular dependency or unresolved imports\n");
+            free(emit_order);
+            free(visited);
+            fclose(out);
+            return 1;
+        }
+
         /* emit in topological order: first module gets preamble (unless --lib) */
         for (int i = 0; i < emit_count; i++) {
             Module *m = &cc.modules[emit_order[i]];

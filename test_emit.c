@@ -2487,6 +2487,19 @@ int main(void) {
         55,
         "array → const slice param = 55");
 
+    /* BUG-141: bit extraction with negative width (hi < lo) — must not UB */
+    printf("[bit extract: swapped indices → 0 (BUG-141)]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 val = 0xFF;\n"
+        "    u32 lo = 4;\n"
+        "    u32 hi = 2;\n"
+        "    u32 result = val[hi..lo];\n"
+        "    return result;\n"
+        "}\n",
+        0,
+        "bit extract hi < lo → 0 (no UB)");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

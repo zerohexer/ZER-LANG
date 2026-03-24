@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-141: Bit extraction with negative width — shift by negative is UB
+- **Symptom:** `val[2..4]` (hi < lo) → `_zer_w = -1` → `1ull << -1` is undefined behavior.
+- **Fix:** Add `<= 0` check to runtime ternary: `(_zer_w >= 64) ? ~0ULL : (_zer_w <= 0) ? 0ULL : ((1ull << _zer_w) - 1)`.
+
+### BUG-142: Topological sort silently skips modules on stall
+- **Symptom:** If topo sort stalls (no progress but `emit_count < module_count`), modules are silently skipped → confusing "undefined symbol" from GCC.
+- **Fix:** After topo loop, check `emit_count < module_count` → error "circular dependency or unresolved imports".
+
 ### BUG-139: `if (optional)` emits struct as C boolean — GCC rejects
 - **Symptom:** `if (val)` where `val` is `?u32` emits `if (val)` in C — but val is a struct. GCC: "used struct type value where scalar is required."
 - **Fix:** Emitter regular-if and while paths check if condition is non-null-sentinel optional → emit `.has_value`.

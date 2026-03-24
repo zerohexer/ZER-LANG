@@ -852,8 +852,8 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->slice.end);
                     emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((", tmp, tmp, tmp);
                     emit_expr(e, node->slice.object);
-                    emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
-                         tmp, tmp, tmp);
+                    emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                         tmp, tmp, tmp, tmp);
                 }
             }
             break;

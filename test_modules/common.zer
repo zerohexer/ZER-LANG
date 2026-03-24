@@ -1,0 +1,4 @@
+struct Packet {
+    u32 id;
+    u32 size;
+}

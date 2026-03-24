@@ -1,0 +1,6 @@
+import drv_a;
+import drv_b;
+
+u32 main() {
+    return drv_a_send() + drv_b_send();
+}

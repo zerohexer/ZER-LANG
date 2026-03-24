@@ -2524,6 +2524,17 @@ int main(void) {
         "}\n",
         "volatile u32 emits volatile keyword");
 
+    /* BUG-173: array size uses %llu — verify emission */
+    printf("[array size emission — %llu format]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[1024] big;\n"
+        "    big[0] = 42;\n"
+        "    return big[0];\n"
+        "}\n",
+        42,
+        "u32[1024] — size emitted correctly");
+
     /* BUG-150: array init/assignment via memcpy */
     printf("[array init from array — BUG-150]\n");
     test_compile_and_run(

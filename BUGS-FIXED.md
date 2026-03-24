@@ -73,6 +73,26 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-182: Const array → mutable slice coercion at call site
+- **Symptom:** `const u32[4] arr; mutate(arr)` where `mutate([]u32)` passes. Const array data written through mutable slice.
+- **Fix:** Call site checks if arg is const NODE_IDENT with TYPE_ARRAY coerced to mutable TYPE_SLICE param.
+
+### BUG-183: Signed division overflow (INT_MIN / -1) — hardware exception
+- **Symptom:** `i32(-2147483648) / -1` triggers x86 SIGFPE / ARM HardFault. Result overflows signed type.
+- **Fix:** Division trap checks `divisor == -1 && dividend == TYPE_MIN` for each signed type width.
+
+### BUG-184: Slice `arr[5..2]` — negative length → buffer overflow
+- **Symptom:** `arr[5..2]` produces `len = 2 - 5` = massive unsigned. Already fixed in BUG-179 but separate from bit extraction.
+- **Fix:** Compile-time check start > end (excludes bit extraction `[high..low]`).
+
+### BUG-185: Volatile lost on struct fields
+- **Symptom:** `struct S { volatile u32 x; }` emits `uint32_t x` — no volatile keyword. GCC optimizes away MMIO reads.
+- **Fix:** Struct field emission checks TYNODE_VOLATILE wrapper on field type node, emits `volatile` keyword.
+
+### BUG-186: Integer promotion breaks narrow type wrapping
+- **Symptom:** `u8 a = 255; u8 b = 1; if (a + b == 0)` is false — C promotes to int, 256 != 0.
+- **Fix:** Emitter casts narrow type arithmetic to result type: `(uint8_t)(a + b)`.
+
 ### BUG-177: Write through `const *T` pointer not blocked
 - **Symptom:** `*p = 5` where `p` is `const *u32` passes checker. Segfault on .rodata/Flash.
 - **Fix:** Assignment target walk detects const pointer (deref or auto-deref) → error.

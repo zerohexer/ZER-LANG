@@ -1079,6 +1079,19 @@ static Type *check_expr(Checker *c, Node *node) {
                                 i + 1);
                         }
                     }
+                    /* const array → mutable slice coercion: check if arg var is const */
+                    if (arg && arg->kind == TYPE_ARRAY &&
+                        param && param->kind == TYPE_SLICE && !param->slice.is_const &&
+                        node->call.args[i]->kind == NODE_IDENT) {
+                        Symbol *arg_sym = scope_lookup(c->current_scope,
+                            node->call.args[i]->ident.name,
+                            (uint32_t)node->call.args[i]->ident.name_len);
+                        if (arg_sym && arg_sym->is_const) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass const array '%.*s' to mutable slice parameter",
+                                i + 1, (int)arg_sym->name_len, arg_sym->name);
+                        }
+                    }
 
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&

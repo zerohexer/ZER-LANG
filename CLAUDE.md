@@ -418,6 +418,18 @@ Slices are structs in C; `struct == struct` is a GCC error. Arrays decay inconsi
 **50. `void` variables rejected — void is for return types only.**
 NODE_VAR_DECL and NODE_GLOBAL_VAR reject TYPE_VOID. `?void` is still allowed (has `has_value` field). (BUG-175)
 
+**51. Const array → mutable slice blocked at call sites.**
+`const u32[4] arr; mutate(arr)` where `mutate([]u32)` — checker looks up arg symbol, rejects if `is_const` and param slice is mutable. Arrays don't have `is_const` on the Type (only on Symbol), so the check must lookup the symbol. (BUG-182)
+
+**52. Signed division overflow: INT_MIN / -1 trapped.**
+Division by -1 on the minimum signed value overflows (result can't fit). Emitter checks `divisor == -1 && dividend == TYPE_MIN` for each width (i8: -128, i16: -32768, i32: -2147483648, i64). (BUG-183)
+
+**53. Volatile on struct fields emitted via TYNODE_VOLATILE check.**
+Struct field emission checks if the field's TypeNode has a TYNODE_VOLATILE wrapper. If so, emits `volatile` before the type. The Type system doesn't carry volatile for non-pointer scalars — it's a syntactic property. (BUG-185)
+
+**54. Narrow type arithmetic cast: `(uint8_t)(a + b)` for u8/u16/i8/i16.**
+C integer promotion makes `u8 + u8` return `int`. Without cast, wrapping comparison `a + b == 0` fails for `255 + 1`. Emitter checks result type from typemap, casts for types narrower than `int`. (BUG-186)
+
 ### Known Technical Debt
 - ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
 - ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~

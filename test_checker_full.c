@@ -724,6 +724,14 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-182: const array → mutable slice coercion */
+    err("void mutate([]u32 s) { s[0] = 0; }\nvoid f() { const u32[4] arr; mutate(arr); }",
+        "const array → mutable slice param REJECT");
+
+    /* BUG-184: slice start > end (constant) */
+    err("void f() { u8[10] arr; []u8 s = arr[5..2]; }",
+        "slice arr[5..2] start > end REJECT");
+
     /* BUG-177: const pointer deref mutation */
     err("void f(const *u32 p) { *p = 5; }",
         "write through const pointer REJECT");

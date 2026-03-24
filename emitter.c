@@ -372,10 +372,25 @@ static void emit_expr(Emitter *e, Node *node) {
         /* division/modulo: trap on zero divisor */
         if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
             int tmp = e->temp_count++;
+            Type *div_type = checker_get_type(node->binary.left);
+            bool is_signed_div = div_type && type_is_signed(div_type);
             emit(e, "({ __auto_type _zer_dv%d = ", tmp);
             emit_expr(e, node->binary.right);
             emit(e, "; if (_zer_dv%d == 0) ", tmp);
-            emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); (");
+            emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); ");
+            /* signed overflow: INT_MIN / -1 traps on x86/ARM */
+            if (is_signed_div) {
+                emit(e, "if (_zer_dv%d == -1) { __auto_type _zer_dd%d = ", tmp, tmp);
+                emit_expr(e, node->binary.left);
+                /* check if dividend is the minimum value for its type */
+                int w = type_width(div_type);
+                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
+                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
+                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
+                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
+            }
+            emit(e, "(");
             emit_expr(e, node->binary.left);
             emit(e, " %s _zer_dv%d); })",
                  node->binary.op == TOK_SLASH ? "/" : "%", tmp);
@@ -2191,6 +2206,10 @@ static void emit_struct_decl(Emitter *e, Node *node) {
                       (uint32_t)i < st->struct_type.field_count) ?
             st->struct_type.fields[i].type : resolve_type_for_emit(e, f->type);
         emit_indent(e);
+        /* check if field has volatile qualifier (TYNODE_VOLATILE wrapper) */
+        if (f->type && f->type->kind == TYNODE_VOLATILE &&
+            !(ftype && ftype->kind == TYPE_POINTER))
+            emit(e, "volatile ");
         emit_type_and_name(e, ftype, f->name, f->name_len);
         emit(e, ";\n");
     }

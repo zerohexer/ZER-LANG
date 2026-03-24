@@ -73,6 +73,24 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-215: Unary `~` on narrow types (u8/u16) not cast — C integer promotion
+- **Symptom:** `u8 a = 0xAA; if (~a == 0x55)` evaluates to false. C promotes `~(uint8_t)0xAA` to `0xFFFFFF55`.
+- **Root cause:** Emitter wrapped binary operations (BUG-186) but not unary `~` and `-`.
+- **Fix:** In `NODE_UNARY` for `TOK_TILDE`/`TOK_MINUS`, if result type is u8/u16/i8/i16, wrap in cast: `(uint8_t)(~a)`.
+- **Test:** `test_emit.c` — `~u8(0xAA) == 85` returns true.
+
+### BUG-214: Slice-to-slice sub-slicing doesn't propagate is_local_derived
+- **Symptom:** `[]u8 s = local_arr; []u8 s2 = s[0..2]; return s2;` — dangling slice via sub-slice.
+- **Root cause:** BUG-207 check only looked for TYPE_ARRAY root. A TYPE_SLICE root already marked local-derived wasn't checked.
+- **Fix:** Check `src->is_local_derived` first (before TYPE_ARRAY check) — propagate flag from source symbol.
+- **Test:** `test_checker_full.c` — sub-slice of local-derived slice blocked.
+
+### BUG-213: Static variables invisible to own module's functions
+- **Symptom:** `static u32 count = 0; void inc() { count += 1; }` → "undefined identifier 'count'".
+- **Root cause:** `checker_register_file` skipped static declarations to prevent cross-module visibility. But this also hid them from the module's own functions.
+- **Fix:** Register ALL declarations including statics. Cross-module visibility is handled by the module scope system.
+- **Test:** `test_checker_full.c` + `test_emit.c` — static variable visible, inc() x3 returns 3.
+
 ### BUG-212: If-unwrap capture loses is_local_derived from condition
 - **Symptom:** `?*u32 opt = &x; if (opt) |p| { return p; }` — returns dangling pointer via capture.
 - **Root cause:** Capture symbol creation didn't propagate safety flags from the condition expression.

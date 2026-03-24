@@ -1122,6 +1122,16 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-213: static vars visible to own functions */
+    ok("static u32 count = 0;\n"
+       "void inc() { count += 1; }\n"
+       "u32 main() { inc(); return count; }",
+       "static variable visible to module functions");
+
+    /* BUG-214: slice-to-slice propagates local-derived */
+    err("[]u8 bad() { u8[10] a; []u8 s = a; []u8 s2 = s[0..2]; return s2; }",
+        "sub-slice of local-derived slice blocked");
+
     /* BUG-211: union field bypass — lock walks to root */
     err("struct A { u32 x; }\nstruct B { u32 y; }\nunion M { A a; B b; }\nstruct S { M msg; }\n"
         "void f(S s) { switch (s.msg) { .a => |*v| { s.msg.b.y = 20; } .b => |*v| { } } }",

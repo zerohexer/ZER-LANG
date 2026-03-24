@@ -503,6 +503,15 @@ Taking the address of the union being switched on creates a pointer alias that b
 **77. If-unwrap capture propagates is_local_derived/is_arena_derived.**
 `if (opt) |p| { return p; }` where `opt` has `is_local_derived` now marks `p` as local-derived. Walks through NODE_ORELSE and field/index chains to find the condition's root ident, then propagates flags to the capture symbol. (BUG-212)
 
+**78. Static declarations registered in global scope — visible to own module.**
+`checker_register_file` no longer skips static vars/functions. They're needed by the module's own function bodies. Cross-module visibility prevention is handled by the module scope system, not by skipping registration. (BUG-213)
+
+**79. Slice-to-slice sub-slicing propagates is_local_derived.**
+`[]u8 s2 = s[0..2]` where `s` is already local-derived marks `s2` as local-derived. The check looks up the source symbol first — if it has `is_local_derived`, propagate immediately (before the TYPE_ARRAY root check). (BUG-214)
+
+**80. Unary `~` and `-` cast for narrow types (u8/u16/i8/i16).**
+C integer promotion makes `~(uint8_t)0xAA` = `0xFFFFFF55`. Emitter wraps narrow unary results: `(uint8_t)(~a)`. Same pattern as binary arithmetic casting (BUG-186). (BUG-215)
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

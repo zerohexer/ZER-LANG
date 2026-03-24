@@ -2698,6 +2698,26 @@ int main(void) {
         77,
         "switch on ?u32 with capture");
 
+    /* BUG-215: unary ~ narrow type cast */
+    printf("[unary ~ narrow cast — BUG-215]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8 a = 170;\n"
+        "    if (~a == 85) { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        1,
+        "~u8(0xAA) == 85 (not 0xFFFFFF55)");
+
+    /* BUG-213: static vars in single file */
+    printf("[static vars — BUG-213]\n");
+    test_compile_and_run(
+        "static u32 count = 0;\n"
+        "void inc() { count += 1; }\n"
+        "u32 main() { inc(); inc(); inc(); return count; }\n",
+        3,
+        "static u32 visible to module functions");
+
     /* BUG-210: bit-set assignment */
     printf("[bit-set assignment — BUG-210]\n");
     test_compile_and_run(

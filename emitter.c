@@ -463,6 +463,23 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_UNARY:
+        /* BUG-215: narrow type unary cast — C promotes u8/u16/i8/i16 to int.
+         * ~(u8)0xAA = 0xFFFFFF55 in C, but ZER expects 0x55. Cast result. */
+        if (node->unary.op == TOK_TILDE || node->unary.op == TOK_MINUS) {
+            Type *res = checker_get_type(node);
+            if (res) res = type_unwrap_distinct(res);
+            if (res && (res->kind == TYPE_U8 || res->kind == TYPE_U16 ||
+                        res->kind == TYPE_I8 || res->kind == TYPE_I16)) {
+                emit(e, "(");
+                emit_type(e, res);
+                emit(e, ")(");
+                if (node->unary.op == TOK_TILDE) emit(e, "~");
+                else emit(e, "-");
+                emit_expr(e, node->unary.operand);
+                emit(e, ")");
+                break;
+            }
+        }
         switch (node->unary.op) {
         case TOK_MINUS: emit(e, "(-"); break;
         case TOK_BANG:  emit(e, "(!"); break;

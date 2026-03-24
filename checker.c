@@ -2107,10 +2107,13 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 if (slice_root && slice_root->kind == NODE_IDENT) {
                     Type *root_type = checker_get_type(slice_root);
-                    if (root_type && root_type->kind == TYPE_ARRAY) {
-                        Symbol *src = scope_lookup(c->current_scope,
-                            slice_root->ident.name,
-                            (uint32_t)slice_root->ident.name_len);
+                    Symbol *src = scope_lookup(c->current_scope,
+                        slice_root->ident.name,
+                        (uint32_t)slice_root->ident.name_len);
+                    /* BUG-214: also propagate if source is already local-derived (slice-to-slice) */
+                    if (src && src->is_local_derived) {
+                        sym->is_local_derived = true;
+                    } else if (root_type && root_type->kind == TYPE_ARRAY) {
                         bool is_global = src && scope_lookup_local(c->global_scope,
                             src->name, src->name_len) != NULL;
                         if (src && !src->is_static && !is_global) {
@@ -3062,9 +3065,9 @@ void checker_register_file(Checker *c, Node *file_node) {
         Node *decl = file_node->file.decls[i];
         /* skip imports — they're handled by the compiler driver */
         if (decl->kind == NODE_IMPORT || decl->kind == NODE_CINCLUDE) continue;
-        /* skip static (module-private) declarations */
-        if (decl->kind == NODE_FUNC_DECL && decl->func_decl.is_static) continue;
-        if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;
+        /* BUG-213: register ALL declarations including statics.
+         * Statics must be visible to the module's own functions.
+         * Cross-module visibility is handled by the module scope system. */
         register_decl(c, decl);
     }
 }

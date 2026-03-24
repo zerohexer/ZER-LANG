@@ -1383,8 +1383,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, " = _zer_or%d;\n", tmp);
             } else if (type && type->kind == TYPE_OPTIONAL &&
                        type->optional.inner->kind == TYPE_VOID) {
-                /* ?void has no .value — orelse just guards, no variable needed */
-                emit(e, "/* ?void unwrap — no value */\n");
+                /* ?void has no .value — keep as ?void (has_value only) */
+                emit(e, "_zer_opt_void %.*s = _zer_or%d;\n",
+                     (int)node->var_decl.name_len, node->var_decl.name, tmp);
             } else if (type && type->kind == TYPE_SLICE) {
                 /* slice: use __auto_type to avoid anonymous struct incompatibility */
                 emit(e, "__auto_type %.*s = _zer_or%d.value;\n",

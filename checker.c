@@ -944,6 +944,17 @@ static Type *check_expr(Checker *c, Node *node) {
                 for (uint32_t i = 0; i < effective_callee->func_ptr.param_count; i++) {
                     Type *param = effective_callee->func_ptr.params[i];
                     Type *arg = arg_types[i];
+
+                    /* const safety: reject string literal → mutable slice param
+                     * (string data is in .rodata, writing segfaults) */
+                    if (node->call.args[i]->kind == NODE_STRING_LIT &&
+                        param && param->kind == TYPE_SLICE) {
+                        checker_error(c, node->loc.line,
+                            "argument %d: cannot pass string literal to mutable []u8 parameter — "
+                            "use const []u8 parameter or copy the string first",
+                            i + 1);
+                    }
+
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&
                         !is_literal_compatible(node->call.args[i], param)) {

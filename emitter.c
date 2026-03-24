@@ -561,9 +561,9 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, " _zer_rpv%d = ", tmp);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
-                        emit(e, "; _zer_ring_push(%.*s.data, &%.*s.head, "
+                        emit(e, "; _zer_ring_push(%.*s.data, &%.*s.head, &%.*s.tail, "
                              "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); })",
-                             rlen, rname, rlen, rname, rlen, rname,
+                             rlen, rname, rlen, rname, rlen, rname, rlen, rname,
                              obj_type->ring.count, tmp, tmp);
                         handled = true;
                     } else if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
@@ -597,13 +597,13 @@ static void emit_expr(Emitter *e, Node *node) {
                             emit_expr(e, node->call.args[0]);
                         emit(e, "; _zer_opt_void _zer_rpc%d = {0}; "
                              "if (%.*s.count < %u) { "
-                             "_zer_ring_push(%.*s.data, &%.*s.head, "
+                             "_zer_ring_push(%.*s.data, &%.*s.head, &%.*s.tail, "
                              "&%.*s.count, %u, &_zer_rpv%d, sizeof(_zer_rpv%d)); "
                              "_zer_rpc%d.has_value = 1; } "
                              "_zer_rpc%d; })",
                              tmp,
                              rlen, rname, obj_type->ring.count,
-                             rlen, rname, rlen, rname,
+                             rlen, rname, rlen, rname, rlen, rname,
                              rlen, rname, obj_type->ring.count, tmp, tmp,
                              tmp,
                              tmp);
@@ -2279,11 +2279,12 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    } NAME = { .capacity = CAPACITY }\n");
     emit(e, "\n");
 
-    emit(e, "static inline void _zer_ring_push(void *ring_data, uint32_t *head, "
+    emit(e, "static inline void _zer_ring_push(void *ring_data, uint32_t *head, uint32_t *tail, "
             "uint32_t *count, uint32_t capacity, const void *val, size_t elem_size) {\n");
     emit(e, "    memcpy((char*)ring_data + (*head) * elem_size, val, elem_size);\n");
     emit(e, "    *head = (*head + 1) %% capacity;\n");
-    emit(e, "    if (*count < capacity) (*count)++;\n");
+    emit(e, "    if (*count < capacity) { (*count)++; }\n");
+    emit(e, "    else { *tail = (*tail + 1) %% capacity; }\n");
     emit(e, "}\n\n");
 
     /* ZER runtime: Arena bump allocator */

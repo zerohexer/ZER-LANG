@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-137: Ring buffer overwrite doesn't advance tail pointer
+- **Symptom:** After overwriting a full ring, `pop()` returns newest item (40) instead of oldest (20).
+- **Fix:** `_zer_ring_push` now takes `tail` param, advances it when buffer is full.
+
+### BUG-138: Return string literal as mutable `[]u8` — .rodata write risk
+- **Symptom:** `[]u8 get() { return "hello"; }` passes checker. Caller can write through returned slice.
+- **Fix:** NODE_RETURN checks NODE_STRING_LIT + TYPE_SLICE target → error.
+
 ### BUG-132: Side-effect index as lvalue fails — GCC rejects statement expression
 - **Symptom:** `arr[func()] = 42` — GCC error "lvalue required." Statement expression is rvalue.
 - **Fix:** Pointer dereference pattern: `*({ size_t _i = func(); check(_i); &arr[_i]; })`.

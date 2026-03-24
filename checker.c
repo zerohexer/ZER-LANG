@@ -1995,6 +1995,13 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
 
+            /* string literal returned as mutable slice → .rodata write risk */
+            if (node->ret.expr->kind == NODE_STRING_LIT &&
+                c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
+                checker_error(c, node->loc.line,
+                    "cannot return string literal as mutable slice — data is read-only");
+            }
+
             /* scope escape: return local array as slice → dangling pointer */
             if (node->ret.expr->kind == NODE_IDENT &&
                 ret_type && ret_type->kind == TYPE_ARRAY &&

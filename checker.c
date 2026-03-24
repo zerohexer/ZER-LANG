@@ -212,7 +212,22 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
     /* unwrap distinct for literal compatibility */
     Type *effective = type_unwrap_distinct(target);
-    if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) return true;
+    if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
+        /* range check: literal must fit in target type */
+        uint64_t val = expr->int_lit.value;
+        switch (effective->kind) {
+        case TYPE_U8:    return val <= 255;
+        case TYPE_U16:   return val <= 65535;
+        case TYPE_U32:   return val <= 0xFFFFFFFFULL;
+        case TYPE_U64:   return true;
+        case TYPE_USIZE: return val <= 0xFFFFFFFFULL; /* 32-bit */
+        case TYPE_I8:    return val <= 127;
+        case TYPE_I16:   return val <= 32767;
+        case TYPE_I32:   return val <= 2147483647ULL;
+        case TYPE_I64:   return true;
+        default:         return true;
+        }
+    }
     /* bool is NOT an integer — no int→bool coercion (spec rule) */
     if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
@@ -220,8 +235,19 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     if (expr->kind == NODE_CHAR_LIT && effective->kind == TYPE_U8) return true;
     /* -5 is UNARY(MINUS, INT_LIT) — negative integer literal */
     if (expr->kind == NODE_UNARY && expr->unary.op == TOK_MINUS) {
-        if (expr->unary.operand->kind == NODE_INT_LIT && type_is_integer(effective))
-            return true;
+        if (expr->unary.operand->kind == NODE_INT_LIT && type_is_integer(effective)) {
+            uint64_t val = expr->unary.operand->int_lit.value;
+            switch (effective->kind) {
+            case TYPE_I8:    return val <= 128;
+            case TYPE_I16:   return val <= 32768;
+            case TYPE_I32:   return val <= 2147483648ULL;
+            case TYPE_I64:   return true;
+            /* unsigned types: negative literals never fit */
+            case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+                return false;
+            default:         return true;
+            }
+        }
         if (expr->unary.operand->kind == NODE_FLOAT_LIT && type_is_float(effective))
             return true;
     }
@@ -1284,6 +1310,15 @@ static Type *check_expr(Checker *c, Node *node) {
             result = obj; /* slice of slice = same slice type */
         } else if (type_is_integer(obj)) {
             /* bit extraction: reg[high..low] → integer result */
+            /* validate constant indices are within type width */
+            if (node->slice.start) {
+                int64_t hi = eval_const_expr(node->slice.start);
+                if (hi >= 0 && hi >= type_width(obj)) {
+                    checker_error(c, node->loc.line,
+                        "bit index %lld out of range for %d-bit type '%s'",
+                        (long long)hi, type_width(obj), type_name(obj));
+                }
+            }
             result = obj;
         } else {
             checker_error(c, node->loc.line,

@@ -696,6 +696,24 @@ static void test_security_review(void) {
         "}\n",
         "arena alias escape via assignment → error");
 
+    /* BUG-153: integer literal overflow */
+    err("void f() { u8 x = 256; }",
+        "u8 x = 256 → overflow REJECT");
+    err("void f() { i8 x = 128; }",
+        "i8 x = 128 → overflow REJECT");
+    err("void f() { u8 x = -1; }",
+        "u8 x = -1 → negative unsigned REJECT");
+    ok("void f() { u8 x = 255; }",
+       "u8 x = 255 → max OK");
+    ok("void f() { i8 x = -128; }",
+       "i8 x = -128 → min OK");
+
+    /* BUG-154: bit extraction out of bounds */
+    err("void f() { u8 v = 0; u32 x = v[15..0]; }",
+        "u8 bit[15..0] → index 15 out of range REJECT");
+    ok("void f() { u8 v = 0; u32 x = v[7..0]; }",
+       "u8 bit[7..0] → max valid index OK");
+
     /* BUG-143: return arena-derived pointer from local arena */
     err("struct Task { u32 id; }\n"
         "*Task bad() {\n"

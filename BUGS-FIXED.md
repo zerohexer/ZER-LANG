@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-153: Integer literal overflow not caught by checker
+- **Symptom:** `u8 x = 256` passes checker, GCC silently truncates to 0.
+- **Fix:** `is_literal_compatible` validates literal value fits target type's range (0-255 for u8, etc.). Negative literals checked against signed ranges.
+
+### BUG-154: Bit extraction index out of range for type width
+- **Symptom:** `u8 val; val[15..0]` passes checker, reads junk bits beyond the 8-bit type.
+- **Fix:** NODE_SLICE in checker validates constant `high` index < `type_width(obj)`.
+
 ### BUG-150: Array init/assignment produces invalid C
 - **Symptom:** `u32[4] b = a;` emits `uint32_t b[4] = a;` — GCC rejects (arrays aren't initializers in C).
 - **Fix:** Detect array=array in var-decl init and NODE_ASSIGN → emit `memcpy(dst, src, sizeof(dst))`.

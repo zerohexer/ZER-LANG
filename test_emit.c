@@ -2315,6 +2315,26 @@ int main(void) {
         20,
         "i32 slice expression with named typedef → 20");
 
+    /* BUG-121: constant folding for array sizes */
+    printf("\n[BUG-121: array size expressions]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8[4 * 256] buf;\n"
+        "    buf[1023] = 99;\n"
+        "    return @truncate(u32, buf[1023]);\n"
+        "}\n",
+        99,
+        "array size 4*256 = 1024, buf[1023] = 99");
+
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[512 + 512] arr;\n"
+        "    arr[1023] = 42;\n"
+        "    return arr[1023];\n"
+        "}\n",
+        42,
+        "array size 512+512 = 1024, arr[1023] = 42");
+
     /* BUG-119: bounds check single-eval for side-effecting index */
     printf("[BUG-119: single-eval bounds check]\n");
     test_compile_and_run(

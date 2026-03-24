@@ -151,11 +151,15 @@ function analyze(node, state):
         // cap at MAX_PATHS — drop excess (under-approximate)
 
     case LOOP:
-        // Bounded unroll to pool capacity
-        current = state
-        for i in 0..pool_capacity:
-            current = analyze(node.loop_body, current)
-        return current
+        // Single-pass analysis of loop body.
+        // Checks: if a handle alive before loop is freed inside → error.
+        // NOTE: Design doc originally specified bounded unrolling to pool
+        // capacity. Actual implementation uses single-pass must-analysis
+        // (simpler, zero false positives, catches the common case).
+        pre_loop = copy(state)
+        state = analyze(node.loop_body, state)
+        for each handle: if alive in pre_loop but freed in state → error
+        return state
 
     case CALL:  // unknown function call with handle arg
         // Optimistic: assume handle stays alive
@@ -194,9 +198,7 @@ is alive. This may MISS a bug (false negative) but will NEVER fabricate one (fal
 Merging (union or intersection) loses information and introduces imprecision.
 Separate paths = exact states = only real bugs.
 
-**Bounded loops**: Pool(T, N) has capacity N known at compile time.
-Unrolling to N covers the entire state space within the pool.
-Bugs beyond N iterations cannot exist (pool is full).
+**Loop analysis**: Single-pass check of the loop body. If a handle alive before the loop is freed inside the body, error (may cause use-after-free on next iteration). Handles allocated and freed within the same iteration are safe. This is a simpler approach than bounded unrolling — it catches the common case with zero false positives.
 
 ---
 
@@ -256,10 +258,10 @@ while (condition) {
 tasks.get(h);  // safe if alloc succeeded, bug if break was taken
 ```
 
-ZER-CHECK unrolls:
-- Iteration 1: free(h) → alloc(h) → h=ALIVE (or break)
-- Path A (no break): h=ALIVE → get(h) → OK
-- Path B (break): h=FREED → get(h) → **BUG reported on break path**
+ZER-CHECK single-pass analysis:
+- Detects: h freed inside loop body (alive before, freed after)
+- Reports: "handle freed inside loop — may cause use-after-free on next iteration"
+- Alloc+free within same iteration: accepted (each iteration starts fresh)
 
 ### Case 3: Wrong pool — type matches but source differs
 
@@ -297,7 +299,8 @@ HandleInfo/PathState structs         ~50
 AST walker (recursive)              ~150
 Typestate transitions (alloc/free)   ~80
 Path forking at branches             ~60
-Bounded loop unrolling               ~80
+Loop single-pass analysis             ~40
+Handle param registration             ~20
 Error reporting with path info       ~50
 --------------------------------------------
 TOTAL                               ~470

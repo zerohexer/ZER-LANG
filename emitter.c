@@ -1856,8 +1856,10 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
     case TYNODE_ARRAY: {
         Type *elem = resolve_type_for_emit(e, tn->array.elem);
         uint32_t size = 0;
-        if (tn->array.size_expr && tn->array.size_expr->kind == NODE_INT_LIT)
-            size = (uint32_t)tn->array.size_expr->int_lit.value;
+        if (tn->array.size_expr) {
+            int64_t val = eval_const_expr(tn->array.size_expr);
+            if (val > 0) size = (uint32_t)val;
+        }
         return type_array(e->arena, elem, size);
     }
     case TYNODE_SLICE: {
@@ -1892,15 +1894,19 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
     case TYNODE_POOL: {
         Type *elem = resolve_type_for_emit(e, tn->pool.elem);
         uint32_t count = 0;
-        if (tn->pool.count_expr && tn->pool.count_expr->kind == NODE_INT_LIT)
-            count = (uint32_t)tn->pool.count_expr->int_lit.value;
+        if (tn->pool.count_expr) {
+            int64_t val = eval_const_expr(tn->pool.count_expr);
+            if (val > 0) count = (uint32_t)val;
+        }
         return type_pool(e->arena, elem, count);
     }
     case TYNODE_RING: {
         Type *elem = resolve_type_for_emit(e, tn->ring.elem);
         uint32_t count = 0;
-        if (tn->ring.count_expr && tn->ring.count_expr->kind == NODE_INT_LIT)
-            count = (uint32_t)tn->ring.count_expr->int_lit.value;
+        if (tn->ring.count_expr) {
+            int64_t val = eval_const_expr(tn->ring.count_expr);
+            if (val > 0) count = (uint32_t)val;
+        }
         return type_ring(e->arena, elem, count);
     }
     case TYNODE_FUNC_PTR: {

@@ -73,6 +73,22 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-121: Array/Pool/Ring size expressions silently evaluate to 0
+- **Symptom:** `u8[4 * 256] buf` emits `uint8_t buf[0]`. `Pool(T, 4 + 4)` creates pool with 0 slots. Any size expression that isn't a bare int literal silently becomes 0.
+- **Root cause:** Both checker and emitter only accepted `NODE_INT_LIT` for size expressions. Binary expressions (`4 * 256`, `512 + 512`) fell through with size=0.
+- **Fix:** Added `eval_const_expr()` in `ast.h` (shared between checker and emitter). Recursively evaluates `+`, `-`, `*`, `/`, `%`, `<<`, `>>`, `&`, `|` on integer literals. Fixed in checker's `resolve_type` AND emitter's `resolve_type_for_emit` (the emitter had its own duplicate type resolver with the same bug).
+- **Test:** `test_emit.c` — `u8[4*256]` and `u32[512+512]` both work correctly.
+
+### BUG-122: Dangling slice via assignment — local array to global slice
+- **Symptom:** `[]u8 g; void f() { u8[64] b; g = b; }` — implicit array-to-slice coercion in assignment to global variable. Slice dangles after function returns. No compiler error.
+- **Root cause:** Scope escape check in NODE_ASSIGN only caught `&local` (NODE_UNARY+TOK_AMP). Implicit array-to-slice coercion (NODE_IDENT with TYPE_ARRAY) bypassed the check.
+- **Fix:** Added check: if target is global/static TYPE_SLICE and value is local TYPE_ARRAY, error. Mirrors BUG-120 logic (return path) but for assignment path.
+- **Test:** `test_checker_full.c` — local array to global slice → error.
+
+### BUG-123: zer-check-design.md claims bounded loop unrolling (not implemented)
+- **Symptom:** Design doc describes "Bounded loop unrolling: Unroll to pool capacity" but actual implementation does single-pass must-analysis.
+- **Fix:** Updated zer-check-design.md to reflect actual implementation: single-pass loop analysis, not bounded unrolling.
+
 ### BUG-119: Bounds check double-evaluates index with side effects
 - **Symptom:** `arr[next_idx()] = 42` — `next_idx()` called twice (once for bounds check, once for access). Side effects execute twice, and bounds check validates a different index than the one written to.
 - **Root cause:** Inline comma operator pattern `(_zer_bounds_check(idx, ...), arr)[idx]` evaluates `idx` expression twice.

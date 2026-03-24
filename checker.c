@@ -228,6 +228,8 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     return false;
 }
 
+/* eval_const_expr() is defined in ast.h (shared with emitter) */
+
 /* ================================================================
  * TYPE RESOLUTION: TypeNode (syntactic) → Type (semantic)
  * ================================================================ */
@@ -279,10 +281,17 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
         if (size_type && !type_is_integer(size_type)) {
             checker_error(c, tn->loc.line, "array size must be an integer");
         }
-        /* for now, extract int literal value directly */
+        /* evaluate compile-time constant size expression */
         uint32_t size = 0;
-        if (tn->array.size_expr && tn->array.size_expr->kind == NODE_INT_LIT) {
-            size = (uint32_t)tn->array.size_expr->int_lit.value;
+        if (tn->array.size_expr) {
+            int64_t val = eval_const_expr(tn->array.size_expr);
+            if (val > 0) {
+                size = (uint32_t)val;
+            } else if (val == 0) {
+                checker_error(c, tn->loc.line, "array size must be > 0");
+            } else {
+                checker_error(c, tn->loc.line, "array size must be a compile-time constant");
+            }
         }
         return type_array(c->arena, elem, size);
     }
@@ -301,8 +310,10 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
     case TYNODE_POOL: {
         Type *elem = resolve_type(c, tn->pool.elem);
         uint32_t count = 0;
-        if (tn->pool.count_expr && tn->pool.count_expr->kind == NODE_INT_LIT) {
-            count = (uint32_t)tn->pool.count_expr->int_lit.value;
+        if (tn->pool.count_expr) {
+            int64_t val = eval_const_expr(tn->pool.count_expr);
+            if (val > 0) count = (uint32_t)val;
+            else checker_error(c, tn->loc.line, "Pool count must be a positive compile-time constant");
         }
         return type_pool(c->arena, elem, count);
     }
@@ -310,8 +321,10 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
     case TYNODE_RING: {
         Type *elem = resolve_type(c, tn->ring.elem);
         uint32_t count = 0;
-        if (tn->ring.count_expr && tn->ring.count_expr->kind == NODE_INT_LIT) {
-            count = (uint32_t)tn->ring.count_expr->int_lit.value;
+        if (tn->ring.count_expr) {
+            int64_t val = eval_const_expr(tn->ring.count_expr);
+            if (val > 0) count = (uint32_t)val;
+            else checker_error(c, tn->loc.line, "Ring count must be a positive compile-time constant");
         }
         return type_ring(c->arena, elem, count);
     }
@@ -663,6 +676,39 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* propagate arena-derived flag to target (alias tracking) */
                     if (target_sym && !target_is_global) {
                         target_sym->is_arena_derived = true;
+                    }
+                }
+            }
+        }
+
+        /* scope escape: assigning local array to global slice (implicit coercion) */
+        if (node->assign.op == TOK_EQ &&
+            target && target->kind == TYPE_SLICE &&
+            value && value->kind == TYPE_ARRAY &&
+            node->assign.value->kind == NODE_IDENT) {
+            const char *vname = node->assign.value->ident.name;
+            uint32_t vlen = (uint32_t)node->assign.value->ident.name_len;
+            Symbol *val_sym = scope_lookup(c->current_scope, vname, vlen);
+            bool val_is_global = val_sym &&
+                scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+            if (val_sym && !val_sym->is_static && !val_is_global) {
+                /* check if target is global/static */
+                Node *root = node->assign.target;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    Symbol *tgt_sym = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    bool tgt_is_global = tgt_sym &&
+                        (tgt_sym->is_static ||
+                         scope_lookup_local(c->global_scope, tgt_sym->name, tgt_sym->name_len) != NULL);
+                    if (tgt_is_global) {
+                        checker_error(c, node->loc.line,
+                            "cannot store local array '%.*s' in global/static slice — "
+                            "pointer will dangle after function returns",
+                            (int)vlen, vname);
                     }
                 }
             }

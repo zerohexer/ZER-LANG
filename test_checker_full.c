@@ -767,6 +767,12 @@ static void test_security_review(void) {
        "[]u8 f() { return g_buf; }\n",
        "return global array as slice (valid)");
 
+    /* BUG-122: dangling slice via assignment */
+    printf("[BUG-122: local array → global slice assignment]\n");
+    err("[]u8 g;\n"
+        "void f() { u8[64] b; g = b; }\n",
+        "local array to global slice assignment → error");
+
     /* BUG-114: switch exhaustiveness on distinct enum */
     printf("[BUG-114: switch on distinct enum]\n");
     err("enum Color { red, green, blue }\n"

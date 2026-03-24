@@ -312,7 +312,13 @@ Not just emit_type — also: checker NODE_FIELD (struct/union/pointer dispatch),
 **16. `arena.alloc()` AND `arena.alloc_slice()` both set `is_arena_derived`.**
 The detection checks `mlen == 5 "alloc" || mlen == 11 "alloc_slice"`. Both results are tracked for escape to global/static. Propagates through aliases (var-decl init + assignment).
 
-**17. `[]bool` maps to `_zer_slice_u8` / `_zer_opt_slice_u8`.**
+**17. Emitter has its OWN `resolve_type_for_emit()` — must stay in sync with checker.**
+The emitter re-resolves TypeNodes independently from the checker. Any fix to type resolution in checker.c MUST also be applied to `resolve_type_for_emit()` in emitter.c. Shared code (like `eval_const_expr`) goes in `ast.h`. This caused BUG-121 (constant folding fixed in checker but not emitter).
+
+**18. `eval_const_expr()` in `ast.h` — shared constant folder.**
+Evaluates compile-time integer expressions (+, -, *, /, %, <<, >>, &, |, unary -). Used by both checker (array/pool/ring size resolution) and emitter (resolve_type_for_emit). Without this, `u8[4 * 256]` silently becomes `u8[0]`.
+
+**19. `[]bool` maps to `_zer_slice_u8` / `_zer_opt_slice_u8`.**
 TYPE_BOOL must be handled in emit_type(TYPE_SLICE), emit_type(TYPE_OPTIONAL > TYPE_SLICE), and NODE_SLICE expression emission. Bool is uint8_t in C — uses the same slice typedef as u8.
 
 ## Spawning Agents That Write ZER Code — MANDATORY

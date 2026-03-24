@@ -135,8 +135,11 @@ static void test_s5_const_coercion(void) {
     printf("[§5 const coercion]\n");
     ok("void read_only(const []u8 d) { }\nvoid f() { u8[64] buf; read_only(buf); }",
        "mutable → const OK");
-    /* dropping const — should reject */
-    /* Note: const is on the slice/pointer, not easily testable without const vars */
+    /* dropping const — const slice → mutable param rejected */
+    err("void mutate([]u8 d) { }\nvoid f() { const []u8 s = \"hi\"; mutate(s); }",
+        "const slice → mutable param REJECT");
+    err("void mutate([]u8 d) { }\nvoid f() { mutate(\"hi\"); }",
+        "string literal → mutable param REJECT");
 }
 
 static void test_s5_typedef(void) {

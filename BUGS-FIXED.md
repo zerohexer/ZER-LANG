@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-139: `if (optional)` emits struct as C boolean — GCC rejects
+- **Symptom:** `if (val)` where `val` is `?u32` emits `if (val)` in C — but val is a struct. GCC: "used struct type value where scalar is required."
+- **Fix:** Emitter regular-if and while paths check if condition is non-null-sentinel optional → emit `.has_value`.
+
+### BUG-140: Const type not propagated from `const []u8` var to Type
+- **Symptom:** `const []u8 msg = "hello"; mutate(msg)` passes checker because `is_const` is only on Symbol, not on the slice Type.
+- **Fix:** In NODE_VAR_DECL and NODE_GLOBAL_VAR, when `is_const` is true and type is slice/pointer, create a const-qualified Type.
+
 ### BUG-137: Ring buffer overwrite doesn't advance tail pointer
 - **Symptom:** After overwriting a full ring, `pop()` returns newest item (40) instead of oldest (20).
 - **Fix:** `_zer_ring_push` now takes `tail` param, advances it when buffer is full.

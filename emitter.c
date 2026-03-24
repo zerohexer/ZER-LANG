@@ -1555,9 +1555,14 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit(e, "}\n");
         } else {
             /* regular if */
+            Type *cond_t = checker_get_type(node->if_stmt.cond);
+            bool cond_is_struct_opt = cond_t &&
+                cond_t->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(cond_t->optional.inner);
             emit_indent(e);
             emit(e, "if (");
             emit_expr(e, node->if_stmt.cond);
+            if (cond_is_struct_opt) emit(e, ".has_value");
             emit(e, ") ");
             emit_stmt(e, node->if_stmt.then_body);
             if (node->if_stmt.else_body) {
@@ -1600,9 +1605,14 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_WHILE: {
         int saved_loop_base = e->loop_defer_base;
         e->loop_defer_base = e->defer_stack.count;
+        Type *while_cond_t = checker_get_type(node->while_stmt.cond);
+        bool while_is_struct_opt = while_cond_t &&
+            while_cond_t->kind == TYPE_OPTIONAL &&
+            !is_null_sentinel(while_cond_t->optional.inner);
         emit_indent(e);
         emit(e, "while (");
         emit_expr(e, node->while_stmt.cond);
+        if (while_is_struct_opt) emit(e, ".has_value");
         emit(e, ") ");
         emit_stmt(e, node->while_stmt.body);
         e->loop_defer_base = saved_loop_base;

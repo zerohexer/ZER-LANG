@@ -955,6 +955,22 @@ static Type *check_expr(Checker *c, Node *node) {
                             i + 1);
                     }
 
+                    /* const safety: reject const slice/pointer → mutable param */
+                    if (arg && param) {
+                        if (arg->kind == TYPE_SLICE && param->kind == TYPE_SLICE &&
+                            arg->slice.is_const && !param->slice.is_const) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass const slice to mutable parameter",
+                                i + 1);
+                        }
+                        if (arg->kind == TYPE_POINTER && param->kind == TYPE_POINTER &&
+                            arg->pointer.is_const && !param->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass const pointer to mutable parameter",
+                                i + 1);
+                        }
+                    }
+
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&
                         !is_literal_compatible(node->call.args[i], param)) {
@@ -1584,6 +1600,14 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        /* propagate const from var qualifier to slice/pointer type */
+        if (node->var_decl.is_const && type) {
+            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
+                type = type_const_slice(c->arena, type->slice.inner);
+            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
+                type = type_const_pointer(c->arena, type->pointer.inner);
+            }
+        }
         typemap_set(node, type); /* store for emitter to read via checker_get_type */
 
         if (node->var_decl.init) {
@@ -2254,6 +2278,14 @@ static void register_decl(Checker *c, Node *node) {
 
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        /* propagate const from var qualifier to slice/pointer type */
+        if (node->var_decl.is_const && type) {
+            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
+                type = type_const_slice(c->arena, type->slice.inner);
+            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
+                type = type_const_pointer(c->arena, type->pointer.inner);
+            }
+        }
         Symbol *sym = add_symbol(c, node->var_decl.name,
                                  (uint32_t)node->var_decl.name_len,
                                  type, node->loc.line);

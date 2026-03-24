@@ -1702,14 +1702,14 @@ int main(void) {
         0,
         "u8[1] buf, set to 0, read back = 0");
 
-    printf("[string literal passed to function]\n");
+    printf("[string literal passed to const param]\n");
     test_compile_only(
-        "void process([]u8 msg) { }\n"
+        "void process(const []u8 msg) { }\n"
         "void start() {\n"
         "    const []u8 s = \"hello\";\n"
         "    process(s);\n"
         "}\n",
-        "function taking []u8 param, passing const string literal");
+        "const []u8 var → const []u8 param — OK");
 
     /* ================================================================
      * Switch on larger enum
@@ -2410,6 +2410,82 @@ int main(void) {
         "}\n",
         3,
         "[]bool param + slice expression → count 3 trues");
+
+    /* BUG-139: if(optional) without capture — struct optional needs .has_value */
+    printf("[if(optional) bare condition — BUG-139]\n");
+    test_compile_and_run(
+        "?u32 maybe(u32 x) {\n"
+        "    if (x > 0) { return x; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    ?u32 a = maybe(5);\n"
+        "    ?u32 b = maybe(0);\n"
+        "    u32 result = 0;\n"
+        "    if (a) { result += 10; }\n"
+        "    if (b) { result += 100; }\n"
+        "    return result;\n"
+        "}\n",
+        10,
+        "if(?u32 some) → true, if(?u32 none) → false");
+
+    test_compile_and_run(
+        "?u32 maybe(u32 x) {\n"
+        "    if (x > 0) { return x; }\n"
+        "    return null;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    ?u32 a = maybe(5);\n"
+        "    ?u32 b = maybe(0);\n"
+        "    u32 result = 0;\n"
+        "    if (a) { result += 10; }\n"
+        "    else { result += 1; }\n"
+        "    if (b) { result += 100; }\n"
+        "    else { result += 2; }\n"
+        "    return result;\n"
+        "}\n",
+        12,
+        "if(?u32) with else branches — 10 + 2 = 12");
+
+    /* Const type system — v0.1.2 */
+    printf("[const []u8 → const []u8 param]\n");
+    test_compile_and_run(
+        "u32 reader(const []u8 data) {\n"
+        "    return @truncate(u32, data[0]);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    const []u8 msg = \"hello\";\n"
+        "    return reader(msg);\n"
+        "}\n",
+        104,
+        "const slice → const param = 'h' (104)");
+
+    printf("[mutable []u8 → const []u8 param]\n");
+    test_compile_and_run(
+        "u32 reader(const []u8 data) {\n"
+        "    return @truncate(u32, data[0]);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u8[3] buf;\n"
+        "    buf[0] = 42;\n"
+        "    []u8 s = buf[0..3];\n"
+        "    return reader(s);\n"
+        "}\n",
+        42,
+        "mutable slice → const param = 42");
+
+    printf("[array → const []u8 param]\n");
+    test_compile_and_run(
+        "u32 reader(const []u8 data) {\n"
+        "    return @truncate(u32, data[0]);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u8[3] buf;\n"
+        "    buf[0] = 55;\n"
+        "    return reader(buf);\n"
+        "}\n",
+        55,
+        "array → const slice param = 55");
 
     /* cleanup temp files */
     remove("_zer_test_out.c");

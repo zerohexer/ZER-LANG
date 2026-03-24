@@ -23,6 +23,22 @@ static void emit(Emitter *e, const char *fmt, ...) {
     va_end(args);
 }
 
+/* emit a user-defined type name with optional module prefix for namespace mangling.
+ * If prefix is set: emits "prefix_name". If NULL: emits "name". */
+static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
+                           const char *name, uint32_t name_len) {
+    if (prefix && prefix_len > 0) {
+        fprintf(e->out, "%.*s_%.*s", (int)prefix_len, prefix, (int)name_len, name);
+    } else {
+        fprintf(e->out, "%.*s", (int)name_len, name);
+    }
+}
+
+/* convenience: emit struct/union/enum name from Type with module prefix */
+#define EMIT_STRUCT_NAME(e, t) emit_user_name(e, (t)->struct_type.module_prefix, (t)->struct_type.module_prefix_len, (t)->struct_type.name, (t)->struct_type.name_len)
+#define EMIT_UNION_NAME(e, t)  emit_user_name(e, (t)->union_type.module_prefix, (t)->union_type.module_prefix_len, (t)->union_type.name, (t)->union_type.name_len)
+#define EMIT_ENUM_NAME(e, t)   emit_user_name(e, (t)->enum_type.module_prefix, (t)->enum_type.module_prefix_len, (t)->enum_type.name, (t)->enum_type.name_len)
+
 /* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
 static inline bool is_null_sentinel(Type *inner) {
@@ -116,14 +132,12 @@ static void emit_type(Emitter *e, Type *t) {
             emit(e, "_zer_opt_u32");  /* handles are uint32_t */
             break;
         case TYPE_STRUCT:
-            emit(e, "_zer_opt_%.*s",
-                 (int)opt_inner->struct_type.name_len,
-                 opt_inner->struct_type.name);
+            emit(e, "_zer_opt_");
+            EMIT_STRUCT_NAME(e, opt_inner);
             break;
         case TYPE_UNION:
-            emit(e, "_zer_opt_%.*s",
-                 (int)opt_inner->union_type.name_len,
-                 opt_inner->union_type.name);
+            emit(e, "_zer_opt_");
+            EMIT_UNION_NAME(e, opt_inner);
             break;
         case TYPE_SLICE: {
             /* ?[]T → _zer_opt_slice_T — unwrap distinct on element type */
@@ -142,12 +156,12 @@ static void emit_type(Emitter *e, Type *t) {
             case TYPE_F32:   emit(e, "_zer_opt_slice_f32"); break;
             case TYPE_F64:   emit(e, "_zer_opt_slice_f64"); break;
             case TYPE_STRUCT:
-                emit(e, "_zer_opt_slice_%.*s",
-                     (int)elem->struct_type.name_len, elem->struct_type.name);
+                emit(e, "_zer_opt_slice_");
+                EMIT_STRUCT_NAME(e, elem);
                 break;
             case TYPE_UNION:
-                emit(e, "_zer_opt_slice_%.*s",
-                     (int)elem->union_type.name_len, elem->union_type.name);
+                emit(e, "_zer_opt_slice_");
+                EMIT_UNION_NAME(e, elem);
                 break;
             default:
                 emit(e, "struct { ");
@@ -183,14 +197,12 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_F32:   emit(e, "_zer_slice_f32"); break;
         case TYPE_F64:   emit(e, "_zer_slice_f64"); break;
         case TYPE_STRUCT:
-            emit(e, "_zer_slice_%.*s",
-                 (int)sl_inner->struct_type.name_len,
-                 sl_inner->struct_type.name);
+            emit(e, "_zer_slice_");
+            EMIT_STRUCT_NAME(e, sl_inner);
             break;
         case TYPE_UNION:
-            emit(e, "_zer_slice_%.*s",
-                 (int)sl_inner->union_type.name_len,
-                 sl_inner->union_type.name);
+            emit(e, "_zer_slice_");
+            EMIT_UNION_NAME(e, sl_inner);
             break;
         default:
             emit(e, "struct { ");
@@ -206,7 +218,8 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_STRUCT:
-        emit(e, "struct %.*s", (int)t->struct_type.name_len, t->struct_type.name);
+        emit(e, "struct ");
+        EMIT_STRUCT_NAME(e, t);
         break;
 
     case TYPE_ENUM:
@@ -214,7 +227,8 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_UNION:
-        emit(e, "struct _union_%.*s", (int)t->union_type.name_len, t->union_type.name);
+        emit(e, "struct _union_");
+        EMIT_UNION_NAME(e, t);
         break;
 
     case TYPE_HANDLE:
@@ -226,10 +240,9 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_POOL:
-        emit(e, "struct _zer_pool_%.*s_%llu",
-             (int)t->pool.elem->struct_type.name_len,
-             t->pool.elem->struct_type.name,
-             (unsigned long long)t->pool.count);
+        emit(e, "struct _zer_pool_");
+        EMIT_STRUCT_NAME(e, t->pool.elem);
+        emit(e, "_%llu", (unsigned long long)t->pool.count);
         break;
 
     case TYPE_RING:
@@ -842,8 +855,9 @@ static void emit_expr(Emitter *e, Node *node) {
             if (sym) obj_type = sym->type;
         }
         if (obj_type && obj_type->kind == TYPE_ENUM) {
-            emit(e, "_ZER_%.*s_%.*s",
-                 (int)obj_type->enum_type.name_len, obj_type->enum_type.name,
+            emit(e, "_ZER_");
+            EMIT_ENUM_NAME(e, obj_type);
+            emit(e, "_%.*s",
                  (int)node->field.field_name_len, node->field.field_name);
             break;
         }
@@ -1043,12 +1057,14 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "((%s){ ", sname);
                 slice_type_emitted = true;
             } else if (eff_elem->kind == TYPE_STRUCT) {
-                emit(e, "((_zer_slice_%.*s){ ",
-                     (int)eff_elem->struct_type.name_len, eff_elem->struct_type.name);
+                emit(e, "((_zer_slice_");
+                EMIT_STRUCT_NAME(e, eff_elem);
+                emit(e, "){ ");
                 slice_type_emitted = true;
             } else if (eff_elem->kind == TYPE_UNION) {
-                emit(e, "((_zer_slice_%.*s){ ",
-                     (int)eff_elem->union_type.name_len, eff_elem->union_type.name);
+                emit(e, "((_zer_slice_");
+                EMIT_UNION_NAME(e, eff_elem);
+                emit(e, "){ ");
                 slice_type_emitted = true;
             }
         }
@@ -2017,9 +2033,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "if (");
                 for (int j = 0; j < arm->value_count; j++) {
                     if (j > 0) emit(e, " || ");
-                    emit(e, "_zer_swp%d->_tag == _ZER_%.*s_TAG_%.*s",
-                         sw_tmp,
-                         (int)sw_type->union_type.name_len, sw_type->union_type.name,
+                    emit(e, "_zer_swp%d->_tag == _ZER_", sw_tmp);
+                    EMIT_UNION_NAME(e, sw_type);
+                    emit(e, "_TAG_%.*s",
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
                 }
                 emit(e, ") ");
@@ -2029,9 +2045,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "if (");
                 for (int j = 0; j < arm->value_count; j++) {
                     if (j > 0) emit(e, " || ");
-                    emit(e, "_zer_sw%d == _ZER_%.*s_%.*s",
-                         sw_tmp,
-                         (int)sw_type->enum_type.name_len, sw_type->enum_type.name,
+                    emit(e, "_zer_sw%d == _ZER_", sw_tmp);
+                    EMIT_ENUM_NAME(e, sw_type);
+                    emit(e, "_%.*s",
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
                 }
                 emit(e, ") ");
@@ -2224,16 +2240,20 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
  * ================================================================ */
 
 static void emit_struct_decl(Emitter *e, Node *node) {
+    Type *st = checker_get_type(node);
     if (node->struct_decl.is_packed) {
-        emit(e, "struct __attribute__((packed)) %.*s {\n",
-             (int)node->struct_decl.name_len, node->struct_decl.name);
+        emit(e, "struct __attribute__((packed)) ");
+        if (st) EMIT_STRUCT_NAME(e, st);
+        else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+        emit(e, " {\n");
     } else {
-        emit(e, "struct %.*s {\n",
-             (int)node->struct_decl.name_len, node->struct_decl.name);
+        emit(e, "struct ");
+        if (st) EMIT_STRUCT_NAME(e, st);
+        else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+        emit(e, " {\n");
     }
     e->indent++;
     {
-    Type *st = checker_get_type(node);
     for (int i = 0; i < node->struct_decl.field_count; i++) {
         FieldDecl *f = &node->struct_decl.fields[i];
         Type *ftype = (st && st->kind == TYPE_STRUCT &&
@@ -2251,17 +2271,29 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     e->indent--;
     emit(e, "};\n");
     /* emit optional typedef for this struct */
-    emit(e, "typedef struct { struct %.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
-         (int)node->struct_decl.name_len, node->struct_decl.name,
-         (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, "typedef struct { struct ");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, " value; uint8_t has_value; } _zer_opt_");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, ";\n");
     /* emit slice typedef for this struct */
-    emit(e, "typedef struct { struct %.*s* ptr; size_t len; } _zer_slice_%.*s;\n",
-         (int)node->struct_decl.name_len, node->struct_decl.name,
-         (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, "typedef struct { struct ");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, "* ptr; size_t len; } _zer_slice_");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, ";\n");
     /* emit optional-slice typedef for this struct */
-    emit(e, "typedef struct { _zer_slice_%.*s value; uint8_t has_value; } _zer_opt_slice_%.*s;\n\n",
-         (int)node->struct_decl.name_len, node->struct_decl.name,
-         (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, "typedef struct { _zer_slice_");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, ";\n\n");
 }
 
 static void emit_func_decl(Emitter *e, Node *node) {
@@ -2593,17 +2625,22 @@ void emit_file(Emitter *e, Node *file_node) {
 
         case NODE_UNION_DECL: {
             /* tagged union → struct with tag + anonymous union */
+            Type *ut = checker_get_type(decl);
             emit(e, "/* tagged union %.*s */\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name);
             /* tag constants */
             for (int j = 0; j < decl->union_decl.variant_count; j++) {
                 UnionVariant *v = &decl->union_decl.variants[j];
-                emit(e, "#define _ZER_%.*s_TAG_%.*s %d\n",
-                     (int)decl->union_decl.name_len, decl->union_decl.name,
+                emit(e, "#define _ZER_");
+                if (ut) EMIT_UNION_NAME(e, ut);
+                else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+                emit(e, "_TAG_%.*s %d\n",
                      (int)v->name_len, v->name, j);
             }
-            emit(e, "struct _union_%.*s {\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "struct _union_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, " {\n");
             emit(e, "    int32_t _tag;\n");
             emit(e, "    union {\n");
             for (int j = 0; j < decl->union_decl.variant_count; j++) {
@@ -2616,22 +2653,35 @@ void emit_file(Emitter *e, Node *file_node) {
             emit(e, "    };\n");
             emit(e, "};\n");
             /* emit optional typedef for this union */
-            emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name,
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "typedef struct { struct _union_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, " value; uint8_t has_value; } _zer_opt_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, ";\n");
             /* emit slice typedef for this union */
-            emit(e, "typedef struct { struct _union_%.*s* ptr; size_t len; } _zer_slice_%.*s;\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name,
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "typedef struct { struct _union_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "* ptr; size_t len; } _zer_slice_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, ";\n");
             /* emit optional-slice typedef for this union */
-            emit(e, "typedef struct { _zer_slice_%.*s value; uint8_t has_value; } _zer_opt_slice_%.*s;\n\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name,
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "typedef struct { _zer_slice_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, ";\n\n");
             break;
         }
 
         case NODE_ENUM_DECL: {
             /* emit as #define constants — use explicit values if provided */
+            Type *et = checker_get_type(decl);
             emit(e, "/* enum %.*s */\n",
                  (int)decl->enum_decl.name_len, decl->enum_decl.name);
             int32_t next_val = 0;
@@ -2649,8 +2699,10 @@ void emit_file(Emitter *e, Node *file_node) {
                 } else {
                     val = next_val++;
                 }
-                emit(e, "#define _ZER_%.*s_%.*s %d\n",
-                     (int)decl->enum_decl.name_len, decl->enum_decl.name,
+                emit(e, "#define _ZER_");
+                if (et) EMIT_ENUM_NAME(e, et);
+                else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
+                emit(e, "_%.*s %d\n",
                      (int)v->name_len, v->name, val);
             }
             emit(e, "\n");
@@ -2708,6 +2760,7 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
         case NODE_STRUCT_DECL: emit_struct_decl(e, decl); break;
 
         case NODE_ENUM_DECL: {
+            Type *et = checker_get_type(decl);
             emit(e, "/* enum %.*s */\n",
                  (int)decl->enum_decl.name_len, decl->enum_decl.name);
             int32_t next_val = 0;
@@ -2725,8 +2778,10 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
                 } else {
                     val = next_val++;
                 }
-                emit(e, "#define _ZER_%.*s_%.*s %d\n",
-                     (int)decl->enum_decl.name_len, decl->enum_decl.name,
+                emit(e, "#define _ZER_");
+                if (et) EMIT_ENUM_NAME(e, et);
+                else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
+                emit(e, "_%.*s %d\n",
                      (int)v->name_len, v->name, val);
             }
             emit(e, "\n");
@@ -2734,18 +2789,22 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
         }
 
         case NODE_UNION_DECL: {
+            Type *ut = checker_get_type(decl);
             emit(e, "/* tagged union %.*s */\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name);
             for (int j = 0; j < decl->union_decl.variant_count; j++) {
                 UnionVariant *v = &decl->union_decl.variants[j];
-                emit(e, "#define _ZER_%.*s_TAG_%.*s %d\n",
-                     (int)decl->union_decl.name_len, decl->union_decl.name,
+                emit(e, "#define _ZER_");
+                if (ut) EMIT_UNION_NAME(e, ut);
+                else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+                emit(e, "_TAG_%.*s %d\n",
                      (int)v->name_len, v->name, j);
             }
-            emit(e, "struct _union_%.*s {\n    int32_t _tag;\n    union {\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "struct _union_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, " {\n    int32_t _tag;\n    union {\n");
             {
-            Type *ut = checker_get_type(decl);
             for (int j = 0; j < decl->union_decl.variant_count; j++) {
                 UnionVariant *v = &decl->union_decl.variants[j];
                 Type *vtype = (ut && ut->kind == TYPE_UNION &&
@@ -2757,15 +2816,30 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
             }
             }
             emit(e, "    };\n};\n");
-            emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name,
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, "typedef struct { struct _union_%.*s* ptr; size_t len; } _zer_slice_%.*s;\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name,
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, "typedef struct { _zer_slice_%.*s value; uint8_t has_value; } _zer_opt_slice_%.*s;\n\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name,
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
+            /* emit optional typedef for this union */
+            emit(e, "typedef struct { struct _union_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, " value; uint8_t has_value; } _zer_opt_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, ";\n");
+            /* emit slice typedef for this union */
+            emit(e, "typedef struct { struct _union_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "* ptr; size_t len; } _zer_slice_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, ";\n");
+            /* emit optional-slice typedef for this union */
+            emit(e, "typedef struct { _zer_slice_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, ";\n\n");
             break;
         }
 

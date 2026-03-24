@@ -277,12 +277,19 @@ int main(int argc, char **argv) {
     Checker checker;
     checker_init(&checker, &cc.arena, input_path);
 
-    /* register imported modules first (so their types are in scope for main) */
+    /* register imported modules first (so their types are in scope for main)
+     * Set module prefix for each — enables name mangling in emitter */
     for (int i = 1; i < cc.module_count; i++) {
         Module *m = &cc.modules[i];
-        if (m->ast) checker_register_file(&checker, m->ast);
+        if (m->ast) {
+            checker.current_module = m->name;
+            checker.current_module_len = (uint32_t)strlen(m->name);
+            checker_register_file(&checker, m->ast);
+        }
     }
-    /* register main module last */
+    /* register main module last — no prefix */
+    checker.current_module = NULL;
+    checker.current_module_len = 0;
     if (main_mod->ast) checker_register_file(&checker, main_mod->ast);
 
     /* type-check imported module bodies (declarations already registered) */

@@ -724,6 +724,9 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-193: cross-module type collision */
+    /* tested via module tests — collision_test.zer gives helpful error */
+
     /* BUG-191: duplicate struct field names */
     err("struct S { u32 x; u32 x; }",
         "duplicate field 'x' in struct REJECT");

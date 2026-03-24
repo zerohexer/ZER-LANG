@@ -73,6 +73,10 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-193: Multi-module type name collision — unhelpful error
+- **Symptom:** Two imported modules with same type name → "redefinition" error with no module info.
+- **Fix:** Checker detects cross-module collision and reports: "name collision: 'X' in module 'a' conflicts with 'X' in module 'b' — rename one." Emitter has module-prefix infrastructure ready for future per-module scoping.
+
 ### BUG-191: Duplicate struct/union field/variant names not caught
 - **Symptom:** `struct S { u32 x; u32 x; }` passes checker, GCC rejects "duplicate member."
 - **Fix:** Field/variant registration loops check previous names for collision.

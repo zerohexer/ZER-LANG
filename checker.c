@@ -108,6 +108,23 @@ static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
     Symbol *sym = scope_add(c->arena, c->current_scope, name, name_len,
                             type, line, c->file_name);
     if (!sym) {
+        /* check if this is a cross-module type collision — give helpful error */
+        Symbol *existing = scope_lookup(c->current_scope, name, name_len);
+        if (existing && existing->type && type && c->current_module) {
+            const char *existing_mod = NULL;
+            if (existing->type->kind == TYPE_STRUCT) existing_mod = existing->type->struct_type.module_prefix;
+            else if (existing->type->kind == TYPE_ENUM) existing_mod = existing->type->enum_type.module_prefix;
+            else if (existing->type->kind == TYPE_UNION) existing_mod = existing->type->union_type.module_prefix;
+
+            if (existing_mod != c->current_module) {
+                checker_error(c, line,
+                    "name collision: '%.*s' defined in module '%s' conflicts with "
+                    "'%.*s' in module '%s' — rename one to avoid conflict",
+                    (int)name_len, name, c->current_module,
+                    (int)name_len, name, existing_mod ? existing_mod : "main");
+                return existing;
+            }
+        }
         checker_error(c, line, "redefinition of '%.*s'", (int)name_len, name);
     }
     return sym;
@@ -2435,6 +2452,8 @@ static void register_decl(Checker *c, Node *node) {
         t->struct_type.name_len = (uint32_t)node->struct_decl.name_len;
         t->struct_type.is_packed = node->struct_decl.is_packed;
         t->struct_type.field_count = (uint32_t)node->struct_decl.field_count;
+        t->struct_type.module_prefix = c->current_module;
+        t->struct_type.module_prefix_len = c->current_module_len;
 
         add_symbol(c, node->struct_decl.name,
                    (uint32_t)node->struct_decl.name_len,
@@ -2473,6 +2492,8 @@ static void register_decl(Checker *c, Node *node) {
         t->enum_type.name = node->enum_decl.name;
         t->enum_type.name_len = (uint32_t)node->enum_decl.name_len;
         t->enum_type.variant_count = (uint32_t)node->enum_decl.variant_count;
+        t->enum_type.module_prefix = c->current_module;
+        t->enum_type.module_prefix_len = c->current_module_len;
 
         if (node->enum_decl.variant_count > 0) {
             t->enum_type.variants = (SEVariant *)arena_alloc(c->arena,
@@ -2513,6 +2534,8 @@ static void register_decl(Checker *c, Node *node) {
         t->union_type.name = node->union_decl.name;
         t->union_type.name_len = (uint32_t)node->union_decl.name_len;
         t->union_type.variant_count = (uint32_t)node->union_decl.variant_count;
+        t->union_type.module_prefix = c->current_module;
+        t->union_type.module_prefix_len = c->current_module_len;
 
         /* register before resolving variants (same as struct) */
         add_symbol(c, node->union_decl.name,

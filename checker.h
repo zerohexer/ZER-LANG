@@ -36,6 +36,8 @@ typedef struct {
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */
     uint32_t union_switch_var_len;
+    const char *current_module;   /* module name for prefix (NULL = main module) */
+    uint32_t current_module_len;
 
     /* diagnostic list — grows dynamically, read by LSP */
     Diagnostic *diagnostics;

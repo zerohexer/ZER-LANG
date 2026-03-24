@@ -96,6 +96,8 @@ struct Type {
             const char *name;
             uint32_t name_len;
             bool is_packed;
+            const char *module_prefix;  /* NULL for main module */
+            uint32_t module_prefix_len;
         } struct_type;
 
         /* TYPE_ENUM */
@@ -104,6 +106,8 @@ struct Type {
             uint32_t variant_count;
             const char *name;
             uint32_t name_len;
+            const char *module_prefix;
+            uint32_t module_prefix_len;
         } enum_type;
 
         /* TYPE_UNION */
@@ -112,6 +116,8 @@ struct Type {
             uint32_t variant_count;
             const char *name;
             uint32_t name_len;
+            const char *module_prefix;
+            uint32_t module_prefix_len;
         } union_type;
 
         /* TYPE_FUNC_PTR */

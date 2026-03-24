@@ -352,8 +352,11 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
                             total += (fw > 0) ? fw / 8 : 4; /* default 4 for pointers etc */
                         }
                         val = total > 0 ? total : -1;
-                    } else if (size_of->kind == TYPE_POINTER) {
-                        val = 4; /* 32-bit pointers */
+                    } else if (size_of->kind == TYPE_POINTER ||
+                               size_of->kind == TYPE_SLICE) {
+                        /* pointer/slice size = target pointer width */
+                        val = type_width(ty_usize) / 8;
+                        if (size_of->kind == TYPE_SLICE) val *= 2; /* ptr + len */
                     }
                 }
             }
@@ -658,6 +661,17 @@ static Type *check_expr(Checker *c, Node *node) {
                     (uint32_t)node->unary.operand->ident.name_len);
                 if (sym && sym->is_volatile) {
                     result->pointer.is_volatile = true;
+                }
+                /* BUG-208: block &union_var inside mutable capture arm.
+                 * Pointer alias would bypass the union switch lock. */
+                if (c->union_switch_var &&
+                    node->unary.operand->ident.name_len == c->union_switch_var_len &&
+                    memcmp(node->unary.operand->ident.name, c->union_switch_var,
+                           c->union_switch_var_len) == 0) {
+                    checker_error(c, node->loc.line,
+                        "cannot take address of union '%.*s' inside its switch arm — "
+                        "pointer alias would bypass variant lock",
+                        (int)c->union_switch_var_len, c->union_switch_var);
                 }
             }
             break;
@@ -2066,20 +2080,31 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-203: slice from local array — mark as local-derived.
-             * []T s = local_array creates a slice pointing to stack memory. */
-            if (node->var_decl.init &&
-                node->var_decl.init->kind == NODE_IDENT &&
-                type && type->kind == TYPE_SLICE) {
-                Type *init_type2 = checker_get_type(node->var_decl.init);
-                if (init_type2 && init_type2->kind == TYPE_ARRAY) {
-                    Symbol *src = scope_lookup(c->current_scope,
-                        node->var_decl.init->ident.name,
-                        (uint32_t)node->var_decl.init->ident.name_len);
-                    bool is_global = src && scope_lookup_local(c->global_scope,
-                        src->name, src->name_len) != NULL;
-                    if (src && !src->is_static && !is_global) {
-                        sym->is_local_derived = true;
+            /* BUG-203/207: slice from local array — mark as local-derived.
+             * []T s = local_array OR []T s = local_array[1..4]
+             * Both create a slice pointing to stack memory. */
+            if (node->var_decl.init && type && type->kind == TYPE_SLICE) {
+                Node *slice_root = node->var_decl.init;
+                /* walk through NODE_SLICE to find the object being sliced */
+                if (slice_root->kind == NODE_SLICE)
+                    slice_root = slice_root->slice.object;
+                /* walk field/index chains */
+                while (slice_root && (slice_root->kind == NODE_FIELD ||
+                                       slice_root->kind == NODE_INDEX)) {
+                    if (slice_root->kind == NODE_FIELD) slice_root = slice_root->field.object;
+                    else slice_root = slice_root->index_expr.object;
+                }
+                if (slice_root && slice_root->kind == NODE_IDENT) {
+                    Type *root_type = checker_get_type(slice_root);
+                    if (root_type && root_type->kind == TYPE_ARRAY) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            slice_root->ident.name,
+                            (uint32_t)slice_root->ident.name_len);
+                        bool is_global = src && scope_lookup_local(c->global_scope,
+                            src->name, src->name_len) != NULL;
+                        if (src && !src->is_static && !is_global) {
+                            sym->is_local_derived = true;
+                        }
                     }
                 }
             }

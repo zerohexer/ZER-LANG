@@ -1122,6 +1122,15 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-207: sub-slice from local array escape */
+    err("[]u8 bad() { u8[10] a; []u8 s = a[1..4]; return s; }",
+        "sub-slice from local array blocked");
+
+    /* BUG-208: union alias via &union_var blocked in switch capture */
+    err("struct A { u32 x; }\nstruct B { u32 y; }\nunion M { A a; B b; }\n"
+        "void f() { M m; m.a.x = 1; switch (m) { .a => |*v| { *M p = &m; } .b => |*v| { } } }",
+        "address-of union in switch arm rejected");
+
     /* BUG-204: orelse break in while(true) */
     err("?u32 mg() { return 5; }\n"
         "u32 bad() { while (true) { u32 x = mg() orelse break; return x; } }",

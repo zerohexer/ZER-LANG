@@ -73,6 +73,24 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-209: @cstr slice destination has no bounds check
+- **Symptom:** `@cstr(slice_dest, src)` emits raw memcpy with no overflow check when dest is a slice.
+- **Root cause:** BUG-152 added bounds check for TYPE_ARRAY destinations but skipped TYPE_SLICE.
+- **Fix:** For slice destinations, hoist slice into temp `_zer_cd`, use `.ptr` for memcpy and `.len` for bounds check: `if (src.len + 1 > dest.len) _zer_trap(...)`.
+- **Test:** Manual test — @cstr overflow on slice traps (exit 3), valid @cstr works.
+
+### BUG-208: Union switch lock bypassed via pointer alias (&union_var)
+- **Symptom:** `switch(msg) { .a => |*v| { *Msg alias = &msg; alias.b.y = 20; } }` — type confusion.
+- **Root cause:** Union lock only checked field access on the exact variable name. `&msg` created a pointer alias that bypassed the name check.
+- **Fix:** In `check_expr(NODE_UNARY/TOK_AMP)`, block `&union_var` when `union_switch_var` is active.
+- **Test:** `test_checker_full.c` — address-of union in switch arm rejected.
+
+### BUG-207: Sub-slice from local array escapes (BUG-203 bypass)
+- **Symptom:** `[]u8 s = local_arr[1..4]; return s;` — dangling slice. BUG-203 only checked `NODE_IDENT` init, not `NODE_SLICE`.
+- **Root cause:** Slice-from-local detection only matched `init->kind == NODE_IDENT`, missed `init->kind == NODE_SLICE`.
+- **Fix:** Walk through `NODE_SLICE` to find the object, then walk field/index chains to find root. If root is local array, mark `is_local_derived`.
+- **Test:** `test_checker_full.c` — sub-slice from local array blocked.
+
 ### BUG-206: orelse unwrap loses is_local_derived from expression
 - **Symptom:** `?*u32 maybe = &x; *u32 p = maybe orelse return; return p;` — returns dangling pointer. No error.
 - **Root cause:** Var-decl init flag propagation walked NODE_FIELD/NODE_INDEX but not NODE_ORELSE. The orelse expression's root symbol was never checked.

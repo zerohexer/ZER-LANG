@@ -1465,18 +1465,28 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @cstr(buf, slice) → memcpy + null terminate
              * Hoist both args to temps for single-eval */
             int tmp = e->temp_count++;
-            emit(e, "({ uint8_t *_zer_cb%d = (uint8_t*)", tmp);
-            if (node->intrinsic.arg_count > 0)
+            Type *buf_type = (node->intrinsic.arg_count > 0) ?
+                checker_get_type(node->intrinsic.args[0]) : NULL;
+            bool dest_is_slice = buf_type && buf_type->kind == TYPE_SLICE;
+            if (dest_is_slice) {
+                /* BUG-209: slice destination — hoist as slice, use .ptr */
+                emit(e, "({ __auto_type _zer_cd%d = ", tmp);
                 emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "; uint8_t *_zer_cb%d = (uint8_t*)_zer_cd%d.ptr", tmp, tmp);
+            } else {
+                emit(e, "({ uint8_t *_zer_cb%d = (uint8_t*)", tmp);
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+            }
             emit(e, "; __auto_type _zer_cs%d = ", tmp);
             if (node->intrinsic.arg_count > 1)
                 emit_expr(e, node->intrinsic.args[1]);
-            /* bounds check if destination is a fixed-size array */
-            Type *buf_type = (node->intrinsic.arg_count > 0) ?
-                checker_get_type(node->intrinsic.args[0]) : NULL;
             if (buf_type && buf_type->kind == TYPE_ARRAY) {
                 emit(e, "; if (_zer_cs%d.len + 1 > %llu) ",
                      tmp, (unsigned long long)buf_type->array.size);
+                emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
+            } else if (dest_is_slice) {
+                emit(e, "; if (_zer_cs%d.len + 1 > _zer_cd%d.len) ", tmp, tmp);
                 emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
             } else {
                 emit(e, "; ");

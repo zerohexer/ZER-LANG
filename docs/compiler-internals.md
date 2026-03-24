@@ -394,5 +394,9 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 34. **`?void` return with void expression** — `return do_stuff()` in `?void` function: emit void call as statement, then `return (_zer_opt_void){ 1 };` separately. Can't put void expression in compound literal initializer.
 35. **Compound shift `<<=`/`>>=` with side-effect targets** — `arr[func()] <<= 1` would double-eval func(). Detect via NODE_INDEX + NODE_CALL/NODE_ASSIGN on index, hoist target via pointer: `*({ auto *_p = &target; *_p = _zer_shl(*_p, n); })`.
 36. **Enum/union exhaustiveness supports >64 variants** — Uses `uint8_t[]` byte array (stack up to 256, arena for larger) instead of `uint64_t` bitmask.
+37. **Arena-derived propagates through assignment AND return walks chains** — `h.ptr = arena.alloc()` marks `h` as arena-derived. `return h.ptr` walks field/index chains to root `h` and checks the flag. Both var-decl and assignment paths detect `arena.alloc`/`arena.alloc_slice` including through orelse.
+38. **Division/modulo wrapped in zero-check trap** — `/` and `%` emit `({ auto _d = divisor; if (_d == 0) _zer_trap(...); (a / _d); })`. Same for `/=` and `%=`. Single-eval of divisor via GCC statement expression.
+39. **Integer literal range validation** — `is_literal_compatible` checks value fits target: u8 0-255, i8 -128..127, u16 0-65535, etc. Negative literals reject all unsigned types. Without this, GCC silently truncates.
+40. **Bit extraction high index validated against type width** — Checker NODE_SLICE checks constant `high < type_width(obj)`. Prevents reading junk bits beyond the type's bit width.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

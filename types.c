@@ -208,13 +208,16 @@ bool type_equals(Type *a, Type *b) {
         return true;
 
     /* pointer/optional/slice: recurse on inner.
-     * NOTE: const is on the Symbol (variable), not the Type.
-     * type_equals ignores const — use targeted checks for const safety. */
+     * const-aware: *const T != *T. This makes const checking work
+     * recursively through any depth of pointers/slices. The safe
+     * direction (mutable→const) is handled by can_implicit_coerce. */
     case TYPE_POINTER:
+        if (a->pointer.is_const != b->pointer.is_const) return false;
         return type_equals(a->pointer.inner, b->pointer.inner);
     case TYPE_OPTIONAL:
         return type_equals(a->optional.inner, b->optional.inner);
     case TYPE_SLICE:
+        if (a->slice.is_const != b->slice.is_const) return false;
         return type_equals(a->slice.inner, b->slice.inner);
 
     /* array: inner + size */

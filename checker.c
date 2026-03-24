@@ -1700,6 +1700,11 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        /* void variables are invalid — void is for return types only */
+        if (type && type->kind == TYPE_VOID) {
+            checker_error(c, node->loc.line,
+                "cannot declare variable of type 'void'");
+        }
         /* Pool/Ring must be global or static — not on the stack */
         if (node->kind == NODE_VAR_DECL && type &&
             (type->kind == TYPE_POOL || type->kind == TYPE_RING) &&
@@ -2653,6 +2658,13 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 checker_error(c, decl->loc.line,
                     "global variable '%.*s' initializer must be a constant expression — "
                     "cannot call functions at global scope",
+                    (int)decl->var_decl.name_len, decl->var_decl.name);
+            }
+            /* global array init from variable — invalid C (arrays can't be init'd from variables) */
+            if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {
+                checker_error(c, decl->loc.line,
+                    "cannot initialize global array '%.*s' from variable — "
+                    "global arrays must use literal initializers",
                     (int)decl->var_decl.name_len, decl->var_decl.name);
             }
             if (!type_equals(type, init) &&

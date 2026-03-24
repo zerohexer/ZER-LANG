@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-174: Global array init from variable — invalid C
+- **Symptom:** `u32[4] b = a;` at global scope emits `uint32_t b[4] = a;` — GCC rejects.
+- **Fix:** Checker rejects NODE_IDENT init for TYPE_ARRAY globals.
+
+### BUG-175: `void` variable declaration — invalid C
+- **Symptom:** `void x;` passes checker, GCC rejects "variable declared void."
+- **Fix:** NODE_VAR_DECL/NODE_GLOBAL_VAR rejects TYPE_VOID.
+
+### BUG-176: Deep const leak via `type_equals` ignoring `is_const`
+- **Symptom:** `**u32 mp = cp;` where `cp` is `const **u32` passes because `type_equals` ignored const.
+- **Fix:** `type_equals` now checks `is_const` for TYPE_POINTER and TYPE_SLICE. Recursive — works at any depth.
+
 ### BUG-171: Global variable with non-constant initializer — invalid C
 - **Symptom:** `u32 g = f()` passes checker. GCC rejects: "initializer element is not constant."
 - **Fix:** NODE_GLOBAL_VAR init rejects NODE_CALL expressions.

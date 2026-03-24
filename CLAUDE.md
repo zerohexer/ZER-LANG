@@ -412,6 +412,12 @@ Slices are structs in C; `struct == struct` is a GCC error. Arrays decay inconsi
 **48. Array/Pool/Ring sizes are `uint64_t` internally, emitted with `%llu`.**
 `types.h` uses `uint64_t` for `array.size`, `pool.count`, `ring.count`. All format specifiers in emitter.c use `%llu` with `(unsigned long long)` cast. Matches GCC's handling of large sizes. (BUG-173)
 
+**49. `type_equals` is const-aware for pointers and slices — recursive.**
+`type_equals(TYPE_POINTER)` checks `is_const` match before recursing into inner type. Same for TYPE_SLICE. This means const laundering is blocked at ANY depth of pointer indirection (`**const T != **T`). The manual const checks at call/return/assign/init sites are kept for better error messages but are now redundant with `type_equals`. (BUG-176)
+
+**50. `void` variables rejected — void is for return types only.**
+NODE_VAR_DECL and NODE_GLOBAL_VAR reject TYPE_VOID. `?void` is still allowed (has `has_value` field). (BUG-175)
+
 ### Known Technical Debt
 - ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
 - ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~

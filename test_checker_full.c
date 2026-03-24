@@ -724,6 +724,18 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-174: global array init from variable */
+    err("u32[4] a;\nu32[4] b = a;\n",
+        "global array init from variable REJECT");
+
+    /* BUG-175: void variable declaration */
+    err("void f() { void x; }",
+        "void variable REJECT");
+
+    /* BUG-176: deep const — type_equals strict */
+    err("void f() { u32 x; *u32 p = &x; const **u32 cp = &p; **u32 mp = cp; }",
+        "deep const launder via **u32 REJECT");
+
     /* BUG-171: global non-constant initializer */
     err("u32 f() { return 1; }\nu32 g = f();\n",
         "global var with function call init REJECT");

@@ -724,6 +724,18 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-157: const laundering via return */
+    err("*u32 wash(const *u32 p) { return p; }",
+        "const ptr → mutable return REJECT");
+
+    /* BUG-159: return &local[i] */
+    err("*u8 bad() { u8[10] arr; return &arr[0]; }",
+        "return &local[i] REJECT");
+
+    /* BUG-161: local Pool on stack */
+    err("struct Task { u32 id; }\nvoid f() { Pool(Task, 8) p; }",
+        "local Pool on stack REJECT");
+
     /* BUG-155: arena return via struct field */
     err("struct Val { u32 x; }\n"
         "struct Holder { *Val ptr; }\n"
@@ -735,6 +747,19 @@ static void test_security_review(void) {
         "    return h.ptr;\n"
         "}\n",
         "arena return via struct field → error");
+
+    /* BUG-158: arena-derived via field read */
+    err("struct Val { u32 x; }\n"
+        "struct Wrap { *Val p; }\n"
+        "*Val leak() {\n"
+        "    u8[1024] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    Wrap w;\n"
+        "    w.p = a.alloc(Val) orelse return;\n"
+        "    *Val p = w.p;\n"
+        "    return p;\n"
+        "}\n",
+        "arena read via struct field → propagate + error");
 
     /* BUG-144: string literal → ?[]u8 return */
     err("?[]u8 get_opt() { return \"hello\"; }\n",

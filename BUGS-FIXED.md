@@ -73,6 +73,26 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-157: Const laundering via return — const ptr returned as mutable
+- **Symptom:** `*u32 wash(const *u32 p) { return p; }` passes because `type_equals` ignores `is_const`.
+- **Fix:** NODE_RETURN checks const mismatch between return type and function return type for pointers/slices.
+
+### BUG-158: Arena-derived flag lost through field/index read
+- **Symptom:** `*Val p = w.p;` where `w` is arena-derived — `p` not marked, escapes via return.
+- **Fix:** Var-decl init walks field/index chains to find root, propagates `is_arena_derived`.
+
+### BUG-159: Return `&local[i]` — dangling pointer via index
+- **Symptom:** `return &arr[0]` passes because `&` operand check only handled NODE_IDENT.
+- **Fix:** Walk field/index chains from `&` operand to find root ident, check if local.
+
+### BUG-160: Compound shift double-eval on field access chains
+- **Symptom:** `get_obj().field <<= 1` calls `get_obj()` twice. Side-effect detection only checked NODE_INDEX.
+- **Fix:** Walk entire target chain checking for NODE_CALL/NODE_ASSIGN at any level.
+
+### BUG-161: Local Pool/Ring on stack — silent stack overflow risk
+- **Symptom:** `Pool(Task, 8) p;` in function body compiles, but large pools overflow the stack.
+- **Fix:** Checker rejects Pool/Ring in NODE_VAR_DECL unless `is_static`.
+
 ### BUG-155: Arena return escape via struct field
 - **Symptom:** `h.ptr = a.alloc(Val) orelse return; return h.ptr;` — arena-derived pointer escapes through struct field. NODE_IDENT-only check missed NODE_FIELD.
 - **Fix:** 1) Assignment `h.ptr = arena.alloc()` propagates `is_arena_derived` to root `h`. 2) Return check walks field/index chains to find root.

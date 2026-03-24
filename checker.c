@@ -1672,6 +1672,15 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        /* Pool/Ring must be global or static — not on the stack */
+        if (node->kind == NODE_VAR_DECL && type &&
+            (type->kind == TYPE_POOL || type->kind == TYPE_RING) &&
+            !node->var_decl.is_static) {
+            checker_error(c, node->loc.line,
+                "%s must be declared as global or static — "
+                "stack allocation risks overflow",
+                type->kind == TYPE_POOL ? "Pool" : "Ring");
+        }
         /* propagate const from var qualifier to slice/pointer type */
         if (node->var_decl.is_const && type) {
             if (type->kind == TYPE_SLICE && !type->slice.is_const) {
@@ -1757,13 +1766,22 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
-                /* propagate arena-derived from simple identifier init: q = arena_ptr */
-                if (node->var_decl.init->kind == NODE_IDENT) {
-                    Symbol *src = scope_lookup(c->current_scope,
-                        node->var_decl.init->ident.name,
-                        (uint32_t)node->var_decl.init->ident.name_len);
-                    if (src && src->is_arena_derived) {
-                        sym->is_arena_derived = true;
+                /* propagate arena-derived from init expression
+                 * Walk field/index chains to find root (handles w.ptr, arr[i]) */
+                {
+                    Node *init_root = node->var_decl.init;
+                    while (init_root && (init_root->kind == NODE_FIELD ||
+                                         init_root->kind == NODE_INDEX)) {
+                        if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
+                        else init_root = init_root->index_expr.object;
+                    }
+                    if (init_root && init_root->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            init_root->ident.name,
+                            (uint32_t)init_root->ident.name_len);
+                        if (src && src->is_arena_derived) {
+                            sym->is_arena_derived = true;
+                        }
                     }
                 }
             }
@@ -2120,6 +2138,20 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* const laundering: reject returning const ptr/slice as mutable */
+            if (ret_type && c->current_func_ret) {
+                if (ret_type->kind == TYPE_POINTER && c->current_func_ret->kind == TYPE_POINTER &&
+                    ret_type->pointer.is_const && !c->current_func_ret->pointer.is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot return const pointer as mutable — would allow writing to read-only memory");
+                }
+                if (ret_type->kind == TYPE_SLICE && c->current_func_ret->kind == TYPE_SLICE &&
+                    ret_type->slice.is_const && !c->current_func_ret->slice.is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot return const slice as mutable — would allow writing to read-only memory");
+                }
+            }
+
             /* scope escape: return local array as slice → dangling pointer */
             if (node->ret.expr->kind == NODE_IDENT &&
                 ret_type && ret_type->kind == TYPE_ARRAY &&
@@ -2156,19 +2188,25 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* scope escape: return &local → error */
+            /* scope escape: return &local or &local[i] or &local.field → error
+             * Walk field/index chains from & operand to find root ident */
             if (node->ret.expr->kind == NODE_UNARY &&
-                node->ret.expr->unary.op == TOK_AMP &&
-                node->ret.expr->unary.operand->kind == NODE_IDENT) {
-                const char *vname = node->ret.expr->unary.operand->ident.name;
-                uint32_t vlen = (uint32_t)node->ret.expr->unary.operand->ident.name_len;
-                Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
-                /* safe if: static, or in global scope */
-                bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-                if (sym && !sym->is_static && !is_global) {
-                    checker_error(c, node->loc.line,
-                        "cannot return pointer to local variable '%.*s'",
-                        (int)vlen, vname);
+                node->ret.expr->unary.op == TOK_AMP) {
+                Node *root = node->ret.expr->unary.operand;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    const char *vname = root->ident.name;
+                    uint32_t vlen = (uint32_t)root->ident.name_len;
+                    Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
+                    bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                    if (sym && !sym->is_static && !is_global) {
+                        checker_error(c, node->loc.line,
+                            "cannot return pointer to local variable '%.*s'",
+                            (int)vlen, vname);
+                    }
                 }
             }
 

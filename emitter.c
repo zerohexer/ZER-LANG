@@ -483,9 +483,19 @@ static void emit_expr(Emitter *e, Node *node) {
         /* compound shift: target <<= n → target = _zer_shl(target, n)
          * If target has side effects, hoist via pointer to avoid double-eval */
         if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
-            bool shift_side_effect = (node->assign.target->kind == NODE_INDEX &&
-                (node->assign.target->index_expr.index->kind == NODE_CALL ||
-                 node->assign.target->index_expr.index->kind == NODE_ASSIGN));
+            /* check if any node in target chain has side effects */
+            bool shift_side_effect = false;
+            {
+                Node *n = node->assign.target;
+                while (n) {
+                    if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
+                        shift_side_effect = true; break;
+                    }
+                    if (n->kind == NODE_FIELD) n = n->field.object;
+                    else if (n->kind == NODE_INDEX) n = n->index_expr.object;
+                    else break;
+                }
+            }
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
             if (shift_side_effect) {
                 /* hoist target into pointer: *({ auto *_p = &target; *_p = macro(*_p, n); _p; }) — but simpler: */

@@ -433,9 +433,18 @@ C integer promotion makes `u8 + u8` return `int`. Without cast, wrapping compari
 **55. `all_paths_return()` checks non-void functions for missing returns.**
 Recursive analysis: NODE_RETURN → true, NODE_BLOCK → last stmt, NODE_IF → both branches (requires else), NODE_SWITCH → all arms (exhaustive if passed checker). Called after `check_stmt` on function body for non-void return types. (BUG-190)
 
+**56. Duplicate struct/union field/variant names rejected.**
+Checker loops through previous fields during registration, errors on name collision. Prevents GCC "duplicate member" errors. (BUG-191)
+
+**57. Return/break/continue inside defer blocks rejected.**
+`defer_depth` counter tracked on Checker struct. NODE_RETURN, NODE_BREAK, NODE_CONTINUE check `defer_depth > 0` → error. Prevents control flow corruption in defer cleanup. (BUG-192)
+
+### Design Decisions (NOT bugs — intentional)
+- **Multi-module type collision:** NOT implementing auto-mangling. Diamond imports already work (topological sort deduplicates). Checker catches same-scope name collisions. Embedded projects rarely have same-named types across unrelated modules. If ever needed, add explicit namespaces in v0.2, not silent prefix mangling.
+- **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
+- **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.
+
 ### Known Technical Debt
-- ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
-- ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~
 - **Global Compiler State:** `type_map`, `non_storable_nodes` are static globals. Makes compiler non-thread-safe. Fix: move into Checker/Emitter structs. Same pattern as GCC.
 - **Static vars in imported modules:** `static u32 counter` in a module → "undefined identifier" when used by the module's own functions. Static globals don't register in scope during `checker_register_file`. Not blocking (non-static globals work fine).
 

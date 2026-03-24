@@ -2524,6 +2524,43 @@ int main(void) {
         "}\n",
         "volatile u32 emits volatile keyword");
 
+    /* BUG-150: array init/assignment via memcpy */
+    printf("[array init from array — BUG-150]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] a;\n"
+        "    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;\n"
+        "    u32[4] b = a;\n"
+        "    return b[0] + b[3];\n"
+        "}\n",
+        5,
+        "array init from array → memcpy, 1+4=5");
+
+    printf("[array assignment — BUG-150]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] a;\n"
+        "    a[0] = 10; a[1] = 20; a[2] = 30; a[3] = 40;\n"
+        "    u32[4] b;\n"
+        "    b = a;\n"
+        "    return b[1] + b[2];\n"
+        "}\n",
+        50,
+        "array assign → memcpy, 20+30=50");
+
+    /* BUG-151: const pointer emission */
+    printf("[const pointer emission — BUG-151]\n");
+    test_compile_and_run(
+        "u32 reader(const *u32 p) {\n"
+        "    return *p;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 x = 42;\n"
+        "    return reader(&x);\n"
+        "}\n",
+        42,
+        "const *u32 emits const uint32_t*");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-150: Array init/assignment produces invalid C
+- **Symptom:** `u32[4] b = a;` emits `uint32_t b[4] = a;` — GCC rejects (arrays aren't initializers in C).
+- **Fix:** Detect array=array in var-decl init and NODE_ASSIGN → emit `memcpy(dst, src, sizeof(dst))`.
+
+### BUG-151: Const pointer not emitted in C output
+- **Symptom:** `const *u32 p` emits as `uint32_t* p` — no `const` keyword. C libraries may write through it.
+- **Fix:** `emit_type(TYPE_POINTER)` checks `is_const` and emits `const` before the inner type.
+
+### BUG-152: @cstr has no bounds check — buffer overflow possible
+- **Symptom:** `@cstr(small_buf, long_slice)` does raw memcpy with no size check.
+- **Fix:** If destination is TYPE_ARRAY, emit `if (slice.len + 1 > array_size) _zer_trap(...)` before memcpy.
+
 ### BUG-143: Arena return escape — pointer to dead stack memory
 - **Symptom:** `*Task bad() { Arena a = Arena.over(buf); return a.alloc(Task) orelse return; }` — returns pointer to stack-allocated arena memory.
 - **Fix:** NODE_RETURN checks `is_arena_derived` on returned symbol. Only blocks local arenas (global arenas outlive functions).

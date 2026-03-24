@@ -80,6 +80,7 @@ static void emit_type(Emitter *e, Type *t) {
     case TYPE_OPAQUE: emit(e, "void"); break;
 
     case TYPE_POINTER:
+        if (t->pointer.is_const) emit(e, "const ");
         if (t->pointer.is_volatile) emit(e, "volatile ");
         emit_type(e, t->pointer.inner);
         emit(e, "*");
@@ -439,6 +440,20 @@ static void emit_expr(Emitter *e, Node *node) {
                         goto assign_done;
                     }
                 }
+            }
+        }
+        /* array assignment: x = y → memcpy(x, y, sizeof(x)) — C arrays aren't lvalues */
+        if (node->assign.op == TOK_EQ) {
+            Type *tgt_type = checker_get_type(node->assign.target);
+            if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
+                emit(e, "memcpy(");
+                emit_expr(e, node->assign.target);
+                emit(e, ", ");
+                emit_expr(e, node->assign.value);
+                emit(e, ", sizeof(");
+                emit_expr(e, node->assign.target);
+                emit(e, "))");
+                goto assign_done;
             }
         }
         /* compound shift: target <<= n → target = _zer_shl(target, n)
@@ -1255,7 +1270,17 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "; __auto_type _zer_cs%d = ", tmp);
             if (node->intrinsic.arg_count > 1)
                 emit_expr(e, node->intrinsic.args[1]);
-            emit(e, "; memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
+            /* bounds check if destination is a fixed-size array */
+            Type *buf_type = (node->intrinsic.arg_count > 0) ?
+                checker_get_type(node->intrinsic.args[0]) : NULL;
+            if (buf_type && buf_type->kind == TYPE_ARRAY) {
+                emit(e, "; if (_zer_cs%d.len + 1 > %u) ",
+                     tmp, buf_type->array.size);
+                emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
+            } else {
+                emit(e, "; ");
+            }
+            emit(e, "memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
             emit(e, "_zer_cb%d[_zer_cs%d.len] = 0; _zer_cb%d; })", tmp, tmp, tmp);
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
             /* @cast(T, val) — distinct typedef conversion, same underlying type */
@@ -1455,6 +1480,16 @@ static void emit_stmt(Emitter *e, Node *node) {
                     init_type && init_type->kind == TYPE_ARRAY) {
                     emit(e, " = ");
                     emit_array_as_slice(e, node->var_decl.init, init_type, type);
+                } else if (type && type->kind == TYPE_ARRAY &&
+                           init_type && init_type->kind == TYPE_ARRAY) {
+                    /* array = array: C arrays aren't assignable, use memcpy */
+                    emit(e, " = {0};\n");
+                    emit_indent(e);
+                    emit(e, "memcpy(%.*s, ",
+                         (int)node->var_decl.name_len, node->var_decl.name);
+                    emit_expr(e, node->var_decl.init);
+                    emit(e, ", sizeof(%.*s))",
+                         (int)node->var_decl.name_len, node->var_decl.name);
                 } else {
                     emit(e, " = ");
                     emit_expr(e, node->var_decl.init);

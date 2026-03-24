@@ -355,6 +355,18 @@ Index expressions with side effects (function calls, assignments) use GCC statem
 **29. `const` on var declaration must propagate to the Type, not just the Symbol.**
 Parser puts `const` into `node->var_decl.is_const`, NOT into the TypeNode (TYNODE_CONST only wraps when `const` appears inside a type expression like function params). The checker must propagate: in NODE_VAR_DECL and NODE_GLOBAL_VAR, when `is_const` is true and type is slice/pointer, create a const-qualified Type via `type_const_slice()` / `type_const_pointer()`. Without this, `const []u8 msg = "hello"; mutate(msg)` passes because `check_expr(NODE_IDENT)` returns `sym->type` which has `is_const = false`. (BUG-140)
 
+**30. Array init/assignment must use `memcpy` — C arrays aren't lvalues.**
+`u32[4] b = a;` and `b = a;` are valid ZER but invalid C. Emitter detects TYPE_ARRAY in var-decl init and NODE_ASSIGN, emits `memcpy(dst, src, sizeof(dst))` instead. For init: emit `= {0}` first, then memcpy on next line. For assignment: emit `memcpy(target, value, sizeof(target))` and goto assign_done. (BUG-150)
+
+**31. `emit_type(TYPE_POINTER)` must emit `const` when `is_const` is set.**
+Without this, `const *u32` emits as plain `uint32_t*` in C — external C libraries can't see the const qualifier. The checker enforces const at call sites, but the C output should also reflect it for C interop safety. (BUG-151)
+
+**32. `@cstr` must bounds-check when destination is a fixed-size array.**
+`@cstr(buf, slice)` emits raw memcpy. If `buf` is TYPE_ARRAY, insert `if (slice.len + 1 > array_size) _zer_trap("@cstr buffer overflow", ...)` before the memcpy. Without this, a long slice silently overflows the stack buffer. (BUG-152)
+
+**33. `is_arena_derived` only set for LOCAL arenas — global arenas are safe to return from.**
+The arena return escape check (`NODE_RETURN` + `is_arena_derived`) must not block pointers from global arenas. Fix: when setting `is_arena_derived`, check if the arena object is a global symbol via `scope_lookup_local(global_scope, ...)`. (BUG-143)
+
 ### Known Technical Debt
 - ~~**Double Resolution:** Fixed in v0.1.1 — emitter uses `checker_get_type(node)` for declarations. `resolve_type_for_emit()` kept only for intrinsic type_arg.~~
 - ~~**Source Mapping:** Fixed in v0.1.1 — `#line N "source.zer"` directives emitted before each statement.~~

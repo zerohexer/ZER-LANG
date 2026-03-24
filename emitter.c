@@ -1290,6 +1290,11 @@ static void emit_defers(Emitter *e) {
 static void emit_stmt(Emitter *e, Node *node) {
     if (!node) return;
 
+    /* source mapping: #line directive maps GCC errors/traps to .zer file */
+    if (e->source_file && node->loc.line > 0 && node->kind != NODE_BLOCK) {
+        emit(e, "#line %d \"%s\"\n", node->loc.line, e->source_file);
+    }
+
     switch (node->kind) {
     case NODE_BLOCK: {
         /* track where this block's defers start in the stack */
@@ -1312,7 +1317,7 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_VAR_DECL: {
-        Type *type = resolve_type_for_emit(e, node->var_decl.type);
+        Type *type = checker_get_type(node);
         /* propagate volatile flag from var-decl to pointer type */
         if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
             Type *vp = type_pointer(e->arena, type->pointer.inner);
@@ -1559,7 +1564,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "for (");
         if (node->for_stmt.init) {
             if (node->for_stmt.init->kind == NODE_VAR_DECL) {
-                Type *type = resolve_type_for_emit(e, node->for_stmt.init->var_decl.type);
+                Type *type = checker_get_type(node->for_stmt.init);
                 emit_type_and_name(e, type,
                     node->for_stmt.init->var_decl.name,
                     node->for_stmt.init->var_decl.name_len);
@@ -1964,12 +1969,17 @@ static void emit_struct_decl(Emitter *e, Node *node) {
              (int)node->struct_decl.name_len, node->struct_decl.name);
     }
     e->indent++;
+    {
+    Type *st = checker_get_type(node);
     for (int i = 0; i < node->struct_decl.field_count; i++) {
         FieldDecl *f = &node->struct_decl.fields[i];
-        Type *ftype = resolve_type_for_emit(e, f->type);
+        Type *ftype = (st && st->kind == TYPE_STRUCT &&
+                      (uint32_t)i < st->struct_type.field_count) ?
+            st->struct_type.fields[i].type : resolve_type_for_emit(e, f->type);
         emit_indent(e);
         emit_type_and_name(e, ftype, f->name, f->name_len);
         emit(e, ";\n");
+    }
     }
     e->indent--;
     emit(e, "};\n");
@@ -1989,7 +1999,9 @@ static void emit_struct_decl(Emitter *e, Node *node) {
 
 static void emit_func_decl(Emitter *e, Node *node) {
 
-    Type *ret = resolve_type_for_emit(e, node->func_decl.return_type);
+    Type *func_type = checker_get_type(node);
+    Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
+        func_type->func_ptr.ret : NULL;
 
     /* static functions */
     if (node->func_decl.is_static) emit(e, "static ");
@@ -2003,7 +2015,9 @@ static void emit_func_decl(Emitter *e, Node *node) {
         for (int i = 0; i < node->func_decl.param_count; i++) {
             if (i > 0) emit(e, ", ");
             ParamDecl *p = &node->func_decl.params[i];
-            Type *ptype = resolve_type_for_emit(e, p->type);
+            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                          (uint32_t)i < func_type->func_ptr.param_count) ?
+                func_type->func_ptr.params[i] : resolve_type_for_emit(e, p->type);
             emit_type_and_name(e, ptype, p->name, p->name_len);
         }
     }
@@ -2020,7 +2034,7 @@ static void emit_func_decl(Emitter *e, Node *node) {
 }
 
 static void emit_global_var(Emitter *e, Node *node) {
-    Type *type = resolve_type_for_emit(e, node->var_decl.type);
+    Type *type = checker_get_type(node);
     /* propagate volatile flag from var-decl to pointer type */
     if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
         Type *vp = type_pointer(e->arena, type->pointer.inner);
@@ -2392,9 +2406,13 @@ void emit_file(Emitter *e, Node *file_node) {
             break;
 
         case NODE_TYPEDEF:
-            /* emit typedef in C */
+            /* emit typedef in C — use checker-resolved type */
             {
-                Type *underlying = resolve_type_for_emit(e, decl->typedef_decl.type);
+                Type *td_type = checker_get_type(decl);
+                /* for distinct, emit the underlying; for alias, emit the type directly */
+                Type *underlying = td_type;
+                if (td_type && td_type->kind == TYPE_DISTINCT)
+                    underlying = td_type->distinct.underlying;
                 emit(e, "typedef ");
                 emit_type_and_name(e, underlying,
                     decl->typedef_decl.name, decl->typedef_decl.name_len);
@@ -2455,12 +2473,17 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
             }
             emit(e, "struct _union_%.*s {\n    int32_t _tag;\n    union {\n",
                  (int)decl->union_decl.name_len, decl->union_decl.name);
+            {
+            Type *ut = checker_get_type(decl);
             for (int j = 0; j < decl->union_decl.variant_count; j++) {
                 UnionVariant *v = &decl->union_decl.variants[j];
-                Type *vtype = resolve_type_for_emit(e, v->type);
+                Type *vtype = (ut && ut->kind == TYPE_UNION &&
+                              (uint32_t)j < ut->union_type.variant_count) ?
+                    ut->union_type.variants[j].type : resolve_type_for_emit(e, v->type);
                 emit(e, "        ");
                 emit_type(e, vtype);
                 emit(e, " %.*s;\n", (int)v->name_len, v->name);
+            }
             }
             emit(e, "    };\n};\n");
             emit(e, "typedef struct { struct _union_%.*s value; uint8_t has_value; } _zer_opt_%.*s;\n",
@@ -2507,7 +2530,10 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
 
         case NODE_TYPEDEF:
             {
-                Type *underlying = resolve_type_for_emit(e, decl->typedef_decl.type);
+                Type *td_type = checker_get_type(decl);
+                Type *underlying = td_type;
+                if (td_type && td_type->kind == TYPE_DISTINCT)
+                    underlying = td_type->distinct.underlying;
                 emit(e, "typedef ");
                 emit_type_and_name(e, underlying,
                     decl->typedef_decl.name, decl->typedef_decl.name_len);

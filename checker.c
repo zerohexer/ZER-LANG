@@ -1573,6 +1573,7 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        typemap_set(node, type); /* store for emitter to read via checker_get_type */
 
         if (node->var_decl.init) {
             Type *init_type = check_expr(c, node->var_decl.init);
@@ -2074,6 +2075,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->struct_decl.name,
                    (uint32_t)node->struct_decl.name_len,
                    t, node->loc.line);
+        typemap_set(node, t);
 
         /* now resolve field types (self-type is in scope) */
         if (node->struct_decl.field_count > 0) {
@@ -2127,6 +2129,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->enum_decl.name,
                    (uint32_t)node->enum_decl.name_len,
                    t, node->loc.line);
+        typemap_set(node, t);
         break;
     }
 
@@ -2141,6 +2144,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->union_decl.name,
                    (uint32_t)node->union_decl.name_len,
                    t, node->loc.line);
+        typemap_set(node, t);
 
         if (node->union_decl.variant_count > 0) {
             t->union_type.variants = (SUVariant *)arena_alloc(c->arena,
@@ -2173,6 +2177,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->typedef_decl.name,
                    (uint32_t)node->typedef_decl.name_len,
                    type, node->loc.line);
+        typemap_set(node, type);
         break;
     }
 
@@ -2211,6 +2216,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_static = node->func_decl.is_static;
             sym->func_node = node;
         }
+        typemap_set(node, func_type);
         break;
     }
 
@@ -2223,6 +2229,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_const = node->var_decl.is_const;
             sym->is_static = node->var_decl.is_static;
         }
+        typemap_set(node, type);
         break;
     }
 

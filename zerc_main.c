@@ -312,6 +312,7 @@ int main(int argc, char **argv) {
     Emitter emitter;
     emitter_init(&emitter, out, &cc.arena, &checker);
     emitter.lib_mode = no_preamble;
+    emitter.source_file = input_path;
 
     /* emit: preamble (from main) → imported modules → main declarations
      * This ensures imported functions are declared before main uses them. */
@@ -378,6 +379,8 @@ int main(int argc, char **argv) {
         /* emit in topological order: first module gets preamble (unless --lib) */
         for (int i = 0; i < emit_count; i++) {
             Module *m = &cc.modules[emit_order[i]];
+            /* update source mapping for current module */
+            emitter.source_file = m->path;
             if (i == 0 && !no_preamble) {
                 emit_file(&emitter, m->ast);
             } else {

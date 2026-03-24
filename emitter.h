@@ -44,6 +44,7 @@ typedef struct {
     DeferStack defer_stack; /* current block's deferred statements */
     int loop_defer_base;    /* defer stack base at loop entry (for break/continue) */
     bool lib_mode;          /* --lib: no prefix on struct names, no preamble */
+    const char *source_file; /* .zer source file name for #line directives */
 } Emitter;
 
 /* ---- API ---- */

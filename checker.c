@@ -807,6 +807,37 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-205: local-derived escape via assignment to global/static.
+         * After flag propagation, check if target is global/static with local-derived value. */
+        if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_IDENT) {
+            Symbol *val_sym = scope_lookup(c->current_scope,
+                node->assign.value->ident.name,
+                (uint32_t)node->assign.value->ident.name_len);
+            if (val_sym && val_sym->is_local_derived) {
+                Node *troot = node->assign.target;
+                while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                    if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                    else troot = troot->index_expr.object;
+                }
+                if (troot && troot->kind == NODE_IDENT) {
+                    Symbol *target_sym = scope_lookup(c->current_scope,
+                        troot->ident.name, (uint32_t)troot->ident.name_len);
+                    bool target_is_global = target_sym &&
+                        (target_sym->is_static ||
+                         scope_lookup_local(c->global_scope, target_sym->name,
+                                            target_sym->name_len) != NULL);
+                    if (target_is_global) {
+                        checker_error(c, node->loc.line,
+                            "cannot store local-derived pointer '%.*s' in "
+                            "global/static variable '%.*s' — pointer will dangle "
+                            "when function returns",
+                            (int)val_sym->name_len, val_sym->name,
+                            (int)target_sym->name_len, target_sym->name);
+                    }
+                }
+            }
+        }
+
         /* arena lifetime escape: storing arena-derived pointer in global/static
          * Also propagates is_arena_derived through assignment targets */
         /* detect direct arena.alloc() in assignment value (including via orelse) */
@@ -1979,6 +2010,9 @@ static void check_stmt(Checker *c, Node *node) {
                  * Walk field/index chains to find root (handles w.ptr, arr[i]) */
                 {
                     Node *init_root = node->var_decl.init;
+                    /* BUG-206: walk through NODE_ORELSE to reach the expression root */
+                    if (init_root && init_root->kind == NODE_ORELSE)
+                        init_root = init_root->orelse.expr;
                     while (init_root && (init_root->kind == NODE_FIELD ||
                                          init_root->kind == NODE_INDEX)) {
                         if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
@@ -2834,6 +2868,13 @@ static bool contains_break(Node *node) {
             if (contains_break(node->switch_stmt.arms[i].body)) return true;
         }
         return false;
+    /* BUG-204: orelse break hidden in expressions */
+    case NODE_ORELSE:
+        return node->orelse.fallback_is_break;
+    case NODE_VAR_DECL:
+        return node->var_decl.init ? contains_break(node->var_decl.init) : false;
+    case NODE_EXPR_STMT:
+        return node->expr_stmt.expr ? contains_break(node->expr_stmt.expr) : false;
     default: return false;
     }
 }

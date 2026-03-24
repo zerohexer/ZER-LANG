@@ -464,6 +464,15 @@ These flags are "sticky" — once set during var-decl, they persist. But `p = &l
 **64. `@size(T)` resolved as compile-time constant in array sizes.**
 `u8[@size(Task)] buffer;` now works. In the checker's TYNODE_ARRAY resolution, when `eval_const_expr` returns -1 and the size expression is `NODE_INTRINSIC` with name "size", resolve the type and compute byte size: primitives via `type_width / 8`, structs via field sum, pointers = 4. The emitter still uses `sizeof(T)` for runtime expressions. (BUG-199)
 
+**69. `contains_break` walks NODE_ORELSE, NODE_VAR_DECL, NODE_EXPR_STMT.**
+`orelse break` inside while(true) body is a hidden break. `contains_break` checks `NODE_ORELSE.fallback_is_break`, recurses into `NODE_VAR_DECL.init` and `NODE_EXPR_STMT.expr`. Without this, `while(true) { x = opt orelse break; }` falsely passes return analysis. (BUG-204)
+
+**70. Local-derived escape via assignment to global blocked.**
+`global_p = p` where `p` has `is_local_derived` and target root is global/static → error. Previous check only caught direct `&local` in assignment value, not aliased local-derived pointers. (BUG-205)
+
+**71. Orelse unwrap preserves is_local_derived from expression.**
+Var-decl init flag propagation walks through `NODE_ORELSE` to reach the expression root. `*u32 p = maybe orelse return` where `maybe` is local-derived marks `p` as local-derived. (BUG-206)
+
 **67. orelse &local in var-decl propagates is_local_derived.**
 `*u32 p = maybe orelse &local_x;` marks `p` as local-derived. The detection checks both direct `NODE_UNARY/TOK_AMP` AND `NODE_ORELSE` fallback for `&local`. Without this, orelse with local address fallback creates a dangling pointer escape. (BUG-202)
 

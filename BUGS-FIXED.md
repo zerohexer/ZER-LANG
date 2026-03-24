@@ -73,6 +73,24 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-206: orelse unwrap loses is_local_derived from expression
+- **Symptom:** `?*u32 maybe = &x; *u32 p = maybe orelse return; return p;` — returns dangling pointer. No error.
+- **Root cause:** Var-decl init flag propagation walked NODE_FIELD/NODE_INDEX but not NODE_ORELSE. The orelse expression's root symbol was never checked.
+- **Fix:** Walk through NODE_ORELSE to reach the expression root before checking `is_local_derived`/`is_arena_derived`.
+- **Test:** `test_checker_full.c` — orelse unwrap preserves local-derived.
+
+### BUG-205: Local-derived pointer escape via assignment to global
+- **Symptom:** `*u32 p = &x; global_p = p;` — stores dangling pointer in global. No error.
+- **Root cause:** Assignment check only caught direct `&local` in value, not `is_local_derived` aliases.
+- **Fix:** After flag propagation in NODE_ASSIGN, check if value ident has `is_local_derived` and target root is global/static → error.
+- **Test:** `test_checker_full.c` — local-derived assigned to global rejected.
+
+### BUG-204: `orelse break` bypasses `contains_break` in return analysis
+- **Symptom:** `while(true) { u32 x = mg() orelse break; return x; }` — function falls off end. No error.
+- **Root cause:** `contains_break` didn't walk NODE_ORELSE, NODE_VAR_DECL, or NODE_EXPR_STMT.
+- **Fix:** Added NODE_ORELSE (check `fallback_is_break`), NODE_VAR_DECL (check init), NODE_EXPR_STMT (check expr) to `contains_break`.
+- **Test:** `test_checker_full.c` — orelse break in while(true) rejected.
+
 ### BUG-203: Slice from local array escapes via variable
 - **Symptom:** `[]u8 s = local_arr; return s;` — returns slice pointing to stack memory. No error.
 - **Root cause:** `is_local_derived` only tracked for pointers (`*T`), not slices (`[]T`). Array→slice coercion creates a slice pointing to local memory but didn't mark the symbol.

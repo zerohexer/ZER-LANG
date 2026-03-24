@@ -1122,6 +1122,20 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-204: orelse break in while(true) */
+    err("?u32 mg() { return 5; }\n"
+        "u32 bad() { while (true) { u32 x = mg() orelse break; return x; } }",
+        "orelse break in while(true) rejected");
+
+    /* BUG-205: local-derived escape via assignment to global */
+    err("*u32 gp;\n"
+        "void bad() { u32 x = 42; *u32 p = &x; gp = p; }",
+        "local-derived assigned to global rejected");
+
+    /* BUG-206: orelse loses local-derived */
+    err("*u32 bad() { u32 x = 42; ?*u32 m = &x; *u32 p = m orelse return; return p; }",
+        "orelse unwrap preserves local-derived");
+
     /* BUG-202: orelse &local propagates is_local_derived */
     err("*u32 bad() { u32 x = 42; ?*u32 m = null; *u32 p = m orelse &x; return p; }",
         "orelse &local marks local-derived");

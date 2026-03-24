@@ -1402,18 +1402,23 @@ static Type *check_expr(Checker *c, Node *node) {
         /* pointer auto-deref for union: ptr.variant = (*ptr).variant */
         if (obj->kind == TYPE_POINTER &&
             type_unwrap_distinct(obj->pointer.inner)->kind == TYPE_UNION) {
-            /* union switch lock applies to pointer auto-deref too */
-            if (c->in_assign_target && c->union_switch_var &&
-                node->field.object->kind == NODE_IDENT &&
-                node->field.object->ident.name_len == c->union_switch_var_len &&
-                memcmp(node->field.object->ident.name, c->union_switch_var,
-                       c->union_switch_var_len) == 0) {
-                checker_error(c, node->loc.line,
-                    "cannot mutate union '%.*s' inside its own switch arm — "
-                    "active capture would become invalid",
-                    (int)c->union_switch_var_len, c->union_switch_var);
-                result = ty_void;
-                break;
+            /* union switch lock applies to pointer auto-deref too.
+             * BUG-211: walk to root for field-based access */
+            if (c->in_assign_target && c->union_switch_var) {
+                Node *mut_root = node->field.object;
+                while (mut_root && mut_root->kind == NODE_FIELD) mut_root = mut_root->field.object;
+                while (mut_root && mut_root->kind == NODE_INDEX) mut_root = mut_root->index_expr.object;
+                if (mut_root && mut_root->kind == NODE_IDENT &&
+                    mut_root->ident.name_len == c->union_switch_var_len &&
+                    memcmp(mut_root->ident.name, c->union_switch_var,
+                           c->union_switch_var_len) == 0) {
+                    checker_error(c, node->loc.line,
+                        "cannot mutate union '%.*s' inside its own switch arm — "
+                        "active capture would become invalid",
+                        (int)c->union_switch_var_len, c->union_switch_var);
+                    result = ty_void;
+                    break;
+                }
             }
             Type *inner = type_unwrap_distinct(obj->pointer.inner);
             for (uint32_t i = 0; i < inner->union_type.variant_count; i++) {
@@ -1463,17 +1468,23 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
                 break;
             }
-            /* prevent mutating union variant while inside a switch arm on same variable */
-            if (c->union_switch_var && node->field.object->kind == NODE_IDENT &&
-                node->field.object->ident.name_len == c->union_switch_var_len &&
-                memcmp(node->field.object->ident.name, c->union_switch_var,
-                       c->union_switch_var_len) == 0) {
-                checker_error(c, node->loc.line,
-                    "cannot mutate union '%.*s' inside its own switch arm — "
-                    "active capture would become invalid",
-                    (int)c->union_switch_var_len, c->union_switch_var);
-                result = ty_void;
-                break;
+            /* prevent mutating union variant while inside a switch arm on same variable.
+             * BUG-211: walk field/index chain to find root ident for field-based unions */
+            if (c->union_switch_var) {
+                Node *mut_root = node->field.object;
+                while (mut_root && mut_root->kind == NODE_FIELD) mut_root = mut_root->field.object;
+                while (mut_root && mut_root->kind == NODE_INDEX) mut_root = mut_root->index_expr.object;
+                if (mut_root && mut_root->kind == NODE_IDENT &&
+                    mut_root->ident.name_len == c->union_switch_var_len &&
+                    memcmp(mut_root->ident.name, c->union_switch_var,
+                           c->union_switch_var_len) == 0) {
+                    checker_error(c, node->loc.line,
+                        "cannot mutate union '%.*s' inside its own switch arm — "
+                        "active capture would become invalid",
+                        (int)c->union_switch_var_len, c->union_switch_var);
+                    result = ty_void;
+                    break;
+                }
             }
             for (uint32_t i = 0; i < obj->union_type.variant_count; i++) {
                 SUVariant *v = &obj->union_type.variants[i];
@@ -2139,6 +2150,22 @@ static void check_stmt(Checker *c, Node *node) {
                 if (cap) {
                     cap->is_const = cap_const;
 
+                    /* BUG-212: propagate local/arena-derived from condition ident */
+                    {
+                        Node *croot = node->if_stmt.cond;
+                        if (croot->kind == NODE_ORELSE) croot = croot->orelse.expr;
+                        while (croot && (croot->kind == NODE_FIELD || croot->kind == NODE_INDEX)) {
+                            if (croot->kind == NODE_FIELD) croot = croot->field.object;
+                            else croot = croot->index_expr.object;
+                        }
+                        if (croot && croot->kind == NODE_IDENT) {
+                            Symbol *csym = scope_lookup(c->current_scope,
+                                croot->ident.name, (uint32_t)croot->ident.name_len);
+                            if (csym && csym->is_local_derived) cap->is_local_derived = true;
+                            if (csym && csym->is_arena_derived) cap->is_arena_derived = true;
+                        }
+                    }
+
                     /* propagate arena-derived from if-unwrap condition:
                      * if (arena.alloc(T)) |t| { ... } — t is arena-derived */
                     Node *cond_expr = node->if_stmt.cond;
@@ -2277,17 +2304,18 @@ static void check_stmt(Checker *c, Node *node) {
                 uint32_t saved_union_var_len = c->union_switch_var_len;
                 if (expr->kind == TYPE_UNION) {
                     Node *sw_expr = node->switch_stmt.expr;
-                    /* direct: switch (d) */
-                    if (sw_expr->kind == NODE_IDENT) {
-                        c->union_switch_var = sw_expr->ident.name;
-                        c->union_switch_var_len = (uint32_t)sw_expr->ident.name_len;
-                    }
-                    /* deref: switch (*ptr) */
-                    else if (sw_expr->kind == NODE_UNARY &&
-                             sw_expr->unary.op == TOK_STAR &&
-                             sw_expr->unary.operand->kind == NODE_IDENT) {
-                        c->union_switch_var = sw_expr->unary.operand->ident.name;
-                        c->union_switch_var_len = (uint32_t)sw_expr->unary.operand->ident.name_len;
+                    /* walk to root ident for union lock.
+                     * Handles: switch(d), switch(*ptr), switch(s.msg), switch(s.msg.inner) */
+                    Node *lock_root = sw_expr;
+                    if (lock_root->kind == NODE_UNARY && lock_root->unary.op == TOK_STAR)
+                        lock_root = lock_root->unary.operand;
+                    while (lock_root->kind == NODE_FIELD)
+                        lock_root = lock_root->field.object;
+                    while (lock_root->kind == NODE_INDEX)
+                        lock_root = lock_root->index_expr.object;
+                    if (lock_root->kind == NODE_IDENT) {
+                        c->union_switch_var = lock_root->ident.name;
+                        c->union_switch_var_len = (uint32_t)lock_root->ident.name_len;
                     }
                 }
                 check_stmt(c, arm->body);

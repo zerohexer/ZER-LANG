@@ -501,6 +501,72 @@ static void emit_expr(Emitter *e, Node *node) {
                 }
             }
         }
+        /* BUG-210: bit-set assignment: reg[7..0] = 0xFF
+         * → reg = (reg & ~mask) | ((value << low) & mask) */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.target->kind == NODE_SLICE) {
+            Type *obj_type = checker_get_type(node->assign.target->slice.object);
+            if (obj_type && type_is_integer(obj_type)) {
+                Node *obj = node->assign.target->slice.object;
+                Node *hi_node = node->assign.target->slice.start;  /* high bit */
+                Node *lo_node = node->assign.target->slice.end;    /* low bit */
+                /* emit: obj = (obj & ~mask) | ((val << low) & mask)
+                 * where mask = ((1ull << (high - low + 1)) - 1) << low */
+                emit_expr(e, obj);
+                emit(e, " = (");
+                emit_expr(e, obj);
+                emit(e, " & ~(");
+                /* emit mask: safe for width >= 64 */
+                if (hi_node && lo_node) {
+                    int64_t hi = eval_const_expr(hi_node);
+                    int64_t lo = eval_const_expr(lo_node);
+                    if (hi >= 0 && lo >= 0) {
+                        int64_t width = hi - lo + 1;
+                        if (width >= 64) {
+                            emit(e, "~(uint64_t)0");
+                        } else {
+                            emit(e, "((1ull << %lld) - 1)", (long long)width);
+                        }
+                        emit(e, " << %lld", (long long)lo);
+                    } else {
+                        /* runtime: ((1ull << (hi - lo + 1)) - 1) << lo */
+                        emit(e, "((((");
+                        emit_expr(e, hi_node);
+                        emit(e, ") - (");
+                        emit_expr(e, lo_node);
+                        emit(e, ") + 1) >= 64 ? ~(uint64_t)0 : ((1ull << ((");
+                        emit_expr(e, hi_node);
+                        emit(e, ") - (");
+                        emit_expr(e, lo_node);
+                        emit(e, ") + 1)) - 1)) << (");
+                        emit_expr(e, lo_node);
+                        emit(e, ")");
+                    }
+                }
+                emit(e, ")) | (((uint64_t)(");
+                emit_expr(e, node->assign.value);
+                emit(e, ") << ");
+                if (lo_node) emit_expr(e, lo_node);
+                else emit(e, "0");
+                emit(e, ") & (");
+                /* re-emit mask */
+                if (hi_node && lo_node) {
+                    int64_t hi = eval_const_expr(hi_node);
+                    int64_t lo = eval_const_expr(lo_node);
+                    if (hi >= 0 && lo >= 0) {
+                        int64_t width = hi - lo + 1;
+                        if (width >= 64) {
+                            emit(e, "~(uint64_t)0");
+                        } else {
+                            emit(e, "((1ull << %lld) - 1)", (long long)width);
+                        }
+                        emit(e, " << %lld", (long long)lo);
+                    }
+                }
+                emit(e, "))");
+                goto assign_done;
+            }
+        }
         /* array assignment: x = y → memcpy(x, y, sizeof(x)) — C arrays aren't lvalues */
         if (node->assign.op == TOK_EQ) {
             Type *tgt_type = checker_get_type(node->assign.target);

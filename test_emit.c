@@ -2698,6 +2698,18 @@ int main(void) {
         77,
         "switch on ?u32 with capture");
 
+    /* BUG-210: bit-set assignment */
+    printf("[bit-set assignment — BUG-210]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 reg = 0;\n"
+        "    reg[3..0] = 5;\n"
+        "    reg[7..4] = 10;\n"
+        "    return reg;\n"
+        "}\n",
+        165,
+        "bit-set: 5 | (10 << 4) = 165");
+
     /* BUG-199: @size(T) as array size */
     printf("[BUG-199: @size(T) array size]\n");
     test_compile_and_run(

@@ -1122,6 +1122,15 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-211: union field bypass — lock walks to root */
+    err("struct A { u32 x; }\nstruct B { u32 y; }\nunion M { A a; B b; }\nstruct S { M msg; }\n"
+        "void f(S s) { switch (s.msg) { .a => |*v| { s.msg.b.y = 20; } .b => |*v| { } } }",
+        "field-based union mutation blocked");
+
+    /* BUG-212: if-unwrap capture propagates local-derived */
+    err("*u32 bad() { u32 x = 42; ?*u32 opt = &x; if (opt) |p| { return p; } return @inttoptr(*u32, 1); }",
+        "if-unwrap capture inherits local-derived");
+
     /* BUG-207: sub-slice from local array escape */
     err("[]u8 bad() { u8[10] a; []u8 s = a[1..4]; return s; }",
         "sub-slice from local array blocked");

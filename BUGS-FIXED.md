@@ -73,6 +73,24 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-212: If-unwrap capture loses is_local_derived from condition
+- **Symptom:** `?*u32 opt = &x; if (opt) |p| { return p; }` — returns dangling pointer via capture.
+- **Root cause:** Capture symbol creation didn't propagate safety flags from the condition expression.
+- **Fix:** Walk condition to root ident, propagate `is_local_derived`/`is_arena_derived` to capture symbol.
+- **Test:** `test_checker_full.c` — if-unwrap capture inherits local-derived.
+
+### BUG-211: Union switch lock bypassed via field-based access
+- **Symptom:** `switch (s.msg) { .a => |*v| { s.msg.b.y = 20; } }` — type confusion through struct field.
+- **Root cause:** Lock only set for NODE_IDENT expressions. NODE_FIELD (`s.msg`) fell through with no lock. Mutation check also only matched NODE_IDENT objects.
+- **Fix:** Walk through NODE_FIELD/NODE_INDEX/NODE_UNARY(STAR) to find root ident for both lock setup and mutation check.
+- **Test:** `test_checker_full.c` — field-based union mutation blocked.
+
+### BUG-210: Bit-set assignment (`reg[7..0] = val`) produces broken C
+- **Symptom:** `reg[7..0] = 0xFF` emits a struct literal on LHS — GCC "lvalue required" error.
+- **Root cause:** Emitter's NODE_ASSIGN didn't handle NODE_SLICE target on integer type. NODE_SLICE emits an rvalue (bit extraction struct), which can't be assigned to.
+- **Fix:** In NODE_ASSIGN, detect NODE_SLICE on integer → emit `target = (target & ~mask) | ((value << low) & mask)`. Safe mask generation for all widths.
+- **Test:** `test_emit.c` — bit-set `reg[3..0] = 5; reg[7..4] = 10` → 165.
+
 ### BUG-209: @cstr slice destination has no bounds check
 - **Symptom:** `@cstr(slice_dest, src)` emits raw memcpy with no overflow check when dest is a slice.
 - **Root cause:** BUG-152 added bounds check for TYPE_ARRAY destinations but skipped TYPE_SLICE.

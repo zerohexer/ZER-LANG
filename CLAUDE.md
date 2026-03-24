@@ -494,6 +494,15 @@ Taking the address of the union being switched on creates a pointer alias that b
 **74. `@cstr` slice destination gets bounds check.**
 `@cstr(slice_dest, src)` now checks `src.len + 1 > dest.len` before memcpy. For slice destinations, the emitter hoists the full slice into `__auto_type _zer_cd` temp (for `.len`), and uses `.ptr` for the memcpy target. Array destinations already had bounds checks (BUG-152). (BUG-209)
 
+**75. Bit-set assignment: `reg[7..0] = 0xFF` emits mask-and-set.**
+`target = (target & ~mask) | ((value << low) & mask)`. In `NODE_ASSIGN`, if target is `NODE_SLICE` on an integer type, emit bitmask operation instead of struct literal assignment. Constant bit ranges use precomputed masks. Runtime ranges use safe ternary for width >= 64. (BUG-210)
+
+**76. Union switch lock walks field/index chains to root.**
+`switch (s.msg)` now locks root `s`, not just direct idents. The lock check in field mutation (`s.msg.b = 20`) also walks to root. Prevents field-based union alias bypass. Both the switch lock setup AND the mutation check walk through NODE_FIELD/NODE_INDEX. (BUG-211)
+
+**77. If-unwrap capture propagates is_local_derived/is_arena_derived.**
+`if (opt) |p| { return p; }` where `opt` has `is_local_derived` now marks `p` as local-derived. Walks through NODE_ORELSE and field/index chains to find the condition's root ident, then propagates flags to the capture symbol. (BUG-212)
+
 ### Design Decisions (NOT bugs — intentional)
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.

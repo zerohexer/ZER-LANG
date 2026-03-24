@@ -73,6 +73,12 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-223: @cstr loses volatile qualifier on destination
+- **Symptom:** `volatile u8[64] buf; @cstr(buf, slice);` — memcpy discards volatile, GCC may optimize away writes.
+- **Root cause:** Destination always cast to plain `uint8_t*`.
+- **Fix:** Check if destination ident is `is_volatile`. If so, cast to `volatile uint8_t*` and use byte-by-byte copy loop instead of memcpy.
+- **Test:** `test_emit.c` — volatile @cstr preserves writes.
+
 ### BUG-222: Static variable collision across imported modules
 - **Symptom:** Two modules with `static u32 x` → GCC "redefinition" error.
 - **Root cause:** BUG-213 registered statics in global scope, causing collisions.

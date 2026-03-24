@@ -2730,6 +2730,22 @@ int main(void) {
         165,
         "bit-set: 5 | (10 << 4) = 165");
 
+    /* BUG-223: volatile @cstr uses byte loop, not memcpy */
+    printf("[volatile @cstr — BUG-223]\n");
+    test_compile_and_run(
+        "volatile u8[16] vbuf;\n"
+        "u32 main() {\n"
+        "    u8[4] src;\n"
+        "    src[0] = 72;\n"
+        "    src[1] = 105;\n"
+        "    src[2] = 0;\n"
+        "    []u8 s = src[0..2];\n"
+        "    @cstr(vbuf, s);\n"
+        "    return vbuf[0];\n"
+        "}\n",
+        72,
+        "volatile @cstr preserves writes, vbuf[0] = 'H'");
+
     /* BUG-199: @size(T) as array size */
     printf("[BUG-199: @size(T) array size]\n");
     test_compile_and_run(

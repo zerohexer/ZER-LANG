@@ -441,14 +441,29 @@ static void emit_expr(Emitter *e, Node *node) {
                 }
             }
         }
-        /* compound shift: target <<= n → target = _zer_shl(target, n) */
+        /* compound shift: target <<= n → target = _zer_shl(target, n)
+         * If target has side effects, hoist via pointer to avoid double-eval */
         if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
-            emit_expr(e, node->assign.target);
-            emit(e, " = %s(", node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr");
-            emit_expr(e, node->assign.target);
-            emit(e, ", ");
-            emit_expr(e, node->assign.value);
-            emit(e, ")");
+            bool shift_side_effect = (node->assign.target->kind == NODE_INDEX &&
+                (node->assign.target->index_expr.index->kind == NODE_CALL ||
+                 node->assign.target->index_expr.index->kind == NODE_ASSIGN));
+            const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
+            if (shift_side_effect) {
+                /* hoist target into pointer: *({ auto *_p = &target; *_p = macro(*_p, n); _p; }) — but simpler: */
+                int tmp = e->temp_count++;
+                emit(e, "({ __auto_type _zer_sp%d = &(", tmp);
+                emit_expr(e, node->assign.target);
+                emit(e, "); *_zer_sp%d = %s(*_zer_sp%d, ", tmp, macro, tmp);
+                emit_expr(e, node->assign.value);
+                emit(e, "); })");
+            } else {
+                emit_expr(e, node->assign.target);
+                emit(e, " = %s(", macro);
+                emit_expr(e, node->assign.target);
+                emit(e, ", ");
+                emit_expr(e, node->assign.value);
+                emit(e, ")");
+            }
         } else {
         emit_expr(e, node->assign.target);
         switch (node->assign.op) {
@@ -1231,22 +1246,17 @@ static void emit_expr(Emitter *e, Node *node) {
             else
                 emit(e, "0");
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
-            /* @cstr(buf, slice) → memcpy + null terminate */
-            /* emit inline: ({memcpy(buf, slice.ptr, slice.len); buf[slice.len]=0; buf;}) */
+            /* @cstr(buf, slice) → memcpy + null terminate
+             * Hoist both args to temps for single-eval */
             int tmp = e->temp_count++;
-            emit(e, "({__auto_type _zer_cs%d = ", tmp);
+            emit(e, "({ uint8_t *_zer_cb%d = (uint8_t*)", tmp);
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "; __auto_type _zer_cs%d = ", tmp);
             if (node->intrinsic.arg_count > 1)
                 emit_expr(e, node->intrinsic.args[1]);
-            emit(e, "; memcpy(");
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ", _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp);
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "[_zer_cs%d.len] = 0; (uint8_t*)", tmp);
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "; })");
+            emit(e, "; memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
+            emit(e, "_zer_cb%d[_zer_cs%d.len] = 0; _zer_cb%d; })", tmp, tmp, tmp);
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
             /* @cast(T, val) — distinct typedef conversion, same underlying type */
             if (node->intrinsic.type_arg && node->intrinsic.arg_count > 0) {
@@ -1400,6 +1410,8 @@ static void emit_stmt(Emitter *e, Node *node) {
         /* Normal var decl */
         emit_indent(e);
         if (node->var_decl.is_static) emit(e, "static ");
+        if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
+            emit(e, "volatile ");
         emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
         if (node->var_decl.init) {
             /* Optional init: null → {0, 0}, value → {val, 1}
@@ -1648,6 +1660,12 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "return ");
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
+                } else if (e->current_func_ret->optional.inner->kind == TYPE_VOID) {
+                    /* ?void: emit void expr as statement, then return {1} */
+                    emit_expr(e, node->ret.expr);
+                    emit(e, ";\n");
+                    emit_indent(e);
+                    emit(e, "return (_zer_opt_void){ 1 };\n");
                 } else {
                     emit(e, "return (");
                     emit_type(e, e->current_func_ret);
@@ -2104,6 +2122,9 @@ static void emit_global_var(Emitter *e, Node *node) {
     }
 
     if (node->var_decl.is_static) emit(e, "static ");
+    /* volatile on non-pointer scalars (pointers handled above) */
+    if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
+        emit(e, "volatile ");
 
     emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
 

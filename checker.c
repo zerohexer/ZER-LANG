@@ -1673,7 +1673,15 @@ static void check_stmt(Checker *c, Node *node) {
                                (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
                         Type *obj_type = checker_get_type(obj);
                         if (obj_type && obj_type->kind == TYPE_ARENA) {
-                            sym->is_arena_derived = true;
+                            /* only mark as arena-derived if arena is LOCAL
+                             * (global arenas outlive functions, pointers safe to return) */
+                            bool arena_is_global = false;
+                            if (obj->kind == NODE_IDENT) {
+                                arena_is_global = scope_lookup_local(c->global_scope,
+                                    obj->ident.name, (uint32_t)obj->ident.name_len) != NULL;
+                            }
+                            if (!arena_is_global)
+                                sym->is_arena_derived = true;
                         }
                     }
                 }
@@ -1893,8 +1901,13 @@ static void check_stmt(Checker *c, Node *node) {
                 /* enum switch: must handle all variants OR have default */
                 if (!has_default) {
                     uint32_t total = sw_type->enum_type.variant_count;
-                    /* track unique variants covered using a bitmask (up to 64 variants) */
-                    uint64_t covered = 0;
+                    /* track which variants are covered using a byte array (supports any count) */
+                    uint8_t covered_stack[256] = {0};
+                    uint8_t *covered = covered_stack;
+                    if (total > 256) {
+                        covered = (uint8_t *)arena_alloc(c->arena, total);
+                        memset(covered, 0, total);
+                    }
                     for (int i = 0; i < node->switch_stmt.arm_count; i++) {
                         SwitchArm *arm = &node->switch_stmt.arms[i];
                         for (int v = 0; v < arm->value_count; v++) {
@@ -1915,17 +1928,17 @@ static void check_stmt(Checker *c, Node *node) {
                                 for (uint32_t vi = 0; vi < total; vi++) {
                                     if (sw_type->enum_type.variants[vi].name_len == vname_len &&
                                         memcmp(sw_type->enum_type.variants[vi].name, vname, vname_len) == 0) {
-                                        if (vi < 64) covered |= (1ULL << vi);
+                                        covered[vi] = 1;
                                         break;
                                     }
                                 }
                             }
                         }
                     }
-                    /* count unique bits */
+                    /* count covered variants */
                     uint32_t handled = 0;
-                    for (uint32_t b = 0; b < total && b < 64; b++) {
-                        if (covered & (1ULL << b)) handled++;
+                    for (uint32_t b = 0; b < total; b++) {
+                        if (covered[b]) handled++;
                     }
                     if (handled < total) {
                         checker_error(c, node->loc.line,
@@ -1961,9 +1974,14 @@ static void check_stmt(Checker *c, Node *node) {
                         "switch on integer must have a default arm");
                 }
             } else if (sw_type->kind == TYPE_UNION) {
-                /* validate variant names + exhaustiveness via bitmask */
+                /* validate variant names + exhaustiveness */
                 uint32_t total = sw_type->union_type.variant_count;
-                uint64_t covered = 0;
+                uint8_t ucov_stack[256] = {0};
+                uint8_t *covered = ucov_stack;
+                if (total > 256) {
+                    covered = (uint8_t *)arena_alloc(c->arena, total);
+                    memset(covered, 0, total);
+                }
                 for (int i = 0; i < node->switch_stmt.arm_count; i++) {
                     SwitchArm *arm = &node->switch_stmt.arms[i];
                     if (arm->is_default) continue;
@@ -1983,7 +2001,7 @@ static void check_stmt(Checker *c, Node *node) {
                             for (uint32_t vi = 0; vi < total; vi++) {
                                 if (sw_type->union_type.variants[vi].name_len == (uint32_t)vname_len &&
                                     memcmp(sw_type->union_type.variants[vi].name, vname, vname_len) == 0) {
-                                    if (vi < 64) covered |= (1ULL << vi);
+                                    covered[vi] = 1;
                                     found = true;
                                     break;
                                 }
@@ -1999,8 +2017,8 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 if (!has_default) {
                     uint32_t handled = 0;
-                    for (uint32_t b = 0; b < total && b < 64; b++) {
-                        if (covered & (1ULL << b)) handled++;
+                    for (uint32_t b = 0; b < total; b++) {
+                        if (covered[b]) handled++;
                     }
                     if (handled < total) {
                         checker_error(c, node->loc.line,
@@ -2019,11 +2037,15 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
 
-            /* string literal returned as mutable slice → .rodata write risk */
-            if (node->ret.expr->kind == NODE_STRING_LIT &&
-                c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
-                checker_error(c, node->loc.line,
-                    "cannot return string literal as mutable slice — data is read-only");
+            /* string literal returned as mutable slice → .rodata write risk
+             * Covers both []u8 and ?[]u8 return types */
+            if (node->ret.expr->kind == NODE_STRING_LIT && c->current_func_ret) {
+                Type *ret = c->current_func_ret;
+                if (ret->kind == TYPE_SLICE ||
+                    (ret->kind == TYPE_OPTIONAL && ret->optional.inner->kind == TYPE_SLICE)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return string literal as mutable slice — data is read-only");
+                }
             }
 
             /* scope escape: return local array as slice → dangling pointer */
@@ -2039,6 +2061,20 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot return local array '%.*s' as slice — "
                         "pointer will dangle after function returns",
                         (int)vlen, vname);
+                }
+            }
+
+            /* scope escape: return arena-derived pointer → dangling after stack unwind
+             * is_arena_derived only set for LOCAL arenas (global arenas are safe) */
+            if (node->ret.expr->kind == NODE_IDENT) {
+                Symbol *sym = scope_lookup(c->current_scope,
+                    node->ret.expr->ident.name,
+                    (uint32_t)node->ret.expr->ident.name_len);
+                if (sym && sym->is_arena_derived) {
+                    checker_error(c, node->loc.line,
+                        "cannot return arena-derived pointer '%.*s' — "
+                        "arena memory is freed when function returns",
+                        (int)sym->name_len, sym->name);
                 }
             }
 

@@ -696,6 +696,20 @@ static void test_security_review(void) {
         "}\n",
         "arena alias escape via assignment → error");
 
+    /* BUG-143: return arena-derived pointer from local arena */
+    err("struct Task { u32 id; }\n"
+        "*Task bad() {\n"
+        "    u8[1024] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    *Task t = a.alloc(Task) orelse return;\n"
+        "    return t;\n"
+        "}\n",
+        "arena return escape from local arena → error");
+
+    /* BUG-144: string literal → ?[]u8 return */
+    err("?[]u8 get_opt() { return \"hello\"; }\n",
+        "string literal → ?[]u8 return → error");
+
     /* union switch lock via pointer deref */
     err("union D { u32 a; u32 b; }\n"
         "void f(*D ptr) {\n"

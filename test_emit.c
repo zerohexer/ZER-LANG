@@ -2500,6 +2500,30 @@ int main(void) {
         0,
         "bit extract hi < lo → 0 (no UB)");
 
+    /* BUG-145: ?void return void expression */
+    printf("[?void return void expr — BUG-145]\n");
+    test_compile_and_run(
+        "void do_stuff() { }\n"
+        "?void wrapper() {\n"
+        "    return do_stuff();\n"
+        "}\n"
+        "u32 main() {\n"
+        "    wrapper() orelse return;\n"
+        "    return 1;\n"
+        "}\n",
+        1,
+        "?void return void_func() → valid C");
+
+    /* BUG-146: volatile scalar emission */
+    printf("[volatile scalar — BUG-146]\n");
+    test_compile_only(
+        "volatile u32 status = 0;\n"
+        "u32 main() {\n"
+        "    status = 42;\n"
+        "    return status;\n"
+        "}\n",
+        "volatile u32 emits volatile keyword");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

@@ -73,6 +73,34 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-143: Arena return escape — pointer to dead stack memory
+- **Symptom:** `*Task bad() { Arena a = Arena.over(buf); return a.alloc(Task) orelse return; }` — returns pointer to stack-allocated arena memory.
+- **Fix:** NODE_RETURN checks `is_arena_derived` on returned symbol. Only blocks local arenas (global arenas outlive functions).
+
+### BUG-144: String literal leak to `?[]u8` return type
+- **Symptom:** `?[]u8 get() { return "hello"; }` bypasses the TYPE_SLICE check.
+- **Fix:** NODE_RETURN string literal check covers both TYPE_SLICE and TYPE_OPTIONAL(TYPE_SLICE).
+
+### BUG-145: `?void` return void expression — invalid C compound literal
+- **Symptom:** `?void f() { return do_stuff(); }` emits `return (_zer_opt_void){ do_stuff(), 1 };` — GCC rejects (void in initializer + excess elements).
+- **Fix:** Emit void expression as statement, then `return (_zer_opt_void){ 1 };` separately.
+
+### BUG-146: Volatile qualifier lost on scalar types
+- **Symptom:** `volatile u32 status` emits as `uint32_t status` — GCC optimizer may eliminate reads.
+- **Fix:** Emit `volatile` keyword for non-pointer types in both global and local var-decl paths.
+
+### BUG-147: Compound shift `<<=`/`>>=` double-evaluates side-effect targets
+- **Symptom:** `arr[next()] <<= 1` calls `next()` twice (read from one index, write to another).
+- **Fix:** Detect side-effect targets (NODE_CALL/NODE_ASSIGN in index), hoist via pointer: `*({ auto *_p = &target; *_p = _zer_shl(*_p, n); })`.
+
+### BUG-148: Enum/union exhaustiveness bitmask limited to 64 variants
+- **Symptom:** Enum with >64 variants shows "handles 64 of N" even when all arms covered.
+- **Fix:** Replace `uint64_t` bitmask with `uint8_t[]` byte array (stack-allocated up to 256, arena for larger).
+
+### BUG-149: `@cstr` double-evaluates buf argument
+- **Symptom:** `@cstr(buf, slice)` emits `buf` 3 times — side-effecting buf expressions execute thrice.
+- **Fix:** Hoist buf into `uint8_t *_zer_cb` temp for single evaluation.
+
 ### BUG-141: Bit extraction with negative width — shift by negative is UB
 - **Symptom:** `val[2..4]` (hi < lo) → `_zer_w = -1` → `1ull << -1` is undefined behavior.
 - **Fix:** Add `<= 0` check to runtime ternary: `(_zer_w >= 64) ? ~0ULL : (_zer_w <= 0) ? 0ULL : ((1ull << _zer_w) - 1)`.

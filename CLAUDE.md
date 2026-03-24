@@ -439,8 +439,14 @@ Checker loops through previous fields during registration, errors on name collis
 **57. Return/break/continue inside defer blocks rejected.**
 `defer_depth` counter tracked on Checker struct. NODE_RETURN, NODE_BREAK, NODE_CONTINUE check `defer_depth > 0` → error. Prevents control flow corruption in defer cleanup. (BUG-192)
 
+**58. Per-module scope + module-prefix mangling for multi-module type isolation.**
+Same-named types in different modules (e.g., `struct Config` in both `cfg_a.zer` and `cfg_b.zer`) now work. Three pieces:
+1. **Checker**: `checker_push_module_scope()` pushes a scope with the module's own type declarations before checking bodies. Each module sees its own types.
+2. **Checker**: `add_symbol` silently allows cross-module same-named types (first wins in global scope, module scope overrides during body check).
+3. **Emitter**: `EMIT_STRUCT_NAME`/`EMIT_UNION_NAME`/`EMIT_ENUM_NAME` macros prepend `module_prefix` — emits `struct cfg_a_Config` vs `struct cfg_b_Config`. All 60+ name emission sites use these macros.
+Diamond imports (same module imported via two paths) still deduplicate correctly. (BUG-193)
+
 ### Design Decisions (NOT bugs — intentional)
-- **Multi-module type collision:** NOT implementing auto-mangling. Diamond imports already work (topological sort deduplicates). Checker catches same-scope name collisions. Embedded projects rarely have same-named types across unrelated modules. If ever needed, add explicit namespaces in v0.2, not silent prefix mangling.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.
 

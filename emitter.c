@@ -369,6 +369,18 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_BINARY:
+        /* division/modulo: trap on zero divisor */
+        if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
+            int tmp = e->temp_count++;
+            emit(e, "({ __auto_type _zer_dv%d = ", tmp);
+            emit_expr(e, node->binary.right);
+            emit(e, "; if (_zer_dv%d == 0) ", tmp);
+            emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); (");
+            emit_expr(e, node->binary.left);
+            emit(e, " %s _zer_dv%d); })",
+                 node->binary.op == TOK_SLASH ? "/" : "%", tmp);
+            break;
+        }
         /* shift operators use safe macros (ZER spec: shift >= width = 0) */
         if (node->binary.op == TOK_LSHIFT || node->binary.op == TOK_RSHIFT) {
             emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
@@ -455,6 +467,18 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "))");
                 goto assign_done;
             }
+        }
+        /* compound div/mod: target /= n → check n != 0 first */
+        if (node->assign.op == TOK_SLASHEQ || node->assign.op == TOK_PERCENTEQ) {
+            int tmp = e->temp_count++;
+            emit(e, "({ __auto_type _zer_dv%d = ", tmp);
+            emit_expr(e, node->assign.value);
+            emit(e, "; if (_zer_dv%d == 0) ", tmp);
+            emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); ");
+            emit_expr(e, node->assign.target);
+            emit(e, " %s= _zer_dv%d; })",
+                 node->assign.op == TOK_SLASHEQ ? "/" : "%", tmp);
+            goto assign_done;
         }
         /* compound shift: target <<= n → target = _zer_shl(target, n)
          * If target has side effects, hoist via pointer to avoid double-eval */

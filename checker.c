@@ -679,7 +679,44 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* arena lifetime escape: storing arena-derived pointer in global/static */
+        /* arena lifetime escape: storing arena-derived pointer in global/static
+         * Also propagates is_arena_derived through assignment targets */
+        /* detect direct arena.alloc() in assignment value (including via orelse) */
+        if (node->assign.op == TOK_EQ) {
+            Node *alloc_call = node->assign.value;
+            if (alloc_call->kind == NODE_ORELSE)
+                alloc_call = alloc_call->orelse.expr;
+            if (alloc_call && alloc_call->kind == NODE_CALL &&
+                alloc_call->call.callee->kind == NODE_FIELD) {
+                Node *obj = alloc_call->call.callee->field.object;
+                const char *mname = alloc_call->call.callee->field.field_name;
+                size_t mlen = alloc_call->call.callee->field.field_name_len;
+                if (obj && ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                           (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
+                    Type *obj_type = checker_get_type(obj);
+                    if (obj_type && obj_type->kind == TYPE_ARENA) {
+                        bool arena_is_global = false;
+                        if (obj->kind == NODE_IDENT) {
+                            arena_is_global = scope_lookup_local(c->global_scope,
+                                obj->ident.name, (uint32_t)obj->ident.name_len) != NULL;
+                        }
+                        if (!arena_is_global) {
+                            /* mark target root as arena-derived */
+                            Node *root = node->assign.target;
+                            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                                if (root->kind == NODE_FIELD) root = root->field.object;
+                                else root = root->index_expr.object;
+                            }
+                            if (root && root->kind == NODE_IDENT) {
+                                Symbol *tsym = scope_lookup(c->current_scope,
+                                    root->ident.name, (uint32_t)root->ident.name_len);
+                                if (tsym) tsym->is_arena_derived = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (node->assign.op == TOK_EQ &&
             node->assign.value->kind == NODE_IDENT) {
             Symbol *val_sym = scope_lookup(c->current_scope,
@@ -2100,16 +2137,22 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             /* scope escape: return arena-derived pointer → dangling after stack unwind
-             * is_arena_derived only set for LOCAL arenas (global arenas are safe) */
-            if (node->ret.expr->kind == NODE_IDENT) {
-                Symbol *sym = scope_lookup(c->current_scope,
-                    node->ret.expr->ident.name,
-                    (uint32_t)node->ret.expr->ident.name_len);
-                if (sym && sym->is_arena_derived) {
-                    checker_error(c, node->loc.line,
-                        "cannot return arena-derived pointer '%.*s' — "
-                        "arena memory is freed when function returns",
-                        (int)sym->name_len, sym->name);
+             * Walk field/index chains to find root ident (BUG-155: h.ptr escape) */
+            {
+                Node *root = node->ret.expr;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    if (sym && sym->is_arena_derived) {
+                        checker_error(c, node->loc.line,
+                            "cannot return arena-derived pointer '%.*s' — "
+                            "arena memory is freed when function returns",
+                            (int)sym->name_len, sym->name);
+                    }
                 }
             }
 

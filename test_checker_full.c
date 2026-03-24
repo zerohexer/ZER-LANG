@@ -724,6 +724,18 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-155: arena return via struct field */
+    err("struct Val { u32 x; }\n"
+        "struct Holder { *Val ptr; }\n"
+        "*Val bad() {\n"
+        "    u8[1024] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    Holder h;\n"
+        "    h.ptr = a.alloc(Val) orelse return;\n"
+        "    return h.ptr;\n"
+        "}\n",
+        "arena return via struct field → error");
+
     /* BUG-144: string literal → ?[]u8 return */
     err("?[]u8 get_opt() { return \"hello\"; }\n",
         "string literal → ?[]u8 return → error");

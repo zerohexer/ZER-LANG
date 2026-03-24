@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-155: Arena return escape via struct field
+- **Symptom:** `h.ptr = a.alloc(Val) orelse return; return h.ptr;` — arena-derived pointer escapes through struct field. NODE_IDENT-only check missed NODE_FIELD.
+- **Fix:** 1) Assignment `h.ptr = arena.alloc()` propagates `is_arena_derived` to root `h`. 2) Return check walks field/index chains to find root.
+
+### BUG-156: Division/modulo by zero — undefined behavior in C
+- **Symptom:** `a / b` where `b=0` → raw C division, UB (SIGFPE on x86, undefined on ARM).
+- **Fix:** Wrap `/` and `%` in `({ auto _d = divisor; if (_d == 0) _zer_trap(...); (a / _d); })`. Same for `/=` and `%=`.
+
 ### BUG-153: Integer literal overflow not caught by checker
 - **Symptom:** `u8 x = 256` passes checker, GCC silently truncates to 0.
 - **Fix:** `is_literal_compatible` validates literal value fits target type's range (0-255 for u8, etc.). Negative literals checked against signed ranges.

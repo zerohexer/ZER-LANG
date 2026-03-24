@@ -2561,6 +2561,17 @@ int main(void) {
         42,
         "const *u32 emits const uint32_t*");
 
+    /* BUG-156: division by zero trap */
+    printf("[division by zero trap — BUG-156]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 a = 10;\n"
+        "    u32 b = 2;\n"
+        "    return a / b;\n"
+        "}\n",
+        5,
+        "10 / 2 = 5 (safe div)");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove("_zer_test_out.exe");

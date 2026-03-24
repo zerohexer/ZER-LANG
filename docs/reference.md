@@ -1,7 +1,7 @@
 # ZER Language Reference
 
 **Version:** 0.1 | **Compiler:** `zerc` | **Target:** Any platform GCC supports
-**1015 tests + 491 fuzz inputs, all passing**
+**1018 tests + 491 fuzz inputs, all passing**
 
 ---
 
@@ -673,7 +673,7 @@ zerc module.zer --lib        # no preamble/runtime, for C interop
 ```bash
 make            # build zerc compiler
 make zer-lsp    # build language server
-make check      # run all 1015 tests + 491 fuzz
+make check      # run all 1018 tests + 491 fuzz
 make release    # release binaries in release/
 ```
 

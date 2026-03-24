@@ -196,11 +196,11 @@ All notable changes to ZER-LANG. Read this to understand project history and cur
 
 ## Project State
 
-**Compiler:** 1015 tests + 491 fuzz, all passing. ~10,000 lines. 120 bugs found and fixed.
+**Compiler:** 1018 tests + 491 fuzz, all passing. ~10,000 lines. 127 bugs found and fixed.
 **License:** GPL v3 + Runtime Exception (GCC model).
 **Language features:** All core features implemented. `cinclude` for C interop. `@cast` for distinct typedefs. `?FuncPtr` optional function pointers. Function pointer typedef. Named slice typedefs for all types. Array-to-slice coercion. Volatile emission. Enum explicit values. `else if` supported.
 **Safety:** Inline bounds checks (conditions + short-circuit safe). Scope escape via struct fields caught. Union type confusion blocked. ZER-CHECK handles aliasing. Arena lifetime escape detected.
-**Audit status:** 16 rounds completed (12→9→2→2→1→2→CLEAN→6→12→5→2→5→2→4→1→1). 26 systematic negative tests. 4 QEMU real-program demos.
+**Audit status:** 19 rounds completed (12→9→2→2→1→2→CLEAN→6→12→5→2→5→2→4→1→1→2→3→1). 4 QEMU real-program demos. 6 module import tests.
 **Demos:** CVE-2014-0160 (Heartbleed) + CVE-2021-3156 (Baron Samedit) side-by-side. ARM Cortex-M3 QEMU firmware (1225 bytes).
 **Known limitations:**
 - `[]FuncPtr` (slice of raw function pointers without typedef) still anonymous — use `typedef` first.

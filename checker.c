@@ -780,6 +780,14 @@ static Type *check_expr(Checker *c, Node *node) {
                 "cannot store result of get() — use inline");
         }
 
+        /* BUG-225: reject Pool/Ring assignment — unique hardware resources */
+        if (node->assign.op == TOK_EQ && target &&
+            (target->kind == TYPE_POOL || target->kind == TYPE_RING)) {
+            checker_error(c, node->loc.line,
+                "cannot assign %s — hardware resource types are not copyable",
+                target->kind == TYPE_POOL ? "Pool" : "Ring");
+        }
+
         /* string literal to mutable slice: runtime crash on write */
         if (node->assign.op == TOK_EQ &&
             node->assign.value->kind == NODE_STRING_LIT &&
@@ -2314,6 +2322,13 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_SWITCH: {
         Type *expr = check_expr(c, node->switch_stmt.expr);
 
+        /* BUG-226: reject float switch — spec says "switch on float: NOT ALLOWED" */
+        if (expr && type_is_float(expr)) {
+            checker_error(c, node->loc.line,
+                "cannot switch on float type '%s' — use if/else for float comparisons",
+                type_name(expr));
+        }
+
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
 
@@ -2772,6 +2787,12 @@ static void register_decl(Checker *c, Node *node) {
                 sf->name = fd->name;
                 sf->name_len = (uint32_t)fd->name_len;
                 sf->type = resolve_type(c, fd->type);
+                /* BUG-224: reject void fields */
+                if (sf->type && sf->type->kind == TYPE_VOID) {
+                    checker_error(c, node->loc.line,
+                        "struct field '%.*s' cannot have type 'void'",
+                        (int)fd->name_len, fd->name);
+                }
                 sf->is_keep = fd->is_keep;
             }
         }
@@ -2864,6 +2885,12 @@ static void register_decl(Checker *c, Node *node) {
                 sv->name = uv->name;
                 sv->name_len = (uint32_t)uv->name_len;
                 sv->type = resolve_type(c, uv->type);
+                /* BUG-224: reject void union variants */
+                if (sv->type && sv->type->kind == TYPE_VOID) {
+                    checker_error(c, node->loc.line,
+                        "union variant '%.*s' cannot have type 'void'",
+                        (int)uv->name_len, uv->name);
+                }
             }
         }
         break;

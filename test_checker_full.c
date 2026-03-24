@@ -1122,6 +1122,20 @@ static void test_negative_sweep(void) {
         "*u32 test() { *u32 p = &g; u32 x = 42; p = &x; return p; }",
         "assign &local sets local-derived flag");
 
+    /* BUG-224: void struct field / union variant rejected */
+    err("struct S { void x; }\nu32 main() { return 0; }",
+        "void struct field rejected");
+    err("union U { void a; u32 b; }\nu32 main() { return 0; }",
+        "void union variant rejected");
+
+    /* BUG-225: Pool/Ring/Arena assignment rejected */
+    err("static Pool(u32, 4) p;\nstatic Pool(u32, 4) q;\nu32 main() { p = q; return 0; }",
+        "Pool assignment rejected");
+
+    /* BUG-226: float switch rejected */
+    err("u32 main() { f32 x = 1.0; switch (x) { default => { return 1; } } }",
+        "float switch rejected");
+
     /* BUG-221: keep parameter rejects local-derived pointers */
     err("static Pool(u32, 4) pool;\n"
         "void store(keep *u32 p) { pool.alloc(); }\n"

@@ -325,10 +325,9 @@ bool can_implicit_coerce(Type *from, Type *to) {
         }
     }
 
-    /* slice to pointer: []T → *T (decay, like C array-to-pointer) */
-    if (from->kind == TYPE_SLICE && to->kind == TYPE_POINTER) {
-        return type_equals(from->slice.inner, to->pointer.inner);
-    }
+    /* slice to pointer: []T → *T — REMOVED (BUG-162)
+     * An empty slice has ptr=NULL, violating *T non-null guarantee.
+     * Use .ptr explicitly if you need a pointer from a slice. */
 
     return false;
 }

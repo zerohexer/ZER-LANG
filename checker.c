@@ -1782,6 +1782,28 @@ static void check_stmt(Checker *c, Node *node) {
                         if (src && src->is_arena_derived) {
                             sym->is_arena_derived = true;
                         }
+                        if (src && src->is_local_derived) {
+                            sym->is_local_derived = true;
+                        }
+                    }
+                }
+
+                /* detect pointer to local: p = &local or p = &local.field */
+                Node *init = node->var_decl.init;
+                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
+                    Node *root = init->unary.operand;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        bool is_global = scope_lookup_local(c->global_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                        Symbol *src = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (src && !src->is_static && !is_global) {
+                            sym->is_local_derived = true;
+                        }
                     }
                 }
             }
@@ -2183,6 +2205,12 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "cannot return arena-derived pointer '%.*s' — "
                             "arena memory is freed when function returns",
+                            (int)sym->name_len, sym->name);
+                    }
+                    if (sym && sym->is_local_derived) {
+                        checker_error(c, node->loc.line,
+                            "cannot return pointer to local '%.*s' — "
+                            "stack memory is freed when function returns",
                             (int)sym->name_len, sym->name);
                     }
                 }

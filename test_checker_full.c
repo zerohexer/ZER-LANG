@@ -724,6 +724,14 @@ static void test_security_review(void) {
         "}\n",
         "arena return escape from local arena → error");
 
+    /* BUG-162: slice-to-pointer null hole */
+    err("void clear(*u8 data) { *data = 0; }\nvoid f() { []u8 empty; clear(empty); }",
+        "[]u8 → *u8 coercion REJECT (null hole)");
+
+    /* BUG-163: pointer escape via local variable */
+    err("*u32 leak() { u32 x = 42; *u32 p = &x; return p; }",
+        "return local-derived pointer REJECT");
+
     /* BUG-157: const laundering via return */
     err("*u32 wash(const *u32 p) { return p; }",
         "const ptr → mutable return REJECT");

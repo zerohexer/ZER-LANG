@@ -831,10 +831,23 @@ static void emit_expr(Emitter *e, Node *node) {
          * Inline check respects short-circuit (&&/||) and works in
          * if/while/for conditions — fixes both hoisting and missing-check bugs. */
         Type *idx_obj_type = checker_get_type(node->index_expr.object);
-        /* Check if index has side effects (function call) — needs single-eval.
+        /* Check if index or object has side effects — needs single-eval.
          * Simple expressions (ident, literal) can safely double-evaluate. */
         bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL ||
                                       node->index_expr.index->kind == NODE_ASSIGN);
+        /* check if base object has side effects (e.g. get_slice()[0]) */
+        bool obj_has_side_effects = false;
+        {
+            Node *n = node->index_expr.object;
+            while (n) {
+                if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
+                    obj_has_side_effects = true; break;
+                }
+                if (n->kind == NODE_FIELD) n = n->field.object;
+                else if (n->kind == NODE_INDEX) n = n->index_expr.object;
+                else break;
+            }
+        }
         if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY && idx_obj_type->array.size > 0) {
             if (idx_has_side_effects) {
                 /* Single-eval lvalue path: pointer dereference preserves lvalue.
@@ -857,15 +870,16 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "]");
             }
         } else if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
-            if (idx_has_side_effects) {
+            if (idx_has_side_effects || obj_has_side_effects) {
+                /* hoist both object and index for single-eval */
                 int tmp = e->temp_count++;
-                emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
+                emit(e, "*({ __auto_type _zer_obj%d = ", tmp);
+                emit_expr(e, node->index_expr.object);
+                emit(e, "; size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
-                emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
-                emit_expr(e, node->index_expr.object);
-                emit(e, ".len, __FILE__, __LINE__); &");
-                emit_expr(e, node->index_expr.object);
-                emit(e, ".ptr[_zer_idx%d]; })", tmp);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, _zer_obj%d.len, __FILE__, __LINE__); &",
+                     tmp, tmp);
+                emit(e, "_zer_obj%d.ptr[_zer_idx%d]; })", tmp, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_expr(e, node->index_expr.index);

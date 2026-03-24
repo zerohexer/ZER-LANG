@@ -73,6 +73,18 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-162: Slice-to-pointer implicit coercion allows NULL — non-null guarantee broken
+- **Symptom:** `[]u8 empty; clear(empty)` passes, `empty.ptr` is NULL but `*u8` is non-null type.
+- **Fix:** Remove `[]T → *T` implicit coercion from `can_implicit_coerce`. Use `.ptr` explicitly.
+
+### BUG-163: Pointer escape via local variable — `p = &x; return p`
+- **Symptom:** `*u32 p = &x; return p` passes because return check only handles direct `&x`.
+- **Fix:** Add `is_local_derived` flag on Symbol. Set when `p = &local`. Propagate through aliases. Block on return.
+
+### BUG-164: Base-object double-evaluation in slice indexing
+- **Symptom:** `get_slice()[0]` calls `get_slice()` twice (bounds check + access).
+- **Fix:** Detect side effects in base object chain. Hoist slice into `__auto_type _zer_obj` temp.
+
 ### BUG-157: Const laundering via return — const ptr returned as mutable
 - **Symptom:** `*u32 wash(const *u32 p) { return p; }` passes because `type_equals` ignores `is_const`.
 - **Fix:** NODE_RETURN checks const mismatch between return type and function return type for pointers/slices.

@@ -164,6 +164,7 @@ struct Symbol {
     bool is_const;          /* const qualifier */
     bool is_static;         /* static storage duration */
     bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
+    bool is_local_derived;  /* pointer to local variable — cannot be returned */
 
     /* for functions */
     bool is_function;

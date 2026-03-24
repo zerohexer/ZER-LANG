@@ -340,6 +340,12 @@ ZER spec promises defined behavior for shifts. C has UB for shift >= width. The 
 **24. Bounds check side-effect detection: NODE_CALL AND NODE_ASSIGN.**
 Index expressions with side effects (function calls, assignments) use GCC statement expression for single evaluation. Simple indices (ident, literal) use comma operator for lvalue compatibility. Detection: `kind == NODE_CALL || kind == NODE_ASSIGN`. (BUG-119, BUG-126)
 
+**25. GCC flags: `-fwrapv -fno-strict-aliasing` are MANDATORY.**
+`-fwrapv` = signed overflow wraps (ZER spec). `-fno-strict-aliasing` = prevents GCC optimizer from reordering through `@ptrcast` type-punned pointers. Both in `zerc --run` invocation and emitted C preamble comment.
+
+**26. Side-effect index lvalue: `*({ ...; &arr[_idx]; })` pattern.**
+`arr[func()] = val` needs single-eval AND lvalue. Plain statement expression `({ ...; arr[_idx]; })` is rvalue only. Fix: take address inside, dereference outside: `*({ size_t _i = func(); check(_i); &arr[_i]; })`. (BUG-132)
+
 ### Known Technical Debt (v0.2)
 - **Double Resolution:** `resolve_type_for_emit()` in emitter.c duplicates `resolve_type()` in checker.c. Any type resolution fix must be applied in BOTH. Mitigation: shared `eval_const_expr()` in ast.h. Proper fix: checker stores resolved Type* on AST nodes via `typemap_set()`, emitter reads via `checker_get_type()`. ~200 lines refactor.
 - **Source Mapping:** Runtime traps show `.c` file lines. Fix: emit `#line N "source.zer"` directives. ~50 lines.

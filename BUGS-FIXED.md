@@ -73,6 +73,14 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-132: Side-effect index as lvalue fails — GCC rejects statement expression
+- **Symptom:** `arr[func()] = 42` — GCC error "lvalue required." Statement expression is rvalue.
+- **Fix:** Pointer dereference pattern: `*({ size_t _i = func(); check(_i); &arr[_i]; })`.
+
+### BUG-133: Strict aliasing — GCC optimizer reorders through @ptrcast
+- **Symptom:** `@ptrcast(*f32, &u32_val)` — GCC `-O2` may reorder reads/writes via TBAA.
+- **Fix:** Added `-fno-strict-aliasing` to GCC invocation and preamble comment.
+
 ### BUG-128: Runtime bit extraction [63..0] still has UB when indices are variables
 - **Symptom:** `val[hi..lo]` where `hi=63, lo=0` are runtime variables returns 0 instead of full value. BUG-125 only fixed the constant-folded path.
 - **Root cause:** When `eval_const_expr` returns -1 (non-constant), the `else` branch emits raw `1ull << (high - low + 1)` which is UB when width=64.

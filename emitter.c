@@ -70,6 +70,15 @@ static void emit_type(Emitter *e, Type *t);
 static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
+
+/* RF3: resolve TypeNode via checker's typemap (set during resolve_type).
+ * Falls back to resolve_type_for_emit if not cached (safety net). */
+static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
+    if (!tn) return NULL;
+    Type *t = checker_get_type(e->checker, (Node *)tn);
+    if (t) return t;
+    return resolve_type_for_emit(e, tn);  /* fallback for uncached TypeNodes */
+}
 static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
 
@@ -1442,7 +1451,7 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @size(T) → sizeof(T) */
             emit(e, "sizeof(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
@@ -1459,7 +1468,7 @@ static void emit_expr(Emitter *e, Node *node) {
              * or as args[0] if it's a named type (identifier). */
             emit(e, "offsetof(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
                 emit(e, ", ");
                 if (node->intrinsic.arg_count > 0)
@@ -1476,7 +1485,7 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @ptrcast(*T, expr) → (T*)(expr) */
             emit(e, "(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
             }
             emit(e, ")(");
@@ -1486,7 +1495,7 @@ static void emit_expr(Emitter *e, Node *node) {
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             /* @bitcast(T, val) → memcpy type punning (valid C99+GCC) */
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
                 emit(e, "({__auto_type _zer_bci%d = ", tmp2);
@@ -1503,7 +1512,7 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @truncate(val) → (T)(val) */
             emit(e, "(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
             }
             emit(e, ")(");
@@ -1513,7 +1522,7 @@ static void emit_expr(Emitter *e, Node *node) {
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
@@ -1548,7 +1557,7 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr) */
             emit(e, "(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
             }
             emit(e, ")(uintptr_t)(");
@@ -1573,7 +1582,7 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field)) */
             emit(e, "((");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
             }
             emit(e, ")((char*)(");
@@ -1581,7 +1590,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, ") - offsetof(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 /* need the struct type without pointer */
                 if (t->kind == TYPE_POINTER)
                     emit_type(e, t->pointer.inner);
@@ -1661,7 +1670,7 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @cast(T, val) — distinct typedef conversion, same underlying type */
             if (node->intrinsic.type_arg && node->intrinsic.arg_count > 0) {
                 emit(e, "((");
-                Type *tgt = resolve_type_for_emit(e, node->intrinsic.type_arg);
+                Type *tgt = resolve_tynode(e,node->intrinsic.type_arg);
                 if (tgt) emit_type(e, tgt);
                 emit(e, ")(");
                 emit_expr(e, node->intrinsic.args[0]);
@@ -2375,15 +2384,15 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
     case TYNODE_BOOL:   return ty_bool;
     case TYNODE_VOID:   return ty_void;
     case TYNODE_POINTER: {
-        Type *inner = resolve_type_for_emit(e, tn->pointer.inner);
+        Type *inner = resolve_tynode(e,tn->pointer.inner);
         return type_pointer(e->arena, inner);
     }
     case TYNODE_OPTIONAL: {
-        Type *inner = resolve_type_for_emit(e, tn->optional.inner);
+        Type *inner = resolve_tynode(e,tn->optional.inner);
         return type_optional(e->arena, inner);
     }
     case TYNODE_ARRAY: {
-        Type *elem = resolve_type_for_emit(e, tn->array.elem);
+        Type *elem = resolve_tynode(e,tn->array.elem);
         uint32_t size = 0;
         if (tn->array.size_expr) {
             int64_t val = eval_const_expr(tn->array.size_expr);
@@ -2392,11 +2401,11 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return type_array(e->arena, elem, size);
     }
     case TYNODE_SLICE: {
-        Type *inner = resolve_type_for_emit(e, tn->slice.inner);
+        Type *inner = resolve_tynode(e,tn->slice.inner);
         return type_slice(e->arena, inner);
     }
     case TYNODE_HANDLE:
-        return type_handle(e->arena, resolve_type_for_emit(e, tn->handle.elem));
+        return type_handle(e->arena, resolve_tynode(e,tn->handle.elem));
     case TYNODE_NAMED: {
         /* look up in checker's global scope */
         Symbol *sym = scope_lookup(e->checker->global_scope,
@@ -2405,9 +2414,9 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return ty_void;
     }
     case TYNODE_CONST:
-        return resolve_type_for_emit(e, tn->qualified.inner);
+        return resolve_tynode(e,tn->qualified.inner);
     case TYNODE_VOLATILE: {
-        Type *inner = resolve_type_for_emit(e, tn->qualified.inner);
+        Type *inner = resolve_tynode(e,tn->qualified.inner);
         /* propagate volatile to pointer type */
         if (inner && inner->kind == TYPE_POINTER) {
             Type *vp = type_pointer(e->arena, inner->pointer.inner);
@@ -2421,7 +2430,7 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
     case TYNODE_OPAQUE:
         return ty_opaque;
     case TYNODE_POOL: {
-        Type *elem = resolve_type_for_emit(e, tn->pool.elem);
+        Type *elem = resolve_tynode(e,tn->pool.elem);
         uint32_t count = 0;
         if (tn->pool.count_expr) {
             int64_t val = eval_const_expr(tn->pool.count_expr);
@@ -2430,7 +2439,7 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return type_pool(e->arena, elem, count);
     }
     case TYNODE_RING: {
-        Type *elem = resolve_type_for_emit(e, tn->ring.elem);
+        Type *elem = resolve_tynode(e,tn->ring.elem);
         uint32_t count = 0;
         if (tn->ring.count_expr) {
             int64_t val = eval_const_expr(tn->ring.count_expr);
@@ -2439,13 +2448,13 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return type_ring(e->arena, elem, count);
     }
     case TYNODE_FUNC_PTR: {
-        Type *ret = resolve_type_for_emit(e, tn->func_ptr.return_type);
+        Type *ret = resolve_tynode(e,tn->func_ptr.return_type);
         uint32_t pc = (uint32_t)tn->func_ptr.param_count;
         Type **params = NULL;
         if (pc > 0) {
             params = (Type **)arena_alloc(e->arena, pc * sizeof(Type *));
             for (uint32_t i = 0; i < pc; i++)
-                params[i] = resolve_type_for_emit(e, tn->func_ptr.param_types[i]);
+                params[i] = resolve_tynode(e,tn->func_ptr.param_types[i]);
         }
         return type_func_ptr(e->arena, params, pc, ret);
     }
@@ -2477,7 +2486,7 @@ static void emit_struct_decl(Emitter *e, Node *node) {
         FieldDecl *f = &node->struct_decl.fields[i];
         Type *ftype = (st && st->kind == TYPE_STRUCT &&
                       (uint32_t)i < st->struct_type.field_count) ?
-            st->struct_type.fields[i].type : resolve_type_for_emit(e, f->type);
+            st->struct_type.fields[i].type : resolve_tynode(e,f->type);
         emit_indent(e);
         /* check if field has volatile qualifier (TYNODE_VOLATILE wrapper) */
         if (f->type && f->type->kind == TYNODE_VOLATILE &&
@@ -2537,7 +2546,7 @@ static void emit_func_decl(Emitter *e, Node *node) {
             ParamDecl *p = &node->func_decl.params[i];
             Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
                           (uint32_t)i < func_type->func_ptr.param_count) ?
-                func_type->func_ptr.params[i] : resolve_type_for_emit(e, p->type);
+                func_type->func_ptr.params[i] : resolve_tynode(e,p->type);
             emit_type_and_name(e, ptype, p->name, p->name_len);
         }
     }
@@ -2702,7 +2711,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         emit(e, " {\n    int32_t _tag;\n    union {\n");
         for (int j = 0; j < decl->union_decl.variant_count; j++) {
             UnionVariant *v = &decl->union_decl.variants[j];
-            Type *vtype = resolve_type_for_emit(e, v->type);
+            Type *vtype = resolve_tynode(e,v->type);
             emit(e, "        ");
             emit_type(e, vtype);
             emit(e, " %.*s;\n", (int)v->name_len, v->name);

@@ -310,9 +310,21 @@ static int64_t compute_type_size(Type *t) {
     return -1;
 }
 
+static Type *resolve_type_inner(Checker *c, TypeNode *tn);
+
+/* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
 static Type *resolve_type(Checker *c, TypeNode *tn) {
     if (!tn) return ty_void;
+    /* check cache first */
+    Type *cached = typemap_get(c, (Node *)tn);
+    if (cached) return cached;
+    /* resolve and store */
+    Type *t = resolve_type_inner(c, tn);
+    if (t) typemap_set(c, (Node *)tn, t);
+    return t;
+}
 
+static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
     switch (tn->kind) {
     case TYNODE_U8:     return ty_u8;
     case TYNODE_U16:    return ty_u16;

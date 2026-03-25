@@ -124,4 +124,11 @@ docker-shell:
 	docker build -t zer-lang-dev .
 	docker run --rm -it zer-lang-dev bash
 
-.PHONY: check clean release docker-check docker-build docker-shell
+# ---- Docker release: build Linux binaries (extracted to release/) ----
+docker-release:
+	docker build -t zer-lang-dev .
+	@mkdir -p release
+	docker run --rm zer-lang-dev sh -c "make zerc zer-lsp 2>/dev/null && tar cf - zerc zer-lsp" | tar xf - -C release/
+	@echo "Linux binaries in release/ (zerc, zer-lsp)"
+
+.PHONY: check clean release docker-check docker-build docker-shell docker-release

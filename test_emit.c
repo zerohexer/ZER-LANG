@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include "lexer.h"
 #include "ast.h"
 #include "parser.h"
@@ -2571,7 +2574,7 @@ int main(void) {
         0,
         "@saturate(u8, -5) = 0");
 
-    printf("[array size emission — %llu format]\n");
+    printf("[array size emission — %%llu format]\n");
     test_compile_and_run(
         "u32 main() {\n"
         "    u32[1024] big;\n"

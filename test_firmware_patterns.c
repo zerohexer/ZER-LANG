@@ -63,7 +63,11 @@ static void test_e2e(const char *zer_source, int expected_exit, const char *test
         return;
     }
 
+#ifdef _WIN32
     int gcc_ret = system("gcc -std=c99 -O0 -w -o _zer_fw_test.exe _zer_fw_test.c 2>_zer_fw_err.txt");
+#else
+    int gcc_ret = system("gcc -std=c99 -O0 -w -o _zer_fw_test _zer_fw_test.c 2>_zer_fw_err.txt");
+#endif
     if (gcc_ret != 0) {
         printf("  FAIL: %s — GCC compilation failed\n", test_name);
         FILE *ef = fopen("_zer_fw_err.txt", "r");
@@ -76,7 +80,11 @@ static void test_e2e(const char *zer_source, int expected_exit, const char *test
         return;
     }
 
+#ifdef _WIN32
     int run_ret = system(".\\_zer_fw_test.exe");
+#else
+    int run_ret = system("./_zer_fw_test");
+#endif
     int exit_code = run_ret;
 
     if (exit_code != expected_exit) {

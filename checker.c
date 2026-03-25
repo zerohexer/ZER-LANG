@@ -140,42 +140,31 @@ static Symbol *find_symbol(Checker *c, const char *name, uint32_t name_len, int 
  * hash map keyed by node pointer. This avoids modifying the Node struct. */
 
 /* ---- Dynamic type map: open-addressing hash, grows when >70% full ---- */
-
-typedef struct {
-    Node *key;
-    Type *type;
-} TypeMapEntry;
-
-static TypeMapEntry *type_map = NULL;
-static uint32_t type_map_size = 0;
-static uint32_t type_map_count = 0;
-static Arena *type_map_arena = NULL;
+/* RF1: typemap is now per-Checker (fields in Checker struct), not global */
 
 #define TYPE_MAP_INIT_SIZE 4096
 
-static void typemap_init(Arena *a) {
-    type_map_arena = a;
-    type_map_size = TYPE_MAP_INIT_SIZE;
-    type_map = (TypeMapEntry *)arena_alloc(a, type_map_size * sizeof(TypeMapEntry));
-    type_map_count = 0;
+static void typemap_init(Checker *c) {
+    c->type_map_size = TYPE_MAP_INIT_SIZE;
+    c->type_map = (TypeMapEntry *)arena_alloc(c->arena, c->type_map_size * sizeof(TypeMapEntry));
+    c->type_map_count = 0;
 }
 
-static void typemap_grow(void) {
-    uint32_t old_size = type_map_size;
-    TypeMapEntry *old_map = type_map;
-    type_map_size = old_size * 2;
-    type_map = (TypeMapEntry *)arena_alloc(type_map_arena,
-        type_map_size * sizeof(TypeMapEntry));
-    type_map_count = 0;
-    /* rehash all existing entries */
+static void typemap_grow(Checker *c) {
+    uint32_t old_size = c->type_map_size;
+    TypeMapEntry *old_map = c->type_map;
+    c->type_map_size = old_size * 2;
+    c->type_map = (TypeMapEntry *)arena_alloc(c->arena,
+        c->type_map_size * sizeof(TypeMapEntry));
+    c->type_map_count = 0;
     for (uint32_t i = 0; i < old_size; i++) {
         if (old_map[i].key) {
-            uint32_t idx = ((uintptr_t)old_map[i].key >> 3) % type_map_size;
-            for (uint32_t j = 0; j < type_map_size; j++) {
-                uint32_t slot = (idx + j) % type_map_size;
-                if (!type_map[slot].key) {
-                    type_map[slot] = old_map[i];
-                    type_map_count++;
+            uint32_t idx = ((uintptr_t)old_map[i].key >> 3) % c->type_map_size;
+            for (uint32_t j = 0; j < c->type_map_size; j++) {
+                uint32_t slot = (idx + j) % c->type_map_size;
+                if (!c->type_map[slot].key) {
+                    c->type_map[slot] = old_map[i];
+                    c->type_map_count++;
                     break;
                 }
             }
@@ -183,34 +172,33 @@ static void typemap_grow(void) {
     }
 }
 
-static void typemap_set(Node *node, Type *type) {
-    /* grow at 70% load to keep collisions low */
-    if (type_map_count * 10 > type_map_size * 7) {
-        typemap_grow();
+static void typemap_set(Checker *c, Node *node, Type *type) {
+    if (c->type_map_count * 10 > c->type_map_size * 7) {
+        typemap_grow(c);
     }
-    uint32_t idx = ((uintptr_t)node >> 3) % type_map_size;
-    for (uint32_t i = 0; i < type_map_size; i++) {
-        uint32_t slot = (idx + i) % type_map_size;
-        if (!type_map[slot].key) {
-            type_map[slot].key = node;
-            type_map[slot].type = type;
-            type_map_count++;
+    uint32_t idx = ((uintptr_t)node >> 3) % c->type_map_size;
+    for (uint32_t i = 0; i < c->type_map_size; i++) {
+        uint32_t slot = (idx + i) % c->type_map_size;
+        if (!c->type_map[slot].key) {
+            c->type_map[slot].key = node;
+            c->type_map[slot].type = type;
+            c->type_map_count++;
             return;
         }
-        if (type_map[slot].key == node) {
-            type_map[slot].type = type;
+        if (c->type_map[slot].key == node) {
+            c->type_map[slot].type = type;
             return;
         }
     }
 }
 
-static Type *typemap_get(Node *node) {
-    if (!type_map) return NULL;
-    uint32_t idx = ((uintptr_t)node >> 3) % type_map_size;
-    for (uint32_t i = 0; i < type_map_size; i++) {
-        uint32_t slot = (idx + i) % type_map_size;
-        if (type_map[slot].key == node) return type_map[slot].type;
-        if (!type_map[slot].key) return NULL;
+static Type *typemap_get(Checker *c, Node *node) {
+    if (!c->type_map) return NULL;
+    uint32_t idx = ((uintptr_t)node >> 3) % c->type_map_size;
+    for (uint32_t i = 0; i < c->type_map_size; i++) {
+        uint32_t slot = (idx + i) % c->type_map_size;
+        if (c->type_map[slot].key == node) return c->type_map[slot].type;
+        if (!c->type_map[slot].key) return NULL;
     }
     return NULL;
 }
@@ -752,7 +740,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             root->kind == NODE_UNARY)) {
                 if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
                     /* deref: *p = val — check if p's type is const pointer */
-                    Type *ptr_type = checker_get_type(root->unary.operand);
+                    Type *ptr_type = typemap_get(c, root->unary.operand);
                     if (ptr_type && ptr_type->kind == TYPE_POINTER && ptr_type->pointer.is_const) {
                         through_const_pointer = true;
                     }
@@ -760,7 +748,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     root = root->unary.operand;
                 } else if (root->kind == NODE_FIELD) {
                     /* check if object is a pointer (auto-deref) */
-                    Type *obj_type = checker_get_type(root->field.object);
+                    Type *obj_type = typemap_get(c, root->field.object);
                     if (obj_type && obj_type->kind == TYPE_POINTER) {
                         through_pointer = true;
                         if (obj_type->pointer.is_const)
@@ -975,7 +963,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 size_t mlen = alloc_call->call.callee->field.field_name_len;
                 if (obj && ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
                            (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
-                    Type *obj_type = checker_get_type(obj);
+                    Type *obj_type = typemap_get(c, obj);
                     if (obj_type && obj_type->kind == TYPE_ARENA) {
                         bool arena_is_global = false;
                         if (obj->kind == NODE_IDENT) {
@@ -1165,14 +1153,14 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "pool.alloc() takes no arguments");
                     result = type_optional(c->arena, type_handle(c->arena, obj->pool.elem));
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "pool.get() takes exactly 1 argument");
                     result = type_pointer(c->arena, obj->pool.elem);
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     mark_non_storable(node); /* Rule 2: get() result non-storable */
                     break;
                 }
@@ -1183,7 +1171,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "pool.free() takes exactly 1 argument");
                     result = ty_void;
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 checker_error(c, node->loc.line,
@@ -1202,7 +1190,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push() takes exactly 1 argument");
                     result = ty_void;
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 12 && memcmp(mname, "push_checked", 12) == 0) {
@@ -1212,7 +1200,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push_checked() takes exactly 1 argument");
                     result = type_optional(c->arena, ty_void);
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
@@ -1222,7 +1210,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "ring.pop() takes no arguments");
                     result = type_optional(c->arena, obj->ring.elem);
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 checker_error(c, node->loc.line,
@@ -1238,7 +1226,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "Arena.over() takes exactly 1 argument");
                     result = ty_arena;
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
@@ -1264,7 +1252,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     } else {
                         result = ty_void;
                     }
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 5 && memcmp(mname, "reset", 5) == 0) {
@@ -1277,7 +1265,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             "use defer or unsafe_reset()");
                     }
                     result = ty_void;
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0) {
@@ -1303,7 +1291,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     } else {
                         result = ty_void;
                     }
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 if (mlen == 12 && memcmp(mname, "unsafe_reset", 12) == 0) {
@@ -1313,7 +1301,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "arena.unsafe_reset() takes no arguments");
                     result = ty_void;
-                    typemap_set(field_node, result);
+                    typemap_set(c, field_node,result);
                     break;
                 }
                 checker_error(c, node->loc.line,
@@ -1899,7 +1887,7 @@ static Type *check_expr(Checker *c, Node *node) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
                 if (node->intrinsic.arg_count > 0) {
-                    Type *val_type = typemap_get(node->intrinsic.args[0]);
+                    Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
                         Type *eff = type_unwrap_distinct(val_type);
                         if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
@@ -1967,7 +1955,7 @@ static Type *check_expr(Checker *c, Node *node) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
                 if (node->intrinsic.arg_count > 0) {
-                    Type *val_type = typemap_get(node->intrinsic.args[0]);
+                    Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
                         Type *eff = type_unwrap_distinct(val_type);
                         if (!type_is_integer(eff)) {
@@ -1983,7 +1971,7 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
             /* @ptrtoint(ptr) — source must be a pointer */
             if (node->intrinsic.arg_count > 0) {
-                Type *val_type = typemap_get(node->intrinsic.args[0]);
+                Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                 if (val_type) {
                     Type *eff = type_unwrap_distinct(val_type);
                     if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
@@ -2015,7 +2003,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* BUG-241: also check if destination type is const pointer */
             if (node->intrinsic.arg_count >= 1) {
-                Type *dst_type = checker_get_type(node->intrinsic.args[0]);
+                Type *dst_type = typemap_get(c, node->intrinsic.args[0]);
                 if (dst_type && dst_type->kind == TYPE_POINTER && dst_type->pointer.is_const) {
                     checker_error(c, node->loc.line,
                         "@cstr destination is a const pointer — cannot write to read-only memory");
@@ -2023,7 +2011,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* BUG-234: compile-time overflow check when dest is array and src is string literal */
             if (node->intrinsic.arg_count >= 2) {
-                Type *dst_type = checker_get_type(node->intrinsic.args[0]);
+                Type *dst_type = typemap_get(c, node->intrinsic.args[0]);
                 if (dst_type && dst_type->kind == TYPE_ARRAY &&
                     node->intrinsic.args[1]->kind == NODE_STRING_LIT) {
                     uint64_t buf_size = dst_type->array.size;
@@ -2057,7 +2045,7 @@ static Type *check_expr(Checker *c, Node *node) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
                 if (node->intrinsic.arg_count > 0) {
-                    Type *val_type = typemap_get(node->intrinsic.args[0]);
+                    Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
                         bool tgt_distinct = result->kind == TYPE_DISTINCT;
                         bool src_distinct = val_type->kind == TYPE_DISTINCT;
@@ -2103,7 +2091,7 @@ static Type *check_expr(Checker *c, Node *node) {
     }
 
     if (!result) result = ty_void;
-    typemap_set(node, result);
+    typemap_set(c, node,result);
     c->expr_depth--;
     return result;
 }
@@ -2158,7 +2146,7 @@ static void check_stmt(Checker *c, Node *node) {
                 type_name(type->pointer.inner), type_name(type->pointer.inner));
         }
 
-        typemap_set(node, type); /* store for emitter to read via checker_get_type */
+        typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
 
         if (node->var_decl.init) {
             Type *init_type = check_expr(c, node->var_decl.init);
@@ -2221,10 +2209,18 @@ static void check_stmt(Checker *c, Node *node) {
             if (!type_equals(type, init_type) &&
                 !can_implicit_coerce(init_type, type) &&
                 !is_literal_compatible(node->var_decl.init, type)) {
-                checker_error(c, node->loc.line,
-                    "cannot initialize '%.*s' of type '%s' with '%s'",
-                    (int)node->var_decl.name_len, node->var_decl.name,
-                    type_name(type), type_name(init_type));
+                /* RF6: better error for null used with non-optional type */
+                if (node->var_decl.init->kind == NODE_NULL_LIT) {
+                    checker_error(c, node->loc.line,
+                        "'null' can only be assigned to optional types (?*T, ?T) — "
+                        "'%s' is not optional",
+                        type_name(type));
+                } else {
+                    checker_error(c, node->loc.line,
+                        "cannot initialize '%.*s' of type '%s' with '%s'",
+                        (int)node->var_decl.name_len, node->var_decl.name,
+                        type_name(type), type_name(init_type));
+                }
             }
         }
 
@@ -2248,7 +2244,7 @@ static void check_stmt(Checker *c, Node *node) {
                     size_t mlen = alloc_call->call.callee->field.field_name_len;
                     if (obj && ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
                                (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
-                        Type *obj_type = checker_get_type(obj);
+                        Type *obj_type = typemap_get(c, obj);
                         if (obj_type && obj_type->kind == TYPE_ARENA) {
                             /* only mark as arena-derived if arena is LOCAL
                              * (global arenas outlive functions, pointers safe to return) */
@@ -2337,7 +2333,7 @@ static void check_stmt(Checker *c, Node *node) {
                     else slice_root = slice_root->index_expr.object;
                 }
                 if (slice_root && slice_root->kind == NODE_IDENT) {
-                    Type *root_type = checker_get_type(slice_root);
+                    Type *root_type = typemap_get(c, slice_root);
                     Symbol *src = scope_lookup(c->current_scope,
                         slice_root->ident.name,
                         (uint32_t)slice_root->ident.name_len);
@@ -2409,7 +2405,7 @@ static void check_stmt(Checker *c, Node *node) {
                         const char *mname = cond_expr->call.callee->field.field_name;
                         size_t mlen = cond_expr->call.callee->field.field_name_len;
                         if (obj) {
-                            Type *obj_type = checker_get_type(obj);
+                            Type *obj_type = typemap_get(c, obj);
                             if (obj_type && obj_type->kind == TYPE_ARENA &&
                                 ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
                                  (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
@@ -2924,7 +2920,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->struct_decl.name,
                    (uint32_t)node->struct_decl.name_len,
                    t, node->loc.line);
-        typemap_set(node, t);
+        typemap_set(c, node,t);
 
         /* now resolve field types (self-type is in scope) */
         if (node->struct_decl.field_count > 0) {
@@ -3018,7 +3014,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->enum_decl.name,
                    (uint32_t)node->enum_decl.name_len,
                    t, node->loc.line);
-        typemap_set(node, t);
+        typemap_set(c, node,t);
         break;
     }
 
@@ -3035,7 +3031,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->union_decl.name,
                    (uint32_t)node->union_decl.name_len,
                    t, node->loc.line);
-        typemap_set(node, t);
+        typemap_set(c, node,t);
 
         if (node->union_decl.variant_count > 0) {
             t->union_type.variants = (SUVariant *)arena_alloc(c->arena,
@@ -3084,7 +3080,7 @@ static void register_decl(Checker *c, Node *node) {
         add_symbol(c, node->typedef_decl.name,
                    (uint32_t)node->typedef_decl.name_len,
                    type, node->loc.line);
-        typemap_set(node, type);
+        typemap_set(c, node,type);
         break;
     }
 
@@ -3126,7 +3122,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->module_prefix = c->current_module;
             sym->module_prefix_len = c->current_module_len;
         }
-        typemap_set(node, func_type);
+        typemap_set(c, node,func_type);
         break;
     }
 
@@ -3151,7 +3147,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->module_prefix = c->current_module;
             sym->module_prefix_len = c->current_module_len;
         }
-        typemap_set(node, type);
+        typemap_set(c, node,type);
         break;
     }
 
@@ -3320,7 +3316,7 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     c->current_scope = c->global_scope;
 
     /* init dynamic type map */
-    typemap_init(arena);
+    typemap_init(c);
 
     /* init non-storable tracking */
     non_storable_init(arena);
@@ -3329,8 +3325,8 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     scope_add(arena, c->global_scope, "Arena", 5, ty_arena, 0, file_name);
 }
 
-Type *checker_get_type(Node *node) {
-    return typemap_get(node);
+Type *checker_get_type(Checker *c, Node *node) {
+    return typemap_get(c, node);
 }
 
 void checker_register_file(Checker *c, Node *file_node) {
@@ -3353,21 +3349,21 @@ void checker_register_file(Checker *c, Node *file_node) {
          * symbol. Mangled key = "module_name", used by emitter's BUG-229 fallback. */
         if (c->current_module &&
             (decl->kind == NODE_FUNC_DECL || decl->kind == NODE_GLOBAL_VAR)) {
-            Type *dt = typemap_get(decl);
+            Type *dt = typemap_get(c, decl);
             if (dt) {
                 const char *dname = (decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name : decl->var_decl.name;
                 uint32_t dname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name_len : decl->var_decl.name_len);
-                char mk[256];
-                int mkl = snprintf(mk, sizeof(mk), "%.*s_%.*s",
-                    (int)c->current_module_len, c->current_module,
-                    (int)dname_len, dname);
-                char *mk_copy = (char *)arena_alloc(c->arena, (uint32_t)mkl + 1);
-                memcpy(mk_copy, mk, (uint32_t)mkl);
+                /* RF4: use arena-allocated buffer for arbitrary length mangled names */
+                uint32_t mkl = c->current_module_len + 1 + dname_len;
+                char *mk_copy = (char *)arena_alloc(c->arena, mkl + 1);
+                memcpy(mk_copy, c->current_module, c->current_module_len);
+                mk_copy[c->current_module_len] = '_';
+                memcpy(mk_copy + c->current_module_len + 1, dname, dname_len);
                 mk_copy[mkl] = '\0';
                 Symbol *ms = scope_add(c->arena, c->global_scope,
-                    mk_copy, (uint32_t)mkl, dt, decl->loc.line, c->file_name);
+                    mk_copy, mkl, dt, decl->loc.line, c->file_name);
                 if (ms) {
                     ms->module_prefix = c->current_module;
                     ms->module_prefix_len = c->current_module_len;
@@ -3392,7 +3388,7 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
         Node *decl = file_node->file.decls[i];
         if (decl->kind == NODE_STRUCT_DECL || decl->kind == NODE_ENUM_DECL ||
             decl->kind == NODE_UNION_DECL) {
-            Type *t = typemap_get(decl);
+            Type *t = typemap_get(c, decl);
             if (t) {
                 const char *name = NULL;
                 uint32_t name_len = 0;
@@ -3420,20 +3416,18 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
             /* BUG-229: register into global scope with MANGLED key for emitter.
              * Uses "module_name" as key to avoid collision between
              * mod_a's static x and mod_b's static x. */
-            Type *st = typemap_get(decl);
+            Type *st = typemap_get(c, decl);
             if (st && c->current_module) {
                 const char *sname = (decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name : decl->var_decl.name;
                 uint32_t sname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name_len : decl->var_decl.name_len);
-                /* build mangled key: module_name */
-                char mangled_key[256];
-                int mk_len = snprintf(mangled_key, sizeof(mangled_key), "%.*s_%.*s",
-                    (int)c->current_module_len, c->current_module,
-                    (int)sname_len, sname);
-                /* allocate persistent copy in arena */
-                char *mk_copy = (char *)arena_alloc(c->arena, (uint32_t)mk_len + 1);
-                memcpy(mk_copy, mangled_key, (uint32_t)mk_len);
+                /* RF4: arena-allocated mangled key — no fixed buffer limit */
+                uint32_t mk_len = c->current_module_len + 1 + sname_len;
+                char *mk_copy = (char *)arena_alloc(c->arena, mk_len + 1);
+                memcpy(mk_copy, c->current_module, c->current_module_len);
+                mk_copy[c->current_module_len] = '_';
+                memcpy(mk_copy + c->current_module_len + 1, sname, sname_len);
                 mk_copy[mk_len] = '\0';
                 /* register under MANGLED name — no collision possible */
                 Symbol *gs = scope_add(c->arena, c->global_scope,

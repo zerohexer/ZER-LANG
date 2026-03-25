@@ -394,11 +394,16 @@ static void emit_expr(Emitter *e, Node *node) {
         bool emitted = false;
         if (e->current_module) {
             /* BUG-233: try current module's mangled key FIRST */
-            char mk[256];
-            int mkl = snprintf(mk, sizeof(mk), "%.*s_%.*s",
-                (int)e->current_module_len, e->current_module,
-                (int)node->ident.name_len, node->ident.name);
-            Symbol *ms = scope_lookup(e->checker->global_scope, mk, (uint32_t)mkl);
+            /* RF4: sized to actual need, not fixed 256 */
+            uint32_t mkl = e->current_module_len + 1 + (uint32_t)node->ident.name_len;
+            char mk_buf[512]; /* stack buffer for common case */
+            char *mk = mk_buf;
+            if (mkl >= sizeof(mk_buf)) mk = (char *)arena_alloc(e->arena, mkl + 1);
+            memcpy(mk, e->current_module, e->current_module_len);
+            mk[e->current_module_len] = '_';
+            memcpy(mk + e->current_module_len + 1, node->ident.name, node->ident.name_len);
+            mk[mkl] = '\0';
+            Symbol *ms = scope_lookup(e->checker->global_scope, mk, mkl);
             if (ms && ms->module_prefix) {
                 emit(e, "%.*s_%.*s",
                      (int)ms->module_prefix_len, ms->module_prefix,
@@ -425,7 +430,7 @@ static void emit_expr(Emitter *e, Node *node) {
         /* division/modulo: trap on zero divisor */
         if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
             int tmp = e->temp_count++;
-            Type *div_type = checker_get_type(node->binary.left);
+            Type *div_type = checker_get_type(e->checker,node->binary.left);
             bool is_signed_div = div_type && type_is_signed(div_type);
             emit(e, "({ __auto_type _zer_dv%d = ", tmp);
             emit_expr(e, node->binary.right);
@@ -464,7 +469,7 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->binary.op == TOK_PLUS || node->binary.op == TOK_MINUS ||
                 node->binary.op == TOK_STAR || node->binary.op == TOK_AMP ||
                 node->binary.op == TOK_PIPE || node->binary.op == TOK_CARET) {
-                Type *res_type = checker_get_type(node);
+                Type *res_type = checker_get_type(e->checker,node);
                 if (res_type) {
                     switch (res_type->kind) {
                     case TYPE_U8:  narrow_cast = "(uint8_t)"; needs_narrow_cast = true; break;
@@ -506,7 +511,7 @@ static void emit_expr(Emitter *e, Node *node) {
         /* BUG-215: narrow type unary cast — C promotes u8/u16/i8/i16 to int.
          * ~(u8)0xAA = 0xFFFFFF55 in C, but ZER expects 0x55. Cast result. */
         if (node->unary.op == TOK_TILDE || node->unary.op == TOK_MINUS) {
-            Type *res = checker_get_type(node);
+            Type *res = checker_get_type(e->checker,node);
             if (res) res = type_unwrap_distinct(res);
             if (res && (res->kind == TYPE_U8 || res->kind == TYPE_U16 ||
                         res->kind == TYPE_I8 || res->kind == TYPE_I16)) {
@@ -537,7 +542,7 @@ static void emit_expr(Emitter *e, Node *node) {
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_FIELD) {
             Node *obj_node = node->assign.target->field.object;
-            Type *obj_type = checker_get_type(obj_node);
+            Type *obj_type = checker_get_type(e->checker,obj_node);
             if (obj_type && obj_type->kind == TYPE_UNION) {
                 /* find variant index */
                 const char *vname = node->assign.target->field.field_name;
@@ -563,7 +568,7 @@ static void emit_expr(Emitter *e, Node *node) {
          * Uses pointer hoist for single-eval of target expression. */
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_SLICE) {
-            Type *obj_type = checker_get_type(node->assign.target->slice.object);
+            Type *obj_type = checker_get_type(e->checker,node->assign.target->slice.object);
             if (obj_type && type_is_integer(obj_type)) {
                 Node *obj = node->assign.target->slice.object;
                 Node *hi_node = node->assign.target->slice.start;  /* high bit */
@@ -635,7 +640,7 @@ static void emit_expr(Emitter *e, Node *node) {
         }
         /* array assignment: x = y → memcpy(x, y, sizeof(x)) — C arrays aren't lvalues */
         if (node->assign.op == TOK_EQ) {
-            Type *tgt_type = checker_get_type(node->assign.target);
+            Type *tgt_type = checker_get_type(e->checker,node->assign.target);
             if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
                 emit(e, "memcpy(");
                 emit_expr(e, node->assign.target);
@@ -707,8 +712,8 @@ static void emit_expr(Emitter *e, Node *node) {
         default:            emit(e, " = "); break;
         }
         /* T → ?T wrap: if target is optional and value isn't, wrap in {value, 1} */
-        Type *tgt_type = checker_get_type(node->assign.target);
-        Type *val_type = checker_get_type(node->assign.value);
+        Type *tgt_type = checker_get_type(e->checker,node->assign.target);
+        Type *val_type = checker_get_type(e->checker,node->assign.value);
         if (node->assign.op == TOK_EQ && tgt_type && val_type &&
             tgt_type->kind == TYPE_OPTIONAL &&
             !is_null_sentinel(tgt_type->optional.inner) &&
@@ -746,7 +751,7 @@ static void emit_expr(Emitter *e, Node *node) {
 
             /* check if object is a Pool variable — try checker type first, then global scope */
             if (obj_node->kind == NODE_IDENT) {
-                Type *obj_type = checker_get_type(obj_node);
+                Type *obj_type = checker_get_type(e->checker,obj_node);
                 Symbol *sym = NULL;
                 if (!obj_type)  {
                     sym = scope_lookup(e->checker->global_scope,
@@ -863,7 +868,7 @@ static void emit_expr(Emitter *e, Node *node) {
                         /* Arena.over(buf) → (_zer_arena){ (uint8_t*)buf, sizeof(buf), 0 }
                          * or for slices: (_zer_arena){ buf.ptr, buf.len, 0 } */
                         if (node->call.arg_count > 0) {
-                            Type *arg_type = checker_get_type(node->call.args[0]);
+                            Type *arg_type = checker_get_type(e->checker,node->call.args[0]);
                             if (arg_type && arg_type->kind == TYPE_SLICE) {
                                 emit(e, "((_zer_arena){ (uint8_t*)");
                                 emit_expr(e, node->call.args[0]);
@@ -947,13 +952,13 @@ static void emit_expr(Emitter *e, Node *node) {
             /* normal function call */
             emit_expr(e, node->call.callee);
             emit(e, "(");
-            Type *callee_type = checker_get_type(node->call.callee);
+            Type *callee_type = checker_get_type(e->checker,node->call.callee);
             for (int i = 0; i < node->call.arg_count; i++) {
                 if (i > 0) emit(e, ", ");
                 /* unwrap distinct for callee type */
                 Type *eff_callee = type_unwrap_distinct(callee_type);
                 /* slice→pointer decay: emit .ptr when passing []T to *T */
-                Type *arg_type = checker_get_type(node->call.args[i]);
+                Type *arg_type = checker_get_type(e->checker,node->call.args[i]);
                 bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
                     eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
                     (uint32_t)i < eff_callee->func_ptr.param_count &&
@@ -978,7 +983,7 @@ static void emit_expr(Emitter *e, Node *node) {
 
     case NODE_FIELD: {
         /* check if object is an enum type → emit _ZER_EnumName_variant */
-        Type *obj_type = checker_get_type(node->field.object);
+        Type *obj_type = checker_get_type(e->checker,node->field.object);
         /* fallback for imported modules: typemap may not have the node */
         if (!obj_type && node->field.object->kind == NODE_IDENT) {
             Symbol *sym = scope_lookup(e->checker->global_scope,
@@ -1010,7 +1015,7 @@ static void emit_expr(Emitter *e, Node *node) {
          * Comma operator preserves lvalue (array decays to pointer).
          * Inline check respects short-circuit (&&/||) and works in
          * if/while/for conditions — fixes both hoisting and missing-check bugs. */
-        Type *idx_obj_type = checker_get_type(node->index_expr.object);
+        Type *idx_obj_type = checker_get_type(e->checker,node->index_expr.object);
         /* Check if index or object has side effects — needs single-eval.
          * Simple expressions (ident, literal) can safely double-evaluate. */
         /* detect index expressions with side effects or volatile reads.
@@ -1087,7 +1092,7 @@ static void emit_expr(Emitter *e, Node *node) {
     case NODE_SLICE: {
         /* Bit extraction: reg[high..low] on integer → (reg >> low) & mask
          * Array slicing: buf[start..end] → slice struct */
-        Type *obj_type = checker_get_type(node->slice.object);
+        Type *obj_type = checker_get_type(e->checker,node->slice.object);
         if (obj_type && type_is_integer(obj_type) &&
             node->slice.start && node->slice.end) {
             /* bit extraction: expr[high..low] → ((unsigned)expr >> low) & mask
@@ -1314,7 +1319,7 @@ static void emit_expr(Emitter *e, Node *node) {
          * by checking the type from the checker's type map.
          * ?*T uses null sentinel → simple ternary
          * ?T uses struct → .has_value/.value */
-        Type *orelse_type = checker_get_type(node->orelse.expr);
+        Type *orelse_type = checker_get_type(e->checker,node->orelse.expr);
         bool is_ptr_optional = orelse_type &&
             orelse_type->kind == TYPE_OPTIONAL &&
             is_null_sentinel(orelse_type->optional.inner);
@@ -1598,16 +1603,27 @@ static void emit_expr(Emitter *e, Node *node) {
              * Hoist both args to temps for single-eval */
             int tmp = e->temp_count++;
             Type *buf_type = (node->intrinsic.arg_count > 0) ?
-                checker_get_type(node->intrinsic.args[0]) : NULL;
+                checker_get_type(e->checker,node->intrinsic.args[0]) : NULL;
             bool dest_is_slice = buf_type && buf_type->kind == TYPE_SLICE;
-            /* BUG-223: check if destination is volatile */
+            /* BUG-223/RF7: check if destination is volatile — walk field/index chains */
             bool dest_volatile = false;
-            if (node->intrinsic.arg_count > 0 &&
-                node->intrinsic.args[0]->kind == NODE_IDENT) {
-                Symbol *dsym = scope_lookup(e->checker->global_scope,
-                    node->intrinsic.args[0]->ident.name,
-                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                if (dsym && dsym->is_volatile) dest_volatile = true;
+            if (node->intrinsic.arg_count > 0) {
+                Node *droot = node->intrinsic.args[0];
+                while (droot && (droot->kind == NODE_FIELD || droot->kind == NODE_INDEX)) {
+                    if (droot->kind == NODE_FIELD) droot = droot->field.object;
+                    else droot = droot->index_expr.object;
+                }
+                if (droot && droot->kind == NODE_IDENT) {
+                    /* check global scope first, then local scope */
+                    Symbol *dsym = scope_lookup(e->checker->global_scope,
+                        droot->ident.name, (uint32_t)droot->ident.name_len);
+                    if (!dsym) {
+                        /* try current function scope for local volatile vars */
+                        dsym = scope_lookup(e->checker->current_scope,
+                            droot->ident.name, (uint32_t)droot->ident.name_len);
+                    }
+                    if (dsym && dsym->is_volatile) dest_volatile = true;
+                }
             }
             const char *vol = dest_volatile ? "volatile " : "";
             if (dest_is_slice) {
@@ -1717,7 +1733,7 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_VAR_DECL: {
-        Type *type = checker_get_type(node);
+        Type *type = checker_get_type(e->checker,node);
         /* propagate volatile flag from var-decl to pointer type */
         if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
             Type *vp = type_pointer(e->arena, type->pointer.inner);
@@ -1734,7 +1750,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             (node->var_decl.init->orelse.fallback_is_return ||
              node->var_decl.init->orelse.fallback_is_break ||
              node->var_decl.init->orelse.fallback_is_continue)) {
-            Type *or_expr_type = checker_get_type(node->var_decl.init->orelse.expr);
+            Type *or_expr_type = checker_get_type(e->checker,node->var_decl.init->orelse.expr);
             bool or_is_ptr = or_expr_type &&
                 or_expr_type->kind == TYPE_OPTIONAL &&
                 is_null_sentinel(or_expr_type->optional.inner);
@@ -1814,7 +1830,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit_expr(e, node->var_decl.init);
                 } else if (node->var_decl.init->kind == NODE_IDENT) {
                     /* check if ident is already ?T or needs wrapping */
-                    Type *init_type = checker_get_type(node->var_decl.init);
+                    Type *init_type = checker_get_type(e->checker,node->var_decl.init);
                     if (init_type && init_type->kind == TYPE_OPTIONAL) {
                         emit(e, " = ");
                         emit_expr(e, node->var_decl.init);
@@ -1834,7 +1850,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                 }
             } else {
                 /* array→slice coercion at var-decl */
-                Type *init_type = checker_get_type(node->var_decl.init);
+                Type *init_type = checker_get_type(e->checker,node->var_decl.init);
                 if (type && type->kind == TYPE_SLICE &&
                     init_type && init_type->kind == TYPE_ARRAY) {
                     emit(e, " = ");
@@ -1879,7 +1895,7 @@ static void emit_stmt(Emitter *e, Node *node) {
              * For |*val|: { auto *_ptr = &expr; if (_ptr->has_value) { auto val = &_ptr->value; ... } }
              * ?*T (ptr): { auto _tmp = expr; if (_tmp) { auto val = _tmp; ... } } */
             int tmp = e->temp_count++;
-            Type *cond_type = checker_get_type(node->if_stmt.cond);
+            Type *cond_type = checker_get_type(e->checker,node->if_stmt.cond);
             bool is_ptr_opt = cond_type &&
                 cond_type->kind == TYPE_OPTIONAL &&
                 is_null_sentinel(cond_type->optional.inner);
@@ -1961,7 +1977,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit(e, "}\n");
         } else {
             /* regular if */
-            Type *cond_t = checker_get_type(node->if_stmt.cond);
+            Type *cond_t = checker_get_type(e->checker,node->if_stmt.cond);
             bool cond_is_struct_opt = cond_t &&
                 cond_t->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(cond_t->optional.inner);
@@ -1986,7 +2002,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "for (");
         if (node->for_stmt.init) {
             if (node->for_stmt.init->kind == NODE_VAR_DECL) {
-                Type *type = checker_get_type(node->for_stmt.init);
+                Type *type = checker_get_type(e->checker,node->for_stmt.init);
                 emit_type_and_name(e, type,
                     node->for_stmt.init->var_decl.name,
                     node->for_stmt.init->var_decl.name_len);
@@ -2011,7 +2027,7 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_WHILE: {
         int saved_loop_base = e->loop_defer_base;
         e->loop_defer_base = e->defer_stack.count;
-        Type *while_cond_t = checker_get_type(node->while_stmt.cond);
+        Type *while_cond_t = checker_get_type(e->checker,node->while_stmt.cond);
         bool while_is_struct_opt = while_cond_t &&
             while_cond_t->kind == TYPE_OPTIONAL &&
             !is_null_sentinel(while_cond_t->optional.inner);
@@ -2048,7 +2064,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                      !is_null_sentinel(e->current_func_ret->optional.inner) &&
                      node->ret.expr->kind != NODE_NULL_LIT) {
                 /* check if expr already has the optional type (e.g. return ring.pop()) */
-                Type *expr_type = checker_get_type(node->ret.expr);
+                Type *expr_type = checker_get_type(e->checker,node->ret.expr);
                 if (expr_type && type_equals(expr_type, e->current_func_ret)) {
                     /* already optional — return directly */
                     emit(e, "return ");
@@ -2069,7 +2085,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                 }
             } else {
                 /* array→slice coercion on return */
-                Type *expr_type = checker_get_type(node->ret.expr);
+                Type *expr_type = checker_get_type(e->checker,node->ret.expr);
                 if (e->current_func_ret && e->current_func_ret->kind == TYPE_SLICE &&
                     expr_type && expr_type->kind == TYPE_ARRAY) {
                     emit(e, "return ");
@@ -2156,7 +2172,7 @@ static void emit_stmt(Emitter *e, Node *node) {
          * For default: else { ... }
          */
         int sw_tmp = e->temp_count++;
-        Type *sw_type = checker_get_type(node->switch_stmt.expr);
+        Type *sw_type = checker_get_type(e->checker,node->switch_stmt.expr);
         bool is_union_switch = sw_type && sw_type->kind == TYPE_UNION;
         /* BUG-196b: detect struct-based optional in switch */
         bool is_opt_switch = false;
@@ -2443,7 +2459,7 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
  * ================================================================ */
 
 static void emit_struct_decl(Emitter *e, Node *node) {
-    Type *st = checker_get_type(node);
+    Type *st = checker_get_type(e->checker,node);
     if (node->struct_decl.is_packed) {
         emit(e, "struct __attribute__((packed)) ");
         if (st) EMIT_STRUCT_NAME(e, st);
@@ -2501,7 +2517,7 @@ static void emit_struct_decl(Emitter *e, Node *node) {
 
 static void emit_func_decl(Emitter *e, Node *node) {
 
-    Type *func_type = checker_get_type(node);
+    Type *func_type = checker_get_type(e->checker,node);
     Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
         func_type->func_ptr.ret : NULL;
 
@@ -2538,7 +2554,7 @@ static void emit_func_decl(Emitter *e, Node *node) {
 }
 
 static void emit_global_var(Emitter *e, Node *node) {
-    Type *type = checker_get_type(node);
+    Type *type = checker_get_type(e->checker,node);
     /* propagate volatile flag from var-decl to pointer type */
     if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
         Type *vp = type_pointer(e->arena, type->pointer.inner);
@@ -2589,11 +2605,14 @@ static void emit_global_var(Emitter *e, Node *node) {
 
     /* BUG-218/222: mangle global var names for imported modules (including static) */
     if (e->current_module) {
-        char mangled[256];
-        int mlen = snprintf(mangled, sizeof(mangled), "%.*s_%.*s",
-            (int)e->current_module_len, e->current_module,
-            (int)node->var_decl.name_len, node->var_decl.name);
-        emit_type_and_name(e, type, mangled, mlen);
+        /* RF4: arena-allocated — no fixed buffer limit */
+        uint32_t mlen = e->current_module_len + 1 + (uint32_t)node->var_decl.name_len;
+        char *mangled = (char *)arena_alloc(e->arena, mlen + 1);
+        memcpy(mangled, e->current_module, e->current_module_len);
+        mangled[e->current_module_len] = '_';
+        memcpy(mangled + e->current_module_len + 1, node->var_decl.name, node->var_decl.name_len);
+        mangled[mlen] = '\0';
+        emit_type_and_name(e, type, mangled, (int)mlen);
     } else {
         emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
     }
@@ -2634,6 +2653,148 @@ void emitter_init(Emitter *e, FILE *out, Arena *arena, Checker *checker) {
     e->out = out;
     e->arena = arena;
     e->checker = checker;
+}
+
+/* RF2: unified top-level declaration emitter — used by both emit_file and emit_file_no_preamble.
+ * Previously these were two parallel switch statements that had to stay in sync (BUG-086/087 class). */
+static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int decl_index) {
+    switch (decl->kind) {
+    case NODE_STRUCT_DECL:
+        emit_struct_decl(e, decl);
+        break;
+
+    case NODE_FUNC_DECL:
+        if (!decl->func_decl.body) {
+            bool has_def = false;
+            for (int j = decl_index + 1; j < file_node->file.decl_count; j++) {
+                Node *other = file_node->file.decls[j];
+                if (other->kind == NODE_FUNC_DECL && other->func_decl.body &&
+                    other->func_decl.name_len == decl->func_decl.name_len &&
+                    memcmp(other->func_decl.name, decl->func_decl.name,
+                           decl->func_decl.name_len) == 0) {
+                    has_def = true;
+                    break;
+                }
+            }
+            if (!has_def) break;
+        }
+        emit_func_decl(e, decl);
+        break;
+
+    case NODE_GLOBAL_VAR:
+        emit_global_var(e, decl);
+        break;
+
+    case NODE_UNION_DECL: {
+        Type *ut = checker_get_type(e->checker, decl);
+        emit(e, "/* tagged union %.*s */\n",
+             (int)decl->union_decl.name_len, decl->union_decl.name);
+        for (int j = 0; j < decl->union_decl.variant_count; j++) {
+            UnionVariant *v = &decl->union_decl.variants[j];
+            emit(e, "#define _ZER_");
+            if (ut) EMIT_UNION_NAME(e, ut);
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            emit(e, "_TAG_%.*s %d\n", (int)v->name_len, v->name, j);
+        }
+        emit(e, "struct _union_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, " {\n    int32_t _tag;\n    union {\n");
+        for (int j = 0; j < decl->union_decl.variant_count; j++) {
+            UnionVariant *v = &decl->union_decl.variants[j];
+            Type *vtype = resolve_type_for_emit(e, v->type);
+            emit(e, "        ");
+            emit_type(e, vtype);
+            emit(e, " %.*s;\n", (int)v->name_len, v->name);
+        }
+        emit(e, "    };\n};\n");
+        /* optional/slice/opt-slice typedefs */
+        emit(e, "typedef struct { struct _union_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, " value; uint8_t has_value; } _zer_opt_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, ";\n");
+        emit(e, "typedef struct { struct _union_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "* ptr; size_t len; } _zer_slice_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, ";\n");
+        emit(e, "typedef struct { _zer_slice_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, ";\n\n");
+        break;
+    }
+
+    case NODE_ENUM_DECL: {
+        Type *et = checker_get_type(e->checker, decl);
+        emit(e, "/* enum %.*s */\n",
+             (int)decl->enum_decl.name_len, decl->enum_decl.name);
+        int32_t next_val = 0;
+        for (int j = 0; j < decl->enum_decl.variant_count; j++) {
+            EnumVariant *v = &decl->enum_decl.variants[j];
+            int32_t val;
+            if (v->value && v->value->kind == NODE_INT_LIT) {
+                val = (int32_t)v->value->int_lit.value;
+                next_val = val + 1;
+            } else if (v->value && v->value->kind == NODE_UNARY &&
+                       v->value->unary.op == TOK_MINUS &&
+                       v->value->unary.operand->kind == NODE_INT_LIT) {
+                val = -(int32_t)v->value->unary.operand->int_lit.value;
+                next_val = val + 1;
+            } else {
+                val = next_val++;
+            }
+            emit(e, "#define _ZER_");
+            if (et) EMIT_ENUM_NAME(e, et);
+            else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
+            emit(e, "_%.*s %d\n", (int)v->name_len, v->name, val);
+        }
+        emit(e, "\n");
+        break;
+    }
+
+    case NODE_IMPORT:
+        emit(e, "/* import %.*s — TODO */\n\n",
+             (int)decl->import.module_name_len, decl->import.module_name);
+        break;
+
+    case NODE_CINCLUDE:
+        emit(e, "#include \"%.*s\"\n",
+             (int)decl->cinclude.path_len, decl->cinclude.path);
+        break;
+
+    case NODE_INTERRUPT:
+        emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void) ",
+             (int)decl->interrupt.name_len, decl->interrupt.name);
+        if (decl->interrupt.body) {
+            emit_stmt(e, decl->interrupt.body);
+        }
+        emit(e, "\n");
+        break;
+
+    case NODE_TYPEDEF: {
+        Type *td_type = checker_get_type(e->checker, decl);
+        Type *underlying = td_type;
+        if (td_type && td_type->kind == TYPE_DISTINCT)
+            underlying = td_type->distinct.underlying;
+        emit(e, "typedef ");
+        emit_type_and_name(e, underlying,
+            decl->typedef_decl.name, decl->typedef_decl.name_len);
+        emit(e, ";\n\n");
+        break;
+    }
+
+    default:
+        break;
+    }
 }
 
 void emit_file(Emitter *e, Node *file_node) {
@@ -2802,305 +2963,19 @@ void emit_file(Emitter *e, Node *file_node) {
 
     emit(e, "\n");
 
-    /* emit declarations */
+    /* emit declarations — uses unified emit_top_level_decl (RF2) */
     for (int i = 0; i < file_node->file.decl_count; i++) {
-        Node *decl = file_node->file.decls[i];
-
-        switch (decl->kind) {
-        case NODE_STRUCT_DECL:
-            emit_struct_decl(e, decl);
-            break;
-
-        case NODE_FUNC_DECL:
-            /* skip pure extern forward declarations (no body, no definition
-             * in this file) — avoids conflicts with <stdio.h>/<stdlib.h>.
-             * Forward decls that DO have a definition later (mutual recursion)
-             * are emitted as C prototypes. */
-            if (!decl->func_decl.body) {
-                bool has_def = false;
-                for (int j = i + 1; j < file_node->file.decl_count; j++) {
-                    Node *other = file_node->file.decls[j];
-                    if (other->kind == NODE_FUNC_DECL && other->func_decl.body &&
-                        other->func_decl.name_len == decl->func_decl.name_len &&
-                        memcmp(other->func_decl.name, decl->func_decl.name,
-                               decl->func_decl.name_len) == 0) {
-                        has_def = true;
-                        break;
-                    }
-                }
-                if (!has_def) break; /* pure extern — skip */
-            }
-            emit_func_decl(e, decl);
-            break;
-
-        case NODE_GLOBAL_VAR:
-            emit_global_var(e, decl);
-            break;
-
-        case NODE_UNION_DECL: {
-            /* tagged union → struct with tag + anonymous union */
-            Type *ut = checker_get_type(decl);
-            emit(e, "/* tagged union %.*s */\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
-            /* tag constants */
-            for (int j = 0; j < decl->union_decl.variant_count; j++) {
-                UnionVariant *v = &decl->union_decl.variants[j];
-                emit(e, "#define _ZER_");
-                if (ut) EMIT_UNION_NAME(e, ut);
-                else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-                emit(e, "_TAG_%.*s %d\n",
-                     (int)v->name_len, v->name, j);
-            }
-            emit(e, "struct _union_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, " {\n");
-            emit(e, "    int32_t _tag;\n");
-            emit(e, "    union {\n");
-            for (int j = 0; j < decl->union_decl.variant_count; j++) {
-                UnionVariant *v = &decl->union_decl.variants[j];
-                Type *vtype = resolve_type_for_emit(e, v->type);
-                emit(e, "        ");
-                emit_type(e, vtype);
-                emit(e, " %.*s;\n", (int)v->name_len, v->name);
-            }
-            emit(e, "    };\n");
-            emit(e, "};\n");
-            /* emit optional typedef for this union */
-            emit(e, "typedef struct { struct _union_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, " value; uint8_t has_value; } _zer_opt_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, ";\n");
-            /* emit slice typedef for this union */
-            emit(e, "typedef struct { struct _union_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, "* ptr; size_t len; } _zer_slice_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, ";\n");
-            /* emit optional-slice typedef for this union */
-            emit(e, "typedef struct { _zer_slice_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, ";\n\n");
-            break;
-        }
-
-        case NODE_ENUM_DECL: {
-            /* emit as #define constants — use explicit values if provided */
-            Type *et = checker_get_type(decl);
-            emit(e, "/* enum %.*s */\n",
-                 (int)decl->enum_decl.name_len, decl->enum_decl.name);
-            int32_t next_val = 0;
-            for (int j = 0; j < decl->enum_decl.variant_count; j++) {
-                EnumVariant *v = &decl->enum_decl.variants[j];
-                int32_t val;
-                if (v->value && v->value->kind == NODE_INT_LIT) {
-                    val = (int32_t)v->value->int_lit.value;
-                    next_val = val + 1;
-                } else if (v->value && v->value->kind == NODE_UNARY &&
-                           v->value->unary.op == TOK_MINUS &&
-                           v->value->unary.operand->kind == NODE_INT_LIT) {
-                    val = -(int32_t)v->value->unary.operand->int_lit.value;
-                    next_val = val + 1;
-                } else {
-                    val = next_val++;
-                }
-                emit(e, "#define _ZER_");
-                if (et) EMIT_ENUM_NAME(e, et);
-                else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
-                emit(e, "_%.*s %d\n",
-                     (int)v->name_len, v->name, val);
-            }
-            emit(e, "\n");
-            break;
-        }
-
-        case NODE_IMPORT:
-            emit(e, "/* import %.*s — TODO */\n\n",
-                 (int)decl->import.module_name_len, decl->import.module_name);
-            break;
-
-        case NODE_CINCLUDE:
-            emit(e, "#include \"%.*s\"\n",
-                 (int)decl->cinclude.path_len, decl->cinclude.path);
-            break;
-
-        case NODE_INTERRUPT:
-            emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void) ",
-                 (int)decl->interrupt.name_len, decl->interrupt.name);
-            if (decl->interrupt.body) {
-                emit_stmt(e, decl->interrupt.body);
-            }
-            emit(e, "\n");
-            break;
-
-        case NODE_TYPEDEF:
-            /* emit typedef in C — use checker-resolved type */
-            {
-                Type *td_type = checker_get_type(decl);
-                /* for distinct, emit the underlying; for alias, emit the type directly */
-                Type *underlying = td_type;
-                if (td_type && td_type->kind == TYPE_DISTINCT)
-                    underlying = td_type->distinct.underlying;
-                emit(e, "typedef ");
-                emit_type_and_name(e, underlying,
-                    decl->typedef_decl.name, decl->typedef_decl.name_len);
-                emit(e, ";\n\n");
-            }
-            break;
-
-        default:
-            emit(e, "/* unhandled decl %s */\n\n", node_kind_name(decl->kind));
-            break;
-        }
+        emit_top_level_decl(e, file_node->file.decls[i], file_node, i);
     }
 }
 
+/* RF2: unified — uses same emit_top_level_decl as emit_file */
 void emit_file_no_preamble(Emitter *e, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
     emit(e, "\n/* --- imported module --- */\n\n");
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         if (decl->kind == NODE_IMPORT || decl->kind == NODE_CINCLUDE) continue;
-        switch (decl->kind) {
-        case NODE_STRUCT_DECL: emit_struct_decl(e, decl); break;
-
-        case NODE_ENUM_DECL: {
-            Type *et = checker_get_type(decl);
-            emit(e, "/* enum %.*s */\n",
-                 (int)decl->enum_decl.name_len, decl->enum_decl.name);
-            int32_t next_val = 0;
-            for (int j = 0; j < decl->enum_decl.variant_count; j++) {
-                EnumVariant *v = &decl->enum_decl.variants[j];
-                int32_t val;
-                if (v->value && v->value->kind == NODE_INT_LIT) {
-                    val = (int32_t)v->value->int_lit.value;
-                    next_val = val + 1;
-                } else if (v->value && v->value->kind == NODE_UNARY &&
-                           v->value->unary.op == TOK_MINUS &&
-                           v->value->unary.operand->kind == NODE_INT_LIT) {
-                    val = -(int32_t)v->value->unary.operand->int_lit.value;
-                    next_val = val + 1;
-                } else {
-                    val = next_val++;
-                }
-                emit(e, "#define _ZER_");
-                if (et) EMIT_ENUM_NAME(e, et);
-                else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
-                emit(e, "_%.*s %d\n",
-                     (int)v->name_len, v->name, val);
-            }
-            emit(e, "\n");
-            break;
-        }
-
-        case NODE_UNION_DECL: {
-            Type *ut = checker_get_type(decl);
-            emit(e, "/* tagged union %.*s */\n",
-                 (int)decl->union_decl.name_len, decl->union_decl.name);
-            for (int j = 0; j < decl->union_decl.variant_count; j++) {
-                UnionVariant *v = &decl->union_decl.variants[j];
-                emit(e, "#define _ZER_");
-                if (ut) EMIT_UNION_NAME(e, ut);
-                else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-                emit(e, "_TAG_%.*s %d\n",
-                     (int)v->name_len, v->name, j);
-            }
-            emit(e, "struct _union_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, " {\n    int32_t _tag;\n    union {\n");
-            {
-            for (int j = 0; j < decl->union_decl.variant_count; j++) {
-                UnionVariant *v = &decl->union_decl.variants[j];
-                Type *vtype = (ut && ut->kind == TYPE_UNION &&
-                              (uint32_t)j < ut->union_type.variant_count) ?
-                    ut->union_type.variants[j].type : resolve_type_for_emit(e, v->type);
-                emit(e, "        ");
-                emit_type(e, vtype);
-                emit(e, " %.*s;\n", (int)v->name_len, v->name);
-            }
-            }
-            emit(e, "    };\n};\n");
-            /* emit optional typedef for this union */
-            emit(e, "typedef struct { struct _union_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, " value; uint8_t has_value; } _zer_opt_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, ";\n");
-            /* emit slice typedef for this union */
-            emit(e, "typedef struct { struct _union_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, "* ptr; size_t len; } _zer_slice_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, ";\n");
-            /* emit optional-slice typedef for this union */
-            emit(e, "typedef struct { _zer_slice_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-            emit(e, ";\n\n");
-            break;
-        }
-
-        case NODE_FUNC_DECL:
-            /* skip pure extern forward decls (same as emit_file) */
-            if (!decl->func_decl.body) {
-                bool has_def = false;
-                for (int j = i + 1; j < file_node->file.decl_count; j++) {
-                    Node *other = file_node->file.decls[j];
-                    if (other->kind == NODE_FUNC_DECL && other->func_decl.body &&
-                        other->func_decl.name_len == decl->func_decl.name_len &&
-                        memcmp(other->func_decl.name, decl->func_decl.name,
-                               decl->func_decl.name_len) == 0) {
-                        has_def = true;
-                        break;
-                    }
-                }
-                if (!has_def) break;
-            }
-            emit_func_decl(e, decl);
-            break;
-
-        case NODE_GLOBAL_VAR:  emit_global_var(e, decl); break;
-
-        case NODE_INTERRUPT:
-            emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void) ",
-                 (int)decl->interrupt.name_len, decl->interrupt.name);
-            if (decl->interrupt.body) {
-                emit_stmt(e, decl->interrupt.body);
-            }
-            emit(e, "\n");
-            break;
-
-        case NODE_TYPEDEF:
-            {
-                Type *td_type = checker_get_type(decl);
-                Type *underlying = td_type;
-                if (td_type && td_type->kind == TYPE_DISTINCT)
-                    underlying = td_type->distinct.underlying;
-                emit(e, "typedef ");
-                emit_type_and_name(e, underlying,
-                    decl->typedef_decl.name, decl->typedef_decl.name_len);
-                emit(e, ";\n\n");
-            }
-            break;
-
-        default: break;
-        }
+        emit_top_level_decl(e, decl, file_node, i);
     }
 }

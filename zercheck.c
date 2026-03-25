@@ -128,7 +128,7 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
     uint32_t plen = (uint32_t)obj->ident.name_len;
 
     /* check if this is a pool variable — try checker type first, then global scope */
-    Type *pool_type = checker_get_type(obj);
+    Type *pool_type = checker_get_type(zc->checker, obj);
     if (!pool_type) {
         Symbol *sym = scope_lookup(zc->checker->global_scope, pool_name, plen);
         if (sym) pool_type = sym->type;

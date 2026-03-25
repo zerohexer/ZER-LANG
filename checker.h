@@ -23,6 +23,12 @@ typedef struct {
     char message[256];
 } Diagnostic;
 
+/* typemap entry — maps AST Node* to resolved Type* */
+typedef struct {
+    Node *key;
+    Type *type;
+} TypeMapEntry;
+
 typedef struct {
     Arena *arena;           /* arena for type allocations */
     Scope *global_scope;    /* module-level scope */
@@ -40,6 +46,11 @@ typedef struct {
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */
 
+    /* typemap — maps AST Node* to resolved Type* (was global, now per-checker) */
+    TypeMapEntry *type_map;
+    uint32_t type_map_size;
+    uint32_t type_map_count;
+
     /* diagnostic list — grows dynamically, read by LSP */
     Diagnostic *diagnostics;
     int diag_count;
@@ -55,6 +66,6 @@ void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with 
 void checker_pop_module_scope(Checker *c); /* pop module scope */
 
 /* returns the resolved Type* for an expression node (set during check) */
-Type *checker_get_type(Node *node);
+Type *checker_get_type(Checker *c, Node *node);
 
 #endif /* ZER_CHECKER_H */

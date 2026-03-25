@@ -2923,27 +2923,38 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             /* scope escape: return arena-derived pointer → dangling after stack unwind
-             * Walk field/index chains to find root ident (BUG-155: h.ptr escape) */
+             * Walk field/index chains to find root ident (BUG-155: h.ptr escape)
+             * BUG-251: also walk through NODE_ORELSE to check both expr and fallback */
             {
-                Node *root = node->ret.expr;
-                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                    if (root->kind == NODE_FIELD) root = root->field.object;
-                    else root = root->index_expr.object;
+                /* check up to 2 roots: the main expression, and orelse fallback if present */
+                Node *roots[2] = { node->ret.expr, NULL };
+                int root_count = 1;
+                if (node->ret.expr->kind == NODE_ORELSE) {
+                    roots[0] = node->ret.expr->orelse.expr;
+                    if (node->ret.expr->orelse.fallback)
+                        roots[root_count++] = node->ret.expr->orelse.fallback;
                 }
-                if (root && root->kind == NODE_IDENT) {
-                    Symbol *sym = scope_lookup(c->current_scope,
-                        root->ident.name, (uint32_t)root->ident.name_len);
-                    if (sym && sym->is_arena_derived) {
-                        checker_error(c, node->loc.line,
-                            "cannot return arena-derived pointer '%.*s' — "
-                            "arena memory is freed when function returns",
-                            (int)sym->name_len, sym->name);
+                for (int ri = 0; ri < root_count; ri++) {
+                    Node *root = roots[ri];
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
                     }
-                    if (sym && sym->is_local_derived) {
-                        checker_error(c, node->loc.line,
-                            "cannot return pointer to local '%.*s' — "
-                            "stack memory is freed when function returns",
-                            (int)sym->name_len, sym->name);
+                    if (root && root->kind == NODE_IDENT) {
+                        Symbol *sym = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (sym && sym->is_arena_derived) {
+                            checker_error(c, node->loc.line,
+                                "cannot return arena-derived pointer '%.*s' — "
+                                "arena memory is freed when function returns",
+                                (int)sym->name_len, sym->name);
+                        }
+                        if (sym && sym->is_local_derived) {
+                            checker_error(c, node->loc.line,
+                                "cannot return pointer to local '%.*s' — "
+                                "stack memory is freed when function returns",
+                                (int)sym->name_len, sym->name);
+                        }
                     }
                 }
             }

@@ -629,6 +629,12 @@ Null-sentinel `?*T` = pointer size. `?void` = 1. Value `?T` = inner_size + 1 (ha
 **112. `check_expr` recursion depth guard (limit 1000).**
 `c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
 
+**113. NODE_RETURN walks through NODE_ORELSE for safety flag checks.**
+`return opt orelse p` where `p` has `is_local_derived` or `is_arena_derived` must be caught. The return escape check splits the expression: if `ret.expr` is `NODE_ORELSE`, check both `.orelse.expr` AND `.orelse.fallback` for local/arena-derived roots. Without this, `return opt orelse local_ptr` escapes unchecked. (BUG-251)
+
+**114. Array assignment uses pointer hoist for single-eval.**
+`get_s().arr = local` emits `({ __typeof__(target) *_p = &(target); memcpy(_p, src, sizeof(*_p)); })`. The old pattern `memcpy(target, src, sizeof(target))` called `target` twice — double-evaluating side effects. Same hoist pattern as BUG-216 (bit-set assignment). (BUG-252)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.

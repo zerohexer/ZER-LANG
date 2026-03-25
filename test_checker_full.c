@@ -1355,6 +1355,26 @@ static void test_negative_sweep(void) {
        "u8[@size(Msg)] buffer;\n"
        "u32 main() { return 0; }",
        "@size(union) accepted as array size constant");
+
+    /* BUG-251: return opt orelse local_derived — orelse walk bypass */
+    err("*u32 bad(?*u32 opt) {\n"
+        "    u32 x = 42;\n"
+        "    *u32 p = &x;\n"
+        "    return opt orelse p;\n"
+        "}",
+        "return orelse local-derived fallback rejected");
+    err("struct Task { u32 id; }\n"
+        "*Task bad(?*Task opt) {\n"
+        "    u8[64] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    *Task t = a.alloc(Task) orelse return @inttoptr(*Task, 1);\n"
+        "    return opt orelse t;\n"
+        "}",
+        "return orelse arena-derived fallback rejected");
+    ok("u32 g = 99;\n"
+       "*u32 ok_fn(?*u32 opt) { *u32 p = &g; return opt orelse p; }\n"
+       "u32 main() { return 0; }",
+       "return orelse global-derived fallback accepted");
 }
 
 /* ================================================================ */

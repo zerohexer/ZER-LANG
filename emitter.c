@@ -647,17 +647,20 @@ static void emit_expr(Emitter *e, Node *node) {
                 goto assign_done;
             }
         }
-        /* array assignment: x = y → memcpy(x, y, sizeof(x)) — C arrays aren't lvalues */
+        /* array assignment: x = y → memcpy(x, y, sizeof(x)) — C arrays aren't lvalues
+         * BUG-252: hoist target into pointer temp for single evaluation.
+         * get_s().arr = local was calling get_s() twice (dest + sizeof). */
         if (node->assign.op == TOK_EQ) {
             Type *tgt_type = checker_get_type(e->checker,node->assign.target);
             if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
-                emit(e, "memcpy(");
+                int tmp = e->temp_count++;
+                emit(e, "({ __typeof__(");
                 emit_expr(e, node->assign.target);
-                emit(e, ", ");
+                emit(e, ") *_zer_ma%d = &(", tmp);
+                emit_expr(e, node->assign.target);
+                emit(e, "); memcpy(_zer_ma%d, ", tmp);
                 emit_expr(e, node->assign.value);
-                emit(e, ", sizeof(");
-                emit_expr(e, node->assign.target);
-                emit(e, "))");
+                emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
                 goto assign_done;
             }
         }

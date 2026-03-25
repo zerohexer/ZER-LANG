@@ -409,14 +409,19 @@ int main(int argc, char **argv) {
 
     /* --run: compile with GCC and execute */
     if (do_run) {
-        /* build exe path: replace .c with .exe (or append .exe) */
+        /* build exe path: replace .c with platform-appropriate extension */
         char exe_path[512];
         size_t clen = strlen(output_path);
+#ifdef _WIN32
+        const char *exe_ext = ".exe";
+#else
+        const char *exe_ext = "";
+#endif
         if (clen > 2 && strcmp(output_path + clen - 2, ".c") == 0) {
             memcpy(exe_path, output_path, clen - 2);
-            strcpy(exe_path + clen - 2, ".exe");
+            strcpy(exe_path + clen - 2, exe_ext);
         } else {
-            snprintf(exe_path, sizeof(exe_path), "%s.exe", output_path);
+            snprintf(exe_path, sizeof(exe_path), "%s%s", output_path, exe_ext);
         }
 
         char gcc_cmd[1024];
@@ -433,7 +438,11 @@ int main(int argc, char **argv) {
         }
 
         char run_cmd[1024];
+#ifdef _WIN32
         snprintf(run_cmd, sizeof(run_cmd), ".\\\"%s\"", exe_path);
+#else
+        snprintf(run_cmd, sizeof(run_cmd), "./%s", exe_path);
+#endif
         printf("zerc: running %s\n", exe_path);
         int run_ret = system(run_cmd);
         free(cc.modules);

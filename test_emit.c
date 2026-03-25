@@ -8,6 +8,21 @@
 #include "checker.h"
 #include "emitter.h"
 
+/* Platform-specific paths for E2E test binaries */
+#ifdef _WIN32
+#define TEST_EXE "_zer_test_out.exe"
+#define TEST_RUN ".\\_zer_test_out.exe"
+#define GCC_COMPILE "gcc -std=c99 -fwrapv -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt"
+#define GCC_COMPILE_ONLY "gcc -std=c99 -fwrapv -c -o _zer_test_out.o _zer_test_out.c 2>_zer_gcc_err.txt"
+#define GCC_COMPILE_NOWRAP "gcc -std=c99 -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt"
+#else
+#define TEST_EXE "_zer_test_out"
+#define TEST_RUN "./_zer_test_out"
+#define GCC_COMPILE "gcc -std=c99 -fwrapv -o _zer_test_out _zer_test_out.c 2>_zer_gcc_err.txt"
+#define GCC_COMPILE_ONLY "gcc -std=c99 -fwrapv -c -o _zer_test_out.o _zer_test_out.c 2>_zer_gcc_err.txt"
+#define GCC_COMPILE_NOWRAP "gcc -std=c99 -o _zer_test_out _zer_test_out.c 2>_zer_gcc_err.txt"
+#endif
+
 /* ================================================================
  * ZER C Emitter Tests
  *
@@ -59,7 +74,7 @@ static void test_compile_and_run(const char *zer_source, int expected_exit,
     }
 
     /* step 2: C → binary with GCC */
-    int gcc_ret = system("gcc -std=c99 -fwrapv -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt");
+    int gcc_ret = system(GCC_COMPILE);
     if (gcc_ret != 0) {
         printf("  FAIL: %s — GCC compilation failed\n", test_name);
         /* print gcc errors */
@@ -74,7 +89,7 @@ static void test_compile_and_run(const char *zer_source, int expected_exit,
     }
 
     /* step 3: run binary */
-    int run_ret = system(".\\_zer_test_out.exe");
+    int run_ret = system(TEST_RUN);
     /* system() returns wait status, extract exit code */
     int exit_code = run_ret;
 #ifdef _WIN32
@@ -102,7 +117,7 @@ static void test_compile_only(const char *zer_source, const char *test_name) {
         return;
     }
 
-    int gcc_ret = system("gcc -std=c99 -fwrapv -c -o _zer_test_out.o _zer_test_out.c 2>_zer_gcc_err.txt");
+    int gcc_ret = system(GCC_COMPILE_ONLY);
     if (gcc_ret != 0) {
         printf("  FAIL: %s — GCC compilation failed\n", test_name);
         FILE *errf = fopen("_zer_gcc_err.txt", "r");
@@ -1094,9 +1109,9 @@ int main(void) {
             "    arr[idx] = 99;\n"
             "    return 0;\n"
             "}\n", "_zer_test_out.c")) {
-            int gcc = system("gcc -std=c99 -o _zer_test_out.exe _zer_test_out.c 2>_zer_gcc_err.txt");
+            int gcc = system(GCC_COMPILE_NOWRAP);
             if (gcc == 0) {
-                int run = system(".\\_zer_test_out.exe");
+                int run = system(TEST_RUN);
                 if (run != 0) {
                     tests_passed++; /* non-zero exit = trap fired */
                 } else {
@@ -2770,7 +2785,7 @@ int main(void) {
 
     /* cleanup temp files */
     remove("_zer_test_out.c");
-    remove("_zer_test_out.exe");
+    remove(TEST_EXE);
     remove("_zer_test_out.o");
     remove("_zer_gcc_err.txt");
 

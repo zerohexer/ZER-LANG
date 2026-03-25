@@ -111,4 +111,17 @@ clean:
 	      _zer_test_out.c _zer_test_out.exe _zer_test_out.o _zer_gcc_err.txt
 	rm -rf release
 
-.PHONY: check clean release
+# ---- Docker build + test (avoids AV false positives) ----
+docker-check:
+	docker build -t zer-lang-dev .
+	docker run --rm zer-lang-dev make check
+
+docker-build:
+	docker build -t zer-lang-dev .
+	docker run --rm zer-lang-dev make zerc
+
+docker-shell:
+	docker build -t zer-lang-dev .
+	docker run --rm -it zer-lang-dev bash
+
+.PHONY: check clean release docker-check docker-build docker-shell

@@ -1,0 +1,11 @@
+*.exe
+*.o
+*.obj
+_zer_*
+.claude/
+.obsidian/
+.git/
+zerc/
+release/
+docs/
+*.md

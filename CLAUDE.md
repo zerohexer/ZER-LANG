@@ -654,7 +654,7 @@ When starting a new session or lacking context:
 3. Read `BUGS-FIXED.md` — 41 past bugs with root causes. Prevents re-introducing fixed bugs.
 4. `ZER-LANG.md` — full language spec (only if CLAUDE.md quick reference is insufficient)
 5. Read the relevant header files: `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
-4. Run `make check` to verify everything passes before making changes
+4. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
 5. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
 
 ## Project Architecture
@@ -664,12 +664,37 @@ When starting a new session or lacking context:
 - Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`
 - Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`, `test_fuzz.c`
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
-- On Windows: use `.\\_zer_test_out.exe` (backslash) to run test binaries from `system()` calls
+- Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
 - Compiler flags: `--run` (compile+execute), `--lib` (no preamble/runtime, for C interop)
 - GCC flags: emitted C requires `-fwrapv` (ZER defines signed overflow as wrapping). `zerc --run` adds this automatically.
 - Emitted C uses GCC extensions: statement expressions `({...})`, `__auto_type`, `_Alignof`, `__attribute__((packed))`
 - User-defined struct/enum/union names emit as-is (no `_zer_` prefix). Only internal names are prefixed.
+
+## Building & Testing
+
+**PREFERRED: Use Docker** to avoid Windows Defender false positives on compiled executables:
+```
+make docker-check     # build + run ALL tests in container (gcc:13 image)
+make docker-build     # just build zerc in container
+make docker-shell     # interactive bash inside container for debugging
+```
+
+**Fallback: Native (triggers AV on Windows corporate laptops):**
+```
+make zerc             # build the compiler
+make check            # build + run all tests
+```
+
+**DO NOT run `make check` or execute compiled binaries outside Docker** on the dev machine — Windows flags rapid create-execute-delete of unsigned .exe files as malware.
+
+**WARNING:** Do NOT use bind mounts (`docker run -v $(pwd):/zer`) for test runs. Compiled binaries would land on the Windows filesystem and Defender sees them again. The Dockerfile uses `COPY` — all compilation stays inside the container's filesystem. Keep it that way.
+
+The codebase is **cross-platform** (Windows + Linux/Docker):
+- `test_emit.c`: `#ifdef _WIN32` macros for `.exe` extension and path separators
+- `test_modules/run_tests.sh`: detects platform via `$OSTYPE` for executable extension
+- `zerc_main.c --run`: platform-appropriate exe path and run command
+- `Dockerfile`: uses `gcc:13`, copies sources, runs `make check`
 
 ## Git Rules
 
@@ -720,7 +745,7 @@ Before marking ANY component as "done":
 - Never delete a passing test
 - If a bug is found, write a test that reproduces it BEFORE fixing
 - All tests must pass before any commit
-- Run `make check` before every push
+- Run `make docker-check` (or `make check`) before every push
 
 ## Debugging Workflow — ZER Source Code Bugs
 
@@ -750,7 +775,7 @@ If you can't commit (tests failing), stash.
 5. **Fix one thing**
    The fix should be 1-5 lines. If growing beyond that, you're fixing the wrong thing.
 
-6. **`make check` immediately after fix**
+6. **`make docker-check` immediately after fix**
    950+ tests must pass. If not — revert, re-examine root cause.
 
 7. **Update BUGS-FIXED.md** with: symptom, root cause, fix, test reference.

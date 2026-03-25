@@ -2,6 +2,12 @@
 ZERC="../zerc"
 if [ ! -f "$ZERC" ] && [ -f "../zerc.exe" ]; then ZERC="../zerc.exe"; fi
 
+# Platform-specific executable extension
+EXT=""
+if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ -n "$WINDIR" ]]; then
+    EXT=".exe"
+fi
+
 PASS=0
 FAIL=0
 
@@ -10,9 +16,9 @@ run_test() {
     local expected=$2
     $ZERC $name.zer -o _$name.c 2>/dev/null
     if [ $? -ne 0 ]; then echo "  FAIL: $name (zerc failed)"; FAIL=$((FAIL+1)); return; fi
-    gcc -std=c99 -w -o _$name.exe _$name.c 2>/dev/null
+    gcc -std=c99 -w -o _${name}${EXT} _$name.c 2>/dev/null
     if [ $? -ne 0 ]; then echo "  FAIL: $name (gcc failed)"; FAIL=$((FAIL+1)); return; fi
-    ./_$name.exe
+    ./_${name}${EXT}
     local got=$?
     if [ "$got" -eq "$expected" ]; then
         PASS=$((PASS+1))
@@ -43,7 +49,7 @@ else
 fi
 
 # cleanup
-rm -f _*.c _*.exe
+rm -f _*.c _*.exe _*.o _*[!.]*
 
 echo "=== Module tests: $PASS passed, $FAIL failed ==="
 exit $FAIL

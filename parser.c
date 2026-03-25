@@ -1075,45 +1075,104 @@ static Node *parse_statement(Parser *p) {
     }
 
     /* Detect variable declaration vs expression statement.
-     * Strategy: save scanner state, try to parse a type, check if
-     * followed by an identifier (which means var decl). Restore if not. */
+     * Instead of speculatively calling parse_type() (which allocates AST nodes
+     * and requires error suppression), use lightweight token scanning.
+     *
+     * A var decl starts with a type followed by an identifier name:
+     *   Type Name ...     where Type can be:
+     *     keyword         u32, bool, void, etc. (already handled above for const/static/volatile)
+     *     Ident           user-defined type (Task, Config)
+     *     Ident[N]        array type (Task[10])
+     *     *Type           pointer (*Task, **u32)
+     *     ?Type           optional (?u32, ?*Task)
+     *     []Type          slice ([]u8)
+     *     Type(*name)(...)  function pointer
+     *
+     * For TOK_IDENT specifically (the ambiguous case), we scan forward:
+     *   IDENT IDENT          → var decl (Task t)
+     *   IDENT [expr] IDENT   → array var decl (Task[10] t)
+     *   IDENT (              → could be func ptr decl or call expr
+     *   IDENT anything_else  → expression statement
+     *
+     * For non-IDENT type tokens (*, ?, []), these unambiguously start types,
+     * so we still use the speculative parse for those.
+     */
     if (is_type_token(p->current.type)) {
-        Scanner saved_scanner = *p->scanner;
-        Token saved_cur = p->current;
-        Token saved_prev = p->previous;
-        bool saved_error = p->had_error;
-        bool saved_panic = p->panic_mode;
+        bool is_var = false;
 
-        /* suppress errors during lookahead */
-        p->had_error = false;
-        p->panic_mode = true;
+        if (p->current.type == TOK_IDENT) {
+            /* Lightweight lookahead for IDENT-starting statements.
+             * No AST allocation, no error suppression needed. */
+            Scanner saved_scanner = *p->scanner;
+            Token saved_cur = p->current;
+            Token saved_prev = p->previous;
 
-        /* try to parse a type */
-        TypeNode *try_type = parse_type(p);
-        (void)try_type;
+            advance(p); /* consume the type name */
 
-        /* if next token is an identifier, this is a var decl.
-         * also detect function pointer: type ( * name )( params ) */
-        bool is_func_ptr = false;
-        if (!p->had_error && check(p, TOK_LPAREN)) {
-            /* peek further: ( * means function pointer */
-            Scanner saved2 = *p->scanner;
-            Token saved2_cur = p->current;
-            advance(p); /* consume ( */
-            is_func_ptr = check(p, TOK_STAR);
-            *p->scanner = saved2;
-            p->current = saved2_cur;
+            if (check(p, TOK_IDENT)) {
+                /* IDENT IDENT → definitely a var decl (Task t) */
+                is_var = true;
+            } else if (check(p, TOK_LBRACKET)) {
+                /* IDENT [ — could be array type (Task[10] t) or index (arr[0]).
+                 * Scan past balanced brackets, check if followed by IDENT. */
+                advance(p); /* consume [ */
+                int depth = 1;
+                while (depth > 0 && !check(p, TOK_EOF)) {
+                    if (check(p, TOK_LBRACKET)) depth++;
+                    else if (check(p, TOK_RBRACKET)) depth--;
+                    advance(p);
+                }
+                /* after ] — if IDENT follows, it's an array var decl */
+                is_var = check(p, TOK_IDENT);
+            } else if (check(p, TOK_LPAREN)) {
+                /* IDENT ( — could be func ptr type or function call.
+                 * Peek: ( * means function pointer declaration. */
+                Scanner saved2 = *p->scanner;
+                Token saved2_cur = p->current;
+                advance(p); /* consume ( */
+                is_var = check(p, TOK_STAR);
+                *p->scanner = saved2;
+                p->current = saved2_cur;
+            }
+
+            /* restore scanner state */
+            *p->scanner = saved_scanner;
+            p->current = saved_cur;
+            p->previous = saved_prev;
+        } else {
+            /* Non-IDENT type token (*, ?, [], keyword) — unambiguously a type.
+             * Use speculative parse for complex types like ?*Task or []u8. */
+            Scanner saved_scanner = *p->scanner;
+            Token saved_cur = p->current;
+            Token saved_prev = p->previous;
+            bool saved_error = p->had_error;
+            bool saved_panic = p->panic_mode;
+
+            p->had_error = false;
+            p->panic_mode = true;
+
+            TypeNode *try_type = parse_type(p);
+            (void)try_type;
+
+            bool is_func_ptr = false;
+            if (!p->had_error && check(p, TOK_LPAREN)) {
+                Scanner saved2 = *p->scanner;
+                Token saved2_cur = p->current;
+                advance(p);
+                is_func_ptr = check(p, TOK_STAR);
+                *p->scanner = saved2;
+                p->current = saved2_cur;
+            }
+            is_var = !p->had_error && (check(p, TOK_IDENT) || is_func_ptr);
+
+            *p->scanner = saved_scanner;
+            p->current = saved_cur;
+            p->previous = saved_prev;
+            p->had_error = saved_error;
+            p->panic_mode = saved_panic;
         }
-        bool is_var_decl = !p->had_error && (check(p, TOK_IDENT) || is_func_ptr);
 
-        /* restore scanner state completely */
-        *p->scanner = saved_scanner;
-        p->current = saved_cur;
-        p->previous = saved_prev;
-        p->had_error = saved_error;
-        p->panic_mode = saved_panic;
-
-        if (is_var_decl) {
+        if (is_var) {
             return parse_var_decl(p, false, false, false);
         }
     }

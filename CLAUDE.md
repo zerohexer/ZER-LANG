@@ -584,7 +584,10 @@ Pool (alloc, free), Ring (push, push_checked, pop), Arena (alloc, alloc_slice, u
 **104. `@cstr` const pointer destination rejected.**
 `@cstr(p, "hi")` where `p` is `const *u8` → error. Checks `pointer.is_const` on destination type, in addition to `is_const` on symbol (BUG-238). (BUG-241)
 
-**105. `check_expr` recursion depth guard (limit 1000).**
+**105. Parser: lightweight lookahead replaces speculative parse for IDENT-starting statements.**
+`is_type_token` returns true for `TOK_IDENT`, which previously caused every identifier-starting statement (`foo(bar)`, `x = 5`) to trigger a full `parse_type()` + backtrack. Now IDENT-starting statements use token scanning: IDENT IDENT → var decl, IDENT `[` ... `]` IDENT → array var decl, IDENT `(*` → func ptr decl, anything else → expression. No AST allocation, no error suppression. Speculative `parse_type()` only used for unambiguous type starters (`*`, `?`, `[]`).
+
+**106. `check_expr` recursion depth guard (limit 1000).**
 `c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
 
 ### Design Decisions (NOT bugs — intentional)

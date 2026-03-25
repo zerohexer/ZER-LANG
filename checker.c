@@ -293,6 +293,25 @@ static int64_t compute_type_size(Type *t) {
             total += align - (total % align);
         return total;
     }
+    if (t->kind == TYPE_UNION) {
+        /* BUG-250: tagged union = int32_t tag + max(variant_sizes), aligned */
+        int64_t max_variant = 0;
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
+            int64_t vs = compute_type_size(t->union_type.variants[i].type);
+            if (vs > max_variant) max_variant = vs;
+        }
+        int64_t total = 4; /* int32_t _tag */
+        /* align union data to max variant alignment */
+        int data_align = (int)(max_variant > 8 ? 8 : (max_variant > 0 ? max_variant : 4));
+        if (data_align > 1 && (total % data_align) != 0)
+            total += data_align - (total % data_align);
+        total += max_variant;
+        /* pad to alignment of largest member */
+        int struct_align = data_align > 4 ? data_align : 4; /* at least tag alignment */
+        if (struct_align > 1 && (total % struct_align) != 0)
+            total += struct_align - (total % struct_align);
+        return total > 0 ? total : -1;
+    }
     if (t->kind == TYPE_STRUCT) {
         int64_t total = 0;
         int max_align = 1;
@@ -766,6 +785,30 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
+
+        /* BUG-248: block direct assignment to union variable during switch capture.
+         * msg = other_msg changes tag+data, invalidating capture pointer. */
+        if (c->union_switch_var && node->assign.op == TOK_EQ) {
+            Node *troot = node->assign.target;
+            while (troot) {
+                if (troot->kind == NODE_UNARY && troot->unary.op == TOK_STAR)
+                    troot = troot->unary.operand;
+                else if (troot->kind == NODE_FIELD)
+                    troot = troot->field.object;
+                else if (troot->kind == NODE_INDEX)
+                    troot = troot->index_expr.object;
+                else break;
+            }
+            if (troot && troot->kind == NODE_IDENT &&
+                troot->ident.name_len == c->union_switch_var_len &&
+                memcmp(troot->ident.name, c->union_switch_var,
+                       c->union_switch_var_len) == 0) {
+                checker_error(c, node->loc.line,
+                    "cannot assign to union '%.*s' inside its switch arm — "
+                    "active capture would become invalid",
+                    (int)c->union_switch_var_len, c->union_switch_var);
+            }
+        }
 
         /* const check: cannot assign to const variable, const pointer target, or fields thereof */
         {
@@ -2616,6 +2659,29 @@ static void check_stmt(Checker *c, Node *node) {
                     (uint32_t)arm->capture_name_len,
                     cap_type, arm->loc.line);
                 if (cap) cap->is_const = cap_const;
+
+                /* BUG-249: propagate safety flags from switch expression to capture.
+                 * Same pattern as if-unwrap (BUG-212). */
+                if (cap) {
+                    Node *sw_root = node->switch_stmt.expr;
+                    while (sw_root) {
+                        if (sw_root->kind == NODE_UNARY && sw_root->unary.op == TOK_STAR)
+                            sw_root = sw_root->unary.operand;
+                        else if (sw_root->kind == NODE_FIELD)
+                            sw_root = sw_root->field.object;
+                        else if (sw_root->kind == NODE_INDEX)
+                            sw_root = sw_root->index_expr.object;
+                        else if (sw_root->kind == NODE_ORELSE)
+                            sw_root = sw_root->orelse.expr;
+                        else break;
+                    }
+                    if (sw_root && sw_root->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            sw_root->ident.name, (uint32_t)sw_root->ident.name_len);
+                        if (src && src->is_local_derived) cap->is_local_derived = true;
+                        if (src && src->is_arena_derived) cap->is_arena_derived = true;
+                    }
+                }
 
                 /* lock union variable during switch arm to prevent type confusion.
                  * Handles: switch (d) and switch (*ptr) where ptr points to union */

@@ -746,28 +746,34 @@ static Type *check_expr(Checker *c, Node *node) {
 
         case TOK_AMP: /* address-of */
             result = type_pointer(c->arena, operand);
-            /* BUG-197: volatile propagation — &volatile_var yields volatile pointer */
-            /* BUG-228: const propagation — &const_var yields const pointer */
-            if (node->unary.operand->kind == NODE_IDENT) {
-                Symbol *sym = scope_lookup(c->current_scope,
-                    node->unary.operand->ident.name,
-                    (uint32_t)node->unary.operand->ident.name_len);
-                if (sym && sym->is_volatile) {
-                    result->pointer.is_volatile = true;
+            /* BUG-197/228/254: walk operand to root for volatile/const propagation.
+             * Handles &ident, &arr[i], &s.field, &s.arr[i].field etc. */
+            {
+                Node *root = node->unary.operand;
+                while (root) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                    else break;
                 }
-                if (sym && sym->is_const) {
-                    result->pointer.is_const = true;
-                }
-                /* BUG-208: block &union_var inside mutable capture arm.
-                 * Pointer alias would bypass the union switch lock. */
-                if (c->union_switch_var &&
-                    node->unary.operand->ident.name_len == c->union_switch_var_len &&
-                    memcmp(node->unary.operand->ident.name, c->union_switch_var,
-                           c->union_switch_var_len) == 0) {
-                    checker_error(c, node->loc.line,
-                        "cannot take address of union '%.*s' inside its switch arm — "
-                        "pointer alias would bypass variant lock",
-                        (int)c->union_switch_var_len, c->union_switch_var);
+                if (root && root->kind == NODE_IDENT) {
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    if (sym && sym->is_volatile) {
+                        result->pointer.is_volatile = true;
+                    }
+                    if (sym && sym->is_const) {
+                        result->pointer.is_const = true;
+                    }
+                    /* BUG-208: block &union_var inside mutable capture arm. */
+                    if (c->union_switch_var &&
+                        root->ident.name_len == c->union_switch_var_len &&
+                        memcmp(root->ident.name, c->union_switch_var,
+                               c->union_switch_var_len) == 0) {
+                        checker_error(c, node->loc.line,
+                            "cannot take address of union '%.*s' inside its switch arm — "
+                            "pointer alias would bypass variant lock",
+                            (int)c->union_switch_var_len, c->union_switch_var);
+                    }
                 }
             }
             break;
@@ -2262,9 +2268,9 @@ static void check_stmt(Checker *c, Node *node) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
         }
-        /* BUG-239: non-null pointer (*T) requires initializer — auto-zero creates NULL */
-        if (!node->var_decl.init && type && type->kind == TYPE_POINTER &&
-            node->kind == NODE_VAR_DECL) {
+        /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
+         * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR). */
+        if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
             checker_error(c, node->loc.line,
                 "non-null pointer '*%s' requires an initializer — "
                 "use '?*%s' for nullable pointers",
@@ -2981,8 +2987,9 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-246: scope escape via @ptrcast/@bitcast wrapping &local.
-             * return @ptrcast(*u8, &x) where x is local → dangling pointer */
+            /* BUG-246/256: scope escape via @ptrcast/@bitcast wrapping &local OR local-derived ident.
+             * return @ptrcast(*u8, &x) where x is local → dangling pointer
+             * return @ptrcast(*u8, p) where p is local-derived → dangling pointer */
             if (node->ret.expr->kind == NODE_INTRINSIC) {
                 const char *iname = node->ret.expr->intrinsic.name;
                 uint32_t ilen = (uint32_t)node->ret.expr->intrinsic.name_len;
@@ -2991,6 +2998,7 @@ static void check_stmt(Checker *c, Node *node) {
                 if (is_ptr_cast && node->ret.expr->intrinsic.arg_count > 0) {
                     Node *arg = node->ret.expr->intrinsic.args[
                         node->ret.expr->intrinsic.arg_count - 1];
+                    /* check &local pattern */
                     if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
                         Node *root = arg->unary.operand;
                         while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -3007,6 +3015,33 @@ static void check_stmt(Checker *c, Node *node) {
                                     "cannot return pointer to local '%.*s' via @%.*s — "
                                     "stack memory is freed when function returns",
                                     (int)root->ident.name_len, root->ident.name,
+                                    (int)ilen, iname);
+                            }
+                        }
+                    }
+                    /* BUG-256: check local/arena-derived ident through pointer cast.
+                     * Only applies when result is a pointer type (not value bitcast). */
+                    if (ret_type && ret_type->kind == TYPE_POINTER) {
+                        Node *root = arg;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                            if (root->kind == NODE_FIELD) root = root->field.object;
+                            else root = root->index_expr.object;
+                        }
+                        if (root && root->kind == NODE_IDENT) {
+                            Symbol *sym = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            if (sym && sym->is_local_derived) {
+                                checker_error(c, node->loc.line,
+                                    "cannot return local-derived pointer '%.*s' via @%.*s — "
+                                    "stack memory is freed when function returns",
+                                    (int)sym->name_len, sym->name,
+                                    (int)ilen, iname);
+                            }
+                            if (sym && sym->is_arena_derived) {
+                                checker_error(c, node->loc.line,
+                                    "cannot return arena-derived pointer '%.*s' via @%.*s — "
+                                    "arena memory is freed when function returns",
+                                    (int)sym->name_len, sym->name,
                                     (int)ilen, iname);
                             }
                         }
@@ -3332,6 +3367,13 @@ static void register_decl(Checker *c, Node *node) {
             } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
+        }
+        /* BUG-253: non-null pointer (*T) requires initializer at global scope too */
+        if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
+            checker_error(c, node->loc.line,
+                "non-null pointer '*%s' requires an initializer — "
+                "use '?*%s' for nullable pointers",
+                type_name(type->pointer.inner), type_name(type->pointer.inner));
         }
         Symbol *sym = add_symbol(c, node->var_decl.name,
                                  (uint32_t)node->var_decl.name_len,

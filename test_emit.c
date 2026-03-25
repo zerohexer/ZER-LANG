@@ -2816,6 +2816,19 @@ int main(void) {
         16,
         "@size(union) = 16 (tag=4 + pad=4 + u64=8)");
 
+    /* BUG-255: orelse index single-eval — get() called once, not twice */
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "?u32 next() { counter += 1; return counter; }\n"
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;\n"
+        "    u32 x = arr[next() orelse 0];\n"
+        "    return x + counter;\n"
+        "}\n",
+        21,
+        "orelse index single-eval (next() called once, counter=1, arr[1]=20)");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove(TEST_EXE);

@@ -635,6 +635,18 @@ Null-sentinel `?*T` = pointer size. `?void` = 1. Value `?T` = inner_size + 1 (ha
 **114. Array assignment uses pointer hoist for single-eval.**
 `get_s().arr = local` emits `({ __typeof__(target) *_p = &(target); memcpy(_p, src, sizeof(*_p)); })`. The old pattern `memcpy(target, src, sizeof(target))` called `target` twice — double-evaluating side effects. Same hoist pattern as BUG-216 (bit-set assignment). (BUG-252)
 
+**115. Global non-null pointer `*T` requires initializer.**
+`*u32 g_ptr;` at global scope auto-zeros to NULL, violating `*T` non-null guarantee. Check added in BOTH `register_decl` (global registration) AND `check_stmt` (local vars). `?*T` without init is still allowed (nullable by design). (BUG-253)
+
+**116. `&arr[i]` and `&s.field` propagate const/volatile from root.**
+BUG-228 only checked `NODE_IDENT` operands in TOK_AMP. Now walks field/index chains to root ident and propagates `is_const`/`is_volatile`. `&const_arr[0]` yields `const *u32`, preventing const laundering through indexing. (BUG-254)
+
+**117. NODE_ORELSE in index triggers single-eval path.**
+`arr[get() orelse 0]` duplicated the orelse expression (bounds check + access). Added `NODE_ORELSE` to `idx_has_side_effects` detection — now uses the hoisted `_zer_idx` temp path. (BUG-255)
+
+**118. `@ptrcast`/`@bitcast` return checks local/arena-derived idents.**
+BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @ptrcast(*u8, p)` where `p` has `is_local_derived` or `is_arena_derived`. Only fires when the return type is a pointer (not value bitcasts like `@bitcast(u32, x)`). (BUG-256)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.

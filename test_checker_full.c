@@ -1375,6 +1375,38 @@ static void test_negative_sweep(void) {
        "*u32 ok_fn(?*u32 opt) { *u32 p = &g; return opt orelse p; }\n"
        "u32 main() { return 0; }",
        "return orelse global-derived fallback accepted");
+
+    /* BUG-253: global non-null pointer requires initializer */
+    err("*u32 g_ptr;\nu32 main() { return 0; }",
+        "global *T without init rejected");
+    ok("u32 val = 0;\n*u32 g_ptr = &val;\nu32 main() { return 0; }",
+       "global *T with init accepted");
+    ok("?*u32 g_ptr;\nu32 main() { return 0; }",
+       "global ?*T without init accepted (nullable)");
+
+    /* BUG-254: const leak via &arr[i] and &s.field */
+    err("const u32[4] arr;\n"
+        "void f() { *u32 p = &arr[0]; }",
+        "&const_arr[idx] yields const ptr — mutable rejected");
+    err("struct S { u32 x; }\n"
+        "const S s;\n"
+        "void f() { *u32 p = &s.x; }",
+        "&const_struct.field yields const ptr — mutable rejected");
+    ok("const u32[4] arr;\n"
+       "u32 main() { const *u32 p = &arr[0]; return 0; }",
+       "&const_arr[idx] to const ptr accepted");
+
+    /* BUG-256: @ptrcast local/arena-derived ident bypass */
+    err("*u8 bad() {\n"
+        "    u32 x = 42;\n"
+        "    *u32 p = &x;\n"
+        "    return @ptrcast(*u8, p);\n"
+        "}",
+        "@ptrcast local-derived ident return rejected");
+    ok("u32 g = 99;\n"
+       "*u8 ok_fn() { *u32 p = &g; return @ptrcast(*u8, p); }\n"
+       "u32 main() { return 0; }",
+       "@ptrcast global-derived ident return accepted");
 }
 
 /* ================================================================ */

@@ -1032,10 +1032,12 @@ static void emit_expr(Emitter *e, Node *node) {
          * Simple expressions (ident, literal) can safely double-evaluate. */
         /* detect index expressions with side effects or volatile reads.
          * NODE_CALL, NODE_ASSIGN: obvious side effects.
-         * NODE_UNARY(deref): volatile pointer deref must not be double-read. */
+         * NODE_UNARY(deref): volatile pointer deref must not be double-read.
+         * BUG-255: NODE_ORELSE may wrap a NODE_CALL (e.g. get() orelse 0). */
         bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL ||
                                       node->index_expr.index->kind == NODE_ASSIGN ||
-                                      node->index_expr.index->kind == NODE_UNARY);
+                                      node->index_expr.index->kind == NODE_UNARY ||
+                                      node->index_expr.index->kind == NODE_ORELSE);
         /* check if base object has side effects (e.g. get_slice()[0]) */
         bool obj_has_side_effects = false;
         {

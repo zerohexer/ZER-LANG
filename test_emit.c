@@ -2805,6 +2805,17 @@ int main(void) {
         2,
         "slice.ptr field access works");
 
+    /* BUG-250: @size(union) returns correct value */
+    test_compile_and_run(
+        "struct A { u32 x; }\n"
+        "struct B { u64 y; }\n"
+        "union Msg { A a; B b; }\n"
+        "u32 main() {\n"
+        "    return @truncate(u32, @size(Msg));\n"
+        "}\n",
+        16,
+        "@size(union) = 16 (tag=4 + pad=4 + u64=8)");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove(TEST_EXE);

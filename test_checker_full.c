@@ -1328,6 +1328,33 @@ static void test_negative_sweep(void) {
     ok("u32 loop_if() { while (true) { u32 x = 1; if (x > 0) { return 1; } } }\n"
        "u32 main() { return loop_if(); }",
        "while(true) with conditional return accepted");
+
+    /* BUG-248: union assignment during switch capture */
+    err("struct A { u32 x; }\nstruct B { u32 y; }\nunion Msg { A a; B b; }\n"
+        "void f() { Msg m; m.a.x = 1; Msg other; other.b.y = 99;\n"
+        "  switch (m) { .a => |*v| { m = other; } .b => |*v| { } } }",
+        "direct union assign inside capture arm rejected");
+    ok("struct A { u32 x; }\nstruct B { u32 y; }\nunion Msg { A a; B b; }\n"
+       "void f() { Msg m; m.a.x = 1; Msg other; other.b.y = 99;\n"
+       "  switch (m) { .a => |*v| { v.x = 5; } .b => |*v| { } } }",
+       "capture field mutation (not union itself) accepted");
+
+    /* BUG-249: switch capture propagates is_local_derived/is_arena_derived */
+    err("*u32 bad() {\n"
+        "    u32 x = 42;\n"
+        "    ?*u32 opt = &x;\n"
+        "    switch (opt) {\n"
+        "        null => { return @inttoptr(*u32, 1); }\n"
+        "        default => |p| { return p; }\n"
+        "    }\n"
+        "}",
+        "switch capture of local-derived optional rejected on return");
+
+    /* BUG-250: @size(union) resolved as compile-time constant */
+    ok("struct A { u32 x; }\nstruct B { u64 y; }\nunion Msg { A a; B b; }\n"
+       "u8[@size(Msg)] buffer;\n"
+       "u32 main() { return 0; }",
+       "@size(union) accepted as array size constant");
 }
 
 /* ================================================================ */

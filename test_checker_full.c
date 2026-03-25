@@ -1160,6 +1160,20 @@ static void test_negative_sweep(void) {
     err("u32 main() { u8[4] buf; @cstr(buf, \"hello world\"); return 0; }",
         "@cstr constant overflow rejected");
 
+    /* BUG-236: const builtin mutating methods rejected */
+    err("struct Task { u32 id; }\nconst Pool(Task, 4) tasks;\n"
+        "u32 main() { Handle(Task) h = tasks.alloc() orelse return; return 0; }",
+        "const Pool alloc rejected");
+
+    /* BUG-237: nested array return as slice (struct field) */
+    err("struct S { u8[10] arr; }\n[]u8 bad() { S s; return s.arr; }\n"
+        "u32 main() { return 0; }",
+        "nested array return escape rejected");
+
+    /* BUG-238: @cstr to const destination */
+    err("u32 main() { const u8[16] buf; @cstr(buf, \"hello\"); return 0; }",
+        "@cstr to const array rejected");
+
     /* BUG-221: keep parameter rejects local-derived pointers */
     err("static Pool(u32, 4) pool;\n"
         "void store(keep *u32 p) { pool.alloc(); }\n"

@@ -563,10 +563,19 @@ Non-static functions/globals from imported modules also registered under mangled
 **96. `@size(void)` and `@size(opaque)` rejected.**
 Both types have no meaningful size. `@size(opaque)` previously emitted `sizeof(void)` which is a GCC extension returning 1. Now caught at checker level. `@size(*opaque)` still works (pointer has known size). (BUG-231)
 
-**98. `@cstr` compile-time overflow for constant arguments.**
+**98. Mutating methods on const builtins rejected.**
+Pool (alloc, free), Ring (push, push_checked, pop), Arena (alloc, alloc_slice, unsafe_reset) are rejected when the object is `const`. The checker walks field/index chains to find the root symbol and checks `is_const`. `over` and `get` are non-mutating and allowed. (BUG-236)
+
+**99. Nested array return escape walks field chains.**
+`return s.arr` where `s` is local and `arr` is TYPE_ARRAY → slice coercion now caught. NODE_RETURN walks field/index chains to root ident (same pattern as BUG-155 arena escape). (BUG-237)
+
+**100. `@cstr` to const destination rejected.**
+`@cstr(buf, "hello")` where `buf` is `const` → error. Checks destination symbol `is_const`. (BUG-238)
+
+**101. `@cstr` compile-time overflow for constant arguments.**
 `@cstr(buf, "hello world")` where `buf` is `u8[4]` is caught at compile time (string length 11 + null > buffer size 4). Runtime trap still fires for variable-length slices. (BUG-234)
 
-**99. `check_expr` recursion depth guard (limit 1000).**
+**102. `check_expr` recursion depth guard (limit 1000).**
 `c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
 
 ### Design Decisions (NOT bugs — intentional)

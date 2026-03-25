@@ -73,6 +73,22 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-238: @cstr to const destination not rejected
+- **Symptom:** `const u8[16] buf; @cstr(buf, "hello");` compiles — writes to const buffer.
+- **Fix:** In @cstr checker handler, look up destination symbol and reject if `is_const`.
+- **Test:** `test_checker_full.c` — @cstr to const array rejected.
+
+### BUG-237: Nested array return escape (struct field → slice)
+- **Symptom:** `struct S { u8[10] arr; } []u8 bad() { S s; return s.arr; }` — returns dangling slice.
+- **Root cause:** NODE_RETURN array→slice check only matched NODE_IDENT, missed NODE_FIELD chains.
+- **Fix:** Walk field/index chains to find root ident before checking if local.
+- **Test:** `test_checker_full.c` — nested array return escape rejected.
+
+### BUG-236: Mutating methods on const builtins allowed
+- **Symptom:** `const Pool(Task, 4) tasks; tasks.alloc()` compiles — modifies const resource.
+- **Fix:** In NODE_CALL builtin handlers, walk object to root symbol, check `is_const`. All mutating methods (Pool: alloc/free, Ring: push/push_checked/pop, Arena: alloc/alloc_slice/unsafe_reset) rejected on const.
+- **Test:** `test_checker_full.c` — const Pool alloc rejected.
+
 ### BUG-234: @cstr compile-time overflow not caught
 - **Symptom:** `u8[4] buf; @cstr(buf, "hello world");` compiles — runtime trap catches it but compile-time is better.
 - **Fix:** In @cstr checker handler, if dest is TYPE_ARRAY and src is NODE_STRING_LIT, compare `string.length + 1 > array.size`.

@@ -441,5 +441,8 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 81. **Recursive struct unwraps arrays** — BUG-227 self-reference check unwraps TYPE_ARRAY chain before comparing element type to struct being defined. `struct S { S[1] next; }` is caught (GCC would reject as incomplete element type).
 82. **@cstr compile-time overflow** — In @cstr checker handler, if dest is TYPE_ARRAY and src is NODE_STRING_LIT, checks `string.length + 1 > array.size` → compile error. Runtime trap still fires for variable-length slices.
 83. **check_expr recursion depth guard** — `c->expr_depth` counter in Checker struct. Incremented on entry, decremented on exit. Limit 1000. Prevents stack overflow on pathological input (deeply chained orelse, nested expressions). Returns `ty_void` with error on overflow.
+84. **Const builtin method check** — `obj_is_const` flag computed by walking field/index chains to root symbol and checking `is_const`. All mutating Pool/Ring/Arena methods check this flag. Non-mutating methods (`get`, `over`) skip the check.
+85. **Nested array return walks chains** — NODE_RETURN array→slice escape check walks field/index chains to root ident (not just NODE_IDENT). Catches `return s.arr` where `s` is local struct with array field.
+86. **@cstr const destination check** — Looks up destination ident symbol; if `is_const`, error. Separate from the compile-time overflow check (BUG-234) which validates sizes.
 7. **Defer stack scoping** — return emits ALL defers, break/continue emit only loop-scope defers
 8. **Type arg parsing** — intrinsics use `type_arg`, but method calls pass types as NODE_IDENT expression args. Primitive type keywords (`u32`) can't be passed as args (only struct/enum names work as NODE_IDENT).

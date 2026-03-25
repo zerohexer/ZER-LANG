@@ -1103,9 +1103,27 @@ static Type *check_expr(Checker *c, Node *node) {
             const char *mname = field_node->field.field_name;
             uint32_t mlen = (uint32_t)field_node->field.field_name_len;
 
+            /* BUG-236: reject mutating methods on const builtins */
+            bool obj_is_const = false;
+            {
+                Node *oroot = field_node->field.object;
+                while (oroot && (oroot->kind == NODE_FIELD || oroot->kind == NODE_INDEX)) {
+                    if (oroot->kind == NODE_FIELD) oroot = oroot->field.object;
+                    else oroot = oroot->index_expr.object;
+                }
+                if (oroot && oroot->kind == NODE_IDENT) {
+                    Symbol *osym = scope_lookup(c->current_scope,
+                        oroot->ident.name, (uint32_t)oroot->ident.name_len);
+                    if (osym && osym->is_const) obj_is_const = true;
+                }
+            }
+
             /* Pool methods */
             if (obj->kind == TYPE_POOL) {
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'alloc' on const Pool");
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "pool.alloc() takes no arguments");
                     result = type_optional(c->arena, type_handle(c->arena, obj->pool.elem));
@@ -1121,6 +1139,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'free' on const Pool");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "pool.free() takes exactly 1 argument");
                     result = ty_void;
@@ -1137,6 +1158,9 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Ring methods */
             if (obj->kind == TYPE_RING) {
                 if (mlen == 4 && memcmp(mname, "push", 4) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'push' on const Ring");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push() takes exactly 1 argument");
                     result = ty_void;
@@ -1144,6 +1168,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 12 && memcmp(mname, "push_checked", 12) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'push_checked' on const Ring");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push_checked() takes exactly 1 argument");
                     result = type_optional(c->arena, ty_void);
@@ -1151,6 +1178,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 3 && memcmp(mname, "pop", 3) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'pop' on const Ring");
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "ring.pop() takes no arguments");
                     result = type_optional(c->arena, obj->ring.elem);
@@ -1175,6 +1205,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
                     /* Arena.alloc(T) → ?*T */
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'alloc' on const Arena");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "arena.alloc() takes exactly 1 argument");
                     if (node->call.arg_count >= 1 &&
@@ -1211,6 +1244,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0) {
                     /* Arena.alloc_slice(T, n) → ?[]T */
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'alloc_slice' on const Arena");
                     if (node->call.arg_count != 2)
                         checker_error(c, node->loc.line, "arena.alloc_slice() takes exactly 2 arguments");
                     if (node->call.arg_count >= 1 &&
@@ -1233,6 +1269,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 12 && memcmp(mname, "unsafe_reset", 12) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'unsafe_reset' on const Arena");
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "arena.unsafe_reset() takes no arguments");
                     result = ty_void;
@@ -1924,6 +1963,18 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             result = ty_void;
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
+            /* BUG-238: reject @cstr to const destination */
+            if (node->intrinsic.arg_count >= 1 &&
+                node->intrinsic.args[0]->kind == NODE_IDENT) {
+                Symbol *dst_sym = scope_lookup(c->current_scope,
+                    node->intrinsic.args[0]->ident.name,
+                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                if (dst_sym && dst_sym->is_const) {
+                    checker_error(c, node->loc.line,
+                        "@cstr destination '%.*s' is const — cannot write to read-only buffer",
+                        (int)dst_sym->name_len, dst_sym->name);
+                }
+            }
             /* BUG-234: compile-time overflow check when dest is array and src is string literal */
             if (node->intrinsic.arg_count >= 2) {
                 Type *dst_type = checker_get_type(node->intrinsic.args[0]);
@@ -2645,19 +2696,25 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* scope escape: return local array as slice → dangling pointer */
-            if (node->ret.expr->kind == NODE_IDENT &&
-                ret_type && ret_type->kind == TYPE_ARRAY &&
+            /* scope escape: return local array as slice → dangling pointer
+             * BUG-237: walk field/index chains to catch s.arr, s.inner.arr etc. */
+            if (ret_type && ret_type->kind == TYPE_ARRAY &&
                 c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
-                const char *vname = node->ret.expr->ident.name;
-                uint32_t vlen = (uint32_t)node->ret.expr->ident.name_len;
-                Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
-                bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-                if (sym && !sym->is_static && !is_global) {
-                    checker_error(c, node->loc.line,
-                        "cannot return local array '%.*s' as slice — "
-                        "pointer will dangle after function returns",
-                        (int)vlen, vname);
+                Node *root = node->ret.expr;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    const char *vname = root->ident.name;
+                    uint32_t vlen = (uint32_t)root->ident.name_len;
+                    Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
+                    bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                    if (sym && !sym->is_static && !is_global) {
+                        checker_error(c, node->loc.line,
+                            "cannot return local array as slice — "
+                            "pointer will dangle after function returns");
+                    }
                 }
             }
 

@@ -274,6 +274,25 @@ static int64_t compute_type_size(Type *t) {
         int64_t elem_size = compute_type_size(t->array.inner);
         return elem_size > 0 ? elem_size * (int64_t)t->array.size : -1;
     }
+    if (t->kind == TYPE_OPTIONAL) {
+        /* BUG-243: ?*T and ?FuncPtr are null-sentinel (same size as pointer) */
+        { Type *oi = type_unwrap_distinct(t->optional.inner);
+          if (oi->kind == TYPE_POINTER || oi->kind == TYPE_FUNC_PTR)
+              return type_width(ty_usize) / 8; }
+        /* ?void = { has_value: u8 } = 1 byte */
+        if (t->optional.inner->kind == TYPE_VOID) return 1;
+        /* ?T = { T value; u8 has_value; } — aligned like a struct */
+        int64_t inner_size = compute_type_size(t->optional.inner);
+        if (inner_size <= 0) return -1;
+        int align = (int)(inner_size > 8 ? 8 : inner_size);
+        int64_t total = inner_size; /* value field */
+        /* add has_value (u8) with alignment padding */
+        total += 1;
+        /* pad to alignment of largest field */
+        if (align > 1 && (total % align) != 0)
+            total += align - (total % align);
+        return total;
+    }
     if (t->kind == TYPE_STRUCT) {
         int64_t total = 0;
         int max_align = 1;
@@ -1574,9 +1593,17 @@ static Type *check_expr(Checker *c, Node *node) {
             /* union switch lock applies to pointer auto-deref too.
              * BUG-211: walk to root for field-based access */
             if (c->in_assign_target && c->union_switch_var) {
+                /* BUG-244: walk ALL deref/field/index levels to find root */
                 Node *mut_root = node->field.object;
-                while (mut_root && mut_root->kind == NODE_FIELD) mut_root = mut_root->field.object;
-                while (mut_root && mut_root->kind == NODE_INDEX) mut_root = mut_root->index_expr.object;
+                while (mut_root) {
+                    if (mut_root->kind == NODE_UNARY && mut_root->unary.op == TOK_STAR)
+                        mut_root = mut_root->unary.operand;
+                    else if (mut_root->kind == NODE_FIELD)
+                        mut_root = mut_root->field.object;
+                    else if (mut_root->kind == NODE_INDEX)
+                        mut_root = mut_root->index_expr.object;
+                    else break;
+                }
                 if (mut_root && mut_root->kind == NODE_IDENT &&
                     mut_root->ident.name_len == c->union_switch_var_len &&
                     memcmp(mut_root->ident.name, c->union_switch_var,
@@ -1639,10 +1666,18 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* prevent mutating union variant while inside a switch arm on same variable.
              * BUG-211: walk field/index chain to find root ident for field-based unions */
+            /* BUG-244: walk ALL deref/field/index levels to find root */
             if (c->union_switch_var) {
                 Node *mut_root = node->field.object;
-                while (mut_root && mut_root->kind == NODE_FIELD) mut_root = mut_root->field.object;
-                while (mut_root && mut_root->kind == NODE_INDEX) mut_root = mut_root->index_expr.object;
+                while (mut_root) {
+                    if (mut_root->kind == NODE_UNARY && mut_root->unary.op == TOK_STAR)
+                        mut_root = mut_root->unary.operand;
+                    else if (mut_root->kind == NODE_FIELD)
+                        mut_root = mut_root->field.object;
+                    else if (mut_root->kind == NODE_INDEX)
+                        mut_root = mut_root->index_expr.object;
+                    else break;
+                }
                 if (mut_root && mut_root->kind == NODE_IDENT &&
                     mut_root->ident.name_len == c->union_switch_var_len &&
                     memcmp(mut_root->ident.name, c->union_switch_var,
@@ -2563,13 +2598,18 @@ static void check_stmt(Checker *c, Node *node) {
                     Node *sw_expr = node->switch_stmt.expr;
                     /* walk to root ident for union lock.
                      * Handles: switch(d), switch(*ptr), switch(s.msg), switch(s.msg.inner) */
+                    /* BUG-244: walk ALL deref/field/index levels to find root.
+                     * Handles: switch(**pp), switch(*ptr), switch(s.msg), etc. */
                     Node *lock_root = sw_expr;
-                    if (lock_root->kind == NODE_UNARY && lock_root->unary.op == TOK_STAR)
-                        lock_root = lock_root->unary.operand;
-                    while (lock_root->kind == NODE_FIELD)
-                        lock_root = lock_root->field.object;
-                    while (lock_root->kind == NODE_INDEX)
-                        lock_root = lock_root->index_expr.object;
+                    while (lock_root) {
+                        if (lock_root->kind == NODE_UNARY && lock_root->unary.op == TOK_STAR)
+                            lock_root = lock_root->unary.operand;
+                        else if (lock_root->kind == NODE_FIELD)
+                            lock_root = lock_root->field.object;
+                        else if (lock_root->kind == NODE_INDEX)
+                            lock_root = lock_root->index_expr.object;
+                        else break;
+                    }
                     if (lock_root->kind == NODE_IDENT) {
                         c->union_switch_var = lock_root->ident.name;
                         c->union_switch_var_len = (uint32_t)lock_root->ident.name_len;

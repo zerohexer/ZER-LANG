@@ -29,6 +29,8 @@ run_test use_types 50
 run_test use_defs 42
 run_test diamond2 30
 run_test collision_test 170
+run_test static_coll 30
+run_test gcoll 30
 
 # BUG-087: imported interrupt — compile-only (interrupt attr is ARM-specific)
 $ZERC use_hal.zer -o _use_hal.c 2>/dev/null

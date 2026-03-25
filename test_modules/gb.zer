@@ -1,0 +1,2 @@
+u32 val = 20;
+u32 gb_read() { return val; }

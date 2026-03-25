@@ -1,0 +1,2 @@
+static u32 x = 20;
+u32 get_b() { return x; }

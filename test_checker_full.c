@@ -1136,6 +1136,30 @@ static void test_negative_sweep(void) {
     err("u32 main() { f32 x = 1.0; switch (x) { default => { return 1; } } }",
         "float switch rejected");
 
+    /* BUG-227/232: recursive struct by value rejected (including via array) */
+    err("struct S { S next; }\nu32 main() { return 0; }",
+        "recursive struct by value rejected");
+    err("struct S { S[1] next; }\nu32 main() { return 0; }",
+        "recursive struct via array rejected");
+
+    /* BUG-228: const address-of leak — &const_var yields const pointer */
+    err("const u32 x = 42;\nu32 main() { *u32 p = &x; return *p; }",
+        "mutable pointer from &const rejected");
+
+    /* BUG-230: pointer parameter escape — &local through pointer param field */
+    err("struct H { *u32 p; }\nvoid leak(*H h) { u32 x = 5; h.p = &x; }",
+        "local escape through pointer param rejected");
+
+    /* BUG-231: @size(opaque) and @size(void) rejected */
+    err("u32 main() { usize s = @size(opaque); return 0; }",
+        "@size(opaque) rejected");
+    err("u32 main() { usize s = @size(void); return 0; }",
+        "@size(void) rejected");
+
+    /* BUG-234: @cstr compile-time overflow check */
+    err("u32 main() { u8[4] buf; @cstr(buf, \"hello world\"); return 0; }",
+        "@cstr constant overflow rejected");
+
     /* BUG-221: keep parameter rejects local-derived pointers */
     err("static Pool(u32, 4) pool;\n"
         "void store(keep *u32 p) { pool.alloc(); }\n"

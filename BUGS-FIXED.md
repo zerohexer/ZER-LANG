@@ -73,6 +73,50 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-234: @cstr compile-time overflow not caught
+- **Symptom:** `u8[4] buf; @cstr(buf, "hello world");` compiles — runtime trap catches it but compile-time is better.
+- **Fix:** In @cstr checker handler, if dest is TYPE_ARRAY and src is NODE_STRING_LIT, compare `string.length + 1 > array.size`.
+- **Test:** `test_checker_full.c` — @cstr constant overflow rejected.
+
+### BUG-233: Global symbol collision across modules
+- **Symptom:** `mod_a` and `mod_b` both define `u32 val` and `get_val()`. Inside `ga_get_val()`, `val` resolves to `gb_val` (wrong module).
+- **Root cause:** Raw key `val` in global scope holds last-registered module's symbol. Emitter inside module body finds wrong module's symbol.
+- **Fix:** (1) `checker_register_file` registers imported non-static functions/globals under mangled key (`module_name`) in addition to raw key. (2) Emitter NODE_IDENT prefers mangled lookup for current module before raw lookup.
+- **Test:** `test_modules/gcoll` — `ga_read() + gb_read()` = 30 (10+20, each reads own `val`).
+
+### BUG-232: Recursive struct via array not caught
+- **Symptom:** `struct S { S[1] next; }` → GCC "array type has incomplete element type".
+- **Root cause:** BUG-227 check only tested `sf->type == t` but `S[1]` is TYPE_ARRAY wrapping S.
+- **Fix:** Unwrap TYPE_ARRAY chain before comparing element type to struct being defined.
+- **Test:** `test_checker_full.c` — recursive struct via array rejected.
+
+### BUG-231: @size(void) and @size(opaque) not rejected
+- **Symptom:** `@size(opaque)` emits `sizeof(void)` — GCC extension returns 1 (meaningless).
+- **Fix:** In @size handler, resolve type_arg and reject TYPE_VOID and TYPE_OPAQUE.
+- **Test:** `test_checker_full.c` — @size(opaque) and @size(void) rejected.
+
+### BUG-230: Pointer parameter escape — &local through param field
+- **Symptom:** `void leak(*Holder h) { u32 x = 5; h.p = &x; }` allowed. Caller may pass &global, creating dangling pointer.
+- **Fix:** NODE_ASSIGN escape check treats pointer parameters with field access as potential escape targets.
+- **Test:** `test_checker_full.c` — local escape through pointer param rejected.
+
+### BUG-229: Static symbol collision across modules
+- **Symptom:** `mod_a` and `mod_b` both have `static u32 x` — second one silently dropped, `get_a()` returns wrong value.
+- **Root cause:** `scope_add` used unmangled name as key in global scope — collision returns NULL.
+- **Fix:** Register statics under mangled key (`module_name`) in global scope. Emitter NODE_IDENT tries mangled lookup when raw lookup fails.
+- **Test:** `test_modules/static_coll` — `get_a() + get_b()` = 30 (10+20).
+
+### BUG-228: &const_var yields mutable pointer (const leak)
+- **Symptom:** `const u32 x = 42; *u32 p = &x; *p = 99;` — writes to .rodata, segfault.
+- **Root cause:** TOK_AMP handler propagated `is_volatile` but not `is_const`.
+- **Fix:** Propagate `sym->is_const` to `result->pointer.is_const` in TOK_AMP handler.
+- **Test:** `test_checker_full.c` — mutable pointer from &const rejected.
+
+### BUG-227: Recursive struct by value not rejected
+- **Symptom:** `struct S { S next; }` → GCC "field has incomplete type".
+- **Fix:** After resolving field type, check if `sf->type == t` (struct being defined) → error.
+- **Test:** `test_checker_full.c` — recursive struct by value rejected.
+
 ### BUG-226: Float switch allowed (spec violation)
 - **Symptom:** `switch (f32_val) { default => { ... } }` compiles. ZER spec says "switch on float: NOT ALLOWED."
 - **Fix:** Added float check at top of NODE_SWITCH handler.

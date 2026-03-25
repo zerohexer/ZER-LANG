@@ -1,0 +1,5 @@
+import sa;
+import sb;
+u32 main() {
+    return get_a() + get_b();
+}

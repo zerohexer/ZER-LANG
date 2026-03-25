@@ -38,6 +38,7 @@ typedef struct {
     uint32_t union_switch_var_len;
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
+    int expr_depth;               /* recursion depth guard for check_expr */
 
     /* diagnostic list — grows dynamically, read by LSP */
     Diagnostic *diagnostics;

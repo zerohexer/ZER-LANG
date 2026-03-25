@@ -528,6 +528,14 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
+    /* recursion depth guard — prevents stack overflow on pathological input */
+    if (++c->expr_depth > 1000) {
+        checker_error(c, node->loc.line,
+            "expression nesting too deep (limit 1000) — simplify expression");
+        c->expr_depth--;
+        return ty_void;
+    }
+
     Type *result = NULL;
 
     switch (node->kind) {
@@ -695,12 +703,16 @@ static Type *check_expr(Checker *c, Node *node) {
         case TOK_AMP: /* address-of */
             result = type_pointer(c->arena, operand);
             /* BUG-197: volatile propagation — &volatile_var yields volatile pointer */
+            /* BUG-228: const propagation — &const_var yields const pointer */
             if (node->unary.operand->kind == NODE_IDENT) {
                 Symbol *sym = scope_lookup(c->current_scope,
                     node->unary.operand->ident.name,
                     (uint32_t)node->unary.operand->ident.name_len);
                 if (sym && sym->is_volatile) {
                     result->pointer.is_volatile = true;
+                }
+                if (sym && sym->is_const) {
+                    result->pointer.is_const = true;
                 }
                 /* BUG-208: block &union_var inside mutable capture arm.
                  * Pointer alias would bypass the union switch lock. */
@@ -818,9 +830,20 @@ static Type *check_expr(Checker *c, Node *node) {
                 bool target_is_static = target_sym && target_sym->is_static;
                 bool target_is_global = target_sym &&
                     scope_lookup_local(c->global_scope, target_sym->name, target_sym->name_len) != NULL;
-                if ((target_is_static || target_is_global) && val_sym &&
+                /* BUG-230: pointer parameter fields can alias globals — treat as escape */
+                bool target_is_param_ptr = false;
+                if (target_sym && !target_is_static && !target_is_global &&
+                    target_sym->type && target_sym->type->kind == TYPE_POINTER &&
+                    node->assign.target->kind == NODE_FIELD) {
+                    /* target is param->field — escapes through caller's pointer */
+                    target_is_param_ptr = true;
+                }
+                if ((target_is_static || target_is_global || target_is_param_ptr) && val_sym &&
                     !val_sym->is_static && !val_is_global) {
                     checker_error(c, node->loc.line,
+                        target_is_param_ptr ?
+                        "cannot store pointer to local '%.*s' through pointer parameter '%.*s' — "
+                        "may escape to caller's scope" :
                         "cannot store pointer to local '%.*s' in static/global variable '%.*s'",
                         (int)val_sym->name_len, val_sym->name,
                         (int)target_sym->name_len, target_sym->name);
@@ -1742,6 +1765,15 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
+            /* BUG-231: reject @size(void) and @size(opaque) — no meaningful size */
+            if (node->intrinsic.type_arg) {
+                Type *st = resolve_type(c, node->intrinsic.type_arg);
+                if (st && (st->kind == TYPE_VOID || st->kind == TYPE_OPAQUE)) {
+                    checker_error(c, node->loc.line,
+                        "@size(%s) is invalid — type has no defined size",
+                        st->kind == TYPE_VOID ? "void" : "opaque");
+                }
+            }
             result = ty_usize;
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
             /* @offset(T, field) — validate field exists on struct T */
@@ -1892,6 +1924,20 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             result = ty_void;
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
+            /* BUG-234: compile-time overflow check when dest is array and src is string literal */
+            if (node->intrinsic.arg_count >= 2) {
+                Type *dst_type = checker_get_type(node->intrinsic.args[0]);
+                if (dst_type && dst_type->kind == TYPE_ARRAY &&
+                    node->intrinsic.args[1]->kind == NODE_STRING_LIT) {
+                    uint64_t buf_size = dst_type->array.size;
+                    uint64_t str_len = (uint64_t)node->intrinsic.args[1]->string_lit.length;
+                    if (str_len + 1 > buf_size) {
+                        checker_error(c, node->loc.line,
+                            "@cstr buffer overflow: string length %llu + null terminator exceeds buffer size %llu",
+                            (unsigned long long)str_len, (unsigned long long)buf_size);
+                    }
+                }
+            }
             result = type_pointer(c->arena, ty_u8);
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             if (node->intrinsic.type_arg) {
@@ -1961,6 +2007,7 @@ static Type *check_expr(Checker *c, Node *node) {
 
     if (!result) result = ty_void;
     typemap_set(node, result);
+    c->expr_depth--;
     return result;
 }
 
@@ -2793,6 +2840,18 @@ static void register_decl(Checker *c, Node *node) {
                         "struct field '%.*s' cannot have type 'void'",
                         (int)fd->name_len, fd->name);
                 }
+                /* BUG-227/232: reject recursive struct by value (incomplete type in C).
+                 * Unwrap arrays — S[1] contains S by value too. */
+                {
+                    Type *inner = sf->type;
+                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+                    if (inner == t) {
+                        checker_error(c, node->loc.line,
+                            "struct '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
+                            (int)node->struct_decl.name_len, node->struct_decl.name,
+                            (int)node->struct_decl.name_len, node->struct_decl.name);
+                    }
+                }
                 sf->is_keep = fd->is_keep;
             }
         }
@@ -3175,6 +3234,38 @@ void checker_register_file(Checker *c, Node *file_node) {
             if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;
         }
         register_decl(c, decl);
+
+        /* BUG-233: also register imported non-static functions/globals under MANGLED key.
+         * Without this, two modules with same-named functions (e.g., both have init())
+         * collide under raw key — the emitter inside module B's body resolves to module A's
+         * symbol. Mangled key = "module_name", used by emitter's BUG-229 fallback. */
+        if (c->current_module &&
+            (decl->kind == NODE_FUNC_DECL || decl->kind == NODE_GLOBAL_VAR)) {
+            Type *dt = typemap_get(decl);
+            if (dt) {
+                const char *dname = (decl->kind == NODE_FUNC_DECL) ?
+                    decl->func_decl.name : decl->var_decl.name;
+                uint32_t dname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
+                    decl->func_decl.name_len : decl->var_decl.name_len);
+                char mk[256];
+                int mkl = snprintf(mk, sizeof(mk), "%.*s_%.*s",
+                    (int)c->current_module_len, c->current_module,
+                    (int)dname_len, dname);
+                char *mk_copy = (char *)arena_alloc(c->arena, (uint32_t)mkl + 1);
+                memcpy(mk_copy, mk, (uint32_t)mkl);
+                mk_copy[mkl] = '\0';
+                Symbol *ms = scope_add(c->arena, c->global_scope,
+                    mk_copy, (uint32_t)mkl, dt, decl->loc.line, c->file_name);
+                if (ms) {
+                    ms->module_prefix = c->current_module;
+                    ms->module_prefix_len = c->current_module_len;
+                    if (decl->kind == NODE_FUNC_DECL) {
+                        ms->is_function = true;
+                        ms->func_node = decl;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3214,17 +3305,27 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
             (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static)) {
             /* register into module scope (for checker body-check) */
             register_decl(c, decl);
-            /* also register into global scope with MANGLED name for emitter.
-             * This avoids collision between mod_a's static x and mod_b's static x. */
+            /* BUG-229: register into global scope with MANGLED key for emitter.
+             * Uses "module_name" as key to avoid collision between
+             * mod_a's static x and mod_b's static x. */
             Type *st = typemap_get(decl);
             if (st && c->current_module) {
                 const char *sname = (decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name : decl->var_decl.name;
                 uint32_t sname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name_len : decl->var_decl.name_len);
-                /* register under original name with module_prefix */
+                /* build mangled key: module_name */
+                char mangled_key[256];
+                int mk_len = snprintf(mangled_key, sizeof(mangled_key), "%.*s_%.*s",
+                    (int)c->current_module_len, c->current_module,
+                    (int)sname_len, sname);
+                /* allocate persistent copy in arena */
+                char *mk_copy = (char *)arena_alloc(c->arena, (uint32_t)mk_len + 1);
+                memcpy(mk_copy, mangled_key, (uint32_t)mk_len);
+                mk_copy[mk_len] = '\0';
+                /* register under MANGLED name — no collision possible */
                 Symbol *gs = scope_add(c->arena, c->global_scope,
-                    sname, sname_len, st, decl->loc.line, c->file_name);
+                    mk_copy, (uint32_t)mk_len, st, decl->loc.line, c->file_name);
                 if (gs) {
                     gs->module_prefix = c->current_module;
                     gs->module_prefix_len = c->current_module_len;

@@ -387,17 +387,36 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_IDENT: {
-        /* BUG-218/222: module-aware identifier emission.
-         * Look up in global scope — if found with module_prefix, mangle.
-         * Local vars (params, block-scoped) won't be in global scope → raw name. */
-        Symbol *id_sym = scope_lookup(e->checker->global_scope,
-            node->ident.name, (uint32_t)node->ident.name_len);
-        if (id_sym && id_sym->module_prefix) {
-            emit(e, "%.*s_%.*s",
-                 (int)id_sym->module_prefix_len, id_sym->module_prefix,
-                 (int)node->ident.name_len, node->ident.name);
-        } else {
-            emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
+        /* BUG-218/222/229/233: module-aware identifier emission.
+         * When inside a module body (current_module set), PREFER the mangled key
+         * for the current module. This prevents cross-module collision where raw
+         * key resolves to wrong module's symbol. */
+        bool emitted = false;
+        if (e->current_module) {
+            /* BUG-233: try current module's mangled key FIRST */
+            char mk[256];
+            int mkl = snprintf(mk, sizeof(mk), "%.*s_%.*s",
+                (int)e->current_module_len, e->current_module,
+                (int)node->ident.name_len, node->ident.name);
+            Symbol *ms = scope_lookup(e->checker->global_scope, mk, (uint32_t)mkl);
+            if (ms && ms->module_prefix) {
+                emit(e, "%.*s_%.*s",
+                     (int)ms->module_prefix_len, ms->module_prefix,
+                     (int)node->ident.name_len, node->ident.name);
+                emitted = true;
+            }
+        }
+        if (!emitted) {
+            /* Fall back to raw key lookup */
+            Symbol *id_sym = scope_lookup(e->checker->global_scope,
+                node->ident.name, (uint32_t)node->ident.name_len);
+            if (id_sym && id_sym->module_prefix) {
+                emit(e, "%.*s_%.*s",
+                     (int)id_sym->module_prefix_len, id_sym->module_prefix,
+                     (int)node->ident.name_len, node->ident.name);
+            } else {
+                emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
+            }
         }
         break;
     }

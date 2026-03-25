@@ -545,6 +545,30 @@ Statics from imported modules skip `checker_register_file` (global scope) and ar
 **91. Float switch rejected per spec.**
 `switch (f32_val) { ... }` is an error. ZER spec: "switch on float: NOT ALLOWED." Use if/else for float comparisons. (BUG-226)
 
+**92. Recursive struct by value rejected.**
+`struct S { S next; }` is caught in register_decl — field type == struct being defined → error. Use `*S` (pointer) for self-referential types. (BUG-227)
+
+**93. `&const_var` yields const pointer — prevents const leak.**
+`const u32 x = 42; *u32 p = &x;` is rejected. The TOK_AMP handler propagates `sym->is_const` to `result->pointer.is_const`. Existing const-mutable checks (BUG-140/176) then catch the mismatch. Without this, writing through the mutable pointer corrupts `.rodata`. (BUG-228)
+
+**94. Static symbol collision fixed — mangled keys in global scope.**
+`static u32 x` in mod_a and mod_b no longer collide. `checker_push_module_scope` registers statics under mangled key (`sa_x`, `sb_x`) in global scope. Emitter NODE_IDENT tries mangled lookup (`module_name`) when raw lookup fails and `current_module` is set. (BUG-229)
+
+**97. Global symbol collision fixed — all imported symbols get mangled keys.**
+Non-static functions/globals from imported modules also registered under mangled key in global scope by `checker_register_file`. Emitter NODE_IDENT **prefers** mangled lookup for current module (tries `current_module + "_" + name` FIRST). This ensures `val` inside `ga`'s body resolves to `ga_val`, not `gb_val`. Raw key still registered for backward compat (main module unqualified calls). (BUG-233)
+
+**95. Pointer parameter escape blocked — `h.p = &local` rejected.**
+`void leak(*Holder h) { u32 x = 5; h.p = &x; }` is caught. NODE_ASSIGN escape check treats pointer parameters with field access as potential escape targets (parameter may alias globals). (BUG-230)
+
+**96. `@size(void)` and `@size(opaque)` rejected.**
+Both types have no meaningful size. `@size(opaque)` previously emitted `sizeof(void)` which is a GCC extension returning 1. Now caught at checker level. `@size(*opaque)` still works (pointer has known size). (BUG-231)
+
+**98. `@cstr` compile-time overflow for constant arguments.**
+`@cstr(buf, "hello world")` where `buf` is `u8[4]` is caught at compile time (string length 11 + null > buffer size 4). Runtime trap still fires for variable-length slices. (BUG-234)
+
+**99. `check_expr` recursion depth guard (limit 1000).**
+`c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
@@ -552,7 +576,7 @@ Statics from imported modules skip `checker_register_file` (global scope) and ar
 
 ### Known Technical Debt
 - **Global Compiler State:** `type_map`, `non_storable_nodes` are static globals. Makes compiler non-thread-safe. Fix: move into Checker/Emitter structs. Same pattern as GCC.
-- **Static vars in imported modules:** `static u32 counter` in a module → "undefined identifier" when used by the module's own functions. Static globals don't register in scope during `checker_register_file`. Not blocking (non-static globals work fine).
+- **Static vars in imported modules:** Fixed in BUG-222/229/233. All imported symbols (static and non-static) register under mangled keys. Cross-module same-named symbols work correctly. No qualified call syntax yet (unqualified calls resolve to last import).
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

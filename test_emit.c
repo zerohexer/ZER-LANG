@@ -2786,6 +2786,25 @@ int main(void) {
         42,
         "arr[9] on u32[10] — valid boundary access");
 
+    /* BUG-243: @size(?u32) = 8 bytes (value + has_value + padding) */
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    return @truncate(u32, @size(?u32));\n"
+        "}\n",
+        8,
+        "@size(?u32) = 8 (matches GCC sizeof)");
+
+    /* BUG-242: slice.ptr field access */
+    test_compile_and_run(
+        "void puts(const *u8 s);\n"
+        "u32 main() {\n"
+        "    const []u8 msg = \"Hi\";\n"
+        "    const *u8 p = msg.ptr;\n"
+        "    return @truncate(u32, msg.len);\n"
+        "}\n",
+        2,
+        "slice.ptr field access works");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove(TEST_EXE);

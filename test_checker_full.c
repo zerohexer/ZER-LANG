@@ -1187,6 +1187,16 @@ static void test_negative_sweep(void) {
     err("void bad(const *u8 p) { @cstr(p, \"hi\"); }\nu32 main() { return 0; }",
         "@cstr to const pointer rejected");
 
+    /* BUG-244: double-pointer union lock bypass */
+    err("union Msg { u32 a; u32 b; }\n"
+        "void bad(**Msg pp) {\n"
+        "    switch (**pp) {\n"
+        "        .a => |*v| { (*pp).b = 20; }\n"
+        "        .b => { }\n"
+        "    }\n"
+        "}\nu32 main() { return 0; }",
+        "double-ptr union mutation blocked");
+
     /* BUG-221: keep parameter rejects local-derived pointers */
     err("static Pool(u32, 4) pool;\n"
         "void store(keep *u32 p) { pool.alloc(); }\n"

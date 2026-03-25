@@ -608,7 +608,16 @@ Pool (alloc, free), Ring (push, push_checked, pop), Arena (alloc, alloc_slice, u
 **105. Parser: lightweight lookahead replaces speculative parse for IDENT-starting statements.**
 `is_type_token` returns true for `TOK_IDENT`, which previously caused every identifier-starting statement (`foo(bar)`, `x = 5`) to trigger a full `parse_type()` + backtrack. Now IDENT-starting statements use token scanning: IDENT IDENT → var decl, IDENT `[` ... `]` IDENT → array var decl, IDENT `(*` → func ptr decl, anything else → expression. No AST allocation, no error suppression. Speculative `parse_type()` only used for unambiguous type starters (`*`, `?`, `[]`).
 
-**106. `check_expr` recursion depth guard (limit 1000).**
+**106. `slice.ptr` field access returns `*T` (const-aware).**
+`msg.ptr` on a `[]u8` returns `*u8`. If the slice is `const []u8`, returns `const *u8`. Required for C interop (`puts("hello".ptr)`). (BUG-242)
+
+**107. `@size(?T)` resolved by `compute_type_size`.**
+Null-sentinel `?*T` = pointer size. `?void` = 1. Value `?T` = inner_size + 1 (has_value) + alignment padding. `@size(?u32)` = 8, matching GCC `sizeof`. (BUG-243)
+
+**108. Union switch lock walks ALL deref/field/index levels.**
+`switch(**pp)` with double pointer now correctly locks `pp`. Both the lock setup AND mutation check use a unified walk loop (deref + field + index). Catches `(*pp).b = 20` inside capture arms at any pointer indirection depth. (BUG-244)
+
+**109. `check_expr` recursion depth guard (limit 1000).**
 `c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
 
 ### Design Decisions (NOT bugs — intentional)

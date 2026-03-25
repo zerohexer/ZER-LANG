@@ -142,17 +142,22 @@ docker-release-win:
 	docker rm -f zer-release-win 2>/dev/null; true
 	docker run --name zer-release-win zer-lang-win
 	docker cp zer-release-win:/zer/zerc.exe release/zerc.exe
+	docker cp zer-release-win:/zer/zer-lsp.exe release/zer-lsp.exe
 	docker rm zer-release-win
-	@echo "Windows binary in release/zerc.exe"
+	@echo "Windows binaries in release/ (zerc.exe, zer-lsp.exe)"
 
 # ---- Docker release all: both Linux + Windows ----
 docker-release-all: docker-release docker-release-win
 	@echo "All binaries in release/"
 
-# ---- Docker install: build Windows binary in Docker, copy to MinGW bin (on PATH) ----
+# ---- Docker install: build Windows binaries in Docker, copy to MinGW bin (on PATH) ----
 docker-install: docker-release-win
 	cp release/zerc.exe /c/msys64/mingw64/bin/zerc.exe
-	@echo "Installed zerc.exe to C:\\msys64\\mingw64\\bin\\"
+	mv -f /c/msys64/mingw64/bin/zer-lsp.exe /c/msys64/mingw64/bin/zer-lsp.old.exe 2>/dev/null; true
+	cp release/zer-lsp.exe /c/msys64/mingw64/bin/zer-lsp.exe
+	rm -f /c/msys64/mingw64/bin/zer-lsp.old.exe 2>/dev/null; true
+	@echo "Installed zerc.exe + zer-lsp.exe to C:\\msys64\\mingw64\\bin\\"
+	@echo "Restart VS Code to pick up the new LSP"
 
 # ---- Install: build natively, copy to MinGW bin (on PATH) — may trigger AV ----
 install: zerc

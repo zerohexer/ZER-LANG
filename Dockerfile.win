@@ -8,4 +8,4 @@ WORKDIR /zer
 COPY *.c *.h Makefile ./
 COPY test_modules/ test_modules/
 
-CMD ["sh", "-c", "x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o zerc.exe lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c"]
+CMD ["sh", "-c", "x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o zerc.exe lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o zer-lsp.exe zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c"]

@@ -1,0 +1,11 @@
+FROM gcc:13
+
+# Pre-install mingw for Windows cross-compilation
+RUN apt-get update -qq && apt-get install -y -qq gcc-mingw-w64-x86-64-posix && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /zer
+
+COPY *.c *.h Makefile ./
+COPY test_modules/ test_modules/
+
+CMD ["sh", "-c", "x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o zerc.exe lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c"]

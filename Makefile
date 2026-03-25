@@ -135,22 +135,23 @@ docker-release:
 	docker rm zer-release
 	@echo "Linux binaries in release/ (zerc, zer-lsp)"
 
-# ---- Docker release Windows: cross-compile with mingw inside Docker ----
+# ---- Docker release Windows: cross-compile with mingw (pre-installed in image) ----
 docker-release-win:
-	docker build -t zer-lang-dev .
+	docker build -t zer-lang-win -f Dockerfile.win .
 	@mkdir -p release
 	docker rm -f zer-release-win 2>/dev/null; true
-	docker run --name zer-release-win zer-lang-dev sh -c \
-		"apt-get update -qq && apt-get install -y -qq gcc-mingw-w64-x86-64-posix >/dev/null 2>&1 && \
-		 x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o zerc.exe lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && \
-		 x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o zer-lsp.exe zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c"
+	docker run --name zer-release-win zer-lang-win
 	docker cp zer-release-win:/zer/zerc.exe release/zerc.exe
-	docker cp zer-release-win:/zer/zer-lsp.exe release/zer-lsp.exe
 	docker rm zer-release-win
-	@echo "Windows binaries in release/ (zerc.exe, zer-lsp.exe)"
+	@echo "Windows binary in release/zerc.exe"
 
 # ---- Docker release all: both Linux + Windows ----
 docker-release-all: docker-release docker-release-win
 	@echo "All binaries in release/"
 
-.PHONY: check clean release docker-check docker-build docker-shell docker-release docker-release-win docker-release-all
+# ---- Install: build Windows binary in Docker, copy to MinGW bin (on PATH) ----
+install: docker-release-win
+	cp release/zerc.exe /c/msys64/mingw64/bin/zerc.exe
+	@echo "Installed zerc.exe to C:\\msys64\\mingw64\\bin\\"
+
+.PHONY: check clean release docker-check docker-build docker-shell docker-release docker-release-win docker-release-all install

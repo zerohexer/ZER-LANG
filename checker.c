@@ -1528,6 +1528,14 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
+        /* slice.ptr — returns pointer to element type (const if slice is const) */
+        if (obj->kind == TYPE_SLICE && flen == 3 && memcmp(fname, "ptr", 3) == 0) {
+            Type *ptr = type_pointer(c->arena, obj->slice.inner);
+            if (obj->slice.is_const) ptr->pointer.is_const = true;
+            result = ptr;
+            break;
+        }
+
         /* slice.len */
         if (obj->kind == TYPE_SLICE && flen == 3 && memcmp(fname, "len", 3) == 0) {
             result = ty_usize;

@@ -1407,6 +1407,21 @@ static void test_negative_sweep(void) {
        "*u8 ok_fn() { *u32 p = &g; return @ptrcast(*u8, p); }\n"
        "u32 main() { return 0; }",
        "@ptrcast global-derived ident return accepted");
+
+    /* BUG-258: volatile stripping via @ptrcast */
+    err("volatile u32 hw = 0;\n"
+        "void f() {\n"
+        "    volatile *u32 reg = &hw;\n"
+        "    *u32 p = @ptrcast(*u32, reg);\n"
+        "}",
+        "@ptrcast volatile to non-volatile rejected");
+    ok("volatile u32 hw = 0;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = &hw;\n"
+       "    volatile *u8 p = @ptrcast(volatile *u8, reg);\n"
+       "    return 0;\n"
+       "}",
+       "@ptrcast volatile to volatile accepted");
 }
 
 /* ================================================================ */

@@ -489,6 +489,25 @@ static void emit_expr(Emitter *e, Node *node) {
                     }
                 }
             }
+            /* BUG-257: optional == null / != null for struct-based optionals.
+             * ?*T (null-sentinel) uses plain pointer comparison, but ?u32 etc. are
+             * structs — must compare .has_value instead of raw struct == 0. */
+            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ) &&
+                (node->binary.left->kind == NODE_NULL_LIT ||
+                 node->binary.right->kind == NODE_NULL_LIT)) {
+                Node *opt_node = node->binary.left->kind == NODE_NULL_LIT ?
+                    node->binary.right : node->binary.left;
+                Type *opt_type = checker_get_type(e->checker, opt_node);
+                if (opt_type && opt_type->kind == TYPE_OPTIONAL &&
+                    !is_null_sentinel(opt_type->optional.inner)) {
+                    /* struct optional: emit .has_value check */
+                    if (node->binary.op == TOK_EQEQ) emit(e, "(!");
+                    else emit(e, "(");
+                    emit_expr(e, opt_node);
+                    emit(e, ".has_value)");
+                    break;
+                }
+            }
             if (needs_narrow_cast) emit(e, "%s", narrow_cast);
             emit(e, "(");
             emit_expr(e, node->binary.left);

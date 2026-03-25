@@ -2816,6 +2816,21 @@ int main(void) {
         16,
         "@size(union) = 16 (tag=4 + pad=4 + u64=8)");
 
+    /* BUG-257: optional == null / != null for struct optionals */
+    test_compile_and_run(
+        "?u32 get_some() { return 42; }\n"
+        "?u32 get_none() { return null; }\n"
+        "u32 main() {\n"
+        "    ?u32 a = get_some();\n"
+        "    ?u32 b = get_none();\n"
+        "    u32 r = 0;\n"
+        "    if (a != null) { r += 1; }\n"
+        "    if (b == null) { r += 10; }\n"
+        "    return r;\n"
+        "}\n",
+        11,
+        "optional == null / != null on struct optionals");
+
     /* BUG-255: orelse index single-eval — get() called once, not twice */
     test_compile_and_run(
         "u32 counter = 0;\n"

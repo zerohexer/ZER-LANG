@@ -647,6 +647,12 @@ BUG-228 only checked `NODE_IDENT` operands in TOK_AMP. Now walks field/index cha
 **118. `@ptrcast`/`@bitcast` return checks local/arena-derived idents.**
 BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @ptrcast(*u8, p)` where `p` has `is_local_derived` or `is_arena_derived`. Only fires when the return type is a pointer (not value bitcasts like `@bitcast(u32, x)`). (BUG-256)
 
+**119. Optional `== null` / `!= null` emits `.has_value` for struct optionals.**
+`?u32 x; if (x == null)` emitted `if (x == 0)` — but `x` is a struct in C. Now emits `(!x.has_value)` for `== null` and `(x.has_value)` for `!= null`. Null-sentinel optionals (`?*T`) still use direct pointer comparison. (BUG-257)
+
+**120. `@ptrcast` cannot strip volatile qualifier.**
+`@ptrcast(*u32, volatile_ptr)` was allowed — GCC optimizes away writes through the non-volatile result. Now checks both type-level `pointer.is_volatile` AND symbol-level `sym->is_volatile` on the source ident. (BUG-258)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.

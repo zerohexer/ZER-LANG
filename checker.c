@@ -2026,6 +2026,28 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "@ptrcast source must be a pointer, got '%s'",
                                 type_name(val_type));
                         }
+                        /* BUG-258: volatile stripping via @ptrcast.
+                         * Cannot cast volatile pointer to non-volatile — writes may
+                         * be optimized away by GCC, causing silent hardware failure.
+                         * Check both type-level volatile (pointer.is_volatile) and
+                         * symbol-level volatile (var_decl.is_volatile on the source ident). */
+                        if (eff->kind == TYPE_POINTER &&
+                            result && result->kind == TYPE_POINTER &&
+                            !result->pointer.is_volatile) {
+                            bool src_volatile = eff->pointer.is_volatile;
+                            /* also check if source ident has sym->is_volatile */
+                            if (!src_volatile && node->intrinsic.args[0]->kind == NODE_IDENT) {
+                                Symbol *src_sym = scope_lookup(c->current_scope,
+                                    node->intrinsic.args[0]->ident.name,
+                                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                                if (src_sym && src_sym->is_volatile) src_volatile = true;
+                            }
+                            if (src_volatile) {
+                                checker_error(c, node->loc.line,
+                                    "@ptrcast cannot strip volatile qualifier — "
+                                    "target must be volatile pointer");
+                            }
+                        }
                     }
                 }
             } else {

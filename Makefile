@@ -149,9 +149,14 @@ docker-release-win:
 docker-release-all: docker-release docker-release-win
 	@echo "All binaries in release/"
 
-# ---- Install: build Windows binary in Docker, copy to MinGW bin (on PATH) ----
-install: docker-release-win
+# ---- Docker install: build Windows binary in Docker, copy to MinGW bin (on PATH) ----
+docker-install: docker-release-win
 	cp release/zerc.exe /c/msys64/mingw64/bin/zerc.exe
 	@echo "Installed zerc.exe to C:\\msys64\\mingw64\\bin\\"
 
-.PHONY: check clean release docker-check docker-build docker-shell docker-release docker-release-win docker-release-all install
+# ---- Install: build natively, copy to MinGW bin (on PATH) — may trigger AV ----
+install: zerc
+	cp zerc.exe /c/msys64/mingw64/bin/zerc.exe 2>/dev/null || cp zerc /c/msys64/mingw64/bin/zerc 2>/dev/null
+	@echo "Installed zerc to C:\\msys64\\mingw64\\bin\\"
+
+.PHONY: check clean release install docker-check docker-build docker-shell docker-release docker-release-win docker-release-all docker-install

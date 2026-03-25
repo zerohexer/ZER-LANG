@@ -73,6 +73,22 @@ Three parallel audit agents (checker, emitter, interaction edge cases) plus code
 - **Root cause:** `zerc_main.c:52` — `fread(buf, 1, size, f);` return value ignored.
 - **Fix:** Check `bytes_read != (size_t)size` → free buffer, close file, return NULL.
 
+### BUG-241: @cstr to const pointer not rejected
+- **Symptom:** `void bad(const *u8 p) { @cstr(p, "hi"); }` compiles — writes through const pointer.
+- **Fix:** In @cstr handler, check if destination type is const pointer (`pointer.is_const`).
+- **Test:** `test_checker_full.c` — @cstr to const pointer rejected.
+
+### BUG-240: Nested array assign escape to global/static
+- **Symptom:** `global_s = s.arr` where `s` is local struct — dangling slice in global.
+- **Root cause:** Array→slice escape check in NODE_ASSIGN only matched direct NODE_IDENT values.
+- **Fix:** Walk value's field/index chains to root, check if local and target is global/static.
+- **Test:** `test_checker_full.c` — nested array assign to global rejected.
+
+### BUG-239: Non-null pointer (*T) allowed without initializer
+- **Symptom:** `*u32 p;` compiles — auto-zeroes to NULL, violating *T non-null guarantee.
+- **Fix:** NODE_VAR_DECL rejects TYPE_POINTER without init (local vars only, globals need init elsewhere).
+- **Test:** `test_checker_full.c` — non-null pointer without init rejected.
+
 ### BUG-238: @cstr to const destination not rejected
 - **Symptom:** `const u8[16] buf; @cstr(buf, "hello");` compiles — writes to const buffer.
 - **Fix:** In @cstr checker handler, look up destination symbol and reject if `is_const`.

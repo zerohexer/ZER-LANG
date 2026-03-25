@@ -923,6 +923,44 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-240: nested array→slice escape via assignment to global/static.
+         * global_s = s.arr where s is local — walk value chain to root. */
+        if (node->assign.op == TOK_EQ && value && value->kind == TYPE_ARRAY &&
+            target && target->kind == TYPE_SLICE) {
+            Node *vroot = node->assign.value;
+            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                else vroot = vroot->index_expr.object;
+            }
+            if (vroot && vroot->kind == NODE_IDENT) {
+                Symbol *vsym = scope_lookup(c->current_scope,
+                    vroot->ident.name, (uint32_t)vroot->ident.name_len);
+                bool val_is_global = vsym &&
+                    (vsym->is_static || scope_lookup_local(c->global_scope,
+                        vsym->name, vsym->name_len) != NULL);
+                if (vsym && !val_is_global) {
+                    /* value root is local — check if target is global/static */
+                    Node *troot = node->assign.target;
+                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                        else troot = troot->index_expr.object;
+                    }
+                    if (troot && troot->kind == NODE_IDENT) {
+                        Symbol *tsym = scope_lookup(c->current_scope,
+                            troot->ident.name, (uint32_t)troot->ident.name_len);
+                        bool tgt_is_global = tsym &&
+                            (tsym->is_static || scope_lookup_local(c->global_scope,
+                                tsym->name, tsym->name_len) != NULL);
+                        if (tgt_is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot store local array as slice in global/static — "
+                                "pointer will dangle after function returns");
+                        }
+                    }
+                }
+            }
+        }
+
         /* arena lifetime escape: storing arena-derived pointer in global/static
          * Also propagates is_arena_derived through assignment targets */
         /* detect direct arena.alloc() in assignment value (including via orelse) */
@@ -1975,6 +2013,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         (int)dst_sym->name_len, dst_sym->name);
                 }
             }
+            /* BUG-241: also check if destination type is const pointer */
+            if (node->intrinsic.arg_count >= 1) {
+                Type *dst_type = checker_get_type(node->intrinsic.args[0]);
+                if (dst_type && dst_type->kind == TYPE_POINTER && dst_type->pointer.is_const) {
+                    checker_error(c, node->loc.line,
+                        "@cstr destination is a const pointer — cannot write to read-only memory");
+                }
+            }
             /* BUG-234: compile-time overflow check when dest is array and src is string literal */
             if (node->intrinsic.arg_count >= 2) {
                 Type *dst_type = checker_get_type(node->intrinsic.args[0]);
@@ -2103,6 +2149,15 @@ static void check_stmt(Checker *c, Node *node) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
         }
+        /* BUG-239: non-null pointer (*T) requires initializer — auto-zero creates NULL */
+        if (!node->var_decl.init && type && type->kind == TYPE_POINTER &&
+            node->kind == NODE_VAR_DECL) {
+            checker_error(c, node->loc.line,
+                "non-null pointer '*%s' requires an initializer — "
+                "use '?*%s' for nullable pointers",
+                type_name(type->pointer.inner), type_name(type->pointer.inner));
+        }
+
         typemap_set(node, type); /* store for emitter to read via checker_get_type */
 
         if (node->var_decl.init) {

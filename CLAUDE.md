@@ -575,7 +575,16 @@ Pool (alloc, free), Ring (push, push_checked, pop), Arena (alloc, alloc_slice, u
 **101. `@cstr` compile-time overflow for constant arguments.**
 `@cstr(buf, "hello world")` where `buf` is `u8[4]` is caught at compile time (string length 11 + null > buffer size 4). Runtime trap still fires for variable-length slices. (BUG-234)
 
-**102. `check_expr` recursion depth guard (limit 1000).**
+**102. Non-null pointer `*T` requires initializer.**
+`*u32 p;` without init is rejected for local vars — auto-zero creates NULL, violating `*T` non-null guarantee. Use `?*T` for nullable, or provide init: `*u32 p = &x;`. Globals already require init via NODE_GLOBAL_VAR. (BUG-239)
+
+**103. Nested array assign escape to global walks chains.**
+`global_s = s.arr` where `s` is local and `s.arr` is TYPE_ARRAY→TYPE_SLICE coercion — walk value's field/index chains to root, check if local vs global target. (BUG-240)
+
+**104. `@cstr` const pointer destination rejected.**
+`@cstr(p, "hi")` where `p` is `const *u8` → error. Checks `pointer.is_const` on destination type, in addition to `is_const` on symbol (BUG-238). (BUG-241)
+
+**105. `check_expr` recursion depth guard (limit 1000).**
 `c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
 
 ### Design Decisions (NOT bugs — intentional)

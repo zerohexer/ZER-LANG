@@ -1174,6 +1174,19 @@ static void test_negative_sweep(void) {
     err("u32 main() { const u8[16] buf; @cstr(buf, \"hello\"); return 0; }",
         "@cstr to const array rejected");
 
+    /* BUG-239: non-null pointer requires initializer */
+    err("u32 main() { *u32 p; return 0; }",
+        "non-null pointer without init rejected");
+
+    /* BUG-240: nested array assign escape to global */
+    err("struct S { u8[10] arr; }\nstatic []u8 global_s;\n"
+        "void bad() { S s; global_s = s.arr; }\nu32 main() { return 0; }",
+        "nested array assign to global rejected");
+
+    /* BUG-241: @cstr to const pointer */
+    err("void bad(const *u8 p) { @cstr(p, \"hi\"); }\nu32 main() { return 0; }",
+        "@cstr to const pointer rejected");
+
     /* BUG-221: keep parameter rejects local-derived pointers */
     err("static Pool(u32, 4) pool;\n"
         "void store(keep *u32 p) { pool.alloc(); }\n"

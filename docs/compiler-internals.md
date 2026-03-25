@@ -296,8 +296,8 @@ Enums emit as `#define` constants, not C enums:
 ### Union Switch Emission
 Union switch takes a POINTER to the original: `__auto_type *_zer_swp = &(expr)`. Tag checked via `_zer_swp->_tag`. Immutable capture copies: `__auto_type v = _zer_swp->variant`. Mutable capture takes pointer: `Type *v = &_zer_swp->variant`. This ensures `|*v|` modifications persist to the original union.
 
-### Keeping emit_file and emit_file_no_preamble in sync
-Both functions emit struct/union/enum declarations. Every typedef emitted in `emit_file` MUST also be emitted in `emit_file_no_preamble`. Current list per struct: `_zer_opt_`, `_zer_slice_`, `_zer_opt_slice_`. Per union: same three. Missing any causes GCC errors in multi-module projects.
+### emit_file and emit_file_no_preamble — UNIFIED (RF2)
+Both functions now call `emit_top_level_decl(e, decl, file_node, i)`. Adding a new NODE kind only requires updating that one function. The old pattern of two parallel switch statements (which caused BUG-086/087) is eliminated.
 
 ### GCC Extensions Used
 - `__auto_type` — C equivalent of `auto` (type inference)
@@ -368,7 +368,7 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 8. **Scope/lifetime checks must walk field/index chains** — `global.ptr = &local` has target `NODE_FIELD`, not `NODE_IDENT`. Walk to root before checking.
 9. **Union switch arms must lock the switched-on variable** — mutation during mutable capture creates type confusion. Track `union_switch_var` in Checker.
 10. **Handle aliasing must propagate freed state** — `alias = h` copies the handle value. Freeing the original must mark all aliases freed (match by pool_id + alloc_line).
-11. **`emit_file` AND `emit_file_no_preamble` must handle ALL declaration types** — NODE_TYPEDEF and NODE_INTERRUPT were missing from no_preamble, silently dropping imported typedefs and interrupt handlers.
+11. **`emit_top_level_decl` handles ALL declaration types (RF2)** — Unified dispatch function. NODE_TYPEDEF and NODE_INTERRUPT are handled here. Adding new declaration types: update this ONE function.
 12. **`is_null_sentinel()` must unwrap TYPE_DISTINCT** — `?DistinctFuncPtr` must be treated as null sentinel. Use `is_null_sentinel(type)` function, not `IS_NULL_SENTINEL(kind)` macro.
 13. **NODE_SLICE must use named typedefs for ALL primitives** — not just u8/u32. Anonymous structs create type mismatches with named `_zer_slice_T`.
 14. **Struct field lookup must error on miss** — don't silently return ty_void (old UFCS fallback). Same for field access on non-struct types.
@@ -376,12 +376,12 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 16. **Use `type_unwrap_distinct(t)` helper for ALL type dispatch** — defined in `types.h`. Applies to: emit_type inner switches (optional, slice, optional-slice element), NODE_FIELD handler (struct/union/pointer dispatch), switch exhaustiveness checks, auto-zero paths (global + local), intrinsic validation, NODE_SLICE expression emission. Always unwrap: `Type *inner = type_unwrap_distinct(t);`. Never write the unwrap manually.
 17. **ZER-CHECK must track Handle parameters** — `zc_check_function` scans params for TYNODE_HANDLE and registers as HS_ALIVE. Without this, use-after-free on param handles goes undetected.
 18. **`[]bool` needs TYPE_BOOL in all slice type switches** — bool = uint8_t, maps to `_zer_slice_u8`. Missing from any emit_type slice switch causes anonymous struct mismatch.
-19. **Emitter's `resolve_type_for_emit` must mirror checker's `resolve_type`** — The emitter re-resolves TypeNodes independently. Any fix to type resolution must be applied in BOTH places. Shared code goes in `ast.h`.
+19. **Emitter uses `resolve_tynode()` — typemap first, fallback to `resolve_type_for_emit` (RF3)** — `resolve_type()` in checker caches every resolved TypeNode in typemap. Emitter's `resolve_tynode(e, tn)` reads from typemap via `checker_get_type(e->checker, (Node *)tn)`. Falls back to old `resolve_type_for_emit()` for uncached TypeNodes. New type constructs only need updating in `resolve_type_inner()` — emitter gets them automatically.
 20. **`eval_const_expr()` in `ast.h` for compile-time sizes** — Array/Pool/Ring sizes support expressions (`4 * 256`, `512 + 512`). Without the constant folder, non-literal sizes silently become 0.
 21. **Scope escape must check implicit array-to-slice coercion in assignments** — `global_slice = local_array` bypasses `&local` check because no TOK_AMP is involved. Check TYPE_ARRAY value → TYPE_SLICE target with local/global mismatch.
 22. **String literals are const — block assignment to mutable `[]u8`** — Check NODE_STRING_LIT in var-decl and assignment. Only `const []u8` targets allowed. Function args still work (slice struct is copied).
 23. **Bit extraction mask has 3 paths** — constant >= 64 → `~(uint64_t)0`; constant < 64 → precomputed `(1ull << N) - 1`; runtime variables → safe ternary. Never raw `1ull << (high - low + 1)`.
-26. **Emitter uses `checker_get_type(node)` for declarations** — v0.1.1 unified type resolution. `resolve_type_for_emit` kept ONLY for intrinsic type_arg. All var-decl, func-decl, struct, union, typedef, global-var use checker's typemap.
+26. **`checker_get_type(Checker *c, Node *node)` — takes Checker* (RF1)** — Typemap moved into Checker struct. All call sites pass the Checker: emitter uses `checker_get_type(e->checker, node)`, zercheck uses `checker_get_type(zc->checker, node)`. No more global typemap state.
 27. **Source mapping via `#line` directives** — `emitter.source_file` set per module. Emits `#line N "file.zer"` before each non-block statement. NULL = disabled (for tests).
 24. **Shift operators use `_zer_shl`/`_zer_shr` macros** — ZER spec: shift >= width = 0. C has UB. Macros use GCC statement expression for single-eval. Compound shifts (`<<=`) emit `x = _zer_shl(x, n)`.
 25. **Bounds check side-effect detection** — NODE_CALL AND NODE_ASSIGN both trigger single-eval path (GCC statement expression). All other index expressions use comma operator (lvalue-safe, double-eval OK for pure expressions).

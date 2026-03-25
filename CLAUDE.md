@@ -224,6 +224,27 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Array→slice coercion (call/var/return) | Done | Done |
 | Mutable union capture |*v| | Done | Done (pointer to original) |
 
+### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
+
+ZER will **NOT** have native backends, IR, or QBE. Emit-C via GCC is the permanent architecture.
+- GCC handles all embedded targets, provides decades of optimization, acts as a second validation layer
+- No IR layer planned — emit-C → GCC is the only compilation path
+- Self-hosting (zerc.zer compiled by zerc via GCC) is the v1.0 milestone
+- **Never suggest IR, LLVM, QBE, or native code generation in this project**
+
+**Roadmap:** v0.2 (bounds check optimization) → v0.3 (better errors/diagnostics) → v1.0 (self-hosting)
+
+### Structural Refactors Completed (RF1-RF7)
+
+These changed fundamental patterns. Fresh sessions MUST know:
+- **RF1:** Typemap moved from static globals into Checker struct. `checker_get_type(Checker *c, Node *node)` — takes Checker* now. Emitter: `checker_get_type(e->checker, node)`.
+- **RF2:** `emit_file` and `emit_file_no_preamble` unified into single `emit_top_level_decl()`. Add new NODE kinds in ONE place only.
+- **RF3:** `resolve_type()` caches in typemap. Emitter's `resolve_tynode(e, tn)` reads typemap first, falls back to `resolve_type_for_emit()`. Add new types to `resolve_type_inner()` — emitter gets them automatically.
+- **RF4:** Module name mangling uses arena-allocated buffers (no fixed 256 limit).
+- **RF5:** Parser uses lightweight token scanning for IDENT-starting statements (not full speculative parse_type).
+- **RF6:** `null` used with non-optional types gives targeted error message.
+- **RF7:** `@cstr` volatile detection walks field/index chains to root symbol.
+
 ### Emitter Critical Patterns (causes of most bugs)
 
 **Optional types in emitted C:**
@@ -280,8 +301,8 @@ Anonymous `struct { ... }` in C creates a new type at each use. Slices, optional
 **5. Function pointer syntax — name goes INSIDE `(*)`.**
 `emit_type_and_name` handles this for TYPE_FUNC_PTR, TYPE_OPTIONAL wrapping func ptr, and TYPE_DISTINCT wrapping func ptr. If you add new optional/distinct combinations, check that `emit_type_and_name` handles the name placement.
 
-**6. `emit_file` AND `emit_file_no_preamble` must stay in sync.**
-Every typedef/declaration emitted in `emit_file` for structs/unions/enums MUST also be emitted in `emit_file_no_preamble` (used for imported modules). Missing typedefs in imported modules cause GCC errors.
+**6. `emit_file` AND `emit_file_no_preamble` share `emit_top_level_decl()` (RF2).**
+Both functions now call a single `emit_top_level_decl(e, decl, file_node, i)` dispatch. Adding a new NODE kind requires updating only ONE place. The old pattern of two parallel switch statements that had to stay in sync (caused BUG-086/087) is eliminated.
 
 **7. UFCS is dropped.** Dead code commented out in checker.c. Do not implement or rely on `t.method()` syntax. Builtin methods (Pool/Ring/Arena) work via compiler intrinsics, NOT UFCS.
 
@@ -312,8 +333,8 @@ Not just emit_type — also: checker NODE_FIELD (struct/union/pointer dispatch),
 **16. `arena.alloc()` AND `arena.alloc_slice()` both set `is_arena_derived`.**
 The detection checks `mlen == 5 "alloc" || mlen == 11 "alloc_slice"`. Both results are tracked for escape to global/static. Propagates through aliases (var-decl init + assignment).
 
-**17. Emitter has its OWN `resolve_type_for_emit()` — must stay in sync with checker.**
-The emitter re-resolves TypeNodes independently from the checker. Any fix to type resolution in checker.c MUST also be applied to `resolve_type_for_emit()` in emitter.c. Shared code (like `eval_const_expr`) goes in `ast.h`. This caused BUG-121 (constant folding fixed in checker but not emitter).
+**17. Emitter uses `resolve_tynode()` — tries typemap first, falls back to `resolve_type_for_emit()` (RF3).**
+`resolve_type()` in checker.c now caches every resolved TypeNode in the typemap (split into `resolve_type` wrapper + `resolve_type_inner`). The emitter's `resolve_tynode(e, tn)` reads from typemap via `checker_get_type(e->checker, (Node *)tn)`, falling back to the old `resolve_type_for_emit()` for any uncached TypeNodes. The fallback will become dead code over time. **If adding a new type construct:** ensure `resolve_type_inner()` handles it — the typemap cache means the emitter gets it automatically.
 
 **18. `eval_const_expr()` in `ast.h` — shared constant folder.**
 Evaluates compile-time integer expressions (+, -, *, /, %, <<, >>, &, |, unary -). Used by both checker (array/pool/ring size resolution) and emitter (resolve_type_for_emit). Without this, `u8[4 * 256]` silently becomes `u8[0]`.
@@ -350,7 +371,7 @@ Index expressions with side effects (function calls, assignments) use GCC statem
 `switch(get_union())` with capture needs `&(expr)` but rvalue addresses are illegal. Fix: `__auto_type _swt = expr; __typeof__(_swt) *_swp = &_swt;`. Can't use `__auto_type *` (GCC rejects) — must use `__typeof__`. (BUG-134)
 
 **28. Bare `if(optional)` / `while(optional)` must emit `.has_value` for struct optionals.**
-`if (val)` where val is `?u32` emits `if (val)` in C — but val is a struct. GCC rejects: "used struct type value where scalar is required." The emitter's regular-if and while paths must check `checker_get_type(cond)` — if it's a non-null-sentinel optional, append `.has_value`. The if-unwrap path (`|val|`) already handles this correctly. (BUG-139)
+`if (val)` where val is `?u32` emits `if (val)` in C — but val is a struct. GCC rejects: "used struct type value where scalar is required." The emitter's regular-if and while paths must check `checker_get_type(e->checker, cond)` — if it's a non-null-sentinel optional, append `.has_value`. The if-unwrap path (`|val|`) already handles this correctly. **NOTE:** `checker_get_type` now takes `Checker *c` as first arg (RF1). Emitter uses `e->checker`. (BUG-139)
 
 **29. `const` on var declaration must propagate to the Type, not just the Symbol.**
 Parser puts `const` into `node->var_decl.is_const`, NOT into the TypeNode (TYNODE_CONST only wraps when `const` appears inside a type expression like function params). The checker must propagate: in NODE_VAR_DECL and NODE_GLOBAL_VAR, when `is_const` is true and type is slice/pointer, create a const-qualified Type via `type_const_slice()` / `type_const_pointer()`. Without this, `const []u8 msg = "hello"; mutate(msg)` passes because `check_expr(NODE_IDENT)` returns `sym->type` which has `is_const = false`. (BUG-140)

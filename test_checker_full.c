@@ -1197,6 +1197,19 @@ static void test_negative_sweep(void) {
         "}\nu32 main() { return 0; }",
         "double-ptr union mutation blocked");
 
+    /* BUG-245: const array → mutable slice assignment */
+    err("u32 main() { const u32[4] arr; []u32 s; s = arr; return 0; }",
+        "const array to mutable slice assign rejected");
+
+    /* BUG-246: @ptrcast loses local-derived */
+    err("*u8 bad() { u32 x = 42; return @ptrcast(*u8, &x); }\n"
+        "u32 main() { return 0; }",
+        "@ptrcast(&local) return rejected");
+
+    /* BUG-247: array size overflow */
+    err("u32 main() { u8[1 << 33] arr; return 0; }",
+        "array size > 4GB rejected");
+
     /* BUG-221: keep parameter rejects local-derived pointers */
     err("static Pool(u32, 4) pool;\n"
         "void store(keep *u32 p) { pool.alloc(); }\n"

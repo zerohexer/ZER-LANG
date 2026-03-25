@@ -617,7 +617,16 @@ Null-sentinel `?*T` = pointer size. `?void` = 1. Value `?T` = inner_size + 1 (ha
 **108. Union switch lock walks ALL deref/field/index levels.**
 `switch(**pp)` with double pointer now correctly locks `pp`. Both the lock setup AND mutation check use a unified walk loop (deref + field + index). Catches `(*pp).b = 20` inside capture arms at any pointer indirection depth. (BUG-244)
 
-**109. `check_expr` recursion depth guard (limit 1000).**
+**109. Const array → mutable slice assignment blocked.**
+`const u32[4] arr; []u32 s; s = arr;` rejected — writing through `s` would modify read-only data. NODE_ASSIGN checks if value is TYPE_ARRAY with `is_const` symbol and target is mutable TYPE_SLICE. (BUG-245)
+
+**110. `@ptrcast`/`@bitcast` of `&local` caught in return.**
+`return @ptrcast(*u8, &x)` where `x` is local → error. NODE_RETURN walks into NODE_INTRINSIC args to find `&local` patterns inside ptrcast/bitcast wrappers. (BUG-246)
+
+**111. Array size overflow > 4GB rejected.**
+`u8[1 << 33]` silently truncated to `arr[0]` via `(uint32_t)val` cast. Now explicitly checked: if `val > UINT32_MAX`, error. ZER targets embedded — 4GB+ arrays are nonsensical. (BUG-247)
+
+**112. `check_expr` recursion depth guard (limit 1000).**
 `c->expr_depth` incremented on entry, decremented on exit. At depth > 1000, emits "expression nesting too deep" error and returns `ty_void`. Prevents stack overflow on pathological input like 10,000 chained `orelse` expressions. (BUG-235)
 
 ### Design Decisions (NOT bugs — intentional)

@@ -420,6 +420,12 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 }
             }
             if (val > 0) {
+                /* BUG-247: reject sizes that overflow uint32_t (>4GB arrays) */
+                if ((uint64_t)val > UINT32_MAX) {
+                    checker_error(c, tn->loc.line,
+                        "array size %lld exceeds maximum (4GB)",
+                        (long long)val);
+                }
                 size = (uint32_t)val;
             } else if (val == 0) {
                 checker_error(c, tn->loc.line, "array size must be > 0");
@@ -1097,6 +1103,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 value->slice.is_const && !target->slice.is_const) {
                 checker_error(c, node->loc.line,
                     "cannot assign const slice to mutable — would allow writing to read-only memory");
+            }
+        }
+
+        /* BUG-245: const array → mutable slice assignment blocked */
+        if (node->assign.op == TOK_EQ &&
+            target && target->kind == TYPE_SLICE && !target->slice.is_const &&
+            value && value->kind == TYPE_ARRAY) {
+            /* look up value symbol to check is_const */
+            Node *vroot = node->assign.value;
+            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                else vroot = vroot->index_expr.object;
+            }
+            if (vroot && vroot->kind == NODE_IDENT) {
+                Symbol *vsym = scope_lookup(c->current_scope,
+                    vroot->ident.name, (uint32_t)vroot->ident.name_len);
+                if (vsym && vsym->is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign const array to mutable slice — "
+                        "would allow writing to read-only memory");
+                }
             }
         }
 
@@ -2873,6 +2900,39 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "cannot return pointer to local variable '%.*s'",
                             (int)vlen, vname);
+                    }
+                }
+            }
+
+            /* BUG-246: scope escape via @ptrcast/@bitcast wrapping &local.
+             * return @ptrcast(*u8, &x) where x is local → dangling pointer */
+            if (node->ret.expr->kind == NODE_INTRINSIC) {
+                const char *iname = node->ret.expr->intrinsic.name;
+                uint32_t ilen = (uint32_t)node->ret.expr->intrinsic.name_len;
+                bool is_ptr_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
+                                   (ilen == 7 && memcmp(iname, "bitcast", 7) == 0);
+                if (is_ptr_cast && node->ret.expr->intrinsic.arg_count > 0) {
+                    Node *arg = node->ret.expr->intrinsic.args[
+                        node->ret.expr->intrinsic.arg_count - 1];
+                    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+                        Node *root = arg->unary.operand;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                            if (root->kind == NODE_FIELD) root = root->field.object;
+                            else root = root->index_expr.object;
+                        }
+                        if (root && root->kind == NODE_IDENT) {
+                            Symbol *sym = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            bool is_global = scope_lookup_local(c->global_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                            if (sym && !sym->is_static && !is_global) {
+                                checker_error(c, node->loc.line,
+                                    "cannot return pointer to local '%.*s' via @%.*s — "
+                                    "stack memory is freed when function returns",
+                                    (int)root->ident.name_len, root->ident.name,
+                                    (int)ilen, iname);
+                            }
+                        }
                     }
                 }
             }

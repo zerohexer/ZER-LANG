@@ -1475,6 +1475,18 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-275: `@size` pointer width mismatch on 64-bit targets
+- **Symptom:** `u8[@size(*u32)] buf` creates 4-byte buffer, but `sizeof(*u32)` is 8 on 64-bit.
+- **Root cause:** `compute_type_size` hardcoded pointer=4, slice=8. Constant folder disagrees with GCC.
+- **Fix:** `compute_type_size` returns `CONST_EVAL_FAIL` for pointer/slice. Array stores `sizeof_type` — emitter emits `sizeof(T)`. GCC resolves per target.
+- **Test:** `test_emit.c` — @size(*u32) matches target width. `test_checker_full.c` — @size(*u32) as array size accepted.
+
+### BUG-276: `_zer_` prefix not reserved
+- **Symptom:** `u32 _zer_tmp0 = 100` compiles — could shadow compiler temporaries.
+- **Root cause:** No prefix reservation in `add_symbol`.
+- **Fix:** Check `name_len >= 5 && memcmp(name, "_zer_", 5) == 0` → error.
+- **Test:** `test_checker_full.c` — `_zer_foo` rejected, `zer_foo` accepted.
+
 ### BUG-274: Union switch mutable capture drops volatile on pointer
 - **Symptom:** `switch(volatile_msg) { .a => |*v| }` — `v` declared as `struct A *`, not `volatile struct A *`.
 - **Root cause:** Variant pointer type emitted without checking if switch expression is volatile.

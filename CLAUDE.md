@@ -720,6 +720,12 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**138. `@size` on pointer/slice types emits `sizeof()` — target-portable.**
+`u8[@size(*u32)] buf` now emits `uint8_t buf[sizeof(uint32_t*)]` instead of hardcoded `buf[4]`. `compute_type_size` returns `CONST_EVAL_FAIL` for pointer/slice types. Array Type stores `sizeof_type` — emitter uses `emit_array_size()` helper. GCC resolves per target. (BUG-275)
+
+**139. `_zer_` prefix reserved — prevents compiler internal shadowing.**
+Variables starting with `_zer_` rejected in `add_symbol`. Prevents accidental collision with compiler-generated temporaries (`_zer_tmp0`, `_zer_ss0`, etc.). (BUG-276)
+
 **RF11: Shared `expr_is_volatile()` / `expr_root_symbol()` helpers.**
 4 independent inline volatile detection walks (array assign, if-unwrap, switch capture, @cstr) replaced with single `expr_is_volatile(e, expr)` helper. Walks any expression through field/index/deref chains to root ident, looks up symbol `is_volatile`. New emission sites just call the helper — no more per-site volatile walk duplication.
 

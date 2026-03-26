@@ -1468,6 +1468,23 @@ static void test_negative_sweep(void) {
        "}\nu32 main() { return 0; }",
        "different-type pointer mutation in switch arm accepted");
 
+    /* BUG-263: volatile pointer to non-volatile param rejected */
+    err("void write_reg(*u32 p) { *p = 5; }\n"
+        "volatile u32 hw = 0;\n"
+        "void f() {\n"
+        "    volatile *u32 reg = &hw;\n"
+        "    write_reg(reg);\n"
+        "}",
+        "volatile *u32 to *u32 param rejected");
+    ok("void write_reg(volatile *u32 p) { *p = 5; }\n"
+       "volatile u32 hw = 0;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = &hw;\n"
+       "    write_reg(reg);\n"
+       "    return 0;\n"
+       "}",
+       "volatile *u32 to volatile *u32 param accepted");
+
     /* RF8: eval_const_expr with negative intermediates */
     ok("u8[10 - 5] arr;\nu32 main() { arr[0] = 1; return 0; }",
        "array size from subtraction (10-5=5) accepted");

@@ -345,12 +345,20 @@ static TypeNode *parse_type(Parser *p) {
     /* base type, possibly followed by [N] for array */
     TypeNode *base = parse_base_type(p);
 
-    /* check for array suffix: T[N] */
+    /* check for array suffix: T[N] or T[N][M] (multi-dimensional) */
     if (match(p, TOK_LBRACKET)) {
         TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
         arr->array.elem = base;
         arr->array.size_expr = parse_expression(p);
         consume(p, TOK_RBRACKET, "expected ']' after array size");
+        /* multi-dim: T[N][M] → array of M elements of T[N] */
+        while (match(p, TOK_LBRACKET)) {
+            TypeNode *outer = new_type_node(p, TYNODE_ARRAY);
+            outer->array.elem = arr;
+            outer->array.size_expr = parse_expression(p);
+            consume(p, TOK_RBRACKET, "expected ']' after array size");
+            arr = outer;
+        }
         return arr;
     }
 
@@ -1201,15 +1209,17 @@ static Node *parse_statement(Parser *p) {
                 is_var = true;
             } else if (check(p, TOK_LBRACKET)) {
                 /* IDENT [ — could be array type (Task[10] t) or index (arr[0]).
-                 * Scan past balanced brackets, check if followed by IDENT. */
-                advance(p); /* consume [ */
-                int depth = 1;
-                while (depth > 0 && !check(p, TOK_EOF)) {
-                    if (check(p, TOK_LBRACKET)) depth++;
-                    else if (check(p, TOK_RBRACKET)) depth--;
-                    advance(p);
-                }
-                /* after ] — if IDENT follows, it's an array var decl */
+                 * Scan past balanced brackets (and multi-dim [N][M]), check if followed by IDENT. */
+                do {
+                    advance(p); /* consume [ */
+                    int depth = 1;
+                    while (depth > 0 && !check(p, TOK_EOF)) {
+                        if (check(p, TOK_LBRACKET)) depth++;
+                        else if (check(p, TOK_RBRACKET)) depth--;
+                        advance(p);
+                    }
+                } while (check(p, TOK_LBRACKET)); /* multi-dim: scan next [M] */
+                /* after all ] — if IDENT follows, it's an array var decl */
                 is_var = check(p, TOK_IDENT);
             } else if (check(p, TOK_LPAREN)) {
                 /* IDENT ( — could be func ptr type or function call.

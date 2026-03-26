@@ -289,8 +289,16 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
 
     if (t->kind == TYPE_ARRAY) {
-        emit_type(e, t->array.inner);
-        emit(e, " %.*s[%llu]", (int)name_len, name, (unsigned long long)t->array.size);
+        /* collect all array dimensions, emit base type + name + all dims */
+        Type *base = t;
+        while (base->kind == TYPE_ARRAY) base = base->array.inner;
+        emit_type(e, base);
+        emit(e, " %.*s", (int)name_len, name);
+        Type *dim = t;
+        while (dim->kind == TYPE_ARRAY) {
+            emit(e, "[%llu]", (unsigned long long)dim->array.size);
+            dim = dim->array.inner;
+        }
         return;
     }
 
@@ -1290,24 +1298,19 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             emit(e, " }; })");
         } else if (slice_needs_runtime_check) {
-            /* runtime check path: wrap entire slice in stmt expr with bounds check */
-            emit(e, "({ if ((size_t)(");
+            /* BUG-262: hoist start/end into temps for single evaluation */
+            int sl_tmp = e->temp_count++;
+            emit(e, "({ size_t _zer_ss%d = (size_t)(", sl_tmp);
             emit_expr(e, node->slice.start);
-            emit(e, ") > (size_t)(");
+            emit(e, "); size_t _zer_se%d = (size_t)(", sl_tmp);
             emit_expr(e, node->slice.end);
-            emit(e, ")) _zer_trap(\"slice start > end\", __FILE__, __LINE__); (");
+            emit(e, "); if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); (", sl_tmp, sl_tmp);
             emit_type(e, type_slice(e->arena, obj_type->kind == TYPE_ARRAY ?
                 obj_type->array.inner : obj_type->slice.inner));
             emit(e, "){ &(");
             emit_expr(e, node->slice.object);
             if (obj_is_slice) emit(e, ".ptr");
-            emit(e, ")[");
-            emit_expr(e, node->slice.start);
-            emit(e, "], (");
-            emit_expr(e, node->slice.end);
-            emit(e, ") - (");
-            emit_expr(e, node->slice.start);
-            emit(e, ") }; })");
+            emit(e, ")[_zer_ss%d], _zer_se%d - _zer_ss%d }; })", sl_tmp, sl_tmp, sl_tmp);
         } else {
             /* normal path — no side effects in object */
             emit(e, "&(");
@@ -1938,12 +1941,25 @@ static void emit_stmt(Emitter *e, Node *node) {
             e->indent++;
 
             if (node->if_stmt.capture_is_ptr && !is_ptr_opt) {
-                /* |*val| on struct optional — need pointer to original */
+                /* |*val| on struct optional — need pointer to original.
+                 * BUG-264: for rvalue expressions (NODE_CALL), hoist into temp
+                 * to avoid &(rvalue). For lvalues, use &(expr) directly. */
+                bool cond_is_rvalue = (node->if_stmt.cond->kind == NODE_CALL);
                 emit_indent(e);
-                emit_type(e, cond_type);
-                emit(e, " *_zer_uwp%d = &(", tmp);
-                emit_expr(e, node->if_stmt.cond);
-                emit(e, ");\n");
+                if (cond_is_rvalue) {
+                    emit_type(e, cond_type);
+                    emit(e, " _zer_uwt%d = ", tmp);
+                    emit_expr(e, node->if_stmt.cond);
+                    emit(e, ";\n");
+                    emit_indent(e);
+                    emit_type(e, cond_type);
+                    emit(e, " *_zer_uwp%d = &_zer_uwt%d;\n", tmp, tmp);
+                } else {
+                    emit_type(e, cond_type);
+                    emit(e, " *_zer_uwp%d = &(", tmp);
+                    emit_expr(e, node->if_stmt.cond);
+                    emit(e, ");\n");
+                }
                 emit_indent(e);
                 emit(e, "if (_zer_uwp%d->has_value) ", tmp);
                 emit(e, "{\n");

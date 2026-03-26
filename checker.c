@@ -1512,6 +1512,23 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "argument %d: cannot pass const pointer to mutable parameter",
                                 i + 1);
                         }
+                        /* BUG-263: volatile pointer → non-volatile param strips volatile.
+                         * Check both type-level and symbol-level volatile. */
+                        if (arg->kind == TYPE_POINTER && param->kind == TYPE_POINTER &&
+                            !param->pointer.is_volatile) {
+                            bool arg_volatile = arg->pointer.is_volatile;
+                            if (!arg_volatile && node->call.args[i]->kind == NODE_IDENT) {
+                                Symbol *as = scope_lookup(c->current_scope,
+                                    node->call.args[i]->ident.name,
+                                    (uint32_t)node->call.args[i]->ident.name_len);
+                                if (as && as->is_volatile) arg_volatile = true;
+                            }
+                            if (arg_volatile) {
+                                checker_error(c, node->loc.line,
+                                    "argument %d: cannot pass volatile pointer to non-volatile parameter",
+                                    i + 1);
+                            }
+                        }
                     }
                     /* const array → mutable slice coercion: check if arg var is const */
                     if (arg && arg->kind == TYPE_ARRAY &&

@@ -2844,6 +2844,43 @@ int main(void) {
         21,
         "orelse index single-eval (next() called once, counter=1, arr[1]=20)");
 
+    /* BUG-262: slice start/end single-eval */
+    test_compile_and_run(
+        "u32 counter = 0;\n"
+        "u32 get_start() { counter += 1; return 1; }\n"
+        "u32 get_end() { counter += 1; return 3; }\n"
+        "u32 main() {\n"
+        "    u32[5] arr;\n"
+        "    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40; arr[4] = 50;\n"
+        "    []u32 s = arr[get_start()..get_end()];\n"
+        "    return counter;\n"
+        "}\n",
+        2,
+        "slice start/end single-eval (counter=2, not 4+)");
+
+    /* BUG-264: if-unwrap mutable capture on rvalue compiles (no GCC error) */
+    test_compile_and_run(
+        "?u32 get_opt() { return 42; }\n"
+        "u32 main() {\n"
+        "    if (get_opt()) |*v| {\n"
+        "        return *v;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        42,
+        "if-unwrap |*v| on rvalue compiles without GCC error");
+
+    /* Multi-dim array */
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8[10][3] grid;\n"
+        "    grid[0][0] = 1;\n"
+        "    grid[2][9] = 42;\n"
+        "    return @truncate(u32, grid[0][0]) + @truncate(u32, grid[2][9]);\n"
+        "}\n",
+        43,
+        "multi-dim array u8[10][3] works");
+
     /* RF8: eval_const_expr negative intermediates */
     test_compile_and_run(
         "u8[10 - 5] arr;\n"

@@ -1442,6 +1442,16 @@ static void test_negative_sweep(void) {
         "    *ptr_pool.get(h) = &x;\n"
         "}",
         "store &local through *pool.get() rejected");
+
+    /* RF8: eval_const_expr with negative intermediates */
+    ok("u8[10 - 5] arr;\nu32 main() { arr[0] = 1; return 0; }",
+       "array size from subtraction (10-5=5) accepted");
+    ok("u8[3 * 4 - 2] arr;\nu32 main() { return 0; }",
+       "array size from mixed ops (3*4-2=10) accepted");
+    err("u8[5 - 10] arr;\nu32 main() { return 0; }",
+        "negative array size (5-10=-5) rejected");
+    err("u8[0 - 1] arr;\nu32 main() { return 0; }",
+        "negative array size (0-1=-1) rejected");
 }
 
 /* ================================================================ */

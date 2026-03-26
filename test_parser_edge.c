@@ -606,6 +606,37 @@ int main(void) {
         "}\n",
         "17 switch arm values accepted (dynamic arrays)");
 
+    /* RF9: parser handles malformed enum/struct/union without infinite loop */
+    printf("[malformed type declarations (no hang)]\n");
+    expect_fail("enum struct union;", "enum with keyword name doesn't hang");
+    expect_fail("struct if { }", "struct with keyword name doesn't hang");
+    expect_fail("union return { }", "union with keyword name doesn't hang");
+
+    /* RF9: parser depth limit (64) */
+    printf("[parser depth limit]\n");
+    {
+        /* 70 nested blocks — exceeds depth limit of 64 */
+        char deep[2048];
+        strcpy(deep, "void f() ");
+        for (int i = 0; i < 70; i++) strcat(deep, "{ ");
+        for (int i = 0; i < 70; i++) strcat(deep, "} ");
+        expect_fail(deep, "70 nested blocks rejected (depth limit 64)");
+    }
+
+    /* RF9: dynamic arrays handle >32 params */
+    printf("[dynamic param arrays]\n");
+    {
+        char many_params[4096];
+        strcpy(many_params, "void f(u32 p0");
+        for (int i = 1; i < 40; i++) {
+            char p[32];
+            sprintf(p, ", u32 p%d", i);
+            strcat(many_params, p);
+        }
+        strcat(many_params, ") {}");
+        expect_ok(many_params, "40 params accepted (was limited to 32)");
+    }
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

@@ -664,6 +664,17 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.
 
+### Structural Refactors RF8-RF10 (2026-03-26)
+
+**RF8: `eval_const_expr` uses `CONST_EVAL_FAIL` (INT64_MIN) sentinel.**
+Old `-1` sentinel collided with valid negative values. `u8[10 - 5]` now evaluates to 5. `u8[5 - 10]` correctly reports "array size must be > 0" instead of "not a constant". All callers updated to check `== CONST_EVAL_FAIL`.
+
+**RF9: Parser arrays are dynamic (stack-first, arena-overflow).**
+All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more artificial limits. Includes: OOM flag on Parser struct, `parser_alloc()` helper, depth limit (64), Token-before infinite-loop guards on ALL parse loops (block, file, struct, enum, union, switch). Prevents hangs on malformed input like `"enum struct union;"`.
+
+**RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
+5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
+
 ### Known Technical Debt
 - **Global Compiler State:** `non_storable_nodes` is a static global. `type_map` was moved into Checker struct (RF1). Remaining global makes compiler non-thread-safe for LSP concurrent requests.
 - **Static vars in imported modules:** Fixed in BUG-222/229/233. All imported symbols (static and non-static) register under mangled keys. Cross-module same-named symbols work correctly. No qualified call syntax yet (unqualified calls resolve to last import).

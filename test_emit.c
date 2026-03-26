@@ -2844,6 +2844,17 @@ int main(void) {
         21,
         "orelse index single-eval (next() called once, counter=1, arr[1]=20)");
 
+    /* RF8: eval_const_expr negative intermediates */
+    test_compile_and_run(
+        "u8[10 - 5] arr;\n"
+        "u32 main() {\n"
+        "    arr[0] = 42;\n"
+        "    arr[4] = 99;\n"
+        "    return @truncate(u32, arr[0]) + @truncate(u32, arr[4]);\n"
+        "}\n",
+        141,
+        "array size from subtraction (10-5=5) works at runtime");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove(TEST_EXE);

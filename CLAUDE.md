@@ -720,6 +720,15 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**146. Arena.over slice arg single-eval.**
+`Arena.over(next_buf())` called `next_buf()` twice (`.ptr` and `.len`). Now hoists slice arg into `__auto_type` temp. Array path unchanged (sizeof doesn't eval). (BUG-286)
+
+**147. Pool/Ring as struct fields rejected.**
+`struct M { Pool(u32, 4) tasks; }` → error. Pool/Ring macros can't be emitted inside C structs. Must be global/static. v0.2 will support this. (BUG-287)
+
+**148. Bit extraction `hi < lo` rejected.**
+`reg[0..7]` now caught at compile time — "high index must be >= low index". Prevents silent negative-width extraction. (BUG-288)
+
 **144. Volatile pointer stripping on return rejected.**
 `return volatile_ptr` as non-volatile `*T` return type now caught. Checks both type-level and symbol-level volatile on the return expression. (BUG-281)
 

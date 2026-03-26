@@ -1475,6 +1475,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-286: Arena.over double evaluation
+- **Symptom:** `Arena.over(next_buf())` calls `next_buf()` twice — counter=2 instead of 1.
+- **Root cause:** Emitter accesses `.ptr` and `.len` separately from the expression.
+- **Fix:** Hoist slice arg into `__auto_type _zer_ao` temp. Array path unchanged (sizeof doesn't eval).
+- **Test:** `test_emit.c` — Arena.over single-eval (counter=1).
+
+### BUG-287: Pool/Ring as struct fields (architectural)
+- **Symptom:** `struct M { Pool(u32, 4) tasks; }` → GCC error "incomplete type."
+- **Root cause:** Pool/Ring emitted as C macros at global scope, can't be inside struct definitions.
+- **Fix:** Checker rejects Pool/Ring as struct fields. v0.2 will support this.
+- **Test:** `test_checker_full.c` — Pool/Ring struct fields rejected.
+
+### BUG-288: Bit extraction hi < lo silent no-op
+- **Symptom:** `reg[0..7]` compiles but produces garbage (negative width).
+- **Root cause:** No compile-time check that hi >= lo for constant bit ranges.
+- **Fix:** In NODE_SLICE integer path, check constant hi < lo → error.
+- **Test:** `test_checker_full.c` — hi < lo rejected, hi >= lo accepted.
+
 ### BUG-281: Volatile pointer stripping on return
 - **Symptom:** `*u32 wash(volatile *u32 p) { return p; }` compiles — volatile stripped silently.
 - **Root cause:** NODE_RETURN had const check but no volatile check.

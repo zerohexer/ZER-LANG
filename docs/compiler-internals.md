@@ -480,6 +480,9 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 109. **Volatile if-unwrap copy (BUG-272)** — Checks if condition ident's symbol has `is_volatile`. If so, emits `volatile` before the typed copy. Uses `emit_type_and_name` for correct func ptr name placement.
 110. **Volatile array assign byte loop (BUG-273)** — Array assignment checks target root symbol for `is_volatile`. If volatile, emits `for(_i) vd[_i] = vs[_i]` byte loop instead of memcpy. Same pattern as @cstr volatile (BUG-223).
 111. **Volatile union capture pointer (BUG-274)** — `sw_volatile` flag detected from switch expression root symbol. When set, mutable capture `|*v|` emits `volatile T *v` instead of `T *v`.
+121. **Arena.over slice single-eval (BUG-286)** — Hoists slice arg into `__auto_type _zer_ao` temp before extracting `.ptr` and `.len`. Array args unchanged (sizeof doesn't evaluate).
+122. **Pool/Ring struct field rejected (BUG-287)** — In struct field registration, checks TYPE_POOL/TYPE_RING and errors. These types use C macros that can't be inside struct definitions.
+123. **Bit extract hi < lo rejected (BUG-288)** — In NODE_SLICE integer path, when both hi and lo are constant and hi < lo, compile error. Prevents silent negative-width extraction.
 119. **Volatile return stripping (BUG-281)** — NODE_RETURN checks if return expression is volatile (type-level or symbol-level) and function return type is non-volatile pointer. Same pattern as const return check.
 120. **Volatile init/assign stripping (BUG-282)** — NODE_VAR_DECL and NODE_ASSIGN check source ident's `is_volatile` symbol flag when type-level `pointer.is_volatile` is not set. Assignment also checks target symbol volatile to allow volatile-to-volatile.
 116. **Volatile array var-decl init byte loop (BUG-278)** — NODE_VAR_DECL array init path checks `var_decl.is_volatile`. If volatile, emits byte-by-byte loop instead of memcpy.

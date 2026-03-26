@@ -963,15 +963,15 @@ static void emit_expr(Emitter *e, Node *node) {
 
                     if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
                         /* Arena.over(buf) → (_zer_arena){ (uint8_t*)buf, sizeof(buf), 0 }
-                         * or for slices: (_zer_arena){ buf.ptr, buf.len, 0 } */
+                         * or for slices: (_zer_arena){ buf.ptr, buf.len, 0 }
+                         * BUG-286: hoist arg into temp for single evaluation */
                         if (node->call.arg_count > 0) {
+                            int tmp = e->temp_count++;
                             Type *arg_type = checker_get_type(e->checker,node->call.args[0]);
                             if (arg_type && arg_type->kind == TYPE_SLICE) {
-                                emit(e, "((_zer_arena){ (uint8_t*)");
+                                emit(e, "({ __auto_type _zer_ao%d = ", tmp);
                                 emit_expr(e, node->call.args[0]);
-                                emit(e, ".ptr, ");
-                                emit_expr(e, node->call.args[0]);
-                                emit(e, ".len, 0 })");
+                                emit(e, "; (_zer_arena){ (uint8_t*)_zer_ao%d.ptr, _zer_ao%d.len, 0 }; })", tmp, tmp);
                             } else {
                                 emit(e, "((_zer_arena){ (uint8_t*)");
                                 emit_expr(e, node->call.args[0]);

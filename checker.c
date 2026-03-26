@@ -2046,6 +2046,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         "bit index %lld out of range for %d-bit type '%s'",
                         (long long)hi, type_width(obj), type_name(obj));
                 }
+                /* BUG-288: reject hi < lo — negative width bit extraction */
+                if (node->slice.end) {
+                    int64_t lo = eval_const_expr(node->slice.end);
+                    if (hi != CONST_EVAL_FAIL && lo != CONST_EVAL_FAIL && hi < lo) {
+                        checker_error(c, node->loc.line,
+                            "bit extraction high index (%lld) must be >= low index (%lld)",
+                            (long long)hi, (long long)lo);
+                    }
+                }
             }
             result = obj;
         } else {
@@ -3419,6 +3428,11 @@ static void register_decl(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "struct field '%.*s' cannot have type 'void'",
                         (int)fd->name_len, fd->name);
+                }
+                /* BUG-287: Pool/Ring as struct fields not yet supported */
+                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING)) {
+                    checker_error(c, node->loc.line,
+                        "Pool/Ring cannot be struct fields — must be global or static variables");
                 }
                 /* BUG-227/232: reject recursive struct by value (incomplete type in C).
                  * Unwrap arrays — S[1] contains S by value too. */

@@ -1485,6 +1485,18 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-287: Pool/Ring as struct fields rejected */
+    err("struct M { Pool(u32, 4) tasks; }\nu32 main() { return 0; }",
+        "Pool as struct field rejected");
+    err("struct M { Ring(u32, 8) buf; }\nu32 main() { return 0; }",
+        "Ring as struct field rejected");
+
+    /* BUG-288: bit extraction hi < lo rejected */
+    err("u32 main() { u32 r = 0xFF; u32 x = r[0..7]; return x; }",
+        "bit extract hi < lo rejected");
+    ok("u32 main() { u32 r = 0xFF; u32 x = r[7..0]; return x; }",
+       "bit extract hi >= lo accepted");
+
     /* BUG-281: volatile stripping on return */
     err("*u32 wash(volatile *u32 p) {\n"
         "    return p;\n"

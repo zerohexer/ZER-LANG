@@ -2955,6 +2955,18 @@ int main(void) {
         0,
         "arena alloc_slice overflow returns null (not corrupted slice)");
 
+    /* BUG-286: Arena.over single-eval */
+    test_compile_and_run(
+        "u8[64] g_buf;\n"
+        "u32 counter = 0;\n"
+        "[]u8 next_buf() { counter += 1; return g_buf; }\n"
+        "u32 main() {\n"
+        "    Arena a = Arena.over(next_buf());\n"
+        "    return counter;\n"
+        "}\n",
+        1,
+        "Arena.over single-eval (counter=1, not 2)");
+
     /* BUG-278: volatile array init uses byte loop */
     test_compile_and_run(
         "u32 main() {\n"

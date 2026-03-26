@@ -1485,6 +1485,12 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-265: recursive union by value rejected */
+    err("struct A { u32 x; }\nunion U { A a; U recursive; }\nu32 main() { return 0; }",
+        "recursive union by value rejected");
+    ok("struct A { u32 x; }\nunion U { A a; *U recursive; }\nu32 main() { return 0; }",
+       "recursive union via pointer accepted");
+
     /* RF8: eval_const_expr with negative intermediates */
     ok("u8[10 - 5] arr;\nu32 main() { arr[0] = 1; return 0; }",
        "array size from subtraction (10-5=5) accepted");

@@ -3446,6 +3446,17 @@ static void register_decl(Checker *c, Node *node) {
                         "union variant '%.*s' cannot have type 'void'",
                         (int)uv->name_len, uv->name);
                 }
+                /* BUG-265: reject recursive union by value (incomplete type in C) */
+                {
+                    Type *inner = sv->type;
+                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+                    if (inner == t) {
+                        checker_error(c, node->loc.line,
+                            "union '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
+                            (int)node->union_decl.name_len, node->union_decl.name,
+                            (int)node->union_decl.name_len, node->union_decl.name);
+                    }
+                }
             }
         }
         break;

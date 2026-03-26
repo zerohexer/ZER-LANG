@@ -2881,6 +2881,19 @@ int main(void) {
         43,
         "multi-dim array u8[10][3] works");
 
+    /* BUG-266: arena alloc_slice overflow returns null */
+    test_compile_and_run(
+        "struct Task { u32 id; u32 pri; }\n"
+        "u32 main() {\n"
+        "    u8[256] buf;\n"
+        "    Arena a = Arena.over(buf);\n"
+        "    ?[]Task s = a.alloc_slice(Task, 1152921504606846975);\n"
+        "    if (s) |v| { return 1; }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "arena alloc_slice overflow returns null (not corrupted slice)");
+
     /* RF8: eval_const_expr negative intermediates */
     test_compile_and_run(
         "u8[10 - 5] arr;\n"

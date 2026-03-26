@@ -960,10 +960,13 @@ static void emit_expr(Emitter *e, Node *node) {
                                 Type *opt_type = type_optional(e->arena, slice_type);
                                 emit(e, "({ size_t _zer_asn%d = (size_t)", tmp);
                                 emit_expr(e, node->call.args[1]);
-                                emit(e, "; void *_zer_asp%d = _zer_arena_alloc(&%.*s, sizeof(",
-                                     tmp, alen, aname);
+                                /* BUG-266: overflow-safe multiplication for alloc size */
+                                emit(e, "; size_t _zer_asz%d; void *_zer_asp%d = "
+                                     "__builtin_mul_overflow(sizeof(", tmp, tmp);
                                 emit_type(e, tsym->type);
-                                emit(e, ") * _zer_asn%d, _Alignof(", tmp);
+                                emit(e, "), _zer_asn%d, &_zer_asz%d) ? (void*)0 : "
+                                     "_zer_arena_alloc(&%.*s, _zer_asz%d, _Alignof(",
+                                     tmp, tmp, alen, aname, tmp);
                                 emit_type(e, tsym->type);
                                 emit(e, ")); ");
                                 emit_type(e, opt_type);

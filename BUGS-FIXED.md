@@ -1475,6 +1475,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-278: Volatile array var-decl init uses memcpy
+- **Symptom:** `volatile u8[4] hw = src` emits `memcpy(hw, src, sizeof(hw))` — volatile stripped.
+- **Root cause:** Var-decl array init path always used memcpy regardless of volatile.
+- **Fix:** Check `var_decl.is_volatile`, emit byte-by-byte loop when volatile.
+- **Test:** `test_emit.c` — volatile array init via byte loop works.
+
+### BUG-279: `is_null_sentinel` only unwraps one distinct level
+- **Symptom:** `?Ptr2` where Ptr2 is `distinct typedef (distinct typedef *u32)` treated as struct optional.
+- **Root cause:** `is_null_sentinel` had single `if (TYPE_DISTINCT)`, not recursive.
+- **Fix:** Changed to `while (TYPE_DISTINCT)` loop.
+- **Test:** `test_checker_full.c` — nested distinct optional uses null-sentinel.
+
+### BUG-280: `@size(usize)` returns 4 on 64-bit targets
+- **Symptom:** `u8[@size(usize)] buf` creates 4-byte buffer on 64-bit where sizeof(size_t) is 8.
+- **Root cause:** `compute_type_size` reached `type_width(TYPE_USIZE)` = 32 before target-dependent check.
+- **Fix:** Check TYPE_USIZE before type_width, return CONST_EVAL_FAIL. Emitter uses sizeof(size_t).
+- **Test:** `test_checker_full.c` — @size(usize) as array size accepted.
+
 ### BUG-277: `keep` bypass via function pointers
 - **Symptom:** Assigning `store` (with `keep *u32 p`) to `void (*fn)(*u32)` erases keep — `fn(&local)` bypasses check.
 - **Root cause:** `keep` not stored in TYPE_FUNC_PTR. Call-site check only worked for direct function calls via `func_node`.

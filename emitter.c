@@ -52,12 +52,9 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
 static inline bool is_null_sentinel(Type *inner) {
     if (!inner) return false;
-    if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return true;
-    if (inner->kind == TYPE_DISTINCT) {
-        Type *u = inner->distinct.underlying;
-        return u && (u->kind == TYPE_POINTER || u->kind == TYPE_FUNC_PTR);
-    }
-    return false;
+    /* BUG-279: unwrap ALL levels of distinct, not just one */
+    while (inner->kind == TYPE_DISTINCT) inner = inner->distinct.underlying;
+    return inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR;
 }
 #define IS_NULL_SENTINEL(inner_kind) \
     ((inner_kind) == TYPE_POINTER || (inner_kind) == TYPE_FUNC_PTR)
@@ -1945,14 +1942,25 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit_array_as_slice(e, node->var_decl.init, init_type, type);
                 } else if (type && type->kind == TYPE_ARRAY &&
                            init_type && init_type->kind == TYPE_ARRAY) {
-                    /* array = array: C arrays aren't assignable, use memcpy */
+                    /* array = array: C arrays aren't assignable, use memcpy.
+                     * BUG-278: volatile arrays use byte loop (memcpy strips volatile) */
                     emit(e, " = {0};\n");
                     emit_indent(e);
-                    emit(e, "memcpy(%.*s, ",
-                         (int)node->var_decl.name_len, node->var_decl.name);
-                    emit_expr(e, node->var_decl.init);
-                    emit(e, ", sizeof(%.*s))",
-                         (int)node->var_decl.name_len, node->var_decl.name);
+                    if (node->var_decl.is_volatile) {
+                        int tmp = e->temp_count++;
+                        emit(e, "{ const uint8_t *_zer_vs%d = (const uint8_t*)&(", tmp);
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, "); for (size_t _i = 0; _i < sizeof(%.*s); _i++) "
+                             "((volatile uint8_t*)%.*s)[_i] = _zer_vs%d[_i]; }",
+                             (int)node->var_decl.name_len, node->var_decl.name,
+                             (int)node->var_decl.name_len, node->var_decl.name, tmp);
+                    } else {
+                        emit(e, "memcpy(%.*s, ",
+                             (int)node->var_decl.name_len, node->var_decl.name);
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ", sizeof(%.*s))",
+                             (int)node->var_decl.name_len, node->var_decl.name);
+                    }
                 } else {
                     emit(e, " = ");
                     emit_expr(e, node->var_decl.init);

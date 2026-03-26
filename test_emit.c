@@ -2955,6 +2955,17 @@ int main(void) {
         0,
         "arena alloc_slice overflow returns null (not corrupted slice)");
 
+    /* BUG-278: volatile array init uses byte loop */
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8[4] src;\n"
+        "    src[0] = 42; src[1] = 1;\n"
+        "    volatile u8[4] hw = src;\n"
+        "    return @truncate(u32, hw[0]) + @truncate(u32, hw[1]);\n"
+        "}\n",
+        43,
+        "volatile array init via byte loop works");
+
     /* BUG-275: @size(*T) uses sizeof — matches target pointer width */
     test_compile_and_run(
         "u8[@size(*u32)] buf;\n"

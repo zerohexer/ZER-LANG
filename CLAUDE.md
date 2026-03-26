@@ -720,6 +720,15 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**141. Volatile array var-decl init uses byte loop.**
+`volatile u8[4] hw = src` used `memcpy` — doesn't respect volatile. Now uses byte-by-byte loop when `var_decl.is_volatile` is set. Same pattern as BUG-273 (array assignment). (BUG-278)
+
+**142. `is_null_sentinel` unwraps ALL distinct levels.**
+`distinct typedef (distinct typedef *u32) Ptr2; ?Ptr2 maybe` was treated as struct optional. Now uses `while` loop to unwrap through any depth of distinct to find the base pointer/func_ptr. (BUG-279)
+
+**143. `@size(usize)` target-dependent via `sizeof()`.**
+`compute_type_size` returns `CONST_EVAL_FAIL` for `TYPE_USIZE`. Same approach as BUG-275 for pointers/slices — emitter uses `sizeof(size_t)`. (BUG-280)
+
 **140. `keep` qualifier carried through function pointer types.**
 `void (*fn)(keep *u32) = store` — keep flags stored per-param in `TYPE_FUNC_PTR` via `param_keeps` array. Parser parses `keep` in func ptr params. `type_equals` checks keep mismatch. Call-site validation works for both direct calls and function pointer calls using the Type's `param_keeps`. (BUG-277)
 

@@ -1485,6 +1485,20 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-279: nested distinct null-sentinel */
+    ok("distinct typedef *u32 Ptr1;\n"
+       "distinct typedef Ptr1 Ptr2;\n"
+       "u32 main() {\n"
+       "    ?Ptr2 maybe = null;\n"
+       "    if (maybe == null) { return 1; }\n"
+       "    return 0;\n"
+       "}",
+       "nested distinct ?Ptr2 uses null-sentinel (not struct)");
+
+    /* BUG-280: @size(usize) target-portable */
+    ok("u8[@size(usize)] buf;\nu32 main() { return 0; }",
+       "@size(usize) as array size accepted (sizeof-based)");
+
     /* BUG-277: keep in function pointer types */
     err("void store(keep *u32 p) { }\n"
         "u32 main() {\n"

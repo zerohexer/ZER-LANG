@@ -273,12 +273,13 @@ static bool is_literal_compatible(Node *expr, Type *target) {
  * Handles nested structs, arrays, pointers, slices with natural alignment. */
 static int64_t compute_type_size(Type *t) {
     t = type_unwrap_distinct(t);
-    int w = type_width(t);
-    if (w > 0) return w / 8;
-    /* BUG-275: pointer/slice sizes are target-dependent — don't constant-fold.
+    /* BUG-275/280: target-dependent types — don't constant-fold.
      * Let the emitter use sizeof() which GCC resolves per target. */
     if (t->kind == TYPE_POINTER) return CONST_EVAL_FAIL;
     if (t->kind == TYPE_SLICE) return CONST_EVAL_FAIL;
+    if (t->kind == TYPE_USIZE) return CONST_EVAL_FAIL;
+    int w = type_width(t);
+    if (w > 0) return w / 8;
     if (t->kind == TYPE_ARRAY) {
         int64_t elem_size = compute_type_size(t->array.inner);
         return elem_size > 0 ? elem_size * (int64_t)t->array.size : -1;

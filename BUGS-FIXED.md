@@ -1432,3 +1432,33 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** No overflow check on size multiplication in emitted C.
 - **Fix:** Use `__builtin_mul_overflow(sizeof(T), n, &total)` — overflow returns null.
 - **Test:** `test_emit.c` — overflow alloc returns null (not corrupted slice).
+
+### BUG-267: Volatile stripping via `__auto_type` in if-unwrap
+- **Symptom:** `volatile ?u32 reg; if (reg) |v|` — capture `v` loses volatile qualifier.
+- **Root cause:** `__auto_type` drops volatile in GCC.
+- **Fix:** Use `emit_type_and_name` for explicit typed copy. Handles func ptr name placement.
+- **Test:** Existing tests pass (volatile preserved in emitted type).
+
+### BUG-268: Union switch mutable capture modifies copy
+- **Symptom:** `switch(g_msg) { .a => |*v| { v.x = 99; } }` — modification lost, g_msg unchanged.
+- **Root cause:** Always hoisted into `__auto_type _zer_swt` temp, then `&_zer_swt`. Mutations go to copy.
+- **Fix:** Detect lvalue expressions (not NODE_CALL), use direct `&(expr)`. Rvalue still uses temp.
+- **Test:** `test_emit.c` — union switch |*v| on global modifies original (returns 99).
+
+### BUG-269: Constant expression div-by-zero not caught
+- **Symptom:** `10 / (2 - 2)` passes checker — traps at runtime instead of compile time.
+- **Root cause:** Zero check only tested `NODE_INT_LIT == 0`, not computed expressions.
+- **Fix:** Use `eval_const_expr` on divisor. `val == 0` → compile-time error.
+- **Test:** `test_checker_full.c` — const expr div-by-zero rejected.
+
+### BUG-270: Array return type produces invalid C
+- **Symptom:** `u8[10] get_buf()` emits `uint8_t get_buf()` — dimension lost, type mismatch.
+- **Root cause:** `emit_type(TYPE_ARRAY)` recurses to base type. C forbids array returns.
+- **Fix:** Checker rejects TYPE_ARRAY return types in `check_func_body`.
+- **Test:** `test_checker_full.c` — array return type rejected.
+
+### BUG-271: Distinct typedef union/enum in switch broken
+- **Symptom:** `switch(distinct_event)` — captures fail, treated as integer switch.
+- **Root cause:** Switch dispatch checked `sw_type->kind == TYPE_UNION` without unwrapping distinct.
+- **Fix:** `type_unwrap_distinct` before dispatch in both checker (`expr_eff`) and emitter (`sw_eff`).
+- **Test:** `test_emit.c` — distinct typedef union switch works (returns 77).

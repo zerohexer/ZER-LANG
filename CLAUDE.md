@@ -685,6 +685,21 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.
 - **`[]T → *T` coercion removed:** Empty slice has `ptr = NULL`, violating `*T` non-null guarantee. Use `.ptr` explicitly for C interop.
 
+**130. If-unwrap uses `emit_type_and_name` to preserve volatile.**
+`__auto_type` drops volatile. Now uses explicit type emission via `emit_type_and_name` (handles func ptr name placement correctly). (BUG-267)
+
+**131. Union switch `|*v|` uses direct `&` for lvalue expressions.**
+`switch(g_msg) { .a => |*v| { v.x = 99; } }` was modifying a copy. Now detects lvalue vs rvalue — lvalue uses `&(expr)`, rvalue (NODE_CALL) uses temp hoist. (BUG-268)
+
+**132. Compile-time div-by-zero uses `eval_const_expr`.**
+`10 / (2 - 2)` now caught at compile time. Uses `eval_const_expr` on divisor instead of just checking `NODE_INT_LIT == 0`. (BUG-269)
+
+**133. Array return type rejected.**
+`u8[10] get_buf()` is invalid C — arrays can't be returned. Checker rejects TYPE_ARRAY return types in `check_func_body`. Use struct wrapper or slice. (BUG-270)
+
+**134. Distinct typedef union/enum in switch unwrapped.**
+`switch(distinct_event)` failed when the underlying type was a union. Both checker and emitter now call `type_unwrap_distinct` before TYPE_UNION/TYPE_ENUM dispatch. (BUG-271)
+
 ### Structural Refactors RF8-RF10 (2026-03-26)
 
 **RF8: `eval_const_expr` uses `CONST_EVAL_FAIL` (INT64_MIN) sentinel.**

@@ -659,6 +659,21 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 **122. `*func() = &local` rejected — escape through dereferenced call.**
 `*pool.get(h) = &x` stores a local address into memory returned by a function call (which may be global). NODE_ASSIGN walks the target through deref/field/index; if root is NODE_CALL, rejects `&local` and local-derived values. (BUG-260)
 
+**123. Union switch lock blocks pointer aliases of same type.**
+`*Msg alias` inside `switch(g_msg)` capture arm — mutation through `alias.b.y = 99` rejected if alias type matches the locked union type. Only applies to pointers (might alias external memory), not direct local variables of same type. (BUG-261)
+
+**124. Slice start/end hoisted for single evaluation.**
+`arr[get_start()..get_end()]` was calling `get_start()` 3x and `get_end()` 2x. Now hoisted into `_zer_ss`/`_zer_se` temps inside a GCC statement expression. (BUG-262)
+
+**125. Volatile pointer to non-volatile param rejected at call sites.**
+`write_reg(volatile_ptr)` where param is `*u32` strips volatile — GCC may optimize away writes. Checker checks both `pointer.is_volatile` on the Type AND `sym->is_volatile` on the arg ident. (BUG-263)
+
+**126. If-unwrap `|*v|` on rvalue hoists into temp.**
+`if (get_opt()) |*v|` emitted `&(get_opt())` — illegal C (rvalue address). Now detects `NODE_CALL` condition and hoists: `__auto_type _tmp = get_opt(); ... &_tmp`. Lvalue conditions still use direct `&` for mutation semantics. (BUG-264)
+
+**127. Multi-dimensional arrays supported.**
+`u8[10][20] grid` — parser chains TYNODE_ARRAY dimensions. `u8[10]` is the element type, `[20]` is the outer count. Emitter collects all dims: `uint8_t grid[20][10]`. Bounds checks on each dimension. Statement disambiguator scans through multiple `[N]` suffixes. (New feature)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.

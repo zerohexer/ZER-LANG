@@ -248,6 +248,10 @@ bool type_equals(Type *a, Type *b) {
         for (uint32_t i = 0; i < a->func_ptr.param_count; i++) {
             if (!type_equals(a->func_ptr.params[i], b->func_ptr.params[i]))
                 return false;
+            /* keep mismatch: if source has keep, target must too */
+            bool a_keep = a->func_ptr.param_keeps && a->func_ptr.param_keeps[i];
+            bool b_keep = b->func_ptr.param_keeps && b->func_ptr.param_keeps[i];
+            if (a_keep != b_keep) return false;
         }
         return true;
 

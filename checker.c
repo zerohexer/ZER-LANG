@@ -526,7 +526,13 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 params[i] = resolve_type(c, tn->func_ptr.param_types[i]);
             }
         }
-        return type_func_ptr(c->arena, params, pc, ret);
+        Type *fpt = type_func_ptr(c->arena, params, pc, ret);
+        /* carry keep flags from TypeNode to Type */
+        if (tn->func_ptr.param_keeps) {
+            fpt->func_ptr.param_keeps = (bool *)arena_alloc(c->arena, pc * sizeof(bool));
+            memcpy(fpt->func_ptr.param_keeps, tn->func_ptr.param_keeps, pc * sizeof(bool));
+        }
+        return fpt;
     }
 
     case TYNODE_CONST: {
@@ -1578,46 +1584,44 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
 
-                /* keep parameter validation: check call arguments */
-                if (node->call.callee->kind == NODE_IDENT) {
-                    Symbol *func_sym = scope_lookup(c->current_scope,
-                        node->call.callee->ident.name,
-                        (uint32_t)node->call.callee->ident.name_len);
-                    if (func_sym && func_sym->func_node &&
-                        func_sym->func_node->kind == NODE_FUNC_DECL) {
-                        Node *fdecl = func_sym->func_node;
-                        for (int i = 0; i < fdecl->func_decl.param_count &&
-                             i < node->call.arg_count; i++) {
-                            if (fdecl->func_decl.params[i].is_keep) {
-                                /* keep param: arg must be static/global, not local */
-                                Node *arg_node = node->call.args[i];
-                                if (arg_node->kind == NODE_UNARY &&
-                                    arg_node->unary.op == TOK_AMP &&
-                                    arg_node->unary.operand->kind == NODE_IDENT) {
-                                    Symbol *arg_sym = scope_lookup(c->current_scope,
-                                        arg_node->unary.operand->ident.name,
-                                        (uint32_t)arg_node->unary.operand->ident.name_len);
-                                    if (arg_sym && !arg_sym->is_static) {
-                                        checker_error(c, node->loc.line,
-                                            "argument %d: local variable '%.*s' cannot "
-                                            "satisfy 'keep' parameter — must be static or global",
-                                            i + 1,
-                                            (int)arg_sym->name_len, arg_sym->name);
-                                    }
+                /* keep parameter validation: check call arguments.
+                 * Works for BOTH direct function calls AND function pointer calls
+                 * by using param_keeps on the resolved Type (BUG-277). */
+                if (effective_callee->func_ptr.param_keeps) {
+                    for (int i = 0; i < (int)effective_callee->func_ptr.param_count &&
+                         i < node->call.arg_count; i++) {
+                        if (!effective_callee->func_ptr.param_keeps[i]) continue;
+                        /* keep param: arg must be static/global, not local */
+                        Node *arg_node = node->call.args[i];
+                        if (arg_node->kind == NODE_UNARY &&
+                            arg_node->unary.op == TOK_AMP &&
+                            arg_node->unary.operand->kind == NODE_IDENT) {
+                            Symbol *arg_sym = scope_lookup(c->current_scope,
+                                arg_node->unary.operand->ident.name,
+                                (uint32_t)arg_node->unary.operand->ident.name_len);
+                            if (arg_sym && !arg_sym->is_static) {
+                                bool is_global = scope_lookup_local(c->global_scope,
+                                    arg_sym->name, arg_sym->name_len) != NULL;
+                                if (!is_global) {
+                                    checker_error(c, node->loc.line,
+                                        "argument %d: local variable '%.*s' cannot "
+                                        "satisfy 'keep' parameter — must be static or global",
+                                        i + 1,
+                                        (int)arg_sym->name_len, arg_sym->name);
                                 }
-                                /* BUG-221: also reject local-derived pointers */
-                                if (arg_node->kind == NODE_IDENT) {
-                                    Symbol *arg_sym = scope_lookup(c->current_scope,
-                                        arg_node->ident.name,
-                                        (uint32_t)arg_node->ident.name_len);
-                                    if (arg_sym && arg_sym->is_local_derived) {
-                                        checker_error(c, node->loc.line,
-                                            "argument %d: local-derived pointer '%.*s' cannot "
-                                            "satisfy 'keep' parameter — points to stack memory",
-                                            i + 1,
-                                            (int)arg_sym->name_len, arg_sym->name);
-                                    }
-                                }
+                            }
+                        }
+                        /* BUG-221: also reject local-derived pointers */
+                        if (arg_node->kind == NODE_IDENT) {
+                            Symbol *arg_sym = scope_lookup(c->current_scope,
+                                arg_node->ident.name,
+                                (uint32_t)arg_node->ident.name_len);
+                            if (arg_sym && arg_sym->is_local_derived) {
+                                checker_error(c, node->loc.line,
+                                    "argument %d: local-derived pointer '%.*s' cannot "
+                                    "satisfy 'keep' parameter — points to stack memory",
+                                    i + 1,
+                                    (int)arg_sym->name_len, arg_sym->name);
                             }
                         }
                     }
@@ -3522,6 +3526,19 @@ static void register_decl(Checker *c, Node *node) {
             }
         }
         Type *func_type = type_func_ptr(c->arena, params, pc, ret);
+        /* carry keep flags from ParamDecl to Type */
+        {
+            bool any_keep = false;
+            for (uint32_t i = 0; i < pc; i++) {
+                if (node->func_decl.params[i].is_keep) { any_keep = true; break; }
+            }
+            if (any_keep) {
+                func_type->func_ptr.param_keeps = (bool *)arena_alloc(c->arena, pc * sizeof(bool));
+                for (uint32_t i = 0; i < pc; i++) {
+                    func_type->func_ptr.param_keeps[i] = node->func_decl.params[i].is_keep;
+                }
+            }
+        }
 
         /* check for forward declaration → definition pattern */
         Symbol *existing = scope_lookup_local(c->current_scope,

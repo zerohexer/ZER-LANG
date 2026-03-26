@@ -1475,6 +1475,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-277: `keep` bypass via function pointers
+- **Symptom:** Assigning `store` (with `keep *u32 p`) to `void (*fn)(*u32)` erases keep — `fn(&local)` bypasses check.
+- **Root cause:** `keep` not stored in TYPE_FUNC_PTR. Call-site check only worked for direct function calls via `func_node`.
+- **Fix:** Added `bool *param_keeps` to TYPE_FUNC_PTR. Parser parses `keep` in func ptr params. `type_equals` checks keep mismatch. Call-site validation uses Type's `param_keeps` for both direct and func ptr calls.
+- **Test:** `test_checker_full.c` — keep func to non-keep ptr rejected, keep ptr call with local rejected, keep ptr call with global accepted.
+
 ### BUG-275: `@size` pointer width mismatch on 64-bit targets
 - **Symptom:** `u8[@size(*u32)] buf` creates 4-byte buffer, but `sizeof(*u32)` is 8 on 64-bit.
 - **Root cause:** `compute_type_size` hardcoded pointer=4, slice=8. Constant folder disagrees with GCC.

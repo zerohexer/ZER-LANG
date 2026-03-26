@@ -125,6 +125,7 @@ struct Type {
             Type **params;
             uint32_t param_count;
             Type *ret;
+            bool *param_keeps;  /* per-param keep flags (NULL if none) */
         } func_ptr;
 
         /* TYPE_POOL */

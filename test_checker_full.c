@@ -1485,6 +1485,30 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-277: keep in function pointer types */
+    err("void store(keep *u32 p) { }\n"
+        "u32 main() {\n"
+        "    void (*fn)(*u32) = store;\n"
+        "    return 0;\n"
+        "}",
+        "keep func to non-keep func ptr rejected (type mismatch)");
+    err("void store(keep *u32 p) { }\n"
+        "u32 main() {\n"
+        "    u32 x = 5;\n"
+        "    void (*fn)(keep *u32) = store;\n"
+        "    fn(&x);\n"
+        "    return 0;\n"
+        "}",
+        "keep func ptr call with local arg rejected");
+    ok("u32 g = 99;\n"
+       "void store(keep *u32 p) { }\n"
+       "u32 main() {\n"
+       "    void (*fn)(keep *u32) = store;\n"
+       "    fn(&g);\n"
+       "    return 0;\n"
+       "}",
+       "keep func ptr call with global arg accepted");
+
     /* BUG-275: @size on pointer/slice emits sizeof (target-portable) */
     ok("u8[@size(*u32)] buf;\nu32 main() { return 0; }",
        "@size(*u32) as array size accepted (sizeof-based)");

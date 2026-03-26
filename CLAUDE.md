@@ -720,6 +720,9 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**140. `keep` qualifier carried through function pointer types.**
+`void (*fn)(keep *u32) = store` — keep flags stored per-param in `TYPE_FUNC_PTR` via `param_keeps` array. Parser parses `keep` in func ptr params. `type_equals` checks keep mismatch. Call-site validation works for both direct calls and function pointer calls using the Type's `param_keeps`. (BUG-277)
+
 **138. `@size` on pointer/slice types emits `sizeof()` — target-portable.**
 `u8[@size(*u32)] buf` now emits `uint8_t buf[sizeof(uint32_t*)]` instead of hardcoded `buf[4]`. `compute_type_size` returns `CONST_EVAL_FAIL` for pointer/slice types. Array Type stores `sizeof_type` — emitter uses `emit_array_size()` helper. GCC resolves per target. (BUG-275)
 

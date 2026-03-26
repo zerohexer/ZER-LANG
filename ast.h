@@ -100,8 +100,8 @@ struct TypeNode {
             TypeNode *return_type;
             TypeNode **param_types;
             const char **param_names;   /* NULL if unnamed */
+            bool *param_keeps;          /* per-param keep flags (NULL if none) */
             int param_count;
-            bool has_keep;              /* any param marked keep */
         } func_ptr;
 
         /* TYNODE_POOL: Pool(T, N) */

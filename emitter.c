@@ -619,7 +619,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (hi_node && lo_node) {
                     int64_t hi = eval_const_expr(hi_node);
                     int64_t lo = eval_const_expr(lo_node);
-                    if (hi >= 0 && lo >= 0) {
+                    if (hi != CONST_EVAL_FAIL && lo != CONST_EVAL_FAIL && hi >= 0 && lo >= 0) {
                         int64_t width = hi - lo + 1;
                         if (width >= 64) {
                             emit(e, "~(uint64_t)0");
@@ -652,7 +652,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (hi_node && lo_node) {
                     int64_t hi = eval_const_expr(hi_node);
                     int64_t lo = eval_const_expr(lo_node);
-                    if (hi >= 0 && lo >= 0) {
+                    if (hi != CONST_EVAL_FAIL && lo != CONST_EVAL_FAIL && hi >= 0 && lo >= 0) {
                         int64_t width = hi - lo + 1;
                         if (width >= 64) {
                             emit(e, "~(uint64_t)0");
@@ -1146,7 +1146,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 }
                 int64_t high = eval_const_expr(node->slice.start);
                 int64_t low = eval_const_expr(node->slice.end);
-                int64_t width = (high >= 0 && low >= 0) ? high - low + 1 : -1;
+                int64_t width = (high != CONST_EVAL_FAIL && low != CONST_EVAL_FAIL && high >= 0 && low >= 0) ? high - low + 1 : -1;
                 if (width >= 64) {
                     /* constant full-width — just emit the value (mask is all 1s) */
                     emit(e, "%s", ucast);
@@ -1199,7 +1199,7 @@ static void emit_expr(Emitter *e, Node *node) {
         if (node->slice.start && node->slice.end && !type_is_integer(obj_type)) {
             int64_t sv = eval_const_expr(node->slice.start);
             int64_t ev = eval_const_expr(node->slice.end);
-            if (sv < 0 || ev < 0) slice_needs_runtime_check = true;
+            if (sv == CONST_EVAL_FAIL || ev == CONST_EVAL_FAIL) slice_needs_runtime_check = true;
         }
 
         /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */

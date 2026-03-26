@@ -469,31 +469,35 @@ void ast_print(Node *node, int indent);
  * Supports: int literals, +, -, *, /, %, <<, >>, &, |, unary -.
  * Returns -1 if not a compile-time constant.
  * Used by both checker (type resolution) and emitter (resolve_type_for_emit). */
+/* sentinel for "not a compile-time constant" — INT64_MIN is never a valid
+ * array/pool/ring size and won't appear in real constant expressions. */
+#define CONST_EVAL_FAIL INT64_MIN
+
 static inline int64_t eval_const_expr(Node *n) {
-    if (!n) return -1;
+    if (!n) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_UNARY && n->unary.op == TOK_MINUS) {
         int64_t v = eval_const_expr(n->unary.operand);
-        return v >= 0 ? -v : -1;
+        return v != CONST_EVAL_FAIL ? -v : CONST_EVAL_FAIL;
     }
     if (n->kind == NODE_BINARY) {
         int64_t l = eval_const_expr(n->binary.left);
         int64_t r = eval_const_expr(n->binary.right);
-        if (l < 0 || r < 0) return -1;
+        if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         switch (n->binary.op) {
         case TOK_PLUS:    return l + r;
         case TOK_MINUS:   return l - r;
         case TOK_STAR:    return l * r;
-        case TOK_SLASH:   return r != 0 ? l / r : -1;
-        case TOK_PERCENT: return r != 0 ? l % r : -1;
+        case TOK_SLASH:   return r != 0 ? l / r : CONST_EVAL_FAIL;
+        case TOK_PERCENT: return r != 0 ? l % r : CONST_EVAL_FAIL;
         case TOK_LSHIFT:  return l << r;
         case TOK_RSHIFT:  return l >> r;
         case TOK_AMP:     return l & r;
         case TOK_PIPE:    return l | r;
-        default: return -1;
+        default: return CONST_EVAL_FAIL;
         }
     }
-    return -1;
+    return CONST_EVAL_FAIL;
 }
 
 #endif /* ZER_AST_H */

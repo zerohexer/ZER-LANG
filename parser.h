@@ -12,7 +12,9 @@ typedef struct {
     Arena *arena;           /* arena for AST allocation */
     bool had_error;
     bool panic_mode;        /* suppress cascading errors */
+    bool oom;               /* arena allocation failed — stop parsing */
     const char *file_name;  /* for error messages */
+    int depth;              /* nesting depth for recursion limit */
 } Parser;
 
 /* ---- API ---- */

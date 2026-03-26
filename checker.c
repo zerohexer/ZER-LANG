@@ -412,7 +412,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (tn->array.size_expr) {
             int64_t val = eval_const_expr(tn->array.size_expr);
             /* BUG-199: handle @size(T) as compile-time constant */
-            if (val < 0 && tn->array.size_expr->kind == NODE_INTRINSIC &&
+            if (val == CONST_EVAL_FAIL && tn->array.size_expr->kind == NODE_INTRINSIC &&
                 tn->array.size_expr->intrinsic.name_len == 4 &&
                 memcmp(tn->array.size_expr->intrinsic.name, "size", 4) == 0) {
                 Type *size_of = NULL;
@@ -438,7 +438,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                     }
                 }
             }
-            if (val > 0) {
+            if (val == CONST_EVAL_FAIL) {
+                checker_error(c, tn->loc.line, "array size must be a compile-time constant");
+            } else if (val <= 0) {
+                checker_error(c, tn->loc.line, "array size must be > 0");
+            } else {
                 /* BUG-247: reject sizes that overflow uint32_t (>4GB arrays) */
                 if ((uint64_t)val > UINT32_MAX) {
                     checker_error(c, tn->loc.line,
@@ -446,10 +450,6 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                         (long long)val);
                 }
                 size = (uint32_t)val;
-            } else if (val == 0) {
-                checker_error(c, tn->loc.line, "array size must be > 0");
-            } else {
-                checker_error(c, tn->loc.line, "array size must be a compile-time constant");
             }
         }
         return type_array(c->arena, elem, size);
@@ -1897,7 +1897,7 @@ static Type *check_expr(Checker *c, Node *node) {
             !type_is_integer(obj)) {
             int64_t start_val = eval_const_expr(node->slice.start);
             int64_t end_val = eval_const_expr(node->slice.end);
-            if (start_val >= 0 && end_val >= 0 && start_val > end_val) {
+            if (start_val != CONST_EVAL_FAIL && end_val != CONST_EVAL_FAIL && start_val > end_val) {
                 checker_error(c, node->loc.line,
                     "slice start (%lld) is greater than end (%lld)",
                     (long long)start_val, (long long)end_val);
@@ -1908,7 +1908,7 @@ static Type *check_expr(Checker *c, Node *node) {
         if (obj->kind == TYPE_ARRAY) {
             if (node->slice.end) {
                 int64_t end_val = eval_const_expr(node->slice.end);
-                if (end_val >= 0 && (uint64_t)end_val > obj->array.size) {
+                if (end_val != CONST_EVAL_FAIL && end_val >= 0 && (uint64_t)end_val > obj->array.size) {
                     checker_error(c, node->loc.line,
                         "slice end %lld exceeds array size %llu",
                         (long long)end_val, (unsigned long long)obj->array.size);
@@ -1916,7 +1916,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             if (node->slice.start) {
                 int64_t start_val = eval_const_expr(node->slice.start);
-                if (start_val >= 0 && (uint64_t)start_val > obj->array.size) {
+                if (start_val != CONST_EVAL_FAIL && start_val >= 0 && (uint64_t)start_val > obj->array.size) {
                     checker_error(c, node->loc.line,
                         "slice start %lld exceeds array size %llu",
                         (long long)start_val, (unsigned long long)obj->array.size);
@@ -1930,7 +1930,7 @@ static Type *check_expr(Checker *c, Node *node) {
             /* validate constant indices are within type width */
             if (node->slice.start) {
                 int64_t hi = eval_const_expr(node->slice.start);
-                if (hi >= 0 && hi >= type_width(obj)) {
+                if (hi != CONST_EVAL_FAIL && hi >= 0 && hi >= type_width(obj)) {
                     checker_error(c, node->loc.line,
                         "bit index %lld out of range for %d-bit type '%s'",
                         (long long)hi, type_width(obj), type_name(obj));

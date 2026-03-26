@@ -594,9 +594,9 @@ int main(void) {
     test_nested_control_flow();
     test_full_programs();
 
-    /* BUG-084: switch arm with 17+ values must error, not overflow */
-    printf("[BUG-084: switch arm overflow]\n");
-    expect_fail(
+    /* BUG-084: switch arm with 17+ values — now dynamic, no overflow */
+    printf("[BUG-084: switch arm many values (dynamic)]\n");
+    expect_ok(
         "void f() {\n"
         "    u32 x = 5;\n"
         "    switch (x) {\n"
@@ -604,7 +604,7 @@ int main(void) {
         "        default => { }\n"
         "    }\n"
         "}\n",
-        "17 switch arm values exceeds max 16");
+        "17 switch arm values accepted (dynamic arrays)");
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

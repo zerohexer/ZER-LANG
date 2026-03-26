@@ -71,6 +71,7 @@ static Token peek(Parser *p) {
 
 static Node *new_node(Parser *p, NodeKind kind) {
     Node *n = (Node *)arena_alloc(p->arena, sizeof(Node));
+    if (!n) { p->oom = true; p->had_error = true; static Node oom_node = {0}; return &oom_node; }
     n->kind = kind;
     n->loc.line = p->previous.line;
     n->loc.file = p->file_name;
@@ -79,10 +80,18 @@ static Node *new_node(Parser *p, NodeKind kind) {
 
 static TypeNode *new_type_node(Parser *p, TypeNodeKind kind) {
     TypeNode *t = (TypeNode *)arena_alloc(p->arena, sizeof(TypeNode));
+    if (!t) { p->oom = true; p->had_error = true; static TypeNode oom_tn = {0}; return &oom_tn; }
     t->kind = kind;
     t->loc.line = p->previous.line;
     t->loc.file = p->file_name;
     return t;
+}
+
+/* safe arena alloc — sets oom flag on failure */
+static void *parser_alloc(Parser *p, size_t size) {
+    void *ptr = arena_alloc(p->arena, size);
+    if (!ptr) { p->oom = true; p->had_error = true; }
+    return ptr;
 }
 
 /* allocate array in arena */
@@ -116,6 +125,22 @@ static TypeNode *parse_type(Parser *p);
  * Returns TYNODE_FUNC_PTR with name stored in func_ptr.param_names[0]
  * if a name was present (for struct fields / var decls).
  */
+
+/* Helper: check if current position is '(' '*' — the start of a function pointer.
+ * Does NOT consume tokens — caller must save/restore if needed. */
+static bool is_func_ptr_start(Parser *p) {
+    if (!check(p, TOK_LPAREN)) return false;
+    Scanner saved = *p->scanner;
+    Token saved_cur = p->current;
+    Token saved_prev = p->previous;
+    advance(p); /* consume '(' */
+    bool result = check(p, TOK_STAR);
+    *p->scanner = saved;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return result;
+}
+
 static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
                                            const char **out_name,
                                            size_t *out_name_len) {
@@ -134,15 +159,25 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
     /* parameter list */
     consume(p, TOK_LPAREN, "expected '(' for function pointer parameters");
 
-    TypeNode *param_types[32];
-    const char *param_names[32];
+    TypeNode *stack_pt[8];
+    const char *stack_pn[8];
+    TypeNode **param_types = stack_pt;
+    const char **param_names = stack_pn;
+    int fpp_cap = 8;
     int param_count = 0;
 
     if (!check(p, TOK_RPAREN)) {
         do {
-            if (param_count >= 32) {
-                error(p, "too many function pointer parameters");
-                break;
+            if (param_count >= fpp_cap) {
+                int new_cap = fpp_cap * 2;
+                TypeNode **new_types = (TypeNode **)parser_alloc(p, new_cap * sizeof(TypeNode *));
+                const char **new_names = (const char **)parser_alloc(p, new_cap * sizeof(const char *));
+                if (!new_types || !new_names) break;
+                memcpy(new_types, param_types, param_count * sizeof(TypeNode *));
+                memcpy(new_names, param_names, param_count * sizeof(const char *));
+                param_types = new_types;
+                param_names = new_names;
+                fpp_cap = new_cap;
             }
             param_types[param_count] = parse_type(p);
             /* optional param name */
@@ -533,13 +568,19 @@ static Node *parse_primary(Parser *p) {
         }
 
         /* parse expression arguments */
-        Node *args[16];
+        Node *stack_iargs[8];
+        Node **args = stack_iargs;
+        int arg_cap = 8;
         int arg_count = 0;
         if (!check(p, TOK_RPAREN)) {
             do {
-                if (arg_count >= 16) {
-                    error(p, "too many intrinsic arguments");
-                    break;
+                if (arg_count >= arg_cap) {
+                    int new_cap = arg_cap * 2;
+                    Node **new_args = (Node **)parser_alloc(p, new_cap * sizeof(Node *));
+                    if (!new_args) break;
+                    memcpy(new_args, args, arg_count * sizeof(Node *));
+                    args = new_args;
+                    arg_cap = new_cap;
                 }
                 args[arg_count++] = parse_expression(p);
             } while (match(p, TOK_COMMA));
@@ -585,13 +626,19 @@ static Node *parse_postfix(Parser *p, Node *left) {
         if (match(p, TOK_LPAREN)) {
             Node *n = new_node(p, NODE_CALL);
             n->call.callee = left;
-            Node *args[64];
+            Node *stack_args[16];
+            Node **args = stack_args;
+            int arg_cap = 16;
             int arg_count = 0;
             if (!check(p, TOK_RPAREN)) {
                 do {
-                    if (arg_count >= 64) {
-                        error(p, "too many function arguments");
-                        break;
+                    if (arg_count >= arg_cap) {
+                        int new_cap = arg_cap * 2;
+                        Node **new_args = (Node **)parser_alloc(p, new_cap * sizeof(Node *));
+                        if (!new_args) break;
+                        memcpy(new_args, args, arg_count * sizeof(Node *));
+                        args = new_args;
+                        arg_cap = new_cap;
                     }
                     args[arg_count++] = parse_expression(p);
                 } while (match(p, TOK_COMMA));
@@ -739,19 +786,45 @@ static Node *parse_block(Parser *p) {
     consume(p, TOK_LBRACE, "expected '{'");
     Node *n = new_node(p, NODE_BLOCK);
 
-    Node *stmts[1024];
+    if (++p->depth > 64) {
+        error(p, "nesting too deep (limit 64)");
+        /* skip to matching '}' */
+        int brace_depth = 1;
+        while (brace_depth > 0 && !check(p, TOK_EOF)) {
+            if (check(p, TOK_LBRACE)) brace_depth++;
+            else if (check(p, TOK_RBRACE)) brace_depth--;
+            if (brace_depth > 0) advance(p);
+        }
+        if (check(p, TOK_RBRACE)) advance(p);
+        p->depth--;
+        return n;
+    }
+
+    Node *stack_stmts[32];
+    Node **stmts = stack_stmts;
+    int cap = 32;
     int count = 0;
 
-    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-        if (count >= 1024) {
-            error(p, "too many statements in block");
-            break;
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        if (count >= cap) {
+            int new_cap = cap * 2;
+            Node **new_stmts = (Node **)parser_alloc(p, new_cap * sizeof(Node *));
+            if (!new_stmts) break;
+            memcpy(new_stmts, stmts, count * sizeof(Node *));
+            stmts = new_stmts;
+            cap = new_cap;
         }
+        Token before = p->current;
         stmts[count++] = parse_statement(p);
+        /* safety: if parse_statement didn't advance, skip token to avoid infinite loop */
+        if (p->current.start == before.start && p->current.type == before.type) {
+            advance(p);
+        }
     }
 
     consume(p, TOK_RBRACE, "expected '}'");
 
+    p->depth--;
     n->block.stmt_count = count;
     if (count > 0) {
         n->block.stmts = (Node **)arena_alloc(p->arena, count * sizeof(Node *));
@@ -780,11 +853,10 @@ static Node *parse_var_decl(Parser *p, bool is_const, bool is_static, bool is_vo
     TypeNode *type = parse_type(p);
 
     /* function pointer local: rettype (*name)(params...) or ?rettype (*name)(params...) */
-    if (check(p, TOK_LPAREN)) {
-        Token saved = p->current;
-        advance(p);
-        if (check(p, TOK_STAR)) {
-            advance(p);
+    if (is_func_ptr_start(p)) {
+        advance(p); /* consume '(' */
+        advance(p); /* consume '*' */
+        {
             /* if type is ?T, unwrap for func ptr return type, wrap result in optional */
             bool is_optional_fptr = (type->kind == TYNODE_OPTIONAL);
             TypeNode *ret_type = is_optional_fptr ? type->optional.inner : type;
@@ -809,7 +881,6 @@ static Node *parse_var_decl(Parser *p, bool is_const, bool is_static, bool is_vo
             consume(p, TOK_SEMICOLON, "expected ';' after variable declaration");
             return n;
         }
-        p->current = saved;
     }
 
     consume(p, TOK_IDENT, "expected variable name");
@@ -921,13 +992,19 @@ static Node *parse_switch_stmt(Parser *p) {
     consume(p, TOK_RPAREN, "expected ')' after switch expression");
     consume(p, TOK_LBRACE, "expected '{'");
 
-    SwitchArm arms[128];
+    SwitchArm stack_arms[32];
+    SwitchArm *arms = stack_arms;
+    int arm_cap = 32;
     int arm_count = 0;
 
-    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-        if (arm_count >= 128) {
-            error(p, "too many switch arms");
-            break;
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        if (arm_count >= arm_cap) {
+            int new_cap = arm_cap * 2;
+            SwitchArm *new_arms = (SwitchArm *)parser_alloc(p, new_cap * sizeof(SwitchArm));
+            if (!new_arms) break;
+            memcpy(new_arms, arms, arm_count * sizeof(SwitchArm));
+            arms = new_arms;
+            arm_cap = new_cap;
         }
         SwitchArm *arm = &arms[arm_count++];
         memset(arm, 0, sizeof(SwitchArm));
@@ -937,12 +1014,18 @@ static Node *parse_switch_stmt(Parser *p) {
             arm->is_default = true;
         } else {
             /* parse match values: .variant or value, possibly comma-separated */
-            Node *values[16];
+            Node *stack_vals[16];
+            Node **values = stack_vals;
+            int val_cap = 16;
             int val_count = 0;
             do {
-                if (val_count >= 16) {
-                    error(p, "too many values in switch arm (max 16)");
-                    break;
+                if (val_count >= val_cap) {
+                    int new_cap = val_cap * 2;
+                    Node **new_vals = (Node **)parser_alloc(p, new_cap * sizeof(Node *));
+                    if (!new_vals) break;
+                    memcpy(new_vals, values, val_count * sizeof(Node *));
+                    values = new_vals;
+                    val_cap = new_cap;
                 }
                 if (match(p, TOK_DOT)) {
                     arm->is_enum_dot = true;
@@ -1203,13 +1286,19 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
 
     consume(p, TOK_LBRACE, "expected '{' after struct name");
 
-    FieldDecl fields[128];
+    FieldDecl stack_fields[32];
+    FieldDecl *fields = stack_fields;
+    int field_cap = 32;
     int count = 0;
 
-    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-        if (count >= 128) {
-            error(p, "too many struct fields");
-            break;
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        if (count >= field_cap) {
+            int new_cap = field_cap * 2;
+            FieldDecl *new_fields = (FieldDecl *)parser_alloc(p, new_cap * sizeof(FieldDecl));
+            if (!new_fields) break;
+            memcpy(new_fields, fields, count * sizeof(FieldDecl));
+            fields = new_fields;
+            field_cap = new_cap;
         }
         FieldDecl *f = &fields[count++];
         memset(f, 0, sizeof(FieldDecl));
@@ -1219,30 +1308,25 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
         TypeNode *type = parse_type(p);
 
         /* function pointer field: rettype (*name)(params...) or ?rettype (*name)(params...) */
-        if (check(p, TOK_LPAREN)) {
-            Token saved = p->current;
+        if (is_func_ptr_start(p)) {
             advance(p); /* consume '(' */
-            if (check(p, TOK_STAR)) {
-                advance(p); /* consume '*' */
-                bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
-                TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
-                const char *fname = NULL;
-                size_t fname_len = 0;
-                type = parse_func_ptr_after_ret(p, fp_ret, &fname, &fname_len);
-                if (is_opt_fp) {
-                    TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                    opt->optional.inner = type;
-                    type = opt;
-                }
-                f->type = type;
-                f->name = fname;
-                f->name_len = fname_len;
-                if (!fname) error(p, "expected name in function pointer field");
-                consume(p, TOK_SEMICOLON, "expected ';' after field");
-                continue;
+            advance(p); /* consume '*' */
+            bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
+            TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
+            const char *fname = NULL;
+            size_t fname_len = 0;
+            type = parse_func_ptr_after_ret(p, fp_ret, &fname, &fname_len);
+            if (is_opt_fp) {
+                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                opt->optional.inner = type;
+                type = opt;
             }
-            /* not a func ptr — backtrack */
-            p->current = saved;
+            f->type = type;
+            f->name = fname;
+            f->name_len = fname_len;
+            if (!fname) error(p, "expected name in function pointer field");
+            consume(p, TOK_SEMICOLON, "expected ';' after field");
+            continue;
         }
 
         f->type = type;
@@ -1270,13 +1354,19 @@ static Node *parse_enum_decl(Parser *p) {
 
     consume(p, TOK_LBRACE, "expected '{' after enum name");
 
-    EnumVariant variants[256];
+    EnumVariant stack_variants[64];
+    EnumVariant *variants = stack_variants;
+    int var_cap = 64;
     int count = 0;
 
-    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-        if (count >= 256) {
-            error(p, "too many enum variants");
-            break;
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        if (count >= var_cap) {
+            int new_cap = var_cap * 2;
+            EnumVariant *new_v = (EnumVariant *)parser_alloc(p, new_cap * sizeof(EnumVariant));
+            if (!new_v) break;
+            memcpy(new_v, variants, count * sizeof(EnumVariant));
+            variants = new_v;
+            var_cap = new_cap;
         }
         EnumVariant *v = &variants[count++];
         memset(v, 0, sizeof(EnumVariant));
@@ -1311,13 +1401,19 @@ static Node *parse_union_decl(Parser *p) {
 
     consume(p, TOK_LBRACE, "expected '{' after union name");
 
-    UnionVariant variants[128];
+    UnionVariant stack_uvariants[32];
+    UnionVariant *variants = stack_uvariants;
+    int uvar_cap = 32;
     int count = 0;
 
-    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-        if (count >= 128) {
-            error(p, "too many union variants");
-            break;
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        if (count >= uvar_cap) {
+            int new_cap = uvar_cap * 2;
+            UnionVariant *new_v = (UnionVariant *)parser_alloc(p, new_cap * sizeof(UnionVariant));
+            if (!new_v) break;
+            memcpy(new_v, variants, count * sizeof(UnionVariant));
+            variants = new_v;
+            uvar_cap = new_cap;
         }
         UnionVariant *v = &variants[count++];
         memset(v, 0, sizeof(UnionVariant));
@@ -1345,11 +1441,10 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
     TypeNode *type = parse_type(p);
 
     /* function pointer declaration: type (*name)(params...) or ?type (*name)(params...) */
-    if (check(p, TOK_LPAREN)) {
-        Token saved = p->current;
+    if (is_func_ptr_start(p)) {
         advance(p); /* consume '(' */
-        if (check(p, TOK_STAR)) {
-            advance(p); /* consume '*' */
+        advance(p); /* consume '*' */
+        {
             bool is_optional_fptr = (type->kind == TYNODE_OPTIONAL);
             TypeNode *ret_type = is_optional_fptr ? type->optional.inner : type;
             const char *fpname = NULL;
@@ -1375,8 +1470,6 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
             consume(p, TOK_SEMICOLON, "expected ';' after function pointer declaration");
             return n;
         }
-        /* not a func ptr — backtrack */
-        p->current = saved;
     }
 
     consume(p, TOK_IDENT, "expected name");
@@ -1391,14 +1484,20 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
         n->func_decl.name_len = name_len;
         n->func_decl.is_static = is_static;
 
-        ParamDecl params[32];
+        ParamDecl stack_params[16];
+        ParamDecl *params = stack_params;
+        int param_cap = 16;
         int param_count = 0;
 
         if (!check(p, TOK_RPAREN)) {
             do {
-                if (param_count >= 32) {
-                    error(p, "too many function parameters");
-                    break;
+                if (param_count >= param_cap) {
+                    int new_cap = param_cap * 2;
+                    ParamDecl *new_p = (ParamDecl *)parser_alloc(p, new_cap * sizeof(ParamDecl));
+                    if (!new_p) break;
+                    memcpy(new_p, params, param_count * sizeof(ParamDecl));
+                    params = new_p;
+                    param_cap = new_cap;
                 }
                 ParamDecl *param = &params[param_count++];
                 memset(param, 0, sizeof(ParamDecl));
@@ -1407,27 +1506,23 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
                 param->type = parse_type(p);
 
                 /* function pointer parameter: rettype (*name)(params...) or ?rettype (*name)(params...) */
-                if (check(p, TOK_LPAREN)) {
-                    Token saved = p->current;
-                    advance(p);
-                    if (check(p, TOK_STAR)) {
-                        advance(p);
-                        bool is_opt_fp = (param->type->kind == TYNODE_OPTIONAL);
-                        TypeNode *fp_ret = is_opt_fp ? param->type->optional.inner : param->type;
-                        const char *fpname = NULL;
-                        size_t fpname_len = 0;
-                        param->type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
-                        if (is_opt_fp) {
-                            TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                            opt->optional.inner = param->type;
-                            param->type = opt;
-                        }
-                        param->name = fpname;
-                        param->name_len = fpname_len;
-                        if (!fpname) error(p, "expected name in function pointer parameter");
-                        goto param_done;
+                if (is_func_ptr_start(p)) {
+                    advance(p); /* consume '(' */
+                    advance(p); /* consume '*' */
+                    bool is_opt_fp = (param->type->kind == TYNODE_OPTIONAL);
+                    TypeNode *fp_ret = is_opt_fp ? param->type->optional.inner : param->type;
+                    const char *fpname = NULL;
+                    size_t fpname_len = 0;
+                    param->type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
+                    if (is_opt_fp) {
+                        TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                        opt->optional.inner = param->type;
+                        param->type = opt;
                     }
-                    p->current = saved;
+                    param->name = fpname;
+                    param->name_len = fpname_len;
+                    if (!fpname) error(p, "expected name in function pointer parameter");
+                    goto param_done;
                 }
 
                 consume(p, TOK_IDENT, "expected parameter name");
@@ -1513,30 +1608,26 @@ static Node *parse_declaration(Parser *p) {
         consume(p, TOK_TYPEDEF, "expected 'typedef' after 'distinct'");
         TypeNode *type = parse_type(p);
         /* function pointer distinct typedef: distinct typedef rettype (*Name)(params); */
-        if (check(p, TOK_LPAREN)) {
-            Token saved = p->current;
-            advance(p);
-            if (check(p, TOK_STAR)) {
-                advance(p);
-                bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
-                TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
-                const char *fpname = NULL;
-                size_t fpname_len = 0;
-                type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
-                if (is_opt_fp) {
-                    TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                    opt->optional.inner = type;
-                    type = opt;
-                }
-                Node *n = new_node(p, NODE_TYPEDEF);
-                n->typedef_decl.type = type;
-                n->typedef_decl.name = fpname;
-                n->typedef_decl.name_len = fpname_len;
-                n->typedef_decl.is_distinct = true;
-                consume(p, TOK_SEMICOLON, "expected ';' after typedef");
-                return n;
+        if (is_func_ptr_start(p)) {
+            advance(p); /* consume '(' */
+            advance(p); /* consume '*' */
+            bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
+            TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
+            const char *fpname = NULL;
+            size_t fpname_len = 0;
+            type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
+            if (is_opt_fp) {
+                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                opt->optional.inner = type;
+                type = opt;
             }
-            p->current = saved;
+            Node *n = new_node(p, NODE_TYPEDEF);
+            n->typedef_decl.type = type;
+            n->typedef_decl.name = fpname;
+            n->typedef_decl.name_len = fpname_len;
+            n->typedef_decl.is_distinct = true;
+            consume(p, TOK_SEMICOLON, "expected ';' after typedef");
+            return n;
         }
         consume(p, TOK_IDENT, "expected type alias name");
         Node *n = new_node(p, NODE_TYPEDEF);
@@ -1550,30 +1641,26 @@ static Node *parse_declaration(Parser *p) {
     if (match(p, TOK_TYPEDEF)) {
         TypeNode *type = parse_type(p);
         /* function pointer typedef: typedef rettype (*Name)(params); */
-        if (check(p, TOK_LPAREN)) {
-            Token saved = p->current;
-            advance(p);
-            if (check(p, TOK_STAR)) {
-                advance(p);
-                bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
-                TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
-                const char *fpname = NULL;
-                size_t fpname_len = 0;
-                type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
-                if (is_opt_fp) {
-                    TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                    opt->optional.inner = type;
-                    type = opt;
-                }
-                Node *n = new_node(p, NODE_TYPEDEF);
-                n->typedef_decl.type = type;
-                n->typedef_decl.name = fpname;
-                n->typedef_decl.name_len = fpname_len;
-                n->typedef_decl.is_distinct = false;
-                consume(p, TOK_SEMICOLON, "expected ';' after typedef");
-                return n;
+        if (is_func_ptr_start(p)) {
+            advance(p); /* consume '(' */
+            advance(p); /* consume '*' */
+            bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
+            TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
+            const char *fpname = NULL;
+            size_t fpname_len = 0;
+            type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
+            if (is_opt_fp) {
+                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+                opt->optional.inner = type;
+                type = opt;
             }
-            p->current = saved;
+            Node *n = new_node(p, NODE_TYPEDEF);
+            n->typedef_decl.type = type;
+            n->typedef_decl.name = fpname;
+            n->typedef_decl.name_len = fpname_len;
+            n->typedef_decl.is_distinct = false;
+            consume(p, TOK_SEMICOLON, "expected ';' after typedef");
+            return n;
         }
         consume(p, TOK_IDENT, "expected type alias name");
         Node *n = new_node(p, NODE_TYPEDEF);
@@ -1635,23 +1722,35 @@ void parser_init(Parser *p, Scanner *scanner, Arena *arena, const char *file_nam
     p->arena = arena;
     p->had_error = false;
     p->panic_mode = false;
+    p->oom = false;
     p->file_name = file_name;
+    p->depth = 0;
     advance(p); /* prime the first token */
 }
 
 Node *parse_file(Parser *p) {
     Node *file_node = new_node(p, NODE_FILE);
 
-    Node *decls[1024];
+    Node *stack_decls[64];
+    Node **decls = stack_decls;
+    int cap = 64;
     int count = 0;
 
-    while (!check(p, TOK_EOF)) {
-        if (count >= 1024) {
-            error(p, "too many top-level declarations");
-            break;
+    while (!check(p, TOK_EOF) && !p->oom) {
+        if (count >= cap) {
+            int new_cap = cap * 2;
+            Node **new_decls = (Node **)parser_alloc(p, new_cap * sizeof(Node *));
+            if (!new_decls) break;
+            memcpy(new_decls, decls, count * sizeof(Node *));
+            decls = new_decls;
+            cap = new_cap;
         }
         p->panic_mode = false;
+        Token before = p->current;
         decls[count++] = parse_declaration(p);
+        if (p->current.start == before.start && p->current.type == before.type) {
+            advance(p);
+        }
     }
 
     file_node->file.decl_count = count;

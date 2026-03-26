@@ -31,7 +31,7 @@ static int fuzz_one(const char *source, const char *label, int run_check) {
     parser_init(&parser, &scanner, &arena, "fuzz");
     Node *file = parse_file(&parser);
 
-    if (run_check && file && file->kind == NODE_FILE) {
+    if (run_check && file && file->kind == NODE_FILE && !parser.oom) {
         Checker checker;
         checker_init(&checker, &arena, "fuzz");
         checker_check(&checker, file);

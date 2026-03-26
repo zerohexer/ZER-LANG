@@ -1223,7 +1223,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* const laundering: reject const → mutable assignment for ptr/slice */
+        /* const/volatile laundering: reject qualified → unqualified assignment */
         if (node->assign.op == TOK_EQ && target && value) {
             if (target->kind == TYPE_POINTER && value->kind == TYPE_POINTER &&
                 value->pointer.is_const && !target->pointer.is_const) {
@@ -1234,6 +1234,34 @@ static Type *check_expr(Checker *c, Node *node) {
                 value->slice.is_const && !target->slice.is_const) {
                 checker_error(c, node->loc.line,
                     "cannot assign const slice to mutable — would allow writing to read-only memory");
+            }
+            /* BUG-282: volatile pointer → non-volatile assignment */
+            if (target->kind == TYPE_POINTER && value->kind == TYPE_POINTER &&
+                !target->pointer.is_volatile) {
+                bool val_volatile = value->pointer.is_volatile;
+                if (!val_volatile && node->assign.value->kind == NODE_IDENT) {
+                    Symbol *vs = scope_lookup(c->current_scope,
+                        node->assign.value->ident.name,
+                        (uint32_t)node->assign.value->ident.name_len);
+                    if (vs && vs->is_volatile) val_volatile = true;
+                }
+                /* check target too — if target sym is volatile, it's fine */
+                bool tgt_volatile = target->pointer.is_volatile;
+                if (!tgt_volatile) {
+                    Node *tr = node->assign.target;
+                    while (tr && (tr->kind == NODE_FIELD || tr->kind == NODE_INDEX))
+                        tr = tr->kind == NODE_FIELD ? tr->field.object : tr->index_expr.object;
+                    if (tr && tr->kind == NODE_IDENT) {
+                        Symbol *ts = scope_lookup(c->current_scope,
+                            tr->ident.name, (uint32_t)tr->ident.name_len);
+                        if (ts && ts->is_volatile) tgt_volatile = true;
+                    }
+                }
+                if (val_volatile && !tgt_volatile) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign volatile pointer to non-volatile — "
+                        "writes may be optimized away");
+                }
             }
         }
 
@@ -2474,15 +2502,22 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot initialize mutable pointer from const — "
                         "would allow writing to read-only memory");
                 }
-                /* BUG-197: volatile pointer → non-volatile drops volatile qualifier.
-                 * &volatile_var yields a volatile pointer (is_volatile on type).
-                 * Target must also be volatile (var_decl.is_volatile or type.is_volatile). */
+                /* BUG-197/282: volatile pointer → non-volatile drops volatile qualifier.
+                 * Check both type-level (pointer.is_volatile) and symbol-level (sym->is_volatile). */
                 if (type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER &&
-                    init_type->pointer.is_volatile &&
                     !type->pointer.is_volatile && !node->var_decl.is_volatile) {
-                    checker_error(c, node->loc.line,
-                        "cannot initialize non-volatile pointer from volatile — "
-                        "writes through non-volatile pointer may be optimized away");
+                    bool src_volatile = init_type->pointer.is_volatile;
+                    if (!src_volatile && node->var_decl.init->kind == NODE_IDENT) {
+                        Symbol *vs = scope_lookup(c->current_scope,
+                            node->var_decl.init->ident.name,
+                            (uint32_t)node->var_decl.init->ident.name_len);
+                        if (vs && vs->is_volatile) src_volatile = true;
+                    }
+                    if (src_volatile) {
+                        checker_error(c, node->loc.line,
+                            "cannot initialize non-volatile pointer from volatile — "
+                            "writes through non-volatile pointer may be optimized away");
+                    }
                 }
                 if (type->kind == TYPE_SLICE && init_type->kind == TYPE_SLICE &&
                     init_type->slice.is_const && !type->slice.is_const) {
@@ -3052,7 +3087,7 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* const laundering: reject returning const ptr/slice as mutable */
+            /* const/volatile laundering: reject returning qualified ptr as unqualified */
             if (ret_type && c->current_func_ret) {
                 if (ret_type->kind == TYPE_POINTER && c->current_func_ret->kind == TYPE_POINTER &&
                     ret_type->pointer.is_const && !c->current_func_ret->pointer.is_const) {
@@ -3063,6 +3098,23 @@ static void check_stmt(Checker *c, Node *node) {
                     ret_type->slice.is_const && !c->current_func_ret->slice.is_const) {
                     checker_error(c, node->loc.line,
                         "cannot return const slice as mutable — would allow writing to read-only memory");
+                }
+                /* BUG-281: volatile stripping on return */
+                if (ret_type->kind == TYPE_POINTER && c->current_func_ret->kind == TYPE_POINTER &&
+                    !c->current_func_ret->pointer.is_volatile) {
+                    /* check both type-level and symbol-level volatile */
+                    bool ret_volatile = ret_type->pointer.is_volatile;
+                    if (!ret_volatile && node->ret.expr->kind == NODE_IDENT) {
+                        Symbol *rs = scope_lookup(c->current_scope,
+                            node->ret.expr->ident.name,
+                            (uint32_t)node->ret.expr->ident.name_len);
+                        if (rs && rs->is_volatile) ret_volatile = true;
+                    }
+                    if (ret_volatile) {
+                        checker_error(c, node->loc.line,
+                            "cannot return volatile pointer as non-volatile — "
+                            "writes through result may be optimized away");
+                    }
                 }
             }
 

@@ -720,6 +720,12 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**144. Volatile pointer stripping on return rejected.**
+`return volatile_ptr` as non-volatile `*T` return type now caught. Checks both type-level and symbol-level volatile on the return expression. (BUG-281)
+
+**145. Volatile pointer stripping on init/assign rejected.**
+`*u32 p = volatile_ptr` and `p = volatile_ptr` now caught. Checks symbol-level `is_volatile` on source ident when type-level `pointer.is_volatile` is not set. (BUG-282)
+
 **141. Volatile array var-decl init uses byte loop.**
 `volatile u8[4] hw = src` used `memcpy` — doesn't respect volatile. Now uses byte-by-byte loop when `var_decl.is_volatile` is set. Same pattern as BUG-273 (array assignment). (BUG-278)
 

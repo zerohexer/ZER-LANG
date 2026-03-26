@@ -480,6 +480,8 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 109. **Volatile if-unwrap copy (BUG-272)** — Checks if condition ident's symbol has `is_volatile`. If so, emits `volatile` before the typed copy. Uses `emit_type_and_name` for correct func ptr name placement.
 110. **Volatile array assign byte loop (BUG-273)** — Array assignment checks target root symbol for `is_volatile`. If volatile, emits `for(_i) vd[_i] = vs[_i]` byte loop instead of memcpy. Same pattern as @cstr volatile (BUG-223).
 111. **Volatile union capture pointer (BUG-274)** — `sw_volatile` flag detected from switch expression root symbol. When set, mutable capture `|*v|` emits `volatile T *v` instead of `T *v`.
+119. **Volatile return stripping (BUG-281)** — NODE_RETURN checks if return expression is volatile (type-level or symbol-level) and function return type is non-volatile pointer. Same pattern as const return check.
+120. **Volatile init/assign stripping (BUG-282)** — NODE_VAR_DECL and NODE_ASSIGN check source ident's `is_volatile` symbol flag when type-level `pointer.is_volatile` is not set. Assignment also checks target symbol volatile to allow volatile-to-volatile.
 116. **Volatile array var-decl init byte loop (BUG-278)** — NODE_VAR_DECL array init path checks `var_decl.is_volatile`. If volatile, emits byte-by-byte loop instead of memcpy.
 117. **`is_null_sentinel` recursive distinct unwrap (BUG-279)** — Changed from single `if (TYPE_DISTINCT)` to `while (TYPE_DISTINCT)` loop. Handles `distinct typedef (distinct typedef *T)` chains at any depth.
 118. **`@size(usize)` target-dependent (BUG-280)** — `compute_type_size` returns `CONST_EVAL_FAIL` for TYPE_USIZE (before `type_width` which hardcodes 32). Emitter uses `sizeof(size_t)`.

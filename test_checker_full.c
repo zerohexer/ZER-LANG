@@ -1485,6 +1485,30 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-281: volatile stripping on return */
+    err("*u32 wash(volatile *u32 p) {\n"
+        "    return p;\n"
+        "}\nu32 main() { return 0; }",
+        "return volatile ptr as non-volatile rejected");
+    /* Note: volatile on function return types is not supported syntax.
+     * The fix prevents returning volatile as non-volatile. */
+
+    /* BUG-282: volatile stripping on init/assign */
+    err("volatile u32 hw = 0;\n"
+        "void f() {\n"
+        "    volatile *u32 vp = &hw;\n"
+        "    *u32 p = vp;\n"
+        "}",
+        "init non-volatile ptr from volatile rejected");
+    err("volatile u32 hw = 0;\n"
+        "u32 dummy = 0;\n"
+        "*u32 p = &dummy;\n"
+        "void f() {\n"
+        "    volatile *u32 vp = &hw;\n"
+        "    p = vp;\n"
+        "}",
+        "assign volatile ptr to non-volatile rejected");
+
     /* BUG-279: nested distinct null-sentinel */
     ok("distinct typedef *u32 Ptr1;\n"
        "distinct typedef Ptr1 Ptr2;\n"

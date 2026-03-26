@@ -1475,6 +1475,18 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-281: Volatile pointer stripping on return
+- **Symptom:** `*u32 wash(volatile *u32 p) { return p; }` compiles — volatile stripped silently.
+- **Root cause:** NODE_RETURN had const check but no volatile check.
+- **Fix:** After const check, check if return expr is volatile (type-level or symbol-level) and func return type is non-volatile.
+- **Test:** `test_checker_full.c` — volatile return as non-volatile rejected.
+
+### BUG-282: Volatile pointer stripping on init/assign
+- **Symptom:** `*u32 p = vp` where vp is `volatile *u32` compiles — volatile stripped.
+- **Root cause:** Var-decl init checked `pointer.is_volatile` on Type but missed symbol-level `is_volatile`. Assignment had no volatile check.
+- **Fix:** Both init and assign paths check source ident's `sym->is_volatile`. Assignment also checks target symbol.
+- **Test:** `test_checker_full.c` — init and assign volatile-to-non-volatile rejected.
+
 ### BUG-278: Volatile array var-decl init uses memcpy
 - **Symptom:** `volatile u8[4] hw = src` emits `memcpy(hw, src, sizeof(hw))` — volatile stripped.
 - **Root cause:** Var-decl array init path always used memcpy regardless of volatile.

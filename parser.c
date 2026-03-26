@@ -998,6 +998,7 @@ static Node *parse_switch_stmt(Parser *p) {
     int arm_count = 0;
 
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        Token before = p->current;
         if (arm_count >= arm_cap) {
             int new_cap = arm_cap * 2;
             SwitchArm *new_arms = (SwitchArm *)parser_alloc(p, new_cap * sizeof(SwitchArm));
@@ -1060,6 +1061,9 @@ static Node *parse_switch_stmt(Parser *p) {
             stmt->expr_stmt.expr = expr;
             arm->body = stmt;
             consume(p, TOK_COMMA, "expected ',' after switch arm expression");
+        }
+        if (p->current.start == before.start && p->current.type == before.type) {
+            advance(p);
         }
     }
 
@@ -1292,6 +1296,7 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
     int count = 0;
 
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        Token before = p->current;
         if (count >= field_cap) {
             int new_cap = field_cap * 2;
             FieldDecl *new_fields = (FieldDecl *)parser_alloc(p, new_cap * sizeof(FieldDecl));
@@ -1334,6 +1339,9 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
         f->name = tok_text(&p->previous);
         f->name_len = tok_len(&p->previous);
         consume(p, TOK_SEMICOLON, "expected ';' after field");
+        if (p->current.start == before.start && p->current.type == before.type) {
+            advance(p);
+        }
     }
 
     consume(p, TOK_RBRACE, "expected '}' after struct body");
@@ -1368,6 +1376,7 @@ static Node *parse_enum_decl(Parser *p) {
             variants = new_v;
             var_cap = new_cap;
         }
+        Token before = p->current;
         EnumVariant *v = &variants[count++];
         memset(v, 0, sizeof(EnumVariant));
         v->loc.line = p->current.line;
@@ -1381,6 +1390,9 @@ static Node *parse_enum_decl(Parser *p) {
         }
 
         match(p, TOK_COMMA); /* optional comma */
+        if (p->current.start == before.start && p->current.type == before.type) {
+            advance(p); /* skip stuck token */
+        }
     }
 
     consume(p, TOK_RBRACE, "expected '}' after enum body");
@@ -1407,6 +1419,7 @@ static Node *parse_union_decl(Parser *p) {
     int count = 0;
 
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF) && !p->oom) {
+        Token before = p->current;
         if (count >= uvar_cap) {
             int new_cap = uvar_cap * 2;
             UnionVariant *new_v = (UnionVariant *)parser_alloc(p, new_cap * sizeof(UnionVariant));
@@ -1424,6 +1437,9 @@ static Node *parse_union_decl(Parser *p) {
         v->name = tok_text(&p->previous);
         v->name_len = tok_len(&p->previous);
         consume(p, TOK_SEMICOLON, "expected ';' after union variant");
+        if (p->current.start == before.start && p->current.type == before.type) {
+            advance(p);
+        }
     }
 
     consume(p, TOK_RBRACE, "expected '}' after union body");

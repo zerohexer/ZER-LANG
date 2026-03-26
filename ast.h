@@ -485,13 +485,33 @@ static inline int64_t eval_const_expr(Node *n) {
         int64_t r = eval_const_expr(n->binary.right);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         switch (n->binary.op) {
-        case TOK_PLUS:    return l + r;
-        case TOK_MINUS:   return l - r;
-        case TOK_STAR:    return l * r;
+        case TOK_PLUS:
+            /* overflow check: if signs match and result sign differs */
+            if ((r > 0 && l > INT64_MAX - r) || (r < 0 && l < INT64_MIN - r))
+                return CONST_EVAL_FAIL;
+            return l + r;
+        case TOK_MINUS:
+            if ((r < 0 && l > INT64_MAX + r) || (r > 0 && l < INT64_MIN + r))
+                return CONST_EVAL_FAIL;
+            return l - r;
+        case TOK_STAR:
+            /* overflow check for multiplication */
+            if (l != 0 && r != 0) {
+                if ((l > 0 && r > 0 && l > INT64_MAX / r) ||
+                    (l < 0 && r < 0 && l < INT64_MAX / r) ||
+                    (l > 0 && r < 0 && r < INT64_MIN / l) ||
+                    (l < 0 && r > 0 && l < INT64_MIN / r))
+                    return CONST_EVAL_FAIL;
+            }
+            return l * r;
         case TOK_SLASH:   return r != 0 ? l / r : CONST_EVAL_FAIL;
         case TOK_PERCENT: return r != 0 ? l % r : CONST_EVAL_FAIL;
-        case TOK_LSHIFT:  return l << r;
-        case TOK_RSHIFT:  return l >> r;
+        case TOK_LSHIFT:
+            if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+            return l << r;
+        case TOK_RSHIFT:
+            if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+            return l >> r;
         case TOK_AMP:     return l & r;
         case TOK_PIPE:    return l | r;
         default: return CONST_EVAL_FAIL;

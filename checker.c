@@ -1730,16 +1730,34 @@ static Type *check_expr(Checker *c, Node *node) {
                         mut_root = mut_root->index_expr.object;
                     else break;
                 }
-                if (mut_root && mut_root->kind == NODE_IDENT &&
-                    mut_root->ident.name_len == c->union_switch_var_len &&
-                    memcmp(mut_root->ident.name, c->union_switch_var,
-                           c->union_switch_var_len) == 0) {
-                    checker_error(c, node->loc.line,
-                        "cannot mutate union '%.*s' inside its own switch arm — "
-                        "active capture would become invalid",
-                        (int)c->union_switch_var_len, c->union_switch_var);
-                    result = ty_void;
-                    break;
+                if (mut_root && mut_root->kind == NODE_IDENT) {
+                    bool name_match = (mut_root->ident.name_len == c->union_switch_var_len &&
+                        memcmp(mut_root->ident.name, c->union_switch_var,
+                               c->union_switch_var_len) == 0);
+                    /* BUG-261: block mutation through pointer alias of same union type.
+                     * Only applies to pointers — they might alias the locked variable.
+                     * Direct locals of the same type are safe (different memory). */
+                    bool type_match = false;
+                    if (!name_match && c->union_switch_type) {
+                        Symbol *ms = scope_lookup(c->current_scope,
+                            mut_root->ident.name, (uint32_t)mut_root->ident.name_len);
+                        if (ms && ms->type) {
+                            Type *mt = type_unwrap_distinct(ms->type);
+                            if (mt->kind == TYPE_POINTER) {
+                                Type *inner = type_unwrap_distinct(mt->pointer.inner);
+                                if (inner == c->union_switch_type) type_match = true;
+                            }
+                        }
+                    }
+                    if (name_match || type_match) {
+                        checker_error(c, node->loc.line,
+                            "cannot mutate union '%.*s' inside its own switch arm — "
+                            "active capture would become invalid",
+                            (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
+                            name_match ? c->union_switch_var : mut_root->ident.name);
+                        result = ty_void;
+                        break;
+                    }
                 }
             }
             Type *inner = type_unwrap_distinct(obj->pointer.inner);
@@ -1804,16 +1822,34 @@ static Type *check_expr(Checker *c, Node *node) {
                         mut_root = mut_root->index_expr.object;
                     else break;
                 }
-                if (mut_root && mut_root->kind == NODE_IDENT &&
-                    mut_root->ident.name_len == c->union_switch_var_len &&
-                    memcmp(mut_root->ident.name, c->union_switch_var,
-                           c->union_switch_var_len) == 0) {
-                    checker_error(c, node->loc.line,
-                        "cannot mutate union '%.*s' inside its own switch arm — "
-                        "active capture would become invalid",
-                        (int)c->union_switch_var_len, c->union_switch_var);
-                    result = ty_void;
-                    break;
+                if (mut_root && mut_root->kind == NODE_IDENT) {
+                    bool name_match = (mut_root->ident.name_len == c->union_switch_var_len &&
+                        memcmp(mut_root->ident.name, c->union_switch_var,
+                               c->union_switch_var_len) == 0);
+                    /* BUG-261: block mutation through pointer alias of same union type.
+                     * Only applies to pointers — they might alias the locked variable.
+                     * Direct locals of the same type are safe (different memory). */
+                    bool type_match = false;
+                    if (!name_match && c->union_switch_type) {
+                        Symbol *ms = scope_lookup(c->current_scope,
+                            mut_root->ident.name, (uint32_t)mut_root->ident.name_len);
+                        if (ms && ms->type) {
+                            Type *mt = type_unwrap_distinct(ms->type);
+                            if (mt->kind == TYPE_POINTER) {
+                                Type *inner = type_unwrap_distinct(mt->pointer.inner);
+                                if (inner == c->union_switch_type) type_match = true;
+                            }
+                        }
+                    }
+                    if (name_match || type_match) {
+                        checker_error(c, node->loc.line,
+                            "cannot mutate union '%.*s' inside its own switch arm — "
+                            "active capture would become invalid",
+                            (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
+                            name_match ? c->union_switch_var : mut_root->ident.name);
+                        result = ty_void;
+                        break;
+                    }
                 }
             }
             for (uint32_t i = 0; i < obj->union_type.variant_count; i++) {
@@ -2765,7 +2801,9 @@ static void check_stmt(Checker *c, Node *node) {
                  * Handles: switch (d) and switch (*ptr) where ptr points to union */
                 const char *saved_union_var = c->union_switch_var;
                 uint32_t saved_union_var_len = c->union_switch_var_len;
+                Type *saved_union_type = c->union_switch_type;
                 if (expr->kind == TYPE_UNION) {
+                    c->union_switch_type = expr;
                     Node *sw_expr = node->switch_stmt.expr;
                     /* walk to root ident for union lock.
                      * Handles: switch(d), switch(*ptr), switch(s.msg), switch(s.msg.inner) */
@@ -2789,6 +2827,7 @@ static void check_stmt(Checker *c, Node *node) {
                 check_stmt(c, arm->body);
                 c->union_switch_var = saved_union_var;
                 c->union_switch_var_len = saved_union_var_len;
+                c->union_switch_type = saved_union_type;
                 pop_scope(c);
             } else {
                 check_stmt(c, arm->body);

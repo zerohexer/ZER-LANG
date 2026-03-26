@@ -42,6 +42,7 @@ typedef struct {
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */
     uint32_t union_switch_var_len;
+    Type *union_switch_type;      /* the union type being switched — blocks alias mutation */
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */

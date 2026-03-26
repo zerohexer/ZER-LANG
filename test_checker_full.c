@@ -1443,6 +1443,31 @@ static void test_negative_sweep(void) {
         "}",
         "store &local through *pool.get() rejected");
 
+    /* BUG-261: union alias bypass via pointer of same type */
+    err("struct A { u32 x; }\nstruct B { u32 y; }\nunion Msg { A a; B b; }\n"
+        "Msg g_msg;\n"
+        "void exploit(*Msg alias) {\n"
+        "    switch (g_msg) {\n"
+        "        .a => |*ptr| {\n"
+        "            alias.b.y = 99;\n"
+        "        }\n"
+        "        .b => |*v| { }\n"
+        "    }\n"
+        "}",
+        "union alias mutation via same-type pointer rejected");
+    ok("struct A { u32 x; }\nstruct B { u32 y; }\nunion Msg { A a; B b; }\n"
+       "struct Other { u32 z; }\n"
+       "Msg g_msg;\n"
+       "void safe(*Other p) {\n"
+       "    switch (g_msg) {\n"
+       "        .a => |*ptr| {\n"
+       "            p.z = 99;\n"
+       "        }\n"
+       "        .b => |*v| { }\n"
+       "    }\n"
+       "}\nu32 main() { return 0; }",
+       "different-type pointer mutation in switch arm accepted");
+
     /* RF8: eval_const_expr with negative intermediates */
     ok("u8[10 - 5] arr;\nu32 main() { arr[0] = 1; return 0; }",
        "array size from subtraction (10-5=5) accepted");

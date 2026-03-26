@@ -2881,6 +2881,43 @@ int main(void) {
         43,
         "multi-dim array u8[10][3] works");
 
+    /* BUG-268: union switch mutable capture modifies original (not copy) */
+    test_compile_and_run(
+        "struct A { u32 x; }\n"
+        "struct B { u32 y; }\n"
+        "union Msg { A a; B b; }\n"
+        "Msg g_msg;\n"
+        "u32 main() {\n"
+        "    g_msg.a.x = 10;\n"
+        "    switch (g_msg) {\n"
+        "        .a => |*v| { v.x = 99; }\n"
+        "        .b => |*v| { }\n"
+        "    }\n"
+        "    switch (g_msg) {\n"
+        "        .a => |v| { return v.x; }\n"
+        "        .b => |v| { return 0; }\n"
+        "    }\n"
+        "}\n",
+        99,
+        "union switch |*v| modifies original (not copy)");
+
+    /* BUG-271: distinct typedef union switch */
+    test_compile_and_run(
+        "struct A { u32 x; }\n"
+        "struct B { u32 y; }\n"
+        "union Msg { A a; B b; }\n"
+        "distinct typedef Msg Event;\n"
+        "u32 main() {\n"
+        "    Event e;\n"
+        "    e.a.x = 77;\n"
+        "    switch (e) {\n"
+        "        .a => |v| { return v.x; }\n"
+        "        .b => |v| { return 0; }\n"
+        "    }\n"
+        "}\n",
+        77,
+        "distinct typedef union switch works");
+
     /* BUG-266: arena alloc_slice overflow returns null */
     test_compile_and_run(
         "struct Task { u32 id; u32 pri; }\n"

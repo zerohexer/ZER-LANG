@@ -644,11 +644,13 @@ static Type *check_expr(Checker *c, Node *node) {
                     type_name(left), type_name(right));
                 result = left;
             } else {
-                /* compile-time division by zero check */
-                if ((node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) &&
-                    node->binary.right->kind == NODE_INT_LIT &&
-                    node->binary.right->int_lit.value == 0) {
-                    checker_error(c, node->loc.line, "division by zero");
+                /* compile-time division by zero check.
+                 * BUG-269: use eval_const_expr to catch expressions like (2-2) */
+                if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
+                    int64_t div_val = eval_const_expr(node->binary.right);
+                    if (div_val == 0) {
+                        checker_error(c, node->loc.line, "division by zero");
+                    }
                 }
                 result = common_numeric_type(c, left, right, node->loc.line);
             }
@@ -2726,6 +2728,8 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_SWITCH: {
         Type *expr = check_expr(c, node->switch_stmt.expr);
+        /* BUG-271: unwrap distinct for union/enum switch dispatch */
+        Type *expr_eff = expr ? type_unwrap_distinct(expr) : NULL;
 
         /* BUG-226: reject float switch — spec says "switch on float: NOT ALLOWED" */
         if (expr && type_is_float(expr)) {
@@ -2750,14 +2754,14 @@ static void check_stmt(Checker *c, Node *node) {
                 Type *cap_type;
                 bool cap_const;
 
-                if (expr->kind == TYPE_UNION) {
+                if (expr_eff->kind == TYPE_UNION) {
                     /* tagged union switch — look up variant type */
                     Type *variant_type = ty_void;
                     if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
                         const char *vname = arm->values[0]->ident.name;
                         uint32_t vlen = (uint32_t)arm->values[0]->ident.name_len;
-                        for (uint32_t k = 0; k < expr->union_type.variant_count; k++) {
-                            SUVariant *v = &expr->union_type.variants[k];
+                        for (uint32_t k = 0; k < expr_eff->union_type.variant_count; k++) {
+                            SUVariant *v = &expr_eff->union_type.variants[k];
                             if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0) {
                                 variant_type = v->type;
                                 break;
@@ -2819,7 +2823,7 @@ static void check_stmt(Checker *c, Node *node) {
                 const char *saved_union_var = c->union_switch_var;
                 uint32_t saved_union_var_len = c->union_switch_var_len;
                 Type *saved_union_type = c->union_switch_type;
-                if (expr->kind == TYPE_UNION) {
+                if (expr_eff->kind == TYPE_UNION) {
                     c->union_switch_type = expr;
                     Node *sw_expr = node->switch_stmt.expr;
                     /* walk to root ident for union lock.
@@ -3672,6 +3676,12 @@ static void check_func_body(Checker *c, Node *node) {
     if (node->kind == NODE_FUNC_DECL && node->func_decl.body) {
         /* resolve return type */
         Type *ret = resolve_type(c, node->func_decl.return_type);
+        /* BUG-270: reject array return types — C forbids returning arrays.
+         * Use a struct wrapper or return a slice instead. */
+        if (ret && ret->kind == TYPE_ARRAY) {
+            checker_error(c, node->loc.line,
+                "cannot return array type — use a struct wrapper or slice instead");
+        }
         c->current_func_ret = ret;
 
         /* create function scope with parameters */

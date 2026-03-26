@@ -1972,9 +1972,18 @@ static void emit_stmt(Emitter *e, Node *node) {
                      (int)node->if_stmt.capture_name_len,
                      node->if_stmt.capture_name, tmp);
             } else {
-                /* |val| or ?*T — use copy */
+                /* |val| or ?*T — use copy.
+                 * BUG-267: use explicit type to preserve volatile qualifier.
+                 * Use emit_type_and_name for func ptr (name goes inside (*)). */
                 emit_indent(e);
-                emit(e, "__auto_type _zer_uw%d = ", tmp);
+                if (cond_type) {
+                    char uwname[32];
+                    snprintf(uwname, sizeof(uwname), "_zer_uw%d", tmp);
+                    emit_type_and_name(e, cond_type, uwname, strlen(uwname));
+                    emit(e, " = ");
+                } else {
+                    emit(e, "__auto_type _zer_uw%d = ", tmp);
+                }
                 emit_expr(e, node->if_stmt.cond);
                 emit(e, ";\n");
                 emit_indent(e);
@@ -2225,7 +2234,9 @@ static void emit_stmt(Emitter *e, Node *node) {
          */
         int sw_tmp = e->temp_count++;
         Type *sw_type = checker_get_type(e->checker,node->switch_stmt.expr);
-        bool is_union_switch = sw_type && sw_type->kind == TYPE_UNION;
+        /* BUG-271: unwrap distinct before checking for union switch */
+        Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
+        bool is_union_switch = sw_eff && sw_eff->kind == TYPE_UNION;
         /* BUG-196b: detect struct-based optional in switch */
         bool is_opt_switch = false;
         if (sw_type && sw_type->kind == TYPE_OPTIONAL) {
@@ -2240,14 +2251,23 @@ static void emit_stmt(Emitter *e, Node *node) {
         e->indent++;
         emit_indent(e);
         if (is_union_switch) {
-            /* union switch: hoist into temp, then take pointer.
-             * Direct &(expr) fails for rvalue expressions like function calls.
-             * Can't use __auto_type with * — use __typeof__ instead. */
-            emit(e, "__auto_type _zer_swt%d = ", sw_tmp);
-            emit_expr(e, node->switch_stmt.expr);
-            emit(e, ";\n");
-            emit_indent(e);
-            emit(e, "__typeof__(_zer_swt%d) *_zer_swp%d = &_zer_swt%d;\n", sw_tmp, sw_tmp, sw_tmp);
+            /* union switch: need pointer for mutable capture.
+             * BUG-268: for lvalue expressions, use direct &(expr) so mutations
+             * affect the original. For rvalue (NODE_CALL), hoist into temp. */
+            bool sw_is_rvalue = (node->switch_stmt.expr->kind == NODE_CALL);
+            if (sw_is_rvalue) {
+                emit(e, "__auto_type _zer_swt%d = ", sw_tmp);
+                emit_expr(e, node->switch_stmt.expr);
+                emit(e, ";\n");
+                emit_indent(e);
+                emit(e, "__typeof__(_zer_swt%d) *_zer_swp%d = &_zer_swt%d;\n", sw_tmp, sw_tmp, sw_tmp);
+            } else {
+                emit(e, "__typeof__(");
+                emit_expr(e, node->switch_stmt.expr);
+                emit(e, ") *_zer_swp%d = &(", sw_tmp);
+                emit_expr(e, node->switch_stmt.expr);
+                emit(e, ");\n");
+            }
         } else {
             emit(e, "__auto_type _zer_sw%d = ", sw_tmp);
             emit_expr(e, node->switch_stmt.expr);
@@ -2268,19 +2288,19 @@ static void emit_stmt(Emitter *e, Node *node) {
                 for (int j = 0; j < arm->value_count; j++) {
                     if (j > 0) emit(e, " || ");
                     emit(e, "_zer_swp%d->_tag == _ZER_", sw_tmp);
-                    EMIT_UNION_NAME(e, sw_type);
+                    EMIT_UNION_NAME(e, sw_eff);
                     emit(e, "_TAG_%.*s",
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
                 }
                 emit(e, ") ");
-            } else if (!is_union_switch && arm->is_enum_dot && sw_type && sw_type->kind == TYPE_ENUM) {
+            } else if (!is_union_switch && arm->is_enum_dot && sw_eff && sw_eff->kind == TYPE_ENUM) {
                 /* enum switch: .idle => ... → if (_sw == _ZER_State_idle) */
                 if (i > 0) emit(e, "else ");
                 emit(e, "if (");
                 for (int j = 0; j < arm->value_count; j++) {
                     if (j > 0) emit(e, " || ");
                     emit(e, "_zer_sw%d == _ZER_", sw_tmp);
-                    EMIT_ENUM_NAME(e, sw_type);
+                    EMIT_ENUM_NAME(e, sw_eff);
                     emit(e, "_%.*s",
                          (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
                 }
@@ -2345,10 +2365,10 @@ static void emit_stmt(Emitter *e, Node *node) {
                     const char *vname = arm->values[0]->ident.name;
                     uint32_t vlen = (uint32_t)arm->values[0]->ident.name_len;
                     Type *vtype = NULL;
-                    for (uint32_t vi = 0; vi < sw_type->union_type.variant_count; vi++) {
-                        if (sw_type->union_type.variants[vi].name_len == vlen &&
-                            memcmp(sw_type->union_type.variants[vi].name, vname, vlen) == 0) {
-                            vtype = sw_type->union_type.variants[vi].type;
+                    for (uint32_t vi = 0; vi < sw_eff->union_type.variant_count; vi++) {
+                        if (sw_eff->union_type.variants[vi].name_len == vlen &&
+                            memcmp(sw_eff->union_type.variants[vi].name, vname, vlen) == 0) {
+                            vtype = sw_eff->union_type.variants[vi].type;
                             break;
                         }
                     }

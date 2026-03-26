@@ -1485,6 +1485,16 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-269: constant expression div-by-zero */
+    err("u32 main() { u32 x = 10 / (2 - 2); return x; }",
+        "const expr div-by-zero (2-2=0) rejected");
+    ok("u32 main() { u32 x = 10 / (3 - 1); return x; }",
+       "const expr div (3-1=2) accepted");
+
+    /* BUG-270: array return type rejected */
+    err("u8[10] get_buf() { u8[10] b; return b; }\nu32 main() { return 0; }",
+        "array return type rejected");
+
     /* BUG-265: recursive union by value rejected */
     err("struct A { u32 x; }\nunion U { A a; U recursive; }\nu32 main() { return 0; }",
         "recursive union by value rejected");

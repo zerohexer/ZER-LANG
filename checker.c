@@ -105,6 +105,13 @@ static void pop_scope(Checker *c) {
 
 static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
                           Type *type, int line) {
+    /* BUG-276: warn on _zer_ prefixed names — reserved for compiler internals */
+    if (name_len >= 5 && memcmp(name, "_zer_", 5) == 0) {
+        checker_error(c, line,
+            "identifier '%.*s' uses reserved prefix '_zer_' — "
+            "may collide with compiler-generated names",
+            (int)name_len, name);
+    }
     Symbol *sym = scope_add(c->arena, c->current_scope, name, name_len,
                             type, line, c->file_name);
     if (!sym) {
@@ -268,17 +275,20 @@ static int64_t compute_type_size(Type *t) {
     t = type_unwrap_distinct(t);
     int w = type_width(t);
     if (w > 0) return w / 8;
-    if (t->kind == TYPE_POINTER) return type_width(ty_usize) / 8;
-    if (t->kind == TYPE_SLICE) return (type_width(ty_usize) / 8) * 2;
+    /* BUG-275: pointer/slice sizes are target-dependent — don't constant-fold.
+     * Let the emitter use sizeof() which GCC resolves per target. */
+    if (t->kind == TYPE_POINTER) return CONST_EVAL_FAIL;
+    if (t->kind == TYPE_SLICE) return CONST_EVAL_FAIL;
     if (t->kind == TYPE_ARRAY) {
         int64_t elem_size = compute_type_size(t->array.inner);
         return elem_size > 0 ? elem_size * (int64_t)t->array.size : -1;
     }
     if (t->kind == TYPE_OPTIONAL) {
-        /* BUG-243: ?*T and ?FuncPtr are null-sentinel (same size as pointer) */
+        /* BUG-243/275: ?*T and ?FuncPtr are null-sentinel (same size as pointer).
+         * Target-dependent — don't constant-fold, let emitter use sizeof(). */
         { Type *oi = type_unwrap_distinct(t->optional.inner);
           if (oi->kind == TYPE_POINTER || oi->kind == TYPE_FUNC_PTR)
-              return type_width(ty_usize) / 8; }
+              return CONST_EVAL_FAIL; }
         /* ?void = { has_value: u8 } = 1 byte */
         if (t->optional.inner->kind == TYPE_VOID) return 1;
         /* ?T = { T value; u8 has_value; } — aligned like a struct */
@@ -298,6 +308,7 @@ static int64_t compute_type_size(Type *t) {
         int64_t max_variant = 0;
         for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
             int64_t vs = compute_type_size(t->union_type.variants[i].type);
+            if (vs == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
             if (vs > max_variant) max_variant = vs;
         }
         int64_t total = 4; /* int32_t _tag */
@@ -318,6 +329,8 @@ static int64_t compute_type_size(Type *t) {
         bool is_packed = t->struct_type.is_packed;
         for (uint32_t fi = 0; fi < t->struct_type.field_count; fi++) {
             int64_t fsize = compute_type_size(t->struct_type.fields[fi].type);
+            /* BUG-275: if any field is target-dependent, whole struct is */
+            if (fsize == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
             if (fsize <= 0) fsize = 4; /* fallback for unknown types */
             int falign = is_packed ? 1 : (int)(fsize > 8 ? 8 : fsize);
             /* for nested structs, alignment = largest field alignment, capped at 8 */
@@ -409,13 +422,13 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         }
         /* evaluate compile-time constant size expression */
         uint32_t size = 0;
+        Type *size_of = NULL; /* resolved @size type, if any */
         if (tn->array.size_expr) {
             int64_t val = eval_const_expr(tn->array.size_expr);
             /* BUG-199: handle @size(T) as compile-time constant */
             if (val == CONST_EVAL_FAIL && tn->array.size_expr->kind == NODE_INTRINSIC &&
                 tn->array.size_expr->intrinsic.name_len == 4 &&
                 memcmp(tn->array.size_expr->intrinsic.name, "size", 4) == 0) {
-                Type *size_of = NULL;
                 if (tn->array.size_expr->intrinsic.type_arg) {
                     size_of = resolve_type(c, tn->array.size_expr->intrinsic.type_arg);
                 } else if (tn->array.size_expr->intrinsic.arg_count > 0 &&
@@ -439,6 +452,16 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 }
             }
             if (val == CONST_EVAL_FAIL) {
+                /* BUG-275: if @size on target-dependent type (pointer/slice/struct-with-ptr),
+                 * don't error — store the resolved Type for emitter to emit sizeof(). */
+                if (tn->array.size_expr->kind == NODE_INTRINSIC &&
+                    tn->array.size_expr->intrinsic.name_len == 4 &&
+                    memcmp(tn->array.size_expr->intrinsic.name, "size", 4) == 0 &&
+                    size_of) {
+                    Type *arr_type = type_array(c->arena, elem, 0);
+                    arr_type->array.sizeof_type = size_of;
+                    return arr_type;
+                }
                 checker_error(c, tn->loc.line, "array size must be a compile-time constant");
             } else if (val <= 0) {
                 checker_error(c, tn->loc.line, "array size must be > 0");

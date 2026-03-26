@@ -1485,6 +1485,18 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-275: @size on pointer/slice emits sizeof (target-portable) */
+    ok("u8[@size(*u32)] buf;\nu32 main() { return 0; }",
+       "@size(*u32) as array size accepted (sizeof-based)");
+    ok("u8[@size([]u8)] buf;\nu32 main() { return 0; }",
+       "@size([]u8) as array size accepted (sizeof-based)");
+
+    /* BUG-276: _zer_ prefix reserved */
+    err("u32 main() { u32 _zer_foo = 5; return _zer_foo; }",
+        "_zer_ prefixed variable rejected");
+    ok("u32 main() { u32 zer_foo = 5; return zer_foo; }",
+       "zer_ prefixed variable accepted (no underscore prefix)");
+
     /* BUG-269: constant expression div-by-zero */
     err("u32 main() { u32 x = 10 / (2 - 2); return x; }",
         "const expr div-by-zero (2-2=0) rejected");

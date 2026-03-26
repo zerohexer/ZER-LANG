@@ -2955,6 +2955,19 @@ int main(void) {
         0,
         "arena alloc_slice overflow returns null (not corrupted slice)");
 
+    /* BUG-275: @size(*T) uses sizeof — matches target pointer width */
+    test_compile_and_run(
+        "u8[@size(*u32)] buf;\n"
+        "u32 main() {\n"
+        "    return @truncate(u32, @size(*u32));\n"
+        "}\n",
+#ifdef _WIN32
+        4, /* 32-bit mingw target */
+#else
+        8, /* 64-bit Linux/Docker */
+#endif
+        "@size(*u32) matches target pointer width");
+
     /* RF8: eval_const_expr negative intermediates */
     test_compile_and_run(
         "u8[10 - 5] arr;\n"

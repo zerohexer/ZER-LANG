@@ -86,6 +86,9 @@ Type *type_const_slice(Arena *a, Type *inner) {
     return t;
 }
 
+/* NOTE: size == 0 with sizeof_type != NULL means "emit sizeof(T)" —
+ * used for target-dependent array dimensions (@size on pointer/slice types).
+ * The emitter checks sizeof_type first; if set, emits sizeof(T) instead of numeric size. */
 Type *type_array(Arena *a, Type *inner, uint64_t size) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
     t->kind = TYPE_ARRAY;

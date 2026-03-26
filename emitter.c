@@ -64,6 +64,19 @@ static inline bool is_null_sentinel(Type *inner) {
 /* NOTE: Use is_null_sentinel(type) for full distinct-aware check.
  * IS_NULL_SENTINEL macro kept for backward compat where only kind is available. */
 
+/* ---- Array size emission helper (BUG-275) ---- */
+/* Emit array size — uses sizeof() for target-dependent sizes, numeric for constant */
+static void emit_type(Emitter *e, Type *t); /* forward decl */
+static void emit_array_size(Emitter *e, Type *arr_type) {
+    if (arr_type->array.sizeof_type) {
+        emit(e, "sizeof(");
+        emit_type(e, arr_type->array.sizeof_type);
+        emit(e, ")");
+    } else {
+        emit(e, "%llu", (unsigned long long)arr_type->array.size);
+    }
+}
+
 /* ---- Qualifier helpers (RF11) ---- */
 
 /* Walk an expression to its root ident and look up the symbol.
@@ -96,7 +109,6 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
 
 /* ---- Type emission ---- */
 
-static void emit_type(Emitter *e, Type *t);
 static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
@@ -326,7 +338,14 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         emit(e, " %.*s", (int)name_len, name);
         Type *dim = t;
         while (dim->kind == TYPE_ARRAY) {
-            emit(e, "[%llu]", (unsigned long long)dim->array.size);
+            if (dim->array.sizeof_type) {
+                /* BUG-275: target-dependent size — emit sizeof(T) */
+                emit(e, "[sizeof(");
+                emit_type(e, dim->array.sizeof_type);
+                emit(e, ")]");
+            } else {
+                emit(e, "[%llu]", (unsigned long long)dim->array.size);
+            }
             dim = dim->array.inner;
         }
         return;
@@ -1123,22 +1142,26 @@ static void emit_expr(Emitter *e, Node *node) {
                 else break;
             }
         }
-        if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY && idx_obj_type->array.size > 0) {
+        if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY &&
+            (idx_obj_type->array.size > 0 || idx_obj_type->array.sizeof_type)) {
             if (idx_has_side_effects) {
                 /* Single-eval lvalue path: pointer dereference preserves lvalue.
                  * *({ size_t _i = idx; check(_i); &arr[_i]; }) */
                 int tmp = e->temp_count++;
                 emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
-                emit(e, "); _zer_bounds_check(_zer_idx%d, %llu, __FILE__, __LINE__); &",
-                     tmp, (unsigned long long)idx_obj_type->array.size);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
+                emit_array_size(e, idx_obj_type);
+                emit(e, ", __FILE__, __LINE__); &");
                 emit_expr(e, node->index_expr.object);
                 emit(e, "[_zer_idx%d]; })", tmp);
             } else {
                 /* Simple index — comma operator, preserves lvalue */
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_expr(e, node->index_expr.index);
-                emit(e, "), %llu, __FILE__, __LINE__), ", (unsigned long long)idx_obj_type->array.size);
+                emit(e, "), ");
+                emit_array_size(e, idx_obj_type);
+                emit(e, ", __FILE__, __LINE__), ");
                 emit_expr(e, node->index_expr.object);
                 emit(e, ")[");
                 emit_expr(e, node->index_expr.index);

@@ -87,7 +87,7 @@ struct Type {
         struct { Type *inner; bool is_const; } slice;
 
         /* TYPE_ARRAY */
-        struct { Type *inner; uint64_t size; } array;
+        struct { Type *inner; uint64_t size; Type *sizeof_type; /* non-NULL → emit sizeof(T) instead of numeric size */ } array;
 
         /* TYPE_STRUCT */
         struct {

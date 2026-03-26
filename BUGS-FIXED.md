@@ -1312,3 +1312,123 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Mask formula used `1u` (32-bit) which overflows when shift count reaches 32.
 - **Fix:** Changed `1u` to `1ull` (64-bit) so shifts up to 63 are safe.
 - **Test:** `test_emit.c` — `[0..0]` single bit, `[7..0]` low byte, `[15..8]` mid-range
+
+---
+
+## Session 3 — Red Team Audit (2026-03-26)
+
+266 bugs fixed total. 10 structural refactors (RF1-RF10). 1,685 tests.
+
+### BUG-248: Union assignment during switch capture
+- **Symptom:** `msg = other` inside `|*v|` arm compiles — invalidates capture pointer.
+- **Root cause:** NODE_ASSIGN didn't check if target matches `union_switch_var`.
+- **Fix:** Walk target to root ident, compare against locked variable name.
+- **Test:** `test_checker_full.c` — union assign in capture rejected, field mutation accepted.
+
+### BUG-249: Switch capture doesn't propagate safety flags
+- **Symptom:** `switch(opt) { default => |p| { return p; } }` — p doesn't inherit `is_local_derived`.
+- **Root cause:** Capture symbol creation didn't walk switch expression to find source symbol flags.
+- **Fix:** Walk switch expr through deref/field/index/orelse to root, propagate flags to capture.
+- **Test:** `test_checker_full.c` — switch capture local-derived return rejected.
+
+### BUG-250: `@size(union)` returns -1
+- **Symptom:** `u8[@size(Msg)] buffer` fails — "array size must be a compile-time constant".
+- **Root cause:** `compute_type_size` had no TYPE_UNION case.
+- **Fix:** Added: tag(4) + align padding + max(variant_sizes), padded to struct alignment.
+- **Test:** `test_emit.c` — @size(union) = 16 for `{ u32 a; u64 b; }`, `test_checker_full.c` — accepted as array size.
+
+### BUG-251: `return opt orelse local_ptr` unchecked
+- **Symptom:** `return opt orelse p` where p is local-derived compiles.
+- **Root cause:** NODE_RETURN walk stopped at NODE_ORELSE — never checked fallback.
+- **Fix:** Split: if ret.expr is NODE_ORELSE, check both `.orelse.expr` and `.orelse.fallback`.
+- **Test:** `test_checker_full.c` — orelse local/arena fallback rejected, global accepted.
+
+### BUG-252: Array assignment double-eval
+- **Symptom:** `get_s().arr = local` calls `get_s()` twice in emitted memcpy.
+- **Root cause:** `memcpy(target, src, sizeof(target))` evaluates target twice.
+- **Fix:** Pointer hoist: `({ __typeof__(t) *_p = &(t); memcpy(_p, src, sizeof(*_p)); })`.
+- **Test:** Existing E2E tests pass (array assignment still works).
+
+### BUG-253: Global non-null `*T` without initializer
+- **Symptom:** `*u32 g_ptr;` at global scope compiles — auto-zeros to NULL.
+- **Root cause:** Non-null pointer init check only applied to NODE_VAR_DECL, not NODE_GLOBAL_VAR.
+- **Fix:** Added check in `register_decl(NODE_GLOBAL_VAR)` path.
+- **Test:** `test_checker_full.c` — global `*T` without init rejected, `?*T` accepted.
+
+### BUG-254: `&const_arr[i]` yields mutable pointer
+- **Symptom:** `const u32[4] arr; *u32 p = &arr[0];` compiles — const leak.
+- **Root cause:** TOK_AMP handler only checked NODE_IDENT operand for const, not field/index chains.
+- **Fix:** Walk operand through field/index chains to root, propagate is_const/is_volatile.
+- **Test:** `test_checker_full.c` — &const_arr[idx] to mutable rejected, to const accepted.
+
+### BUG-255: Orelse index double-eval
+- **Symptom:** `arr[get() orelse 0]` calls get() twice (bounds check + access).
+- **Root cause:** NODE_ORELSE not in `idx_has_side_effects` detection.
+- **Fix:** Added NODE_ORELSE to side-effect check — triggers single-eval temp path.
+- **Test:** `test_emit.c` — orelse index counter=1 (not 2).
+
+### BUG-256: `@ptrcast` local-derived ident bypass in return
+- **Symptom:** `return @ptrcast(*u8, p)` where p is local-derived compiles.
+- **Root cause:** BUG-246 only checked `&local` inside intrinsic, not local-derived idents.
+- **Fix:** Check `is_local_derived`/`is_arena_derived` on arg ident (only when result is pointer type).
+- **Test:** `test_checker_full.c` — ptrcast local-derived rejected, global accepted.
+
+### BUG-257: Optional `== null` emits broken C
+- **Symptom:** `?u32 x; if (x == null)` emits `if (x == 0)` — struct == int is GCC error.
+- **Root cause:** NODE_BINARY emitter didn't special-case struct optionals with null.
+- **Fix:** Detect NULL_LIT side + struct optional → emit `(!x.has_value)` / `(x.has_value)`.
+- **Test:** `test_emit.c` — optional == null / != null returns correct values.
+
+### BUG-258: `@ptrcast` strips volatile
+- **Symptom:** `@ptrcast(*u32, volatile_reg)` allowed — GCC optimizes away writes.
+- **Root cause:** No volatile check in @ptrcast handler.
+- **Fix:** Check both type-level `pointer.is_volatile` and symbol-level `sym->is_volatile`.
+- **Test:** `test_checker_full.c` — volatile to non-volatile rejected, volatile to volatile accepted.
+
+### BUG-259: `return @cstr(local_buf)` dangling pointer
+- **Symptom:** `return @cstr(buf, "hi")` where buf is local compiles — dangling pointer.
+- **Root cause:** NODE_RETURN didn't check @cstr intrinsic for local buffer args.
+- **Fix:** Detect NODE_INTRINSIC "cstr", walk buffer arg to root, reject if local.
+- **Test:** `test_checker_full.c` — @cstr local rejected, global accepted.
+
+### BUG-260: `*pool.get(h) = &local` escape
+- **Symptom:** Storing local address through dereferenced function call compiles.
+- **Root cause:** Assignment escape check didn't recognize NODE_CALL as potential global target.
+- **Fix:** Walk target through deref/field/index; if root is NODE_CALL, reject &local and local-derived.
+- **Test:** `test_checker_full.c` — store &local through *pool.get() rejected.
+
+### BUG-261: Union alias bypass via same-type pointer
+- **Symptom:** `alias.b.y = 99` inside `switch(g_msg)` capture — alias is `*Msg` pointing to g_msg.
+- **Root cause:** Union switch lock only checked variable name, not pointer type aliases.
+- **Fix:** Store `union_switch_type` on Checker. Check if mutation root's type is `*UnionType` matching locked type. Only applies to pointers (not local values).
+- **Test:** `test_checker_full.c` — same-type pointer mutation rejected, different-type accepted.
+
+### BUG-262: Slice start/end double-eval
+- **Symptom:** `arr[get_start()..get_end()]` calls get_start() 3x and get_end() 2x.
+- **Root cause:** Emitter's runtime check path evaluated start/end directly multiple times.
+- **Fix:** Hoist into `_zer_ss`/`_zer_se` temps inside GCC statement expression.
+- **Test:** `test_emit.c` — counter=2 (not 4+) after slice with side-effecting bounds.
+
+### BUG-263: Volatile pointer to non-volatile param
+- **Symptom:** `write_reg(volatile_ptr)` where param is `*u32` compiles — volatile stripped.
+- **Root cause:** No volatile check at function call arg sites.
+- **Fix:** Check arg pointer is_volatile (type-level OR symbol-level) vs param non-volatile.
+- **Test:** `test_checker_full.c` — volatile to non-volatile rejected, volatile to volatile accepted.
+
+### BUG-264: If-unwrap `|*v|` on rvalue — GCC error
+- **Symptom:** `if (get_opt()) |*v|` emits `&(get_opt())` — rvalue address illegal in C.
+- **Root cause:** Emitter took address of condition directly, didn't check for rvalue.
+- **Fix:** Detect NODE_CALL condition, hoist into typed temp first. Lvalues still use direct `&`.
+- **Test:** `test_emit.c` — if-unwrap |*v| on rvalue compiles and runs correctly.
+
+### BUG-265: Recursive union by value not caught
+- **Symptom:** `union U { A a; U recursive; }` compiles — incomplete type in C.
+- **Root cause:** BUG-227 recursive check only applied to NODE_STRUCT_DECL, not NODE_UNION_DECL.
+- **Fix:** Same self-reference check in union variant registration. Walks through arrays.
+- **Test:** `test_checker_full.c` — recursive union rejected, pointer self-reference accepted.
+
+### BUG-266: Arena `alloc_slice` multiplication overflow
+- **Symptom:** `a.alloc_slice(Task, huge_n)` — `sizeof(T) * n` overflows to small value, creates tiny buffer with huge `.len`.
+- **Root cause:** No overflow check on size multiplication in emitted C.
+- **Fix:** Use `__builtin_mul_overflow(sizeof(T), n, &total)` — overflow returns null.
+- **Test:** `test_emit.c` — overflow alloc returns null (not corrupted slice).

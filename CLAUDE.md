@@ -674,6 +674,12 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 **127. Multi-dimensional arrays supported.**
 `u8[10][20] grid` — parser chains TYNODE_ARRAY dimensions. `u8[10]` is the element type, `[20]` is the outer count. Emitter collects all dims: `uint8_t grid[20][10]`. Bounds checks on each dimension. Statement disambiguator scans through multiple `[N]` suffixes. (New feature)
 
+**128. Recursive union by value rejected.**
+`union U { A a; U recursive; }` caught — same pattern as struct BUG-227. Walks through arrays (`U[4]` also contains `U` by value). Use `*U` for self-referential unions. (BUG-265)
+
+**129. Arena `alloc_slice` uses overflow-safe multiplication.**
+`arena.alloc_slice(T, huge_n)` emitted `sizeof(T) * n` which overflowed `size_t` to a small value, creating a tiny buffer with a huge `.len`. Now uses `__builtin_mul_overflow` — overflow returns null (allocation fails). (BUG-266)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.

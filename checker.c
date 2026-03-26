@@ -997,6 +997,56 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-260: local-derived escape via dereferenced function call.
+         * *pool.get(h) = &local or *func() = local_derived — function calls may
+         * return pointers to global memory, so storing local pointers through them
+         * is an escape. Walk target through deref/field/index; if root is NODE_CALL,
+         * reject local-derived values. */
+        if (node->assign.op == TOK_EQ) {
+            Node *troot = node->assign.target;
+            while (troot) {
+                if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                else if (troot->kind == NODE_INDEX) troot = troot->index_expr.object;
+                else if (troot->kind == NODE_UNARY && troot->unary.op == TOK_STAR)
+                    troot = troot->unary.operand;
+                else break;
+            }
+            if (troot && troot->kind == NODE_CALL) {
+                /* target root is a function call — check if value is &local or local-derived */
+                if (node->assign.value->kind == NODE_UNARY &&
+                    node->assign.value->unary.op == TOK_AMP) {
+                    Node *vroot = node->assign.value->unary.operand;
+                    while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                        if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                        else vroot = vroot->index_expr.object;
+                    }
+                    if (vroot && vroot->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            vroot->ident.name, (uint32_t)vroot->ident.name_len);
+                        bool src_global = src && (src->is_static ||
+                            scope_lookup_local(c->global_scope, src->name, src->name_len) != NULL);
+                        if (src && !src_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot store pointer to local '%.*s' through function call — "
+                                "may escape to global memory",
+                                (int)src->name_len, src->name);
+                        }
+                    }
+                }
+                if (node->assign.value->kind == NODE_IDENT) {
+                    Symbol *val_sym = scope_lookup(c->current_scope,
+                        node->assign.value->ident.name,
+                        (uint32_t)node->assign.value->ident.name_len);
+                    if (val_sym && val_sym->is_local_derived) {
+                        checker_error(c, node->loc.line,
+                            "cannot store local-derived pointer '%.*s' through function call — "
+                            "may escape to global memory",
+                            (int)val_sym->name_len, val_sym->name);
+                    }
+                }
+            }
+        }
+
         /* BUG-240: nested array→slice escape via assignment to global/static.
          * global_s = s.arr where s is local — walk value chain to root. */
         if (node->assign.op == TOK_EQ && value && value->kind == TYPE_ARRAY &&
@@ -3066,6 +3116,34 @@ static void check_stmt(Checker *c, Node *node) {
                                     (int)sym->name_len, sym->name,
                                     (int)ilen, iname);
                             }
+                        }
+                    }
+                }
+            }
+
+            /* BUG-259: scope escape via @cstr — returns pointer to first arg (buffer).
+             * return @cstr(local_buf, "hi") → dangling pointer to stack memory. */
+            if (node->ret.expr->kind == NODE_INTRINSIC) {
+                const char *iname = node->ret.expr->intrinsic.name;
+                uint32_t ilen = (uint32_t)node->ret.expr->intrinsic.name_len;
+                if (ilen == 4 && memcmp(iname, "cstr", 4) == 0 &&
+                    node->ret.expr->intrinsic.arg_count > 0) {
+                    Node *buf_arg = node->ret.expr->intrinsic.args[0];
+                    Node *root = buf_arg;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        Symbol *sym = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        bool is_global = scope_lookup_local(c->global_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                        if (sym && !sym->is_static && !is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot return @cstr of local buffer '%.*s' — "
+                                "stack memory is freed when function returns",
+                                (int)sym->name_len, sym->name);
                         }
                     }
                 }

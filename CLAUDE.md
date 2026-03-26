@@ -653,6 +653,12 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 **120. `@ptrcast` cannot strip volatile qualifier.**
 `@ptrcast(*u32, volatile_ptr)` was allowed — GCC optimizes away writes through the non-volatile result. Now checks both type-level `pointer.is_volatile` AND symbol-level `sym->is_volatile` on the source ident. (BUG-258)
 
+**121. `return @cstr(local_buf, ...)` rejected — dangling pointer.**
+`@cstr` returns `*u8` pointing to its first arg. If that arg is a local buffer, the returned pointer dangles. NODE_RETURN checks for `NODE_INTRINSIC` with name "cstr" and walks the buffer arg to root ident — rejects if local. (BUG-259)
+
+**122. `*func() = &local` rejected — escape through dereferenced call.**
+`*pool.get(h) = &x` stores a local address into memory returned by a function call (which may be global). NODE_ASSIGN walks the target through deref/field/index; if root is NODE_CALL, rejects `&local` and local-derived values. (BUG-260)
+
 ### Design Decisions (NOT bugs — intentional)
 - **`@inttoptr(*T, 0)` allowed:** MMIO address 0x0 is valid on some platforms. `@inttoptr` is the unsafe escape hatch — users accept responsibility. Use `?*T` with null for safe optional pointers.
 - **Shift widening (`u8 << 8 = 0`):** Spec-correct. Shift result = common type of operands. Integer literal adapts to left operand type. `u8 << 8` → shift by 8 on 8-bit value → 0 per "shift >= width = 0" rule. Use `@truncate(u32, 1) << 8` for widening.

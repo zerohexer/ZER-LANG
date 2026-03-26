@@ -1422,6 +1422,26 @@ static void test_negative_sweep(void) {
        "    return 0;\n"
        "}",
        "@ptrcast volatile to volatile accepted");
+
+    /* BUG-259: @cstr return of local buffer */
+    err("*u8 bad() {\n"
+        "    u8[10] buf;\n"
+        "    return @cstr(buf, \"hi\");\n"
+        "}",
+        "return @cstr(local_buf) rejected — dangling pointer");
+    ok("u8[10] g_buf;\n"
+       "*u8 ok_fn() { return @cstr(g_buf, \"hi\"); }\n"
+       "u32 main() { return 0; }",
+       "return @cstr(global_buf) accepted");
+
+    /* BUG-260: local-derived escape through dereferenced function call */
+    err("static Pool(*u32, 4) ptr_pool;\n"
+        "void bad() {\n"
+        "    u32 x = 42;\n"
+        "    Handle(*u32) h = ptr_pool.alloc() orelse return;\n"
+        "    *ptr_pool.get(h) = &x;\n"
+        "}",
+        "store &local through *pool.get() rejected");
 }
 
 /* ================================================================ */

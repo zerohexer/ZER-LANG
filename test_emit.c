@@ -2881,6 +2881,30 @@ int main(void) {
         43,
         "multi-dim array u8[10][3] works");
 
+    /* BUG-272: volatile if-unwrap preserves qualifier (compile-only check) */
+    test_compile_and_run(
+        "?u32 get_val() { return 42; }\n"
+        "u32 main() {\n"
+        "    volatile ?u32 reg = get_val();\n"
+        "    if (reg) |v| { return v; }\n"
+        "    return 0;\n"
+        "}\n",
+        42,
+        "volatile optional if-unwrap compiles and works");
+
+    /* BUG-273: volatile array assignment uses byte loop */
+    test_compile_and_run(
+        "volatile u8[4] hw;\n"
+        "u32 main() {\n"
+        "    u8[4] src;\n"
+        "    src[0] = 42;\n"
+        "    src[1] = 1;\n"
+        "    hw = src;\n"
+        "    return @truncate(u32, hw[0]) + @truncate(u32, hw[1]);\n"
+        "}\n",
+        43,
+        "volatile array assignment works (byte loop)");
+
     /* BUG-268: union switch mutable capture modifies original (not copy) */
     test_compile_and_run(
         "struct A { u32 x; }\n"

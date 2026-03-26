@@ -64,6 +64,36 @@ static inline bool is_null_sentinel(Type *inner) {
 /* NOTE: Use is_null_sentinel(type) for full distinct-aware check.
  * IS_NULL_SENTINEL macro kept for backward compat where only kind is available. */
 
+/* ---- Qualifier helpers (RF11) ---- */
+
+/* Walk an expression to its root ident and look up the symbol.
+ * Returns the symbol or NULL if not found. Used to detect volatile/const. */
+static Symbol *expr_root_symbol(Emitter *e, Node *expr) {
+    Node *root = expr;
+    while (root) {
+        if (root->kind == NODE_FIELD) root = root->field.object;
+        else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+        else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        else break;
+    }
+    if (root && root->kind == NODE_IDENT) {
+        /* try local scope first, then global */
+        Symbol *s = scope_lookup(e->checker->current_scope,
+            root->ident.name, (uint32_t)root->ident.name_len);
+        if (!s) s = scope_lookup(e->checker->global_scope,
+            root->ident.name, (uint32_t)root->ident.name_len);
+        return s;
+    }
+    return NULL;
+}
+
+/* Check if an expression's root symbol has volatile qualifier. */
+static bool expr_is_volatile(Emitter *e, Node *expr) {
+    Symbol *s = expr_root_symbol(e, expr);
+    return s && s->is_volatile;
+}
+
 /* ---- Type emission ---- */
 
 static void emit_type(Emitter *e, Type *t);
@@ -681,19 +711,7 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *tgt_type = checker_get_type(e->checker,node->assign.target);
             if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
                 /* BUG-273: check if target is volatile — use byte loop instead of memcpy */
-                bool arr_volatile = false;
-                {
-                    Node *ar = node->assign.target;
-                    while (ar && (ar->kind == NODE_FIELD || ar->kind == NODE_INDEX)) {
-                        if (ar->kind == NODE_FIELD) ar = ar->field.object;
-                        else ar = ar->index_expr.object;
-                    }
-                    if (ar && ar->kind == NODE_IDENT) {
-                        Symbol *as = scope_lookup(e->checker->global_scope,
-                            ar->ident.name, (uint32_t)ar->ident.name_len);
-                        if (as && as->is_volatile) arr_volatile = true;
-                    }
-                }
+                bool arr_volatile = expr_is_volatile(e, node->assign.target);
                 int tmp = e->temp_count++;
                 if (arr_volatile) {
                     emit(e, "({ volatile uint8_t *_zer_vd%d = (volatile uint8_t*)&(", tmp);
@@ -1669,25 +1687,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 checker_get_type(e->checker,node->intrinsic.args[0]) : NULL;
             bool dest_is_slice = buf_type && buf_type->kind == TYPE_SLICE;
             /* BUG-223/RF7: check if destination is volatile — walk field/index chains */
-            bool dest_volatile = false;
-            if (node->intrinsic.arg_count > 0) {
-                Node *droot = node->intrinsic.args[0];
-                while (droot && (droot->kind == NODE_FIELD || droot->kind == NODE_INDEX)) {
-                    if (droot->kind == NODE_FIELD) droot = droot->field.object;
-                    else droot = droot->index_expr.object;
-                }
-                if (droot && droot->kind == NODE_IDENT) {
-                    /* check global scope first, then local scope */
-                    Symbol *dsym = scope_lookup(e->checker->global_scope,
-                        droot->ident.name, (uint32_t)droot->ident.name_len);
-                    if (!dsym) {
-                        /* try current function scope for local volatile vars */
-                        dsym = scope_lookup(e->checker->current_scope,
-                            droot->ident.name, (uint32_t)droot->ident.name_len);
-                    }
-                    if (dsym && dsym->is_volatile) dest_volatile = true;
-                }
-            }
+            /* RF11: use shared volatile detection helper */
+            bool dest_volatile = (node->intrinsic.arg_count > 0) ?
+                expr_is_volatile(e, node->intrinsic.args[0]) : false;
             const char *vol = dest_volatile ? "volatile " : "";
             if (dest_is_slice) {
                 /* BUG-209: slice destination — hoist as slice, use .ptr */
@@ -2000,15 +2002,8 @@ static void emit_stmt(Emitter *e, Node *node) {
                  * BUG-267/272: use explicit type to preserve volatile qualifier. */
                 emit_indent(e);
                 if (cond_type) {
-                    /* BUG-272: check if source is volatile (symbol-level) */
-                    bool cond_volatile = false;
-                    if (node->if_stmt.cond->kind == NODE_IDENT) {
-                        Symbol *cs = scope_lookup(e->checker->global_scope,
-                            node->if_stmt.cond->ident.name,
-                            (uint32_t)node->if_stmt.cond->ident.name_len);
-                        if (cs && cs->is_volatile) cond_volatile = true;
-                    }
-                    if (cond_volatile) emit(e, "volatile ");
+                    /* BUG-272: preserve volatile from source (RF11 helper) */
+                    if (expr_is_volatile(e, node->if_stmt.cond)) emit(e, "volatile ");
                     char uwname[32];
                     snprintf(uwname, sizeof(uwname), "_zer_uw%d", tmp);
                     emit_type_and_name(e, cond_type, uwname, strlen(uwname));
@@ -2269,20 +2264,8 @@ static void emit_stmt(Emitter *e, Node *node) {
         /* BUG-271: unwrap distinct before checking for union switch */
         Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
         bool is_union_switch = sw_eff && sw_eff->kind == TYPE_UNION;
-        /* BUG-274: detect volatile switch expression for capture qualifiers */
-        bool sw_volatile = false;
-        {
-            Node *swr = node->switch_stmt.expr;
-            while (swr && (swr->kind == NODE_FIELD || swr->kind == NODE_INDEX)) {
-                if (swr->kind == NODE_FIELD) swr = swr->field.object;
-                else swr = swr->index_expr.object;
-            }
-            if (swr && swr->kind == NODE_IDENT) {
-                Symbol *sws = scope_lookup(e->checker->global_scope,
-                    swr->ident.name, (uint32_t)swr->ident.name_len);
-                if (sws && sws->is_volatile) sw_volatile = true;
-            }
-        }
+        /* BUG-274: detect volatile switch expression (RF11 helper) */
+        bool sw_volatile = expr_is_volatile(e, node->switch_stmt.expr);
         /* BUG-196b: detect struct-based optional in switch */
         bool is_opt_switch = false;
         if (sw_type && sw_type->kind == TYPE_OPTIONAL) {

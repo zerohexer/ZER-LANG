@@ -477,3 +477,6 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 106. **Const expr div-by-zero (BUG-269)** — Checker uses `eval_const_expr(divisor)` instead of checking only `NODE_INT_LIT`. Catches `10 / (2 - 2)` at compile time.
 107. **Array return type rejected (BUG-270)** — In `check_func_body`, if resolved return type is TYPE_ARRAY, error. C forbids array returns. Suggest struct wrapper or slice.
 108. **Distinct union/enum switch unwrap (BUG-271)** — Both checker and emitter call `type_unwrap_distinct` on switch expression type before TYPE_UNION/TYPE_ENUM dispatch. `expr_eff` / `sw_eff` used for all variant lookups and tag emission.
+109. **Volatile if-unwrap copy (BUG-272)** — Checks if condition ident's symbol has `is_volatile`. If so, emits `volatile` before the typed copy. Uses `emit_type_and_name` for correct func ptr name placement.
+110. **Volatile array assign byte loop (BUG-273)** — Array assignment checks target root symbol for `is_volatile`. If volatile, emits `for(_i) vd[_i] = vs[_i]` byte loop instead of memcpy. Same pattern as @cstr volatile (BUG-223).
+111. **Volatile union capture pointer (BUG-274)** — `sw_volatile` flag detected from switch expression root symbol. When set, mutable capture `|*v|` emits `volatile T *v` instead of `T *v`.

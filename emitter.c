@@ -680,14 +680,38 @@ static void emit_expr(Emitter *e, Node *node) {
         if (node->assign.op == TOK_EQ) {
             Type *tgt_type = checker_get_type(e->checker,node->assign.target);
             if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
+                /* BUG-273: check if target is volatile — use byte loop instead of memcpy */
+                bool arr_volatile = false;
+                {
+                    Node *ar = node->assign.target;
+                    while (ar && (ar->kind == NODE_FIELD || ar->kind == NODE_INDEX)) {
+                        if (ar->kind == NODE_FIELD) ar = ar->field.object;
+                        else ar = ar->index_expr.object;
+                    }
+                    if (ar && ar->kind == NODE_IDENT) {
+                        Symbol *as = scope_lookup(e->checker->global_scope,
+                            ar->ident.name, (uint32_t)ar->ident.name_len);
+                        if (as && as->is_volatile) arr_volatile = true;
+                    }
+                }
                 int tmp = e->temp_count++;
-                emit(e, "({ __typeof__(");
-                emit_expr(e, node->assign.target);
-                emit(e, ") *_zer_ma%d = &(", tmp);
-                emit_expr(e, node->assign.target);
-                emit(e, "); memcpy(_zer_ma%d, ", tmp);
-                emit_expr(e, node->assign.value);
-                emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
+                if (arr_volatile) {
+                    emit(e, "({ volatile uint8_t *_zer_vd%d = (volatile uint8_t*)&(", tmp);
+                    emit_expr(e, node->assign.target);
+                    emit(e, "); const uint8_t *_zer_vs%d = (const uint8_t*)&(", tmp);
+                    emit_expr(e, node->assign.value);
+                    emit(e, "); for (size_t _i = 0; _i < sizeof(");
+                    emit_expr(e, node->assign.target);
+                    emit(e, "); _i++) _zer_vd%d[_i] = _zer_vs%d[_i]; })", tmp, tmp);
+                } else {
+                    emit(e, "({ __typeof__(");
+                    emit_expr(e, node->assign.target);
+                    emit(e, ") *_zer_ma%d = &(", tmp);
+                    emit_expr(e, node->assign.target);
+                    emit(e, "); memcpy(_zer_ma%d, ", tmp);
+                    emit_expr(e, node->assign.value);
+                    emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
+                }
                 goto assign_done;
             }
         }
@@ -1973,10 +1997,18 @@ static void emit_stmt(Emitter *e, Node *node) {
                      node->if_stmt.capture_name, tmp);
             } else {
                 /* |val| or ?*T — use copy.
-                 * BUG-267: use explicit type to preserve volatile qualifier.
-                 * Use emit_type_and_name for func ptr (name goes inside (*)). */
+                 * BUG-267/272: use explicit type to preserve volatile qualifier. */
                 emit_indent(e);
                 if (cond_type) {
+                    /* BUG-272: check if source is volatile (symbol-level) */
+                    bool cond_volatile = false;
+                    if (node->if_stmt.cond->kind == NODE_IDENT) {
+                        Symbol *cs = scope_lookup(e->checker->global_scope,
+                            node->if_stmt.cond->ident.name,
+                            (uint32_t)node->if_stmt.cond->ident.name_len);
+                        if (cs && cs->is_volatile) cond_volatile = true;
+                    }
+                    if (cond_volatile) emit(e, "volatile ");
                     char uwname[32];
                     snprintf(uwname, sizeof(uwname), "_zer_uw%d", tmp);
                     emit_type_and_name(e, cond_type, uwname, strlen(uwname));
@@ -2237,6 +2269,20 @@ static void emit_stmt(Emitter *e, Node *node) {
         /* BUG-271: unwrap distinct before checking for union switch */
         Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
         bool is_union_switch = sw_eff && sw_eff->kind == TYPE_UNION;
+        /* BUG-274: detect volatile switch expression for capture qualifiers */
+        bool sw_volatile = false;
+        {
+            Node *swr = node->switch_stmt.expr;
+            while (swr && (swr->kind == NODE_FIELD || swr->kind == NODE_INDEX)) {
+                if (swr->kind == NODE_FIELD) swr = swr->field.object;
+                else swr = swr->index_expr.object;
+            }
+            if (swr && swr->kind == NODE_IDENT) {
+                Symbol *sws = scope_lookup(e->checker->global_scope,
+                    swr->ident.name, (uint32_t)swr->ident.name_len);
+                if (sws && sws->is_volatile) sw_volatile = true;
+            }
+        }
         /* BUG-196b: detect struct-based optional in switch */
         bool is_opt_switch = false;
         if (sw_type && sw_type->kind == TYPE_OPTIONAL) {
@@ -2372,6 +2418,8 @@ static void emit_stmt(Emitter *e, Node *node) {
                             break;
                         }
                     }
+                    /* BUG-274: preserve volatile on variant pointer */
+                    if (sw_volatile) emit(e, "volatile ");
                     if (vtype) emit_type(e, vtype);
                     else emit(e, "void");
                     emit(e, " *%.*s = &_zer_swp%d->%.*s;\n",

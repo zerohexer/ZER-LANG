@@ -700,6 +700,15 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 **134. Distinct typedef union/enum in switch unwrapped.**
 `switch(distinct_event)` failed when the underlying type was a union. Both checker and emitter now call `type_unwrap_distinct` before TYPE_UNION/TYPE_ENUM dispatch. (BUG-271)
 
+**135. Volatile preserved in if-unwrap capture initial copy.**
+`volatile ?u32 reg; if(reg) |v|` now emits `volatile _zer_opt_u32 _zer_uw0 = reg` — volatile qualifier carried from source symbol. (BUG-272)
+
+**136. Volatile array assignment uses byte loop, not memcpy.**
+`hw_buf = src` where `hw_buf` is volatile emits `for(_i) vd[_i] = vs[_i]` instead of `memcpy`. Same pattern as @cstr volatile (BUG-223). (BUG-273)
+
+**137. Volatile union switch capture pointer preserves qualifier.**
+`switch(volatile_msg) { .a => |*v| }` now emits `volatile struct A *v = &_zer_swp->a`. Detects volatile on switch expression root symbol. (BUG-274)
+
 ### Structural Refactors RF8-RF10 (2026-03-26)
 
 **RF8: `eval_const_expr` uses `CONST_EVAL_FAIL` (INT64_MIN) sentinel.**

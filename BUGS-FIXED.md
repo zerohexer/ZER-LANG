@@ -1462,3 +1462,21 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Switch dispatch checked `sw_type->kind == TYPE_UNION` without unwrapping distinct.
 - **Fix:** `type_unwrap_distinct` before dispatch in both checker (`expr_eff`) and emitter (`sw_eff`).
 - **Test:** `test_emit.c` — distinct typedef union switch works (returns 77).
+
+### BUG-272: Volatile stripped in if-unwrap capture copy
+- **Symptom:** `volatile ?u32 reg; if(reg) |v|` — initial copy loses volatile qualifier.
+- **Root cause:** `emit_type_and_name` doesn't carry symbol-level volatile to emitted type.
+- **Fix:** Check source ident's `is_volatile` flag, emit `volatile` prefix on typed copy.
+- **Test:** Verified emitted C shows `volatile _zer_opt_u32 _zer_uw0`.
+
+### BUG-273: Volatile array assignment uses memcpy
+- **Symptom:** `volatile u8[16] hw; hw = src` emits `memcpy` which doesn't respect volatile.
+- **Root cause:** Array assign handler always used memcpy regardless of volatile.
+- **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
+- **Test:** Verified emitted C uses volatile byte loop.
+
+### BUG-274: Union switch mutable capture drops volatile on pointer
+- **Symptom:** `switch(volatile_msg) { .a => |*v| }` — `v` declared as `struct A *`, not `volatile struct A *`.
+- **Root cause:** Variant pointer type emitted without checking if switch expression is volatile.
+- **Fix:** `sw_volatile` flag detected from switch expression root symbol. Mutable capture emits `volatile T *v`.
+- **Test:** Verified emitted C shows `volatile struct A *v`.

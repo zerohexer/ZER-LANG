@@ -1,0 +1,344 @@
+// ZER Standard Library — str.zer
+// Byte slice operations. No heap. No cinclude. Pure ZER.
+//
+// All functions operate on []u8 slices (bounded, safe).
+// No null terminators — slices carry their length.
+
+// ================================================================
+// Comparison
+// ================================================================
+
+// Compare two byte slices for equality
+bool bytes_equal(const []u8 a, const []u8 b) {
+    if (a.len != b.len) { return false; }
+    for (usize i = 0; i < a.len; i += 1) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+// Compare with case-insensitive ASCII matching
+bool bytes_equal_ci(const []u8 a, const []u8 b) {
+    if (a.len != b.len) { return false; }
+    for (usize i = 0; i < a.len; i += 1) {
+        u8 ca = a[i];
+        u8 cb = b[i];
+        if (ca >= 65) { if (ca <= 90) { ca += 32; } }
+        if (cb >= 65) { if (cb <= 90) { cb += 32; } }
+        if (ca != cb) { return false; }
+    }
+    return true;
+}
+
+// Lexicographic comparison: -1 (a < b), 0 (equal), 1 (a > b)
+i32 bytes_compare(const []u8 a, const []u8 b) {
+    usize min_len = a.len;
+    if (b.len < min_len) { min_len = b.len; }
+    for (usize i = 0; i < min_len; i += 1) {
+        if (a[i] < b[i]) { return -1; }
+        if (a[i] > b[i]) { return 1; }
+    }
+    if (a.len < b.len) { return -1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+// ================================================================
+// Search
+// ================================================================
+
+// Find first occurrence of needle in haystack. Returns index or null.
+?usize bytes_find(const []u8 haystack, const []u8 needle) {
+    if (needle.len == 0) { return 0; }
+    if (needle.len > haystack.len) { return null; }
+    usize end = haystack.len - needle.len;
+    for (usize i = 0; i <= end; i += 1) {
+        bool match = true;
+        for (usize j = 0; j < needle.len; j += 1) {
+            if (haystack[i + j] != needle[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) { return i; }
+    }
+    return null;
+}
+
+// Find last occurrence of needle in haystack
+?usize bytes_find_last(const []u8 haystack, const []u8 needle) {
+    if (needle.len == 0) { return haystack.len; }
+    if (needle.len > haystack.len) { return null; }
+    usize i = haystack.len - needle.len;
+    while (true) {
+        bool match = true;
+        for (usize j = 0; j < needle.len; j += 1) {
+            if (haystack[i + j] != needle[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) { return i; }
+        if (i == 0) { break; }
+        i -= 1;
+    }
+    return null;
+}
+
+// Find first occurrence of a single byte
+?usize bytes_find_byte(const []u8 haystack, u8 needle) {
+    for (usize i = 0; i < haystack.len; i += 1) {
+        if (haystack[i] == needle) { return i; }
+    }
+    return null;
+}
+
+// Check if haystack contains needle
+bool bytes_contains(const []u8 haystack, const []u8 needle) {
+    ?usize idx = bytes_find(haystack, needle);
+    if (idx) |_i| { return true; }
+    return false;
+}
+
+// ================================================================
+// Prefix / Suffix
+// ================================================================
+
+// Check if slice starts with prefix
+bool bytes_starts_with(const []u8 s, const []u8 prefix) {
+    if (prefix.len > s.len) { return false; }
+    return bytes_equal(s[0..prefix.len], prefix);
+}
+
+// Check if slice ends with suffix
+bool bytes_ends_with(const []u8 s, const []u8 suffix) {
+    if (suffix.len > s.len) { return false; }
+    usize start = s.len - suffix.len;
+    return bytes_equal(s[start..s.len], suffix);
+}
+
+// ================================================================
+// Copy / Fill
+// ================================================================
+
+// Copy src into dst. Returns bytes written (min of both lengths).
+usize bytes_copy([]u8 dst, const []u8 src) {
+    usize len = src.len;
+    if (dst.len < len) { len = dst.len; }
+    for (usize i = 0; i < len; i += 1) {
+        dst[i] = src[i];
+    }
+    return len;
+}
+
+// Fill slice with a single byte value
+void bytes_fill([]u8 dst, u8 val) {
+    for (usize i = 0; i < dst.len; i += 1) {
+        dst[i] = val;
+    }
+}
+
+// Zero out a slice
+void bytes_zero([]u8 dst) {
+    bytes_fill(dst, 0);
+}
+
+// ================================================================
+// Trim (whitespace removal)
+// ================================================================
+
+// Check if byte is ASCII whitespace (space, tab, newline, carriage return)
+bool u8_is_space(u8 c) {
+    if (c == 32) { return true; }
+    if (c == 9) { return true; }
+    if (c == 10) { return true; }
+    if (c == 13) { return true; }
+    return false;
+}
+
+// Trim leading whitespace — returns sub-slice
+const []u8 bytes_trim_left(const []u8 s) {
+    usize start = 0;
+    while (start < s.len) {
+        if (!u8_is_space(s[start])) { break; }
+        start += 1;
+    }
+    return s[start..s.len];
+}
+
+// Trim trailing whitespace — returns sub-slice
+const []u8 bytes_trim_right(const []u8 s) {
+    usize end = s.len;
+    while (end > 0) {
+        if (!u8_is_space(s[end - 1])) { break; }
+        end -= 1;
+    }
+    return s[0..end];
+}
+
+// Trim both sides
+const []u8 bytes_trim(const []u8 s) {
+    return bytes_trim_right(bytes_trim_left(s));
+}
+
+// ================================================================
+// Character classification (ASCII)
+// ================================================================
+
+bool u8_is_alpha(u8 c) {
+    if (c >= 65) { if (c <= 90) { return true; } }
+    if (c >= 97) { if (c <= 122) { return true; } }
+    return false;
+}
+
+bool u8_is_digit(u8 c) {
+    if (c >= 48) { if (c <= 57) { return true; } }
+    return false;
+}
+
+bool u8_is_alnum(u8 c) {
+    return u8_is_alpha(c) || u8_is_digit(c);
+}
+
+bool u8_is_hex(u8 c) {
+    if (u8_is_digit(c)) { return true; }
+    if (c >= 65) { if (c <= 70) { return true; } }
+    if (c >= 97) { if (c <= 102) { return true; } }
+    return false;
+}
+
+bool u8_is_upper(u8 c) {
+    if (c >= 65) { if (c <= 90) { return true; } }
+    return false;
+}
+
+bool u8_is_lower(u8 c) {
+    if (c >= 97) { if (c <= 122) { return true; } }
+    return false;
+}
+
+u8 u8_to_lower(u8 c) {
+    if (u8_is_upper(c)) { return c + 32; }
+    return c;
+}
+
+u8 u8_to_upper(u8 c) {
+    if (u8_is_lower(c)) { return c - 32; }
+    return c;
+}
+
+// ================================================================
+// Integer parsing
+// ================================================================
+
+// Parse unsigned decimal integer from byte slice.
+// Returns the parsed value and how many bytes were consumed.
+// Returns null if no digits found.
+struct ParseResult {
+    u64 value;
+    usize consumed;
+}
+
+?ParseResult parse_u64(const []u8 s) {
+    if (s.len == 0) { return null; }
+    if (!u8_is_digit(s[0])) { return null; }
+    u64 val = 0;
+    usize i = 0;
+    while (i < s.len) {
+        if (!u8_is_digit(s[i])) { break; }
+        val = val * 10 + @truncate(u64, s[i] - 48);
+        i += 1;
+    }
+    ParseResult r;
+    r.value = val;
+    r.consumed = i;
+    return r;
+}
+
+// Parse signed decimal integer
+?ParseResult parse_i64(const []u8 s) {
+    if (s.len == 0) { return null; }
+    bool negative = false;
+    usize start = 0;
+    if (s[0] == 45) {
+        negative = true;
+        start = 1;
+    }
+    if (start >= s.len) { return null; }
+    ?ParseResult r = parse_u64(s[start..s.len]);
+    if (r) |pr| {
+        ParseResult result;
+        if (negative) {
+            result.value = @bitcast(u64, -@bitcast(i64, pr.value));
+        } else {
+            result.value = pr.value;
+        }
+        result.consumed = pr.consumed + start;
+        return result;
+    }
+    return null;
+}
+
+// ================================================================
+// Integer formatting
+// ================================================================
+
+// Write unsigned decimal integer into buffer.
+// Returns bytes written.
+usize fmt_u64([]u8 buf, u64 val) {
+    if (val == 0) {
+        if (buf.len > 0) { buf[0] = 48; }
+        return 1;
+    }
+    // Write digits in reverse
+    u8[20] tmp;
+    usize len = 0;
+    u64 v = val;
+    while (v > 0) {
+        tmp[len] = @truncate(u8, v % 10) + 48;
+        v = v / 10;
+        len += 1;
+    }
+    // Copy reversed
+    usize written = len;
+    if (written > buf.len) { written = buf.len; }
+    for (usize i = 0; i < written; i += 1) {
+        buf[i] = tmp[len - 1 - i];
+    }
+    return written;
+}
+
+// Write signed decimal integer into buffer
+usize fmt_i64([]u8 buf, i64 val) {
+    if (val >= 0) { return fmt_u64(buf, @bitcast(u64, val)); }
+    if (buf.len == 0) { return 0; }
+    buf[0] = 45;
+    return 1 + fmt_u64(buf[1..buf.len], @bitcast(u64, -val));
+}
+
+// Write hex into buffer (no 0x prefix)
+usize fmt_hex([]u8 buf, u64 val) {
+    if (val == 0) {
+        if (buf.len > 0) { buf[0] = 48; }
+        return 1;
+    }
+    u8[16] tmp;
+    usize len = 0;
+    u64 v = val;
+    while (v > 0) {
+        u8 nib = @truncate(u8, v % 16);
+        if (nib < 10) {
+            tmp[len] = nib + 48;
+        } else {
+            tmp[len] = nib - 10 + 97;
+        }
+        v = v / 16;
+        len += 1;
+    }
+    usize written = len;
+    if (written > buf.len) { written = buf.len; }
+    for (usize i = 0; i < written; i += 1) {
+        buf[i] = tmp[len - 1 - i];
+    }
+    return written;
+}

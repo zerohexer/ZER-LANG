@@ -1742,11 +1742,38 @@ static Node *parse_declaration(Parser *p) {
         return parse_func_or_var(p, true);
     }
 
-    /* const global variable */
-    if (match(p, TOK_CONST)) {
-        Node *n = parse_var_decl(p, true, false, false);
-        n->kind = NODE_GLOBAL_VAR;
-        return n;
+    /* const global variable or function with const return type */
+    if (check(p, TOK_CONST)) {
+        /* peek ahead: const TYPE NAME '(' → function with const return type */
+        Scanner saved_sc = *p->scanner;
+        Token saved_cur = p->current;
+        Token saved_prev = p->previous;
+        advance(p); /* consume const */
+        int depth = 0;
+        bool found_func = false;
+        while (!check(p, TOK_EOF)) {
+            if (check(p, TOK_LBRACKET)) { depth += 1; advance(p); continue; }
+            if (check(p, TOK_RBRACKET)) { if (depth > 0) depth -= 1; advance(p); continue; }
+            if (depth == 0 && check(p, TOK_IDENT)) {
+                advance(p);
+                found_func = check(p, TOK_LPAREN);
+                break;
+            }
+            if (check(p, TOK_STAR) || check(p, TOK_QUESTION)) { advance(p); continue; }
+            if (p->current.type >= TOK_U8 && p->current.type <= TOK_VOID) { advance(p); continue; }
+            break;
+        }
+        *p->scanner = saved_sc;
+        p->current = saved_cur;
+        p->previous = saved_prev;
+        if (found_func) {
+            return parse_func_or_var(p, false);
+        } else {
+            advance(p); /* re-consume const */
+            Node *n = parse_var_decl(p, true, false, false);
+            n->kind = NODE_GLOBAL_VAR;
+            return n;
+        }
     }
 
     /* volatile global variable or function with volatile return type */

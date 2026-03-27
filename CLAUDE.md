@@ -720,6 +720,9 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**156. Rvalue struct field assignment rejected.**
+`get_s().x = 5` now caught — walks field/index chains to find base NODE_CALL, checks if return type is non-pointer (value type → rvalue). Pointer-returning calls (`pool.get(h).field`) are still valid lvalues via auto-deref. (BUG-302)
+
 **153. `type_unwrap_distinct` recursive — handles any nesting depth.**
 `distinct typedef (distinct typedef u32) P2` now unwraps fully to `u32`. Uses `while` loop. Fixes arithmetic, type queries, and intrinsic validation on nested distinct types. (BUG-295)
 

@@ -1475,6 +1475,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-302: Rvalue struct field assignment
+- **Symptom:** `get_s().x = 5` passes checker but GCC rejects — "lvalue required."
+- **Root cause:** BUG-294 lvalue check only caught direct NODE_CALL, not field chains on calls.
+- **Fix:** Walk field/index chains to base. NODE_CALL with non-pointer return → reject. Pointer return → valid lvalue.
+- **Test:** `test_checker_full.c` — rvalue field assign rejected, lvalue field assign accepted.
+
 ### BUG-295: `type_unwrap_distinct` not recursive
 - **Symptom:** `distinct typedef P1 P2; P2 x + y` — rejected as "not numeric."
 - **Root cause:** Single `if` unwrap, not `while` loop. P2 → P1 (still distinct).

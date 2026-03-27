@@ -1597,9 +1597,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     Type *arg = arg_types[i];
 
                     /* const safety: reject string literal → mutable slice param
-                     * (string data is in .rodata, writing segfaults) */
+                     * (string data is in .rodata, writing segfaults)
+                     * BUG-313: only reject if param is NOT const — const []u8 is safe */
                     if (node->call.args[i]->kind == NODE_STRING_LIT &&
-                        param && param->kind == TYPE_SLICE) {
+                        param && param->kind == TYPE_SLICE &&
+                        !param->slice.is_const) {
                         checker_error(c, node->loc.line,
                             "argument %d: cannot pass string literal to mutable []u8 parameter — "
                             "use const []u8 parameter or copy the string first",

@@ -1518,6 +1518,14 @@ static void test_negative_sweep(void) {
        "u32 main() { volatile []u8 s = hw_regs; return 0; }",
        "volatile array to volatile slice var-decl accepted");
 
+    /* BUG-313: string literal to const []u8 param should work */
+    ok("void f(const []u8 s) { }\n"
+       "u32 main() { f(\"hello\"); return 0; }",
+       "string literal to const []u8 param accepted");
+    err("void f([]u8 s) { }\n"
+        "u32 main() { f(\"hello\"); return 0; }",
+        "string literal to mutable []u8 param rejected");
+
     /* BUG-304: @ptrcast const stripping */
     err("const u32 val = 42;\n"
         "void f() { *u32 p = @ptrcast(*u32, &val); }",

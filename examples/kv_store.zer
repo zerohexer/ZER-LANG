@@ -1,0 +1,194 @@
+// ZER Key-Value Store — hashmap with Pool allocator
+// No malloc — Pool is a fixed-slot allocator (like a slab).
+//
+// Pool is NOT stack. It's a global array of slots with generation
+// counters. Same memory layout as a kernel slab allocator.
+// O(1) alloc, O(1) free, use-after-free detection.
+
+struct KvEntry {
+    u8[32] key;
+    u32 key_len;
+    u8[64] value;
+    u32 val_len;
+    u32 next_handle;   // raw handle bits for next in chain
+    bool has_next;
+}
+
+struct KvTable {
+    u32[16] bucket_handle;   // raw handle bits per bucket
+    bool[16] bucket_used;    // whether bucket has a head entry
+    u32 count;
+}
+
+// Global pool — 256 entry slots, NOT on the stack.
+// This is static memory with O(1) alloc/free.
+static Pool(KvEntry, 256) entries;
+
+u32 kv_hash(const []u8 key, u32 table_size) {
+    u32 h = 0;
+    for (u32 i = 0; i < @truncate(u32, key.len); i += 1) {
+        h = h * 31 + @truncate(u32, key[i]);
+    }
+    return h % table_size;
+}
+
+bool key_matches(Handle(KvEntry) h, const []u8 key) {
+    u32 klen = entries.get(h).key_len;
+    if (klen != @truncate(u32, key.len)) { return false; }
+    for (u32 i = 0; i < klen; i += 1) {
+        if (entries.get(h).key[i] != key[i]) { return false; }
+    }
+    return true;
+}
+
+bool kv_set(*KvTable t, const []u8 key, const []u8 value) {
+    u32 idx = kv_hash(key, 16);
+
+    // Search chain for existing key
+    if (t.bucket_used[idx]) {
+        u32 raw = t.bucket_handle[idx];
+        bool searching = true;
+        while (searching) {
+            Handle(KvEntry) cur = @bitcast(Handle(KvEntry), raw);
+            if (key_matches(cur, key)) {
+                // Update value inline
+                u32 vlen = @truncate(u32, value.len);
+                if (vlen > 64) { vlen = 64; }
+                for (u32 i = 0; i < vlen; i += 1) {
+                    entries.get(cur).value[i] = value[i];
+                }
+                entries.get(cur).val_len = vlen;
+                return true;
+            }
+            if (entries.get(cur).has_next) {
+                raw = entries.get(cur).next_handle;
+            } else {
+                searching = false;
+            }
+        }
+    }
+
+    // Allocate new entry
+    ?Handle(KvEntry) maybe_h = entries.alloc();
+    Handle(KvEntry) h = maybe_h orelse return;
+
+    // Copy key inline (pool.get() is non-storable)
+    u32 klen = @truncate(u32, key.len);
+    if (klen > 32) { klen = 32; }
+    for (u32 i = 0; i < klen; i += 1) {
+        entries.get(h).key[i] = key[i];
+    }
+    entries.get(h).key_len = klen;
+
+    // Copy value
+    u32 vlen = @truncate(u32, value.len);
+    if (vlen > 64) { vlen = 64; }
+    for (u32 i = 0; i < vlen; i += 1) {
+        entries.get(h).value[i] = value[i];
+    }
+    entries.get(h).val_len = vlen;
+
+    // Head insert
+    if (t.bucket_used[idx]) {
+        entries.get(h).next_handle = t.bucket_handle[idx];
+        entries.get(h).has_next = true;
+    } else {
+        entries.get(h).has_next = false;
+    }
+    t.bucket_handle[idx] = @bitcast(u32, h);
+    t.bucket_used[idx] = true;
+    t.count += 1;
+    return true;
+}
+
+u32 kv_get_len(*KvTable t, const []u8 key) {
+    u32 idx = kv_hash(key, 16);
+    if (!t.bucket_used[idx]) { return 0; }
+
+    u32 raw = t.bucket_handle[idx];
+    bool searching = true;
+    while (searching) {
+        Handle(KvEntry) cur = @bitcast(Handle(KvEntry), raw);
+        if (key_matches(cur, key)) {
+            return entries.get(cur).val_len;
+        }
+        if (entries.get(cur).has_next) {
+            raw = entries.get(cur).next_handle;
+        } else {
+            searching = false;
+        }
+    }
+    return 0;
+}
+
+bool kv_delete(*KvTable t, const []u8 key) {
+    u32 idx = kv_hash(key, 16);
+    if (!t.bucket_used[idx]) { return false; }
+
+    u32 raw = t.bucket_handle[idx];
+    Handle(KvEntry) cur = @bitcast(Handle(KvEntry), raw);
+
+    // Check head entry
+    if (key_matches(cur, key)) {
+        if (entries.get(cur).has_next) {
+            t.bucket_handle[idx] = entries.get(cur).next_handle;
+        } else {
+            t.bucket_used[idx] = false;
+        }
+        entries.free(cur);
+        t.count -= 1;
+        return true;
+    }
+
+    // Walk chain
+    while (entries.get(cur).has_next) {
+        u32 next_raw = entries.get(cur).next_handle;
+        Handle(KvEntry) next = @bitcast(Handle(KvEntry), next_raw);
+        if (key_matches(next, key)) {
+            if (entries.get(next).has_next) {
+                entries.get(cur).next_handle = entries.get(next).next_handle;
+            } else {
+                entries.get(cur).has_next = false;
+            }
+            entries.free(next);
+            t.count -= 1;
+            return true;
+        }
+        cur = next;
+    }
+    return false;
+}
+
+u32 main() {
+    KvTable table;
+    table.count = 0;
+
+    // Insert 3 entries
+    kv_set(&table, "username", "zerohexer");
+    kv_set(&table, "project", "zer-lang");
+    kv_set(&table, "version", "0.1");
+
+    u32 result = 0;
+
+    // Get: "zerohexer" = 9 chars
+    result += kv_get_len(&table, "username");
+
+    // Get: "zer-lang" = 8 chars
+    result += kv_get_len(&table, "project");
+
+    // Update username
+    kv_set(&table, "username", "newuser");
+    // "newuser" = 7 chars
+    result += kv_get_len(&table, "username");
+
+    // Delete project
+    kv_delete(&table, "project");
+    // Should be 0 (not found)
+    result += kv_get_len(&table, "project");
+
+    // Count = 2 (username + version)
+    result += table.count;
+
+    // 9 + 8 + 7 + 0 + 2 = 26
+    return result;
+}

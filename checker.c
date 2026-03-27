@@ -551,11 +551,17 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_VOLATILE: {
         Type *inner = resolve_type(c, tn->qualified.inner);
-        /* propagate volatile to pointer type for codegen */
+        /* propagate volatile to pointer/slice type for codegen */
         if (inner && inner->kind == TYPE_POINTER) {
             Type *vp = type_pointer(c->arena, inner->pointer.inner);
             vp->pointer.is_volatile = true;
+            if (inner->pointer.is_const) vp->pointer.is_const = true;
             return vp;
+        }
+        if (inner && inner->kind == TYPE_SLICE) {
+            Type *vs = type_volatile_slice(c->arena, inner->slice.inner);
+            if (inner->slice.is_const) vs->slice.is_const = true;
+            return vs;
         }
         return inner;
     }
@@ -1316,12 +1322,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         "cannot assign const array to mutable slice — "
                         "would allow writing to read-only memory");
                 }
-                /* BUG-310: volatile array → slice strips volatile */
+                /* BUG-310: volatile array → volatile slice propagation.
+                 * If source is volatile array and target is non-volatile slice, reject. */
                 if (vsym && vsym->is_volatile &&
-                    target->kind == TYPE_SLICE) {
+                    target->kind == TYPE_SLICE && !target->slice.is_volatile) {
                     checker_error(c, node->loc.line,
-                        "cannot assign volatile array to slice — "
-                        "volatile qualifier would be stripped");
+                        "cannot assign volatile array to non-volatile slice — "
+                        "use 'volatile []%s' to preserve volatile qualifier",
+                        type_name(target->slice.inner));
                 }
             }
         }
@@ -1643,19 +1651,21 @@ static Type *check_expr(Checker *c, Node *node) {
                                 i + 1, (int)arg_sym->name_len, arg_sym->name);
                         }
                     }
-                    /* BUG-310: volatile array → slice strips volatile qualifier.
-                     * Slice has no is_volatile — GCC optimizes away MMIO reads. */
+                    /* BUG-310: volatile array → non-volatile slice param rejected.
+                     * Volatile must propagate — use volatile []T param. */
                     if (arg && arg->kind == TYPE_ARRAY &&
                         param && param->kind == TYPE_SLICE &&
+                        !param->slice.is_volatile &&
                         node->call.args[i]->kind == NODE_IDENT) {
                         Symbol *arg_sym = scope_lookup(c->current_scope,
                             node->call.args[i]->ident.name,
                             (uint32_t)node->call.args[i]->ident.name_len);
                         if (arg_sym && arg_sym->is_volatile) {
                             checker_error(c, node->loc.line,
-                                "argument %d: cannot pass volatile array '%.*s' as slice — "
-                                "volatile qualifier would be stripped",
-                                i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                "argument %d: cannot pass volatile array '%.*s' to non-volatile slice parameter — "
+                                "use 'volatile []%s' parameter type",
+                                i + 1, (int)arg_sym->name_len, arg_sym->name,
+                                type_name(param->slice.inner));
                         }
                     }
 
@@ -2523,6 +2533,13 @@ static void check_stmt(Checker *c, Node *node) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
         }
+        /* propagate volatile from var qualifier to slice type */
+        if (node->var_decl.is_volatile && type) {
+            if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
+                type = type_volatile_slice(c->arena, type->slice.inner);
+                if (node->var_decl.is_const) type->slice.is_const = true;
+            }
+        }
         /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
          * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR). */
         if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
@@ -2597,16 +2614,18 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot initialize mutable slice from const — "
                         "would allow writing to read-only memory");
                 }
-                /* BUG-310: volatile array → slice strips volatile qualifier */
-                if (type->kind == TYPE_SLICE && init_type->kind == TYPE_ARRAY &&
+                /* BUG-310: volatile array → non-volatile slice rejected */
+                if (type->kind == TYPE_SLICE && !type->slice.is_volatile &&
+                    init_type->kind == TYPE_ARRAY &&
                     node->var_decl.init->kind == NODE_IDENT) {
                     Symbol *vs = scope_lookup(c->current_scope,
                         node->var_decl.init->ident.name,
                         (uint32_t)node->var_decl.init->ident.name_len);
                     if (vs && vs->is_volatile) {
                         checker_error(c, node->loc.line,
-                            "cannot initialize slice from volatile array — "
-                            "volatile qualifier would be stripped");
+                            "cannot initialize non-volatile slice from volatile array — "
+                            "use 'volatile []%s' to preserve volatile qualifier",
+                            type_name(type->slice.inner));
                     }
                 }
             }

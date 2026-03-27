@@ -84,7 +84,7 @@ struct Type {
         struct { Type *inner; } optional;
 
         /* TYPE_SLICE */
-        struct { Type *inner; bool is_const; } slice;
+        struct { Type *inner; bool is_const; bool is_volatile; } slice;
 
         /* TYPE_ARRAY */
         struct { Type *inner; uint64_t size; Type *sizeof_type; /* non-NULL → emit sizeof(T) instead of numeric size */ } array;
@@ -230,6 +230,7 @@ Type *type_const_pointer(Arena *a, Type *inner);
 Type *type_optional(Arena *a, Type *inner);
 Type *type_slice(Arena *a, Type *inner);
 Type *type_const_slice(Arena *a, Type *inner);
+Type *type_volatile_slice(Arena *a, Type *inner);
 Type *type_array(Arena *a, Type *inner, uint64_t size);
 Type *type_pool(Arena *a, Type *elem, uint64_t count);
 Type *type_ring(Arena *a, Type *elem, uint64_t count);

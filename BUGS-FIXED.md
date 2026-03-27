@@ -1499,11 +1499,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added `> 18446744073709551615.0 ? UINT64_MAX` clamp.
 - **Test:** Implicit — correct saturation behavior.
 
-### BUG-310: Volatile array → slice strips volatile qualifier
+### BUG-310: Volatile slice qualifier — `volatile []T`
 - **Symptom:** `volatile u8[16] hw_regs; poll(hw_regs)` where `poll([]u8)` — slice `.ptr` is non-volatile, GCC optimizes away MMIO reads in loops.
-- **Root cause:** TYPE_SLICE has no `is_volatile` flag. Array → slice coercion silently drops volatile.
-- **Fix:** Reject volatile array → slice coercion at all 3 sites: call args, var-decl init, assignment. Users must use `volatile *u8` or access array directly.
-- **Test:** `test_checker_full.c` — volatile array to slice rejected at call, var-decl, assign; non-volatile accepted.
+- **Root cause:** TYPE_SLICE had no `is_volatile` flag.
+- **Fix:** Added `bool is_volatile` to TYPE_SLICE. Full type system change: `type_volatile_slice()` constructor, `type_equals` checks volatile, `can_implicit_coerce` blocks volatile stripping (allows non-volatile→volatile widening). Parser `TYNODE_VOLATILE` propagates to TYPE_SLICE. Emitter uses `_zer_vslice_T` typedefs with `volatile T *ptr`. Volatile array → non-volatile slice rejected at call/var-decl/assign.
+- **Test:** `test_checker_full.c` — 6 tests (rejection + acceptance). `test_emit.c` — E2E volatile slice param.
 
 ### BUG-302: Rvalue struct field assignment
 - **Symptom:** `get_s().x = 5` passes checker but GCC rejects — "lvalue required."

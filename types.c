@@ -86,6 +86,12 @@ Type *type_const_slice(Arena *a, Type *inner) {
     return t;
 }
 
+Type *type_volatile_slice(Arena *a, Type *inner) {
+    Type *t = type_slice(a, inner);
+    t->slice.is_volatile = true;
+    return t;
+}
+
 /* NOTE: size == 0 with sizeof_type != NULL means "emit sizeof(T)" —
  * used for target-dependent array dimensions (@size on pointer/slice types).
  * The emitter checks sizeof_type first; if set, emits sizeof(T) instead of numeric size. */
@@ -226,6 +232,7 @@ bool type_equals(Type *a, Type *b) {
         return type_equals(a->optional.inner, b->optional.inner);
     case TYPE_SLICE:
         if (a->slice.is_const != b->slice.is_const) return false;
+        if (a->slice.is_volatile != b->slice.is_volatile) return false;
         return type_equals(a->slice.inner, b->slice.inner);
 
     /* array: inner + size */
@@ -326,10 +333,16 @@ bool can_implicit_coerce(Type *from, Type *to) {
         return type_equals(from->array.inner, to->slice.inner);
     }
 
-    /* mutable slice to const slice */
+    /* slice qualifier widening: mutable→const, non-volatile→volatile */
     if (from->kind == TYPE_SLICE && to->kind == TYPE_SLICE) {
-        if (to->slice.is_const && !from->slice.is_const) {
-            return type_equals(from->slice.inner, to->slice.inner);
+        /* cannot strip volatile or const */
+        if (from->slice.is_volatile && !to->slice.is_volatile) return false;
+        if (from->slice.is_const && !to->slice.is_const) return false;
+        /* allow widening (adding const or volatile) */
+        if ((to->slice.is_const >= from->slice.is_const) &&
+            (to->slice.is_volatile >= from->slice.is_volatile) &&
+            type_equals(from->slice.inner, to->slice.inner)) {
+            return true;
         }
     }
 
@@ -382,6 +395,7 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         pos += snprintf(buf + pos, max - pos, "?");
         return type_name_write(t->optional.inner, buf, pos, max);
     case TYPE_SLICE:
+        if (t->slice.is_volatile) pos += snprintf(buf + pos, max - pos, "volatile ");
         pos += snprintf(buf + pos, max - pos, "[]");
         return type_name_write(t->slice.inner, buf, pos, max);
     case TYPE_ARRAY:

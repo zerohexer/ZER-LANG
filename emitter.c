@@ -126,6 +126,7 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
     emit(e, "((");
     emit_type(e, slice_type);
     emit(e, "){ (");
+    if (slice_type && slice_type->slice.is_volatile) emit(e, "volatile ");
     emit_type(e, array_type->array.inner);
     emit(e, "*)");
     emit_expr(e, array_expr);
@@ -240,29 +241,31 @@ static void emit_type(Emitter *e, Type *t) {
     case TYPE_SLICE: {
         /* Unwrap TYPE_DISTINCT for named typedef lookup */
         Type *sl_inner = type_unwrap_distinct(t->slice.inner);
+        const char *prefix = t->slice.is_volatile ? "_zer_vslice_" : "_zer_slice_";
         switch (sl_inner->kind) {
         case TYPE_U8:
-        case TYPE_BOOL:  emit(e, "_zer_slice_u8"); break; /* bool = uint8_t */
-        case TYPE_U16:   emit(e, "_zer_slice_u16"); break;
-        case TYPE_U32:   emit(e, "_zer_slice_u32"); break;
-        case TYPE_U64:   emit(e, "_zer_slice_u64"); break;
-        case TYPE_I8:    emit(e, "_zer_slice_i8"); break;
-        case TYPE_I16:   emit(e, "_zer_slice_i16"); break;
-        case TYPE_I32:   emit(e, "_zer_slice_i32"); break;
-        case TYPE_I64:   emit(e, "_zer_slice_i64"); break;
-        case TYPE_USIZE: emit(e, "_zer_slice_usize"); break;
-        case TYPE_F32:   emit(e, "_zer_slice_f32"); break;
-        case TYPE_F64:   emit(e, "_zer_slice_f64"); break;
+        case TYPE_BOOL:  emit(e, "%su8", prefix); break; /* bool = uint8_t */
+        case TYPE_U16:   emit(e, "%su16", prefix); break;
+        case TYPE_U32:   emit(e, "%su32", prefix); break;
+        case TYPE_U64:   emit(e, "%su64", prefix); break;
+        case TYPE_I8:    emit(e, "%si8", prefix); break;
+        case TYPE_I16:   emit(e, "%si16", prefix); break;
+        case TYPE_I32:   emit(e, "%si32", prefix); break;
+        case TYPE_I64:   emit(e, "%si64", prefix); break;
+        case TYPE_USIZE: emit(e, "%susize", prefix); break;
+        case TYPE_F32:   emit(e, "%sf32", prefix); break;
+        case TYPE_F64:   emit(e, "%sf64", prefix); break;
         case TYPE_STRUCT:
-            emit(e, "_zer_slice_");
+            emit(e, "%s", prefix);
             EMIT_STRUCT_NAME(e, sl_inner);
             break;
         case TYPE_UNION:
-            emit(e, "_zer_slice_");
+            emit(e, "%s", prefix);
             EMIT_UNION_NAME(e, sl_inner);
             break;
         default:
             emit(e, "struct { ");
+            if (t->slice.is_volatile) emit(e, "volatile ");
             emit_type(e, sl_inner);
             emit(e, "* ptr; size_t len; }");
             break;
@@ -2668,6 +2671,14 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     if (st) EMIT_STRUCT_NAME(e, st);
     else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
     emit(e, ";\n");
+    /* emit volatile slice typedef for this struct */
+    emit(e, "typedef struct { volatile struct ");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, "* ptr; size_t len; } _zer_vslice_");
+    if (st) EMIT_STRUCT_NAME(e, st);
+    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
+    emit(e, ";\n");
     /* emit optional-slice typedef for this struct */
     emit(e, "typedef struct { _zer_slice_");
     if (st) EMIT_STRUCT_NAME(e, st);
@@ -2886,6 +2897,13 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         if (ut) EMIT_UNION_NAME(e, ut);
         else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
         emit(e, ";\n");
+        emit(e, "typedef struct { volatile struct _union_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "* ptr; size_t len; } _zer_vslice_");
+        if (ut) EMIT_UNION_NAME(e, ut);
+        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, ";\n");
         emit(e, "typedef struct { _zer_slice_");
         if (ut) EMIT_UNION_NAME(e, ut);
         else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
@@ -3003,6 +3021,19 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "typedef struct { size_t* ptr; size_t len; } _zer_slice_usize;\n");
     emit(e, "typedef struct { float* ptr; size_t len; } _zer_slice_f32;\n");
     emit(e, "typedef struct { double* ptr; size_t len; } _zer_slice_f64;\n");
+    emit(e, "\n");
+    /* ZER volatile slice types — volatile []T for all primitives */
+    emit(e, "typedef struct { volatile uint8_t* ptr; size_t len; } _zer_vslice_u8;\n");
+    emit(e, "typedef struct { volatile uint16_t* ptr; size_t len; } _zer_vslice_u16;\n");
+    emit(e, "typedef struct { volatile uint32_t* ptr; size_t len; } _zer_vslice_u32;\n");
+    emit(e, "typedef struct { volatile uint64_t* ptr; size_t len; } _zer_vslice_u64;\n");
+    emit(e, "typedef struct { volatile int8_t* ptr; size_t len; } _zer_vslice_i8;\n");
+    emit(e, "typedef struct { volatile int16_t* ptr; size_t len; } _zer_vslice_i16;\n");
+    emit(e, "typedef struct { volatile int32_t* ptr; size_t len; } _zer_vslice_i32;\n");
+    emit(e, "typedef struct { volatile int64_t* ptr; size_t len; } _zer_vslice_i64;\n");
+    emit(e, "typedef struct { volatile size_t* ptr; size_t len; } _zer_vslice_usize;\n");
+    emit(e, "typedef struct { volatile float* ptr; size_t len; } _zer_vslice_f32;\n");
+    emit(e, "typedef struct { volatile double* ptr; size_t len; } _zer_vslice_f64;\n");
     emit(e, "\n");
     /* ZER optional-slice types — ?[]T for all primitives */
     emit(e, "typedef struct { _zer_slice_u8 value; uint8_t has_value; } _zer_opt_slice_u8;\n");

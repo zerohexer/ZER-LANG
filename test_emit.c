@@ -3010,6 +3010,19 @@ int main(void) {
         141,
         "array size from subtraction (10-5=5) works at runtime");
 
+    /* BUG-310: volatile slice — volatile propagates through array→slice coercion */
+    test_compile_and_run(
+        "volatile u8[4] hw;\n"
+        "u32 read_hw(volatile []u8 regs) {\n"
+        "    return @truncate(u32, regs[0]);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    hw[0] = 42;\n"
+        "    return read_hw(hw);\n"
+        "}\n",
+        42,
+        "volatile array to volatile slice param E2E");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove(TEST_EXE);

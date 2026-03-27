@@ -1022,8 +1022,47 @@ static void rewrite_signatures(void) {
                 j++;
             }
         } else {
-            /* not a function declaration — copy line as-is */
-            NB_WRITE(out_buf + line_start, line_end - line_start);
+            /* not a function declaration — check for struct field: SlabType *field; */
+            bool did_struct_field = false;
+            {
+                int ls = line_start;
+                while (ls < line_end && (out_buf[ls] == ' ' || out_buf[ls] == '\t')) ls++;
+                /* read potential type name */
+                int ft_start = ls;
+                while (ls < line_end && (isalnum(out_buf[ls]) || out_buf[ls] == '_')) ls++;
+                int ft_len = ls - ft_start;
+                if (ft_len > 0 && ft_len < 63) {
+                    char ft_name[64] = {0};
+                    memcpy(ft_name, out_buf + ft_start, ft_len);
+                    /* skip spaces */
+                    while (ls < line_end && out_buf[ls] == ' ') ls++;
+                    /* check for * */
+                    if (ls < line_end && out_buf[ls] == '*' && is_slab_type(ft_name)) {
+                        ls++;
+                        while (ls < line_end && out_buf[ls] == ' ') ls++;
+                        /* read field name */
+                        int fn_start = ls;
+                        while (ls < line_end && (isalnum(out_buf[ls]) || out_buf[ls] == '_')) ls++;
+                        int fn_len = ls - fn_start;
+                        /* check that line ends with ; (struct field) */
+                        int check = ls;
+                        while (check < line_end && (out_buf[check] == ' ' || out_buf[check] == '\t' || out_buf[check] == '\r')) check++;
+                        if (fn_len > 0 && check < line_end && out_buf[check] == ';') {
+                            /* emit: indent + ?Handle(Type) field_name; */
+                            NB_WRITE(out_buf + line_start, ft_start - line_start); /* indent */
+                            NB_STR("?Handle(");
+                            NB_STR(ft_name);
+                            NB_STR(") ");
+                            NB_WRITE(out_buf + fn_start, fn_len);
+                            NB_STR(";");
+                            did_struct_field = true;
+                        }
+                    }
+                }
+            }
+            if (!did_struct_field) {
+                NB_WRITE(out_buf + line_start, line_end - line_start);
+            }
         }
 
         /* copy newline */

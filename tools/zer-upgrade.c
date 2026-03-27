@@ -187,6 +187,37 @@ static const char *get_slab_name(const char *type_name) {
     return "unknown_slab";
 }
 
+/* check if a type name has a Slab allocator */
+static bool is_slab_type(const char *type_name) {
+    for (int i = 0; i < slab_type_count; i++) {
+        if (strcmp(slab_types[i].name, type_name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Track handle parameters: function params of Slab types get rewritten */
+#define MAX_HANDLE_PARAMS 32
+typedef struct {
+    char var_name[64];
+    char type_name[64];
+    int func_start;
+    int func_end;
+} HandleParam;
+
+static HandleParam handle_params[MAX_HANDLE_PARAMS * 16]; /* per scan */
+static int handle_param_count = 0;
+
+/* check if a variable is a handle parameter in the current function scope */
+static HandleParam *find_handle_param(const char *var_name, int pos) {
+    for (int i = 0; i < handle_param_count; i++) {
+        if (strcmp(handle_params[i].var_name, var_name) == 0 &&
+            pos >= handle_params[i].func_start && pos <= handle_params[i].func_end)
+            return &handle_params[i];
+    }
+    return NULL;
+}
+
 /* check if a variable name was malloc'd — only within the same function scope */
 static AllocInfo *find_alloc(const char *var_name, int pos) {
     for (int i = 0; i < alloc_count; i++) {
@@ -282,6 +313,90 @@ static void scan_allocs(const char *src, int src_len) {
                     var_name[vlen] = '\0';
                     AllocInfo *ai = find_alloc(var_name, i);
                     if (ai) ai->has_free = true;
+                }
+            }
+        }
+    }
+}
+
+/* Second scan: find function params of Slab types.
+ * Pattern: TYPE *NAME in function signature → Handle(TYPE) NAME_h
+ * Must run AFTER scan_allocs so slab_types is populated. */
+static void scan_handle_params(const char *src, int src_len) {
+    handle_param_count = 0;
+    if (slab_type_count == 0) return;
+
+    for (int i = 0; i < src_len; i++) {
+        /* look for function signatures: IDENT IDENT( or IDENT *IDENT( */
+        /* We detect: TYPE *PARAM inside function param lists.
+         * A param list starts with ( and we're inside a top-level declaration. */
+        /* Simple heuristic: find ( that follows IDENT IDENT pattern (return_type func_name) */
+
+        /* Find lines that look like function declarations:
+         * word word( or word *word( at start of line */
+        if (src[i] == '(' && i > 2) {
+            /* check if this could be a function decl paren */
+            int k = i - 1;
+            while (k > 0 && (isalnum(src[k]) || src[k] == '_')) k--;
+            if (k >= 0 && k < i - 1) {
+                /* scan inside the parens for SlabType *name patterns */
+                int close = find_close_paren(src, i, src_len);
+                if (close < 0 || close - i > 500) continue; /* not a short param list */
+
+                int func_start, func_end;
+                /* find function body bounds — look for { after ) */
+                int body = close + 1;
+                while (body < src_len && (src[body] == ' ' || src[body] == '\n' || src[body] == '\t')) body++;
+                if (body >= src_len || src[body] != '{') continue; /* not a function def */
+                find_func_bounds(src, src_len, body, &func_start, &func_end);
+
+                /* scan params */
+                int p = i + 1;
+                while (p < close) {
+                    /* skip whitespace */
+                    while (p < close && (src[p] == ' ' || src[p] == '\t' || src[p] == '\n' || src[p] == ',')) p++;
+                    if (p >= close) break;
+
+                    /* skip const */
+                    if (p + 5 < close && memcmp(src + p, "const", 5) == 0 && !isalnum(src[p + 5])) p += 5;
+                    while (p < close && src[p] == ' ') p++;
+
+                    /* read type name */
+                    int tn_start = p;
+                    while (p < close && (isalnum(src[p]) || src[p] == '_')) p++;
+                    int tn_len = p - tn_start;
+                    if (tn_len == 0) { p++; continue; }
+
+                    char type_name[64] = {0};
+                    if (tn_len < 63) memcpy(type_name, src + tn_start, tn_len);
+
+                    /* skip spaces */
+                    while (p < close && src[p] == ' ') p++;
+
+                    /* check for * */
+                    if (p < close && src[p] == '*') {
+                        p++;
+                        while (p < close && src[p] == ' ') p++;
+
+                        /* read param name */
+                        int pn_start = p;
+                        while (p < close && (isalnum(src[p]) || src[p] == '_')) p++;
+                        int pn_len = p - pn_start;
+
+                        /* check if type is a Slab type */
+                        if (pn_len > 0 && pn_len < 63 && is_slab_type(type_name) &&
+                            handle_param_count < MAX_HANDLE_PARAMS * 16) {
+                            HandleParam *hp = &handle_params[handle_param_count++];
+                            memcpy(hp->var_name, src + pn_start, pn_len);
+                            hp->var_name[pn_len] = '\0';
+                            strncpy(hp->type_name, type_name, 63);
+                            hp->func_start = func_start;
+                            hp->func_end = func_end;
+                        }
+                    }
+
+                    /* skip to next comma or close paren */
+                    while (p < close && src[p] != ',') p++;
                 }
             }
         }
@@ -616,8 +731,10 @@ static void upgrade(const char *src, int src_len) {
                     memcpy(var_name, src + args[0].start, vl);
                     var_name[vl] = '\0';
                     AllocInfo *ai = find_alloc(var_name, i);
-                    if (ai) {
-                        const char *slab = get_slab_name(ai->type_name);
+                    HandleParam *hp = ai ? NULL : find_handle_param(var_name, i);
+                    if (ai || hp) {
+                        const char *type = ai ? ai->type_name : hp->type_name;
+                        const char *slab = get_slab_name(type);
                         out_str(slab);
                         out_str(".free(");
                         out_str(var_name);
@@ -642,10 +759,12 @@ static void upgrade(const char *src, int src_len) {
             if (id_len < 63) memcpy(ident, src + id_start, id_len);
             ident[id_len < 63 ? id_len : 63] = '\0';
 
-            /* check if this ident is a malloc'd variable followed by . */
+            /* check if this ident is a malloc'd or handle-param variable followed by . */
             AllocInfo *ai = find_alloc(ident, id_start);
-            if (ai && i < src_len && src[i] == '.') {
-                const char *slab = get_slab_name(ai->type_name);
+            HandleParam *hp = ai ? NULL : find_handle_param(ident, id_start);
+            if ((ai || hp) && i < src_len && src[i] == '.') {
+                const char *type = ai ? ai->type_name : hp->type_name;
+                const char *slab = get_slab_name(type);
                 out_str(slab);
                 out_str(".get(");
                 out_str(ident);
@@ -807,6 +926,7 @@ int main(int argc, char **argv) {
 
     /* Layer 2: pre-scan for malloc/free patterns */
     scan_allocs(src, src_len);
+    scan_handle_params(src, src_len);
 
     out_init();
     upgrade(src, src_len);

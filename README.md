@@ -246,12 +246,12 @@ ZER compiles to C99 and runs on any target GCC supports.
 
 ## License
 
-GNU General Public License v3.0 with Runtime Exception.
+Mozilla Public License 2.0 with Runtime Exception.
 
-**zerc (the compiler)** is GPL v3. You cannot take zerc, improve it, and keep those improvements private. Modifications must be released under GPL v3.
+**zerc (the compiler)** is MPL-2.0. If you modify a zerc source file and distribute it, you must share that file under MPL-2.0. New files you add alongside zerc can be under any license — your proprietary chip support, custom backends, and hardware-specific additions stay yours.
 
-**Firmware compiled BY zerc** is yours. No GPL inheritance. Compile proprietary firmware freely. The Runtime Exception covers you.
+**Firmware compiled BY zerc** is yours. No license inheritance. The emitted C code and compiled binaries are not covered by MPL-2.0. Compile proprietary firmware freely.
 
-This is the same model as GCC.
+"ZER" and "ZER-LANG" are trademarks of ZEROHEXER.
 
 Copyright 2026 ZEROHEXER (zerohexer@gmail.com).

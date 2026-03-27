@@ -1,0 +1,132 @@
+// ZER Compatibility Library — compat.zer
+// NOT part of ZER. Scaffolding for C-to-ZER conversion ONLY.
+// Phase 1 (zer-convert) imports this. Phase 2 (zerc --safe-upgrade) removes it.
+//
+// Every function here is a tagged wrapper around a C stdlib call.
+// The zer_ prefix tells the safe-upgrade pass what to replace.
+//
+// DO NOT use in new ZER code. Write safe ZER from the start.
+
+cinclude "stdio.h";
+cinclude "stdlib.h";
+cinclude "string.h";
+
+// C function declarations
+*opaque malloc(usize size);
+*opaque calloc(usize count, usize size);
+*opaque realloc(*opaque ptr, usize size);
+void free(*opaque ptr);
+usize strlen(*u8 s);
+i32 strcmp(*u8 a, *u8 b);
+i32 strncmp(*u8 a, *u8 b, usize n);
+i32 memcmp(*opaque a, *opaque b, usize n);
+*opaque memcpy(*opaque dst, *opaque src, usize n);
+*opaque memset(*opaque dst, i32 val, usize n);
+void exit(i32 status);
+
+// ================================================================
+// Memory Allocation
+// Phase 2 replaces with: Slab(T).alloc() or Arena.alloc(T)
+// ================================================================
+
+// zer_malloc_bytes(size) — allocate raw bytes
+// Phase 2: Arena.alloc_slice or Slab depending on free pattern
+?*opaque zer_malloc_bytes(usize size) {
+    *opaque p = malloc(size);
+    return p;
+}
+
+// zer_calloc_bytes(count, elem_size) — allocate zeroed array
+// Phase 2: Arena.alloc_slice (already zeroed by ZER)
+?*opaque zer_calloc_bytes(usize count, usize elem_size) {
+    *opaque p = calloc(count, elem_size);
+    return p;
+}
+
+// zer_realloc_bytes(ptr, new_size) — resize allocation
+// Phase 2: new Slab alloc + bytes_copy + zer_free
+?*opaque zer_realloc_bytes(*opaque ptr, usize new_size) {
+    *opaque p = realloc(ptr, new_size);
+    return p;
+}
+
+// zer_free(ptr) — free one allocation
+// Phase 2: slab.free(handle)
+void zer_free(*opaque ptr) {
+    free(ptr);
+}
+
+// ================================================================
+// Pointer Arithmetic
+// Phase 2 replaces with: slice indexing (bounds-checked)
+// ================================================================
+
+// zer_ptr_add(ptr, offset, elem_size) — advance pointer
+// Phase 2: slice[offset]
+*opaque zer_ptr_add(*opaque ptr, usize offset, usize elem_size) {
+    return @inttoptr(*opaque, @ptrtoint(ptr) + offset * elem_size);
+}
+
+// zer_ptr_sub(ptr, offset, elem_size) — retreat pointer
+// Phase 2: slice[len - offset]
+*opaque zer_ptr_sub(*opaque ptr, usize offset, usize elem_size) {
+    return @inttoptr(*opaque, @ptrtoint(ptr) - offset * elem_size);
+}
+
+// zer_ptr_diff(a, b, elem_size) — pointer difference in elements
+// Phase 2: a_index - b_index
+usize zer_ptr_diff(*opaque a, *opaque b, usize elem_size) {
+    return (@ptrtoint(a) - @ptrtoint(b)) / elem_size;
+}
+
+// ================================================================
+// String Operations
+// Phase 2 replaces with: []u8 slice operations from str.zer
+// ================================================================
+
+// zer_strlen(s) — length of null-terminated string
+// Phase 2: s.len (slices carry length)
+usize zer_strlen(*u8 s) {
+    return strlen(s);
+}
+
+// zer_strcmp(a, b) — compare null-terminated strings
+// Phase 2: bytes_equal(a, b) from str.zer
+i32 zer_strcmp(*u8 a, *u8 b) {
+    return strcmp(a, b);
+}
+
+// zer_strncmp(a, b, n) — compare n bytes
+// Phase 2: bytes_equal(a[0..n], b[0..n])
+i32 zer_strncmp(*u8 a, *u8 b, usize n) {
+    return strncmp(a, b, n);
+}
+
+// zer_memcmp(a, b, n) — compare raw memory
+// Phase 2: bytes_equal(a[0..n], b[0..n])
+i32 zer_memcmp(*opaque a, *opaque b, usize n) {
+    return memcmp(a, b, n);
+}
+
+// zer_memcpy(dst, src, n) — copy bytes
+// Phase 2: bytes_copy(dst, src) from str.zer
+*opaque zer_memcpy(*opaque dst, *opaque src, usize n) {
+    return memcpy(dst, src, n);
+}
+
+// zer_memset(dst, val, n) — fill memory
+// Phase 2: bytes_fill(dst, val) from str.zer
+*opaque zer_memset(*opaque dst, i32 val, usize n) {
+    return memset(dst, val, n);
+}
+
+// ================================================================
+// Error Handling
+// Phase 2 replaces with: ?T return types + orelse
+// ================================================================
+
+// zer_exit(code) — terminate program
+// Phase 2: restructure to return error codes up the call chain
+void zer_exit(i32 code) {
+    exit(code);
+}

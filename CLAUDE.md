@@ -780,6 +780,9 @@ Signed overflow UB in the compiler itself prevented. Both `/` and `%` paths chec
 **143. `@size(usize)` target-dependent via `sizeof()`.**
 `compute_type_size` returns `CONST_EVAL_FAIL` for `TYPE_USIZE`. Same approach as BUG-275 for pointers/slices — emitter uses `sizeof(size_t)`. (BUG-280)
 
+**161. `usize` width matches host platform — 64-bit gap closed.**
+`type_width(TYPE_USIZE)` now returns `sizeof(size_t) * 8` instead of hardcoded 32. On 64-bit hosts: `u32 → usize` widening works, big literals accepted, `@truncate(u32, usize)` valid, `usize → u32` direct blocked. `is_literal_compatible` also uses `sizeof(size_t)` for range. Emitter unchanged — already emits `size_t`.
+
 **140. `keep` qualifier carried through function pointer types.**
 `void (*fn)(keep *u32) = store` — keep flags stored per-param in `TYPE_FUNC_PTR` via `param_keeps` array. Parser parses `keep` in func ptr params. `type_equals` checks keep mismatch. Call-site validation works for both direct calls and function pointer calls using the Type's `param_keeps`. (BUG-277)
 

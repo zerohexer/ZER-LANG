@@ -499,6 +499,24 @@ static void upgrade(const char *src, int src_len) {
 
     while (i < src_len) {
 
+        /* ---- skip comments — don't replace inside comment blocks ---- */
+        if (src[i] == '/' && i + 1 < src_len && src[i + 1] == '/') {
+            /* single-line comment — emit until newline */
+            while (i < src_len && src[i] != '\n') { out_write(src + i, 1); i++; }
+            continue;
+        }
+        if (src[i] == '/' && i + 1 < src_len && src[i + 1] == '*') {
+            /* block comment — emit until end-of-comment */
+            out_write(src + i, 2); i += 2;
+            while (i < src_len) {
+                if (src[i] == '*' && i + 1 < src_len && src[i + 1] == '/') {
+                    out_write(src + i, 2); i += 2; break;
+                }
+                out_write(src + i, 1); i++;
+            }
+            continue;
+        }
+
         /* ---- skip string literals — don't replace identifiers inside strings ---- */
         if (src[i] == '"') {
             out_write(src + i, 1); i++;
@@ -553,9 +571,11 @@ static void upgrade(const char *src, int src_len) {
                 out_write(src + open + 1, close - open - 1);
                 out_str(")");
                 if (has_eq0 || has_neq0) {
-                    /* skip past the == 0 / != 0 */
-                    i = after;
-                    while (i < src_len && (src[i] == '=' || src[i] == '!' || src[i] == ' ' || src[i] == '0')) i++;
+                    /* skip past the == 0 / != 0: advance past the operator and the 0 */
+                    i = after; /* at == or != */
+                    i += 2;   /* past == or != */
+                    while (i < src_len && src[i] == ' ') i++; /* skip spaces */
+                    if (i < src_len && src[i] == '0') i++; /* skip the 0 */
                 } else {
                     i = close + 1;
                 }
@@ -592,7 +612,9 @@ static void upgrade(const char *src, int src_len) {
                     out_str("])");
                     if (has_eq0 || has_neq0) {
                         i = after;
-                        while (i < src_len && (src[i]=='='||src[i]=='!'||src[i]==' '||src[i]=='0')) i++;
+                        i += 2; /* past == or != */
+                        while (i < src_len && src[i] == ' ') i++;
+                        if (i < src_len && src[i] == '0') i++;
                     } else {
                         i = close + 1;
                     }
@@ -681,6 +703,14 @@ static void upgrade(const char *src, int src_len) {
                 Span args[3];
                 int argc = extract_args(src, open, close, args, 3);
                 if (argc == 3) {
+                    /* check for trailing == 0 or != 0 (same as strcmp) */
+                    int after = close + 1;
+                    while (after < src_len && (src[after] == ' ' || src[after] == '\t')) after++;
+                    bool has_eq0 = (after + 3 < src_len && src[after]=='=' && src[after+1]=='=' && src[after+2]==' ' && src[after+3]=='0');
+                    bool has_neq0 = (after + 3 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]==' ' && src[after+3]=='0');
+                    if (!has_eq0 && after+2 < src_len && src[after]=='=' && src[after+1]=='=' && src[after+2]=='0') has_eq0 = true;
+                    if (!has_neq0 && after+2 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]=='0') has_neq0 = true;
+                    if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
                     out_write(src + args[0].start, args[0].len);
                     out_str("[0..");
@@ -690,7 +720,14 @@ static void upgrade(const char *src, int src_len) {
                     out_str("[0..");
                     out_write(src + args[2].start, args[2].len);
                     out_str("])");
-                    i = close + 1;
+                    if (has_eq0 || has_neq0) {
+                        i = after;
+                        i += 2;
+                        while (i < src_len && src[i] == ' ') i++;
+                        if (i < src_len && src[i] == '0') i++;
+                    } else {
+                        i = close + 1;
+                    }
                     upgrades++;
                     needs_str_import = true;
                     continue;
@@ -991,7 +1028,7 @@ static void add_str_import_if_needed(void) {
     int ilen = (int)strlen(import_line);
 
     /* find a good insertion point — after last "import" or "cinclude" line */
-    int insert_at = 0;
+    int insert_at = -1;
     for (int i = 0; i < out_len; i++) {
         if (out_buf[i] == '\n') {
             /* check if next line starts with import or cinclude */
@@ -1001,9 +1038,25 @@ static void add_str_import_if_needed(void) {
             if (j + 8 < out_len && memcmp(out_buf + j, "cinclude", 8) == 0) insert_at = i + 1;
         }
     }
-    /* find end of that line */
-    while (insert_at < out_len && out_buf[insert_at] != '\n') insert_at++;
-    if (insert_at < out_len) insert_at++; /* past the newline */
+    if (insert_at >= 0) {
+        /* find end of that line */
+        while (insert_at < out_len && out_buf[insert_at] != '\n') insert_at++;
+        if (insert_at < out_len) insert_at++; /* past the newline */
+    } else {
+        /* no import/cinclude found — insert at top of file, skip leading comments */
+        insert_at = 0;
+        while (insert_at < out_len) {
+            /* skip blank lines and // comment lines */
+            if (out_buf[insert_at] == '\n') { insert_at++; continue; }
+            if (out_buf[insert_at] == '\r') { insert_at++; continue; }
+            if (insert_at + 1 < out_len && out_buf[insert_at] == '/' && out_buf[insert_at + 1] == '/') {
+                while (insert_at < out_len && out_buf[insert_at] != '\n') insert_at++;
+                if (insert_at < out_len) insert_at++;
+                continue;
+            }
+            break;
+        }
+    }
 
     /* insert */
     while (out_len + ilen >= out_cap) { out_cap *= 2; out_buf = (char *)realloc(out_buf, out_cap); }

@@ -331,6 +331,30 @@ check_phase2_absent "import compat removed when clean" \
 void f() { usize n = zer_strlen(s); }' \
     "import compat;"
 
+# --- strcmp space preservation ---
+check_phase2 "strcmp ==0 preserves space before &&" \
+    'import compat;
+void f() { if (zer_strcmp(a, b) == 0 && x) {} }' \
+    "bytes_equal(a, b) &&"
+
+# --- memcmp ==0 stripping ---
+check_phase2 "memcmp ==0 stripped" \
+    'import compat;
+void f() { if (zer_memcmp(a, b, 10) == 0) {} }' \
+    "bytes_equal(a[0..10], b[0..10]))"
+
+check_phase2_absent "memcmp no stale ==0" \
+    'import compat;
+void f() { if (zer_memcmp(a, b, 10) == 0) {} }' \
+    "== 0"
+
+# --- comment preservation ---
+check_phase2 "comment not transformed" \
+    'import compat;
+// zer_strlen(data) would give length
+void f() { usize n = zer_strlen(s); }' \
+    "// zer_strlen(data)"
+
 echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"

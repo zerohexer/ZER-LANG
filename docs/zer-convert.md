@@ -402,6 +402,63 @@ Total: 97% automated across 8 files, 5 manual review items
 
 ---
 
+## Compat Builtin Complete Reference
+
+The compat library is **external to ZER** — it lives in `lib/compat.zer`, NOT in the compiler. It's a ZER file that uses `cinclude` to wrap C stdlib functions. The converter imports it, the safe-upgrade pass removes it.
+
+### Memory Allocation
+
+| Compat Builtin | C Equivalent | Phase 2 Safe Replacement |
+|---|---|---|
+| `zer_malloc(T)` | `malloc(sizeof(T))` | `Slab(T).alloc() orelse return` |
+| `zer_calloc(T, n)` | `calloc(n, sizeof(T))` | `Arena.alloc_slice(T, n) orelse return` |
+| `zer_realloc(ptr, size)` | `realloc(ptr, size)` | New Slab alloc + copy + free old |
+| `zer_free(ptr)` | `free(ptr)` | `slab.free(handle)` |
+| `zer_alloca(T, n)` | `alloca(n * sizeof(T))` | `Arena.alloc_slice(T, n)` |
+
+### Pointer Operations
+
+| Compat Builtin | C Equivalent | Phase 2 Safe Replacement |
+|---|---|---|
+| `zer_ptr_add(ptr, n)` | `ptr + n` | `slice[n]` (bounds-checked) |
+| `zer_ptr_sub(ptr, n)` | `ptr - n` | `slice[len - n]` (bounds-checked) |
+| `zer_ptr_index(ptr, i)` | `ptr[i]` | `slice[i]` (bounds-checked) |
+| `zer_ptr_diff(a, b)` | `a - b` | `a_idx - b_idx` (index arithmetic) |
+
+### String Operations
+
+| Compat Builtin | C Equivalent | Phase 2 Safe Replacement |
+|---|---|---|
+| `zer_strlen(s)` | `strlen(s)` | `s.len` (slice carries length) |
+| `zer_strcmp(a, b)` | `strcmp(a, b)` | `bytes_equal(a, b)` (stdlib) |
+| `zer_strncmp(a, b, n)` | `strncmp(a, b, n)` | `bytes_equal(a[0..n], b[0..n])` |
+| `zer_memcmp(a, b, n)` | `memcmp(a, b, n)` | `bytes_equal(a[0..n], b[0..n])` |
+| `zer_memcpy(d, s, n)` | `memcpy(d, s, n)` | `copy_bytes(dst, src)` (stdlib) |
+| `zer_memset(p, v, n)` | `memset(p, v, n)` | `fill_bytes(slice, val)` (stdlib) |
+| `zer_strdup(s)` | `strdup(s)` | `Arena.alloc_slice(u8, s.len)` + copy |
+
+### Error Handling
+
+| Compat Builtin | C Equivalent | Phase 2 Safe Replacement |
+|---|---|---|
+| `zer_setjmp(buf)` | `setjmp(buf)` | `?T` return type (function returns optional) |
+| `zer_longjmp(buf, val)` | `longjmp(buf, val)` | `return null` (propagate error via optional) |
+
+### I/O (stay as cinclude — no Phase 2 replacement)
+
+| Compat Builtin | C Equivalent | Notes |
+|---|---|---|
+| `zer_printf(fmt, ...)` | `printf(fmt, ...)` | Stays as `cinclude` call until ZER stdlib `fmt.print` exists |
+| `zer_fprintf(f, fmt, ...)` | `fprintf(f, fmt, ...)` | Same — variadic, stays as `cinclude` |
+| `zer_fopen(path, mode)` | `fopen(path, mode)` | Stays until ZER stdlib `io.open` exists |
+| `zer_fclose(f)` | `fclose(f)` | Stays until ZER stdlib `io.close` exists |
+| `zer_fread(buf, s, n, f)` | `fread(buf, s, n, f)` | Stays until ZER stdlib `io.read` exists |
+| `zer_fwrite(buf, s, n, f)` | `fwrite(buf, s, n, f)` | Stays until ZER stdlib `io.write` exists |
+
+I/O builtins remain as `cinclude` wrappers even after Phase 2 — they're replaced when ZER stdlib (`io.zer`, `fmt.zer`) is implemented in v0.2.
+
+---
+
 ## Design Decisions
 
 ### Why two phases instead of one?
@@ -469,12 +526,11 @@ The compat library is training wheels. You remove them when you can ride.
 
 ## Scope Limitations
 
-`zer-convert` targets C code. NOT C++. NOT K&R-style C.
+`zer-convert` targets C code. NOT C++. The only true limitation is C++ — everything else has an automated conversion path.
 
 ### True limitations (out of scope)
 
-- **C++ code** — classes, templates, exceptions, RAII. Not C. Not convertible.
-- **Computed gotos** (`goto *label_ptr`) — niche GCC extension, no ZER equivalent.
+- **C++ code** — classes, templates, exceptions, RAII. Not C. Not convertible. ZER is memory-safe C, not memory-safe C++.
 
 ### Handled via cinclude (already works, zero conversion needed)
 
@@ -496,3 +552,4 @@ The compat library is training wheels. You remove them when you can ride.
 
 - **Complex preprocessor metaprogramming** — recursive macros, X-macros with `##` token pasting. The converter extracts them into a `.h` file and adds `cinclude "macros.h"` automatically. GCC expands the macros normally. Zero manual work.
 - **Variadic functions** (`printf(fmt, ...)`) — ZER doesn't have varargs. The converter keeps variadic calls in a `.h` wrapper and adds `cinclude`. Calls work unchanged through GCC.
+- **Computed gotos** (`goto *label_ptr`) — GCC extension used for interpreter dispatch tables. The converter extracts the jump table into a `.h` file with a wrapper function. ZER calls the wrapper via `cinclude`. GCC compiles the computed goto natively.

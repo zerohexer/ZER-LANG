@@ -844,7 +844,9 @@ static void upgrade(const char *src, int src_len) {
         }
 
         /* ---- var.field → slab.get(var_h).field for malloc'd variables ---- */
-        if (src[i] != '.' && (isalpha(src[i]) || src[i] == '_')) {
+        /* skip if preceded by . — it's a field name, not a variable reference */
+        if (src[i] != '.' && (isalpha(src[i]) || src[i] == '_') &&
+            !(i > 0 && src[i - 1] == '.')) {
             /* scan identifier */
             int id_start = i;
             while (i < src_len && (isalnum(src[i]) || src[i] == '_')) i++;
@@ -1176,7 +1178,7 @@ static void rewrite_signatures(void) {
                             NB_STR(ft_name);
                             NB_STR(") ");
                             NB_WRITE(out_buf + fn_start, fn_len);
-                            NB_STR("_h");
+                            NB_STR("_h ");
                             /* emit the rest of the line (= expr;) */
                             NB_WRITE(out_buf + check, line_end - check);
                             did_struct_field = true;

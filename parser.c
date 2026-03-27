@@ -1740,8 +1740,49 @@ static Node *parse_declaration(Parser *p) {
         return n;
     }
 
-    /* volatile global variable */
-    if (match(p, TOK_VOLATILE)) {
+    /* volatile global variable or function with volatile return type */
+    if (check(p, TOK_VOLATILE)) {
+        /* peek ahead: volatile TYPE NAME '(' → function with volatile return type.
+         * Otherwise → volatile variable declaration. */
+        Scanner saved_sc = *p->scanner;
+        Token saved_cur = p->current;
+        Token saved_prev = p->previous;
+        advance(p); /* consume volatile */
+        /* skip the type tokens */
+        int depth = 0;
+        while (!check(p, TOK_EOF)) {
+            if (check(p, TOK_LBRACKET)) { depth += 1; advance(p); continue; }
+            if (check(p, TOK_RBRACKET)) { if (depth > 0) depth -= 1; advance(p); continue; }
+            if (depth == 0 && check(p, TOK_IDENT)) {
+                advance(p); /* consume the name */
+                bool is_func = check(p, TOK_LPAREN);
+                /* restore scanner */
+                *p->scanner = saved_sc;
+                p->current = saved_cur;
+                p->previous = saved_prev;
+                if (is_func) {
+                    return parse_func_or_var(p, false);
+                } else {
+                    advance(p); /* re-consume volatile */
+                    Node *n = parse_var_decl(p, false, false, true);
+                    n->kind = NODE_GLOBAL_VAR;
+                    return n;
+                }
+            }
+            if (check(p, TOK_STAR) || check(p, TOK_QUESTION)) {
+                advance(p); continue;
+            }
+            /* type keyword — skip */
+            if (p->current.type >= TOK_U8 && p->current.type <= TOK_VOID) {
+                advance(p); continue;
+            }
+            break;
+        }
+        /* fallback: restore and treat as var decl */
+        *p->scanner = saved_sc;
+        p->current = saved_cur;
+        p->previous = saved_prev;
+        advance(p); /* re-consume volatile */
         Node *n = parse_var_decl(p, false, false, true);
         n->kind = NODE_GLOBAL_VAR;
         return n;

@@ -3023,6 +3023,46 @@ int main(void) {
         42,
         "volatile array to volatile slice param E2E");
 
+    test_compile_and_run(
+        "volatile u8[4] hw;\n"
+        "void write_hw(volatile []u8 regs, u32 idx, u8 val) {\n"
+        "    regs[idx] = val;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    write_hw(hw, 0, 42);\n"
+        "    write_hw(hw, 1, 10);\n"
+        "    return @truncate(u32, hw[0]) + @truncate(u32, hw[1]);\n"
+        "}\n",
+        52,
+        "volatile slice write through param E2E");
+
+    test_compile_and_run(
+        "volatile u8[4] hw;\n"
+        "volatile []u8 get_hw() {\n"
+        "    volatile []u8 s = hw;\n"
+        "    return s;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    hw[0] = 77;\n"
+        "    volatile []u8 s = get_hw();\n"
+        "    return @truncate(u32, s[0]);\n"
+        "}\n",
+        77,
+        "volatile slice as function return type E2E");
+
+    test_compile_and_run(
+        "struct Reg { u32 val; }\n"
+        "volatile Reg[4] hw;\n"
+        "void configure(volatile []Reg regs) {\n"
+        "    regs[0].val = 123;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    configure(hw);\n"
+        "    return hw[0].val;\n"
+        "}\n",
+        123,
+        "volatile struct slice E2E");
+
     /* cleanup temp files */
     remove("_zer_test_out.c");
     remove(TEST_EXE);

@@ -784,6 +784,15 @@ Signed overflow UB in the compiler itself prevented. Both `/` and `%` paths chec
 **141. Volatile array var-decl init uses byte loop.**
 `volatile u8[4] hw = src` used `memcpy` — doesn't respect volatile. Now uses byte-by-byte loop when `var_decl.is_volatile` is set. Same pattern as BUG-273 (array assignment). (BUG-278)
 
+**163. Orelse assignment escape to global caught.**
+`g_ptr = opt orelse &local` — NODE_ASSIGN now walks into NODE_ORELSE fallback, checks both `&local` and local-derived idents. Rejects when target is global/static. (BUG-314)
+
+**164. Distinct slice/array comparison rejected.**
+`distinct typedef []u8 Buffer; a == b` — binary ==/!= now calls `type_unwrap_distinct` before checking TYPE_SLICE/TYPE_ARRAY. Prevents GCC "invalid operands to binary ==" on emitted C. (BUG-315)
+
+**165. Bit-set index single evaluation.**
+`reg[get_hi()..get_lo()] = val` — runtime (non-constant) hi/lo hoisted into `_zer_bh`/`_zer_bl` temps. Constant path unchanged (precomputed masks). Prevents side-effect functions from executing multiple times. (BUG-316)
+
 **142. `is_null_sentinel` unwraps ALL distinct levels.**
 `distinct typedef (distinct typedef *u32) Ptr2; ?Ptr2 maybe` was treated as struct optional. Now uses `while` loop to unwrap through any depth of distinct to find the base pointer/func_ptr. (BUG-279)
 

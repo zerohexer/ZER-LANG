@@ -1499,6 +1499,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added `> 18446744073709551615.0 ? UINT64_MAX` clamp.
 - **Test:** Implicit — correct saturation behavior.
 
+### BUG-314: Orelse assignment escape to global
+- **Symptom:** `g_ptr = opt orelse &x` where `x` is local — compiles, creates dangling pointer.
+- **Root cause:** NODE_ASSIGN escape check only looked at direct `NODE_UNARY/TOK_AMP`, didn't walk into `NODE_ORELSE` fallback.
+- **Fix:** Assignment flag propagation walks into NODE_ORELSE fallback for `&local` and local-derived idents. Direct escape check added for `orelse &local` → global target.
+- **Test:** `test_checker_full.c` — orelse &local escape rejected, orelse &global accepted.
+
+### BUG-315: Distinct slice comparison bypass
+- **Symptom:** `distinct typedef []u8 Buffer; a == b` passes checker, GCC rejects with "invalid operands."
+- **Root cause:** Binary ==/!= check used `left->kind == TYPE_SLICE` without unwrapping distinct.
+- **Fix:** Call `type_unwrap_distinct()` on both operands before TYPE_SLICE/TYPE_ARRAY check.
+- **Test:** `test_checker_full.c` — distinct slice comparison rejected.
+
+### BUG-316: Bit-set index double evaluation
+- **Symptom:** `reg[get_hi()..get_lo()] = val` calls `get_hi()` 2x and `get_lo()` 4x in emitted C.
+- **Root cause:** Runtime bit-set path emitted hi/lo expressions inline multiple times (mask calc + shift).
+- **Fix:** Hoist into `_zer_bh`/`_zer_bl` uint64_t temps at start of statement expression. Constant path unchanged.
+- **Test:** Implicit — existing bit-set tests pass, constant path verified (reg[7..4] = 5 → 80).
+
 ### BUG-310: Volatile slice qualifier — `volatile []T`
 - **Symptom:** `volatile u8[16] hw_regs; poll(hw_regs)` where `poll([]u8)` — slice `.ptr` is non-volatile, GCC optimizes away MMIO reads in loops.
 - **Root cause:** TYPE_SLICE had no `is_volatile` flag.

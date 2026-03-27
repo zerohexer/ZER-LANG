@@ -475,7 +475,6 @@ The compat library is training wheels. You remove them when you can ride.
 
 - **C++ code** — classes, templates, exceptions, RAII. Not C. Not convertible.
 - **Computed gotos** (`goto *label_ptr`) — niche GCC extension, no ZER equivalent.
-- **K&R style function declarations** — ancient C, rewrite to ANSI C first.
 
 ### Handled via cinclude (already works, zero conversion needed)
 

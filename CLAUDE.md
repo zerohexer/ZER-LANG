@@ -302,6 +302,12 @@ Two tools + one library for automated C-to-ZER migration:
 - The line-based approach (detect pattern at `\n` boundary, emit replacement, skip source line) is much more reliable than mid-stream output buffer rollback. The rollback approach broke because earlier Layer 1 transforms changed output length vs source length.
 - `strcmp`/`strncmp`/`memcmp` → `bytes_equal` strips trailing `== 0` and `!= 0` comparisons (strcmp returns int, bytes_equal returns bool).
 - **Windows `\r\r\n` pitfall:** Phase 1 output may have `\r` chars. The `is_func_decl` backward scan must skip `\r` in addition to space/tab, otherwise no function signatures are detected.
+- **`scan_handle_params` must NOT reset `handle_param_count`** — `scan_local_slab_vars` runs first and adds entries. Resetting wipes them. This was the root cause of bare references (`a` instead of `a_h`) not being rewritten in `main()`.
+- **String literal skipping:** `upgrade()` must skip content inside `"..."` to prevent replacing identifiers inside strings. `"a=%d"` was becoming `"a_h=%d"` without this.
+- **Double `_h` prevention:** bare reference handler must detect var declarations (`Type *name = expr`) and skip them — `rewrite_signatures` already adds `_h` to declarations. The handler checks: if preceded by `*` and followed by `=`, it's a declaration → emit as-is.
+- **Local slab var tracking:** `scan_local_slab_vars()` finds `SlabType *var = expr` in function bodies (e.g., `Task *a = task_create()`). Registers as handle variable with function bounds. Combined with `scan_handle_params` (function params) and `scan_allocs` (malloc sites), covers all three sources of handle variables.
+- **Struct field rewriting:** `rewrite_signatures()` also detects `SlabType *field;` in struct definitions and rewrites to `?Handle(SlabType) field;`. Handles linked list `next`/`prev` and parent pointers.
+- **Local var declaration rewriting:** `rewrite_signatures()` detects `SlabType *var = expr;` and rewrites to `?Handle(SlabType) var_h = expr;`.
 
 **`lib/compat.zer`** — Scaffolding library (NOT part of ZER). Wraps C stdlib via `cinclude`. Tagged `zer_` prefix for Phase 2 detection. Removed after full upgrade.
 

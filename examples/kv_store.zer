@@ -1,9 +1,7 @@
-// ZER Key-Value Store — hashmap with Pool allocator
-// No malloc — Pool is a fixed-slot allocator (like a slab).
-//
-// Pool is NOT stack. It's a global array of slots with generation
-// counters. Same memory layout as a kernel slab allocator.
-// O(1) alloc, O(1) free, use-after-free detection.
+// ZER Key-Value Store — hashmap with Slab allocator
+// No malloc — Slab is a dynamic growable allocator.
+// Grows on demand (64 slots per page). No compile-time limit.
+// O(1) alloc, O(1) free, use-after-free detection via generation counters.
 
 struct KvEntry {
     u8[32] key;
@@ -20,9 +18,9 @@ struct KvTable {
     u32 count;
 }
 
-// Global pool — 256 entry slots, NOT on the stack.
-// This is static memory with O(1) alloc/free.
-static Pool(KvEntry, 256) entries;
+// Dynamic slab — no limit, grows on demand.
+// Same Handle API as Pool. Same safety guarantees.
+static Slab(KvEntry) entries;
 
 u32 kv_hash(const []u8 key, u32 table_size) {
     u32 h = 0;
@@ -72,7 +70,7 @@ bool kv_set(*KvTable t, const []u8 key, const []u8 value) {
     ?Handle(KvEntry) maybe_h = entries.alloc();
     Handle(KvEntry) h = maybe_h orelse return;
 
-    // Copy key inline (pool.get() is non-storable)
+    // Copy key inline (slab.get() is non-storable)
     u32 klen = @truncate(u32, key.len);
     if (klen > 32) { klen = 32; }
     for (u32 i = 0; i < klen; i += 1) {

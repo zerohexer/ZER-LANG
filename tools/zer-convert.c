@@ -318,6 +318,30 @@ static FILE *out;
 static bool needs_compat = false; /* set true if malloc/free/ptr arith used */
 static bool in_switch_arm = false; /* track open switch arm for auto-close */
 
+/* typedef tag→name mapping: typedef struct node { ... } Node; → node maps to Node */
+#define MAX_TAG_MAPS 64
+static struct { char tag[64]; char name[64]; } tag_maps[MAX_TAG_MAPS];
+static int tag_map_count = 0;
+
+static void add_tag_map(const char *tag, int tag_len, const char *name, int name_len) {
+    if (tag_map_count >= MAX_TAG_MAPS) return;
+    if (tag_len >= 63 || name_len >= 63) return;
+    memcpy(tag_maps[tag_map_count].tag, tag, tag_len);
+    tag_maps[tag_map_count].tag[tag_len] = '\0';
+    memcpy(tag_maps[tag_map_count].name, name, name_len);
+    tag_maps[tag_map_count].name[name_len] = '\0';
+    tag_map_count++;
+}
+
+static const char *lookup_tag(const char *ident, int len) {
+    for (int i = 0; i < tag_map_count; i++) {
+        if ((int)strlen(tag_maps[i].tag) == len &&
+            memcmp(tag_maps[i].tag, ident, len) == 0)
+            return tag_maps[i].name;
+    }
+    return NULL;
+}
+
 static void emit_raw(const char *s, int len) {
     fwrite(s, 1, len, out);
 }
@@ -483,7 +507,14 @@ static void transform(void) {
         /* case VALUE: → .VALUE => { and default: → default => { */
         if (t->type == CT_IDENT && tok_eq(t, "case")) {
             /* close previous arm if one was open (case without break) */
-            if (in_switch_arm) { emit_str("}\n"); in_switch_arm = false; }
+            if (in_switch_arm) {
+                emit_str("}\n");
+                in_switch_arm = false;
+                /* re-emit indentation */
+                for (int w = i - 1; w >= 0 && tokens[w].type == CT_WHITESPACE; w--) {
+                    emit_tok(&tokens[w]);
+                }
+            }
             i++;
             int j = skip_spaces(i);
             /* collect everything up to : as the case value */
@@ -502,7 +533,14 @@ static void transform(void) {
             int j = skip_spaces(i + 1);
             if (j < token_count && tokens[j].type == CT_COLON) {
                 /* close previous arm if open */
-                if (in_switch_arm) { emit_str("}\n"); in_switch_arm = false; }
+                if (in_switch_arm) {
+                    emit_str("}\n");
+                    in_switch_arm = false;
+                    /* re-emit indentation (whitespace before default was already emitted) */
+                    for (int w = i - 1; w >= 0 && tokens[w].type == CT_WHITESPACE; w--) {
+                        emit_tok(&tokens[w]);
+                    }
+                }
                 emit_str("default => {");
                 in_switch_arm = true;
                 i = j + 1;
@@ -700,10 +738,12 @@ static void transform(void) {
                     const char *kw = tok_eq(&tokens[j], "struct") ? "struct" :
                                      tok_eq(&tokens[j], "union") ? "union" : "enum";
                     int k = skip_spaces(j + 1);
+                    int tag_idx = -1; /* optional struct tag */
                     /* skip optional tag name (e.g., typedef struct node { ... } Node;) */
                     if (k < token_count && tokens[k].type == CT_IDENT) {
                         int m = skip_ws(k + 1);
                         if (m < token_count && tokens[m].type == CT_LBRACE) {
+                            tag_idx = k;
                             k = m; /* skip tag, jump to { */
                         }
                     }
@@ -723,6 +763,11 @@ static void transform(void) {
                             name_idx = n;
                         }
                         if (name_idx >= 0) {
+                            /* register tag→name mapping if tag exists */
+                            if (tag_idx >= 0) {
+                                add_tag_map(tokens[tag_idx].start, tokens[tag_idx].len,
+                                           tokens[name_idx].start, tokens[name_idx].len);
+                            }
                             /* emit "struct Name " and mark the post-} name+; for skipping */
                             emit_str(kw);
                             emit_str(" ");
@@ -764,8 +809,15 @@ static void transform(void) {
                         i++;
                         continue;
                     }
-                    /* struct usage: struct<ws>Node → Node (skip struct + whitespace) */
-                    i = j; /* jump to the name, skip struct + spaces */
+                    /* struct usage: struct<ws>Name → Name (skip struct + whitespace) */
+                    /* also apply tag mapping: struct node → Node (if node maps to Node) */
+                    const char *tag_name = lookup_tag(tokens[j].start, tokens[j].len);
+                    if (tag_name) {
+                        emit_str(tag_name);
+                        i = j + 1;
+                    } else {
+                        i = j; /* jump to the name, skip struct + spaces */
+                    }
                     continue;
                 }
             }
@@ -867,6 +919,16 @@ static void transform(void) {
                 i++;
                 { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
+            }
+
+            /* Tag→name mapping: bare 'node' → 'Node' (from typedef struct node {} Node;) */
+            {
+                const char *tag_name = lookup_tag(t->start, t->len);
+                if (tag_name) {
+                    emit_str(tag_name);
+                    i++;
+                    continue;
+                }
             }
         }
 

@@ -493,7 +493,7 @@ The compat library is training wheels. You remove them when you can ride.
 - **Simple macros** — `#define SIZE 256` → `const usize SIZE = 256;`. `#define MAX(a,b) ((a)>(b)?(a):(b))` → inline function. Auto-converted.
 - **Conditional compilation** — `#ifdef _WIN32` → ZER doesn't have a preprocessor, but `cinclude` blocks can wrap platform-specific C headers. Platform detection moves to build system (Makefile), not source code.
 
-### Requires manual review (flagged with warnings)
+### Handled via automated cinclude extraction
 
-- **Complex preprocessor metaprogramming** — recursive macros, X-macros with `##` token pasting generating code across multiple expansion levels. Phase 1 flags these. The user rewrites as ZER functions or uses `cinclude` to keep the C macro in a header.
-- **Variadic functions** (`printf(fmt, ...)`) — ZER doesn't have varargs. Calls to variadic C functions work via `cinclude`. ZER-native alternatives use typed formatting (`fmt.print` in stdlib).
+- **Complex preprocessor metaprogramming** — recursive macros, X-macros with `##` token pasting. The converter extracts them into a `.h` file and adds `cinclude "macros.h"` automatically. GCC expands the macros normally. Zero manual work.
+- **Variadic functions** (`printf(fmt, ...)`) — ZER doesn't have varargs. The converter keeps variadic calls in a `.h` wrapper and adds `cinclude`. Calls work unchanged through GCC.

@@ -229,7 +229,7 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         case TYPE_U16:   return val <= 65535;
         case TYPE_U32:   return val <= 0xFFFFFFFFULL;
         case TYPE_U64:   return true;
-        case TYPE_USIZE: return val <= 0xFFFFFFFFULL; /* 32-bit */
+        case TYPE_USIZE: return val <= (sizeof(size_t) == 8 ? UINT64_MAX : 0xFFFFFFFFULL);
         case TYPE_I8:    return val <= 127;
         case TYPE_I16:   return val <= 32767;
         case TYPE_I32:   return val <= 2147483647ULL;

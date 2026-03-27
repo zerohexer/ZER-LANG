@@ -1485,6 +1485,14 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* usize 64-bit gap closure */
+    ok("u32 main() { u32 x = 42; usize len = x; return @truncate(u32, len); }",
+       "u32 to usize widening accepted");
+    ok("u32 main() { usize x = 42; u32 y = @truncate(u32, x); return y; }",
+       "@truncate(u32, usize) accepted");
+    err("u32 main() { usize x = 42; u32 y = x; return y; }",
+        "usize to u32 direct narrowing rejected");
+
     /* BUG-304: @ptrcast const stripping */
     err("const u32 val = 42;\n"
         "void f() { *u32 p = @ptrcast(*u32, &val); }",

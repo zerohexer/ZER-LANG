@@ -183,7 +183,7 @@ int type_width(Type *a) {
     case TYPE_U16: case TYPE_I16: return 16;
     case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_ENUM: return 32;
     case TYPE_U64: case TYPE_I64: case TYPE_F64:  return 64;
-    case TYPE_USIZE: return 32; /* 32-bit target default, configurable later */
+    case TYPE_USIZE: return (int)(sizeof(size_t) * 8); /* matches host platform */
     default: return 0;
     }
 }

@@ -380,7 +380,7 @@ static void scan_local_slab_vars(const char *src, int src_len) {
  * Pattern: TYPE *NAME in function signature → Handle(TYPE) NAME_h
  * Must run AFTER scan_allocs so slab_types is populated. */
 static void scan_handle_params(const char *src, int src_len) {
-    handle_param_count = 0;
+    /* don't reset handle_param_count — scan_local_slab_vars may have added entries */
     if (slab_type_count == 0) return;
 
     for (int i = 0; i < src_len; i++) {
@@ -478,6 +478,17 @@ static void upgrade(const char *src, int src_len) {
     int i = 0;
 
     while (i < src_len) {
+
+        /* ---- skip string literals — don't replace identifiers inside strings ---- */
+        if (src[i] == '"') {
+            out_write(src + i, 1); i++;
+            while (i < src_len && src[i] != '"') {
+                if (src[i] == '\\' && i + 1 < src_len) { out_write(src + i, 2); i += 2; continue; }
+                out_write(src + i, 1); i++;
+            }
+            if (i < src_len) { out_write(src + i, 1); i++; } /* closing " */
+            continue;
+        }
 
         /* ---- zer_strlen(expr) → expr.len ---- */
         if (starts_with(src, i, src_len, "zer_strlen(") && word_boundary_before(src, i)) {
@@ -819,6 +830,23 @@ static void upgrade(const char *src, int src_len) {
             /* check if this ident is a malloc'd or handle-param variable */
             AllocInfo *ai = find_alloc(ident, id_start);
             HandleParam *hp = ai ? NULL : find_handle_param(ident, id_start);
+
+            /* skip if this is a var declaration (Type *name = ...) — rewrite_signatures handles it */
+            if (hp && !ai) {
+                int check_after = i;
+                while (check_after < src_len && src[check_after] == ' ') check_after++;
+                if (check_after < src_len && src[check_after] == '=') {
+                    /* check backward for * (pointer decl) */
+                    int check_before = id_start - 1;
+                    while (check_before > 0 && src[check_before] == ' ') check_before--;
+                    if (check_before > 0 && src[check_before] == '*') {
+                        /* this is a declaration — don't add _h, rewrite_signatures does it */
+                        out_write(src + id_start, id_len);
+                        continue;
+                    }
+                }
+            }
+
             if (ai || hp) {
                 const char *type = ai ? ai->type_name : hp->type_name;
                 const char *slab = get_slab_name(type);

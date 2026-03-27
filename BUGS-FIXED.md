@@ -1475,6 +1475,18 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-292: Volatile stripping in |*v| mutable capture
+- **Symptom:** `if (volatile_reg) |*v|` — `_zer_uwp` declared without volatile.
+- **Root cause:** BUG-272 fixed immutable captures but mutable `|*v|` path was separate.
+- **Fix:** `expr_is_volatile` check added to mutable capture branch; emits `volatile T *_zer_uwp`.
+- **Test:** Verified emitted C shows `volatile _zer_opt_u32 *_zer_uwp0`.
+
+### BUG-294: Assignment to non-lvalue (function call)
+- **Symptom:** `get_val() = 5` passes checker but produces GCC error.
+- **Root cause:** No lvalue validation in NODE_ASSIGN.
+- **Fix:** Check target kind — NODE_CALL, NODE_INT_LIT, NODE_STRING_LIT, NODE_NULL_LIT, NODE_BOOL_LIT → error.
+- **Test:** `test_checker_full.c` — assign to call rejected, assign to variable accepted.
+
 ### BUG-289: Volatile stripping in orelse temp
 - **Symptom:** `volatile ?u32 reg; u32 val = reg orelse 0` — orelse temp copies as non-volatile.
 - **Root cause:** `__auto_type` strips qualifiers in GCC.

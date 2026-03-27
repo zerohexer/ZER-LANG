@@ -720,6 +720,12 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**151. Volatile `|*v|` mutable capture pointer preserved.**
+`if (volatile_reg) |*v|` — `_zer_uwp` pointer now declared as `volatile T *` when source is volatile. Uses `expr_is_volatile` helper. (BUG-292)
+
+**152. Assignment to non-lvalue rejected.**
+`get_val() = 5` now caught at checker level — "not an lvalue". Checks NODE_CALL, NODE_INT_LIT, NODE_STRING_LIT, NODE_NULL_LIT, NODE_BOOL_LIT as assignment targets. (BUG-294)
+
 **149. Orelse temp preserves volatile via `__typeof__`.**
 `volatile ?u32 reg; u32 val = reg orelse 0` — orelse temp now uses `__typeof__(expr)` instead of `__auto_type`. `__typeof__` preserves volatile, `__auto_type` does not. (BUG-289)
 

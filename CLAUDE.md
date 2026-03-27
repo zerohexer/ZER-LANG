@@ -231,10 +231,42 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ZER will **NOT** have native backends, IR, or QBE. Emit-C via GCC is the permanent architecture.
 - GCC handles all embedded targets, provides decades of optimization, acts as a second validation layer
 - No IR layer planned — emit-C → GCC is the only compilation path
-- Self-hosting (zerc.zer compiled by zerc via GCC) is the v1.0 milestone
 - **Never suggest IR, LLVM, QBE, or native code generation in this project**
 
-**Roadmap:** v0.2 (bounds check optimization) → v0.3 (better errors/diagnostics) → v1.0 (self-hosting)
+### Self-Hosting Strategy (decided 2026-03-27)
+
+**Develop in C, prove in ZER.** The compiler is always written in C (`.c` files). LLMs assist development. Fast iteration.
+
+Self-hosting means zerc can emit a working copy of itself in ZER (`zerc.zer`), compile that copy, and the result is an identical compiler. The ZER mirror is the ultimate integration test — NOT the primary development codebase.
+
+```
+src/                ← active C development (LLM-assisted, fast)
+  lexer.c, parser.c, checker.c, emitter.c, ...
+zer-src/            ← ZER mirror (proof of self-hosting)
+  lexer.zer, parser.zer, checker.zer, emitter.zer, ...
+bootstrap/          ← frozen C snapshot (insurance, never touched)
+  lexer.c, parser.c, ...
+```
+
+**Build chain:**
+```
+gcc src/*.c -o zerc              ← build from C (primary)
+./zerc zer-src/main.zer -o zerc_zer.c  ← compile ZER mirror
+gcc zerc_zer.c -o zerc2          ← build from emitted C
+diff zerc zerc2                  ← identical = v1.0 proven
+```
+
+**Why not develop in `.zer` directly:**
+- LLMs have zero ZER training data — they write C syntax and call it ZER
+- C development is faster with LLM assistance today
+- ZER development becomes viable when users post real ZER code online (trains future models)
+- The C codebase is the productive path; the ZER mirror is the correctness proof
+
+**v1.0 definition:** `zerc.zer` compiles itself and produces an identical compiler.
+
+**Migration to `.zer`-primary happens when:** ZER has enough public code (GitHub repos, blog posts, Stack Overflow) that LLMs learn the syntax natively. Until then, C is the development language.
+
+**Roadmap:** v0.2 (bounds check optimization, stdlib) → v0.3 (better errors/diagnostics) → v1.0 (self-hosting proof)
 
 ### Structural Refactors Completed (RF1-RF7)
 

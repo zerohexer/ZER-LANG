@@ -1,0 +1,91 @@
+// ZER Standard Library — io.zer
+// File I/O via cinclude wrapping libc.
+// NOT freestanding — requires hosted OS (Linux, macOS, Windows).
+// Embedded targets: do NOT import this. Use UART/SPI directly.
+
+cinclude "stdio.h";
+cinclude "stdlib.h";
+cinclude "zer_helpers.h";
+
+// C function declarations
+*opaque fopen(*u8 path, *u8 mode);
+i32 fclose(*opaque stream);
+usize fread(*opaque buf, usize size, usize count, *opaque stream);
+usize fwrite(const *opaque buf, usize size, usize count, *opaque stream);
+i32 fseek(*opaque stream, i64 offset, i32 whence);
+
+// ================================================================
+// File open / close
+// ================================================================
+
+?*opaque io_open(const []u8 path, const []u8 mode) {
+    u8[512] path_buf;
+    u8[8] mode_buf;
+    if (path.len >= 511) { return null; }
+    if (mode.len >= 7) { return null; }
+    for (usize i = 0; i < path.len; i += 1) {
+        path_buf[i] = path[i];
+    }
+    path_buf[path.len] = 0;
+    for (usize i = 0; i < mode.len; i += 1) {
+        mode_buf[i] = mode[i];
+    }
+    mode_buf[mode.len] = 0;
+    *opaque fp = fopen(&path_buf[0], &mode_buf[0]);
+    return fp;
+}
+
+void io_close(*opaque f) {
+    fclose(f);
+}
+
+// ================================================================
+// Read / Write
+// ================================================================
+
+usize io_read(*opaque f, []u8 buf) {
+    return fread(@ptrcast(*opaque, buf.ptr), 1, buf.len, f);
+}
+
+usize io_write(*opaque f, const []u8 data) {
+    return fwrite(@ptrcast(const *opaque, data.ptr), 1, data.len, f);
+}
+
+usize io_writeln(*opaque f, const []u8 data) {
+    usize n = io_write(f, data);
+    fputc(10, f);
+    return n + 1;
+}
+
+// ================================================================
+// Convenience: read entire file into a fixed buffer
+// ================================================================
+
+// Read entire file into a caller-provided buffer.
+// Returns slice of bytes read, or null on failure.
+?[]u8 io_read_file_buf(const []u8 path, []u8 buf) {
+    ?*opaque mf = io_open(path, "rb");
+    *opaque f = mf orelse return;
+    usize total = 0;
+    while (total < buf.len) {
+        usize n = io_read(f, buf[total..buf.len]);
+        if (n == 0) { break; }
+        total += n;
+    }
+    io_close(f);
+    if (total == 0) { return null; }
+    return buf[0..total];
+}
+
+// ================================================================
+// Write entire buffer to file
+// ================================================================
+
+bool io_write_file(const []u8 path, const []u8 data) {
+    ?*opaque mf = io_open(path, "wb");
+    *opaque f = mf orelse return;
+    usize written = io_write(f, data);
+    io_close(f);
+    if (written == data.len) { return true; }
+    return false;
+}

@@ -819,6 +819,9 @@ Signed overflow UB in the compiler itself prevented. Both `/` and `%` paths chec
 **141. Volatile array var-decl init uses byte loop.**
 `volatile u8[4] hw = src` used `memcpy` — doesn't respect volatile. Now uses byte-by-byte loop when `var_decl.is_volatile` is set. Same pattern as BUG-273 (array assignment). (BUG-278)
 
+**169. Const return type parsing — global scope lookahead.**
+`const []u8 get_name() { ... }` — parser sees `const` at global scope and now peeks ahead for function declarations (same lookahead as volatile return types). Without this, `const` routes to `parse_var_decl` and rejects the `(` after the function name. Enables stdlib functions returning `const []u8`.
+
 **166. Return orelse @ptrcast(&local) caught.**
 `return opt orelse @ptrcast(*u8, &local)` — orelse root walk now inspects NODE_INTRINSIC (ptrcast/bitcast) and NODE_UNARY(&) in fallback branch. Only fires when return type is pointer (value bitcasts like `@bitcast(u32, s[1])` are safe). (BUG-317)
 

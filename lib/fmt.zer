@@ -1,0 +1,142 @@
+// ZER Standard Library — fmt.zer
+// Formatted output to stdout/stderr.
+// Uses libc putchar/fputc — available on any hosted platform.
+// Embedded targets: replace these declarations with UART-backed versions.
+
+// C function declarations (provided by libc, linked by GCC)
+cinclude "stdio.h";
+cinclude "zer_helpers.h";
+i32 putchar(i32 c);
+i32 fputc(i32 c, *opaque stream);
+*opaque zer_get_stderr();
+*opaque zer_get_stdout();
+
+// ================================================================
+// Core output — write to stdout
+// ================================================================
+
+// Print a byte slice to stdout (no newline)
+void print(const []u8 s) {
+    for (usize i = 0; i < s.len; i += 1) {
+        putchar(@truncate(i32, s[i]));
+    }
+}
+
+// Print a byte slice to stdout with newline
+void println(const []u8 s) {
+    print(s);
+    putchar(10);
+}
+
+// Print a single character
+void print_char(u8 c) {
+    putchar(@truncate(i32, c));
+}
+
+// Print a newline
+void print_nl() {
+    putchar(10);
+}
+
+// ================================================================
+// Integer output
+// ================================================================
+
+// Print unsigned 64-bit integer as decimal
+void print_u64(u64 val) {
+    u8[20] buf;
+    usize len = fmt_u64(buf, val);
+    print(buf[0..len]);
+}
+
+// Print unsigned 32-bit integer as decimal
+void print_u32(u32 val) {
+    print_u64(@truncate(u64, val));
+}
+
+// Print signed 64-bit integer as decimal
+void print_i64(i64 val) {
+    u8[21] buf;
+    usize len = fmt_i64(buf, val);
+    print(buf[0..len]);
+}
+
+// Print signed 32-bit integer as decimal
+void print_i32(i32 val) {
+    print_i64(@truncate(i64, val));
+}
+
+// Print unsigned integer as hexadecimal (no 0x prefix)
+void print_hex(u64 val) {
+    u8[16] buf;
+    usize len = fmt_hex(buf, val);
+    print(buf[0..len]);
+}
+
+// Print unsigned integer as hexadecimal with 0x prefix
+void print_hex_prefix(u64 val) {
+    print("0x");
+    print_hex(val);
+}
+
+// Print boolean as "true" or "false"
+void print_bool(bool val) {
+    if (val) {
+        print("true");
+    } else {
+        print("false");
+    }
+}
+
+// Print usize as decimal
+void print_usize(usize val) {
+    print_u64(@truncate(u64, val));
+}
+
+// ================================================================
+// Stderr output
+// ================================================================
+
+// Print to stderr (for error messages)
+void eprint(const []u8 s) {
+    *opaque err = zer_get_stderr();
+    for (usize i = 0; i < s.len; i += 1) {
+        fputc(@truncate(i32, s[i]), err);
+    }
+}
+
+// Print to stderr with newline
+void eprintln(const []u8 s) {
+    eprint(s);
+    *opaque err = zer_get_stderr();
+    fputc(10, err);
+}
+
+// ================================================================
+// Formatted helpers
+// ================================================================
+
+// Print "key: value\n" pattern (common for debugging)
+void print_kv(const []u8 key, const []u8 value) {
+    print(key);
+    print(": ");
+    println(value);
+}
+
+// Print "key: N\n" pattern with integer value
+void print_kv_u32(const []u8 key, u32 value) {
+    print(key);
+    print(": ");
+    print_u32(value);
+    print_nl();
+}
+
+// Print "label [N/M]\n" progress pattern
+void print_progress(const []u8 label, u32 current, u32 total) {
+    print(label);
+    print(" [");
+    print_u32(current);
+    print("/");
+    print_u32(total);
+    println("]");
+}

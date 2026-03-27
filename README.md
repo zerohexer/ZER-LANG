@@ -225,7 +225,7 @@ VS Code extension in `editors/vscode/` with full syntax highlighting.
 
 Works with: VS Code, Neovim (nvim-lspconfig), Emacs (eglot/lsp-mode), Helix, Zed.
 
-## Status: v0.1.0
+## Status: v0.2.0
 
 ZER compiles to C99 and runs on any target GCC supports.
 
@@ -233,15 +233,13 @@ ZER compiles to C99 and runs on any target GCC supports.
 
 **Proven against real CVEs:** Heartbleed (CVE-2014-0160) and Baron Samedit (CVE-2021-3156) reproduced side-by-side — C silently leaks memory, ZER traps at the bounds check. See [`examples/cve-demos/`](examples/cve-demos/).
 
-**Multiple exhaustive rounds of systematic auditing.** Each round spawned independent agents to audit the checker and emitter for bugs, then every finding was manually verified against the actual compiler before fixing. Bug count per round: 12 → 9 → 2 → 2 → 1 → 2 → CLEAN → 6 → 12 → 5 → 2 → 5 → 2 → 4 → 1 → 1 → 2 → 3 → 1. 127 bugs found and fixed.
-
-**1018 tests across 7 dimensions:**
+**1,775 tests across 7 dimensions:**
 - **Lexer** — 218 tests: every token type, edge cases, error recovery
-- **Parser** — 163 tests: every AST node kind, adversarial inputs
-- **Type Checker** — 327 tests: every type coercion, every rejection rule, security/audit tests
-- **C Emitter** — 160 end-to-end tests: ZER source → C → GCC → run → verify exit code
+- **Parser** — 168 tests: every AST node kind, adversarial inputs
+- **Type Checker** — 474 tests: every type coercion, every rejection rule, security/audit tests
+- **C Emitter** — 213 end-to-end tests: ZER source → C → GCC → run → verify exit code
 - **ZER-CHECK** — 24 tests: handle tracking, use-after-free detection, double-free, alias tracking, params
-- **Firmware Patterns** — 116 tests: real embedded patterns (UART, SPI, CAN, DMA, state machines, interrupt handlers, packed structs, MMIO registers)
+- **Firmware Patterns** — 102 tests: real embedded patterns (UART, SPI, CAN, DMA, state machines, interrupt handlers, packed structs, MMIO registers)
 - **Parser Fuzz** — 491 adversarial inputs: random/malformed input, zero crashes
 
 ## License

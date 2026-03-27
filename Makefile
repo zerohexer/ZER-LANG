@@ -74,6 +74,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_fuzz
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh
+	@echo "=== Conversion tool tests ==="
+	@bash tests/test_convert.sh
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

@@ -287,6 +287,11 @@ static const char *map_type(CToken *t) {
             return type_map[i].zer_name;
         }
     }
+    /* also check standalone keywords not in the table */
+    if (tok_eq(t, "int")) return "i32";
+    if (tok_eq(t, "long")) return "i64";
+    if (tok_eq(t, "short")) return "i16";
+    if (tok_eq(t, "unsigned")) return "u32";
     return NULL;
 }
 
@@ -707,7 +712,7 @@ static void transform(void) {
                 int j = skip_spaces(i + 1);
                 if (j < token_count && tokens[j].type == CT_STAR) {
                     /* void * → *opaque */
-                    emit_str("*opaque");
+                    emit_str("*opaque ");
                     i = j + 1; /* skip void + * */
                     continue;
                 }

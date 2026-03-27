@@ -2,7 +2,7 @@
 
 You know C. You've written linked lists, hash tables, malloc'd structs. You've never built a compiler. This guide takes you from "I know C" to "I understand every stage of zerc" in one read.
 
-The ZER compiler is ~9,500 lines of C. You can read the entire thing in a weekend. This guide shows you how each part works, with real code from the source.
+The ZER compiler is ~10,600 lines of C. You can read the entire thing in a weekend. This guide shows you how each part works, with real code from the source.
 
 ---
 
@@ -30,11 +30,11 @@ Each stage takes the previous stage's output and transforms it. They're separate
 
 | File | Lines | What it does |
 |------|-------|-------------|
-| `lexer.c` | ~600 | Text → tokens |
-| `parser.c` | ~1500 | Tokens → tree (AST) |
-| `checker.c` | ~1950 | Tree → typed tree (catches errors) |
-| `zercheck.c` | ~440 | Handle safety analysis |
-| `emitter.c` | ~2200 | Typed tree → C code |
+| `lexer.c` | ~620 | Text → tokens |
+| `parser.c` | ~1800 | Tokens → tree (AST) |
+| `checker.c` | ~4100 | Tree → typed tree (catches errors) |
+| `zercheck.c` | ~510 | Handle safety analysis |
+| `emitter.c` | ~3150 | Typed tree → C code |
 
 ---
 
@@ -253,7 +253,7 @@ struct Type {
         struct { Type *inner; bool is_const; bool is_volatile; } pointer;
         struct { Type *inner; } optional;
         struct { Type *inner; uint32_t size; } array;
-        struct { Type *inner; } slice;
+        struct { Type *inner; bool is_const; bool is_volatile; } slice;
         struct { SField *fields; uint32_t field_count;
                  const char *name; } struct_type;
         struct { SEVariant *variants; uint32_t variant_count;
@@ -500,7 +500,7 @@ The expression path uses GCC statement expressions `({...})` — a GCC extension
 
 ### Hard emission: builtin methods
 
-`pool.alloc()`, `ring.push()`, `arena.alloc()` are not function calls — they're compiler-known operations that emit inline C:
+`pool.alloc()`, `slab.alloc()`, `ring.push()`, `arena.alloc()` are not function calls — they're compiler-known operations that emit inline C:
 
 ```c
 // From emitter.c — builtin method interception (simplified)
@@ -509,9 +509,22 @@ if (obj_type->kind == TYPE_POOL && method == "alloc") {
     emit(e, "({ _zer_opt_u32 r; uint32_t h = _zer_pool_alloc(...); ... })");
     handled = true;  // skip normal call emission
 }
+
+// Slab uses the same pattern — same API, different runtime
+if (obj_type->kind == TYPE_SLAB && method == "alloc") {
+    emit(e, "({ _zer_opt_u32 r; uint32_t h = _zer_slab_alloc(&slab, ...); ... })");
+    handled = true;
+}
 ```
 
-The pattern: check if the callee is a field access on a Pool/Ring/Arena, match the method name, emit inline C, set `handled = true` to skip the normal function call path.
+The pattern: check if the callee is a field access on a Pool/Slab/Ring/Arena, match the method name, emit inline C, set `handled = true` to skip the normal function call path.
+
+**Pool vs Slab:**
+- `Pool(Task, 8)` — 8 slots, compile-time size, static arrays. For embedded where you know your limits.
+- `Slab(Task)` — unlimited slots, pages allocated on demand (64 per page). For x86_64/servers.
+- Same Handle(T) API: `alloc() → ?Handle(T)`, `get(h) → *T`, `free(h)`.
+- Same safety: generation counters, use-after-free detection, ZER-CHECK tracking.
+- Pool emits inline struct with arrays. Slab emits `_zer_slab` struct with pointer-based pages.
 
 ### Hard emission: enum switch
 
@@ -544,8 +557,10 @@ The emitter outputs a preamble at the top of every `.c` file containing:
 
 - `#include` for stdint.h, stddef.h, string.h, stdio.h, stdlib.h
 - Optional type typedefs: `_zer_opt_u32`, `_zer_opt_void`, etc.
-- Slice type typedefs: `_zer_slice_u8`, `_zer_slice_u32`
+- Slice type typedefs: `_zer_slice_u8`, `_zer_slice_u32`, etc.
+- Volatile slice typedefs: `_zer_vslice_u8`, `_zer_vslice_u32`, etc. (with `volatile T *ptr`)
 - Pool runtime: `_zer_pool_alloc`, `_zer_pool_get`, `_zer_pool_free`
+- Slab runtime: `_zer_slab`, `_zer_slab_alloc`, `_zer_slab_get`, `_zer_slab_free`
 - Ring runtime: `_zer_ring_push`
 - Arena runtime: `_zer_arena`, `_zer_arena_alloc`
 - Bounds check: `_zer_bounds_check`, `_zer_trap`
@@ -728,7 +743,7 @@ Write a positive test (valid code runs correctly) and a negative test (invalid c
 3. **One debug print** — add ONE `fprintf(stderr, ...)` at the decision point
 4. **Confirm root cause** — read the debug output, don't guess
 5. **Fix** — should be 1-5 lines
-6. **`make check`** — all 940+ tests must pass
+6. **`make check`** — all 1766+ tests must pass
 7. **Update docs** — BUGS-FIXED.md, compiler-internals.md if patterns changed
 
 If the fix grows beyond 10 lines, you're fixing the wrong thing. Stop and reconsider.
@@ -746,4 +761,48 @@ Once you've read this guide:
 - **New keyword needed?** → `lexer.h` + `lexer.c`
 - **New syntax needed?** → `ast.h` + `parser.c` + `checker.c` + `emitter.c` + tests
 
-The compiler is 9,500 lines. You can read it all. There is no magic.
+The compiler is 10,600 lines. You can read it all. There is no magic.
+
+---
+
+## Memory Builtins Quick Reference
+
+ZER has no malloc. Four builtin allocators cover every pattern:
+
+```
+Pool(Task, 8)   — 8 fixed slots. Compile-time bound. Embedded/real-time.
+                  alloc() → ?Handle(Task)    free(h)    get(h) → *Task
+
+Slab(Task)      — Unlimited slots. Grows on demand (64 per page).
+                  alloc() → ?Handle(Task)    free(h)    get(h) → *Task
+                  Same API as Pool. Same safety. No compile-time count.
+
+Ring(u8, 256)   — 256-slot circular buffer. FIFO.
+                  push(val)    pop() → ?u8    push_checked(val) → ?void
+
+Arena           — Bump allocator. Bulk free only.
+                  alloc(T) → ?*T    alloc_slice(T, n) → ?[]T    unsafe_reset()
+```
+
+All four must be `static` or global — not on the stack.
+Pool/Slab/Ring cannot be assigned (not copyable) or used as struct fields.
+Pool/Slab `get()` returns non-storable `*T` — you must use it inline:
+```
+// OK:   slab.get(h).field = 5;
+// BAD:  *Task t = slab.get(h);   // compile error — non-storable
+```
+
+### Volatile Slices
+
+ZER slices carry `is_volatile`. When a volatile array is passed as a slice, the volatile qualifier propagates:
+
+```
+volatile u8[16] hw_regs;
+void poll(volatile []u8 regs) { ... }   // volatile preserved
+poll(hw_regs);                           // OK — volatile → volatile
+
+void bad([]u8 regs) { ... }             // non-volatile param
+bad(hw_regs);                            // COMPILE ERROR — would strip volatile
+```
+
+The emitter uses `_zer_vslice_T` typedefs with `volatile T *ptr` for volatile slices. This is how ZER preserves MMIO safety through slice abstractions — something C silently drops.

@@ -289,8 +289,16 @@ Two tools + one library for automated C-to-ZER migration:
 **`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
 - Layer 1: `zer_strlen(s)`→`s.len`, `zer_strcmp(a,b)==0`→`bytes_equal(a,b)`, `zer_memcpy`→`bytes_copy`, `zer_memset(d,0,n)`→`bytes_zero(d)`, `zer_exit`→`@trap()`
 - Layer 2: Scans `@ptrcast(*T, zer_malloc_bytes(@size(T)))` patterns, matches with `zer_free()`, generates `static Slab(T)` declarations, rewrites `var.field`→`slab.get(var_h).field`
+- Scope-aware: tracks function boundaries per malloc — parameters in other functions NOT wrapped with `slab.get()`
+- Line-based replacement: detects malloc pattern at line start, replaces entire line. No output buffer rollback (was causing stray `)` bugs).
+- Null check removal: `if (!var) return ...;` after `orelse return;` automatically skipped
 - Auto-adds `import str;`, removes `import compat;` when fully upgraded
 - Reports: N upgraded, M kept (for remaining compat calls)
+
+**zer-upgrade architecture notes for fresh sessions:**
+- Layer 2 malloc detection uses `find_func_bounds()` to record `func_start`/`func_end` for each alloc. `find_alloc(name, pos)` only matches if `pos` is within the function where malloc occurred. This prevents wrapping function parameters with `slab.get()`.
+- The line-based approach (detect pattern at `\n` boundary, emit replacement, skip source line) is much more reliable than mid-stream output buffer rollback. The rollback approach broke because earlier Layer 1 transforms changed output length vs source length.
+- `strcmp`/`strncmp`/`memcmp` → `bytes_equal` strips trailing `== 0` and `!= 0` comparisons (strcmp returns int, bytes_equal returns bool).
 
 **`lib/compat.zer`** — Scaffolding library (NOT part of ZER). Wraps C stdlib via `cinclude`. Tagged `zer_` prefix for Phase 2 detection. Removed after full upgrade.
 

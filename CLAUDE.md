@@ -784,6 +784,15 @@ Signed overflow UB in the compiler itself prevented. Both `/` and `%` paths chec
 **141. Volatile array var-decl init uses byte loop.**
 `volatile u8[4] hw = src` used `memcpy` — doesn't respect volatile. Now uses byte-by-byte loop when `var_decl.is_volatile` is set. Same pattern as BUG-273 (array assignment). (BUG-278)
 
+**166. Return orelse @ptrcast(&local) caught.**
+`return opt orelse @ptrcast(*u8, &local)` — orelse root walk now inspects NODE_INTRINSIC (ptrcast/bitcast) and NODE_UNARY(&) in fallback branch. Only fires when return type is pointer (value bitcasts like `@bitcast(u32, s[1])` are safe). (BUG-317)
+
+**167. Orelse fallback flag propagation bidirectional.**
+`*u32 q = opt orelse p` where `p` is local-derived — var-decl init flag propagation now checks BOTH `orelse.expr` AND `orelse.fallback` for local/arena-derived flags. Previously only checked the expr side. (BUG-318)
+
+**168. `@size(distinct void)` rejected.**
+`distinct typedef void MyVoid; @size(MyVoid)` — unwraps distinct before checking TYPE_VOID/TYPE_OPAQUE. Also checks expression args (named types parsed as NODE_IDENT, not type_arg). (BUG-320)
+
 **163. Orelse assignment escape to global caught.**
 `g_ptr = opt orelse &local` — NODE_ASSIGN now walks into NODE_ORELSE fallback, checks both `&local` and local-derived idents. Rejects when target is global/static. (BUG-314)
 

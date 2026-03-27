@@ -1499,6 +1499,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added `> 18446744073709551615.0 ? UINT64_MAX` clamp.
 - **Test:** Implicit — correct saturation behavior.
 
+### BUG-317: Return orelse @ptrcast(&local) escape
+- **Symptom:** `return opt orelse @ptrcast(*u8, &x)` compiles — local address escapes through intrinsic in orelse fallback.
+- **Root cause:** NODE_RETURN orelse root walk didn't inspect NODE_INTRINSIC or NODE_UNARY(&) in fallback.
+- **Fix:** Walk into ptrcast/bitcast intrinsics and & expressions in orelse fallback. Only when return type is pointer (value bitcasts safe).
+- **Test:** `test_checker_full.c` — return orelse @ptrcast(&local) rejected.
+
+### BUG-318: Orelse fallback flag propagation missing
+- **Symptom:** `*u32 q = opt orelse p` where `p` is local-derived — `q` not marked local-derived, escapes to global.
+- **Root cause:** Var-decl init flag propagation only checked `orelse.expr`, not `orelse.fallback`.
+- **Fix:** Check both sides — split NODE_ORELSE into two root checks for local/arena-derived.
+- **Test:** `test_checker_full.c` — orelse alias local-derived escape rejected.
+
+### BUG-320: @size(distinct void) bypass
+- **Symptom:** `distinct typedef void MyVoid; @size(MyVoid)` compiles — void has no size.
+- **Root cause:** @size only checked `type_arg` for void/opaque. Named types (distinct typedef) parse as expression args (NODE_IDENT), not type_arg.
+- **Fix:** Also check expression arg's resolved type. Call `type_unwrap_distinct` before TYPE_VOID/TYPE_OPAQUE check.
+- **Test:** `test_checker_full.c` — @size(distinct void) rejected.
+
 ### BUG-314: Orelse assignment escape to global
 - **Symptom:** `g_ptr = opt orelse &x` where `x` is local — compiles, creates dangling pointer.
 - **Root cause:** NODE_ASSIGN escape check only looked at direct `NODE_UNARY/TOK_AMP`, didn't walk into `NODE_ORELSE` fallback.

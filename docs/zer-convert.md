@@ -469,15 +469,31 @@ The compat library is training wheels. You remove them when you can ride.
 
 ## Scope Limitations
 
-`zer-convert` targets well-structured C code. It is NOT designed to handle:
+`zer-convert` targets C code. NOT C++. NOT K&R-style C.
 
-- C++ code (classes, templates, exceptions, RAII)
-- Assembly inline (`__asm__`) — passed through via `cinclude`
-- Computed gotos (`goto *label_ptr`)
-- `setjmp`/`longjmp` — no ZER equivalent
-- `alloca` — stack allocation with runtime size
-- Bit fields in structs — ZER uses bit extraction syntax instead
-- K&R style function declarations
-- Complex preprocessor metaprogramming (#if chains, recursive macros)
+### True limitations (out of scope)
 
-These are flagged as errors during Phase 1. The user must simplify the C code before converting.
+- **C++ code** — classes, templates, exceptions, RAII. Not C. Not convertible.
+- **Computed gotos** (`goto *label_ptr`) — niche GCC extension, no ZER equivalent.
+- **K&R style function declarations** — ancient C, rewrite to ANSI C first.
+
+### Handled via cinclude (already works, zero conversion needed)
+
+- **Assembly inline** (`__asm__`) — `cinclude` passes C headers through to GCC unchanged. Assembly blocks in C headers work as-is. No conversion needed.
+- **Platform-specific headers** (`#include <windows.h>`) — `cinclude` handles all C headers.
+
+### Handled via compat builtins (Phase 1 converts, Phase 2 replaces)
+
+- **`setjmp`/`longjmp`** — Phase 1: `zer_setjmp()`/`zer_longjmp()` compat wrappers. Phase 2: replaces with ZER error handling (`?T` return types, `orelse` propagation). The C pattern "setjmp for error recovery" maps to "optional returns with orelse."
+- **`alloca`** — Phase 1: `zer_alloca(T, n)` compat wrapper. Phase 2: replaces with `Arena.alloc_slice(T, n)`. Same concept — bump allocation on a buffer. Arena is stack-like but bounded and safe.
+
+### Handled via syntax transform (Phase 1 converts directly)
+
+- **Bit fields** — C `struct { uint8_t flag : 1; uint8_t mode : 3; }` converts to ZER bit extraction: `val[0..0]` for flag, `val[3..1]` for mode. ZER's bit syntax is more explicit and works with any integer, not just struct fields.
+- **Simple macros** — `#define SIZE 256` → `const usize SIZE = 256;`. `#define MAX(a,b) ((a)>(b)?(a):(b))` → inline function. Auto-converted.
+- **Conditional compilation** — `#ifdef _WIN32` → ZER doesn't have a preprocessor, but `cinclude` blocks can wrap platform-specific C headers. Platform detection moves to build system (Makefile), not source code.
+
+### Requires manual review (flagged with warnings)
+
+- **Complex preprocessor metaprogramming** — recursive macros, X-macros with `##` token pasting generating code across multiple expansion levels. Phase 1 flags these. The user rewrites as ZER functions or uses `cinclude` to keep the C macro in a header.
+- **Variadic functions** (`printf(fmt, ...)`) — ZER doesn't have varargs. Calls to variadic C functions work via `cinclude`. ZER-native alternatives use typed formatting (`fmt.print` in stdlib).

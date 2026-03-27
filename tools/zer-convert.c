@@ -677,8 +677,9 @@ static void transform(void) {
                         cast_end = m + 1;
                     }
                 }
-                /* check for (type) pattern — value cast */
-                if (!is_cast && mapped_cast) {
+                /* check for (type) pattern — value cast.
+                 * Exclude (void) — that's a function param list, not a cast. */
+                if (!is_cast && mapped_cast && !tok_eq(&tokens[j], "void")) {
                     if (k < token_count && tokens[k].type == CT_RPAREN) {
                         cast_type = mapped_cast;
                         is_cast = true;

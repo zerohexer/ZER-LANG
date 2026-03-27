@@ -690,53 +690,64 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, obj);
                 emit(e, ") *_zer_bp%d = &(", btmp);
                 emit_expr(e, obj);
-                emit(e, "); *_zer_bp%d = (*_zer_bp%d", btmp, btmp);
+                emit(e, "); ");
+                /* BUG-316: hoist hi/lo into temps for single evaluation */
+                int64_t const_hi = hi_node ? eval_const_expr(hi_node) : CONST_EVAL_FAIL;
+                int64_t const_lo = lo_node ? eval_const_expr(lo_node) : CONST_EVAL_FAIL;
+                bool bits_const = (const_hi != CONST_EVAL_FAIL && const_lo != CONST_EVAL_FAIL &&
+                                   const_hi >= 0 && const_lo >= 0);
+                if (!bits_const && hi_node && lo_node) {
+                    emit(e, "uint64_t _zer_bh%d = (uint64_t)(", btmp);
+                    emit_expr(e, hi_node);
+                    emit(e, "); uint64_t _zer_bl%d = (uint64_t)(", btmp);
+                    emit_expr(e, lo_node);
+                    emit(e, "); ");
+                }
+                emit(e, "*_zer_bp%d = (*_zer_bp%d", btmp, btmp);
                 emit(e, " & ~(");
                 /* emit mask: safe for width >= 64 */
                 if (hi_node && lo_node) {
-                    int64_t hi = eval_const_expr(hi_node);
-                    int64_t lo = eval_const_expr(lo_node);
-                    if (hi != CONST_EVAL_FAIL && lo != CONST_EVAL_FAIL && hi >= 0 && lo >= 0) {
-                        int64_t width = hi - lo + 1;
+                    if (bits_const) {
+                        int64_t width = const_hi - const_lo + 1;
                         if (width >= 64) {
                             emit(e, "~(uint64_t)0");
                         } else {
                             emit(e, "((1ull << %lld) - 1)", (long long)width);
                         }
-                        emit(e, " << %lld", (long long)lo);
+                        emit(e, " << %lld", (long long)const_lo);
                     } else {
-                        /* runtime: ((1ull << (hi - lo + 1)) - 1) << lo */
-                        emit(e, "((((");
-                        emit_expr(e, hi_node);
-                        emit(e, ") - (");
-                        emit_expr(e, lo_node);
-                        emit(e, ") + 1) >= 64 ? ~(uint64_t)0 : ((1ull << ((");
-                        emit_expr(e, hi_node);
-                        emit(e, ") - (");
-                        emit_expr(e, lo_node);
-                        emit(e, ") + 1)) - 1)) << (");
-                        emit_expr(e, lo_node);
-                        emit(e, ")");
+                        /* runtime: use hoisted temps */
+                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
+                             "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
+                             "<< _zer_bl%d)",
+                             btmp, btmp, btmp, btmp, btmp);
                     }
                 }
                 emit(e, ")) | (((uint64_t)(");
                 emit_expr(e, node->assign.value);
                 emit(e, ") << ");
-                if (lo_node) emit_expr(e, lo_node);
-                else emit(e, "0");
+                if (hi_node && lo_node) {
+                    if (bits_const) emit(e, "%lld", (long long)const_lo);
+                    else emit(e, "_zer_bl%d", btmp);
+                } else {
+                    emit(e, "0");
+                }
                 emit(e, ") & (");
                 /* re-emit mask */
                 if (hi_node && lo_node) {
-                    int64_t hi = eval_const_expr(hi_node);
-                    int64_t lo = eval_const_expr(lo_node);
-                    if (hi != CONST_EVAL_FAIL && lo != CONST_EVAL_FAIL && hi >= 0 && lo >= 0) {
-                        int64_t width = hi - lo + 1;
+                    if (bits_const) {
+                        int64_t width = const_hi - const_lo + 1;
                         if (width >= 64) {
                             emit(e, "~(uint64_t)0");
                         } else {
                             emit(e, "((1ull << %lld) - 1)", (long long)width);
                         }
-                        emit(e, " << %lld", (long long)lo);
+                        emit(e, " << %lld", (long long)const_lo);
+                    } else {
+                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
+                             "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
+                             "<< _zer_bl%d)",
+                             btmp, btmp, btmp, btmp, btmp);
                     }
                 }
                 emit(e, ")); })");

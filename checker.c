@@ -700,13 +700,17 @@ static Type *check_expr(Checker *c, Node *node) {
         /* comparison: both same type (or coercible), result = bool */
         case TOK_EQEQ: case TOK_BANGEQ:
         case TOK_LT: case TOK_GT: case TOK_LTEQ: case TOK_GTEQ:
-            /* reject slice/array comparison — C compares struct/pointer, not content */
-            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ) &&
-                ((left->kind == TYPE_SLICE || left->kind == TYPE_ARRAY) ||
-                 (right->kind == TYPE_SLICE || right->kind == TYPE_ARRAY))) {
-                checker_error(c, node->loc.line,
-                    "cannot compare '%s' with == — use element-wise comparison",
-                    type_name(left->kind == TYPE_SLICE || left->kind == TYPE_ARRAY ? left : right));
+            /* reject slice/array comparison — C compares struct/pointer, not content.
+             * BUG-315: unwrap distinct before checking (distinct []u8 is still a slice). */
+            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ)) {
+                Type *eff_l = type_unwrap_distinct(left);
+                Type *eff_r = type_unwrap_distinct(right);
+                if ((eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY) ||
+                    (eff_r->kind == TYPE_SLICE || eff_r->kind == TYPE_ARRAY)) {
+                    checker_error(c, node->loc.line,
+                        "cannot compare '%s' with == — use element-wise comparison",
+                        type_name(eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY ? left : right));
+                }
             }
             if (!type_equals(left, right) &&
                 !can_implicit_coerce(left, right) &&
@@ -1017,26 +1021,53 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* clear — will be re-set below if new value is unsafe */
                     tsym->is_local_derived = false;
                     tsym->is_arena_derived = false;
-                    /* check if new value is &local */
-                    if (node->assign.value->kind == NODE_UNARY &&
-                        node->assign.value->unary.op == TOK_AMP &&
-                        node->assign.value->unary.operand->kind == NODE_IDENT) {
-                        Symbol *src = scope_lookup(c->current_scope,
-                            node->assign.value->unary.operand->ident.name,
-                            (uint32_t)node->assign.value->unary.operand->ident.name_len);
-                        bool src_is_global = src && scope_lookup_local(c->global_scope,
-                            src->name, src->name_len) != NULL;
-                        if (src && !src->is_static && !src_is_global) {
-                            tsym->is_local_derived = true;
+                    /* check if new value is &local — also check orelse fallback (BUG-314) */
+                    {
+                        Node *vcheck = node->assign.value;
+                        /* BUG-314: walk into orelse — check both expr and fallback */
+                        if (vcheck->kind == NODE_ORELSE) {
+                            Node *fb = vcheck->orelse.fallback;
+                            if (fb && fb->kind == NODE_UNARY &&
+                                fb->unary.op == TOK_AMP &&
+                                fb->unary.operand->kind == NODE_IDENT) {
+                                Symbol *src = scope_lookup(c->current_scope,
+                                    fb->unary.operand->ident.name,
+                                    (uint32_t)fb->unary.operand->ident.name_len);
+                                bool src_is_global = src && scope_lookup_local(c->global_scope,
+                                    src->name, src->name_len) != NULL;
+                                if (src && !src->is_static && !src_is_global)
+                                    tsym->is_local_derived = true;
+                            }
+                            if (fb && fb->kind == NODE_IDENT) {
+                                Symbol *src = scope_lookup(c->current_scope,
+                                    fb->ident.name, (uint32_t)fb->ident.name_len);
+                                if (src && src->is_local_derived) tsym->is_local_derived = true;
+                                if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                            }
+                            vcheck = vcheck->orelse.expr;
+                        }
+                        if (vcheck->kind == NODE_UNARY &&
+                            vcheck->unary.op == TOK_AMP &&
+                            vcheck->unary.operand->kind == NODE_IDENT) {
+                            Symbol *src = scope_lookup(c->current_scope,
+                                vcheck->unary.operand->ident.name,
+                                (uint32_t)vcheck->unary.operand->ident.name_len);
+                            bool src_is_global = src && scope_lookup_local(c->global_scope,
+                                src->name, src->name_len) != NULL;
+                            if (src && !src->is_static && !src_is_global)
+                                tsym->is_local_derived = true;
                         }
                     }
                     /* check if new value is an alias of local/arena-derived */
-                    if (node->assign.value->kind == NODE_IDENT) {
-                        Symbol *src = scope_lookup(c->current_scope,
-                            node->assign.value->ident.name,
-                            (uint32_t)node->assign.value->ident.name_len);
-                        if (src && src->is_local_derived) tsym->is_local_derived = true;
-                        if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                    {
+                        Node *vcheck = node->assign.value;
+                        if (vcheck->kind == NODE_ORELSE) vcheck = vcheck->orelse.expr;
+                        if (vcheck->kind == NODE_IDENT) {
+                            Symbol *src = scope_lookup(c->current_scope,
+                                vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
+                            if (src && src->is_local_derived) tsym->is_local_derived = true;
+                            if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                        }
                     }
                 }
             }
@@ -1068,6 +1099,46 @@ static Type *check_expr(Checker *c, Node *node) {
                             "when function returns",
                             (int)val_sym->name_len, val_sym->name,
                             (int)target_sym->name_len, target_sym->name);
+                    }
+                }
+            }
+        }
+
+        /* BUG-314: orelse &local escape to global via assignment.
+         * g_ptr = opt orelse &local — if target is global, reject directly. */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.value->kind == NODE_ORELSE) {
+            Node *fb = node->assign.value->orelse.fallback;
+            bool fb_is_local = false;
+            if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP &&
+                fb->unary.operand->kind == NODE_IDENT) {
+                Symbol *src = scope_lookup(c->current_scope,
+                    fb->unary.operand->ident.name,
+                    (uint32_t)fb->unary.operand->ident.name_len);
+                bool src_is_global = src && (src->is_static ||
+                    scope_lookup_local(c->global_scope, src->name, src->name_len) != NULL);
+                if (src && !src_is_global) fb_is_local = true;
+            }
+            if (fb && fb->kind == NODE_IDENT) {
+                Symbol *src = scope_lookup(c->current_scope,
+                    fb->ident.name, (uint32_t)fb->ident.name_len);
+                if (src && src->is_local_derived) fb_is_local = true;
+            }
+            if (fb_is_local) {
+                Node *troot = node->assign.target;
+                while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                    if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                    else troot = troot->index_expr.object;
+                }
+                if (troot && troot->kind == NODE_IDENT) {
+                    Symbol *ts = scope_lookup(c->current_scope,
+                        troot->ident.name, (uint32_t)troot->ident.name_len);
+                    bool tgt_global = ts && (ts->is_static ||
+                        scope_lookup_local(c->global_scope, ts->name, ts->name_len) != NULL);
+                    if (tgt_global) {
+                        checker_error(c, node->loc.line,
+                            "orelse fallback stores local pointer in global — "
+                            "pointer will dangle after function returns");
                     }
                 }
             }

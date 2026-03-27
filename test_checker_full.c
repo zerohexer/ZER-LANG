@@ -1509,6 +1509,27 @@ static void test_negative_sweep(void) {
        "void process([]u8 data) { }\n"
        "u32 main() { process(buf); return 0; }",
        "non-volatile array to slice accepted");
+    /* BUG-314: orelse &local escape to global */
+    err("?*u32 g_ptr;\n"
+        "void f(?*u32 opt) {\n"
+        "    u32 x = 5;\n"
+        "    g_ptr = opt orelse &x;\n"
+        "}",
+        "orelse &local escape to global rejected");
+    ok("?*u32 g_ptr;\n"
+       "u32 g_val = 42;\n"
+       "void f(?*u32 opt) {\n"
+       "    g_ptr = opt orelse &g_val;\n"
+       "}",
+       "orelse &global to global accepted");
+
+    /* BUG-315: distinct slice comparison */
+    err("distinct typedef []u8 Buffer;\n"
+        "bool f(Buffer a, Buffer b) {\n"
+        "    return a == b;\n"
+        "}",
+        "distinct slice comparison rejected");
+
     /* volatile []T — proper propagation */
     ok("volatile u8[16] hw_regs;\n"
        "void poll(volatile []u8 regs) { }\n"

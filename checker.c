@@ -2311,13 +2311,22 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* BUG-231: reject @size(void) and @size(opaque) — no meaningful size */
-            if (node->intrinsic.type_arg) {
-                Type *st = resolve_type(c, node->intrinsic.type_arg);
-                if (st && (st->kind == TYPE_VOID || st->kind == TYPE_OPAQUE)) {
-                    checker_error(c, node->loc.line,
-                        "@size(%s) is invalid — type has no defined size",
-                        st->kind == TYPE_VOID ? "void" : "opaque");
+            /* BUG-231/320: reject @size(void) and @size(opaque) — no meaningful size.
+             * Unwrap distinct first (BUG-320: distinct typedef void still has no size).
+             * Check both type_arg path AND expression arg path (named types parsed as ident). */
+            {
+                Type *st = NULL;
+                if (node->intrinsic.type_arg)
+                    st = resolve_type(c, node->intrinsic.type_arg);
+                else if (node->intrinsic.arg_count > 0)
+                    st = typemap_get(c, node->intrinsic.args[0]);
+                if (st) {
+                    Type *st_eff = type_unwrap_distinct(st);
+                    if (st_eff && (st_eff->kind == TYPE_VOID || st_eff->kind == TYPE_OPAQUE)) {
+                        checker_error(c, node->loc.line,
+                            "@size(%s) is invalid — type has no defined size",
+                            type_name(st));
+                    }
                 }
             }
             result = ty_usize;
@@ -2797,27 +2806,32 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
-                /* propagate arena-derived from init expression
-                 * Walk field/index chains to find root (handles w.ptr, arr[i]) */
+                /* propagate arena/local-derived from init expression
+                 * Walk field/index chains to find root (handles w.ptr, arr[i])
+                 * BUG-318: check BOTH orelse.expr AND orelse.fallback */
                 {
-                    Node *init_root = node->var_decl.init;
-                    /* BUG-206: walk through NODE_ORELSE to reach the expression root */
-                    if (init_root && init_root->kind == NODE_ORELSE)
-                        init_root = init_root->orelse.expr;
-                    while (init_root && (init_root->kind == NODE_FIELD ||
-                                         init_root->kind == NODE_INDEX)) {
-                        if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
-                        else init_root = init_root->index_expr.object;
+                    Node *checks[2] = { node->var_decl.init, NULL };
+                    int check_count = 1;
+                    if (checks[0] && checks[0]->kind == NODE_ORELSE) {
+                        checks[0] = node->var_decl.init->orelse.expr;
+                        if (node->var_decl.init->orelse.fallback)
+                            checks[check_count++] = node->var_decl.init->orelse.fallback;
                     }
-                    if (init_root && init_root->kind == NODE_IDENT) {
-                        Symbol *src = scope_lookup(c->current_scope,
-                            init_root->ident.name,
-                            (uint32_t)init_root->ident.name_len);
-                        if (src && src->is_arena_derived) {
-                            sym->is_arena_derived = true;
+                    for (int ci = 0; ci < check_count; ci++) {
+                        Node *init_root = checks[ci];
+                        while (init_root && (init_root->kind == NODE_FIELD ||
+                                             init_root->kind == NODE_INDEX)) {
+                            if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
+                            else init_root = init_root->index_expr.object;
                         }
-                        if (src && src->is_local_derived) {
-                            sym->is_local_derived = true;
+                        if (init_root && init_root->kind == NODE_IDENT) {
+                            Symbol *src = scope_lookup(c->current_scope,
+                                init_root->ident.name,
+                                (uint32_t)init_root->ident.name_len);
+                            if (src && src->is_arena_derived)
+                                sym->is_arena_derived = true;
+                            if (src && src->is_local_derived)
+                                sym->is_local_derived = true;
                         }
                     }
                 }
@@ -3386,6 +3400,37 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 for (int ri = 0; ri < root_count; ri++) {
                     Node *root = roots[ri];
+                    /* BUG-317: walk into @ptrcast/@bitcast in orelse fallback.
+                     * Only when return type is pointer — value bitcasts are safe. */
+                    if (root && root->kind == NODE_INTRINSIC &&
+                        ret_type && ret_type->kind == TYPE_POINTER) {
+                        const char *iname = root->intrinsic.name;
+                        uint32_t ilen = (uint32_t)root->intrinsic.name_len;
+                        bool is_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
+                                       (ilen == 7 && memcmp(iname, "bitcast", 7) == 0);
+                        if (is_cast && root->intrinsic.arg_count > 0)
+                            root = root->intrinsic.args[root->intrinsic.arg_count - 1];
+                    }
+                    /* BUG-317: walk into &expr in orelse fallback */
+                    if (root && root->kind == NODE_UNARY && root->unary.op == TOK_AMP) {
+                        Node *inner = root->unary.operand;
+                        while (inner && (inner->kind == NODE_FIELD || inner->kind == NODE_INDEX)) {
+                            if (inner->kind == NODE_FIELD) inner = inner->field.object;
+                            else inner = inner->index_expr.object;
+                        }
+                        if (inner && inner->kind == NODE_IDENT) {
+                            Symbol *sym = scope_lookup(c->current_scope,
+                                inner->ident.name, (uint32_t)inner->ident.name_len);
+                            bool is_global = scope_lookup_local(c->global_scope,
+                                inner->ident.name, (uint32_t)inner->ident.name_len) != NULL;
+                            if (sym && !sym->is_static && !is_global) {
+                                checker_error(c, node->loc.line,
+                                    "cannot return pointer to local '%.*s' — "
+                                    "stack memory is freed when function returns",
+                                    (int)inner->ident.name_len, inner->ident.name);
+                            }
+                        }
+                    }
                     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                         if (root->kind == NODE_FIELD) root = root->field.object;
                         else root = root->index_expr.object;

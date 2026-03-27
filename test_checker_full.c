@@ -1523,6 +1523,28 @@ static void test_negative_sweep(void) {
        "}",
        "orelse &global to global accepted");
 
+    /* BUG-317: return orelse @ptrcast(&local) */
+    err("*u8 leak(?*u8 opt) {\n"
+        "    u8 x = 42;\n"
+        "    return opt orelse @ptrcast(*u8, &x);\n"
+        "}\n",
+        "return orelse @ptrcast(&local) rejected");
+
+    /* BUG-318: orelse fallback flag propagation */
+    err("?*u32 g_ptr;\n"
+        "void f(?*u32 opt) {\n"
+        "    u32 x = 5;\n"
+        "    *u32 p = &x;\n"
+        "    *u32 q = opt orelse p;\n"
+        "    g_ptr = q;\n"
+        "}\n",
+        "orelse alias local-derived escape rejected");
+
+    /* BUG-320: @size(distinct void) */
+    err("distinct typedef void MyVoid;\n"
+        "u32 main() { return @truncate(u32, @size(MyVoid)); }",
+        "@size(distinct void) rejected");
+
     /* BUG-315: distinct slice comparison */
     err("distinct typedef []u8 Buffer;\n"
         "bool f(Buffer a, Buffer b) {\n"

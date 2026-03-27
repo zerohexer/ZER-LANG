@@ -658,8 +658,9 @@ static void transform(void) {
                     }
                 }
             }
-            /* check for (type *) pattern */
-            if (!is_cast && j < token_count && tokens[j].type == CT_IDENT) {
+            /* check for (type *) pattern — exclude (void *) in func ptr params */
+            if (!is_cast && j < token_count && tokens[j].type == CT_IDENT &&
+                !tok_eq(&tokens[j], "void")) {
                 const char *mapped_cast = map_type(&tokens[j]);
                 int k = skip_spaces(j + 1);
                 if (k < token_count && tokens[k].type == CT_STAR) {

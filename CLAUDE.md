@@ -267,9 +267,34 @@ diff zerc zerc2                  ← identical = v1.0 proven
 **Migration to `.zer`-primary happens when:** ZER has enough public code (GitHub repos, blog posts, Stack Overflow) that LLMs learn the syntax natively. Until then, C is the development language.
 
 **Roadmap:**
-- **v0.2:** bounds check optimization, stdlib (str, io, fmt), bundled GCC distribution
-- **v0.3:** zer-convert tool (C→ZER automated migration), better error messages/diagnostics
+- **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
+- **v0.3:** bounds check optimization, better error messages, zer-convert Layer 2 refinement
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
+
+### C-to-ZER Conversion Tools (implemented v0.2)
+
+Two tools + one library for automated C-to-ZER migration:
+
+**`tools/zer-convert.c`** — Phase 1: C syntax → ZER syntax (token-level transform)
+- Types: `int`→`i32`, `unsigned int`→`u32`, `char`→`u8`, `size_t`→`usize`
+- Operators: `i++`→`i += 1`, `NULL`→`null`, `->`→`.`
+- Memory: `malloc`→`zer_malloc_bytes`, `free`→`zer_free`
+- Strings: `strlen`→`zer_strlen`, `strcmp`→`zer_strcmp`, `memcpy`→`zer_memcpy`
+- Casts: `(Type *)expr`→`@ptrcast(*Type, expr)`, `(int)x`→`@truncate(i32, x)`
+- sizeof: `sizeof(Type *)`→`@size(*Type)`, inside cast args too
+- Preprocessor: `#include`→`cinclude`, `#define N 42`→`const u32 N = 42;`
+- Struct: `struct Node` in usage→`Node` (keeps `struct` in declarations)
+- Auto-imports `compat.zer` when unsafe patterns detected
+
+**`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
+- Layer 1: `zer_strlen(s)`→`s.len`, `zer_strcmp(a,b)==0`→`bytes_equal(a,b)`, `zer_memcpy`→`bytes_copy`, `zer_memset(d,0,n)`→`bytes_zero(d)`, `zer_exit`→`@trap()`
+- Layer 2: Scans `@ptrcast(*T, zer_malloc_bytes(@size(T)))` patterns, matches with `zer_free()`, generates `static Slab(T)` declarations, rewrites `var.field`→`slab.get(var_h).field`
+- Auto-adds `import str;`, removes `import compat;` when fully upgraded
+- Reports: N upgraded, M kept (for remaining compat calls)
+
+**`lib/compat.zer`** — Scaffolding library (NOT part of ZER). Wraps C stdlib via `cinclude`. Tagged `zer_` prefix for Phase 2 detection. Removed after full upgrade.
+
+**Pipeline:** `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`
 
 ### Structural Refactors Completed (RF1-RF7)
 

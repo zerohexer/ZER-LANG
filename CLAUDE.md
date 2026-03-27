@@ -720,6 +720,18 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**157. `@ptrcast` cannot strip const qualifier.**
+`@ptrcast(*u32, const_ptr)` rejected — mirrors volatile check. Source `pointer.is_const` must be matched by target. (BUG-304)
+
+**158. Mutable capture `|*v|` on const source forced const.**
+`const ?u32 val; if(val) |*v|` — capture pointer marked const. Walks condition to root symbol, checks `is_const`. (BUG-305)
+
+**159. Array assignment uses `memmove` (overlap-safe).**
+`arr = arr` self-assignment no longer UB. Changed `memcpy` to `memmove` in both NODE_ASSIGN and NODE_VAR_DECL array paths. (BUG-306)
+
+**160. `@saturate(u64, f64)` upper bound check.**
+`f64` can exceed `UINT64_MAX`. Now clamps: `> 18446744073709551615.0 ? UINT64_MAX : (uint64_t)val`. (BUG-308)
+
 **156. Rvalue struct field assignment rejected.**
 `get_s().x = 5` now caught — walks field/index chains to find base NODE_CALL, checks if return type is non-pointer (value type → rvalue). Pointer-returning calls (`pool.get(h).field`) are still valid lvalues via auto-deref. (BUG-302)
 

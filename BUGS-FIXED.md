@@ -1475,6 +1475,30 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-304: @ptrcast const stripping bypass
+- **Symptom:** `@ptrcast(*u32, &const_val)` strips const — allows writing to ROM.
+- **Root cause:** @ptrcast checked volatile (BUG-258) but not const.
+- **Fix:** Check `eff->pointer.is_const && !result->pointer.is_const` → error.
+- **Test:** `test_checker_full.c` — ptrcast const strip rejected, const-to-const accepted.
+
+### BUG-305: Mutable capture |*v| on const source
+- **Symptom:** `const ?u32 val; if(val) |*v| { *v = 99; }` — writes through const.
+- **Root cause:** Capture always set `cap_const = false` for |*v|.
+- **Fix:** Walk to root symbol, if `is_const`, force const on capture pointer.
+- **Test:** `test_checker_full.c` — write through const capture rejected.
+
+### BUG-306: Array self-assignment UB (memcpy overlap)
+- **Symptom:** `arr = arr` emits `memcpy(arr, arr, size)` — UB for overlapping memory.
+- **Root cause:** Used `memcpy` which doesn't handle overlap.
+- **Fix:** Changed to `memmove` in both assign and var-decl paths.
+- **Test:** Implicit — all existing tests pass with memmove.
+
+### BUG-308: @saturate(u64, f64) overflow UB
+- **Symptom:** `@saturate(u64, huge_f64)` — cast of f64 > UINT64_MAX to u64 is UB.
+- **Root cause:** u64 path had no upper bound check (only `< 0`).
+- **Fix:** Added `> 18446744073709551615.0 ? UINT64_MAX` clamp.
+- **Test:** Implicit — correct saturation behavior.
+
 ### BUG-302: Rvalue struct field assignment
 - **Symptom:** `get_s().x = 5` passes checker but GCC rejects — "lvalue required."
 - **Root cause:** BUG-294 lvalue check only caught direct NODE_CALL, not field chains on calls.

@@ -480,6 +480,10 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 109. **Volatile if-unwrap copy (BUG-272)** — Checks if condition ident's symbol has `is_volatile`. If so, emits `volatile` before the typed copy. Uses `emit_type_and_name` for correct func ptr name placement.
 110. **Volatile array assign byte loop (BUG-273)** — Array assignment checks target root symbol for `is_volatile`. If volatile, emits `for(_i) vd[_i] = vs[_i]` byte loop instead of memcpy. Same pattern as @cstr volatile (BUG-223).
 111. **Volatile union capture pointer (BUG-274)** — `sw_volatile` flag detected from switch expression root symbol. When set, mutable capture `|*v|` emits `volatile T *v` instead of `T *v`.
+132. **@ptrcast const stripping (BUG-304)** — Mirrors BUG-258 volatile check. If source `pointer.is_const` and target is not, error.
+133. **Const capture bypass (BUG-305)** — In if-unwrap |*v|, walks condition to root ident. If `is_const`, forces `cap_const = true` and `cap_type->pointer.is_const = true`.
+134. **memmove for array assign (BUG-306)** — Both NODE_ASSIGN and NODE_VAR_DECL array paths use `memmove` instead of `memcpy`. Handles self-assignment overlap safely.
+135. **@saturate u64 upper bound (BUG-308)** — u64 saturate path adds `> 18446744073709551615.0 ? UINT64_MAX` check when source could be f64.
 131. **Rvalue field assign lvalue check (BUG-302)** — NODE_ASSIGN walks field/index chains to base. If base is NODE_CALL, checks return type: non-pointer (value type) → "not an lvalue". Pointer return → valid lvalue via auto-deref. Literals also rejected.
 128. **`type_unwrap_distinct` recursive (BUG-295)** — Changed from single `if` to `while` loop. Handles `distinct typedef (distinct typedef T)` at any depth. All callers benefit automatically.
 129. **Const fold INT_MIN / -1 guard (BUG-296)** — `eval_const_expr` TOK_SLASH and TOK_PERCENT check `l == INT64_MIN && r == -1` → CONST_EVAL_FAIL. Prevents signed overflow UB in the compiler.

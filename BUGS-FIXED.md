@@ -1475,6 +1475,18 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-289: Volatile stripping in orelse temp
+- **Symptom:** `volatile ?u32 reg; u32 val = reg orelse 0` — orelse temp copies as non-volatile.
+- **Root cause:** `__auto_type` strips qualifiers in GCC.
+- **Fix:** All 3 orelse temp sites use `__typeof__(expr) _zer_tmp` instead. `__typeof__` preserves volatile.
+- **Test:** All existing tests pass; volatile is preserved in emitted C.
+
+### BUG-290: Local address escape via *param
+- **Symptom:** `void leak(**u32 p) { u32 x; *p = &x; }` — compiles, creates dangling pointer in caller.
+- **Root cause:** Target walk in &local escape check didn't handle NODE_UNARY(STAR).
+- **Fix:** Walk extended: NODE_UNARY(TOK_STAR) added. `target_is_param_ptr` broadened to any deref/field/index.
+- **Test:** `test_checker_full.c` — *param = &local rejected, *param = &global accepted.
+
 ### BUG-286: Arena.over double evaluation
 - **Symptom:** `Arena.over(next_buf())` calls `next_buf()` twice — counter=2 instead of 1.
 - **Root cause:** Emitter accesses `.ptr` and `.len` separately from the expression.

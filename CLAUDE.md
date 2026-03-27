@@ -720,6 +720,12 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**149. Orelse temp preserves volatile via `__typeof__`.**
+`volatile ?u32 reg; u32 val = reg orelse 0` — orelse temp now uses `__typeof__(expr)` instead of `__auto_type`. `__typeof__` preserves volatile, `__auto_type` does not. (BUG-289)
+
+**150. Local escape via `*param = &local` blocked.**
+`void leak(**u32 p) { u32 x; *p = &x; }` — target walk extended to handle `NODE_UNARY(STAR)` in addition to `NODE_FIELD`/`NODE_INDEX`. Catches all deref-through-param escape paths. (BUG-290)
+
 **146. Arena.over slice arg single-eval.**
 `Arena.over(next_buf())` called `next_buf()` twice (`.ptr` and `.len`). Now hoists slice arg into `__auto_type` temp. Array path unchanged (sizeof doesn't eval). (BUG-286)
 

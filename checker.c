@@ -1316,6 +1316,13 @@ static Type *check_expr(Checker *c, Node *node) {
                         "cannot assign const array to mutable slice — "
                         "would allow writing to read-only memory");
                 }
+                /* BUG-310: volatile array → slice strips volatile */
+                if (vsym && vsym->is_volatile &&
+                    target->kind == TYPE_SLICE) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign volatile array to slice — "
+                        "volatile qualifier would be stripped");
+                }
             }
         }
 
@@ -1633,6 +1640,21 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (arg_sym && arg_sym->is_const) {
                             checker_error(c, node->loc.line,
                                 "argument %d: cannot pass const array '%.*s' to mutable slice parameter",
+                                i + 1, (int)arg_sym->name_len, arg_sym->name);
+                        }
+                    }
+                    /* BUG-310: volatile array → slice strips volatile qualifier.
+                     * Slice has no is_volatile — GCC optimizes away MMIO reads. */
+                    if (arg && arg->kind == TYPE_ARRAY &&
+                        param && param->kind == TYPE_SLICE &&
+                        node->call.args[i]->kind == NODE_IDENT) {
+                        Symbol *arg_sym = scope_lookup(c->current_scope,
+                            node->call.args[i]->ident.name,
+                            (uint32_t)node->call.args[i]->ident.name_len);
+                        if (arg_sym && arg_sym->is_volatile) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass volatile array '%.*s' as slice — "
+                                "volatile qualifier would be stripped",
                                 i + 1, (int)arg_sym->name_len, arg_sym->name);
                         }
                     }
@@ -2574,6 +2596,18 @@ static void check_stmt(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot initialize mutable slice from const — "
                         "would allow writing to read-only memory");
+                }
+                /* BUG-310: volatile array → slice strips volatile qualifier */
+                if (type->kind == TYPE_SLICE && init_type->kind == TYPE_ARRAY &&
+                    node->var_decl.init->kind == NODE_IDENT) {
+                    Symbol *vs = scope_lookup(c->current_scope,
+                        node->var_decl.init->ident.name,
+                        (uint32_t)node->var_decl.init->ident.name_len);
+                    if (vs && vs->is_volatile) {
+                        checker_error(c, node->loc.line,
+                            "cannot initialize slice from volatile array — "
+                            "volatile qualifier would be stripped");
+                    }
                 }
             }
 

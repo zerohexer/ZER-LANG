@@ -1499,6 +1499,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added `> 18446744073709551615.0 ? UINT64_MAX` clamp.
 - **Test:** Implicit — correct saturation behavior.
 
+### BUG-310: Volatile array → slice strips volatile qualifier
+- **Symptom:** `volatile u8[16] hw_regs; poll(hw_regs)` where `poll([]u8)` — slice `.ptr` is non-volatile, GCC optimizes away MMIO reads in loops.
+- **Root cause:** TYPE_SLICE has no `is_volatile` flag. Array → slice coercion silently drops volatile.
+- **Fix:** Reject volatile array → slice coercion at all 3 sites: call args, var-decl init, assignment. Users must use `volatile *u8` or access array directly.
+- **Test:** `test_checker_full.c` — volatile array to slice rejected at call, var-decl, assign; non-volatile accepted.
+
 ### BUG-302: Rvalue struct field assignment
 - **Symptom:** `get_s().x = 5` passes checker but GCC rejects — "lvalue required."
 - **Root cause:** BUG-294 lvalue check only caught direct NODE_CALL, not field chains on calls.

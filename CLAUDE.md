@@ -780,6 +780,9 @@ Signed overflow UB in the compiler itself prevented. Both `/` and `%` paths chec
 **143. `@size(usize)` target-dependent via `sizeof()`.**
 `compute_type_size` returns `CONST_EVAL_FAIL` for `TYPE_USIZE`. Same approach as BUG-275 for pointers/slices — emitter uses `sizeof(size_t)`. (BUG-280)
 
+**162. Volatile array → slice coercion rejected.**
+`volatile u8[16] hw_regs; poll(hw_regs)` where `poll([]u8)` — slice has no `is_volatile`, so volatile qualifier is silently stripped. GCC optimizes away MMIO reads. Rejected at all 3 sites: call args, var-decl init, assignment. C silently allows this (`-Wdiscarded-qualifiers` is only a warning). ZER catches it at compile time. Use `volatile *u8` parameter or access the array directly. (BUG-310)
+
 **161. `usize` width matches host platform — 64-bit gap closed.**
 `type_width(TYPE_USIZE)` now returns `sizeof(size_t) * 8` instead of hardcoded 32. On 64-bit hosts: `u32 → usize` widening works, big literals accepted, `@truncate(u32, usize)` valid, `usize → u32` direct blocked. `is_literal_compatible` also uses `sizeof(size_t)` for range. Emitter unchanged — already emits `size_t`.
 

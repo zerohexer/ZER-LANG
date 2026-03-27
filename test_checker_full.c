@@ -1493,6 +1493,23 @@ static void test_negative_sweep(void) {
     err("u32 main() { usize x = 42; u32 y = x; return y; }",
         "usize to u32 direct narrowing rejected");
 
+    /* BUG-310: volatile array → slice strips volatile */
+    err("volatile u8[16] hw_regs;\n"
+        "void poll([]u8 regs) { while (regs[0] == 0) { } }\n"
+        "u32 main() { poll(hw_regs); return 0; }",
+        "volatile array to slice param rejected");
+    err("volatile u8[16] hw_regs;\n"
+        "u32 main() { []u8 s = hw_regs; return 0; }",
+        "volatile array to slice var-decl rejected");
+    err("volatile u8[16] hw_regs;\n"
+        "[]u8 g_s;\n"
+        "u32 main() { g_s = hw_regs; return 0; }",
+        "volatile array to slice assign rejected");
+    ok("u8[16] buf;\n"
+       "void process([]u8 data) { }\n"
+       "u32 main() { process(buf); return 0; }",
+       "non-volatile array to slice accepted");
+
     /* BUG-304: @ptrcast const stripping */
     err("const u32 val = 42;\n"
         "void f() { *u32 p = @ptrcast(*u32, &val); }",

@@ -319,7 +319,64 @@ static void scan_allocs(const char *src, int src_len) {
     }
 }
 
-/* Second scan: find function params of Slab types.
+/* Second scan (a): find local variables of Slab types assigned from function returns.
+ * Pattern: SlabType *var = func_call(...)
+ * These are handle variables even though they weren't malloc'd directly.
+ * Must run AFTER scan_allocs so slab_types is populated. */
+static void scan_local_slab_vars(const char *src, int src_len) {
+    if (slab_type_count == 0) return;
+
+    for (int i = 0; i < src_len; i++) {
+        /* skip if not an identifier start */
+        if (!isalpha(src[i]) && src[i] != '_') continue;
+
+        /* read identifier */
+        int id_start = i;
+        while (i < src_len && (isalnum(src[i]) || src[i] == '_')) i++;
+        int id_len = i - id_start;
+        if (id_len <= 0 || id_len >= 63) continue;
+
+        char type_name[64] = {0};
+        memcpy(type_name, src + id_start, id_len);
+
+        if (!is_slab_type(type_name)) continue;
+
+        /* skip spaces */
+        int p = i;
+        while (p < src_len && src[p] == ' ') p++;
+
+        /* check for * */
+        if (p >= src_len || src[p] != '*') continue;
+        p++;
+        while (p < src_len && src[p] == ' ') p++;
+
+        /* read var name */
+        int vn_start = p;
+        while (p < src_len && (isalnum(src[p]) || src[p] == '_')) p++;
+        int vn_len = p - vn_start;
+        if (vn_len <= 0 || vn_len >= 63) continue;
+
+        /* check for = (assignment, not just declaration) */
+        while (p < src_len && src[p] == ' ') p++;
+        if (p >= src_len || src[p] != '=') continue;
+
+        /* check it's NOT already a malloc alloc (avoid double-registration) */
+        char var_name[64] = {0};
+        memcpy(var_name, src + vn_start, vn_len);
+
+        if (find_alloc(var_name, vn_start)) continue; /* already tracked */
+
+        /* register as handle param (reuses HandleParam for simplicity) */
+        if (handle_param_count < MAX_HANDLE_PARAMS * 16) {
+            HandleParam *hp = &handle_params[handle_param_count++];
+            strncpy(hp->var_name, var_name, 63);
+            strncpy(hp->type_name, type_name, 63);
+            find_func_bounds(src, src_len, vn_start, &hp->func_start, &hp->func_end);
+        }
+    }
+}
+
+/* Second scan (b): find function params of Slab types.
  * Pattern: TYPE *NAME in function signature → Handle(TYPE) NAME_h
  * Must run AFTER scan_allocs so slab_types is populated. */
 static void scan_handle_params(const char *src, int src_len) {
@@ -759,27 +816,29 @@ static void upgrade(const char *src, int src_len) {
             if (id_len < 63) memcpy(ident, src + id_start, id_len);
             ident[id_len < 63 ? id_len : 63] = '\0';
 
-            /* check if this ident is a malloc'd or handle-param variable followed by . */
+            /* check if this ident is a malloc'd or handle-param variable */
             AllocInfo *ai = find_alloc(ident, id_start);
             HandleParam *hp = ai ? NULL : find_handle_param(ident, id_start);
-            if ((ai || hp) && i < src_len && src[i] == '.') {
+            if (ai || hp) {
                 const char *type = ai ? ai->type_name : hp->type_name;
                 const char *slab = get_slab_name(type);
-                out_str(slab);
-                out_str(".get(");
-                out_str(ident);
-                out_str("_h)");
-                /* don't consume the . — it'll be emitted next */
+                if (i < src_len && src[i] == '.') {
+                    /* var.field → slab.get(var_h).field */
+                    out_str(slab);
+                    out_str(".get(");
+                    out_str(ident);
+                    out_str("_h)");
+                    /* don't consume the . — it'll be emitted next */
+                } else {
+                    /* bare reference: return var, func(var), x = var
+                     * → var_h (the handle replaces the pointer) */
+                    out_str(ident);
+                    out_str("_h");
+                }
                 continue;
             }
 
-            /* check for !var (null check on malloc result) → !var_maybe */
-            /* this is tricky — skip for now, emit as-is */
-
-            /* emit the identifier (possibly mapped) */
-            const char *mapped = NULL;
-            /* re-check type maps and compat maps for the ident */
-            /* but we already handled those above — just emit raw */
+            /* emit the identifier as-is */
             out_write(src + id_start, id_len);
             continue;
         }
@@ -1044,17 +1103,28 @@ static void rewrite_signatures(void) {
                         int fn_start = ls;
                         while (ls < line_end && (isalnum(out_buf[ls]) || out_buf[ls] == '_')) ls++;
                         int fn_len = ls - fn_start;
-                        /* check that line ends with ; (struct field) */
+                        /* check what follows: ; (struct field) or = (local var decl) */
                         int check = ls;
                         while (check < line_end && (out_buf[check] == ' ' || out_buf[check] == '\t' || out_buf[check] == '\r')) check++;
                         if (fn_len > 0 && check < line_end && out_buf[check] == ';') {
-                            /* emit: indent + ?Handle(Type) field_name; */
-                            NB_WRITE(out_buf + line_start, ft_start - line_start); /* indent */
+                            /* struct field: emit ?Handle(Type) field_name; */
+                            NB_WRITE(out_buf + line_start, ft_start - line_start);
                             NB_STR("?Handle(");
                             NB_STR(ft_name);
                             NB_STR(") ");
                             NB_WRITE(out_buf + fn_start, fn_len);
                             NB_STR(";");
+                            did_struct_field = true;
+                        } else if (fn_len > 0 && check < line_end && out_buf[check] == '=') {
+                            /* local var decl: Task *a = expr → ?Handle(Task) a_h = expr */
+                            NB_WRITE(out_buf + line_start, ft_start - line_start);
+                            NB_STR("?Handle(");
+                            NB_STR(ft_name);
+                            NB_STR(") ");
+                            NB_WRITE(out_buf + fn_start, fn_len);
+                            NB_STR("_h");
+                            /* emit the rest of the line (= expr;) */
+                            NB_WRITE(out_buf + check, line_end - check);
                             did_struct_field = true;
                         }
                     }
@@ -1111,6 +1181,7 @@ int main(int argc, char **argv) {
 
     /* Layer 2: pre-scan for malloc/free patterns */
     scan_allocs(src, src_len);
+    scan_local_slab_vars(src, src_len);
     scan_handle_params(src, src_len);
 
     out_init();

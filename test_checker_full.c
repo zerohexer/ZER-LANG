@@ -1485,6 +1485,11 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-295: nested distinct arithmetic */
+    ok("distinct typedef u32 P1;\ndistinct typedef P1 P2;\n"
+       "u32 main() { P2 x = @cast(P2, @cast(P1, 5)); return @cast(u32, @cast(P1, x)); }",
+       "nested distinct arithmetic accepted");
+
     /* BUG-294: assign to non-lvalue */
     err("u32 get() { return 0; }\nvoid f() { get() = 5; }",
         "assign to function call rejected");

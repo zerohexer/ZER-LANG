@@ -270,9 +270,25 @@ static void emit_type(Emitter *e, Type *t) {
         break;
     }
 
-    case TYPE_ARRAY:
-        emit_type(e, t->array.inner);
+    case TYPE_ARRAY: {
+        /* BUG-297: emit full array type with dimensions for sizeof() context.
+         * Walk to base type, then emit all dimensions. */
+        Type *base = t;
+        while (base->kind == TYPE_ARRAY) base = base->array.inner;
+        emit_type(e, base);
+        Type *dim = t;
+        while (dim->kind == TYPE_ARRAY) {
+            if (dim->array.sizeof_type) {
+                emit(e, "[sizeof(");
+                emit_type(e, dim->array.sizeof_type);
+                emit(e, ")]");
+            } else {
+                emit(e, "[%llu]", (unsigned long long)dim->array.size);
+            }
+            dim = dim->array.inner;
+        }
         break;
+    }
 
     case TYPE_STRUCT:
         emit(e, "struct ");

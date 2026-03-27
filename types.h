@@ -154,8 +154,10 @@ struct Type {
  * Use this before any switch on type->kind to prevent distinct types
  * from falling through to default/anonymous-struct paths.
  * Safe to call on any type — returns the type unchanged if not distinct. */
+/* BUG-295: unwrap ALL levels of distinct, not just one */
 static inline Type *type_unwrap_distinct(Type *t) {
-    return (t && t->kind == TYPE_DISTINCT) ? t->distinct.underlying : t;
+    while (t && t->kind == TYPE_DISTINCT) t = t->distinct.underlying;
+    return t;
 }
 
 /* ================================================================

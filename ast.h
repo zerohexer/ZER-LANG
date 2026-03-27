@@ -504,8 +504,15 @@ static inline int64_t eval_const_expr(Node *n) {
                     return CONST_EVAL_FAIL;
             }
             return l * r;
-        case TOK_SLASH:   return r != 0 ? l / r : CONST_EVAL_FAIL;
-        case TOK_PERCENT: return r != 0 ? l % r : CONST_EVAL_FAIL;
+        case TOK_SLASH:
+            if (r == 0) return CONST_EVAL_FAIL;
+            /* BUG-296: INT_MIN / -1 is signed overflow */
+            if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
+            return l / r;
+        case TOK_PERCENT:
+            if (r == 0) return CONST_EVAL_FAIL;
+            if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
+            return l % r;
         case TOK_LSHIFT:
             if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
             return l << r;

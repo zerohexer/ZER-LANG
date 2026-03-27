@@ -2955,6 +2955,14 @@ int main(void) {
         0,
         "arena alloc_slice overflow returns null (not corrupted slice)");
 
+    /* BUG-297: @size(array) includes dimensions */
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    return @truncate(u32, @size(u32[10]));\n"
+        "}\n",
+        40,
+        "@size(u32[10]) = 40 (not 4)");
+
     /* BUG-286: Arena.over single-eval */
     test_compile_and_run(
         "u8[64] g_buf;\n"

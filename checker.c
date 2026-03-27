@@ -919,11 +919,14 @@ static Type *check_expr(Checker *c, Node *node) {
             node->assign.value->kind == NODE_UNARY &&
             node->assign.value->unary.op == TOK_AMP &&
             node->assign.value->unary.operand->kind == NODE_IDENT) {
-            /* Walk target chain (field/index) to find root identifier */
+            /* Walk target chain (field/index/deref) to find root identifier */
             Node *root = node->assign.target;
-            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+            while (root) {
                 if (root->kind == NODE_FIELD) root = root->field.object;
-                else root = root->index_expr.object;
+                else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+                    root = root->unary.operand;
+                else break;
             }
             if (root && root->kind == NODE_IDENT) {
                 Symbol *target_sym = scope_lookup(c->current_scope,
@@ -936,13 +939,17 @@ static Type *check_expr(Checker *c, Node *node) {
                 bool target_is_static = target_sym && target_sym->is_static;
                 bool target_is_global = target_sym &&
                     scope_lookup_local(c->global_scope, target_sym->name, target_sym->name_len) != NULL;
-                /* BUG-230: pointer parameter fields can alias globals — treat as escape */
+                /* BUG-230/290: pointer parameter deref/fields can alias globals — treat as escape.
+                 * Catches: p->field = &local, *p = &local, **p = &local */
                 bool target_is_param_ptr = false;
                 if (target_sym && !target_is_static && !target_is_global &&
-                    target_sym->type && target_sym->type->kind == TYPE_POINTER &&
-                    node->assign.target->kind == NODE_FIELD) {
-                    /* target is param->field — escapes through caller's pointer */
-                    target_is_param_ptr = true;
+                    target_sym->type && target_sym->type->kind == TYPE_POINTER) {
+                    /* target involves dereferencing a pointer param — escapes to caller */
+                    Node *t = node->assign.target;
+                    if (t->kind == NODE_FIELD || t->kind == NODE_INDEX ||
+                        (t->kind == NODE_UNARY && t->unary.op == TOK_STAR)) {
+                        target_is_param_ptr = true;
+                    }
                 }
                 if ((target_is_static || target_is_global || target_is_param_ptr) && val_sym &&
                     !val_sym->is_static && !val_is_global) {

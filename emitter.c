@@ -1435,7 +1435,10 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* ?void orelse return/break/continue — no .value to extract,
                  * just check has_value and branch */
                 int tmp = e->temp_count++;
-                emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+                /* BUG-289: use __typeof__ to preserve volatile in orelse temp */
+                emit(e, "({__typeof__(");
+                emit_expr(e, node->orelse.expr);
+                emit(e, ") _zer_tmp%d = ", tmp);
                 emit_expr(e, node->orelse.expr);
                 emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
                 /* emit defers before return/break/continue */
@@ -1465,7 +1468,10 @@ static void emit_expr(Emitter *e, Node *node) {
             } else {
                 /* ?T (non-void, non-pointer) orelse return/break/continue */
                 int tmp = e->temp_count++;
-                emit(e, "({__auto_type _zer_tmp%d = ", tmp);
+                /* BUG-289: use __typeof__ to preserve volatile in orelse temp */
+                emit(e, "({__typeof__(");
+                emit_expr(e, node->orelse.expr);
+                emit(e, ") _zer_tmp%d = ", tmp);
                 emit_expr(e, node->orelse.expr);
                 if (is_ptr_optional) {
                     emit(e, "; if (!_zer_tmp%d) { ", tmp);

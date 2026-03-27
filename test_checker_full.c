@@ -1485,6 +1485,18 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-290: local escape via *param = &local */
+    err("void leak(**u32 p) {\n"
+        "    u32 x = 5;\n"
+        "    *p = &x;\n"
+        "}",
+        "store &local through *param rejected");
+    ok("u32 g = 99;\n"
+       "void safe(**u32 p) {\n"
+       "    *p = &g;\n"
+       "}\nu32 main() { return 0; }",
+       "store &global through *param accepted");
+
     /* BUG-287: Pool/Ring as struct fields rejected */
     err("struct M { Pool(u32, 4) tasks; }\nu32 main() { return 0; }",
         "Pool as struct field rejected");

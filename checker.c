@@ -824,6 +824,17 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
+        /* BUG-294: reject assignment to non-lvalue (function call, literal) */
+        {
+            Node *t = node->assign.target;
+            if (t->kind == NODE_CALL || t->kind == NODE_INT_LIT ||
+                t->kind == NODE_STRING_LIT || t->kind == NODE_NULL_LIT ||
+                t->kind == NODE_BOOL_LIT) {
+                checker_error(c, node->loc.line,
+                    "cannot assign to expression — not an lvalue");
+            }
+        }
+
         /* BUG-248: block direct assignment to union variable during switch capture.
          * msg = other_msg changes tag+data, invalidating capture pointer. */
         if (c->union_switch_var && node->assign.op == TOK_EQ) {

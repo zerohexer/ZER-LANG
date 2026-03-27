@@ -1485,6 +1485,12 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-294: assign to non-lvalue */
+    err("u32 get() { return 0; }\nvoid f() { get() = 5; }",
+        "assign to function call rejected");
+    ok("u32 x = 0;\nvoid f() { x = 5; }\nu32 main() { return 0; }",
+       "assign to variable accepted");
+
     /* BUG-290: local escape via *param = &local */
     err("void leak(**u32 p) {\n"
         "    u32 x = 5;\n"

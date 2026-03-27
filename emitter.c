@@ -2011,16 +2011,21 @@ static void emit_stmt(Emitter *e, Node *node) {
                  * BUG-264: for rvalue expressions (NODE_CALL), hoist into temp
                  * to avoid &(rvalue). For lvalues, use &(expr) directly. */
                 bool cond_is_rvalue = (node->if_stmt.cond->kind == NODE_CALL);
+                /* BUG-292: preserve volatile on mutable capture pointer */
+                bool cond_vol = expr_is_volatile(e, node->if_stmt.cond);
                 emit_indent(e);
                 if (cond_is_rvalue) {
+                    if (cond_vol) emit(e, "volatile ");
                     emit_type(e, cond_type);
                     emit(e, " _zer_uwt%d = ", tmp);
                     emit_expr(e, node->if_stmt.cond);
                     emit(e, ";\n");
                     emit_indent(e);
+                    if (cond_vol) emit(e, "volatile ");
                     emit_type(e, cond_type);
                     emit(e, " *_zer_uwp%d = &_zer_uwt%d;\n", tmp, tmp);
                 } else {
+                    if (cond_vol) emit(e, "volatile ");
                     emit_type(e, cond_type);
                     emit(e, " *_zer_uwp%d = &(", tmp);
                     emit_expr(e, node->if_stmt.cond);

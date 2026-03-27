@@ -542,10 +542,49 @@ static void transform(void) {
                 }
             }
 
-            /* sizeof(T) → @size(T) */
+            /* sizeof(T) → @size(T) — must handle type args to prevent
+             * (type *) inside sizeof from being detected as a cast.
+             * sizeof(dict_entry *) → @size(*dict_entry) not @size@ptrcast(...) */
             if (tok_eq(t, "sizeof")) {
-                emit_str("@size");
                 i++;
+                int j = skip_spaces(i);
+                if (j < token_count && tokens[j].type == CT_LPAREN) {
+                    /* sizeof(something) — check if the content is a type */
+                    int k = skip_spaces(j + 1);
+                    /* skip 'struct' keyword if present */
+                    bool had_struct = false;
+                    if (k < token_count && tokens[k].type == CT_IDENT && tok_eq(&tokens[k], "struct")) {
+                        had_struct = true;
+                        k = skip_spaces(k + 1);
+                    }
+                    if (k < token_count && tokens[k].type == CT_IDENT) {
+                        const char *mt = map_type(&tokens[k]);
+                        int m = skip_spaces(k + 1);
+                        /* sizeof(type *) → @size(*type) */
+                        if (m < token_count && tokens[m].type == CT_STAR) {
+                            int n = skip_spaces(m + 1);
+                            if (n < token_count && tokens[n].type == CT_RPAREN) {
+                                emit_str("@size(*");
+                                if (mt) emit_str(mt);
+                                else emit_raw(tokens[k].start, tokens[k].len);
+                                emit_str(")");
+                                i = n + 1;
+                                continue;
+                            }
+                        }
+                        /* sizeof(type) → @size(type) */
+                        if (m < token_count && tokens[m].type == CT_RPAREN) {
+                            emit_str("@size(");
+                            if (mt) emit_str(mt);
+                            else emit_raw(tokens[k].start, tokens[k].len);
+                            emit_str(")");
+                            i = m + 1;
+                            continue;
+                        }
+                    }
+                }
+                /* fallback: emit @size and let normal parsing handle the rest */
+                emit_str("@size");
                 continue;
             }
 
@@ -658,13 +697,17 @@ static void transform(void) {
                     emit_str(cast_type);
                     emit_str(", ");
                 }
-                /* emit the expression after the cast — up to the next operator/semicolon/comma/rparen.
-                 * For simple cases: (int)x → @truncate(i32, x), just emit the next token + close paren.
-                 * For complex cases: (int)(a + b) → @truncate(i32, (a + b))
-                 * Strategy: if next is (, emit matching parens. Otherwise emit one token. */
+                /* emit the cast operand expression.
+                 * (int)x → @truncate(i32, x)
+                 * (int)(a + b) → @truncate(i32, (a + b))
+                 * (dict *)malloc(sizeof(dict)) → @ptrcast(*dict, zer_malloc_bytes(@size(dict)))
+                 * Key: if operand is ident followed by (, it's a function call — include the args. */
                 i = cast_end;
+                /* skip whitespace */
+                while (i < token_count && tokens[i].type == CT_WHITESPACE) i++;
+
                 if (i < token_count && tokens[i].type == CT_LPAREN) {
-                    /* emit everything up to matching ) */
+                    /* (int)(expr) — emit matching parens */
                     int depth = 0;
                     while (i < token_count) {
                         if (tokens[i].type == CT_LPAREN) depth++;
@@ -675,14 +718,64 @@ static void transform(void) {
                         emit_tok(&tokens[i]);
                         i++;
                     }
-                } else {
-                    /* single token or ident */
-                    while (i < token_count && (tokens[i].type == CT_IDENT ||
-                           tokens[i].type == CT_NUMBER || tokens[i].type == CT_STAR ||
-                           tokens[i].type == CT_DOT || tokens[i].type == CT_ARROW)) {
-                        if (tokens[i].type == CT_ARROW) emit_str(".");
-                        else emit_tok(&tokens[i]);
-                        i++;
+                } else if (i < token_count && tokens[i].type == CT_IDENT) {
+                    /* check if it's a function call: ident( */
+                    int fn = i;
+                    int after_fn = skip_spaces(fn + 1);
+                    if (after_fn < token_count && tokens[after_fn].type == CT_LPAREN) {
+                        /* function call — emit ident + (args) as the full cast operand.
+                         * Also apply compat mapping to the function name. */
+                        CToken *fntok = &tokens[fn];
+                        /* map function name through compat */
+                        if (tok_eq(fntok, "malloc")) { emit_str("zer_malloc_bytes"); needs_compat = true; }
+                        else if (tok_eq(fntok, "calloc")) { emit_str("zer_calloc_bytes"); needs_compat = true; }
+                        else if (tok_eq(fntok, "realloc")) { emit_str("zer_realloc_bytes"); needs_compat = true; }
+                        else { emit_tok(fntok); }
+                        i = after_fn;
+                        /* emit the (args) — transform sizeof inside */
+                        int depth = 0;
+                        while (i < token_count) {
+                            if (tokens[i].type == CT_LPAREN) depth++;
+                            if (tokens[i].type == CT_RPAREN) {
+                                depth--;
+                                if (depth == 0) { emit_tok(&tokens[i]); i++; break; }
+                            }
+                            /* transform sizeof inside args */
+                            if (tokens[i].type == CT_IDENT && tok_eq(&tokens[i], "sizeof")) {
+                                emit_str("@size");
+                                i++;
+                                continue;
+                            }
+                            /* transform NULL inside args */
+                            if (tokens[i].type == CT_IDENT && tok_eq(&tokens[i], "NULL")) {
+                                emit_str("null");
+                                i++;
+                                continue;
+                            }
+                            /* transform type names inside args */
+                            if (tokens[i].type == CT_IDENT) {
+                                const char *mt = map_type(&tokens[i]);
+                                if (mt) { emit_str(mt); i++; continue; }
+                            }
+                            emit_tok(&tokens[i]);
+                            i++;
+                        }
+                    } else {
+                        /* single identifier — just emit it */
+                        if (tokens[i].type == CT_STAR || tokens[i].type == CT_AMP) {
+                            emit_tok(&tokens[i]); i++;
+                        }
+                        if (i < token_count && (tokens[i].type == CT_IDENT || tokens[i].type == CT_NUMBER)) {
+                            emit_tok(&tokens[i]); i++;
+                        }
+                    }
+                } else if (i < token_count) {
+                    /* prefix operator like * or & */
+                    if (tokens[i].type == CT_STAR || tokens[i].type == CT_AMP) {
+                        emit_tok(&tokens[i]); i++;
+                    }
+                    if (i < token_count && (tokens[i].type == CT_IDENT || tokens[i].type == CT_NUMBER)) {
+                        emit_tok(&tokens[i]); i++;
                     }
                 }
                 emit_str(")");

@@ -515,20 +515,36 @@ static void transform(void) {
             if (in_switch_arm) {
                 emit_str("}\n");
                 in_switch_arm = false;
-                /* re-emit indentation */
                 for (int w = i - 1; w >= 0 && tokens[w].type == CT_WHITESPACE; w--) {
                     emit_tok(&tokens[w]);
                 }
             }
             i++;
             int j = skip_spaces(i);
-            /* collect everything up to : as the case value */
+            /* collect case value up to : */
             emit_str(".");
             while (j < token_count && tokens[j].type != CT_COLON) {
                 emit_tok(&tokens[j]);
                 j++;
             }
             if (j < token_count && tokens[j].type == CT_COLON) j++; /* skip : */
+            /* check for consecutive case (fallthrough): case X: case Y: → .X, .Y => */
+            while (1) {
+                int nxt = skip_ws(j);
+                if (nxt < token_count && tokens[nxt].type == CT_IDENT && tok_eq(&tokens[nxt], "case")) {
+                    nxt++; /* skip 'case' */
+                    int k = skip_spaces(nxt);
+                    emit_str(", .");
+                    while (k < token_count && tokens[k].type != CT_COLON) {
+                        emit_tok(&tokens[k]);
+                        k++;
+                    }
+                    if (k < token_count && tokens[k].type == CT_COLON) k++;
+                    j = k;
+                } else {
+                    break;
+                }
+            }
             emit_str(" => {");
             in_switch_arm = true;
             i = j;
@@ -634,14 +650,33 @@ static void transform(void) {
         }
 
         /* ---- i++ / i-- → i += 1 / i -= 1 ---- */
+        /* ++i (pre) → i += 1; i++ (post) → += 1 (ident already emitted) */
         if (t->type == CT_PLUSPLUS) {
-            emit_str(" += 1");
-            i++;
+            int j = skip_spaces(i + 1);
+            if (j < token_count && tokens[j].type == CT_IDENT &&
+                (i == 0 || tokens[i - 1].type != CT_IDENT)) {
+                /* pre-increment: ++ident → ident += 1 */
+                emit_tok(&tokens[j]);
+                emit_str(" += 1");
+                i = j + 1;
+            } else {
+                /* post-increment: ident++ → += 1 */
+                emit_str(" += 1");
+                i++;
+            }
             continue;
         }
         if (t->type == CT_MINUSMINUS) {
-            emit_str(" -= 1");
-            i++;
+            int j = skip_spaces(i + 1);
+            if (j < token_count && tokens[j].type == CT_IDENT &&
+                (i == 0 || tokens[i - 1].type != CT_IDENT)) {
+                emit_tok(&tokens[j]);
+                emit_str(" -= 1");
+                i = j + 1;
+            } else {
+                emit_str(" -= 1");
+                i++;
+            }
             continue;
         }
 
@@ -657,8 +692,15 @@ static void transform(void) {
                         int j = skip_spaces(i + 1);
                         if (j < token_count && tokens[j].type == CT_IDENT &&
                             tok_eq(&tokens[j], type_combos[ci].second)) {
-                            emit_str(type_combos[ci].zer);
                             i = j + 1; /* skip both tokens */
+                            /* check for trailing 'long' (unsigned long long → u64) */
+                            { int nxt = skip_spaces(i);
+                              if (nxt < token_count && tokens[nxt].type == CT_IDENT &&
+                                  tok_eq(&tokens[nxt], "long")) {
+                                  i = nxt + 1; /* skip the extra 'long' */
+                              }
+                            }
+                            emit_str(type_combos[ci].zer);
                             /* check for C-style array: type name[N] → type[N] name */
                             { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                             found_combo = true;
@@ -845,6 +887,21 @@ static void transform(void) {
                 }
             }
 
+            /* union keyword in usage (not declaration) — drop it + trailing whitespace */
+            if (tok_eq(t, "union")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_IDENT) {
+                    int k = skip_ws(j + 1);
+                    if (k < token_count && tokens[k].type == CT_LBRACE) {
+                        emit_str("union");
+                        i++;
+                        continue;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+
             /* sizeof(T) → @size(T) — must handle type args to prevent
              * (type *) inside sizeof from being detected as a cast.
              * sizeof(dict_entry *) → @size(*dict_entry) not @size@ptrcast(...) */
@@ -1005,6 +1062,17 @@ static void transform(void) {
                         cast_type = mapped_cast;
                         is_cast = true;
                         cast_end = k + 1;
+                    }
+                }
+            }
+
+            /* verify cast: what follows ) must be an expression, not , or ) or ; */
+            if (is_cast) {
+                int after = skip_spaces(cast_end);
+                if (after < token_count) {
+                    CTokenType at = tokens[after].type;
+                    if (at == CT_COMMA || at == CT_RPAREN || at == CT_SEMICOLON || at == CT_EOF) {
+                        is_cast = false; /* not a cast — it's a param type in funcptr decl */
                     }
                 }
             }

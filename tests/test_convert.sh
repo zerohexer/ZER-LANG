@@ -114,6 +114,8 @@ check_phase1 "short→i16" "short s;" "i16 s;"
 check_phase1 "uint8_t→u8" "uint8_t b;" "u8 b;"
 check_phase1 "uint32_t→u32" "uint32_t v;" "u32 v;"
 check_phase1 "size_t→usize" "size_t n;" "usize n;"
+check_phase1 "unsigned long long→u64" "unsigned long long x;" "u64 x;"
+check_phase1 "long long→i64" "long long b;" "i64 b;"
 check_phase1 "float→f32" "float f;" "f32 f;"
 check_phase1 "double→f64" "double d;" "f64 d;"
 check_phase1 "char→u8" "char c = 'a';" "u8 c = 'a';"
@@ -122,6 +124,8 @@ check_phase1 "bool→bool" "_Bool b;" "bool b;"
 # --- Operators ---
 check_phase1 "i++→i+=1" "void f() { i++; }" "+= 1"
 check_phase1 "i--→i-=1" "void f() { i--; }" "i -= 1"
+check_phase1 "++i pre-increment" "void f() { ++i; }" "i += 1"
+check_phase1 "--j pre-decrement" "void f() { --j; }" "j -= 1"
 check_phase1 "arrow→dot" "void f() { p->x; }" "p.x"
 check_phase1 "NULL→null" "void *p = NULL;" "null"
 
@@ -154,6 +158,15 @@ check_phase1 "enum usage dropped" "void f(enum state s) {}" "void f(state s)"
 check_phase1 "enum decl kept" "enum color { RED, GREEN };" "enum color"
 check_phase1_absent "enum in usage gone" "void f(enum state s) {}" "enum state"
 
+# --- union keyword ---
+check_phase1 "union usage dropped" 'void f() { union Val v; }' "Val v;"
+check_phase1 "union decl kept" "union Val { int i; float f; };" "union Val"
+check_phase1_absent "union in usage gone" 'void f() { union Val v; }' "union Val"
+
+# --- funcptr typedef not treated as cast ---
+check_phase1 "typedef funcptr params" "typedef void (*fn_t)(int, float);" "(i32, f32)"
+check_phase1_absent "no @truncate in funcptr" "typedef void (*fn_t)(int, float);" "@truncate"
+
 # --- Array reorder ---
 check_phase1 "int arr[10]→i32[10] arr" "void f() { int arr[10]; }" "i32[10] arr"
 check_phase1 "char buf[256]→u8[256] buf" "void f() { char buf[256]; }" "u8[256] buf"
@@ -164,6 +177,7 @@ check_phase1 "case→.VALUE=>" 'void f() { switch(x) { case 1: break; } }' ".1 =
 check_phase1 "default=>" 'void f() { switch(x) { default: break; } }' "default => {"
 check_phase1 "break→}" 'void f() { switch(x) { case 1: break; } }' "}"
 check_phase1_absent "no case keyword" 'void f() { switch(x) { case 1: break; } }' "case 1"
+check_phase1 "multi-case merge" 'void f() { switch(x) { case 1: case 2: case 3: f(); break; } }' ".1, .2, .3 => {"
 
 # --- do-while ---
 check_phase1 "do-while→while(true)" "void f() { do { x++; } while (x < 10); }" "while (true)"

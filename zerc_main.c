@@ -424,14 +424,49 @@ int main(int argc, char **argv) {
             snprintf(exe_path, sizeof(exe_path), "%s%s", output_path, exe_ext);
         }
 
-        char gcc_cmd[1024];
+        /* find GCC: check for bundled gcc relative to zerc binary first,
+         * then fall back to system PATH.
+         * Bundled layout: zerc[.exe] + gcc/bin/gcc[.exe] in same directory. */
+        char gcc_path[512];
+        int found_bundled = 0;
+        {
+            /* extract directory from argv[0] */
+            char zerc_dir[512];
+            strncpy(zerc_dir, argv[0], sizeof(zerc_dir) - 1);
+            zerc_dir[sizeof(zerc_dir) - 1] = '\0';
+            /* find last slash or backslash */
+            char *last_sep = NULL;
+            for (char *p = zerc_dir; *p; p++) {
+                if (*p == '/' || *p == '\\') last_sep = p;
+            }
+            if (last_sep) {
+                *(last_sep + 1) = '\0';
+            } else {
+                zerc_dir[0] = '\0'; /* zerc in current dir */
+            }
+#ifdef _WIN32
+            snprintf(gcc_path, sizeof(gcc_path), "%sgcc\\bin\\gcc.exe", zerc_dir);
+#else
+            snprintf(gcc_path, sizeof(gcc_path), "%sgcc/bin/gcc", zerc_dir);
+#endif
+            FILE *test = fopen(gcc_path, "r");
+            if (test) {
+                fclose(test);
+                found_bundled = 1;
+            }
+        }
+        if (!found_bundled) {
+            strcpy(gcc_path, "gcc"); /* fall back to system PATH */
+        }
+
+        char gcc_cmd[2048];
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 "gcc -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\"",
-                 exe_path, output_path);
+                 "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\"",
+                 gcc_path, exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);
         if (gcc_ret != 0) {
-            fprintf(stderr, "zerc: gcc failed\n");
+            fprintf(stderr, "zerc: gcc failed (tried: %s)\n", gcc_path);
             free(cc.modules);
             arena_free(&cc.arena);
             return 1;

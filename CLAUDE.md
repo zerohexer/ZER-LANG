@@ -296,9 +296,12 @@ Two tools + one library for automated C-to-ZER migration:
 - Reports: N upgraded, M kept (for remaining compat calls)
 
 **zer-upgrade architecture notes for fresh sessions:**
-- Layer 2 malloc detection uses `find_func_bounds()` to record `func_start`/`func_end` for each alloc. `find_alloc(name, pos)` only matches if `pos` is within the function where malloc occurred. This prevents wrapping function parameters with `slab.get()`.
+- Layer 2 malloc detection uses `find_func_bounds()` to record `func_start`/`func_end` for each alloc. `find_alloc(name, pos)` only matches if `pos` is within the function where malloc occurred.
+- Cross-function support: `scan_handle_params()` finds function params of Slab types. `find_handle_param(name, pos)` enables `slab.get()` wrapping and `slab.free()` for params that receive Slab-allocated objects. This handles the pattern where malloc is in func A and free is in func B.
+- Function signature rewriting: `rewrite_signatures()` post-processing pass detects function declarations (line contains `(` and ends with `{` or `)`, skipping `\r`). Rewrites `SlabType *param` → `Handle(SlabType) param_h` in params, and `SlabType *func(` → `?Handle(SlabType) func(` for return types.
 - The line-based approach (detect pattern at `\n` boundary, emit replacement, skip source line) is much more reliable than mid-stream output buffer rollback. The rollback approach broke because earlier Layer 1 transforms changed output length vs source length.
 - `strcmp`/`strncmp`/`memcmp` → `bytes_equal` strips trailing `== 0` and `!= 0` comparisons (strcmp returns int, bytes_equal returns bool).
+- **Windows `\r\r\n` pitfall:** Phase 1 output may have `\r` chars. The `is_func_decl` backward scan must skip `\r` in addition to space/tab, otherwise no function signatures are detected.
 
 **`lib/compat.zer`** — Scaffolding library (NOT part of ZER). Wraps C stdlib via `cinclude`. Tagged `zer_` prefix for Phase 2 detection. Removed after full upgrade.
 

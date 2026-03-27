@@ -824,14 +824,29 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
-        /* BUG-294: reject assignment to non-lvalue (function call, literal) */
+        /* BUG-294/302: reject assignment to non-lvalue.
+         * Walk field/index chains to find base — if it's a call returning a value
+         * type (not a pointer, which auto-derefs to lvalue), reject.
+         * Deref (*expr) makes it an lvalue, so stop walking at NODE_UNARY. */
         {
             Node *t = node->assign.target;
-            if (t->kind == NODE_CALL || t->kind == NODE_INT_LIT ||
-                t->kind == NODE_STRING_LIT || t->kind == NODE_NULL_LIT ||
-                t->kind == NODE_BOOL_LIT) {
+            while (t) {
+                if (t->kind == NODE_FIELD) t = t->field.object;
+                else if (t->kind == NODE_INDEX) t = t->index_expr.object;
+                else break;
+            }
+            if (t && (t->kind == NODE_INT_LIT || t->kind == NODE_STRING_LIT ||
+                t->kind == NODE_NULL_LIT || t->kind == NODE_BOOL_LIT)) {
                 checker_error(c, node->loc.line,
                     "cannot assign to expression — not an lvalue");
+            }
+            /* function call: only reject if it returns a value type (not pointer) */
+            if (t && t->kind == NODE_CALL) {
+                Type *call_ret = checker_get_type(c, t);
+                if (call_ret && call_ret->kind != TYPE_POINTER) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign to expression — not an lvalue");
+                }
             }
         }
 

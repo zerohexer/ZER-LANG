@@ -1493,6 +1493,9 @@ static void test_negative_sweep(void) {
     /* BUG-294: assign to non-lvalue */
     err("u32 get() { return 0; }\nvoid f() { get() = 5; }",
         "assign to function call rejected");
+    err("struct S { u32 x; }\nS get_s() { S s; s.x = 0; return s; }\n"
+        "void f() { get_s().x = 5; }",
+        "assign to rvalue struct field rejected (BUG-302)");
     ok("u32 x = 0;\nvoid f() { x = 5; }\nu32 main() { return 0; }",
        "assign to variable accepted");
 

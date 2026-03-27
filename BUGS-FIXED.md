@@ -1475,6 +1475,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Walk target to root, check `is_volatile`. If volatile, emit byte-by-byte loop.
 - **Test:** Verified emitted C uses volatile byte loop.
 
+### BUG-295: `type_unwrap_distinct` not recursive
+- **Symptom:** `distinct typedef P1 P2; P2 x + y` — rejected as "not numeric."
+- **Root cause:** Single `if` unwrap, not `while` loop. P2 → P1 (still distinct).
+- **Fix:** Changed to `while (t && t->kind == TYPE_DISTINCT) t = t->distinct.underlying;`.
+- **Test:** `test_checker_full.c` — nested distinct arithmetic accepted.
+
+### BUG-296: INT_MIN / -1 in constant folder
+- **Symptom:** Potential signed overflow UB in the compiler itself.
+- **Root cause:** Division path had no INT_MIN / -1 guard.
+- **Fix:** Check `l == INT64_MIN && r == -1` → CONST_EVAL_FAIL for both / and %.
+- **Test:** Implicit in existing tests (no crash).
+
+### BUG-297: @size(array) loses dimensions
+- **Symptom:** `@size(u32[10])` returns 4 instead of 40.
+- **Root cause:** `emit_type(TYPE_ARRAY)` recursed to base type, dropping [10].
+- **Fix:** Walk array chain, emit all `[N]` dimensions after base type.
+- **Test:** `test_emit.c` — @size(u32[10]) = 40.
+
 ### BUG-292: Volatile stripping in |*v| mutable capture
 - **Symptom:** `if (volatile_reg) |*v|` — `_zer_uwp` declared without volatile.
 - **Root cause:** BUG-272 fixed immutable captures but mutable `|*v|` path was separate.

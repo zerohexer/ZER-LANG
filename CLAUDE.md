@@ -720,6 +720,15 @@ All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more a
 **RF10: Function pointer detection consolidated into `is_func_ptr_start()`.**
 5 duplicated `save → advance('(') → check('*') → restore` patterns replaced with single helper. Saves/restores scanner, current, and previous tokens. Eliminates the "Nth site forgot the pattern" bug class.
 
+**153. `type_unwrap_distinct` recursive — handles any nesting depth.**
+`distinct typedef (distinct typedef u32) P2` now unwraps fully to `u32`. Uses `while` loop. Fixes arithmetic, type queries, and intrinsic validation on nested distinct types. (BUG-295)
+
+**154. Constant folder guards `INT_MIN / -1`.**
+Signed overflow UB in the compiler itself prevented. Both `/` and `%` paths check `l == INT64_MIN && r == -1` → `CONST_EVAL_FAIL`. (BUG-296)
+
+**155. `emit_type(TYPE_ARRAY)` includes dimensions.**
+`sizeof(u32[10])` now emits `sizeof(uint32_t[10])` = 40, not `sizeof(uint32_t)` = 4. Walks array chain to base, emits all `[N]` dimensions. Multi-dim also works. (BUG-297)
+
 **151. Volatile `|*v|` mutable capture pointer preserved.**
 `if (volatile_reg) |*v|` — `_zer_uwp` pointer now declared as `volatile T *` when source is volatile. Uses `expr_is_volatile` helper. (BUG-292)
 

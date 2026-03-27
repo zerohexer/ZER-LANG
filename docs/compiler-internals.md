@@ -480,6 +480,9 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 109. **Volatile if-unwrap copy (BUG-272)** — Checks if condition ident's symbol has `is_volatile`. If so, emits `volatile` before the typed copy. Uses `emit_type_and_name` for correct func ptr name placement.
 110. **Volatile array assign byte loop (BUG-273)** — Array assignment checks target root symbol for `is_volatile`. If volatile, emits `for(_i) vd[_i] = vs[_i]` byte loop instead of memcpy. Same pattern as @cstr volatile (BUG-223).
 111. **Volatile union capture pointer (BUG-274)** — `sw_volatile` flag detected from switch expression root symbol. When set, mutable capture `|*v|` emits `volatile T *v` instead of `T *v`.
+128. **`type_unwrap_distinct` recursive (BUG-295)** — Changed from single `if` to `while` loop. Handles `distinct typedef (distinct typedef T)` at any depth. All callers benefit automatically.
+129. **Const fold INT_MIN / -1 guard (BUG-296)** — `eval_const_expr` TOK_SLASH and TOK_PERCENT check `l == INT64_MIN && r == -1` → CONST_EVAL_FAIL. Prevents signed overflow UB in the compiler.
+130. **`emit_type(TYPE_ARRAY)` emits dimensions (BUG-297)** — Walks array chain to base type, emits all `[N]` suffixes. `sizeof(u32[10])` emits `sizeof(uint32_t[10])` = 40. Multi-dim: `sizeof(u8[10][20])` emits `sizeof(uint8_t[20][10])`.
 126. **Volatile |*v| capture pointer (BUG-292)** — `expr_is_volatile` check added to mutable capture branch. When volatile, emits `volatile T *_zer_uwp` and `volatile T _zer_uwt` (rvalue path).
 127. **Assign to non-lvalue rejected (BUG-294)** — NODE_ASSIGN checks target kind. NODE_CALL, NODE_INT_LIT, NODE_STRING_LIT, NODE_NULL_LIT, NODE_BOOL_LIT → "not an lvalue" error.
 124. **Orelse volatile via __typeof__ (BUG-289)** — All 3 orelse `__auto_type _zer_tmp` sites replaced with `__typeof__(expr) _zer_tmp`. `__typeof__` preserves volatile/const from the expression type. `__auto_type` strips qualifiers.

@@ -207,8 +207,9 @@ Module Imports:              10 patterns
 Firmware Patterns (3 rounds): 102 end-to-end tests
 Production Firmware:          14 end-to-end tests
 Parser Fuzz:                 491 adversarial inputs
+Conversion Tools:            75 tests (zer-convert + zer-upgrade)
 ──────────────────────────────────────────────────
-Total:                     1766 tests + 491 fuzz, all passing
+Total:                     1841 tests + 491 fuzz, all passing
 ```
 
 313 compiler bugs found and fixed across 30+ rounds of testing.

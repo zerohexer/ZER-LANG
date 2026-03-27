@@ -284,7 +284,24 @@ Two tools + one library for automated C-to-ZER migration:
 - sizeof: `sizeof(Type *)`→`@size(*Type)`, inside cast args too
 - Preprocessor: `#include`→`cinclude`, `#define N 42`→`const u32 N = 42;`
 - Struct: `struct Node` in usage→`Node` (keeps `struct` in declarations)
+- Enum: `enum State` in usage→`State` (keeps `enum` in declarations)
+- void*: `void *`→`*opaque`, `(void *)expr`→`@ptrcast(*opaque, expr)`
+- Arrays: `int arr[10]`→`i32[10] arr` (ZER size-before-name reorder)
+- switch: `case VAL: ... break;`→`.VAL => { ... }`, `default:`→`default => {`
+- do-while: `do { body } while(cond);`→`while (true) { body if (!(cond)) { break; } }`
+- typedef struct: `typedef struct { ... } Name;`→`struct Name { ... }`
+- Tag mapping: `typedef struct node { ... } Node;` records `node`→`Node`, applies in body and usage
+- I/O functions: `printf`, `fprintf` etc. stay as-is (used via cinclude, not compat)
 - Auto-imports `compat.zer` when unsafe patterns detected
+
+**zer-convert architecture notes for fresh sessions:**
+- `map_type()` covers BOTH the type_map table AND standalone keywords (`int`, `long`, `short`, `unsigned`). Without this, `(int)x` cast detection fails — the cast handler calls `map_type` to check if a token is a type.
+- `try_reorder_array(i)` called after every type emission to detect C-style `type name[N]` and reorder to ZER's `type[N] name`.
+- `in_switch_arm` static flag tracks open switch arms. When `case` or `default` is encountered while an arm is open, auto-closes with `}`. When `break;` is encountered inside a switch arm, emits `}` instead.
+- `tag_maps[]` records typedef struct tag→name mappings. `lookup_tag()` resolves bare tag names in body and usage. Both `struct tag_name` usage (via struct handler) and bare `tag_name` usage (via identifier fallthrough) are resolved.
+- `typedef struct` handler neutralizes the post-`}` typedef name and `;` tokens, then jumps `i` to `{` so the normal transform loop handles body contents (enabling type transforms inside struct bodies).
+- do-while body is emitted with inline transforms (++, --, ->, NULL, type mapping) since the token-level approach can't easily recurse the full transform on a sub-range.
+- 75 regression tests in `tests/test_convert.sh`, integrated into `make check`.
 
 **`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
 - Layer 1: `zer_strlen(s)`→`s.len`, `zer_strcmp(a,b)==0`→`bytes_equal(a,b)`, `zer_memcpy`→`bytes_copy`, `zer_memset(d,0,n)`→`bytes_zero(d)`, `zer_exit`→`@trap()`
@@ -308,6 +325,7 @@ Two tools + one library for automated C-to-ZER migration:
 - **Local slab var tracking:** `scan_local_slab_vars()` finds `SlabType *var = expr` in function bodies (e.g., `Task *a = task_create()`). Registers as handle variable with function bounds. Combined with `scan_handle_params` (function params) and `scan_allocs` (malloc sites), covers all three sources of handle variables.
 - **Struct field rewriting:** `rewrite_signatures()` also detects `SlabType *field;` in struct definitions and rewrites to `?Handle(SlabType) field;`. Handles linked list `next`/`prev` and parent pointers.
 - **Local var declaration rewriting:** `rewrite_signatures()` detects `SlabType *var = expr;` and rewrites to `?Handle(SlabType) var_h = expr;`.
+- **Primitive type exclusion:** `is_primitive_type()` checks if a type name is a primitive (`u8`, `i32`, etc.). `scan_allocs` skips primitives — raw byte malloc (e.g., `u8 *buf = malloc(100)`) stays as compat, not Slab. The check is in BOTH `scan_allocs` (pre-scan) AND `upgrade()` (line-based replacement) — the line-based path also calls `get_slab_name()` which creates slab types if not guarded.
 
 **`lib/compat.zer`** — Scaffolding library (NOT part of ZER). Wraps C stdlib via `cinclude`. Tagged `zer_` prefix for Phase 2 detection. Removed after full upgrade.
 

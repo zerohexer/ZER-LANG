@@ -316,6 +316,7 @@ static void tokenize(const char *src, int len) {
 
 static FILE *out;
 static bool needs_compat = false; /* set true if malloc/free/ptr arith used */
+static bool in_switch_arm = false; /* track open switch arm for auto-close */
 
 static void emit_raw(const char *s, int len) {
     fwrite(s, 1, len, out);
@@ -348,6 +349,37 @@ static int skip_spaces(int i) {
     while (i < token_count && tokens[i].type == CT_WHITESPACE)
         i++;
     return i;
+}
+
+/* check if position i is followed by: WS IDENT [ expr ] (C array decl pattern)
+ * If so, emit [expr] SPACE IDENT and return new position after ].
+ * Otherwise return -1. */
+static int try_reorder_array(int i) {
+    int j = skip_spaces(i);
+    if (j >= token_count || tokens[j].type != CT_IDENT) return -1;
+    int name_idx = j;
+    int k = skip_spaces(j + 1);
+    if (k >= token_count || tokens[k].type != CT_LBRACKET) return -1;
+    /* find matching ] — collect everything inside */
+    int depth = 1;
+    int m = k + 1;
+    while (m < token_count && depth > 0) {
+        if (tokens[m].type == CT_LBRACKET) depth++;
+        if (tokens[m].type == CT_RBRACKET) { depth--; if (depth == 0) break; }
+        m++;
+    }
+    if (m >= token_count || tokens[m].type != CT_RBRACKET) return -1;
+    /* check what follows ] — must NOT be = or ( (those indicate indexing/function, not decl) */
+    int after = skip_spaces(m + 1);
+    /* array decl: type name[N]; or type name[N] = ... (but with preceding type context)
+     * vs indexing: arr[i] = ... (but arr was already emitted as ident, not as type)
+     * Since we only call this after type emission, it's always a declaration context. */
+    /* emit [size] name */
+    emit_str("[");
+    for (int x = k + 1; x < m; x++) emit_tok(&tokens[x]);
+    emit_str("] ");
+    emit_tok(&tokens[name_idx]);
+    return m + 1;
 }
 
 static void transform(void) {
@@ -447,6 +479,117 @@ static void transform(void) {
             }
         }
 
+        /* ---- switch/case/break → ZER switch syntax ---- */
+        /* case VALUE: → .VALUE => { and default: → default => { */
+        if (t->type == CT_IDENT && tok_eq(t, "case")) {
+            /* close previous arm if one was open (case without break) */
+            if (in_switch_arm) { emit_str("}\n"); in_switch_arm = false; }
+            i++;
+            int j = skip_spaces(i);
+            /* collect everything up to : as the case value */
+            emit_str(".");
+            while (j < token_count && tokens[j].type != CT_COLON) {
+                emit_tok(&tokens[j]);
+                j++;
+            }
+            if (j < token_count && tokens[j].type == CT_COLON) j++; /* skip : */
+            emit_str(" => {");
+            in_switch_arm = true;
+            i = j;
+            continue;
+        }
+        if (t->type == CT_IDENT && tok_eq(t, "default")) {
+            int j = skip_spaces(i + 1);
+            if (j < token_count && tokens[j].type == CT_COLON) {
+                /* close previous arm if open */
+                if (in_switch_arm) { emit_str("}\n"); in_switch_arm = false; }
+                emit_str("default => {");
+                in_switch_arm = true;
+                i = j + 1;
+                continue;
+            }
+        }
+        /* break; inside switch → } (close arm block) */
+        if (t->type == CT_IDENT && tok_eq(t, "break") && in_switch_arm) {
+            int j = skip_spaces(i + 1);
+            if (j < token_count && tokens[j].type == CT_SEMICOLON) {
+                emit_str("}");
+                in_switch_arm = false;
+                i = j + 1; /* skip break + ; */
+                continue;
+            }
+        }
+        /* closing } of switch body — close any open arm first */
+        if (t->type == CT_RBRACE && in_switch_arm) {
+            emit_str("}\n"); /* close the arm */
+            in_switch_arm = false;
+            /* don't consume the } — let it emit normally for the switch body close */
+        }
+
+        /* ---- do { body } while (cond); → while (true) { body if (!(cond)) { break; } } ---- */
+        if (t->type == CT_IDENT && tok_eq(t, "do")) {
+            int j = skip_ws(i + 1);
+            if (j < token_count && tokens[j].type == CT_LBRACE) {
+                /* find matching } */
+                int depth = 1;
+                int body_end = j + 1;
+                while (body_end < token_count && depth > 0) {
+                    if (tokens[body_end].type == CT_LBRACE) depth++;
+                    if (tokens[body_end].type == CT_RBRACE) depth--;
+                    body_end++;
+                }
+                /* body_end is past }. Check for while (cond); */
+                int w = skip_ws(body_end);
+                if (w < token_count && tokens[w].type == CT_IDENT && tok_eq(&tokens[w], "while")) {
+                    int p = skip_spaces(w + 1);
+                    if (p < token_count && tokens[p].type == CT_LPAREN) {
+                        int close = -1;
+                        int pd = 1;
+                        int q = p + 1;
+                        while (q < token_count && pd > 0) {
+                            if (tokens[q].type == CT_LPAREN) pd++;
+                            if (tokens[q].type == CT_RPAREN) { pd--; if (pd == 0) { close = q; break; } }
+                            q++;
+                        }
+                        if (close > 0) {
+                            int semi = skip_spaces(close + 1);
+                            /* Emit: while (true) { [body with transforms] if (!(cond)) { break; } } */
+                            emit_str("while (true) {\n");
+                            /* emit body contents with basic transforms */
+                            int rbrace_idx = body_end - 1;
+                            for (int x = j + 1; x < rbrace_idx; x++) {
+                                if (tokens[x].type == CT_PLUSPLUS) { emit_str(" += 1"); continue; }
+                                if (tokens[x].type == CT_MINUSMINUS) { emit_str(" -= 1"); continue; }
+                                if (tokens[x].type == CT_ARROW) { emit_str("."); continue; }
+                                if (tokens[x].type == CT_IDENT && tok_eq(&tokens[x], "NULL")) { emit_str("null"); continue; }
+                                if (tokens[x].type == CT_IDENT) {
+                                    const char *mt = map_type(&tokens[x]);
+                                    if (mt) { emit_str(mt); continue; }
+                                }
+                                emit_tok(&tokens[x]);
+                            }
+                            /* emit the condition check */
+                            emit_str("    if (!(");
+                            for (int x = p + 1; x < close; x++) {
+                                if (tokens[x].type == CT_IDENT) {
+                                    const char *mt = map_type(&tokens[x]);
+                                    if (mt) { emit_str(mt); continue; }
+                                }
+                                emit_tok(&tokens[x]);
+                            }
+                            emit_str(")) { break; }\n");
+                            emit_str("}");
+                            if (semi < token_count && tokens[semi].type == CT_SEMICOLON)
+                                i = semi + 1;
+                            else
+                                i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         /* ---- i++ / i-- → i += 1 / i -= 1 ---- */
         if (t->type == CT_PLUSPLUS) {
             emit_str(" += 1");
@@ -473,6 +616,8 @@ static void transform(void) {
                             tok_eq(&tokens[j], type_combos[ci].second)) {
                             emit_str(type_combos[ci].zer);
                             i = j + 1; /* skip both tokens */
+                            /* check for C-style array: type name[N] → type[N] name */
+                            { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                             found_combo = true;
                             break;
                         }
@@ -490,6 +635,7 @@ static void transform(void) {
                      !tok_eq(&tokens[j], "short") && !tok_eq(&tokens[j], "long"))) {
                     emit_str("u32");
                     i++;
+                    { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                     continue;
                 }
             }
@@ -498,6 +644,7 @@ static void transform(void) {
             if (tok_eq(t, "int")) {
                 emit_str("i32");
                 i++;
+                { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }
 
@@ -505,12 +652,29 @@ static void transform(void) {
             if (tok_eq(t, "long")) {
                 emit_str("i64");
                 i++;
+                { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }
 
             /* standalone 'short' (not part of combo) → i16 */
             if (tok_eq(t, "short")) {
                 emit_str("i16");
+                i++;
+                { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
+                continue;
+            }
+
+            /* void * → *opaque (type-erased pointer) */
+            if (tok_eq(t, "void")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_STAR) {
+                    /* void * → *opaque */
+                    emit_str("*opaque");
+                    i = j + 1; /* skip void + * */
+                    continue;
+                }
+                /* standalone void — keep as void */
+                emit_str("void");
                 i++;
                 continue;
             }
@@ -520,6 +684,70 @@ static void transform(void) {
             /* NULL → null */
             if (tok_eq(t, "NULL")) {
                 emit_str("null");
+                i++;
+                continue;
+            }
+
+            /* typedef struct → struct Name { ... } (ZER doesn't use typedef for structs) */
+            if (tok_eq(t, "typedef")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_IDENT &&
+                    (tok_eq(&tokens[j], "struct") || tok_eq(&tokens[j], "union") || tok_eq(&tokens[j], "enum"))) {
+                    /* typedef struct [tag] { ... } Name;
+                     * → struct Name { ... }
+                     * Strategy: find the }, then the Name before ;.
+                     * Emit "struct Name " then jump i to { so normal transform handles body. */
+                    const char *kw = tok_eq(&tokens[j], "struct") ? "struct" :
+                                     tok_eq(&tokens[j], "union") ? "union" : "enum";
+                    int k = skip_spaces(j + 1);
+                    /* skip optional tag name (e.g., typedef struct node { ... } Node;) */
+                    if (k < token_count && tokens[k].type == CT_IDENT) {
+                        int m = skip_ws(k + 1);
+                        if (m < token_count && tokens[m].type == CT_LBRACE) {
+                            k = m; /* skip tag, jump to { */
+                        }
+                    }
+                    if (k < token_count && tokens[k].type == CT_LBRACE) {
+                        /* find matching } to locate the typedef name after it */
+                        int depth = 1;
+                        int m = k + 1;
+                        while (m < token_count && depth > 0) {
+                            if (tokens[m].type == CT_LBRACE) depth++;
+                            if (tokens[m].type == CT_RBRACE) depth--;
+                            m++;
+                        }
+                        /* m is past }. Find the typedef name before ; */
+                        int name_idx = -1;
+                        int n = skip_spaces(m);
+                        if (n < token_count && tokens[n].type == CT_IDENT) {
+                            name_idx = n;
+                        }
+                        if (name_idx >= 0) {
+                            /* emit "struct Name " and mark the post-} name+; for skipping */
+                            emit_str(kw);
+                            emit_str(" ");
+                            emit_tok(&tokens[name_idx]);
+                            emit_str(" ");
+                            /* Set i to { — let normal transform loop handle body contents.
+                             * We need to mark the typedef-name + ; after } for skipping.
+                             * Use a simple approach: replace the name token with a skip marker. */
+                            tokens[name_idx].type = CT_WHITESPACE; /* neutralize — will emit as space */
+                            tokens[name_idx].start = " ";
+                            tokens[name_idx].len = 0;
+                            /* also neutralize the ; if present */
+                            int semi = skip_spaces(name_idx + 1);
+                            if (semi < token_count && tokens[semi].type == CT_SEMICOLON) {
+                                tokens[semi].type = CT_WHITESPACE;
+                                tokens[semi].start = "";
+                                tokens[semi].len = 0;
+                            }
+                            i = k; /* jump to {, normal loop handles contents */
+                            continue;
+                        }
+                    }
+                }
+                /* non-struct typedef — pass through */
+                emit_str("typedef");
                 i++;
                 continue;
             }
@@ -538,6 +766,24 @@ static void transform(void) {
                     }
                     /* struct usage: struct<ws>Node → Node (skip struct + whitespace) */
                     i = j; /* jump to the name, skip struct + spaces */
+                    continue;
+                }
+            }
+
+            /* enum keyword in usage (not declaration) — drop it + trailing whitespace */
+            if (tok_eq(t, "enum")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_IDENT) {
+                    /* check if next-next is { → keep 'enum' (declaration) */
+                    int k = skip_ws(j + 1);
+                    if (k < token_count && tokens[k].type == CT_LBRACE) {
+                        /* enum declaration — keep enum keyword */
+                        emit_str("enum");
+                        i++;
+                        continue;
+                    }
+                    /* enum usage: enum State → State (skip enum + whitespace) */
+                    i = j;
                     continue;
                 }
             }
@@ -608,17 +854,9 @@ static void transform(void) {
             if (tok_eq(t, "memmove")) { emit_str("zer_memmove"); needs_compat = true; i++; continue; }
             if (tok_eq(t, "memset")) { emit_str("zer_memset"); needs_compat = true; i++; continue; }
 
-            /* I/O functions — keep as cinclude calls but tag them */
-            if (tok_eq(t, "printf")) { emit_str("zer_printf"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "fprintf")) { emit_str("zer_fprintf"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "sprintf")) { emit_str("zer_sprintf"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "snprintf")) { emit_str("zer_snprintf"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "puts")) { emit_str("zer_puts"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "fputs")) { emit_str("zer_fputs"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "fopen")) { emit_str("zer_fopen"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "fclose")) { emit_str("zer_fclose"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "fread")) { emit_str("zer_fread"); needs_compat = true; i++; continue; }
-            if (tok_eq(t, "fwrite")) { emit_str("zer_fwrite"); needs_compat = true; i++; continue; }
+            /* I/O functions — keep as-is (accessed via cinclude "stdio.h") */
+            /* printf, fprintf, etc. are C functions used directly via cinclude.
+             * They don't need compat wrappers — just declare them in ZER. */
 
             /* exit() → zer_exit() */
             if (tok_eq(t, "exit")) { emit_str("zer_exit"); needs_compat = true; i++; continue; }
@@ -627,6 +865,7 @@ static void transform(void) {
             if (mapped) {
                 emit_str(mapped);
                 i++;
+                { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }
         }
@@ -658,7 +897,21 @@ static void transform(void) {
                     }
                 }
             }
-            /* check for (type *) pattern — exclude (void *) in func ptr params */
+            /* check for (void *) cast → @ptrcast(*opaque, ...) */
+            if (!is_cast && j < token_count && tokens[j].type == CT_IDENT &&
+                tok_eq(&tokens[j], "void")) {
+                int k = skip_spaces(j + 1);
+                if (k < token_count && tokens[k].type == CT_STAR) {
+                    int m = skip_spaces(k + 1);
+                    if (m < token_count && tokens[m].type == CT_RPAREN) {
+                        cast_type = "*opaque";
+                        is_ptr_cast = true;
+                        is_cast = true;
+                        cast_end = m + 1;
+                    }
+                }
+            }
+            /* check for (type *) pattern */
             if (!is_cast && j < token_count && tokens[j].type == CT_IDENT &&
                 !tok_eq(&tokens[j], "void")) {
                 const char *mapped_cast = map_type(&tokens[j]);

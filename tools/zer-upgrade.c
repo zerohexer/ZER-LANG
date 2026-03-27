@@ -187,6 +187,23 @@ static const char *get_slab_name(const char *type_name) {
     return "unknown_slab";
 }
 
+/* check if a type name is a primitive (should NOT become a Slab type) */
+static bool is_primitive_type(const char *name) {
+    static const char *prims[] = {
+        "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64",
+        "usize", "f32", "f64", "bool", "void", "opaque",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "char", "int", "float", "double", "short", "long",
+        "size_t", "ssize_t", "ptrdiff_t",
+        NULL
+    };
+    for (int i = 0; prims[i]; i++) {
+        if (strcmp(name, prims[i]) == 0) return true;
+    }
+    return false;
+}
+
 /* check if a type name has a Slab allocator */
 static bool is_slab_type(const char *type_name) {
     for (int i = 0; i < slab_type_count; i++) {
@@ -271,6 +288,9 @@ static void scan_allocs(const char *src, int src_len) {
                 memcpy(type_name, src + type_start, type_len);
                 type_name[type_len] = '\0';
                 while (type_len > 0 && type_name[type_len - 1] == ' ') type_name[--type_len] = '\0';
+
+                /* skip primitive types — they don't make sense as Slab(u8) etc. */
+                if (is_primitive_type(type_name)) continue;
 
                 if (strstr(src + j, "zer_malloc_bytes") && (strstr(src + j, "zer_malloc_bytes") - (src + j)) < 30) {
                     int k = i - 1;
@@ -738,6 +758,10 @@ static void upgrade(const char *src, int src_len) {
                                 char type_buf[64] = {0}, var_buf[64] = {0};
                                 if (tn_len < 63) memcpy(type_buf, src + tn_start, tn_len);
                                 if (vn_len < 63) memcpy(var_buf, src + vn_start, vn_len);
+
+                                /* skip primitive types — keep as compat call */
+                                if (is_primitive_type(type_buf)) goto emit_line_asis;
+
                                 const char *slab = get_slab_name(type_buf);
 
                                 /* emit newline if we're not at start */
@@ -785,6 +809,8 @@ static void upgrade(const char *src, int src_len) {
                 }
             }
         }
+
+        emit_line_asis: /* label for primitive type skip — emit line as-is */
 
         /* ---- zer_free(var) → type_slab.free(var_h) ---- */
         if (starts_with(src, i, src_len, "zer_free(") && word_boundary_before(src, i)) {

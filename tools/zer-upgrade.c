@@ -151,7 +151,10 @@ static int find_close_paren(const char *src, int start, int len);
 typedef struct {
     char type_name[64];     /* the allocated type: Node, dict, etc. */
     char var_name[64];      /* the variable: n, d, entry, etc. */
-    int malloc_line;        /* line of malloc */
+    char func_name[64];     /* function where malloc occurs */
+    int malloc_pos;         /* byte position of malloc in source */
+    int func_start;         /* byte position of function start */
+    int func_end;           /* byte position of function end (closing }) */
     bool has_free;          /* matched free found */
 } AllocInfo;
 
@@ -184,28 +187,51 @@ static const char *get_slab_name(const char *type_name) {
     return "unknown_slab";
 }
 
-/* check if a variable name was malloc'd */
-static AllocInfo *find_alloc(const char *var_name) {
+/* check if a variable name was malloc'd — only within the same function scope */
+static AllocInfo *find_alloc(const char *var_name, int pos) {
     for (int i = 0; i < alloc_count; i++) {
-        if (strcmp(allocs[i].var_name, var_name) == 0)
+        if (strcmp(allocs[i].var_name, var_name) == 0 &&
+            pos >= allocs[i].func_start && pos <= allocs[i].func_end)
             return &allocs[i];
     }
     return NULL;
+}
+
+/* find the enclosing function boundaries for a position */
+static void find_func_bounds(const char *src, int src_len, int pos, int *out_start, int *out_end) {
+    /* scan backward for opening { at depth 0 (function body start) */
+    int depth = 0;
+    int fstart = pos;
+    for (int i = pos; i >= 0; i--) {
+        if (src[i] == '}') depth++;
+        if (src[i] == '{') {
+            if (depth == 0) { fstart = i; break; }
+            depth--;
+        }
+    }
+    /* scan forward for matching closing } */
+    depth = 0;
+    int fend = src_len;
+    for (int i = fstart; i < src_len; i++) {
+        if (src[i] == '{') depth++;
+        if (src[i] == '}') {
+            depth--;
+            if (depth == 0) { fend = i; break; }
+        }
+    }
+    *out_start = fstart;
+    *out_end = fend;
 }
 
 /* Pre-scan: find all malloc/free patterns in source */
 static void scan_allocs(const char *src, int src_len) {
     alloc_count = 0;
     slab_type_count = 0;
-    int line = 1;
 
     for (int i = 0; i < src_len; i++) {
-        if (src[i] == '\n') line++;
-
         /* Pattern: TYPE *VAR = @ptrcast(*TYPE, zer_malloc_bytes(@size(TYPE))); */
         if (starts_with(src, i, src_len, "@ptrcast(*") && word_boundary_before(src, i)) {
-            int j = i + 10; /* after @ptrcast(* */
-            /* extract type name */
+            int j = i + 10;
             int type_start = j;
             while (j < src_len && src[j] != ',' && src[j] != ')') j++;
             int type_len = j - type_start;
@@ -213,30 +239,27 @@ static void scan_allocs(const char *src, int src_len) {
                 char type_name[64];
                 memcpy(type_name, src + type_start, type_len);
                 type_name[type_len] = '\0';
-                /* trim whitespace */
                 while (type_len > 0 && type_name[type_len - 1] == ' ') type_name[--type_len] = '\0';
 
-                /* check if this contains zer_malloc_bytes */
                 if (strstr(src + j, "zer_malloc_bytes") && (strstr(src + j, "zer_malloc_bytes") - (src + j)) < 30) {
-                    /* find variable name: scan backward from @ptrcast for "= " then the ident before it */
                     int k = i - 1;
                     while (k > 0 && (src[k] == ' ' || src[k] == '\t')) k--;
                     if (k > 0 && src[k] == '=') {
                         k--;
                         while (k > 0 && (src[k] == ' ' || src[k] == '\t')) k--;
-                        /* now k points to end of var name */
                         int var_end = k + 1;
                         while (k > 0 && (isalnum(src[k]) || src[k] == '_')) k--;
-                        k++; /* start of var name */
+                        k++;
                         int var_len = var_end - k;
                         if (var_len > 0 && var_len < 63 && alloc_count < MAX_ALLOCS) {
                             AllocInfo *ai = &allocs[alloc_count++];
                             memcpy(ai->var_name, src + k, var_len);
                             ai->var_name[var_len] = '\0';
                             strncpy(ai->type_name, type_name, 63);
-                            ai->malloc_line = line;
+                            ai->malloc_pos = i;
                             ai->has_free = false;
-                            get_slab_name(type_name); /* register type */
+                            find_func_bounds(src, src_len, i, &ai->func_start, &ai->func_end);
+                            get_slab_name(type_name);
                         }
                     }
                 }
@@ -245,24 +268,20 @@ static void scan_allocs(const char *src, int src_len) {
 
         /* Pattern: zer_free(VAR); — match to alloc */
         if (starts_with(src, i, src_len, "zer_free(") && word_boundary_before(src, i)) {
-            int open = i + 9;
+            int open = i + 8;
             int close = find_close_paren(src, open, src_len);
             if (close > 0) {
-                char var_name[64];
-                int vlen = close - open - 1;
+                int vs = open + 1;
+                while (vs < close && (src[vs] == ' ' || src[vs] == '\t')) vs++;
+                int ve = close;
+                while (ve > vs && (src[ve - 1] == ' ' || src[ve - 1] == '\t')) ve--;
+                int vlen = ve - vs;
                 if (vlen > 0 && vlen < 63) {
-                    /* trim whitespace */
-                    int vs = open + 1;
-                    while (vs < close && (src[vs] == ' ' || src[vs] == '\t')) vs++;
-                    int ve = close;
-                    while (ve > vs && (src[ve - 1] == ' ' || src[ve - 1] == '\t')) ve--;
-                    vlen = ve - vs;
-                    if (vlen > 0 && vlen < 63) {
-                        memcpy(var_name, src + vs, vlen);
-                        var_name[vlen] = '\0';
-                        AllocInfo *ai = find_alloc(var_name);
-                        if (ai) ai->has_free = true;
-                    }
+                    char var_name[64];
+                    memcpy(var_name, src + vs, vlen);
+                    var_name[vlen] = '\0';
+                    AllocInfo *ai = find_alloc(var_name, i);
+                    if (ai) ai->has_free = true;
                 }
             }
         }
@@ -574,6 +593,27 @@ static void upgrade(const char *src, int src_len) {
 
                             /* skip past the closing paren and semicolon */
                             i = outer_close + 1;
+                            /* skip ; */
+                            while (i < src_len && (src[i] == ' ' || src[i] == '\t')) i++;
+                            if (i < src_len && src[i] == ';') i++;
+                            /* skip newline */
+                            if (i < src_len && src[i] == '\n') i++;
+                            /* skip redundant null check: if (!var) return ...; */
+                            {
+                                int peek = i;
+                                while (peek < src_len && (src[peek] == ' ' || src[peek] == '\t')) peek++;
+                                if (starts_with(src, peek, src_len, "if (!")) {
+                                    int check_start = peek + 5;
+                                    /* check if the var name matches */
+                                    if (strncmp(src + check_start, var_name, strlen(var_name)) == 0) {
+                                        /* skip the entire null check line */
+                                        while (i < src_len && src[i] != '\n') i++;
+                                        if (i < src_len) i++; /* skip newline */
+                                    }
+                                }
+                            }
+                            /* emit the semicolon for our orelse return */
+                            out_str(";\n");
                             upgrades++;
                             continue;
                         }
@@ -594,7 +634,7 @@ static void upgrade(const char *src, int src_len) {
                     int vl = args[0].len < 63 ? args[0].len : 63;
                     memcpy(var_name, src + args[0].start, vl);
                     var_name[vl] = '\0';
-                    AllocInfo *ai = find_alloc(var_name);
+                    AllocInfo *ai = find_alloc(var_name, i);
                     if (ai) {
                         const char *slab = get_slab_name(ai->type_name);
                         out_str(slab);
@@ -622,7 +662,7 @@ static void upgrade(const char *src, int src_len) {
             ident[id_len < 63 ? id_len : 63] = '\0';
 
             /* check if this ident is a malloc'd variable followed by . */
-            AllocInfo *ai = find_alloc(ident);
+            AllocInfo *ai = find_alloc(ident, id_start);
             if (ai && i < src_len && src[i] == '.') {
                 const char *slab = get_slab_name(ai->type_name);
                 out_str(slab);

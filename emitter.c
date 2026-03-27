@@ -758,7 +758,8 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->assign.target);
                     emit(e, ") *_zer_ma%d = &(", tmp);
                     emit_expr(e, node->assign.target);
-                    emit(e, "); memcpy(_zer_ma%d, ", tmp);
+                    /* BUG-306: use memmove for overlap-safe self-assignment */
+                    emit(e, "); memmove(_zer_ma%d, ", tmp);
                     emit_expr(e, node->assign.value);
                     emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
                 }
@@ -1650,7 +1651,8 @@ static void emit_expr(Emitter *e, Node *node) {
                     if (w == 8) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp, tmp);
                     else if (w == 16) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp, tmp);
                     else if (w == 32) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 4294967295ULL ? 4294967295U : (uint32_t)_zer_sat%d", tmp, tmp, tmp);
-                    else emit(e, "_zer_sat%d < 0 ? 0 : (uint64_t)_zer_sat%d", tmp, tmp);
+                    /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
+                    else emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
                 } else {
                     /* signed: clamp to [min, max] for target width */
                     int w = type_width(t);
@@ -1977,7 +1979,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                              (int)node->var_decl.name_len, node->var_decl.name,
                              (int)node->var_decl.name_len, node->var_decl.name, tmp);
                     } else {
-                        emit(e, "memcpy(%.*s, ",
+                        emit(e, "memmove(%.*s, ",
                              (int)node->var_decl.name_len, node->var_decl.name);
                         emit_expr(e, node->var_decl.init);
                         emit(e, ", sizeof(%.*s))",

@@ -1485,6 +1485,21 @@ static void test_negative_sweep(void) {
        "}",
        "volatile *u32 to volatile *u32 param accepted");
 
+    /* BUG-304: @ptrcast const stripping */
+    err("const u32 val = 42;\n"
+        "void f() { *u32 p = @ptrcast(*u32, &val); }",
+        "@ptrcast strips const rejected");
+    ok("const u32 val = 42;\n"
+       "u32 main() { const *u32 p = @ptrcast(const *u32, &val); return 0; }",
+       "@ptrcast preserves const accepted");
+
+    /* BUG-305: const capture via |*v| */
+    err("const ?u32 val = 42;\n"
+        "void f() {\n"
+        "    if (val) |*v| { *v = 99; }\n"
+        "}",
+        "|*v| on const source — write through const ptr rejected");
+
     /* BUG-295: nested distinct arithmetic */
     ok("distinct typedef u32 P1;\ndistinct typedef P1 P2;\n"
        "u32 main() { P2 x = @cast(P2, @cast(P1, 5)); return @cast(u32, @cast(P1, x)); }",

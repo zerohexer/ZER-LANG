@@ -2229,6 +2229,14 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "@ptrcast source must be a pointer, got '%s'",
                                 type_name(val_type));
                         }
+                        /* BUG-304: const stripping via @ptrcast */
+                        if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
+                            result && result->kind == TYPE_POINTER &&
+                            !result->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "@ptrcast cannot strip const qualifier — "
+                                "target must be const pointer");
+                        }
                         /* BUG-258: volatile stripping via @ptrcast.
                          * Cannot cast volatile pointer to non-volatile — writes may
                          * be optimized away by GCC, causing silent hardware failure.
@@ -2732,7 +2740,21 @@ static void check_stmt(Checker *c, Node *node) {
                 bool cap_const;
                 if (node->if_stmt.capture_is_ptr) {
                     cap_type = type_pointer(c->arena, unwrapped);
+                    /* BUG-305: if source is const, capture pointer must be const */
                     cap_const = false;
+                    {
+                        Node *cr = node->if_stmt.cond;
+                        while (cr && (cr->kind == NODE_FIELD || cr->kind == NODE_INDEX))
+                            cr = cr->kind == NODE_FIELD ? cr->field.object : cr->index_expr.object;
+                        if (cr && cr->kind == NODE_IDENT) {
+                            Symbol *cs = scope_lookup(c->current_scope,
+                                cr->ident.name, (uint32_t)cr->ident.name_len);
+                            if (cs && cs->is_const) {
+                                cap_const = true;
+                                cap_type->pointer.is_const = true;
+                            }
+                        }
+                    }
                 } else {
                     cap_type = unwrapped;
                     cap_const = true;

@@ -510,112 +510,93 @@ static void upgrade(const char *src, int src_len) {
         /* ---- Layer 2: malloc/free → Slab(T) ---- */
 
         /* Pattern: TYPE *var = @ptrcast(*TYPE, zer_malloc_bytes(@size(TYPE)));
-         * → ?Handle(TYPE) var_maybe = type_slab.alloc();
-         *   Handle(TYPE) var_h = var_maybe orelse return; */
-        if (starts_with(src, i, src_len, "@ptrcast(*") && word_boundary_before(src, i)) {
-            /* check if this is a malloc ptrcast */
-            int j = i + 10;
-            int type_start = j;
-            while (j < src_len && src[j] != ',' && src[j] != ')') j++;
-            char type_buf[64] = {0};
-            int tlen = j - type_start;
-            if (tlen > 0 && tlen < 63) {
-                memcpy(type_buf, src + type_start, tlen);
-                type_buf[tlen] = '\0';
-                while (tlen > 0 && type_buf[tlen - 1] == ' ') type_buf[--tlen] = '\0';
-            }
-            /* check if zer_malloc_bytes follows */
-            int rest = j;
-            while (rest < src_len && (src[rest] == ',' || src[rest] == ' ')) rest++;
-            if (tlen > 0 && starts_with(src, rest, src_len, "zer_malloc_bytes(")) {
-                /* find the outer closing paren of @ptrcast */
-                int outer_close = find_close_paren(src, i + 9, src_len);
-                if (outer_close > 0) {
-                    const char *slab = get_slab_name(type_buf);
-                    /* scan backward for variable name and type declaration */
-                    int k = i - 1;
-                    while (k > 0 && (src[k] == ' ' || src[k] == '\t')) k--;
-                    if (k > 0 && src[k] == '=') {
-                        k--;
-                        while (k > 0 && (src[k] == ' ' || src[k] == '\t')) k--;
-                        int var_end = k + 1;
-                        while (k > 0 && (isalnum(src[k]) || src[k] == '_')) k--;
-                        if (!isalnum(src[k]) && src[k] != '_') k++;
-                        char var_name[64] = {0};
-                        int vlen = var_end - k;
-                        if (vlen > 0 && vlen < 63) {
-                            memcpy(var_name, src + k, vlen);
-                            var_name[vlen] = '\0';
+         * Strategy: DON'T rollback output. Instead, detect at start of line
+         * and replace the entire line before any chars are emitted. */
+        /* We detect this at the LINE level: scan the current line for the pattern,
+         * and if found, emit the replacement and skip the whole line. */
+        if (src[i] == '\n' || i == 0) {
+            /* look at the NEXT line */
+            int line_start = (src[i] == '\n') ? i + 1 : i;
+            if (line_start < src_len) {
+                /* skip indentation */
+                int ls = line_start;
+                while (ls < src_len && (src[ls] == ' ' || src[ls] == '\t')) ls++;
 
-                            /* scan further back to remove "TYPE *" declaration */
-                            int decl_start = k - 1;
-                            while (decl_start > 0 && (src[decl_start] == ' ' || src[decl_start] == '\t')) decl_start--;
-                            if (decl_start > 0 && src[decl_start] == '*') {
-                                decl_start--;
-                                while (decl_start > 0 && (src[decl_start] == ' ' || src[decl_start] == '\t')) decl_start--;
-                                /* now at end of type name — remove from output buffer */
-                                int type_end = decl_start + 1;
-                                while (decl_start > 0 && (isalnum(src[decl_start]) || src[decl_start] == '_')) decl_start--;
-                                if (!isalnum(src[decl_start]) && src[decl_start] != '_') decl_start++;
+                /* check for: IDENT *IDENT = @ptrcast(*IDENT, zer_malloc_bytes( */
+                int p = ls;
+                /* skip type name */
+                int tn_start = p;
+                while (p < src_len && (isalnum(src[p]) || src[p] == '_')) p++;
+                int tn_len = p - tn_start;
+                /* skip spaces + * */
+                while (p < src_len && src[p] == ' ') p++;
+                if (p < src_len && src[p] == '*') {
+                    p++;
+                    /* skip var name */
+                    while (p < src_len && src[p] == ' ') p++;
+                    int vn_start = p;
+                    while (p < src_len && (isalnum(src[p]) || src[p] == '_')) p++;
+                    int vn_len = p - vn_start;
+                    /* skip = */
+                    while (p < src_len && src[p] == ' ') p++;
+                    if (p < src_len && src[p] == '=' && vn_len > 0 && tn_len > 0) {
+                        p++;
+                        while (p < src_len && src[p] == ' ') p++;
+                        /* check for @ptrcast(* */
+                        if (starts_with(src, p, src_len, "@ptrcast(*")) {
+                            int cast_start = p + 10;
+                            int ct = cast_start;
+                            while (ct < src_len && src[ct] != ',' && src[ct] != ')') ct++;
+                            /* check zer_malloc_bytes after comma */
+                            int rest = ct;
+                            while (rest < src_len && (src[rest] == ',' || src[rest] == ' ')) rest++;
+                            if (starts_with(src, rest, src_len, "zer_malloc_bytes(")) {
+                                /* MATCH! Replace the entire line. */
+                                char type_buf[64] = {0}, var_buf[64] = {0};
+                                if (tn_len < 63) memcpy(type_buf, src + tn_start, tn_len);
+                                if (vn_len < 63) memcpy(var_buf, src + vn_start, vn_len);
+                                const char *slab = get_slab_name(type_buf);
 
-                                /* truncate output to before the type declaration */
-                                /* find how many chars to remove from out_buf */
-                                int remove_len = (int)(src + i - (src + decl_start));
-                                if (out_len >= remove_len) {
-                                    out_len -= remove_len;
-                                }
-                            }
+                                /* emit newline if we're not at start */
+                                if (i > 0 && src[i] == '\n') out_str("\n");
 
-                            /* emit the Slab alloc pattern */
-                            out_str("?Handle(");
-                            out_str(type_buf);
-                            out_str(") ");
-                            out_str(var_name);
-                            out_str("_maybe = ");
-                            out_str(slab);
-                            out_str(".alloc();\n");
-                            /* find indentation */
-                            int indent_pos = decl_start - 1;
-                            while (indent_pos > 0 && src[indent_pos] != '\n') indent_pos--;
-                            if (indent_pos > 0) indent_pos++;
-                            int indent_len = 0;
-                            while (indent_pos + indent_len < src_len &&
-                                   (src[indent_pos + indent_len] == ' ' || src[indent_pos + indent_len] == '\t'))
-                                indent_len++;
-                            out_write(src + indent_pos, indent_len);
-                            out_str("Handle(");
-                            out_str(type_buf);
-                            out_str(") ");
-                            out_str(var_name);
-                            out_str("_h = ");
-                            out_str(var_name);
-                            out_str("_maybe orelse return");
+                                /* emit indentation */
+                                out_write(src + line_start, ls - line_start);
 
-                            /* skip past the closing paren and semicolon */
-                            i = outer_close + 1;
-                            /* skip ; */
-                            while (i < src_len && (src[i] == ' ' || src[i] == '\t')) i++;
-                            if (i < src_len && src[i] == ';') i++;
-                            /* skip newline */
-                            if (i < src_len && src[i] == '\n') i++;
-                            /* skip redundant null check: if (!var) return ...; */
-                            {
-                                int peek = i;
-                                while (peek < src_len && (src[peek] == ' ' || src[peek] == '\t')) peek++;
-                                if (starts_with(src, peek, src_len, "if (!")) {
-                                    int check_start = peek + 5;
-                                    /* check if the var name matches */
-                                    if (strncmp(src + check_start, var_name, strlen(var_name)) == 0) {
-                                        /* skip the entire null check line */
+                                /* emit Handle alloc pattern */
+                                out_str("?Handle(");
+                                out_str(type_buf);
+                                out_str(") ");
+                                out_str(var_buf);
+                                out_str("_maybe = ");
+                                out_str(slab);
+                                out_str(".alloc();\n");
+                                out_write(src + line_start, ls - line_start);
+                                out_str("Handle(");
+                                out_str(type_buf);
+                                out_str(") ");
+                                out_str(var_buf);
+                                out_str("_h = ");
+                                out_str(var_buf);
+                                out_str("_maybe orelse return;");
+
+                                /* skip to end of this line */
+                                i = line_start;
+                                while (i < src_len && src[i] != '\n') i++;
+                                /* skip the next line if it's a null check: if (!var) ... */
+                                if (i < src_len && src[i] == '\n') {
+                                    int peek = i + 1;
+                                    while (peek < src_len && (src[peek] == ' ' || src[peek] == '\t')) peek++;
+                                    if (starts_with(src, peek, src_len, "if (!") &&
+                                        strncmp(src + peek + 5, var_buf, strlen(var_buf)) == 0) {
+                                        /* skip null check line */
+                                        i++;
                                         while (i < src_len && src[i] != '\n') i++;
-                                        if (i < src_len) i++; /* skip newline */
                                     }
                                 }
+                                upgrades++;
+                                continue;
                             }
-                            /* emit the semicolon for our orelse return */
-                            out_str(";\n");
-                            upgrades++;
-                            continue;
                         }
                     }
                 }

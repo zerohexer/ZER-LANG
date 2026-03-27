@@ -266,7 +266,10 @@ diff zerc zerc2                  ← identical = v1.0 proven
 
 **Migration to `.zer`-primary happens when:** ZER has enough public code (GitHub repos, blog posts, Stack Overflow) that LLMs learn the syntax natively. Until then, C is the development language.
 
-**Roadmap:** v0.2 (bounds check optimization, stdlib) → v0.3 (better errors/diagnostics) → v1.0 (self-hosting proof)
+**Roadmap:**
+- **v0.2:** bounds check optimization, stdlib (str, io, fmt), bundled GCC distribution
+- **v0.3:** zer-convert tool (C→ZER automated migration), better error messages/diagnostics
+- **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
 ### Structural Refactors Completed (RF1-RF7)
 

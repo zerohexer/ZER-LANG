@@ -247,8 +247,6 @@ static const TypeMap type_map[] = {
     { "float",    5, "f32" },
     { "double",   6, "f64" },
     { "char",     4, "u8" },
-    { "int",      3, "i32" },
-    { "unsigned",  8, "u32" },  /* standalone 'unsigned' = u32 */
     { "void",     4, "void" },
     { "bool",     4, "bool" },
     { "_Bool",    5, "bool" },
@@ -257,6 +255,25 @@ static const TypeMap type_map[] = {
     { "false",    5, "false" },
     { NULL, 0, NULL }
 };
+
+/* two-token type combos that must be checked BEFORE single-token map */
+typedef struct { const char *first; const char *second; const char *zer; } TypeCombo;
+static const TypeCombo type_combos[] = {
+    { "unsigned", "int",   "u32" },
+    { "unsigned", "char",  "u8" },
+    { "unsigned", "short", "u16" },
+    { "unsigned", "long",  "u64" },
+    { "signed",   "int",   "i32" },
+    { "signed",   "char",  "i8" },
+    { "signed",   "short", "i16" },
+    { "signed",   "long",  "i64" },
+    { "long",     "long",  "i64" },
+    { "long",     "int",   "i64" },
+    { "short",    "int",   "i16" },
+    { NULL, NULL, NULL }
+};
+
+/* is_c_type and next_is_star defined after token buffer */
 
 static bool tok_eq(CToken *t, const char *s) {
     int len = (int)strlen(s);
@@ -349,8 +366,8 @@ static void transform(void) {
                     /* #include <foo.h> → cinclude "foo.h"; */
                     emit_str("cinclude ");
                     j++;
-                    /* skip whitespace */
-                    while (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    /* skip whitespace between 'include' and the path */
+                    while (j < token_count && (tokens[j].type == CT_WHITESPACE || tokens[j].type == CT_NEWLINE)) j++;
                     if (j < token_count && tokens[j].type == CT_STRING) {
                         emit_tok(&tokens[j]);
                         j++;
@@ -444,6 +461,60 @@ static void transform(void) {
 
         /* ---- Type mapping: int → i32, uint8_t → u8, etc. ---- */
         if (t->type == CT_IDENT) {
+
+            /* Two-token type combos: unsigned int → u32, etc.
+             * Must check BEFORE single-token map to avoid double-mapping. */
+            {
+                bool found_combo = false;
+                for (int ci = 0; type_combos[ci].first; ci++) {
+                    if (tok_eq(t, type_combos[ci].first)) {
+                        int j = skip_spaces(i + 1);
+                        if (j < token_count && tokens[j].type == CT_IDENT &&
+                            tok_eq(&tokens[j], type_combos[ci].second)) {
+                            emit_str(type_combos[ci].zer);
+                            i = j + 1; /* skip both tokens */
+                            found_combo = true;
+                            break;
+                        }
+                    }
+                }
+                if (found_combo) continue;
+            }
+
+            /* standalone 'unsigned' without type after it → u32 */
+            if (tok_eq(t, "unsigned")) {
+                int j = skip_spaces(i + 1);
+                /* if next meaningful token is NOT a type keyword, emit u32 */
+                if (j >= token_count || tokens[j].type != CT_IDENT ||
+                    (!tok_eq(&tokens[j], "int") && !tok_eq(&tokens[j], "char") &&
+                     !tok_eq(&tokens[j], "short") && !tok_eq(&tokens[j], "long"))) {
+                    emit_str("u32");
+                    i++;
+                    continue;
+                }
+            }
+
+            /* standalone 'int' (not part of a combo already handled) → i32 */
+            if (tok_eq(t, "int")) {
+                emit_str("i32");
+                i++;
+                continue;
+            }
+
+            /* standalone 'long' (not part of combo) → i64 */
+            if (tok_eq(t, "long")) {
+                emit_str("i64");
+                i++;
+                continue;
+            }
+
+            /* standalone 'short' (not part of combo) → i16 */
+            if (tok_eq(t, "short")) {
+                emit_str("i16");
+                i++;
+                continue;
+            }
+
             const char *mapped = map_type(t);
 
             /* NULL → null */
@@ -453,9 +524,9 @@ static void transform(void) {
                 continue;
             }
 
-            /* struct keyword in usage (not declaration) — drop it */
+            /* struct keyword in usage (not declaration) — drop it + trailing whitespace */
             if (tok_eq(t, "struct")) {
-                int j = skip_ws(i + 1);
+                int j = skip_spaces(i + 1);
                 if (j < token_count && tokens[j].type == CT_IDENT) {
                     /* check if next-next is { → keep 'struct' (declaration) */
                     int k = skip_ws(j + 1);
@@ -465,8 +536,8 @@ static void transform(void) {
                         i++;
                         continue;
                     }
-                    /* struct usage: struct Node → Node */
-                    i++; /* skip 'struct' */
+                    /* struct usage: struct<ws>Node → Node (skip struct + whitespace) */
+                    i = j; /* jump to the name, skip struct + spaces */
                     continue;
                 }
             }
@@ -478,39 +549,37 @@ static void transform(void) {
                 continue;
             }
 
-            /* malloc(sizeof(T)) → zer_malloc_bytes(@size(T)) */
-            if (tok_eq(t, "malloc")) {
-                emit_str("zer_malloc_bytes");
-                needs_compat = true;
-                i++;
-                continue;
-            }
-            if (tok_eq(t, "calloc")) {
-                emit_str("zer_calloc_bytes");
-                needs_compat = true;
-                i++;
-                continue;
-            }
-            if (tok_eq(t, "realloc")) {
-                emit_str("zer_realloc_bytes");
-                needs_compat = true;
-                i++;
-                continue;
-            }
-            if (tok_eq(t, "free")) {
-                emit_str("zer_free");
-                needs_compat = true;
-                i++;
-                continue;
-            }
+            /* malloc/calloc/realloc/free → compat wrappers */
+            if (tok_eq(t, "malloc")) { emit_str("zer_malloc_bytes"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "calloc")) { emit_str("zer_calloc_bytes"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "realloc")) { emit_str("zer_realloc_bytes"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "free")) { emit_str("zer_free"); needs_compat = true; i++; continue; }
 
-            /* strlen, strcmp, memcmp, memcpy, memset */
+            /* string/memory functions → compat wrappers */
             if (tok_eq(t, "strlen")) { emit_str("zer_strlen"); needs_compat = true; i++; continue; }
             if (tok_eq(t, "strcmp")) { emit_str("zer_strcmp"); needs_compat = true; i++; continue; }
             if (tok_eq(t, "strncmp")) { emit_str("zer_strncmp"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "strdup")) { emit_str("zer_strdup"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "strndup")) { emit_str("zer_strndup"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "strcpy")) { emit_str("zer_strcpy"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "strncpy")) { emit_str("zer_strncpy"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "strcat")) { emit_str("zer_strcat"); needs_compat = true; i++; continue; }
             if (tok_eq(t, "memcmp")) { emit_str("zer_memcmp"); needs_compat = true; i++; continue; }
             if (tok_eq(t, "memcpy")) { emit_str("zer_memcpy"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "memmove")) { emit_str("zer_memmove"); needs_compat = true; i++; continue; }
             if (tok_eq(t, "memset")) { emit_str("zer_memset"); needs_compat = true; i++; continue; }
+
+            /* I/O functions — keep as cinclude calls but tag them */
+            if (tok_eq(t, "printf")) { emit_str("zer_printf"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "fprintf")) { emit_str("zer_fprintf"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "sprintf")) { emit_str("zer_sprintf"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "snprintf")) { emit_str("zer_snprintf"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "puts")) { emit_str("zer_puts"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "fputs")) { emit_str("zer_fputs"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "fopen")) { emit_str("zer_fopen"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "fclose")) { emit_str("zer_fclose"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "fread")) { emit_str("zer_fread"); needs_compat = true; i++; continue; }
+            if (tok_eq(t, "fwrite")) { emit_str("zer_fwrite"); needs_compat = true; i++; continue; }
 
             /* exit() → zer_exit() */
             if (tok_eq(t, "exit")) { emit_str("zer_exit"); needs_compat = true; i++; continue; }
@@ -519,6 +588,104 @@ static void transform(void) {
             if (mapped) {
                 emit_str(mapped);
                 i++;
+                continue;
+            }
+        }
+
+        /* ---- C-style cast: (int)x → @truncate(i32, x), (Node *)p → @ptrcast(*Node, p) ---- */
+        if (t->type == CT_LPAREN) {
+            /* look ahead: ( TYPE ) or ( TYPE * ) or ( struct TYPE * ) */
+            int j = skip_spaces(i + 1);
+            bool is_cast = false;
+            bool is_ptr_cast = false;
+            const char *cast_type = NULL;
+            char cast_buf[128];
+            int cast_end = j;
+
+            /* check for (struct Name *) pattern */
+            if (j < token_count && tokens[j].type == CT_IDENT && tok_eq(&tokens[j], "struct")) {
+                int k = skip_spaces(j + 1);
+                if (k < token_count && tokens[k].type == CT_IDENT) {
+                    int m = skip_spaces(k + 1);
+                    if (m < token_count && tokens[m].type == CT_STAR) {
+                        int n = skip_spaces(m + 1);
+                        if (n < token_count && tokens[n].type == CT_RPAREN) {
+                            snprintf(cast_buf, sizeof(cast_buf), "*%.*s", tokens[k].len, tokens[k].start);
+                            cast_type = cast_buf;
+                            is_ptr_cast = true;
+                            is_cast = true;
+                            cast_end = n + 1;
+                        }
+                    }
+                }
+            }
+            /* check for (type *) pattern */
+            if (!is_cast && j < token_count && tokens[j].type == CT_IDENT) {
+                const char *mapped_cast = map_type(&tokens[j]);
+                int k = skip_spaces(j + 1);
+                if (k < token_count && tokens[k].type == CT_STAR) {
+                    int m = skip_spaces(k + 1);
+                    if (m < token_count && tokens[m].type == CT_RPAREN) {
+                        const char *tname = mapped_cast ? mapped_cast : "";
+                        if (!mapped_cast) {
+                            snprintf(cast_buf, sizeof(cast_buf), "*%.*s", tokens[j].len, tokens[j].start);
+                        } else {
+                            snprintf(cast_buf, sizeof(cast_buf), "*%s", tname);
+                        }
+                        cast_type = cast_buf;
+                        is_ptr_cast = true;
+                        is_cast = true;
+                        cast_end = m + 1;
+                    }
+                }
+                /* check for (type) pattern — value cast */
+                if (!is_cast && mapped_cast) {
+                    if (k < token_count && tokens[k].type == CT_RPAREN) {
+                        cast_type = mapped_cast;
+                        is_cast = true;
+                        cast_end = k + 1;
+                    }
+                }
+            }
+
+            if (is_cast && cast_type) {
+                if (is_ptr_cast) {
+                    emit_str("@ptrcast(");
+                    emit_str(cast_type);
+                    emit_str(", ");
+                } else {
+                    emit_str("@truncate(");
+                    emit_str(cast_type);
+                    emit_str(", ");
+                }
+                /* emit the expression after the cast — up to the next operator/semicolon/comma/rparen.
+                 * For simple cases: (int)x → @truncate(i32, x), just emit the next token + close paren.
+                 * For complex cases: (int)(a + b) → @truncate(i32, (a + b))
+                 * Strategy: if next is (, emit matching parens. Otherwise emit one token. */
+                i = cast_end;
+                if (i < token_count && tokens[i].type == CT_LPAREN) {
+                    /* emit everything up to matching ) */
+                    int depth = 0;
+                    while (i < token_count) {
+                        if (tokens[i].type == CT_LPAREN) depth++;
+                        if (tokens[i].type == CT_RPAREN) {
+                            depth--;
+                            if (depth == 0) { emit_tok(&tokens[i]); i++; break; }
+                        }
+                        emit_tok(&tokens[i]);
+                        i++;
+                    }
+                } else {
+                    /* single token or ident */
+                    while (i < token_count && (tokens[i].type == CT_IDENT ||
+                           tokens[i].type == CT_NUMBER || tokens[i].type == CT_STAR ||
+                           tokens[i].type == CT_DOT || tokens[i].type == CT_ARROW)) {
+                        if (tokens[i].type == CT_ARROW) emit_str(".");
+                        else emit_tok(&tokens[i]);
+                        i++;
+                    }
+                }
+                emit_str(")");
                 continue;
             }
         }

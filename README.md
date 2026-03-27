@@ -11,7 +11,7 @@ Requires GCC (MinGW on Windows, gcc on Linux/Mac):
 ```bash
 make           # build zerc compiler
 make zer-lsp   # build language server
-make check     # run all 1018 tests + 491 fuzz
+make check     # run all 1766 tests + 491 fuzz
 make release   # build release binaries in release/
 ```
 
@@ -118,12 +118,19 @@ if (uart_read(buf)) |n| {
 ### Memory Builtins — No Heap Required
 
 ```c
+// Fixed-count pool — compile-time bound (embedded, real-time)
 Pool(Task, 8) tasks;                     // 8 slots in static RAM
 Handle(Task) h = tasks.alloc() orelse return;
 tasks.get(h).priority = 5;
 tasks.free(h);
 // use-after-free caught at compile time (ZER-CHECK)
 // or runtime trap (generation counter)
+
+// Dynamic slab — grows on demand (x86_64, servers)
+Slab(Connection) conns;                  // no limit, pages allocated as needed
+Handle(Connection) c = conns.alloc() orelse return;
+conns.get(c).fd = new_fd;
+conns.free(c);                           // same safety as Pool
 
 Ring(u8, 256) uart_rx;                   // circular buffer
 uart_rx.push(byte);
@@ -192,23 +199,19 @@ Stress-tested against real production code: MODBUS CRC, CAN bus, USB state machi
 
 ```
 Lexer:                      218 tests
-Parser:                     163 tests
-Type Checker:               327 tests
+Parser:                     168 tests
+Type Checker:               474 tests
 ZER-CHECK:                   24 tests
-C Emitter:                  160 end-to-end tests
-Module Imports:               6 patterns
+C Emitter:                  213 end-to-end tests
+Module Imports:              10 patterns
 Firmware Patterns (3 rounds): 102 end-to-end tests
 Production Firmware:          14 end-to-end tests
 Parser Fuzz:                 491 adversarial inputs
 ──────────────────────────────────────────────────
-Total:                     1018 tests + 491 fuzz, all passing
+Total:                     1766 tests + 491 fuzz, all passing
 ```
 
-All 227 end-to-end tests verified at GCC `-O2` — no optimizer-exposed issues.
-
-Additionally tested outside the main suite: 11 OS/kernel programs (hash map, scheduler, memory pool, event queue, TCP state machine, linked list, page allocator, VFS, IPC pipe, network stack, block cache), 5 multi-module programs (cross-module enums, structs, optionals, 5-module diamond imports), and 3 stress tests (5-level nested structs, all integer widths, union pipelines).
-
-127 compiler bugs found and fixed across 19 rounds of testing.
+313 compiler bugs found and fixed across 30+ rounds of testing.
 
 ## Editor Support
 

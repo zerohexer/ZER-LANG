@@ -28,9 +28,10 @@ u8[256] buf;             fixed array — NOTE: size AFTER type, BEFORE name
 
 ### Builtin Container Types
 ```
-Pool(Task, 8) tasks;     fixed-slot allocator — ALWAYS global, E2E works
-Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global, E2E works
-Arena scratch;            bump allocator — fully implemented (over, alloc, alloc_slice, reset)
+Pool(Task, 8) tasks;     fixed-slot allocator — compile-time count, ALWAYS global
+Slab(Task) tasks;         dynamic slab allocator — grows on demand, ALWAYS global
+Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global
+Arena scratch;            bump allocator — (over, alloc, alloc_slice, reset)
 Handle(Task) h;          index + generation counter, not a pointer
 ```
 
@@ -97,7 +98,7 @@ Handle(Task) h;          index + generation counter, not a pointer
 
 8. **No `++`/`--` operators.** Use `+= 1` / `-= 1`.
 
-9. **No `malloc`/`free`.** Use Pool, Ring, or Arena builtins.
+9. **No `malloc`/`free`.** Use Pool, Slab, Ring, or Arena builtins.
 
 10. **String literals are `[]u8` (slices), not `char*`.**
     ```
@@ -177,7 +178,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - No classes, inheritance, templates, generics
 - No exceptions, try/catch
 - No garbage collector
-- No heap/malloc/free (use Pool/Ring/Arena)
+- No heap/malloc/free (use Pool/Slab/Ring/Arena)
 - No implicit narrowing or sign conversion
 - No undefined behavior (overflow wraps, shift by >=width = 0)
 - No `++`/`--`, no comma operator, no `goto`
@@ -207,6 +208,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Enums, unions, switch | Done | Done |
 | Function pointers | Done | Done |
 | Pool + Handle | Done | Done |
+| Slab (dynamic growable pool) | Done | Done |
 | Ring | Done | Done |
 | Arena (alloc, alloc_slice, over, reset) | Done | Done |
 | Modules/imports | Done | Done (multi-file) |
@@ -275,12 +277,20 @@ These changed fundamental patterns. Fresh sessions MUST know:
 - `emit_type_and_name` handles name-inside-parens for `TYPE_OPTIONAL + TYPE_DISTINCT(TYPE_FUNC_PTR)`.
 
 **Builtin method emission pattern (emitter.c ~line 350-520):**
-1. Check if callee is `NODE_FIELD` with object of type Pool/Ring/Arena
+1. Check if callee is `NODE_FIELD` with object of type Pool/Ring/Slab/Arena
 2. Get object name and method name
 3. Emit inline C code or call to runtime helper
 4. Set `handled = true` to skip normal call emission
 
-**Adding new builtin methods:** Copy the Pool/Ring/Arena pattern. Need: checker NODE_CALL handler (return type), emitter interception (C codegen), and E2E test.
+**Adding new builtin methods:** Copy the Pool/Ring/Slab/Arena pattern. Need: checker NODE_CALL handler (return type), emitter interception (C codegen), and E2E test.
+
+**Slab(T) — dynamic growable pool:**
+- Same Handle(T) API as Pool: `alloc() → ?Handle(T)`, `get(h) → *T`, `free(h)`
+- Emitter: `_zer_slab` struct with `slot_size`, pages grow via `calloc` on demand (64 slots/page)
+- Runtime: `_zer_slab_alloc()` scans for free slot, grows if full; `_zer_slab_get()` checks generation; `_zer_slab_free()` marks unused + bumps generation
+- Global var: `_zer_slab name = { .slot_size = sizeof(T) };`
+- Method interception passes `&name` to runtime helpers (unlike Pool which passes individual arrays)
+- Same restrictions as Pool: must be global/static, not copyable, not in struct fields, get() is non-storable
 
 ### Critical Patterns That Cause Bugs — READ BEFORE MODIFYING
 

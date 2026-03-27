@@ -31,7 +31,7 @@
 19. [Defer — Cleanup Without Goto](#19-defer--cleanup-without-goto)
 20. [C Interop](#20-c-interop)
 21. [Bounds Check — Safety vs Optimization](#21-bounds-check--safety-vs-optimization)
-22. [Pool, Ring, Arena — Builtin Types](#22-pool-ring-arena--builtin-types)
+22. [Pool, Slab, Ring, Arena — Builtin Types](#22-pool-slab-ring-arena--builtin-types)
 23. [What ZER Does NOT Have](#23-what-zer-does-not-have)
 24. [Complete Keyword Reference](#24-complete-keyword-reference)
 25. [Compiler Architecture](#25-compiler-architecture)
@@ -96,7 +96,7 @@ A C developer can READ ZER code in 5 minutes — type-first declarations, braces
 The compiler does not detect bugs and ask the developer to rewrite. The language design makes bugs impossible to write in the first place. Arrays always carry length. Variables are always initialized. Overflow is always defined. The developer writes normal code — it's already safe.
 
 **Principle 3: Freestanding first.**
-ZER works on bare metal with no OS, no heap, no runtime. Stack and static memory only. Dynamic allocation (Pool, Ring, Arena) is opt-in via builtin types that use static memory the developer declares. No malloc. No free. No garbage collector.
+ZER works on bare metal with no OS, no heap, no runtime. Stack and static memory only. Dynamic allocation (Pool, Slab, Ring, Arena) is opt-in via builtin types. Pool/Ring use compile-time-sized static memory. Slab grows dynamically via page allocation. No malloc. No free. No garbage collector.
 
 **Principle 4: No LLVM. Own compiler.**
 The ZER compiler is written in C. It is a single self-contained binary. No external dependencies. Targets: ARM Cortex-M (Thumb-2), RISC-V (RV32IM), x86_64, AVR. Initial strategy: emit C, let GCC handle backends. Later: own native backends.
@@ -218,7 +218,8 @@ u8[256] buf;                  fixed array — size known at compile time
 ### Builtin Container Types
 
 ```
-Pool(Task, 8) tasks;          fixed-slot allocator, 8 Task slots
+Pool(Task, 8) tasks;          fixed-slot allocator, 8 Task slots (compile-time bound)
+Slab(Task) tasks;             dynamic slab allocator, grows on demand (no bound)
 Ring(u8, 256) rx_buf;         circular buffer, 256 bytes
 Arena scratch;                bump allocator over developer-owned memory
 Handle(Task) h;               index + generation counter, not a pointer
@@ -1584,11 +1585,11 @@ waits 87 microseconds per UART byte.
 
 ---
 
-## 22. Pool, Ring, Arena — Builtin Types
+## 22. Pool, Slab, Ring, Arena — Builtin Types
 
-These are PART OF THE LANGUAGE. Not a library. Not an import. Builtin. They compile to plain instructions, use static memory the developer declares, and work freestanding on any chip. No malloc. No heap. No OS.
+These are PART OF THE LANGUAGE. Not a library. Not an import. Builtin. They compile to plain instructions and work freestanding. No malloc. No heap. No garbage collector.
 
-Method-style calls on builtins (e.g., `tasks.alloc()`, `rx.push()`) are compiler-generated — not UFCS. The compiler has special knowledge of Pool, Ring, Arena, and Handle operations. These are not free functions that UFCS discovers; they are intrinsic operations the compiler emits directly. UFCS applies only to user-defined functions.
+Method-style calls on builtins (e.g., `tasks.alloc()`, `rx.push()`) are compiler-generated — not UFCS. The compiler has special knowledge of Pool, Slab, Ring, Arena, and Handle operations. These are not free functions that UFCS discovers; they are intrinsic operations the compiler emits directly.
 
 ### Pool(T, N) — Fixed-Slot Allocator
 
@@ -1824,6 +1825,36 @@ pool_alloc:
 
 // ~15 instructions. No OS. No heap. Runs on $2 chip.
 ```
+
+### Slab(T) — Dynamic Growable Pool
+
+```
+// No compile-time count — grows on demand
+Slab(Connection) conns;
+
+// Same Handle API as Pool
+Handle(Connection) h = conns.alloc() orelse return;
+conns.get(h).fd = new_fd;
+conns.free(h);
+
+// Slab vs Pool:
+//   Pool(T, 8)  — 8 slots, compile-time, static RAM, embedded
+//   Slab(T)     — unlimited, grows by allocating pages, x86_64/servers
+//
+// Same safety: generation counters, use-after-free detection,
+// non-storable get() results, ZER-CHECK handle tracking.
+//
+// Slab allocates pages of 64 slots each. When full, a new page
+// is allocated. Handle encoding: (gen << 16) | flat_index.
+// Max 65,536 total slots (1024 pages).
+```
+
+Rules:
+- Must be `static` or global — not on the stack
+- Cannot be assigned (not copyable) — same as Pool
+- Cannot be a struct field — same as Pool
+- `get()` returns non-storable `*T` — use inline
+- `alloc()` returns `?Handle(T)` — handle OOM with `orelse`
 
 ### Ring(T, N) — Circular Buffer
 

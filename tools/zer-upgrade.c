@@ -897,6 +897,152 @@ static void add_str_import_if_needed(void) {
     out_len += ilen;
 }
 
+/* rewrite function signatures: SlabType *param → Handle(SlabType) param_h
+ * and SlabType *func_name( → ?Handle(SlabType) func_name( */
+static void rewrite_signatures(void) {
+    if (slab_type_count == 0) return;
+    /* rewrite function signatures containing Slab-type params */
+
+    /* work on a copy — build new buffer with replacements */
+    char *new_buf = (char *)malloc(out_cap * 2);
+    int new_len = 0;
+    int new_cap = out_cap * 2;
+
+    #define NB_WRITE(s, l) do { \
+        while (new_len + (l) >= new_cap) { new_cap *= 2; new_buf = (char *)realloc(new_buf, new_cap); } \
+        memcpy(new_buf + new_len, (s), (l)); new_len += (l); \
+    } while(0)
+    #define NB_STR(s) NB_WRITE(s, (int)strlen(s))
+
+    int i = 0;
+    while (i < out_len) {
+        /* find start of each line */
+        int line_start = i;
+        int line_end = i;
+        while (line_end < out_len && out_buf[line_end] != '\n') line_end++;
+
+        /* check if this line is a function declaration:
+         * must contain ( and end with ) { or have , for multi-line */
+        bool has_paren = false;
+        for (int j = line_start; j < line_end; j++) {
+            if (out_buf[j] == '(') { has_paren = true; break; }
+        }
+
+        bool is_func_decl = false;
+        if (has_paren) {
+            /* check if line ends with { or ) — skip trailing whitespace and \r */
+            for (int j = line_end - 1; j >= line_start; j--) {
+                if (out_buf[j] == '{') { is_func_decl = true; break; }
+                if (out_buf[j] == ')') { is_func_decl = true; break; }
+                if (out_buf[j] != ' ' && out_buf[j] != '\t' && out_buf[j] != '\r') break;
+            }
+        }
+
+        if (is_func_decl) {
+            /* process this line character by character, replacing Slab type patterns */
+            int j = line_start;
+
+            /* check for return type: SlabType *func_name( → ?Handle(SlabType) func_name( */
+            int ls = j;
+            while (ls < line_end && (out_buf[ls] == ' ' || out_buf[ls] == '\t')) ls++;
+            /* skip 'static' if present */
+            bool has_static = false;
+            if (ls + 7 < line_end && memcmp(out_buf + ls, "static ", 7) == 0) {
+                has_static = true;
+                NB_WRITE(out_buf + j, ls + 7 - j);
+                j = ls + 7;
+                ls = j;
+            }
+
+            /* check if return type is SlabType * */
+            int rt_start = ls;
+            while (ls < line_end && (isalnum(out_buf[ls]) || out_buf[ls] == '_')) ls++;
+            int rt_len = ls - rt_start;
+            if (rt_len > 0) {
+                char rt_name[64] = {0};
+                if (rt_len < 63) memcpy(rt_name, out_buf + rt_start, rt_len);
+                int rs = ls;
+                while (rs < line_end && out_buf[rs] == ' ') rs++;
+                if (rs < line_end && out_buf[rs] == '*' && is_slab_type(rt_name)) {
+                    /* SlabType *func_name → ?Handle(SlabType) func_name */
+                    NB_WRITE(out_buf + j, rt_start - j); /* emit indent */
+                    NB_STR("?Handle(");
+                    NB_STR(rt_name);
+                    NB_STR(") ");
+                    j = rs + 1; /* skip past * */
+                    while (j < line_end && out_buf[j] == ' ') j++; /* skip spaces */
+                }
+            }
+
+            /* now process the rest, looking for SlabType *param inside parens */
+            bool in_params = false;
+            while (j < line_end) {
+                if (out_buf[j] == '(') in_params = true;
+                if (out_buf[j] == ')') in_params = false;
+
+                if (in_params && (isalpha(out_buf[j]) || out_buf[j] == '_')) {
+                    /* read identifier */
+                    int id_start = j;
+                    while (j < line_end && (isalnum(out_buf[j]) || out_buf[j] == '_')) j++;
+                    int id_len = j - id_start;
+                    char id_name[64] = {0};
+                    if (id_len < 63) memcpy(id_name, out_buf + id_start, id_len);
+
+                    /* skip spaces */
+                    int after = j;
+                    while (after < line_end && out_buf[after] == ' ') after++;
+
+                    /* check: is this SlabType * param_name ? */
+                    if (after < line_end && out_buf[after] == '*' && is_slab_type(id_name)) {
+                        after++; /* skip * */
+                        while (after < line_end && out_buf[after] == ' ') after++;
+                        /* read param name */
+                        int pn_start = after;
+                        while (after < line_end && (isalnum(out_buf[after]) || out_buf[after] == '_')) after++;
+                        int pn_len = after - pn_start;
+
+                        if (pn_len > 0) {
+                            /* emit: Handle(Type) name_h */
+                            NB_STR("Handle(");
+                            NB_STR(id_name);
+                            NB_STR(") ");
+                            NB_WRITE(out_buf + pn_start, pn_len);
+                            NB_STR("_h");
+                            j = after;
+                            continue;
+                        }
+                    }
+
+                    /* not a slab type — emit as-is */
+                    NB_WRITE(out_buf + id_start, id_len);
+                    continue;
+                }
+
+                NB_WRITE(out_buf + j, 1);
+                j++;
+            }
+        } else {
+            /* not a function declaration — copy line as-is */
+            NB_WRITE(out_buf + line_start, line_end - line_start);
+        }
+
+        /* copy newline */
+        if (line_end < out_len) {
+            NB_WRITE(out_buf + line_end, 1);
+        }
+        i = line_end + 1;
+    }
+
+    /* swap buffers */
+    free(out_buf);
+    out_buf = new_buf;
+    out_len = new_len;
+    out_cap = new_cap;
+
+    #undef NB_WRITE
+    #undef NB_STR
+}
+
 /* ================================================================
  * Main
  * ================================================================ */
@@ -933,6 +1079,7 @@ int main(int argc, char **argv) {
 
     /* post-processing */
     add_slab_declarations();
+    rewrite_signatures();
     remove_compat_import_if_clean();
     add_str_import_if_needed();
 

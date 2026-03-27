@@ -140,6 +140,9 @@ static TokenType check_keyword(const char *word, size_t word_len) {
     case 'R':
         if (word_len == 4 && memcmp(word+1, "ing", 3) == 0) return TOK_RING;
         break;
+    case 'S':
+        if (word_len == 4 && memcmp(word+1, "lab", 3) == 0) return TOK_SLAB;
+        break;
     case 'a':
         if (word_len == 2 && word[1] == 's') return TOK_AS;
         if (word_len == 3 && memcmp(word+1, "sm", 2) == 0) return TOK_ASM;
@@ -552,6 +555,7 @@ const char *token_type_name(TokenType type) {
     case TOK_RING: return "Ring";
     case TOK_ARENA: return "Arena";
     case TOK_HANDLE: return "Handle";
+    case TOK_SLAB: return "Slab";
     case TOK_DEFER: return "defer";
     case TOK_IMPORT: return "import";
     case TOK_CINCLUDE: return "cinclude";

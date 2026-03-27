@@ -315,6 +315,10 @@ static void emit_type(Emitter *e, Type *t) {
         emit(e, "_zer_arena");
         break;
 
+    case TYPE_SLAB:
+        emit(e, "_zer_slab");
+        break;
+
     case TYPE_POOL:
         emit(e, "struct _zer_pool_");
         EMIT_STRUCT_NAME(e, t->pool.elem);
@@ -972,6 +976,36 @@ static void emit_expr(Emitter *e, Node *node) {
                              rlen, rname, (unsigned long long)obj_type->ring.count, tmp, tmp,
                              tmp,
                              tmp);
+                        handled = true;
+                    }
+                }
+
+                /* Slab methods */
+                if (!handled && obj_type && obj_type->kind == TYPE_SLAB) {
+                    const char *sname = obj_node->ident.name;
+                    int slen = (int)obj_node->ident.name_len;
+
+                    if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                        int tmp = e->temp_count++;
+                        emit(e, "({uint8_t _zer_aok%d = 0; uint32_t _zer_ah%d = "
+                             "_zer_slab_alloc(&%.*s, &_zer_aok%d); "
+                             "(_zer_opt_u32){_zer_ah%d, _zer_aok%d}; })",
+                             tmp, tmp,
+                             slen, sname, tmp, tmp, tmp);
+                        handled = true;
+                    } else if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
+                        emit(e, "((");
+                        emit_type(e, obj_type->slab.elem);
+                        emit(e, "*)_zer_slab_get(&%.*s, ", slen, sname);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, "))");
+                        handled = true;
+                    } else if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                        emit(e, "_zer_slab_free(&%.*s, ", slen, sname);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, ")");
                         handled = true;
                     }
                 }
@@ -2772,6 +2806,15 @@ static void emit_global_var(Emitter *e, Node *node) {
         return;
     }
 
+    /* Slab(T) → _zer_slab with slot_size */
+    if (type && type->kind == TYPE_SLAB) {
+        emit(e, "_zer_slab %.*s = { .slot_size = sizeof(",
+             (int)node->var_decl.name_len, node->var_decl.name);
+        emit_type(e, type->slab.elem);
+        emit(e, ") };\n\n");
+        return;
+    }
+
     if (node->var_decl.is_static) emit(e, "static ");
     /* volatile on non-pointer scalars (pointers handled above) */
     if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
@@ -3153,6 +3196,70 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    a->offset = off + size;\n");
     emit(e, "    memset(a->buf + off, 0, size);\n");
     emit(e, "    return a->buf + off;\n");
+    emit(e, "}\n\n");
+
+    /* ZER runtime: Slab dynamic allocator */
+    emit(e, "/* ZER Slab runtime — dynamic growable pool via mmap/malloc */\n");
+    emit(e, "#define _ZER_SLAB_PAGE_SLOTS 64\n");
+    emit(e, "typedef struct {\n");
+    emit(e, "    char **pages;         /* array of page pointers */\n");
+    emit(e, "    uint16_t *gen;        /* flat generation array */\n");
+    emit(e, "    uint8_t *used;        /* flat used-slot array */\n");
+    emit(e, "    uint32_t page_count;\n");
+    emit(e, "    uint32_t page_cap;\n");
+    emit(e, "    uint32_t total_slots;\n");
+    emit(e, "    size_t slot_size;\n");
+    emit(e, "} _zer_slab;\n\n");
+
+    emit(e, "static inline uint32_t _zer_slab_alloc(_zer_slab *s, uint8_t *ok) {\n");
+    emit(e, "    /* scan for free slot */\n");
+    emit(e, "    for (uint32_t i = 0; i < s->total_slots; i++) {\n");
+    emit(e, "        if (!s->used[i]) {\n");
+    emit(e, "            s->used[i] = 1;\n");
+    emit(e, "            *ok = 1;\n");
+    emit(e, "            return (uint32_t)((s->gen[i] << 16) | i);\n");
+    emit(e, "        }\n");
+    emit(e, "    }\n");
+    emit(e, "    /* grow: add a new page */\n");
+    emit(e, "    if (s->page_count >= s->page_cap) {\n");
+    emit(e, "        uint32_t nc = s->page_cap < 4 ? 4 : s->page_cap * 2;\n");
+    emit(e, "        char **np = (char**)calloc(nc, sizeof(char*));\n");
+    emit(e, "        uint16_t *ng = (uint16_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint16_t));\n");
+    emit(e, "        uint8_t *nu = (uint8_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint8_t));\n");
+    emit(e, "        if (!np || !ng || !nu) { *ok = 0; return 0; }\n");
+    emit(e, "        if (s->pages) { memcpy(np, s->pages, s->page_count * sizeof(char*)); free(s->pages); }\n");
+    emit(e, "        if (s->gen) { memcpy(ng, s->gen, s->total_slots * sizeof(uint16_t)); free(s->gen); }\n");
+    emit(e, "        if (s->used) { memcpy(nu, s->used, s->total_slots * sizeof(uint8_t)); free(s->used); }\n");
+    emit(e, "        s->pages = np; s->gen = ng; s->used = nu; s->page_cap = nc;\n");
+    emit(e, "    }\n");
+    emit(e, "    char *page = (char*)calloc(_ZER_SLAB_PAGE_SLOTS, s->slot_size);\n");
+    emit(e, "    if (!page) { *ok = 0; return 0; }\n");
+    emit(e, "    s->pages[s->page_count] = page;\n");
+    emit(e, "    uint32_t base = s->total_slots;\n");
+    emit(e, "    s->page_count++;\n");
+    emit(e, "    s->total_slots += _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "    s->used[base] = 1;\n");
+    emit(e, "    *ok = 1;\n");
+    emit(e, "    return (uint32_t)((s->gen[base] << 16) | base);\n");
+    emit(e, "}\n\n");
+
+    emit(e, "static inline void *_zer_slab_get(_zer_slab *s, uint32_t handle) {\n");
+    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
+    emit(e, "    uint16_t gen = (uint16_t)(handle >> 16);\n");
+    emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != gen) {\n");
+    emit(e, "        _zer_trap(\"slab: use-after-free or invalid handle\", __FILE__, __LINE__);\n");
+    emit(e, "    }\n");
+    emit(e, "    uint32_t page = idx / _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "    uint32_t slot = idx %% _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "    return s->pages[page] + slot * s->slot_size;\n");
+    emit(e, "}\n\n");
+
+    emit(e, "static inline void _zer_slab_free(_zer_slab *s, uint32_t handle) {\n");
+    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
+    emit(e, "    if (idx < s->total_slots) {\n");
+    emit(e, "        s->used[idx] = 0;\n");
+    emit(e, "        s->gen[idx]++;\n");
+    emit(e, "    }\n");
     emit(e, "}\n\n");
 
     emit(e, "\n");

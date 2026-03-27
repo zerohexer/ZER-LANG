@@ -126,6 +126,13 @@ Type *type_handle(Arena *a, Type *elem) {
     return t;
 }
 
+Type *type_slab(Arena *a, Type *elem) {
+    Type *t = (Type *)arena_alloc(a, sizeof(Type));
+    t->kind = TYPE_SLAB;
+    t->slab.elem = elem;
+    return t;
+}
+
 Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
     t->kind = TYPE_FUNC_PTR;
@@ -273,6 +280,10 @@ bool type_equals(Type *a, Type *b) {
     /* handle: elem */
     case TYPE_HANDLE:
         return type_equals(a->handle.elem, b->handle.elem);
+
+    /* slab: elem */
+    case TYPE_SLAB:
+        return type_equals(a->slab.elem, b->slab.elem);
 
     /* distinct: nominal — pointer identity (same definition = same type) */
     case TYPE_DISTINCT:
@@ -423,6 +434,10 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_HANDLE:
         pos += snprintf(buf + pos, max - pos, "Handle(");
         pos = type_name_write(t->handle.elem, buf, pos, max);
+        return pos + snprintf(buf + pos, max - pos, ")");
+    case TYPE_SLAB:
+        pos += snprintf(buf + pos, max - pos, "Slab(");
+        pos = type_name_write(t->slab.elem, buf, pos, max);
         return pos + snprintf(buf + pos, max - pos, ")");
     case TYPE_DISTINCT:
         return pos + snprintf(buf + pos, max - pos, "%.*s",

@@ -1518,6 +1518,24 @@ static void test_negative_sweep(void) {
        "u32 main() { volatile []u8 s = hw_regs; return 0; }",
        "volatile array to volatile slice var-decl accepted");
 
+    /* Slab(T) type checking */
+    ok("struct Item { u32 val; }\nstatic Slab(Item) items;\n"
+       "u32 main() {\n"
+       "    ?Handle(Item) m = items.alloc();\n"
+       "    Handle(Item) h = m orelse return;\n"
+       "    items.get(h).val = 42;\n"
+       "    u32 r = items.get(h).val;\n"
+       "    items.free(h);\n"
+       "    return r;\n"
+       "}",
+       "Slab alloc/get/free accepted");
+    err("struct Item { u32 val; }\n"
+        "u32 main() { Slab(Item) s; return 0; }",
+        "Slab on stack rejected");
+    err("struct Item { u32 val; }\nstatic Slab(Item) items;\n"
+        "void f() { items.alloc(Item); }",
+        "slab.alloc() with args rejected");
+
     /* BUG-313: string literal to const []u8 param should work */
     ok("void f(const []u8 s) { }\n"
        "u32 main() { f(\"hello\"); return 0; }",

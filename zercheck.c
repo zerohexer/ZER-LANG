@@ -133,7 +133,7 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
         Symbol *sym = scope_lookup(zc->checker->global_scope, pool_name, plen);
         if (sym) pool_type = sym->type;
     }
-    if (!pool_type || pool_type->kind != TYPE_POOL) return;
+    if (!pool_type || (pool_type->kind != TYPE_POOL && pool_type->kind != TYPE_SLAB)) return;
 
     int pool_id = register_pool(zc, pool_name, plen);
 
@@ -482,7 +482,7 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
         if (decl->kind == NODE_GLOBAL_VAR) {
             Symbol *sym = scope_lookup(zc->checker->global_scope,
                 decl->var_decl.name, (uint32_t)decl->var_decl.name_len);
-            if (sym && sym->type && sym->type->kind == TYPE_POOL) {
+            if (sym && sym->type && (sym->type->kind == TYPE_POOL || sym->type->kind == TYPE_SLAB)) {
                 register_pool(zc, decl->var_decl.name,
                     (uint32_t)decl->var_decl.name_len);
             }

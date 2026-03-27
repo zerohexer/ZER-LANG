@@ -63,6 +63,7 @@ typedef enum {
     TYNODE_RING,            /* Ring(T, N) */
     TYNODE_ARENA,           /* Arena */
     TYNODE_HANDLE,          /* Handle(T) */
+    TYNODE_SLAB,            /* Slab(T) — dynamic growable pool */
 
     /* qualifiers */
     TYNODE_CONST,           /* const T */
@@ -118,6 +119,9 @@ struct TypeNode {
 
         /* TYNODE_HANDLE: Handle(T) */
         struct { TypeNode *elem; } handle;
+
+        /* TYNODE_SLAB: Slab(T) — no count, grows dynamically */
+        struct { TypeNode *elem; } slab;
 
         /* TYNODE_CONST / TYNODE_VOLATILE: qualifier wrapping inner type */
         struct { TypeNode *inner; } qualified;

@@ -45,6 +45,7 @@ typedef enum {
     TYPE_RING,          /* Ring(T, N) — elem type + count */
     TYPE_ARENA,         /* Arena — no parameters */
     TYPE_HANDLE,        /* Handle(T) — elem type */
+    TYPE_SLAB,          /* Slab(T) — dynamic growable pool, elem type */
 
     /* distinct typedef */
     TYPE_DISTINCT,      /* distinct typedef — nominal wrapper around underlying type */
@@ -136,6 +137,9 @@ struct Type {
 
         /* TYPE_HANDLE */
         struct { Type *elem; } handle;
+
+        /* TYPE_SLAB */
+        struct { Type *elem; } slab;
 
         /* TYPE_DISTINCT */
         struct {
@@ -235,6 +239,7 @@ Type *type_array(Arena *a, Type *inner, uint64_t size);
 Type *type_pool(Arena *a, Type *elem, uint64_t count);
 Type *type_ring(Arena *a, Type *elem, uint64_t count);
 Type *type_handle(Arena *a, Type *elem);
+Type *type_slab(Arena *a, Type *elem);
 Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret);
 
 /* queries */

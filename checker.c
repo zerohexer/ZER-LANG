@@ -517,6 +517,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         return type_handle(c->arena, elem);
     }
 
+    case TYNODE_SLAB: {
+        Type *elem = resolve_type(c, tn->slab.elem);
+        return type_slab(c->arena, elem);
+    }
+
     case TYNODE_FUNC_PTR: {
         Type *ret = resolve_type(c, tn->func_ptr.return_type);
         uint32_t pc = (uint32_t)tn->func_ptr.param_count;
@@ -930,12 +935,12 @@ static Type *check_expr(Checker *c, Node *node) {
                 "cannot store result of get() — use inline");
         }
 
-        /* BUG-225: reject Pool/Ring assignment — unique hardware resources */
+        /* BUG-225: reject Pool/Ring/Slab assignment — unique resource types */
         if (node->assign.op == TOK_EQ && target &&
-            (target->kind == TYPE_POOL || target->kind == TYPE_RING)) {
+            (target->kind == TYPE_POOL || target->kind == TYPE_RING || target->kind == TYPE_SLAB)) {
             checker_error(c, node->loc.line,
-                "cannot assign %s — hardware resource types are not copyable",
-                target->kind == TYPE_POOL ? "Pool" : "Ring");
+                "cannot assign %s — resource types are not copyable",
+                target->kind == TYPE_POOL ? "Pool" : target->kind == TYPE_RING ? "Ring" : "Slab");
         }
 
         /* string literal to mutable slice: runtime crash on write */
@@ -1480,6 +1485,43 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 checker_error(c, node->loc.line,
                     "Ring has no method '%.*s' (available: push, push_checked, pop)",
+                    (int)mlen, mname);
+                result = ty_void;
+                break;
+            }
+
+            /* Slab methods — same API as Pool but dynamically growable */
+            if (obj->kind == TYPE_SLAB) {
+                if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'alloc' on const Slab");
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "slab.alloc() takes no arguments");
+                    result = type_optional(c->arena, type_handle(c->arena, obj->slab.elem));
+                    typemap_set(c, field_node,result);
+                    break;
+                }
+                if (mlen == 3 && memcmp(mname, "get", 3) == 0) {
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "slab.get() takes exactly 1 argument");
+                    result = type_pointer(c->arena, obj->slab.elem);
+                    typemap_set(c, field_node,result);
+                    mark_non_storable(node);
+                    break;
+                }
+                if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'free' on const Slab");
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "slab.free() takes exactly 1 argument");
+                    result = ty_void;
+                    typemap_set(c, field_node,result);
+                    break;
+                }
+                checker_error(c, node->loc.line,
+                    "Slab has no method '%.*s' (available: alloc, get, free)",
                     (int)mlen, mname);
                 result = ty_void;
                 break;
@@ -2518,14 +2560,14 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "cannot declare variable of type 'void'");
         }
-        /* Pool/Ring must be global or static — not on the stack */
+        /* Pool/Ring/Slab must be global or static — not on the stack */
         if (node->kind == NODE_VAR_DECL && type &&
-            (type->kind == TYPE_POOL || type->kind == TYPE_RING) &&
+            (type->kind == TYPE_POOL || type->kind == TYPE_RING || type->kind == TYPE_SLAB) &&
             !node->var_decl.is_static) {
             checker_error(c, node->loc.line,
                 "%s must be declared as global or static — "
                 "stack allocation risks overflow",
-                type->kind == TYPE_POOL ? "Pool" : "Ring");
+                type->kind == TYPE_POOL ? "Pool" : type->kind == TYPE_RING ? "Ring" : "Slab");
         }
         /* propagate const from var qualifier to slice/pointer type */
         if (node->var_decl.is_const && type) {
@@ -3539,10 +3581,10 @@ static void register_decl(Checker *c, Node *node) {
                         "struct field '%.*s' cannot have type 'void'",
                         (int)fd->name_len, fd->name);
                 }
-                /* BUG-287: Pool/Ring as struct fields not yet supported */
-                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING)) {
+                /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
+                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB)) {
                     checker_error(c, node->loc.line,
-                        "Pool/Ring cannot be struct fields — must be global or static variables");
+                        "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
                 }
                 /* BUG-227/232: reject recursive struct by value (incomplete type in C).
                  * Unwrap arrays — S[1] contains S by value too. */

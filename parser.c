@@ -232,7 +232,7 @@ static bool is_type_token(TokenType type) {
     case TOK_I8: case TOK_I16: case TOK_I32: case TOK_I64:
     case TOK_USIZE: case TOK_F32: case TOK_F64:
     case TOK_BOOL: case TOK_VOID: case TOK_OPAQUE:
-    case TOK_POOL: case TOK_RING: case TOK_ARENA: case TOK_HANDLE:
+    case TOK_POOL: case TOK_RING: case TOK_ARENA: case TOK_HANDLE: case TOK_SLAB:
     case TOK_CONST: case TOK_VOLATILE:
     case TOK_STAR:      /* *T pointer type */
     case TOK_QUESTION:  /* ?T optional type */
@@ -292,6 +292,15 @@ static TypeNode *parse_base_type(Parser *p) {
         TypeNode *t = new_type_node(p, TYNODE_HANDLE);
         t->handle.elem = parse_type(p);
         consume(p, TOK_RPAREN, "expected ')' after Handle(T)");
+        return t;
+    }
+
+    case TOK_SLAB: {
+        advance(p);
+        consume(p, TOK_LPAREN, "expected '(' after 'Slab'");
+        TypeNode *t = new_type_node(p, TYNODE_SLAB);
+        t->slab.elem = parse_type(p);
+        consume(p, TOK_RPAREN, "expected ')' after Slab(T)");
         return t;
     }
 

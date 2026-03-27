@@ -3010,6 +3010,57 @@ int main(void) {
         141,
         "array size from subtraction (10-5=5) works at runtime");
 
+    /* Slab(T) E2E */
+    test_compile_and_run(
+        "struct Task { u32 id; u32 pri; }\n"
+        "static Slab(Task) tasks;\n"
+        "u32 main() {\n"
+        "    ?Handle(Task) m = tasks.alloc();\n"
+        "    Handle(Task) h = m orelse return;\n"
+        "    tasks.get(h).id = 42;\n"
+        "    tasks.get(h).pri = 10;\n"
+        "    u32 r = tasks.get(h).id + tasks.get(h).pri;\n"
+        "    tasks.free(h);\n"
+        "    return r;\n"
+        "}\n",
+        52,
+        "Slab basic alloc/get/free E2E");
+
+    test_compile_and_run(
+        "struct Item { u32 val; }\n"
+        "static Slab(Item) items;\n"
+        "u32 main() {\n"
+        "    u32 count = 0;\n"
+        "    for (u32 i = 0; i < 200; i += 1) {\n"
+        "        ?Handle(Item) m = items.alloc();\n"
+        "        Handle(Item) h = m orelse return;\n"
+        "        items.get(h).val = i;\n"
+        "        count += 1;\n"
+        "    }\n"
+        "    return count;\n"
+        "}\n",
+        200,
+        "Slab dynamic growth past 64 slots E2E");
+
+    test_compile_and_run(
+        "struct Node { u32 val; }\n"
+        "static Slab(Node) nodes;\n"
+        "u32 main() {\n"
+        "    ?Handle(Node) m1 = nodes.alloc();\n"
+        "    Handle(Node) h1 = m1 orelse return;\n"
+        "    ?Handle(Node) m2 = nodes.alloc();\n"
+        "    Handle(Node) h2 = m2 orelse return;\n"
+        "    nodes.get(h1).val = 10;\n"
+        "    nodes.get(h2).val = 20;\n"
+        "    nodes.free(h2);\n"
+        "    ?Handle(Node) m3 = nodes.alloc();\n"
+        "    Handle(Node) h3 = m3 orelse return;\n"
+        "    nodes.get(h3).val = 99;\n"
+        "    return nodes.get(h1).val + nodes.get(h3).val;\n"
+        "}\n",
+        109,
+        "Slab free + realloc reuse E2E");
+
     /* BUG-310: volatile slice — volatile propagates through array→slice coercion */
     test_compile_and_run(
         "volatile u8[4] hw;\n"

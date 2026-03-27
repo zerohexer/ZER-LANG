@@ -32,7 +32,7 @@ typedef enum {
     TOK_TRUE, TOK_FALSE,
 
     /* === Memory builtins === */
-    TOK_POOL, TOK_RING, TOK_ARENA, TOK_HANDLE,
+    TOK_POOL, TOK_RING, TOK_ARENA, TOK_HANDLE, TOK_SLAB,
 
     /* === Special keywords === */
     TOK_DEFER, TOK_IMPORT, TOK_CINCLUDE, TOK_VOLATILE, TOK_INTERRUPT,

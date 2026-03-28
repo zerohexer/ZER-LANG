@@ -247,6 +247,9 @@ static const TypeMap type_map[] = {
     { "float",    5, "f32" },
     { "double",   6, "f64" },
     { "char",     4, "u8" },
+    { "int",      3, "i32" },
+    { "short",    5, "i16" },
+    { "long",     4, "i64" },
     { "void",     4, "void" },
     { "bool",     4, "bool" },
     { "_Bool",    5, "bool" },
@@ -350,11 +353,64 @@ static int skip_spaces(int i) {
     return i;
 }
 
+/* Try to rearrange pointer declaration: type *name → *type name
+ * Emits stars + zer_type + space if successful.
+ * Returns token index to continue from (the variable name), or -1 if no rearrangement. */
+static int try_ptr_rearrange(int type_idx, const char *zer_type) {
+    int j = type_idx + 1;
+    while (j < token_count && tokens[j].type == CT_WHITESPACE) j++;
+
+    int star_count = 0;
+    while (j < token_count && tokens[j].type == CT_STAR) {
+        star_count++;
+        j++;
+        while (j < token_count && tokens[j].type == CT_WHITESPACE) j++;
+    }
+
+    if (star_count == 0) return -1;
+    if (j >= token_count || tokens[j].type != CT_IDENT) return -1;
+
+    /* Verify declaration context: after name should be ; = , ) ( [ */
+    int after = j + 1;
+    while (after < token_count && tokens[after].type == CT_WHITESPACE) after++;
+    if (after >= token_count) return -1;
+    CTokenType at = tokens[after].type;
+    if (at != CT_SEMICOLON && at != CT_EQ && at != CT_COMMA &&
+        at != CT_RPAREN && at != CT_LPAREN && at != CT_LBRACKET) return -1;
+
+    for (int s = 0; s < star_count; s++) emit_str("*");
+    emit_str(zer_type);
+    emit_str(" ");
+    return j; /* continue from variable name */
+}
+
 static void transform(void) {
     int i = 0;
 
+    /* State tracking for switch/case and loop transforms */
+    int brace_depth = 0;
+    int switch_depth = 0;
+    struct { int brace; bool arm_open; } sw_stack[32];
+    int loop_depth = 0;
+    int loop_brace[32];
+    bool next_brace_is_switch = false;
+    bool next_brace_is_loop = false;
+    /* For typedef struct { } Name; — skip trailing name after } */
+    bool skip_typedef_trailer = false;
+    int typedef_body_depth = -1; /* brace_depth when typedef body { was seen */
+
     while (i < token_count && tokens[i].type != CT_EOF) {
         CToken *t = &tokens[i];
+
+        /* ---- Skip trailing Name ; after typedef struct {} Name; ---- */
+        if (skip_typedef_trailer && typedef_body_depth < 0) {
+            /* Past the body } — skip trailing tokens until ; */
+            if (t->type == CT_SEMICOLON) {
+                skip_typedef_trailer = false;
+            }
+            i++;
+            continue;
+        }
 
         /* ---- Preprocessor lines: #include, #define ---- */
         if (t->type == CT_HASH) {
@@ -462,6 +518,296 @@ static void transform(void) {
         /* ---- Type mapping: int → i32, uint8_t → u8, etc. ---- */
         if (t->type == CT_IDENT) {
 
+            /* ---- switch keyword: track for case/break transform ---- */
+            if (tok_eq(t, "switch")) {
+                next_brace_is_switch = true;
+                emit_str("switch");
+                i++;
+                continue;
+            }
+
+            /* ---- case VALUE: → VALUE => { ---- */
+            if (tok_eq(t, "case") && switch_depth > 0) {
+                /* Find preceding indentation for proper formatting */
+                const char *indent = "";
+                int indent_len = 0;
+                for (int p = i - 1; p >= 0; p--) {
+                    if (tokens[p].type == CT_WHITESPACE) {
+                        indent = tokens[p].start;
+                        indent_len = tokens[p].len;
+                        break;
+                    }
+                    if (tokens[p].type == CT_NEWLINE) break;
+                }
+                /* Close previous arm if open */
+                if (sw_stack[switch_depth - 1].arm_open) {
+                    emit_str("}\n");
+                    emit_raw(indent, indent_len);
+                    sw_stack[switch_depth - 1].arm_open = false;
+                }
+                i++; /* skip 'case' */
+                int j = skip_spaces(i);
+                /* Collect case values, handling fallthrough (case A: case B: → A, B =>) */
+                while (j < token_count) {
+                    int val_start = j;
+                    /* collect tokens until ':' */
+                    while (j < token_count && tokens[j].type != CT_COLON) j++;
+                    /* emit value tokens with type mapping */
+                    for (int v = val_start; v < j; v++) {
+                        if (tokens[v].type == CT_WHITESPACE) continue; /* trim spaces in value */
+                        if (tokens[v].type == CT_IDENT) {
+                            const char *mt = map_type(&tokens[v]);
+                            if (mt) { emit_str(mt); continue; }
+                        }
+                        emit_tok(&tokens[v]);
+                    }
+                    if (j < token_count && tokens[j].type == CT_COLON) j++; /* skip ':' */
+                    /* Check for fallthrough: next meaningful token is 'case' */
+                    int next = skip_ws(j);
+                    if (next < token_count && tokens[next].type == CT_IDENT &&
+                        tok_eq(&tokens[next], "case")) {
+                        emit_str(", ");
+                        j = next + 1; /* skip 'case' */
+                        j = skip_spaces(j);
+                    } else {
+                        break;
+                    }
+                }
+                emit_str(" => {");
+                sw_stack[switch_depth - 1].arm_open = true;
+                i = j;
+                continue;
+            }
+
+            /* ---- default: → default => { ---- */
+            if (tok_eq(t, "default") && switch_depth > 0) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_COLON) {
+                    if (sw_stack[switch_depth - 1].arm_open) {
+                        const char *indent = "";
+                        int indent_len = 0;
+                        for (int p = i - 1; p >= 0; p--) {
+                            if (tokens[p].type == CT_WHITESPACE) {
+                                indent = tokens[p].start;
+                                indent_len = tokens[p].len;
+                                break;
+                            }
+                            if (tokens[p].type == CT_NEWLINE) break;
+                        }
+                        emit_str("}\n");
+                        emit_raw(indent, indent_len);
+                        sw_stack[switch_depth - 1].arm_open = false;
+                    }
+                    emit_str("default => {");
+                    sw_stack[switch_depth - 1].arm_open = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+
+            /* ---- break; inside switch → } (close arm) ---- */
+            if (tok_eq(t, "break")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_SEMICOLON && switch_depth > 0) {
+                    /* Check if break belongs to switch or nested loop */
+                    bool is_switch_break = true;
+                    if (loop_depth > 0 &&
+                        loop_brace[loop_depth - 1] > sw_stack[switch_depth - 1].brace) {
+                        is_switch_break = false;
+                    }
+                    if (is_switch_break) {
+                        emit_str("}");
+                        sw_stack[switch_depth - 1].arm_open = false;
+                        i = j + 1; /* skip break; */
+                        continue;
+                    }
+                }
+                emit_str("break");
+                i++;
+                continue;
+            }
+
+            /* ---- for/while/do — track loop depth ---- */
+            if (tok_eq(t, "for") || tok_eq(t, "while") || tok_eq(t, "do")) {
+                next_brace_is_loop = true;
+                emit_tok(t);
+                i++;
+                continue;
+            }
+
+            /* ---- goto LABEL; → // MANUAL: goto LABEL; ---- */
+            if (tok_eq(t, "goto")) {
+                emit_str("// MANUAL: ");
+                while (i < token_count && tokens[i].type != CT_SEMICOLON &&
+                       tokens[i].type != CT_NEWLINE && tokens[i].type != CT_EOF) {
+                    emit_tok(&tokens[i]);
+                    i++;
+                }
+                if (i < token_count && tokens[i].type == CT_SEMICOLON) {
+                    emit_str(";");
+                    i++;
+                }
+                continue;
+            }
+
+            /* ---- enum keyword: strip in usage, keep in declaration ---- */
+            if (tok_eq(t, "enum")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_IDENT) {
+                    int k = skip_ws(j + 1);
+                    if (k < token_count && tokens[k].type == CT_LBRACE) {
+                        /* enum declaration — keep enum keyword */
+                        emit_str("enum");
+                        i++;
+                        continue;
+                    }
+                    /* enum usage: enum Color → Color */
+                    i = j;
+                    continue;
+                }
+                if (j < token_count && tokens[j].type == CT_LBRACE) {
+                    /* anonymous enum { ... } — keep */
+                    emit_str("enum");
+                    i++;
+                    continue;
+                }
+                emit_str("enum");
+                i++;
+                continue;
+            }
+
+            /* ---- union keyword: strip in usage, keep in declaration ---- */
+            if (tok_eq(t, "union")) {
+                int j = skip_spaces(i + 1);
+                if (j < token_count && tokens[j].type == CT_IDENT) {
+                    int k = skip_ws(j + 1);
+                    if (k < token_count && tokens[k].type == CT_LBRACE) {
+                        emit_str("union");
+                        i++;
+                        continue;
+                    }
+                    /* union usage: union Data → Data */
+                    i = j;
+                    continue;
+                }
+                emit_str("union");
+                i++;
+                continue;
+            }
+
+            /* ---- typedef handling ---- */
+            if (tok_eq(t, "typedef")) {
+                int j = skip_spaces(i + 1);
+
+                /* typedef struct/enum/union ... */
+                if (j < token_count && tokens[j].type == CT_IDENT &&
+                    (tok_eq(&tokens[j], "struct") || tok_eq(&tokens[j], "enum") ||
+                     tok_eq(&tokens[j], "union"))) {
+                    int k = skip_spaces(j + 1);
+
+                    /* typedef struct Name Name; → drop (forward decl) */
+                    if (k < token_count && tokens[k].type == CT_IDENT) {
+                        int m = skip_spaces(k + 1);
+                        if (m < token_count && tokens[m].type == CT_IDENT) {
+                            int n = skip_spaces(m + 1);
+                            if (n < token_count && tokens[n].type == CT_SEMICOLON) {
+                                /* typedef struct X X; → skip */
+                                i = n + 1;
+                                continue;
+                            }
+                        }
+                        /* typedef struct Name { ... } Alias; → struct Name { ... } */
+                        if (m < token_count && tokens[m].type == CT_LBRACE) {
+                            emit_tok(&tokens[j]); /* struct/enum/union */
+                            emit_str(" ");
+                            emit_tok(&tokens[k]); /* Name */
+                            emit_str(" ");
+                            i = m; /* point to { — main loop processes body */
+                            /* After }, skip trailing Alias ; */
+                            skip_typedef_trailer = true;
+                            typedef_body_depth = 0;
+                            continue;
+                        }
+                    }
+
+                    /* typedef struct { ... } Name; → struct Name { ... } */
+                    if (k < token_count && tokens[k].type == CT_LBRACE) {
+                        /* Find closing } to get the Name */
+                        int depth = 0, m = k;
+                        while (m < token_count) {
+                            if (tokens[m].type == CT_LBRACE) depth++;
+                            if (tokens[m].type == CT_RBRACE) { depth--; if (depth == 0) break; }
+                            m++;
+                        }
+                        int name_idx = skip_spaces(m + 1);
+                        if (name_idx < token_count && tokens[name_idx].type == CT_IDENT) {
+                            emit_tok(&tokens[j]); /* keyword */
+                            emit_str(" ");
+                            emit_tok(&tokens[name_idx]); /* Name */
+                            emit_str(" ");
+                            i = k; /* point to { — main loop processes body */
+                            /* After }, skip trailing Name ; */
+                            skip_typedef_trailer = true;
+                            typedef_body_depth = 0; /* next { will increment to 1 */
+                            continue;
+                        }
+                    }
+                }
+
+                /* typedef with function pointer: typedef ... (*Name)(...); → keep with mapping */
+                {
+                    int scan = j;
+                    bool has_fptr = false;
+                    while (scan < token_count && tokens[scan].type != CT_SEMICOLON &&
+                           tokens[scan].type != CT_EOF) {
+                        if (tokens[scan].type == CT_LPAREN) {
+                            int next = skip_spaces(scan + 1);
+                            if (next < token_count && tokens[next].type == CT_STAR) {
+                                has_fptr = true;
+                                break;
+                            }
+                        }
+                        scan++;
+                    }
+                    if (has_fptr) {
+                        /* Emit typedef, let main loop handle rest with type mapping */
+                        emit_str("typedef ");
+                        i = j;
+                        continue;
+                    }
+                }
+
+                /* Simple typedef alias: typedef TYPE NAME; → drop as comment */
+                if (j < token_count && tokens[j].type == CT_IDENT) {
+                    emit_str("// typedef (dropped): ");
+                    while (i < token_count && tokens[i].type != CT_SEMICOLON &&
+                           tokens[i].type != CT_EOF) {
+                        emit_tok(&tokens[i]);
+                        i++;
+                    }
+                    if (i < token_count && tokens[i].type == CT_SEMICOLON) {
+                        emit_str(";");
+                        i++;
+                    }
+                    emit_str("\n");
+                    continue;
+                }
+
+                /* Fallback: mark as manual */
+                emit_str("// MANUAL: ");
+                while (i < token_count && tokens[i].type != CT_SEMICOLON &&
+                       tokens[i].type != CT_EOF) {
+                    emit_tok(&tokens[i]);
+                    i++;
+                }
+                if (i < token_count && tokens[i].type == CT_SEMICOLON) {
+                    emit_str(";");
+                    i++;
+                }
+                emit_str("\n");
+                continue;
+            }
+
             /* Two-token type combos: unsigned int → u32, etc.
              * Must check BEFORE single-token map to avoid double-mapping. */
             {
@@ -471,8 +817,14 @@ static void transform(void) {
                         int j = skip_spaces(i + 1);
                         if (j < token_count && tokens[j].type == CT_IDENT &&
                             tok_eq(&tokens[j], type_combos[ci].second)) {
-                            emit_str(type_combos[ci].zer);
-                            i = j + 1; /* skip both tokens */
+                            /* Check for pointer rearrangement */
+                            int next = try_ptr_rearrange(j, type_combos[ci].zer);
+                            if (next >= 0) {
+                                i = next;
+                            } else {
+                                emit_str(type_combos[ci].zer);
+                                i = j + 1;
+                            }
                             found_combo = true;
                             break;
                         }
@@ -488,6 +840,8 @@ static void transform(void) {
                 if (j >= token_count || tokens[j].type != CT_IDENT ||
                     (!tok_eq(&tokens[j], "int") && !tok_eq(&tokens[j], "char") &&
                      !tok_eq(&tokens[j], "short") && !tok_eq(&tokens[j], "long"))) {
+                    int next = try_ptr_rearrange(i, "u32");
+                    if (next >= 0) { i = next; continue; }
                     emit_str("u32");
                     i++;
                     continue;
@@ -496,6 +850,8 @@ static void transform(void) {
 
             /* standalone 'int' (not part of a combo already handled) → i32 */
             if (tok_eq(t, "int")) {
+                int next = try_ptr_rearrange(i, "i32");
+                if (next >= 0) { i = next; continue; }
                 emit_str("i32");
                 i++;
                 continue;
@@ -503,6 +859,8 @@ static void transform(void) {
 
             /* standalone 'long' (not part of combo) → i64 */
             if (tok_eq(t, "long")) {
+                int next = try_ptr_rearrange(i, "i64");
+                if (next >= 0) { i = next; continue; }
                 emit_str("i64");
                 i++;
                 continue;
@@ -510,6 +868,8 @@ static void transform(void) {
 
             /* standalone 'short' (not part of combo) → i16 */
             if (tok_eq(t, "short")) {
+                int next = try_ptr_rearrange(i, "i16");
+                if (next >= 0) { i = next; continue; }
                 emit_str("i16");
                 i++;
                 continue;
@@ -536,8 +896,32 @@ static void transform(void) {
                         i++;
                         continue;
                     }
-                    /* struct usage: struct<ws>Node → Node (skip struct + whitespace) */
-                    i = j; /* jump to the name, skip struct + spaces */
+                    /* Check for struct Name *var → *Name var */
+                    {
+                        int m = j + 1;
+                        while (m < token_count && tokens[m].type == CT_WHITESPACE) m++;
+                        int star_count = 0;
+                        while (m < token_count && tokens[m].type == CT_STAR) {
+                            star_count++;
+                            m++;
+                            while (m < token_count && tokens[m].type == CT_WHITESPACE) m++;
+                        }
+                        if (star_count > 0 && m < token_count && tokens[m].type == CT_IDENT) {
+                            int after = m + 1;
+                            while (after < token_count && tokens[after].type == CT_WHITESPACE) after++;
+                            CTokenType at = after < token_count ? tokens[after].type : CT_EOF;
+                            if (at == CT_SEMICOLON || at == CT_EQ || at == CT_COMMA ||
+                                at == CT_RPAREN || at == CT_LPAREN || at == CT_LBRACKET) {
+                                for (int s = 0; s < star_count; s++) emit_str("*");
+                                emit_tok(&tokens[j]); /* Name */
+                                emit_str(" ");
+                                i = m; /* continue from var name */
+                                continue;
+                            }
+                        }
+                    }
+                    /* struct usage without pointer: struct Node → Node */
+                    i = j;
                     continue;
                 }
             }
@@ -625,6 +1009,8 @@ static void transform(void) {
 
             /* Type-mapped identifier */
             if (mapped) {
+                int next = try_ptr_rearrange(i, mapped);
+                if (next >= 0) { i = next; continue; }
                 emit_str(mapped);
                 i++;
                 continue;
@@ -754,6 +1140,12 @@ static void transform(void) {
                                 i++;
                                 continue;
                             }
+                            /* strip 'struct' keyword inside args */
+                            if (tokens[i].type == CT_IDENT && tok_eq(&tokens[i], "struct")) {
+                                i++;
+                                while (i < token_count && tokens[i].type == CT_WHITESPACE) i++;
+                                continue;
+                            }
                             /* transform type names inside args */
                             if (tokens[i].type == CT_IDENT) {
                                 const char *mt = map_type(&tokens[i]);
@@ -788,6 +1180,77 @@ static void transform(void) {
         /* ---- Arrow operator: -> stays as . (ZER auto-derefs) ---- */
         if (t->type == CT_ARROW) {
             emit_str(".");
+            i++;
+            continue;
+        }
+
+        /* ---- Brace tracking for switch/loop depth ---- */
+        if (t->type == CT_LBRACE) {
+            brace_depth++;
+            if (skip_typedef_trailer && typedef_body_depth >= 0) {
+                typedef_body_depth++;
+            }
+            if (next_brace_is_switch && switch_depth < 32) {
+                sw_stack[switch_depth].brace = brace_depth;
+                sw_stack[switch_depth].arm_open = false;
+                switch_depth++;
+                next_brace_is_switch = false;
+                next_brace_is_loop = false;
+            } else if (next_brace_is_loop && loop_depth < 32) {
+                loop_brace[loop_depth] = brace_depth;
+                loop_depth++;
+                next_brace_is_loop = false;
+            }
+            emit_str("{");
+            i++;
+            continue;
+        }
+        if (t->type == CT_RBRACE) {
+            /* Check if closing a typedef body */
+            if (skip_typedef_trailer && typedef_body_depth > 0) {
+                typedef_body_depth--;
+                if (typedef_body_depth == 0) {
+                    /* Body closed — emit } and start skipping trailer */
+                    typedef_body_depth = -1;
+                    brace_depth--;
+                    emit_str("}\n");
+                    i++;
+                    continue;
+                }
+            }
+            /* Check if closing a switch body */
+            if (switch_depth > 0 && brace_depth == sw_stack[switch_depth - 1].brace) {
+                if (sw_stack[switch_depth - 1].arm_open) {
+                    /* Find indentation of this closing brace */
+                    const char *indent = "";
+                    int indent_len = 0;
+                    for (int p = i - 1; p >= 0; p--) {
+                        if (tokens[p].type == CT_WHITESPACE) {
+                            indent = tokens[p].start;
+                            indent_len = tokens[p].len;
+                            break;
+                        }
+                        if (tokens[p].type == CT_NEWLINE) break;
+                    }
+                    emit_str("}\n");
+                    emit_raw(indent, indent_len);
+                    sw_stack[switch_depth - 1].arm_open = false;
+                }
+                switch_depth--;
+            }
+            /* Check if closing a loop body */
+            if (loop_depth > 0 && brace_depth == loop_brace[loop_depth - 1]) {
+                loop_depth--;
+            }
+            brace_depth--;
+            emit_str("}");
+            i++;
+            continue;
+        }
+
+        /* ---- Ternary operator: mark as MANUAL ---- */
+        if (t->type == CT_QUESTION) {
+            emit_str("/* MANUAL: rewrite ternary as if/else */ ?");
             i++;
             continue;
         }

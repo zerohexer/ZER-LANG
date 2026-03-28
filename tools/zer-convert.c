@@ -1523,6 +1523,47 @@ static void transform(void) {
             continue;
         }
 
+        /* ---- *(ptr + N) → ptr[N] for classified slice params ---- */
+        if (t->type == CT_STAR) {
+            int j = skip_spaces(i + 1);
+            if (j < token_count && tokens[j].type == CT_LPAREN) {
+                int k = skip_spaces(j + 1);
+                if (k < token_count && tokens[k].type == CT_IDENT) {
+                    ParamInfo *pi = find_param_info(tokens[k].start, tokens[k].len, k);
+                    if (pi && pi->is_slice) {
+                        int m = skip_spaces(k + 1);
+                        if (m < token_count && tokens[m].type == CT_PLUS) {
+                            /* *(ptr + expr) → ptr[expr] */
+                            int n = skip_spaces(m + 1);
+                            int expr_start = n;
+                            int depth = 0;
+                            while (n < token_count) {
+                                if (tokens[n].type == CT_LPAREN) depth++;
+                                if (tokens[n].type == CT_RPAREN) {
+                                    if (depth == 0) break;
+                                    depth--;
+                                }
+                                n++;
+                            }
+                            /* n is at closing ) */
+                            emit_tok(&tokens[k]); /* ptr name */
+                            emit_str("[");
+                            for (int x = expr_start; x < n; x++) {
+                                if (tokens[x].type == CT_IDENT) {
+                                    const char *mt = map_type(&tokens[x]);
+                                    if (mt) { emit_str(mt); continue; }
+                                }
+                                emit_tok(&tokens[x]);
+                            }
+                            emit_str("]");
+                            i = n + 1; /* skip past ) */
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         /* ---- Everything else: pass through unchanged ---- */
         emit_tok(t);
         i++;

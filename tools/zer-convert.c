@@ -314,22 +314,37 @@ static void tokenize(const char *src, int len) {
 }
 
 /* ================================================================
- * Transform engine
+ * Transform engine — output to growable buffer
  * ================================================================ */
 
-static FILE *out;
+static char *out_buf = NULL;
+static int out_len = 0;
+static int out_cap = 0;
 static bool needs_compat = false; /* set true if malloc/free/ptr arith used */
 
 static void emit_raw(const char *s, int len) {
-    fwrite(s, 1, len, out);
+    if (out_len + len > out_cap) {
+        if (out_cap == 0) out_cap = 65536;
+        while (out_len + len > out_cap) out_cap *= 2;
+        out_buf = realloc(out_buf, out_cap);
+    }
+    memcpy(out_buf + out_len, s, len);
+    out_len += len;
 }
 
 static void emit_str(const char *s) {
-    fputs(s, out);
+    emit_raw(s, (int)strlen(s));
 }
 
 static void emit_tok(CToken *t) {
-    fwrite(t->start, 1, t->len, out);
+    emit_raw(t->start, t->len);
+}
+
+/* Trim trailing whitespace/newlines from output buffer */
+static void emit_trim_trailing_ws(void) {
+    while (out_len > 0 && (out_buf[out_len - 1] == ' ' || out_buf[out_len - 1] == '\t' ||
+           out_buf[out_len - 1] == '\n' || out_buf[out_len - 1] == '\r'))
+        out_len--;
 }
 
 /* check if token at index i is a specific identifier */
@@ -390,7 +405,7 @@ static void transform(void) {
     /* State tracking for switch/case and loop transforms */
     int brace_depth = 0;
     int switch_depth = 0;
-    struct { int brace; bool arm_open; } sw_stack[32];
+    struct { int brace; bool arm_open; const char *indent; int indent_len; } sw_stack[32];
     int loop_depth = 0;
     int loop_brace[32];
     bool next_brace_is_switch = false;
@@ -575,6 +590,8 @@ static void transform(void) {
                 }
                 emit_str(" => {");
                 sw_stack[switch_depth - 1].arm_open = true;
+                sw_stack[switch_depth - 1].indent = indent;
+                sw_stack[switch_depth - 1].indent_len = indent_len;
                 i = j;
                 continue;
             }
@@ -600,6 +617,21 @@ static void transform(void) {
                     }
                     emit_str("default => {");
                     sw_stack[switch_depth - 1].arm_open = true;
+                    /* Save indent for this arm (reuse case-level indent from backward scan) */
+                    {
+                        const char *di = "";
+                        int dil = 0;
+                        for (int p = i - 1; p >= 0; p--) {
+                            if (tokens[p].type == CT_WHITESPACE) {
+                                di = tokens[p].start;
+                                dil = tokens[p].len;
+                                break;
+                            }
+                            if (tokens[p].type == CT_NEWLINE) break;
+                        }
+                        sw_stack[switch_depth - 1].indent = di;
+                        sw_stack[switch_depth - 1].indent_len = dil;
+                    }
                     i = j + 1;
                     continue;
                 }
@@ -616,9 +648,16 @@ static void transform(void) {
                         is_switch_break = false;
                     }
                     if (is_switch_break) {
-                        emit_str("}");
+                        /* Trim trailing whitespace (the indent before 'break' was already emitted) */
+                        emit_trim_trailing_ws();
+                        emit_str("\n");
+                        emit_raw(sw_stack[switch_depth - 1].indent,
+                                 sw_stack[switch_depth - 1].indent_len);
+                        emit_str("}\n");
                         sw_stack[switch_depth - 1].arm_open = false;
                         i = j + 1; /* skip break; */
+                        /* Skip trailing newline after break; (we already emitted one) */
+                        if (i < token_count && tokens[i].type == CT_NEWLINE) i++;
                         continue;
                     }
                 }
@@ -1221,20 +1260,25 @@ static void transform(void) {
             /* Check if closing a switch body */
             if (switch_depth > 0 && brace_depth == sw_stack[switch_depth - 1].brace) {
                 if (sw_stack[switch_depth - 1].arm_open) {
-                    /* Find indentation of this closing brace */
-                    const char *indent = "";
-                    int indent_len = 0;
+                    /* Trim trailing whitespace, emit arm close at case-level indent */
+                    emit_trim_trailing_ws();
+                    emit_str("\n");
+                    emit_raw(sw_stack[switch_depth - 1].indent,
+                             sw_stack[switch_depth - 1].indent_len);
+                    emit_str("}\n");
+                    sw_stack[switch_depth - 1].arm_open = false;
+                    /* Re-emit the switch-level indent (was trimmed above) */
+                    const char *sw_indent = "";
+                    int sw_indent_len = 0;
                     for (int p = i - 1; p >= 0; p--) {
                         if (tokens[p].type == CT_WHITESPACE) {
-                            indent = tokens[p].start;
-                            indent_len = tokens[p].len;
+                            sw_indent = tokens[p].start;
+                            sw_indent_len = tokens[p].len;
                             break;
                         }
                         if (tokens[p].type == CT_NEWLINE) break;
                     }
-                    emit_str("}\n");
-                    emit_raw(indent, indent_len);
-                    sw_stack[switch_depth - 1].arm_open = false;
+                    emit_raw(sw_indent, sw_indent_len);
                 }
                 switch_depth--;
             }
@@ -1286,7 +1330,7 @@ static void transform(void) {
  * Main
  * ================================================================ */
 
-static char *read_file(const char *path, int *out_len) {
+static char *read_file(const char *path, int *file_len) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "zer-convert: cannot open '%s'\n", path); return NULL; }
     fseek(f, 0, SEEK_END);
@@ -1297,7 +1341,7 @@ static char *read_file(const char *path, int *out_len) {
     fread(buf, 1, len, f);
     buf[len] = '\0';
     fclose(f);
-    *out_len = (int)len;
+    *file_len = (int)len;
     return buf;
 }
 
@@ -1336,44 +1380,29 @@ int main(int argc, char **argv) {
 
     tokenize(src, src_len);
 
-    out = fopen(output_path, "w");
-    if (!out) {
+    /* Transform to buffer */
+    transform();
+
+    /* Write output file */
+    FILE *outf = fopen(output_path, "w");
+    if (!outf) {
         fprintf(stderr, "zer-convert: cannot write '%s'\n", output_path);
         free(src);
         return 1;
     }
 
-    /* header */
-    fprintf(out, "// Converted from %s by zer-convert\n", input_path);
-    fprintf(out, "// Review MANUAL: comments for items needing attention\n\n");
-
-    transform();
-
-    /* add compat import if needed */
     if (needs_compat) {
-        /* prepend compat import — rewrite file */
-        fclose(out);
-
-        /* read what we wrote */
-        int zer_len;
-        char *zer_content = read_file(output_path, &zer_len);
-
-        out = fopen(output_path, "w");
-        fprintf(out, "// Converted from %s by zer-convert\n", input_path);
-        fprintf(out, "// Uses compat.zer — run 'zerc --safe-upgrade' to replace with safe ZER\n\n");
-        fprintf(out, "import compat;\n\n");
-        /* skip the old header lines */
-        char *body = zer_content;
-        /* skip first two comment lines + blank */
-        for (int skip = 0; skip < 3 && body && *body; skip++) {
-            char *nl = strchr(body, '\n');
-            if (nl) body = nl + 1; else break;
-        }
-        if (body) fwrite(body, 1, strlen(body), out);
-        free(zer_content);
+        fprintf(outf, "// Converted from %s by zer-convert\n", input_path);
+        fprintf(outf, "// Uses compat.zer — run 'zerc --safe-upgrade' to replace with safe ZER\n\n");
+        fprintf(outf, "import compat;\n\n");
+    } else {
+        fprintf(outf, "// Converted from %s by zer-convert\n", input_path);
+        fprintf(outf, "// Review MANUAL: comments for items needing attention\n\n");
     }
 
-    fclose(out);
+    fwrite(out_buf, 1, out_len, outf);
+    fclose(outf);
+    free(out_buf);
     free(src);
 
     printf("zer-convert: %s -> %s", input_path, output_path);

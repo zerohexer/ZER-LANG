@@ -321,7 +321,20 @@ static void tokenize(const char *src, int len) {
 
 static FILE *out;
 static bool needs_compat = false; /* set true if malloc/free/ptr arith used */
-static bool in_switch_arm = false; /* track open switch arm for auto-close */
+static int switch_depth = 0;       /* nesting depth of switch statements */
+static int switch_arm_depth[16];   /* which depth levels have an open arm */
+static int switch_arm_top = 0;     /* stack top for open arm tracking */
+
+static bool in_switch_arm_at_current_depth(void) {
+    return switch_arm_top > 0 && switch_arm_depth[switch_arm_top - 1] == switch_depth;
+}
+static void push_switch_arm(void) {
+    if (switch_arm_top < 16) switch_arm_depth[switch_arm_top++] = switch_depth;
+}
+static void pop_switch_arm(void) {
+    if (switch_arm_top > 0 && switch_arm_depth[switch_arm_top - 1] == switch_depth)
+        switch_arm_top--;
+}
 
 /* typedef tag→name mapping: typedef struct node { ... } Node; → node maps to Node */
 #define MAX_TAG_MAPS 64
@@ -345,6 +358,217 @@ static const char *lookup_tag(const char *ident, int len) {
             return tag_maps[i].name;
     }
     return NULL;
+}
+
+/* forward declarations for helpers used in classify_params */
+static int skip_ws(int i);
+static int skip_spaces(int i);
+
+/* ================================================================
+ * Pre-scan: classify char* params/vars as slice vs pointer
+ * Also detect nullable pointers and pointer arithmetic
+ * ================================================================ */
+
+#define MAX_PARAM_INFO 256
+
+typedef struct {
+    char name[64];       /* param/var name */
+    int func_idx;        /* token index of function body { */
+    int func_end;        /* token index of function body } */
+    bool is_const;       /* was const char * */
+    bool is_slice;       /* classified as []u8 */
+    bool is_nullable;    /* should be ?*T (uses null checks/assigns) */
+} ParamInfo;
+
+static ParamInfo param_infos[MAX_PARAM_INFO];
+static int param_info_count = 0;
+
+/* check if param at given name should be a slice in a function scope.
+ * tok_idx can be in the param list (before func_idx) or in the body. */
+static ParamInfo *find_param_info(const char *name, int name_len, int tok_idx) {
+    for (int i = 0; i < param_info_count; i++) {
+        if ((int)strlen(param_infos[i].name) == name_len &&
+            memcmp(param_infos[i].name, name, name_len) == 0 &&
+            tok_idx <= param_infos[i].func_end)
+            return &param_infos[i];
+    }
+    return NULL;
+}
+
+/* check if token i..i+N matches a name */
+static bool tokens_match_name(int idx, const char *name) {
+    if (idx < 0 || idx >= token_count) return false;
+    return tok_eq(&tokens[idx], name);
+}
+
+/* Pre-scan pass: find char-ptr and const-char-ptr params, analyze usage, classify */
+static void classify_params(void) {
+    param_info_count = 0;
+
+    for (int i = 0; i < token_count; i++) {
+        /* find function declarations: type name ( params ) { */
+        /* look for ( that could start a param list */
+        if (tokens[i].type != CT_LPAREN) continue;
+        if (i < 2) continue;
+
+        /* check if preceded by: IDENT IDENT( or IDENT *IDENT( pattern */
+        int fname = -1;
+        { int k = i - 1;
+          while (k > 0 && tokens[k].type == CT_WHITESPACE) k--;
+          if (k >= 0 && tokens[k].type == CT_IDENT) fname = k;
+        }
+        if (fname < 0) continue;
+
+        /* find matching ) and then { */
+        int depth = 1, close = i + 1;
+        while (close < token_count && depth > 0) {
+            if (tokens[close].type == CT_LPAREN) depth++;
+            if (tokens[close].type == CT_RPAREN) depth--;
+            close++;
+        }
+        /* close is past ). Find { */
+        int brace = skip_ws(close);
+        if (brace >= token_count || tokens[brace].type != CT_LBRACE) continue;
+
+        /* find matching } for function body */
+        int body_end = brace + 1;
+        depth = 1;
+        while (body_end < token_count && depth > 0) {
+            if (tokens[body_end].type == CT_LBRACE) depth++;
+            if (tokens[body_end].type == CT_RBRACE) depth--;
+            body_end++;
+        }
+
+        /* scan params for char-ptr and const-char-ptr patterns */
+        int p = i + 1;
+        while (p < close - 1) {
+            if (tokens[p].type == CT_WHITESPACE || tokens[p].type == CT_COMMA) { p++; continue; }
+
+            /* detect const */
+            bool is_const = false;
+            if (tokens[p].type == CT_IDENT && tok_eq(&tokens[p], "const")) {
+                is_const = true;
+                p++; while (p < close && tokens[p].type == CT_WHITESPACE) p++;
+            }
+
+            /* detect char-ptr or void-ptr type */
+            bool is_char_ptr = false;
+            if (p < close && tokens[p].type == CT_IDENT &&
+                (tok_eq(&tokens[p], "char") || tok_eq(&tokens[p], "void"))) {
+                int k = skip_spaces(p + 1);
+                if (k < close && tokens[k].type == CT_STAR) {
+                    is_char_ptr = true;
+                    p = k + 1;
+                    while (p < close && tokens[p].type == CT_WHITESPACE) p++;
+                }
+            }
+
+            if (!is_char_ptr) { p++; continue; }
+
+            /* read param name */
+            if (p >= close || tokens[p].type != CT_IDENT) { p++; continue; }
+            if (param_info_count >= MAX_PARAM_INFO) break;
+
+            ParamInfo *pi = &param_infos[param_info_count];
+            memset(pi, 0, sizeof(*pi));
+            int nlen = tokens[p].len < 63 ? tokens[p].len : 63;
+            memcpy(pi->name, tokens[p].start, nlen);
+            pi->name[nlen] = '\0';
+            pi->is_const = is_const;
+            pi->func_idx = brace;
+            pi->func_end = body_end;
+            pi->is_slice = false;
+            pi->is_nullable = false;
+
+            /* scan function body for usage patterns */
+            for (int b = brace + 1; b < body_end - 1; b++) {
+                if (tokens[b].type != CT_IDENT) continue;
+                if (!tok_eq(&tokens[b], pi->name)) continue;
+
+                /* check what follows the name */
+                int after = skip_spaces(b + 1);
+
+                /* name[...] → indexing → slice */
+                if (after < body_end && tokens[after].type == CT_LBRACKET) {
+                    pi->is_slice = true;
+                }
+                /* name == NULL / name != NULL → nullable */
+                if (after + 1 < body_end && tokens[after].type == CT_EQEQ) {
+                    int val = skip_spaces(after + 1);
+                    if (val < body_end && tokens[val].type == CT_IDENT && tok_eq(&tokens[val], "NULL"))
+                        pi->is_nullable = true;
+                }
+                if (after + 1 < body_end && tokens[after].type == CT_BANGEQ) {
+                    int val = skip_spaces(after + 1);
+                    if (val < body_end && tokens[val].type == CT_IDENT && tok_eq(&tokens[val], "NULL"))
+                        pi->is_nullable = true;
+                }
+                /* name = NULL → nullable */
+                if (after < body_end && tokens[after].type == CT_EQ) {
+                    int val = skip_spaces(after + 1);
+                    if (val < body_end && tokens[val].type == CT_IDENT && tok_eq(&tokens[val], "NULL"))
+                        pi->is_nullable = true;
+                }
+
+                /* check what precedes — if(!name) or if(name) → nullable */
+                int before = b - 1;
+                while (before > brace && tokens[before].type == CT_WHITESPACE) before--;
+                if (before > brace && tokens[before].type == CT_BANG)
+                    pi->is_nullable = true;
+                if (before > brace && tokens[before].type == CT_LPAREN) {
+                    /* if(name) pattern — check if preceded by if/while */
+                    int kw = before - 1;
+                    while (kw > brace && tokens[kw].type == CT_WHITESPACE) kw--;
+                    if (kw > brace && tokens[kw].type == CT_IDENT &&
+                        (tok_eq(&tokens[kw], "if") || tok_eq(&tokens[kw], "while")))
+                        pi->is_nullable = true;
+                }
+
+                /* check if name is arg to strlen/strcmp/printf → string → slice */
+                if (before > brace && tokens[before].type == CT_LPAREN) {
+                    int fn = before - 1;
+                    while (fn > brace && tokens[fn].type == CT_WHITESPACE) fn--;
+                    if (fn > brace && tokens[fn].type == CT_IDENT) {
+                        if (tok_eq(&tokens[fn], "strlen") || tok_eq(&tokens[fn], "strcmp") ||
+                            tok_eq(&tokens[fn], "strncmp") || tok_eq(&tokens[fn], "strcpy") ||
+                            tok_eq(&tokens[fn], "strcat") || tok_eq(&tokens[fn], "puts") ||
+                            tok_eq(&tokens[fn], "printf") || tok_eq(&tokens[fn], "fputs"))
+                            pi->is_slice = true;
+                    }
+                }
+                /* also as second arg: strcmp(other, name) */
+                if (before > brace && tokens[before].type == CT_COMMA) {
+                    /* walk back to find function name before ( */
+                    int scan = before - 1;
+                    int pdepth = 0;
+                    while (scan > brace) {
+                        if (tokens[scan].type == CT_RPAREN) pdepth++;
+                        if (tokens[scan].type == CT_LPAREN) {
+                            if (pdepth == 0) break;
+                            pdepth--;
+                        }
+                        scan--;
+                    }
+                    /* scan is at (. Check token before it. */
+                    int fn = scan - 1;
+                    while (fn > brace && tokens[fn].type == CT_WHITESPACE) fn--;
+                    if (fn > brace && tokens[fn].type == CT_IDENT) {
+                        if (tok_eq(&tokens[fn], "strcmp") || tok_eq(&tokens[fn], "strncmp") ||
+                            tok_eq(&tokens[fn], "memcpy") || tok_eq(&tokens[fn], "memcmp"))
+                            pi->is_slice = true;
+                    }
+                }
+            }
+
+            /* const char * without counter-evidence → slice (convention) */
+            if (is_const && !pi->is_slice) {
+                pi->is_slice = true; /* const char* is almost always a string */
+            }
+
+            param_info_count++;
+            p++;
+        }
+    }
 }
 
 static void emit_raw(const char *s, int len) {
@@ -508,81 +732,91 @@ static void transform(void) {
             }
         }
 
+        /* ---- switch depth tracking ---- */
+        if (t->type == CT_IDENT && tok_eq(t, "switch")) {
+            /* emit "switch" and track depth — the { after switch(...) increments */
+            emit_str("switch");
+            i++;
+            /* emit everything up to and including the { */
+            while (i < token_count && tokens[i].type != CT_LBRACE && tokens[i].type != CT_EOF) {
+                emit_tok(&tokens[i]); i++;
+            }
+            if (i < token_count && tokens[i].type == CT_LBRACE) {
+                emit_tok(&tokens[i]); i++;
+                switch_depth++;
+            }
+            continue;
+        }
+
         /* ---- switch/case/break → ZER switch syntax ---- */
-        /* case VALUE: → .VALUE => { and default: → default => { */
-        if (t->type == CT_IDENT && tok_eq(t, "case")) {
-            /* close previous arm if one was open (case without break) */
-            if (in_switch_arm) {
+        if (t->type == CT_IDENT && tok_eq(t, "case") && switch_depth > 0) {
+            if (in_switch_arm_at_current_depth()) {
                 emit_str("}\n");
-                in_switch_arm = false;
+                pop_switch_arm();
                 for (int w = i - 1; w >= 0 && tokens[w].type == CT_WHITESPACE; w--) {
                     emit_tok(&tokens[w]);
                 }
             }
             i++;
             int j = skip_spaces(i);
-            /* collect case value up to : */
             emit_str(".");
             while (j < token_count && tokens[j].type != CT_COLON) {
-                emit_tok(&tokens[j]);
-                j++;
+                emit_tok(&tokens[j]); j++;
             }
-            if (j < token_count && tokens[j].type == CT_COLON) j++; /* skip : */
-            /* check for consecutive case (fallthrough): case X: case Y: → .X, .Y => */
+            if (j < token_count && tokens[j].type == CT_COLON) j++;
+            /* merge consecutive case labels */
             while (1) {
                 int nxt = skip_ws(j);
                 if (nxt < token_count && tokens[nxt].type == CT_IDENT && tok_eq(&tokens[nxt], "case")) {
-                    nxt++; /* skip 'case' */
+                    nxt++;
                     int k = skip_spaces(nxt);
                     emit_str(", .");
                     while (k < token_count && tokens[k].type != CT_COLON) {
-                        emit_tok(&tokens[k]);
-                        k++;
+                        emit_tok(&tokens[k]); k++;
                     }
                     if (k < token_count && tokens[k].type == CT_COLON) k++;
                     j = k;
-                } else {
-                    break;
-                }
+                } else break;
             }
             emit_str(" => {");
-            in_switch_arm = true;
+            push_switch_arm();
             i = j;
             continue;
         }
-        if (t->type == CT_IDENT && tok_eq(t, "default")) {
+        if (t->type == CT_IDENT && tok_eq(t, "default") && switch_depth > 0) {
             int j = skip_spaces(i + 1);
             if (j < token_count && tokens[j].type == CT_COLON) {
-                /* close previous arm if open */
-                if (in_switch_arm) {
+                if (in_switch_arm_at_current_depth()) {
                     emit_str("}\n");
-                    in_switch_arm = false;
-                    /* re-emit indentation (whitespace before default was already emitted) */
+                    pop_switch_arm();
                     for (int w = i - 1; w >= 0 && tokens[w].type == CT_WHITESPACE; w--) {
                         emit_tok(&tokens[w]);
                     }
                 }
                 emit_str("default => {");
-                in_switch_arm = true;
+                push_switch_arm();
                 i = j + 1;
                 continue;
             }
         }
-        /* break; inside switch → } (close arm block) */
-        if (t->type == CT_IDENT && tok_eq(t, "break") && in_switch_arm) {
+        /* break; inside switch arm → } (close arm block) */
+        if (t->type == CT_IDENT && tok_eq(t, "break") && in_switch_arm_at_current_depth()) {
             int j = skip_spaces(i + 1);
             if (j < token_count && tokens[j].type == CT_SEMICOLON) {
                 emit_str("}");
-                in_switch_arm = false;
-                i = j + 1; /* skip break + ; */
+                pop_switch_arm();
+                i = j + 1;
                 continue;
             }
         }
-        /* closing } of switch body — close any open arm first */
-        if (t->type == CT_RBRACE && in_switch_arm) {
-            emit_str("}\n"); /* close the arm */
-            in_switch_arm = false;
-            /* don't consume the } — let it emit normally for the switch body close */
+        /* closing } of switch body — close any open arm, decrement depth */
+        if (t->type == CT_RBRACE && switch_depth > 0) {
+            if (in_switch_arm_at_current_depth()) {
+                emit_str("}\n");
+                pop_switch_arm();
+            }
+            switch_depth--;
+            /* emit the } normally */
         }
 
         /* ---- do { body } while (cond); → while (true) { body if (!(cond)) { break; } } ---- */
@@ -682,6 +916,44 @@ static void transform(void) {
 
         /* ---- Type mapping: int → i32, uint8_t → u8, etc. ---- */
         if (t->type == CT_IDENT) {
+
+            /* char * name → []u8 name or ?*u8 name (usage-based classification) */
+            {
+                bool had_const = false;
+                int ci_pos = i;
+                bool check_char = tok_eq(t, "char");
+                if (!check_char && tok_eq(t, "const")) {
+                    ci_pos = skip_spaces(i + 1);
+                    if (ci_pos < token_count && tok_eq(&tokens[ci_pos], "char")) {
+                        had_const = true;
+                        check_char = true;
+                    }
+                }
+                if (check_char) {
+                    int star_pos = skip_spaces(ci_pos + 1);
+                    if (star_pos < token_count && tokens[star_pos].type == CT_STAR) {
+                        int name_pos = skip_spaces(star_pos + 1);
+                        if (name_pos < token_count && tokens[name_pos].type == CT_IDENT) {
+                            ParamInfo *pi = find_param_info(tokens[name_pos].start, tokens[name_pos].len, name_pos);
+                            if (pi && pi->is_slice) {
+                                if (had_const) emit_str("const ");
+                                if (pi->is_nullable) emit_str("?");
+                                emit_str("[]u8 ");
+                                i = star_pos + 1;
+                                while (i < token_count && tokens[i].type == CT_WHITESPACE) i++;
+                                continue;
+                            }
+                            if (pi && pi->is_nullable && !pi->is_slice) {
+                                if (had_const) emit_str("const ");
+                                emit_str("?*u8 ");
+                                i = star_pos + 1;
+                                while (i < token_count && tokens[i].type == CT_WHITESPACE) i++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
 
             /* Two-token type combos: unsigned int → u32, etc.
              * Must check BEFORE single-token map to avoid double-mapping. */
@@ -1260,6 +1532,7 @@ int main(int argc, char **argv) {
     if (!src) return 1;
 
     tokenize(src, src_len);
+    classify_params();
 
     out = fopen(output_path, "w");
     if (!out) {

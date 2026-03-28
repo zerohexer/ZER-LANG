@@ -331,6 +331,31 @@ check_phase2_absent "import compat removed when clean" \
 void f() { usize n = zer_strlen(s); }' \
     "import compat;"
 
+# --- bare strcmp kept as compat ---
+check_phase2 "bare strcmp kept as compat" \
+    'import compat;
+void f() { i32 r = zer_strcmp(a, b); }' \
+    "zer_strcmp"
+
+# --- nested switch ---
+check_phase1 "nested switch outer" 'void f() {
+switch(x) { case 1: switch(y) { case 10: a(); break; default: b(); break; } break; case 2: c(); break; }
+}' ".1 => {"
+check_phase1 "nested switch inner" 'void f() {
+switch(x) { case 1: switch(y) { case 10: a(); break; default: b(); break; } break; case 2: c(); break; }
+}' ".10 => {"
+
+# --- char* → []u8 classification ---
+check_phase1 "const char* → const []u8" \
+    'int f(const char *s) { return strlen(s); }' \
+    "const []u8 s"
+check_phase1 "char* with null check → ?[]u8" \
+    'int f(char *s) { if (s == NULL) return -1; return strlen(s); }' \
+    "?[]u8 s"
+check_phase1 "char* write-only stays *u8" \
+    'void f(char *p) { *p = 42; }' \
+    "u8 *p"
+
 # --- strcmp space preservation ---
 check_phase2 "strcmp ==0 preserves space before &&" \
     'import compat;

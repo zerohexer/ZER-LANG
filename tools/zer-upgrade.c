@@ -566,16 +566,21 @@ static void upgrade(const char *src, int src_len) {
                 if (!has_neq0 && after + 2 < src_len && src[after] == '!' && src[after+1] == '=' && src[after+2] == '0')
                     has_neq0 = true;
 
+                /* bare usage without == 0 or != 0: keep as compat (returns i32, not bool) */
+                if (!has_eq0 && !has_neq0) {
+                    kept++;
+                    goto strcmp_skip;
+                }
+
                 if (has_neq0) out_str("!");
                 out_str("bytes_equal(");
                 out_write(src + open + 1, close - open - 1);
                 out_str(")");
                 if (has_eq0 || has_neq0) {
-                    /* skip past the == 0 / != 0: advance past the operator and the 0 */
-                    i = after; /* at == or != */
-                    i += 2;   /* past == or != */
-                    while (i < src_len && src[i] == ' ') i++; /* skip spaces */
-                    if (i < src_len && src[i] == '0') i++; /* skip the 0 */
+                    i = after;
+                    i += 2;
+                    while (i < src_len && src[i] == ' ') i++;
+                    if (i < src_len && src[i] == '0') i++;
                 } else {
                     i = close + 1;
                 }
@@ -584,6 +589,7 @@ static void upgrade(const char *src, int src_len) {
                 continue;
             }
         }
+        strcmp_skip:
 
         /* ---- zer_strncmp(a, b, n) → bytes_equal(a[0..n], b[0..n]) ---- */
         if (starts_with(src, i, src_len, "zer_strncmp(") && word_boundary_before(src, i)) {
@@ -600,6 +606,7 @@ static void upgrade(const char *src, int src_len) {
                     bool has_neq0 = (after + 3 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]==' ' && src[after+3]=='0');
                     if (!has_eq0 && after+2 < src_len && src[after]=='=' && src[after+1]=='=' && src[after+2]=='0') has_eq0 = true;
                     if (!has_neq0 && after+2 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]=='0') has_neq0 = true;
+                    if (!has_eq0 && !has_neq0) { kept++; goto strncmp_skip; }
                     if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
                     out_write(src + args[0].start, args[0].len);
@@ -612,7 +619,7 @@ static void upgrade(const char *src, int src_len) {
                     out_str("])");
                     if (has_eq0 || has_neq0) {
                         i = after;
-                        i += 2; /* past == or != */
+                        i += 2;
                         while (i < src_len && src[i] == ' ') i++;
                         if (i < src_len && src[i] == '0') i++;
                     } else {
@@ -624,6 +631,7 @@ static void upgrade(const char *src, int src_len) {
                 }
             }
         }
+        strncmp_skip:
 
         /* ---- zer_memcpy(dst, src, n) → bytes_copy(dst, src) ---- */
         if (starts_with(src, i, src_len, "zer_memcpy(") && word_boundary_before(src, i)) {
@@ -710,6 +718,7 @@ static void upgrade(const char *src, int src_len) {
                     bool has_neq0 = (after + 3 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]==' ' && src[after+3]=='0');
                     if (!has_eq0 && after+2 < src_len && src[after]=='=' && src[after+1]=='=' && src[after+2]=='0') has_eq0 = true;
                     if (!has_neq0 && after+2 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]=='0') has_neq0 = true;
+                    if (!has_eq0 && !has_neq0) { kept++; goto memcmp_skip; }
                     if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
                     out_write(src + args[0].start, args[0].len);
@@ -720,20 +729,17 @@ static void upgrade(const char *src, int src_len) {
                     out_str("[0..");
                     out_write(src + args[2].start, args[2].len);
                     out_str("])");
-                    if (has_eq0 || has_neq0) {
-                        i = after;
-                        i += 2;
-                        while (i < src_len && src[i] == ' ') i++;
-                        if (i < src_len && src[i] == '0') i++;
-                    } else {
-                        i = close + 1;
-                    }
+                    i = after;
+                    i += 2;
+                    while (i < src_len && src[i] == ' ') i++;
+                    if (i < src_len && src[i] == '0') i++;
                     upgrades++;
                     needs_str_import = true;
                     continue;
                 }
             }
         }
+        memcmp_skip:
 
         /* ---- zer_exit(n) → @trap() ---- */
         if (starts_with(src, i, src_len, "zer_exit(") && word_boundary_before(src, i)) {

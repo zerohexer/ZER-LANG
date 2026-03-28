@@ -1278,6 +1278,42 @@ static void transform(void) {
                     continue;
                 }
             }
+
+            /* Pointer arithmetic: ptr + N → ptr[N..] (sub-slice)
+             * Only for classified char* params that became slices. */
+            {
+                ParamInfo *pi = find_param_info(t->start, t->len, i);
+                if (pi && pi->is_slice) {
+                    int j = skip_spaces(i + 1);
+                    if (j < token_count && tokens[j].type == CT_PLUS) {
+                        /* collect the offset expression up to ) or ; or , */
+                        int k = skip_spaces(j + 1);
+                        int expr_start = k;
+                        int depth = 0;
+                        while (k < token_count) {
+                            if (tokens[k].type == CT_LPAREN) depth++;
+                            if (tokens[k].type == CT_RPAREN) { if (depth == 0) break; depth--; }
+                            if (depth == 0 && (tokens[k].type == CT_SEMICOLON ||
+                                               tokens[k].type == CT_COMMA ||
+                                               tokens[k].type == CT_RBRACKET)) break;
+                            k++;
+                        }
+                        /* ptr + N → ptr[N..] */
+                        emit_tok(t);
+                        emit_str("[");
+                        for (int x = expr_start; x < k; x++) {
+                            if (tokens[x].type == CT_IDENT) {
+                                const char *mt = map_type(&tokens[x]);
+                                if (mt) { emit_str(mt); continue; }
+                            }
+                            emit_tok(&tokens[x]);
+                        }
+                        emit_str("..]");
+                        i = k;
+                        continue;
+                    }
+                }
+            }
         }
 
         /* ---- C-style cast: (int)x → @truncate(i32, x), (Node *)p → @ptrcast(*Node, p) ---- */

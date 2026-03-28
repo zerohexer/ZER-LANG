@@ -331,11 +331,11 @@ check_phase2_absent "import compat removed when clean" \
 void f() { usize n = zer_strlen(s); }' \
     "import compat;"
 
-# --- bare strcmp kept as compat ---
-check_phase2 "bare strcmp kept as compat" \
+# --- bare strcmp → bytes_compare ---
+check_phase2 "bare strcmp→bytes_compare" \
     'import compat;
 void f() { i32 r = zer_strcmp(a, b); }' \
-    "zer_strcmp"
+    "bytes_compare(a, b)"
 
 # --- nested switch ---
 check_phase1 "nested switch outer" 'void f() {

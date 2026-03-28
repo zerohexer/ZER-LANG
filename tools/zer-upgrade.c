@@ -612,10 +612,15 @@ static void upgrade(const char *src, int src_len) {
                 if (!has_neq0 && after + 2 < src_len && src[after] == '!' && src[after+1] == '=' && src[after+2] == '0')
                     has_neq0 = true;
 
-                /* bare usage without == 0 or != 0: keep as compat (returns i32, not bool) */
+                /* bare usage without == 0 or != 0: use bytes_compare (returns i32) */
                 if (!has_eq0 && !has_neq0) {
-                    kept++;
-                    goto strcmp_skip;
+                    out_str("bytes_compare(");
+                    out_write_with_handles(src, open + 1, close - open - 1, i);
+                    out_str(")");
+                    i = close + 1;
+                    upgrades++;
+                    needs_str_import = true;
+                    continue;
                 }
 
                 if (has_neq0) out_str("!");
@@ -652,7 +657,21 @@ static void upgrade(const char *src, int src_len) {
                     bool has_neq0 = (after + 3 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]==' ' && src[after+3]=='0');
                     if (!has_eq0 && after+2 < src_len && src[after]=='=' && src[after+1]=='=' && src[after+2]=='0') has_eq0 = true;
                     if (!has_neq0 && after+2 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]=='0') has_neq0 = true;
-                    if (!has_eq0 && !has_neq0) { kept++; goto strncmp_skip; }
+                    if (!has_eq0 && !has_neq0) {
+                        out_str("bytes_compare(");
+                        out_write_with_handles(src, args[0].start, args[0].len, i);
+                        out_str("[0..");
+                        out_write_with_handles(src, args[2].start, args[2].len, i);
+                        out_str("], ");
+                        out_write_with_handles(src, args[1].start, args[1].len, i);
+                        out_str("[0..");
+                        out_write_with_handles(src, args[2].start, args[2].len, i);
+                        out_str("])");
+                        i = close + 1;
+                        upgrades++;
+                        needs_str_import = true;
+                        continue;
+                    }
                     if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
                     out_write_with_handles(src, args[0].start, args[0].len, i);
@@ -806,7 +825,21 @@ static void upgrade(const char *src, int src_len) {
                     bool has_neq0 = (after + 3 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]==' ' && src[after+3]=='0');
                     if (!has_eq0 && after+2 < src_len && src[after]=='=' && src[after+1]=='=' && src[after+2]=='0') has_eq0 = true;
                     if (!has_neq0 && after+2 < src_len && src[after]=='!' && src[after+1]=='=' && src[after+2]=='0') has_neq0 = true;
-                    if (!has_eq0 && !has_neq0) { kept++; goto memcmp_skip; }
+                    if (!has_eq0 && !has_neq0) {
+                        out_str("bytes_compare(");
+                        out_write_with_handles(src, args[0].start, args[0].len, i);
+                        out_str("[0..");
+                        out_write_with_handles(src, args[2].start, args[2].len, i);
+                        out_str("], ");
+                        out_write_with_handles(src, args[1].start, args[1].len, i);
+                        out_str("[0..");
+                        out_write_with_handles(src, args[2].start, args[2].len, i);
+                        out_str("])");
+                        i = close + 1;
+                        upgrades++;
+                        needs_str_import = true;
+                        continue;
+                    }
                     if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
                     out_write_with_handles(src, args[0].start, args[0].len, i);

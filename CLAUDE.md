@@ -331,6 +331,21 @@ Two tools + one library for automated C-to-ZER migration:
 
 **Pipeline:** `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`
 
+**Multi-file conversion and cinclude → import migration:**
+- Each `.c` file converts independently. Types are shared via `cinclude "header.h"` (passes through to GCC).
+- `cinclude` is safe scaffolding — GCC handles type resolution across C headers. Converted `.zer` files compile correctly with `cinclude`.
+- For **fully safe ZER** (Handle-based, bounds-checked across modules): replace `cinclude "module.h"` with `import module;`. This requires converting the header into a `.zer` module file with ZER type signatures (e.g., `?Handle(Connection)` instead of `Connection *`).
+- Both approaches are valid: `cinclude` for mixed C/ZER projects (incremental migration), `import` for pure ZER projects (full safety).
+- The converter does NOT auto-convert `cinclude` → `import` — this is a manual step when the user is ready to make the module fully ZER.
+
+**zer-upgrade additional rules (post-agent-audit):**
+- `zer_memset(var, 0, sizeof(T))` and `bytes_zero(var)` after Slab alloc are auto-removed (Slab uses calloc, already zeroed).
+- `zer_strcpy(dst, src)` → `@cstr(dst, src)`, `zer_strncpy(dst, src, n)` → `@cstr(dst, src)`.
+- Bare `zer_strcmp`/`zer_strncmp`/`zer_memcmp` without `== 0`/`!= 0` kept as compat (wrong return type: `i32` vs `bool`).
+- Comments (`//` and block comments) skipped — `zer_` names inside comments preserved.
+- `char *` params classified by usage: `strlen`/`strcmp`/indexing → `[]u8`, null checks → `?*T`/`?[]T`, `const char *` convention → `const []u8`, write-through `*p = val` → `*u8`, ambiguous → `*u8` + compat.
+- Nested switch uses depth counter (not single boolean) — inner switch break doesn't corrupt outer arm tracking.
+
 ### Structural Refactors Completed (RF1-RF7)
 
 These changed fundamental patterns. Fresh sessions MUST know:

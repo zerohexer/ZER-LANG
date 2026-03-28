@@ -675,6 +675,48 @@ static void upgrade(const char *src, int src_len) {
             }
         }
 
+        /* ---- zer_strcpy(dst, src) → @cstr(dst, src) ---- */
+        if (starts_with(src, i, src_len, "zer_strcpy(") && word_boundary_before(src, i)) {
+            int open = i + 10;
+            int close = find_close_paren(src, open, src_len);
+            if (close > 0) {
+                Span args[2];
+                int argc = extract_args(src, open, close, args, 2);
+                if (argc == 2) {
+                    out_str("@cstr(");
+                    out_write(src + args[0].start, args[0].len);
+                    out_str(", ");
+                    out_write(src + args[1].start, args[1].len);
+                    out_str(")");
+                    i = close + 1;
+                    upgrades++;
+                    continue;
+                }
+            }
+        }
+
+        /* ---- zer_strncpy(dst, src, n) → @cstr(dst, src) ---- */
+        /* strncpy copies up to n bytes with null-termination.
+         * @cstr(dst, src) copies with bounds check. Close enough. */
+        if (starts_with(src, i, src_len, "zer_strncpy(") && word_boundary_before(src, i)) {
+            int open = i + 11;
+            int close = find_close_paren(src, open, src_len);
+            if (close > 0) {
+                Span args[3];
+                int argc = extract_args(src, open, close, args, 3);
+                if (argc == 3) {
+                    out_str("@cstr(");
+                    out_write(src + args[0].start, args[0].len);
+                    out_str(", ");
+                    out_write(src + args[1].start, args[1].len);
+                    out_str(")");
+                    i = close + 1;
+                    upgrades++;
+                    continue;
+                }
+            }
+        }
+
         /* ---- zer_memset(dst, val, n) → bytes_fill(dst, val) ---- */
         if (starts_with(src, i, src_len, "zer_memset(") && word_boundary_before(src, i)) {
             int open = i + 10;
@@ -833,16 +875,31 @@ static void upgrade(const char *src, int src_len) {
                                 /* skip to end of this line */
                                 i = line_start;
                                 while (i < src_len && src[i] != '\n') i++;
-                                /* skip the next line if it's a null check: if (!var) ... */
-                                if (i < src_len && src[i] == '\n') {
+                                /* skip subsequent lines that are redundant after Slab alloc */
+                                for (int skip_pass = 0; skip_pass < 3; skip_pass++) {
+                                    if (i >= src_len || src[i] != '\n') break;
                                     int peek = i + 1;
                                     while (peek < src_len && (src[peek] == ' ' || src[peek] == '\t')) peek++;
+                                    bool skip_line = false;
+                                    /* skip null check: if (!var) ... */
                                     if (starts_with(src, peek, src_len, "if (!") &&
                                         strncmp(src + peek + 5, var_buf, strlen(var_buf)) == 0) {
-                                        /* skip null check line */
+                                        skip_line = true;
+                                    }
+                                    /* skip memset zero: zer_memset(var, 0, ...) — Slab already zeroes */
+                                    if (starts_with(src, peek, src_len, "zer_memset(") &&
+                                        strncmp(src + peek + 11, var_buf, strlen(var_buf)) == 0) {
+                                        skip_line = true;
+                                    }
+                                    /* skip bytes_zero(var) — Slab already zeroes */
+                                    if (starts_with(src, peek, src_len, "bytes_zero(") &&
+                                        strncmp(src + peek + 11, var_buf, strlen(var_buf)) == 0) {
+                                        skip_line = true;
+                                    }
+                                    if (skip_line) {
                                         i++;
                                         while (i < src_len && src[i] != '\n') i++;
-                                    }
+                                    } else break;
                                 }
                                 upgrades++;
                                 continue;

@@ -272,6 +272,52 @@ static void find_func_bounds(const char *src, int src_len, int pos, int *out_sta
 }
 
 /* Pre-scan: find all malloc/free patterns in source */
+/* emit an argument span with handle rewriting applied.
+ * Scans for identifiers that match handle variables and rewrites them.
+ * Used by Layer 1 handlers (strncpy→@cstr, memcpy→bytes_copy, etc.)
+ * so their args get Layer 2 handle treatment. */
+static void out_write_with_handles(const char *src, int start, int len, int src_pos) {
+    int end = start + len;
+    int ii = start;
+    while (ii < end) {
+        if (!isalpha(src[ii]) && src[ii] != '_') {
+            out_write(src + ii, 1);
+            ii++;
+            continue;
+        }
+        int id_start = ii;
+        while (ii < end && (isalnum(src[ii]) || src[ii] == '_')) ii++;
+        int id_len = ii - id_start;
+        char ident[64] = {0};
+        if (id_len < 63) memcpy(ident, src + id_start, id_len);
+
+        /* skip if preceded by . (field name) */
+        if (id_start > start && src[id_start - 1] == '.') {
+            out_write(src + id_start, id_len);
+            continue;
+        }
+
+        AllocInfo *ai = find_alloc(ident, src_pos);
+        HandleParam *hp = ai ? NULL : find_handle_param(ident, src_pos);
+
+        if (ai || hp) {
+            const char *type = ai ? ai->type_name : hp->type_name;
+            const char *slab = get_slab_name(type);
+            if (ii < end && src[ii] == '.') {
+                out_str(slab);
+                out_str(".get(");
+                out_write(src + id_start, id_len);
+                out_str("_h)");
+            } else {
+                out_write(src + id_start, id_len);
+                out_str("_h");
+            }
+        } else {
+            out_write(src + id_start, id_len);
+        }
+    }
+}
+
 static void scan_allocs(const char *src, int src_len) {
     alloc_count = 0;
     slab_type_count = 0;
@@ -536,7 +582,7 @@ static void upgrade(const char *src, int src_len) {
                 Span args[1];
                 int argc = extract_args(src, open, close, args, 1);
                 if (argc == 1) {
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str(".len");
                     i = close + 1;
                     upgrades++;
@@ -574,7 +620,7 @@ static void upgrade(const char *src, int src_len) {
 
                 if (has_neq0) out_str("!");
                 out_str("bytes_equal(");
-                out_write(src + open + 1, close - open - 1);
+                out_write_with_handles(src, open + 1, close - open - 1, i);
                 out_str(")");
                 if (has_eq0 || has_neq0) {
                     i = after;
@@ -609,13 +655,13 @@ static void upgrade(const char *src, int src_len) {
                     if (!has_eq0 && !has_neq0) { kept++; goto strncmp_skip; }
                     if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str("[0..");
-                    out_write(src + args[2].start, args[2].len);
+                    out_write_with_handles(src, args[2].start, args[2].len, i);
                     out_str("], ");
-                    out_write(src + args[1].start, args[1].len);
+                    out_write_with_handles(src, args[1].start, args[1].len, i);
                     out_str("[0..");
-                    out_write(src + args[2].start, args[2].len);
+                    out_write_with_handles(src, args[2].start, args[2].len, i);
                     out_str("])");
                     if (has_eq0 || has_neq0) {
                         i = after;
@@ -642,9 +688,9 @@ static void upgrade(const char *src, int src_len) {
                 int argc = extract_args(src, open, close, args, 3);
                 if (argc == 3) {
                     out_str("bytes_copy(");
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str(", ");
-                    out_write(src + args[1].start, args[1].len);
+                    out_write_with_handles(src, args[1].start, args[1].len, i);
                     out_str(")");
                     i = close + 1;
                     upgrades++;
@@ -663,9 +709,9 @@ static void upgrade(const char *src, int src_len) {
                 int argc = extract_args(src, open, close, args, 3);
                 if (argc == 3) {
                     out_str("bytes_copy(");
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str(", ");
-                    out_write(src + args[1].start, args[1].len);
+                    out_write_with_handles(src, args[1].start, args[1].len, i);
                     out_str(")");
                     i = close + 1;
                     upgrades++;
@@ -684,9 +730,9 @@ static void upgrade(const char *src, int src_len) {
                 int argc = extract_args(src, open, close, args, 2);
                 if (argc == 2) {
                     out_str("@cstr(");
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str(", ");
-                    out_write(src + args[1].start, args[1].len);
+                    out_write_with_handles(src, args[1].start, args[1].len, i);
                     out_str(")");
                     i = close + 1;
                     upgrades++;
@@ -706,9 +752,9 @@ static void upgrade(const char *src, int src_len) {
                 int argc = extract_args(src, open, close, args, 3);
                 if (argc == 3) {
                     out_str("@cstr(");
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str(", ");
-                    out_write(src + args[1].start, args[1].len);
+                    out_write_with_handles(src, args[1].start, args[1].len, i);
                     out_str(")");
                     i = close + 1;
                     upgrades++;
@@ -728,13 +774,13 @@ static void upgrade(const char *src, int src_len) {
                     /* check if val is 0 → bytes_zero */
                     if (args[1].len == 1 && src[args[1].start] == '0') {
                         out_str("bytes_zero(");
-                        out_write(src + args[0].start, args[0].len);
+                        out_write_with_handles(src, args[0].start, args[0].len, i);
                         out_str(")");
                     } else {
                         out_str("bytes_fill(");
-                        out_write(src + args[0].start, args[0].len);
+                        out_write_with_handles(src, args[0].start, args[0].len, i);
                         out_str(", ");
-                        out_write(src + args[1].start, args[1].len);
+                        out_write_with_handles(src, args[1].start, args[1].len, i);
                         out_str(")");
                     }
                     i = close + 1;
@@ -763,13 +809,13 @@ static void upgrade(const char *src, int src_len) {
                     if (!has_eq0 && !has_neq0) { kept++; goto memcmp_skip; }
                     if (has_neq0) out_str("!");
                     out_str("bytes_equal(");
-                    out_write(src + args[0].start, args[0].len);
+                    out_write_with_handles(src, args[0].start, args[0].len, i);
                     out_str("[0..");
-                    out_write(src + args[2].start, args[2].len);
+                    out_write_with_handles(src, args[2].start, args[2].len, i);
                     out_str("], ");
-                    out_write(src + args[1].start, args[1].len);
+                    out_write_with_handles(src, args[1].start, args[1].len, i);
                     out_str("[0..");
-                    out_write(src + args[2].start, args[2].len);
+                    out_write_with_handles(src, args[2].start, args[2].len, i);
                     out_str("])");
                     i = after;
                     i += 2;

@@ -1809,8 +1809,20 @@ static Type *check_expr(Checker *c, Node *node) {
                                 arg_node->unary.operand->ident.name,
                                 (uint32_t)arg_node->unary.operand->ident.name_len);
                             if (arg_sym && !arg_sym->is_static) {
+                                /* BUG-317: check both raw AND mangled keys for imported globals */
                                 bool is_global = scope_lookup_local(c->global_scope,
                                     arg_sym->name, arg_sym->name_len) != NULL;
+                                if (!is_global && c->current_module) {
+                                    /* try mangled: module_name */
+                                    uint32_t mkl = c->current_module_len + 1 + arg_sym->name_len;
+                                    char mk[256];
+                                    if (mkl < sizeof(mk)) {
+                                        memcpy(mk, c->current_module, c->current_module_len);
+                                        mk[c->current_module_len] = '_';
+                                        memcpy(mk + c->current_module_len + 1, arg_sym->name, arg_sym->name_len);
+                                        is_global = scope_lookup_local(c->global_scope, mk, mkl) != NULL;
+                                    }
+                                }
                                 if (!is_global) {
                                     checker_error(c, node->loc.line,
                                         "argument %d: local variable '%.*s' cannot "
@@ -3702,11 +3714,12 @@ static void register_decl(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
                 }
-                /* BUG-227/232: reject recursive struct by value (incomplete type in C).
-                 * Unwrap arrays — S[1] contains S by value too. */
+                /* BUG-227/232/314: reject recursive struct by value (incomplete type in C).
+                 * Unwrap arrays AND distinct — S[1] or distinct S contains S by value too. */
                 {
                     Type *inner = sf->type;
                     while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+                    inner = type_unwrap_distinct(inner);
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "struct '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -3812,10 +3825,11 @@ static void register_decl(Checker *c, Node *node) {
                         "union variant '%.*s' cannot have type 'void'",
                         (int)uv->name_len, uv->name);
                 }
-                /* BUG-265: reject recursive union by value (incomplete type in C) */
+                /* BUG-265/314: reject recursive union by value (incomplete type in C) */
                 {
                     Type *inner = sv->type;
                     while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+                    inner = type_unwrap_distinct(inner);
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "union '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -4051,11 +4065,13 @@ static void check_func_body(Checker *c, Node *node) {
     if (node->kind == NODE_FUNC_DECL && node->func_decl.body) {
         /* resolve return type */
         Type *ret = resolve_type(c, node->func_decl.return_type);
-        /* BUG-270: reject array return types — C forbids returning arrays.
-         * Use a struct wrapper or return a slice instead. */
-        if (ret && ret->kind == TYPE_ARRAY) {
+        /* BUG-270/315: reject array return types — C forbids returning arrays.
+         * Unwrap distinct — distinct typedef u8[10] Buffer is still an array. */
+        { Type *ret_base = type_unwrap_distinct(ret);
+        if (ret_base && ret_base->kind == TYPE_ARRAY) {
             checker_error(c, node->loc.line,
                 "cannot return array type — use a struct wrapper or slice instead");
+        }
         }
         c->current_func_ret = ret;
 

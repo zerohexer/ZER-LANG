@@ -519,7 +519,8 @@ static inline int64_t eval_const_expr(Node *n) {
             return l % r;
         case TOK_LSHIFT:
             if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
-            return l << r;
+            /* BUG-318: cast to unsigned to avoid signed overflow UB */
+            return (int64_t)((uint64_t)l << r);
         case TOK_RSHIFT:
             if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
             return l >> r;

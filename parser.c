@@ -586,8 +586,15 @@ static Node *parse_primary(Parser *p) {
         /* collect args — first check for type argument */
         /* intrinsics like @ptrcast(*T, expr) and @size(T) take a type as first arg */
         /* @cast always takes a named type (distinct typedef) — allow TOK_IDENT for it */
+        /* BUG-316: allow named types (TOK_IDENT) as first arg for intrinsics
+         * that take type parameters: @cast, @bitcast, @truncate, @saturate */
         bool force_type_arg = (n->intrinsic.name_len == 4 &&
-                               memcmp(n->intrinsic.name, "cast", 4) == 0);
+                               memcmp(n->intrinsic.name, "cast", 4) == 0) ||
+                              (n->intrinsic.name_len == 7 &&
+                               memcmp(n->intrinsic.name, "bitcast", 7) == 0) ||
+                              (n->intrinsic.name_len == 8 &&
+                               (memcmp(n->intrinsic.name, "truncate", 8) == 0 ||
+                                memcmp(n->intrinsic.name, "saturate", 8) == 0));
         if (is_type_token(p->current.type) &&
             (p->current.type != TOK_IDENT || force_type_arg)) {
             n->intrinsic.type_arg = parse_type(p);

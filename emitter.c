@@ -760,13 +760,14 @@ static void emit_expr(Emitter *e, Node *node) {
         if (node->assign.op == TOK_EQ) {
             Type *tgt_type = checker_get_type(e->checker,node->assign.target);
             if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
-                /* BUG-273: check if target is volatile — use byte loop instead of memcpy */
-                bool arr_volatile = expr_is_volatile(e, node->assign.target);
+                /* BUG-273/320: check if target OR source is volatile — use byte loop */
+                bool arr_volatile = expr_is_volatile(e, node->assign.target) ||
+                                    expr_is_volatile(e, node->assign.value);
                 int tmp = e->temp_count++;
                 if (arr_volatile) {
                     emit(e, "({ volatile uint8_t *_zer_vd%d = (volatile uint8_t*)&(", tmp);
                     emit_expr(e, node->assign.target);
-                    emit(e, "); const uint8_t *_zer_vs%d = (const uint8_t*)&(", tmp);
+                    emit(e, "); const volatile uint8_t *_zer_vs%d = (const volatile uint8_t*)&(", tmp);
                     emit_expr(e, node->assign.value);
                     emit(e, "); for (size_t _i = 0; _i < sizeof(");
                     emit_expr(e, node->assign.target);
@@ -1912,9 +1913,12 @@ static void emit_stmt(Emitter *e, Node *node) {
                 or_expr_type->kind == TYPE_OPTIONAL &&
                 is_null_sentinel(or_expr_type->optional.inner);
 
+            /* BUG-319: use __typeof__ to preserve volatile qualifier */
             int tmp = e->temp_count++;
             emit_indent(e);
-            emit(e, "__auto_type _zer_or%d = ", tmp);
+            emit(e, "__typeof__(");
+            emit_expr(e, node->var_decl.init->orelse.expr);
+            emit(e, ") _zer_or%d = ", tmp);
             emit_expr(e, node->var_decl.init->orelse.expr);
             emit(e, ";\n");
             emit_indent(e);
@@ -2015,12 +2019,14 @@ static void emit_stmt(Emitter *e, Node *node) {
                 } else if (type && type->kind == TYPE_ARRAY &&
                            init_type && init_type->kind == TYPE_ARRAY) {
                     /* array = array: C arrays aren't assignable, use memcpy.
-                     * BUG-278: volatile arrays use byte loop (memcpy strips volatile) */
+                     * BUG-278/320: volatile arrays (target OR source) use byte loop */
                     emit(e, " = {0};\n");
                     emit_indent(e);
-                    if (node->var_decl.is_volatile) {
+                    bool vd_init_volatile = node->var_decl.is_volatile ||
+                                            expr_is_volatile(e, node->var_decl.init);
+                    if (vd_init_volatile) {
                         int tmp = e->temp_count++;
-                        emit(e, "{ const uint8_t *_zer_vs%d = (const uint8_t*)&(", tmp);
+                        emit(e, "{ const volatile uint8_t *_zer_vs%d = (const volatile uint8_t*)&(", tmp);
                         emit_expr(e, node->var_decl.init);
                         emit(e, "); for (size_t _i = 0; _i < sizeof(%.*s); _i++) "
                              "((volatile uint8_t*)%.*s)[_i] = _zer_vs%d[_i]; }",
@@ -2102,7 +2108,10 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "{\n");
                 e->indent++;
                 emit_indent(e);
-                emit(e, "__auto_type %.*s = &_zer_uwp%d->value;\n",
+                /* BUG-321/322: preserve volatile in capture pointer */
+                if (cond_vol) emit(e, "volatile ");
+                emit(e, "__typeof__(_zer_uwp%d->value) *%.*s = &_zer_uwp%d->value;\n",
+                     tmp,
                      (int)node->if_stmt.capture_name_len,
                      node->if_stmt.capture_name, tmp);
             } else {
@@ -2131,7 +2140,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                 e->indent++;
                 emit_indent(e);
                 if (is_ptr_opt) {
-                    emit(e, "__auto_type %.*s = _zer_uw%d;\n",
+                    /* BUG-322: use __typeof__ to preserve volatile */
+                    emit(e, "__typeof__(_zer_uw%d) %.*s = _zer_uw%d;\n",
+                         tmp,
                          (int)node->if_stmt.capture_name_len,
                          node->if_stmt.capture_name, tmp);
                 } else if (cond_type && cond_type->kind == TYPE_OPTIONAL &&
@@ -2141,7 +2152,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                          (int)node->if_stmt.capture_name_len,
                          node->if_stmt.capture_name);
                 } else {
-                    emit(e, "__auto_type %.*s = _zer_uw%d.value;\n",
+                    /* BUG-322: use __typeof__ to preserve volatile */
+                    emit(e, "__typeof__(_zer_uw%d.value) %.*s = _zer_uw%d.value;\n",
+                         tmp,
                          (int)node->if_stmt.capture_name_len,
                          node->if_stmt.capture_name, tmp);
                 }

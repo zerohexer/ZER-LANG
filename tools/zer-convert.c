@@ -321,6 +321,21 @@ static void tokenize(const char *src, int len) {
 
 static FILE *out;
 static bool needs_compat = false; /* set true if malloc/free/ptr arith used */
+static bool needs_extract = false; /* set true if cinclude extraction used */
+
+/* Extraction buffer — collects C code that can't be converted to ZER */
+#define EXTRACT_CAP (64 * 1024)
+static char extract_buf[EXTRACT_CAP];
+static int extract_len = 0;
+
+static void extract_write(const char *s, int len) {
+    if (extract_len + len < EXTRACT_CAP) {
+        memcpy(extract_buf + extract_len, s, len);
+        extract_len += len;
+    }
+}
+static void extract_str(const char *s) { extract_write(s, (int)strlen(s)); }
+static void extract_tok(CToken *t) { extract_write(t->start, t->len); }
 static int switch_depth = 0;       /* nesting depth of switch statements */
 static int switch_arm_depth[16];   /* which depth levels have an open arm */
 static int switch_arm_top = 0;     /* stack top for open arm tracking */
@@ -571,6 +586,149 @@ static void classify_params(void) {
     }
 }
 
+/* ================================================================
+ * Pre-scan: mark functions/structs needing cinclude extraction
+ * (contain goto, ternary, inline asm, or bit fields)
+ * ================================================================ */
+
+#define MAX_EXTRACT 64
+typedef struct {
+    int start;      /* token index of the start (function return type or struct keyword) */
+    int end;        /* token index past the closing } */
+    bool is_func;   /* true = function, false = struct */
+    char name[64];  /* function or struct name */
+} ExtractRange;
+
+static ExtractRange extracts[MAX_EXTRACT];
+static int extract_count = 0;
+
+static bool is_in_extract(int tok_idx) {
+    for (int i = 0; i < extract_count; i++) {
+        if (tok_idx >= extracts[i].start && tok_idx < extracts[i].end)
+            return true;
+    }
+    return false;
+}
+
+static void scan_for_extractions(void) {
+    extract_count = 0;
+
+    for (int i = 0; i < token_count; i++) {
+        /* find struct definitions with bit fields: struct Name { ... : N ... } */
+        if (tokens[i].type == CT_IDENT &&
+            (tok_eq(&tokens[i], "struct") || tok_eq(&tokens[i], "union"))) {
+            int j = skip_spaces(i + 1);
+            /* skip optional name */
+            if (j < token_count && tokens[j].type == CT_IDENT) j = skip_spaces(j + 1);
+            if (j >= token_count || tokens[j].type != CT_LBRACE) continue;
+            /* scan body for : N (bit field) */
+            int depth = 1;
+            int k = j + 1;
+            bool has_bitfield = false;
+            while (k < token_count && depth > 0) {
+                if (tokens[k].type == CT_LBRACE) depth++;
+                if (tokens[k].type == CT_RBRACE) depth--;
+                if (tokens[k].type == CT_COLON && depth == 1) {
+                    /* check if followed by a number (bit width) */
+                    int m = skip_spaces(k + 1);
+                    if (m < token_count && tokens[m].type == CT_NUMBER)
+                        has_bitfield = true;
+                }
+                k++;
+            }
+            if (has_bitfield && extract_count < MAX_EXTRACT) {
+                /* find the start — could be preceded by typedef */
+                int start = i;
+                if (start > 0) {
+                    int prev = start - 1;
+                    while (prev > 0 && tokens[prev].type == CT_WHITESPACE) prev--;
+                    if (prev >= 0 && tokens[prev].type == CT_IDENT && tok_eq(&tokens[prev], "typedef"))
+                        start = prev;
+                }
+                ExtractRange *er = &extracts[extract_count++];
+                er->start = start;
+                er->end = k; /* past } */
+                /* skip ; after } */
+                int semi = skip_spaces(k);
+                if (semi < token_count && tokens[semi].type == CT_SEMICOLON) er->end = semi + 1;
+                /* skip typedef name + ; after } */
+                if (semi < token_count && tokens[semi].type == CT_IDENT) {
+                    int semi2 = skip_spaces(semi + 1);
+                    if (semi2 < token_count && tokens[semi2].type == CT_SEMICOLON)
+                        er->end = semi2 + 1;
+                }
+                er->is_func = false;
+                /* extract struct name */
+                int nj = skip_spaces(i + 1);
+                if (nj < token_count && tokens[nj].type == CT_IDENT &&
+                    skip_spaces(nj + 1) < token_count && tokens[skip_spaces(nj + 1)].type == CT_LBRACE) {
+                    int nl = tokens[nj].len < 63 ? tokens[nj].len : 63;
+                    memcpy(er->name, tokens[nj].start, nl);
+                    er->name[nl] = '\0';
+                } else {
+                    strcpy(er->name, "anonymous");
+                }
+            }
+        }
+
+        /* find function definitions containing goto, ternary, or inline asm */
+        if (tokens[i].type == CT_LBRACE) {
+            /* check if this { is a function body (preceded by ) ) */
+            int prev = i - 1;
+            while (prev > 0 && (tokens[prev].type == CT_WHITESPACE || tokens[prev].type == CT_NEWLINE)) prev--;
+            if (prev < 0 || tokens[prev].type != CT_RPAREN) continue;
+
+            /* scan body for goto, ?, asm */
+            int depth = 1;
+            int k = i + 1;
+            bool has_goto = false, has_ternary = false, has_asm = false;
+            while (k < token_count && depth > 0) {
+                if (tokens[k].type == CT_LBRACE) depth++;
+                if (tokens[k].type == CT_RBRACE) depth--;
+                if (tokens[k].type == CT_IDENT && tok_eq(&tokens[k], "goto")) has_goto = true;
+                if (tokens[k].type == CT_QUESTION) has_ternary = true;
+                if (tokens[k].type == CT_IDENT &&
+                    (tok_eq(&tokens[k], "asm") || tok_eq(&tokens[k], "__asm__") || tok_eq(&tokens[k], "__asm")))
+                    has_asm = true;
+                k++;
+            }
+            if ((has_goto || has_ternary || has_asm) && extract_count < MAX_EXTRACT) {
+                /* walk backward to find function start (return type) */
+                /* from the ), walk back past params to ( */
+                int paren = prev;
+                int pdepth = 1;
+                paren--;
+                while (paren > 0 && pdepth > 0) {
+                    if (tokens[paren].type == CT_RPAREN) pdepth++;
+                    if (tokens[paren].type == CT_LPAREN) pdepth--;
+                    paren--;
+                }
+                paren++; /* at ( */
+                /* function name is before ( */
+                int fname = paren - 1;
+                while (fname > 0 && tokens[fname].type == CT_WHITESPACE) fname--;
+                /* return type is before function name */
+                int rtype = fname - 1;
+                while (rtype > 0 && tokens[rtype].type == CT_WHITESPACE) rtype--;
+                /* walk back to start of return type (could be multi-token: unsigned long) */
+                while (rtype > 0 && (tokens[rtype].type == CT_IDENT || tokens[rtype].type == CT_STAR ||
+                       tokens[rtype].type == CT_WHITESPACE)) rtype--;
+                rtype++; /* first token of return type */
+                /* skip leading whitespace */
+                while (rtype < fname && tokens[rtype].type == CT_WHITESPACE) rtype++;
+
+                ExtractRange *er = &extracts[extract_count++];
+                er->start = rtype;
+                er->end = k; /* past } */
+                er->is_func = true;
+                int nl = tokens[fname].len < 63 ? tokens[fname].len : 63;
+                memcpy(er->name, tokens[fname].start, nl);
+                er->name[nl] = '\0';
+            }
+        }
+    }
+}
+
 static void emit_raw(const char *s, int len) {
     fwrite(s, 1, len, out);
 }
@@ -640,6 +798,65 @@ static void transform(void) {
 
     while (i < token_count && tokens[i].type != CT_EOF) {
         CToken *t = &tokens[i];
+
+        /* ---- Extract functions/structs that can't be converted to ZER ---- */
+        /* Copy them verbatim to the .h extraction file, emit declaration in .zer */
+        {
+            for (int ei = 0; ei < extract_count; ei++) {
+                if (i == extracts[ei].start) {
+                    needs_extract = true;
+                    /* write original C tokens to extract buffer */
+                    for (int x = extracts[ei].start; x < extracts[ei].end; x++) {
+                        extract_tok(&tokens[x]);
+                    }
+                    extract_str("\n");
+
+                    if (extracts[ei].is_func) {
+                        /* emit ZER declaration: return_type func_name(params); */
+                        /* find ( and ) to extract the signature */
+                        int x = extracts[ei].start;
+                        while (x < extracts[ei].end && tokens[x].type != CT_LPAREN) {
+                            /* map types in the return type + name */
+                            if (tokens[x].type == CT_IDENT) {
+                                const char *mt = map_type(&tokens[x]);
+                                if (mt) emit_str(mt);
+                                else emit_tok(&tokens[x]);
+                            } else {
+                                emit_tok(&tokens[x]);
+                            }
+                            x++;
+                        }
+                        /* emit (params) with type mapping */
+                        if (x < extracts[ei].end) {
+                            emit_str("(");
+                            x++; /* skip ( */
+                            while (x < extracts[ei].end && tokens[x].type != CT_RPAREN) {
+                                if (tokens[x].type == CT_IDENT) {
+                                    const char *mt = map_type(&tokens[x]);
+                                    if (mt) emit_str(mt);
+                                    else emit_tok(&tokens[x]);
+                                } else if (tokens[x].type == CT_ARROW) {
+                                    emit_str(".");
+                                } else {
+                                    emit_tok(&tokens[x]);
+                                }
+                                x++;
+                            }
+                            emit_str(")");
+                        }
+                        emit_str(";\n");
+                    } else {
+                        /* struct with bit fields — emit comment that it's in .h */
+                        emit_str("// struct ");
+                        emit_str(extracts[ei].name);
+                        emit_str(" — in extracted .h (has bit fields)\n");
+                    }
+
+                    i = extracts[ei].end;
+                    goto next_token;
+                }
+            }
+        }
 
         /* ---- Preprocessor lines: #include, #define ---- */
         if (t->type == CT_HASH) {
@@ -1567,6 +1784,7 @@ static void transform(void) {
         /* ---- Everything else: pass through unchanged ---- */
         emit_tok(t);
         i++;
+        next_token: ;
     }
 }
 
@@ -1624,6 +1842,7 @@ int main(int argc, char **argv) {
 
     tokenize(src, src_len);
     classify_params();
+    scan_for_extractions();
 
     out = fopen(output_path, "w");
     if (!out) {
@@ -1663,10 +1882,61 @@ int main(int argc, char **argv) {
     }
 
     fclose(out);
+
+    /* write extracted .h file if any constructs needed extraction */
+    if (needs_extract && extract_len > 0) {
+        char h_path[512];
+        strncpy(h_path, output_path, sizeof(h_path) - 10);
+        int hlen = (int)strlen(h_path);
+        /* replace .zer with _extract.h */
+        if (hlen > 4 && strcmp(h_path + hlen - 4, ".zer") == 0) {
+            strcpy(h_path + hlen - 4, "_extract.h");
+        } else {
+            strcat(h_path, "_extract.h");
+        }
+
+        FILE *hf = fopen(h_path, "w");
+        if (hf) {
+            fprintf(hf, "/* Extracted C code from %s — constructs that can't be expressed in ZER */\n", input_path);
+            fprintf(hf, "/* (bit fields, goto, ternary, inline asm) */\n\n");
+            fwrite(extract_buf, 1, extract_len, hf);
+            fclose(hf);
+        }
+
+        /* prepend cinclude for the extracted .h into the .zer file */
+        int zer_len2;
+        char *zer_content2 = read_file(output_path, &zer_len2);
+        if (zer_content2) {
+            out = fopen(output_path, "w");
+            /* find the basename of h_path for the cinclude */
+            const char *h_basename = h_path;
+            for (const char *p = h_path; *p; p++) {
+                if (*p == '/' || *p == '\\') h_basename = p + 1;
+            }
+            /* find insertion point — after the header comments */
+            char *insert_point = zer_content2;
+            /* skip comment lines at top */
+            while (*insert_point == '/' || *insert_point == '\n') {
+                char *nl = strchr(insert_point, '\n');
+                if (nl) insert_point = nl + 1; else break;
+                if (*insert_point != '/' && *insert_point != '\n') break;
+            }
+            /* write: header comments, cinclude, rest */
+            fwrite(zer_content2, 1, insert_point - zer_content2, out);
+            fprintf(out, "cinclude \"%s\";\n", h_basename);
+            fwrite(insert_point, 1, zer_len2 - (insert_point - zer_content2), out);
+            fclose(out);
+            free(zer_content2);
+        }
+
+        printf("zer-convert: extracted %d constructs to %s\n", extract_count, h_path);
+    }
+
     free(src);
 
     printf("zer-convert: %s -> %s", input_path, output_path);
     if (needs_compat) printf(" (uses compat.zer)");
+    if (needs_extract) printf(" (extracted .h)");
     printf("\n");
 
     return 0;

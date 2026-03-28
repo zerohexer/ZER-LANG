@@ -2,6 +2,25 @@
 *.o
 *.exe
 release/
+zerc
+zer-convert
+NUL
+
+# Compiled test binaries
+test_lexer
+test_parser
+test_parser_edge
+test_checker
+test_checker_full
+test_emit
+test_extra
+test_gaps
+test_zercheck
+test_firmware
+test_firmware2
+test_firmware3
+test_production
+test_fuzz
 
 # Editor/IDE
 .idea/

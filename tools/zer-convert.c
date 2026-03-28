@@ -393,6 +393,7 @@ typedef struct {
     bool is_const;       /* was const char * */
     bool is_slice;       /* classified as []u8 */
     bool is_nullable;    /* should be ?*T (uses null checks/assigns) */
+    bool is_ambiguous;   /* zero usage clues — extract function to .h */
 } ParamInfo;
 
 static ParamInfo param_infos[MAX_PARAM_INFO];
@@ -580,6 +581,11 @@ static void classify_params(void) {
                 pi->is_slice = true; /* const char* is almost always a string */
             }
 
+            /* non-const, no usage clues at all → ambiguous, extract function */
+            if (!is_const && !pi->is_slice && !pi->is_nullable) {
+                pi->is_ambiguous = true;
+            }
+
             param_info_count++;
             p++;
         }
@@ -682,6 +688,7 @@ static void scan_for_extractions(void) {
             int depth = 1;
             int k = i + 1;
             bool has_goto = false, has_ternary = false, has_asm = false;
+            bool has_ambiguous_param = false;
             while (k < token_count && depth > 0) {
                 if (tokens[k].type == CT_LBRACE) depth++;
                 if (tokens[k].type == CT_RBRACE) depth--;
@@ -692,7 +699,13 @@ static void scan_for_extractions(void) {
                     has_asm = true;
                 k++;
             }
-            if ((has_goto || has_ternary || has_asm) && extract_count < MAX_EXTRACT) {
+            /* check if any param in this function is ambiguous */
+            for (int pi = 0; pi < param_info_count; pi++) {
+                if (param_infos[pi].is_ambiguous &&
+                    param_infos[pi].func_idx == i)
+                    has_ambiguous_param = true;
+            }
+            if ((has_goto || has_ternary || has_asm || has_ambiguous_param) && extract_count < MAX_EXTRACT) {
                 /* walk backward to find function start (return type) */
                 /* from the ), walk back past params to ( */
                 int paren = prev;
@@ -739,6 +752,39 @@ static void emit_str(const char *s) {
 
 static void emit_tok(CToken *t) {
     fwrite(t->start, 1, t->len, out);
+}
+
+/* try to rearrange pointer declaration: after emitting a type like "i32",
+ * check if followed by * name (declaration context). If so, emit *type name
+ * and return new position. Otherwise return -1.
+ * Declaration context: name followed by =, ;, ,, ), [ */
+static int try_ptr_rearrange(int pos, const char *type_str) {
+    int j = pos;
+    /* collect all * (handles **ptr, ***ptr) */
+    int star_count = 0;
+    while (j < token_count) {
+        int k = skip_spaces(j);
+        if (k < token_count && tokens[k].type == CT_STAR) {
+            star_count++;
+            j = k + 1;
+        } else break;
+    }
+    if (star_count == 0) return -1;
+    /* check for identifier after the stars */
+    int name_pos = skip_spaces(j);
+    if (name_pos >= token_count || tokens[name_pos].type != CT_IDENT) return -1;
+    /* check what follows the name — must be declaration context */
+    int after_name = skip_spaces(name_pos + 1);
+    if (after_name >= token_count) return -1;
+    CTokenType at = tokens[after_name].type;
+    if (at != CT_EQ && at != CT_SEMICOLON && at != CT_COMMA &&
+        at != CT_RPAREN && at != CT_LBRACKET && at != CT_LPAREN) return -1;
+    /* rearrange: emit *...*type_str name */
+    for (int s = 0; s < star_count; s++) emit_str("*");
+    emit_str(type_str);
+    emit_str(" ");
+    emit_tok(&tokens[name_pos]);
+    return after_name; /* caller continues from here */
 }
 
 /* check if token at index i is a specific identifier */
@@ -1189,6 +1235,7 @@ static void transform(void) {
                                   i = nxt + 1; /* skip the extra 'long' */
                               }
                             }
+                            { int pr = try_ptr_rearrange(i, type_combos[ci].zer); if (pr >= 0) { i = pr; found_combo = true; break; } }
                             emit_str(type_combos[ci].zer);
                             /* check for C-style array: type name[N] → type[N] name */
                             { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
@@ -1216,24 +1263,27 @@ static void transform(void) {
 
             /* standalone 'int' (not part of a combo already handled) → i32 */
             if (tok_eq(t, "int")) {
-                emit_str("i32");
                 i++;
+                { int pr = try_ptr_rearrange(i, "i32"); if (pr >= 0) { i = pr; continue; } }
+                emit_str("i32");
                 { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }
 
             /* standalone 'long' (not part of combo) → i64 */
             if (tok_eq(t, "long")) {
-                emit_str("i64");
                 i++;
+                { int pr = try_ptr_rearrange(i, "i64"); if (pr >= 0) { i = pr; continue; } }
+                emit_str("i64");
                 { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }
 
             /* standalone 'short' (not part of combo) → i16 */
             if (tok_eq(t, "short")) {
-                emit_str("i16");
                 i++;
+                { int pr = try_ptr_rearrange(i, "i16"); if (pr >= 0) { i = pr; continue; } }
+                emit_str("i16");
                 { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }
@@ -1480,8 +1530,9 @@ static void transform(void) {
 
             /* Type-mapped identifier */
             if (mapped) {
-                emit_str(mapped);
                 i++;
+                { int pr = try_ptr_rearrange(i, mapped); if (pr >= 0) { i = pr; continue; } }
+                emit_str(mapped);
                 { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
                 continue;
             }

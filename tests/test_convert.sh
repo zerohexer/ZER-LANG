@@ -167,6 +167,15 @@ check_phase1_absent "union in usage gone" 'void f() { union Val v; }' "union Val
 check_phase1 "typedef funcptr params" "typedef void (*fn_t)(int, float);" "(i32, f32)"
 check_phase1_absent "no @truncate in funcptr" "typedef void (*fn_t)(int, float);" "@truncate"
 
+# --- pointer declaration rearrangement ---
+check_phase1 "int *ptr → *i32 ptr" "int *ptr;" "*i32 ptr;"
+check_phase1 "int **pp → **i32 pp" "int **pp;" "**i32 pp;"
+check_phase1 "float *fp → *f32 fp" "float *fp;" "*f32 fp;"
+check_phase1 "uint32_t *p → *u32 p" "uint32_t *p;" "*u32 p;"
+check_phase1 "unsigned int *p → *u32 p" "unsigned int *p;" "*u32 p;"
+check_phase1 "int *f() → *i32 f()" "int *f(void) {}" "*i32 f(void)"
+check_phase1 "int x = 5 no rearrange" "int x = 5;" "i32 x = 5;"
+
 # --- Array reorder ---
 check_phase1 "int arr[10]→i32[10] arr" "void f() { int arr[10]; }" "i32[10] arr"
 check_phase1 "char buf[256]→u8[256] buf" "void f() { char buf[256]; }" "u8[256] buf"

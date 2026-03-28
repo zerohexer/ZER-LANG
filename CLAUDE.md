@@ -369,11 +369,24 @@ Two tools + one library for automated C-to-ZER migration:
 - `var = @ptrcast(*Type, zer_malloc_bytes(...))` (no `Type *` prefix) now detected and converted to `var_h = slab.alloc() orelse return;` (single line, no intermediate `_maybe`).
 - Declaration check for double `_h` prevention fires for BOTH `ai` and `hp` variables (was `hp` only — caused `t_h_h` on declarations when `t` was also an alloc target from reassignment).
 
+**Pointer declaration rearrangement:**
+- `int *ptr` → `*i32 ptr`, `int **pp` → `**i32 pp` (multi-level).
+- `try_ptr_rearrange()` called after every type emission. Detects declaration context: name followed by `=`, `;`, `,`, `)`, `[`, `(`.
+- Works for all mapped types (uint8_t, float, etc.), combos (unsigned int), and standalone keywords (int, long, short).
+- Return type pointers: `int *func()` → `*i32 func()`.
+
+**Auto-extraction to .h via cinclude (unconvertible C constructs):**
+- `scan_for_extractions()` pre-scan detects functions/structs that can't be expressed in ZER.
+- Ternary (`? :`), goto/labels, inline asm (`__asm__`): entire function extracted to companion `_extract.h`.
+- Bit fields (`: N` in struct): entire struct extracted to `_extract.h`.
+- Ambiguous `char *` with zero usage clues: function extracted to `_extract.h`.
+- `.zer` file gets `cinclude "name_extract.h";` + function declarations with ZER type mapping.
+- Zero `// MANUAL:` comments needed. Everything compiles via GCC.
+
 **Remaining design limitations:**
 - `cinclude` → `import` migration — manual step (one line per file). Required for full ZER safety across modules.
-- Ambiguous `char *` with zero usage clues — stays as `*u8`. Only occurs with `cinclude` (pass-through to external C). Pure ZER projects with `import` only have zero ambiguous cases.
-- Nested switch uses depth counter array (16 levels max) instead of single boolean.
-- 95 regression tests covering all conversion patterns.
+- Complex `#define` macros inline in `.c` files → `// MANUAL:` (macros in headers work via `cinclude` automatically).
+- 102 regression tests covering all conversion patterns.
 
 ### Structural Refactors Completed (RF1-RF7)
 

@@ -341,7 +341,7 @@ Two tools + one library for automated C-to-ZER migration:
 **zer-upgrade additional rules (post-agent-audit):**
 - `zer_memset(var, 0, sizeof(T))` and `bytes_zero(var)` after Slab alloc are auto-removed (Slab uses calloc, already zeroed). Loops up to 3 consecutive redundant lines (null check + memset + bytes_zero).
 - `zer_strcpy(dst, src)` → `@cstr(dst, src)`, `zer_strncpy(dst, src, n)` → `@cstr(dst, src)`.
-- Bare `zer_strcmp`/`zer_strncmp`/`zer_memcmp` without `== 0`/`!= 0` kept as compat (wrong return type: `i32` vs `bool`).
+- Bare `zer_strcmp`/`zer_strncmp`/`zer_memcmp` without `== 0`/`!= 0` → `bytes_compare()` (returns `i32`, same as C's strcmp). With `== 0` → `bytes_equal()` (returns `bool`). Both are from `str.zer`.
 - Comments (`//` and block comments) skipped — `zer_` names inside comments preserved.
 - `== 0` stripping uses exact advancement (past `==` + spaces + `0`) instead of greedy char loop. Preserves space before `&&`/`||`.
 - `out_write_with_handles()` routes ALL Layer 1 replacement args through Layer 2 handle rewriting. Fixes `@cstr(c.host, ...)` → `@cstr(slab.get(c_h).host, ...)`. Applied to all compat function replacements (strlen, strcmp, memcpy, memset, strcpy, strncpy, memcmp).
@@ -356,13 +356,24 @@ Two tools + one library for automated C-to-ZER migration:
 - Ambiguous (no usage clues, non-const) stays as `*u8` + compat (safe fallback, compiles).
 - Nested switch uses depth counter array (16 levels max) instead of single boolean.
 
-**Remaining design limitations (handled by compat or manual):**
-- Reassignment malloc (`var = malloc(...)` not on declaration line) — stays as compat.
-- Pointer arithmetic (`ptr + N`) — stays as compat via `zer_ptr_add`.
-- `sizeof(variable)` vs `sizeof(type)` — indistinguishable at token level, emits `@size(x)`.
-- `cinclude` → `import` migration — manual step for full ZER safety across modules.
-- `char *` params classified by usage: `strlen`/`strcmp`/indexing → `[]u8`, null checks → `?*T`/`?[]T`, `const char *` convention → `const []u8`, write-through `*p = val` → `*u8`, ambiguous → `*u8` + compat.
-- Nested switch uses depth counter (not single boolean) — inner switch break doesn't corrupt outer arm tracking.
+**Pointer arithmetic conversion:**
+- `ptr + N` → `ptr[N..]` (sub-slice from offset) for classified slice params.
+- `*(ptr + N)` → `ptr[N]` (index at offset) via lookahead at `*` token — detects `*(IDENT + expr)` where IDENT is a classified slice.
+- Only fires for params classified as slices by `classify_params`. Non-classified `*u8` pointers pass through — zerc catches invalid arithmetic with clear error.
+
+**sizeof(variable) vs sizeof(type):**
+- `sizeof(Type)` → `@size(Type)` when arg is a mapped C type or starts with uppercase.
+- `sizeof(var)` → kept as `sizeof(var)` when arg starts with lowercase (likely a variable). GCC resolves via `cinclude`.
+
+**Reassignment malloc:**
+- `var = @ptrcast(*Type, zer_malloc_bytes(...))` (no `Type *` prefix) now detected and converted to `var_h = slab.alloc() orelse return;` (single line, no intermediate `_maybe`).
+- Declaration check for double `_h` prevention fires for BOTH `ai` and `hp` variables (was `hp` only — caused `t_h_h` on declarations when `t` was also an alloc target from reassignment).
+
+**Remaining design limitations:**
+- `cinclude` → `import` migration — manual step (one line per file). Required for full ZER safety across modules.
+- Ambiguous `char *` with zero usage clues — stays as `*u8`. Only occurs with `cinclude` (pass-through to external C). Pure ZER projects with `import` only have zero ambiguous cases.
+- Nested switch uses depth counter array (16 levels max) instead of single boolean.
+- 95 regression tests covering all conversion patterns.
 
 ### Structural Refactors Completed (RF1-RF7)
 

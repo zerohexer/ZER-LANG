@@ -339,10 +339,28 @@ Two tools + one library for automated C-to-ZER migration:
 - The converter does NOT auto-convert `cinclude` → `import` — this is a manual step when the user is ready to make the module fully ZER.
 
 **zer-upgrade additional rules (post-agent-audit):**
-- `zer_memset(var, 0, sizeof(T))` and `bytes_zero(var)` after Slab alloc are auto-removed (Slab uses calloc, already zeroed).
+- `zer_memset(var, 0, sizeof(T))` and `bytes_zero(var)` after Slab alloc are auto-removed (Slab uses calloc, already zeroed). Loops up to 3 consecutive redundant lines (null check + memset + bytes_zero).
 - `zer_strcpy(dst, src)` → `@cstr(dst, src)`, `zer_strncpy(dst, src, n)` → `@cstr(dst, src)`.
 - Bare `zer_strcmp`/`zer_strncmp`/`zer_memcmp` without `== 0`/`!= 0` kept as compat (wrong return type: `i32` vs `bool`).
 - Comments (`//` and block comments) skipped — `zer_` names inside comments preserved.
+- `== 0` stripping uses exact advancement (past `==` + spaces + `0`) instead of greedy char loop. Preserves space before `&&`/`||`.
+- `out_write_with_handles()` routes ALL Layer 1 replacement args through Layer 2 handle rewriting. Fixes `@cstr(c.host, ...)` → `@cstr(slab.get(c_h).host, ...)`. Applied to all compat function replacements (strlen, strcmp, memcpy, memset, strcpy, strncpy, memcmp).
+
+**zer-convert usage scanner (classify_params):**
+- Pre-scan pass runs after tokenizing, before transform. Classifies `char *` / `const char *` params.
+- Detects string usage: `strlen(param)`, `strcmp(param, ...)`, `param[i]` indexing, passed to string functions.
+- Detects nullable: `param == NULL`, `param = NULL`, `if (param)`, `if (!param)`.
+- `const char *` without counter-evidence defaults to `const []u8` (convention: ~99.9% correct).
+- Non-const `char *` with string usage → `[]u8`, with null checks → `?[]u8` or `?*u8`.
+- Write-through pattern (`*p = val`) stays as `*u8`.
+- Ambiguous (no usage clues, non-const) stays as `*u8` + compat (safe fallback, compiles).
+- Nested switch uses depth counter array (16 levels max) instead of single boolean.
+
+**Remaining design limitations (handled by compat or manual):**
+- Reassignment malloc (`var = malloc(...)` not on declaration line) — stays as compat.
+- Pointer arithmetic (`ptr + N`) — stays as compat via `zer_ptr_add`.
+- `sizeof(variable)` vs `sizeof(type)` — indistinguishable at token level, emits `@size(x)`.
+- `cinclude` → `import` migration — manual step for full ZER safety across modules.
 - `char *` params classified by usage: `strlen`/`strcmp`/indexing → `[]u8`, null checks → `?*T`/`?[]T`, `const char *` convention → `const []u8`, write-through `*p = val` → `*u8`, ambiguous → `*u8` + compat.
 - Nested switch uses depth counter (not single boolean) — inner switch break doesn't corrupt outer arm tracking.
 

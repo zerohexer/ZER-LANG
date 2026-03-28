@@ -388,6 +388,18 @@ Two tools + one library for automated C-to-ZER migration:
 - Complex `#define` macros inline in `.c` files → `// MANUAL:` (macros in headers work via `cinclude` automatically).
 - 102 regression tests covering all conversion patterns.
 
+### Red Team Audit Fixes (BUG-314 through BUG-318)
+
+**170. Recursive struct/union via distinct unwrapped.** `type_unwrap_distinct(inner)` before self-reference check. (BUG-314)
+
+**171. Array return via distinct unwrapped.** `type_unwrap_distinct(ret)` before `TYPE_ARRAY` rejection. (BUG-315)
+
+**172. Intrinsic named types: `force_type_arg` for @bitcast/@truncate/@saturate.** Not just @cast. (BUG-316)
+
+**173. keep validation: mangled key fallback.** Try `module_name` when raw lookup fails for imported globals. (BUG-317)
+
+**174. Constant folder shift UB.** `(uint64_t)l << r` prevents signed overflow in the compiler. (BUG-318)
+
 ### Structural Refactors Completed (RF1-RF7)
 
 These changed fundamental patterns. Fresh sessions MUST know:

@@ -1743,6 +1743,62 @@ static void test_negative_sweep(void) {
 
 /* ================================================================ */
 
+/* ================================================================
+ * RED TEAM AUDIT: BUG-314 through BUG-318
+ * ================================================================ */
+static void test_red_team_314_318(void) {
+    printf("[Red Team audit: BUG-314 through BUG-318]\n");
+
+    /* BUG-314: recursive struct via distinct typedef */
+    err("distinct typedef S SafeS;\n"
+        "struct S { SafeS next; }",
+        "BUG-314: recursive struct via distinct");
+
+    /* BUG-314: recursive union via distinct typedef */
+    err("distinct typedef U SafeU;\n"
+        "union U { SafeU a; u32 b; }",
+        "BUG-314: recursive union via distinct");
+
+    /* BUG-314 positive: distinct of DIFFERENT struct is fine */
+    ok("struct A { u32 x; }\n"
+       "distinct typedef A B;\n"
+       "struct C { B val; }",
+       "BUG-314: distinct of different struct OK");
+
+    /* BUG-315: array return via distinct typedef */
+    err("distinct typedef u8[10] Buffer;\n"
+        "Buffer get_data() { Buffer b; return b; }",
+        "BUG-315: array return via distinct");
+
+    /* BUG-315 positive: distinct of non-array is fine to return */
+    ok("distinct typedef u32 Meters;\n"
+       "Meters get_m() { return @cast(Meters, 42); }",
+       "BUG-315: distinct non-array return OK");
+
+    /* BUG-316: @bitcast with named distinct type */
+    ok("distinct typedef u32 Meters;\n"
+       "void f() { u32 x = 5; Meters m = @bitcast(Meters, x); }",
+       "BUG-316: @bitcast with distinct type");
+
+    /* BUG-316: @truncate with named distinct type */
+    ok("distinct typedef u16 Short;\n"
+       "void f() { u32 x = 5; Short s = @truncate(Short, x); }",
+       "BUG-316: @truncate with distinct type");
+
+    /* BUG-316: @saturate with named distinct type */
+    ok("distinct typedef u8 Byte;\n"
+       "void f() { u32 x = 500; Byte b = @saturate(Byte, x); }",
+       "BUG-316: @saturate with distinct type");
+
+    /* BUG-318: large shift doesn't crash the compiler */
+    ok("void f() { u64 x = 1; u64 y = x << 62; }",
+       "BUG-318: large shift no compiler UB");
+
+    /* BUG-318: constant expression with large shift */
+    ok("u8[1 << 10] buf;\nvoid f() { buf[0] = 1; }",
+       "BUG-318: const expr large shift");
+}
+
 int main(void) {
     printf("=== ZER Type Checker — Full Spec Coverage ===\n\n");
 
@@ -1781,6 +1837,7 @@ int main(void) {
     test_adversarial();
     test_security_review();
     test_negative_sweep();
+    test_red_team_314_318();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

@@ -1660,3 +1660,35 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Variant pointer type emitted without checking if switch expression is volatile.
 - **Fix:** `sw_volatile` flag detected from switch expression root symbol. Mutable capture emits `volatile T *v`.
 - **Test:** Verified emitted C shows `volatile struct A *v`.
+
+## Red Team Audit — Session 2026-03-28
+
+### BUG-314: Recursive struct bypass via distinct typedef
+- **Symptom:** `distinct typedef S SafeS; struct S { SafeS next; }` bypasses self-reference check.
+- **Root cause:** `register_decl` compares `inner == t` (pointer equality) — `TYPE_DISTINCT` wrapping `t` is a different pointer.
+- **Fix:** Call `type_unwrap_distinct(inner)` before the self-reference check. Same fix for unions.
+- **Test:** `test_checker_full.c` — distinct self-reference rejected, distinct of different struct accepted.
+
+### BUG-315: Array return bypass via distinct typedef
+- **Symptom:** `distinct typedef u8[10] Buffer; Buffer get_data()` passes checker — emits invalid C.
+- **Root cause:** `check_func_body` checks `ret->kind == TYPE_ARRAY` without unwrapping distinct.
+- **Fix:** `type_unwrap_distinct(ret)` before `TYPE_ARRAY` check.
+- **Test:** `test_checker_full.c` — distinct array return rejected, distinct non-array return accepted.
+
+### BUG-316: Intrinsic named type resolution for @bitcast/@truncate/@saturate
+- **Symptom:** `@bitcast(Meters, x)` where `Meters` is distinct typedef → parse error "expected type".
+- **Root cause:** `force_type_arg` only set for `@cast`, not `@bitcast`/`@truncate`/`@saturate`.
+- **Fix:** Set `force_type_arg` for all four intrinsics.
+- **Test:** `test_checker_full.c` — @bitcast, @truncate, @saturate with distinct types accepted.
+
+### BUG-317: keep validation false positive on imported globals
+- **Symptom:** Passing imported global to `keep` param falsely rejected as "local variable".
+- **Root cause:** `scope_lookup_local(global_scope, raw_name)` — imported globals stored under mangled key.
+- **Fix:** Fallback: try mangled key (`module_name`) when raw lookup fails.
+- **Test:** Multi-module pattern (keep with imported global).
+
+### BUG-318: Compiler UB in constant folder shift
+- **Symptom:** `1 << 62` on large `int64_t` values → signed overflow UB in the compiler itself.
+- **Root cause:** `l << r` with signed `l` — C UB when result exceeds `INT64_MAX`.
+- **Fix:** Cast to `(uint64_t)l << r` then back to `int64_t`.
+- **Test:** `test_checker_full.c` — large shift expressions don't crash compiler.

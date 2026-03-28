@@ -953,6 +953,62 @@ static void upgrade(const char *src, int src_len) {
                         }
                     }
                 }
+
+                /* Pattern 2: reassignment — VAR = @ptrcast(*TYPE, zer_malloc_bytes(...))
+                 * No Type* prefix. VAR must be a known alloc variable. */
+                {
+                    int p2 = ls;
+                    int vn2_start = p2;
+                    while (p2 < src_len && (isalnum(src[p2]) || src[p2] == '_')) p2++;
+                    int vn2_len = p2 - vn2_start;
+                    while (p2 < src_len && src[p2] == ' ') p2++;
+                    if (p2 < src_len && src[p2] == '=' && vn2_len > 0) {
+                        p2++;
+                        while (p2 < src_len && src[p2] == ' ') p2++;
+                        if (starts_with(src, p2, src_len, "@ptrcast(*")) {
+                            int ct = p2 + 10;
+                            int ct_start = ct;
+                            while (ct < src_len && src[ct] != ',' && src[ct] != ')') ct++;
+                            int ct_len = ct - ct_start;
+                            int rest = ct;
+                            while (rest < src_len && (src[rest] == ',' || src[rest] == ' ')) rest++;
+                            if (ct_len > 0 && ct_len < 63 && starts_with(src, rest, src_len, "zer_malloc_bytes(")) {
+                                char type_buf[64] = {0}, var_buf[64] = {0};
+                                memcpy(type_buf, src + ct_start, ct_len);
+                                while (ct_len > 0 && type_buf[ct_len-1] == ' ') type_buf[--ct_len] = '\0';
+                                memcpy(var_buf, src + vn2_start, vn2_len);
+                                if (is_primitive_type(type_buf)) goto emit_line_asis;
+                                const char *slab = get_slab_name(type_buf);
+                                if (i > 0 && src[i] == '\n') out_str("\n");
+                                out_write(src + line_start, ls - line_start);
+                                /* reassignment: var_h = slab.alloc() orelse return; */
+                                out_str(var_buf);
+                                out_str("_h = ");
+                                out_str(slab);
+                                out_str(".alloc() orelse return;");
+                                i = line_start;
+                                while (i < src_len && src[i] != '\n') i++;
+                                /* skip redundant lines after alloc */
+                                for (int skip_pass = 0; skip_pass < 3; skip_pass++) {
+                                    if (i >= src_len || src[i] != '\n') break;
+                                    int peek = i + 1;
+                                    while (peek < src_len && (src[peek] == ' ' || src[peek] == '\t')) peek++;
+                                    bool skip_line = false;
+                                    if (starts_with(src, peek, src_len, "if (!") &&
+                                        strncmp(src + peek + 5, var_buf, strlen(var_buf)) == 0) skip_line = true;
+                                    if (starts_with(src, peek, src_len, "zer_memset(") &&
+                                        strncmp(src + peek + 11, var_buf, strlen(var_buf)) == 0) skip_line = true;
+                                    if (starts_with(src, peek, src_len, "bytes_zero(") &&
+                                        strncmp(src + peek + 11, var_buf, strlen(var_buf)) == 0) skip_line = true;
+                                    if (skip_line) { i++; while (i < src_len && src[i] != '\n') i++; }
+                                    else break;
+                                }
+                                upgrades++;
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1006,7 +1062,7 @@ static void upgrade(const char *src, int src_len) {
             HandleParam *hp = ai ? NULL : find_handle_param(ident, id_start);
 
             /* skip if this is a var declaration (Type *name = ...) — rewrite_signatures handles it */
-            if (hp && !ai) {
+            if (ai || hp) {
                 int check_after = i;
                 while (check_after < src_len && src[check_after] == ' ') check_after++;
                 if (check_after < src_len && src[check_after] == '=') {

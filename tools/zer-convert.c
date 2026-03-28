@@ -1204,12 +1204,26 @@ static void transform(void) {
                                 continue;
                             }
                         }
-                        /* sizeof(type) → @size(type) */
+                        /* sizeof(type) → @size(type), sizeof(var) → sizeof(var) */
                         if (m < token_count && tokens[m].type == CT_RPAREN) {
-                            emit_str("@size(");
-                            if (mt) emit_str(mt);
-                            else emit_raw(tokens[k].start, tokens[k].len);
-                            emit_str(")");
+                            /* distinguish type vs variable:
+                             * - mapped C type (int, char, etc.) → always @size
+                             * - struct-prefixed → always @size
+                             * - starts with uppercase → likely type → @size
+                             * - starts with lowercase → likely variable → keep sizeof */
+                            bool is_type = (mt != NULL) || had_struct ||
+                                           (tokens[k].len > 0 && tokens[k].start[0] >= 'A' && tokens[k].start[0] <= 'Z');
+                            if (is_type) {
+                                emit_str("@size(");
+                                if (mt) emit_str(mt);
+                                else emit_raw(tokens[k].start, tokens[k].len);
+                                emit_str(")");
+                            } else {
+                                /* variable — keep sizeof for GCC via cinclude */
+                                emit_str("sizeof(");
+                                emit_raw(tokens[k].start, tokens[k].len);
+                                emit_str(")");
+                            }
                             i = m + 1;
                             continue;
                         }

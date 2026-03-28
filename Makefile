@@ -122,6 +122,10 @@ docker-build:
 	docker build -t zer-lang-dev .
 	docker run --rm zer-lang-dev make zerc
 
+docker-test-convert:
+	docker build -t zer-lang-dev .
+	docker run --rm zer-lang-dev bash tests/test_convert.sh
+
 docker-shell:
 	docker build -t zer-lang-dev .
 	docker run --rm -it zer-lang-dev bash
@@ -166,4 +170,4 @@ install: zerc
 	cp zerc.exe /c/msys64/mingw64/bin/zerc.exe 2>/dev/null || cp zerc /c/msys64/mingw64/bin/zerc 2>/dev/null
 	@echo "Installed zerc to C:\\msys64\\mingw64\\bin\\"
 
-.PHONY: check clean release install docker-check docker-build docker-shell docker-release docker-release-win docker-release-all docker-install
+.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install

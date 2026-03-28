@@ -1064,9 +1064,10 @@ When starting a new session or lacking context:
 
 **PREFERRED: Use Docker** to avoid Windows Defender false positives on compiled executables:
 ```
-make docker-check     # build + run ALL tests in container (gcc:13 image)
-make docker-build     # just build zerc in container
-make docker-shell     # interactive bash inside container for debugging
+make docker-check          # build + run ALL tests in container (gcc:13 image)
+make docker-test-convert   # run only conversion tool tests (zer-convert + zer-upgrade)
+make docker-build          # just build zerc in container
+make docker-shell          # interactive bash inside container for debugging
 ```
 
 **Fallback: Native (triggers AV on Windows corporate laptops):**

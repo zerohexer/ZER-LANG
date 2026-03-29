@@ -1291,8 +1291,8 @@ Variables starting with `_zer_` rejected in `add_symbol`. Prevents accidental co
 **RF11: Shared `expr_is_volatile()` / `expr_root_symbol()` helpers.**
 4 independent inline volatile detection walks (array assign, if-unwrap, switch capture, @cstr) replaced with single `expr_is_volatile(e, expr)` helper. Walks any expression through field/index/deref chains to root ident, looks up symbol `is_volatile`. New emission sites just call the helper — no more per-site volatile walk duplication.
 
-### Known Technical Debt
-- **Global Compiler State:** `non_storable_nodes` is a static global. `type_map` was moved into Checker struct (RF1). Remaining global makes compiler non-thread-safe for LSP concurrent requests.
+### Known Technical Debt (resolved)
+- **Global Compiler State:** `non_storable_nodes` moved into Checker struct (BUG-346/RF12). `type_map` moved in RF1. All compiler state is now per-instance — thread-safe for LSP.
 - **Static vars in imported modules:** Fixed in BUG-222/229/233. All imported symbols (static and non-static) register under mangled keys. Cross-module same-named symbols work correctly. No qualified call syntax yet (unqualified calls resolve to last import).
 
 
@@ -1307,3 +1307,18 @@ Call-site keep validation must unwrap NODE_ORELSE before checking for &local. `r
 
 ### @bitcast Volatile Check (BUG-341)
 Same pattern as @ptrcast volatile check (BUG-258). In the @bitcast handler, after width validation, check if source is a volatile pointer and target is not. Checks both type-level `pointer.is_volatile` and symbol-level `is_volatile`. Prevents GCC from optimizing away hardware register writes through the bitcasted pointer.
+
+### @cast Volatile/Const Check (BUG-343)
+Same pattern as @ptrcast (BUG-258) and @bitcast (BUG-341), applied to @cast (distinct typedef conversion). After the type_equals validation, unwrap distinct on both source and result types. If both are pointers, check volatile (type-level + symbol-level) and const (`pointer.is_const`). Prevents `distinct typedef *u32 SafePtr; @cast(SafePtr, volatile_reg)` from silently stripping volatile.
+
+### compute_type_size Overflow Guard (BUG-344)
+`elem_size * (int64_t)t->array.size` could wrap to a small positive via -fwrapv for massive multi-dim arrays. Guard: `if (count > 0 && elem_size > INT64_MAX / count) return CONST_EVAL_FAIL`. Falls back to emitter's `sizeof()` which GCC handles correctly.
+
+### Handle(T) Always u32 (BUG-345 — spec fix)
+Handle is always `uint32_t` (16-bit index + 16-bit generation). Max 65,535 slots per Pool/Slab. The spec (ZER-LANG.md) previously claimed platform-width handles, but the entire Pool/Slab runtime hardcodes `uint32_t` and `0xFFFF` masks. Spec updated to match implementation. Future 64-bit handle support would require runtime rewrite.
+
+### non_storable_nodes Moved to Checker Struct (BUG-346, RF12)
+`non_storable_nodes`, `non_storable_count`, `non_storable_capacity` moved from static globals into Checker struct. All helpers (`non_storable_init`, `mark_non_storable`, `is_non_storable`) now take `Checker *c`. Arena pointer uses `c->arena`. Eliminates last known static global state — compiler is now thread-safe for LSP concurrent requests.
+
+### Known Technical Debt (updated)
+- **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.

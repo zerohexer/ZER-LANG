@@ -61,34 +61,28 @@ static void checker_warning(Checker *c, int line, const char *fmt, ...) {
 
 /* ---- Non-storable tracking ----
  * pool.get(h) returns a non-storable result.
- * We track this with a dynamic array in the arena — no fixed cap. */
+ * BUG-346: moved from static globals into Checker struct for thread safety. */
 
-static Node **non_storable_nodes = NULL;
-static int non_storable_count = 0;
-static int non_storable_capacity = 0;
-static Arena *non_storable_arena = NULL;
-
-static void non_storable_init(Arena *a) {
-    non_storable_arena = a;
-    non_storable_capacity = 64;
-    non_storable_nodes = (Node **)arena_alloc(a, non_storable_capacity * sizeof(Node *));
-    non_storable_count = 0;
+static void non_storable_init(Checker *c) {
+    c->non_storable_capacity = 64;
+    c->non_storable_nodes = (Node **)arena_alloc(c->arena, c->non_storable_capacity * sizeof(Node *));
+    c->non_storable_count = 0;
 }
 
-static void mark_non_storable(Node *n) {
-    if (non_storable_count >= non_storable_capacity) {
-        int new_cap = non_storable_capacity * 2;
-        Node **new_arr = (Node **)arena_alloc(non_storable_arena, new_cap * sizeof(Node *));
-        memcpy(new_arr, non_storable_nodes, non_storable_count * sizeof(Node *));
-        non_storable_nodes = new_arr;
-        non_storable_capacity = new_cap;
+static void mark_non_storable(Checker *c, Node *n) {
+    if (c->non_storable_count >= c->non_storable_capacity) {
+        int new_cap = c->non_storable_capacity * 2;
+        Node **new_arr = (Node **)arena_alloc(c->arena, new_cap * sizeof(Node *));
+        memcpy(new_arr, c->non_storable_nodes, c->non_storable_count * sizeof(Node *));
+        c->non_storable_nodes = new_arr;
+        c->non_storable_capacity = new_cap;
     }
-    non_storable_nodes[non_storable_count++] = n;
+    c->non_storable_nodes[c->non_storable_count++] = n;
 }
 
-static bool is_non_storable(Node *n) {
-    for (int i = 0; i < non_storable_count; i++) {
-        if (non_storable_nodes[i] == n) return true;
+static bool is_non_storable(Checker *c, Node *n) {
+    for (int i = 0; i < c->non_storable_count; i++) {
+        if (c->non_storable_nodes[i] == n) return true;
     }
     return false;
 }
@@ -282,7 +276,11 @@ static int64_t compute_type_size(Type *t) {
     if (w > 0) return w / 8;
     if (t->kind == TYPE_ARRAY) {
         int64_t elem_size = compute_type_size(t->array.inner);
-        return elem_size > 0 ? elem_size * (int64_t)t->array.size : -1;
+        if (elem_size <= 0) return -1;
+        /* BUG-344: overflow-safe multiplication */
+        int64_t count = (int64_t)t->array.size;
+        if (count > 0 && elem_size > INT64_MAX / count) return CONST_EVAL_FAIL;
+        return elem_size * count;
     }
     if (t->kind == TYPE_OPTIONAL) {
         /* BUG-243/275: ?*T and ?FuncPtr are null-sentinel (same size as pointer).
@@ -950,7 +948,7 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* non-storable check: pool.get(h) result cannot be stored */
-        if (node->assign.op == TOK_EQ && is_non_storable(node->assign.value)) {
+        if (node->assign.op == TOK_EQ && is_non_storable(c, node->assign.value)) {
             checker_error(c, node->loc.line,
                 "cannot store result of get() — use inline");
         }
@@ -1518,7 +1516,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line, "pool.get() takes exactly 1 argument");
                     result = type_pointer(c->arena, obj->pool.elem);
                     typemap_set(c, field_node,result);
-                    mark_non_storable(node); /* Rule 2: get() result non-storable */
+                    mark_non_storable(c, node); /* Rule 2: get() result non-storable */
                     break;
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
@@ -1594,7 +1592,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line, "slab.get() takes exactly 1 argument");
                     result = type_pointer(c->arena, obj->slab.elem);
                     typemap_set(c, field_node,result);
-                    mark_non_storable(node);
+                    mark_non_storable(c, node);
                     break;
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
@@ -2687,6 +2685,35 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
+                    /* BUG-343: @cast cannot strip volatile or const qualifier
+                     * (same pattern as @ptrcast BUG-258 and @bitcast BUG-341) */
+                    Type *veff = type_unwrap_distinct(val_type);
+                    Type *reff = type_unwrap_distinct(result);
+                    if (veff && veff->kind == TYPE_POINTER &&
+                        reff && reff->kind == TYPE_POINTER) {
+                        /* volatile check */
+                        if (!reff->pointer.is_volatile) {
+                            bool src_vol = veff->pointer.is_volatile;
+                            if (!src_vol && node->intrinsic.arg_count > 0 &&
+                                node->intrinsic.args[0]->kind == NODE_IDENT) {
+                                Symbol *vs = scope_lookup(c->current_scope,
+                                    node->intrinsic.args[0]->ident.name,
+                                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                                if (vs && vs->is_volatile) src_vol = true;
+                            }
+                            if (src_vol) {
+                                checker_error(c, node->loc.line,
+                                    "@cast cannot strip volatile qualifier — "
+                                    "target must be volatile pointer");
+                            }
+                        }
+                        /* const check */
+                        if (veff->pointer.is_const && !reff->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "@cast cannot strip const qualifier — "
+                                "target must be const pointer");
+                        }
+                    }
                 }
             } else {
                 result = ty_void;
@@ -2773,7 +2800,7 @@ static void check_stmt(Checker *c, Node *node) {
             Type *init_type = check_expr(c, node->var_decl.init);
 
             /* non-storable check: pool.get(h) result */
-            if (is_non_storable(node->var_decl.init)) {
+            if (is_non_storable(c, node->var_decl.init)) {
                 checker_error(c, node->loc.line,
                     "cannot store result of get() — use inline");
             }
@@ -4239,7 +4266,7 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     typemap_init(c);
 
     /* init non-storable tracking */
-    non_storable_init(arena);
+    non_storable_init(c);
 
     /* Arena type available in expression context for Arena.over() */
     scope_add(arena, c->global_scope, "Arena", 5, ty_arena, 0, file_name);

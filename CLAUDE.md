@@ -330,7 +330,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - `@inttoptr(*T, 0)` allowed (MMIO address 0x0), shift widening spec-correct, `[]T → *T` coercion removed
 
 **Known Technical Debt:**
-- `non_storable_nodes` global (non-thread-safe for LSP), no qualified module call syntax yet
+- No qualified module call syntax yet (unqualified calls resolve to last import)
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

@@ -1782,3 +1782,27 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** BUG-258 fixed @ptrcast but same check was missing for @bitcast.
 - **Fix:** Same volatile check as @ptrcast: source pointer.is_volatile or symbol is_volatile → reject if target not volatile.
 - **Test:** All existing tests pass.
+
+### BUG-343: Volatile/const stripping via @cast
+- **Symptom:** `distinct typedef *u32 SafePtr; SafePtr p = @cast(SafePtr, volatile_reg)` — strips volatile silently. Same for const.
+- **Root cause:** BUG-258 fixed @ptrcast and BUG-341 fixed @bitcast, but @cast (distinct typedef conversion) was missed.
+- **Fix:** Added volatile and const checks to @cast handler: unwrap distinct on both sides, check pointer qualifiers. Same pattern as @ptrcast/@bitcast.
+- **Test:** test_checker_full.c — 3 new tests (volatile strip rejected, const strip rejected, volatile preserved OK).
+
+### BUG-344: Multiplication overflow in compute_type_size
+- **Symptom:** Multi-dimensional arrays with large dimensions could cause `elem_size * count` to wrap via -fwrapv, producing a small positive value.
+- **Root cause:** Raw multiplication without overflow guard on line 285 of checker.c.
+- **Fix:** Added overflow check: `if (count > 0 && elem_size > INT64_MAX / count) return CONST_EVAL_FAIL`. Falls back to emitter's sizeof() for massive arrays.
+- **Test:** test_checker_full.c — @size on large struct OK (no overflow).
+
+### BUG-345: Handle(T) width spec/impl mismatch
+- **Symptom:** ZER-LANG.md spec said Handle is platform-width (u32 on 32-bit, u64 on 64-bit). Implementation is always u32.
+- **Root cause:** Spec written with future 64-bit targets in mind, but Pool/Slab runtime hardcodes uint32_t and 0xFFFF masks throughout.
+- **Fix:** Updated spec (ZER-LANG.md) to match implementation: Handle is always u32 with 16-bit index + 16-bit generation. Changing to platform-width would require runtime rewrite (deferred).
+- **Test:** N/A (documentation fix).
+
+### BUG-346: Non-thread-safe non_storable_nodes global (RF12)
+- **Symptom:** `non_storable_nodes` was a static global array shared across all Checker instances. LSP concurrent requests could corrupt the list.
+- **Root cause:** Legacy design from before RF1 (typemap refactor). Was documented as known technical debt.
+- **Fix:** Moved `non_storable_nodes`, `non_storable_count`, `non_storable_capacity` into Checker struct. All call sites now pass Checker pointer. Arena pointer from `c->arena` replaces separate `non_storable_arena` global.
+- **Test:** All existing tests pass (no behavior change for single-threaded use).

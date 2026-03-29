@@ -1840,6 +1840,45 @@ static void test_red_team_314_318(void) {
        "BUG-326: switch mutable capture on non-const OK");
 }
 
+static void test_red_team_343_346(void) {
+    /* BUG-343: @cast cannot strip volatile qualifier */
+    err("distinct typedef *u32 SafePtr;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x40020000);\n"
+       "    SafePtr p = @cast(SafePtr, reg);\n"
+       "    return 0;\n"
+       "}",
+       "BUG-343: @cast strips volatile");
+
+    /* BUG-343: @cast cannot strip const qualifier */
+    err("distinct typedef *u32 MutPtr;\n"
+       "u32 main() {\n"
+       "    u32 x = 5;\n"
+       "    const *u32 cp = &x;\n"
+       "    MutPtr p = @cast(MutPtr, cp);\n"
+       "    return 0;\n"
+       "}",
+       "BUG-343: @cast strips const");
+
+    /* BUG-343: @cast with volatile OK when target is volatile */
+    ok("distinct typedef volatile *u32 VolPtr;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x40020000);\n"
+       "    VolPtr p = @cast(VolPtr, reg);\n"
+       "    return 0;\n"
+       "}",
+       "BUG-343: @cast volatile preserved OK");
+
+    /* BUG-344: compute_type_size overflow — @size of massive multi-dim array
+     * should return CONST_EVAL_FAIL (emitter uses sizeof), not a wrapped value */
+    ok("struct Big { u32[1000] data; }\n"
+       "u32 main() {\n"
+       "    usize s = @size(Big);\n"
+       "    return @truncate(u32, s);\n"
+       "}",
+       "BUG-344: @size on struct OK (no overflow)");
+}
+
 int main(void) {
     printf("=== ZER Type Checker — Full Spec Coverage ===\n\n");
 
@@ -1879,6 +1918,7 @@ int main(void) {
     test_security_review();
     test_negative_sweep();
     test_red_team_314_318();
+    test_red_team_343_346();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

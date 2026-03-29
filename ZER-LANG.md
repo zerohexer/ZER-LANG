@@ -1615,14 +1615,12 @@ tasks.get(h);
 #### How Handles Work
 
 ```
-Handle(T) — size matches platform pointer width:
-  32-bit target: u32 [generation: 16 bits] [index: 16 bits]
-  64-bit target: u64 [generation: 32 bits] [index: 32 bits]
+Handle(T) — always u32 (fixed-width, cross-platform):
+  u32 [generation: 16 bits] [index: 16 bits]
 
-  Generation wraps after 65,535 (32-bit) or ~4 billion (64-bit)
-  alloc/free cycles per slot. For long-running industrial systems
-  on 32-bit targets, monitor generation counts or schedule
-  maintenance resets. 64-bit targets are practically infinite.
+  Max 65,535 slots per Pool/Slab. Generation wraps after 65,535
+  alloc/free cycles per slot. For long-running industrial systems,
+  monitor generation counts or schedule maintenance resets.
 
 Pool(Task, 8) in memory:
   slots:       [Task, Task, Task, Task, Task, Task, Task, Task]

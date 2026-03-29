@@ -56,6 +56,11 @@ typedef struct {
     Diagnostic *diagnostics;
     int diag_count;
     int diag_capacity;
+
+    /* non-storable node tracking (pool.get, slab.get results) — was global (BUG-346) */
+    Node **non_storable_nodes;
+    int non_storable_count;
+    int non_storable_capacity;
 } Checker;
 
 /* ---- API ---- */

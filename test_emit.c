@@ -1260,6 +1260,7 @@ int main(void) {
 
     printf("[combo: @inttoptr + @ptrtoint roundtrip]\n");
     test_compile_and_run(
+        "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
         "u32 main() {\n"
         "    u32 x = 42;\n"
         "    usize addr = @ptrtoint(&x);\n"

@@ -1842,7 +1842,8 @@ static void test_red_team_314_318(void) {
 
 static void test_red_team_343_346(void) {
     /* BUG-343: @cast cannot strip volatile qualifier */
-    err("distinct typedef *u32 SafePtr;\n"
+    err("mmio 0x40020000..0x40020FFF;\n"
+       "distinct typedef *u32 SafePtr;\n"
        "u32 main() {\n"
        "    volatile *u32 reg = @inttoptr(*u32, 0x40020000);\n"
        "    SafePtr p = @cast(SafePtr, reg);\n"
@@ -1861,7 +1862,8 @@ static void test_red_team_343_346(void) {
        "BUG-343: @cast strips const");
 
     /* BUG-343: @cast with volatile OK when target is volatile */
-    ok("distinct typedef volatile *u32 VolPtr;\n"
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "distinct typedef volatile *u32 VolPtr;\n"
        "u32 main() {\n"
        "    volatile *u32 reg = @inttoptr(*u32, 0x40020000);\n"
        "    VolPtr p = @cast(VolPtr, reg);\n"
@@ -1905,12 +1907,12 @@ static void test_mmio_provenance(void) {
        "}",
        "mmio: constant address outside range rejected");
 
-    /* mmio: no ranges declared — backward compat, all addresses allowed */
-    ok("u32 main() {\n"
+    /* mmio: no ranges declared — @inttoptr rejected */
+    err("u32 main() {\n"
        "    volatile *u32 reg = @inttoptr(*u32, 0x12345678);\n"
        "    return 0;\n"
        "}",
-       "mmio: no ranges = all allowed (backward compat)");
+       "mmio: no ranges = @inttoptr rejected");
 
     /* mmio: multiple ranges, second range matches */
     ok("mmio 0x40020000..0x40020FFF;\n"

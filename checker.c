@@ -2649,7 +2649,12 @@ static Type *check_expr(Checker *c, Node *node) {
                                 type_name(val_type));
                         }
                     }
-                    /* mmio range validation: if ranges declared, constant addr must be in range */
+                    /* mmio range validation: @inttoptr REQUIRES mmio declarations */
+                    if (c->mmio_range_count == 0) {
+                        checker_error(c, node->loc.line,
+                            "@inttoptr requires mmio range declarations — "
+                            "add 'mmio 0xSTART..0xEND;' for your target's address space");
+                    }
                     if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0 &&
                         node->intrinsic.args[0]->kind == NODE_INT_LIT) {
                         uint64_t addr = node->intrinsic.args[0]->int_lit.value;

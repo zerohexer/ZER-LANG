@@ -1824,3 +1824,20 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Generic alignment formula `min(fsize, 8)` doesn't account for arrays whose alignment equals their element type, not their total size.
 - **Fix:** Array alignment computed from element type (recursing through multi-dim). Struct alignment computed from max field alignment. Generic types use `min(fsize, 8)` as before.
 - **Test:** test_checker_full.c — @size struct with array uses element alignment. 429 checker tests total.
+
+## Safe Intrinsics (Features, not bugs)
+
+### FEAT: mmio Range Registry (@inttoptr validation)
+- **What:** New `mmio 0xSTART..0xEND;` top-level declaration. Constant `@inttoptr` addresses validated against ranges at compile time. Variable addresses get runtime range check + trap. No mmio declarations = all allowed (backward compat).
+- **Scope:** lexer (TOK_MMIO), parser (NODE_MMIO), ast (mmio_decl), checker (mmio_ranges array + @inttoptr validation), emitter (runtime range check + comment).
+- **Test:** 6 new checker tests (valid range, outside range, backward compat, multiple ranges, start>end rejected, variable address).
+
+### FEAT: @ptrcast Type Provenance Tracking
+- **What:** Tracks original type through `*opaque` round-trips. `*opaque ctx = @ptrcast(*opaque, &sensor)` records provenance = `*Sensor`. Later `@ptrcast(*Motor, ctx)` → compile error (provenance mismatch). Unknown provenance (params, cinclude) allowed.
+- **Scope:** types.h (Symbol.provenance_type), checker.c (set in var-decl init + assignment, check in @ptrcast handler). Propagates through aliases, clears+re-derives on assignment.
+- **Test:** 4 new checker tests (round-trip OK, wrong type rejected, unknown allowed, alias propagation).
+
+### FEAT: @container Field Validation + Provenance Tracking
+- **What:** (1) Validates field exists in struct — was unchecked, GCC caught it. (2) Tracks which struct+field a pointer was derived from via `&struct.field`. Wrong struct or field in `@container` → compile error when provenance known.
+- **Scope:** types.h (Symbol.container_struct/field), checker.c (set in var-decl/assign on &struct.field, check in @container handler). Propagates through aliases.
+- **Test:** 6 new checker tests (field exists, field missing, proven containment, wrong struct, wrong field, unknown allowed).

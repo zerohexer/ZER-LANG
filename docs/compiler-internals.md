@@ -1329,5 +1329,27 @@ Module registration must use topological order (dependencies before dependents),
 ### Array Alignment in compute_type_size (BUG-350)
 Array member alignment = element type alignment, NOT total array size. `u8[10]` has alignment 1, not 8. For multi-dim arrays, recurse to innermost element. Struct member alignment = max field alignment. The generic formula `min(fsize, 8)` only applies to scalar types. Without this fix, `@size` over-estimates padding for structs containing arrays, causing binary layout mismatch with C (broke C interop via cinclude).
 
+### mmio Range Registry (Safe @inttoptr)
+New top-level declaration: `mmio 0x40020000..0x40020FFF;`. Stores address ranges in Checker struct (`mmio_ranges` array of `[start, end]` pairs). When mmio ranges are declared:
+- **Constant addresses** in `@inttoptr` validated at compile time — must fall within at least one range. Outside all ranges → compile error.
+- **Variable addresses** in `@inttoptr` get runtime range check in emitter: `if (!(addr >= range1_start && addr <= range1_end) && ...) _zer_trap(...)`. Emitted as GCC statement expression with hoisted temp for single-eval.
+- **No mmio declarations** → all `@inttoptr` allowed (backward compatibility).
+- Lexer: `TOK_MMIO`. Parser: `mmio` → consume INT → consume `..` → consume INT → `;`. AST: `NODE_MMIO` with `range_start`/`range_end` (uint64_t). Emitter: emits as comment `/* mmio 0x...–0x... */`.
+
+### @ptrcast Type Provenance Tracking
+Symbol gains `provenance_type` field — tracks the original Type before a `@ptrcast` to `*opaque`. Set when:
+1. `*opaque ctx = @ptrcast(*opaque, sensor_ptr)` → provenance = type of sensor_ptr
+2. Alias propagation: `*opaque q = p` where p has provenance → q inherits
+3. Clear + re-derive on assignment (same pattern as `is_local_derived`)
+
+Checked in `@ptrcast` handler: when casting FROM `*opaque` TO `*T`, if source symbol has `provenance_type`, unwrap both and compare inner types. Mismatch → compile error "source has provenance X but target is Y". Unknown provenance (params, cinclude) → allowed (can't prove wrong).
+
+### @container Field Validation + Provenance
+Two new checks in the `@container` handler:
+1. **Field exists** — resolves type_arg to struct type, looks up field name in fields. Missing field → compile error. This was previously unchecked (GCC caught it via `offsetof` in emitted C).
+2. **Provenance** — Symbol gains `container_struct`, `container_field`, `container_field_len`. Set when `*T ptr = &struct.field` (NODE_UNARY(AMP) → NODE_FIELD, walk to struct type). In `@container`, if source has provenance: target struct must match `container_struct` (pointer identity), field must match `container_field`. Mismatch → compile error. Unknown provenance → allowed.
+
+Both provenance systems propagate through aliases and clear+re-derive on assignment, following the same pattern as `is_local_derived`/`is_arena_derived`.
+
 ### Known Technical Debt (updated)
 - **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.

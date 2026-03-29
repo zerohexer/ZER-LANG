@@ -134,17 +134,26 @@ Handle(Task) h;          index + generation counter, not a pointer
 @size(T)                 sizeof — returns usize
 @truncate(T, val)        keep low bits (big→small)
 @saturate(T, val)        clamp to min/max of T
-@bitcast(T, val)         reinterpret bits (same width required)
-@cast(T, val)            distinct typedef conversion only
-@inttoptr(*T, addr)      integer to pointer
+@bitcast(T, val)         reinterpret bits (same width required, qualifier-checked)
+@cast(T, val)            distinct typedef conversion only (qualifier-checked)
+@inttoptr(*T, addr)      integer to pointer (mmio-range-validated if ranges declared)
 @ptrtoint(ptr)           pointer to integer (usize)
-@ptrcast(*T, ptr)        pointer type cast
+@ptrcast(*T, ptr)        pointer type cast (provenance-tracked, qualifier-checked)
 @barrier()               full memory barrier
 @barrier_store()         store barrier
 @barrier_load()          load barrier
 @offset(T, field)        offsetof
-@container(*T, ptr, f)   container_of
+@container(*T, ptr, f)   container_of (field-validated, provenance-tracked)
 @trap()                  crash intentionally
+```
+
+### mmio Declaration
+```
+mmio 0x40020000..0x40020FFF;   // declare valid MMIO address range
+mmio 0x40011000..0x4001103F;   // multiple ranges allowed
+// @inttoptr with constant address outside ranges → compile error
+// @inttoptr with variable address → runtime range check + trap
+// No mmio declarations → all @inttoptr allowed (backward compat)
 ```
 
 ### Function Pointers
@@ -199,6 +208,10 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
+| Invalid MMIO address | `mmio` range declarations + compile-time/runtime validation of `@inttoptr` |
+| Wrong pointer cast | `@ptrcast` provenance tracking through `*opaque` round-trips |
+| Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
+| Volatile/const strip | `@ptrcast`, `@bitcast`, `@cast` all check qualifier preservation |
 
 ### Implementation Status
 | Feature | Checker | Emitter (E2E) |
@@ -225,6 +238,9 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Volatile emission | Done | Done |
 | Array→slice coercion (call/var/return) | Done | Done |
 | Mutable union capture |*v| | Done | Done (pointer to original) |
+| mmio range validation | Done | Done (runtime trap for variables) |
+| @ptrcast type provenance | Done | N/A (compile-time) |
+| @container field+provenance | Done | N/A (compile-time) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

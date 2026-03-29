@@ -1797,6 +1797,34 @@ static void test_red_team_314_318(void) {
     /* BUG-318: constant expression with large shift */
     ok("u8[1 << 10] buf;\nvoid f() { buf[0] = 1; }",
        "BUG-318: const expr large shift");
+
+    /* BUG-325: @bitcast struct width validation */
+    err("struct Small { u32 x; }\n"
+        "struct Big { u64 x; u64 y; }\n"
+        "void f() { Small s; Big b = @bitcast(Big, s); }",
+        "BUG-325: @bitcast different-size structs rejected");
+
+    ok("struct A { u32 x; u32 y; }\n"
+       "struct B { u64 z; }\n"
+       "void f() { A a; B b = @bitcast(B, a); }",
+       "BUG-325: @bitcast same-size structs accepted");
+
+    /* BUG-326: switch capture const safety */
+    err("void f() {\n"
+        "    const ?u32 val = 42;\n"
+        "    switch (val) {\n"
+        "        default => |*v| { *v = 10; }\n"
+        "    }\n"
+        "}",
+        "BUG-326: switch mutable capture on const source rejected");
+
+    ok("void f() {\n"
+       "    ?u32 val = 42;\n"
+       "    switch (val) {\n"
+       "        default => |*v| { *v = 10; }\n"
+       "    }\n"
+       "}",
+       "BUG-326: switch mutable capture on non-const OK");
 }
 
 int main(void) {

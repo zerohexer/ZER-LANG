@@ -410,6 +410,12 @@ Two tools + one library for automated C-to-ZER migration:
 
 **178. `__typeof__` in ALL capture declarations.** Three sites in if-unwrap replaced `__auto_type` with `__typeof__()`: mutable `|*v|` pointer, null-sentinel `|v|` copy, struct optional `|v|` value extraction. Preserves both volatile and const qualifiers. (BUG-322)
 
+### Red Team Audit Fixes (BUG-325, BUG-326)
+
+**179. @bitcast struct width validation.** `type_width()` returns 0 for structs — falls back to `compute_type_size() * 8`. Prevents mismatched-size struct bitcasts. (BUG-325)
+
+**180. Switch capture const safety.** Walk switch expression to root ident, check `is_const`. Mutable capture `|*v|` on const source now rejected. Applies to both union and optional switch paths. (BUG-326)
+
 ### Structural Refactors Completed (RF1-RF7)
 
 These changed fundamental patterns. Fresh sessions MUST know:

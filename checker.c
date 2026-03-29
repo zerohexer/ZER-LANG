@@ -2440,6 +2440,15 @@ static Type *check_expr(Checker *c, Node *node) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
                     int tw = type_width(result);
                     int vw = type_width(val_type);
+                    /* BUG-325: type_width returns 0 for structs/unions — use compute_type_size */
+                    if (tw == 0 && result) {
+                        int64_t sz = compute_type_size(result);
+                        if (sz != CONST_EVAL_FAIL) tw = (int)(sz * 8);
+                    }
+                    if (vw == 0 && val_type) {
+                        int64_t sz = compute_type_size(val_type);
+                        if (sz != CONST_EVAL_FAIL) vw = (int)(sz * 8);
+                    }
                     if (tw > 0 && vw > 0 && tw != vw) {
                         checker_error(c, node->loc.line,
                             "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
@@ -3075,6 +3084,19 @@ static void check_stmt(Checker *c, Node *node) {
                 Type *cap_type;
                 bool cap_const;
 
+                /* BUG-326: check if source is const — walk to root ident */
+                bool switch_src_const = false;
+                {
+                    Node *cr = node->switch_stmt.expr;
+                    while (cr && (cr->kind == NODE_FIELD || cr->kind == NODE_INDEX))
+                        cr = cr->kind == NODE_FIELD ? cr->field.object : cr->index_expr.object;
+                    if (cr && cr->kind == NODE_IDENT) {
+                        Symbol *cs = scope_lookup(c->current_scope,
+                            cr->ident.name, (uint32_t)cr->ident.name_len);
+                        if (cs && cs->is_const) switch_src_const = true;
+                    }
+                }
+
                 if (expr_eff->kind == TYPE_UNION) {
                     /* tagged union switch — look up variant type */
                     Type *variant_type = ty_void;
@@ -3091,7 +3113,8 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                     if (arm->capture_is_ptr) {
                         cap_type = type_pointer(c->arena, variant_type);
-                        cap_const = false;
+                        cap_const = switch_src_const; /* BUG-326 */
+                        if (cap_const) cap_type->pointer.is_const = true;
                     } else {
                         cap_type = variant_type;
                         cap_const = true;
@@ -3101,7 +3124,8 @@ static void check_stmt(Checker *c, Node *node) {
                     Type *unwrapped = type_unwrap_optional(expr);
                     if (arm->capture_is_ptr) {
                         cap_type = type_pointer(c->arena, unwrapped);
-                        cap_const = false;
+                        cap_const = switch_src_const; /* BUG-326 */
+                        if (cap_const) cap_type->pointer.is_const = true;
                     } else {
                         cap_type = unwrapped;
                         cap_const = true;

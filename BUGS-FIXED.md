@@ -1716,3 +1716,15 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `__auto_type` in GCC drops qualifiers from deduced type.
 - **Fix:** Replace all 3 capture `__auto_type` sites with `__typeof__()` which preserves qualifiers.
 - **Test:** Existing E2E tests pass.
+
+### BUG-325: @bitcast width bypass for structs/unions
+- **Symptom:** `@bitcast(Big, small_struct)` accepted — memcpy over-reads.
+- **Root cause:** `type_width()` returns 0 for structs. Check `tw > 0 && vw > 0` skipped for 0 vs 0.
+- **Fix:** Fall back to `compute_type_size() * 8` when `type_width` returns 0.
+- **Test:** `test_checker_full.c` — different-size structs rejected, same-size accepted.
+
+### BUG-326: Const-safety bypass in switch captures
+- **Symptom:** `const ?u32 val; switch(val) { default => |*v| { *v = 10; } }` — writes to const.
+- **Root cause:** Switch capture `cap_const = false` for mutable `|*v|` without checking source.
+- **Fix:** Walk switch expr to root ident, check `is_const`. Apply to both union and optional switch paths.
+- **Test:** `test_checker_full.c` — mutable capture on const rejected, on non-const accepted.

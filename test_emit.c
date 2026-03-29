@@ -1301,6 +1301,23 @@ int main(void) {
         16,
         "comptime ALIGN_UP(13,8)=16");
 
+    printf("[comptime if: conditional compilation]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 result = 0;\n"
+        "    comptime if (1) {\n"
+        "        result = 10;\n"
+        "    }\n"
+        "    comptime if (0) {\n"
+        "        result = 99;\n"
+        "    } else {\n"
+        "        result += 5;\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n",
+        15,
+        "comptime if: true=10, else=+5, total=15");
+
     /* ---- BUG-025 regression: function pointer declarations ---- */
     printf("\n--- BUG-025 regression: function pointers ---\n");
 

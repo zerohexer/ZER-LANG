@@ -3381,6 +3381,38 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_IF: {
+        /* comptime if — evaluate condition at compile time, only check taken branch */
+        if (node->if_stmt.is_comptime) {
+            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval == CONST_EVAL_FAIL) {
+                /* try looking up const bool/int ident */
+                if (node->if_stmt.cond->kind == NODE_IDENT) {
+                    Symbol *cs = scope_lookup(c->current_scope,
+                        node->if_stmt.cond->ident.name,
+                        (uint32_t)node->if_stmt.cond->ident.name_len);
+                    if (cs && cs->is_const && cs->is_comptime) {
+                        /* comptime bool constant — need the init value */
+                        if (cs->func_node && cs->func_node->kind == NODE_GLOBAL_VAR &&
+                            cs->func_node->var_decl.init)
+                            cval = eval_const_expr(cs->func_node->var_decl.init);
+                    }
+                }
+            }
+            if (cval == CONST_EVAL_FAIL) {
+                checker_error(c, node->loc.line,
+                    "comptime if condition must be a compile-time constant");
+            }
+            /* store result for emitter */
+            node->if_stmt.cond->int_lit.value = (uint64_t)(cval ? 1 : 0);
+            /* only check the taken branch */
+            if (cval) {
+                if (node->if_stmt.then_body) check_stmt(c, node->if_stmt.then_body);
+            } else {
+                if (node->if_stmt.else_body) check_stmt(c, node->if_stmt.else_body);
+            }
+            break;
+        }
+
         Type *cond = check_expr(c, node->if_stmt.cond);
 
         /* if-unwrap: cond must be ?T */

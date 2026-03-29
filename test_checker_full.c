@@ -2112,6 +2112,38 @@ static void test_mmio_provenance(void) {
        "    return f;\n"
        "}",
        "comptime: bitwise OR FLAGS(4, 8) = 12");
+
+    /* comptime if: true branch taken */
+    ok("u32 main() {\n"
+       "    u32 x = 0;\n"
+       "    comptime if (1) {\n"
+       "        x = 42;\n"
+       "    }\n"
+       "    return x;\n"
+       "}",
+       "comptime if: true branch taken");
+
+    /* comptime if: false branch skipped, else taken */
+    ok("u32 main() {\n"
+       "    u32 x = 0;\n"
+       "    comptime if (0) {\n"
+       "        x = 99;\n"
+       "    } else {\n"
+       "        x = 42;\n"
+       "    }\n"
+       "    return x;\n"
+       "}",
+       "comptime if: else branch taken");
+
+    /* comptime if: non-constant condition rejected */
+    err("u32 main() {\n"
+       "    u32 flag = 1;\n"
+       "    comptime if (flag) {\n"
+       "        u32 x = 5;\n"
+       "    }\n"
+       "    return 0;\n"
+       "}",
+       "comptime if: non-constant condition rejected");
 }
 
 int main(void) {

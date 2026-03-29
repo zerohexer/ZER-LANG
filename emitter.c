@@ -2096,6 +2096,16 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_IF:
+        /* comptime if — only emit the taken branch */
+        if (node->if_stmt.is_comptime) {
+            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval) {
+                if (node->if_stmt.then_body) emit_stmt(e, node->if_stmt.then_body);
+            } else {
+                if (node->if_stmt.else_body) emit_stmt(e, node->if_stmt.else_body);
+            }
+            break;
+        }
         if (node->if_stmt.capture_name) {
             /* if-unwrap: if (maybe) |val| { ... }
              * |val|  → copy of unwrapped value (immutable)

@@ -1118,6 +1118,17 @@ static Node *parse_statement(Parser *p) {
     if (check(p, TOK_LBRACE))
         return parse_block(p);
 
+    /* comptime if — compile-time conditional */
+    if (check(p, TOK_COMPTIME)) {
+        advance(p);
+        if (!match(p, TOK_IF)) {
+            error_at(p, &p->previous, "expected 'if' after 'comptime' in statement");
+        }
+        Node *n = parse_if_stmt(p);
+        n->if_stmt.is_comptime = true;
+        return n;
+    }
+
     /* if */
     if (match(p, TOK_IF))
         return parse_if_stmt(p);

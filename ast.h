@@ -344,6 +344,7 @@ struct Node {
             const char *capture_name;   /* NULL if no capture */
             size_t capture_name_len;
             bool capture_is_ptr;        /* true for |*val| */
+            bool is_comptime;           /* comptime if — condition evaluated at compile time */
         } if_stmt;
 
         /* NODE_FOR: for (init; cond; step) { body } */

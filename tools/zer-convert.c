@@ -947,14 +947,49 @@ static void transform(void) {
                         j++;
                         /* Check if it's a function-like macro: NAME( */
                         if (j < token_count && tokens[j].type == CT_LPAREN) {
-                            /* function-like macro — emit as comment, too complex */
-                            emit_str("// MANUAL: ");
-                            while (i < token_count && tokens[i].type != CT_NEWLINE && tokens[i].type != CT_EOF) {
-                                emit_tok(&tokens[i]);
-                                i++;
+                            /* function-like macro → comptime function
+                             * #define MAX(a, b) ((a) > (b) ? (a) : (b))
+                             * → comptime u32 MAX(u32 a, u32 b) { return (a) > (b) ? (a) : (b); } */
+                            emit_str("comptime u32 ");
+                            emit_tok(name);
+                            emit_str("(");
+                            j++; /* skip ( */
+                            /* collect param names */
+                            bool first_param = true;
+                            while (j < token_count && tokens[j].type != CT_RPAREN &&
+                                   tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                                if (tokens[j].type == CT_COMMA) {
+                                    emit_str(", ");
+                                    j++;
+                                    continue;
+                                }
+                                if (tokens[j].type == CT_WHITESPACE) { j++; continue; }
+                                if (tokens[j].type == CT_IDENT) {
+                                    if (!first_param) { /* already emitted comma */ }
+                                    emit_str("u32 ");
+                                    emit_tok(&tokens[j]);
+                                    first_param = false;
+                                }
+                                j++;
                             }
-                            emit_str("\n");
-                            if (i < token_count && tokens[i].type == CT_NEWLINE) i++;
+                            if (j < token_count && tokens[j].type == CT_RPAREN) j++;
+                            emit_str(") {\n    return ");
+                            /* skip whitespace after ) */
+                            while (j < token_count && tokens[j].type == CT_WHITESPACE) j++;
+                            /* emit the macro body expression */
+                            while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                                /* handle line continuation \ */
+                                if (tokens[j].type == CT_UNKNOWN && tokens[j].len == 1 && tokens[j].start[0] == '\\') {
+                                    j++;
+                                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                                    continue;
+                                }
+                                emit_tok(&tokens[j]);
+                                j++;
+                            }
+                            emit_str(";\n}\n");
+                            if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                            i = j;
                             continue;
                         }
                         /* simple constant: #define FOO 42 */
@@ -972,19 +1007,116 @@ static void transform(void) {
                             i = j;
                             continue;
                         }
+                        /* fallback: #define NAME expr (non-numeric expression)
+                         * → comptime u32 NAME() { return expr; }
+                         * If empty body (guard macro), emit as const */
+                        j = skip_ws(j);
+                        if (j >= token_count || tokens[j].type == CT_NEWLINE || tokens[j].type == CT_EOF) {
+                            /* empty #define — guard macro or flag, emit as const bool */
+                            emit_str("const bool ");
+                            emit_tok(name);
+                            emit_str(" = true;\n");
+                            if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                            i = j;
+                            continue;
+                        }
+                        /* has expression body — emit as comptime */
+                        emit_str("comptime u32 ");
+                        emit_tok(name);
+                        emit_str("() {\n    return ");
+                        while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                            if (tokens[j].type == CT_UNKNOWN && tokens[j].len == 1 && tokens[j].start[0] == '\\') {
+                                j++;
+                                if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                                continue;
+                            }
+                            emit_tok(&tokens[j]);
+                            j++;
+                        }
+                        emit_str(";\n}\n");
+                        if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                        i = j;
+                        continue;
                     }
-                    /* fallback: emit as comment */
-                    emit_str("// MANUAL: ");
-                    while (i < token_count && tokens[i].type != CT_NEWLINE && tokens[i].type != CT_EOF) {
-                        emit_tok(&tokens[i]);
-                        i++;
+                }
+                /* #ifdef NAME → comptime if (NAME) { */
+                if (tok_eq(&tokens[j], "ifdef")) {
+                    j++;
+                    j = skip_ws(j);
+                    if (j < token_count && tokens[j].type == CT_IDENT) {
+                        emit_str("comptime if (");
+                        emit_tok(&tokens[j]);
+                        emit_str(") {\n");
+                        j++;
                     }
-                    emit_str("\n");
-                    if (i < token_count && tokens[i].type == CT_NEWLINE) i++;
+                    while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) j++;
+                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    i = j;
                     continue;
                 }
-                /* other preprocessor: #ifdef, #endif, etc → emit as comment */
-                emit_str("// MANUAL: ");
+                /* #ifndef NAME → comptime if (!NAME) { */
+                if (tok_eq(&tokens[j], "ifndef")) {
+                    j++;
+                    j = skip_ws(j);
+                    if (j < token_count && tokens[j].type == CT_IDENT) {
+                        emit_str("comptime if (!");
+                        emit_tok(&tokens[j]);
+                        emit_str(") {\n");
+                        j++;
+                    }
+                    while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) j++;
+                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    i = j;
+                    continue;
+                }
+                /* #endif → } */
+                if (tok_eq(&tokens[j], "endif")) {
+                    emit_str("}\n");
+                    j++;
+                    while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) j++;
+                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    i = j;
+                    continue;
+                }
+                /* #else → } else { */
+                if (tok_eq(&tokens[j], "else")) {
+                    emit_str("} else {\n");
+                    j++;
+                    while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) j++;
+                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    i = j;
+                    continue;
+                }
+                /* #if expr → comptime if (expr) { */
+                if (tok_eq(&tokens[j], "if")) {
+                    emit_str("comptime if (");
+                    j++;
+                    j = skip_ws(j);
+                    while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                        emit_tok(&tokens[j]);
+                        j++;
+                    }
+                    emit_str(") {\n");
+                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    i = j;
+                    continue;
+                }
+                /* #elif expr → } else comptime if (expr) { — emit as comment for now */
+                if (tok_eq(&tokens[j], "elif")) {
+                    emit_str("} else {\ncomptime if (");
+                    j++;
+                    j = skip_ws(j);
+                    while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                        emit_tok(&tokens[j]);
+                        j++;
+                    }
+                    emit_str(") {\n");
+                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                    i = j;
+                    continue;
+                }
+                /* #pragma, #error, #warning, #line, etc → emit as comment */
+                emit_str("// ");
                 while (i < token_count && tokens[i].type != CT_NEWLINE && tokens[i].type != CT_EOF) {
                     emit_tok(&tokens[i]);
                     i++;

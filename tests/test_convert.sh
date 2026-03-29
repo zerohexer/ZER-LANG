@@ -133,7 +133,13 @@ check_phase1 "NULL→null" "void *p = NULL;" "null"
 check_phase1 "#include→cinclude" '#include <stdio.h>' 'cinclude "stdio.h";'
 check_phase1 "#include quotes" '#include "myheader.h"' 'cinclude "myheader.h";'
 check_phase1 "#define const" '#define SIZE 256' 'const u32 SIZE = 256;'
-check_phase1 "#define macro→comment" '#define MAX(a,b) ((a)>(b)?(a):(b))' '// MANUAL:'
+check_phase1 "#define macro→comptime" '#define MAX(a,b) ((a)>(b)?(a):(b))' 'comptime u32 MAX(u32 a, u32 b)'
+check_phase1 "#define guard→const bool" '#define MY_GUARD' 'const bool MY_GUARD = true;'
+check_phase1 "#define expr→comptime" '#define MASK (0xFF << 8)' 'comptime u32 MASK()'
+check_phase1 "#ifdef→comptime if" '#ifdef ARM' 'comptime if (ARM)'
+check_phase1 "#ifndef→comptime if" '#ifndef DEBUG' 'comptime if (!DEBUG)'
+check_phase1 "#endif→close brace" '#endif' '}'
+check_phase1 "#else→else brace" '#else' '} else {'
 
 # --- sizeof ---
 check_phase1 "sizeof(T)→@size(T)" "sizeof(Node)" "@size(Node)"

@@ -327,7 +327,8 @@ diff zerc zerc2                  ← identical = v1.0 proven
 
 **Roadmap:**
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
-- **v0.3:** bounds check optimization, better error messages, zer-convert Layer 2 refinement
+- **v0.2.1 (CURRENT):** comptime functions + comptime if, mmio range validation, @ptrcast/@container provenance tracking, safe intrinsics (every @ operation validated), zer-convert preprocessor→comptime (zero // MANUAL:), 350+ bug fixes, 1,280+ tests
+- **v0.3:** bounds check optimization, better error messages, stdlib completion (io/fmt/conv)
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
 
@@ -336,13 +337,14 @@ diff zerc zerc2                  ← identical = v1.0 proven
 Two tools + one library for automated C-to-ZER migration. Full architecture docs in `docs/compiler-internals.md`.
 
 **`tools/zer-convert.c`** — Phase 1: C syntax → ZER syntax (token-level transform)
-- Types, operators, casts, sizeof, preprocessor, struct/enum/union keyword removal
+- Types, operators, casts, sizeof, struct/enum/union keyword removal
 - switch/case/break → ZER `.VALUE => {}` syntax (nested, multi-case fallthrough)
 - typedef struct → struct Name, do-while → while(true), void* → *opaque
 - Pointer decl rearrangement: `int *ptr` → `*i32 ptr` (multi-level, return types)
 - Usage scanner `classify_params`: char* → []u8 (string), ?*u8 (nullable), *u8 (write-through)
 - Pointer arithmetic: `ptr + N` → `ptr[N..]`, `*(ptr + N)` → `ptr[N]`
 - Auto-extraction: ternary/goto/bitfields/asm → companion `_extract.h` via cinclude
+- Preprocessor → comptime: `#define MAX(a,b)` → `comptime u32 MAX(u32 a, u32 b)`, `#ifdef` → `comptime if`, `#endif` → `}`, `#define GUARD` → `const bool GUARD = true;`
 
 **`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
 - Layer 1: strlen→.len, strcmp→bytes_equal/bytes_compare, memcpy→bytes_copy, memset→bytes_zero, strcpy/strncpy→@cstr

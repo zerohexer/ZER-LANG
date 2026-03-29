@@ -671,10 +671,24 @@ Two tools + one library for automated C-to-ZER migration:
 - `.zer` file gets `cinclude "name_extract.h";` + function declarations with ZER type mapping.
 - Zero `// MANUAL:` comments needed. Everything compiles via GCC.
 
+**Preprocessor → comptime conversion (zero // MANUAL:):**
+- `#define NAME(params) expr` → `comptime u32 NAME(u32 param, ...) { return expr; }` — function-like macros become comptime functions. All params typed as `u32` (user refines types manually if needed). Line continuation (`\`) handled.
+- `#define NAME expr` (non-numeric) → `comptime u32 NAME() { return expr; }` — expression macros become zero-arg comptime functions.
+- `#define GUARD` (empty) → `const bool GUARD = true;` — guard/flag macros become bool constants.
+- `#define NAME 42` (numeric) → `const u32 NAME = 42;` — unchanged from before.
+- `#ifdef NAME` → `comptime if (NAME) {`
+- `#ifndef NAME` → `comptime if (!NAME) {`
+- `#if expr` → `comptime if (expr) {`
+- `#elif expr` → `} else { comptime if (expr) {`
+- `#else` → `} else {`
+- `#endif` → `}`
+- `#pragma`, `#error`, `#warning`, `#line` → `// #pragma ...` (comment, harmless)
+
 **Remaining design limitations:**
 - `cinclude` → `import` migration — manual step (one line per file). Required for full ZER safety across modules.
-- Complex `#define` macros inline in `.c` files → `// MANUAL:` (macros in headers work via `cinclude` automatically).
-- 102 regression tests covering all conversion patterns.
+- Comptime function-like macros default all params to `u32` — user must refine types for non-integer macros.
+- `#elif` emits nested `} else { comptime if (...) {` which may need extra `}` at `#endif` — manual fixup for complex multi-branch `#if/#elif/#else/#endif` chains.
+- 108 regression tests covering all conversion patterns.
 
 ### Red Team Audit Fixes (BUG-314 through BUG-318)
 

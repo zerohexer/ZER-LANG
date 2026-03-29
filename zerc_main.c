@@ -255,36 +255,75 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* type check — register all imported module declarations first */
+    /* BUG-349: compute topological order for registration AND body checking,
+     * not just emission. Dependencies must be registered before dependents. */
+    int *topo_order = (int *)malloc(cc.module_count * sizeof(int));
+    int topo_count = 0;
+    {
+        bool *tvisited = (bool *)calloc(cc.module_count, sizeof(bool));
+        bool tprogress = true;
+        while (tprogress && topo_count < cc.module_count) {
+            tprogress = false;
+            for (int i = 0; i < cc.module_count; i++) {
+                if (tvisited[i]) continue;
+                Module *m = &cc.modules[i];
+                if (!m->ast) { tvisited[i] = true; continue; }
+                bool deps_met = true;
+                for (int j = 0; j < m->ast->file.decl_count; j++) {
+                    Node *d = m->ast->file.decls[j];
+                    if (d->kind == NODE_IMPORT) {
+                        for (int k = 0; k < cc.module_count; k++) {
+                            if (strlen(cc.modules[k].name) == d->import.module_name_len &&
+                                memcmp(cc.modules[k].name, d->import.module_name,
+                                       d->import.module_name_len) == 0) {
+                                if (!tvisited[k]) { deps_met = false; break; }
+                            }
+                        }
+                        if (!deps_met) break;
+                    }
+                }
+                if (deps_met) {
+                    topo_order[topo_count++] = i;
+                    tvisited[i] = true;
+                    tprogress = true;
+                }
+            }
+        }
+        free(tvisited);
+    }
+
+    /* type check — register all modules in topological order */
     Checker checker;
     checker_init(&checker, &cc.arena, input_path);
 
-    /* register imported modules first (so their types are in scope for main)
-     * Set module prefix for each — enables name mangling in emitter */
-    for (int i = 1; i < cc.module_count; i++) {
-        Module *m = &cc.modules[i];
-        if (m->ast) {
+    /* register in topo order: dependencies first, main last */
+    for (int ti = 0; ti < topo_count; ti++) {
+        int idx = topo_order[ti];
+        Module *m = &cc.modules[idx];
+        if (!m->ast) continue;
+        if (idx == 0) {
+            /* main module — no prefix */
+            checker.current_module = NULL;
+            checker.current_module_len = 0;
+        } else {
             checker.current_module = m->name;
             checker.current_module_len = (uint32_t)strlen(m->name);
-            checker_register_file(&checker, m->ast);
         }
+        checker_register_file(&checker, m->ast);
     }
-    /* register main module last — no prefix */
-    checker.current_module = NULL;
-    checker.current_module_len = 0;
-    if (main_mod->ast) checker_register_file(&checker, main_mod->ast);
 
-    /* type-check imported module bodies — each module gets its own scope
+    /* type-check bodies in topo order — each imported module gets its own scope
      * so same-named types in different modules resolve correctly */
-    for (int i = 1; i < cc.module_count; i++) {
-        Module *m = &cc.modules[i];
-        if (m->ast) {
-            checker.current_module = m->name;
-            checker.current_module_len = (uint32_t)strlen(m->name);
-            checker_push_module_scope(&checker, m->ast);
-            checker_check_bodies(&checker, m->ast);
-            checker_pop_module_scope(&checker);
-        }
+    for (int ti = 0; ti < topo_count; ti++) {
+        int idx = topo_order[ti];
+        if (idx == 0) continue; /* main checked separately below */
+        Module *m = &cc.modules[idx];
+        if (!m->ast) continue;
+        checker.current_module = m->name;
+        checker.current_module_len = (uint32_t)strlen(m->name);
+        checker_push_module_scope(&checker, m->ast);
+        checker_check_bodies(&checker, m->ast);
+        checker_pop_module_scope(&checker);
     }
     checker.current_module = NULL;
     checker.current_module_len = 0;
@@ -310,98 +349,25 @@ int main(int argc, char **argv) {
     emitter.lib_mode = no_preamble;
     emitter.source_file = input_path;
 
-    /* emit: preamble (from main) → imported modules → main declarations
-     * This ensures imported functions are declared before main uses them. */
-    /* We emit main's file which includes preamble + main declarations,
-     * but imported module code needs to come between preamble and main body.
-     * Simplest: emit preamble via main, then imported, then main body.
-     * Since emit_file does both, just emit imported first with preamble,
-     * then main without. But only first file needs preamble. */
-    /* Emit with topological ordering: dependencies before dependents.
-     * Recursive: emit a module's imports first, then the module itself.
-     * emitted flag prevents double emission in diamond dependencies. */
-    {
-        /* first, emit preamble (only once) via a dummy main emit */
-        /* we need preamble before any module code */
-        /* hack: emit main file (which has preamble), but we also need
-         * imported modules before main's functions. So: emit preamble
-         * separately by emitting an empty-ish main first... */
-        /* Actually simpler: just emit preamble manually, then topo-order all */
+    /* emit in topological order (reuse topo_order from registration):
+     * first module gets preamble (unless --lib) */
+    for (int ti = 0; ti < topo_count; ti++) {
+        Module *m = &cc.modules[topo_order[ti]];
+        emitter.source_file = m->path;
+        if (topo_order[ti] == 0) {
+            emitter.current_module = NULL;
+            emitter.current_module_len = 0;
+        } else {
+            emitter.current_module = m->name;
+            emitter.current_module_len = (uint32_t)strlen(m->name);
+        }
+        if (ti == 0 && !no_preamble) {
+            emit_file(&emitter, m->ast);
+        } else {
+            emit_file_no_preamble(&emitter, m->ast);
+        }
     }
-    /* For clean solution: emit main file (has preamble + runtime),
-     * then topo-emit imports, then... no, main needs imports first.
-     *
-     * Cleanest: build emit order array via DFS, emit first gets preamble. */
-    {
-        int *emit_order = (int *)malloc(cc.module_count * sizeof(int));
-        int emit_count = 0;
-        bool *visited = (bool *)calloc(cc.module_count, sizeof(bool));
-
-        /* recursive topo sort via function pointer... or just inline loops.
-         * For simplicity, iterate: repeatedly find modules with all deps emitted */
-        bool progress = true;
-        while (progress && emit_count < cc.module_count) {
-            progress = false;
-            for (int i = 0; i < cc.module_count; i++) {
-                if (visited[i]) continue;
-                Module *m = &cc.modules[i];
-                if (!m->ast) { visited[i] = true; continue; }
-
-                /* check if all imports of this module are already emitted */
-                bool deps_met = true;
-                for (int j = 0; j < m->ast->file.decl_count; j++) {
-                    Node *d = m->ast->file.decls[j];
-                    if (d->kind == NODE_IMPORT) {
-                        /* find the imported module index */
-                        for (int k = 0; k < cc.module_count; k++) {
-                            if (strlen(cc.modules[k].name) == d->import.module_name_len &&
-                                memcmp(cc.modules[k].name, d->import.module_name,
-                                       d->import.module_name_len) == 0) {
-                                if (!visited[k]) { deps_met = false; break; }
-                            }
-                        }
-                        if (!deps_met) break;
-                    }
-                }
-
-                if (deps_met) {
-                    emit_order[emit_count++] = i;
-                    visited[i] = true;
-                    progress = true;
-                }
-            }
-        }
-
-        if (emit_count < cc.module_count) {
-            fprintf(stderr, "error: circular dependency or unresolved imports\n");
-            free(emit_order);
-            free(visited);
-            fclose(out);
-            return 1;
-        }
-
-        /* emit in topological order: first module gets preamble (unless --lib) */
-        for (int i = 0; i < emit_count; i++) {
-            Module *m = &cc.modules[emit_order[i]];
-            /* update source mapping and module context for current module */
-            emitter.source_file = m->path;
-            /* main module (index 0) has no prefix; imported modules get their name */
-            if (emit_order[i] == 0) {
-                emitter.current_module = NULL;
-                emitter.current_module_len = 0;
-            } else {
-                emitter.current_module = m->name;
-                emitter.current_module_len = (uint32_t)strlen(m->name);
-            }
-            if (i == 0 && !no_preamble) {
-                emit_file(&emitter, m->ast);
-            } else {
-                emit_file_no_preamble(&emitter, m->ast);
-            }
-        }
-        free(emit_order);
-        free(visited);
-    }
+    free(topo_order);
 
     fclose(out);
 

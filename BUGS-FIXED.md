@@ -1806,3 +1806,21 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Legacy design from before RF1 (typemap refactor). Was documented as known technical debt.
 - **Fix:** Moved `non_storable_nodes`, `non_storable_count`, `non_storable_capacity` into Checker struct. All call sites now pass Checker pointer. Arena pointer from `c->arena` replaces separate `non_storable_arena` global.
 - **Test:** All existing tests pass (no behavior change for single-threaded use).
+
+### BUG-348: Missing memory barriers in Ring push/pop
+- **Symptom:** Ring spec (§22) promises internal barriers ("Ring handles barriers INTERNALLY"), but emitted code had no `__atomic_thread_fence` calls.
+- **Root cause:** Ring runtime `_zer_ring_push` and inline pop code were implemented without barriers.
+- **Fix:** Added `__atomic_thread_fence(__ATOMIC_RELEASE)` in `_zer_ring_push` between data write and head update. Added `__atomic_thread_fence(__ATOMIC_ACQUIRE)` in pop after data read, before tail update. Ensures interrupt/other core sees data before seeing updated head/tail.
+- **Test:** All E2E tests pass (barriers are no-ops on single-threaded tests but present in emitted C).
+
+### BUG-349: Module registration order breaks transitive struct deps
+- **Symptom:** `main imports mid, mid imports base` — `struct Point` from `base` not in scope when `mid` registers `struct Holder { Point pt; }`. Error: "undefined type 'Point'".
+- **Root cause:** Modules registered in BFS discovery order (mid before base), but topological sort only applied to emission, not registration.
+- **Fix:** Compute topological order once, reuse for registration, body checking, AND emission. Dependencies registered before dependents.
+- **Test:** New module test `transitive.zer` — 3-level import chain with cross-module struct fields. 11 module tests total.
+
+### BUG-350: Array alignment in compute_type_size
+- **Symptom:** `struct S { u8 a; u8[10] data; u8 b; }` — `@size(S)` returned 24 but GCC says 12. `u8[10]` got falign=8 (capped size) instead of 1 (element alignment).
+- **Root cause:** Generic alignment formula `min(fsize, 8)` doesn't account for arrays whose alignment equals their element type, not their total size.
+- **Fix:** Array alignment computed from element type (recursing through multi-dim). Struct alignment computed from max field alignment. Generic types use `min(fsize, 8)` as before.
+- **Test:** test_checker_full.c — @size struct with array uses element alignment. 429 checker tests total.

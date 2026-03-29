@@ -1320,5 +1320,14 @@ Handle is always `uint32_t` (16-bit index + 16-bit generation). Max 65,535 slots
 ### non_storable_nodes Moved to Checker Struct (BUG-346, RF12)
 `non_storable_nodes`, `non_storable_count`, `non_storable_capacity` moved from static globals into Checker struct. All helpers (`non_storable_init`, `mark_non_storable`, `is_non_storable`) now take `Checker *c`. Arena pointer uses `c->arena`. Eliminates last known static global state — compiler is now thread-safe for LSP concurrent requests.
 
+### Ring Memory Barriers (BUG-348)
+Ring push emits `__atomic_thread_fence(__ATOMIC_RELEASE)` between data write (`memcpy`) and head pointer update. Ring pop emits `__atomic_thread_fence(__ATOMIC_ACQUIRE)` after data read and before tail pointer update. This fulfills the spec promise "Ring handles barriers INTERNALLY" — data is guaranteed visible before the pointer update on out-of-order processors (ARM Cortex-A, modern x86, RISC-V). Without these, an interrupt handler reading head/tail could see stale data.
+
+### Topological Registration Order (BUG-349)
+Module registration must use topological order (dependencies before dependents), not BFS discovery order. `register_decl` for structs resolves field types immediately via `resolve_type` — if a dependency module's types aren't registered yet, field types resolve to `ty_void`. The topo sort is computed once in `zerc_main.c` and reused for: (1) registration, (2) body checking, (3) emission. Eliminates the old duplicate topo sort for emission.
+
+### Array Alignment in compute_type_size (BUG-350)
+Array member alignment = element type alignment, NOT total array size. `u8[10]` has alignment 1, not 8. For multi-dim arrays, recurse to innermost element. Struct member alignment = max field alignment. The generic formula `min(fsize, 8)` only applies to scalar types. Without this fix, `@size` over-estimates padding for structs containing arrays, causing binary layout mismatch with C (broke C interop via cinclude).
+
 ### Known Technical Debt (updated)
 - **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.

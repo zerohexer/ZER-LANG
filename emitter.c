@@ -959,9 +959,11 @@ static void emit_expr(Emitter *e, Node *node) {
                         Type *opt_type = type_optional(e->arena, obj_type->ring.elem);
                         emit(e, "({");
                         emit_type(e, opt_type);
+                        /* BUG-348: acquire barrier after data read, before tail update */
                         emit(e, " _zer_rp%d = {0}; "
                              "if (%.*s.count > 0) { "
                              "_zer_rp%d.value = %.*s.data[%.*s.tail]; "
+                             "__atomic_thread_fence(__ATOMIC_ACQUIRE); "
                              "_zer_rp%d.has_value = 1; "
                              "%.*s.tail = (%.*s.tail + 1) %% %llu; "
                              "%.*s.count--; } "
@@ -3213,6 +3215,9 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "static inline void _zer_ring_push(void *ring_data, uint32_t *head, uint32_t *tail, "
             "uint32_t *count, size_t capacity, const void *val, size_t elem_size) {\n");
     emit(e, "    memcpy((char*)ring_data + (*head) * elem_size, val, elem_size);\n");
+    /* BUG-348: store barrier between data write and head update.
+     * Ensures interrupt/other core sees data before updated head. */
+    emit(e, "    __atomic_thread_fence(__ATOMIC_RELEASE);\n");
     emit(e, "    *head = (*head + 1) %% capacity;\n");
     emit(e, "    if (*count < capacity) { (*count)++; }\n");
     emit(e, "    else { *tail = (*tail + 1) %% capacity; }\n");

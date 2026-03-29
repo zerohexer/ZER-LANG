@@ -1877,6 +1877,15 @@ static void test_red_team_343_346(void) {
        "    return @truncate(u32, s);\n"
        "}",
        "BUG-344: @size on struct OK (no overflow)");
+
+    /* BUG-350: array alignment in compute_type_size — u8[10] alignment=1 not 8 */
+    ok("struct S { u8 a; u8[10] data; u8 b; }\n"
+       "u8[@size(S)] buf;\n"
+       "u32 main() {\n"
+       "    usize s = @size(S);\n"
+       "    return @truncate(u32, s);\n"
+       "}",
+       "BUG-350: @size struct with array uses element alignment");
 }
 
 int main(void) {

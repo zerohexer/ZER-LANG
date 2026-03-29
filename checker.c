@@ -331,21 +331,28 @@ static int64_t compute_type_size(Type *t) {
             /* BUG-275: if any field is target-dependent, whole struct is */
             if (fsize == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
             if (fsize <= 0) fsize = 4; /* fallback for unknown types */
-            int falign = is_packed ? 1 : (int)(fsize > 8 ? 8 : fsize);
-            /* for nested structs, alignment = largest field alignment, capped at 8 */
-            if (t->struct_type.fields[fi].type->kind == TYPE_STRUCT ||
-                t->struct_type.fields[fi].type->kind == TYPE_ARRAY) {
-                /* use the inner struct/array's natural alignment */
+            /* BUG-350: alignment must be based on element type, not total size.
+             * u8[10] has alignment 1 (element u8), not 8 (capped size). */
+            int falign;
+            if (is_packed) {
+                falign = 1;
+            } else {
                 Type *ft = type_unwrap_distinct(t->struct_type.fields[fi].type);
-                if (ft->kind == TYPE_STRUCT && ft->struct_type.field_count > 0) {
-                    int64_t first_field_size = compute_type_size(ft->struct_type.fields[0].type);
-                    if (first_field_size > 0 && first_field_size <= 8)
-                        falign = (int)first_field_size;
-                    /* find max field alignment */
+                if (ft->kind == TYPE_ARRAY) {
+                    /* array alignment = element alignment */
+                    Type *elem = ft->array.inner;
+                    while (elem && elem->kind == TYPE_ARRAY) elem = elem->array.inner;
+                    int64_t elem_sz = compute_type_size(elem);
+                    falign = (elem_sz > 0 && elem_sz <= 8) ? (int)elem_sz : 1;
+                } else if (ft->kind == TYPE_STRUCT && ft->struct_type.field_count > 0) {
+                    /* struct alignment = max field alignment */
+                    falign = 1;
                     for (uint32_t k = 0; k < ft->struct_type.field_count; k++) {
                         int64_t ks = compute_type_size(ft->struct_type.fields[k].type);
                         if (ks > 0 && ks <= 8 && (int)ks > falign) falign = (int)ks;
                     }
+                } else {
+                    falign = (int)(fsize > 8 ? 8 : (fsize > 0 ? fsize : 1));
                 }
             }
             if (falign > max_align) max_align = falign;

@@ -1,0 +1,7 @@
+import base;
+struct Holder { Point pt; }
+Holder make_holder() {
+    Holder h;
+    h.pt = make_point();
+    return h;
+}

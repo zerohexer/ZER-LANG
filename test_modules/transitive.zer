@@ -1,0 +1,5 @@
+import mid;
+u32 main() {
+    Holder h = make_holder();
+    return h.pt.x + h.pt.y;
+}

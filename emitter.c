@@ -656,14 +656,19 @@ static void emit_expr(Emitter *e, Node *node) {
                 for (uint32_t i = 0; i < obj_type->union_type.variant_count; i++) {
                     SUVariant *v = &obj_type->union_type.variants[i];
                     if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0) {
-                        /* emit: obj._tag = TAG_variant, obj.variant = val */
-                        emit(e, "(");
-                        emit_expr(e, obj_node);
-                        emit(e, "._tag = %u, ", i);
-                        emit_expr(e, node->assign.target);
-                        emit(e, " = ");
-                        emit_expr(e, node->assign.value);
-                        emit(e, ")");
+                        /* BUG-340: hoist target into pointer temp for single-eval */
+                        {
+                            int tmp = e->temp_count++;
+                            emit(e, "({ __typeof__(");
+                            emit_expr(e, obj_node);
+                            emit(e, ") *_zer_up%d = &(", tmp);
+                            emit_expr(e, obj_node);
+                            emit(e, "); _zer_up%d->_tag = %u; _zer_up%d->", tmp, i, tmp);
+                            fprintf(e->out, "%.*s", (int)vlen, vname);
+                            emit(e, " = ");
+                            emit_expr(e, node->assign.value);
+                            emit(e, "; })");
+                        }
                         goto assign_done;
                     }
                 }

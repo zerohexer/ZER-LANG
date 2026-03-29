@@ -1816,11 +1816,26 @@ static Type *check_expr(Checker *c, Node *node) {
                     for (int i = 0; i < (int)effective_callee->func_ptr.param_count &&
                          i < node->call.arg_count; i++) {
                         if (!effective_callee->func_ptr.param_keeps[i]) continue;
-                        /* keep param: arg must be static/global, not local */
+                        /* keep param: arg must be static/global, not local.
+                         * BUG-339: also check orelse fallback for &local.
+                         * BUG-338: walk into intrinsics for &local. */
                         Node *arg_node = node->call.args[i];
-                        if (arg_node->kind == NODE_UNARY &&
-                            arg_node->unary.op == TOK_AMP &&
-                            arg_node->unary.operand->kind == NODE_IDENT) {
+                        /* unwrap orelse — check both expr and fallback */
+                        Node *keep_checks[2] = { arg_node, NULL };
+                        int keep_check_count = 1;
+                        if (arg_node->kind == NODE_ORELSE) {
+                            keep_checks[0] = arg_node->orelse.expr;
+                            if (arg_node->orelse.fallback)
+                                keep_checks[keep_check_count++] = arg_node->orelse.fallback;
+                        }
+                        for (int kc = 0; kc < keep_check_count; kc++) {
+                        Node *karg = keep_checks[kc];
+                        /* walk into intrinsics */
+                        while (karg && karg->kind == NODE_INTRINSIC && karg->intrinsic.arg_count > 0)
+                            karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                        if (karg && karg->kind == NODE_UNARY &&
+                            karg->unary.op == TOK_AMP &&
+                            karg->unary.operand->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
                                 arg_node->unary.operand->ident.name,
                                 (uint32_t)arg_node->unary.operand->ident.name_len);
@@ -1849,6 +1864,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        } /* end keep_checks loop (BUG-339) */
                         /* BUG-221: also reject local-derived pointers */
                         if (arg_node->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
@@ -2491,6 +2507,25 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
                     }
+                    /* BUG-341: volatile stripping via @bitcast (same as @ptrcast BUG-258) */
+                    Type *veff = type_unwrap_distinct(val_type);
+                    Type *reff = type_unwrap_distinct(result);
+                    if (veff && veff->kind == TYPE_POINTER &&
+                        reff && reff->kind == TYPE_POINTER &&
+                        !reff->pointer.is_volatile) {
+                        bool src_vol = veff->pointer.is_volatile;
+                        if (!src_vol && node->intrinsic.args[0]->kind == NODE_IDENT) {
+                            Symbol *vs = scope_lookup(c->current_scope,
+                                node->intrinsic.args[0]->ident.name,
+                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                            if (vs && vs->is_volatile) src_vol = true;
+                        }
+                        if (src_vol) {
+                            checker_error(c, node->loc.line,
+                                "@bitcast cannot strip volatile qualifier — "
+                                "target must be volatile pointer");
+                        }
+                    }
                 }
             } else {
                 result = ty_void;
@@ -2878,10 +2913,16 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                     for (int ci = 0; ci < check_count; ci++) {
                         Node *init_root = checks[ci];
-                        while (init_root && (init_root->kind == NODE_FIELD ||
-                                             init_root->kind == NODE_INDEX)) {
+                        while (init_root) {
                             if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
-                            else init_root = init_root->index_expr.object;
+                            else if (init_root->kind == NODE_INDEX) init_root = init_root->index_expr.object;
+                            /* BUG-338: walk into intrinsic args (ptrcast, bitcast) */
+                            else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
+                                init_root = init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                            /* walk into & — &x root is x */
+                            else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
+                                init_root = init_root->unary.operand;
+                            else break;
                         }
                         if (init_root && init_root->kind == NODE_IDENT) {
                             Symbol *src = scope_lookup(c->current_scope,
@@ -2900,16 +2941,26 @@ static void check_stmt(Checker *c, Node *node) {
                 {
                     Node *init = node->var_decl.init;
                     /* check both direct &local AND orelse fallback &local */
-                    Node *addr_exprs[2] = { NULL, NULL };
+                    Node *addr_exprs[4] = { NULL, NULL, NULL, NULL };
                     int addr_count = 0;
-                    if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
-                        addr_exprs[addr_count++] = init;
+                    /* BUG-338: walk into intrinsics to find &local */
+                    Node *init_unwrap = init;
+                    while (init_unwrap && init_unwrap->kind == NODE_INTRINSIC &&
+                           init_unwrap->intrinsic.arg_count > 0)
+                        init_unwrap = init_unwrap->intrinsic.args[init_unwrap->intrinsic.arg_count - 1];
+                    if (init_unwrap && init_unwrap->kind == NODE_UNARY && init_unwrap->unary.op == TOK_AMP) {
+                        addr_exprs[addr_count++] = init_unwrap;
                     }
-                    if (init->kind == NODE_ORELSE &&
-                        init->orelse.fallback &&
-                        init->orelse.fallback->kind == NODE_UNARY &&
-                        init->orelse.fallback->unary.op == TOK_AMP) {
-                        addr_exprs[addr_count++] = init->orelse.fallback;
+                    if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
+                        if (addr_count == 0 || addr_exprs[0] != init)
+                            addr_exprs[addr_count++] = init;
+                    }
+                    if (init->kind == NODE_ORELSE && init->orelse.fallback) {
+                        Node *fb = init->orelse.fallback;
+                        while (fb && fb->kind == NODE_INTRINSIC && fb->intrinsic.arg_count > 0)
+                            fb = fb->intrinsic.args[fb->intrinsic.arg_count - 1];
+                        if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP)
+                            addr_exprs[addr_count++] = fb;
                     }
                     for (int ai = 0; ai < addr_count; ai++) {
                         Node *root = addr_exprs[ai]->unary.operand;

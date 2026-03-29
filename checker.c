@@ -869,7 +869,22 @@ static Type *check_expr(Checker *c, Node *node) {
          * msg = other_msg changes tag+data, invalidating capture pointer. */
         if (c->union_switch_var && node->assign.op == TOK_EQ) {
             Node *troot = node->assign.target;
+            bool locked_via_alias = false;
             while (troot) {
+                /* BUG-337: check if chain goes through a pointer to the locked union type.
+                 * s.ptr.b where ptr is *U — ptr could alias the locked union.
+                 * Only triggers when the field's object type is a pointer to the locked union. */
+                if (c->union_switch_type && troot->kind == NODE_FIELD) {
+                    Type *obj_type = checker_get_type(c, troot->field.object);
+                    if (!obj_type) obj_type = check_expr(c, troot->field.object);
+                    Type *unwrapped = type_unwrap_distinct(obj_type);
+                    /* check if the object is a pointer to the locked union */
+                    if (unwrapped && unwrapped->kind == TYPE_POINTER) {
+                        Type *inner = type_unwrap_distinct(unwrapped->pointer.inner);
+                        if (inner == c->union_switch_type)
+                            locked_via_alias = true;
+                    }
+                }
                 if (troot->kind == NODE_UNARY && troot->unary.op == TOK_STAR)
                     troot = troot->unary.operand;
                 else if (troot->kind == NODE_FIELD)
@@ -879,9 +894,10 @@ static Type *check_expr(Checker *c, Node *node) {
                 else break;
             }
             if (troot && troot->kind == NODE_IDENT &&
-                troot->ident.name_len == c->union_switch_var_len &&
-                memcmp(troot->ident.name, c->union_switch_var,
-                       c->union_switch_var_len) == 0) {
+                (locked_via_alias ||
+                 (troot->ident.name_len == c->union_switch_var_len &&
+                  memcmp(troot->ident.name, c->union_switch_var,
+                         c->union_switch_var_len) == 0))) {
                 checker_error(c, node->loc.line,
                     "cannot assign to union '%.*s' inside its switch arm — "
                     "active capture would become invalid",
@@ -1844,6 +1860,27 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "satisfy 'keep' parameter — points to stack memory",
                                     i + 1,
                                     (int)arg_sym->name_len, arg_sym->name);
+                            }
+                            /* BUG-336: reject arena-derived pointers for keep params */
+                            if (arg_sym && arg_sym->is_arena_derived) {
+                                checker_error(c, node->loc.line,
+                                    "argument %d: arena-derived pointer '%.*s' cannot "
+                                    "satisfy 'keep' parameter — arena memory may be reset",
+                                    i + 1,
+                                    (int)arg_sym->name_len, arg_sym->name);
+                            }
+                            /* BUG-334: reject local arrays coerced to keep slices */
+                            if (arg_sym && !arg_sym->is_static &&
+                                arg_sym->type && arg_sym->type->kind == TYPE_ARRAY) {
+                                bool sym_is_global = scope_lookup_local(c->global_scope,
+                                    arg_sym->name, arg_sym->name_len) != NULL;
+                                if (!sym_is_global) {
+                                    checker_error(c, node->loc.line,
+                                        "argument %d: local array '%.*s' cannot "
+                                        "satisfy 'keep' parameter — stack memory is freed when function returns",
+                                        i + 1,
+                                        (int)arg_sym->name_len, arg_sym->name);
+                                }
                             }
                         }
                     }

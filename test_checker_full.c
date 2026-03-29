@@ -1798,6 +1798,19 @@ static void test_red_team_314_318(void) {
     ok("u8[1 << 10] buf;\nvoid f() { buf[0] = 1; }",
        "BUG-318: const expr large shift");
 
+    /* BUG-334: keep bypass via local array coercion */
+    err("static ?[]u8 g = null;\n"
+        "void reg(keep []u8 d) { g = d; }\n"
+        "void f() { u8[16] buf; reg(buf); }",
+        "BUG-334: local array to keep slice rejected");
+
+    /* BUG-336: arena-derived to keep param */
+    err("struct D { u32 v; }\n"
+        "void reg(keep *D ctx) {}\n"
+        "void f() { u8[512] mem; Arena a = Arena.over(mem);\n"
+        "    *D p = a.alloc(D) orelse return; reg(p); }",
+        "BUG-336: arena-derived to keep rejected");
+
     /* BUG-325: @bitcast struct width validation */
     err("struct Small { u32 x; }\n"
         "struct Big { u64 x; u64 y; }\n"

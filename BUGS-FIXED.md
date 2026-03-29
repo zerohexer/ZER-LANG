@@ -1734,3 +1734,27 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Single underscore `_` separator between module name and symbol name.
 - **Fix:** Changed to double underscore `__` separator. `mod_a__b_c` vs `mod_a_b__c` are always distinct. Updated all 8 sites (3 checker registrations, 1 checker lookup, 4 emitter emissions).
 - **Test:** All 10 module import tests pass with new separator.
+
+### BUG-334: keep bypass via local array-to-slice coercion
+- **Symptom:** `reg(local_buf)` where `reg` takes `keep []u8` — accepted, stack array escapes.
+- **Root cause:** keep validation only checked `&local` and `is_local_derived`, not local arrays coerced to slices.
+- **Fix:** Check if arg is local `TYPE_ARRAY` (not static/global) when param is `keep`.
+- **Test:** `test_checker_full.c` — local array to keep slice rejected.
+
+### BUG-335: zercheck missing handle capture tracking
+- **Symptom:** `if (pool.alloc()) |h| { pool.free(h); pool.get(h); }` — no use-after-free error.
+- **Root cause:** if-unwrap captures not registered in zercheck's PathState.
+- **Fix:** Detect `pool.alloc()` condition in NODE_IF with capture, register capture as HS_ALIVE.
+- **Test:** Zercheck captures now tracked for use-after-free detection.
+
+### BUG-336: arena-derived pointer to keep parameter
+- **Symptom:** `reg(arena_ptr)` where `reg` takes `keep *T` — accepted, arena memory can be reset.
+- **Root cause:** keep validation didn't check `is_arena_derived` flag.
+- **Fix:** Reject `is_arena_derived` arguments for keep parameters.
+- **Test:** `test_checker_full.c` — arena-derived to keep rejected.
+
+### BUG-337: union variant lock bypass via pointer alias in struct field
+- **Symptom:** `s.ptr.b = 10` where `s.ptr` aliases locked union — not caught.
+- **Root cause:** Variant lock only checked root ident name, not intermediate pointer types.
+- **Fix:** During mutation walk, check if any field's object type is a pointer to the locked union type.
+- **Test:** Existing union mutation tests pass, alias through struct pointer blocked.

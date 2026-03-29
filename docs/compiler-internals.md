@@ -542,3 +542,17 @@ Module-qualified symbols use `module__name` (double underscore `__`) as the sepa
 - **Emitter:** `EMIT_MANGLED_NAME` macro (function declarations)
 - **Emitter:** NODE_IDENT primary mangled lookup + fallback raw lookup (both emit `%.*s__%.*s`)
 - **Emitter:** Global var declaration mangling
+
+### keep Validation Completeness (BUG-334/336)
+The `keep` parameter escape check in NODE_CALL must block ALL sources of short-lived memory:
+1. `&local` — direct address of local (original check)
+2. `is_local_derived` — aliased local pointers (BUG-221)
+3. `is_arena_derived` — arena-allocated pointers (BUG-336)
+4. Local `TYPE_ARRAY` → slice coercion (BUG-334) — stack array creates slice pointing to stack
+Each check is a separate `if` block in the keep validation loop. All use `arg_node->kind == NODE_IDENT` to find the argument symbol.
+
+### zercheck Capture Tracking (BUG-335)
+If-unwrap captures (`if (pool.alloc()) |h| { ... }`) must register `h` as HS_ALIVE in the then-branch PathState. Without this, use-after-free (`pool.free(h); pool.get(h)`) inside capture blocks is invisible to zercheck. Detection: NODE_IF with `capture_name` + condition is NODE_CALL with callee NODE_FIELD where field name is "alloc".
+
+### Union Variant Lock via Pointer Alias (BUG-337)
+The variant lock must detect mutations through struct field chains: `s.ptr.b = 10` where `s.ptr` is `*U` (pointer to locked union). During the assignment target walk, check if any NODE_FIELD's object has type `TYPE_POINTER` whose inner type matches `union_switch_type`. Only triggers for pointer-typed fields (could alias external memory), not direct local variables of same union type (those are distinct values).

@@ -315,6 +315,26 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             zc_check_expr(zc, ps, node->if_stmt.cond);
         /* fork paths at if/else */
         PathState then_state = pathstate_copy(ps);
+        /* BUG-335: if-unwrap capture — register captured handle as HS_ALIVE.
+         * Pattern: if (pool.alloc()) |h| { ... } */
+        if (node->if_stmt.capture_name && node->if_stmt.cond) {
+            Node *cond = node->if_stmt.cond;
+            if (cond->kind == NODE_CALL && cond->call.callee &&
+                cond->call.callee->kind == NODE_FIELD) {
+                const char *mname = cond->call.callee->field.field_name;
+                uint32_t mlen = (uint32_t)cond->call.callee->field.field_name_len;
+                if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    HandleInfo *h = add_handle(&then_state,
+                        node->if_stmt.capture_name,
+                        (uint32_t)node->if_stmt.capture_name_len);
+                    if (h) {
+                        h->state = HS_ALIVE;
+                        h->pool_id = -1;
+                        h->alloc_line = node->loc.line;
+                    }
+                }
+            }
+        }
         zc_check_stmt(zc, &then_state, node->if_stmt.then_body);
 
         if (node->if_stmt.else_body) {

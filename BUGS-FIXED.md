@@ -1758,3 +1758,27 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Variant lock only checked root ident name, not intermediate pointer types.
 - **Fix:** During mutation walk, check if any field's object type is a pointer to the locked union type.
 - **Test:** Existing union mutation tests pass, alias through struct pointer blocked.
+
+### BUG-338: is_local_derived escape via intrinsics (@ptrcast/@bitcast)
+- **Symptom:** `*opaque p = @ptrcast(*opaque, &x); reg(p);` — local escapes via cast wrapping.
+- **Root cause:** Flag propagation walk didn't enter NODE_INTRINSIC or NODE_UNARY(&) to find root.
+- **Fix:** Walk into intrinsic args (last arg) and & unary in both var-decl init and &local detection paths.
+- **Test:** All existing tests pass. Pattern now blocks cast-wrapped local escapes.
+
+### BUG-339: keep bypass via orelse fallback in function calls
+- **Symptom:** `reg(opt orelse &x)` — orelse fallback provides local to keep param.
+- **Root cause:** keep validation only checked direct &local, not orelse branches.
+- **Fix:** Unwrap orelse — check both expr and fallback. Also walk into intrinsics in both paths.
+- **Test:** All existing tests pass.
+
+### BUG-340: Union variant assignment double evaluation
+- **Symptom:** `get_msg().sensor = val` — get_msg() called twice (tag update + value assignment).
+- **Root cause:** Emitter evaluated union target object twice in comma expression.
+- **Fix:** Hoist object into `__typeof__` pointer temp: `_zer_up = &(obj); _zer_up->_tag = N; _zer_up->variant = val`.
+- **Test:** All existing E2E tests pass.
+
+### BUG-341: Volatile stripping via @bitcast
+- **Symptom:** `*u32 p = @bitcast(*u32, volatile_ptr)` — strips volatile silently.
+- **Root cause:** BUG-258 fixed @ptrcast but same check was missing for @bitcast.
+- **Fix:** Same volatile check as @ptrcast: source pointer.is_volatile or symbol is_volatile → reject if target not volatile.
+- **Test:** All existing tests pass.

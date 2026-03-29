@@ -1295,3 +1295,15 @@ Variables starting with `_zer_` rejected in `add_symbol`. Prevents accidental co
 - **Global Compiler State:** `non_storable_nodes` is a static global. `type_map` was moved into Checker struct (RF1). Remaining global makes compiler non-thread-safe for LSP concurrent requests.
 - **Static vars in imported modules:** Fixed in BUG-222/229/233. All imported symbols (static and non-static) register under mangled keys. Cross-module same-named symbols work correctly. No qualified call syntax yet (unqualified calls resolve to last import).
 
+
+### Intrinsic Flag Propagation (BUG-338)
+`is_local_derived` and `is_arena_derived` flags must propagate THROUGH intrinsics. `*opaque p = @ptrcast(*opaque, &x)` — the init root walk must enter NODE_INTRINSIC (take last arg) and NODE_UNARY(&) (take operand) to reach the actual `x` symbol. Two sites in checker.c NODE_VAR_DECL: (1) alias propagation loop at ~line 2880, (2) &local detection at ~line 2906. Both now walk into intrinsics and & unary.
+
+### keep Orelse Fallback Check (BUG-339)
+Call-site keep validation must unwrap NODE_ORELSE before checking for &local. `reg(opt orelse &x)` — the orelse fallback provides a local address. Fix: split arg into `keep_checks[2]` (expr + fallback for orelse, or just arg itself). Each check also walks into intrinsics before looking for NODE_UNARY(&).
+
+### Union Variant Assignment Single-Eval (BUG-340)
+`msg.sensor = val` emits tag update + value assignment. If `msg` is a function call, the old comma expression `(get_msg()._tag = 0, get_msg().sensor = val)` evaluated it twice. Fix: hoist into pointer temp: `({ __typeof__(obj) *_zer_up = &(obj); _zer_up->_tag = N; _zer_up->variant = val; })`. Single evaluation via `&(obj)`.
+
+### @bitcast Volatile Check (BUG-341)
+Same pattern as @ptrcast volatile check (BUG-258). In the @bitcast handler, after width validation, check if source is a volatile pointer and target is not. Checks both type-level `pointer.is_volatile` and symbol-level `is_volatile`. Prevents GCC from optimizing away hardware register writes through the bitcasted pointer.

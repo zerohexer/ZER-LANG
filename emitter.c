@@ -881,6 +881,11 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_CALL: {
+        /* comptime call — emit constant value directly */
+        if (node->call.is_comptime_resolved) {
+            emit(e, "%lld", (long long)node->call.comptime_value);
+            break;
+        }
         /* intercept builtin method calls: pool.alloc(), pool.get(h), etc. */
         bool handled = false;
         if (node->call.callee->kind == NODE_FIELD) {
@@ -2938,6 +2943,8 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         break;
 
     case NODE_FUNC_DECL:
+        /* comptime functions are compile-time only — no C emission */
+        if (decl->func_decl.is_comptime) break;
         if (!decl->func_decl.body) {
             bool has_def = false;
             for (int j = decl_index + 1; j < file_node->file.decl_count; j++) {

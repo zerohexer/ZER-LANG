@@ -190,6 +190,7 @@ struct Symbol {
 
     /* for functions */
     bool is_function;
+    bool is_comptime;       /* comptime function — evaluated at compile time */
     Node *func_node;        /* AST node for function body, if applicable */
 
     /* module prefix for name mangling (NULL = main module) */

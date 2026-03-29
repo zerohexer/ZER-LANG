@@ -615,6 +615,100 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
     return a;
 }
 
+/* ---- comptime function evaluation ----
+ * Evaluates a comptime function body with substituted argument values.
+ * Supports: return expressions, if/else branching, nested blocks.
+ * Uses eval_const_expr with a param→value substitution table. */
+
+typedef struct { const char *name; uint32_t name_len; int64_t value; } ComptimeParam;
+
+static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
+    if (!n) return CONST_EVAL_FAIL;
+    /* substitute parameter references */
+    if (n->kind == NODE_IDENT) {
+        for (int i = 0; i < param_count; i++) {
+            if (n->ident.name_len == params[i].name_len &&
+                memcmp(n->ident.name, params[i].name, params[i].name_len) == 0)
+                return params[i].value;
+        }
+        return CONST_EVAL_FAIL;
+    }
+    if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
+    if (n->kind == NODE_BOOL_LIT) return n->bool_lit.value ? 1 : 0;
+    if (n->kind == NODE_UNARY) {
+        int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
+        if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        if (n->unary.op == TOK_MINUS) return -v;
+        if (n->unary.op == TOK_TILDE) return ~v;
+        if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
+        return CONST_EVAL_FAIL;
+    }
+    if (n->kind == NODE_BINARY) {
+        int64_t l = eval_const_expr_subst(n->binary.left, params, param_count);
+        int64_t r = eval_const_expr_subst(n->binary.right, params, param_count);
+        if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        switch (n->binary.op) {
+        case TOK_PLUS:   return l + r;
+        case TOK_MINUS:  return l - r;
+        case TOK_STAR:   return l * r;
+        case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : l / r;
+        case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : l % r;
+        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : (int64_t)((uint64_t)l << r);
+        case TOK_RSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : l >> r;
+        case TOK_AMP:    return l & r;
+        case TOK_PIPE:   return l | r;
+        case TOK_CARET:  return l ^ r;
+        case TOK_GT:     return l > r ? 1 : 0;
+        case TOK_LT:     return l < r ? 1 : 0;
+        case TOK_GTEQ:   return l >= r ? 1 : 0;
+        case TOK_LTEQ:   return l <= r ? 1 : 0;
+        case TOK_EQEQ:   return l == r ? 1 : 0;
+        case TOK_BANGEQ: return l != r ? 1 : 0;
+        case TOK_AMPAMP: return (l && r) ? 1 : 0;
+        case TOK_PIPEPIPE: return (l || r) ? 1 : 0;
+        default: return CONST_EVAL_FAIL;
+        }
+    }
+    return CONST_EVAL_FAIL;
+}
+
+static int64_t eval_comptime_stmt(Node *n, ComptimeParam *params, int param_count);
+
+static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param_count) {
+    if (!block) return CONST_EVAL_FAIL;
+    if (block->kind == NODE_BLOCK) {
+        for (int i = 0; i < block->block.stmt_count; i++) {
+            int64_t r = eval_comptime_stmt(block->block.stmts[i], params, param_count);
+            if (r != CONST_EVAL_FAIL) return r; /* hit a return */
+        }
+        return CONST_EVAL_FAIL;
+    }
+    return eval_comptime_stmt(block, params, param_count);
+}
+
+static int64_t eval_comptime_stmt(Node *n, ComptimeParam *params, int param_count) {
+    if (!n) return CONST_EVAL_FAIL;
+    if (n->kind == NODE_RETURN) {
+        if (n->ret.expr)
+            return eval_const_expr_subst(n->ret.expr, params, param_count);
+        return CONST_EVAL_FAIL;
+    }
+    if (n->kind == NODE_IF) {
+        int64_t cond = eval_const_expr_subst(n->if_stmt.cond, params, param_count);
+        if (cond == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        if (cond) {
+            return eval_comptime_block(n->if_stmt.then_body, params, param_count);
+        } else if (n->if_stmt.else_body) {
+            return eval_comptime_block(n->if_stmt.else_body, params, param_count);
+        }
+        return CONST_EVAL_FAIL;
+    }
+    if (n->kind == NODE_BLOCK) {
+        return eval_comptime_block(n, params, param_count);
+    }
+    return CONST_EVAL_FAIL;
+}
+
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
@@ -1946,6 +2040,42 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = effective_callee->func_ptr.ret;
+
+            /* comptime function call — evaluate at compile time */
+            if (node->call.callee->kind == NODE_IDENT) {
+                Symbol *callee_sym = scope_lookup(c->current_scope,
+                    node->call.callee->ident.name,
+                    (uint32_t)node->call.callee->ident.name_len);
+                if (callee_sym && callee_sym->is_comptime && callee_sym->func_node) {
+                    Node *fn = callee_sym->func_node;
+                    /* all args must be compile-time constant */
+                    int pc = fn->func_decl.param_count;
+                    ComptimeParam cparams[32];
+                    bool all_const = true;
+                    for (int ci = 0; ci < node->call.arg_count && ci < pc && ci < 32; ci++) {
+                        int64_t v = eval_const_expr(node->call.args[ci]);
+                        if (v == CONST_EVAL_FAIL) { all_const = false; break; }
+                        cparams[ci].name = fn->func_decl.params[ci].name;
+                        cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
+                        cparams[ci].value = v;
+                    }
+                    if (!all_const) {
+                        checker_error(c, node->loc.line,
+                            "comptime function '%.*s' requires all arguments to be compile-time constants",
+                            (int)callee_sym->name_len, callee_sym->name);
+                    } else if (fn->func_decl.body) {
+                        int64_t val = eval_comptime_block(fn->func_decl.body, cparams, pc);
+                        if (val == CONST_EVAL_FAIL) {
+                            checker_error(c, node->loc.line,
+                                "comptime function '%.*s' body could not be evaluated at compile time",
+                                (int)callee_sym->name_len, callee_sym->name);
+                        } else {
+                            node->call.comptime_value = val;
+                            node->call.is_comptime_resolved = true;
+                        }
+                    }
+                }
+            }
         } else {
             checker_error(c, node->loc.line,
                 "cannot call non-function type '%s'",
@@ -4256,6 +4386,7 @@ static void register_decl(Checker *c, Node *node) {
         if (sym) {
             sym->is_function = true;
             sym->is_static = node->func_decl.is_static;
+            sym->is_comptime = node->func_decl.is_comptime;
             sym->func_node = node;
             /* BUG-218: store module prefix for function name mangling */
             sym->module_prefix = c->current_module;

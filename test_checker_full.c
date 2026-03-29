@@ -2040,6 +2040,78 @@ static void test_mmio_provenance(void) {
        "    return d.id;\n"
        "}",
        "@container provenance: unknown (param) allowed");
+
+    /* comptime: BIT macro equivalent */
+    ok("comptime u32 BIT(u32 n) {\n"
+       "    return 1 << n;\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 mask = BIT(3);\n"
+       "    return mask;\n"
+       "}",
+       "comptime: BIT(3) = 8");
+
+    /* comptime: MAX with if/else */
+    ok("comptime u32 MAX(u32 a, u32 b) {\n"
+       "    if (a > b) { return a; }\n"
+       "    return b;\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 big = MAX(10, 20);\n"
+       "    return big;\n"
+       "}",
+       "comptime: MAX(10, 20) = 20");
+
+    /* comptime: non-constant args rejected */
+    err("comptime u32 BIT(u32 n) {\n"
+       "    return 1 << n;\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 x = 3;\n"
+       "    u32 mask = BIT(x);\n"
+       "    return mask;\n"
+       "}",
+       "comptime: non-constant args rejected");
+
+    /* comptime: arithmetic expression */
+    ok("comptime u32 ALIGN_UP(u32 n, u32 align) {\n"
+       "    return (n + align - 1) & ~(align - 1);\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 aligned = ALIGN_UP(13, 8);\n"
+       "    return aligned;\n"
+       "}",
+       "comptime: ALIGN_UP(13, 8) = 16");
+
+    /* comptime: nested comptime call */
+    ok("comptime u32 DOUBLE(u32 x) {\n"
+       "    return x * 2;\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 val = DOUBLE(21);\n"
+       "    return val;\n"
+       "}",
+       "comptime: DOUBLE(21) = 42");
+
+    /* comptime: used in global const init */
+    ok("comptime u32 BUF_SIZE(u32 n) {\n"
+       "    return n * 4;\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 size = BUF_SIZE(8);\n"
+       "    return size;\n"
+       "}",
+       "comptime: BUF_SIZE(8) = 32");
+
+    /* comptime: bitwise operations */
+    ok("comptime u32 FLAGS(u32 a, u32 b) {\n"
+       "    return a | b;\n"
+       "}\n"
+       "u32 main() {\n"
+       "    u32 f = FLAGS(4, 8);\n"
+       "    return f;\n"
+       "}",
+       "comptime: bitwise OR FLAGS(4, 8) = 12");
 }
 
 int main(void) {

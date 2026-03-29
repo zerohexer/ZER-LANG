@@ -1270,6 +1270,37 @@ int main(void) {
         42,
         "@ptrtoint→@inttoptr roundtrip = 42");
 
+    /* ---- comptime function E2E ---- */
+    printf("\n--- comptime functions ---\n");
+
+    printf("[comptime: BIT + MAX]\n");
+    test_compile_and_run(
+        "comptime u32 BIT(u32 n) {\n"
+        "    return 1 << n;\n"
+        "}\n"
+        "comptime u32 MAX(u32 a, u32 b) {\n"
+        "    if (a > b) { return a; }\n"
+        "    return b;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    u32 mask = BIT(3);\n"
+        "    u32 big = MAX(10, 5);\n"
+        "    return mask + big;\n"
+        "}\n",
+        18,
+        "comptime BIT(3)=8, MAX(10,5)=10, total=18");
+
+    printf("[comptime: ALIGN_UP]\n");
+    test_compile_and_run(
+        "comptime u32 ALIGN_UP(u32 n, u32 align) {\n"
+        "    return (n + align - 1) & ~(align - 1);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return ALIGN_UP(13, 8);\n"
+        "}\n",
+        16,
+        "comptime ALIGN_UP(13,8)=16");
+
     /* ---- BUG-025 regression: function pointer declarations ---- */
     printf("\n--- BUG-025 regression: function pointers ---\n");
 

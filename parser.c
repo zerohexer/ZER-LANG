@@ -1796,6 +1796,17 @@ static Node *parse_declaration(Parser *p) {
         return n;
     }
 
+    /* comptime — compile-time evaluated function */
+    if (match(p, TOK_COMPTIME)) {
+        Node *n = parse_func_or_var(p, false);
+        if (n->kind != NODE_FUNC_DECL) {
+            error_at(p, &p->previous, "comptime can only be applied to functions");
+        } else {
+            n->func_decl.is_comptime = true;
+        }
+        return n;
+    }
+
     /* static — modifier for function or variable */
     if (match(p, TOK_STATIC)) {
         return parse_func_or_var(p, true);

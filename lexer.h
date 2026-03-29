@@ -36,7 +36,7 @@ typedef enum {
 
     /* === Special keywords === */
     TOK_DEFER, TOK_IMPORT, TOK_CINCLUDE, TOK_VOLATILE, TOK_INTERRUPT,
-    TOK_ASM, TOK_STATIC, TOK_KEEP, TOK_AS, TOK_MMIO,
+    TOK_ASM, TOK_STATIC, TOK_KEEP, TOK_AS, TOK_MMIO, TOK_COMPTIME,
 
     /* === Literals === */
     TOK_IDENT,          /* user identifier */

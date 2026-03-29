@@ -255,6 +255,7 @@ struct Node {
             int param_count;
             Node *body;             /* block, or NULL for forward decl */
             bool is_static;         /* static = module-private */
+            bool is_comptime;       /* comptime = compile-time evaluated */
         } func_decl;
 
         /* NODE_STRUCT_DECL: struct Task { ... } or packed struct { ... } */
@@ -430,6 +431,8 @@ struct Node {
             Node *callee;       /* expression — ident, field access, etc. */
             Node **args;
             int arg_count;
+            int64_t comptime_value;  /* result of comptime evaluation (if is_comptime_resolved) */
+            bool is_comptime_resolved; /* true if this call was resolved at compile time */
         } call;
 
         /* NODE_FIELD: expr.field */
@@ -487,9 +490,13 @@ void ast_print(Node *node, int indent);
 static inline int64_t eval_const_expr(Node *n) {
     if (!n) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
-    if (n->kind == NODE_UNARY && n->unary.op == TOK_MINUS) {
+    if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr(n->unary.operand);
-        return v != CONST_EVAL_FAIL ? -v : CONST_EVAL_FAIL;
+        if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        if (n->unary.op == TOK_MINUS) return -v;
+        if (n->unary.op == TOK_TILDE) return ~v;
+        if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
+        return CONST_EVAL_FAIL;
     }
     if (n->kind == NODE_BINARY) {
         int64_t l = eval_const_expr(n->binary.left);
@@ -533,6 +540,16 @@ static inline int64_t eval_const_expr(Node *n) {
             return l >> r;
         case TOK_AMP:     return l & r;
         case TOK_PIPE:    return l | r;
+        case TOK_CARET:   return l ^ r;
+        /* comparison operators — return 1 (true) or 0 (false) */
+        case TOK_GT:      return l > r ? 1 : 0;
+        case TOK_LT:      return l < r ? 1 : 0;
+        case TOK_GTEQ:    return l >= r ? 1 : 0;
+        case TOK_LTEQ:    return l <= r ? 1 : 0;
+        case TOK_EQEQ:    return l == r ? 1 : 0;
+        case TOK_BANGEQ:  return l != r ? 1 : 0;
+        case TOK_AMPAMP:  return (l && r) ? 1 : 0;
+        case TOK_PIPEPIPE: return (l || r) ? 1 : 0;
         default: return CONST_EVAL_FAIL;
         }
     }

@@ -2649,11 +2649,12 @@ static Type *check_expr(Checker *c, Node *node) {
                                 type_name(val_type));
                         }
                     }
-                    /* mmio range validation: @inttoptr REQUIRES mmio declarations */
-                    if (c->mmio_range_count == 0) {
+                    /* mmio range validation: @inttoptr REQUIRES mmio declarations
+                     * unless --no-strict-mmio flag is set */
+                    if (c->mmio_range_count == 0 && !c->no_strict_mmio) {
                         checker_error(c, node->loc.line,
                             "@inttoptr requires mmio range declarations — "
-                            "add 'mmio 0xSTART..0xEND;' for your target's address space");
+                            "add 'mmio 0xSTART..0xEND;' or use --no-strict-mmio");
                     }
                     if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0 &&
                         node->intrinsic.args[0]->kind == NODE_INT_LIT) {

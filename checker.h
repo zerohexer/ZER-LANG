@@ -66,6 +66,7 @@ typedef struct {
     uint64_t (*mmio_ranges)[2]; /* array of [start, end] pairs */
     int mmio_range_count;
     int mmio_range_capacity;
+    bool no_strict_mmio;  /* --no-strict-mmio: allow @inttoptr without mmio declarations */
 } Checker;
 
 /* ---- API ---- */

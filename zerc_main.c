@@ -179,6 +179,7 @@ int main(int argc, char **argv) {
     const char *output_path = NULL;
     bool do_run = false;
     bool no_preamble = false;
+    bool no_strict_mmio = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -187,6 +188,8 @@ int main(int argc, char **argv) {
             do_run = true;
         } else if (strcmp(argv[i], "--lib") == 0) {
             no_preamble = true;
+        } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
+            no_strict_mmio = true;
         }
     }
 
@@ -295,6 +298,7 @@ int main(int argc, char **argv) {
     /* type check — register all modules in topological order */
     Checker checker;
     checker_init(&checker, &cc.arena, input_path);
+    checker.no_strict_mmio = no_strict_mmio;
 
     /* register in topo order: dependencies first, main last */
     for (int ti = 0; ti < topo_count; ti++) {

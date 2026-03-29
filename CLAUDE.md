@@ -147,13 +147,14 @@ Handle(Task) h;          index + generation counter, not a pointer
 @trap()                  crash intentionally
 ```
 
-### mmio Declaration
+### mmio Declaration (MANDATORY for @inttoptr)
 ```
 mmio 0x40020000..0x40020FFF;   // declare valid MMIO address range
 mmio 0x40011000..0x4001103F;   // multiple ranges allowed
 // @inttoptr with constant address outside ranges → compile error
 // @inttoptr with variable address → runtime range check + trap
-// No mmio declarations → all @inttoptr allowed (backward compat)
+// No mmio declarations + @inttoptr → compile error (strict by default)
+// For tests: mmio 0x0..0xFFFFFFFFFFFFFFFF; (allow all addresses)
 ```
 
 ### Function Pointers

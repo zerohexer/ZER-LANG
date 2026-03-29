@@ -1333,7 +1333,7 @@ Array member alignment = element type alignment, NOT total array size. `u8[10]` 
 New top-level declaration: `mmio 0x40020000..0x40020FFF;`. Stores address ranges in Checker struct (`mmio_ranges` array of `[start, end]` pairs). When mmio ranges are declared:
 - **Constant addresses** in `@inttoptr` validated at compile time — must fall within at least one range. Outside all ranges → compile error.
 - **Variable addresses** in `@inttoptr` get runtime range check in emitter: `if (!(addr >= range1_start && addr <= range1_end) && ...) _zer_trap(...)`. Emitted as GCC statement expression with hoisted temp for single-eval.
-- **No mmio declarations** → all `@inttoptr` allowed (backward compatibility).
+- **No mmio declarations + @inttoptr** → compile error "mmio range declarations required". Strict by default — no existing ZER code to break. For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` allows all addresses.
 - Lexer: `TOK_MMIO`. Parser: `mmio` → consume INT → consume `..` → consume INT → `;`. AST: `NODE_MMIO` with `range_start`/`range_end` (uint64_t). Emitter: emits as comment `/* mmio 0x...–0x... */`.
 
 ### @ptrcast Type Provenance Tracking

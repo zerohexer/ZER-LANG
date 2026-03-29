@@ -28,7 +28,8 @@ static void emit(Emitter *e, const char *fmt, ...) {
 static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
                            const char *name, uint32_t name_len) {
     if (prefix && prefix_len > 0) {
-        fprintf(e->out, "%.*s_%.*s", (int)prefix_len, prefix, (int)name_len, name);
+        /* BUG-332: double underscore separator prevents name collisions */
+        fprintf(e->out, "%.*s__%.*s", (int)prefix_len, prefix, (int)name_len, name);
     } else {
         fprintf(e->out, "%.*s", (int)name_len, name);
     }
@@ -42,7 +43,7 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
 /* BUG-218: emit function/global var name with module prefix */
 #define EMIT_MANGLED_NAME(e, name, name_len) do { \
     if ((e)->current_module) { \
-        fprintf((e)->out, "%.*s_%.*s", (int)(e)->current_module_len, (e)->current_module, (int)(name_len), (name)); \
+        fprintf((e)->out, "%.*s__%.*s", (int)(e)->current_module_len, (e)->current_module, (int)(name_len), (name)); \
     } else { \
         fprintf((e)->out, "%.*s", (int)(name_len), (name)); \
     } \
@@ -479,19 +480,19 @@ static void emit_expr(Emitter *e, Node *node) {
          * key resolves to wrong module's symbol. */
         bool emitted = false;
         if (e->current_module) {
-            /* BUG-233: try current module's mangled key FIRST */
-            /* RF4: sized to actual need, not fixed 256 */
-            uint32_t mkl = e->current_module_len + 1 + (uint32_t)node->ident.name_len;
-            char mk_buf[512]; /* stack buffer for common case */
+            /* BUG-233/332: try current module's mangled key FIRST (double underscore) */
+            uint32_t mkl = e->current_module_len + 2 + (uint32_t)node->ident.name_len;
+            char mk_buf[512];
             char *mk = mk_buf;
             if (mkl >= sizeof(mk_buf)) mk = (char *)arena_alloc(e->arena, mkl + 1);
             memcpy(mk, e->current_module, e->current_module_len);
             mk[e->current_module_len] = '_';
-            memcpy(mk + e->current_module_len + 1, node->ident.name, node->ident.name_len);
+            mk[e->current_module_len + 1] = '_';
+            memcpy(mk + e->current_module_len + 2, node->ident.name, node->ident.name_len);
             mk[mkl] = '\0';
             Symbol *ms = scope_lookup(e->checker->global_scope, mk, mkl);
             if (ms && ms->module_prefix) {
-                emit(e, "%.*s_%.*s",
+                emit(e, "%.*s__%.*s",
                      (int)ms->module_prefix_len, ms->module_prefix,
                      (int)node->ident.name_len, node->ident.name);
                 emitted = true;
@@ -502,7 +503,7 @@ static void emit_expr(Emitter *e, Node *node) {
             Symbol *id_sym = scope_lookup(e->checker->global_scope,
                 node->ident.name, (uint32_t)node->ident.name_len);
             if (id_sym && id_sym->module_prefix) {
-                emit(e, "%.*s_%.*s",
+                emit(e, "%.*s__%.*s",
                      (int)id_sym->module_prefix_len, id_sym->module_prefix,
                      (int)node->ident.name_len, node->ident.name);
             } else {
@@ -2846,12 +2847,14 @@ static void emit_global_var(Emitter *e, Node *node) {
 
     /* BUG-218/222: mangle global var names for imported modules (including static) */
     if (e->current_module) {
-        /* RF4: arena-allocated — no fixed buffer limit */
-        uint32_t mlen = e->current_module_len + 1 + (uint32_t)node->var_decl.name_len;
+        /* RF4: arena-allocated — no fixed buffer limit
+         * BUG-332: double underscore __ separator */
+        uint32_t mlen = e->current_module_len + 2 + (uint32_t)node->var_decl.name_len;
         char *mangled = (char *)arena_alloc(e->arena, mlen + 1);
         memcpy(mangled, e->current_module, e->current_module_len);
         mangled[e->current_module_len] = '_';
-        memcpy(mangled + e->current_module_len + 1, node->var_decl.name, node->var_decl.name_len);
+        mangled[e->current_module_len + 1] = '_';
+        memcpy(mangled + e->current_module_len + 2, node->var_decl.name, node->var_decl.name_len);
         mangled[mlen] = '\0';
         emit_type_and_name(e, type, mangled, (int)mlen);
     } else {

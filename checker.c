@@ -1813,13 +1813,14 @@ static Type *check_expr(Checker *c, Node *node) {
                                 bool is_global = scope_lookup_local(c->global_scope,
                                     arg_sym->name, arg_sym->name_len) != NULL;
                                 if (!is_global && c->current_module) {
-                                    /* try mangled: module_name */
-                                    uint32_t mkl = c->current_module_len + 1 + arg_sym->name_len;
+                                    /* try mangled: module__name (BUG-332: double underscore) */
+                                    uint32_t mkl = c->current_module_len + 2 + arg_sym->name_len;
                                     char mk[256];
                                     if (mkl < sizeof(mk)) {
                                         memcpy(mk, c->current_module, c->current_module_len);
                                         mk[c->current_module_len] = '_';
-                                        memcpy(mk + c->current_module_len + 1, arg_sym->name, arg_sym->name_len);
+                                        mk[c->current_module_len + 1] = '_';
+                                        memcpy(mk + c->current_module_len + 2, arg_sym->name, arg_sym->name_len);
                                         is_global = scope_lookup_local(c->global_scope, mk, mkl) != NULL;
                                     }
                                 }
@@ -4186,12 +4187,14 @@ void checker_register_file(Checker *c, Node *file_node) {
                     decl->func_decl.name : decl->var_decl.name;
                 uint32_t dname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name_len : decl->var_decl.name_len);
-                /* RF4: use arena-allocated buffer for arbitrary length mangled names */
-                uint32_t mkl = c->current_module_len + 1 + dname_len;
+                /* RF4: use arena-allocated buffer for arbitrary length mangled names
+                 * BUG-332: use double underscore __ separator to avoid collisions */
+                uint32_t mkl = c->current_module_len + 2 + dname_len;
                 char *mk_copy = (char *)arena_alloc(c->arena, mkl + 1);
                 memcpy(mk_copy, c->current_module, c->current_module_len);
                 mk_copy[c->current_module_len] = '_';
-                memcpy(mk_copy + c->current_module_len + 1, dname, dname_len);
+                mk_copy[c->current_module_len + 1] = '_';
+                memcpy(mk_copy + c->current_module_len + 2, dname, dname_len);
                 mk_copy[mkl] = '\0';
                 Symbol *ms = scope_add(c->arena, c->global_scope,
                     mk_copy, mkl, dt, decl->loc.line, c->file_name);
@@ -4253,12 +4256,14 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
                     decl->func_decl.name : decl->var_decl.name;
                 uint32_t sname_len = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
                     decl->func_decl.name_len : decl->var_decl.name_len);
-                /* RF4: arena-allocated mangled key — no fixed buffer limit */
-                uint32_t mk_len = c->current_module_len + 1 + sname_len;
+                /* RF4: arena-allocated mangled key — no fixed buffer limit
+                 * BUG-332: double underscore __ separator */
+                uint32_t mk_len = c->current_module_len + 2 + sname_len;
                 char *mk_copy = (char *)arena_alloc(c->arena, mk_len + 1);
                 memcpy(mk_copy, c->current_module, c->current_module_len);
                 mk_copy[c->current_module_len] = '_';
-                memcpy(mk_copy + c->current_module_len + 1, sname, sname_len);
+                mk_copy[c->current_module_len + 1] = '_';
+                memcpy(mk_copy + c->current_module_len + 2, sname, sname_len);
                 mk_copy[mk_len] = '\0';
                 /* register under MANGLED name — no collision possible */
                 Symbol *gs = scope_add(c->arena, c->global_scope,

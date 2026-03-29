@@ -531,3 +531,14 @@ The if-unwrap path (BUG-305) walks the condition expression to its root ident an
 
 ### Array Copy Source Volatile (BUG-320)
 Array assignment and var-decl init paths only checked `expr_is_volatile(target)` for the destination. The source can also be volatile (e.g., reading from MMIO). Fix: `arr_volatile = expr_is_volatile(target) || expr_is_volatile(value)`. Source pointer cast uses `const volatile uint8_t*` to preserve volatile reads. Both NODE_ASSIGN and NODE_VAR_DECL array init paths updated.
+
+### Module Name Mangling — Double Underscore Separator (BUG-332)
+Module-qualified symbols use `module__name` (double underscore `__`) as the separator in both checker mangled keys and emitter C output. Previously used single `_` which caused collisions: `mod_a` + `b_c` and `mod_a_b` + `c` both mangled to `mod_a_b_c`. With `__`: `mod_a__b_c` vs `mod_a_b__c` are always distinct.
+
+8 sites updated:
+- **Checker:** 3 mangled key registrations in `checker_register_file` and `checker_push_module_scope` (arena-allocated, `+2` for separator)
+- **Checker:** 1 mangled key lookup in `keep` validation fallback
+- **Emitter:** `emit_user_name()` helper (used by `EMIT_STRUCT_NAME`/`EMIT_UNION_NAME`/`EMIT_ENUM_NAME`)
+- **Emitter:** `EMIT_MANGLED_NAME` macro (function declarations)
+- **Emitter:** NODE_IDENT primary mangled lookup + fallback raw lookup (both emit `%.*s__%.*s`)
+- **Emitter:** Global var declaration mangling

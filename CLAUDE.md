@@ -416,6 +416,8 @@ Two tools + one library for automated C-to-ZER migration:
 
 **180. Switch capture const safety.** Walk switch expression to root ident, check `is_const`. Mutable capture `|*v|` on const source now rejected. Applies to both union and optional switch paths. (BUG-326)
 
+**181. Module name mangling uses double underscore `__` separator.** `module__name` instead of `module_name`. Prevents collisions when module names contain underscores (`mod_a` + `b_c` vs `mod_a_b` + `c`). All 8 sites updated: checker (3 registrations + 1 lookup), emitter (`emit_user_name`, `EMIT_MANGLED_NAME`, NODE_IDENT primary + fallback, global var). (BUG-332)
+
 ### Structural Refactors Completed (RF1-RF7)
 
 These changed fundamental patterns. Fresh sessions MUST know:

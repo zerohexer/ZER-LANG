@@ -154,7 +154,24 @@ mmio 0x40011000..0x4001103F;   // multiple ranges allowed
 // @inttoptr with constant address outside ranges → compile error
 // @inttoptr with variable address → runtime range check + trap
 // No mmio declarations + @inttoptr → compile error (strict by default)
+// --no-strict-mmio flag: allow @inttoptr without mmio declarations
 // For tests: mmio 0x0..0xFFFFFFFFFFFFFFFF; (allow all addresses)
+```
+
+### Provenance Tracking (@ptrcast + @container)
+```
+// @ptrcast tracks original type through *opaque round-trips:
+*opaque ctx = @ptrcast(*opaque, &sensor);  // provenance = *Sensor
+*Sensor s = @ptrcast(*Sensor, ctx);        // OK — matches provenance
+*Motor m = @ptrcast(*Motor, ctx);          // COMPILE ERROR — wrong type
+
+// @container validates field existence + tracks &struct.field origin:
+*ListHead ptr = &dev.list;                  // provenance = (Device, list)
+*Device d = @container(*Device, ptr, list); // OK — proven
+*Other o = @container(*Other, ptr, list);   // COMPILE ERROR — wrong struct
+
+// Unknown provenance (params, cinclude) → allowed (can't prove wrong)
+// Propagates through aliases and clears+re-derives on assignment
 ```
 
 ### Function Pointers
@@ -419,7 +436,7 @@ When starting a new session or lacking context:
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
 - Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
-- Compiler flags: `--run` (compile+execute), `--lib` (no preamble/runtime, for C interop)
+- Compiler flags: `--run` (compile+execute), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations)
 - GCC flags: emitted C requires `-fwrapv` (ZER defines signed overflow as wrapping). `zerc --run` adds this automatically.
 - Emitted C uses GCC extensions: statement expressions `({...})`, `__auto_type`, `_Alignof`, `__attribute__((packed))`
 - User-defined struct/enum/union names emit as-is (no `_zer_` prefix). Only internal names are prefixed.

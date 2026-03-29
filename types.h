@@ -180,6 +180,14 @@ struct Symbol {
     bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
 
+    /* @ptrcast provenance: tracks original type before cast to *opaque */
+    Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
+
+    /* @container provenance: tracks which struct+field this pointer points inside */
+    Type *container_struct;          /* NULL = unknown */
+    const char *container_field;
+    uint32_t container_field_len;
+
     /* for functions */
     bool is_function;
     Node *func_node;        /* AST node for function body, if applicable */

@@ -1727,16 +1727,39 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "0");
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
-            /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                emit_type(e, t);
-            }
-            emit(e, ")(uintptr_t)(");
-            if (node->intrinsic.arg_count > 0)
+            /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr)
+             * With mmio ranges: variable addresses get runtime range check */
+            bool need_runtime_check = e->checker->mmio_range_count > 0 &&
+                node->intrinsic.arg_count > 0 &&
+                node->intrinsic.args[0]->kind != NODE_INT_LIT;
+            if (need_runtime_check) {
+                int tmp = e->temp_count++;
+                emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
                 emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ")");
+                emit(e, "); if (!(");
+                for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
+                    if (ri > 0) emit(e, " || ");
+                    emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
+                         tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
+                         tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                }
+                emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); (");
+                if (node->intrinsic.type_arg) {
+                    Type *t = resolve_tynode(e,node->intrinsic.type_arg);
+                    emit_type(e, t);
+                }
+                emit(e, ")_zer_ma%d; })", tmp);
+            } else {
+                emit(e, "(");
+                if (node->intrinsic.type_arg) {
+                    Type *t = resolve_tynode(e,node->intrinsic.type_arg);
+                    emit_type(e, t);
+                }
+                emit(e, ")(uintptr_t)(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
+            }
         } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
             /* @ptrtoint(ptr) → (uintptr_t)(ptr) */
             emit(e, "(uintptr_t)(");
@@ -3036,6 +3059,13 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
             emit_stmt(e, decl->interrupt.body);
         }
         emit(e, "\n");
+        break;
+
+    case NODE_MMIO:
+        /* mmio ranges are compile-time only — emit as comment */
+        emit(e, "/* mmio 0x%llx..0x%llx */\n",
+             (unsigned long long)decl->mmio_decl.range_start,
+             (unsigned long long)decl->mmio_decl.range_end);
         break;
 
     case NODE_TYPEDEF: {

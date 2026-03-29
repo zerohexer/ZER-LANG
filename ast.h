@@ -143,6 +143,7 @@ typedef enum {
     NODE_IMPORT,            /* import uart; */
     NODE_CINCLUDE,          /* cinclude "header.h"; */
     NODE_INTERRUPT,         /* interrupt USART1 { ... } */
+    NODE_MMIO,              /* mmio 0x40020000..0x40020FFF; */
     NODE_GLOBAL_VAR,        /* top-level variable declaration */
 
     /* === Statements === */
@@ -309,6 +310,12 @@ struct Node {
             size_t as_name_len;
             Node *body;
         } interrupt;
+
+        /* NODE_MMIO: mmio 0x40020000..0x40020FFF; */
+        struct {
+            uint64_t range_start;
+            uint64_t range_end;
+        } mmio_decl;
 
         /* NODE_GLOBAL_VAR / NODE_VAR_DECL: type name = value; */
         struct {

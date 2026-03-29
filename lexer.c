@@ -213,6 +213,9 @@ static TokenType check_keyword(const char *word, size_t word_len) {
     case 'k':
         if (word_len == 4 && memcmp(word+1, "eep", 3) == 0) return TOK_KEEP;
         break;
+    case 'm':
+        if (word_len == 4 && memcmp(word+1, "mio", 3) == 0) return TOK_MMIO;
+        break;
     case 'n':
         if (word_len == 4 && memcmp(word+1, "ull", 3) == 0) return TOK_NULL;
         break;
@@ -565,6 +568,7 @@ const char *token_type_name(TokenType type) {
     case TOK_STATIC: return "static";
     case TOK_KEEP: return "keep";
     case TOK_AS: return "as";
+    case TOK_MMIO: return "mmio";
     case TOK_IDENT: return "IDENT";
     case TOK_NUMBER_INT: return "INT";
     case TOK_NUMBER_FLOAT: return "FLOAT";

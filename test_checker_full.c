@@ -1888,6 +1888,158 @@ static void test_red_team_343_346(void) {
        "BUG-350: @size struct with array uses element alignment");
 }
 
+static void test_mmio_provenance(void) {
+    /* mmio: valid constant address in range */
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x40020014);\n"
+       "    return 0;\n"
+       "}",
+       "mmio: constant address in range OK");
+
+    /* mmio: constant address outside range */
+    err("mmio 0x40020000..0x40020FFF;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x12345678);\n"
+       "    return 0;\n"
+       "}",
+       "mmio: constant address outside range rejected");
+
+    /* mmio: no ranges declared — backward compat, all addresses allowed */
+    ok("u32 main() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x12345678);\n"
+       "    return 0;\n"
+       "}",
+       "mmio: no ranges = all allowed (backward compat)");
+
+    /* mmio: multiple ranges, second range matches */
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "mmio 0x40011000..0x4001103F;\n"
+       "u32 main() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x40011004);\n"
+       "    return 0;\n"
+       "}",
+       "mmio: second range matches OK");
+
+    /* mmio: start > end rejected */
+    err("mmio 0x40020FFF..0x40020000;\n"
+       "u32 main() { return 0; }",
+       "mmio: start > end rejected");
+
+    /* mmio: variable address — checker allows (runtime check in emitter) */
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "u32 main() {\n"
+       "    u32 addr = 0x40020014;\n"
+       "    volatile *u32 reg = @inttoptr(*u32, addr);\n"
+       "    return 0;\n"
+       "}",
+       "mmio: variable address allowed at compile time");
+
+    /* @ptrcast provenance: round-trip match OK */
+    ok("struct Sensor { u32 id; }\n"
+       "void use(*Sensor s) {}\n"
+       "void test(*Sensor s) {\n"
+       "    *opaque ctx = @ptrcast(*opaque, s);\n"
+       "    *Sensor s2 = @ptrcast(*Sensor, ctx);\n"
+       "    use(s2);\n"
+       "}",
+       "ptrcast provenance: round-trip match OK");
+
+    /* @ptrcast provenance: wrong type rejected */
+    err("struct Sensor { u32 id; }\n"
+       "struct Motor { u32 speed; }\n"
+       "u32 main() {\n"
+       "    Sensor s;\n"
+       "    *opaque ctx = @ptrcast(*opaque, &s);\n"
+       "    *Motor m = @ptrcast(*Motor, ctx);\n"
+       "    return 0;\n"
+       "}",
+       "ptrcast provenance: wrong type rejected");
+
+    /* @ptrcast provenance: unknown provenance allowed */
+    ok("struct Sensor { u32 id; }\n"
+       "u32 test(*opaque ctx) {\n"
+       "    *Sensor s = @ptrcast(*Sensor, ctx);\n"
+       "    return s.id;\n"
+       "}",
+       "ptrcast provenance: unknown (param) allowed");
+
+    /* @ptrcast provenance: alias propagation */
+    err("struct Sensor { u32 id; }\n"
+       "struct Motor { u32 speed; }\n"
+       "u32 main() {\n"
+       "    Sensor s;\n"
+       "    *opaque ctx = @ptrcast(*opaque, &s);\n"
+       "    *opaque alias = ctx;\n"
+       "    *Motor m = @ptrcast(*Motor, alias);\n"
+       "    return 0;\n"
+       "}",
+       "ptrcast provenance: alias propagation catches mismatch");
+
+    /* @container: field validation — field exists */
+    ok("struct Device { u32 id; u32 status; }\n"
+       "u32 main() {\n"
+       "    Device d;\n"
+       "    *u32 p = &d.status;\n"
+       "    *Device dev = @container(*Device, p, status);\n"
+       "    return dev.id;\n"
+       "}",
+       "@container: valid field OK");
+
+    /* @container: field validation — field does not exist */
+    err("struct Device { u32 id; u32 status; }\n"
+       "u32 main() {\n"
+       "    Device d;\n"
+       "    *u32 p = &d.status;\n"
+       "    *Device dev = @container(*Device, p, nonexistent);\n"
+       "    return 0;\n"
+       "}",
+       "@container: nonexistent field rejected");
+
+    /* @container provenance: proven containment OK */
+    ok("struct ListHead { *ListHead next; *ListHead prev; }\n"
+       "struct Device { u32 id; ListHead list; }\n"
+       "u32 main() {\n"
+       "    Device dev;\n"
+       "    *ListHead ptr = &dev.list;\n"
+       "    *Device d = @container(*Device, ptr, list);\n"
+       "    return d.id;\n"
+       "}",
+       "@container provenance: proven containment OK");
+
+    /* @container provenance: wrong struct rejected */
+    err("struct ListHead { *ListHead next; *ListHead prev; }\n"
+       "struct Device { u32 id; ListHead list; }\n"
+       "struct Other { u32 x; ListHead list; }\n"
+       "u32 main() {\n"
+       "    Device dev;\n"
+       "    *ListHead ptr = &dev.list;\n"
+       "    *Other o = @container(*Other, ptr, list);\n"
+       "    return 0;\n"
+       "}",
+       "@container provenance: wrong struct rejected");
+
+    /* @container provenance: wrong field rejected */
+    err("struct ListHead { *ListHead next; *ListHead prev; }\n"
+       "struct Device { u32 id; ListHead list; ListHead list2; }\n"
+       "u32 main() {\n"
+       "    Device dev;\n"
+       "    *ListHead ptr = &dev.list;\n"
+       "    *Device d = @container(*Device, ptr, list2);\n"
+       "    return 0;\n"
+       "}",
+       "@container provenance: wrong field rejected");
+
+    /* @container provenance: unknown provenance allowed */
+    ok("struct ListHead { *ListHead next; *ListHead prev; }\n"
+       "struct Device { u32 id; ListHead list; }\n"
+       "u32 test(*ListHead ptr) {\n"
+       "    *Device d = @container(*Device, ptr, list);\n"
+       "    return d.id;\n"
+       "}",
+       "@container provenance: unknown (param) allowed");
+}
+
 int main(void) {
     printf("=== ZER Type Checker — Full Spec Coverage ===\n\n");
 
@@ -1928,6 +2080,7 @@ int main(void) {
     test_negative_sweep();
     test_red_team_314_318();
     test_red_team_343_346();
+    test_mmio_provenance();
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

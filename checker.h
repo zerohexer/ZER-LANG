@@ -61,6 +61,11 @@ typedef struct {
     Node **non_storable_nodes;
     int non_storable_count;
     int non_storable_capacity;
+
+    /* mmio range registry — @inttoptr validates addresses against these */
+    uint64_t (*mmio_ranges)[2]; /* array of [start, end] pairs */
+    int mmio_range_count;
+    int mmio_range_capacity;
 } Checker;
 
 /* ---- API ---- */

@@ -1726,6 +1726,58 @@ static Node *parse_declaration(Parser *p) {
         return n;
     }
 
+    /* mmio range declaration: mmio 0x40020000..0x40020FFF; */
+    if (match(p, TOK_MMIO)) {
+        consume(p, TOK_NUMBER_INT, "expected start address after 'mmio'");
+        Node *n = new_node(p, NODE_MMIO);
+        /* parse start address from previous token */
+        {
+            const char *text = p->previous.start;
+            size_t len = p->previous.length;
+            uint64_t val = 0;
+            if (len > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+                for (size_t i = 2; i < len; i++) {
+                    if (text[i] == '_') continue;
+                    val *= 16;
+                    if (text[i] >= '0' && text[i] <= '9') val += text[i] - '0';
+                    else if (text[i] >= 'a' && text[i] <= 'f') val += text[i] - 'a' + 10;
+                    else if (text[i] >= 'A' && text[i] <= 'F') val += text[i] - 'A' + 10;
+                }
+            } else {
+                for (size_t i = 0; i < len; i++) {
+                    if (text[i] == '_') continue;
+                    val = val * 10 + (text[i] - '0');
+                }
+            }
+            n->mmio_decl.range_start = val;
+        }
+        consume(p, TOK_DOTDOT, "expected '..' in mmio range");
+        consume(p, TOK_NUMBER_INT, "expected end address in mmio range");
+        /* parse end address */
+        {
+            const char *text = p->previous.start;
+            size_t len = p->previous.length;
+            uint64_t val = 0;
+            if (len > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+                for (size_t i = 2; i < len; i++) {
+                    if (text[i] == '_') continue;
+                    val *= 16;
+                    if (text[i] >= '0' && text[i] <= '9') val += text[i] - '0';
+                    else if (text[i] >= 'a' && text[i] <= 'f') val += text[i] - 'a' + 10;
+                    else if (text[i] >= 'A' && text[i] <= 'F') val += text[i] - 'A' + 10;
+                }
+            } else {
+                for (size_t i = 0; i < len; i++) {
+                    if (text[i] == '_') continue;
+                    val = val * 10 + (text[i] - '0');
+                }
+            }
+            n->mmio_decl.range_end = val;
+        }
+        consume(p, TOK_SEMICOLON, "expected ';' after mmio declaration");
+        return n;
+    }
+
     /* interrupt */
     if (match(p, TOK_INTERRUPT)) {
         consume(p, TOK_IDENT, "expected interrupt name");

@@ -1042,6 +1042,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* clear — will be re-set below if new value is unsafe */
                     tsym->is_local_derived = false;
                     tsym->is_arena_derived = false;
+                    tsym->provenance_type = NULL;
+                    tsym->container_struct = NULL;
+                    tsym->container_field = NULL;
+                    tsym->container_field_len = 0;
                     /* check if new value is &local — also check orelse fallback (BUG-314) */
                     {
                         Node *vcheck = node->assign.value;
@@ -1088,6 +1092,40 @@ static Type *check_expr(Checker *c, Node *node) {
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src && src->is_local_derived) tsym->is_local_derived = true;
                             if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                            /* provenance propagation through alias */
+                            if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
+                            if (src && src->container_struct) {
+                                tsym->container_struct = src->container_struct;
+                                tsym->container_field = src->container_field;
+                                tsym->container_field_len = src->container_field_len;
+                            }
+                        }
+                        /* @ptrcast provenance on assignment */
+                        if (vcheck->kind == NODE_INTRINSIC &&
+                            vcheck->intrinsic.name_len == 7 &&
+                            memcmp(vcheck->intrinsic.name, "ptrcast", 7) == 0 &&
+                            vcheck->intrinsic.arg_count > 0) {
+                            Type *tgt_eff = type_unwrap_distinct(tsym->type);
+                            if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                                tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
+                                Type *src_type = typemap_get(c, vcheck->intrinsic.args[0]);
+                                if (src_type) tsym->provenance_type = src_type;
+                            }
+                        }
+                        /* @container provenance: val = &struct.field */
+                        if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP &&
+                            vcheck->unary.operand->kind == NODE_FIELD) {
+                            Node *fn = vcheck->unary.operand;
+                            Type *ot = typemap_get(c, fn->field.object);
+                            if (ot) {
+                                Type *st = type_unwrap_distinct(ot);
+                                if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
+                                if (st && st->kind == TYPE_STRUCT) {
+                                    tsym->container_struct = st;
+                                    tsym->container_field = fn->field.field_name;
+                                    tsym->container_field_len = (uint32_t)fn->field.field_name_len;
+                                }
+                            }
                         }
                     }
                 }
@@ -2486,6 +2524,34 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "target must be volatile pointer");
                             }
                         }
+                        /* provenance check: casting FROM *opaque TO *T —
+                         * if source has provenance, target must match */
+                        if (eff->kind == TYPE_POINTER &&
+                            eff->pointer.inner->kind == TYPE_OPAQUE &&
+                            node->intrinsic.args[0]->kind == NODE_IDENT) {
+                            Symbol *src_sym = scope_lookup(c->current_scope,
+                                node->intrinsic.args[0]->ident.name,
+                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                            if (src_sym && src_sym->provenance_type) {
+                                Type *prov = type_unwrap_distinct(src_sym->provenance_type);
+                                Type *tgt = type_unwrap_distinct(result);
+                                /* compare: provenance type should match target pointer inner */
+                                if (tgt && tgt->kind == TYPE_POINTER && prov &&
+                                    prov->kind == TYPE_POINTER) {
+                                    Type *prov_inner = type_unwrap_distinct(prov->pointer.inner);
+                                    Type *tgt_inner = type_unwrap_distinct(tgt->pointer.inner);
+                                    if (prov_inner && tgt_inner &&
+                                        tgt_inner->kind != TYPE_OPAQUE &&
+                                        !type_equals(prov_inner, tgt_inner)) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast type mismatch: source has provenance '%s' "
+                                            "but target is '*%s'",
+                                            type_name(src_sym->provenance_type),
+                                            type_name(tgt_inner));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -2583,6 +2649,23 @@ static Type *check_expr(Checker *c, Node *node) {
                                 type_name(val_type));
                         }
                     }
+                    /* mmio range validation: if ranges declared, constant addr must be in range */
+                    if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0 &&
+                        node->intrinsic.args[0]->kind == NODE_INT_LIT) {
+                        uint64_t addr = node->intrinsic.args[0]->int_lit.value;
+                        bool in_range = false;
+                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                            if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
+                                in_range = true;
+                                break;
+                            }
+                        }
+                        if (!in_range) {
+                            checker_error(c, node->loc.line,
+                                "@inttoptr address 0x%llx is outside all declared mmio ranges",
+                                (unsigned long long)addr);
+                        }
+                    }
                 }
             } else {
                 result = ty_void;
@@ -2644,8 +2727,66 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = type_pointer(c->arena, ty_u8);
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
+            /* @container(*T, ptr, field) — reverse of &struct.field */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* validate field exists in target struct */
+                Type *tgt = type_unwrap_distinct(result);
+                if (tgt && tgt->kind == TYPE_POINTER) tgt = type_unwrap_distinct(tgt->pointer.inner);
+                if (tgt && tgt->kind == TYPE_STRUCT &&
+                    node->intrinsic.arg_count > 1 &&
+                    node->intrinsic.args[1]->kind == NODE_IDENT) {
+                    const char *fn = node->intrinsic.args[1]->ident.name;
+                    uint32_t fl = (uint32_t)node->intrinsic.args[1]->ident.name_len;
+                    bool found = false;
+                    for (uint32_t fi = 0; fi < tgt->struct_type.field_count; fi++) {
+                        if (tgt->struct_type.fields[fi].name_len == fl &&
+                            memcmp(tgt->struct_type.fields[fi].name, fn, fl) == 0) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        checker_error(c, node->loc.line,
+                            "@container: struct '%.*s' has no field '%.*s'",
+                            (int)tgt->struct_type.name_len, tgt->struct_type.name,
+                            (int)fl, fn);
+                    }
+                }
+                /* provenance check: if source pointer has container provenance,
+                 * target struct + field must match */
+                if (node->intrinsic.arg_count > 0 &&
+                    node->intrinsic.args[0]->kind == NODE_IDENT) {
+                    Symbol *src_sym = scope_lookup(c->current_scope,
+                        node->intrinsic.args[0]->ident.name,
+                        (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                    if (src_sym && src_sym->container_struct) {
+                        /* check struct matches */
+                        if (tgt && tgt->kind == TYPE_STRUCT &&
+                            tgt != src_sym->container_struct) {
+                            checker_error(c, node->loc.line,
+                                "@container: pointer provenance is struct '%.*s' "
+                                "but target is '%.*s'",
+                                (int)src_sym->container_struct->struct_type.name_len,
+                                src_sym->container_struct->struct_type.name,
+                                (int)tgt->struct_type.name_len, tgt->struct_type.name);
+                        }
+                        /* check field matches */
+                        if (node->intrinsic.arg_count > 1 &&
+                            node->intrinsic.args[1]->kind == NODE_IDENT) {
+                            const char *fn = node->intrinsic.args[1]->ident.name;
+                            uint32_t fl = (uint32_t)node->intrinsic.args[1]->ident.name_len;
+                            if (src_sym->container_field_len != fl ||
+                                memcmp(src_sym->container_field, fn, fl) != 0) {
+                                checker_error(c, node->loc.line,
+                                    "@container: pointer was derived from field '%.*s' "
+                                    "but used with field '%.*s'",
+                                    (int)src_sym->container_field_len, src_sym->container_field,
+                                    (int)fl, fn);
+                            }
+                        }
+                    }
+                }
             } else {
                 result = ty_void;
             }
@@ -3042,6 +3183,59 @@ static void check_stmt(Checker *c, Node *node) {
                             src->name, src->name_len) != NULL;
                         if (src && !src->is_static && !is_global) {
                             sym->is_local_derived = true;
+                        }
+                    }
+                }
+            }
+
+            /* @ptrcast provenance: track original type when casting to *opaque.
+             * *opaque ctx = @ptrcast(*opaque, sensor_ptr) → provenance = Sensor type.
+             * Also propagate provenance through aliases: q = p where p has provenance. */
+            if (sym && node->var_decl.init) {
+                Node *init = node->var_decl.init;
+                if (init->kind == NODE_ORELSE) init = init->orelse.expr;
+                /* direct @ptrcast to *opaque — record source type */
+                if (init->kind == NODE_INTRINSIC &&
+                    init->intrinsic.name_len == 7 &&
+                    memcmp(init->intrinsic.name, "ptrcast", 7) == 0 &&
+                    init->intrinsic.arg_count > 0) {
+                    Type *eff = type_unwrap_distinct(type);
+                    if (eff && eff->kind == TYPE_POINTER &&
+                        eff->pointer.inner->kind == TYPE_OPAQUE) {
+                        /* target is *opaque — record source type */
+                        Type *src_type = typemap_get(c, init->intrinsic.args[0]);
+                        if (src_type) sym->provenance_type = src_type;
+                    }
+                }
+                /* alias propagation: q = p where p has provenance */
+                if (init->kind == NODE_IDENT) {
+                    Symbol *src = scope_lookup(c->current_scope,
+                        init->ident.name, (uint32_t)init->ident.name_len);
+                    if (src && src->provenance_type)
+                        sym->provenance_type = src->provenance_type;
+                    if (src && src->container_struct) {
+                        sym->container_struct = src->container_struct;
+                        sym->container_field = src->container_field;
+                        sym->container_field_len = src->container_field_len;
+                    }
+                }
+            }
+
+            /* @container provenance: track struct+field when ptr = &struct.field */
+            if (sym && node->var_decl.init) {
+                Node *init = node->var_decl.init;
+                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP &&
+                    init->unary.operand->kind == NODE_FIELD) {
+                    Node *field_node = init->unary.operand;
+                    Type *obj_type = typemap_get(c, field_node->field.object);
+                    if (obj_type) {
+                        Type *st = type_unwrap_distinct(obj_type);
+                        /* walk through pointer auto-deref */
+                        if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
+                        if (st && st->kind == TYPE_STRUCT) {
+                            sym->container_struct = st;
+                            sym->container_field = field_node->field.field_name;
+                            sym->container_field_len = (uint32_t)field_node->field.field_name_len;
                         }
                     }
                 }
@@ -4109,6 +4303,28 @@ static void register_decl(Checker *c, Node *node) {
         /* register as a void function */
         /* body checked in pass 2 */
         break;
+
+    case NODE_MMIO: {
+        /* register mmio address range for @inttoptr validation */
+        if (c->mmio_range_count >= c->mmio_range_capacity) {
+            int new_cap = c->mmio_range_capacity < 16 ? 16 : c->mmio_range_capacity * 2;
+            uint64_t (*new_arr)[2] = (uint64_t (*)[2])arena_alloc(c->arena, new_cap * sizeof(uint64_t[2]));
+            if (c->mmio_ranges && c->mmio_range_count > 0)
+                memcpy(new_arr, c->mmio_ranges, c->mmio_range_count * sizeof(uint64_t[2]));
+            c->mmio_ranges = new_arr;
+            c->mmio_range_capacity = new_cap;
+        }
+        c->mmio_ranges[c->mmio_range_count][0] = node->mmio_decl.range_start;
+        c->mmio_ranges[c->mmio_range_count][1] = node->mmio_decl.range_end;
+        c->mmio_range_count++;
+        if (node->mmio_decl.range_start > node->mmio_decl.range_end) {
+            checker_error(c, node->loc.line,
+                "mmio range start (0x%llx) must be <= end (0x%llx)",
+                (unsigned long long)node->mmio_decl.range_start,
+                (unsigned long long)node->mmio_decl.range_end);
+        }
+        break;
+    }
 
     default:
         break;

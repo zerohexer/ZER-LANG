@@ -1351,5 +1351,42 @@ Two new checks in the `@container` handler:
 
 Both provenance systems propagate through aliases and clear+re-derive on assignment, following the same pattern as `is_local_derived`/`is_arena_derived`.
 
+### Comptime Functions (compile-time evaluation)
+
+**Keyword:** `TOK_COMPTIME` in lexer. Parser handles `comptime` prefix before `parse_func_or_var()` — sets `func_decl.is_comptime = true`. Symbol gets `is_comptime = true` during `register_decl`.
+
+**Evaluation mechanism:** NOT a full interpreter. Uses inline expansion + constant folding:
+1. At call site (NODE_CALL), checker detects `callee_sym->is_comptime`
+2. All args verified as compile-time constants via `eval_const_expr()`
+3. `eval_comptime_block()` walks the function body with parameter substitution:
+   - `eval_const_expr_subst()` — like `eval_const_expr` but replaces NODE_IDENT matching param names with mapped int64_t values
+   - NODE_RETURN → evaluate return expression with substitution
+   - NODE_IF → evaluate condition, recurse into taken branch only
+   - NODE_BLOCK → walk statements sequentially, return first result
+4. Result stored on `node->call.comptime_value` + `node->call.is_comptime_resolved = true`
+
+**Emitter:** `emit_top_level_decl` skips comptime functions entirely (no C output). `emit_expr(NODE_CALL)` checks `is_comptime_resolved` and emits the constant value directly as `%lld` literal.
+
+**Extended eval_const_expr (ast.h):** Added comparison operators (`> < >= <= == !=`), logical (`&& ||`), XOR (`^`), bitwise NOT (`~`), logical NOT (`!`). These support comptime function bodies with if/else branching.
+
+**Limitation:** Comptime calls in array size context (`u8[BIT(3)]`) don't work yet — array sizes use `eval_const_expr` which doesn't have Checker access to resolve comptime function calls. Comptime calls work in all expression contexts (var init, function args, return values).
+
+### Comptime If (conditional compilation)
+
+**Syntax:** `comptime if (CONST) { ... } else { ... }` — parsed as regular NODE_IF with `if_stmt.is_comptime = true`. Parser detects `TOK_COMPTIME` followed by `TOK_IF` at statement level.
+
+**Checker:** Evaluates condition via `eval_const_expr()`. Only the taken branch is type-checked. Dead branch is completely ignored — can contain undefined types/functions without error. This matches C `#ifdef` behavior where the dead branch is never compiled.
+
+**Emitter:** Checks `if_stmt.is_comptime`, evaluates condition, only emits the taken branch. Dead branch produces zero C output.
+
+**Use case:** Platform-specific code:
+```zer
+comptime if (ARM) {
+    mmio 0x40020000..0x40020FFF;
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+}
+```
+
 ### Known Technical Debt (updated)
 - **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.
+- **Comptime in array sizes:** `u8[BIT(3)]` doesn't work — eval_const_expr can't resolve comptime calls without Checker access. Workaround: use `const u32 SIZE = BIT(3); u8[SIZE] buf;` (doesn't work either since SIZE is a var). Future fix: pass Checker to eval_const_expr or pre-evaluate comptime calls before type resolution.

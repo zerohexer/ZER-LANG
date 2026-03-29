@@ -1841,3 +1841,13 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **What:** (1) Validates field exists in struct — was unchecked, GCC caught it. (2) Tracks which struct+field a pointer was derived from via `&struct.field`. Wrong struct or field in `@container` → compile error when provenance known.
 - **Scope:** types.h (Symbol.container_struct/field), checker.c (set in var-decl/assign on &struct.field, check in @container handler). Propagates through aliases.
 - **Test:** 6 new checker tests (field exists, field missing, proven containment, wrong struct, wrong field, unknown allowed).
+
+### FEAT: comptime Functions (compile-time evaluated, type-checked macros)
+- **What:** New `comptime` keyword prefix for functions. Body evaluated at compile time with argument substitution. All args must be compile-time constants. Results inlined as literals in emitted C. Comptime function bodies not emitted. Replaces C `#define` function-like macros.
+- **Scope:** lexer (TOK_COMPTIME), ast (func_decl.is_comptime, call.comptime_value/is_comptime_resolved), parser (comptime prefix), types.h (Symbol.is_comptime), checker (eval_comptime_block/eval_const_expr_subst + call-site interception), emitter (skip comptime funcs + emit constant for calls). Extended eval_const_expr with comparisons, logical, XOR, NOT.
+- **Test:** 8 checker tests + 2 E2E tests. 452 checker, 215 E2E.
+
+### FEAT: comptime if (conditional compilation, #ifdef replacement)
+- **What:** `comptime if (CONST) { ... } else { ... }` — condition evaluated at compile time, only taken branch type-checked and emitted. Dead branch stripped entirely. Replaces C `#ifdef/#ifndef/#endif`.
+- **Scope:** ast (if_stmt.is_comptime), parser (comptime + if at statement level), checker (eval condition, check only taken branch), emitter (emit only taken branch).
+- **Test:** 3 checker tests + 1 E2E test. 455 checker, 216 E2E.

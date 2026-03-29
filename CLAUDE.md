@@ -193,6 +193,28 @@ void f() {
 }
 ```
 
+### Comptime (compile-time evaluation — replaces C macros + #ifdef)
+```
+// comptime functions — type-checked, zero runtime cost:
+comptime u32 BIT(u32 n) { return 1 << n; }
+comptime u32 MAX(u32 a, u32 b) {
+    if (a > b) { return a; }
+    return b;
+}
+u32 mask = BIT(3);            // → 8 at compile time
+u32 big = MAX(10, 20);        // → 20 at compile time
+// All args MUST be compile-time constants — variables rejected
+
+// comptime if — conditional compilation (#ifdef replacement):
+comptime if (1) {
+    // this code is checked and emitted
+} else {
+    // this code is stripped entirely
+}
+// Condition must be compile-time constant (literal, const, comptime result)
+// Only the taken branch is type-checked — dead branch ignored
+```
+
 ### Hardware Support
 ```
 volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);  // MMIO register
@@ -210,6 +232,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - No undefined behavior (overflow wraps, shift by >=width = 0)
 - No `++`/`--`, no comma operator, no `goto`
 - No C-style casts
+- No preprocessor (#define → `comptime` functions, #ifdef → `comptime if`)
 - No header files (use `import`)
 - No preprocessor (#define, #ifdef)
 
@@ -259,6 +282,8 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | mmio range validation | Done | Done (runtime trap for variables) |
 | @ptrcast type provenance | Done | N/A (compile-time) |
 | @container field+provenance | Done | N/A (compile-time) |
+| comptime functions | Done | Done (inlined constants) |
+| comptime if (conditional compilation) | Done | Done (dead branch stripped) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

@@ -294,7 +294,15 @@ Enums emit as `#define` constants, not C enums:
 - Negative enum values: parser produces NODE_UNARY(MINUS, INT_LIT) — checker and emitter both handle this pattern
 
 ### Union Switch Emission
-Union switch takes a POINTER to the original: `__auto_type *_zer_swp = &(expr)`. Tag checked via `_zer_swp->_tag`. Immutable capture copies: `__auto_type v = _zer_swp->variant`. Mutable capture takes pointer: `Type *v = &_zer_swp->variant`. This ensures `|*v|` modifications persist to the original union.
+Union switch takes a POINTER to the original: `__auto_type *_zer_swp = &(expr)`. Tag checked via `_zer_swp->_tag`. Immutable capture copies: `__typeof__(...) v = _zer_swp->variant`. Mutable capture takes pointer: `Type *v = &_zer_swp->variant`. This ensures `|*v|` modifications persist to the original union.
+
+### Volatile and Qualifier Preservation in Captures (BUG-319/321/322)
+**CRITICAL:** Never use `__auto_type` for capture variables or orelse temporaries — GCC drops volatile and const qualifiers. Always use `__typeof__(expr)` which preserves them. Three sites in if-unwrap fixed:
+1. Mutable capture `|*v|` on struct optional: `volatile __typeof__(ptr->value) *v = &ptr->value;`
+2. Null-sentinel capture `|v|`: `__typeof__(tmp) v = tmp;`
+3. Value capture `|v|` on struct optional: `__typeof__(tmp.value) v = tmp.value;`
+Also: var-decl orelse uses `__typeof__(expr) _zer_or = expr;` (not `__auto_type`).
+Also: array copy checks BOTH target AND source for volatile — `expr_is_volatile(target) || expr_is_volatile(value)`.
 
 ### emit_file and emit_file_no_preamble — UNIFIED (RF2)
 Both functions now call `emit_top_level_decl(e, decl, file_node, i)`. Adding a new NODE kind only requires updating that one function. The old pattern of two parallel switch statements (which caused BUG-086/087) is eliminated.

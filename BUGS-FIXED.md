@@ -1692,3 +1692,27 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `l << r` with signed `l` — C UB when result exceeds `INT64_MAX`.
 - **Fix:** Cast to `(uint64_t)l << r` then back to `int64_t`.
 - **Test:** `test_checker_full.c` — large shift expressions don't crash compiler.
+
+### BUG-319: Volatile stripping in var-decl orelse
+- **Symptom:** `volatile ?u32 reg; u32 val = reg orelse 0;` — temporary loses volatile.
+- **Root cause:** `__auto_type _zer_or = expr` — GCC's `__auto_type` drops volatile.
+- **Fix:** Use `__typeof__(expr) _zer_or = expr` — `__typeof__` preserves qualifiers.
+- **Test:** Existing E2E tests pass. Volatile orelse now emits `__typeof__`.
+
+### BUG-320: Volatile stripping from source in array copy
+- **Symptom:** `dst = volatile_src` uses memmove — strips volatile on read.
+- **Root cause:** Only target checked for volatile (`expr_is_volatile(e, target)`), source ignored.
+- **Fix:** `arr_volatile = expr_is_volatile(target) || expr_is_volatile(value)`. Source cast uses `const volatile uint8_t*`. Same fix for var-decl init path.
+- **Test:** Existing E2E tests pass.
+
+### BUG-321: Volatile stripping in mutable captures
+- **Symptom:** `if (volatile_reg) |*v| { ... }` — `v` declared non-volatile.
+- **Root cause:** Capture pointer emission checked `is_const` but not `is_volatile`.
+- **Fix:** Emit `volatile` prefix on capture pointer when `cond_vol` is true.
+- **Test:** Existing E2E tests pass.
+
+### BUG-322: Qualifier loss in __auto_type captures
+- **Symptom:** All capture variables (`|v|` and `|*v|`) lose volatile/const via `__auto_type`.
+- **Root cause:** `__auto_type` in GCC drops qualifiers from deduced type.
+- **Fix:** Replace all 3 capture `__auto_type` sites with `__typeof__()` which preserves qualifiers.
+- **Test:** Existing E2E tests pass.

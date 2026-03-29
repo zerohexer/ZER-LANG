@@ -400,6 +400,16 @@ Two tools + one library for automated C-to-ZER migration:
 
 **174. Constant folder shift UB.** `(uint64_t)l << r` prevents signed overflow in the compiler. (BUG-318)
 
+### Red Team Audit Fixes (BUG-319 through BUG-322)
+
+**175. Volatile orelse var-decl: `__typeof__` instead of `__auto_type`.** GCC's `__auto_type` drops volatile. `__typeof__(expr) tmp = expr` preserves it. (BUG-319)
+
+**176. Array copy source volatile check.** `arr_volatile` now checks BOTH `expr_is_volatile(target)` AND `expr_is_volatile(value)`. Source cast uses `const volatile uint8_t*`. Same fix in var-decl init path. (BUG-320)
+
+**177. Volatile in mutable capture `|*v|`.** Emit `volatile` prefix on capture pointer when source expression is volatile. Was only propagating `const`, not `volatile`. (BUG-321)
+
+**178. `__typeof__` in ALL capture declarations.** Three sites in if-unwrap replaced `__auto_type` with `__typeof__()`: mutable `|*v|` pointer, null-sentinel `|v|` copy, struct optional `|v|` value extraction. Preserves both volatile and const qualifiers. (BUG-322)
+
 ### Structural Refactors Completed (RF1-RF7)
 
 These changed fundamental patterns. Fresh sessions MUST know:

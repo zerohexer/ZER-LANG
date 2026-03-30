@@ -846,3 +846,255 @@ Not implemented yet. Future addition:
 - `zerc` or `zerc --release`: skip proven checks (production performance)
 
 Default behavior until flag exists: proven paths skip runtime checks.
+
+---
+
+## CONTEXT DUMP — Design Decisions, Reasoning, and Rejected Alternatives
+
+**This section exists for fresh Claude sessions that have zero context of the discussions that led to these decisions. Read this section FULLY before proposing changes to the safety roadmap.**
+
+### Core Philosophy (decided through extensive discussion)
+
+1. **Zero language complexity.** Every safety feature is a compiler improvement, not a new syntax. The programmer writes C-style code. The compiler gets smarter. No new types, no new keywords, no annotations, no contracts, no proof obligations.
+
+2. **Belt and suspenders.** Runtime checks are NEVER removed, even when compile-time proves safety. The runtime check is a backup in case the compile-time analysis has implementation bugs. The value range propagation is ~500 lines of new checker logic — it WILL have bugs initially. The runtime checks are ~5 lines of emitted C each — trivially correct.
+
+3. **Force where it prevents UB, don't force where it's just overhead.** Division by zero = C undefined behavior → forced. Bounds = C undefined behavior → forced. @cstr overflow = ZER-defined trap → not forced (auto-orelse instead). The line is: if C has UB for this, ZER forces the guard.
+
+4. **Auto-insert over explicit.** When the compiler can determine the correct behavior, do it automatically. `@cstr` auto-inserts `orelse { return <zero>; }`. Function pointer pointer-params auto-become `keep`. The programmer doesn't write these — the compiler inserts them invisibly.
+
+5. **The programmer's guards are the proofs.** `if (i >= len) { return; }` is not boilerplate — it's the proof that `i < len`. The programmer already writes these guards as defensive practice. Value range propagation just notices them and skips the redundant runtime check. No new concept to learn.
+
+### Evolution of Design (what was considered and why it was rejected)
+
+**Attempt 1: Explicit ranged types `u32(0..N)`**
+- Proposed: new type syntax, `u32(0..buf.len) i = get_index() orelse return;`
+- Problem: adds language complexity, new type syntax to learn
+- Status: **REJECTED** — replaced by value range propagation
+
+**Attempt 2: Non-zero type `nz_u32`**
+- Proposed: new type for proven-nonzero integers, eliminates div-zero checks
+- Problem: new type to learn, forced `nz()` construction on every divisor
+- Status: **REJECTED** — replaced by value range propagation (compiler infers nonzero from `if (d == 0) { return; }` guard)
+
+**Attempt 3: Forced ranged indexing**
+- Proposed: `buf[i]` requires `i` to be `u32(0..buf.len)` type, compile error otherwise
+- Problem: 30-50% of statements are array access, massive boilerplate
+- Status: **TRANSFORMED** — forced bounds guard (compile error if index not proven in range), but no new type. The guard IS the proof, not a type annotation.
+
+**Attempt 4: Iterators `for (x in arr)` for bounds elimination**
+- Proposed: new loop syntax, structurally bounded, no bounds check
+- Problem: not needed for safety — value range propagation handles `for (i = 0; i < len; ...)` automatically
+- Status: **REMOVED from safety roadmap** — may be added later as ergonomic feature, not safety feature
+
+**Attempt 5: @cstr silent truncation**
+- Proposed: @cstr always truncates to fit, never overflows, never crashes
+- Problem: hides logic bugs. Truncated command to motor controller is worse than failed command.
+- Status: **REJECTED** — replaced by auto-orelse
+
+**Attempt 6: @cstr forced explicit `orelse`**
+- Proposed: @cstr returns `?void`, programmer must write `orelse return`
+- Problem: non-void functions need `orelse { return 0; }` — beginner doesn't know what value to return
+- Status: **TRANSFORMED** — auto-orelse: compiler auto-inserts `orelse { return <zero_value>; }` based on function return type. 100% invisible in void functions, auto-correct in non-void.
+
+**Attempt 7: Generics to replace `*opaque`**
+- Proposed: `fn register(T)(void (*fn)(*T), *T ctx)` — type-safe callbacks without type erasure
+- Problem: ~1000+ lines implementation, interacts with every feature, breaks "same syntax as C"
+- Status: **REJECTED** — `*opaque` with 3-layer provenance (compile-time Symbol + compound key + runtime type_id tag) achieves 100% safety without generics. Generics may be reconsidered for v2.0 if ZER gains adoption beyond embedded.
+
+**Attempt 8: Provenance on Type struct instead of Symbol**
+- Proposed: move `provenance_type` from Symbol to Type for per-field tracking
+- Problem: struct field Types are shared across all instances of a struct — can't have per-instance provenance on shared Types
+- Status: **REJECTED** — compound key map on Checker struct achieves the same coverage. Runtime type_id tag covers the remaining paths.
+
+### Key Mechanism: Value Range Propagation
+
+**This is the single most important planned feature.** It eliminates ~80% of all runtime checks without any language change.
+
+**How it works:** At each program point, the compiler tracks value constraints per variable:
+```
+Variable → { min_value, max_value, known_nonzero }
+```
+
+**Narrowing events:**
+- `if (i < N)` → inside then-block: `i.max = N - 1`
+- `if (i >= N)` then return → after the if: `i.max = N - 1`
+- `if (x != 0)` → inside then-block: `x.known_nonzero = true`
+- `if (x == 0) { return; }` → after the if: `x.known_nonzero = true`
+- `for (i = 0; i < N; ...)` → inside body: `i.min = 0, i.max = N - 1`
+- Literal assignment: `x = 5` → `x.min = 5, x.max = 5, x.known_nonzero = true`
+
+**Widening events:**
+- Assignment from unknown: `x = get_value()` → constraints reset
+- Function call might modify: only for globals/pointers
+- Loop exit: loop variable constraints no longer valid
+
+**Check elimination rules:**
+- `arr[i]` → skip bounds check if `i.max < arr.len`
+- `a / b` → skip div check if `b.known_nonzero` or `b.min > 0`
+- `@inttoptr(*T, base + offset)` → skip mmio check if `(base + offset.min)...(base + offset.max)` within mmio range
+- `@cstr(buf, data[0..n])` → skip length check if `n.max + 1 <= buf.size`
+
+**Implementation:** ~300-500 lines in checker.c. Data structure: `VarRange` array on Checker struct. Integrated into `check_expr`/`check_stmt`.
+
+**Does NOT handle (acceptable):**
+- Cross-function range inference (would need function summaries — future)
+- Complex arithmetic (`x * y` range = full product range, usually unknown)
+- Pointer-derived values (ranges don't apply to pointers)
+
+### Key Mechanism: Auto-Orelse for @cstr
+
+When `@cstr(buf, data)` is used as an expression statement without explicit `orelse`, the compiler auto-inserts `orelse { return <zero_value>; }` based on the enclosing function's return type:
+
+- `void` function → `orelse return`
+- `u32` function → `orelse { return 0; }`
+- `bool` function → `orelse { return false; }`
+- `?*T` function → `orelse { return null; }`
+
+The compiler already knows `current_func_ret` (used for return type checking). It already knows zero values for all types (used for auto-zero). Auto-orelse just combines both.
+
+**This pattern could extend to other failable operations in the future** — any intrinsic returning `?T` could auto-insert orelse. But start with @cstr — it's the simplest case and the only one where the programmer has no natural reason to write `orelse` explicitly.
+
+### Key Mechanism: Auto-Keep on Function Pointer Params
+
+ALL pointer parameters in function pointer types are automatically treated as `keep`. The programmer never writes `keep` on function pointer declarations — the compiler inserts it invisibly.
+
+**Why:** The compiler can't see inside a function pointer call. It must assume the worst — the function might store the pointer. `keep` prevents passing `&local` through function pointers.
+
+**Regular functions are different:** The compiler CAN see the body. `keep` is explicit and only required when the function actually stores the pointer. This is the existing behavior — unchanged.
+
+### Key Mechanism: Array-Level *opaque Provenance
+
+When assigning to any element of a `*opaque` array, provenance is stored under BOTH the element key AND the array root key in `prov_map`:
+
+```
+callbacks[0] = @ptrcast(*opaque, &sensor)
+  → prov_map["callbacks[0]"] = *Sensor    // element-level
+  → prov_map["callbacks"] = *Sensor       // array-level
+```
+
+Subsequent assignments to ANY element must match the array-level provenance. This forces homogeneous `*opaque` arrays — all elements must be the same type.
+
+**Consequence:** Heterogeneous `*opaque` arrays (different types per element) produce compile errors. The programmer must use separate arrays per type. This is cleaner code anyway — a `*opaque[4]` mixing Sensor and Motor pointers is a code smell.
+
+**Variable index:** `@ptrcast(*Sensor, callbacks[i])` checks against the array-level key `"callbacks"`. Since all elements are proven to be Sensor, any `i` is valid. 100% compile-time.
+
+### Key Mechanism: Cross-Function Provenance Summaries
+
+When a function returns `*opaque`, the compiler analyzes the function body once and records what provenance the return value carries. This summary is used at call sites.
+
+**Depends on:** zercheck change 4 (cross-function analysis infrastructure). The provenance summaries reuse the same function summary mechanism — analyze once, use at every call site.
+
+**Implementation:** ~50 lines on top of change 4's infrastructure.
+
+### Forced vs Not-Forced Decision Table
+
+| Rule | Forced? | Why |
+|------|---------|-----|
+| `*T` requires init | **Yes** | Prevents null deref (C UB) |
+| `?T` requires `orelse` | **Yes** | Prevents unhandled None |
+| Division requires guard | **Yes** | Prevents div-by-zero (C UB) |
+| Bounds requires guard | **Yes** | Prevents buffer overflow (C UB) |
+| @cstr requires handling | **Auto** | Auto-orelse inserted, invisible |
+| Fn ptr params = keep | **Auto** | Auto-inserted, invisible |
+| *opaque array homogeneous | **Yes** | Prevents type confusion at compile time |
+| Non-zero type | **No** | Removed — range propagation handles it |
+| Iterators | **No** | Removed from safety roadmap — ergonomic only |
+| MMIO guard | **No** | Range propagation handles it naturally |
+
+### Comparison: ZER vs Rust vs SPARK (Post-Roadmap)
+
+| | ZER | Rust | SPARK |
+|---|-----|------|-------|
+| Compile-time safety | **100%** (13/13 categories) | ~80% (no bounds proof, no div proof) | **100%** |
+| Runtime backup | **Always on** | Panics (no backup, IS the safety) | Optional |
+| `unwrap()` panic | **Impossible** (no unwrap exists) | Possible (common source of crashes) | N/A |
+| Volatile/MMIO | **100% tracked** | `unsafe` block, untracked | Partial |
+| Dynamic allocation | Pool/Slab/Ring/Arena — all safe | Vec/Box — safe via borrow checker | **None** (stack only) |
+| void*/type erasure | `*opaque` with runtime type tag | No void* (generics instead) | No void* |
+| Language complexity | **C syntax** | Lifetimes, traits, borrowing, Send/Sync | Contracts, loop invariants, pre/post |
+| Programmer effort for safety | **Zero** (compiler does everything) | Medium (fight borrow checker) | High (write proofs) |
+| Prover/toolchain cost | **Free** (GCC) | Free (rustc) | $10K-50K/year |
+| LLM can write it | **Yes** (C syntax) | Partially (lifetimes trip LLMs) | No (no training data) |
+| Data races | Not addressed (single-core target) | Compile-time (Send/Sync) | Compile-time (Ravenscar) |
+
+### Why Not Borrow Checker
+
+Discussed and rejected. A borrow checker would:
+- Eliminate the handle gen counter runtime check (the ONE check it solves)
+- Add move semantics, lifetime annotations, borrowing rules
+- Break "same syntax as C"
+- Cost: massive language complexity for one check that costs 3 cycles
+
+ZER's zercheck (changes 1-4) achieves ~100% compile-time handle tracking via typestate analysis — same result, zero language change.
+
+### Why Not Dependent Types
+
+Discussed and rejected. Dependent types (`u32 where i < N`) would:
+- Eliminate ALL runtime checks (100% compile-time proof)
+- Require the programmer to write proofs for every variable
+- Turn every function signature into a contract
+- Make ZER into Idris/F*/ATS — theorem provers, not programming languages
+- Nobody writes firmware in theorem provers
+
+Value range propagation achieves the same result for the common patterns (guards, loop conditions, literals) without any programmer effort.
+
+### Why Not Generics
+
+Discussed and rejected for now. Generics would:
+- Eliminate `*opaque` entirely — no type erasure needed
+- Add ~1000+ lines of implementation (monomorphization)
+- Interact with every other feature (optionals, comptime, distinct types)
+- Produce template-style error messages (C++ nightmare)
+- Break "same syntax as C"
+
+`*opaque` with 3-layer provenance (Symbol + compound key + runtime type_id) achieves 100% safety. Generics solve a problem that's already solved. May reconsider for v2.0 if user demand exists.
+
+### Implementation Dependencies
+
+```
+zercheck 1-3 (MAYBE_FREED, leak detection, loop pass)
+    ↓ (no dependency)
+zercheck 4 (cross-function analysis)
+    ↓ (provides function summary infrastructure)
+Cross-function provenance summaries (reuses change 4 summaries)
+
+Value range propagation (independent — no dependency on zercheck)
+    ↓ (enables)
+Forced division guard (requires range propagation to prove guards)
+Forced bounds guard (requires range propagation to prove guards)
+MMIO guard elimination (range propagation proves computed addresses)
+@cstr check elimination (range propagation proves slice fits)
+
+Auto-orelse for @cstr (independent — pure emitter change)
+Auto-keep on fn ptr params (independent — pure checker change)
+Array-level *opaque provenance (independent — extends existing prov_map)
+```
+
+**Start with:** zercheck 1-3 (immediate, ~90 lines, no dependencies)
+**Then:** value range propagation (biggest impact, ~300-500 lines)
+**Then:** everything else (all small, all independent)
+
+### What "100% Compile-Time" Actually Means
+
+It does NOT mean "zero runtime checks in the emitted C." Runtime checks stay as backup.
+
+It means: **for every safety category, the compiler catches 100% of violations before the code runs.** The programmer gets a compile error, not a runtime crash. The error message tells them exactly how to fix it.
+
+The runtime checks remain as a second layer. They should never fire in correct code — the compiler already caught the problem. But if the compiler's analysis has a bug (it will — it's ~1000 lines of new logic), the runtime check catches what the compiler missed.
+
+This is unique to ZER. SPARK doesn't keep runtime backup. Rust's runtime panics ARE the safety (no compile-time backup for bounds/div). ZER has BOTH layers on every path.
+
+### Target Audience Context
+
+ZER is NOT competing for web developers, application programmers, or systems programmers who already chose Rust. ZER is competing for **embedded firmware engineers who currently write C** and:
+
+- Have been told to "learn Rust" and resisted
+- Had a senior engineer say "we've been doing C for 20 years, it works"
+- Had a production bug caused by a buffer overflow that took a week to find
+- Work at companies where SPARK/Ada licensing costs more than a developer's salary
+- Use GCC cross-compilers for ARM/RISC-V/AVR and can't change toolchains
+
+These engineers will NOT learn new syntax. They will NOT write proofs. They will NOT change their build system. They WILL accept "same code, fewer bugs, same compiler" if the evidence is compelling.
+
+The safety roadmap's value proposition: **"Your code, but the compiler catches your bugs before they reach hardware."**

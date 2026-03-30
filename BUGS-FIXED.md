@@ -1887,3 +1887,33 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Provenance alias propagation only checked direct NODE_IDENT. @bitcast and @cast wrapping an ident was not walked through.
 - **Fix:** Walk through all intrinsics before checking root ident for provenance: `while (prov_root->kind == NODE_INTRINSIC) prov_root = prov_root->intrinsic.args[last]`.
 - **Test:** test_checker_full.c — provenance preserved through @bitcast.
+
+### BUG-360: Identity washing — local address escape through function return
+- **Symptom:** `return identity(&x)` where `identity(*u32 p) { return p; }` — compiles fine, returns dangling stack pointer.
+- **Root cause:** NODE_CALL return values never marked as local-derived, even when pointer arguments were local-derived.
+- **Fix:** In NODE_RETURN, if return expr is NODE_CALL returning pointer type, check all args for &local and local-derived idents. Also added same check in NODE_VAR_DECL init for call results.
+- **Test:** Existing tests pass. Identity washing caught.
+
+### BUG-361: zercheck global handle blindspot
+- **Symptom:** `g_h = pool.alloc(); pool.free(g_h); pool.get(g_h);` — zercheck didn't track handles assigned via NODE_ASSIGN (only NODE_VAR_DECL).
+- **Root cause:** zc_check_expr(NODE_ASSIGN) handled aliasing but not pool.alloc() assignment.
+- **Fix:** Added pool.alloc() detection in NODE_ASSIGN handler — registers handle in PathState same as var-decl init.
+- **Test:** Existing tests pass.
+
+### BUG-362: Struct field summation overflow
+- **Symptom:** compute_type_size could overflow when summing multiple massive array fields.
+- **Root cause:** `total += fsize` without overflow guard (BUG-344 only guarded array multiplication).
+- **Fix:** Added `if (fsize > 0 && total > INT64_MAX - fsize) return CONST_EVAL_FAIL` before field summation.
+- **Test:** Existing tests pass.
+
+### BUG-363: usize width tied to host instead of target
+- **Symptom:** `type_width(TYPE_USIZE)` returned `sizeof(size_t) * 8` from the host machine. Cross-compiling from 64-bit host for 32-bit target → checker uses wrong width for coercion/truncation validation.
+- **Root cause:** `types.c` used `sizeof(size_t)` which reflects the compiler's own platform, not the target.
+- **Fix:** Added `zer_target_ptr_bits` global (default 32 for embedded targets). `type_width(TYPE_USIZE)` returns this value. `--target-bits N` flag to override. Emitted C uses `size_t` which GCC resolves per target — always correct. `can_implicit_coerce` updated: same-width u32↔usize coercion allowed when involving TYPE_USIZE.
+- **Test:** usize widening test updated for 32-bit default.
+
+### BUG-364: Union alignment uses size not element alignment
+- **Symptom:** Union containing `u8[10]` variant gets `data_align = 8` instead of 1. Same bug as BUG-350 but in the union path.
+- **Root cause:** `compute_type_size(TYPE_UNION)` used `max_variant` size for alignment instead of computing per-variant element alignment.
+- **Fix:** Same pattern as BUG-350: array variants use element alignment, struct variants use max field alignment. Iterate variants to find max alignment independently from max size.
+- **Test:** Existing tests pass.

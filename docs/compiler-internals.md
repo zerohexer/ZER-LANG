@@ -1423,3 +1423,15 @@ The is_local_derived/is_arena_derived propagation walk now handles `NODE_UNARY(T
 
 ### Provenance Propagation Through All Intrinsics (BUG-358)
 Provenance alias propagation in NODE_VAR_DECL now walks through ALL intrinsics (not just @ptrcast) to find the root ident and copy its provenance_type and container_struct/field. `*opaque q = @bitcast(*opaque, ctx)` preserves `ctx`'s provenance. Uses same `while (prov_root->kind == NODE_INTRINSIC) walk` pattern as BUG-355 (assignment escape).
+
+### Identity Washing — Call-Site Escape Check (BUG-360)
+`return func(&local)` where func returns a pointer — conservatively rejected. In NODE_RETURN, if return expr is NODE_CALL with pointer return type, scan all arguments for `&local` patterns and local-derived idents. Same check added in NODE_VAR_DECL init: `*u32 p = func(&x)` where `x` is local marks `p` as local-derived. This is an overapproximation (safe functions that don't return their args get false positives) but prevents identity-washing escape. `keep` parameters are the programmer's opt-in for "I know this function stores but doesn't return the pointer."
+
+### zercheck Assignment Handle Tracking (BUG-361)
+zercheck NODE_ASSIGN handler now detects `g_h = pool.alloc() orelse return` — registers the handle in PathState same as NODE_VAR_DECL. Covers global handles assigned within function bodies. Without this, `pool.free(g_h); pool.get(g_h)` use-after-free was invisible to zercheck (fell back to runtime generation traps only).
+
+### usize Target Width (BUG-363)
+`zer_target_ptr_bits` global in types.c (default 32). `type_width(TYPE_USIZE)` returns this instead of host `sizeof(size_t) * 8`. The emitted C always uses `size_t` — GCC resolves the actual width per target. The ZER checker's default of 32 is conservative and correct for all embedded targets. `--target-bits N` flag available but rarely needed since emitted C is always correct. `can_implicit_coerce` allows same-width coercion when TYPE_USIZE is involved (u32↔usize on 32-bit targets).
+
+### Union Alignment Element-Based (BUG-364)
+Same fix as BUG-350 (struct alignment) applied to union path in `compute_type_size`. Union data alignment now computed per-variant: arrays use element alignment, structs use max field alignment, scalars use `min(size, 8)`. Prevents binary layout mismatch with C for unions containing byte arrays.

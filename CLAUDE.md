@@ -463,7 +463,7 @@ When starting a new session or lacking context:
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
 - Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
-- Compiler flags: `--run` (compile+execute), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations)
+- Compiler flags: `--run` (compile+execute), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations), `--target-bits N` (usize width, default 32)
 - GCC flags: emitted C requires `-fwrapv` (ZER defines signed overflow as wrapping). `zerc --run` adds this automatically.
 - Emitted C uses GCC extensions: statement expressions `({...})`, `__auto_type`, `_Alignof`, `__attribute__((packed))`
 - User-defined struct/enum/union names emit as-is (no `_zer_` prefix). Only internal names are prefixed.

@@ -302,6 +302,44 @@ static int build_expr_key(Node *expr, char *buf, int bufsize) {
     return 0;
 }
 
+/* BUG-393: compound key provenance map — set/get for struct fields and array elements */
+static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *prov) {
+    /* check if key already exists — update in place */
+    for (int i = 0; i < c->prov_map_count; i++) {
+        if (c->prov_map[i].key_len == key_len &&
+            memcmp(c->prov_map[i].key, key, key_len) == 0) {
+            c->prov_map[i].provenance = prov;
+            return;
+        }
+    }
+    /* add new entry */
+    if (c->prov_map_count >= c->prov_map_capacity) {
+        int new_cap = c->prov_map_capacity < 16 ? 16 : c->prov_map_capacity * 2;
+        void *np = realloc(c->prov_map, new_cap * sizeof(c->prov_map[0]));
+        if (!np) return;
+        c->prov_map = np;
+        c->prov_map_capacity = new_cap;
+    }
+    char *akey = (char *)arena_alloc(c->arena, key_len + 1);
+    if (!akey) return;
+    memcpy(akey, key, key_len);
+    akey[key_len] = '\0';
+    c->prov_map[c->prov_map_count].key = akey;
+    c->prov_map[c->prov_map_count].key_len = key_len;
+    c->prov_map[c->prov_map_count].provenance = prov;
+    c->prov_map_count++;
+}
+
+static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len) {
+    for (int i = 0; i < c->prov_map_count; i++) {
+        if (c->prov_map[i].key_len == key_len &&
+            memcmp(c->prov_map[i].key, key, key_len) == 0) {
+            return c->prov_map[i].provenance;
+        }
+    }
+    return NULL;
+}
+
 /* BUG-374: recursively check if a call expression has any local-derived pointer
  * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
  * which itself has &x. We recurse into nested calls (max depth 8 to prevent
@@ -1376,6 +1414,25 @@ static Type *check_expr(Checker *c, Node *node) {
                                 tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
                                 Type *src_type = typemap_get(c, vcheck->intrinsic.args[0]);
                                 if (src_type) tsym->provenance_type = src_type;
+                            }
+                            /* BUG-393: also store in compound key map for h.p, arr[0] */
+                            {
+                                Type *val_type = typemap_get(c, vcheck->intrinsic.args[0]);
+                                if (val_type) {
+                                    char tkey[128];
+                                    int tklen = build_expr_key(node->assign.target, tkey, sizeof(tkey));
+                                    if (tklen > 0) prov_map_set(c, tkey, (uint32_t)tklen, val_type);
+                                }
+                            }
+                        }
+                        /* BUG-393: propagate provenance from source ident to compound target */
+                        if (vcheck->kind == NODE_IDENT) {
+                            Symbol *src = scope_lookup(c->current_scope,
+                                vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
+                            if (src && src->provenance_type) {
+                                char tkey[128];
+                                int tklen = build_expr_key(node->assign.target, tkey, sizeof(tkey));
+                                if (tklen > 0) prov_map_set(c, tkey, (uint32_t)tklen, src->provenance_type);
                             }
                         }
                         /* @container provenance: val = &struct.field */
@@ -2940,16 +2997,29 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "target must be volatile pointer");
                             }
                         }
-                        /* provenance check: compile-time belt for simple idents.
-                         * BUG-393: runtime type_id is the suspenders for complex paths. */
+                        /* provenance check: compile-time belt.
+                         * Simple idents: check Symbol. Compound paths (h.p, arr[0]):
+                         * check prov_map. BUG-393 runtime type_id is the suspenders. */
                         if (eff->kind == TYPE_POINTER &&
-                            eff->pointer.inner->kind == TYPE_OPAQUE &&
-                            node->intrinsic.args[0]->kind == NODE_IDENT) {
-                            Symbol *src_sym = scope_lookup(c->current_scope,
-                                node->intrinsic.args[0]->ident.name,
-                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                            if (src_sym && src_sym->provenance_type) {
-                                Type *prov = type_unwrap_distinct(src_sym->provenance_type);
+                            eff->pointer.inner->kind == TYPE_OPAQUE) {
+                            Type *prov_type = NULL;
+                            /* try simple ident first */
+                            if (node->intrinsic.args[0]->kind == NODE_IDENT) {
+                                Symbol *src_sym = scope_lookup(c->current_scope,
+                                    node->intrinsic.args[0]->ident.name,
+                                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                                if (src_sym) prov_type = src_sym->provenance_type;
+                            }
+                            /* BUG-393: try compound key map (h.p, arr[0]) */
+                            if (!prov_type) {
+                                char skey[128];
+                                int sklen = build_expr_key(node->intrinsic.args[0],
+                                                           skey, sizeof(skey));
+                                if (sklen > 0)
+                                    prov_type = prov_map_get(c, skey, (uint32_t)sklen);
+                            }
+                            if (prov_type) {
+                                Type *prov = type_unwrap_distinct(prov_type);
                                 Type *tgt = type_unwrap_distinct(result);
                                 if (tgt && tgt->kind == TYPE_POINTER && prov &&
                                     prov->kind == TYPE_POINTER) {
@@ -2961,7 +3031,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                         checker_error(c, node->loc.line,
                                             "@ptrcast type mismatch: source has provenance '%s' "
                                             "but target is '*%s'",
-                                            type_name(src_sym->provenance_type),
+                                            type_name(prov_type),
                                             type_name(tgt_inner));
                                     }
                                 }

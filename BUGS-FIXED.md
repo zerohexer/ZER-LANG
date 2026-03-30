@@ -1936,7 +1936,17 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
-### BUG-393: *opaque runtime provenance via type tags
+### BUG-393: *opaque provenance — compile-time compound keys + runtime type tags
+- **Symptom:** Provenance tracking only worked for simple variables. Struct fields (`h.p`), array elements (`arr[0]`), function returns all lost provenance.
+- **Root cause:** `provenance_type` on Symbol only tracked simple variable assignments. No compound path tracking, no runtime fallback.
+- **Fix (3 layers):**
+  1. **Compile-time Symbol-level** (existing): `ctx = @ptrcast(*opaque, &s)` → `ctx.provenance_type = *Sensor`. Catches simple ident mismatches.
+  2. **Compile-time compound keys** (new): `h.p = @ptrcast(*opaque, &s)` → stores provenance under key `"h.p"` in `prov_map`. @ptrcast check tries `build_expr_key` + `prov_map_get` when source isn't simple ident. Catches struct fields and constant array indices.
+  3. **Runtime type tags** (new): `*opaque` emitted as `_zer_opaque{void *ptr, uint32_t type_id}`. Each struct/enum/union gets unique `type_id`. @ptrcast checks type_id at runtime — traps on mismatch. Catches everything including variable indices and function returns.
+- **Coverage:** Simple idents → compile-time. `h.p`, `arr[0]` → compile-time. `arr[i]`, `get_ctx()` → runtime. 100% total.
+- **Test:** 2 checker tests (struct field mismatch/match), 2 E2E tests (round-trip, struct field round-trip).
+
+### BUG-393 runtime implementation: *opaque runtime provenance via type tags
 - **Symptom:** Provenance tracking for `@ptrcast` was compile-time only, stored on Symbol. Struct fields (`h.p`), array elements (`arr[i]`), function returns, and cross-function flows all lost provenance.
 - **Root cause:** `provenance_type` on Symbol only tracked simple variable assignments. No runtime fallback for cases the compiler couldn't prove.
 - **Fix:** `*opaque` in emitted C becomes `_zer_opaque` struct: `{ void *ptr; uint32_t type_id; }`. Each struct/enum/union gets a unique `type_id` assigned during `register_decl`. `@ptrcast(*opaque, sensor_ptr)` wraps with `(_zer_opaque){(void*)ptr, TYPE_ID}`. `@ptrcast(*Sensor, ctx)` unwraps with runtime check: `if (ctx.type_id != expected && ctx.type_id != 0) _zer_trap(...)`. Type ID 0 = unknown (params, cinclude) → always allowed.

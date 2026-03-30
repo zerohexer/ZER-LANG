@@ -2369,6 +2369,27 @@ static void test_mmio_provenance(void) {
        "}",
        "BUG-356: deref flag propagation catches escape");
 
+    /* BUG-393: compile-time provenance for struct fields (compound key) */
+    err("struct Sensor { u32 val; }\n"
+        "struct Motor { u32 speed; }\n"
+        "struct Holder { *opaque p; }\n"
+        "Sensor g_s;\n"
+        "Holder g_h;\n"
+        "void test() {\n"
+        "    g_h.p = @ptrcast(*opaque, &g_s);\n"
+        "    *Motor m = @ptrcast(*Motor, g_h.p);\n"
+        "}\n",
+        "BUG-393: struct field provenance mismatch (compile-time)");
+    ok("struct Sensor { u32 val; }\n"
+       "struct Holder { *opaque p; }\n"
+       "Sensor g_s;\n"
+       "Holder g_h;\n"
+       "void test() {\n"
+       "    g_h.p = @ptrcast(*opaque, &g_s);\n"
+       "    *Sensor s = @ptrcast(*Sensor, g_h.p);\n"
+       "}\n",
+       "BUG-393: struct field provenance match (compile-time)");
+
     /* BUG-358: provenance preserved through @bitcast (compile-time) */
     err("struct Sensor { u32 id; }\n"
        "struct Motor { u32 speed; }\n"

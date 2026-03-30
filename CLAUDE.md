@@ -250,7 +250,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 | Invalid MMIO address | `mmio` range declarations + compile-time/runtime validation of `@inttoptr` |
-| Wrong pointer cast | `*opaque` runtime type tags — `_zer_opaque{ptr, type_id}` traps on mismatch |
+| Wrong pointer cast | 3-layer: compile-time Symbol + compound key map + runtime `_zer_opaque{ptr, type_id}` trap |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
 | Volatile/const strip | `@ptrcast`, `@bitcast`, `@cast` all check qualifier preservation |
 

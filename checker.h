@@ -71,6 +71,11 @@ typedef struct {
     bool no_strict_mmio;  /* --no-strict-mmio: allow @inttoptr without mmio declarations */
     int target_ptr_bits;  /* target pointer width in bits (default 32 for embedded) */
     uint32_t next_type_id; /* BUG-393: counter for runtime provenance type IDs */
+
+    /* BUG-393: compile-time provenance map for compound paths (h.p, arr[0]) */
+    struct { char *key; uint32_t key_len; Type *provenance; } *prov_map;
+    int prov_map_count;
+    int prov_map_capacity;
 } Checker;
 
 /* ---- API ---- */

@@ -1451,7 +1451,15 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
-### Runtime Provenance Tags for *opaque (BUG-393)
+### Provenance: 3-Layer System (BUG-393)
+
+**Layer 1 — Compile-time Symbol-level (simple idents):**
+`provenance_type` on Symbol. `ctx = @ptrcast(*opaque, &s)` sets `ctx.provenance_type`. @ptrcast CHECK looks up source ident's Symbol. Covers simple variable round-trips.
+
+**Layer 2 — Compile-time compound key map (struct fields, constant array indices):**
+`prov_map` on Checker — `{key, provenance}` entries. `h.p = @ptrcast(*opaque, &s)` stores provenance under key `"h.p"` via `build_expr_key`. @ptrcast CHECK calls `prov_map_get` when source isn't a simple ident. `prov_map_set` called in NODE_ASSIGN when value is @ptrcast or provenance-carrying ident. Same `build_expr_key` helper used by union lock (BUG-392) and zercheck (BUG-357).
+
+**Layer 3 — Runtime type tags (everything else):**
 `*opaque` in emitted C is now `_zer_opaque` struct (`{ void *ptr; uint32_t type_id; }`), not `void*`. Each struct/enum/union gets a unique `type_id` assigned in `register_decl` via `c->next_type_id++` (0 = unknown/external).
 
 **Emitter changes:**

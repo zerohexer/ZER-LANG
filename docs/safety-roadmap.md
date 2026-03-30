@@ -345,7 +345,7 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 | Value range propagation | v0.3 | ~300-500 | **None** | No |
 | Forced division guard | v0.3 | ~20 | **None** (new compile error only) | Unguarded divisions become errors |
 | Forced bounds guard | v0.3 | ~20 | **None** (new compile error only) | Unguarded indexing becomes errors |
-| Forced keep on fn ptr returns | v0.3 | ~10 | **None** (extends existing `keep`) | Fn ptrs returning pointer need `keep` params |
+| Auto keep on fn ptr pointer-params | v0.3 | ~10 | **None** (invisible, auto-inserted) | No — invisible to programmer |
 | @cstr auto-orelse | v0.3 | ~30 | **None** (auto-inserted) | No — invisible |
 | Array-level *opaque provenance | v0.3 | ~10 | **None** | Heterogeneous *opaque arrays become errors |
 | Cross-function provenance summaries | v0.3 | ~50 | **None** | No — extends change 4 infrastructure |
@@ -643,7 +643,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Value range propagation | Compiler improvement | **None** | ~300-500 lines in checker.c |
 | Forced division guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
 | Forced bounds guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
-| Forced keep on fn ptr params | Compiler rule | **None** (extends existing `keep`) | ~10 lines in checker.c |
+| Auto keep on fn ptr pointer-params | Compiler rule | **None** (invisible, auto-inserted) | ~10 lines in checker.c |
 | @cstr auto-orelse | Compiler + Emitter | **None** (auto-inserted) | ~30 lines in checker.c + emitter.c |
 
 **All six are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, forces safety invariants, and makes @cstr physically unable to overflow. No new types, no new keywords, no new syntax.
@@ -653,7 +653,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 - `?T` requires `orelse` or `if |capture|` (already forced)
 - Division requires proven nonzero divisor (NEW)
 - Array/slice indexing requires proven in-range index (NEW)
-- Function pointers returning pointer with pointer params require `keep` on those params (NEW — extends existing `keep` keyword)
+- Function pointer pointer-params auto-`keep` — invisible, compiler inserts (NEW — no programmer action)
 - `@cstr` auto-inserts `orelse { return <zero>; }` when no explicit `orelse` — never overflows (NEW — 100% invisible)
 
 ```zer
@@ -685,7 +685,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Signed overflow | Defined as wrapping (`-fwrapv`) | Automatic |
 | Uninitialized memory | Auto-zero everything | Automatic |
 | Double free | Handle gen counter + zercheck | Automatic |
-| Out-of-bounds pointer | Scope escape analysis + **forced keep on fn ptrs** | Forced + Automatic |
+| Out-of-bounds pointer | Scope escape analysis + **auto keep on fn ptr params** | Forced + Automatic |
 | Type confusion (void*) | `_zer_opaque` runtime type tag + compile-time provenance | Automatic |
 | Volatile access reorder | Qualifier tracking on all casts | Automatic |
 
@@ -701,7 +701,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Handle leaks | **100%** | None |
 | Null deref | **100%** | None |
 | *opaque cast | **100%** | Array-level provenance + cross-function summaries (runtime tag stays as backup) |
-| Scope escape | **~95%** | Deep indirection chains |
+| Scope escape | **100%** | Cross-function analysis + auto keep on fn ptr params |
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |
 | MMIO range | **~99%** | Computed variable addresses (rare) |

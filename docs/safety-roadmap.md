@@ -344,13 +344,15 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 | Non-zero type (`nz_u32`) | v0.3 | ~100 | No |
 | Ranged integers (`u32(0..N)`) | v1.0-v2.0 | ~500-800 | No |
 
-All features are additive. No existing ZER code breaks. The programmer opts in to stricter types for compile-time guarantees. The old patterns continue to work with runtime checks.
+All features are additive. No existing ZER code breaks.
 
 ---
 
-## Design Decisions: Forced vs Optional
+## Original Design Decisions (Preserved for Reference)
 
-### Decision: Ranged Indexing — FORCED
+### Original Decision: Ranged Indexing — FORCED
+
+**Status: SUPERSEDED by Value Range Propagation (see below) — no longer needed as explicit type.**
 
 Array/slice indexing with `buf[i]` **requires** `i` to be a ranged type (`u32(0..buf.len)`) or a compile-time-provable literal. Bare `u32` as index is a compile error.
 
@@ -383,7 +385,9 @@ for (x in buf) { x += 1; }
 - `zer-upgrade` rewrites to `u32(0..buf.len) i = i orelse return; buf[i] = 5`
 - Same pipeline as `malloc → compat → Slab`
 
-### Decision: Non-Zero Division — OPTIONAL (not forced)
+### Original Decision: Non-Zero Division — OPTIONAL (not forced)
+
+**Status: SUPERSEDED by Value Range Propagation (see below) — `nz_u32` no longer needed.**
 
 `nz_u32` exists as an opt-in type. Regular `u32 / u32` keeps runtime div-zero check. Not forced.
 
@@ -406,7 +410,9 @@ u32 result = total / safe_count;          // no check — programmer opted in
 - `total / nz_val` — nz type, proven
 - `total / count` — unknown, runtime check
 
-### Decision: Iterators — OPTIONAL (not forced)
+### Original Decision: Iterators — OPTIONAL (not forced)
+
+**Status: UNCHANGED — iterators still planned as optional cleaner syntax.**
 
 `for (x in arr)` is available alongside `for (u32 i = 0; ...)`. Not forced — both work.
 
@@ -421,15 +427,7 @@ for (x in buf) { process(x); }                          // no bounds check
 for (u32 i = 0; i < buf.len; i += 1) { buf2[i] = buf[i]; }  // bounds checks on both
 ```
 
-When ranged indexing is forced (above), the indexed loop pattern naturally becomes:
-```zer
-for (u32(0..buf.len) i = 0; i < buf.len; i += 1) {
-    buf[i] = 5;  // no bounds check — i is ranged
-}
-```
-The compiler can infer the range from the loop condition `i < buf.len`, so the programmer may not even need to write the range explicitly. This is a compiler optimization, not a language rule.
-
-### Summary Table
+### Original Summary Table
 
 | Feature | Enforcement | Reason |
 |---------|------------|--------|
@@ -438,10 +436,188 @@ The compiler can infer the range from the loop condition `i < buf.len`, so the p
 | Iterators | Optional | Better tool, not the only valid tool |
 | zercheck 1-4 | Automatic | Compiler improvement, no programmer involvement |
 
+---
+
+## REVISED DESIGN: Value Range Propagation (Replaces nz_u32 and Explicit Ranged Types)
+
+### The Key Insight
+
+`nz_u32` and `u32(0..N)` are unnecessary new types IF the compiler is smart enough to infer value constraints from existing code patterns. Programmers already write guard checks — the compiler just needs to notice them.
+
+**One compiler pass — value range propagation — eliminates:**
+- Bounds checks after `if (i < len)` guards
+- Div-zero checks after `if (x != 0)` guards
+- Both without ANY new syntax, types, or keywords
+
+### How It Works
+
+The compiler tracks what values a variable CAN hold based on prior conditionals:
+
+```zer
+// BOUNDS: compiler infers i < buf.len from guard
+u32 i = get_index();
+if (i >= buf.len) { return; }
+buf[i] = 5;     // compiler: skip bounds check — proven i < buf.len
+
+// DIVISION: compiler infers d != 0 from guard
+u32 d = get_divisor();
+if (d == 0) { return; }
+total / d;       // compiler: skip div check — proven d != 0
+
+// LOOPS: compiler infers i < buf.len from loop condition
+for (u32 i = 0; i < buf.len; i += 1) {
+    buf[i] = 5; // compiler: skip bounds check — i < buf.len by loop structure
+}
+
+// LITERALS: compiler knows the value
+buf[0] = 5;      // 0 < any len — skip check
+total / 4;        // 4 != 0 — skip check
+```
+
+**Zero language complexity added. Zero new types. Zero new keywords.**
+The programmer writes normal C-style guards they'd write anyway. Same code ZER already accepts. Just smarter emission.
+
+### What the Compiler Tracks Per Variable
+
+At each program point, the compiler maintains:
+```
+Variable → { min_value, max_value, known_nonzero }
+```
+
+**Narrowing events (update constraints):**
+- `if (i < N)` → inside the then-block: `i.max = N - 1`
+- `if (i >= N)` then return → after the if: `i.max = N - 1`
+- `if (x != 0)` → inside the then-block: `x.known_nonzero = true`
+- `if (x == 0) { return; }` → after the if: `x.known_nonzero = true`
+- `for (i = 0; i < N; ...)` → inside body: `i.min = 0, i.max = N - 1`
+- Literal assignment: `x = 5` → `x.min = 5, x.max = 5, x.known_nonzero = true`
+
+**Widening events (lose constraints):**
+- Assignment from unknown: `x = get_value()` → constraints reset
+- Function call might modify: only for globals/pointers
+- Loop exit: loop variable constraints no longer valid
+
+### Runtime Check Elimination Rules
+
+```
+Bounds:   arr[i]   → skip if i.max < arr.len (proven in range)
+Division: a / b    → skip if b.known_nonzero (proven nonzero)
+Division: a / b    → skip if b.min > 0 (proven positive)
+```
+
+### Examples: Before and After
+
+```zer
+// Example 1: sensor array processing
+u32 idx = read_sensor_id();
+if (idx >= 16) { idx = 0; }        // guard: idx now in 0..15
+sensors[idx].value = read_adc();     // NO bounds check (was: runtime)
+
+// Example 2: averaging with guard
+u32 count = get_sample_count();
+if (count == 0) { return; }         // guard: count now nonzero
+u32 avg = total / count;             // NO div check (was: runtime)
+
+// Example 3: standard for loop
+for (u32 i = 0; i < data.len; i += 1) {
+    data[i] = process(data[i]);      // NO bounds check per iteration (was: runtime)
+}
+
+// Example 4: no guard, unknown value
+u32 i = get_index();
+buf[i] = 5;                          // runtime bounds check (can't prove)
+```
+
+### This Replaces Three Planned Features
+
+| Original Feature | Status | Replaced By |
+|-----------------|--------|-------------|
+| `nz_u32` (non-zero type) | **REPLACED** | Range propagation infers nonzero from `if (x != 0)` guards |
+| `u32(0..N)` (ranged integers) | **REPLACED** | Range propagation infers bounds from `if (i < N)` guards |
+| Forced ranged indexing | **REPLACED** | Not needed — compiler auto-eliminates checks when guards exist |
+
+**What remains as planned:**
+- **zercheck 1-4** — unchanged, still needed for handle tracking
+- **Iterators (`for in`)** — still useful for cleaner syntax + guaranteed no bounds check
+
+### Iterators — OPTIONAL (unchanged)
+
+`for (x in arr)` still planned as a cleaner syntax option. Not forced.
+
+```zer
+for (x in buf) { process(x); }                                // no bounds check (structural)
+for (u32 i = 0; i < buf.len; i += 1) { buf[i] = process(i); } // no bounds check (range propagation)
+```
+
+Both achieve the same result. Iterator is cleaner. Indexed loop is more flexible. Programmer picks.
+
+### Coverage After Range Propagation
+
+| Category | Compile-time | Remaining runtime |
+|----------|-------------|-------------------|
+| Bounds (with guard or loop) | **100%** | Only unguarded bare `buf[unknown_i]` |
+| Bounds (iterator) | **100%** | None |
+| Division (with guard) | **100%** | Only unguarded bare `a / unknown` |
+| Handle UAF (zercheck 1-4) | **~99%** | ISR + cinclude edge cases |
+| *opaque cast | **~98%** | Variable index + function return |
+| MMIO range | **~99%** | Computed variable addresses (rare) |
+| @cstr overflow | **~50%** | Variable slice source |
+| Arena overflow | **0%** | Inherently runtime |
+
+**Overall: ~95% compile-time for guarded code, ~90% for unguarded code.**
+
+### What Happens to Unguarded Code?
+
+```zer
+u32 i = get_index();
+buf[i] = 5;  // no guard — compiler can't prove anything
+```
+
+Two options:
+1. **Runtime check (current behavior)** — safe, costs 2 cycles. No change needed.
+2. **Compiler warning** — "unguarded index access, consider adding bounds check." Nudges programmer toward guards without forcing them.
+
+Option 2 is the gentle push. The programmer sees: "line 42: warning: array index 'i' not proven in range — consider `if (i >= buf.len) { return; }` before this line." They add the guard, the warning disappears, the runtime check is eliminated. No new syntax learned.
+
+### Implementation
+
+**Where it lives:** New pass in checker.c, between type checking and emitter. Or integrated into check_expr/check_stmt with a `VarRange` map on the Checker struct.
+
+**Data structure:**
+```c
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    int64_t min_val;     // INT64_MIN = unknown lower bound
+    int64_t max_val;     // INT64_MAX = unknown upper bound
+    bool known_nonzero;
+} VarRange;
+```
+
+**Estimated size:** ~300-500 lines in checker.c. Handles:
+- `if (x < N)` / `if (x >= N)` / `if (x == 0)` / `if (x != 0)` narrowing
+- For loop condition inference
+- Literal assignment
+- Reset on unknown assignment
+- Propagation through simple arithmetic (`x + 1` shifts range by 1)
+
+**Does NOT handle (acceptable):**
+- Cross-function range inference (would need function summaries)
+- Complex arithmetic (`x * y` range = full product range, usually unknown)
+- Pointer-derived values (ranges don't apply)
+
+### The ZER Philosophy
+
+**Same code a C programmer writes. Same guards they'd write anyway. The compiler just rewards them by skipping redundant checks.**
+
+No new types. No new keywords. No new annotations. No new syntax. The programmer writes natural defensive code. The compiler notices and optimizes.
+
+This is the opposite of Rust's approach (force new concepts on the programmer) and the opposite of Ada's approach (force ranged types). ZER's approach: **write C, get SPARK-level safety, because the compiler is smart enough to see what you already told it.**
+
 ### Debug/Release Flag (Future)
 
 Not implemented yet. Future addition:
-- `zerc --debug`: emit runtime checks even on proven paths (validates compiler reasoning)
+- `zerc --debug`: emit ALL runtime checks, even on proven paths (validates compiler reasoning)
 - `zerc` or `zerc --release`: skip proven checks (production performance)
 
-Default behavior until flag exists: proven paths skip runtime checks (the whole point of ranged types).
+Default behavior until flag exists: proven paths skip runtime checks.

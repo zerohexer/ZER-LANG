@@ -1875,3 +1875,15 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Assignment escape check (BUG-205) only checked `NODE_IDENT` values, not `NODE_INTRINSIC`-wrapped values.
 - **Fix:** Walk through intrinsics before checking root ident: `while (vnode->kind == NODE_INTRINSIC) vnode = vnode->intrinsic.args[last]`.
 - **Test:** test_checker_full.c — @ptrcast and @cast assignment escape rejected.
+
+### BUG-356: is_local_derived lost through pointer dereference
+- **Symptom:** `*u32 p2 = *pp` where `pp` is `**u32` pointing to local-derived `p` — `p2` not marked local-derived, `return p2` accepted (dangling pointer).
+- **Root cause:** Flag propagation walk handled field, index, intrinsic, and & — but not deref (*). The walk stopped at NODE_UNARY(STAR).
+- **Fix:** Added `NODE_UNARY(TOK_STAR)` to the walk — deref walks into operand to check its flags.
+- **Test:** test_checker_full.c — deref flag propagation catches escape.
+
+### BUG-358: Provenance lost through @bitcast/@cast
+- **Symptom:** `*opaque q = @bitcast(*opaque, ctx)` where `ctx` has provenance `*Sensor` — `q` loses provenance, allowing wrong-type `@ptrcast(*Motor, q)`.
+- **Root cause:** Provenance alias propagation only checked direct NODE_IDENT. @bitcast and @cast wrapping an ident was not walked through.
+- **Fix:** Walk through all intrinsics before checking root ident for provenance: `while (prov_root->kind == NODE_INTRINSIC) prov_root = prov_root->intrinsic.args[last]`.
+- **Test:** test_checker_full.c — provenance preserved through @bitcast.

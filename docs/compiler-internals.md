@@ -1416,3 +1416,10 @@ The BUG-205 assignment escape check (`g_ptr = local_derived_ptr`) only fired whe
 ### Known Technical Debt (updated)
 - **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.
 - **Comptime in array sizes:** `u8[BIT(3)]` doesn't work — eval_const_expr can't resolve comptime calls without Checker access. Workaround: use `const u32 SIZE = BIT(3); u8[SIZE] buf;` (doesn't work either since SIZE is a var). Future fix: pass Checker to eval_const_expr or pre-evaluate comptime calls before type resolution.
+- **zercheck field/index handles:** HandleInfo tracks by flat name string only — can't represent `arr[0]` or `s.h`. Handles stored in arrays or struct fields fall back to runtime generation counter traps. Refactoring to support NODE_FIELD/NODE_INDEX handle targets is a future enhancement (BUG-357).
+
+### Deref Walk in Flag Propagation (BUG-356)
+The is_local_derived/is_arena_derived propagation walk now handles `NODE_UNARY(TOK_STAR)` — pointer dereference. `*u32 p2 = *pp` where `pp` is a double pointer to a local-derived pointer — the walk goes through the deref to find `pp`, checks its flags, propagates to `p2`. Without this, double pointers "washed" the safety flag. Same walk location as BUG-338 (intrinsic args) at ~line 3232.
+
+### Provenance Propagation Through All Intrinsics (BUG-358)
+Provenance alias propagation in NODE_VAR_DECL now walks through ALL intrinsics (not just @ptrcast) to find the root ident and copy its provenance_type and container_struct/field. `*opaque q = @bitcast(*opaque, ctx)` preserves `ctx`'s provenance. Uses same `while (prov_root->kind == NODE_INTRINSIC) walk` pattern as BUG-355 (assignment escape).

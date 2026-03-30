@@ -343,9 +343,28 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 | zercheck changes 1-3 | v0.2.2 (now) | ~90 | **None** | No |
 | zercheck change 4 (cross-func) | v0.3 | ~300 | **None** | No |
 | Value range propagation | v0.3 | ~300-500 | **None** | No |
-| Forced division guard | v0.3 | ~20 | **None** (new compile error only) | Existing unguarded divisions become errors |
+| Forced division guard | v0.3 | ~20 | **None** (new compile error only) | Unguarded divisions become errors |
+| Forced bounds guard | v0.3 | ~20 | **None** (new compile error only) | Unguarded indexing becomes errors |
+| Forced keep on fn ptr returns | v0.3 | ~10 | **None** (extends existing `keep`) | Fn ptrs returning pointer need `keep` params |
 
-Total: ~710-910 lines of compiler logic. Zero language changes. Zero new keywords. Zero new types. One new compile error (division requires proven nonzero divisor).
+Total: ~740-940 lines of compiler logic. Zero new language syntax. Three new compile errors. One existing keyword (`keep`) extended to function pointer types.
+
+### Remaining Inherent Runtime Checks (Cannot Be Compile-Time)
+
+These are runtime checks that ZER keeps because the information is **physically unknowable** at compile time. SPARK/Ada comparison included.
+
+| Check | ZER | SPARK/Ada | Why runtime is inherent |
+|-------|-----|-----------|------------------------|
+| `*opaque` variable-index `arr[i]` | Runtime type_id trap | **N/A** (no void* in SPARK) | `i` is a runtime value — can't know which element |
+| @cstr variable slice (unguarded) | Runtime overflow trap | **N/A** (no @cstr in SPARK) | Slice length is runtime input |
+| Arena alloc overflow | Runtime `__builtin_mul_overflow` | **N/A** (no arena in SPARK, stack only) | Multiplication overflow depends on runtime `n` |
+| MMIO computed address (rare) | Runtime range trap | Same (runtime check) | Address computed from runtime value |
+
+**Key insight:** 3 out of 4 remaining runtime checks exist because ZER has features SPARK doesn't have (`*opaque`, `@cstr`, Arena). SPARK avoids the runtime by not having the feature at all. ZER has the feature AND makes it safe via runtime traps.
+
+The 4th (MMIO computed address) is the same in both — inherently runtime. SPARK doesn't do better here.
+
+**ZER's philosophy: have the feature, make it safe. SPARK's philosophy: don't have the feature.**
 
 ### Original (preserved for reference)
 
@@ -550,20 +569,40 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Forced ranged indexing | **REPLACED** | Not needed — compiler auto-eliminates checks when guards exist |
 | Iterators (`for in`) | **NOT NEEDED for safety** | Range propagation handles `for (i = 0; i < len; ...)` loops. Iterators may be added later as ergonomic improvement, not a safety feature. |
 
-### FINAL PLAN: Two Compiler Features + One Forced Rule, Zero Language Complexity
+### FINAL PLAN: Two Compiler Features + Three Forced Rules, Zero New Syntax
 
 | Feature | Type | Language change | Implementation |
 |---------|------|----------------|----------------|
 | zercheck 1-4 | Compiler improvement | **None** | ~400 lines in zercheck.c |
 | Value range propagation | Compiler improvement | **None** | ~300-500 lines in checker.c |
-| Forced division guard | Compiler rule | **None** (just a new error) | ~20 lines in checker.c |
+| Forced division guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
+| Forced bounds guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
+| Forced keep on fn ptr params | Compiler rule | **None** (extends existing `keep`) | ~10 lines in checker.c |
 
-**All three are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, and forces one more safety invariant (divisor nonzero). No new types, no new keywords, no new syntax.
+**All five are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, and forces three safety invariants. No new types, no new keywords, no new syntax.
 
-**Forced division** is the same pattern as existing forced rules:
+**Forced rules** — same pattern as existing forced rules:
 - `*T` requires initializer (already forced)
 - `?T` requires `orelse` or `if |capture|` (already forced)
-- Division requires proven nonzero divisor (NEW — closes last C UB gap)
+- Division requires proven nonzero divisor (NEW)
+- Array/slice indexing requires proven in-range index (NEW)
+- Function pointers returning pointer with pointer params require `keep` on those params (NEW — extends existing `keep` keyword)
+
+```zer
+// Forced division: compiler error if divisor not proven nonzero
+u32 avg = total / count;          // ERROR: 'count' not proven nonzero
+if (count == 0) { return; }
+u32 avg = total / count;          // OK — guard proves nonzero
+
+// Forced bounds: compiler error if index not proven in range
+buf[i] = 5;                        // ERROR: 'i' not proven < buf.len
+if (i >= buf.len) { return; }
+buf[i] = 5;                        // OK — guard proves in range
+
+// Forced keep on function pointer returning pointer:
+*u32 (*fn)(*u32) = f;              // ERROR: pointer param must be 'keep'
+*u32 (*fn)(keep *u32) = f;         // OK — caller must pass global/static
+```
 
 **Iterators are NOT on the safety roadmap.** They may be added in the future as a syntax convenience (ergonomics), but they are not needed for compile-time safety — value range propagation covers the same loop patterns. If iterators are added, it's a separate decision driven by programmer ergonomics, not safety.
 
@@ -571,14 +610,14 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 
 | C Undefined Behavior | ZER Prevention | Type |
 |----------------------|----------------|------|
-| Buffer overflow | Bounds check (runtime) + range propagation (compile-time) | Automatic |
+| Buffer overflow | **Forced in-range proof** + range propagation | **Forced** |
 | Null pointer deref | `*T` non-null, `?T` forced `orelse` | Forced |
 | Use-after-free | Handle gen counter + zercheck | Automatic |
 | Division by zero | **Forced nonzero proof** | **Forced** |
 | Signed overflow | Defined as wrapping (`-fwrapv`) | Automatic |
 | Uninitialized memory | Auto-zero everything | Automatic |
 | Double free | Handle gen counter + zercheck | Automatic |
-| Out-of-bounds pointer | Scope escape analysis | Automatic |
+| Out-of-bounds pointer | Scope escape analysis + **forced keep on fn ptrs** | Forced + Automatic |
 | Type confusion (void*) | `_zer_opaque` runtime type tag + compile-time provenance | Automatic |
 | Volatile access reorder | Qualifier tracking on all casts | Automatic |
 
@@ -598,7 +637,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |
 | MMIO range | **~99%** | Computed variable addresses (rare) |
-| @cstr overflow | **~90%** | Unguarded variable slice (range propagation proves guarded slices fit) |
+| @cstr overflow | **~90%** | Unguarded variable slice (range propagation proves guarded slices fit, not forced) |
 | Arena overflow | **0%** | Inherently runtime |
 
 **Overall: ~97% compile-time for guarded code, ~92% for unguarded code.**

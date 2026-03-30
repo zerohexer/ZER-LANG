@@ -1935,3 +1935,27 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `resolve_type` for TYNODE_POINTER and TYNODE_SLICE didn't check inner type for TYPE_VOID.
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
+
+### BUG-373: is_literal_compatible uses host sizeof(size_t) for usize range
+- **Symptom:** `usize x = 5000000000` accepted on 64-bit host compiling for 32-bit target (--target-bits 32). Value truncated silently by target GCC.
+- **Root cause:** Two issues: (1) `is_literal_compatible` used `sizeof(size_t) == 8` (host) instead of `zer_target_ptr_bits == 64` (target). (2) Integer literals default to `ty_u32`, so `can_implicit_coerce(u32, usize)` succeeded before `is_literal_compatible` was ever checked — oversized values bypassed range validation.
+- **Fix:** Changed `is_literal_compatible` to use `zer_target_ptr_bits`. Added explicit literal range checks in NODE_VAR_DECL, NODE_ASSIGN, and NODE_GLOBAL_VAR that fire AFTER coercion passes — always validates integer literal values against target type range.
+- **Test:** 3 tests added: 5B rejected on 32-bit, accepted on 64-bit, u32_max accepted on 32-bit.
+
+### BUG-374: Nested identity washing bypass via nested calls
+- **Symptom:** `return identity(identity(&x))` bypassed BUG-360 escape check. Outer call saw NODE_CALL arg, not NODE_IDENT or NODE_UNARY(&).
+- **Root cause:** BUG-360 only checked direct args of the call for &local/local-derived. Nested calls hid the local pointer one level deep.
+- **Fix:** Added `call_has_local_derived_arg()` recursive helper. Checks args for &local, local-derived idents, AND recurses into pointer-returning NODE_CALL args (max depth 8). Used in both NODE_RETURN and NODE_VAR_DECL BUG-360 paths.
+- **Test:** 2 tests added: triple-nested identity caught, identity(&global) allowed.
+
+### BUG-375: Missing type validation for pointer intrinsics
+- **Symptom:** `@inttoptr(u32, addr)`, `@ptrcast(u32, ptr)`, `@container(*S, non_ptr, f)` compiled — produced invalid C that GCC rejected.
+- **Root cause:** @inttoptr and @ptrcast validated source types but not target type (must be pointer). @container didn't validate that first arg is a pointer.
+- **Fix:** Added target type checks: @inttoptr → `result` must be TYPE_POINTER. @ptrcast → `result` must be TYPE_POINTER or TYPE_FUNC_PTR. @container → first arg must be TYPE_POINTER.
+- **Test:** 3 tests added: each intrinsic with non-pointer target/source rejected.
+
+### BUG-377: Local array escape via orelse fallback
+- **Symptom:** `g_slice = opt orelse local_buf` — global slice got pointer to stack memory. Orelse fallback provided a local array as slice, unchecked.
+- **Root cause:** BUG-240 assignment check and BUG-203 var_decl check only inspected direct value, not orelse fallback branches.
+- **Fix:** Both NODE_ASSIGN (BUG-240) and NODE_VAR_DECL (BUG-203) now also check orelse fallback for local array roots. Assignment path collects both direct value and orelse fallback into `arr_checks[]`. Var_decl path iterates over init + fallback in `arr_roots[]`.
+- **Test:** 2 tests added: orelse array assign to global, orelse array var_decl then assign to global.

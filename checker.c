@@ -223,7 +223,7 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         case TYPE_U16:   return val <= 65535;
         case TYPE_U32:   return val <= 0xFFFFFFFFULL;
         case TYPE_U64:   return true;
-        case TYPE_USIZE: return val <= (sizeof(size_t) == 8 ? UINT64_MAX : 0xFFFFFFFFULL);
+        case TYPE_USIZE: return val <= (zer_target_ptr_bits == 64 ? UINT64_MAX : 0xFFFFFFFFULL);
         case TYPE_I8:    return val <= 127;
         case TYPE_I16:   return val <= 32767;
         case TYPE_I32:   return val <= 2147483647ULL;
@@ -258,6 +258,48 @@ static bool is_literal_compatible(Node *expr, Type *target) {
 }
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
+
+/* BUG-374: recursively check if a call expression has any local-derived pointer
+ * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
+ * which itself has &x. We recurse into nested calls (max depth 8 to prevent
+ * pathological input). Returns true if any arg is &local or local-derived. */
+static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
+    if (!call || call->kind != NODE_CALL || depth > 8) return false;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        Node *arg = call->call.args[i];
+        /* direct &local */
+        if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+            Node *root = arg->unary.operand;
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                if (root->kind == NODE_FIELD) root = root->field.object;
+                else root = root->index_expr.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                bool is_global = scope_lookup_local(c->global_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                Symbol *src = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (src && !src->is_static && !is_global) return true;
+            }
+        }
+        /* local-derived ident */
+        if (arg->kind == NODE_IDENT) {
+            Symbol *src = scope_lookup(c->current_scope,
+                arg->ident.name, (uint32_t)arg->ident.name_len);
+            if (src && (src->is_local_derived || src->is_arena_derived))
+                return true;
+        }
+        /* nested call returning pointer — recurse */
+        if (arg->kind == NODE_CALL) {
+            Type *arg_type = typemap_get(c, arg);
+            if (arg_type && type_unwrap_distinct(arg_type)->kind == TYPE_POINTER) {
+                if (call_has_local_derived_arg(c, arg, depth + 1))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
 
 /* ================================================================
  * TYPE RESOLUTION: TypeNode (syntactic) → Type (semantic)
@@ -1386,38 +1428,55 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-240: nested array→slice escape via assignment to global/static.
-         * global_s = s.arr where s is local — walk value chain to root. */
-        if (node->assign.op == TOK_EQ && value && value->kind == TYPE_ARRAY &&
-            target && target->kind == TYPE_SLICE) {
-            Node *vroot = node->assign.value;
-            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
-                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
-                else vroot = vroot->index_expr.object;
+        /* BUG-240/377: nested array→slice escape via assignment to global/static.
+         * global_s = s.arr where s is local — walk value chain to root.
+         * BUG-377: also check orelse fallback — g_slice = opt orelse local_buf. */
+        if (node->assign.op == TOK_EQ && target && target->kind == TYPE_SLICE) {
+            /* collect value nodes to check: direct value + orelse fallback */
+            Node *arr_checks[2] = { NULL, NULL };
+            int arr_check_count = 0;
+            if (value && value->kind == TYPE_ARRAY) {
+                arr_checks[arr_check_count++] = node->assign.value;
             }
-            if (vroot && vroot->kind == NODE_IDENT) {
-                Symbol *vsym = scope_lookup(c->current_scope,
-                    vroot->ident.name, (uint32_t)vroot->ident.name_len);
-                bool val_is_global = vsym &&
-                    (vsym->is_static || scope_lookup_local(c->global_scope,
-                        vsym->name, vsym->name_len) != NULL);
-                if (vsym && !val_is_global) {
-                    /* value root is local — check if target is global/static */
-                    Node *troot = node->assign.target;
-                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                        else troot = troot->index_expr.object;
-                    }
-                    if (troot && troot->kind == NODE_IDENT) {
-                        Symbol *tsym = scope_lookup(c->current_scope,
-                            troot->ident.name, (uint32_t)troot->ident.name_len);
-                        bool tgt_is_global = tsym &&
-                            (tsym->is_static || scope_lookup_local(c->global_scope,
-                                tsym->name, tsym->name_len) != NULL);
-                        if (tgt_is_global) {
-                            checker_error(c, node->loc.line,
-                                "cannot store local array as slice in global/static — "
-                                "pointer will dangle after function returns");
+            /* BUG-377: orelse fallback may be a local array */
+            if (node->assign.value->kind == NODE_ORELSE &&
+                node->assign.value->orelse.fallback) {
+                Node *fb = node->assign.value->orelse.fallback;
+                Type *fb_type = typemap_get(c, fb);
+                if (fb_type && type_unwrap_distinct(fb_type)->kind == TYPE_ARRAY) {
+                    arr_checks[arr_check_count++] = fb;
+                }
+            }
+            for (int aci = 0; aci < arr_check_count; aci++) {
+                Node *vroot = arr_checks[aci];
+                while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                    if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                    else vroot = vroot->index_expr.object;
+                }
+                if (vroot && vroot->kind == NODE_IDENT) {
+                    Symbol *vsym = scope_lookup(c->current_scope,
+                        vroot->ident.name, (uint32_t)vroot->ident.name_len);
+                    bool val_is_global = vsym &&
+                        (vsym->is_static || scope_lookup_local(c->global_scope,
+                            vsym->name, vsym->name_len) != NULL);
+                    if (vsym && !val_is_global) {
+                        /* value root is local — check if target is global/static */
+                        Node *troot = node->assign.target;
+                        while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                            if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                            else troot = troot->index_expr.object;
+                        }
+                        if (troot && troot->kind == NODE_IDENT) {
+                            Symbol *tsym = scope_lookup(c->current_scope,
+                                troot->ident.name, (uint32_t)troot->ident.name_len);
+                            bool tgt_is_global = tsym &&
+                                (tsym->is_static || scope_lookup_local(c->global_scope,
+                                    tsym->name, tsym->name_len) != NULL);
+                            if (tgt_is_global) {
+                                checker_error(c, node->loc.line,
+                                    "cannot store local array as slice in global/static — "
+                                    "pointer will dangle after function returns");
+                            }
                         }
                     }
                 }
@@ -1610,6 +1669,16 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "cannot assign '%s' to '%s'",
                     type_name(value), type_name(target));
+            }
+            /* BUG-373: integer literal range check on assignment */
+            if (node->assign.value->kind == NODE_INT_LIT &&
+                target && type_is_integer(type_unwrap_distinct(target))) {
+                if (!is_literal_compatible(node->assign.value, target)) {
+                    checker_error(c, node->loc.line,
+                        "integer literal %llu does not fit in '%s'",
+                        (unsigned long long)node->assign.value->int_lit.value,
+                        type_name(target));
+                }
             }
         } else {
             /* compound assignment: += -= etc. — both must be numeric */
@@ -2680,9 +2749,18 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = ty_usize;
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
-            /* @ptrcast(*T, expr) → *T — source must be a pointer */
+            /* @ptrcast(*T, expr) → *T — source AND target must be pointers */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-375: target type must be a pointer */
+                if (result) {
+                    Type *res_eff = type_unwrap_distinct(result);
+                    if (res_eff->kind != TYPE_POINTER && res_eff->kind != TYPE_FUNC_PTR) {
+                        checker_error(c, node->loc.line,
+                            "@ptrcast target must be a pointer type, got '%s'",
+                            type_name(result));
+                    }
+                }
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
@@ -2834,9 +2912,18 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
-            /* @inttoptr(*T, addr) — addr must be an integer */
+            /* @inttoptr(*T, addr) — addr must be an integer, target must be pointer */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-375: target type must be a pointer */
+                if (result) {
+                    Type *res_eff = type_unwrap_distinct(result);
+                    if (res_eff->kind != TYPE_POINTER) {
+                        checker_error(c, node->loc.line,
+                            "@inttoptr target must be a pointer type, got '%s'",
+                            type_name(result));
+                    }
+                }
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
@@ -2936,6 +3023,18 @@ static Type *check_expr(Checker *c, Node *node) {
             /* @container(*T, ptr, field) — reverse of &struct.field */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-375: first arg (ptr) must be a pointer */
+                if (node->intrinsic.arg_count > 0) {
+                    Type *ptr_type = typemap_get(c, node->intrinsic.args[0]);
+                    if (ptr_type) {
+                        Type *ptr_eff = type_unwrap_distinct(ptr_type);
+                        if (ptr_eff->kind != TYPE_POINTER) {
+                            checker_error(c, node->loc.line,
+                                "@container source must be a pointer, got '%s'",
+                                type_name(ptr_type));
+                        }
+                    }
+                }
                 /* validate field exists in target struct */
                 Type *tgt = type_unwrap_distinct(result);
                 if (tgt && tgt->kind == TYPE_POINTER) tgt = type_unwrap_distinct(tgt->pointer.inner);
@@ -3245,6 +3344,18 @@ static void check_stmt(Checker *c, Node *node) {
                         type_name(type), type_name(init_type));
                 }
             }
+            /* BUG-373: integer literal range check — even if coercion passed,
+             * verify the literal value fits the target type. Literals default
+             * to ty_u32 so can_implicit_coerce may accept oversized values. */
+            if (node->var_decl.init->kind == NODE_INT_LIT &&
+                type && type_is_integer(type_unwrap_distinct(type))) {
+                if (!is_literal_compatible(node->var_decl.init, type)) {
+                    checker_error(c, node->loc.line,
+                        "integer literal %llu does not fit in '%s'",
+                        (unsigned long long)node->var_decl.init->int_lit.value,
+                        type_name(type));
+                }
+            }
         }
 
         Symbol *sym = add_symbol(c, node->var_decl.name,
@@ -3365,33 +3476,43 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-203/207: slice from local array — mark as local-derived.
+            /* BUG-203/207/377: slice from local array — mark as local-derived.
              * []T s = local_array OR []T s = local_array[1..4]
-             * Both create a slice pointing to stack memory. */
+             * Both create a slice pointing to stack memory.
+             * BUG-377: also check orelse fallback — s = opt orelse local_buf. */
             if (node->var_decl.init && type && type->kind == TYPE_SLICE) {
-                Node *slice_root = node->var_decl.init;
-                /* walk through NODE_SLICE to find the object being sliced */
-                if (slice_root->kind == NODE_SLICE)
-                    slice_root = slice_root->slice.object;
-                /* walk field/index chains */
-                while (slice_root && (slice_root->kind == NODE_FIELD ||
-                                       slice_root->kind == NODE_INDEX)) {
-                    if (slice_root->kind == NODE_FIELD) slice_root = slice_root->field.object;
-                    else slice_root = slice_root->index_expr.object;
+                /* collect nodes to check: direct init + orelse fallback */
+                Node *arr_roots[2] = { node->var_decl.init, NULL };
+                int arr_root_count = 1;
+                if (node->var_decl.init->kind == NODE_ORELSE &&
+                    node->var_decl.init->orelse.fallback) {
+                    arr_roots[arr_root_count++] = node->var_decl.init->orelse.fallback;
                 }
-                if (slice_root && slice_root->kind == NODE_IDENT) {
-                    Type *root_type = typemap_get(c, slice_root);
-                    Symbol *src = scope_lookup(c->current_scope,
-                        slice_root->ident.name,
-                        (uint32_t)slice_root->ident.name_len);
-                    /* BUG-214: also propagate if source is already local-derived (slice-to-slice) */
-                    if (src && src->is_local_derived) {
-                        sym->is_local_derived = true;
-                    } else if (root_type && root_type->kind == TYPE_ARRAY) {
-                        bool is_global = src && scope_lookup_local(c->global_scope,
-                            src->name, src->name_len) != NULL;
-                        if (src && !src->is_static && !is_global) {
+                for (int ari = 0; ari < arr_root_count; ari++) {
+                    Node *slice_root = arr_roots[ari];
+                    /* walk through NODE_SLICE to find the object being sliced */
+                    if (slice_root->kind == NODE_SLICE)
+                        slice_root = slice_root->slice.object;
+                    /* walk field/index chains */
+                    while (slice_root && (slice_root->kind == NODE_FIELD ||
+                                           slice_root->kind == NODE_INDEX)) {
+                        if (slice_root->kind == NODE_FIELD) slice_root = slice_root->field.object;
+                        else slice_root = slice_root->index_expr.object;
+                    }
+                    if (slice_root && slice_root->kind == NODE_IDENT) {
+                        Type *root_type = typemap_get(c, slice_root);
+                        Symbol *src = scope_lookup(c->current_scope,
+                            slice_root->ident.name,
+                            (uint32_t)slice_root->ident.name_len);
+                        /* BUG-214: also propagate if source is already local-derived (slice-to-slice) */
+                        if (src && src->is_local_derived) {
                             sym->is_local_derived = true;
+                        } else if (root_type && type_unwrap_distinct(root_type)->kind == TYPE_ARRAY) {
+                            bool is_global = src && scope_lookup_local(c->global_scope,
+                                src->name, src->name_len) != NULL;
+                            if (src && !src->is_static && !is_global) {
+                                sym->is_local_derived = true;
+                            }
                         }
                     }
                 }
@@ -3457,41 +3578,17 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-360: function call returning pointer — if any pointer arg is
+            /* BUG-360/374: function call returning pointer — if any pointer arg is
              * local-derived, conservatively mark the result as local-derived.
-             * identity(&x) returns &x, must not escape. */
+             * identity(&x) returns &x, must not escape.
+             * BUG-374: recurse into nested calls — identity(identity(&x)). */
             if (sym && node->var_decl.init && type &&
                 type->kind == TYPE_POINTER) {
                 Node *call = node->var_decl.init;
                 if (call->kind == NODE_ORELSE) call = call->orelse.expr;
                 if (call->kind == NODE_CALL) {
-                    for (int ai = 0; ai < call->call.arg_count; ai++) {
-                        Node *arg = call->call.args[ai];
-                        /* direct &local */
-                        if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
-                            Node *root = arg->unary.operand;
-                            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                                if (root->kind == NODE_FIELD) root = root->field.object;
-                                else root = root->index_expr.object;
-                            }
-                            if (root && root->kind == NODE_IDENT) {
-                                bool is_global = scope_lookup_local(c->global_scope,
-                                    root->ident.name, (uint32_t)root->ident.name_len) != NULL;
-                                Symbol *asrc = scope_lookup(c->current_scope,
-                                    root->ident.name, (uint32_t)root->ident.name_len);
-                                if (asrc && !asrc->is_static && !is_global)
-                                    sym->is_local_derived = true;
-                            }
-                        }
-                        /* local-derived ident arg */
-                        if (arg->kind == NODE_IDENT) {
-                            Symbol *asrc = scope_lookup(c->current_scope,
-                                arg->ident.name, (uint32_t)arg->ident.name_len);
-                            if (asrc && asrc->is_local_derived)
-                                sym->is_local_derived = true;
-                            if (asrc && asrc->is_arena_derived)
-                                sym->is_arena_derived = true;
-                        }
+                    if (call_has_local_derived_arg(c, call, 0)) {
+                        sym->is_local_derived = true;
                     }
                 }
             }
@@ -4210,42 +4307,16 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-360: return func(&local) — function call with local-derived pointer arg
-             * returning a pointer type. Conservatively assume result may be local-derived. */
+            /* BUG-360/374: return func(&local) — function call with local-derived
+             * pointer arg returning a pointer type. Conservatively assume result
+             * may be local-derived. BUG-374: recurse into nested calls —
+             * return identity(identity(&x)) must also be caught. */
             if (node->ret.expr->kind == NODE_CALL &&
                 ret_type && ret_type->kind == TYPE_POINTER) {
-                Node *call = node->ret.expr;
-                for (int ai = 0; ai < call->call.arg_count; ai++) {
-                    Node *arg = call->call.args[ai];
-                    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
-                        Node *root = arg->unary.operand;
-                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                            if (root->kind == NODE_FIELD) root = root->field.object;
-                            else root = root->index_expr.object;
-                        }
-                        if (root && root->kind == NODE_IDENT) {
-                            bool is_global = scope_lookup_local(c->global_scope,
-                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
-                            Symbol *asrc = scope_lookup(c->current_scope,
-                                root->ident.name, (uint32_t)root->ident.name_len);
-                            if (asrc && !asrc->is_static && !is_global) {
-                                checker_error(c, node->loc.line,
-                                    "cannot return result of call with local address '&%.*s' — "
-                                    "stack memory may escape through function return",
-                                    (int)asrc->name_len, asrc->name);
-                            }
-                        }
-                    }
-                    if (arg->kind == NODE_IDENT) {
-                        Symbol *asrc = scope_lookup(c->current_scope,
-                            arg->ident.name, (uint32_t)arg->ident.name_len);
-                        if (asrc && asrc->is_local_derived) {
-                            checker_error(c, node->loc.line,
-                                "cannot return result of call with local-derived pointer '%.*s' — "
-                                "stack memory may escape through function return",
-                                (int)asrc->name_len, asrc->name);
-                        }
-                    }
+                if (call_has_local_derived_arg(c, node->ret.expr, 0)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return result of call with local-derived pointer argument — "
+                        "stack memory may escape through function return");
                 }
             }
 
@@ -4994,6 +5065,16 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     "cannot initialize '%.*s' of type '%s' with '%s'",
                     (int)decl->var_decl.name_len, decl->var_decl.name,
                     type_name(type), type_name(init));
+            }
+            /* BUG-373: integer literal range check for globals */
+            if (decl->var_decl.init->kind == NODE_INT_LIT &&
+                type && type_is_integer(type_unwrap_distinct(type))) {
+                if (!is_literal_compatible(decl->var_decl.init, type)) {
+                    checker_error(c, decl->loc.line,
+                        "integer literal %llu does not fit in '%s'",
+                        (unsigned long long)decl->var_decl.init->int_lit.value,
+                        type_name(type));
+                }
             }
         }
     }

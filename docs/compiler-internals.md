@@ -1450,3 +1450,19 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
+
+### Integer Literal Range Uses Target Width (BUG-373)
+`is_literal_compatible` for TYPE_USIZE now uses `zer_target_ptr_bits == 64` instead of `sizeof(size_t) == 8`. Additionally, all integer literal initializations (var_decl, assign, global var) now run `is_literal_compatible` AFTER coercion passes — catches oversized values that slip through `can_implicit_coerce` because literals default to `ty_u32`. `usize x = 5000000000` rejected on 32-bit target, accepted on 64-bit.
+
+### Nested Identity Washing Blocked (BUG-374)
+`call_has_local_derived_arg()` recursive helper added at checker.c top. Scans call args for `&local`, `is_local_derived` idents, AND recurses into pointer-returning `NODE_CALL` args (max depth 8). Used by both NODE_RETURN and NODE_VAR_DECL BUG-360 paths. `return identity(identity(&x))` now caught — previously only the outermost call's direct args were checked.
+
+### Intrinsic Target Type Validation (BUG-375)
+Three intrinsics now validate target/source pointer types:
+- `@inttoptr(T, addr)` — `T` must be TYPE_POINTER (was unchecked, could emit broken C with non-pointer target)
+- `@ptrcast(T, expr)` — `T` must be TYPE_POINTER or TYPE_FUNC_PTR (source already validated, target was not)
+- `@container(*T, ptr, field)` — `ptr` arg must be TYPE_POINTER (was unchecked)
+All checks unwrap TYPE_DISTINCT before comparing.
+
+### Orelse Array Escape to Global (BUG-377)
+Both NODE_ASSIGN (BUG-240 path) and NODE_VAR_DECL (BUG-203 path) now check orelse fallback for local array roots. `g_slice = opt orelse local_buf` — the assignment path collects both direct value AND `orelse.fallback` into `arr_checks[]`, iterates each. Var_decl path does the same with `arr_roots[]`. Catches local array provided as orelse fallback being stored in global/static slices.

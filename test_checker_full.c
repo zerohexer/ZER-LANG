@@ -1507,6 +1507,58 @@ static void test_negative_sweep(void) {
         zer_target_ptr_bits = saved;
     }
 
+    /* BUG-373: integer literal range check uses target width, not host */
+    {
+        int saved = zer_target_ptr_bits;
+        zer_target_ptr_bits = 32;
+        err("u32 main() { usize x = 5000000000; return 0; }",
+            "BUG-373: 5B literal rejected on 32-bit usize");
+        ok("u32 main() { usize x = 4294967295; return 0; }",
+           "BUG-373: u32 max literal accepted on 32-bit usize");
+        zer_target_ptr_bits = 64;
+        ok("u32 main() { usize x = 5000000000; return @truncate(u32, x); }",
+           "BUG-373: 5B literal accepted on 64-bit usize");
+        zer_target_ptr_bits = saved;
+    }
+
+    /* BUG-374: nested identity washing via nested calls */
+    err("*u32 identity(*u32 p) { return p; }\n"
+        "*u32 leak() { u32 x = 5; return identity(identity(&x)); }\n"
+        "u32 main() { return 0; }",
+        "BUG-374: nested identity(identity(&x)) return caught");
+    ok("u32 g_val = 1;\n"
+       "*u32 identity(*u32 p) { return p; }\n"
+       "*u32 safe() { return identity(&g_val); }\n"
+       "u32 main() { return 0; }",
+       "BUG-374: identity(&global) return allowed");
+
+    /* BUG-377: local array escape via orelse fallback */
+    err("[]u8 g_slice;\n"
+        "void leak(?[]u8 opt) {\n"
+        "    u8[10] local_buf;\n"
+        "    g_slice = opt orelse local_buf;\n"
+        "}\n"
+        "u32 main() { return 0; }",
+        "BUG-377: orelse local array assign to global caught");
+    err("[]u8 g_slice;\n"
+        "void leak(?[]u8 opt) {\n"
+        "    u8[10] local_buf;\n"
+        "    []u8 s = opt orelse local_buf;\n"
+        "    g_slice = s;\n"
+        "}\n"
+        "u32 main() { return 0; }",
+        "BUG-377: orelse local array var_decl then assign to global caught");
+
+    /* BUG-375: missing target type validation for pointer intrinsics */
+    err("mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+        "u32 main() { u32 x = @inttoptr(u32, 0x1000); return 0; }",
+        "BUG-375: @inttoptr non-pointer target rejected");
+    err("u32 main() { u32 x = 5; *u32 p = &x; u32 y = @ptrcast(u32, p); return 0; }",
+        "BUG-375: @ptrcast non-pointer target rejected");
+    err("struct Node { u32 data; u32 next; }\n"
+        "u32 main() { Node n; *Node p = @container(*Node, n.data, data); return 0; }",
+        "BUG-375: @container non-pointer source rejected");
+
     /* BUG-310: volatile slice qualifier */
     err("volatile u8[16] hw_regs;\n"
         "void poll([]u8 regs) { while (regs[0] == 0) { } }\n"

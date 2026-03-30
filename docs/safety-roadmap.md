@@ -598,7 +598,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |
 | MMIO range | **~99%** | Computed variable addresses (rare) |
-| @cstr overflow | **~50%** | Variable slice source |
+| @cstr overflow | **~90%** | Unguarded variable slice (range propagation proves guarded slices fit) |
 | Arena overflow | **0%** | Inherently runtime |
 
 **Overall: ~97% compile-time for guarded code, ~92% for unguarded code.**
@@ -679,6 +679,15 @@ typedef struct {
 - Literal assignment
 - Reset on unknown assignment
 - Propagation through simple arithmetic (`x + 1` shifts range by 1)
+- `@cstr` overflow: if source slice length proven < buffer size via guard, skip runtime check (improves @cstr from ~50% to ~90% compile-time)
+
+**@cstr example (range propagation eliminates runtime check):**
+```zer
+u8[256] buf;
+if (n >= 255) { return; }        // guard: n now in 0..254
+@cstr(buf, data[0..n]);          // compiler: n + 1 <= 255 < 256 — skip check
+```
+Without guard: runtime check stays (safe, not forced — @cstr overflow is not C UB, it's a clean ZER trap).
 
 **Does NOT handle (acceptable):**
 - Cross-function range inference (would need function summaries)

@@ -1075,6 +1075,106 @@ Array-level *opaque provenance (independent — extends existing prov_map)
 **Then:** value range propagation (biggest impact, ~300-500 lines)
 **Then:** everything else (all small, all independent)
 
+### Code Location Guide (WHERE to implement each feature)
+
+**Read `docs/compiler-internals.md` first — it documents every pattern in the codebase.**
+
+#### zercheck changes 1-3 (MAYBE_FREED, leak detection, loop pass)
+
+**File:** `zercheck.c` (~600 lines total)
+
+- **HandleState enum** → `zercheck.h:24-28` — add `HS_MAYBE_FREED` after `HS_FREED`
+- **if/else merge logic** → `zercheck.c:444` — currently "mark freed only if freed on BOTH paths." Change: if one branch frees and other doesn't → `HS_MAYBE_FREED`
+- **if-without-else merge** → `zercheck.c:457-464` — currently "conservatively keep as ALIVE." Change: if then-branch frees → `HS_MAYBE_FREED`
+- **Use of MAYBE_FREED** → `zercheck.c:175` (pool.get check) and `zercheck.c:147` (pool.free check) — add: `if (h->state == HS_MAYBE_FREED) error("handle may have been freed")`
+- **Leak detection** → `zercheck.c:559-582` (zc_check_function) — at end, scan PathState for any `HS_ALIVE` handles → warning "handle leaked without free"
+- **Overwrite detection** → `zercheck.c:280-290` (alloc assignment) — if target handle already `HS_ALIVE` → warning "overwriting live handle"
+- **Loop second pass** → `zercheck.c:472-500` (NODE_FOR/NODE_WHILE) — after first pass, check if any state changed. If yes, run body once more. If still changing → widen to `HS_MAYBE_FREED`
+
+#### zercheck change 4 (cross-function analysis)
+
+**File:** `zercheck.c`
+
+- **Function summaries** — new data structure: `{ func_name, frees_param[N], stores_param[N] }`. Pre-scan all functions before main analysis.
+- **Summary building** → scan each function body for `pool.free(param_name)` patterns. Record which parameter index gets freed.
+- **Summary usage** → in `zc_check_call` (`zercheck.c:172`), when calling a non-builtin function, look up summary. If summary says "frees param 1", mark the argument handle as freed in caller's PathState.
+- **Reuses** `zc_check_function` (`zercheck.c:559`) infrastructure — same AST walking, just recording instead of reporting.
+
+#### Value range propagation
+
+**File:** `checker.c`
+
+- **Data structure** — add to `checker.h` (Checker struct):
+  ```c
+  typedef struct { const char *name; uint32_t name_len; int64_t min_val; int64_t max_val; bool known_nonzero; } VarRange;
+  VarRange *var_ranges; int var_range_count; int var_range_capacity;
+  ```
+- **Set ranges** — in `check_stmt` NODE_IF (`checker.c:~3624`): when condition is `NODE_BINARY` with `TOK_LT`/`TOK_GTEQ`/`TOK_EQEQ`/`TOK_BANGEQ`, and one side is `NODE_IDENT` and other is constant/known, narrow the ident's range in the taken branch.
+- **Set ranges in loops** — in `check_stmt` NODE_FOR (`checker.c:~3750`): extract condition variable and bound from `for (i = 0; i < N; ...)`, set `i.min = 0, i.max = N-1` inside body.
+- **Check bounds** — in `check_expr` NODE_INDEX (`checker.c:~900`): look up index ident in var_ranges. If `max_val < array_size`, skip runtime check (tell emitter via flag on node or typemap).
+- **Check division** — in `check_expr` NODE_BINARY TOK_SLASH/TOK_PERCENT (`checker.c:~850`): look up divisor in var_ranges. If `known_nonzero` or `min_val > 0`, skip runtime check.
+- **Reset on assignment** — in `check_stmt` NODE_ASSIGN/NODE_VAR_DECL: if target ident has a range, reset it (unless assigning from a literal or known-range source).
+- **Emitter interface** — either add a `bool bounds_proven` flag to NODE_INDEX in ast.h, or use typemap to store "this index was proven safe." The emitter checks this flag and skips the `_zer_bounds_check` call.
+
+#### Forced division guard
+
+**File:** `checker.c`
+
+- **Location** → `check_expr` NODE_BINARY, cases TOK_SLASH and TOK_PERCENT (`checker.c:~850`)
+- **Logic** → after computing right operand type, check: is divisor a literal nonzero? Is divisor in var_ranges with `known_nonzero`? If neither, `checker_error("divisor not proven nonzero")`
+- **Depends on** value range propagation being implemented first (otherwise the guard-based proof doesn't work)
+
+#### Forced bounds guard
+
+**File:** `checker.c`
+
+- **Location** → `check_expr` NODE_INDEX (`checker.c:~900`)
+- **Logic** → after computing index type, check: is index a literal < array_size? Is index in var_ranges with `max_val < array_size`? If neither, `checker_error("index not proven in range")`
+- **Depends on** value range propagation being implemented first
+
+#### Auto-orelse for @cstr
+
+**Files:** `checker.c` + `emitter.c`
+
+- **Checker** → in `check_expr` NODE_INTRINSIC, @cstr handler (`checker.c:~3080`): when @cstr is used as `NODE_EXPR_STMT` (expression statement) without being wrapped in `NODE_ORELSE`, auto-wrap. OR: do it in `check_stmt` NODE_EXPR_STMT — detect @cstr call without orelse, insert synthetic orelse node.
+- **Emitter** → in `emit_expr` NODE_INTRINSIC, @cstr handler (`emitter.c:~1830`): if the @cstr has auto-orelse flag, emit the orelse path with function return type's zero value. Use `e->current_func_ret` (already available on Emitter struct).
+- **Zero value emission** → already exists in emitter for auto-zero global vars and return-null paths. Reuse: `TYPE_VOID → return`, `TYPE_U32 → return 0`, `TYPE_BOOL → return 0`, `TYPE_POINTER → return NULL`, `TYPE_OPTIONAL → return {0}`.
+
+#### Auto-keep on function pointer pointer-params
+
+**File:** `checker.c`
+
+- **Location** → NODE_CALL handler (`checker.c:~2054`), keep parameter validation section
+- **Logic** → when callee is a function pointer (resolved via typemap → TYPE_FUNC_PTR), treat ALL pointer params as `keep` regardless of the type's `param_keeps` array. Add check: if `effective_callee` from typemap has `kind == TYPE_FUNC_PTR`, force keep validation on every pointer-typed argument.
+- **Existing keep validation** → `checker.c:~2060-2170` — already handles keep checks for direct calls and function pointer calls via `param_keeps`. Just need to override: if callee is func ptr, all pointer params are keep.
+
+#### Array-level *opaque provenance
+
+**File:** `checker.c`
+
+- **Location** → `prov_map_set` calls in NODE_ASSIGN (`checker.c:~1193`) and NODE_VAR_DECL (`checker.c:~3655`)
+- **Logic** → when storing provenance under a compound key like `"callbacks[0]"`, ALSO extract the array root name (everything before `[`) and store provenance under that root key. On subsequent assignments to any element, check if root key already has provenance — if different, compile error.
+- **Helper** → extract root from key: scan backwards from key end for `[`, take substring. E.g., `"callbacks[0]"` → `"callbacks"`, `"s.arr[2]"` → `"s.arr"`.
+- **Existing infrastructure** → `prov_map_set` at `checker.c:306`, `prov_map_get` at `checker.c:335`, `build_expr_key` at `checker.c:264`.
+
+#### Cross-function provenance summaries
+
+**File:** `checker.c`
+
+- **Depends on** zercheck change 4's function summary infrastructure. Same pre-scan, same summary storage.
+- **Summary** → for each function, record: "return value has provenance X" if the function returns `*opaque` and the return expression's provenance is known.
+- **Usage** → in `check_expr` NODE_CALL, when callee returns `*opaque`: look up function summary, get return provenance. Store in prov_map for the call site's target.
+- **Location** → near existing provenance check in @ptrcast handler (`checker.c:~3000`)
+
+#### Existing code patterns to follow
+
+- **Compound key pattern** → `build_expr_key()` in checker.c:264 and `handle_key_from_expr()` in zercheck.c:126 — same pattern, both build string keys from AST expressions
+- **Provenance map** → `prov_map_set/get` in checker.c:306-340 — dynamic array with arena-allocated keys
+- **Type ID assignment** → checker.c register_decl, `c->next_type_id++` for struct/enum/union
+- **Runtime type tag** → emitter.c:1700-1740, @ptrcast handler — wraps with `(_zer_opaque){ptr, tid}`, unwraps with `({ check type_id; (T*)tmp.ptr; })`
+- **Auto-zero values** → emitter uses `current_func_ret` to determine zero values for return paths. Same logic reusable for auto-orelse.
+- **Union switch key** → `union_switch_key` on Checker struct, built via `build_expr_key` — same pattern for array-level provenance
+
 ### What "100% Compile-Time" Actually Means
 
 It does NOT mean "zero runtime checks in the emitted C." Runtime checks stay as backup.

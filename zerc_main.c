@@ -180,6 +180,8 @@ int main(int argc, char **argv) {
     bool do_run = false;
     bool no_preamble = false;
     bool no_strict_mmio = false;
+    const char *gcc_override = NULL;
+    bool target_bits_explicit = false;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -192,7 +194,43 @@ int main(int argc, char **argv) {
             no_strict_mmio = true;
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             zer_target_ptr_bits = atoi(argv[++i]);
+            target_bits_explicit = true;
+        } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
+            gcc_override = argv[++i];
         }
+    }
+
+    /* auto-detect target pointer width from GCC if not explicitly set */
+    if (!target_bits_explicit) {
+        const char *probe_gcc = gcc_override ? gcc_override : "gcc";
+        char probe_cmd[512];
+#ifdef _WIN32
+        snprintf(probe_cmd, sizeof(probe_cmd),
+            "echo. | \"%s\" -dM -E - 2>NUL", probe_gcc);
+#else
+        snprintf(probe_cmd, sizeof(probe_cmd),
+            "echo '' | \"%s\" -dM -E - 2>/dev/null", probe_gcc);
+#endif
+        FILE *probe = popen(probe_cmd, "r");
+        if (probe) {
+            char line[256];
+            while (fgets(line, sizeof(line), probe)) {
+                /* look for: #define __SIZEOF_SIZE_T__ N */
+                if (strstr(line, "__SIZEOF_SIZE_T__")) {
+                    int sz = 0;
+                    char *val = strstr(line, "__SIZEOF_SIZE_T__");
+                    if (val) {
+                        val += 17; /* skip "__SIZEOF_SIZE_T__" */
+                        while (*val == ' ') val++;
+                        sz = atoi(val);
+                    }
+                    if (sz > 0) zer_target_ptr_bits = sz * 8;
+                    break;
+                }
+            }
+            pclose(probe);
+        }
+        /* if probe failed, keep default 32 */
     }
 
     /* default output: input with .c extension */

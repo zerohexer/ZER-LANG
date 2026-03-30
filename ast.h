@@ -488,11 +488,12 @@ void ast_print(Node *node, int indent);
  * array/pool/ring size and won't appear in real constant expressions. */
 #define CONST_EVAL_FAIL INT64_MIN
 
-static inline int64_t eval_const_expr(Node *n) {
-    if (!n) return CONST_EVAL_FAIL;
+/* BUG-389: depth-limited version prevents stack overflow on pathological input */
+static inline int64_t eval_const_expr_d(Node *n, int depth) {
+    if (!n || depth > 256) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_UNARY) {
-        int64_t v = eval_const_expr(n->unary.operand);
+        int64_t v = eval_const_expr_d(n->unary.operand, depth + 1);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         if (n->unary.op == TOK_MINUS) return -v;
         if (n->unary.op == TOK_TILDE) return ~v;
@@ -500,8 +501,8 @@ static inline int64_t eval_const_expr(Node *n) {
         return CONST_EVAL_FAIL;
     }
     if (n->kind == NODE_BINARY) {
-        int64_t l = eval_const_expr(n->binary.left);
-        int64_t r = eval_const_expr(n->binary.right);
+        int64_t l = eval_const_expr_d(n->binary.left, depth + 1);
+        int64_t r = eval_const_expr_d(n->binary.right, depth + 1);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         switch (n->binary.op) {
         case TOK_PLUS:
@@ -555,6 +556,9 @@ static inline int64_t eval_const_expr(Node *n) {
         }
     }
     return CONST_EVAL_FAIL;
+}
+static inline int64_t eval_const_expr(Node *n) {
+    return eval_const_expr_d(n, 0);
 }
 
 #endif /* ZER_AST_H */

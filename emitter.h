@@ -24,7 +24,7 @@
  *   ?*T                → T* (null sentinel)
  *   []T                → struct { T *ptr; size_t len; }
  *   Pool(T,N)          → struct with slots, gen counters, used flags
- *   Handle(T)          → uint32_t (gen << 16 | index)
+ *   Handle(T)          → uint64_t (gen(32) << 32 | index(32))
  * ================================================================ */
 
 /* deferred statement stack — grows dynamically */

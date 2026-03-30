@@ -1451,6 +1451,21 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
+### eval_const_expr Depth Limit (BUG-389)
+`eval_const_expr` renamed to `eval_const_expr_d(Node *n, int depth)` with `depth > 256 → CONST_EVAL_FAIL` guard. Wrapper `eval_const_expr(Node *n)` calls with depth 0. Prevents stack overflow on pathological deeply-nested constant expressions.
+
+### Handle u64 with u32 Generation (BUG-390)
+`Handle(T)` changed from `uint32_t` to `uint64_t`. Encoding: `(uint64_t)gen << 32 | idx`. Gen counter changed from `uint16_t` to `uint32_t`. 4 billion cycles per slot before potential ABA wrap (was 65,536).
+
+Sites updated:
+- `emit_type(TYPE_HANDLE)` → `uint64_t`
+- `emit_type(TYPE_OPTIONAL > TYPE_HANDLE)` → `_zer_opt_u64`
+- Pool struct: `uint32_t gen[N]` (was `uint16_t`)
+- Slab struct: `uint32_t *gen` (was `uint16_t *`)
+- `_zer_pool_alloc/get/free`: u64 handle, u32 gen params, `handle & 0xFFFFFFFF` / `handle >> 32` decode
+- `_zer_slab_alloc/get/free`: same changes
+- Pool/Slab alloc call emission: `uint64_t _zer_ah`, `_zer_opt_u64` result
+
 ### Pool/Ring/Slab in Union Rejected (BUG-386)
 Same check as BUG-287 (struct fields) added to NODE_UNION_DECL variant registration. Pool/Ring/Slab types use C macros that can't be inside union definitions.
 

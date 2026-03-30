@@ -32,7 +32,7 @@ Pool(Task, 8) tasks;     fixed-slot allocator — compile-time count, ALWAYS glo
 Slab(Task) tasks;         dynamic slab allocator — grows on demand, ALWAYS global
 Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global
 Arena scratch;            bump allocator — (over, alloc, alloc_slice, reset)
-Handle(Task) h;          index + generation counter, not a pointer
+Handle(Task) h;          u64: index(32) + generation(32), not a pointer
 ```
 
 ### CRITICAL Syntax Differences from C

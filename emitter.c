@@ -189,7 +189,7 @@ static void emit_type(Emitter *e, Type *t) {
             emit(e, "_zer_opt_i32");  /* enums are int32_t */
             break;
         case TYPE_HANDLE:
-            emit(e, "_zer_opt_u32");  /* handles are uint32_t */
+            emit(e, "_zer_opt_u64");  /* handles are uint64_t (BUG-390) */
             break;
         case TYPE_STRUCT:
             emit(e, "_zer_opt_");
@@ -310,7 +310,7 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_HANDLE:
-        emit(e, "uint32_t"); /* Handle = gen << 16 | index */
+        emit(e, "uint64_t"); /* BUG-390: Handle = gen(32) << 32 | index(32) */
         break;
 
     case TYPE_ARENA:
@@ -919,10 +919,10 @@ static void emit_expr(Emitter *e, Node *node) {
                     if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
                         /* pool.alloc() → _zer_pool_alloc(...) wrapped in optional */
                         int tmp = e->temp_count++;
-                        emit(e, "({uint8_t _zer_aok%d = 0; uint32_t _zer_ah%d = "
+                        emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
                              "_zer_pool_alloc(%.*s.slots, sizeof(%.*s.slots[0]), "
                              "%.*s.gen, %.*s.used, %llu, &_zer_aok%d); "
-                             "(_zer_opt_u32){_zer_ah%d, _zer_aok%d}; })",
+                             "(_zer_opt_u64){_zer_ah%d, _zer_aok%d}; })",
                              tmp, tmp,
                              plen, pname, plen, pname,
                              plen, pname, plen, pname,
@@ -1021,9 +1021,9 @@ static void emit_expr(Emitter *e, Node *node) {
 
                     if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
                         int tmp = e->temp_count++;
-                        emit(e, "({uint8_t _zer_aok%d = 0; uint32_t _zer_ah%d = "
+                        emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
                              "_zer_slab_alloc(&%.*s, &_zer_aok%d); "
-                             "(_zer_opt_u32){_zer_ah%d, _zer_aok%d}; })",
+                             "(_zer_opt_u64){_zer_ah%d, _zer_aok%d}; })",
                              tmp, tmp,
                              slen, sname, tmp, tmp, tmp);
                         handled = true;
@@ -2871,7 +2871,7 @@ static void emit_global_var(Emitter *e, Node *node) {
     if (type && type->kind == TYPE_POOL) {
         emit(e, "struct { ");
         emit_type(e, type->pool.elem);
-        emit(e, " slots[%llu]; uint16_t gen[%llu]; uint8_t used[%llu]; } ",
+        emit(e, " slots[%llu]; uint32_t gen[%llu]; uint8_t used[%llu]; } ",
              (unsigned long long)type->pool.count, (unsigned long long)type->pool.count, (unsigned long long)type->pool.count);
         emit(e, "%.*s = {0};\n\n",
              (int)node->var_decl.name_len, node->var_decl.name);
@@ -3201,21 +3201,21 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "\n");
 
     /* ZER runtime: Pool helper macros */
-    emit(e, "/* ZER Pool runtime */\n");
+    emit(e, "/* ZER Pool runtime — BUG-390: u64 handles, u32 gen */\n");
     emit(e, "#define _ZER_POOL_DECL(NAME, ELEM_TYPE, CAPACITY) \\\n");
     emit(e, "    struct { \\\n");
     emit(e, "        ELEM_TYPE slots[CAPACITY]; \\\n");
-    emit(e, "        uint16_t gen[CAPACITY]; \\\n");
+    emit(e, "        uint32_t gen[CAPACITY]; \\\n");
     emit(e, "        uint8_t used[CAPACITY]; \\\n");
     emit(e, "    } NAME = {0}\n");
     emit(e, "\n");
-    emit(e, "static inline uint32_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
-            "uint16_t *gen, uint8_t *used, size_t capacity, uint8_t *ok) {\n");
+    emit(e, "static inline uint64_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
+            "uint32_t *gen, uint8_t *used, size_t capacity, uint8_t *ok) {\n");
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
     emit(e, "        if (!used[i]) {\n");
     emit(e, "            used[i] = 1;\n");
     emit(e, "            *ok = 1;\n");
-    emit(e, "            return (uint32_t)((gen[i] << 16) | i);\n");
+    emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
     emit(e, "        }\n");
     emit(e, "    }\n");
     emit(e, "    *ok = 0;\n");
@@ -3255,19 +3255,19 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    if (idx >= len) _zer_trap(\"array index out of bounds\", file, line);\n");
     emit(e, "}\n\n");
 
-    emit(e, "static inline void *_zer_pool_get(void *slots, uint16_t *gen, uint8_t *used, "
-            "size_t slot_size, uint32_t handle, size_t capacity) {\n");
-    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
-    emit(e, "    uint16_t h_gen = (uint16_t)(handle >> 16);\n");
+    emit(e, "static inline void *_zer_pool_get(void *slots, uint32_t *gen, uint8_t *used, "
+            "size_t slot_size, uint64_t handle, size_t capacity) {\n");
+    emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
+    emit(e, "    uint32_t h_gen = (uint32_t)(handle >> 32);\n");
     emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen) {\n");
     emit(e, "        _zer_trap(\"use-after-free: handle generation mismatch\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
     emit(e, "    return (char*)slots + idx * slot_size;\n");
     emit(e, "}\n\n");
 
-    emit(e, "static inline void _zer_pool_free(uint16_t *gen, uint8_t *used, "
-            "uint32_t handle, size_t capacity) {\n");
-    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
+    emit(e, "static inline void _zer_pool_free(uint32_t *gen, uint8_t *used, "
+            "uint64_t handle, size_t capacity) {\n");
+    emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    if (idx < capacity) {\n");
     emit(e, "        used[idx] = 0;\n");
     emit(e, "        gen[idx]++;\n");
@@ -3309,12 +3309,12 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    return a->buf + off;\n");
     emit(e, "}\n\n");
 
-    /* ZER runtime: Slab dynamic allocator */
+    /* ZER runtime: Slab dynamic allocator — BUG-390: u64 handles, u32 gen */
     emit(e, "/* ZER Slab runtime — dynamic growable pool via mmap/malloc */\n");
     emit(e, "#define _ZER_SLAB_PAGE_SLOTS 64\n");
     emit(e, "typedef struct {\n");
     emit(e, "    char **pages;         /* array of page pointers */\n");
-    emit(e, "    uint16_t *gen;        /* flat generation array */\n");
+    emit(e, "    uint32_t *gen;        /* flat generation array */\n");
     emit(e, "    uint8_t *used;        /* flat used-slot array */\n");
     emit(e, "    uint32_t page_count;\n");
     emit(e, "    uint32_t page_cap;\n");
@@ -3322,24 +3322,24 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    size_t slot_size;\n");
     emit(e, "} _zer_slab;\n\n");
 
-    emit(e, "static inline uint32_t _zer_slab_alloc(_zer_slab *s, uint8_t *ok) {\n");
+    emit(e, "static inline uint64_t _zer_slab_alloc(_zer_slab *s, uint8_t *ok) {\n");
     emit(e, "    /* scan for free slot */\n");
     emit(e, "    for (uint32_t i = 0; i < s->total_slots; i++) {\n");
     emit(e, "        if (!s->used[i]) {\n");
     emit(e, "            s->used[i] = 1;\n");
     emit(e, "            *ok = 1;\n");
-    emit(e, "            return (uint32_t)((s->gen[i] << 16) | i);\n");
+    emit(e, "            return ((uint64_t)s->gen[i] << 32) | i;\n");
     emit(e, "        }\n");
     emit(e, "    }\n");
     emit(e, "    /* grow: add a new page */\n");
     emit(e, "    if (s->page_count >= s->page_cap) {\n");
     emit(e, "        uint32_t nc = s->page_cap < 4 ? 4 : s->page_cap * 2;\n");
     emit(e, "        char **np = (char**)calloc(nc, sizeof(char*));\n");
-    emit(e, "        uint16_t *ng = (uint16_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint16_t));\n");
+    emit(e, "        uint32_t *ng = (uint32_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint32_t));\n");
     emit(e, "        uint8_t *nu = (uint8_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint8_t));\n");
     emit(e, "        if (!np || !ng || !nu) { *ok = 0; return 0; }\n");
     emit(e, "        if (s->pages) { memcpy(np, s->pages, s->page_count * sizeof(char*)); free(s->pages); }\n");
-    emit(e, "        if (s->gen) { memcpy(ng, s->gen, s->total_slots * sizeof(uint16_t)); free(s->gen); }\n");
+    emit(e, "        if (s->gen) { memcpy(ng, s->gen, s->total_slots * sizeof(uint32_t)); free(s->gen); }\n");
     emit(e, "        if (s->used) { memcpy(nu, s->used, s->total_slots * sizeof(uint8_t)); free(s->used); }\n");
     emit(e, "        s->pages = np; s->gen = ng; s->used = nu; s->page_cap = nc;\n");
     emit(e, "    }\n");
@@ -3351,12 +3351,12 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    s->total_slots += _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    s->used[base] = 1;\n");
     emit(e, "    *ok = 1;\n");
-    emit(e, "    return (uint32_t)((s->gen[base] << 16) | base);\n");
+    emit(e, "    return ((uint64_t)s->gen[base] << 32) | base;\n");
     emit(e, "}\n\n");
 
-    emit(e, "static inline void *_zer_slab_get(_zer_slab *s, uint32_t handle) {\n");
-    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
-    emit(e, "    uint16_t gen = (uint16_t)(handle >> 16);\n");
+    emit(e, "static inline void *_zer_slab_get(_zer_slab *s, uint64_t handle) {\n");
+    emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
+    emit(e, "    uint32_t gen = (uint32_t)(handle >> 32);\n");
     emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != gen) {\n");
     emit(e, "        _zer_trap(\"slab: use-after-free or invalid handle\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
@@ -3365,8 +3365,8 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    return s->pages[page] + slot * s->slot_size;\n");
     emit(e, "}\n\n");
 
-    emit(e, "static inline void _zer_slab_free(_zer_slab *s, uint32_t handle) {\n");
-    emit(e, "    uint32_t idx = handle & 0xFFFF;\n");
+    emit(e, "static inline void _zer_slab_free(_zer_slab *s, uint64_t handle) {\n");
+    emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    if (idx < s->total_slots) {\n");
     emit(e, "        s->used[idx] = 0;\n");
     emit(e, "        s->gen[idx]++;\n");

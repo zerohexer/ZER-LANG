@@ -1936,6 +1936,18 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-389: eval_const_expr stack overflow on deep expressions
+- **Symptom:** Pathological input with deeply nested arithmetic (e.g., `1+1+1+...` 2000 levels) crashes compiler with stack overflow.
+- **Root cause:** `eval_const_expr` in ast.h was purely recursive with no depth limit. Unlike `check_expr` (which has `expr_depth` guard), the constant folder had no protection.
+- **Fix:** Renamed to `eval_const_expr_d(Node *n, int depth)` with `depth > 256 → CONST_EVAL_FAIL` guard. Added `eval_const_expr(Node *n)` wrapper that calls with depth 0. All recursive calls pass `depth + 1`.
+- **Test:** Existing tests pass. Parser depth limit (64) prevents most pathological input from reaching this code.
+
+### BUG-390: Handle generation counter wraps at 65536 (ABA problem)
+- **Symptom:** After 65,536 alloc/free cycles on a single Pool/Slab slot, `uint16_t` gen wraps to 0. A stale handle from gen 0 passes the safety check — use-after-free undetected.
+- **Root cause:** Handle was `uint32_t` with `gen(16) << 16 | idx(16)`. Gen counter was `uint16_t`.
+- **Fix:** Handle is now `uint64_t` with `gen(32) << 32 | idx(32)`. Gen counter is `uint32_t`. 4 billion cycles per slot before wrap — practically infinite. Updated: Pool struct (gen array), Slab struct (gen pointer), all alloc/get/free functions, optional Handle type (`_zer_opt_u64`), alloc call emission.
+- **Test:** All existing Pool/Slab E2E tests pass with u64 handles.
+
 ### BUG-386: Pool/Ring/Slab allowed in union variants
 - **Symptom:** `union Oops { Pool(u32, 4) p; u32 other; }` compiled — produces invalid C (macro inside union).
 - **Root cause:** BUG-287 added the check for struct fields but not union variants.

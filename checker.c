@@ -3092,6 +3092,31 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
                 }
+                /* BUG-381: volatile check — if source pointer is volatile,
+                 * target must also be volatile. Same pattern as @ptrcast BUG-258. */
+                if (node->intrinsic.arg_count > 0 && result) {
+                    Type *res_eff = type_unwrap_distinct(result);
+                    if (res_eff->kind == TYPE_POINTER && !res_eff->pointer.is_volatile) {
+                        Type *ptr_type = typemap_get(c, node->intrinsic.args[0]);
+                        bool src_volatile = false;
+                        if (ptr_type) {
+                            Type *pe = type_unwrap_distinct(ptr_type);
+                            if (pe->kind == TYPE_POINTER && pe->pointer.is_volatile)
+                                src_volatile = true;
+                        }
+                        if (!src_volatile && node->intrinsic.args[0]->kind == NODE_IDENT) {
+                            Symbol *src_sym = scope_lookup(c->current_scope,
+                                node->intrinsic.args[0]->ident.name,
+                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                            if (src_sym && src_sym->is_volatile) src_volatile = true;
+                        }
+                        if (src_volatile) {
+                            checker_error(c, node->loc.line,
+                                "@container cannot strip volatile qualifier — "
+                                "target must be volatile pointer");
+                        }
+                    }
+                }
             } else {
                 result = ty_void;
             }

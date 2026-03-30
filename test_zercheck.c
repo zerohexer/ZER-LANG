@@ -413,6 +413,33 @@ int main(void) {
        "}\n",
        "BUG-357: arr[0] freed, arr[1] still valid");
 
+    /* BUG-380: alias via struct field — freeing h should also mark s.h as freed */
+    printf("[BUG-380: alias double-free via struct field]\n");
+    err("struct T { u32 x; }\n"
+        "struct State { Handle(T) h; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    State s;\n"
+        "    s.h = h;\n"
+        "    pool.free(h);\n"
+        "    pool.free(s.h);\n"
+        "}\n",
+        "BUG-380: free(h) then free(s.h) — double free via alias");
+
+    printf("[BUG-380: alias UAF via struct field]\n");
+    err("struct T { u32 x; }\n"
+        "struct State { Handle(T) h; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    State s;\n"
+        "    s.h = h;\n"
+        "    pool.free(h);\n"
+        "    pool.get(s.h).x = 5;\n"
+        "}\n",
+        "BUG-380: free(h) then get(s.h) — use-after-free via alias");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

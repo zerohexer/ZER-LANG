@@ -1780,8 +1780,14 @@ static void emit_expr(Emitter *e, Node *node) {
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
-            /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field)) */
+            /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field))
+             * BUG-381: propagate volatile from source pointer to result */
             emit(e, "((");
+            /* check if source expression is volatile */
+            if (node->intrinsic.arg_count > 0 &&
+                expr_is_volatile(e, node->intrinsic.args[0])) {
+                emit(e, "volatile ");
+            }
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);

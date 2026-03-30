@@ -1559,6 +1559,24 @@ static void test_negative_sweep(void) {
         "u32 main() { Node n; *Node p = @container(*Node, n.data, data); return 0; }",
         "BUG-375: @container non-pointer source rejected");
 
+    /* BUG-381: @container volatile stripping */
+    err("struct Device { u32 status; u32 list; }\n"
+        "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+        "u32 main() {\n"
+        "    volatile *u32 ptr = @inttoptr(*u32, 0x4000);\n"
+        "    *Device d = @container(*Device, ptr, list);\n"
+        "    return 0;\n"
+        "}",
+        "BUG-381: @container volatile stripping rejected");
+    ok("struct Device { u32 status; u32 list; }\n"
+       "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+       "u32 main() {\n"
+       "    volatile *u32 ptr = @inttoptr(*u32, 0x4000);\n"
+       "    volatile *Device d = @container(volatile *Device, ptr, list);\n"
+       "    return 0;\n"
+       "}",
+       "BUG-381: @container volatile preserved accepted");
+
     /* BUG-310: volatile slice qualifier */
     err("volatile u8[16] hw_regs;\n"
         "void poll([]u8 regs) { while (regs[0] == 0) { } }\n"

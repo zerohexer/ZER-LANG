@@ -1451,6 +1451,9 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
+### @container Volatile Propagation (BUG-381)
+`@container(*T, ptr, field)` now checks volatile on source pointer — same pattern as @ptrcast (BUG-258). Checker validates: if source is volatile (type-level `pointer.is_volatile` OR symbol-level `is_volatile`), target must also be volatile pointer. Emitter: `expr_is_volatile(e, args[0])` check, prepends `volatile ` before the cast type in the emitted `((volatile T*)((char*)(ptr) - offsetof(T, field)))`.
+
 ### zercheck Compound Handle Keys (BUG-357)
 `handle_key_from_expr()` helper builds string keys from handle expressions: `NODE_IDENT` → `"h"`, `NODE_FIELD` → `"s.h"`, `NODE_INDEX(constant)` → `"arr[0]"`. Recursive — handles `s.arr[1]` etc. Returns 0 for untrackable expressions (variable index `arr[i]`).
 

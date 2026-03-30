@@ -1936,6 +1936,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-381: @container strips volatile qualifier
+- **Symptom:** `volatile *u32 ptr = ...; *Device d = @container(*Device, ptr, list)` — emitted C casts volatile pointer to non-volatile `Device*`. GCC optimizes away subsequent hardware register accesses.
+- **Root cause:** @container emitter emitted `(T*)((char*)(ptr) - offsetof(T, field))` without checking source volatility. Checker also didn't validate volatile like @ptrcast (BUG-258).
+- **Fix:** Checker: if source pointer is volatile (type-level or symbol-level) and target is non-volatile pointer, error. Same pattern as @ptrcast BUG-258. Emitter: `expr_is_volatile()` check on source arg, prepends `volatile` to cast type.
+- **Test:** 2 tests added: volatile stripping rejected, volatile preserved accepted.
+
 ### BUG-357: zercheck cannot track handles in arrays or struct fields
 - **Symptom:** `pool.free(arr[0]); pool.get(arr[0])` — use-after-free invisible to zercheck. Same for `pool.free(s.h); pool.get(s.h)`.
 - **Root cause:** `find_handle` matched by flat name string. `pool.free(arr[0])` arg is NODE_INDEX, not NODE_IDENT — `find_handle` never matched.

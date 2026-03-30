@@ -3239,6 +3239,9 @@ static void check_stmt(Checker *c, Node *node) {
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;
+                            /* BUG-356: walk through deref — *pp root is pp */
+                            else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_STAR)
+                                init_root = init_root->unary.operand;
                             else break;
                         }
                         if (init_root && init_root->kind == NODE_IDENT) {
@@ -3349,16 +3352,23 @@ static void check_stmt(Checker *c, Node *node) {
                         if (src_type) sym->provenance_type = src_type;
                     }
                 }
-                /* alias propagation: q = p where p has provenance */
-                if (init->kind == NODE_IDENT) {
-                    Symbol *src = scope_lookup(c->current_scope,
-                        init->ident.name, (uint32_t)init->ident.name_len);
-                    if (src && src->provenance_type)
-                        sym->provenance_type = src->provenance_type;
-                    if (src && src->container_struct) {
-                        sym->container_struct = src->container_struct;
-                        sym->container_field = src->container_field;
-                        sym->container_field_len = src->container_field_len;
+                /* alias propagation: q = p where p has provenance
+                 * BUG-358: also walk through @bitcast/@cast to find root ident */
+                {
+                    Node *prov_root = init;
+                    while (prov_root && prov_root->kind == NODE_INTRINSIC &&
+                           prov_root->intrinsic.arg_count > 0)
+                        prov_root = prov_root->intrinsic.args[prov_root->intrinsic.arg_count - 1];
+                    if (prov_root && prov_root->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            prov_root->ident.name, (uint32_t)prov_root->ident.name_len);
+                        if (src && src->provenance_type)
+                            sym->provenance_type = src->provenance_type;
+                        if (src && src->container_struct) {
+                            sym->container_struct = src->container_struct;
+                            sym->container_field = src->container_field;
+                            sym->container_field_len = src->container_field_len;
+                        }
                     }
                 }
             }

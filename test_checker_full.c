@@ -2188,6 +2188,29 @@ static void test_mmio_provenance(void) {
        "    g = @cast(GPtr, p);\n"
        "}",
        "BUG-355: assign @cast escape rejected");
+
+    /* BUG-356: deref flag loss — *pp washes is_local_derived */
+    err("*u32 leak() {\n"
+       "    u32 x = 10;\n"
+       "    *u32 p = &x;\n"
+       "    **u32 pp = &p;\n"
+       "    *u32 p2 = *pp;\n"
+       "    return p2;\n"
+       "}",
+       "BUG-356: deref flag propagation catches escape");
+
+    /* BUG-358: provenance loss through @bitcast */
+    err("struct Sensor { u32 id; }\n"
+       "struct Motor { u32 speed; }\n"
+       "void use(*Motor m) {}\n"
+       "void test() {\n"
+       "    Sensor s;\n"
+       "    *opaque ctx = @ptrcast(*opaque, &s);\n"
+       "    *opaque q = @bitcast(*opaque, ctx);\n"
+       "    *Motor m = @ptrcast(*Motor, q);\n"
+       "    use(m);\n"
+       "}",
+       "BUG-358: provenance preserved through @bitcast");
 }
 
 int main(void) {

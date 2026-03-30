@@ -578,7 +578,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Forced division guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
 | Forced bounds guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
 | Forced keep on fn ptr params | Compiler rule | **None** (extends existing `keep`) | ~10 lines in checker.c |
-| @cstr safe truncation | Emitter change | **None** | ~10 lines in emitter.c |
+| @cstr auto-orelse | Compiler + Emitter | **None** (auto-inserted) | ~30 lines in checker.c + emitter.c |
 
 **All six are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, forces safety invariants, and makes @cstr physically unable to overflow. No new types, no new keywords, no new syntax.
 
@@ -588,7 +588,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 - Division requires proven nonzero divisor (NEW)
 - Array/slice indexing requires proven in-range index (NEW)
 - Function pointers returning pointer with pointer params require `keep` on those params (NEW — extends existing `keep` keyword)
-- `@cstr` silently truncates to fit buffer — never overflows (NEW — automatic, no programmer action)
+- `@cstr` auto-inserts `orelse { return <zero>; }` when no explicit `orelse` — never overflows (NEW — 100% invisible)
 
 ```zer
 // Forced division: compiler error if divisor not proven nonzero
@@ -639,7 +639,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |
 | MMIO range | **~99%** | Computed variable addresses (rare) |
-| @cstr overflow | **100%** | Silent truncation for variable slices, compile error for constant strings that don't fit |
+| @cstr overflow | **100%** | Auto-orelse for variable slices, compile error for constant strings |
 | Arena overflow | **0%** | Inherently runtime |
 
 **Overall: ~97% compile-time for guarded code, ~92% for unguarded code.**
@@ -722,31 +722,43 @@ typedef struct {
 - Propagation through simple arithmetic (`x + 1` shifts range by 1)
 - `@cstr` overflow: if source slice length proven < buffer size via guard, skip runtime check (improves @cstr from ~50% to ~90% compile-time)
 
-**@cstr safe truncation (REVISED — replaces range propagation approach):**
+**@cstr auto-orelse (FINAL DESIGN — replaces truncation approach):**
 
-`@cstr` now silently truncates to fit the destination buffer. Never overflows. No `orelse`, no `if` guard, no programmer action needed.
+`@cstr` returns `?void`. When no explicit `orelse` is written, the compiler auto-inserts `orelse { return <zero_value>; }` based on the function's return type. 100% invisible to the programmer.
 
 ```zer
-u8[8] buf;
-@cstr(buf, long_data);           // copies min(long_data.len, 7) bytes + null. Always fits.
-@cstr(buf, "hello world");       // COMPILE ERROR: constant "hello world" (11) > buf (8)
+// Programmer just writes:
+@cstr(buf, data);
+
+// Compiler auto-generates based on enclosing function return type:
+//   void function:  @cstr(buf, data) orelse return;
+//   u32 function:   @cstr(buf, data) orelse { return 0; };
+//   bool function:  @cstr(buf, data) orelse { return false; };
+//   ?*T function:   @cstr(buf, data) orelse { return null; };
+
+// Explicit orelse still available for custom behavior:
+@cstr(buf, data) orelse break;                     // exit loop
+@cstr(buf, data) orelse { log("too long"); return; };  // log then bail
 ```
 
-**Emitted C:**
-```c
-// Variable slice: silent truncation
-size_t _n = src.len < 7 ? src.len : 7;
-memcpy(buf, src.ptr, _n);
-buf[_n] = 0;
+**Why not truncation:** Silent truncation hides logic bugs. A truncated command to a motor controller is worse than a clean failure. `orelse return` fails loud — the function stops, the caller knows something went wrong, the system keeps running (unlike a trap which crashes everything).
 
-// Constant string too large: compile error (checker catches this already)
-```
+**Why auto-insert instead of forcing explicit `orelse`:** The programmer just writes `@cstr(buf, data);` and it works in ANY function. The compiler knows `current_func_ret`, knows the zero value for every type (same logic as auto-zero), and inserts the correct return. Zero boilerplate. Zero learning curve. If they want custom failure handling, they write `orelse` explicitly — same keyword they already know.
 
 **Rules:**
-- Constant string that doesn't fit → compile error (fix your sizes, don't silently truncate hardcoded strings)
-- Variable slice → truncate to `buf_size - 1`, always safe, 2 extra instructions (compare + conditional)
-- No runtime trap. No `orelse`. No programmer effort. Buffer physically cannot overflow.
-- Removes @cstr from the runtime check table entirely — **100% safe with zero boilerplate**.
+- Constant string that doesn't fit → **compile error** (fix your sizes)
+- Variable slice without explicit `orelse` → **auto-inserted** `orelse { return <zero>; }`
+- Variable slice with explicit `orelse` → **programmer's choice**
+- Buffer physically cannot overflow in any case
+- **100% safe. 100% invisible. Zero boilerplate.**
+
+**Can this auto-orelse pattern apply to other failable operations?**
+Yes — any intrinsic or builtin that returns `?T` could auto-insert `orelse { return <zero>; }`. This is a general mechanism, not @cstr-specific. Potential future extension to `arena.alloc()`, etc. But start with `@cstr` first — it's the simplest case.
+
+**Implementation:**
+- Checker: when `@cstr` is used as expression-statement (NODE_EXPR_STMT) without explicit `orelse`, auto-wrap in orelse with zero-return
+- Emitter: emit the orelse path with function return type's zero value
+- ~30 lines total (checker + emitter)
 
 **Does NOT handle (acceptable):**
 - Cross-function range inference (would need function summaries)

@@ -346,25 +346,91 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 | Forced division guard | v0.3 | ~20 | **None** (new compile error only) | Unguarded divisions become errors |
 | Forced bounds guard | v0.3 | ~20 | **None** (new compile error only) | Unguarded indexing becomes errors |
 | Forced keep on fn ptr returns | v0.3 | ~10 | **None** (extends existing `keep`) | Fn ptrs returning pointer need `keep` params |
+| @cstr auto-orelse | v0.3 | ~30 | **None** (auto-inserted) | No — invisible |
+| Array-level *opaque provenance | v0.3 | ~10 | **None** | Heterogeneous *opaque arrays become errors |
+| Cross-function provenance summaries | v0.3 | ~50 | **None** | No — extends change 4 infrastructure |
 
-Total: ~740-940 lines of compiler logic. Zero new language syntax. Three new compile errors. One existing keyword (`keep`) extended to function pointer types.
+Total: ~830-1030 lines of compiler logic. Zero new language syntax. Three new compile errors. One existing keyword (`keep`) extended. One auto-inserted `orelse`. Runtime checks kept as belt-and-suspenders backup on all paths.
 
-### Remaining Inherent Runtime Checks (Cannot Be Compile-Time)
+### Remaining Runtime Checks (Belt-and-Suspenders Only)
 
-These are runtime checks that ZER keeps because the information is **physically unknowable** at compile time. SPARK/Ada comparison included.
+After all planned features, these runtime checks remain in the emitted C as **backup safety nets**. The compile-time analysis catches them first — the runtime check is a redundant layer that should never fire in correct code.
 
-| Check | ZER | SPARK/Ada | Why runtime is inherent |
-|-------|-----|-----------|------------------------|
-| `*opaque` variable-index `arr[i]` | Runtime type_id trap | **N/A** (no void* in SPARK) | `i` is a runtime value — can't know which element |
-| ~~@cstr variable slice~~ | ~~Runtime overflow trap~~ | **N/A** | **ELIMINATED** — silent truncation, never overflows, no runtime trap |
-| Arena alloc overflow | Runtime `__builtin_mul_overflow` | **N/A** (no arena in SPARK, stack only) | Multiplication overflow depends on runtime `n` |
-| MMIO computed address (rare) | Runtime range trap | Same (runtime check) | Address computed from runtime value |
+| Check | Compile-time | Runtime (backup) | When runtime fires |
+|-------|-------------|-----------------|-------------------|
+| Bounds | Forced guard proves in range | `_zer_bounds_check` stays in emitted C | Never (guard already caught it) |
+| Division | Forced guard proves nonzero | `if (_d == 0)` stays in emitted C | Never (guard already caught it) |
+| Handle gen | zercheck proves valid | Gen counter check stays | Never (zercheck already caught it) |
+| `*opaque` type | Compile-time provenance (all paths) | `type_id` check stays in emitted C | Never (provenance already caught it) |
+| @cstr overflow | Auto-orelse handles failure | Length check inside @cstr stays | Triggers → auto-orelse handles it |
+| MMIO range | Constant addresses proven | Variable address check stays | Only computed MMIO (rare) |
+| Arena overflow | Can't prove (inherent) | `__builtin_mul_overflow` stays | Large allocations (rare) |
 
-**Key insight:** 3 out of 4 remaining runtime checks exist because ZER has features SPARK doesn't have (`*opaque`, `@cstr`, Arena). SPARK avoids the runtime by not having the feature at all. ZER has the feature AND makes it safe via runtime traps.
+**Runtime checks are NEVER removed.** Even when the compiler proves safety at compile time, the runtime check remains as a second layer. Belt and suspenders. If the compiler has a bug in its range propagation, the runtime catches it.
 
-The 4th (MMIO computed address) is the same in both — inherently runtime. SPARK doesn't do better here.
+**Future `--release` flag** may strip proven runtime checks for performance. But default always keeps both layers.
 
-**ZER's philosophy: have the feature, make it safe. SPARK's philosophy: don't have the feature.**
+### *opaque 100% Compile-Time Coverage
+
+Three mechanisms close all `*opaque` gaps:
+
+**1. Array-level provenance (NEW — closes variable-index gap):**
+When any element of a `*opaque` array is assigned, provenance is stored under BOTH the element key AND the array root key:
+```
+callbacks[0] = @ptrcast(*opaque, &sensor)
+  → prov_map["callbacks[0]"] = *Sensor    // element-level
+  → prov_map["callbacks"] = *Sensor       // array-level (NEW)
+
+callbacks[1] = @ptrcast(*opaque, &motor)
+  → prov_map["callbacks[1]"] = *Motor
+  → prov_map["callbacks"] CONFLICT: *Sensor vs *Motor → COMPILE ERROR
+```
+All elements must have the same provenance. `@ptrcast(*Sensor, callbacks[i])` checks against array-level provenance — proven for ANY `i`.
+
+Forces homogeneous `*opaque` arrays. Heterogeneous arrays (different types per element) get compile error — use separate arrays per type.
+
+~10 lines in checker.c (extend `prov_map_set` to also set root key on array assignments).
+
+**2. Cross-function provenance summaries (NEW — closes function-return gap):**
+When a function returns `*opaque`, the compiler analyzes the function body and records what provenance the return value carries:
+```zer
+*opaque get_ctx() { return stored_ctx; }  // summary: returns provenance of stored_ctx
+
+*Sensor s = @ptrcast(*Sensor, get_ctx());  // checks against function's provenance summary
+```
+Same infrastructure as zercheck change 4 (cross-function analysis). Applied to provenance instead of handle state.
+
+~50 lines on top of zercheck change 4's function summary infrastructure.
+
+**3. Existing mechanisms (unchanged):**
+- Symbol-level provenance for simple idents
+- Compound key `prov_map` for struct fields and constant indices
+
+**Coverage after all three:**
+
+| Path | Mechanism | Coverage |
+|------|-----------|----------|
+| `ctx` (simple ident) | Symbol provenance_type | **Compile-time** |
+| `h.p` (struct field) | prov_map compound key | **Compile-time** |
+| `arr[0]` (constant index) | prov_map compound key | **Compile-time** |
+| `arr[i]` (variable index) | prov_map array-level key | **Compile-time** |
+| `get_ctx()` (function return) | Cross-function summary | **Compile-time** |
+
+**100% compile-time. Runtime type_id tag stays as belt-and-suspenders backup.**
+
+### SPARK/Ada Comparison (Updated)
+
+| Check | ZER | SPARK/Ada |
+|-------|-----|-----------|
+| `*opaque` type safety | **100% compile-time** + runtime backup | **N/A** (no void* — avoids the feature) |
+| @cstr overflow | **100%** (auto-orelse) | **N/A** (no @cstr — avoids the feature) |
+| Arena overflow | Runtime (inherent) | **N/A** (no arena — stack only) |
+| MMIO computed address | Runtime (inherent) | Runtime (same — inherent) |
+
+**ZER now matches SPARK's compile-time coverage while having features SPARK doesn't offer.** The only remaining runtime checks (arena overflow, MMIO computed address) are inherent — SPARK doesn't do better, it just doesn't have the feature.
+
+**ZER's philosophy: have the feature, make it safe, prove it at compile time, AND keep runtime backup.**
+**SPARK's philosophy: don't have the feature.**
 
 ### Original (preserved for reference)
 
@@ -634,7 +700,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Handle UAF (zercheck 1-4) | **~99%** | ISR + cinclude edge cases |
 | Handle leaks | **100%** | None |
 | Null deref | **100%** | None |
-| *opaque cast | **~98%** | Variable index + function return |
+| *opaque cast | **100%** | Array-level provenance + cross-function summaries (runtime tag stays as backup) |
 | Scope escape | **~95%** | Deep indirection chains |
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |

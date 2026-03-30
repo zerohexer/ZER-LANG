@@ -1308,7 +1308,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* clear — will be re-set below if new value is unsafe */
                     tsym->is_local_derived = false;
                     tsym->is_arena_derived = false;
-                    tsym->provenance_type = NULL;
+                    /* provenance_type removed — BUG-393 runtime tags */
                     tsym->container_struct = NULL;
                     tsym->container_field = NULL;
                     tsym->container_field_len = 0;
@@ -1358,26 +1358,14 @@ static Type *check_expr(Checker *c, Node *node) {
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src && src->is_local_derived) tsym->is_local_derived = true;
                             if (src && src->is_arena_derived) tsym->is_arena_derived = true;
-                            /* provenance propagation through alias */
-                            if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
+                            /* provenance_type removed — BUG-393 runtime tags */
                             if (src && src->container_struct) {
                                 tsym->container_struct = src->container_struct;
                                 tsym->container_field = src->container_field;
                                 tsym->container_field_len = src->container_field_len;
                             }
                         }
-                        /* @ptrcast provenance on assignment */
-                        if (vcheck->kind == NODE_INTRINSIC &&
-                            vcheck->intrinsic.name_len == 7 &&
-                            memcmp(vcheck->intrinsic.name, "ptrcast", 7) == 0 &&
-                            vcheck->intrinsic.arg_count > 0) {
-                            Type *tgt_eff = type_unwrap_distinct(tsym->type);
-                            if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
-                                tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
-                                Type *src_type = typemap_get(c, vcheck->intrinsic.args[0]);
-                                if (src_type) tsym->provenance_type = src_type;
-                            }
-                        }
+                        /* @ptrcast provenance removed — BUG-393 runtime tags */
                         /* @container provenance: val = &struct.field */
                         if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP &&
                             vcheck->unary.operand->kind == NODE_FIELD) {
@@ -2940,34 +2928,8 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "target must be volatile pointer");
                             }
                         }
-                        /* provenance check: casting FROM *opaque TO *T —
-                         * if source has provenance, target must match */
-                        if (eff->kind == TYPE_POINTER &&
-                            eff->pointer.inner->kind == TYPE_OPAQUE &&
-                            node->intrinsic.args[0]->kind == NODE_IDENT) {
-                            Symbol *src_sym = scope_lookup(c->current_scope,
-                                node->intrinsic.args[0]->ident.name,
-                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                            if (src_sym && src_sym->provenance_type) {
-                                Type *prov = type_unwrap_distinct(src_sym->provenance_type);
-                                Type *tgt = type_unwrap_distinct(result);
-                                /* compare: provenance type should match target pointer inner */
-                                if (tgt && tgt->kind == TYPE_POINTER && prov &&
-                                    prov->kind == TYPE_POINTER) {
-                                    Type *prov_inner = type_unwrap_distinct(prov->pointer.inner);
-                                    Type *tgt_inner = type_unwrap_distinct(tgt->pointer.inner);
-                                    if (prov_inner && tgt_inner &&
-                                        tgt_inner->kind != TYPE_OPAQUE &&
-                                        !type_equals(prov_inner, tgt_inner)) {
-                                        checker_error(c, node->loc.line,
-                                            "@ptrcast type mismatch: source has provenance '%s' "
-                                            "but target is '*%s'",
-                                            type_name(src_sym->provenance_type),
-                                            type_name(tgt_inner));
-                                    }
-                                }
-                            }
-                        }
+                        /* provenance check removed — BUG-393 runtime type tags
+                         * handle this via _zer_opaque.type_id in emitted C */
                     }
                 }
             } else {
@@ -3690,30 +3652,18 @@ static void check_stmt(Checker *c, Node *node) {
                 Node *init = node->var_decl.init;
                 if (init->kind == NODE_ORELSE) init = init->orelse.expr;
                 /* direct @ptrcast to *opaque — record source type */
-                if (init->kind == NODE_INTRINSIC &&
-                    init->intrinsic.name_len == 7 &&
-                    memcmp(init->intrinsic.name, "ptrcast", 7) == 0 &&
-                    init->intrinsic.arg_count > 0) {
-                    Type *eff = type_unwrap_distinct(type);
-                    if (eff && eff->kind == TYPE_POINTER &&
-                        eff->pointer.inner->kind == TYPE_OPAQUE) {
-                        /* target is *opaque — record source type */
-                        Type *src_type = typemap_get(c, init->intrinsic.args[0]);
-                        if (src_type) sym->provenance_type = src_type;
-                    }
-                }
-                /* alias propagation: q = p where p has provenance
-                 * BUG-358: also walk through @bitcast/@cast to find root ident */
+                /* @ptrcast provenance removed — BUG-393 runtime tags */
+                /* alias propagation for @container provenance only
+                 * BUG-358: walk through @bitcast/@cast to find root ident */
                 {
                     Node *prov_root = init;
+                    if (init->kind == NODE_ORELSE) prov_root = init->orelse.expr;
                     while (prov_root && prov_root->kind == NODE_INTRINSIC &&
                            prov_root->intrinsic.arg_count > 0)
                         prov_root = prov_root->intrinsic.args[prov_root->intrinsic.arg_count - 1];
                     if (prov_root && prov_root->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             prov_root->ident.name, (uint32_t)prov_root->ident.name_len);
-                        if (src && src->provenance_type)
-                            sym->provenance_type = src->provenance_type;
                         if (src && src->container_struct) {
                             sym->container_struct = src->container_struct;
                             sym->container_field = src->container_field;
@@ -4624,6 +4574,7 @@ static void register_decl(Checker *c, Node *node) {
         t->struct_type.name_len = (uint32_t)node->struct_decl.name_len;
         t->struct_type.is_packed = node->struct_decl.is_packed;
         t->struct_type.field_count = (uint32_t)node->struct_decl.field_count;
+        t->struct_type.type_id = c->next_type_id++;
         t->struct_type.module_prefix = c->current_module;
         t->struct_type.module_prefix_len = c->current_module_len;
 
@@ -4688,6 +4639,7 @@ static void register_decl(Checker *c, Node *node) {
         t->enum_type.name = node->enum_decl.name;
         t->enum_type.name_len = (uint32_t)node->enum_decl.name_len;
         t->enum_type.variant_count = (uint32_t)node->enum_decl.variant_count;
+        t->enum_type.type_id = c->next_type_id++;
         t->enum_type.module_prefix = c->current_module;
         t->enum_type.module_prefix_len = c->current_module_len;
 
@@ -4740,6 +4692,7 @@ static void register_decl(Checker *c, Node *node) {
         t->union_type.name = node->union_decl.name;
         t->union_type.name_len = (uint32_t)node->union_decl.name_len;
         t->union_type.variant_count = (uint32_t)node->union_decl.variant_count;
+        t->union_type.type_id = c->next_type_id++;
         t->union_type.module_prefix = c->current_module;
         t->union_type.module_prefix_len = c->current_module_len;
 
@@ -5106,6 +5059,7 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     types_init(arena);
     c->global_scope = scope_new(arena, NULL);
     c->current_scope = c->global_scope;
+    c->next_type_id = 1; /* 0 = unknown provenance (BUG-393) */
 
     /* init dynamic type map */
     typemap_init(c);

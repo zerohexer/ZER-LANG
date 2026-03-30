@@ -3135,6 +3135,36 @@ int main(void) {
         25,
         "BUG-390: u64 handle multi-alloc+free+realloc = 25");
 
+    /* BUG-393: *opaque runtime provenance — correct round-trip */
+    printf("[BUG-393: *opaque round-trip correct type]\n");
+    test_compile_and_run(
+        "struct Sensor { u32 id; }\n"
+        "Sensor g_s;\n"
+        "u32 main() {\n"
+        "    g_s.id = 42;\n"
+        "    *opaque ctx = @ptrcast(*opaque, &g_s);\n"
+        "    *Sensor s2 = @ptrcast(*Sensor, ctx);\n"
+        "    return s2.id;\n"
+        "}\n",
+        42,
+        "BUG-393: *opaque round-trip preserves data = 42");
+
+    /* BUG-393: *opaque in struct field — provenance preserved per-instance */
+    printf("[BUG-393: *opaque struct field round-trip]\n");
+    test_compile_and_run(
+        "struct Sensor { u32 id; }\n"
+        "struct Holder { *opaque p; }\n"
+        "Sensor g_s;\n"
+        "Holder g_h;\n"
+        "u32 main() {\n"
+        "    g_s.id = 99;\n"
+        "    g_h.p = @ptrcast(*opaque, &g_s);\n"
+        "    *Sensor s2 = @ptrcast(*Sensor, g_h.p);\n"
+        "    return s2.id;\n"
+        "}\n",
+        99,
+        "BUG-393: *opaque struct field round-trip = 99");
+
     /* BUG-310: volatile slice — volatile propagates through array→slice coercion */
     test_compile_and_run(
         "volatile u8[4] hw;\n"

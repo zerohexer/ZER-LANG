@@ -1451,6 +1451,25 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
+### Runtime Provenance Tags for *opaque (BUG-393)
+`*opaque` in emitted C is now `_zer_opaque` struct (`{ void *ptr; uint32_t type_id; }`), not `void*`. Each struct/enum/union gets a unique `type_id` assigned in `register_decl` via `c->next_type_id++` (0 = unknown/external).
+
+**Emitter changes:**
+- `emit_type(TYPE_POINTER)`: when inner is TYPE_OPAQUE, emits `_zer_opaque` (no star)
+- `is_null_sentinel`: excludes TYPE_OPAQUE inner — `?*opaque` is now struct optional `_zer_opt_opaque`
+- `@ptrcast` TO `*opaque`: emits `(_zer_opaque){(void*)(expr), TYPE_ID}` where TYPE_ID is the source type's `type_id`
+- `@ptrcast` FROM `*opaque`: emits `({ _zer_opaque tmp = expr; if (tmp.type_id != EXPECTED && tmp.type_id != 0) trap; (T*)tmp.ptr; })`
+- Preamble: `_zer_opaque` and `_zer_opt_opaque` typedefs after `_zer_opt_void`
+
+**Checker changes:**
+- `Symbol.provenance_type` REMOVED — no longer needed, runtime handles it
+- All provenance SET sites removed (NODE_ASSIGN, NODE_VAR_DECL)
+- All provenance CHECK sites removed (@ptrcast handler)
+- `@container` field/struct provenance (`container_struct/field` on Symbol) KEPT — orthogonal system
+- `next_type_id` counter on Checker, initialized to 1
+
+**Coverage:** 100% of `*opaque` round-trips. Type_id embedded in data, not compiler metadata. Struct fields, array elements, function returns all carry provenance. Unknown (params, cinclude) = type_id 0 = allowed through.
+
 ### Comptime Array Sizes (BUG-391)
 `u8[BIT(3)]` now works. In `resolve_type_inner(TYNODE_ARRAY)`, when `eval_const_expr` fails and the size expr is `NODE_CALL` with a comptime callee (`is_comptime && func_node`), evaluates via `eval_comptime_block`. `ComptimeParam` and `eval_comptime_block` forward-declared above `resolve_type_inner` for this purpose. Nested comptime calls in array sizes don't work yet (would need recursive comptime resolution in `eval_comptime_block`).
 

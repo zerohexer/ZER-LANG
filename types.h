@@ -99,6 +99,7 @@ struct Type {
             bool is_packed;
             const char *module_prefix;  /* NULL for main module */
             uint32_t module_prefix_len;
+            uint32_t type_id;           /* BUG-393: runtime provenance tag */
         } struct_type;
 
         /* TYPE_ENUM */
@@ -109,6 +110,7 @@ struct Type {
             uint32_t name_len;
             const char *module_prefix;
             uint32_t module_prefix_len;
+            uint32_t type_id;           /* BUG-393: runtime provenance tag */
         } enum_type;
 
         /* TYPE_UNION */
@@ -119,6 +121,7 @@ struct Type {
             uint32_t name_len;
             const char *module_prefix;
             uint32_t module_prefix_len;
+            uint32_t type_id;           /* BUG-393: runtime provenance tag */
         } union_type;
 
         /* TYPE_FUNC_PTR */
@@ -180,8 +183,8 @@ struct Symbol {
     bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
 
-    /* @ptrcast provenance: tracks original type before cast to *opaque */
-    Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
+    /* @ptrcast provenance: now handled by runtime type tags on _zer_opaque (BUG-393).
+     * Symbol-level provenance_type REMOVED — replaced by runtime type_id in emitted C. */
 
     /* @container provenance: tracks which struct+field this pointer points inside */
     Type *container_struct;          /* NULL = unknown */

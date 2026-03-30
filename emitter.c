@@ -55,6 +55,9 @@ static inline bool is_null_sentinel(Type *inner) {
     if (!inner) return false;
     /* BUG-279: unwrap ALL levels of distinct, not just one */
     while (inner->kind == TYPE_DISTINCT) inner = inner->distinct.underlying;
+    /* BUG-393: *opaque is _zer_opaque struct, not a pointer — NOT null sentinel */
+    if (inner->kind == TYPE_POINTER && inner->pointer.inner &&
+        inner->pointer.inner->kind == TYPE_OPAQUE) return false;
     return inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR;
 }
 #define IS_NULL_SENTINEL(inner_kind) \
@@ -156,10 +159,17 @@ static void emit_type(Emitter *e, Type *t) {
     case TYPE_OPAQUE: emit(e, "void"); break;
 
     case TYPE_POINTER:
-        if (t->pointer.is_const) emit(e, "const ");
-        if (t->pointer.is_volatile) emit(e, "volatile ");
-        emit_type(e, t->pointer.inner);
-        emit(e, "*");
+        if (t->pointer.inner && t->pointer.inner->kind == TYPE_OPAQUE) {
+            /* BUG-393: *opaque → _zer_opaque (tagged struct, not void*) */
+            if (t->pointer.is_const) emit(e, "const ");
+            if (t->pointer.is_volatile) emit(e, "volatile ");
+            emit(e, "_zer_opaque");
+        } else {
+            if (t->pointer.is_const) emit(e, "const ");
+            if (t->pointer.is_volatile) emit(e, "volatile ");
+            emit_type(e, t->pointer.inner);
+            emit(e, "*");
+        }
         break;
 
     case TYPE_OPTIONAL:
@@ -190,6 +200,15 @@ static void emit_type(Emitter *e, Type *t) {
             break;
         case TYPE_HANDLE:
             emit(e, "_zer_opt_u64");  /* handles are uint64_t (BUG-390) */
+            break;
+        case TYPE_POINTER:
+            if (opt_inner->pointer.inner &&
+                opt_inner->pointer.inner->kind == TYPE_OPAQUE) {
+                emit(e, "_zer_opt_opaque");  /* BUG-393: ?*opaque → struct optional */
+            } else {
+                /* regular ?*T — null sentinel, shouldn't reach here */
+                emit_type(e, opt_inner);
+            }
             break;
         case TYPE_STRUCT:
             emit(e, "_zer_opt_");
@@ -1668,16 +1687,68 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             emit(e, ")");
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
-            /* @ptrcast(*T, expr) → (T*)(expr) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* BUG-393: @ptrcast with runtime type tags for *opaque */
+            Type *tgt_type = node->intrinsic.type_arg ?
+                resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            Type *src_type = (node->intrinsic.arg_count > 0) ?
+                checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+            Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+
+            if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                tgt_eff->pointer.inner && tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
+                /* casting TO *opaque — wrap with type_id */
+                /* determine source type's ID */
+                uint32_t tid = 0;
+                if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
+                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
+                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
+                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
+                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                }
+                emit(e, "(_zer_opaque){(void*)(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "), %u}", (unsigned)tid);
+            } else if (src_eff && src_eff->kind == TYPE_POINTER &&
+                       src_eff->pointer.inner &&
+                       src_eff->pointer.inner->kind == TYPE_OPAQUE) {
+                /* casting FROM *opaque — check type_id + unwrap .ptr */
+                uint32_t expected_tid = 0;
+                if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
+                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
+                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
+                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                }
+                if (expected_tid > 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+                    if (node->intrinsic.arg_count > 0)
+                        emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) ",
+                         tmp, (unsigned)expected_tid, tmp);
+                    emit(e, "_zer_trap(\"@ptrcast type mismatch\", __FILE__, __LINE__); (");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")_zer_pc%d.ptr; })", tmp);
+                } else {
+                    /* target is primitive pointer or unknown — just unwrap .ptr */
+                    emit(e, "(");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, ").ptr");
+                }
+            } else {
+                /* neither side is *opaque — plain cast */
+                emit(e, "(");
+                if (tgt_type) emit_type(e, tgt_type);
+                emit(e, ")(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
             }
-            emit(e, ")(");
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ")");
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             /* @bitcast(T, val) → memcpy type punning (valid C99+GCC) */
             if (node->intrinsic.type_arg) {
@@ -3157,6 +3228,12 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "typedef struct { float value; uint8_t has_value; } _zer_opt_f32;\n");
     emit(e, "typedef struct { double value; uint8_t has_value; } _zer_opt_f64;\n");
     emit(e, "typedef struct { uint8_t has_value; } _zer_opt_void;\n");
+    emit(e, "\n");
+
+    /* BUG-393: tagged opaque pointer — runtime provenance checking */
+    emit(e, "/* ZER opaque pointer with runtime type tag */\n");
+    emit(e, "typedef struct { void *ptr; uint32_t type_id; } _zer_opaque;\n");
+    emit(e, "typedef struct { _zer_opaque value; uint8_t has_value; } _zer_opt_opaque;\n");
     emit(e, "\n");
 
     /* ZER slice types — all primitives */

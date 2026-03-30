@@ -1936,6 +1936,14 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-393: *opaque runtime provenance via type tags
+- **Symptom:** Provenance tracking for `@ptrcast` was compile-time only, stored on Symbol. Struct fields (`h.p`), array elements (`arr[i]`), function returns, and cross-function flows all lost provenance.
+- **Root cause:** `provenance_type` on Symbol only tracked simple variable assignments. No runtime fallback for cases the compiler couldn't prove.
+- **Fix:** `*opaque` in emitted C becomes `_zer_opaque` struct: `{ void *ptr; uint32_t type_id; }`. Each struct/enum/union gets a unique `type_id` assigned during `register_decl`. `@ptrcast(*opaque, sensor_ptr)` wraps with `(_zer_opaque){(void*)ptr, TYPE_ID}`. `@ptrcast(*Sensor, ctx)` unwraps with runtime check: `if (ctx.type_id != expected && ctx.type_id != 0) _zer_trap(...)`. Type ID 0 = unknown (params, cinclude) → always allowed.
+- **Breaking changes:** `?*opaque` is no longer a null sentinel — becomes struct optional `_zer_opt_opaque`. Symbol-level `provenance_type` removed (was compile-time only). Old provenance checker tests changed from `err` to `ok` (runtime catches instead).
+- **Coverage:** 100% of `*opaque` round-trips — local vars, struct fields, arrays, function returns, cross-function. The type_id travels with the data, not compiler metadata.
+- **Test:** 2 E2E tests: simple round-trip (42), struct field round-trip (99). 3 checker tests updated from `err` to `ok`.
+
 ### BUG-391: comptime function calls as array sizes
 - **Symptom:** `u8[BIT(3)] buf` failed — "array size must be a compile-time constant". comptime couldn't replace C macros for buffer sizing.
 - **Root cause:** `eval_const_expr` in ast.h has no Checker access, can't resolve NODE_CALL. Array size resolution in TYNODE_ARRAY only tried `eval_const_expr`, never attempted comptime evaluation.

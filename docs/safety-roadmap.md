@@ -345,3 +345,103 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 | Ranged integers (`u32(0..N)`) | v1.0-v2.0 | ~500-800 | No |
 
 All features are additive. No existing ZER code breaks. The programmer opts in to stricter types for compile-time guarantees. The old patterns continue to work with runtime checks.
+
+---
+
+## Design Decisions: Forced vs Optional
+
+### Decision: Ranged Indexing — FORCED
+
+Array/slice indexing with `buf[i]` **requires** `i` to be a ranged type (`u32(0..buf.len)`) or a compile-time-provable literal. Bare `u32` as index is a compile error.
+
+**Rationale:**
+- Bounds checks are 30-50% of all runtime checks — the highest-frequency safety cost
+- Buffer overflows are the #1 vulnerability class in systems code
+- The boilerplate is minimal — one `orelse` per index source
+- Same forcing pattern as `orelse` for optionals (already accepted by ZER programmers)
+- Teaches good habit: handle the out-of-range case at the point you receive the value
+
+```zer
+// COMPILE ERROR: i is bare u32
+u32 i = get_index();
+buf[i] = 5;
+
+// OK: ranged type, proven at construction
+u32(0..buf.len) i = get_index() orelse return;
+buf[i] = 5;  // zero runtime cost
+
+// OK: literal, compiler proves in range
+buf[0] = 5;
+buf[7] = 5;
+
+// OK: iterator, structurally bounded
+for (x in buf) { x += 1; }
+```
+
+**Migration path (zer-convert / zer-upgrade):**
+- `zer-convert` outputs `buf[i] = 5` (compat-level, runtime bounds check)
+- `zer-upgrade` rewrites to `u32(0..buf.len) i = i orelse return; buf[i] = 5`
+- Same pipeline as `malloc → compat → Slab`
+
+### Decision: Non-Zero Division — OPTIONAL (not forced)
+
+`nz_u32` exists as an opt-in type. Regular `u32 / u32` keeps runtime div-zero check. Not forced.
+
+**Rationale:**
+- Division is only 1-2% of statements — low frequency
+- Runtime div-zero check costs 2 cycles — negligible
+- Forcing `nz()` on every divisor adds boilerplate with minimal safety return
+- Division by zero is rarely a vulnerability (it crashes, doesn't corrupt memory)
+
+```zer
+// Both are valid:
+u32 result = total / count;              // runtime check — SAFE, 2 cycles
+nz_u32 safe_count = nz(count) orelse 1;
+u32 result = total / safe_count;          // no check — programmer opted in
+```
+
+**Smart compiler inference (no boilerplate needed):**
+- `total / 4` — literal, compiler proves nonzero
+- `total / (a + 1)` — unsigned a+1 >= 1, compiler proves nonzero
+- `total / nz_val` — nz type, proven
+- `total / count` — unknown, runtime check
+
+### Decision: Iterators — OPTIONAL (not forced)
+
+`for (x in arr)` is available alongside `for (u32 i = 0; ...)`. Not forced — both work.
+
+**Rationale:**
+- Some loops genuinely need an index variable (e.g., writing to a second array)
+- The indexed loop still has runtime bounds checks — safe, just slower
+- Iterators are the **better tool** but forcing them would break legitimate patterns
+
+```zer
+// Both valid:
+for (x in buf) { process(x); }                          // no bounds check
+for (u32 i = 0; i < buf.len; i += 1) { buf2[i] = buf[i]; }  // bounds checks on both
+```
+
+When ranged indexing is forced (above), the indexed loop pattern naturally becomes:
+```zer
+for (u32(0..buf.len) i = 0; i < buf.len; i += 1) {
+    buf[i] = 5;  // no bounds check — i is ranged
+}
+```
+The compiler can infer the range from the loop condition `i < buf.len`, so the programmer may not even need to write the range explicitly. This is a compiler optimization, not a language rule.
+
+### Summary Table
+
+| Feature | Enforcement | Reason |
+|---------|------------|--------|
+| Ranged indexing | **FORCED** | High frequency (30-50%), #1 vulnerability class, minimal boilerplate |
+| Non-zero division | Optional | Low frequency (1-2%), negligible runtime cost, annoying to force |
+| Iterators | Optional | Better tool, not the only valid tool |
+| zercheck 1-4 | Automatic | Compiler improvement, no programmer involvement |
+
+### Debug/Release Flag (Future)
+
+Not implemented yet. Future addition:
+- `zerc --debug`: emit runtime checks even on proven paths (validates compiler reasoning)
+- `zerc` or `zerc --release`: skip proven checks (production performance)
+
+Default behavior until flag exists: proven paths skip runtime checks (the whole point of ranged types).

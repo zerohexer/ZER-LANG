@@ -424,6 +424,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_POINTER: {
         Type *inner = resolve_type(c, tn->pointer.inner);
+        /* BUG-372: *void is invalid — use *opaque for type-erased pointers */
+        if (inner && inner->kind == TYPE_VOID) {
+            checker_error(c, tn->loc.line,
+                "cannot create pointer to void — use '*opaque' for type-erased pointers");
+        }
         return type_pointer(c->arena, inner);
     }
 
@@ -439,6 +444,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_SLICE: {
         Type *inner = resolve_type(c, tn->slice.inner);
+        /* BUG-372: []void is invalid — void has no size */
+        if (inner && inner->kind == TYPE_VOID) {
+            checker_error(c, tn->loc.line,
+                "cannot create slice of void — void has no size");
+        }
         return type_slice(c->arena, inner);
     }
 
@@ -1986,13 +1996,22 @@ static Type *check_expr(Checker *c, Node *node) {
                          * BUG-339: also check orelse fallback for &local.
                          * BUG-338: walk into intrinsics for &local. */
                         Node *arg_node = node->call.args[i];
-                        /* unwrap orelse — check both expr and fallback */
-                        Node *keep_checks[2] = { arg_node, NULL };
+                        /* unwrap orelse — check all branches recursively
+                         * BUG-370: nested orelse chains: a orelse b orelse &x */
+                        Node *keep_checks[8] = { arg_node, NULL };
                         int keep_check_count = 1;
-                        if (arg_node->kind == NODE_ORELSE) {
-                            keep_checks[0] = arg_node->orelse.expr;
-                            if (arg_node->orelse.fallback)
-                                keep_checks[keep_check_count++] = arg_node->orelse.fallback;
+                        {
+                            Node *ow = arg_node;
+                            int idx = 0;
+                            while (ow && ow->kind == NODE_ORELSE && idx < 7) {
+                                keep_checks[idx++] = ow->orelse.expr;
+                                if (ow->orelse.fallback && ow->orelse.fallback->kind != NODE_ORELSE) {
+                                    keep_checks[idx++] = ow->orelse.fallback;
+                                    break;
+                                }
+                                ow = ow->orelse.fallback;
+                            }
+                            if (idx > 0) keep_check_count = idx;
                         }
                         for (int kc = 0; kc < keep_check_count; kc++) {
                         Node *karg = keep_checks[kc];
@@ -2031,7 +2050,27 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                         } /* end keep_checks loop (BUG-339) */
-                        /* BUG-221: also reject local-derived pointers */
+                        /* BUG-221/370: also reject local-derived pointers.
+                         * Walk through orelse chain to check all branches. */
+                        Node *ld_check = arg_node;
+                        while (ld_check && ld_check->kind == NODE_ORELSE)
+                            ld_check = ld_check->orelse.expr;
+                        if (ld_check && ld_check->kind == NODE_IDENT) {
+                            Symbol *arg_sym = scope_lookup(c->current_scope,
+                                ld_check->ident.name, (uint32_t)ld_check->ident.name_len);
+                            if (arg_sym && arg_sym->is_local_derived) {
+                                checker_error(c, node->loc.line,
+                                    "argument %d: local-derived pointer '%.*s' cannot "
+                                    "satisfy 'keep' parameter — points to stack memory",
+                                    i + 1, (int)arg_sym->name_len, arg_sym->name);
+                            }
+                            if (arg_sym && arg_sym->is_arena_derived) {
+                                checker_error(c, node->loc.line,
+                                    "argument %d: arena-derived pointer '%.*s' cannot "
+                                    "satisfy 'keep' parameter — arena memory may be reset",
+                                    i + 1, (int)arg_sym->name_len, arg_sym->name);
+                            }
+                        }
                         if (arg_node->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
                                 arg_node->ident.name,
@@ -2815,9 +2854,11 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@inttoptr requires mmio range declarations — "
                             "add 'mmio 0xSTART..0xEND;' or use --no-strict-mmio");
                     }
-                    if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0 &&
-                        node->intrinsic.args[0]->kind == NODE_INT_LIT) {
-                        uint64_t addr = node->intrinsic.args[0]->int_lit.value;
+                    /* BUG-371: also validate constant expressions, not just literals */
+                    if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0) {
+                        int64_t cval = eval_const_expr(node->intrinsic.args[0]);
+                        if (cval != CONST_EVAL_FAIL) {
+                        uint64_t addr = (uint64_t)cval;
                         bool in_range = false;
                         for (int ri = 0; ri < c->mmio_range_count; ri++) {
                             if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
@@ -2830,7 +2871,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "@inttoptr address 0x%llx is outside all declared mmio ranges",
                                 (unsigned long long)addr);
                         }
-                    }
+                    } }
                 }
             } else {
                 result = ty_void;

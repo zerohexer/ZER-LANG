@@ -1494,6 +1494,19 @@ static void test_negative_sweep(void) {
     ok("u32 main() { usize x = 42; u32 y = x; return y; }",
        "usize to u32 same-width coercion on 32-bit target");
 
+    /* 64-bit target: usize→u32 is narrowing, must be rejected */
+    {
+        int saved = zer_target_ptr_bits;
+        zer_target_ptr_bits = 64;
+        err("u32 main() { usize x = 42; u32 y = x; return y; }",
+            "64-bit: usize to u32 narrowing rejected");
+        ok("u32 main() { u32 x = 42; usize len = x; return @truncate(u32, len); }",
+           "64-bit: u32 to usize widening accepted");
+        ok("u32 main() { u64 x = 42; usize len = x; return @truncate(u32, len); }",
+           "64-bit: u64 to usize same-width accepted");
+        zer_target_ptr_bits = saved;
+    }
+
     /* BUG-310: volatile slice qualifier */
     err("volatile u8[16] hw_regs;\n"
         "void poll([]u8 regs) { while (regs[0] == 0) { } }\n"

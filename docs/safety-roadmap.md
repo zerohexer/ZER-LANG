@@ -356,7 +356,7 @@ These are runtime checks that ZER keeps because the information is **physically 
 | Check | ZER | SPARK/Ada | Why runtime is inherent |
 |-------|-----|-----------|------------------------|
 | `*opaque` variable-index `arr[i]` | Runtime type_id trap | **N/A** (no void* in SPARK) | `i` is a runtime value — can't know which element |
-| @cstr variable slice (unguarded) | Runtime overflow trap | **N/A** (no @cstr in SPARK) | Slice length is runtime input |
+| ~~@cstr variable slice~~ | ~~Runtime overflow trap~~ | **N/A** | **ELIMINATED** — silent truncation, never overflows, no runtime trap |
 | Arena alloc overflow | Runtime `__builtin_mul_overflow` | **N/A** (no arena in SPARK, stack only) | Multiplication overflow depends on runtime `n` |
 | MMIO computed address (rare) | Runtime range trap | Same (runtime check) | Address computed from runtime value |
 
@@ -578,8 +578,9 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Forced division guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
 | Forced bounds guard | Compiler rule | **None** (new error only) | ~20 lines in checker.c |
 | Forced keep on fn ptr params | Compiler rule | **None** (extends existing `keep`) | ~10 lines in checker.c |
+| @cstr safe truncation | Emitter change | **None** | ~10 lines in emitter.c |
 
-**All five are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, and forces three safety invariants. No new types, no new keywords, no new syntax.
+**All six are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, forces safety invariants, and makes @cstr physically unable to overflow. No new types, no new keywords, no new syntax.
 
 **Forced rules** — same pattern as existing forced rules:
 - `*T` requires initializer (already forced)
@@ -587,6 +588,7 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 - Division requires proven nonzero divisor (NEW)
 - Array/slice indexing requires proven in-range index (NEW)
 - Function pointers returning pointer with pointer params require `keep` on those params (NEW — extends existing `keep` keyword)
+- `@cstr` silently truncates to fit buffer — never overflows (NEW — automatic, no programmer action)
 
 ```zer
 // Forced division: compiler error if divisor not proven nonzero
@@ -637,7 +639,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |
 | MMIO range | **~99%** | Computed variable addresses (rare) |
-| @cstr overflow | **~90%** | Unguarded variable slice (range propagation proves guarded slices fit, not forced) |
+| @cstr overflow | **100%** | Silent truncation for variable slices, compile error for constant strings that don't fit |
 | Arena overflow | **0%** | Inherently runtime |
 
 **Overall: ~97% compile-time for guarded code, ~92% for unguarded code.**
@@ -720,13 +722,31 @@ typedef struct {
 - Propagation through simple arithmetic (`x + 1` shifts range by 1)
 - `@cstr` overflow: if source slice length proven < buffer size via guard, skip runtime check (improves @cstr from ~50% to ~90% compile-time)
 
-**@cstr example (range propagation eliminates runtime check):**
+**@cstr safe truncation (REVISED — replaces range propagation approach):**
+
+`@cstr` now silently truncates to fit the destination buffer. Never overflows. No `orelse`, no `if` guard, no programmer action needed.
+
 ```zer
-u8[256] buf;
-if (n >= 255) { return; }        // guard: n now in 0..254
-@cstr(buf, data[0..n]);          // compiler: n + 1 <= 255 < 256 — skip check
+u8[8] buf;
+@cstr(buf, long_data);           // copies min(long_data.len, 7) bytes + null. Always fits.
+@cstr(buf, "hello world");       // COMPILE ERROR: constant "hello world" (11) > buf (8)
 ```
-Without guard: runtime check stays (safe, not forced — @cstr overflow is not C UB, it's a clean ZER trap).
+
+**Emitted C:**
+```c
+// Variable slice: silent truncation
+size_t _n = src.len < 7 ? src.len : 7;
+memcpy(buf, src.ptr, _n);
+buf[_n] = 0;
+
+// Constant string too large: compile error (checker catches this already)
+```
+
+**Rules:**
+- Constant string that doesn't fit → compile error (fix your sizes, don't silently truncate hardcoded strings)
+- Variable slice → truncate to `buf_size - 1`, always safe, 2 extra instructions (compare + conditional)
+- No runtime trap. No `orelse`. No programmer effort. Buffer physically cannot overflow.
+- Removes @cstr from the runtime check table entirely — **100% safe with zero boilerplate**.
 
 **Does NOT handle (acceptable):**
 - Cross-function range inference (would need function summaries)

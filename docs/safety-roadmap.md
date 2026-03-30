@@ -336,6 +336,18 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 
 ## Implementation Timeline
 
+### FINAL (revised)
+
+| Feature | Target | Lines | Language Change | Breaks Existing Code? |
+|---------|--------|-------|----------------|----------------------|
+| zercheck changes 1-3 | v0.2.2 (now) | ~90 | **None** | No |
+| zercheck change 4 (cross-func) | v0.3 | ~300 | **None** | No |
+| Value range propagation | v0.3 | ~300-500 | **None** | No |
+
+Total: ~700-900 lines of compiler logic. Zero language changes. Zero new keywords. Zero new types.
+
+### Original (preserved for reference)
+
 | Feature | Target | Lines | Breaks Existing Code? |
 |---------|--------|-------|-----------------------|
 | zercheck changes 1-3 | v0.2.2 (now) | ~90 | No |
@@ -528,28 +540,25 @@ u32 i = get_index();
 buf[i] = 5;                          // runtime bounds check (can't prove)
 ```
 
-### This Replaces Three Planned Features
+### This Replaces ALL Planned Language Features
 
 | Original Feature | Status | Replaced By |
 |-----------------|--------|-------------|
 | `nz_u32` (non-zero type) | **REPLACED** | Range propagation infers nonzero from `if (x != 0)` guards |
 | `u32(0..N)` (ranged integers) | **REPLACED** | Range propagation infers bounds from `if (i < N)` guards |
 | Forced ranged indexing | **REPLACED** | Not needed — compiler auto-eliminates checks when guards exist |
+| Iterators (`for in`) | **NOT NEEDED for safety** | Range propagation handles `for (i = 0; i < len; ...)` loops. Iterators may be added later as ergonomic improvement, not a safety feature. |
 
-**What remains as planned:**
-- **zercheck 1-4** — unchanged, still needed for handle tracking
-- **Iterators (`for in`)** — still useful for cleaner syntax + guaranteed no bounds check
+### FINAL PLAN: Two Features, Zero Language Complexity
 
-### Iterators — OPTIONAL (unchanged)
+| Feature | Type | Language change | Implementation |
+|---------|------|----------------|----------------|
+| zercheck 1-4 | Compiler improvement | **None** | ~400 lines in zercheck.c |
+| Value range propagation | Compiler improvement | **None** | ~300-500 lines in checker.c |
 
-`for (x in arr)` still planned as a cleaner syntax option. Not forced.
+**Both are invisible to the programmer.** Same ZER code. Same C syntax. The compiler just gets smarter about what it can prove. This is the ZER philosophy — the programmer writes natural defensive code, the compiler rewards them by skipping redundant runtime checks.
 
-```zer
-for (x in buf) { process(x); }                                // no bounds check (structural)
-for (u32 i = 0; i < buf.len; i += 1) { buf[i] = process(i); } // no bounds check (range propagation)
-```
-
-Both achieve the same result. Iterator is cleaner. Indexed loop is more flexible. Programmer picks.
+**Iterators are NOT on the safety roadmap.** They may be added in the future as a syntax convenience (ergonomics), but they are not needed for compile-time safety — value range propagation covers the same loop patterns. If iterators are added, it's a separate decision driven by programmer ergonomics, not safety.
 
 ### Coverage After Range Propagation
 

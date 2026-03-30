@@ -440,6 +440,37 @@ int main(void) {
         "}\n",
         "BUG-380: free(h) then get(s.h) — use-after-free via alias");
 
+    /* BUG-385: struct param with Handle field — UAF via s.h */
+    printf("[BUG-385: struct param handle UAF]\n");
+    err("struct T { u32 x; }\n"
+        "struct State { Handle(T) h; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(State s) {\n"
+        "    pool.free(s.h);\n"
+        "    pool.get(s.h).x = 5;\n"
+        "}\n",
+        "BUG-385: struct param handle use-after-free");
+
+    printf("[BUG-385: struct param handle double free]\n");
+    err("struct T { u32 x; }\n"
+        "struct State { Handle(T) h; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(State s) {\n"
+        "    pool.free(s.h);\n"
+        "    pool.free(s.h);\n"
+        "}\n",
+        "BUG-385: struct param handle double free");
+
+    printf("[BUG-385: struct param handle valid use]\n");
+    ok("struct T { u32 x; }\n"
+       "struct State { Handle(T) h; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f(State s) {\n"
+       "    pool.get(s.h).x = 5;\n"
+       "    pool.free(s.h);\n"
+       "}\n",
+       "BUG-385: struct param handle valid lifecycle");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

@@ -3606,12 +3606,18 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-360/374: function call returning pointer — if any pointer arg is
              * local-derived, conservatively mark the result as local-derived.
              * identity(&x) returns &x, must not escape.
-             * BUG-374: recurse into nested calls — identity(identity(&x)). */
+             * BUG-374: recurse into nested calls — identity(identity(&x)).
+             * BUG-383: also walk through field/index chains — wrap(&x).p. */
             if (sym && node->var_decl.init && type &&
                 type->kind == TYPE_POINTER) {
                 Node *call = node->var_decl.init;
                 if (call->kind == NODE_ORELSE) call = call->orelse.expr;
-                if (call->kind == NODE_CALL) {
+                /* BUG-383: walk through field/index to find call root */
+                while (call && (call->kind == NODE_FIELD || call->kind == NODE_INDEX)) {
+                    if (call->kind == NODE_FIELD) call = call->field.object;
+                    else call = call->index_expr.object;
+                }
+                if (call && call->kind == NODE_CALL) {
                     if (call_has_local_derived_arg(c, call, 0)) {
                         sym->is_local_derived = true;
                     }
@@ -4342,6 +4348,25 @@ static void check_stmt(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot return result of call with local-derived pointer argument — "
                         "stack memory may escape through function return");
+                }
+            }
+
+            /* BUG-383: return wrap(&x).p — struct wrapper bypasses BUG-360 because
+             * the function returns a struct, not a pointer. Walk through field/index
+             * chains to find if root is a NODE_CALL with local-derived args.
+             * Only when the final return type is a pointer (extracted via .field). */
+            if (ret_type && ret_type->kind == TYPE_POINTER) {
+                Node *rroot = node->ret.expr;
+                while (rroot && (rroot->kind == NODE_FIELD || rroot->kind == NODE_INDEX)) {
+                    if (rroot->kind == NODE_FIELD) rroot = rroot->field.object;
+                    else rroot = rroot->index_expr.object;
+                }
+                if (rroot && rroot->kind == NODE_CALL) {
+                    if (call_has_local_derived_arg(c, rroot, 0)) {
+                        checker_error(c, node->loc.line,
+                            "cannot return pointer extracted from call with local-derived "
+                            "argument — stack memory may escape through struct field");
+                    }
                 }
             }
 

@@ -1936,6 +1936,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-383: Identity washing via struct wrappers
+- **Symptom:** `return wrap(&x).p` — wraps local address in struct, extracts pointer field. BUG-360 only checked direct call with pointer return type, not struct-returning calls with field extraction.
+- **Root cause:** BUG-360/374 check required `node->ret.expr->kind == NODE_CALL && ret_type->kind == TYPE_POINTER`. When return expr is NODE_FIELD on NODE_CALL (struct wrapper), the call was never inspected.
+- **Fix:** In NODE_RETURN, walk return expression through field/index chains. If root is NODE_CALL with local-derived args and final return type is pointer, reject. Same walk added to NODE_VAR_DECL init path.
+- **Test:** 2 tests added: `wrap(&local).p` rejected, `wrap(&global).p` allowed.
+
+### BUG-384: @cstr volatile source stripping
+- **Symptom:** `@cstr(local_buf, mmio_buf[0..4])` emitted `memcpy` — GCC may optimize away volatile reads from hardware buffer.
+- **Root cause:** @cstr emitter only checked destination volatility (BUG-223), not source. Also `expr_root_symbol` didn't walk through NODE_SLICE.
+- **Fix:** (1) Added `src_volatile` check via `expr_is_volatile` on source arg. `any_volatile = dest_volatile || src_volatile` triggers byte loop. Source pointer cast uses `volatile const uint8_t*` when source is volatile. (2) Added NODE_SLICE to `expr_root_symbol` walk — `mmio_buf[0..4]` now correctly resolves to `mmio_buf` symbol.
+- **Test:** Verified emitted C uses byte loop with volatile source cast.
+
+### BUG-385: zercheck doesn't scan struct params for Handle fields
+- **Symptom:** `void f(State s) { pool.free(s.h); pool.get(s.h); }` — UAF not detected. zercheck only registered direct `Handle(T)` params, not handles nested in struct params.
+- **Root cause:** `zc_check_function` param scan only checked `TYNODE_HANDLE`. Struct params (`TYNODE_NAMED`) were ignored.
+- **Fix:** For TYNODE_NAMED params, resolve via checker's global scope, walk struct fields for TYPE_HANDLE. Build compound keys `"param.field"` and register as HS_ALIVE.
+- **Test:** 3 tests added: struct param UAF, double free, valid lifecycle.
+
 ### BUG-381: @container strips volatile qualifier
 - **Symptom:** `volatile *u32 ptr = ...; *Device d = @container(*Device, ptr, list)` — emitted C casts volatile pointer to non-volatile `Device*`. GCC optimizes away subsequent hardware register accesses.
 - **Root cause:** @container emitter emitted `(T*)((char*)(ptr) - offsetof(T, field))` without checking source volatility. Checker also didn't validate volatile like @ptrcast (BUG-258).

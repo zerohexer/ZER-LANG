@@ -563,17 +563,51 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
     pathstate_init(&ps);
 
     /* register Handle(T) parameters as alive handles so use-after-free
-     * on parameters is caught within the function body (BUG-117 fix) */
+     * on parameters is caught within the function body (BUG-117 fix).
+     * BUG-385: also scan struct/union parameters for Handle fields. */
     for (int i = 0; i < func->func_decl.param_count; i++) {
         TypeNode *tnode = func->func_decl.params[i].type;
+        const char *pname = func->func_decl.params[i].name;
+        uint32_t plen = (uint32_t)func->func_decl.params[i].name_len;
         if (tnode && tnode->kind == TYNODE_HANDLE) {
-            HandleInfo *h = add_handle(&ps,
-                func->func_decl.params[i].name,
-                (uint32_t)func->func_decl.params[i].name_len);
+            HandleInfo *h = add_handle(&ps, pname, plen);
             if (h) {
                 h->state = HS_ALIVE;
-                h->pool_id = -1; /* unknown pool — can't validate wrong-pool */
+                h->pool_id = -1;
                 h->alloc_line = func->loc.line;
+            }
+        }
+        /* BUG-385: if param is a struct, scan for Handle fields.
+         * Build compound keys like "s.h" for each Handle field. */
+        if (tnode && tnode->kind == TYNODE_NAMED) {
+            Symbol *type_sym = scope_lookup(zc->checker->global_scope,
+                tnode->named.name, (uint32_t)tnode->named.name_len);
+            if (type_sym && type_sym->type) {
+                Type *st = type_unwrap_distinct(type_sym->type);
+                if (st && st->kind == TYPE_STRUCT) {
+                    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+                        Type *ft = type_unwrap_distinct(st->struct_type.fields[fi].type);
+                        if (ft && ft->kind == TYPE_HANDLE) {
+                            /* build "param.field" key */
+                            uint32_t flen = st->struct_type.fields[fi].name_len;
+                            int klen = (int)(plen + 1 + flen);
+                            char *key = (char *)arena_alloc(zc->arena, klen + 1);
+                            if (key) {
+                                memcpy(key, pname, plen);
+                                key[plen] = '.';
+                                memcpy(key + plen + 1,
+                                       st->struct_type.fields[fi].name, flen);
+                                key[klen] = '\0';
+                                HandleInfo *h = add_handle(&ps, key, (uint32_t)klen);
+                                if (h) {
+                                    h->state = HS_ALIVE;
+                                    h->pool_id = -1;
+                                    h->alloc_line = func->loc.line;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

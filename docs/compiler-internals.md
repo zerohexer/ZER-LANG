@@ -1451,6 +1451,15 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
+### Struct Wrapper Escape (BUG-383)
+`return wrap(&x).p` — walks return expression through NODE_FIELD/NODE_INDEX chains to find root NODE_CALL. If that call has local-derived args (via `call_has_local_derived_arg`) and the final return type is TYPE_POINTER, rejected. Same walk in NODE_VAR_DECL init: `*u32 p = wrap(&x).p` marks `p` as local-derived. Covers the pattern where a function wraps a pointer in a struct and the caller extracts it via field access.
+
+### @cstr Source Volatile (BUG-384)
+`@cstr` byte-loop now triggers when EITHER destination OR source is volatile. Previously only checked `dest_volatile`. Added `src_volatile` via `expr_is_volatile` on source arg. When source is volatile, the source pointer is cast to `volatile const uint8_t*` in the byte loop. Also fixed `expr_root_symbol` to walk through NODE_SLICE — `mmio_buf[0..4]` now correctly resolves to the `mmio_buf` root symbol.
+
+### zercheck Struct Parameter Handle Fields (BUG-385)
+`zc_check_function` now scans TYNODE_NAMED params by resolving via `checker->global_scope`, then walking struct fields for TYPE_HANDLE. Builds compound keys `"param.field"` and registers as HS_ALIVE. `void f(State s) { pool.free(s.h); pool.get(s.h); }` now detected as UAF.
+
 ### @container Volatile Propagation (BUG-381)
 `@container(*T, ptr, field)` now checks volatile on source pointer — same pattern as @ptrcast (BUG-258). Checker validates: if source is volatile (type-level `pointer.is_volatile` OR symbol-level `is_volatile`), target must also be volatile pointer. Emitter: `expr_is_volatile(e, args[0])` check, prepends `volatile ` before the cast type in the emitted `((volatile T*)((char*)(ptr) - offsetof(T, field)))`.
 

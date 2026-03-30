@@ -84,6 +84,7 @@ static Symbol *expr_root_symbol(Emitter *e, Node *expr) {
     while (root) {
         if (root->kind == NODE_FIELD) root = root->field.object;
         else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+        else if (root->kind == NODE_SLICE) root = root->slice.object;
         else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
             root = root->unary.operand;
         else break;
@@ -1823,8 +1824,12 @@ static void emit_expr(Emitter *e, Node *node) {
             bool dest_is_slice = buf_type && buf_type->kind == TYPE_SLICE;
             /* BUG-223/RF7: check if destination is volatile — walk field/index chains */
             /* RF11: use shared volatile detection helper */
+            /* BUG-384: also check source volatility — memcpy strips volatile reads */
             bool dest_volatile = (node->intrinsic.arg_count > 0) ?
                 expr_is_volatile(e, node->intrinsic.args[0]) : false;
+            bool src_volatile = (node->intrinsic.arg_count > 1) ?
+                expr_is_volatile(e, node->intrinsic.args[1]) : false;
+            bool any_volatile = dest_volatile || src_volatile;
             const char *vol = dest_volatile ? "volatile " : "";
             if (dest_is_slice) {
                 /* BUG-209: slice destination — hoist as slice, use .ptr */
@@ -1849,10 +1854,15 @@ static void emit_expr(Emitter *e, Node *node) {
             } else {
                 emit(e, "; ");
             }
-            if (dest_volatile) {
-                /* volatile: byte-by-byte copy (memcpy discards volatile qualifier) */
-                emit(e, "for (size_t _i = 0; _i < _zer_cs%d.len; _i++) _zer_cb%d[_i] = _zer_cs%d.ptr[_i]; ",
-                     tmp, tmp, tmp);
+            if (any_volatile) {
+                /* BUG-223/384: volatile byte-by-byte copy — memcpy strips volatile
+                 * on both reads (source) and writes (destination).
+                 * Cast source to volatile if source is volatile. */
+                const char *src_vol = src_volatile ? "volatile " : "";
+                emit(e, "{ %sconst uint8_t *_sv = (%sconst uint8_t*)_zer_cs%d.ptr; ",
+                     src_vol, src_vol, tmp);
+                emit(e, "for (size_t _i = 0; _i < _zer_cs%d.len; _i++) _zer_cb%d[_i] = _sv[_i]; } ",
+                     tmp, tmp);
             } else {
                 emit(e, "memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
             }

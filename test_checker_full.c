@@ -1577,6 +1577,24 @@ static void test_negative_sweep(void) {
        "}",
        "BUG-381: @container volatile preserved accepted");
 
+    /* BUG-383: struct wrapper escape via field extraction */
+    err("struct Wrap { *u32 p; }\n"
+        "Wrap wrap(*u32 p) { Wrap w; w.p = p; return w; }\n"
+        "*u32 leak() {\n"
+        "    u32 x = 5;\n"
+        "    return wrap(&x).p;\n"
+        "}\n"
+        "u32 main() { return 0; }",
+        "BUG-383: return wrap(&x).p caught");
+    ok("u32 g = 1;\n"
+       "struct Wrap { *u32 p; }\n"
+       "Wrap wrap(*u32 p) { Wrap w; w.p = p; return w; }\n"
+       "*u32 safe() {\n"
+       "    return wrap(&g).p;\n"
+       "}\n"
+       "u32 main() { return 0; }",
+       "BUG-383: return wrap(&global).p allowed");
+
     /* BUG-310: volatile slice qualifier */
     err("volatile u8[16] hw_regs;\n"
         "void poll([]u8 regs) { while (regs[0] == 0) { } }\n"

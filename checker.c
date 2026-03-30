@@ -311,8 +311,29 @@ static int64_t compute_type_size(Type *t) {
             if (vs > max_variant) max_variant = vs;
         }
         int64_t total = 4; /* int32_t _tag */
-        /* align union data to max variant alignment */
-        int data_align = (int)(max_variant > 8 ? 8 : (max_variant > 0 ? max_variant : 4));
+        /* BUG-364: align union data to max variant ALIGNMENT, not size.
+         * For arrays, alignment = element alignment (same fix as BUG-350 for structs). */
+        int data_align = 4; /* minimum: tag alignment */
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
+            Type *vt = type_unwrap_distinct(t->union_type.variants[i].type);
+            int va;
+            if (vt && vt->kind == TYPE_ARRAY) {
+                Type *elem = vt->array.inner;
+                while (elem && elem->kind == TYPE_ARRAY) elem = elem->array.inner;
+                int64_t esz = compute_type_size(elem);
+                va = (esz > 0 && esz <= 8) ? (int)esz : 1;
+            } else if (vt && vt->kind == TYPE_STRUCT && vt->struct_type.field_count > 0) {
+                va = 1;
+                for (uint32_t k = 0; k < vt->struct_type.field_count; k++) {
+                    int64_t ks = compute_type_size(vt->struct_type.fields[k].type);
+                    if (ks > 0 && ks <= 8 && (int)ks > va) va = (int)ks;
+                }
+            } else {
+                int64_t vs = compute_type_size(vt);
+                va = (int)(vs > 8 ? 8 : (vs > 0 ? vs : 1));
+            }
+            if (va > data_align) data_align = va;
+        }
         if (data_align > 1 && (total % data_align) != 0)
             total += data_align - (total % data_align);
         total += max_variant;
@@ -358,6 +379,8 @@ static int64_t compute_type_size(Type *t) {
             if (falign > max_align) max_align = falign;
             if (!is_packed && falign > 1 && (total % falign) != 0)
                 total += falign - (total % falign);
+            /* BUG-362: overflow-safe field summation */
+            if (fsize > 0 && total > INT64_MAX - fsize) return CONST_EVAL_FAIL;
             total += fsize;
         }
         if (!is_packed && max_align > 1 && (total % max_align) != 0)
@@ -3392,6 +3415,45 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
             }
+
+            /* BUG-360: function call returning pointer — if any pointer arg is
+             * local-derived, conservatively mark the result as local-derived.
+             * identity(&x) returns &x, must not escape. */
+            if (sym && node->var_decl.init && type &&
+                type->kind == TYPE_POINTER) {
+                Node *call = node->var_decl.init;
+                if (call->kind == NODE_ORELSE) call = call->orelse.expr;
+                if (call->kind == NODE_CALL) {
+                    for (int ai = 0; ai < call->call.arg_count; ai++) {
+                        Node *arg = call->call.args[ai];
+                        /* direct &local */
+                        if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+                            Node *root = arg->unary.operand;
+                            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                                if (root->kind == NODE_FIELD) root = root->field.object;
+                                else root = root->index_expr.object;
+                            }
+                            if (root && root->kind == NODE_IDENT) {
+                                bool is_global = scope_lookup_local(c->global_scope,
+                                    root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                                Symbol *asrc = scope_lookup(c->current_scope,
+                                    root->ident.name, (uint32_t)root->ident.name_len);
+                                if (asrc && !asrc->is_static && !is_global)
+                                    sym->is_local_derived = true;
+                            }
+                        }
+                        /* local-derived ident arg */
+                        if (arg->kind == NODE_IDENT) {
+                            Symbol *asrc = scope_lookup(c->current_scope,
+                                arg->ident.name, (uint32_t)arg->ident.name_len);
+                            if (asrc && asrc->is_local_derived)
+                                sym->is_local_derived = true;
+                            if (asrc && asrc->is_arena_derived)
+                                sym->is_arena_derived = true;
+                        }
+                    }
+                }
+            }
         }
         break;
     }
@@ -4102,6 +4164,45 @@ static void check_stmt(Checker *c, Node *node) {
                                 "cannot return @cstr of local buffer '%.*s' — "
                                 "stack memory is freed when function returns",
                                 (int)sym->name_len, sym->name);
+                        }
+                    }
+                }
+            }
+
+            /* BUG-360: return func(&local) — function call with local-derived pointer arg
+             * returning a pointer type. Conservatively assume result may be local-derived. */
+            if (node->ret.expr->kind == NODE_CALL &&
+                ret_type && ret_type->kind == TYPE_POINTER) {
+                Node *call = node->ret.expr;
+                for (int ai = 0; ai < call->call.arg_count; ai++) {
+                    Node *arg = call->call.args[ai];
+                    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+                        Node *root = arg->unary.operand;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                            if (root->kind == NODE_FIELD) root = root->field.object;
+                            else root = root->index_expr.object;
+                        }
+                        if (root && root->kind == NODE_IDENT) {
+                            bool is_global = scope_lookup_local(c->global_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                            Symbol *asrc = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            if (asrc && !asrc->is_static && !is_global) {
+                                checker_error(c, node->loc.line,
+                                    "cannot return result of call with local address '&%.*s' — "
+                                    "stack memory may escape through function return",
+                                    (int)asrc->name_len, asrc->name);
+                            }
+                        }
+                    }
+                    if (arg->kind == NODE_IDENT) {
+                        Symbol *asrc = scope_lookup(c->current_scope,
+                            arg->ident.name, (uint32_t)arg->ident.name_len);
+                        if (asrc && asrc->is_local_derived) {
+                            checker_error(c, node->loc.line,
+                                "cannot return result of call with local-derived pointer '%.*s' — "
+                                "stack memory may escape through function return",
+                                (int)asrc->name_len, asrc->name);
                         }
                     }
                 }

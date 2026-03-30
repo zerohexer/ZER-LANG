@@ -3,6 +3,11 @@
 #include <string.h>
 
 /* ================================================================
+ * Target configuration
+ * ================================================================ */
+int zer_target_ptr_bits = 32; /* default 32-bit for embedded targets */
+
+/* ================================================================
  * Global type singletons
  * ================================================================ */
 
@@ -196,7 +201,7 @@ int type_width(Type *a) {
     case TYPE_U16: case TYPE_I16: return 16;
     case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_ENUM: return 32;
     case TYPE_U64: case TYPE_I64: case TYPE_F64:  return 64;
-    case TYPE_USIZE: return (int)(sizeof(size_t) * 8); /* matches host platform */
+    case TYPE_USIZE: return zer_target_ptr_bits; /* matches target, not host */
     default: return 0;
     }
 }
@@ -320,6 +325,9 @@ bool can_implicit_coerce(Type *from, Type *to) {
 
         /* same sign, smaller → larger */
         if (from_signed == to_signed && from_w < to_w) return true;
+        /* same sign, same width: allow u32 → usize on 32-bit targets */
+        if (from_signed == to_signed && from_w == to_w &&
+            (from->kind == TYPE_USIZE || to->kind == TYPE_USIZE)) return true;
 
         /* unsigned to larger signed (u8 → i16, u16 → i32, etc.) */
         if (!from_signed && to_signed && from_w < to_w) return true;

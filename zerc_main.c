@@ -190,6 +190,8 @@ int main(int argc, char **argv) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
             no_strict_mmio = true;
+        } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
+            zer_target_ptr_bits = atoi(argv[++i]);
         }
     }
 

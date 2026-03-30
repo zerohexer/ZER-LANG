@@ -211,6 +211,11 @@ struct Scope {
 };
 
 /* ================================================================
+ * Target configuration — set by checker, read by type_width
+ * ================================================================ */
+extern int zer_target_ptr_bits; /* default 32, set via --target-bits */
+
+/* ================================================================
  * Global type singletons — primitives allocated once
  * ================================================================ */
 

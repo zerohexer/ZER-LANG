@@ -254,6 +254,31 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_ASSIGN:
         zc_check_expr(zc, ps, node->assign.target);
         zc_check_expr(zc, ps, node->assign.value);
+        /* BUG-361: handle assignment from pool.alloc() — works for globals too.
+         * g_h = pool.alloc() orelse return → register g_h in PathState */
+        if (node->assign.target->kind == NODE_IDENT) {
+            Node *val = node->assign.value;
+            if (val->kind == NODE_ORELSE) val = val->orelse.expr;
+            if (val && val->kind == NODE_CALL && val->call.callee &&
+                val->call.callee->kind == NODE_FIELD) {
+                const char *mname = val->call.callee->field.field_name;
+                uint32_t mlen = (uint32_t)val->call.callee->field.field_name_len;
+                if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    const char *tname = node->assign.target->ident.name;
+                    uint32_t tlen = (uint32_t)node->assign.target->ident.name_len;
+                    Node *obj = val->call.callee->field.object;
+                    int pool_id = (obj && obj->kind == NODE_IDENT) ?
+                        register_pool(zc, obj->ident.name, (uint32_t)obj->ident.name_len) : -1;
+                    HandleInfo *h = find_handle(ps, tname, tlen);
+                    if (!h) h = add_handle(ps, tname, tlen);
+                    if (h) {
+                        h->state = HS_ALIVE;
+                        h->pool_id = pool_id;
+                        h->alloc_line = node->loc.line;
+                    }
+                }
+            }
+        }
         /* Handle aliasing via assignment: alias = tracked_handle */
         if (node->assign.target->kind == NODE_IDENT &&
             node->assign.value->kind == NODE_IDENT) {

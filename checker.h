@@ -67,6 +67,7 @@ typedef struct {
     int mmio_range_count;
     int mmio_range_capacity;
     bool no_strict_mmio;  /* --no-strict-mmio: allow @inttoptr without mmio declarations */
+    int target_ptr_bits;  /* target pointer width in bits (default 32 for embedded) */
 } Checker;
 
 /* ---- API ---- */

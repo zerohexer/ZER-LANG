@@ -1490,8 +1490,9 @@ static void test_negative_sweep(void) {
        "u32 to usize widening accepted");
     ok("u32 main() { usize x = 42; u32 y = @truncate(u32, x); return y; }",
        "@truncate(u32, usize) accepted");
-    err("u32 main() { usize x = 42; u32 y = x; return y; }",
-        "usize to u32 direct narrowing rejected");
+    /* On 32-bit target (default), usize == u32 in width, so coercion is allowed */
+    ok("u32 main() { usize x = 42; u32 y = x; return y; }",
+       "usize to u32 same-width coercion on 32-bit target");
 
     /* BUG-310: volatile slice qualifier */
     err("volatile u8[16] hw_regs;\n"

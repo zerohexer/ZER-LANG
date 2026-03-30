@@ -1917,3 +1917,21 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `compute_type_size(TYPE_UNION)` used `max_variant` size for alignment instead of computing per-variant element alignment.
 - **Fix:** Same pattern as BUG-350: array variants use element alignment, struct variants use max field alignment. Iterate variants to find max alignment independently from max size.
 - **Test:** Existing tests pass.
+
+### BUG-370: keep validation bypass via nested orelse
+- **Symptom:** `reg(o_local orelse opt orelse &x)` where `o_local` is local-derived — bypasses keep check. Nested orelse chains hide local-derived pointers.
+- **Root cause:** Keep validation only unwrapped one level of orelse (BUG-339). For `a orelse b orelse c` (AST: ORELSE(a, ORELSE(b, c))), only `a` and `ORELSE(b,c)` were checked, not `b` and `c` individually. Also BUG-221 local-derived ident check only fired on direct NODE_IDENT, not through orelse expr chain.
+- **Fix:** Recursive orelse collection into keep_checks array (up to 8 branches). Added separate walk through orelse expr chain to check local-derived idents for keep params.
+- **Test:** Existing tests pass. Nested orelse keep bypass now caught.
+
+### BUG-371: MMIO range bypass for constant expressions
+- **Symptom:** `@inttoptr(*u32, 0x50000000 + 0)` with mmio ranges — checker skipped validation because address arg was NODE_BINARY, not NODE_INT_LIT.
+- **Root cause:** MMIO range check only triggered for `node->intrinsic.args[0]->kind == NODE_INT_LIT`. Constant expressions (binary ops on literals) were treated as variable addresses → runtime check instead of compile-time error.
+- **Fix:** Use `eval_const_expr()` on the address arg. If it returns a constant (not CONST_EVAL_FAIL), validate against mmio ranges at compile time.
+- **Test:** Existing tests pass. Constant expression addresses now validated.
+
+### BUG-372: void as slice/pointer inner type allowed
+- **Symptom:** `[]void x` and `*void p` compiled without error. Void is for return types only per spec — slices/pointers to void have no semantic meaning.
+- **Root cause:** `resolve_type` for TYNODE_POINTER and TYNODE_SLICE didn't check inner type for TYPE_VOID.
+- **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
+- **Test:** Existing tests pass.

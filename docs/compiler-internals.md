@@ -1435,3 +1435,12 @@ zercheck NODE_ASSIGN handler now detects `g_h = pool.alloc() orelse return` — 
 
 ### Union Alignment Element-Based (BUG-364)
 Same fix as BUG-350 (struct alignment) applied to union path in `compute_type_size`. Union data alignment now computed per-variant: arrays use element alignment, structs use max field alignment, scalars use `min(size, 8)`. Prevents binary layout mismatch with C for unions containing byte arrays.
+
+### Nested Orelse in keep Validation (BUG-370)
+Keep parameter validation now recursively walks orelse chains. `reg(a orelse b orelse &x)` — collects up to 8 branches and checks each for `&local` patterns. Also added orelse expr walk for local-derived ident check: `reg(local_derived orelse opt orelse &x)` — walks to the expr root through orelse chain, checks `is_local_derived`. Two separate checks: (1) recursive branch collection for `&local` in keep_checks loop, (2) orelse expr root walk for local-derived idents before the BUG-221 check.
+
+### MMIO Constant Expression Validation (BUG-371)
+`@inttoptr` mmio range check now uses `eval_const_expr()` instead of only checking `NODE_INT_LIT`. `@inttoptr(*u32, 0x50000000 + 0)` is now validated at compile time against declared ranges. Any constant expression that `eval_const_expr` can fold (arithmetic, bitwise, shifts on literals) gets compile-time range checking. Non-constant expressions still get runtime range traps in the emitter.
+
+### Void as Compound Inner Type Rejected (BUG-372)
+`*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).

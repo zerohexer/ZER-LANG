@@ -1451,6 +1451,12 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
+### Comptime Array Sizes (BUG-391)
+`u8[BIT(3)]` now works. In `resolve_type_inner(TYNODE_ARRAY)`, when `eval_const_expr` fails and the size expr is `NODE_CALL` with a comptime callee (`is_comptime && func_node`), evaluates via `eval_comptime_block`. `ComptimeParam` and `eval_comptime_block` forward-declared above `resolve_type_inner` for this purpose. Nested comptime calls in array sizes don't work yet (would need recursive comptime resolution in `eval_comptime_block`).
+
+### Union Array Lock Precision (BUG-392)
+`union_switch_key` added to Checker — full expression key (e.g., `"msgs[0]"`) built via `build_expr_key()` helper. Mutation check compares assignment target's object key against the switch key. Different array elements are independent — `msgs[1].data = 20` inside `switch(msgs[0])` is allowed. Same element (`msgs[0].cmd = 99`) and pointer aliases still blocked. `build_expr_key()` handles NODE_IDENT, NODE_FIELD, NODE_INDEX(constant), NODE_UNARY(STAR) — same pattern as zercheck's `handle_key_from_expr`. Three mutation check sites updated: NODE_ASSIGN direct, NODE_FIELD pointer auto-deref, NODE_FIELD direct union.
+
 ### eval_const_expr Depth Limit (BUG-389)
 `eval_const_expr` renamed to `eval_const_expr_d(Node *n, int depth)` with `depth > 256 → CONST_EVAL_FAIL` guard. Wrapper `eval_const_expr(Node *n)` calls with depth 0. Prevents stack overflow on pathological deeply-nested constant expressions.
 

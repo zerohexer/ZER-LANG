@@ -1936,6 +1936,19 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-391: comptime function calls as array sizes
+- **Symptom:** `u8[BIT(3)] buf` failed — "array size must be a compile-time constant". comptime couldn't replace C macros for buffer sizing.
+- **Root cause:** `eval_const_expr` in ast.h has no Checker access, can't resolve NODE_CALL. Array size resolution in TYNODE_ARRAY only tried `eval_const_expr`, never attempted comptime evaluation.
+- **Fix:** In `resolve_type_inner(TYNODE_ARRAY)`, when `eval_const_expr` returns CONST_EVAL_FAIL and size expr is NODE_CALL with comptime callee, evaluate via `eval_comptime_block`. Forward-declared `ComptimeParam` and `eval_comptime_block` above `resolve_type_inner`.
+- **Limitation:** Nested comptime calls in array sizes (`BUF_SIZE()` calling `BIT()`) don't work yet — `eval_comptime_block` can't resolve nested comptime calls. Direct calls with literal args work.
+- **Test:** 2 tests added: `BIT(3)` and `SLOTS(2)` as array sizes.
+
+### BUG-392: Union array lock blocks all elements
+- **Symptom:** `switch(msgs[0]) { .data => |*v| { msgs[1].data = 20; } }` — rejected even though msgs[1] is independent.
+- **Root cause:** Union switch lock stored only the root ident name (`"msgs"`). Any assignment to any element of `msgs` triggered the lock.
+- **Fix:** Added `union_switch_key` to Checker — full expression key built via `build_expr_key()` (e.g., `"msgs[0]"`). Mutation check compares target's object key against switch key. Different keys (e.g., `"msgs[1]" != "msgs[0]"`) are allowed. Same element and pointer aliases still blocked.
+- **Test:** 2 tests added: different element allowed, same element blocked.
+
 ### BUG-389: eval_const_expr stack overflow on deep expressions
 - **Symptom:** Pathological input with deeply nested arithmetic (e.g., `1+1+1+...` 2000 levels) crashes compiler with stack overflow.
 - **Root cause:** `eval_const_expr` in ast.h was purely recursive with no depth limit. Unlike `check_expr` (which has `expr_depth` guard), the constant folder had no protection.

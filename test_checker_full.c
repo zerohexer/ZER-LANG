@@ -1577,6 +1577,38 @@ static void test_negative_sweep(void) {
        "}",
        "BUG-381: @container volatile preserved accepted");
 
+    /* BUG-391: comptime function call as array size */
+    ok("comptime u32 BIT(u32 n) { return 1 << n; }\n"
+       "u32 main() { u8[BIT(3)] buf; buf[0] = 1; return @truncate(u32, buf[0]); }",
+       "BUG-391: comptime call as array size");
+    ok("comptime u32 SLOTS(u32 n) { return n * 4; }\n"
+       "u32 main() { u32[SLOTS(2)] arr; arr[0] = 5; return arr[0]; }",
+       "BUG-391: comptime with arithmetic as array size");
+
+    /* BUG-392: union array lock — different elements should be independent */
+    ok("union Msg { u32 data; u32 cmd; }\n"
+       "Msg[2] msgs;\n"
+       "void test() {\n"
+       "    msgs[0].data = 5;\n"
+       "    switch (msgs[0]) {\n"
+       "        .data => |*v| { msgs[1].data = 20; }\n"
+       "        .cmd => {}\n"
+       "    }\n"
+       "}\n"
+       "u32 main() { test(); return 0; }",
+       "BUG-392: switch(msgs[0]) allows msgs[1] mutation");
+    err("union Msg { u32 data; u32 cmd; }\n"
+        "Msg[2] msgs;\n"
+        "void test() {\n"
+        "    msgs[0].data = 5;\n"
+        "    switch (msgs[0]) {\n"
+        "        .data => |*v| { msgs[0].cmd = 99; }\n"
+        "        .cmd => {}\n"
+        "    }\n"
+        "}\n"
+        "u32 main() { test(); return 0; }",
+        "BUG-392: switch(msgs[0]) still blocks msgs[0] mutation");
+
     /* BUG-389: eval_const_expr depth limit — deep nesting still works up to limit */
     ok("u32 main() { u8[((1+1)+(1+1))+((1+1)+(1+1))] buf; return 0; }",
        "BUG-389: nested constant expr accepted (within depth)");

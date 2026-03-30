@@ -259,6 +259,49 @@ static bool is_literal_compatible(Node *expr, Type *target) {
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
 
+/* BUG-392: Build a string key from an expression for union switch locking.
+ * Same pattern as zercheck's handle_key_from_expr. Returns key length or 0. */
+static int build_expr_key(Node *expr, char *buf, int bufsize) {
+    if (!expr || bufsize < 2) return 0;
+    if (expr->kind == NODE_IDENT) {
+        int len = (int)expr->ident.name_len;
+        if (len >= bufsize) return 0;
+        memcpy(buf, expr->ident.name, len);
+        buf[len] = '\0';
+        return len;
+    }
+    if (expr->kind == NODE_FIELD) {
+        int base = build_expr_key(expr->field.object, buf, bufsize);
+        if (base <= 0) return 0;
+        int flen = (int)expr->field.field_name_len;
+        if (base + 1 + flen >= bufsize) return 0;
+        buf[base] = '.';
+        memcpy(buf + base + 1, expr->field.field_name, flen);
+        int total = base + 1 + flen;
+        buf[total] = '\0';
+        return total;
+    }
+    if (expr->kind == NODE_INDEX && expr->index_expr.index &&
+        expr->index_expr.index->kind == NODE_INT_LIT) {
+        int base = build_expr_key(expr->index_expr.object, buf, bufsize);
+        if (base <= 0) return 0;
+        int written = snprintf(buf + base, bufsize - base, "[%llu]",
+                               (unsigned long long)expr->index_expr.index->int_lit.value);
+        if (written <= 0 || base + written >= bufsize) return 0;
+        return base + written;
+    }
+    if (expr->kind == NODE_UNARY && expr->unary.op == TOK_STAR) {
+        int base = build_expr_key(expr->unary.operand, buf, bufsize);
+        if (base <= 0) return 0;
+        /* prepend * — shift right and insert */
+        if (base + 1 >= bufsize) return 0;
+        memmove(buf + 1, buf, base + 1);
+        buf[0] = '*';
+        return base + 1;
+    }
+    return 0;
+}
+
 /* BUG-374: recursively check if a call expression has any local-derived pointer
  * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
  * which itself has &x. We recurse into nested calls (max depth 8 to prevent
@@ -434,6 +477,10 @@ static int64_t compute_type_size(Type *t) {
 
 static Type *resolve_type_inner(Checker *c, TypeNode *tn);
 
+/* BUG-391: forward declarations for comptime evaluation in array sizes */
+typedef struct { const char *name; uint32_t name_len; int64_t value; } ComptimeParam;
+static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param_count);
+
 /* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
 static Type *resolve_type(Checker *c, TypeNode *tn) {
     if (!tn) return ty_void;
@@ -529,6 +576,33 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                     } else {
                         /* fallback: use recursive compute for any type */
                         val = compute_type_size(unwrapped);
+                    }
+                }
+            }
+            /* BUG-391: comptime function call as array size.
+             * eval_const_expr can't resolve function calls (no Checker access).
+             * Try resolving NODE_CALL on comptime functions here. */
+            if (val == CONST_EVAL_FAIL &&
+                tn->array.size_expr->kind == NODE_CALL &&
+                tn->array.size_expr->call.callee->kind == NODE_IDENT) {
+                Symbol *csym = scope_lookup(c->current_scope,
+                    tn->array.size_expr->call.callee->ident.name,
+                    (uint32_t)tn->array.size_expr->call.callee->ident.name_len);
+                if (csym && csym->is_comptime && csym->func_node) {
+                    Node *fn = csym->func_node;
+                    int pc = fn->func_decl.param_count;
+                    ComptimeParam cparams[32];
+                    bool all_const = true;
+                    for (int ci = 0; ci < tn->array.size_expr->call.arg_count &&
+                         ci < pc && ci < 32; ci++) {
+                        int64_t cv = eval_const_expr(tn->array.size_expr->call.args[ci]);
+                        if (cv == CONST_EVAL_FAIL) { all_const = false; break; }
+                        cparams[ci].name = fn->func_decl.params[ci].name;
+                        cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
+                        cparams[ci].value = cv;
+                    }
+                    if (all_const && fn->func_decl.body) {
+                        val = eval_comptime_block(fn->func_decl.body, cparams, pc);
                     }
                 }
             }
@@ -695,7 +769,7 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
  * Supports: return expressions, if/else branching, nested blocks.
  * Uses eval_const_expr with a param→value substitution table. */
 
-typedef struct { const char *name; uint32_t name_len; int64_t value; } ComptimeParam;
+/* ComptimeParam and eval_comptime_block forward-declared above resolve_type_inner (BUG-391) */
 
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
     if (!n) return CONST_EVAL_FAIL;
@@ -1072,10 +1146,33 @@ static Type *check_expr(Checker *c, Node *node) {
                  (troot->ident.name_len == c->union_switch_var_len &&
                   memcmp(troot->ident.name, c->union_switch_var,
                          c->union_switch_var_len) == 0))) {
-                checker_error(c, node->loc.line,
-                    "cannot assign to union '%.*s' inside its switch arm — "
-                    "active capture would become invalid",
-                    (int)c->union_switch_var_len, c->union_switch_var);
+                /* BUG-392: if we have a precise key (e.g. "msgs[0]"), compare
+                 * against target's full key. Different array elements are safe. */
+                bool blocked = true;
+                if (c->union_switch_key && c->union_switch_key_len > 0 &&
+                    !locked_via_alias) {
+                    char tgt_key[128];
+                    int tklen = build_expr_key(node->assign.target, tgt_key, sizeof(tgt_key));
+                    if (tklen > 0) {
+                        /* strip the trailing .field from target key for comparison.
+                         * msgs[1].data → compare "msgs[1]" against "msgs[0]" */
+                        char *last_dot = NULL;
+                        for (int di = tklen - 1; di >= 0; di--) {
+                            if (tgt_key[di] == '.') { last_dot = &tgt_key[di]; break; }
+                        }
+                        int cmp_len = last_dot ? (int)(last_dot - tgt_key) : tklen;
+                        if (cmp_len != (int)c->union_switch_key_len ||
+                            memcmp(tgt_key, c->union_switch_key, cmp_len) != 0) {
+                            blocked = false; /* different element, safe */
+                        }
+                    }
+                }
+                if (blocked) {
+                    checker_error(c, node->loc.line,
+                        "cannot mutate union '%.*s' inside its own switch arm — "
+                        "active capture would become invalid",
+                        (int)c->union_switch_var_len, c->union_switch_var);
+                }
             }
         }
 
@@ -2390,19 +2487,33 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (ms && ms->type) {
                             Type *mt = type_unwrap_distinct(ms->type);
                             if (mt->kind == TYPE_POINTER) {
-                                Type *inner = type_unwrap_distinct(mt->pointer.inner);
-                                if (inner == c->union_switch_type) type_match = true;
+                                Type *inner_t = type_unwrap_distinct(mt->pointer.inner);
+                                if (inner_t == c->union_switch_type) type_match = true;
                             }
                         }
                     }
                     if (name_match || type_match) {
-                        checker_error(c, node->loc.line,
-                            "cannot mutate union '%.*s' inside its own switch arm — "
-                            "active capture would become invalid",
-                            (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
-                            name_match ? c->union_switch_var : mut_root->ident.name);
-                        result = ty_void;
-                        break;
+                        /* BUG-392: precise key check — different array elements are safe */
+                        bool blocked = true;
+                        if (name_match && c->union_switch_key &&
+                            c->union_switch_key_len > 0 && !type_match) {
+                            char tgt_key[128];
+                            int tklen = build_expr_key(node->field.object, tgt_key, sizeof(tgt_key));
+                            if (tklen > 0 &&
+                                ((int)c->union_switch_key_len != tklen ||
+                                 memcmp(tgt_key, c->union_switch_key, tklen) != 0)) {
+                                blocked = false;
+                            }
+                        }
+                        if (blocked) {
+                            checker_error(c, node->loc.line,
+                                "cannot mutate union '%.*s' inside its own switch arm — "
+                                "active capture would become invalid",
+                                (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
+                                name_match ? c->union_switch_var : mut_root->ident.name);
+                            result = ty_void;
+                            break;
+                        }
                     }
                 }
             }
@@ -2482,19 +2593,33 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (ms && ms->type) {
                             Type *mt = type_unwrap_distinct(ms->type);
                             if (mt->kind == TYPE_POINTER) {
-                                Type *inner = type_unwrap_distinct(mt->pointer.inner);
-                                if (inner == c->union_switch_type) type_match = true;
+                                Type *inner_t = type_unwrap_distinct(mt->pointer.inner);
+                                if (inner_t == c->union_switch_type) type_match = true;
                             }
                         }
                     }
                     if (name_match || type_match) {
-                        checker_error(c, node->loc.line,
-                            "cannot mutate union '%.*s' inside its own switch arm — "
-                            "active capture would become invalid",
-                            (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
-                            name_match ? c->union_switch_var : mut_root->ident.name);
-                        result = ty_void;
-                        break;
+                        /* BUG-392: precise key check — different array elements are safe */
+                        bool blocked = true;
+                        if (name_match && c->union_switch_key &&
+                            c->union_switch_key_len > 0 && !type_match) {
+                            char tgt_key[128];
+                            int tklen = build_expr_key(node->field.object, tgt_key, sizeof(tgt_key));
+                            if (tklen > 0 &&
+                                ((int)c->union_switch_key_len != tklen ||
+                                 memcmp(tgt_key, c->union_switch_key, tklen) != 0)) {
+                                blocked = false;
+                            }
+                        }
+                        if (blocked) {
+                            checker_error(c, node->loc.line,
+                                "cannot mutate union '%.*s' inside its own switch arm — "
+                                "active capture would become invalid",
+                                (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
+                                name_match ? c->union_switch_var : mut_root->ident.name);
+                            result = ty_void;
+                            break;
+                        }
                     }
                 }
             }
@@ -3914,14 +4039,15 @@ static void check_stmt(Checker *c, Node *node) {
                  * Handles: switch (d) and switch (*ptr) where ptr points to union */
                 const char *saved_union_var = c->union_switch_var;
                 uint32_t saved_union_var_len = c->union_switch_var_len;
+                const char *saved_union_key = c->union_switch_key;
+                uint32_t saved_union_key_len = c->union_switch_key_len;
                 Type *saved_union_type = c->union_switch_type;
                 if (expr_eff->kind == TYPE_UNION) {
                     c->union_switch_type = expr;
                     Node *sw_expr = node->switch_stmt.expr;
-                    /* walk to root ident for union lock.
-                     * Handles: switch(d), switch(*ptr), switch(s.msg), switch(s.msg.inner) */
-                    /* BUG-244: walk ALL deref/field/index levels to find root.
-                     * Handles: switch(**pp), switch(*ptr), switch(s.msg), etc. */
+                    /* BUG-392: build full expression key for precise locking.
+                     * switch(msgs[0]) → key "msgs[0]", allows msgs[1] mutation.
+                     * walk to root ident for backward-compat root lock too. */
                     Node *lock_root = sw_expr;
                     while (lock_root) {
                         if (lock_root->kind == NODE_UNARY && lock_root->unary.op == TOK_STAR)
@@ -3936,10 +4062,26 @@ static void check_stmt(Checker *c, Node *node) {
                         c->union_switch_var = lock_root->ident.name;
                         c->union_switch_var_len = (uint32_t)lock_root->ident.name_len;
                     }
+                    /* build full key for precise comparison */
+                    char key_buf[128];
+                    int klen = build_expr_key(sw_expr, key_buf, sizeof(key_buf));
+                    if (klen > 0) {
+                        char *akey = (char *)arena_alloc(c->arena, klen + 1);
+                        if (akey) {
+                            memcpy(akey, key_buf, klen + 1);
+                            c->union_switch_key = akey;
+                            c->union_switch_key_len = (uint32_t)klen;
+                        }
+                    } else {
+                        c->union_switch_key = NULL;
+                        c->union_switch_key_len = 0;
+                    }
                 }
                 check_stmt(c, arm->body);
                 c->union_switch_var = saved_union_var;
                 c->union_switch_var_len = saved_union_var_len;
+                c->union_switch_key = saved_union_key;
+                c->union_switch_key_len = saved_union_key_len;
                 c->union_switch_type = saved_union_type;
                 pop_scope(c);
             } else {

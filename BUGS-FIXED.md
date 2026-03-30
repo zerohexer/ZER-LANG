@@ -1851,3 +1851,27 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **What:** `comptime if (CONST) { ... } else { ... }` — condition evaluated at compile time, only taken branch type-checked and emitted. Dead branch stripped entirely. Replaces C `#ifdef/#ifndef/#endif`.
 - **Scope:** ast (if_stmt.is_comptime), parser (comptime + if at statement level), checker (eval condition, check only taken branch), emitter (emit only taken branch).
 - **Test:** 3 checker tests + 1 E2E test. 455 checker, 216 E2E.
+
+### BUG-351: @cast escape bypass — local address via distinct typedef
+- **Symptom:** `return @cast(SafePtr, &x)` where SafePtr is `distinct typedef *u32` — compiles fine, returns dangling stack pointer.
+- **Root cause:** Escape check sites (return + orelse fallback) only walked into @ptrcast and @bitcast, not @cast.
+- **Fix:** Added `(ilen == 4 && memcmp(iname, "cast", 4) == 0)` to both escape check sites.
+- **Test:** test_checker_full.c — @cast local escape rejected.
+
+### BUG-352: Volatile stripping in union switch rvalue temp
+- **Symptom:** `switch(get_volatile_union())` — rvalue temp uses `__auto_type` which strips volatile.
+- **Root cause:** Line 2455 in emitter.c used `__auto_type` for rvalue union switch temps.
+- **Fix:** Changed to `__typeof__(expr)` which preserves volatile qualifier.
+- **Test:** Existing tests pass (narrow edge case — rvalue volatile union switch).
+
+### BUG-354: comptime if breaks all_paths_return
+- **Symptom:** `u32 f() { comptime if (1) { return 1; } }` — rejected with "not all paths return" even though the taken branch always returns.
+- **Root cause:** `all_paths_return` didn't check `is_comptime` — treated comptime if like regular if, requiring both branches.
+- **Fix:** In `all_paths_return(NODE_IF)`, if `is_comptime`, evaluate condition and only check the taken branch.
+- **Test:** test_checker_full.c — comptime if true without else OK, comptime if false with else OK.
+
+### BUG-355: Assignment escape through intrinsic wrapper
+- **Symptom:** `g_ptr = @ptrcast(*u32, p)` where p is local-derived — compiles fine, stores dangling pointer in global.
+- **Root cause:** Assignment escape check (BUG-205) only checked `NODE_IDENT` values, not `NODE_INTRINSIC`-wrapped values.
+- **Fix:** Walk through intrinsics before checking root ident: `while (vnode->kind == NODE_INTRINSIC) vnode = vnode->intrinsic.args[last]`.
+- **Test:** test_checker_full.c — @ptrcast and @cast assignment escape rejected.

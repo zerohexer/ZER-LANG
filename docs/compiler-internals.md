@@ -1401,6 +1401,18 @@ comptime if (ARM) {
 }
 ```
 
+### @cast Added to All Escape Check Sites (BUG-351)
+The return escape and orelse fallback escape checks walked into `@ptrcast` and `@bitcast` intrinsics to find `&local` patterns, but missed `@cast`. Since `@cast` converts between distinct typedefs (which can wrap pointer types), `return @cast(SafePtr, &x)` bypassed escape analysis. Fix: added `(ilen == 4 && memcmp(iname, "cast", 4) == 0)` to both sites (return check ~line 3930 and orelse fallback check ~line 4006).
+
+### Union Switch Rvalue Volatile (BUG-352)
+The rvalue union switch temp at emitter.c line 2455 used `__auto_type` which strips volatile. Changed to `__typeof__(expr)` (same fix pattern as BUG-319/322 for captures and orelse). Only fires when switch expression is NODE_CALL (rvalue). Lvalue path already used `__typeof__` correctly.
+
+### all_paths_return Respects comptime if (BUG-354)
+`all_paths_return(NODE_IF)` now checks `is_comptime`. If true, evaluates the condition via `eval_const_expr` and only requires a return from the taken branch. `comptime if (1) { return 42; }` without else now passes return analysis — the dead branch is irrelevant.
+
+### Assignment Escape Walks Through Intrinsics (BUG-355)
+The BUG-205 assignment escape check (`g_ptr = local_derived_ptr`) only fired when the value was direct `NODE_IDENT`. Now walks through `NODE_INTRINSIC` chain to find the root ident: `while (vnode->kind == NODE_INTRINSIC) vnode = vnode->intrinsic.args[last]`. Catches `g_ptr = @ptrcast(*u32, p)` and `g_ptr = @cast(GPtr, p)` where `p` is local-derived.
+
 ### Known Technical Debt (updated)
 - **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.
 - **Comptime in array sizes:** `u8[BIT(3)]` doesn't work — eval_const_expr can't resolve comptime calls without Checker access. Workaround: use `const u32 SIZE = BIT(3); u8[SIZE] buf;` (doesn't work either since SIZE is a var). Future fix: pass Checker to eval_const_expr or pre-evaluate comptime calls before type resolution.

@@ -364,7 +364,7 @@ After all planned features, these runtime checks remain in the emitted C as **ba
 | `*opaque` type | Compile-time provenance (all paths) | `type_id` check stays in emitted C | Never (provenance already caught it) |
 | @cstr overflow | Auto-orelse handles failure | Length check inside @cstr stays | Triggers → auto-orelse handles it |
 | MMIO range | Constant addresses proven | Variable address check stays | Only computed MMIO (rare) |
-| Arena overflow | Can't prove (inherent) | `__builtin_mul_overflow` stays | Large allocations (rare) |
+| Arena overflow | `?[]T` forces `orelse` — overflow → null → handled | `__builtin_mul_overflow` stays | **Already 100% safe** — `orelse` forces programmer to handle failure |
 
 **Runtime checks are NEVER removed.** Even when the compiler proves safety at compile time, the runtime check remains as a second layer. Belt and suspenders. If the compiler has a bug in its range propagation, the runtime catches it.
 
@@ -424,7 +424,7 @@ Same infrastructure as zercheck change 4 (cross-function analysis). Applied to p
 |-------|-----|-----------|
 | `*opaque` type safety | **100% compile-time** + runtime backup | **N/A** (no void* — avoids the feature) |
 | @cstr overflow | **100%** (auto-orelse) | **N/A** (no @cstr — avoids the feature) |
-| Arena overflow | Runtime (inherent) | **N/A** (no arena — stack only) |
+| ~~Arena overflow~~ | ~~Runtime (inherent)~~ | **ALREADY SAFE** — `?[]T` forces `orelse`, overflow returns null |
 | MMIO computed address | Runtime (inherent) | Runtime (same — inherent) |
 
 **ZER now matches SPARK's compile-time coverage while having features SPARK doesn't offer.** The only remaining runtime checks (arena overflow, MMIO computed address) are inherent — SPARK doesn't do better, it just doesn't have the feature.
@@ -706,7 +706,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Volatile stripping | **100%** | None |
 | MMIO range | **100%** | Range propagation proves guarded computed addresses (runtime backup stays) |
 | @cstr overflow | **100%** | Auto-orelse for variable slices, compile error for constant strings |
-| Arena overflow | **0%** | Inherently runtime |
+| Arena overflow | **100%** | `?[]T` return forces `orelse` — overflow returns null, programmer handles it (already safe today) |
 
 **Overall: ~97% compile-time for guarded code, ~92% for unguarded code.**
 

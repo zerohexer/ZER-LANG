@@ -351,6 +351,68 @@ int main(void) {
        "}\n",
        "handle param: use then free — OK");
 
+    /* BUG-357: handle tracking for array elements and struct fields */
+    printf("[BUG-357: array handle UAF]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T)[2] arr;\n"
+        "    arr[0] = pool.alloc() orelse return;\n"
+        "    pool.free(arr[0]);\n"
+        "    pool.get(arr[0]).x = 5;\n"
+        "}\n",
+        "BUG-357: array handle use-after-free");
+
+    printf("[BUG-357: array handle double free]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T)[2] arr;\n"
+        "    arr[0] = pool.alloc() orelse return;\n"
+        "    pool.free(arr[0]);\n"
+        "    pool.free(arr[0]);\n"
+        "}\n",
+        "BUG-357: array handle double free");
+
+    printf("[BUG-357: struct field handle UAF]\n");
+    err("struct T { u32 x; }\n"
+        "struct State { Handle(T) h; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    State s;\n"
+        "    s.h = pool.alloc() orelse return;\n"
+        "    pool.free(s.h);\n"
+        "    pool.get(s.h).x = 5;\n"
+        "}\n",
+        "BUG-357: struct field handle use-after-free");
+
+    printf("[BUG-357: array handle valid use]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T)[2] arr;\n"
+       "    arr[0] = pool.alloc() orelse return;\n"
+       "    arr[1] = pool.alloc() orelse return;\n"
+       "    pool.get(arr[0]).x = 5;\n"
+       "    pool.get(arr[1]).x = 10;\n"
+       "    pool.free(arr[0]);\n"
+       "    pool.free(arr[1]);\n"
+       "}\n",
+       "BUG-357: array handle valid lifecycle");
+
+    printf("[BUG-357: different array indices independent]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T)[2] arr;\n"
+       "    arr[0] = pool.alloc() orelse return;\n"
+       "    arr[1] = pool.alloc() orelse return;\n"
+       "    pool.free(arr[0]);\n"
+       "    pool.get(arr[1]).x = 10;\n"
+       "    pool.free(arr[1]);\n"
+       "}\n",
+       "BUG-357: arr[0] freed, arr[1] still valid");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

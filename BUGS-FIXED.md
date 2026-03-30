@@ -1936,6 +1936,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-357: zercheck cannot track handles in arrays or struct fields
+- **Symptom:** `pool.free(arr[0]); pool.get(arr[0])` — use-after-free invisible to zercheck. Same for `pool.free(s.h); pool.get(s.h)`.
+- **Root cause:** `find_handle` matched by flat name string. `pool.free(arr[0])` arg is NODE_INDEX, not NODE_IDENT — `find_handle` never matched.
+- **Fix:** Added `handle_key_from_expr()` helper that builds string keys from NODE_IDENT (`"h"`), NODE_FIELD (`"s.h"`), NODE_INDEX with constant index (`"arr[0]"`). Updated all handle lookup/registration sites in `zc_check_call` (free/get), `zc_check_var_init` (aliasing), and assignment tracking to use compound keys. Arena-allocated keys for stored HandleInfo pointers. Variable indices (`arr[i]`) remain untrackable (runtime traps only).
+- **Test:** 5 tests added: array UAF, array double-free, struct field UAF, valid array lifecycle, independent array indices.
+
 ### BUG-373: is_literal_compatible uses host sizeof(size_t) for usize range
 - **Symptom:** `usize x = 5000000000` accepted on 64-bit host compiling for 32-bit target (--target-bits 32). Value truncated silently by target GCC.
 - **Root cause:** Two issues: (1) `is_literal_compatible` used `sizeof(size_t) == 8` (host) instead of `zer_target_ptr_bits == 64` (target). (2) Integer literals default to `ty_u32`, so `can_implicit_coerce(u32, usize)` succeeded before `is_literal_compatible` was ever checked — oversized values bypassed range validation.

@@ -109,6 +109,60 @@ static int register_pool(ZerCheck *zc, const char *name, uint32_t name_len) {
     return id;
 }
 
+/* ---- Handle key extraction from expressions ---- */
+
+/* BUG-357: Build a string key from a handle expression so we can track
+ * handles stored in arrays (arr[0]) and struct fields (s.h).
+ * Returns key length, or 0 if the expression can't be tracked statically.
+ * Only constant array indices are supported — variable indices return 0.
+ *
+ * Examples:
+ *   NODE_IDENT "h"           → "h"
+ *   NODE_INDEX arr[0]        → "arr[0]"
+ *   NODE_FIELD s.h           → "s.h"
+ *   NODE_FIELD s.arr[1]      → "s.arr[1]"
+ *   NODE_INDEX arr[i]        → 0 (variable index, can't track)
+ */
+static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
+    if (!expr || bufsize < 2) return 0;
+
+    if (expr->kind == NODE_IDENT) {
+        int len = (int)expr->ident.name_len;
+        if (len >= bufsize) return 0;
+        memcpy(buf, expr->ident.name, len);
+        buf[len] = '\0';
+        return len;
+    }
+
+    if (expr->kind == NODE_FIELD) {
+        /* recurse on object, then append ".field" */
+        int base = handle_key_from_expr(expr->field.object, buf, bufsize);
+        if (base <= 0) return 0;
+        int flen = (int)expr->field.field_name_len;
+        if (base + 1 + flen >= bufsize) return 0;
+        buf[base] = '.';
+        memcpy(buf + base + 1, expr->field.field_name, flen);
+        int total = base + 1 + flen;
+        buf[total] = '\0';
+        return total;
+    }
+
+    if (expr->kind == NODE_INDEX) {
+        /* only constant integer indices can be tracked */
+        if (!expr->index_expr.index ||
+            expr->index_expr.index->kind != NODE_INT_LIT) return 0;
+        int base = handle_key_from_expr(expr->index_expr.object, buf, bufsize);
+        if (base <= 0) return 0;
+        uint64_t idx = expr->index_expr.index->int_lit.value;
+        int written = snprintf(buf + base, bufsize - base, "[%llu]",
+                               (unsigned long long)idx);
+        if (written <= 0 || base + written >= bufsize) return 0;
+        return base + written;
+    }
+
+    return 0;
+}
+
 /* ---- AST walking ---- */
 
 static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node);
@@ -137,50 +191,56 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
 
     int pool_id = register_pool(zc, pool_name, plen);
 
-    /* pool.free(h) — mark handle as freed */
+    /* pool.free(h) — mark handle as freed
+     * BUG-357: also handles arr[0], s.h via handle_key_from_expr */
     if (mlen == 4 && memcmp(method, "free", 4) == 0) {
-        if (node->call.arg_count > 0 && node->call.args[0]->kind == NODE_IDENT) {
-            const char *hname = node->call.args[0]->ident.name;
-            uint32_t hlen = (uint32_t)node->call.args[0]->ident.name_len;
-            HandleInfo *h = find_handle(ps, hname, hlen);
-            if (h) {
-                if (h->state == HS_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "double free: '%.*s' already freed at line %d",
-                        (int)hlen, hname, h->free_line);
-                }
-                h->state = HS_FREED;
-                h->free_line = node->loc.line;
-                /* propagate freed state to all aliases (same pool + same alloc line) */
-                for (int i = 0; i < ps->handle_count; i++) {
-                    if (&ps->handles[i] != h &&
-                        ps->handles[i].pool_id == h->pool_id &&
-                        ps->handles[i].alloc_line == h->alloc_line &&
-                        ps->handles[i].state == HS_ALIVE) {
-                        ps->handles[i].state = HS_FREED;
-                        ps->handles[i].free_line = node->loc.line;
+        if (node->call.arg_count > 0) {
+            char hkey[128];
+            int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
+            if (hklen > 0) {
+                HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
+                if (h) {
+                    if (h->state == HS_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "double free: '%.*s' already freed at line %d",
+                            hklen, hkey, h->free_line);
+                    }
+                    h->state = HS_FREED;
+                    h->free_line = node->loc.line;
+                    /* propagate freed state to all aliases (same pool + same alloc line) */
+                    for (int i = 0; i < ps->handle_count; i++) {
+                        if (&ps->handles[i] != h &&
+                            ps->handles[i].pool_id == h->pool_id &&
+                            ps->handles[i].alloc_line == h->alloc_line &&
+                            ps->handles[i].state == HS_ALIVE) {
+                            ps->handles[i].state = HS_FREED;
+                            ps->handles[i].free_line = node->loc.line;
+                        }
                     }
                 }
             }
         }
     }
 
-    /* pool.get(h) — check handle is alive and correct pool */
+    /* pool.get(h) — check handle is alive and correct pool
+     * BUG-357: also handles arr[0], s.h via handle_key_from_expr */
     if (mlen == 3 && memcmp(method, "get", 3) == 0) {
-        if (node->call.arg_count > 0 && node->call.args[0]->kind == NODE_IDENT) {
-            const char *hname = node->call.args[0]->ident.name;
-            uint32_t hlen = (uint32_t)node->call.args[0]->ident.name_len;
-            HandleInfo *h = find_handle(ps, hname, hlen);
-            if (h) {
-                if (h->state == HS_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' freed at line %d",
-                        (int)hlen, hname, h->free_line);
-                }
-                if (h->pool_id >= 0 && h->pool_id != pool_id) {
-                    zc_error(zc, node->loc.line,
-                        "wrong pool: '%.*s' allocated from pool %d, used on pool %d",
-                        (int)hlen, hname, h->pool_id, pool_id);
+        if (node->call.arg_count > 0) {
+            char hkey[128];
+            int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
+            if (hklen > 0) {
+                HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
+                if (h) {
+                    if (h->state == HS_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "use-after-free: '%.*s' freed at line %d",
+                            hklen, hkey, h->free_line);
+                    }
+                    if (h->pool_id >= 0 && h->pool_id != pool_id) {
+                        zc_error(zc, node->loc.line,
+                            "wrong pool: '%.*s' allocated from pool %d, used on pool %d",
+                            hklen, hkey, h->pool_id, pool_id);
+                    }
                 }
             }
         }
@@ -224,19 +284,21 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
     }
 
     /* Handle aliasing: Handle(T) alias = existing_handle;
-     * If init is a simple identifier that matches a tracked handle,
-     * register the new variable with the same state and pool. */
-    if (init->kind == NODE_IDENT) {
-        HandleInfo *src = find_handle(ps, init->ident.name,
-            (uint32_t)init->ident.name_len);
-        if (src) {
-            HandleInfo *dst = find_handle(ps, vname, vlen);
-            if (!dst) dst = add_handle(ps, vname, vlen);
-            if (dst) {
-                dst->state = src->state;
-                dst->pool_id = src->pool_id;
-                dst->alloc_line = src->alloc_line;
-                dst->free_line = src->free_line;
+     * BUG-357: also match NODE_INDEX and NODE_FIELD on init side. */
+    {
+        char src_key[128];
+        int sklen = handle_key_from_expr(init, src_key, sizeof(src_key));
+        if (sklen > 0) {
+            HandleInfo *src = find_handle(ps, src_key, (uint32_t)sklen);
+            if (src) {
+                HandleInfo *dst = find_handle(ps, vname, vlen);
+                if (!dst) dst = add_handle(ps, vname, vlen);
+                if (dst) {
+                    dst->state = src->state;
+                    dst->pool_id = src->pool_id;
+                    dst->alloc_line = src->alloc_line;
+                    dst->free_line = src->free_line;
+                }
             }
         }
     }
@@ -254,46 +316,59 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_ASSIGN:
         zc_check_expr(zc, ps, node->assign.target);
         zc_check_expr(zc, ps, node->assign.value);
-        /* BUG-361: handle assignment from pool.alloc() — works for globals too.
-         * g_h = pool.alloc() orelse return → register g_h in PathState */
-        if (node->assign.target->kind == NODE_IDENT) {
-            Node *val = node->assign.value;
-            if (val->kind == NODE_ORELSE) val = val->orelse.expr;
-            if (val && val->kind == NODE_CALL && val->call.callee &&
-                val->call.callee->kind == NODE_FIELD) {
-                const char *mname = val->call.callee->field.field_name;
-                uint32_t mlen = (uint32_t)val->call.callee->field.field_name_len;
-                if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
-                    const char *tname = node->assign.target->ident.name;
-                    uint32_t tlen = (uint32_t)node->assign.target->ident.name_len;
-                    Node *obj = val->call.callee->field.object;
-                    int pool_id = (obj && obj->kind == NODE_IDENT) ?
-                        register_pool(zc, obj->ident.name, (uint32_t)obj->ident.name_len) : -1;
-                    HandleInfo *h = find_handle(ps, tname, tlen);
-                    if (!h) h = add_handle(ps, tname, tlen);
-                    if (h) {
-                        h->state = HS_ALIVE;
-                        h->pool_id = pool_id;
-                        h->alloc_line = node->loc.line;
+        /* BUG-361/357: handle assignment from pool.alloc() — works for globals,
+         * array elements, struct fields.
+         * arr[0] = pool.alloc() orelse return → register "arr[0]" in PathState */
+        {
+            char tkey[128];
+            int tklen = handle_key_from_expr(node->assign.target, tkey, sizeof(tkey));
+            if (tklen > 0) {
+                Node *val = node->assign.value;
+                if (val->kind == NODE_ORELSE) val = val->orelse.expr;
+                if (val && val->kind == NODE_CALL && val->call.callee &&
+                    val->call.callee->kind == NODE_FIELD) {
+                    const char *mname = val->call.callee->field.field_name;
+                    uint32_t mlen = (uint32_t)val->call.callee->field.field_name_len;
+                    if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                        Node *obj = val->call.callee->field.object;
+                        int pool_id = (obj && obj->kind == NODE_IDENT) ?
+                            register_pool(zc, obj->ident.name, (uint32_t)obj->ident.name_len) : -1;
+                        /* arena-allocate key so HandleInfo.name pointer remains valid */
+                        char *akey = (char *)arena_alloc(zc->arena, tklen + 1);
+                        if (akey) {
+                            memcpy(akey, tkey, tklen + 1);
+                            HandleInfo *h = find_handle(ps, akey, (uint32_t)tklen);
+                            if (!h) h = add_handle(ps, akey, (uint32_t)tklen);
+                            if (h) {
+                                h->state = HS_ALIVE;
+                                h->pool_id = pool_id;
+                                h->alloc_line = node->loc.line;
+                            }
+                        }
                     }
                 }
-            }
-        }
-        /* Handle aliasing via assignment: alias = tracked_handle */
-        if (node->assign.target->kind == NODE_IDENT &&
-            node->assign.value->kind == NODE_IDENT) {
-            HandleInfo *src = find_handle(ps, node->assign.value->ident.name,
-                (uint32_t)node->assign.value->ident.name_len);
-            if (src) {
-                const char *tname = node->assign.target->ident.name;
-                uint32_t tlen = (uint32_t)node->assign.target->ident.name_len;
-                HandleInfo *dst = find_handle(ps, tname, tlen);
-                if (!dst) dst = add_handle(ps, tname, tlen);
-                if (dst) {
-                    dst->state = src->state;
-                    dst->pool_id = src->pool_id;
-                    dst->alloc_line = src->alloc_line;
-                    dst->free_line = src->free_line;
+                /* Handle aliasing via assignment: alias = tracked_handle
+                 * BUG-357: supports arr[0] = h, s.h = other_h, etc. */
+                {
+                    char skey[128];
+                    int sklen = handle_key_from_expr(node->assign.value, skey, sizeof(skey));
+                    if (sklen > 0) {
+                        HandleInfo *src = find_handle(ps, skey, (uint32_t)sklen);
+                        if (src) {
+                            char *akey = (char *)arena_alloc(zc->arena, tklen + 1);
+                            if (akey) {
+                                memcpy(akey, tkey, tklen + 1);
+                                HandleInfo *dst = find_handle(ps, akey, (uint32_t)tklen);
+                                if (!dst) dst = add_handle(ps, akey, (uint32_t)tklen);
+                                if (dst) {
+                                    dst->state = src->state;
+                                    dst->pool_id = src->pool_id;
+                                    dst->alloc_line = src->alloc_line;
+                                    dst->free_line = src->free_line;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

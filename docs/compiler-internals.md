@@ -1416,7 +1416,7 @@ The BUG-205 assignment escape check (`g_ptr = local_derived_ptr`) only fired whe
 ### Known Technical Debt (updated)
 - **No qualified module call syntax:** Unqualified calls resolve to last import when same-named functions exist in multiple modules.
 - **Comptime in array sizes:** `u8[BIT(3)]` doesn't work — eval_const_expr can't resolve comptime calls without Checker access. Workaround: use `const u32 SIZE = BIT(3); u8[SIZE] buf;` (doesn't work either since SIZE is a var). Future fix: pass Checker to eval_const_expr or pre-evaluate comptime calls before type resolution.
-- **zercheck field/index handles:** HandleInfo tracks by flat name string only — can't represent `arr[0]` or `s.h`. Handles stored in arrays or struct fields fall back to runtime generation counter traps. Refactoring to support NODE_FIELD/NODE_INDEX handle targets is a future enhancement (BUG-357).
+- **zercheck variable-index handles:** `arr[i]` with variable index still untrackable — falls back to runtime generation counter traps. Constant indices (`arr[0]`, `s.h`) now tracked via compound string keys (BUG-357 fix).
 
 ### Deref Walk in Flag Propagation (BUG-356)
 The is_local_derived/is_arena_derived propagation walk now handles `NODE_UNARY(TOK_STAR)` — pointer dereference. `*u32 p2 = *pp` where `pp` is a double pointer to a local-derived pointer — the walk goes through the deref to find `pp`, checks its flags, propagates to `p2`. Without this, double pointers "washed" the safety flag. Same walk location as BUG-338 (intrinsic args) at ~line 3232.
@@ -1450,6 +1450,17 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
+
+### zercheck Compound Handle Keys (BUG-357)
+`handle_key_from_expr()` helper builds string keys from handle expressions: `NODE_IDENT` → `"h"`, `NODE_FIELD` → `"s.h"`, `NODE_INDEX(constant)` → `"arr[0]"`. Recursive — handles `s.arr[1]` etc. Returns 0 for untrackable expressions (variable index `arr[i]`).
+
+All handle tracking sites updated to use compound keys:
+- `zc_check_call` free/get: builds key from `args[0]` via `handle_key_from_expr`, looks up with `find_handle`
+- `zc_check_var_init` aliasing: builds key from init expression (was NODE_IDENT only)
+- Assignment alloc tracking: builds key from `assign.target`, arena-allocates for storage in HandleInfo
+- Assignment aliasing: builds key from both target and value expressions
+
+Variable indices (`arr[i]`) remain untrackable — fall back to runtime generation counter traps. Constant indices (`arr[0]`, `arr[1]`) are fully tracked with independent state (freeing arr[0] doesn't affect arr[1]).
 
 ### Integer Literal Range Uses Target Width (BUG-373)
 `is_literal_compatible` for TYPE_USIZE now uses `zer_target_ptr_bits == 64` instead of `sizeof(size_t) == 8`. Additionally, all integer literal initializations (var_decl, assign, global var) now run `is_literal_compatible` AFTER coercion passes — catches oversized values that slip through `can_implicit_coerce` because literals default to `ty_u32`. `usize x = 5000000000` rejected on 32-bit target, accepted on 64-bit.

@@ -3110,6 +3110,31 @@ int main(void) {
         109,
         "Slab free + realloc reuse E2E");
 
+    /* BUG-390: u64 handles — multiple allocs, verify gen/idx encoding */
+    printf("[BUG-390: u64 Handle multi-alloc]\n");
+    test_compile_and_run(
+        "struct Task { u32 val; }\n"
+        "Pool(Task, 4) pool;\n"
+        "u32 g_result;\n"
+        "void run() {\n"
+        "    Handle(Task) h1 = pool.alloc() orelse return;\n"
+        "    Handle(Task) h2 = pool.alloc() orelse return;\n"
+        "    pool.get(h1).val = 10;\n"
+        "    pool.get(h2).val = 20;\n"
+        "    pool.free(h1);\n"
+        "    Handle(Task) h3 = pool.alloc() orelse return;\n"
+        "    pool.get(h3).val = 5;\n"
+        "    g_result = pool.get(h2).val + pool.get(h3).val;\n"
+        "    pool.free(h2);\n"
+        "    pool.free(h3);\n"
+        "}\n"
+        "u32 main() {\n"
+        "    run();\n"
+        "    return g_result;\n"
+        "}\n",
+        25,
+        "BUG-390: u64 handle multi-alloc+free+realloc = 25");
+
     /* BUG-310: volatile slice — volatile propagates through array→slice coercion */
     test_compile_and_run(
         "volatile u8[4] hw;\n"

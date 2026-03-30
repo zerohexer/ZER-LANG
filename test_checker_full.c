@@ -1577,6 +1577,23 @@ static void test_negative_sweep(void) {
        "}",
        "BUG-381: @container volatile preserved accepted");
 
+    /* BUG-389: eval_const_expr depth limit — deep nesting still works up to limit */
+    ok("u32 main() { u8[((1+1)+(1+1))+((1+1)+(1+1))] buf; return 0; }",
+       "BUG-389: nested constant expr accepted (within depth)");
+    ok("u32 main() { u32 x = 1+2+3+4+5+6+7+8+9+10; return x; }",
+       "BUG-389: chained additions accepted");
+
+    /* BUG-390: Handle(T) is u64 — Pool/Slab alloc returns ?Handle (opt u64) */
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void run() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    pool.get(h).x = 42;\n"
+       "    pool.free(h);\n"
+       "}\n"
+       "u32 main() { run(); return 0; }",
+       "BUG-390: u64 Handle pool lifecycle accepted");
+
     /* BUG-386: Pool/Ring/Slab in union rejected */
     err("union Oops { Pool(u32, 4) p; u32 other; }\n"
         "u32 main() { return 0; }",

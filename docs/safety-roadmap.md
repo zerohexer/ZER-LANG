@@ -343,8 +343,9 @@ This is the highest safety standard used in production systems (DO-178C Level A 
 | zercheck changes 1-3 | v0.2.2 (now) | ~90 | **None** | No |
 | zercheck change 4 (cross-func) | v0.3 | ~300 | **None** | No |
 | Value range propagation | v0.3 | ~300-500 | **None** | No |
+| Forced division guard | v0.3 | ~20 | **None** (new compile error only) | Existing unguarded divisions become errors |
 
-Total: ~700-900 lines of compiler logic. Zero language changes. Zero new keywords. Zero new types.
+Total: ~710-910 lines of compiler logic. Zero language changes. Zero new keywords. Zero new types. One new compile error (division requires proven nonzero divisor).
 
 ### Original (preserved for reference)
 
@@ -549,44 +550,113 @@ buf[i] = 5;                          // runtime bounds check (can't prove)
 | Forced ranged indexing | **REPLACED** | Not needed — compiler auto-eliminates checks when guards exist |
 | Iterators (`for in`) | **NOT NEEDED for safety** | Range propagation handles `for (i = 0; i < len; ...)` loops. Iterators may be added later as ergonomic improvement, not a safety feature. |
 
-### FINAL PLAN: Two Features, Zero Language Complexity
+### FINAL PLAN: Two Compiler Features + One Forced Rule, Zero Language Complexity
 
 | Feature | Type | Language change | Implementation |
 |---------|------|----------------|----------------|
 | zercheck 1-4 | Compiler improvement | **None** | ~400 lines in zercheck.c |
 | Value range propagation | Compiler improvement | **None** | ~300-500 lines in checker.c |
+| Forced division guard | Compiler rule | **None** (just a new error) | ~20 lines in checker.c |
 
-**Both are invisible to the programmer.** Same ZER code. Same C syntax. The compiler just gets smarter about what it can prove. This is the ZER philosophy — the programmer writes natural defensive code, the compiler rewards them by skipping redundant runtime checks.
+**All three are invisible to the programmer's syntax.** Same ZER code. Same C syntax. The compiler gets smarter about what it can prove, and forces one more safety invariant (divisor nonzero). No new types, no new keywords, no new syntax.
+
+**Forced division** is the same pattern as existing forced rules:
+- `*T` requires initializer (already forced)
+- `?T` requires `orelse` or `if |capture|` (already forced)
+- Division requires proven nonzero divisor (NEW — closes last C UB gap)
 
 **Iterators are NOT on the safety roadmap.** They may be added in the future as a syntax convenience (ergonomics), but they are not needed for compile-time safety — value range propagation covers the same loop patterns. If iterators are added, it's a separate decision driven by programmer ergonomics, not safety.
 
-### Coverage After Range Propagation
+### Every C Undefined Behavior → ZER Compile Error
+
+| C Undefined Behavior | ZER Prevention | Type |
+|----------------------|----------------|------|
+| Buffer overflow | Bounds check (runtime) + range propagation (compile-time) | Automatic |
+| Null pointer deref | `*T` non-null, `?T` forced `orelse` | Forced |
+| Use-after-free | Handle gen counter + zercheck | Automatic |
+| Division by zero | **Forced nonzero proof** | **Forced** |
+| Signed overflow | Defined as wrapping (`-fwrapv`) | Automatic |
+| Uninitialized memory | Auto-zero everything | Automatic |
+| Double free | Handle gen counter + zercheck | Automatic |
+| Out-of-bounds pointer | Scope escape analysis | Automatic |
+| Type confusion (void*) | `_zer_opaque` runtime type tag + compile-time provenance | Automatic |
+| Volatile access reorder | Qualifier tracking on all casts | Automatic |
+
+**Zero C undefined behaviors remain in ZER.** Every one is either prevented at compile time, trapped at runtime, or defined as safe behavior (wrapping).
+
+### Coverage After Range Propagation + Forced Division Guard
 
 | Category | Compile-time | Remaining runtime |
 |----------|-------------|-------------------|
 | Bounds (with guard or loop) | **100%** | Only unguarded bare `buf[unknown_i]` |
-| Bounds (iterator) | **100%** | None |
-| Division (with guard) | **100%** | Only unguarded bare `a / unknown` |
+| Division | **100%** | **None — FORCED** (divisor must be proven nonzero) |
 | Handle UAF (zercheck 1-4) | **~99%** | ISR + cinclude edge cases |
+| Handle leaks | **100%** | None |
+| Null deref | **100%** | None |
 | *opaque cast | **~98%** | Variable index + function return |
+| Scope escape | **~95%** | Deep indirection chains |
+| Union type confusion | **100%** | None |
+| Volatile stripping | **100%** | None |
 | MMIO range | **~99%** | Computed variable addresses (rare) |
 | @cstr overflow | **~50%** | Variable slice source |
 | Arena overflow | **0%** | Inherently runtime |
 
-**Overall: ~95% compile-time for guarded code, ~90% for unguarded code.**
+**Overall: ~97% compile-time for guarded code, ~92% for unguarded code.**
 
-### What Happens to Unguarded Code?
+### Forced: Division Guard (DECISION)
+
+Division by zero is **undefined behavior in C** — can crash, corrupt memory, or do anything. ZER eliminates all C undefined behaviors at compile time. Division was the last gap. Now forced.
+
+If the compiler cannot prove the divisor is nonzero, it's a **compile error**:
+
+```zer
+u32 x = total / count;  // COMPILE ERROR: divisor 'count' not proven nonzero
+```
+
+**How the programmer proves it (one of these):**
+
+```zer
+// Option 1: guard (most common)
+if (count == 0) { return; }
+u32 x = total / count;     // OK — compiler tracks count != 0 after guard
+
+// Option 2: literal
+u32 x = total / 4;          // OK — 4 is provably nonzero
+
+// Option 3: loop variable starting > 0
+for (u32 i = 1; i <= 10; i += 1) {
+    total / i;               // OK — i starts at 1, always >= 1
+}
+
+// Option 4: orelse fallback (future, when orelse supports value exprs)
+u32 x = total / (count orelse 1);  // OK — fallback guarantees nonzero
+```
+
+**Error message guides the fix:**
+```
+main.zer:5: error: divisor 'count' not proven nonzero —
+    add 'if (count == 0) { return; }' before division,
+    or use a literal divisor
+```
+
+**Why forced:**
+- Closes the last C undefined behavior gap in ZER
+- Consistent with existing forced patterns: `*T` requires init, `?T` requires `orelse`
+- One `if` line per division — same guard C programmers should write anyway
+- Division is 1-2% of statements — low boilerplate cost
+
+### What Happens to Unguarded Bounds?
+
+Bounds indexing is NOT forced (unlike division). Unguarded `buf[i]` keeps runtime check:
 
 ```zer
 u32 i = get_index();
-buf[i] = 5;  // no guard — compiler can't prove anything
+buf[i] = 5;  // no guard — runtime bounds check (safe, 2 cycles)
 ```
 
-Two options:
-1. **Runtime check (current behavior)** — safe, costs 2 cycles. No change needed.
-2. **Compiler warning** — "unguarded index access, consider adding bounds check." Nudges programmer toward guards without forcing them.
+**Why not forced:** Bounds checks are 30-50% of statements. Forcing guards on every index access would be extremely verbose. The runtime check is cheap (2 cycles) and the common patterns (for loops, guarded access) are automatically optimized by range propagation. Unguarded access is safe via runtime — no UB, just overhead.
 
-Option 2 is the gentle push. The programmer sees: "line 42: warning: array index 'i' not proven in range — consider `if (i >= buf.len) { return; }` before this line." They add the guard, the warning disappears, the runtime check is eliminated. No new syntax learned.
+**Compiler warning (optional future enhancement):** "unguarded index access, consider adding bounds check." Nudges programmer toward guards without forcing them. The programmer sees the warning, adds the guard, the warning disappears, the runtime check is eliminated.
 
 ### Implementation
 

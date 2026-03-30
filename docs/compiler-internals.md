@@ -1430,8 +1430,14 @@ Provenance alias propagation in NODE_VAR_DECL now walks through ALL intrinsics (
 ### zercheck Assignment Handle Tracking (BUG-361)
 zercheck NODE_ASSIGN handler now detects `g_h = pool.alloc() orelse return` — registers the handle in PathState same as NODE_VAR_DECL. Covers global handles assigned within function bodies. Without this, `pool.free(g_h); pool.get(g_h)` use-after-free was invisible to zercheck (fell back to runtime generation traps only).
 
-### usize Target Width (BUG-363)
-`zer_target_ptr_bits` global in types.c (default 32). `type_width(TYPE_USIZE)` returns this instead of host `sizeof(size_t) * 8`. The emitted C always uses `size_t` — GCC resolves the actual width per target. The ZER checker's default of 32 is conservative and correct for all embedded targets. `--target-bits N` flag available but rarely needed since emitted C is always correct. `can_implicit_coerce` allows same-width coercion when TYPE_USIZE is involved (u32↔usize on 32-bit targets).
+### usize Target Width (BUG-363) + GCC Auto-Detect
+`zer_target_ptr_bits` global in types.c (default 32). `type_width(TYPE_USIZE)` returns this instead of host `sizeof(size_t) * 8`. The emitted C always uses `size_t` — GCC resolves the actual width per target.
+
+**Auto-detection:** `zerc_main.c` probes GCC at startup via `echo '' | gcc -dM -E -` and parses `__SIZEOF_SIZE_T__` to set `zer_target_ptr_bits` automatically. For cross-compilers: `--gcc arm-none-eabi-gcc` uses the specified compiler for the probe. `--target-bits N` is still available as explicit override (skips probe). If probe fails (no GCC in PATH), falls back to default 32.
+
+**Test suite:** does NOT use the probe — tests use the default 32 directly. For 64-bit tests, `zer_target_ptr_bits` is set/restored explicitly: `{ int saved = zer_target_ptr_bits; zer_target_ptr_bits = 64; ... zer_target_ptr_bits = saved; }`. This keeps tests platform-independent.
+
+**Coercion rule:** `can_implicit_coerce` allows same-width coercion when TYPE_USIZE is involved (u32↔usize on 32-bit). On 64-bit, u32→usize is widening (allowed), usize→u32 is narrowing (requires @truncate).
 
 ### Union Alignment Element-Based (BUG-364)
 Same fix as BUG-350 (struct alignment) applied to union path in `compute_type_size`. Union data alignment now computed per-variant: arrays use element alignment, structs use max field alignment, scalars use `min(size, 8)`. Prevents binary layout mismatch with C for unions containing byte arrays.

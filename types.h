@@ -183,8 +183,9 @@ struct Symbol {
     bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
 
-    /* @ptrcast provenance: now handled by runtime type tags on _zer_opaque (BUG-393).
-     * Symbol-level provenance_type REMOVED — replaced by runtime type_id in emitted C. */
+    /* @ptrcast provenance: compile-time check for simple variables (belt),
+     * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */
+    Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
 
     /* @container provenance: tracks which struct+field this pointer points inside */
     Type *container_struct;          /* NULL = unknown */

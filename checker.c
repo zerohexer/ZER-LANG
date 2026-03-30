@@ -1308,7 +1308,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* clear — will be re-set below if new value is unsafe */
                     tsym->is_local_derived = false;
                     tsym->is_arena_derived = false;
-                    /* provenance_type removed — BUG-393 runtime tags */
+                    tsym->provenance_type = NULL;
                     tsym->container_struct = NULL;
                     tsym->container_field = NULL;
                     tsym->container_field_len = 0;
@@ -1358,14 +1358,26 @@ static Type *check_expr(Checker *c, Node *node) {
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src && src->is_local_derived) tsym->is_local_derived = true;
                             if (src && src->is_arena_derived) tsym->is_arena_derived = true;
-                            /* provenance_type removed — BUG-393 runtime tags */
+                            /* provenance propagation through alias (compile-time belt) */
+                            if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
                             if (src && src->container_struct) {
                                 tsym->container_struct = src->container_struct;
                                 tsym->container_field = src->container_field;
                                 tsym->container_field_len = src->container_field_len;
                             }
                         }
-                        /* @ptrcast provenance removed — BUG-393 runtime tags */
+                        /* @ptrcast provenance on assignment (compile-time belt) */
+                        if (vcheck->kind == NODE_INTRINSIC &&
+                            vcheck->intrinsic.name_len == 7 &&
+                            memcmp(vcheck->intrinsic.name, "ptrcast", 7) == 0 &&
+                            vcheck->intrinsic.arg_count > 0) {
+                            Type *tgt_eff = type_unwrap_distinct(tsym->type);
+                            if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                                tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
+                                Type *src_type = typemap_get(c, vcheck->intrinsic.args[0]);
+                                if (src_type) tsym->provenance_type = src_type;
+                            }
+                        }
                         /* @container provenance: val = &struct.field */
                         if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP &&
                             vcheck->unary.operand->kind == NODE_FIELD) {
@@ -2928,8 +2940,33 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "target must be volatile pointer");
                             }
                         }
-                        /* provenance check removed — BUG-393 runtime type tags
-                         * handle this via _zer_opaque.type_id in emitted C */
+                        /* provenance check: compile-time belt for simple idents.
+                         * BUG-393: runtime type_id is the suspenders for complex paths. */
+                        if (eff->kind == TYPE_POINTER &&
+                            eff->pointer.inner->kind == TYPE_OPAQUE &&
+                            node->intrinsic.args[0]->kind == NODE_IDENT) {
+                            Symbol *src_sym = scope_lookup(c->current_scope,
+                                node->intrinsic.args[0]->ident.name,
+                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                            if (src_sym && src_sym->provenance_type) {
+                                Type *prov = type_unwrap_distinct(src_sym->provenance_type);
+                                Type *tgt = type_unwrap_distinct(result);
+                                if (tgt && tgt->kind == TYPE_POINTER && prov &&
+                                    prov->kind == TYPE_POINTER) {
+                                    Type *prov_inner = type_unwrap_distinct(prov->pointer.inner);
+                                    Type *tgt_inner = type_unwrap_distinct(tgt->pointer.inner);
+                                    if (prov_inner && tgt_inner &&
+                                        tgt_inner->kind != TYPE_OPAQUE &&
+                                        !type_equals(prov_inner, tgt_inner)) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast type mismatch: source has provenance '%s' "
+                                            "but target is '*%s'",
+                                            type_name(src_sym->provenance_type),
+                                            type_name(tgt_inner));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -3652,8 +3689,19 @@ static void check_stmt(Checker *c, Node *node) {
                 Node *init = node->var_decl.init;
                 if (init->kind == NODE_ORELSE) init = init->orelse.expr;
                 /* direct @ptrcast to *opaque — record source type */
-                /* @ptrcast provenance removed — BUG-393 runtime tags */
-                /* alias propagation for @container provenance only
+                /* @ptrcast provenance: compile-time belt for simple variables */
+                if (init->kind == NODE_INTRINSIC &&
+                    init->intrinsic.name_len == 7 &&
+                    memcmp(init->intrinsic.name, "ptrcast", 7) == 0 &&
+                    init->intrinsic.arg_count > 0) {
+                    Type *eff = type_unwrap_distinct(type);
+                    if (eff && eff->kind == TYPE_POINTER &&
+                        eff->pointer.inner->kind == TYPE_OPAQUE) {
+                        Type *src_type = typemap_get(c, init->intrinsic.args[0]);
+                        if (src_type) sym->provenance_type = src_type;
+                    }
+                }
+                /* alias propagation for provenance + @container
                  * BUG-358: walk through @bitcast/@cast to find root ident */
                 {
                     Node *prov_root = init;
@@ -3664,6 +3712,8 @@ static void check_stmt(Checker *c, Node *node) {
                     if (prov_root && prov_root->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             prov_root->ident.name, (uint32_t)prov_root->ident.name_len);
+                        if (src && src->provenance_type)
+                            sym->provenance_type = src->provenance_type;
                         if (src && src->container_struct) {
                             sym->container_struct = src->container_struct;
                             sym->container_field = src->container_field;

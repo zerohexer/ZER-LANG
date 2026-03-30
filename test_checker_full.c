@@ -2117,8 +2117,8 @@ static void test_mmio_provenance(void) {
        "}",
        "ptrcast provenance: round-trip match OK");
 
-    /* @ptrcast provenance: wrong type now caught at RUNTIME via type_id (BUG-393) */
-    ok("struct Sensor { u32 id; }\n"
+    /* @ptrcast provenance: wrong type caught at COMPILE TIME for simple idents */
+    err("struct Sensor { u32 id; }\n"
        "struct Motor { u32 speed; }\n"
        "u32 main() {\n"
        "    Sensor s;\n"
@@ -2126,7 +2126,7 @@ static void test_mmio_provenance(void) {
        "    *Motor m = @ptrcast(*Motor, ctx);\n"
        "    return 0;\n"
        "}",
-       "ptrcast provenance: wrong type passes checker (runtime trap)");
+       "ptrcast provenance: wrong type rejected (compile-time)");
 
     /* @ptrcast provenance: unknown provenance allowed */
     ok("struct Sensor { u32 id; }\n"
@@ -2136,8 +2136,8 @@ static void test_mmio_provenance(void) {
        "}",
        "ptrcast provenance: unknown (param) allowed");
 
-    /* @ptrcast provenance: alias propagation now runtime (BUG-393) */
-    ok("struct Sensor { u32 id; }\n"
+    /* @ptrcast provenance: alias propagation caught at compile time */
+    err("struct Sensor { u32 id; }\n"
        "struct Motor { u32 speed; }\n"
        "u32 main() {\n"
        "    Sensor s;\n"
@@ -2146,7 +2146,7 @@ static void test_mmio_provenance(void) {
        "    *Motor m = @ptrcast(*Motor, alias);\n"
        "    return 0;\n"
        "}",
-       "ptrcast provenance: alias passes checker (runtime trap)");
+       "ptrcast provenance: alias caught (compile-time)");
 
     /* @container: field validation — field exists */
     ok("struct Device { u32 id; u32 status; }\n"
@@ -2369,8 +2369,8 @@ static void test_mmio_provenance(void) {
        "}",
        "BUG-356: deref flag propagation catches escape");
 
-    /* BUG-358/393: provenance now runtime via type_id */
-    ok("struct Sensor { u32 id; }\n"
+    /* BUG-358: provenance preserved through @bitcast (compile-time) */
+    err("struct Sensor { u32 id; }\n"
        "struct Motor { u32 speed; }\n"
        "void use(*Motor m) {}\n"
        "void test() {\n"
@@ -2380,7 +2380,7 @@ static void test_mmio_provenance(void) {
        "    *Motor m = @ptrcast(*Motor, q);\n"
        "    use(m);\n"
        "}",
-       "BUG-393: provenance passes checker (runtime trap via type_id)");
+       "BUG-358: provenance through @bitcast (compile-time)");
 }
 
 int main(void) {

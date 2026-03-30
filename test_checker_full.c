@@ -2144,6 +2144,50 @@ static void test_mmio_provenance(void) {
        "    return 0;\n"
        "}",
        "comptime if: non-constant condition rejected");
+
+    /* BUG-351: @cast escape — local address via distinct typedef */
+    err("distinct typedef *u32 SafePtr;\n"
+       "SafePtr leak() {\n"
+       "    u32 x = 5;\n"
+       "    return @cast(SafePtr, &x);\n"
+       "}",
+       "BUG-351: @cast local escape rejected");
+
+    /* BUG-354: comptime if without else — return analysis respects taken branch */
+    ok("u32 f() {\n"
+       "    comptime if (1) { return 42; }\n"
+       "}\n"
+       "u32 main() { return f(); }",
+       "BUG-354: comptime if (true) without else OK");
+
+    /* BUG-354: comptime if false with else — else branch is the taken path */
+    ok("u32 f() {\n"
+       "    comptime if (0) { return 1; }\n"
+       "    else { return 2; }\n"
+       "}\n"
+       "u32 main() { return f(); }",
+       "BUG-354: comptime if (false) else branch OK");
+
+    /* BUG-355: assignment escape through @ptrcast */
+    err("mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+       "*u32 g_ptr = @inttoptr(*u32, 1);\n"
+       "void f() {\n"
+       "    u32 x = 5;\n"
+       "    *u32 p = &x;\n"
+       "    g_ptr = @ptrcast(*u32, p);\n"
+       "}",
+       "BUG-355: assign intrinsic wash rejected");
+
+    /* BUG-355: assignment escape through @cast */
+    err("mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+       "distinct typedef *u32 GPtr;\n"
+       "GPtr g = @cast(GPtr, @inttoptr(*u32, 1));\n"
+       "void f() {\n"
+       "    u32 x = 5;\n"
+       "    *u32 p = &x;\n"
+       "    g = @cast(GPtr, p);\n"
+       "}",
+       "BUG-355: assign @cast escape rejected");
 }
 
 int main(void) {

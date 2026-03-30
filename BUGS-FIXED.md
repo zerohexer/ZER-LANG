@@ -1936,6 +1936,24 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added void rejection in both TYNODE_POINTER and TYNODE_SLICE resolution. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size".
 - **Test:** Existing tests pass.
 
+### BUG-386: Pool/Ring/Slab allowed in union variants
+- **Symptom:** `union Oops { Pool(u32, 4) p; u32 other; }` compiled — produces invalid C (macro inside union).
+- **Root cause:** BUG-287 added the check for struct fields but not union variants.
+- **Fix:** Added same TYPE_POOL/TYPE_RING/TYPE_SLAB check to union variant registration in NODE_UNION_DECL.
+- **Test:** 2 tests added: Pool and Ring in union rejected.
+
+### BUG-387: orelse keep fallback local-derived bypass
+- **Symptom:** `reg(opt orelse local_ptr)` where `local_ptr` is local-derived — passes keep validation.
+- **Root cause:** BUG-370 orelse walk only followed `orelse.expr` (the expression side), never checked `orelse.fallback` for local/arena-derived idents.
+- **Fix:** Rewrote keep orelse walk to collect ALL terminal nodes from orelse chain (both expr and fallback sides, up to 8 branches). Each checked for is_local_derived and is_arena_derived.
+- **Test:** 1 test added: orelse fallback local-derived pointer rejected.
+
+### BUG-388: comptime optional emission wrong
+- **Symptom:** `comptime ?u32 maybe(u32 x) { ... }` — call emitted as `10` instead of `(_zer_opt_u32){10, 1}`. GCC error or wrong struct initialization.
+- **Root cause:** Emitter comptime path emitted raw `%lld` without checking if return type is TYPE_OPTIONAL.
+- **Fix:** Check `checker_get_type` on comptime call node. If TYPE_OPTIONAL, wrap in `(type){value, 1}`.
+- **Test:** Verified emitted C shows correct optional struct literal.
+
 ### BUG-383: Identity washing via struct wrappers
 - **Symptom:** `return wrap(&x).p` — wraps local address in struct, extracts pointer field. BUG-360 only checked direct call with pointer return type, not struct-returning calls with field extraction.
 - **Root cause:** BUG-360/374 check required `node->ret.expr->kind == NODE_CALL && ret_type->kind == TYPE_POINTER`. When return expr is NODE_FIELD on NODE_CALL (struct wrapper), the call was never inspected.

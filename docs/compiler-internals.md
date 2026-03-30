@@ -1451,6 +1451,15 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 ### Void as Compound Inner Type Rejected (BUG-372)
 `*void` and `[]void` now produce compile errors in `resolve_type`. `*void` → "use *opaque for type-erased pointers". `[]void` → "void has no size". `*opaque` (TYPE_OPAQUE) is unaffected — it's the correct way to express type-erased pointers. `?void` is also unaffected — it has valid semantics (`has_value` flag only, no `.value` field).
 
+### Pool/Ring/Slab in Union Rejected (BUG-386)
+Same check as BUG-287 (struct fields) added to NODE_UNION_DECL variant registration. Pool/Ring/Slab types use C macros that can't be inside union definitions.
+
+### Orelse Keep Fallback Check (BUG-387)
+Keep parameter orelse validation now collects ALL terminal nodes from orelse chain — both `orelse.expr` and `orelse.fallback` sides, up to 8 branches. Previously only walked `orelse.expr`, missing fallback local-derived idents. `reg(opt orelse local_ptr)` where `local_ptr` is local-derived now caught.
+
+### Comptime Optional Emission (BUG-388)
+Emitter comptime path checks `checker_get_type` on call node. If TYPE_OPTIONAL, emits `(type){value, 1}` instead of raw `%lld`. `comptime ?u32 maybe(u32 x)` now emits `(_zer_opt_u32){10, 1}` correctly.
+
 ### Struct Wrapper Escape (BUG-383)
 `return wrap(&x).p` — walks return expression through NODE_FIELD/NODE_INDEX chains to find root NODE_CALL. If that call has local-derived args (via `call_has_local_derived_arg`) and the final return type is TYPE_POINTER, rejected. Same walk in NODE_VAR_DECL init: `*u32 p = wrap(&x).p` marks `p` as local-derived. Covers the pattern where a function wraps a pointer in a struct and the caller extracts it via field access.
 

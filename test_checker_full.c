@@ -1577,6 +1577,25 @@ static void test_negative_sweep(void) {
        "}",
        "BUG-381: @container volatile preserved accepted");
 
+    /* BUG-386: Pool/Ring/Slab in union rejected */
+    err("union Oops { Pool(u32, 4) p; u32 other; }\n"
+        "u32 main() { return 0; }",
+        "BUG-386: Pool in union rejected");
+    err("union Oops { Ring(u32, 8) r; u32 other; }\n"
+        "u32 main() { return 0; }",
+        "BUG-386: Ring in union rejected");
+
+    /* BUG-387: orelse keep fallback local-derived check */
+    err("void reg(keep *u32 p) {}\n"
+        "u32 main() {\n"
+        "    u32 x = 5;\n"
+        "    *u32 local_ptr = &x;\n"
+        "    ?*u32 opt;\n"
+        "    reg(opt orelse local_ptr);\n"
+        "    return 0;\n"
+        "}",
+        "BUG-387: orelse keep fallback local-derived rejected");
+
     /* BUG-383: struct wrapper escape via field extraction */
     err("struct Wrap { *u32 p; }\n"
         "Wrap wrap(*u32 p) { Wrap w; w.p = p; return w; }\n"

@@ -2119,25 +2119,40 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                         } /* end keep_checks loop (BUG-339) */
-                        /* BUG-221/370: also reject local-derived pointers.
-                         * Walk through orelse chain to check all branches. */
-                        Node *ld_check = arg_node;
-                        while (ld_check && ld_check->kind == NODE_ORELSE)
-                            ld_check = ld_check->orelse.expr;
-                        if (ld_check && ld_check->kind == NODE_IDENT) {
-                            Symbol *arg_sym = scope_lookup(c->current_scope,
-                                ld_check->ident.name, (uint32_t)ld_check->ident.name_len);
-                            if (arg_sym && arg_sym->is_local_derived) {
-                                checker_error(c, node->loc.line,
-                                    "argument %d: local-derived pointer '%.*s' cannot "
-                                    "satisfy 'keep' parameter — points to stack memory",
-                                    i + 1, (int)arg_sym->name_len, arg_sym->name);
+                        /* BUG-221/370/387: also reject local-derived pointers.
+                         * Walk through orelse chain to check BOTH expr and fallback sides.
+                         * BUG-387: orelse fallback may be a local-derived ident. */
+                        {
+                            /* collect all terminal idents from orelse chain */
+                            Node *ld_nodes[8];
+                            int ld_count = 0;
+                            Node *ld_walk = arg_node;
+                            while (ld_walk && ld_walk->kind == NODE_ORELSE && ld_count < 7) {
+                                /* check fallback side */
+                                if (ld_walk->orelse.fallback &&
+                                    ld_walk->orelse.fallback->kind != NODE_ORELSE) {
+                                    ld_nodes[ld_count++] = ld_walk->orelse.fallback;
+                                }
+                                ld_walk = ld_walk->orelse.expr;
                             }
-                            if (arg_sym && arg_sym->is_arena_derived) {
-                                checker_error(c, node->loc.line,
-                                    "argument %d: arena-derived pointer '%.*s' cannot "
-                                    "satisfy 'keep' parameter — arena memory may be reset",
-                                    i + 1, (int)arg_sym->name_len, arg_sym->name);
+                            if (ld_walk) ld_nodes[ld_count++] = ld_walk;
+                            for (int ldi = 0; ldi < ld_count; ldi++) {
+                                if (ld_nodes[ldi]->kind != NODE_IDENT) continue;
+                                Symbol *arg_sym = scope_lookup(c->current_scope,
+                                    ld_nodes[ldi]->ident.name,
+                                    (uint32_t)ld_nodes[ldi]->ident.name_len);
+                                if (arg_sym && arg_sym->is_local_derived) {
+                                    checker_error(c, node->loc.line,
+                                        "argument %d: local-derived pointer '%.*s' cannot "
+                                        "satisfy 'keep' parameter — points to stack memory",
+                                        i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                }
+                                if (arg_sym && arg_sym->is_arena_derived) {
+                                    checker_error(c, node->loc.line,
+                                        "argument %d: arena-derived pointer '%.*s' cannot "
+                                        "satisfy 'keep' parameter — arena memory may be reset",
+                                        i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                }
                             }
                         }
                         if (arg_node->kind == NODE_IDENT) {
@@ -4616,6 +4631,11 @@ static void register_decl(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "union variant '%.*s' cannot have type 'void'",
                         (int)uv->name_len, uv->name);
+                }
+                /* BUG-386: Pool/Ring/Slab in union not supported (same as BUG-287 for structs) */
+                if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB)) {
+                    checker_error(c, node->loc.line,
+                        "Pool/Ring/Slab cannot be union variants — must be global or static variables");
                 }
                 /* BUG-265/314: reject recursive union by value (incomplete type in C) */
                 {

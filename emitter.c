@@ -882,9 +882,17 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_CALL: {
-        /* comptime call — emit constant value directly */
+        /* comptime call — emit constant value directly.
+         * BUG-388: if target type is optional, wrap in {value, 1}. */
         if (node->call.is_comptime_resolved) {
-            emit(e, "%lld", (long long)node->call.comptime_value);
+            Type *ct = checker_get_type(e->checker, node);
+            if (ct && ct->kind == TYPE_OPTIONAL) {
+                emit(e, "(");
+                emit_type(e, ct);
+                emit(e, "){%lld, 1}", (long long)node->call.comptime_value);
+            } else {
+                emit(e, "%lld", (long long)node->call.comptime_value);
+            }
             break;
         }
         /* intercept builtin method calls: pool.alloc(), pool.get(h), etc. */

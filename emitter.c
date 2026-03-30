@@ -2452,7 +2452,10 @@ static void emit_stmt(Emitter *e, Node *node) {
              * affect the original. For rvalue (NODE_CALL), hoist into temp. */
             bool sw_is_rvalue = (node->switch_stmt.expr->kind == NODE_CALL);
             if (sw_is_rvalue) {
-                emit(e, "__auto_type _zer_swt%d = ", sw_tmp);
+                /* BUG-352: __typeof__ preserves volatile, __auto_type does not */
+                emit(e, "__typeof__(");
+                emit_expr(e, node->switch_stmt.expr);
+                emit(e, ") _zer_swt%d = ", sw_tmp);
                 emit_expr(e, node->switch_stmt.expr);
                 emit(e, ";\n");
                 emit_indent(e);

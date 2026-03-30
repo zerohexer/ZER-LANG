@@ -1226,32 +1226,38 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-205: local-derived escape via assignment to global/static.
-         * After flag propagation, check if target is global/static with local-derived value. */
-        if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_IDENT) {
-            Symbol *val_sym = scope_lookup(c->current_scope,
-                node->assign.value->ident.name,
-                (uint32_t)node->assign.value->ident.name_len);
-            if (val_sym && val_sym->is_local_derived) {
-                Node *troot = node->assign.target;
-                while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                    if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                    else troot = troot->index_expr.object;
-                }
-                if (troot && troot->kind == NODE_IDENT) {
-                    Symbol *target_sym = scope_lookup(c->current_scope,
-                        troot->ident.name, (uint32_t)troot->ident.name_len);
-                    bool target_is_global = target_sym &&
-                        (target_sym->is_static ||
-                         scope_lookup_local(c->global_scope, target_sym->name,
-                                            target_sym->name_len) != NULL);
-                    if (target_is_global) {
-                        checker_error(c, node->loc.line,
-                            "cannot store local-derived pointer '%.*s' in "
-                            "global/static variable '%.*s' — pointer will dangle "
-                            "when function returns",
-                            (int)val_sym->name_len, val_sym->name,
-                            (int)target_sym->name_len, target_sym->name);
+        /* BUG-205/355: local-derived escape via assignment to global/static.
+         * After flag propagation, check if target is global/static with local-derived value.
+         * BUG-355: also walk through intrinsics (@ptrcast, @bitcast, @cast) to find root ident. */
+        if (node->assign.op == TOK_EQ) {
+            Node *vnode = node->assign.value;
+            /* BUG-355: walk through intrinsics to find root ident */
+            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
+                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            if (vnode && vnode->kind == NODE_IDENT) {
+                Symbol *val_sym = scope_lookup(c->current_scope,
+                    vnode->ident.name, (uint32_t)vnode->ident.name_len);
+                if (val_sym && val_sym->is_local_derived) {
+                    Node *troot = node->assign.target;
+                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                        else troot = troot->index_expr.object;
+                    }
+                    if (troot && troot->kind == NODE_IDENT) {
+                        Symbol *target_sym = scope_lookup(c->current_scope,
+                            troot->ident.name, (uint32_t)troot->ident.name_len);
+                        bool target_is_global = target_sym &&
+                            (target_sym->is_static ||
+                             scope_lookup_local(c->global_scope, target_sym->name,
+                                                target_sym->name_len) != NULL);
+                        if (target_is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot store local-derived pointer '%.*s' in "
+                                "global/static variable '%.*s' — pointer will dangle "
+                                "when function returns",
+                                (int)val_sym->name_len, val_sym->name,
+                                (int)target_sym->name_len, target_sym->name);
+                        }
                     }
                 }
             }
@@ -3927,8 +3933,10 @@ static void check_stmt(Checker *c, Node *node) {
                         ret_type && ret_type->kind == TYPE_POINTER) {
                         const char *iname = root->intrinsic.name;
                         uint32_t ilen = (uint32_t)root->intrinsic.name_len;
+                        /* BUG-351: @cast also needs escape check */
                         bool is_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
-                                       (ilen == 7 && memcmp(iname, "bitcast", 7) == 0);
+                                       (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
+                                       (ilen == 4 && memcmp(iname, "cast", 4) == 0);
                         if (is_cast && root->intrinsic.arg_count > 0)
                             root = root->intrinsic.args[root->intrinsic.arg_count - 1];
                     }
@@ -4003,8 +4011,10 @@ static void check_stmt(Checker *c, Node *node) {
             if (node->ret.expr->kind == NODE_INTRINSIC) {
                 const char *iname = node->ret.expr->intrinsic.name;
                 uint32_t ilen = (uint32_t)node->ret.expr->intrinsic.name_len;
+                /* BUG-351: @cast also needs escape check */
                 bool is_ptr_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
-                                   (ilen == 7 && memcmp(iname, "bitcast", 7) == 0);
+                                   (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
+                                   (ilen == 4 && memcmp(iname, "cast", 4) == 0);
                 if (is_ptr_cast && node->ret.expr->intrinsic.arg_count > 0) {
                     Node *arg = node->ret.expr->intrinsic.args[
                         node->ret.expr->intrinsic.arg_count - 1];
@@ -4550,6 +4560,14 @@ static bool all_paths_return(Node *node) {
         }
         return false;
     case NODE_IF:
+        /* BUG-354: comptime if — only the taken branch matters */
+        if (node->if_stmt.is_comptime) {
+            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval && cval != CONST_EVAL_FAIL)
+                return node->if_stmt.then_body && all_paths_return(node->if_stmt.then_body);
+            else
+                return node->if_stmt.else_body && all_paths_return(node->if_stmt.else_body);
+        }
         /* both branches must return; else is required */
         if (!node->if_stmt.else_body) return false;
         return all_paths_return(node->if_stmt.then_body) &&

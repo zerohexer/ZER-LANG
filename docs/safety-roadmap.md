@@ -704,7 +704,7 @@ buf[i] = 5;                        // OK — guard proves in range
 | Scope escape | **100%** | Cross-function analysis + auto keep on fn ptr params |
 | Union type confusion | **100%** | None |
 | Volatile stripping | **100%** | None |
-| MMIO range | **~99%** | Computed variable addresses (rare) |
+| MMIO range | **100%** | Range propagation proves guarded computed addresses (runtime backup stays) |
 | @cstr overflow | **100%** | Auto-orelse for variable slices, compile error for constant strings |
 | Arena overflow | **0%** | Inherently runtime |
 

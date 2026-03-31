@@ -2141,3 +2141,20 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Feature:** 5-phase boot scan when `--no-strict-mmio` + `@inttoptr` + no `mmio`. Discovers all hardware via brute-force RCC/power controller + rescan.
 - **Implementation:** `has_inttoptr()` AST scan, `__attribute__((constructor))` discovery, `_zer_mmio_valid()` validation.
 - **Test:** 1 E2E test.
+
+### Forward declaration emission fix
+- **Symptom:** Functions forward-declared without body (extern, mutual recursion) produced GCC errors: "conflicting types" or "implicit declaration" when the return type was non-int (bool, struct, opaque).
+- **Root cause:** Emitter skipped forward declarations without body — no C prototype emitted. GCC assumed `int` return, conflicting with actual return type.
+- **Fix:** Emit C prototypes for ALL bodyless forward declarations. For forward decls WITH later definition in same file, still emit prototype (needed for mutual recursion). Skip well-known C stdlib names (puts, printf, etc.) to avoid conflicting with `<stdio.h>`.
+- **Test:** Existing mutual recursion test (is_even/is_odd) now passes. Pre-existing bug.
+
+### Nested comptime function calls
+- **Symptom:** `comptime u32 BUF_SIZE() { return BIT(3) * 4; }` failed with "body could not be evaluated" when BIT is another comptime function.
+- **Root cause:** `eval_const_expr_subst` handled NODE_IDENT, NODE_INT_LIT, NODE_BINARY but NOT NODE_CALL. Nested comptime calls within comptime bodies returned CONST_EVAL_FAIL.
+- **Fix:** Added `eval_comptime_call_subst()` — when NODE_CALL is encountered during comptime evaluation, looks up callee via `_comptime_global_scope`, evaluates args with current substitution, recursively evaluates callee body. `_comptime_global_scope` set before each comptime evaluation site (array size resolution + call-site evaluation).
+- **Test:** 2 new checker tests + 1 E2E test.
+
+### NODE_INTRINSIC optional init fix
+- **Symptom:** `?u32 val = @probe(addr);` emitted `(_zer_opt_u32){ _zer_probe(addr), 1 }` — double-wrapping because @probe already returns `_zer_opt_u32`.
+- **Root cause:** Var-decl optional init path only checked NODE_CALL and NODE_ORELSE for direct assignment. NODE_INTRINSIC fell to the `else` branch that wrapped in `{ val, 1 }`.
+- **Fix:** Added `NODE_INTRINSIC` to the `NODE_CALL || NODE_ORELSE` direct-assign check in emitter NODE_VAR_DECL.

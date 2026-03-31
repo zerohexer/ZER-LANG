@@ -2696,6 +2696,22 @@ int main(void) {
     err("void f() { @probe(); }",
         "@probe: no args rejected");
 
+    /* ---- Nested comptime calls ---- */
+    printf("\n[comptime nested: BUF_SIZE calls BIT]\n");
+    ok("comptime u32 BIT(u32 n) { return 1 << n; }\n"
+       "comptime u32 BUF_SIZE() { return BIT(3) * 4; }\n"
+       "u32[BUF_SIZE()] buf;\n"
+       "u32 main() { return 0; }\n",
+       "comptime nested: BUF_SIZE()=BIT(3)*4=32 as array size");
+
+    printf("[comptime nested: triple nesting]\n");
+    ok("comptime u32 A() { return 2; }\n"
+       "comptime u32 B() { return A() * 3; }\n"
+       "comptime u32 C() { return B() + 1; }\n"
+       "u32[C()] arr;\n"
+       "u32 main() { return 0; }\n",
+       "comptime nested: C()=B()+1=A()*3+1=7 as array size");
+
     printf("[@probe: scan loop pattern]\n");
     ok("u32 scan() {\n"
        "    u32 count = 0;\n"

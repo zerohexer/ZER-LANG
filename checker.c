@@ -553,6 +553,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn);
 /* BUG-391: forward declarations for comptime evaluation in array sizes */
 typedef struct { const char *name; uint32_t name_len; int64_t value; } ComptimeParam;
 static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param_count);
+static Scope *_comptime_global_scope; /* set before eval for nested comptime calls */
 
 /* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
 static Type *resolve_type(Checker *c, TypeNode *tn) {
@@ -675,6 +676,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                         cparams[ci].value = cv;
                     }
                     if (all_const && fn->func_decl.body) {
+                        _comptime_global_scope = c->global_scope;
                         val = eval_comptime_block(fn->func_decl.body, cparams, pc);
                     }
                 }
@@ -844,6 +846,33 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
 
 /* ComptimeParam and eval_comptime_block forward-declared above resolve_type_inner (BUG-391) */
 
+/* Forward declare for recursive comptime calls */
+static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count);
+
+/* Resolve a comptime NODE_CALL within eval_const_expr_subst.
+ * Looks up the callee as a comptime function and recursively evaluates. */
+static Scope *_comptime_global_scope; /* set by caller before eval */
+static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params, int outer_count) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee ||
+        call->call.callee->kind != NODE_IDENT || !_comptime_global_scope)
+        return CONST_EVAL_FAIL;
+    Symbol *sym = scope_lookup(_comptime_global_scope,
+        call->call.callee->ident.name, (uint32_t)call->call.callee->ident.name_len);
+    if (!sym || !sym->is_comptime || !sym->func_node) return CONST_EVAL_FAIL;
+    Node *fn = sym->func_node;
+    int pc = fn->func_decl.param_count;
+    if (pc != call->call.arg_count) return CONST_EVAL_FAIL;
+    ComptimeParam cparams[32];
+    for (int i = 0; i < pc && i < 32; i++) {
+        int64_t av = eval_const_expr_subst(call->call.args[i], outer_params, outer_count);
+        if (av == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        cparams[i].name = fn->func_decl.params[i].name;
+        cparams[i].name_len = (uint32_t)fn->func_decl.params[i].name_len;
+        cparams[i].value = av;
+    }
+    return eval_comptime_block(fn->func_decl.body, cparams, pc);
+}
+
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
     if (!n) return CONST_EVAL_FAIL;
     /* substitute parameter references */
@@ -857,6 +886,8 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     }
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_BOOL_LIT) return n->bool_lit.value ? 1 : 0;
+    /* nested comptime function calls */
+    if (n->kind == NODE_CALL) return eval_comptime_call_subst(n, params, param_count);
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
@@ -2462,6 +2493,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             "comptime function '%.*s' requires all arguments to be compile-time constants",
                             (int)callee_sym->name_len, callee_sym->name);
                     } else if (fn->func_decl.body) {
+                        _comptime_global_scope = c->global_scope;
                         int64_t val = eval_comptime_block(fn->func_decl.body, cparams, pc);
                         if (val == CONST_EVAL_FAIL) {
                             checker_error(c, node->loc.line,

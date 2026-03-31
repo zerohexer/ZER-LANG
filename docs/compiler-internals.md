@@ -313,7 +313,7 @@ Both functions now call `emit_top_level_decl(e, decl, file_node, i)`. Adding a n
 - `_Alignof(T)` — type alignment (C11, supported by GCC/Clang)
 - These make the emitted C NOT portable to MSVC
 
-## ZER-CHECK (zercheck.c) — ~400 lines
+## ZER-CHECK (zercheck.c) — ~900 lines
 
 ### What It Checks
 Path-sensitive handle tracking after type checker, before emitter:
@@ -321,22 +321,76 @@ Path-sensitive handle tracking after type checker, before emitter:
 - Double free: `pool.free(h); pool.free(h)` → error
 - Wrong pool: `pool_a.alloc() → h; pool_b.get(h)` → error
 - Free in loop: `for { pool.free(h); }` → error (may use-after-free next iteration)
+- **Maybe-freed use**: `if (c) { pool.free(h); } pool.get(h)` → error (handle may have been freed)
+- **Handle leak**: `h = pool.alloc(); /* no free */` → error at function exit
+- **Handle overwrite**: `h = pool.alloc(); h = pool.alloc()` → error (first handle leaked)
 
 ### Handle States
 `HS_UNKNOWN` → `HS_ALIVE` (after alloc) → `HS_FREED` (after free)
+                                         → `HS_MAYBE_FREED` (freed on some paths, not all)
+
+`HS_MAYBE_FREED` is an error state — using or freeing a MAYBE_FREED handle produces a compile error. This closes the gap where conditional frees (if-without-else, partial switch arms) were previously undetected.
 
 ### Handle Aliasing (BUG-082 fix)
 When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is registered with the same state, pool_id, and alloc_line as the source. When `pool.free(h)` is called, all handles with the same pool_id + alloc_line are also marked HS_FREED (aliases of the same allocation). Independent handles from the same pool (different alloc_line) are unaffected.
 
-### Path Merging (under-approximation — zero false positives)
-- **if/else**: mark freed only if freed on BOTH branches
-- **if without else**: keep original state (accept false negatives over false positives)
-- **switch**: mark freed only if freed in ALL arms
-- **loops**: check that handles alive before loop aren't freed inside
+### Path Merging
+- **if/else**: both freed → `FREED`, one freed → `MAYBE_FREED`
+- **if without else**: then frees → `MAYBE_FREED`
+- **switch**: all arms free → `FREED`, some arms free → `MAYBE_FREED`
+- **loops**: unconditional free inside loop → error. Loop second pass: if state changed after first pass, run body once more; if still unstable → widen to `MAYBE_FREED`
+
+### Leak Detection
+At function exit, any handle that is `HS_ALIVE` or `HS_MAYBE_FREED` and was allocated inside the function (not a parameter) triggers a warning:
+- `HS_ALIVE` → "handle leaked: never freed"
+- `HS_MAYBE_FREED` → "handle leaked: may not be freed on all paths"
+- Parameter handles (pool_id == -1, alloc_line == func start) are excluded — caller is responsible.
+
+### Overwrite Detection
+If a handle target is already `HS_ALIVE` when a new `pool.alloc()` is assigned to it, the first handle is leaked. Error: "handle overwritten while alive — previous handle leaked."
+
+### Cross-Function Analysis (Change 4)
+Pre-scan builds `FuncSummary` for each function with Handle params:
+- `frees_param[i]` — this function definitely frees parameter i on all paths
+- `maybe_frees_param[i]` — this function conditionally frees parameter i
+
+**Summary building:** `zc_build_summary()` runs the existing `zc_check_stmt` walker with `building_summary=true` (suppresses errors). After walking, checks each Handle param's final state: FREED → `frees_param`, MAYBE_FREED → `maybe_frees_param`.
+
+**Summary usage:** `zc_apply_summary()` called from `zc_check_expr(NODE_CALL)` when callee is `NODE_IDENT` (not `NODE_FIELD` which is pool.method). Looks up callee's summary, applies effects to caller's PathState. Freed params → mark handle arg as FREED. Maybe-freed → MAYBE_FREED.
+
+**Flow in `zercheck_run`:** (1) register pools, (2) pre-scan: build summaries, (3) main analysis: check functions.
 
 ### Scope
 - Looks up Pool types via `checker_get_type()` first, then `global_scope` fallback
 - Checks `NODE_FUNC_DECL` and `NODE_INTERRUPT` bodies
+
+## Value Range Propagation (checker.c)
+
+Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entries shadow older, save/restore via count for scoped narrowing. `push_var_range()` intersects with existing (only narrows), clamps min to 0 for unsigned types.
+
+**Narrowing events:** literal init (`u32 d = 5` → {5,5,true}), for-loop condition (`i < N` → {0,N-1}), guard pattern (`if (i >= N) return` → {0,N-1} after if), comparison in then-block.
+
+**Proven nodes:** `mark_proven(c, node)` adds to `proven_safe` array. `checker_is_proven()` exposed to emitter. Emitter skips `_zer_bounds_check` for proven NODE_INDEX, skips div trap for proven NODE_BINARY.
+
+**Forced division guard:** NODE_IDENT divisor not proven nonzero → compile error with fix suggestion. Complex expressions keep runtime check.
+
+## Bounds Auto-Guard (checker.c + emitter.c)
+
+When array index is not proven by range propagation, compiler auto-inserts `if (idx >= size) { return <zero>; }` as invisible guard. Works for ALL cases: params, globals, volatile, computed.
+
+**Checker:** `mark_auto_guard(c, node, array_size)` stores in `auto_guards` array. `checker_auto_guard_size()` exposed to emitter. Warning emitted so programmer can add explicit guard for zero overhead.
+
+**Emitter:** `emit_auto_guards(e, node)` walks expression tree, finds auto-guarded NODE_INDEX, emits `if` guard as preceding statement. Called from emit_stmt for NODE_EXPR_STMT, NODE_VAR_DECL, NODE_RETURN. Uses `emit_zero_value()` for return type's zero value. Runtime `_zer_bounds_check` stays as belt-and-suspenders backup.
+
+## Auto-Keep, @cstr Auto-Orelse, Provenance Extensions
+
+**Auto-keep on fn ptr pointer-params:** In NODE_CALL keep validation, if callee is a function pointer (not direct call to named function), ALL pointer params treated as `keep` automatically. Invisible to programmer.
+
+**@cstr auto-orelse:** In emitter @cstr handler, overflow check uses `return <zero_value>` instead of `_zer_trap`. Same pattern as auto-guard — device keeps running on overflow.
+
+**Array-level *opaque provenance:** `prov_map_set()` auto-sets root key when key contains `[`. "callbacks[0]" → also sets "callbacks". Different type on same root → compile error "heterogeneous *opaque array."
+
+**Cross-function provenance summaries:** `find_return_provenance()` scans function body for return expression provenance. `ProvSummary` stored on Checker. At NODE_VAR_DECL init from function call returning *opaque, `lookup_prov_summary()` sets `sym->provenance_type`.
 
 ## Test Files
 | File | What | Count |
@@ -346,11 +400,11 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 | `test_parser_edge.c` | Edge cases, func ptrs, overflow | 93 |
 | `test_modules/` | Multi-file imports, typedefs, interrupts | 6 |
 | `test_checker.c` | Type checking basic | 71 |
-| `test_checker_full.c` | Full spec coverage + security + audit | 237 |
+| `test_checker_full.c` | Full spec coverage + security + audit + safety | 510 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 160 |
-| `test_zercheck.c` | Handle tracking, aliasing, params | 24 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 229 |
+| `test_zercheck.c` | Handle tracking, aliasing, params, leaks, cross-func | 49 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
 | `test_firmware_patterns2.c` | Round 2 firmware | 41 |
@@ -1546,3 +1600,183 @@ All checks unwrap TYPE_DISTINCT before comparing.
 
 ### Orelse Array Escape to Global (BUG-377)
 Both NODE_ASSIGN (BUG-240 path) and NODE_VAR_DECL (BUG-203 path) now check orelse fallback for local array roots. `g_slice = opt orelse local_buf` — the assignment path collects both direct value AND `orelse.fallback` into `arr_checks[]`, iterates each. Var_decl path does the same with `arr_roots[]`. Catches local array provided as orelse fallback being stored in global/static slices.
+
+## Value Range Propagation
+
+### Overview
+The checker maintains a `VarRange` stack on the `Checker` struct: `{name, min_val, max_val, known_nonzero}`. This enables eliminating redundant runtime checks at compile time, and inserting invisible safety guards only when the index cannot be proven safe.
+
+### VarRange Stack API
+- `push_var_range(c, name, min, max, nonzero)` — adds entry, intersects with existing range for same name (narrowing only, never widens). Clamps `min` to 0 for unsigned types.
+- Save/restore via `c->range_count` snapshot for scoped narrowing (if-body, for-body).
+- `proven_safe` array on Checker: set of `Node *` pointers proven bounds/div safe. `checker_is_proven(c, node)` returns bool.
+
+### Patterns Tracked
+| Pattern | What's learned |
+|---|---|
+| `u32 d = 5;` | d in [5,5], known_nonzero=1 |
+| `for (u32 i = 0; i < N; i += 1)` | i in [0, N-1] inside body |
+| `if (i >= arr_len) { return; }` | i < arr_len after the if |
+| `if (d == 0) { return; }` | d known_nonzero after the if |
+| Literal index `arr[3]` where size > 3 | node added to proven_safe |
+| Literal divisor `x / 4` | node added to proven_safe |
+
+### Emitter Integration
+- `NODE_INDEX` checks `checker_is_proven(e->checker, node)` → emits plain `arr[idx]` (no `_zer_bounds_check` wrapper).
+- `NODE_BINARY TOK_SLASH/TOK_PERCENT` checks → emits plain `(a / b)` (no runtime division-by-zero trap).
+- Belt and suspenders: proven-safe paths are zero overhead. Unproven paths still get bounds check OR auto-guard.
+
+## Forced Division Guard
+
+For `NODE_BINARY TOK_SLASH/TOK_PERCENT`: if divisor is `NODE_IDENT` and NOT in `proven_safe`, the checker emits a **compile error** with a fix suggestion. This prevents silent division-by-zero UB for the most common case.
+
+- Error: `divisor 'd' not proven nonzero — add 'if (d == 0) { return; }' before division`
+- Complex divisors (struct fields, function calls, array elements) keep the existing runtime trap — they're too hard to prove statically.
+- Proof methods: literal nonzero init, zero-guard before use, for-loop range starting at 1+.
+
+## Bounds Auto-Guard
+
+### Design Decision (why not "forced bounds guard")
+An earlier design tried to require the programmer to add an explicit bounds guard before any array index. This was rejected because:
+1. It broke hundreds of existing tests.
+2. It required guard syntax that doesn't exist in ZER.
+3. It was too invasive — every array access needed ceremony.
+
+### Final Design: Compiler-Inserted Invisible Guard
+When an array index is NOT proven safe by range propagation, the compiler inserts an invisible guard **before** the containing statement:
+
+```c
+// ZER: arr[i] = 5;
+// Emitted C (when i not proven):
+if (i >= arr_size) { return <zero_value>; }   // auto-guard
+arr[i] = 5;                                    // _zer_bounds_check still present (belt+suspenders)
+```
+
+A **warning** is emitted so the programmer knows: `"auto-guard inserted for arr[i] — add explicit guard for zero overhead"`.
+
+### Implementation
+- `AutoGuard` struct in `checker.h`: `{node, size, type_tag}`. Array `auto_guard_count/capacity` on Checker.
+- `checker_mark_auto_guard(c, node, size)` — called in checker when index is unproven.
+- `emit_auto_guards(e, stmt)` — walks statement expression tree, finds auto-guarded NODE_INDEX nodes, emits if-return before the statement.
+- `emit_zero_value(e, type)` — emits the appropriate zero for the function's return type: `void` → nothing (just `return`), integer → `0`, bool → `0`, pointer → `NULL`, optional → `{0}`.
+- `checker_auto_guard_size(c, node)` — API for emitter to query guard size for a given node.
+
+### Interaction with Range Propagation
+1. Checker runs range propagation for each statement.
+2. Proven-safe indices → `proven_safe` set → emitter skips `_zer_bounds_check`.
+3. Unproven indices → `auto_guard` set → emitter inserts if-return guard + keeps `_zer_bounds_check`.
+4. Net effect: safe code is zero overhead; unsafe code is safe with a warning.
+
+## Auto-Keep for Function Pointer Calls
+
+In `NODE_CALL` keep-parameter validation: when the callee is a **function pointer** (not a direct call to a named function), ALL pointer parameters are automatically treated as `keep`. This is because the compiler cannot see the function body to know whether the pointer escapes.
+
+Detection: callee is `NODE_IDENT` but the resolved symbol `is_function == false` (it's a function pointer variable), OR callee is not `NODE_IDENT` at all (e.g., `ops.fn(ptr)`).
+
+This is invisible to the programmer — no annotation needed. The compiler enforces conservatively for all function pointer calls.
+
+## @cstr Overflow Auto-Return
+
+Previously, `@cstr` buffer overflow (source slice too long for destination) called `_zer_trap()`. Now it uses the same `emit_zero_value()` pattern as bounds auto-guard:
+- If destination buffer too small: emit `if (src.len + 1 > dest_size) { emit_defers(); return <zero_value>; }` instead of trap.
+- `emit_defers()` is called before the return so pending defers fire on this path.
+- Applies to both array destination and slice destination overflow checks.
+
+## *opaque Array Homogeneous Provenance
+
+`prov_map_set()` has an additional check: when the key contains `[` (array element), the root key (prefix before `[`) is also checked. If the root already has a DIFFERENT provenance, it's a compile error: `"heterogeneous *opaque array — all elements must have the same type"`.
+
+This enforces that `*opaque arr[4]` cannot have `arr[0]` pointing to `Sensor` and `arr[1]` pointing to `Motor`. All elements must be the same concrete type.
+
+## Cross-Function *opaque Provenance Summaries
+
+When a function returns `*opaque`, the checker scans the function body for `NODE_RETURN` nodes that contain `@ptrcast` or provenance-carrying idents. This return provenance is recorded in `ProvSummary` entries on the Checker struct.
+
+- `find_return_provenance(c, func_node)` — walks function body for returns with ptrcast source type or ident provenance.
+- `add_prov_summary(c, func_name, type)` / `lookup_prov_summary(c, func_name)` — summary table API.
+- Built after checking each function body (if return type is `*opaque`).
+- Used in `NODE_VAR_DECL`: if init is a call to a function with a known prov summary and target is `*opaque`, sets `sym->provenance_type` automatically.
+
+This means `*opaque p = get_sensor();` can be typed as `Sensor`-provenance without any `@ptrcast` annotation at the call site, if `get_sensor()` always returns a `Sensor`-casted pointer.
+
+## Whole-Program *opaque Param Provenance (checker.c)
+
+Post-check pass validates that call-site arguments match what the callee expects.
+
+**Building:** `find_param_cast_type(c, body, param_name)` scans function body for `@ptrcast(*T, param)` — returns the target type *T from typemap. Stored in `ParamExpect` entries on Checker.
+
+**Validation:** `check_call_provenance(c, node)` runs after all bodies are checked (Pass 3 in `checker_check`). At each call to a function with `*opaque` params, extracts argument provenance (from @ptrcast source type or ident provenance_type) and compares against expected type. Mismatch → compile error.
+
+**Limitation:** only works for ZER-to-ZER calls. `cinclude` functions have no body to analyze — runtime `type_id` handles those.
+
+## Struct Field Range Propagation (checker.c)
+
+Value range propagation extended to handle struct fields via `build_expr_key()`:
+- `if (cfg.divisor == 0) { return; }` → range `"cfg.divisor"` set to known_nonzero
+- `total / cfg.divisor` → lookup `"cfg.divisor"` in var_ranges → proven
+- Both NODE_IF condition extraction and NODE_BINARY division check handle NODE_FIELD
+
+**Critical fix:** compound key strings MUST be arena-allocated, not stack-allocated. The `cmp_key_buf` in NODE_IF is stack-local — `push_var_range` stores a pointer to it. After the if-block scope ends, the pointer dangles. Fix: `arena_alloc` + `memcpy` before pushing.
+
+## @probe Intrinsic (checker.c + emitter.c)
+
+Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, returns `?u32` — null if the address faults.
+
+**Checker:** validates 1 integer arg, result type = `type_optional(ty_u32)`.
+
+**Emitter:** emits `_zer_probe((uint32_t)(addr))`. Preamble emits platform-specific fault handler:
+- ARM: naked HardFault handler sets fault flag, skips instruction via stacked PC
+- RISC-V: exception handler on mcause 5/7
+- x86/hosted: `setjmp` + `SIGSEGV` signal handler + `longjmp`
+
+**Important:** `NODE_INTRINSIC` returning `?T` must be handled in var-decl optional init path — added to the `NODE_CALL || NODE_ORELSE` check that assigns directly (without `{ val, 1 }` wrapping).
+
+## MMIO Auto-Discovery (emitter.c)
+
+When `--no-strict-mmio` is set AND `@inttoptr` is used AND no `mmio` ranges declared, the emitter auto-generates a 5-phase hardware discovery system.
+
+**Detection:** `has_inttoptr(file_node)` scans AST for any NODE_INTRINSIC with name "inttoptr".
+
+**Emitted functions:**
+- `_zer_disc_scan(start, end, step)` — probe address range at block granularity
+- `_zer_disc_brute_enable(start, end, step)` — brute-force clock/power controller (write 0xFFFFFFFF to each block, check if new blocks appear)
+- `_zer_mmio_discover()` — `__attribute__((constructor))`, runs 5 phases before main
+- `_zer_mmio_valid(addr)` — checks if address is in discovered map
+
+**Platform behavior:**
+- ARM/RISC-V/AVR: full 5-phase boot scan (~12ms on Cortex-M at 72MHz)
+- x86 hosted: per-access probe via `_zer_probe()` (no startup scan — x86 address space is different)
+
+**@inttoptr emission with discovery:** wraps variable addresses with `if (!_zer_mmio_valid(addr)) { return <zero>; }` — auto-guard pattern, same as bounds.
+
+**5 phases:**
+1. Initial scan — find always-on peripherals
+2. Brute-force clock controller — write to blocks, check if new blocks appear
+3. Rescan — find clock-gated peripherals
+4. Brute-force power controller — same technique
+5. Final rescan — find power-gated peripherals
+
+**Flags:**
+- (none): strict mode, `mmio` required, @inttoptr without declaration = compile error
+- `--no-strict-mmio`: auto-probe at boot, @inttoptr compiles, validated against discovered map
+- `--discover`: (planned) same as `--no-strict-mmio` + prints discovered ranges to console
+
+## Test Counts (v0.2.1 final)
+
+| File | What | Count |
+|---|---|---|
+| `test_lexer.c` | Token scanning | 218 |
+| `test_parser.c` | AST construction | 70 |
+| `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
+| `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
+| `test_checker.c` | Type checking basic | 72 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe | 522 |
+| `test_extra.c` | Additional checker | 18 |
+| `test_gaps.c` | Gap coverage | 4 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 233 |
+| `test_zercheck.c` | Handle tracking, leaks, cross-func | 49 |
+| `test_fuzz.c` | Parser adversarial inputs | 491 |
+| `test_firmware_patterns.c` | Round 1 firmware | 39 |
+| `test_firmware_patterns2.c` | Round 2 firmware | 41 |
+| `test_firmware_patterns3.c` | Round 3 firmware | 22 |
+| `test_production.c` | Production firmware E2E | 14 |

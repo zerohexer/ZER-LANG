@@ -145,6 +145,7 @@ Handle(Task) h;          u64: index(32) + generation(32), not a pointer
 @offset(T, field)        offsetof
 @container(*T, ptr, f)   container_of (field-validated, provenance-tracked)
 @trap()                  crash intentionally
+@probe(addr)             safe MMIO read — returns ?u32, null if address faults
 ```
 
 ### mmio Declaration (MANDATORY for @inttoptr)
@@ -239,8 +240,8 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ### Safety Guarantees
 | Bug Class | Prevention |
 |---|---|
-| Buffer overflow | Inline bounds check on every array/slice access (conditions, loops, all expressions) |
-| Use-after-free | Handle generation counter + ZER-CHECK (with alias tracking) |
+| Buffer overflow | Inline bounds check on every array/slice access; proven-safe indices skip check (range propagation); unsafe indices get auto-guard (silent if-return inserted) |
+| Use-after-free | Handle generation counter + ZER-CHECK (MAYBE_FREED + leak detection + loop pass + cross-function summaries) |
 | Null dereference | `*T` non-null by default, `?T` requires unwrapping |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
@@ -249,8 +250,10 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
-| Invalid MMIO address | `mmio` range declarations + compile-time/runtime validation of `@inttoptr` |
-| Wrong pointer cast | 3-layer: compile-time Symbol + compound key map + runtime `_zer_opaque{ptr, type_id}` trap |
+| Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
+| Invalid MMIO address | `mmio` declarations (compile-time) + `@probe` auto-discovery (boot-time, 5-phase scan) + `--no-strict-mmio` auto-validation |
+| Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
+| Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
 | Volatile/const strip | `@ptrcast`, `@bitcast`, `@cast` all check qualifier preservation |
 
@@ -268,7 +271,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Modules/imports | Done | Done (multi-file) |
 | Intrinsics (@size, @truncate, etc.) | Done | Done |
 | Defer | Done | Done |
-| ZER-CHECK (handle tracking) | Done | N/A (analysis pass) |
+| ZER-CHECK (MAYBE_FREED, leaks, loops) | Done | N/A (analysis pass) |
 | ?FuncPtr (optional function pointers) | Done | Done (null sentinel) |
 | Function pointer typedef | Done | Done |
 | Distinct typedef (including func ptrs) | Done | Done |
@@ -284,6 +287,18 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | @container field+provenance | Done | N/A (compile-time) |
 | comptime functions | Done | Done (inlined constants) |
 | comptime if (conditional compilation) | Done | Done (dead branch stripped) |
+| Value range propagation (bounds/div opt) | Done | Done (proven-safe skip check) |
+| Bounds auto-guard (unproven indices) | Done | Done (auto if-return inserted) |
+| Forced division guard (ident divisors) | Done | N/A (compile error with fix hint) |
+| ZER-CHECK cross-function summaries | Done | N/A (analysis pass) |
+| Auto-keep on fn-ptr pointer params | Done | N/A (compile-time) |
+| @cstr overflow → auto-return | Done | Done (returns zero value) |
+| *opaque array homogeneous provenance | Done | N/A (compile-time) |
+| Cross-function *opaque prov summaries | Done | N/A (compile-time) |
+| Whole-program *opaque param provenance | Done | N/A (compile-time — call-site validation) |
+| Struct field range propagation | Done | Done (guards on s.field work) |
+| @probe (safe MMIO hardware discovery) | Done | Done (platform-specific fault handler) |
+| MMIO auto-discovery (5-phase boot scan) | Done | Done (constructor, --no-strict-mmio) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 
@@ -327,8 +342,8 @@ diff zerc zerc2                  ← identical = v1.0 proven
 
 **Roadmap:**
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
-- **v0.2.1 (CURRENT):** comptime functions + comptime if, mmio range validation, @ptrcast/@container provenance tracking, safe intrinsics (every @ operation validated), zer-convert preprocessor→comptime (zero // MANUAL:), 350+ bug fixes, 1,280+ tests
-- **v0.3:** bounds check optimization, better error messages, stdlib completion (io/fmt/conv)
+- **v0.2.1 (CURRENT):** comptime functions + comptime if, mmio range validation, @ptrcast/@container provenance tracking, safe intrinsics, zer-convert preprocessor→comptime, FULL SAFETY ROADMAP: value range propagation, bounds auto-guard, forced division guard (incl. struct fields), @cstr auto-orelse, auto-keep on fn ptr params, array-level + whole-program *opaque provenance, zercheck 1-4 (MAYBE_FREED + leaks + loops + cross-func), @probe safe MMIO discovery (5-phase boot scan), 400+ bug fixes, 1,500+ tests
+- **v0.3:** better error messages, stdlib completion (io/fmt/conv)
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
 

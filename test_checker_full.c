@@ -2446,6 +2446,268 @@ int main(void) {
     test_red_team_343_346();
     test_mmio_provenance();
 
+    /* ---- Forced division guard ---- */
+    printf("\n[forced division: literal divisor OK]\n");
+    ok("u32 main() { return 100 / 4; }",
+       "forced div: literal nonzero divisor OK");
+
+    printf("[forced division: variable with literal init OK]\n");
+    ok("u32 main() { u32 d = 5; return 100 / d; }",
+       "forced div: variable initialized to nonzero OK");
+
+    printf("[forced division: after nonzero guard OK]\n");
+    ok("u32 f(u32 d) {\n"
+       "    if (d == 0) { return 0; }\n"
+       "    return 100 / d;\n"
+       "}",
+       "forced div: after if(d==0)return guard OK");
+
+    printf("[forced division: unguarded variable — error]\n");
+    err("u32 f(u32 d) { return 100 / d; }",
+        "forced div: unguarded variable divisor rejected");
+
+    printf("[forced division: modulo also forced]\n");
+    err("u32 f(u32 d) { return 100 % d; }",
+        "forced div: unguarded modulo rejected");
+
+    printf("[forced division: modulo with guard OK]\n");
+    ok("u32 f(u32 d) {\n"
+       "    if (d == 0) { return 0; }\n"
+       "    return 100 % d;\n"
+       "}",
+       "forced div: modulo after guard OK");
+
+    printf("[forced division: for loop variable OK]\n");
+    ok("u32 f() {\n"
+       "    u32 sum = 0;\n"
+       "    for (u32 i = 1; i < 10; i += 1) {\n"
+       "        sum += 100 / i;\n"
+       "    }\n"
+       "    return sum;\n"
+       "}",
+       "forced div: for loop var starting at 1 is nonzero");
+
+    /* ---- Auto-keep on fn ptr pointer-params ---- */
+    printf("\n[auto-keep: fn ptr call with &local → error]\n");
+    err("u32 g_val = 0;\n"
+        "void do_thing(*u32 p) { }\n"
+        "void f() {\n"
+        "    void (*cb)(*u32) = do_thing;\n"
+        "    u32 local = 5;\n"
+        "    cb(&local);\n"
+        "}",
+        "auto-keep: fn ptr call with &local rejected (auto-keep)");
+
+    printf("[auto-keep: fn ptr call with &global → OK]\n");
+    ok("u32 g_val = 0;\n"
+       "void do_thing(*u32 p) { }\n"
+       "void f() {\n"
+       "    void (*cb)(*u32) = do_thing;\n"
+       "    cb(&g_val);\n"
+       "}",
+       "auto-keep: fn ptr call with &global OK");
+
+    printf("[auto-keep: direct call with &local (no keep) → OK]\n");
+    ok("void use_ptr(*u32 p) { }\n"
+       "void f() {\n"
+       "    u32 local = 5;\n"
+       "    use_ptr(&local);\n"
+       "}",
+       "auto-keep: direct call without keep → &local OK");
+
+    /* ---- Array-level *opaque provenance ---- */
+    printf("\n[array provenance: homogeneous *opaque → OK]\n");
+    ok("struct Sensor { u32 id; }\n"
+       "struct State { *opaque ctx; *opaque ctx2; }\n"
+       "void f() {\n"
+       "    Sensor s1; Sensor s2;\n"
+       "    State st;\n"
+       "    st.ctx = @ptrcast(*opaque, &s1);\n"
+       "    st.ctx2 = @ptrcast(*opaque, &s2);\n"
+       "}",
+       "array provenance: struct fields same type OK");
+
+    printf("[array provenance: different struct fields can differ → OK]\n");
+    ok("struct Sensor { u32 id; }\n"
+       "struct Motor { u32 speed; }\n"
+       "struct Holder { *opaque sensor_ctx; *opaque motor_ctx; }\n"
+       "Sensor g_s;\n"
+       "Motor g_m;\n"
+       "void f() {\n"
+       "    Holder h;\n"
+       "    h.sensor_ctx = @ptrcast(*opaque, &g_s);\n"
+       "    h.motor_ctx = @ptrcast(*opaque, &g_m);\n"
+       "}",
+       "array provenance: different struct fields → different types OK");
+
+    /* ---- Cross-function provenance summaries ---- */
+    printf("\n[cross-func prov: correct type from fn return → OK]\n");
+    ok("struct Sensor { u32 id; }\n"
+       "Sensor g_sensor;\n"
+       "*opaque get_ctx() {\n"
+       "    return @ptrcast(*opaque, &g_sensor);\n"
+       "}\n"
+       "void f() {\n"
+       "    *opaque ctx = get_ctx();\n"
+       "    *Sensor s = @ptrcast(*Sensor, ctx);\n"
+       "}",
+       "cross-func prov: fn returns *Sensor provenance, cast matches OK");
+
+    printf("[cross-func prov: wrong type from fn return → error]\n");
+    err("struct Sensor { u32 id; }\n"
+        "struct Motor { u32 speed; }\n"
+        "Sensor g_sensor;\n"
+        "*opaque get_ctx() {\n"
+        "    return @ptrcast(*opaque, &g_sensor);\n"
+        "}\n"
+        "void f() {\n"
+        "    *opaque ctx = get_ctx();\n"
+        "    *Motor m = @ptrcast(*Motor, ctx);\n"
+        "}",
+        "cross-func prov: fn returns *Sensor, cast to *Motor rejected");
+
+    /* ---- Struct field division guard ---- */
+    printf("\n[struct field div: guarded → OK]\n");
+    ok("struct Config { u32 divisor; }\n"
+       "u32 f(Config cfg) {\n"
+       "    if (cfg.divisor == 0) { return 0; }\n"
+       "    return 100 / cfg.divisor;\n"
+       "}",
+       "struct field div: guarded cfg.divisor OK");
+
+    printf("[struct field div: unguarded → error]\n");
+    err("struct Config { u32 divisor; }\n"
+        "u32 f(Config cfg) {\n"
+        "    return 100 / cfg.divisor;\n"
+        "}",
+        "struct field div: unguarded cfg.divisor rejected");
+
+    /* ---- Bounds auto-guard ---- */
+    printf("\n[auto-guard: unproven param index → warning (compiles OK)]\n");
+    ok("void f(u32 idx) {\n"
+       "    u32[8] buf;\n"
+       "    buf[idx] = 5;\n"
+       "}",
+       "auto-guard: unproven param index compiles (auto-guard inserted)");
+
+    printf("[auto-guard: unproven global index → warning (compiles OK)]\n");
+    ok("u32 g_idx = 0;\n"
+       "u32[8] buf;\n"
+       "void f() {\n"
+       "    buf[g_idx] = 5;\n"
+       "}",
+       "auto-guard: unproven global index compiles (auto-guard inserted)");
+
+    printf("[auto-guard: proven literal → no warning]\n");
+    ok("void f() {\n"
+       "    u32[8] buf;\n"
+       "    buf[3] = 5;\n"
+       "}",
+       "auto-guard: literal index proven — no auto-guard");
+
+    printf("[auto-guard: proven for-loop → no warning]\n");
+    ok("void f() {\n"
+       "    u32[8] buf;\n"
+       "    for (u32 i = 0; i < 8; i += 1) { buf[i] = i; }\n"
+       "}",
+       "auto-guard: for-loop index proven — no auto-guard");
+
+    printf("[auto-guard: proven after guard → no warning]\n");
+    ok("u32 f(u32 idx) {\n"
+       "    u32[8] buf;\n"
+       "    if (idx >= 8) { return 0; }\n"
+       "    return buf[idx];\n"
+       "}",
+       "auto-guard: guarded index proven — no auto-guard");
+
+    /* ---- Whole-program *opaque param provenance ---- */
+    printf("\n[whole-program prov: correct type passed → OK]\n");
+    ok("struct Sensor { u32 id; }\n"
+       "void process(*opaque ctx) {\n"
+       "    *Sensor s = @ptrcast(*Sensor, ctx);\n"
+       "}\n"
+       "Sensor g_s;\n"
+       "void f() {\n"
+       "    process(@ptrcast(*opaque, &g_s));\n"
+       "}",
+       "whole-program prov: caller passes *Sensor, callee casts to *Sensor OK");
+
+    printf("[whole-program prov: wrong type passed → error]\n");
+    err("struct Sensor { u32 id; }\n"
+        "struct Motor { u32 speed; }\n"
+        "void process(*opaque ctx) {\n"
+        "    *Sensor s = @ptrcast(*Sensor, ctx);\n"
+        "}\n"
+        "Motor g_m;\n"
+        "void f() {\n"
+        "    process(@ptrcast(*opaque, &g_m));\n"
+        "}",
+        "whole-program prov: caller passes *Motor, callee expects *Sensor → error");
+
+    printf("[whole-program prov: unknown provenance (param) → OK (runtime handles)]\n");
+    ok("struct Sensor { u32 id; }\n"
+       "void process(*opaque ctx) {\n"
+       "    *Sensor s = @ptrcast(*Sensor, ctx);\n"
+       "}\n"
+       "void f(*opaque unknown) {\n"
+       "    process(unknown);\n"
+       "}",
+       "whole-program prov: unknown provenance → OK (runtime type_id)");
+
+    /* ---- @probe intrinsic ---- */
+    printf("\n[@probe: basic usage → returns ?u32]\n");
+    ok("void f() {\n"
+       "    ?u32 val = @probe(0x40020000);\n"
+       "}",
+       "@probe: basic constant address returns ?u32");
+
+    printf("[@probe: with orelse → unwrap]\n");
+    ok("u32 f() {\n"
+       "    u32 val = @probe(0x40020000) orelse 0;\n"
+       "    return val;\n"
+       "}",
+       "@probe: orelse unwrap to u32");
+
+    printf("[@probe: with if-unwrap → capture]\n");
+    ok("u32 f() {\n"
+       "    if (@probe(0x40020000)) |val| {\n"
+       "        return val;\n"
+       "    }\n"
+       "    return 0;\n"
+       "}",
+       "@probe: if-unwrap capture");
+
+    printf("[@probe: variable address]\n");
+    ok("u32 f(u32 addr) {\n"
+       "    ?u32 val = @probe(addr);\n"
+       "    return val orelse 0;\n"
+       "}",
+       "@probe: variable address");
+
+    printf("[@probe: wrong arg type → error]\n");
+    err("struct S { u32 x; }\n"
+        "void f() {\n"
+        "    S s;\n"
+        "    ?u32 val = @probe(s);\n"
+        "}",
+        "@probe: struct arg rejected");
+
+    printf("[@probe: no args → error]\n");
+    err("void f() { @probe(); }",
+        "@probe: no args rejected");
+
+    printf("[@probe: scan loop pattern]\n");
+    ok("u32 scan() {\n"
+       "    u32 count = 0;\n"
+       "    for (u32 addr = 0x40000000; addr < 0x40010000; addr += 0x1000) {\n"
+       "        if (@probe(addr)) |val| {\n"
+       "            count += 1;\n"
+       "        }\n"
+       "    }\n"
+       "    return count;\n"
+       "}",
+       "@probe: discovery scan loop");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

@@ -155,22 +155,22 @@ int main(void) {
     test_multiple_handles();
     test_use_after_free_second_handle();
 
-    /* ---- BUG-035: if/else merge — only mark freed if BOTH paths free ---- */
-    printf("\n[if/else merge: freed on one branch only → not freed]\n");
-    /* Key regression test: then-branch frees, else doesn't — use after if
-     * must be OK. Old code (|| merge) would false-positive here. */
-    ok("struct T { u32 x; }\n"
-       "Pool(T, 4) pool;\n"
-       "void f(bool cond) {\n"
-       "    Handle(T) h = pool.alloc() orelse return;\n"
-       "    if (cond) {\n"
-       "        pool.free(h);\n"
-       "    } else {\n"
-       "        pool.get(h).x = 1;\n"
-       "    }\n"
-       "    pool.get(h).x = 2;\n"
-       "}\n",
-       "one-branch free with else: no false positive on post-if use");
+    /* ---- MAYBE_FREED: if/else merge — one branch frees → MAYBE_FREED ---- */
+    printf("\n[if/else merge: freed on one branch only → MAYBE_FREED]\n");
+    /* After MAYBE_FREED change: then-branch frees, else doesn't → h is
+     * MAYBE_FREED. Use after the if is now an error. */
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(bool cond) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    if (cond) {\n"
+        "        pool.free(h);\n"
+        "    } else {\n"
+        "        pool.get(h).x = 1;\n"
+        "    }\n"
+        "    pool.get(h).x = 2;\n"
+        "}\n",
+        "one-branch free with else: use after MAYBE_FREED = error");
 
     printf("[if/else merge: freed on both branches → use after = error]\n");
     err("struct T { u32 x; }\n"
@@ -201,20 +201,20 @@ int main(void) {
         "}\n",
         "all switch arms free then use = error");
 
-    printf("[switch merge: freed in some arms → no false positive]\n");
-    /* Key regression test: only one arm frees — use after switch must be OK */
-    ok("struct T { u32 x; }\n"
-       "Pool(T, 4) pool;\n"
-       "enum Mode { a, b }\n"
-       "void f(Mode m) {\n"
-       "    Handle(T) h = pool.alloc() orelse return;\n"
-       "    switch (m) {\n"
-       "        .a => { pool.free(h); }\n"
-       "        .b => { }\n"
-       "    }\n"
-       "    pool.get(h).x = 1;\n"
-       "}\n",
-       "partial switch free: no false positive on post-switch use");
+    printf("[switch merge: freed in some arms → MAYBE_FREED]\n");
+    /* After MAYBE_FREED: one arm frees → MAYBE_FREED. Use after switch = error. */
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "enum Mode { a, b }\n"
+        "void f(Mode m) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    switch (m) {\n"
+        "        .a => { pool.free(h); }\n"
+        "        .b => { }\n"
+        "    }\n"
+        "    pool.get(h).x = 1;\n"
+        "}\n",
+        "partial switch free: use after MAYBE_FREED = error");
 
     /* ---- Loop + Pool patterns ---- */
     printf("\n[loop: pool.free inside loop — caught]\n");
@@ -240,19 +240,19 @@ int main(void) {
        "}\n",
        "alloc+use+free in same iteration — OK");
 
-    printf("[loop: conditional free in loop — not caught]\n");
-    /* NOTE: zercheck under-approximation — conditional free inside
-       loop doesn't propagate freed state outside the loop body */
-    ok("struct T { u32 x; }\n"
-       "Pool(T, 4) pool;\n"
-       "void f(bool cond) {\n"
-       "    Handle(T) h = pool.alloc() orelse return;\n"
-       "    for (u32 i = 0; i < 3; i += 1) {\n"
-       "        if (cond) { pool.free(h); }\n"
-       "    }\n"
-       "    pool.get(h).x = 1;\n"
-       "}\n",
-       "conditional free in loop then use after — not caught (under-approx)");
+    printf("[loop: conditional free in loop — now caught]\n");
+    /* After MAYBE_FREED + loop second pass: conditional free inside loop
+     * marks h as MAYBE_FREED. Use after loop is now caught. */
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(bool cond) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    for (u32 i = 0; i < 3; i += 1) {\n"
+        "        if (cond) { pool.free(h); }\n"
+        "    }\n"
+        "    pool.get(h).x = 1;\n"
+        "}\n",
+        "conditional free in loop then use after — caught via MAYBE_FREED");
 
     printf("[loop: alloc before loop, use in loop, free after — OK]\n");
     ok("struct T { u32 x; }\n"
@@ -470,6 +470,184 @@ int main(void) {
        "    pool.free(s.h);\n"
        "}\n",
        "BUG-385: struct param handle valid lifecycle");
+
+    /* ---- MAYBE_FREED: new tests ---- */
+    printf("\n[MAYBE_FREED: if-without-else, then frees → use after = error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(bool cond) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    if (cond) { pool.free(h); }\n"
+        "    pool.get(h).x = 1;\n"
+        "}\n",
+        "if-no-else free: use after = error");
+
+    printf("[MAYBE_FREED: if-without-else, then frees → free after = error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(bool cond) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    if (cond) { pool.free(h); }\n"
+        "    pool.free(h);\n"
+        "}\n",
+        "if-no-else free: double free after = error");
+
+    printf("[MAYBE_FREED: both branches free, no use after → OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f(bool cond) {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    if (cond) {\n"
+       "        pool.free(h);\n"
+       "    } else {\n"
+       "        pool.free(h);\n"
+       "    }\n"
+       "}\n",
+       "both branches free, no use after — OK (FREED, not MAYBE)");
+
+    printf("[MAYBE_FREED: one branch frees, else doesn't, no use after → leak warning]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f(bool cond) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    if (cond) {\n"
+        "        pool.free(h);\n"
+        "    } else {\n"
+        "        pool.get(h).x = 1;\n"
+        "    }\n"
+        "}\n",
+        "one branch free, else doesn't — handle maybe leaked");
+
+    /* ---- Leak detection tests ---- */
+    printf("\n[leak: alloc without free → error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    pool.get(h).x = 5;\n"
+        "}\n",
+        "alloc without free — handle leaked");
+
+    printf("[leak: overwrite alive handle → error]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    h = pool.alloc() orelse return;\n"
+        "    pool.free(h);\n"
+        "}\n",
+        "overwrite alive handle — first handle leaked");
+
+    printf("[leak: alloc + free → OK (no leak)]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    pool.get(h).x = 5;\n"
+       "    pool.free(h);\n"
+       "}\n",
+       "alloc + use + free — clean, no leak");
+
+    printf("[leak: param handle not freed → OK (caller responsibility)]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f(Handle(T) h) {\n"
+       "    pool.get(h).x = 5;\n"
+       "}\n",
+       "param handle not freed — OK, caller's responsibility");
+
+    /* ---- Loop second pass tests ---- */
+    printf("\n[loop2: conditional free then alloc in loop → OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    for (u32 i = 0; i < 3; i += 1) {\n"
+       "        pool.free(h);\n"
+       "        h = pool.alloc() orelse return;\n"
+       "    }\n"
+       "    pool.free(h);\n"
+       "}\n",
+       "free-then-realloc in loop — valid cycling pattern");
+
+    /* ---- Cross-function analysis (change 4) ---- */
+    printf("\n[cross-func: wrapper frees handle → use-after-free caught]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void free_handle(Handle(T) h) {\n"
+        "    pool.free(h);\n"
+        "}\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    free_handle(h);\n"
+        "    pool.get(h).x = 5;\n"
+        "}\n",
+        "cross-func: wrapper frees → use-after-free");
+
+    printf("[cross-func: wrapper frees handle → double free caught]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void free_handle(Handle(T) h) {\n"
+        "    pool.free(h);\n"
+        "}\n"
+        "void f() {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    free_handle(h);\n"
+        "    pool.free(h);\n"
+        "}\n",
+        "cross-func: wrapper frees → double free");
+
+    printf("[cross-func: wrapper uses handle (no free) → OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void use_handle(Handle(T) h) {\n"
+       "    pool.get(h).x = 42;\n"
+       "}\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    use_handle(h);\n"
+       "    pool.free(h);\n"
+       "}\n",
+       "cross-func: wrapper uses (no free) — OK");
+
+    printf("[cross-func: conditional free wrapper → MAYBE_FREED]\n");
+    err("struct T { u32 x; }\n"
+        "Pool(T, 4) pool;\n"
+        "void maybe_free(Handle(T) h, bool cond) {\n"
+        "    if (cond) { pool.free(h); }\n"
+        "}\n"
+        "void f(bool c) {\n"
+        "    Handle(T) h = pool.alloc() orelse return;\n"
+        "    maybe_free(h, c);\n"
+        "    pool.get(h).x = 5;\n"
+        "}\n",
+        "cross-func: conditional free → use after MAYBE_FREED");
+
+    printf("[cross-func: non-handle param → no effect]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void helper(u32 n) {\n"
+       "    u32 x = n;\n"
+       "}\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    helper(42);\n"
+       "    pool.free(h);\n"
+       "}\n",
+       "cross-func: non-handle param → no effect on handle");
+
+    printf("[cross-func: free then use inside wrapper → caller OK]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void process_and_free(Handle(T) h) {\n"
+       "    pool.get(h).x = 99;\n"
+       "    pool.free(h);\n"
+       "}\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    process_and_free(h);\n"
+       "}\n",
+       "cross-func: wrapper frees — caller clean (no leak, no UAF)");
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);

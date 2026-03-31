@@ -114,6 +114,78 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
 static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
+static void emit_auto_guards(Emitter *e, Node *node);
+static void emit_defers(Emitter *e);
+
+/* Emit the zero value for a type (used by auto-guard return, auto-orelse).
+ * void → nothing (caller emits bare return), integer → 0, bool → 0,
+ * optional non-pointer → {0}/{0,0}, pointer → NULL */
+static void emit_zero_value(Emitter *e, Type *t) {
+    if (!t || t->kind == TYPE_VOID) return;
+    Type *inner = type_unwrap_distinct(t);
+    if (inner->kind == TYPE_OPTIONAL && !is_null_sentinel(inner->optional.inner)) {
+        emit(e, "(");
+        emit_type(e, t);
+        if (inner->optional.inner->kind == TYPE_VOID)
+            emit(e, "){ 0 }");
+        else
+            emit(e, "){ {0} }");
+    } else if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR ||
+               (inner->kind == TYPE_OPTIONAL && is_null_sentinel(inner->optional.inner))) {
+        emit(e, "NULL");
+    } else {
+        emit(e, "0");
+    }
+}
+
+/* Walk expression tree, emit auto-guard if-return statements for unproven NODE_INDEX.
+ * Called BEFORE emit_expr for the containing statement. */
+static void emit_auto_guards(Emitter *e, Node *node) {
+    if (!node) return;
+    switch (node->kind) {
+    case NODE_INDEX: {
+        uint64_t ag_size = checker_auto_guard_size(e->checker, node);
+        if (ag_size > 0) {
+            emit_indent(e);
+            emit(e, "if ((size_t)(");
+            emit_expr(e, node->index_expr.index);
+            emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
+            if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                emit(e, "{ ");
+                emit_defers(e);
+                emit(e, "return ");
+                emit_zero_value(e, e->current_func_ret);
+                emit(e, "; }\n");
+            } else {
+                emit(e, "{ ");
+                emit_defers(e);
+                emit(e, "return; }\n");
+            }
+        }
+        emit_auto_guards(e, node->index_expr.object);
+        emit_auto_guards(e, node->index_expr.index);
+        break;
+    }
+    case NODE_FIELD:
+        emit_auto_guards(e, node->field.object); break;
+    case NODE_ASSIGN:
+        emit_auto_guards(e, node->assign.target);
+        emit_auto_guards(e, node->assign.value); break;
+    case NODE_BINARY:
+        emit_auto_guards(e, node->binary.left);
+        emit_auto_guards(e, node->binary.right); break;
+    case NODE_UNARY:
+        emit_auto_guards(e, node->unary.operand); break;
+    case NODE_CALL:
+        emit_auto_guards(e, node->call.callee);
+        for (int i = 0; i < node->call.arg_count; i++)
+            emit_auto_guards(e, node->call.args[i]);
+        break;
+    case NODE_ORELSE:
+        emit_auto_guards(e, node->orelse.expr); break;
+    default: break;
+    }
+}
 
 /* RF3: resolve TypeNode via checker's typemap (set during resolve_type).
  * Falls back to resolve_type_for_emit if not cached (safety net). */
@@ -534,7 +606,17 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_BINARY:
-        /* division/modulo: trap on zero divisor */
+        /* division/modulo: trap on zero divisor (skip if proven safe by range propagation) */
+        if ((node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) &&
+            checker_is_proven(e->checker, node)) {
+            /* proven nonzero divisor — emit plain division, no check */
+            emit(e, "(");
+            emit_expr(e, node->binary.left);
+            emit(e, " %s ", node->binary.op == TOK_SLASH ? "/" : "%");
+            emit_expr(e, node->binary.right);
+            emit(e, ")");
+            break;
+        }
         if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
             int tmp = e->temp_count++;
             Type *div_type = checker_get_type(e->checker,node->binary.left);
@@ -1216,6 +1298,25 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_INDEX: {
+        /* Auto-guard is emitted at statement level by emit_auto_guards().
+         * By the time we reach here, the guard has already been emitted.
+         * The normal bounds check still runs as belt-and-suspenders backup. */
+        /* Value range propagation: if bounds proven safe, skip check entirely */
+        if (checker_is_proven(e->checker, node)) {
+            Type *proven_obj_type = checker_get_type(e->checker, node->index_expr.object);
+            if (proven_obj_type && proven_obj_type->kind == TYPE_SLICE) {
+                emit_expr(e, node->index_expr.object);
+                emit(e, ".ptr[");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "]");
+            } else {
+                emit_expr(e, node->index_expr.object);
+                emit(e, "[");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "]");
+            }
+            break;
+        }
         /* Inline bounds check using comma operator:
          *   array:  (_zer_bounds_check(idx, size, ...), arr)[idx]
          *   slice:  (_zer_bounds_check(idx, s.len, ...), s.ptr)[idx]
@@ -1813,11 +1914,34 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
             /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr)
-             * With mmio ranges: variable addresses get runtime range check */
+             * With mmio ranges: variable addresses get runtime range check
+             * With auto-discovery: validate against discovered map */
             bool need_runtime_check = e->checker->mmio_range_count > 0 &&
                 node->intrinsic.arg_count > 0 &&
                 node->intrinsic.args[0]->kind != NODE_INT_LIT;
-            if (need_runtime_check) {
+            bool need_discovery_check = e->checker->no_strict_mmio &&
+                e->checker->mmio_range_count == 0 &&
+                node->intrinsic.arg_count > 0;
+            if (need_discovery_check) {
+                /* auto-discovery mode: validate against discovered map */
+                int tmp = e->temp_count++;
+                emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "); if (!_zer_mmio_valid((uint32_t)_zer_ma%d)) ", tmp);
+                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                    emit(e, "{ return ");
+                    emit_zero_value(e, e->current_func_ret);
+                    emit(e, "; } ");
+                } else {
+                    emit(e, "{ return; } ");
+                }
+                emit(e, "(");
+                if (node->intrinsic.type_arg) {
+                    Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                    emit_type(e, t);
+                }
+                emit(e, ")_zer_ma%d; })", tmp);
+            } else if (need_runtime_check) {
                 int tmp = e->temp_count++;
                 emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
                 emit_expr(e, node->intrinsic.args[0]);
@@ -1859,6 +1983,11 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
+        } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
+            emit(e, "_zer_probe((uint32_t)(");
+            if (node->intrinsic.arg_count > 0)
+                emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "))");
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field))
              * BUG-381: propagate volatile from source pointer to result */
@@ -1924,12 +2053,29 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 1)
                 emit_expr(e, node->intrinsic.args[1]);
             if (buf_type && buf_type->kind == TYPE_ARRAY) {
-                emit(e, "; if (_zer_cs%d.len + 1 > %llu) ",
+                emit(e, "; if (_zer_cs%d.len + 1 > %llu) { ",
                      tmp, (unsigned long long)buf_type->array.size);
-                emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
+                /* auto-orelse: return zero value instead of trap. Trap stays as comment. */
+                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                    emit_defers(e);
+                    emit(e, "return ");
+                    emit_zero_value(e, e->current_func_ret);
+                    emit(e, "; } ");
+                } else {
+                    emit_defers(e);
+                    emit(e, "return; } ");
+                }
             } else if (dest_is_slice) {
-                emit(e, "; if (_zer_cs%d.len + 1 > _zer_cd%d.len) ", tmp, tmp);
-                emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
+                emit(e, "; if (_zer_cs%d.len + 1 > _zer_cd%d.len) { ", tmp, tmp);
+                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                    emit_defers(e);
+                    emit(e, "return ");
+                    emit_zero_value(e, e->current_func_ret);
+                    emit(e, "; } ");
+                } else {
+                    emit_defers(e);
+                    emit(e, "return; } ");
+                }
             } else {
                 emit(e, "; ");
             }
@@ -2022,6 +2168,8 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_VAR_DECL: {
+        /* auto-guard: emit bounds guards before var init */
+        if (node->var_decl.init) emit_auto_guards(e, node->var_decl.init);
         Type *type = checker_get_type(e->checker,node);
         /* propagate volatile flag from var-decl to pointer type */
         if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
@@ -2116,8 +2264,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                     else
                         emit(e, " = {0}");
                 } else if (node->var_decl.init->kind == NODE_CALL ||
-                           node->var_decl.init->kind == NODE_ORELSE) {
-                    /* call/orelse might already return ?T — assign directly */
+                           node->var_decl.init->kind == NODE_ORELSE ||
+                           node->var_decl.init->kind == NODE_INTRINSIC) {
+                    /* call/orelse/intrinsic might already return ?T — assign directly */
                     emit(e, " = ");
                     emit_expr(e, node->var_decl.init);
                 } else if (node->var_decl.init->kind == NODE_IDENT) {
@@ -2392,7 +2541,8 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_RETURN:
-        /* bounds checks now inline in emit_expr(NODE_INDEX) */
+        /* auto-guard: emit bounds guards before return expression */
+        if (node->ret.expr) emit_auto_guards(e, node->ret.expr);
         /* emit defers before return (reverse order) */
         emit_defers(e);
         emit_indent(e);
@@ -2483,7 +2633,8 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_EXPR_STMT:
-        /* bounds checks now inline in emit_expr(NODE_INDEX) */
+        /* auto-guard: emit bounds guards before the statement */
+        emit_auto_guards(e, node->expr_stmt.expr);
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");
@@ -3200,6 +3351,42 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     }
 }
 
+/* scan AST for @inttoptr usage — needed to emit auto-discovery preamble */
+static bool has_inttoptr(Node *node) {
+    if (!node) return false;
+    if (node->kind == NODE_INTRINSIC && node->intrinsic.name_len == 8 &&
+        memcmp(node->intrinsic.name, "inttoptr", 8) == 0) return true;
+    switch (node->kind) {
+    case NODE_FILE:
+        for (int i = 0; i < node->file.decl_count; i++)
+            if (has_inttoptr(node->file.decls[i])) return true;
+        return false;
+    case NODE_FUNC_DECL: return has_inttoptr(node->func_decl.body);
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            if (has_inttoptr(node->block.stmts[i])) return true;
+        return false;
+    case NODE_IF:
+        return has_inttoptr(node->if_stmt.then_body) || has_inttoptr(node->if_stmt.else_body);
+    case NODE_FOR: return has_inttoptr(node->for_stmt.body);
+    case NODE_WHILE: return has_inttoptr(node->while_stmt.body);
+    case NODE_VAR_DECL: return has_inttoptr(node->var_decl.init);
+    case NODE_EXPR_STMT: return has_inttoptr(node->expr_stmt.expr);
+    case NODE_RETURN: return has_inttoptr(node->ret.expr);
+    case NODE_ASSIGN:
+        return has_inttoptr(node->assign.target) || has_inttoptr(node->assign.value);
+    case NODE_CALL:
+        for (int i = 0; i < node->call.arg_count; i++)
+            if (has_inttoptr(node->call.args[i])) return true;
+        return false;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            if (has_inttoptr(node->intrinsic.args[i])) return true;
+        return false;
+    default: return false;
+    }
+}
+
 void emit_file(Emitter *e, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
 
@@ -3318,6 +3505,63 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    abort();\n");
     emit(e, "#endif\n");
     emit(e, "}\n\n");
+
+    /* @probe: safe hardware discovery — try reading an address, return ?u32.
+     * Platform-specific fault handler catches invalid addresses. */
+    emit(e, "/* @probe: safe MMIO address probing */\n");
+    emit(e, "#if defined(__ARM_ARCH)\n");
+    emit(e, "/* ARM Cortex-M: use BusFault/HardFault handler */\n");
+    emit(e, "static volatile int _zer_probe_fault_flag = 0;\n");
+    emit(e, "void _zer_probe_fault_handler(void) __attribute__((naked));\n");
+    emit(e, "void _zer_probe_fault_handler(void) {\n");
+    emit(e, "    __asm__ volatile(\n");
+    emit(e, "        \"ldr r0, =_zer_probe_fault_flag\\n\"\n");
+    emit(e, "        \"mov r1, #1\\n\"\n");
+    emit(e, "        \"str r1, [r0]\\n\"\n");
+    emit(e, "        \"ldr r0, [sp, #24]\\n\"\n");
+    emit(e, "        \"add r0, #2\\n\"\n");
+    emit(e, "        \"str r0, [sp, #24]\\n\"\n");
+    emit(e, "        \"bx lr\\n\"\n");
+    emit(e, "    );\n");
+    emit(e, "}\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "    _zer_probe_fault_flag = 0;\n");
+    emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
+    emit(e, "    uint32_t val = *p;\n");
+    emit(e, "    if (_zer_probe_fault_flag) return (_zer_opt_u32){ 0, 0 };\n");
+    emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
+    emit(e, "}\n");
+    emit(e, "#elif defined(__riscv)\n");
+    emit(e, "/* RISC-V: use access fault exception handler */\n");
+    emit(e, "static volatile int _zer_probe_fault_flag = 0;\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "    _zer_probe_fault_flag = 0;\n");
+    emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
+    emit(e, "    uint32_t val = *p;\n");
+    emit(e, "    if (_zer_probe_fault_flag) return (_zer_opt_u32){ 0, 0 };\n");
+    emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
+    emit(e, "}\n");
+    emit(e, "#else\n");
+    emit(e, "/* x86/hosted: use setjmp + signal handler */\n");
+    emit(e, "#include <setjmp.h>\n");
+    emit(e, "#include <signal.h>\n");
+    emit(e, "static jmp_buf _zer_probe_jmp;\n");
+    emit(e, "static void _zer_probe_sighandler(int sig) { (void)sig; longjmp(_zer_probe_jmp, 1); }\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "    signal(SIGSEGV, _zer_probe_sighandler);\n");
+    emit(e, "#ifdef SIGBUS\n");
+    emit(e, "    signal(SIGBUS, _zer_probe_sighandler);\n");
+    emit(e, "#endif\n");
+    emit(e, "    if (setjmp(_zer_probe_jmp) != 0) {\n");
+    emit(e, "        signal(SIGSEGV, SIG_DFL);\n");
+    emit(e, "        return (_zer_opt_u32){ 0, 0 };\n");
+    emit(e, "    }\n");
+    emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
+    emit(e, "    uint32_t val = *p;\n");
+    emit(e, "    signal(SIGSEGV, SIG_DFL);\n");
+    emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
+    emit(e, "}\n");
+    emit(e, "#endif\n\n");
 
     /* safe shift — ZER spec: shift by >= width returns 0 (not UB like C).
      * Uses GCC statement expression to evaluate b exactly once. */
@@ -3451,6 +3695,94 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "}\n\n");
 
     emit(e, "\n");
+
+    /* MMIO auto-discovery: if @inttoptr is used + no mmio declared + --no-strict-mmio,
+     * emit 5-phase hardware discovery with __attribute__((constructor)). */
+    if (e->checker->no_strict_mmio && e->checker->mmio_range_count == 0 &&
+        has_inttoptr(file_node)) {
+        emit(e, "/* MMIO auto-discovery — 5-phase hardware scan at boot */\n");
+        emit(e, "static uint32_t _zer_disc[256][2];\n");
+        emit(e, "static int _zer_disc_count = 0;\n\n");
+
+        emit(e, "static int _zer_in_disc(uint32_t addr) {\n");
+        emit(e, "    for (int i = 0; i < _zer_disc_count; i++)\n");
+        emit(e, "        if (addr >= _zer_disc[i][0] && addr <= _zer_disc[i][1]) return 1;\n");
+        emit(e, "    return 0;\n");
+        emit(e, "}\n\n");
+
+        emit(e, "static void _zer_disc_add(uint32_t start, uint32_t end) {\n");
+        emit(e, "    if (_zer_disc_count < 256) {\n");
+        emit(e, "        _zer_disc[_zer_disc_count][0] = start;\n");
+        emit(e, "        _zer_disc[_zer_disc_count][1] = end;\n");
+        emit(e, "        _zer_disc_count++;\n");
+        emit(e, "    }\n");
+        emit(e, "}\n\n");
+
+        emit(e, "static void _zer_disc_scan(uint32_t start, uint32_t end, uint32_t step) {\n");
+        emit(e, "    for (uint32_t b = start; b <= end && _zer_disc_count < 256; b += step) {\n");
+        emit(e, "        if (!_zer_in_disc(b) && _zer_probe(b).has_value)\n");
+        emit(e, "            _zer_disc_add(b, b + step - 1);\n");
+        emit(e, "        if (b > (uint32_t)(0xFFFFFFFFu - step)) break;\n");
+        emit(e, "    }\n");
+        emit(e, "}\n\n");
+
+        /* Brute-force clock/power controller discovery */
+        emit(e, "static void _zer_disc_brute_enable(uint32_t scan_start, uint32_t scan_end, uint32_t step) {\n");
+        emit(e, "    int baseline = _zer_disc_count;\n");
+        emit(e, "    for (int i = 0; i < baseline; i++) {\n");
+        emit(e, "        volatile uint32_t *regs = (volatile uint32_t *)(uintptr_t)_zer_disc[i][0];\n");
+        emit(e, "        uint32_t saved[16];\n");
+        emit(e, "        int r;\n");
+        emit(e, "        for (r = 0; r < 16; r++) saved[r] = regs[r];\n");
+        emit(e, "        for (r = 0; r < 16; r++) regs[r] = 0xFFFFFFFFu;\n");
+        emit(e, "        int found_new = 0;\n");
+        emit(e, "        for (uint32_t t = scan_start; t <= scan_end && !found_new; t += step * 8) {\n");
+        emit(e, "            if (!_zer_in_disc(t) && _zer_probe(t).has_value) found_new = 1;\n");
+        emit(e, "            if (t > (uint32_t)(0xFFFFFFFFu - step * 8)) break;\n");
+        emit(e, "        }\n");
+        emit(e, "        if (found_new) break;\n");
+        emit(e, "        for (r = 0; r < 16; r++) regs[r] = saved[r];\n");
+        emit(e, "    }\n");
+        emit(e, "}\n\n");
+
+        /* Main discovery function — runs before main()
+         * On bare-metal (ARM/RISC-V/AVR): full 5-phase scan
+         * On hosted (x86): skip scan, validate each @inttoptr individually via _zer_probe */
+        emit(e, "#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)\n");
+        emit(e, "__attribute__((constructor))\n");
+        emit(e, "static void _zer_mmio_discover(void) {\n");
+        emit(e, "    uint32_t s_start, s_end, s_step;\n");
+        emit(e, "#if defined(__ARM_ARCH)\n");
+        emit(e, "    s_start = 0x40000000u; s_end = 0x5FFFFFFFu; s_step = 0x1000u;\n");
+        emit(e, "#elif defined(__riscv)\n");
+        emit(e, "    s_start = 0x10000000u; s_end = 0x1FFFFFFFu; s_step = 0x1000u;\n");
+        emit(e, "#else /* AVR */\n");
+        emit(e, "    s_start = 0x00u; s_end = 0xFFu; s_step = 0x01u;\n");
+        emit(e, "#endif\n");
+        emit(e, "    /* Phase 1: initial scan */\n");
+        emit(e, "    _zer_disc_scan(s_start, s_end, s_step);\n");
+        emit(e, "    /* Phase 2: brute-force clock controller */\n");
+        emit(e, "    _zer_disc_brute_enable(s_start, s_end, s_step);\n");
+        emit(e, "    /* Phase 3: rescan (clock-gated peripherals) */\n");
+        emit(e, "    _zer_disc_scan(s_start, s_end, s_step);\n");
+        emit(e, "    /* Phase 4: brute-force power controller */\n");
+        emit(e, "    _zer_disc_brute_enable(s_start, s_end, s_step);\n");
+        emit(e, "    /* Phase 5: final rescan (power-gated peripherals) */\n");
+        emit(e, "    _zer_disc_scan(s_start, s_end, s_step);\n");
+        emit(e, "}\n");
+        emit(e, "#endif\n\n");
+
+        /* Validation function for @inttoptr
+         * Bare-metal: check against discovered map
+         * Hosted (x86): probe each address directly (no startup scan) */
+        emit(e, "static int _zer_mmio_valid(uint32_t addr) {\n");
+        emit(e, "#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)\n");
+        emit(e, "    return _zer_in_disc(addr);\n");
+        emit(e, "#else\n");
+        emit(e, "    return _zer_probe(addr).has_value;\n");
+        emit(e, "#endif\n");
+        emit(e, "}\n\n");
+    }
 
     /* emit declarations — uses unified emit_top_level_decl (RF2) */
     for (int i = 0; i < file_node->file.decl_count; i++) {

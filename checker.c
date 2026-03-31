@@ -209,6 +209,19 @@ static Type *check_expr(Checker *c, Node *node);
 static void check_stmt(Checker *c, Node *node);
 static Type *resolve_type(Checker *c, TypeNode *tn);
 
+/* Value range propagation helpers (defined after checker_init) */
+static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
+static void push_var_range(Checker *c, const char *name, uint32_t name_len,
+                           int64_t min_val, int64_t max_val, bool known_nonzero);
+static void mark_proven(Checker *c, Node *node);
+static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
+static bool body_always_exits(Node *body);
+static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
+static Type *find_return_provenance(Checker *c, Node *node);
+static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
+static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
+static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
+
 /* Check if an expression node is a literal that can be assigned to target type.
  * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
 static bool is_literal_compatible(Node *expr, Type *target) {
@@ -309,7 +322,7 @@ static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *pr
         if (c->prov_map[i].key_len == key_len &&
             memcmp(c->prov_map[i].key, key, key_len) == 0) {
             c->prov_map[i].provenance = prov;
-            return;
+            goto set_array_root;
         }
     }
     /* add new entry */
@@ -328,6 +341,28 @@ static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *pr
     c->prov_map[c->prov_map_count].key_len = key_len;
     c->prov_map[c->prov_map_count].provenance = prov;
     c->prov_map_count++;
+
+set_array_root:
+    /* Array-level provenance: if key contains '[', also set root key.
+     * "callbacks[0]" → root "callbacks". Forces homogeneous *opaque arrays.
+     * If root already has different provenance → compile error. */
+    {
+        const char *bracket = memchr(key, '[', key_len);
+        if (bracket) {
+            uint32_t root_len = (uint32_t)(bracket - key);
+            if (root_len > 0) {
+                Type *existing = prov_map_get(c, key, root_len);
+                if (existing && !type_equals(existing, prov)) {
+                    checker_error(c, 0,
+                        "heterogeneous *opaque array: '%.*s' has provenance '%s' but element assigned '%s'",
+                        (int)root_len, key, type_name(existing), type_name(prov));
+                } else if (!existing) {
+                    /* set root-level provenance (recurse but won't hit '[' again) */
+                    prov_map_set(c, key, root_len, prov);
+                }
+            }
+        }
+    }
 }
 
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len) {
@@ -977,6 +1012,43 @@ static Type *check_expr(Checker *c, Node *node) {
                     int64_t div_val = eval_const_expr(node->binary.right);
                     if (div_val == 0) {
                         checker_error(c, node->loc.line, "division by zero");
+                    }
+                    /* range propagation: mark proven if divisor is nonzero.
+                     * Handles both simple idents (d) and struct fields (cfg.d). */
+                    if (div_val != CONST_EVAL_FAIL && div_val != 0) {
+                        mark_proven(c, node); /* constant nonzero divisor */
+                    } else {
+                        /* try ident lookup first, then compound key for struct fields */
+                        char dkey[128];
+                        int dklen = 0;
+                        if (node->binary.right->kind == NODE_IDENT) {
+                            dklen = (int)node->binary.right->ident.name_len;
+                            if (dklen < (int)sizeof(dkey)) {
+                                memcpy(dkey, node->binary.right->ident.name, dklen);
+                                dkey[dklen] = '\0';
+                            }
+                        } else {
+                            dklen = build_expr_key(node->binary.right, dkey, sizeof(dkey));
+                        }
+                        if (dklen > 0) {
+                            struct VarRange *r = find_var_range(c, dkey, (uint32_t)dklen);
+                            if (r && (r->known_nonzero || r->min_val > 0)) {
+                                mark_proven(c, node);
+                            }
+                        }
+                    }
+                    /* Forced division guard: if divisor is ident or struct field and
+                     * not proven nonzero → compile error. */
+                    if (div_val != 0 && !checker_is_proven(c, node) &&
+                        (node->binary.right->kind == NODE_IDENT ||
+                         node->binary.right->kind == NODE_FIELD)) {
+                        char dname[128];
+                        int dnlen = build_expr_key(node->binary.right, dname, sizeof(dname));
+                        if (dnlen > 0) {
+                            checker_error(c, node->loc.line,
+                                "divisor '%.*s' not proven nonzero — add 'if (%.*s == 0) { return; }' before division",
+                                dnlen, dname, dnlen, dname);
+                        }
                     }
                 }
                 result = common_numeric_type(c, left, right, node->loc.line);
@@ -2210,11 +2282,31 @@ static Type *check_expr(Checker *c, Node *node) {
 
                 /* keep parameter validation: check call arguments.
                  * Works for BOTH direct function calls AND function pointer calls
-                 * by using param_keeps on the resolved Type (BUG-277). */
-                if (effective_callee->func_ptr.param_keeps) {
+                 * by using param_keeps on the resolved Type (BUG-277).
+                 * Auto-keep: if callee is a function POINTER (not direct call),
+                 * all pointer params are treated as keep — compiler can't see
+                 * inside the fn ptr target, must assume worst case. */
+                bool is_fn_ptr_call = (node->call.callee->kind != NODE_IDENT ||
+                    !scope_lookup(c->current_scope,
+                        node->call.callee->ident.name,
+                        (uint32_t)node->call.callee->ident.name_len) ||
+                    !scope_lookup(c->current_scope,
+                        node->call.callee->ident.name,
+                        (uint32_t)node->call.callee->ident.name_len)->is_function);
+                if (effective_callee->func_ptr.param_keeps || is_fn_ptr_call) {
                     for (int i = 0; i < (int)effective_callee->func_ptr.param_count &&
                          i < node->call.arg_count; i++) {
-                        if (!effective_callee->func_ptr.param_keeps[i]) continue;
+                        /* auto-keep: fn ptr calls treat ALL pointer params as keep */
+                        bool param_is_keep = false;
+                        if (effective_callee->func_ptr.param_keeps &&
+                            effective_callee->func_ptr.param_keeps[i]) {
+                            param_is_keep = true;
+                        } else if (is_fn_ptr_call) {
+                            Type *pt = effective_callee->func_ptr.params[i];
+                            Type *ptu = type_unwrap_distinct(pt);
+                            if (ptu && ptu->kind == TYPE_POINTER) param_is_keep = true;
+                        }
+                        if (!param_is_keep) continue;
                         /* keep param: arg must be static/global, not local.
                          * BUG-339: also check orelse fallback for &local.
                          * BUG-338: walk into intrinsics for &local. */
@@ -2724,9 +2816,47 @@ static Type *check_expr(Checker *c, Node *node) {
                         "array index %llu is out of bounds for array of size %llu",
                         (unsigned long long)idx_val, (unsigned long long)obj->array.size);
                 }
+                /* literal index in range → proven safe */
+                if (idx_val < obj->array.size) {
+                    mark_proven(c, node);
+                }
+            }
+            /* range propagation: check if index ident has proven range */
+            if (node->index_expr.index->kind == NODE_IDENT) {
+                struct VarRange *r = find_var_range(c,
+                    node->index_expr.index->ident.name,
+                    (uint32_t)node->index_expr.index->ident.name_len);
+                if (r && r->min_val >= 0 && r->max_val >= 0 &&
+                    (uint64_t)r->max_val < obj->array.size) {
+                    mark_proven(c, node);
+                }
+                /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
+                 * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
+                 * Warn so programmer knows they can add a guard for zero overhead. */
+                if (!checker_is_proven(c, node)) {
+                    mark_auto_guard(c, node, obj->array.size);
+                    checker_warning(c, node->loc.line,
+                        "index '%.*s' not proven in range for array of size %llu — "
+                        "auto-guard inserted. Add 'if (%.*s >= %llu) { return; }' to eliminate guard",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (unsigned long long)obj->array.size,
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (unsigned long long)obj->array.size);
+                }
             }
             result = obj->array.inner;
         } else if (obj->kind == TYPE_SLICE) {
+            /* range propagation for slices: if index proven < slice bound */
+            if (node->index_expr.index->kind == NODE_INT_LIT) {
+                /* literal index on slice — can't prove at compile time (len unknown) */
+            } else if (node->index_expr.index->kind == NODE_IDENT) {
+                /* If guard was against a constant AND we know slice len, we could prove.
+                 * For now: slices with range-proven indices still get runtime check
+                 * (slice len is runtime). This is correct — we'll optimize when we
+                 * track slice-len as a known value. */
+            }
             result = obj->slice.inner;
         } else if (obj->kind == TYPE_POINTER) {
             /* pointer indexing: *T[i] → T (same as C pointer arithmetic) */
@@ -3192,6 +3322,18 @@ static Type *check_expr(Checker *c, Node *node) {
             result = ty_void;
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             result = ty_void;
+        } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
+            /* @probe(addr) → ?u32: try reading MMIO address, null if faults */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@probe requires exactly 1 argument (address)");
+            } else {
+                Type *addr_type = typemap_get(c, node->intrinsic.args[0]);
+                if (addr_type && !type_is_integer(addr_type)) {
+                    checker_error(c, node->loc.line,
+                        "@probe argument must be integer address, got '%s'", type_name(addr_type));
+                }
+            }
+            result = type_optional(c->arena, ty_u32);
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
             /* BUG-238: reject @cstr to const destination */
             if (node->intrinsic.arg_count >= 1 &&
@@ -3793,6 +3935,24 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* Cross-function provenance: if init is a call to a function with
+             * known return provenance, propagate to the variable. */
+            if (sym && !sym->provenance_type && node->var_decl.init) {
+                Node *call_init = node->var_decl.init;
+                if (call_init->kind == NODE_ORELSE) call_init = call_init->orelse.expr;
+                if (call_init && call_init->kind == NODE_CALL &&
+                    call_init->call.callee->kind == NODE_IDENT) {
+                    Type *var_eff = type_unwrap_distinct(type);
+                    if (var_eff && var_eff->kind == TYPE_POINTER &&
+                        var_eff->pointer.inner->kind == TYPE_OPAQUE) {
+                        Type *rprov = lookup_prov_summary(c,
+                            call_init->call.callee->ident.name,
+                            (uint32_t)call_init->call.callee->ident.name_len);
+                        if (rprov) sym->provenance_type = rprov;
+                    }
+                }
+            }
+
             /* @container provenance: track struct+field when ptr = &struct.field */
             if (sym && node->var_decl.init) {
                 Node *init = node->var_decl.init;
@@ -3834,6 +3994,16 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
         }
+
+        /* Value range propagation: track literal init values */
+        if (node->var_decl.init && type && type_is_integer(type)) {
+            int64_t val = eval_const_expr(node->var_decl.init);
+            if (val != CONST_EVAL_FAIL) {
+                push_var_range(c, node->var_decl.name,
+                    (uint32_t)node->var_decl.name_len, val, val, val != 0);
+            }
+        }
+
         break;
     }
 
@@ -3959,9 +4129,201 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "if condition must be bool or optional, got '%s'", type_name(cond));
         }
-        check_stmt(c, node->if_stmt.then_body);
-        if (node->if_stmt.else_body)
-            check_stmt(c, node->if_stmt.else_body);
+
+        /* Value range propagation: extract constraints from condition */
+        {
+            int saved_range_count = c->var_range_count;
+            Node *if_cond = node->if_stmt.cond;
+
+            /* detect comparison pattern: ident OP const or const OP ident */
+            const char *cmp_var = NULL;
+            uint32_t cmp_var_len = 0;
+            int64_t cmp_val = CONST_EVAL_FAIL;
+            TokenType cmp_op = TOK_EOF;
+            bool var_on_left = false;
+
+            /* cmp_key buffer for compound keys (struct fields) */
+            char cmp_key_buf[128];
+
+            if (if_cond && if_cond->kind == NODE_BINARY) {
+                cmp_op = if_cond->binary.op;
+                Node *lhs = if_cond->binary.left;
+                Node *rhs = if_cond->binary.right;
+
+                /* try left side as ident or struct field */
+                if (lhs->kind == NODE_IDENT) {
+                    cmp_val = eval_const_expr(rhs);
+                    if (cmp_val != CONST_EVAL_FAIL) {
+                        cmp_var = lhs->ident.name;
+                        cmp_var_len = (uint32_t)lhs->ident.name_len;
+                        var_on_left = true;
+                    }
+                } else if (lhs->kind == NODE_FIELD) {
+                    cmp_val = eval_const_expr(rhs);
+                    if (cmp_val != CONST_EVAL_FAIL) {
+                        int klen = build_expr_key(lhs, cmp_key_buf, sizeof(cmp_key_buf));
+                        if (klen > 0) {
+                            /* arena-allocate so pointer survives past this block */
+                            char *akey = (char *)arena_alloc(c->arena, klen + 1);
+                            if (akey) { memcpy(akey, cmp_key_buf, klen + 1); }
+                            cmp_var = akey;
+                            cmp_var_len = (uint32_t)klen;
+                            var_on_left = true;
+                        }
+                    }
+                }
+                /* try right side */
+                if (!cmp_var && rhs->kind == NODE_IDENT) {
+                    cmp_val = eval_const_expr(lhs);
+                    if (cmp_val != CONST_EVAL_FAIL) {
+                        cmp_var = rhs->ident.name;
+                        cmp_var_len = (uint32_t)rhs->ident.name_len;
+                        var_on_left = false;
+                    }
+                } else if (!cmp_var && rhs->kind == NODE_FIELD) {
+                    cmp_val = eval_const_expr(lhs);
+                    if (cmp_val != CONST_EVAL_FAIL) {
+                        int klen = build_expr_key(rhs, cmp_key_buf, sizeof(cmp_key_buf));
+                        if (klen > 0) {
+                            char *akey = (char *)arena_alloc(c->arena, klen + 1);
+                            if (akey) { memcpy(akey, cmp_key_buf, klen + 1); }
+                            cmp_var = akey;
+                            cmp_var_len = (uint32_t)klen;
+                            var_on_left = false;
+                        }
+                    }
+                }
+            }
+
+            /* detect comparison with == 0 / != 0 */
+            if (if_cond && if_cond->kind == NODE_BINARY && cmp_var) {
+                bool is_guard = body_always_exits(node->if_stmt.then_body) &&
+                                !node->if_stmt.else_body;
+
+                /* Inside then-block: apply condition directly */
+                if (var_on_left) {
+                    switch (cmp_op) {
+                    case TOK_LT:      /* var < val → var.max = val - 1 */
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                                       cmp_val > 1);
+                        break;
+                    case TOK_LTEQ:    /* var <= val → var.max = val */
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_GT:      /* var > val → var.min = val + 1 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                        break;
+                    case TOK_GTEQ:    /* var >= val → var.min = val */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_EQEQ:    /* var == val → var.min = var.max = val */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, cmp_val,
+                                       cmp_val != 0);
+                        break;
+                    case TOK_BANGEQ:  /* var != val → if val == 0, known_nonzero */
+                        if (cmp_val == 0)
+                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
+                        break;
+                    default: break;
+                    }
+                } else {
+                    /* val OP var → flip: val < var means var > val */
+                    switch (cmp_op) {
+                    case TOK_LT:      /* val < var → var > val → var.min = val + 1 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                        break;
+                    case TOK_LTEQ:
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_GT:
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                                       cmp_val > 1);
+                        break;
+                    case TOK_GTEQ:
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_EQEQ:
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, cmp_val,
+                                       cmp_val != 0);
+                        break;
+                    case TOK_BANGEQ:
+                        if (cmp_val == 0)
+                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
+                        break;
+                    default: break;
+                    }
+                }
+
+                check_stmt(c, node->if_stmt.then_body);
+                c->var_range_count = saved_range_count; /* restore */
+
+                /* Guard pattern: if (cond) { return; } → apply INVERSE after the if */
+                if (is_guard && var_on_left) {
+                    switch (cmp_op) {
+                    case TOK_GTEQ:    /* if (var >= val) return → var < val → var.max = val - 1 */
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                                       cmp_val > 1);
+                        break;
+                    case TOK_GT:      /* if (var > val) return → var <= val → var.max = val */
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_LT:      /* if (var < val) return → var >= val → var.min = val */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_LTEQ:    /* if (var <= val) return → var > val → var.min = val + 1 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                        break;
+                    case TOK_EQEQ:    /* if (var == 0) return → var != 0 → known_nonzero */
+                        if (cmp_val == 0)
+                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
+                        break;
+                    default: break;
+                    }
+                } else if (is_guard && !var_on_left) {
+                    /* val OP var guard → apply inverse (flip) */
+                    switch (cmp_op) {
+                    case TOK_GTEQ:    /* if (val >= var) return → var > val */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                        break;
+                    case TOK_GT:
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_LT:
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                                       cmp_val > 1);
+                        break;
+                    case TOK_LTEQ:
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
+                                       cmp_val > 0 || cmp_val < 0);
+                        break;
+                    case TOK_EQEQ:
+                        if (cmp_val == 0)
+                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
+                        break;
+                    default: break;
+                    }
+                }
+
+                if (node->if_stmt.else_body) {
+                    /* else-block gets the inverse of then-block's range
+                     * (but we already restored, so just check else normally) */
+                    check_stmt(c, node->if_stmt.else_body);
+                }
+            } else {
+                /* non-comparison condition — no range narrowing */
+                check_stmt(c, node->if_stmt.then_body);
+                if (node->if_stmt.else_body)
+                    check_stmt(c, node->if_stmt.else_body);
+            }
+            /* guard ranges stay — they're valid after the if */
+        }
         break;
     }
 
@@ -3969,18 +4331,54 @@ static void check_stmt(Checker *c, Node *node) {
         push_scope(c); /* for loop has its own scope */
         if (node->for_stmt.init) check_stmt(c, node->for_stmt.init);
         if (node->for_stmt.cond) {
-            Type *cond = check_expr(c, node->for_stmt.cond);
-            if (!type_equals(cond, ty_bool)) {
+            Type *fcond = check_expr(c, node->for_stmt.cond);
+            if (!type_equals(fcond, ty_bool)) {
                 checker_error(c, node->loc.line,
-                    "for condition must be bool, got '%s'", type_name(cond));
+                    "for condition must be bool, got '%s'", type_name(fcond));
             }
         }
         if (node->for_stmt.step) check_expr(c, node->for_stmt.step);
+
+        /* Value range propagation: for (i = 0; i < N; ...) → i in [0, N-1] */
+        int saved_range_count = c->var_range_count;
+        if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY) {
+            Node *fc = node->for_stmt.cond;
+            TokenType fop = fc->binary.op;
+            const char *loop_var = NULL;
+            uint32_t loop_var_len = 0;
+            int64_t bound_val = CONST_EVAL_FAIL;
+
+            /* pattern: ident < const or ident < ident.len */
+            if (fc->binary.left->kind == NODE_IDENT) {
+                loop_var = fc->binary.left->ident.name;
+                loop_var_len = (uint32_t)fc->binary.left->ident.name_len;
+                bound_val = eval_const_expr(fc->binary.right);
+            }
+
+            /* try to get init value for min */
+            int64_t init_val = 0; /* default min */
+            if (node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
+                node->for_stmt.init->var_decl.init) {
+                int64_t iv = eval_const_expr(node->for_stmt.init->var_decl.init);
+                if (iv != CONST_EVAL_FAIL) init_val = iv;
+            }
+
+            if (loop_var && bound_val != CONST_EVAL_FAIL) {
+                if (fop == TOK_LT) {
+                    push_var_range(c, loop_var, loop_var_len, init_val, bound_val - 1,
+                                   init_val > 0);
+                } else if (fop == TOK_LTEQ) {
+                    push_var_range(c, loop_var, loop_var_len, init_val, bound_val,
+                                   init_val > 0);
+                }
+            }
+        }
 
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
         check_stmt(c, node->for_stmt.body);
         c->in_loop = prev_in_loop;
+        c->var_range_count = saved_range_count; /* ranges invalid after loop */
         pop_scope(c);
         break;
     }
@@ -5155,6 +5553,46 @@ static void check_func_body(Checker *c, Node *node) {
                 (int)node->func_decl.name_len, node->func_decl.name);
         }
 
+        /* Cross-function provenance: if function returns *opaque, record
+         * what provenance the return expression carries. Used at call sites. */
+        {
+            Type *ret_eff = type_unwrap_distinct(ret);
+            if (ret_eff && ret_eff->kind == TYPE_POINTER &&
+                ret_eff->pointer.inner->kind == TYPE_OPAQUE) {
+                Type *rprov = find_return_provenance(c, node->func_decl.body);
+                if (rprov) {
+                    add_prov_summary(c, node->func_decl.name,
+                        (uint32_t)node->func_decl.name_len, rprov);
+                }
+            }
+        }
+
+        /* Whole-program param provenance: for each *opaque parameter,
+         * scan body for @ptrcast to determine expected type. */
+        for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+            Type *pt = resolve_type(c, node->func_decl.params[pi].type);
+            Type *ptu = type_unwrap_distinct(pt);
+            if (ptu && ptu->kind == TYPE_POINTER && ptu->pointer.inner->kind == TYPE_OPAQUE) {
+                Type *expected = find_param_cast_type(c, node->func_decl.body,
+                    node->func_decl.params[pi].name,
+                    (uint32_t)node->func_decl.params[pi].name_len);
+                if (expected) {
+                    /* store: function X expects param pi to be *T */
+                    if (c->param_expect_count >= c->param_expect_capacity) {
+                        int nc = c->param_expect_capacity * 2;
+                        if (nc < 8) nc = 8;
+                        c->param_expects = realloc(c->param_expects, nc * sizeof(struct ParamExpect));
+                        c->param_expect_capacity = nc;
+                    }
+                    struct ParamExpect *pe = &c->param_expects[c->param_expect_count++];
+                    pe->func_name = node->func_decl.name;
+                    pe->func_name_len = (uint32_t)node->func_decl.name_len;
+                    pe->param_index = pi;
+                    pe->expected_type = expected;
+                }
+            }
+        }
+
         pop_scope(c);
         c->current_func_ret = NULL;
     }
@@ -5193,6 +5631,219 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
 
 Type *checker_get_type(Checker *c, Node *node) {
     return typemap_get(c, node);
+}
+
+/* ---- Value Range Propagation helpers ---- */
+
+/* Find the most recent range entry for a variable (stack: scan from end) */
+static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len) {
+    for (int i = c->var_range_count - 1; i >= 0; i--) {
+        if (c->var_ranges[i].name_len == name_len &&
+            memcmp(c->var_ranges[i].name, name, name_len) == 0)
+            return &c->var_ranges[i];
+    }
+    return NULL;
+}
+
+/* Push a new range entry. If an existing range exists for this var,
+ * intersect (narrow) rather than replace — ensures ranges only tighten.
+ * For unsigned types, min is clamped to 0 (can't be negative). */
+static void push_var_range(Checker *c, const char *name, uint32_t name_len,
+                           int64_t min_val, int64_t max_val, bool known_nonzero) {
+    /* clamp min to 0 for unsigned variables */
+    if (min_val < 0) {
+        Symbol *sym = scope_lookup(c->current_scope, name, name_len);
+        if (sym && sym->type && type_is_unsigned(sym->type)) {
+            min_val = 0;
+        }
+    }
+    /* intersect with existing range if present */
+    struct VarRange *existing = find_var_range(c, name, name_len);
+    if (existing) {
+        if (existing->min_val > min_val) min_val = existing->min_val;
+        if (existing->max_val < max_val) max_val = existing->max_val;
+        if (existing->known_nonzero) known_nonzero = true;
+    }
+    if (c->var_range_count >= c->var_range_capacity) {
+        int new_cap = c->var_range_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        c->var_ranges = realloc(c->var_ranges, new_cap * sizeof(struct VarRange));
+        c->var_range_capacity = new_cap;
+    }
+    struct VarRange *r = &c->var_ranges[c->var_range_count++];
+    r->name = name;
+    r->name_len = name_len;
+    r->min_val = min_val;
+    r->max_val = max_val;
+    r->known_nonzero = known_nonzero;
+}
+
+/* Mark a node as proven safe — emitter will skip runtime check */
+static void mark_proven(Checker *c, Node *node) {
+    if (c->proven_safe_count >= c->proven_safe_capacity) {
+        int new_cap = c->proven_safe_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        c->proven_safe = realloc(c->proven_safe, new_cap * sizeof(Node *));
+        c->proven_safe_capacity = new_cap;
+    }
+    c->proven_safe[c->proven_safe_count++] = node;
+}
+
+bool checker_is_proven(Checker *c, Node *node) {
+    for (int i = 0; i < c->proven_safe_count; i++) {
+        if (c->proven_safe[i] == node) return true;
+    }
+    return false;
+}
+
+/* Mark a node as needing auto-guard insertion by the emitter */
+static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size) {
+    if (c->auto_guard_count >= c->auto_guard_capacity) {
+        int new_cap = c->auto_guard_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        c->auto_guards = realloc(c->auto_guards, new_cap * sizeof(struct AutoGuard));
+        c->auto_guard_capacity = new_cap;
+    }
+    struct AutoGuard *g = &c->auto_guards[c->auto_guard_count++];
+    g->node = node;
+    g->array_size = array_size;
+}
+
+uint64_t checker_auto_guard_size(Checker *c, Node *node) {
+    for (int i = 0; i < c->auto_guard_count; i++) {
+        if (c->auto_guards[i].node == node) return c->auto_guards[i].array_size;
+    }
+    return 0;
+}
+
+/* Cross-function provenance: find return provenance in a function body */
+static Type *find_return_provenance(Checker *c, Node *node) {
+    if (!node) return NULL;
+    if (node->kind == NODE_RETURN && node->ret.expr) {
+        Node *rexpr = node->ret.expr;
+        /* check for @ptrcast(*opaque, source) — source carries provenance */
+        if (rexpr->kind == NODE_INTRINSIC && rexpr->intrinsic.name_len == 7 &&
+            memcmp(rexpr->intrinsic.name, "ptrcast", 7) == 0 &&
+            rexpr->intrinsic.arg_count > 0) {
+            return typemap_get(c, rexpr->intrinsic.args[0]);
+        }
+        /* check if return expr is an ident with known provenance */
+        if (rexpr->kind == NODE_IDENT) {
+            Symbol *sym = scope_lookup(c->current_scope, rexpr->ident.name,
+                (uint32_t)rexpr->ident.name_len);
+            if (sym && sym->provenance_type) return sym->provenance_type;
+            /* also check prov_map for compound keys */
+            char key[128];
+            int klen = build_expr_key(rexpr, key, sizeof(key));
+            if (klen > 0) {
+                Type *p = prov_map_get(c, key, (uint32_t)klen);
+                if (p) return p;
+            }
+        }
+        return NULL;
+    }
+    /* recurse into blocks and if-bodies */
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            Type *p = find_return_provenance(c, node->block.stmts[i]);
+            if (p) return p;
+        }
+    }
+    if (node->kind == NODE_IF) {
+        Type *p = find_return_provenance(c, node->if_stmt.then_body);
+        if (p) return p;
+        return find_return_provenance(c, node->if_stmt.else_body);
+    }
+    return NULL;
+}
+
+/* Find what type a *opaque parameter is cast to inside a function body.
+ * Scans for @ptrcast(*T, param_name) → returns *T (the target pointer type).
+ * Uses typemap to get the resolved type of the @ptrcast node. */
+static Type *find_param_cast_type(Checker *c, Node *node,
+                                   const char *param_name, uint32_t param_len) {
+    if (!node) return NULL;
+    if (node->kind == NODE_INTRINSIC && node->intrinsic.name_len == 7 &&
+        memcmp(node->intrinsic.name, "ptrcast", 7) == 0 &&
+        node->intrinsic.arg_count > 0) {
+        Node *src = node->intrinsic.args[0];
+        if (src->kind == NODE_IDENT && src->ident.name_len == param_len &&
+            memcmp(src->ident.name, param_name, param_len) == 0) {
+            /* found @ptrcast(*T, param) — return the result type from typemap */
+            Type *result = typemap_get(c, node);
+            if (result) return result;
+        }
+    }
+    /* recurse into all statement/expression kinds */
+    switch (node->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            Type *t = find_param_cast_type(c, node->block.stmts[i], param_name, param_len);
+            if (t) return t;
+        }
+        break;
+    case NODE_IF: {
+        Type *t = find_param_cast_type(c, node->if_stmt.then_body, param_name, param_len);
+        if (t) return t;
+        return find_param_cast_type(c, node->if_stmt.else_body, param_name, param_len);
+    }
+    case NODE_VAR_DECL:
+        return find_param_cast_type(c, node->var_decl.init, param_name, param_len);
+    case NODE_EXPR_STMT:
+        return find_param_cast_type(c, node->expr_stmt.expr, param_name, param_len);
+    case NODE_RETURN:
+        return find_param_cast_type(c, node->ret.expr, param_name, param_len);
+    case NODE_ASSIGN:
+        return find_param_cast_type(c, node->assign.value, param_name, param_len);
+    case NODE_CALL:
+        for (int i = 0; i < node->call.arg_count; i++) {
+            Type *t = find_param_cast_type(c, node->call.args[i], param_name, param_len);
+            if (t) return t;
+        }
+        break;
+    default: break;
+    }
+    return NULL;
+}
+
+static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov) {
+    if (c->prov_summary_count >= c->prov_summary_capacity) {
+        int new_cap = c->prov_summary_capacity * 2;
+        if (new_cap < 8) new_cap = 8;
+        c->prov_summaries = realloc(c->prov_summaries, new_cap * sizeof(struct ProvSummary));
+        c->prov_summary_capacity = new_cap;
+    }
+    struct ProvSummary *s = &c->prov_summaries[c->prov_summary_count++];
+    s->func_name = name;
+    s->func_name_len = name_len;
+    s->return_provenance = prov;
+}
+
+static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len) {
+    for (int i = 0; i < c->prov_summary_count; i++) {
+        if (c->prov_summaries[i].func_name_len == name_len &&
+            memcmp(c->prov_summaries[i].func_name, name, name_len) == 0)
+            return c->prov_summaries[i].return_provenance;
+    }
+    return NULL;
+}
+
+/* Check if an if-body guarantees early exit (return/break/continue) */
+static bool body_always_exits(Node *body) {
+    if (!body) return false;
+    if (body->kind == NODE_RETURN || body->kind == NODE_BREAK ||
+        body->kind == NODE_CONTINUE) return true;
+    if (body->kind == NODE_BLOCK && body->block.stmt_count > 0) {
+        Node *last = body->block.stmts[body->block.stmt_count - 1];
+        return last->kind == NODE_RETURN || last->kind == NODE_BREAK ||
+               last->kind == NODE_CONTINUE;
+    }
+    /* expression statement with orelse return/break */
+    if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
+        body->expr_stmt.expr->kind == NODE_ORELSE &&
+        (body->expr_stmt.expr->orelse.fallback_is_return ||
+         body->expr_stmt.expr->orelse.fallback_is_break)) return true;
+    return false;
 }
 
 void checker_register_file(Checker *c, Node *file_node) {
@@ -5367,6 +6018,94 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
     return c->error_count == 0;
 }
 
+/* Post-check: validate *opaque call-site provenance against param expectations.
+ * Scans all call expressions in the file, checks argument provenance. */
+static void check_call_provenance(Checker *c, Node *node) {
+    if (!node) return;
+    if (node->kind == NODE_CALL && node->call.callee->kind == NODE_IDENT) {
+        const char *fname = node->call.callee->ident.name;
+        uint32_t flen = (uint32_t)node->call.callee->ident.name_len;
+
+        /* check each argument against param expectations */
+        for (int i = 0; i < node->call.arg_count; i++) {
+            /* find expected type for this param */
+            Type *expected = NULL;
+            for (int pe = 0; pe < c->param_expect_count; pe++) {
+                if (c->param_expects[pe].param_index == i &&
+                    c->param_expects[pe].func_name_len == flen &&
+                    memcmp(c->param_expects[pe].func_name, fname, flen) == 0) {
+                    expected = c->param_expects[pe].expected_type;
+                    break;
+                }
+            }
+            if (!expected) continue;
+
+            /* get argument provenance */
+            Type *arg_prov = NULL;
+            Node *arg = node->call.args[i];
+
+            /* @ptrcast(*opaque, &source) — source type is the provenance */
+            if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 7 &&
+                memcmp(arg->intrinsic.name, "ptrcast", 7) == 0 &&
+                arg->intrinsic.arg_count > 0) {
+                arg_prov = typemap_get(c, arg->intrinsic.args[0]);
+            }
+            /* ident with known provenance */
+            if (!arg_prov && arg->kind == NODE_IDENT) {
+                Symbol *sym = scope_lookup(c->global_scope, arg->ident.name,
+                    (uint32_t)arg->ident.name_len);
+                if (sym && sym->provenance_type) arg_prov = sym->provenance_type;
+            }
+
+            if (!arg_prov) continue; /* unknown provenance — runtime handles it */
+
+            /* compare: expected is *Sensor, arg_prov is the source type (*Sensor or *Motor) */
+            Type *exp_inner = type_unwrap_distinct(expected);
+            if (exp_inner && exp_inner->kind == TYPE_POINTER) exp_inner = exp_inner->pointer.inner;
+            Type *arg_inner = type_unwrap_distinct(arg_prov);
+            if (arg_inner && arg_inner->kind == TYPE_POINTER) arg_inner = arg_inner->pointer.inner;
+
+            if (exp_inner && arg_inner && !type_equals(exp_inner, arg_inner)) {
+                checker_error(c, node->loc.line,
+                    "wrong *opaque type: function '%.*s' expects '%s' for parameter %d, "
+                    "but caller passes '%s'",
+                    (int)flen, fname, type_name(expected), i + 1, type_name(arg_prov));
+            }
+        }
+    }
+
+    /* recurse into all node types */
+    switch (node->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            check_call_provenance(c, node->block.stmts[i]);
+        break;
+    case NODE_IF:
+        check_call_provenance(c, node->if_stmt.then_body);
+        check_call_provenance(c, node->if_stmt.else_body);
+        break;
+    case NODE_FOR:
+        check_call_provenance(c, node->for_stmt.body);
+        break;
+    case NODE_WHILE:
+        check_call_provenance(c, node->while_stmt.body);
+        break;
+    case NODE_FUNC_DECL:
+        check_call_provenance(c, node->func_decl.body);
+        break;
+    case NODE_EXPR_STMT:
+        check_call_provenance(c, node->expr_stmt.expr);
+        break;
+    case NODE_VAR_DECL:
+        check_call_provenance(c, node->var_decl.init);
+        break;
+    case NODE_RETURN:
+        check_call_provenance(c, node->ret.expr);
+        break;
+    default: break;
+    }
+}
+
 bool checker_check(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return false;
 
@@ -5376,5 +6115,14 @@ bool checker_check(Checker *c, Node *file_node) {
     }
 
     /* Pass 2: type-check all function bodies and global initializers */
-    return checker_check_bodies(c, file_node);
+    bool ok = checker_check_bodies(c, file_node);
+
+    /* Pass 3: whole-program *opaque param provenance validation */
+    if (c->param_expect_count > 0) {
+        for (int i = 0; i < file_node->file.decl_count; i++) {
+            check_call_provenance(c, file_node->file.decls[i]);
+        }
+    }
+
+    return c->error_count == 0;
 }

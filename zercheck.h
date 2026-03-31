@@ -25,6 +25,7 @@ typedef enum {
     HS_UNKNOWN,         /* not yet seen */
     HS_ALIVE,           /* allocated, valid to use */
     HS_FREED,           /* freed, any use = bug */
+    HS_MAYBE_FREED,     /* freed on some paths — use is a potential bug */
 } HandleState;
 
 /* per-handle tracking info */
@@ -51,6 +52,15 @@ typedef struct {
     int id;
 } ZcPool;
 
+/* cross-function summary: what a function does to its Handle params */
+typedef struct {
+    const char *func_name;
+    uint32_t func_name_len;
+    int param_count;
+    bool *frees_param;        /* definite free (all paths) */
+    bool *maybe_frees_param;  /* conditional free (some paths) */
+} FuncSummary;
+
 /* ZER-CHECK context */
 typedef struct {
     Checker *checker;
@@ -67,6 +77,12 @@ typedef struct {
     ZcPool *pools;
     int pool_count;
     int pool_capacity;
+
+    /* cross-function summaries — built in pre-scan, used during analysis */
+    FuncSummary *summaries;
+    int summary_count;
+    int summary_capacity;
+    bool building_summary;  /* suppress error reporting during summary phase */
 } ZerCheck;
 
 /* ---- API ---- */

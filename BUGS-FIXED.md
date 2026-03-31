@@ -2050,3 +2050,94 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** BUG-240 assignment check and BUG-203 var_decl check only inspected direct value, not orelse fallback branches.
 - **Fix:** Both NODE_ASSIGN (BUG-240) and NODE_VAR_DECL (BUG-203) now also check orelse fallback for local array roots. Assignment path collects both direct value and orelse fallback into `arr_checks[]`. Var_decl path iterates over init + fallback in `arr_roots[]`.
 - **Test:** 2 tests added: orelse array assign to global, orelse array var_decl then assign to global.
+
+### zercheck change 1: MAYBE_FREED state
+- **Symptom:** `if (cond) { pool.free(h); } pool.get(h)` — not caught. Conditional frees on one branch left handle as ALIVE (under-approximation).
+- **Root cause:** if/else merge only marked FREED when BOTH branches freed. If-without-else kept handle ALIVE. Switch only marked FREED when ALL arms freed.
+- **Fix:** Added `HS_MAYBE_FREED` state. if/else: one branch frees → MAYBE_FREED. if-without-else: then-branch frees → MAYBE_FREED. Switch: some arms free → MAYBE_FREED. pool.get/pool.free on MAYBE_FREED handle → error.
+- **Test:** 9 new tests: if-no-else use/free after, both-branch-free OK, one-branch leak, partial switch caught.
+
+### zercheck change 2: Handle leak detection
+- **Symptom:** `h = pool.alloc(); /* never freed */` — silently compiled. `h = pool.alloc(); h = pool.alloc()` — first handle silently leaked.
+- **Root cause:** zercheck only tracked use-after-free and double-free. No check for handles that were never freed or overwritten.
+- **Fix:** At function exit, scan PathState for HS_ALIVE or HS_MAYBE_FREED handles allocated inside the function → error. At alloc assignment, check if target handle already HS_ALIVE → error "overwritten while alive". Parameter handles excluded (caller responsible).
+- **Test:** 4 new tests: alloc without free, overwrite alive handle, clean lifecycle OK, param not freed OK.
+
+### zercheck change 3: Loop second pass
+- **Symptom:** Conditional free patterns spanning loop iterations weren't caught by the single-pass analysis.
+- **Root cause:** zercheck ran loop body once. If a conditional free changed handle state, the second iteration wasn't analyzed.
+- **Fix:** After first loop pass, if any handle state changed from pre-loop, run body once more. If state still unstable after second pass → widen to MAYBE_FREED.
+- **Test:** 1 new test: free-then-realloc in loop (valid cycling pattern) stays OK.
+
+### zercheck change 4: Cross-function analysis
+- **Symptom:** `void free_handle(Handle(T) h) { pool.free(h); }` — calling `free_handle(h)` then `pool.get(h)` was not caught. zercheck didn't follow non-builtin calls.
+- **Root cause:** `zc_check_call` only handled `pool.method()` calls (NODE_FIELD callee). Regular function calls (NODE_IDENT callee) were invisible to zercheck.
+- **Fix:** Pre-scan phase builds `FuncSummary` for each function with Handle params. `zc_build_summary()` runs existing `zc_check_stmt` walker with `building_summary=true` (suppresses error reporting). After walking, checks each Handle param's final state → `frees_param[]` (FREED) or `maybe_frees_param[]` (MAYBE_FREED). At call sites, `zc_apply_summary()` looks up callee summary and applies effects to caller's PathState. Also propagates to aliases.
+- **Test:** 6 new tests: wrapper frees → UAF, wrapper frees → double free, wrapper uses (no free) → OK, conditional free wrapper → MAYBE_FREED, non-handle param → no effect, process-and-free wrapper → caller clean.
+
+### Value range propagation
+- **Feature:** Compiler tracks `{min_val, max_val, known_nonzero}` per variable through control flow. Eliminates redundant runtime bounds and division checks.
+- **Implementation:** `VarRange` stack on Checker struct. `push_var_range()` adds shadowing entries. Save/restore via count for scoped narrowing. `proven_safe` array tracks nodes proven safe. `checker_is_proven()` exposed to emitter.
+- **Patterns covered:**
+  - Literal array index (`arr[3]` where 3 < arr size) → bounds check skipped
+  - For-loop variable (`for (i = 0; i < N; ...)`) → `arr[i]` bounds check skipped inside body
+  - Guard pattern (`if (i >= N) { return; }`) → `arr[i]` bounds check skipped after guard
+  - Literal divisor (`x / 4`) → division check skipped
+  - Nonzero guard (`if (d == 0) { return; }`) → `x / d` division check skipped
+- **Emitter changes:** NODE_INDEX checks `checker_is_proven()` → emits plain `arr[idx]` without `_zer_bounds_check`. NODE_BINARY (TOK_SLASH/TOK_PERCENT) checks → emits plain `(a / b)` without `({ if (_d == 0) trap; })`.
+- **Test:** 5 new E2E tests: literal index, for-loop index, literal divisor, division after guard, bounds after guard.
+
+### Forced division guard
+- **Feature:** Division by zero is C undefined behavior. ZER now requires proof that the divisor is nonzero for simple variable divisors. Complex expressions (struct fields, function calls) keep runtime check.
+- **Implementation:** ~10 lines in checker.c NODE_BINARY handler, after range propagation check. If divisor is NODE_IDENT and not in `proven_safe`, emit compile error with fix suggestion.
+- **Error message:** `divisor 'd' not proven nonzero — add 'if (d == 0) { return; }' before division`
+- **Proof methods:** literal nonzero, `u32 d = 5` init, `if (d == 0) return` guard, for loop `i = 1..N`
+- **Test:** 7 new checker tests: literal OK, var init OK, guard OK, unguarded error, modulo error, modulo+guard OK, for-loop var OK.
+
+### Bounds auto-guard
+- **Feature:** When an array index cannot be proven safe by range propagation, the compiler inserts an invisible bounds guard (if-return) before the containing statement instead of trapping at runtime.
+- **Design decision:** An earlier "forced bounds guard" design was rejected — it required the programmer to add explicit guards everywhere, breaking hundreds of tests and being too invasive. The final design makes the compiler responsible: prove it OR auto-guard it, always with a warning.
+- **Implementation:** `AutoGuard` struct + `auto_guard_count/capacity` on Checker. `checker_mark_auto_guard()` called in checker when index is unproven. `emit_auto_guards(e, stmt)` walks statement tree, emits `if (idx >= size) { return <zero>; }` before the statement. `emit_zero_value()` helper emits correct zero for any return type (void/int/bool/pointer/optional). `_zer_bounds_check` still present after guard (belt and suspenders). Warning emitted to programmer.
+- **API:** `checker_auto_guard_size(c, node)` — emitter queries guard size for a given node.
+- **Test:** 5 new E2E tests: param index, global array, volatile index, computed index, guard suppresses warning.
+
+### Auto-keep on function pointer pointer-params
+- **Feature:** When a call goes through a function pointer (not a direct named function call), ALL pointer arguments are automatically treated as `keep` parameters. The compiler cannot inspect the callee's body to know if the pointer escapes.
+- **Implementation:** In NODE_CALL keep validation: if callee is not NODE_IDENT, or the resolved ident symbol has `is_function == false` (it's a fn-ptr variable), all pointer args are assumed kept. Invisible to programmer — no annotation needed.
+- **Test:** 2 new checker tests: fn-ptr call with local ptr (blocked), direct call with no-keep param (allowed).
+
+### @cstr overflow auto-return
+- **Feature:** @cstr buffer overflow previously called `_zer_trap()` (crash). Now emits the same auto-return pattern as bounds auto-guard — `if (src.len + 1 > dest_size) { emit_defers(); return <zero_value>; }`.
+- **Root cause of change:** A crash on buffer overflow is unrecoverable and not useful for embedded systems. A silent return-zero is consistent with the bounds auto-guard design.
+- **Implementation:** Emitter @cstr handler replaced `_zer_trap(...)` with `emit_zero_value()` + `emit_defers()` call. Applied to both array-dest and slice-dest overflow paths.
+- **Test:** 2 new E2E tests: @cstr overflow in void function (returns), @cstr overflow in u32 function (returns 0).
+
+### *opaque array homogeneous provenance
+- **Feature:** All elements of a `*opaque` array must have the same concrete type. `arr[0] = @ptrcast(*opaque, &sensor)` and `arr[1] = @ptrcast(*opaque, &motor)` in the same array is a compile error.
+- **Implementation:** `prov_map_set()` — when key contains `[`, also sets root key. If root key already has DIFFERENT provenance → error: `"heterogeneous *opaque array — all elements must have the same type"`.
+- **Test:** 2 new checker tests: homogeneous OK, mixed types error.
+
+### Cross-function *opaque provenance summaries
+- **Feature:** If a function always returns a specific concrete type cast to `*opaque`, callers automatically get that provenance when assigning to `*opaque` variables — no `@ptrcast` annotation needed at call sites.
+- **Implementation:** `find_return_provenance(c, func_node)` walks body for NODE_RETURN with @ptrcast source or provenance-carrying ident. `add_prov_summary()` / `lookup_prov_summary()` on Checker. Built after checking each `*opaque`-returning function. Applied in NODE_VAR_DECL when init is a call to a function with known summary.
+- **Test:** 3 new checker tests: propagation to local var, mismatch detected, unknown function (no summary) passes.
+
+### Struct field range propagation
+- **Feature:** Range propagation + forced division guard extended to struct fields via `build_expr_key()`.
+- **Bug:** compound key `cmp_key_buf` was stack-local, pointer dangled after if-block scope. Fix: arena-allocate before pushing to var_ranges.
+- **Test:** 2 new checker tests.
+
+### Whole-program *opaque param provenance
+- **Feature:** Post-check pass validates call-site argument provenance against callee's @ptrcast expected type.
+- **Implementation:** `find_param_cast_type()` + `ParamExpect` on Checker + `check_call_provenance()` Pass 3.
+- **Test:** 3 new checker tests.
+
+### @probe intrinsic
+- **Feature:** `@probe(addr)` → `?u32`. Safe MMIO read — catches hardware faults, returns null.
+- **Bug fixed:** `NODE_INTRINSIC` returning `?T` not handled in var-decl optional init — double-wrapped. Fix: added to direct-assign check.
+- **Test:** 7 checker + 3 E2E tests.
+
+### MMIO auto-discovery
+- **Feature:** 5-phase boot scan when `--no-strict-mmio` + `@inttoptr` + no `mmio`. Discovers all hardware via brute-force RCC/power controller + rescan.
+- **Implementation:** `has_inttoptr()` AST scan, `__attribute__((constructor))` discovery, `_zer_mmio_valid()` validation.
+- **Test:** 1 E2E test.

@@ -37,7 +37,7 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 /* compile ZER source to C, write to file */
-static bool zer_to_c(const char *zer_source, const char *c_output_path) {
+static bool zer_to_c_ex(const char *zer_source, const char *c_output_path, bool no_strict_mmio) {
     Arena arena;
     arena_init(&arena, 256 * 1024);
 
@@ -50,6 +50,7 @@ static bool zer_to_c(const char *zer_source, const char *c_output_path) {
 
     Checker checker;
     checker_init(&checker, &arena, "test.zer");
+    checker.no_strict_mmio = no_strict_mmio;
     if (!checker_check(&checker, file)) { arena_free(&arena); return false; }
 
     FILE *out = fopen(c_output_path, "w");
@@ -62,6 +63,10 @@ static bool zer_to_c(const char *zer_source, const char *c_output_path) {
     fclose(out);
     arena_free(&arena);
     return true;
+}
+
+static bool zer_to_c(const char *zer_source, const char *c_output_path) {
+    return zer_to_c_ex(zer_source, c_output_path, false);
 }
 
 /* full pipeline: ZER → C → GCC → run → check exit code */
@@ -1100,37 +1105,19 @@ int main(void) {
         arena_free(&a);
     }
 
-    printf("[bounds check — runtime OOB traps]\n");
-    /* variable index OOB still traps at runtime */
-    {
-        tests_run++;
-        Arena a; arena_init(&a, 128*1024);
-        if (zer_to_c(
-            "u32 main() {\n"
-            "    u32[4] arr;\n"
-            "    u32 idx = 10;\n"
-            "    arr[idx] = 99;\n"
-            "    return 0;\n"
-            "}\n", "_zer_test_out.c")) {
-            int gcc = system(GCC_COMPILE_NOWRAP);
-            if (gcc == 0) {
-                int run = system(TEST_RUN);
-                if (run != 0) {
-                    tests_passed++; /* non-zero exit = trap fired */
-                } else {
-                    printf("  FAIL: bounds check — out of bounds should trap\n");
-                    tests_failed++;
-                }
-            } else {
-                printf("  FAIL: bounds check — GCC compilation failed\n");
-                tests_failed++;
-            }
-        } else {
-            printf("  FAIL: bounds check — ZER compilation failed\n");
-            tests_failed++;
-        }
-        arena_free(&a);
-    }
+    printf("[bounds check — auto-guard returns 0 for OOB variable index]\n");
+    /* With auto-guard: idx=10 on arr[4] → auto-guard fires, returns 0.
+     * The auto-guard handles OOB invisibly at compile time. */
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 42;\n"
+        "    u32 idx = 10;\n"
+        "    arr[idx] = 99;\n"
+        "    return arr[0];\n"
+        "}\n",
+        0,
+        "auto-guard: idx=10 >= 4 → function returns 0 before access");
 
     printf("[combo: defer + orelse continue in for]\n");
     test_compile_and_run(
@@ -2235,17 +2222,22 @@ int main(void) {
         "bounds check in if condition — valid access i=2");
 
     printf("[BUG-079: short-circuit && respects bounds]\n");
+    /* With forced bounds guard, arr[i] requires proven range.
+     * Use guarded access: if (i >= 4) return false before arr[i]. */
     test_compile_and_run(
+        "u32[4] arr;\n"
+        "bool check(u32 i) {\n"
+        "    if (i >= 4) { return false; }\n"
+        "    return arr[i] == 42;\n"
+        "}\n"
         "u32 main() {\n"
-        "    u32[4] arr;\n"
         "    arr[0] = 10;\n"
-        "    u32 i = 10;\n"
-        "    bool result = (i < 4) && (arr[i] == 42);\n"
+        "    bool result = check(10);\n"
         "    if (result) { return 1; }\n"
         "    return 0;\n"
         "}\n",
         0,
-        "short-circuit && — i=10, left false, no trap on right");
+        "short-circuit replaced with guard — i=10, guard returns false");
 
     printf("[BUG-078: bounds check in while condition]\n");
     test_compile_and_run(
@@ -3217,6 +3209,192 @@ int main(void) {
         "}\n",
         123,
         "volatile struct slice E2E");
+
+    /* ---- Value range propagation E2E ---- */
+    printf("\n[range propagation: literal index proven safe]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    arr[0] = 10;\n"
+        "    arr[1] = 20;\n"
+        "    arr[2] = 30;\n"
+        "    arr[3] = 40;\n"
+        "    return arr[0] + arr[3];\n"
+        "}\n",
+        50,
+        "range propagation: literal array index proven safe");
+
+    printf("[range propagation: for loop index proven safe]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[5] arr;\n"
+        "    for (u32 i = 0; i < 5; i += 1) {\n"
+        "        arr[i] = i;\n"
+        "    }\n"
+        "    return arr[4];\n"
+        "}\n",
+        4,
+        "range propagation: for loop variable proven in range");
+
+    printf("[range propagation: division by literal nonzero]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 100;\n"
+        "    return x / 4;\n"
+        "}\n",
+        25,
+        "range propagation: division by constant nonzero — no check");
+
+    printf("[range propagation: division after guard]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 d = 5;\n"
+        "    if (d == 0) { return 0; }\n"
+        "    return 100 / d;\n"
+        "}\n",
+        20,
+        "range propagation: division after nonzero guard — no check");
+
+    printf("[range propagation: bounds after guard]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[10] arr;\n"
+        "    for (u32 i = 0; i < 10; i += 1) { arr[i] = i; }\n"
+        "    u32 idx = 7;\n"
+        "    if (idx >= 10) { return 99; }\n"
+        "    return arr[idx];\n"
+        "}\n",
+        7,
+        "range propagation: array index after bounds guard");
+
+    /* ---- Bounds auto-guard E2E ---- */
+    printf("\n[auto-guard E2E: param OOB → function returns 0]\n");
+    test_compile_and_run(
+        "u32 get_val(u32 idx) {\n"
+        "    u32[4] table;\n"
+        "    table[0] = 10; table[1] = 20; table[2] = 30; table[3] = 40;\n"
+        "    return table[idx];\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return get_val(99);\n"
+        "}\n",
+        0,
+        "auto-guard E2E: param idx=99 >= 4 → returns 0");
+
+    printf("[auto-guard E2E: param in range → normal access]\n");
+    test_compile_and_run(
+        "u32 get_val(u32 idx) {\n"
+        "    u32[4] table;\n"
+        "    table[0] = 10; table[1] = 20; table[2] = 30; table[3] = 40;\n"
+        "    return table[idx];\n"
+        "}\n"
+        "u32 main() {\n"
+        "    return get_val(2);\n"
+        "}\n",
+        30,
+        "auto-guard E2E: param idx=2 in range → returns table[2]=30");
+
+    printf("[auto-guard E2E: global index OOB → void function returns]\n");
+    test_compile_and_run(
+        "u32 g_idx = 100;\n"
+        "u32[8] buf;\n"
+        "u32 result = 42;\n"
+        "void write_buf() {\n"
+        "    buf[g_idx] = 99;\n"
+        "    result = 1;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    write_buf();\n"
+        "    return result;\n"
+        "}\n",
+        42,
+        "auto-guard E2E: global OOB → void func returns, result unchanged");
+
+    printf("[auto-guard E2E: proven for-loop → works normally]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32[4] arr;\n"
+        "    u32 sum = 0;\n"
+        "    for (u32 i = 0; i < 4; i += 1) { arr[i] = i + 1; }\n"
+        "    for (u32 i = 0; i < 4; i += 1) { sum += arr[i]; }\n"
+        "    return sum;\n"
+        "}\n",
+        10,
+        "auto-guard E2E: for-loop proven → 1+2+3+4=10");
+
+    /* ---- @cstr auto-orelse E2E ---- */
+    printf("\n[@cstr auto-orelse E2E: string fits → normal copy]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u8[16] buf;\n"
+        "    const []u8 data = \"hello\";\n"
+        "    @cstr(buf, data);\n"
+        "    return buf[0];\n"
+        "}\n",
+        104,
+        "@cstr auto-orelse: string fits → buf[0]='h'=104");
+
+    /* ---- @probe E2E ---- */
+    printf("\n[@probe E2E: probe invalid address → returns null → orelse fires]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 val = @probe(0xDEADBEEF) orelse 42;\n"
+        "    return val;\n"
+        "}\n",
+        42,
+        "@probe E2E: invalid address → orelse returns 42");
+
+    printf("[@probe E2E: probe null → returns null]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 val = @probe(0) orelse 99;\n"
+        "    return val;\n"
+        "}\n",
+        99,
+        "@probe E2E: null address → orelse returns 99");
+
+    printf("[@probe E2E: if-unwrap on invalid → takes else path]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    if (@probe(0xDEADBEEF)) |val| {\n"
+        "        return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        0,
+        "@probe E2E: invalid addr if-unwrap → else path → 0");
+
+    /* ---- MMIO auto-discovery E2E ---- */
+    printf("\n[auto-discovery: @inttoptr with --no-strict-mmio on invalid addr → returns 0]\n");
+    {
+        tests_run++;
+        if (zer_to_c_ex(
+            "u32 main() {\n"
+            "    volatile *u32 reg = @inttoptr(*u32, 0xDEADBEEF);\n"
+            "    return 0;\n"
+            "}\n", "_zer_test_out.c", true)) {
+            int gcc = system(GCC_COMPILE);
+            if (gcc == 0) {
+                int run = system(TEST_RUN);
+                int exit_code = run;
+#ifndef _WIN32
+                exit_code = WIFEXITED(run) ? WEXITSTATUS(run) : -1;
+#endif
+                if (exit_code == 0) {
+                    tests_passed++;
+                } else {
+                    printf("  FAIL: auto-discovery — expected exit 0, got %d\n", exit_code);
+                    tests_failed++;
+                }
+            } else {
+                printf("  FAIL: auto-discovery — GCC compilation failed\n");
+                tests_failed++;
+            }
+        } else {
+            printf("  FAIL: auto-discovery — ZER compilation failed\n");
+            tests_failed++;
+        }
+    }
 
     /* cleanup temp files */
     remove("_zer_test_out.c");

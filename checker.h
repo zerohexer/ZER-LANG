@@ -76,6 +76,51 @@ typedef struct {
     struct { char *key; uint32_t key_len; Type *provenance; } *prov_map;
     int prov_map_count;
     int prov_map_capacity;
+
+    /* Value range propagation: tracks {min, max, known_nonzero} per variable.
+     * Stack-based: newer entries shadow older. Save/restore via count. */
+    struct VarRange {
+        const char *name;
+        uint32_t name_len;
+        int64_t min_val;
+        int64_t max_val;
+        bool known_nonzero;
+    } *var_ranges;
+    int var_range_count;
+    int var_range_capacity;
+
+    /* Nodes proven safe by range propagation — emitter skips runtime checks */
+    Node **proven_safe;
+    int proven_safe_count;
+    int proven_safe_capacity;
+
+    /* Auto-guard nodes: unproven array accesses that need auto-inserted bounds guard.
+     * Emitter inserts if (idx >= size) { return <zero>; } before the access. */
+    struct AutoGuard {
+        Node *node;         /* the NODE_INDEX node */
+        uint64_t array_size; /* 0 = slice (use .len at runtime) */
+    } *auto_guards;
+    int auto_guard_count;
+    int auto_guard_capacity;
+
+    /* Cross-function provenance summaries: what provenance a function's return carries */
+    struct ProvSummary {
+        const char *func_name;
+        uint32_t func_name_len;
+        Type *return_provenance;  /* NULL = unknown */
+    } *prov_summaries;
+    int prov_summary_count;
+    int prov_summary_capacity;
+
+    /* Whole-program param provenance: what type each *opaque param expects */
+    struct ParamExpect {
+        const char *func_name;
+        uint32_t func_name_len;
+        int param_index;          /* which parameter */
+        Type *expected_type;      /* what @ptrcast casts it to inside the function */
+    } *param_expects;
+    int param_expect_count;
+    int param_expect_capacity;
 } Checker;
 
 /* ---- API ---- */
@@ -88,5 +133,11 @@ void checker_pop_module_scope(Checker *c); /* pop module scope */
 
 /* returns the resolved Type* for an expression node (set during check) */
 Type *checker_get_type(Checker *c, Node *node);
+
+/* returns true if this node was proven safe by value range propagation */
+bool checker_is_proven(Checker *c, Node *node);
+
+/* returns array_size if this node needs auto-guard, 0 if not */
+uint64_t checker_auto_guard_size(Checker *c, Node *node);
 
 #endif /* ZER_CHECKER_H */

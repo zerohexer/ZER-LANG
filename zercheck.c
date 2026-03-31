@@ -13,6 +13,7 @@
 /* ---- Error reporting ---- */
 
 static void zc_error(ZerCheck *zc, int line, const char *fmt, ...) {
+    if (zc->building_summary) return; /* suppress during summary phase */
     zc->error_count++;
     fprintf(stderr, "%s:%d: zercheck: ", zc->file_name, line);
     va_list args;
@@ -167,6 +168,7 @@ static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
 
 static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node);
 static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node);
+static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node);
 
 /* check if a call is pool.alloc/get/free and track state */
 static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
@@ -204,6 +206,10 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
                         zc_error(zc, node->loc.line,
                             "double free: '%.*s' already freed at line %d",
                             hklen, hkey, h->free_line);
+                    } else if (h->state == HS_MAYBE_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "double free: '%.*s' may have been freed at line %d",
+                            hklen, hkey, h->free_line);
                     }
                     h->state = HS_FREED;
                     h->free_line = node->loc.line;
@@ -234,6 +240,10 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
                     if (h->state == HS_FREED) {
                         zc_error(zc, node->loc.line,
                             "use-after-free: '%.*s' freed at line %d",
+                            hklen, hkey, h->free_line);
+                    } else if (h->state == HS_MAYBE_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "use-after-free: '%.*s' may have been freed at line %d",
                             hklen, hkey, h->free_line);
                     }
                     if (h->pool_id >= 0 && h->pool_id != pool_id) {
@@ -274,6 +284,11 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             int pool_id = register_pool(zc, obj->ident.name,
                 (uint32_t)obj->ident.name_len);
             HandleInfo *h = find_handle(ps, vname, vlen);
+            if (h && h->state == HS_ALIVE) {
+                zc_error(zc, var_node->loc.line,
+                    "handle leak: '%.*s' overwritten while alive (allocated at line %d) — previous handle leaked",
+                    (int)vlen, vname, h->alloc_line);
+            }
             if (!h) h = add_handle(ps, vname, vlen);
             if (h) {
                 h->state = HS_ALIVE;
@@ -310,6 +325,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     switch (node->kind) {
     case NODE_CALL:
         zc_check_call(zc, ps, node);
+        zc_apply_summary(zc, ps, node);
         for (int i = 0; i < node->call.arg_count; i++)
             zc_check_expr(zc, ps, node->call.args[i]);
         break;
@@ -338,6 +354,11 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         if (akey) {
                             memcpy(akey, tkey, tklen + 1);
                             HandleInfo *h = find_handle(ps, akey, (uint32_t)tklen);
+                            if (h && h->state == HS_ALIVE) {
+                                zc_error(zc, node->loc.line,
+                                    "handle leak: '%.*s' overwritten while alive (allocated at line %d) — previous handle leaked",
+                                    tklen, tkey, h->alloc_line);
+                            }
                             if (!h) h = add_handle(ps, akey, (uint32_t)tklen);
                             if (h) {
                                 h->state = HS_ALIVE;
@@ -441,28 +462,33 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             PathState else_state = pathstate_copy(ps);
             zc_check_stmt(zc, &else_state, node->if_stmt.else_body);
 
-            /* merge: only mark freed if freed on BOTH paths (under-approximation) */
+            /* merge: if freed on BOTH → FREED, if freed on ONE → MAYBE_FREED */
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
                 HandleInfo *eh = find_handle(&else_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
-                if (th && eh && th->state == HS_FREED && eh->state == HS_FREED) {
+                if (!th || !eh) continue;
+                bool t_freed = (th->state == HS_FREED || th->state == HS_MAYBE_FREED);
+                bool e_freed = (eh->state == HS_FREED || eh->state == HS_MAYBE_FREED);
+                if (t_freed && e_freed) {
                     ps->handles[i].state = HS_FREED;
                     ps->handles[i].free_line = th->free_line;
+                } else if (t_freed || e_freed) {
+                    ps->handles[i].state = HS_MAYBE_FREED;
+                    ps->handles[i].free_line = t_freed ? th->free_line : eh->free_line;
                 }
             }
             pathstate_free(&else_state);
         } else {
-            /* if without else: merge then-state back (under-approximation:
-             * only mark freed if then-path frees, since we might not take it) */
+            /* if without else: then-branch frees → MAYBE_FREED
+             * (may or may not take the branch) */
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
-                if (th && th->state == HS_FREED) {
-                    /* conservatively keep as ALIVE — under-approx avoids false positives.
-                     * but check: if handle is used after this if, and then-path freed it,
-                     * we can't catch it without full path analysis. Accept this false negative. */
+                if (th && (th->state == HS_FREED || th->state == HS_MAYBE_FREED)) {
+                    ps->handles[i].state = HS_MAYBE_FREED;
+                    ps->handles[i].free_line = th->free_line;
                 }
             }
         }
@@ -486,6 +512,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         PathState pre_loop = pathstate_copy(ps);
         zc_check_stmt(zc, ps, body);
 
+        /* unconditional free inside loop — definite error */
         for (int i = 0; i < ps->handle_count; i++) {
             HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
                                           ps->handles[i].name_len);
@@ -497,6 +524,35 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                     ps->handles[i].alloc_line);
             }
         }
+
+        /* Loop second pass: check if any handle state changed from pre-loop.
+         * If yes, run the body once more. If state still unstable → MAYBE_FREED.
+         * This catches conditional frees that span iterations. */
+        bool state_changed = false;
+        for (int i = 0; i < ps->handle_count; i++) {
+            HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
+                                          ps->handles[i].name_len);
+            if (pre && pre->state != ps->handles[i].state) {
+                state_changed = true;
+                break;
+            }
+        }
+        if (state_changed) {
+            PathState pass2_pre = pathstate_copy(ps);
+            zc_check_stmt(zc, ps, body);
+            /* if state still changing after 2nd pass → widen to MAYBE_FREED */
+            for (int i = 0; i < ps->handle_count; i++) {
+                HandleInfo *p2 = find_handle(&pass2_pre, ps->handles[i].name,
+                                              ps->handles[i].name_len);
+                if (p2 && p2->state != ps->handles[i].state &&
+                    ps->handles[i].state != HS_MAYBE_FREED) {
+                    ps->handles[i].state = HS_MAYBE_FREED;
+                    ps->handles[i].free_line = ps->handles[i].free_line;
+                }
+            }
+            pathstate_free(&pass2_pre);
+        }
+
         pathstate_free(&pre_loop);
         break;
     }
@@ -511,11 +567,13 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
     case NODE_SWITCH: {
         zc_check_expr(zc, ps, node->switch_stmt.expr);
-        /* track which handles are freed in ALL arms (under-approximation) */
+        /* track which handles are freed in each arm */
         bool *freed_all = NULL;
+        bool *freed_any = NULL;
         int *freed_line = NULL;
         if (ps->handle_count > 0 && node->switch_stmt.arm_count > 0) {
             freed_all = calloc(ps->handle_count, sizeof(bool));
+            freed_any = calloc(ps->handle_count, sizeof(bool));
             freed_line = calloc(ps->handle_count, sizeof(int));
             for (int i = 0; i < ps->handle_count; i++) freed_all[i] = true;
         }
@@ -526,24 +584,30 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 for (int j = 0; j < ps->handle_count; j++) {
                     HandleInfo *ah = find_handle(&arm_state, ps->handles[j].name,
                                                  ps->handles[j].name_len);
-                    if (!ah || ah->state != HS_FREED) {
+                    bool arm_freed = ah && (ah->state == HS_FREED || ah->state == HS_MAYBE_FREED);
+                    if (!arm_freed) {
                         freed_all[j] = false;
-                    } else if (i == 0) {
-                        freed_line[j] = ah->free_line;
+                    } else {
+                        freed_any[j] = true;
+                        if (i == 0) freed_line[j] = ah->free_line;
                     }
                 }
             }
             pathstate_free(&arm_state);
         }
-        /* merge: only mark freed if freed in ALL arms */
+        /* merge: ALL arms freed → FREED, SOME arms freed → MAYBE_FREED */
         if (freed_all) {
             for (int j = 0; j < ps->handle_count; j++) {
                 if (freed_all[j]) {
                     ps->handles[j].state = HS_FREED;
                     ps->handles[j].free_line = freed_line[j];
+                } else if (freed_any[j]) {
+                    ps->handles[j].state = HS_MAYBE_FREED;
+                    ps->handles[j].free_line = freed_line[j];
                 }
             }
             free(freed_all);
+            free(freed_any);
             free(freed_line);
         }
         break;
@@ -551,6 +615,148 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
     default:
         break;
+    }
+}
+
+/* ---- Cross-function summary helpers ---- */
+
+static FuncSummary *find_summary(ZerCheck *zc, const char *name, uint32_t name_len) {
+    for (int i = 0; i < zc->summary_count; i++) {
+        if (zc->summaries[i].func_name_len == name_len &&
+            memcmp(zc->summaries[i].func_name, name, name_len) == 0)
+            return &zc->summaries[i];
+    }
+    return NULL;
+}
+
+/* Build a summary for one function: what does it do to its Handle params?
+ * Uses the existing zc_check_stmt walker with error suppression. */
+static void zc_build_summary(ZerCheck *zc, Node *func) {
+    if (!func->func_decl.body) return;
+    if (func->func_decl.param_count == 0) return;
+
+    /* check if any param is Handle(T) */
+    bool has_handle_param = false;
+    for (int i = 0; i < func->func_decl.param_count; i++) {
+        TypeNode *tnode = func->func_decl.params[i].type;
+        if (tnode && tnode->kind == TYNODE_HANDLE) {
+            has_handle_param = true;
+            break;
+        }
+    }
+    if (!has_handle_param) return;
+
+    /* suppress errors during summary phase */
+    zc->building_summary = true;
+
+    PathState ps;
+    pathstate_init(&ps);
+
+    /* register Handle params as ALIVE */
+    for (int i = 0; i < func->func_decl.param_count; i++) {
+        TypeNode *tnode = func->func_decl.params[i].type;
+        if (tnode && tnode->kind == TYNODE_HANDLE) {
+            HandleInfo *h = add_handle(&ps, func->func_decl.params[i].name,
+                (uint32_t)func->func_decl.params[i].name_len);
+            if (h) {
+                h->state = HS_ALIVE;
+                h->pool_id = -1;
+                h->alloc_line = func->loc.line;
+            }
+        }
+    }
+
+    /* walk the body — errors suppressed */
+    zc_check_stmt(zc, &ps, func->func_decl.body);
+
+    /* extract summary: check each param's final state */
+    int pc = func->func_decl.param_count;
+    bool *frees = calloc(pc, sizeof(bool));
+    bool *maybe_frees = calloc(pc, sizeof(bool));
+    for (int i = 0; i < pc; i++) {
+        TypeNode *tnode = func->func_decl.params[i].type;
+        if (!tnode || tnode->kind != TYNODE_HANDLE) continue;
+        HandleInfo *h = find_handle(&ps, func->func_decl.params[i].name,
+            (uint32_t)func->func_decl.params[i].name_len);
+        if (h) {
+            if (h->state == HS_FREED) frees[i] = true;
+            else if (h->state == HS_MAYBE_FREED) maybe_frees[i] = true;
+        }
+    }
+
+    /* store summary */
+    if (zc->summary_count >= zc->summary_capacity) {
+        int new_cap = zc->summary_capacity * 2;
+        if (new_cap < 8) new_cap = 8;
+        FuncSummary *new_s = realloc(zc->summaries, new_cap * sizeof(FuncSummary));
+        if (!new_s) { free(frees); free(maybe_frees); pathstate_free(&ps); zc->building_summary = false; return; }
+        zc->summaries = new_s;
+        zc->summary_capacity = new_cap;
+    }
+    FuncSummary *s = &zc->summaries[zc->summary_count++];
+    s->func_name = func->func_decl.name;
+    s->func_name_len = (uint32_t)func->func_decl.name_len;
+    s->param_count = pc;
+    s->frees_param = frees;
+    s->maybe_frees_param = maybe_frees;
+
+    pathstate_free(&ps);
+    zc->building_summary = false;
+}
+
+/* Apply function summary at a call site: mark handle args as freed/maybe-freed
+ * based on what the callee does to its params. */
+static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
+    if (!call_node || call_node->kind != NODE_CALL) return;
+    Node *callee = call_node->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return;
+
+    FuncSummary *s = find_summary(zc, callee->ident.name,
+        (uint32_t)callee->ident.name_len);
+    if (!s) return;
+
+    int arg_count = call_node->call.arg_count;
+    if (arg_count > s->param_count) arg_count = s->param_count;
+
+    for (int i = 0; i < arg_count; i++) {
+        if (!s->frees_param[i] && !s->maybe_frees_param[i]) continue;
+
+        /* get the handle key for this argument */
+        char hkey[128];
+        int hklen = handle_key_from_expr(call_node->call.args[i], hkey, sizeof(hkey));
+        if (hklen <= 0) continue;
+
+        HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
+        if (!h) continue;
+
+        if (s->frees_param[i]) {
+            if (h->state == HS_FREED) {
+                zc_error(zc, call_node->loc.line,
+                    "double free: '%.*s' freed by call to '%.*s' (already freed at line %d)",
+                    hklen, hkey, (int)s->func_name_len, s->func_name, h->free_line);
+            } else if (h->state == HS_MAYBE_FREED) {
+                zc_error(zc, call_node->loc.line,
+                    "double free: '%.*s' freed by call to '%.*s' (may have been freed at line %d)",
+                    hklen, hkey, (int)s->func_name_len, s->func_name, h->free_line);
+            }
+            h->state = HS_FREED;
+            h->free_line = call_node->loc.line;
+            /* propagate to aliases */
+            for (int j = 0; j < ps->handle_count; j++) {
+                if (&ps->handles[j] != h &&
+                    ps->handles[j].pool_id == h->pool_id &&
+                    ps->handles[j].alloc_line == h->alloc_line &&
+                    ps->handles[j].state == HS_ALIVE) {
+                    ps->handles[j].state = HS_FREED;
+                    ps->handles[j].free_line = call_node->loc.line;
+                }
+            }
+        } else if (s->maybe_frees_param[i]) {
+            if (h->state == HS_ALIVE) {
+                h->state = HS_MAYBE_FREED;
+                h->free_line = call_node->loc.line;
+            }
+        }
     }
 }
 
@@ -613,6 +819,25 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
     }
 
     zc_check_stmt(zc, &ps, func->func_decl.body);
+
+    /* Leak detection: any handle still ALIVE or MAYBE_FREED at function exit
+     * that was allocated inside this function (not a parameter) → warning.
+     * Parameters (alloc_line == func->loc.line, pool_id == -1) are excluded —
+     * the caller is responsible for freeing parameter handles. */
+    for (int i = 0; i < ps.handle_count; i++) {
+        bool is_param = (ps.handles[i].pool_id == -1 && ps.handles[i].alloc_line == (int)func->loc.line);
+        if (is_param) continue;
+        if (ps.handles[i].state == HS_ALIVE) {
+            zc_error(zc, ps.handles[i].alloc_line,
+                "handle leak: '%.*s' allocated but never freed",
+                (int)ps.handles[i].name_len, ps.handles[i].name);
+        } else if (ps.handles[i].state == HS_MAYBE_FREED) {
+            zc_error(zc, ps.handles[i].alloc_line,
+                "handle leak: '%.*s' may not be freed on all paths",
+                (int)ps.handles[i].name_len, ps.handles[i].name);
+        }
+    }
+
     pathstate_free(&ps);
 }
 
@@ -643,7 +868,15 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
         }
     }
 
-    /* check each function and interrupt body */
+    /* pre-scan: build cross-function summaries for all functions with Handle params */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *decl = file_node->file.decls[i];
+        if (decl->kind == NODE_FUNC_DECL) {
+            zc_build_summary(zc, decl);
+        }
+    }
+
+    /* main analysis: check each function and interrupt body */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         if (decl->kind == NODE_FUNC_DECL) {
@@ -657,6 +890,12 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
     }
 
     /* cleanup */
+    for (int i = 0; i < zc->summary_count; i++) {
+        free(zc->summaries[i].frees_param);
+        free(zc->summaries[i].maybe_frees_param);
+    }
+    free(zc->summaries);
+    zc->summaries = NULL;
     free(zc->pools);
     zc->pools = NULL;
 

@@ -1780,3 +1780,23 @@ When `--no-strict-mmio` is set AND `@inttoptr` is used AND no `mmio` ranges decl
 | `test_firmware_patterns2.c` | Round 2 firmware | 41 |
 | `test_firmware_patterns3.c` | Round 3 firmware | 22 |
 | `test_production.c` | Production firmware E2E | 14 |
+
+## Comptime Nested Calls + Global Init (checker.c)
+
+**Nested calls:** `eval_const_expr_subst` handles NODE_CALL via `eval_comptime_call_subst()`. Uses `_comptime_global_scope` to look up callees. Enables `BUF_SIZE()` calling `BIT(3)`.
+
+**Global init:** `u32 mask = BIT(3);` at global scope allowed — check skips `NODE_CALL` when `is_comptime_resolved` is true.
+
+**Limitation:** comptime returns `int64_t` only. No structs/slices/pointers.
+
+## zercheck Struct Copy Aliasing (zercheck.c)
+
+`State s2 = s1` propagates handle tracking. Scans PathState for `"s1.*"` keys, creates `"s2.*"` aliases. Freeing `s1.h` marks `s2.h` FREED via alias propagation. UAF caught.
+
+## Forward Declaration Emission Fix (emitter.c)
+
+Bodyless forward decls emit C prototypes for mutual recursion + extern functions. Skip C stdlib names (puts, printf) to avoid conflicts.
+
+## Session v0.2.1 Final (2026-03-30/31)
+
+525 checker + 233 E2E + 50 zercheck. 4 audit rounds, 4 bugs fixed. Only 2 runtime cases: *opaque from cinclude + INT_MIN/-1. ZER is the only language with @probe MMIO auto-discovery.

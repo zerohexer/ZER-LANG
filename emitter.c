@@ -3205,6 +3205,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         /* comptime functions are compile-time only — no C emission */
         if (decl->func_decl.is_comptime) break;
         if (!decl->func_decl.body) {
+            /* Forward declaration: check if definition exists later in same file */
             bool has_def = false;
             for (int j = decl_index + 1; j < file_node->file.decl_count; j++) {
                 Node *other = file_node->file.decls[j];
@@ -3216,7 +3217,31 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
                     break;
                 }
             }
-            if (!has_def) break;
+            if (has_def) {
+                /* Definition exists later — emit prototype so earlier functions
+                 * can call it (e.g., mutual recursion). */
+                emit_func_decl(e, decl);
+                break;
+            }
+            /* No body in this file — emit C prototype so GCC knows the
+             * return type and parameter types. Without prototype, GCC assumes
+             * int return which fails for bool/struct/optional types.
+             * Skip well-known C stdlib names to avoid conflicting prototypes. */
+            {
+                const char *n = decl->func_decl.name;
+                size_t nl = decl->func_decl.name_len;
+                bool is_cstdlib = (nl == 4 && memcmp(n, "puts", 4) == 0) ||
+                                  (nl == 6 && memcmp(n, "printf", 6) == 0) ||
+                                  (nl == 7 && memcmp(n, "fprintf", 7) == 0) ||
+                                  (nl == 6 && memcmp(n, "malloc", 6) == 0) ||
+                                  (nl == 4 && memcmp(n, "free", 4) == 0) ||
+                                  (nl == 6 && memcmp(n, "memcpy", 6) == 0) ||
+                                  (nl == 6 && memcmp(n, "memset", 6) == 0) ||
+                                  (nl == 7 && memcmp(n, "putchar", 7) == 0) ||
+                                  (nl == 5 && memcmp(n, "fputc", 5) == 0);
+                if (!is_cstdlib) emit_func_decl(e, decl);
+            }
+            break;
         }
         emit_func_decl(e, decl);
         break;

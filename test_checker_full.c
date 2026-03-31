@@ -2704,6 +2704,12 @@ int main(void) {
        "u32 main() { return 0; }\n",
        "comptime nested: BUF_SIZE()=BIT(3)*4=32 as array size");
 
+    printf("[comptime global: BIT(3) at global scope]\n");
+    ok("comptime u32 BIT(u32 n) { return 1 << n; }\n"
+       "u32 mask = BIT(3);\n"
+       "u32 main() { return mask; }\n",
+       "comptime global: u32 mask = BIT(3) at global scope");
+
     printf("[comptime nested: triple nesting]\n");
     ok("comptime u32 A() { return 2; }\n"
        "comptime u32 B() { return A() * 3; }\n"

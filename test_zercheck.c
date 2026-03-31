@@ -649,6 +649,20 @@ int main(void) {
        "}\n",
        "cross-func: wrapper frees — caller clean (no leak, no UAF)");
 
+    /* ---- Struct copy aliasing ---- */
+    printf("\n[struct copy: UAF via copied struct]\n");
+    err("struct T { u32 x; }\n"
+        "struct State { Handle(T) h; }\n"
+        "Pool(T, 4) tasks;\n"
+        "void f() {\n"
+        "    State s1;\n"
+        "    s1.h = tasks.alloc() orelse return;\n"
+        "    State s2 = s1;\n"
+        "    tasks.free(s1.h);\n"
+        "    tasks.get(s2.h).x = 5;\n"
+        "}\n",
+        "struct copy: free s1.h then use s2.h — UAF via alias");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) printf(", %d FAILED", tests_failed);
     printf(" ===\n");

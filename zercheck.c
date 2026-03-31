@@ -315,6 +315,32 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     dst->free_line = src->free_line;
                 }
             }
+            /* Struct copy aliasing: if source has tracked fields like "s1.h",
+             * create aliases "s2.h" for each. Catches UAF via struct copy. */
+            for (int hi = 0; hi < ps->handle_count; hi++) {
+                if (ps->handles[hi].name_len > (uint32_t)sklen + 1 &&
+                    memcmp(ps->handles[hi].name, src_key, sklen) == 0 &&
+                    ps->handles[hi].name[sklen] == '.') {
+                    /* found "s1.field" — create "s2.field" */
+                    const char *suffix = ps->handles[hi].name + sklen;
+                    uint32_t suf_len = ps->handles[hi].name_len - (uint32_t)sklen;
+                    uint32_t new_len = vlen + suf_len;
+                    char *akey = (char *)arena_alloc(zc->arena, new_len + 1);
+                    if (akey) {
+                        memcpy(akey, vname, vlen);
+                        memcpy(akey + vlen, suffix, suf_len);
+                        akey[new_len] = '\0';
+                        HandleInfo *dst = find_handle(ps, akey, new_len);
+                        if (!dst) dst = add_handle(ps, akey, new_len);
+                        if (dst) {
+                            dst->state = ps->handles[hi].state;
+                            dst->pool_id = ps->handles[hi].pool_id;
+                            dst->alloc_line = ps->handles[hi].alloc_line;
+                            dst->free_line = ps->handles[hi].free_line;
+                        }
+                    }
+                }
+            }
         }
     }
 }

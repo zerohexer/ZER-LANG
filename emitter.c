@@ -3447,9 +3447,9 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "static inline uint64_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
             "uint32_t *gen, uint8_t *used, size_t capacity, uint8_t *ok) {\n");
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
-    emit(e, "        if (!used[i] && gen[i] != 0xFFFFFFFFu) {\n");
+    emit(e, "        if (!used[i]) {\n");
     emit(e, "            used[i] = 1;\n");
-    emit(e, "            if (gen[i] == 0) gen[i] = 1; /* zero handle must not match any valid alloc */\n");
+    emit(e, "            if (gen[i] == 0) gen[i] = 1; /* skip 0: reserved for null handle */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -3560,7 +3560,8 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    if (idx < capacity) {\n");
     emit(e, "        used[idx] = 0;\n");
-    emit(e, "        if (gen[idx] < 0xFFFFFFFFu) gen[idx]++;\n");
+    emit(e, "        gen[idx]++;\n");
+    emit(e, "        if (gen[idx] == 0) gen[idx] = 1; /* skip 0: reserved for null handle */\n");
     emit(e, "    }\n");
     emit(e, "}\n\n");
 
@@ -3613,9 +3614,9 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "} _zer_slab;\n\n");
 
     emit(e, "static inline uint64_t _zer_slab_alloc(_zer_slab *s, uint8_t *ok) {\n");
-    emit(e, "    /* scan for free slot — skip retired slots (gen maxed after 2^32 cycles) */\n");
+    emit(e, "    /* scan for free slot */\n");
     emit(e, "    for (uint32_t i = 0; i < s->total_slots; i++) {\n");
-    emit(e, "        if (!s->used[i] && s->gen[i] != 0xFFFFFFFFu) {\n");
+    emit(e, "        if (!s->used[i]) {\n");
     emit(e, "            s->used[i] = 1;\n");
     emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1; /* zero handle must not match */\n");
     emit(e, "            *ok = 1;\n");
@@ -3661,7 +3662,8 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    if (idx < s->total_slots) {\n");
     emit(e, "        s->used[idx] = 0;\n");
-    emit(e, "        if (s->gen[idx] < 0xFFFFFFFFu) s->gen[idx]++;\n");
+    emit(e, "        s->gen[idx]++;\n");
+    emit(e, "        if (s->gen[idx] == 0) s->gen[idx] = 1; /* skip 0: reserved for null handle */\n");
     emit(e, "    }\n");
     emit(e, "}\n\n");
 

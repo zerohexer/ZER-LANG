@@ -1525,8 +1525,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* invalidate value range — reassignment makes old range stale.
                      * Without this: if (i < 10) { i = get_input(); arr[i]; }
                      * would use stale range [0,9] for i after reassignment.
-                     * Override existing range directly (don't intersect). */
+                     * Override existing range directly (don't intersect).
+                     * Also invalidate compound keys (s.x) for struct field assignments. */
                     {
+                        /* simple ident range */
                         struct VarRange *existing = find_var_range(c, troot->ident.name,
                             (uint32_t)troot->ident.name_len);
                         if (existing) {
@@ -1536,10 +1538,29 @@ static Type *check_expr(Checker *c, Node *node) {
                                 existing->max_val = v;
                                 existing->known_nonzero = (v != 0);
                             } else {
-                                /* non-literal → unknown, wipe range */
                                 existing->min_val = INT64_MIN;
                                 existing->max_val = INT64_MAX;
                                 existing->known_nonzero = false;
+                            }
+                        }
+                        /* compound key range (e.g., "s.x" for struct field) */
+                        if (node->assign.target->kind == NODE_FIELD) {
+                            char ckey[128];
+                            int cklen = build_expr_key(node->assign.target, ckey, sizeof(ckey));
+                            if (cklen > 0) {
+                                struct VarRange *cexist = find_var_range(c, ckey, (uint32_t)cklen);
+                                if (cexist) {
+                                    if (node->assign.value->kind == NODE_INT_LIT) {
+                                        int64_t v = (int64_t)node->assign.value->int_lit.value;
+                                        cexist->min_val = v;
+                                        cexist->max_val = v;
+                                        cexist->known_nonzero = (v != 0);
+                                    } else {
+                                        cexist->min_val = INT64_MIN;
+                                        cexist->max_val = INT64_MAX;
+                                        cexist->known_nonzero = false;
+                                    }
+                                }
                             }
                         }
                     }

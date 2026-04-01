@@ -13,6 +13,7 @@
  *        ast.c types.c checker.c zercheck.c
  * ================================================================ */
 
+#define _POSIX_C_SOURCE 200809L /* for strdup, fileno */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -712,9 +713,9 @@ static void format_type(Type *t, char *buf, size_t buf_size) {
         if (t->array.inner) {
             char inner[256];
             format_type(t->array.inner, inner, sizeof(inner));
-            snprintf(buf, buf_size, "%s[%u]", inner, t->array.size);
+            snprintf(buf, buf_size, "%s[%llu]", inner, (unsigned long long)t->array.size);
         } else {
-            snprintf(buf, buf_size, "T[%u]", t->array.size);
+            snprintf(buf, buf_size, "T[%llu]", (unsigned long long)t->array.size);
         }
         break;
     case TYPE_SLICE:
@@ -759,13 +760,13 @@ static void format_type(Type *t, char *buf, size_t buf_size) {
     case TYPE_POOL: {
         char elem[256];
         format_type(t->pool.elem, elem, sizeof(elem));
-        snprintf(buf, buf_size, "Pool(%s, %u)", elem, t->pool.count);
+        snprintf(buf, buf_size, "Pool(%s, %llu)", elem, (unsigned long long)t->pool.count);
         break;
     }
     case TYPE_RING: {
         char elem[256];
         format_type(t->ring.elem, elem, sizeof(elem));
-        snprintf(buf, buf_size, "Ring(%s, %u)", elem, t->ring.count);
+        snprintf(buf, buf_size, "Ring(%s, %llu)", elem, (unsigned long long)t->ring.count);
         break;
     }
     case TYPE_HANDLE: {
@@ -976,8 +977,11 @@ static void handle_hover(int id, const char *params) {
 
         StringBuilder sb;
         sb_init(&sb);
-        sb_append(&sb, "{\"contents\":{\"kind\":\"plaintext\",\"value\":");
-        sb_append_json_string(&sb, hover_text);
+        /* format as markdown code block for syntax highlighting in editor */
+        char md_hover[1200];
+        snprintf(md_hover, sizeof(md_hover), "```zer\n%s\n```", hover_text);
+        sb_append(&sb, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
+        sb_append_json_string(&sb, md_hover);
         sb_append(&sb, "}}");
         lsp_respond(id, sb.buf);
         sb_free(&sb);
@@ -1051,8 +1055,9 @@ static void handle_completion(int id, const char *params) {
         "struct", "packed", "enum", "union", "const", "typedef", "distinct",
         "if", "else", "for", "while", "switch", "break", "continue", "return",
         "default", "orelse", "null", "true", "false",
-        "Pool", "Ring", "Arena", "Handle",
-        "defer", "import", "volatile", "interrupt", "asm", "static", "keep", "as",
+        "Pool", "Ring", "Slab", "Arena", "Handle",
+        "defer", "import", "cinclude", "volatile", "interrupt", "asm", "static",
+        "keep", "as", "comptime", "mmio", "naked", "section",
         NULL
     };
 
@@ -1067,9 +1072,14 @@ static void handle_completion(int id, const char *params) {
 
     /* ZER intrinsics */
     static const char *intrinsics[] = {
-        "@size", "@truncate", "@saturate", "@bitcast",
+        "@size", "@truncate", "@saturate", "@bitcast", "@cast",
         "@ptrcast", "@ptrtoint", "@inttoptr",
-        "@barrier", "@config", "@offset", "@container",
+        "@barrier", "@barrier_store", "@barrier_load",
+        "@offset", "@container",
+        "@trap", "@probe", "@cstr",
+        "@critical", "@atomic_add", "@atomic_sub", "@atomic_or",
+        "@atomic_and", "@atomic_xor", "@atomic_cas",
+        "@atomic_load", "@atomic_store",
         NULL
     };
 

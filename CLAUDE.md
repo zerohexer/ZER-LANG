@@ -348,7 +348,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 
 **Roadmap:**
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
-- **v0.2.1 (CURRENT):** comptime functions + comptime if, mmio range validation + startup @probe validation, @ptrcast/@container provenance tracking, safe intrinsics, zer-convert preprocessor→comptime, FULL SAFETY ROADMAP: value range propagation, bounds auto-guard, forced division guard (incl. struct fields), @cstr auto-orelse, auto-keep on fn ptr params, array-level + whole-program *opaque provenance, zercheck 1-4 (MAYBE_FREED + leaks + loops + cross-func), @probe safe MMIO reads, 400+ bug fixes, 1,500+ tests
+- **v0.2.1 (CURRENT):** comptime functions + comptime if, 4-layer MMIO safety (range + alignment + boot probe + signal() fault handler), @ptrcast/@container provenance tracking, safe intrinsics, zer-convert P0+P1 (volatile, MMIO casts, defined(), suffixes, include guards, stringify extraction), FULL SAFETY ROADMAP: value range propagation, bounds auto-guard, forced division guard (incl. struct fields), @cstr auto-orelse, auto-keep on fn ptr params, array-level + whole-program *opaque provenance, zercheck 1-4 (MAYBE_FREED + leaks + loops + cross-func), @probe safe MMIO reads, interrupt safety (ISR shared-state analysis), stack depth analysis (recursion detection), cross-platform portability warnings, 400+ bug fixes, 1,700+ tests
 - **v0.3:** better error messages, stdlib completion (io/fmt/conv)
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -382,7 +382,7 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 **Pipeline:** `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`
 - Multi-file: each .c converts independently, types shared via `cinclude "header.h"`
 - For full ZER safety: replace `cinclude` with `import` (manual, one line per file)
-- 139 regression tests in `tests/test_convert.sh`
+- 139 regression tests in `tests/test_convert.sh` (was 108, +31 for P0/P1 fixes)
 
 ### Compiler Internals — MANDATORY READING
 

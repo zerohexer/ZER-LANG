@@ -1805,6 +1805,12 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 `State s2 = s1` propagates handle tracking. Scans PathState for `"s1.*"` keys, creates `"s2.*"` aliases. Freeing `s1.h` marks `s2.h` FREED via alias propagation. UAF caught.
 
+## Cross-Platform Portability Warning (checker.c)
+
+`u32 addr = @ptrtoint(ptr)` works on 32-bit but silently loses upper bits on 64-bit. Warning emitted in NODE_VAR_DECL when init is `NODE_INTRINSIC("ptrtoint")` and target type is a fixed-width integer (not `TYPE_USIZE`). Uses `checker_warning()` — code still compiles. Message suggests using `usize` for portability.
+
+Detection: check `type_unwrap_distinct(type)->kind != TYPE_USIZE && init is @ptrtoint`. Fires even when types match on current target (e.g. 32-bit ARM where usize == u32) — the whole point is catching code that WILL break when ported.
+
 ## Interrupt Safety Analysis (checker.c — Pass 4)
 
 Detects unsafe shared state between interrupt handlers and regular code. No other language does this at compile time.
@@ -1842,3 +1848,35 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 ## Session v0.2.1 Final (2026-03-30/31)
 
 525 checker + 233 E2E + 50 zercheck. 4 audit rounds, 4 bugs fixed. Only 2 runtime cases: *opaque from cinclude + INT_MIN/-1. Auto-discovery removed (2026-04-01) — replaced with mmio startup validation via @probe of declared ranges.
+
+## Session v0.2.2 (2026-04-01)
+
+**MMIO redesign:**
+- Removed 5-phase auto-discovery (~150 lines, unreliable, chip-specific)
+- Added mmio startup validation: @probe declared range starts at boot
+- Universal signal() fault handler: replaces all platform-specific handlers. Dual-mode: @probe recovers, normal code traps. Re-installs signal after longjmp (SysV resets to SIG_DFL).
+- @probe takes uintptr_t (was uint32_t — broken on 64-bit)
+- __STDC_HOSTED__ guard: freestanding compiles don't fail (no signal/setjmp)
+- x86 bare-metal included in mmio validation (was ARM/RISC-V/AVR only)
+- @inttoptr alignment check: address must match type alignment (u32=4, u16=2, u64=8)
+- 4-layer MMIO safety: range + alignment + boot probe + runtime fault handler
+
+**New safety categories (13 → 17):**
+- Interrupt safety: shared globals between ISR and main without volatile → error. Compound assign on shared volatile → error (non-atomic race). Pass 4 post-check.
+- Stack depth: call graph DFS, frame size estimation, recursion detection → warning. Pass 5 post-check.
+- @inttoptr alignment: compile-time check, universal
+- Cross-platform @ptrtoint portability: warning when stored in fixed-width type
+
+**zer-convert P0+P1 fixes (108 → 139 tests):**
+- volatile qualifier preserved and reordered
+- extern/inline/restrict/register/__extension__ stripped
+- #if defined(X) → comptime if (X) (expand defined() operator)
+- Number suffixes (U/L/UL/ULL) stripped from literals
+- MMIO casts → @inttoptr (numeric address detection)
+- (uintptr_t)ptr → @ptrtoint (was @truncate)
+- uintptr_t/intptr_t added to type_map
+- Include guard (#ifndef/#define) detection and stripping
+- void ** → **opaque
+- Stringify (#), token paste (##), variadic (__VA_ARGS__) macros → auto-extracted to companion .h
+
+543 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.

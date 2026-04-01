@@ -3364,6 +3364,92 @@ int main(void) {
         0,
         "@probe E2E: invalid addr if-unwrap → else path → 0");
 
+    /* ---- signal() fault handler E2E ---- */
+    printf("\n--- signal() universal fault handler ---\n");
+
+    printf("[fault handler: bad pointer deref → trap, non-zero exit]\n");
+    {
+        tests_run++;
+        if (zer_to_c_ex(
+            "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+            "u32 main() {\n"
+            "    volatile *u32 bad = @inttoptr(*u32, 0xDEADBEEF);\n"
+            "    u32 val = *bad;\n"
+            "    return val;\n"
+            "}\n", "_zer_test_out.c", false)) {
+            int gcc = system(GCC_COMPILE);
+            if (gcc == 0) {
+                int run = system(TEST_RUN " 2>/dev/null");
+                int exit_code = run;
+#ifndef _WIN32
+                exit_code = WIFEXITED(run) ? WEXITSTATUS(run) : -1;
+#endif
+                if (exit_code != 0) {
+                    tests_passed++; /* non-zero = trap fired, correct */
+                } else {
+                    printf("  FAIL: fault handler — expected non-zero exit (trap), got 0\n");
+                    tests_failed++;
+                }
+            } else {
+                printf("  FAIL: fault handler — GCC compilation failed\n");
+                tests_failed++;
+            }
+        } else {
+            printf("  FAIL: fault handler — ZER compilation failed\n");
+            tests_failed++;
+        }
+    }
+
+    printf("[fault handler: normal code not affected → exit 0]\n");
+    test_compile_and_run(
+        "u32 main() {\n"
+        "    u32 x = 42;\n"
+        "    u32 y = x + 1;\n"
+        "    return y - 43;\n"
+        "}\n",
+        0,
+        "fault handler: normal code runs fine → 0");
+
+    printf("[@probe: probe after bad → handler still works]\n");
+    test_compile_and_run(
+        "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+        "u32 main() {\n"
+        "    ?u32 bad = @probe(0xDEADBEEF);\n"
+        "    u32 val = bad orelse 99;\n"
+        "    return val - 99;\n"
+        "}\n",
+        0,
+        "@probe: bad addr → orelse 99 → 99-99=0");
+
+    printf("[@probe: two bad probes then normal code — handler stable]\n");
+    test_compile_and_run(
+        "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+        "u32 main() {\n"
+        "    ?u32 a = @probe(0xDEADBEEF);\n"
+        "    ?u32 b = @probe(0xCAFEBABE);\n"
+        "    u32 x = a orelse 0;\n"
+        "    u32 y = b orelse 0;\n"
+        "    u32 z = 42;\n"
+        "    return x + y + z - 42;\n"
+        "}\n",
+        0,
+        "@probe: two bad probes → null, normal code still works → 0");
+
+    printf("[@probe: multiple bad probes don't crash]\n");
+    test_compile_and_run(
+        "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+        "u32 main() {\n"
+        "    ?u32 a = @probe(0xDEADBEEF);\n"
+        "    ?u32 b = @probe(0xCAFEBABE);\n"
+        "    ?u32 c = @probe(0xBAADF00D);\n"
+        "    u32 x = a orelse 0;\n"
+        "    u32 y = b orelse 0;\n"
+        "    u32 z = c orelse 0;\n"
+        "    return x + y + z;\n"
+        "}\n",
+        0,
+        "@probe: 3 bad addresses → all null → sum is 0");
+
     /* ---- MMIO --no-strict-mmio E2E (auto-discovery removed, plain cast) ---- */
     printf("\n[no-strict-mmio: @inttoptr compiles without mmio declarations]\n");
     {

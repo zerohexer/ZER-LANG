@@ -1963,7 +1963,7 @@ static void emit_expr(Emitter *e, Node *node) {
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
-            emit(e, "_zer_probe((uint32_t)(");
+            emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "))");
@@ -3506,10 +3506,15 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    signal(SIGBUS, _zer_fault_handler);\n");
     emit(e, "#endif\n");
     emit(e, "}\n\n");
-    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uintptr_t addr) {\n");
     emit(e, "    _zer_in_probe = 1;\n");
     emit(e, "    if (setjmp(_zer_probe_jmp) != 0) {\n");
     emit(e, "        _zer_in_probe = 0;\n");
+    emit(e, "        /* re-install handler — signal() resets to SIG_DFL after longjmp on some platforms */\n");
+    emit(e, "        signal(SIGSEGV, _zer_fault_handler);\n");
+    emit(e, "#ifdef SIGBUS\n");
+    emit(e, "        signal(SIGBUS, _zer_fault_handler);\n");
+    emit(e, "#endif\n");
     emit(e, "        return (_zer_opt_u32){ 0, 0 };\n");
     emit(e, "    }\n");
     emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
@@ -3518,7 +3523,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
     emit(e, "}\n\n");
     emit(e, "#else /* freestanding — no signal/setjmp, @probe unavailable */\n");
-    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uintptr_t addr) {\n");
     emit(e, "    /* freestanding: no fault handler, direct read (same as C) */\n");
     emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
     emit(e, "    uint32_t val = *p;\n");
@@ -3683,7 +3688,7 @@ void emit_file(Emitter *e, Node *file_node) {
             for (int i = 0; i < e->checker->mmio_range_count; i++) {
                 if (e->checker->mmio_ranges[i][0] == 0 &&
                     e->checker->mmio_ranges[i][1] >= 0xFFFFFFFF) continue;
-                emit(e, "    if (!_zer_probe(0x%llxu).has_value)\n",
+                emit(e, "    if (!_zer_probe((uintptr_t)0x%llxu).has_value)\n",
                      (unsigned long long)e->checker->mmio_ranges[i][0]);
                 emit(e, "        _zer_trap(\"mmio 0x%llx..0x%llx: no hardware detected\", __FILE__, __LINE__);\n",
                      (unsigned long long)e->checker->mmio_ranges[i][0],

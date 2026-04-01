@@ -399,12 +399,18 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                 if (src && !src->is_static && !is_global) return true;
             }
         }
-        /* local-derived ident */
+        /* local-derived ident OR local array (array→slice coercion) */
         if (arg->kind == NODE_IDENT) {
             Symbol *src = scope_lookup(c->current_scope,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
             if (src && (src->is_local_derived || src->is_arena_derived))
                 return true;
+            /* local array passed as slice → points to stack */
+            if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
+                bool is_global = scope_lookup_local(c->global_scope,
+                    arg->ident.name, (uint32_t)arg->ident.name_len) != NULL;
+                if (!src->is_static && !is_global) return true;
+            }
         }
         /* nested call returning pointer — recurse */
         if (arg->kind == NODE_CALL) {
@@ -4152,6 +4158,27 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* @cstr local-derived: p = @cstr(local_buf, "hi") → p is local-derived */
+            if (sym && node->var_decl.init &&
+                node->var_decl.init->kind == NODE_INTRINSIC &&
+                node->var_decl.init->intrinsic.name_len == 4 &&
+                memcmp(node->var_decl.init->intrinsic.name, "cstr", 4) == 0 &&
+                node->var_decl.init->intrinsic.arg_count > 0) {
+                Node *buf = node->var_decl.init->intrinsic.args[0];
+                while (buf && (buf->kind == NODE_FIELD || buf->kind == NODE_INDEX)) {
+                    if (buf->kind == NODE_FIELD) buf = buf->field.object;
+                    else buf = buf->index_expr.object;
+                }
+                if (buf && buf->kind == NODE_IDENT) {
+                    Symbol *bsym = scope_lookup(c->current_scope,
+                        buf->ident.name, (uint32_t)buf->ident.name_len);
+                    bool is_global = scope_lookup_local(c->global_scope,
+                        buf->ident.name, (uint32_t)buf->ident.name_len) != NULL;
+                    if (bsym && !bsym->is_static && !is_global)
+                        sym->is_local_derived = true;
+                }
+            }
+
             /* @container provenance: track struct+field when ptr = &struct.field */
             if (sym && node->var_decl.init) {
                 Node *init = node->var_decl.init;
@@ -4180,7 +4207,7 @@ static void check_stmt(Checker *c, Node *node) {
              * Applies to BOTH pointer results AND struct results (struct may
              * contain pointer fields carrying the local pointer). */
             if (sym && node->var_decl.init && type &&
-                (type->kind == TYPE_POINTER || type->kind == TYPE_STRUCT)) {
+                (type->kind == TYPE_POINTER || type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE)) {
                 Node *call = node->var_decl.init;
                 if (call->kind == NODE_ORELSE) call = call->orelse.expr;
                 /* BUG-383: walk through field/index to find call root */
@@ -5169,7 +5196,7 @@ static void check_stmt(Checker *c, Node *node) {
              * may be local-derived. BUG-374: recurse into nested calls —
              * return identity(identity(&x)) must also be caught. */
             if (node->ret.expr->kind == NODE_CALL &&
-                ret_type && ret_type->kind == TYPE_POINTER) {
+                ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
                 if (call_has_local_derived_arg(c, node->ret.expr, 0)) {
                     checker_error(c, node->loc.line,
                         "cannot return result of call with local-derived pointer argument — "
@@ -5178,10 +5205,10 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             /* BUG-383: return wrap(&x).p — struct wrapper bypasses BUG-360 because
-             * the function returns a struct, not a pointer. Walk through field/index
+             * the function returns a struct, not a pointer/slice. Walk through field/index
              * chains to find if root is a NODE_CALL with local-derived args.
-             * Only when the final return type is a pointer (extracted via .field). */
-            if (ret_type && ret_type->kind == TYPE_POINTER) {
+             * Fires when the final return type is a pointer OR slice. */
+            if (ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
                 Node *rroot = node->ret.expr;
                 while (rroot && (rroot->kind == NODE_FIELD || rroot->kind == NODE_INDEX)) {
                     if (rroot->kind == NODE_FIELD) rroot = rroot->field.object;

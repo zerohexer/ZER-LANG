@@ -2213,3 +2213,15 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `call_has_local_derived_arg` checked NODE_UNARY(&), NODE_IDENT, NODE_CALL, NODE_FIELD — but not NODE_ORELSE. Orelse fallback `&x` was invisible to the escape walker.
 - **Fix:** Added NODE_ORELSE case in `call_has_local_derived_arg`: checks fallback for direct `&local` and local-derived idents.
 - **Test:** 1 new checker test.
+
+### @cstr local-derived not propagated
+- **Symptom:** `*u8 p = @cstr(local_buf, "hi"); return identity(p);` — pointer to local buffer escapes. `p` not marked local-derived from @cstr.
+- **Root cause:** NODE_VAR_DECL only checked `&local` and NODE_CALL for local-derived init. `@cstr(local, ...)` is NODE_INTRINSIC — not checked.
+- **Fix:** Added NODE_INTRINSIC("cstr") case in var-decl: walks first arg (buffer) to root ident, marks local-derived if local.
+- **Test:** 1 new checker test.
+
+### Slice escape via struct wrapper not caught
+- **Symptom:** `return wrap(local_array).data` — slice pointing to stack escapes via struct field. BUG-383 only checked TYPE_POINTER returns, not TYPE_SLICE.
+- **Root cause:** Two gaps: (1) BUG-360/383 return checks used `ret_type->kind == TYPE_POINTER` — slices excluded. (2) `call_has_local_derived_arg` didn't detect local arrays passed as slice args (array→slice coercion).
+- **Fix:** (1) Extended return checks to `TYPE_POINTER || TYPE_SLICE`. (2) Added TYPE_ARRAY check in `call_has_local_derived_arg` — local array passed to function treated as local-derived. (3) Var-decl local-derived marking extended to TYPE_SLICE results.
+- **Test:** 1 new checker test.

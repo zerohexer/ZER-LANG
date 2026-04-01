@@ -2813,6 +2813,24 @@ int main(void) {
        "*u32 safe() { return wrap(&g).p; }\n",
        "struct escape: global pointer — no escape, OK");
 
+    printf("[struct escape: @cstr local-derived → error]\n");
+    err("*u8 identity(*u8 p) { return p; }\n"
+        "*u8 leak() {\n"
+        "    u8[10] local;\n"
+        "    *u8 p = @cstr(local, \"hi\");\n"
+        "    return identity(p);\n"
+        "}\n",
+        "@cstr escape: p = @cstr(local,...) is local-derived");
+
+    printf("[struct escape: slice via struct wrapper → error]\n");
+    err("struct Box { []u8 data; }\n"
+        "Box wrap([]u8 d) { Box b; b.data = d; return b; }\n"
+        "[]u8 leak() {\n"
+        "    u8[10] local;\n"
+        "    return wrap(local).data;\n"
+        "}\n",
+        "slice escape: wrap(local_array).data caught");
+
     printf("[struct escape: identity(opt orelse &x) → error]\n");
     err("*u32 identity(*u32 p) { return p; }\n"
         "*u32 leak(?*u32 opt) {\n"

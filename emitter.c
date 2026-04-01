@@ -3481,6 +3481,12 @@ void emit_file(Emitter *e, Node *file_node) {
      * No platform-specific #ifdef. Works on any OS and bare-metal with libc.
      * Dual-mode: during @probe → recover and return null.
      *            during normal code → trap with error message (catches bad MMIO). */
+    /* Universal fault handler + @probe.
+     * Hosted C (any OS, bare-metal with newlib/picolibc): uses signal() + setjmp().
+     * Freestanding C (no libc): fault handler not installed, @probe unavailable.
+     * __STDC_HOSTED__ is defined by GCC: 1 = hosted, 0 = freestanding.
+     * Guard all signal/setjmp usage so freestanding compiles don't fail. */
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1\n");
     emit(e, "#include <setjmp.h>\n");
     emit(e, "#include <signal.h>\n\n");
     emit(e, "/* Universal memory fault handler — catches bad MMIO at runtime */\n");
@@ -3488,14 +3494,11 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "static jmp_buf _zer_probe_jmp;\n\n");
     emit(e, "static void _zer_fault_handler(int sig) {\n");
     emit(e, "    if (_zer_in_probe) {\n");
-    emit(e, "        /* inside @probe — recover, return null */\n");
     emit(e, "        longjmp(_zer_probe_jmp, 1);\n");
     emit(e, "    }\n");
-    emit(e, "    /* normal code — bad MMIO access, trap with message */\n");
     emit(e, "    (void)sig;\n");
     emit(e, "    _zer_trap(\"memory access fault — invalid MMIO or pointer\", __FILE__, __LINE__);\n");
     emit(e, "}\n\n");
-    emit(e, "/* Install fault handler at startup — runs before main() */\n");
     emit(e, "__attribute__((constructor))\n");
     emit(e, "static void _zer_install_fault_handler(void) {\n");
     emit(e, "    signal(SIGSEGV, _zer_fault_handler);\n");
@@ -3503,7 +3506,6 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    signal(SIGBUS, _zer_fault_handler);\n");
     emit(e, "#endif\n");
     emit(e, "}\n\n");
-    emit(e, "/* @probe: safe MMIO read — returns ?u32, null if address faults */\n");
     emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
     emit(e, "    _zer_in_probe = 1;\n");
     emit(e, "    if (setjmp(_zer_probe_jmp) != 0) {\n");
@@ -3515,6 +3517,14 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    _zer_in_probe = 0;\n");
     emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
     emit(e, "}\n\n");
+    emit(e, "#else /* freestanding — no signal/setjmp, @probe unavailable */\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "    /* freestanding: no fault handler, direct read (same as C) */\n");
+    emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
+    emit(e, "    uint32_t val = *p;\n");
+    emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
+    emit(e, "}\n");
+    emit(e, "#endif /* __STDC_HOSTED__ */\n\n");
 
     /* safe shift — ZER spec: shift by >= width returns 0 (not UB like C).
      * Uses GCC statement expression to evaluate b exactly once. */

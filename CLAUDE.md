@@ -354,12 +354,19 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 **`tools/zer-convert.c`** — Phase 1: C syntax → ZER syntax (token-level transform)
 - Types, operators, casts, sizeof, struct/enum/union keyword removal
 - switch/case/break → ZER `.VALUE => {}` syntax (nested, multi-case fallthrough)
-- typedef struct → struct Name, do-while → while(true), void* → *opaque
+- typedef struct → struct Name, do-while → while(true), void* → *opaque, void** → **opaque
 - Pointer decl rearrangement: `int *ptr` → `*i32 ptr` (multi-level, return types)
 - Usage scanner `classify_params`: char* → []u8 (string), ?*u8 (nullable), *u8 (write-through)
 - Pointer arithmetic: `ptr + N` → `ptr[N..]`, `*(ptr + N)` → `ptr[N]`
 - Auto-extraction: ternary/goto/bitfields/asm → companion `_extract.h` via cinclude
 - Preprocessor → comptime: `#define MAX(a,b)` → `comptime u32 MAX(u32 a, u32 b)`, `#ifdef` → `comptime if`, `#endif` → `}`, `#define GUARD` → `const bool GUARD = true;`
+- Qualifier handling: `volatile` preserved and reordered, `extern`/`inline`/`restrict`/`register` stripped
+- MMIO casts: `(uint32_t*)0xADDR` → `@inttoptr(*u32, 0xADDR)`, `(volatile uint32_t*)0xADDR` same
+- Pointer-to-int: `(uintptr_t)ptr` → `@ptrtoint(ptr)`, `uintptr_t`/`intptr_t` → `usize`
+- Number suffixes: C suffixes (U, L, UL, ULL) stripped from literals
+- Include guards: `#ifndef FOO_H / #define FOO_H` detected and stripped
+- Unconvertible macros: stringify (`#`), token paste (`##`), variadic (`__VA_ARGS__`) → `// MANUAL:` comment
+- `#if defined(X)` → `comptime if (X)` (expands `defined()` operator)
 
 **`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
 - Layer 1: strlen→.len, strcmp→bytes_equal/bytes_compare, memcpy→bytes_copy, memset→bytes_zero, strcpy/strncpy→@cstr
@@ -369,7 +376,7 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 **Pipeline:** `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`
 - Multi-file: each .c converts independently, types shared via `cinclude "header.h"`
 - For full ZER safety: replace `cinclude` with `import` (manual, one line per file)
-- 102 regression tests in `tests/test_convert.sh`
+- 139 regression tests in `tests/test_convert.sh`
 
 ### Compiler Internals — MANDATORY READING
 

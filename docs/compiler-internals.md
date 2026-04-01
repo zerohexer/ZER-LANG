@@ -622,12 +622,14 @@ Two tools + one library for automated C-to-ZER migration:
 - Operators: `i++`→`i += 1`, `NULL`→`null`, `->`→`.`
 - Memory: `malloc`→`zer_malloc_bytes`, `free`→`zer_free`
 - Strings: `strlen`→`zer_strlen`, `strcmp`→`zer_strcmp`, `memcpy`→`zer_memcpy`
-- Casts: `(Type *)expr`→`@ptrcast(*Type, expr)`, `(int)x`→`@truncate(i32, x)`
+- Casts: `(Type *)expr`→`@ptrcast(*Type, expr)`, `(int)x`→`@truncate(i32, x)`, `(uintptr_t)ptr`→`@ptrtoint(ptr)`
+- MMIO casts: `(uint32_t*)0x40020000`→`@inttoptr(*u32, 0x40020000)`, `(volatile uint32_t*)0xADDR`→`@inttoptr(*u32, 0xADDR)`
 - sizeof: `sizeof(Type *)`→`@size(*Type)`, inside cast args too
+- Qualifiers: `volatile` preserved and reordered (`volatile uint32_t *`→`volatile *u32`), `extern`/`inline`/`restrict`/`register`/`__extension__` stripped
 - Preprocessor: `#include`→`cinclude`, `#define N 42`→`const u32 N = 42;`
 - Struct: `struct Node` in usage→`Node` (keeps `struct` in declarations)
 - Enum: `enum State` in usage→`State` (keeps `enum` in declarations)
-- void*: `void *`→`*opaque`, `(void *)expr`→`@ptrcast(*opaque, expr)`
+- void*: `void *`→`*opaque`, `void **`→`**opaque`, `(void *)expr`→`@ptrcast(*opaque, expr)`
 - Arrays: `int arr[10]`→`i32[10] arr` (ZER size-before-name reorder)
 - switch: `case VAL: ... break;`→`.VAL => { ... }`, `default:`→`default => {`
 - do-while: `do { body } while(cond);`→`while (true) { body if (!(cond)) { break; } }`
@@ -643,7 +645,19 @@ Two tools + one library for automated C-to-ZER migration:
 - `tag_maps[]` records typedef struct tag→name mappings. `lookup_tag()` resolves bare tag names in body and usage. Both `struct tag_name` usage (via struct handler) and bare `tag_name` usage (via identifier fallthrough) are resolved.
 - `typedef struct` handler neutralizes the post-`}` typedef name and `;` tokens, then jumps `i` to `{` so the normal transform loop handles body contents (enabling type transforms inside struct bodies).
 - do-while body is emitted with inline transforms (++, --, ->, NULL, type mapping) since the token-level approach can't easily recurse the full transform on a sub-range.
-- 75 regression tests in `tests/test_convert.sh`, integrated into `make check`.
+- Number suffixes: C suffixes (U, L, UL, ULL, u, l) stripped from numeric literals during emission
+- Include guards: `#ifndef FOO_H / #define FOO_H` pattern detected and stripped (ZER uses import)
+- Stringify/token-paste macros (`#`, `##`): detected in macro body, emit as `// MANUAL:` comment instead of invalid comptime
+- Variadic macros (`...`, `__VA_ARGS__`): detected in params/body, emit as `// MANUAL:` comment
+- Types: `uintptr_t`→`usize`, `intptr_t`→`usize` added to type_map
+- Keyword stripping (`extern`, `inline`, `restrict`, `register`, `__extension__`, `__inline__`, `__restrict__`) is early in the main loop — before type mapping. Just skips the token.
+- `volatile` handling is also before type mapping. Detects `volatile TYPE *` → reorders to `volatile *TYPE`. For non-pointer `volatile TYPE` → emits `volatile TYPE`.
+- MMIO detection in cast handler: after recognizing `(TYPE*)` or `(volatile TYPE*)`, peeks at the operand. If numeric literal → emits `@inttoptr` instead of `@ptrcast`. Works for both direct `0x40020000` and parenthesized `(0x40020000)`.
+- `(uintptr_t)` cast uses `use_ptrtoint` flag — emits `@ptrtoint(expr)` instead of `@truncate(usize, expr)`. Requires `uintptr_t` in type_map (len=9, not 10!).
+- Include guard detection runs before `#ifndef` handler. Peeks ahead for `#define SAME_NAME` with empty body on next line. If found, emits comment and skips both lines. Otherwise falls through to normal `#ifndef` → `comptime if`.
+- Stringify/variadic detection runs before comptime emission. Scans past params to `)`, then scans body for `CT_HASH` or `__VA_ARGS__`. Also scans params for `...` (three `CT_DOT` tokens). If found, emits `// MANUAL:` comment line instead of comptime function.
+- `emit_tok()` strips C number suffixes (U/L/UL/ULL) from `CT_NUMBER` tokens by trimming trailing u/U/l/L chars before writing.
+- 139 regression tests in `tests/test_convert.sh`, integrated into `make check`.
 
 **`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
 - Layer 1: `zer_strlen(s)`→`s.len`, `zer_strcmp(a,b)==0`→`bytes_equal(a,b)`, `zer_memcpy`→`bytes_copy`, `zer_memset(d,0,n)`→`bytes_zero(d)`, `zer_exit`→`@trap()`

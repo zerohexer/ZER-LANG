@@ -3373,7 +3373,7 @@ int main(void) {
         if (zer_to_c_ex(
             "mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
             "u32 main() {\n"
-            "    volatile *u32 bad = @inttoptr(*u32, 0xDEADBEEF);\n"
+            "    volatile *u32 bad = @inttoptr(*u32, 0xDEADBEE0);\n"
             "    u32 val = *bad;\n"
             "    return val;\n"
             "}\n", "_zer_test_out.c", false)) {
@@ -3456,7 +3456,7 @@ int main(void) {
         tests_run++;
         if (zer_to_c_ex(
             "u32 main() {\n"
-            "    volatile *u32 reg = @inttoptr(*u32, 0xDEADBEEF);\n"
+            "    volatile *u32 reg = @inttoptr(*u32, 0xDEADBEE0);\n"
             "    return 0;\n"
             "}\n", "_zer_test_out.c", true)) {
             int gcc = system(GCC_COMPILE);

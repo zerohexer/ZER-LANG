@@ -2696,6 +2696,56 @@ int main(void) {
     err("void f() { @probe(); }",
         "@probe: no args rejected");
 
+    /* ---- @inttoptr alignment check ---- */
+    printf("\n[@inttoptr alignment: u32 at misaligned address → error]\n");
+    err("mmio 0x40020000..0x40020FFF;\n"
+        "void f() {\n"
+        "    volatile *u32 reg = @inttoptr(*u32, 0x40020001);\n"
+        "}\n",
+        "@inttoptr alignment: u32 at 0x40020001 (not 4-byte aligned)");
+
+    printf("[@inttoptr alignment: u16 at odd address → error]\n");
+    err("mmio 0x40020000..0x40020FFF;\n"
+        "void f() {\n"
+        "    volatile *u16 reg = @inttoptr(*u16, 0x40020001);\n"
+        "}\n",
+        "@inttoptr alignment: u16 at 0x40020001 (not 2-byte aligned)");
+
+    printf("[@inttoptr alignment: u32 at aligned address → ok]\n");
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "void f() {\n"
+       "    volatile *u32 reg = @inttoptr(*u32, 0x40020000);\n"
+       "}\n",
+       "@inttoptr alignment: u32 at 0x40020000 (4-byte aligned OK)");
+
+    printf("[@inttoptr alignment: u16 at even address → ok]\n");
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "void f() {\n"
+       "    volatile *u16 reg = @inttoptr(*u16, 0x40020002);\n"
+       "}\n",
+       "@inttoptr alignment: u16 at 0x40020002 (2-byte aligned OK)");
+
+    printf("[@inttoptr alignment: u8 at any address → ok]\n");
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "void f() {\n"
+       "    volatile *u8 reg = @inttoptr(*u8, 0x40020001);\n"
+       "}\n",
+       "@inttoptr alignment: u8 at 0x40020001 (1-byte aligned OK)");
+
+    printf("[@inttoptr alignment: u64 at 4-byte aligned → error]\n");
+    err("mmio 0x40020000..0x40020FFF;\n"
+        "void f() {\n"
+        "    volatile *u64 reg = @inttoptr(*u64, 0x40020004);\n"
+        "}\n",
+        "@inttoptr alignment: u64 at 0x40020004 (not 8-byte aligned)");
+
+    printf("[@inttoptr alignment: u64 at 8-byte aligned → ok]\n");
+    ok("mmio 0x40020000..0x40020FFF;\n"
+       "void f() {\n"
+       "    volatile *u64 reg = @inttoptr(*u64, 0x40020008);\n"
+       "}\n",
+       "@inttoptr alignment: u64 at 0x40020008 (8-byte aligned OK)");
+
     /* ---- Nested comptime calls ---- */
     printf("\n[comptime nested: BUF_SIZE calls BIT]\n");
     ok("comptime u32 BIT(u32 n) { return 1 << n; }\n"

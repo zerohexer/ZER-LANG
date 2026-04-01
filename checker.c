@@ -3329,6 +3329,19 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "@inttoptr address 0x%llx is outside all declared mmio ranges",
                                 (unsigned long long)addr);
                         }
+                        /* alignment check: constant address must be aligned to target type */
+                        if (result) {
+                            Type *inner = type_unwrap_distinct(result);
+                            if (inner->kind == TYPE_POINTER && inner->pointer.inner) {
+                                int w = type_width(inner->pointer.inner);
+                                int align = w > 0 ? w / 8 : 0;
+                                if (align > 1 && (addr % (uint64_t)align) != 0) {
+                                    checker_error(c, node->loc.line,
+                                        "@inttoptr address 0x%llx is not aligned to %d bytes (required for %s)",
+                                        (unsigned long long)addr, align, type_name(inner->pointer.inner));
+                                }
+                            }
+                        }
                     } }
                 }
             } else {

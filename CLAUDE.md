@@ -251,7 +251,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
-| Invalid MMIO address | `mmio` declarations (compile-time) + startup @probe validation of declared ranges (boot-time) + `--no-strict-mmio` for unchecked access |
+| Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + startup @probe validation (boot-time) + `--no-strict-mmio` for unchecked access |
 | Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
 | Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |

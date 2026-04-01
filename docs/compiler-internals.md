@@ -1767,10 +1767,11 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 **@probe remains as standalone intrinsic** for manual hardware discovery. `@probe(addr)` → `?u32`, safe read. Takes `uintptr_t` (was `uint32_t` — fixed for 64-bit systems).
 
-**3-layer MMIO safety (final design):**
+**4-layer MMIO safety (final design):**
 1. **Compile-time:** `mmio` declarations validate `@inttoptr` addresses (100%, zero cost)
-2. **Boot-time:** `_zer_mmio_validate()` probes declared range starts (catches wrong datasheet)
-3. **Runtime:** universal `signal()` fault handler catches bad registers within ranges (zero per-access cost, fires only on CPU fault)
+2. **Compile-time:** alignment check — `@inttoptr(*u32, 0x40020001)` rejected (u32 needs 4-byte alignment). Universal, based on `type_width()`, works for all integer/float types. u8=any, u16=2, u32=4, u64=8.
+3. **Boot-time:** `_zer_mmio_validate()` probes declared range starts (catches wrong datasheet)
+4. **Runtime:** universal `signal()` fault handler catches bad registers within ranges (zero per-access cost, fires only on CPU fault)
 
 ## Test Counts (v0.2.1 final)
 

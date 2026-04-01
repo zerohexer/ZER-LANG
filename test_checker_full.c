@@ -2847,6 +2847,17 @@ int main(void) {
         "}\n",
         "orelse escape: identity(opt orelse &local) caught");
 
+    printf("[struct escape: identity(h.p) where h is local-derived → error]\n");
+    err("struct Holder { *u32 p; }\n"
+        "*u32 identity(*u32 p) { return p; }\n"
+        "*u32 leak() {\n"
+        "    u32 x = 5;\n"
+        "    Holder h;\n"
+        "    h.p = &x;\n"
+        "    return identity(h.p);\n"
+        "}\n",
+        "field escape: identity(h.p) where h local-derived caught");
+
     printf("[struct escape: nested orelse o1 orelse o2 orelse &x → error]\n");
     err("*u32 identity(*u32 p) { return p; }\n"
         "*u32 leak(?*u32 o1, ?*u32 o2) {\n"

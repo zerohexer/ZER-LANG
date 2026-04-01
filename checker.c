@@ -503,6 +503,13 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                 if (call_has_local_derived_arg(c, froot, depth + 1))
                     return true;
             }
+            /* field of local-derived struct: identity(h.p) where h is local-derived */
+            if (froot && froot->kind == NODE_IDENT && froot != arg) {
+                Symbol *src = scope_lookup(c->current_scope,
+                    froot->ident.name, (uint32_t)froot->ident.name_len);
+                if (src && (src->is_local_derived || src->is_arena_derived))
+                    return true;
+            }
         }
     }
     return false;

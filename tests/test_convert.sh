@@ -395,6 +395,116 @@ check_phase2 "comment not transformed" \
 void f() { usize n = zer_strlen(s); }' \
     "// zer_strlen(data)"
 
+# === P0 fixes: volatile, extern/inline/restrict, #if defined, number suffixes, MMIO ===
+
+echo "--- P0: keyword stripping ---"
+
+check_phase1 "extern stripped" \
+    'extern void foo(int x);' \
+    "void foo(i32 x)"
+
+check_phase1 "inline stripped" \
+    'inline int square(int x) { return x * x; }' \
+    "i32 square(i32 x)"
+
+check_phase1 "restrict stripped" \
+    'void copy(int *restrict dst, int *restrict src) {}' \
+    "void copy("
+
+check_phase1_absent "restrict not in output" \
+    'void copy(int *restrict dst) {}' \
+    "restrict"
+
+check_phase1 "register stripped" \
+    'register int i = 0;' \
+    "i32 i = 0"
+
+check_phase1 "__extension__ stripped" \
+    '__extension__ int x = 5;' \
+    "i32 x = 5"
+
+echo "--- P0: volatile qualifier ---"
+
+check_phase1 "volatile uint32_t *reg" \
+    'volatile uint32_t *reg;' \
+    "volatile *u32 reg"
+
+check_phase1 "volatile int var" \
+    'volatile int status;' \
+    "volatile i32"
+
+echo "--- P0: #if defined() expansion ---"
+
+check_phase1 "#if defined(X) expanded" \
+    '#if defined(DEBUG)
+int x;
+#endif' \
+    "comptime if (DEBUG)"
+
+check_phase1_absent "#if defined — no 'defined' in output" \
+    '#if defined(FEATURE)
+int x;
+#endif' \
+    "defined("
+
+check_phase1 "#if !defined(X) expanded" \
+    '#if !defined(GUARD_H)
+int y;
+#endif' \
+    "comptime if (!GUARD_H)"
+
+check_phase1 "#if defined X (no parens)" \
+    '#if defined FOO
+int z;
+#endif' \
+    "comptime if (FOO)"
+
+check_phase1 "#elif defined(X) expanded" \
+    '#if defined(A)
+int a;
+#elif defined(B)
+int b;
+#endif' \
+    "comptime if (B)"
+
+echo "--- P0: number suffix stripping ---"
+
+check_phase1 "0xFFU suffix stripped" \
+    'int x = 0xFFU;' \
+    "0xFF"
+
+check_phase1_absent "UL suffix not in output" \
+    'long x = 100UL;' \
+    "UL"
+
+check_phase1_absent "ULL suffix not in output" \
+    'long long x = 100ULL;' \
+    "ULL"
+
+check_phase1 "0xDEADBEEFu stripped" \
+    'unsigned int x = 0xDEADBEEFu;' \
+    "0xDEADBEEF"
+
+echo "--- P0: MMIO @inttoptr ---"
+
+check_phase1 "(uint32_t*)0x40020000 → @inttoptr" \
+    'uint32_t *reg = (uint32_t *)0x40020000;' \
+    "@inttoptr(*u32, 0x40020000)"
+
+check_phase1 "(volatile uint32_t*)0x40020014 → @inttoptr" \
+    'volatile uint32_t *reg = (volatile uint32_t *)0x40020014;' \
+    "@inttoptr(*u32, 0x40020014)"
+
+echo "--- P0: (uintptr_t)ptr → @ptrtoint ---"
+
+check_phase1 "(uintptr_t)ptr → @ptrtoint" \
+    'uintptr_t addr = (uintptr_t)ptr;' \
+    "@ptrtoint(ptr)"
+
+check_phase1_absent "no @truncate for uintptr_t cast" \
+    'uintptr_t addr = (uintptr_t)ptr;' \
+    "@truncate"
+
 echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"

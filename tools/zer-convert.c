@@ -244,6 +244,8 @@ static const TypeMap type_map[] = {
     { "int32_t",  7, "i32" },
     { "int64_t",  7, "i64" },
     { "size_t",   6, "usize" },
+    { "uintptr_t", 9, "usize" },
+    { "intptr_t",  8, "usize" },
     { "float",    5, "f32" },
     { "double",   6, "f64" },
     { "char",     4, "u8" },
@@ -751,6 +753,16 @@ static void emit_str(const char *s) {
 }
 
 static void emit_tok(CToken *t) {
+    /* strip C number suffixes (U, L, UL, ULL, LL, u, l) from numeric literals */
+    if (t->type == CT_NUMBER) {
+        int len = t->len;
+        while (len > 0 && (t->start[len-1] == 'u' || t->start[len-1] == 'U' ||
+               t->start[len-1] == 'l' || t->start[len-1] == 'L'))
+            len--;
+        if (len > 0) fwrite(t->start, 1, len, out);
+        else fwrite(t->start, 1, t->len, out); /* safety: don't emit empty */
+        return;
+    }
     fwrite(t->start, 1, t->len, out);
 }
 
@@ -1087,12 +1099,33 @@ static void transform(void) {
                     i = j;
                     continue;
                 }
-                /* #if expr → comptime if (expr) { */
+                /* #if expr → comptime if (expr) {
+                 * Expand defined(X) → X and defined X → X in the expression */
                 if (tok_eq(&tokens[j], "if")) {
                     emit_str("comptime if (");
                     j++;
                     j = skip_ws(j);
                     while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                        /* expand defined(X) → X or defined X → X */
+                        if (tokens[j].type == CT_IDENT && tok_eq(&tokens[j], "defined")) {
+                            int d = skip_spaces(j + 1);
+                            if (d < token_count && tokens[d].type == CT_LPAREN) {
+                                /* defined(X) → X */
+                                int e = skip_spaces(d + 1);
+                                if (e < token_count && tokens[e].type == CT_IDENT) {
+                                    emit_tok(&tokens[e]);
+                                    int f = skip_spaces(e + 1);
+                                    if (f < token_count && tokens[f].type == CT_RPAREN) j = f + 1;
+                                    else j = e + 1;
+                                    continue;
+                                }
+                            } else if (d < token_count && tokens[d].type == CT_IDENT) {
+                                /* defined X → X */
+                                emit_tok(&tokens[d]);
+                                j = d + 1;
+                                continue;
+                            }
+                        }
                         emit_tok(&tokens[j]);
                         j++;
                     }
@@ -1101,12 +1134,30 @@ static void transform(void) {
                     i = j;
                     continue;
                 }
-                /* #elif expr → } else comptime if (expr) { — emit as comment for now */
+                /* #elif expr → } else comptime if (expr) {
+                 * Same defined() expansion as #if */
                 if (tok_eq(&tokens[j], "elif")) {
                     emit_str("} else {\ncomptime if (");
                     j++;
                     j = skip_ws(j);
                     while (j < token_count && tokens[j].type != CT_NEWLINE && tokens[j].type != CT_EOF) {
+                        if (tokens[j].type == CT_IDENT && tok_eq(&tokens[j], "defined")) {
+                            int d = skip_spaces(j + 1);
+                            if (d < token_count && tokens[d].type == CT_LPAREN) {
+                                int e = skip_spaces(d + 1);
+                                if (e < token_count && tokens[e].type == CT_IDENT) {
+                                    emit_tok(&tokens[e]);
+                                    int f = skip_spaces(e + 1);
+                                    if (f < token_count && tokens[f].type == CT_RPAREN) j = f + 1;
+                                    else j = e + 1;
+                                    continue;
+                                }
+                            } else if (d < token_count && tokens[d].type == CT_IDENT) {
+                                emit_tok(&tokens[d]);
+                                j = d + 1;
+                                continue;
+                            }
+                        }
                         emit_tok(&tokens[j]);
                         j++;
                     }
@@ -1306,6 +1357,53 @@ static void transform(void) {
                 emit_str(" -= 1");
                 i++;
             }
+            continue;
+        }
+
+        /* ---- Strip C keywords not in ZER: extern, inline, restrict, register ---- */
+        if (t->type == CT_IDENT &&
+            (tok_eq(t, "extern") || tok_eq(t, "inline") ||
+             tok_eq(t, "restrict") || tok_eq(t, "__inline") ||
+             tok_eq(t, "__inline__") || tok_eq(t, "__restrict") ||
+             tok_eq(t, "__restrict__") || tok_eq(t, "__extension__") ||
+             tok_eq(t, "register"))) {
+            /* strip keyword, preserve trailing whitespace */
+            i++;
+            continue;
+        }
+
+        /* ---- volatile qualifier: preserve for ZER (volatile *u32, volatile i32) ---- */
+        if (t->type == CT_IDENT && tok_eq(t, "volatile")) {
+            /* volatile TYPE *name → volatile *TYPE name
+             * volatile TYPE name  → volatile TYPE name
+             * Check if followed by a type + pointer pattern for MMIO */
+            int j = skip_spaces(i + 1);
+            /* check for volatile TYPE * → volatile *TYPE (pointer reorder) */
+            if (j < token_count && tokens[j].type == CT_IDENT) {
+                const char *mapped = map_type(&tokens[j]);
+                int k = skip_spaces(j + 1);
+                if (k < token_count && tokens[k].type == CT_STAR && mapped) {
+                    /* volatile uint32_t *name → volatile *u32 name */
+                    emit_str("volatile *");
+                    emit_str(mapped);
+                    emit_str(" ");
+                    i = k + 1; /* skip volatile + type + * */
+                    /* skip trailing whitespace */
+                    while (i < token_count && tokens[i].type == CT_WHITESPACE) i++;
+                    continue;
+                }
+                /* volatile TYPE name (no pointer) */
+                if (mapped) {
+                    emit_str("volatile ");
+                    emit_str(mapped);
+                    i = j + 1;
+                    { int ar = try_reorder_array(i); if (ar >= 0) i = ar; }
+                    continue;
+                }
+            }
+            /* volatile followed by non-mapped type — emit as-is */
+            emit_str("volatile ");
+            i++;
             continue;
         }
 
@@ -1743,6 +1841,47 @@ static void transform(void) {
                     }
                 }
             }
+            /* check for (volatile TYPE *) cast → volatile *TYPE via @inttoptr if numeric arg */
+            if (!is_cast && j < token_count && tokens[j].type == CT_IDENT &&
+                tok_eq(&tokens[j], "volatile")) {
+                int v = skip_spaces(j + 1);
+                if (v < token_count && tokens[v].type == CT_IDENT) {
+                    const char *vm = map_type(&tokens[v]);
+                    int k = skip_spaces(v + 1);
+                    if (k < token_count && tokens[k].type == CT_STAR) {
+                        int m = skip_spaces(k + 1);
+                        if (m < token_count && tokens[m].type == CT_RPAREN) {
+                            /* (volatile uint32_t *) — check if arg is numeric → @inttoptr */
+                            int after = skip_spaces(m + 1);
+                            bool arg_is_numeric = (after < token_count &&
+                                tokens[after].type == CT_NUMBER);
+                            /* also check (volatile TYPE *)(0x...) with parens */
+                            if (!arg_is_numeric && after < token_count &&
+                                tokens[after].type == CT_LPAREN) {
+                                int inner = skip_spaces(after + 1);
+                                if (inner < token_count && tokens[inner].type == CT_NUMBER)
+                                    arg_is_numeric = true;
+                            }
+                            if (arg_is_numeric) {
+                                const char *tn = vm ? vm : "u32";
+                                snprintf(cast_buf, sizeof(cast_buf), "*%s", tn);
+                                cast_type = cast_buf;
+                                is_ptr_cast = true;
+                                is_cast = true;
+                                cast_end = m + 1;
+                                /* will emit @inttoptr instead of @ptrcast below */
+                            } else {
+                                const char *tn = vm ? vm : "u32";
+                                snprintf(cast_buf, sizeof(cast_buf), "*%s", tn);
+                                cast_type = cast_buf;
+                                is_ptr_cast = true;
+                                is_cast = true;
+                                cast_end = m + 1;
+                            }
+                        }
+                    }
+                }
+            }
             /* check for (void *) cast → @ptrcast(*opaque, ...) */
             if (!is_cast && j < token_count && tokens[j].type == CT_IDENT &&
                 tok_eq(&tokens[j], "void")) {
@@ -1799,11 +1938,40 @@ static void transform(void) {
                 }
             }
 
+            /* (uintptr_t)expr → @ptrtoint(expr) — almost always pointer-to-int */
+            bool use_ptrtoint = false;
+            if (is_cast && !is_ptr_cast && j < token_count &&
+                tokens[j].type == CT_IDENT &&
+                (tok_eq(&tokens[j], "uintptr_t") || tok_eq(&tokens[j], "intptr_t"))) {
+                use_ptrtoint = true;
+            }
+
             if (is_cast && cast_type) {
+                /* detect if cast operand is a numeric literal → @inttoptr for MMIO */
+                bool use_inttoptr = false;
                 if (is_ptr_cast) {
+                    int peek_i = skip_spaces(cast_end);
+                    /* direct number: (type*)0x40020000 */
+                    if (peek_i < token_count && tokens[peek_i].type == CT_NUMBER)
+                        use_inttoptr = true;
+                    /* parenthesized number: (type*)(0x40020000) */
+                    if (!use_inttoptr && peek_i < token_count && tokens[peek_i].type == CT_LPAREN) {
+                        int inner = skip_spaces(peek_i + 1);
+                        if (inner < token_count && tokens[inner].type == CT_NUMBER)
+                            use_inttoptr = true;
+                    }
+                }
+                if (is_ptr_cast && use_inttoptr) {
+                    emit_str("@inttoptr(");
+                    emit_str(cast_type);
+                    emit_str(", ");
+                } else if (is_ptr_cast) {
                     emit_str("@ptrcast(");
                     emit_str(cast_type);
                     emit_str(", ");
+                } else if (use_ptrtoint) {
+                    emit_str("@ptrtoint(");
+                    /* cast_type not needed — @ptrtoint has no type arg */
                 } else {
                     emit_str("@truncate(");
                     emit_str(cast_type);

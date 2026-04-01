@@ -1496,6 +1496,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *tsym = scope_lookup(c->current_scope,
                     troot->ident.name, (uint32_t)troot->ident.name_len);
                 if (tsym) {
+                    /* invalidate value range — reassignment makes old range stale.
+                     * Without this: if (i < 10) { i = get_input(); arr[i]; }
+                     * would use stale range [0,9] for i after reassignment.
+                     * Override existing range directly (don't intersect). */
+                    {
+                        struct VarRange *existing = find_var_range(c, troot->ident.name,
+                            (uint32_t)troot->ident.name_len);
+                        if (existing) {
+                            if (node->assign.value->kind == NODE_INT_LIT) {
+                                int64_t v = (int64_t)node->assign.value->int_lit.value;
+                                existing->min_val = v;
+                                existing->max_val = v;
+                                existing->known_nonzero = (v != 0);
+                            } else {
+                                /* non-literal → unknown, wipe range */
+                                existing->min_val = INT64_MIN;
+                                existing->max_val = INT64_MAX;
+                                existing->known_nonzero = false;
+                            }
+                        }
+                    }
                     /* clear — will be re-set below if new value is unsafe */
                     tsym->is_local_derived = false;
                     tsym->is_arena_derived = false;
@@ -2001,6 +2022,26 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "bitwise compound assignment requires integer types, got '%s'",
                         type_name(target));
+                }
+            }
+            /* forced division guard for /= and %= — same check as NODE_BINARY */
+            if (node->assign.op == TOK_SLASHEQ || node->assign.op == TOK_PERCENTEQ) {
+                Node *divisor = node->assign.value;
+                /* literal nonzero → ok */
+                bool div_ok = false;
+                if (divisor->kind == NODE_INT_LIT && divisor->int_lit.value != 0) div_ok = true;
+                /* range-proven nonzero → ok */
+                if (!div_ok && divisor->kind == NODE_IDENT) {
+                    struct VarRange *r = find_var_range(c, divisor->ident.name,
+                        (uint32_t)divisor->ident.name_len);
+                    if (r && r->known_nonzero) div_ok = true;
+                }
+                if (!div_ok && divisor->kind == NODE_IDENT) {
+                    checker_error(c, node->loc.line,
+                        "divisor '%.*s' not proven nonzero — "
+                        "add 'if (%.*s == 0) { return; }' before division",
+                        (int)divisor->ident.name_len, divisor->ident.name,
+                        (int)divisor->ident.name_len, divisor->ident.name);
                 }
             }
             /* reject narrowing: value wider than target (unless value is a literal) */

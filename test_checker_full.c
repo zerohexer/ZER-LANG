@@ -2753,6 +2753,43 @@ int main(void) {
        "void c() { b(); }\n",
        "stack: chain call, no recursion OK");
 
+    /* ---- Range invalidation on reassignment ---- */
+    printf("\n--- range invalidation ---\n");
+
+    printf("[range: reassignment invalidates proven range]\n");
+    ok("u32 get_input() { return 0; }\n"
+       "u32 main() {\n"
+       "    u32 i = 5;\n"
+       "    u32[10] arr;\n"
+       "    if (i < 10) {\n"
+       "        i = get_input();\n"
+       "        arr[i] = 1;\n"
+       "    }\n"
+       "    return 0;\n"
+       "}\n",
+       "range: reassigned i not proven — auto-guard fires");
+
+    /* ---- Compound division guard ---- */
+    printf("\n--- compound division guard ---\n");
+
+    printf("[/= unproven divisor → error]\n");
+    err("u32 get_input() { return 0; }\n"
+        "u32 main() {\n"
+        "    u32 x = 100;\n"
+        "    u32 d = get_input();\n"
+        "    x /= d;\n"
+        "    return x;\n"
+        "}\n",
+        "/= compound: unproven divisor rejected");
+
+    printf("[/= literal nonzero → ok]\n");
+    ok("u32 main() {\n"
+       "    u32 x = 100;\n"
+       "    x /= 5;\n"
+       "    return x;\n"
+       "}\n",
+       "/= literal 5: proven nonzero OK");
+
     /* ---- Struct wrapper escape detection ---- */
     printf("\n--- struct wrapper local escape ---\n");
 

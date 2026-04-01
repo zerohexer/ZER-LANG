@@ -1883,4 +1883,13 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 - void ** → **opaque
 - Stringify (#), token paste (##), variadic (__VA_ARGS__) macros → auto-extracted to companion .h
 
-543 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
+550 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
+
+**Additional fixes (audit rounds 4-5):**
+- Range propagation stale guard: reassignment directly overwrites VarRange entry (not intersect). `i = get_input()` wipes range.
+- Compound /= %= forced division guard: added to NODE_ASSIGN alongside NODE_BINARY.
+- Struct wrapper escape: `call_has_local_derived_arg` walks NODE_FIELD chains to call root. Var-decl marks struct results as local-derived.
+- Slab calloc overflow: `(size_t)nc * _ZER_SLAB_PAGE_SLOTS` prevents 32-bit wrap.
+- Pool/Slab ABA: gen capped at 0xFFFFFFFF, retired slots skipped in alloc.
+- Pool/Slab zero-handle: gen starts at 1 (not 0), zero Handle never matches.
+- Comptime recursion: 3-layer depth guard in eval_comptime_block/call_subst/const_expr_subst.

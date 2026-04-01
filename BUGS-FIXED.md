@@ -2195,3 +2195,15 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Symptom:** Heap corruption when Slab grows to many pages on 64-bit systems.
 - **Root cause:** `calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint32_t))` — `nc` is uint32_t, multiplication overflows at 2^26 pages (2^32 items). calloc gets tiny value, memcpy overwrites heap.
 - **Fix:** Cast to size_t: `calloc((size_t)nc * _ZER_SLAB_PAGE_SLOTS, ...)`. Applied to both gen and used arrays.
+
+### Range propagation stale guard bypass
+- **Symptom:** `if (i < 10) { i = get_input(); arr[i] = 1; }` — `arr[i]` skipped bounds check because `i` had stale proven range [0,9] from before reassignment.
+- **Root cause:** `push_var_range` intersects with existing ranges (only narrows). Reassignment `i = get_input()` didn't invalidate the existing range — intersection of [0,9] with [INT64_MIN,INT64_MAX] = [0,9].
+- **Fix:** In NODE_ASSIGN (TOK_EQ), directly overwrite existing VarRange entry via `find_var_range()`. Non-literal assignment → wipe to full range. Literal → set exact value. No intersection.
+- **Test:** 1 new checker test.
+
+### Compound /= and %= bypass forced division guard
+- **Symptom:** `x /= d` compiled without error even when `d` not proven nonzero. `x / d` correctly errored.
+- **Root cause:** Forced division guard only checked NODE_BINARY (TOK_SLASH/TOK_PERCENT). Compound assignments (TOK_SLASHEQ/TOK_PERCENTEQ) are handled in NODE_ASSIGN, which had no division guard.
+- **Fix:** Added forced division guard in NODE_ASSIGN compound path: check divisor is literal nonzero or range-proven nonzero, else error.
+- **Test:** 2 new checker tests (/= error, /= literal OK).

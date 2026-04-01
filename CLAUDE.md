@@ -256,6 +256,9 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
 | Volatile/const strip | `@ptrcast`, `@bitcast`, `@cast` all check qualifier preservation |
+| ISR data race | Shared global without volatile → error. Compound assign on shared volatile → error (non-atomic read-modify-write) |
+| Stack overflow | Recursion detection via call graph DFS → warning. Stack frame size estimation per function |
+| Misaligned MMIO | `@inttoptr` alignment check — address must match target type alignment (u32=4, u16=2, u64=8) |
 
 ### Implementation Status
 | Feature | Checker | Emitter (E2E) |
@@ -300,6 +303,8 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | @probe (safe MMIO read, uintptr_t) | Done | Done (universal signal() fault handler) |
 | MMIO startup validation (declared ranges) | Done | Done (constructor, @probe at boot) |
 | Universal fault handler (signal) | Done | Done (catches bad MMIO at runtime, any platform) |
+| Interrupt safety (ISR shared globals) | Done | N/A (compile-time — missing volatile, race detection) |
+| Stack depth analysis (recursion detect) | Done | N/A (compile-time — warning on recursive calls) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

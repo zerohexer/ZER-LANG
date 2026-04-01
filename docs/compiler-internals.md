@@ -1782,7 +1782,7 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 | `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
 | `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
 | `test_checker.c` | Type checking basic | 72 |
-| `test_checker_full.c` | Full spec + safety + provenance + @probe | 525 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack | 541 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
 | `test_emit.c` | Full E2E (ZER→C→GCC→run) + signal() fault handler | 238 |
@@ -1804,6 +1804,36 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 ## zercheck Struct Copy Aliasing (zercheck.c)
 
 `State s2 = s1` propagates handle tracking. Scans PathState for `"s1.*"` keys, creates `"s2.*"` aliases. Freeing `s1.h` marks `s2.h` FREED via alias propagation. UAF caught.
+
+## Interrupt Safety Analysis (checker.c — Pass 4)
+
+Detects unsafe shared state between interrupt handlers and regular code. No other language does this at compile time.
+
+**Mechanism:** `in_interrupt` flag on Checker. When checking NODE_INTERRUPT body, flag is set. NODE_IDENT handler checks if ident is a global (`scope_lookup(global_scope, name)` == found symbol). If so, calls `track_isr_global()` which records access in `IsrGlobal` array with `from_isr`/`from_func` flags.
+
+**NODE_ASSIGN handler:** compound assignments (op != TOK_EQ) on global targets also tracked via `track_isr_global(c, name, len, true)` setting `compound_in_isr`/`compound_in_func`.
+
+**Post-check Pass 4 (`check_interrupt_safety`):** scans `isr_globals` array. For each entry where `from_isr && from_func`:
+- If `!sym->is_volatile` → compile error: "must be declared volatile"
+- If volatile but `compound_in_isr || compound_in_func` → compile error: "read-modify-write is not atomic"
+
+**What it catches:** #1 and #2 most common embedded bugs — missing volatile on ISR-shared state and non-atomic read-modify-write races. Both are invisible in C — code compiles, runs for days, then randomly corrupts data.
+
+## Stack Depth Analysis (checker.c — Pass 5)
+
+Builds call graph, estimates frame sizes, detects recursion. MISRA tools charge $10K+/year for this.
+
+**Mechanism:** `StackFrame` struct tracks per-function: `frame_size` (bytes), `callees` (function names), `is_recursive`.
+
+**`check_stack_depth()`:** walks all NODE_FUNC_DECL and NODE_INTERRUPT, builds frames via `scan_frame()` which:
+- Counts NODE_VAR_DECL sizes via `estimate_type_size()` (walks type tree)
+- Records NODE_CALL targets (direct calls to NODE_IDENT that resolve to functions in global scope)
+
+**`compute_max_depth()`:** DFS with visited array. Cycles detected = recursion. Accumulates frame sizes along deepest path.
+
+**Recursion = warning (not error):** recursive code is valid ZER, but dangerous on embedded (unbounded stack). Warning lets programmer decide.
+
+**`estimate_type_size()`:** conservative estimates: u8=1, u16=2, u32/usize=4, u64=8, pointer=4, handle=8, array=elem*count, struct=sum of fields, optional=inner+1 (or pointer size for null sentinel).
 
 ## Forward Declaration Emission Fix (emitter.c)
 

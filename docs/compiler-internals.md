@@ -655,7 +655,7 @@ Two tools + one library for automated C-to-ZER migration:
 - MMIO detection in cast handler: after recognizing `(TYPE*)` or `(volatile TYPE*)`, peeks at the operand. If numeric literal → emits `@inttoptr` instead of `@ptrcast`. Works for both direct `0x40020000` and parenthesized `(0x40020000)`.
 - `(uintptr_t)` cast uses `use_ptrtoint` flag — emits `@ptrtoint(expr)` instead of `@truncate(usize, expr)`. Requires `uintptr_t` in type_map (len=9, not 10!).
 - Include guard detection runs before `#ifndef` handler. Peeks ahead for `#define SAME_NAME` with empty body on next line. If found, emits comment and skips both lines. Otherwise falls through to normal `#ifndef` → `comptime if`.
-- Stringify/variadic detection runs before comptime emission. Scans past params to `)`, then scans body for `CT_HASH` or `__VA_ARGS__`. Also scans params for `...` (three `CT_DOT` tokens). If found, emits `// MANUAL:` comment line instead of comptime function.
+- Stringify/variadic detection runs before comptime emission. Scans past params to `)`, then scans body for `CT_HASH` or `__VA_ARGS__`. Also scans params for `...` (three `CT_DOT` tokens). If found, auto-extracts the `#define` line to companion `_extract.h` file (same mechanism as ternary/goto/bitfields). Sets `needs_extract = true`, writes macro via `extract_str`/`extract_tok`, handles line continuation (`\\`). The `.zer` file gets a `// extracted to .h:` comment. Zero manual work — macro works through GCC via cinclude.
 - `emit_tok()` strips C number suffixes (U/L/UL/ULL) from `CT_NUMBER` tokens by trimming trailing u/U/l/L chars before writing.
 - 139 regression tests in `tests/test_convert.sh`, integrated into `make check`.
 

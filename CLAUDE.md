@@ -365,7 +365,7 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 - Pointer-to-int: `(uintptr_t)ptr` → `@ptrtoint(ptr)`, `uintptr_t`/`intptr_t` → `usize`
 - Number suffixes: C suffixes (U, L, UL, ULL) stripped from literals
 - Include guards: `#ifndef FOO_H / #define FOO_H` detected and stripped
-- Unconvertible macros: stringify (`#`), token paste (`##`), variadic (`__VA_ARGS__`) → `// MANUAL:` comment
+- Unconvertible macros: stringify (`#`), token paste (`##`), variadic (`__VA_ARGS__`) → auto-extracted to companion `_extract.h` via cinclude (zero manual work)
 - `#if defined(X)` → `comptime if (X)` (expands `defined()` operator)
 
 **`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)

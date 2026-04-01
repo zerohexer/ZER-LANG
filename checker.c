@@ -220,6 +220,7 @@ static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
+static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
 
 /* Check if an expression node is a literal that can be assigned to target type.
@@ -1013,6 +1014,16 @@ static Type *check_expr(Checker *c, Node *node) {
         Symbol *sym = find_symbol(c, node->ident.name, (uint32_t)node->ident.name_len,
                                   node->loc.line);
         result = sym ? sym->type : ty_void;
+        /* interrupt safety: track global variable access from ISR vs regular code */
+        if (sym && !sym->is_function && c->current_func_ret != NULL) {
+            Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
+                                      (uint32_t)node->ident.name_len);
+            if (gs && gs == sym) {
+                /* this ident IS a global — track ISR/func access */
+                track_isr_global(c, node->ident.name,
+                                 (uint32_t)node->ident.name_len, false);
+            }
+        }
         break;
     }
 
@@ -1227,6 +1238,16 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
+
+        /* interrupt safety: track compound assignment (|=, +=, etc.) on globals */
+        if (node->assign.op != TOK_EQ && node->assign.target->kind == NODE_IDENT) {
+            Symbol *gs = scope_lookup(c->global_scope, node->assign.target->ident.name,
+                                      (uint32_t)node->assign.target->ident.name_len);
+            if (gs && !gs->is_function) {
+                track_isr_global(c, node->assign.target->ident.name,
+                                 (uint32_t)node->assign.target->ident.name_len, true);
+            }
+        }
 
         /* BUG-294/302: reject assignment to non-lvalue.
          * Walk field/index chains to find base — if it's a call returning a value
@@ -5644,9 +5665,11 @@ static void check_func_body(Checker *c, Node *node) {
 
     if (node->kind == NODE_INTERRUPT && node->interrupt.body) {
         c->current_func_ret = ty_void;
+        c->in_interrupt = true;
         push_scope(c);
         check_stmt(c, node->interrupt.body);
         pop_scope(c);
+        c->in_interrupt = false;
         c->current_func_ret = NULL;
     }
 }
@@ -5759,6 +5782,264 @@ uint64_t checker_auto_guard_size(Checker *c, Node *node) {
         if (c->auto_guards[i].node == node) return c->auto_guards[i].array_size;
     }
     return 0;
+}
+
+/* ================================================================
+ * INTERRUPT SAFETY — track globals shared between ISR and regular code
+ * ================================================================ */
+static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound) {
+    /* find existing entry */
+    for (int i = 0; i < c->isr_global_count; i++) {
+        struct IsrGlobal *g = &c->isr_globals[i];
+        if (g->name_len == name_len && memcmp(g->name, name, name_len) == 0) {
+            if (c->in_interrupt) {
+                g->from_isr = true;
+                if (is_compound) g->compound_in_isr = true;
+            } else {
+                g->from_func = true;
+                if (is_compound) g->compound_in_func = true;
+            }
+            return;
+        }
+    }
+    /* add new entry */
+    if (c->isr_global_count >= c->isr_global_capacity) {
+        int new_cap = c->isr_global_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        c->isr_globals = realloc(c->isr_globals, new_cap * sizeof(struct IsrGlobal));
+        c->isr_global_capacity = new_cap;
+    }
+    struct IsrGlobal *g = &c->isr_globals[c->isr_global_count++];
+    memset(g, 0, sizeof(*g));
+    g->name = name;
+    g->name_len = name_len;
+    if (c->in_interrupt) {
+        g->from_isr = true;
+        if (is_compound) g->compound_in_isr = true;
+    } else {
+        g->from_func = true;
+        if (is_compound) g->compound_in_func = true;
+    }
+}
+
+/* Post-check: validate interrupt safety for shared globals */
+static void check_interrupt_safety(Checker *c) {
+    for (int i = 0; i < c->isr_global_count; i++) {
+        struct IsrGlobal *g = &c->isr_globals[i];
+        if (!g->from_isr || !g->from_func) continue; /* not shared */
+        /* shared global — check volatile */
+        Symbol *sym = scope_lookup(c->global_scope, g->name, g->name_len);
+        if (!sym) continue;
+        if (!sym->is_volatile) {
+            checker_error(c, sym->line,
+                "global '%.*s' is accessed from both interrupt and main code — "
+                "must be declared volatile",
+                (int)g->name_len, g->name);
+        } else if (g->compound_in_isr || g->compound_in_func) {
+            /* volatile but compound assignment — race condition */
+            checker_error(c, sym->line,
+                "volatile global '%.*s' has compound assignment (+=, |=, etc.) "
+                "shared between interrupt and main code — "
+                "read-modify-write is not atomic, use explicit read/mask/write",
+                (int)g->name_len, g->name);
+        }
+    }
+}
+
+/* ================================================================
+ * STACK DEPTH ANALYSIS — build call graph, compute max depth
+ * ================================================================ */
+static struct StackFrame *find_or_add_frame(Checker *c, const char *name, uint32_t name_len) {
+    for (int i = 0; i < c->stack_frame_count; i++) {
+        if (c->stack_frames[i].name_len == name_len &&
+            memcmp(c->stack_frames[i].name, name, name_len) == 0)
+            return &c->stack_frames[i];
+    }
+    if (c->stack_frame_count >= c->stack_frame_capacity) {
+        int new_cap = c->stack_frame_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        c->stack_frames = realloc(c->stack_frames, new_cap * sizeof(struct StackFrame));
+        c->stack_frame_capacity = new_cap;
+    }
+    struct StackFrame *f = &c->stack_frames[c->stack_frame_count++];
+    memset(f, 0, sizeof(*f));
+    f->name = name;
+    f->name_len = name_len;
+    return f;
+}
+
+static void add_callee(struct StackFrame *f, const char *name, uint32_t name_len) {
+    /* dedup */
+    for (int i = 0; i < f->callee_count; i++) {
+        if (f->callee_lens[i] == name_len && memcmp(f->callees[i], name, name_len) == 0)
+            return;
+    }
+    if (f->callee_count >= f->callee_capacity) {
+        int new_cap = f->callee_capacity * 2;
+        if (new_cap < 8) new_cap = 8;
+        f->callees = realloc(f->callees, new_cap * sizeof(const char *));
+        f->callee_lens = realloc(f->callee_lens, new_cap * sizeof(uint32_t));
+        f->callee_capacity = new_cap;
+    }
+    f->callees[f->callee_count] = name;
+    f->callee_lens[f->callee_count] = name_len;
+    f->callee_count++;
+}
+
+/* estimate type size for stack frame calculation */
+static uint32_t estimate_type_size(Type *t) {
+    if (!t) return 0;
+    t = type_unwrap_distinct(t);
+    switch (t->kind) {
+    case TYPE_BOOL: case TYPE_U8: case TYPE_I8: return 1;
+    case TYPE_U16: case TYPE_I16: return 2;
+    case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_USIZE: return 4;
+    case TYPE_U64: case TYPE_I64: case TYPE_F64: return 8;
+    case TYPE_POINTER: case TYPE_OPAQUE: return 4; /* conservative: 32-bit */
+    case TYPE_HANDLE: return 8; /* u64 */
+    case TYPE_ARRAY: return (uint32_t)(t->array.size * estimate_type_size(t->array.inner));
+    case TYPE_SLICE: return 8; /* ptr + len */
+    case TYPE_OPTIONAL: {
+        Type *inner = type_unwrap_distinct(t->optional.inner);
+        if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return 4; /* null sentinel */
+        if (inner->kind == TYPE_VOID) return 1; /* has_value only */
+        return estimate_type_size(inner) + 1; /* value + has_value */
+    }
+    case TYPE_STRUCT: {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < t->struct_type.field_count; i++)
+            total += estimate_type_size(t->struct_type.fields[i].type);
+        return total;
+    }
+    default: return 4;
+    }
+}
+
+/* scan function body for local variable sizes and callee names */
+static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
+    if (!node) return;
+    switch (node->kind) {
+    case NODE_VAR_DECL: {
+        Type *t = typemap_get(c, node);
+        if (!t && node->var_decl.type) t = typemap_get(c, (Node *)node->var_decl.type);
+        /* rough estimate: resolve type from the type node name */
+        if (t) frame->frame_size += estimate_type_size(t);
+        else frame->frame_size += 4; /* unknown, assume 4 */
+        if (node->var_decl.init) scan_frame(c, frame, node->var_decl.init);
+        break;
+    }
+    case NODE_CALL:
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            /* only track direct function calls (not method calls) */
+            Symbol *sym = scope_lookup(c->global_scope,
+                node->call.callee->ident.name,
+                (uint32_t)node->call.callee->ident.name_len);
+            if (sym && sym->is_function) {
+                add_callee(frame, node->call.callee->ident.name,
+                           (uint32_t)node->call.callee->ident.name_len);
+            }
+        }
+        for (int i = 0; i < node->call.arg_count; i++)
+            scan_frame(c, frame, node->call.args[i]);
+        break;
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            scan_frame(c, frame, node->block.stmts[i]);
+        break;
+    case NODE_IF:
+        scan_frame(c, frame, node->if_stmt.cond);
+        scan_frame(c, frame, node->if_stmt.then_body);
+        scan_frame(c, frame, node->if_stmt.else_body);
+        break;
+    case NODE_FOR:
+        scan_frame(c, frame, node->for_stmt.init);
+        scan_frame(c, frame, node->for_stmt.body);
+        break;
+    case NODE_WHILE:
+        scan_frame(c, frame, node->while_stmt.body);
+        break;
+    case NODE_RETURN:
+        scan_frame(c, frame, node->ret.expr);
+        break;
+    case NODE_EXPR_STMT:
+        scan_frame(c, frame, node->expr_stmt.expr);
+        break;
+    case NODE_ASSIGN:
+        scan_frame(c, frame, node->assign.value);
+        break;
+    default: break;
+    }
+}
+
+/* DFS to find max stack depth — detect recursion via visited array */
+static uint32_t compute_max_depth(Checker *c, struct StackFrame *frame,
+                                   bool *visited, int depth) {
+    if (depth > 256) return 0; /* safety limit */
+    /* find frame index */
+    int idx = (int)(frame - c->stack_frames);
+    if (idx < 0 || idx >= c->stack_frame_count) return 0;
+    if (visited[idx]) {
+        frame->is_recursive = true;
+        return 0; /* cycle detected */
+    }
+    visited[idx] = true;
+    uint32_t max_child = 0;
+    for (int i = 0; i < frame->callee_count; i++) {
+        struct StackFrame *callee = NULL;
+        for (int j = 0; j < c->stack_frame_count; j++) {
+            if (c->stack_frames[j].name_len == frame->callee_lens[i] &&
+                memcmp(c->stack_frames[j].name, frame->callees[i], frame->callee_lens[i]) == 0) {
+                callee = &c->stack_frames[j];
+                break;
+            }
+        }
+        if (callee) {
+            uint32_t child_depth = compute_max_depth(c, callee, visited, depth + 1);
+            if (child_depth > max_child) max_child = child_depth;
+        }
+    }
+    visited[idx] = false;
+    return frame->frame_size + max_child;
+}
+
+/* Build call graph and report stack depth + recursion warnings */
+static void check_stack_depth(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    /* build frames for all functions and interrupts */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *decl = file_node->file.decls[i];
+        if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body && !decl->func_decl.is_comptime) {
+            struct StackFrame *f = find_or_add_frame(c, decl->func_decl.name,
+                (uint32_t)decl->func_decl.name_len);
+            /* add param sizes */
+            for (int p = 0; p < decl->func_decl.param_count; p++) {
+                Type *pt = NULL;
+                if (decl->func_decl.params[p].type)
+                    pt = typemap_get(c, (Node *)decl->func_decl.params[p].type);
+                f->frame_size += pt ? estimate_type_size(pt) : 4;
+            }
+            scan_frame(c, f, decl->func_decl.body);
+        }
+        if (decl->kind == NODE_INTERRUPT && decl->interrupt.body) {
+            struct StackFrame *f = find_or_add_frame(c, decl->interrupt.name,
+                (uint32_t)decl->interrupt.name_len);
+            scan_frame(c, f, decl->interrupt.body);
+        }
+    }
+    /* compute max depth from main and each interrupt */
+    if (c->stack_frame_count > 0) {
+        bool *visited = calloc(c->stack_frame_count, sizeof(bool));
+        for (int i = 0; i < c->stack_frame_count; i++) {
+            struct StackFrame *f = &c->stack_frames[i];
+            compute_max_depth(c, f, visited, 0);
+            if (f->is_recursive) {
+                checker_warning(c, 0,
+                    "function '%.*s' is recursive — unbounded stack growth on embedded",
+                    (int)f->name_len, f->name);
+            }
+        }
+        free(visited);
+    }
 }
 
 /* Cross-function provenance: find return provenance in a function body */
@@ -6168,6 +6449,14 @@ bool checker_check(Checker *c, Node *file_node) {
             check_call_provenance(c, file_node->file.decls[i]);
         }
     }
+
+    /* Pass 4: interrupt safety — validate shared globals */
+    if (c->isr_global_count > 0) {
+        check_interrupt_safety(c);
+    }
+
+    /* Pass 5: stack depth analysis — detect recursion */
+    check_stack_depth(c, file_node);
 
     return c->error_count == 0;
 }

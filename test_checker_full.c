@@ -2696,6 +2696,63 @@ int main(void) {
     err("void f() { @probe(); }",
         "@probe: no args rejected");
 
+    /* ---- Interrupt safety ---- */
+    printf("\n--- interrupt safety ---\n");
+
+    printf("[ISR safety: shared global without volatile → error]\n");
+    err("u32 counter = 0;\n"
+        "interrupt TIMER1 { counter += 1; }\n"
+        "void f() { u32 x = counter; }\n",
+        "ISR safety: shared global without volatile");
+
+    printf("[ISR safety: shared volatile global → ok]\n");
+    ok("volatile u32 counter = 0;\n"
+       "interrupt TIMER1 { counter = counter + 1; }\n"
+       "void f() { u32 x = counter; }\n",
+       "ISR safety: volatile shared global OK");
+
+    printf("[ISR safety: volatile + compound assign → error (race)]\n");
+    err("volatile u32 flags = 0;\n"
+        "interrupt UART_RX { flags |= 0x01; }\n"
+        "void f() { flags |= 0x02; }\n",
+        "ISR safety: compound assign on shared volatile = race");
+
+    printf("[ISR safety: global only in ISR → ok (no sharing)]\n");
+    ok("u32 isr_only = 0;\n"
+       "interrupt TIMER1 { isr_only = 1; }\n"
+       "void f() { u32 x = 5; }\n",
+       "ISR safety: global only in ISR — no sharing, OK");
+
+    printf("[ISR safety: global only in func → ok]\n");
+    ok("u32 func_only = 0;\n"
+       "void f() { func_only = 1; }\n",
+       "ISR safety: global only in func — OK");
+
+    printf("[ISR safety: volatile + plain assign (no compound) → ok]\n");
+    ok("volatile u32 flag = 0;\n"
+       "interrupt TIMER1 { flag = 1; }\n"
+       "void f() { flag = 0; }\n",
+       "ISR safety: volatile plain assign both sides OK");
+
+    /* ---- Stack depth / recursion ---- */
+    printf("\n--- stack depth analysis ---\n");
+
+    printf("[stack: direct recursion → warning (not error)]\n");
+    ok("void f() { f(); }\n"
+       "void g() { }\n",
+       "stack: direct recursion compiles (warning only)");
+
+    printf("[stack: mutual recursion → warning (not error)]\n");
+    ok("void a() { b(); }\n"
+       "void b() { a(); }\n",
+       "stack: mutual recursion compiles (warning only)");
+
+    printf("[stack: no recursion → ok]\n");
+    ok("void a() { }\n"
+       "void b() { a(); }\n"
+       "void c() { b(); }\n",
+       "stack: chain call, no recursion OK");
+
     /* ---- @inttoptr alignment check ---- */
     printf("\n[@inttoptr alignment: u32 at misaligned address → error]\n");
     err("mmio 0x40020000..0x40020FFF;\n"

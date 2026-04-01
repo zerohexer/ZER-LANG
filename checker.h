@@ -121,6 +121,33 @@ typedef struct {
     } *param_expects;
     int param_expect_count;
     int param_expect_capacity;
+
+    /* Interrupt safety: track globals accessed from ISR and regular code */
+    bool in_interrupt;  /* true when checking NODE_INTERRUPT body */
+    struct IsrGlobal {
+        const char *name;
+        uint32_t name_len;
+        bool from_isr;          /* accessed inside interrupt body */
+        bool from_func;         /* accessed inside regular function */
+        bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
+        bool compound_in_func;  /* compound assign in regular func */
+    } *isr_globals;
+    int isr_global_count;
+    int isr_global_capacity;
+
+    /* Stack depth analysis: call graph + frame sizes */
+    struct StackFrame {
+        const char *name;
+        uint32_t name_len;
+        uint32_t frame_size;    /* estimated local variable bytes */
+        const char **callees;   /* function names called from this function */
+        uint32_t *callee_lens;
+        int callee_count;
+        int callee_capacity;
+        bool is_recursive;      /* part of a call cycle */
+    } *stack_frames;
+    int stack_frame_count;
+    int stack_frame_capacity;
 } Checker;
 
 /* ---- API ---- */

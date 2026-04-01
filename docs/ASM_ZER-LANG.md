@@ -303,6 +303,108 @@ The 20% is concentrated in 3 files: boot.zer, context_switch.zer, syscall.zer. E
 
 ---
 
+## MISRA Dir 4.3 Enforcement: ASM Isolation Rule (decided 2026-04-01)
+
+### The Rule
+
+**MISRA C:2023 Directive 4.3:** "Assembly language shall be encapsulated and isolated."
+
+ZER enforces this at compile time. No other language does this.
+
+**asm statements are ONLY allowed inside `naked` functions.** Regular functions cannot contain asm. This is a compile error, not a warning.
+
+```zer
+// REJECTED — asm mixed with regular code:
+void process_data() {
+    u32 x = 5;
+    asm("cpsid i" :::);      // COMPILE ERROR: asm only allowed in naked functions
+    x += 1;
+    asm("cpsie i" :::);      // COMPILE ERROR
+}
+
+// ACCEPTED — asm isolated in naked function:
+naked void context_switch(*Context old, *Context new) {
+    asm("stmia %0, {r0-r12, sp, lr}" : : "r"(old) : "memory");
+    asm("ldmia %0, {r0-r12, sp, lr}" : : "r"(new) : "memory");
+    asm("bx lr" :::);
+}
+
+// ACCEPTED — naked boot startup:
+naked void _start() {
+    asm("ldr sp, =_stack_top" :::);
+    asm("bl main" :::);
+}
+
+// Safe ZER code calls the isolated asm function:
+void schedule() {
+    *Context old = current_task();    // full safety — bounds, null, escape
+    *Context new = next_task();       // full safety
+    context_switch(old, new);          // type-checked call to asm function
+}
+```
+
+### What This Means
+
+| Code pattern | Allowed? | MISRA compliant? | Safety |
+|---|---|---|---|
+| `@critical { }` | Yes | Yes — asm encapsulated in intrinsic | 100% safe |
+| `@atomic_add(&x, 1)` | Yes | Yes — asm encapsulated in intrinsic | 100% safe |
+| `@barrier()` | Yes | Yes — asm encapsulated in intrinsic | 100% safe |
+| `naked void f() { asm(...); }` | Yes | Yes — dedicated asm function | Interface type-checked |
+| `void f() { asm(...); x += 1; }` | **No — compile error** | N/A — rejected | N/A |
+| `void f() { u32 x = 5; }` | Yes | Yes — no asm | 100% safe |
+
+### Zero Functionality Loss
+
+The rule restricts WHERE you write asm, not WHAT you write. Inside a `naked` function, you can write ANY instruction, ANY register operation, ANY architecture-specific code. The asm contents are not restricted.
+
+The call INTERFACE between safe ZER code and naked asm functions IS type-checked:
+- Argument types validated (pointer width, integer size)
+- Argument count validated
+- Return type validated
+- The naked function's parameters and return type are ZER types
+
+### naked Function Rules
+
+1. Body must contain ONLY `asm(...)` statements — no variable declarations, no expressions, no if/for/while
+2. No automatic prologue/epilogue (GCC `__attribute__((naked))`)
+3. Parameters are accessible via asm operands, NOT as regular variables
+4. Caller's argument types are validated by ZER's type checker
+5. If a naked function needs local variables, use register operands — not stack
+
+### Why This Is Better Than Rust
+
+| | Rust | ZER |
+|---|---|---|
+| asm location | `unsafe { asm!() }` — anywhere | Only in `naked` functions — isolated |
+| asm + regular code mixing | Allowed inside `unsafe` block | **Compile error** — must separate |
+| MISRA compliance | Not enforced | **Enforced at language level** |
+| Type checking on operands | Yes — per register class | Yes — per ZER type width |
+| Call interface validation | Via function signature | Via function signature (same) |
+
+Rust allows `unsafe { asm!("..."); let x = 5; asm!("..."); }` — asm mixed with regular code inside one function. ZER rejects this. Asm functions are asm-only. Regular functions are asm-free. Clean separation.
+
+### Example: Complete OS Kernel File Structure
+
+```
+kernel/
+  boot.zer           ← 1 naked function: _start (set SP, jump to main)
+  context.zer         ← 1 naked function: context_switch (save/restore regs)
+  syscall_entry.zer   ← 1 naked function: syscall_entry (read args, dispatch)
+  scheduler.zer       ← pure ZER: @critical, @atomic_cas, full safety
+  memory.zer          ← pure ZER: Pool/Slab/Arena, full safety
+  drivers/
+    uart.zer          ← pure ZER: mmio + @inttoptr + interrupt, full safety
+    gpio.zer          ← pure ZER: mmio + volatile, full safety
+    spi.zer           ← pure ZER: mmio + Ring, full safety
+  ipc.zer             ← pure ZER: Ring + slices, full safety
+  fs.zer              ← pure ZER: Arena + structs, full safety
+```
+
+3 files with `naked` functions (~60 lines of asm total). Everything else is fully checked ZER. No C files. No cinclude. Pure ZER OS kernel.
+
+---
+
 ## References
 
 - [GCC __atomic Builtins](https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html)

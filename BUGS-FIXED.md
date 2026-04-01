@@ -2172,3 +2172,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Added `static int depth` counter in `eval_comptime_block` (limit 32) and `_comptime_call_depth` in `eval_comptime_call_subst` (limit 16). Also added `_subst_depth` guard in `eval_const_expr_subst` NODE_CALL handler. Three-layer guard prevents stack overflow from any recursion path.
 - **Test:** 1 new checker test (comptime mutual recursion → error, not crash).
 - **Note:** Previous Docker builds were caching old code, masking the fix. Required `docker build --no-cache` to verify. Also found leftover `_comptime_block_depth` reference from partial edit — caused compile failure in Docker.
+
+### Pool/Slab generation counter ABA prevention
+- **Symptom:** After 2^32 alloc/free cycles on a single slot, generation counter wraps to 0. Stale handles from first cycle match — silent use-after-free on long-running servers.
+- **Root cause:** `gen[idx]++` in free has no overflow guard. u32 wraps at 4,294,967,296.
+- **Fix:** Cap gen at 0xFFFFFFFF (never wrap). In free: `if (gen[idx] < 0xFFFFFFFFu) gen[idx]++`. In alloc: skip slots where `gen[idx] == 0xFFFFFFFFu` (permanently retired). Retired slots stay used=0 so get() always traps. One slot lost per 2^32 cycles — negligible.
+- **Applied to:** Both Pool (`_zer_pool_alloc`/`_zer_pool_free`) and Slab (`_zer_slab_alloc`/`_zer_slab_free`).
+- **Note:** First proposed fix (set used=1 on wrap) was WRONG — would let stale handles with gen=0 pass get() check. Correct fix keeps slot free (used=0) so get() always rejects.

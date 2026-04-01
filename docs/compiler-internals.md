@@ -835,6 +835,7 @@ Two tools + one library for automated C-to-ZER migration:
 - Global var: `_zer_slab name = { .slot_size = sizeof(T) };`
 - Method interception passes `&name` to runtime helpers (unlike Pool which passes individual arrays)
 - Same restrictions as Pool: must be global/static, not copyable, not in struct fields, get() is non-storable
+- **ABA prevention:** gen counter capped at 0xFFFFFFFF (never wraps). Free: `if (gen < max) gen++`. Alloc: skip slots where `gen == max` (permanently retired, used=0 so get() traps). Prevents silent use-after-free after 2^32 alloc/free cycles per slot. Applied to both Pool and Slab.
 
 ### Critical Patterns That Cause Bugs — READ BEFORE MODIFYING
 

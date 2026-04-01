@@ -2877,6 +2877,18 @@ int main(void) {
         "}\n",
         "partial struct mutation: h.val=42 doesn't clear h.p local-derived");
 
+    /* ---- MISRA Dir 4.3: asm isolation ---- */
+    printf("\n--- MISRA Dir 4.3 asm isolation ---\n");
+
+    printf("[asm in regular function → error]\n");
+    err("void f() { asm(\"nop\"); }\n",
+        "MISRA: asm in regular function rejected");
+
+    printf("[asm in naked function → ok]\n");
+    ok("naked void f() { asm(\"nop\"); }\n"
+       "u32 main() { return 0; }\n",
+       "MISRA: asm in naked function OK");
+
     /* ---- Cross-platform portability ---- */
     printf("\n--- cross-platform portability ---\n");
 

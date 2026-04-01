@@ -5406,7 +5406,12 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_ASM:
-        /* nothing to check — just assembly */
+        /* MISRA Dir 4.3: asm must be encapsulated in naked functions */
+        if (!c->in_naked) {
+            checker_error(c, node->loc.line,
+                "asm statements only allowed in naked functions — "
+                "use @critical or @atomic_* for safe alternatives (MISRA Dir 4.3)");
+        }
         break;
 
     case NODE_CRITICAL:
@@ -5887,7 +5892,9 @@ static void check_func_body(Checker *c, Node *node) {
             }
         }
 
+        if (node->func_decl.is_naked) c->in_naked = true;
         check_stmt(c, node->func_decl.body);
+        c->in_naked = false;
 
         /* check that all paths return for non-void functions */
         if (ret && ret->kind != TYPE_VOID &&

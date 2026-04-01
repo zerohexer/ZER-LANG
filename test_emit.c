@@ -3364,8 +3364,8 @@ int main(void) {
         0,
         "@probe E2E: invalid addr if-unwrap → else path → 0");
 
-    /* ---- MMIO auto-discovery E2E ---- */
-    printf("\n[auto-discovery: @inttoptr with --no-strict-mmio on invalid addr → returns 0]\n");
+    /* ---- MMIO --no-strict-mmio E2E (auto-discovery removed, plain cast) ---- */
+    printf("\n[no-strict-mmio: @inttoptr compiles without mmio declarations]\n");
     {
         tests_run++;
         if (zer_to_c_ex(
@@ -3383,15 +3383,15 @@ int main(void) {
                 if (exit_code == 0) {
                     tests_passed++;
                 } else {
-                    printf("  FAIL: auto-discovery — expected exit 0, got %d\n", exit_code);
+                    printf("  FAIL: no-strict-mmio — expected exit 0, got %d\n", exit_code);
                     tests_failed++;
                 }
             } else {
-                printf("  FAIL: auto-discovery — GCC compilation failed\n");
+                printf("  FAIL: no-strict-mmio — GCC compilation failed\n");
                 tests_failed++;
             }
         } else {
-            printf("  FAIL: auto-discovery — ZER compilation failed\n");
+            printf("  FAIL: no-strict-mmio — ZER compilation failed\n");
             tests_failed++;
         }
     }

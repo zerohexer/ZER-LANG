@@ -2158,3 +2158,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Symptom:** `?u32 val = @probe(addr);` emitted `(_zer_opt_u32){ _zer_probe(addr), 1 }` — double-wrapping because @probe already returns `_zer_opt_u32`.
 - **Root cause:** Var-decl optional init path only checked NODE_CALL and NODE_ORELSE for direct assignment. NODE_INTRINSIC fell to the `else` branch that wrapped in `{ val, 1 }`.
 - **Fix:** Added `NODE_INTRINSIC` to the `NODE_CALL || NODE_ORELSE` direct-assign check in emitter NODE_VAR_DECL.
+
+### Auto-discovery removal + mmio startup validation (design decision, not bug)
+- **Decision (2026-04-01):** Removed 5-phase brute-force auto-discovery boot scan and `_zer_mmio_valid()` runtime gate.
+- **Why:** Auto-discovery couldn't find locked/gated/write-only peripherals (~80% coverage presented as 100%). `_zer_mmio_valid()` false-blocked legitimate MMIO accesses. STM32-centric RCC brute-forcing didn't work on other chip families.
+- **Removed:** `has_inttoptr()` AST scanner, `_zer_disc_scan`, `_zer_disc_brute_enable`, `_zer_mmio_discover` constructor, `_zer_mmio_valid`, `_zer_in_disc`, `_zer_disc_add`, `need_discovery_check` path in @inttoptr emission.
+- **Added:** mmio declaration startup validation — `_zer_mmio_validate()` as `__attribute__((constructor))` probes start address of each declared `mmio` range via `@probe()`. Wrong datasheet address caught at first power-on. Skips wildcard ranges and x86 hosted.
+- **@probe kept:** Standalone intrinsic for safe MMIO reads. Fault handler preamble unchanged.

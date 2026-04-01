@@ -1915,33 +1915,12 @@ static void emit_expr(Emitter *e, Node *node) {
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
             /* @inttoptr(*T, addr) → (T*)(uintptr_t)(addr)
              * With mmio ranges: variable addresses get runtime range check
-             * With auto-discovery: validate against discovered map */
+             * Auto-discovery removed (2026-04-01) — --no-strict-mmio with no
+             * mmio declarations just emits plain cast (like C, programmer's choice) */
             bool need_runtime_check = e->checker->mmio_range_count > 0 &&
                 node->intrinsic.arg_count > 0 &&
                 node->intrinsic.args[0]->kind != NODE_INT_LIT;
-            bool need_discovery_check = e->checker->no_strict_mmio &&
-                e->checker->mmio_range_count == 0 &&
-                node->intrinsic.arg_count > 0;
-            if (need_discovery_check) {
-                /* auto-discovery mode: validate against discovered map */
-                int tmp = e->temp_count++;
-                emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "); if (!_zer_mmio_valid((uint32_t)_zer_ma%d)) ", tmp);
-                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                    emit(e, "{ return ");
-                    emit_zero_value(e, e->current_func_ret);
-                    emit(e, "; } ");
-                } else {
-                    emit(e, "{ return; } ");
-                }
-                emit(e, "(");
-                if (node->intrinsic.type_arg) {
-                    Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                    emit_type(e, t);
-                }
-                emit(e, ")_zer_ma%d; })", tmp);
-            } else if (need_runtime_check) {
+            if (need_runtime_check) {
                 int tmp = e->temp_count++;
                 emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
                 emit_expr(e, node->intrinsic.args[0]);
@@ -3376,41 +3355,8 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     }
 }
 
-/* scan AST for @inttoptr usage — needed to emit auto-discovery preamble */
-static bool has_inttoptr(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC && node->intrinsic.name_len == 8 &&
-        memcmp(node->intrinsic.name, "inttoptr", 8) == 0) return true;
-    switch (node->kind) {
-    case NODE_FILE:
-        for (int i = 0; i < node->file.decl_count; i++)
-            if (has_inttoptr(node->file.decls[i])) return true;
-        return false;
-    case NODE_FUNC_DECL: return has_inttoptr(node->func_decl.body);
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_inttoptr(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_inttoptr(node->if_stmt.then_body) || has_inttoptr(node->if_stmt.else_body);
-    case NODE_FOR: return has_inttoptr(node->for_stmt.body);
-    case NODE_WHILE: return has_inttoptr(node->while_stmt.body);
-    case NODE_VAR_DECL: return has_inttoptr(node->var_decl.init);
-    case NODE_EXPR_STMT: return has_inttoptr(node->expr_stmt.expr);
-    case NODE_RETURN: return has_inttoptr(node->ret.expr);
-    case NODE_ASSIGN:
-        return has_inttoptr(node->assign.target) || has_inttoptr(node->assign.value);
-    case NODE_CALL:
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_inttoptr(node->call.args[i])) return true;
-        return false;
-    case NODE_INTRINSIC:
-        for (int i = 0; i < node->intrinsic.arg_count; i++)
-            if (has_inttoptr(node->intrinsic.args[i])) return true;
-        return false;
-    default: return false;
-    }
-}
+/* has_inttoptr removed — auto-discovery removed (2026-04-01 decision).
+ * mmio validation now uses startup @probe of declared ranges instead. */
 
 void emit_file(Emitter *e, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
@@ -3721,92 +3667,38 @@ void emit_file(Emitter *e, Node *file_node) {
 
     emit(e, "\n");
 
-    /* MMIO auto-discovery: if @inttoptr is used + no mmio declared + --no-strict-mmio,
-     * emit 5-phase hardware discovery with __attribute__((constructor)). */
-    if (e->checker->no_strict_mmio && e->checker->mmio_range_count == 0 &&
-        has_inttoptr(file_node)) {
-        emit(e, "/* MMIO auto-discovery — 5-phase hardware scan at boot */\n");
-        emit(e, "static uint32_t _zer_disc[256][2];\n");
-        emit(e, "static int _zer_disc_count = 0;\n\n");
-
-        emit(e, "static int _zer_in_disc(uint32_t addr) {\n");
-        emit(e, "    for (int i = 0; i < _zer_disc_count; i++)\n");
-        emit(e, "        if (addr >= _zer_disc[i][0] && addr <= _zer_disc[i][1]) return 1;\n");
-        emit(e, "    return 0;\n");
-        emit(e, "}\n\n");
-
-        emit(e, "static void _zer_disc_add(uint32_t start, uint32_t end) {\n");
-        emit(e, "    if (_zer_disc_count < 256) {\n");
-        emit(e, "        _zer_disc[_zer_disc_count][0] = start;\n");
-        emit(e, "        _zer_disc[_zer_disc_count][1] = end;\n");
-        emit(e, "        _zer_disc_count++;\n");
-        emit(e, "    }\n");
-        emit(e, "}\n\n");
-
-        emit(e, "static void _zer_disc_scan(uint32_t start, uint32_t end, uint32_t step) {\n");
-        emit(e, "    for (uint32_t b = start; b <= end && _zer_disc_count < 256; b += step) {\n");
-        emit(e, "        if (!_zer_in_disc(b) && _zer_probe(b).has_value)\n");
-        emit(e, "            _zer_disc_add(b, b + step - 1);\n");
-        emit(e, "        if (b > (uint32_t)(0xFFFFFFFFu - step)) break;\n");
-        emit(e, "    }\n");
-        emit(e, "}\n\n");
-
-        /* Brute-force clock/power controller discovery */
-        emit(e, "static void _zer_disc_brute_enable(uint32_t scan_start, uint32_t scan_end, uint32_t step) {\n");
-        emit(e, "    int baseline = _zer_disc_count;\n");
-        emit(e, "    for (int i = 0; i < baseline; i++) {\n");
-        emit(e, "        volatile uint32_t *regs = (volatile uint32_t *)(uintptr_t)_zer_disc[i][0];\n");
-        emit(e, "        uint32_t saved[16];\n");
-        emit(e, "        int r;\n");
-        emit(e, "        for (r = 0; r < 16; r++) saved[r] = regs[r];\n");
-        emit(e, "        for (r = 0; r < 16; r++) regs[r] = 0xFFFFFFFFu;\n");
-        emit(e, "        int found_new = 0;\n");
-        emit(e, "        for (uint32_t t = scan_start; t <= scan_end && !found_new; t += step * 8) {\n");
-        emit(e, "            if (!_zer_in_disc(t) && _zer_probe(t).has_value) found_new = 1;\n");
-        emit(e, "            if (t > (uint32_t)(0xFFFFFFFFu - step * 8)) break;\n");
-        emit(e, "        }\n");
-        emit(e, "        if (found_new) break;\n");
-        emit(e, "        for (r = 0; r < 16; r++) regs[r] = saved[r];\n");
-        emit(e, "    }\n");
-        emit(e, "}\n\n");
-
-        /* Main discovery function — runs before main()
-         * On bare-metal (ARM/RISC-V/AVR): full 5-phase scan
-         * On hosted (x86): skip scan, validate each @inttoptr individually via _zer_probe */
-        emit(e, "#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)\n");
-        emit(e, "__attribute__((constructor))\n");
-        emit(e, "static void _zer_mmio_discover(void) {\n");
-        emit(e, "    uint32_t s_start, s_end, s_step;\n");
-        emit(e, "#if defined(__ARM_ARCH)\n");
-        emit(e, "    s_start = 0x40000000u; s_end = 0x5FFFFFFFu; s_step = 0x1000u;\n");
-        emit(e, "#elif defined(__riscv)\n");
-        emit(e, "    s_start = 0x10000000u; s_end = 0x1FFFFFFFu; s_step = 0x1000u;\n");
-        emit(e, "#else /* AVR */\n");
-        emit(e, "    s_start = 0x00u; s_end = 0xFFu; s_step = 0x01u;\n");
-        emit(e, "#endif\n");
-        emit(e, "    /* Phase 1: initial scan */\n");
-        emit(e, "    _zer_disc_scan(s_start, s_end, s_step);\n");
-        emit(e, "    /* Phase 2: brute-force clock controller */\n");
-        emit(e, "    _zer_disc_brute_enable(s_start, s_end, s_step);\n");
-        emit(e, "    /* Phase 3: rescan (clock-gated peripherals) */\n");
-        emit(e, "    _zer_disc_scan(s_start, s_end, s_step);\n");
-        emit(e, "    /* Phase 4: brute-force power controller */\n");
-        emit(e, "    _zer_disc_brute_enable(s_start, s_end, s_step);\n");
-        emit(e, "    /* Phase 5: final rescan (power-gated peripherals) */\n");
-        emit(e, "    _zer_disc_scan(s_start, s_end, s_step);\n");
-        emit(e, "}\n");
-        emit(e, "#endif\n\n");
-
-        /* Validation function for @inttoptr
-         * Bare-metal: check against discovered map
-         * Hosted (x86): probe each address directly (no startup scan) */
-        emit(e, "static int _zer_mmio_valid(uint32_t addr) {\n");
-        emit(e, "#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)\n");
-        emit(e, "    return _zer_in_disc(addr);\n");
-        emit(e, "#else\n");
-        emit(e, "    return _zer_probe(addr).has_value;\n");
-        emit(e, "#endif\n");
-        emit(e, "}\n\n");
+    /* MMIO declaration startup validation: @probe each declared mmio range
+     * at boot to verify hardware is actually present. Catches wrong datasheet
+     * addresses at first power-on instead of hours later in untested code paths.
+     * Auto-discovery removed (2026-04-01 decision) — see safety-roadmap.md. */
+    /* Emit mmio startup validation only for real hardware ranges.
+     * Skip when range covers entire address space (test/development wildcard)
+     * or when running on hosted x86 (no real MMIO hardware). */
+    {
+        int real_ranges = 0;
+        for (int i = 0; i < e->checker->mmio_range_count; i++) {
+            /* skip wildcard "allow all" range (0x0..0xFFFFFFFFFFFFFFFF) */
+            if (e->checker->mmio_ranges[i][0] == 0 &&
+                e->checker->mmio_ranges[i][1] >= 0xFFFFFFFF) continue;
+            real_ranges++;
+        }
+        if (real_ranges > 0) {
+            emit(e, "/* MMIO startup validation — verify declared ranges have real hardware */\n");
+            emit(e, "#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)\n");
+            emit(e, "__attribute__((constructor))\n");
+            emit(e, "static void _zer_mmio_validate(void) {\n");
+            for (int i = 0; i < e->checker->mmio_range_count; i++) {
+                if (e->checker->mmio_ranges[i][0] == 0 &&
+                    e->checker->mmio_ranges[i][1] >= 0xFFFFFFFF) continue;
+                emit(e, "    if (!_zer_probe(0x%llxu).has_value)\n",
+                     (unsigned long long)e->checker->mmio_ranges[i][0]);
+                emit(e, "        _zer_trap(\"mmio 0x%llx..0x%llx: no hardware detected\", __FILE__, __LINE__);\n",
+                     (unsigned long long)e->checker->mmio_ranges[i][0],
+                     (unsigned long long)e->checker->mmio_ranges[i][1]);
+            }
+            emit(e, "}\n");
+            emit(e, "#endif\n\n");
+        }
     }
 
     /* emit declarations — uses unified emit_top_level_decl (RF2) */

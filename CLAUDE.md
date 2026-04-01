@@ -251,7 +251,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
-| Invalid MMIO address | `mmio` declarations (compile-time) + `@probe` auto-discovery (boot-time, 5-phase scan) + `--no-strict-mmio` auto-validation |
+| Invalid MMIO address | `mmio` declarations (compile-time) + startup @probe validation of declared ranges (boot-time) + `--no-strict-mmio` for unchecked access |
 | Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
 | Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
@@ -298,7 +298,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Whole-program *opaque param provenance | Done | N/A (compile-time — call-site validation) |
 | Struct field range propagation | Done | Done (guards on s.field work) |
 | @probe (safe MMIO hardware discovery) | Done | Done (platform-specific fault handler) |
-| MMIO auto-discovery (5-phase boot scan) | Done | Done (constructor, --no-strict-mmio) |
+| MMIO startup validation (declared ranges) | Done | Done (constructor, @probe at boot) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 
@@ -342,7 +342,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 
 **Roadmap:**
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
-- **v0.2.1 (CURRENT):** comptime functions + comptime if, mmio range validation, @ptrcast/@container provenance tracking, safe intrinsics, zer-convert preprocessor→comptime, FULL SAFETY ROADMAP: value range propagation, bounds auto-guard, forced division guard (incl. struct fields), @cstr auto-orelse, auto-keep on fn ptr params, array-level + whole-program *opaque provenance, zercheck 1-4 (MAYBE_FREED + leaks + loops + cross-func), @probe safe MMIO discovery (5-phase boot scan), 400+ bug fixes, 1,500+ tests
+- **v0.2.1 (CURRENT):** comptime functions + comptime if, mmio range validation + startup @probe validation, @ptrcast/@container provenance tracking, safe intrinsics, zer-convert preprocessor→comptime, FULL SAFETY ROADMAP: value range propagation, bounds auto-guard, forced division guard (incl. struct fields), @cstr auto-orelse, auto-keep on fn ptr params, array-level + whole-program *opaque provenance, zercheck 1-4 (MAYBE_FREED + leaks + loops + cross-func), @probe safe MMIO reads, 400+ bug fixes, 1,500+ tests
 - **v0.3:** better error messages, stdlib completion (io/fmt/conv)
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 

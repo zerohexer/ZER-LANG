@@ -1731,35 +1731,21 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 **Important:** `NODE_INTRINSIC` returning `?T` must be handled in var-decl optional init path — added to the `NODE_CALL || NODE_ORELSE` check that assigns directly (without `{ val, 1 }` wrapping).
 
-## MMIO Auto-Discovery (emitter.c)
+## MMIO Validation (emitter.c)
 
-When `--no-strict-mmio` is set AND `@inttoptr` is used AND no `mmio` ranges declared, the emitter auto-generates a 5-phase hardware discovery system.
+**5-phase auto-discovery REMOVED (2026-04-01 decision).** See `docs/safety-roadmap.md` for full rationale. Summary: auto-discovery couldn't find locked/gated/write-only peripherals (~80% coverage presented as 100%), was chip-family-specific (STM32-centric), and `_zer_mmio_valid()` false-blocked legitimate MMIO accesses.
 
-**Detection:** `has_inttoptr(file_node)` scans AST for any NODE_INTRINSIC with name "inttoptr".
+**Replaced with: mmio declaration startup validation.** When `mmio` ranges are declared, emitter generates `_zer_mmio_validate()` as `__attribute__((constructor))`. Probes the start address of each declared range via `_zer_probe()`. If hardware doesn't respond → trap with "no hardware detected" message. Catches wrong datasheet addresses at first power-on.
 
-**Emitted functions:**
-- `_zer_disc_scan(start, end, step)` — probe address range at block granularity
-- `_zer_disc_brute_enable(start, end, step)` — brute-force clock/power controller (write 0xFFFFFFFF to each block, check if new blocks appear)
-- `_zer_mmio_discover()` — `__attribute__((constructor))`, runs 5 phases before main
-- `_zer_mmio_valid(addr)` — checks if address is in discovered map
-
-**Platform behavior:**
-- ARM/RISC-V/AVR: full 5-phase boot scan (~12ms on Cortex-M at 72MHz)
-- x86 hosted: per-access probe via `_zer_probe()` (no startup scan — x86 address space is different)
-
-**@inttoptr emission with discovery:** wraps variable addresses with `if (!_zer_mmio_valid(addr)) { return <zero>; }` — auto-guard pattern, same as bounds.
-
-**5 phases:**
-1. Initial scan — find always-on peripherals
-2. Brute-force clock controller — write to blocks, check if new blocks appear
-3. Rescan — find clock-gated peripherals
-4. Brute-force power controller — same technique
-5. Final rescan — find power-gated peripherals
+**Skips:**
+- Wildcard ranges (`mmio 0x0..0xFFFFFFFFFFFFFFFF;`) — clearly test/dev, not real hardware
+- x86 hosted (`#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)`) — no real MMIO on hosted
 
 **Flags:**
-- (none): strict mode, `mmio` required, @inttoptr without declaration = compile error
-- `--no-strict-mmio`: auto-probe at boot, @inttoptr compiles, validated against discovered map
-- `--discover`: (planned) same as `--no-strict-mmio` + prints discovered ranges to console
+- (none): strict mode, `mmio` required, @inttoptr without declaration = compile error. Declared ranges validated at boot.
+- `--no-strict-mmio`: allows @inttoptr without `mmio` declarations — plain cast, no validation (programmer's choice, like C)
+
+**@probe remains as standalone intrinsic** for manual hardware discovery. `@probe(addr)` → `?u32`, safe read with fault handler.
 
 ## Test Counts (v0.2.1 final)
 
@@ -1799,4 +1785,4 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 
 ## Session v0.2.1 Final (2026-03-30/31)
 
-525 checker + 233 E2E + 50 zercheck. 4 audit rounds, 4 bugs fixed. Only 2 runtime cases: *opaque from cinclude + INT_MIN/-1. ZER is the only language with @probe MMIO auto-discovery.
+525 checker + 233 E2E + 50 zercheck. 4 audit rounds, 4 bugs fixed. Only 2 runtime cases: *opaque from cinclude + INT_MIN/-1. Auto-discovery removed (2026-04-01) — replaced with mmio startup validation via @probe of declared ranges.

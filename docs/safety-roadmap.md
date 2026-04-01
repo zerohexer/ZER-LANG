@@ -1807,3 +1807,61 @@ ZER is NOT competing for web developers, application programmers, or systems pro
 These engineers will NOT learn new syntax. They will NOT write proofs. They will NOT change their build system. They WILL accept "same code, fewer bugs, same compiler" if the evidence is compelling.
 
 The safety roadmap's value proposition: **"Your code, but the compiler catches your bugs before they reach hardware."**
+
+---
+
+## Design Decision: Remove 5-Phase Auto-Discovery (decided 2026-04-01)
+
+**Decision:** Remove the 5-phase brute-force auto-discovery boot scan (Phases 1-5 above) and `_zer_mmio_valid()` runtime gate. Keep `@probe` as a standalone intrinsic. Keep `mmio` declarations with compile-time validation.
+
+**What is removed:**
+- 5-phase boot scan (`_zer_mmio_discover` constructor): initial scan, RCC brute-force, rescan, power controller brute-force, final rescan
+- `_zer_mmio_valid()` — runtime validation of `@inttoptr` against discovered map
+- `_zer_in_disc()` / `_zer_disc_scan()` / `_zer_disc_brute_enable()` helpers
+- `has_inttoptr()` AST scan that triggered discovery emission
+- `--no-strict-mmio` no longer emits any discovery infrastructure
+
+**What is kept:**
+- `mmio` declarations — compile-time `@inttoptr` address validation (100% correct)
+- `@probe(addr)` intrinsic — safe read returning `?u32`, no crash on fault (100% accurate)
+- `@probe` fault handler preamble (ARM HardFault, RISC-V exception, x86 SIGSEGV) — needed by @probe
+- `--no-strict-mmio` flag — allows `@inttoptr` without `mmio` declarations (no validation, like C)
+
+**Why removed:**
+1. **False negatives → false blocking.** Auto-discovery can't find locked peripherals (watchdog behind KEY register), TrustZone-gated peripherals, write-only registers, or peripherals behind vendor-specific unlock sequences. `_zer_mmio_valid()` blocks access to these valid addresses — the "safety" mechanism becomes a bug source.
+2. **Chip-family-specific.** RCC brute-forcing is STM32-centric. NXP, TI, Microchip, Nordic have different clock architectures. The code pretends to be universal but isn't.
+3. **Overpromises.** "100% coverage guarantee" in the original design is false. @probe can only find hardware that responds to reads. Locked/gated/write-only hardware exists but doesn't respond. ~80% coverage presented as 100%.
+4. **Complexity vs value.** ~150 lines of platform-specific emitted C, boot-time overhead (~12ms), and runtime validation on every `@inttoptr` — all for a heuristic that can't be trusted.
+
+**What replaces it — mmio declaration startup validation (simpler, correct):**
+Instead of discovering unknown hardware, validate known declarations. At boot, @probe each declared mmio range start address. If the hardware doesn't respond, trap immediately with a clear message. Wrong datasheet address caught at first power-on, not hours later in an untested code path.
+
+```c
+// Emitted C — runs before main()
+__attribute__((constructor))
+static void _zer_mmio_validate(void) {
+    if (!_zer_probe(0x40020000).has_value)
+        _zer_trap("mmio 0x40020000..0x40020FFF: no hardware detected");
+    if (!_zer_probe(0x40011000).has_value)
+        _zer_trap("mmio 0x40011000..0x4001103F: no hardware detected");
+}
+```
+
+- Probes only declared ranges (2-5 addresses, not thousands)
+- Microseconds, not milliseconds
+- No false positives — validates what the programmer declared
+- Wrong address from datasheet → instant trap at boot
+
+**@probe remains useful standalone** — programmers who want to discover hardware write their own scan loop:
+```zer
+for (u32 base = 0x40000000; base < 0x50000000; base += 0x1000) {
+    ?u32 val = @probe(base);
+    if (val) |v| { /* found peripheral at base */ }
+}
+```
+
+**Revised MMIO safety layers:**
+1. **Compile-time:** `mmio` declarations validate `@inttoptr` addresses (100%)
+2. **Boot-time:** @probe validates declared ranges have real hardware (catches wrong datasheet)
+3. **Manual:** @probe available for programmer-driven discovery
+4. **`--no-strict-mmio`:** allows @inttoptr without declarations — no validation (programmer's choice)

@@ -2753,6 +2753,29 @@ int main(void) {
        "void c() { b(); }\n",
        "stack: chain call, no recursion OK");
 
+    /* ---- Struct wrapper escape detection ---- */
+    printf("\n--- struct wrapper local escape ---\n");
+
+    printf("[struct escape: identity(wrap(&x).p) → error]\n");
+    err("struct Box { *u32 p; }\n"
+        "Box wrap(*u32 p) { Box b; b.p = p; return b; }\n"
+        "*u32 identity(*u32 p) { return p; }\n"
+        "*u32 leak() { u32 x = 5; return identity(wrap(&x).p); }\n",
+        "struct escape: identity(wrap(&x).p) caught");
+
+    printf("[struct escape: Box b = wrap(&x); return b.p → error]\n");
+    err("struct Box { *u32 p; }\n"
+        "Box wrap(*u32 p) { Box b; b.p = p; return b; }\n"
+        "*u32 leak() { u32 x = 5; Box b = wrap(&x); return b.p; }\n",
+        "struct escape: intermediate var b = wrap(&x), return b.p caught");
+
+    printf("[struct escape: wrap(global_ptr).p → ok]\n");
+    ok("struct Box { *u32 p; }\n"
+       "u32 g = 5;\n"
+       "Box wrap(*u32 p) { Box b; b.p = p; return b; }\n"
+       "*u32 safe() { return wrap(&g).p; }\n",
+       "struct escape: global pointer — no escape, OK");
+
     /* ---- Cross-platform portability ---- */
     printf("\n--- cross-platform portability ---\n");
 

@@ -414,6 +414,18 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                     return true;
             }
         }
+        /* struct field from call: wrap(&x).p — walk to call root, check args */
+        {
+            Node *froot = arg;
+            while (froot && (froot->kind == NODE_FIELD || froot->kind == NODE_INDEX)) {
+                if (froot->kind == NODE_FIELD) froot = froot->field.object;
+                else froot = froot->index_expr.object;
+            }
+            if (froot && froot->kind == NODE_CALL && froot != arg) {
+                if (call_has_local_derived_arg(c, froot, depth + 1))
+                    return true;
+            }
+        }
     }
     return false;
 }
@@ -4072,13 +4084,15 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-360/374: function call returning pointer — if any pointer arg is
-             * local-derived, conservatively mark the result as local-derived.
+            /* BUG-360/374: function call with local-derived arg — if any pointer
+             * arg is local-derived, conservatively mark the result as local-derived.
              * identity(&x) returns &x, must not escape.
              * BUG-374: recurse into nested calls — identity(identity(&x)).
-             * BUG-383: also walk through field/index chains — wrap(&x).p. */
+             * BUG-383: also walk through field/index chains — wrap(&x).p.
+             * Applies to BOTH pointer results AND struct results (struct may
+             * contain pointer fields carrying the local pointer). */
             if (sym && node->var_decl.init && type &&
-                type->kind == TYPE_POINTER) {
+                (type->kind == TYPE_POINTER || type->kind == TYPE_STRUCT)) {
                 Node *call = node->var_decl.init;
                 if (call->kind == NODE_ORELSE) call = call->orelse.expr;
                 /* BUG-383: walk through field/index to find call root */

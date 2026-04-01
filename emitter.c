@@ -3626,8 +3626,8 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    if (s->page_count >= s->page_cap) {\n");
     emit(e, "        uint32_t nc = s->page_cap < 4 ? 4 : s->page_cap * 2;\n");
     emit(e, "        char **np = (char**)calloc(nc, sizeof(char*));\n");
-    emit(e, "        uint32_t *ng = (uint32_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint32_t));\n");
-    emit(e, "        uint8_t *nu = (uint8_t*)calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint8_t));\n");
+    emit(e, "        uint32_t *ng = (uint32_t*)calloc((size_t)nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint32_t));\n");
+    emit(e, "        uint8_t *nu = (uint8_t*)calloc((size_t)nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint8_t));\n");
     emit(e, "        if (!np || !ng || !nu) { *ok = 0; return 0; }\n");
     emit(e, "        if (s->pages) { memcpy(np, s->pages, s->page_count * sizeof(char*)); free(s->pages); }\n");
     emit(e, "        if (s->gen) { memcpy(ng, s->gen, s->total_slots * sizeof(uint32_t)); free(s->gen); }\n");

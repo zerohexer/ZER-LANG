@@ -2185,8 +2185,13 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Pool/Slab gen arrays start at 0 (C static init / calloc). First alloc returns handle `(gen=0 << 32 | idx=0)` = 0. Zero-initialized Handle also = 0. Match → silent UAF.
 - **Fix:** In alloc, before returning handle: `if (gen[i] == 0) gen[i] = 1`. First alloc returns gen=1. Zero handle (gen=0) never matches any valid allocation. Applied to Pool alloc, Slab alloc (scan path), and Slab alloc (grow path).
 
-### KNOWN LIMITATION: struct wrapper launders local-derived pointers
-- **Symptom:** `Box wrap(*u32 p) { Box b; b.p = p; return b; }` then `return wrap(&x).p` — local pointer escapes via struct field. Checker doesn't catch it.
-- **Root cause:** `is_local_derived` tracks per-symbol. `wrap(&x)` returns a struct by value — no symbol to mark. The struct's pointer field carries `&x` but the checker can't see through the function call to know the returned struct contains a local pointer.
-- **Status:** Known limitation. Fixing requires interprocedural escape analysis through struct fields — research-level complexity. Direct `return &x`, `return p` (where p=&x), and `return @ptrcast(*u32, p)` are all caught. Only the struct-field-wrapping path escapes.
-- **Workaround:** Use `keep` on the pointer parameter if it will be stored.
+### Struct wrapper launders local-derived pointers — FIXED
+- **Symptom:** `return identity(wrap(&x).p)` and `Box b = wrap(&x); return b.p` — local pointer escapes via struct field wrapping. Checker missed it.
+- **Root cause:** Two gaps: (1) `call_has_local_derived_arg` didn't check NODE_FIELD on NODE_CALL args (missed `wrap(&x).p` as arg to `identity`). (2) NODE_VAR_DECL only marked local-derived for pointer results, not struct results containing pointers.
+- **Fix:** (1) Added field-to-call-root walk in `call_has_local_derived_arg` — if arg is NODE_FIELD chain leading to NODE_CALL with local-derived args, return true. (2) Extended var-decl local-derived check from `TYPE_POINTER` only to `TYPE_POINTER || TYPE_STRUCT`. Struct result from call with local-derived args marks the variable.
+- **Test:** 3 new checker tests: identity(wrap(&x).p), Box b = wrap(&x) return b.p, wrap(global).p OK.
+
+### Slab metadata calloc overflow on 64-bit
+- **Symptom:** Heap corruption when Slab grows to many pages on 64-bit systems.
+- **Root cause:** `calloc(nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint32_t))` — `nc` is uint32_t, multiplication overflows at 2^26 pages (2^32 items). calloc gets tiny value, memcpy overwrites heap.
+- **Fix:** Cast to size_t: `calloc((size_t)nc * _ZER_SLAB_PAGE_SLOTS, ...)`. Applied to both gen and used arrays.

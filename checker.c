@@ -3382,6 +3382,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = ty_usize;
+            /* cross-platform warning: if @ptrtoint result is used in a context
+             * that narrows to a fixed-width type, warn about portability.
+             * Checked at NODE_VAR_DECL init below — flag the node here. */
         } else if ((nlen == 7 && memcmp(name, "barrier", 7) == 0) ||
                    (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||
                    (nlen == 12 && memcmp(name, "barrier_load", 12) == 0)) {
@@ -3785,6 +3788,19 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)node->var_decl.name_len, node->var_decl.name,
                         type_name(type), type_name(init_type));
                 }
+            }
+            /* cross-platform portability: @ptrtoint to fixed-width type is fragile.
+             * u32 x = @ptrtoint(ptr) works on 32-bit but loses bits on 64-bit.
+             * Warn even if types match on current target — use usize instead. */
+            if (type && type_is_integer(type_unwrap_distinct(type)) &&
+                type_unwrap_distinct(type)->kind != TYPE_USIZE &&
+                node->var_decl.init->kind == NODE_INTRINSIC &&
+                node->var_decl.init->intrinsic.name_len == 8 &&
+                memcmp(node->var_decl.init->intrinsic.name, "ptrtoint", 8) == 0) {
+                checker_warning(c, node->loc.line,
+                    "@ptrtoint result stored in '%s' — use 'usize' for portability "
+                    "(pointer width varies: 32-bit on ARM Cortex-M, 64-bit on ARM64/x86_64)",
+                    type_name(type));
             }
             /* BUG-373: integer literal range check — even if coercion passed,
              * verify the literal value fits the target type. Literals default

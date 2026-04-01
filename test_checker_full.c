@@ -2753,6 +2753,28 @@ int main(void) {
        "void c() { b(); }\n",
        "stack: chain call, no recursion OK");
 
+    /* ---- Cross-platform portability ---- */
+    printf("\n--- cross-platform portability ---\n");
+
+    printf("[portability: @ptrtoint to usize → ok]\n");
+    ok("mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+       "void f() {\n"
+       "    u32 x = 42;\n"
+       "    usize addr = @ptrtoint(&x);\n"
+       "}\n",
+       "portability: @ptrtoint to usize OK");
+
+    /* Note: @ptrtoint to u32 produces a WARNING (not error),
+     * so ok() still passes — warnings don't count as failures.
+     * The warning is for portability only. */
+    printf("[portability: @ptrtoint to u32 → warning (compiles)]\n");
+    ok("mmio 0x0..0xFFFFFFFFFFFFFFFF;\n"
+       "void f() {\n"
+       "    u32 x = 42;\n"
+       "    u32 addr = @ptrtoint(&x);\n"
+       "}\n",
+       "portability: @ptrtoint to u32 — warning but compiles");
+
     /* ---- @inttoptr alignment check ---- */
     printf("\n[@inttoptr alignment: u32 at misaligned address → error]\n");
     err("mmio 0x40020000..0x40020FFF;\n"

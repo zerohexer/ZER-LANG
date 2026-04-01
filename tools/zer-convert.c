@@ -993,16 +993,28 @@ static void transform(void) {
                                     bscan++;
                                 }
                                 if (has_unconvertible) {
-                                    /* extract to .h file — can't convert to comptime */
-                                    emit_str("// MANUAL: macro with #/## — use cinclude\n// ");
-                                    emit_str("#define ");
-                                    emit_tok(name);
-                                    /* emit rest of line as comment */
+                                    /* extract to companion .h — can't convert to comptime */
+                                    needs_extract = true;
+                                    extract_str("#define ");
+                                    extract_tok(name);
+                                    /* extract rest of line (params + body) */
                                     while (j < token_count && tokens[j].type != CT_NEWLINE &&
                                            tokens[j].type != CT_EOF) {
-                                        emit_tok(&tokens[j]); j++;
+                                        /* handle line continuation */
+                                        if (tokens[j].type == CT_UNKNOWN && tokens[j].len == 1 &&
+                                            tokens[j].start[0] == '\\') {
+                                            extract_str("\\\n");
+                                            j++;
+                                            if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                                            continue;
+                                        }
+                                        extract_tok(&tokens[j]); j++;
                                     }
-                                    emit_str("\n");
+                                    extract_str("\n");
+                                    /* emit declaration in .zer so the macro name is usable */
+                                    emit_str("// extracted to .h: ");
+                                    emit_tok(name);
+                                    emit_str(" (stringify/variadic macro)\n");
                                     if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
                                     i = j;
                                     continue;

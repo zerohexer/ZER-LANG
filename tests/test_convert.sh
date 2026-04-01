@@ -541,17 +541,17 @@ check_phase1 "void * still works" \
 
 echo "--- P1: stringify/token-paste macros ---"
 
-check_phase1 "stringify macro → MANUAL comment" \
+check_phase1 "stringify macro → extracted to .h" \
     '#define STR(x) #x' \
-    "// MANUAL: macro with #/##"
+    "// extracted to .h: STR"
 
 check_phase1_absent "stringify macro — no comptime" \
     '#define STR(x) #x' \
     "comptime u32 STR"
 
-check_phase1 "variadic macro → MANUAL comment" \
+check_phase1 "variadic macro → extracted to .h" \
     '#define LOG(fmt, ...) printf(fmt, __VA_ARGS__)' \
-    "// MANUAL: macro with #/##"
+    "// extracted to .h: LOG"
 
 check_phase1_absent "variadic macro — no comptime" \
     '#define LOG(fmt, ...) printf(fmt, __VA_ARGS__)' \

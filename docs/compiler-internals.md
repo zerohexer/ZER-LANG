@@ -1799,6 +1799,8 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 **Global init:** `u32 mask = BIT(3);` at global scope allowed — check skips `NODE_CALL` when `is_comptime_resolved` is true.
 
+**Recursion guard:** `eval_comptime_block` has `static int depth` (limit 32). `eval_comptime_call_subst` has `_comptime_call_depth` (limit 16). `eval_const_expr_subst` NODE_CALL handler has `_subst_depth` (limit 32). Three-layer guard prevents compiler crash from `comptime u32 f() { return f(); }`.
+
 **Limitation:** comptime returns `int64_t` only. No structs/slices/pointers.
 
 ## zercheck Struct Copy Aliasing (zercheck.c)

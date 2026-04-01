@@ -2165,3 +2165,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Removed:** `has_inttoptr()` AST scanner, `_zer_disc_scan`, `_zer_disc_brute_enable`, `_zer_mmio_discover` constructor, `_zer_mmio_valid`, `_zer_in_disc`, `_zer_disc_add`, `need_discovery_check` path in @inttoptr emission.
 - **Added:** mmio declaration startup validation — `_zer_mmio_validate()` as `__attribute__((constructor))` probes start address of each declared `mmio` range via `@probe()`. Wrong datasheet address caught at first power-on. Skips wildcard ranges and x86 hosted.
 - **@probe kept:** Standalone intrinsic for safe MMIO reads. Fault handler preamble unchanged.
+
+### Comptime mutual recursion segfault
+- **Symptom:** `comptime u32 crash(u32 n) { return crash(n); }` with `u32[crash(1)] arr;` caused compiler segfault (stack overflow from infinite recursion in comptime evaluator).
+- **Root cause:** `eval_comptime_block` and `eval_comptime_call_subst` had no recursion depth limit. `eval_const_expr_d` had depth limit (BUG-389) but the comptime function evaluator path bypassed it.
+- **Fix:** Added `static int depth` counter in `eval_comptime_block` (limit 32) and `_comptime_call_depth` in `eval_comptime_call_subst` (limit 16). Also added `_subst_depth` guard in `eval_const_expr_subst` NODE_CALL handler. Three-layer guard prevents stack overflow from any recursion path.
+- **Test:** 1 new checker test (comptime mutual recursion → error, not crash).
+- **Note:** Previous Docker builds were caching old code, masking the fix. Required `docker build --no-cache` to verify. Also found leftover `_comptime_block_depth` reference from partial edit — caused compile failure in Docker.

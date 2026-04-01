@@ -2833,6 +2833,12 @@ int main(void) {
        "u32 main() { return 0; }\n",
        "comptime nested: BUF_SIZE()=BIT(3)*4=32 as array size");
 
+    printf("[comptime: mutual recursion → error (not crash)]\n");
+    err("comptime u32 crash(u32 n) { return crash(n); }\n"
+        "u32[crash(1)] arr;\n"
+        "u32 main() { return 0; }\n",
+        "comptime: infinite recursion caught, not segfault");
+
     printf("[comptime global: BIT(3) at global scope]\n");
     ok("comptime u32 BIT(u32 n) { return 1 << n; }\n"
        "u32 mask = BIT(3);\n"

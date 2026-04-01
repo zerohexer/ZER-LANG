@@ -853,10 +853,13 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
 /* Resolve a comptime NODE_CALL within eval_const_expr_subst.
  * Looks up the callee as a comptime function and recursively evaluates. */
 static Scope *_comptime_global_scope; /* set by caller before eval */
+static int _comptime_call_depth = 0;  /* recursion guard for nested comptime calls */
 static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params, int outer_count) {
     if (!call || call->kind != NODE_CALL || !call->call.callee ||
         call->call.callee->kind != NODE_IDENT || !_comptime_global_scope)
         return CONST_EVAL_FAIL;
+    if (_comptime_call_depth > 16) return CONST_EVAL_FAIL; /* prevent infinite recursion */
+    _comptime_call_depth++;
     Symbol *sym = scope_lookup(_comptime_global_scope,
         call->call.callee->ident.name, (uint32_t)call->call.callee->ident.name_len);
     if (!sym || !sym->is_comptime || !sym->func_node) return CONST_EVAL_FAIL;
@@ -871,7 +874,9 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
         cparams[i].name_len = (uint32_t)fn->func_decl.params[i].name_len;
         cparams[i].value = av;
     }
-    return eval_comptime_block(fn->func_decl.body, cparams, pc);
+    int64_t result = eval_comptime_block(fn->func_decl.body, cparams, pc);
+    _comptime_call_depth--;
+    return result;
 }
 
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
@@ -887,8 +892,14 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     }
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_BOOL_LIT) return n->bool_lit.value ? 1 : 0;
-    /* nested comptime function calls */
-    if (n->kind == NODE_CALL) return eval_comptime_call_subst(n, params, param_count);
+    /* nested comptime function calls — depth guard prevents stack overflow */
+    if (n->kind == NODE_CALL) {
+        static int _subst_depth = 0;
+        if (++_subst_depth > 32) { _subst_depth--; return CONST_EVAL_FAIL; }
+        int64_t r = eval_comptime_call_subst(n, params, param_count);
+        _subst_depth--;
+        return r;
+    }
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
@@ -929,15 +940,21 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
 static int64_t eval_comptime_stmt(Node *n, ComptimeParam *params, int param_count);
 
 static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param_count) {
+    static int depth = 0;
     if (!block) return CONST_EVAL_FAIL;
+    if (depth++ > 32) { depth--; return CONST_EVAL_FAIL; }
+    int64_t result;
     if (block->kind == NODE_BLOCK) {
+        result = CONST_EVAL_FAIL;
         for (int i = 0; i < block->block.stmt_count; i++) {
             int64_t r = eval_comptime_stmt(block->block.stmts[i], params, param_count);
-            if (r != CONST_EVAL_FAIL) return r; /* hit a return */
+            if (r != CONST_EVAL_FAIL) { result = r; break; }
         }
-        return CONST_EVAL_FAIL;
+    } else {
+        result = eval_comptime_stmt(block, params, param_count);
     }
-    return eval_comptime_stmt(block, params, param_count);
+    depth--;
+    return result;
 }
 
 static int64_t eval_comptime_stmt(Node *n, ComptimeParam *params, int param_count) {

@@ -3449,6 +3449,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
     emit(e, "        if (!used[i] && gen[i] != 0xFFFFFFFFu) {\n");
     emit(e, "            used[i] = 1;\n");
+    emit(e, "            if (gen[i] == 0) gen[i] = 1; /* zero handle must not match any valid alloc */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -3616,6 +3617,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    for (uint32_t i = 0; i < s->total_slots; i++) {\n");
     emit(e, "        if (!s->used[i] && s->gen[i] != 0xFFFFFFFFu) {\n");
     emit(e, "            s->used[i] = 1;\n");
+    emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1; /* zero handle must not match */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)s->gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -3639,6 +3641,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    s->page_count++;\n");
     emit(e, "    s->total_slots += _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    s->used[base] = 1;\n");
+    emit(e, "    if (s->gen[base] == 0) s->gen[base] = 1; /* zero handle must not match */\n");
     emit(e, "    *ok = 1;\n");
     emit(e, "    return ((uint64_t)s->gen[base] << 32) | base;\n");
     emit(e, "}\n\n");

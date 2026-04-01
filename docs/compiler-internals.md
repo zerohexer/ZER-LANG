@@ -836,6 +836,7 @@ Two tools + one library for automated C-to-ZER migration:
 - Method interception passes `&name` to runtime helpers (unlike Pool which passes individual arrays)
 - Same restrictions as Pool: must be global/static, not copyable, not in struct fields, get() is non-storable
 - **ABA prevention:** gen counter capped at 0xFFFFFFFF (never wraps). Free: `if (gen < max) gen++`. Alloc: skip slots where `gen == max` (permanently retired, used=0 so get() traps). Prevents silent use-after-free after 2^32 alloc/free cycles per slot. Applied to both Pool and Slab.
+- **Zero-handle safety:** Alloc bumps gen from 0 to 1 on first use: `if (gen[i] == 0) gen[i] = 1`. Zero-initialized `Handle(T) h;` has gen=0, which never matches any valid allocation (all start at gen≥1). Prevents silent access via uninitialized handles.
 
 ### Critical Patterns That Cause Bugs — READ BEFORE MODIFYING
 

@@ -2179,3 +2179,8 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Cap gen at 0xFFFFFFFF (never wrap). In free: `if (gen[idx] < 0xFFFFFFFFu) gen[idx]++`. In alloc: skip slots where `gen[idx] == 0xFFFFFFFFu` (permanently retired). Retired slots stay used=0 so get() always traps. One slot lost per 2^32 cycles — negligible.
 - **Applied to:** Both Pool (`_zer_pool_alloc`/`_zer_pool_free`) and Slab (`_zer_slab_alloc`/`_zer_slab_free`).
 - **Note:** First proposed fix (set used=1 on wrap) was WRONG — would let stale handles with gen=0 pass get() check. Correct fix keeps slot free (used=0) so get() always rejects.
+
+### Pool/Slab zero-handle collision
+- **Symptom:** `Handle(T) h;` (zero-initialized) passes `get()` check when slot 0 was allocated with gen=0. Silent memory access via uninitialized handle.
+- **Root cause:** Pool/Slab gen arrays start at 0 (C static init / calloc). First alloc returns handle `(gen=0 << 32 | idx=0)` = 0. Zero-initialized Handle also = 0. Match → silent UAF.
+- **Fix:** In alloc, before returning handle: `if (gen[i] == 0) gen[i] = 1`. First alloc returns gen=1. Zero handle (gen=0) never matches any valid allocation. Applied to Pool alloc, Slab alloc (scan path), and Slab alloc (grow path).

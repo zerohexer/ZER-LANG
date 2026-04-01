@@ -247,7 +247,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
 | Missing switch case | Exhaustive check for enums and bools |
-| Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals) |
+| Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |

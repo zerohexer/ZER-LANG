@@ -1784,7 +1784,7 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 | `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
 | `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
 | `test_checker.c` | Type checking basic | 72 |
-| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack | 541 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack + escape | 554 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
 | `test_emit.c` | Full E2E (ZER→C→GCC→run) + signal() fault handler | 238 |
@@ -1883,7 +1883,7 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 - void ** → **opaque
 - Stringify (#), token paste (##), variadic (__VA_ARGS__) macros → auto-extracted to companion .h
 
-550 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
+554 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
 
 **Additional fixes (audit rounds 4-5):**
 - Range propagation stale guard: reassignment directly overwrites VarRange entry (not intersect). `i = get_input()` wipes range.
@@ -1893,3 +1893,19 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 - Pool/Slab ABA: gen capped at 0xFFFFFFFF, retired slots skipped in alloc.
 - Pool/Slab zero-handle: gen starts at 1 (not 0), zero Handle never matches.
 - Comptime recursion: 3-layer depth guard in eval_comptime_block/call_subst/const_expr_subst.
+- Identity washing via orelse: `call_has_local_derived_arg` checks NODE_ORELSE fallback for &local and local-derived idents.
+- @cstr local-derived: var-decl marks local-derived when init is @cstr(local_buf,...). `call_has_local_derived_arg` also checks NODE_INTRINSIC(@cstr) args directly.
+- Slice struct escape: BUG-360/383 return checks extended to TYPE_SLICE. `call_has_local_derived_arg` detects local TYPE_ARRAY args (array→slice coercion). Var-decl local-derived marking includes TYPE_SLICE.
+- Struct field range invalidation: NODE_ASSIGN uses `build_expr_key` on NODE_FIELD targets to invalidate compound key ranges ("s.x") on reassignment.
+- Compound /= %= forced division guard: added to NODE_ASSIGN alongside NODE_BINARY.
+
+**`call_has_local_derived_arg` — the escape analysis walker (checker.c line ~383):**
+Central function for detecting local pointer escape through function calls. Checks all args of a NODE_CALL for local-derived sources. Cases handled:
+1. `&local` — NODE_UNARY(TOK_AMP) with local root ident
+2. Local-derived ident — symbol has `is_local_derived` or `is_arena_derived`
+3. Local array — TYPE_ARRAY ident that's not global/static (array→slice coercion)
+4. Nested call — NODE_CALL arg returning pointer, recurse
+5. Orelse fallback — NODE_ORELSE, check fallback for &local or local-derived ident
+6. @cstr — NODE_INTRINSIC("cstr"), check first arg (buffer) for local root
+7. Struct field from call — NODE_FIELD chain walking to NODE_CALL root, recurse
+If adding a new expression type that can carry a local pointer, ADD A CASE HERE. This is the most-patched function in the checker (6 cases added across audit rounds 5-13).

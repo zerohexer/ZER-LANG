@@ -2225,3 +2225,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Two gaps: (1) BUG-360/383 return checks used `ret_type->kind == TYPE_POINTER` — slices excluded. (2) `call_has_local_derived_arg` didn't detect local arrays passed as slice args (array→slice coercion).
 - **Fix:** (1) Extended return checks to `TYPE_POINTER || TYPE_SLICE`. (2) Added TYPE_ARRAY check in `call_has_local_derived_arg` — local array passed to function treated as local-derived. (3) Var-decl local-derived marking extended to TYPE_SLICE results.
 - **Test:** 1 new checker test.
+
+### identity(@cstr(local,...)) direct arg escape
+- **Symptom:** `return identity(@cstr(local, "hi"))` — @cstr result (pointer to local buffer) passed directly as call argument. `call_has_local_derived_arg` didn't check NODE_INTRINSIC args.
+- **Root cause:** Previous fix only handled `p = @cstr(local,...); return identity(p)` (intermediate variable). Direct `identity(@cstr(local,...))` has the @cstr as a NODE_INTRINSIC arg to the call — no intermediate symbol to mark.
+- **Fix:** Added NODE_INTRINSIC("cstr") case in `call_has_local_derived_arg`: walks first arg (buffer) to root ident, returns true if local.
+- **Test:** 1 new checker test.

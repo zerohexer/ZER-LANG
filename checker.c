@@ -446,6 +446,23 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                     return true;
             }
         }
+        /* @cstr(local,...) as arg — result points to local buffer */
+        if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 4 &&
+            memcmp(arg->intrinsic.name, "cstr", 4) == 0 &&
+            arg->intrinsic.arg_count > 0) {
+            Node *buf = arg->intrinsic.args[0];
+            while (buf && (buf->kind == NODE_FIELD || buf->kind == NODE_INDEX)) {
+                if (buf->kind == NODE_FIELD) buf = buf->field.object;
+                else buf = buf->index_expr.object;
+            }
+            if (buf && buf->kind == NODE_IDENT) {
+                bool is_global = scope_lookup_local(c->global_scope,
+                    buf->ident.name, (uint32_t)buf->ident.name_len) != NULL;
+                Symbol *src = scope_lookup(c->current_scope,
+                    buf->ident.name, (uint32_t)buf->ident.name_len);
+                if (src && !src->is_static && !is_global) return true;
+            }
+        }
         /* struct field from call: wrap(&x).p — walk to call root, check args */
         {
             Node *froot = arg;

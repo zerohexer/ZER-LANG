@@ -2813,6 +2813,14 @@ int main(void) {
        "*u32 safe() { return wrap(&g).p; }\n",
        "struct escape: global pointer — no escape, OK");
 
+    printf("[struct escape: identity(@cstr(local,...)) direct → error]\n");
+    err("*u8 identity(*u8 p) { return p; }\n"
+        "*u8 leak() {\n"
+        "    u8[10] local;\n"
+        "    return identity(@cstr(local, \"hi\"));\n"
+        "}\n",
+        "@cstr escape: identity(@cstr(local,...)) direct arg caught");
+
     printf("[struct escape: @cstr local-derived → error]\n");
     err("*u8 identity(*u8 p) { return p; }\n"
         "*u8 leak() {\n"

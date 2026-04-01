@@ -2184,3 +2184,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Symptom:** `Handle(T) h;` (zero-initialized) passes `get()` check when slot 0 was allocated with gen=0. Silent memory access via uninitialized handle.
 - **Root cause:** Pool/Slab gen arrays start at 0 (C static init / calloc). First alloc returns handle `(gen=0 << 32 | idx=0)` = 0. Zero-initialized Handle also = 0. Match → silent UAF.
 - **Fix:** In alloc, before returning handle: `if (gen[i] == 0) gen[i] = 1`. First alloc returns gen=1. Zero handle (gen=0) never matches any valid allocation. Applied to Pool alloc, Slab alloc (scan path), and Slab alloc (grow path).
+
+### KNOWN LIMITATION: struct wrapper launders local-derived pointers
+- **Symptom:** `Box wrap(*u32 p) { Box b; b.p = p; return b; }` then `return wrap(&x).p` — local pointer escapes via struct field. Checker doesn't catch it.
+- **Root cause:** `is_local_derived` tracks per-symbol. `wrap(&x)` returns a struct by value — no symbol to mark. The struct's pointer field carries `&x` but the checker can't see through the function call to know the returned struct contains a local pointer.
+- **Status:** Known limitation. Fixing requires interprocedural escape analysis through struct fields — research-level complexity. Direct `return &x`, `return p` (where p=&x), and `return @ptrcast(*u32, p)` are all caught. Only the struct-field-wrapping path escapes.
+- **Workaround:** Use `keep` on the pointer parameter if it will be stored.

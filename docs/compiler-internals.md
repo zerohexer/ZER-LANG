@@ -1784,7 +1784,7 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 | `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
 | `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
 | `test_checker.c` | Type checking basic | 72 |
-| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack + escape | 554 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack + escape | 557 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
 | `test_emit.c` | Full E2E (ZER→C→GCC→run) + signal() fault handler | 238 |
@@ -1883,7 +1883,10 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 - void ** → **opaque
 - Stringify (#), token paste (##), variadic (__VA_ARGS__) macros → auto-extracted to companion .h
 
-554 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
+557 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
+
+**Session 2026-04-01 audit summary (11 rounds, 15 bugs fixed):**
+Comptime recursion depth guard, Pool/Slab zero-handle collision, Pool/Slab ABA wrap-to-1, struct wrapper escape (2 patterns), slab calloc 64-bit overflow, stale range on reassignment, compound /= division guard, orelse identity washing, @cstr local-derived (var-decl + direct arg), slice struct escape, nested orelse recursion, field of local-derived, struct field range invalidation, partial struct mutation flag preservation, Handle type_width=64.
 
 **Additional fixes (audit rounds 4-5):**
 - Range propagation stale guard: reassignment directly overwrites VarRange entry (not intersect). `i = get_input()` wipes range.
@@ -1899,13 +1902,20 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 - Struct field range invalidation: NODE_ASSIGN uses `build_expr_key` on NODE_FIELD targets to invalidate compound key ranges ("s.x") on reassignment.
 - Compound /= %= forced division guard: added to NODE_ASSIGN alongside NODE_BINARY.
 
+- Nested orelse recursion: walks through `o1 orelse o2 orelse &x` chains to any depth.
+- Field of local-derived struct: `identity(h.p)` where `h` has `is_local_derived` — walks NODE_FIELD to root NODE_IDENT, checks symbol flag.
+- Partial struct mutation: field assignments (`h.val = 42`) no longer clear `is_local_derived` on root. Only whole-variable replacement (`h = ...`) clears flags.
+- Handle type_width: TYPE_HANDLE returns 64 (was 0 — broke @size and stack estimates).
+
 **`call_has_local_derived_arg` — the escape analysis walker (checker.c line ~383):**
-Central function for detecting local pointer escape through function calls. Checks all args of a NODE_CALL for local-derived sources. Cases handled:
+Central function for detecting local pointer escape through function calls. Checks all args of a NODE_CALL for local-derived sources. **9 cases handled:**
 1. `&local` — NODE_UNARY(TOK_AMP) with local root ident
 2. Local-derived ident — symbol has `is_local_derived` or `is_arena_derived`
 3. Local array — TYPE_ARRAY ident that's not global/static (array→slice coercion)
 4. Nested call — NODE_CALL arg returning pointer, recurse
 5. Orelse fallback — NODE_ORELSE, check fallback for &local or local-derived ident
-6. @cstr — NODE_INTRINSIC("cstr"), check first arg (buffer) for local root
-7. Struct field from call — NODE_FIELD chain walking to NODE_CALL root, recurse
-If adding a new expression type that can carry a local pointer, ADD A CASE HERE. This is the most-patched function in the checker (6 cases added across audit rounds 5-13).
+6. Nested orelse — recurse through chained NODE_ORELSE fallbacks to any depth
+7. @cstr — NODE_INTRINSIC("cstr"), check first arg (buffer) for local root
+8. Struct field from call — NODE_FIELD chain walking to NODE_CALL root, recurse
+9. Field of local-derived — NODE_FIELD chain to NODE_IDENT root, check `is_local_derived`
+If adding a new expression type that can carry a local pointer, ADD A CASE HERE. This is the most-patched function in the checker (9 cases added across audit rounds 5-11).

@@ -416,8 +416,55 @@ kernel/
 - [Stabilizing naked functions in Rust (2025)](https://blog.rust-lang.org/2025/07/03/stabilizing-naked-functions.html)
 - [Redox OS (Rust kernel)](https://www.redox-os.org/)
 
+## Critical Implementation Context for Fresh Sessions
+
+### Current Compiler State (2026-04-01)
+- **14,000+ lines** of compiler code (lexer.c, parser.c, ast.h, types.c, checker.c, emitter.c, zercheck.c)
+- **checker.c: 6,200+ lines** — the largest file. Type checking, escape analysis, range propagation, ISR safety, stack depth, provenance tracking
+- **emitter.c: 3,800+ lines** — C code generation, preamble with runtime helpers
+- **557 checker + 238 E2E + 50 zercheck + 139 convert = 1,700+ tests**
+- **11 audit rounds this session, 15 bugs fixed, convergence reached**
+
+### Escape Analysis Walker — MOST CRITICAL FUNCTION
+`call_has_local_derived_arg` (checker.c ~line 383) has **9 cases**. This is the most-patched function. When implementing asm features, if a new expression type can carry a pointer (e.g., asm output operand), it MUST be added here.
+
+### Emitter Preamble Pattern
+All runtime helpers are emitted in `emit_file()` before user code. Pattern:
+1. Type typedefs (`_zer_opt_u32`, `_zer_slice_u8`, etc.)
+2. Trap function (`_zer_trap`)
+3. Fault handler (`_zer_fault_handler` via `signal()`)
+4. @probe (`_zer_probe` via `setjmp`/`longjmp`)
+5. Shift macros (`_zer_shl`, `_zer_shr`)
+6. Bounds check (`_zer_bounds_check`)
+7. Pool/Slab/Ring runtime helpers
+8. MMIO startup validation (`_zer_mmio_validate`)
+
+New intrinsics (@critical, @atomic_*) should add their helpers HERE — between step 7 and 8.
+
+### Parser Pattern for New Intrinsics
+Intrinsics are parsed as `NODE_INTRINSIC` with name string. Parser detects `@` token, reads name, parses args. New intrinsics like `@critical`, `@atomic_add` follow this pattern. `@critical { body }` is special — it's a BLOCK intrinsic, not an expression. May need a new NODE_CRITICAL or extend NODE_INTRINSIC with a body field.
+
+### Checker Pattern for New Intrinsics
+NODE_INTRINSIC handler in `check_expr` (checker.c ~line 3280). Each intrinsic has its own validation block. Add new blocks for @atomic_* (validate ptr-to-integer first arg, matching type second arg). @critical would be in `check_stmt` instead (it's a statement, not expression).
+
+### Emitter Pattern for New Intrinsics
+NODE_INTRINSIC handler in `emit_expr` (emitter.c ~line 1860). Each intrinsic emits specific C code. @atomic_* emits `#if defined` blocks with dual path (native `__atomic_*` or interrupt-disable fallback). @critical emits interrupt disable/enable wrapper.
+
+### GCC Flags
+Emitted C requires `-fwrapv -fno-strict-aliasing`. `zerc --run` adds these. Tests compile with these flags.
+
+### Docker Testing
+`make docker-check` — builds + runs ALL tests in gcc:13 container. `docker build --no-cache` required after emitter.c changes (Docker layer caching can miss file changes that only modify emitted C patterns).
+
+### Files NOT to Modify Without Reading compiler-internals.md First
+- checker.c — 6,200+ lines, 100+ bug fix patterns documented
+- emitter.c — 3,800+ lines, critical emission patterns (optional handling, bounds checks, etc.)
+- types.c — type_width, type_equals, coercion rules
+- zercheck.c — path-sensitive handle analysis (not integrated into zerc yet)
+
 ## Related ZER-LANG Docs
-- `docs/compiler-internals.md` — emitter patterns, checker passes, safety analysis
-- `docs/safety-roadmap.md` — MMIO safety layers, auto-guard design
-- `CLAUDE.md` — language reference, implementation status
-- `BUGS-FIXED.md` — 400+ bugs with root causes
+- `docs/compiler-internals.md` — emitter patterns, checker passes, safety analysis, ALL bug fix patterns
+- `docs/safety-roadmap.md` — MMIO safety layers, auto-guard design, @probe design
+- `CLAUDE.md` — language reference, implementation status, ZER syntax rules
+- `BUGS-FIXED.md` — 415+ bugs with root causes
+- `docs/ASM_ZER-LANG.md` — THIS FILE — asm design, safe intrinsics, MISRA enforcement

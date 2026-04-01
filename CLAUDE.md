@@ -297,8 +297,9 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Cross-function *opaque prov summaries | Done | N/A (compile-time) |
 | Whole-program *opaque param provenance | Done | N/A (compile-time — call-site validation) |
 | Struct field range propagation | Done | Done (guards on s.field work) |
-| @probe (safe MMIO hardware discovery) | Done | Done (platform-specific fault handler) |
+| @probe (safe MMIO read, uintptr_t) | Done | Done (universal signal() fault handler) |
 | MMIO startup validation (declared ranges) | Done | Done (constructor, @probe at boot) |
+| Universal fault handler (signal) | Done | Done (catches bad MMIO at runtime, any platform) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

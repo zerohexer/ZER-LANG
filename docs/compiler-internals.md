@@ -1738,10 +1738,16 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 **Checker:** validates 1 integer arg, result type = `type_optional(ty_u32)`.
 
-**Emitter:** emits `_zer_probe((uint32_t)(addr))`. Preamble emits platform-specific fault handler:
-- ARM: naked HardFault handler sets fault flag, skips instruction via stacked PC
-- RISC-V: exception handler on mcause 5/7
-- x86/hosted: `setjmp` + `SIGSEGV` signal handler + `longjmp`
+**Emitter:** emits `_zer_probe((uintptr_t)(addr))`. Uses universal C `signal()` + `setjmp`/`longjmp` — NO platform-specific `#ifdef`. Works on any platform with C libc. `__STDC_HOSTED__` guard for freestanding compatibility (no signal/setjmp available → @probe does direct read, same as C).
+
+**Universal fault handler (dual-mode):**
+- `_zer_fault_handler(int sig)` installed at startup via `__attribute__((constructor))`
+- `_zer_in_probe` flag distinguishes probe vs normal code
+- During `@probe()`: `_zer_in_probe = 1` → fault handler calls `longjmp` → probe returns null
+- During normal code: `_zer_in_probe = 0` → fault handler calls `_zer_trap("memory access fault")` → catches bad MMIO register access at runtime
+- **Critical:** `signal()` must be re-installed after `longjmp` recovery — System V semantics reset handler to `SIG_DFL` after delivery. Without re-install, second probe crashes.
+- Zero per-access overhead — handler is dormant until CPU faults
+- Catches bad registers WITHIN declared mmio ranges (the gap that compile-time + boot probe can't cover)
 
 **Important:** `NODE_INTRINSIC` returning `?T` must be handled in var-decl optional init path — added to the `NODE_CALL || NODE_ORELSE` check that assigns directly (without `{ val, 1 }` wrapping).
 
@@ -1753,13 +1759,18 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 **Skips:**
 - Wildcard ranges (`mmio 0x0..0xFFFFFFFFFFFFFFFF;`) — clearly test/dev, not real hardware
-- x86 hosted (`#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)`) — no real MMIO on hosted
+- Hosted user-space (`#if !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)`) — can't probe physical MMIO. x86 bare-metal gets validation.
 
 **Flags:**
 - (none): strict mode, `mmio` required, @inttoptr without declaration = compile error. Declared ranges validated at boot.
 - `--no-strict-mmio`: allows @inttoptr without `mmio` declarations — plain cast, no validation (programmer's choice, like C)
 
-**@probe remains as standalone intrinsic** for manual hardware discovery. `@probe(addr)` → `?u32`, safe read with fault handler.
+**@probe remains as standalone intrinsic** for manual hardware discovery. `@probe(addr)` → `?u32`, safe read. Takes `uintptr_t` (was `uint32_t` — fixed for 64-bit systems).
+
+**3-layer MMIO safety (final design):**
+1. **Compile-time:** `mmio` declarations validate `@inttoptr` addresses (100%, zero cost)
+2. **Boot-time:** `_zer_mmio_validate()` probes declared range starts (catches wrong datasheet)
+3. **Runtime:** universal `signal()` fault handler catches bad registers within ranges (zero per-access cost, fires only on CPU fault)
 
 ## Test Counts (v0.2.1 final)
 
@@ -1770,11 +1781,11 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 | `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
 | `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
 | `test_checker.c` | Type checking basic | 72 |
-| `test_checker_full.c` | Full spec + safety + provenance + @probe | 522 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe | 525 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
-| `test_emit.c` | Full E2E (ZER→C→GCC→run) | 233 |
-| `test_zercheck.c` | Handle tracking, leaks, cross-func | 49 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) + signal() fault handler | 238 |
+| `test_zercheck.c` | Handle tracking, leaks, cross-func | 50 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
 | `test_firmware_patterns2.c` | Round 2 firmware | 41 |

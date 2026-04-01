@@ -2847,6 +2847,14 @@ int main(void) {
         "}\n",
         "orelse escape: identity(opt orelse &local) caught");
 
+    printf("[struct escape: nested orelse o1 orelse o2 orelse &x → error]\n");
+    err("*u32 identity(*u32 p) { return p; }\n"
+        "*u32 leak(?*u32 o1, ?*u32 o2) {\n"
+        "    u32 x = 5;\n"
+        "    return identity(o1 orelse o2 orelse &x);\n"
+        "}\n",
+        "nested orelse escape: o1 orelse o2 orelse &local caught");
+
     /* ---- Cross-platform portability ---- */
     printf("\n--- cross-platform portability ---\n");
 

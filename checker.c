@@ -445,6 +445,35 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                 if (src && (src->is_local_derived || src->is_arena_derived))
                     return true;
             }
+            /* recurse into nested orelse: o1 orelse o2 orelse &x */
+            if (fb && fb->kind == NODE_ORELSE) {
+                /* treat the inner orelse as if it were the arg — re-check */
+                Node *inner = fb;
+                while (inner && inner->kind == NODE_ORELSE) {
+                    Node *ifb = inner->orelse.fallback;
+                    if (ifb && ifb->kind == NODE_UNARY && ifb->unary.op == TOK_AMP) {
+                        Node *root = ifb->unary.operand;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                            if (root->kind == NODE_FIELD) root = root->field.object;
+                            else root = root->index_expr.object;
+                        }
+                        if (root && root->kind == NODE_IDENT) {
+                            bool is_global = scope_lookup_local(c->global_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                            Symbol *src = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            if (src && !src->is_static && !is_global) return true;
+                        }
+                    }
+                    if (ifb && ifb->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            ifb->ident.name, (uint32_t)ifb->ident.name_len);
+                        if (src && (src->is_local_derived || src->is_arena_derived))
+                            return true;
+                    }
+                    inner = ifb;
+                }
+            }
         }
         /* @cstr(local,...) as arg — result points to local buffer */
         if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 4 &&

@@ -1185,14 +1185,47 @@ static Node *parse_statement(Parser *p) {
         return n;
     }
 
-    /* asm */
+    /* @critical { body } — interrupt-disabled block */
+    if (check(p, TOK_AT)) {
+        Scanner saved_s = *p->scanner;
+        Token saved_c = p->current;
+        Token saved_p2 = p->previous;
+        advance(p); /* consume @ */
+        if (check(p, TOK_IDENT) && p->current.length == 8 &&
+            memcmp(p->current.start, "critical", 8) == 0) {
+            advance(p); /* consume "critical" */
+            Node *n = new_node(p, NODE_CRITICAL);
+            n->critical.body = parse_block(p);
+            return n;
+        }
+        /* not @critical — restore and fall through to expression parser */
+        *p->scanner = saved_s;
+        p->current = saved_c;
+        p->previous = saved_p2;
+    }
+
+    /* asm — simple: asm("nop"); or extended: asm("..." : "=r"(out) : "r"(in) : "memory");
+     * Bypass lexer — scan raw source for matching ) because ':' is not a ZER token. */
     if (match(p, TOK_ASM)) {
         consume(p, TOK_LPAREN, "expected '(' after 'asm'");
-        consume(p, TOK_STRING, "expected string in asm()");
+        /* scan raw source from current position to find matching ) */
+        const char *start = p->current.start;
+        const char *src = start;
+        int depth = 1;
+        while (*src && depth > 0) {
+            if (*src == '(') depth++;
+            else if (*src == ')') { depth--; if (depth == 0) break; }
+            else if (*src == '"') { src++; while (*src && *src != '"') { if (*src == '\\') src++; src++; } }
+            else if (*src == '\'') { src++; while (*src && *src != '\'') { if (*src == '\\') src++; src++; } }
+            src++;
+        }
         Node *n = new_node(p, NODE_ASM);
-        n->asm_stmt.code = p->previous.start + 1;
-        n->asm_stmt.code_len = p->previous.length - 2;
-        consume(p, TOK_RPAREN, "expected ')' after asm string");
+        n->asm_stmt.code = start;
+        n->asm_stmt.code_len = (size_t)(src - start);
+        /* advance scanner past the raw content + closing ) */
+        p->scanner->pos = (size_t)(src + 1 - p->scanner->source); /* past ) */
+        /* re-lex current token to sync parser state */
+        p->current = next_token(p->scanner);
         consume(p, TOK_SEMICOLON, "expected ';' after asm");
         return n;
     }
@@ -1630,6 +1663,27 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
 }
 
 static Node *parse_declaration(Parser *p) {
+    /* section("name") — attribute for next declaration */
+    const char *section_str = NULL;
+    size_t section_len = 0;
+    if (check(p, TOK_IDENT) && p->current.length == 7 &&
+        memcmp(p->current.start, "section", 7) == 0) {
+        advance(p); /* consume "section" */
+        consume(p, TOK_LPAREN, "expected '(' after 'section'");
+        consume(p, TOK_STRING, "expected string in section()");
+        section_str = p->previous.start + 1;
+        section_len = p->previous.length - 2;
+        consume(p, TOK_RPAREN, "expected ')' after section string");
+    }
+
+    /* naked — attribute for next function */
+    bool is_naked = false;
+    if (check(p, TOK_IDENT) && p->current.length == 5 &&
+        memcmp(p->current.start, "naked", 5) == 0) {
+        advance(p); /* consume "naked" */
+        is_naked = true;
+    }
+
     /* import */
     if (match(p, TOK_IMPORT)) {
         consume(p, TOK_IDENT, "expected module name after 'import'");
@@ -1906,7 +1960,23 @@ static Node *parse_declaration(Parser *p) {
     }
 
     /* function or global variable */
-    return parse_func_or_var(p, false);
+    {
+        Node *n = parse_func_or_var(p, false);
+        /* apply section/naked attributes if present */
+        if (n && section_str) {
+            if (n->kind == NODE_FUNC_DECL) {
+                n->func_decl.section = section_str;
+                n->func_decl.section_len = section_len;
+            } else if (n->kind == NODE_GLOBAL_VAR) {
+                n->var_decl.section = section_str;
+                n->var_decl.section_len = section_len;
+            }
+        }
+        if (n && is_naked && n->kind == NODE_FUNC_DECL) {
+            n->func_decl.is_naked = true;
+        }
+        return n;
+    }
 }
 
 /* ================================================================

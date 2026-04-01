@@ -3584,6 +3584,57 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = type_optional(c->arena, ty_u32);
+        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor,
+             * @atomic_load, @atomic_store, @atomic_cas */
+            const char *op = name + 7;
+            int oplen = nlen - 7;
+            bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
+            bool is_store = (oplen == 5 && memcmp(op, "store", 5) == 0);
+            bool is_cas = (oplen == 3 && memcmp(op, "cas", 3) == 0);
+            bool is_arith = (oplen == 3 && (memcmp(op, "add", 3) == 0 || memcmp(op, "sub", 3) == 0 ||
+                             memcmp(op, "and", 3) == 0 || memcmp(op, "xor", 3) == 0)) ||
+                            (oplen == 2 && memcmp(op, "or", 2) == 0);
+            if (!is_load && !is_store && !is_cas && !is_arith) {
+                checker_error(c, node->loc.line, "unknown atomic intrinsic '@%.*s'", (int)nlen, name);
+            }
+            if (is_load) {
+                /* @atomic_load(&var) → T */
+                if (node->intrinsic.arg_count != 1)
+                    checker_error(c, node->loc.line, "@atomic_load requires 1 argument");
+                else {
+                    Type *at = typemap_get(c, node->intrinsic.args[0]);
+                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner))
+                        result = at->pointer.inner;
+                    else {
+                        checker_error(c, node->loc.line, "@atomic_load argument must be pointer to integer");
+                        result = ty_u32;
+                    }
+                }
+            } else if (is_store) {
+                /* @atomic_store(&var, val) → void */
+                if (node->intrinsic.arg_count != 2)
+                    checker_error(c, node->loc.line, "@atomic_store requires 2 arguments");
+                result = ty_void;
+            } else if (is_cas) {
+                /* @atomic_cas(&var, expected, desired) → bool */
+                if (node->intrinsic.arg_count != 3)
+                    checker_error(c, node->loc.line, "@atomic_cas requires 3 arguments");
+                result = ty_bool;
+            } else {
+                /* @atomic_add/sub/or/and/xor(&var, val) → T (old value) */
+                if (node->intrinsic.arg_count != 2)
+                    checker_error(c, node->loc.line, "@%.*s requires 2 arguments", (int)nlen, name);
+                else {
+                    Type *at = typemap_get(c, node->intrinsic.args[0]);
+                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner))
+                        result = at->pointer.inner;
+                    else {
+                        checker_error(c, node->loc.line, "@%.*s first argument must be pointer to integer", (int)nlen, name);
+                        result = ty_u32;
+                    }
+                }
+            }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
             /* BUG-238: reject @cstr to const destination */
             if (node->intrinsic.arg_count >= 1 &&
@@ -5356,6 +5407,13 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_ASM:
         /* nothing to check — just assembly */
+        break;
+
+    case NODE_CRITICAL:
+        /* @critical { body } — check body normally */
+        if (node->critical.body) {
+            check_stmt(c, node->critical.body);
+        }
         break;
 
     default:

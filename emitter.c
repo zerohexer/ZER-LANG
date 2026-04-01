@@ -1967,6 +1967,47 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "))");
+        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission */
+            const char *op = name + 7;
+            int oplen = nlen - 7;
+            bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
+            bool is_store = (oplen == 5 && memcmp(op, "store", 5) == 0);
+            bool is_cas = (oplen == 3 && memcmp(op, "cas", 3) == 0);
+            /* map op name to GCC __atomic builtin suffix */
+            const char *gcc_op = NULL;
+            if (oplen == 3 && memcmp(op, "add", 3) == 0) gcc_op = "add";
+            if (oplen == 3 && memcmp(op, "sub", 3) == 0) gcc_op = "sub";
+            if (oplen == 2 && memcmp(op, "or", 2) == 0) gcc_op = "or";
+            if (oplen == 3 && memcmp(op, "and", 3) == 0) gcc_op = "and";
+            if (oplen == 3 && memcmp(op, "xor", 3) == 0) gcc_op = "xor";
+
+            if (is_load) {
+                emit(e, "__atomic_load_n(");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", __ATOMIC_SEQ_CST)");
+            } else if (is_store) {
+                emit(e, "__atomic_store_n(");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", ");
+                emit_expr(e, node->intrinsic.args[1]);
+                emit(e, ", __ATOMIC_SEQ_CST)");
+            } else if (is_cas) {
+                /* __atomic_compare_exchange_n(&var, &expected, desired, false, SEQ_CST, SEQ_CST) */
+                emit(e, "__atomic_compare_exchange_n(");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", &(");
+                emit_expr(e, node->intrinsic.args[1]);
+                emit(e, "), ");
+                emit_expr(e, node->intrinsic.args[2]);
+                emit(e, ", 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)");
+            } else if (gcc_op) {
+                emit(e, "__atomic_fetch_%s(", gcc_op);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", ");
+                emit_expr(e, node->intrinsic.args[1]);
+                emit(e, ", __ATOMIC_SEQ_CST)");
+            }
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field))
              * BUG-381: propagate volatile from source pointer to result */
@@ -2621,8 +2662,66 @@ static void emit_stmt(Emitter *e, Node *node) {
 
     case NODE_ASM:
         emit_indent(e);
-        emit(e, "__asm__ __volatile__(\"%.*s\");\n",
+        /* extended asm: raw content includes template + operands + clobbers */
+        emit(e, "__asm__ __volatile__(%.*s);\n",
              (int)node->asm_stmt.code_len, node->asm_stmt.code);
+        break;
+
+    case NODE_CRITICAL:
+        /* @critical { body } — emit interrupt disable/enable wrapper */
+        emit_indent(e);
+        emit(e, "{ /* @critical */\n");
+        e->indent++;
+        emit_indent(e);
+        emit(e, "#if defined(__ARM_ARCH)\n");
+        emit_indent(e);
+        emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask));\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__AVR__)\n");
+        emit_indent(e);
+        emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__riscv)\n");
+        emit_indent(e);
+        emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus));\n");
+        emit_indent(e);
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)\n");
+        emit_indent(e);
+        emit(e, "unsigned long _zer_flags; __asm__ __volatile__(\"pushf; pop %%0; cli\" : \"=r\"(_zer_flags));\n");
+        emit_indent(e);
+        emit(e, "#else\n");
+        emit_indent(e);
+        emit(e, "/* hosted x86: @critical is a compiler fence (no real interrupt disable) */\n");
+        emit_indent(e);
+        emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
+        emit_indent(e);
+        emit(e, "#endif\n");
+        if (node->critical.body) emit_stmt(e, node->critical.body);
+        emit_indent(e);
+        emit(e, "#if defined(__ARM_ARCH)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask));\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__AVR__)\n");
+        emit_indent(e);
+        emit(e, "SREG = _zer_sreg;\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__riscv)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus));\n");
+        emit_indent(e);
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"push %%0; popf\" :: \"r\"(_zer_flags));\n");
+        emit_indent(e);
+        emit(e, "#else\n");
+        emit_indent(e);
+        emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
+        emit_indent(e);
+        emit(e, "#endif\n");
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
         break;
 
     case NODE_DEFER:
@@ -3027,6 +3126,15 @@ static void emit_func_decl(Emitter *e, Node *node) {
     Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
         func_type->func_ptr.ret : NULL;
 
+    /* section attribute */
+    if (node->func_decl.section) {
+        emit(e, "__attribute__((section(\"%.*s\"))) ",
+             (int)node->func_decl.section_len, node->func_decl.section);
+    }
+    /* naked attribute */
+    if (node->func_decl.is_naked) {
+        emit(e, "__attribute__((naked)) ");
+    }
     /* static functions */
     if (node->func_decl.is_static) emit(e, "static ");
 
@@ -3061,6 +3169,11 @@ static void emit_func_decl(Emitter *e, Node *node) {
 
 static void emit_global_var(Emitter *e, Node *node) {
     Type *type = checker_get_type(e->checker,node);
+    /* section attribute */
+    if (node->var_decl.section) {
+        emit(e, "__attribute__((section(\"%.*s\"))) ",
+             (int)node->var_decl.section_len, node->var_decl.section);
+    }
     /* propagate volatile flag from var-decl to pointer type */
     if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
         Type *vp = type_pointer(e->arena, type->pointer.inner);

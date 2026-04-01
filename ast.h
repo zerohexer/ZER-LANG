@@ -158,7 +158,8 @@ typedef enum {
     NODE_CONTINUE,          /* continue; */
     NODE_DEFER,             /* defer stmt; */
     NODE_EXPR_STMT,         /* expression as statement: foo(); */
-    NODE_ASM,               /* asm("nop"); */
+    NODE_ASM,               /* asm("nop"); or extended asm */
+    NODE_CRITICAL,          /* @critical { body } — interrupt-disabled block */
 
     /* === Expressions === */
     NODE_INT_LIT,           /* 42, 0xFF, 0b1010 */
@@ -256,6 +257,9 @@ struct Node {
             Node *body;             /* block, or NULL for forward decl */
             bool is_static;         /* static = module-private */
             bool is_comptime;       /* comptime = compile-time evaluated */
+            bool is_naked;          /* naked = no prologue/epilogue, asm-only body */
+            const char *section;    /* section(".text.startup") or NULL */
+            size_t section_len;
         } func_decl;
 
         /* NODE_STRUCT_DECL: struct Task { ... } or packed struct { ... } */
@@ -327,6 +331,8 @@ struct Node {
             bool is_const;
             bool is_static;         /* static storage duration */
             bool is_volatile;
+            const char *section;    /* section(".rodata") or NULL */
+            size_t section_len;
         } var_decl;
 
         /* NODE_BLOCK: { stmts... } */
@@ -377,11 +383,14 @@ struct Node {
         /* NODE_EXPR_STMT: expression used as statement */
         struct { Node *expr; } expr_stmt;
 
-        /* NODE_ASM: asm("nop"); */
+        /* NODE_ASM: asm("nop"); or extended asm("..." : outputs : inputs : clobbers); */
         struct {
-            const char *code;
+            const char *code;       /* full asm content between ( and ) */
             size_t code_len;
         } asm_stmt;
+
+        /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */
+        struct { Node *body; } critical;
 
         /* NODE_INT_LIT: 42, 0xFF, 0b1010, 1_000_000 */
         struct { uint64_t value; } int_lit;

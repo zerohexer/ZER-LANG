@@ -2207,3 +2207,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Forced division guard only checked NODE_BINARY (TOK_SLASH/TOK_PERCENT). Compound assignments (TOK_SLASHEQ/TOK_PERCENTEQ) are handled in NODE_ASSIGN, which had no division guard.
 - **Fix:** Added forced division guard in NODE_ASSIGN compound path: check divisor is literal nonzero or range-proven nonzero, else error.
 - **Test:** 2 new checker tests (/= error, /= literal OK).
+
+### Identity washing via orelse fallback
+- **Symptom:** `return identity(opt orelse &x)` — local pointer `&x` in orelse fallback escapes through function call. Checker didn't catch it.
+- **Root cause:** `call_has_local_derived_arg` checked NODE_UNARY(&), NODE_IDENT, NODE_CALL, NODE_FIELD — but not NODE_ORELSE. Orelse fallback `&x` was invisible to the escape walker.
+- **Fix:** Added NODE_ORELSE case in `call_has_local_derived_arg`: checks fallback for direct `&local` and local-derived idents.
+- **Test:** 1 new checker test.

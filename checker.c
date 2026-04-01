@@ -414,6 +414,32 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                     return true;
             }
         }
+        /* orelse: identity(opt orelse &x) — check fallback for &local */
+        if (arg->kind == NODE_ORELSE) {
+            Node *fb = arg->orelse.fallback;
+            /* check fallback for direct &local */
+            if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP) {
+                Node *root = fb->unary.operand;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    bool is_global = scope_lookup_local(c->global_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                    Symbol *src = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    if (src && !src->is_static && !is_global) return true;
+                }
+            }
+            /* check fallback for local-derived ident */
+            if (fb && fb->kind == NODE_IDENT) {
+                Symbol *src = scope_lookup(c->current_scope,
+                    fb->ident.name, (uint32_t)fb->ident.name_len);
+                if (src && (src->is_local_derived || src->is_arena_derived))
+                    return true;
+            }
+        }
         /* struct field from call: wrap(&x).p — walk to call root, check args */
         {
             Node *froot = arg;

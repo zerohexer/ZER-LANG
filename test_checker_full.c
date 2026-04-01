@@ -2813,6 +2813,14 @@ int main(void) {
        "*u32 safe() { return wrap(&g).p; }\n",
        "struct escape: global pointer — no escape, OK");
 
+    printf("[struct escape: identity(opt orelse &x) → error]\n");
+    err("*u32 identity(*u32 p) { return p; }\n"
+        "*u32 leak(?*u32 opt) {\n"
+        "    u32 x = 5;\n"
+        "    return identity(opt orelse &x);\n"
+        "}\n",
+        "orelse escape: identity(opt orelse &local) caught");
+
     /* ---- Cross-platform portability ---- */
     printf("\n--- cross-platform portability ---\n");
 

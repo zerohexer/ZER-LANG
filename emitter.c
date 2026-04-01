@@ -3673,7 +3673,8 @@ void emit_file(Emitter *e, Node *file_node) {
      * Auto-discovery removed (2026-04-01 decision) — see safety-roadmap.md. */
     /* Emit mmio startup validation only for real hardware ranges.
      * Skip when range covers entire address space (test/development wildcard)
-     * or when running on hosted x86 (no real MMIO hardware). */
+     * or when running on hosted user-space (can't probe physical MMIO addresses).
+     * Bare-metal x86 (no __linux__/__APPLE__/_WIN32) gets validation too. */
     {
         int real_ranges = 0;
         for (int i = 0; i < e->checker->mmio_range_count; i++) {
@@ -3684,7 +3685,7 @@ void emit_file(Emitter *e, Node *file_node) {
         }
         if (real_ranges > 0) {
             emit(e, "/* MMIO startup validation — verify declared ranges have real hardware */\n");
-            emit(e, "#if defined(__ARM_ARCH) || defined(__riscv) || defined(__AVR__)\n");
+            emit(e, "#if !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)\n");
             emit(e, "__attribute__((constructor))\n");
             emit(e, "static void _zer_mmio_validate(void) {\n");
             for (int i = 0; i < e->checker->mmio_range_count; i++) {

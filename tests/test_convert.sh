@@ -505,6 +505,62 @@ check_phase1_absent "no @truncate for uintptr_t cast" \
     'uintptr_t addr = (uintptr_t)ptr;' \
     "@truncate"
 
+# === P1 fixes: include guard, void **, stringify/variadic macros ===
+
+echo "--- P1: include guard detection ---"
+
+check_phase1 "include guard stripped" \
+    '#ifndef MY_HEADER_H
+#define MY_HEADER_H
+int x;
+#endif' \
+    "// include guard: MY_HEADER_H"
+
+check_phase1_absent "include guard — no comptime if" \
+    '#ifndef MY_HEADER_H
+#define MY_HEADER_H
+int x;
+#endif' \
+    "comptime if (!MY_HEADER_H)"
+
+check_phase1 "non-guard ifndef kept" \
+    '#ifndef DEBUG
+int debug_mode = 0;
+#endif' \
+    "comptime if (!DEBUG)"
+
+echo "--- P1: void ** → **opaque ---"
+
+check_phase1 "void ** → **opaque" \
+    'void **table;' \
+    "**opaque table"
+
+check_phase1 "void * still works" \
+    'void *ptr;' \
+    "*opaque ptr"
+
+echo "--- P1: stringify/token-paste macros ---"
+
+check_phase1 "stringify macro → MANUAL comment" \
+    '#define STR(x) #x' \
+    "// MANUAL: macro with #/##"
+
+check_phase1_absent "stringify macro — no comptime" \
+    '#define STR(x) #x' \
+    "comptime u32 STR"
+
+check_phase1 "variadic macro → MANUAL comment" \
+    '#define LOG(fmt, ...) printf(fmt, __VA_ARGS__)' \
+    "// MANUAL: macro with #/##"
+
+check_phase1_absent "variadic macro — no comptime" \
+    '#define LOG(fmt, ...) printf(fmt, __VA_ARGS__)' \
+    "comptime u32 LOG"
+
+check_phase1 "normal macro still comptime" \
+    '#define MAX(a, b) ((a) > (b) ? (a) : (b))' \
+    "comptime u32 MAX(u32 a, u32 b)"
+
 echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"

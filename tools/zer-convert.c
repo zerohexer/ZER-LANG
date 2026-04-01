@@ -959,6 +959,55 @@ static void transform(void) {
                         j++;
                         /* Check if it's a function-like macro: NAME( */
                         if (j < token_count && tokens[j].type == CT_LPAREN) {
+                            /* Check for stringify (#) or token paste (##) in macro body.
+                             * These can't be expressed as comptime — extract to .h */
+                            {
+                                bool has_unconvertible = false;
+                                int scan = j;
+                                /* scan params for ... (variadic) */
+                                int pdepth = 1;
+                                scan++;
+                                while (scan < token_count && pdepth > 0) {
+                                    if (tokens[scan].type == CT_LPAREN) pdepth++;
+                                    if (tokens[scan].type == CT_RPAREN) pdepth--;
+                                    if (tokens[scan].type == CT_DOT) {
+                                        /* check for ... (three dots) */
+                                        if (scan + 2 < token_count &&
+                                            tokens[scan+1].type == CT_DOT &&
+                                            tokens[scan+2].type == CT_DOT)
+                                            has_unconvertible = true;
+                                    }
+                                    if (tokens[scan].type == CT_IDENT &&
+                                        tok_eq(&tokens[scan], "__VA_ARGS__"))
+                                        has_unconvertible = true;
+                                    scan++;
+                                }
+                                /* scan body for # (stringify) or ## (token paste) or __VA_ARGS__ */
+                                int bscan = scan;
+                                while (bscan < token_count && tokens[bscan].type != CT_NEWLINE &&
+                                       tokens[bscan].type != CT_EOF) {
+                                    if (tokens[bscan].type == CT_HASH) { has_unconvertible = true; break; }
+                                    if (tokens[bscan].type == CT_IDENT &&
+                                        tok_eq(&tokens[bscan], "__VA_ARGS__"))
+                                        { has_unconvertible = true; break; }
+                                    bscan++;
+                                }
+                                if (has_unconvertible) {
+                                    /* extract to .h file — can't convert to comptime */
+                                    emit_str("// MANUAL: macro with #/## — use cinclude\n// ");
+                                    emit_str("#define ");
+                                    emit_tok(name);
+                                    /* emit rest of line as comment */
+                                    while (j < token_count && tokens[j].type != CT_NEWLINE &&
+                                           tokens[j].type != CT_EOF) {
+                                        emit_tok(&tokens[j]); j++;
+                                    }
+                                    emit_str("\n");
+                                    if (j < token_count && tokens[j].type == CT_NEWLINE) j++;
+                                    i = j;
+                                    continue;
+                                }
+                            }
                             /* function-like macro → comptime function
                              * #define MAX(a, b) ((a) > (b) ? (a) : (b))
                              * → comptime u32 MAX(u32 a, u32 b) { return (a) > (b) ? (a) : (b); } */
@@ -1050,6 +1099,49 @@ static void transform(void) {
                         i = j;
                         continue;
                     }
+                }
+                /* #ifdef NAME → comptime if (NAME) {
+                 * Include guard detection: #ifndef NAME followed by #define NAME
+                 * on the next preprocessor line → strip both (ZER uses import) */
+                if (tok_eq(&tokens[j], "ifndef")) {
+                    int nj = skip_ws(j + 1);
+                    if (nj < token_count && tokens[nj].type == CT_IDENT) {
+                        /* look ahead for #define SAME_NAME on next line */
+                        int guard_name = nj;
+                        int peek = nj + 1;
+                        /* skip to next line */
+                        while (peek < token_count && tokens[peek].type != CT_NEWLINE) peek++;
+                        if (peek < token_count) peek++; /* skip newline */
+                        /* skip whitespace */
+                        while (peek < token_count && tokens[peek].type == CT_WHITESPACE) peek++;
+                        /* check for # define SAME_NAME */
+                        if (peek < token_count && tokens[peek].type == CT_HASH) {
+                            int dp = skip_ws(peek + 1);
+                            if (dp < token_count && tok_eq(&tokens[dp], "define")) {
+                                int dn = skip_ws(dp + 1);
+                                if (dn < token_count && tokens[dn].type == CT_IDENT &&
+                                    tokens[dn].len == tokens[guard_name].len &&
+                                    memcmp(tokens[dn].start, tokens[guard_name].start, tokens[dn].len) == 0) {
+                                    /* check that #define has empty body (guard macro) */
+                                    int after_def = dn + 1;
+                                    while (after_def < token_count && tokens[after_def].type == CT_WHITESPACE) after_def++;
+                                    if (after_def >= token_count || tokens[after_def].type == CT_NEWLINE ||
+                                        tokens[after_def].type == CT_EOF) {
+                                        /* include guard pattern detected — strip both lines */
+                                        emit_str("// include guard: ");
+                                        emit_tok(&tokens[guard_name]);
+                                        emit_str(" (stripped)\n");
+                                        /* skip past #define line */
+                                        int skip = after_def;
+                                        if (skip < token_count && tokens[skip].type == CT_NEWLINE) skip++;
+                                        i = skip;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    /* not a guard — fall through to regular #ifndef handling below */
                 }
                 /* #ifdef NAME → comptime if (NAME) { */
                 if (tok_eq(&tokens[j], "ifdef")) {
@@ -1518,10 +1610,17 @@ static void transform(void) {
                 continue;
             }
 
-            /* void * → *opaque (type-erased pointer) */
+            /* void * → *opaque, void ** → **opaque (type-erased pointer) */
             if (tok_eq(t, "void")) {
                 int j = skip_spaces(i + 1);
                 if (j < token_count && tokens[j].type == CT_STAR) {
+                    int k = skip_spaces(j + 1);
+                    if (k < token_count && tokens[k].type == CT_STAR) {
+                        /* void ** → **opaque */
+                        emit_str("**opaque ");
+                        i = k + 1;
+                        continue;
+                    }
                     /* void * → *opaque */
                     emit_str("*opaque ");
                     i = j + 1; /* skip void + * */

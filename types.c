@@ -200,7 +200,7 @@ int type_width(Type *a) {
     case TYPE_U8:  case TYPE_I8:  case TYPE_BOOL: return 8;
     case TYPE_U16: case TYPE_I16: return 16;
     case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_ENUM: return 32;
-    case TYPE_U64: case TYPE_I64: case TYPE_F64:  return 64;
+    case TYPE_U64: case TYPE_I64: case TYPE_F64: case TYPE_HANDLE: return 64;
     case TYPE_USIZE: return zer_target_ptr_bits; /* matches target, not host */
     default: return 0;
     }

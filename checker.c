@@ -1623,13 +1623,18 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* clear — will be re-set below if new value is unsafe */
-                    tsym->is_local_derived = false;
-                    tsym->is_arena_derived = false;
-                    tsym->provenance_type = NULL;
-                    tsym->container_struct = NULL;
-                    tsym->container_field = NULL;
-                    tsym->container_field_len = 0;
+                    /* clear — will be re-set below if new value is unsafe.
+                     * ONLY clear if assigning the whole variable (NODE_IDENT target).
+                     * Field/index assignments (h.val = 42) must NOT clear flags on
+                     * root — other fields (h.p) may still hold unsafe pointers. */
+                    if (node->assign.target->kind == NODE_IDENT) {
+                        tsym->is_local_derived = false;
+                        tsym->is_arena_derived = false;
+                        tsym->provenance_type = NULL;
+                        tsym->container_struct = NULL;
+                        tsym->container_field = NULL;
+                        tsym->container_field_len = 0;
+                    }
                     /* check if new value is &local — also check orelse fallback (BUG-314) */
                     {
                         Node *vcheck = node->assign.value;

@@ -2866,6 +2866,17 @@ int main(void) {
         "}\n",
         "nested orelse escape: o1 orelse o2 orelse &local caught");
 
+    printf("[struct escape: partial mutation doesn't clear flags → error]\n");
+    err("struct Holder { *u32 p; u32 val; }\n"
+        "*u32 leak() {\n"
+        "    u32 x = 5;\n"
+        "    Holder h;\n"
+        "    h.p = &x;\n"
+        "    h.val = 42;\n"
+        "    return h.p;\n"
+        "}\n",
+        "partial struct mutation: h.val=42 doesn't clear h.p local-derived");
+
     /* ---- Cross-platform portability ---- */
     printf("\n--- cross-platform portability ---\n");
 

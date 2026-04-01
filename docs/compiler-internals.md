@@ -1885,6 +1885,14 @@ Bodyless forward decls emit C prototypes for mutual recursion + extern functions
 
 557 checker + 238 E2E + 50 zercheck + 139 convert = ~1,700+ tests. All passing.
 
+**ASM implementation (all 5 phases):**
+- `@critical { }`: NODE_CRITICAL in parser/checker/emitter. Per-arch interrupt disable/enable via #if defined. Hosted x86 uses __atomic_thread_fence (CLI needs ring 0).
+- `@atomic_*`: Checker validates ptr-to-integer first arg. Emitter emits `__atomic_fetch_add` etc. All 8 operations: add/sub/or/and/xor/cas/load/store.
+- Extended asm: Parser bypasses lexer — scans raw source for matching `)` (colon not a ZER token). Emits `__asm__ __volatile__(...)` verbatim.
+- `naked`: `func_decl.is_naked` flag. Emitter prepends `__attribute__((naked))`.
+- `section("name")`: stored on func_decl and var_decl. Emitter prepends `__attribute__((section(...)))`.
+- Parser detects `section(...)` and `naked` as contextual keywords at top-level before parse_func_or_var.
+
 **Session 2026-04-01 audit summary (11 rounds, 15 bugs fixed):**
 Comptime recursion depth guard, Pool/Slab zero-handle collision, Pool/Slab ABA wrap-to-1, struct wrapper escape (2 patterns), slab calloc 64-bit overflow, stale range on reassignment, compound /= division guard, orelse identity washing, @cstr local-derived (var-decl + direct arg), slice struct escape, nested orelse recursion, field of local-derived, struct field range invalidation, partial struct mutation flag preservation, Handle type_width=64.
 

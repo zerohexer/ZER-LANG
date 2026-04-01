@@ -305,6 +305,11 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Universal fault handler (signal) | Done | Done (catches bad MMIO at runtime, any platform) |
 | Interrupt safety (ISR shared globals) | Done | N/A (compile-time — missing volatile, race detection) |
 | Stack depth analysis (recursion detect) | Done | N/A (compile-time — warning on recursive calls) |
+| @critical (interrupt-disabled block) | Done | Done (per-arch interrupt disable/enable) |
+| @atomic_* (add/sub/or/and/xor/cas/load/store) | Done | Done (GCC __atomic builtins) |
+| Extended asm (GCC operand syntax) | Done | Done (raw pass-through, all archs) |
+| naked functions | Done | Done (__attribute__((naked))) |
+| section attribute | Done | Done (__attribute__((section))) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

@@ -3477,62 +3477,44 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "#endif\n");
     emit(e, "}\n\n");
 
-    /* @probe: safe hardware discovery — try reading an address, return ?u32.
-     * Platform-specific fault handler catches invalid addresses. */
-    emit(e, "/* @probe: safe MMIO address probing */\n");
-    emit(e, "#if defined(__ARM_ARCH)\n");
-    emit(e, "/* ARM Cortex-M: use BusFault/HardFault handler */\n");
-    emit(e, "static volatile int _zer_probe_fault_flag = 0;\n");
-    emit(e, "void _zer_probe_fault_handler(void) __attribute__((naked));\n");
-    emit(e, "void _zer_probe_fault_handler(void) {\n");
-    emit(e, "    __asm__ volatile(\n");
-    emit(e, "        \"ldr r0, =_zer_probe_fault_flag\\n\"\n");
-    emit(e, "        \"mov r1, #1\\n\"\n");
-    emit(e, "        \"str r1, [r0]\\n\"\n");
-    emit(e, "        \"ldr r0, [sp, #24]\\n\"\n");
-    emit(e, "        \"add r0, #2\\n\"\n");
-    emit(e, "        \"str r0, [sp, #24]\\n\"\n");
-    emit(e, "        \"bx lr\\n\"\n");
-    emit(e, "    );\n");
-    emit(e, "}\n");
-    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
-    emit(e, "    _zer_probe_fault_flag = 0;\n");
-    emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
-    emit(e, "    uint32_t val = *p;\n");
-    emit(e, "    if (_zer_probe_fault_flag) return (_zer_opt_u32){ 0, 0 };\n");
-    emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
-    emit(e, "}\n");
-    emit(e, "#elif defined(__riscv)\n");
-    emit(e, "/* RISC-V: use access fault exception handler */\n");
-    emit(e, "static volatile int _zer_probe_fault_flag = 0;\n");
-    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
-    emit(e, "    _zer_probe_fault_flag = 0;\n");
-    emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
-    emit(e, "    uint32_t val = *p;\n");
-    emit(e, "    if (_zer_probe_fault_flag) return (_zer_opt_u32){ 0, 0 };\n");
-    emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
-    emit(e, "}\n");
-    emit(e, "#else\n");
-    emit(e, "/* x86/hosted: use setjmp + signal handler */\n");
+    /* Universal fault handler + @probe — uses C standard signal() everywhere.
+     * No platform-specific #ifdef. Works on any OS and bare-metal with libc.
+     * Dual-mode: during @probe → recover and return null.
+     *            during normal code → trap with error message (catches bad MMIO). */
     emit(e, "#include <setjmp.h>\n");
-    emit(e, "#include <signal.h>\n");
-    emit(e, "static jmp_buf _zer_probe_jmp;\n");
-    emit(e, "static void _zer_probe_sighandler(int sig) { (void)sig; longjmp(_zer_probe_jmp, 1); }\n");
-    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
-    emit(e, "    signal(SIGSEGV, _zer_probe_sighandler);\n");
+    emit(e, "#include <signal.h>\n\n");
+    emit(e, "/* Universal memory fault handler — catches bad MMIO at runtime */\n");
+    emit(e, "static volatile int _zer_in_probe = 0;\n");
+    emit(e, "static jmp_buf _zer_probe_jmp;\n\n");
+    emit(e, "static void _zer_fault_handler(int sig) {\n");
+    emit(e, "    if (_zer_in_probe) {\n");
+    emit(e, "        /* inside @probe — recover, return null */\n");
+    emit(e, "        longjmp(_zer_probe_jmp, 1);\n");
+    emit(e, "    }\n");
+    emit(e, "    /* normal code — bad MMIO access, trap with message */\n");
+    emit(e, "    (void)sig;\n");
+    emit(e, "    _zer_trap(\"memory access fault — invalid MMIO or pointer\", __FILE__, __LINE__);\n");
+    emit(e, "}\n\n");
+    emit(e, "/* Install fault handler at startup — runs before main() */\n");
+    emit(e, "__attribute__((constructor))\n");
+    emit(e, "static void _zer_install_fault_handler(void) {\n");
+    emit(e, "    signal(SIGSEGV, _zer_fault_handler);\n");
     emit(e, "#ifdef SIGBUS\n");
-    emit(e, "    signal(SIGBUS, _zer_probe_sighandler);\n");
+    emit(e, "    signal(SIGBUS, _zer_fault_handler);\n");
     emit(e, "#endif\n");
+    emit(e, "}\n\n");
+    emit(e, "/* @probe: safe MMIO read — returns ?u32, null if address faults */\n");
+    emit(e, "static _zer_opt_u32 _zer_probe(uint32_t addr) {\n");
+    emit(e, "    _zer_in_probe = 1;\n");
     emit(e, "    if (setjmp(_zer_probe_jmp) != 0) {\n");
-    emit(e, "        signal(SIGSEGV, SIG_DFL);\n");
+    emit(e, "        _zer_in_probe = 0;\n");
     emit(e, "        return (_zer_opt_u32){ 0, 0 };\n");
     emit(e, "    }\n");
     emit(e, "    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;\n");
     emit(e, "    uint32_t val = *p;\n");
-    emit(e, "    signal(SIGSEGV, SIG_DFL);\n");
+    emit(e, "    _zer_in_probe = 0;\n");
     emit(e, "    return (_zer_opt_u32){ val, 1 };\n");
-    emit(e, "}\n");
-    emit(e, "#endif\n\n");
+    emit(e, "}\n\n");
 
     /* safe shift — ZER spec: shift by >= width returns 0 (not UB like C).
      * Uses GCC statement expression to evaluate b exactly once. */

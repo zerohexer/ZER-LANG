@@ -79,6 +79,26 @@ TYPE_VOID, TYPE_BOOL, TYPE_U8..TYPE_U64, TYPE_USIZE, TYPE_I8..TYPE_I64, TYPE_F32
 - []T → *T: implicit (takes .ptr, for C interop)
 - *T → bool: NOT allowed (use `if (opt) |val|` for optionals)
 
+## Error Display
+
+Both checker and parser show source lines with caret underlines on errors:
+```
+file.zer:3: error: array index 10 is out of bounds for array of size 4
+    3 |     arr[10] = 1;
+      |     ^^^^^^^^^^^^
+```
+
+**Implementation:**
+- `Checker.source` / `Parser.source` — pointer to source text (NULL = skip display)
+- `print_source_line(stderr, source, line)` in checker.c — finds line N (1-based), prints `line | text` then `| ^^^` under content
+- `print_source_line_p()` in parser.c — identical copy (avoids shared header for 20 lines)
+- Called from `checker_error()`, `checker_warning()`, parser `error_at()`
+- `zerc_main.c` sets `parser.source = m->source` and `checker.source = m->source` — switches when checking imported module bodies
+- Tests/LSP: source=NULL (from memset zero in init), display silently skipped
+- Carets span from first non-whitespace to end of line (capped at 60 chars)
+
+**When modifying error reporting:** Always call `print_source_line` after printing the error text line. The function handles NULL source gracefully. If adding a new error path that doesn't go through `checker_error`/`checker_warning`, add the call manually.
+
 ## Checker (checker.c) — ~1800 lines
 
 ### Key Functions

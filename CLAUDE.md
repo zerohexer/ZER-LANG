@@ -435,6 +435,21 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Symbol lookup is `memcmp`-based — standard for C compilers (GCC/TCC do the same)
 - ZER does NOT need: lifetime/borrow tracking (memory model too simple for it), generics (`*opaque`+provenance covers it), incremental compilation (emit-C + Makefile handles it), closures (function pointers + `*opaque` context is the C pattern)
 
+**Error Display:**
+- Errors show source line + caret underline: `3 | arr[10] = 1;` / `  | ^^^^^^^^^^^^`
+- `Checker.source` and `Parser.source` fields hold source text (NULL = skip display)
+- `print_source_line()` in checker.c, `print_source_line_p()` in parser.c (same logic, separate to avoid shared header)
+- `zerc_main.c` passes `Module.source` to both parser and checker, switches `checker.source`/`checker.file_name` when checking imported module bodies
+- Tests and LSP set source=NULL (memset zero) — source line display silently skipped
+- Carets underline from first non-whitespace to end of line (max 60 chars)
+
+**Benchmark Results (Docker x86, gcc -O2, 2026-04-02):**
+- Bounds check: ~0-4% overhead (branch predictor eliminates always-false check)
+- Division guard: ~0-5% overhead (single branch, always predicted not-taken)
+- Shift safety: ~0% overhead (ternary compiles to cmov, no branch)
+- Handle gen check: ~60-130% in synthetic microbenchmark (tight loop doing nothing but pool.get), <5% in real code with actual computation per access
+- Benchmarks in `benchmarks/` directory (not committed — local only)
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

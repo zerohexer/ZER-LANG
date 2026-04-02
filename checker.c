@@ -2638,11 +2638,22 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
 
                     /* []T → *T auto-coerce for extern (no body) C functions only.
-                     * Emitter will auto-emit .ptr at call site. */
+                     * Emitter will auto-emit .ptr at call site.
+                     * Const check: string literals and const slices require const *T param. */
                     bool slice_to_ptr_ok = false;
                     if (arg && arg->kind == TYPE_SLICE &&
                         param && param->kind == TYPE_POINTER &&
                         type_equals(arg->slice.inner, param->pointer.inner)) {
+                        /* const safety: string literal or const slice → must be const *T */
+                        bool arg_is_const = arg->slice.is_const ||
+                            node->call.args[i]->kind == NODE_STRING_LIT;
+                        if (arg_is_const && !param->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass const []%s to non-const '*%s' — use 'const *%s'",
+                                i + 1, type_name(arg->slice.inner),
+                                type_name(param->pointer.inner),
+                                type_name(param->pointer.inner));
+                        }
                         /* only allow for extern functions (forward decl, no body) */
                         if (node->call.callee->kind == NODE_IDENT) {
                             Symbol *csym = scope_lookup(c->current_scope,

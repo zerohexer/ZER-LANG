@@ -3041,6 +3041,12 @@ int main(void) {
         "    return 0;\n"
         "}",
         "[]u8 NOT auto-coerced for ZER function with body");
+    err("void ext(*u8 s);\n"
+        "u32 main() {\n"
+        "    ext(\"hello\");\n"
+        "    return 0;\n"
+        "}",
+        "string literal to non-const *u8 extern rejected");
 
     /* ---- ?Handle(T) in struct field ---- */
     printf("[@optional handle in struct]\n");

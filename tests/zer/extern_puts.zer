@@ -1,0 +1,9 @@
+// Extern C function call — []T auto-coerces to *T for extern (no body) functions
+// Tests: cinclude, extern function declaration, slice→pointer auto .ptr
+
+i32 puts(const *u8 s);
+
+u32 main() {
+    puts("extern_puts: test passed!");
+    return 0;
+}

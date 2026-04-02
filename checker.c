@@ -2578,9 +2578,27 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
 
+                    /* []T → *T auto-coerce for extern (no body) C functions only.
+                     * Emitter will auto-emit .ptr at call site. */
+                    bool slice_to_ptr_ok = false;
+                    if (arg && arg->kind == TYPE_SLICE &&
+                        param && param->kind == TYPE_POINTER &&
+                        type_equals(arg->slice.inner, param->pointer.inner)) {
+                        /* only allow for extern functions (forward decl, no body) */
+                        if (node->call.callee->kind == NODE_IDENT) {
+                            Symbol *csym = scope_lookup(c->current_scope,
+                                node->call.callee->ident.name,
+                                (uint32_t)node->call.callee->ident.name_len);
+                            if (csym && csym->is_function && csym->func_node &&
+                                !csym->func_node->func_decl.body) {
+                                slice_to_ptr_ok = true;
+                            }
+                        }
+                    }
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&
-                        !is_literal_compatible(node->call.args[i], param)) {
+                        !is_literal_compatible(node->call.args[i], param) &&
+                        !slice_to_ptr_ok) {
                         checker_error(c, node->loc.line,
                             "argument %u: expected '%s', got '%s'",
                             i + 1, type_name(param), type_name(arg));

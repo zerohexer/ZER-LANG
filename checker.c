@@ -316,6 +316,20 @@ static int build_expr_key(Node *expr, char *buf, int bufsize) {
     return 0;
 }
 
+/* Arena-allocated expr key — no fixed buffer limit.
+ * Uses a generous stack buffer, arena-copies the result.
+ * Returns {key, len} or {NULL, 0} on failure. */
+typedef struct { const char *str; int len; } ExprKey;
+static ExprKey build_expr_key_a(Checker *c, Node *expr) {
+    char stack_buf[512];
+    int len = build_expr_key(expr, stack_buf, sizeof(stack_buf));
+    if (len <= 0) return (ExprKey){ NULL, 0 };
+    char *key = (char *)arena_alloc(c->arena, len + 1);
+    if (!key) return (ExprKey){ NULL, 0 };
+    memcpy(key, stack_buf, len + 1);
+    return (ExprKey){ key, len };
+}
+
 /* BUG-393: compound key provenance map — set/get for struct fields and array elements */
 static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *prov) {
     /* check if key already exists — update in place */
@@ -763,10 +777,12 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 if (csym && csym->is_comptime && csym->func_node) {
                     Node *fn = csym->func_node;
                     int pc = fn->func_decl.param_count;
-                    ComptimeParam cparams[32];
-                    bool all_const = true;
+                    ComptimeParam stack_cp[8];
+                    ComptimeParam *cparams = pc <= 8 ? stack_cp :
+                        (ComptimeParam *)arena_alloc(c->arena, pc * sizeof(ComptimeParam));
+                    bool all_const = cparams != NULL;
                     for (int ci = 0; ci < tn->array.size_expr->call.arg_count &&
-                         ci < pc && ci < 32; ci++) {
+                         ci < pc && all_const; ci++) {
                         int64_t cv = eval_const_expr(tn->array.size_expr->call.args[ci]);
                         if (cv == CONST_EVAL_FAIL) { all_const = false; break; }
                         cparams[ci].name = fn->func_decl.params[ci].name;
@@ -963,15 +979,20 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     Node *fn = sym->func_node;
     int pc = fn->func_decl.param_count;
     if (pc != call->call.arg_count) return CONST_EVAL_FAIL;
-    ComptimeParam cparams[32];
-    for (int i = 0; i < pc && i < 32; i++) {
+    ComptimeParam stack_cp[8];
+    ComptimeParam *cparams = pc <= 8 ? stack_cp :
+        (ComptimeParam *)malloc(pc * sizeof(ComptimeParam));
+    if (!cparams) return CONST_EVAL_FAIL;
+    bool need_free = (cparams != stack_cp);
+    for (int i = 0; i < pc; i++) {
         int64_t av = eval_const_expr_subst(call->call.args[i], outer_params, outer_count);
-        if (av == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        if (av == CONST_EVAL_FAIL) { if (need_free) free(cparams); _comptime_call_depth--; return CONST_EVAL_FAIL; }
         cparams[i].name = fn->func_decl.params[i].name;
         cparams[i].name_len = (uint32_t)fn->func_decl.params[i].name_len;
         cparams[i].value = av;
     }
     int64_t result = eval_comptime_block(fn->func_decl.body, cparams, pc);
+    if (need_free) free(cparams);
     _comptime_call_depth--;
     return result;
 }
@@ -1175,19 +1196,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         mark_proven(c, node); /* constant nonzero divisor */
                     } else {
                         /* try ident lookup first, then compound key for struct fields */
-                        char dkey[128];
-                        int dklen = 0;
+                        ExprKey dkey = {NULL, 0};
                         if (node->binary.right->kind == NODE_IDENT) {
-                            dklen = (int)node->binary.right->ident.name_len;
-                            if (dklen < (int)sizeof(dkey)) {
-                                memcpy(dkey, node->binary.right->ident.name, dklen);
-                                dkey[dklen] = '\0';
-                            }
+                            dkey.str = node->binary.right->ident.name;
+                            dkey.len = (int)node->binary.right->ident.name_len;
                         } else {
-                            dklen = build_expr_key(node->binary.right, dkey, sizeof(dkey));
+                            dkey = build_expr_key_a(c, node->binary.right);
                         }
-                        if (dklen > 0) {
-                            struct VarRange *r = find_var_range(c, dkey, (uint32_t)dklen);
+                        if (dkey.len > 0) {
+                            struct VarRange *r = find_var_range(c, dkey.str, (uint32_t)dkey.len);
                             if (r && (r->known_nonzero || r->min_val > 0)) {
                                 mark_proven(c, node);
                             }
@@ -1198,12 +1215,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (div_val != 0 && !checker_is_proven(c, node) &&
                         (node->binary.right->kind == NODE_IDENT ||
                          node->binary.right->kind == NODE_FIELD)) {
-                        char dname[128];
-                        int dnlen = build_expr_key(node->binary.right, dname, sizeof(dname));
-                        if (dnlen > 0) {
+                        ExprKey dname = build_expr_key_a(c, node->binary.right);
+                        if (dname.len > 0) {
                             checker_error(c, node->loc.line,
                                 "divisor '%.*s' not proven nonzero — add 'if (%.*s == 0) { return; }' before division",
-                                dnlen, dname, dnlen, dname);
+                                dname.len, dname.str, dname.len, dname.str);
                         }
                     }
                 }
@@ -1427,18 +1443,17 @@ static Type *check_expr(Checker *c, Node *node) {
                 bool blocked = true;
                 if (c->union_switch_key && c->union_switch_key_len > 0 &&
                     !locked_via_alias) {
-                    char tgt_key[128];
-                    int tklen = build_expr_key(node->assign.target, tgt_key, sizeof(tgt_key));
-                    if (tklen > 0) {
+                    ExprKey tgt_key = build_expr_key_a(c, node->assign.target);
+                    if (tgt_key.len > 0) {
                         /* strip the trailing .field from target key for comparison.
                          * msgs[1].data → compare "msgs[1]" against "msgs[0]" */
-                        char *last_dot = NULL;
-                        for (int di = tklen - 1; di >= 0; di--) {
-                            if (tgt_key[di] == '.') { last_dot = &tgt_key[di]; break; }
+                        const char *last_dot = NULL;
+                        for (int di = tgt_key.len - 1; di >= 0; di--) {
+                            if (tgt_key.str[di] == '.') { last_dot = &tgt_key.str[di]; break; }
                         }
-                        int cmp_len = last_dot ? (int)(last_dot - tgt_key) : tklen;
+                        int cmp_len = last_dot ? (int)(last_dot - tgt_key.str) : tgt_key.len;
                         if (cmp_len != (int)c->union_switch_key_len ||
-                            memcmp(tgt_key, c->union_switch_key, cmp_len) != 0) {
+                            memcmp(tgt_key.str, c->union_switch_key, cmp_len) != 0) {
                             blocked = false; /* different element, safe */
                         }
                     }
@@ -1604,10 +1619,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         /* compound key range (e.g., "s.x" for struct field) */
                         if (node->assign.target->kind == NODE_FIELD) {
-                            char ckey[128];
-                            int cklen = build_expr_key(node->assign.target, ckey, sizeof(ckey));
-                            if (cklen > 0) {
-                                struct VarRange *cexist = find_var_range(c, ckey, (uint32_t)cklen);
+                            ExprKey ckey = build_expr_key_a(c, node->assign.target);
+                            if (ckey.len > 0) {
+                                struct VarRange *cexist = find_var_range(c, ckey.str, (uint32_t)ckey.len);
                                 if (cexist) {
                                     if (node->assign.value->kind == NODE_INT_LIT) {
                                         int64_t v = (int64_t)node->assign.value->int_lit.value;
@@ -1704,9 +1718,8 @@ static Type *check_expr(Checker *c, Node *node) {
                             {
                                 Type *val_type = typemap_get(c, vcheck->intrinsic.args[0]);
                                 if (val_type) {
-                                    char tkey[128];
-                                    int tklen = build_expr_key(node->assign.target, tkey, sizeof(tkey));
-                                    if (tklen > 0) prov_map_set(c, tkey, (uint32_t)tklen, val_type);
+                                    ExprKey tkey = build_expr_key_a(c, node->assign.target);
+                                    if (tkey.len > 0) prov_map_set(c, tkey.str, (uint32_t)tkey.len, val_type);
                                 }
                             }
                         }
@@ -1715,9 +1728,8 @@ static Type *check_expr(Checker *c, Node *node) {
                             Symbol *src = scope_lookup(c->current_scope,
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src && src->provenance_type) {
-                                char tkey[128];
-                                int tklen = build_expr_key(node->assign.target, tkey, sizeof(tkey));
-                                if (tklen > 0) prov_map_set(c, tkey, (uint32_t)tklen, src->provenance_type);
+                                ExprKey tkey = build_expr_key_a(c, node->assign.target);
+                                if (tkey.len > 0) prov_map_set(c, tkey.str, (uint32_t)tkey.len, src->provenance_type);
                             }
                         }
                         /* @container provenance: val = &struct.field */
@@ -2579,8 +2591,8 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (!is_global && c->current_module) {
                                     /* try mangled: module__name (BUG-332: double underscore) */
                                     uint32_t mkl = c->current_module_len + 2 + arg_sym->name_len;
-                                    char mk[256];
-                                    if (mkl < sizeof(mk)) {
+                                    char *mk = (char *)arena_alloc(c->arena, mkl + 1);
+                                    if (mk) {
                                         memcpy(mk, c->current_module, c->current_module_len);
                                         mk[c->current_module_len] = '_';
                                         mk[c->current_module_len + 1] = '_';
@@ -2681,9 +2693,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     Node *fn = callee_sym->func_node;
                     /* all args must be compile-time constant */
                     int pc = fn->func_decl.param_count;
-                    ComptimeParam cparams[32];
-                    bool all_const = true;
-                    for (int ci = 0; ci < node->call.arg_count && ci < pc && ci < 32; ci++) {
+                    ComptimeParam stack_cp2[8];
+                    ComptimeParam *cparams = pc <= 8 ? stack_cp2 :
+                        (ComptimeParam *)arena_alloc(c->arena, pc * sizeof(ComptimeParam));
+                    bool all_const = cparams != NULL;
+                    for (int ci = 0; ci < node->call.arg_count && ci < pc && all_const; ci++) {
                         int64_t v = eval_const_expr(node->call.args[ci]);
                         if (v == CONST_EVAL_FAIL) { all_const = false; break; }
                         cparams[ci].name = fn->func_decl.params[ci].name;
@@ -2880,11 +2894,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         bool blocked = true;
                         if (name_match && c->union_switch_key &&
                             c->union_switch_key_len > 0 && !type_match) {
-                            char tgt_key[128];
-                            int tklen = build_expr_key(node->field.object, tgt_key, sizeof(tgt_key));
-                            if (tklen > 0 &&
-                                ((int)c->union_switch_key_len != tklen ||
-                                 memcmp(tgt_key, c->union_switch_key, tklen) != 0)) {
+                            ExprKey tgt_key = build_expr_key_a(c, node->field.object);
+                            if (tgt_key.len > 0 &&
+                                ((int)c->union_switch_key_len != tgt_key.len ||
+                                 memcmp(tgt_key.str, c->union_switch_key, tgt_key.len) != 0)) {
                                 blocked = false;
                             }
                         }
@@ -2986,11 +2999,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         bool blocked = true;
                         if (name_match && c->union_switch_key &&
                             c->union_switch_key_len > 0 && !type_match) {
-                            char tgt_key[128];
-                            int tklen = build_expr_key(node->field.object, tgt_key, sizeof(tgt_key));
-                            if (tklen > 0 &&
-                                ((int)c->union_switch_key_len != tklen ||
-                                 memcmp(tgt_key, c->union_switch_key, tklen) != 0)) {
+                            ExprKey tgt_key = build_expr_key_a(c, node->field.object);
+                            if (tgt_key.len > 0 &&
+                                ((int)c->union_switch_key_len != tgt_key.len ||
+                                 memcmp(tgt_key.str, c->union_switch_key, tgt_key.len) != 0)) {
                                 blocked = false;
                             }
                         }
@@ -3376,11 +3388,9 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                             /* BUG-393: try compound key map (h.p, arr[0]) */
                             if (!prov_type) {
-                                char skey[128];
-                                int sklen = build_expr_key(node->intrinsic.args[0],
-                                                           skey, sizeof(skey));
-                                if (sklen > 0)
-                                    prov_type = prov_map_get(c, skey, (uint32_t)sklen);
+                                ExprKey skey = build_expr_key_a(c, node->intrinsic.args[0]);
+                                if (skey.len > 0)
+                                    prov_type = prov_map_get(c, skey.str, (uint32_t)skey.len);
                             }
                             if (prov_type) {
                                 Type *prov = type_unwrap_distinct(prov_type);
@@ -4479,9 +4489,6 @@ static void check_stmt(Checker *c, Node *node) {
             TokenType cmp_op = TOK_EOF;
             bool var_on_left = false;
 
-            /* cmp_key buffer for compound keys (struct fields) */
-            char cmp_key_buf[128];
-
             if (if_cond && if_cond->kind == NODE_BINARY) {
                 cmp_op = if_cond->binary.op;
                 Node *lhs = if_cond->binary.left;
@@ -4498,13 +4505,10 @@ static void check_stmt(Checker *c, Node *node) {
                 } else if (lhs->kind == NODE_FIELD) {
                     cmp_val = eval_const_expr(rhs);
                     if (cmp_val != CONST_EVAL_FAIL) {
-                        int klen = build_expr_key(lhs, cmp_key_buf, sizeof(cmp_key_buf));
-                        if (klen > 0) {
-                            /* arena-allocate so pointer survives past this block */
-                            char *akey = (char *)arena_alloc(c->arena, klen + 1);
-                            if (akey) { memcpy(akey, cmp_key_buf, klen + 1); }
-                            cmp_var = akey;
-                            cmp_var_len = (uint32_t)klen;
+                        ExprKey ek = build_expr_key_a(c, lhs);
+                        if (ek.len > 0) {
+                            cmp_var = ek.str;
+                            cmp_var_len = (uint32_t)ek.len;
                             var_on_left = true;
                         }
                     }
@@ -4520,12 +4524,10 @@ static void check_stmt(Checker *c, Node *node) {
                 } else if (!cmp_var && rhs->kind == NODE_FIELD) {
                     cmp_val = eval_const_expr(lhs);
                     if (cmp_val != CONST_EVAL_FAIL) {
-                        int klen = build_expr_key(rhs, cmp_key_buf, sizeof(cmp_key_buf));
-                        if (klen > 0) {
-                            char *akey = (char *)arena_alloc(c->arena, klen + 1);
-                            if (akey) { memcpy(akey, cmp_key_buf, klen + 1); }
-                            cmp_var = akey;
-                            cmp_var_len = (uint32_t)klen;
+                        ExprKey ek = build_expr_key_a(c, rhs);
+                        if (ek.len > 0) {
+                            cmp_var = ek.str;
+                            cmp_var_len = (uint32_t)ek.len;
                             var_on_left = false;
                         }
                     }
@@ -4868,15 +4870,10 @@ static void check_stmt(Checker *c, Node *node) {
                         c->union_switch_var_len = (uint32_t)lock_root->ident.name_len;
                     }
                     /* build full key for precise comparison */
-                    char key_buf[128];
-                    int klen = build_expr_key(sw_expr, key_buf, sizeof(key_buf));
-                    if (klen > 0) {
-                        char *akey = (char *)arena_alloc(c->arena, klen + 1);
-                        if (akey) {
-                            memcpy(akey, key_buf, klen + 1);
-                            c->union_switch_key = akey;
-                            c->union_switch_key_len = (uint32_t)klen;
-                        }
+                    ExprKey sw_key = build_expr_key_a(c, sw_expr);
+                    if (sw_key.len > 0) {
+                        c->union_switch_key = sw_key.str;
+                        c->union_switch_key_len = (uint32_t)sw_key.len;
                     } else {
                         c->union_switch_key = NULL;
                         c->union_switch_key_len = 0;
@@ -6344,10 +6341,9 @@ static Type *find_return_provenance(Checker *c, Node *node) {
                 (uint32_t)rexpr->ident.name_len);
             if (sym && sym->provenance_type) return sym->provenance_type;
             /* also check prov_map for compound keys */
-            char key[128];
-            int klen = build_expr_key(rexpr, key, sizeof(key));
-            if (klen > 0) {
-                Type *p = prov_map_get(c, key, (uint32_t)klen);
+            ExprKey pkey = build_expr_key_a(c, rexpr);
+            if (pkey.len > 0) {
+                Type *p = prov_map_get(c, pkey.str, (uint32_t)pkey.len);
                 if (p) return p;
             }
         }

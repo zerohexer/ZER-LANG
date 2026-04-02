@@ -413,18 +413,27 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Scope escape checks cover return, assignment, keep params, orelse fallback, @ptrcast
 - Union variant lock walks ALL deref/field/index levels and detects pointer-type aliases
 
-**Structural Refactors (RF1-RF11):**
+**Structural Refactors (RF1-RF12):**
 - RF1: Typemap in Checker struct (not globals). RF2: Unified `emit_top_level_decl()`.
 - RF3: `resolve_type()` caches in typemap. RF4: Arena-allocated mangled names.
 - RF5: Lightweight parser lookahead. RF8: `CONST_EVAL_FAIL` sentinel.
 - RF9: Dynamic parser arrays. RF10: `is_func_ptr_start()` consolidated.
 - RF11: Shared `expr_is_volatile()` / `expr_root_symbol()` helpers.
+- RF12: `build_expr_key_a()` arena-allocated expr keys (no fixed `char[128]` buffers). Dynamic `ComptimeParam` arrays (stack-first `[8]` with arena overflow).
 
 **Design Decisions (intentional, NOT bugs):**
 - `@inttoptr(*T, 0)` allowed (MMIO address 0x0), shift widening spec-correct, `[]T → *T` coercion removed
 
 **Known Technical Debt:**
 - No qualified module call syntax yet (unqualified calls resolve to last import)
+- checker.c is 6700+ lines (monolith) — works but large to navigate. Split not urgent.
+
+**Internal Quality Notes (verified 2026-04-02):**
+- Static globals (`_comptime_global_scope`, `_comptime_call_depth`) are safe — LSP is single-threaded, no concurrency
+- Parser arrays are already dynamic (RF9) — stack-first `[32]` with arena overflow doubling
+- Checker key buffers are now arena-allocated (RF12) — no fixed `char[128]` limits remain
+- Symbol lookup is `memcmp`-based — standard for C compilers (GCC/TCC do the same)
+- ZER does NOT need: lifetime/borrow tracking (memory model too simple for it), generics (`*opaque`+provenance covers it), incremental compilation (emit-C + Makefile handles it), closures (function pointers + `*opaque` context is the C pattern)
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

@@ -1,0 +1,114 @@
+// Chained hash map — Slab-allocated linked list per bucket
+// Slab grows dynamically (like malloc). Handle prevents UAF.
+// Manual bool flag for next pointer (workaround: ?Handle in struct field has emission bug).
+
+i32 puts(const *u8 s);
+
+struct Node {
+    u32 key;
+    u32 value;
+    Handle(Node) next;
+    bool has_next;
+}
+
+Slab(Node) nodes;
+
+const u32 BUCKET_COUNT = 8;
+
+struct Bucket {
+    Handle(Node) head;
+    bool occupied;
+}
+
+Bucket[8] buckets;
+
+u32 hash(u32 key) {
+    u32 h = key;
+    h = h ^ (h >> 16);
+    h = h * 0x45D9F3B;
+    h = h ^ (h >> 16);
+    return h % BUCKET_COUNT;
+}
+
+bool map_put(u32 key, u32 value) {
+    u32 slot = hash(key);
+    if (buckets[slot].occupied) {
+        Handle(Node) h = buckets[slot].head;
+        if (nodes.get(h).key == key) {
+            nodes.get(h).value = value;
+            return true;
+        }
+    }
+    Handle(Node) n = nodes.alloc() orelse return;
+    nodes.get(n).key = key;
+    nodes.get(n).value = value;
+    if (buckets[slot].occupied) {
+        nodes.get(n).next = buckets[slot].head;
+        nodes.get(n).has_next = true;
+    }
+    buckets[slot].head = n;
+    buckets[slot].occupied = true;
+    return true;
+}
+
+?u32 map_get(u32 key) {
+    u32 slot = hash(key);
+    if (!buckets[slot].occupied) { return null; }
+    Handle(Node) h = buckets[slot].head;
+    if (nodes.get(h).key == key) {
+        return nodes.get(h).value;
+    }
+    if (nodes.get(h).has_next) {
+        Handle(Node) nh = nodes.get(h).next;
+        if (nodes.get(nh).key == key) {
+            return nodes.get(nh).value;
+        }
+    }
+    return null;
+}
+
+bool map_delete(u32 key) {
+    u32 slot = hash(key);
+    if (!buckets[slot].occupied) { return false; }
+    Handle(Node) h = buckets[slot].head;
+    if (nodes.get(h).key == key) {
+        if (nodes.get(h).has_next) {
+            buckets[slot].head = nodes.get(h).next;
+        } else {
+            buckets[slot].occupied = false;
+        }
+        nodes.free(h);
+        return true;
+    }
+    return false;
+}
+
+u32 main() {
+    if (!map_put(10, 100)) { return 1; }
+    if (!map_put(20, 200)) { return 2; }
+    if (!map_put(30, 300)) { return 3; }
+
+    u32 val = map_get(20) orelse return;
+    if (val != 200) { return 4; }
+
+    map_put(20, 999);
+    val = map_get(20) orelse return;
+    if (val != 999) { return 5; }
+
+    if (!map_put(100, 1000)) { return 6; }
+    if (!map_put(200, 2000)) { return 7; }
+    if (!map_put(300, 3000)) { return 8; }
+
+    val = map_get(300) orelse return;
+    if (val != 3000) { return 9; }
+
+    if (!map_delete(20)) { return 10; }
+    ?u32 gone = map_get(20);
+    if (gone) |v| { return 11; }
+
+    val = map_get(10) orelse return;
+    if (val != 100) { return 12; }
+
+    puts("hash_map_chained: all tests passed!");
+    return 0;
+}

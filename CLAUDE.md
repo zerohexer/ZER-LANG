@@ -461,8 +461,13 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **ZER Integration Tests (`tests/zer/`):**
 - Real `.zer` files compiled with `zerc --run`, must exit 0
 - Runner: `tests/test_zer.sh`, added to `make check`
-- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts
+- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained
 - Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
+
+**Known Bugs Found (to fix in future sessions):**
+- `?Handle(T)` in struct fields has emission mismatch — `_zer_opt_u64` vs `long unsigned int`. Workaround: use `Handle(T) field; bool has_field;` instead.
+- Range propagation doesn't track function return values — `slot = hash(key)` where `hash()` internally does `% N` still warns. Only direct `slot = expr % N` is proven. Cross-function range summaries would fix this but not urgent (auto-guard keeps it safe).
+- `--run` with absolute output path prepends `./` to `/tmp/file` making `.//tmp/file`. Only affects Docker testing, not real use.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

@@ -2303,11 +2303,18 @@ static void emit_stmt(Emitter *e, Node *node) {
                         emit(e, ", 1 }");
                     }
                 } else {
-                    emit(e, " = (");
-                    emit_type(e, type);
-                    emit(e, "){ ");
-                    emit_expr(e, node->var_decl.init);
-                    emit(e, ", 1 }");
+                    /* check if init expression is already ?T (e.g. struct field of ?Handle type) */
+                    Type *init_type = checker_get_type(e->checker,node->var_decl.init);
+                    if (init_type && init_type->kind == TYPE_OPTIONAL) {
+                        emit(e, " = ");
+                        emit_expr(e, node->var_decl.init);
+                    } else {
+                        emit(e, " = (");
+                        emit_type(e, type);
+                        emit(e, "){ ");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ", 1 }");
+                    }
                 }
             } else {
                 /* array→slice coercion at var-decl */

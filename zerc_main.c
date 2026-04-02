@@ -495,9 +495,19 @@ int main(int argc, char **argv) {
 
         char run_cmd[1024];
 #ifdef _WIN32
-        snprintf(run_cmd, sizeof(run_cmd), ".\\%s", exe_path);
+        /* absolute paths (C:\...) don't need .\ prefix */
+        if (exe_path[0] && exe_path[1] == ':') {
+            snprintf(run_cmd, sizeof(run_cmd), "%s", exe_path);
+        } else {
+            snprintf(run_cmd, sizeof(run_cmd), ".\\%s", exe_path);
+        }
 #else
-        snprintf(run_cmd, sizeof(run_cmd), "./%s", exe_path);
+        /* absolute paths (/...) don't need ./ prefix */
+        if (exe_path[0] == '/') {
+            snprintf(run_cmd, sizeof(run_cmd), "%s", exe_path);
+        } else {
+            snprintf(run_cmd, sizeof(run_cmd), "./%s", exe_path);
+        }
 #endif
         printf("zerc: running %s\n", exe_path);
         int run_ret = system(run_cmd);

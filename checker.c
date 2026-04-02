@@ -253,6 +253,7 @@ static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
+static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
@@ -1703,6 +1704,20 @@ static Type *check_expr(Checker *c, Node *node) {
                                     existing->min_val = rmin;
                                     existing->max_val = rmax;
                                     existing->known_nonzero = (rmin > 0);
+                                } else if (node->assign.value->kind == NODE_CALL &&
+                                           node->assign.value->call.callee->kind == NODE_IDENT) {
+                                    Symbol *csym = scope_lookup(c->current_scope,
+                                        node->assign.value->call.callee->ident.name,
+                                        (uint32_t)node->assign.value->call.callee->ident.name_len);
+                                    if (csym && csym->has_return_range) {
+                                        existing->min_val = csym->return_range_min;
+                                        existing->max_val = csym->return_range_max;
+                                        existing->known_nonzero = (csym->return_range_min > 0);
+                                    } else {
+                                        existing->min_val = INT64_MIN;
+                                        existing->max_val = INT64_MAX;
+                                        existing->known_nonzero = false;
+                                    }
                                 } else {
                                     existing->min_val = INT64_MIN;
                                     existing->max_val = INT64_MAX;
@@ -4478,6 +4493,18 @@ static void check_stmt(Checker *c, Node *node) {
                 if (derive_expr_range(c, node->var_decl.init, &rmin, &rmax)) {
                     push_var_range(c, node->var_decl.name,
                         (uint32_t)node->var_decl.name_len, rmin, rmax, rmin > 0);
+                } else if (node->var_decl.init->kind == NODE_CALL &&
+                           node->var_decl.init->call.callee->kind == NODE_IDENT) {
+                    /* cross-function range: check if callee has return range summary */
+                    Symbol *csym = scope_lookup(c->current_scope,
+                        node->var_decl.init->call.callee->ident.name,
+                        (uint32_t)node->var_decl.init->call.callee->ident.name_len);
+                    if (csym && csym->has_return_range) {
+                        push_var_range(c, node->var_decl.name,
+                            (uint32_t)node->var_decl.name_len,
+                            csym->return_range_min, csym->return_range_max,
+                            csym->return_range_min > 0);
+                    }
                 }
             }
         }
@@ -6047,6 +6074,25 @@ static void check_func_body(Checker *c, Node *node) {
             }
         }
 
+        /* Cross-function range summary: if function returns integer and
+         * all return paths have derivable ranges (% N, & MASK), store on symbol. */
+        {
+            Type *ret_eff = type_unwrap_distinct(ret);
+            if (ret_eff && type_is_integer(ret_eff) && node->func_decl.body) {
+                int64_t rmin = 0, rmax = 0;
+                bool found = false;
+                if (find_return_range(c, node->func_decl.body, &rmin, &rmax, &found) && found) {
+                    Symbol *fsym = scope_lookup(c->current_scope,
+                        node->func_decl.name, (uint32_t)node->func_decl.name_len);
+                    if (fsym) {
+                        fsym->return_range_min = rmin;
+                        fsym->return_range_max = rmax;
+                        fsym->has_return_range = true;
+                    }
+                }
+            }
+        }
+
         /* Whole-program param provenance: for each *opaque parameter,
          * scan body for @ptrcast to determine expected type. */
         for (int pi = 0; pi < node->func_decl.param_count; pi++) {
@@ -6494,6 +6540,41 @@ static Type *find_return_provenance(Checker *c, Node *node) {
         return find_return_provenance(c, node->if_stmt.else_body);
     }
     return NULL;
+}
+
+/* Scan a function body for return expressions with derivable range.
+ * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found) {
+    if (!node) return true;
+    if (node->kind == NODE_RETURN && node->ret.expr) {
+        int64_t rmin, rmax;
+        if (derive_expr_range(c, node->ret.expr, &rmin, &rmax)) {
+            if (!*found) {
+                *out_min = rmin;
+                *out_max = rmax;
+                *found = true;
+            } else {
+                /* widen to union of ranges */
+                if (rmin < *out_min) *out_min = rmin;
+                if (rmax > *out_max) *out_max = rmax;
+            }
+            return true;
+        }
+        return false; /* return without derivable range — give up */
+    }
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            if (!find_return_range(c, node->block.stmts[i], out_min, out_max, found))
+                return false;
+        }
+        return true;
+    }
+    if (node->kind == NODE_IF) {
+        if (!find_return_range(c, node->if_stmt.then_body, out_min, out_max, found))
+            return false;
+        return find_return_range(c, node->if_stmt.else_body, out_min, out_max, found);
+    }
+    return true; /* non-return statement — ok */
 }
 
 /* Find what type a *opaque parameter is cast to inside a function body.

@@ -3001,6 +3001,59 @@ int main(void) {
        "}",
        "@probe: discovery scan loop");
 
+    /* ---- const global division guard (BUG-395) ---- */
+    printf("[@const global division guard]\n");
+    ok("const u32 SIZE = 16;\n"
+       "u32 hash(u32 x) { return x % SIZE; }",
+       "const global as divisor — proven nonzero");
+    ok("const u32 N = 8;\n"
+       "u32 main() { u32 x = 100; x /= N; return x; }",
+       "const global compound /= — proven nonzero");
+
+    /* ---- modulo/AND range propagation ---- */
+    printf("[@modulo/AND range propagation]\n");
+    ok("u32[16] arr;\n"
+       "u32 main() {\n"
+       "    u32 slot = 42 % 16;\n"
+       "    arr[slot] = 1;\n"
+       "    return arr[slot];\n"
+       "}",
+       "modulo range: slot = x % 16 proven [0,15]");
+    ok("u32[256] buf;\n"
+       "u32 main() {\n"
+       "    u32 idx = 0xFF & 0xAB;\n"
+       "    buf[idx] = 5;\n"
+       "    return buf[idx];\n"
+       "}",
+       "AND range: idx = x & 0xFF proven [0,255]");
+
+    /* ---- []T → *T extern auto-coerce ---- */
+    printf("[@slice to pointer extern coerce]\n");
+    ok("i32 puts(const *u8 s);\n"
+       "u32 main() {\n"
+       "    puts(\"hello\");\n"
+       "    return 0;\n"
+       "}",
+       "[]u8 auto-coerces to *u8 for extern function");
+    err("i32 internal(const *u8 s) { return 0; }\n"
+        "u32 main() {\n"
+        "    internal(\"hello\");\n"
+        "    return 0;\n"
+        "}",
+        "[]u8 NOT auto-coerced for ZER function with body");
+
+    /* ---- ?Handle(T) in struct field ---- */
+    printf("[@optional handle in struct]\n");
+    ok("struct Node { u32 val; ?Handle(Node) next; }\n"
+       "Slab(Node) store;\n"
+       "u32 main() {\n"
+       "    Handle(Node) h = store.alloc() orelse return;\n"
+       "    store.get(h).val = 42;\n"
+       "    store.get(h).next = null;\n"
+       "    return 0;\n"
+       "}",
+       "?Handle(Node) struct field — alloc, set, null assign");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

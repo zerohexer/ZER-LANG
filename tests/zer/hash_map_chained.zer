@@ -1,14 +1,12 @@
 // Chained hash map — Slab-allocated linked list per bucket
-// Slab grows dynamically (like malloc). Handle prevents UAF.
-// Manual bool flag for next pointer (workaround: ?Handle in struct field has emission bug).
+// Slab grows dynamically. Handle prevents UAF. ?Handle for optional next pointers.
 
 i32 puts(const *u8 s);
 
 struct Node {
     u32 key;
     u32 value;
-    Handle(Node) next;
-    bool has_next;
+    ?Handle(Node) next;
 }
 
 Slab(Node) nodes;
@@ -16,8 +14,7 @@ Slab(Node) nodes;
 const u32 BUCKET_COUNT = 8;
 
 struct Bucket {
-    Handle(Node) head;
-    bool occupied;
+    ?Handle(Node) head;
 }
 
 Bucket[8] buckets;
@@ -32,8 +29,7 @@ u32 hash(u32 key) {
 
 bool map_put(u32 key, u32 value) {
     u32 slot = hash(key);
-    if (buckets[slot].occupied) {
-        Handle(Node) h = buckets[slot].head;
+    if (buckets[slot].head) |h| {
         if (nodes.get(h).key == key) {
             nodes.get(h).value = value;
             return true;
@@ -42,26 +38,22 @@ bool map_put(u32 key, u32 value) {
     Handle(Node) n = nodes.alloc() orelse return;
     nodes.get(n).key = key;
     nodes.get(n).value = value;
-    if (buckets[slot].occupied) {
-        nodes.get(n).next = buckets[slot].head;
-        nodes.get(n).has_next = true;
-    }
+    nodes.get(n).next = buckets[slot].head;
     buckets[slot].head = n;
-    buckets[slot].occupied = true;
     return true;
 }
 
 ?u32 map_get(u32 key) {
     u32 slot = hash(key);
-    if (!buckets[slot].occupied) { return null; }
-    Handle(Node) h = buckets[slot].head;
-    if (nodes.get(h).key == key) {
-        return nodes.get(h).value;
-    }
-    if (nodes.get(h).has_next) {
-        Handle(Node) nh = nodes.get(h).next;
-        if (nodes.get(nh).key == key) {
-            return nodes.get(nh).value;
+    if (buckets[slot].head) |h| {
+        if (nodes.get(h).key == key) {
+            return nodes.get(h).value;
+        }
+        ?Handle(Node) next = nodes.get(h).next;
+        if (next) |nh| {
+            if (nodes.get(nh).key == key) {
+                return nodes.get(nh).value;
+            }
         }
     }
     return null;
@@ -69,16 +61,13 @@ bool map_put(u32 key, u32 value) {
 
 bool map_delete(u32 key) {
     u32 slot = hash(key);
-    if (!buckets[slot].occupied) { return false; }
-    Handle(Node) h = buckets[slot].head;
-    if (nodes.get(h).key == key) {
-        if (nodes.get(h).has_next) {
-            buckets[slot].head = nodes.get(h).next;
-        } else {
-            buckets[slot].occupied = false;
+    if (buckets[slot].head) |h| {
+        if (nodes.get(h).key == key) {
+            ?Handle(Node) nxt = nodes.get(h).next;
+            nodes.free(h);
+            buckets[slot].head = nxt;
+            return true;
         }
-        nodes.free(h);
-        return true;
     }
     return false;
 }

@@ -197,6 +197,11 @@ struct Symbol {
     bool is_comptime;       /* comptime function — evaluated at compile time */
     Node *func_node;        /* AST node for function body, if applicable */
 
+    /* cross-function range summary: return value range for simple functions */
+    int64_t return_range_min;
+    int64_t return_range_max;
+    bool has_return_range;
+
     /* module prefix for name mangling (NULL = main module) */
     const char *module_prefix;
     uint32_t module_prefix_len;

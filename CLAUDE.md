@@ -450,6 +450,18 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Handle gen check: ~60-130% in synthetic microbenchmark (tight loop doing nothing but pool.get), <5% in real code with actual computation per access
 - Benchmarks in `benchmarks/` directory (not committed — local only)
 
+**Bugs Found by Writing Real ZER Code (2026-04-02):**
+- `const u32 MAP_SIZE = 16; h % MAP_SIZE` → false "not proven nonzero". Root cause: `eval_const_expr` doesn't resolve `NODE_IDENT`, and `sym->func_node` was never set for `NODE_GLOBAL_VAR` in `register_decl`. Fix: (1) add const symbol init lookup in division guard path, (2) set `sym->func_node = node` for global vars. Both `/` `%` and `/=` `%=` paths fixed.
+- `#line` directive emitted on same line as `{` in orelse-return defer path → GCC "stray #" error. All `emit(e, "{ "); emit_defers(e);` sites changed to `emit(e, "{\n"); emit_defers(e);` (var-decl orelse return, auto-guard return, orelse break/continue).
+- Windows `zerc --run`: quoting `"gcc"` in `system()` breaks `cmd.exe`. Fix: only quote gcc path if it contains spaces (bundled path vs system PATH).
+- `pool.get()` is non-storable — `*Task t = pool.get(h)` is a checker error. Must use inline: `pool.get(h).field`.
+
+**ZER Integration Tests (`tests/zer/`):**
+- Real `.zer` files compiled with `zerc --run`, must exit 0
+- Runner: `tests/test_zer.sh`, added to `make check`
+- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup
+- Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

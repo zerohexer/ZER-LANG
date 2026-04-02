@@ -464,10 +464,11 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained
 - Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
 
-**Known Bugs Found (to fix in future sessions):**
-- `?Handle(T)` in struct fields has emission mismatch — `_zer_opt_u64` vs `long unsigned int`. Workaround: use `Handle(T) field; bool has_field;` instead.
-- Range propagation doesn't track function return values — `slot = hash(key)` where `hash()` internally does `% N` still warns. Only direct `slot = expr % N` is proven. Cross-function range summaries would fix this but not urgent (auto-guard keeps it safe).
-- `--run` with absolute output path prepends `./` to `/tmp/file` making `.//tmp/file`. Only affects Docker testing, not real use.
+**Bugs Fixed This Session (2026-04-02):**
+- `?Handle(T)` struct field double-wrap: emitter var-decl init wrapped already-optional value in `{value, 1}`. Fix: check `init_type->kind == TYPE_OPTIONAL` before wrapping (same pattern as BUG-032 for NODE_IDENT). `hash_map_chained.zer` now uses `?Handle(Node) next` directly.
+- Cross-function range propagation: `find_return_range()` scans function bodies for return expressions with `% N` or `& MASK`. Stores `return_range_min/max` on Symbol. Call sites propagate range to variables. `slot = hash(key)` where `hash()` returns `h % TABLE_SIZE` → slot proven `[0, TABLE_SIZE-1]`.
+- `--run` absolute path: skip `./` prefix for paths starting with `/` (Linux) or drive letter `C:` (Windows).
+- `[]T → *T` extern auto-coerce const safety: string literals and const slices to non-const `*T` param now rejected. Must declare `const *T`. Prevents `.rodata` write-through.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

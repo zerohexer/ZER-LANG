@@ -612,6 +612,15 @@ When array index is not proven by range propagation, compiler auto-inserts `if (
 ### Windows `zerc --run` GCC Quoting (BUG-397)
 `system("\"gcc\" -std=c99 ...")` fails on Windows `cmd.exe` — outer quotes treated as the entire command string. Fix: only quote gcc_path when it contains spaces (bundled GCC path). Plain `gcc` from system PATH emitted without quotes. Same fix for run command: `.\hash_map.exe` not `.\"hash_map.exe"`.
 
+### ?Handle(T) Struct Field Double-Wrap (BUG-398)
+Emitter var-decl init for `?T` target wraps value in `{value, 1}`. But if init expression is NODE_FIELD returning `?Handle(T)` (already `_zer_opt_u64`), it double-wraps. Fix: in the `else` branch (non-IDENT, non-CALL, non-NULL init), check `checker_get_type(init)->kind == TYPE_OPTIONAL` — if already optional, assign directly. Same pattern as BUG-032 (NODE_IDENT already-optional check).
+
+### Cross-Function Range Propagation (BUG-399)
+`find_return_range(c, body, &min, &max, &found)` walks function body for NODE_RETURN expressions with derivable ranges (% N, & MASK). If ALL returns have ranges, stores `return_range_min/max` + `has_return_range` on Symbol (types.h). At call sites (var-decl init + assignment), if `derive_expr_range` fails and value is NODE_CALL to a function with `has_return_range`, propagates the range. Eliminates false "index not proven" warnings for `slot = hash(key)` where `hash()` returns `h % TABLE_SIZE`.
+
+### []T → *T Extern Const Safety (BUG-400)
+The `[]T → *T` auto-coerce for extern functions must check const: if arg is string literal or const slice, param must be `const *T`. Without this, `puts(*u8 s)` accepted string literals — would allow writes through `.rodata` pointer. Check is before the `slice_to_ptr_ok` flag, so const rejection takes priority over extern allowance.
+
 ### @bitcast Struct Width Validation (BUG-325)
 `type_width()` returns 0 for TYPE_STRUCT, TYPE_UNION, TYPE_ARRAY. The @bitcast width check `if (tw > 0 && vw > 0 && tw != vw)` was silently skipped for structs. Fix: when `type_width()` returns 0, fall back to `compute_type_size(t) * 8`. This catches `@bitcast(Big, small)` where structs have different memory sizes. `compute_type_size` returns `CONST_EVAL_FAIL` for types with target-dependent size (pointers, slices) — those still skip the check (GCC validates at C level).
 

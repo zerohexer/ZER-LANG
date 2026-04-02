@@ -14,6 +14,7 @@ typedef struct {
     bool panic_mode;        /* suppress cascading errors */
     bool oom;               /* arena allocation failed — stop parsing */
     const char *file_name;  /* for error messages */
+    const char *source;     /* source text for error display (NULL = skip source line) */
     int depth;              /* nesting depth for recursion limit */
 } Parser;
 

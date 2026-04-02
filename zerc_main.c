@@ -142,6 +142,7 @@ static bool parse_module(Compiler *cc, Module *m) {
     scanner_init(&scanner, m->source);
     Parser parser;
     parser_init(&parser, &scanner, &cc->arena, m->path);
+    parser.source = m->source;
     m->ast = parse_file(&parser);
     if (parser.had_error) {
         fprintf(stderr, "error: parse errors in module '%s'\n", m->name);
@@ -276,6 +277,7 @@ int main(int argc, char **argv) {
     scanner_init(&scanner, main_mod->source);
     Parser parser;
     parser_init(&parser, &scanner, &cc.arena, input_path);
+    parser.source = main_mod->source;
     main_mod->ast = parse_file(&parser);
     if (parser.had_error) {
         fprintf(stderr, "error: parse failed\n");
@@ -338,6 +340,7 @@ int main(int argc, char **argv) {
     /* type check — register all modules in topological order */
     Checker checker;
     checker_init(&checker, &cc.arena, input_path);
+    checker.source = main_mod->source;
     checker.no_strict_mmio = no_strict_mmio;
 
     /* register in topo order: dependencies first, main last */
@@ -365,12 +368,16 @@ int main(int argc, char **argv) {
         if (!m->ast) continue;
         checker.current_module = m->name;
         checker.current_module_len = (uint32_t)strlen(m->name);
+        checker.file_name = m->path;
+        checker.source = m->source;
         checker_push_module_scope(&checker, m->ast);
         checker_check_bodies(&checker, m->ast);
         checker_pop_module_scope(&checker);
     }
     checker.current_module = NULL;
     checker.current_module_len = 0;
+    checker.file_name = input_path;
+    checker.source = main_mod->source;
 
     /* type-check main file (full check — its decls were registered above) */
     if (!checker_check_bodies(&checker, main_mod->ast)) {

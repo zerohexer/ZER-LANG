@@ -18,6 +18,39 @@
 
 /* ---- Error reporting ---- */
 
+/* Print the source line and a caret underline for the error location.
+ * If source is NULL, does nothing. */
+static void print_source_line(FILE *out, const char *source, int line) {
+    if (!source || line < 1) return;
+    /* find line N (1-based) */
+    const char *p = source;
+    for (int cur = 1; cur < line && *p; cur++) {
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    if (!*p) return;
+    /* find end of line */
+    const char *end = p;
+    while (*end && *end != '\n' && *end != '\r') end++;
+    int len = (int)(end - p);
+    if (len == 0) return;
+    /* find first non-whitespace for caret position */
+    int first_nonws = 0;
+    while (first_nonws < len && (p[first_nonws] == ' ' || p[first_nonws] == '\t'))
+        first_nonws++;
+    int content_len = len - first_nonws;
+    if (content_len <= 0) return;
+    /* print: " line | source_text" */
+    fprintf(out, " %4d | %.*s\n", line, len, p);
+    /* print: "      | ^^^^..." under the content */
+    fprintf(out, "      | ");
+    for (int i = 0; i < first_nonws; i++)
+        fputc(p[i] == '\t' ? '\t' : ' ', out);
+    for (int i = 0; i < content_len && i < 60; i++)
+        fputc('^', out);
+    fputc('\n', out);
+}
+
 static void checker_add_diag(Checker *c, int line, int severity, const char *fmt, va_list ap) {
     if (c->diag_count >= c->diag_capacity) {
         int new_cap = c->diag_capacity * 2;
@@ -44,6 +77,7 @@ static void checker_error(Checker *c, int line, const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fprintf(stderr, "\n");
+    print_source_line(stderr, c->source, line);
 }
 
 static void checker_warning(Checker *c, int line, const char *fmt, ...) {
@@ -57,6 +91,7 @@ static void checker_warning(Checker *c, int line, const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fprintf(stderr, "\n");
+    print_source_line(stderr, c->source, line);
 }
 
 /* ---- Non-storable tracking ----

@@ -34,6 +34,7 @@ typedef struct {
     Scope *global_scope;    /* module-level scope */
     Scope *current_scope;   /* current scope in traversal */
     const char *file_name;
+    const char *source;     /* source text for error display (NULL = skip source line) */
     int error_count;
     int warning_count;
     Type *current_func_ret; /* return type of current function (for return stmt checking) */

@@ -13,6 +13,32 @@
 
 /* ---- Error reporting ---- */
 
+static void print_source_line_p(FILE *out, const char *source, int line) {
+    if (!source || line < 1) return;
+    const char *p = source;
+    for (int cur = 1; cur < line && *p; cur++) {
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    if (!*p) return;
+    const char *end = p;
+    while (*end && *end != '\n' && *end != '\r') end++;
+    int len = (int)(end - p);
+    if (len == 0) return;
+    int first_nonws = 0;
+    while (first_nonws < len && (p[first_nonws] == ' ' || p[first_nonws] == '\t'))
+        first_nonws++;
+    int content_len = len - first_nonws;
+    if (content_len <= 0) return;
+    fprintf(out, " %4d | %.*s\n", line, len, p);
+    fprintf(out, "      | ");
+    for (int i = 0; i < first_nonws; i++)
+        fputc(p[i] == '\t' ? '\t' : ' ', out);
+    for (int i = 0; i < content_len && i < 60; i++)
+        fputc('^', out);
+    fputc('\n', out);
+}
+
 static void error_at(Parser *p, Token *tok, const char *msg) {
     if (p->panic_mode) return;
     p->panic_mode = true;
@@ -24,6 +50,7 @@ static void error_at(Parser *p, Token *tok, const char *msg) {
         fprintf(stderr, " at '%.*s'", (int)tok->length, tok->start);
     }
     fprintf(stderr, "\n");
+    print_source_line_p(stderr, p->source, tok->line);
 }
 
 static void error(Parser *p, const char *msg) {
@@ -1990,6 +2017,7 @@ void parser_init(Parser *p, Scanner *scanner, Arena *arena, const char *file_nam
     p->panic_mode = false;
     p->oom = false;
     p->file_name = file_name;
+    p->source = NULL;
     p->depth = 0;
     advance(p); /* prime the first token */
 }

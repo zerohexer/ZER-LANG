@@ -1,14 +1,18 @@
 FROM gcc:13
 
-# Install mingw for Windows cross-compilation + Node.js for vsce + 7zip for w64devkit
+# Install mingw (Windows), osxcross deps (macOS), Node.js, vsce, 7zip, rsvg
 RUN apt-get update -qq && \
-    apt-get install -y -qq gcc-mingw-w64-x86-64-posix p7zip-full curl librsvg2-bin && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y -qq nodejs && \
-    npm install -g @vscode/vsce && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y -qq \
+    gcc-mingw-w64-x86-64-posix \
+    p7zip-full curl librsvg2-bin \
+    clang cmake libssl-dev libxml2-dev lzma-dev libbz2-dev zlib1g-dev \
+    gcc-aarch64-linux-gnu \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y -qq nodejs \
+    && npm install -g @vscode/vsce \
+    && rm -rf /var/lib/apt/lists/*
 
-# Download portable MinGW GCC for Windows (w64devkit — standalone, no installer)
+# Download portable MinGW GCC for Windows
 RUN curl -fsSL "https://github.com/skeeto/w64devkit/releases/download/v2.6.0/w64devkit-x64-2.6.0.7z.exe" \
     -o /tmp/w64devkit.7z && \
     cd /tmp && 7z x -y w64devkit.7z > /dev/null && \
@@ -23,19 +27,40 @@ COPY test_modules/ test_modules/
 # Copy extension sources
 COPY editors/vscode/ /ext/
 
-# Create bin directory
-RUN mkdir -p /ext/bin
+# Create platform bin directories
+RUN mkdir -p /ext/bin/win32-x64 /ext/bin/linux-x64 /ext/bin/darwin-x64 /ext/bin/darwin-arm64
 
-# Build Windows binaries
-RUN x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/zerc.exe \
+# ---- Windows x64 ----
+RUN x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zerc.exe \
     lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && \
-    x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/zer-lsp.exe \
+    x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zer-lsp.exe \
     zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c
 
-# Bundle portable GCC — copy entire w64devkit into bin/gcc/
-# Strip unnecessary files to reduce size (share/, src/, docs)
-RUN cp -r /tmp/w64devkit /ext/bin/gcc && \
-    rm -rf /ext/bin/gcc/share /ext/bin/gcc/src
+# Bundle portable GCC for Windows
+RUN cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
+    rm -rf /ext/bin/win32-x64/gcc/share /ext/bin/win32-x64/gcc/src
+
+# ---- Linux x64 (native gcc:13) ----
+RUN gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zerc \
+    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && \
+    gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zer-lsp \
+    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c
+# Linux users have gcc installed — no need to bundle
+
+# ---- macOS x64 + arm64 ----
+# macOS cross-compilation requires osxcross + macOS SDK (legal gray area).
+# Instead: build as C source bundle — macOS users compile on first run.
+RUN cp lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c zer_lsp.c \
+       lexer.h parser.h ast.h types.h checker.h emitter.h zercheck.h \
+       /ext/bin/darwin-x64/ && \
+    cp /ext/bin/darwin-x64/* /ext/bin/darwin-arm64/ 2>/dev/null; true && \
+    echo '#!/bin/bash' > /ext/bin/darwin-x64/build.sh && \
+    echo 'DIR="$(cd "$(dirname "$0")" && pwd)"' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zerc" "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/zerc_main.c' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zer-lsp" "$DIR"/zer_lsp.c "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'echo "ZER: compiled zerc and zer-lsp for macOS"' >> /ext/bin/darwin-x64/build.sh && \
+    chmod +x /ext/bin/darwin-x64/build.sh && \
+    cp /ext/bin/darwin-x64/build.sh /ext/bin/darwin-arm64/build.sh
 
 # Convert SVG icon to PNG for marketplace
 RUN rsvg-convert -w 128 -h 128 /ext/icon.svg -o /ext/icon.png

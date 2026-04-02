@@ -2,7 +2,7 @@
     "name": "zerohexer-lang",
     "displayName": "ZER(C) Language",
     "description": "Memory-safe systems programming — compiler, LSP, and GCC bundled. Zero setup.",
-    "version": "0.2.3",
+    "version": "0.2.4",
     "publisher": "zerohexer",
     "license": "MPL-2.0",
     "repository": {

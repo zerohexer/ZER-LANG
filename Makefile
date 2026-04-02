@@ -172,4 +172,15 @@ install: zerc
 	cp zerc.exe /c/msys64/mingw64/bin/zerc.exe 2>/dev/null || cp zerc /c/msys64/mingw64/bin/zerc 2>/dev/null
 	@echo "Installed zerc to C:\\msys64\\mingw64\\bin\\"
 
-.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install
+# ---- Docker VSIX: build VS Code extension with bundled compiler + GCC ----
+docker-vsix:
+	docker build -t zer-lang-vsix -f Dockerfile.vsix .
+	@mkdir -p release
+	docker rm -f zer-vsix-out 2>/dev/null; true
+	docker run --name zer-vsix-out zer-lang-vsix true
+	docker cp zer-vsix-out:/out/zer-lang.vsix release/zer-lang.vsix
+	docker rm zer-vsix-out
+	@echo "VS Code extension: release/zer-lang.vsix"
+	@echo "Install: code --install-extension release/zer-lang.vsix"
+
+.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix

@@ -470,6 +470,20 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - `--run` absolute path: skip `./` prefix for paths starting with `/` (Linux) or drive letter `C:` (Windows).
 - `[]T → *T` extern auto-coerce const safety: string literals and const slices to non-const `*T` param now rejected. Must declare `const *T`. Prevents `.rodata` write-through.
 
+**VS Code Extension (VSIX) Build:**
+- `make docker-vsix` — builds complete VSIX with bundled `zerc.exe`, `zer-lsp.exe`, and portable GCC (w64devkit)
+- `Dockerfile.vsix` — gcc:13 + mingw cross-compile + Node.js/vsce + w64devkit portable GCC + librsvg2 for SVG→PNG icon conversion
+- Extension auto-detects bundled binaries: `bin/zerc.exe`, `bin/zer-lsp.exe`, `bin/gcc/bin/gcc.exe`
+- Adds bundled `bin/` and `bin/gcc/bin/` to VS Code process PATH — no system PATH modification needed (sandboxed)
+- `editors/vscode/extension.js` — uses `findBundled()` to prefer bundled binaries, falls back to system PATH
+- `editors/vscode/package.json` — name `zerohexer-lang`, publisher `zerohexer`, MPL-2.0
+- Icon: `editors/vscode/icon.svg` — black background, silver `[*]` pointer-in-brackets logo, auto-converted to PNG during build
+- README.md in extension shows quick start, safety table, syntax examples
+- Marketplace: publisher "Zerohexer", display name "ZER(C) Language"
+
+**LLM Reference:**
+- `ZER-LANG-LLM.md` — compact ZER syntax reference designed for LLM consumption. Feed to any LLM to enable accurate ZER code generation. Covers all C→ZER differences, intrinsics, builtins, MMIO, ASM, common patterns, coercion rules. ~5K tokens.
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

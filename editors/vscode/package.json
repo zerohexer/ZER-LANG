@@ -1,14 +1,15 @@
 {
-    "name": "zer-lang",
-    "displayName": "ZER Language",
-    "description": "Language support for ZER — memory-safe systems programming language",
-    "version": "0.1.0",
+    "name": "zerohexer-lang",
+    "displayName": "ZER(C) Language",
+    "description": "Memory-safe systems programming — compiler, LSP, and GCC bundled. Zero setup.",
+    "version": "0.2.3",
     "publisher": "zerohexer",
-    "license": "Apache-2.0",
+    "license": "MPL-2.0",
     "repository": {
         "type": "git",
         "url": "https://github.com/zerohexer/ZER-LANG"
     },
+    "icon": "icon.png",
     "engines": {
         "vscode": "^1.75.0"
     },
@@ -34,8 +35,8 @@
             "properties": {
                 "zer.lspPath": {
                     "type": "string",
-                    "default": "zer-lsp",
-                    "description": "Path to the zer-lsp executable"
+                    "default": "",
+                    "description": "Path to zer-lsp executable (leave empty to use bundled)"
                 },
                 "zer.lspArgs": {
                     "type": "array",
@@ -50,6 +51,7 @@
         "vscode-languageserver-protocol": "^3.17.0"
     },
     "devDependencies": {
-        "@types/vscode": "^1.75.0"
+        "@types/vscode": "^1.75.0",
+        "@vscode/vsce": "^3.0.0"
     }
 }

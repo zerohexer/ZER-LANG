@@ -1227,6 +1227,20 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* range propagation: mark proven if divisor is nonzero.
                      * Handles both simple idents (d) and struct fields (cfg.d). */
+                    /* if eval_const_expr didn't resolve, try const symbol lookup */
+                    if (div_val == CONST_EVAL_FAIL && node->binary.right->kind == NODE_IDENT) {
+                        Symbol *dsym = scope_lookup(c->current_scope,
+                            node->binary.right->ident.name,
+                            (uint32_t)node->binary.right->ident.name_len);
+                        if (dsym && dsym->is_const && dsym->func_node) {
+                            Node *init = NULL;
+                            if (dsym->func_node->kind == NODE_GLOBAL_VAR)
+                                init = dsym->func_node->var_decl.init;
+                            else if (dsym->func_node->kind == NODE_VAR_DECL)
+                                init = dsym->func_node->var_decl.init;
+                            if (init) div_val = eval_const_expr(init);
+                        }
+                    }
                     if (div_val != CONST_EVAL_FAIL && div_val != 0) {
                         mark_proven(c, node); /* constant nonzero divisor */
                     } else {
@@ -2187,7 +2201,20 @@ static Type *check_expr(Checker *c, Node *node) {
                 Node *divisor = node->assign.value;
                 /* literal nonzero → ok */
                 bool div_ok = false;
-                if (divisor->kind == NODE_INT_LIT && divisor->int_lit.value != 0) div_ok = true;
+                int64_t dv = eval_const_expr(divisor);
+                if (dv == CONST_EVAL_FAIL && divisor->kind == NODE_IDENT) {
+                    Symbol *dsym = scope_lookup(c->current_scope,
+                        divisor->ident.name, (uint32_t)divisor->ident.name_len);
+                    if (dsym && dsym->is_const && dsym->func_node) {
+                        Node *dinit = NULL;
+                        if (dsym->func_node->kind == NODE_GLOBAL_VAR)
+                            dinit = dsym->func_node->var_decl.init;
+                        else if (dsym->func_node->kind == NODE_VAR_DECL)
+                            dinit = dsym->func_node->var_decl.init;
+                        if (dinit) dv = eval_const_expr(dinit);
+                    }
+                }
+                if (dv != CONST_EVAL_FAIL && dv != 0) div_ok = true;
                 /* range-proven nonzero → ok */
                 if (!div_ok && divisor->kind == NODE_IDENT) {
                     struct VarRange *r = find_var_range(c, divisor->ident.name,

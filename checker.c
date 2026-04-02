@@ -258,6 +258,42 @@ static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Ty
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
 
+/* Try to derive a bounded range from an expression.
+ * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
+ * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
+    if (!expr || expr->kind != NODE_BINARY) return false;
+    Node *rhs = expr->binary.right;
+    int64_t rval = eval_const_expr(rhs);
+    /* try const symbol lookup for ident RHS (e.g., MAP_SIZE) */
+    if (rval == CONST_EVAL_FAIL && rhs->kind == NODE_IDENT) {
+        Symbol *rsym = scope_lookup(c->current_scope,
+            rhs->ident.name, (uint32_t)rhs->ident.name_len);
+        if (rsym && rsym->is_const && rsym->func_node) {
+            Node *init = NULL;
+            if (rsym->func_node->kind == NODE_GLOBAL_VAR)
+                init = rsym->func_node->var_decl.init;
+            else if (rsym->func_node->kind == NODE_VAR_DECL)
+                init = rsym->func_node->var_decl.init;
+            if (init) rval = eval_const_expr(init);
+        }
+    }
+    if (rval == CONST_EVAL_FAIL || rval <= 0) return false;
+    if (expr->binary.op == TOK_PERCENT) {
+        /* x % N → [0, N-1] */
+        *out_min = 0;
+        *out_max = rval - 1;
+        return true;
+    }
+    if (expr->binary.op == TOK_AMP) {
+        /* x & MASK → [0, MASK] (unsigned bitmask) */
+        *out_min = 0;
+        *out_max = rval;
+        return true;
+    }
+    return false;
+}
+
 /* Check if an expression node is a literal that can be assigned to target type.
  * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
 static bool is_literal_compatible(Node *expr, Type *target) {
@@ -1661,9 +1697,17 @@ static Type *check_expr(Checker *c, Node *node) {
                                 existing->max_val = v;
                                 existing->known_nonzero = (v != 0);
                             } else {
-                                existing->min_val = INT64_MIN;
-                                existing->max_val = INT64_MAX;
-                                existing->known_nonzero = false;
+                                /* try derive range from expression: x % N, x & MASK */
+                                int64_t rmin, rmax;
+                                if (derive_expr_range(c, node->assign.value, &rmin, &rmax)) {
+                                    existing->min_val = rmin;
+                                    existing->max_val = rmax;
+                                    existing->known_nonzero = (rmin > 0);
+                                } else {
+                                    existing->min_val = INT64_MIN;
+                                    existing->max_val = INT64_MAX;
+                                    existing->known_nonzero = false;
+                                }
                             }
                         }
                         /* compound key range (e.g., "s.x" for struct field) */
@@ -4428,6 +4472,13 @@ static void check_stmt(Checker *c, Node *node) {
             if (val != CONST_EVAL_FAIL) {
                 push_var_range(c, node->var_decl.name,
                     (uint32_t)node->var_decl.name_len, val, val, val != 0);
+            } else {
+                /* derive range from expression: x % N → [0, N-1], x & MASK → [0, MASK] */
+                int64_t rmin, rmax;
+                if (derive_expr_range(c, node->var_decl.init, &rmin, &rmax)) {
+                    push_var_range(c, node->var_decl.name,
+                        (uint32_t)node->var_decl.name_len, rmin, rmax, rmin > 0);
+                }
             }
         }
 

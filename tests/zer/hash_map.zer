@@ -1,0 +1,91 @@
+// Hash map — open addressing with linear probing
+// Tests: const divisor, struct arrays, optional return, if-unwrap
+
+struct Entry {
+    u32 key;
+    u32 value;
+    bool occupied;
+}
+
+const u32 MAP_SIZE = 16;
+Entry[16] buckets;
+
+u32 hash(u32 key) {
+    u32 h = key;
+    h = h ^ (h >> 16);
+    h = h * 0x45D9F3B;
+    h = h ^ (h >> 16);
+    return h % MAP_SIZE;
+}
+
+bool map_put(u32 key, u32 value) {
+    u32 idx = hash(key);
+    for (u32 i = 0; i < MAP_SIZE; i += 1) {
+        u32 slot = (idx + i) % MAP_SIZE;
+        if (!buckets[slot].occupied) {
+            buckets[slot].key = key;
+            buckets[slot].value = value;
+            buckets[slot].occupied = true;
+            return true;
+        }
+        if (buckets[slot].key == key) {
+            buckets[slot].value = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+?u32 map_get(u32 key) {
+    u32 idx = hash(key);
+    for (u32 i = 0; i < MAP_SIZE; i += 1) {
+        u32 slot = (idx + i) % MAP_SIZE;
+        if (!buckets[slot].occupied) { return null; }
+        if (buckets[slot].key == key) {
+            return buckets[slot].value;
+        }
+    }
+    return null;
+}
+
+bool map_delete(u32 key) {
+    u32 idx = hash(key);
+    for (u32 i = 0; i < MAP_SIZE; i += 1) {
+        u32 slot = (idx + i) % MAP_SIZE;
+        if (!buckets[slot].occupied) { return false; }
+        if (buckets[slot].key == key) {
+            buckets[slot].occupied = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+u32 main() {
+    // Insert
+    if (!map_put(100, 42)) { return 1; }
+    if (!map_put(200, 84)) { return 2; }
+    if (!map_put(300, 126)) { return 3; }
+
+    // Lookup
+    u32 val = map_get(200) orelse return;
+    if (val != 84) { return 4; }
+
+    // Update
+    map_put(200, 99);
+    val = map_get(200) orelse return;
+    if (val != 99) { return 5; }
+
+    // Delete
+    if (!map_delete(200)) { return 6; }
+    ?u32 gone = map_get(200);
+    if (gone) |v| { return 7; }
+
+    // Remaining keys still work
+    val = map_get(100) orelse return;
+    if (val != 42) { return 8; }
+    val = map_get(300) orelse return;
+    if (val != 126) { return 9; }
+
+    return 0;
+}

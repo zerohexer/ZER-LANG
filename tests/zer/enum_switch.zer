@@ -1,0 +1,30 @@
+// Enum + exhaustive switch
+// Tests: enum declaration, qualified access, switch arms, default
+
+enum Color { red, green, blue }
+
+u32 color_value(Color c) {
+    switch (c) {
+        .red => { return 1; }
+        .green => { return 2; }
+        .blue => { return 3; }
+    }
+}
+
+enum Priority { low = 0, medium = 5, high = 10 }
+
+u32 main() {
+    Color c = Color.red;
+    if (color_value(c) != 1) { return 1; }
+
+    c = Color.blue;
+    if (color_value(c) != 3) { return 2; }
+
+    // Explicit enum values
+    Priority p = Priority.high;
+    if (@bitcast(u32, p) != 10) { return 3; }
+    p = Priority.medium;
+    if (@bitcast(u32, p) != 5) { return 4; }
+
+    return 0;
+}

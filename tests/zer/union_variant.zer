@@ -1,0 +1,45 @@
+// Union with tagged variants + mutable capture
+// Tests: union declaration, switch, immutable capture |v|, mutable capture |*v|
+
+union Message {
+    u32 integer;
+    bool flag;
+}
+
+u32 main() {
+    Message msg;
+    msg.integer = 42;
+
+    // Immutable capture
+    u32 result = 0;
+    switch (msg) {
+        .integer => |v| { result = v; }
+        .flag => |v| { return 1; }
+    }
+    if (result != 42) { return 2; }
+
+    // Mutable capture
+    switch (msg) {
+        .integer => |*v| { *v = 99; }
+        .flag => |v| { return 3; }
+    }
+
+    // Verify mutation
+    switch (msg) {
+        .integer => |v| {
+            if (v != 99) { return 4; }
+        }
+        .flag => |v| { return 5; }
+    }
+
+    // Flag variant
+    msg.flag = true;
+    switch (msg) {
+        .integer => |v| { return 6; }
+        .flag => |v| {
+            if (!v) { return 7; }
+        }
+    }
+
+    return 0;
+}

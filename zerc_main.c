@@ -477,8 +477,12 @@ int main(int argc, char **argv) {
         }
 
         char gcc_cmd[2048];
+        /* Only quote gcc path if it contains spaces (bundled path).
+         * Plain "gcc" with quotes breaks Windows cmd.exe system(). */
+        bool need_quote = (strchr(gcc_path, ' ') != NULL);
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\"",
+                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\""
+                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\"",
                  gcc_path, exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);
@@ -491,7 +495,7 @@ int main(int argc, char **argv) {
 
         char run_cmd[1024];
 #ifdef _WIN32
-        snprintf(run_cmd, sizeof(run_cmd), ".\\\"%s\"", exe_path);
+        snprintf(run_cmd, sizeof(run_cmd), ".\\%s", exe_path);
 #else
         snprintf(run_cmd, sizeof(run_cmd), "./%s", exe_path);
 #endif

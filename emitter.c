@@ -151,13 +151,13 @@ static void emit_auto_guards(Emitter *e, Node *node) {
             emit_expr(e, node->index_expr.index);
             emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
             if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                emit(e, "{ ");
+                emit(e, "{\n");
                 emit_defers(e);
                 emit(e, "return ");
                 emit_zero_value(e, e->current_func_ret);
                 emit(e, "; }\n");
             } else {
-                emit(e, "{ ");
+                emit(e, "{\n");
                 emit_defers(e);
                 emit(e, "return; }\n");
             }
@@ -2227,7 +2227,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                 emit(e, "if (!_zer_or%d.has_value) ", tmp);
             }
             if (node->var_decl.init->orelse.fallback_is_return) {
-                emit(e, "{ "); emit_defers(e);
+                emit(e, "{\n"); emit_defers(e);
                 if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
                     !is_null_sentinel(e->current_func_ret->optional.inner)) {
                     /* ?T function: return null optional */
@@ -2243,9 +2243,9 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "return; }\n");
                 }
             } else if (node->var_decl.init->orelse.fallback_is_break) {
-                emit(e, "{ "); emit_defers_from(e, e->loop_defer_base); emit(e, "break; }\n");
+                emit(e, "{\n"); emit_defers_from(e, e->loop_defer_base); emit(e, "break; }\n");
             } else {
-                emit(e, "{ "); emit_defers_from(e, e->loop_defer_base); emit(e, "continue; }\n");
+                emit(e, "{\n"); emit_defers_from(e, e->loop_defer_base); emit(e, "continue; }\n");
             }
             emit_indent(e);
             if (or_is_ptr) {

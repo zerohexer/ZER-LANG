@@ -1,0 +1,39 @@
+// Defer cleanup on all exit paths
+// Tests: defer ordering, defer with early return, defer with orelse
+
+u32 counter;
+
+void inc() {
+    counter += 1;
+}
+
+u32 test_defer_order() {
+    counter = 0;
+    defer inc();
+    defer inc();
+    defer inc();
+    return counter;
+}
+
+?u32 maybe_fail(bool fail) {
+    if (fail) { return null; }
+    return 42;
+}
+
+u32 test_defer_orelse() {
+    counter = 0;
+    defer inc();
+    u32 val = maybe_fail(true) orelse return;
+    return 99;
+}
+
+u32 main() {
+    test_defer_order();
+    if (counter != 3) { return 1; }
+
+    counter = 0;
+    test_defer_orelse();
+    if (counter != 1) { return 2; }
+
+    return 0;
+}

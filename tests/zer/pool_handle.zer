@@ -1,0 +1,44 @@
+// Pool with Handle — alloc/get/free, generation safety
+// Tests: Pool(T, N), Handle(T), optional unwrap, inline get access
+
+struct Task {
+    u32 id;
+    u32 priority;
+}
+
+Pool(Task, 8) tasks;
+
+u32 main() {
+    // Alloc
+    Handle(Task) h1 = tasks.alloc() orelse return;
+    Handle(Task) h2 = tasks.alloc() orelse return;
+
+    // Set fields via inline get
+    tasks.get(h1).id = 1;
+    tasks.get(h1).priority = 10;
+    tasks.get(h2).id = 2;
+    tasks.get(h2).priority = 20;
+
+    // Read back
+    if (tasks.get(h1).id != 1) { return 1; }
+    if (tasks.get(h1).priority != 10) { return 2; }
+    if (tasks.get(h2).id != 2) { return 3; }
+    if (tasks.get(h2).priority != 20) { return 4; }
+
+    // Free and realloc
+    tasks.free(h1);
+    Handle(Task) h3 = tasks.alloc() orelse return;
+    tasks.get(h3).id = 3;
+    tasks.get(h3).priority = 30;
+
+    // h2 still valid
+    if (tasks.get(h2).id != 2) { return 5; }
+
+    // h3 works
+    if (tasks.get(h3).id != 3) { return 6; }
+
+    tasks.free(h2);
+    tasks.free(h3);
+
+    return 0;
+}

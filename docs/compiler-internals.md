@@ -388,11 +388,15 @@ Pre-scan builds `FuncSummary` for each function with Handle params:
 
 Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entries shadow older, save/restore via count for scoped narrowing. `push_var_range()` intersects with existing (only narrows), clamps min to 0 for unsigned types.
 
-**Narrowing events:** literal init (`u32 d = 5` → {5,5,true}), for-loop condition (`i < N` → {0,N-1}), guard pattern (`if (i >= N) return` → {0,N-1} after if), comparison in then-block.
+**Narrowing events:** literal init (`u32 d = 5` → {5,5,true}), for-loop condition (`i < N` → {0,N-1}), guard pattern (`if (i >= N) return` → {0,N-1} after if), comparison in then-block, modulo (`x % N` → {0,N-1}), bitwise AND (`x & MASK` → {0,MASK}).
+
+**Expression-derived ranges:** `derive_expr_range(c, expr, &min, &max)` handles `TOK_PERCENT` and `TOK_AMP` with constant RHS (including const global symbol lookup). Used at both var-decl init and NODE_ASSIGN reassignment paths. This eliminates false "index not proven" warnings for hash map patterns like `slot = hash % TABLE_SIZE; arr[slot]`.
 
 **Proven nodes:** `mark_proven(c, node)` adds to `proven_safe` array. `checker_is_proven()` exposed to emitter. Emitter skips `_zer_bounds_check` for proven NODE_INDEX, skips div trap for proven NODE_BINARY.
 
-**Forced division guard:** NODE_IDENT divisor not proven nonzero → compile error with fix suggestion. Complex expressions keep runtime check.
+**Forced division guard:** NODE_IDENT divisor not proven nonzero → compile error with fix suggestion. Resolves const global symbol init values (e.g., `const u32 N = 16; x / N` → proven nonzero). Complex expressions keep runtime check.
+
+**Slice-to-pointer auto-coerce for extern C functions:** When arg is `[]T` and param is `*T` at a call site for a forward-declared function (no body), the checker allows it. The emitter auto-appends `.ptr` (already handled at line ~1265). ZER-to-ZER calls with bodies still require explicit `.ptr`. This is the C interop boundary convenience — `puts("hello")` works without `.ptr` when `puts` is declared as `i32 puts(const *u8 s);`.
 
 ## Bounds Auto-Guard (checker.c + emitter.c)
 

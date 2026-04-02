@@ -5776,6 +5776,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
+            sym->func_node = node; /* store AST node for const init lookup */
             /* BUG-218/222: store module prefix for name mangling (including static) */
             sym->module_prefix = c->current_module;
             sym->module_prefix_len = c->current_module_len;

@@ -251,7 +251,10 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
-| Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + startup @probe validation (boot-time) + `--no-strict-mmio` for unchecked access |
+| Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + **MMIO index bounds from range** (compile-time) + startup @probe validation (boot-time) + `--no-strict-mmio` for unchecked access |
+| Unsafe pointer indexing | Non-volatile `*T` indexing warns "use slice". Volatile `*T` from `@inttoptr` bounds-checked against `mmio` range. |
+| Slab alloc in ISR | `slab.alloc()` in interrupt handler → compile error (calloc may deadlock). Use Pool instead. |
+| Ghost handle (leaked alloc) | `pool.alloc()` / `slab.alloc()` as bare expression → compile error (handle discarded) |
 | Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
 | Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
@@ -313,6 +316,10 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | *opaque Level 1 (zercheck malloc/free) | Done | N/A (compile-time — UAF, double-free, leak) |
 | *opaque Level 2 (poison-after-free) | Done | Done (auto ptr=NULL after free) |
 | *opaque Level 3+4+5 (inline header+wrap) | Done | Done (--track-cptrs, --wrap=malloc) |
+| MMIO index bounds from mmio range | Done | N/A (compile-time — mmio_bound on Symbol) |
+| Pointer indexing warning (non-volatile) | Done | N/A (compile-time warning) |
+| Slab.alloc() banned in ISR | Done | N/A (compile-time error) |
+| Ghost handle (discarded alloc) | Done | N/A (compile-time error) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

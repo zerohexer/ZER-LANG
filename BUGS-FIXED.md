@@ -37,6 +37,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** After check_expr in NODE_EXPR_STMT, detect pool.alloc()/slab.alloc() calls and error: "discarded alloc result — handle leaked."
 - **Test:** `tests/zer_fail/ghost_handle.zer` — bare pool.alloc() rejected.
 
+### BUG-407: MMIO pointer indexing unchecked
+- **Symptom:** `gpio[100]` where `gpio` is `volatile *u32` from `@inttoptr` with `mmio 0x40020000..0x4002001F` — compiles without error even though index 100 is far outside the 32-byte MMIO range.
+- **Root cause:** TYPE_POINTER indexing in NODE_INDEX had no bounds information. The `mmio` range declaration existed but was never connected to pointer indexing.
+- **Fix:** When `@inttoptr(*T, addr)` is assigned to a variable, calculate `mmio_bound = (range_end - addr + 1) / sizeof(T)` from the matching `mmio` range. Store on Symbol. In NODE_INDEX for TYPE_POINTER, if `mmio_bound > 0` and index is constant, check `idx < mmio_bound`. Compile error on OOB. Both local and global var-decl paths set the bound.
+- **Test:** `test_checker_full.c` — MMIO index 7 valid (range = 8), index 8 and 100 rejected. 4 tests.
+
 ### BUG-403: zercheck not integrated into zerc pipeline
 - **Symptom:** zercheck (UAF, double-free, leak detection) never ran during `zerc` compilation. All 50+ zercheck tests passed because they called `zercheck_run()` directly in the test harness. Users had ZERO zercheck protection.
 - **Root cause:** `zerc_main.c` never called `zercheck_run()`. The function existed, was tested, but never invoked in the actual compiler pipeline.

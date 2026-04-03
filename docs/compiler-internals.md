@@ -684,6 +684,41 @@ These caused test failures and are not obvious from reading C source tests:
 6. **Large preamble** — Real debt, acknowledged. ~300 lines of C strings in emitter. Works but hard to maintain.
 7. **Comptime nested calls** — Partially real. Recursion depth guard works (max 16). Error message is generic. Two-pass registration handles most ordering issues.
 
+### Second External Audit (2026-04-03)
+
+4-point audit — pointer indexing, ISR alloc, type-ID shadowing, ghost handle:
+
+1. **Pointer indexing no bounds check** — Real. `p[N]` on `*T` emitted raw C. Fix: non-volatile `*T` indexing now warns "use slice." Volatile `*T` from `@inttoptr` gets compile-time bounds from `mmio` range (NEW — `mmio_bound` on Symbol). No other language bounds-checks MMIO indexing at compile time.
+2. **Slab.alloc in ISR** — Real. Slab uses calloc internally which may deadlock with global mutex. Fix: `c->in_interrupt` check before Slab alloc → compile error. Pool is safe (static, no malloc).
+3. **Type-ID shadowing** — False. ZER compiles all modules in one invocation with one `next_type_id` counter. No incremental compilation = no collision possible.
+4. **Ghost handle** — Real. `pool.alloc()` as bare expression → handle leaked silently. Fix: NODE_EXPR_STMT detects pool/slab alloc without assignment → compile error.
+
+### MMIO Pointer Index Bounds (5-Layer MMIO Safety)
+
+When `volatile *T ptr = @inttoptr(*T, addr)` is assigned:
+1. Look up which `mmio` range contains `addr`
+2. Calculate `bound = (range_end - addr + 1) / sizeof(T)`
+3. Store as `sym->mmio_bound` on the Symbol
+4. In NODE_INDEX for TYPE_POINTER, if `mmio_bound > 0` and index is constant, check `idx < mmio_bound`
+5. If proven, `mark_proven(c, node)` — emitter skips bounds check
+
+```
+mmio 0x40020000..0x4002001F;              → 32 bytes
+volatile *u32 gpio = @inttoptr(*u32, 0x40020000);
+                                            → bound = 32/4 = 8
+gpio[7] = 0xFF;                           → 7 < 8 → proven safe
+gpio[8] = 0xFF;                           → 8 >= 8 → compile error
+```
+
+Both var-decl (local) and global var paths set `mmio_bound`. Works on any architecture — math is `(range_end - addr + 1) / type_width`.
+
+5 layers total:
+1. Compile-time: address in declared range
+2. Compile-time: address aligned
+3. **Compile-time: index within range-derived bound (NEW)**
+4. Boot-time: @probe verifies hardware
+5. Runtime: fault handler traps
+
 ### Why ZER doesn't need a borrow checker
 
 ZER's memory model is fundamentally simpler than Rust's:

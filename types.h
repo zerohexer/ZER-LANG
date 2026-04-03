@@ -197,6 +197,9 @@ struct Symbol {
     bool is_comptime;       /* comptime function — evaluated at compile time */
     Node *func_node;        /* AST node for function body, if applicable */
 
+    /* MMIO pointer bound: derived from mmio range for @inttoptr pointers */
+    uint64_t mmio_bound;        /* max valid index (0 = no bound) */
+
     /* cross-function range summary: return value range for simple functions */
     int64_t return_range_min;
     int64_t return_range_max;

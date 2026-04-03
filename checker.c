@@ -3270,9 +3270,27 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = obj->slice.inner;
         } else if (obj->kind == TYPE_POINTER) {
-            /* pointer indexing: no bounds check possible (no length).
-             * Warn for non-volatile pointers — use slices for safety. */
-            if (!obj->pointer.is_volatile) {
+            /* pointer indexing: check mmio_bound if available, else warn */
+            bool ptr_proven = false;
+            if (node->index_expr.object->kind == NODE_IDENT) {
+                Symbol *psym = scope_lookup(c->current_scope,
+                    node->index_expr.object->ident.name,
+                    (uint32_t)node->index_expr.object->ident.name_len);
+                if (psym && psym->mmio_bound > 0) {
+                    /* MMIO pointer with known bound from mmio range */
+                    if (node->index_expr.index->kind == NODE_INT_LIT) {
+                        uint64_t idx = node->index_expr.index->int_lit.value;
+                        if (idx >= psym->mmio_bound) {
+                            checker_error(c, node->loc.line,
+                                "MMIO index %llu is out of range (max %llu from mmio declaration)",
+                                (unsigned long long)idx, (unsigned long long)psym->mmio_bound - 1);
+                        }
+                    }
+                    ptr_proven = true;
+                    mark_proven(c, node);
+                }
+            }
+            if (!ptr_proven && !obj->pointer.is_volatile) {
                 checker_warning(c, node->loc.line,
                     "pointer indexing has no bounds check — "
                     "use []%s (slice) for bounds-checked access",
@@ -4529,6 +4547,32 @@ static void check_stmt(Checker *c, Node *node) {
                 if (call && call->kind == NODE_CALL) {
                     if (call_has_local_derived_arg(c, call, 0)) {
                         sym->is_local_derived = true;
+                    }
+                }
+            }
+        }
+
+        /* MMIO pointer bound: if init is @inttoptr, derive bound from mmio range */
+        if (node->var_decl.init && sym && type &&
+            type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+            Node *init_expr = node->var_decl.init;
+            if (init_expr->kind == NODE_INTRINSIC &&
+                init_expr->intrinsic.name_len == 8 &&
+                memcmp(init_expr->intrinsic.name, "inttoptr", 8) == 0 &&
+                init_expr->intrinsic.arg_count > 0) {
+                int64_t addr = eval_const_expr(init_expr->intrinsic.args[0]);
+                if (addr != CONST_EVAL_FAIL) {
+                    for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                        if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
+                            (uint64_t)addr <= c->mmio_ranges[ri][1]) {
+                            uint64_t range_size = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
+                            Type *inner = type_unwrap_distinct(type);
+                            int elem_size = type_width(inner->pointer.inner) / 8;
+                            if (elem_size > 0) {
+                                sym->mmio_bound = range_size / (uint64_t)elem_size;
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -5957,6 +6001,27 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
             sym->func_node = node; /* store AST node for const init lookup */
+            /* MMIO pointer bound for globals */
+            if (node->var_decl.init && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+                Node *gi = node->var_decl.init;
+                if (gi->kind == NODE_INTRINSIC && gi->intrinsic.name_len == 8 &&
+                    memcmp(gi->intrinsic.name, "inttoptr", 8) == 0 &&
+                    gi->intrinsic.arg_count > 0) {
+                    int64_t addr = eval_const_expr(gi->intrinsic.args[0]);
+                    if (addr != CONST_EVAL_FAIL) {
+                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                            if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
+                                (uint64_t)addr <= c->mmio_ranges[ri][1]) {
+                                uint64_t rsz = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
+                                Type *inn = type_unwrap_distinct(type);
+                                int esz = type_width(inn->pointer.inner) / 8;
+                                if (esz > 0) sym->mmio_bound = rsz / (uint64_t)esz;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             /* BUG-218/222: store module prefix for name mangling (including static) */
             sym->module_prefix = c->current_module;
             sym->module_prefix_len = c->current_module_len;

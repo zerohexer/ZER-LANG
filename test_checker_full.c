@@ -3099,6 +3099,25 @@ int main(void) {
        "void f() { g_state.flags = 1; }",
        "ISR: direct assign on struct field — no compound, valid");
 
+    /* ---- MMIO pointer indexing bounds from mmio range ---- */
+    printf("[@MMIO pointer index bounds]\n");
+    ok("mmio 0x40020000..0x4002001F;\n"
+       "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
+       "void f() { gpio[7] = 0xFF; }",
+       "MMIO index 7 in range (32 bytes / 4 = 8 max) — valid");
+    err("mmio 0x40020000..0x4002001F;\n"
+        "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
+        "void f() { gpio[8] = 0xFF; }",
+        "MMIO index 8 out of range (max 7) — rejected");
+    err("mmio 0x40020000..0x4002001F;\n"
+        "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
+        "void f() { gpio[100] = 0xFF; }",
+        "MMIO index 100 out of range — rejected");
+    ok("mmio 0x40020000..0x4002001F;\n"
+       "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
+       "void f() { gpio[0] = 1; }",
+       "MMIO index 0 — valid");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

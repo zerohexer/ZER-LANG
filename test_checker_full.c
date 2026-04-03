@@ -3124,6 +3124,21 @@ int main(void) {
        "void f() { @inttoptr(*u32, 0x40020000)[7] = 1; }",
        "direct @inttoptr[7] — in range, valid");
 
+    /* ---- [*]T syntax (v0.3) ---- */
+    printf("[@star-slice [*]T syntax]\n");
+    ok("void f([*]u32 data, u32 len) {\n"
+       "    if (len > 0) { data[0] = 42; }\n"
+       "}",
+       "[*]u32 parameter — valid");
+    ok("u32 f() {\n"
+       "    const [*]u8 name = \"hello\";\n"
+       "    return name[0];\n"
+       "}",
+       "const [*]u8 local — string literal");
+    ok("struct Node { u32 id; ?*Node next; }\n"
+       "void f([*]Node nodes) { nodes[0].id = 1; }",
+       "[*]Node struct slice — field access");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

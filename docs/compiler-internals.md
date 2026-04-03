@@ -725,6 +725,23 @@ Both var-decl (local) and global var paths set `mmio_bound`. Works on any archit
 4. Boot-time: @probe verifies hardware
 5. Runtime: fault handler traps
 
+### `[*]T` Syntax (v0.3 — dynamic pointer to many)
+
+Parser accepts `[*]T` as alias for `[]T`. Both resolve to `TYNODE_SLICE`. Same internal `TYPE_SLICE` = `{ptr, len}`.
+
+**Parser (parser.c line ~380):** `TOK_LBRACKET` → check `TOK_STAR` → `TOK_RBRACKET` → `TYNODE_SLICE`. Falls through to existing `[]T` path if no `*`.
+
+**Why `[*]T` instead of `[]T`:** C devs read `[]` as "empty array, fill in size." `[*]` reads as "pointer (`*`) to many items (`[]`)." Same type, better name for C audience.
+
+**Type system after v0.3:**
+- `T[N]` → fixed array (compile-time size)
+- `[*]T` → dynamic pointer to many (bounds checked, replaces `[]T`)
+- `*T` → pointer to one (non-null)
+- `?*T` → pointer to one (nullable)
+- `[]T` → kept for backward compat, same as `[*]T`
+
+**Full design document:** `docs/ZER_STARS.md`
+
 ### Why ZER doesn't need a borrow checker
 
 ZER's memory model is fundamentally simpler than Rust's:

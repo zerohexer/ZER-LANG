@@ -3272,22 +3272,58 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (obj->kind == TYPE_POINTER) {
             /* pointer indexing: check mmio_bound if available, else warn */
             bool ptr_proven = false;
+            uint64_t mmio_bound = 0;
+
+            /* Path 1: variable with mmio_bound (volatile *T var = @inttoptr) */
             if (node->index_expr.object->kind == NODE_IDENT) {
                 Symbol *psym = scope_lookup(c->current_scope,
                     node->index_expr.object->ident.name,
                     (uint32_t)node->index_expr.object->ident.name_len);
-                if (psym && psym->mmio_bound > 0) {
-                    /* MMIO pointer with known bound from mmio range */
-                    if (node->index_expr.index->kind == NODE_INT_LIT) {
-                        uint64_t idx = node->index_expr.index->int_lit.value;
-                        if (idx >= psym->mmio_bound) {
-                            checker_error(c, node->loc.line,
-                                "MMIO index %llu is out of range (max %llu from mmio declaration)",
-                                (unsigned long long)idx, (unsigned long long)psym->mmio_bound - 1);
+                if (psym && psym->mmio_bound > 0)
+                    mmio_bound = psym->mmio_bound;
+            }
+            /* Path 2: direct @inttoptr(...)[N] — no variable, compute bound inline */
+            if (mmio_bound == 0 && node->index_expr.object->kind == NODE_INTRINSIC &&
+                node->index_expr.object->intrinsic.name_len == 8 &&
+                memcmp(node->index_expr.object->intrinsic.name, "inttoptr", 8) == 0 &&
+                node->index_expr.object->intrinsic.arg_count > 0) {
+                int64_t addr = eval_const_expr(node->index_expr.object->intrinsic.args[0]);
+                if (addr != CONST_EVAL_FAIL) {
+                    for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                        if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
+                            (uint64_t)addr <= c->mmio_ranges[ri][1]) {
+                            uint64_t rsz = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
+                            int esz = type_width(obj->pointer.inner) / 8;
+                            if (esz > 0) mmio_bound = rsz / (uint64_t)esz;
+                            break;
                         }
+                    }
+                }
+            }
+
+            /* Check index against mmio_bound */
+            if (mmio_bound > 0) {
+                if (node->index_expr.index->kind == NODE_INT_LIT) {
+                    /* constant index — compile-time check */
+                    uint64_t idx = node->index_expr.index->int_lit.value;
+                    if (idx >= mmio_bound) {
+                        checker_error(c, node->loc.line,
+                            "MMIO index %llu is out of range (max %llu from mmio declaration)",
+                            (unsigned long long)idx, (unsigned long long)mmio_bound - 1);
                     }
                     ptr_proven = true;
                     mark_proven(c, node);
+                } else {
+                    /* variable index — auto-guard using mmio_bound as array size */
+                    mark_auto_guard(c, node, mmio_bound);
+                    checker_warning(c, node->loc.line,
+                        "MMIO index '%.*s' not proven in range (max %llu) — auto-guard inserted",
+                        node->index_expr.index->kind == NODE_IDENT ?
+                            (int)node->index_expr.index->ident.name_len : 1,
+                        node->index_expr.index->kind == NODE_IDENT ?
+                            node->index_expr.index->ident.name : "?",
+                        (unsigned long long)mmio_bound - 1);
+                    ptr_proven = true;
                 }
             }
             if (!ptr_proven && !obj->pointer.is_volatile) {

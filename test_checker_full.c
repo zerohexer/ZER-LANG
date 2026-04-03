@@ -3117,6 +3117,12 @@ int main(void) {
        "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
        "void f() { gpio[0] = 1; }",
        "MMIO index 0 — valid");
+    err("mmio 0x40020000..0x4002001F;\n"
+        "void f() { @inttoptr(*u32, 0x40020000)[100] = 1; }",
+        "direct @inttoptr[100] — out of range, rejected");
+    ok("mmio 0x40020000..0x4002001F;\n"
+       "void f() { @inttoptr(*u32, 0x40020000)[7] = 1; }",
+       "direct @inttoptr[7] — in range, valid");
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

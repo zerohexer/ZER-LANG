@@ -1,0 +1,140 @@
+// Tracked malloc test — exercises Level 1-5 *opaque safety
+// Uses Slab for safe dynamic allocation (the ZER way)
+// Then tests C interop: Slab + Handle with linked data structures
+
+i32 puts(const *u8 s);
+
+struct Task {
+    u32 id;
+    u32 priority;
+    bool active;
+}
+
+struct Connection {
+    u32 socket_fd;
+    u32 rx_bytes;
+    u32 tx_bytes;
+    ?Handle(Connection) next;
+}
+
+// Dynamic allocators
+Slab(Task) task_pool;
+Slab(Connection) conn_pool;
+
+// Connection list head
+struct ConnList {
+    ?Handle(Connection) head;
+    u32 count;
+}
+
+ConnList active_conns;
+
+bool add_connection(u32 fd) {
+    Handle(Connection) h = conn_pool.alloc() orelse return;
+    conn_pool.get(h).socket_fd = fd;
+    conn_pool.get(h).rx_bytes = 0;
+    conn_pool.get(h).tx_bytes = 0;
+    conn_pool.get(h).next = active_conns.head;
+    active_conns.head = h;
+    active_conns.count += 1;
+    return true;
+}
+
+?u32 find_connection_rx(u32 fd) {
+    if (active_conns.head) |h| {
+        if (conn_pool.get(h).socket_fd == fd) {
+            return conn_pool.get(h).rx_bytes;
+        }
+        ?Handle(Connection) cur = conn_pool.get(h).next;
+        if (cur) |nh| {
+            if (conn_pool.get(nh).socket_fd == fd) {
+                return conn_pool.get(nh).rx_bytes;
+            }
+        }
+    }
+    return null;
+}
+
+bool remove_connection(u32 fd) {
+    if (active_conns.head) |h| {
+        if (conn_pool.get(h).socket_fd == fd) {
+            ?Handle(Connection) nxt = conn_pool.get(h).next;
+            conn_pool.free(h);
+            active_conns.head = nxt;
+            active_conns.count -= 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+u32 main() {
+    // Test 1: Task allocation via Slab
+    Handle(Task) t1 = task_pool.alloc() orelse return;
+    Handle(Task) t2 = task_pool.alloc() orelse return;
+    Handle(Task) t3 = task_pool.alloc() orelse return;
+
+    task_pool.get(t1).id = 1;
+    task_pool.get(t1).priority = 10;
+    task_pool.get(t1).active = true;
+
+    task_pool.get(t2).id = 2;
+    task_pool.get(t2).priority = 5;
+    task_pool.get(t2).active = true;
+
+    task_pool.get(t3).id = 3;
+    task_pool.get(t3).priority = 1;
+    task_pool.get(t3).active = false;
+
+    if (task_pool.get(t1).id != 1) { return 1; }
+    if (task_pool.get(t2).priority != 5) { return 2; }
+    if (task_pool.get(t3).active) { return 3; }
+
+    // Free middle task, realloc
+    task_pool.free(t2);
+    Handle(Task) t4 = task_pool.alloc() orelse return;
+    task_pool.get(t4).id = 4;
+    task_pool.get(t4).priority = 99;
+    task_pool.get(t4).active = true;
+    if (task_pool.get(t4).id != 4) { return 4; }
+
+    task_pool.free(t1);
+    task_pool.free(t3);
+    task_pool.free(t4);
+
+    // Test 2: Connection linked list via Slab
+    if (!add_connection(80)) { return 5; }
+    if (!add_connection(443)) { return 6; }
+    if (!add_connection(8080)) { return 7; }
+
+    if (active_conns.count != 3) { return 8; }
+
+    // Update rx bytes
+    if (active_conns.head) |h| {
+        conn_pool.get(h).rx_bytes = 1024;
+    }
+
+    // Find connection
+    u32 rx = find_connection_rx(8080) orelse return;
+    if (rx != 1024) { return 9; }
+
+    // Remove connection
+    if (!remove_connection(8080)) { return 10; }
+    if (active_conns.count != 2) { return 11; }
+
+    // Verify removed connection not findable
+    ?u32 gone = find_connection_rx(8080);
+    if (gone) |v| { return 12; }
+
+    // Cleanup remaining
+    if (active_conns.head) |h| {
+        ?Handle(Connection) nxt = conn_pool.get(h).next;
+        conn_pool.free(h);
+        if (nxt) |nh| {
+            conn_pool.free(nh);
+        }
+    }
+
+    puts("tracked_malloc: all tests passed!");
+    return 0;
+}

@@ -675,15 +675,13 @@ int main(void) {
         "}\n",
         "*opaque double free — error");
 
-    err("*opaque malloc(u32 size);\n"
-        "void free(*opaque ptr);\n"
-        "void f() {\n"
-        "    *opaque p = malloc(64);\n"
-        "    free(p);\n"
-        "}\n",
-        "*opaque alloc without use after free — leak not reported (freed)");
-    /* Note: the above actually passes (no error) because p is freed.
-     * Change to a real test: */
+    ok("*opaque malloc(u32 size);\n"
+       "void free(*opaque ptr);\n"
+       "void f() {\n"
+       "    *opaque p = malloc(64);\n"
+       "    free(p);\n"
+       "}\n",
+       "*opaque alloc + free — valid (no leak)");
 
     err("*opaque malloc(u32 size);\n"
         "void free(*opaque ptr);\n"

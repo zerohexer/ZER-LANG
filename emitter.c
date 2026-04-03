@@ -3818,6 +3818,9 @@ void emit_file(Emitter *e, Node *file_node) {
     /* Level 3+4+5: *opaque inline header tracking (--track-cptrs) */
     if (e->track_cptrs) {
         emit(e, "\n/* ZER *opaque tracking — inline header per allocation */\n");
+        emit(e, "extern void *__real_malloc(size_t);\n");
+        emit(e, "extern void __real_free(void *);\n");
+        emit(e, "extern void *__real_realloc(void *, size_t);\n");
         emit(e, "static _Atomic uint32_t _zer_alloc_gen = 0;\n\n");
 
         emit(e, "void *__wrap_malloc(size_t size) {\n");
@@ -3884,10 +3887,6 @@ void emit_file(Emitter *e, Node *file_node) {
         emit(e, "    if (!hdr[3]) _zer_trap(\"use-after-free: tracked pointer freed\", file, line);\n");
         emit(e, "}\n\n");
 
-        /* Forward declarations for __real_* functions (linker provides them) */
-        emit(e, "extern void *__real_malloc(size_t);\n");
-        emit(e, "extern void __real_free(void *);\n");
-        emit(e, "extern void *__real_realloc(void *, size_t);\n\n");
     }
 
     emit(e, "\n");

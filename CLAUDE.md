@@ -17,7 +17,8 @@ void                     return type only, cannot declare void variables
 ### Compound Types
 ```
 u8[256] buf;             fixed array — NOTE: size AFTER type, BEFORE name
-[]u8 data;               slice — {ptr, len} pair, always bounded
+[*]u8 data;              dynamic pointer to many — {ptr, len}, bounds checked (replaces []T)
+[]u8 data;               DEPRECATED — same as [*]u8, warns "use [*]T instead"
 *Task ptr;               pointer — guaranteed non-null
 ?*Task maybe;            optional pointer — might be null (null sentinel, zero overhead)
 ?u32 result;             optional value — struct { u32 value; u8 has_value; }
@@ -100,9 +101,9 @@ Handle(Task) h;          u64: index(32) + generation(32), not a pointer
 
 9. **No `malloc`/`free`.** Use Pool, Slab, Ring, or Arena builtins.
 
-10. **String literals are `[]u8` / `[*]u8` (slices), not `char*`.** `[*]T` is the v0.3 syntax for slices — reads as "pointer to many." Both `[]T` and `[*]T` work (same internal type).
+10. **String literals are `[*]u8` (slices), not `char*`.** `[*]T` is the preferred syntax — reads as "pointer to many." `[]T` still works but emits a deprecation warning ("use [*]T instead"). Use `[*]T` in all new code.
     ```
-    []u8 msg = "Hello";           // slice with .ptr and .len
+    [*]u8 msg = "Hello";          // slice with .ptr and .len
     ```
 
 11. **`else if` is supported.** Both forms work:

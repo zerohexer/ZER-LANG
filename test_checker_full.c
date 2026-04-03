@@ -3138,6 +3138,13 @@ int main(void) {
     ok("struct Node { u32 id; ?*Node next; }\n"
        "void f([*]Node nodes) { nodes[0].id = 1; }",
        "[*]Node struct slice — field access");
+    /* []T still works (backward compat, warns in real files but test harness has source=NULL) */
+    ok("void f([]u32 data) { data[0] = 1; }",
+       "[]T backward compat — still compiles (deprecated)");
+    ok("[*]u32 sum([*]u32 a, [*]u32 b, u32 len) {\n"
+       "    return a;\n"
+       "}",
+       "[*]T multiple params + return type");
 
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {

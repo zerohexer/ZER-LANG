@@ -7,6 +7,26 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-03 — External Audit + Pipeline Integration
 
+## Session 2026-04-03 — [*]T Syntax + []T Deprecation
+
+### FEATURE: [*]T dynamic pointer syntax
+- **What:** Added `[*]T` as preferred syntax for slices (dynamic pointer to many). Reads as "pointer to many" — C devs understand `*` = pointer. `[]T` reads as "empty array" which confuses C devs.
+- **Implementation:** Parser change only (~10 lines). `TOK_LBRACKET` + `TOK_STAR` + `TOK_RBRACKET` → `TYNODE_SLICE`. Same internal type as `[]T`. Zero checker/emitter changes.
+- **Test:** `tests/zer/star_slice.zer` (E2E), 5 checker tests in `test_checker_full.c`.
+- **Design doc:** `docs/ZER_STARS.md`
+
+### FEATURE: []T deprecation warning
+- **What:** Parser now warns "[]T is deprecated, use [*]T instead" with source line + caret display when `[]T` is used.
+- **Implementation:** Added `warn()` function in parser.c. Warning suppressed when `parser.source == NULL` (test harness mode) to avoid noise from 200+ test strings still using `[]T`.
+- **Test:** Verified warning fires on real `.zer` files, silent in test harness. Backward compat test in `test_checker_full.c`.
+
+### DESIGN: Handle auto-deref + Task.new() + alloc_ptr() superseded
+- **What:** Design for three syntactic sugars: (1) `h.field` auto-inserts `slab.get(h).field` (100% safe, same gen check), (2) `Task.new()` auto-creates module-level Slab (like C's malloc), (3) `alloc_ptr()` superseded by Handle auto-deref (100% > 95%).
+- **Design doc:** `docs/ZER_SUGAR.md` (495 lines, full context)
+- **Status:** Design only, not implemented yet. ~70 lines for Handle auto-deref, ~50 for Task.new().
+
+---
+
 ### BUG-401: Volatile TOCTOU — range propagation unsound for volatile
 - **Symptom:** `if (hw_status != 0) { 100 / hw_status; }` where `hw_status` is volatile MMIO — range propagation proves divisor nonzero, skips runtime trap. But volatile can change between check and use.
 - **Root cause:** `push_var_range` in if-guard path never checked if the variable's symbol is `is_volatile`.

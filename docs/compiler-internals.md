@@ -738,9 +738,11 @@ Parser accepts `[*]T` as alias for `[]T`. Both resolve to `TYNODE_SLICE`. Same i
 - `[*]T` → dynamic pointer to many (bounds checked, replaces `[]T`)
 - `*T` → pointer to one (non-null)
 - `?*T` → pointer to one (nullable)
-- `[]T` → kept for backward compat, same as `[*]T`
+- `[]T` → **deprecated** (parser warns: "use [*]T instead"), same as `[*]T` internally
 
-**Full design document:** `docs/ZER_STARS.md`
+**Deprecation warning:** Parser emits `warn()` when `[]T` is used. Warning suppressed when `parser.source == NULL` (test harness mode) to avoid noise from 200+ test strings that still use `[]T`. Real `.zer` files always see the warning. The `warn()` function (parser.c line ~57) uses same `print_source_line_p()` as errors.
+
+**Full design documents:** `docs/ZER_STARS.md` (syntax), `docs/ZER_SUGAR.md` (Handle auto-deref + Task.new())
 
 ### Why ZER doesn't need a borrow checker
 

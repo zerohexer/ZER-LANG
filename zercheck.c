@@ -164,6 +164,51 @@ static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
     return 0;
 }
 
+/* ---- *opaque alloc/free detection (Level 1) ---- */
+
+/* Check if a function call is a known allocator (extern returning *opaque).
+ * Recognized: malloc, calloc, realloc, strdup, strndup, or any extern
+ * function returning *opaque with no body. */
+static bool is_alloc_call(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    /* look up function symbol */
+    Symbol *sym = scope_lookup(zc->checker->global_scope,
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (!sym || !sym->is_function || !sym->func_node) return false;
+    /* must be extern (no body) */
+    if (sym->func_node->func_decl.body) return false;
+    /* return type must be *opaque or *T (pointer) */
+    Type *ret = sym->type;
+    if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+    if (!ret) return false;
+    ret = type_unwrap_distinct(ret);
+    if (ret->kind == TYPE_POINTER || ret->kind == TYPE_OPAQUE) return true;
+    /* optional pointer (?*T) also counts */
+    if (ret->kind == TYPE_OPTIONAL) {
+        Type *inner = type_unwrap_distinct(ret->optional.inner);
+        if (inner && (inner->kind == TYPE_POINTER || inner->kind == TYPE_OPAQUE))
+            return true;
+    }
+    return false;
+}
+
+/* Check if a function call is free() — extern void function taking *opaque/*T. */
+static bool is_free_call(Node *call, char *arg_key, int *arg_key_len, int key_bufsize) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    /* must be named "free" */
+    if (callee->ident.name_len != 4 ||
+        memcmp(callee->ident.name, "free", 4) != 0) return false;
+    /* must have exactly 1 argument */
+    if (call->call.arg_count != 1) return false;
+    /* extract the argument key */
+    *arg_key_len = handle_key_from_expr(call->call.args[0], arg_key, key_bufsize);
+    return *arg_key_len > 0;
+}
+
 /* ---- AST walking ---- */
 
 static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node);
@@ -298,6 +343,22 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         }
     }
 
+    /* Level 1: *opaque p = malloc/calloc/strdup(...) — register as ALIVE */
+    if (alloc_call && is_alloc_call(zc, alloc_call)) {
+        HandleInfo *h = find_handle(ps, vname, vlen);
+        if (h && h->state == HS_ALIVE) {
+            zc_error(zc, var_node->loc.line,
+                "pointer leak: '%.*s' overwritten while alive (allocated at line %d)",
+                (int)vlen, vname, h->alloc_line);
+        }
+        if (!h) h = add_handle(ps, vname, vlen);
+        if (h) {
+            h->state = HS_ALIVE;
+            h->pool_id = -2; /* -2 = malloc'd (not pool, not param) */
+            h->alloc_line = var_node->loc.line;
+        }
+    }
+
     /* Handle aliasing: Handle(T) alias = existing_handle;
      * BUG-357: also match NODE_INDEX and NODE_FIELD on init side. */
     {
@@ -352,6 +413,37 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_CALL:
         zc_check_call(zc, ps, node);
         zc_apply_summary(zc, ps, node);
+        /* Level 1: detect free(*opaque) — track as FREED */
+        {
+            char fkey[128];
+            int fklen = 0;
+            if (is_free_call(node, fkey, &fklen, sizeof(fkey))) {
+                HandleInfo *h = find_handle(ps, fkey, (uint32_t)fklen);
+                if (h) {
+                    if (h->state == HS_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "double free: '%.*s' already freed at line %d",
+                            fklen, fkey, h->free_line);
+                    } else if (h->state == HS_MAYBE_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "double free: '%.*s' may have been freed at line %d",
+                            fklen, fkey, h->free_line);
+                    }
+                    h->state = HS_FREED;
+                    h->free_line = node->loc.line;
+                    /* propagate to aliases (same alloc_line) */
+                    for (int ai = 0; ai < ps->handle_count; ai++) {
+                        if (&ps->handles[ai] != h &&
+                            ps->handles[ai].alloc_line == h->alloc_line &&
+                            ps->handles[ai].pool_id == h->pool_id &&
+                            ps->handles[ai].state == HS_ALIVE) {
+                            ps->handles[ai].state = HS_FREED;
+                            ps->handles[ai].free_line = node->loc.line;
+                        }
+                    }
+                }
+            }
+        }
         for (int i = 0; i < node->call.arg_count; i++)
             zc_check_expr(zc, ps, node->call.args[i]);
         break;
@@ -431,6 +523,52 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
         zc_check_expr(zc, ps, node->orelse.expr);
         if (node->orelse.fallback)
             zc_check_expr(zc, ps, node->orelse.fallback);
+        break;
+    case NODE_INTRINSIC: {
+        /* Level 1: check @ptrcast on freed *opaque */
+        if (node->intrinsic.name_len == 7 &&
+            memcmp(node->intrinsic.name, "ptrcast", 7) == 0 &&
+            node->intrinsic.arg_count > 0) {
+            Node *src = node->intrinsic.args[0];
+            char skey[128];
+            int sklen = handle_key_from_expr(src, skey, sizeof(skey));
+            if (sklen > 0) {
+                HandleInfo *h = find_handle(ps, skey, (uint32_t)sklen);
+                if (h && h->state == HS_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "use-after-free: '%.*s' freed at line %d",
+                        sklen, skey, h->free_line);
+                } else if (h && h->state == HS_MAYBE_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "use-after-free: '%.*s' may have been freed at line %d",
+                        sklen, skey, h->free_line);
+                }
+            }
+        }
+        /* recurse into intrinsic args */
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            zc_check_expr(zc, ps, node->intrinsic.args[i]);
+        break;
+    }
+    case NODE_UNARY:
+        /* Level 1: check deref on freed *opaque — *ptr after free */
+        if (node->unary.op == TOK_STAR) {
+            char dkey[128];
+            int dklen = handle_key_from_expr(node->unary.operand, dkey, sizeof(dkey));
+            if (dklen > 0) {
+                HandleInfo *h = find_handle(ps, dkey, (uint32_t)dklen);
+                if (h && h->state == HS_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "use-after-free: '%.*s' freed at line %d",
+                        dklen, dkey, h->free_line);
+                } else if (h && h->state == HS_MAYBE_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "use-after-free: '%.*s' may have been freed at line %d",
+                        dklen, dkey, h->free_line);
+                }
+            }
+        }
+        zc_check_expr(zc, ps, node->unary.operand);
         break;
     default:
         break;

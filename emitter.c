@@ -1796,6 +1796,20 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
             Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
 
+            /* Level 3+4+5: check alive before any @ptrcast from *opaque */
+            bool _ptrcast_track = false;
+            if (e->track_cptrs && src_eff &&
+                ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+                  src_eff->pointer.inner->kind == TYPE_OPAQUE) ||
+                 src_eff->kind == TYPE_OPAQUE) &&
+                node->intrinsic.arg_count > 0 &&
+                node->intrinsic.args[0]->kind == NODE_IDENT) {
+                emit(e, "(_zer_check_alive((void*)%.*s, __FILE__, __LINE__), ",
+                     (int)node->intrinsic.args[0]->ident.name_len,
+                     node->intrinsic.args[0]->ident.name);
+                _ptrcast_track = true;
+            }
+
             if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
                 tgt_eff->pointer.inner && tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
                 /* casting TO *opaque — wrap with type_id */
@@ -1850,6 +1864,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ")");
             }
+            if (_ptrcast_track) emit(e, ")"); /* close comma expr from check_alive */
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             /* @bitcast(T, val) → memcpy type punning (valid C99+GCC) */
             if (node->intrinsic.type_arg) {
@@ -2665,6 +2680,19 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");
+        /* Level 2: poison-after-free — set pointer to NULL after free() */
+        if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
+            node->expr_stmt.expr->call.callee &&
+            node->expr_stmt.expr->call.callee->kind == NODE_IDENT &&
+            node->expr_stmt.expr->call.callee->ident.name_len == 4 &&
+            memcmp(node->expr_stmt.expr->call.callee->ident.name, "free", 4) == 0 &&
+            node->expr_stmt.expr->call.arg_count == 1 &&
+            node->expr_stmt.expr->call.args[0]->kind == NODE_IDENT) {
+            emit_indent(e);
+            emit(e, "%.*s = (void*)0; /* poison-after-free */\n",
+                 (int)node->expr_stmt.expr->call.args[0]->ident.name_len,
+                 node->expr_stmt.expr->call.args[0]->ident.name);
+        }
         break;
 
     case NODE_ASM:
@@ -3786,6 +3814,81 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "        if (s->gen[idx] == 0) s->gen[idx] = 1; /* skip 0: reserved for null handle */\n");
     emit(e, "    }\n");
     emit(e, "}\n\n");
+
+    /* Level 3+4+5: *opaque inline header tracking (--track-cptrs) */
+    if (e->track_cptrs) {
+        emit(e, "\n/* ZER *opaque tracking — inline header per allocation */\n");
+        emit(e, "static _Atomic uint32_t _zer_alloc_gen = 0;\n\n");
+
+        emit(e, "void *__wrap_malloc(size_t size) {\n");
+        emit(e, "    void *raw = __real_malloc(size + 16);\n");
+        emit(e, "    if (!raw) return (void*)0;\n");
+        emit(e, "    uint32_t *hdr = (uint32_t *)raw;\n");
+        emit(e, "    hdr[0] = ++_zer_alloc_gen;\n");
+        emit(e, "    hdr[1] = (uint32_t)size;\n");
+        emit(e, "    hdr[2] = 0x5A455243u; /* magic ZERC */\n");
+        emit(e, "    hdr[3] = 1; /* alive */\n");
+        emit(e, "    return (char*)raw + 16;\n");
+        emit(e, "}\n\n");
+
+        emit(e, "void __wrap_free(void *ptr) {\n");
+        emit(e, "    if (!ptr) return;\n");
+        emit(e, "    uint32_t *hdr = (uint32_t *)((char*)ptr - 16);\n");
+        emit(e, "    if (hdr[2] != 0x5A455243u) { __real_free(ptr); return; }\n");
+        emit(e, "    if (!hdr[3]) _zer_trap(\"double free: tracked pointer\", __FILE__, __LINE__);\n");
+        emit(e, "    hdr[3] = 0;\n");
+        emit(e, "    __real_free(hdr);\n");
+        emit(e, "}\n\n");
+
+        emit(e, "void *__wrap_calloc(size_t n, size_t size) {\n");
+        emit(e, "    size_t total = n * size;\n");
+        emit(e, "    void *p = __wrap_malloc(total);\n");
+        emit(e, "    if (p) memset(p, 0, total);\n");
+        emit(e, "    return p;\n");
+        emit(e, "}\n\n");
+
+        emit(e, "void *__wrap_realloc(void *ptr, size_t new_size) {\n");
+        emit(e, "    if (!ptr) return __wrap_malloc(new_size);\n");
+        emit(e, "    if (new_size == 0) { __wrap_free(ptr); return (void*)0; }\n");
+        emit(e, "    uint32_t *hdr = (uint32_t *)((char*)ptr - 16);\n");
+        emit(e, "    if (hdr[2] != 0x5A455243u) return __real_realloc(ptr, new_size);\n");
+        emit(e, "    void *np = __wrap_malloc(new_size);\n");
+        emit(e, "    if (!np) return (void*)0;\n");
+        emit(e, "    uint32_t old_size = hdr[1];\n");
+        emit(e, "    memcpy(np, ptr, old_size < new_size ? old_size : new_size);\n");
+        emit(e, "    __wrap_free(ptr);\n");
+        emit(e, "    return np;\n");
+        emit(e, "}\n\n");
+
+        emit(e, "char *__wrap_strdup(const char *s) {\n");
+        emit(e, "    if (!s) return (void*)0;\n");
+        emit(e, "    size_t len = strlen(s) + 1;\n");
+        emit(e, "    char *p = (char*)__wrap_malloc(len);\n");
+        emit(e, "    if (p) memcpy(p, s, len);\n");
+        emit(e, "    return p;\n");
+        emit(e, "}\n\n");
+
+        emit(e, "char *__wrap_strndup(const char *s, size_t n) {\n");
+        emit(e, "    if (!s) return (void*)0;\n");
+        emit(e, "    size_t len = strlen(s);\n");
+        emit(e, "    if (len > n) len = n;\n");
+        emit(e, "    char *p = (char*)__wrap_malloc(len + 1);\n");
+        emit(e, "    if (p) { memcpy(p, s, len); p[len] = 0; }\n");
+        emit(e, "    return p;\n");
+        emit(e, "}\n\n");
+
+        emit(e, "static inline void _zer_check_alive(void *ptr, const char *file, int line) {\n");
+        emit(e, "    if (!ptr) return;\n");
+        emit(e, "    uint32_t *hdr = (uint32_t *)((char*)ptr - 16);\n");
+        emit(e, "    if (hdr[2] != 0x5A455243u) return; /* not tracked */\n");
+        emit(e, "    if (!hdr[3]) _zer_trap(\"use-after-free: tracked pointer freed\", file, line);\n");
+        emit(e, "}\n\n");
+
+        /* Forward declarations for __real_* functions (linker provides them) */
+        emit(e, "extern void *__real_malloc(size_t);\n");
+        emit(e, "extern void __real_free(void *);\n");
+        emit(e, "extern void *__real_realloc(void *, size_t);\n\n");
+    }
 
     emit(e, "\n");
 

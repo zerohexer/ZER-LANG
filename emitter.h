@@ -44,6 +44,7 @@ typedef struct {
     DeferStack defer_stack; /* current block's deferred statements */
     int loop_defer_base;    /* defer stack base at loop entry (for break/continue) */
     bool lib_mode;          /* --lib: no prefix on struct names, no preamble */
+    bool track_cptrs;       /* --track-cptrs: Level 3+4+5 inline header tracking */
     const char *source_file; /* .zer source file name for #line directives */
     const char *current_module; /* module name for function/global mangling (NULL = main) */
     uint32_t current_module_len;

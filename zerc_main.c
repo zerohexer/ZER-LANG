@@ -181,6 +181,8 @@ int main(int argc, char **argv) {
     bool do_run = false;
     bool no_preamble = false;
     bool no_strict_mmio = false;
+    bool track_cptrs = false;
+    bool release_mode = false;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
 
@@ -193,6 +195,10 @@ int main(int argc, char **argv) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
             no_strict_mmio = true;
+        } else if (strcmp(argv[i], "--track-cptrs") == 0) {
+            track_cptrs = true;
+        } else if (strcmp(argv[i], "--release") == 0) {
+            release_mode = true;
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             zer_target_ptr_bits = atoi(argv[++i]);
             target_bits_explicit = true;
@@ -398,6 +404,7 @@ int main(int argc, char **argv) {
     Emitter emitter;
     emitter_init(&emitter, out, &cc.arena, &checker);
     emitter.lib_mode = no_preamble;
+    emitter.track_cptrs = track_cptrs || (!release_mode && do_run);
     emitter.source_file = input_path;
 
     /* emit in topological order (reuse topo_order from registration):
@@ -480,10 +487,12 @@ int main(int argc, char **argv) {
         /* Only quote gcc path if it contains spaces (bundled path).
          * Plain "gcc" with quotes breaks Windows cmd.exe system(). */
         bool need_quote = (strchr(gcc_path, ' ') != NULL);
+        const char *wrap_flags = (emitter.track_cptrs) ?
+            " -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc" : "";
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\""
-                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing -o \"%s\" \"%s\"",
-                 gcc_path, exe_path, output_path);
+                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing%s -o \"%s\" \"%s\""
+                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing%s -o \"%s\" \"%s\"",
+                 gcc_path, wrap_flags, exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);
         if (gcc_ret != 0) {

@@ -63,6 +63,18 @@ function activate(context) {
         }
     }
 
+    // Propagate bundled bin/ to integrated terminal so zerc is available there
+    const envVar = context.environmentVariableCollection;
+    if (fs.existsSync(platDir)) {
+        envVar.prepend('PATH', platDir + sep);
+    }
+    if (process.platform === 'win32') {
+        const gccBinDir = path.join(platDir, 'gcc', 'bin');
+        if (fs.existsSync(gccBinDir)) {
+            envVar.prepend('PATH', gccBinDir + sep);
+        }
+    }
+
     const args = config.get('lspArgs', []);
 
     const serverOptions = {

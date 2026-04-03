@@ -1,0 +1,49 @@
+// [*]T syntax — dynamic pointer to many
+// Tests: [*]u8, [*]struct, function params, array coercion
+
+i32 puts(const *u8 s);
+
+struct Point {
+    u32 x;
+    u32 y;
+}
+
+u32 sum_points([*]Point pts, u32 count) {
+    u32 total = 0;
+    for (u32 i = 0; i < count; i += 1) {
+        total += pts[i].x + pts[i].y;
+    }
+    return total;
+}
+
+u32 str_len(const [*]u8 s) {
+    u32 len = 0;
+    for (u32 i = 0; i < 1000; i += 1) {
+        if (s[i] == 0) { return len; }
+        len += 1;
+    }
+    return len;
+}
+
+u32 main() {
+    // Test 1: [*]u8 from string literal
+    const [*]u8 name = "hello";
+    if (name[0] != 104) { return 1; }
+    if (name[4] != 111) { return 2; }
+
+    // Test 2: [*]Point from array coercion
+    Point[3] arr;
+    arr[0].x = 1; arr[0].y = 2;
+    arr[1].x = 3; arr[1].y = 4;
+    arr[2].x = 5; arr[2].y = 6;
+    u32 total = sum_points(arr, 3);
+    if (total != 21) { return 3; }
+
+    // Test 3: [*]u8 as string
+    const [*]u8 msg = "test";
+    u32 len = str_len(msg);
+    if (len != 4) { return 4; }
+
+    puts("star_slice: all tests passed!");
+    return 0;
+}

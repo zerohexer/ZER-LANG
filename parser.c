@@ -376,17 +376,28 @@ static TypeNode *parse_type(Parser *p) {
         return t;
     }
 
-    /* []T — slice type */
+    /* []T or [*]T — slice/dynamic pointer type */
     if (check(p, TOK_LBRACKET)) {
         advance(p); /* consume [ */
         if (match(p, TOK_RBRACKET)) {
-            /* []T — slice */
+            /* []T — slice (legacy syntax, kept for backward compat) */
             TypeNode *t = new_type_node(p, TYNODE_SLICE);
             t->slice.inner = parse_type(p);
             return t;
         }
+        if (check(p, TOK_STAR)) {
+            advance(p); /* consume * */
+            if (match(p, TOK_RBRACKET)) {
+                /* [*]T — dynamic pointer to many (v0.3 syntax) */
+                TypeNode *t = new_type_node(p, TYNODE_SLICE);
+                t->slice.inner = parse_type(p);
+                return t;
+            }
+            error(p, "expected ']' after '[*'");
+            return new_type_node(p, TYNODE_VOID);
+        }
         /* not a slice — could be a mistake, but let it fall through */
-        error(p, "expected ']' for slice type");
+        error(p, "expected ']' or '*]' for slice type");
         return new_type_node(p, TYNODE_VOID);
     }
 

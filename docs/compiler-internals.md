@@ -621,6 +621,37 @@ Emitter var-decl init for `?T` target wraps value in `{value, 1}`. But if init e
 ### []T → *T Extern Const Safety (BUG-400)
 The `[]T → *T` auto-coerce for extern functions must check const: if arg is string literal or const slice, param must be `const *T`. Without this, `puts(*u8 s)` accepted string literals — would allow writes through `.rodata` pointer. Check is before the `slice_to_ptr_ok` flag, so const rejection takes priority over extern allowance.
 
+### *opaque Level 1-5 Safety Tracking
+
+**Level 1 — zercheck compile-time (zercheck.c):**
+- `is_alloc_call(zc, call)` — detects extern functions returning `*opaque`/pointer with no body (malloc, calloc, strdup, any extern returning pointer)
+- `is_free_call(call, key, keylen, bufsize)` — detects `free()` by name (4 chars, 1 arg)
+- `zc_check_var_init`: registers `*opaque p = malloc(...)` as ALIVE with `pool_id = -2` (malloc'd, not pool/param)
+- `zc_check_expr(NODE_CALL)`: detects `free(p)` → marks FREED, propagates to aliases
+- `zc_check_expr(NODE_INTRINSIC)`: checks `@ptrcast` source against freed *opaque
+- `zc_check_expr(NODE_UNARY/TOK_STAR)`: checks deref `*p` against freed *opaque
+- Reuses existing HandleInfo/PathState machinery — same state machine as Handle tracking
+
+**Level 2 — poison-after-free (emitter.c):**
+- In `NODE_EXPR_STMT`, after emitting `free(p);`, auto-inserts `p = (void*)0;`
+- Only fires for direct `free()` calls with NODE_IDENT argument (not pool.free)
+
+**Level 3+4+5 — inline header + global wrap (emitter.c preamble + zerc_main.c):**
+- Preamble emits `__wrap_malloc/free/calloc/realloc/strdup/strndup` when `e->track_cptrs` is set
+- 16-byte inline header: `[gen:4][size:4][magic:4][alive:4]` prepended to every allocation
+- Magic `0x5A455243` ("ZERC") identifies tracked allocations — untracked pointers pass through
+- `_zer_check_alive(ptr, file, line)` — emitted before `@ptrcast` from `*opaque` via comma operator
+- `extern void *__real_malloc(size_t)` etc. — forward declarations for linker-provided originals
+- GCC invocation adds `-Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc`
+
+**Flags (zerc_main.c):**
+- `--track-cptrs`: explicitly enable Level 3+4+5
+- `--release`: disable Level 3+4+5 (Level 1+2 always active)
+- `--run` without `--release`: Level 3+4+5 enabled by default (`track_cptrs || (!release_mode && do_run)`)
+- `emitter.track_cptrs` flag on Emitter struct controls preamble emission
+
+**Full design document:** `docs/ZER_OPAQUE.md` — 601 lines covering all levels, edge cases, performance, Ada/SPARK comparison, implementation plan.
+
 ### @bitcast Struct Width Validation (BUG-325)
 `type_width()` returns 0 for TYPE_STRUCT, TYPE_UNION, TYPE_ARRAY. The @bitcast width check `if (tw > 0 && vw > 0 && tw != vw)` was silently skipped for structs. Fix: when `type_width()` returns 0, fall back to `compute_type_size(t) * 8`. This catches `@bitcast(Big, small)` where structs have different memory sizes. `compute_type_size` returns `CONST_EVAL_FAIL` for types with target-dependent size (pointers, slices) — those still skip the check (GCC validates at C level).
 

@@ -241,7 +241,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Bug Class | Prevention |
 |---|---|
 | Buffer overflow | Inline bounds check on every array/slice access; proven-safe indices skip check (range propagation); unsafe indices get auto-guard (silent if-return inserted) |
-| Use-after-free | Handle generation counter + ZER-CHECK (MAYBE_FREED + leak detection + loop pass + cross-function summaries) |
+| Use-after-free | Handle generation counter + ZER-CHECK (MAYBE_FREED + leak detection + loop pass + cross-function summaries) + Level 1-5 *opaque tracking (compile-time zercheck + poison-after-free + inline header + global malloc interception) |
 | Null dereference | `*T` non-null by default, `?T` requires unwrapping |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
@@ -310,6 +310,9 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Extended asm (GCC operand syntax) | Done | Done (raw pass-through, all archs) |
 | naked functions | Done | Done (__attribute__((naked))) |
 | section attribute | Done | Done (__attribute__((section))) |
+| *opaque Level 1 (zercheck malloc/free) | Done | N/A (compile-time — UAF, double-free, leak) |
+| *opaque Level 2 (poison-after-free) | Done | Done (auto ptr=NULL after free) |
+| *opaque Level 3+4+5 (inline header+wrap) | Done | Done (--track-cptrs, --wrap=malloc) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

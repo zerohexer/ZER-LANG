@@ -652,6 +652,18 @@ The `[]T → *T` auto-coerce for extern functions must check const: if arg is st
 
 **Full design document:** `docs/ZER_OPAQUE.md` — 601 lines covering all levels, edge cases, performance, Ada/SPARK comparison, implementation plan.
 
+### Pitfalls Found Writing Real .zer Code (2026-04-02)
+
+These caused test failures and are not obvious from reading C source tests:
+
+- **Arena.over() at global scope is rejected** — "initializer must be constant expression." Must create Arena inside a function: `u8[4096] backing; Arena scratch = Arena.over(backing);`
+- **`?void` function must have explicit `return;`** — `?void validate(u32 x) { if (x > 100) { return null; } }` errors "not all paths return." Add `return;` at end for the success path.
+- **`!ptr` on `*opaque` is rejected** — ZER's `!` requires bool, not pointer. Use `if (ptr) |p| { }` pattern for optional pointers, or declare as `?*opaque` and unwrap with orelse.
+- **`@size(T)` returns `usize`, not `u32`** — function params declared as `u32 size` won't accept `@size(T)`. Use `usize size` for C interop with size_t.
+- **`*opaque` emits as `_zer_opaque` (struct with type_id)** — NOT `void*`. Can't directly pass to C's `free(void*)` via forward declaration. Use Slab instead, or wrap C allocation in helper functions.
+- **`cinclude "stdlib.h"` + declaring `free(*opaque)` conflicts** — GCC sees both `free(void*)` from header and `free(_zer_opaque)` from ZER declaration. Don't cinclude headers for functions you declare manually.
+- **`arena.reset()` outside defer warns** — use `arena.unsafe_reset()` to suppress the warning in tests/non-safety-critical code.
+
 ### @bitcast Struct Width Validation (BUG-325)
 `type_width()` returns 0 for TYPE_STRUCT, TYPE_UNION, TYPE_ARRAY. The @bitcast width check `if (tw > 0 && vw > 0 && tw != vw)` was silently skipped for structs. Fix: when `type_width()` returns 0, fall back to `compute_type_size(t) * 8`. This catches `@bitcast(Big, small)` where structs have different memory sizes. `compute_type_size` returns `CONST_EVAL_FAIL` for types with target-dependent size (pointers, slices) — those still skip the check (GCC validates at C level).
 

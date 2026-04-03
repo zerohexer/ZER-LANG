@@ -664,6 +664,28 @@ These caused test failures and are not obvious from reading C source tests:
 - **`cinclude "stdlib.h"` + declaring `free(*opaque)` conflicts** — GCC sees both `free(void*)` from header and `free(_zer_opaque)` from ZER declaration. Don't cinclude headers for functions you declare manually.
 - **`arena.reset()` outside defer warns** — use `arena.unsafe_reset()` to suppress the warning in tests/non-safety-critical code.
 
+### Audit Findings Verified (2026-04-03)
+
+7-point external audit verified against codebase:
+
+1. **Type ID 0 (provenance bypass)** — Real, by design. `@ptrcast` skips type_id==0 for C interop. Not a bug — C boundary is inherently untracked. Future `--strict-interop` flag possible.
+2. **Pointer arithmetic** — False finding. ZER deliberately rejects `ptr + N`. Use `ptr[N]` (indexing). This is a safety feature.
+3. **Slab uint32_t total_slots** — Real, fixed. Changed to `size_t` (page_count, page_cap, total_slots, local vars in slab functions).
+4. **MAYBE_FREED conservatism** — Real, by design. Developer restructures code with `return;` after free. NOT worth adding path constraints — would become a borrow checker for zero additional safety. Handle + zercheck covers all cases without lifetime annotations.
+5. **Atomic width unchecked** — Real bug, fixed. Added width validation: must be 8/16/32/64 bits. 64-bit targets get warning about libatomic on 32-bit platforms.
+6. **Large preamble** — Real debt, acknowledged. ~300 lines of C strings in emitter. Works but hard to maintain.
+7. **Comptime nested calls** — Partially real. Recursion depth guard works (max 16). Error message is generic. Two-pass registration handles most ordering issues.
+
+### Why ZER doesn't need a borrow checker
+
+ZER's memory model is fundamentally simpler than Rust's:
+- **Handles are indices (u64), not references** — `pool.get(h)` does a fresh lookup each call, never caches a pointer
+- **Pool is fixed, Slab uses paged allocation** — existing pages never move, no invalidation
+- **No `&mut` vs `&` distinction** — no shared mutable reference problem
+- **ALIVE/FREED/MAYBE_FREED** covers ownership at compile-time, generation counter catches UAF at runtime
+- **Cost of borrow checker:** lifetime annotations on every function, 6-month learning curve, "fighting the checker" friction
+- **Cost of ZER's approach:** occasional `return;` after conditional free — 10 seconds to fix, produces better code
+
 ### @bitcast Struct Width Validation (BUG-325)
 `type_width()` returns 0 for TYPE_STRUCT, TYPE_UNION, TYPE_ARRAY. The @bitcast width check `if (tw > 0 && vw > 0 && tw != vw)` was silently skipped for structs. Fix: when `type_width()` returns 0, fall back to `compute_type_size(t) * 8`. This catches `@bitcast(Big, small)` where structs have different memory sizes. `compute_type_size` returns `CONST_EVAL_FAIL` for types with target-dependent size (pointers, slices) — those still skip the check (GCC validates at C level).
 

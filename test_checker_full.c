@@ -3060,6 +3060,18 @@ int main(void) {
        "}",
        "?Handle(Node) struct field — alloc, set, null assign");
 
+    /* ---- atomic width validation ---- */
+    printf("[@atomic width check]\n");
+    ok("volatile u32 counter;\n"
+       "void f() { @atomic_add(&counter, 1); }",
+       "@atomic_add on u32 — valid (4 bytes)");
+    ok("volatile u8 flag;\n"
+       "void f() { @atomic_store(&flag, 1); }",
+       "@atomic_store on u8 — valid (1 byte)");
+    ok("volatile u16 val;\n"
+       "void f() { u16 v = @atomic_load(&val); }",
+       "@atomic_load on u16 — valid (2 bytes)");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

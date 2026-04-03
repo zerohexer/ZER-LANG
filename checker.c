@@ -3764,9 +3764,17 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line, "@atomic_load requires 1 argument");
                 else {
                     Type *at = typemap_get(c, node->intrinsic.args[0]);
-                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner))
+                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
                         result = at->pointer.inner;
-                    else {
+                        int aw = type_width(at->pointer.inner);
+                        if (aw != 8 && aw != 16 && aw != 32 && aw != 64) {
+                            checker_error(c, node->loc.line,
+                                "@atomic_load target must be 1, 2, 4, or 8 bytes (got %d-bit type)", aw);
+                        } else if (aw == 64) {
+                            checker_warning(c, node->loc.line,
+                                "@atomic_load on 64-bit type may require libatomic on 32-bit targets");
+                        }
+                    } else {
                         checker_error(c, node->loc.line, "@atomic_load argument must be pointer to integer");
                         result = ty_u32;
                     }
@@ -3787,9 +3795,21 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line, "@%.*s requires 2 arguments", (int)nlen, name);
                 else {
                     Type *at = typemap_get(c, node->intrinsic.args[0]);
-                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner))
+                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
                         result = at->pointer.inner;
-                    else {
+                        /* validate atomic width: must be 1, 2, 4, or 8 bytes */
+                        int aw = type_width(at->pointer.inner);
+                        if (aw != 8 && aw != 16 && aw != 32 && aw != 64) {
+                            checker_error(c, node->loc.line,
+                                "@%.*s target must be 1, 2, 4, or 8 bytes (got %d-bit type)",
+                                (int)nlen, name, aw);
+                        } else if (aw == 64) {
+                            checker_warning(c, node->loc.line,
+                                "@%.*s on 64-bit type may require libatomic on 32-bit targets "
+                                "(AVR, Cortex-M0, RISC-V without A extension)",
+                                (int)nlen, name);
+                        }
+                    } else {
                         checker_error(c, node->loc.line, "@%.*s first argument must be pointer to integer", (int)nlen, name);
                         result = ty_u32;
                     }

@@ -506,27 +506,27 @@ int main(void) {
        "both branches free, no use after — OK (FREED, not MAYBE)");
 
     printf("[MAYBE_FREED: one branch frees, else doesn't, no use after → leak warning]\n");
-    err("struct T { u32 x; }\n"
-        "Pool(T, 4) pool;\n"
-        "void f(bool cond) {\n"
-        "    Handle(T) h = pool.alloc() orelse return;\n"
-        "    if (cond) {\n"
-        "        pool.free(h);\n"
-        "    } else {\n"
-        "        pool.get(h).x = 1;\n"
-        "    }\n"
-        "}\n",
-        "one branch free, else doesn't — handle maybe leaked");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f(bool cond) {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    if (cond) {\n"
+       "        pool.free(h);\n"
+       "    } else {\n"
+       "        pool.get(h).x = 1;\n"
+       "    }\n"
+       "}\n",
+       "one branch free, else doesn't — warning only (maybe leaked)");
 
     /* ---- Leak detection tests ---- */
-    printf("\n[leak: alloc without free → error]\n");
-    err("struct T { u32 x; }\n"
-        "Pool(T, 4) pool;\n"
-        "void f() {\n"
-        "    Handle(T) h = pool.alloc() orelse return;\n"
-        "    pool.get(h).x = 5;\n"
-        "}\n",
-        "alloc without free — handle leaked");
+    printf("\n[leak: alloc without free → warning (not error)]\n");
+    ok("struct T { u32 x; }\n"
+       "Pool(T, 4) pool;\n"
+       "void f() {\n"
+       "    Handle(T) h = pool.alloc() orelse return;\n"
+       "    pool.get(h).x = 5;\n"
+       "}\n",
+       "alloc without free — warning only, not compile error");
 
     printf("[leak: overwrite alive handle → error]\n");
     err("struct T { u32 x; }\n"
@@ -683,12 +683,12 @@ int main(void) {
        "}\n",
        "*opaque alloc + free — valid (no leak)");
 
-    err("*opaque malloc(u32 size);\n"
-        "void free(*opaque ptr);\n"
-        "void f() {\n"
-        "    *opaque p = malloc(64);\n"
-        "}\n",
-        "*opaque leak — alloc without free");
+    ok("*opaque malloc(u32 size);\n"
+       "void free(*opaque ptr);\n"
+       "void f() {\n"
+       "    *opaque p = malloc(64);\n"
+       "}\n",
+       "*opaque leak — warning only, not compile error");
 
     ok("*opaque malloc(u32 size);\n"
        "void free(*opaque ptr);\n"

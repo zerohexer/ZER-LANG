@@ -23,6 +23,16 @@ static void zc_error(ZerCheck *zc, int line, const char *fmt, ...) {
     fprintf(stderr, "\n");
 }
 
+static void zc_warning(ZerCheck *zc, int line, const char *fmt, ...) {
+    if (zc->building_summary) return;
+    fprintf(stderr, "%s:%d: zercheck warning: ", zc->file_name, line);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
 /* ---- Path state helpers ---- */
 
 static void pathstate_init(PathState *ps) {
@@ -325,6 +335,16 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
 
         if (mlen == 5 && memcmp(method, "alloc", 5) == 0 &&
             obj->kind == NODE_IDENT) {
+            /* check if object is Pool/Slab (not Arena — arena allocs don't need individual free) */
+            Type *obj_type = checker_get_type(zc->checker, obj);
+            if (!obj_type) {
+                Symbol *sym = scope_lookup(zc->checker->global_scope,
+                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                if (sym) obj_type = sym->type;
+            }
+            if (obj_type && obj_type->kind == TYPE_ARENA) {
+                /* arena.alloc() — skip handle tracking */
+            } else {
             /* this is h = pool.alloc() */
             int pool_id = register_pool(zc, obj->ident.name,
                 (uint32_t)obj->ident.name_len);
@@ -340,6 +360,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                 h->pool_id = pool_id;
                 h->alloc_line = var_node->loc.line;
             }
+            } /* end else (not arena) */
         }
     }
 
@@ -992,12 +1013,12 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
         bool is_param = (ps.handles[i].pool_id == -1 && ps.handles[i].alloc_line == (int)func->loc.line);
         if (is_param) continue;
         if (ps.handles[i].state == HS_ALIVE) {
-            zc_error(zc, ps.handles[i].alloc_line,
-                "handle leak: '%.*s' allocated but never freed",
+            zc_warning(zc, ps.handles[i].alloc_line,
+                "handle '%.*s' allocated but never freed in this function",
                 (int)ps.handles[i].name_len, ps.handles[i].name);
         } else if (ps.handles[i].state == HS_MAYBE_FREED) {
-            zc_error(zc, ps.handles[i].alloc_line,
-                "handle leak: '%.*s' may not be freed on all paths",
+            zc_warning(zc, ps.handles[i].alloc_line,
+                "handle '%.*s' may not be freed on all paths",
                 (int)ps.handles[i].name_len, ps.handles[i].name);
         }
     }

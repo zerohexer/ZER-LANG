@@ -434,6 +434,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **Known Technical Debt:**
 - No qualified module call syntax yet (unqualified calls resolve to last import)
 - checker.c is 6700+ lines (monolith) — works but large to navigate. Split not urgent.
+- zercheck was NOT integrated into zerc until 2026-04-03. All sessions before this date had zercheck only in test harness. Now runs in pipeline: checker → zercheck → emitter. Leaks are warnings (not errors) because zercheck can't track handles across function boundaries or stored in struct fields perfectly. UAF and double-free remain compile errors.
 
 **Internal Quality Notes (verified 2026-04-02):**
 - Static globals (`_comptime_global_scope`, `_comptime_call_depth`) are safe — LSP is single-threaded, no concurrency

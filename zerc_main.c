@@ -7,6 +7,7 @@
 #include "types.h"
 #include "checker.h"
 #include "emitter.h"
+#include "zercheck.h"
 
 /* ================================================================
  * ZER Compiler Driver — zerc
@@ -391,6 +392,18 @@ int main(int argc, char **argv) {
         free(cc.modules);
         arena_free(&cc.arena);
         return 1;
+    }
+
+    /* ZER-CHECK: path-sensitive handle + *opaque tracking */
+    {
+        ZerCheck zc;
+        zercheck_init(&zc, &checker, &cc.arena, input_path);
+        if (!zercheck_run(&zc, main_mod->ast)) {
+            fprintf(stderr, "error: zercheck failed\n");
+            free(cc.modules);
+            arena_free(&cc.arena);
+            return 1;
+        }
     }
 
     /* emit C */

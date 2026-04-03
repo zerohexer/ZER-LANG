@@ -5,6 +5,14 @@
 source.zer → Scanner (lexer.c) → Parser (parser.c) → AST (ast.h)
            → Checker (checker.c) → ZER-CHECK (zercheck.c)
            → Emitter (emitter.c) → output.c → GCC
+
+NOTE: zercheck integrated into zerc_main.c pipeline on 2026-04-03.
+Before this date, zercheck only ran in test_zercheck.c test harness.
+Now: checker_check() → zercheck_run() → emit_file(). UAF and
+double-free are compile errors. Leaks are warnings (zercheck can't
+perfectly track handles across function calls or in struct fields).
+Arena allocations excluded from handle tracking (arena.alloc() does
+not need individual free — arena.reset() frees everything).
 ```
 
 ## Lexer (lexer.c/h)

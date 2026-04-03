@@ -3072,6 +3072,33 @@ int main(void) {
        "void f() { u16 v = @atomic_load(&val); }",
        "@atomic_load on u16 — valid (2 bytes)");
 
+    /* ---- volatile TOCTOU: range propagation must skip volatile ---- */
+    printf("[@volatile TOCTOU]\n");
+    err("volatile u32 hw_status;\n"
+        "u32 f() {\n"
+        "    if (hw_status != 0) {\n"
+        "        return 100 / hw_status;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}",
+        "volatile TOCTOU — guard can't prove volatile safe, rejected");
+    ok("volatile u32 hw_status;\n"
+       "u32 f() {\n"
+       "    u32 status = hw_status;\n"
+       "    if (status != 0) {\n"
+       "        return 100 / status;\n"
+       "    }\n"
+       "    return 0;\n"
+       "}",
+       "volatile read-once into local — local proven safe after guard");
+
+    /* ---- ISR field-blind fix ---- */
+    printf("[@ISR struct field compound assign]\n");
+    ok("struct State { volatile u32 flags; }\n"
+       "volatile State g_state;\n"
+       "void f() { g_state.flags = 1; }",
+       "ISR: direct assign on struct field — no compound, valid");
+
     printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0) {
         printf(", %d FAILED", tests_failed);

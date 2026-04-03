@@ -1455,13 +1455,24 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
-        /* interrupt safety: track compound assignment (|=, +=, etc.) on globals */
-        if (node->assign.op != TOK_EQ && node->assign.target->kind == NODE_IDENT) {
-            Symbol *gs = scope_lookup(c->global_scope, node->assign.target->ident.name,
-                                      (uint32_t)node->assign.target->ident.name_len);
-            if (gs && !gs->is_function) {
-                track_isr_global(c, node->assign.target->ident.name,
-                                 (uint32_t)node->assign.target->ident.name_len, true);
+        /* interrupt safety: track compound assignment (|=, +=, etc.) on globals.
+         * Walk field/index chains to root ident (catches g_state.flags |= 1). */
+        if (node->assign.op != TOK_EQ) {
+            Node *isr_root = node->assign.target;
+            while (isr_root && (isr_root->kind == NODE_FIELD ||
+                                isr_root->kind == NODE_INDEX ||
+                                (isr_root->kind == NODE_UNARY && isr_root->unary.op == TOK_STAR))) {
+                if (isr_root->kind == NODE_FIELD) isr_root = isr_root->field.object;
+                else if (isr_root->kind == NODE_INDEX) isr_root = isr_root->index_expr.object;
+                else isr_root = isr_root->unary.operand;
+            }
+            if (isr_root && isr_root->kind == NODE_IDENT) {
+                Symbol *gs = scope_lookup(c->global_scope, isr_root->ident.name,
+                                          (uint32_t)isr_root->ident.name_len);
+                if (gs && !gs->is_function) {
+                    track_isr_global(c, isr_root->ident.name,
+                                     (uint32_t)isr_root->ident.name_len, true);
+                }
             }
         }
 
@@ -4683,10 +4694,15 @@ static void check_stmt(Checker *c, Node *node) {
                 Node *lhs = if_cond->binary.left;
                 Node *rhs = if_cond->binary.right;
 
-                /* try left side as ident or struct field */
+                /* try left side as ident or struct field
+                 * TOCTOU: skip volatile variables — value can change between
+                 * guard check and use, so range narrowing is unsound */
                 if (lhs->kind == NODE_IDENT) {
+                    Symbol *lsym = scope_lookup(c->current_scope,
+                        lhs->ident.name, (uint32_t)lhs->ident.name_len);
+                    bool is_vol = (lsym && lsym->is_volatile);
                     cmp_val = eval_const_expr(rhs);
-                    if (cmp_val != CONST_EVAL_FAIL) {
+                    if (cmp_val != CONST_EVAL_FAIL && !is_vol) {
                         cmp_var = lhs->ident.name;
                         cmp_var_len = (uint32_t)lhs->ident.name_len;
                         var_on_left = true;
@@ -4702,10 +4718,13 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
-                /* try right side */
+                /* try right side — also skip volatile (TOCTOU) */
                 if (!cmp_var && rhs->kind == NODE_IDENT) {
+                    Symbol *rsym = scope_lookup(c->current_scope,
+                        rhs->ident.name, (uint32_t)rhs->ident.name_len);
+                    bool r_vol = (rsym && rsym->is_volatile);
                     cmp_val = eval_const_expr(lhs);
-                    if (cmp_val != CONST_EVAL_FAIL) {
+                    if (cmp_val != CONST_EVAL_FAIL && !r_vol) {
                         cmp_var = rhs->ident.name;
                         cmp_var_len = (uint32_t)rhs->ident.name_len;
                         var_on_left = false;

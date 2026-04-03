@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-03 — External Audit + Pipeline Integration
+
+### BUG-401: Volatile TOCTOU — range propagation unsound for volatile
+- **Symptom:** `if (hw_status != 0) { 100 / hw_status; }` where `hw_status` is volatile MMIO — range propagation proves divisor nonzero, skips runtime trap. But volatile can change between check and use.
+- **Root cause:** `push_var_range` in if-guard path never checked if the variable's symbol is `is_volatile`.
+- **Fix:** Before narrowing range from guard comparison, look up symbol. If `is_volatile`, skip range narrowing entirely. Volatile variables always keep runtime safety checks.
+- **Test:** `test_checker_full.c` — volatile TOCTOU rejected, read-once-into-local pattern accepted.
+
+### BUG-402: ISR compound assign field-blind
+- **Symptom:** `g_state.flags |= 1` in interrupt handler — ISR safety analysis misses compound assign on struct fields because `track_isr_global` only fires on `NODE_IDENT` targets.
+- **Root cause:** Line 1459 checked `node->assign.target->kind == NODE_IDENT`. Struct field targets (`NODE_FIELD`) bypassed the ISR tracking.
+- **Fix:** Walk field/index/deref chain to root ident before calling `track_isr_global`. Same walker pattern as scope escape analysis.
+- **Test:** `test_checker_full.c` — struct field compound assign tracked.
+
+### BUG-403: zercheck not integrated into zerc pipeline
+- **Symptom:** zercheck (UAF, double-free, leak detection) never ran during `zerc` compilation. All 50+ zercheck tests passed because they called `zercheck_run()` directly in the test harness. Users had ZERO zercheck protection.
+- **Root cause:** `zerc_main.c` never called `zercheck_run()`. The function existed, was tested, but never invoked in the actual compiler pipeline.
+- **Fix:** Added `zercheck_run()` call after `checker_check_bodies()` in `zerc_main.c`. Leaks demoted to warnings (zercheck can't perfectly track handles across function calls or in struct fields). UAF and double-free remain compile errors. Arena allocations excluded from handle tracking.
+- **Test:** 7 negative `.zer` tests in `tests/zer_fail/` that exercise every safety system through the full `zerc` pipeline.
+
+---
+
 ## Round 9 — Agent-Driven Audit (2026-03-23)
 
 Three parallel audit agents (checker, emitter, interaction edge cases) plus code quality review. Found 12 bugs across parser, checker, emitter, AST, and main.

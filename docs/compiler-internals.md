@@ -712,6 +712,12 @@ gpio[8] = 0xFF;                           → 8 >= 8 → compile error
 
 Both var-decl (local) and global var paths set `mmio_bound`. Works on any architecture — math is `(range_end - addr + 1) / type_width`.
 
+**Direct `@inttoptr[N]` indexing:** NODE_INDEX also checks when object is `NODE_INTRINSIC(inttoptr)` — performs mmio range lookup inline without needing a Symbol. Closes the "no variable" bypass.
+
+**Variable index auto-guard:** When MMIO pointer has `mmio_bound > 0` and index is not constant, `mark_auto_guard(c, node, mmio_bound)` inserts runtime `if (i >= bound) return;`. Same auto-guard mechanism as arrays.
+
+**Handle design: why `tasks.get(h).id` is verbose but correct:** Handle is `u64` (index+gen). It carries no reference to which Pool/Slab allocated it. `h.id` shortcut was proposed but rejected — compiler can't resolve which pool when multiple exist for the same type. The explicit `pool.get(h)` tells the emitter which `_zer_slab_get()` to call. This is a fundamental design constraint of Handle-based allocation, not fixable without making Handle a fat struct.
+
 5 layers total:
 1. Compile-time: address in declared range
 2. Compile-time: address aligned

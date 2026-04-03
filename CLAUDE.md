@@ -437,6 +437,10 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Type ID 0 for `*opaque` provenance: extern/cinclude pointers get type_id=0 (unknown). `@ptrcast` check skips type_id==0 to allow C interop. Not a security hole — C code is outside ZER's safety boundary. Future `--strict-interop` flag could force explicit type assignment.
 - No pointer arithmetic: `ptr + N` deliberately rejected. Use `ptr[N]` for pointer indexing, `@ptrtoint` + math + `@inttoptr` for MMIO. Safety feature, not a gap.
 - Atomic width validation: `@atomic_*` on 64-bit targets warns about libatomic requirement on 32-bit platforms (AVR, Cortex-M0). Width must be 1/2/4/8 bytes.
+- `pool.get(h)` is intentionally verbose — Handle is `u64` (index+gen), carries no pool reference. `h.id` shortcut proposed but rejected: compiler can't resolve which pool to call `_zer_slab_get()` on when multiple pools exist for the same type. Explicit `tasks.get(h).id` tells both compiler and reader which pool.
+- Pool/Slab/Arena are NOT the same thing with different names — Pool (fixed, ISR-safe, no malloc), Slab (dynamic, grows via calloc, NOT ISR-safe), Arena (bump allocator, bulk reset). Don't rename or unify them.
+- `pool.get()` is non-storable — `*Task t = pool.get(h)` is a checker error. Must use inline: `pool.get(h).field`. This prevents caching a pointer that becomes invalid after another alloc/free.
+- Array→slice auto-coercion at call sites already works: `process(arr)` where `process([]u8 data)` auto-converts `u8[N]` to `[]u8 {ptr, len}`.
 
 **Known Technical Debt:**
 - No qualified module call syntax yet (unqualified calls resolve to last import)

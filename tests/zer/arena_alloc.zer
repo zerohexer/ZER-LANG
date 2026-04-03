@@ -1,0 +1,62 @@
+// Arena allocator — bump allocation, reset, overflow handling
+// Tests: Arena.over, alloc, reset, orelse on exhaustion
+
+i32 puts(const *u8 s);
+
+struct Sensor {
+    u32 id;
+    u32 reading;
+}
+
+struct Config {
+    u32 rate;
+    u32 threshold;
+}
+
+u32 main() {
+    u8[4096] backing;
+    Arena scratch = Arena.over(backing);
+
+    // Test 1: alloc single struct
+    *Sensor s = scratch.alloc(Sensor) orelse return;
+    s.id = 1;
+    s.reading = 42;
+    if (s.id != 1) { return 1; }
+    if (s.reading != 42) { return 2; }
+
+    // Test 2: alloc multiple
+    *Config c1 = scratch.alloc(Config) orelse return;
+    *Config c2 = scratch.alloc(Config) orelse return;
+    c1.rate = 100;
+    c1.threshold = 50;
+    c2.rate = 200;
+    c2.threshold = 75;
+    if (c1.rate != 100) { return 3; }
+    if (c2.threshold != 75) { return 4; }
+
+    // Test 3: reset and reuse
+    scratch.unsafe_reset();
+    *Sensor s2 = scratch.alloc(Sensor) orelse return;
+    s2.id = 99;
+    s2.reading = 0;
+    if (s2.id != 99) { return 5; }
+
+    // Test 4: alloc until full, orelse handles exhaustion
+    scratch.unsafe_reset();
+    u32 count = 0;
+    for (u32 i = 0; i < 1000; i += 1) {
+        ?*Sensor tmp = scratch.alloc(Sensor);
+        if (tmp) |t| {
+            t.id = i;
+            count += 1;
+        } else {
+            i = 1000;
+        }
+    }
+    // 4096 bytes / 8 bytes per Sensor = ~512 allocations
+    if (count == 0) { return 6; }
+    if (count > 600) { return 7; }
+
+    puts("arena_alloc: all tests passed!");
+    return 0;
+}

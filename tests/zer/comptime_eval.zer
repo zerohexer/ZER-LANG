@@ -1,0 +1,55 @@
+// Comptime functions — compile-time evaluation, zero runtime cost
+// Tests: comptime function calls, comptime if, nested comptime
+
+i32 puts(const *u8 s);
+
+comptime u32 BIT(u32 n) {
+    return 1 << n;
+}
+
+comptime u32 MAX(u32 a, u32 b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+comptime u32 ALIGN(u32 size, u32 alignment) {
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+// Use comptime results as array sizes and constants
+const u32 FLAGS = BIT(0) | BIT(3) | BIT(7);
+u32[MAX(8, 16)] buffer;
+const u32 ALIGNED_SIZE = ALIGN(13, 4);
+
+u32 main() {
+    // Test 1: BIT macro replacement
+    if (BIT(0) != 1) { return 1; }
+    if (BIT(3) != 8) { return 2; }
+    if (BIT(7) != 128) { return 3; }
+
+    // Test 2: MAX
+    if (MAX(10, 20) != 20) { return 4; }
+    if (MAX(99, 1) != 99) { return 5; }
+
+    // Test 3: FLAGS constant
+    if (FLAGS != 137) { return 6; }
+
+    // Test 4: buffer size from MAX
+    // MAX(8, 16) = 16, buffer is u32[16]
+    buffer[0] = 42;
+    buffer[15] = 99;
+    if (buffer[0] != 42) { return 7; }
+    if (buffer[15] != 99) { return 8; }
+
+    // Test 5: ALIGN
+    if (ALIGNED_SIZE != 16) { return 9; }
+
+    // Test 6: comptime if
+    comptime if (1) {
+        u32 x = 42;
+        if (x != 42) { return 10; }
+    }
+
+    puts("comptime_eval: all tests passed!");
+    return 0;
+}

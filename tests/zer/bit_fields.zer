@@ -1,0 +1,51 @@
+// Bit extraction and bit-set — hardware register patterns
+// Tests: val[hi..lo] read, reg[hi..lo] = val write, multi-field
+
+i32 puts(const *u8 s);
+
+u32 main() {
+    // Test 1: bit extraction
+    u32 reg = 0xABCD1234;
+    u32 low_byte = reg[7..0];
+    if (low_byte != 0x34) { return 1; }
+
+    u32 high_byte = reg[31..24];
+    if (high_byte != 0xAB) { return 2; }
+
+    u32 mid = reg[15..8];
+    if (mid != 0x12) { return 3; }
+
+    // Test 2: bit-set
+    u32 ctrl = 0;
+    ctrl[3..0] = 0xF;
+    if (ctrl != 0xF) { return 4; }
+
+    ctrl[7..4] = 0xA;
+    if (ctrl != 0xAF) { return 5; }
+
+    // Test 3: single bit
+    u32 flag = 0;
+    flag[0..0] = 1;
+    if (flag != 1) { return 6; }
+    flag[7..7] = 1;
+    if (flag != 129) { return 7; }
+
+    // Test 4: 8-bit register pattern
+    u8 status = 0;
+    status[0..0] = 1;     // bit 0: ready
+    status[1..1] = 1;     // bit 1: busy
+    if (status != 3) { return 8; }
+
+    u8 ready = status[0..0];
+    if (ready != 1) { return 9; }
+
+    // Test 5: extract from constant
+    u32 packet = 0x12345678;
+    u32 version = packet[31..28];
+    u32 length = packet[15..0];
+    if (version != 1) { return 10; }
+    if (length != 0x5678) { return 11; }
+
+    puts("bit_fields: all tests passed!");
+    return 0;
+}

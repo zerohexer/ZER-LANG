@@ -1,0 +1,82 @@
+// Optional patterns — ?T, ?*T, ?void, orelse, if-unwrap
+// Tests: all optional variants, chaining, struct fields
+
+i32 puts(const *u8 s);
+
+struct Result {
+    u32 value;
+    bool valid;
+}
+
+?u32 safe_divide(u32 a, u32 b) {
+    if (b == 0) { return null; }
+    return a / b;
+}
+
+?Result parse_input(u32 raw) {
+    if (raw == 0) { return null; }
+    Result r;
+    r.value = raw * 2;
+    r.valid = true;
+    return r;
+}
+
+?void validate(u32 x) {
+    if (x > 100) { return null; }
+    return;
+}
+
+u32 count;
+
+void inc() {
+    count += 1;
+}
+
+u32 main() {
+    // Test 1: ?u32 with orelse default
+    u32 val = safe_divide(10, 2) orelse 0;
+    if (val != 5) { return 1; }
+
+    // Test 2: ?u32 orelse return
+    val = safe_divide(100, 4) orelse return;
+    if (val != 25) { return 2; }
+
+    // Test 3: ?u32 null case
+    ?u32 bad = safe_divide(10, 0);
+    if (bad) |v| { return 3; }
+
+    // Test 4: if-unwrap
+    ?u32 maybe = safe_divide(42, 7);
+    if (maybe) |v| {
+        if (v != 6) { return 4; }
+    } else {
+        return 5;
+    }
+
+    // Test 5: ?struct
+    Result r = parse_input(21) orelse return;
+    if (r.value != 42) { return 6; }
+    if (!r.valid) { return 7; }
+
+    // Test 6: ?struct null
+    ?Result empty = parse_input(0);
+    if (empty) |v| { return 8; }
+
+    // Test 7: ?void
+    validate(50) orelse return;
+
+    // Test 8: ?void failure
+    count = 0;
+    defer inc();
+    ?void check = validate(200);
+    if (check) |v| { return 9; }
+
+    // Test 9: chained orelse
+    u32 a = safe_divide(10, 0) orelse 0;
+    u32 b = safe_divide(10, 2) orelse 0;
+    if (a != 0) { return 10; }
+    if (b != 5) { return 11; }
+
+    puts("optional_patterns: all tests passed!");
+    return 0;
+}

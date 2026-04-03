@@ -100,7 +100,7 @@ Handle(Task) h;          u64: index(32) + generation(32), not a pointer
 
 9. **No `malloc`/`free`.** Use Pool, Slab, Ring, or Arena builtins.
 
-10. **String literals are `[]u8` (slices), not `char*`.**
+10. **String literals are `[]u8` / `[*]u8` (slices), not `char*`.** `[*]T` is the v0.3 syntax for slices — reads as "pointer to many." Both `[]T` and `[*]T` work (same internal type).
     ```
     []u8 msg = "Hello";           // slice with .ptr and .len
     ```

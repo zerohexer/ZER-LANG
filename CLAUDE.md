@@ -493,12 +493,13 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **VS Code Extension (VSIX) Build:**
 - `make docker-vsix` — builds complete VSIX with bundled `zerc.exe`, `zer-lsp.exe`, and portable GCC (w64devkit)
 - `Dockerfile.vsix` — gcc:13 + mingw cross-compile + Node.js/vsce + w64devkit portable GCC + librsvg2 for SVG→PNG icon conversion
-- Extension auto-detects bundled binaries: `bin/zerc.exe`, `bin/zer-lsp.exe`, `bin/gcc/bin/gcc.exe`
-- Adds bundled `bin/` and `bin/gcc/bin/` to VS Code process PATH — no system PATH modification needed (sandboxed)
+- Extension auto-detects bundled binaries: `bin/win32-x64/zerc.exe`, `bin/win32-x64/zer-lsp.exe`, `bin/win32-x64/gcc/bin/gcc.exe`
 - `editors/vscode/extension.js` — uses `findBundled()` to prefer bundled binaries, falls back to system PATH
-- `editors/vscode/package.json` — name `zerohexer-lang`, publisher `zerohexer`, MPL-2.0
+- `editors/vscode/package.json` — name `zerc-language`, publisher `zerohexer`, MPL-2.0
 - Icon: `editors/vscode/icon.svg` — black background, silver `[*]` pointer-in-brackets logo, auto-converted to PNG during build
-- README.md in extension shows quick start, safety table, syntax examples
+- Auto-PATH: on first activation, if `zerc` not on system PATH, prompts user to add bundled dir permanently via PowerShell `[Environment]::SetEnvironmentVariable`. Requires VS Code restart after.
+- **CRITICAL:** `where zerc` check must run BEFORE `process.env.PATH` prepend (line 52-56 injects bundled dir). If checked after, it finds the bundled binary and skips the prompt.
+- **CRITICAL:** `zer.lspPath` in VS Code settings overrides bundled detection. If set to a path that doesn't exist (e.g., old mingw path), LSP fails. Fix: clear the setting.
 - Marketplace: publisher "Zerohexer", display name "ZER(C) Language"
 
 **LLM Reference:**

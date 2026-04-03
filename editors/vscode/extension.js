@@ -49,9 +49,13 @@ function activate(context) {
         lspPath = findBundled(context, lspName);
     }
 
-    // Add bundled bin/ to PATH for zerc and gcc
+    // Check if zerc is on system PATH BEFORE we inject bundled dir
     const platDir = path.join(context.extensionPath, 'bin', getPlatformDir());
     const sep = process.platform === 'win32' ? ';' : ':';
+    let zercOnSystemPath = false;
+    try { execSync('where zerc', { stdio: 'ignore' }); zercOnSystemPath = true; } catch(e) {}
+
+    // Add bundled bin/ to PATH for zerc and gcc
     if (fs.existsSync(platDir)) {
         process.env.PATH = platDir + sep + process.env.PATH;
     }
@@ -72,6 +76,30 @@ function activate(context) {
         const gccBinDir = path.join(platDir, 'gcc', 'bin');
         if (fs.existsSync(gccBinDir)) {
             envVar.prepend('PATH', gccBinDir + sep);
+        }
+
+        // First-time: offer to add zerc to user PATH permanently
+        const addedKey = 'zer.pathAdded';
+        const alreadyAdded = context.globalState.get(addedKey);
+
+        if (!alreadyAdded && !zercOnSystemPath) {
+            vscode.window.showWarningMessage(
+                'ZER: zerc not found on PATH. Add bundled zerc + gcc to your system PATH?',
+                'Yes', 'No'
+            ).then(choice => {
+                if (choice === 'Yes') {
+                    try {
+                        const psCmd = `[Environment]::SetEnvironmentVariable('Path', '${platDir};${gccBinDir};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')`;
+                        execSync(`powershell -Command "${psCmd}"`, { stdio: 'ignore' });
+                        context.globalState.update(addedKey, true);
+                        vscode.window.showInformationMessage('ZER: Added to PATH. Restart VS Code to use zerc in terminal.');
+                    } catch (err) {
+                        vscode.window.showErrorMessage('ZER: Failed to update PATH — add manually: ' + platDir);
+                    }
+                } else {
+                    context.globalState.update(addedKey, true);
+                }
+            });
         }
     }
 

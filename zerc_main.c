@@ -502,10 +502,15 @@ int main(int argc, char **argv) {
         bool need_quote = (strchr(gcc_path, ' ') != NULL);
         const char *wrap_flags = (emitter.track_cptrs) ?
             " -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc" : "";
+#ifdef _WIN32
+        const char *platform_flags = " -mconsole";
+#else
+        const char *platform_flags = "";
+#endif
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing%s -o \"%s\" \"%s\""
-                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing%s -o \"%s\" \"%s\"",
-                 gcc_path, wrap_flags, exe_path, output_path);
+                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing%s%s -o \"%s\" \"%s\""
+                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing%s%s -o \"%s\" \"%s\"",
+                 gcc_path, wrap_flags, platform_flags, exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);
         if (gcc_ret != 0) {

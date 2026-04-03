@@ -4270,6 +4270,14 @@ static void check_stmt(Checker *c, Node *node) {
                         "'null' can only be assigned to optional types (?*T, ?T) — "
                         "'%s' is not optional",
                         type_name(type));
+                } else if (init_type->kind == TYPE_OPTIONAL &&
+                           type_equals(init_type->optional.inner, type)) {
+                    /* ?T assigned to T without orelse — suggest unwrap */
+                    checker_error(c, node->loc.line,
+                        "cannot initialize '%.*s' of type '%s' with '%s' — "
+                        "add 'orelse { return; }' to unwrap",
+                        (int)node->var_decl.name_len, node->var_decl.name,
+                        type_name(type), type_name(init_type));
                 } else {
                     checker_error(c, node->loc.line,
                         "cannot initialize '%.*s' of type '%s' with '%s'",

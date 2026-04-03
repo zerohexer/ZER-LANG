@@ -107,6 +107,14 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 **When modifying error reporting:** Always call `print_source_line` after printing the error text line. The function handles NULL source gracefully. If adding a new error path that doesn't go through `checker_error`/`checker_warning`, add the call manually.
 
+**Parser `warn()` function:** Added for `[]T` deprecation. Suppressed when `parser.source == NULL` (test harness) to avoid noise from 200+ test strings using `[]T`.
+
+**`?T` → `T` orelse hint:** When var-decl init type is `TYPE_OPTIONAL` and inner matches target type, error message includes "add 'orelse { return; }' to unwrap" hint. Checker line ~4275.
+
+### Windows `--run` — `-mconsole` flag
+
+`zerc_main.c` adds `-mconsole` to GCC invocation on Windows (`#ifdef _WIN32`). Without this, msys64 mingw GCC links as GUI app expecting `WinMain` instead of `main`. Linux/macOS unaffected.
+
 ## Checker (checker.c) — ~1800 lines
 
 ### Key Functions

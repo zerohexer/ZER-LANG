@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-04 — VSIX + Error Messages + Windows Fixes
+
+### BUG: Windows `--run` WinMain undefined reference
+- **Symptom:** `zerc Test.zer --run` on Windows with msys64 mingw GCC fails: `undefined reference to 'WinMain'`. GCC links as GUI app instead of console app.
+- **Root cause:** zerc's GCC invocation missing `-mconsole` flag on Windows.
+- **Fix:** Added `#ifdef _WIN32` → `-mconsole` flag in `zerc_main.c` GCC command construction.
+- **Test:** Windows-only, verified manually.
+
+### BUG: `?T` to `T` assignment gives no orelse hint
+- **Symptom:** `Handle(Task) t = heap.alloc();` — error says "cannot initialize Handle(Task) with ?Handle(Task)" but doesn't suggest `orelse { return; }`.
+- **Root cause:** Generic type mismatch error path at checker.c line ~4275. No special case for `?T` → `T` mismatch.
+- **Fix:** Added check: if `init_type->kind == TYPE_OPTIONAL` and `init_type->optional.inner` equals target type, show hint: "add 'orelse { return; }' to unwrap".
+- **Test:** Verified manually, existing tests pass.
+
+### FEATURE: VS Code extension auto-PATH setup
+- **What:** Extension detects if `zerc` is not on system PATH on first activation. Shows prompt: "Add bundled zerc + gcc to your system PATH?" Clicking Yes uses PowerShell `[Environment]::SetEnvironmentVariable` to add extension's `bin/win32-x64/` and `bin/win32-x64/gcc/bin/` to user PATH permanently.
+- **Root cause of prior issues:** Extension's `zer.lspPath` setting was hardcoded to `C:\msys64\mingw64\bin\zer-lsp.exe`, overriding bundled binary detection. Old extension `zerohexer.zer-lang-0.1.0` was also installed alongside new one.
+- **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
+- **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
+
+### FEATURE: VS Code extension version 0.2.6
+- **Changes:** Auto-PATH prompt, `-mconsole` fix in bundled zerc, `?T` orelse hint, `[*]T` + `[]T` deprecation warning.
+
+---
+
 ## Session 2026-04-03 — External Audit + Pipeline Integration
 
 ## Session 2026-04-03 — [*]T Syntax + []T Deprecation

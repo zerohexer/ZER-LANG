@@ -1,0 +1,15 @@
+// MUST FAIL: return pointer to local variable
+// If this compiles, scope escape analysis is broken
+
+struct Data { u32 x; }
+
+*Data bad() {
+    Data local;
+    local.x = 42;
+    return &local;
+}
+
+u32 main() {
+    *Data p = bad();
+    return p.x;
+}

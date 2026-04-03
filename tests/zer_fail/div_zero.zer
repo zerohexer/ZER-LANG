@@ -1,0 +1,7 @@
+// MUST FAIL: division by zero literal
+// If this compiles, division guard is broken
+
+u32 main() {
+    u32 x = 10 / 0;
+    return x;
+}

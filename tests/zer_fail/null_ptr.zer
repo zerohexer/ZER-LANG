@@ -1,0 +1,9 @@
+// MUST FAIL: non-null pointer without initializer
+// If this compiles, null safety is broken
+
+struct Task { u32 id; }
+
+u32 main() {
+    *Task ptr;
+    return 0;
+}

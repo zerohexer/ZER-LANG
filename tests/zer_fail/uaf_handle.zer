@@ -1,0 +1,12 @@
+// MUST FAIL: use-after-free on handle
+// If this compiles, zercheck is not integrated into the pipeline
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    Handle(Task) h = pool.alloc() orelse return;
+    pool.free(h);
+    pool.get(h).id = 5;
+    return 0;
+}

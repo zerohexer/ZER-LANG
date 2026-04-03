@@ -1,0 +1,14 @@
+// MUST FAIL: use handle after conditional free (MAYBE_FREED)
+// If this compiles, zercheck MAYBE_FREED detection is broken
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (pool.get(h).id == 0) {
+        pool.free(h);
+    }
+    pool.get(h).id = 5;
+    return 0;
+}

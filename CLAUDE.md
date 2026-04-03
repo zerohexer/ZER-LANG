@@ -669,6 +669,37 @@ Before marking ANY component as "done":
 - All tests must pass before any commit
 - Run `make docker-check` (or `make check`) before every push
 
+### Pipeline Integration Testing — CRITICAL
+
+**Problem this solves:** zercheck existed for months with 50+ passing unit tests, but was NEVER called from the actual compiler (`zerc_main.c`). All safety promises were lies — the tests tested zercheck in isolation, not whether `zerc` actually invoked it. This was caught on 2026-04-03.
+
+**The rule:** For every safety system (checker, zercheck, emitter safety checks), there MUST be a `.zer` file in `tests/zer_fail/` that exercises it through the FULL compiler pipeline:
+
+```
+tests/zer/          ← positive: must compile + run + exit 0
+tests/zer_fail/     ← negative: must FAIL to compile
+```
+
+**Current negative tests (`tests/zer_fail/`):**
+- `uaf_handle.zer` — use-after-free on Pool handle (zercheck)
+- `double_free.zer` — double free on Pool handle (zercheck)
+- `maybe_freed.zer` — use handle after conditional free (zercheck MAYBE_FREED)
+- `bounds_oob.zer` — compile-time array OOB (checker)
+- `div_zero.zer` — division by zero literal (checker)
+- `null_ptr.zer` — non-null pointer without init (checker)
+- `dangling_return.zer` — return pointer to local (checker escape analysis)
+
+**When adding a new safety feature:**
+1. Write the checker/zercheck/emitter code
+2. Write C-level unit tests (test_checker_full.c, test_zercheck.c, test_emit.c)
+3. **ALSO write a `tests/zer_fail/feature_name.zer`** that exercises the feature through `zerc`
+4. If the negative test compiles when it shouldn't → the feature isn't integrated into the pipeline
+
+**The test runner (`tests/test_zer.sh`):**
+- Positive tests: `zerc file.zer --run` must exit 0
+- Negative tests: `zerc file.zer -o /dev/null` must exit non-zero
+- Both run as part of `make check`
+
 ## Debugging Workflow — ZER Source Code Bugs
 
 ### The Rule

@@ -3755,9 +3755,9 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    char **pages;         /* array of page pointers */\n");
     emit(e, "    uint32_t *gen;        /* flat generation array */\n");
     emit(e, "    uint8_t *used;        /* flat used-slot array */\n");
-    emit(e, "    uint32_t page_count;\n");
-    emit(e, "    uint32_t page_cap;\n");
-    emit(e, "    uint32_t total_slots;\n");
+    emit(e, "    size_t page_count;\n");
+    emit(e, "    size_t page_cap;\n");
+    emit(e, "    size_t total_slots;\n");
     emit(e, "    size_t slot_size;\n");
     emit(e, "} _zer_slab;\n\n");
 
@@ -3773,7 +3773,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    }\n");
     emit(e, "    /* grow: add a new page */\n");
     emit(e, "    if (s->page_count >= s->page_cap) {\n");
-    emit(e, "        uint32_t nc = s->page_cap < 4 ? 4 : s->page_cap * 2;\n");
+    emit(e, "        size_t nc = s->page_cap < 4 ? 4 : s->page_cap * 2;\n");
     emit(e, "        char **np = (char**)calloc(nc, sizeof(char*));\n");
     emit(e, "        uint32_t *ng = (uint32_t*)calloc((size_t)nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint32_t));\n");
     emit(e, "        uint8_t *nu = (uint8_t*)calloc((size_t)nc * _ZER_SLAB_PAGE_SLOTS, sizeof(uint8_t));\n");
@@ -3786,7 +3786,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    char *page = (char*)calloc(_ZER_SLAB_PAGE_SLOTS, s->slot_size);\n");
     emit(e, "    if (!page) { *ok = 0; return 0; }\n");
     emit(e, "    s->pages[s->page_count] = page;\n");
-    emit(e, "    uint32_t base = s->total_slots;\n");
+    emit(e, "    size_t base = s->total_slots;\n");
     emit(e, "    s->page_count++;\n");
     emit(e, "    s->total_slots += _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    s->used[base] = 1;\n");
@@ -3801,8 +3801,8 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != gen) {\n");
     emit(e, "        _zer_trap(\"slab: use-after-free or invalid handle\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
-    emit(e, "    uint32_t page = idx / _ZER_SLAB_PAGE_SLOTS;\n");
-    emit(e, "    uint32_t slot = idx %% _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "    size_t page = idx / _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "    size_t slot = idx %% _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    return s->pages[page] + slot * s->slot_size;\n");
     emit(e, "}\n\n");
 

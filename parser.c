@@ -57,6 +57,12 @@ static void error(Parser *p, const char *msg) {
     error_at(p, &p->previous, msg);
 }
 
+static void warn(Parser *p, const char *msg) {
+    if (!p->source) return; /* suppress warnings in test harness (source=NULL) */
+    fprintf(stderr, "%s:%d: warning: %s\n", p->file_name, p->previous.line, msg);
+    print_source_line_p(stderr, p->source, p->previous.line);
+}
+
 static void error_current(Parser *p, const char *msg) {
     error_at(p, &p->current, msg);
 }
@@ -380,7 +386,8 @@ static TypeNode *parse_type(Parser *p) {
     if (check(p, TOK_LBRACKET)) {
         advance(p); /* consume [ */
         if (match(p, TOK_RBRACKET)) {
-            /* []T — slice (legacy syntax, kept for backward compat) */
+            /* []T — deprecated, use [*]T */
+            warn(p, "[]T is deprecated, use [*]T instead");
             TypeNode *t = new_type_node(p, TYNODE_SLICE);
             t->slice.inner = parse_type(p);
             return t;

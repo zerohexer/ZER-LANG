@@ -19,6 +19,24 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** Walk field/index/deref chain to root ident before calling `track_isr_global`. Same walker pattern as scope escape analysis.
 - **Test:** `test_checker_full.c` — struct field compound assign tracked.
 
+### BUG-404: Pointer indexing has no bounds check
+- **Symptom:** `p[1000000] = 42` where `p` is `*u32` — emits raw C indexing with no `_zer_bounds_check`. Bypasses ALL of ZER's bounds safety.
+- **Root cause:** checker.c TYPE_POINTER case in NODE_INDEX returned `pointer.inner` with no validation or warning.
+- **Fix:** Added warning for non-volatile pointer indexing: "use slice for bounds-checked access." Not banned (too common in C interop) but made visible. Volatile pointers (MMIO) skip the warning.
+- **Test:** Warning emitted on pointer indexing. Volatile pointer indexing is silent (MMIO use case).
+
+### BUG-405: Slab.alloc() allowed in interrupt handler
+- **Symptom:** `tasks.alloc()` inside `interrupt UART { }` compiles without error. On real hardware, Slab.alloc() calls calloc which may use a global mutex — deadlock if main thread is also allocating.
+- **Root cause:** No `c->in_interrupt` check in Slab alloc method validation.
+- **Fix:** Added `c->in_interrupt` check before Slab alloc. Error: "slab.alloc() not allowed in interrupt handler — use Pool(T, N) instead." Pool is safe (static, no malloc).
+- **Test:** `tests/zer_fail/isr_slab_alloc.zer` — Slab.alloc in interrupt rejected.
+
+### BUG-406: Ghost Handle — discarded alloc result
+- **Symptom:** `pool.alloc();` as bare expression statement — handle returned but never assigned. Allocation leaked silently.
+- **Root cause:** NODE_EXPR_STMT didn't check if the expression was a pool/slab alloc() call with discarded result.
+- **Fix:** After check_expr in NODE_EXPR_STMT, detect pool.alloc()/slab.alloc() calls and error: "discarded alloc result — handle leaked."
+- **Test:** `tests/zer_fail/ghost_handle.zer` — bare pool.alloc() rejected.
+
 ### BUG-403: zercheck not integrated into zerc pipeline
 - **Symptom:** zercheck (UAF, double-free, leak detection) never ran during `zerc` compilation. All 50+ zercheck tests passed because they called `zercheck_run()` directly in the test harness. Users had ZERO zercheck protection.
 - **Root cause:** `zerc_main.c` never called `zercheck_run()`. The function existed, was tested, but never invoked in the actual compiler pipeline.

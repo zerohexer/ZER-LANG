@@ -1,0 +1,9 @@
+// MUST FAIL: discarded alloc result — handle leaked
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    pool.alloc();
+    return 0;
+}

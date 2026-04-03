@@ -2428,6 +2428,10 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Slab methods — same API as Pool but dynamically growable */
             if (obj->kind == TYPE_SLAB) {
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    if (c->in_interrupt)
+                        checker_error(c, node->loc.line,
+                            "slab.alloc() not allowed in interrupt handler — "
+                            "malloc/calloc may deadlock. Use Pool(T, N) instead");
                     if (obj_is_const)
                         checker_error(c, node->loc.line,
                             "cannot call mutating method 'alloc' on const Slab");
@@ -3266,7 +3270,14 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = obj->slice.inner;
         } else if (obj->kind == TYPE_POINTER) {
-            /* pointer indexing: *T[i] → T (same as C pointer arithmetic) */
+            /* pointer indexing: no bounds check possible (no length).
+             * Warn for non-volatile pointers — use slices for safety. */
+            if (!obj->pointer.is_volatile) {
+                checker_warning(c, node->loc.line,
+                    "pointer indexing has no bounds check — "
+                    "use []%s (slice) for bounds-checked access",
+                    type_name(obj->pointer.inner));
+            }
             result = obj->pointer.inner;
         } else {
             checker_error(c, node->loc.line,
@@ -5608,6 +5619,29 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_EXPR_STMT:
         check_expr(c, node->expr_stmt.expr);
+        /* Ghost handle: warn if pool.alloc()/slab.alloc() result is discarded.
+         * The handle is leaked — must assign to a variable. */
+        if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
+            node->expr_stmt.expr->call.callee &&
+            node->expr_stmt.expr->call.callee->kind == NODE_FIELD) {
+            Node *call_obj = node->expr_stmt.expr->call.callee->field.object;
+            const char *mname = node->expr_stmt.expr->call.callee->field.field_name;
+            uint32_t mlen = (uint32_t)node->expr_stmt.expr->call.callee->field.field_name_len;
+            if (mlen == 5 && memcmp(mname, "alloc", 5) == 0 && call_obj->kind == NODE_IDENT) {
+                Type *ot = checker_get_type(c, call_obj);
+                if (!ot) {
+                    Symbol *s = scope_lookup(c->current_scope, call_obj->ident.name,
+                        (uint32_t)call_obj->ident.name_len);
+                    if (s) ot = s->type;
+                }
+                if (ot && (ot->kind == TYPE_POOL || ot->kind == TYPE_SLAB)) {
+                    checker_error(c, node->loc.line,
+                        "discarded alloc result — handle leaked. Assign to a variable: "
+                        "'Handle(...) h = %.*s.alloc() orelse return;'",
+                        (int)call_obj->ident.name_len, call_obj->ident.name);
+                }
+            }
+        }
         break;
 
     case NODE_ASM:

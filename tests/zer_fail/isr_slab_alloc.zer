@@ -1,0 +1,12 @@
+// MUST FAIL: Slab.alloc in interrupt handler
+// malloc/calloc may deadlock — use Pool instead
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+interrupt UART {
+    Handle(Task) h = tasks.alloc() orelse return;
+    tasks.free(h);
+}
+
+u32 main() { return 0; }

@@ -1,0 +1,50 @@
+// alloc_ptr with Pool — same API as Slab
+
+struct Sensor {
+    u32 id;
+    u32 value;
+    u32 flags;
+}
+
+Pool(Sensor, 8) sensors;
+
+u32 main() {
+    // Allocate multiple via alloc_ptr
+    *Sensor s1 = sensors.alloc_ptr() orelse { return 1; };
+    *Sensor s2 = sensors.alloc_ptr() orelse { return 2; };
+    *Sensor s3 = sensors.alloc_ptr() orelse { return 3; };
+
+    s1.id = 1;
+    s1.value = 100;
+    s1.flags = 0;
+
+    s2.id = 2;
+    s2.value = 200;
+    s2.flags = 1;
+
+    s3.id = 3;
+    s3.value = 300;
+    s3.flags = 2;
+
+    // Verify all values
+    if (s1.id != 1) { return 4; }
+    if (s2.value != 200) { return 5; }
+    if (s3.flags != 2) { return 6; }
+
+    // Modify and verify
+    s1.value = 999;
+    if (s1.value != 999) { return 7; }
+
+    // Free all
+    sensors.free_ptr(s1);
+    sensors.free_ptr(s2);
+    sensors.free_ptr(s3);
+
+    // Reallocate — should reuse freed slots
+    *Sensor s4 = sensors.alloc_ptr() orelse { return 8; };
+    s4.id = 44;
+    if (s4.id != 44) { return 9; }
+    sensors.free_ptr(s4);
+
+    return 0;
+}

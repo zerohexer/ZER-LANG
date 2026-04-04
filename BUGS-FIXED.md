@@ -25,6 +25,17 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### FEATURE: Handle auto-deref (h.field → slab.get(h).field)
+- **What:** `h.id = 1` now works where h is Handle(Task). Compiler auto-inserts gen-checked `.get()` call. Same 100% ABA safety.
+- **Implementation:** Checker NODE_FIELD on TYPE_HANDLE resolves struct field. `Symbol.slab_source` tracks allocator provenance. `find_unique_allocator()` as fallback. Emitter emits `_zer_slab_get` or `_zer_pool_get` wrapper.
+- **Test:** `handle_autoderef.zer`, `handle_autoderef_pool.zer` (E2E)
+
+### FEATURE: alloc_ptr/free_ptr — *Task from Slab/Pool
+- **What:** `*Task t = heap.alloc_ptr()` returns a direct pointer instead of Handle. `heap.free_ptr(t)` frees it. zercheck tracks it at compile time (Level 9) — UAF and double-free caught.
+- **Safety:** 100% compile-time for pure ZER code. Level 2+3+5 runtime backup for C interop boundary.
+- **Implementation:** Checker: new methods on TYPE_SLAB and TYPE_POOL. Emitter: alloc+get combined, `_zer_slab_free_ptr` preamble function. zercheck: `alloc_ptr` recognized as allocation, `free_ptr` as free, NODE_FIELD root ident check for freed status.
+- **Test:** `alloc_ptr.zer`, `alloc_ptr_pool.zer`, `alloc_ptr_mixed.zer` (positive), `alloc_ptr_uaf.zer`, `alloc_ptr_double_free.zer` (negative)
+
 ### FEATURE: goto + labels (forward + backward)
 - **What:** Full goto support with labels. Forward and backward jumps. `NODE_GOTO` + `NODE_LABEL` AST nodes. `TOK_GOTO` keyword + `TOK_COLON` token added to lexer.
 - **Safety:** goto inside defer block → compile error. Label validation: target must exist in same function, no duplicate labels. Both forward and backward safe due to auto-zero + defer.

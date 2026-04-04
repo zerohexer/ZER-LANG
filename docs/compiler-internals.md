@@ -140,6 +140,26 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 **Design:** Both forward and backward goto allowed. Safe because: (1) auto-zero prevents uninitialized memory from skipped declarations, (2) defer fires on all scope exits regardless of goto. The only restriction is no goto inside defer blocks (could cause infinite loops or skip other defers).
 
+### Handle Auto-Deref (`h.field` → `slab.get(h).field`)
+
+**Checker (NODE_FIELD, ~line 2960):** When object type is `TYPE_HANDLE`, unwrap element type, find struct field. Mark as non-storable (same as `.get()` result). Uses `slab_source` provenance on Symbol to know which allocator.
+
+**Slab source tracking:** Set at var-decl init — when Handle is assigned from `pool.alloc()` or `slab.alloc()`, the variable's `Symbol.slab_source` points to the allocator Symbol. Fallback: `find_unique_allocator()` walks scopes to find the ONE Slab/Pool for that element type. Multiple → ambiguous → compile error.
+
+**Emitter (NODE_FIELD, ~line 1290):** When object is Handle, emits `((T*)_zer_slab_get(&slab, h))->field` or equivalent `_zer_pool_get(...)`. Slab/Pool name comes from `slab_source` or `find_unique_allocator()`.
+
+### alloc_ptr / free_ptr — `*T` from Slab/Pool
+
+**Checker:** `alloc_ptr()` returns `?*T` (null sentinel optional pointer). `free_ptr(*T)` takes a pointer. Both on Slab and Pool. Same ISR ban as `slab.alloc()`.
+
+**Emitter:** `alloc_ptr()` emits alloc + get combined — allocates a slot, gets the pointer, returns NULL if allocation fails. `free_ptr()` on Slab uses `_zer_slab_free_ptr()` (linear scan to find slot index from pointer address). On Pool, computes index from pointer arithmetic.
+
+**zercheck (Level 9):** Extended to recognize `alloc_ptr` as allocation source and `free_ptr` as free call. NODE_FIELD checks root ident for freed status — `t.field` after `free_ptr(t)` is caught as UAF at compile time. Same ALIVE/FREED/MAYBE_FREED tracking as Handle.
+
+**Preamble:** `_zer_slab_free_ptr(_zer_slab *s, void *ptr)` — scans all slots to find matching pointer, frees it. Traps if pointer not found (invalid free).
+
+**Design decision:** `*Task` from `alloc_ptr()` is 100% compile-time safe for pure ZER code (zercheck tracks all uses). For C interop boundary (`*opaque` round-trips), Level 2+3+5 runtime backup. Handle remains available for cases requiring gen-check on every access (paranoid mode).
+
 ## Checker (checker.c) — ~1800 lines
 
 ### Key Functions

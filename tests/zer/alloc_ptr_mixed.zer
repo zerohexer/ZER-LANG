@@ -1,0 +1,28 @@
+// Mix Handle and alloc_ptr on same Slab — both work
+
+struct Task {
+    u32 id;
+    u32 priority;
+}
+
+Slab(Task) heap;
+
+u32 main() {
+    // Handle path
+    Handle(Task) h = heap.alloc() orelse { return 1; };
+    h.id = 10;       // auto-deref
+
+    // Pointer path — same slab
+    *Task t = heap.alloc_ptr() orelse { return 2; };
+    t.id = 20;
+
+    // Verify both
+    if (h.id != 10) { return 3; }
+    if (t.id != 20) { return 4; }
+
+    // Free both
+    heap.free(h);
+    heap.free_ptr(t);
+
+    return 0;
+}

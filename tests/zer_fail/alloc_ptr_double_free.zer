@@ -1,0 +1,15 @@
+// alloc_ptr double free — must fail compilation
+
+struct Task {
+    u32 id;
+}
+
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    t.id = 42;
+    heap.free_ptr(t);
+    heap.free_ptr(t);    // DOUBLE FREE — zercheck must catch
+    return 0;
+}

@@ -902,9 +902,11 @@ Pool(Task, 8) tasks;       // 8 slots for Task, global only
 ```
 
 **METHODS**
-- `.alloc()` → `?Handle(T)` — Allocate a slot. Returns null if all slots used.
+- `.alloc()` → `?Handle(T)` — Allocate a slot (Handle). Returns null if all slots used.
+- `.alloc_ptr()` → `?*T` — Allocate a slot (pointer). Returns null if all slots used.
 - `.get(h)` → `*T` — Access by handle. Traps if gen mismatch.
-- `.free(h)` → `void` — Free slot, increment generation.
+- `.free(h)` → `void` — Free slot by handle, increment generation.
+- `.free_ptr(p)` → `void` — Free slot by pointer.
 
 **EXAMPLE**
 ```zer
@@ -953,9 +955,11 @@ Slab(Task) heap;           // global only
 ```
 
 **METHODS**
-- `.alloc()` → `?Handle(T)` — Allocate a slot. Returns null if OOM.
+- `.alloc()` → `?Handle(T)` — Allocate a slot (Handle). Returns null if OOM.
+- `.alloc_ptr()` → `?*T` — Allocate a slot (pointer). Returns null if OOM.
 - `.get(h)` → `*T` — Access by handle. Traps if gen mismatch.
-- `.free(h)` → `void` — Free slot, increment generation.
+- `.free(h)` → `void` — Free slot by handle, increment generation.
+- `.free_ptr(p)` → `void` — Free slot by pointer.
 
 **EXAMPLE**
 ```zer
@@ -1018,11 +1022,12 @@ tasks.free(h);                 // gen incremented
 
 **NOTES**
 - Handle is a value type (u64). Can be copied, stored in structs, passed to functions.
-- Cannot be dereferenced directly. Must use `pool.get(h)` or `slab.get(h)`.
+- **Auto-deref:** `h.field` works — compiler auto-inserts `slab.get(h).field` with gen check. No need to write `.get()` explicitly.
 - `?Handle(T)` is an optional handle — used as return type of `.alloc()`.
+- For direct pointer access without Handle, use `alloc_ptr()` instead.
 
 **SEE ALSO**
-Pool(T,N), Slab(T)
+Pool(T,N), Slab(T), alloc_ptr
 
 ---
 

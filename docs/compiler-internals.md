@@ -138,7 +138,13 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 **Emitter:** `NODE_GOTO` → `goto label;`. `NODE_LABEL` → `label:;` (empty statement after colon for C compliance). Direct pass-through to C — no transformation needed.
 
-**Design:** Both forward and backward goto allowed. Safe because: (1) auto-zero prevents uninitialized memory from skipped declarations, (2) defer fires on all scope exits regardless of goto. The only restriction is no goto inside defer blocks (could cause infinite loops or skip other defers).
+**Design:** Both forward and backward goto allowed. Safe because: (1) auto-zero prevents uninitialized memory from skipped declarations, (2) defer fires before every goto (emitter calls `emit_defers(e)` before `goto label;`). The only restriction is no goto inside defer blocks.
+
+**Audit fixes (2026-04-04):**
+- `collect_labels()` / `validate_gotos()` now recurse into NODE_SWITCH arms, NODE_DEFER body, NODE_CRITICAL body (was missing — labels inside switch arms were invisible).
+- `NODE_GOTO` emitter now calls `emit_defers(e)` before emitting `goto` — defers fire on goto same as return/break/continue.
+
+**Known limitation:** zercheck is linear — backward goto UAF (`free(h); goto retry;` looping back) not caught at compile time. Runtime gen check catches it. Full CFG analysis would require ~500+ lines of refactoring zercheck to work on control-flow graphs instead of linear statement lists.
 
 ### Handle Auto-Deref (`h.field` → `slab.get(h).field`)
 
@@ -159,6 +165,12 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 **Preamble:** `_zer_slab_free_ptr(_zer_slab *s, void *ptr)` — scans all slots to find matching pointer, frees it. Traps if pointer not found (invalid free).
 
 **Design decision:** `*Task` from `alloc_ptr()` is 100% compile-time safe for pure ZER code (zercheck tracks all uses). For C interop boundary (`*opaque` round-trips), Level 2+3+5 runtime backup. Handle remains available for cases requiring gen-check on every access (paranoid mode).
+
+**Audit fixes (2026-04-04):**
+- `free_ptr()` now type-checks argument — `*Motor` to `Task` pool is a compile error. Both Pool and Slab.
+- Handle auto-deref verifies allocator exists at check time. No allocator in scope → compile error (was: emitter silently output `0`).
+- const Handle mutation blocked: `const Handle(Task) h; h.id = 42` → compile error. Checks `c->in_assign_target` + `hsym->is_const` in Handle auto-deref path.
+- Ghost handle check extended to `alloc_ptr()` (was `alloc` only).
 
 ### Handle(T)[N] — Array of Handles
 

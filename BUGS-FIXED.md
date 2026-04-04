@@ -25,6 +25,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+## Session 2026-04-04 — Audit Round: 6 bugs fixed in new features
+
+### BUG: goto/label missed NODE_SWITCH, NODE_DEFER, NODE_CRITICAL
+- **Symptom:** Label inside switch arm → "goto target not found" false error. Goto inside switch arm not validated.
+- **Root cause:** `collect_labels()` and `validate_gotos()` only recursed into NODE_BLOCK, NODE_IF, NODE_FOR, NODE_WHILE. Missing NODE_SWITCH (arm bodies), NODE_DEFER, NODE_CRITICAL.
+- **Fix:** Added recursion into switch arms, defer body, critical body in both functions.
+- **Test:** `goto_switch_label.zer`
+
+### BUG: goto doesn't fire defers before jumping
+- **Symptom:** `defer free(buf); goto skip;` — defer silently skipped. CLAUDE.md claimed "defer fires on all scope exits regardless of goto" but emitter didn't implement it.
+- **Root cause:** `NODE_GOTO` in emitter emitted raw `goto label;` without calling `emit_defers()`. Compare with NODE_RETURN, NODE_BREAK, NODE_CONTINUE which all emit defers.
+- **Fix:** Added `emit_defers(e)` before `goto` emission.
+- **Test:** `goto_defer.zer`
+
+### BUG: free_ptr() doesn't type-check argument
+- **Symptom:** `tasks.free_ptr(motor_ptr)` — Motor* passed to Task pool. No error. Runtime UB (wrong slot calculation).
+- **Root cause:** Checker only validated `arg_count == 1`, not argument type vs pool/slab element type.
+- **Fix:** Added `type_equals` check — arg type must match `type_pointer(elem)`. Error: "pool.free_ptr() expects '*Task', got '*Motor'".
+- **Test:** `free_ptr_wrong_type.zer`
+
+### BUG: Handle auto-deref emits 0 when no allocator in scope
+- **Symptom:** `u32 get_id(Handle(Task) h) { return h.id; }` — no Pool/Slab in scope. Emitter outputs `/* ERROR */ 0`. Compiles in GCC, returns wrong value silently.
+- **Root cause:** Checker accepted Handle auto-deref without verifying an allocator exists. Emitter's fallback was a comment + literal 0.
+- **Fix:** Checker now verifies `find_unique_allocator` or `slab_source` exists before accepting auto-deref. Error: "no Pool or Slab found for Handle(Task) — cannot auto-deref."
+- **Test:** `handle_no_allocator.zer`
+
+### BUG: const Handle allows mutation through auto-deref
+- **Symptom:** `const Handle(Task) h = ...; h.id = 42;` — accepted. Mutates pool slot despite const declaration.
+- **Root cause:** Const-assignment check walked field chain looking for TYPE_POINTER with is_const. Handle auto-deref produces TYPE_HANDLE, not TYPE_POINTER, so const check didn't trigger.
+- **Fix:** Added const Handle check in Handle auto-deref NODE_FIELD path — if `c->in_assign_target` and handle symbol `is_const`, error.
+- **Test:** `const_handle_mutation.zer`
+
+### BUG: Ghost handle check misses alloc_ptr()
+- **Symptom:** `tasks.alloc_ptr();` as bare expression — discarded pointer, slot leaked. No warning.
+- **Root cause:** Ghost handle check at NODE_EXPR_STMT only matched method name `"alloc"` (5 chars). `"alloc_ptr"` (9 chars) not checked.
+- **Fix:** Extended check to match both `alloc` and `alloc_ptr`.
+- **Test:** `ghost_alloc_ptr.zer`
+
+### KNOWN: zercheck doesn't track goto backward UAF (Bug #5)
+- **What:** `free(h); goto retry;` where retry label is before free — zercheck processes linearly, doesn't see that execution loops back to use freed handle.
+- **Status:** Known design limitation. zercheck is linear, not CFG-based. Runtime gen check catches it. Full CFG analysis would be a major refactor (~500+ lines).
+
+---
+
 ### FIX: Handle(T)[N] array syntax not parsing
 - **Symptom:** `Handle(Task)[4] tasks;` → parse error "expected ';' after variable declaration"
 - **Root cause:** Parser returned TYNODE_HANDLE directly without checking for `[N]` array suffix. Array suffix only applied to `parse_base_type()` results, not Handle/Pool/etc.

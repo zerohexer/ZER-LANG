@@ -1,0 +1,11 @@
+// Double free on *opaque
+
+*opaque malloc(usize size);
+void free(*opaque ptr);
+
+u32 main() {
+    *opaque p = malloc(64);
+    free(p);
+    free(p);    // DOUBLE FREE
+    return 0;
+}

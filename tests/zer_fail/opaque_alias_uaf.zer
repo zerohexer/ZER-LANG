@@ -1,0 +1,14 @@
+// Alias UAF — p and q point to same allocation, free p, use q
+
+*opaque malloc(usize size);
+void free(*opaque ptr);
+
+struct Task { u32 id; }
+
+u32 main() {
+    *opaque p = malloc(64);
+    *opaque q = p;
+    free(p);
+    *Task t = @ptrcast(*Task, q);   // UAF — q aliases freed p
+    return 0;
+}

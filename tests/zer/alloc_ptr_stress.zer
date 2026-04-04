@@ -1,0 +1,44 @@
+// Stress test: rapid alloc_ptr + free_ptr cycles
+
+struct Item {
+    u32 id;
+    u32 flags;
+    u32 count;
+}
+
+Slab(Item) store;
+
+u32 main() {
+    // Allocate and free 50 times in a loop
+    for (u32 i = 0; i < 50; i += 1) {
+        *Item it = store.alloc_ptr() orelse { return 1; };
+        it.id = i;
+        it.flags = i * 2;
+        it.count = i * 3;
+
+        if (it.id != i) { return 2; }
+        if (it.flags != i * 2) { return 3; }
+
+        store.free_ptr(it);
+    }
+
+    // Allocate many at once
+    *Item a = store.alloc_ptr() orelse { return 4; };
+    *Item b = store.alloc_ptr() orelse { return 5; };
+    *Item c = store.alloc_ptr() orelse { return 6; };
+
+    a.id = 111;
+    b.id = 222;
+    c.id = 333;
+
+    if (a.id != 111) { return 7; }
+    if (b.id != 222) { return 8; }
+    if (c.id != 333) { return 9; }
+
+    // Free in reverse order
+    store.free_ptr(c);
+    store.free_ptr(b);
+    store.free_ptr(a);
+
+    return 0;
+}

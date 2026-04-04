@@ -1,0 +1,15 @@
+// MAYBE_FREED — conditional free, then use
+
+*opaque malloc(usize size);
+void free(*opaque ptr);
+
+struct Task { u32 id; }
+
+u32 main() {
+    *opaque p = malloc(64);
+    if (true) {
+        free(p);
+    }
+    *Task t = @ptrcast(*Task, p);   // MAYBE_FREED — might have been freed
+    return 0;
+}

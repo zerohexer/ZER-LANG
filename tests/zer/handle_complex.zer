@@ -1,0 +1,52 @@
+// Complex Handle patterns — auto-deref + alloc_ptr mixed with loops and conditionals
+
+struct Node {
+    u32 value;
+    u32 depth;
+}
+
+Slab(Node) heap;
+
+u32 main() {
+    // Allocate multiple via Handle (individual vars — ZER arrays use type[N] name)
+    Handle(Node) n0 = heap.alloc() orelse { return 1; };
+    Handle(Node) n1 = heap.alloc() orelse { return 1; };
+    Handle(Node) n2 = heap.alloc() orelse { return 1; };
+    Handle(Node) n3 = heap.alloc() orelse { return 1; };
+    n0.value = 0;  n0.depth = 0;
+    n1.value = 10; n1.depth = 1;
+    n2.value = 20; n2.depth = 2;
+    n3.value = 30; n3.depth = 3;
+
+    // Verify via auto-deref
+    if (n0.value != 0) { return 2; }
+    if (n1.value != 10) { return 3; }
+    if (n2.value != 20) { return 4; }
+    if (n3.value != 30) { return 5; }
+
+    // Modify
+    n0.value = n0.value + 1;
+    n3.value = n3.value + 1;
+    if (n0.value != 1) { return 6; }
+    if (n3.value != 31) { return 7; }
+
+    // Free all
+    heap.free(n0);
+    heap.free(n1);
+    heap.free(n2);
+    heap.free(n3);
+
+    // alloc_ptr mixed — allocate after freeing
+    *Node p1 = heap.alloc_ptr() orelse { return 8; };
+    *Node p2 = heap.alloc_ptr() orelse { return 9; };
+    p1.value = 100;
+    p2.value = 200;
+
+    if (p1.value != 100) { return 10; }
+    if (p2.value != 200) { return 11; }
+
+    heap.free_ptr(p1);
+    heap.free_ptr(p2);
+
+    return 0;
+}

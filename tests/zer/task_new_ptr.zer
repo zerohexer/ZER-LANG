@@ -1,0 +1,26 @@
+// Task.new_ptr() — returns *Task directly, no Handle
+
+struct Sensor {
+    u32 id;
+    u32 value;
+    u32 flags;
+}
+
+u32 main() {
+    *Sensor s = Sensor.new_ptr() orelse { return 1; };
+    s.id = 1;
+    s.value = 100;
+    s.flags = 0xFF;
+
+    *Sensor s2 = Sensor.new_ptr() orelse { return 2; };
+    s2.id = 2;
+    s2.value = 200;
+
+    if (s.id != 1) { return 3; }
+    if (s.value != 100) { return 4; }
+    if (s2.id != 2) { return 5; }
+
+    Sensor.delete_ptr(s);
+    Sensor.delete_ptr(s2);
+    return 0;
+}

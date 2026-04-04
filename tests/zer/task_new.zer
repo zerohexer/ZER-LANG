@@ -1,0 +1,24 @@
+// Task.new() / Task.delete() — no Slab declaration needed
+
+struct Task {
+    u32 id;
+    u32 priority;
+}
+
+u32 main() {
+    // Handle path — auto-Slab created behind the scenes
+    Handle(Task) t = Task.new() orelse { return 1; };
+    t.id = 42;
+    t.priority = 3;
+
+    Handle(Task) t2 = Task.new() orelse { return 2; };
+    t2.id = 99;
+
+    if (t.id != 42) { return 3; }
+    if (t.priority != 3) { return 4; }
+    if (t2.id != 99) { return 5; }
+
+    Task.delete(t);
+    Task.delete(t2);
+    return 0;
+}

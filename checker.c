@@ -2636,6 +2636,129 @@ static Type *check_expr(Checker *c, Node *node) {
                 break;
             }
 
+            /* Task.new() / Task.delete() — auto-Slab sugar */
+            obj = type_unwrap_distinct(obj);
+            if (obj->kind == TYPE_STRUCT) {
+                if (mlen == 3 && memcmp(mname, "new", 3) == 0) {
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "%.*s.new() takes no arguments",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                    /* find or create auto-Slab for this struct type */
+                    Symbol *auto_sym = NULL;
+                    for (int asi = 0; asi < c->auto_slab_count; asi++) {
+                        if (type_equals(c->auto_slabs[asi].elem_type, obj)) {
+                            auto_sym = c->auto_slabs[asi].slab_sym;
+                            break;
+                        }
+                    }
+                    if (!auto_sym) {
+                        /* create auto-slab symbol in global scope */
+                        char slab_name[128];
+                        int sn_len = snprintf(slab_name, sizeof(slab_name),
+                            "_zer_auto_slab_%.*s",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                        Type *slab_type = (Type *)arena_alloc(c->arena, sizeof(Type));
+                        memset(slab_type, 0, sizeof(Type));
+                        slab_type->kind = TYPE_SLAB;
+                        slab_type->slab.elem = obj;
+                        char *name_copy = (char *)arena_alloc(c->arena, sn_len + 1);
+                        memcpy(name_copy, slab_name, sn_len + 1);
+                        auto_sym = scope_add(c->arena, c->global_scope,
+                            name_copy, (uint32_t)sn_len, slab_type, 0, c->file_name);
+                        /* register in auto_slabs array */
+                        if (c->auto_slab_count >= c->auto_slab_capacity) {
+                            int nc = c->auto_slab_capacity * 2;
+                            if (nc < 8) nc = 8;
+                            void *new_arr = arena_alloc(c->arena, nc * sizeof(c->auto_slabs[0]));
+                            if (c->auto_slab_count > 0)
+                                memcpy(new_arr, c->auto_slabs, c->auto_slab_count * sizeof(c->auto_slabs[0]));
+                            c->auto_slabs = new_arr;
+                            c->auto_slab_capacity = nc;
+                        }
+                        c->auto_slabs[c->auto_slab_count].elem_type = obj;
+                        c->auto_slabs[c->auto_slab_count].slab_sym = auto_sym;
+                        c->auto_slab_count++;
+                    }
+                    /* return ?Handle(T) — same as slab.alloc() */
+                    result = type_optional(c->arena, type_handle(c->arena, obj));
+                    typemap_set(c, field_node, result);
+                    break;
+                }
+                if (mlen == 7 && memcmp(mname, "new_ptr", 7) == 0) {
+                    /* Task.new_ptr() → ?*Task — same as slab.alloc_ptr() */
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "%.*s.new_ptr() takes no arguments",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                    /* find or create auto-slab (same as .new) */
+                    Symbol *auto_sym = NULL;
+                    for (int asi = 0; asi < c->auto_slab_count; asi++) {
+                        if (type_equals(c->auto_slabs[asi].elem_type, obj)) {
+                            auto_sym = c->auto_slabs[asi].slab_sym;
+                            break;
+                        }
+                    }
+                    if (!auto_sym) {
+                        /* same auto-slab creation as .new — reuse when both called */
+                        char slab_name[128];
+                        int sn_len = snprintf(slab_name, sizeof(slab_name),
+                            "_zer_auto_slab_%.*s",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                        Type *slab_type = (Type *)arena_alloc(c->arena, sizeof(Type));
+                        memset(slab_type, 0, sizeof(Type));
+                        slab_type->kind = TYPE_SLAB;
+                        slab_type->slab.elem = obj;
+                        char *name_copy = (char *)arena_alloc(c->arena, sn_len + 1);
+                        memcpy(name_copy, slab_name, sn_len + 1);
+                        auto_sym = scope_add(c->arena, c->global_scope,
+                            name_copy, (uint32_t)sn_len, slab_type, 0, c->file_name);
+                        if (c->auto_slab_count >= c->auto_slab_capacity) {
+                            int nc = c->auto_slab_capacity * 2;
+                            if (nc < 8) nc = 8;
+                            void *new_arr = arena_alloc(c->arena, nc * sizeof(c->auto_slabs[0]));
+                            if (c->auto_slab_count > 0)
+                                memcpy(new_arr, c->auto_slabs, c->auto_slab_count * sizeof(c->auto_slabs[0]));
+                            c->auto_slabs = new_arr;
+                            c->auto_slab_capacity = nc;
+                        }
+                        c->auto_slabs[c->auto_slab_count].elem_type = obj;
+                        c->auto_slabs[c->auto_slab_count].slab_sym = auto_sym;
+                        c->auto_slab_count++;
+                    }
+                    result = type_optional(c->arena, type_pointer(c->arena, obj));
+                    typemap_set(c, field_node, result);
+                    break;
+                }
+                if (mlen == 6 && memcmp(mname, "delete", 6) == 0) {
+                    /* Task.delete(h) → void — same as slab.free(h) */
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "%.*s.delete() takes exactly 1 argument",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                    result = ty_void;
+                    typemap_set(c, field_node, result);
+                    break;
+                }
+                if (mlen == 10 && memcmp(mname, "delete_ptr", 10) == 0) {
+                    /* Task.delete_ptr(p) → void — same as slab.free_ptr(p) */
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "%.*s.delete_ptr() takes exactly 1 argument",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                    if (node->call.arg_count == 1) {
+                        Type *arg_t = check_expr(c, node->call.args[0]);
+                        Type *expected = type_pointer(c->arena, obj);
+                        if (arg_t && !type_equals(type_unwrap_distinct(arg_t), type_unwrap_distinct(expected))) {
+                            checker_error(c, node->loc.line,
+                                "%.*s.delete_ptr() expects '*%.*s', got '%s'",
+                                (int)obj->struct_type.name_len, obj->struct_type.name,
+                                (int)obj->struct_type.name_len, obj->struct_type.name,
+                                type_name(arg_t));
+                        }
+                    }
+                    result = ty_void;
+                    typemap_set(c, field_node, result);
+                    break;
+                }
+            }
+
             /* not a builtin — fall through to normal call resolution */
         }
 

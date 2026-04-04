@@ -1285,6 +1285,55 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         }
 
+        /* Task.new() / Task.delete() — auto-Slab sugar */
+        if (!handled && node->call.callee->kind == NODE_FIELD) {
+            Node *obj_n = node->call.callee->field.object;
+            Type *ot = checker_get_type(e->checker, obj_n);
+            if (ot) ot = type_unwrap_distinct(ot);
+            if (ot && ot->kind == TYPE_STRUCT) {
+                const char *mn = node->call.callee->field.field_name;
+                uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
+                /* find auto-slab name */
+                char asname[128];
+                int aslen = snprintf(asname, sizeof(asname), "_zer_auto_slab_%.*s",
+                    (int)ot->struct_type.name_len, ot->struct_type.name);
+                if (ml == 3 && memcmp(mn, "new", 3) == 0) {
+                    /* Task.new() → slab.alloc() */
+                    int tmp = e->temp_count++;
+                    emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
+                         "_zer_slab_alloc(&%.*s, &_zer_aok%d); "
+                         "(_zer_opt_u64){_zer_ah%d, _zer_aok%d}; })",
+                         tmp, tmp, aslen, asname, tmp, tmp, tmp);
+                    handled = true;
+                } else if (ml == 7 && memcmp(mn, "new_ptr", 7) == 0) {
+                    /* Task.new_ptr() → slab.alloc_ptr() */
+                    int tmp = e->temp_count++;
+                    emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
+                         "_zer_slab_alloc(&%.*s, &_zer_aok%d); ",
+                         tmp, tmp, aslen, asname, tmp);
+                    emit(e, "_zer_aok%d ? (", tmp);
+                    emit_type(e, ot);
+                    emit(e, "*)_zer_slab_get(&%.*s, _zer_ah%d) : (void*)0; })",
+                         aslen, asname, tmp);
+                    handled = true;
+                } else if (ml == 6 && memcmp(mn, "delete", 6) == 0) {
+                    /* Task.delete(h) → slab.free(h) */
+                    emit(e, "_zer_slab_free(&%.*s, ", aslen, asname);
+                    if (node->call.arg_count > 0)
+                        emit_expr(e, node->call.args[0]);
+                    emit(e, ")");
+                    handled = true;
+                } else if (ml == 10 && memcmp(mn, "delete_ptr", 10) == 0) {
+                    /* Task.delete_ptr(p) → slab.free_ptr(p) */
+                    emit(e, "_zer_slab_free_ptr(&%.*s, ", aslen, asname);
+                    if (node->call.arg_count > 0)
+                        emit_expr(e, node->call.args[0]);
+                    emit(e, ")");
+                    handled = true;
+                }
+            }
+        }
+
         if (!handled) {
             /* normal function call */
             emit_expr(e, node->call.callee);
@@ -4058,9 +4107,33 @@ void emit_file(Emitter *e, Node *file_node) {
         }
     }
 
-    /* emit declarations — uses unified emit_top_level_decl (RF2) */
+    /* Pass 1: emit struct/enum/union/typedef declarations first */
     for (int i = 0; i < file_node->file.decl_count; i++) {
-        emit_top_level_decl(e, file_node->file.decls[i], file_node, i);
+        Node *d = file_node->file.decls[i];
+        if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
+            d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF)
+            emit_top_level_decl(e, d, file_node, i);
+    }
+
+    /* emit auto-Slab globals for Task.new() / Task.delete() — after structs, before functions */
+    if (e->checker->auto_slab_count > 0) {
+        emit(e, "\n/* ZER auto-Slab globals (Task.new/delete) */\n");
+        for (int i = 0; i < e->checker->auto_slab_count; i++) {
+            Type *elem = e->checker->auto_slabs[i].elem_type;
+            Symbol *sym = e->checker->auto_slabs[i].slab_sym;
+            emit(e, "static _zer_slab %.*s = {sizeof(", (int)sym->name_len, sym->name);
+            emit_type(e, elem);
+            emit(e, "), 0, 0, 0, 0, 0, 0};\n");
+        }
+        emit(e, "\n");
+    }
+
+    /* Pass 2: emit everything else (functions, globals, etc.) */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
+            d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF)
+            emit_top_level_decl(e, d, file_node, i);
     }
 }
 

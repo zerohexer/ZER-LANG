@@ -70,6 +70,11 @@ typedef struct {
     int mmio_range_count;
     int mmio_range_capacity;
     bool no_strict_mmio;  /* --no-strict-mmio: allow @inttoptr without mmio declarations */
+
+    /* Task.new() auto-slab: auto-created Slab(T) per struct type */
+    struct { Type *elem_type; Symbol *slab_sym; } *auto_slabs;
+    int auto_slab_count;
+    int auto_slab_capacity;
     int target_ptr_bits;  /* target pointer width in bits (default 32 for embedded) */
     uint32_t next_type_id; /* BUG-393: counter for runtime provenance type IDs */
 

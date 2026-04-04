@@ -25,6 +25,25 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### FIX: const Handle allows data mutation (like const fd)
+- **Symptom:** `const Handle(Task) h; h.id = 42;` → compile error "cannot assign to const variable." Also: `if (maybe) |t| { t.id = 42; }` blocked because if-unwrap capture is const.
+- **Root cause:** Assignment checker walked field chain to root ident, found const, blocked ALL writes. Didn't distinguish "modifying the key" from "modifying data through the key."
+- **Fix:** In const-assign walker, set `through_pointer = true` when encountering TYPE_HANDLE in field chain. Same logic as const pointer: `const *Task p; p->id = 1;` is valid (const pointer, mutable pointee). Handle is a key (like file descriptor), const key ≠ const data.
+- **Side effect:** Removed the earlier Handle-specific const check in auto-deref path (was redundant and wrong).
+- **Test:** `const_handle_ok.zer` (positive — const Handle data write), `handle_if_unwrap.zer` (if-unwrap + auto-deref mutation)
+
+### BUG: zercheck doesn't recognize Task.delete() as free
+- **Symptom:** `Task.delete(t); Task.delete(t);` — no double-free error. `Task.delete(t); t.id = 99;` — no UAF error.
+- **Root cause:** `zc_check_call` only matched `pool.free`/`slab.free` on TYPE_POOL/TYPE_SLAB objects. `Task.delete(t)` has TYPE_STRUCT object — skipped entirely.
+- **Fix:** Added TYPE_STRUCT check in `zc_check_call` for `delete`/`delete_ptr` methods. Also added `new`/`new_ptr` recognition in `zc_check_var_init` for alloc tracking.
+- **Test:** `task_delete_double.zer`, `task_delete_uaf.zer` (negative)
+
+### BUG: Task.new() not banned in interrupt handler
+- **Symptom:** `Task.new()` in `interrupt UART { }` compiles without error. Task.new() uses calloc (via Slab) which may deadlock in ISR context.
+- **Root cause:** ISR check only on TYPE_SLAB `alloc`/`alloc_ptr`. Task.new() goes through TYPE_STRUCT path — no `c->in_interrupt` check.
+- **Fix:** Added `c->in_interrupt` check to Task.new() and Task.new_ptr() paths.
+- **Test:** Verified manually.
+
 ### BUG: Auto-slab initializer wrong field order
 - **Symptom:** `Task.new()` crashes at runtime. GCC warns: "initialization of 'char **' from 'long unsigned int'". The auto-slab `sizeof(Task)` value goes into `pages` field instead of `slot_size`.
 - **Root cause:** Auto-slab emission used positional initializer `{sizeof(Task), 0, 0, ...}` but `_zer_slab` struct has `slot_size` as a later field. Normal Slab emission (line 3422) uses `.slot_size = sizeof(...)` — auto-slab didn't follow the same pattern.

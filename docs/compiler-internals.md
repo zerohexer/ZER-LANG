@@ -169,8 +169,10 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 **Audit fixes (2026-04-04):**
 - `free_ptr()` now type-checks argument — `*Motor` to `Task` pool is a compile error. Both Pool and Slab.
 - Handle auto-deref verifies allocator exists at check time. No allocator in scope → compile error (was: emitter silently output `0`).
-- const Handle mutation blocked: `const Handle(Task) h; h.id = 42` → compile error. Checks `c->in_assign_target` + `hsym->is_const` in Handle auto-deref path.
+- const Handle semantics: `const Handle(Task) h; h.id = 42` is ALLOWED. Handle is a key (like const file descriptor), const key ≠ const data. Assignment checker sets `through_pointer = true` when TYPE_HANDLE found in field chain. This also fixes if-unwrap `|t|` + Handle auto-deref (capture is const but data mutation allowed).
 - Ghost handle check extended to `alloc_ptr()` (was `alloc` only).
+- zercheck recognizes `Task.delete()`/`Task.delete_ptr()` as free (TYPE_STRUCT method in `zc_check_call`). `Task.new()`/`Task.new_ptr()` recognized as alloc in `zc_check_var_init`.
+- `Task.new()`/`Task.new_ptr()` banned in interrupt handler (same ISR check as slab.alloc).
 
 ### Handle(T)[N] — Array of Handles
 

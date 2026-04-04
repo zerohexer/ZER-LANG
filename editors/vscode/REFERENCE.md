@@ -1024,6 +1024,8 @@ tasks.free(h);                 // gen incremented
 **NOTES**
 - Handle is a value type (u64). Can be copied, stored in structs, passed to functions.
 - **Auto-deref:** `h.field` works — compiler auto-inserts `slab.get(h).field` with gen check. No need to write `.get()` explicitly.
+- **const Handle:** `const Handle(Task) h` allows data mutation through auto-deref. Handle is a key (like `const int fd`), const key does NOT mean const data. You can't reassign `h`, but you CAN write to `h.field`.
+- **if-unwrap:** `if (maybe) |t| { t.id = 42; }` works — immutable capture `|t|` still allows data mutation through Handle auto-deref.
 - **Arrays:** `Handle(T)[N]` works — array of handles with auto-deref on elements.
 - `?Handle(T)` is an optional handle — used as return type of `.alloc()`.
 - For direct pointer access without Handle, use `alloc_ptr()` instead.

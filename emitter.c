@@ -129,7 +129,7 @@ static void emit_zero_value(Emitter *e, Type *t) {
         if (type_unwrap_distinct(inner->optional.inner)->kind == TYPE_VOID)
             emit(e, "){ 0 }");
         else
-            emit(e, "){ {0} }");
+            emit(e, "){ 0, 0 }");
     } else if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR ||
                (inner->kind == TYPE_OPTIONAL && is_null_sentinel(inner->optional.inner))) {
         emit(e, "NULL");
@@ -980,7 +980,7 @@ static void emit_expr(Emitter *e, Node *node) {
             if (type_unwrap_distinct(tgt_type->optional.inner)->kind == TYPE_VOID)
                 emit(e, "){ 0 }");
             else
-                emit(e, "){ {0} }");
+                emit(e, "){ 0, 0 }");
         } else {
             emit_expr(e, node->assign.value);
         }
@@ -1816,7 +1816,7 @@ static void emit_expr(Emitter *e, Node *node) {
                         if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID)
                             emit(e, "){ 0 }; ");
                         else
-                            emit(e, "){ {0} }; ");
+                            emit(e, "){ 0, 0 }; ");
                     } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                         emit(e, "return 0; ");
                     } else {
@@ -1853,7 +1853,7 @@ static void emit_expr(Emitter *e, Node *node) {
                         if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID)
                             emit(e, "){ 0 }; ");
                         else
-                            emit(e, "){ {0} }; ");
+                            emit(e, "){ 0, 0 }; ");
                     } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                         emit(e, "return 0; ");
                     } else {
@@ -2424,7 +2424,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                     if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID)
                         emit(e, "){ 0 }; }\n");
                     else
-                        emit(e, "){ {0} }; }\n");
+                        emit(e, "){ 0, 0 }; }\n");
                 } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                     emit(e, "return 0; }\n");
                 } else {
@@ -2771,7 +2771,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                 if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID) {
                     emit(e, "){ 0 };\n");
                 } else {
-                    emit(e, "){ {0} };\n");
+                    emit(e, "){ 0, 0 };\n");
                 }
             }
             /* return value from ?T function → return {value, 1} */

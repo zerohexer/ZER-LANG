@@ -5,6 +5,22 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
+
+### BUG-402: comptime func const not recognized in comptime if
+- **Symptom:** `comptime u32 PLATFORM() { return 1; } const u32 P = PLATFORM(); comptime if (P) { ... }` → "comptime if condition must be a compile-time constant."
+- **Root cause:** Two issues: (1) `comptime if` ident lookup required `is_comptime` flag (only set on comptime functions, not const vars). (2) Emitter's `eval_const_expr` saw NODE_IDENT for the condition but checker stored result in `int_lit.value` without changing node kind — emitter didn't see it.
+- **Fix:** (1) Checker relaxed to check `is_const` (not `is_comptime`), also checks `call.is_comptime_resolved` on init expression. (2) Checker now sets `cond->kind = NODE_INT_LIT` so emitter's `eval_const_expr` picks up the resolved value.
+- **Test:** `comptime_const_if.zer` (true/false branch, dead code stripped)
+
+### BUG-403: Optional null init emits `{ {0} }` — GCC warning
+- **Symptom:** `return null` from `?u32` function emits `(_zer_opt_u32){ {0} }`. GCC warns: "braces around scalar initializer." Functionally correct but noisy.
+- **Root cause:** 6 sites in emitter used `){ {0} }` for non-void optional null. The inner `{0}` wraps a scalar `value` field with unnecessary braces.
+- **Fix:** Changed all 6 sites from `){ {0} }` to `){ 0, 0 }` (explicit value=0, has_value=0).
+- **Test:** `optional_null_init.zer` (exercises ?u32 and ?bool null returns + orelse)
+
+---
+
 ## Session 2026-04-05 — Critical Pattern Audit Fixes (BUG-401)
 
 ### BUG-401a: Division guard temps use __auto_type — drops volatile

@@ -4948,11 +4948,18 @@ static void check_stmt(Checker *c, Node *node) {
                     Symbol *cs = scope_lookup(c->current_scope,
                         node->if_stmt.cond->ident.name,
                         (uint32_t)node->if_stmt.cond->ident.name_len);
-                    if (cs && cs->is_const && cs->is_comptime) {
-                        /* comptime bool constant — need the init value */
-                        if (cs->func_node && cs->func_node->kind == NODE_GLOBAL_VAR &&
-                            cs->func_node->var_decl.init)
+                    if (cs && cs->is_const) {
+                        /* const variable — try to resolve init value.
+                         * Covers: const bool X = true, const u32 P = COMPTIME_FUNC() */
+                        if (cs->func_node && cs->func_node->var_decl.init) {
                             cval = eval_const_expr(cs->func_node->var_decl.init);
+                            /* If init is a resolved comptime call, use its value */
+                            if (cval == CONST_EVAL_FAIL &&
+                                cs->func_node->var_decl.init->kind == NODE_CALL &&
+                                cs->func_node->var_decl.init->call.is_comptime_resolved) {
+                                cval = cs->func_node->var_decl.init->call.comptime_value;
+                            }
+                        }
                     }
                 }
             }
@@ -4960,7 +4967,9 @@ static void check_stmt(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "comptime if condition must be a compile-time constant");
             }
-            /* store result for emitter */
+            /* store result for emitter — convert cond to int literal
+             * so eval_const_expr in emitter picks it up */
+            node->if_stmt.cond->kind = NODE_INT_LIT;
             node->if_stmt.cond->int_lit.value = (uint64_t)(cval ? 1 : 0);
             /* only check the taken branch */
             if (cval) {

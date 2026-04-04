@@ -1,0 +1,26 @@
+// comptime function result stored in const → used in comptime if
+// Tests: const from comptime call recognized as compile-time constant
+// Dead branch must be stripped (not type-checked, not emitted)
+
+comptime u32 PLATFORM() { return 1; }
+comptime u32 DEBUG() { return 0; }
+
+const u32 P = PLATFORM();
+const u32 D = DEBUG();
+
+u32 main() {
+    // true branch taken, false branch stripped
+    comptime if (P) {
+        u32 x = 42;
+        if (x != 42) { return 1; }
+    }
+
+    // false branch — dead code not emitted
+    comptime if (D) {
+        // this would fail if emitted — function doesn't exist
+        u32 y = 99;
+        if (y != 99) { return 2; }
+    }
+
+    return 0;
+}

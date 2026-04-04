@@ -1,0 +1,28 @@
+// Optional null return — must emit { 0, 0 } not { {0} }
+// Tests: no GCC "braces around scalar initializer" warning
+
+?u32 find(u32 x) {
+    if (x == 0) { return null; }
+    return x;
+}
+
+?bool check(u32 x) {
+    if (x == 0) { return null; }
+    return x > 10;
+}
+
+u32 main() {
+    // ?u32 orelse
+    u32 a = find(5) orelse 0;
+    if (a != 5) { return 1; }
+    u32 b = find(0) orelse 99;
+    if (b != 99) { return 2; }
+
+    // ?bool orelse
+    bool c = check(20) orelse { return 3; };
+    if (!c) { return 4; }
+    bool d = check(0) orelse false;
+    if (d) { return 5; }
+
+    return 0;
+}

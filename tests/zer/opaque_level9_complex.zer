@@ -1,0 +1,63 @@
+// Level 9: alloc_ptr full lifecycle — no conditional frees
+// Tests: alloc_ptr, struct field chain, compound assign, Task.new_ptr,
+// Handle + alloc_ptr mixed in same pool
+
+struct Connection {
+    u32 fd;
+    u32 rx_count;
+    u32 tx_count;
+    bool connected;
+}
+
+struct Worker {
+    u32 id;
+    u32 jobs_done;
+    bool busy;
+}
+
+Slab(Connection) conn_pool;
+
+u32 test_alloc_ptr() {
+    *Connection c = conn_pool.alloc_ptr() orelse { return 1; };
+    c.fd = 80;
+    c.rx_count = 0;
+    c.tx_count = 0;
+    c.connected = true;
+    c.rx_count += 10;
+    c.tx_count += 5;
+    conn_pool.free_ptr(c);
+    return 0;
+}
+
+u32 test_task_new_ptr() {
+    *Worker w = Worker.new_ptr() orelse { return 1; };
+    w.id = 1;
+    w.jobs_done = 0;
+    w.busy = true;
+    w.jobs_done += 1;
+    w.jobs_done += 1;
+    w.jobs_done += 1;
+    Worker.delete_ptr(w);
+    return 0;
+}
+
+u32 test_mixed() {
+    // Handle and alloc_ptr from same Slab
+    Handle(Connection) h = conn_pool.alloc() orelse { return 1; };
+    h.fd = 8080;
+    h.connected = true;
+    conn_pool.free(h);
+
+    *Connection c = conn_pool.alloc_ptr() orelse { return 2; };
+    c.fd = 9090;
+    c.rx_count = 42;
+    conn_pool.free_ptr(c);
+    return 0;
+}
+
+u32 main() {
+    if (test_alloc_ptr() != 0) { return 1; }
+    if (test_task_new_ptr() != 0) { return 2; }
+    if (test_mixed() != 0) { return 3; }
+    return 0;
+}

@@ -1,0 +1,41 @@
+// Level 1: zercheck compile-time tracking — Slab alloc_ptr lifecycle
+// Exercises: alloc, field access, free, reuse after free
+
+struct Sensor { u32 value; u32 calibration; }
+struct Motor { u32 speed; }
+
+Slab(Sensor) sensor_pool;
+Slab(Motor) motor_pool;
+
+u32 test_sensor() {
+    *Sensor s = sensor_pool.alloc_ptr() orelse { return 1; };
+    s.value = 100;
+    s.calibration = 42;
+    sensor_pool.free_ptr(s);
+    return 0;
+}
+
+u32 test_motor() {
+    *Motor m = motor_pool.alloc_ptr() orelse { return 1; };
+    m.speed = 5000;
+    motor_pool.free_ptr(m);
+    return 0;
+}
+
+u32 test_reuse() {
+    *Sensor s = sensor_pool.alloc_ptr() orelse { return 1; };
+    s.value = 1;
+    sensor_pool.free_ptr(s);
+    // Realloc — pool slot reused
+    *Sensor s2 = sensor_pool.alloc_ptr() orelse { return 2; };
+    s2.value = 2;
+    sensor_pool.free_ptr(s2);
+    return 0;
+}
+
+u32 main() {
+    if (test_sensor() != 0) { return 1; }
+    if (test_motor() != 0) { return 2; }
+    if (test_reuse() != 0) { return 3; }
+    return 0;
+}

@@ -1,0 +1,84 @@
+// *opaque interaction: Handle auto-deref, if-unwrap, orelse,
+// comptime, for loop alloc/free cycle, goto cleanup
+
+struct Task { u32 id; u32 priority; }
+struct Config { u32 max_tasks; }
+
+Slab(Task) task_heap;
+Pool(Config, 4) cfg_pool;
+
+comptime u32 DEFAULT_PRIORITY() { return 5; }
+
+u32 run_task(*Task t) {
+    return t.id + t.priority;
+}
+
+u32 test_comptime_handle() {
+    Handle(Config) cfg = cfg_pool.alloc() orelse { return 1; };
+    cfg.max_tasks = DEFAULT_PRIORITY() + 5;
+    cfg_pool.free(cfg);
+    return 0;
+}
+
+u32 test_alloc_ptr_func() {
+    *Task t = task_heap.alloc_ptr() orelse { return 1; };
+    t.id = 1;
+    t.priority = DEFAULT_PRIORITY();
+    u32 r = run_task(t);
+    task_heap.free_ptr(t);
+    return 0;
+}
+
+u32 test_handle_deref() {
+    Handle(Task) h = task_heap.alloc() orelse { return 1; };
+    h.id = 2;
+    h.priority = 10;
+    task_heap.free(h);
+    return 0;
+}
+
+u32 test_if_unwrap() {
+    ?Handle(Task) maybe = task_heap.alloc();
+    if (maybe) |t| {
+        t.id = 3;
+        t.priority = 15;
+        task_heap.free(t);
+    }
+    return 0;
+}
+
+u32 test_loop_alloc_free() {
+    u32 sum = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        *Task tmp = task_heap.alloc_ptr() orelse { return 1; };
+        tmp.id = i;
+        tmp.priority = 1;
+        sum += run_task(tmp);
+        task_heap.free_ptr(tmp);
+    }
+    // sum = (0+1)+(1+1)+(2+1)+(3+1)+(4+1) = 1+2+3+4+5 = 15
+    if (sum != 15) { return 2; }
+    return 0;
+}
+
+u32 test_goto_cleanup() {
+    *Task t = task_heap.alloc_ptr() orelse { return 1; };
+    t.id = 42;
+    t.priority = 7;
+    if (t.id + t.priority == 49) {
+        goto done;
+    }
+    done:
+        task_heap.free_ptr(t);
+        return 0;
+}
+
+u32 main() {
+    if (test_comptime_handle() != 0) { return 1; }
+    if (test_alloc_ptr_func() != 0) { return 2; }
+    if (test_handle_deref() != 0) { return 3; }
+    if (test_if_unwrap() != 0) { return 4; }
+    if (test_loop_alloc_free() != 0) { return 5; }
+    if (test_goto_cleanup() != 0) { return 6; }
+    return 0;
+}

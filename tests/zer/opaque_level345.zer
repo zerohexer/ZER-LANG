@@ -1,0 +1,49 @@
+// Level 3+4+5: alloc_ptr with runtime tracking (--track-cptrs active)
+// Multiple allocs from same pool, struct field access, compound assign
+
+struct Packet { u32 id; u32 payload; u32 checksum; }
+struct Header { u32 magic; u32 version; }
+
+Slab(Packet) pkt_pool;
+Slab(Header) hdr_pool;
+
+u32 test_packet() {
+    *Packet p = pkt_pool.alloc_ptr() orelse { return 1; };
+    p.id = 1;
+    p.payload = 0xBEEF;
+    p.checksum = p.id + p.payload;
+    pkt_pool.free_ptr(p);
+    return 0;
+}
+
+u32 test_multi_header() {
+    *Header a = hdr_pool.alloc_ptr() orelse { return 1; };
+    a.magic = 0xDEAD;
+    a.version = 1;
+    hdr_pool.free_ptr(a);
+
+    *Header b = hdr_pool.alloc_ptr() orelse { return 2; };
+    b.magic = 0xBEEF;
+    b.version = 2;
+    hdr_pool.free_ptr(b);
+    return 0;
+}
+
+u32 test_compound() {
+    *Packet p = pkt_pool.alloc_ptr() orelse { return 1; };
+    p.id = 0;
+    p.payload = 0;
+    p.checksum = 0;
+    p.id += 1;
+    p.payload += 100;
+    p.checksum += p.id + p.payload;
+    pkt_pool.free_ptr(p);
+    return 0;
+}
+
+u32 main() {
+    if (test_packet() != 0) { return 1; }
+    if (test_multi_header() != 0) { return 2; }
+    if (test_compound() != 0) { return 3; }
+    return 0;
+}

@@ -1,0 +1,11 @@
+// Task.delete_ptr UAF — use after delete_ptr
+
+struct Worker { u32 id; }
+
+u32 main() {
+    *Worker w = Worker.new_ptr() orelse { return 1; };
+    w.id = 42;
+    Worker.delete_ptr(w);
+    w.id = 99;    // UAF — w freed by Task.delete_ptr
+    return 0;
+}

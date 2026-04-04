@@ -1,0 +1,35 @@
+// Level 9b: cross-function free tracking — safe patterns only
+
+struct Resource { u32 handle; u32 flags; }
+Slab(Resource) res_pool;
+
+void release(*Resource r) {
+    res_pool.free_ptr(r);
+}
+
+u32 test_cross_func() {
+    *Resource r = res_pool.alloc_ptr() orelse { return 1; };
+    r.handle = 42;
+    r.flags = 0xFF;
+    release(r);
+    // r is FREED here — zercheck knows via cross-func summary
+    return 0;
+}
+
+u32 test_reuse_after_release() {
+    *Resource r = res_pool.alloc_ptr() orelse { return 1; };
+    r.handle = 99;
+    res_pool.free_ptr(r);
+
+    // Pool can be reused
+    *Resource r2 = res_pool.alloc_ptr() orelse { return 2; };
+    r2.handle = 100;
+    res_pool.free_ptr(r2);
+    return 0;
+}
+
+u32 main() {
+    if (test_cross_func() != 0) { return 1; }
+    if (test_reuse_after_release() != 0) { return 2; }
+    return 0;
+}

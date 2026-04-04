@@ -2576,7 +2576,11 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (eff_local && (eff_local->kind == TYPE_STRUCT || eff_local->kind == TYPE_ARRAY ||
                          eff_local->kind == TYPE_OPTIONAL || eff_local->kind == TYPE_UNION ||
                          eff_local->kind == TYPE_ARENA || eff_local->kind == TYPE_SLICE)) {
-                emit(e, " = {0}");
+                /* BUG-411: empty struct {0} warns — use {} for zero-field structs */
+                if (eff_local->kind == TYPE_STRUCT && eff_local->struct_type.field_count == 0)
+                    emit(e, " = {}");
+                else
+                    emit(e, " = {0}");
             } else {
                 emit(e, " = 0");
             }
@@ -3526,7 +3530,11 @@ static void emit_global_var(Emitter *e, Node *node) {
         if (eff_type && (eff_type->kind == TYPE_STRUCT || eff_type->kind == TYPE_ARRAY ||
                      eff_type->kind == TYPE_OPTIONAL || eff_type->kind == TYPE_UNION ||
                      eff_type->kind == TYPE_SLICE)) {
-            emit(e, " = {0}");
+            /* BUG-411: empty struct {0} warns — use {} for zero-field structs */
+            if (eff_type->kind == TYPE_STRUCT && eff_type->struct_type.field_count == 0)
+                emit(e, " = {}");
+            else
+                emit(e, " = {0}");
         } else {
             emit(e, " = 0");
         }

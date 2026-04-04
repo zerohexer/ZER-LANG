@@ -1214,7 +1214,8 @@ static void emit_expr(Emitter *e, Node *node) {
                         if (node->call.arg_count > 0) {
                             int tmp = e->temp_count++;
                             Type *arg_type = checker_get_type(e->checker,node->call.args[0]);
-                            if (arg_type && arg_type->kind == TYPE_SLICE) {
+                            Type *arg_eff = arg_type ? type_unwrap_distinct(arg_type) : NULL;
+                            if (arg_eff && arg_eff->kind == TYPE_SLICE) {
                                 emit(e, "({ __auto_type _zer_ao%d = ", tmp);
                                 emit_expr(e, node->call.args[0]);
                                 emit(e, "; (_zer_arena){ (uint8_t*)_zer_ao%d.ptr, _zer_ao%d.len, 0 }; })", tmp, tmp);
@@ -1353,7 +1354,8 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* unwrap distinct for callee type */
                 Type *eff_callee = type_unwrap_distinct(callee_type);
                 /* slice→pointer decay: emit .ptr when passing []T to *T */
-                Type *arg_type = checker_get_type(e->checker,node->call.args[i]);
+                Type *arg_type_raw = checker_get_type(e->checker,node->call.args[i]);
+                Type *arg_type = arg_type_raw ? type_unwrap_distinct(arg_type_raw) : NULL;
                 bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
                     eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
                     (uint32_t)i < eff_callee->func_ptr.param_count &&
@@ -1467,7 +1469,8 @@ static void emit_expr(Emitter *e, Node *node) {
         /* Value range propagation: if bounds proven safe, skip check entirely */
         if (checker_is_proven(e->checker, node)) {
             Type *proven_obj_type = checker_get_type(e->checker, node->index_expr.object);
-            if (proven_obj_type && proven_obj_type->kind == TYPE_SLICE) {
+            Type *proven_eff = proven_obj_type ? type_unwrap_distinct(proven_obj_type) : NULL;
+            if (proven_eff && proven_eff->kind == TYPE_SLICE) {
                 emit_expr(e, node->index_expr.object);
                 emit(e, ".ptr[");
                 emit_expr(e, node->index_expr.index);
@@ -1486,7 +1489,9 @@ static void emit_expr(Emitter *e, Node *node) {
          * Comma operator preserves lvalue (array decays to pointer).
          * Inline check respects short-circuit (&&/||) and works in
          * if/while/for conditions — fixes both hoisting and missing-check bugs. */
-        Type *idx_obj_type = checker_get_type(e->checker,node->index_expr.object);
+        Type *idx_obj_type_raw = checker_get_type(e->checker,node->index_expr.object);
+        /* BUG-410: unwrap distinct for array/slice/pointer index dispatch */
+        Type *idx_obj_type = idx_obj_type_raw ? type_unwrap_distinct(idx_obj_type_raw) : NULL;
         /* Check if index or object has side effects — needs single-eval.
          * Simple expressions (ident, literal) can safely double-evaluate. */
         /* detect index expressions with side effects or volatile reads.
@@ -1569,7 +1574,9 @@ static void emit_expr(Emitter *e, Node *node) {
     case NODE_SLICE: {
         /* Bit extraction: reg[high..low] on integer → (reg >> low) & mask
          * Array slicing: buf[start..end] → slice struct */
-        Type *obj_type = checker_get_type(e->checker,node->slice.object);
+        Type *obj_type_raw = checker_get_type(e->checker,node->slice.object);
+        /* BUG-410: unwrap distinct for slice/array/integer dispatch */
+        Type *obj_type = obj_type_raw ? type_unwrap_distinct(obj_type_raw) : NULL;
         if (obj_type && type_is_integer(obj_type) &&
             node->slice.start && node->slice.end) {
             /* bit extraction: expr[high..low] → ((unsigned)expr >> low) & mask
@@ -2245,7 +2252,8 @@ static void emit_expr(Emitter *e, Node *node) {
             int tmp = e->temp_count++;
             Type *buf_type = (node->intrinsic.arg_count > 0) ?
                 checker_get_type(e->checker,node->intrinsic.args[0]) : NULL;
-            bool dest_is_slice = buf_type && buf_type->kind == TYPE_SLICE;
+            Type *buf_eff = buf_type ? type_unwrap_distinct(buf_type) : NULL;
+            bool dest_is_slice = buf_eff && buf_eff->kind == TYPE_SLICE;
             /* BUG-223/RF7: check if destination is volatile — walk field/index chains */
             /* RF11: use shared volatile detection helper */
             /* BUG-384: also check source volatility — memcpy strips volatile reads */
@@ -2452,7 +2460,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                 /* ?void has no .value — keep as ?void (has_value only) */
                 emit(e, "_zer_opt_void %.*s = _zer_or%d;\n",
                      (int)node->var_decl.name_len, node->var_decl.name, tmp);
-            } else if (type && type->kind == TYPE_SLICE) {
+            } else if (type && type_unwrap_distinct(type)->kind == TYPE_SLICE) {
                 /* slice: use __auto_type to avoid anonymous struct incompatibility */
                 emit(e, "__auto_type %.*s = _zer_or%d.value;\n",
                      (int)node->var_decl.name_len, node->var_decl.name, tmp);
@@ -2529,8 +2537,8 @@ static void emit_stmt(Emitter *e, Node *node) {
             } else {
                 /* array→slice coercion at var-decl */
                 Type *init_type = checker_get_type(e->checker,node->var_decl.init);
-                if (type && type->kind == TYPE_SLICE &&
-                    init_type && init_type->kind == TYPE_ARRAY) {
+                if (type && type_unwrap_distinct(type)->kind == TYPE_SLICE &&
+                    init_type && type_unwrap_distinct(init_type)->kind == TYPE_ARRAY) {
                     emit(e, " = ");
                     emit_array_as_slice(e, node->var_decl.init, init_type, type);
                 } else if (type && type->kind == TYPE_ARRAY &&
@@ -2830,8 +2838,8 @@ static void emit_stmt(Emitter *e, Node *node) {
             } else {
                 /* array→slice coercion on return */
                 Type *expr_type = checker_get_type(e->checker,node->ret.expr);
-                if (e->current_func_ret && e->current_func_ret->kind == TYPE_SLICE &&
-                    expr_type && expr_type->kind == TYPE_ARRAY) {
+                if (ret_eff && ret_eff->kind == TYPE_SLICE &&
+                    expr_type && type_unwrap_distinct(expr_type)->kind == TYPE_ARRAY) {
                     emit(e, "return ");
                     emit_array_as_slice(e, node->ret.expr, expr_type, e->current_func_ret);
                     emit(e, ";\n");

@@ -7,6 +7,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-410 (cont): Distinct slice/array — indexing, sub-slice, emitter dispatch
+- **Symptom:** `distinct typedef const [*]u8 Text; msg[0]` → "cannot index type." `msg[1..]` → "cannot slice type." Various emitter sites produced wrong C for distinct slice/array.
+- **Root cause:** Checker NODE_INDEX and NODE_SLICE didn't unwrap distinct on `obj`. Emitter had 10+ sites checking `->kind == TYPE_SLICE` or `->kind == TYPE_ARRAY` without unwrapping: proven index, bounds check, sub-slice, call-site decay, Arena.over(), @cstr dest, var-decl orelse, array→slice coercion, return coercion.
+- **Fix:** Checker: unwrap distinct at entry of NODE_INDEX and NODE_SLICE. Emitter: unwrap at 10 sites for TYPE_SLICE dispatch.
+- **Test:** `distinct_slice_ops.zer` (indexing, .len, sub-slice on distinct const [*]u8)
+
 ### BUG-410: Distinct typedef — deref, field access, pointer auto-deref
 - **Symptom:** `distinct typedef *u32 SafePtr; *p` → "cannot dereference non-pointer." `distinct typedef Point Vec2; v.x` → "no field 'x'." `distinct typedef *Motor SM; sm.speed` → GCC "is a pointer, use ->."
 - **Root cause:** Checker deref (TOK_STAR) checked `operand->kind != TYPE_POINTER` without unwrapping distinct. NODE_FIELD didn't unwrap distinct on `obj` before struct/slice/pointer dispatch. Emitter NODE_FIELD used `obj_type->kind == TYPE_POINTER` for `->` emission without unwrapping.

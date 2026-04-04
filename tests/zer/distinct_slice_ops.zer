@@ -1,0 +1,27 @@
+// Distinct typedef wrapping slice — indexing, .len, .ptr, sub-slice
+// BUG-410: emitter NODE_INDEX, NODE_SLICE, call-site decay all need unwrap
+
+distinct typedef const [*]u8 Text;
+
+u32 get_len(Text t) {
+    return @truncate(u32, t.len);
+}
+
+u32 main() {
+    Text msg = @cast(Text, "hello");
+
+    // .len access
+    u32 len = get_len(msg);
+    if (len != 5) { return 1; }
+
+    // indexing
+    u8 first = msg[0];
+    if (first != 104) { return 2; }
+
+    // sub-slice
+    Text sub = @cast(Text, msg[1..]);
+    u32 sub_len = get_len(sub);
+    if (sub_len != 4) { return 3; }
+
+    return 0;
+}

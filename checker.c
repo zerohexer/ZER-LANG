@@ -3502,7 +3502,9 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Index ---- */
     case NODE_INDEX: {
-        Type *obj = check_expr(c, node->index_expr.object);
+        Type *obj_raw = check_expr(c, node->index_expr.object);
+        /* BUG-410: unwrap distinct for array/slice/pointer index dispatch */
+        Type *obj = type_unwrap_distinct(obj_raw);
         Type *idx = check_expr(c, node->index_expr.index);
 
         if (!type_is_integer(idx)) {
@@ -3635,7 +3637,9 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Slice ---- */
     case NODE_SLICE: {
-        Type *obj = check_expr(c, node->slice.object);
+        Type *obj_raw = check_expr(c, node->slice.object);
+        /* BUG-410: unwrap distinct for slice/array/integer dispatch */
+        Type *obj = type_unwrap_distinct(obj_raw);
         if (node->slice.start) {
             Type *start = check_expr(c, node->slice.start);
             if (!type_is_integer(start)) {

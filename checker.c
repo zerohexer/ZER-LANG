@@ -5691,6 +5691,17 @@ static void check_stmt(Checker *c, Node *node) {
         }
         break;
 
+    case NODE_GOTO:
+        /* goto target label validation done in check_function_body (post-pass) */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line, "cannot use 'goto' inside defer block");
+        }
+        break;
+
+    case NODE_LABEL:
+        /* labels are just markers — no type checking needed */
+        break;
+
     case NODE_CONTINUE:
         if (c->defer_depth > 0) {
             checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
@@ -6115,6 +6126,83 @@ static void register_decl(Checker *c, Node *node) {
 }
 
 /* ================================================================
+ * GOTO / LABEL VALIDATION
+ * ================================================================ */
+
+/* Collect all labels in a function body, then validate all gotos have targets */
+typedef struct { const char *name; size_t len; int line; } LabelInfo;
+
+static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
+    if (!node) return;
+    if (node->kind == NODE_LABEL && *count < max) {
+        labels[*count].name = node->label_stmt.name;
+        labels[*count].len = node->label_stmt.name_len;
+        labels[*count].line = node->loc.line;
+        (*count)++;
+    }
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++)
+            collect_labels(node->block.stmts[i], labels, count, max);
+    }
+    if (node->kind == NODE_IF) {
+        collect_labels(node->if_stmt.then_body, labels, count, max);
+        collect_labels(node->if_stmt.else_body, labels, count, max);
+    }
+    if (node->kind == NODE_FOR) collect_labels(node->for_stmt.body, labels, count, max);
+    if (node->kind == NODE_WHILE) collect_labels(node->while_stmt.body, labels, count, max);
+}
+
+static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_count) {
+    if (!node) return;
+    if (node->kind == NODE_GOTO) {
+        bool found = false;
+        for (int i = 0; i < label_count; i++) {
+            if (labels[i].len == node->goto_stmt.label_len &&
+                memcmp(labels[i].name, node->goto_stmt.label, labels[i].len) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            checker_error(c, node->loc.line,
+                "goto target '%.*s' not found in this function",
+                (int)node->goto_stmt.label_len, node->goto_stmt.label);
+        }
+    }
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++)
+            validate_gotos(c, node->block.stmts[i], labels, label_count);
+    }
+    if (node->kind == NODE_IF) {
+        validate_gotos(c, node->if_stmt.then_body, labels, label_count);
+        validate_gotos(c, node->if_stmt.else_body, labels, label_count);
+    }
+    if (node->kind == NODE_FOR) validate_gotos(c, node->for_stmt.body, labels, label_count);
+    if (node->kind == NODE_WHILE) validate_gotos(c, node->while_stmt.body, labels, label_count);
+}
+
+static void check_goto_labels(Checker *c, Node *func_body) {
+    LabelInfo labels[128];
+    int label_count = 0;
+    collect_labels(func_body, labels, &label_count, 128);
+
+    /* Check for duplicate labels */
+    for (int i = 0; i < label_count; i++) {
+        for (int j = i + 1; j < label_count; j++) {
+            if (labels[i].len == labels[j].len &&
+                memcmp(labels[i].name, labels[j].name, labels[i].len) == 0) {
+                checker_error(c, labels[j].line,
+                    "duplicate label '%.*s' (first defined at line %d)",
+                    (int)labels[j].len, labels[j].name, labels[i].line);
+            }
+        }
+    }
+
+    /* Validate all gotos have matching labels */
+    validate_gotos(c, func_body, labels, label_count);
+}
+
+/* ================================================================
  * TOP-LEVEL FUNCTION BODY CHECKING (Pass 2)
  * ================================================================ */
 
@@ -6311,6 +6399,9 @@ static void check_func_body(Checker *c, Node *node) {
                 }
             }
         }
+
+        /* Validate goto targets and duplicate labels */
+        check_goto_labels(c, node->func_decl.body);
 
         pop_scope(c);
         c->current_func_ret = NULL;

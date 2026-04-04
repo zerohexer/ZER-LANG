@@ -157,6 +157,8 @@ typedef enum {
     NODE_BREAK,             /* break; */
     NODE_CONTINUE,          /* continue; */
     NODE_DEFER,             /* defer stmt; */
+    NODE_GOTO,              /* goto label; */
+    NODE_LABEL,             /* label: */
     NODE_EXPR_STMT,         /* expression as statement: foo(); */
     NODE_ASM,               /* asm("nop"); or extended asm */
     NODE_CRITICAL,          /* @critical { body } — interrupt-disabled block */
@@ -379,6 +381,12 @@ struct Node {
 
         /* NODE_DEFER: defer stmt; or defer { block } */
         struct { Node *body; } defer;
+
+        /* NODE_GOTO: goto label; */
+        struct { const char *label; size_t label_len; } goto_stmt;
+
+        /* NODE_LABEL: label: */
+        struct { const char *name; size_t name_len; } label_stmt;
 
         /* NODE_EXPR_STMT: expression used as statement */
         struct { Node *expr; } expr_stmt;

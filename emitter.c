@@ -2662,6 +2662,15 @@ static void emit_stmt(Emitter *e, Node *node) {
         }
         break;
 
+    case NODE_GOTO:
+        emit_indent(e);
+        emit(e, "goto %.*s;\n", (int)node->goto_stmt.label_len, node->goto_stmt.label);
+        break;
+
+    case NODE_LABEL:
+        emit(e, "%.*s:;\n", (int)node->label_stmt.name_len, node->label_stmt.name);
+        break;
+
     case NODE_BREAK:
         emit_defers_from(e, e->loop_defer_base); /* defers in loop scope only */
         emit_indent(e);

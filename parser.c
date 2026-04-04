@@ -1200,6 +1200,43 @@ static Node *parse_statement(Parser *p) {
         return n;
     }
 
+    /* goto label; */
+    if (match(p, TOK_GOTO)) {
+        Node *n = new_node(p, NODE_GOTO);
+        if (check(p, TOK_IDENT)) {
+            n->goto_stmt.label = p->current.start;
+            n->goto_stmt.label_len = p->current.length;
+            advance(p);
+        } else {
+            error(p, "expected label name after 'goto'");
+        }
+        consume(p, TOK_SEMICOLON, "expected ';' after goto");
+        return n;
+    }
+
+    /* label: (identifier followed by colon at statement position) */
+    if (check(p, TOK_IDENT) && p->current.length > 0) {
+        /* peek ahead for colon */
+        Scanner saved_scanner = *p->scanner;
+        Token saved_cur = p->current;
+        Token saved_prev = p->previous;
+        bool saved_panic = p->panic_mode;
+        advance(p);
+        if (check(p, TOK_COLON)) {
+            /* it's a label */
+            advance(p); /* consume colon */
+            Node *n = new_node(p, NODE_LABEL);
+            n->label_stmt.name = saved_cur.start;
+            n->label_stmt.name_len = saved_cur.length;
+            return n;
+        }
+        /* not a label — restore and fall through */
+        *p->scanner = saved_scanner;
+        p->current = saved_cur;
+        p->previous = saved_prev;
+        p->panic_mode = saved_panic;
+    }
+
     /* break */
     if (match(p, TOK_BREAK)) {
         Node *n = new_node(p, NODE_BREAK);

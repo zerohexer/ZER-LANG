@@ -1,0 +1,6 @@
+// goto to nonexistent label — must fail compilation
+
+u32 main() {
+    goto nowhere;
+    return 0;
+}

@@ -162,6 +162,9 @@ static TokenType check_keyword(const char *word, size_t word_len) {
         if (word_len == 7 && memcmp(word+1, "efault", 6) == 0) return TOK_DEFAULT;
         if (word_len == 8 && memcmp(word+1, "istinct", 7) == 0) return TOK_DISTINCT;
         break;
+    case 'g':
+        if (word_len == 4 && memcmp(word+1, "oto", 3) == 0) return TOK_GOTO;
+        break;
     case 'e':
         if (word_len == 4 && memcmp(word+1, "lse", 3) == 0) return TOK_ELSE;
         if (word_len == 4 && memcmp(word+1, "num", 3) == 0) return TOK_ENUM;
@@ -431,6 +434,7 @@ Token next_token(Scanner *s) {
     case '[': return make_token(s, TOK_LBRACKET, start);
     case ']': return make_token(s, TOK_RBRACKET, start);
     case ';': return make_token(s, TOK_SEMICOLON, start);
+    case ':': return make_token(s, TOK_COLON, start);
     case ',': return make_token(s, TOK_COMMA, start);
     case '~': return make_token(s, TOK_TILDE, start);
     case '@': return make_token(s, TOK_AT, start);
@@ -550,6 +554,7 @@ const char *token_type_name(TokenType type) {
     case TOK_BREAK: return "break";
     case TOK_CONTINUE: return "continue";
     case TOK_RETURN: return "return";
+    case TOK_GOTO: return "goto";
     case TOK_DEFAULT: return "default";
     case TOK_ORELSE: return "orelse";
     case TOK_NULL: return "null";
@@ -583,6 +588,7 @@ const char *token_type_name(TokenType type) {
     case TOK_LBRACKET: return "[";
     case TOK_RBRACKET: return "]";
     case TOK_SEMICOLON: return ";";
+    case TOK_COLON: return ":";
     case TOK_COMMA: return ",";
     case TOK_TILDE: return "~";
     case TOK_AT: return "@";

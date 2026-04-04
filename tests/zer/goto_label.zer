@@ -1,0 +1,48 @@
+// goto + label — forward and backward jumps
+
+u32 main() {
+    u32 result = 0;
+
+    // Test 1: forward goto (skip code)
+    goto skip;
+    result = 999;
+skip:
+    if (result != 0) { return 1; }
+
+    // Test 2: backward goto (retry loop)
+    u32 count = 0;
+retry:
+    count += 1;
+    if (count < 5) { goto retry; }
+    if (count != 5) { return 2; }
+
+    // Test 3: forward goto out of nested loop
+    u32 found = 0;
+    for (u32 i = 0; i < 10; i += 1) {
+        for (u32 j = 0; j < 10; j += 1) {
+            if (i == 3) {
+                found = 1;
+                goto done;
+            }
+        }
+    }
+done:
+    if (found != 1) { return 3; }
+
+    // Test 4: error path cleanup pattern
+    u32 step = 0;
+    step = 1;
+    if (step == 0) { goto fail; }
+    step = 2;
+    if (step == 0) { goto fail; }
+    step = 3;
+    goto success;
+
+fail:
+    return 4;
+
+success:
+    if (step != 3) { return 5; }
+
+    return 0;
+}

@@ -22,7 +22,7 @@ typedef enum {
 
     /* === Control flow === */
     TOK_IF, TOK_ELSE, TOK_FOR, TOK_WHILE,
-    TOK_SWITCH, TOK_BREAK, TOK_CONTINUE, TOK_RETURN,
+    TOK_SWITCH, TOK_BREAK, TOK_CONTINUE, TOK_RETURN, TOK_GOTO,
     TOK_DEFAULT,
 
     /* === Error handling === */
@@ -53,6 +53,7 @@ typedef enum {
     TOK_LBRACKET,       /* [ */
     TOK_RBRACKET,       /* ] */
     TOK_SEMICOLON,      /* ; */
+    TOK_COLON,          /* : */
     TOK_COMMA,          /* , */
     TOK_TILDE,          /* ~ */
     TOK_AT,             /* @ (intrinsic prefix) */

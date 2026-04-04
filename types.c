@@ -207,10 +207,14 @@ int type_width(Type *a) {
 }
 
 bool type_is_optional(Type *a) {
+    /* BUG-409: unwrap distinct — distinct typedef ?*T is still optional */
+    a = type_unwrap_distinct(a);
     return a->kind == TYPE_OPTIONAL;
 }
 
 Type *type_unwrap_optional(Type *a) {
+    /* BUG-409: unwrap distinct first */
+    a = type_unwrap_distinct(a);
     if (a->kind == TYPE_OPTIONAL) return a->optional.inner;
     return a; /* not optional — return as-is */
 }
@@ -341,10 +345,14 @@ bool can_implicit_coerce(Type *from, Type *to) {
     /* NOTE: f64 → f32 is NOT implicit. Must use explicit conversion.
      * But float LITERALS are handled specially in the checker (not here). */
 
-    /* T → ?T: value to optional (implicit wrap) */
-    if (to->kind == TYPE_OPTIONAL) {
-        return type_equals(from, to->optional.inner) ||
-               can_implicit_coerce(from, to->optional.inner);
+    /* T → ?T: value to optional (implicit wrap)
+     * BUG-409: unwrap distinct — distinct typedef ?T still accepts T */
+    {
+        Type *to_eff = type_unwrap_distinct(to);
+        if (to_eff->kind == TYPE_OPTIONAL) {
+            return type_equals(from, to_eff->optional.inner) ||
+                   can_implicit_coerce(from, to_eff->optional.inner);
+        }
     }
 
     /* array to slice: T[N] → []T */

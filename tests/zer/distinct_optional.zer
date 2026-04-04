@@ -1,0 +1,34 @@
+// Distinct typedef wrapping optional types — checker + emitter must unwrap
+// BUG-409: type_is_optional, type_unwrap_optional, can_implicit_coerce,
+// orelse emission, return null/value/bare all need to unwrap distinct
+
+distinct typedef ?u32 MaybeId;
+
+MaybeId find(bool ok) {
+    if (!ok) { return null; }
+    ?u32 val = 42;
+    return @cast(MaybeId, val);
+}
+
+MaybeId make_none() {
+    return null;
+}
+
+u32 main() {
+    // orelse with default value
+    MaybeId m = find(true);
+    u32 val = m orelse 0;
+    if (val != 42) { return 1; }
+
+    // orelse with null result
+    MaybeId m2 = find(false);
+    u32 val2 = m2 orelse 99;
+    if (val2 != 99) { return 2; }
+
+    // orelse { block }
+    MaybeId m3 = make_none();
+    u32 val3 = m3 orelse { return 0; };
+
+    // should not reach here
+    return 3;
+}

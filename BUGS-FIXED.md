@@ -7,6 +7,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-409: Distinct typedef wrapping optional types (Gemini finding #1)
+- **Symptom:** `distinct typedef ?u32 MaybeId; MaybeId find() { return null; }` → "return type doesn't match." `m orelse 0` → "orelse requires optional type." Distinct wrapping `?T` not recognized as optional.
+- **Root cause:** `type_is_optional()` and `type_unwrap_optional()` in types.c didn't call `type_unwrap_distinct()`. Also `can_implicit_coerce()` T→?T path didn't unwrap distinct on target. Emitter orelse paths and return-null/bare-return paths all checked `->kind == TYPE_OPTIONAL` without unwrapping distinct on `current_func_ret`.
+- **Fix:** (1) `type_is_optional()` / `type_unwrap_optional()` now unwrap distinct. (2) `can_implicit_coerce` T→?T path unwraps distinct on `to`. (3) Emitter: orelse `is_ptr_optional`/`is_void_optional` use `type_unwrap_distinct(orelse_type)`. (4) Emitter: return null, return value, bare return all unwrap distinct on `current_func_ret`.
+- **Test:** `distinct_optional.zer` (distinct ?u32 orelse default, orelse block, return null)
+- **Credit:** Gemini 2.5 Pro identified the checker-level issue; emitter fixes found during verification.
+
 ### BUG-407: Nested distinct funcptr name placement wrong (Gemini finding)
 - **Symptom:** `distinct typedef Fn SafeFn; distinct typedef SafeFn ExtraSafeFn; ?ExtraSafeFn callback` emits `void (*)(uint32_t) callback` — name AFTER type instead of inside `(*callback)`.
 - **Root cause:** `emit_type_and_name` only checked one level of TYPE_DISTINCT before TYPE_FUNC_PTR. `t->optional.inner->kind == TYPE_DISTINCT && t->optional.inner->distinct.underlying->kind == TYPE_FUNC_PTR` — misses multi-level distinct chains.

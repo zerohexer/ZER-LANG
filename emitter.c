@@ -1785,13 +1785,15 @@ static void emit_expr(Emitter *e, Node *node) {
          * ?*T uses null sentinel → simple ternary
          * ?T uses struct → .has_value/.value */
         Type *orelse_type = checker_get_type(e->checker,node->orelse.expr);
-        bool is_ptr_optional = orelse_type &&
-            orelse_type->kind == TYPE_OPTIONAL &&
-            is_null_sentinel(orelse_type->optional.inner);
+        /* BUG-409: unwrap distinct — distinct typedef ?T is still optional */
+        Type *orelse_eff = orelse_type ? type_unwrap_distinct(orelse_type) : NULL;
+        bool is_ptr_optional = orelse_eff &&
+            orelse_eff->kind == TYPE_OPTIONAL &&
+            is_null_sentinel(orelse_eff->optional.inner);
 
-        bool is_void_optional = orelse_type &&
-            orelse_type->kind == TYPE_OPTIONAL &&
-            type_unwrap_distinct(orelse_type->optional.inner)->kind == TYPE_VOID;
+        bool is_void_optional = orelse_eff &&
+            orelse_eff->kind == TYPE_OPTIONAL &&
+            type_unwrap_distinct(orelse_eff->optional.inner)->kind == TYPE_VOID;
 
         if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
@@ -2768,28 +2770,31 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
     }
 
-    case NODE_RETURN:
+    case NODE_RETURN: {
+        /* BUG-409: unwrap distinct on return type for optional dispatch */
+        Type *ret_eff = e->current_func_ret ? type_unwrap_distinct(e->current_func_ret) : NULL;
         /* auto-guard: emit bounds guards before return expression */
         if (node->ret.expr) emit_auto_guards(e, node->ret.expr);
         /* emit defers before return (reverse order) */
         emit_defers(e);
         emit_indent(e);
         if (node->ret.expr) {
-            /* return null from ?T function → return {0, 0} (or {0} for ?void) */
-            if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                !is_null_sentinel(e->current_func_ret->optional.inner) &&
+            /* return null from ?T function → return {0, 0} (or {0} for ?void)
+             * BUG-409: unwrap distinct on return type — distinct ?T is still optional */
+            if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(ret_eff->optional.inner) &&
                 node->ret.expr->kind == NODE_NULL_LIT) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
-                if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID) {
+                if (type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_VOID) {
                     emit(e, "){ 0 };\n");
                 } else {
                     emit(e, "){ 0, 0 };\n");
                 }
             }
             /* return value from ?T function → return {value, 1} */
-            else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                     !is_null_sentinel(e->current_func_ret->optional.inner) &&
+            else if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+                     !is_null_sentinel(ret_eff->optional.inner) &&
                      node->ret.expr->kind != NODE_NULL_LIT) {
                 /* check if expr already has the optional type (e.g. return ring.pop()) */
                 Type *expr_type = checker_get_type(e->checker,node->ret.expr);
@@ -2827,14 +2832,16 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
         } else {
             /* bare return — for ?void, return {1} (success); for other ?T, return {0,1}
-             * For null-sentinel types (?*T, ?FuncPtr), bare return = return NULL (none) */
-            if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                is_null_sentinel(e->current_func_ret->optional.inner)) {
+             * For null-sentinel types (?*T, ?FuncPtr), bare return = return NULL (none)
+             * BUG-409: unwrap distinct on return type */
+            Type *bare_ret = e->current_func_ret ? type_unwrap_distinct(e->current_func_ret) : NULL;
+            if (bare_ret && bare_ret->kind == TYPE_OPTIONAL &&
+                is_null_sentinel(bare_ret->optional.inner)) {
                 /* null-sentinel: bare return = none = NULL */
                 emit(e, "return (");
-                emit_type(e, e->current_func_ret->optional.inner);
+                emit_type(e, bare_ret->optional.inner);
                 emit(e, ")0;\n");
-            } else if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL) {
+            } else if (bare_ret && bare_ret->kind == TYPE_OPTIONAL) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
                 if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID) {
@@ -2847,6 +2854,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
         }
         break;
+    }
 
     case NODE_GOTO:
         emit_defers(e);  /* fire all pending defers before jumping */

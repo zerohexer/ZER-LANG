@@ -240,6 +240,19 @@ The `is_non_storable` check blocked ALL var-decl/assignment from Handle auto-der
 
 Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only error when the result type is TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, or TYPE_UNION. Scalar types pass through.
 
+### Distinct Typedef Wrapping Optional (BUG-409, 2026-04-05)
+
+`distinct typedef ?u32 MaybeId` was completely broken — checker rejected `return null`, `orelse`, and `T → ?T` coercion. Emitter produced wrong C for return/orelse paths.
+
+**Root causes (5 sites):**
+1. `type_is_optional()` / `type_unwrap_optional()` — didn't unwrap distinct
+2. `can_implicit_coerce()` T→?T path — didn't unwrap distinct on target
+3. Emitter `is_ptr_optional` / `is_void_optional` — didn't unwrap distinct on orelse_type
+4. Emitter return-null path — checked `current_func_ret->kind == TYPE_OPTIONAL` directly
+5. Emitter bare-return path — same
+
+**Fix pattern:** Every site that checks `->kind == TYPE_OPTIONAL` must either use `type_is_optional()` (which now unwraps) or call `type_unwrap_distinct()` explicitly. This is the same lesson as BUG-279/BUG-295 — distinct unwrap is needed EVERYWHERE types are dispatched.
+
 ### Nested Distinct FuncPtr Name Placement (BUG-407, 2026-04-05)
 
 `emit_type_and_name` only checked one level of TYPE_DISTINCT before TYPE_FUNC_PTR dispatch. `distinct typedef (distinct typedef Fn) ExtraSafeFn` wrapped TWO levels — the second was missed, producing `void (*)(uint32_t) name` instead of `void (*name)(uint32_t)`. Fixed: use `type_unwrap_distinct()` at both the optional and non-optional distinct func ptr paths (lines 480, 506).

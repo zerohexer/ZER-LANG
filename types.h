@@ -197,6 +197,9 @@ struct Symbol {
     bool is_comptime;       /* comptime function — evaluated at compile time */
     Node *func_node;        /* AST node for function body, if applicable */
 
+    /* Handle auto-deref: which Slab/Pool this handle was allocated from */
+    Symbol *slab_source;        /* NULL = unknown (parameter, conditional) */
+
     /* MMIO pointer bound: derived from mmio range for @inttoptr pointers */
     uint64_t mmio_bound;        /* max valid index (0 = no bound) */
 

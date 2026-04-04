@@ -1287,6 +1287,60 @@ static void emit_expr(Emitter *e, Node *node) {
                  (int)node->field.field_name_len, node->field.field_name);
             break;
         }
+        /* Handle auto-deref: h.field → ((T*)_zer_slab_get(&slab, h))->field
+         * or ((T*)_zer_pool_get(pool.slots, pool.gen, pool.used, sizeof(pool.slots[0]), h, N))->field */
+        if (obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_HANDLE) {
+            Type *handle_type = type_unwrap_distinct(obj_type);
+            /* find the allocator symbol — first try slab_source on the variable */
+            Symbol *alloc_sym = NULL;
+            if (node->field.object->kind == NODE_IDENT) {
+                Symbol *hsym = scope_lookup(e->checker->current_scope,
+                    node->field.object->ident.name,
+                    (uint32_t)node->field.object->ident.name_len);
+                if (!hsym) hsym = scope_lookup(e->checker->global_scope,
+                    node->field.object->ident.name,
+                    (uint32_t)node->field.object->ident.name_len);
+                if (hsym) alloc_sym = hsym->slab_source;
+            }
+            /* fallback: find unique allocator for this element type */
+            if (!alloc_sym) {
+                alloc_sym = find_unique_allocator(e->checker->current_scope,
+                    handle_type->handle.elem);
+                if (!alloc_sym)
+                    alloc_sym = find_unique_allocator(e->checker->global_scope,
+                        handle_type->handle.elem);
+            }
+            if (alloc_sym && alloc_sym->type) {
+                Type *at = alloc_sym->type;
+                if (at->kind == TYPE_SLAB) {
+                    emit(e, "((");
+                    emit_type(e, at->slab.elem);
+                    emit(e, "*)_zer_slab_get(&%.*s, ",
+                         (int)alloc_sym->name_len, alloc_sym->name);
+                    emit_expr(e, node->field.object);
+                    emit(e, "))->%.*s",
+                         (int)node->field.field_name_len, node->field.field_name);
+                } else if (at->kind == TYPE_POOL) {
+                    emit(e, "((");
+                    emit_type(e, at->pool.elem);
+                    emit(e, "*)_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
+                         "sizeof(%.*s.slots[0]), ",
+                         (int)alloc_sym->name_len, alloc_sym->name,
+                         (int)alloc_sym->name_len, alloc_sym->name,
+                         (int)alloc_sym->name_len, alloc_sym->name,
+                         (int)alloc_sym->name_len, alloc_sym->name);
+                    emit_expr(e, node->field.object);
+                    emit(e, ", %llu))->%.*s",
+                         (unsigned long long)at->pool.count,
+                         (int)node->field.field_name_len, node->field.field_name);
+                }
+            } else {
+                /* shouldn't happen — checker should have caught this */
+                emit(e, "/* ERROR: no allocator for handle auto-deref */ 0");
+            }
+            break;
+        }
+
         /* check if object is a pointer → use -> instead of . */
         emit_expr(e, node->field.object);
         if (obj_type && obj_type->kind == TYPE_POINTER) {

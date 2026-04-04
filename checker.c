@@ -98,6 +98,23 @@ static void checker_warning(Checker *c, int line, const char *fmt, ...) {
  * pool.get(h) returns a non-storable result.
  * BUG-346: moved from static globals into Checker struct for thread safety. */
 
+/* ---- Handle auto-deref: find unique Slab/Pool for a Handle's element type ---- */
+Symbol *find_unique_allocator(Scope *s, Type *elem_type) {
+    Symbol *found = NULL;
+    for (Scope *sc = s; sc; sc = sc->parent) {
+        for (uint32_t i = 0; i < sc->symbol_count; i++) {
+            Type *t = sc->symbols[i].type;
+            if (!t) continue;
+            if ((t->kind == TYPE_SLAB && type_equals(t->slab.elem, elem_type)) ||
+                (t->kind == TYPE_POOL && type_equals(t->pool.elem, elem_type))) {
+                if (found) return NULL; /* ambiguous — two allocators for same type */
+                found = &sc->symbols[i];
+            }
+        }
+    }
+    return found;
+}
+
 static void non_storable_init(Checker *c) {
     c->non_storable_capacity = 64;
     c->non_storable_nodes = (Node **)arena_alloc(c->arena, c->non_storable_capacity * sizeof(Node *));
@@ -2959,6 +2976,36 @@ static Type *check_expr(Checker *c, Node *node) {
         /* unwrap distinct for all field access below (struct, enum, union, pointer deref) */
         obj = type_unwrap_distinct(obj);
 
+        /* Handle auto-deref: h.field → slab.get(h).field */
+        if (obj->kind == TYPE_HANDLE) {
+            Type *elem = type_unwrap_distinct(obj->handle.elem);
+            if (elem->kind == TYPE_STRUCT) {
+                /* find the struct field */
+                for (uint32_t i = 0; i < elem->struct_type.field_count; i++) {
+                    SField *f = &elem->struct_type.fields[i];
+                    if (f->name_len == flen && memcmp(f->name, fname, flen) == 0) {
+                        result = f->type;
+                        /* mark as non-storable — same as pool.get(h).field */
+                        mark_non_storable(c, node);
+                        break;
+                    }
+                }
+                if (!result) {
+                    checker_error(c, node->loc.line,
+                        "struct '%.*s' has no field '%.*s'",
+                        (int)elem->struct_type.name_len, elem->struct_type.name,
+                        (int)flen, fname);
+                    result = ty_void;
+                }
+                break;
+            }
+            checker_error(c, node->loc.line,
+                "Handle element type '%s' is not a struct — cannot auto-deref",
+                type_name(elem));
+            result = ty_void;
+            break;
+        }
+
         /* struct field lookup */
         if (obj->kind == TYPE_STRUCT) {
             for (uint32_t i = 0; i < obj->struct_type.field_count; i++) {
@@ -4343,6 +4390,17 @@ static void check_stmt(Checker *c, Node *node) {
                             }
                             if (!arena_is_global)
                                 sym->is_arena_derived = true;
+                        }
+                        /* Handle auto-deref: track slab_source from pool/slab.alloc() */
+                        if (obj_type && (obj_type->kind == TYPE_POOL || obj_type->kind == TYPE_SLAB)) {
+                            if (obj->kind == NODE_IDENT) {
+                                Symbol *alloc_src = scope_lookup(c->current_scope,
+                                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                                if (!alloc_src)
+                                    alloc_src = scope_lookup(c->global_scope,
+                                        obj->ident.name, (uint32_t)obj->ident.name_len);
+                                if (alloc_src) sym->slab_source = alloc_src;
+                            }
                         }
                     }
                 }

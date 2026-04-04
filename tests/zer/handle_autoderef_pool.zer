@@ -1,0 +1,29 @@
+// Handle auto-deref with Pool (not just Slab)
+
+struct Sensor {
+    u32 id;
+    u32 value;
+}
+
+Pool(Sensor, 4) sensors;
+
+u32 main() {
+    Handle(Sensor) s1 = sensors.alloc() orelse { return 1; };
+    s1.id = 1;
+    s1.value = 100;
+
+    Handle(Sensor) s2 = sensors.alloc() orelse { return 2; };
+    s2.id = 2;
+    s2.value = 200;
+
+    if (s1.id != 1) { return 3; }
+    if (s2.value != 200) { return 4; }
+
+    // Mix explicit and auto-deref
+    s1.value = 999;
+    if (sensors.get(s1).value != 999) { return 5; }
+
+    sensors.free(s1);
+    sensors.free(s2);
+    return 0;
+}

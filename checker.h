@@ -169,4 +169,7 @@ bool checker_is_proven(Checker *c, Node *node);
 /* returns array_size if this node needs auto-guard, 0 if not */
 uint64_t checker_auto_guard_size(Checker *c, Node *node);
 
+/* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
+Symbol *find_unique_allocator(Scope *s, Type *elem_type);
+
 #endif /* ZER_CHECKER_H */

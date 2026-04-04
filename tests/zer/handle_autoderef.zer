@@ -1,0 +1,35 @@
+// Handle auto-deref: h.field → slab.get(h).field
+// Same gen check, same safety, less typing
+
+struct Task {
+    u32 id;
+    u32 priority;
+}
+
+Slab(Task) heap;
+
+u32 main() {
+    // Allocate with explicit .get() (old way)
+    Handle(Task) t1 = heap.alloc() orelse { return 1; };
+    heap.get(t1).id = 10;
+    heap.get(t1).priority = 3;
+
+    // Allocate with auto-deref (new way — same safety)
+    Handle(Task) t2 = heap.alloc() orelse { return 2; };
+    t2.id = 20;
+    t2.priority = 5;
+
+    // Verify values through both access patterns
+    if (heap.get(t1).id != 10) { return 3; }
+    if (t1.priority != 3) { return 4; }
+    if (t2.id != 20) { return 5; }
+    if (heap.get(t2).priority != 5) { return 6; }
+
+    // Modify through auto-deref, read through explicit
+    t1.id = 99;
+    if (heap.get(t1).id != 99) { return 7; }
+
+    heap.free(t1);
+    heap.free(t2);
+    return 0;
+}

@@ -2396,8 +2396,28 @@ static Type *check_expr(Checker *c, Node *node) {
                     typemap_set(c, field_node,result);
                     break;
                 }
+                if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'alloc_ptr' on const Pool");
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "pool.alloc_ptr() takes no arguments");
+                    result = type_optional(c->arena, type_pointer(c->arena, obj->pool.elem));
+                    typemap_set(c, field_node, result);
+                    break;
+                }
+                if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'free_ptr' on const Pool");
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "pool.free_ptr() takes exactly 1 argument");
+                    result = ty_void;
+                    typemap_set(c, field_node, result);
+                    break;
+                }
                 checker_error(c, node->loc.line,
-                    "Pool has no method '%.*s' (available: alloc, get, free)",
+                    "Pool has no method '%.*s' (available: alloc, alloc_ptr, get, free, free_ptr)",
                     (int)mlen, mname);
                 result = ty_void;
                 break;
@@ -2476,8 +2496,32 @@ static Type *check_expr(Checker *c, Node *node) {
                     typemap_set(c, field_node,result);
                     break;
                 }
+                if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
+                    if (c->in_interrupt)
+                        checker_error(c, node->loc.line,
+                            "slab.alloc_ptr() not allowed in interrupt handler — "
+                            "malloc/calloc may deadlock. Use Pool instead");
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'alloc_ptr' on const Slab");
+                    if (node->call.arg_count != 0)
+                        checker_error(c, node->loc.line, "slab.alloc_ptr() takes no arguments");
+                    result = type_optional(c->arena, type_pointer(c->arena, obj->slab.elem));
+                    typemap_set(c, field_node, result);
+                    break;
+                }
+                if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
+                    if (obj_is_const)
+                        checker_error(c, node->loc.line,
+                            "cannot call mutating method 'free_ptr' on const Slab");
+                    if (node->call.arg_count != 1)
+                        checker_error(c, node->loc.line, "slab.free_ptr() takes exactly 1 argument");
+                    result = ty_void;
+                    typemap_set(c, field_node, result);
+                    break;
+                }
                 checker_error(c, node->loc.line,
-                    "Slab has no method '%.*s' (available: alloc, get, free)",
+                    "Slab has no method '%.*s' (available: alloc, alloc_ptr, get, free, free_ptr)",
                     (int)mlen, mname);
                 result = ty_void;
                 break;

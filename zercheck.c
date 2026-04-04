@@ -250,7 +250,8 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
 
     /* pool.free(h) — mark handle as freed
      * BUG-357: also handles arr[0], s.h via handle_key_from_expr */
-    if (mlen == 4 && memcmp(method, "free", 4) == 0) {
+    if ((mlen == 4 && memcmp(method, "free", 4) == 0) ||
+        (mlen == 8 && memcmp(method, "free_ptr", 8) == 0)) {
         if (node->call.arg_count > 0) {
             char hkey[128];
             int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
@@ -333,7 +334,8 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         const char *method = alloc_call->call.callee->field.field_name;
         uint32_t mlen = (uint32_t)alloc_call->call.callee->field.field_name_len;
 
-        if (mlen == 5 && memcmp(method, "alloc", 5) == 0 &&
+        if (((mlen == 5 && memcmp(method, "alloc", 5) == 0) ||
+             (mlen == 9 && memcmp(method, "alloc_ptr", 9) == 0)) &&
             obj->kind == NODE_IDENT) {
             /* check if object is Pool/Slab (not Arena — arena allocs don't need individual free) */
             Type *obj_type = checker_get_type(zc->checker, obj);
@@ -538,6 +540,31 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
         zc_check_expr(zc, ps, node->binary.right);
         break;
     case NODE_FIELD:
+        /* Level 9: check if a tracked pointer (from alloc_ptr) is accessed after free.
+         * t.field where t is freed → use-after-free. Check the root ident. */
+        {
+            Node *root = node->field.object;
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                if (root->kind == NODE_FIELD) root = root->field.object;
+                else root = root->index_expr.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                char fkey[128];
+                int fklen = handle_key_from_expr(root, fkey, sizeof(fkey));
+                if (fklen > 0) {
+                    HandleInfo *h = find_handle(ps, fkey, (uint32_t)fklen);
+                    if (h && h->state == HS_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "use-after-free: '%.*s' freed at line %d",
+                            fklen, fkey, h->free_line);
+                    } else if (h && h->state == HS_MAYBE_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "use-after-free: '%.*s' may have been freed at line %d",
+                            fklen, fkey, h->free_line);
+                    }
+                }
+            }
+        }
         zc_check_expr(zc, ps, node->field.object);
         break;
     case NODE_ORELSE:

@@ -1048,6 +1048,35 @@ static void emit_expr(Emitter *e, Node *node) {
                             emit_expr(e, node->call.args[0]);
                         emit(e, ", %llu)", (unsigned long long)pool->pool.count);
                         handled = true;
+                    } else if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
+                        /* pool.alloc_ptr() → alloc slot, return pointer (NULL if full) */
+                        int tmp = e->temp_count++;
+                        emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
+                             "_zer_pool_alloc(%.*s.slots, sizeof(%.*s.slots[0]), "
+                             "%.*s.gen, %.*s.used, %llu, &_zer_aok%d); ",
+                             tmp, tmp,
+                             plen, pname, plen, pname,
+                             plen, pname, plen, pname,
+                             (unsigned long long)pool->pool.count, tmp);
+                        /* ?*T is null sentinel — return pointer or NULL */
+                        emit(e, "_zer_aok%d ? (", tmp);
+                        emit_type(e, pool->pool.elem);
+                        emit(e, "*)_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
+                             "sizeof(%.*s.slots[0]), _zer_ah%d, %llu) : (void*)0; })",
+                             plen, pname, plen, pname, plen, pname,
+                             plen, pname, tmp,
+                             (unsigned long long)pool->pool.count);
+                        handled = true;
+                    } else if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
+                        /* pool.free_ptr(ptr) → find slot index from pointer, free it */
+                        emit(e, "_zer_pool_free(%.*s.gen, %.*s.used, "
+                             "((uint64_t)((char*)(", plen, pname, plen, pname);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, ") - (char*)%.*s.slots) / sizeof(%.*s.slots[0])), %llu)",
+                             plen, pname, plen, pname,
+                             (unsigned long long)pool->pool.count);
+                        handled = true;
                     }
                 }
 
@@ -1138,6 +1167,25 @@ static void emit_expr(Emitter *e, Node *node) {
                         handled = true;
                     } else if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
                         emit(e, "_zer_slab_free(&%.*s, ", slen, sname);
+                        if (node->call.arg_count > 0)
+                            emit_expr(e, node->call.args[0]);
+                        emit(e, ")");
+                        handled = true;
+                    } else if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
+                        /* slab.alloc_ptr() → alloc slot, return pointer (NULL if OOM) */
+                        int tmp = e->temp_count++;
+                        emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
+                             "_zer_slab_alloc(&%.*s, &_zer_aok%d); ",
+                             tmp, tmp, slen, sname, tmp);
+                        /* ?*T is null sentinel — return pointer or NULL */
+                        emit(e, "_zer_aok%d ? (", tmp);
+                        emit_type(e, obj_type->slab.elem);
+                        emit(e, "*)_zer_slab_get(&%.*s, _zer_ah%d) : (void*)0; })",
+                             slen, sname, tmp);
+                        handled = true;
+                    } else if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
+                        /* slab.free_ptr(ptr) → find handle from pointer, free it */
+                        emit(e, "_zer_slab_free_ptr(&%.*s, ", slen, sname);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
                         emit(e, ")");
@@ -3876,6 +3924,21 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "        s->gen[idx]++;\n");
     emit(e, "        if (s->gen[idx] == 0) s->gen[idx] = 1; /* skip 0: reserved for null handle */\n");
     emit(e, "    }\n");
+    emit(e, "}\n\n");
+
+    emit(e, "static inline void _zer_slab_free_ptr(_zer_slab *s, void *ptr) {\n");
+    emit(e, "    if (!ptr) return;\n");
+    emit(e, "    for (size_t i = 0; i < s->total_slots; i++) {\n");
+    emit(e, "        size_t page = i / _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "        size_t slot = i %% _ZER_SLAB_PAGE_SLOTS;\n");
+    emit(e, "        if (s->pages[page] + slot * s->slot_size == (char*)ptr) {\n");
+    emit(e, "            s->used[i] = 0;\n");
+    emit(e, "            s->gen[i]++;\n");
+    emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1;\n");
+    emit(e, "            return;\n");
+    emit(e, "        }\n");
+    emit(e, "    }\n");
+    emit(e, "    _zer_trap(\"slab: free_ptr with invalid pointer\", __FILE__, __LINE__);\n");
     emit(e, "}\n\n");
 
     /* Level 3+4+5: *opaque inline header tracking (--track-cptrs) */

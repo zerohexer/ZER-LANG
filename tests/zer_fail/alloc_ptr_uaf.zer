@@ -1,0 +1,15 @@
+// alloc_ptr use-after-free — must fail compilation (zercheck)
+
+struct Task {
+    u32 id;
+}
+
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    t.id = 42;
+    heap.free_ptr(t);
+    t.id = 99;       // USE-AFTER-FREE — zercheck must catch this
+    return 0;
+}

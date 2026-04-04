@@ -1,0 +1,46 @@
+// comptime if with direct comptime function call as condition
+// Tests: FUNC() and FUNC() > N in comptime if, nested comptime if,
+// comptime call in array size, dead branch stripping
+
+comptime u32 FEATURE_A() { return 1; }
+comptime u32 FEATURE_B() { return 0; }
+comptime u32 VER() { return 2; }
+comptime u32 BUF_SIZE() { return 16; }
+
+u32 main() {
+    // direct call in comptime if
+    u32 result = 0;
+    comptime if (FEATURE_A()) {
+        result = 10;
+    }
+    if (result != 10) { return 1; }
+
+    // false branch stripped
+    comptime if (FEATURE_B()) {
+        result = 99;
+    }
+    if (result != 10) { return 2; }
+
+    // nested comptime if
+    comptime if (FEATURE_A()) {
+        comptime if (FEATURE_B()) {
+            result = 20;
+        }
+    }
+    if (result != 10) { return 3; }
+
+    // comparison in comptime if
+    comptime if (VER() > 1) {
+        result = 30;
+    }
+    if (result != 30) { return 4; }
+
+    // comptime call in array size
+    u8[BUF_SIZE()] buf;
+    buf[0] = 42;
+    buf[15] = 99;
+    if (buf[0] != 42) { return 5; }
+    if (buf[15] != 99) { return 6; }
+
+    return 0;
+}

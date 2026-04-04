@@ -3099,6 +3099,11 @@ static Type *check_expr(Checker *c, Node *node) {
                         } else {
                             node->call.comptime_value = val;
                             node->call.is_comptime_resolved = true;
+                            /* Convert to int literal in-place so eval_const_expr
+                             * works on comptime calls in binary expressions,
+                             * comptime if conditions, array sizes, etc. */
+                            node->kind = NODE_INT_LIT;
+                            node->int_lit.value = (uint64_t)val;
                         }
                     }
                 }
@@ -4941,7 +4946,16 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_IF: {
         /* comptime if — evaluate condition at compile time, only check taken branch */
         if (node->if_stmt.is_comptime) {
+            /* type-check the condition first so comptime calls get resolved */
+            check_expr(c, node->if_stmt.cond);
             int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval == CONST_EVAL_FAIL) {
+                /* try resolved comptime call: comptime if (FUNC()) */
+                if (node->if_stmt.cond->kind == NODE_CALL &&
+                    node->if_stmt.cond->call.is_comptime_resolved) {
+                    cval = node->if_stmt.cond->call.comptime_value;
+                }
+            }
             if (cval == CONST_EVAL_FAIL) {
                 /* try looking up const bool/int ident */
                 if (node->if_stmt.cond->kind == NODE_IDENT) {

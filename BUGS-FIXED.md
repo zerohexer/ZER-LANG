@@ -7,6 +7,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-404: comptime call in-place conversion to NODE_INT_LIT
+- **Symptom:** `comptime if (FUNC() > 1)` failed — comptime call resolved but `eval_const_expr` in binary expression couldn't read it. Also `u8[BUF_SIZE()]` failed for same reason.
+- **Root cause:** Resolved comptime calls set `is_comptime_resolved` + `comptime_value` but kept `NODE_CALL` kind. `eval_const_expr` (ast.h) only handles `NODE_INT_LIT` and binary/unary nodes — doesn't know about comptime resolution.
+- **Fix:** After resolving comptime call value, convert node in-place: `node->kind = NODE_INT_LIT; node->int_lit.value = val`. Now `eval_const_expr` sees it universally — in comptime if conditions, array sizes, binary expressions, etc.
+- **Side effect:** The emitter's `NODE_CALL` comptime handler (line 994) is now dead code — converted nodes go to `NODE_INT_LIT` instead. Left in place for safety (unreachable).
+- **Test:** `comptime_if_call.zer` (direct call, comparison, nested, array size)
+
 ### BUG-402: comptime func const not recognized in comptime if
 - **Symptom:** `comptime u32 PLATFORM() { return 1; } const u32 P = PLATFORM(); comptime if (P) { ... }` → "comptime if condition must be a compile-time constant."
 - **Root cause:** Two issues: (1) `comptime if` ident lookup required `is_comptime` flag (only set on comptime functions, not const vars). (2) Emitter's `eval_const_expr` saw NODE_IDENT for the condition but checker stored result in `int_lit.value` without changing node kind — emitter didn't see it.

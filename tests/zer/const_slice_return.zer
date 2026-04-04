@@ -1,0 +1,29 @@
+// Return string literal from const [*]u8 function
+// BUG-406: checker blocked return even when return type was const
+
+const [*]u8 get_greeting() {
+    return "hello world";
+}
+
+const [*]u8 get_name() {
+    return "ZER";
+}
+
+u32 count(const [*]u8 s) {
+    return @truncate(u32, s.len);
+}
+
+u32 main() {
+    const [*]u8 msg = get_greeting();
+    u32 len = count(msg);
+    if (len != 11) { return 1; }
+
+    const [*]u8 name = get_name();
+    if (count(name) != 3) { return 2; }
+
+    // sub-slice of returned const slice
+    const [*]u8 sub = msg[6..];
+    if (count(sub) != 5) { return 3; }
+
+    return 0;
+}

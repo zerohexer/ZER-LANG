@@ -234,6 +234,16 @@ This makes `eval_const_expr` work universally for comptime results — no specia
 
 **Finding: Task.new() + explicit Slab for same type = ambiguous allocator.** `Slab(Task) heap;` + `Task.new()` creates two Slabs for the same struct type. Handle auto-deref can't pick which one → compile error. This is correct behavior — use one or the other, not both.
 
+### Handle Auto-Deref Scalar Store (BUG-405, 2026-04-05)
+
+The `is_non_storable` check blocked ALL var-decl/assignment from Handle auto-deref, including scalar field reads like `u32 v = h.value`. This was too aggressive — only `*T` pointer storage is dangerous (caches `pool.get()` result that becomes invalid after alloc/free). Scalar field values (`u32`, `bool`, etc.) are safe to store.
+
+Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only error when the result type is TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, or TYPE_UNION. Scalar types pass through.
+
+### Return String Literal from Const Slice Function (BUG-406, 2026-04-05)
+
+`const [*]u8 get() { return "hello"; }` was rejected — checker fired "cannot return string literal as mutable slice" without checking if the return type was `const`. Fix: added `!ret->slice.is_const` condition. Also handles `?const [*]u8` optional return path.
+
 ### Task.new() / Task.delete() — Auto-Slab Sugar
 
 **Checker:** When NODE_FIELD on TYPE_STRUCT with method `new`/`new_ptr`/`delete`/`delete_ptr`, checker creates/finds auto-Slab in `checker.auto_slabs[]`. One auto-Slab per struct type (program-wide). `auto_slabs` is an arena-allocated dynamic array on the Checker struct.

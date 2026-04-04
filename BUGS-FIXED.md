@@ -7,6 +7,18 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-405: Handle auto-deref scalar store blocked by non-storable check
+- **Symptom:** `u32 v = h.value;` where `h` is `Handle(Sensor)` → "cannot store result of get() — use inline." Scalar field reads from Handle auto-deref blocked.
+- **Root cause:** `is_non_storable()` check at var-decl init (line 4468) and assignment (line 1635) fired on ALL expressions from Handle auto-deref, regardless of result type. The check should only block `*T` pointer storage (caching pool.get result), not scalar field values.
+- **Fix:** Added type check — only error when result is TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, or TYPE_UNION. Scalar types (u32, bool, etc.) pass through safely.
+- **Test:** `handle_scalar_store.zer` (Slab + Pool scalar reads into locals, expressions)
+
+### BUG-406: return string literal from const [*]u8 function blocked
+- **Symptom:** `const [*]u8 get() { return "hello"; }` → "cannot return string literal as mutable slice." Checker didn't check if return type was const.
+- **Root cause:** NODE_RETURN string literal check (line 5684) tested `ret->kind == TYPE_SLICE` without checking `ret->slice.is_const`. Fired on ALL slice returns including const ones.
+- **Fix:** Added `!ret->slice.is_const` condition. Also handles `?const [*]u8` (optional const slice).
+- **Test:** `const_slice_return.zer` (const [*]u8 return, sub-slice, function pass)
+
 ### BUG-404: comptime call in-place conversion to NODE_INT_LIT
 - **Symptom:** `comptime if (FUNC() > 1)` failed — comptime call resolved but `eval_const_expr` in binary expression couldn't read it. Also `u8[BUF_SIZE()]` failed for same reason.
 - **Root cause:** Resolved comptime calls set `is_comptime_resolved` + `comptime_value` but kept `NODE_CALL` kind. `eval_const_expr` (ast.h) only handles `NODE_INT_LIT` and binary/unary nodes — doesn't know about comptime resolution.

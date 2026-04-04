@@ -1631,10 +1631,17 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* non-storable check: pool.get(h) result cannot be stored */
+        /* non-storable check: pool.get(h) pointer result cannot be stored.
+         * BUG-405: only block when result is a pointer — scalar field values
+         * (u32, bool etc.) from Handle auto-deref are safe to store. */
         if (node->assign.op == TOK_EQ && is_non_storable(c, node->assign.value)) {
-            checker_error(c, node->loc.line,
-                "cannot store result of get() — use inline");
+            Type *ns_type = checker_get_type(c, node->assign.value);
+            if (ns_type) ns_type = type_unwrap_distinct(ns_type);
+            if (!ns_type || ns_type->kind == TYPE_POINTER || ns_type->kind == TYPE_SLICE ||
+                ns_type->kind == TYPE_STRUCT || ns_type->kind == TYPE_UNION) {
+                checker_error(c, node->loc.line,
+                    "cannot store result of get() — use inline");
+            }
         }
 
         /* BUG-225: reject Pool/Ring/Slab assignment — unique resource types */
@@ -4464,10 +4471,16 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->var_decl.init) {
             Type *init_type = check_expr(c, node->var_decl.init);
 
-            /* non-storable check: pool.get(h) result */
+            /* non-storable check: pool.get(h) pointer result.
+             * BUG-405: only block when result is a pointer — scalar values
+             * from Handle auto-deref (h.id, h.count) are safe to store. */
             if (is_non_storable(c, node->var_decl.init)) {
-                checker_error(c, node->loc.line,
-                    "cannot store result of get() — use inline");
+                Type *ns_type = type_unwrap_distinct(init_type);
+                if (!ns_type || ns_type->kind == TYPE_POINTER || ns_type->kind == TYPE_SLICE ||
+                    ns_type->kind == TYPE_STRUCT || ns_type->kind == TYPE_UNION) {
+                    checker_error(c, node->loc.line,
+                        "cannot store result of get() — use inline");
+                }
             }
 
             /* string literal to mutable slice: runtime crash on write.
@@ -5665,11 +5678,14 @@ static void check_stmt(Checker *c, Node *node) {
             Type *ret_type = check_expr(c, node->ret.expr);
 
             /* string literal returned as mutable slice → .rodata write risk
-             * Covers both []u8 and ?[]u8 return types */
+             * Covers both []u8 and ?[]u8 return types.
+             * BUG-406: allow return from const []u8 functions (string literals are const). */
             if (node->ret.expr->kind == NODE_STRING_LIT && c->current_func_ret) {
                 Type *ret = c->current_func_ret;
-                if (ret->kind == TYPE_SLICE ||
-                    (ret->kind == TYPE_OPTIONAL && ret->optional.inner->kind == TYPE_SLICE)) {
+                if ((ret->kind == TYPE_SLICE && !ret->slice.is_const) ||
+                    (ret->kind == TYPE_OPTIONAL &&
+                     ret->optional.inner->kind == TYPE_SLICE &&
+                     !ret->optional.inner->slice.is_const)) {
                     checker_error(c, node->loc.line,
                         "cannot return string literal as mutable slice — data is read-only");
                 }

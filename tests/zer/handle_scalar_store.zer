@@ -1,0 +1,51 @@
+// Handle auto-deref scalar field values can be stored in local vars
+// BUG-405: non-storable check was blocking scalar reads, not just pointer stores
+
+struct Sensor { u32 value; u32 calibration; }
+struct Motor { u32 speed; bool active; }
+
+Slab(Sensor) sensors;
+Pool(Motor, 8) motors;
+
+u32 test_slab_scalar() {
+    Handle(Sensor) s = sensors.alloc() orelse { return 1; };
+    s.value = 42;
+    s.calibration = 7;
+    // Store scalar fields into local variables — must be allowed
+    u32 v = s.value;
+    u32 c = s.calibration;
+    u32 sum = v + c;
+    sensors.free(s);
+    if (sum != 49) { return 2; }
+    return 0;
+}
+
+u32 test_pool_scalar() {
+    Handle(Motor) m = motors.alloc() orelse { return 1; };
+    m.speed = 1000;
+    m.active = true;
+    u32 spd = m.speed;
+    bool on = m.active;
+    motors.free(m);
+    if (spd != 1000) { return 2; }
+    if (!on) { return 3; }
+    return 0;
+}
+
+u32 test_expr_use() {
+    Handle(Sensor) s = sensors.alloc() orelse { return 1; };
+    s.value = 10;
+    s.calibration = 20;
+    // Use in expressions — also scalar, must work
+    u32 result = s.value + s.calibration;
+    sensors.free(s);
+    if (result != 30) { return 2; }
+    return 0;
+}
+
+u32 main() {
+    if (test_slab_scalar() != 0) { return 1; }
+    if (test_pool_scalar() != 0) { return 2; }
+    if (test_expr_use() != 0) { return 3; }
+    return 0;
+}

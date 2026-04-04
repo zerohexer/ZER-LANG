@@ -130,6 +130,15 @@ Handle(Task) h;          u64: index(32) + generation(32), not a pointer
     for (u32 i = 0; i < 10; i++) { ... }       // PARSE ERROR — no ++
     ```
 
+15. **`goto` and labels are supported.** Forward and backward jumps. Safe because auto-zero + defer neutralize goto's traditional dangers. Banned inside `defer` blocks.
+    ```
+    goto cleanup;                              // forward jump
+    // ...
+    cleanup:
+        free_resources();
+        return 1;
+    ```
+
 ### Intrinsics (@ builtins)
 ```
 @size(T)                 sizeof — returns usize
@@ -232,7 +241,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - No heap/malloc/free (use Pool/Slab/Ring/Arena)
 - No implicit narrowing or sign conversion
 - No undefined behavior (overflow wraps, shift by >=width = 0)
-- No `++`/`--`, no comma operator, no `goto`
+- No `++`/`--`, no comma operator
 - No C-style casts
 - No preprocessor (#define → `comptime` functions, #ifdef → `comptime if`)
 - No header files (use `import`)
@@ -278,6 +287,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Modules/imports | Done | Done (multi-file) |
 | Intrinsics (@size, @truncate, etc.) | Done | Done |
 | Defer | Done | Done |
+| Goto + labels (forward + backward) | Done | Done (C pass-through) |
 | ZER-CHECK (MAYBE_FREED, leaks, loops) | Done | N/A (analysis pass) |
 | ?FuncPtr (optional function pointers) | Done | Done (null sentinel) |
 | Function pointer typedef | Done | Done |
@@ -550,6 +560,7 @@ ZER SYNTAX RULES (not C — these differ):
 - bool is NOT an integer — no bool↔int coercion
 - Optional: ?*T (null sentinel), ?T (struct with .value/.has_value), ?void (has_value ONLY, no .value)
 - Unwrap: if (opt) |val| { use(val); }  or  val = opt orelse default;
+- goto label; and label: are supported (forward + backward). Banned inside defer blocks.
 ```
 
 Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).

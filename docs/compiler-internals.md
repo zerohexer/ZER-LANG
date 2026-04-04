@@ -115,6 +115,18 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 `zerc_main.c` adds `-mconsole` to GCC invocation on Windows (`#ifdef _WIN32`). Without this, msys64 mingw GCC links as GUI app expecting `WinMain` instead of `main`. Linux/macOS unaffected.
 
+### Goto + Labels
+
+**Lexer:** `TOK_GOTO` keyword, `TOK_COLON` token (`:` was not tokenized before).
+
+**Parser:** `goto label;` → `NODE_GOTO` with label name/len. Labels detected by lookahead: if `TOK_IDENT` followed by `TOK_COLON`, parse as `NODE_LABEL`. Scanner state saved/restored on failed lookahead (same pattern as func ptr detection). Labels are statement-level, no semicolon after `label:`.
+
+**Checker:** `NODE_GOTO` banned inside defer blocks (compile error). `NODE_LABEL` is a no-op. `check_goto_labels()` runs per function body after all statements checked: collects all labels via `collect_labels()` (recursive AST walk), checks for duplicates, then `validate_gotos()` verifies every goto target exists. Max 128 labels per function (stack array).
+
+**Emitter:** `NODE_GOTO` → `goto label;`. `NODE_LABEL` → `label:;` (empty statement after colon for C compliance). Direct pass-through to C — no transformation needed.
+
+**Design:** Both forward and backward goto allowed. Safe because: (1) auto-zero prevents uninitialized memory from skipped declarations, (2) defer fires on all scope exits regardless of goto. The only restriction is no goto inside defer blocks (could cause infinite loops or skip other defers).
+
 ## Checker (checker.c) — ~1800 lines
 
 ### Key Functions

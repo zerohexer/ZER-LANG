@@ -666,6 +666,60 @@ NOTES
 
 ---
 
+### goto + labels
+
+DESCRIPTION
+    Jump to a labeled location in the same function. Both forward and backward
+    jumps allowed. Safe because auto-zero prevents uninitialized memory and
+    defer fires on all scope exits.
+
+SYNTAX
+    goto label_name;           // jump to label
+    label_name:                // label declaration (no semicolon needed)
+
+EXAMPLE
+    // Forward goto — error cleanup pattern (replaces nested if):
+    u32 init() {
+        *opaque buf = kmalloc(SIZE) orelse { goto fail; };
+        *opaque irq = request_irq(IRQ) orelse { goto fail_irq; };
+        return 0;
+
+    fail_irq:
+        kfree(buf);
+    fail:
+        return 1;
+    }
+
+    // Backward goto — retry loop:
+    u32 count = 0;
+    retry:
+        count += 1;
+        if (count < 5) { goto retry; }
+
+    // Forward goto — break out of nested loops:
+    for (u32 i = 0; i < n; i += 1) {
+        for (u32 j = 0; j < m; j += 1) {
+            if (found) { goto done; }
+        }
+    }
+    done:
+
+ERRORS
+    goto nowhere;              // COMPILE ERROR — label 'nowhere' not found
+    goto inside defer block    // COMPILE ERROR — cannot use goto inside defer
+    duplicate labels           // COMPILE ERROR — label 'x' already defined
+
+NOTES
+    - Labels are function-scoped — cannot goto between functions.
+    - Max 128 labels per function.
+    - goto does NOT skip defer execution — defers still fire at scope exit.
+    - Backward goto is just a loop — same as `while(true)` with condition.
+
+SEE ALSO
+    defer, break, continue
+
+---
+
 ## OPTIONAL UNWRAPPING
 
 ### orelse
@@ -1522,7 +1576,7 @@ make docker-install    # build Windows binaries, install to PATH
 - No garbage collector
 - No implicit narrowing or sign conversion
 - No undefined behavior
-- No `++` / `--`, no comma operator, no `goto`
+- No `++` / `--`, no comma operator
 - No C-style casts
 - No header files (use `import`)
 - No preprocessor (use `comptime`)

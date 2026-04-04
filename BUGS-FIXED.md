@@ -25,6 +25,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### FEATURE: goto + labels (forward + backward)
+- **What:** Full goto support with labels. Forward and backward jumps. `NODE_GOTO` + `NODE_LABEL` AST nodes. `TOK_GOTO` keyword + `TOK_COLON` token added to lexer.
+- **Safety:** goto inside defer block → compile error. Label validation: target must exist in same function, no duplicate labels. Both forward and backward safe due to auto-zero + defer.
+- **Implementation:** ~70 lines across lexer.h, lexer.c, ast.h, parser.c, checker.c, emitter.c.
+- **Test:** `tests/zer/goto_label.zer` (forward, backward, nested loop break, error path), `tests/zer_fail/goto_bad_label.zer` (nonexistent target rejected).
+
 ### FEATURE: VS Code extension version 0.2.6
 - **Changes:** Auto-PATH prompt, `-mconsole` fix in bundled zerc, `?T` orelse hint, `[*]T` + `[]T` deprecation warning.
 

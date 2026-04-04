@@ -1,0 +1,19 @@
+// Bug #1 fix: goto/label inside switch arms
+
+u32 main() {
+    u32 result = 0;
+
+    switch (1) {
+        0 => { result = 10; }
+        1 => { goto found; }
+        default => { result = 30; }
+    }
+    goto done;
+
+found:
+    result = 99;
+
+done:
+    if (result != 99) { return 1; }
+    return 0;
+}

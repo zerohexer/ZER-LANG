@@ -2412,6 +2412,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'free_ptr' on const Pool");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "pool.free_ptr() takes exactly 1 argument");
+                    if (node->call.arg_count == 1) {
+                        Type *arg_t = check_expr(c, node->call.args[0]);
+                        Type *expected = type_pointer(c->arena, obj->pool.elem);
+                        if (arg_t && !type_equals(type_unwrap_distinct(arg_t), type_unwrap_distinct(expected))) {
+                            checker_error(c, node->loc.line,
+                                "pool.free_ptr() expects '*%s', got '%s'",
+                                type_name(obj->pool.elem), type_name(arg_t));
+                        }
+                    }
                     result = ty_void;
                     typemap_set(c, field_node, result);
                     break;
@@ -2516,6 +2525,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'free_ptr' on const Slab");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "slab.free_ptr() takes exactly 1 argument");
+                    if (node->call.arg_count == 1) {
+                        Type *arg_t = check_expr(c, node->call.args[0]);
+                        Type *expected = type_pointer(c->arena, obj->slab.elem);
+                        if (arg_t && !type_equals(type_unwrap_distinct(arg_t), type_unwrap_distinct(expected))) {
+                            checker_error(c, node->loc.line,
+                                "slab.free_ptr() expects '*%s', got '%s'",
+                                type_name(obj->slab.elem), type_name(arg_t));
+                        }
+                    }
                     result = ty_void;
                     typemap_set(c, field_node, result);
                     break;
@@ -3022,8 +3040,42 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* Handle auto-deref: h.field → slab.get(h).field */
         if (obj->kind == TYPE_HANDLE) {
+            /* const Handle check: cannot mutate through const handle */
+            if (c->in_assign_target && node->field.object->kind == NODE_IDENT) {
+                Symbol *hsym = scope_lookup(c->current_scope,
+                    node->field.object->ident.name,
+                    (uint32_t)node->field.object->ident.name_len);
+                if (hsym && hsym->is_const) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign through const Handle '%.*s'",
+                        (int)node->field.object->ident.name_len,
+                        node->field.object->ident.name);
+                }
+            }
             Type *elem = type_unwrap_distinct(obj->handle.elem);
             if (elem->kind == TYPE_STRUCT) {
+                /* verify an allocator exists for this Handle type */
+                Symbol *alloc_sym = NULL;
+                if (node->field.object->kind == NODE_IDENT) {
+                    Symbol *hsym = scope_lookup(c->current_scope,
+                        node->field.object->ident.name,
+                        (uint32_t)node->field.object->ident.name_len);
+                    if (hsym) alloc_sym = hsym->slab_source;
+                }
+                if (!alloc_sym) {
+                    alloc_sym = find_unique_allocator(c->current_scope, obj->handle.elem);
+                    if (!alloc_sym)
+                        alloc_sym = find_unique_allocator(c->global_scope, obj->handle.elem);
+                }
+                if (!alloc_sym) {
+                    checker_error(c, node->loc.line,
+                        "no Pool or Slab found for Handle(%.*s) — cannot auto-deref. "
+                        "Use explicit pool.get(h).%.*s",
+                        (int)elem->struct_type.name_len, elem->struct_type.name,
+                        (int)flen, fname);
+                    result = ty_void;
+                    break;
+                }
                 /* find the struct field */
                 for (uint32_t i = 0; i < elem->struct_type.field_count; i++) {
                     SField *f = &elem->struct_type.fields[i];
@@ -5828,7 +5880,8 @@ static void check_stmt(Checker *c, Node *node) {
             Node *call_obj = node->expr_stmt.expr->call.callee->field.object;
             const char *mname = node->expr_stmt.expr->call.callee->field.field_name;
             uint32_t mlen = (uint32_t)node->expr_stmt.expr->call.callee->field.field_name_len;
-            if (mlen == 5 && memcmp(mname, "alloc", 5) == 0 && call_obj->kind == NODE_IDENT) {
+            if (((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                 (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0)) && call_obj->kind == NODE_IDENT) {
                 Type *ot = checker_get_type(c, call_obj);
                 if (!ot) {
                     Symbol *s = scope_lookup(c->current_scope, call_obj->ident.name,
@@ -6252,6 +6305,12 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     }
     if (node->kind == NODE_FOR) collect_labels(node->for_stmt.body, labels, count, max);
     if (node->kind == NODE_WHILE) collect_labels(node->while_stmt.body, labels, count, max);
+    if (node->kind == NODE_SWITCH) {
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            collect_labels(node->switch_stmt.arms[i].body, labels, count, max);
+    }
+    if (node->kind == NODE_DEFER) collect_labels(node->defer.body, labels, count, max);
+    if (node->kind == NODE_CRITICAL) collect_labels(node->critical.body, labels, count, max);
 }
 
 static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_count) {
@@ -6281,6 +6340,12 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     }
     if (node->kind == NODE_FOR) validate_gotos(c, node->for_stmt.body, labels, label_count);
     if (node->kind == NODE_WHILE) validate_gotos(c, node->while_stmt.body, labels, label_count);
+    if (node->kind == NODE_SWITCH) {
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            validate_gotos(c, node->switch_stmt.arms[i].body, labels, label_count);
+    }
+    if (node->kind == NODE_DEFER) validate_gotos(c, node->defer.body, labels, label_count);
+    if (node->kind == NODE_CRITICAL) validate_gotos(c, node->critical.body, labels, label_count);
 }
 
 static void check_goto_labels(Checker *c, Node *func_body) {

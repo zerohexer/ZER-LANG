@@ -1,0 +1,19 @@
+// Bug #2 fix: goto fires defers before jumping
+
+struct Counter { u32 val; }
+Pool(Counter, 4) pool;
+
+u32 main() {
+    Handle(Counter) c = pool.alloc() orelse { return 1; };
+    c.val = 0;
+
+    // defer should fire before goto
+    c.val = 42;
+    defer pool.free(c);
+
+    goto done;
+
+done:
+    // c should have been freed by defer
+    return 0;
+}

@@ -1,0 +1,7 @@
+// Bug #4 fix: Handle auto-deref with no allocator in scope
+
+struct Task { u32 id; }
+
+u32 get_id(Handle(Task) h) {
+    return h.id;    // COMPILE ERROR — no Pool/Slab for Handle(Task) in scope
+}

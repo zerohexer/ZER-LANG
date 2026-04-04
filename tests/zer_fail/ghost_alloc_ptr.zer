@@ -1,0 +1,9 @@
+// Bug #7 fix: discarded alloc_ptr result caught
+
+struct Task { u32 id; }
+Pool(Task, 8) tasks;
+
+u32 main() {
+    tasks.alloc_ptr();    // COMPILE ERROR — discarded alloc_ptr result
+    return 0;
+}

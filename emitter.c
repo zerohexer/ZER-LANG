@@ -2765,6 +2765,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_GOTO:
+        emit_defers(e);  /* fire all pending defers before jumping */
         emit_indent(e);
         emit(e, "goto %.*s;\n", (int)node->goto_stmt.label_len, node->goto_stmt.label);
         break;

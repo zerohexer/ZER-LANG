@@ -1,0 +1,13 @@
+// Bug #3 fix: free_ptr type mismatch caught
+
+struct Task { u32 id; }
+struct Motor { u32 speed; }
+
+Pool(Task, 8) tasks;
+Pool(Motor, 8) motors;
+
+u32 main() {
+    *Motor m = motors.alloc_ptr() orelse { return 1; };
+    tasks.free_ptr(m);    // COMPILE ERROR — Motor* to Task pool
+    return 0;
+}

@@ -15,7 +15,8 @@
     },
     "categories": ["Programming Languages"],
     "activationEvents": [
-        "onLanguage:zer"
+        "onLanguage:zer",
+        "onCommand:zer.openReference"
     ],
     "main": "./extension.js",
     "contributes": {
@@ -29,6 +30,10 @@
             "language": "zer",
             "scopeName": "source.zer",
             "path": "./syntaxes/zer.tmLanguage.json"
+        }],
+        "commands": [{
+            "command": "zer.openReference",
+            "title": "ZER: Open Language Reference"
         }],
         "configuration": {
             "title": "ZER Language",

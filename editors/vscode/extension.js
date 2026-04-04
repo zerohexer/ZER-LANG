@@ -128,6 +128,18 @@ function activate(context) {
     client.start();
     context.subscriptions.push(client);
 
+    // Command: open language reference as markdown preview
+    const refCmd = vscode.commands.registerCommand('zer.openReference', () => {
+        const refPath = path.join(context.extensionPath, 'REFERENCE.md');
+        if (fs.existsSync(refPath)) {
+            const uri = vscode.Uri.file(refPath);
+            vscode.commands.executeCommand('markdown.showPreview', uri);
+        } else {
+            vscode.window.showErrorMessage('ZER: REFERENCE.md not found in extension');
+        }
+    });
+    context.subscriptions.push(refCmd);
+
     // Status message
     const zercName = process.platform === 'win32' ? 'zerc.exe' : 'zerc';
     const bundledZerc = path.join(platDir, zercName);

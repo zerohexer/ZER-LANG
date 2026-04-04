@@ -556,6 +556,7 @@ struct Ops { u32 (*compute)(u32); }        // struct field
 u32 apply(u32 (*op)(u32, u32), u32 x, u32 y);  // parameter
 ?void (*on_event)(u32) = null;             // optional — null = not set
 typedef u32 (*BinOp)(u32, u32);            // typedef
+BinOp[4] ops;                              // array of function pointers (via typedef)
 ```
 
 **EXAMPLE**

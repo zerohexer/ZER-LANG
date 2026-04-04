@@ -447,6 +447,30 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         /* collect all array dimensions, emit base type + name + all dims */
         Type *base = t;
         while (base->kind == TYPE_ARRAY) base = base->array.inner;
+        /* function pointer array: ret (*name[dim1][dim2])(params) */
+        Type *base_eff = type_unwrap_distinct(base);
+        if (base_eff->kind == TYPE_FUNC_PTR) {
+            emit_type(e, base_eff->func_ptr.ret);
+            emit(e, " (*%.*s", (int)name_len, name);
+            Type *dim = t;
+            while (dim->kind == TYPE_ARRAY) {
+                if (dim->array.sizeof_type) {
+                    emit(e, "[sizeof(");
+                    emit_type(e, dim->array.sizeof_type);
+                    emit(e, ")]");
+                } else {
+                    emit(e, "[%llu]", (unsigned long long)dim->array.size);
+                }
+                dim = dim->array.inner;
+            }
+            emit(e, ")(");
+            for (uint32_t i = 0; i < base_eff->func_ptr.param_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_type(e, base_eff->func_ptr.params[i]);
+            }
+            emit(e, ")");
+            return;
+        }
         emit_type(e, base);
         emit(e, " %.*s", (int)name_len, name);
         Type *dim = t;

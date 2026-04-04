@@ -253,6 +253,10 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Fix pattern:** Every site that checks `->kind == TYPE_OPTIONAL` must either use `type_is_optional()` (which now unwraps) or call `type_unwrap_distinct()` explicitly. This is the same lesson as BUG-279/BUG-295 — distinct unwrap is needed EVERYWHERE types are dispatched.
 
+### Function Pointer Array Emission (BUG-412, 2026-04-05)
+
+`Op[3] ops` where `Op` is `typedef u32 (*Op)(u32)` emitted `uint32_t (*)(uint32_t) ops[3]` — name outside the `(*)` instead of inside `(*ops[3])`. Fix: in `emit_type_and_name` for TYPE_ARRAY, when base type (after unwrapping array chain) is TYPE_FUNC_PTR (or distinct wrapping it), use function pointer emission pattern: `ret (*name[dims])(params)`. Works with distinct typedef func ptrs too.
+
 ### Comprehensive Distinct Typedef Audit (BUG-409/410, 2026-04-05)
 
 **The #1 bug class in ZER:** Every `->kind == TYPE_X` check on a type from `checker_get_type()` or `check_expr()` must call `type_unwrap_distinct()` first. This session found 35+ sites across checker.c, emitter.c, and types.c. The systematic audit used `grep "->kind == TYPE_X"` for each type kind and verified each site.

@@ -253,6 +253,24 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Fix pattern:** Every site that checks `->kind == TYPE_OPTIONAL` must either use `type_is_optional()` (which now unwraps) or call `type_unwrap_distinct()` explicitly. This is the same lesson as BUG-279/BUG-295 — distinct unwrap is needed EVERYWHERE types are dispatched.
 
+### Comprehensive Distinct Typedef Audit (BUG-409/410, 2026-04-05)
+
+**The #1 bug class in ZER:** Every `->kind == TYPE_X` check on a type from `checker_get_type()` or `check_expr()` must call `type_unwrap_distinct()` first. This session found 35+ sites across checker.c, emitter.c, and types.c. The systematic audit used `grep "->kind == TYPE_X"` for each type kind and verified each site.
+
+**Sites fixed by category:**
+- **TYPE_OPTIONAL (15 sites):** `type_is_optional()`, `type_unwrap_optional()`, `can_implicit_coerce()`, emitter orelse 3 paths, emitter return null/value/bare, assign null, `== null`, bare `if(opt)`, `while(opt)`, var-decl orelse
+- **TYPE_FUNC_PTR (2 sites):** `emit_type_and_name` distinct funcptr (non-optional + optional)
+- **TYPE_POINTER (7 sites):** checker deref (TOK_STAR), checker NODE_FIELD dispatch, emitter NODE_FIELD `->` emission, volatile pointer var-decl (local + global, 4 sites)
+- **TYPE_SLICE (12 sites):** checker NODE_INDEX, checker NODE_SLICE, emitter proven index, bounds check, sub-slice, call-site decay, Arena.over(), @cstr dest, var-decl orelse, array→slice coercion (var-decl + return)
+- **TYPE_ARRAY (6 sites):** emitter array assign target, @cstr array dest, array init memcpy, checker assign value, escape check, const array→slice
+- **TYPE_VOID (14+6 sites):** `optional.inner->kind == TYPE_VOID` (emitter + checker), `pointer.inner->kind == TYPE_OPAQUE` (emitter)
+
+**How to prevent future occurrences:**
+1. When adding ANY new `->kind == TYPE_X` check, call `type_unwrap_distinct()` first
+2. The helpers `type_is_optional()`, `type_is_integer()`, `type_is_signed()`, `type_width()` all unwrap internally — safe to call directly
+3. For `optional.inner`, `pointer.inner`, `slice.inner` — these are already-resolved inner types, usually don't need unwrapping (but check for `distinct typedef void` edge cases)
+4. Use the grep audit pattern: `grep "->kind == TYPE_X" file.c` → check each site
+
 ### Nested Distinct FuncPtr Name Placement (BUG-407, 2026-04-05)
 
 `emit_type_and_name` only checked one level of TYPE_DISTINCT before TYPE_FUNC_PTR dispatch. `distinct typedef (distinct typedef Fn) ExtraSafeFn` wrapped TWO levels — the second was missed, producing `void (*)(uint32_t) name` instead of `void (*name)(uint32_t)`. Fixed: use `type_unwrap_distinct()` at both the optional and non-optional distinct func ptr paths (lines 480, 506).

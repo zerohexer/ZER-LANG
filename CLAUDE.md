@@ -437,7 +437,7 @@ Contents of `docs/compiler-internals.md`:
 **Critical Bug Fix Patterns (1-181):**
 All numbered patterns from BUG-042 through BUG-337. Key themes:
 - `?void` has ONE field (has_value), everything else has TWO — check at every optional null emission site
-- `TYPE_DISTINCT` must be unwrapped before ANY type dispatch — use `type_unwrap_distinct()`
+- `TYPE_DISTINCT` must be unwrapped before ANY type dispatch — use `type_unwrap_distinct()`. **This was the #1 bug class: 35+ sites fixed in one session.** Every `->kind == TYPE_X` on a type from `checker_get_type()` / `check_expr()` needs unwrap. The helpers `type_is_optional()`, `type_is_integer()`, `type_width()` unwrap internally. `type_is_optional()` and `type_unwrap_optional()` also unwrap distinct now.
 - `is_null_sentinel()` function (not macro) unwraps distinct before checking pointer/func_ptr
 - Named typedefs required for EVERY compound type — prevents anonymous struct duplication
 - `__typeof__` instead of `__auto_type` for captures/orelse temps — preserves volatile/const

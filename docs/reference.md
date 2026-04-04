@@ -590,6 +590,15 @@ u32 raw = @cast(u32, c);              // unwrap: Celsius → u32
 Fahrenheit f = @cast(Fahrenheit, c);   // COMPILE ERROR — cross-distinct
 ```
 
+**COMPOUND TYPES**
+Distinct typedef works with all compound types. The wrapped type's operations are preserved:
+```zer
+distinct typedef ?u32 MaybeId;       // orelse, if-unwrap, == null all work
+distinct typedef *Motor SafeMotor;   // deref (*p), field access (p.speed) work
+distinct typedef [*]u8 Text;         // indexing (t[0]), .len, sub-slice work
+distinct typedef Point Vec2;         // field access (v.x, v.y) works
+```
+
 **SEE ALSO**
 @cast
 

@@ -1,0 +1,16 @@
+// if-unwrap |t| + Handle auto-deref — immutable capture allows data mutation
+
+struct Task { u32 id; u32 priority; }
+Slab(Task) heap;
+
+u32 main() {
+    ?Handle(Task) maybe = heap.alloc();
+    if (maybe) |t| {
+        t.id = 42;
+        t.priority = 3;
+        if (t.id != 42) { return 1; }
+        if (t.priority != 3) { return 2; }
+        heap.free(t);
+    }
+    return 0;
+}

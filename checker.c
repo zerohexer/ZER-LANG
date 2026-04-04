@@ -1598,6 +1598,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     through_pointer = true;
                     root = root->unary.operand;
                 } else if (root->kind == NODE_FIELD) {
+                    /* Handle auto-deref: h.field goes through slab.get() indirection.
+                     * const Handle = const key, NOT const data. Same as const *T. */
+                    Type *fld_obj_type = typemap_get(c, root->field.object);
+                    if (fld_obj_type && type_unwrap_distinct(fld_obj_type)->kind == TYPE_HANDLE) {
+                        through_pointer = true;
+                    }
                     /* check if object is a pointer (auto-deref) */
                     Type *obj_type = typemap_get(c, root->field.object);
                     if (obj_type && obj_type->kind == TYPE_POINTER) {

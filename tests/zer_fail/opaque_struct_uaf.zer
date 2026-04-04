@@ -1,0 +1,12 @@
+// 9a: struct field use-after-free — caught at compile time by zercheck
+
+*opaque malloc(usize size);
+void free(*opaque ptr);
+
+struct Task { u32 id; }
+
+void use_data(*opaque data) {
+    free(data);
+    *Task t = @ptrcast(*Task, data);   // UAF — data freed above
+    return;
+}

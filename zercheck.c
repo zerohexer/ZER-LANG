@@ -464,6 +464,19 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                             ps->handles[ai].free_line = node->loc.line;
                         }
                     }
+                } else {
+                    /* 9a/9b: free() on untracked key (e.g., parameter's field).
+                     * Register as FREED so subsequent use is caught. */
+                    char *akey = (char *)arena_alloc(zc->arena, fklen + 1);
+                    if (akey) {
+                        memcpy(akey, fkey, fklen + 1);
+                        h = add_handle(ps, akey, (uint32_t)fklen);
+                        if (h) {
+                            h->state = HS_FREED;
+                            h->pool_id = -2;
+                            h->free_line = node->loc.line;
+                        }
+                    }
                 }
             }
         }
@@ -486,7 +499,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     val->call.callee->kind == NODE_FIELD) {
                     const char *mname = val->call.callee->field.field_name;
                     uint32_t mlen = (uint32_t)val->call.callee->field.field_name_len;
-                    if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    if ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                        (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0)) {
                         Node *obj = val->call.callee->field.object;
                         int pool_id = (obj && obj->kind == NODE_IDENT) ?
                             register_pool(zc, obj->ident.name, (uint32_t)obj->ident.name_len) : -1;
@@ -506,6 +520,20 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                 h->pool_id = pool_id;
                                 h->alloc_line = node->loc.line;
                             }
+                        }
+                    }
+                }
+                /* 9a: *opaque struct field from malloc — ctx.data = malloc(64) */
+                if (val && is_alloc_call(zc, val)) {
+                    char *akey = (char *)arena_alloc(zc->arena, tklen + 1);
+                    if (akey) {
+                        memcpy(akey, tkey, tklen + 1);
+                        HandleInfo *h = find_handle(ps, akey, (uint32_t)tklen);
+                        if (!h) h = add_handle(ps, akey, (uint32_t)tklen);
+                        if (h) {
+                            h->state = HS_ALIVE;
+                            h->pool_id = -2; /* malloc'd */
+                            h->alloc_line = node->loc.line;
                         }
                     }
                 }
@@ -772,6 +800,23 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_RETURN:
         if (node->ret.expr)
             zc_check_expr(zc, ps, node->ret.expr);
+        /* 9c: check if returning a freed/maybe-freed pointer */
+        if (node->ret.expr) {
+            char rkey[128];
+            int rklen = handle_key_from_expr(node->ret.expr, rkey, sizeof(rkey));
+            if (rklen > 0) {
+                HandleInfo *h = find_handle(ps, rkey, (uint32_t)rklen);
+                if (h && h->state == HS_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "returning freed pointer '%.*s' (freed at line %d)",
+                        rklen, rkey, h->free_line);
+                } else if (h && h->state == HS_MAYBE_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "returning potentially freed pointer '%.*s' (freed at line %d)",
+                        rklen, rkey, h->free_line);
+                }
+            }
+        }
         break;
 
     case NODE_DEFER:
@@ -887,7 +932,9 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
     bool *maybe_frees = calloc(pc, sizeof(bool));
     for (int i = 0; i < pc; i++) {
         TypeNode *tnode = func->func_decl.params[i].type;
-        if (!tnode || tnode->kind != TYNODE_HANDLE) continue;
+        /* 9b: track Handle, *T, and *opaque params for cross-function summary */
+        if (!tnode || (tnode->kind != TYNODE_HANDLE &&
+            tnode->kind != TYNODE_POINTER)) continue;
         HandleInfo *h = find_handle(&ps, func->func_decl.params[i].name,
             (uint32_t)func->func_decl.params[i].name_len);
         if (h) {

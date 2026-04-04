@@ -1,0 +1,10 @@
+// 9c: returning freed pointer — caught at compile time by zercheck
+
+*opaque malloc(usize size);
+void free(*opaque ptr);
+
+*opaque bad_func() {
+    *opaque p = malloc(64);
+    free(p);
+    return p;      // ERROR: returning freed pointer
+}

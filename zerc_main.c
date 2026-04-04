@@ -173,13 +173,14 @@ static bool parse_module(Compiler *cc, Module *m) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: zerc <input.zer> [-o output.c] [--run]\n");
+        fprintf(stderr, "Usage: zerc <input.zer> [-o output] [--run] [--emit-c]\n");
         return 1;
     }
 
     const char *input_path = argv[1];
     const char *output_path = NULL;
     bool do_run = false;
+    bool emit_c = false;
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
@@ -192,6 +193,8 @@ int main(int argc, char **argv) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--run") == 0) {
             do_run = true;
+        } else if (strcmp(argv[i], "--emit-c") == 0) {
+            emit_c = true;
         } else if (strcmp(argv[i], "--lib") == 0) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
@@ -241,9 +244,44 @@ int main(int argc, char **argv) {
         /* if probe failed, keep default 32 */
     }
 
-    /* default output: input with .c extension */
+    /* determine output mode:
+     * zerc main.zer              → compile to main.exe (temp .c, deleted)
+     * zerc main.zer --run        → compile + run (temp .c, deleted)
+     * zerc main.zer --emit-c     → emit C to main.c (kept)
+     * zerc main.zer -o out.c     → emit C to out.c (kept)
+     * zerc main.zer -o out.exe   → compile to out.exe (temp .c, deleted) */
     char default_output[256];
-    if (!output_path) {
+    bool use_temp_c = false;
+
+    if (output_path) {
+        /* -o specified: check if target is .c (emit C) or not (compile to exe) */
+        size_t olen = strlen(output_path);
+        if (olen > 2 && strcmp(output_path + olen - 2, ".c") == 0) {
+            /* -o file.c → emit C, keep file */
+            emit_c = true;
+        } else {
+            /* -o file.exe or -o file → compile to that exe via temp .c */
+            use_temp_c = true;
+        }
+    } else if (emit_c) {
+        /* --emit-c with no -o: default to input.c */
+        size_t len = strlen(input_path);
+        if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {
+            memcpy(default_output, input_path, len - 4);
+            strcpy(default_output + len - 4, ".c");
+        } else {
+            snprintf(default_output, sizeof(default_output), "%s.c", input_path);
+        }
+        output_path = default_output;
+    } else {
+        /* default: compile to exe via temp .c */
+        use_temp_c = true;
+    }
+
+    /* for temp .c mode, create temp path and set up exe path */
+    char temp_c_path[512];
+    char exe_from_input[512];
+    if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {
             memcpy(default_output, input_path, len - 4);
@@ -442,23 +480,26 @@ int main(int argc, char **argv) {
 
     fclose(out);
 
-    printf("zerc: %s -> %s\n", input_path, output_path);
+    if (emit_c) {
+        printf("zerc: %s -> %s\n", input_path, output_path);
+    }
 
-    /* --run: compile with GCC and execute */
-    if (do_run) {
-        /* build exe path: replace .c with platform-appropriate extension */
+    /* compile to exe: when --run or use_temp_c (default compile mode) */
+    if (do_run || use_temp_c) {
+        /* build exe path */
         char exe_path[512];
-        size_t clen = strlen(output_path);
 #ifdef _WIN32
         const char *exe_ext = ".exe";
 #else
         const char *exe_ext = "";
 #endif
-        if (clen > 2 && strcmp(output_path + clen - 2, ".c") == 0) {
-            memcpy(exe_path, output_path, clen - 2);
-            strcpy(exe_path + clen - 2, exe_ext);
+        /* derive exe name from input .zer file */
+        size_t ilen = strlen(input_path);
+        if (ilen > 4 && strcmp(input_path + ilen - 4, ".zer") == 0) {
+            memcpy(exe_path, input_path, ilen - 4);
+            strcpy(exe_path + ilen - 4, exe_ext);
         } else {
-            snprintf(exe_path, sizeof(exe_path), "%s%s", output_path, exe_ext);
+            snprintf(exe_path, sizeof(exe_path), "%s%s", input_path, exe_ext);
         }
 
         /* find GCC: check for bundled gcc relative to zerc binary first,
@@ -513,6 +554,12 @@ int main(int argc, char **argv) {
                  gcc_path, wrap_flags, platform_flags, exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);
+
+        /* delete temp .c file after GCC (success or fail) */
+        if (use_temp_c) {
+            remove(output_path);
+        }
+
         if (gcc_ret != 0) {
             fprintf(stderr, "zerc: gcc failed (tried: %s)\n", gcc_path);
             free(cc.modules);
@@ -520,27 +567,32 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        char run_cmd[1024];
+        printf("zerc: %s -> %s\n", input_path, exe_path);
+
+        /* only run if --run was specified */
+        if (do_run) {
+            char run_cmd[1024];
 #ifdef _WIN32
-        /* absolute paths (C:\...) don't need .\ prefix */
-        if (exe_path[0] && exe_path[1] == ':') {
-            snprintf(run_cmd, sizeof(run_cmd), "%s", exe_path);
-        } else {
-            snprintf(run_cmd, sizeof(run_cmd), ".\\%s", exe_path);
-        }
+            /* absolute paths (C:\...) don't need .\ prefix */
+            if (exe_path[0] && exe_path[1] == ':') {
+                snprintf(run_cmd, sizeof(run_cmd), "%s", exe_path);
+            } else {
+                snprintf(run_cmd, sizeof(run_cmd), ".\\%s", exe_path);
+            }
 #else
-        /* absolute paths (/...) don't need ./ prefix */
-        if (exe_path[0] == '/') {
-            snprintf(run_cmd, sizeof(run_cmd), "%s", exe_path);
-        } else {
-            snprintf(run_cmd, sizeof(run_cmd), "./%s", exe_path);
-        }
+            /* absolute paths (/...) don't need ./ prefix */
+            if (exe_path[0] == '/') {
+                snprintf(run_cmd, sizeof(run_cmd), "%s", exe_path);
+            } else {
+                snprintf(run_cmd, sizeof(run_cmd), "./%s", exe_path);
+            }
 #endif
-        printf("zerc: running %s\n", exe_path);
-        int run_ret = system(run_cmd);
-        free(cc.modules);
-        arena_free(&cc.arena);
-        return run_ret;
+            printf("zerc: running %s\n", exe_path);
+            int run_ret = system(run_cmd);
+            free(cc.modules);
+            arena_free(&cc.arena);
+            return run_ret;
+        }
     }
 
     free(cc.modules);

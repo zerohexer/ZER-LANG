@@ -645,16 +645,36 @@ This is needed because auto-slabs use `sizeof(StructType)` which requires the st
 
 ### Testing New Features — Interaction Test Checklist
 After implementing any feature, test these interactions:
-1. Feature + `orelse` (unwrapping)
+1. Feature + `orelse return` (bare) AND `orelse { return; }` (block) — BOTH forms, they take different emitter paths
 2. Feature + `defer` (cleanup on exit)
-3. Feature + `const`/`volatile` (qualifiers)
+3. Feature + `const`/`volatile` (qualifiers) — especially const + Handle (const key ≠ const data)
 4. Feature + loops (`for`/`while` + `break`/`continue`)
 5. Feature + `switch` (arms, captures)
 6. Feature + other NEW features from same session
 7. Feature + `*opaque` (C interop boundary)
 8. Feature as bare expression (ghost handle check)
+9. Feature + `if (opt) |t|` unwrap (immutable capture) — Handle auto-deref must allow data writes
+10. Feature + struct field access (nested struct containing Handle/pointer)
+11. Feature in interrupt handler (`c->in_interrupt` — ISR ban needed?)
+12. Feature + zercheck (does zercheck RECOGNIZE new alloc/free patterns?)
 
-The audit round found 6 bugs, ALL in feature interactions.
+### Write Real Code After Implementing Features — MANDATORY
+
+Unit tests find syntax bugs. REAL CODE finds interaction bugs. After implementing ANY new feature:
+
+1. Write a **real program** (10-60 lines) that uses the feature in a realistic pattern
+2. Compile with `zerc --run` in Docker
+3. If it crashes or gives wrong output → you found a bug unit tests missed
+
+This session's proof: writing a 60-line HTTP server found the orelse block null-sentinel bug that 1,700+ unit tests missed. Testing `Task.new()` with both orelse forms found the auto-slab initializer bug.
+
+**Bug patterns found ONLY by real code (not unit tests):**
+- `orelse { return; }` (block form) emitting 0 instead of pointer — tests all used bare `orelse return`
+- Auto-slab `{sizeof(T), 0, 0}` positional init putting sizeof in wrong field — tests used explicit Slab
+- zercheck not recognizing `Task.delete()` as free — tests used `heap.free()` directly
+- const Handle blocking if-unwrap capture writes — tests didn't combine if-unwrap + Handle + assign
+
+The audit round found 6 bugs, real code found 5 more. Both are needed.
 
 ### Windows VSIX Workflow
 - `make docker-install` — builds + installs to mingw PATH

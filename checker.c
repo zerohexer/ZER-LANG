@@ -2039,7 +2039,7 @@ static Type *check_expr(Checker *c, Node *node) {
             /* collect value nodes to check: direct value + orelse fallback */
             Node *arr_checks[2] = { NULL, NULL };
             int arr_check_count = 0;
-            if (value && value->kind == TYPE_ARRAY) {
+            if (value && type_unwrap_distinct(value)->kind == TYPE_ARRAY) {
                 arr_checks[arr_check_count++] = node->assign.value;
             }
             /* BUG-377: orelse fallback may be a local array */
@@ -2162,8 +2162,8 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* scope escape: assigning local array to global slice (implicit coercion) */
         if (node->assign.op == TOK_EQ &&
-            target && target->kind == TYPE_SLICE &&
-            value && value->kind == TYPE_ARRAY &&
+            target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
+            value && type_unwrap_distinct(value)->kind == TYPE_ARRAY &&
             node->assign.value->kind == NODE_IDENT) {
             const char *vname = node->assign.value->ident.name;
             uint32_t vlen = (uint32_t)node->assign.value->ident.name_len;
@@ -2237,8 +2237,9 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* BUG-245: const array → mutable slice assignment blocked */
         if (node->assign.op == TOK_EQ &&
-            target && target->kind == TYPE_SLICE && !target->slice.is_const &&
-            value && value->kind == TYPE_ARRAY) {
+            target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
+            !type_unwrap_distinct(target)->slice.is_const &&
+            value && type_unwrap_distinct(value)->kind == TYPE_ARRAY) {
             /* look up value symbol to check is_const */
             Node *vroot = node->assign.value;
             while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
@@ -2849,8 +2850,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
                     /* const array → mutable slice coercion: check if arg var is const */
-                    if (arg && arg->kind == TYPE_ARRAY &&
-                        param && param->kind == TYPE_SLICE && !param->slice.is_const &&
+                    if (arg && type_unwrap_distinct(arg)->kind == TYPE_ARRAY &&
+                        param && type_unwrap_distinct(param)->kind == TYPE_SLICE &&
+                        !type_unwrap_distinct(param)->slice.is_const &&
                         node->call.args[i]->kind == NODE_IDENT) {
                         Symbol *arg_sym = scope_lookup(c->current_scope,
                             node->call.args[i]->ident.name,
@@ -2863,8 +2865,8 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* BUG-310: volatile array → non-volatile slice param rejected.
                      * Volatile must propagate — use volatile []T param. */
-                    if (arg && arg->kind == TYPE_ARRAY &&
-                        param && param->kind == TYPE_SLICE &&
+                    if (arg && type_unwrap_distinct(arg)->kind == TYPE_ARRAY &&
+                        param && type_unwrap_distinct(param)->kind == TYPE_SLICE &&
                         !param->slice.is_volatile &&
                         node->call.args[i]->kind == NODE_IDENT) {
                         Symbol *arg_sym = scope_lookup(c->current_scope,

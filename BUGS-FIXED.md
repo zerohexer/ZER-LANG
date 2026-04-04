@@ -7,6 +7,11 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-410 (cont): Remaining distinct unwrap — all TYPE_ARRAY, TYPE_POINTER, TYPE_SLICE sites
+- **Sites fixed in emitter.c (6):** array assign target, @cstr array dest (use buf_eff), array init memcpy, volatile pointer local var-decl (2 sites), volatile pointer global var (2 sites).
+- **Sites fixed in checker.c (5):** assign value TYPE_ARRAY check, assign target TYPE_SLICE + value TYPE_ARRAY escape check, const array→mutable slice assign, call-site const array→slice (2 sites).
+- **Pattern:** every `->kind == TYPE_X` on a type from `checker_get_type()` or `check_expr()` must use `type_unwrap_distinct()`.
+
 ### BUG-410 (cont): Distinct slice/array — indexing, sub-slice, emitter dispatch
 - **Symptom:** `distinct typedef const [*]u8 Text; msg[0]` → "cannot index type." `msg[1..]` → "cannot slice type." Various emitter sites produced wrong C for distinct slice/array.
 - **Root cause:** Checker NODE_INDEX and NODE_SLICE didn't unwrap distinct on `obj`. Emitter had 10+ sites checking `->kind == TYPE_SLICE` or `->kind == TYPE_ARRAY` without unwrapping: proven index, bounds check, sub-slice, call-site decay, Arena.over(), @cstr dest, var-decl orelse, array→slice coercion, return coercion.

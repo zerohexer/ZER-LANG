@@ -872,7 +872,7 @@ static void emit_expr(Emitter *e, Node *node) {
          * get_s().arr = local was calling get_s() twice (dest + sizeof). */
         if (node->assign.op == TOK_EQ) {
             Type *tgt_type = checker_get_type(e->checker,node->assign.target);
-            if (tgt_type && tgt_type->kind == TYPE_ARRAY) {
+            if (tgt_type && type_unwrap_distinct(tgt_type)->kind == TYPE_ARRAY) {
                 /* BUG-273/320: check if target OR source is volatile — use byte loop */
                 bool arr_volatile = expr_is_volatile(e, node->assign.target) ||
                                     expr_is_volatile(e, node->assign.value);
@@ -2276,9 +2276,9 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "; __auto_type _zer_cs%d = ", tmp);
             if (node->intrinsic.arg_count > 1)
                 emit_expr(e, node->intrinsic.args[1]);
-            if (buf_type && buf_type->kind == TYPE_ARRAY) {
+            if (buf_eff && buf_eff->kind == TYPE_ARRAY) {
                 emit(e, "; if (_zer_cs%d.len + 1 > %llu) { ",
-                     tmp, (unsigned long long)buf_type->array.size);
+                     tmp, (unsigned long long)buf_eff->array.size);
                 /* auto-orelse: return zero value instead of trap. Trap stays as comment. */
                 if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
                     emit_defers(e);
@@ -2396,8 +2396,9 @@ static void emit_stmt(Emitter *e, Node *node) {
         if (node->var_decl.init) emit_auto_guards(e, node->var_decl.init);
         Type *type = checker_get_type(e->checker,node);
         /* propagate volatile flag from var-decl to pointer type */
-        if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
-            Type *vp = type_pointer(e->arena, type->pointer.inner);
+        if (node->var_decl.is_volatile && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+            Type *tp = type_unwrap_distinct(type);
+            Type *vp = type_pointer(e->arena, tp->pointer.inner);
             vp->pointer.is_volatile = true;
             type = vp;
         }
@@ -2474,7 +2475,7 @@ static void emit_stmt(Emitter *e, Node *node) {
         /* Normal var decl */
         emit_indent(e);
         if (node->var_decl.is_static) emit(e, "static ");
-        if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
+        if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
             emit(e, "volatile ");
         emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
         if (node->var_decl.init) {
@@ -2541,8 +2542,8 @@ static void emit_stmt(Emitter *e, Node *node) {
                     init_type && type_unwrap_distinct(init_type)->kind == TYPE_ARRAY) {
                     emit(e, " = ");
                     emit_array_as_slice(e, node->var_decl.init, init_type, type);
-                } else if (type && type->kind == TYPE_ARRAY &&
-                           init_type && init_type->kind == TYPE_ARRAY) {
+                } else if (type && type_unwrap_distinct(type)->kind == TYPE_ARRAY &&
+                           init_type && type_unwrap_distinct(init_type)->kind == TYPE_ARRAY) {
                     /* array = array: C arrays aren't assignable, use memcpy.
                      * BUG-278/320: volatile arrays (target OR source) use byte loop */
                     emit(e, " = {0};\n");
@@ -3433,8 +3434,9 @@ static void emit_global_var(Emitter *e, Node *node) {
              (int)node->var_decl.section_len, node->var_decl.section);
     }
     /* propagate volatile flag from var-decl to pointer type */
-    if (node->var_decl.is_volatile && type && type->kind == TYPE_POINTER) {
-        Type *vp = type_pointer(e->arena, type->pointer.inner);
+    if (node->var_decl.is_volatile && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+        Type *tp = type_unwrap_distinct(type);
+        Type *vp = type_pointer(e->arena, tp->pointer.inner);
         vp->pointer.is_volatile = true;
         type = vp;
     }
@@ -3486,7 +3488,7 @@ static void emit_global_var(Emitter *e, Node *node) {
 
     if (node->var_decl.is_static) emit(e, "static ");
     /* volatile on non-pointer scalars (pointers handled above) */
-    if (node->var_decl.is_volatile && !(type && type->kind == TYPE_POINTER))
+    if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
         emit(e, "volatile ");
 
     /* BUG-218/222: mangle global var names for imported modules (including static) */

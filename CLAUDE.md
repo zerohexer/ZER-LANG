@@ -605,6 +605,57 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 10. **`bool` return via `orelse` needs restructuring.** Can't do `*opaque f = mf orelse return false;`. Instead: `?*opaque mf = io_open(...); *opaque f = mf orelse return;` for void, or use an if-unwrap pattern for bool returns.
 
+## Implementation Workflow — Lessons Learned
+
+These patterns were discovered through repeated mistakes. Follow them to avoid wasting turns.
+
+### Adding New Builtin Methods (alloc_ptr, Task.new, etc.)
+Every new builtin method requires changes in THREE places:
+1. **Checker** — type-check the call, return correct type, validate args
+2. **Emitter** — emit the correct C code for the call
+3. **zercheck** — if the method allocates/frees, register it in zercheck tracking
+
+Forgetting zercheck = the method works but UAF/double-free are not caught. This happened with `alloc_ptr()` — checker + emitter worked, zercheck didn't recognize it.
+
+### Adding New AST Node Types (goto, label, etc.)
+New node types require changes in FIVE places:
+1. **Lexer** — keyword token (e.g., `TOK_GOTO`)
+2. **AST** — node kind + data struct (e.g., `NODE_GOTO` + `goto_stmt`)
+3. **Parser** — parse the syntax, create the node
+4. **Checker** — validate (label exists, not in defer block, etc.)
+5. **Emitter** — emit the C equivalent
+
+Also: update EVERY recursive AST walker that handles all node types. This session found that `collect_labels()` and `validate_gotos()` missed NODE_SWITCH/NODE_DEFER/NODE_CRITICAL. Zercheck's `zc_check_stmt()` may also need updating.
+
+### Two-Pass Emission Pattern
+`emit_file()` uses two-pass emission:
+- Pass 1: struct/enum/union/typedef declarations
+- Auto-Slab globals (between passes)
+- Pass 2: functions, global variables, everything else
+
+This is needed because auto-slabs use `sizeof(StructType)` which requires the struct to be declared first. If adding new auto-generated globals, insert them between the passes.
+
+### Testing New Features — Interaction Test Checklist
+After implementing any feature, test these interactions:
+1. Feature + `orelse` (unwrapping)
+2. Feature + `defer` (cleanup on exit)
+3. Feature + `const`/`volatile` (qualifiers)
+4. Feature + loops (`for`/`while` + `break`/`continue`)
+5. Feature + `switch` (arms, captures)
+6. Feature + other NEW features from same session
+7. Feature + `*opaque` (C interop boundary)
+8. Feature as bare expression (ghost handle check)
+
+The audit round found 6 bugs, ALL in feature interactions.
+
+### Windows VSIX Workflow
+- `make docker-install` — builds + installs to mingw PATH
+- VSIX build: `docker build -f Dockerfile.vsix .`
+- `package.json` name MUST match marketplace listing name
+- `zer.lspPath` in VS Code settings overrides bundled binary detection — clear it if LSP fails
+- `where zerc` check must run BEFORE `process.env.PATH` injection in extension.js
+- Multiple extension versions can coexist — remove old ones from `.vscode/extensions/`
+
 ## First Session Workflow
 
 When starting a new session or lacking context:

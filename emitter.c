@@ -1386,9 +1386,11 @@ static void emit_expr(Emitter *e, Node *node) {
                 (uint32_t)node->field.object->ident.name_len);
             if (sym) obj_type = sym->type;
         }
-        if (obj_type && obj_type->kind == TYPE_ENUM) {
+        /* BUG-410: unwrap distinct for field access dispatch */
+        Type *obj_eff = obj_type ? type_unwrap_distinct(obj_type) : NULL;
+        if (obj_eff && obj_eff->kind == TYPE_ENUM) {
             emit(e, "_ZER_");
-            EMIT_ENUM_NAME(e, obj_type);
+            EMIT_ENUM_NAME(e, obj_eff);
             emit(e, "_%.*s",
                  (int)node->field.field_name_len, node->field.field_name);
             break;
@@ -1447,9 +1449,10 @@ static void emit_expr(Emitter *e, Node *node) {
             break;
         }
 
-        /* check if object is a pointer → use -> instead of . */
+        /* check if object is a pointer → use -> instead of .
+         * BUG-410: unwrap distinct — distinct typedef *T still uses -> */
         emit_expr(e, node->field.object);
-        if (obj_type && obj_type->kind == TYPE_POINTER) {
+        if (obj_eff && obj_eff->kind == TYPE_POINTER) {
             emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
         } else {
             emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);

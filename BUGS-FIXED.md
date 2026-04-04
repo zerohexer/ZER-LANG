@@ -7,6 +7,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-410: Distinct typedef — deref, field access, pointer auto-deref
+- **Symptom:** `distinct typedef *u32 SafePtr; *p` → "cannot dereference non-pointer." `distinct typedef Point Vec2; v.x` → "no field 'x'." `distinct typedef *Motor SM; sm.speed` → GCC "is a pointer, use ->."
+- **Root cause:** Checker deref (TOK_STAR) checked `operand->kind != TYPE_POINTER` without unwrapping distinct. NODE_FIELD didn't unwrap distinct on `obj` before struct/slice/pointer dispatch. Emitter NODE_FIELD used `obj_type->kind == TYPE_POINTER` for `->` emission without unwrapping.
+- **Fix:** (1) Checker deref unwraps distinct before TYPE_POINTER check. (2) Checker NODE_FIELD unwraps distinct on `obj` at entry. (3) Emitter NODE_FIELD unwraps distinct for enum/pointer dispatch.
+- **Test:** `distinct_types.zer` (deref, struct field, pointer auto-deref)
+
 ### BUG-409 (cont): Distinct optional — assign null, == null, bare if(), while()
 - **Symptom:** `m = null` on distinct ?u32 → GCC "incompatible types." `m == null` → GCC "invalid operands." `if (m)` → GCC "used struct type where scalar required."
 - **Root cause:** 5 more emitter sites checked `->kind == TYPE_OPTIONAL` without `type_unwrap_distinct()`: assignment null (line 964/974), `== null` comparison (line 684), bare `if(opt)` condition (line 2711), `while(opt)` condition (line 2761).

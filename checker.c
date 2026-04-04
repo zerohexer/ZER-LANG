@@ -1415,12 +1415,16 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
 
         case TOK_STAR: /* dereference */
-            if (operand->kind != TYPE_POINTER) {
+            /* BUG-410: unwrap distinct — distinct typedef *T is still a pointer */
+            {
+            Type *deref_inner = type_unwrap_distinct(operand);
+            if (deref_inner->kind != TYPE_POINTER) {
                 checker_error(c, node->loc.line,
                     "cannot dereference non-pointer type '%s'", type_name(operand));
                 result = ty_void;
             } else {
-                result = operand->pointer.inner;
+                result = deref_inner->pointer.inner;
+            }
             }
             break;
 
@@ -3126,7 +3130,9 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Field access ---- */
     case NODE_FIELD: {
-        Type *obj = check_expr(c, node->field.object);
+        Type *obj_raw = check_expr(c, node->field.object);
+        /* BUG-410: unwrap distinct for field access dispatch */
+        Type *obj = type_unwrap_distinct(obj_raw);
         const char *fname = node->field.field_name;
         uint32_t flen = (uint32_t)node->field.field_name_len;
 

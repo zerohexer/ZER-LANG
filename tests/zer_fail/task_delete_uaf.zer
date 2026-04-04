@@ -1,0 +1,11 @@
+// Task.delete() use-after-free — zercheck must catch
+
+struct Task { u32 id; }
+
+u32 main() {
+    Handle(Task) t = Task.new() orelse { return 1; };
+    t.id = 42;
+    Task.delete(t);
+    t.id = 99;         // UAF
+    return 0;
+}

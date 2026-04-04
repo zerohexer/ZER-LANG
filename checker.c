@@ -2640,6 +2640,10 @@ static Type *check_expr(Checker *c, Node *node) {
             obj = type_unwrap_distinct(obj);
             if (obj->kind == TYPE_STRUCT) {
                 if (mlen == 3 && memcmp(mname, "new", 3) == 0) {
+                    if (c->in_interrupt)
+                        checker_error(c, node->loc.line,
+                            "%.*s.new() not allowed in interrupt handler — uses calloc. Use Pool instead",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "%.*s.new() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -2686,6 +2690,10 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 7 && memcmp(mname, "new_ptr", 7) == 0) {
                     /* Task.new_ptr() → ?*Task — same as slab.alloc_ptr() */
+                    if (c->in_interrupt)
+                        checker_error(c, node->loc.line,
+                            "%.*s.new_ptr() not allowed in interrupt handler — uses calloc. Use Pool instead",
+                            (int)obj->struct_type.name_len, obj->struct_type.name);
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "%.*s.new_ptr() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -3163,18 +3171,12 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* Handle auto-deref: h.field → slab.get(h).field */
         if (obj->kind == TYPE_HANDLE) {
-            /* const Handle check: cannot mutate through const handle */
-            if (c->in_assign_target && node->field.object->kind == NODE_IDENT) {
-                Symbol *hsym = scope_lookup(c->current_scope,
-                    node->field.object->ident.name,
-                    (uint32_t)node->field.object->ident.name_len);
-                if (hsym && hsym->is_const) {
-                    checker_error(c, node->loc.line,
-                        "cannot assign through const Handle '%.*s'",
-                        (int)node->field.object->ident.name_len,
-                        node->field.object->ident.name);
-                }
-            }
+            /* Note: const Handle does NOT block mutation through auto-deref.
+             * Handle is a key (like file descriptor), not a pointer.
+             * const key doesn't mean const data — same as const int fd = open();
+             * write(fd, data, n) is valid. If user wants immutable data,
+             * don't write to it — the Handle itself being const just means
+             * you can't reassign the handle variable. */
             Type *elem = type_unwrap_distinct(obj->handle.elem);
             if (elem->kind == TYPE_STRUCT) {
                 /* verify an allocator exists for this Handle type */

@@ -244,6 +244,57 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
         Symbol *sym = scope_lookup(zc->checker->global_scope, pool_name, plen);
         if (sym) pool_type = sym->type;
     }
+    /* Task.delete(h) / Task.delete_ptr(p) — auto-Slab free via struct method */
+    if (pool_type && pool_type->kind == TYPE_STRUCT) {
+        if ((mlen == 6 && memcmp(method, "delete", 6) == 0) ||
+            (mlen == 10 && memcmp(method, "delete_ptr", 10) == 0)) {
+            if (node->call.arg_count > 0) {
+                char hkey[128];
+                int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
+                if (hklen > 0) {
+                    HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
+                    if (h) {
+                        if (h->state == HS_FREED) {
+                            zc_error(zc, node->loc.line,
+                                "double free: '%.*s' already freed at line %d",
+                                hklen, hkey, h->free_line);
+                        } else if (h->state == HS_MAYBE_FREED) {
+                            zc_error(zc, node->loc.line,
+                                "double free: '%.*s' may have been freed at line %d",
+                                hklen, hkey, h->free_line);
+                        }
+                        h->state = HS_FREED;
+                        h->free_line = node->loc.line;
+                        /* propagate to aliases */
+                        for (int ai = 0; ai < ps->handle_count; ai++) {
+                            if (&ps->handles[ai] != h &&
+                                ps->handles[ai].alloc_line == h->alloc_line &&
+                                ps->handles[ai].pool_id == h->pool_id &&
+                                ps->handles[ai].state == HS_ALIVE) {
+                                ps->handles[ai].state = HS_FREED;
+                                ps->handles[ai].free_line = node->loc.line;
+                            }
+                        }
+                    } else {
+                        /* untracked — register as FREED (9a pattern) */
+                        char *akey = (char *)arena_alloc(zc->arena, hklen + 1);
+                        if (akey) {
+                            memcpy(akey, hkey, hklen + 1);
+                            h = add_handle(ps, akey, (uint32_t)hklen);
+                            if (h) {
+                                h->state = HS_FREED;
+                                h->pool_id = -2;
+                                h->free_line = node->loc.line;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        /* Task.new() alloc tracking handled in zc_check_var_init via alloc pattern */
+        return;
+    }
+
     if (!pool_type || (pool_type->kind != TYPE_POOL && pool_type->kind != TYPE_SLAB)) return;
 
     int pool_id = register_pool(zc, pool_name, plen);
@@ -335,7 +386,9 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         uint32_t mlen = (uint32_t)alloc_call->call.callee->field.field_name_len;
 
         if (((mlen == 5 && memcmp(method, "alloc", 5) == 0) ||
-             (mlen == 9 && memcmp(method, "alloc_ptr", 9) == 0)) &&
+             (mlen == 9 && memcmp(method, "alloc_ptr", 9) == 0) ||
+             (mlen == 3 && memcmp(method, "new", 3) == 0) ||
+             (mlen == 7 && memcmp(method, "new_ptr", 7) == 0)) &&
             obj->kind == NODE_IDENT) {
             /* check if object is Pool/Slab (not Arena — arena allocs don't need individual free) */
             Type *obj_type = checker_get_type(zc->checker, obj);

@@ -464,32 +464,111 @@ These sugars are purely syntactic. Nothing changes in the safety model:
 - Provenance — same @ptrcast / @container tracking
 - Non-storable get() — auto-deref pointer still lives one expression only
 
-## alloc_ptr() — NOT recommended (superseded by Handle auto-deref)
+## alloc_ptr() / free_ptr() — IMPLEMENTED (zercheck Level 9)
 
-Originally considered: `*Task t = slab.alloc_ptr()` returning raw pointer instead of Handle.
+`*Task t = slab.alloc_ptr()` returns a real pointer, not Handle. zercheck tracks it at compile time — UAF, double-free, cross-function free, return-freed all caught. 100% compile-time safe for pure ZER code.
 
-**Problem:** 95% safety only. ABA risk — Slab reuses slots, freed+reallocated slot has new inline header with alive=true, old pointer (copied before poison) passes alive check.
+```zer
+Slab(Task) heap;
+*Task t = heap.alloc_ptr() orelse { return 1; };
+t.id = 42;           // direct pointer deref — zero overhead
+heap.free_ptr(t);
+t.id = 99;           // COMPILE ERROR — zercheck: use-after-free
+```
 
-**Superseded by Handle auto-deref:** `t.id = 1` with Handle gives 100% safety AND C-style syntax. No need for alloc_ptr(). Handle auto-deref is strictly better — same ergonomics, more safety.
+**Handle vs alloc_ptr tradeoff:**
 
-alloc_ptr() remains as a possible v1.0 opt-in for users who explicitly want raw pointer semantics and accept the ABA tradeoff. But it's no longer the recommended path.
+| | Handle(Task) | *Task from alloc_ptr() |
+|---|---|---|
+| Gen check on every access | Yes (100% ABA safe) | No (direct deref) |
+| Compile-time UAF (same func) | zercheck | zercheck (Level 9) |
+| Compile-time UAF (cross func) | zercheck + gen | zercheck FuncSummary (9b) |
+| ABA (slot reuse, aliased ptr) | Gen check catches | Level 3+5 runtime (~1ns) |
+| Syntax | `Handle(Task) t` | `*Task t` |
+| Performance | Gen check per access | Zero overhead |
 
-## Implementation Priority
+Both are valid. Both can coexist on the same Slab/Pool. User chooses: Handle for maximum paranoia, `*Task` for C-style directness.
 
-1. **[*]T syntax** — DONE (parser.c, 10 lines, all tests pass)
-2. **Handle auto-deref** — Next (checker + emitter, ~70 lines)
-3. **Task.new()** — After auto-deref (checker + emitter, ~50 lines, depends on auto-deref)
+**Type checking:** `free_ptr()` validates argument type matches pool/slab element — `*Motor` to `Task` pool is a compile error.
 
-All three are independent of each other but build on each other for maximum ergonomics. Each can be shipped separately.
+**Ghost check:** bare `heap.alloc_ptr();` without assignment is a compile error (leaked allocation).
+
+## *opaque Safety — Compile-Time vs Runtime Coverage
+
+### Current coverage breakdown (after 9a+9b+9c):
+
+| `*opaque` case | Compile-time? | Runtime? | How |
+|---|---|---|---|
+| Direct variable UAF | 100% compile | — | zercheck ALIVE/FREED |
+| Alias UAF (same function) | 100% compile | — | zercheck alias tracking |
+| Struct field `ctx.data` after free | 100% compile | — | 9a: untracked key FREED registration |
+| Cross-function free (FuncSummary) | 100% compile | — | 9b: *T params tracked in summary |
+| Return freed pointer | 100% compile | — | 9c: NODE_RETURN state check |
+| Constant array index `cache[3]` | 100% compile | — | zercheck compound key `cache.3` |
+| Dynamic array index `cache[slot]` | — | ~1ns | Level 3 inline header at `@ptrcast` |
+| C library boundary (`lib_store(p)`) | — | ~1ns | Level 3+5 header check |
+| Integer round-trip (`@ptrtoint`→`@inttoptr`) | — | ~1ns | Level 3 header check |
+| Pointer-to-pointer (`**opaque pp = &p`) | — | ~1ns | Level 3 header check |
+| Pointer math on raw integers | — | ~1ns | Level 3 header check |
+| setjmp/longjmp restoring stale pointer | — | ~1ns | Level 3 header check |
+
+**Total: ~98% compile-time, ~2% runtime at ~1ns per check.**
+
+### The ~2% runtime cases — why they can't be compile-time:
+
+These all involve information that doesn't exist until the program runs:
+- Dynamic array index: `slot` is a runtime value, compiler can't track which element
+- C library: compiler can't see inside compiled C code
+- Integer round-trip: after `@ptrtoint`, it's just a number — math can modify it
+- Pointer-to-pointer: `*pp` dereferences through indirection compiler can't resolve
+
+**No language on earth solves these at compile time.** Not Rust, not Ada, not anything. The information doesn't exist in the source code. Runtime check is the mathematically correct answer.
+
+### Potential optimization: check every `*opaque` USE (not just `@ptrcast`)
+
+Currently the Level 3 inline header check fires at `@ptrcast` (when `*opaque` is cast back to `*Task`). This is the earliest USEFUL point — you can't do anything with `*opaque` without casting first.
+
+A future optimization could check at EVERY `*opaque` expression (function calls, stores, comparisons):
+
+```zer
+free(p);
+lib_store(p);    // currently: not checked here (checked later at @ptrcast)
+                  // optimization: check HERE — catch 1 line earlier
+```
+
+**Status:** Not implemented. Not a safety gap (bug is caught either way). Just makes the error message point to a closer line. Implement if real users report confusing error locations.
+
+### The 5+4 safety levels (all implemented):
+
+| Level | What | When | Cost |
+|---|---|---|---|
+| 1 | zercheck (ALIVE/FREED/MAYBE_FREED) | Compile | Zero |
+| 2 | Poison after free (ptr = NULL) | Runtime (at free) | 1 instruction |
+| 3+4 | Inline 16-byte header (magic `0x5A455243`) | Runtime (at `@ptrcast`) | ~1ns |
+| 5 | `--wrap=malloc` global interception | Runtime (link time) | Same as 3 |
+| 9 | zercheck for `*Task` from `alloc_ptr` | Compile | Zero |
+| 9a | zercheck struct field tracking | Compile | Zero |
+| 9b | zercheck cross-function `*T` summary | Compile | Zero |
+| 9c | zercheck return freed detection | Compile | Zero |
+
+## Implementation Status
+
+1. **[*]T syntax** — DONE
+2. **Handle auto-deref** — DONE (checker + emitter, ~80 lines)
+3. **alloc_ptr() / free_ptr()** — DONE (checker + emitter + zercheck Level 9, ~100 lines)
+4. **zercheck 9a+9b+9c** — DONE (~70 lines)
+5. **Handle(T)[N] arrays** — DONE (parser, ~10 lines)
+6. **Audit fixes** — 6 bugs found and fixed (goto/switch/defer, free_ptr type check, const Handle, ghost alloc_ptr, no-allocator error)
+7. **Task.new()** — NOT YET (auto-Slab creation, ~50 lines)
 
 ## Why This Matters
 
 ZER's goal: C developers adopt ZER without changing how they think. The mental model is pointers, structs, manual memory management. ZER just prevents the bugs.
 
-With these three sugars:
+With these sugars:
 - Declaration looks like C (struct fields, pointer types)
-- Allocation looks like C (one line, get a thing, use it)
-- Field access looks like C (dot operator, no ceremony)
+- Allocation: `Handle(Task) t` for safety, `*Task t` for C-style — both work
+- Field access looks like C (dot operator, no ceremony, auto-deref)
 - Safety is invisible (gen checks, bounds checks, zercheck — all automatic)
 
 The compiler does more work. The developer writes the same code. The bugs disappear.

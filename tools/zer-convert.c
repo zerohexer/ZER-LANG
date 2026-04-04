@@ -1535,7 +1535,7 @@ static void transform(void) {
                             if (pi && pi->is_slice) {
                                 if (had_const) emit_str("const ");
                                 if (pi->is_nullable) emit_str("?");
-                                emit_str("[]u8 ");
+                                emit_str("[*]u8 ");
                                 i = star_pos + 1;
                                 while (i < token_count && tokens[i].type == CT_WHITESPACE) i++;
                                 continue;

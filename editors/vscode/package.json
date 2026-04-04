@@ -2,7 +2,7 @@
     "name": "zerc-language",
     "displayName": "ZER Lang",
     "description": "Memory-safe systems programming — compiler, LSP, and GCC bundled. Zero setup.",
-    "version": "0.2.6",
+    "version": "0.2.8",
     "publisher": "zerohexer",
     "license": "MPL-2.0",
     "repository": {

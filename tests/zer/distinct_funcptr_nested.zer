@@ -1,0 +1,24 @@
+// Nested distinct typedef wrapping function pointer
+// BUG-407: emit_type_and_name only unwrapped one level of distinct
+
+typedef void (*Fn)(u32);
+distinct typedef Fn SafeFn;
+distinct typedef SafeFn ExtraSafeFn;
+
+void handler(u32 x) { }
+
+u32 main() {
+    // non-optional distinct func ptr
+    ExtraSafeFn f = @cast(ExtraSafeFn, @cast(SafeFn, handler));
+    f(10);
+
+    // optional distinct func ptr
+    ?ExtraSafeFn callback = @cast(ExtraSafeFn, @cast(SafeFn, handler));
+    if (callback) |cb| { cb(42); }
+
+    // null optional
+    ?ExtraSafeFn empty = null;
+    if (empty) |cb| { return 1; }
+
+    return 0;
+}

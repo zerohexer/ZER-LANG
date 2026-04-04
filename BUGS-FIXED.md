@@ -7,6 +7,20 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-407: Nested distinct funcptr name placement wrong (Gemini finding)
+- **Symptom:** `distinct typedef Fn SafeFn; distinct typedef SafeFn ExtraSafeFn; ?ExtraSafeFn callback` emits `void (*)(uint32_t) callback` — name AFTER type instead of inside `(*callback)`.
+- **Root cause:** `emit_type_and_name` only checked one level of TYPE_DISTINCT before TYPE_FUNC_PTR. `t->optional.inner->kind == TYPE_DISTINCT && t->optional.inner->distinct.underlying->kind == TYPE_FUNC_PTR` — misses multi-level distinct chains.
+- **Fix:** Changed to `type_unwrap_distinct(t->optional.inner)->kind == TYPE_FUNC_PTR`. Also fixed the non-optional distinct funcptr path (line 480).
+- **Test:** `distinct_funcptr_nested.zer` (non-optional, optional, null optional)
+- **Credit:** Found by Gemini 2.5 Pro via Repomix codebase audit.
+
+### BUG-408: ?void initialized from void function call (Gemini finding)
+- **Symptom:** `?void result = do_work();` emits `_zer_opt_void result = do_work();` — void expression in struct initializer, GCC error.
+- **Root cause:** var-decl init for `?T` with NODE_CALL assigns directly (`= call()`). Works for functions returning values, but void functions can't be used as initializer expressions.
+- **Fix:** When target is `?void` and call returns `TYPE_VOID`, hoist call to statement: `result; do_work(); result = (_zer_opt_void){ 1 };`. Same pattern as BUG-145 (NODE_RETURN void-as-statement).
+- **Test:** `void_optional_init.zer` (void func, ?void func, null)
+- **Credit:** Found by Gemini 2.5 Pro via Repomix codebase audit.
+
 ### BUG-405: Handle auto-deref scalar store blocked by non-storable check
 - **Symptom:** `u32 v = h.value;` where `h` is `Handle(Sensor)` → "cannot store result of get() — use inline." Scalar field reads from Handle auto-deref blocked.
 - **Root cause:** `is_non_storable()` check at var-decl init (line 4468) and assignment (line 1635) fired on ALL expressions from Handle auto-deref, regardless of result type. The check should only block `*T` pointer storage (caching pool.get result), not scalar field values.

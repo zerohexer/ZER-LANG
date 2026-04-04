@@ -477,8 +477,8 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
     }
 
     /* distinct function pointer: unwrap distinct to get func ptr for name placement */
-    if (t->kind == TYPE_DISTINCT && t->distinct.underlying->kind == TYPE_FUNC_PTR) {
-        Type *fp = t->distinct.underlying;
+    if (t->kind == TYPE_DISTINCT && type_unwrap_distinct(t)->kind == TYPE_FUNC_PTR) {
+        Type *fp = type_unwrap_distinct(t);
         emit_type(e, fp->func_ptr.ret);
         emit(e, " (*%.*s)(", (int)name_len, name);
         for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
@@ -503,9 +503,8 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
     }
 
     /* optional distinct function pointer: ?DistinctFuncPtr → null sentinel with name inside (*) */
-    if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_DISTINCT &&
-        t->optional.inner->distinct.underlying->kind == TYPE_FUNC_PTR) {
-        Type *fp = t->optional.inner->distinct.underlying;
+    if (t->kind == TYPE_OPTIONAL && type_unwrap_distinct(t->optional.inner)->kind == TYPE_FUNC_PTR) {
+        Type *fp = type_unwrap_distinct(t->optional.inner);
         emit_type(e, fp->func_ptr.ret);
         emit(e, " (*%.*s)(", (int)name_len, name);
         for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
@@ -2474,9 +2473,23 @@ static void emit_stmt(Emitter *e, Node *node) {
                 } else if (node->var_decl.init->kind == NODE_CALL ||
                            node->var_decl.init->kind == NODE_ORELSE ||
                            node->var_decl.init->kind == NODE_INTRINSIC) {
-                    /* call/orelse/intrinsic might already return ?T — assign directly */
-                    emit(e, " = ");
-                    emit_expr(e, node->var_decl.init);
+                    /* call/orelse/intrinsic might already return ?T — assign directly.
+                     * BUG-408: ?void from void function — hoist void call to statement,
+                     * then init with { 1 }. Can't put void expression in initializer. */
+                    Type *call_ret = checker_get_type(e->checker, node->var_decl.init);
+                    if (call_ret && call_ret->kind == TYPE_VOID &&
+                        type_unwrap_distinct(type->optional.inner)->kind == TYPE_VOID) {
+                        emit(e, ";\n");
+                        emit_indent(e);
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ";\n");
+                        emit_indent(e);
+                        emit(e, "%.*s = (_zer_opt_void){ 1 }",
+                             (int)node->var_decl.name_len, node->var_decl.name);
+                    } else {
+                        emit(e, " = ");
+                        emit_expr(e, node->var_decl.init);
+                    }
                 } else if (node->var_decl.init->kind == NODE_IDENT) {
                     /* check if ident is already ?T or needs wrapping */
                     Type *init_type = checker_get_type(e->checker,node->var_decl.init);

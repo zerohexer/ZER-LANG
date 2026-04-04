@@ -1,0 +1,30 @@
+// ?void initialized from void function call
+// BUG-408: void expression can't be used in struct initializer
+
+void do_work() { }
+void setup() { }
+
+?void try_validate(u32 x) {
+    if (x > 100) { return null; }
+    return;
+}
+
+u32 main() {
+    // ?void from void function — hoisted to statement
+    ?void result = do_work();
+    if (result) |v| { } else { return 1; }
+
+    // ?void from another void function
+    ?void r2 = setup();
+    if (r2) |v| { } else { return 2; }
+
+    // ?void from ?void function — direct assign (already ?void)
+    ?void r3 = try_validate(50);
+    if (r3) |v| { } else { return 3; }
+
+    // ?void null
+    ?void r4 = try_validate(200);
+    if (r4) |v| { return 4; }
+
+    return 0;
+}

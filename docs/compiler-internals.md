@@ -240,6 +240,14 @@ The `is_non_storable` check blocked ALL var-decl/assignment from Handle auto-der
 
 Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only error when the result type is TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, or TYPE_UNION. Scalar types pass through.
 
+### Nested Distinct FuncPtr Name Placement (BUG-407, 2026-04-05)
+
+`emit_type_and_name` only checked one level of TYPE_DISTINCT before TYPE_FUNC_PTR dispatch. `distinct typedef (distinct typedef Fn) ExtraSafeFn` wrapped TWO levels — the second was missed, producing `void (*)(uint32_t) name` instead of `void (*name)(uint32_t)`. Fixed: use `type_unwrap_distinct()` at both the optional and non-optional distinct func ptr paths (lines 480, 506).
+
+### ?void Init from Void Function (BUG-408, 2026-04-05)
+
+`?void result = do_work()` where `do_work()` returns void — emitter put void expression in struct initializer (`_zer_opt_void result = do_work()`). GCC error: void can't be in initializer. Fixed: detect void call target + ?void type, hoist call to statement, then assign `(_zer_opt_void){ 1 }`. Same pattern as BUG-145 (NODE_RETURN void-as-statement logic).
+
 ### Return String Literal from Const Slice Function (BUG-406, 2026-04-05)
 
 `const [*]u8 get() { return "hello"; }` was rejected — checker fired "cannot return string literal as mutable slice" without checking if the return type was `const`. Fix: added `!ret->slice.is_const` condition. Also handles `?const [*]u8` optional return path.

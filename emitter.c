@@ -1880,7 +1880,11 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "if (!_zer_tmp%d.has_value) ", tmp);
             }
             emit_stmt(e, node->orelse.fallback);
-            emit(e, " 0; })");
+            if (is_ptr_optional) {
+                emit(e, " _zer_tmp%d; })", tmp);
+            } else {
+                emit(e, " _zer_tmp%d.value; })", tmp);
+            }
         } else {
             int tmp = e->temp_count++;
             emit(e, "({__auto_type _zer_tmp%d = ", tmp);

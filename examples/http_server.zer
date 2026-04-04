@@ -1,0 +1,116 @@
+// Minimal HTTP server in ZER — stress test for the compiler
+// Tests: [*]u8, defer, Task.new_ptr, alloc_ptr, struct, loops, goto
+
+// POSIX socket declarations (extern C functions)
+i32 socket(i32 domain, i32 socktype, i32 protocol);
+i32 bind(i32 fd, *opaque addr, u32 addrlen);
+i32 listen(i32 fd, i32 backlog);
+i32 accept(i32 fd, *opaque addr, *opaque addrlen);
+i32 read(i32 fd, *opaque buf, u32 count);
+i32 write(i32 fd, *opaque buf, u32 count);
+i32 close(i32 fd);
+i32 setsockopt(i32 fd, i32 level, i32 optname, *opaque optval, u32 optlen);
+i32 puts(*opaque s);
+
+// Constants
+const i32 AF_INET = 2;
+const i32 SOCK_STREAM = 1;
+const i32 SOL_SOCKET = 1;
+const i32 SO_REUSEADDR = 2;
+
+// sockaddr_in — 16 bytes
+packed struct SockAddr {
+    u16 family;
+    u16 port;
+    u32 addr;
+    u8 pad0;
+    u8 pad1;
+    u8 pad2;
+    u8 pad3;
+    u8 pad4;
+    u8 pad5;
+    u8 pad6;
+    u8 pad7;
+}
+
+struct Request {
+    u8[1024] raw;
+    u32 len;
+}
+
+// htons — byte swap for network order
+u16 htons(u16 val) {
+    u16 hi = @truncate(u16, @truncate(u8, val));
+    u16 lo = @truncate(u16, @truncate(u8, val >> 8));
+    return (hi << 8) | lo;
+}
+
+// Simple string compare
+bool str_starts_with([*]u8 haystack, u32 haystack_len, [*]u8 needle, u32 needle_len) {
+    if (haystack_len < needle_len) { return false; }
+    for (u32 i = 0; i < needle_len; i += 1) {
+        if (haystack[i] != needle[i]) { return false; }
+    }
+    return true;
+}
+
+// Handle one client connection
+void handle_client(i32 client_fd) {
+    u8[1024] buf;
+    i32 n = read(client_fd, @ptrcast(*opaque, &buf), 1024);
+    if (n <= 0) { return; }
+
+    // Simple response
+    const [*]u8 response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 36\r\nConnection: close\r\n\r\nHello from ZER — no GC, no crashes!";
+
+    write(client_fd, @ptrcast(*opaque, response.ptr), @truncate(u32, response.len));
+}
+
+u32 main() {
+    // Create socket
+    i32 server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        puts("socket failed");
+        return 1;
+    }
+    defer close(server_fd);
+
+    // Set SO_REUSEADDR
+    i32 opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, @ptrcast(*opaque, &opt), 4);
+
+    // Bind to port 8080
+    SockAddr addr;
+    addr.family = @truncate(u16, AF_INET);
+    addr.port = htons(8080);
+    addr.addr = 0;
+
+    i32 bind_result = bind(server_fd, @ptrcast(*opaque, &addr), @truncate(u32, @size(SockAddr)));
+    if (bind_result < 0) {
+        puts("bind failed");
+        return 2;
+    }
+
+    // Listen
+    if (listen(server_fd, 10) < 0) {
+        puts("listen failed");
+        return 3;
+    }
+
+    puts("ZER HTTP server listening on port 8080");
+
+    // Accept loop — handle 3 connections then exit (for testing)
+    for (u32 i = 0; i < 3; i += 1) {
+        i32 client_fd = accept(server_fd, @ptrcast(*opaque, &addr), @ptrcast(*opaque, &opt));
+        if (client_fd < 0) {
+            puts("accept failed");
+            return 4;
+        }
+
+        handle_client(client_fd);
+        close(client_fd);
+    }
+
+    puts("ZER HTTP server done — handled 3 requests");
+    return 0;
+}

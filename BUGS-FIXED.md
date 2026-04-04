@@ -25,6 +25,21 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### BUG: orelse block null-sentinel emits 0 instead of _zer_tmp
+- **Symptom:** `*Node a = heap.alloc_ptr() orelse { return 1; };` — `a` gets assigned `0` (integer) instead of pointer. GCC warns "initialization of 'struct Node *' from 'int'". Runtime: pointer is 0 → access fault.
+- **Root cause:** Emitter's orelse block path (line ~1883) emitted literal `"0;"` as final expression of statement expression for ALL orelse block fallbacks. For null-sentinel `?*T`, should emit `_zer_tmp` (the unwrapped pointer). For struct optionals, should emit `_zer_tmp.value`.
+- **Fix:** Changed `emit(e, " 0; })")` to emit `_zer_tmp` for null-sentinel, `_zer_tmp.value` for struct optional — same pattern as the `orelse return` path (line 1863-1867).
+- **Affected:** ALL `*T = alloc_ptr() orelse { block }` patterns. Also `?*T` orelse { block } generally.
+- **Found by:** Writing HTTP server in ZER — real code exercising `alloc_ptr` + `orelse { return; }` block syntax.
+- **Note:** The `orelse return;` bare form (line 1835) was correct — only the block `{ return; }` form was broken. This is why existing tests passed — they all used bare `orelse return`.
+- **Test:** Verified via http_server.zer example + manual tests 2/3/5.
+
+### BUG: zercheck false warning: defer free_ptr not recognized as free
+- **Symptom:** `defer heap.free_ptr(it);` in loop — zercheck warns "handle 'it' allocated but never freed". But the defer DOES free it — emitted C shows `_zer_slab_free_ptr` correctly.
+- **Root cause:** zercheck doesn't look inside defer bodies for free calls. Linear analysis skips deferred statements.
+- **Status:** Known limitation. Warning only, not error. Emitted code IS correct.
+- **Impact:** Cosmetic — false warning on valid code using defer + free_ptr.
+
 ### FEATURE: Task.new() / Task.delete() — auto-Slab
 - **What:** `Task.new()` → `?Handle(Task)`, `Task.new_ptr()` → `?*Task`, `Task.delete(h)`, `Task.delete_ptr(p)`. No Slab declaration needed. Compiler auto-creates `_zer_auto_slab_TaskName` per struct type.
 - **Implementation:** Checker: auto_slabs array on Checker struct. NODE_FIELD on TYPE_STRUCT intercepts new/new_ptr/delete/delete_ptr. Emitter: two-pass declaration (structs → auto-slabs → functions).

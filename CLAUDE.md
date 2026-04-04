@@ -464,6 +464,9 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - **Known limitation:** zercheck is linear (not CFG-based). Backward goto UAF (`free(h); goto retry;` where retry is before free) not caught at compile time. Runtime gen check catches it.
 - `Task.new()` / `Task.delete()` — auto-creates a global `Slab(T)` per struct type. No Slab declaration needed. Returns `?Handle(T)`. `Task.new_ptr()` returns `?*T`. `Task.delete_ptr()` type-checks argument. Auto-slabs emitted after struct declarations, before function bodies (two-pass emission). One auto-Slab per struct type, program-wide.
 - **Emitter two-pass:** `emit_file` now emits struct/enum/union/typedef declarations first (pass 1), then auto-slab globals, then functions/globals (pass 2). This ensures auto-slabs can use `sizeof(StructType)`.
+- **CRITICAL BUG (fixed):** orelse block path (`orelse { return; }`) emitted `0` as final statement expression value for null-sentinel `?*T`. This made ALL `*T = alloc_ptr() orelse { return; }` assign 0 instead of the pointer. The bare form (`orelse return`) was correct — only the block form was broken. Fixed: emit `_zer_tmp` for null-sentinel, `_zer_tmp.value` for struct optional.
+- **Real code finds real bugs:** Writing a 60-line HTTP server in ZER found this orelse bug that 1,700+ tests missed. All tests used bare `orelse return`, none used block `orelse { return; }`. Lesson: write real programs in ZER, not just tests.
+- zercheck limitation: `defer free_ptr(t)` not recognized as "t is freed" — zercheck warns "never freed" but emitted code is correct. Cosmetic false warning.
 - Pool/Slab/Arena are NOT the same thing with different names — Pool (fixed, ISR-safe, no malloc), Slab (dynamic, grows via calloc, NOT ISR-safe), Arena (bump allocator, bulk reset). Don't rename or unify them.
 - `pool.get()` is non-storable — `*Task t = pool.get(h)` is a checker error. Must use inline: `pool.get(h).field`. This prevents caching a pointer that becomes invalid after another alloc/free.
 - Array→slice auto-coercion at call sites already works: `process(arr)` where `process([]u8 data)` auto-converts `u8[N]` to `[]u8 {ptr, len}`.
@@ -507,7 +510,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Real `.zer` files compiled with `zerc --run`, must exit 0
 - Runner: `tests/test_zer.sh`, added to `make check`
 - Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained, tracked_malloc, arena_alloc, comptime_eval, bit_fields, optional_patterns, star_slice, goto_label, goto_switch_label, goto_defer, handle_autoderef, handle_autoderef_pool, alloc_ptr, alloc_ptr_pool, alloc_ptr_mixed, alloc_ptr_stress, handle_complex, handle_array, opaque_safe_patterns, task_new, task_new_ptr, task_new_complex
-- Negative tests: uaf_handle, double_free, maybe_freed, bounds_oob, div_zero, null_ptr, dangling_return, isr_slab_alloc, ghost_handle, goto_bad_label, alloc_ptr_uaf, alloc_ptr_double_free, opaque_struct_uaf, opaque_return_freed, opaque_alias_uaf, opaque_maybe_freed, opaque_double_free, cross_func_free_ptr
+- Negative tests: uaf_handle, double_free, maybe_freed, bounds_oob, div_zero, null_ptr, dangling_return, isr_slab_alloc, ghost_handle, goto_bad_label, alloc_ptr_uaf, alloc_ptr_double_free, opaque_struct_uaf, opaque_return_freed, opaque_alias_uaf, opaque_maybe_freed, opaque_double_free, cross_func_free_ptr, free_ptr_wrong_type, handle_no_allocator, const_handle_mutation, ghost_alloc_ptr
+- Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
 - Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
 
 **Bugs Fixed This Session (2026-04-02):**

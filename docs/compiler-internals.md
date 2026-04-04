@@ -188,6 +188,17 @@ Parser: after parsing `TYNODE_HANDLE`, checks for `[N]` suffix. If found, wraps 
 
 **Coverage after 9a+9b+9c:** ~98% compile-time for `*opaque`. Remaining ~2% is runtime: dynamic array indices (`cache[slot]`), C library internals (can't see inside C code). Runtime check is 1ns inline header at `@ptrcast`.
 
+### orelse block null-sentinel bug (fixed 2026-04-05)
+
+The `orelse { block }` path in the emitter (line ~1883) emitted literal `0` as the final expression of the statement expression. For null-sentinel `?*T` (like `?*Node` from `alloc_ptr`), this assigned integer 0 instead of the pointer. The `orelse return` bare path (line ~1863) was correct.
+
+**Pattern to watch:** There are THREE orelse emission paths:
+1. `orelse return/break/continue` (bare) — line ~1835. Emits `_zer_tmp` or `_zer_tmp.value`.
+2. `orelse { block }` — line ~1869. Was emitting `0`, now emits `_zer_tmp` / `_zer_tmp.value`.
+3. `orelse default_value` — line ~1884. Emits ternary `tmp ? tmp : default`.
+
+Any future changes to orelse must update ALL THREE paths consistently. Check `is_ptr_optional` branching in each.
+
 ### Task.new() / Task.delete() — Auto-Slab Sugar
 
 **Checker:** When NODE_FIELD on TYPE_STRUCT with method `new`/`new_ptr`/`delete`/`delete_ptr`, checker creates/finds auto-Slab in `checker.auto_slabs[]`. One auto-Slab per struct type (program-wide). `auto_slabs` is an arena-allocated dynamic array on the Checker struct.

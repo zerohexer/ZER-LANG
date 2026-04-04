@@ -1,0 +1,51 @@
+// orelse { block } with null-sentinel ?*T — the fixed bug pattern
+// Tests: alloc_ptr + orelse { return }, struct field Handle, defer + alloc_ptr
+
+struct Node { u32 value; u32 depth; }
+Slab(Node) heap;
+
+struct Job {
+    Handle(Node) node;
+    u32 priority;
+}
+
+u32 main() {
+    // Test 1: alloc_ptr with orelse block (was broken — emitted 0)
+    *Node a = heap.alloc_ptr() orelse { return 1; };
+    a.value = 42;
+    if (a.value != 42) { return 2; }
+
+    // Test 2: multiple alloc_ptrs with orelse blocks
+    *Node b = heap.alloc_ptr() orelse { return 3; };
+    *Node c = heap.alloc_ptr() orelse { return 4; };
+    b.value = 10;
+    c.value = 20;
+    if (b.value != 10) { return 5; }
+    if (c.value != 20) { return 6; }
+
+    // Test 3: Handle in struct field with auto-deref
+    Job j;
+    j.node = heap.alloc() orelse { return 7; };
+    j.priority = 99;
+    j.node.value = 77;
+    j.node.depth = 3;
+    if (j.node.value != 77) { return 8; }
+    if (j.node.depth != 3) { return 9; }
+    if (j.priority != 99) { return 10; }
+
+    // Test 4: defer + alloc_ptr in loop
+    for (u32 i = 0; i < 5; i += 1) {
+        *Node tmp = heap.alloc_ptr() orelse { return 11; };
+        defer heap.free_ptr(tmp);
+        tmp.value = i * 100;
+        if (tmp.value != i * 100) { return 12; }
+    }
+
+    // Cleanup
+    heap.free_ptr(a);
+    heap.free_ptr(b);
+    heap.free_ptr(c);
+    heap.free(j.node);
+
+    return 0;
+}

@@ -1,689 +1,1502 @@
-# ZER Language Reference
+# ZER(C) Language Reference
 
-**Version:** 0.1 | **Compiler:** `zerc` | **Target:** Any platform GCC supports
-**1018 tests + 491 fuzz inputs, all passing**
-
----
-
-## Types
-
-### Primitive Types
-
-| Type | Size | Description |
-|------|------|-------------|
-| `u8` | 1 byte | Unsigned 8-bit integer |
-| `u16` | 2 bytes | Unsigned 16-bit integer |
-| `u32` | 4 bytes | Unsigned 32-bit integer |
-| `u64` | 8 bytes | Unsigned 64-bit integer |
-| `i8` | 1 byte | Signed 8-bit integer |
-| `i16` | 2 bytes | Signed 16-bit integer |
-| `i32` | 4 bytes | Signed 32-bit integer |
-| `i64` | 8 bytes | Signed 64-bit integer |
-| `usize` | platform | Pointer-width unsigned |
-| `f32` | 4 bytes | 32-bit float |
-| `f64` | 8 bytes | 64-bit float |
-| `bool` | 1 byte | `true` or `false` (not an integer) |
-| `void` | 0 | Return type only |
-
-All integers auto-zero on declaration. Overflow wraps (defined behavior). Shift by >= width returns 0.
-
-### Arrays
-
-Size goes between type and name:
-
-```zer
-u8[256] buf;        // 256-byte buffer
-u32[4] values;      // 4 u32s
-```
-
-Every index is bounds-checked at runtime. Out-of-bounds traps.
-
-### Slices — `[]T`
-
-A `{ptr, len}` pair. Always bounded.
-
-```zer
-[]u8 data;                   // slice of bytes
-void process([]u8 input) {   // function parameter
-    u8 first = input[0];     // bounds-checked
-    usize n = input.len;     // .len field
-}
-```
-
-String literals are `[]u8`:
-
-```zer
-[]u8 msg = "hello";          // .ptr and .len (len=5, no NUL)
-```
-
-Sub-slicing:
-
-```zer
-buf[0..3]    // elements 0,1,2 (exclusive end)
-buf[2..]     // element 2 through end
-buf[..5]     // elements 0-4
-```
-
-Array-to-slice coercion happens at function calls, var-decl init, and return:
-
-```zer
-u8[256] buf;
-void process([]u8 data) { }
-process(buf);                // auto-coerces: { .ptr=buf, .len=256 }
-[]u8 s = buf;                // also coerces at var-decl
-```
-
-**Safety:** Returning a local array as a slice is a compile error — the slice would dangle after the function returns. Global/static arrays can be returned as slices.
-
-### Pointers — `*T`
-
-Non-null by default. The compiler guarantees `*T` is never null.
-
-```zer
-*Task t = get_task();        // always valid
-t.priority = 5;              // safe — guaranteed non-null
-```
-
-ZER does **not** support pointer arithmetic. Use array indexing or `@inttoptr`/`@ptrtoint` for address math.
-
-### Optional Pointers — `?*T`
-
-Might be null. Must unwrap before use.
-
-```zer
-?*Task maybe = find_task();
-maybe.priority = 5;                    // COMPILE ERROR
-if (maybe) |t| { t.priority = 5; }    // safe — unwrapped
-```
-
-Zero overhead — represented as a plain C pointer where NULL = none.
-
-### Optional Values — `?T`
-
-Carries a value or nothing.
-
-```zer
-?u32 result;                 // struct { u32 value; u8 has_value; }
-?bool flag;                  // struct { u8 value; u8 has_value; }
-?void status;                // struct { u8 has_value; } — NO value field
-```
-
-### Type-Erased Pointer — `*opaque`
-
-Equivalent to C's `void*`. Cannot be dereferenced without casting back.
-
-```zer
-*opaque raw = @ptrcast(*opaque, &my_task);
-*Task t = @ptrcast(*Task, raw);          // explicit cast back
-```
-
-### Const
-
-```zer
-const u32 MAX = 100;
-const []u8 NAME = "ZER";    // in .rodata (flash on embedded)
-```
+**Zero Error Risk C Extension**
+**Version:** 0.2.1 | **Compiler:** `zerc` | **Target:** Any platform GCC supports
+**1700+ tests, all passing**
 
 ---
 
-## Declarations
+## PRIMITIVE TYPES
 
-### Variables
+### u8, u16, u32, u64
 
-```zer
-u32 x;                      // auto-zeroed to 0
-u32 y = 42;                 // explicit init
-static u32 count;           // persists across calls
-```
+DESCRIPTION
+    Unsigned integers of 8, 16, 32, and 64 bits respectively.
+    Auto-zeroed on declaration. Overflow wraps (defined behavior, never UB).
 
-### Functions
+SYNTAX
+    u8 a;           // 0
+    u16 b = 1000;
+    u32 c = 0xDEAD;
+    u64 d = 123456789;
 
-```zer
-u32 add(u32 a, u32 b) {
-    return a + b;
-}
+NOTES
+    - No implicit narrowing: `u8 x = 300;` is a compile error. Use `@truncate(u8, 300)` or `@saturate(u8, 300)`.
+    - No implicit sign conversion: `u32 x = -1;` is a compile error. Use `@bitcast(u32, -1)`.
+    - Shift by >= width returns 0 (defined, not UB).
 
-?u32 safe_divide(u32 a, u32 b) {
-    if (b == 0) { return null; }
-    return a / b;
-}
-
-void no_return() {
-    // ...
-}
-```
-
-### Structs
-
-```zer
-struct Task {
-    u32 pid;
-    []u8 name;
-    u32 priority;
-}
-
-Task t;                      // no 'struct' prefix in usage
-t.pid = 42;
-```
-
-### Packed Structs
-
-```zer
-packed struct SensorPacket {
-    u8  id;
-    u16 temperature;         // unaligned — ZER handles safely
-    u8  checksum;
-}   // exactly 4 bytes, no padding
-```
-
-### Enums
-
-```zer
-enum State { idle, running, blocked, done }
-
-State s = State.idle;        // qualified access
-
-switch (s) {
-    .idle    => { start(); }
-    .running => { work(); }
-    .blocked => { wait(); }
-    .done    => { finish(); }
-}
-```
-
-Explicit values and gaps (like C):
-
-```zer
-enum ErrorCode { ok = 0, warn = 100, err, fatal }
-// ok=0, warn=100, err=101 (auto), fatal=102 (auto)
-```
-
-Enum switches must be exhaustive — missing a variant is a compile error.
-
-### Tagged Unions
-
-```zer
-union Message {
-    SensorData sensor;
-    Command    command;
-    Ack        ack;
-}
-
-Message msg;
-msg.sensor = read_sensor();  // sets tag automatically
-
-switch (msg) {
-    .sensor  => |data| { process(data); }     // immutable capture
-    .command => |*cmd| { cmd.x = 5; }         // mutable capture
-    .ack     => |a|    { confirm(a); }
-}
-
-msg.sensor.temperature;      // COMPILE ERROR — must switch first
-```
-
-Mutable capture `|*v|` modifies the original union — the switch takes a pointer to the source (`&(expr)`), not a copy. Mutating the switched-on union's variant inside a capture arm is a compile error (type confusion prevention).
-
-### Function Pointers
-
-Same syntax as C. Optional function pointers use null sentinel (zero overhead).
-
-```zer
-u32 (*fn)(u32, u32) = add;                    // local variable
-void (*callback)(u32 event);                   // global variable
-struct Ops { u32 (*compute)(u32); }            // struct field
-u32 apply(u32 (*op)(u32, u32), u32 x, u32 y); // parameter
-?void (*on_event)(u32) = null;                 // optional — null = not set
-typedef u32 (*BinOp)(u32, u32);                // function pointer typedef
-```
-
-Optional function pointers:
-
-```zer
-?void (*callback)(u32) = null;
-callback = my_handler;           // set it
-if (callback) |cb| { cb(42); }  // safe — unwrap before calling
-```
-
-### Distinct Types
-
-```zer
-typedef u32 Milliseconds;                // alias — interchangeable with u32
-distinct typedef u32 Celsius;            // distinct — NOT interchangeable
-distinct typedef u32 Fahrenheit;
-
-Fahrenheit f = celsius_val;              // COMPILE ERROR — distinct types
-Celsius c = @cast(Celsius, 100);         // wrap: u32 → Celsius
-u32 raw = @cast(u32, c);                // unwrap: Celsius → u32
-Fahrenheit f = @cast(Fahrenheit, c);     // COMPILE ERROR — cross-distinct
-```
+SEE ALSO
+    i8..i64, @truncate, @saturate, @bitcast
 
 ---
 
-## Control Flow
+### i8, i16, i32, i64
+
+DESCRIPTION
+    Signed integers of 8, 16, 32, and 64 bits respectively.
+    Auto-zeroed on declaration. Overflow wraps (defined behavior).
+
+SYNTAX
+    i32 x = -42;
+    i8 small = @truncate(i8, big_value);
+
+NOTES
+    - Same rules as unsigned: no implicit narrowing, no implicit sign conversion.
+
+SEE ALSO
+    u8..u64
+
+---
+
+### usize
+
+DESCRIPTION
+    Pointer-width unsigned integer. Auto-detected from GCC at compile time
+    (32-bit or 64-bit). Override with `--target-bits N`.
+
+SYNTAX
+    usize len = data.len;
+    usize addr = @ptrtoint(ptr);
+
+NOTES
+    - Returned by `@size(T)`, `@offset(T, field)`, `@ptrtoint(ptr)`.
+    - Returned by `.len` on arrays and slices.
+
+SEE ALSO
+    @size, @ptrtoint
+
+---
+
+### f32, f64
+
+DESCRIPTION
+    IEEE 754 floating-point numbers. 32-bit and 64-bit.
+
+SYNTAX
+    f32 temp = 36.6;
+    f64 precise = 3.14159265358979;
+
+---
+
+### bool
+
+DESCRIPTION
+    Boolean type. Only `true` or `false`. NOT an integer — no bool-to-int
+    or int-to-bool coercion.
+
+SYNTAX
+    bool ready = true;
+    bool done = false;
+
+EXAMPLE
+    bool flag = true;
+    if (flag) { go(); }      // OK
+    u32 x = flag;             // COMPILE ERROR — bool is not integer
+    bool b = 1;               // COMPILE ERROR — int is not bool
+    if (x) { }                // COMPILE ERROR — x is u32, not bool
+
+NOTES
+    - Switch on bool must be exhaustive: both `true` and `false` arms required.
+    - Comparisons (`==`, `<`, etc.) return bool.
+
+---
+
+### void
+
+DESCRIPTION
+    Return type only. Cannot declare void variables.
+
+SYNTAX
+    void do_work() { }
+
+NOTES
+    - `?void` is valid — `struct { u8 has_value; }` with NO `.value` field.
+    - Used as return type for `push_checked()` and similar try-operations.
+
+---
+
+## COMPOUND TYPES
+
+### T[N] — Fixed Array
+
+DESCRIPTION
+    Fixed-size array. Size goes between type and name (NOT after name like C).
+    Every index access is bounds-checked. Out-of-bounds traps at runtime.
+    Compile-time constant indices are checked at compile time.
+
+SYNTAX
+    u8[256] buf;              // 256 bytes, auto-zeroed
+    u32[4] values;            // 4 u32s
+    i32[3][3] matrix;         // 3x3 multi-dimensional
+
+EXAMPLE
+    u32[4] scores;
+    scores[0] = 100;
+    scores[3] = 200;          // OK — index 3 < 4
+    scores[4] = 300;          // COMPILE ERROR — index 4 >= 4
+
+    u32 i = get_index();
+    scores[i] = 50;           // runtime bounds check — traps if i >= 4
+
+FIELDS
+    .len        → usize       Array length (compile-time constant)
+
+COERCION
+    T[N] auto-coerces to [*]T at function calls, var-decl init, and return:
+
+    u8[256] buf;
+    void process([*]u8 data) { }
+    process(buf);              // auto-coerces: { .ptr=buf, .len=256 }
+
+NOTES
+    - Size must be a compile-time constant.
+    - Returning a local array as a slice is a compile error (dangling pointer).
+
+SEE ALSO
+    [*]T
+
+---
+
+### [*]T — Dynamic Pointer to Many
+
+DESCRIPTION
+    A fat pointer: `{ *T ptr; usize len; }`. Carries a pointer AND its length.
+    Every index access is bounds-checked. Reads as "pointer to many T".
+
+    This is ZER's replacement for C's `T*` when pointing to arrays/buffers.
+    Preferred over `[]T` (which is deprecated).
+
+SYNTAX
+    [*]u8 name;               // pointer to many bytes
+    [*]Task items;            // pointer to many Tasks
+    const [*]u8 msg = "hi";  // string literal (read-only)
+
+EXAMPLE
+    void process([*]u32 data) {
+        for (u32 i = 0; i < data.len; i += 1) {
+            data[i] += 1;     // bounds-checked: i < data.len
+        }
+    }
+
+    u32[8] arr;
+    process(arr);              // auto-coerces: T[N] → [*]T
+
+FIELDS
+    .ptr        → *T          Raw pointer to first element
+    .len        → usize       Number of elements
+
+SUB-SLICING
+    buf[0..3]                  // elements 0,1,2 (exclusive end)
+    buf[2..]                   // element 2 through end
+    buf[..5]                   // elements 0-4
+
+NOTES
+    - `[]T` is deprecated. Use `[*]T` instead. `[]T` emits a warning.
+    - String literals are `const [*]u8`, not `char*`.
+    - Cannot be null. Use `?[*]T` for nullable.
+
+SEE ALSO
+    T[N], *T, []T
+
+---
+
+### []T — Slice (DEPRECATED)
+
+DESCRIPTION
+    Same as `[*]T`. Deprecated — compiler warns "use [*]T instead".
+    Kept for backward compatibility. Will be removed in v1.0.
+
+SYNTAX
+    []u8 data;                 // WARNING: use [*]u8 instead
+
+SEE ALSO
+    [*]T
+
+---
+
+### *T — Pointer to One
+
+DESCRIPTION
+    Non-null pointer. The compiler guarantees `*T` is never null.
+    Must be initialized at declaration.
+
+    Auto-derefs for field access: `ptr.field` works (no `->` needed).
+
+SYNTAX
+    *Task t = &my_task;
+    t.priority = 5;            // auto-deref, like ptr->priority in C
+
+EXAMPLE
+    struct Task { u32 id; u32 priority; }
+
+    void set_priority(*Task t, u32 p) {
+        t.priority = p;        // auto-deref
+    }
+
+ERRORS
+    *Task t;                   // COMPILE ERROR — non-null pointer requires initializer
+                               // use ?*Task for nullable
+
+NOTES
+    - No pointer arithmetic. `ptr + 1` is a compile error. Use indexing or @ptrtoint.
+    - Pointer indexing (`ptr[5]`) emits a warning — use [*]T for bounds-checked access.
+
+SEE ALSO
+    ?*T, [*]T, *opaque
+
+---
+
+### ?*T — Optional Pointer (Nullable)
+
+DESCRIPTION
+    Pointer that might be null. Must unwrap before use.
+    Zero overhead — represented as a plain C pointer where NULL = none.
+
+SYNTAX
+    ?*Task maybe = null;
+    ?*Task found = find_task(id);
+
+EXAMPLE
+    ?*Task maybe = find_task(42);
+
+    // COMPILE ERROR — must unwrap first:
+    maybe.id = 1;
+
+    // Correct — unwrap with if:
+    if (maybe) |t| {
+        t.id = 1;              // t is *Task, guaranteed non-null
+    }
+
+    // Correct — unwrap with orelse:
+    *Task t = maybe orelse return;
+    t.id = 1;
+
+SEE ALSO
+    *T, ?T, orelse, if-unwrap
+
+---
+
+### ?T — Optional Value
+
+DESCRIPTION
+    Carries a value or nothing. Implemented as a struct with `has_value` flag.
+    Must unwrap before use.
+
+SYNTAX
+    ?u32 result;               // struct { u32 value; u8 has_value; }
+    ?bool flag;                // struct { u8 value; u8 has_value; }
+    ?void status;              // struct { u8 has_value; } — NO .value field!
+
+EXAMPLE
+    ?u32 safe_divide(u32 a, u32 b) {
+        if (b == 0) { return null; }
+        return a / b;
+    }
+
+    u32 result = safe_divide(10, 3) orelse 0;  // default to 0
+
+NOTES
+    - `?void` has ONE field (`has_value`). Everything else has TWO (`value` + `has_value`).
+    - Returning `null` sets `has_value = 0`.
+    - Returning a value sets `has_value = 1` and stores the value.
+
+SEE ALSO
+    ?*T, orelse, if-unwrap
+
+---
+
+### *opaque — Type-Erased Pointer
+
+DESCRIPTION
+    Equivalent to C's `void*`. Cannot be dereferenced without casting back.
+    Provenance-tracked: the compiler remembers what type was cast in, and
+    rejects casting out to a different type.
+
+SYNTAX
+    *opaque raw = @ptrcast(*opaque, &my_task);
+
+EXAMPLE
+    struct Task { u32 id; }
+    struct Motor { u32 rpm; }
+
+    *opaque ctx = @ptrcast(*opaque, &task);   // provenance = *Task
+    *Task t = @ptrcast(*Task, ctx);           // OK — matches provenance
+    *Motor m = @ptrcast(*Motor, ctx);         // COMPILE ERROR — wrong type
+
+NOTES
+    - Extern/cinclude pointers have unknown provenance (type_id=0) — cast check skipped.
+    - Level 1-5 *opaque tracking catches UAF through malloc/free. See docs/ZER_OPAQUE.md.
+
+SEE ALSO
+    @ptrcast, cinclude
+
+---
+
+## DECLARATIONS
+
+### struct
+
+DESCRIPTION
+    User-defined aggregate type. No `struct` keyword needed in usage.
+    All fields auto-zeroed.
+
+SYNTAX
+    struct Task {
+        u32 id;
+        [*]u8 name;
+        u32 priority;
+        ?*Task next;
+    }
+
+EXAMPLE
+    Task t;                    // no 'struct' prefix (unlike C)
+    t.id = 42;
+    t.name = "worker";
+    t.priority = 3;
+    t.next = null;
+
+NOTES
+    - No semicolon after closing `}` (unlike C).
+    - Pool/Slab/Ring/Arena cannot be struct fields.
+
+SEE ALSO
+    packed struct, enum, union
+
+---
+
+### packed struct
+
+DESCRIPTION
+    Struct with no padding between fields. Emits `__attribute__((packed))`.
+    Used for hardware registers, network packets, binary protocols.
+
+SYNTAX
+    packed struct SensorPacket {
+        u8 id;
+        u16 temperature;      // unaligned — ZER handles safely
+        u8 checksum;
+    }   // exactly 4 bytes, no padding
+
+SEE ALSO
+    struct
+
+---
+
+### enum
+
+DESCRIPTION
+    Named integer constants. Values are `i32` internally.
+    Switch on enum must be exhaustive — missing a variant is a compile error.
+
+SYNTAX
+    enum State { idle, running, blocked, done }
+
+EXAMPLE
+    State s = State.idle;      // qualified access
+
+    switch (s) {
+        .idle    => { start(); }
+        .running => { work(); }
+        .blocked => { wait(); }
+        .done    => { finish(); }
+    }
+
+    // Explicit values and gaps:
+    enum ErrorCode { ok = 0, warn = 100, err, fatal }
+    // ok=0, warn=100, err=101, fatal=102
+
+    // Negative values:
+    enum Direction { left = -1, center = 0, right = 1 }
+
+NOTES
+    - Dot syntax required: `State.idle`, not bare `idle`.
+    - Switch arms use `.variant => { }` syntax.
+
+SEE ALSO
+    switch, union
+
+---
+
+### union (Tagged)
+
+DESCRIPTION
+    Tagged union. Tag is set automatically on assignment.
+    Must switch to access variant — direct field access is a compile error.
+
+SYNTAX
+    union Message {
+        SensorData sensor;
+        Command command;
+        Ack ack;
+    }
+
+EXAMPLE
+    Message msg;
+    msg.sensor = read_sensor();     // sets tag to .sensor
+
+    switch (msg) {
+        .sensor  => |data| { process(data); }   // immutable capture
+        .command => |*cmd| { cmd.x = 5; }       // mutable capture (pointer)
+        .ack     => |a|    { confirm(a); }
+    }
+
+    msg.sensor.temperature;         // COMPILE ERROR — must switch first
+
+NOTES
+    - Mutable capture `|*v|` takes a pointer to the original union variant.
+    - Mutating the switched-on union's variant inside a capture arm is a compile error.
+
+SEE ALSO
+    enum, switch
+
+---
+
+### Function
+
+DESCRIPTION
+    Function declaration. Return type before name (like C).
+    All parameters are by value unless pointer.
+
+SYNTAX
+    u32 add(u32 a, u32 b) {
+        return a + b;
+    }
+
+EXAMPLE
+    ?u32 safe_divide(u32 a, u32 b) {
+        if (b == 0) { return null; }
+        return a / b;
+    }
+
+    void greet([*]u8 name) {
+        // ...
+    }
+
+NOTES
+    - `void` return = no return value.
+    - `?T` return = can return `null` for failure.
+    - `static` functions are module-internal (not visible to importers).
+
+---
+
+### Function Pointer
+
+DESCRIPTION
+    Same syntax as C. Optional function pointers use null sentinel.
+
+SYNTAX
+    u32 (*fn)(u32, u32) = add;                 // local variable
+    void (*callback)(u32 event);               // global variable
+    struct Ops { u32 (*compute)(u32); }        // struct field
+    u32 apply(u32 (*op)(u32, u32), u32 x, u32 y);  // parameter
+    ?void (*on_event)(u32) = null;             // optional — null = not set
+    typedef u32 (*BinOp)(u32, u32);            // typedef
+
+EXAMPLE
+    ?void (*callback)(u32) = null;
+    callback = my_handler;
+    if (callback) |cb| { cb(42); }   // safe — unwrap before calling
+
+SEE ALSO
+    typedef, distinct typedef
+
+---
+
+### typedef / distinct typedef
+
+DESCRIPTION
+    `typedef` creates an alias — interchangeable with the base type.
+    `distinct typedef` creates a new type — NOT interchangeable. Use `@cast` to convert.
+
+SYNTAX
+    typedef u32 Milliseconds;              // alias — u32 and Milliseconds are same
+    distinct typedef u32 Celsius;          // distinct — NOT interchangeable
+    distinct typedef u32 Fahrenheit;
+
+EXAMPLE
+    Celsius c = @cast(Celsius, 100);       // wrap: u32 → Celsius
+    u32 raw = @cast(u32, c);              // unwrap: Celsius → u32
+    Fahrenheit f = @cast(Fahrenheit, c);   // COMPILE ERROR — cross-distinct
+
+SEE ALSO
+    @cast
+
+---
+
+### const
+
+DESCRIPTION
+    Compile-time constant. Value must be known at compile time.
+
+SYNTAX
+    const u32 MAX = 100;
+    const [*]u8 NAME = "ZER";    // in .rodata (flash on embedded)
+
+---
+
+### static
+
+DESCRIPTION
+    On local variables: persists across function calls (like C).
+    On functions: internal to module (not visible to importers).
+
+SYNTAX
+    void count() {
+        static u32 n;
+        n += 1;
+    }
+
+    static void helper() { }    // not exported
+
+---
+
+## CONTROL FLOW
 
 ### if / else
 
-Braces always required. `else if` works like C.
+DESCRIPTION
+    Conditional execution. Braces ALWAYS required (no braceless one-liners).
+    `else if` is supported.
 
-```zer
-if (x > 5) {
-    do_thing();
-}
-
-if (a) {
-    handle_a();
-} else if (b) {
-    handle_b();
-} else {
-    handle_neither();
+SYNTAX
+    if (condition) {
+        // body
     }
-}
-```
+
+    if (a) {
+        handle_a();
+    } else if (b) {
+        handle_b();
+    } else {
+        handle_neither();
+    }
+
+ERRORS
+    if (x > 5) return 1;      // COMPILE ERROR — braces required
+
+---
 
 ### for
 
-No `++` or `--`. Use `+= 1`.
+DESCRIPTION
+    C-style for loop. No `++` or `--` — use `+= 1` / `-= 1`.
+    Loop variable is scoped to the loop body.
 
-```zer
-for (u32 i = 0; i < 10; i += 1) {
-    process(i);
-}
-```
+SYNTAX
+    for (u32 i = 0; i < 10; i += 1) {
+        process(i);
+    }
 
-Loop variable `i` is scoped to the loop body.
+ERRORS
+    for (u32 i = 0; i < 10; i++) { }   // COMPILE ERROR — no ++
+
+---
 
 ### while
 
-```zer
-while (running) {
-    poll();
-}
-```
+DESCRIPTION
+    Loop while condition is true. Braces required.
+
+SYNTAX
+    while (running) {
+        poll();
+    }
+
+---
 
 ### switch
 
-Uses `=>` arrows. No `case` keyword. No fallthrough. No `break` needed.
+DESCRIPTION
+    Pattern matching on enums, integers, and bools.
+    Uses `=>` arrows. No `case` keyword. No fallthrough. No `break` needed.
+    Enum and bool switches must be exhaustive. Integer switches need `default`.
 
-```zer
-// Enum — exhaustive, no default needed
-switch (state) {
-    .idle    => { start(); }
-    .running => { work(); }
-    .done    => { finish(); }
-}
+SYNTAX
+    // Enum — exhaustive
+    switch (state) {
+        .idle    => { start(); }
+        .running => { work(); }
+        .done    => { finish(); }
+    }
 
-// Integer — default required
-switch (code) {
-    0 => { ok(); }
-    1 => { retry(); }
-    default => { error(); }
-}
+    // Integer — default required
+    switch (code) {
+        0 => { ok(); }
+        1, 2 => { retry(); }      // multi-value arm
+        default => { error(); }
+    }
 
-// Bool — exhaustive
-switch (ready) {
-    true  => { go(); }
-    false => { wait(); }
-}
+    // Bool — exhaustive
+    switch (ready) {
+        true  => { go(); }
+        false => { wait(); }
+    }
 
-// Multi-value arms
-switch (val) {
-    0, 1, 2 => { low(); }
-    3, 4    => { high(); }
-    default => { other(); }
-}
-```
+NOTES
+    - Union switch uses capture syntax: `.variant => |val| { ... }`
+    - Mutable capture: `.variant => |*val| { val.field = 5; }`
+
+SEE ALSO
+    enum, union
+
+---
 
 ### defer
 
-Runs at scope exit, in reverse order. Fires on all exit paths.
+DESCRIPTION
+    Runs a statement at scope exit, in reverse order of declaration.
+    Fires on ALL exit paths (return, break, continue, end of block).
 
-```zer
-void transfer() {
-    mutex_lock(&lock);
-    defer mutex_unlock(&lock);    // runs last
-    cs_low();
-    defer cs_high();              // runs first (reverse order)
+SYNTAX
+    defer statement;
 
-    if (error) { return; }        // both defers fire
-    do_work();
-}
-```
+EXAMPLE
+    void transfer() {
+        mutex_lock(&lock);
+        defer mutex_unlock(&lock);     // runs last
+        cs_low();
+        defer cs_high();               // runs first (reverse order)
+
+        if (error) { return; }         // both defers fire
+        do_work();
+    }   // defers fire: cs_high() then mutex_unlock()
+
+NOTES
+    - Multiple defers in same scope run in LIFO order (last declared = first run).
 
 ---
 
-## Optional Unwrapping
+## OPTIONAL UNWRAPPING
 
 ### orelse
 
-```zer
-u32 val = get_value() orelse 0;          // default value
-u32 val = get_value() orelse return;     // bare return (no value!)
-u32 val = get_value() orelse break;      // exit loop
-u32 val = get_value() orelse continue;   // skip iteration
-u32 val = get_value() orelse {           // block fallback
-    log_error();
-    return;
-};
-```
+DESCRIPTION
+    Unwrap an optional value. If null, execute the fallback.
 
-**Critical:** `orelse return` is bare. `orelse return 1` is a parse error.
+SYNTAX
+    u32 val = get_value() orelse 0;           // default value
+    u32 val = get_value() orelse return;      // bare return (NO value!)
+    u32 val = get_value() orelse break;       // exit loop
+    u32 val = get_value() orelse continue;    // skip iteration
+    u32 val = get_value() orelse {            // block fallback
+        log_error();
+        return;
+    };
+
+ERRORS
+    u32 val = get_value() orelse return 1;    // PARSE ERROR — orelse return is bare
+
+NOTES
+    - `orelse return` has no value. The return value comes from the function's return type.
+    - For bool-returning functions, restructure to avoid orelse in return path.
+
+SEE ALSO
+    ?T, ?*T, if-unwrap
+
+---
 
 ### if-unwrap
 
-```zer
-if (maybe_val) |v| {
-    use(v);                              // v is the unwrapped value
-}
+DESCRIPTION
+    Unwrap an optional in an if-condition. If non-null, the captured variable
+    holds the unwrapped value inside the body.
 
-if (maybe_ptr) |*p| {
-    p.field = 5;                         // mutable capture
-}
-```
+SYNTAX
+    if (optional) |val| {
+        // val is the unwrapped value (immutable)
+    }
 
----
+    if (optional) |*val| {
+        // val is a mutable pointer to the unwrapped value
+        val.field = 5;
+    }
 
-## Intrinsics
+EXAMPLE
+    ?u32 result = safe_divide(10, 3);
 
-All intrinsics start with `@`.
+    if (result) |val| {
+        use(val);              // val is u32, guaranteed non-null
+    } else {
+        handle_error();
+    }
 
-### Type Conversion
-
-| Intrinsic | Description | Example |
-|-----------|-------------|---------|
-| `@truncate(T, val)` | Keep low bits (big → small) | `@truncate(u8, big_u32)` |
-| `@saturate(T, val)` | Clamp to T's min/max | `@saturate(i8, 200)` → 127 |
-| `@bitcast(T, val)` | Reinterpret bits (same width) | `@bitcast(u32, signed_i32)` |
-| `@cast(T, val)` | Distinct typedef wrap/unwrap | `@cast(Celsius, u32_val)` or `@cast(u32, celsius_val)` |
-
-### Pointer Operations
-
-| Intrinsic | Description | Example |
-|-----------|-------------|---------|
-| `@inttoptr(*T, addr)` | Integer → pointer | `@inttoptr(*u32, 0x4000_0000)` |
-| `@ptrtoint(ptr)` | Pointer → usize | `@ptrtoint(my_ptr)` |
-| `@ptrcast(*T, ptr)` | Pointer type cast | `@ptrcast(*Task, opaque_ptr)` |
-
-### Struct Operations
-
-| Intrinsic | Description | Example |
-|-----------|-------------|---------|
-| `@size(T)` | sizeof → usize | `@size(Task)` |
-| `@offset(T, field)` | offsetof → usize | `@offset(Task, priority)` |
-| `@container(*T, ptr, field)` | container_of | `@container(*Task, field_ptr, name)` |
-
-### Memory Barriers
-
-| Intrinsic | Description | Emitted C |
-|-----------|-------------|-----------|
-| `@barrier()` | Full memory barrier | `__atomic_thread_fence(__ATOMIC_SEQ_CST)` |
-| `@barrier_store()` | Store barrier | `__atomic_thread_fence(__ATOMIC_RELEASE)` |
-| `@barrier_load()` | Load barrier | `__atomic_thread_fence(__ATOMIC_ACQUIRE)` |
-
-### Other
-
-| Intrinsic | Description |
-|-----------|-------------|
-| `@cstr(buf, slice)` | Copy `[]u8` into buffer + NUL terminator for C interop |
-| `@config(key, default)` | Build-time constant from `--config` flag |
-| `@trap()` | Intentional crash — calls `_zer_trap` |
+SEE ALSO
+    orelse, ?T, ?*T
 
 ---
 
-## Builtin Types
+## BUILTIN ALLOCATORS
 
 ### Pool(T, N) — Fixed-Slot Allocator
 
-Must be global. Pre-allocated array of N slots with generation counters.
+DESCRIPTION
+    Pre-allocated array of N slots with generation counters. Must be global.
+    ISR-safe — no heap, no malloc, no locking. Fixed at compile time.
 
-```zer
-Pool(Task, 8) tasks;
+    Every slot has a generation counter. When freed, the generation increments.
+    Accessing a freed slot with an old handle traps (generation mismatch).
 
-// Allocate — returns Handle or null
-Handle(Task) h = tasks.alloc() orelse return;
+SYNOPSIS
+    Pool(Task, 8) tasks;       // 8 slots for Task, global only
 
-// Access — must use inline, cannot store result
-tasks.get(h).priority = 5;
+METHODS
+    .alloc()     → ?Handle(T)  Allocate a slot. Returns null if all slots used.
+    .get(h)      → *T          Access by handle. Traps if gen mismatch.
+    .free(h)     → void        Free slot, increment generation.
 
-// Free — handle consumed, use-after-free caught by ZER-CHECK
-tasks.free(h);
-```
+EXAMPLE
+    struct Task { u32 id; u32 priority; }
+    Pool(Task, 8) tasks;
 
-| Method | Return | Description |
-|--------|--------|-------------|
-| `.alloc()` | `?Handle(T)` | Allocate a slot |
-| `.get(h)` | `*T` | Access by handle (generation checked) |
-| `.free(h)` | `void` | Release slot, increment generation |
+    u32 main() {
+        Handle(Task) t = tasks.alloc() orelse { return 1; };
+        tasks.get(t).id = 42;
+        tasks.get(t).priority = 3;
+
+        tasks.free(t);
+        // tasks.get(t).id = 1;   // COMPILE ERROR: use-after-free
+        return 0;
+    }
+
+ERRORS
+    Pool on stack          → COMPILE ERROR — must be global
+    tasks.get(t) after free → COMPILE ERROR (zercheck: use-after-free)
+    tasks.free(t) twice    → COMPILE ERROR (zercheck: double free)
+    tasks.alloc();         → COMPILE ERROR (ghost handle — must assign result)
+
+NOTES
+    - Pool does NOT use heap. Safe for ISR and bare metal.
+    - `.get(h)` result is non-storable: `*Task t = tasks.get(h)` is a compile error.
+      Must use inline: `tasks.get(h).field`.
+    - N must be a compile-time constant.
+
+SEE ALSO
+    Slab(T), Handle(T), Arena
+
+---
+
+### Slab(T) — Dynamic Growable Allocator
+
+DESCRIPTION
+    Dynamic slab allocator. Grows on demand via calloc. Same Handle API as Pool
+    but not limited to a fixed count. Must be global.
+
+    NOT ISR-safe — calloc may use a global mutex that deadlocks in interrupt context.
+
+SYNOPSIS
+    Slab(Task) heap;           // global only
+
+METHODS
+    .alloc()     → ?Handle(T)  Allocate a slot. Returns null if OOM.
+    .get(h)      → *T          Access by handle. Traps if gen mismatch.
+    .free(h)     → void        Free slot, increment generation.
+
+EXAMPLE
+    struct Task { u32 id; [*]u8 name; ?*Task next; }
+    Slab(Task) heap;
+
+    u32 main() {
+        Handle(Task) t1 = heap.alloc() orelse { return 1; };
+        heap.get(t1).id = 1;
+        heap.get(t1).name = "first";
+
+        Handle(Task) t2 = heap.alloc() orelse { return 2; };
+        heap.get(t2).id = 2;
+
+        heap.free(t1);
+        heap.free(t2);
+        return 0;
+    }
+
+ERRORS
+    Slab.alloc() in interrupt handler → COMPILE ERROR (calloc may deadlock)
+    Same zercheck errors as Pool (UAF, double-free, ghost handle)
+
+NOTES
+    - Use Pool for ISR-safe allocation with fixed count.
+    - Use Slab for dynamic allocation when count is unknown.
+    - Slab uses calloc internally — requires a heap (OS, RTOS, or custom allocator).
+
+SEE ALSO
+    Pool(T,N), Handle(T), Arena
+
+---
+
+### Handle(T) — Slot Reference
+
+DESCRIPTION
+    A 64-bit value: index (32 bits) + generation (32 bits). NOT a pointer.
+    Used to safely reference slots in Pool and Slab. Generation counter
+    prevents use-after-free with 100% detection (ABA-safe).
+
+SYNOPSIS
+    Handle(Task) h = pool.alloc() orelse { return 1; };
+
+EXAMPLE
+    Pool(Task, 8) tasks;
+
+    Handle(Task) h = tasks.alloc() orelse { return 1; };
+    tasks.get(h).id = 42;         // gen checked on every access
+
+    Handle(Task) saved = h;        // copy the handle
+    tasks.free(h);                 // gen incremented
+
+    // Runtime: saved has old gen → mismatch → trap
+    // Compile: zercheck catches this as use-after-free
+
+NOTES
+    - Handle is a value type (u64). Can be copied, stored in structs, passed to functions.
+    - Cannot be dereferenced directly. Must use `pool.get(h)` or `slab.get(h)`.
+    - `?Handle(T)` is an optional handle — used as return type of `.alloc()`.
+
+SEE ALSO
+    Pool(T,N), Slab(T)
+
+---
 
 ### Ring(T, N) — Circular Buffer
 
-Must be global. ISR-safe with memory barriers.
+DESCRIPTION
+    Fixed-size circular buffer. ISR-safe with memory barriers.
+    Must be global. Used for producer-consumer patterns (e.g., UART RX/TX).
 
-```zer
-Ring(u8, 256) rx_buf;
+SYNOPSIS
+    Ring(u8, 256) rx_buf;      // 256-byte circular buffer, global only
 
-rx_buf.push(byte);                          // always succeeds, overwrites oldest
-rx_buf.push_checked(byte) orelse { ... };   // returns ?void, null if full
-if (rx_buf.pop()) |byte| { process(byte); } // returns ?T, null if empty
-```
+METHODS
+    .push(val)         → void    Push value. Overwrites oldest if full.
+    .push_checked(val) → ?void   Push value. Returns null if full.
+    .pop()             → ?T      Pop oldest. Returns null if empty.
 
-| Method | Return | Description |
-|--------|--------|-------------|
-| `.push(val)` | `void` | Push, overwrite oldest if full |
-| `.push_checked(val)` | `?void` | Push, return null if full |
-| `.pop()` | `?T` | Pop oldest, return null if empty |
+EXAMPLE
+    Ring(u8, 256) rx_buf;
+
+    // Producer (e.g., interrupt handler):
+    interrupt USART1 {
+        u8 byte = @truncate(u8, UART1.DR);
+        rx_buf.push(byte);                     // always succeeds
+    }
+
+    // Consumer (main loop):
+    while (true) {
+        if (rx_buf.pop()) |byte| {
+            process(byte);
+        }
+    }
+
+    // Checked push (don't overwrite):
+    rx_buf.push_checked(byte) orelse {
+        // buffer full — drop or handle
+    };
+
+NOTES
+    - N must be a compile-time constant.
+    - ISR-safe: uses memory barriers between producer and consumer.
+
+SEE ALSO
+    Pool(T,N)
+
+---
 
 ### Arena — Bump Allocator
 
-Uses developer-owned memory. No heap.
+DESCRIPTION
+    Bump allocator over developer-owned memory. No heap.
+    Allocates forward, frees everything at once with `.reset()`.
+    Cannot free individual allocations.
 
-```zer
-u8[4096] mem;
-Arena ar = Arena.over(mem);
+SYNOPSIS
+    u8[4096] backing;
+    Arena ar = Arena.over(backing);
 
-// Allocate struct (T must be struct/enum name, NOT primitive)
-*Task t = ar.alloc(Task) orelse return;
+METHODS
+    Arena.over(buf)        → Arena     Create arena over an array or slice.
+    .alloc(T)              → ?*T       Allocate one T (aligned). T must be struct/enum name.
+    .alloc_slice(T, n)     → ?[*]T     Allocate n elements. T must be struct/enum name.
+    .reset()               → void      Reset offset to 0 (frees everything).
+    .unsafe_reset()        → void      Reset without warning.
 
-// Allocate slice (T must be struct/enum name)
-struct Elem { u32 val; }
-?[]Elem items = ar.alloc_slice(Elem, 16);
+EXAMPLE
+    struct Node { u32 id; ?*Node next; }
 
-// Reset
-defer ar.reset();           // recommended — in defer
-ar.unsafe_reset();          // no warning variant
-```
+    u8[4096] backing;
+    Arena ar = Arena.over(backing);
 
-| Method | Return | Description |
-|--------|--------|-------------|
-| `Arena.over(buf)` | `Arena` | Create arena over array or slice |
-| `.alloc(T)` | `?*T` | Allocate one T (aligned) |
-| `.alloc_slice(T, n)` | `?[]T` | Allocate n elements |
-| `.reset()` | `void` | Reset offset to 0 |
-| `.unsafe_reset()` | `void` | Reset without warning |
+    *Node a = ar.alloc(Node) orelse { return 1; };
+    a.id = 1;
 
----
+    *Node b = ar.alloc(Node) orelse { return 2; };
+    b.id = 2;
+    a.next = b;
 
-## Hardware Support
+    defer ar.reset();      // free everything at scope exit
 
-### Volatile / MMIO
+ERRORS
+    ar.alloc(u32)          → PARSE ERROR — T must be struct/enum name, not primitive
+    ar.alloc_slice(u8, n)  → PARSE ERROR — same restriction
 
-```zer
-volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);
-*reg = 0xFF;             // never optimized away
-u32 val = *reg;          // never cached
-```
+    // Workaround for primitives:
+    struct Byte { u8 val; }
+    ar.alloc_slice(Byte, 64);
 
-### Interrupt Handlers
+NOTES
+    - Arena-derived pointers cannot be stored in global/static variables (compile error).
+    - No individual free — arena is all-or-nothing.
+    - Use `defer ar.reset()` to ensure cleanup on all exit paths.
 
-```zer
-interrupt USART1 {
-    u8 byte = @truncate(u8, UART1.DR);
-    rx_buf.push(byte);
-}
-
-interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
-    // ...
-}
-```
-
-Emitted C: `void __attribute__((interrupt)) USART1_IRQHandler(void) { ... }`
-
-### Bit Extraction / Set
-
-```zer
-u32 mode = reg[9..8];       // extract bits 9:8
-reg[7..4] = 0x0F;           // set bits 7:4
-u8 low_bit = val[0..0];     // single bit
-```
-
-### Inline Assembly
-
-```zer
-asm("cpsid i");              // disable interrupts
-asm("wfi");                  // wait for interrupt
-```
-
-### Packed Structs
-
-```zer
-packed struct UART_Regs {
-    u32 SR; u32 DR; u32 BRR; u32 CR1; u32 CR2; u32 CR3;
-}
-```
-
-Emitted C: `__attribute__((packed))`. ZER handles unaligned access safely.
+SEE ALSO
+    Pool(T,N), Slab(T)
 
 ---
 
-## Modules
+## INTRINSICS
 
-```zer
-import uart;                 // imports uart.zer from same directory
-import gpio;
+All intrinsics start with `@`.
 
-uart_init(9600);             // direct access to exported functions
-```
+### @truncate(T, val)
 
-- Functions are visible to importers by default
-- `static` functions are internal only
-- Circular imports are a compile error
-- No header files, no forward declarations needed
+DESCRIPTION
+    Keep the low bits of val to fit into type T. For big-to-small conversions.
+
+EXAMPLE
+    u8 low = @truncate(u8, 0x1234);    // 0x34
 
 ---
 
-## C Interop
+### @saturate(T, val)
 
-### Including C Headers
+DESCRIPTION
+    Clamp val to the min/max of type T. No data loss — just capped.
 
-```zer
-cinclude "stm32f4xx_hal.h";   // C header — passed through to #include in emitted C
-import uart;                   // ZER module — full safety pipeline
-```
+EXAMPLE
+    i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
+    u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
 
-### Keep Parameters
+---
 
-Functions that store pointers beyond the call must annotate with `keep`:
+### @bitcast(T, val)
 
-```zer
-void register_callback(keep *Handler h) {
-    global_handler = h;        // stores pointer — caller must pass static/global
-}
+DESCRIPTION
+    Reinterpret the bits of val as type T. Same bit width required.
+    Checks qualifier preservation (const, volatile).
 
-register_callback(&local_handler);  // COMPILE ERROR — local can't satisfy keep
-register_callback(&global_handler); // OK — global persists
-```
+EXAMPLE
+    u32 bits = @bitcast(u32, my_i32);  // same bits, different type
 
-### Calling C from ZER
+---
 
-```zer
-const []u8 path = "data.bin";
-u8[64] cbuf;
-?*opaque f = c_fopen(@cstr(cbuf, path), "rb");
-if (f) |file| { use(file); }
-```
+### @cast(T, val)
 
-### Type Mapping
+DESCRIPTION
+    Convert between a distinct typedef and its base type. Only works for
+    distinct typedefs — not general-purpose.
+
+EXAMPLE
+    distinct typedef u32 Celsius;
+    Celsius c = @cast(Celsius, 100);   // wrap
+    u32 raw = @cast(u32, c);          // unwrap
+
+---
+
+### @inttoptr(*T, addr)
+
+DESCRIPTION
+    Convert integer address to pointer. Used for MMIO registers.
+    Requires `mmio` range declaration (compile error without it).
+    Address must be aligned to T's alignment.
+
+SYNOPSIS
+    @inttoptr(*T, address)
+
+EXAMPLE
+    mmio 0x40020000..0x40020FFF;       // declare valid MMIO range
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+
+ERRORS
+    @inttoptr(*u32, 0x12345678)        // COMPILE ERROR — no mmio range declared
+    @inttoptr(*u32, 0x40020001)        // COMPILE ERROR — misaligned for u32
+
+NOTES
+    - `--no-strict-mmio` flag allows @inttoptr without mmio declarations.
+    - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
+
+SEE ALSO
+    @ptrtoint, mmio
+
+---
+
+### @ptrtoint(ptr)
+
+DESCRIPTION
+    Convert pointer to usize integer.
+
+EXAMPLE
+    usize addr = @ptrtoint(my_ptr);
+
+---
+
+### @ptrcast(*T, ptr)
+
+DESCRIPTION
+    Cast pointer to a different pointer type. Provenance-tracked: the compiler
+    remembers what type went in through `*opaque` round-trips.
+
+EXAMPLE
+    *opaque ctx = @ptrcast(*opaque, &sensor);  // provenance = *Sensor
+    *Sensor s = @ptrcast(*Sensor, ctx);        // OK — matches
+    *Motor m = @ptrcast(*Motor, ctx);          // COMPILE ERROR — wrong provenance
+
+NOTES
+    - Checks qualifier preservation (const, volatile cannot be stripped).
+    - Unknown provenance (function params, cinclude) → check skipped.
+
+SEE ALSO
+    *opaque, @container
+
+---
+
+### @container(*T, ptr, field)
+
+DESCRIPTION
+    Container-of: given a pointer to a struct field, get a pointer to the
+    containing struct. Field existence is validated at compile time.
+
+EXAMPLE
+    struct Device { u32 id; ListHead list; }
+
+    *ListHead ptr = &dev.list;
+    *Device d = @container(*Device, ptr, list);   // OK
+
+---
+
+### @size(T)
+
+DESCRIPTION
+    Returns the size of type T in bytes as usize. Like C's sizeof.
+
+EXAMPLE
+    usize s = @size(Task);     // e.g., 12
+
+---
+
+### @offset(T, field)
+
+DESCRIPTION
+    Returns the byte offset of a field within struct T as usize. Like C's offsetof.
+
+EXAMPLE
+    usize off = @offset(Task, priority);
+
+---
+
+### @trap()
+
+DESCRIPTION
+    Intentional crash. Calls the ZER trap handler with a message.
+
+EXAMPLE
+    if (should_never_happen) { @trap(); }
+
+---
+
+### @probe(addr)
+
+DESCRIPTION
+    Safe MMIO read. Returns `?u32` — null if the address faults (unmapped memory).
+    Uses signal-based fault handler. Works on any platform.
+
+EXAMPLE
+    ?u32 val = @probe(0x40020000);
+    if (val) |v| {
+        // hardware present
+    } else {
+        // address faulted — hardware not present
+    }
+
+---
+
+### @barrier(), @barrier_store(), @barrier_load()
+
+DESCRIPTION
+    Memory barriers. Full, store-only, or load-only.
+    Emits GCC `__atomic_thread_fence()`.
+
+---
+
+### @cstr(buf, slice)
+
+DESCRIPTION
+    Copy a `[*]u8` slice into a fixed buffer and append NUL terminator.
+    For C interop (C functions expect NUL-terminated strings).
+
+EXAMPLE
+    u8[64] cbuf;
+    const [*]u8 name = "hello";
+    *u8 cname = @cstr(cbuf, name);    // "hello\0" in cbuf
+
+NOTES
+    - Returns pointer to buf. If slice doesn't fit, returns zero value (auto-guard).
+
+---
+
+### @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor
+
+DESCRIPTION
+    Atomic read-modify-write operations. Uses GCC `__atomic_*` builtins.
+    Value must be 1, 2, 4, or 8 bytes wide.
+
+EXAMPLE
+    u32 counter;
+    @atomic_add(&counter, 1);
+
+---
+
+### @atomic_load, @atomic_store
+
+DESCRIPTION
+    Atomic load and store with sequential consistency.
+
+EXAMPLE
+    u32 val = @atomic_load(&shared);
+    @atomic_store(&shared, 42);
+
+---
+
+### @atomic_cas(ptr, expected, desired)
+
+DESCRIPTION
+    Compare-and-swap. Returns bool (true if swapped).
+
+EXAMPLE
+    bool swapped = @atomic_cas(&lock, 0, 1);
+
+---
+
+### @critical { }
+
+DESCRIPTION
+    Interrupt-disabled block. Disables interrupts on entry, re-enables on exit.
+    Per-architecture interrupt disable/enable.
+
+EXAMPLE
+    @critical {
+        // interrupts disabled here
+        shared_counter += 1;
+    }
+    // interrupts re-enabled
+
+---
+
+## HARDWARE SUPPORT
+
+### mmio
+
+DESCRIPTION
+    Declare valid MMIO address ranges. Required for @inttoptr (unless --no-strict-mmio).
+    Multiple ranges allowed. Checked at compile time for constants, runtime for variables.
+
+SYNTAX
+    mmio 0x40020000..0x40020FFF;
+    mmio 0x40011000..0x4001103F;
+
+---
+
+### volatile
+
+DESCRIPTION
+    Prevents compiler from optimizing away reads/writes. Required for MMIO registers.
+
+SYNTAX
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+
+NOTES
+    - Shared globals accessed from interrupt handlers must be volatile.
+    - Compound assign (`reg |= 1`) on shared volatile → compile error (non-atomic RMW).
+
+---
+
+### interrupt
+
+DESCRIPTION
+    Interrupt handler declaration. Emits `__attribute__((interrupt))`.
+
+SYNTAX
+    interrupt USART1 {
+        // handler body
+    }
+
+    interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
+        // handler body
+    }
+
+NOTES
+    - Slab.alloc() inside interrupt → compile error (calloc may deadlock).
+    - Access to non-volatile shared globals → compile error.
+
+---
+
+### asm
+
+DESCRIPTION
+    Inline assembly. GCC operand syntax. Raw pass-through.
+
+SYNTAX
+    asm("cpsid i");              // disable interrupts
+    asm("wfi");                  // wait for interrupt
+
+    // With operands (GCC extended syntax):
+    asm("mov %0, %1" : "=r"(out) : "r"(in));
+
+---
+
+### naked functions
+
+DESCRIPTION
+    Function with no compiler-generated prologue/epilogue.
+    Body must be pure assembly.
+
+SYNTAX
+    naked void reset_handler() {
+        asm("ldr sp, =_stack_top");
+        asm("b main");
+    }
+
+---
+
+### section attribute
+
+DESCRIPTION
+    Place function or variable in a specific linker section.
+
+SYNTAX
+    section(".isr_vector") u32[64] vector_table;
+
+---
+
+## MODULES
+
+### import
+
+DESCRIPTION
+    Import another ZER file. Functions are visible by default.
+    `static` functions are not exported.
+
+SYNTAX
+    import uart;               // imports uart.zer from same directory
+    import gpio;
+
+EXAMPLE
+    // uart.zer:
+    void uart_init(u32 baud) { }
+    static void internal_helper() { }   // not visible to importers
+
+    // main.zer:
+    import uart;
+    u32 main() {
+        uart_init(9600);       // OK
+        // internal_helper();  // COMPILE ERROR — static
+        return 0;
+    }
+
+NOTES
+    - Circular imports are a compile error.
+    - No header files needed.
+
+---
+
+### cinclude
+
+DESCRIPTION
+    Include a C header file. Passes through to `#include` in emitted C.
+    Does NOT register C symbols — you must declare every C function you want
+    to call as a ZER function signature.
+
+SYNTAX
+    cinclude "<stdlib.h>";
+    cinclude "my_header.h";
+
+EXAMPLE
+    cinclude "<stdlib.h>";
+
+    *opaque malloc(usize size);
+    void free(*opaque ptr);
+
+    u32 main() {
+        *opaque raw = malloc(64);
+        free(raw);
+        return 0;
+    }
+
+NOTES
+    - C macros (stderr, stdout, etc.) are NOT accessible. Wrap in a C helper function.
+    - `_zer_` prefix is reserved — name helpers `zer_get_stderr`, not `_zer_stderr`.
+
+SEE ALSO
+    import, *opaque
+
+---
+
+## COMPTIME
+
+### comptime functions
+
+DESCRIPTION
+    Compile-time evaluated functions. Replaces C `#define` macros.
+    All arguments must be compile-time constants. Zero runtime cost.
+
+SYNTAX
+    comptime u32 BIT(u32 n) { return 1 << n; }
+    comptime u32 MAX(u32 a, u32 b) {
+        if (a > b) { return a; }
+        return b;
+    }
+
+EXAMPLE
+    u32 mask = BIT(3);         // → 8 at compile time
+    u32 big = MAX(10, 20);     // → 20 at compile time
+
+    u32 x = 5;
+    u32 y = BIT(x);            // COMPILE ERROR — x is not compile-time constant
+
+---
+
+### comptime if
+
+DESCRIPTION
+    Conditional compilation. Replaces C `#ifdef`. Condition must be compile-time constant.
+    Only the taken branch is type-checked — dead branch is ignored entirely.
+
+SYNTAX
+    comptime if (DEBUG) {
+        // only compiled when DEBUG is true
+    } else {
+        // only compiled when DEBUG is false
+    }
+
+EXAMPLE
+    const bool DEBUG = true;
+
+    comptime if (DEBUG) {
+        void log([*]u8 msg) { puts(msg.ptr); }
+    } else {
+        void log([*]u8 msg) { }    // no-op in release
+    }
+
+---
+
+## C INTEROP
+
+### keep parameters
+
+DESCRIPTION
+    Functions that store pointers beyond the call must annotate with `keep`.
+    The compiler checks that only global/static pointers are passed to `keep` params.
+
+SYNTAX
+    void register_callback(keep *Handler h) {
+        global_handler = h;
+    }
+
+EXAMPLE
+    register_callback(&local_handler);   // COMPILE ERROR — local can't satisfy keep
+    register_callback(&global_handler);  // OK — global persists
+
+---
+
+### @cstr
+
+DESCRIPTION
+    Convert a `[*]u8` slice to a NUL-terminated C string in a buffer.
+
+EXAMPLE
+    u8[64] buf;
+    const [*]u8 name = "hello";
+    ?*opaque f = c_fopen(@cstr(buf, name), "rb");
+
+SEE ALSO
+    cinclude
+
+---
+
+### Type Mapping (ZER ↔ C)
 
 | ZER | C | Notes |
 |-----|---|-------|
 | `u8, u16, u32, u64` | `uint8_t, uint16_t, uint32_t, uint64_t` | Identical |
 | `i8, i16, i32, i64` | `int8_t, int16_t, int32_t, int64_t` | Identical |
-| `*T` | `T*` | Non-null both sides |
-| `?*T` | `T*` (nullable) | ZER wraps as optional |
-| `*opaque` | `void*` | Same |
-| `[]u8` | `struct { uint8_t* ptr; size_t len; }` | Slice |
-| `bool` | `uint8_t` | NOT an integer in ZER |
-
-### --lib Flag
-
-```bash
-zerc module.zer --lib        # no preamble/runtime, for C interop
-```
+| `*T` | `T*` | Non-null on both sides |
+| `?*T` | `T*` (nullable) | ZER forces unwrap |
+| `*opaque` | `void*` | Provenance tracked |
+| `[*]u8` | `struct { uint8_t *ptr; size_t len; }` | Fat pointer |
+| `bool` | `uint8_t` | NOT integer in ZER |
+| `Handle(T)` | `uint64_t` | index + generation |
 
 ---
 
-## Operators
+## OPERATORS
 
 ### Arithmetic
-
-`+` `-` `*` `/` `%` — all integer overflow wraps (defined, never UB).
+    +  -  *  /  %              All integer overflow wraps (never UB).
 
 ### Bitwise
-
-`&` `|` `^` `~` `<<` `>>` — shift by >= width returns 0 (defined).
+    &  |  ^  ~  <<  >>         Shift by >= width returns 0 (defined).
 
 ### Comparison
-
-`==` `!=` `<` `>` `<=` `>=`
+    ==  !=  <  >  <=  >=       Returns bool.
 
 ### Logical
-
-`&&` `||` `!`
+    &&  ||  !                  Short-circuit evaluation.
 
 ### Assignment
+    =  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
 
-`=` `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`
+### Bit Extraction
+    reg[9..8]                  Extract bits 9:8
+    reg[7..4] = 0x0F;          Set bits 7:4
 
 ### NOT in ZER
-
-`++` `--` — use `+= 1` / `-= 1` instead.
+    ++  --                     Use += 1, -= 1
+    (T)x                       C-style casts — use @truncate, @saturate, @bitcast
+    ,                          Comma operator
+    goto                       Use structured control flow
 
 ---
 
-## Safety Guarantees
+## SAFETY GUARANTEES
 
 | Bug Class | How ZER Prevents It |
 |-----------|-------------------|
-| Buffer overflow | Inline bounds check on every array/slice access (conditions, loops, all expressions) |
-| Use-after-free | Handle generation counter + ZER-CHECK (with alias + parameter tracking) |
-| Null dereference | `*T` is non-null by type, `?*T` forces unwrap |
+| Buffer overflow | Bounds check on every array/[*]T access. Proven-safe indices skip check. |
+| Use-after-free | Handle generation counter + zercheck compile-time analysis |
+| Null dereference | `*T` non-null by type. `?*T` forces unwrap. |
+| Double free | zercheck: compile error |
+| Memory leak | zercheck: compile warning (alloc without free) |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
-| Silent truncation | Must `@truncate` or `@saturate` explicitly |
-| Missing switch case | Exhaustive check for enums, bools, and unions (including distinct typedefs) |
-| Dangling pointer | Scope escape analysis (`return &local`, `global.ptr = &local`, `return local_array` as slice) |
-| Union type confusion | Cannot mutate union variant during mutable switch capture |
-| Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
+| Silent truncation | Must use @truncate or @saturate explicitly |
+| Missing switch case | Exhaustive check for enums, bools, unions |
+| Dangling pointer | Scope escape analysis on return, assign, keep, orelse |
+| Union type confusion | Cannot mutate union variant during switch capture |
+| Arena pointer escape | Arena-derived pointers cannot be stored in globals |
+| Division by zero | Forced guard — compile error if divisor not proven nonzero |
+| Invalid MMIO address | mmio range declarations + alignment check + boot probe |
+| ISR data race | Shared globals without volatile → compile error |
+| Wrong pointer cast | Provenance tracking through *opaque round-trips |
 
 ---
 
-## Compiler
-
-### Build
-
-```bash
-make            # build zerc compiler
-make zer-lsp    # build language server
-make check      # run all 1018 tests + 491 fuzz
-make release    # release binaries in release/
-```
+## COMPILER
 
 ### Usage
 
 ```bash
-zerc source.zer              # compile to C
-zerc source.zer --run        # compile + run
-zerc source.zer --lib        # library mode (no preamble)
-zerc source.zer --config DEBUG=true
+zerc source.zer                   # emit C to source.c
+zerc source.zer -o output.c       # emit C to specific file
+zerc source.zer --run              # compile + execute
+zerc source.zer --lib              # library mode (no preamble/main)
+zerc source.zer --no-strict-mmio   # allow @inttoptr without mmio ranges
+zerc source.zer --target-bits 64   # set usize width
+zerc source.zer --gcc arm-none-eabi-gcc   # cross-compile
 ```
 
 ### Pipeline
@@ -692,97 +1505,29 @@ zerc source.zer --config DEBUG=true
 source.zer → Lexer → Parser → AST → Checker → ZER-CHECK → Emitter → .c → GCC → binary
 ```
 
-### Keywords (50)
+### Build
 
-**Types:** `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64` `usize` `f32` `f64` `bool` `void` `opaque`
-
-**Declarations:** `struct` `packed` `enum` `union` `const` `typedef` `distinct`
-
-**Control:** `if` `else` `for` `while` `switch` `break` `continue` `return` `default`
-
-**Error handling:** `orelse` `null` `true` `false`
-
-**Memory:** `Pool` `Ring` `Arena` `Handle`
-
-**Special:** `defer` `import` `cinclude` `volatile` `interrupt` `asm` `static` `keep`
+```bash
+make docker-check      # build + test in Docker (preferred)
+make check             # build + test natively
+make docker-install    # build Windows binaries, install to PATH
+```
 
 ---
 
-## What ZER Does NOT Have
+## WHAT ZER DOES NOT HAVE
 
 - No classes, inheritance, templates, generics
 - No exceptions, try/catch
 - No garbage collector
-- No heap / malloc / free
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator, no `goto`
 - No C-style casts
 - No header files (use `import`)
-- No preprocessor (#define, #ifdef)
-- No `float` switch
-- No pointer arithmetic (`*T + n` is a compile error)
+- No preprocessor (use `comptime`)
+- No pointer arithmetic
 
 ---
 
-## Full Example — UART Driver
-
-```zer
-import gpio;
-
-packed struct UART_Regs {
-    u32 SR; u32 DR; u32 BRR; u32 CR1; u32 CR2; u32 CR3;
-}
-
-volatile *UART_Regs UART1 = @inttoptr(*UART_Regs, 0x4001_1000);
-Ring(u8, 256) rx_buf;
-Ring(u8, 256) tx_buf;
-
-void uart_init(u32 baud) {
-    gpio.configure(gpio.PA9, gpio.AF7);
-    gpio.configure(gpio.PA10, gpio.AF7);
-    UART1.BRR = 16000000 / baud;
-    UART1.CR1 = (1 << 13) | (1 << 3) | (1 << 2) | (1 << 5);
-}
-
-interrupt USART1 {
-    u32 sr = UART1.SR;
-    if (sr & (1 << 5)) {
-        u8 byte = @truncate(u8, UART1.DR);
-        rx_buf.push(byte);
-    }
-    if (sr & (1 << 7)) {
-        if (tx_buf.pop()) |byte| {
-            UART1.DR = byte;
-        } else {
-            UART1.CR1 &= ~(1 << 7);
-        }
-    }
-}
-
-?u32 uart_read([]u8 buf) {
-    u32 count = 0;
-    while (count < buf.len) {
-        if (rx_buf.pop()) |byte| {
-            buf[count] = byte;
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    if (count == 0) { return null; }
-    return count;
-}
-
-u32 uart_write([]u8 data) {
-    for (u32 i = 0; i < data.len; i += 1) {
-        tx_buf.push(data[i]);
-    }
-    UART1.CR1 |= (1 << 7);
-    return @truncate(u32, data.len);
-}
-```
-
----
-
-*ZER — Memory-safe C. Same syntax, same mental model. The compiler does the safety work.*
+*ZER(C) — Zero Error Risk C Extension. Same syntax, same mental model. The compiler does the safety work.*

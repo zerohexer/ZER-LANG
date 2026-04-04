@@ -4125,9 +4125,9 @@ void emit_file(Emitter *e, Node *file_node) {
         for (int i = 0; i < e->checker->auto_slab_count; i++) {
             Type *elem = e->checker->auto_slabs[i].elem_type;
             Symbol *sym = e->checker->auto_slabs[i].slab_sym;
-            emit(e, "static _zer_slab %.*s = {sizeof(", (int)sym->name_len, sym->name);
+            emit(e, "static _zer_slab %.*s = { .slot_size = sizeof(", (int)sym->name_len, sym->name);
             emit_type(e, elem);
-            emit(e, "), 0, 0, 0, 0, 0, 0};\n");
+            emit(e, ") };\n");
         }
         emit(e, "\n");
     }

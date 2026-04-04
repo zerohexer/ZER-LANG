@@ -1101,6 +1101,61 @@ Handle(T), Pool(T,N), Slab(T)
 
 ---
 
+### Task.new() / Task.delete() — Auto-Slab Allocation
+
+**DESCRIPTION**
+Allocate a struct without declaring a Slab. The compiler auto-creates a global
+Slab per struct type behind the scenes. Same safety as explicit Slab.
+
+**SYNOPSIS**
+```zer
+// Handle path:
+Handle(Task) t = Task.new() orelse { return 1; };
+t.id = 42;           // auto-deref
+Task.delete(t);
+
+// Pointer path:
+*Task t = Task.new_ptr() orelse { return 1; };
+t.id = 42;           // direct deref
+Task.delete_ptr(t);
+```
+
+**METHODS**
+- `T.new()` → `?Handle(T)` — allocate via auto-Slab, returns Handle
+- `T.new_ptr()` → `?*T` — allocate via auto-Slab, returns pointer
+- `T.delete(h)` → `void` — free Handle
+- `T.delete_ptr(p)` → `void` — free pointer (type-checked)
+
+**EXAMPLE**
+```zer
+struct Task { u32 id; u32 priority; }
+struct Node { u32 value; }
+
+u32 main() {
+    // No Slab declaration needed — auto-created per struct type
+    Handle(Task) t = Task.new() orelse { return 1; };
+    t.id = 42;
+
+    *Node n = Node.new_ptr() orelse { return 2; };
+    n.value = 99;
+
+    Task.delete(t);
+    Node.delete_ptr(n);
+    return 0;
+}
+```
+
+**NOTES**
+- One auto-Slab per struct type, program-wide (shared across modules like C's malloc heap).
+- Uses `calloc` internally — same ISR restriction as Slab.
+- `delete_ptr()` type-checks argument — `*Motor` to `Task.delete_ptr()` is a compile error.
+- Can mix with explicit Slab/Pool in the same program.
+
+**SEE ALSO**
+Slab(T), Pool(T,N), Handle(T), alloc_ptr
+
+---
+
 ### Ring(T, N) — Circular Buffer
 
 **DESCRIPTION**

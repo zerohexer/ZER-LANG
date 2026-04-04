@@ -25,6 +25,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### FEATURE: Task.new() / Task.delete() — auto-Slab
+- **What:** `Task.new()` → `?Handle(Task)`, `Task.new_ptr()` → `?*Task`, `Task.delete(h)`, `Task.delete_ptr(p)`. No Slab declaration needed. Compiler auto-creates `_zer_auto_slab_TaskName` per struct type.
+- **Implementation:** Checker: auto_slabs array on Checker struct. NODE_FIELD on TYPE_STRUCT intercepts new/new_ptr/delete/delete_ptr. Emitter: two-pass declaration (structs → auto-slabs → functions).
+- **Bug found during implementation:** auto-slab declared AFTER functions → "undeclared" GCC error. Fix: two-pass emission.
+- **Test:** `task_new.zer`, `task_new_ptr.zer`, `task_new_complex.zer`
+
 ## Session 2026-04-04 — Audit Round: 6 bugs fixed in new features
 
 ### BUG: goto/label missed NODE_SWITCH, NODE_DEFER, NODE_CRITICAL

@@ -188,6 +188,25 @@ Parser: after parsing `TYNODE_HANDLE`, checks for `[N]` suffix. If found, wraps 
 
 **Coverage after 9a+9b+9c:** ~98% compile-time for `*opaque`. Remaining ~2% is runtime: dynamic array indices (`cache[slot]`), C library internals (can't see inside C code). Runtime check is 1ns inline header at `@ptrcast`.
 
+### Task.new() / Task.delete() — Auto-Slab Sugar
+
+**Checker:** When NODE_FIELD on TYPE_STRUCT with method `new`/`new_ptr`/`delete`/`delete_ptr`, checker creates/finds auto-Slab in `checker.auto_slabs[]`. One auto-Slab per struct type (program-wide). `auto_slabs` is an arena-allocated dynamic array on the Checker struct.
+
+**Auto-Slab creation:** On first `Task.new()`, creates `_zer_auto_slab_Task` as a Symbol in global scope with TYPE_SLAB. Subsequent `Task.new()` calls reuse the same auto-Slab. `Task.new_ptr()` shares the same auto-Slab.
+
+**Emitter:** Two-pass declaration emission in `emit_file()`:
+1. Pass 1: emit struct/enum/union/typedef declarations
+2. Emit auto-Slab globals: `static _zer_slab _zer_auto_slab_Task = {sizeof(Task), 0, ...};`
+3. Pass 2: emit functions, global vars, everything else
+
+The two-pass ensures `sizeof(Task)` is available (struct declared in pass 1). The `emit_file_no_preamble` (for imported modules) is NOT affected — auto-slabs are only emitted in the main file's `emit_file`.
+
+**Method emission:**
+- `Task.new()` → `_zer_slab_alloc(&_zer_auto_slab_Task, &ok)` wrapped in optional u64
+- `Task.new_ptr()` → `_zer_slab_alloc` + `_zer_slab_get` combined, returns pointer
+- `Task.delete(h)` → `_zer_slab_free(&_zer_auto_slab_Task, h)`
+- `Task.delete_ptr(p)` → `_zer_slab_free_ptr(&_zer_auto_slab_Task, p)`
+
 ## Checker (checker.c) — ~1800 lines
 
 ### Key Functions

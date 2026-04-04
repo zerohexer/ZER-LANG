@@ -1,0 +1,32 @@
+// Volatile division operands — tests that emitted C preserves volatile
+// qualifier through __typeof__ in division guard temps (BUG-401)
+// Uses const divisor (proven nonzero) to bypass range check,
+// while dividend is volatile to exercise the __typeof__ path.
+
+u32 main() {
+    volatile u32 dividend;
+    dividend = 20;
+    const u32 divisor = 4;
+
+    // volatile / const — dividend temp must preserve volatile
+    u32 result = dividend / divisor;
+    if (result != 5) { return 1; }
+
+    // volatile % const
+    u32 remainder = dividend % divisor;
+    if (remainder != 0) { return 2; }
+
+    // compound /= with const divisor
+    volatile u32 x;
+    x = 100;
+    x /= divisor;
+    if (x != 25) { return 3; }
+
+    // compound %= with const divisor
+    volatile u32 y;
+    y = 17;
+    y %= divisor;
+    if (y != 1) { return 4; }
+
+    return 0;
+}

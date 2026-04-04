@@ -199,7 +199,13 @@ The `orelse { block }` path in the emitter (line ~1883) emitted literal `0` as t
 2. `orelse { block }` — line ~1869. Was emitting `0`, now emits `_zer_tmp` / `_zer_tmp.value`.
 3. `orelse default_value` — line ~1884. Emits ternary `tmp ? tmp : default`.
 
-Any future changes to orelse must update ALL THREE paths consistently. Check `is_ptr_optional` branching in each.
+Any future changes to orelse must update ALL THREE paths consistently. Check `is_ptr_optional` AND `is_void_optional` branching in each.
+
+**BUG-401 audit fixes (2026-04-05):**
+- Paths 2 and 3 now use `__typeof__` instead of `__auto_type` (preserves volatile/const on temp).
+- Paths 2 and 3 now check `is_void_optional` — `?void` emits `(void)0` instead of accessing nonexistent `.value`.
+- Division guard temps (lines 624, 630, 899) changed from `__auto_type` to `__typeof__` for volatile preservation.
+- All `optional.inner->kind == TYPE_VOID` checks wrapped with `type_unwrap_distinct()` (14 sites in emitter + 1 in checker). Same for `pointer.inner->kind == TYPE_OPAQUE` (6 sites in emitter).
 
 ### Task.new() / Task.delete() — Auto-Slab Sugar
 

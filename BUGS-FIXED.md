@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Critical Pattern Audit Fixes (BUG-401)
+
+### BUG-401a: Division guard temps use __auto_type — drops volatile
+- **Symptom:** `volatile u32 x; x / divisor` — emitted `__auto_type _zer_dv = divisor` which strips volatile qualifier. GCC may optimize away volatile reads.
+- **Root cause:** Division guard (lines 624, 630, 899) predated BUG-289 fix. Never updated to `__typeof__`.
+- **Fix:** All 3 sites changed to `__typeof__(expr) _zer_dv = expr` — preserves volatile/const.
+- **Test:** `volatile_div.zer` (volatile dividend with const divisor division)
+
+### BUG-401b: orelse { block } uses __auto_type — drops volatile
+- **Symptom:** `volatile ?u32 x = expr orelse { block }` — temp strips volatile.
+- **Root cause:** orelse block path (line 1874) and orelse default path (line 1890) used `__auto_type` while orelse return paths (1798, 1831) correctly used `__typeof__`.
+- **Fix:** Both paths changed to `__typeof__(expr) _zer_tmp = expr`.
+- **Test:** `orelse_void_block.zer`, `volatile_orelse.zer`
+
+### BUG-401c: orelse { block } and orelse default access .value on ?void
+- **Symptom:** `?void orelse { block }` emits `_zer_tmp.value` — but `_zer_opt_void` has NO `.value` field. GCC error.
+- **Root cause:** orelse block path (line 1886) and orelse default path (line 1895) didn't check `is_void_optional`. Only the bare orelse return path (line 1793) had the check.
+- **Fix:** Added `is_void_optional` checks — block path emits `(void)0;`, default path emits `_zer_tmp.has_value ? (void)0 : fallback`.
+- **Test:** `orelse_void_block.zer` (exercises ?void orelse { return 0; })
+
+### BUG-401d: optional.inner not unwrapped for distinct typedef void
+- **Symptom:** `distinct typedef void MyVoid; ?MyVoid x = null;` — emitter checks `optional.inner->kind == TYPE_VOID` without unwrapping distinct. Would emit wrong init for distinct-wrapped void.
+- **Root cause:** 13 sites in emitter.c + 1 in checker.c checked `.optional.inner->kind` without `type_unwrap_distinct()`. Same pattern as BUG-279 but for inner types.
+- **Fix:** All 14 sites wrapped with `type_unwrap_distinct()`. Also 6 sites checking `.pointer.inner->kind == TYPE_OPAQUE` in @ptrcast/emit_type paths.
+- **Test:** Existing tests pass. Edge case too rare for dedicated test (nobody writes `distinct typedef void`).
+
+---
+
 ## Session 2026-04-04 — VSIX + Error Messages + Windows Fixes
 
 ### BUG: Windows `--run` WinMain undefined reference

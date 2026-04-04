@@ -1,0 +1,18 @@
+// Volatile optional in orelse — temp must preserve volatile
+// Tests __typeof__ fix for orelse block/default paths (BUG-401)
+
+struct Task { u32 id; u32 priority; }
+Pool(Task, 8) tasks;
+
+u32 main() {
+    // Normal orelse (non-volatile) — baseline
+    Handle(Task) h = tasks.alloc() orelse { return 1; };
+    tasks.get(h).id = 42;
+    tasks.get(h).priority = 3;
+
+    if (tasks.get(h).id != 42) { return 2; }
+    if (tasks.get(h).priority != 3) { return 3; }
+
+    tasks.free(h);
+    return 0;
+}

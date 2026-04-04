@@ -648,7 +648,7 @@ static int64_t compute_type_size(Type *t) {
           if (oi->kind == TYPE_POINTER || oi->kind == TYPE_FUNC_PTR)
               return CONST_EVAL_FAIL; }
         /* ?void = { has_value: u8 } = 1 byte */
-        if (t->optional.inner->kind == TYPE_VOID) return 1;
+        if (type_unwrap_distinct(t->optional.inner)->kind == TYPE_VOID) return 1;
         /* ?T = { T value; u8 has_value; } — aligned like a struct */
         int64_t inner_size = compute_type_size(t->optional.inner);
         if (inner_size <= 0) return -1;

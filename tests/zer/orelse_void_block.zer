@@ -1,0 +1,18 @@
+// ?void orelse { block } — must not access .value (no such field)
+// Tests ?void check in orelse block path (BUG-401)
+
+?void try_validate(u32 x) {
+    if (x > 100) { return null; }
+    return;
+}
+
+u32 main() {
+    // ?void orelse return (bare) — already worked
+    try_validate(50) orelse return;
+
+    // ?void orelse { block } — was buggy, accessed .value on ?void
+    try_validate(200) orelse { return 0; };
+
+    // should not reach here — 200 > 100 triggers null return
+    return 2;
+}

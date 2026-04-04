@@ -1,0 +1,16 @@
+// Gap 3 fix: cross-function free_ptr tracked via FuncSummary
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+void destroy(*Task t) {
+    heap.free_ptr(t);
+}
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    t.id = 42;
+    destroy(t);
+    t.id = 99;    // UAF — destroy freed t via cross-function summary
+    return 0;
+}

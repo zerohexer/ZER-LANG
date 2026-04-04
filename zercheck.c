@@ -892,11 +892,11 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
     if (!func->func_decl.body) return;
     if (func->func_decl.param_count == 0) return;
 
-    /* check if any param is Handle(T) */
+    /* check if any param is Handle(T) or *T (trackable) */
     bool has_handle_param = false;
     for (int i = 0; i < func->func_decl.param_count; i++) {
         TypeNode *tnode = func->func_decl.params[i].type;
-        if (tnode && tnode->kind == TYNODE_HANDLE) {
+        if (tnode && (tnode->kind == TYNODE_HANDLE || tnode->kind == TYNODE_POINTER)) {
             has_handle_param = true;
             break;
         }
@@ -909,10 +909,10 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
     PathState ps;
     pathstate_init(&ps);
 
-    /* register Handle params as ALIVE */
+    /* register Handle and *T params as ALIVE */
     for (int i = 0; i < func->func_decl.param_count; i++) {
         TypeNode *tnode = func->func_decl.params[i].type;
-        if (tnode && tnode->kind == TYNODE_HANDLE) {
+        if (tnode && (tnode->kind == TYNODE_HANDLE || tnode->kind == TYNODE_POINTER)) {
             HandleInfo *h = add_handle(&ps, func->func_decl.params[i].name,
                 (uint32_t)func->func_decl.params[i].name_len);
             if (h) {

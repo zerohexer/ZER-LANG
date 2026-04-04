@@ -1,0 +1,24 @@
+// Handle(T)[N] — array of handles
+
+struct Task { u32 id; u32 val; }
+Slab(Task) heap;
+
+u32 main() {
+    Handle(Task)[4] tasks;
+
+    for (u32 i = 0; i < 4; i += 1) {
+        tasks[i] = heap.alloc() orelse { return 1; };
+        tasks[i].id = i;
+        tasks[i].val = i * 100;
+    }
+
+    if (tasks[0].id != 0) { return 2; }
+    if (tasks[2].val != 200) { return 3; }
+    if (tasks[3].val != 300) { return 4; }
+
+    for (u32 i = 0; i < 4; i += 1) {
+        heap.free(tasks[i]);
+    }
+
+    return 0;
+}

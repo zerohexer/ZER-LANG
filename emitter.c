@@ -3472,9 +3472,14 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
                                   (nl == 6 && memcmp(n, "printf", 6) == 0) ||
                                   (nl == 7 && memcmp(n, "fprintf", 7) == 0) ||
                                   (nl == 6 && memcmp(n, "malloc", 6) == 0) ||
+                                  (nl == 6 && memcmp(n, "calloc", 6) == 0) ||
+                                  (nl == 7 && memcmp(n, "realloc", 7) == 0) ||
+                                  (nl == 6 && memcmp(n, "strdup", 6) == 0) ||
+                                  (nl == 7 && memcmp(n, "strndup", 7) == 0) ||
                                   (nl == 4 && memcmp(n, "free", 4) == 0) ||
                                   (nl == 6 && memcmp(n, "memcpy", 6) == 0) ||
                                   (nl == 6 && memcmp(n, "memset", 6) == 0) ||
+                                  (nl == 6 && memcmp(n, "strlen", 6) == 0) ||
                                   (nl == 7 && memcmp(n, "putchar", 7) == 0) ||
                                   (nl == 5 && memcmp(n, "fputc", 5) == 0);
                 if (!is_cstdlib) emit_func_decl(e, decl);

@@ -325,6 +325,14 @@ static TypeNode *parse_base_type(Parser *p) {
         TypeNode *t = new_type_node(p, TYNODE_HANDLE);
         t->handle.elem = parse_type(p);
         consume(p, TOK_RPAREN, "expected ')' after Handle(T)");
+        /* Handle(T)[N] — array of handles */
+        if (match(p, TOK_LBRACKET)) {
+            TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
+            arr->array.elem = t;
+            arr->array.size_expr = parse_expression(p);
+            consume(p, TOK_RBRACKET, "expected ']' after array size");
+            return arr;
+        }
         return t;
     }
 

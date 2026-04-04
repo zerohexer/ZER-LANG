@@ -1023,11 +1023,79 @@ tasks.free(h);                 // gen incremented
 **NOTES**
 - Handle is a value type (u64). Can be copied, stored in structs, passed to functions.
 - **Auto-deref:** `h.field` works — compiler auto-inserts `slab.get(h).field` with gen check. No need to write `.get()` explicitly.
+- **Arrays:** `Handle(T)[N]` works — array of handles with auto-deref on elements.
 - `?Handle(T)` is an optional handle — used as return type of `.alloc()`.
 - For direct pointer access without Handle, use `alloc_ptr()` instead.
 
+**EXAMPLE (array of handles)**
+```zer
+Handle(Task)[4] tasks;
+for (u32 i = 0; i < 4; i += 1) {
+    tasks[i] = heap.alloc() orelse { return 1; };
+    tasks[i].id = i;          // auto-deref on array element
+}
+```
+
 **SEE ALSO**
 Pool(T,N), Slab(T), alloc_ptr
+
+---
+
+### alloc_ptr / free_ptr — Direct Pointer from Slab/Pool
+
+**DESCRIPTION**
+Alternative to Handle that returns `*T` directly. Same Slab/Pool, but you get a
+real pointer instead of a Handle. Tracked by zercheck at compile time — UAF, double-free,
+cross-function free, and return-freed all caught. 100% compile-time safe for pure ZER code.
+
+**SYNOPSIS**
+```zer
+*Task t = heap.alloc_ptr() orelse { return 1; };
+t.id = 1;          // direct pointer deref — no gen check overhead
+heap.free_ptr(t);   // zercheck marks t as FREED
+```
+
+**EXAMPLE**
+```zer
+struct Task { u32 id; u32 priority; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    t.id = 42;
+    t.priority = 3;
+
+    *Task t2 = heap.alloc_ptr() orelse { return 2; };
+    t2.id = 99;
+
+    heap.free_ptr(t);
+    heap.free_ptr(t2);
+    return 0;
+}
+```
+
+**ERRORS**
+```zer
+heap.free_ptr(t);
+t.id = 1;            // COMPILE ERROR — use-after-free (zercheck Level 9)
+
+heap.free_ptr(t);
+heap.free_ptr(t);     // COMPILE ERROR — double free
+
+// Cross-function:
+void destroy(*Task t) { heap.free_ptr(t); }
+destroy(t);
+t.id = 1;             // COMPILE ERROR — zercheck FuncSummary knows destroy frees param 0
+```
+
+**NOTES**
+- `alloc_ptr()` returns `?*T` (null sentinel). Use `orelse` to unwrap.
+- `free_ptr(*T)` finds the slot by pointer address and frees it.
+- Can mix Handle and alloc_ptr on the same Slab/Pool.
+- For `*opaque` (C interop), Level 2+3+5 runtime checks (~1ns) cover the remaining cases zercheck can't track.
+
+**SEE ALSO**
+Handle(T), Pool(T,N), Slab(T)
 
 ---
 

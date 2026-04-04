@@ -160,6 +160,22 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 **Design decision:** `*Task` from `alloc_ptr()` is 100% compile-time safe for pure ZER code (zercheck tracks all uses). For C interop boundary (`*opaque` round-trips), Level 2+3+5 runtime backup. Handle remains available for cases requiring gen-check on every access (paranoid mode).
 
+### Handle(T)[N] — Array of Handles
+
+Parser: after parsing `TYNODE_HANDLE`, checks for `[N]` suffix. If found, wraps in `TYNODE_ARRAY` with element = handle type. Auto-deref works on array elements: `tasks[i].field` emits gen-checked access.
+
+### zercheck 9a/9b/9c — Extended *opaque compile-time tracking
+
+**9a (struct field tracking):** `free()` on untracked key (e.g., parameter's struct field `c.data`) now registers the key as FREED with `pool_id = -2`. Subsequent use at `@ptrcast` or field access triggers compile error. Also: `alloc_ptr` recognized in NODE_ASSIGN tracking (was `alloc`-only).
+
+**9b (cross-function summary):** `zc_build_summary()` now checks `TYNODE_POINTER` params (was `TYNODE_HANDLE` only). Functions like `void destroy(*Task t) { heap.free_ptr(t); }` produce FuncSummary that marks param 0 as FREED. Call sites see `t` as FREED after `destroy(t)`. Also: summary extraction checks `TYNODE_POINTER` params for final state.
+
+**9c (return state analysis):** `NODE_RETURN` in zercheck checks if returned expression is FREED or MAYBE_FREED. `return p` where `p` was freed → compile error "returning freed pointer."
+
+**Emitter cstdlib skip list:** `calloc`, `realloc`, `strdup`, `strndup`, `strlen` added to `is_cstdlib` in `emit_top_level_decl`. User declarations of these names are skipped to avoid conflicting with `--track-cptrs` wrappers (`_zer_opaque` type mismatch with libc's `void*`).
+
+**Coverage after 9a+9b+9c:** ~98% compile-time for `*opaque`. Remaining ~2% is runtime: dynamic array indices (`cache[slot]`), C library internals (can't see inside C code). Runtime check is 1ns inline header at `@ptrcast`.
+
 ## Checker (checker.c) — ~1800 lines
 
 ### Key Functions

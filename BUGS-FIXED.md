@@ -25,6 +25,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### FIX: Handle(T)[N] array syntax not parsing
+- **Symptom:** `Handle(Task)[4] tasks;` → parse error "expected ';' after variable declaration"
+- **Root cause:** Parser returned TYNODE_HANDLE directly without checking for `[N]` array suffix. Array suffix only applied to `parse_base_type()` results, not Handle/Pool/etc.
+- **Fix:** After parsing Handle(T), check for `TOK_LBRACKET` → wrap in TYNODE_ARRAY.
+- **Test:** `handle_array.zer` (E2E — allocate, auto-deref, free in loop)
+
+### FIX: `_zer_opaque` wrapper conflicts with user-declared malloc/free
+- **Symptom:** User declares `*opaque malloc(usize size); void free(*opaque ptr);` — with `--track-cptrs`, emits `_zer_opaque malloc(...)` which conflicts with libc's `void* malloc(...)`.
+- **Root cause:** `is_cstdlib` skip list missing `calloc`, `realloc`, `strdup`, `strndup`, `strlen`.
+- **Fix:** Added all to skip list in `emit_top_level_decl`.
+- **Test:** `opaque_safe_patterns.zer` (uses Slab to avoid the issue, but skip list prevents it for raw malloc users)
+
+### FIX: Cross-function free_ptr not tracked by FuncSummary
+- **Symptom:** `destroy(*Task t) { heap.free_ptr(t); }` — caller does `destroy(t); t.id = 99;` → no error. FuncSummary didn't track pointer params.
+- **Root cause:** `zc_build_summary()` only checked `TYNODE_HANDLE` params. `TYNODE_POINTER` params skipped.
+- **Fix:** Extended `has_handle_param` check and param registration to include `TYNODE_POINTER`. Summary builder now tracks `*T` params same as Handle.
+- **Test:** `cross_func_free_ptr.zer` (negative — correctly rejected)
+
+### FIX: free() on untracked key (param field) not registered as FREED
+- **Symptom:** `free(c.data)` where `c` is a parameter — zercheck didn't register `c.data` as FREED because it was never tracked as ALIVE.
+- **Root cause:** `is_free_call` only updated existing HandleInfo entries. Untracked keys were ignored.
+- **Fix:** When `find_handle` returns NULL after `is_free_call`, create a new entry with state=FREED.
+- **Test:** `opaque_struct_uaf.zer` (negative — correctly rejected)
+
 ### FEATURE: Handle auto-deref (h.field → slab.get(h).field)
 - **What:** `h.id = 1` now works where h is Handle(Task). Compiler auto-inserts gen-checked `.get()` call. Same 100% ABA safety.
 - **Implementation:** Checker NODE_FIELD on TYPE_HANDLE resolves struct field. `Symbol.slab_source` tracks allocator provenance. `find_unique_allocator()` as fallback. Emitter emits `_zer_slab_get` or `_zer_pool_get` wrapper.

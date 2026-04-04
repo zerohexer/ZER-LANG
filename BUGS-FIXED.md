@@ -25,6 +25,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** `findBundled()` works correctly. Auto-PATH prompt added. Check runs BEFORE bundled dir is injected to process PATH (avoids false positive).
 - **Key lesson:** `where zerc` check must run BEFORE `process.env.PATH` prepend at line 56, otherwise it finds the bundled binary and thinks zerc is already system-wide.
 
+### BUG: Auto-slab initializer wrong field order
+- **Symptom:** `Task.new()` crashes at runtime. GCC warns: "initialization of 'char **' from 'long unsigned int'". The auto-slab `sizeof(Task)` value goes into `pages` field instead of `slot_size`.
+- **Root cause:** Auto-slab emission used positional initializer `{sizeof(Task), 0, 0, ...}` but `_zer_slab` struct has `slot_size` as a later field. Normal Slab emission (line 3422) uses `.slot_size = sizeof(...)` — auto-slab didn't follow the same pattern.
+- **Fix:** Changed to designated initializer `{ .slot_size = sizeof(Task) }`. Rest zero-initialized by C default.
+- **Found by:** Testing `Task.new()` with both bare and block orelse forms.
+- **Test:** `task_new_orelse.zer` (4 variants)
+
 ### BUG: orelse block null-sentinel emits 0 instead of _zer_tmp
 - **Symptom:** `*Node a = heap.alloc_ptr() orelse { return 1; };` — `a` gets assigned `0` (integer) instead of pointer. GCC warns "initialization of 'struct Node *' from 'int'". Runtime: pointer is 0 → access fault.
 - **Root cause:** Emitter's orelse block path (line ~1883) emitted literal `"0;"` as final expression of statement expression for ALL orelse block fallbacks. For null-sentinel `?*T`, should emit `_zer_tmp` (the unwrapped pointer). For struct optionals, should emit `_zer_tmp.value`.

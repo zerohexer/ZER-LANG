@@ -212,6 +212,8 @@ Any future changes to orelse must update ALL THREE paths consistently. Check `is
 
 The two-pass ensures `sizeof(Task)` is available (struct declared in pass 1). The `emit_file_no_preamble` (for imported modules) is NOT affected — auto-slabs are only emitted in the main file's `emit_file`.
 
+**CRITICAL: use designated initializers for auto-slab.** The emission MUST be `{ .slot_size = sizeof(T) }`, NOT `{sizeof(T), 0, 0, ...}`. Positional init put sizeof into `pages` field (wrong) because `_zer_slab` struct field order doesn't start with `slot_size`. Normal Slab emission (line ~3422) already uses `.slot_size =` — auto-slab must match.
+
 **Method emission:**
 - `Task.new()` → `_zer_slab_alloc(&_zer_auto_slab_Task, &ok)` wrapped in optional u64
 - `Task.new_ptr()` → `_zer_slab_alloc` + `_zer_slab_get` combined, returns pointer

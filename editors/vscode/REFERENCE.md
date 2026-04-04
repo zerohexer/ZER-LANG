@@ -1753,6 +1753,17 @@ comptime if (DEBUG) {
 }
 ```
 
+**CONDITIONS**
+Accepted: literals (`1`, `0`), `const` variables, comptime function calls, expressions combining these.
+```zer
+comptime if (1) { ... }                    // literal
+comptime if (DEBUG) { ... }                // const bool
+comptime if (PLATFORM()) { ... }           // comptime function call
+comptime if (VER() > 1) { ... }            // expression with comptime call
+const u32 P = PLATFORM();
+comptime if (P) { ... }                    // const from comptime result
+```
+
 **EXAMPLE**
 ```zer
 const bool DEBUG = true;

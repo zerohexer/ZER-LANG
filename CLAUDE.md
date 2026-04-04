@@ -222,7 +222,10 @@ comptime if (1) {
 } else {
     // this code is stripped entirely
 }
-// Condition must be compile-time constant (literal, const, comptime result)
+// Condition: literal, const, comptime call, or expression of these
+// Comptime calls in conditions: comptime if (FUNC()) { ... }
+// Comparisons: comptime if (VER() > 1) { ... }
+// const from comptime: const u32 P = PLATFORM(); comptime if (P) { ... }
 // Only the taken branch is type-checked — dead branch ignored
 ```
 

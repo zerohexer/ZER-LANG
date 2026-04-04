@@ -206,6 +206,33 @@ Any future changes to orelse must update ALL THREE paths consistently. Check `is
 - Paths 2 and 3 now check `is_void_optional` — `?void` emits `(void)0` instead of accessing nonexistent `.value`.
 - Division guard temps (lines 624, 630, 899) changed from `__auto_type` to `__typeof__` for volatile preservation.
 - All `optional.inner->kind == TYPE_VOID` checks wrapped with `type_unwrap_distinct()` (14 sites in emitter + 1 in checker). Same for `pointer.inner->kind == TYPE_OPAQUE` (6 sites in emitter).
+- Optional null init changed from `{ {0} }` to `{ 0, 0 }` (6 sites) — eliminates GCC "braces around scalar initializer" warning.
+
+### Comptime Call In-Place Conversion (BUG-402/403/404, 2026-04-05)
+
+**BUG-402:** `const u32 P = PLATFORM(); comptime if (P) { ... }` failed — comptime if condition resolver required `is_comptime` flag (only on comptime functions, not const vars from comptime calls). Fix: relaxed to `is_const`, also checks `call.is_comptime_resolved` on init expression.
+
+**BUG-404:** Resolved comptime calls kept `NODE_CALL` kind. `eval_const_expr` (ast.h) only handles `NODE_INT_LIT` — so comptime results were invisible in binary expressions (`VER() > 1`), array sizes (`u8[BUF_SIZE()]`), and comptime if conditions.
+
+**Fix:** After resolving a comptime call, convert the node in-place:
+```c
+node->kind = NODE_INT_LIT;
+node->int_lit.value = (uint64_t)val;
+```
+This makes `eval_const_expr` work universally for comptime results — no special handling needed anywhere else. The emitter's `NODE_CALL` comptime handler (line 994) is now dead code (converted nodes go to `NODE_INT_LIT` instead).
+
+**comptime if condition resolution now has 3 stages:**
+1. `check_expr(cond)` — resolves comptime calls to NODE_INT_LIT
+2. `eval_const_expr(cond)` — evaluates literals and binary expressions
+3. Const ident fallback — looks up `is_const` symbol init value + `call.is_comptime_resolved`
+
+**Also:** After resolution, checker sets `cond->kind = NODE_INT_LIT` so emitter's `eval_const_expr` in `emit_stmt(NODE_IF)` correctly strips dead branches.
+
+### *opaque Test Coverage (2026-04-05)
+
+**Finding: raw `malloc/free` with `*opaque` and `--track-cptrs`:** When `--track-cptrs` is active (default for `--run`), `*opaque` emits as `_zer_opaque` (struct with type_id), not `void*`. C's `malloc()` returns `void*` — type mismatch with `_zer_opaque`. Positive tests using raw malloc/free must use `--release` mode OR (preferred) use Slab/Pool instead. The existing negative tests work because they fail at zercheck before reaching GCC.
+
+**Finding: Task.new() + explicit Slab for same type = ambiguous allocator.** `Slab(Task) heap;` + `Task.new()` creates two Slabs for the same struct type. Handle auto-deref can't pick which one → compile error. This is correct behavior — use one or the other, not both.
 
 ### Task.new() / Task.delete() — Auto-Slab Sugar
 

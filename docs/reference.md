@@ -1748,9 +1748,11 @@ reg[7..4] = 0x0F;          // Set bits 7:4
 ### Usage
 
 ```bash
-zerc source.zer                   # emit C to source.c
-zerc source.zer -o output.c       # emit C to specific file
-zerc source.zer --run              # compile + execute
+zerc source.zer                   # compile to source.exe (default — no .c visible)
+zerc source.zer --run              # compile + execute (no .c visible)
+zerc source.zer --emit-c           # emit C to source.c (kept)
+zerc source.zer -o output.c        # emit C to specific file (kept)
+zerc source.zer -o output           # compile to specific exe (no .c visible)
 zerc source.zer --lib              # library mode (no preamble/main)
 zerc source.zer --no-strict-mmio   # allow @inttoptr without mmio ranges
 zerc source.zer --target-bits 64   # set usize width

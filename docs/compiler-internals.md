@@ -115,6 +115,19 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 `zerc_main.c` adds `-mconsole` to GCC invocation on Windows (`#ifdef _WIN32`). Without this, msys64 mingw GCC links as GUI app expecting `WinMain` instead of `main`. Linux/macOS unaffected.
 
+### Default compile mode — temp .c, native-looking output
+
+`zerc main.zer` now compiles directly to `main.exe` (or `main` on Linux). The `.c` intermediate is a temp file, deleted after GCC finishes. User sees `.zer → exe` — looks like a native compiler.
+
+**Modes:**
+- `zerc main.zer` → compile to exe (temp .c, deleted)
+- `zerc main.zer --run` → compile + run (temp .c, deleted)
+- `zerc main.zer --emit-c` → emit C to `main.c` (kept)
+- `zerc main.zer -o out.c` → emit C to `out.c` (kept)
+- `zerc main.zer -o out` → compile to `out` exe (temp .c, deleted)
+
+**Implementation:** `use_temp_c` bool in `zerc_main.c`. When true, `remove(output_path)` called after GCC succeeds or fails. The `emit_c` flag set by `--emit-c` or when `-o` path ends in `.c`.
+
 ### Goto + Labels
 
 **Lexer:** `TOK_GOTO` keyword, `TOK_COLON` token (`:` was not tokenized before).

@@ -31,6 +31,11 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Implementation:** ~70 lines across lexer.h, lexer.c, ast.h, parser.c, checker.c, emitter.c.
 - **Test:** `tests/zer/goto_label.zer` (forward, backward, nested loop break, error path), `tests/zer_fail/goto_bad_label.zer` (nonexistent target rejected).
 
+### FEATURE: Default compile to exe (temp .c hidden)
+- **What:** `zerc main.zer` now compiles to `main.exe` by default. The `.c` intermediate is temp, deleted after GCC. Use `--emit-c` to keep the `.c` file. `-o file.c` also keeps it.
+- **Implementation:** `use_temp_c` flag in zerc_main.c. `remove(output_path)` after GCC. `do_run` only triggers execution, not compilation (compilation now always happens by default).
+- **Rationale:** Looks like a native compiler. Users see `.zer → exe`. The emit-C-via-GCC architecture is an implementation detail, not a user concern.
+
 ### FEATURE: VS Code extension version 0.2.6
 - **Changes:** Auto-PATH prompt, `-mconsole` fix in bundled zerc, `?T` orelse hint, `[*]T` + `[]T` deprecation warning.
 

@@ -681,8 +681,10 @@ static void emit_expr(Emitter *e, Node *node) {
                 Node *opt_node = node->binary.left->kind == NODE_NULL_LIT ?
                     node->binary.right : node->binary.left;
                 Type *opt_type = checker_get_type(e->checker, opt_node);
-                if (opt_type && opt_type->kind == TYPE_OPTIONAL &&
-                    !is_null_sentinel(opt_type->optional.inner)) {
+                /* BUG-409: unwrap distinct for optional null comparison */
+                Type *opt_eff = opt_type ? type_unwrap_distinct(opt_type) : NULL;
+                if (opt_eff && opt_eff->kind == TYPE_OPTIONAL &&
+                    !is_null_sentinel(opt_eff->optional.inner)) {
                     /* struct optional: emit .has_value check */
                     if (node->binary.op == TOK_EQEQ) emit(e, "(!");
                     else emit(e, "(");
@@ -960,9 +962,11 @@ static void emit_expr(Emitter *e, Node *node) {
         /* T → ?T wrap: if target is optional and value isn't, wrap in {value, 1} */
         Type *tgt_type = checker_get_type(e->checker,node->assign.target);
         Type *val_type = checker_get_type(e->checker,node->assign.value);
-        if (node->assign.op == TOK_EQ && tgt_type && val_type &&
-            tgt_type->kind == TYPE_OPTIONAL &&
-            !is_null_sentinel(tgt_type->optional.inner) &&
+        /* BUG-409: unwrap distinct for optional assignment checks */
+        Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+        if (node->assign.op == TOK_EQ && tgt_eff && val_type &&
+            tgt_eff->kind == TYPE_OPTIONAL &&
+            !is_null_sentinel(tgt_eff->optional.inner) &&
             val_type->kind != TYPE_OPTIONAL &&
             node->assign.value->kind != NODE_NULL_LIT) {
             emit(e, "(");
@@ -970,9 +974,9 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "){ ");
             emit_expr(e, node->assign.value);
             emit(e, ", 1 }");
-        } else if (node->assign.op == TOK_EQ && tgt_type &&
-                   tgt_type->kind == TYPE_OPTIONAL &&
-                   !is_null_sentinel(tgt_type->optional.inner) &&
+        } else if (node->assign.op == TOK_EQ && tgt_eff &&
+                   tgt_eff->kind == TYPE_OPTIONAL &&
+                   !is_null_sentinel(tgt_eff->optional.inner) &&
                    node->assign.value->kind == NODE_NULL_LIT) {
             emit(e, "(");
             emit_type(e, tgt_type);
@@ -2707,9 +2711,11 @@ static void emit_stmt(Emitter *e, Node *node) {
         } else {
             /* regular if */
             Type *cond_t = checker_get_type(e->checker,node->if_stmt.cond);
-            bool cond_is_struct_opt = cond_t &&
-                cond_t->kind == TYPE_OPTIONAL &&
-                !is_null_sentinel(cond_t->optional.inner);
+            /* BUG-409: unwrap distinct for optional condition check */
+            Type *cond_t_eff = cond_t ? type_unwrap_distinct(cond_t) : NULL;
+            bool cond_is_struct_opt = cond_t_eff &&
+                cond_t_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(cond_t_eff->optional.inner);
             emit_indent(e);
             emit(e, "if (");
             emit_expr(e, node->if_stmt.cond);
@@ -2757,9 +2763,11 @@ static void emit_stmt(Emitter *e, Node *node) {
         int saved_loop_base = e->loop_defer_base;
         e->loop_defer_base = e->defer_stack.count;
         Type *while_cond_t = checker_get_type(e->checker,node->while_stmt.cond);
-        bool while_is_struct_opt = while_cond_t &&
-            while_cond_t->kind == TYPE_OPTIONAL &&
-            !is_null_sentinel(while_cond_t->optional.inner);
+        /* BUG-409: unwrap distinct for optional while condition */
+        Type *while_eff = while_cond_t ? type_unwrap_distinct(while_cond_t) : NULL;
+        bool while_is_struct_opt = while_eff &&
+            while_eff->kind == TYPE_OPTIONAL &&
+            !is_null_sentinel(while_eff->optional.inner);
         emit_indent(e);
         emit(e, "while (");
         emit_expr(e, node->while_stmt.cond);

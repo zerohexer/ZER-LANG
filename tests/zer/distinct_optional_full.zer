@@ -1,0 +1,53 @@
+// Distinct optional — ALL emitter paths: assign null, == null,
+// bare if(), orelse, if-unwrap, return null, bare return
+// BUG-409 continuation: emitter must unwrap distinct at every optional site
+
+distinct typedef ?u32 MaybeId;
+
+MaybeId find(bool ok) {
+    if (!ok) { return null; }
+    ?u32 v = 42;
+    return @cast(MaybeId, v);
+}
+
+MaybeId make_none() {
+    return null;
+}
+
+u32 main() {
+    // assign null
+    MaybeId m;
+    m = null;
+    u32 v1 = m orelse 99;
+    if (v1 != 99) { return 1; }
+
+    // == null
+    MaybeId m2 = find(false);
+    if (m2 == null) { } else { return 2; }
+
+    // != null
+    MaybeId m3 = find(true);
+    if (m3 != null) { } else { return 3; }
+
+    // bare if(opt) without capture
+    MaybeId m4 = find(true);
+    if (m4) { } else { return 4; }
+    MaybeId m5 = find(false);
+    if (m5) { return 5; }
+
+    // if-unwrap
+    MaybeId m6 = find(true);
+    if (m6) |val| {
+        if (val != 42) { return 6; }
+    } else {
+        return 7;
+    }
+
+    // orelse default
+    u32 v2 = find(true) orelse 0;
+    if (v2 != 42) { return 8; }
+
+    // orelse { block }
+    u32 v3 = find(false) orelse { return 0; };
+    return 9;
+}

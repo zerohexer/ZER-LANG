@@ -7,6 +7,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-409 (cont): Distinct optional — assign null, == null, bare if(), while()
+- **Symptom:** `m = null` on distinct ?u32 → GCC "incompatible types." `m == null` → GCC "invalid operands." `if (m)` → GCC "used struct type where scalar required."
+- **Root cause:** 5 more emitter sites checked `->kind == TYPE_OPTIONAL` without `type_unwrap_distinct()`: assignment null (line 964/974), `== null` comparison (line 684), bare `if(opt)` condition (line 2711), `while(opt)` condition (line 2761).
+- **Fix:** All 5 sites unwrap distinct before TYPE_OPTIONAL dispatch.
+- **Test:** `distinct_optional_full.zer` (assign null, == null, != null, bare if, if-unwrap, orelse default, orelse block)
+
 ### BUG-409: Distinct typedef wrapping optional types (Gemini finding #1)
 - **Symptom:** `distinct typedef ?u32 MaybeId; MaybeId find() { return null; }` → "return type doesn't match." `m orelse 0` → "orelse requires optional type." Distinct wrapping `?T` not recognized as optional.
 - **Root cause:** `type_is_optional()` and `type_unwrap_optional()` in types.c didn't call `type_unwrap_distinct()`. Also `can_implicit_coerce()` T→?T path didn't unwrap distinct on target. Emitter orelse paths and return-null/bare-return paths all checked `->kind == TYPE_OPTIONAL` without unwrapping distinct on `current_func_ret`.

@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Late Fixes (BUG-414 through BUG-416)
+
+### BUG-414: Volatile struct array field uses memmove (strips volatile)
+- **Symptom:** `struct Hw { volatile u8[4] regs; }; dev.regs = src;` → GCC warns "discards volatile qualifier from pointer target type." GCC can optimize away the write.
+- **Root cause:** `expr_is_volatile()` only checked root symbol `is_volatile`. For `dev.regs` where `dev` is non-volatile but `regs` field is volatile, returned false.
+- **Fix:** Added `SField.is_volatile` flag in types.h. Checker sets it when field has TYNODE_VOLATILE wrapper. `expr_is_volatile()` now walks field chains and checks SField.is_volatile. Also checks type-level volatile on slice/pointer fields.
+- **Test:** `volatile_field_array.zer`
+
+### BUG-415: Comptime negative return values
+- **Symptom:** `comptime i32 NEG() { return -1; }; i32 n = NEG();` → "integer literal 18446744073709551615 does not fit in i32." Also `comptime if (MODE() < 0)` failed.
+- **Root cause:** In-place NODE_INT_LIT conversion stored `(uint64_t)(-1)` = huge unsigned number. `is_literal_compatible` rejected it.
+- **Fix:** (1) Only convert to NODE_INT_LIT for non-negative values. Negative results stay as NODE_CALL with `is_comptime_resolved`. (2) Extended `eval_const_expr` in ast.h to handle NODE_CALL with `is_comptime_resolved` — reads `comptime_value` directly. Works universally in binary expressions and comptime if conditions.
+- **Test:** `comptime_negative.zer`
+
+### BUG-416: Cross-module Handle auto-deref + qualified function calls
+- **Symptom:** Handle auto-deref (`e.id = id`) in imported module function emitted `/* ERROR: no allocator */ 0 = id`. Also `config.MAX_SIZE()` qualified call failed with "undefined identifier."
+- **Root cause:** (1) Emitter's `find_unique_allocator` used `type_equals` (pointer identity for structs) which can fail across module boundaries. (2) Module names aren't variables — `config` in `config.func()` fails scope lookup as ident.
+- **Fix:** (1) Name-based struct matching fallback in emitter when pointer-identity fails. (2) In NODE_CALL, detect `ident.field()` where ident isn't a variable, look up `module__func` in global scope, rewrite callee to raw function name.
+- **Test:** `test_modules/cross_handle.zer`, `test_modules/qualified_call.zer`
+
+---
+
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
 ### BUG-413: ?T[N] parsed as OPTIONAL(ARRAY) instead of ARRAY(OPTIONAL)

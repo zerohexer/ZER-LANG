@@ -261,6 +261,26 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Design:** `?T[N]` = "array of N optional T values." This matches the intuition: `?u32[4]` = "4 slots, each either u32 or null." The alternative (`?(T[N])` = "optionally an entire array") is expressible with parentheses if ever needed, but extremely rare.
 
+### Comptime Negative Return Values (BUG-415, 2026-04-05)
+
+`comptime i32 NEG() { return -1; }` broke — in-place NODE_INT_LIT conversion stored `-1` as `uint64_t` (0xFFFFFFFFFFFFFFFF), failing `is_literal_compatible`.
+
+**Fix (two parts):**
+1. checker.c: Only convert to NODE_INT_LIT for `val >= 0`. Negative results stay as NODE_CALL with `is_comptime_resolved = true`.
+2. ast.h: `eval_const_expr_d` now handles `NODE_CALL` with `is_comptime_resolved` — reads `comptime_value` directly. This makes negative comptime results work universally in binary expressions (`MODE() < 0`), comptime if conditions, etc.
+
+### Cross-Module Handle Auto-Deref + Qualified Calls (BUG-416, 2026-04-05)
+
+**Handle auto-deref in imported module functions:** `e.id = id` inside entity.zer function emitted `/* ERROR: no allocator */ 0 = id`. Root cause: `find_unique_allocator` uses `type_equals` (pointer identity for structs) which can fail across module scope boundaries. Fix: name-based struct matching fallback — when pointer-identity fails, compare `struct_type.name` strings. Safe because module prefixing prevents cross-module name collision.
+
+**Module-qualified function calls:** `config.MAX_SIZE()` now works. Implementation: in NODE_CALL, before builtin method dispatch, detect callee `NODE_FIELD(NODE_IDENT, field)` where the ident isn't a variable/type. Look up `module__func` in global scope via mangled name. If found, rewrite callee to `NODE_IDENT(raw_func_name)` and goto normal call resolution. This reuses all existing call handling (comptime, arg checking, type validation).
+
+### Volatile Struct Array Fields (BUG-414, 2026-04-05)
+
+`struct Hw { volatile u8[4] regs; }` — array assignment `dev.regs = src` used `memmove` which strips volatile (GCC warning, optimizer can eliminate write). Root cause: `expr_is_volatile()` only checked root symbol `is_volatile`, not struct field qualifiers.
+
+**Fix:** Added `SField.is_volatile` flag in types.h. Checker sets it during struct field resolution when `fd->type->kind == TYNODE_VOLATILE`. `expr_is_volatile()` now walks field chains, checking each field's `SField.is_volatile` (also checks type-level `slice.is_volatile` and `pointer.is_volatile`). Emitter uses byte loop for volatile array assignment.
+
 ### Function Pointer Array Emission (BUG-412, 2026-04-05)
 
 `Op[3] ops` where `Op` is `typedef u32 (*Op)(u32)` emitted `uint32_t (*)(uint32_t) ops[3]` — name outside the `(*)` instead of inside `(*ops[3])`. Fix: in `emit_type_and_name` for TYPE_ARRAY, when base type (after unwrapping array chain) is TYPE_FUNC_PTR (or distinct wrapping it), use function pointer emission pattern: `ret (*name[dims])(params)`. Works with distinct typedef func ptrs too.

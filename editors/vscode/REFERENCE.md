@@ -1678,6 +1678,14 @@ u32 main() {
 }
 ```
 
+**QUALIFIED CALLS**
+Both unqualified and module-qualified calls work:
+```zer
+import config;
+u32 a = MAX_SIZE();           // unqualified — OK
+u32 b = config.MAX_SIZE();    // qualified — also OK
+```
+
 **NOTES**
 - Circular imports are a compile error.
 - No header files needed.

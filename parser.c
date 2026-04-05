@@ -957,27 +957,37 @@ static void parse_capture(Parser *p, const char **name, size_t *name_len, bool *
     }
 }
 
+/* Parse function pointer type with context-dependent ? handling.
+ * BUG-420: typedef sites pass ? as return type (funcptr returning ?T).
+ * All other sites unwrap ? and re-wrap as optional funcptr (nullable).
+ * Caller must already have consumed '(' and '*' tokens.
+ * This helper enforces the invariant in one place — 6 call sites. */
+static TypeNode *parse_funcptr_with_opt(Parser *p, TypeNode *type,
+                                         const char **name, size_t *name_len,
+                                         bool is_typedef) {
+    bool is_opt = (type->kind == TYNODE_OPTIONAL);
+    TypeNode *ret = (is_opt && !is_typedef) ? type->optional.inner : type;
+    TypeNode *fp = parse_func_ptr_after_ret(p, ret, name, name_len);
+    if (is_opt && !is_typedef) {
+        TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
+        opt->optional.inner = fp;
+        fp = opt;
+    }
+    return fp;
+}
+
 /* variable declaration: type name = expr; or type name; */
 static Node *parse_var_decl(Parser *p, bool is_const, bool is_static, bool is_volatile) {
     TypeNode *type = parse_type(p);
 
-    /* function pointer local: rettype (*name)(params...) or ?rettype (*name)(params...)
-     * For local vars, ? wraps the function pointer (nullable funcptr), NOT the return type.
-     * Use typedef for funcptr-returning-optional: typedef ?u32 (*Handler)(u32); */
+    /* function pointer local: rettype (*name)(params...) */
     if (is_func_ptr_start(p)) {
         advance(p); /* consume '(' */
         advance(p); /* consume '*' */
         {
-            bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
-            TypeNode *ret_type = is_opt_fp ? type->optional.inner : type;
             const char *fpname = NULL;
             size_t fpname_len = 0;
-            type = parse_func_ptr_after_ret(p, ret_type, &fpname, &fpname_len);
-            if (is_opt_fp) {
-                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                opt->optional.inner = type;
-                type = opt;
-            }
+            type = parse_funcptr_with_opt(p, type, &fpname, &fpname_len, false);
             Node *n = new_node(p, NODE_VAR_DECL);
             n->var_decl.type = type;
             n->var_decl.name = fpname;
@@ -1505,21 +1515,13 @@ static Node *parse_struct_decl(Parser *p, bool is_packed) {
         f->is_keep = match(p, TOK_KEEP);
         TypeNode *type = parse_type(p);
 
-        /* function pointer field: rettype (*name)(params...) or ?rettype (*name)(params...)
-         * For struct fields, ? wraps the function pointer (nullable funcptr). */
+        /* function pointer field: rettype (*name)(params...) */
         if (is_func_ptr_start(p)) {
             advance(p); /* consume '(' */
             advance(p); /* consume '*' */
-            bool is_opt_fp = (type->kind == TYNODE_OPTIONAL);
-            TypeNode *fp_ret = is_opt_fp ? type->optional.inner : type;
             const char *fname = NULL;
             size_t fname_len = 0;
-            type = parse_func_ptr_after_ret(p, fp_ret, &fname, &fname_len);
-            if (is_opt_fp) {
-                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                opt->optional.inner = type;
-                type = opt;
-            }
+            type = parse_funcptr_with_opt(p, type, &fname, &fname_len, false);
             f->type = type;
             f->name = fname;
             f->name_len = fname_len;
@@ -1650,22 +1652,14 @@ static Node *parse_union_decl(Parser *p) {
 static Node *parse_func_or_var(Parser *p, bool is_static) {
     TypeNode *type = parse_type(p);
 
-    /* function pointer declaration: type (*name)(params...) or ?type (*name)(params...)
-     * For global var, ? wraps the function pointer (nullable funcptr). */
+    /* function pointer declaration: type (*name)(params...) */
     if (is_func_ptr_start(p)) {
         advance(p); /* consume '(' */
         advance(p); /* consume '*' */
         {
-            bool is_optional_fptr = (type->kind == TYNODE_OPTIONAL);
-            TypeNode *ret_type = is_optional_fptr ? type->optional.inner : type;
             const char *fpname = NULL;
             size_t fpname_len = 0;
-            TypeNode *fp_type = parse_func_ptr_after_ret(p, ret_type, &fpname, &fpname_len);
-            if (is_optional_fptr) {
-                TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                opt->optional.inner = fp_type;
-                fp_type = opt;
-            }
+            TypeNode *fp_type = parse_funcptr_with_opt(p, type, &fpname, &fpname_len, false);
             if (!fpname) {
                 error(p, "expected name in function pointer declaration");
                 return new_node(p, NODE_VAR_DECL);
@@ -1716,21 +1710,13 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
                 param->is_keep = match(p, TOK_KEEP);
                 param->type = parse_type(p);
 
-                /* function pointer parameter: rettype (*name)(params...) or ?rettype (*name)(params...) */
+                /* function pointer parameter: rettype (*name)(params...) */
                 if (is_func_ptr_start(p)) {
                     advance(p); /* consume '(' */
                     advance(p); /* consume '*' */
-                    /* For params, ? wraps the function pointer (nullable funcptr) */
-                    bool is_opt_fp = (param->type->kind == TYNODE_OPTIONAL);
-                    TypeNode *fp_ret = is_opt_fp ? param->type->optional.inner : param->type;
                     const char *fpname = NULL;
                     size_t fpname_len = 0;
-                    param->type = parse_func_ptr_after_ret(p, fp_ret, &fpname, &fpname_len);
-                    if (is_opt_fp) {
-                        TypeNode *opt = new_type_node(p, TYNODE_OPTIONAL);
-                        opt->optional.inner = param->type;
-                        param->type = opt;
-                    }
+                    param->type = parse_funcptr_with_opt(p, param->type, &fpname, &fpname_len, false);
                     param->name = fpname;
                     param->name_len = fpname_len;
                     if (!fpname) error(p, "expected name in function pointer parameter");
@@ -1844,10 +1830,9 @@ static Node *parse_declaration(Parser *p) {
         if (is_func_ptr_start(p)) {
             advance(p); /* consume '(' */
             advance(p); /* consume '*' */
-            /* BUG-420: same fix as regular typedef — ? binds to return type */
             const char *fpname = NULL;
             size_t fpname_len = 0;
-            type = parse_func_ptr_after_ret(p, type, &fpname, &fpname_len);
+            type = parse_funcptr_with_opt(p, type, &fpname, &fpname_len, true);
             Node *n = new_node(p, NODE_TYPEDEF);
             n->typedef_decl.type = type;
             n->typedef_decl.name = fpname;
@@ -1871,16 +1856,9 @@ static Node *parse_declaration(Parser *p) {
         if (is_func_ptr_start(p)) {
             advance(p); /* consume '(' */
             advance(p); /* consume '*' */
-            /* BUG-420: ?RetType (*Name)(params) — the ? is part of the return type,
-             * NOT an optional wrapper around the function pointer. Previously this
-             * stripped ? from the return type and re-wrapped the whole funcptr as
-             * optional, making typedef ?u32 (*Handler)(u32) produce ?(u32 (*)(u32))
-             * instead of (?u32) (*)(u32). Now we pass the full type (including ?)
-             * as the return type. Optional function pointers use ?FuncPtrTypedef
-             * syntax instead (e.g., ?Handler where Handler is a typedef). */
             const char *fpname = NULL;
             size_t fpname_len = 0;
-            type = parse_func_ptr_after_ret(p, type, &fpname, &fpname_len);
+            type = parse_funcptr_with_opt(p, type, &fpname, &fpname_len, true);
             Node *n = new_node(p, NODE_TYPEDEF);
             n->typedef_decl.type = type;
             n->typedef_decl.name = fpname;

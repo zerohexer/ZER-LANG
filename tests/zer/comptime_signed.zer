@@ -1,0 +1,28 @@
+// Comptime functions with signed values + nested if branches
+comptime i32 SIGN(i32 x) {
+    if (x > 0) { return 1; }
+    if (x < 0) { return -1; }
+    return 0;
+}
+
+comptime i32 ABS(i32 x) {
+    if (x < 0) { return 0 - x; }
+    return x;
+}
+
+comptime i32 CLAMP_SIGNED(i32 val, i32 lo, i32 hi) {
+    if (val < lo) { return lo; }
+    if (val > hi) { return hi; }
+    return val;
+}
+
+u32 main() {
+    if (SIGN(42) != 1) { return 1; }
+    if (SIGN(-10) != -1) { return 2; }
+    if (SIGN(0) != 0) { return 3; }
+    if (ABS(-5) != 5) { return 4; }
+    if (ABS(7) != 7) { return 5; }
+    if (CLAMP_SIGNED(-50, -10, 10) != -10) { return 6; }
+    if (CLAMP_SIGNED(50, -10, 10) != 10) { return 7; }
+    return 0;
+}

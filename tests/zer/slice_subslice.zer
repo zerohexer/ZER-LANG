@@ -1,0 +1,29 @@
+// Slice operations — sub-slicing + len + sum
+u32 sum_slice(const [*]u32 data) {
+    u32 total = 0;
+    for (usize i = 0; i < data.len; i += 1) {
+        total = total + data.ptr[i];
+    }
+    return total;
+}
+
+u32 main() {
+    u32[8] arr;
+    for (u32 i = 0; i < 8; i += 1) {
+        arr[i] = i + 1;
+    }
+
+    [*]u32 full = arr;
+    if (@truncate(u32, full.len) != 8) { return 1; }
+    if (sum_slice(full) != 36) { return 2; }
+
+    [*]u32 mid = arr[2..6];
+    if (@truncate(u32, mid.len) != 4) { return 3; }
+    if (sum_slice(mid) != 18) { return 4; }
+
+    [*]u32 tail = arr[5..8];
+    if (@truncate(u32, tail.len) != 3) { return 5; }
+    if (sum_slice(tail) != 21) { return 6; }
+
+    return 0;
+}

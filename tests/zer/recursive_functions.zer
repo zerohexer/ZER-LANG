@@ -1,0 +1,21 @@
+// Recursive function calls — factorial + fibonacci
+u32 factorial(u32 n) {
+    if (n <= 1) { return 1; }
+    return n * factorial(n - 1);
+}
+
+u32 fib(u32 n) {
+    if (n <= 1) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+u32 main() {
+    if (factorial(0) != 1) { return 1; }
+    if (factorial(1) != 1) { return 2; }
+    if (factorial(5) != 120) { return 3; }
+    if (fib(0) != 0) { return 4; }
+    if (fib(1) != 1) { return 5; }
+    if (fib(6) != 8) { return 6; }
+    if (fib(10) != 55) { return 7; }
+    return 0;
+}

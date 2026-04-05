@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-06 — Scale Testing (BUG-432)
+
+### BUG-432: Module-qualified variable access (`config.VERSION`)
+- **Symptom:** `import config; if (config.VERSION != 3)` → "undefined identifier 'config'". Qualified function calls (`config.func()`) worked (BUG-416), but qualified variable access didn't.
+- **Root cause:** NODE_CALL had pre-`check_expr` interception for module-qualified calls (BUG-416). NODE_FIELD did not — `check_expr(NODE_IDENT)` fired "undefined identifier" for the module name before NODE_FIELD could intercept.
+- **Fix:** Added pre-`check_expr` interception in NODE_FIELD (same pattern as NODE_CALL). When object is NODE_IDENT and not found in current scope, try `module__field` mangled lookup in global scope. Rewrite to NODE_IDENT with raw field name (emitter resolves via mangled lookup, avoids double-mangling).
+- **Test:** `test_modules/qualified_var.zer`, 10-module scale test
+
+---
+
 ## Session 2026-04-05 — track-cptrs Audit (BUG-431)
 
 ### BUG-431: `@ptrcast` from `*opaque` with `--track-cptrs` — GCC "cannot convert to pointer type"

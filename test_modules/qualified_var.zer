@@ -1,0 +1,6 @@
+import helpers;
+
+u32 main() {
+    if (helpers.TRIPLE(3) != 9) { return 1; }
+    return 0;
+}

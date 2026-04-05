@@ -261,6 +261,12 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Design:** `?T[N]` = "array of N optional T values." This matches the intuition: `?u32[4]` = "4 slots, each either u32 or null." The alternative (`?(T[N])` = "optionally an entire array") is expressible with parentheses if ever needed, but extremely rare.
 
+### Nested Comptime Function Calls (BUG-425, 2026-04-05)
+
+`comptime u32 QUAD(u32 x) { return DOUBLE(DOUBLE(x)); }` rejected — checker's NODE_CALL handler validated comptime args via `eval_const_expr()` during body type-checking, but parameters are `NODE_IDENT` (not yet substituted). Fix: `bool in_comptime_body` flag on Checker, set during `check_func_body` for comptime functions. When true, skip the "all args must be compile-time constants" error. The real evaluation happens at the call site via `eval_comptime_block` + `eval_const_expr_subst`, which correctly substitutes params and handles nested calls.
+
+**Pattern:** Any validation that requires compile-time constant args must check `c->in_comptime_body` — comptime function bodies contain parameter references that aren't constants until substituted at the call site.
+
 ### Comptime Call in Pool/Ring Size (BUG-423, 2026-04-05)
 
 `Pool(Item, POOL_SIZE())` failed — `eval_const_expr` ran before `check_expr` resolved the comptime call. Fix: call `check_expr` before `eval_const_expr` in TYNODE_POOL and TYNODE_RING. **General rule:** any site calling `eval_const_expr` on user expressions must call `check_expr` first.
@@ -1920,7 +1926,7 @@ Both provenance systems propagate through aliases and clear+re-derive on assignm
 
 **Extended eval_const_expr (ast.h):** Added comparison operators (`> < >= <= == !=`), logical (`&& ||`), XOR (`^`), bitwise NOT (`~`), logical NOT (`!`). These support comptime function bodies with if/else branching.
 
-**Limitation:** Comptime calls in array size context (`u8[BIT(3)]`) don't work yet — array sizes use `eval_const_expr` which doesn't have Checker access to resolve comptime function calls. Comptime calls work in all expression contexts (var init, function args, return values).
+**Nested calls:** Comptime functions can call other comptime functions — `QUAD(x) { return DOUBLE(DOUBLE(x)); }` works. BUG-425 fixed the checker rejecting params as non-constant during body type-checking (`in_comptime_body` flag). Array sizes also work: `u8[QUAD(2)]` (BUG-391/423 fixed `resolve_type_inner` to call `eval_comptime_block`).
 
 ### Comptime If (conditional compilation)
 
@@ -1952,7 +1958,7 @@ The BUG-205 assignment escape check (`g_ptr = local_derived_ptr`) only fired whe
 
 ### Known Technical Debt (updated)
 - **~~No qualified module call syntax~~** — RESOLVED (BUG-416 session). `config.func()` now works via mangled lookup rewrite.
-- **Comptime in array sizes:** `u8[BIT(3)]` doesn't work — eval_const_expr can't resolve comptime calls without Checker access. Workaround: use `const u32 SIZE = BIT(3); u8[SIZE] buf;` (doesn't work either since SIZE is a var). Future fix: pass Checker to eval_const_expr or pre-evaluate comptime calls before type resolution.
+- **~~Comptime in array sizes~~** — RESOLVED (BUG-391/423). `u8[BIT(3)]` works via `eval_comptime_block` in `resolve_type_inner`. Nested calls like `u8[QUAD(2)]` also work (BUG-425).
 - **zercheck variable-index handles:** `arr[i]` with variable index still untrackable — falls back to runtime generation counter traps. Constant indices (`arr[0]`, `s.h`) now tracked via compound string keys (BUG-357 fix).
 - **Dual symbol registration for imported globals:** Imported non-static globals/functions are registered TWICE in global scope — raw name + mangled name (BUG-233). This is intentional (emitter needs both), but any code that scans global scope for unique matches (like `find_unique_allocator`) must handle duplicates. Pattern: check `found->type == candidate->type` before declaring ambiguity.
 
@@ -2017,7 +2023,7 @@ Keep parameter validation now recursively walks orelse chains. `reg(a orelse b o
 **Coverage:** 100% of `*opaque` round-trips. Type_id embedded in data, not compiler metadata. Struct fields, array elements, function returns all carry provenance. Unknown (params, cinclude) = type_id 0 = allowed through.
 
 ### Comptime Array Sizes (BUG-391)
-`u8[BIT(3)]` now works. In `resolve_type_inner(TYNODE_ARRAY)`, when `eval_const_expr` fails and the size expr is `NODE_CALL` with a comptime callee (`is_comptime && func_node`), evaluates via `eval_comptime_block`. `ComptimeParam` and `eval_comptime_block` forward-declared above `resolve_type_inner` for this purpose. Nested comptime calls in array sizes don't work yet (would need recursive comptime resolution in `eval_comptime_block`).
+`u8[BIT(3)]` now works. In `resolve_type_inner(TYNODE_ARRAY)`, when `eval_const_expr` fails and the size expr is `NODE_CALL` with a comptime callee (`is_comptime && func_node`), evaluates via `eval_comptime_block`. `ComptimeParam` and `eval_comptime_block` forward-declared above `resolve_type_inner` for this purpose. Nested comptime calls in array sizes work — `eval_comptime_block` + `eval_const_expr_subst` recursively resolves calls. BUG-425 fixed the checker rejecting nested calls during body type-checking.
 
 ### Union Array Lock Precision (BUG-392)
 `union_switch_key` added to Checker — full expression key (e.g., `"msgs[0]"`) built via `build_expr_key()` helper. Mutation check compares assignment target's object key against the switch key. Different array elements are independent — `msgs[1].data = 20` inside `switch(msgs[0])` is allowed. Same element (`msgs[0].cmd = 99`) and pointer aliases still blocked. `build_expr_key()` handles NODE_IDENT, NODE_FIELD, NODE_INDEX(constant), NODE_UNARY(STAR) — same pattern as zercheck's `handle_key_from_expr`. Three mutation check sites updated: NODE_ASSIGN direct, NODE_FIELD pointer auto-deref, NODE_FIELD direct union.

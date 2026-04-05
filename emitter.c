@@ -1462,13 +1462,39 @@ static void emit_expr(Emitter *e, Node *node) {
                     (uint32_t)node->field.object->ident.name_len);
                 if (hsym) alloc_sym = hsym->slab_source;
             }
-            /* fallback: find unique allocator for this element type */
+            /* fallback: find unique allocator for this element type.
+             * BUG-416: cross-module Handle auto-deref — also search by
+             * struct name match, not just pointer identity, since the
+             * slab's elem type may have been resolved from a different
+             * scope context than the handle's elem type. */
             if (!alloc_sym) {
                 alloc_sym = find_unique_allocator(e->checker->current_scope,
                     handle_type->handle.elem);
                 if (!alloc_sym)
                     alloc_sym = find_unique_allocator(e->checker->global_scope,
                         handle_type->handle.elem);
+                /* cross-module fallback: search global scope for any Slab/Pool
+                 * whose element struct has the same name as our Handle's elem */
+                if (!alloc_sym) {
+                    Type *helem = type_unwrap_distinct(handle_type->handle.elem);
+                    if (helem->kind == TYPE_STRUCT) {
+                        Scope *gs = e->checker->global_scope;
+                        for (uint32_t si = 0; si < gs->symbol_count; si++) {
+                            Type *st = gs->symbols[si].type;
+                            if (!st) continue;
+                            Type *selem = NULL;
+                            if (st->kind == TYPE_SLAB) selem = st->slab.elem;
+                            else if (st->kind == TYPE_POOL) selem = st->pool.elem;
+                            if (selem && selem->kind == TYPE_STRUCT &&
+                                selem->struct_type.name_len == helem->struct_type.name_len &&
+                                memcmp(selem->struct_type.name, helem->struct_type.name,
+                                       helem->struct_type.name_len) == 0) {
+                                alloc_sym = &gs->symbols[si];
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             if (alloc_sym && alloc_sym->type) {
                 Type *at = alloc_sym->type;

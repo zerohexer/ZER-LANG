@@ -1,0 +1,10 @@
+// Cross-module Handle auto-deref with Slab
+// BUG-416: emitter couldn't find allocator across module boundary
+
+import cross_entity;
+
+u32 main() {
+    u32 id = cross_create(1, 100);
+    if (id != 1) { return 1; }
+    return 0;
+}

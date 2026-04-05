@@ -1,0 +1,10 @@
+struct CrossEnt { u32 id; u32 hp; }
+Slab(CrossEnt) cross_world;
+
+u32 cross_create(u32 id, u32 hp) {
+    Handle(CrossEnt) e = cross_world.alloc() orelse { return 0; };
+    e.id = id;
+    e.hp = hp;
+    cross_world.free(e);
+    return id;
+}

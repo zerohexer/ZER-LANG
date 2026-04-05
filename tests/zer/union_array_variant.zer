@@ -1,0 +1,32 @@
+// Union with array variant — BUG-429: array inside union emitted wrong C
+// emit_type + name instead of emit_type_and_name
+union Data { u32 single; u32[4] quad; }
+
+u32 main() {
+    Data d;
+    d.quad[0] = 10;
+    d.quad[1] = 20;
+    d.quad[2] = 30;
+    d.quad[3] = 40;
+
+    // Read values through variant
+    switch (d) {
+        .quad => |v| {
+            if (v[0] != 10) { return 1; }
+            if (v[3] != 40) { return 2; }
+        }
+        default => { return 3; }
+    }
+
+    // Single variant
+    Data d2;
+    d2.single = 99;
+    switch (d2) {
+        .single => |v| {
+            if (v != 99) { return 4; }
+        }
+        default => { return 5; }
+    }
+
+    return 0;
+}

@@ -3718,8 +3718,9 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
             UnionVariant *v = &decl->union_decl.variants[j];
             Type *vtype = resolve_tynode(e,v->type);
             emit(e, "        ");
-            emit_type(e, vtype);
-            emit(e, " %.*s;\n", (int)v->name_len, v->name);
+            /* BUG-429: use emit_type_and_name for arrays/funcptrs in union variants */
+            emit_type_and_name(e, vtype, v->name, (int)v->name_len);
+            emit(e, ";\n");
         }
         emit(e, "    };\n};\n");
         /* optional/slice/opt-slice typedefs */

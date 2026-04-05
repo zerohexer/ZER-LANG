@@ -509,6 +509,9 @@ void ast_print(Node *node, int indent);
 static inline int64_t eval_const_expr_d(Node *n, int depth) {
     if (!n || depth > 256) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
+    /* BUG-415: resolved comptime calls (including negative results) */
+    if (n->kind == NODE_CALL && n->call.is_comptime_resolved)
+        return n->call.comptime_value;
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_d(n->unary.operand, depth + 1);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;

@@ -689,7 +689,8 @@ This session's proof: writing a 60-line HTTP server found the orelse block null-
 - `slice = array` assignment missing coercion — tests only used var-decl init, not assignment
 - `typedef ?u32 (*Handler)(u32)` creating optional funcptr — tests used void return funcptrs
 
-The audit round found 6 bugs, real code found 5 more, real-code session 2 found 3 more. Both are needed.
+- `u32 val = get_tok(&state).field; return val;` falsely rejected as "pointer to local" — scalar can't carry pointer
+The audit round found 6 bugs, real code found 5 more, real-code session 2 found 4 more. Both are needed.
 
 ### Windows VSIX Workflow
 - `make docker-install` — builds + installs to mingw PATH

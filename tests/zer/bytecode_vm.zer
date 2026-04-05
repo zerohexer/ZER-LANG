@@ -1,0 +1,177 @@
+// Hard test 1: Bytecode interpreter
+// Exercises: enum with explicit values, switch on enum, arrays,
+//            while loop, nested switch, struct mutation, stack operations,
+//            @truncate, arithmetic overflow (wrapping), break from nested
+
+enum Op {
+    nop = 0,
+    push = 1,
+    pop = 2,
+    add = 3,
+    sub = 4,
+    mul = 5,
+    dup = 6,
+    swap = 7,
+    jmpz = 8,
+    halt = 9
+}
+
+struct VM {
+    u32[64] stack;
+    u32 sp;
+    u8[128] code;
+    u32 pc;
+    bool halted;
+    u32 cycles;
+}
+
+void vm_init(*VM vm) {
+    vm.sp = 0;
+    vm.pc = 0;
+    vm.halted = false;
+    vm.cycles = 0;
+}
+
+bool vm_push(*VM vm, u32 val) {
+    if (vm.sp >= 64) { return false; }
+    vm.stack[vm.sp] = val;
+    vm.sp = vm.sp + 1;
+    return true;
+}
+
+?u32 vm_pop(*VM vm) {
+    if (vm.sp == 0) { return null; }
+    vm.sp = vm.sp - 1;
+    return vm.stack[vm.sp];
+}
+
+void vm_step(*VM vm) {
+    if (vm.halted) { return; }
+    if (vm.pc >= 128) { vm.halted = true; return; }
+
+    u8 opcode = vm.code[vm.pc];
+    vm.pc = vm.pc + 1;
+    vm.cycles = vm.cycles + 1;
+
+    // Manual dispatch since enum from u8 needs comparison
+    if (opcode == 0) {
+        // nop
+    } else if (opcode == 1) {
+        // push: next byte is immediate value
+        if (vm.pc >= 128) { vm.halted = true; return; }
+        u8 imm = vm.code[vm.pc];
+        vm.pc = vm.pc + 1;
+        if (!vm_push(vm, imm)) { vm.halted = true; }
+    } else if (opcode == 2) {
+        // pop
+        u32 v = vm_pop(vm) orelse { vm.halted = true; return; };
+    } else if (opcode == 3) {
+        // add
+        u32 b = vm_pop(vm) orelse { vm.halted = true; return; };
+        u32 a = vm_pop(vm) orelse { vm.halted = true; return; };
+        if (!vm_push(vm, a + b)) { vm.halted = true; }
+    } else if (opcode == 4) {
+        // sub
+        u32 b = vm_pop(vm) orelse { vm.halted = true; return; };
+        u32 a = vm_pop(vm) orelse { vm.halted = true; return; };
+        if (!vm_push(vm, a - b)) { vm.halted = true; }
+    } else if (opcode == 5) {
+        // mul
+        u32 b = vm_pop(vm) orelse { vm.halted = true; return; };
+        u32 a = vm_pop(vm) orelse { vm.halted = true; return; };
+        if (!vm_push(vm, a * b)) { vm.halted = true; }
+    } else if (opcode == 6) {
+        // dup
+        u32 top = vm_pop(vm) orelse { vm.halted = true; return; };
+        if (!vm_push(vm, top)) { vm.halted = true; return; }
+        if (!vm_push(vm, top)) { vm.halted = true; }
+    } else if (opcode == 7) {
+        // swap
+        u32 b = vm_pop(vm) orelse { vm.halted = true; return; };
+        u32 a = vm_pop(vm) orelse { vm.halted = true; return; };
+        if (!vm_push(vm, b)) { vm.halted = true; return; }
+        if (!vm_push(vm, a)) { vm.halted = true; }
+    } else if (opcode == 8) {
+        // jmpz: if TOS == 0, jump to next byte offset
+        if (vm.pc >= 128) { vm.halted = true; return; }
+        u8 target = vm.code[vm.pc];
+        vm.pc = vm.pc + 1;
+        u32 top = vm_pop(vm) orelse { vm.halted = true; return; };
+        if (top == 0) { vm.pc = target; }
+    } else if (opcode == 9) {
+        // halt
+        vm.halted = true;
+    } else {
+        // unknown opcode
+        vm.halted = true;
+    }
+}
+
+void vm_run(*VM vm) {
+    for (u32 i = 0; i < 1000; i += 1) {
+        if (vm.halted) { break; }
+        vm_step(vm);
+    }
+}
+
+u32 main() {
+    VM vm;
+    vm_init(&vm);
+
+    // Program: push 10, push 20, add, push 3, mul, halt
+    // Expected: (10 + 20) * 3 = 90
+    vm.code[0] = 1;   // push
+    vm.code[1] = 10;  // imm 10
+    vm.code[2] = 1;   // push
+    vm.code[3] = 20;  // imm 20
+    vm.code[4] = 3;   // add
+    vm.code[5] = 1;   // push
+    vm.code[6] = 3;   // imm 3
+    vm.code[7] = 5;   // mul
+    vm.code[8] = 9;   // halt
+
+    vm_run(&vm);
+
+    if (!vm.halted) { return 1; }
+    if (vm.sp != 1) { return 2; }
+
+    u32 result = vm_pop(&vm) orelse { return 3; };
+    if (result != 90) { return 4; }
+
+    // Program 2: push 5, dup, mul → 25, push 0, jmpz to halt, push 99 (skipped), halt
+    VM vm2;
+    vm_init(&vm2);
+    vm2.code[0] = 1;   // push
+    vm2.code[1] = 5;   // imm 5
+    vm2.code[2] = 6;   // dup → [5, 5]
+    vm2.code[3] = 5;   // mul → [25]
+    vm2.code[4] = 1;   // push
+    vm2.code[5] = 0;   // imm 0
+    vm2.code[6] = 8;   // jmpz
+    vm2.code[7] = 10;  // target: pc=10
+    vm2.code[8] = 1;   // push (should be skipped)
+    vm2.code[9] = 99;  // imm 99
+    vm2.code[10] = 9;  // halt
+
+    vm_run(&vm2);
+    if (!vm2.halted) { return 5; }
+    if (vm2.sp != 1) { return 6; }
+
+    u32 r2 = vm_pop(&vm2) orelse { return 7; };
+    if (r2 != 25) { return 8; }
+
+    // Program 3: swap test — push 1, push 2, swap → [2, 1]
+    VM vm3;
+    vm_init(&vm3);
+    vm3.code[0] = 1;  vm3.code[1] = 1;   // push 1
+    vm3.code[2] = 1;  vm3.code[3] = 2;   // push 2
+    vm3.code[4] = 7;  // swap → [2, 1]
+    vm3.code[5] = 4;  // sub → [2 - 1] = [1]
+    vm3.code[6] = 9;  // halt
+
+    vm_run(&vm3);
+    u32 r3 = vm_pop(&vm3) orelse { return 9; };
+    if (r3 != 1) { return 10; }
+
+    return 0;
+}

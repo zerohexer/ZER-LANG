@@ -1,0 +1,37 @@
+// BUG-421: scalar field extract from struct returned by function with &local arg
+// falsely marked as local-derived. u32 result = get_tok(&local).val should be safe.
+
+enum K { a, b }
+struct Token { K kind; u32 val; }
+struct State { u32 pos; }
+
+Token get_tok(*State s) {
+    Token t;
+    t.val = s.pos;
+    s.pos = s.pos + 1;
+    if (s.pos >= 3) { t.kind = K.a; } else { t.kind = K.b; }
+    return t;
+}
+
+?u32 process() {
+    State s;
+    s.pos = 0;
+    Token first = get_tok(&s);
+    u32 result = first.val;
+    while (true) {
+        Token tok = get_tok(&s);
+        switch (tok.kind) {
+            .a => { return result; }
+            .b => { }
+        }
+        result = result + tok.val;
+    }
+}
+
+u32 main() {
+    u32 v = process() orelse { return 1; };
+    // first.val=0, tok.val=1 (round 1), tok.val=2 (round 2, returns)
+    // result = 0 + 1 = 1 after round 1, then returns 1
+    if (v != 1) { return 2; }
+    return 0;
+}

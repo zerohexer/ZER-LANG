@@ -4743,9 +4743,19 @@ static void check_stmt(Checker *c, Node *node) {
                             Symbol *src = scope_lookup(c->current_scope,
                                 init_root->ident.name,
                                 (uint32_t)init_root->ident.name_len);
-                            if (src && src->is_arena_derived)
+                            /* BUG-421: only propagate local/arena-derived flags when the
+                             * target variable can actually carry a pointer. Scalar types
+                             * (u32, bool, etc.) can't escape local memory even if the
+                             * source struct was marked local-derived. Without this check,
+                             * u32 val = struct_result.field falsely inherits the flag. */
+                            Type *sym_eff = type ? type_unwrap_distinct(type) : NULL;
+                            bool can_carry_ptr = sym_eff && (
+                                sym_eff->kind == TYPE_POINTER || sym_eff->kind == TYPE_SLICE ||
+                                sym_eff->kind == TYPE_STRUCT || sym_eff->kind == TYPE_UNION ||
+                                sym_eff->kind == TYPE_OPAQUE);
+                            if (src && src->is_arena_derived && can_carry_ptr)
                                 sym->is_arena_derived = true;
-                            if (src && src->is_local_derived)
+                            if (src && src->is_local_derived && can_carry_ptr)
                                 sym->is_local_derived = true;
                         }
                     }

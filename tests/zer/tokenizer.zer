@@ -1,0 +1,186 @@
+// Hard test 3: A simple tokenizer / lexer
+// Exercises: slice iteration, byte comparison chains, nested if/else-if,
+//            enum, switch, struct with slice field, while loops,
+//            function returning struct, optional struct return
+
+enum TokenKind { number, plus, minus, star, eof, err }
+
+struct Token {
+    TokenKind kind;
+    u32 start;
+    u32 len;
+    u32 value;  // for number tokens
+}
+
+struct Lexer {
+    const [*]u8 source;
+    u32 pos;
+}
+
+bool is_digit(u8 c) {
+    if (c >= 48) {
+        if (c <= 57) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_space(u8 c) {
+    if (c == 32) { return true; }   // space
+    if (c == 9) { return true; }    // tab
+    if (c == 10) { return true; }   // newline
+    if (c == 13) { return true; }   // carriage return
+    return false;
+}
+
+void skip_whitespace(*Lexer lex) {
+    while (true) {
+        if (lex.pos >= lex.source.len) { break; }
+        u8 c = lex.source[lex.pos];
+        if (!is_space(c)) { break; }
+        lex.pos = lex.pos + 1;
+    }
+}
+
+Token next_token(*Lexer lex) {
+    skip_whitespace(lex);
+
+    Token tok;
+    tok.value = 0;
+
+    usize slen = lex.source.len;
+    u32 pos32 = @truncate(u32, slen);
+
+    if (lex.pos >= pos32) {
+        tok.kind = TokenKind.eof;
+        tok.start = lex.pos;
+        tok.len = 0;
+        return tok;
+    }
+
+    u8 c = lex.source[lex.pos];
+    tok.start = lex.pos;
+
+    if (c == 43) {
+        // '+'
+        tok.kind = TokenKind.plus;
+        tok.len = 1;
+        lex.pos = lex.pos + 1;
+        return tok;
+    }
+
+    if (c == 45) {
+        // '-'
+        tok.kind = TokenKind.minus;
+        tok.len = 1;
+        lex.pos = lex.pos + 1;
+        return tok;
+    }
+
+    if (c == 42) {
+        // '*'
+        tok.kind = TokenKind.star;
+        tok.len = 1;
+        lex.pos = lex.pos + 1;
+        return tok;
+    }
+
+    if (is_digit(c)) {
+        tok.kind = TokenKind.number;
+        u32 val = 0;
+        u32 digit_start = lex.pos;
+        while (true) {
+            if (lex.pos >= pos32) { break; }
+            u8 d = lex.source[lex.pos];
+            if (!is_digit(d)) { break; }
+            val = val * 10 + (d - 48);
+            lex.pos = lex.pos + 1;
+        }
+        tok.len = lex.pos - digit_start;
+        tok.value = val;
+        return tok;
+    }
+
+    // Unknown character
+    tok.kind = TokenKind.err;
+    tok.len = 1;
+    lex.pos = lex.pos + 1;
+    return tok;
+}
+
+// Simple expression evaluator: number (op number)*
+// Only handles left-to-right, no precedence
+?u32 evaluate(const [*]u8 input) {
+    Lexer lex;
+    lex.source = input;
+    lex.pos = 0;
+
+    Token first = next_token(&lex);
+    switch (first.kind) {
+        .number => { }
+        default => { return null; }
+    }
+
+    u32 result = first.value;
+
+    while (true) {
+        Token op = next_token(&lex);
+        switch (op.kind) {
+            .eof => { return result; }
+            .plus => { }
+            .minus => { }
+            .star => { }
+            default => { return null; }
+        }
+
+        Token num = next_token(&lex);
+        switch (num.kind) {
+            .number => { }
+            default => { return null; }
+        }
+
+        switch (op.kind) {
+            .plus => { result = result + num.value; }
+            .minus => { result = result - num.value; }
+            .star => { result = result * num.value; }
+            default => { }
+        }
+    }
+}
+
+u32 main() {
+    // "42"
+    u32 v1 = evaluate("42") orelse { return 1; };
+    if (v1 != 42) { return 2; }
+
+    // "10 + 20"
+    u32 v2 = evaluate("10 + 20") orelse { return 3; };
+    if (v2 != 30) { return 4; }
+
+    // "100 - 30 + 5"
+    u32 v3 = evaluate("100 - 30 + 5") orelse { return 5; };
+    if (v3 != 75) { return 6; }
+
+    // "3 * 4 + 2"  → left-to-right: (3*4)+2 = 14
+    u32 v4 = evaluate("3 * 4 + 2") orelse { return 7; };
+    if (v4 != 14) { return 8; }
+
+    // "0"
+    u32 v5 = evaluate("0") orelse { return 9; };
+    if (v5 != 0) { return 10; }
+
+    // "  123  " (whitespace)
+    u32 v6 = evaluate("  123  ") orelse { return 11; };
+    if (v6 != 123) { return 12; }
+
+    // Empty string
+    ?u32 v7 = evaluate("");
+    if (v7) |v| { return 13; }
+
+    // Just operator
+    ?u32 v8 = evaluate("+");
+    if (v8) |v| { return 14; }
+
+    return 0;
+}

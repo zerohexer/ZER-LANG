@@ -1,0 +1,145 @@
+// Hard test 2: Manual free list allocator using arrays
+// Exercises: array indexing with computed indices, bit manipulation,
+//            nested for loops, struct arrays, conditional chains,
+//            u8/u32 conversions, @truncate
+
+comptime u32 BLOCK_COUNT() { return 32; }
+comptime u32 BLOCK_SIZE() { return 16; }
+
+struct Block {
+    u8[BLOCK_SIZE()] data;
+    bool used;
+    u32 next_free;  // index of next free block, or 0xFFFFFFFF if none
+}
+
+struct Allocator {
+    Block[BLOCK_COUNT()] blocks;
+    u32 free_head;
+    u32 used_count;
+}
+
+void alloc_init(*Allocator a) {
+    a.free_head = 0;
+    a.used_count = 0;
+    for (u32 i = 0; i < BLOCK_COUNT(); i += 1) {
+        a.blocks[i].used = false;
+        if (i < BLOCK_COUNT() - 1) {
+            a.blocks[i].next_free = i + 1;
+        } else {
+            a.blocks[i].next_free = 0xFFFFFFFF;
+        }
+        // zero data
+        for (u32 j = 0; j < BLOCK_SIZE(); j += 1) {
+            a.blocks[i].data[j] = 0;
+        }
+    }
+}
+
+// Allocate a block, returns index or 0xFFFFFFFF on failure
+u32 alloc_block(*Allocator a) {
+    if (a.free_head == 0xFFFFFFFF) { return 0xFFFFFFFF; }
+    u32 idx = a.free_head;
+    if (idx >= BLOCK_COUNT()) { return 0xFFFFFFFF; }
+    a.free_head = a.blocks[idx].next_free;
+    a.blocks[idx].used = true;
+    a.blocks[idx].next_free = 0xFFFFFFFF;
+    a.used_count = a.used_count + 1;
+    return idx;
+}
+
+// Free a block
+bool free_block(*Allocator a, u32 idx) {
+    if (idx >= BLOCK_COUNT()) { return false; }
+    if (!a.blocks[idx].used) { return false; }
+    a.blocks[idx].used = false;
+    a.blocks[idx].next_free = a.free_head;
+    a.free_head = idx;
+    a.used_count = a.used_count - 1;
+    // Zero data on free
+    for (u32 j = 0; j < BLOCK_SIZE(); j += 1) {
+        a.blocks[idx].data[j] = 0;
+    }
+    return true;
+}
+
+// Write a byte to a block
+bool write_byte(*Allocator a, u32 block_idx, u32 offset, u8 val) {
+    if (block_idx >= BLOCK_COUNT()) { return false; }
+    if (!a.blocks[block_idx].used) { return false; }
+    if (offset >= BLOCK_SIZE()) { return false; }
+    a.blocks[block_idx].data[offset] = val;
+    return true;
+}
+
+// Read a byte from a block
+?u8 read_byte(*Allocator a, u32 block_idx, u32 offset) {
+    if (block_idx >= BLOCK_COUNT()) { return null; }
+    if (!a.blocks[block_idx].used) { return null; }
+    if (offset >= BLOCK_SIZE()) { return null; }
+    return a.blocks[block_idx].data[offset];
+}
+
+u32 main() {
+    Allocator alloc;
+    alloc_init(&alloc);
+
+    if (alloc.used_count != 0) { return 1; }
+
+    // Allocate 3 blocks
+    u32 b0 = alloc_block(&alloc);
+    u32 b1 = alloc_block(&alloc);
+    u32 b2 = alloc_block(&alloc);
+
+    if (b0 == 0xFFFFFFFF) { return 2; }
+    if (b1 == 0xFFFFFFFF) { return 3; }
+    if (b2 == 0xFFFFFFFF) { return 4; }
+    if (alloc.used_count != 3) { return 5; }
+
+    // Write data
+    if (!write_byte(&alloc, b0, 0, 0xAA)) { return 6; }
+    if (!write_byte(&alloc, b0, 1, 0xBB)) { return 7; }
+    if (!write_byte(&alloc, b1, 0, 0xCC)) { return 8; }
+    if (!write_byte(&alloc, b2, 15, 0xDD)) { return 9; }  // last byte
+
+    // Read back
+    u8 r0 = read_byte(&alloc, b0, 0) orelse { return 10; };
+    if (r0 != 0xAA) { return 11; }
+
+    u8 r1 = read_byte(&alloc, b0, 1) orelse { return 12; };
+    if (r1 != 0xBB) { return 13; }
+
+    u8 r2 = read_byte(&alloc, b1, 0) orelse { return 14; };
+    if (r2 != 0xCC) { return 15; }
+
+    u8 r3 = read_byte(&alloc, b2, 15) orelse { return 16; };
+    if (r3 != 0xDD) { return 17; }
+
+    // Read out of bounds
+    ?u8 oob = read_byte(&alloc, b0, 100);
+    if (oob) |v| { return 18; }
+
+    // Free middle block and reallocate
+    if (!free_block(&alloc, b1)) { return 19; }
+    if (alloc.used_count != 2) { return 20; }
+
+    // Freed data should be zeroed
+    ?u8 freed = read_byte(&alloc, b1, 0);
+    if (freed) |v| { return 21; }  // block not in use, should return null
+
+    // Reallocate — should get b1 back (free list LIFO)
+    u32 b3 = alloc_block(&alloc);
+    if (b3 == 0xFFFFFFFF) { return 22; }
+    if (b3 != b1) { return 23; }  // should reuse freed block
+
+    // Original blocks still intact
+    u8 check = read_byte(&alloc, b0, 0) orelse { return 24; };
+    if (check != 0xAA) { return 25; }
+
+    // Cleanup
+    free_block(&alloc, b0);
+    free_block(&alloc, b2);
+    free_block(&alloc, b3);
+    if (alloc.used_count != 0) { return 26; }
+
+    return 0;
+}

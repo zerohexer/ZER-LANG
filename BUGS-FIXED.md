@@ -5,6 +5,22 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Late Bug Hunting (BUG-423/424)
+
+### BUG-423: Comptime call in Pool/Ring size argument
+- **Symptom:** `Pool(Item, POOL_SIZE())` → "Pool count must be a positive compile-time constant." Comptime function call as Pool/Ring size rejected.
+- **Root cause:** `eval_const_expr` ran before `check_expr` resolved the comptime call in the type resolution path (TYNODE_POOL/TYNODE_RING count expression).
+- **Fix:** Added `check_expr(c, tn->pool.count_expr)` before `eval_const_expr` in both TYNODE_POOL and TYNODE_RING.
+- **Test:** `comptime_pool_size.zer`
+
+### BUG-424: String literal to const slice struct field blocked
+- **Symptom:** `struct Log { const [*]u8 msg; }; e.msg = "hello";` → "string literal is read-only." Checker blocked all string→slice assignments without checking target's const qualifier.
+- **Root cause:** Assignment string literal check (line 1671) tested `target->kind == TYPE_SLICE` without checking `target->slice.is_const`. Const slice targets are safe for string literals.
+- **Fix:** Added `!type_unwrap_distinct(target)->slice.is_const` condition. Also added distinct unwrap.
+- **Test:** `const_slice_field.zer`
+
+---
+
 ## Session 2026-04-05 — Bugs Found by Hard ZER Programs (BUG-421)
 
 ### BUG-421: Scalar field from struct returned by `func(&local)` falsely rejected as local-derived

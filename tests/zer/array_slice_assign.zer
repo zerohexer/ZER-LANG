@@ -1,0 +1,36 @@
+// BUG-419: array→slice coercion in assignment was missing
+// Tests: assign array to slice variable, assign array to struct slice field
+
+struct Buffer { [*]u8 data; u32 pos; }
+
+u32 main() {
+    u8[4] arr;
+    arr[0] = 10;
+    arr[1] = 20;
+    arr[2] = 30;
+    arr[3] = 40;
+
+    // Direct assignment to slice variable
+    [*]u8 s;
+    s = arr;
+    if (s.len != 4) { return 1; }
+    if (s[0] != 10) { return 2; }
+    if (s[3] != 40) { return 3; }
+
+    // Assignment to struct slice field
+    Buffer buf;
+    buf.data = arr;
+    buf.pos = 0;
+    if (buf.data.len != 4) { return 4; }
+    if (buf.data[2] != 30) { return 5; }
+
+    // Re-assign with different array
+    u8[2] small;
+    small[0] = 99;
+    small[1] = 88;
+    s = small;
+    if (s.len != 2) { return 6; }
+    if (s[0] != 99) { return 7; }
+
+    return 0;
+}

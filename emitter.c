@@ -107,6 +107,10 @@ static Symbol *expr_root_symbol(Emitter *e, Node *expr) {
 static bool expr_is_volatile(Emitter *e, Node *expr) {
     Symbol *s = expr_root_symbol(e, expr);
     return s && s->is_volatile;
+    /* NOTE: volatile struct ARRAY fields (struct Hw { volatile u8[4] regs; })
+     * are NOT detected here — TYPE_ARRAY has no is_volatile flag (BUG-185).
+     * The volatile is on the TYNODE_VOLATILE wrapper, not in the Type system.
+     * This is a known limitation requiring a design change to TYPE_ARRAY. */
 }
 
 /* ---- Type emission ---- */
@@ -2437,9 +2441,11 @@ static void emit_stmt(Emitter *e, Node *node) {
              node->var_decl.init->orelse.fallback_is_break ||
              node->var_decl.init->orelse.fallback_is_continue)) {
             Type *or_expr_type = checker_get_type(e->checker,node->var_decl.init->orelse.expr);
-            bool or_is_ptr = or_expr_type &&
-                or_expr_type->kind == TYPE_OPTIONAL &&
-                is_null_sentinel(or_expr_type->optional.inner);
+            /* BUG-409: unwrap distinct for optional dispatch */
+            Type *or_eff = or_expr_type ? type_unwrap_distinct(or_expr_type) : NULL;
+            bool or_is_ptr = or_eff &&
+                or_eff->kind == TYPE_OPTIONAL &&
+                is_null_sentinel(or_eff->optional.inner);
 
             /* BUG-319: use __typeof__ to preserve volatile qualifier */
             int tmp = e->temp_count++;
@@ -2457,8 +2463,9 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
             if (node->var_decl.init->orelse.fallback_is_return) {
                 emit(e, "{\n"); emit_defers(e);
-                if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                    !is_null_sentinel(e->current_func_ret->optional.inner)) {
+                Type *vd_ret = e->current_func_ret ? type_unwrap_distinct(e->current_func_ret) : NULL;
+                if (vd_ret && vd_ret->kind == TYPE_OPTIONAL &&
+                    !is_null_sentinel(vd_ret->optional.inner)) {
                     /* ?T function: return null optional */
                     emit(e, "return (");
                     emit_type(e, e->current_func_ret);
@@ -2466,7 +2473,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                         emit(e, "){ 0 }; }\n");
                     else
                         emit(e, "){ 0, 0 }; }\n");
-                } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                } else if (vd_ret && vd_ret->kind != TYPE_VOID) {
                     emit(e, "return 0; }\n");
                 } else {
                     emit(e, "return; }\n");
@@ -2892,7 +2899,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             } else if (bare_ret && bare_ret->kind == TYPE_OPTIONAL) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
-                if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID) {
+                if (type_unwrap_distinct(bare_ret->optional.inner)->kind == TYPE_VOID) {
                     emit(e, "){ 1 };\n");
                 } else {
                     emit(e, "){ 0, 1 };\n");

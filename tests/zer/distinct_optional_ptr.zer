@@ -1,0 +1,26 @@
+// distinct typedef ?*T — var-decl orelse must use null check, not .has_value
+// Also: distinct ?void bare return must emit { 1 } not { 0, 1 }
+
+struct Data { u32 x; }
+
+distinct typedef ?*Data SafeData;
+distinct typedef ?void Result;
+
+SafeData get_data(bool ok) {
+    if (!ok) { return null; }
+    return null;
+}
+
+Result do_work() {
+    return;
+}
+
+Result do_fail() {
+    return null;
+}
+
+u32 main() {
+    // distinct ?*T orelse — null sentinel path
+    *Data d = get_data(false) orelse { return 0; };
+    return 1;
+}

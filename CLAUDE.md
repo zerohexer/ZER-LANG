@@ -480,7 +480,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Array→slice auto-coercion at call sites already works: `process(arr)` where `process([]u8 data)` auto-converts `u8[N]` to `[]u8 {ptr, len}`.
 
 **Known Technical Debt:**
-- No qualified module call syntax yet (unqualified calls resolve to last import)
+- **Qualified module call syntax supported:** `config.func()` rewrites to unqualified `func()` with mangled lookup. Works for regular functions and comptime functions. Unqualified calls still work as before.
 - checker.c is 6700+ lines (monolith) — works but large to navigate. Split not urgent.
 - zercheck was NOT integrated into zerc until 2026-04-03. All sessions before this date had zercheck only in test harness. Now runs in pipeline: checker → zercheck → emitter. Leaks are warnings (not errors) because zercheck can't track handles across function boundaries or stored in struct fields perfectly. UAF and double-free remain compile errors.
 

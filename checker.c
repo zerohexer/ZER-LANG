@@ -2362,6 +2362,45 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* module-qualified call: config.func() → rewrite callee to NODE_IDENT
+         * with the raw function name. The existing unqualified call resolution
+         * already finds imported functions by raw name in global scope.
+         * Must happen before check_expr on callee object, because module names
+         * aren't variables and would fail as "undefined identifier". */
+        if (node->call.callee->kind == NODE_FIELD &&
+            node->call.callee->field.object->kind == NODE_IDENT) {
+            const char *maybe_mod = node->call.callee->field.object->ident.name;
+            uint32_t maybe_mod_len = (uint32_t)node->call.callee->field.object->ident.name_len;
+            const char *func_name = node->call.callee->field.field_name;
+            uint32_t func_len = (uint32_t)node->call.callee->field.field_name_len;
+            /* check if this is a module name (not a variable/type) */
+            Symbol *var_sym = scope_lookup(c->current_scope, maybe_mod, maybe_mod_len);
+            if (!var_sym || (var_sym->type && var_sym->type->kind != TYPE_STRUCT &&
+                var_sym->type->kind != TYPE_ENUM && var_sym->type->kind != TYPE_UNION &&
+                var_sym->type->kind != TYPE_POOL && var_sym->type->kind != TYPE_SLAB &&
+                var_sym->type->kind != TYPE_RING && var_sym->type->kind != TYPE_ARENA)) {
+                /* try as module-qualified call — look up module__func in global scope */
+                uint32_t mang_len = maybe_mod_len + 2 + func_len;
+                char *mangled = (char *)arena_alloc(c->arena, mang_len + 1);
+                if (mangled) {
+                    memcpy(mangled, maybe_mod, maybe_mod_len);
+                    mangled[maybe_mod_len] = '_';
+                    mangled[maybe_mod_len + 1] = '_';
+                    memcpy(mangled + maybe_mod_len + 2, func_name, func_len);
+                    mangled[mang_len] = '\0';
+                    Symbol *mod_func = scope_lookup(c->global_scope, mangled, mang_len);
+                    if (mod_func && mod_func->is_function) {
+                        /* rewrite callee to raw function name — the existing
+                         * unqualified resolution finds it in global scope */
+                        node->call.callee->kind = NODE_IDENT;
+                        node->call.callee->ident.name = func_name;
+                        node->call.callee->ident.name_len = func_len;
+                        goto normal_call;
+                    }
+                }
+            }
+        }
+
         /* builtin method call: expr.method(args) where expr is Pool/Ring/Arena */
         if (node->call.callee->kind == NODE_FIELD) {
             Node *field_node = node->call.callee;
@@ -2789,6 +2828,7 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* normal function call */
+        normal_call:;
         Type *callee_type = check_expr(c, node->call.callee);
         /* unwrap distinct typedef for call dispatch */
         Type *effective_callee = type_unwrap_distinct(callee_type);

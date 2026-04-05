@@ -1,0 +1,17 @@
+// Module-qualified function calls: config.func()
+// Tests: comptime call, comptime with args, regular function call
+
+import helpers;
+
+u32 main() {
+    u32 sz = helpers.MAX_SIZE();
+    if (sz != 16) { return 1; }
+
+    u32 mask = helpers.BIT(3);
+    if (mask != 8) { return 2; }
+
+    u32 ver = helpers.get_version();
+    if (ver != 42) { return 3; }
+
+    return 0;
+}

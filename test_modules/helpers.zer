@@ -1,0 +1,3 @@
+comptime u32 MAX_SIZE() { return 16; }
+comptime u32 BIT(u32 n) { return 1 << n; }
+u32 get_version() { return 42; }

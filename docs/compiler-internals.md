@@ -271,6 +271,10 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 `!integer` now returns bool (was: "'!' requires bool"). Common C idiom for `#ifndef` → `comptime if (!FLAG())`. Checker changed from `type_equals(operand, ty_bool)` to `!type_equals(operand, ty_bool) && !type_is_integer(operand)`. Result always TYPE_BOOL. Emitter unchanged (`(!expr)` works in C for both types).
 
+### Union Array Variant Emission (BUG-429, 2026-04-05)
+
+`union Data { u32[4] quad; }` emitted `uint32_t[4] quad;` — invalid C. Union variant emission used `emit_type()` + manual name, which doesn't place array dimensions after the name. Fix: use `emit_type_and_name()` (same as struct fields). **Pattern:** Any site emitting a type+name pair must use `emit_type_and_name()`, never `emit_type()` + manual name — arrays and function pointers require special name placement.
+
 ### @atomic_or Name Length (BUG-427, 2026-04-05)
 
 Atomic intrinsic prefix check was `nlen >= 10` but `"atomic_or"` is 9 chars. Fixed to `>= 9`. All other atomics (add=10, sub=10, and=10, xor=10, load=11, store=12, cas=10) were fine.

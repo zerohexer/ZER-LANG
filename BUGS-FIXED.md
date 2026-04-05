@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Systematic Audit Round 2 (BUG-429)
+
+### BUG-429: Array variant in union emitted wrong C syntax
+- **Symptom:** `union Data { u32 single; u32[4] quad; }` emitted `uint32_t[4] quad;` inside union — invalid C. Should be `uint32_t quad[4];`.
+- **Root cause:** Union variant emission used `emit_type()` + manual name printf, which doesn't handle array dimension placement. Struct fields already used `emit_type_and_name()` which handles this correctly.
+- **Fix:** Changed union variant emission to use `emit_type_and_name()` (same pattern as struct fields).
+- **Test:** `union_array_variant.zer`
+
+---
+
 ## Session 2026-04-05 — Systematic Audit (BUG-426/427/428)
 
 ### BUG-426: `!` operator rejected integers (only accepted bool)

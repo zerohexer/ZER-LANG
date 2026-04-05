@@ -556,7 +556,26 @@ struct Ops { u32 (*compute)(u32); }        // struct field
 u32 apply(u32 (*op)(u32, u32), u32 x, u32 y);  // parameter
 ?void (*on_event)(u32) = null;             // optional — null = not set
 typedef u32 (*BinOp)(u32, u32);            // typedef
+typedef ?u32 (*OptHandler)(u32);           // typedef — returns ?u32
 BinOp[4] ops;                              // array of function pointers (via typedef)
+```
+
+**OPTIONAL FUNCTION POINTERS VS OPTIONAL RETURN**
+```zer
+// At declaration sites (var, param, field, global):
+// ? wraps the function pointer → nullable funcptr
+?void (*cb)(u32) = null;                   // nullable callback
+?void (*cb)(u32) = my_handler;             // assign function
+if (cb) |f| { f(42); }                     // unwrap before calling
+
+// At typedef sites:
+// ? is part of the return type → funcptr returning optional
+typedef ?u32 (*Lookup)(u32 key);           // returns ?u32
+Lookup fn = my_lookup;
+u32 val = fn(42) orelse 0;                 // unwrap return value
+
+// For nullable typedef'd funcptr, use ? on the typedef name:
+?Lookup maybe_fn = null;                   // nullable Lookup
 ```
 
 **EXAMPLE**

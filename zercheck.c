@@ -665,13 +665,20 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     is_free_site = true;
             }
             /* Also skip if callee has a summary or heuristic that frees params */
-            if (!is_free_site && cc && cc->kind == NODE_IDENT) {
-                FuncSummary *cs = find_summary(zc, cc->ident.name, (uint32_t)cc->ident.name_len);
-                if (cs) is_free_site = true;
+            const char *cc_name = NULL; uint32_t cc_nlen = 0;
+            if (cc && cc->kind == NODE_IDENT) { cc_name = cc->ident.name; cc_nlen = (uint32_t)cc->ident.name_len; }
+            else if (cc && cc->kind == NODE_FIELD) { cc_name = cc->field.field_name; cc_nlen = (uint32_t)cc->field.field_name_len; }
+            if (!is_free_site && cc_name) {
+                FuncSummary *cs = find_summary(zc, cc_name, cc_nlen);
+                /* Only skip UAF check if summary says it actually frees a param */
+                if (cs) {
+                    for (int fi = 0; fi < cs->param_count && !is_free_site; fi++)
+                        if (cs->frees_param[fi]) is_free_site = true;
+                }
                 /* heuristic: bodyless void func(*opaque) */
                 if (!is_free_site) {
                     Symbol *csym = scope_lookup(zc->checker->global_scope,
-                        cc->ident.name, (uint32_t)cc->ident.name_len);
+                        cc_name, cc_nlen);
                     if (csym && csym->is_function && csym->func_node &&
                         !csym->func_node->func_decl.body && csym->type) {
                         Type *cret = csym->type;
@@ -1201,10 +1208,22 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
 static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
     if (!call_node || call_node->kind != NODE_CALL) return;
     Node *callee = call_node->call.callee;
-    if (!callee || callee->kind != NODE_IDENT) return;
+    if (!callee) return;
+    /* Extract function name — handle both unqualified and qualified calls */
+    const char *func_name = NULL;
+    uint32_t func_name_len = 0;
+    if (callee->kind == NODE_IDENT) {
+        func_name = callee->ident.name;
+        func_name_len = (uint32_t)callee->ident.name_len;
+    } else if (callee->kind == NODE_FIELD) {
+        /* module.func() — use field name (raw function name) */
+        func_name = callee->field.field_name;
+        func_name_len = (uint32_t)callee->field.field_name_len;
+    } else {
+        return;
+    }
 
-    FuncSummary *s = find_summary(zc, callee->ident.name,
-        (uint32_t)callee->ident.name_len);
+    FuncSummary *s = find_summary(zc, func_name, func_name_len);
     /* Signature heuristic fallback: if no summary exists but the function
      * takes *opaque/*T as param and returns void, treat as @frees(0).
      * Covers wrapper chains: app_stop → service_shutdown → resource_destroy.
@@ -1212,11 +1231,22 @@ static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
     bool heuristic_free = false;
     if (!s && call_node->call.arg_count >= 1) {
         Symbol *sym = scope_lookup(zc->checker->global_scope,
-            callee->ident.name, (uint32_t)callee->ident.name_len);
+            func_name, func_name_len);
+        /* Also try mangled name for imported module functions */
+        if (!sym && callee->kind == NODE_FIELD && callee->field.object &&
+            callee->field.object->kind == NODE_IDENT) {
+            char mkey[256];
+            uint32_t mlen = (uint32_t)callee->field.object->ident.name_len;
+            if (mlen + 2 + func_name_len < sizeof(mkey)) {
+                memcpy(mkey, callee->field.object->ident.name, mlen);
+                mkey[mlen] = '_'; mkey[mlen+1] = '_';
+                memcpy(mkey + mlen + 2, func_name, func_name_len);
+                sym = scope_lookup(zc->checker->global_scope, mkey, mlen + 2 + func_name_len);
+            }
+        }
         if (sym && sym->is_function && sym->type &&
             sym->func_node && !sym->func_node->func_decl.body &&
-            /* skip if already handled by is_free_call (explicit "free" name) */
-            !(callee->ident.name_len == 4 && memcmp(callee->ident.name, "free", 4) == 0)) {
+            !(func_name_len == 4 && memcmp(func_name, "free", 4) == 0)) {
             /* Only for bodyless functions (extern/cinclude). Functions WITH
              * bodies get proper summaries via zc_build_summary. */
             Type *ret = sym->type;

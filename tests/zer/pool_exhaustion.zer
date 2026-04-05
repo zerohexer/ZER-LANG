@@ -1,0 +1,31 @@
+// Pool exhaustion + recovery — alloc until full, free, re-alloc
+struct Slot { u32 val; }
+Pool(Slot, 2) pool;
+
+u32 main() {
+    ?Handle(Slot) m1 = pool.alloc();
+    Handle(Slot) h1 = m1 orelse return;
+    h1.val = 10;
+
+    ?Handle(Slot) m2 = pool.alloc();
+    Handle(Slot) h2 = m2 orelse return;
+    h2.val = 20;
+
+    // Pool is full (capacity 2) — alloc should fail
+    ?Handle(Slot) m3 = pool.alloc();
+    if (m3) |h3| {
+        pool.free(h3);
+        return 1;
+    }
+
+    // Free one and re-alloc
+    pool.free(h1);
+    ?Handle(Slot) m4 = pool.alloc();
+    Handle(Slot) h4 = m4 orelse return;
+    h4.val = 30;
+    if (h4.val != 30) { return 2; }
+
+    pool.free(h2);
+    pool.free(h4);
+    return 0;
+}

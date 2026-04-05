@@ -107,7 +107,12 @@ Symbol *find_unique_allocator(Scope *s, Type *elem_type) {
             if (!t) continue;
             if ((t->kind == TYPE_SLAB && type_equals(t->slab.elem, elem_type)) ||
                 (t->kind == TYPE_POOL && type_equals(t->pool.elem, elem_type))) {
-                if (found) return NULL; /* ambiguous — two allocators for same type */
+                /* BUG-416 fix: imported module globals are registered under both
+                 * raw name ("cross_world") and mangled name ("cross_entity__cross_world")
+                 * in the global scope (BUG-233). Both point to the same Type*.
+                 * Don't treat these as ambiguous — same Type* = same allocator. */
+                if (found && found->type == t) continue; /* same allocator, skip */
+                if (found) return NULL; /* genuinely different allocator — ambiguous */
                 found = &sc->symbols[i];
             }
         }

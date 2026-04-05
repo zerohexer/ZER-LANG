@@ -1,3 +1,8 @@
+/* _POSIX_C_SOURCE needed for popen/pclose declarations on Linux/macOS.
+ * Without this, popen returns implicit int → truncates 64-bit pointer → SIGSEGV. */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

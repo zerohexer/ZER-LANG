@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Bugs Found by Hard ZER Programs (BUG-421)
+
+### BUG-421: Scalar field from struct returned by `func(&local)` falsely rejected as local-derived
+- **Symptom:** `Token tok = get_tok(&local_state); u32 result = tok.val; return result;` → "cannot return pointer to local 'result'" even though `result` is a plain `u32`.
+- **Root cause:** BUG-360/383 conservatively marks struct results of calls with `&local` args as `is_local_derived` (struct might contain pointer field carrying local address). The alias propagation at var-decl init walks field chains to root and propagates the flag without checking the target type. So `u32 val = struct_result.field` inherits `is_local_derived` from the struct, even though `u32` can never carry a pointer.
+- **Fix:** In the alias propagation (checker.c ~line 4742), only propagate `is_local_derived`/`is_arena_derived` when the target type can actually carry a pointer (TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, TYPE_UNION, TYPE_OPAQUE). Scalar types (integers, floats, bools, enums, handles) skip propagation.
+- **Test:** `tests/zer/scalar_from_struct_call.zer`, `tests/zer/tokenizer.zer`
+
+---
+
 ## Session 2026-04-05 — Bugs Found by Writing Real ZER Code (BUG-418/419/420)
 
 ### BUG-420: `typedef ?u32 (*Handler)(u32)` creates optional funcptr instead of funcptr returning optional

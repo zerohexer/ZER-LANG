@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Bug Hunting Round 2 (BUG-425)
+
+### BUG-425: Nested comptime function calls rejected
+- **Symptom:** `comptime u32 QUAD(u32 x) { return DOUBLE(DOUBLE(x)); }` → "comptime function 'DOUBLE' requires all arguments to be compile-time constants." Comptime functions calling other comptime functions with their own parameters failed.
+- **Root cause:** The checker's NODE_CALL handler validates comptime call args via `eval_const_expr()` during body type-checking. Inside a comptime function body, parameters are `NODE_IDENT` (not yet substituted) — `eval_const_expr` returns `CONST_EVAL_FAIL`. The real evaluation happens at the call site (with concrete values) via `eval_comptime_block` + `eval_const_expr_subst`, which correctly handles parameter substitution and nested calls.
+- **Fix:** Added `bool in_comptime_body` to Checker struct. Set to `true` when checking a comptime function body (`check_func_body`). When `in_comptime_body` is true and comptime call args aren't all constant, skip the error — the call site will evaluate with real values.
+- **Test:** `comptime_nested_call.zer` (DOUBLE→QUAD→ADD_QUAD chain, MAX→MAX3 chain, QUAD in array size)
+
+---
+
 ## Session 2026-04-05 — Late Bug Hunting (BUG-423/424)
 
 ### BUG-423: Comptime call in Pool/Ring size argument

@@ -1,0 +1,30 @@
+// Comptime function call as Pool/Ring size argument
+// BUG-423: eval_const_expr ran before check_expr resolved comptime call
+
+comptime u32 POOL_SIZE() { return 8; }
+comptime u32 BUF_SIZE() { return 16; }
+
+struct Item { u32 val; }
+struct Msg { u32 data; }
+
+Pool(Item, POOL_SIZE()) items;
+Ring(Msg, BUF_SIZE()) rx_buf;
+
+u32 main() {
+    // Pool with comptime size
+    Handle(Item) h = items.alloc() orelse { return 1; };
+    items.get(h).val = 42;
+    if (items.get(h).val != 42) { return 2; }
+    items.free(h);
+
+    // Ring with comptime size
+    Msg m;
+    m.data = 99;
+    rx_buf.push(m);
+    ?Msg r = rx_buf.pop();
+    if (r) |msg| {
+        if (msg.data != 99) { return 3; }
+    } else { return 4; }
+
+    return 0;
+}

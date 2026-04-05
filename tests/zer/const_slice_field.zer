@@ -1,0 +1,23 @@
+// String literal assigned to const [*]u8 struct field
+// BUG-424: checker blocked all string→slice assignments without checking const
+
+struct LogEntry { const [*]u8 msg; u32 level; }
+struct Config { const [*]u8 name; const [*]u8 version; }
+
+u32 str_len(const [*]u8 s) { return @truncate(u32, s.len); }
+
+u32 main() {
+    LogEntry e;
+    e.msg = "hello";
+    e.level = 3;
+    if (str_len(e.msg) != 5) { return 1; }
+    if (e.level != 3) { return 2; }
+
+    Config cfg;
+    cfg.name = "ZER";
+    cfg.version = "0.2.9";
+    if (str_len(cfg.name) != 3) { return 3; }
+    if (str_len(cfg.version) != 5) { return 4; }
+
+    return 0;
+}

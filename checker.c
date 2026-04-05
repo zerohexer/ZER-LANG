@@ -1665,10 +1665,12 @@ static Type *check_expr(Checker *c, Node *node) {
                 target->kind == TYPE_POOL ? "Pool" : target->kind == TYPE_RING ? "Ring" : "Slab");
         }
 
-        /* string literal to mutable slice: runtime crash on write */
+        /* string literal to mutable slice: runtime crash on write.
+         * BUG-424: allow assignment to const slice fields (const []u8 is safe). */
         if (node->assign.op == TOK_EQ &&
             node->assign.value->kind == NODE_STRING_LIT &&
-            target && target->kind == TYPE_SLICE) {
+            target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
+            !type_unwrap_distinct(target)->slice.is_const) {
             checker_error(c, node->loc.line,
                 "string literal is read-only — use 'const []u8' for string storage");
         }

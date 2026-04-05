@@ -109,6 +109,18 @@ typedef struct {
     int auto_guard_count;
     int auto_guard_capacity;
 
+    /* Dynamic-index freed handles: tracks pool.free(arr[variable]) for UAF auto-guard.
+     * When arr[j] is later accessed via Handle auto-deref, emitter inserts
+     * if (j == freed_idx) { return <zero>; } before the access. */
+    struct DynFreed {
+        const char *array_name;     /* root array variable name */
+        uint32_t array_name_len;
+        Node *freed_idx;            /* the index expression used in free() */
+        bool all_freed;             /* true if freed in a loop (all elements) */
+    } *dyn_freed;
+    int dyn_freed_count;
+    int dyn_freed_capacity;
+
     /* Cross-function provenance summaries: what provenance a function's return carries */
     struct ProvSummary {
         const char *func_name;

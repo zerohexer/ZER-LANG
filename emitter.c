@@ -198,6 +198,39 @@ static void emit_auto_guards(Emitter *e, Node *node) {
         break;
     }
     case NODE_FIELD:
+        /* UAF auto-guard: if handle array element may have been freed at dynamic index,
+         * emit if (use_idx == freed_idx) { return <zero>; } */
+        if (checker_auto_guard_size(e->checker, node) == UINT64_MAX &&
+            node->field.object->kind == NODE_INDEX &&
+            node->field.object->index_expr.object->kind == NODE_IDENT) {
+            const char *aname = node->field.object->index_expr.object->ident.name;
+            uint32_t alen = (uint32_t)node->field.object->index_expr.object->ident.name_len;
+            Checker *ck = e->checker;
+            for (int dfi = 0; dfi < ck->dyn_freed_count; dfi++) {
+                struct DynFreed *df = &ck->dyn_freed[dfi];
+                if (df->array_name_len == alen &&
+                    memcmp(df->array_name, aname, alen) == 0 && !df->all_freed) {
+                    emit_indent(e);
+                    emit(e, "if ((");
+                    emit_expr(e, node->field.object->index_expr.index);
+                    emit(e, ") == (");
+                    emit_expr(e, df->freed_idx);
+                    emit(e, ")) ");
+                    if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+                        emit(e, "{\n");
+                        emit_defers(e);
+                        emit(e, "return ");
+                        emit_zero_value(e, e->current_func_ret);
+                        emit(e, "; }\n");
+                    } else {
+                        emit(e, "{\n");
+                        emit_defers(e);
+                        emit(e, "return; }\n");
+                    }
+                    break;
+                }
+            }
+        }
         emit_auto_guards(e, node->field.object); break;
     case NODE_ASSIGN:
         emit_auto_guards(e, node->assign.target);

@@ -2529,6 +2529,30 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'free' on const Pool");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "pool.free() takes exactly 1 argument");
+                    /* Track dynamic-index free for auto-guard:
+                     * pool.free(handles[k]) where k is variable */
+                    if (node->call.arg_count == 1) {
+                        Node *arg = node->call.args[0];
+                        if (arg->kind == NODE_INDEX && arg->index_expr.object->kind == NODE_IDENT &&
+                            arg->index_expr.index->kind != NODE_INT_LIT) {
+                            if (c->dyn_freed_count >= c->dyn_freed_capacity) {
+                                int newcap = c->dyn_freed_capacity ? c->dyn_freed_capacity * 2 : 8;
+                                struct DynFreed *nf = (struct DynFreed *)arena_alloc(c->arena, newcap * sizeof(struct DynFreed));
+                                if (nf) {
+                                    if (c->dyn_freed) memcpy(nf, c->dyn_freed, c->dyn_freed_count * sizeof(struct DynFreed));
+                                    c->dyn_freed = nf;
+                                    c->dyn_freed_capacity = newcap;
+                                }
+                            }
+                            if (c->dyn_freed && c->dyn_freed_count < c->dyn_freed_capacity) {
+                                struct DynFreed *df = &c->dyn_freed[c->dyn_freed_count++];
+                                df->array_name = arg->index_expr.object->ident.name;
+                                df->array_name_len = (uint32_t)arg->index_expr.object->ident.name_len;
+                                df->freed_idx = arg->index_expr.index;
+                                df->all_freed = c->in_loop;
+                            }
+                        }
+                    }
                     result = ty_void;
                     typemap_set(c, field_node,result);
                     break;
@@ -2638,6 +2662,29 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'free' on const Slab");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "slab.free() takes exactly 1 argument");
+                    /* Track dynamic-index free (same as pool.free above) */
+                    if (node->call.arg_count == 1) {
+                        Node *arg = node->call.args[0];
+                        if (arg->kind == NODE_INDEX && arg->index_expr.object->kind == NODE_IDENT &&
+                            arg->index_expr.index->kind != NODE_INT_LIT) {
+                            if (c->dyn_freed_count >= c->dyn_freed_capacity) {
+                                int newcap = c->dyn_freed_capacity ? c->dyn_freed_capacity * 2 : 8;
+                                struct DynFreed *nf = (struct DynFreed *)arena_alloc(c->arena, newcap * sizeof(struct DynFreed));
+                                if (nf) {
+                                    if (c->dyn_freed) memcpy(nf, c->dyn_freed, c->dyn_freed_count * sizeof(struct DynFreed));
+                                    c->dyn_freed = nf;
+                                    c->dyn_freed_capacity = newcap;
+                                }
+                            }
+                            if (c->dyn_freed && c->dyn_freed_count < c->dyn_freed_capacity) {
+                                struct DynFreed *df = &c->dyn_freed[c->dyn_freed_count++];
+                                df->array_name = arg->index_expr.object->ident.name;
+                                df->array_name_len = (uint32_t)arg->index_expr.object->ident.name_len;
+                                df->freed_idx = arg->index_expr.index;
+                                df->all_freed = c->in_loop;
+                            }
+                        }
+                    }
                     result = ty_void;
                     typemap_set(c, field_node,result);
                     break;
@@ -3389,6 +3436,50 @@ static Type *check_expr(Checker *c, Node *node) {
                     result = ty_void;
                     break;
                 }
+                /* Dynamic-index UAF check: if handles[j] and handles was
+                 * dynamically freed, either error (all_freed) or auto-guard */
+                if (node->field.object->kind == NODE_INDEX &&
+                    node->field.object->index_expr.object->kind == NODE_IDENT) {
+                    const char *aname = node->field.object->index_expr.object->ident.name;
+                    uint32_t alen = (uint32_t)node->field.object->index_expr.object->ident.name_len;
+                    for (int dfi = 0; dfi < c->dyn_freed_count; dfi++) {
+                        struct DynFreed *df = &c->dyn_freed[dfi];
+                        if (df->array_name_len == alen &&
+                            memcmp(df->array_name, aname, alen) == 0) {
+                            if (df->all_freed) {
+                                checker_error(c, node->loc.line,
+                                    "all elements of '%.*s' were freed in loop — "
+                                    "cannot access '%.*s[...].%.*s'",
+                                    (int)alen, aname, (int)alen, aname, (int)flen, fname);
+                            } else {
+                                checker_warning(c, node->loc.line,
+                                    "auto-guard inserted for '%.*s' — element may have been freed "
+                                    "at dynamic index. Add explicit index guard for zero overhead",
+                                    (int)alen, aname);
+                                /* Store the UAF guard info for emitter.
+                                 * Reuse auto_guard array — emitter checks dyn_freed to
+                                 * distinguish bounds guard from UAF guard. */
+                                if (c->auto_guard_count >= c->auto_guard_capacity) {
+                                    int nc = c->auto_guard_capacity ? c->auto_guard_capacity * 2 : 16;
+                                    struct AutoGuard *ng = (struct AutoGuard *)arena_alloc(c->arena, nc * sizeof(struct AutoGuard));
+                                    if (ng) {
+                                        if (c->auto_guards) memcpy(ng, c->auto_guards, c->auto_guard_count * sizeof(struct AutoGuard));
+                                        c->auto_guards = ng;
+                                        c->auto_guard_capacity = nc;
+                                    }
+                                }
+                                if (c->auto_guards && c->auto_guard_count < c->auto_guard_capacity) {
+                                    /* Use array_size = UINT64_MAX as sentinel for "UAF guard" */
+                                    c->auto_guards[c->auto_guard_count].node = node;
+                                    c->auto_guards[c->auto_guard_count].array_size = UINT64_MAX;
+                                    c->auto_guard_count++;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 /* find the struct field */
                 for (uint32_t i = 0; i < elem->struct_type.field_count; i++) {
                     SField *f = &elem->struct_type.fields[i];

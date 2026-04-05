@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-06 — Dynamic Array UAF Auto-Guard
+
+### NEW FEATURE: Compile-time dynamic array Handle UAF protection
+- **What:** `pool.free(handles[k])` with variable `k`, then `handles[j].field` — compiler auto-inserts `if (j == k) { return; }` before the access. Same pattern as bounds auto-guard.
+- **Loop free detection:** `for (i = 0; i < N; i += 1) { pool.free(handles[i]); }` marks ALL elements as freed. Any post-loop `handles[j].field` → **compile error** (not auto-guard — provably all freed).
+- **Implementation:** `DynFreed` struct on Checker tracks `{array_name, freed_idx, all_freed}`. Set during pool.free/slab.free NODE_CALL handler. Checked during Handle auto-deref NODE_FIELD handler. Auto-guard sentinel `array_size == UINT64_MAX` distinguishes UAF guard from bounds guard in emitter.
+- **Tests:** `dyn_array_guard.zer` (positive), `dyn_array_loop_freed.zer` (negative)
+
+---
+
 ## Session 2026-04-06 — Scale Testing (BUG-432)
 
 ### BUG-432: Module-qualified variable access (`config.VERSION`)

@@ -271,6 +271,16 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 `!integer` now returns bool (was: "'!' requires bool"). Common C idiom for `#ifndef` → `comptime if (!FLAG())`. Checker changed from `type_equals(operand, ty_bool)` to `!type_equals(operand, ty_bool) && !type_is_integer(operand)`. Result always TYPE_BOOL. Emitter unchanged (`(!expr)` works in C for both types).
 
+### Dynamic Array Handle UAF Auto-Guard (2026-04-06)
+
+`pool.free(handles[k])` with variable `k` followed by `handles[j].field` — compiler auto-inserts `if (j == k) { return <zero>; }` before the Handle auto-deref. Same compile-time decision pattern as bounds auto-guard.
+
+**Checker:** `DynFreed` struct tracks `{array_name, freed_idx_node, all_freed}`. Set in pool.free/slab.free NODE_CALL handler when argument is `arr[variable]`. `all_freed` set when `c->in_loop` is true (loop free pattern). Checked in NODE_FIELD Handle auto-deref — when object is `arr[j]` and `arr` has DynFreed entry: `all_freed` → compile error, otherwise → auto-guard with UAF sentinel `array_size == UINT64_MAX`.
+
+**Emitter:** `emit_auto_guards(NODE_FIELD)` checks for UAF sentinel. When found, looks up `dyn_freed` to find the freed index node, emits `if ((use_idx) == (freed_idx)) { return <zero>; }`.
+
+**Coverage:** loop-free-all → compile error. Dynamic free + dynamic use → auto-guard. No dynamic free → no guard. Works for both Pool and Slab.
+
 ### Module-Qualified Variable Access (BUG-432, 2026-04-06)
 
 `config.VERSION` failed — NODE_CALL had pre-`check_expr` interception for module-qualified calls (BUG-416), but NODE_FIELD did not. `check_expr(NODE_IDENT)` errored "undefined identifier" for the module name before NODE_FIELD could intercept. Fix: added same pre-`check_expr` interception in NODE_FIELD — when object is NODE_IDENT not found in scope, try `module__field` mangled lookup. Rewrite to NODE_IDENT with raw field name. **Pattern:** Both NODE_CALL and NODE_FIELD must intercept module-qualified access BEFORE `check_expr` on the object.

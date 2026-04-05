@@ -261,6 +261,14 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Design:** `?T[N]` = "array of N optional T values." This matches the intuition: `?u32[4]` = "4 slots, each either u32 or null." The alternative (`?(T[N])` = "optionally an entire array") is expressible with parentheses if ever needed, but extremely rare.
 
+### Comptime Call in Pool/Ring Size (BUG-423, 2026-04-05)
+
+`Pool(Item, POOL_SIZE())` failed — `eval_const_expr` ran before `check_expr` resolved the comptime call. Fix: call `check_expr` before `eval_const_expr` in TYNODE_POOL and TYNODE_RING. **General rule:** any site calling `eval_const_expr` on user expressions must call `check_expr` first.
+
+### String Literal to Const Slice Field (BUG-424, 2026-04-05)
+
+`e.msg = "hello"` where `msg` is `const [*]u8` was blocked. Assignment string literal check didn't check `slice.is_const`. Fix: added const + distinct unwrap check.
+
 ### Comptime Negative Return Values (BUG-415, 2026-04-05)
 
 `comptime i32 NEG() { return -1; }` broke — in-place NODE_INT_LIT conversion stored `-1` as `uint64_t` (0xFFFFFFFFFFFFFFFF), failing `is_literal_compatible`.

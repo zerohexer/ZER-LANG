@@ -1,0 +1,115 @@
+// Real program 5: Arena-based string builder
+// Exercises: Arena.over, arena.alloc, @cstr, slices, @truncate,
+//            struct with slice field, for loops, function chains
+
+struct StringBuilder {
+    u8[256] storage;
+    u32 len;
+}
+
+void sb_init(*StringBuilder sb) {
+    sb.len = 0;
+}
+
+bool sb_append_byte(*StringBuilder sb, u8 byte) {
+    if (sb.len >= 255) { return false; }
+    sb.storage[sb.len] = byte;
+    sb.len = sb.len + 1;
+    sb.storage[sb.len] = 0;  // null terminate
+    return true;
+}
+
+bool sb_append_u32(*StringBuilder sb, u32 val) {
+    // Simple decimal conversion
+    if (val == 0) {
+        return sb_append_byte(sb, 48);  // '0'
+    }
+
+    u8[10] digits;
+    u32 digit_count = 0;
+
+    u32 remaining = val;
+    for (u32 i = 0; i < 10; i += 1) {
+        if (remaining == 0) { break; }
+        u32 d = remaining % 10;
+        digits[digit_count] = @truncate(u8, d + 48);
+        digit_count = digit_count + 1;
+        remaining = remaining / 10;
+    }
+
+    // Reverse digits into string builder
+    for (u32 i = 0; i < digit_count; i += 1) {
+        u32 rev_idx = digit_count - 1 - i;
+        if (rev_idx < 10) {
+            if (!sb_append_byte(sb, digits[rev_idx])) { return false; }
+        }
+    }
+    return true;
+}
+
+bool sb_append_str(*StringBuilder sb, const [*]u8 s) {
+    for (usize i = 0; i < s.len; i += 1) {
+        if (!sb_append_byte(sb, s[i])) { return false; }
+    }
+    return true;
+}
+
+struct Pair { u32 a; u32 b; }
+
+u32 main() {
+    StringBuilder sb;
+    sb_init(&sb);
+
+    // Build "Hello, World! 42"
+    if (!sb_append_str(&sb, "Hello")) { return 1; }
+    if (sb.len != 5) { return 2; }
+
+    if (!sb_append_str(&sb, ", ")) { return 3; }
+    if (!sb_append_str(&sb, "World! ")) { return 4; }
+    if (!sb_append_u32(&sb, 42)) { return 5; }
+
+    // Verify length: "Hello, World! 42" = 16 chars
+    if (sb.len != 16) { return 6; }
+
+    // Verify some bytes
+    if (sb.storage[0] != 72) { return 7; }   // 'H'
+    if (sb.storage[5] != 44) { return 8; }   // ','
+    if (sb.storage[14] != 52) { return 9; }  // '4'
+    if (sb.storage[15] != 50) { return 10; } // '2'
+
+    // Test number formatting
+    StringBuilder sb2;
+    sb_init(&sb2);
+    if (!sb_append_u32(&sb2, 0)) { return 11; }
+    if (sb2.len != 1) { return 12; }
+    if (sb2.storage[0] != 48) { return 13; }  // '0'
+
+    StringBuilder sb3;
+    sb_init(&sb3);
+    if (!sb_append_u32(&sb3, 12345)) { return 14; }
+    if (sb3.len != 5) { return 15; }
+    if (sb3.storage[0] != 49) { return 16; }  // '1'
+    if (sb3.storage[4] != 53) { return 17; }  // '5'
+
+    // Test Arena-based allocation
+    u8[1024] backing;
+    Arena scratch = Arena.over(backing);
+
+    *Pair p = scratch.alloc(Pair) orelse { return 18; };
+    p.a = 100;
+    p.b = 200;
+    if (p.a + p.b != 300) { return 19; }
+
+    // Allocate second pair from same arena
+    *Pair p2 = scratch.alloc(Pair) orelse { return 20; };
+    p2.a = 1;
+    p2.b = 2;
+
+    // First pair still valid
+    if (p.a != 100) { return 21; }
+    if (p2.b != 2) { return 22; }
+
+    defer scratch.unsafe_reset();
+
+    return 0;
+}

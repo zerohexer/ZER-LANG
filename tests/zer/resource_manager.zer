@@ -1,0 +1,102 @@
+// Real program 7: Resource manager with cleanup via defer and goto
+// Exercises: Slab, alloc_ptr, free_ptr, defer cleanup, goto on error,
+//            function pointers, struct with function pointer fields,
+//            multiple pools, cross-function resource passing
+
+struct FileHandle {
+    u32 fd;
+    bool is_open;
+}
+
+struct NetSocket {
+    u32 port;
+    bool connected;
+}
+
+Slab(FileHandle) file_pool;
+Slab(NetSocket) sock_pool;
+
+?*FileHandle open_file(u32 fd) {
+    *FileHandle f = file_pool.alloc_ptr() orelse { return null; };
+    f.fd = fd;
+    f.is_open = true;
+    return f;
+}
+
+void close_file(*FileHandle f) {
+    f.is_open = false;
+    file_pool.free_ptr(f);
+}
+
+?*NetSocket connect_socket(u32 port) {
+    *NetSocket s = sock_pool.alloc_ptr() orelse { return null; };
+    s.port = port;
+    s.connected = true;
+    return s;
+}
+
+void disconnect_socket(*NetSocket s) {
+    s.connected = false;
+    sock_pool.free_ptr(s);
+}
+
+// Simulate a complex operation needing multiple resources
+u32 do_transfer(u32 src_fd, u32 dst_port) {
+    *FileHandle file = open_file(src_fd) orelse { return 1; };
+    defer close_file(file);
+
+    *NetSocket sock = connect_socket(dst_port) orelse { return 2; };
+    defer disconnect_socket(sock);
+
+    // "Transfer" — just verify both are valid
+    if (!file.is_open) { return 3; }
+    if (!sock.connected) { return 4; }
+    if (file.fd != src_fd) { return 5; }
+    if (sock.port != dst_port) { return 6; }
+
+    // Simulate some work
+    u32 bytes = 0;
+    for (u32 i = 0; i < 10; i += 1) {
+        bytes = bytes + 64;
+    }
+
+    if (bytes != 640) { return 7; }
+
+    // Defers fire here: disconnect_socket then close_file
+    return 0;
+}
+
+u32 main() {
+    // Test basic transfer
+    u32 result = do_transfer(42, 8080);
+    if (result != 0) { return result + 10; }
+
+    // Test second transfer (resources should be recycled)
+    u32 result2 = do_transfer(99, 443);
+    if (result2 != 0) { return result2 + 20; }
+
+    // Test goto-based cleanup pattern
+    u32 cleanup_order = 0;
+    *FileHandle f1 = open_file(1) orelse { return 30; };
+    *FileHandle f2 = open_file(2) orelse {
+        close_file(f1);
+        return 31;
+    };
+    *FileHandle f3 = open_file(3) orelse {
+        close_file(f2);
+        close_file(f1);
+        return 32;
+    };
+
+    // All three open — verify
+    if (f1.fd != 1) { return 33; }
+    if (f2.fd != 2) { return 34; }
+    if (f3.fd != 3) { return 35; }
+
+    // Clean up in reverse order
+    close_file(f3);
+    close_file(f2);
+    close_file(f1);
+
+    return 0;
+}

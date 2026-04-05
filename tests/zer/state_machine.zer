@@ -1,0 +1,140 @@
+// Real program 3: Protocol parser state machine
+// Exercises: enum switch, struct mutation through pointer, for loop over array,
+//            byte comparison, @truncate, multiple functions, nested if-else
+
+enum ParseState { idle, header, length, payload, checksum, done, error_state }
+
+struct Parser {
+    ParseState state;
+    u8[64] buffer;
+    u32 buf_pos;
+    u32 payload_len;
+    u8 computed_checksum;
+    bool valid;
+}
+
+void parser_init(*Parser p) {
+    p.state = ParseState.idle;
+    p.buf_pos = 0;
+    p.payload_len = 0;
+    p.computed_checksum = 0;
+    p.valid = false;
+}
+
+// Feed one byte to the parser
+void parser_feed(*Parser p, u8 byte) {
+    switch (p.state) {
+        .idle => {
+            // Wait for sync byte 0xAA
+            if (byte == 0xAA) {
+                p.state = ParseState.header;
+                p.buf_pos = 0;
+                p.computed_checksum = 0;
+            }
+        }
+        .header => {
+            // Second sync byte 0x55
+            if (byte == 0x55) {
+                p.state = ParseState.length;
+            } else {
+                p.state = ParseState.idle;
+            }
+        }
+        .length => {
+            p.payload_len = byte;
+            p.computed_checksum = p.computed_checksum ^ byte;
+            if (byte == 0) {
+                p.state = ParseState.checksum;
+            } else if (byte > 60) {
+                p.state = ParseState.error_state;
+            } else {
+                p.state = ParseState.payload;
+            }
+        }
+        .payload => {
+            if (p.buf_pos < 64) {
+                p.buffer[p.buf_pos] = byte;
+            }
+            p.buf_pos = p.buf_pos + 1;
+            p.computed_checksum = p.computed_checksum ^ byte;
+            if (p.buf_pos >= p.payload_len) {
+                p.state = ParseState.checksum;
+            }
+        }
+        .checksum => {
+            if (byte == p.computed_checksum) {
+                p.valid = true;
+                p.state = ParseState.done;
+            } else {
+                p.state = ParseState.error_state;
+            }
+        }
+        .done => { }
+        .error_state => { }
+    }
+}
+
+u32 main() {
+    Parser p;
+    parser_init(&p);
+
+    // Build a valid packet: 0xAA 0x55 <len=3> <d0> <d1> <d2> <checksum>
+    u8[7] packet;
+    packet[0] = 0xAA;  // sync1
+    packet[1] = 0x55;  // sync2
+    packet[2] = 3;     // length
+    packet[3] = 0x10;  // data[0]
+    packet[4] = 0x20;  // data[1]
+    packet[5] = 0x30;  // data[2]
+    // checksum = len ^ d0 ^ d1 ^ d2 = 3 ^ 0x10 ^ 0x20 ^ 0x30 = 0x03
+    packet[6] = 0x03;
+
+    // Feed all bytes
+    for (u32 i = 0; i < 7; i += 1) {
+        parser_feed(&p, packet[i]);
+    }
+
+    // Verify parser state
+    switch (p.state) {
+        .done => { }
+        default => { return 1; }
+    }
+    if (!p.valid) { return 2; }
+    if (p.payload_len != 3) { return 3; }
+    if (p.buffer[0] != 0x10) { return 4; }
+    if (p.buffer[1] != 0x20) { return 5; }
+    if (p.buffer[2] != 0x30) { return 6; }
+
+    // Test invalid checksum
+    Parser p2;
+    parser_init(&p2);
+    packet[6] = 0xFF;  // wrong checksum
+    for (u32 i = 0; i < 7; i += 1) {
+        parser_feed(&p2, packet[i]);
+    }
+    switch (p2.state) {
+        .error_state => { }
+        default => { return 7; }
+    }
+
+    // Test partial packet (no sync2)
+    Parser p3;
+    parser_init(&p3);
+    parser_feed(&p3, 0xAA);
+    parser_feed(&p3, 0x00);  // wrong sync2
+    switch (p3.state) {
+        .idle => { }
+        default => { return 8; }
+    }
+
+    // Test zero-length payload
+    Parser p4;
+    parser_init(&p4);
+    parser_feed(&p4, 0xAA);
+    parser_feed(&p4, 0x55);
+    parser_feed(&p4, 0);     // length = 0
+    parser_feed(&p4, 0);     // checksum = 0 ^ 0 = 0
+    if (!p4.valid) { return 9; }
+
+    return 0;
+}

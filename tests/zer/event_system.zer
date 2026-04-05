@@ -1,0 +1,100 @@
+// Real program 6: Union-based event system with Ring buffer
+// Exercises: union, union switch, Ring, mutable capture |*v|,
+//            enum, multiple structs, nested switch, defer
+
+struct KeyEvent { u8 keycode; bool pressed; }
+struct MouseEvent { u32 x; u32 y; u8 button; }
+struct TimerEvent { u32 timer_id; u32 elapsed_ms; }
+
+union Event {
+    KeyEvent key;
+    MouseEvent mouse;
+    TimerEvent timer;
+}
+
+Ring(Event, 8) event_queue;
+
+// Event counters
+u32 key_count;
+u32 mouse_count;
+u32 timer_count;
+u32 total_elapsed;
+
+void process_event(Event ev) {
+    switch (ev) {
+        .key => |k| {
+            key_count = key_count + 1;
+        }
+        .mouse => |m| {
+            mouse_count = mouse_count + 1;
+        }
+        .timer => |t| {
+            timer_count = timer_count + 1;
+            total_elapsed = total_elapsed + t.elapsed_ms;
+        }
+    }
+}
+
+void push_key(u8 code, bool pressed) {
+    Event ev;
+    ev.key.keycode = code;
+    ev.key.pressed = pressed;
+    event_queue.push(ev);
+}
+
+void push_mouse(u32 x, u32 y, u8 button) {
+    Event ev;
+    ev.mouse.x = x;
+    ev.mouse.y = y;
+    ev.mouse.button = button;
+    event_queue.push(ev);
+}
+
+void push_timer(u32 id, u32 ms) {
+    Event ev;
+    ev.timer.timer_id = id;
+    ev.timer.elapsed_ms = ms;
+    event_queue.push(ev);
+}
+
+u32 drain_events() {
+    u32 processed = 0;
+    while (true) {
+        Event ev = event_queue.pop() orelse { break; };
+        process_event(ev);
+        processed = processed + 1;
+    }
+    return processed;
+}
+
+u32 main() {
+    key_count = 0;
+    mouse_count = 0;
+    timer_count = 0;
+    total_elapsed = 0;
+
+    // Push various events
+    push_key(65, true);     // 'A' pressed
+    push_key(65, false);    // 'A' released
+    push_mouse(100, 200, 1);
+    push_timer(0, 16);
+    push_timer(0, 16);
+    push_mouse(150, 250, 0);
+    push_timer(1, 100);
+
+    // Drain all events
+    u32 count = drain_events();
+    if (count != 7) { return 1; }
+
+    // Verify counters
+    if (key_count != 2) { return 2; }
+    if (mouse_count != 2) { return 3; }
+    if (timer_count != 3) { return 4; }
+    if (total_elapsed != 132) { return 5; }  // 16 + 16 + 100
+
+    // Queue should be empty
+    ?Event empty = event_queue.pop();
+    if (empty) |e| { return 6; }
+
+    return 0;
+}

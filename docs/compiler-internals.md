@@ -253,6 +253,14 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Fix pattern:** Every site that checks `->kind == TYPE_OPTIONAL` must either use `type_is_optional()` (which now unwraps) or call `type_unwrap_distinct()` explicitly. This is the same lesson as BUG-279/BUG-295 — distinct unwrap is needed EVERYWHERE types are dispatched.
 
+### ?T[N] Parser Precedence Fix (BUG-413, 2026-04-05)
+
+`?Handle(Task)[4]` was parsed as `OPTIONAL(ARRAY(HANDLE))` — optional wrapping an array. Indexing failed because you can't index an optional. User wants `ARRAY(OPTIONAL(HANDLE))` — array of optional handles.
+
+**Fix:** In the `?T` parser path, after parsing the inner type, check if it was already wrapped in `TYNODE_ARRAY` by the inner parser (e.g., `Handle(T)[N]`). If so, swap: pull array outside optional → `ARRAY(OPTIONAL(inner_elem))`. Also handle `?NamedType[N]` by checking for `[N]` suffix after optional parsing.
+
+**Design:** `?T[N]` = "array of N optional T values." This matches the intuition: `?u32[4]` = "4 slots, each either u32 or null." The alternative (`?(T[N])` = "optionally an entire array") is expressible with parentheses if ever needed, but extremely rare.
+
 ### Function Pointer Array Emission (BUG-412, 2026-04-05)
 
 `Op[3] ops` where `Op` is `typedef u32 (*Op)(u32)` emitted `uint32_t (*)(uint32_t) ops[3]` — name outside the `(*)` instead of inside `(*ops[3])`. Fix: in `emit_type_and_name` for TYPE_ARRAY, when base type (after unwrapping array chain) is TYPE_FUNC_PTR (or distinct wrapping it), use function pointer emission pattern: `ret (*name[dims])(params)`. Works with distinct typedef func ptrs too.

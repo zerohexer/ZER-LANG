@@ -387,6 +387,26 @@ static TypeNode *parse_type(Parser *p) {
     if (match(p, TOK_QUESTION)) {
         TypeNode *t = new_type_node(p, TYNODE_OPTIONAL);
         t->optional.inner = parse_type(p);
+        /* ?T[N] — array of optionals, not optional of array.
+         * ?Handle(T)[N] → ARRAY(OPTIONAL(HANDLE)), not OPTIONAL(ARRAY(HANDLE)).
+         * Check if the inner type was already wrapped in ARRAY by the inner parser
+         * (e.g., Handle(T)[N]). If so, swap: pull array outside optional. */
+        if (t->optional.inner->kind == TYNODE_ARRAY) {
+            /* Swap: OPTIONAL(ARRAY(inner)) → ARRAY(OPTIONAL(inner)) */
+            TypeNode *inner_array = t->optional.inner;
+            t->optional.inner = inner_array->array.elem;
+            inner_array->array.elem = t;
+            return inner_array;
+        }
+        /* Also handle ?T[N] where [N] is a suffix after the inner type
+         * (for named types like ?MyStruct[4]) */
+        if (match(p, TOK_LBRACKET)) {
+            TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
+            arr->array.elem = t;
+            arr->array.size_expr = parse_expression(p);
+            consume(p, TOK_RBRACKET, "expected ']' after array size");
+            return arr;
+        }
         return t;
     }
 

@@ -1,0 +1,249 @@
+// Task Scheduler — real ZER program exercising most language features
+// Priority-based task queue with callbacks, state management, and statistics
+
+comptime u32 MAX_TASKS() { return 32; }
+comptime u32 MAX_PRIO() { return 4; }
+comptime u32 TICK_LIMIT() { return 100; }
+
+// ---- Types ----
+
+enum TaskState { idle, ready, running, blocked, done }
+
+struct TaskStats {
+    u32 runs;
+    u32 ticks_used;
+    u32 last_tick;
+}
+
+struct Task {
+    u32 id;
+    u32 priority;       // 0 = highest, MAX_PRIO-1 = lowest
+    TaskState state;
+    TaskStats stats;
+}
+
+typedef u32 (*TaskFunc)(u32);
+
+struct Callback {
+    TaskFunc func;
+    u32 arg;
+}
+
+// ---- Global state ----
+
+Slab(Task) task_pool;
+Pool(Callback, MAX_TASKS()) cb_pool;
+
+u32 next_id;
+u32 current_tick;
+u32 tasks_completed;
+
+// Ready queue: array of optional handles per priority level
+?Handle(Task)[MAX_TASKS()] ready_queue;
+u32 ready_count;
+
+// ---- Task lifecycle ----
+
+?Handle(Task) task_create(u32 priority) {
+    if (priority >= MAX_PRIO()) { return null; }
+    Handle(Task) h = task_pool.alloc() orelse { return null; };
+    h.id = next_id;
+    next_id += 1;
+    h.priority = priority;
+    h.state = TaskState.idle;
+    h.stats.runs = 0;
+    h.stats.ticks_used = 0;
+    h.stats.last_tick = 0;
+    return h;
+}
+
+bool task_enqueue(Handle(Task) h) {
+    if (ready_count >= MAX_TASKS()) { return false; }
+    h.state = TaskState.ready;
+    // Find empty slot
+    for (u32 i = 0; i < MAX_TASKS(); i += 1) {
+        if (ready_queue[i] == null) {
+            ready_queue[i] = h;
+            ready_count += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Find highest-priority ready task (lowest priority number)
+?Handle(Task) task_dequeue() {
+    ?Handle(Task) best = null;
+    u32 best_prio = MAX_PRIO();
+    u32 best_idx = 0;
+
+    for (u32 i = 0; i < MAX_TASKS(); i += 1) {
+        if (ready_queue[i]) |h| {
+            if (h.priority < best_prio) {
+                best = h;
+                best_prio = h.priority;
+                best_idx = i;
+            }
+        }
+    }
+
+    if (best) |b| {
+        ready_queue[best_idx] = null;
+        ready_count -= 1;
+    }
+    return best;
+}
+
+// ---- Task execution ----
+
+u32 dummy_work(u32 iterations) {
+    u32 sum = 0;
+    for (u32 i = 0; i < iterations; i += 1) {
+        sum += i;
+    }
+    return sum;
+}
+
+void task_run(Handle(Task) h) {
+    h.state = TaskState.running;
+    h.stats.runs += 1;
+    h.stats.last_tick = current_tick;
+
+    // Simulate work based on priority (lower prio = more work)
+    u32 work = (h.priority + 1) * 10;
+    u32 result = dummy_work(work);
+
+    h.stats.ticks_used += 1;
+    h.state = TaskState.done;
+    tasks_completed += 1;
+}
+
+// ---- Scheduler ----
+
+u32 scheduler_run(u32 num_tasks) {
+    // Create tasks with varying priorities
+    for (u32 i = 0; i < num_tasks; i += 1) {
+        u32 prio = i % MAX_PRIO();
+        ?Handle(Task) maybe = task_create(prio);
+        if (maybe) |h| {
+            if (!task_enqueue(h)) {
+                task_pool.free(h);
+                return 1;
+            }
+        } else {
+            return 2;
+        }
+    }
+
+    // Run scheduler loop
+    current_tick = 0;
+    while (ready_count > 0) {
+        if (current_tick >= TICK_LIMIT()) { goto timeout; }
+
+        ?Handle(Task) next = task_dequeue();
+        if (next) |h| {
+            task_run(h);
+            task_pool.free(h);
+        }
+        current_tick += 1;
+    }
+    return 0;
+
+    timeout:
+        // Free remaining tasks
+        for (u32 i = 0; i < MAX_TASKS(); i += 1) {
+            if (ready_queue[i]) |h| {
+                task_pool.free(h);
+                ready_queue[i] = null;
+            }
+        }
+        return 3;
+}
+
+// ---- Statistics ----
+
+struct SchedulerStats {
+    u32 total_tasks;
+    u32 completed;
+    u32 ticks;
+}
+
+SchedulerStats get_stats(u32 total) {
+    SchedulerStats s;
+    s.total_tasks = total;
+    s.completed = tasks_completed;
+    s.ticks = current_tick;
+    return s;
+}
+
+// ---- Main ----
+
+u32 main() {
+    next_id = 0;
+    current_tick = 0;
+    tasks_completed = 0;
+    ready_count = 0;
+
+    // Initialize ready queue
+    for (u32 i = 0; i < MAX_TASKS(); i += 1) {
+        ready_queue[i] = null;
+    }
+
+    // Test 1: basic scheduler run
+    u32 err = scheduler_run(8);
+    if (err != 0) { return err; }
+
+    // Verify all tasks completed
+    SchedulerStats stats = get_stats(8);
+    if (stats.completed != 8) { return 10; }
+    if (stats.ticks != 8) { return 11; }
+
+    // Test 2: larger batch
+    tasks_completed = 0;
+    ready_count = 0;
+    err = scheduler_run(20);
+    if (err != 0) { return 20 + err; }
+
+    stats = get_stats(20);
+    if (stats.completed != 20) { return 30; }
+
+    // Test 3: priority ordering — create specific tasks and verify dequeue order
+    tasks_completed = 0;
+    ready_count = 0;
+    for (u32 i = 0; i < MAX_TASKS(); i += 1) {
+        ready_queue[i] = null;
+    }
+
+    // Create tasks: prio 3, 1, 2, 0
+    ?Handle(Task) t3 = task_create(3);
+    ?Handle(Task) t1 = task_create(1);
+    ?Handle(Task) t2 = task_create(2);
+    ?Handle(Task) t0 = task_create(0);
+
+    if (t3) |h| { task_enqueue(h); } else { return 40; }
+    if (t1) |h| { task_enqueue(h); } else { return 41; }
+    if (t2) |h| { task_enqueue(h); } else { return 42; }
+    if (t0) |h| { task_enqueue(h); } else { return 43; }
+
+    // Dequeue should return prio 0 first
+    ?Handle(Task) first = task_dequeue();
+    if (first) |h| {
+        if (h.priority != 0) { task_pool.free(h); return 50; }
+        task_pool.free(h);
+    } else { return 51; }
+
+    // Then prio 1
+    ?Handle(Task) second = task_dequeue();
+    if (second) |h| {
+        if (h.priority != 1) { task_pool.free(h); return 52; }
+        task_pool.free(h);
+    } else { return 53; }
+
+    // Free remaining
+    ?Handle(Task) rem1 = task_dequeue();
+    if (rem1) |h| { task_pool.free(h); }
+    ?Handle(Task) rem2 = task_dequeue();
+    if (rem2) |h| { task_pool.free(h); }
+
+    return 0;
+}

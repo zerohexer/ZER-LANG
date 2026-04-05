@@ -7,6 +7,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### BUG-413: ?T[N] parsed as OPTIONAL(ARRAY) instead of ARRAY(OPTIONAL)
+- **Symptom:** `?Handle(Task)[4] arr; arr[0] = pool.alloc();` → "cannot index type ?Handle(Task)[4]." Indexing failed because type was optional wrapping an array, not array of optionals.
+- **Root cause:** Parser `?T` handler calls `parse_type(p)` for inner. For `?Handle(T)[N]`, inner parser sees `Handle(T)` then `[N]` suffix → wraps in TYNODE_ARRAY → returns `ARRAY(HANDLE)`. Optional wraps: `OPTIONAL(ARRAY(HANDLE))`. User wants `ARRAY(OPTIONAL(HANDLE))`.
+- **Fix:** After parsing optional inner, check if inner is TYNODE_ARRAY. If so, swap: pull array outside optional → `ARRAY(OPTIONAL(inner_elem))`. Also handle `?T[N]` for named types by checking for `[N]` suffix after optional.
+- **Found by:** Writing 170-line task scheduler in ZER — `?Handle(Task)[MAX_TASKS()]` ready queue needed this syntax.
+- **Test:** `optional_array.zer` (?Handle[N], ?u32[N], indexing, if-unwrap, == null)
+
 ### zercheck: defer free scanning + if-exit MAYBE_FREED fix
 - **Defer free:** `defer pool.free(h);` no longer triggers false "never freed" warning. zercheck now scans all top-level defer bodies for free/delete/free_ptr/delete_ptr calls before leak detection. Matched handles are marked FREED.
 - **If-exit MAYBE_FREED:** `if (err) { free(h); return; } use(h);` no longer triggers false MAYBE_FREED. When the then-branch always exits (return/break/continue/goto), handles freed inside it stay ALIVE on the continuation path — we only reach post-if if the branch was NOT taken.

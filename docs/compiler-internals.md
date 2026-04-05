@@ -285,6 +285,22 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 `config.VERSION` failed — NODE_CALL had pre-`check_expr` interception for module-qualified calls (BUG-416), but NODE_FIELD did not. `check_expr(NODE_IDENT)` errored "undefined identifier" for the module name before NODE_FIELD could intercept. Fix: added same pre-`check_expr` interception in NODE_FIELD — when object is NODE_IDENT not found in scope, try `module__field` mangled lookup. Rewrite to NODE_IDENT with raw field name. **Pattern:** Both NODE_CALL and NODE_FIELD must intercept module-qualified access BEFORE `check_expr` on the object.
 
+### *opaque Compile-Time Tracking Improvements (2026-04-06)
+
+**Signature heuristic:** Bodyless `void func(*opaque)` auto-detected as free in `is_free_call` and `zc_apply_summary`. Covers cinclude C interop without annotations. Excludes functions named "free" (already handled by explicit check).
+
+**UAF-at-call-site:** After a handle is FREED, passing it as argument to any non-free function → compile error. Skips free/delete calls and functions whose FuncSummary shows they free the param.
+
+**Cross-module summaries:** `zercheck_run` now scans imported module ASTs (`zc->import_asts`) for FuncSummary building. Multi-pass (4 iterations) for wrapper chain propagation.
+
+**@ptrcast alias tracking:** `*RealData r = @ptrcast(*RealData, handle)` creates alias link via `zc_check_var_init`. Walker through NODE_INTRINSIC extracts source ident. When `free_ptr(r)` fires, FREED propagates to `handle` via `alloc_line` match.
+
+**Qualified call summary lookup:** `zc_apply_summary` handles NODE_FIELD callee (`module.func()`) by extracting field name as function name.
+
+**Known remaining gaps:**
+- `?*opaque r = wrapper_create()` — custom wrapper allocators not recognized (only `pool.alloc`/`slab.alloc` patterns registered). Needs `is_alloc_call` expansion for functions with bodies returning `?*opaque`.
+- 3-layer ZER wrapper chains: summary propagation works but alloc registration at call site doesn't track the returned `*opaque` as ALIVE.
+
 ### @ptrcast _zer_check_alive .ptr (BUG-431, 2026-04-05)
 
 With `--track-cptrs`, `_zer_check_alive((void*)ctx, ...)` tried to cast `_zer_opaque` struct to `void*`. Fix: use `ctx.ptr` instead. **Pattern:** When `track_cptrs` is active, `*opaque` is `_zer_opaque` struct — any site emitting a `(void*)` cast on an opaque variable must use `.ptr` to extract the raw pointer.

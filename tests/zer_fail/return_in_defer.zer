@@ -1,0 +1,5 @@
+// return inside defer must be rejected
+u32 main() {
+    defer { return 0; };
+    return 1;
+}

@@ -100,9 +100,9 @@ int main(void) {
     err("void f() { bool b = true; bool c = ~b; }",
         "~bool rejected");
 
-    /* logical NOT on integer */
-    err("void f() { u32 x = 5; bool b = !x; }",
-        "!u32 rejected");
+    /* logical NOT on integer — BUG-426: now allowed (common C idiom) */
+    ok("void f() { u32 x = 5; bool b = !x; }",
+        "!u32 OK");
 
     /* index non-indexable */
     err("void f() { u32 x = 5; u32 y = x[0]; }",

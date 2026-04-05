@@ -1,0 +1,6 @@
+// Implicit narrowing coercion must be rejected
+u32 main() {
+    u32 big = 1000;
+    u8 small = big;
+    return 0;
+}

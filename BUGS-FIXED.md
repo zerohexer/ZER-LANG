@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Systematic Audit (BUG-426/427/428)
+
+### BUG-426: `!` operator rejected integers (only accepted bool)
+- **Symptom:** `comptime if (!FEATURE_B())` → "'!' requires bool, got 'u32'". Common C idiom `!integer` rejected.
+- **Root cause:** `TOK_BANG` handler required `type_equals(operand, ty_bool)` — only bool accepted.
+- **Fix:** Changed to `!type_equals(operand, ty_bool) && !type_is_integer(operand)` — accept bool OR integer. Result is always bool. Updated 2 existing negative tests to positive.
+- **Test:** `bang_integer.zer`
+
+### BUG-427: `@atomic_or` rejected as unknown intrinsic
+- **Symptom:** `@atomic_or(&flags, 0x0F)` → "unknown intrinsic '@atomic_or'". All other atomics worked.
+- **Root cause:** Atomic intrinsic name length check was `nlen >= 10`, but `"atomic_or"` is 9 chars. Minimum should be 9.
+- **Fix:** Changed `>= 10` to `>= 9` in checker.c.
+- **Test:** `atomic_ops.zer`
+
+### BUG-428: `@atomic_cas` with literal expected value — GCC "lvalue required"
+- **Symptom:** `@atomic_cas(&state, 0, 1)` → GCC error "lvalue required as unary '&' operand". `__atomic_compare_exchange_n` needs `&expected` but emitter emitted `&(0)` — taking address of literal.
+- **Root cause:** Emitter emitted `&(expected_expr)` directly. Literals are rvalues, can't take their address.
+- **Fix:** Hoist expected value into `__typeof__` temp: `({ __typeof__(*ptr) _zer_cas_exp = expected; __atomic_compare_exchange_n(ptr, &_zer_cas_exp, desired, ...); })`.
+- **Test:** `atomic_ops.zer`
+
+---
+
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-425)
 
 ### BUG-425: Nested comptime function calls rejected

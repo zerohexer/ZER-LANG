@@ -1,0 +1,35 @@
+// Bit extraction and bit set operations on u32/u8/u16
+u32 main() {
+    u32 reg = 0xDEADBEEF;
+    u32 low_byte = reg[7..0];
+    if (low_byte != 0xEF) { return 1; }
+    u32 high_byte = reg[31..24];
+    if (high_byte != 0xDE) { return 2; }
+    u32 mid = reg[15..8];
+    if (mid != 0xBE) { return 3; }
+    u32 nibble = reg[19..16];
+    if (nibble != 0xA) { return 4; }
+
+    // Bit set
+    u32 r2 = 0;
+    r2[7..0] = 0xFF;
+    if (r2 != 0xFF) { return 5; }
+    r2[15..8] = 0xAB;
+    if (r2 != 0xABFF) { return 6; }
+
+    // Single bit
+    u32 flags = 0;
+    flags[0..0] = 1;
+    flags[7..7] = 1;
+    u32 bit0 = flags[0..0];
+    if (bit0 != 1) { return 7; }
+    u32 bit1 = flags[1..1];
+    if (bit1 != 0) { return 8; }
+
+    // u8 bit extract
+    u8 byte = 0xA5;
+    u32 hi_nib = @truncate(u32, byte[7..4]);
+    if (hi_nib != 0xA) { return 9; }
+
+    return 0;
+}

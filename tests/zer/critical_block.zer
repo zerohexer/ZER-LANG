@@ -1,0 +1,12 @@
+// @critical block — interrupt-disabled region (hosted = thread fence)
+u32 shared_counter;
+
+u32 main() {
+    shared_counter = 0;
+    @critical {
+        shared_counter = shared_counter + 1;
+        shared_counter = shared_counter + 1;
+    }
+    if (shared_counter != 2) { return 1; }
+    return 0;
+}

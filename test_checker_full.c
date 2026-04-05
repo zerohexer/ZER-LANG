@@ -350,7 +350,8 @@ static void test_s18_logical(void) {
     ok("void f() { bool a = true; bool b = false; bool c = a && b; }", "&& OK");
     ok("void f() { bool a = true; bool b = false; bool c = a || b; }", "|| OK");
     ok("void f() { bool a = true; bool b = !a; }", "!bool OK");
-    err("void f() { u32 a = 1; bool b = !a; }", "!u32 REJECT");
+    /* BUG-426: ! now accepts integers (not just bool) — common C idiom for comptime if */
+    ok("void f() { u32 a = 1; bool b = !a; }", "!u32 OK");
     err("void f() { u32 a = 1; bool b = a && true; }", "u32 && bool REJECT");
 }
 

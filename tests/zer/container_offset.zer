@@ -1,0 +1,25 @@
+// @container and @offset intrinsics
+struct ListNode { u32 val; u32 dummy; }
+struct Device {
+    u32 id;
+    ListNode node;
+}
+
+u32 main() {
+    // @offset
+    usize off_id = @offset(Device, id);
+    if (off_id != 0) { return 1; }
+    usize off_node = @offset(Device, node);
+    if (off_node != 4) { return 2; }
+
+    // @container
+    Device dev;
+    dev.id = 99;
+    dev.node.val = 42;
+    *ListNode nptr = &dev.node;
+    *Device dptr = @container(*Device, nptr, node);
+    if (dptr.id != 99) { return 3; }
+    if (dptr.node.val != 42) { return 4; }
+
+    return 0;
+}

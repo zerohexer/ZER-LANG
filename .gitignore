@@ -2,6 +2,25 @@
 *.o
 *.exe
 release/
+zerc
+zerc_debug
+NUL
+
+# Test binaries (compiled by make check)
+test_lexer
+test_parser
+test_parser_edge
+test_checker
+test_checker_full
+test_extra
+test_gaps
+test_emit
+test_zercheck
+test_fuzz
+test_firmware
+test_firmware2
+test_firmware3
+test_production
 
 # Editor/IDE
 .idea/

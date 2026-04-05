@@ -1,0 +1,177 @@
+// Real program 9: Mini Entity Component System
+// Exercises: Pool, Handle arrays, auto-deref, enum flags via bit ops,
+//            for loops, struct arrays, optional Handle, function pointers,
+//            multiple pools, cross-pool references, comptime
+
+comptime u32 MAX_ENTITIES() { return 32; }
+
+struct Position { i32 x; i32 y; }
+struct Velocity { i32 dx; i32 dy; }
+struct Health { u32 current; u32 max; }
+
+Pool(Position, 32) pos_pool;
+Pool(Velocity, 32) vel_pool;
+Pool(Health, 32) hp_pool;
+
+struct Entity {
+    u32 id;
+    ?Handle(Position) pos;
+    ?Handle(Velocity) vel;
+    ?Handle(Health) hp;
+    bool alive;
+}
+
+Entity[MAX_ENTITIES()] entities;
+u32 entity_count;
+
+// Create entity with position
+u32 spawn(i32 x, i32 y) {
+    if (entity_count >= MAX_ENTITIES()) { return 0xFFFFFFFF; }
+    u32 idx = entity_count;
+    entity_count = entity_count + 1;
+
+    entities[idx].id = idx;
+    entities[idx].alive = true;
+    entities[idx].vel = null;
+    entities[idx].hp = null;
+
+    Handle(Position) ph = pos_pool.alloc() orelse { return 0xFFFFFFFF; };
+    ph.x = x;
+    ph.y = y;
+    entities[idx].pos = ph;
+
+    return idx;
+}
+
+// Add velocity component to entity
+bool add_velocity(u32 idx, i32 dx, i32 dy) {
+    if (idx >= entity_count) { return false; }
+    Handle(Velocity) vh = vel_pool.alloc() orelse { return false; };
+    vh.dx = dx;
+    vh.dy = dy;
+    entities[idx].vel = vh;
+    return true;
+}
+
+// Add health component to entity
+bool add_health(u32 idx, u32 max_hp) {
+    if (idx >= entity_count) { return false; }
+    Handle(Health) hh = hp_pool.alloc() orelse { return false; };
+    hh.current = max_hp;
+    hh.max = max_hp;
+    entities[idx].hp = hh;
+    return true;
+}
+
+// Movement system: update position from velocity
+void system_movement() {
+    for (u32 i = 0; i < entity_count; i += 1) {
+        if (!entities[i].alive) { continue; }
+        if (entities[i].pos) |ph| {
+            if (entities[i].vel) |vh| {
+                i32 new_x = ph.x + vh.dx;
+                i32 new_y = ph.y + vh.dy;
+                ph.x = new_x;
+                ph.y = new_y;
+            }
+        }
+    }
+}
+
+// Damage system: reduce health
+void damage_entity(u32 idx, u32 amount) {
+    if (idx >= entity_count) { return; }
+    if (entities[idx].hp) |hh| {
+        if (hh.current <= amount) {
+            hh.current = 0;
+            entities[idx].alive = false;
+        } else {
+            hh.current = hh.current - amount;
+        }
+    }
+}
+
+u32 main() {
+    entity_count = 0;
+
+    // Spawn entities
+    u32 player = spawn(0, 0);
+    if (player == 0xFFFFFFFF) { return 1; }
+
+    u32 enemy1 = spawn(10, 10);
+    if (enemy1 == 0xFFFFFFFF) { return 2; }
+
+    u32 enemy2 = spawn(20, 5);
+    if (enemy2 == 0xFFFFFFFF) { return 3; }
+
+    // Add components
+    if (!add_velocity(player, 1, 2)) { return 4; }
+    if (!add_velocity(enemy1, -1, 0)) { return 5; }
+    if (!add_health(player, 100)) { return 6; }
+    if (!add_health(enemy1, 50)) { return 7; }
+    if (!add_health(enemy2, 30)) { return 8; }
+
+    // Run movement for 3 ticks
+    system_movement();
+    system_movement();
+    system_movement();
+
+    // Verify player position: (0,0) + 3*(1,2) = (3,6)
+    if (entities[player].pos) |ph| {
+        if (ph.x != 3) { return 9; }
+        if (ph.y != 6) { return 10; }
+    } else {
+        return 11;
+    }
+
+    // Verify enemy1 position: (10,10) + 3*(-1,0) = (7,10)
+    if (entities[enemy1].pos) |ph| {
+        if (ph.x != 7) { return 12; }
+        if (ph.y != 10) { return 13; }
+    } else {
+        return 14;
+    }
+
+    // enemy2 has no velocity, position unchanged
+    if (entities[enemy2].pos) |ph| {
+        if (ph.x != 20) { return 15; }
+        if (ph.y != 5) { return 16; }
+    } else {
+        return 17;
+    }
+
+    // Damage entities
+    damage_entity(enemy1, 30);
+    if (entities[enemy1].hp) |hh| {
+        if (hh.current != 20) { return 18; }
+    } else {
+        return 19;
+    }
+
+    // Kill enemy2 with overkill damage
+    damage_entity(enemy2, 999);
+    if (entities[enemy2].alive) { return 20; }
+
+    // Player health unchanged
+    if (entities[player].hp) |hh| {
+        if (hh.current != 100) { return 21; }
+    } else {
+        return 22;
+    }
+
+    // Count alive entities
+    u32 alive = 0;
+    for (u32 i = 0; i < entity_count; i += 1) {
+        if (entities[i].alive) { alive = alive + 1; }
+    }
+    if (alive != 2) { return 23; }  // player + enemy1
+
+    // Cleanup
+    for (u32 i = 0; i < entity_count; i += 1) {
+        if (entities[i].pos) |ph| { pos_pool.free(ph); }
+        if (entities[i].vel) |vh| { vel_pool.free(vh); }
+        if (entities[i].hp) |hh| { hp_pool.free(hh); }
+    }
+
+    return 0;
+}

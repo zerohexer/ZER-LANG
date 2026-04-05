@@ -1,0 +1,97 @@
+// Real program 10: Callback dispatch with optional returns
+// Exercises: function pointer typedef with ?return, orelse chains,
+//            struct with funcptr fields, enum dispatch, for loop
+
+typedef ?u32 (*Validator)(u32 input);
+typedef void (*Action)(u32 input);
+
+// Validators — return null on invalid input
+?u32 validate_range(u32 x) {
+    if (x > 100) { return null; }
+    return x;
+}
+
+?u32 validate_even(u32 x) {
+    if (x % 2 != 0) { return null; }
+    return x;
+}
+
+?u32 validate_nonzero(u32 x) {
+    if (x == 0) { return null; }
+    return x;
+}
+
+// Run a chain of validators — all must pass
+?u32 validate_all(u32 input, Validator[4] validators, u32 count) {
+    u32 val = input;
+    for (u32 i = 0; i < count; i += 1) {
+        if (i >= 4) { break; }
+        val = validators[i](val) orelse { return null; };
+    }
+    return val;
+}
+
+// Action counters
+u32 action_sum;
+
+void action_accumulate(u32 x) {
+    action_sum = action_sum + x;
+}
+
+// Dispatch table
+struct Command {
+    u32 id;
+    Validator check;
+    Action run;
+}
+
+u32 main() {
+    action_sum = 0;
+
+    // Build validator chain
+    Validator[4] chain;
+    chain[0] = validate_nonzero;
+    chain[1] = validate_range;
+    chain[2] = validate_even;
+    chain[3] = validate_nonzero;  // dummy, won't be used
+
+    // Valid input: 42 (nonzero, <=100, even)
+    u32 v1 = validate_all(42, chain, 3) orelse { return 1; };
+    if (v1 != 42) { return 2; }
+
+    // Invalid: 0 (fails nonzero)
+    ?u32 v2 = validate_all(0, chain, 3);
+    if (v2) |v| { return 3; }
+
+    // Invalid: 200 (passes nonzero, fails range)
+    ?u32 v3 = validate_all(200, chain, 3);
+    if (v3) |v| { return 4; }
+
+    // Invalid: 7 (passes nonzero, passes range, fails even)
+    ?u32 v4 = validate_all(7, chain, 3);
+    if (v4) |v| { return 5; }
+
+    // Build command table
+    Command[3] commands;
+    commands[0].id = 1;
+    commands[0].check = validate_range;
+    commands[0].run = action_accumulate;
+    commands[1].id = 2;
+    commands[1].check = validate_even;
+    commands[1].run = action_accumulate;
+    commands[2].id = 3;
+    commands[2].check = validate_nonzero;
+    commands[2].run = action_accumulate;
+
+    // Execute commands with valid inputs
+    for (u32 i = 0; i < 3; i += 1) {
+        u32 input = (i + 1) * 10;  // 10, 20, 30
+        u32 validated = commands[i].check(input) orelse { continue; };
+        commands[i].run(validated);
+    }
+
+    // action_sum should be 10 + 20 + 30 = 60
+    if (action_sum != 60) { return 6; }
+
+    return 0;
+}

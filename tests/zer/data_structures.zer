@@ -1,0 +1,103 @@
+// Real program 2: Stack + Queue using Pool
+// Exercises: Pool, Handle auto-deref, ?Handle fields, while loops,
+//            if-unwrap, orelse, multiple structs, cross-struct references
+
+// ---- Stack (LIFO) via linked handles ----
+
+struct StackNode {
+    u32 value;
+    ?Handle(StackNode) next;
+}
+
+Pool(StackNode, 16) stack_pool;
+
+struct Stack {
+    ?Handle(StackNode) top;
+    u32 size;
+}
+
+void stack_push(*Stack s, u32 val) {
+    Handle(StackNode) node = stack_pool.alloc() orelse { return; };
+    node.value = val;
+    node.next = s.top;
+    s.top = node;
+    s.size = s.size + 1;
+}
+
+?u32 stack_pop(*Stack s) {
+    if (s.top) |top_h| {
+        u32 val = top_h.value;
+        ?Handle(StackNode) next = top_h.next;
+        stack_pool.free(top_h);
+        s.top = next;
+        s.size = s.size - 1;
+        return val;
+    }
+    return null;
+}
+
+// ---- Ring-based Queue (FIFO) ----
+
+Ring(u32, 8) ring_queue;
+
+// ---- Test both ----
+
+u32 main() {
+    // === Stack tests ===
+    Stack s;
+    s.top = null;
+    s.size = 0;
+
+    stack_push(&s, 10);
+    stack_push(&s, 20);
+    stack_push(&s, 30);
+
+    if (s.size != 3) { return 1; }
+
+    // Pop should return 30, 20, 10 (LIFO)
+    u32 v1 = stack_pop(&s) orelse { return 2; };
+    if (v1 != 30) { return 3; }
+
+    u32 v2 = stack_pop(&s) orelse { return 4; };
+    if (v2 != 20) { return 5; }
+
+    u32 v3 = stack_pop(&s) orelse { return 6; };
+    if (v3 != 10) { return 7; }
+
+    if (s.size != 0) { return 8; }
+
+    // Pop on empty stack returns null
+    ?u32 empty = stack_pop(&s);
+    if (empty) |v| { return 9; }
+
+    // === Ring queue tests ===
+    ring_queue.push(100);
+    ring_queue.push(200);
+    ring_queue.push(300);
+
+    // Pop should return 100, 200, 300 (FIFO)
+    u32 q1 = ring_queue.pop() orelse { return 10; };
+    if (q1 != 100) { return 11; }
+
+    u32 q2 = ring_queue.pop() orelse { return 12; };
+    if (q2 != 200) { return 13; }
+
+    // Push more while partially drained
+    ring_queue.push(400);
+    ring_queue.push(500);
+
+    u32 q3 = ring_queue.pop() orelse { return 14; };
+    if (q3 != 300) { return 15; }
+
+    u32 q4 = ring_queue.pop() orelse { return 16; };
+    if (q4 != 400) { return 17; }
+
+    u32 q5 = ring_queue.pop() orelse { return 18; };
+    if (q5 != 500) { return 19; }
+
+    // Empty
+    ?u32 qempty = ring_queue.pop();
+    if (qempty) |v| { return 20; }
+
+    return 0;
+}

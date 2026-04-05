@@ -193,8 +193,13 @@ struct Ops { u32 (*compute)(u32); }      // struct field
 u32 apply(u32 (*op)(u32, u32), x, y);   // parameter
 ?void (*on_event)(u32) = null;           // optional — null sentinel
 typedef u32 (*BinOp)(u32, u32);          // function pointer typedef
+typedef ?u32 (*OptHandler)(u32);         // typedef with optional return
 BinOp[4] ops;                            // array of function pointers (via typedef)
 ```
+**`?` on funcptr — context-dependent (BUG-420):**
+- At var/param/field/global: `?RetType (*name)(params)` → **nullable funcptr** (? wraps the pointer)
+- At typedef: `typedef ?RetType (*Name)(params)` → **funcptr returning optional** (? is part of return type)
+- For nullable typedef'd funcptr: `?TypedefName var = null;`
 
 ### Defer
 ```
@@ -303,6 +308,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | ZER-CHECK (MAYBE_FREED, leaks, loops) | Done | N/A (analysis pass) |
 | ?FuncPtr (optional function pointers) | Done | Done (null sentinel) |
 | Function pointer typedef | Done | Done |
+| Funcptr typedef ?RetType (*Name)() | Done | Done (BUG-420: ? binds to return type in typedef) |
 | Distinct typedef (including func ptrs) | Done | Done |
 | cinclude (C header inclusion) | Done | Done |
 | Enum explicit values (incl. negative) | Done | Done |
@@ -661,6 +667,8 @@ After implementing any feature, test these interactions:
 10. Feature + struct field access (nested struct containing Handle/pointer)
 11. Feature in interrupt handler (`c->in_interrupt` — ISR ban needed?)
 12. Feature + zercheck (does zercheck RECOGNIZE new alloc/free patterns?)
+13. Feature + `else if` chains — source mapping `#line` must not follow `else` on same line (BUG-418)
+14. Any new coercion must work in ALL 4 value-flow sites: var-decl init, assignment, call args, return (BUG-419)
 
 ### Write Real Code After Implementing Features — MANDATORY
 
@@ -677,8 +685,11 @@ This session's proof: writing a 60-line HTTP server found the orelse block null-
 - Auto-slab `{sizeof(T), 0, 0}` positional init putting sizeof in wrong field — tests used explicit Slab
 - zercheck not recognizing `Task.delete()` as free — tests used `heap.free()` directly
 - const Handle blocking if-unwrap capture writes — tests didn't combine if-unwrap + Handle + assign
+- `else if` chain emitting `else #line N` (stray # in GCC) — tests had source=NULL, skipping #line
+- `slice = array` assignment missing coercion — tests only used var-decl init, not assignment
+- `typedef ?u32 (*Handler)(u32)` creating optional funcptr — tests used void return funcptrs
 
-The audit round found 6 bugs, real code found 5 more. Both are needed.
+The audit round found 6 bugs, real code found 5 more, real-code session 2 found 3 more. Both are needed.
 
 ### Windows VSIX Workflow
 - `make docker-install` — builds + installs to mingw PATH

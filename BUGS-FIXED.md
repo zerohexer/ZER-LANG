@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Const in Comptime Args (BUG-430)
+
+### BUG-430: Const variable as comptime function argument rejected
+- **Symptom:** `const u32 perms = FLAG_READ() | FLAG_WRITE(); comptime if (HAS_FLAG(perms, FLAG_READ()))` → "requires all arguments to be compile-time constants." Comptime calls with const ident args failed.
+- **Root cause:** `eval_const_expr` (ast.h) doesn't resolve `NODE_IDENT` — it has no scope access. Comptime call arg evaluation used `eval_const_expr` directly.
+- **Fix:** Added `eval_const_expr_scoped(Checker *c, Node *n)` — tries `eval_const_expr` first, falls back to const symbol lookup via scope chain. Reads `sym->func_node->var_decl.init` and recursively evaluates. Depth-limited to 32 (prevents circular const refs). Also set `sym->func_node = node` for local var-decls (was only set for globals and functions).
+- **Test:** `comptime_const_arg.zer`
+
+---
+
 ## Session 2026-04-05 — Systematic Audit Round 2 (BUG-429)
 
 ### BUG-429: Array variant in union emitted wrong C syntax

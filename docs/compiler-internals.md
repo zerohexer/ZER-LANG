@@ -271,6 +271,12 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 `!integer` now returns bool (was: "'!' requires bool"). Common C idiom for `#ifndef` → `comptime if (!FLAG())`. Checker changed from `type_equals(operand, ty_bool)` to `!type_equals(operand, ty_bool) && !type_is_integer(operand)`. Result always TYPE_BOOL. Emitter unchanged (`(!expr)` works in C for both types).
 
+### Const Ident in Comptime Call Args (BUG-430, 2026-04-05)
+
+`const u32 perms = FLAG_READ() | FLAG_WRITE(); HAS_FLAG(perms, ...)` failed — `eval_const_expr` can't resolve `NODE_IDENT` (no scope access). Fix: `eval_const_expr_scoped(Checker *c, Node *n)` wrapper that tries `eval_const_expr` first, falls back to const symbol lookup. Reads init value from `sym->func_node->var_decl.init` and recursively evaluates. Depth-limited to 32. Also: `sym->func_node = node` now set for local var-decls (was only globals/functions).
+
+**Pattern:** Any site that evaluates user expressions at compile time and needs to resolve const variables should use `eval_const_expr_scoped` instead of `eval_const_expr`. Currently only used for comptime call arg evaluation.
+
 ### Union Array Variant Emission (BUG-429, 2026-04-05)
 
 `union Data { u32[4] quad; }` emitted `uint32_t[4] quad;` — invalid C. Union variant emission used `emit_type()` + manual name, which doesn't place array dimensions after the name. Fix: use `emit_type_and_name()` (same as struct fields). **Pattern:** Any site emitting a type+name pair must use `emit_type_and_name()`, never `emit_type()` + manual name — arrays and function pointers require special name placement.

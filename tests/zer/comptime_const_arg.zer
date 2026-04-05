@@ -1,0 +1,37 @@
+// BUG-430: const ident as comptime function argument
+// const u32 perms = FLAG_READ() | FLAG_WRITE();
+// comptime if (HAS_FLAG(perms, FLAG_READ())) { ... }
+
+comptime u32 BIT(u32 n) { return 1 << n; }
+comptime u32 FLAG_READ() { return BIT(0); }
+comptime u32 FLAG_WRITE() { return BIT(1); }
+comptime u32 FLAG_EXEC() { return BIT(2); }
+
+comptime bool HAS_FLAG(u32 flags, u32 flag) {
+    if ((flags & flag) != 0) { return true; }
+    return false;
+}
+
+u32 main() {
+    const u32 perms = FLAG_READ() | FLAG_WRITE();
+
+    // perms resolved to const 3 at the var-decl,
+    // HAS_FLAG(perms, FLAG_READ()) should resolve perms → 3
+    comptime if (HAS_FLAG(perms, FLAG_READ())) {
+        u32 ok = 1;
+        if (ok != 1) { return 1; }
+    }
+    comptime if (HAS_FLAG(perms, FLAG_EXEC())) {
+        return 2;
+    }
+
+    // Also works with global const
+    const u32 rw = FLAG_READ() | FLAG_WRITE();
+    u32 check = 0;
+    comptime if (HAS_FLAG(rw, FLAG_WRITE())) {
+        check = 1;
+    }
+    if (check != 1) { return 3; }
+
+    return 0;
+}

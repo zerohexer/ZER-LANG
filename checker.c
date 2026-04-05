@@ -1196,6 +1196,72 @@ static int64_t eval_comptime_stmt(Node *n, ComptimeParam *params, int param_coun
     return CONST_EVAL_FAIL;
 }
 
+/* Evaluate constant expression with scope access for const symbol lookup.
+ * Tries eval_const_expr first, falls back to resolving const identifiers
+ * and already-resolved comptime calls. Enables patterns like:
+ *   const u32 perms = FLAG_READ() | FLAG_WRITE();
+ *   comptime if (HAS_FLAG(perms, FLAG_READ())) { ... }
+ * BUG-430: eval_const_expr in ast.h has no scope access. */
+/* Wrapper: try eval_const_expr, then resolve const idents via scope.
+ * Depth-limited to prevent circular const references. */
+static int64_t eval_const_expr_scoped(Checker *c, Node *n) {
+    static int depth = 0;
+    if (!n || depth > 32) return CONST_EVAL_FAIL;
+    /* fast path: eval_const_expr handles literals + resolved comptime calls */
+    int64_t v = eval_const_expr(n);
+    if (v != CONST_EVAL_FAIL) return v;
+    depth++;
+    int64_t result = CONST_EVAL_FAIL;
+    if (n->kind == NODE_IDENT) {
+        /* const ident: look up symbol, read init value */
+        Symbol *sym = scope_lookup(c->current_scope, n->ident.name,
+                                   (uint32_t)n->ident.name_len);
+        if (!sym) sym = scope_lookup(c->global_scope, n->ident.name,
+                                     (uint32_t)n->ident.name_len);
+        if (sym && sym->is_const && sym->func_node) {
+            Node *init = (sym->func_node->kind == NODE_VAR_DECL ||
+                          sym->func_node->kind == NODE_GLOBAL_VAR)
+                         ? sym->func_node->var_decl.init : NULL;
+            if (init) result = eval_const_expr_scoped(c, init);
+        }
+    } else if (n->kind == NODE_BINARY) {
+        int64_t l = eval_const_expr_scoped(c, n->binary.left);
+        int64_t r = eval_const_expr_scoped(c, n->binary.right);
+        if (l != CONST_EVAL_FAIL && r != CONST_EVAL_FAIL)
+            result = eval_const_expr_d(n, 0) != CONST_EVAL_FAIL
+                     ? eval_const_expr_d(n, 0)
+                     : CONST_EVAL_FAIL;
+        /* If children resolved but parent didn't (because children were idents),
+         * compute manually */
+        if (result == CONST_EVAL_FAIL && l != CONST_EVAL_FAIL && r != CONST_EVAL_FAIL) {
+            switch (n->binary.op) {
+            case TOK_PLUS: result = l + r; break; case TOK_MINUS: result = l - r; break;
+            case TOK_STAR: result = l * r; break;
+            case TOK_SLASH: result = r != 0 ? l / r : CONST_EVAL_FAIL; break;
+            case TOK_PERCENT: result = r != 0 ? l % r : CONST_EVAL_FAIL; break;
+            case TOK_LSHIFT: result = (r >= 0 && r < 63) ? (int64_t)((uint64_t)l << r) : CONST_EVAL_FAIL; break;
+            case TOK_RSHIFT: result = (r >= 0 && r < 63) ? l >> r : CONST_EVAL_FAIL; break;
+            case TOK_AMP: result = l & r; break; case TOK_PIPE: result = l | r; break;
+            case TOK_CARET: result = l ^ r; break;
+            case TOK_GT: result = l > r; break; case TOK_LT: result = l < r; break;
+            case TOK_GTEQ: result = l >= r; break; case TOK_LTEQ: result = l <= r; break;
+            case TOK_EQEQ: result = l == r; break; case TOK_BANGEQ: result = l != r; break;
+            case TOK_AMPAMP: result = l && r; break; case TOK_PIPEPIPE: result = l || r; break;
+            default: break;
+            }
+        }
+    } else if (n->kind == NODE_UNARY) {
+        int64_t op = eval_const_expr_scoped(c, n->unary.operand);
+        if (op != CONST_EVAL_FAIL) {
+            if (n->unary.op == TOK_MINUS) result = -op;
+            else if (n->unary.op == TOK_TILDE) result = ~op;
+            else if (n->unary.op == TOK_BANG) result = op ? 0 : 1;
+        }
+    }
+    depth--;
+    return result;
+}
+
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
@@ -3146,7 +3212,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         (ComptimeParam *)arena_alloc(c->arena, pc * sizeof(ComptimeParam));
                     bool all_const = cparams != NULL;
                     for (int ci = 0; ci < node->call.arg_count && ci < pc && all_const; ci++) {
-                        int64_t v = eval_const_expr(node->call.args[ci]);
+                        /* BUG-430: use scoped eval to resolve const idents */
+                        int64_t v = eval_const_expr_scoped(c, node->call.args[ci]);
                         if (v == CONST_EVAL_FAIL) { all_const = false; break; }
                         cparams[ci].name = fn->func_decl.params[ci].name;
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
@@ -4689,6 +4756,9 @@ static void check_stmt(Checker *c, Node *node) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
+            /* BUG-430: store AST node for const init lookup (enables
+             * const u32 perms = ...; comptime if (FUNC(perms)) pattern) */
+            sym->func_node = node;
 
             /* detect arena-derived pointers: x = arena.alloc(T) orelse ... */
             if (node->var_decl.init) {

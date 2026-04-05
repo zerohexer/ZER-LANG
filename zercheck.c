@@ -534,10 +534,26 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
     }
 
     /* Handle aliasing: Handle(T) alias = existing_handle;
-     * BUG-357: also match NODE_INDEX and NODE_FIELD on init side. */
+     * BUG-357: also match NODE_INDEX and NODE_FIELD on init side.
+     * Also: @ptrcast alias — *RealData r = @ptrcast(*RealData, handle)
+     * makes r an alias of handle. Freeing r = freeing handle. */
     {
+        Node *alias_src = init;
+        /* Walk through @ptrcast/@bitcast to find the actual source */
+        while (alias_src && alias_src->kind == NODE_INTRINSIC &&
+               alias_src->intrinsic.arg_count > 0) {
+            /* @ptrcast(*T, expr) — source is the last arg */
+            alias_src = alias_src->intrinsic.args[alias_src->intrinsic.arg_count - 1];
+        }
+        /* Also walk through orelse */
+        if (alias_src && alias_src->kind == NODE_ORELSE)
+            alias_src = alias_src->orelse.expr;
+        if (alias_src && alias_src->kind == NODE_INTRINSIC &&
+            alias_src->intrinsic.arg_count > 0)
+            alias_src = alias_src->intrinsic.args[alias_src->intrinsic.arg_count - 1];
+
         char src_key[128];
-        int sklen = handle_key_from_expr(init, src_key, sizeof(src_key));
+        int sklen = handle_key_from_expr(alias_src, src_key, sizeof(src_key));
         if (sklen > 0) {
             HandleInfo *src = find_handle(ps, src_key, (uint32_t)sklen);
             if (src) {

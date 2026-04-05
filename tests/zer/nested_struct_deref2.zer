@@ -1,0 +1,33 @@
+// Deeply nested struct field access + function call
+struct Vec2 { u32 x; u32 y; }
+struct Transform { Vec2 pos; Vec2 scale; }
+struct Entity { Transform xform; u32 id; }
+
+u32 dist_sq(Vec2 a, Vec2 b) {
+    u32 dx = 0;
+    u32 dy = 0;
+    if (a.x > b.x) { dx = a.x - b.x; } else { dx = b.x - a.x; }
+    if (a.y > b.y) { dy = a.y - b.y; } else { dy = b.y - a.y; }
+    return dx * dx + dy * dy;
+}
+
+u32 main() {
+    Entity player;
+    player.xform.pos.x = 10;
+    player.xform.pos.y = 20;
+    player.xform.scale.x = 1;
+    player.xform.scale.y = 1;
+    player.id = 1;
+
+    Entity target;
+    target.xform.pos.x = 13;
+    target.xform.pos.y = 24;
+    target.xform.scale.x = 2;
+    target.xform.scale.y = 2;
+    target.id = 2;
+
+    u32 d = dist_sq(player.xform.pos, target.xform.pos);
+    // dx=3, dy=4, 9+16=25
+    if (d != 25) { return 1; }
+    return 0;
+}

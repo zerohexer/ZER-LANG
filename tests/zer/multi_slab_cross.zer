@@ -1,0 +1,26 @@
+// Multiple slabs + cross-slab operations
+struct Enemy { u32 hp; u32 dmg; }
+struct Bullet { u32 x; u32 y; u32 power; }
+Slab(Enemy) enemies;
+Slab(Bullet) bullets;
+
+u32 main() {
+    ?Handle(Enemy) me = enemies.alloc();
+    Handle(Enemy) e = me orelse return;
+    e.hp = 100;
+    e.dmg = 5;
+
+    ?Handle(Bullet) mb = bullets.alloc();
+    Handle(Bullet) b = mb orelse return;
+    b.x = 0;
+    b.y = 0;
+    b.power = 25;
+
+    u32 new_hp = e.hp - b.power;
+    e.hp = new_hp;
+    if (e.hp != 75) { return 1; }
+
+    bullets.free(b);
+    enemies.free(e);
+    return 0;
+}

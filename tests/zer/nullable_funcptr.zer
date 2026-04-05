@@ -1,0 +1,24 @@
+// Optional nullable function pointer + if-unwrap call
+typedef void (*Callback)(u32);
+u32 call_count;
+
+void on_event(u32 id) {
+    call_count = call_count + id;
+}
+
+u32 main() {
+    call_count = 0;
+    ?Callback cb = null;
+
+    if (cb) |f| { f(10); }
+    if (call_count != 0) { return 1; }
+
+    cb = on_event;
+    if (cb) |f| { f(5); }
+    if (call_count != 5) { return 2; }
+
+    if (cb) |f| { f(3); }
+    if (call_count != 8) { return 3; }
+
+    return 0;
+}

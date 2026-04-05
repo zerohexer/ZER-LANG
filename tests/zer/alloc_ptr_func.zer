@@ -1,0 +1,30 @@
+// alloc_ptr through function boundary + update
+struct Particle { u32 x; u32 y; u32 vx; u32 vy; }
+Slab(Particle) particles;
+
+?*Particle spawn(u32 x, u32 y) {
+    ?*Particle mp = particles.alloc_ptr();
+    *Particle p = mp orelse { return null; };
+    p.x = x;
+    p.y = y;
+    p.vx = 1;
+    p.vy = 2;
+    return p;
+}
+
+void update(*Particle p) {
+    p.x = p.x + p.vx;
+    p.y = p.y + p.vy;
+}
+
+u32 main() {
+    ?*Particle mp = spawn(10, 20);
+    *Particle p = mp orelse { return 1; };
+    update(p);
+    if (p.x != 11) { return 2; }
+    if (p.y != 22) { return 3; }
+    update(p);
+    if (p.x != 12) { return 4; }
+    particles.free_ptr(p);
+    return 0;
+}

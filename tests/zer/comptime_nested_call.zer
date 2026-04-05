@@ -1,0 +1,35 @@
+// Comptime functions calling other comptime functions
+// BUG-425: nested comptime calls inside comptime body rejected
+// because checker evaluated params as non-constant NODE_IDENT
+
+comptime u32 DOUBLE(u32 x) { return x * 2; }
+comptime u32 QUAD(u32 x) { return DOUBLE(DOUBLE(x)); }
+comptime u32 ADD_QUAD(u32 a, u32 b) { return QUAD(a) + QUAD(b); }
+
+comptime u32 MAX(u32 a, u32 b) {
+    if (a > b) { return a; }
+    return b;
+}
+comptime u32 MAX3(u32 a, u32 b, u32 c) {
+    return MAX(MAX(a, b), c);
+}
+
+u32 main() {
+    if (DOUBLE(3) != 6) { return 1; }
+    if (QUAD(3) != 12) { return 2; }
+    if (ADD_QUAD(2, 3) != 20) { return 3; }
+
+    const u32 SIZE = QUAD(4);
+    if (SIZE != 16) { return 4; }
+
+    if (MAX3(5, 15, 10) != 15) { return 5; }
+    if (MAX3(20, 10, 5) != 20) { return 6; }
+
+    u32[QUAD(2)] arr;
+    for (u32 i = 0; i < 8; i += 1) {
+        arr[i] = i;
+    }
+    if (arr[7] != 7) { return 7; }
+
+    return 0;
+}

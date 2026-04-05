@@ -131,6 +131,7 @@ typedef struct {
     /* Interrupt safety: track globals accessed from ISR and regular code */
     bool in_interrupt;  /* true when checking NODE_INTERRUPT body */
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */
+    bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
     struct IsrGlobal {
         const char *name;
         uint32_t name_len;

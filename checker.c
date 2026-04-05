@@ -3150,9 +3150,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         cparams[ci].value = v;
                     }
                     if (!all_const) {
-                        checker_error(c, node->loc.line,
-                            "comptime function '%.*s' requires all arguments to be compile-time constants",
-                            (int)callee_sym->name_len, callee_sym->name);
+                        /* BUG-425: inside comptime function body, args may be
+                         * params not yet substituted — skip error here, the real
+                         * evaluation happens at the call site with concrete values */
+                        if (!c->in_comptime_body) {
+                            checker_error(c, node->loc.line,
+                                "comptime function '%.*s' requires all arguments to be compile-time constants",
+                                (int)callee_sym->name_len, callee_sym->name);
+                        }
                     } else if (fn->func_decl.body) {
                         _comptime_global_scope = c->global_scope;
                         int64_t val = eval_comptime_block(fn->func_decl.body, cparams, pc);
@@ -6748,7 +6753,10 @@ static void check_func_body(Checker *c, Node *node) {
         }
 
         if (node->func_decl.is_naked) c->in_naked = true;
+        bool saved_comptime = c->in_comptime_body;
+        if (node->func_decl.is_comptime) c->in_comptime_body = true;
         check_stmt(c, node->func_decl.body);
+        c->in_comptime_body = saved_comptime;
         c->in_naked = false;
 
         /* check that all paths return for non-void functions */

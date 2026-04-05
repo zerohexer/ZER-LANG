@@ -1,0 +1,38 @@
+// Function pointer as struct field + reduce pattern
+typedef u32 (*Reducer)(u32, u32);
+
+struct Pipeline {
+    Reducer op;
+    u32 init;
+}
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+
+u32 reduce(Pipeline pipe, u32[4] data) {
+    u32 acc = pipe.init;
+    for (u32 i = 0; i < 4; i += 1) {
+        acc = pipe.op(acc, data[i]);
+    }
+    return acc;
+}
+
+u32 main() {
+    u32[4] nums;
+    nums[0] = 1;
+    nums[1] = 2;
+    nums[2] = 3;
+    nums[3] = 4;
+
+    Pipeline sum_pipe;
+    sum_pipe.op = add;
+    sum_pipe.init = 0;
+    if (reduce(sum_pipe, nums) != 10) { return 1; }
+
+    Pipeline mul_pipe;
+    mul_pipe.op = mul;
+    mul_pipe.init = 1;
+    if (reduce(mul_pipe, nums) != 24) { return 2; }
+
+    return 0;
+}

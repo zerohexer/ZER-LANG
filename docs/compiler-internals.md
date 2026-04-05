@@ -271,7 +271,7 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 ### Cross-Module Handle Auto-Deref + Qualified Calls (BUG-416, 2026-04-05)
 
-**Handle auto-deref in imported module functions:** `e.id = id` inside entity.zer function emitted `/* ERROR: no allocator */ 0 = id`. Root cause: `find_unique_allocator` uses `type_equals` (pointer identity for structs) which can fail across module scope boundaries. Fix: name-based struct matching fallback — when pointer-identity fails, compare `struct_type.name` strings. Safe because module prefixing prevents cross-module name collision.
+**Handle auto-deref in imported module functions:** `e.id = id` inside entity.zer function emitted `/* ERROR: no allocator */ 0 = id`. Root cause: `find_unique_allocator()` returned NULL (ambiguous) because imported module globals are registered TWICE in global scope — raw name (`cross_world`) AND mangled name (`cross_entity__cross_world`, from BUG-233). Both have the same `Type*` pointer, but `find_unique_allocator` counted them as two different allocators. Fix: in `find_unique_allocator()`, skip duplicate matches where `found->type == t` (same Type pointer = same allocator). The name-based fallback from the previous session was removed — pointer identity works correctly, the bug was in the ambiguity check.
 
 **Module-qualified function calls:** `config.MAX_SIZE()` now works. Implementation: in NODE_CALL, before builtin method dispatch, detect callee `NODE_FIELD(NODE_IDENT, field)` where the ident isn't a variable/type. Look up `module__func` in global scope via mangled name. If found, rewrite callee to `NODE_IDENT(raw_func_name)` and goto normal call resolution. This reuses all existing call handling (comptime, arg checking, type validation).
 

@@ -19,11 +19,17 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** (1) Only convert to NODE_INT_LIT for non-negative values. Negative results stay as NODE_CALL with `is_comptime_resolved`. (2) Extended `eval_const_expr` in ast.h to handle NODE_CALL with `is_comptime_resolved` — reads `comptime_value` directly. Works universally in binary expressions and comptime if conditions.
 - **Test:** `comptime_negative.zer`
 
-### BUG-416: Cross-module Handle auto-deref + qualified function calls
-- **Symptom:** Handle auto-deref (`e.id = id`) in imported module function emitted `/* ERROR: no allocator */ 0 = id`. Also `config.MAX_SIZE()` qualified call failed with "undefined identifier."
-- **Root cause:** (1) Emitter's `find_unique_allocator` used `type_equals` (pointer identity for structs) which can fail across module boundaries. (2) Module names aren't variables — `config` in `config.func()` fails scope lookup as ident.
-- **Fix:** (1) Name-based struct matching fallback in emitter when pointer-identity fails. (2) In NODE_CALL, detect `ident.field()` where ident isn't a variable, look up `module__func` in global scope, rewrite callee to raw function name.
+### BUG-416: Cross-module Handle auto-deref — duplicate allocator in global scope
+- **Symptom:** Handle auto-deref (`e.id = id`) in imported module function emitted `/* ERROR: no allocator */ 0 = id`.
+- **Root cause:** `find_unique_allocator()` returned NULL (ambiguous) because imported module globals are registered TWICE in global scope — once under raw name (`cross_world`) and once under mangled name (`cross_entity__cross_world`, from BUG-233 fix). Both point to the same `Type*` object. The function found two matching Slab entries and returned NULL. The previous session's name-based fallback was a workaround for this, but the true root cause was the duplicate registration, not pointer identity failure.
+- **Fix:** In `find_unique_allocator()`, when finding a second match, check `found->type == t` (same Type pointer). If same allocator, skip it. Only return NULL for genuinely different allocators. Removed the name-based fallback in emitter — it was never needed.
 - **Test:** `test_modules/cross_handle.zer`, `test_modules/qualified_call.zer`
+
+### BUG-417: popen segfault on 64-bit Linux — missing _POSIX_C_SOURCE
+- **Symptom:** `zerc` crashes with SIGSEGV at `fgets()` during GCC auto-detection probe on 64-bit Linux when compiled with `-std=c99`.
+- **Root cause:** `popen`/`pclose` are POSIX extensions not declared in strict C99 `<stdio.h>`. Without a declaration, compiler assumes `popen` returns `int` (32-bit), truncating the 64-bit FILE* pointer. The truncated pointer passed to `fgets` causes segfault.
+- **Fix:** Added `#define _POSIX_C_SOURCE 200809L` before `<stdio.h>` in `zerc_main.c` (guarded by `#ifndef _WIN32`). Standard practice for POSIX functions.
+- **Note:** Did not manifest on Windows (no popen) or Docker `gcc:13` image (defaults to GNU extensions). Only affects strict C99 compilation on 64-bit POSIX systems.
 
 ---
 

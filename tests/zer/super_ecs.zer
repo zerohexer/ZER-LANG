@@ -1,0 +1,88 @@
+comptime u32 MAX_ENTITIES() { return 16; }
+comptime u32 COMPONENT_MASK_POS() { return 1; }
+comptime u32 COMPONENT_MASK_VEL() { return 2; }
+comptime u32 COMPONENT_MASK_HP() { return 4; }
+
+struct Position { i32 x; i32 y; }
+struct Velocity { i32 dx; i32 dy; }
+struct Health { u32 current; u32 max; }
+
+struct Entity {
+    u32 component_mask;
+    Position pos;
+    Velocity vel;
+    Health hp;
+    bool alive;
+}
+
+Slab(Entity) entities;
+
+?Handle(Entity) spawn(i32 x, i32 y, u32 mask) {
+    ?Handle(Entity) me = entities.alloc();
+    Handle(Entity) e = me orelse { return null; };
+    e.component_mask = mask;
+    e.pos.x = x;
+    e.pos.y = y;
+    e.vel.dx = 0;
+    e.vel.dy = 0;
+    e.hp.current = 100;
+    e.hp.max = 100;
+    e.alive = true;
+    return me;
+}
+
+void system_movement(Handle(Entity) e) {
+    if ((e.component_mask & COMPONENT_MASK_POS()) == 0) { return; }
+    if ((e.component_mask & COMPONENT_MASK_VEL()) == 0) { return; }
+    e.pos.x = e.pos.x + e.vel.dx;
+    e.pos.y = e.pos.y + e.vel.dy;
+}
+
+void system_damage(Handle(Entity) e, u32 dmg) {
+    if ((e.component_mask & COMPONENT_MASK_HP()) == 0) { return; }
+    if (dmg >= e.hp.current) {
+        e.hp.current = 0;
+        e.alive = false;
+    } else {
+        e.hp.current = e.hp.current - dmg;
+    }
+}
+
+u32 main() {
+    u32 all = COMPONENT_MASK_POS() | COMPONENT_MASK_VEL() | COMPONENT_MASK_HP();
+
+    ?Handle(Entity) mp = spawn(10, 20, all);
+    Handle(Entity) player = mp orelse return;
+    player.vel.dx = 3;
+    player.vel.dy = -1;
+
+    ?Handle(Entity) me = spawn(50, 50, COMPONENT_MASK_POS() | COMPONENT_MASK_HP());
+    Handle(Entity) enemy = me orelse return;
+
+    // Move player twice
+    system_movement(player);
+    system_movement(player);
+    if (player.pos.x != 16) { return 1; }
+    if (player.pos.y != 18) { return 2; }
+
+    // Enemy has no velocity component, movement is no-op
+    system_movement(enemy);
+    if (enemy.pos.x != 50) { return 3; }
+
+    // Damage enemy
+    system_damage(enemy, 30);
+    if (enemy.hp.current != 70) { return 4; }
+    if (enemy.alive != true) { return 5; }
+
+    // Kill enemy
+    system_damage(enemy, 80);
+    if (enemy.hp.current != 0) { return 6; }
+    if (enemy.alive != false) { return 7; }
+
+    // Player still alive
+    if (player.alive != true) { return 8; }
+
+    entities.free(player);
+    entities.free(enemy);
+    return 0;
+}

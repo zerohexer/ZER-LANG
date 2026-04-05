@@ -1,0 +1,69 @@
+comptime u32 POOL_CAP() { return 8; }
+
+struct Block { u32 data; ?Handle(Block) next; }
+Pool(Block, POOL_CAP()) pool;
+
+?Handle(Block) free_list;
+
+?Handle(Block) alloc_block(u32 val) {
+    ?Handle(Block) mh = pool.alloc();
+    Handle(Block) h = mh orelse { return null; };
+    h.data = val;
+    h.next = null;
+    return mh;
+}
+
+void push_free(Handle(Block) h) {
+    h.next = free_list;
+    h.data = 0;
+    free_list = h;
+}
+
+?Handle(Block) pop_free() {
+    Handle(Block) h = free_list orelse { return null; };
+    free_list = h.next;
+    h.next = null;
+    return h;
+}
+
+u32 main() {
+    free_list = null;
+
+    // Allocate 4 blocks
+    Handle(Block)[4] blocks;
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Block) mb = alloc_block((i + 1) * 10);
+        blocks[i] = mb orelse return;
+    }
+
+    // Verify data
+    if (blocks[0].data != 10) { return 1; }
+    if (blocks[3].data != 40) { return 2; }
+
+    // Free blocks 1 and 2 to free list
+    push_free(blocks[1]);
+    push_free(blocks[2]);
+
+    // Pop from free list and reuse
+    ?Handle(Block) mr1 = pop_free();
+    Handle(Block) r1 = mr1 orelse return;
+    r1.data = 99;
+
+    ?Handle(Block) mr2 = pop_free();
+    Handle(Block) r2 = mr2 orelse return;
+    r2.data = 88;
+
+    if (r1.data != 99) { return 3; }
+    if (r2.data != 88) { return 4; }
+
+    // Free list should be empty now
+    ?Handle(Block) empty = pop_free();
+    if (empty) |h| { return 5; }
+
+    // Cleanup
+    pool.free(blocks[0]);
+    pool.free(blocks[3]);
+    pool.free(r1);
+    pool.free(r2);
+    return 0;
+}

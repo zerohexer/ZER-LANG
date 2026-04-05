@@ -1,0 +1,96 @@
+comptime u32 MAX_EVENTS() { return 16; }
+
+enum State { idle, connecting, connected, error }
+enum EventType { connect, disconnect, data_recv, timeout }
+
+distinct typedef u32 SessionId;
+
+union EventData {
+    SessionId session;
+    u32 bytes_recv;
+    u32 timeout_ms;
+}
+
+struct Event {
+    EventType etype;
+    EventData data;
+}
+
+struct Machine {
+    State state;
+    SessionId current_session;
+    u32 total_bytes;
+    u32 error_count;
+}
+
+State process_event(Machine m, Event ev) {
+    switch (m.state) {
+        .idle => {
+            switch (ev.etype) {
+                .connect => { return State.connecting; }
+                default => { return State.idle; }
+            }
+        }
+        .connecting => {
+            switch (ev.etype) {
+                .data_recv => { return State.connected; }
+                .timeout => { return State.error; }
+                default => { return State.connecting; }
+            }
+        }
+        .connected => {
+            switch (ev.etype) {
+                .disconnect => { return State.idle; }
+                .timeout => { return State.error; }
+                default => { return State.connected; }
+            }
+        }
+        .error => {
+            switch (ev.etype) {
+                .connect => { return State.connecting; }
+                default => { return State.error; }
+            }
+        }
+    }
+}
+
+u32 main() {
+    Machine m;
+    m.state = State.idle;
+    m.current_session = @cast(SessionId, 0);
+    m.total_bytes = 0;
+    m.error_count = 0;
+
+    Event ev;
+
+    // idle -> connecting
+    ev.etype = EventType.connect;
+    ev.data.session = @cast(SessionId, 1);
+    m.state = process_event(m, ev);
+    switch (m.state) { .connecting => {} default => { return 1; } }
+
+    // connecting -> connected (data received)
+    ev.etype = EventType.data_recv;
+    ev.data.bytes_recv = 1024;
+    m.state = process_event(m, ev);
+    switch (m.state) { .connected => {} default => { return 2; } }
+
+    // connected -> idle (disconnect)
+    ev.etype = EventType.disconnect;
+    m.state = process_event(m, ev);
+    switch (m.state) { .idle => {} default => { return 3; } }
+
+    // idle -> connecting -> error (timeout)
+    ev.etype = EventType.connect;
+    m.state = process_event(m, ev);
+    ev.etype = EventType.timeout;
+    m.state = process_event(m, ev);
+    switch (m.state) { .error => {} default => { return 4; } }
+
+    // error -> connecting (retry)
+    ev.etype = EventType.connect;
+    m.state = process_event(m, ev);
+    switch (m.state) { .connecting => {} default => { return 5; } }
+
+    return 0;
+}

@@ -3259,11 +3259,46 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Field access ---- */
     case NODE_FIELD: {
+        const char *fname = node->field.field_name;
+        uint32_t flen = (uint32_t)node->field.field_name_len;
+
+        /* BUG-432: module-qualified variable access: config.VERSION
+         * Must intercept BEFORE check_expr on object, because module
+         * names aren't variables — check_expr would error "undefined".
+         * Same pattern as NODE_CALL module-qualified call (BUG-416). */
+        if (node->field.object->kind == NODE_IDENT) {
+            const char *maybe_mod = node->field.object->ident.name;
+            uint32_t maybe_mod_len = (uint32_t)node->field.object->ident.name_len;
+            Symbol *var_sym = scope_lookup(c->current_scope, maybe_mod, maybe_mod_len);
+            if (!var_sym) {
+                /* not a variable — try as module__field in global scope */
+                uint32_t mang_len = maybe_mod_len + 2 + flen;
+                char *mangled = (char *)arena_alloc(c->arena, mang_len + 1);
+                if (mangled) {
+                    memcpy(mangled, maybe_mod, maybe_mod_len);
+                    mangled[maybe_mod_len] = '_';
+                    mangled[maybe_mod_len + 1] = '_';
+                    memcpy(mangled + maybe_mod_len + 2, fname, flen);
+                    mangled[mang_len] = '\0';
+                    Symbol *gsym = scope_lookup(c->global_scope, mangled, mang_len);
+                    if (gsym && gsym->type) {
+                        /* rewrite to NODE_IDENT with the raw field name.
+                         * The emitter resolves via mangled lookup in global scope.
+                         * Using raw name avoids double-mangling. */
+                        node->kind = NODE_IDENT;
+                        node->ident.name = fname;
+                        node->ident.name_len = flen;
+                        typemap_set(c, node, gsym->type);
+                        result = gsym->type;
+                        break;
+                    }
+                }
+            }
+        }
+
         Type *obj_raw = check_expr(c, node->field.object);
         /* BUG-410: unwrap distinct for field access dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
-        const char *fname = node->field.field_name;
-        uint32_t flen = (uint32_t)node->field.field_name_len;
 
         /* builtin method check — Pool, Ring, Arena */
         if (obj->kind == TYPE_POOL) {

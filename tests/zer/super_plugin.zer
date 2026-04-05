@@ -1,0 +1,88 @@
+comptime u32 MAX_PLUGINS() { return 4; }
+comptime u32 VERSION() { return 1; }
+
+enum PluginType { filter, transform, output }
+distinct typedef u32 PluginId;
+
+typedef ?u32 (*PluginHandler)(const [*]u8, u32);
+
+struct Plugin {
+    PluginId id;
+    PluginType ptype;
+    PluginHandler handler;
+    const [*]u8 name;
+    bool enabled;
+}
+
+?u32 filter_handler(const [*]u8 data, u32 threshold) {
+    if (data.len == 0) { return null; }
+    u32 first = @truncate(u32, data.ptr[0]);
+    if (first < threshold) { return null; }
+    return first;
+}
+
+?u32 transform_handler(const [*]u8 data, u32 multiplier) {
+    if (data.len == 0) { return null; }
+    return @truncate(u32, data.ptr[0]) * multiplier;
+}
+
+u32 run_plugins(Plugin[MAX_PLUGINS()] plugins, const [*]u8 data) {
+    u32 total = 0;
+    for (u32 i = 0; i < MAX_PLUGINS(); i += 1) {
+        if (!plugins[i].enabled) { continue; }
+        ?u32 result = plugins[i].handler(data, 10);
+        if (result) |v| {
+            total = total + v;
+        }
+    }
+    return total;
+}
+
+u32 main() {
+    Plugin[MAX_PLUGINS()] plugins;
+
+    plugins[0].id = @cast(PluginId, 1);
+    plugins[0].ptype = PluginType.filter;
+    plugins[0].handler = filter_handler;
+    plugins[0].name = "filter";
+    plugins[0].enabled = true;
+
+    plugins[1].id = @cast(PluginId, 2);
+    plugins[1].ptype = PluginType.transform;
+    plugins[1].handler = transform_handler;
+    plugins[1].name = "transform";
+    plugins[1].enabled = true;
+
+    plugins[2].id = @cast(PluginId, 3);
+    plugins[2].ptype = PluginType.filter;
+    plugins[2].handler = filter_handler;
+    plugins[2].name = "filter2";
+    plugins[2].enabled = false;
+
+    plugins[3].id = @cast(PluginId, 4);
+    plugins[3].ptype = PluginType.output;
+    plugins[3].handler = transform_handler;
+    plugins[3].name = "output";
+    plugins[3].enabled = true;
+
+    u8[3] input;
+    input[0] = 50;
+    input[1] = 5;
+    input[2] = 100;
+
+    u32 result = run_plugins(plugins, input);
+    // plugin 0 (filter): 50 >= 10 -> 50
+    // plugin 1 (transform): 50 * 10 = 500
+    // plugin 2: disabled
+    // plugin 3 (transform): 50 * 10 = 500
+    // total = 1050
+    if (result != 1050) { return 1; }
+
+    // Disable all, should be 0
+    for (u32 i = 0; i < MAX_PLUGINS(); i += 1) {
+        plugins[i].enabled = false;
+    }
+    if (run_plugins(plugins, input) != 0) { return 2; }
+
+    return 0;
+}

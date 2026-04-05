@@ -174,6 +174,9 @@ static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
     return 0;
 }
 
+/* forward declaration for use in zc_check_expr */
+static FuncSummary *find_summary(ZerCheck *zc, const char *name, uint32_t name_len);
+
 /* ---- *opaque alloc/free detection (Level 1) ---- */
 
 /* Check if a function call is a known allocator (extern returning *opaque).
@@ -204,19 +207,48 @@ static bool is_alloc_call(ZerCheck *zc, Node *call) {
     return false;
 }
 
-/* Check if a function call is free() — extern void function taking *opaque/*T. */
-static bool is_free_call(Node *call, char *arg_key, int *arg_key_len, int key_bufsize) {
+/* Check if a function call is a free/close/destroy — detected by:
+ * 1. Named "free" (original check)
+ * 2. Any bodyless (extern/cinclude) function taking *opaque as first param
+ *    and returning void — signature heuristic for compile-time tracking.
+ *    Covers: db_close(*opaque), sqlite3_close(*opaque), destroy(*opaque), etc.
+ *    The function is bodyless so we can't see inside — the signature tells us. */
+static bool is_free_call(ZerCheck *zc, Node *call, char *arg_key, int *arg_key_len, int key_bufsize) {
     if (!call || call->kind != NODE_CALL) return false;
     Node *callee = call->call.callee;
     if (!callee || callee->kind != NODE_IDENT) return false;
-    /* must be named "free" */
-    if (callee->ident.name_len != 4 ||
-        memcmp(callee->ident.name, "free", 4) != 0) return false;
-    /* must have exactly 1 argument */
-    if (call->call.arg_count != 1) return false;
-    /* extract the argument key */
-    *arg_key_len = handle_key_from_expr(call->call.args[0], arg_key, key_bufsize);
-    return *arg_key_len > 0;
+    if (call->call.arg_count < 1) return false;
+    /* Check 1: named "free" */
+    if (callee->ident.name_len == 4 &&
+        memcmp(callee->ident.name, "free", 4) == 0 &&
+        call->call.arg_count == 1) {
+        *arg_key_len = handle_key_from_expr(call->call.args[0], arg_key, key_bufsize);
+        return *arg_key_len > 0;
+    }
+    /* Check 2: signature heuristic — bodyless void func(*opaque param) */
+    Symbol *sym = scope_lookup(zc->checker->global_scope,
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (sym && sym->is_function && sym->func_node &&
+        !sym->func_node->func_decl.body) {
+        /* must return void */
+        Type *ret = sym->type;
+        if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+        if (ret && type_unwrap_distinct(ret)->kind == TYPE_VOID) {
+            /* first param must be *opaque or *T (pointer) */
+            if (sym->func_node->func_decl.param_count >= 1) {
+                Type *p0 = NULL;
+                if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
+                    sym->type->func_ptr.param_count >= 1)
+                    p0 = sym->type->func_ptr.params[0];
+                if (p0) p0 = type_unwrap_distinct(p0);
+                if (p0 && (p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE)) {
+                    *arg_key_len = handle_key_from_expr(call->call.args[0], arg_key, key_bufsize);
+                    return *arg_key_len > 0;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /* ---- Helpers ---- */
@@ -559,7 +591,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
         {
             char fkey[128];
             int fklen = 0;
-            if (is_free_call(node, fkey, &fklen, sizeof(fkey))) {
+            if (is_free_call(zc, node, fkey, &fklen, sizeof(fkey))) {
                 HandleInfo *h = find_handle(ps, fkey, (uint32_t)fklen);
                 if (h) {
                     if (h->state == HS_FREED) {
@@ -599,8 +631,64 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
         }
-        for (int i = 0; i < node->call.arg_count; i++)
-            zc_check_expr(zc, ps, node->call.args[i]);
+        /* Check if any argument is a freed *opaque handle — UAF at call site.
+         * Skip for free/delete calls (the arg IS what we're freeing). */
+        {
+            bool is_free_site = false;
+            Node *cc = node->call.callee;
+            if (cc && cc->kind == NODE_IDENT && cc->ident.name_len == 4 &&
+                memcmp(cc->ident.name, "free", 4) == 0)
+                is_free_site = true;
+            if (cc && cc->kind == NODE_FIELD) {
+                const char *mn = cc->field.field_name;
+                uint32_t ml = (uint32_t)cc->field.field_name_len;
+                if ((ml == 4 && memcmp(mn, "free", 4) == 0) ||
+                    (ml == 8 && memcmp(mn, "free_ptr", 8) == 0) ||
+                    (ml == 6 && memcmp(mn, "delete", 6) == 0) ||
+                    (ml == 10 && memcmp(mn, "delete_ptr", 10) == 0))
+                    is_free_site = true;
+            }
+            /* Also skip if callee has a summary or heuristic that frees params */
+            if (!is_free_site && cc && cc->kind == NODE_IDENT) {
+                FuncSummary *cs = find_summary(zc, cc->ident.name, (uint32_t)cc->ident.name_len);
+                if (cs) is_free_site = true;
+                /* heuristic: bodyless void func(*opaque) */
+                if (!is_free_site) {
+                    Symbol *csym = scope_lookup(zc->checker->global_scope,
+                        cc->ident.name, (uint32_t)cc->ident.name_len);
+                    if (csym && csym->is_function && csym->func_node &&
+                        !csym->func_node->func_decl.body && csym->type) {
+                        Type *cret = csym->type;
+                        if (cret->kind == TYPE_FUNC_PTR) cret = cret->func_ptr.ret;
+                        if (cret && type_unwrap_distinct(cret)->kind == TYPE_VOID)
+                            is_free_site = true;
+                    }
+                }
+            }
+            if (!is_free_site) {
+                for (int i = 0; i < node->call.arg_count; i++) {
+                    Node *arg = node->call.args[i];
+                    if (arg && arg->kind == NODE_IDENT) {
+                        char akey[128];
+                        int aklen = handle_key_from_expr(arg, akey, sizeof(akey));
+                        if (aklen > 0) {
+                            HandleInfo *ah = find_handle(ps, akey, (uint32_t)aklen);
+                            if (ah && (ah->state == HS_FREED || ah->state == HS_MAYBE_FREED)) {
+                                zc_error(zc, node->loc.line,
+                                    "use after free: '%.*s' %s at line %d — cannot pass to function",
+                                    aklen, akey,
+                                    ah->state == HS_FREED ? "freed" : "may have been freed",
+                                    ah->free_line);
+                            }
+                        }
+                    }
+                    zc_check_expr(zc, ps, arg);
+                }
+            } else {
+                for (int i = 0; i < node->call.arg_count; i++)
+                    zc_check_expr(zc, ps, node->call.args[i]);
+            }
+        }
         break;
     case NODE_ASSIGN:
         zc_check_expr(zc, ps, node->assign.target);
@@ -1101,7 +1189,51 @@ static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
 
     FuncSummary *s = find_summary(zc, callee->ident.name,
         (uint32_t)callee->ident.name_len);
-    if (!s) return;
+    /* Signature heuristic fallback: if no summary exists but the function
+     * takes *opaque/*T as param and returns void, treat as @frees(0).
+     * Covers wrapper chains: app_stop → service_shutdown → resource_destroy.
+     * Works for both bodyless (cinclude) and ZER functions in other modules. */
+    bool heuristic_free = false;
+    if (!s && call_node->call.arg_count >= 1) {
+        Symbol *sym = scope_lookup(zc->checker->global_scope,
+            callee->ident.name, (uint32_t)callee->ident.name_len);
+        if (sym && sym->is_function && sym->type &&
+            sym->func_node && !sym->func_node->func_decl.body &&
+            /* skip if already handled by is_free_call (explicit "free" name) */
+            !(callee->ident.name_len == 4 && memcmp(callee->ident.name, "free", 4) == 0)) {
+            /* Only for bodyless functions (extern/cinclude). Functions WITH
+             * bodies get proper summaries via zc_build_summary. */
+            Type *ret = sym->type;
+            if (ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+            if (ret && type_unwrap_distinct(ret)->kind == TYPE_VOID &&
+                sym->type->kind == TYPE_FUNC_PTR &&
+                sym->type->func_ptr.param_count >= 1) {
+                Type *p0 = type_unwrap_distinct(sym->type->func_ptr.params[0]);
+                if (p0 && (p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE)) {
+                    heuristic_free = true;
+                }
+            }
+        }
+    }
+    if (!s && !heuristic_free) return;
+    /* If heuristic free, treat param 0 as freed */
+    if (heuristic_free && !s) {
+        char hkey[128];
+        int hklen = handle_key_from_expr(call_node->call.args[0], hkey, sizeof(hkey));
+        if (hklen > 0) {
+            HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
+            if (h) {
+                if (h->state == HS_FREED) {
+                    zc_error(zc, call_node->loc.line,
+                        "double free: '%.*s' already freed at line %d",
+                        hklen, hkey, h->free_line);
+                }
+                h->state = HS_FREED;
+                h->free_line = call_node->loc.line;
+            }
+        }
+        return;
+    }
 
     int arg_count = call_node->call.arg_count;
     if (arg_count > s->param_count) arg_count = s->param_count;
@@ -1276,12 +1408,32 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
         }
     }
 
-    /* pre-scan: build cross-function summaries for all functions with Handle params */
-    for (int i = 0; i < file_node->file.decl_count; i++) {
-        Node *decl = file_node->file.decls[i];
-        if (decl->kind == NODE_FUNC_DECL) {
-            zc_build_summary(zc, decl);
+    /* pre-scan: build cross-function summaries for all functions.
+     * Scan imported modules first (dependencies before dependents),
+     * then main module. Multiple passes for wrapper chain propagation. */
+    for (int pass = 0; pass < 4; pass++) {
+        int prev_count = zc->summary_count;
+        /* imported modules first */
+        for (int mi = 0; mi < zc->import_ast_count; mi++) {
+            Node *mod = zc->import_asts[mi];
+            if (!mod || mod->kind != NODE_FILE) continue;
+            for (int i = 0; i < mod->file.decl_count; i++) {
+                Node *decl = mod->file.decls[i];
+                if (decl->kind == NODE_FUNC_DECL &&
+                    !find_summary(zc, decl->func_decl.name,
+                        (uint32_t)decl->func_decl.name_len))
+                    zc_build_summary(zc, decl);
+            }
         }
+        /* main module */
+        for (int i = 0; i < file_node->file.decl_count; i++) {
+            Node *decl = file_node->file.decls[i];
+            if (decl->kind == NODE_FUNC_DECL &&
+                !find_summary(zc, decl->func_decl.name,
+                    (uint32_t)decl->func_decl.name_len))
+                zc_build_summary(zc, decl);
+        }
+        if (zc->summary_count == prev_count) break; /* converged */
     }
 
     /* main analysis: check each function and interrupt body */

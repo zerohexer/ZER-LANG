@@ -83,6 +83,10 @@ typedef struct {
     int summary_count;
     int summary_capacity;
     bool building_summary;  /* suppress error reporting during summary phase */
+
+    /* imported module ASTs for cross-module summary building */
+    Node **import_asts;
+    int import_ast_count;
 } ZerCheck;
 
 /* ---- API ---- */

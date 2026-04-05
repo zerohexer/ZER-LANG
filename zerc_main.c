@@ -441,6 +441,15 @@ int main(int argc, char **argv) {
     {
         ZerCheck zc;
         zercheck_init(&zc, &checker, &cc.arena, input_path);
+        /* Feed imported module ASTs for cross-module summary building */
+        Node *import_asts[64];
+        int import_ast_count = 0;
+        for (int mi = 1; mi < cc.module_count && import_ast_count < 64; mi++) {
+            if (cc.modules[mi].ast)
+                import_asts[import_ast_count++] = cc.modules[mi].ast;
+        }
+        zc.import_asts = import_asts;
+        zc.import_ast_count = import_ast_count;
         if (!zercheck_run(&zc, main_mod->ast)) {
             fprintf(stderr, "error: zercheck failed\n");
             free(cc.modules);

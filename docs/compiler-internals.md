@@ -575,6 +575,10 @@ At function exit, any handle that is `HS_ALIVE` or `HS_MAYBE_FREED` and was allo
 - `HS_MAYBE_FREED` → "handle leaked: may not be freed on all paths"
 - Parameter handles (pool_id == -1, alloc_line == func start) are excluded — caller is responsible.
 
+**Defer free scanning (2026-04-05):** Before leak detection, zercheck scans all top-level `NODE_DEFER` statements in the function body. `defer_scans_free()` checks for pool.free, slab.free_ptr, Task.delete, Task.delete_ptr, and bare free() calls inside defer bodies. Matched handles are marked HS_FREED, suppressing the false "never freed" warning.
+
+**If-exit MAYBE_FREED fix (2026-04-05):** In if-without-else merging, `block_always_exits()` checks if the then-branch always exits (NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, or NODE_IF with both branches exiting). If the freeing branch always exits, handles stay ALIVE on the continuation path — the pattern `if (err) { free(h); return; } use(h);` is now correctly safe.
+
 ### Overwrite Detection
 If a handle target is already `HS_ALIVE` when a new `pool.alloc()` is assigned to it, the first handle is leaked. Error: "handle overwritten while alive — previous handle leaked."
 
@@ -880,7 +884,7 @@ These caused test failures and are not obvious from reading C source tests:
 1. **Type ID 0 (provenance bypass)** — Real, by design. `@ptrcast` skips type_id==0 for C interop. Not a bug — C boundary is inherently untracked. Future `--strict-interop` flag possible.
 2. **Pointer arithmetic** — False finding. ZER deliberately rejects `ptr + N`. Use `ptr[N]` (indexing). This is a safety feature.
 3. **Slab uint32_t total_slots** — Real, fixed. Changed to `size_t` (page_count, page_cap, total_slots, local vars in slab functions).
-4. **MAYBE_FREED conservatism** — Real, by design. Developer restructures code with `return;` after free. NOT worth adding path constraints — would become a borrow checker for zero additional safety. Handle + zercheck covers all cases without lifetime annotations.
+4. **MAYBE_FREED conservatism** — Partially fixed (2026-04-05). `if (err) { free(h); return; }` no longer causes false MAYBE_FREED — zercheck now detects that the freeing branch always exits (return/break/continue/goto), so post-if the handle is still ALIVE. Remaining case: `if (cond) { free(h); }` without return — this is genuine MAYBE_FREED (developer should add `return;` after free).
 5. **Atomic width unchecked** — Real bug, fixed. Added width validation: must be 8/16/32/64 bits. 64-bit targets get warning about libatomic on 32-bit platforms.
 6. **Large preamble** — Real debt, acknowledged. ~300 lines of C strings in emitter. Works but hard to maintain.
 7. **Comptime nested calls** — Partially real. Recursion depth guard works (max 16). Error message is generic. Two-pass registration handles most ordering issues.

@@ -1,0 +1,50 @@
+// zercheck: if-branch that exits doesn't cause MAYBE_FREED
+// Pattern: if (err) { free(h); return; } use(h); free(h);
+// The return means h is only freed on the error path — post-if h is ALIVE
+
+struct Task { u32 id; u32 priority; }
+struct Conn { u32 fd; bool active; }
+
+Slab(Task) tasks;
+Pool(Conn, 8) conns;
+
+u32 test_alloc_ptr_if_return() {
+    *Task t = tasks.alloc_ptr() orelse { return 1; };
+    t.id = 42;
+    t.priority = 5;
+    if (t.id != 42) { tasks.free_ptr(t); return 2; }
+    if (t.priority > 100) { tasks.free_ptr(t); return 3; }
+    // t is still ALIVE here — both branches returned
+    tasks.free_ptr(t);
+    return 0;
+}
+
+u32 test_handle_if_return() {
+    Handle(Conn) c = conns.alloc() orelse { return 1; };
+    conns.get(c).fd = 80;
+    conns.get(c).active = true;
+    if (conns.get(c).fd == 0) { conns.free(c); return 2; }
+    // c is still ALIVE
+    conns.free(c);
+    return 0;
+}
+
+u32 test_multiple_guards() {
+    *Task t = tasks.alloc_ptr() orelse { return 1; };
+    t.id = 1;
+    if (t.id == 0) { tasks.free_ptr(t); return 2; }
+    t.priority = 10;
+    if (t.priority == 0) { tasks.free_ptr(t); return 3; }
+    // both guards returned — t alive
+    u32 sum = t.id + t.priority;
+    tasks.free_ptr(t);
+    if (sum != 11) { return 4; }
+    return 0;
+}
+
+u32 main() {
+    if (test_alloc_ptr_if_return() != 0) { return 1; }
+    if (test_handle_if_return() != 0) { return 2; }
+    if (test_multiple_guards() != 0) { return 3; }
+    return 0;
+}

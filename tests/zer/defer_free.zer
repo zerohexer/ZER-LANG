@@ -1,0 +1,39 @@
+// zercheck recognizes defer free — no false "never freed" warning
+// Tests: defer pool.free(h), defer slab.free_ptr(p), defer Task.delete()
+
+struct Res { u32 id; }
+struct Worker { u32 jobs; }
+struct Job { u32 priority; }
+
+Slab(Res) res_pool;
+Pool(Worker, 8) worker_pool;
+
+u32 test_defer_free_ptr() {
+    *Res r = res_pool.alloc_ptr() orelse { return 1; };
+    defer res_pool.free_ptr(r);
+    r.id = 42;
+    if (r.id != 42) { return 2; }
+    return 0;
+}
+
+u32 test_defer_free_handle() {
+    Handle(Worker) w = worker_pool.alloc() orelse { return 1; };
+    defer worker_pool.free(w);
+    worker_pool.get(w).jobs = 10;
+    if (worker_pool.get(w).jobs != 10) { return 2; }
+    return 0;
+}
+
+u32 test_defer_task_delete() {
+    Handle(Job) h = Job.new() orelse { return 1; };
+    defer Job.delete(h);
+    h.priority = 5;
+    return 0;
+}
+
+u32 main() {
+    if (test_defer_free_ptr() != 0) { return 1; }
+    if (test_defer_free_handle() != 0) { return 2; }
+    if (test_defer_task_delete() != 0) { return 3; }
+    return 0;
+}

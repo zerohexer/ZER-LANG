@@ -7,6 +7,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-05 — Bug Hunting Round 2 (BUG-402/403)
 
+### zercheck: defer free scanning + if-exit MAYBE_FREED fix
+- **Defer free:** `defer pool.free(h);` no longer triggers false "never freed" warning. zercheck now scans all top-level defer bodies for free/delete/free_ptr/delete_ptr calls before leak detection. Matched handles are marked FREED.
+- **If-exit MAYBE_FREED:** `if (err) { free(h); return; } use(h);` no longer triggers false MAYBE_FREED. When the then-branch always exits (return/break/continue/goto), handles freed inside it stay ALIVE on the continuation path — we only reach post-if if the branch was NOT taken.
+- **`block_always_exits()` helper:** Recursively checks NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, NODE_BLOCK (last statement), NODE_IF (both branches exit).
+- **`defer_scans_free()` helper:** Scans defer body for pool.free, slab.free_ptr, Task.delete, bare free calls. Returns handle key.
+- **Test:** `defer_free.zer` (defer free_ptr, defer pool.free, defer Task.delete), `if_exit_free.zer` (multiple if-return guards with alloc_ptr and Handle)
+
 ### BUG-410 (cont): Remaining distinct unwrap — all TYPE_ARRAY, TYPE_POINTER, TYPE_SLICE sites
 - **Sites fixed in emitter.c (6):** array assign target, @cstr array dest (use buf_eff), array init memcpy, volatile pointer local var-decl (2 sites), volatile pointer global var (2 sites).
 - **Sites fixed in checker.c (5):** assign value TYPE_ARRAY check, assign target TYPE_SLICE + value TYPE_ARRAY escape check, const array→mutable slice assign, call-site const array→slice (2 sites).

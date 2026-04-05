@@ -219,6 +219,72 @@ static bool is_free_call(Node *call, char *arg_key, int *arg_key_len, int key_bu
     return *arg_key_len > 0;
 }
 
+/* ---- Helpers ---- */
+
+/* Check if a block always exits (return/break/continue on all paths).
+ * Used by if-without-else: if the then-branch always exits, handles
+ * freed inside it are NOT MAYBE_FREED after the if — we only reach
+ * post-if if the branch was NOT taken. */
+static bool block_always_exits(Node *node) {
+    if (!node) return false;
+    if (node->kind == NODE_RETURN || node->kind == NODE_BREAK ||
+        node->kind == NODE_CONTINUE) return true;
+    if (node->kind == NODE_GOTO) return true;
+    if (node->kind == NODE_BLOCK) {
+        /* last statement in block determines exit */
+        for (int i = node->block.stmt_count - 1; i >= 0; i--) {
+            if (block_always_exits(node->block.stmts[i])) return true;
+            /* skip non-control-flow statements */
+            if (node->block.stmts[i]->kind != NODE_VAR_DECL &&
+                node->block.stmts[i]->kind != NODE_EXPR_STMT &&
+                node->block.stmts[i]->kind != NODE_DEFER)
+                break;
+        }
+    }
+    if (node->kind == NODE_IF && node->if_stmt.then_body && node->if_stmt.else_body) {
+        return block_always_exits(node->if_stmt.then_body) &&
+               block_always_exits(node->if_stmt.else_body);
+    }
+    return false;
+}
+
+/* Scan a defer body for free/delete calls. Returns handle key if found. */
+static int defer_scans_free(Node *node, char *key_buf, int key_bufsize) {
+    if (!node) return 0;
+    /* defer pool.free(h) or defer slab.free_ptr(p) */
+    if (node->kind == NODE_EXPR_STMT && node->expr_stmt.expr &&
+        node->expr_stmt.expr->kind == NODE_CALL) {
+        Node *call = node->expr_stmt.expr;
+        if (call->call.callee && call->call.callee->kind == NODE_FIELD) {
+            const char *method = call->call.callee->field.field_name;
+            uint32_t mlen = (uint32_t)call->call.callee->field.field_name_len;
+            if ((mlen == 4 && memcmp(method, "free", 4) == 0) ||
+                (mlen == 8 && memcmp(method, "free_ptr", 8) == 0) ||
+                (mlen == 6 && memcmp(method, "delete", 6) == 0) ||
+                (mlen == 10 && memcmp(method, "delete_ptr", 10) == 0)) {
+                if (call->call.arg_count > 0) {
+                    return handle_key_from_expr(call->call.args[0], key_buf, key_bufsize);
+                }
+            }
+        }
+        /* defer free(p) — bare free call */
+        if (call->call.callee && call->call.callee->kind == NODE_IDENT &&
+            call->call.callee->ident.name_len == 4 &&
+            memcmp(call->call.callee->ident.name, "free", 4) == 0 &&
+            call->call.arg_count > 0) {
+            return handle_key_from_expr(call->call.args[0], key_buf, key_bufsize);
+        }
+    }
+    /* defer { block } — scan statements inside */
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            int klen = defer_scans_free(node->block.stmts[i], key_buf, key_bufsize);
+            if (klen > 0) return klen;
+        }
+    }
+    return 0;
+}
+
 /* ---- AST walking ---- */
 
 static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node);
@@ -775,13 +841,23 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             pathstate_free(&else_state);
         } else {
             /* if without else: then-branch frees → MAYBE_FREED
-             * (may or may not take the branch) */
+             * (may or may not take the branch).
+             * BUT: if the then-branch always exits (return/break/continue/goto),
+             * we only reach post-if if the branch was NOT taken — handle is
+             * still ALIVE, not MAYBE_FREED. This is the most common false
+             * positive pattern: if (err) { free(h); return; } use(h); */
+            bool then_exits = block_always_exits(node->if_stmt.then_body);
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
                 if (th && (th->state == HS_FREED || th->state == HS_MAYBE_FREED)) {
-                    ps->handles[i].state = HS_MAYBE_FREED;
-                    ps->handles[i].free_line = th->free_line;
+                    if (then_exits) {
+                        /* branch exits — handle still alive on continuation path */
+                        /* don't change state — it stays ALIVE */
+                    } else {
+                        ps->handles[i].state = HS_MAYBE_FREED;
+                        ps->handles[i].free_line = th->free_line;
+                    }
                 }
             }
         }
@@ -1131,6 +1207,26 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
     }
 
     zc_check_stmt(zc, &ps, func->func_decl.body);
+
+    /* Defer free scanning: scan function body for defer { free(h) } patterns.
+     * Handles freed in defer are not leaked — defer fires on all return paths.
+     * Scan top-level defers in the function body. */
+    if (func->func_decl.body && func->func_decl.body->kind == NODE_BLOCK) {
+        for (int di = 0; di < func->func_decl.body->block.stmt_count; di++) {
+            Node *stmt = func->func_decl.body->block.stmts[di];
+            if (stmt->kind == NODE_DEFER) {
+                char dkey[128];
+                int dklen = defer_scans_free(stmt->defer.body, dkey, sizeof(dkey));
+                if (dklen > 0) {
+                    HandleInfo *h = find_handle(&ps, dkey, (uint32_t)dklen);
+                    if (h && (h->state == HS_ALIVE || h->state == HS_MAYBE_FREED)) {
+                        h->state = HS_FREED;
+                        h->free_line = stmt->loc.line;
+                    }
+                }
+            }
+        }
+    }
 
     /* Leak detection: any handle still ALIVE or MAYBE_FREED at function exit
      * that was allocated inside this function (not a parameter) → warning.

@@ -931,6 +931,8 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         Type *elem = resolve_type(c, tn->pool.elem);
         uint32_t count = 0;
         if (tn->pool.count_expr) {
+            /* BUG-423: resolve comptime calls before eval */
+            check_expr(c, tn->pool.count_expr);
             int64_t val = eval_const_expr(tn->pool.count_expr);
             if (val > 0) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Pool count must be a positive compile-time constant");
@@ -942,6 +944,8 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         Type *elem = resolve_type(c, tn->ring.elem);
         uint32_t count = 0;
         if (tn->ring.count_expr) {
+            /* BUG-423: resolve comptime calls before eval */
+            check_expr(c, tn->ring.count_expr);
             int64_t val = eval_const_expr(tn->ring.count_expr);
             if (val > 0) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Ring count must be a positive compile-time constant");

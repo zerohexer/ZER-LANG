@@ -3238,17 +3238,12 @@ static Type *check_expr(Checker *c, Node *node) {
                         } else {
                             node->call.comptime_value = val;
                             node->call.is_comptime_resolved = true;
-                            /* Convert to int literal in-place so eval_const_expr
-                             * works on comptime calls in binary expressions,
-                             * comptime if conditions, array sizes, etc.
-                             * BUG-415: only for non-negative values — negative values
-                             * can't be represented in uint64_t NODE_INT_LIT without
-                             * sign confusion. Negative results stay as NODE_CALL with
-                             * is_comptime_resolved, emitter handles via %lld. */
-                            if (val >= 0) {
-                                node->kind = NODE_INT_LIT;
-                                node->int_lit.value = (uint64_t)val;
-                            }
+                            /* BUG-415 cleanup: always keep as NODE_CALL with
+                             * is_comptime_resolved. eval_const_expr in ast.h
+                             * reads comptime_value for both positive and negative.
+                             * Previous approach converted positive to NODE_INT_LIT
+                             * but not negative (uint64_t can't represent -1), creating
+                             * a fragile two-path split. Single path is simpler. */
                         }
                     }
                 }

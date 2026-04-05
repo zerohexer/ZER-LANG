@@ -305,9 +305,7 @@ Atomic intrinsic prefix check was `nlen >= 10` but `"atomic_or"` is 9 chars. Fix
 
 `comptime i32 NEG() { return -1; }` broke — in-place NODE_INT_LIT conversion stored `-1` as `uint64_t` (0xFFFFFFFFFFFFFFFF), failing `is_literal_compatible`.
 
-**Fix (two parts):**
-1. checker.c: Only convert to NODE_INT_LIT for `val >= 0`. Negative results stay as NODE_CALL with `is_comptime_resolved = true`.
-2. ast.h: `eval_const_expr_d` now handles `NODE_CALL` with `is_comptime_resolved` — reads `comptime_value` directly. This makes negative comptime results work universally in binary expressions (`MODE() < 0`), comptime if conditions, etc.
+**Fix:** `eval_const_expr_d` in ast.h extended to handle `NODE_CALL` with `is_comptime_resolved` — reads `comptime_value` directly. Comptime calls are NOT converted to NODE_INT_LIT (previous approach converted positive results to NODE_INT_LIT but couldn't handle negatives in uint64_t, creating a fragile two-path split). Now ALL resolved comptime calls stay as NODE_CALL with `is_comptime_resolved + comptime_value`. Single path, works for both positive and negative.
 
 ### Cross-Module Handle Auto-Deref + Qualified Calls (BUG-416, 2026-04-05)
 

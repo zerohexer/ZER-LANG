@@ -1,0 +1,36 @@
+// Dynamic array Handle UAF auto-guard
+// When pool.free(handles[k]) with variable k, compiler auto-inserts
+// if (use_idx == k) { return; } before handles[j].field access
+
+struct Item { u32 val; }
+Pool(Item, 8) pool;
+
+u32 do_work(u32 free_idx, u32 use_idx) {
+    Handle(Item)[4] handles;
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Item) mh = pool.alloc();
+        handles[i] = mh orelse return;
+        handles[i].val = (i + 1) * 10;
+    }
+    // Free at dynamic index
+    pool.free(handles[free_idx]);
+    // Use at different dynamic index — auto-guard protects
+    u32 v = handles[use_idx].val;
+    // cleanup
+    for (u32 i = 0; i < 4; i += 1) {
+        if (i != free_idx) {
+            pool.free(handles[i]);
+        }
+    }
+    return v;
+}
+
+u32 main() {
+    // free_idx=2, use_idx=0 -> different -> returns handles[0].val = 10
+    u32 r = do_work(2, 0);
+    if (r != 10) { return 1; }
+    // free_idx=0, use_idx=1 -> different -> returns handles[1].val = 20
+    u32 r2 = do_work(0, 1);
+    if (r2 != 20) { return 2; }
+    return 0;
+}

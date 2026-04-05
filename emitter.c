@@ -2058,7 +2058,8 @@ static void emit_expr(Emitter *e, Node *node) {
                  src_eff->kind == TYPE_OPAQUE) &&
                 node->intrinsic.arg_count > 0 &&
                 node->intrinsic.args[0]->kind == NODE_IDENT) {
-                emit(e, "(_zer_check_alive((void*)%.*s, __FILE__, __LINE__), ",
+                /* BUG-431: ctx is _zer_opaque struct, use .ptr not (void*)ctx */
+                emit(e, "(_zer_check_alive(%.*s.ptr, __FILE__, __LINE__), ",
                      (int)node->intrinsic.args[0]->ident.name_len,
                      node->intrinsic.args[0]->ident.name);
                 _ptrcast_track = true;

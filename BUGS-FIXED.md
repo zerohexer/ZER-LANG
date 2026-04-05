@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — track-cptrs Audit (BUG-431)
+
+### BUG-431: `@ptrcast` from `*opaque` with `--track-cptrs` — GCC "cannot convert to pointer type"
+- **Symptom:** `*Sensor back = @ptrcast(*Sensor, ctx)` where `ctx` is `*opaque` → GCC error "cannot convert to a pointer type." Only with `--run` (which enables `--track-cptrs`). `--emit-c` without `--track-cptrs` worked fine.
+- **Root cause:** `_zer_check_alive((void*)ctx, ...)` cast `_zer_opaque` struct directly to `void*`. With `--track-cptrs`, `*opaque` is a `_zer_opaque` struct `{void *ptr, uint32_t type_id}`, not a raw pointer. `(void*)struct` is invalid C.
+- **Fix:** Changed to `_zer_check_alive(ctx.ptr, ...)` — extract the `.ptr` field before passing to alive check.
+- **Test:** `opaque_ptrcast_roundtrip.zer`
+
+---
+
 ## Session 2026-04-05 — Const in Comptime Args (BUG-430)
 
 ### BUG-430: Const variable as comptime function argument rejected

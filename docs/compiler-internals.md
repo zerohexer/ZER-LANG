@@ -343,6 +343,8 @@ Auto-guard `if (idx >= size) { return 0; }` in a function returning struct/union
 
 **Design decision:** The `?` prefix is inherently ambiguous for raw function pointer declarations. The typedef rule resolves it: at typedef you specify the *signature* (including optional return), and at usage sites you wrap the *pointer* (including nullable). Both `?RetType` and `?FuncPtr` are expressible — just through different syntax paths.
 
+**Implementation:** `parse_funcptr_with_opt(p, type, &name, &len, is_typedef)` helper enforces the invariant in one place. All 6 funcptr declaration sites call it with `is_typedef=false` (local/global/field/param) or `is_typedef=true` (typedef/distinct typedef). The helper unwraps+re-wraps `?` for non-typedef sites, passes through for typedef sites.
+
 ### Else-If Chain #line Directive (BUG-418, 2026-04-05)
 
 `if (a) { } else if (b) { }` emitted `else #line N "file"` on the same line — GCC error "stray '#' in program." Root cause: `emit_stmt` emits `#line` before each non-block statement. When else_body is NODE_IF, the `#line` follows `else ` without a newline.

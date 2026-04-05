@@ -5,6 +5,17 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Bugs Found by Writing Real ZER Code (BUG-418/419/420)
+
+### BUG-420: `typedef ?u32 (*Handler)(u32)` creates optional funcptr instead of funcptr returning optional
+- **Symptom:** `typedef ?u32 (*Handler)(u32)` produces `?(u32 (*)(u32))` (nullable function pointer) instead of `(?u32) (*)(u32)` (function pointer returning `?u32`). Calling `handler(x) orelse fallback` errors "cannot call non-function type '?fn(...)'"
+- **Root cause:** All 6 function pointer declaration sites stripped `?` from the return type and re-wrapped the whole funcptr as optional. This was correct for var-decl/param/struct-field/global sites (nullable funcptr is the common use case) but wrong for typedef sites (where `?RetType` should be part of the function signature).
+- **Fix:** Only typedef sites (regular + distinct) pass `?RetType` through as the return type. All other 4 sites (local var, global var, struct field, function param) keep the original behavior: `?` wraps the function pointer as optional/nullable.
+- **Design:** `?void (*cb)(u32)` at declaration = optional function pointer. `typedef ?u32 (*Handler)(u32)` = funcptr returning optional. `?Handler` via typedef = optional function pointer.
+- **Test:** `tests/zer/funcptr_optional_ret.zer`
+
+---
+
 ## Session 2026-04-05 — Bugs Found by Writing Real ZER Code (BUG-418/419)
 
 ### BUG-418: `else if` chain emits `#line` after `else` — GCC "stray #" error

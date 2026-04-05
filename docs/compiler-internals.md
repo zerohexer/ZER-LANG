@@ -283,6 +283,16 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Lesson:** Always check GCC warnings for `implicit declaration of function 'popen'`. On 64-bit, implicit `int` return = truncated pointer = guaranteed crash. This is a classic C99 portability bug.
 
+### Funcptr Typedef Optional Return Type (BUG-420, 2026-04-05)
+
+`typedef ?u32 (*Handler)(u32)` created `?(u32 (*)(u32))` (nullable funcptr) instead of `(?u32) (*)(u32)` (funcptr returning `?u32`). All 6 funcptr declaration sites had the same `is_opt_fp` unwrap-and-rewrap pattern.
+
+**Fix:** Split behavior by context:
+- **Typedef sites** (regular + distinct): `?` binds to the return type. `typedef ?u32 (*Handler)(u32)` = funcptr returning `?u32`. This is the only context where it makes sense — typedefs create named types, and `?Handler` separately gives you nullable.
+- **All other 4 sites** (local var, global var, struct field, function param): `?` wraps the function pointer as optional/nullable. `?void (*cb)(u32)` = nullable callback. This is the common use case at declaration sites.
+
+**Design decision:** The `?` prefix is inherently ambiguous for raw function pointer declarations. The typedef rule resolves it: at typedef you specify the *signature* (including optional return), and at usage sites you wrap the *pointer* (including nullable). Both `?RetType` and `?FuncPtr` are expressible — just through different syntax paths.
+
 ### Else-If Chain #line Directive (BUG-418, 2026-04-05)
 
 `if (a) { } else if (b) { }` emitted `else #line N "file"` on the same line — GCC error "stray '#' in program." Root cause: `emit_stmt` emits `#line` before each non-block statement. When else_body is NODE_IF, the `#line` follows `else ` without a newline.

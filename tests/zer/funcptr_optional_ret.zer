@@ -1,0 +1,43 @@
+// BUG-420: typedef with ?RetType (*Name)(params) — ? binds to return type
+// Tests: function pointer typedef with optional return, dispatch pattern
+
+typedef ?u32 (*OptHandler)(u32 input);
+
+?u32 handle_double(u32 x) {
+    if (x > 1000) { return null; }
+    return x * 2;
+}
+
+?u32 handle_square(u32 x) {
+    if (x > 100) { return null; }
+    return x * x;
+}
+
+u32 dispatch(OptHandler handler, u32 input, u32 fallback) {
+    u32 result = handler(input) orelse fallback;
+    return result;
+}
+
+u32 main() {
+    u32 a = dispatch(handle_double, 5, 0);
+    if (a != 10) { return 1; }
+
+    u32 b = dispatch(handle_square, 7, 0);
+    if (b != 49) { return 2; }
+
+    // Test overflow fallback
+    u32 c = dispatch(handle_double, 2000, 999);
+    if (c != 999) { return 3; }
+
+    u32 d = dispatch(handle_square, 200, 888);
+    if (d != 888) { return 4; }
+
+    // Test with local function pointer variable via typedef
+    OptHandler local_handler = handle_double;
+    u32 e = local_handler(3) orelse { return 5; };
+    if (e != 6) { return 6; }
+
+    // Note: ?u32 (*fn)(u32) at var-decl means OPTIONAL funcptr (nullable),
+    // NOT funcptr-returning-optional. Use typedef for the latter.
+    return 0;
+}

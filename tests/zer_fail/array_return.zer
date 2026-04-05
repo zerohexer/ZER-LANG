@@ -1,0 +1,6 @@
+// Array return type must be rejected
+u8[10] get_buf() {
+    u8[10] buf;
+    return buf;
+}
+u32 main() { return 0; }

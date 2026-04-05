@@ -1,0 +1,18 @@
+// 3D array indexing
+u32 main() {
+    u32[2][3][4] cube;
+    u32 val = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        for (u32 j = 0; j < 3; j += 1) {
+            for (u32 k = 0; k < 2; k += 1) {
+                cube[i][j][k] = val;
+                val = val + 1;
+            }
+        }
+    }
+    if (cube[0][0][0] != 0) { return 1; }
+    if (cube[0][0][1] != 1) { return 2; }
+    if (cube[1][0][0] != 6) { return 3; }
+    if (cube[3][2][1] != 23) { return 4; }
+    return 0;
+}

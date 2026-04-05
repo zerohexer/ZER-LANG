@@ -1,0 +1,16 @@
+// @bitcast between same-width signed/unsigned integers
+u32 main() {
+    u32 unsigned_val = 0xFFFFFFFF;
+    i32 signed_val = @bitcast(i32, unsigned_val);
+    if (signed_val != -1) { return 1; }
+
+    i32 neg = -1;
+    u32 as_unsigned = @bitcast(u32, neg);
+    if (as_unsigned != 0xFFFFFFFF) { return 2; }
+
+    u16 u = 0x8000;
+    i16 s = @bitcast(i16, u);
+    if (s != -32768) { return 3; }
+
+    return 0;
+}

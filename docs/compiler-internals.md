@@ -267,6 +267,18 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Pattern:** Any validation that requires compile-time constant args must check `c->in_comptime_body` — comptime function bodies contain parameter references that aren't constants until substituted at the call site.
 
+### `!` Operator Accepts Integers (BUG-426, 2026-04-05)
+
+`!integer` now returns bool (was: "'!' requires bool"). Common C idiom for `#ifndef` → `comptime if (!FLAG())`. Checker changed from `type_equals(operand, ty_bool)` to `!type_equals(operand, ty_bool) && !type_is_integer(operand)`. Result always TYPE_BOOL. Emitter unchanged (`(!expr)` works in C for both types).
+
+### @atomic_or Name Length (BUG-427, 2026-04-05)
+
+Atomic intrinsic prefix check was `nlen >= 10` but `"atomic_or"` is 9 chars. Fixed to `>= 9`. All other atomics (add=10, sub=10, and=10, xor=10, load=11, store=12, cas=10) were fine.
+
+### @atomic_cas Literal Expected Value (BUG-428, 2026-04-05)
+
+`@atomic_cas(&state, 0, 1)` emitted `&(0)` — taking address of rvalue literal. `__atomic_compare_exchange_n` needs `&expected` as lvalue. Fix: hoist expected into `__typeof__` temp inside GCC statement expression. Pattern: `({ __typeof__(*ptr) _zer_cas_exp = expected; __atomic_compare_exchange_n(ptr, &_zer_cas_exp, desired, 0, SEQ_CST, SEQ_CST); })`.
+
 ### Comptime Call in Pool/Ring Size (BUG-423, 2026-04-05)
 
 `Pool(Item, POOL_SIZE())` failed — `eval_const_expr` ran before `check_expr` resolved the comptime call. Fix: call `check_expr` before `eval_const_expr` in TYNODE_POOL and TYNODE_RING. **General rule:** any site calling `eval_const_expr` on user expressions must call `check_expr` first.

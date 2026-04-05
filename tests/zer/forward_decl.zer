@@ -1,0 +1,22 @@
+// Forward declarations + mutual recursion
+u32 is_even(u32 n);
+u32 is_odd(u32 n);
+
+u32 is_even(u32 n) {
+    if (n == 0) { return 1; }
+    return is_odd(n - 1);
+}
+
+u32 is_odd(u32 n) {
+    if (n == 0) { return 0; }
+    return is_even(n - 1);
+}
+
+u32 main() {
+    if (is_even(0) != 1) { return 1; }
+    if (is_even(4) != 1) { return 2; }
+    if (is_even(3) != 0) { return 3; }
+    if (is_odd(5) != 1) { return 4; }
+    if (is_odd(6) != 0) { return 5; }
+    return 0;
+}

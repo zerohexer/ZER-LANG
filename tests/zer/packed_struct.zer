@@ -1,0 +1,32 @@
+// Packed struct — no padding, exact sizeof
+packed struct Header {
+    u8 version;
+    u16 length;
+    u8 flags;
+}
+
+packed struct Packet {
+    u8 id;
+    u32 payload;
+    u8 checksum;
+}
+
+u32 main() {
+    Header h;
+    h.version = 1;
+    h.length = 1024;
+    h.flags = 0x80;
+    if (@truncate(u32, h.version) != 1) { return 1; }
+    if (@truncate(u32, h.length) != 1024) { return 2; }
+    if (@truncate(u32, h.flags) != 0x80) { return 3; }
+    if (@size(Header) != 4) { return 4; }
+
+    Packet p;
+    p.id = 42;
+    p.payload = 0x12345678;
+    p.checksum = 0xFF;
+    if (@truncate(u32, p.id) != 42) { return 5; }
+    if (p.payload != 0x12345678) { return 6; }
+    if (@size(Packet) != 6) { return 7; }
+    return 0;
+}

@@ -1,0 +1,6 @@
+// @bitcast width mismatch must be rejected
+u32 main() {
+    u32 x = 42;
+    u8 y = @bitcast(u8, x);
+    return 0;
+}

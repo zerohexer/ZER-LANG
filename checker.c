@@ -1408,9 +1408,12 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
 
         case TOK_BANG:
-            if (!type_equals(operand, ty_bool)) {
+            /* BUG-426: allow ! on integers (not just bool) for comptime if
+             * patterns like `comptime if (!FEATURE())`. Common C idiom.
+             * Result is always bool. */
+            if (!type_equals(operand, ty_bool) && !type_is_integer(operand)) {
                 checker_error(c, node->loc.line,
-                    "'!' requires bool, got '%s'", type_name(operand));
+                    "'!' requires bool or integer, got '%s'", type_name(operand));
             }
             result = ty_bool;
             break;
@@ -4180,7 +4183,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = type_optional(c->arena, ty_u32);
-        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
+        } else if (nlen >= 9 && memcmp(name, "atomic_", 7) == 0) {
+            /* BUG-427: was >= 10, but @atomic_or is 9 chars */
             /* @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor,
              * @atomic_load, @atomic_store, @atomic_cas */
             const char *op = name + 7;

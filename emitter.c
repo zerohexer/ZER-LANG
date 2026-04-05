@@ -2262,14 +2262,17 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[1]);
                 emit(e, ", __ATOMIC_SEQ_CST)");
             } else if (is_cas) {
-                /* __atomic_compare_exchange_n(&var, &expected, desired, false, SEQ_CST, SEQ_CST) */
-                emit(e, "__atomic_compare_exchange_n(");
+                /* BUG-428: __atomic_compare_exchange_n needs &expected as lvalue.
+                 * Hoist expected into temp to handle literal args like @atomic_cas(&x, 0, 1). */
+                emit(e, "({ __typeof__(*(");
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, ", &(");
+                emit(e, ")) _zer_cas_exp = ");
                 emit_expr(e, node->intrinsic.args[1]);
-                emit(e, "), ");
+                emit(e, "; __atomic_compare_exchange_n(");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", &_zer_cas_exp, ");
                 emit_expr(e, node->intrinsic.args[2]);
-                emit(e, ", 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)");
+                emit(e, ", 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); })");
             } else if (gcc_op) {
                 emit(e, "__atomic_fetch_%s(", gcc_op);
                 emit_expr(e, node->intrinsic.args[0]);

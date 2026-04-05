@@ -1,0 +1,7 @@
+// Float switch must be rejected
+u32 main() {
+    f32 x = 1.0;
+    switch (x) {
+        default => { return 0; }
+    }
+}

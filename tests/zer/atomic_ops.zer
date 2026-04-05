@@ -1,0 +1,44 @@
+// All @atomic operations: add, sub, or, and, xor, load, store, cas
+// BUG-427: @atomic_or was rejected (name length check >= 10, should be >= 9)
+// BUG-428: @atomic_cas literal args needed lvalue hoist for expected
+
+u32 counter;
+u32 flags;
+u32 shared;
+u32 state;
+
+u32 main() {
+    // atomic add/sub
+    counter = 0;
+    @atomic_add(&counter, 5);
+    if (counter != 5) { return 1; }
+    @atomic_sub(&counter, 2);
+    if (counter != 3) { return 2; }
+
+    // atomic or/and/xor
+    flags = 0;
+    @atomic_or(&flags, 0x0F);
+    if (flags != 0x0F) { return 3; }
+    @atomic_or(&flags, 0xF0);
+    if (flags != 0xFF) { return 4; }
+    @atomic_and(&flags, 0x0F);
+    if (flags != 0x0F) { return 5; }
+    @atomic_xor(&flags, 0xFF);
+    if (flags != 0xF0) { return 6; }
+
+    // atomic load/store
+    @atomic_store(&shared, 42);
+    u32 val = @atomic_load(&shared);
+    if (val != 42) { return 7; }
+
+    // atomic cas
+    state = 0;
+    bool ok = @atomic_cas(&state, 0, 1);
+    if (ok != true) { return 8; }
+    if (state != 1) { return 9; }
+    bool fail = @atomic_cas(&state, 0, 2);
+    if (fail != false) { return 10; }
+    if (state != 1) { return 11; }
+
+    return 0;
+}

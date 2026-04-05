@@ -533,6 +533,34 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         }
     }
 
+    /* Wrapper allocator: *opaque r = create_resource() orelse ...
+     * Any function call (with body or not) returning ?*T or ?*opaque
+     * that wasn't caught by is_alloc_call or pool.alloc patterns above. */
+    if (alloc_call && alloc_call->kind == NODE_CALL &&
+        !find_handle(ps, vname, vlen)) {
+        Type *ret_type = checker_get_type(zc->checker, alloc_call);
+        if (ret_type) {
+            Type *ret_eff = type_unwrap_distinct(ret_type);
+            /* Check for ?*T, ?*opaque, *T, *opaque return */
+            bool is_ptr_return = false;
+            if (ret_eff->kind == TYPE_POINTER || ret_eff->kind == TYPE_OPAQUE)
+                is_ptr_return = true;
+            if (ret_eff->kind == TYPE_OPTIONAL) {
+                Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
+                if (inner && (inner->kind == TYPE_POINTER || inner->kind == TYPE_OPAQUE))
+                    is_ptr_return = true;
+            }
+            if (is_ptr_return) {
+                HandleInfo *h = add_handle(ps, vname, vlen);
+                if (h) {
+                    h->state = HS_ALIVE;
+                    h->pool_id = -2;
+                    h->alloc_line = var_node->loc.line;
+                }
+            }
+        }
+    }
+
     /* Handle aliasing: Handle(T) alias = existing_handle;
      * BUG-357: also match NODE_INDEX and NODE_FIELD on init side.
      * Also: @ptrcast alias — *RealData r = @ptrcast(*RealData, handle)

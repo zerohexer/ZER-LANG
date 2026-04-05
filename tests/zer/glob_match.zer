@@ -1,0 +1,89 @@
+// Hard test 7: Simple pattern matcher (subset of glob)
+// Supports: literal chars, '?' (any single char), '*' (any sequence)
+// Exercises: nested while loops, recursive-like iteration, byte comparisons,
+//            early return from nested loops, slice operations
+
+bool match_at(const [*]u8 pattern, u32 pi, const [*]u8 text, u32 ti) {
+    u32 plen = @truncate(u32, pattern.len);
+    u32 tlen = @truncate(u32, text.len);
+
+    while (true) {
+        if (pi >= plen) {
+            // Pattern exhausted — match only if text also exhausted
+            if (ti >= tlen) { return true; }
+            return false;
+        }
+
+        u8 pc = pattern[pi];
+
+        if (pc == 42) {
+            // '*' — try matching rest of pattern at every position
+            pi = pi + 1;
+
+            // Optimization: trailing '*' always matches
+            if (pi >= plen) { return true; }
+
+            // Try each remaining text position
+            u32 try_pos = ti;
+            while (try_pos <= tlen) {
+                if (match_at(pattern, pi, text, try_pos)) { return true; }
+                try_pos = try_pos + 1;
+            }
+            return false;
+        }
+
+        if (ti >= tlen) { return false; }  // text exhausted but pattern continues
+
+        u8 tc = text[ti];
+
+        if (pc == 63) {
+            // '?' — match any single character
+            pi = pi + 1;
+            ti = ti + 1;
+            continue;
+        }
+
+        // Literal match
+        if (pc != tc) { return false; }
+        pi = pi + 1;
+        ti = ti + 1;
+    }
+}
+
+bool glob_match(const [*]u8 pattern, const [*]u8 text) {
+    return match_at(pattern, 0, text, 0);
+}
+
+u32 main() {
+    // Exact match
+    if (!glob_match("hello", "hello")) { return 1; }
+    if (glob_match("hello", "world")) { return 2; }
+
+    // '?' matches single char
+    if (!glob_match("h?llo", "hello")) { return 3; }
+    if (!glob_match("h?llo", "hallo")) { return 4; }
+    if (glob_match("h?llo", "hllo")) { return 5; }  // ? needs exactly 1 char
+
+    // '*' matches any sequence
+    if (!glob_match("*", "anything")) { return 6; }
+    if (!glob_match("h*", "hello")) { return 7; }
+    if (!glob_match("*lo", "hello")) { return 8; }
+    if (!glob_match("h*lo", "hello")) { return 9; }
+    if (!glob_match("h*l*o", "hello")) { return 10; }
+
+    // Mixed
+    if (!glob_match("?e*o", "hello")) { return 11; }
+    if (glob_match("?e*o", "hellx")) { return 12; }
+
+    // Empty
+    if (!glob_match("", "")) { return 13; }
+    if (glob_match("", "x")) { return 14; }
+    if (!glob_match("*", "")) { return 15; }
+
+    // Complex
+    if (!glob_match("*.zer", "main.zer")) { return 16; }
+    if (!glob_match("test_*", "test_emit")) { return 17; }
+    if (glob_match("*.zer", "main.c")) { return 18; }
+
+    return 0;
+}

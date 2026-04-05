@@ -283,6 +283,22 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Lesson:** Always check GCC warnings for `implicit declaration of function 'popen'`. On 64-bit, implicit `int` return = truncated pointer = guaranteed crash. This is a classic C99 portability bug.
 
+### Else-If Chain #line Directive (BUG-418, 2026-04-05)
+
+`if (a) { } else if (b) { }` emitted `else #line N "file"` on the same line — GCC error "stray '#' in program." Root cause: `emit_stmt` emits `#line` before each non-block statement. When else_body is NODE_IF, the `#line` follows `else ` without a newline.
+
+**Fix:** Both regular-if and if-unwrap else paths: when `else_body->kind == NODE_IF && e->source_file`, emit `"else\n"` instead of `"else "`. Same class of bug as BUG-396 (orelse defer #line).
+
+**Pattern:** Any site that emits text followed by `emit_stmt()` on the same line risks `#line` collision when source mapping is active. The text before `emit_stmt` must end with `\n` if the child statement might emit `#line`.
+
+### Array→Slice Coercion Missing in Assignment (BUG-419, 2026-04-05)
+
+`[*]u8 s; s = arr;` emitted `s = arr` — GCC error "incompatible types" because `arr` decays to `uint8_t*` but `s` is `_zer_slice_u8`. Array→slice coercion (`emit_array_as_slice`) was implemented for var-decl init (line 2603), call args (line 1419), and return (line 2920) — but NOT for NODE_ASSIGN.
+
+**Fix:** In NODE_ASSIGN emission, after the optional-wrap and null-assign paths, check if `target is TYPE_SLICE && value is TYPE_ARRAY`. If so, call `emit_array_as_slice()`.
+
+**Pattern:** Any new coercion path must be checked in ALL FOUR value-flow sites: (1) var-decl init, (2) assignment, (3) call args, (4) return. Missing any one creates a silent GCC error on valid ZER code.
+
 ### Volatile Struct Array Fields (BUG-414, 2026-04-05)
 
 `struct Hw { volatile u8[4] regs; }` — array assignment `dev.regs = src` used `memmove` which strips volatile (GCC warning, optimizer can eliminate write). Root cause: `expr_is_volatile()` only checked root symbol `is_volatile`, not struct field qualifiers.

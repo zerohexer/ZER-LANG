@@ -1034,6 +1034,11 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "){ 0 }");
             else
                 emit(e, "){ 0, 0 }");
+        } else if (node->assign.op == TOK_EQ && tgt_eff && val_type &&
+                   tgt_eff->kind == TYPE_SLICE &&
+                   type_unwrap_distinct(val_type)->kind == TYPE_ARRAY) {
+            /* BUG-419: array→slice coercion in assignment (same as var-decl) */
+            emit_array_as_slice(e, node->assign.value, val_type, tgt_type);
         } else {
             emit_expr(e, node->assign.value);
         }
@@ -2777,7 +2782,12 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit(e, "}\n");
             if (node->if_stmt.else_body) {
                 emit_indent(e);
-                emit(e, "else ");
+                /* BUG-418: same fix for if-unwrap else path */
+                if (node->if_stmt.else_body->kind == NODE_IF && e->source_file) {
+                    emit(e, "else\n");
+                } else {
+                    emit(e, "else ");
+                }
                 emit_stmt(e, node->if_stmt.else_body);
             }
             e->indent--;
@@ -2799,7 +2809,14 @@ static void emit_stmt(Emitter *e, Node *node) {
             emit_stmt(e, node->if_stmt.then_body);
             if (node->if_stmt.else_body) {
                 emit_indent(e);
-                emit(e, "else ");
+                /* BUG-418: else-if chain — emit_stmt emits #line which must
+                 * start at beginning of a line. Without newline after "else",
+                 * GCC gets "stray '#' in program" error. */
+                if (node->if_stmt.else_body->kind == NODE_IF && e->source_file) {
+                    emit(e, "else\n");
+                } else {
+                    emit(e, "else ");
+                }
                 emit_stmt(e, node->if_stmt.else_body);
             }
         }

@@ -5,6 +5,22 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-05 — Bugs Found by Writing Real ZER Code (BUG-418/419)
+
+### BUG-418: `else if` chain emits `#line` after `else` — GCC "stray #" error
+- **Symptom:** `if (x < 10) { ... } else if (x < 20) { ... }` causes GCC error "stray '#' in program" when source mapping (`--run` or `zerc file.zer`) is enabled.
+- **Root cause:** `emit_stmt` emits `#line N "file"` at the start of each statement. When else_body is NODE_IF, the output becomes `else #line 38 ...` on the same line — GCC requires `#line` at the start of a line.
+- **Fix:** When else_body is NODE_IF and source_file is set, emit `"else\n"` instead of `"else "` so the `#line` directive starts on its own line. Both regular-if and if-unwrap else paths fixed.
+- **Test:** `tests/zer/else_if_chain.zer`
+
+### BUG-419: Array→slice coercion missing in assignment
+- **Symptom:** `[*]u8 s; s = array;` and `buf.data = array;` cause GCC error "incompatible types when assigning to type '_zer_slice_u8' from type 'uint8_t*'".
+- **Root cause:** Array→slice coercion was handled in var-decl init, call args, and return, but NOT in NODE_ASSIGN. The emitter's assignment handler fell through to plain `emit_expr()` which emits the raw array identifier (decays to pointer in C).
+- **Fix:** In NODE_ASSIGN emission, when target is TYPE_SLICE and value is TYPE_ARRAY, call `emit_array_as_slice()` — same function used by var-decl init path.
+- **Test:** `tests/zer/array_slice_assign.zer`
+
+---
+
 ## Session 2026-04-05 — Late Fixes (BUG-414 through BUG-416)
 
 ### BUG-414: Volatile struct array field uses memmove (strips volatile)

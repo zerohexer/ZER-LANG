@@ -6145,6 +6145,8 @@ static void register_decl(Checker *c, Node *node) {
                 sf->name = fd->name;
                 sf->name_len = (uint32_t)fd->name_len;
                 sf->type = resolve_type(c, fd->type);
+                /* BUG-414: detect volatile qualifier on field TypeNode */
+                sf->is_volatile = (fd->type && fd->type->kind == TYNODE_VOLATILE);
                 /* BUG-224: reject void fields */
                 if (sf->type && sf->type->kind == TYPE_VOID) {
                     checker_error(c, node->loc.line,

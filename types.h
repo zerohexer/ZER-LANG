@@ -57,6 +57,7 @@ typedef struct {
     uint32_t name_len;
     Type *type;
     bool is_keep;
+    bool is_volatile;   /* BUG-414: volatile struct field (for array fields that lack Type-level flag) */
 } SField;
 
 /* ---- Enum variant (semantic) ---- */

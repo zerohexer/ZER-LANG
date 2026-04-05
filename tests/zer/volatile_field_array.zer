@@ -1,0 +1,32 @@
+// Volatile struct array field — must use byte loop, not memmove
+// BUG-414: expr_is_volatile didn't check SField.is_volatile
+
+struct Hw {
+    volatile u8[4] regs;
+    u32 id;
+}
+
+Hw dev;
+
+u32 main() {
+    dev.id = 42;
+
+    // Write to volatile array field — must use byte loop
+    u8[4] src;
+    src[0] = 0xAA;
+    src[1] = 0xBB;
+    src[2] = 0xCC;
+    src[3] = 0xDD;
+    dev.regs = src;
+
+    // Verify writes persisted
+    if (dev.regs[0] != 0xAA) { return 1; }
+    if (dev.regs[1] != 0xBB) { return 2; }
+    if (dev.regs[2] != 0xCC) { return 3; }
+    if (dev.regs[3] != 0xDD) { return 4; }
+
+    // Non-volatile field unaffected
+    if (dev.id != 42) { return 5; }
+
+    return 0;
+}

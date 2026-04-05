@@ -106,11 +106,33 @@ static Symbol *expr_root_symbol(Emitter *e, Node *expr) {
 /* Check if an expression's root symbol has volatile qualifier. */
 static bool expr_is_volatile(Emitter *e, Node *expr) {
     Symbol *s = expr_root_symbol(e, expr);
-    return s && s->is_volatile;
-    /* NOTE: volatile struct ARRAY fields (struct Hw { volatile u8[4] regs; })
-     * are NOT detected here — TYPE_ARRAY has no is_volatile flag (BUG-185).
-     * The volatile is on the TYNODE_VOLATILE wrapper, not in the Type system.
-     * This is a known limitation requiring a design change to TYPE_ARRAY. */
+    if (s && s->is_volatile) return true;
+    /* BUG-414: check volatile struct fields. Walk field chain, look up
+     * SField.is_volatile for each field access. Handles: dev.regs where
+     * dev is non-volatile but regs field is volatile u8[4]. */
+    Node *n = expr;
+    while (n && n->kind == NODE_FIELD) {
+        Type *obj_type = checker_get_type(e->checker, n->field.object);
+        if (obj_type) {
+            Type *eff = type_unwrap_distinct(obj_type);
+            if (eff->kind == TYPE_STRUCT) {
+                for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
+                    if (eff->struct_type.fields[i].name_len == (uint32_t)n->field.field_name_len &&
+                        memcmp(eff->struct_type.fields[i].name, n->field.field_name,
+                               n->field.field_name_len) == 0) {
+                        if (eff->struct_type.fields[i].is_volatile) return true;
+                        /* also check type-level volatile (slice/pointer) */
+                        Type *ft = eff->struct_type.fields[i].type;
+                        if (ft && ft->kind == TYPE_SLICE && ft->slice.is_volatile) return true;
+                        if (ft && ft->kind == TYPE_POINTER && ft->pointer.is_volatile) return true;
+                        break;
+                    }
+                }
+            }
+        }
+        n = n->field.object;
+    }
+    return false;
 }
 
 /* ---- Type emission ---- */

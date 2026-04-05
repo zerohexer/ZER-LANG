@@ -1,0 +1,102 @@
+// Hard test 4: Circular buffer with struct elements + pointer passing
+// Exercises: array of structs, modulo indexing, pointer params mutating structs,
+//            nested struct field access through pointers, for loop + break
+
+struct LogEntry {
+    u32 timestamp;
+    u32 level;
+    u8[32] message;
+    u32 msg_len;
+}
+
+struct Logger {
+    LogEntry[16] entries;
+    u32 head;
+    u32 count;
+}
+
+void logger_init(*Logger log) {
+    log.head = 0;
+    log.count = 0;
+}
+
+void logger_write(*Logger log, u32 ts, u32 level, const [*]u8 msg) {
+    u32 idx = (log.head + log.count) % 16;
+    if (idx >= 16) { return; }
+    if (log.count >= 16) {
+        // Overwrite oldest
+        log.head = (log.head + 1) % 16;
+    } else {
+        log.count = log.count + 1;
+    }
+    log.entries[idx].timestamp = ts;
+    log.entries[idx].level = level;
+    log.entries[idx].msg_len = 0;
+    // Copy message bytes
+    for (usize i = 0; i < msg.len; i += 1) {
+        if (i >= 31) { break; }
+        u32 idx32 = @truncate(u32, i);
+        log.entries[idx].message[idx32] = msg[i];
+        log.entries[idx].msg_len = idx32 + 1;
+    }
+}
+
+?u32 logger_find_by_level(*Logger log, u32 level) {
+    for (u32 i = 0; i < log.count; i += 1) {
+        u32 idx = (log.head + i) % 16;
+        if (idx >= 16) { continue; }
+        if (log.entries[idx].level == level) {
+            return log.entries[idx].timestamp;
+        }
+    }
+    return null;
+}
+
+u32 logger_count_level(*Logger log, u32 level) {
+    u32 count = 0;
+    for (u32 i = 0; i < log.count; i += 1) {
+        u32 idx = (log.head + i) % 16;
+        if (idx >= 16) { continue; }
+        if (log.entries[idx].level == level) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+u32 main() {
+    Logger log;
+    logger_init(&log);
+
+    logger_write(&log, 100, 1, "boot");
+    logger_write(&log, 200, 2, "warning: low mem");
+    logger_write(&log, 300, 1, "connected");
+    logger_write(&log, 400, 3, "error: timeout");
+    logger_write(&log, 500, 1, "reconnected");
+
+    if (log.count != 5) { return 1; }
+
+    // Find first error (level 3)
+    u32 err_ts = logger_find_by_level(&log, 3) orelse { return 2; };
+    if (err_ts != 400) { return 3; }
+
+    // Count info messages (level 1)
+    u32 info_count = logger_count_level(&log, 1);
+    if (info_count != 3) { return 4; }
+
+    // Count warnings (level 2)
+    u32 warn_count = logger_count_level(&log, 2);
+    if (warn_count != 1) { return 5; }
+
+    // Verify message length
+    if (log.entries[0].msg_len != 4) { return 6; }  // "boot" = 4
+
+    // Verify first byte of first message
+    if (log.entries[0].message[0] != 98) { return 7; }  // 'b'
+
+    // No level 4 messages
+    ?u32 none = logger_find_by_level(&log, 4);
+    if (none) |v| { return 8; }
+
+    return 0;
+}

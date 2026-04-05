@@ -1,0 +1,85 @@
+// Hard test 8: Deeply nested struct access + Slab + Handle auto-deref chains
+// Exercises: struct containing struct, Handle to struct with Handle field,
+//            multiple levels of auto-deref, optional chains
+
+struct Vec2 { i32 x; i32 y; }
+
+struct Transform {
+    Vec2 position;
+    Vec2 scale;
+    i32 rotation;
+}
+
+struct Sprite {
+    Transform transform;
+    u32 texture_id;
+    bool visible;
+}
+
+Slab(Sprite) sprites;
+
+?Handle(Sprite) create_sprite(i32 x, i32 y, u32 tex) {
+    Handle(Sprite) h = sprites.alloc() orelse { return null; };
+    h.transform.position.x = x;
+    h.transform.position.y = y;
+    h.transform.scale.x = 1;
+    h.transform.scale.y = 1;
+    h.transform.rotation = 0;
+    h.texture_id = tex;
+    h.visible = true;
+    return h;
+}
+
+void move_sprite(Handle(Sprite) h, i32 dx, i32 dy) {
+    h.transform.position.x = h.transform.position.x + dx;
+    h.transform.position.y = h.transform.position.y + dy;
+}
+
+void scale_sprite(Handle(Sprite) h, i32 sx, i32 sy) {
+    h.transform.scale.x = sx;
+    h.transform.scale.y = sy;
+}
+
+i32 sprite_area(Handle(Sprite) h) {
+    i32 w = h.transform.scale.x;
+    i32 h_val = h.transform.scale.y;
+    if (w < 0) { w = 0 - w; }
+    if (h_val < 0) { h_val = 0 - h_val; }
+    return w * h_val;
+}
+
+u32 main() {
+    Handle(Sprite) player = create_sprite(100, 200, 1) orelse { return 1; };
+    Handle(Sprite) enemy = create_sprite(300, 400, 2) orelse { return 2; };
+
+    // Verify initial positions via deep nested access
+    if (player.transform.position.x != 100) { return 3; }
+    if (player.transform.position.y != 200) { return 4; }
+    if (enemy.transform.position.x != 300) { return 5; }
+
+    // Move player
+    move_sprite(player, 10, -20);
+    if (player.transform.position.x != 110) { return 6; }
+    if (player.transform.position.y != 180) { return 7; }
+
+    // Scale enemy
+    scale_sprite(enemy, 3, 4);
+    i32 area = sprite_area(enemy);
+    if (area != 12) { return 8; }
+
+    // Verify texture IDs
+    if (player.texture_id != 1) { return 9; }
+    if (enemy.texture_id != 2) { return 10; }
+
+    // Toggle visibility
+    player.visible = false;
+    if (player.visible) { return 11; }
+    enemy.visible = true;
+    if (!enemy.visible) { return 12; }
+
+    // Cleanup
+    sprites.free(player);
+    sprites.free(enemy);
+
+    return 0;
+}

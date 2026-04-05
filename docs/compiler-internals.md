@@ -283,6 +283,18 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Lesson:** Always check GCC warnings for `implicit declaration of function 'popen'`. On 64-bit, implicit `int` return = truncated pointer = guaranteed crash. This is a classic C99 portability bug.
 
+### Scalar Field Extract False Local-Derived (BUG-421, 2026-04-05)
+
+`Token tok = get_tok(&state); u32 val = tok.val; return val;` falsely rejected as "cannot return pointer to local." Root cause: BUG-360/383 marks struct results of calls with `&local` args as `is_local_derived`. Alias propagation at var-decl walks field chain to root and propagates unconditionally — `u32 val = tok.val` inherits from `tok` even though `u32` can't carry a pointer.
+
+**Fix:** In alias propagation (~line 4742), only propagate `is_local_derived`/`is_arena_derived` when target type can carry a pointer: TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, TYPE_UNION, TYPE_OPAQUE. Scalar types (integers, floats, bools, enums, handles) skip propagation.
+
+### Auto-Guard emit_zero_value for Struct/Union Return (BUG-422, 2026-04-05)
+
+Auto-guard `if (idx >= size) { return 0; }` in a function returning struct/union emitted bare `return 0` — GCC error "incompatible types." `emit_zero_value` only handled void, optional, pointer, and scalar cases.
+
+**Fix:** Added TYPE_STRUCT and TYPE_UNION case: `emit(e, "("); emit_type(e, t); emit(e, "){0}");` — compound literal with zero initializer.
+
 ### Funcptr Typedef Optional Return Type (BUG-420, 2026-04-05)
 
 `typedef ?u32 (*Handler)(u32)` created `?(u32 (*)(u32))` (nullable funcptr) instead of `(?u32) (*)(u32)` (funcptr returning `?u32`). All 6 funcptr declaration sites had the same `is_opt_fp` unwrap-and-rewrap pattern.

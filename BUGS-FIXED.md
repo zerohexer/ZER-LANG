@@ -13,6 +13,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** In the alias propagation (checker.c ~line 4742), only propagate `is_local_derived`/`is_arena_derived` when the target type can actually carry a pointer (TYPE_POINTER, TYPE_SLICE, TYPE_STRUCT, TYPE_UNION, TYPE_OPAQUE). Scalar types (integers, floats, bools, enums, handles) skip propagation.
 - **Test:** `tests/zer/scalar_from_struct_call.zer`, `tests/zer/tokenizer.zer`
 
+### BUG-422: Auto-guard `return 0` for struct/union return type — GCC "incompatible types"
+- **Symptom:** Function returning union/struct with auto-guarded array access emits `return 0;` which GCC rejects.
+- **Root cause:** `emit_zero_value()` only handled void, optional, pointer, and scalar. TYPE_STRUCT and TYPE_UNION fell through to bare `0`.
+- **Fix:** Added struct/union case: emit `(StructType){0}` compound literal.
+- **Test:** `tests/zer/tagged_values.zer`
+
 ---
 
 ## Session 2026-04-05 — Bugs Found by Writing Real ZER Code (BUG-418/419/420)

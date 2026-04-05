@@ -1,0 +1,136 @@
+// Hard test 5: Tagged value system (like JSON values)
+// Exercises: union with multiple variant types, switch + mutable capture,
+//            nested struct in union, recursive-like patterns with handles
+
+struct JString { u8[32] chars; u32 len; }
+struct JArray { u32[8] items; u32 count; }
+
+union JValue {
+    u32 number;
+    JString string;
+    JArray array;
+    bool boolean;
+}
+
+// Create different value types
+JValue make_number(u32 n) {
+    JValue v;
+    v.number = n;
+    return v;
+}
+
+JValue make_bool(bool b) {
+    JValue v;
+    v.boolean = b;
+    return v;
+}
+
+JValue make_string(const [*]u8 s) {
+    JString str;
+    str.len = 0;
+    for (usize i = 0; i < s.len; i += 1) {
+        if (str.len >= 31) { break; }
+        u32 idx = str.len;
+        str.chars[idx] = s[i];
+        str.len = str.len + 1;
+    }
+    JValue v;
+    v.string = str;
+    return v;
+}
+
+JValue make_array() {
+    JValue v;
+    v.array.count = 0;
+    return v;
+}
+
+// Type-safe operations using switch
+?u32 as_number(JValue v) {
+    switch (v) {
+        .number => |n| { return n; }
+        default => { return null; }
+    }
+}
+
+?u32 string_len(JValue v) {
+    switch (v) {
+        .string => |s| { return s.len; }
+        default => { return null; }
+    }
+}
+
+// Compare two values
+bool value_equal(JValue a, JValue b) {
+    // Simple: just compare numbers
+    ?u32 an = as_number(a);
+    ?u32 bn = as_number(b);
+    if (an) |av| {
+        if (bn) |bv| {
+            if (av == bv) { return true; }
+        }
+    }
+    return false;
+}
+
+// Accumulate array of numbers
+u32 sum_array(JArray arr) {
+    u32 total = 0;
+    for (u32 i = 0; i < arr.count; i += 1) {
+        if (i >= 8) { break; }
+        total = total + arr.items[i];
+    }
+    return total;
+}
+
+u32 main() {
+    // Test number
+    JValue n = make_number(42);
+    u32 nv = as_number(n) orelse { return 1; };
+    if (nv != 42) { return 2; }
+
+    // Test string
+    JValue s = make_string("hello");
+    u32 sl = string_len(s) orelse { return 3; };
+    if (sl != 5) { return 4; }
+
+    // Test bool
+    JValue b = make_bool(true);
+    ?u32 bn = as_number(b);
+    // bool variant, as_number should return null (wrong variant)
+    // NOTE: this depends on union tag tracking
+
+    // Test value equality
+    JValue n1 = make_number(10);
+    JValue n2 = make_number(10);
+    JValue n3 = make_number(20);
+    if (!value_equal(n1, n2)) { return 5; }
+    if (value_equal(n1, n3)) { return 6; }
+
+    // Test array
+    JValue a = make_array();
+    // Build array manually
+    JArray arr;
+    arr.count = 4;
+    arr.items[0] = 10;
+    arr.items[1] = 20;
+    arr.items[2] = 30;
+    arr.items[3] = 40;
+
+    u32 total = sum_array(arr);
+    if (total != 100) { return 7; }
+
+    // Test mutable switch capture
+    JValue mv = make_number(5);
+    switch (mv) {
+        .number => |*nptr| {
+            *nptr = 99;
+        }
+        default => { return 8; }
+    }
+    // Verify mutation
+    u32 changed = as_number(mv) orelse { return 9; };
+    if (changed != 99) { return 10; }
+
+    return 0;
+}

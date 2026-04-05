@@ -159,6 +159,11 @@ static void emit_zero_value(Emitter *e, Type *t) {
     } else if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR ||
                (inner->kind == TYPE_OPTIONAL && is_null_sentinel(inner->optional.inner))) {
         emit(e, "NULL");
+    } else if (inner->kind == TYPE_STRUCT || inner->kind == TYPE_UNION) {
+        /* BUG-422: struct/union return needs compound literal, not bare 0 */
+        emit(e, "(");
+        emit_type(e, t);
+        emit(e, "){0}");
     } else {
         emit(e, "0");
     }

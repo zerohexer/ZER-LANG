@@ -1,0 +1,24 @@
+// *opaque @ptrcast round-trip with --track-cptrs (Level 3+)
+// BUG-431: _zer_check_alive used (void*)ctx instead of ctx.ptr
+// when ctx is _zer_opaque struct
+
+struct Sensor { u32 reading; u32 id; }
+Slab(Sensor) sensors;
+
+u32 main() {
+    ?*Sensor ms = sensors.alloc_ptr();
+    *Sensor s = ms orelse { return 1; };
+    s.reading = 42;
+    s.id = 7;
+
+    // Cast to *opaque (wraps with type_id)
+    *opaque ctx = @ptrcast(*opaque, s);
+
+    // Cast back to *Sensor (checks type_id, unwraps .ptr)
+    *Sensor back = @ptrcast(*Sensor, ctx);
+    if (back.reading != 42) { return 2; }
+    if (back.id != 7) { return 3; }
+
+    sensors.free_ptr(s);
+    return 0;
+}

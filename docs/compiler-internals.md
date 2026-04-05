@@ -271,6 +271,10 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 `!integer` now returns bool (was: "'!' requires bool"). Common C idiom for `#ifndef` → `comptime if (!FLAG())`. Checker changed from `type_equals(operand, ty_bool)` to `!type_equals(operand, ty_bool) && !type_is_integer(operand)`. Result always TYPE_BOOL. Emitter unchanged (`(!expr)` works in C for both types).
 
+### @ptrcast _zer_check_alive .ptr (BUG-431, 2026-04-05)
+
+With `--track-cptrs`, `_zer_check_alive((void*)ctx, ...)` tried to cast `_zer_opaque` struct to `void*`. Fix: use `ctx.ptr` instead. **Pattern:** When `track_cptrs` is active, `*opaque` is `_zer_opaque` struct — any site emitting a `(void*)` cast on an opaque variable must use `.ptr` to extract the raw pointer.
+
 ### Const Ident in Comptime Call Args (BUG-430, 2026-04-05)
 
 `const u32 perms = FLAG_READ() | FLAG_WRITE(); HAS_FLAG(perms, ...)` failed — `eval_const_expr` can't resolve `NODE_IDENT` (no scope access). Fix: `eval_const_expr_scoped(Checker *c, Node *n)` wrapper that tries `eval_const_expr` first, falls back to const symbol lookup. Reads init value from `sym->func_node->var_decl.init` and recursively evaluates. Depth-limited to 32. Also: `sym->func_node = node` now set for local var-decls (was only globals/functions).

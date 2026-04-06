@@ -48,6 +48,31 @@ for f in tests/zer_fail/*.zer; do
 done
 
 echo ""
+echo "=== ZER Warning Verification (must compile + warn + exit 0) ==="
+
+# Verify auto-guard warnings are emitted for dynamic array UAF
+warn_check() {
+    local f="$1" pattern="$2" name="$3"
+    TOTAL=$((TOTAL + 1))
+    output=$($ZERC "$f" --run 2>&1)
+    ret=$?
+    if [ $ret -eq 0 ] && echo "$output" | grep -q "$pattern"; then
+        PASS=$((PASS + 1))
+        echo "  PASS: $name (warning verified)"
+    elif [ $ret -ne 0 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (exit $ret, expected 0)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (no warning matching '$pattern')"
+    fi
+    rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
+}
+
+warn_check tests/zer/dyn_array_autoguard_crash.zer "auto-guard inserted" "autoguard-warning-emitted"
+warn_check tests/zer/dyn_array_guard.zer "auto-guard inserted" "dynguard-warning-emitted"
+
+echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"

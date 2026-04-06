@@ -7499,6 +7499,27 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
                 return true;
             }
         }
+        /* try parameter ident: return param — check if preceding guard
+         * constrains it. Pattern: if (param >= N) { return C; } return param;
+         * The guard ensures param < N at this return point.
+         * Use VarRange if available (set by check_stmt during body checking). */
+        if (node->ret.expr->kind == NODE_IDENT) {
+            struct VarRange *r = find_var_range(c,
+                node->ret.expr->ident.name,
+                (uint32_t)node->ret.expr->ident.name_len);
+            if (r && r->min_val >= 0 && r->max_val >= 0) {
+                int64_t rmin = r->min_val, rmax = r->max_val;
+                if (!*found) {
+                    *out_min = rmin;
+                    *out_max = rmax;
+                    *found = true;
+                } else {
+                    if (rmin < *out_min) *out_min = rmin;
+                    if (rmax > *out_max) *out_max = rmax;
+                }
+                return true;
+            }
+        }
         return false; /* return without derivable range — give up */
     }
     if (node->kind == NODE_BLOCK) {

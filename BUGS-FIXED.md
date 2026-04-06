@@ -2829,3 +2829,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
   4. **NODE_SWITCH/FOR/WHILE/CRITICAL:** `find_return_range` recurses into switch arms, loop bodies, @critical blocks.
 - **Effect:** Hash map patterns `table[hash(key)]` now zero overhead — no bounds check, no auto-guard, proven at compile time through call chain.
 - **Tests:** `inline_call_range.zer` (basic), `inline_range_deep.zer` (3-layer deep, 7 accesses, all proven).
+
+### Guard-clamped return range: if (idx >= N) { return C; } return idx;
+- **What:** `find_return_range` now handles `return ident` when the ident has a known VarRange from a preceding guard. Pattern: `if (idx >= 8) { return 0; } return idx;` — the guard narrows `idx` to `[0, 7]`, this range is used for the return expression.
+- **Mechanism:** After derive_expr_range, constant, and chained-call checks all fail, try `find_var_range()` on the return ident. If a range is found (set by the guard narrowing in check_stmt), use it.
+- **Limitation:** VarRange is only available because `find_return_range` runs immediately after `check_stmt(body)` — the ranges haven't been cleaned up yet. This is intentional coupling.
+- **Note:** Auto-guard for NODE_CALL indices was attempted but reverted — it double-evaluates side-effect expressions (function called twice: once in guard, once in access). Inline `_zer_bounds_check` with statement expression is the correct mechanism for call indices (single-eval).
+- **Tests:** `guard_clamp_range.zer` — clamp/safe_get patterns, both variable and inline call, all proven zero overhead.

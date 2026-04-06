@@ -783,6 +783,16 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
 5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
 
+### C-Style Cast Syntax: (Type)expr (2026-04-07)
+
+`NODE_TYPECAST` — parser detects `(TypeKeyword)expr` and `(*Type)expr`. Only keyword types are unambiguous (`u32`, `f32`, `*`, `?`, `const`, `volatile`). `(ident)expr` stays as parenthesized expression (ident could be a variable).
+
+**Checker:** validates source→target conversion. Allows: int↔int, int↔float, float↔float, ptr↔ptr, ptr↔opaque, int→ptr, ptr→int, distinct typedef. Rejects: struct→int, invalid combinations.
+
+**Emitter:** primitives emit as C cast `((uint16_t)(expr))`. `*opaque` round-trips use `_zer_opaque` wrap/unwrap with type_id check (same as `@ptrcast`).
+
+**`@truncate`/`@ptrcast`/`@inttoptr` still work** — `(Type)expr` is sugar. `@saturate` and `@bitcast` remain the only REQUIRED explicit intrinsics.
+
 ### Block Defer Multi-Free Tracking (BUG-443, 2026-04-06)
 
 `defer_scans_free` returned on FIRST match — `defer { free(a); free(b); }` only tracked `a`. Replaced with `defer_scan_all_frees` which walks ALL statements in defer blocks recursively, marking each found handle as FREED. Split into `defer_stmt_is_free` (single check) + `defer_scan_all_frees` (recursive walker with direct PathState mutation).

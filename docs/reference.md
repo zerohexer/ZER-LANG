@@ -1525,6 +1525,34 @@ const [*]u8 name = "hello";
 
 ---
 
+### (Type)expr — C-Style Cast
+
+**DESCRIPTION**
+Explicit type conversion using C-style syntax. Narrowing truncates by default.
+
+**SYNTAX**
+```zer
+(TargetType)expression
+```
+
+**EXAMPLE**
+```zer
+u8 small = 42;
+u32 big = (u32)small;          // widening
+u16 trunc = (u16)big;          // narrowing (truncate)
+f32 ratio = (f32)big;          // int → float value convert
+(*Motor)opaque_ctx             // pointer cast (provenance checked)
+(*opaque)sensor_ptr            // type erase
+```
+
+**NOTES**
+- Widening: always safe, no data loss.
+- Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
+- `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
+- `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+
+---
+
 ### @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor
 
 **DESCRIPTION**

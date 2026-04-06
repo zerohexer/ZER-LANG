@@ -4038,6 +4038,47 @@ static Type *check_expr(Checker *c, Node *node) {
         break;
     }
 
+    /* ---- C-style typecast: (Type)expr ---- */
+    case NODE_TYPECAST: {
+        Type *target = resolve_type(c, node->typecast.target_type);
+        Type *source = check_expr(c, node->typecast.expr);
+        Type *tgt_eff = type_unwrap_distinct(target);
+        Type *src_eff = type_unwrap_distinct(source);
+
+        /* Validate the cast is sensible */
+        bool valid = false;
+
+        /* integer ↔ integer: widening (silent) or narrowing (truncate) */
+        if (type_is_integer(target) && type_is_integer(source)) valid = true;
+        /* integer ↔ float: value conversion */
+        if (type_is_integer(target) && type_is_float(source)) valid = true;
+        if (type_is_float(target) && type_is_integer(source)) valid = true;
+        /* float ↔ float: f32 ↔ f64 */
+        if (type_is_float(target) && type_is_float(source)) valid = true;
+        /* bool ↔ integer */
+        if ((tgt_eff->kind == TYPE_BOOL && type_is_integer(source)) ||
+            (type_is_integer(target) && src_eff->kind == TYPE_BOOL)) valid = true;
+        /* pointer ↔ pointer: (*Motor)ctx, (*opaque)sensor */
+        if (tgt_eff->kind == TYPE_POINTER && src_eff->kind == TYPE_POINTER) valid = true;
+        if (tgt_eff->kind == TYPE_POINTER && src_eff->kind == TYPE_OPAQUE) valid = true;
+        if (tgt_eff->kind == TYPE_OPAQUE && src_eff->kind == TYPE_POINTER) valid = true;
+        /* integer → pointer: (*u32)0x40020000 (MMIO) */
+        if (tgt_eff->kind == TYPE_POINTER && type_is_integer(source)) valid = true;
+        /* pointer → integer: (usize)ptr */
+        if (type_is_integer(target) && src_eff->kind == TYPE_POINTER) valid = true;
+        if (tgt_eff->kind == TYPE_USIZE && src_eff->kind == TYPE_POINTER) valid = true;
+        /* distinct typedef: (Celsius)raw_u32, (u32)celsius */
+        if (target->kind == TYPE_DISTINCT || source->kind == TYPE_DISTINCT) valid = true;
+
+        if (!valid) {
+            checker_error(c, node->loc.line,
+                "invalid cast from '%s' to '%s'", type_name(source), type_name(target));
+        }
+
+        result = target;
+        break;
+    }
+
     /* ---- Intrinsic ---- */
     case NODE_INTRINSIC: {
         const char *name = node->intrinsic.name;

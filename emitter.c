@@ -255,6 +255,9 @@ static void emit_auto_guards(Emitter *e, Node *node) {
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             emit_auto_guards(e, node->intrinsic.args[i]);
         break;
+    case NODE_TYPECAST:
+        emit_auto_guards(e, node->typecast.expr);
+        break;
     case NODE_SLICE:
         emit_auto_guards(e, node->slice.object);
         emit_auto_guards(e, node->slice.start);
@@ -2046,6 +2049,70 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "0");
             }
             emit(e, "; })");
+        }
+        break;
+    }
+
+    case NODE_TYPECAST: {
+        /* (Type)expr — emit as C cast for primitives.
+         * For *opaque round-trips, emit the _zer_opaque unwrap/wrap. */
+        Type *tgt = checker_get_type(e->checker, node);
+        Type *src = checker_get_type(e->checker, node->typecast.expr);
+        Type *tgt_eff = tgt ? type_unwrap_distinct(tgt) : NULL;
+        Type *src_eff = src ? type_unwrap_distinct(src) : NULL;
+
+        /* pointer ↔ *opaque: use _zer_opaque wrap/unwrap (same as @ptrcast) */
+        if (tgt_eff && src_eff &&
+            tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
+            type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
+            src_eff->kind == TYPE_POINTER) {
+            /* casting TO *opaque — wrap with type_id */
+            uint32_t tid = 0;
+            if (src_eff->pointer.inner) {
+                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
+                if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
+                else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
+                else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+            }
+            emit(e, "(_zer_opaque){(void*)(");
+            emit_expr(e, node->typecast.expr);
+            emit(e, "), %u}", (unsigned)tid);
+        } else if (tgt_eff && src_eff &&
+                   tgt_eff->kind == TYPE_POINTER &&
+                   ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+                     type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
+                    src_eff->kind == TYPE_OPAQUE)) {
+            /* casting FROM *opaque — unwrap .ptr with type check */
+            uint32_t expected_tid = 0;
+            if (tgt_eff->pointer.inner) {
+                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
+                else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
+                else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+            }
+            if (expected_tid > 0) {
+                int tmp = e->temp_count++;
+                emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+                emit_expr(e, node->typecast.expr);
+                emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
+                     "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); "
+                     "(", tmp, (unsigned)expected_tid, tmp);
+                emit_type(e, tgt);
+                emit(e, ")_zer_pc%d.ptr; })", tmp);
+            } else {
+                emit(e, "((");
+                emit_type(e, tgt);
+                emit(e, ")(");
+                emit_expr(e, node->typecast.expr);
+                emit(e, ").ptr)");
+            }
+        } else {
+            /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
+            emit(e, "((");
+            emit_type(e, tgt);
+            emit(e, ")(");
+            emit_expr(e, node->typecast.expr);
+            emit(e, "))");
         }
         break;
     }

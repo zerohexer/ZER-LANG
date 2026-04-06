@@ -528,7 +528,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **ZER Integration Tests (`tests/zer/`):**
 - Real `.zer` files compiled with `zerc --run`, must exit 0
 - Runner: `tests/test_zer.sh`, added to `make check`
-- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained, tracked_malloc, arena_alloc, comptime_eval, bit_fields, optional_patterns, star_slice, goto_label, goto_switch_label, goto_defer, handle_autoderef, handle_autoderef_pool, alloc_ptr, alloc_ptr_pool, alloc_ptr_mixed, alloc_ptr_stress, handle_complex, handle_array, opaque_safe_patterns, task_new, task_new_ptr, task_new_complex, orelse_block_ptr, task_new_orelse, const_handle_ok, handle_if_unwrap, volatile_div, orelse_void_block, volatile_orelse, comptime_const_if, optional_null_init, comptime_if_call, opaque_level1, opaque_level2, opaque_level345, opaque_level9_complex, opaque_cross_func, opaque_mixed_features, handle_scalar_store, const_slice_return, distinct_funcptr_nested, void_optional_init, distinct_optional, distinct_optional_full, distinct_types, distinct_slice_ops, funcptr_array, defer_free, if_exit_free, optional_array, distinct_optional_ptr, volatile_field_array, comptime_negative, comptime_pool_size, const_slice_field, comptime_nested_call, funcptr_struct_reduce, alloc_ptr_func, multi_slab_cross, nested_struct_deref2, nullable_funcptr, recursive_functions, pool_exhaustion, comptime_signed, slice_subslice, bit_extract_set, packed_struct, atomic_ops, container_offset, bang_integer, forward_decl, critical_block, bitcast_int, array_3d, union_array_variant, comptime_const_arg, opaque_ptrcast_roundtrip, dyn_array_guard, autoguard_intrinsic, critical_handle, distinct_union_assign, goto_backward_safe, inline_call_range, inline_range_deep, guard_clamp_range, keep_store_global, super_plugin, super_ecs, super_interpreter, super_freelist, super_state_machine, super_hashmap
+- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained, tracked_malloc, arena_alloc, comptime_eval, bit_fields, optional_patterns, star_slice, goto_label, goto_switch_label, goto_defer, handle_autoderef, handle_autoderef_pool, alloc_ptr, alloc_ptr_pool, alloc_ptr_mixed, alloc_ptr_stress, handle_complex, handle_array, opaque_safe_patterns, task_new, task_new_ptr, task_new_complex, orelse_block_ptr, task_new_orelse, const_handle_ok, handle_if_unwrap, volatile_div, orelse_void_block, volatile_orelse, comptime_const_if, optional_null_init, comptime_if_call, opaque_level1, opaque_level2, opaque_level345, opaque_level9_complex, opaque_cross_func, opaque_mixed_features, handle_scalar_store, const_slice_return, distinct_funcptr_nested, void_optional_init, distinct_optional, distinct_optional_full, distinct_types, distinct_slice_ops, funcptr_array, defer_free, if_exit_free, optional_array, distinct_optional_ptr, volatile_field_array, comptime_negative, comptime_pool_size, const_slice_field, comptime_nested_call, funcptr_struct_reduce, alloc_ptr_func, multi_slab_cross, nested_struct_deref2, nullable_funcptr, recursive_functions, pool_exhaustion, comptime_signed, slice_subslice, bit_extract_set, packed_struct, atomic_ops, container_offset, bang_integer, forward_decl, critical_block, bitcast_int, array_3d, union_array_variant, comptime_const_arg, opaque_ptrcast_roundtrip, dyn_array_guard, autoguard_intrinsic, critical_handle, distinct_union_assign, goto_backward_safe, inline_call_range, inline_range_deep, guard_clamp_range, keep_store_global, driver_registry, super_plugin, super_ecs, super_interpreter, super_freelist, super_state_machine, super_hashmap
 - Negative tests: uaf_handle, double_free, maybe_freed, bounds_oob, div_zero, null_ptr, dangling_return, isr_slab_alloc, ghost_handle, goto_bad_label, alloc_ptr_uaf, alloc_ptr_double_free, opaque_struct_uaf, opaque_return_freed, opaque_alias_uaf, opaque_maybe_freed, opaque_double_free, cross_func_free_ptr, free_ptr_wrong_type, handle_no_allocator, ghost_alloc_ptr, task_delete_double, task_delete_uaf, opaque_cross_func_uaf, opaque_task_delete_ptr_uaf, bitcast_width, array_return, float_switch, return_in_defer, asm_not_naked, ptrcast_strip_volatile, narrowing_coerce, dyn_array_loop_freed, critical_return, critical_break, goto_backward_uaf, nonkeep_store_global
 - Module tests (`test_modules/`): main, app, diamond, use_types, use_defs, diamond2, collision_test, static_coll, gcoll, transitive, use_hal, opaque_wrap, opaque_wrap_df (negative), opaque_wrap_uaf (negative)
 - Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
@@ -892,6 +892,24 @@ After any bug fix or feature change that passes `make check`, update ALL relevan
 - `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed
 
 **Only update docs after `make check` passes and you have high confidence the change is correct.** Do not update docs for speculative or in-progress work.
+
+### Compiler Crash Debugging — Use ASan
+
+When the compiler (`zerc`) crashes with a segfault:
+
+1. **Build with AddressSanitizer** to get exact crash location:
+   ```
+   docker run --rm zer-check bash -c 'cd /zer && gcc -g -fsanitize=address -O0 -I. -o zerc_asan lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && ./zerc_asan /tmp/crash.zer -o /tmp/crash.c 2>&1'
+   ```
+
+2. ASan output gives file:line and stack trace — go directly to the crash location.
+
+3. Common crash patterns:
+   - **Wrong variable used** — `arg_node` vs `karg` (BUG-441): validated one variable but dereferenced another. ASan showed `checker.c:3148` → immediately found `arg_node` should be `karg`.
+   - **NULL type dereference** — `type->pointer.inner->kind` where `inner` is NULL. Add NULL check.
+   - **Missing `type_unwrap_distinct()`** — accessing `.struct_type` on TYPE_DISTINCT.
+
+This saved hours of debugging in BUG-441 — ASan pinpointed the exact line in 1 command instead of printf-based bisection.
 
 ### Red Flags — Stop and Revert
 

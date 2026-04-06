@@ -3144,8 +3144,8 @@ static Type *check_expr(Checker *c, Node *node) {
                             karg->unary.op == TOK_AMP &&
                             karg->unary.operand->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
-                                arg_node->unary.operand->ident.name,
-                                (uint32_t)arg_node->unary.operand->ident.name_len);
+                                karg->unary.operand->ident.name,
+                                (uint32_t)karg->unary.operand->ident.name_len);
                             if (arg_sym && !arg_sym->is_static) {
                                 /* BUG-317: check both raw AND mangled keys for imported globals */
                                 bool is_global = scope_lookup_local(c->global_scope,

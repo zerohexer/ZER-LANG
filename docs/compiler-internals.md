@@ -771,6 +771,12 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
 5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
 
+### Keep Validation Variable Mismatch (BUG-441, 2026-04-06)
+
+`arg_node` vs `karg` in keep parameter validation (NODE_CALL). The orelse-unwrap + intrinsic-walk loop produces `karg`, but line 3147 used `arg_node` (original unwrapped). `@ptrcast(*opaque, &global)` as arg → `arg_node` is NODE_INTRINSIC → `arg_node->unary.operand` segfaults.
+
+**Debugging:** ASan (`gcc -g -fsanitize=address -O0`) pinpointed `checker.c:3148` instantly. Always use ASan for compiler crashes.
+
 ### Non-Keep Parameter Store Enforcement (BUG-440, 2026-04-06)
 
 `keep` enforcement was caller-side only. The function side — storing a non-keep pointer param to global/static — was unchecked. Now NODE_ASSIGN checks: if target is global/static AND value is a non-keep pointer ident that's local-scope (not global, not static, not `is_local_derived`, not `is_arena_derived`), error. The heuristic identifies parameters as: pointer-typed, non-keep, non-global, non-static, non-flagged locals.

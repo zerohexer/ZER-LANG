@@ -771,6 +771,10 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
 5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
 
+### Non-Keep Parameter Store Enforcement (BUG-440, 2026-04-06)
+
+`keep` enforcement was caller-side only. The function side — storing a non-keep pointer param to global/static — was unchecked. Now NODE_ASSIGN checks: if target is global/static AND value is a non-keep pointer ident that's local-scope (not global, not static, not `is_local_derived`, not `is_arena_derived`), error. The heuristic identifies parameters as: pointer-typed, non-keep, non-global, non-static, non-flagged locals.
+
 **Auto-guard for NODE_CALL indices NOT possible (2026-04-06 — attempted and reverted):**
 `emit_auto_guards` evaluates the index expression to emit `if (idx >= size)`. For NODE_CALL, this calls the function TWICE (once in guard, once in access) — double-evaluating side effects. The inline `_zer_bounds_check` with GCC statement expression correctly handles single-eval for call indices. Auto-guard remains NODE_IDENT only.
 

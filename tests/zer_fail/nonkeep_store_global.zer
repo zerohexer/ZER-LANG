@@ -1,0 +1,14 @@
+// Test: non-keep pointer param stored to global — must be rejected
+// BUG-440: spec says non-keep *T is "non-storable"
+
+?*u32 g_ptr = null;
+
+void store(*u32 p) {
+    g_ptr = p;
+}
+
+u32 main() {
+    u32 local = 42;
+    store(&local);
+    return 0;
+}

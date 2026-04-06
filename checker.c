@@ -1978,6 +1978,51 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-440: non-keep pointer parameter stored in global/static.
+         * Spec: non-keep *T is "non-storable — use it, read it, write through it."
+         * Storing to global violates this contract — caller may pass &local. */
+        if (node->assign.op == TOK_EQ) {
+            Node *vnode = node->assign.value;
+            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
+                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            if (vnode && vnode->kind == NODE_IDENT) {
+                Symbol *val_sym = scope_lookup(c->current_scope,
+                    vnode->ident.name, (uint32_t)vnode->ident.name_len);
+                Type *vt = val_sym ? type_unwrap_distinct(val_sym->type) : NULL;
+                /* A non-keep pointer that's not local-derived, not global/static,
+                 * and not already flagged = function parameter (unknown origin).
+                 * Storing it in global violates the non-keep contract. */
+                bool val_is_global = val_sym && scope_lookup_local(c->global_scope,
+                    val_sym->name, val_sym->name_len) != NULL;
+                bool is_ptr_param = val_sym && !val_sym->is_keep &&
+                    !val_sym->is_local_derived && !val_sym->is_arena_derived &&
+                    !val_sym->is_static && !val_is_global &&
+                    vt && (vt->kind == TYPE_POINTER || vt->kind == TYPE_OPAQUE);
+                if (is_ptr_param) {
+                    Node *troot = node->assign.target;
+                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                        else troot = troot->index_expr.object;
+                    }
+                    if (troot && troot->kind == NODE_IDENT) {
+                        Symbol *target_sym = scope_lookup(c->current_scope,
+                            troot->ident.name, (uint32_t)troot->ident.name_len);
+                        bool target_is_global = target_sym &&
+                            (target_sym->is_static ||
+                             scope_lookup_local(c->global_scope, target_sym->name,
+                                                target_sym->name_len) != NULL);
+                        if (target_is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot store non-keep pointer parameter '%.*s' in "
+                                "global/static '%.*s' — add 'keep' qualifier to parameter",
+                                (int)val_sym->name_len, val_sym->name,
+                                (int)target_sym->name_len, target_sym->name);
+                        }
+                    }
+                }
+            }
+        }
+
         /* BUG-314: orelse &local escape to global via assignment.
          * g_ptr = opt orelse &local — if target is global, reject directly. */
         if (node->assign.op == TOK_EQ &&

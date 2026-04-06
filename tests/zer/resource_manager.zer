@@ -43,10 +43,10 @@ void disconnect_socket(*NetSocket s) {
 // Simulate a complex operation needing multiple resources
 u32 do_transfer(u32 src_fd, u32 dst_port) {
     *FileHandle file = open_file(src_fd) orelse { return 1; };
-    defer close_file(file);
+    defer file_pool.free_ptr(file);
 
     *NetSocket sock = connect_socket(dst_port) orelse { return 2; };
-    defer disconnect_socket(sock);
+    defer sock_pool.free_ptr(sock);
 
     // "Transfer" — just verify both are valid
     if (!file.is_open) { return 3; }

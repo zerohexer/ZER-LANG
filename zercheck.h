@@ -36,7 +36,8 @@ typedef struct {
     int pool_id;            /* which pool allocated this (-1 = unknown) */
     int alloc_line;         /* where allocated */
     int free_line;          /* where freed (if FREED) */
-    bool is_optional;       /* true for ?Handle/?*T wrappers — skip in leak check */
+    int alloc_id;           /* unique allocation ID — aliases share same ID */
+    bool escaped;           /* true if returned, stored in global, or stored in param field */
 } HandleInfo;
 
 /* one execution path's view of all handles — dynamic array */
@@ -84,6 +85,9 @@ typedef struct {
     int summary_count;
     int summary_capacity;
     bool building_summary;  /* suppress error reporting during summary phase */
+
+    /* allocation ID counter — each unique allocation gets a unique ID */
+    int next_alloc_id;
 
     /* imported module ASTs for cross-module summary building */
     Node **import_asts;

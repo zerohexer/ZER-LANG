@@ -529,7 +529,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                 h->state = HS_ALIVE;
                 h->pool_id = pool_id;
                 h->alloc_line = var_node->loc.line;
-                h->is_optional = true; /* pool.alloc() returns ?Handle — optional wrapper */
+                h->alloc_id = zc->next_alloc_id++;
             }
             } /* end else (not arena) */
         }
@@ -548,6 +548,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             h->state = HS_ALIVE;
             h->pool_id = -2; /* -2 = malloc'd (not pool, not param) */
             h->alloc_line = var_node->loc.line;
+            h->alloc_id = zc->next_alloc_id++;
         }
     }
 
@@ -589,9 +590,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     h->state = HS_ALIVE;
                     h->pool_id = -2;
                     h->alloc_line = var_node->loc.line;
-                    /* If init has orelse, the variable is the UNWRAPPED result,
-                     * not the optional wrapper. Otherwise it's the raw return. */
-                    h->is_optional = (init->kind != NODE_ORELSE);
+                    h->alloc_id = zc->next_alloc_id++;
                 }
             }
         }
@@ -628,9 +627,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     dst->pool_id = src->pool_id;
                     dst->alloc_line = src->alloc_line;
                     dst->free_line = src->free_line;
-                    /* Orelse unwrap: h = mh orelse return — h is the REAL handle,
-                     * not an optional wrapper. Clear is_optional on the unwrapped dst. */
-                    dst->is_optional = false;
+                    dst->alloc_id = src->alloc_id; /* same allocation */
                 }
             }
             /* Struct copy aliasing: if source has tracked fields like "s1.h",
@@ -655,6 +652,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                             dst->pool_id = ps->handles[hi].pool_id;
                             dst->alloc_line = ps->handles[hi].alloc_line;
                             dst->free_line = ps->handles[hi].free_line;
+                            dst->alloc_id = ps->handles[hi].alloc_id;
                         }
                     }
                 }
@@ -816,6 +814,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                 h->state = HS_ALIVE;
                                 h->pool_id = pool_id;
                                 h->alloc_line = node->loc.line;
+                                h->alloc_id = zc->next_alloc_id++;
                             }
                         }
                     }
@@ -831,6 +830,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                             h->state = HS_ALIVE;
                             h->pool_id = -2; /* malloc'd */
                             h->alloc_line = node->loc.line;
+                            h->alloc_id = zc->next_alloc_id++;
                         }
                     }
                 }
@@ -852,10 +852,58 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                     dst->pool_id = src->pool_id;
                                     dst->alloc_line = src->alloc_line;
                                     dst->free_line = src->free_line;
+                                    dst->alloc_id = src->alloc_id;
                                 }
                             }
                         }
                     }
+                }
+                /* Escape detection: if target root is global or pointer param,
+                 * the source handle escapes to external scope. */
+                {
+                    Node *troot = node->assign.target;
+                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                        else troot = troot->index_expr.object;
+                    }
+                    if (troot && troot->kind == NODE_IDENT) {
+                        /* Check if root is global */
+                        bool is_global = scope_lookup(zc->checker->global_scope,
+                            troot->ident.name, (uint32_t)troot->ident.name_len) != NULL;
+                        /* Check if root is a pointer param (s.top = h where s is *Stack).
+                         * Can't use scope_lookup (scope may have reset). Check type via checker. */
+                        bool is_param_ptr = false;
+                        if (!is_global && node->assign.target->kind == NODE_FIELD) {
+                            Type *root_type = checker_get_type(zc->checker, troot);
+                            if (root_type) {
+                                Type *rt = type_unwrap_distinct(root_type);
+                                if (rt && rt->kind == TYPE_POINTER)
+                                    is_param_ptr = true;
+                            }
+                        }
+                        if (is_global || is_param_ptr) {
+                            Node *val = node->assign.value;
+                            if (val->kind == NODE_ORELSE) val = val->orelse.expr;
+                            char vkey[128];
+                            int vklen = handle_key_from_expr(val, vkey, sizeof(vkey));
+                            if (vklen > 0) {
+                                HandleInfo *vh = find_handle(ps, vkey, (uint32_t)vklen);
+                                if (vh) vh->escaped = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                /* target untrackable (variable index, complex expression).
+                 * If value is a tracked handle, mark it as escaped —
+                 * the allocation went somewhere we can't follow. */
+                Node *val = node->assign.value;
+                if (val->kind == NODE_ORELSE) val = val->orelse.expr;
+                char vkey[128];
+                int vklen = handle_key_from_expr(val, vkey, sizeof(vkey));
+                if (vklen > 0) {
+                    HandleInfo *vh = find_handle(ps, vkey, (uint32_t)vklen);
+                    if (vh) vh->escaped = true;
                 }
             }
         }
@@ -1038,11 +1086,48 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                         h->state = HS_ALIVE;
                         h->pool_id = -1;
                         h->alloc_line = node->loc.line;
+                        h->alloc_id = zc->next_alloc_id++;
+                    }
+                }
+            }
+            /* if (mh) |t| or if (arr[0]) |h| — capture is alias of condition */
+            char cond_key[128];
+            int cklen = handle_key_from_expr(cond, cond_key, sizeof(cond_key));
+            if (cklen > 0) {
+                HandleInfo *src = find_handle(ps, cond_key, (uint32_t)cklen);
+                if (src) {
+                    HandleInfo *cap = add_handle(&then_state,
+                        node->if_stmt.capture_name,
+                        (uint32_t)node->if_stmt.capture_name_len);
+                    if (cap) {
+                        cap->state = src->state;
+                        cap->pool_id = src->pool_id;
+                        cap->alloc_line = src->alloc_line;
+                        cap->alloc_id = src->alloc_id; /* same allocation */
                     }
                 }
             }
         }
         zc_check_stmt(zc, &then_state, node->if_stmt.then_body);
+
+        /* After then-body: propagate alloc_id coverage from then_state.
+         * If any handle with alloc_id X is FREED in then_state, mark
+         * the corresponding handle in main ps as escaped — the allocation
+         * was freed on the taken path. For if-unwrap on ?Handle, the
+         * not-taken path means null (no allocation) → not a leak. */
+        if (node->if_stmt.capture_name) {
+            for (int ti = 0; ti < then_state.handle_count; ti++) {
+                if (then_state.handles[ti].state == HS_FREED &&
+                    then_state.handles[ti].alloc_id > 0) {
+                    /* find matching alloc_id in main ps */
+                    for (int pi = 0; pi < ps->handle_count; pi++) {
+                        if (ps->handles[pi].alloc_id == then_state.handles[ti].alloc_id) {
+                            ps->handles[pi].escaped = true;
+                        }
+                    }
+                }
+            }
+        }
 
         if (node->if_stmt.else_body) {
             PathState else_state = pathstate_copy(ps);
@@ -1509,175 +1594,132 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
 
     zc_check_stmt(zc, &ps, func->func_decl.body);
 
-    /* Defer free scanning: scan function body for defer { free(h) } patterns.
-     * Handles freed in defer are not leaked — defer fires on all return paths.
-     * Scan top-level defers in the function body. */
-    if (func->func_decl.body && func->func_decl.body->kind == NODE_BLOCK) {
-        for (int di = 0; di < func->func_decl.body->block.stmt_count; di++) {
-            Node *stmt = func->func_decl.body->block.stmts[di];
-            if (stmt->kind == NODE_DEFER) {
-                defer_scan_all_frees(stmt->defer.body, &ps, stmt->loc.line);
+    /* Defer free scanning: scan ENTIRE function body (recursively) for
+     * defer { free(h) } patterns. Handles freed in defer are not leaked.
+     * Must scan inside loops, if-bodies, blocks — defers can appear anywhere. */
+    {
+        /* Recursive defer scanner — walks all statement types */
+        struct { Node **stmts; int count; } scan_stack[32];
+        int scan_depth = 0;
+        if (func->func_decl.body && func->func_decl.body->kind == NODE_BLOCK) {
+            scan_stack[0].stmts = func->func_decl.body->block.stmts;
+            scan_stack[0].count = func->func_decl.body->block.stmt_count;
+            scan_depth = 1;
+        }
+        while (scan_depth > 0) {
+            scan_depth--;
+            Node **stmts = scan_stack[scan_depth].stmts;
+            int count = scan_stack[scan_depth].count;
+            for (int di = 0; di < count; di++) {
+                Node *stmt = stmts[di];
+                if (!stmt) continue;
+                if (stmt->kind == NODE_DEFER) {
+                    defer_scan_all_frees(stmt->defer.body, &ps, stmt->loc.line);
+                }
+                /* Recurse into nested blocks */
+                if (stmt->kind == NODE_BLOCK && scan_depth < 31) {
+                    scan_stack[scan_depth].stmts = stmt->block.stmts;
+                    scan_stack[scan_depth].count = stmt->block.stmt_count;
+                    scan_depth++;
+                }
+                if (stmt->kind == NODE_IF) {
+                    if (stmt->if_stmt.then_body && stmt->if_stmt.then_body->kind == NODE_BLOCK && scan_depth < 31) {
+                        scan_stack[scan_depth].stmts = stmt->if_stmt.then_body->block.stmts;
+                        scan_stack[scan_depth].count = stmt->if_stmt.then_body->block.stmt_count;
+                        scan_depth++;
+                    }
+                    if (stmt->if_stmt.else_body && stmt->if_stmt.else_body->kind == NODE_BLOCK && scan_depth < 31) {
+                        scan_stack[scan_depth].stmts = stmt->if_stmt.else_body->block.stmts;
+                        scan_stack[scan_depth].count = stmt->if_stmt.else_body->block.stmt_count;
+                        scan_depth++;
+                    }
+                }
+                if ((stmt->kind == NODE_FOR || stmt->kind == NODE_WHILE) && scan_depth < 31) {
+                    Node *body = (stmt->kind == NODE_FOR) ? stmt->for_stmt.body : stmt->while_stmt.body;
+                    if (body && body->kind == NODE_BLOCK) {
+                        scan_stack[scan_depth].stmts = body->block.stmts;
+                        scan_stack[scan_depth].count = body->block.stmt_count;
+                        scan_depth++;
+                    }
+                }
+                if (stmt->kind == NODE_CRITICAL && stmt->critical.body &&
+                    stmt->critical.body->kind == NODE_BLOCK && scan_depth < 31) {
+                    scan_stack[scan_depth].stmts = stmt->critical.body->block.stmts;
+                    scan_stack[scan_depth].count = stmt->critical.body->block.stmt_count;
+                    scan_depth++;
+                }
             }
         }
     }
 
-    /* Escape detection: scan function body for handles that escape via
-     * return, global assignment, or param field assignment. These are NOT
-     * leaked — someone else owns them. Collect escaped handle names. */
-    char escaped_keys[16][128];
-    int escaped_count = 0;
+    /* Mark handles that escape via return as escaped.
+     * Scan function body for return statements containing handle idents. */
     if (func->func_decl.body && func->func_decl.body->kind == NODE_BLOCK) {
         for (int si = 0; si < func->func_decl.body->block.stmt_count; si++) {
             Node *stmt = func->func_decl.body->block.stmts[si];
-            /* return h or return mh — handle escapes to caller */
-            if (stmt->kind == NODE_RETURN && stmt->ret.expr && escaped_count < 16) {
+            if (stmt->kind == NODE_RETURN && stmt->ret.expr) {
                 char rkey[128];
                 int rklen = handle_key_from_expr(stmt->ret.expr, rkey, sizeof(rkey));
                 if (rklen > 0) {
-                    memcpy(escaped_keys[escaped_count], rkey, rklen + 1);
-                    escaped_count++;
-                }
-            }
-            /* g_handle = h — handle escapes to global
-             * Also: g_handle = mh orelse return — unwrap orelse to find handle */
-            if (stmt->kind == NODE_EXPR_STMT && stmt->expr_stmt.expr &&
-                stmt->expr_stmt.expr->kind == NODE_ASSIGN &&
-                stmt->expr_stmt.expr->assign.op == TOK_EQ && escaped_count < 16) {
-                Node *tgt = stmt->expr_stmt.expr->assign.target;
-                Node *val = stmt->expr_stmt.expr->assign.value;
-                /* unwrap orelse to find the actual handle ident */
-                while (val && val->kind == NODE_ORELSE) val = val->orelse.expr;
-                /* check if target root is global OR parameter (pointer deref).
-                 * s.top = h where s is a *Stack param — handle escapes to caller. */
-                Node *troot = tgt;
-                while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                    if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                    else troot = troot->index_expr.object;
-                }
-                if (troot && troot->kind == NODE_IDENT) {
-                    Symbol *tsym = scope_lookup(zc->checker->global_scope,
-                        troot->ident.name, (uint32_t)troot->ident.name_len);
-                    /* Also check: target is a pointer param (s.field where s is *Struct) */
-                    if (!tsym) {
-                        /* not global — check if it's a pointer param (handle escapes via param field) */
-                        Symbol *local_sym = scope_lookup(zc->checker->current_scope,
-                            troot->ident.name, (uint32_t)troot->ident.name_len);
-                        if (local_sym) {
-                            Type *lt = local_sym->type ? type_unwrap_distinct(local_sym->type) : NULL;
-                            if (lt && lt->kind == TYPE_POINTER && tgt->kind == NODE_FIELD)
-                                tsym = local_sym; /* treat pointer param field as escape */
-                        }
-                    }
-                    if (tsym) {
-                        /* target is global — value handle escapes */
-                        char vkey[128];
-                        int vklen = handle_key_from_expr(val, vkey, sizeof(vkey));
-                        if (vklen > 0) {
-                            memcpy(escaped_keys[escaped_count], vkey, vklen + 1);
-                            escaped_count++;
-                        }
-                    }
+                    HandleInfo *rh = find_handle(&ps, rkey, (uint32_t)rklen);
+                    if (rh) rh->escaped = true;
                 }
             }
         }
     }
 
-    /* Scan for if-unwrap consumed handles: if (mh) |t| { ... } consumes mh.
-     * These are not leaked — ownership transferred to capture variable. */
-    char consumed_keys[16][128];
-    int consumed_count = 0;
-    if (func->func_decl.body && func->func_decl.body->kind == NODE_BLOCK) {
-        for (int si = 0; si < func->func_decl.body->block.stmt_count; si++) {
-            Node *stmt = func->func_decl.body->block.stmts[si];
-            if (stmt->kind == NODE_IF && stmt->if_stmt.capture_name &&
-                stmt->if_stmt.cond && stmt->if_stmt.cond->kind == NODE_IDENT &&
-                consumed_count < 16) {
-                int clen = (int)stmt->if_stmt.cond->ident.name_len;
-                if (clen < 128) {
-                    memcpy(consumed_keys[consumed_count],
-                           stmt->if_stmt.cond->ident.name, clen);
-                    consumed_keys[consumed_count][clen] = '\0';
-                    consumed_count++;
-                }
-            }
-        }
-    }
-
-    /* Leak detection: any handle still ALIVE or MAYBE_FREED at function exit
-     * that was allocated inside this function (not a parameter) → error.
-     * Parameters (alloc_line == func->loc.line, pool_id == -1) are excluded —
-     * the caller is responsible for freeing parameter handles.
-     * Escaped handles (returned, stored in global) are excluded.
-     * If-unwrap consumed handles (if (mh) |t|) are excluded. */
+    /* Leak detection — alloc_id grouping.
+     * For each allocation (unique alloc_id), check ALL handles that share it.
+     * If ANY handle in the group is FREED or escaped → allocation is covered.
+     * If ALL handles in the group are ALIVE and not escaped → LEAK ERROR.
+     *
+     * This naturally handles:
+     * - mh/h pairs: same alloc_id, h is FREED → mh skipped
+     * - return mh: mh.escaped = true → skipped
+     * - handles[i] = mh: mh.escaped = true (untrackable target) → skipped
+     * - defer free(h): h is FREED → skipped
+     * - Parameters: pool_id == -1, excluded */
+    /* Collect unique alloc_ids that are covered (any member freed/escaped) */
+    int covered_ids[64];
+    int covered_count = 0;
     for (int i = 0; i < ps.handle_count; i++) {
-        bool is_param = (ps.handles[i].pool_id == -1 && ps.handles[i].alloc_line == (int)func->loc.line);
+        if (ps.handles[i].state == HS_FREED || ps.handles[i].escaped) {
+            /* check if already in covered list */
+            bool already = false;
+            for (int c = 0; c < covered_count; c++) {
+                if (covered_ids[c] == ps.handles[i].alloc_id) { already = true; break; }
+            }
+            if (!already && covered_count < 64) {
+                covered_ids[covered_count++] = ps.handles[i].alloc_id;
+            }
+        }
+    }
+    for (int i = 0; i < ps.handle_count; i++) {
+        bool is_param = (ps.handles[i].pool_id == -1 &&
+                         ps.handles[i].alloc_line == (int)func->loc.line);
         if (is_param) continue;
-        /* Skip optional handle wrappers (?Handle) — the unwrapped handle
-         * is what matters. ?Handle names often start with 'm' (convention)
-         * but we can't rely on naming. Instead: if this handle's name is
-         * a prefix match for another handle at same alloc_line that IS
-         * freed/escaped, skip it. Covers: mh/h, maybe/t patterns. */
-        /* Skip optional wrapper handles (?Handle, ?*T from alloc).
-         * They're always unwrapped via orelse — the real handle is tracked separately. */
-        if (ps.handles[i].is_optional) continue;
-        /* check if this handle was consumed by if-unwrap */
-        bool is_consumed = false;
-        for (int ci = 0; ci < consumed_count; ci++) {
-            if (strlen(consumed_keys[ci]) == ps.handles[i].name_len &&
-                memcmp(consumed_keys[ci], ps.handles[i].name, ps.handles[i].name_len) == 0) {
-                is_consumed = true;
-                break;
-            }
+        if (ps.handles[i].state != HS_ALIVE && ps.handles[i].state != HS_MAYBE_FREED) continue;
+        /* check if this allocation is covered */
+        bool covered = false;
+        for (int c = 0; c < covered_count; c++) {
+            if (covered_ids[c] == ps.handles[i].alloc_id) { covered = true; break; }
         }
-        if (is_consumed) continue;
-        /* check if this handle (or an alias of the same allocation) escaped or was freed */
-        bool did_escape = false;
-        /* direct escape check */
-        for (int ei = 0; ei < escaped_count; ei++) {
-            if (strlen(escaped_keys[ei]) == ps.handles[i].name_len &&
-                memcmp(escaped_keys[ei], ps.handles[i].name, ps.handles[i].name_len) == 0) {
-                did_escape = true;
-                break;
-            }
-        }
-        /* alias check: if ANY handle with same alloc_line + pool_id was
-         * freed, escaped, or has state != HS_ALIVE, this handle is covered.
-         * Covers: mh = pool.alloc(); h = mh orelse return; defer free(h);
-         * → h is FREED, mh is ALIVE but same allocation → not leaked. */
-        if (!did_escape) {
-            for (int ai = 0; ai < ps.handle_count; ai++) {
-                if (ai == i) continue;
-                if (ps.handles[ai].alloc_line == ps.handles[i].alloc_line &&
-                    ps.handles[ai].pool_id == ps.handles[i].pool_id) {
-                    if (ps.handles[ai].state == HS_FREED) {
-                        did_escape = true;
-                        break;
-                    }
-                    /* check if alias escaped */
-                    for (int ei = 0; ei < escaped_count; ei++) {
-                        if (strlen(escaped_keys[ei]) == ps.handles[ai].name_len &&
-                            memcmp(escaped_keys[ei], ps.handles[ai].name, ps.handles[ai].name_len) == 0) {
-                            did_escape = true;
-                            break;
-                        }
-                    }
-                    if (did_escape) break;
-                }
-            }
-        }
-        if (did_escape) continue;
+        if (covered) continue;
         if (ps.handles[i].state == HS_ALIVE) {
-            zc_warning(zc, ps.handles[i].alloc_line,
+            zc_error(zc, ps.handles[i].alloc_line,
                 "handle '%.*s' allocated but never freed — add 'defer pool.free(%.*s)' "
                 "after allocation, or return the handle to the caller",
                 (int)ps.handles[i].name_len, ps.handles[i].name,
                 (int)ps.handles[i].name_len, ps.handles[i].name);
         } else if (ps.handles[i].state == HS_MAYBE_FREED) {
-            zc_warning(zc, ps.handles[i].alloc_line,
+            zc_error(zc, ps.handles[i].alloc_line,
                 "handle '%.*s' may not be freed on all paths — ensure all branches "
                 "free the handle or add 'defer' for automatic cleanup",
                 (int)ps.handles[i].name_len, ps.handles[i].name);
         }
+        /* Deduplicate: don't report same allocation twice */
+        if (covered_count < 64)
+            covered_ids[covered_count++] = ps.handles[i].alloc_id;
     }
 
     pathstate_free(&ps);
@@ -1692,6 +1734,7 @@ void zercheck_init(ZerCheck *zc, Checker *checker, Arena *arena, const char *fil
     zc->checker = checker;
     zc->arena = arena;
     zc->file_name = file;
+    zc->next_alloc_id = 1; /* 0 = no allocation (params, uninitialized) */
 }
 
 bool zercheck_run(ZerCheck *zc, Node *file_node) {

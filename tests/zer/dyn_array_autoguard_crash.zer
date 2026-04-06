@@ -1,0 +1,48 @@
+// Deliberately try to trigger UAF on dynamic array Handle
+// NO manual guard written — rely on compiler auto-guard
+// The auto-guard should insert if (j == k) { return 0; }
+// preventing the crash
+
+struct Obj { u32 val; u32 tag; }
+Pool(Obj, 8) pool;
+
+u32 try_crash(u32 free_idx, u32 use_idx) {
+    Handle(Obj)[4] handles;
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Obj) mh = pool.alloc();
+        handles[i] = mh orelse return;
+        handles[i].val = (i + 1) * 100;
+        handles[i].tag = i;
+    }
+
+    // Free one at dynamic index
+    pool.free(handles[free_idx]);
+
+    // Try to access at dynamic index — NO guard written
+    // Auto-guard should protect: if (use_idx == free_idx) return 0
+    u32 result = handles[use_idx].val;
+
+    // Cleanup survivors
+    for (u32 i = 0; i < 4; i += 1) {
+        if (i != free_idx) {
+            pool.free(handles[i]);
+        }
+    }
+    return result;
+}
+
+u32 main() {
+    // Case 1: free_idx != use_idx — access succeeds, returns real value
+    u32 r1 = try_crash(3, 0);
+    if (r1 != 100) { return 1; }
+
+    // Case 2: free_idx == use_idx — auto-guard fires, returns 0
+    u32 r2 = try_crash(2, 2);
+    if (r2 != 0) { return 2; }
+
+    // Case 3: different indices again
+    u32 r3 = try_crash(0, 3);
+    if (r3 != 400) { return 3; }
+
+    return 0;
+}

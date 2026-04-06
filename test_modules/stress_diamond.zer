@@ -1,0 +1,15 @@
+// Diamond import: physics + render both import core, main imports all 3
+import stress_core;
+import stress_physics;
+import stress_render;
+
+u32 main() {
+    Vec2 player = stress_core.vec2_new(100, 50);
+    Vec2 after_grav = stress_physics.apply_gravity(player, 10);
+    if (after_grav.y != 60) { return 1; }
+    Vec2 cam = stress_core.vec2_new(20, 10);
+    Vec2 screen = stress_render.screen_pos(after_grav, cam);
+    if (screen.x != 80) { return 2; }
+    if (screen.y != 50) { return 3; }
+    return 0;
+}

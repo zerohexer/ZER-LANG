@@ -1,0 +1,33 @@
+// Mini game engine: math + ECS across modules, Handle auto-deref, enum switch, comptime
+import stress_ecs_math;
+import stress_ecs_world;
+
+u32 main() {
+    ?Handle(Entity) mp = stress_ecs_world.spawn(Tag.player, 0, 0);
+    Handle(Entity) player = mp orelse return;
+    player.vel = stress_ecs_math.v2(2, 1);
+
+    ?Handle(Entity) me = stress_ecs_world.spawn(Tag.enemy, 50, 30);
+    Handle(Entity) enemy = me orelse return;
+
+    ?Handle(Entity) mb = stress_ecs_world.spawn(Tag.bullet, 0, 0);
+    Handle(Entity) bullet = mb orelse return;
+    bullet.vel = stress_ecs_math.v2(5, 3);
+
+    for (u32 i = 0; i < 5; i += 1) {
+        stress_ecs_world.tick(player);
+        stress_ecs_world.tick(bullet);
+    }
+    if (player.pos.x != 10) { return 1; }
+    if (bullet.pos.x != 25) { return 2; }
+
+    stress_ecs_world.damage(enemy, 60);
+    if (enemy.hp != 40) { return 3; }
+    stress_ecs_world.damage(enemy, 50);
+    if (enemy.alive != false) { return 4; }
+
+    stress_ecs_world.despawn(bullet);
+    stress_ecs_world.despawn(enemy);
+    stress_ecs_world.despawn(player);
+    return 0;
+}

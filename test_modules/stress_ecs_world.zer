@@ -1,0 +1,23 @@
+import stress_ecs_math;
+enum Tag { player, enemy, bullet }
+struct Entity { Vec2 pos; Vec2 vel; Tag tag; u32 hp; bool alive; }
+Slab(Entity) world;
+
+?Handle(Entity) spawn(Tag t, i32 x, i32 y) {
+    ?Handle(Entity) mh = world.alloc();
+    Handle(Entity) e = mh orelse { return null; };
+    e.pos = stress_ecs_math.v2(x, y);
+    e.vel = stress_ecs_math.v2(0, 0);
+    e.tag = t;
+    e.hp = 100;
+    e.alive = true;
+    return mh;
+}
+void tick(Handle(Entity) e) {
+    e.pos = stress_ecs_math.v2_add(e.pos, e.vel);
+}
+void damage(Handle(Entity) e, u32 dmg) {
+    if (dmg >= e.hp) { e.hp = 0; e.alive = false; }
+    else { e.hp = e.hp - dmg; }
+}
+void despawn(Handle(Entity) e) { world.free(e); }

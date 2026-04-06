@@ -1,0 +1,3 @@
+struct Vec2 { i32 x; i32 y; }
+Vec2 vec2_new(i32 x, i32 y) { Vec2 v; v.x = x; v.y = y; return v; }
+Vec2 vec2_add(Vec2 a, Vec2 b) { Vec2 r; r.x = a.x + b.x; r.y = a.y + b.y; return r; }

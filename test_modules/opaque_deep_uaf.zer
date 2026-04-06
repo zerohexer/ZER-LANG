@@ -1,0 +1,10 @@
+// 3-layer *opaque UAF must be compile error
+import opaque_layer2;
+
+u32 main() {
+    ?*opaque mh = opaque_layer2.mid_open(21);
+    *opaque h = mh orelse { return 1; };
+    opaque_layer2.mid_close(h);
+    u32 v = opaque_layer2.mid_read(h);
+    return 0;
+}

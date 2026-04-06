@@ -1,0 +1,4 @@
+import opaque_layer1;
+?*opaque mid_open(u32 x) { return opaque_layer1.core_new(x * 2); }
+void mid_close(*opaque h) { opaque_layer1.core_del(h); }
+u32 mid_read(*opaque h) { return opaque_layer1.core_read(h); }

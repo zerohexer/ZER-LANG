@@ -441,11 +441,14 @@ int main(int argc, char **argv) {
     {
         ZerCheck zc;
         zercheck_init(&zc, &checker, &cc.arena, input_path);
-        /* Feed imported module ASTs for cross-module summary building */
+        /* Feed imported module ASTs in topological order (dependencies first)
+         * for cross-module summary building. topo_order[0] is main module,
+         * rest are imports in dependency order. */
         Node *import_asts[64];
         int import_ast_count = 0;
-        for (int mi = 1; mi < cc.module_count && import_ast_count < 64; mi++) {
-            if (cc.modules[mi].ast)
+        for (int ti = 0; ti < topo_count && import_ast_count < 64; ti++) {
+            int mi = topo_order[ti];
+            if (mi != 0 && cc.modules[mi].ast)
                 import_asts[import_ast_count++] = cc.modules[mi].ast;
         }
         zc.import_asts = import_asts;

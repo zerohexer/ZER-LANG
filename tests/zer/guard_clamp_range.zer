@@ -1,0 +1,37 @@
+// Test: guard-clamped return range proving
+// if (idx >= N) { return 0; } return idx; → return range [0, N-1]
+// find_return_range uses VarRange from guard narrowing
+
+u32[8] data;
+
+u32 clamp(u32 idx) {
+    if (idx >= 8) { return 0; }
+    return idx;
+}
+
+u32 safe_get(u32 raw) {
+    if (raw >= 8) { return 7; }
+    return raw;
+}
+
+u32 main() {
+    for (u32 i = 0; i < 8; i += 1) {
+        data[i] = i + 10;
+    }
+
+    // clamp returns [0, 7] (guard + constant) — proven zero overhead
+    u32 idx = clamp(100);
+    u32 val = data[idx];
+    if (val != 10) { return 1; }
+
+    // safe_get returns [0, 7] (constant 7 + guard narrowed ident) — proven
+    u32 idx2 = safe_get(3);
+    u32 val2 = data[idx2];
+    if (val2 != 13) { return 2; }
+
+    // Inline call — also proven
+    u32 val3 = data[clamp(5)];
+    if (val3 != 15) { return 3; }
+
+    return 0;
+}

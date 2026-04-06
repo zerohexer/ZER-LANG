@@ -767,8 +767,12 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 **find_return_range enhancements (2026-04-06):**
 1. Constant returns: `return 0`, `return N+1` via `eval_const_expr_scoped` — unions with `% N` ranges
 2. Chained call returns: `return other_func()` inherits callee's `has_return_range` — enables multi-layer `get_slot() → raw_hash() → % N` chains
-3. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
-4. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
+3. Guard-clamped ident returns: `if (idx >= N) { return 0; } return idx;` — `find_var_range()` on the ident uses the guard narrowing from check_stmt. Works because `find_return_range` runs immediately after `check_stmt(body)` while VarRanges are still on the stack.
+4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
+5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
+
+**Auto-guard for NODE_CALL indices NOT possible (2026-04-06 — attempted and reverted):**
+`emit_auto_guards` evaluates the index expression to emit `if (idx >= size)`. For NODE_CALL, this calls the function TWICE (once in guard, once in access) — double-evaluating side effects. The inline `_zer_bounds_check` with GCC statement expression correctly handles single-eval for call indices. Auto-guard remains NODE_IDENT only.
 
 **Forced division guard:** NODE_IDENT divisor not proven nonzero → compile error with fix suggestion. Resolves const global symbol init values (e.g., `const u32 N = 16; x / N` → proven nonzero). Complex expressions keep runtime check.
 

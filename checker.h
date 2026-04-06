@@ -40,6 +40,7 @@ typedef struct {
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int defer_depth;        /* > 0 when inside a defer block */
+    int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */
     uint32_t union_switch_var_len;

@@ -246,7 +246,20 @@ static void emit_auto_guards(Emitter *e, Node *node) {
             emit_auto_guards(e, node->call.args[i]);
         break;
     case NODE_ORELSE:
-        emit_auto_guards(e, node->orelse.expr); break;
+        emit_auto_guards(e, node->orelse.expr);
+        if (node->orelse.fallback && !node->orelse.fallback_is_return &&
+            !node->orelse.fallback_is_break && !node->orelse.fallback_is_continue)
+            emit_auto_guards(e, node->orelse.fallback);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            emit_auto_guards(e, node->intrinsic.args[i]);
+        break;
+    case NODE_SLICE:
+        emit_auto_guards(e, node->slice.object);
+        emit_auto_guards(e, node->slice.start);
+        emit_auto_guards(e, node->slice.end);
+        break;
     default: break;
     }
 }

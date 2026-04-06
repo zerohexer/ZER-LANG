@@ -1,0 +1,14 @@
+// Test: break inside @critical in while(true) — must compile
+// Bug: contains_break didn't recurse into NODE_CRITICAL,
+// so all_paths_return thought while(true) was infinite terminator.
+
+u32 main() {
+    u32 result = 0;
+    while (true) {
+        @critical {
+            result = 42;
+            break;
+        }
+    }
+    return result - 42;
+}

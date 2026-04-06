@@ -2836,3 +2836,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Limitation:** VarRange is only available because `find_return_range` runs immediately after `check_stmt(body)` — the ranges haven't been cleaned up yet. This is intentional coupling.
 - **Note:** Auto-guard for NODE_CALL indices was attempted but reverted — it double-evaluates side-effect expressions (function called twice: once in guard, once in access). Inline `_zer_bounds_check` with statement expression is the correct mechanism for call indices (single-eval).
 - **Tests:** `guard_clamp_range.zer` — clamp/safe_get patterns, both variable and inline call, all proven zero overhead.
+
+### BUG-440: non-keep pointer parameter stored in global — uncaught
+- **Symptom:** `void store(*u32 p) { g_ptr = p; }` compiled without error. Caller could pass `&local`, function stores it in global → dangling pointer after function returns.
+- **Root cause:** `keep` enforcement was only on the CALLER side (caller can't pass locals to `keep`). The FUNCTION side — storing a non-keep param to global — was never checked. Spec clearly says non-keep `*T` is "non-storable: use it, read it, write through it."
+- **Fix:** In NODE_ASSIGN, when target is global/static and value is a non-keep pointer ident that is local-scoped (not global, not static, not local-derived, not arena-derived), error: "add 'keep' qualifier to parameter."
+- **Tests:** `nonkeep_store_global.zer` (negative), `keep_store_global.zer` (positive with keep).

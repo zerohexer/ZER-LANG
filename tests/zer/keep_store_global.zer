@@ -1,0 +1,20 @@
+// Test: keep pointer param stored to global — valid
+// keep qualifier allows storage, caller must provide global/static
+
+?*u32 g_ptr = null;
+
+void store(keep *u32 p) {
+    g_ptr = p;
+}
+
+u32 global_val = 42;
+
+u32 main() {
+    store(&global_val);
+    if (g_ptr) |p| {
+        if (*p != 42) { return 1; }
+    } else {
+        return 2;
+    }
+    return 0;
+}

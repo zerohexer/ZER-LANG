@@ -724,13 +724,25 @@ When `Handle(T) alias = h1` or `h2 = h1` is detected, the new variable is regist
 - **switch**: all arms free → `FREED`, some arms free → `MAYBE_FREED`
 - **loops**: unconditional free inside loop → error. Loop second pass: if state changed after first pass, run body once more; if still unstable → widen to `MAYBE_FREED`
 
-### Leak Detection
-At function exit, any handle that is `HS_ALIVE` or `HS_MAYBE_FREED` and was allocated inside the function (not a parameter) triggers a warning:
-- `HS_ALIVE` → "handle leaked: never freed"
-- `HS_MAYBE_FREED` → "handle leaked: may not be freed on all paths"
+### Leak Detection — Compile Error (2026-04-06 redesign)
+At function exit, any handle that is `HS_ALIVE` or `HS_MAYBE_FREED` and was allocated inside the function (not a parameter) triggers a **compile error** (MISRA C:2012 Rule 22.1):
+- `HS_ALIVE` → "handle allocated but never freed — add defer pool.free(h)"
+- `HS_MAYBE_FREED` → "handle may not be freed on all paths"
 - Parameter handles (pool_id == -1, alloc_line == func start) are excluded — caller is responsible.
 
-**Defer free scanning (2026-04-05):** Before leak detection, zercheck scans all top-level `NODE_DEFER` statements in the function body. `defer_scans_free()` checks for pool.free, slab.free_ptr, Task.delete, Task.delete_ptr, and bare free() calls inside defer bodies. Matched handles are marked HS_FREED, suppressing the false "never freed" warning.
+**alloc_id grouping:** Each allocation gets a unique `alloc_id`. Aliases (orelse unwrap, struct copy, assignment) share the same `alloc_id`. At leak check, if ANY handle in the group is FREED or escaped, the allocation is covered — no error. This naturally handles `?Handle mh` / `Handle h` pairs without false positives.
+
+**Escape detection:** Handles marked `escaped = true` when:
+- Returned from function (`return h`)
+- Stored in global variable
+- Stored in pointer parameter field (`s.top = h` where s is `*Stack`)
+- Assigned to untrackable target (variable-index array `handles[i] = h`)
+
+**if-unwrap alloc_id propagation:** `if (mh) |t| { free(t); }` — `t` gets `mh`'s alloc_id. When `t` is freed in then_state, the freed alloc_id propagates back to mark `mh` as covered in the main state. The not-taken path (null = no allocation) is not a leak.
+
+**Error deduplication:** One error per allocation (alloc_id), not per variable name. After reporting, alloc_id added to covered set.
+
+**Defer free scanning (2026-04-06, recursive):** Before leak detection, zercheck scans the ENTIRE function body recursively (not just top-level) for defer blocks containing free calls. Handles freed in defer are marked HS_FREED. `defer_scan_all_frees()` walks ALL statements in a defer block (not just the first — BUG-443 fix). Recognizes pool.free, slab.free, slab.free_ptr, Task.delete, Task.delete_ptr, and bare free() calls.
 
 **If-exit MAYBE_FREED fix (2026-04-05):** In if-without-else merging, `block_always_exits()` checks if the then-branch always exits (NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, or NODE_IF with both branches exiting). If the freeing branch always exits, handles stay ALIVE on the continuation path — the pattern `if (err) { free(h); return; } use(h);` is now correctly safe.
 

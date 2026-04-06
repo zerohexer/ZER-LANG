@@ -773,6 +773,8 @@ enum, union
 Runs a statement at scope exit, in reverse order of declaration.
 Fires on ALL exit paths (return, break, continue, end of block).
 
+Handle leaks are **compile errors** — allocating without `defer free()` (or returning/storing the handle) is rejected. The compiler error tells you exactly what to add.
+
 **SYNTAX**
 ```zer
 defer statement;

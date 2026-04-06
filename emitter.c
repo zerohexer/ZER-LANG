@@ -2935,6 +2935,51 @@ static void emit_stmt(Emitter *e, Node *node) {
         Type *ret_eff = e->current_func_ret ? type_unwrap_distinct(e->current_func_ret) : NULL;
         /* auto-guard: emit bounds guards before return expression */
         if (node->ret.expr) emit_auto_guards(e, node->ret.expr);
+        /* BUG-442: if there are pending defers AND a return expression that
+         * could be affected by defer side effects (function calls, field access),
+         * hoist the return value into a temp BEFORE firing defers.
+         * Otherwise defer free() runs before return value is computed → UAF.
+         * Use the function's return type for the temp to preserve ?T wrapping. */
+        if (node->ret.expr && e->defer_stack.count > 0 &&
+            node->ret.expr->kind != NODE_NULL_LIT &&
+            node->ret.expr->kind != NODE_INT_LIT &&
+            node->ret.expr->kind != NODE_BOOL_LIT &&
+            node->ret.expr->kind != NODE_FLOAT_LIT) {
+            int ret_tmp = e->temp_count++;
+            emit_indent(e);
+            /* emit full return type for the temp */
+            if (e->current_func_ret) {
+                emit_type(e, e->current_func_ret);
+            } else {
+                emit(e, "__auto_type");
+            }
+            emit(e, " _zer_ret%d = ", ret_tmp);
+            /* Check if wrapping is needed (?T from non-optional expr) */
+            Type *expr_type = checker_get_type(e->checker, node->ret.expr);
+            if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(ret_eff->optional.inner) &&
+                expr_type && !type_equals(expr_type, e->current_func_ret)) {
+                if (type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_VOID) {
+                    emit_expr(e, node->ret.expr);
+                    emit(e, ";\n");
+                    emit_indent(e);
+                    emit(e, "_zer_ret%d = (_zer_opt_void){ 1 };\n", ret_tmp);
+                } else {
+                    emit(e, "(");
+                    emit_type(e, e->current_func_ret);
+                    emit(e, "){ ");
+                    emit_expr(e, node->ret.expr);
+                    emit(e, ", 1 };\n");
+                }
+            } else {
+                emit_expr(e, node->ret.expr);
+                emit(e, ";\n");
+            }
+            emit_defers(e);
+            emit_indent(e);
+            emit(e, "return _zer_ret%d;\n", ret_tmp);
+            break;
+        }
         /* emit defers before return (reverse order) */
         emit_defers(e);
         emit_indent(e);

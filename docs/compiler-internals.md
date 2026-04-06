@@ -771,6 +771,12 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
 5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
 
+### Defer Before Return Expression — UAF (BUG-442, 2026-04-06)
+
+`defer free(h); return get(h).val;` → emitted C called free BEFORE evaluating return expression. Fix: when NODE_RETURN has expression AND pending defers, hoist into typed temp: `RetType _ret = expr; defers; return _ret;`. Handles `?T` wrapping (optional return from non-optional expression). Skips trivial literals (no side effects).
+
+**CRITICAL: Every `return expr` with `defer` that accessed deferred resources was silently broken.** This is the most common embedded pattern — `defer free(h); return h.field;`. All existing tests happened to return literal values or variables that didn't touch deferred resources.
+
 ### Keep Validation Variable Mismatch (BUG-441, 2026-04-06)
 
 `arg_node` vs `karg` in keep parameter validation (NODE_CALL). The orelse-unwrap + intrinsic-walk loop produces `karg`, but line 3147 used `arg_node` (original unwrapped). `@ptrcast(*opaque, &global)` as arg → `arg_node` is NODE_INTRINSIC → `arg_node->unary.operand` segfaults.

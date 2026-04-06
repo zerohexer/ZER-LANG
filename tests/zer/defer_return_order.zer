@@ -1,0 +1,35 @@
+// BUG-442: defer fires before return expression was evaluated
+// return pool.get(h).val with defer pool.free(h) → UAF
+// Fix: hoist return expression into temp before firing defers
+
+struct Data { u32 val; u32 extra; }
+Slab(Data) store;
+
+u32 get_value() {
+    ?Handle(Data) mh = store.alloc();
+    Handle(Data) h = mh orelse return;
+    defer store.free(h);
+    store.get(h).val = 42;
+    store.get(h).extra = 99;
+    // This return must evaluate BEFORE defer frees h
+    return store.get(h).val + store.get(h).extra;
+}
+
+?u32 get_optional() {
+    ?Handle(Data) mh = store.alloc();
+    Handle(Data) h = mh orelse return;
+    defer store.free(h);
+    store.get(h).val = 77;
+    return store.get(h).val;
+}
+
+u32 main() {
+    u32 r1 = get_value();
+    if (r1 != 141) { return 1; }
+
+    ?u32 r2 = get_optional();
+    u32 v2 = r2 orelse return;
+    if (v2 != 77) { return 2; }
+
+    return 0;
+}

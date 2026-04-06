@@ -505,15 +505,24 @@ void ast_print(Node *node, int indent);
  * array/pool/ring size and won't appear in real constant expressions. */
 #define CONST_EVAL_FAIL INT64_MIN
 
-/* BUG-389: depth-limited version prevents stack overflow on pathological input */
-static inline int64_t eval_const_expr_d(Node *n, int depth) {
+/* Optional ident resolver callback for eval_const_expr_ex.
+ * When provided, NODE_IDENT is resolved via this callback instead of failing.
+ * Breaks circular dependency: ast.h doesn't need Checker, caller provides resolver. */
+typedef int64_t (*ConstIdentResolver)(void *ctx, const char *name, uint32_t name_len);
+
+/* Extended constant expression evaluator with optional ident resolution.
+ * Pass resolve=NULL and resolve_ctx=NULL for basic evaluation (same as eval_const_expr). */
+static inline int64_t eval_const_expr_ex(Node *n, int depth,
+                                          ConstIdentResolver resolve, void *resolve_ctx) {
     if (!n || depth > 256) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
-    /* BUG-415: resolved comptime calls (including negative results) */
     if (n->kind == NODE_CALL && n->call.is_comptime_resolved)
         return n->call.comptime_value;
+    /* Ident resolution via callback */
+    if (n->kind == NODE_IDENT && resolve)
+        return resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len);
     if (n->kind == NODE_UNARY) {
-        int64_t v = eval_const_expr_d(n->unary.operand, depth + 1);
+        int64_t v = eval_const_expr_ex(n->unary.operand, depth + 1, resolve, resolve_ctx);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         if (n->unary.op == TOK_MINUS) return -v;
         if (n->unary.op == TOK_TILDE) return ~v;
@@ -521,12 +530,11 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
         return CONST_EVAL_FAIL;
     }
     if (n->kind == NODE_BINARY) {
-        int64_t l = eval_const_expr_d(n->binary.left, depth + 1);
-        int64_t r = eval_const_expr_d(n->binary.right, depth + 1);
+        int64_t l = eval_const_expr_ex(n->binary.left, depth + 1, resolve, resolve_ctx);
+        int64_t r = eval_const_expr_ex(n->binary.right, depth + 1, resolve, resolve_ctx);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         switch (n->binary.op) {
         case TOK_PLUS:
-            /* overflow check: if signs match and result sign differs */
             if ((r > 0 && l > INT64_MAX - r) || (r < 0 && l < INT64_MIN - r))
                 return CONST_EVAL_FAIL;
             return l + r;
@@ -535,7 +543,6 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
                 return CONST_EVAL_FAIL;
             return l - r;
         case TOK_STAR:
-            /* overflow check for multiplication */
             if (l != 0 && r != 0) {
                 if ((l > 0 && r > 0 && l > INT64_MAX / r) ||
                     (l < 0 && r < 0 && l < INT64_MAX / r) ||
@@ -546,7 +553,6 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
             return l * r;
         case TOK_SLASH:
             if (r == 0) return CONST_EVAL_FAIL;
-            /* BUG-296: INT_MIN / -1 is signed overflow */
             if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
             return l / r;
         case TOK_PERCENT:
@@ -555,7 +561,6 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
             return l % r;
         case TOK_LSHIFT:
             if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
-            /* BUG-318: cast to unsigned to avoid signed overflow UB */
             return (int64_t)((uint64_t)l << r);
         case TOK_RSHIFT:
             if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
@@ -563,7 +568,6 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
         case TOK_AMP:     return l & r;
         case TOK_PIPE:    return l | r;
         case TOK_CARET:   return l ^ r;
-        /* comparison operators — return 1 (true) or 0 (false) */
         case TOK_GT:      return l > r ? 1 : 0;
         case TOK_LT:      return l < r ? 1 : 0;
         case TOK_GTEQ:    return l >= r ? 1 : 0;
@@ -576,6 +580,11 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
         }
     }
     return CONST_EVAL_FAIL;
+}
+
+/* BUG-389: depth-limited version — delegates to eval_const_expr_ex with no resolver */
+static inline int64_t eval_const_expr_d(Node *n, int depth) {
+    return eval_const_expr_ex(n, depth, NULL, NULL);
 }
 static inline int64_t eval_const_expr(Node *n) {
     return eval_const_expr_d(n, 0);

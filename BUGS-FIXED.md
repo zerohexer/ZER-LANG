@@ -2769,3 +2769,37 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Previous fix only handled `p = @cstr(local,...); return identity(p)` (intermediate variable). Direct `identity(@cstr(local,...))` has the @cstr as a NODE_INTRINSIC arg to the call — no intermediate symbol to mark.
 - **Fix:** Added NODE_INTRINSIC("cstr") case in `call_has_local_derived_arg`: walks first arg (buffer) to root ident, returns true if local.
 - **Test:** 1 new checker test.
+
+---
+
+## Session 2026-04-06 — @critical Safety + Auto-Guard Walker Gaps
+
+### BUG-433: emit_auto_guards missing NODE_INTRINSIC, NODE_SLICE, NODE_ORELSE fallback
+- **Symptom:** `u32 x = @bitcast(u32, arr[i])` where `i` is unproven — auto-guard silently skipped. The checker marked `arr[i]` for auto-guard, but the emitter's expression walker didn't recurse into intrinsic args. Instead of a graceful return, the hard `_zer_bounds_check` trap fired.
+- **Root cause:** `emit_auto_guards` only handled NODE_INDEX, NODE_FIELD, NODE_ASSIGN, NODE_BINARY, NODE_UNARY, NODE_CALL, NODE_ORELSE. Missing: NODE_INTRINSIC (intrinsic args), NODE_SLICE (sub-slice expressions), NODE_ORELSE fallback (value fallback path).
+- **Fix:** Added 3 cases to `emit_auto_guards`: NODE_INTRINSIC (recurse all args), NODE_SLICE (object/start/end), NODE_ORELSE (recurse fallback when not return/break/continue).
+- **Test:** `autoguard_intrinsic.zer` — array index inside @bitcast, auto-guard fires correctly.
+
+### BUG-434: contains_break missing NODE_CRITICAL
+- **Symptom:** `while(true) { @critical { break; } }` — `contains_break` didn't recurse into `@critical` body, so `all_paths_return` falsely considered the while(true) loop a terminator (infinite, no break). Functions could appear to "always return" when they actually exit via break from a critical block.
+- **Root cause:** `contains_break` switch had no NODE_CRITICAL case — fell to `default: return false`.
+- **Fix:** Added `case NODE_CRITICAL: return contains_break(node->critical.body);`.
+- **Test:** `critical_break.zer` (negative — break banned inside @critical, see BUG-436).
+
+### BUG-435: all_paths_return missing NODE_CRITICAL
+- **Symptom:** `@critical { return 42; }` as last statement in non-void function — rejected with "not all control flow paths return a value" even though it always returns.
+- **Root cause:** `all_paths_return` switch had no NODE_CRITICAL case — fell to `default: return false`.
+- **Fix:** Added `case NODE_CRITICAL: return all_paths_return(node->critical.body);`.
+- **Test:** `critical_return.zer` (negative — return banned inside @critical, see BUG-436).
+
+### BUG-436: return/break/continue/goto inside @critical not banned — leaves interrupts disabled
+- **Symptom:** `@critical { return; }` compiled without error. The interrupt re-enable code (emitted after the body) became dead code — interrupts permanently disabled. Same class as `defer` control flow ban (BUG-192).
+- **Root cause:** `@critical` had no `critical_depth` tracking. `defer` uses `defer_depth` to ban return/break/continue/goto, but `@critical` had no equivalent.
+- **Fix:** Added `int critical_depth` to Checker struct. Incremented/decremented in NODE_CRITICAL handler. All 4 control flow nodes (return, break, continue, goto) check `critical_depth > 0` → compile error with message "interrupts would not be re-enabled".
+- **Test:** `critical_return.zer` (negative), `critical_break.zer` (negative).
+
+### BUG-437: zercheck zc_check_stmt missing NODE_CRITICAL
+- **Symptom:** `@critical { pool.free(h); pool.get(h); }` — use-after-free invisible to zercheck. Handle tracking didn't recurse into @critical block bodies.
+- **Root cause:** `zc_check_stmt` switch had no NODE_CRITICAL case. Also `block_always_exits` didn't handle NODE_CRITICAL.
+- **Fix:** Added `case NODE_CRITICAL: zc_check_stmt(zc, ps, node->critical.body);` in zc_check_stmt. Added `if (node->kind == NODE_CRITICAL) return block_always_exits(node->critical.body);` in block_always_exits.
+- **Test:** `critical_handle.zer` (positive — handle ops inside @critical tracked correctly).

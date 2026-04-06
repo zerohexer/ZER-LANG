@@ -1,0 +1,16 @@
+// Test: handle tracking works inside @critical blocks
+// Verifies zercheck recurses into NODE_CRITICAL bodies
+
+struct Data { u32 val; }
+Pool(Data, 4) pool;
+
+u32 main() {
+    ?Handle(Data) mh = pool.alloc();
+    Handle(Data) h = mh orelse return;
+    @critical {
+        pool.get(h).val = 42;
+    }
+    u32 result = pool.get(h).val;
+    pool.free(h);
+    return result - 42;
+}

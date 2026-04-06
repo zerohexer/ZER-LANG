@@ -277,6 +277,9 @@ static bool block_always_exits(Node *node) {
         return block_always_exits(node->if_stmt.then_body) &&
                block_always_exits(node->if_stmt.else_body);
     }
+    if (node->kind == NODE_CRITICAL) {
+        return block_always_exits(node->critical.body);
+    }
     return false;
 }
 
@@ -1088,6 +1091,12 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         break;
 
     case NODE_DEFER:
+        break;
+
+    case NODE_CRITICAL:
+        /* @critical { body } — check body for handle operations */
+        if (node->critical.body)
+            zc_check_stmt(zc, ps, node->critical.body);
         break;
 
     case NODE_SWITCH: {

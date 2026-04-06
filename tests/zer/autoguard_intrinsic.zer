@@ -1,0 +1,19 @@
+// Test: auto-guard fires for array index inside intrinsic
+// Bug: emit_auto_guards didn't recurse into NODE_INTRINSIC,
+// so the auto-guard return was silently skipped.
+
+u32 get_idx() {
+    return 1;
+}
+
+u32 main() {
+    u32[4] buf;
+    buf[0] = 10;
+    buf[1] = 20;
+    buf[2] = 30;
+    buf[3] = 40;
+    u32 i = get_idx();
+    // arr[i] is inside @bitcast — auto-guard must still fire
+    u32 val = @bitcast(u32, buf[i]);
+    return val - 20;
+}

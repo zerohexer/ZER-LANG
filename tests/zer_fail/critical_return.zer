@@ -1,0 +1,14 @@
+// Test: return inside @critical as last statement in non-void function
+// Bug: all_paths_return didn't recurse into NODE_CRITICAL,
+// so it rejected "not all paths return" for valid code.
+
+u32 compute(u32 x) {
+    @critical {
+        return x + 1;
+    }
+}
+
+u32 main() {
+    u32 val = compute(41);
+    return val - 42;
+}

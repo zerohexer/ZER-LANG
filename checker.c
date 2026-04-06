@@ -5908,6 +5908,12 @@ static void check_stmt(Checker *c, Node *node) {
                 "cannot use 'return' inside defer block");
             break;
         }
+        /* return inside @critical skips interrupt re-enable */
+        if (c->critical_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'return' inside @critical block — interrupts would not be re-enabled");
+            break;
+        }
 
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
@@ -6245,6 +6251,9 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_BREAK:
         if (c->defer_depth > 0) {
             checker_error(c, node->loc.line, "cannot use 'break' inside defer block");
+        } else if (c->critical_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'break' inside @critical block — interrupts would not be re-enabled");
         } else if (!c->in_loop) {
             checker_error(c, node->loc.line, "'break' outside of loop");
         }
@@ -6254,6 +6263,9 @@ static void check_stmt(Checker *c, Node *node) {
         /* goto target label validation done in check_function_body (post-pass) */
         if (c->defer_depth > 0) {
             checker_error(c, node->loc.line, "cannot use 'goto' inside defer block");
+        } else if (c->critical_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'goto' inside @critical block — interrupts would not be re-enabled");
         }
         break;
 
@@ -6264,6 +6276,9 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_CONTINUE:
         if (c->defer_depth > 0) {
             checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
+        } else if (c->critical_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'continue' inside @critical block — interrupts would not be re-enabled");
         } else if (!c->in_loop) {
             checker_error(c, node->loc.line, "'continue' outside of loop");
         }
@@ -6313,10 +6328,13 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_CRITICAL:
-        /* @critical { body } — check body normally */
+        /* @critical { body } — check body, ban return/break/continue/goto
+         * (jumping out skips interrupt re-enable — leaves system broken) */
+        c->critical_depth++;
         if (node->critical.body) {
             check_stmt(c, node->critical.body);
         }
+        c->critical_depth--;
         break;
 
     default:
@@ -6808,6 +6826,10 @@ static bool contains_break(Node *node) {
         return node->var_decl.init ? contains_break(node->var_decl.init) : false;
     case NODE_EXPR_STMT:
         return node->expr_stmt.expr ? contains_break(node->expr_stmt.expr) : false;
+    case NODE_CRITICAL:
+        return contains_break(node->critical.body);
+    case NODE_DEFER:
+        return false; /* break banned in defer — checker rejects it */
     default: return false;
     }
 }
@@ -6872,6 +6894,8 @@ static bool all_paths_return(Node *node) {
     case NODE_EXPR_STMT:
         /* orelse return/break in expression statement — check for trap calls etc */
         return false;
+    case NODE_CRITICAL:
+        return all_paths_return(node->critical.body);
     default:
         return false;
     }

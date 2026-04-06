@@ -1559,6 +1559,8 @@ bool swapped = @atomic_cas(&lock, 0, 1);
 Interrupt-disabled block. Disables interrupts on entry, re-enables on exit.
 Per-architecture interrupt disable/enable.
 
+`return`, `break`, `continue`, and `goto` are **banned** inside `@critical` blocks — jumping out would skip the interrupt re-enable, leaving the system with interrupts permanently disabled.
+
 **EXAMPLE**
 ```zer
 @critical {

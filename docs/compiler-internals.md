@@ -2032,6 +2032,32 @@ The BUG-205 assignment escape check (`g_ptr = local_derived_ptr`) only fired whe
 - **zercheck variable-index handles:** `arr[i]` with variable index still untrackable — falls back to runtime generation counter traps. Constant indices (`arr[0]`, `s.h`) now tracked via compound string keys (BUG-357 fix).
 - **Dual symbol registration for imported globals:** Imported non-static globals/functions are registered TWICE in global scope — raw name + mangled name (BUG-233). This is intentional (emitter needs both), but any code that scans global scope for unique matches (like `find_unique_allocator`) must handle duplicates. Pattern: check `found->type == candidate->type` before declaring ambiguity.
 
+### @critical Control Flow Ban (BUG-436, 2026-04-06)
+
+`return`, `break`, `continue`, and `goto` are banned inside `@critical` blocks. Jumping out skips the interrupt re-enable code (emitted after the body), leaving the system with interrupts permanently disabled. Same pattern as `defer` control flow ban (BUG-192) using `critical_depth` counter on Checker struct.
+
+**When adding new control flow nodes:** check BOTH `defer_depth > 0` AND `critical_depth > 0`.
+
+### emit_auto_guards Walker Completeness (BUG-433, 2026-04-06)
+
+`emit_auto_guards` must recurse into ALL expression node types that can contain NODE_INDEX children. Missing node types silently skip auto-guards (graceful return not emitted, hard trap fires instead).
+
+**Nodes handled:** NODE_INDEX, NODE_FIELD, NODE_ASSIGN, NODE_BINARY, NODE_UNARY, NODE_CALL, NODE_ORELSE (expr + value fallback), NODE_INTRINSIC (all args), NODE_SLICE (object/start/end).
+
+**When adding new expression nodes:** add a case to `emit_auto_guards` that recurses into all child expressions.
+
+### NODE_CRITICAL in AST Walkers (BUG-434/435/437, 2026-04-06)
+
+NODE_CRITICAL must be handled in ALL recursive AST walkers:
+- `contains_break` — recurse into body (break inside @critical targets outer loop)
+- `all_paths_return` — recurse into body (return inside @critical counts)
+- `zc_check_stmt` (zercheck) — recurse into body (handle ops inside @critical must be tracked)
+- `block_always_exits` (zercheck) — recurse into body
+- `collect_labels` — already handled
+- `validate_gotos` — already handled
+
+**When adding new AST walkers that recurse through statements:** add NODE_CRITICAL case.
+
 ### Deref Walk in Flag Propagation (BUG-356)
 The is_local_derived/is_arena_derived propagation walk now handles `NODE_UNARY(TOK_STAR)` — pointer dereference. `*u32 p2 = *pp` where `pp` is a double pointer to a local-derived pointer — the walk goes through the deref to find `pp`, checks its flags, propagates to `p2`. Without this, double pointers "washed" the safety flag. Same walk location as BUG-338 (intrinsic args) at ~line 3232.
 
@@ -2319,7 +2345,7 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 3. **Boot-time:** `_zer_mmio_validate()` probes declared range starts (catches wrong datasheet)
 4. **Runtime:** universal `signal()` fault handler catches bad registers within ranges (zero per-access cost, fires only on CPU fault)
 
-## Test Counts (v0.2.1 final)
+## Test Counts (v0.2.1 current)
 
 | File | What | Count |
 |---|---|---|
@@ -2328,11 +2354,11 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 | `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
 | `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
 | `test_checker.c` | Type checking basic | 72 |
-| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack + escape | 557 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack + escape | 584 |
 | `test_extra.c` | Additional checker | 18 |
 | `test_gaps.c` | Gap coverage | 4 |
 | `test_emit.c` | Full E2E (ZER→C→GCC→run) + signal() fault handler | 238 |
-| `test_zercheck.c` | Handle tracking, leaks, cross-func | 50 |
+| `test_zercheck.c` | Handle tracking, leaks, cross-func | 54 |
 | `test_fuzz.c` | Parser adversarial inputs | 491 |
 | `test_firmware_patterns.c` | Round 1 firmware | 39 |
 | `test_firmware_patterns2.c` | Round 2 firmware | 41 |

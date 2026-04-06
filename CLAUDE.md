@@ -499,6 +499,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Checker key buffers are now arena-allocated (RF12) — no fixed `char[128]` limits remain
 - Symbol lookup is `memcmp`-based — standard for C compilers (GCC/TCC do the same)
 - ZER does NOT need: lifetime/borrow tracking (memory model too simple for it), generics (`*opaque`+provenance covers it), incremental compilation (emit-C + Makefile handles it), closures (function pointers + `*opaque` context is the C pattern)
+- **Bounds safety philosophy: prove, don't guard.** When array index can't be proven safe, prefer extending range propagation to make it provable (zero overhead) over adding auto-guard/bounds-check (runtime overhead). `arr[func()]` with proven return range = zero overhead. Auto-guard is the fallback, not the goal. For loop conditions (while/for), auto-guard can't work (value changes each iteration) — instead extend `find_return_range` to prove more call chains. Inline `_zer_bounds_check` trap is correct for genuinely unprovable cases (external input).
+- **`find_return_range` chains:** `get_slot()` → `raw_hash()` → `% N` — return range propagates through call chains. Constant returns (`return 0`), `% N`, `& MASK`, and chained calls all handled. Order-dependent: callee checked before caller (declaration order). Cross-module: topological order ensures imported function ranges available.
 
 **Error Display:**
 - Errors show source line + caret underline: `3 | arr[10] = 1;` / `  | ^^^^^^^^^^^^`

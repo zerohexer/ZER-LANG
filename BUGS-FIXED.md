@@ -27,6 +27,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
   5. UAF-at-call-site: passing freed `*opaque` to non-free function = compile error
   6. Qualified call support: `module.func()` summaries resolved via field name
 - **Tests:** `test_modules/opaque_wrap.zer` (positive), `test_modules/opaque_wrap_df.zer` (double-free), `test_modules/opaque_wrap_uaf.zer` (UAF)
+- **Critical fix:** `import_asts` fed to zercheck in BFS order — dependencies scanned AFTER dependents, breaking summary chain. Fix: use `topo_order` (3 lines in zerc_main.c). Same topo_order already used for emission.
 
 ### NEW FEATURE: Dynamic array Handle UAF auto-guard
 - **What:** `pool.free(handles[k])` with variable `k` followed by `handles[j].field` — compiler auto-inserts `if (j == k) { return; }` guard. Loop-free-all pattern → compile error.

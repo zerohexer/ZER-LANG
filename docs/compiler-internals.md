@@ -2058,6 +2058,10 @@ NODE_CRITICAL must be handled in ALL recursive AST walkers:
 
 **When adding new AST walkers that recurse through statements:** add NODE_CRITICAL case.
 
+### Distinct Union Variant Assignment (BUG-438, 2026-04-06)
+
+`distinct typedef union Msg SafeMsg` — variant assignment `sm.sensor = 42` must update `_tag`. The emitter's NODE_ASSIGN handler checks `obj_type->kind == TYPE_UNION`, but `checker_get_type` returns TYPE_DISTINCT wrapping TYPE_UNION. Fix: `type_unwrap_distinct(obj_type)` before the check. **Same pattern as BUG-409/410 (35+ sites fixed), but this one was missed.**
+
 ### Deref Walk in Flag Propagation (BUG-356)
 The is_local_derived/is_arena_derived propagation walk now handles `NODE_UNARY(TOK_STAR)` — pointer dereference. `*u32 p2 = *pp` where `pp` is a double pointer to a local-derived pointer — the walk goes through the deref to find `pp`, checks its flags, propagates to `p2`. Without this, double pointers "washed" the safety flag. Same walk location as BUG-338 (intrinsic args) at ~line 3232.
 

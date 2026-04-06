@@ -1,0 +1,35 @@
+// Test: distinct typedef union — variant assignment must update _tag
+// BUG-438: emitter skipped tag update for distinct-wrapped unions
+
+union Msg {
+    u32 sensor;
+    u32 cmd;
+}
+
+distinct typedef Msg SafeMsg;
+
+u32 main() {
+    SafeMsg sm;
+    sm.sensor = 42;
+
+    // Cast back to switch on it
+    Msg m = @cast(Msg, sm);
+    switch (m) {
+        .sensor => |val| {
+            if (val != 42) { return 1; }
+        }
+        .cmd => { return 2; }
+    }
+
+    // Now switch variant — tag must update to cmd (index 1)
+    sm.cmd = 99;
+    Msg m2 = @cast(Msg, sm);
+    switch (m2) {
+        .sensor => { return 3; }
+        .cmd => |val| {
+            if (val != 99) { return 4; }
+        }
+    }
+
+    return 0;
+}

@@ -15,6 +15,25 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-06 — *opaque Compile-Time Tracking
+
+### NEW FEATURE: Full cross-module *opaque compile-time safety
+- **What:** `*opaque` pointers through wrapper functions (any depth) now fully tracked at compile time. Double-free, UAF, and leak detected across module boundaries without runtime checks.
+- **Components:**
+  1. Signature heuristic: bodyless `void func(*opaque)` auto-detected as free
+  2. @ptrcast alias tracking: `*T r = @ptrcast(*T, handle)` links `r` to `handle`
+  3. Wrapper allocator recognition: any call returning `?*opaque`/`?*T` registers ALIVE
+  4. Cross-module summaries: imported module ASTs scanned for FuncSummary
+  5. UAF-at-call-site: passing freed `*opaque` to non-free function = compile error
+  6. Qualified call support: `module.func()` summaries resolved via field name
+- **Tests:** `test_modules/opaque_wrap.zer` (positive), `test_modules/opaque_wrap_df.zer` (double-free), `test_modules/opaque_wrap_uaf.zer` (UAF)
+
+### NEW FEATURE: Dynamic array Handle UAF auto-guard
+- **What:** `pool.free(handles[k])` with variable `k` followed by `handles[j].field` — compiler auto-inserts `if (j == k) { return; }` guard. Loop-free-all pattern → compile error.
+- **Tests:** `tests/zer/dyn_array_guard.zer` (positive), `tests/zer_fail/dyn_array_loop_freed.zer` (negative)
+
+---
+
 ## Session 2026-04-06 — Scale Testing (BUG-432)
 
 ### BUG-432: Module-qualified variable access (`config.VERSION`)

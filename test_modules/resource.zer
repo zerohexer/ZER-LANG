@@ -1,0 +1,20 @@
+// Resource module for cross-module *opaque tracking tests
+struct RealData { u32 value; }
+Slab(RealData) storage;
+
+?*opaque resource_create(u32 val) {
+    ?*RealData mr = storage.alloc_ptr();
+    *RealData r = mr orelse { return null; };
+    r.value = val;
+    return @ptrcast(*opaque, r);
+}
+
+void resource_destroy(*opaque handle) {
+    *RealData r = @ptrcast(*RealData, handle);
+    storage.free_ptr(r);
+}
+
+u32 resource_read(*opaque handle) {
+    *RealData r = @ptrcast(*RealData, handle);
+    return r.value;
+}

@@ -297,9 +297,18 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Qualified call summary lookup:** `zc_apply_summary` handles NODE_FIELD callee (`module.func()`) by extracting field name as function name.
 
-**Known remaining gaps:**
-- `?*opaque r = wrapper_create()` — custom wrapper allocators not recognized (only `pool.alloc`/`slab.alloc` patterns registered). Needs `is_alloc_call` expansion for functions with bodies returning `?*opaque`.
-- 3-layer ZER wrapper chains: summary propagation works but alloc registration at call site doesn't track the returned `*opaque` as ALIVE.
+**Wrapper allocator recognition:** `?*opaque r = wrapper_create()` now registers `r` as ALIVE. Any function call returning `?*opaque`, `?*T`, `*opaque`, or `*T` is treated as an allocation. This covers arbitrary wrapper depths — the variable is tracked regardless of how many layers the allocation goes through.
+
+**Full cross-module *opaque tracking now works:**
+```
+// resource.zer — wrapper module
+void resource_destroy(*opaque h) { *RealData r = @ptrcast(*RealData, h); slab.free_ptr(r); }
+
+// main.zer
+resource.resource_destroy(r);   // zercheck: r = FREED (summary + alias)
+resource.resource_destroy(r);   // COMPILE ERROR: double free
+resource.resource_read(r);      // COMPILE ERROR: use after free
+```
 
 ### @ptrcast _zer_check_alive .ptr (BUG-431, 2026-04-05)
 

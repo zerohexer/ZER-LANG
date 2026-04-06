@@ -1,0 +1,27 @@
+// Deep cross-module defer: 3-layer resource management
+// Layer 1: raw pool operations
+
+struct Connection { u32 fd; u32 port; bool active; }
+Slab(Connection) conn_pool;
+
+?Handle(Connection) conn_open(u32 port) {
+    ?Handle(Connection) mh = conn_pool.alloc();
+    Handle(Connection) h = mh orelse return;
+    conn_pool.get(h).fd = port + 1000;
+    conn_pool.get(h).port = port;
+    conn_pool.get(h).active = true;
+    return mh;
+}
+
+void conn_close(Handle(Connection) h) {
+    conn_pool.get(h).active = false;
+    conn_pool.free(h);
+}
+
+u32 conn_fd(Handle(Connection) h) {
+    return conn_pool.get(h).fd;
+}
+
+bool conn_active(Handle(Connection) h) {
+    return conn_pool.get(h).active;
+}

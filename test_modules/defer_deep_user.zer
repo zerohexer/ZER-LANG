@@ -1,0 +1,63 @@
+// Layer 2: uses defer_deep module — multi-connection with block defer
+// Tests: cross-module alloc + defer free, return through defer,
+// multiple handles from different calls, if-unwrap + defer
+
+import defer_deep;
+
+struct Session { u32 id; u32 total_bytes; }
+Slab(Session) sessions;
+
+u32 transfer(u32 src_port, u32 dst_port) {
+    // Open two connections — block defer frees both
+    ?Handle(Connection) mc1 = conn_open(src_port);
+    Handle(Connection) c1 = mc1 orelse return;
+    ?Handle(Connection) mc2 = conn_open(dst_port);
+    Handle(Connection) c2 = mc2 orelse return;
+    defer {
+        conn_close(c1);
+        conn_close(c2);
+    }
+
+    // Create session — separate defer
+    ?Handle(Session) ms = sessions.alloc();
+    Handle(Session) sess = ms orelse return;
+    defer sessions.free(sess);
+
+    sessions.get(sess).id = conn_fd(c1);
+    sessions.get(sess).total_bytes = 0;
+
+    // Simulate transfer
+    for (u32 i = 0; i < 5; i += 1) {
+        sessions.get(sess).total_bytes = sessions.get(sess).total_bytes + 64;
+    }
+
+    // Return accesses deferred data (BUG-442 fix)
+    return sessions.get(sess).total_bytes + conn_fd(c1) + conn_fd(c2);
+}
+
+u32 conditional_connect(bool do_connect) {
+    if (!do_connect) { return 0; }
+    ?Handle(Connection) mc = conn_open(8080);
+    if (mc) |c| {
+        u32 fd = conn_fd(c);
+        conn_close(c);
+        return fd;
+    }
+    return 0;
+}
+
+u32 main() {
+    // transfer: 320 bytes + fd(1080) + fd(1090) = 320 + 1080 + 1090 = 2490
+    u32 result = transfer(80, 90);
+    if (result != 2490) { return 1; }
+
+    // conditional: fd = 8080 + 1000 = 9080
+    u32 fd = conditional_connect(true);
+    if (fd != 9080) { return 2; }
+
+    // not connected: 0
+    u32 none = conditional_connect(false);
+    if (none != 0) { return 3; }
+
+    return 0;
+}

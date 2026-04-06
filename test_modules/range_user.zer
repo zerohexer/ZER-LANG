@@ -1,0 +1,36 @@
+// Cross-module: uses range_lib functions to index arrays
+// NO auto-guard should fire — all proven via cross-module return range
+
+import range_lib;
+
+u32[16] slots;
+
+u32 main() {
+    for (u32 i = 0; i < 16; i += 1) { slots[i] = i + 50; }
+
+    // Cross-module modulo — proven [0, 15]
+    u32 s1 = hash_slot(42);
+    u32 v1 = slots[s1];
+    if (v1 != 60) { return 1; }
+
+    // Cross-module guard-clamp — proven [0, 15]
+    u32 s2 = safe_slot(9999);
+    u32 v2 = slots[s2];
+    if (v2 != 50) { return 2; }
+
+    // Cross-module bitwise mask — proven [0, 15]
+    u32 s3 = mask_slot(0xABCD);
+    u32 v3 = slots[s3];
+
+    // Cross-module chained (chain_slot → hash_slot → % 16) — proven [0, 15]
+    u32 s4 = chain_slot(77);
+    u32 v4 = slots[s4];
+
+    // Inline cross-module calls — proven
+    u32 v5 = slots[hash_slot(99)];
+    u32 v6 = slots[safe_slot(888)];
+    u32 v7 = slots[mask_slot(0xFFFF)];
+    u32 v8 = slots[chain_slot(123)];
+
+    return 0;
+}

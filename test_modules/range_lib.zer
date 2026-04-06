@@ -1,0 +1,21 @@
+// Cross-module range proving library
+// All functions have provable return ranges
+
+comptime u32 MAX_SLOTS() { return 16; }
+
+u32 hash_slot(u32 key) {
+    return key % MAX_SLOTS();
+}
+
+u32 safe_slot(u32 raw) {
+    if (raw >= 16) { return 0; }
+    return raw;
+}
+
+u32 mask_slot(u32 val) {
+    return val & 15;
+}
+
+u32 chain_slot(u32 key) {
+    return hash_slot(key);
+}

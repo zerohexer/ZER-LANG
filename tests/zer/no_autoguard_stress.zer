@@ -1,0 +1,186 @@
+// Stress test: NO auto-guard should fire for ANY of these
+// Obfuscated, deep layered, cross-function, complex patterns
+
+u32[32] big;
+u32[8] small;
+u32[16] mid;
+u32[4] tiny;
+
+// === Layer 1: basic range functions ===
+u32 mod32(u32 x) { return x % 32; }
+u32 mod16(u32 x) { return x % 16; }
+u32 mod8(u32 x) { return x % 8; }
+u32 mod4(u32 x) { return x & 3; }
+
+// === Layer 2: wraps layer 1 with extra logic ===
+u32 pick_slot(u32 key) {
+    if (key == 0) { return 0; }
+    if (key == 1) { return 31; }
+    return mod32(key);
+}
+
+u32 pick_bucket(u32 hash_val) {
+    if (hash_val == 0) { return 7; }
+    return mod8(hash_val);
+}
+
+// === Layer 3: wraps layer 2 ===
+u32 get_index(u32 a, u32 b) {
+    u32 combined = a + b;
+    return pick_slot(combined);
+}
+
+u32 deep_lookup(u32 x) {
+    return pick_bucket(mod8(x));
+}
+
+// === Guard-clamp variants ===
+u32 clamp_tiny(u32 idx) {
+    if (idx >= 4) { return 3; }
+    return idx;
+}
+
+u32 clamp_mid(u32 idx) {
+    if (idx >= 16) { return 0; }
+    return idx;
+}
+
+u32 double_clamp(u32 idx) {
+    u32 c = clamp_mid(idx);
+    return c;
+}
+
+// === Comptime depth ===
+comptime u32 TABLE_BITS() { return 5; }
+comptime u32 TABLE_SIZE() { return 1 << TABLE_BITS(); }
+comptime u32 TABLE_MASK() { return TABLE_SIZE() - 1; }
+comptime u32 HALF_SIZE() { return TABLE_SIZE() / 2; }
+
+// === Mixed comptime + runtime ===
+u32 comptime_mod(u32 key) {
+    return key % TABLE_SIZE();
+}
+
+u32 comptime_mask(u32 key) {
+    return key & TABLE_MASK();
+}
+
+// === Multi-return with all paths bounded ===
+u32 multi_path(u32 x) {
+    if (x == 0) { return 0; }
+    if (x == 1) { return 1; }
+    if (x == 2) { return 2; }
+    if (x > 100) { return 7; }
+    return x % 8;
+}
+
+// === Chained guard clamp ===
+u32 safe_idx(u32 raw) {
+    if (raw >= 32) { return mod32(raw); }
+    return raw;
+}
+
+u32 main() {
+    // Init all arrays
+    for (u32 i = 0; i < 32; i += 1) { big[i] = i; }
+    for (u32 i = 0; i < 16; i += 1) { mid[i] = i + 100; }
+    for (u32 i = 0; i < 8; i += 1) { small[i] = i + 200; }
+    for (u32 i = 0; i < 4; i += 1) { tiny[i] = i + 300; }
+
+    // === Inline layer 1 calls ===
+    u32 v1 = big[mod32(999)];
+    u32 v2 = mid[mod16(999)];
+    u32 v3 = small[mod8(999)];
+    u32 v4 = tiny[mod4(999)];
+
+    // === Variable from layer 2 ===
+    u32 s1 = pick_slot(0);
+    u32 r1 = big[s1];
+    u32 s2 = pick_slot(1);
+    u32 r2 = big[s2];
+    u32 s3 = pick_slot(42);
+    u32 r3 = big[s3];
+
+    u32 b1 = pick_bucket(0);
+    u32 r4 = small[b1];
+    u32 b2 = pick_bucket(77);
+    u32 r5 = small[b2];
+
+    // === Layer 3 calls ===
+    u32 i1 = get_index(10, 20);
+    u32 r6 = big[i1];
+    u32 i2 = deep_lookup(55);
+    u32 r7 = small[i2];
+
+    // === Inline layer 3 ===
+    u32 r8 = big[get_index(100, 200)];
+    u32 r9 = small[deep_lookup(99)];
+
+    // === Guard-clamp variants ===
+    u32 c1 = clamp_tiny(999);
+    u32 r10 = tiny[c1];
+    u32 c2 = clamp_mid(999);
+    u32 r11 = mid[c2];
+    u32 c3 = double_clamp(999);
+    u32 r12 = mid[c3];
+
+    // === Inline guard-clamp ===
+    u32 r13 = tiny[clamp_tiny(888)];
+    u32 r14 = mid[clamp_mid(777)];
+
+    // === Comptime + runtime mix ===
+    u32 cm1 = comptime_mod(12345);
+    u32 r15 = big[cm1];
+    u32 cm2 = comptime_mask(0xDEADBEEF);
+    u32 r16 = big[cm2];
+
+    // === Inline comptime mix ===
+    u32 r17 = big[comptime_mod(67890)];
+    u32 r18 = big[comptime_mask(0xCAFEBABE)];
+
+    // === Multi-return function ===
+    u32 m1 = multi_path(0);
+    u32 r19 = small[m1];
+    u32 m2 = multi_path(1);
+    u32 r20 = small[m2];
+    u32 m3 = multi_path(200);
+    u32 r21 = small[m3];
+    u32 m4 = multi_path(50);
+    u32 r22 = small[m4];
+
+    // === Chained guard ===
+    u32 sg = safe_idx(9999);
+    u32 r23 = big[sg];
+
+    // === Double modulo (hash of hash) ===
+    u32 hh = mod8(mod32(12345));
+    u32 r24 = small[hh];
+
+    // === Nested for loops with proven counters ===
+    u32 total = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        for (u32 j = 0; j < 8; j += 1) {
+            total = total + small[j];
+        }
+        total = total + tiny[i];
+    }
+
+    // === Comptime literal index ===
+    u32 r25 = big[TABLE_MASK()];
+    u32 r26 = big[HALF_SIZE()];
+
+    // === Arithmetic on proven range ===
+    u32 x = 5 % 8;
+    u32 r27 = small[x];
+
+    u32 y = 0xFFFF & 3;
+    u32 r28 = tiny[y];
+
+    // === Multiple array accesses same index ===
+    u32 idx = mod8(42);
+    u32 r29 = small[idx];
+    u32 r30 = small[idx];
+    u32 r31 = small[idx];
+
+    return 0;
+}

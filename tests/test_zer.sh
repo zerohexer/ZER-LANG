@@ -95,6 +95,7 @@ nowarn_check() {
 }
 
 nowarn_check tests/zer/no_autoguard_proven.zer "no-autoguard-all-proven"
+nowarn_check tests/zer/no_autoguard_stress.zer "no-autoguard-stress-31-accesses"
 nowarn_check tests/zer/inline_call_range.zer "no-autoguard-inline-call"
 nowarn_check tests/zer/inline_range_deep.zer "no-autoguard-deep-chain"
 nowarn_check tests/zer/guard_clamp_range.zer "no-autoguard-guard-clamp"

@@ -1,0 +1,83 @@
+// PCI-style driver registration — function pointers + keep *opaque context
+// BUG-441: keep *opaque param stored to struct field via @ptrcast crashed checker
+// (arg_node vs karg variable mismatch in keep validation)
+
+typedef u32 (*DriverProbe)(*opaque ctx);
+typedef u32 (*DriverRead)(*opaque ctx, u32 offset);
+
+struct DriverOps { DriverProbe probe; DriverRead read; }
+struct DriverEntry { u32 vendor_id; DriverOps ops; *opaque context; bool active; }
+
+DriverEntry[4] driver_table;
+u32 driver_count;
+
+void register_driver(u32 vid, DriverOps ops, keep *opaque ctx) {
+    if (driver_count >= 4) { return; }
+    u32 idx = driver_count;
+    if (idx >= 4) { return; }
+    driver_table[idx].vendor_id = vid;
+    driver_table[idx].ops = ops;
+    driver_table[idx].context = ctx;
+    driver_table[idx].active = false;
+    driver_count = driver_count + 1;
+}
+
+u32 probe_all() {
+    u32 probed = 0;
+    for (u32 i = 0; i < driver_count; i += 1) {
+        if (i >= 4) { return probed; }
+        u32 result = driver_table[i].ops.probe(driver_table[i].context);
+        if (result != 0) {
+            driver_table[i].active = true;
+            probed = probed + 1;
+        }
+    }
+    return probed;
+}
+
+// UART driver
+struct UartState { u32 baud; u32 tx_count; }
+u32 uart_probe(*opaque ctx) {
+    *UartState s = @ptrcast(*UartState, ctx);
+    s.baud = 115200;
+    s.tx_count = 0;
+    return 1;
+}
+u32 uart_read(*opaque ctx, u32 offset) {
+    *UartState s = @ptrcast(*UartState, ctx);
+    return s.baud;
+}
+
+// SPI driver
+struct SpiState { u32 clock_hz; }
+u32 spi_probe(*opaque ctx) {
+    *SpiState s = @ptrcast(*SpiState, ctx);
+    s.clock_hz = 1000000;
+    return 1;
+}
+u32 spi_read(*opaque ctx, u32 offset) {
+    *SpiState s = @ptrcast(*SpiState, ctx);
+    return s.clock_hz;
+}
+
+UartState g_uart;
+SpiState g_spi;
+
+u32 main() {
+    driver_count = 0;
+    DriverOps uart_ops;
+    uart_ops.probe = uart_probe;
+    uart_ops.read = uart_read;
+    DriverOps spi_ops;
+    spi_ops.probe = spi_probe;
+    spi_ops.read = spi_read;
+
+    register_driver(0x8086, uart_ops, @ptrcast(*opaque, &g_uart));
+    register_driver(0x1234, spi_ops, @ptrcast(*opaque, &g_spi));
+
+    u32 probed = probe_all();
+    if (probed != 2) { return 1; }
+    if (g_uart.baud != 115200) { return 2; }
+    if (g_spi.clock_hz != 1000000) { return 3; }
+    return 0;
+}

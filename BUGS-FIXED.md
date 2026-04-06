@@ -2842,3 +2842,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `keep` enforcement was only on the CALLER side (caller can't pass locals to `keep`). The FUNCTION side — storing a non-keep param to global — was never checked. Spec clearly says non-keep `*T` is "non-storable: use it, read it, write through it."
 - **Fix:** In NODE_ASSIGN, when target is global/static and value is a non-keep pointer ident that is local-scoped (not global, not static, not local-derived, not arena-derived), error: "add 'keep' qualifier to parameter."
 - **Tests:** `nonkeep_store_global.zer` (negative), `keep_store_global.zer` (positive with keep).
+- **BUG-440 fix correction:** Initial heuristic falsely flagged local variables as "non-keep parameters" (used is_local_derived/is_arena_derived check). Fixed: use `func_node == NULL` — parameters never get func_node set, local var-decls always do.
+
+### BUG-441: keep validation `arg_node` vs `karg` variable mismatch — compiler crash
+- **Symptom:** `store(@ptrcast(*opaque, &global_val))` where `store` has `keep *opaque` param → compiler segfault. ASAN: `checker.c:3148 in check_expr`.
+- **Root cause:** In keep parameter validation (NODE_CALL), the orelse-unwrap loop produces `karg` (walked through intrinsics to find `&local` patterns). But line 3147 used `arg_node` (original unwrapped argument) instead of `karg`. When the original arg is `@ptrcast(...)` (NODE_INTRINSIC), `arg_node->unary.operand` dereferences garbage — segfault.
+- **Fix:** Changed `arg_node` to `karg` at line 3147-3148.
+- **Lesson:** When loop variables shadow outer variables (`karg` vs `arg_node`), always use the loop variable inside the loop body. ASan pinpointed the exact line in one command.
+- **Tests:** `driver_registry.zer` — PCI-style driver registration with funcptr + keep *opaque context, 2 drivers, probe + read dispatch.

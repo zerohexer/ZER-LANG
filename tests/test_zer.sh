@@ -73,6 +73,33 @@ warn_check tests/zer/dyn_array_autoguard_crash.zer "auto-guard inserted" "autogu
 warn_check tests/zer/dyn_array_guard.zer "auto-guard inserted" "dynguard-warning-emitted"
 
 echo ""
+echo "=== ZER No-Warning Verification (must compile + NO warnings + exit 0) ==="
+
+nowarn_check() {
+    local f="$1" name="$2"
+    TOTAL=$((TOTAL + 1))
+    output=$($ZERC "$f" --run 2>&1)
+    ret=$?
+    if [ $ret -eq 0 ] && ! echo "$output" | grep -qi "warning"; then
+        PASS=$((PASS + 1))
+        echo "  PASS: $name (no warnings, zero overhead)"
+    elif [ $ret -ne 0 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (exit $ret, expected 0)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (unexpected warning — auto-guard fired on proven index)"
+        echo "$output" | grep -i "warning" | head -3
+    fi
+    rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
+}
+
+nowarn_check tests/zer/no_autoguard_proven.zer "no-autoguard-all-proven"
+nowarn_check tests/zer/inline_call_range.zer "no-autoguard-inline-call"
+nowarn_check tests/zer/inline_range_deep.zer "no-autoguard-deep-chain"
+nowarn_check tests/zer/guard_clamp_range.zer "no-autoguard-guard-clamp"
+
+echo ""
 echo "=== Results ==="
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"

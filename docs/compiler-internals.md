@@ -318,9 +318,9 @@ With `--track-cptrs`, `_zer_check_alive((void*)ctx, ...)` tried to cast `_zer_op
 
 ### Const Ident in Comptime Call Args (BUG-430, 2026-04-05)
 
-`const u32 perms = FLAG_READ() | FLAG_WRITE(); HAS_FLAG(perms, ...)` failed — `eval_const_expr` can't resolve `NODE_IDENT` (no scope access). Fix: `eval_const_expr_scoped(Checker *c, Node *n)` wrapper that tries `eval_const_expr` first, falls back to const symbol lookup. Reads init value from `sym->func_node->var_decl.init` and recursively evaluates. Depth-limited to 32. Also: `sym->func_node = node` now set for local var-decls (was only globals/functions).
+`const u32 perms = FLAG_READ() | FLAG_WRITE(); HAS_FLAG(perms, ...)` failed — `eval_const_expr` can't resolve `NODE_IDENT` (no scope access). Fix: `eval_const_expr_scoped(Checker *c, Node *n)` uses `eval_const_expr_ex` with `resolve_const_ident` callback. The callback walks scope chain for const symbols, recursively evaluates init values. Also: `sym->func_node = node` now set for local var-decls (was only globals/functions).
 
-**Pattern:** Any site that evaluates user expressions at compile time and needs to resolve const variables should use `eval_const_expr_scoped` instead of `eval_const_expr`. Currently only used for comptime call arg evaluation.
+**Pattern:** Any site that evaluates user expressions at compile time and needs to resolve const variables should use `eval_const_expr_scoped` (or call `eval_const_expr_ex` with a custom resolver). Currently used for comptime call arg evaluation.
 
 ### Union Array Variant Emission (BUG-429, 2026-04-05)
 
@@ -1809,6 +1809,9 @@ BUG-246 only caught `return @ptrcast(*u8, &local)`. Now also catches `return @pt
 
 **RF8: `eval_const_expr` uses `CONST_EVAL_FAIL` (INT64_MIN) sentinel.**
 Old `-1` sentinel collided with valid negative values. `u8[10 - 5]` now evaluates to 5. `u8[5 - 10]` correctly reports "array size must be > 0" instead of "not a constant". All callers updated to check `== CONST_EVAL_FAIL`.
+
+**RF13: `eval_const_expr_ex` with callback-based ident resolution (2026-04-06).**
+`eval_const_expr_scoped` in checker.c duplicated all binary/unary math from `eval_const_expr` in ast.h (~60 lines). Refactored: `eval_const_expr_ex(Node *n, int depth, ConstIdentResolver resolve, void *ctx)` in ast.h takes an optional function pointer callback. When `NODE_IDENT` is encountered and `resolve != NULL`, calls `resolve(ctx, name, len)` to look up the value. Checker provides `resolve_const_ident` which walks scope chain for const symbols. `eval_const_expr_d` delegates to `eval_const_expr_ex(n, depth, NULL, NULL)`. `eval_const_expr_scoped` is now 2 lines: `return eval_const_expr_ex(n, 0, resolve_const_ident, c)`. Zero code duplication, no circular includes. Kernel-style callback pattern.
 
 **RF9: Parser arrays are dynamic (stack-first, arena-overflow).**
 All fixed-size parser arrays replaced with hybrid stack/arena pattern. No more artificial limits. Includes: OOM flag on Parser struct, `parser_alloc()` helper, depth limit (64), Token-before infinite-loop guards on ALL parse loops (block, file, struct, enum, union, switch). Prevents hangs on malformed input like `"enum struct union;"`.

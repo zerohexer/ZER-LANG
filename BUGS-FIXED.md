@@ -2863,3 +2863,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `defer_scans_free` returned on FIRST match (`if (klen > 0) return klen;` in block scan loop). Second and subsequent frees in the same block were never visited.
 - **Fix:** Replaced `defer_scans_free` (returns one key) with `defer_scan_all_frees` (walks ALL statements, marks each found handle as FREED directly). Split into `defer_stmt_is_free` (single statement check) + `defer_scan_all_frees` (recursive block walker).
 - **Tests:** `defer_multi_free.zer` (3 handles in one block defer, all tracked). `defer_user.zer` (cross-module, 3 assets, block defer, return accessing deferred data).
+
+### REDESIGN: Handle leaks upgraded from WARNING to compile ERROR (2026-04-06)
+- **What:** Handle leaks are now compile errors (MISRA C:2012 Rule 22.1). Every Pool/Slab/Task allocation MUST be freed via explicit `pool.free(h)`, `defer pool.free(h)`, or returned to the caller. Unfixed leaks → compile fails.
+- **Key design:** `alloc_id` field on HandleInfo. Each allocation gets a unique ID. Aliases (orelse unwrap, struct copy, assignment) share the same ID. At leak check, if ANY handle in the group is FREED or escaped → allocation covered → no error. This naturally handles `?Handle mh` / `Handle h` pairs.
+- **Previous approach failed:** Name-based tracking treated `mh` and `h` as independent variables. Required `is_optional` hack, escape arrays, consumed scans — each patch created new false positives. The alloc_id redesign eliminated ALL false positives.
+- **Escape detection:** `escaped` flag on HandleInfo, set when: returned, stored in global, stored in pointer param field, assigned to untrackable target (variable-index array).
+- **Recursive defer scan:** Finds defers inside loops, if-bodies, blocks — not just top-level. `defer_scan_all_frees()` walks ALL statements (BUG-443 fix for first-match-only).
+- **if-unwrap propagation:** `if (mh) |t| { free(t); }` — freed alloc_id from then_state propagated to mark `mh` as covered in main state.
+- **Tests:** `super_defer_complex.zer` (10 patterns), `defer_deep.zer` + `defer_deep_user.zer` (cross-module 3-layer).

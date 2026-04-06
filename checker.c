@@ -1989,14 +1989,14 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);
                 Type *vt = val_sym ? type_unwrap_distinct(val_sym->type) : NULL;
-                /* A non-keep pointer that's not local-derived, not global/static,
-                 * and not already flagged = function parameter (unknown origin).
-                 * Storing it in global violates the non-keep contract. */
+                /* A non-keep pointer parameter stored in global violates the
+                 * non-keep contract. Detect parameters: func_node is NULL
+                 * (local var-decls and globals always set func_node). */
                 bool val_is_global = val_sym && scope_lookup_local(c->global_scope,
                     val_sym->name, val_sym->name_len) != NULL;
                 bool is_ptr_param = val_sym && !val_sym->is_keep &&
-                    !val_sym->is_local_derived && !val_sym->is_arena_derived &&
                     !val_sym->is_static && !val_is_global &&
+                    val_sym->func_node == NULL && /* parameters have no func_node */
                     vt && (vt->kind == TYPE_POINTER || vt->kind == TYPE_OPAQUE);
                 if (is_ptr_param) {
                     Node *troot = node->assign.target;

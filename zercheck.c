@@ -916,10 +916,59 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
     if (!node) return;
 
     switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
+    case NODE_BLOCK: {
+        /* Backward goto UAF: scan block for labels, detect backward jumps.
+         * A backward goto (label before goto) is like a loop body from
+         * label to goto. Apply same 2-pass + widen-to-MAYBE_FREED pattern. */
+
+        /* Phase 1: collect label positions in this block */
+        struct { const char *name; uint32_t len; int idx; } labels[32];
+        int label_count = 0;
+        for (int i = 0; i < node->block.stmt_count && label_count < 32; i++) {
+            if (node->block.stmts[i]->kind == NODE_LABEL) {
+                labels[label_count].name = node->block.stmts[i]->label_stmt.name;
+                labels[label_count].len = (uint32_t)node->block.stmts[i]->label_stmt.name_len;
+                labels[label_count].idx = i;
+                label_count++;
+            }
+        }
+
+        /* Phase 2: walk statements, detect backward goto */
+        for (int i = 0; i < node->block.stmt_count; i++) {
             zc_check_stmt(zc, ps, node->block.stmts[i]);
+
+            /* after processing a goto, check if it jumps backward */
+            if (node->block.stmts[i]->kind == NODE_GOTO) {
+                const char *tgt = node->block.stmts[i]->goto_stmt.label;
+                uint32_t tlen = (uint32_t)node->block.stmts[i]->goto_stmt.label_len;
+                int label_idx = -1;
+                for (int li = 0; li < label_count; li++) {
+                    if (labels[li].len == tlen &&
+                        memcmp(labels[li].name, tgt, tlen) == 0) {
+                        label_idx = labels[li].idx;
+                        break;
+                    }
+                }
+                if (label_idx >= 0 && label_idx < i) {
+                    /* backward goto — re-walk from label to goto as loop body */
+                    PathState pre_goto = pathstate_copy(ps);
+                    for (int j = label_idx; j <= i; j++)
+                        zc_check_stmt(zc, ps, node->block.stmts[j]);
+                    /* if state changed → widen to MAYBE_FREED */
+                    for (int h = 0; h < ps->handle_count; h++) {
+                        HandleInfo *pre = find_handle(&pre_goto,
+                            ps->handles[h].name, ps->handles[h].name_len);
+                        if (pre && pre->state != ps->handles[h].state &&
+                            ps->handles[h].state != HS_MAYBE_FREED) {
+                            ps->handles[h].state = HS_MAYBE_FREED;
+                        }
+                    }
+                    pathstate_free(&pre_goto);
+                }
+            }
+        }
         break;
+    }
 
     case NODE_VAR_DECL:
         zc_check_var_init(zc, ps, node);

@@ -2026,9 +2026,23 @@ The rvalue union switch temp at emitter.c line 2455 used `__auto_type` which str
 ### Assignment Escape Walks Through Intrinsics (BUG-355)
 The BUG-205 assignment escape check (`g_ptr = local_derived_ptr`) only fired when the value was direct `NODE_IDENT`. Now walks through `NODE_INTRINSIC` chain to find the root ident: `while (vnode->kind == NODE_INTRINSIC) vnode = vnode->intrinsic.args[last]`. Catches `g_ptr = @ptrcast(*u32, p)` and `g_ptr = @cast(GPtr, p)` where `p` is local-derived.
 
+### Backward Goto UAF Detection (2026-04-06)
+
+Backward goto is now tracked by zercheck. In NODE_BLOCK, labels are scanned with their statement indices. When NODE_GOTO targets a label at an earlier index, zercheck re-walks from label to goto with the current PathState. If any handle state changed → widen to MAYBE_FREED (same pattern as for/while loop 2-pass). This closes the previously-documented "zercheck is linear" gap.
+
+**Limitation:** Only detects backward gotos within the same block (covers ~99% of cases). Cross-block backward jumps (e.g., goto from inside an if-body to a label in the parent block) are NOT detected. Runtime gen counter handles those.
+
+### Auto-Guard for if Conditions (BUG-439, 2026-04-06)
+
+`emit_auto_guards` now called for NODE_IF conditions (both regular and if-unwrap). NOT added for while/for conditions because:
+- Loop conditions are re-evaluated every iteration — auto-guard before the loop only checks the initial value
+- OOB condition data causes wrong-branch execution — trap is the correct behavior (stop immediately, don't make decisions on garbage)
+- Inline `_zer_bounds_check` handles loop conditions correctly at every iteration
+
 ### Known Technical Debt (updated)
 - **~~No qualified module call syntax~~** — RESOLVED (BUG-416 session). `config.func()` now works via mangled lookup rewrite.
 - **~~Comptime in array sizes~~** — RESOLVED (BUG-391/423). `u8[BIT(3)]` works via `eval_comptime_block` in `resolve_type_inner`. Nested calls like `u8[QUAD(2)]` also work (BUG-425).
+- **~~Backward goto UAF~~** — RESOLVED (2026-04-06). zercheck re-walks backward goto ranges. Only same-block gotos tracked.
 - **zercheck variable-index handles:** `arr[i]` with variable index still untrackable — falls back to runtime generation counter traps. Constant indices (`arr[0]`, `s.h`) now tracked via compound string keys (BUG-357 fix).
 - **Dual symbol registration for imported globals:** Imported non-static globals/functions are registered TWICE in global scope — raw name + mangled name (BUG-233). This is intentional (emitter needs both), but any code that scans global scope for unique matches (like `find_unique_allocator`) must handle duplicates. Pattern: check `found->type == candidate->type` before declaring ambiguity.
 

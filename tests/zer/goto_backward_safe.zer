@@ -1,0 +1,21 @@
+// Test: backward goto without UAF — must compile
+// handle used (not freed) across backward goto is fine
+
+struct Data { u32 val; }
+Pool(Data, 4) pool;
+
+u32 main() {
+    ?Handle(Data) mh = pool.alloc();
+    Handle(Data) h = mh orelse return;
+    u32 count = 0;
+retry:
+    pool.get(h).val = count;
+    count = count + 1;
+    if (count < 3) {
+        goto retry;
+    }
+    u32 result = pool.get(h).val;
+    pool.free(h);
+    if (result != 2) { return 1; }
+    return 0;
+}

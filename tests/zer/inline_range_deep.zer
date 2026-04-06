@@ -1,0 +1,62 @@
+// Test: deep call chain range proving — 3 layers deep, obfuscated
+
+u32[16] data;
+
+// Layer 1: simple modulo
+u32 raw_hash(u32 x) {
+    return x % 16;
+}
+
+// Layer 2: wraps layer 1, adds constant path
+u32 get_slot(u32 key) {
+    if (key == 0) { return 0; }
+    if (key == 1) { return 15; }
+    return raw_hash(key);
+}
+
+// Layer 3: even more indirection — clamps via modulo
+u32 lookup_idx(u32 a, u32 b) {
+    u32 combined = a + b;
+    return combined % 16;
+}
+
+// Obfuscated: comptime + range
+comptime u32 TABLE_MASK() { return 15; }
+u32 masked_idx(u32 val) {
+    return val & TABLE_MASK();
+}
+
+u32 main() {
+    for (u32 i = 0; i < 16; i += 1) {
+        data[i] = i + i;
+    }
+
+    // Direct inline call — proven via raw_hash return range [0, 15]
+    u32 v1 = data[raw_hash(42)];
+    if (v1 != 20) { return 1; }
+
+    // Variable from multi-return function — proven [0, 15]
+    u32 slot = get_slot(0);
+    u32 v2 = data[slot];
+    if (v2 != 0) { return 2; }
+
+    u32 slot2 = get_slot(1);
+    u32 v3 = data[slot2];
+    if (v3 != 30) { return 3; }
+
+    // Layer 3 — proven [0, 15]
+    u32 v4 = data[lookup_idx(100, 200)];
+
+    // Bitwise mask — proven [0, 15]
+    u32 v5 = data[masked_idx(0xDEADBEEF)];
+
+    // Inline bitwise mask
+    u32 wild = 999999;
+    u32 safe_idx = wild & 15;
+    u32 v6 = data[safe_idx];
+
+    // Nested: hash of hash — inner proven, outer proven
+    u32 v7 = data[raw_hash(raw_hash(77))];
+
+    return 0;
+}

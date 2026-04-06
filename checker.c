@@ -3762,6 +3762,23 @@ static Type *check_expr(Checker *c, Node *node) {
                         (unsigned long long)obj->array.size);
                 }
             }
+            /* Inline call range: arr[func()] where func has return range */
+            if (!checker_is_proven(c, node) &&
+                node->index_expr.index->kind == NODE_CALL &&
+                node->index_expr.index->call.callee &&
+                node->index_expr.index->call.callee->kind == NODE_IDENT) {
+                Symbol *csym = scope_lookup(c->current_scope,
+                    node->index_expr.index->call.callee->ident.name,
+                    (uint32_t)node->index_expr.index->call.callee->ident.name_len);
+                if (!csym) csym = scope_lookup(c->global_scope,
+                    node->index_expr.index->call.callee->ident.name,
+                    (uint32_t)node->index_expr.index->call.callee->ident.name_len);
+                if (csym && csym->has_return_range &&
+                    csym->return_range_min >= 0 &&
+                    (uint64_t)csym->return_range_max < obj->array.size) {
+                    mark_proven(c, node);
+                }
+            }
             result = obj->array.inner;
         } else if (obj->kind == TYPE_SLICE) {
             /* range propagation for slices: if index proven < slice bound */
@@ -7445,6 +7462,43 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
             }
             return true;
         }
+        /* try constant expression: return 0, return 5, return N + 1 */
+        int64_t cval = eval_const_expr_scoped(c, node->ret.expr);
+        if (cval != CONST_EVAL_FAIL) {
+            if (!*found) {
+                *out_min = cval;
+                *out_max = cval;
+                *found = true;
+            } else {
+                if (cval < *out_min) *out_min = cval;
+                if (cval > *out_max) *out_max = cval;
+            }
+            return true;
+        }
+        /* try chained call range: return func() where func has return range */
+        if (node->ret.expr->kind == NODE_CALL &&
+            node->ret.expr->call.callee &&
+            node->ret.expr->call.callee->kind == NODE_IDENT) {
+            Symbol *csym = scope_lookup(c->current_scope,
+                node->ret.expr->call.callee->ident.name,
+                (uint32_t)node->ret.expr->call.callee->ident.name_len);
+            if (!csym) csym = scope_lookup(c->global_scope,
+                node->ret.expr->call.callee->ident.name,
+                (uint32_t)node->ret.expr->call.callee->ident.name_len);
+            if (csym && csym->has_return_range) {
+                int64_t rmin = csym->return_range_min;
+                int64_t rmax = csym->return_range_max;
+                if (!*found) {
+                    *out_min = rmin;
+                    *out_max = rmax;
+                    *found = true;
+                } else {
+                    if (rmin < *out_min) *out_min = rmin;
+                    if (rmax > *out_max) *out_max = rmax;
+                }
+                return true;
+            }
+        }
         return false; /* return without derivable range — give up */
     }
     if (node->kind == NODE_BLOCK) {
@@ -7458,6 +7512,20 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         if (!find_return_range(c, node->if_stmt.then_body, out_min, out_max, found))
             return false;
         return find_return_range(c, node->if_stmt.else_body, out_min, out_max, found);
+    }
+    if (node->kind == NODE_SWITCH) {
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            if (!find_return_range(c, node->switch_stmt.arms[i].body, out_min, out_max, found))
+                return false;
+        }
+        return true;
+    }
+    if (node->kind == NODE_FOR || node->kind == NODE_WHILE) {
+        Node *body = (node->kind == NODE_FOR) ? node->for_stmt.body : node->while_stmt.body;
+        return find_return_range(c, body, out_min, out_max, found);
+    }
+    if (node->kind == NODE_CRITICAL) {
+        return find_return_range(c, node->critical.body, out_min, out_max, found);
     }
     return true; /* non-return statement — ok */
 }

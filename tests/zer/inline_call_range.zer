@@ -1,0 +1,32 @@
+// Test: arr[func()] where func has proven return range — zero overhead
+// find_return_range handles constant returns + % N returns
+// NODE_INDEX checks inline call return range
+
+u32[8] table;
+
+u32 hash(u32 key) {
+    if (key == 0) { return 0; }
+    return key % 8;
+}
+
+u32 main() {
+    for (u32 i = 0; i < 8; i += 1) {
+        table[i] = i + 10;
+    }
+
+    // Inline call: table[hash(5)] — hash returns [0,7], table size 8 → proven
+    u32 val = table[hash(5)];
+    if (val != 15) { return 1; }
+
+    // Variable call: idx = hash(k), table[idx] — also proven
+    u32 k = 3;
+    u32 idx = hash(k);
+    u32 val2 = table[idx];
+    if (val2 != 13) { return 2; }
+
+    // Multi-return function with constant + modulo
+    u32 val3 = table[hash(0)];
+    if (val3 != 10) { return 3; }
+
+    return 0;
+}

@@ -36,6 +36,7 @@ typedef struct {
     int pool_id;            /* which pool allocated this (-1 = unknown) */
     int alloc_line;         /* where allocated */
     int free_line;          /* where freed (if FREED) */
+    bool is_optional;       /* true for ?Handle/?*T wrappers — skip in leak check */
 } HandleInfo;
 
 /* one execution path's view of all handles — dynamic array */

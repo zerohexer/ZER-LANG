@@ -1,0 +1,24 @@
+// Circular pointer swap spaghetti — free in middle, jump back
+// h1 freed, then backward goto uses h1 again
+
+struct Item { u32 x; }
+Pool(Item, 4) pool;
+
+u32 main() {
+    ?Handle(Item) ma = pool.alloc();
+    Handle(Item) a = ma orelse return;
+    ?Handle(Item) mb = pool.alloc();
+    Handle(Item) b = mb orelse return;
+
+    u32 i = 0;
+loop_top:
+    pool.get(a).x = i;
+    pool.get(b).x = i + 1;
+    i = i + 1;
+
+    pool.free(a);
+    goto loop_top;
+
+    pool.free(b);
+    return 0;
+}

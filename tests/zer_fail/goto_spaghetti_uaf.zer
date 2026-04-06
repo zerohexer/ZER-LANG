@@ -1,0 +1,30 @@
+// Spaghetti goto UAF — free h2 then jump back to use it
+// Compiler must reject: goto retry causes use of freed h2
+
+struct Node { u32 val; }
+Pool(Node, 8) pool;
+
+u32 main() {
+    ?Handle(Node) m1 = pool.alloc();
+    Handle(Node) h1 = m1 orelse return;
+    ?Handle(Node) m2 = pool.alloc();
+    Handle(Node) h2 = m2 orelse return;
+    ?Handle(Node) m3 = pool.alloc();
+    Handle(Node) h3 = m3 orelse return;
+
+    u32 count = 0;
+retry:
+    pool.get(h1).val = count;
+    pool.get(h2).val = count;
+    pool.get(h3).val = count;
+    count = count + 1;
+
+    if (count == 2) {
+        pool.free(h2);
+        goto retry;
+    }
+
+    pool.free(h1);
+    pool.free(h3);
+    return 0;
+}

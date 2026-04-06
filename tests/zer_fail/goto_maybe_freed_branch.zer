@@ -1,0 +1,25 @@
+// Goto + conditional free — MAYBE_FREED widening
+// Free h only on some paths, then backward goto uses h
+
+struct Cell { u32 data; }
+Pool(Cell, 4) pool;
+
+u32 main() {
+    ?Handle(Cell) mh = pool.alloc();
+    Handle(Cell) h = mh orelse return;
+
+    u32 step = 0;
+top:
+    pool.get(h).data = step;
+    step = step + 1;
+
+    if (step == 3) {
+        pool.free(h);
+    }
+
+    if (step < 5) {
+        goto top;
+    }
+
+    return 0;
+}

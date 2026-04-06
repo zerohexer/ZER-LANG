@@ -2809,3 +2809,14 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Emitter line 860 checked `obj_type->kind == TYPE_UNION` without calling `type_unwrap_distinct()`. `checker_get_type` returns TYPE_DISTINCT for distinct typedef, so the check failed and tag update was skipped.
 - **Fix:** Added `type_unwrap_distinct()` before TYPE_UNION check in NODE_ASSIGN variant assignment path.
 - **Test:** `distinct_union_assign.zer` — verifies tag update for both variants, verified by emitting C and checking `_tag = 0` / `_tag = 1` presence.
+
+### NEW FEATURE: Backward goto UAF detection in zercheck
+- **What:** `goto retry;` where `retry:` is before a `pool.free(h)` — zercheck now detects use-after-free across backward jumps. Previously documented as a known limitation ("zercheck is linear, not CFG-based").
+- **Mechanism:** In NODE_BLOCK, scan for labels and track statement indices. When NODE_GOTO targets a label at an earlier index (backward jump), re-walk statements from label to goto with current PathState (same 2-pass + widen-to-MAYBE_FREED pattern as for/while loops). ~30 lines.
+- **Tests:** `goto_backward_uaf.zer` (negative — UAF after backward goto caught), `goto_backward_safe.zer` (positive — safe use across backward goto).
+
+### BUG-439: emit_auto_guards not called for if conditions
+- **Symptom:** `if (arr[i] > 0)` — auto-guard not emitted before the condition. Inline `_zer_bounds_check` trap still caught OOB, but graceful auto-guard return was skipped.
+- **Root cause:** `emit_auto_guards` only called for NODE_EXPR_STMT, NODE_VAR_DECL, NODE_RETURN — not for NODE_IF condition.
+- **Fix:** Added `emit_auto_guards(e, node->if_stmt.cond)` before both regular-if and if-unwrap condition emission.
+- **Note:** NOT added for while/for conditions — those are re-evaluated each iteration, auto-guard before the loop would only check the initial value. Inline `_zer_bounds_check` is the correct behavior for loop conditions (trap on OOB rather than silent return, since OOB condition data would cause wrong-branch execution).

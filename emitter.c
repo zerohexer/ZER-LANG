@@ -2734,6 +2734,8 @@ static void emit_stmt(Emitter *e, Node *node) {
                 cond_type->kind == TYPE_OPTIONAL &&
                 is_null_sentinel(cond_type->optional.inner);
 
+            /* auto-guard: emit bounds guards before if-unwrap condition */
+            emit_auto_guards(e, node->if_stmt.cond);
             emit_indent(e);
             emit(e, "{\n");
             e->indent++;
@@ -2857,6 +2859,8 @@ static void emit_stmt(Emitter *e, Node *node) {
             bool cond_is_struct_opt = cond_t_eff &&
                 cond_t_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(cond_t_eff->optional.inner);
+            /* auto-guard: emit bounds guards before if condition */
+            emit_auto_guards(e, node->if_stmt.cond);
             emit_indent(e);
             emit(e, "if (");
             emit_expr(e, node->if_stmt.cond);

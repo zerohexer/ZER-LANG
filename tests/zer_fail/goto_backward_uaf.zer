@@ -1,0 +1,15 @@
+// Test: backward goto UAF — must be rejected
+// pool.free(h) then goto retry jumps back to pool.get(h)
+
+struct Data { u32 val; }
+Pool(Data, 4) pool;
+
+u32 main() {
+    ?Handle(Data) mh = pool.alloc();
+    Handle(Data) h = mh orelse return;
+retry:
+    pool.get(h).val = 42;
+    pool.free(h);
+    goto retry;
+    return 0;
+}

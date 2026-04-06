@@ -2850,3 +2850,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Changed `arg_node` to `karg` at line 3147-3148.
 - **Lesson:** When loop variables shadow outer variables (`karg` vs `arg_node`), always use the loop variable inside the loop body. ASan pinpointed the exact line in one command.
 - **Tests:** `driver_registry.zer` — PCI-style driver registration with funcptr + keep *opaque context, 2 drivers, probe + read dispatch.
+
+### BUG-442: defer fires before return expression evaluation — UAF
+- **Symptom:** `defer pool.free(h); ... return pool.get(h).val;` → handle freed BEFORE return value computed. Runtime gen check traps with "use-after-free."
+- **Root cause:** Emitter's NODE_RETURN handler calls `emit_defers(e)` BEFORE `emit_expr(node->ret.expr)`. Emitted C: `free(h); return get(h).val;` — wrong order.
+- **Fix:** When return has an expression AND pending defers, hoist expression into typed temp: `RetType _ret = expr; defers; return _ret;`. Handles ?T wrapping (checks if return type is optional and expression type differs). Skips for trivial returns (null/int/bool/float literals — no side effects).
+- **Impact:** Every `return expr` with `defer` was broken if `expr` accessed deferred resources. This is a very common pattern: `defer free(h); return h.field;`.
+- **Tests:** `defer_return_order.zer` — slab handle with defer free, return field access, both u32 and ?u32 return types.

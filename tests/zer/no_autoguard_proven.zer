@@ -1,0 +1,103 @@
+// Test: NO auto-guard should fire for any of these — all proven safe
+// If zerc emits any "auto-guard inserted" warning, this test is wrong
+
+u32[8] data;
+u32[16] table;
+u32[4] small;
+
+// Helper functions with proven return ranges
+u32 hash8(u32 key) { return key % 8; }
+u32 hash16(u32 key) { return key % 16; }
+u32 mask3(u32 val) { return val & 3; }
+u32 clamp8(u32 idx) { if (idx >= 8) { return 0; } return idx; }
+u32 clamp16(u32 idx) { if (idx >= 16) { return 15; } return idx; }
+u32 chain_hash(u32 key) { return hash8(key); }
+u32 double_chain(u32 key) { return chain_hash(key); }
+
+comptime u32 SIZE() { return 8; }
+comptime u32 LAST() { return SIZE() - 1; }
+
+u32 main() {
+    // Initialize
+    for (u32 i = 0; i < 8; i += 1) { data[i] = i + 10; }
+    for (u32 i = 0; i < 16; i += 1) { table[i] = i + 100; }
+    for (u32 i = 0; i < 4; i += 1) { small[i] = i + 1000; }
+
+    // === Literal indices — must be proven ===
+    u32 v1 = data[0];
+    u32 v2 = data[7];
+    u32 v3 = table[15];
+    u32 v4 = small[3];
+
+    // === For-loop counter — must be proven ===
+    u32 sum = 0;
+    for (u32 i = 0; i < 8; i += 1) { sum = sum + data[i]; }
+    for (u32 j = 0; j < 16; j += 1) { sum = sum + table[j]; }
+    for (u32 k = 0; k < 4; k += 1) { sum = sum + small[k]; }
+
+    // === Guard pattern (exit-based) — must be proven after guard ===
+    u32 a = 5;
+    if (a >= 8) { return 0; }
+    u32 v5 = data[a];
+
+    u32 b = 10;
+    if (b >= 16) { return 0; }
+    u32 v6 = table[b];
+
+    // === Modulo — must be proven ===
+    u32 c = 9999;
+    u32 idx1 = c % 8;
+    u32 v7 = data[idx1];
+
+    u32 idx2 = c % 16;
+    u32 v8 = table[idx2];
+
+    // === Bitwise AND — must be proven ===
+    u32 idx3 = c & 7;
+    u32 v9 = data[idx3];
+
+    u32 idx4 = c & 3;
+    u32 v10 = small[idx4];
+
+    // === Function call return range (variable) — must be proven ===
+    u32 idx5 = hash8(42);
+    u32 v11 = data[idx5];
+
+    u32 idx6 = hash16(99);
+    u32 v12 = table[idx6];
+
+    u32 idx7 = mask3(0xDEAD);
+    u32 v13 = small[idx7];
+
+    // === Guard-clamped function — must be proven ===
+    u32 idx8 = clamp8(500);
+    u32 v14 = data[idx8];
+
+    u32 idx9 = clamp16(999);
+    u32 v15 = table[idx9];
+
+    // === Inline function call — must be proven ===
+    u32 v16 = data[hash8(77)];
+    u32 v17 = table[hash16(33)];
+    u32 v18 = small[mask3(55)];
+
+    // === Chained call (2 layers) — must be proven ===
+    u32 idx10 = chain_hash(123);
+    u32 v19 = data[idx10];
+
+    // === Chained call (3 layers) — must be proven ===
+    u32 idx11 = double_chain(456);
+    u32 v20 = data[idx11];
+
+    // === Comptime in array size + index — must be proven ===
+    u32 idx12 = 5 % SIZE();
+    u32 v21 = data[idx12];
+
+    u32 v22 = data[LAST()];
+
+    // === Inline call + guard clamp — must be proven ===
+    u32 v23 = data[clamp8(9999)];
+    u32 v24 = table[clamp16(9999)];
+
+    return 0;
+}

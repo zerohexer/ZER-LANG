@@ -675,6 +675,9 @@ After implementing any feature, test these interactions:
 12. Feature + zercheck (does zercheck RECOGNIZE new alloc/free patterns?)
 13. Feature + `else if` chains — source mapping `#line` must not follow `else` on same line (BUG-418)
 14. Any new coercion must work in ALL 4 value-flow sites: var-decl init, assignment, call args, return (BUG-419)
+15. Feature + `@critical` — control flow banned inside (return/break/continue/goto skip interrupt re-enable)
+16. Feature + `defer` + `return expr` — return expression must evaluate BEFORE defers fire (BUG-442). Test: `defer free(h); return h.field;` must work (not UAF)
+17. Feature + `keep` parameter — non-keep pointer params cannot be stored in global/static (BUG-440). Test: function storing param to global without `keep` must error
 
 ### Write Real Code After Implementing Features — MANDATORY
 

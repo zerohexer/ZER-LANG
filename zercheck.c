@@ -284,9 +284,9 @@ static bool block_always_exits(Node *node) {
 }
 
 /* Scan a defer body for free/delete calls. Returns handle key if found. */
-static int defer_scans_free(Node *node, char *key_buf, int key_bufsize) {
+/* Scan a single statement for a free/delete call. Returns handle key length if found. */
+static int defer_stmt_is_free(Node *node, char *key_buf, int key_bufsize) {
     if (!node) return 0;
-    /* defer pool.free(h) or defer slab.free_ptr(p) */
     if (node->kind == NODE_EXPR_STMT && node->expr_stmt.expr &&
         node->expr_stmt.expr->kind == NODE_CALL) {
         Node *call = node->expr_stmt.expr;
@@ -310,14 +310,28 @@ static int defer_scans_free(Node *node, char *key_buf, int key_bufsize) {
             return handle_key_from_expr(call->call.args[0], key_buf, key_bufsize);
         }
     }
-    /* defer { block } — scan statements inside */
-    if (node->kind == NODE_BLOCK) {
-        for (int i = 0; i < node->block.stmt_count; i++) {
-            int klen = defer_scans_free(node->block.stmts[i], key_buf, key_bufsize);
-            if (klen > 0) return klen;
+    return 0;
+}
+
+/* Scan a defer body for ALL free/delete calls. Marks each found handle as FREED.
+ * Handles both single-statement defers and block defers with multiple frees. */
+static void defer_scan_all_frees(Node *node, PathState *ps, int defer_line) {
+    if (!node) return;
+    char key_buf[128];
+    int klen = defer_stmt_is_free(node, key_buf, sizeof(key_buf));
+    if (klen > 0) {
+        HandleInfo *h = find_handle(ps, key_buf, (uint32_t)klen);
+        if (h && (h->state == HS_ALIVE || h->state == HS_MAYBE_FREED)) {
+            h->state = HS_FREED;
+            h->free_line = defer_line;
         }
     }
-    return 0;
+    /* defer { block } — scan ALL statements, not just first match */
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            defer_scan_all_frees(node->block.stmts[i], ps, defer_line);
+        }
+    }
 }
 
 /* ---- AST walking ---- */
@@ -1480,15 +1494,7 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
         for (int di = 0; di < func->func_decl.body->block.stmt_count; di++) {
             Node *stmt = func->func_decl.body->block.stmts[di];
             if (stmt->kind == NODE_DEFER) {
-                char dkey[128];
-                int dklen = defer_scans_free(stmt->defer.body, dkey, sizeof(dkey));
-                if (dklen > 0) {
-                    HandleInfo *h = find_handle(&ps, dkey, (uint32_t)dklen);
-                    if (h && (h->state == HS_ALIVE || h->state == HS_MAYBE_FREED)) {
-                        h->state = HS_FREED;
-                        h->free_line = stmt->loc.line;
-                    }
-                }
+                defer_scan_all_frees(stmt->defer.body, &ps, stmt->loc.line);
             }
         }
     }

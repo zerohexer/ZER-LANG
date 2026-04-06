@@ -1,0 +1,38 @@
+// BUG-443: block defer with multiple frees — all must be tracked
+// Old code only found FIRST free in block, second handle showed false leak warning
+
+struct Sensor { u32 reading; }
+struct Motor { u32 speed; }
+struct Logger { u32 entries; }
+
+Pool(Sensor, 4) sensors;
+Pool(Motor, 4) motors;
+Slab(Logger) loggers;
+
+u32 init_system() {
+    // Three allocations, one block defer frees all three
+    ?Handle(Sensor) ms = sensors.alloc();
+    Handle(Sensor) s = ms orelse return;
+    ?Handle(Motor) mm = motors.alloc();
+    Handle(Motor) m = mm orelse return;
+    ?Handle(Logger) ml = loggers.alloc();
+    Handle(Logger) l = ml orelse return;
+
+    defer {
+        sensors.free(s);
+        motors.free(m);
+        loggers.free(l);
+    }
+
+    sensors.get(s).reading = 42;
+    motors.get(m).speed = 100;
+    loggers.get(l).entries = 1;
+
+    return sensors.get(s).reading + motors.get(m).speed + loggers.get(l).entries;
+}
+
+u32 main() {
+    u32 total = init_system();
+    if (total != 143) { return 1; }
+    return 0;
+}

@@ -2857,3 +2857,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** When return has an expression AND pending defers, hoist expression into typed temp: `RetType _ret = expr; defers; return _ret;`. Handles ?T wrapping (checks if return type is optional and expression type differs). Skips for trivial returns (null/int/bool/float literals — no side effects).
 - **Impact:** Every `return expr` with `defer` was broken if `expr` accessed deferred resources. This is a very common pattern: `defer free(h); return h.field;`.
 - **Tests:** `defer_return_order.zer` — slab handle with defer free, return field access, both u32 and ?u32 return types.
+
+### BUG-443: block defer with multiple frees only tracked FIRST free
+- **Symptom:** `defer { pool_a.free(ha); pool_b.free(hb); }` — only `ha` marked as freed, `hb` showed false "handle leaked" warning.
+- **Root cause:** `defer_scans_free` returned on FIRST match (`if (klen > 0) return klen;` in block scan loop). Second and subsequent frees in the same block were never visited.
+- **Fix:** Replaced `defer_scans_free` (returns one key) with `defer_scan_all_frees` (walks ALL statements, marks each found handle as FREED directly). Split into `defer_stmt_is_free` (single statement check) + `defer_scan_all_frees` (recursive block walker).
+- **Tests:** `defer_multi_free.zer` (3 handles in one block defer, all tracked). `defer_user.zer` (cross-module, 3 assets, block defer, return accessing deferred data).

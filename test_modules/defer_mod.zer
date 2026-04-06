@@ -1,0 +1,23 @@
+// Layer 1: resource management with defer-compatible API
+struct Asset { u32 type_id; u32 size; }
+Slab(Asset) assets;
+
+?Handle(Asset) asset_load(u32 type_id, u32 size) {
+    ?Handle(Asset) mh = assets.alloc();
+    Handle(Asset) h = mh orelse return;
+    assets.get(h).type_id = type_id;
+    assets.get(h).size = size;
+    return mh;
+}
+
+void asset_unload(Handle(Asset) h) {
+    assets.free(h);
+}
+
+u32 asset_size(Handle(Asset) h) {
+    return assets.get(h).size;
+}
+
+u32 asset_type(Handle(Asset) h) {
+    return assets.get(h).type_id;
+}

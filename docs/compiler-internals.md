@@ -771,6 +771,10 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
 5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
 
+### Block Defer Multi-Free Tracking (BUG-443, 2026-04-06)
+
+`defer_scans_free` returned on FIRST match — `defer { free(a); free(b); }` only tracked `a`. Replaced with `defer_scan_all_frees` which walks ALL statements in defer blocks recursively, marking each found handle as FREED. Split into `defer_stmt_is_free` (single check) + `defer_scan_all_frees` (recursive walker with direct PathState mutation).
+
 ### Defer Before Return Expression — UAF (BUG-442, 2026-04-06)
 
 `defer free(h); return get(h).val;` → emitted C called free BEFORE evaluating return expression. Fix: when NODE_RETURN has expression AND pending defers, hoist into typed temp: `RetType _ret = expr; defers; return _ret;`. Handles `?T` wrapping (optional return from non-optional expression). Skips trivial literals (no side effects).

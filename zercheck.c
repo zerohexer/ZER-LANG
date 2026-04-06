@@ -529,6 +529,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                 h->state = HS_ALIVE;
                 h->pool_id = pool_id;
                 h->alloc_line = var_node->loc.line;
+                h->is_optional = true; /* pool.alloc() returns ?Handle — optional wrapper */
             }
             } /* end else (not arena) */
         }
@@ -552,9 +553,24 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
 
     /* Wrapper allocator: *opaque r = create_resource() orelse ...
      * Any function call (with body or not) returning ?*T or ?*opaque
-     * that wasn't caught by is_alloc_call or pool.alloc patterns above. */
+     * that wasn't caught by is_alloc_call or pool.alloc patterns above.
+     * EXCLUDE arena.alloc() — arena uses bulk reset, not individual free. */
+    bool is_arena_alloc = false;
     if (alloc_call && alloc_call->kind == NODE_CALL &&
-        !find_handle(ps, vname, vlen)) {
+        alloc_call->call.callee && alloc_call->call.callee->kind == NODE_FIELD) {
+        Node *aobj = alloc_call->call.callee->field.object;
+        if (aobj && aobj->kind == NODE_IDENT) {
+            Type *atype = checker_get_type(zc->checker, aobj);
+            if (!atype) {
+                Symbol *asym = scope_lookup(zc->checker->global_scope,
+                    aobj->ident.name, (uint32_t)aobj->ident.name_len);
+                if (asym) atype = asym->type;
+            }
+            if (atype && atype->kind == TYPE_ARENA) is_arena_alloc = true;
+        }
+    }
+    if (alloc_call && alloc_call->kind == NODE_CALL &&
+        !find_handle(ps, vname, vlen) && !is_arena_alloc) {
         Type *ret_type = checker_get_type(zc->checker, alloc_call);
         if (ret_type) {
             Type *ret_eff = type_unwrap_distinct(ret_type);
@@ -573,6 +589,9 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     h->state = HS_ALIVE;
                     h->pool_id = -2;
                     h->alloc_line = var_node->loc.line;
+                    /* If init has orelse, the variable is the UNWRAPPED result,
+                     * not the optional wrapper. Otherwise it's the raw return. */
+                    h->is_optional = (init->kind != NODE_ORELSE);
                 }
             }
         }
@@ -609,6 +628,9 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     dst->pool_id = src->pool_id;
                     dst->alloc_line = src->alloc_line;
                     dst->free_line = src->free_line;
+                    /* Orelse unwrap: h = mh orelse return — h is the REAL handle,
+                     * not an optional wrapper. Clear is_optional on the unwrapped dst. */
+                    dst->is_optional = false;
                 }
             }
             /* Struct copy aliasing: if source has tracked fields like "s1.h",
@@ -1525,7 +1547,8 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
                 Node *val = stmt->expr_stmt.expr->assign.value;
                 /* unwrap orelse to find the actual handle ident */
                 while (val && val->kind == NODE_ORELSE) val = val->orelse.expr;
-                /* check if target root is global */
+                /* check if target root is global OR parameter (pointer deref).
+                 * s.top = h where s is a *Stack param — handle escapes to caller. */
                 Node *troot = tgt;
                 while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
                     if (troot->kind == NODE_FIELD) troot = troot->field.object;
@@ -1534,6 +1557,17 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
                 if (troot && troot->kind == NODE_IDENT) {
                     Symbol *tsym = scope_lookup(zc->checker->global_scope,
                         troot->ident.name, (uint32_t)troot->ident.name_len);
+                    /* Also check: target is a pointer param (s.field where s is *Struct) */
+                    if (!tsym) {
+                        /* not global — check if it's a pointer param (handle escapes via param field) */
+                        Symbol *local_sym = scope_lookup(zc->checker->current_scope,
+                            troot->ident.name, (uint32_t)troot->ident.name_len);
+                        if (local_sym) {
+                            Type *lt = local_sym->type ? type_unwrap_distinct(local_sym->type) : NULL;
+                            if (lt && lt->kind == TYPE_POINTER && tgt->kind == NODE_FIELD)
+                                tsym = local_sym; /* treat pointer param field as escape */
+                        }
+                    }
                     if (tsym) {
                         /* target is global — value handle escapes */
                         char vkey[128];
@@ -1583,6 +1617,9 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
          * but we can't rely on naming. Instead: if this handle's name is
          * a prefix match for another handle at same alloc_line that IS
          * freed/escaped, skip it. Covers: mh/h, maybe/t patterns. */
+        /* Skip optional wrapper handles (?Handle, ?*T from alloc).
+         * They're always unwrapped via orelse — the real handle is tracked separately. */
+        if (ps.handles[i].is_optional) continue;
         /* check if this handle was consumed by if-unwrap */
         bool is_consumed = false;
         for (int ci = 0; ci < consumed_count; ci++) {

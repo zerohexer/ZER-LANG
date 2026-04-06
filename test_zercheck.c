@@ -516,7 +516,7 @@ int main(void) {
        "        pool.get(h).x = 1;\n"
        "    }\n"
        "}\n",
-       "one branch free, else doesn't — warning only (maybe leaked)");
+       "one branch free, else doesn't — warning (leak-as-error planned v0.3)");
 
     /* ---- Leak detection tests ---- */
     printf("\n[leak: alloc without free → warning]\n");
@@ -526,7 +526,7 @@ int main(void) {
        "    Handle(T) h = pool.alloc() orelse return;\n"
        "    pool.get(h).x = 5;\n"
        "}\n",
-       "alloc without free — warning (leak detection improved, error planned)");
+       "alloc without free — warning (leak-as-error planned v0.3)");
 
     printf("[leak: overwrite alive handle → error]\n");
     err("struct T { u32 x; }\n"
@@ -688,7 +688,7 @@ int main(void) {
        "void f() {\n"
        "    *opaque p = malloc(64);\n"
        "}\n",
-       "*opaque leak — warning (error planned after false positive elimination)");
+       "*opaque leak — warning (leak-as-error planned v0.3)");
 
     ok("*opaque malloc(u32 size);\n"
        "void free(*opaque ptr);\n"

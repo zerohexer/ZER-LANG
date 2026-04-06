@@ -1,0 +1,10 @@
+// NEGATIVE: cross-module *opaque use-after-free must be compile error
+import resource;
+
+u32 main() {
+    ?*opaque mr = resource.resource_create(42);
+    *opaque r = mr orelse { return 1; };
+    resource.resource_destroy(r);
+    u32 v = resource.resource_read(r);
+    return 0;
+}

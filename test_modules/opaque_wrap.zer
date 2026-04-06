@@ -1,0 +1,11 @@
+// Cross-module *opaque wrapper — correct lifecycle
+import resource;
+
+u32 main() {
+    ?*opaque mr = resource.resource_create(42);
+    *opaque r = mr orelse { return 1; };
+    u32 v = resource.resource_read(r);
+    if (v != 42) { return 2; }
+    resource.resource_destroy(r);
+    return 0;
+}

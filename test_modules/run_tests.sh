@@ -38,6 +38,13 @@ run_test collision_test 170
 run_test static_coll 30
 run_test gcoll 30
 run_test transitive 3
+run_test opaque_wrap 0
+
+# Cross-module *opaque negative: double-free and UAF must be rejected
+$ZERC opaque_wrap_df.zer -o /dev/null 2>/dev/null
+if [ $? -ne 0 ]; then PASS=$((PASS+1)); else echo "  FAIL: opaque_wrap_df (should reject double-free)"; FAIL=$((FAIL+1)); fi
+$ZERC opaque_wrap_uaf.zer -o /dev/null 2>/dev/null
+if [ $? -ne 0 ]; then PASS=$((PASS+1)); else echo "  FAIL: opaque_wrap_uaf (should reject UAF)"; FAIL=$((FAIL+1)); fi
 
 # BUG-087: imported interrupt — compile-only (interrupt attr is ARM-specific)
 $ZERC use_hal.zer -o _use_hal.c 2>/dev/null

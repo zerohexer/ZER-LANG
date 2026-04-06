@@ -1151,6 +1151,7 @@ static FuncSummary *find_summary(ZerCheck *zc, const char *name, uint32_t name_l
             memcmp(zc->summaries[i].func_name, name, name_len) == 0)
             return &zc->summaries[i];
     }
+    /* no match */
     return NULL;
 }
 

@@ -42,6 +42,19 @@ run_test opaque_wrap 0
 run_test opaque_deep_ok 0
 run_test stress_diamond 0
 run_test stress_game 0
+run_test range_user 0
+
+# Cross-module range proving: NO auto-guard warnings should fire
+output=$($ZERC range_user.zer --run 2>&1)
+ret=$?
+if [ $ret -eq 0 ] && ! echo "$output" | grep -qi "warning"; then
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: range_user no-warn (auto-guard fired on cross-module proven index)"
+    echo "$output" | grep -i "warning" | head -3
+    FAIL=$((FAIL+1))
+fi
+rm -f range_user.c range_user range_user.exe 2>/dev/null
 
 # Cross-module *opaque negative: double-free and UAF must be rejected
 $ZERC opaque_wrap_df.zer -o /dev/null 2>/dev/null

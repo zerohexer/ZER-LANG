@@ -154,6 +154,15 @@ scores[4] = 300;          // COMPILE ERROR — index 4 >= 4
 
 u32 i = get_index();
 scores[i] = 50;           // runtime bounds check — traps if i >= 4
+
+// Range propagation: proven-safe indices have ZERO overhead
+for (u32 j = 0; j < 4; j += 1) {
+    scores[j] = j;        // proven j in [0,3] — no bounds check emitted
+}
+
+// Inline call range: function return range proves index safe
+u32 hash(u32 key) { return key % 4; }
+scores[hash(42)] = 10;    // hash returns [0,3] — no bounds check, zero overhead
 ```
 
 **FIELDS**

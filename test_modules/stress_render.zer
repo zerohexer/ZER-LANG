@@ -1,0 +1,7 @@
+import stress_core;
+Vec2 screen_pos(Vec2 world, Vec2 camera) {
+    Vec2 r;
+    r.x = world.x - camera.x;
+    r.y = world.y - camera.y;
+    return r;
+}

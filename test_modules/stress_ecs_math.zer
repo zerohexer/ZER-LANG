@@ -1,0 +1,4 @@
+comptime u32 MAX(u32 a, u32 b) { if (a > b) { return a; } return b; }
+struct Vec2 { i32 x; i32 y; }
+Vec2 v2(i32 x, i32 y) { Vec2 v; v.x = x; v.y = y; return v; }
+Vec2 v2_add(Vec2 a, Vec2 b) { return v2(a.x + b.x, a.y + b.y); }

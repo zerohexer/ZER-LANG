@@ -1,0 +1,18 @@
+struct CoreData { u32 val; u32 flags; }
+Slab(CoreData) cores;
+
+?*opaque core_new(u32 v) {
+    ?*CoreData mc = cores.alloc_ptr();
+    *CoreData c = mc orelse { return null; };
+    c.val = v;
+    c.flags = 0;
+    return @ptrcast(*opaque, c);
+}
+void core_del(*opaque h) {
+    *CoreData c = @ptrcast(*CoreData, h);
+    cores.free_ptr(c);
+}
+u32 core_read(*opaque h) {
+    *CoreData c = @ptrcast(*CoreData, h);
+    return c.val;
+}

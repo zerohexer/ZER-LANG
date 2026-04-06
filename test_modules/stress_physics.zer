@@ -1,0 +1,2 @@
+import stress_core;
+Vec2 apply_gravity(Vec2 pos, i32 g) { return stress_core.vec2_add(pos, stress_core.vec2_new(0, g)); }

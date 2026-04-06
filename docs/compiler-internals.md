@@ -297,6 +297,8 @@ Fix: both check sites (NODE_ASSIGN line 1635, NODE_VAR_DECL line 4468) now only 
 
 **Qualified call summary lookup:** `zc_apply_summary` handles NODE_FIELD callee (`module.func()`) by extracting field name as function name.
 
+**CRITICAL: import_asts must use topological order.** BFS discovery order caused `mid_close` summary to be built BEFORE `base_del` — the dependency's summary didn't exist when needed. Fix: use `topo_order` (same array used for emission) when populating `zc->import_asts` in `zerc_main.c`. Dependencies first = summaries chain correctly through any depth. This was a 3-line fix that unblocked the entire multi-layer *opaque tracking.
+
 **Wrapper allocator recognition:** `?*opaque r = wrapper_create()` now registers `r` as ALIVE. Any function call returning `?*opaque`, `?*T`, `*opaque`, or `*T` is treated as an allocation. This covers arbitrary wrapper depths — the variable is tracked regardless of how many layers the allocation goes through.
 
 **Full cross-module *opaque tracking now works:**

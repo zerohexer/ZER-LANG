@@ -44,6 +44,7 @@ run_test stress_diamond 0
 run_test stress_game 0
 run_test range_user 0
 run_test defer_user 0
+run_test defer_deep_user 0
 
 # Cross-module range proving: NO auto-guard warnings should fire
 output=$($ZERC range_user.zer --run 2>&1)

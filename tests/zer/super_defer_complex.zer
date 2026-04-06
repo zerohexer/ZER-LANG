@@ -1,0 +1,141 @@
+// Extreme defer/free test: multiple pools, nested defers, if-unwrap free,
+// cross-function free, block defer, orelse chains, comptime sizes
+
+comptime u32 POOL_SIZE() { return 8; }
+
+struct Sensor { u32 id; u32 reading; }
+struct Motor { u32 id; u32 speed; }
+struct Logger { u32 entries; u32 last_val; }
+
+Pool(Sensor, POOL_SIZE()) sensors;
+Pool(Motor, POOL_SIZE()) motors;
+Slab(Logger) loggers;
+
+// Layer 1: allocate + defer free in same function
+u32 single_defer() {
+    ?Handle(Sensor) ms = sensors.alloc();
+    Handle(Sensor) s = ms orelse return;
+    defer sensors.free(s);
+    sensors.get(s).id = 1;
+    sensors.get(s).reading = 42;
+    return sensors.get(s).reading;
+}
+
+// Layer 2: block defer with multiple frees
+u32 block_defer() {
+    ?Handle(Sensor) ms = sensors.alloc();
+    Handle(Sensor) s = ms orelse return;
+    ?Handle(Motor) mm = motors.alloc();
+    Handle(Motor) m = mm orelse return;
+    ?Handle(Logger) ml = loggers.alloc();
+    Handle(Logger) l = ml orelse return;
+    defer {
+        sensors.free(s);
+        motors.free(m);
+        loggers.free(l);
+    }
+    sensors.get(s).reading = 10;
+    motors.get(m).speed = 20;
+    loggers.get(l).entries = 1;
+    return sensors.get(s).reading + motors.get(m).speed + loggers.get(l).entries;
+}
+
+// Layer 3: if-unwrap with free inside capture
+u32 if_unwrap_free() {
+    ?Handle(Sensor) ms = sensors.alloc();
+    if (ms) |s| {
+        sensors.get(s).reading = 77;
+        u32 val = sensors.get(s).reading;
+        sensors.free(s);
+        return val;
+    }
+    return 0;
+}
+
+// Layer 4: defer inside for loop
+u32 loop_defer() {
+    u32 total = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Motor) mm = motors.alloc();
+        Handle(Motor) m = mm orelse return;
+        defer motors.free(m);
+        motors.get(m).speed = i * 10;
+        total = total + motors.get(m).speed;
+    }
+    return total;
+}
+
+// Layer 5: multiple return paths all with defer
+u32 multi_return(u32 mode) {
+    ?Handle(Logger) ml = loggers.alloc();
+    Handle(Logger) l = ml orelse return;
+    defer loggers.free(l);
+    loggers.get(l).entries = 0;
+    if (mode == 0) {
+        loggers.get(l).last_val = 100;
+        return loggers.get(l).last_val;
+    }
+    if (mode == 1) {
+        loggers.get(l).last_val = 200;
+        return loggers.get(l).last_val;
+    }
+    loggers.get(l).last_val = 300;
+    return loggers.get(l).last_val;
+}
+
+// Layer 6: nested defer (defer inside defer block would be weird,
+// but multiple defers in sequence is common)
+u32 stacked_defers() {
+    ?Handle(Sensor) ms = sensors.alloc();
+    Handle(Sensor) s = ms orelse return;
+    defer sensors.free(s);
+
+    ?Handle(Motor) mm = motors.alloc();
+    Handle(Motor) m = mm orelse return;
+    defer motors.free(m);
+
+    ?Handle(Logger) ml = loggers.alloc();
+    Handle(Logger) l = ml orelse return;
+    defer loggers.free(l);
+
+    sensors.get(s).reading = 1;
+    motors.get(m).speed = 2;
+    loggers.get(l).entries = 3;
+
+    return sensors.get(s).reading + motors.get(m).speed + loggers.get(l).entries;
+}
+
+// Layer 7: alloc_ptr + defer free_ptr
+u32 ptr_defer() {
+    ?*Sensor sp = sensors.alloc_ptr();
+    *Sensor s = sp orelse return;
+    defer sensors.free_ptr(s);
+    s.id = 99;
+    s.reading = 88;
+    return s.reading;
+}
+
+// Layer 8: Task.new + Task.delete with defer
+struct Entity { u32 hp; u32 atk; }
+u32 task_defer() {
+    ?Handle(Entity) me = Entity.new();
+    Handle(Entity) e = me orelse return;
+    defer Entity.delete(e);
+    e.hp = 100;
+    e.atk = 25;
+    return e.hp + e.atk;
+}
+
+u32 main() {
+    if (single_defer() != 42) { return 1; }
+    if (block_defer() != 31) { return 2; }
+    if (if_unwrap_free() != 77) { return 3; }
+    if (loop_defer() != 60) { return 4; }
+    if (multi_return(0) != 100) { return 5; }
+    if (multi_return(1) != 200) { return 6; }
+    if (multi_return(2) != 300) { return 7; }
+    if (stacked_defers() != 6) { return 8; }
+    if (ptr_defer() != 88) { return 9; }
+    if (task_defer() != 125) { return 10; }
+    return 0;
+}

@@ -505,8 +505,8 @@ int main(void) {
        "}\n",
        "both branches free, no use after — OK (FREED, not MAYBE)");
 
-    printf("[MAYBE_FREED: one branch frees, else doesn't, no use after → leak warning]\n");
-    ok("struct T { u32 x; }\n"
+    printf("[MAYBE_FREED: one branch frees, else doesn't, no use after → leak error]\n");
+    err("struct T { u32 x; }\n"
        "Pool(T, 4) pool;\n"
        "void f(bool cond) {\n"
        "    Handle(T) h = pool.alloc() orelse return;\n"
@@ -516,17 +516,17 @@ int main(void) {
        "        pool.get(h).x = 1;\n"
        "    }\n"
        "}\n",
-       "one branch free, else doesn't — warning (leak-as-error planned v0.3)");
+       "one branch free, else doesn't — leak error (alloc_id grouping)");
 
     /* ---- Leak detection tests ---- */
-    printf("\n[leak: alloc without free → warning]\n");
-    ok("struct T { u32 x; }\n"
+    printf("\n[leak: alloc without free → error]\n");
+    err("struct T { u32 x; }\n"
        "Pool(T, 4) pool;\n"
        "void f() {\n"
        "    Handle(T) h = pool.alloc() orelse return;\n"
        "    pool.get(h).x = 5;\n"
        "}\n",
-       "alloc without free — warning (leak-as-error planned v0.3)");
+       "alloc without free — compile error (MISRA 22.1)");
 
     printf("[leak: overwrite alive handle → error]\n");
     err("struct T { u32 x; }\n"
@@ -683,12 +683,12 @@ int main(void) {
        "}\n",
        "*opaque alloc + free — valid (no leak)");
 
-    ok("*opaque malloc(u32 size);\n"
+    err("*opaque malloc(u32 size);\n"
        "void free(*opaque ptr);\n"
        "void f() {\n"
        "    *opaque p = malloc(64);\n"
        "}\n",
-       "*opaque leak — warning (leak-as-error planned v0.3)");
+       "*opaque leak — compile error (MISRA 22.1)");
 
     ok("*opaque malloc(u32 size);\n"
        "void free(*opaque ptr);\n"

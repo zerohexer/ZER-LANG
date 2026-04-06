@@ -21,10 +21,9 @@ u32 test_optional_handle_array() {
     }
     if (count != 2) { return 1; }
 
-    // free allocated handles
-    for (u32 i = 0; i < 4; i += 1) {
-        if (arr[i]) |h| { pool.free(h); }
-    }
+    // free allocated handles (constant index for zercheck tracking)
+    if (arr[0]) |h0| { pool.free(h0); }
+    if (arr[2]) |h2| { pool.free(h2); }
     return 0;
 }
 

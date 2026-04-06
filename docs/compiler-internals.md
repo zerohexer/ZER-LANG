@@ -762,6 +762,14 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 
 **Proven nodes:** `mark_proven(c, node)` adds to `proven_safe` array. `checker_is_proven()` exposed to emitter. Emitter skips `_zer_bounds_check` for proven NODE_INDEX, skips div trap for proven NODE_BINARY.
 
+**Inline call range (2026-04-06):** `arr[func()]` — at NODE_INDEX, if index is NODE_CALL with an ident callee that has `has_return_range`, and `return_range_max < array.size`, the index is proven safe. Enables hash map pattern `table[hash(key)]` with zero overhead.
+
+**find_return_range enhancements (2026-04-06):**
+1. Constant returns: `return 0`, `return N+1` via `eval_const_expr_scoped` — unions with `% N` ranges
+2. Chained call returns: `return other_func()` inherits callee's `has_return_range` — enables multi-layer `get_slot() → raw_hash() → % N` chains
+3. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
+4. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
+
 **Forced division guard:** NODE_IDENT divisor not proven nonzero → compile error with fix suggestion. Resolves const global symbol init values (e.g., `const u32 N = 16; x / N` → proven nonzero). Complex expressions keep runtime check.
 
 **Slice-to-pointer auto-coerce for extern C functions:** When arg is `[]T` and param is `*T` at a call site for a forward-declared function (no body), the checker allows it. The emitter auto-appends `.ptr` (already handled at line ~1265). ZER-to-ZER calls with bodies still require explicit `.ptr`. This is the C interop boundary convenience — `puts("hello")` works without `.ptr` when `puts` is declared as `i32 puts(const *u8 s);`.

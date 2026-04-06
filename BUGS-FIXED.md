@@ -2820,3 +2820,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `emit_auto_guards` only called for NODE_EXPR_STMT, NODE_VAR_DECL, NODE_RETURN — not for NODE_IF condition.
 - **Fix:** Added `emit_auto_guards(e, node->if_stmt.cond)` before both regular-if and if-unwrap condition emission.
 - **Note:** NOT added for while/for conditions — those are re-evaluated each iteration, auto-guard before the loop would only check the initial value. Inline `_zer_bounds_check` is the correct behavior for loop conditions (trap on OOB rather than silent return, since OOB condition data would cause wrong-branch execution).
+
+### Enhanced range propagation: inline call + constant return + chained call ranges
+- **What:** Three improvements to value range propagation that eliminate more auto-guards/bounds checks at compile time:
+  1. **Inline call range:** `arr[func()]` — if `func` has proven return range and fits array size, index proven safe. Zero overhead.
+  2. **Constant return range:** `return 0;` in `find_return_range` — handles constant expressions via `eval_const_expr_scoped`. Multi-path functions like `if (x==0) { return 0; } return x % 8;` → union `[0, 7]`.
+  3. **Chained call range:** `return other_func();` in `find_return_range` — inherits callee's return range through call chain.
+  4. **NODE_SWITCH/FOR/WHILE/CRITICAL:** `find_return_range` recurses into switch arms, loop bodies, @critical blocks.
+- **Effect:** Hash map patterns `table[hash(key)]` now zero overhead — no bounds check, no auto-guard, proven at compile time through call chain.
+- **Tests:** `inline_call_range.zer` (basic), `inline_range_deep.zer` (3-layer deep, 7 accesses, all proven).

@@ -1,0 +1,57 @@
+// Spaghetti goto stress test — complex control flow, all safe
+// Verifies compiler tracks pointer state through convoluted jumps
+
+struct Node { u32 val; u32 tag; }
+Pool(Node, 8) pool;
+
+u32 main() {
+    // Alloc 3 handles
+    ?Handle(Node) m1 = pool.alloc();
+    Handle(Node) h1 = m1 orelse return;
+    ?Handle(Node) m2 = pool.alloc();
+    Handle(Node) h2 = m2 orelse return;
+    ?Handle(Node) m3 = pool.alloc();
+    Handle(Node) h3 = m3 orelse return;
+
+    pool.get(h1).val = 10;
+    pool.get(h2).val = 20;
+    pool.get(h3).val = 30;
+
+    u32 phase = 0;
+
+    // Spaghetti: forward jumps weaving between handle uses
+    if (phase == 0) {
+        pool.get(h1).tag = 1;
+        goto step2;
+    }
+
+step1:
+    pool.get(h2).tag = 2;
+    goto step3;
+
+step2:
+    pool.get(h3).tag = 3;
+    goto step1;
+
+step3:
+    // All 3 handles still alive — verify tags
+    if (pool.get(h1).tag != 1) { pool.free(h1); pool.free(h2); pool.free(h3); return 1; }
+    if (pool.get(h2).tag != 2) { pool.free(h1); pool.free(h2); pool.free(h3); return 2; }
+    if (pool.get(h3).tag != 3) { pool.free(h1); pool.free(h2); pool.free(h3); return 3; }
+
+    // Swap values through spaghetti
+    u32 tmp = pool.get(h1).val;
+    pool.get(h1).val = pool.get(h2).val;
+    pool.get(h2).val = pool.get(h3).val;
+    pool.get(h3).val = tmp;
+
+    // h1=20, h2=30, h3=10
+    if (pool.get(h1).val != 20) { pool.free(h1); pool.free(h2); pool.free(h3); return 4; }
+    if (pool.get(h2).val != 30) { pool.free(h1); pool.free(h2); pool.free(h3); return 5; }
+    if (pool.get(h3).val != 10) { pool.free(h1); pool.free(h2); pool.free(h3); return 6; }
+
+    pool.free(h1);
+    pool.free(h2);
+    pool.free(h3);
+    return 0;
+}

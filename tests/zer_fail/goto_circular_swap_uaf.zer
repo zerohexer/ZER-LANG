@@ -1,0 +1,27 @@
+// 3-pointer circular swap with goto — UAF through indirection
+// Free p1, swap p2→p1 slot, jump back — p1 slot is dead
+
+struct Obj { u32 a; u32 b; }
+Pool(Obj, 8) pool;
+
+u32 main() {
+    ?Handle(Obj) m1 = pool.alloc();
+    Handle(Obj) p1 = m1 orelse return;
+    ?Handle(Obj) m2 = pool.alloc();
+    Handle(Obj) p2 = m2 orelse return;
+    ?Handle(Obj) m3 = pool.alloc();
+    Handle(Obj) p3 = m3 orelse return;
+
+    u32 round = 0;
+again:
+    pool.get(p1).a = round;
+    pool.get(p2).a = round;
+    pool.get(p3).a = round;
+
+    pool.free(p1);
+    goto again;
+
+    pool.free(p2);
+    pool.free(p3);
+    return 0;
+}

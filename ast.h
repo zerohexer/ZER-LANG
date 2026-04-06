@@ -181,6 +181,7 @@ typedef enum {
     NODE_ORELSE,            /* expr orelse value/return/break/block */
     NODE_INTRINSIC,         /* @ptrcast, @truncate, @size, etc. */
     NODE_CAST,              /* implicit cast inserted by type checker */
+    NODE_TYPECAST,          /* (Type)expr — explicit C-style cast */
     NODE_SIZEOF,            /* @size(T) — resolved from intrinsic */
 } NodeKind;
 
@@ -490,6 +491,12 @@ struct Node {
             int arg_count;
             TypeNode *type_arg;     /* for @ptrcast(*T, expr), @size(T), etc. */
         } intrinsic;
+
+        /* NODE_TYPECAST: (Type)expr — explicit C-style cast */
+        struct {
+            TypeNode *target_type;
+            Node *expr;
+        } typecast;
     };
 };
 

@@ -147,6 +147,7 @@ static const char *tok_str(Parser *p, Token *t) {
 
 /* ---- Forward declarations ---- */
 static Node *parse_expression(Parser *p);
+static Node *parse_unary(Parser *p);
 static Node *parse_statement(Parser *p);
 static Node *parse_block(Parser *p);
 static Node *parse_declaration(Parser *p);
@@ -641,8 +642,36 @@ static Node *parse_primary(Parser *p) {
         return n;
     }
 
-    /* parenthesized expression */
+    /* C-style typecast: (Type)expr — or parenthesized expression */
     if (match(p, TOK_LPAREN)) {
+        /* Check if this is a typecast: (u32)x, (*Motor)ctx, (f32)val
+         * Only KEYWORD types are unambiguous. (ident) could be (variable).
+         * Named type casts use pointer prefix: (*Motor)ctx */
+        bool is_cast = false;
+        switch (p->current.type) {
+        case TOK_U8: case TOK_U16: case TOK_U32: case TOK_U64:
+        case TOK_I8: case TOK_I16: case TOK_I32: case TOK_I64:
+        case TOK_USIZE: case TOK_F32: case TOK_F64:
+        case TOK_BOOL: case TOK_VOID: case TOK_OPAQUE:
+        case TOK_STAR:      /* (*T) pointer cast */
+        case TOK_QUESTION:  /* (?T) optional cast */
+        case TOK_CONST:     /* (const *T) */
+        case TOK_VOLATILE:  /* (volatile *T) */
+            is_cast = true;
+            break;
+        default: break;
+        }
+
+        if (is_cast) {
+            TypeNode *cast_type = parse_type(p);
+            consume(p, TOK_RPAREN, "expected ')' after cast type");
+            Node *expr = parse_unary(p);
+            Node *n = new_node(p, NODE_TYPECAST);
+            n->typecast.target_type = cast_type;
+            n->typecast.expr = expr;
+            return n;
+        }
+
         Node *n = parse_expression(p);
         consume(p, TOK_RPAREN, "expected ')' after expression");
         return n;

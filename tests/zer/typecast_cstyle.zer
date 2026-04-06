@@ -1,0 +1,47 @@
+// C-style (Type)expr cast syntax — all conversion types
+
+struct Sensor { u32 id; u32 reading; }
+Slab(Sensor) store;
+
+u32 main() {
+    // Widening: u8 → u32
+    u8 small = 42;
+    u32 big = (u32)small;
+    if (big != 42) { return 1; }
+
+    // Narrowing: u32 → u16 (truncate)
+    u32 large = 65538;
+    u16 trunc = (u16)large;
+    if (trunc != 2) { return 2; }
+
+    // Narrowing: u32 → u8
+    u32 val = 258;
+    u8 byte = (u8)val;
+    if (byte != 2) { return 3; }
+
+    // int → float → int round-trip
+    u32 count = 42;
+    f32 ratio = (f32)count;
+    u32 back = (u32)ratio;
+    if (back != 42) { return 4; }
+
+    // Pointer cast: *Sensor → *opaque → *Sensor (provenance checked)
+    ?*Sensor ms = store.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer store.free_ptr(s);
+    s.id = 99;
+    s.reading = 123;
+    *opaque ctx = (*opaque)s;
+    *Sensor restored = (*Sensor)ctx;
+    if (restored.id != 99) { return 5; }
+    if (restored.reading != 123) { return 6; }
+
+    // Chain: u8 → u32 → u16 → u8
+    u8 orig = 200;
+    u32 wide = (u32)orig;
+    u16 mid = (u16)wide;
+    u8 final = (u8)mid;
+    if (final != 200) { return 7; }
+
+    return 0;
+}

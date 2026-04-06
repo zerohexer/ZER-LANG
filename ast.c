@@ -103,6 +103,7 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_ORELSE:       return "ORELSE";
     case NODE_INTRINSIC:    return "INTRINSIC";
     case NODE_CAST:         return "CAST";
+    case NODE_TYPECAST:     return "TYPECAST";
     case NODE_SIZEOF:       return "SIZEOF";
     case NODE_CINCLUDE:     return "CINCLUDE";
     }
@@ -435,6 +436,7 @@ void ast_print(Node *node, int depth) {
         break;
 
     case NODE_CAST:
+    case NODE_TYPECAST:
     case NODE_SIZEOF:
         printf("%s\n", node_kind_name(node->kind));
         break;

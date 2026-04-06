@@ -1,0 +1,40 @@
+// Layer 2: uses defer_mod across module boundary
+// Complex: multiple assets loaded, block defer frees all, return accesses deferred data
+
+import defer_mod;
+
+struct Scene { u32 total_size; u32 asset_count; }
+
+u32 load_scene() {
+    // Load 3 assets across module boundary
+    ?Handle(Asset) m1 = asset_load(1, 1024);
+    Handle(Asset) tex = m1 orelse return;
+    ?Handle(Asset) m2 = asset_load(2, 2048);
+    Handle(Asset) mesh = m2 orelse return;
+    ?Handle(Asset) m3 = asset_load(3, 512);
+    Handle(Asset) sound = m3 orelse return;
+
+    // Single block defer frees ALL three
+    defer {
+        asset_unload(tex);
+        asset_unload(mesh);
+        asset_unload(sound);
+    }
+
+    // Access all three, compute result
+    u32 total = asset_size(tex) + asset_size(mesh) + asset_size(sound);
+
+    // Verify types
+    if (asset_type(tex) != 1) { return 0; }
+    if (asset_type(mesh) != 2) { return 0; }
+    if (asset_type(sound) != 3) { return 0; }
+
+    // Return accesses deferred data — BUG-442 fix ensures evaluation before defer
+    return total;
+}
+
+u32 main() {
+    u32 scene_size = load_scene();
+    if (scene_size != 3584) { return 1; }
+    return 0;
+}

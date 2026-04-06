@@ -856,7 +856,8 @@ static void emit_expr(Emitter *e, Node *node) {
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_FIELD) {
             Node *obj_node = node->assign.target->field.object;
-            Type *obj_type = checker_get_type(e->checker,obj_node);
+            Type *obj_type_raw = checker_get_type(e->checker,obj_node);
+            Type *obj_type = obj_type_raw ? type_unwrap_distinct(obj_type_raw) : NULL;
             if (obj_type && obj_type->kind == TYPE_UNION) {
                 /* find variant index */
                 const char *vname = node->assign.target->field.field_name;

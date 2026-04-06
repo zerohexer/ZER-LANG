@@ -2803,3 +2803,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `zc_check_stmt` switch had no NODE_CRITICAL case. Also `block_always_exits` didn't handle NODE_CRITICAL.
 - **Fix:** Added `case NODE_CRITICAL: zc_check_stmt(zc, ps, node->critical.body);` in zc_check_stmt. Added `if (node->kind == NODE_CRITICAL) return block_always_exits(node->critical.body);` in block_always_exits.
 - **Test:** `critical_handle.zer` (positive — handle ops inside @critical tracked correctly).
+
+### BUG-438: distinct union variant assignment skips tag update
+- **Symptom:** `distinct typedef Msg SafeMsg; SafeMsg sm; sm.sensor = 42;` — emitted C was plain `sm.sensor = 42;` without `_tag = 0` update. Switch on the union would read stale tag, matching wrong variant.
+- **Root cause:** Emitter line 860 checked `obj_type->kind == TYPE_UNION` without calling `type_unwrap_distinct()`. `checker_get_type` returns TYPE_DISTINCT for distinct typedef, so the check failed and tag update was skipped.
+- **Fix:** Added `type_unwrap_distinct()` before TYPE_UNION check in NODE_ASSIGN variant assignment path.
+- **Test:** `distinct_union_assign.zer` — verifies tag update for both variants, verified by emitting C and checking `_tag = 0` / `_tag = 1` presence.

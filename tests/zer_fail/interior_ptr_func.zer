@@ -1,0 +1,19 @@
+// Interior pointer passed to function after free — UAF
+// zercheck must catch: field derived from b, freed, passed to use_ptr
+
+struct Block { u32 a; u32 b; }
+Slab(Block) heap;
+
+void use_ptr(*u32 p) {
+    u32 v = p[0];
+}
+
+u32 main() {
+    ?*Block mb = heap.alloc_ptr();
+    *Block b = mb orelse return;
+    b.a = 42;
+    *u32 field = &b.a;
+    heap.free_ptr(b);
+    use_ptr(field);
+    return 0;
+}

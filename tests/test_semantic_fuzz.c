@@ -413,6 +413,193 @@ static void gen_unsafe_goto_uaf(char *buf, int id) {
     p += sprintf(p, "}\n");
 }
 
+/* ---- Wave 3: union, ring, nested, defer+orelse, packed, slice, casts, atomic, critical, distinct, bit ---- */
+
+static void gen_safe_union_capture(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "union Msg%d { u32 integer; bool flag; }\n", id);
+    p += sprintf(p, "u32 test_union_%d() {\n", id);
+    p += sprintf(p, "    Msg%d m;\n", id);
+    p += sprintf(p, "    m.integer = %d;\n", id * 11);
+    p += sprintf(p, "    u32 result = 0;\n");
+    p += sprintf(p, "    switch (m) {\n");
+    p += sprintf(p, "        .integer => |v| { result = v; }\n");
+    p += sprintf(p, "        .flag => |f| { result = 0; }\n");
+    p += sprintf(p, "    }\n");
+    p += sprintf(p, "    if (result != %d) { return 1; }\n", id * 11);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_ring(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "Ring(u32, 8) ring%d;\n", id);
+    p += sprintf(p, "u32 test_ring_%d() {\n", id);
+    int count = 3 + (id % 5);
+    p += sprintf(p, "    u32 sum = 0;\n");
+    p += sprintf(p, "    for (u32 i = 0; i < %d; i += 1) {\n", count);
+    p += sprintf(p, "        ring%d.push(i * 10);\n", id);
+    p += sprintf(p, "    }\n");
+    p += sprintf(p, "    for (u32 i = 0; i < %d; i += 1) {\n", count);
+    p += sprintf(p, "        ?u32 mv = ring%d.pop();\n", id);
+    p += sprintf(p, "        u32 v = mv orelse return;\n");
+    p += sprintf(p, "        sum += v;\n");
+    p += sprintf(p, "    }\n");
+    /* sum = 0+10+20+...+(count-1)*10 = 10 * (count-1)*count/2 */
+    int expected = 10 * (count - 1) * count / 2;
+    p += sprintf(p, "    if (sum != %d) { return 1; }\n", expected);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_nested_struct(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Inner%d { u32 val; }\n", id);
+    p += sprintf(p, "struct Mid%d { Inner%d data; u32 tag; }\n", id, id);
+    p += sprintf(p, "struct Outer%d { Mid%d mid; u32 id; }\n", id, id);
+    p += sprintf(p, "Pool(Outer%d, 4) npool%d;\n", id, id);
+    p += sprintf(p, "u32 test_nested_%d() {\n", id);
+    p += sprintf(p, "    ?Handle(Outer%d) mh = npool%d.alloc();\n", id, id);
+    p += sprintf(p, "    Handle(Outer%d) h = mh orelse return;\n", id);
+    p += sprintf(p, "    defer npool%d.free(h);\n", id);
+    p += sprintf(p, "    h.mid.data.val = %d;\n", id * 17);
+    p += sprintf(p, "    h.mid.tag = %d;\n", id);
+    p += sprintf(p, "    h.id = %d;\n", id + 100);
+    p += sprintf(p, "    if (h.mid.data.val != %d) { return 1; }\n", id * 17);
+    p += sprintf(p, "    if (h.id != %d) { return 2; }\n", id + 100);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_defer_orelse_block(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Do%d { u32 v; }\n", id);
+    p += sprintf(p, "Slab(Do%d) doslab%d;\n", id, id);
+    p += sprintf(p, "u32 test_defer_orelse_%d() {\n", id);
+    p += sprintf(p, "    ?*Do%d md = doslab%d.alloc_ptr();\n", id, id);
+    p += sprintf(p, "    *Do%d d = md orelse { return 0; };\n", id);
+    p += sprintf(p, "    defer doslab%d.free_ptr(d);\n", id);
+    p += sprintf(p, "    d.v = %d;\n", id * 5);
+    p += sprintf(p, "    if (d.v != %d) { return 1; }\n", id * 5);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_packed_struct(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "packed struct Pkt%d { u8 hdr; u16 len; u8 crc; }\n", id);
+    p += sprintf(p, "u32 test_packed_%d() {\n", id);
+    p += sprintf(p, "    Pkt%d p;\n", id);
+    p += sprintf(p, "    p.hdr = 0xAA;\n");
+    p += sprintf(p, "    p.len = %d;\n", 100 + id);
+    p += sprintf(p, "    p.crc = 0x55;\n");
+    p += sprintf(p, "    if (p.hdr != 0xAA) { return 1; }\n");
+    p += sprintf(p, "    if (p.len != %d) { return 2; }\n", 100 + id);
+    p += sprintf(p, "    if (p.crc != 0x55) { return 3; }\n");
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_slice_sub(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "u32 test_slice_%d() {\n", id);
+    p += sprintf(p, "    u8[10] arr;\n");
+    p += sprintf(p, "    for (u32 i = 0; i < 10; i += 1) { arr[i] = (u8)i; }\n");
+    p += sprintf(p, "    [*]u8 full = arr;\n");
+    int start = id % 5;
+    int end = start + 3;
+    p += sprintf(p, "    [*]u8 sub = full[%d..%d];\n", start, end);
+    p += sprintf(p, "    if (sub.len != %d) { return 1; }\n", end - start);
+    p += sprintf(p, "    if (sub[0] != %d) { return 2; }\n", start);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_bool_int_cast(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "u32 test_boolcast_%d() {\n", id);
+    p += sprintf(p, "    bool t = true;\n");
+    p += sprintf(p, "    bool f = false;\n");
+    p += sprintf(p, "    u32 tv = (u32)t;\n");
+    p += sprintf(p, "    u32 fv = (u32)f;\n");
+    p += sprintf(p, "    if (tv != 1) { return 1; }\n");
+    p += sprintf(p, "    if (fv != 0) { return 2; }\n");
+    p += sprintf(p, "    u32 x = %d;\n", id % 2 == 0 ? 0 : id);
+    p += sprintf(p, "    bool bx = (bool)x;\n");
+    p += sprintf(p, "    if (bx != %s) { return 3; }\n", id % 2 == 0 ? "false" : "true");
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_signed_cast(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "u32 test_signcast_%d() {\n", id);
+    p += sprintf(p, "    i32 neg = -%d;\n", 1 + id % 100);
+    p += sprintf(p, "    u32 big = (u32)neg;\n");
+    /* -N as u32 = 4294967296 - N */
+    unsigned expected = (unsigned)(-(1 + id % 100));
+    p += sprintf(p, "    if (big != %u) { return 1; }\n", expected);
+    p += sprintf(p, "    i32 back = (i32)big;\n");
+    p += sprintf(p, "    if (back != -%d) { return 2; }\n", 1 + id % 100);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_distinct(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "distinct typedef u32 Temp%d;\n", id);
+    p += sprintf(p, "distinct typedef u32 Press%d;\n", id);
+    p += sprintf(p, "u32 test_distinct_%d() {\n", id);
+    p += sprintf(p, "    Temp%d t = @cast(Temp%d, %d);\n", id, id, 100 + id);
+    p += sprintf(p, "    Press%d p = @cast(Press%d, %d);\n", id, id, 200 + id);
+    p += sprintf(p, "    u32 tv = @cast(u32, t);\n");
+    p += sprintf(p, "    u32 pv = @cast(u32, p);\n");
+    p += sprintf(p, "    if (tv != %d) { return 1; }\n", 100 + id);
+    p += sprintf(p, "    if (pv != %d) { return 2; }\n", 200 + id);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_bit_extract(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "u32 test_bits_%d() {\n", id);
+    unsigned val = 0xAB00 | (id & 0xFF);
+    p += sprintf(p, "    u32 reg = %u;\n", val);
+    p += sprintf(p, "    u32 low = reg[7..0];\n");
+    p += sprintf(p, "    u32 high = reg[15..8];\n");
+    p += sprintf(p, "    if (low != %u) { return 1; }\n", val & 0xFF);
+    p += sprintf(p, "    if (high != %u) { return 2; }\n", (val >> 8) & 0xFF);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_unsafe_nonkeep_global(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Nk%d { u32 v; }\n", id);
+    p += sprintf(p, "?*Nk%d nk_global%d = null;\n", id, id);
+    p += sprintf(p, "void store_nk%d(*Nk%d t) {\n", id, id);
+    p += sprintf(p, "    nk_global%d = t;\n", id); /* non-keep → error */
+    p += sprintf(p, "}\n");
+    p += sprintf(p, "u32 test_nonkeep_%d() {\n", id);
+    p += sprintf(p, "    Nk%d n; n.v = 42;\n", id);
+    p += sprintf(p, "    store_nk%d(&n);\n", id);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_unsafe_arena_global(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Ag%d { u32 v; }\n", id);
+    p += sprintf(p, "Arena ag_arena%d;\n", id);
+    p += sprintf(p, "?*Ag%d ag_global%d = null;\n", id, id);
+    p += sprintf(p, "u32 test_arena_esc_%d() {\n", id);
+    p += sprintf(p, "    ?*Ag%d ma = ag_arena%d.alloc(Ag%d);\n", id, id, id);
+    p += sprintf(p, "    *Ag%d a = ma orelse return;\n", id);
+    p += sprintf(p, "    ag_global%d = a;\n", id); /* arena escape to global */
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
 int main(int argc, char **argv) {
     unsigned seed = argc > 1 ? (unsigned)atoi(argv[1]) : 42;
     int count = argc > 2 ? atoi(argv[2]) : 200;
@@ -429,7 +616,7 @@ int main(int argc, char **argv) {
         char decls[4096] = "";
         char calls[2048] = "";
         char *cp = calls;
-        int pattern = rng(18);
+        int pattern = rng(32);
 
         switch (pattern) {
         case 0: case 1: { /* safe arena chain */
@@ -584,6 +771,132 @@ int main(int argc, char **argv) {
             }
             snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s}\n", decls, calls);
             run_test(name, prog, 1);
+            break;
+        }
+        case 18: { /* safe union + mutable capture */
+            gen_safe_union_capture(decls, i);
+            cp += sprintf(cp, "    if (test_union_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_union_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 19: { /* safe ring buffer */
+            gen_safe_ring(decls, i);
+            cp += sprintf(cp, "    if (test_ring_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_ring_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 20: { /* safe nested struct through Handle */
+            gen_safe_nested_struct(decls, i);
+            cp += sprintf(cp, "    if (test_nested_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_nested_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 21: { /* safe defer + orelse block */
+            gen_safe_defer_orelse_block(decls, i);
+            cp += sprintf(cp, "    if (test_defer_orelse_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_defer_orelse_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 22: { /* safe packed struct */
+            gen_safe_packed_struct(decls, i);
+            cp += sprintf(cp, "    if (test_packed_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_packed_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 23: { /* safe slice subslice */
+            gen_safe_slice_sub(decls, i);
+            cp += sprintf(cp, "    if (test_slice_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_slice_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 24: { /* safe bool↔int cast */
+            gen_safe_bool_int_cast(decls, i);
+            cp += sprintf(cp, "    if (test_boolcast_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_boolcast_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 25: { /* safe signed↔unsigned cast */
+            gen_safe_signed_cast(decls, i);
+            cp += sprintf(cp, "    if (test_signcast_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_signcast_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 26: { /* safe distinct typedef */
+            gen_safe_distinct(decls, i);
+            cp += sprintf(cp, "    if (test_distinct_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_distinct_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 27: { /* safe bit extraction */
+            gen_safe_bit_extract(decls, i);
+            cp += sprintf(cp, "    if (test_bits_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_bits_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 28: case 29: { /* unsafe non-keep param or arena escape */
+            if (rng(2)) {
+                gen_unsafe_nonkeep_global(decls, i);
+                cp += sprintf(cp, "    return test_nonkeep_%d();\n", i);
+                snprintf(name, sizeof(name), "unsafe_nonkeep_%d", i);
+            } else {
+                gen_unsafe_arena_global(decls, i);
+                cp += sprintf(cp, "    return test_arena_esc_%d();\n", i);
+                snprintf(name, sizeof(name), "unsafe_arena_esc_%d", i);
+            }
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s}\n", decls, calls);
+            run_test(name, prog, 1);
+            break;
+        }
+        case 30: case 31: { /* repeat high-value patterns with different params */
+            int sub = rng(6);
+            if (sub == 0) { /* arena + opaque combo */
+                int d = 1 + rng(3);
+                gen_safe_arena_chain(decls, d);
+                cp += sprintf(cp, "    if (test_arena_chain_%d() != 0) { return 1; }\n", d);
+                snprintf(name, sizeof(name), "safe_combo_arena_%d", i);
+            } else if (sub == 1) {
+                gen_safe_pool_defer(decls, i, 1 + rng(4));
+                cp += sprintf(cp, "    if (test_pool_defer_%d() != 0) { return 1; }\n", i);
+                snprintf(name, sizeof(name), "safe_combo_pool_%d", i);
+            } else if (sub == 2) {
+                gen_safe_opaque_roundtrip(decls, i);
+                cp += sprintf(cp, "    if (test_opaque_%d() != 0) { return 1; }\n", i);
+                snprintf(name, sizeof(name), "safe_combo_opaque_%d", i);
+            } else if (sub == 3) {
+                gen_safe_goto_defer(decls, i);
+                cp += sprintf(cp, "    if (test_goto_defer_%d() != 0) { return 1; }\n", i);
+                snprintf(name, sizeof(name), "safe_combo_goto_%d", i);
+            } else if (sub == 4) {
+                gen_safe_interior_ptr(decls, i);
+                cp += sprintf(cp, "    if (test_interior_%d() != 0) { return 1; }\n", i);
+                snprintf(name, sizeof(name), "safe_combo_interior_%d", i);
+            } else {
+                gen_safe_handle_alias(decls, i);
+                cp += sprintf(cp, "    if (test_halias_%d() != 0) { return 1; }\n", i);
+                snprintf(name, sizeof(name), "safe_combo_alias_%d", i);
+            }
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
             break;
         }
         }

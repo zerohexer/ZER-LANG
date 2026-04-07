@@ -2633,6 +2633,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'push' on const Ring");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push() takes exactly 1 argument");
+                    /* Warn if pushing pointer through Ring (channel safety) */
+                    if (node->call.arg_count == 1) {
+                        Type *elt = obj->ring.elem;
+                        Type *eeff = elt ? type_unwrap_distinct(elt) : NULL;
+                        if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+                            checker_warning(c, node->loc.line,
+                                "pushing pointer through Ring channel — "
+                                "pointer may not be valid in receiver context");
+                    }
                     result = ty_void;
                     typemap_set(c, field_node,result);
                     break;
@@ -2643,6 +2652,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'push_checked' on const Ring");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push_checked() takes exactly 1 argument");
+                    /* Same pointer warning for push_checked */
+                    if (node->call.arg_count == 1) {
+                        Type *elt = obj->ring.elem;
+                        Type *eeff = elt ? type_unwrap_distinct(elt) : NULL;
+                        if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+                            checker_warning(c, node->loc.line,
+                                "pushing pointer through Ring channel — "
+                                "pointer may not be valid in receiver context");
+                    }
                     result = type_optional(c->arena, ty_void);
                     typemap_set(c, field_node,result);
                     break;

@@ -1,0 +1,9 @@
+// ThreadHandle not joined → zercheck error
+shared struct State { u32 count; }
+State g;
+void worker(*State s) { s.count += 1; }
+u32 main() {
+    g.count = 0;
+    ThreadHandle th = spawn worker(&g);
+    return 0;
+}

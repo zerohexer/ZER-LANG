@@ -404,12 +404,15 @@ struct Node {
         /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */
         struct { Node *body; } critical;
 
-        /* NODE_SPAWN: spawn func(args); */
+        /* NODE_SPAWN: spawn func(args); or ThreadHandle th = spawn func(args); */
         struct {
             const char *func_name;
             size_t func_name_len;
             Node **args;
             int arg_count;
+            /* scoped spawn: ThreadHandle capture */
+            const char *handle_name;    /* NULL for fire-and-forget */
+            size_t handle_name_len;
         } spawn_stmt;
 
         /* NODE_INT_LIT: 42, 0xFF, 0b1010, 1_000_000 */

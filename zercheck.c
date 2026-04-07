@@ -914,6 +914,25 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
         }
+        /* ThreadHandle.join() — mark ThreadHandle as FREED (joined) */
+        if (node->call.callee && node->call.callee->kind == NODE_FIELD) {
+            const char *jmn = node->call.callee->field.field_name;
+            uint32_t jml = (uint32_t)node->call.callee->field.field_name_len;
+            if (jml == 4 && memcmp(jmn, "join", 4) == 0) {
+                Node *jobj = node->call.callee->field.object;
+                if (jobj && jobj->kind == NODE_IDENT) {
+                    HandleInfo *jh = find_handle(ps, jobj->ident.name, (uint32_t)jobj->ident.name_len);
+                    if (jh && jh->state == HS_ALIVE) {
+                        jh->state = HS_FREED;
+                        jh->free_line = node->loc.line;
+                    } else if (jh && jh->state == HS_FREED) {
+                        zc_error(zc, node->loc.line,
+                            "thread already joined: '%.*s' joined at line %d",
+                            (int)jobj->ident.name_len, jobj->ident.name, jh->free_line);
+                    }
+                }
+            }
+        }
         /* Check if any argument is a freed *opaque handle — UAF at call site.
          * Skip for free/delete calls (the arg IS what we're freeing). */
         {
@@ -1652,6 +1671,19 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
         }
+        /* Scoped spawn: register ThreadHandle as ALIVE (must be joined) */
+        if (node->spawn_stmt.handle_name) {
+            HandleInfo *th = add_handle(ps,
+                node->spawn_stmt.handle_name,
+                (uint32_t)node->spawn_stmt.handle_name_len);
+            if (th) {
+                th->state = HS_ALIVE;
+                th->alloc_line = node->loc.line;
+                th->alloc_id = zc->next_alloc_id++;
+                th->source_color = ZC_COLOR_UNKNOWN;
+                th->is_thread_handle = true;
+            }
+        }
         break;
 
     /* Nodes not relevant to zercheck handle tracking */
@@ -2059,11 +2091,19 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
         }
         if (covered) continue;
         if (ps.handles[i].state == HS_ALIVE) {
-            zc_error(zc, ps.handles[i].alloc_line,
-                "handle '%.*s' allocated but never freed — add 'defer pool.free(%.*s)' "
-                "after allocation, or return the handle to the caller",
-                (int)ps.handles[i].name_len, ps.handles[i].name,
-                (int)ps.handles[i].name_len, ps.handles[i].name);
+            if (ps.handles[i].is_thread_handle) {
+                zc_error(zc, ps.handles[i].alloc_line,
+                    "thread not joined: '%.*s' spawned but never joined — "
+                    "add '%.*s.join()' before function returns",
+                    (int)ps.handles[i].name_len, ps.handles[i].name,
+                    (int)ps.handles[i].name_len, ps.handles[i].name);
+            } else {
+                zc_error(zc, ps.handles[i].alloc_line,
+                    "handle '%.*s' allocated but never freed — add 'defer pool.free(%.*s)' "
+                    "after allocation, or return the handle to the caller",
+                    (int)ps.handles[i].name_len, ps.handles[i].name,
+                    (int)ps.handles[i].name_len, ps.handles[i].name);
+            }
         } else if (ps.handles[i].state == HS_MAYBE_FREED) {
             zc_error(zc, ps.handles[i].alloc_line,
                 "handle '%.*s' may not be freed on all paths — ensure all branches "

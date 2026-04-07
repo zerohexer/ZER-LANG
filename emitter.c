@@ -351,29 +351,50 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
     return found;
 }
 
+static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
+
+/* Check if a shared struct type uses condvar (needs mutex instead of spinlock) */
+static bool shared_needs_condvar(Emitter *e, Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+    if (eff && eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
+        return is_condvar_type(e, eff->struct_type.type_id);
+    return false;
+}
+
 /* Emit lock acquire for shared struct variable */
 static void emit_shared_lock(Emitter *e, Node *root) {
-    emit_indent(e);
-    emit(e, "_zer_lock_acquire(&");
-    emit_expr(e, root);
-    /* Use -> for pointers, . for direct structs */
     Type *rt = checker_get_type(e->checker, root);
-    if (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER)
-        emit(e, "->_zer_lock);\n");
-    else
-        emit(e, "._zer_lock);\n");
+    bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
+    const char *arrow = is_ptr ? "->" : ".";
+    emit_indent(e);
+    if (shared_needs_condvar(e, rt)) {
+        emit(e, "pthread_mutex_lock(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx);\n", arrow);
+    } else {
+        emit(e, "_zer_lock_acquire(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_lock);\n", arrow);
+    }
 }
 
 /* Emit lock release for shared struct variable */
 static void emit_shared_unlock(Emitter *e, Node *root) {
+    Type *rt = checker_get_type(e->checker, root);
+    bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
+    const char *arrow = is_ptr ? "->" : ".";
     emit_indent(e);
-    emit(e, "_zer_lock_release(&");
-    emit_expr(e, root);
-    Type *rt2 = checker_get_type(e->checker, root);
-    if (rt2 && type_unwrap_distinct(rt2)->kind == TYPE_POINTER)
-        emit(e, "->_zer_lock);\n");
-    else
-        emit(e, "._zer_lock);\n");
+    if (shared_needs_condvar(e, rt)) {
+        emit(e, "pthread_mutex_unlock(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx);\n", arrow);
+    } else {
+        emit(e, "_zer_lock_release(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_lock);\n", arrow);
+    }
 }
 
 /* RF3: resolve TypeNode via checker's typemap (set during resolve_type).
@@ -1563,6 +1584,29 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         }
 
+        /* ThreadHandle.join() → pthread_join(th, NULL)
+         * Check if object is a ThreadHandle by matching against spawn wrapper names */
+        if (!handled && node->call.callee->kind == NODE_FIELD) {
+            Node *thobj = node->call.callee->field.object;
+            const char *thmn = node->call.callee->field.field_name;
+            uint32_t thml = (uint32_t)node->call.callee->field.field_name_len;
+            if (thobj->kind == NODE_IDENT && thml == 4 && memcmp(thmn, "join", 4) == 0) {
+                /* Check if this ident matches any scoped spawn's handle name */
+                for (int swi = 0; swi < e->spawn_wrapper_count; swi++) {
+                    Node *sn = e->spawn_wrappers[swi].spawn_node;
+                    if (sn->spawn_stmt.handle_name &&
+                        sn->spawn_stmt.handle_name_len == thobj->ident.name_len &&
+                        memcmp(sn->spawn_stmt.handle_name, thobj->ident.name,
+                               thobj->ident.name_len) == 0) {
+                        emit(e, "pthread_join(%.*s, NULL)",
+                             (int)thobj->ident.name_len, thobj->ident.name);
+                        handled = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         if (!handled) {
             /* normal function call */
             emit_expr(e, node->call.callee);
@@ -2621,6 +2665,51 @@ static void emit_expr(Emitter *e, Node *node) {
             } else {
                 emit(e, "0");
             }
+        } else if (nlen >= 5 && memcmp(name, "cond_", 5) == 0) {
+            /* @cond_wait(shared_var, condition) → pthread_cond_wait loop
+             * @cond_signal(shared_var) → pthread_cond_signal
+             * @cond_broadcast(shared_var) → pthread_cond_broadcast */
+            const char *cop = name + 5;
+            int coplen = nlen - 5;
+            bool is_wait = (coplen == 4 && memcmp(cop, "wait", 4) == 0);
+            bool is_signal = (coplen == 6 && memcmp(cop, "signal", 6) == 0);
+
+            if (is_wait && node->intrinsic.arg_count >= 2) {
+                /* pthread_mutex_lock → while (!(condition)) { pthread_cond_wait } → pthread_mutex_unlock
+                 * The mutex is held while checking condition, released by cond_wait during sleep,
+                 * re-acquired after wake, released after condition is true. */
+                Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
+                const char *ar = vp ? "->" : ".";
+                emit(e, "({ pthread_mutex_lock(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx); while (!(", ar);
+                emit_expr(e, node->intrinsic.args[1]);
+                emit(e, ")) { pthread_cond_wait(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx); } pthread_mutex_unlock(&", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx); (void)0; })", ar);
+            } else if (is_signal && node->intrinsic.arg_count >= 1) {
+                Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
+                const char *ar = vp ? "->" : ".";
+                emit(e, "pthread_cond_signal(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond)", ar);
+            } else if (node->intrinsic.arg_count >= 1) {
+                /* broadcast */
+                Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
+                const char *ar = vp ? "->" : ".";
+                emit(e, "pthread_cond_broadcast(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond)", ar);
+            } else {
+                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+            }
         } else {
             emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
         }
@@ -3371,52 +3460,56 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
 
     case NODE_SPAWN: {
-        /* spawn func(args); — emit pthread_create wrapper */
-        static int spawn_id = 0;
-        int sid = spawn_id++;
+        /* spawn func(args); — emit pthread_create using pre-scanned wrapper */
+        int sid = -1;
+        for (int wi = 0; wi < e->spawn_wrapper_count; wi++) {
+            if (e->spawn_wrappers[wi].spawn_node == node) {
+                sid = e->spawn_wrappers[wi].id;
+                break;
+            }
+        }
+        if (sid < 0) { emit(e, "/* spawn: wrapper not found */\n"); break; }
         int ac = node->spawn_stmt.arg_count;
+        bool is_scoped = (node->spawn_stmt.handle_name != NULL);
 
-        /* Emit arg struct */
+        /* For scoped spawn, declare pthread_t variable at current scope */
+        if (is_scoped) {
+            emit_indent(e);
+            emit(e, "pthread_t %.*s;\n",
+                 (int)node->spawn_stmt.handle_name_len, node->spawn_stmt.handle_name);
+        }
+
         emit_indent(e);
         emit(e, "{ /* spawn %.*s */\n", (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
         e->indent++;
 
         if (ac > 0) {
             emit_indent(e);
-            emit(e, "struct _zer_spawn_args_%d { ", sid);
-            for (int i = 0; i < ac; i++) {
-                Type *at = checker_get_type(e->checker, node->spawn_stmt.args[i]);
-                if (at) {
-                    emit_type_and_name(e, at, NULL, 0);
-                    emit(e, " a%d; ", i);
-                }
-            }
-            emit(e, "};\n");
-
-            emit_indent(e);
-            emit(e, "struct _zer_spawn_args_%d *_sa%d = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid, sid);
+            emit(e, "struct _zer_spawn_args_%d *_sa = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid);
             for (int i = 0; i < ac; i++) {
                 emit_indent(e);
-                emit(e, "_sa%d->a%d = ", sid, i);
+                emit(e, "_sa->a%d = ", i);
                 emit_expr(e, node->spawn_stmt.args[i]);
                 emit(e, ";\n");
             }
         }
 
-        /* Emit wrapper function (forward decl would be cleaner, but inline works) */
-        /* For now, emit the pthread_create call directly with a cast */
-        emit_indent(e);
-        emit(e, "pthread_t _zer_th_%d;\n", sid);
-        emit_indent(e);
-        emit(e, "pthread_create(&_zer_th_%d, NULL, (void*(*)(void*))%.*s, ",
-             sid, (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
-        if (ac > 0) {
-            emit(e, "_sa%d);\n", sid);
+        if (is_scoped) {
+            emit_indent(e);
+            emit(e, "pthread_create(&%.*s, NULL, _zer_spawn_wrap_%d, ",
+                 (int)node->spawn_stmt.handle_name_len, node->spawn_stmt.handle_name, sid);
         } else {
-            emit(e, "NULL);\n");
+            emit_indent(e);
+            emit(e, "pthread_t _zer_th;\n");
+            emit_indent(e);
+            emit(e, "pthread_create(&_zer_th, NULL, _zer_spawn_wrap_%d, ", sid);
         }
-        emit_indent(e);
-        emit(e, "pthread_detach(_zer_th_%d);\n", sid);
+        emit(e, ac > 0 ? "_sa);\n" : "NULL);\n");
+
+        if (!is_scoped) {
+            emit_indent(e);
+            emit(e, "pthread_detach(_zer_th);\n");
+        }
 
         e->indent--;
         emit_indent(e);
@@ -3784,10 +3877,18 @@ static void emit_struct_decl(Emitter *e, Node *node) {
         emit(e, ";\n");
     }
     }
-    /* shared struct: add hidden lock field */
+    /* shared struct: add hidden lock field (+ condvar if needed) */
     if (node->struct_decl.is_shared) {
-        emit_indent(e);
-        emit(e, "uint32_t _zer_lock;\n");
+        Type *st = checker_get_type(e->checker, (Node *)node);
+        bool needs_condvar = false;
+        if (st && st->kind == TYPE_STRUCT)
+            needs_condvar = is_condvar_type(e, st->struct_type.type_id);
+        if (needs_condvar) {
+            emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
+            emit_indent(e); emit(e, "pthread_cond_t _zer_cond;\n");
+        } else {
+            emit_indent(e); emit(e, "uint32_t _zer_lock;\n");
+        }
     }
     e->indent--;
     emit(e, "};\n");
@@ -3997,6 +4098,198 @@ void emitter_init(Emitter *e, FILE *out, Arena *arena, Checker *checker) {
     e->out = out;
     e->arena = arena;
     e->checker = checker;
+}
+
+/* ================================================================
+ * Spawn wrapper pre-scan + emission
+ *
+ * pthread_create requires a void*(*)(void*) function pointer.
+ * ZER functions have typed params. So we emit a wrapper function at
+ * file scope that unpacks the arg struct and calls the real function.
+ *
+ * Phase 1: pre-scan AST to find all NODE_SPAWN, assign IDs, record them.
+ * Phase 2: emit wrapper functions (arg struct typedef + wrapper) at file scope.
+ * Phase 3: in NODE_SPAWN emission, reference the wrapper by ID.
+ * ================================================================ */
+
+static void prescan_spawn_in_node(Emitter *e, Node *node);
+
+static void prescan_spawn_in_block(Emitter *e, Node *block) {
+    if (!block || block->kind != NODE_BLOCK) return;
+    for (int i = 0; i < block->block.stmt_count; i++)
+        prescan_spawn_in_node(e, block->block.stmts[i]);
+}
+
+static void register_condvar_type(Emitter *e, uint32_t type_id) {
+    /* Check if already registered */
+    for (int i = 0; i < e->condvar_type_count; i++)
+        if (e->condvar_type_ids[i] == type_id) return;
+    if (e->condvar_type_count >= e->condvar_type_capacity) {
+        int nc = e->condvar_type_capacity < 8 ? 8 : e->condvar_type_capacity * 2;
+        uint32_t *nids = (uint32_t *)arena_alloc(e->arena, nc * sizeof(uint32_t));
+        if (e->condvar_type_ids)
+            memcpy(nids, e->condvar_type_ids, e->condvar_type_count * sizeof(uint32_t));
+        e->condvar_type_ids = nids;
+        e->condvar_type_capacity = nc;
+    }
+    e->condvar_type_ids[e->condvar_type_count++] = type_id;
+}
+
+static bool is_condvar_type(Emitter *e, uint32_t type_id) {
+    for (int i = 0; i < e->condvar_type_count; i++)
+        if (e->condvar_type_ids[i] == type_id) return true;
+    return false;
+}
+
+static void prescan_spawn_in_node(Emitter *e, Node *node) {
+    if (!node) return;
+    switch (node->kind) {
+    case NODE_SPAWN: {
+        /* Register this spawn for wrapper emission */
+        if (e->spawn_wrapper_count >= e->spawn_wrapper_capacity) {
+            int nc = e->spawn_wrapper_capacity < 8 ? 8 : e->spawn_wrapper_capacity * 2;
+            SpawnWrapper *nw = (SpawnWrapper *)arena_alloc(e->arena, nc * sizeof(SpawnWrapper));
+            if (e->spawn_wrappers)
+                memcpy(nw, e->spawn_wrappers, e->spawn_wrapper_count * sizeof(SpawnWrapper));
+            e->spawn_wrappers = nw;
+            e->spawn_wrapper_capacity = nc;
+        }
+        SpawnWrapper *sw = &e->spawn_wrappers[e->spawn_wrapper_count++];
+        sw->id = e->next_spawn_id++;
+        sw->spawn_node = node;
+        break;
+    }
+    case NODE_EXPR_STMT:
+        /* Detect @cond_wait/@cond_signal/@cond_broadcast usage */
+        if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_INTRINSIC) {
+            Node *intr = node->expr_stmt.expr;
+            if (intr->intrinsic.name_len >= 5 &&
+                memcmp(intr->intrinsic.name, "cond_", 5) == 0 &&
+                intr->intrinsic.arg_count >= 1) {
+                /* First arg is the shared struct variable — get its type */
+                Type *stype = checker_get_type(e->checker, intr->intrinsic.args[0]);
+                if (stype) {
+                    Type *seff = type_unwrap_distinct(stype);
+                    if (seff->kind == TYPE_STRUCT && seff->struct_type.is_shared)
+                        register_condvar_type(e, seff->struct_type.type_id);
+                    if (seff->kind == TYPE_POINTER) {
+                        Type *inner = type_unwrap_distinct(seff->pointer.inner);
+                        if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                            register_condvar_type(e, inner->struct_type.type_id);
+                    }
+                }
+            }
+        }
+        break;
+    case NODE_BLOCK: prescan_spawn_in_block(e, node); break;
+    case NODE_IF:
+        prescan_spawn_in_node(e, node->if_stmt.then_body);
+        prescan_spawn_in_node(e, node->if_stmt.else_body);
+        break;
+    case NODE_FOR: prescan_spawn_in_node(e, node->for_stmt.body); break;
+    case NODE_WHILE: prescan_spawn_in_node(e, node->while_stmt.body); break;
+    case NODE_SWITCH:
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            prescan_spawn_in_node(e, node->switch_stmt.arms[i].body);
+        break;
+    case NODE_FUNC_DECL:
+        prescan_spawn_in_node(e, node->func_decl.body);
+        break;
+    case NODE_INTERRUPT:
+        prescan_spawn_in_node(e, node->interrupt.body);
+        break;
+    case NODE_DEFER:
+        prescan_spawn_in_node(e, node->defer.body);
+        break;
+    case NODE_CRITICAL:
+        prescan_spawn_in_node(e, node->critical.body);
+        break;
+    default: break;
+    }
+}
+
+static void emit_type(Emitter *e, Type *t); /* forward decl */
+
+static void emit_spawn_wrappers(Emitter *e) {
+    if (e->spawn_wrapper_count == 0) return;
+
+    /* Forward-declare target functions so wrappers can call them */
+    emit(e, "\n/* ZER spawn target forward declarations */\n");
+    for (int wi = 0; wi < e->spawn_wrapper_count; wi++) {
+        SpawnWrapper *sw = &e->spawn_wrappers[wi];
+        Node *sn = sw->spawn_node;
+        Symbol *fsym = scope_lookup(e->checker->global_scope,
+            sn->spawn_stmt.func_name, (uint32_t)sn->spawn_stmt.func_name_len);
+        if (fsym && fsym->type && fsym->type->kind == TYPE_FUNC_PTR) {
+            /* Emit return type + name + params */
+            Type *ft = fsym->type;
+            emit_type(e, ft->func_ptr.ret);
+            emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            for (uint32_t pi = 0; pi < ft->func_ptr.param_count; pi++) {
+                if (pi > 0) emit(e, ", ");
+                emit_type(e, ft->func_ptr.params[pi]);
+            }
+            emit(e, ");\n");
+        } else if (fsym && fsym->func_node) {
+            /* Use func_node to get the prototype */
+            Node *fn = fsym->func_node;
+            if (fn->kind == NODE_FUNC_DECL) {
+                Type *ret = checker_get_type(e->checker, fn);
+                if (ret && ret->kind == TYPE_FUNC_PTR) {
+                    emit_type(e, ret->func_ptr.ret);
+                    emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    for (uint32_t pi = 0; pi < ret->func_ptr.param_count; pi++) {
+                        if (pi > 0) emit(e, ", ");
+                        emit_type(e, ret->func_ptr.params[pi]);
+                    }
+                    emit(e, ");\n");
+                } else {
+                    /* Fallback: just emit void func_name(); */
+                    emit(e, "void %.*s();\n",
+                         (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                }
+            }
+        }
+    }
+
+    emit(e, "\n/* ZER spawn thread wrappers */\n");
+    for (int wi = 0; wi < e->spawn_wrapper_count; wi++) {
+        SpawnWrapper *sw = &e->spawn_wrappers[wi];
+        Node *sn = sw->spawn_node;
+        int sid = sw->id;
+        int ac = sn->spawn_stmt.arg_count;
+
+        if (ac > 0) {
+            /* Emit arg struct typedef */
+            emit(e, "struct _zer_spawn_args_%d { ", sid);
+            for (int i = 0; i < ac; i++) {
+                Type *at = checker_get_type(e->checker, sn->spawn_stmt.args[i]);
+                if (at) {
+                    emit_type_and_name(e, at, NULL, 0);
+                    emit(e, " a%d; ", i);
+                }
+            }
+            emit(e, "};\n");
+        }
+
+        /* Emit wrapper function */
+        emit(e, "static void *_zer_spawn_wrap_%d(void *_raw) {\n", sid);
+        if (ac > 0) {
+            emit(e, "    struct _zer_spawn_args_%d *_a = (struct _zer_spawn_args_%d *)_raw;\n", sid, sid);
+            emit(e, "    %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            for (int i = 0; i < ac; i++) {
+                if (i > 0) emit(e, ", ");
+                emit(e, "_a->a%d", i);
+            }
+            emit(e, ");\n");
+            emit(e, "    free(_a);\n");
+        } else {
+            emit(e, "    %.*s();\n", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+        }
+        emit(e, "    return NULL;\n");
+        emit(e, "}\n");
+    }
+    emit(e, "\n");
 }
 
 /* RF2: unified top-level declaration emitter — used by both emit_file and emit_file_no_preamble.
@@ -4648,6 +4941,10 @@ void emit_file(Emitter *e, Node *file_node) {
         }
     }
 
+    /* Pre-scan: find all spawn statements and assign IDs for wrapper emission */
+    for (int i = 0; i < file_node->file.decl_count; i++)
+        prescan_spawn_in_node(e, file_node->file.decls[i]);
+
     /* Pass 1: emit struct/enum/union/typedef declarations first */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
@@ -4668,6 +4965,9 @@ void emit_file(Emitter *e, Node *file_node) {
         }
         emit(e, "\n");
     }
+
+    /* Emit spawn wrapper functions — after structs/slabs, before user functions */
+    emit_spawn_wrappers(e);
 
     /* Pass 2: emit everything else (functions, globals, etc.) */
     for (int i = 0; i < file_node->file.decl_count; i++) {

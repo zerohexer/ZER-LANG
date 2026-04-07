@@ -17,7 +17,7 @@ typedef enum {
     TOK_OPAQUE,
 
     /* === Declaration keywords === */
-    TOK_STRUCT, TOK_PACKED, TOK_ENUM, TOK_UNION,
+    TOK_STRUCT, TOK_PACKED, TOK_SHARED, TOK_ENUM, TOK_UNION,
     TOK_CONST, TOK_TYPEDEF, TOK_DISTINCT,
 
     /* === Control flow === */

@@ -1,0 +1,11 @@
+// shared struct — cannot take pointer to field
+// Pointer would bypass auto-locking
+
+shared struct State { u32 count; u32 total; }
+State s;
+
+u32 main() {
+    s.count = 42;
+    *u32 p = &s.count;
+    return 0;
+}

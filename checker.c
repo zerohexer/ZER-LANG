@@ -1492,6 +1492,16 @@ static Type *check_expr(Checker *c, Node *node) {
                             "pointer alias would bypass variant lock",
                             (int)c->union_switch_var_len, c->union_switch_var);
                     }
+                    /* shared struct: ban &s.field — pointer would bypass auto-locking */
+                    if (sym && sym->type) {
+                        Type *st = type_unwrap_distinct(sym->type);
+                        if (st->kind == TYPE_STRUCT && st->struct_type.is_shared &&
+                            node->unary.operand->kind == NODE_FIELD) {
+                            checker_error(c, node->loc.line,
+                                "cannot take address of shared struct field — "
+                                "pointer would bypass auto-locking");
+                        }
+                    }
                 }
             }
             break;
@@ -6587,6 +6597,7 @@ static void register_decl(Checker *c, Node *node) {
         t->struct_type.name = node->struct_decl.name;
         t->struct_type.name_len = (uint32_t)node->struct_decl.name_len;
         t->struct_type.is_packed = node->struct_decl.is_packed;
+        t->struct_type.is_shared = node->struct_decl.is_shared;
         t->struct_type.field_count = (uint32_t)node->struct_decl.field_count;
         t->struct_type.type_id = c->next_type_id++;
         t->struct_type.module_prefix = c->current_module;

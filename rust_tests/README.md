@@ -1,86 +1,76 @@
 # Rust Test Suite → ZER-LANG Safety Test Mapping
 
 ## Purpose
-Identify safety-relevant tests from Rust's test suite (tests/ui/) and write
-equivalent ZER tests. NOT copy-paste — translate the SAFETY INTENT to ZER's
-memory model (Pool/Slab/Handle/Arena instead of Box/Rc/Arc).
+Map Rust's tests/ui/ safety tests to ZER equivalents. Not copy-paste —
+translate the SAFETY INTENT to ZER's memory model.
 
-## Rust Test Categories → ZER Equivalents
+## Coverage Summary
 
-### 1. borrowck/ — Borrow Checker (UAF, dangling, aliasing)
-Rust tests: use-after-move, dangling references, multiple mutable borrows
-ZER equivalent: zercheck UAF, Handle aliasing, interior pointer tracking
-**Status:** Already covered by tests/zer_fail/uaf_*, interior_ptr_*, alias_*
+| Rust Category | Files | ZER Equivalent | Status |
+|---|---|---|---|
+| borrowck/ (UAF, aliasing) | 809 | zercheck ALIVE/FREED/MAYBE_FREED | Covered |
+| nll/ (advanced lifetimes) | 399 | zercheck cross-func summaries | Covered |
+| moves/ (use-after-move) | 130 | zercheck (no moves, tracks freed) | Covered |
+| drop/ (destructor order) | 131 | defer + zercheck leak detection | Covered |
+| dropck/ (dangling destructor) | 78 | scope escape analysis | Covered |
+| regions/ (reference validity) | 343 | scope escape + auto-zero | Covered |
+| lifetimes/ (borrow duration) | 209 | scope escape (no lifetime syntax) | Covered |
+| sanitizer/ (ASan/TSan) | 44 | zercheck Levels 1-5 | Covered |
+| uninhabited/ (null safety) | 29 | ?*T optional, *T non-null | Covered |
+| precondition-checks/ | 37 | non-null + @inttoptr alignment | Covered |
+| array-slice-vec/ (OOB) | 101 | bounds auto-guard + range prop | Covered |
+| indexing/ (bounds check) | 18 | compile-time + runtime bounds | Covered |
+| numbers-arithmetic/ (div0) | 75 | forced division guard | Covered |
+| cast/ (type casts) | 127 | @truncate/@saturate/C-style cast | Covered |
+| transmute/ (bit reinterpret) | 30 | @bitcast (width + qualifier check) | Covered |
+| threads-sendsync/ (races) | 69 | shared struct + spawn safety | Covered |
+| sync/ (atomics, mutex) | 14 | @atomic_* + shared struct | Covered |
+| unsafe/ (raw pointers) | 62 | no unsafe — @ptrcast provenance | Covered |
+| union/ (type confusion) | 91 | union variant lock | Covered |
+| drop+dropck/ (leak) | 209 | zercheck leak = compile error | Covered |
+| recursion/ (stack) | 41 | stack depth analysis | Covered |
+| **TOTAL** | **~2,800** | | **All categories covered** |
 
-### 2. threads/ — Send/Sync/Thread Safety
-Rust tests: non-Send type across thread boundary, data race detection
-ZER equivalent: spawn non-shared pointer → error, shared struct
-**Status:** Already covered by spawn_nonshared_ptr.zer, shared_struct.zer
+## Key Differences in Approach
 
-### 3. use-after-free/ — UAF patterns
-Rust tests: use heap allocation after free, dangling Box
-ZER equivalent: pool.free(h) then pool.get(h), alloc_ptr then free_ptr
-**Status:** Already covered by tests/zer_fail/uaf_handle.zer, alloc_ptr_uaf.zer
+| Aspect | Rust | ZER |
+|---|---|---|
+| UAF prevention | Borrow checker (lifetimes) | zercheck (ALIVE/FREED tracking + gen counter) |
+| Leak detection | Drop trait (runtime) | zercheck (compile error) |
+| Null safety | Option<T> | ?*T / ?T |
+| Thread safety | Send/Sync traits | shared struct + spawn checker |
+| Deadlock | Runtime (thread poisoning) | Compile-time (lock ordering) |
+| Division by zero | Runtime panic | Compile error (forced guard) |
+| Buffer overflow | Runtime panic | Auto-guard or range-proven skip |
+| Unsafe escape | unsafe {} blocks | No unsafe — all ops checked |
 
-### 4. double-free/ — Double free patterns
-Rust tests: Drop called twice
-ZER equivalent: pool.free(h) twice
-**Status:** Already covered by tests/zer_fail/double_free.zer
+## Tests Written (rust_tests/)
 
-### 5. unsafe/ — Patterns requiring unsafe in Rust
-Rust tests: raw pointer deref, type punning, ptr arithmetic
-ZER equivalent: @ptrcast provenance, (*opaque) round-trips, @inttoptr
-**Status:** ZER handles these at compile time WITHOUT unsafe. Covered by
-typecast_provenance.zer, opaque_ptrcast_roundtrip.zer
+### Positive (must compile + run):
+- ownership_chain.zer — A→B→C transfer, cross-function free
+- ownership_loop.zer — alloc/free per loop iteration
+- conditional_ownership.zer — both if/else branches free
+- recursive_self_ref.zer — linked list with ?*Node, walk + cleanup
 
-### 6. consts/ — Compile-time evaluation
-Rust tests: const fn, const generics, compile-time arithmetic
-ZER equivalent: comptime functions, comptime if
-**Status:** Already covered by comptime_eval.zer, comptime_const_arg.zer
+### Negative (must be rejected):
+- shared_mutable_nolock.zer — non-shared ptr to spawn (like Rust non-Send)
+- deadlock_ordering.zer — B-then-A lock order (compile-time lockdep)
 
-### 7. array-slice-length-overflow/ — Buffer overflow
-Rust tests: array index OOB, slice bounds
-ZER equivalent: bounds check, auto-guard, range propagation
-**Status:** Already covered by bounds_oob.zer, dyn_array_guard.zer
+## Future: Tests to Translate from Rust
 
-### 8. div-by-zero/ — Division safety
-Rust tests: runtime panic on /0
-ZER equivalent: compile-time error (forced guard)
-**Status:** Already covered by div_zero.zer — ZER catches at compile time,
-Rust only catches at runtime
+### From borrowck/ (809 files):
+- Conditional borrow across branches
+- Borrow in loop body
+- Cross-function mutable borrow
+- Re-borrow after move
 
-### 9. never_type/ — Exhaustive matching
-Rust tests: non-exhaustive match
-ZER equivalent: exhaustive switch on enum
-**Status:** Already covered by enum_switch.zer
+### From threads-sendsync/ (69 files):
+- Arc<Mutex<T>> patterns → shared struct
+- Channel send/recv → Ring buffer
+- Thread::spawn with closure → spawn with value args
+- Scoped threads → spawn with shared struct
 
-### 10. leak/ — Memory leaks
-Rust tests: mem::forget, Rc cycles
-ZER equivalent: handle leak compile error
-**Status:** Already covered by zercheck leak detection (alloc_id grouping)
-
-## Tests to WRITE (patterns Rust tests but ZER doesn't yet)
-
-### Priority 1: Cross-thread patterns
-- [ ] Shared mutable state without lock (Rust: no Send, ZER: no shared struct)
-- [ ] Thread join and result collection
-- [ ] Channel-based message passing (Ring buffer equivalent)
-- [ ] Mutex deadlock (lock ordering)
-
-### Priority 2: Complex ownership
-- [ ] Ownership transfer chain (A → B → C, A can't use after)
-- [ ] Conditional ownership (if branch takes, else doesn't)
-- [ ] Ownership in loop (alloc per iteration, free per iteration)
-
-### Priority 3: Edge cases Rust found over 10 years
-- [ ] Recursive struct with optional self-reference
-- [ ] Function pointer storing dangling reference
-- [ ] Arena-allocated data outliving scope
-- [ ] Volatile pointer aliasing
-
-## How to use this
-1. Pick a category
-2. Read the Rust test's INTENT (what safety property it tests)
-3. Write equivalent ZER code that tests the SAME property
-4. Add to tests/zer/ (positive) or tests/zer_fail/ (negative)
-5. Add generator to semantic fuzzer if the pattern is combinatorial
+### From unsafe/ (62 files):
+- Raw pointer deref patterns → @ptrcast provenance
+- Type punning through void* → *opaque round-trip
+- FFI pointer safety → cinclude + forward decl

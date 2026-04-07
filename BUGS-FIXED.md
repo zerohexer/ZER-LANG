@@ -2957,3 +2957,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
   3. Param color inference (`returns_param_color`) — when function returns cast of param, caller's arg color flows to result. Covers `*opaque → *T` adapter functions.
 - **Coverage:** Direct arena wrapper (100%), chained wrappers up to 8 levels (100%), freelist type-punning through `*opaque` adapters (100%), pool/malloc leaks still caught.
 - **Alias walker updated:** NODE_TYPECAST added to alias source walker for alloc_id + source_color propagation through C-style casts.
+
+### BUG-456: *opaque adapter function return treated as new allocation (found by semantic fuzzer)
+- **Symptom:** `*Src back = unwrap(raw);` where `unwrap(*opaque r) { return (*Src)r; }` — zercheck reports "back never freed" even though `back` is the same memory as the already-deferred original pointer.
+- **Root cause:** Param color inference copied `source_color` but not `alloc_id`. `back` was tracked as a separate allocation from `s`, so defer on `s` didn't cover `back`.
+- **Fix:** Param color inference now creates full ALIAS — copies alloc_id, state, pool_id, free_line, source_color from arg's HandleInfo. Result shares allocation identity with the arg.
+- **Found by:** Semantic fuzzer (`test_semantic_fuzz.c`) — `safe_opaque_*` pattern with Slab + adapter function + defer.
+- **Tests:** 1000 semantic fuzz tests across 5 seeds — zero failures after fix.

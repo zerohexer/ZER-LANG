@@ -747,7 +747,8 @@ When starting a new session or lacking context:
 - **zerc** = the compiler binary (`zerc_main.c` + all lib sources)
 - **zer-lsp** = LSP server (`zer_lsp.c` + all lib sources)
 - Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`
-- Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`, `test_fuzz.c`
+- Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`, `test_fuzz.c`, `tests/test_semantic_fuzz.c`
+- **Semantic fuzzer** (`tests/test_semantic_fuzz.c`): generates 200 random ZER programs combining alloc, cast, defer, interior ptr, *opaque, arena wrappers, pool/slab. Safe programs must compile+run, unsafe must be rejected. Run as part of `make check`. **When adding new features, add generator functions to the fuzzer** — `gen_safe_<feature>()` + `gen_unsafe_<feature>()` + new case in switch. Combinatorial testing happens automatically via RNG mixing.
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
 - Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)

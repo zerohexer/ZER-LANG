@@ -1,0 +1,32 @@
+// Rust: Mutex<SensorState> — lock protects all fields atomically
+// ZER: shared struct — consecutive field accesses grouped under one lock
+
+shared struct SensorState {
+    u32 temperature;
+    u32 pressure;
+    u32 humidity;
+    bool valid;
+}
+
+SensorState state;
+
+void update_sensors(*SensorState s) {
+    // All four writes under ONE lock (block-level grouping)
+    s.temperature = 250;
+    s.pressure = 1013;
+    s.humidity = 65;
+    s.valid = true;
+}
+
+u32 main() {
+    state.temperature = 0;
+    state.pressure = 0;
+    state.humidity = 0;
+    state.valid = false;
+
+    spawn update_sensors(&state);
+
+    // Main thread reads — auto-locked
+    // (In real code, would wait for valid flag)
+    return 0;
+}

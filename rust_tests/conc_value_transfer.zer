@@ -1,0 +1,17 @@
+// Rust: move semantics — value moved into thread::spawn closure
+// ZER: spawn copies value args — original still usable
+
+void process(u32 task_id, u32 priority) {
+    u32 result = task_id + priority;
+}
+
+u32 main() {
+    u32 id = 42;
+    u32 prio = 3;
+    // Values copied to thread — not moved
+    spawn process(id, prio);
+    // Original values still usable (copied, not moved)
+    if (id != 42) { return 1; }
+    if (prio != 3) { return 2; }
+    return 0;
+}

@@ -1,0 +1,27 @@
+// Rust: ABBA deadlock — detected at runtime by thread hang
+// ZER: detected at COMPILE TIME by lock ordering
+
+shared struct BankA { u32 balance; }
+shared struct BankB { u32 balance; }
+
+BankA account_a;
+BankB account_b;
+
+// Transfer A→B: locks A first, then B — correct order
+void transfer_ab(u32 amount) {
+    account_a.balance -= amount;
+    account_b.balance += amount;
+}
+
+// Transfer B→A: locks B first, then A — WRONG ORDER
+// MUST FAIL: deadlock
+void transfer_ba(u32 amount) {
+    account_b.balance -= amount;
+    account_a.balance += amount;  // ERROR: A after B
+}
+
+u32 main() {
+    account_a.balance = 1000;
+    account_b.balance = 2000;
+    return 0;
+}

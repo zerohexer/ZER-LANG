@@ -1,0 +1,18 @@
+// Rust: Rc<T> is !Send — cannot cross thread boundary
+// ZER equivalent: non-shared struct pointer cannot be passed to spawn
+
+struct RefCounted { u32 data; u32 ref_count; }
+
+void worker(*RefCounted r) {
+    r.data += 1;
+    r.ref_count += 1;
+}
+
+u32 main() {
+    RefCounted rc;
+    rc.data = 0;
+    rc.ref_count = 1;
+    // MUST FAIL: non-shared pointer to spawn = data race
+    spawn worker(&rc);
+    return 0;
+}

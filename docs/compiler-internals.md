@@ -2613,6 +2613,15 @@ When crossing pointer/integer boundary:
 
 **Allowed C-style casts:** int↔int (widening/narrowing), int↔float, float↔float, bool↔int, *T↔*opaque (with provenance), distinct↔base (with @cast semantics).
 
+**Provenance propagation for NODE_TYPECAST (BUG-454):**
+Two sites needed for C-style cast provenance to work:
+1. **NODE_TYPECAST handler** — when casting `*T → *opaque`, walk through `&`/field/index to find root ident, set `provenance_type = source` on its symbol.
+2. **Var-decl init handler** — when init is `NODE_TYPECAST` producing `*opaque`, extract source type via `typemap_get(c, init->typecast.expr)` and set as `sym->provenance_type`. Same pattern as @ptrcast's `typemap_get(c, init->intrinsic.args[0])`.
+
+Without (2), `*opaque raw = (*opaque)&a` didn't propagate `*A` provenance to `raw`, so `(*B)raw` wasn't caught. Both `@ptrcast` and C-style cast now use the same provenance mechanism.
+
+**Parser limitation:** `(Celsius)raw` where `Celsius` is a user-defined type — parser can't distinguish from `(variable) * expr`. Use `@cast(Celsius, raw)` for distinct typedefs. Not a safety bug — @cast is the correct syntax for distinct types.
+
 **Tests:** `typecast_safe_complex.zer` (multi-layer safe patterns), `typecast_provenance.zer`, `typecast_volatile_strip.zer`, `typecast_const_strip.zer`, `typecast_direct_ptr.zer`, `typecast_int_to_ptr.zer`, `typecast_ptr_to_int.zer`.
 
 ### checker_post_passes Not Called (BUG-453, 2026-04-07)

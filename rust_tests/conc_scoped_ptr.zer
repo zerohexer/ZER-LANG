@@ -1,0 +1,19 @@
+// Rust: thread::scope allows borrowing local data (scoped threads)
+// ZER: ThreadHandle + join allows *T (non-shared) args
+
+struct Matrix { u32 rows; u32 cols; u32 result; }
+
+void multiply(*Matrix m) {
+    m.result = m.rows * m.cols;
+}
+
+u32 main() {
+    Matrix m;
+    m.rows = 7;
+    m.cols = 6;
+    m.result = 0;
+    ThreadHandle th = spawn multiply(&m);
+    th.join();
+    if (m.result != 42) { return 1; }
+    return 0;
+}

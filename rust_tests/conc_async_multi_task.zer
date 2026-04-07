@@ -1,0 +1,49 @@
+// Rust: tokio::spawn multiple tasks — cooperative multitasking
+// ZER: multiple async tasks polled in round-robin loop
+
+u32 count_a;
+u32 count_b;
+u32 done_a;
+u32 done_b;
+
+async void task_a() {
+    u32 i = 0;
+    while (i < 3) {
+        count_a += 1;
+        i += 1;
+        yield;
+    }
+    done_a = 1;
+}
+
+async void task_b() {
+    u32 i = 0;
+    while (i < 5) {
+        count_b += 1;
+        i += 1;
+        yield;
+    }
+    done_b = 1;
+}
+
+u32 main() {
+    count_a = 0;
+    count_b = 0;
+    done_a = 0;
+    done_b = 0;
+
+    _zer_async_task_a ta;
+    _zer_async_task_b tb;
+    _zer_async_task_a_init(&ta);
+    _zer_async_task_b_init(&tb);
+
+    // Round-robin polling — both tasks interleave
+    while (done_a == 0 || done_b == 0) {
+        if (done_a == 0) { _zer_async_task_a_poll(&ta); }
+        if (done_b == 0) { _zer_async_task_b_poll(&tb); }
+    }
+
+    if (count_a != 3) { return 1; }
+    if (count_b != 5) { return 2; }
+    return 0;
+}

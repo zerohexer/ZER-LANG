@@ -1,0 +1,8 @@
+// Rust: Option<T> must be unwrapped before use
+// ZER: *T is non-null by default, ?*T requires unwrapping
+// EXPECTED: compile error (non-null pointer without init)
+
+u32 main() {
+    *u32 ptr;
+    return 0;
+}

@@ -1,0 +1,9 @@
+// Rust: mod-zero.rs — runtime panic
+// ZER: compile error (forced division guard) — BETTER than Rust
+// EXPECTED: compile error
+
+u32 main() {
+    u32 y = 0;
+    u32 z = 1 % y;
+    return z;
+}

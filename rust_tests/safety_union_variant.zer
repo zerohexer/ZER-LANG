@@ -1,0 +1,24 @@
+// Rust: union field access requires unsafe
+// ZER: union switch capture with safe variant access
+
+union Value {
+    u32 int_val;
+    f32 float_val;
+}
+
+u32 main() {
+    Value v;
+    v.int_val = 42;
+
+    u32 result = 0;
+    switch (v) {
+        .int_val => |val| {
+            result = val;
+        }
+        .float_val => |fval| {
+            result = 99;
+        }
+    }
+    if (result != 42) { return 1; }
+    return 0;
+}

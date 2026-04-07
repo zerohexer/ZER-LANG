@@ -1,0 +1,12 @@
+// Rust: bounds-check-no-overflow.rs — runtime panic on OOB index
+// ZER: compile error for provable OOB, auto-guard for unprovable
+// EXPECTED: compile error
+
+u32 main() {
+    u32[3] arr;
+    arr[0] = 1;
+    arr[1] = 2;
+    arr[2] = 3;
+    u32 x = arr[5];
+    return x;
+}

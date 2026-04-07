@@ -1,0 +1,14 @@
+// Rust: double free — Drop called twice (caught by ownership system)
+// ZER: zercheck double-free detection
+// EXPECTED: compile error
+
+struct Resource { u32 data; }
+Pool(Resource, 4) pool;
+
+u32 main() {
+    ?Handle(Resource) mh = pool.alloc();
+    Handle(Resource) h = mh orelse return;
+    pool.free(h);
+    pool.free(h);
+    return 0;
+}

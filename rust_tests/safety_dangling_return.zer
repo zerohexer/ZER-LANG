@@ -1,0 +1,13 @@
+// Rust: borrowck — cannot return reference to local variable
+// ZER: scope escape analysis catches dangling pointer return
+// EXPECTED: compile error
+
+*u32 bad_func() {
+    u32 local = 42;
+    return &local;
+}
+
+u32 main() {
+    *u32 p = bad_func();
+    return 0;
+}

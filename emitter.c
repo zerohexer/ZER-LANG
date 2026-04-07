@@ -363,13 +363,54 @@ static bool shared_needs_condvar(Emitter *e, Type *t) {
     return false;
 }
 
-/* Emit lock acquire for shared struct variable */
-static void emit_shared_lock(Emitter *e, Node *root) {
+/* Check if a shared struct type uses reader-writer lock */
+static bool shared_is_rw(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+    if (eff && eff->kind == TYPE_STRUCT) return eff->struct_type.is_shared_rw;
+    return false;
+}
+
+/* Check if a statement WRITES to a shared struct (vs read-only).
+ * Write = assignment target, compound assign, mutating method call.
+ * Used to determine rdlock vs wrlock for shared(rw) structs. */
+static bool stmt_writes_shared(Node *stmt) {
+    if (!stmt) return false;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT:
+        /* x.field = ...; or x.field += ...; */
+        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_ASSIGN)
+            return true;
+        /* Method calls that mutate (push, free, etc.) */
+        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_CALL)
+            return true; /* conservative: any call might mutate */
+        return false;
+    case NODE_VAR_DECL:
+        return false; /* reading into a variable is read-only */
+    case NODE_RETURN:
+        return false; /* reading for return */
+    default:
+        return false;
+    }
+}
+
+/* Emit lock acquire for shared struct variable.
+ * For shared(rw) structs, is_write determines rdlock vs wrlock. */
+static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
     Type *rt = checker_get_type(e->checker, root);
     bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
     const char *arrow = is_ptr ? "->" : ".";
     emit_indent(e);
-    if (shared_needs_condvar(e, rt)) {
+    if (shared_is_rw(rt)) {
+        if (is_write) {
+            emit(e, "pthread_rwlock_wrlock(&");
+        } else {
+            emit(e, "pthread_rwlock_rdlock(&");
+        }
+        emit_expr(e, root);
+        emit(e, "%s_zer_rwlock);\n", arrow);
+    } else if (shared_needs_condvar(e, rt)) {
         emit(e, "pthread_mutex_lock(&");
         emit_expr(e, root);
         emit(e, "%s_zer_mtx);\n", arrow);
@@ -380,13 +421,21 @@ static void emit_shared_lock(Emitter *e, Node *root) {
     }
 }
 
+static void emit_shared_lock(Emitter *e, Node *root) {
+    emit_shared_lock_mode(e, root, true); /* default: write lock (conservative) */
+}
+
 /* Emit lock release for shared struct variable */
 static void emit_shared_unlock(Emitter *e, Node *root) {
     Type *rt = checker_get_type(e->checker, root);
     bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
     const char *arrow = is_ptr ? "->" : ".";
     emit_indent(e);
-    if (shared_needs_condvar(e, rt)) {
+    if (shared_is_rw(rt)) {
+        emit(e, "pthread_rwlock_unlock(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_rwlock);\n", arrow);
+    } else if (shared_needs_condvar(e, rt)) {
         emit(e, "pthread_mutex_unlock(&");
         emit_expr(e, root);
         emit(e, "%s_zer_mtx);\n", arrow);
@@ -2764,10 +2813,23 @@ static void emit_stmt(Emitter *e, Node *node) {
              * accessing the same shared variable under one lock scope. */
             Node *sr = find_shared_root_in_stmt(e, node->block.stmts[i]);
             if (sr) {
-                emit_shared_lock(e, sr);
-                /* Emit this statement + scan ahead for consecutive same-root */
+                /* For shared(rw): scan group to determine read vs write lock.
+                 * If ANY statement in the group writes → wrlock. All reads → rdlock. */
+                bool group_writes = stmt_writes_shared(node->block.stmts[i]);
                 const char *sr_name = sr->ident.name;
                 uint32_t sr_len = (uint32_t)sr->ident.name_len;
+                /* Pre-scan the group for writes */
+                for (int j = i + 1; j < node->block.stmt_count; j++) {
+                    Node *jsr = find_shared_root_in_stmt(e, node->block.stmts[j]);
+                    if (!jsr || jsr->kind != NODE_IDENT ||
+                        (uint32_t)jsr->ident.name_len != sr_len ||
+                        memcmp(jsr->ident.name, sr_name, sr_len) != 0)
+                        break;
+                    if (stmt_writes_shared(node->block.stmts[j]))
+                        group_writes = true;
+                }
+                emit_shared_lock_mode(e, sr, group_writes);
+                /* Emit this statement + scan ahead for consecutive same-root */
                 while (i < node->block.stmt_count) {
                     emit_stmt(e, node->block.stmts[i]);
                     /* Check if NEXT statement also accesses same shared root */
@@ -3877,17 +3939,21 @@ static void emit_struct_decl(Emitter *e, Node *node) {
         emit(e, ";\n");
     }
     }
-    /* shared struct: add hidden lock field (+ condvar if needed) */
+    /* shared struct: add hidden lock field (+ condvar/rwlock if needed) */
     if (node->struct_decl.is_shared) {
-        Type *st = checker_get_type(e->checker, (Node *)node);
-        bool needs_condvar = false;
-        if (st && st->kind == TYPE_STRUCT)
-            needs_condvar = is_condvar_type(e, st->struct_type.type_id);
-        if (needs_condvar) {
-            emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
-            emit_indent(e); emit(e, "pthread_cond_t _zer_cond;\n");
+        if (node->struct_decl.is_shared_rw) {
+            emit_indent(e); emit(e, "pthread_rwlock_t _zer_rwlock;\n");
         } else {
-            emit_indent(e); emit(e, "uint32_t _zer_lock;\n");
+            Type *st = checker_get_type(e->checker, (Node *)node);
+            bool needs_condvar = false;
+            if (st && st->kind == TYPE_STRUCT)
+                needs_condvar = is_condvar_type(e, st->struct_type.type_id);
+            if (needs_condvar) {
+                emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
+                emit_indent(e); emit(e, "pthread_cond_t _zer_cond;\n");
+            } else {
+                emit_indent(e); emit(e, "uint32_t _zer_lock;\n");
+            }
         }
     }
     e->indent--;
@@ -4500,6 +4566,9 @@ void emit_file(Emitter *e, Node *file_node) {
     /* C preamble */
     emit(e, "/* Generated by ZER compiler — do not edit */\n");
     emit(e, "/* Compile with: gcc -std=c99 -fwrapv -fno-strict-aliasing */\n");
+    emit(e, "#ifndef _POSIX_C_SOURCE\n");
+    emit(e, "#define _POSIX_C_SOURCE 200112L\n");
+    emit(e, "#endif\n");
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
     emit(e, "#include <string.h>\n");

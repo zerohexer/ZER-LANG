@@ -1,0 +1,14 @@
+// Rust: raw pointer casts require unsafe, no compile-time type checking
+// ZER: @ptrcast provenance tracking — wrong type = compile error (NO unsafe needed)
+// EXPECTED: compile error
+
+struct Motor { u32 speed; }
+struct Sensor { u32 reading; }
+
+u32 main() {
+    Sensor s;
+    s.reading = 42;
+    *opaque ctx = @ptrcast(*opaque, &s);
+    *Motor m = @ptrcast(*Motor, ctx);
+    return 0;
+}

@@ -1,0 +1,14 @@
+// Rust: mem::forget leaks — no compile error (design choice)
+// ZER: handle leak = compile error (zercheck) — BETTER than Rust
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).id = 42;
+    // No free — handle leaked!
+    return 0;
+}

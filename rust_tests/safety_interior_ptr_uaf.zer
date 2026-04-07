@@ -1,0 +1,16 @@
+// Rust: borrowck — interior reference invalidated by free
+// ZER: interior pointer UAF detection — field-derived pointer shares alloc_id
+// EXPECTED: compile error
+
+struct Block { u32 value; u32 flags; }
+Slab(Block) heap;
+
+u32 main() {
+    ?*Block mb = heap.alloc_ptr();
+    *Block b = mb orelse return;
+    b.value = 42;
+    *u32 p = &b.value;
+    heap.free_ptr(b);
+    u32 x = p[0];
+    return 0;
+}

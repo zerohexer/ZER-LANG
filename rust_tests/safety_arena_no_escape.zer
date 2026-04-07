@@ -1,0 +1,18 @@
+// Rust: no equivalent (Rust uses lifetimes instead)
+// ZER: arena-derived pointers cannot escape to globals
+// EXPECTED: compile error
+
+struct Slot { u32 value; }
+
+u8[1024] buf;
+Arena scratch;
+?*Slot global_slot;
+
+u32 main() {
+    scratch = (Arena) { .buf = buf, .capacity = 1024, .offset = 0 };
+    ?*Slot ms = scratch.alloc(Slot);
+    *Slot s = ms orelse return;
+    s.value = 42;
+    global_slot = s;
+    return 0;
+}

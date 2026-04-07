@@ -1,0 +1,19 @@
+// Rust: borrowck — cross-function invalidation via mutable reference
+// ZER: zercheck cross-function summaries detect free through function call
+// EXPECTED: compile error
+
+struct Item { u32 data; }
+Slab(Item) heap;
+
+void destroy(*Item p) {
+    heap.free_ptr(p);
+}
+
+u32 main() {
+    ?*Item mi = heap.alloc_ptr();
+    *Item item = mi orelse return;
+    item.data = 42;
+    destroy(item);
+    item.data = 99;
+    return 0;
+}

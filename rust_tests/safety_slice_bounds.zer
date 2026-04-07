@@ -1,0 +1,17 @@
+// Rust: slice bounds checking — runtime panic on OOB
+// ZER: slice access bounds-checked at runtime via auto-guard
+
+u32 main() {
+    u8[10] data;
+    for (u32 i = 0; i < 10; i += 1) {
+        data[i] = @truncate(u8, i * 10);
+    }
+    // Create slice from array
+    [*]u8 slice = data;
+    // Valid access
+    u8 first = slice[0];
+    u8 last = slice[9];
+    if (first != 0) { return 1; }
+    if (last != 90) { return 2; }
+    return 0;
+}

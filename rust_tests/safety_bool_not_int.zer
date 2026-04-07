@@ -1,0 +1,9 @@
+// Rust: bool is not an integer — no implicit conversion
+// ZER: same — bool is NOT an integer, no bool↔int coercion
+// EXPECTED: compile error
+
+u32 main() {
+    bool flag = true;
+    u32 x = flag;
+    return x;
+}

@@ -1,0 +1,28 @@
+// Rust: Option<T> — must match/unwrap, None access = panic
+// ZER: ?*T — must use orelse or if-unwrap
+
+struct Val { u32 data; }
+Pool(Val, 4) pool;
+
+u32 main() {
+    // alloc returns ?Handle — must unwrap
+    ?Handle(Val) mh = pool.alloc();
+    Handle(Val) h = mh orelse return;
+    pool.get(h).data = 42;
+
+    // orelse with default
+    u32 val = pool.get(h).data;
+    if (val != 42) { return 1; }
+
+    // if-unwrap pattern on optional
+    ?Handle(Val) mh2 = pool.alloc();
+    if (mh2) |h2| {
+        pool.get(h2).data = 99;
+        u32 v2 = pool.get(h2).data;
+        if (v2 != 99) { return 2; }
+        pool.free(h2);
+    }
+
+    pool.free(h);
+    return 0;
+}

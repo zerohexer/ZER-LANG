@@ -263,6 +263,156 @@ static void gen_unsafe_provenance(char *buf, int id) {
     p += sprintf(p, "}\n");
 }
 
+/* ---- New generators: goto, comptime, handle alias, enum, while+break ---- */
+
+static void gen_safe_goto_defer(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Gd%d { u32 v; }\n", id);
+    p += sprintf(p, "Pool(Gd%d, 4) gdpool%d;\n", id, id);
+    p += sprintf(p, "u32 test_goto_defer_%d() {\n", id);
+    p += sprintf(p, "    ?Handle(Gd%d) mh = gdpool%d.alloc();\n", id, id);
+    p += sprintf(p, "    Handle(Gd%d) h = mh orelse return;\n", id);
+    p += sprintf(p, "    defer gdpool%d.free(h);\n", id);
+    p += sprintf(p, "    gdpool%d.get(h).v = %d;\n", id, id * 7);
+    p += sprintf(p, "    goto done%d;\n", id);
+    p += sprintf(p, "    gdpool%d.get(h).v = 0;\n", id);
+    p += sprintf(p, "done%d:\n", id);
+    p += sprintf(p, "    if (gdpool%d.get(h).v != %d) { return 1; }\n", id, id * 7);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_comptime(char *buf, int id) {
+    char *p = buf;
+    unsigned a = 3 + (id % 10);
+    unsigned b = 7 + (id % 5);
+    unsigned max = a > b ? a : b;
+    p += sprintf(p, "comptime u32 MAX%d(u32 a, u32 b) {\n", id);
+    p += sprintf(p, "    if (a > b) { return a; }\n");
+    p += sprintf(p, "    return b;\n");
+    p += sprintf(p, "}\n");
+    p += sprintf(p, "u32 test_comptime_%d() {\n", id);
+    p += sprintf(p, "    u32 val = MAX%d(%u, %u);\n", id, a, b);
+    p += sprintf(p, "    if (val != %u) { return 1; }\n", max);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_handle_alias(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Ha%d { u32 v; }\n", id);
+    p += sprintf(p, "Pool(Ha%d, 4) hapool%d;\n", id, id);
+    p += sprintf(p, "u32 test_halias_%d() {\n", id);
+    p += sprintf(p, "    ?Handle(Ha%d) mh = hapool%d.alloc();\n", id, id);
+    p += sprintf(p, "    Handle(Ha%d) h1 = mh orelse return;\n", id);
+    p += sprintf(p, "    Handle(Ha%d) h2 = h1;\n", id);
+    p += sprintf(p, "    hapool%d.get(h1).v = %d;\n", id, id * 3);
+    p += sprintf(p, "    u32 val = hapool%d.get(h2).v;\n", id);
+    p += sprintf(p, "    hapool%d.free(h1);\n", id);
+    p += sprintf(p, "    if (val != %d) { return 1; }\n", id * 3);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_enum_switch(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "enum Cmd%d { start, stop, reset }\n", id);
+    p += sprintf(p, "u32 run_cmd%d(Cmd%d c) {\n", id, id);
+    p += sprintf(p, "    switch (c) {\n");
+    p += sprintf(p, "        .start => { return 1; }\n");
+    p += sprintf(p, "        .stop => { return 2; }\n");
+    p += sprintf(p, "        .reset => { return 3; }\n");
+    p += sprintf(p, "    }\n");
+    p += sprintf(p, "}\n");
+    p += sprintf(p, "u32 test_enum_%d() {\n", id);
+    p += sprintf(p, "    if (run_cmd%d(Cmd%d.start) != 1) { return 1; }\n", id, id);
+    p += sprintf(p, "    if (run_cmd%d(Cmd%d.stop) != 2) { return 2; }\n", id, id);
+    p += sprintf(p, "    if (run_cmd%d(Cmd%d.reset) != 3) { return 3; }\n", id, id);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_while_break(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Wb%d { u32 count; }\n", id);
+    p += sprintf(p, "Pool(Wb%d, 4) wbpool%d;\n", id, id);
+    p += sprintf(p, "u32 test_while_%d() {\n", id);
+    p += sprintf(p, "    ?Handle(Wb%d) mh = wbpool%d.alloc();\n", id, id);
+    p += sprintf(p, "    Handle(Wb%d) h = mh orelse return;\n", id);
+    p += sprintf(p, "    defer wbpool%d.free(h);\n", id);
+    p += sprintf(p, "    wbpool%d.get(h).count = 0;\n", id);
+    int limit = 5 + (id % 20);
+    int brk = 2 + (id % (limit - 1));
+    p += sprintf(p, "    u32 i = 0;\n");
+    p += sprintf(p, "    while (i < %d) {\n", limit);
+    p += sprintf(p, "        wbpool%d.get(h).count = i;\n", id);
+    p += sprintf(p, "        i += 1;\n");
+    p += sprintf(p, "        if (i == %d) { break; }\n", brk);
+    p += sprintf(p, "    }\n");
+    p += sprintf(p, "    if (wbpool%d.get(h).count != %d) { return 1; }\n", id, brk - 1);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_task_new(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Tk%d { u32 id; u32 priority; }\n", id);
+    p += sprintf(p, "u32 test_task_%d() {\n", id);
+    p += sprintf(p, "    ?*Tk%d mt = Tk%d.new_ptr();\n", id, id);
+    p += sprintf(p, "    *Tk%d t = mt orelse return;\n", id);
+    p += sprintf(p, "    t.id = %d;\n", id);
+    p += sprintf(p, "    t.priority = %d;\n", id % 5);
+    p += sprintf(p, "    if (t.id != %d) { return 1; }\n", id);
+    p += sprintf(p, "    Tk%d.delete_ptr(t);\n", id);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_safe_funcptr_callback(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "u32 double%d(u32 x) { return x + x; }\n", id);
+    p += sprintf(p, "u32 triple%d(u32 x) { return x + x + x; }\n", id);
+    p += sprintf(p, "u32 apply%d(u32 (*op)(u32), u32 val) { return op(val); }\n", id);
+    p += sprintf(p, "u32 test_funcptr_%d() {\n", id);
+    unsigned val = 10 + id;
+    p += sprintf(p, "    u32 a = apply%d(double%d, %u);\n", id, id, val);
+    p += sprintf(p, "    u32 b = apply%d(triple%d, %u);\n", id, id, val);
+    p += sprintf(p, "    if (a != %u) { return 1; }\n", val * 2);
+    p += sprintf(p, "    if (b != %u) { return 2; }\n", val * 3);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_unsafe_alias_uaf(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Au%d { u32 v; }\n", id);
+    p += sprintf(p, "Pool(Au%d, 4) aupool%d;\n", id, id);
+    p += sprintf(p, "u32 test_alias_uaf_%d() {\n", id);
+    p += sprintf(p, "    ?Handle(Au%d) mh = aupool%d.alloc();\n", id, id);
+    p += sprintf(p, "    Handle(Au%d) h1 = mh orelse return;\n", id);
+    p += sprintf(p, "    Handle(Au%d) h2 = h1;\n", id);
+    p += sprintf(p, "    aupool%d.free(h1);\n", id);
+    p += sprintf(p, "    u32 val = aupool%d.get(h2).v;\n", id); /* UAF via alias */
+    p += sprintf(p, "    return val;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_unsafe_goto_uaf(char *buf, int id) {
+    char *p = buf;
+    p += sprintf(p, "struct Gu%d { u32 v; }\n", id);
+    p += sprintf(p, "Pool(Gu%d, 4) gupool%d;\n", id, id);
+    p += sprintf(p, "u32 test_goto_uaf_%d() {\n", id);
+    p += sprintf(p, "    ?Handle(Gu%d) mh = gupool%d.alloc();\n", id, id);
+    p += sprintf(p, "    Handle(Gu%d) h = mh orelse return;\n", id);
+    p += sprintf(p, "    u32 count = 0;\n");
+    p += sprintf(p, "retry%d:\n", id);
+    p += sprintf(p, "    gupool%d.get(h).v = count;\n", id);
+    p += sprintf(p, "    gupool%d.free(h);\n", id);
+    p += sprintf(p, "    goto retry%d;\n", id); /* backward goto after free */
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
 int main(int argc, char **argv) {
     unsigned seed = argc > 1 ? (unsigned)atoi(argv[1]) : 42;
     int count = argc > 2 ? atoi(argv[2]) : 200;
@@ -279,7 +429,7 @@ int main(int argc, char **argv) {
         char decls[4096] = "";
         char calls[2048] = "";
         char *cp = calls;
-        int pattern = rng(10);
+        int pattern = rng(18);
 
         switch (pattern) {
         case 0: case 1: { /* safe arena chain */
@@ -361,6 +511,76 @@ int main(int argc, char **argv) {
                 gen_unsafe_provenance(decls, i);
                 cp += sprintf(cp, "    return test_prov_%d();\n", i);
                 snprintf(name, sizeof(name), "unsafe_provenance_%d", i);
+            }
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s}\n", decls, calls);
+            run_test(name, prog, 1);
+            break;
+        }
+        case 10: { /* safe goto + defer */
+            gen_safe_goto_defer(decls, i);
+            cp += sprintf(cp, "    if (test_goto_defer_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_goto_defer_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 11: { /* safe comptime */
+            gen_safe_comptime(decls, i);
+            cp += sprintf(cp, "    if (test_comptime_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_comptime_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 12: { /* safe handle alias */
+            gen_safe_handle_alias(decls, i);
+            cp += sprintf(cp, "    if (test_halias_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_handle_alias_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 13: { /* safe enum switch */
+            gen_safe_enum_switch(decls, i);
+            cp += sprintf(cp, "    if (test_enum_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_enum_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 14: { /* safe while + break */
+            gen_safe_while_break(decls, i);
+            cp += sprintf(cp, "    if (test_while_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_while_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 15: { /* safe Task.new */
+            gen_safe_task_new(decls, i);
+            cp += sprintf(cp, "    if (test_task_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_task_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 16: { /* safe function pointer callback */
+            gen_safe_funcptr_callback(decls, i);
+            cp += sprintf(cp, "    if (test_funcptr_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_funcptr_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 17: { /* unsafe alias UAF or goto UAF */
+            if (rng(2)) {
+                gen_unsafe_alias_uaf(decls, i);
+                cp += sprintf(cp, "    return test_alias_uaf_%d();\n", i);
+                snprintf(name, sizeof(name), "unsafe_alias_uaf_%d", i);
+            } else {
+                gen_unsafe_goto_uaf(decls, i);
+                cp += sprintf(cp, "    return test_goto_uaf_%d();\n", i);
+                snprintf(name, sizeof(name), "unsafe_goto_uaf_%d", i);
             }
             snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s}\n", decls, calls);
             run_test(name, prog, 1);

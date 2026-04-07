@@ -185,6 +185,7 @@ struct Symbol {
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
     bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
+    bool is_thread_handle;  /* ThreadHandle from scoped spawn — must call .join() */
 
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */

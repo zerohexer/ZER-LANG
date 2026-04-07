@@ -41,6 +41,7 @@ typedef struct {
     int source_color;       /* ZC_COLOR_* — where the memory came from */
     int transfer_line;      /* where ownership was transferred (spawn) */
     bool escaped;           /* true if returned, stored in global, or stored in param field */
+    bool is_thread_handle;  /* ThreadHandle from scoped spawn — leak = "thread not joined" */
 } HandleInfo;
 
 /* one execution path's view of all handles — dynamic array */

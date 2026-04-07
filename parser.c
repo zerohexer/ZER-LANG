@@ -1282,12 +1282,63 @@ static Node *parse_statement(Parser *p) {
         return n;
     }
 
-    /* spawn func(args); — contextual keyword (not a reserved keyword).
+    /* ThreadHandle name = spawn func(args); — scoped spawn with join handle.
+     * Detected by ident "ThreadHandle" at statement position. */
+    if (check(p, TOK_IDENT) && p->current.length == 12 &&
+        memcmp(p->current.start, "ThreadHandle", 12) == 0) {
+        advance(p); /* consume "ThreadHandle" */
+        if (!check(p, TOK_IDENT)) {
+            error(p, "expected variable name after 'ThreadHandle'");
+            return new_node(p, NODE_BREAK);
+        }
+        const char *hname = p->current.start;
+        size_t hlen = p->current.length;
+        advance(p);
+        consume(p, TOK_EQ, "expected '=' after ThreadHandle variable name");
+        /* now expect 'spawn' */
+        if (!check(p, TOK_IDENT) || p->current.length != 5 ||
+            memcmp(p->current.start, "spawn", 5) != 0) {
+            error(p, "expected 'spawn' after 'ThreadHandle name ='");
+            return new_node(p, NODE_BREAK);
+        }
+        advance(p); /* consume "spawn" */
+        Node *n = new_node(p, NODE_SPAWN);
+        n->spawn_stmt.handle_name = hname;
+        n->spawn_stmt.handle_name_len = hlen;
+        if (!check(p, TOK_IDENT)) {
+            error(p, "expected function name after 'spawn'");
+            return n;
+        }
+        n->spawn_stmt.func_name = p->current.start;
+        n->spawn_stmt.func_name_len = p->current.length;
+        advance(p);
+        consume(p, TOK_LPAREN, "expected '(' after spawn function name");
+        Node **args = NULL; int arg_count = 0; int arg_cap = 0;
+        while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
+            if (arg_count > 0) consume(p, TOK_COMMA, "expected ',' between spawn arguments");
+            Node *arg = parse_expression(p);
+            if (arg_count >= arg_cap) {
+                int new_cap = arg_cap < 4 ? 4 : arg_cap * 2;
+                Node **new_args = arena_alloc(p->arena, new_cap * sizeof(Node *));
+                if (args) memcpy(new_args, args, arg_count * sizeof(Node *));
+                args = new_args; arg_cap = new_cap;
+            }
+            args[arg_count++] = arg;
+        }
+        consume(p, TOK_RPAREN, "expected ')' after spawn arguments");
+        consume(p, TOK_SEMICOLON, "expected ';' after spawn");
+        n->spawn_stmt.args = args;
+        n->spawn_stmt.arg_count = arg_count;
+        return n;
+    }
+
+    /* spawn func(args); — fire-and-forget contextual keyword.
      * Detected by ident "spawn" at statement position followed by IDENT + LPAREN. */
     if (check(p, TOK_IDENT) && p->current.length == 5 &&
         memcmp(p->current.start, "spawn", 5) == 0) {
         advance(p); /* consume "spawn" ident */
         Node *n = new_node(p, NODE_SPAWN);
+        n->spawn_stmt.handle_name = NULL; /* fire-and-forget */
         if (!check(p, TOK_IDENT)) {
             error(p, "expected function name after 'spawn'");
             return n;

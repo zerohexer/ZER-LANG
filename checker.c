@@ -2514,6 +2514,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
 
+            /* ThreadHandle.join() — scoped spawn join */
+            if (field_node->field.object->kind == NODE_IDENT) {
+                Symbol *osym2 = scope_lookup(c->current_scope,
+                    field_node->field.object->ident.name,
+                    (uint32_t)field_node->field.object->ident.name_len);
+                if (osym2 && osym2->is_thread_handle) {
+                    if (mlen == 4 && memcmp(mname, "join", 4) == 0) {
+                        if (node->call.arg_count != 0)
+                            checker_error(c, node->loc.line, "ThreadHandle.join() takes no arguments");
+                        result = ty_void;
+                        typemap_set(c, field_node, result);
+                        break;
+                    }
+                    checker_error(c, node->loc.line,
+                        "ThreadHandle has no method '%.*s' (available: join)",
+                        (int)mlen, mname);
+                    result = ty_void;
+                    break;
+                }
+            }
+
             /* Pool methods */
             if (obj->kind == TYPE_POOL) {
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
@@ -4832,6 +4853,58 @@ static Type *check_expr(Checker *c, Node *node) {
             } else {
                 result = ty_void;
             }
+        } else if (nlen >= 5 && memcmp(name, "cond_", 5) == 0) {
+            /* @cond_wait(shared_var, condition), @cond_signal(shared_var), @cond_broadcast(shared_var) */
+            const char *cop = name + 5;
+            int coplen = nlen - 5;
+            bool is_wait = (coplen == 4 && memcmp(cop, "wait", 4) == 0);
+            bool is_signal = (coplen == 6 && memcmp(cop, "signal", 6) == 0);
+            bool is_broadcast = (coplen == 9 && memcmp(cop, "broadcast", 9) == 0);
+            if (!is_wait && !is_signal && !is_broadcast) {
+                checker_error(c, node->loc.line,
+                    "unknown condvar intrinsic '@%.*s' — use @cond_wait, @cond_signal, or @cond_broadcast",
+                    (int)nlen, name);
+            }
+            if (is_wait) {
+                if (node->intrinsic.arg_count != 2)
+                    checker_error(c, node->loc.line,
+                        "@cond_wait requires 2 arguments: @cond_wait(shared_var, condition)");
+            } else {
+                if (node->intrinsic.arg_count != 1)
+                    checker_error(c, node->loc.line,
+                        "@%.*s requires 1 argument: @%.*s(shared_var)",
+                        (int)nlen, name, (int)nlen, name);
+            }
+            /* Validate first arg is a shared struct variable */
+            if (node->intrinsic.arg_count >= 1) {
+                Type *sarg = check_expr(c, node->intrinsic.args[0]);
+                if (sarg) {
+                    Type *seff = type_unwrap_distinct(sarg);
+                    bool ok = false;
+                    if (seff->kind == TYPE_STRUCT && seff->struct_type.is_shared) ok = true;
+                    if (seff->kind == TYPE_POINTER) {
+                        Type *inner = type_unwrap_distinct(seff->pointer.inner);
+                        if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) ok = true;
+                    }
+                    if (!ok) {
+                        checker_error(c, node->loc.line,
+                            "@%.*s first argument must be a shared struct variable",
+                            (int)nlen, name);
+                    }
+                }
+            }
+            /* Type-check the condition expression for @cond_wait */
+            if (is_wait && node->intrinsic.arg_count >= 2) {
+                Type *ct = check_expr(c, node->intrinsic.args[1]);
+                if (ct) {
+                    Type *ceff = type_unwrap_distinct(ct);
+                    if (ceff->kind != TYPE_BOOL && !type_is_integer(ceff)) {
+                        checker_error(c, node->loc.line,
+                            "@cond_wait condition must be bool or integer expression");
+                    }
+                }
+            }
+            result = ty_void;
         } else {
             checker_error(c, node->loc.line,
                 "unknown intrinsic '@%.*s'", (int)nlen, name);
@@ -6588,20 +6661,24 @@ static void check_stmt(Checker *c, Node *node) {
                 (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
             break;
         }
+        bool is_scoped = (node->spawn_stmt.handle_name != NULL);
         /* Check each argument — type-check + pointer safety */
         for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
             Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
             if (!arg_type) continue;
             Type *eff = type_unwrap_distinct(arg_type);
-            /* Pointer args: only *shared_struct allowed */
+            /* Pointer args: scoped spawn allows *T (will be joined), fire-and-forget requires *shared */
             if (eff->kind == TYPE_POINTER) {
                 Type *inner = type_unwrap_distinct(eff->pointer.inner);
                 if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) {
                     /* OK — shared struct pointer, auto-locked */
+                } else if (is_scoped) {
+                    /* OK — scoped spawn, thread will be joined before scope exit */
                 } else {
                     checker_error(c, node->loc.line,
                         "argument %d: cannot pass non-shared pointer to spawn — "
-                        "data race. Use shared struct or copy by value",
+                        "data race. Use shared struct, copy by value, or use "
+                        "ThreadHandle to join before scope exit",
                         i + 1);
                 }
             }
@@ -6611,6 +6688,18 @@ static void check_stmt(Checker *c, Node *node) {
                     "argument %d: cannot pass Handle to spawn — "
                     "pool.get() is not thread-safe",
                     i + 1);
+            }
+        }
+        /* Register ThreadHandle variable in scope */
+        if (is_scoped) {
+            /* ThreadHandle is u64 wrapping pthread_t */
+            Symbol *sym = add_symbol(c, node->spawn_stmt.handle_name,
+                (uint32_t)node->spawn_stmt.handle_name_len,
+                ty_u64, node->loc.line);
+            if (sym) {
+                sym->is_const = false;
+                sym->is_thread_handle = true;
+                typemap_set(c, node, ty_u64);
             }
         }
         /* Ban spawn inside @critical */

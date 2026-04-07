@@ -34,6 +34,12 @@ typedef struct {
     int capacity;
 } DeferStack;
 
+/* spawn wrapper — deferred file-scope wrapper function for pthread_create */
+typedef struct {
+    int id;                 /* spawn_id for unique naming */
+    Node *spawn_node;       /* the NODE_SPAWN for type info */
+} SpawnWrapper;
+
 typedef struct {
     FILE *out;              /* output file */
     Arena *arena;           /* for temporary allocations */
@@ -48,6 +54,18 @@ typedef struct {
     const char *source_file; /* .zer source file name for #line directives */
     const char *current_module; /* module name for function/global mangling (NULL = main) */
     uint32_t current_module_len;
+
+    /* spawn wrappers — collected during pass 1 scan, emitted before functions */
+    SpawnWrapper *spawn_wrappers;
+    int spawn_wrapper_count;
+    int spawn_wrapper_capacity;
+    int next_spawn_id;      /* counter for unique spawn wrapper IDs */
+
+    /* condvar types — shared structs that use @cond_wait/@cond_signal.
+     * These need pthread_mutex_t instead of spinlock. Tracked by type_id. */
+    uint32_t *condvar_type_ids;
+    int condvar_type_count;
+    int condvar_type_capacity;
 } Emitter;
 
 /* ---- API ---- */

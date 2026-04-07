@@ -276,7 +276,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL:
+    case NODE_CRITICAL: case NODE_SPAWN:
         break;
     }
 }
@@ -3361,6 +3361,60 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "}\n");
         break;
 
+    case NODE_SPAWN: {
+        /* spawn func(args); — emit pthread_create wrapper */
+        static int spawn_id = 0;
+        int sid = spawn_id++;
+        int ac = node->spawn_stmt.arg_count;
+
+        /* Emit arg struct */
+        emit_indent(e);
+        emit(e, "{ /* spawn %.*s */\n", (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
+        e->indent++;
+
+        if (ac > 0) {
+            emit_indent(e);
+            emit(e, "struct _zer_spawn_args_%d { ", sid);
+            for (int i = 0; i < ac; i++) {
+                Type *at = checker_get_type(e->checker, node->spawn_stmt.args[i]);
+                if (at) {
+                    emit_type_and_name(e, at, NULL, 0);
+                    emit(e, " a%d; ", i);
+                }
+            }
+            emit(e, "};\n");
+
+            emit_indent(e);
+            emit(e, "struct _zer_spawn_args_%d *_sa%d = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid, sid);
+            for (int i = 0; i < ac; i++) {
+                emit_indent(e);
+                emit(e, "_sa%d->a%d = ", sid, i);
+                emit_expr(e, node->spawn_stmt.args[i]);
+                emit(e, ";\n");
+            }
+        }
+
+        /* Emit wrapper function (forward decl would be cleaner, but inline works) */
+        /* For now, emit the pthread_create call directly with a cast */
+        emit_indent(e);
+        emit(e, "pthread_t _zer_th_%d;\n", sid);
+        emit_indent(e);
+        emit(e, "pthread_create(&_zer_th_%d, NULL, (void*(*)(void*))%.*s, ",
+             sid, (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
+        if (ac > 0) {
+            emit(e, "_sa%d);\n", sid);
+        } else {
+            emit(e, "NULL);\n");
+        }
+        emit_indent(e);
+        emit(e, "pthread_detach(_zer_th_%d);\n", sid);
+
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
+        break;
+    }
+
     case NODE_DEFER:
         /* push onto defer stack — will be emitted at block end in reverse */
         /* grow defer stack if needed */
@@ -4120,7 +4174,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
     case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_SPAWN:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
@@ -4145,6 +4199,9 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "#include <string.h>\n");
     emit(e, "#include <stdio.h>\n");
     emit(e, "#include <stdlib.h>\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "#include <pthread.h>\n");
+    emit(e, "#endif\n");
     emit(e, "\n");
 
     /* ZER optional type definitions */

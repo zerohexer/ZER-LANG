@@ -6578,6 +6578,50 @@ static void check_stmt(Checker *c, Node *node) {
         c->critical_depth--;
         break;
 
+    case NODE_SPAWN: {
+        /* spawn func(args); — validate function, check arg safety */
+        Symbol *func_sym = scope_lookup(c->global_scope,
+            node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
+        if (!func_sym || !func_sym->is_function) {
+            checker_error(c, node->loc.line,
+                "spawn target '%.*s' is not a function",
+                (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
+            break;
+        }
+        /* Check each argument — type-check + pointer safety */
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
+            Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
+            if (!arg_type) continue;
+            Type *eff = type_unwrap_distinct(arg_type);
+            /* Pointer args: only *shared_struct allowed */
+            if (eff->kind == TYPE_POINTER) {
+                Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) {
+                    /* OK — shared struct pointer, auto-locked */
+                } else {
+                    checker_error(c, node->loc.line,
+                        "argument %d: cannot pass non-shared pointer to spawn — "
+                        "data race. Use shared struct or copy by value",
+                        i + 1);
+                }
+            }
+            /* Handle args: ban — pool.get() not thread-safe */
+            if (eff->kind == TYPE_HANDLE) {
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass Handle to spawn — "
+                    "pool.get() is not thread-safe",
+                    i + 1);
+            }
+        }
+        /* Ban spawn inside @critical */
+        if (c->critical_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'spawn' inside @critical block — "
+                "thread creation with interrupts disabled is unsafe");
+        }
+        break;
+    }
+
     default:
         break;
     }
@@ -6994,7 +7038,7 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
     case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
@@ -7052,7 +7096,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
     case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
@@ -7654,6 +7698,12 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_ASM:
     case NODE_CAST:
     case NODE_SIZEOF:
+        break;
+    case NODE_SPAWN:
+        /* spawn func(args) — scan args for function calls */
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            scan_frame(c, frame, node->spawn_stmt.args[i]);
+        break;
     /* Top-level decls — scan_frame only called on function bodies */
     case NODE_FILE:
     case NODE_FUNC_DECL:

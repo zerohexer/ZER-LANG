@@ -26,6 +26,7 @@ typedef enum {
     HS_ALIVE,           /* allocated, valid to use */
     HS_FREED,           /* freed, any use = bug */
     HS_MAYBE_FREED,     /* freed on some paths — use is a potential bug */
+    HS_TRANSFERRED,     /* ownership transferred to another thread via spawn */
 } HandleState;
 
 /* per-handle tracking info */
@@ -38,6 +39,7 @@ typedef struct {
     int free_line;          /* where freed (if FREED) */
     int alloc_id;           /* unique allocation ID — aliases share same ID */
     int source_color;       /* ZC_COLOR_* — where the memory came from */
+    int transfer_line;      /* where ownership was transferred (spawn) */
     bool escaped;           /* true if returned, stored in global, or stored in param field */
 } HandleInfo;
 

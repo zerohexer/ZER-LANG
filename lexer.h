@@ -22,7 +22,7 @@ typedef enum {
 
     /* === Control flow === */
     TOK_IF, TOK_ELSE, TOK_FOR, TOK_WHILE,
-    TOK_SWITCH, TOK_BREAK, TOK_CONTINUE, TOK_RETURN, TOK_GOTO,
+    TOK_SWITCH, TOK_BREAK, TOK_CONTINUE, TOK_RETURN, TOK_GOTO, TOK_SPAWN,
     TOK_DEFAULT,
 
     /* === Error handling === */

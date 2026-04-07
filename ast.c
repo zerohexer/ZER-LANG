@@ -86,6 +86,8 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_DEFER:        return "DEFER";
     case NODE_EXPR_STMT:    return "EXPR_STMT";
     case NODE_ASM:          return "ASM";
+    case NODE_CRITICAL:     return "CRITICAL";
+    case NODE_SPAWN:        return "SPAWN";
     case NODE_INT_LIT:      return "INT_LIT";
     case NODE_FLOAT_LIT:    return "FLOAT_LIT";
     case NODE_STRING_LIT:   return "STRING_LIT";
@@ -349,6 +351,13 @@ void ast_print(Node *node, int depth) {
 
     case NODE_ASM:
         printf("Asm(\"%.*s\")\n", (int)node->asm_stmt.code_len, node->asm_stmt.code);
+        break;
+
+    case NODE_SPAWN:
+        printf("Spawn(%.*s, %d args)\n", (int)node->spawn_stmt.func_name_len,
+               node->spawn_stmt.func_name, node->spawn_stmt.arg_count);
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            ast_print(node->spawn_stmt.args[i], depth + 1);
         break;
 
     case NODE_INT_LIT:

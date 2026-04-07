@@ -1,0 +1,29 @@
+// Rust: Condvar::wait + notify_one — producer signals consumer
+// ZER: @cond_wait + @cond_signal on shared struct
+// Equivalent to: Rust Condvar producer-consumer (notify_one)
+
+shared struct Slot {
+    u32 value;
+    u32 ready;
+}
+
+Slot gslot;
+
+void producer(*Slot s, u32 val) {
+    s.value = val;
+    s.ready = 1;
+    @cond_signal(s);
+}
+
+u32 main() {
+    gslot.value = 0;
+    gslot.ready = 0;
+
+    ThreadHandle th = spawn producer(&gslot, 123);
+    @cond_wait(gslot, gslot.ready > 0);
+    th.join();
+
+    u32 v = gslot.value;
+    if (v != 123) { return 1; }
+    return 0;
+}

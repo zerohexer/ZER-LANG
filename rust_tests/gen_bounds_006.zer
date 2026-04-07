@@ -1,0 +1,9 @@
+// Bounds OOB: access one past end — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u32[4] arr;
+    arr[0] = 1;
+    arr[4] = 99;
+    return 0;
+}

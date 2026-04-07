@@ -1,0 +1,13 @@
+// Division: modulo with guarded divisor — safe
+
+u32 safe_mod(u32 val, u32 n) {
+    if (n == 0) { return 0; }
+    return val % n;
+}
+
+u32 main() {
+    if (safe_mod(17, 5) != 2) { return 1; }
+    if (safe_mod(20, 4) != 0) { return 2; }
+    if (safe_mod(7, 0) != 0) { return 3; }
+    return 0;
+}

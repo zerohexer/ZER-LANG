@@ -1,0 +1,16 @@
+// Volatile: volatile orelse pattern — safe optional volatile
+
+volatile u32 g_ready;
+
+u32 main() {
+    g_ready = 0;
+
+    // Non-null volatile check
+    volatile u32 v = g_ready;
+    if (v != 0) { return 1; }
+
+    g_ready = 1;
+    volatile u32 v2 = g_ready;
+    if (v2 != 1) { return 2; }
+    return 0;
+}

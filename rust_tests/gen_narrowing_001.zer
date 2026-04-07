@@ -1,0 +1,8 @@
+// Narrowing: u32 to u8 without @truncate — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u32 big = 300;
+    u8 small = big;
+    return (u32)small;
+}

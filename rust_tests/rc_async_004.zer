@@ -1,0 +1,67 @@
+// Rust: tokio::spawn three tasks — round-robin scheduling
+// ZER: three async tasks polled round-robin until all complete
+// Equivalent to: Rust multi-task cooperative executor
+
+u32 gc_a;
+u32 gc_b;
+u32 gc_c;
+u32 gd_a;
+u32 gd_b;
+u32 gd_c;
+
+async void worker_a() {
+    u32 i = 0;
+    while (i < 3) {
+        gc_a += 1;
+        i += 1;
+        yield;
+    }
+    gd_a = 1;
+}
+
+async void worker_b() {
+    u32 i = 0;
+    while (i < 5) {
+        gc_b += 1;
+        i += 1;
+        yield;
+    }
+    gd_b = 1;
+}
+
+async void worker_c() {
+    u32 i = 0;
+    while (i < 2) {
+        gc_c += 1;
+        i += 1;
+        yield;
+    }
+    gd_c = 1;
+}
+
+u32 main() {
+    gc_a = 0;
+    gc_b = 0;
+    gc_c = 0;
+    gd_a = 0;
+    gd_b = 0;
+    gd_c = 0;
+
+    _zer_async_worker_a ta;
+    _zer_async_worker_b tb;
+    _zer_async_worker_c tc;
+    _zer_async_worker_a_init(&ta);
+    _zer_async_worker_b_init(&tb);
+    _zer_async_worker_c_init(&tc);
+
+    while (gd_a == 0 || gd_b == 0 || gd_c == 0) {
+        if (gd_a == 0) { _zer_async_worker_a_poll(&ta); }
+        if (gd_b == 0) { _zer_async_worker_b_poll(&tb); }
+        if (gd_c == 0) { _zer_async_worker_c_poll(&tc); }
+    }
+
+    if (gc_a != 3) { return 1; }
+    if (gc_b != 5) { return 2; }
+    if (gc_c != 2) { return 3; }
+    return 0;
+}

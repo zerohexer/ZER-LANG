@@ -1,0 +1,42 @@
+// Rust: Arc<Mutex<T>> passed through helper function
+// ZER: shared struct pointer passed through intermediate function
+// Equivalent to: Rust Arc<Mutex> through function call chain
+
+shared struct Score {
+    u32 total;
+    u32 count;
+}
+
+Score gscore;
+
+void add_score(*Score s, u32 pts) {
+    s.total += pts;
+    s.count += 1;
+}
+
+void player_round(*Score s, u32 round_pts) {
+    add_score(s, round_pts);
+}
+
+void player_thread(*Score s, u32 pts) {
+    player_round(s, pts);
+}
+
+u32 main() {
+    gscore.total = 0;
+    gscore.count = 0;
+
+    ThreadHandle t1 = spawn player_thread(&gscore, 10);
+    ThreadHandle t2 = spawn player_thread(&gscore, 20);
+    ThreadHandle t3 = spawn player_thread(&gscore, 30);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 total = gscore.total;
+    u32 count = gscore.count;
+    if (total != 60) { return 1; }
+    if (count != 3) { return 2; }
+    return 0;
+}

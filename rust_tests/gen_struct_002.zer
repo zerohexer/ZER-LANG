@@ -1,0 +1,21 @@
+// Struct: pointer to struct field — valid within same scope
+
+struct Data { u32 x; u32 y; }
+
+u32 sum_fields(*Data d) {
+    return d.x + d.y;
+}
+
+u32 main() {
+    Data d;
+    d.x = 10;
+    d.y = 20;
+
+    u32 s = sum_fields(&d);
+    if (s != 30) { return 1; }
+
+    *u32 px = &d.x;
+    px[0] = 99;
+    if (d.x != 99) { return 2; }
+    return 0;
+}

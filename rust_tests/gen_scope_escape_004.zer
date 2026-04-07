@@ -1,0 +1,17 @@
+// Scope escape: safe — return value (copy), not pointer
+
+struct Coord { u32 x; u32 y; }
+
+Coord make_coord(u32 x, u32 y) {
+    Coord c;
+    c.x = x;
+    c.y = y;
+    return c;
+}
+
+u32 main() {
+    Coord result = make_coord(3, 4);
+    if (result.x != 3) { return 1; }
+    if (result.y != 4) { return 2; }
+    return 0;
+}

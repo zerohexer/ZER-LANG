@@ -1,0 +1,16 @@
+// Shared struct: scoped spawn without join — compile error
+// EXPECTED: compile error
+
+shared struct G { u32 v; }
+G g;
+
+void worker() {
+    g.v += 1;
+}
+
+u32 main() {
+    g.v = 0;
+    ThreadHandle th = spawn worker();
+    g.v = 5;
+    return 0;
+}

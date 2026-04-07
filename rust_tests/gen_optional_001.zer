@@ -1,0 +1,18 @@
+// Optional: ?u32 — orelse default value
+
+?u32 try_parse(bool succeed) {
+    if (succeed) {
+        ?u32 r = (u32)42;
+        return r;
+    }
+    ?u32 empty;
+    return empty;
+}
+
+u32 main() {
+    u32 v1 = try_parse(true) orelse 0;
+    if (v1 != 42) { return 1; }
+    u32 v2 = try_parse(false) orelse 99;
+    if (v2 != 99) { return 2; }
+    return 0;
+}

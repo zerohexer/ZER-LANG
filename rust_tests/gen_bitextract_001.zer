@@ -1,0 +1,16 @@
+// Bit extraction: field bits from register value
+
+u32 main() {
+    u32 reg = 0b1010_1100_0011;
+
+    u32 bits_3_0 = reg[3..0];
+    if (bits_3_0 != 0b0011) { return 1; }
+
+    u32 bits_7_4 = reg[7..4];
+    if (bits_7_4 != 0b1100) { return 2; }
+
+    u32 bits_11_8 = reg[11..8];
+    if (bits_11_8 != 0b1010) { return 3; }
+
+    return 0;
+}

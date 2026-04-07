@@ -1,0 +1,16 @@
+// Function pointer: chained callbacks with context via *opaque
+
+u32 global_ctx_val;
+
+void set_value(*opaque ctx, u32 val) {
+    *u32 p = (*u32)ctx;
+    p[0] = val;
+}
+
+u32 main() {
+    global_ctx_val = 0;
+    *opaque ctx = (*opaque)&global_ctx_val;
+    set_value(ctx, 123);
+    if (global_ctx_val != 123) { return 1; }
+    return 0;
+}

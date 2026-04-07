@@ -1,0 +1,42 @@
+// Rust: thread_local! — TLS does not leak between threads
+// ZER: threadlocal isolation — main thread TLS unaffected by spawned threads
+// Equivalent to: Rust thread_local isolation proof
+
+threadlocal u32 tls_id;
+
+shared struct Report {
+    u32 worker_ok;
+}
+
+Report greport;
+
+void set_and_check(*Report r, u32 expected_id) {
+    tls_id = expected_id;
+    // Read back — should be what we set
+    u32 got = tls_id;
+    if (got == expected_id) {
+        r.worker_ok += 1;
+    }
+}
+
+u32 main() {
+    greport.worker_ok = 0;
+
+    // Set main thread's TLS
+    tls_id = 0xDEAD;
+
+    ThreadHandle t1 = spawn set_and_check(&greport, 111);
+    ThreadHandle t2 = spawn set_and_check(&greport, 222);
+
+    t1.join();
+    t2.join();
+
+    // Main thread TLS should still be 0xDEAD
+    u32 main_tls = tls_id;
+    if (main_tls != 0xDEAD) { return 1; }
+
+    // Workers should have seen their own values
+    u32 ok = greport.worker_ok;
+    if (ok != 2) { return 2; }
+    return 0;
+}

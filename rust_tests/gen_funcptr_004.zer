@@ -1,0 +1,28 @@
+// Function pointer: struct with ops table (vtable pattern)
+
+struct Ops {
+    u32 (*compute)(u32, u32);
+    bool (*validate)(u32);
+}
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 sub(u32 a, u32 b) { if (a > b) { return a - b; } return 0; }
+bool is_positive(u32 v) { return v > 0; }
+
+u32 main() {
+    Ops add_ops;
+    add_ops.compute = add;
+    add_ops.validate = is_positive;
+
+    Ops sub_ops;
+    sub_ops.compute = sub;
+    sub_ops.validate = is_positive;
+
+    u32 r1 = add_ops.compute(10, 5);
+    if (r1 != 15) { return 1; }
+    if (!add_ops.validate(r1)) { return 2; }
+
+    u32 r2 = sub_ops.compute(10, 5);
+    if (r2 != 5) { return 3; }
+    return 0;
+}

@@ -1,0 +1,20 @@
+// Handle: defer-freed handle — zercheck recognizes defer free
+
+struct Res { u32 id; }
+Pool(Res, 4) pool;
+
+u32 use_resource(u32 resource_id) {
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    defer pool.free(h);
+
+    pool.get(h).id = resource_id;
+    u32 v = pool.get(h).id;
+    return v;
+}
+
+u32 main() {
+    u32 r = use_resource(42);
+    if (r != 42) { return 1; }
+    return 0;
+}

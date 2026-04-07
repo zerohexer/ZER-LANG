@@ -1,0 +1,17 @@
+// Comptime: function evaluated at compile time
+
+comptime u32 BIT(u32 n) {
+    return 1 << n;
+}
+
+comptime u32 MASK(u32 hi, u32 lo) {
+    return BIT(hi + 1) - BIT(lo);
+}
+
+u32 main() {
+    u32 flag = BIT(3);
+    if (flag != 8) { return 1; }
+    u32 m = MASK(3, 1);
+    if (m != 14) { return 2; }
+    return 0;
+}

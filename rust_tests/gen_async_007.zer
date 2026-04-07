@@ -1,0 +1,16 @@
+// Async: task completes without yield (single-step task)
+
+u32 result_val;
+
+async void instant_task() {
+    result_val = 123;
+}
+
+u32 main() {
+    result_val = 0;
+    _zer_async_instant_task t;
+    _zer_async_instant_task_init(&t);
+    _zer_async_instant_task_poll(&t);
+    if (result_val != 123) { return 1; }
+    return 0;
+}

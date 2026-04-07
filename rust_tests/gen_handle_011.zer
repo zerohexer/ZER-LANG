@@ -1,0 +1,26 @@
+// Handle: pool exhaustion — alloc returns null when full
+
+struct Chunk { u32 id; }
+Pool(Chunk, 2) pool;
+
+u32 main() {
+    ?Handle(Chunk) mh1 = pool.alloc();
+    Handle(Chunk) h1 = mh1 orelse return;
+    ?Handle(Chunk) mh2 = pool.alloc();
+    Handle(Chunk) h2 = mh2 orelse return;
+
+    // Pool full — next alloc returns null
+    ?Handle(Chunk) mh3 = pool.alloc();
+    if (mh3) |h3| {
+        pool.free(h3);
+        pool.free(h2);
+        pool.free(h1);
+        return 1;
+    }
+
+    pool.get(h1).id = 1;
+    pool.get(h2).id = 2;
+    pool.free(h1);
+    pool.free(h2);
+    return 0;
+}

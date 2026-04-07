@@ -1,0 +1,14 @@
+// Bounds: bit-mask-based index proven safe (& MASK where MASK < size)
+
+const u32 MASK = 7;
+u32[8] ring;
+
+u32 main() {
+    for (u32 i = 0; i < 8; i += 1) {
+        ring[i] = i + 1;
+    }
+    u32 idx = 25 & MASK;
+    u32 v = ring[idx];
+    if (v != (25 & MASK) + 1) { return 1; }
+    return 0;
+}

@@ -1,0 +1,37 @@
+// Async: fibonacci-like computation across yields
+
+u32 fib_a;
+u32 fib_b;
+u32 fib_steps;
+
+async void fib_task() {
+    fib_a = 0;
+    fib_b = 1;
+    u32 i = 0;
+    while (i < 6) {
+        u32 next = fib_a + fib_b;
+        fib_a = fib_b;
+        fib_b = next;
+        i += 1;
+        yield;
+    }
+    fib_steps = i;
+}
+
+u32 main() {
+    fib_a = 0;
+    fib_b = 0;
+    fib_steps = 0;
+
+    _zer_async_fib_task t;
+    _zer_async_fib_task_init(&t);
+
+    for (u32 i = 0; i < 7; i += 1) {
+        _zer_async_fib_task_poll(&t);
+    }
+
+    // After 6 steps: 0,1,1,2,3,5,8 -> fib_b=8
+    if (fib_b != 8) { return 1; }
+    if (fib_steps != 6) { return 2; }
+    return 0;
+}

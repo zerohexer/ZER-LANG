@@ -1,0 +1,16 @@
+// Bounds: runtime guard on dynamic index — auto-inserted
+
+u32[8] table;
+
+u32 safe_read(u32 idx) {
+    return table[idx];
+}
+
+u32 main() {
+    for (u32 i = 0; i < 8; i += 1) {
+        table[i] = i * 10;
+    }
+    u32 v = safe_read(3);
+    if (v != 30) { return 1; }
+    return 0;
+}

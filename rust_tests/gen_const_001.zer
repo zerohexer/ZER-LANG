@@ -1,0 +1,14 @@
+// Const: global const used as array size and divisor
+
+const u32 N = 8;
+u32[8] data;
+
+u32 main() {
+    for (u32 i = 0; i < N; i += 1) {
+        data[i] = i * N;
+    }
+    u32 idx = 56 / N;
+    u32 v = data[idx];
+    if (v != idx * N) { return 1; }
+    return 0;
+}

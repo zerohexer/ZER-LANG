@@ -1,0 +1,23 @@
+// Defer: defer with Pool alloc and free — no leak
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+u32 compute(u32 input) {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    defer pool.free(h);
+
+    pool.get(h).val = input * 2;
+    return pool.get(h).val;
+}
+
+u32 main() {
+    u32 r1 = compute(5);
+    if (r1 != 10) { return 1; }
+    u32 r2 = compute(7);
+    if (r2 != 14) { return 2; }
+    u32 r3 = compute(10);
+    if (r3 != 20) { return 3; }
+    return 0;
+}

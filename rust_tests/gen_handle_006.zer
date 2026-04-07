@@ -1,0 +1,10 @@
+// Handle: ghost handle — discarded alloc result — compile error
+// EXPECTED: compile error
+
+struct Ghost { u32 x; }
+Pool(Ghost, 4) pool;
+
+u32 main() {
+    pool.alloc();
+    return 0;
+}

@@ -1,0 +1,15 @@
+// Enum: multi-value switch arm
+
+enum Op { add, sub, mul, div_op }
+
+bool is_arithmetic(Op op) {
+    switch (op) {
+        .add, .sub, .mul, .div_op => { return true; }
+    }
+}
+
+u32 main() {
+    if (!is_arithmetic(Op.add)) { return 1; }
+    if (!is_arithmetic(Op.mul)) { return 2; }
+    return 0;
+}

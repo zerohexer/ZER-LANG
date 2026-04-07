@@ -1,0 +1,22 @@
+// Ring buffer: push and pop values in FIFO order
+
+Ring(u32, 8) ring;
+
+u32 main() {
+    ring.push(10);
+    ring.push(20);
+    ring.push(30);
+
+    ?u32 v1 = ring.pop();
+    u32 a = v1 orelse return;
+    if (a != 10) { return 1; }
+
+    ?u32 v2 = ring.pop();
+    u32 b = v2 orelse return;
+    if (b != 20) { return 2; }
+
+    ?u32 v3 = ring.pop();
+    u32 c = v3 orelse return;
+    if (c != 30) { return 3; }
+    return 0;
+}

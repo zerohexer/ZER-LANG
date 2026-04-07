@@ -1,0 +1,33 @@
+// Rust: AtomicU32::fetch_add from many threads — summation
+// ZER: @atomic_add summation from 4 threads
+// Equivalent to: Rust atomic summation stress test
+
+u32 gsum;
+
+void add_range(u32 start, u32 end) {
+    u32 i = start;
+    while (i < end) {
+        @atomic_add(&gsum, i);
+        i += 1;
+    }
+}
+
+u32 main() {
+    gsum = 0;
+
+    // Split 0..20 into 4 ranges
+    ThreadHandle t1 = spawn add_range(0, 5);
+    ThreadHandle t2 = spawn add_range(5, 10);
+    ThreadHandle t3 = spawn add_range(10, 15);
+    ThreadHandle t4 = spawn add_range(15, 20);
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    // Sum 0..19 = 190
+    u32 s = @atomic_load(&gsum);
+    if (s != 190) { return 1; }
+    return 0;
+}

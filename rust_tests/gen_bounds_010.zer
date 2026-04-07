@@ -1,0 +1,9 @@
+// Bounds: zero-length array boundary — access any element is OOB
+// EXPECTED: compile error
+
+u32 main() {
+    u32[1] arr;
+    arr[0] = 5;
+    u32 v = arr[1];
+    return v;
+}

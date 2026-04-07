@@ -1,0 +1,23 @@
+// Struct: pass by value — mutation does not affect original
+
+struct Vec { u32 x; u32 y; }
+
+Vec translate(Vec v, u32 dx, u32 dy) {
+    v.x += dx;
+    v.y += dy;
+    return v;
+}
+
+u32 main() {
+    Vec original;
+    original.x = 5;
+    original.y = 10;
+
+    Vec moved = translate(original, 3, 4);
+
+    if (original.x != 5) { return 1; }
+    if (original.y != 10) { return 2; }
+    if (moved.x != 8) { return 3; }
+    if (moved.y != 14) { return 4; }
+    return 0;
+}

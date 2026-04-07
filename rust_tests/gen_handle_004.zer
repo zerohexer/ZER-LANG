@@ -1,0 +1,21 @@
+// Handle: multiple allocations from same pool — all valid
+
+struct Entry { u32 val; }
+Pool(Entry, 4) pool;
+
+u32 main() {
+    ?Handle(Entry) mh1 = pool.alloc();
+    Handle(Entry) h1 = mh1 orelse return;
+    ?Handle(Entry) mh2 = pool.alloc();
+    Handle(Entry) h2 = mh2 orelse return;
+
+    pool.get(h1).val = 11;
+    pool.get(h2).val = 22;
+
+    if (pool.get(h1).val != 11) { return 1; }
+    if (pool.get(h2).val != 22) { return 2; }
+
+    pool.free(h1);
+    pool.free(h2);
+    return 0;
+}

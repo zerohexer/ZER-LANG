@@ -1,0 +1,30 @@
+// Rust: mpsc — pop from empty channel returns None
+// ZER: Ring pop returns null optional when empty
+// Equivalent to: task-comm-7 (empty recv returns None)
+
+Ring(u32, 8) chan;
+
+u32 main() {
+    // Pop from empty Ring
+    ?u32 empty = chan.pop();
+    if (empty) |_v| {
+        return 1;  // Should have been empty
+    }
+
+    // Push one item, pop it
+    chan.push(77);
+    ?u32 val = chan.pop();
+    if (val) |v| {
+        if (v != 77) { return 2; }
+    } else {
+        return 3;
+    }
+
+    // Pop again — should be empty again
+    ?u32 empty2 = chan.pop();
+    if (empty2) |_v| {
+        return 4;
+    }
+
+    return 0;
+}

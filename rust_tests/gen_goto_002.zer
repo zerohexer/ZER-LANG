@@ -1,0 +1,11 @@
+// Goto: inside defer block — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    defer {
+        goto end;
+    }
+    u32 x = 1;
+end:
+    return 0;
+}

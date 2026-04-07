@@ -1,0 +1,15 @@
+// Defer: fires on loop break
+
+u32 broke_count;
+
+u32 main() {
+    broke_count = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        defer broke_count += 1;
+        if (i == 2) { break; }
+    }
+    // defer fires once per iteration including the break iteration
+    // iterations: 0 (defer), 1 (defer), 2 (defer+break) = 3
+    if (broke_count != 3) { return 1; }
+    return 0;
+}

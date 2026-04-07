@@ -1,0 +1,12 @@
+// Shared struct: field pointer escape — compile error
+// EXPECTED: compile error
+
+shared struct Shared { u32 count; }
+Shared g_shared;
+*u32 g_ptr;
+
+u32 main() {
+    g_shared.count = 5;
+    g_ptr = &g_shared.count;
+    return 0;
+}

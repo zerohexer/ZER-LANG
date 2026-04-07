@@ -1,0 +1,18 @@
+// UAF: free then pass to function (handle passed as arg after free)
+// EXPECTED: compile error
+
+struct Buf { u32 size; }
+Pool(Buf, 4) pool;
+
+void use_buf(Handle(Buf) h) {
+    pool.get(h).size = 0;
+}
+
+u32 main() {
+    ?Handle(Buf) mh = pool.alloc();
+    Handle(Buf) h = mh orelse return;
+    pool.get(h).size = 100;
+    pool.free(h);
+    use_buf(h);
+    return 0;
+}

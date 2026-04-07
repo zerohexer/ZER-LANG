@@ -1,0 +1,18 @@
+// Handle: alloc, use, free — basic lifecycle
+
+struct Task { u32 id; u32 priority; }
+Pool(Task, 8) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+
+    pool.get(h).id = 1;
+    pool.get(h).priority = 5;
+
+    if (pool.get(h).id != 1) { return 1; }
+    if (pool.get(h).priority != 5) { return 2; }
+
+    pool.free(h);
+    return 0;
+}

@@ -1,0 +1,20 @@
+// Handle: auto-deref on field access (h.field syntax)
+
+struct Config { u32 timeout; u32 retries; }
+Pool(Config, 4) pool;
+
+u32 main() {
+    ?Handle(Config) mh = pool.alloc();
+    Handle(Config) h = mh orelse return;
+
+    pool.get(h).timeout = 100;
+    pool.get(h).retries = 3;
+
+    u32 t = pool.get(h).timeout;
+    u32 r = pool.get(h).retries;
+    pool.free(h);
+
+    if (t != 100) { return 1; }
+    if (r != 3) { return 2; }
+    return 0;
+}

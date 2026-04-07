@@ -1,0 +1,12 @@
+// Narrowing: explicit @saturate for clamping — safe
+
+u32 main() {
+    u32 big = 300;
+    u8 clamped = @saturate(u8, big);
+    if (clamped != 255) { return 1; }
+
+    i32 neg = -5;
+    u8 c2 = @saturate(u8, neg);
+    if (c2 != 0) { return 2; }
+    return 0;
+}

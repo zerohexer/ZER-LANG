@@ -1,0 +1,19 @@
+// Handle: scalar field value storage (allowed — not storing pointer)
+
+struct Score { u32 points; u32 level; }
+Pool(Score, 4) pool;
+
+u32 main() {
+    ?Handle(Score) mh = pool.alloc();
+    Handle(Score) h = mh orelse return;
+    pool.get(h).points = 100;
+    pool.get(h).level = 3;
+
+    u32 pts = pool.get(h).points;
+    u32 lvl = pool.get(h).level;
+    pool.free(h);
+
+    if (pts != 100) { return 1; }
+    if (lvl != 3) { return 2; }
+    return 0;
+}

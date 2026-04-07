@@ -1,0 +1,19 @@
+// Shared: Handle arg to spawn — compile error (handle is value type but same struct)
+// Verify value args copy safely
+
+shared struct Tally { u32 n; }
+Tally g_tally;
+
+void tally_work(u32 amount) {
+    g_tally.n += amount;
+}
+
+u32 main() {
+    g_tally.n = 0;
+    ThreadHandle t1 = spawn tally_work(5);
+    t1.join();
+    ThreadHandle t2 = spawn tally_work(3);
+    t2.join();
+    if (g_tally.n != 8) { return 1; }
+    return 0;
+}

@@ -1,0 +1,10 @@
+// Division by unproven variable (no guard) — compile error
+// EXPECTED: compile error
+
+u32 divide(u32 a, u32 b) {
+    return a / b;
+}
+
+u32 main() {
+    return divide(10, 2);
+}

@@ -1,0 +1,22 @@
+// Rust: non-Sync type cannot be shared across threads
+// ZER: fire-and-forget spawn with non-shared struct pointer — data race
+// EXPECTED: compile error
+
+struct Counter {
+    u32 value;
+}
+
+Counter gctr;
+
+void increment(*Counter c) {
+    c.value += 1;
+}
+
+u32 main() {
+    gctr.value = 0;
+    // ERROR: Counter is not shared struct — passing *Counter to fire-and-forget spawn
+    // would cause unguarded data race. Must use shared struct or ThreadHandle.
+    spawn increment(&gctr);
+    spawn increment(&gctr);
+    return 0;
+}

@@ -1,0 +1,20 @@
+// Function pointer: array of function pointers via typedef
+
+typedef u32 (*UnaryOp)(u32);
+
+u32 double_val(u32 x) { return x * 2; }
+u32 triple_val(u32 x) { return x * 3; }
+u32 square_val(u32 x) { return x * x; }
+
+UnaryOp[3] ops;
+
+u32 main() {
+    ops[0] = double_val;
+    ops[1] = triple_val;
+    ops[2] = square_val;
+
+    if (ops[0](5) != 10) { return 1; }
+    if (ops[1](5) != 15) { return 2; }
+    if (ops[2](5) != 25) { return 3; }
+    return 0;
+}

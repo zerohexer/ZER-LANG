@@ -1,0 +1,20 @@
+// Scope escape: safe to pass address of global to function
+
+struct Stats { u32 count; u32 total; }
+Stats g_stats;
+
+void update(*Stats s, u32 v) {
+    s.count += 1;
+    s.total += v;
+}
+
+u32 main() {
+    g_stats.count = 0;
+    g_stats.total = 0;
+    update(&g_stats, 10);
+    update(&g_stats, 20);
+    update(&g_stats, 30);
+    if (g_stats.count != 3) { return 1; }
+    if (g_stats.total != 60) { return 2; }
+    return 0;
+}

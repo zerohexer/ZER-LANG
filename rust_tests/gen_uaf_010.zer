@@ -1,0 +1,21 @@
+// UAF: conditional free both branches then use (definite freed)
+// EXPECTED: compile error
+
+struct Flag { u32 v; }
+Pool(Flag, 4) pool;
+
+u32 main() {
+    ?Handle(Flag) mh = pool.alloc();
+    Handle(Flag) h = mh orelse return;
+    pool.get(h).v = 1;
+
+    bool cond = false;
+    if (cond) {
+        pool.free(h);
+    } else {
+        pool.free(h);
+    }
+
+    u32 x = pool.get(h).v;
+    return x;
+}

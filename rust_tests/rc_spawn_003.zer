@@ -1,0 +1,29 @@
+// Rust: thread::scope — scoped spawn modifies local struct fields
+// ZER: scoped spawn writes into caller-owned struct
+// Equivalent to: Rust scoped borrow of local struct
+
+struct Point {
+    i32 x;
+    i32 y;
+    i32 magnitude;
+}
+
+void compute_magnitude(*Point p) {
+    i32 x2 = p.x * p.x;
+    i32 y2 = p.y * p.y;
+    p.magnitude = x2 + y2;
+}
+
+u32 main() {
+    Point p;
+    p.x = 3;
+    p.y = 4;
+    p.magnitude = 0;
+
+    ThreadHandle th = spawn compute_magnitude(&p);
+    th.join();
+
+    // 3*3 + 4*4 = 9 + 16 = 25
+    if (p.magnitude != 25) { return 1; }
+    return 0;
+}

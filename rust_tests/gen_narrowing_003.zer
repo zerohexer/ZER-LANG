@@ -1,0 +1,8 @@
+// Narrowing: explicit @truncate for u32 to u8 — safe
+
+u32 main() {
+    u32 big = 0x1FF;
+    u8 small = @truncate(u8, big);
+    if (small != 0xFF) { return 1; }
+    return 0;
+}

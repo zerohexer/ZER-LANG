@@ -1,0 +1,17 @@
+// Defer: basic cleanup on normal exit path
+
+struct Counter { u32 n; }
+Slab(Counter) heap;
+
+u32 freed;
+
+u32 main() {
+    freed = 0;
+    ?*Counter mc = heap.alloc_ptr();
+    *Counter c = mc orelse return;
+    defer heap.free_ptr(c);
+
+    c.n = 42;
+    if (c.n != 42) { return 1; }
+    return 0;
+}

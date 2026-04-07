@@ -1,0 +1,8 @@
+// Modulo by zero literal — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u32 x = 7;
+    u32 r = x % 0;
+    return r;
+}

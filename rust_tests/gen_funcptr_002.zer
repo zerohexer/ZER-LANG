@@ -1,0 +1,21 @@
+// Function pointer: optional null funcptr — null check before call
+
+?void (*g_callback)(u32) = null;
+
+void my_handler(u32 event) {
+    event += 0;
+}
+
+u32 main() {
+    if (g_callback) |cb| {
+        cb(1);
+        return 1;
+    }
+
+    g_callback = my_handler;
+
+    if (g_callback) |cb| {
+        cb(2);
+    }
+    return 0;
+}

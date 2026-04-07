@@ -1,0 +1,24 @@
+// Rust: thread::scope — join with result verification
+// ZER: ThreadHandle + join, verify mutation visible after join
+// Equivalent to: Rust thread::scope basic join
+
+struct Work {
+    u32 input;
+    u32 output;
+}
+
+void compute(*Work w) {
+    w.output = w.input * w.input;
+}
+
+u32 main() {
+    Work w;
+    w.input = 9;
+    w.output = 0;
+
+    ThreadHandle th = spawn compute(&w);
+    th.join();
+
+    if (w.output != 81) { return 1; }
+    return 0;
+}

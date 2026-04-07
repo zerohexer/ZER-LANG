@@ -1,0 +1,25 @@
+// Async: simple yield — task suspends and resumes
+
+u32 step;
+
+async void simple_task() {
+    step = 1;
+    yield;
+    step = 2;
+    yield;
+    step = 3;
+}
+
+u32 main() {
+    step = 0;
+    _zer_async_simple_task t;
+    _zer_async_simple_task_init(&t);
+
+    _zer_async_simple_task_poll(&t);
+    if (step != 1) { return 1; }
+    _zer_async_simple_task_poll(&t);
+    if (step != 2) { return 2; }
+    _zer_async_simple_task_poll(&t);
+    if (step != 3) { return 3; }
+    return 0;
+}

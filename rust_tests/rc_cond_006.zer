@@ -1,0 +1,35 @@
+// Rust: Condvar — timed wait that succeeds before timeout
+// ZER: @cond_timedwait — returns non-null when condition met in time
+// Equivalent to: Rust Condvar::wait_timeout_ms (success path)
+
+shared struct Ready {
+    u32 flag;
+}
+
+Ready gready;
+
+void set_ready(*Ready r) {
+    r.flag = 1;
+    @cond_signal(r);
+}
+
+u32 main() {
+    gready.flag = 0;
+
+    ThreadHandle th = spawn set_ready(&gready);
+
+    // Long timeout — thread should signal well within 5000ms
+    ?void result = @cond_timedwait(gready, gready.flag > 0, 5000);
+
+    th.join();
+
+    // result != null means condition was met (not timeout)
+    if (result) |_| {
+        // Success: condition met before timeout
+        u32 f = gready.flag;
+        if (f != 1) { return 1; }
+        return 0;
+    } else {
+        return 2;  // Should not have timed out
+    }
+}

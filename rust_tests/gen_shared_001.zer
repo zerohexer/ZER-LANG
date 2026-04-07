@@ -1,0 +1,13 @@
+// Shared struct: basic counter increment with auto-locking
+
+shared struct Counter { u32 value; }
+Counter g_counter;
+
+u32 main() {
+    g_counter.value = 0;
+    g_counter.value += 1;
+    g_counter.value += 1;
+    g_counter.value += 1;
+    if (g_counter.value != 3) { return 1; }
+    return 0;
+}

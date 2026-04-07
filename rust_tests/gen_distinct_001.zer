@@ -1,0 +1,17 @@
+// Distinct typedef: type safety between aliases
+
+typedef u32 Meters;
+typedef u32 Seconds;
+
+u32 speed(Meters dist, Seconds time) {
+    if (time == 0) { return 0; }
+    return dist / time;
+}
+
+u32 main() {
+    Meters d = 100;
+    Seconds t = 5;
+    u32 s = speed(d, t);
+    if (s != 20) { return 1; }
+    return 0;
+}

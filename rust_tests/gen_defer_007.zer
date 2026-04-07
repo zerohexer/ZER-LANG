@@ -1,0 +1,18 @@
+// Defer: return expression evaluated before defers fire
+
+struct Val { u32 n; }
+Pool(Val, 4) pool;
+
+u32 read_then_free() {
+    ?Handle(Val) mh = pool.alloc();
+    Handle(Val) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).n = 77;
+    return pool.get(h).n;
+}
+
+u32 main() {
+    u32 result = read_then_free();
+    if (result != 77) { return 1; }
+    return 0;
+}

@@ -1,0 +1,46 @@
+// Rust: Arc<Mutex<Vec<u32>>> — shared struct with array field
+// ZER: shared struct with fixed array, threads write to different slots
+// Equivalent to: Rust shared-state with container
+
+shared struct Board {
+    u32[8] slots;
+    u32 filled;
+}
+
+Board gboard;
+
+void fill_slot(*Board b, u32 idx, u32 val) {
+    b.slots[idx] = val;
+    b.filled += 1;
+}
+
+u32 main() {
+    gboard.filled = 0;
+    u32 i = 0;
+    while (i < 8) {
+        gboard.slots[i] = 0;
+        i += 1;
+    }
+
+    ThreadHandle t0 = spawn fill_slot(&gboard, 0, 10);
+    ThreadHandle t1 = spawn fill_slot(&gboard, 1, 20);
+    ThreadHandle t2 = spawn fill_slot(&gboard, 2, 30);
+    ThreadHandle t3 = spawn fill_slot(&gboard, 3, 40);
+
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 filled = gboard.filled;
+    if (filled != 4) { return 1; }
+    u32 s0 = gboard.slots[0];
+    u32 s1 = gboard.slots[1];
+    u32 s2 = gboard.slots[2];
+    u32 s3 = gboard.slots[3];
+    if (s0 != 10) { return 2; }
+    if (s1 != 20) { return 3; }
+    if (s2 != 30) { return 4; }
+    if (s3 != 40) { return 5; }
+    return 0;
+}

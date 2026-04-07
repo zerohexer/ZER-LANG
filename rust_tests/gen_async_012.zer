@@ -1,0 +1,25 @@
+// Async: task that reads global input, yields, then writes output
+
+u32 input_val;
+u32 output_val;
+
+async void transform_task() {
+    u32 local = input_val * 3;
+    yield;
+    output_val = local + 1;
+}
+
+u32 main() {
+    input_val = 10;
+    output_val = 0;
+
+    _zer_async_transform_task t;
+    _zer_async_transform_task_init(&t);
+
+    _zer_async_transform_task_poll(&t);
+    if (output_val != 0) { return 1; }
+
+    _zer_async_transform_task_poll(&t);
+    if (output_val != 31) { return 2; }
+    return 0;
+}

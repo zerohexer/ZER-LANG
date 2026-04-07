@@ -1,0 +1,30 @@
+// Defer: two allocations, both freed via defer on any exit
+
+struct A { u32 x; }
+struct B { u32 y; }
+Slab(A) heap_a;
+Slab(B) heap_b;
+
+u32 test(bool fail_early) {
+    ?*A ma = heap_a.alloc_ptr();
+    *A a = ma orelse return;
+    defer heap_a.free_ptr(a);
+
+    ?*B mb = heap_b.alloc_ptr();
+    *B b = mb orelse return;
+    defer heap_b.free_ptr(b);
+
+    a.x = 1;
+    b.y = 2;
+    if (fail_early) { return 1; }
+    if (a.x + b.y != 3) { return 2; }
+    return 0;
+}
+
+u32 main() {
+    u32 r1 = test(true);
+    if (r1 != 1) { return 1; }
+    u32 r2 = test(false);
+    if (r2 != 0) { return 2; }
+    return 0;
+}

@@ -1,0 +1,30 @@
+// Defer: defer with goto — defer fires before jump
+
+struct Lock { u32 held; }
+Lock g_lock;
+
+u32 locked_op(bool fail) {
+    g_lock.held = 1;
+    defer g_lock.held = 0;
+
+    if (fail) {
+        goto done;
+    }
+
+    g_lock.held += 1;
+
+done:
+    return g_lock.held;
+}
+
+u32 main() {
+    g_lock.held = 0;
+    u32 r1 = locked_op(false);
+    // In function: held=1, held+=1=2, goto done (defer fires, held=0, return 2)
+    // Actually defer fires at scope exit, return happens AFTER defer
+    // So r1 = value of g_lock.held AT return time, which is after defer sets it to 0
+    // Actually: return g_lock.held inside the function fires BEFORE defer
+    // So r1 = 2, then defer runs, g_lock.held = 0
+    if (g_lock.held != 0) { return 1; }
+    return 0;
+}

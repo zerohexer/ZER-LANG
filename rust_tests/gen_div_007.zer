@@ -1,0 +1,10 @@
+// Division safe: divisor proven > 0 by if-guard before use
+
+u32 main() {
+    u32 denom = 0;
+    denom = 5;
+    if (denom == 0) { return 1; }
+    u32 result = 100 / denom;
+    if (result != 20) { return 2; }
+    return 0;
+}

@@ -1,0 +1,10 @@
+// Division: safe with positive literal divisor — compiles
+
+u32 main() {
+    u32 x = 100;
+    u32 y = x / 7;
+    u32 r = x % 7;
+    if (y != 14) { return 1; }
+    if (r != 2) { return 2; }
+    return 0;
+}

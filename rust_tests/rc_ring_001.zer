@@ -1,0 +1,16 @@
+// Rust: mpsc::channel — send/recv single value
+// ZER: Ring buffer push/pop single value
+// Equivalent to: task-comm-0 (basic send/receive)
+
+Ring(u32, 8) chan;
+
+u32 main() {
+    chan.push(42);
+    ?u32 val = chan.pop();
+    if (val) |v| {
+        if (v != 42) { return 1; }
+    } else {
+        return 2;
+    }
+    return 0;
+}

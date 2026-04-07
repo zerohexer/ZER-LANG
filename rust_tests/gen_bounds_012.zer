@@ -1,0 +1,13 @@
+// Bounds: u8 array with all values set and verified
+
+u32 main() {
+    u8[256] lut;
+    for (u32 i = 0; i < 256; i += 1) {
+        lut[i] = @truncate(u8, i * 2);
+    }
+    if (lut[0] != 0) { return 1; }
+    if (lut[1] != 2) { return 2; }
+    if (lut[127] != 254) { return 3; }
+    if (lut[128] != 0) { return 4; }  // wraps at u8
+    return 0;
+}

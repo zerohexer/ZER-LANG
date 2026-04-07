@@ -1,0 +1,25 @@
+// Rust: mpsc — push multiple, pop all in order
+// ZER: Ring buffer push 5 values, pop and verify order
+// Equivalent to: task-comm-2 (sequential sends)
+
+Ring(u32, 16) chan;
+
+u32 main() {
+    u32 i = 0;
+    while (i < 5) {
+        chan.push(i * 10);
+        i += 1;
+    }
+
+    u32 j = 0;
+    while (j < 5) {
+        ?u32 val = chan.pop();
+        if (val) |v| {
+            if (v != j * 10) { return 1; }
+        } else {
+            return 2;
+        }
+        j += 1;
+    }
+    return 0;
+}

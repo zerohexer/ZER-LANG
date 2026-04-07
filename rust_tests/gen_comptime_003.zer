@@ -1,0 +1,16 @@
+// Comptime: pool size from comptime expression
+
+comptime u32 POOL_SIZE() { return 8; }
+
+struct Worker { u32 id; }
+Pool(Worker, 8) workers;
+
+u32 main() {
+    ?Handle(Worker) mh = workers.alloc();
+    Handle(Worker) h = mh orelse return;
+    workers.get(h).id = 1;
+    u32 id = workers.get(h).id;
+    workers.free(h);
+    if (id != 1) { return 1; }
+    return 0;
+}

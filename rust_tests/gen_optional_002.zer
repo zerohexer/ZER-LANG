@@ -1,0 +1,26 @@
+// Optional: ?*T pointer — null sentinel, if-unwrap
+
+struct Link { u32 data; }
+Pool(Link, 4) pool;
+
+u32 main() {
+    ?Handle(Link) mh = pool.alloc();
+    if (mh) |h| {
+        pool.get(h).data = 55;
+        u32 d = pool.get(h).data;
+        pool.free(h);
+        if (d != 55) { return 1; }
+    }
+
+    // Pool exhaustion returns empty optional
+    ?Handle(Link) mh2;
+    u32 fallback = 0;
+    if (mh2) |h2| {
+        fallback = pool.get(h2).data;
+        pool.free(h2);
+    } else {
+        fallback = 77;
+    }
+    if (fallback != 77) { return 2; }
+    return 0;
+}

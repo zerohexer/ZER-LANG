@@ -1,0 +1,14 @@
+// Bounds: subslice within range
+
+u32 main() {
+    u8[8] buf;
+    for (u32 i = 0; i < 8; i += 1) {
+        buf[i] = (u8)i;
+    }
+    [*]u8 full = buf;
+    [*]u8 sub = full[2..6];
+    if (sub.len != 4) { return 1; }
+    if (sub[0] != 2) { return 2; }
+    if (sub[3] != 5) { return 3; }
+    return 0;
+}

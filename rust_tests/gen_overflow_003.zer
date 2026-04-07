@@ -1,0 +1,12 @@
+// Overflow: @saturate prevents wrap for i8
+
+u32 main() {
+    i32 big = 200;
+    i8 clamped = @saturate(i8, big);
+    if (clamped != 127) { return 1; }
+
+    i32 neg_big = -200;
+    i8 clamped2 = @saturate(i8, neg_big);
+    if (clamped2 != -128) { return 2; }
+    return 0;
+}

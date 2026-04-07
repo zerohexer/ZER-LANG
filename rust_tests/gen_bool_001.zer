@@ -1,0 +1,8 @@
+// Bool: no bool-to-int coercion — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    bool b = true;
+    u32 x = b;
+    return x;
+}

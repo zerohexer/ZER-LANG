@@ -1,0 +1,42 @@
+// Rust: thread_local! — accumulate per-thread work, aggregate at end
+// ZER: threadlocal accumulator per thread, shared struct for total
+// Equivalent to: Rust thread_local! with aggregation
+
+threadlocal u32 tls_work;
+
+shared struct Total {
+    u32 value;
+}
+
+Total gtotal;
+
+void do_work(*Total t, u32 n) {
+    tls_work = 0;
+    u32 i = 0;
+    while (i < n) {
+        tls_work += i;
+        i += 1;
+    }
+    // Commit local work to shared total
+    t.value += tls_work;
+}
+
+u32 main() {
+    gtotal.value = 0;
+
+    // Thread 1: sum 0..4 = 10
+    // Thread 2: sum 0..9 = 45  (but n=10 means 0+1+...+9=45)
+    // Thread 3: sum 0..4 = 10
+    ThreadHandle t1 = spawn do_work(&gtotal, 5);
+    ThreadHandle t2 = spawn do_work(&gtotal, 10);
+    ThreadHandle t3 = spawn do_work(&gtotal, 5);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // 10 + 45 + 10 = 65
+    u32 v = gtotal.value;
+    if (v != 65) { return 1; }
+    return 0;
+}

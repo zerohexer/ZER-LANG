@@ -1,0 +1,17 @@
+// Slice: bytes_copy pattern with manual loop
+
+u32 main() {
+    u8[8] src;
+    u8[8] dst;
+    for (u32 i = 0; i < 8; i += 1) {
+        src[i] = @truncate(u8, i + 1);
+        dst[i] = 0;
+    }
+    for (u32 i = 0; i < 8; i += 1) {
+        dst[i] = src[i];
+    }
+    for (u32 i = 0; i < 8; i += 1) {
+        if (dst[i] != i + 1) { return 1; }
+    }
+    return 0;
+}

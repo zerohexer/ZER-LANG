@@ -1,0 +1,14 @@
+// UAF: basic use-after-free on Pool handle
+// EXPECTED: compile error
+
+struct Node { u32 val; }
+Pool(Node, 8) pool;
+
+u32 main() {
+    ?Handle(Node) mh = pool.alloc();
+    Handle(Node) h = mh orelse return;
+    pool.get(h).val = 10;
+    pool.free(h);
+    u32 v = pool.get(h).val;
+    return v;
+}

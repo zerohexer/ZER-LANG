@@ -1,0 +1,14 @@
+// Null safety: optional pointer — safe unwrap with orelse
+
+struct Node { u32 key; }
+Pool(Node, 4) pool;
+
+u32 main() {
+    ?Handle(Node) mh = pool.alloc();
+    Handle(Node) h = mh orelse return;
+    pool.get(h).key = 77;
+    u32 k = pool.get(h).key;
+    pool.free(h);
+    if (k != 77) { return 1; }
+    return 0;
+}

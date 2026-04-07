@@ -1,0 +1,18 @@
+// Null: orelse block form — block with return
+
+struct Obj { u32 v; }
+Slab(Obj) heap;
+
+u32 test() {
+    ?*Obj mo = heap.alloc_ptr();
+    *Obj o = mo orelse { return 99; };
+    defer heap.free_ptr(o);
+    o.v = 7;
+    return o.v;
+}
+
+u32 main() {
+    u32 r = test();
+    if (r != 7) { return 1; }
+    return 0;
+}

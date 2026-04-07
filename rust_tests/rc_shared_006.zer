@@ -1,0 +1,52 @@
+// Rust: RwLock — many readers, single writer pattern
+// ZER: shared(rw) struct — rdlock for reads, wrlock for writes
+// Equivalent to: Rust RwLock::read/write pattern
+
+shared(rw) struct AppConfig {
+    u32 max_conn;
+    u32 timeout_ms;
+    u32 version;
+}
+
+AppConfig gcfg;
+
+shared struct ReadCount {
+    u32 n;
+}
+
+ReadCount grc;
+
+void reader_thread(*AppConfig c, *ReadCount rc) {
+    u32 v = c.version;
+    u32 m = c.max_conn;
+    u32 t = c.timeout_ms;
+    if (v == 2) {
+        rc.n += 1;
+    }
+    if (m == 100) {
+        rc.n += 1;
+    }
+    if (t == 5000) {
+        rc.n += 1;
+    }
+}
+
+u32 main() {
+    gcfg.max_conn = 100;
+    gcfg.timeout_ms = 5000;
+    gcfg.version = 2;
+    grc.n = 0;
+
+    ThreadHandle t1 = spawn reader_thread(&gcfg, &grc);
+    ThreadHandle t2 = spawn reader_thread(&gcfg, &grc);
+    ThreadHandle t3 = spawn reader_thread(&gcfg, &grc);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // Each thread adds 3 to grc.n — total 9
+    u32 n = grc.n;
+    if (n != 9) { return 1; }
+    return 0;
+}

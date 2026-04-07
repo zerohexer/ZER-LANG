@@ -1,0 +1,15 @@
+// Shared struct: spawn with non-shared pointer — compile error
+// EXPECTED: compile error
+
+struct Data { u32 val; }
+Data g_data;
+
+void worker(*Data d) {
+    d.val += 1;
+}
+
+u32 main() {
+    g_data.val = 0;
+    spawn worker(&g_data);
+    return 0;
+}

@@ -1,0 +1,33 @@
+// Async: task with nested while — yield at each level
+
+u32 outer_count;
+u32 inner_count;
+
+async void matrix_task() {
+    u32 i = 0;
+    while (i < 2) {
+        u32 j = 0;
+        outer_count += 1;
+        while (j < 3) {
+            inner_count += 1;
+            j += 1;
+            yield;
+        }
+        i += 1;
+    }
+}
+
+u32 main() {
+    outer_count = 0;
+    inner_count = 0;
+
+    _zer_async_matrix_task t;
+    _zer_async_matrix_task_init(&t);
+
+    for (u32 p = 0; p < 7; p += 1) {
+        _zer_async_matrix_task_poll(&t);
+    }
+
+    if (inner_count != 6) { return 1; }
+    return 0;
+}

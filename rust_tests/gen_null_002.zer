@@ -1,0 +1,11 @@
+// Null safety: optional not unwrapped before use — compile error
+// EXPECTED: compile error
+
+struct Cell { u32 data; }
+Pool(Cell, 4) pool;
+
+u32 main() {
+    ?Handle(Cell) mh = pool.alloc();
+    pool.get(mh).data = 5;
+    return 0;
+}

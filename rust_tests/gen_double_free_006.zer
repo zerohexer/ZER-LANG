@@ -1,0 +1,14 @@
+// Double free: free in while loop body twice — compile error
+// EXPECTED: compile error
+
+struct Frame { u32 seq; }
+Pool(Frame, 4) pool;
+
+u32 main() {
+    ?Handle(Frame) mh = pool.alloc();
+    Handle(Frame) h = mh orelse return;
+    pool.get(h).seq = 1;
+    pool.free(h);
+    pool.free(h);
+    return 0;
+}

@@ -1,0 +1,14 @@
+// Double free: free the same handle twice consecutively
+// EXPECTED: compile error
+
+struct Job { u32 id; }
+Pool(Job, 4) pool;
+
+u32 main() {
+    ?Handle(Job) mh = pool.alloc();
+    Handle(Job) h = mh orelse return;
+    pool.get(h).id = 1;
+    pool.free(h);
+    pool.free(h);
+    return 0;
+}

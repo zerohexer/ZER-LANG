@@ -6945,33 +6945,58 @@ typedef struct { const char *name; size_t len; int line; } LabelInfo;
 
 static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     if (!node) return;
-    if (node->kind == NODE_LABEL && *count < max) {
-        labels[*count].name = node->label_stmt.name;
-        labels[*count].len = node->label_stmt.name_len;
-        labels[*count].line = node->loc.line;
-        (*count)++;
-    }
-    if (node->kind == NODE_BLOCK) {
+    switch (node->kind) {
+    case NODE_LABEL:
+        if (*count < max) {
+            labels[*count].name = node->label_stmt.name;
+            labels[*count].len = node->label_stmt.name_len;
+            labels[*count].line = node->loc.line;
+            (*count)++;
+        }
+        break;
+    case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
             collect_labels(node->block.stmts[i], labels, count, max);
-    }
-    if (node->kind == NODE_IF) {
+        break;
+    case NODE_IF:
         collect_labels(node->if_stmt.then_body, labels, count, max);
         collect_labels(node->if_stmt.else_body, labels, count, max);
-    }
-    if (node->kind == NODE_FOR) collect_labels(node->for_stmt.body, labels, count, max);
-    if (node->kind == NODE_WHILE) collect_labels(node->while_stmt.body, labels, count, max);
-    if (node->kind == NODE_SWITCH) {
+        break;
+    case NODE_FOR:
+        collect_labels(node->for_stmt.body, labels, count, max);
+        break;
+    case NODE_WHILE:
+        collect_labels(node->while_stmt.body, labels, count, max);
+        break;
+    case NODE_SWITCH:
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             collect_labels(node->switch_stmt.arms[i].body, labels, count, max);
+        break;
+    case NODE_DEFER:
+        collect_labels(node->defer.body, labels, count, max);
+        break;
+    case NODE_CRITICAL:
+        collect_labels(node->critical.body, labels, count, max);
+        break;
+    /* Nodes that cannot contain labels */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
+    case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+        break;
     }
-    if (node->kind == NODE_DEFER) collect_labels(node->defer.body, labels, count, max);
-    if (node->kind == NODE_CRITICAL) collect_labels(node->critical.body, labels, count, max);
 }
 
 static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_count) {
     if (!node) return;
-    if (node->kind == NODE_GOTO) {
+    switch (node->kind) {
+    case NODE_GOTO: {
         bool found = false;
         for (int i = 0; i < label_count; i++) {
             if (labels[i].len == node->goto_stmt.label_len &&
@@ -6985,23 +7010,45 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
                 "goto target '%.*s' not found in this function",
                 (int)node->goto_stmt.label_len, node->goto_stmt.label);
         }
+        break;
     }
-    if (node->kind == NODE_BLOCK) {
+    case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
             validate_gotos(c, node->block.stmts[i], labels, label_count);
-    }
-    if (node->kind == NODE_IF) {
+        break;
+    case NODE_IF:
         validate_gotos(c, node->if_stmt.then_body, labels, label_count);
         validate_gotos(c, node->if_stmt.else_body, labels, label_count);
-    }
-    if (node->kind == NODE_FOR) validate_gotos(c, node->for_stmt.body, labels, label_count);
-    if (node->kind == NODE_WHILE) validate_gotos(c, node->while_stmt.body, labels, label_count);
-    if (node->kind == NODE_SWITCH) {
+        break;
+    case NODE_FOR:
+        validate_gotos(c, node->for_stmt.body, labels, label_count);
+        break;
+    case NODE_WHILE:
+        validate_gotos(c, node->while_stmt.body, labels, label_count);
+        break;
+    case NODE_SWITCH:
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             validate_gotos(c, node->switch_stmt.arms[i].body, labels, label_count);
+        break;
+    case NODE_DEFER:
+        validate_gotos(c, node->defer.body, labels, label_count);
+        break;
+    case NODE_CRITICAL:
+        validate_gotos(c, node->critical.body, labels, label_count);
+        break;
+    /* Nodes that cannot contain goto */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
+    case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+        break;
     }
-    if (node->kind == NODE_DEFER) validate_gotos(c, node->defer.body, labels, label_count);
-    if (node->kind == NODE_CRITICAL) validate_gotos(c, node->critical.body, labels, label_count);
 }
 
 static void check_goto_labels(Checker *c, Node *func_body) {
@@ -7553,7 +7600,62 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_ORELSE:
         scan_frame(c, frame, node->orelse.expr);
         break;
-    default: break;
+    case NODE_SWITCH:
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            scan_frame(c, frame, node->switch_stmt.arms[i].body);
+        break;
+    case NODE_DEFER:
+        scan_frame(c, frame, node->defer.body);
+        break;
+    case NODE_CRITICAL:
+        scan_frame(c, frame, node->critical.body);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            scan_frame(c, frame, node->intrinsic.args[i]);
+        break;
+    case NODE_FIELD:
+        scan_frame(c, frame, node->field.object);
+        break;
+    case NODE_INDEX:
+        scan_frame(c, frame, node->index_expr.object);
+        if (node->index_expr.index)
+            scan_frame(c, frame, node->index_expr.index);
+        break;
+    case NODE_TYPECAST:
+        scan_frame(c, frame, node->typecast.expr);
+        break;
+    case NODE_SLICE:
+        scan_frame(c, frame, node->slice.object);
+        break;
+    /* Leaf nodes — no children to recurse into */
+    case NODE_INT_LIT:
+    case NODE_FLOAT_LIT:
+    case NODE_STRING_LIT:
+    case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT:
+    case NODE_NULL_LIT:
+    case NODE_IDENT:
+    case NODE_BREAK:
+    case NODE_CONTINUE:
+    case NODE_GOTO:
+    case NODE_LABEL:
+    case NODE_ASM:
+    case NODE_CAST:
+    case NODE_SIZEOF:
+    /* Top-level decls — scan_frame only called on function bodies */
+    case NODE_FILE:
+    case NODE_FUNC_DECL:
+    case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL:
+    case NODE_UNION_DECL:
+    case NODE_TYPEDEF:
+    case NODE_IMPORT:
+    case NODE_CINCLUDE:
+    case NODE_INTERRUPT:
+    case NODE_MMIO:
+    case NODE_GLOBAL_VAR:
+        break;
     }
 }
 

@@ -2934,3 +2934,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `zerc_main.c` calls `checker_check_bodies` (Pass 2 only), not `checker_check` (all passes). Pass 3/4/5 never executed in the real pipeline.
 - **Fix:** Added `checker_post_passes()` function (runs Pass 3+4+5), called from `zerc_main.c` after `checker_check_bodies`.
 - **Impact:** Same class as zercheck integration bug (2026-04-03). Post-passes existed and passed unit tests but were never called from the actual compiler.
+
+### BUG-454: C-style cast `(*opaque)&a` doesn't propagate provenance
+- **Symptom:** `*opaque raw = (*opaque)&a; *B wrong = (*B)raw;` compiles — wrong type not caught through C-style cast with address-of expression.
+- **Root cause (1):** NODE_TYPECAST provenance-setting code only handled NODE_IDENT expressions, not NODE_UNARY(TOK_AMP). `(*opaque)&a` → `&a` is NODE_UNARY, not NODE_IDENT.
+- **Root cause (2):** Var-decl provenance propagation recognized @ptrcast (NODE_INTRINSIC) but not NODE_TYPECAST for source type extraction. `*opaque raw = (*opaque)&a` didn't copy source type to `raw`'s provenance.
+- **Fix (1):** Walk through `&`, field, index chains to find root ident in NODE_TYPECAST provenance setter.
+- **Fix (2):** Added NODE_TYPECAST case to var-decl provenance handler — extracts source type from `init->typecast.expr` via typemap, same as @ptrcast does with `init->intrinsic.args[0]`.
+- **Tests:** Existing `typecast_provenance.zer` covers named-ptr path. `(*opaque)&a` path verified manually.

@@ -2635,3 +2635,17 @@ Without (2), `*opaque raw = (*opaque)&a` didn't propagate `*A` provenance to `ra
 **Problem:** `return fibonacci(n-1) + fibonacci(n-2)` — function calls inside NODE_BINARY invisible to stack depth analysis. No recursion warning emitted.
 
 **Fix:** Added NODE_BINARY (recurse left+right), NODE_UNARY (recurse operand), NODE_ORELSE (recurse expr) to `scan_frame`. Now all function calls in any expression position are found.
+
+### Arena Global Escape (BUG-455, 2026-04-07)
+
+**Problem:** Global arena pointer stored in global variable not caught. `Arena scratch;` (global) → `*Cfg c = scratch.alloc(Cfg) orelse return; global_cfg = c;` compiles without error. After `scratch.reset()`, `global_cfg` is dangling.
+
+**Root cause:** `is_arena_derived` flag was only set for LOCAL arena allocs (`!arena_is_global` guard). Global arena allocs were considered "safe" — wrong, because `arena.reset()` invalidates all pointers regardless of arena scope.
+
+**Fix:** Added `is_from_arena` flag on Symbol (types.h). Set for ALL arena allocs (global or local). Assignment-to-global check uses `is_from_arena || is_arena_derived`. Return/keep/call checks still use only `is_arena_derived` (local arenas — global arena pointers CAN be returned from functions safely because global arena outlives function scope).
+
+**Design distinction:**
+- `is_arena_derived` = pointer from LOCAL arena → cannot return, cannot pass to keep params, cannot store in global
+- `is_from_arena` = pointer from ANY arena → cannot store in global (but CAN return, CAN pass to functions)
+
+Both propagate through aliases, if-unwrap captures, switch captures, orelse unwrap, struct copy.

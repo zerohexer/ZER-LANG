@@ -1,0 +1,14 @@
+// Arena pointer stored in global — must be rejected
+// Even global arena can be reset(), making the stored pointer dangle
+
+struct Cfg { u32 x; u32 y; }
+Arena scratch;
+?*Cfg global_cfg = null;
+
+u32 main() {
+    ?*Cfg mc = scratch.alloc(Cfg);
+    *Cfg c = mc orelse return;
+    c.x = 42;
+    global_cfg = c;
+    return 0;
+}

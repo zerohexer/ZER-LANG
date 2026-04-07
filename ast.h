@@ -272,6 +272,7 @@ struct Node {
             FieldDecl *fields;
             int field_count;
             bool is_packed;
+            bool is_shared;
         } struct_decl;
 
         /* NODE_ENUM_DECL: enum State { idle, running, ... } */

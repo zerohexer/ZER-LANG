@@ -237,6 +237,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
         if (word_len == 6 && memcmp(word+1, "truct", 5) == 0) return TOK_STRUCT;
         if (word_len == 6 && memcmp(word+1, "witch", 5) == 0) return TOK_SWITCH;
         if (word_len == 6 && memcmp(word+1, "tatic", 5) == 0) return TOK_STATIC;
+        if (word_len == 6 && memcmp(word+1, "hared", 5) == 0) return TOK_SHARED;
         break;
     case 't':
         if (word_len >= 2) {
@@ -541,6 +542,7 @@ const char *token_type_name(TokenType type) {
     case TOK_OPAQUE: return "opaque";
     case TOK_STRUCT: return "struct";
     case TOK_PACKED: return "packed";
+    case TOK_SHARED: return "shared";
     case TOK_ENUM: return "enum";
     case TOK_UNION: return "union";
     case TOK_CONST: return "const";

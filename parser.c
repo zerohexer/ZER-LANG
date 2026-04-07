@@ -1834,10 +1834,16 @@ static Node *parse_declaration(Parser *p) {
         return n;
     }
 
-    /* struct / packed struct */
+    /* struct / packed struct / shared struct */
     if (match(p, TOK_PACKED)) {
         consume(p, TOK_STRUCT, "expected 'struct' after 'packed'");
         return parse_struct_decl(p, true);
+    }
+    if (match(p, TOK_SHARED)) {
+        consume(p, TOK_STRUCT, "expected 'struct' after 'shared'");
+        Node *n = parse_struct_decl(p, false);
+        n->struct_decl.is_shared = true;
+        return n;
     }
     if (match(p, TOK_STRUCT)) {
         return parse_struct_decl(p, false);

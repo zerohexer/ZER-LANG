@@ -98,6 +98,7 @@ struct Type {
             const char *name;
             uint32_t name_len;
             bool is_packed;
+            bool is_shared;
             const char *module_prefix;  /* NULL for main module */
             uint32_t module_prefix_len;
             uint32_t type_id;           /* BUG-393: runtime provenance tag */

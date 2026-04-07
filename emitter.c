@@ -281,6 +281,72 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     }
 }
 
+/* Find shared struct variable accessed in an expression.
+ * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
+ * Used to auto-insert lock/unlock around statements. */
+static Node *find_shared_root(Emitter *e, Node *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == NODE_FIELD) {
+        /* Walk to root of field chain */
+        Node *root = expr;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        if (root->kind == NODE_IDENT) {
+            Type *t = checker_get_type(e->checker, root);
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                /* Direct shared struct */
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
+                /* Pointer to shared struct */
+                if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                        return root;
+                }
+            }
+        }
+    }
+    /* Recurse into sub-expressions */
+    Node *found = NULL;
+    if (expr->kind == NODE_BINARY) {
+        found = find_shared_root(e, expr->binary.left);
+        if (!found) found = find_shared_root(e, expr->binary.right);
+    } else if (expr->kind == NODE_ASSIGN) {
+        found = find_shared_root(e, expr->assign.target);
+        if (!found) found = find_shared_root(e, expr->assign.value);
+    } else if (expr->kind == NODE_CALL) {
+        for (int i = 0; i < expr->call.arg_count && !found; i++)
+            found = find_shared_root(e, expr->call.args[i]);
+    } else if (expr->kind == NODE_UNARY) {
+        found = find_shared_root(e, expr->unary.operand);
+    } else if (expr->kind == NODE_INDEX) {
+        found = find_shared_root(e, expr->index_expr.object);
+    } else if (expr->kind == NODE_ORELSE) {
+        found = find_shared_root(e, expr->orelse.expr);
+    } else if (expr->kind == NODE_TYPECAST) {
+        found = find_shared_root(e, expr->typecast.expr);
+    }
+    return found;
+}
+
+/* Emit lock acquire for shared struct variable */
+static void emit_shared_lock(Emitter *e, Node *root) {
+    emit_indent(e);
+    emit(e, "_zer_lock_acquire(&");
+    emit_expr(e, root);
+    emit(e, "._zer_lock);\n");
+}
+
+/* Emit lock release for shared struct variable */
+static void emit_shared_unlock(Emitter *e, Node *root) {
+    emit_indent(e);
+    emit(e, "_zer_lock_release(&");
+    emit_expr(e, root);
+    emit(e, "._zer_lock);\n");
+}
+
 /* RF3: resolve TypeNode via checker's typemap (set during resolve_type).
  * Falls back to resolve_type_for_emit if not cached (safety net). */
 static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
@@ -3164,12 +3230,16 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "continue;\n");
         break;
 
-    case NODE_EXPR_STMT:
+    case NODE_EXPR_STMT: {
         /* auto-guard: emit bounds guards before the statement */
         emit_auto_guards(e, node->expr_stmt.expr);
+        /* shared struct auto-locking */
+        Node *_shared_root = find_shared_root(e, node->expr_stmt.expr);
+        if (_shared_root) emit_shared_lock(e, _shared_root);
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");
+        if (_shared_root) emit_shared_unlock(e, _shared_root);
         /* Level 2: poison-after-free — set pointer to NULL after free() */
         if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
             node->expr_stmt.expr->call.callee &&
@@ -3184,6 +3254,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                  node->expr_stmt.expr->call.args[0]->ident.name);
         }
         break;
+    }
 
     case NODE_ASM:
         emit_indent(e);
@@ -3608,6 +3679,11 @@ static void emit_struct_decl(Emitter *e, Node *node) {
         emit_type_and_name(e, ftype, f->name, f->name_len);
         emit(e, ";\n");
     }
+    }
+    /* shared struct: add hidden lock field */
+    if (node->struct_decl.is_shared) {
+        emit_indent(e);
+        emit(e, "uint32_t _zer_lock;\n");
     }
     e->indent--;
     emit(e, "};\n");
@@ -4135,6 +4211,15 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
     emit(e, "    abort();\n");
     emit(e, "#endif\n");
+    emit(e, "}\n\n");
+
+    /* ZER shared struct lock primitives */
+    emit(e, "/* ZER shared struct auto-locking */\n");
+    emit(e, "static inline void _zer_lock_acquire(uint32_t *lock) {\n");
+    emit(e, "    while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE)) {}\n");
+    emit(e, "}\n");
+    emit(e, "static inline void _zer_lock_release(uint32_t *lock) {\n");
+    emit(e, "    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);\n");
     emit(e, "}\n\n");
 
     /* Universal fault handler + @probe — uses C standard signal() everywhere.

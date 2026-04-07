@@ -4,7 +4,7 @@
 
 u32 counter;
 u32 flags;
-u32 shared;
+u32 shared_val;
 u32 state;
 
 u32 main() {
@@ -27,8 +27,8 @@ u32 main() {
     if (flags != 0xF0) { return 6; }
 
     // atomic load/store
-    @atomic_store(&shared, 42);
-    u32 val = @atomic_load(&shared);
+    @atomic_store(&shared_val, 42);
+    u32 val = @atomic_load(&shared_val);
     if (val != 42) { return 7; }
 
     // atomic cas

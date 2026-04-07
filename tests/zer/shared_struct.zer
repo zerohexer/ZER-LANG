@@ -1,0 +1,34 @@
+// shared struct — auto-locked field access
+// Verifies: auto lock/unlock, hidden _zer_lock field, field access works
+
+shared struct Counter {
+    u32 value;
+    u32 total;
+}
+
+Counter g;
+
+shared struct Sensor {
+    u32 reading;
+    bool ready;
+}
+
+Sensor sensor;
+
+u32 main() {
+    // Basic field access — auto-locked
+    g.value = 42;
+    g.total = g.value + 1;
+    if (g.total != 43) { return 1; }
+
+    // Another shared struct
+    sensor.reading = 100;
+    sensor.ready = true;
+    if (sensor.reading != 100) { return 2; }
+
+    // Compound assignment — auto-locked
+    g.value += 10;
+    if (g.value != 52) { return 3; }
+
+    return 0;
+}

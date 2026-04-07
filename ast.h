@@ -162,6 +162,7 @@ typedef enum {
     NODE_EXPR_STMT,         /* expression as statement: foo(); */
     NODE_ASM,               /* asm("nop"); or extended asm */
     NODE_CRITICAL,          /* @critical { body } — interrupt-disabled block */
+    NODE_SPAWN,             /* spawn func(args); — thread creation */
 
     /* === Expressions === */
     NODE_INT_LIT,           /* 42, 0xFF, 0b1010 */
@@ -401,6 +402,14 @@ struct Node {
 
         /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */
         struct { Node *body; } critical;
+
+        /* NODE_SPAWN: spawn func(args); */
+        struct {
+            const char *func_name;
+            size_t func_name_len;
+            Node **args;
+            int arg_count;
+        } spawn_stmt;
 
         /* NODE_INT_LIT: 42, 0xFF, 0b1010, 1_000_000 */
         struct { uint64_t value; } int_lit;

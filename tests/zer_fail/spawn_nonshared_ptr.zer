@@ -1,0 +1,15 @@
+// spawn with non-shared pointer — must be rejected
+// Data race: two threads access same memory without locking
+
+struct Data { u32 x; }
+
+void worker(*Data d) {
+    d.x = 42;
+}
+
+u32 main() {
+    Data d;
+    d.x = 0;
+    spawn worker(&d);
+    return 0;
+}

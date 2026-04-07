@@ -1282,6 +1282,43 @@ static Node *parse_statement(Parser *p) {
         return n;
     }
 
+    /* spawn func(args); — contextual keyword (not a reserved keyword).
+     * Detected by ident "spawn" at statement position followed by IDENT + LPAREN. */
+    if (check(p, TOK_IDENT) && p->current.length == 5 &&
+        memcmp(p->current.start, "spawn", 5) == 0) {
+        advance(p); /* consume "spawn" ident */
+        Node *n = new_node(p, NODE_SPAWN);
+        if (!check(p, TOK_IDENT)) {
+            error(p, "expected function name after 'spawn'");
+            return n;
+        }
+        n->spawn_stmt.func_name = p->current.start;
+        n->spawn_stmt.func_name_len = p->current.length;
+        advance(p);
+        consume(p, TOK_LPAREN, "expected '(' after spawn function name");
+        /* parse args */
+        Node **args = NULL;
+        int arg_count = 0;
+        int arg_cap = 0;
+        while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
+            if (arg_count > 0) consume(p, TOK_COMMA, "expected ',' between spawn arguments");
+            Node *arg = parse_expression(p);
+            if (arg_count >= arg_cap) {
+                int new_cap = arg_cap < 4 ? 4 : arg_cap * 2;
+                Node **new_args = arena_alloc(p->arena, new_cap * sizeof(Node *));
+                if (args) memcpy(new_args, args, arg_count * sizeof(Node *));
+                args = new_args;
+                arg_cap = new_cap;
+            }
+            args[arg_count++] = arg;
+        }
+        consume(p, TOK_RPAREN, "expected ')' after spawn arguments");
+        consume(p, TOK_SEMICOLON, "expected ';' after spawn");
+        n->spawn_stmt.args = args;
+        n->spawn_stmt.arg_count = arg_count;
+        return n;
+    }
+
     /* label: (identifier followed by colon at statement position) */
     if (check(p, TOK_IDENT) && p->current.length > 0) {
         /* peek ahead for colon */

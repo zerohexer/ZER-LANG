@@ -1174,6 +1174,10 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         zc_error(zc, node->loc.line,
                             "use-after-free: '%.*s' may have been freed at line %d",
                             fklen, fkey, h->free_line);
+                    } else if (h && h->state == HS_TRANSFERRED) {
+                        zc_error(zc, node->loc.line,
+                            "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                            fklen, fkey, h->transfer_line);
                     }
                 }
             }
@@ -1203,6 +1207,10 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     zc_error(zc, node->loc.line,
                         "use-after-free: '%.*s' may have been freed at line %d",
                         sklen, skey, h->free_line);
+                } else if (h && h->state == HS_TRANSFERRED) {
+                    zc_error(zc, node->loc.line,
+                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                        sklen, skey, h->transfer_line);
                 }
             }
         }
@@ -1228,6 +1236,10 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     zc_error(zc, node->loc.line,
                         "use-after-free: '%.*s' may have been freed at line %d",
                         iklen, ikey, h->free_line);
+                } else if (h && h->state == HS_TRANSFERRED) {
+                    zc_error(zc, node->loc.line,
+                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                        iklen, ikey, h->transfer_line);
                 }
             }
         }
@@ -1250,6 +1262,10 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     zc_error(zc, node->loc.line,
                         "use-after-free: '%.*s' may have been freed at line %d",
                         dklen, dkey, h->free_line);
+                } else if (h && h->state == HS_TRANSFERRED) {
+                    zc_error(zc, node->loc.line,
+                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                        dklen, dkey, h->transfer_line);
                 }
             }
         }
@@ -1274,7 +1290,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL:
+    case NODE_CRITICAL: case NODE_SPAWN:
         break;
     }
 }
@@ -1599,6 +1615,44 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         }
         break;
     }
+
+    case NODE_SPAWN:
+        /* Mark non-shared pointer args as HS_TRANSFERRED */
+        for (int si = 0; si < node->spawn_stmt.arg_count; si++) {
+            Node *arg = node->spawn_stmt.args[si];
+            /* Check if arg is &var or var (pointer ident) */
+            Node *root = arg;
+            if (root->kind == NODE_UNARY && root->unary.op == TOK_AMP)
+                root = root->unary.operand;
+            while (root && root->kind == NODE_FIELD) root = root->field.object;
+            if (root && root->kind == NODE_IDENT) {
+                /* Check if it's a shared struct — don't transfer shared */
+                Type *rt = checker_get_type(zc->checker, root);
+                if (rt) {
+                    Type *reff = type_unwrap_distinct(rt);
+                    bool is_shared_type = false;
+                    if (reff->kind == TYPE_STRUCT && reff->struct_type.is_shared)
+                        is_shared_type = true;
+                    if (reff->kind == TYPE_POINTER) {
+                        Type *inner = type_unwrap_distinct(reff->pointer.inner);
+                        if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                            is_shared_type = true;
+                    }
+                    if (!is_shared_type) {
+                        char akey[128];
+                        int aklen = handle_key_from_expr(root, akey, sizeof(akey));
+                        if (aklen > 0) {
+                            HandleInfo *h = find_handle(ps, akey, (uint32_t)aklen);
+                            if (h && h->state == HS_ALIVE) {
+                                h->state = HS_TRANSFERRED;
+                                h->transfer_line = node->loc.line;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        break;
 
     /* Nodes not relevant to zercheck handle tracking */
     case NODE_GOTO: case NODE_LABEL: case NODE_BREAK: case NODE_CONTINUE:

@@ -8395,9 +8395,9 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
         if (shared_type) {
             uint32_t sid = shared_type->struct_type.type_id;
             if (last_shared_id > 0 && sid != last_shared_id && sid < last_shared_id) {
-                checker_warning(c, stmt->loc.line,
-                    "potential deadlock: shared struct '%.*s' (order %u) accessed after '%.*s' (order %u) — "
-                    "always access shared structs in consistent order",
+                checker_error(c, stmt->loc.line,
+                    "deadlock: shared struct '%.*s' (order %u) accessed after '%.*s' (order %u) — "
+                    "always access shared structs in consistent ascending order",
                     (int)shared_type->struct_type.name_len, shared_type->struct_type.name, sid,
                     (int)last_shared_name_len, last_shared_name, last_shared_id);
             }

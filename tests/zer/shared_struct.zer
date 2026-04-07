@@ -21,14 +21,14 @@ u32 main() {
     g.total = g.value + 1;
     if (g.total != 43) { return 1; }
 
-    // Another shared struct
-    sensor.reading = 100;
-    sensor.ready = true;
-    if (sensor.reading != 100) { return 2; }
-
     // Compound assignment — auto-locked
     g.value += 10;
     if (g.value != 52) { return 3; }
+
+    // Another shared struct — accessed AFTER Counter (ascending order)
+    sensor.reading = 100;
+    sensor.ready = true;
+    if (sensor.reading != 100) { return 2; }
 
     return 0;
 }

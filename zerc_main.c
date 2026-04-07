@@ -437,8 +437,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Post-passes on main file: stack depth + interrupt safety */
+    /* Post-passes on main file: stack depth + interrupt safety + lock ordering */
     checker_post_passes(&checker, main_mod->ast);
+    if (checker.error_count > 0) {
+        fprintf(stderr, "error: type check failed\n");
+        free(cc.modules);
+        arena_free(&cc.arena);
+        return 1;
+    }
 
     /* ZER-CHECK: path-sensitive handle + *opaque tracking */
     {

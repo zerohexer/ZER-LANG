@@ -1,0 +1,28 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-5.rs
+// Send 0..99 through channel (single thread). Receive all. Assert sum == 4950.
+// Original Rust sends 1000 but Ring(T, 1024) is large — use 100 for sanity.
+
+struct Val { u32 n; }
+
+Ring(Val, 128) chan;
+
+u32 main() {
+    // Push 0..99
+    for (u32 i = 0; i < 100; i += 1) {
+        Val v;
+        v.n = i;
+        chan.push(v);
+    }
+
+    // Pop all and sum
+    u32 sum = 0;
+    for (u32 i = 0; i < 100; i += 1) {
+        ?Val r = chan.pop();
+        Val v = r orelse return;
+        sum += v.n;
+    }
+
+    // sum = 0+1+2+...+99 = 4950
+    if (sum != 4950) { return 1; }
+    return 0;
+}

@@ -281,9 +281,29 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     }
 }
 
-/* Find shared struct variable accessed in an expression.
+static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
+
+/* Find shared struct variable accessed in a statement or expression.
  * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
  * Used to auto-insert lock/unlock around statements. */
+static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
+    if (!stmt) return NULL;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: return find_shared_root(e, stmt->expr_stmt.expr);
+    case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
+    case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
+    case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
+    case NODE_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
+    case NODE_FOR: {
+        Node *r = find_shared_root(e, stmt->for_stmt.init);
+        if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
+        return r;
+    }
+    case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
+    default: return NULL;
+    }
+}
+
 static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {
@@ -2642,7 +2662,32 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "{\n");
         e->indent++;
         for (int i = 0; i < node->block.stmt_count; i++) {
-            emit_stmt(e, node->block.stmts[i]);
+            /* Shared struct auto-locking: group consecutive statements
+             * accessing the same shared variable under one lock scope. */
+            Node *sr = find_shared_root_in_stmt(e, node->block.stmts[i]);
+            if (sr) {
+                emit_shared_lock(e, sr);
+                /* Emit this statement + scan ahead for consecutive same-root */
+                const char *sr_name = sr->ident.name;
+                uint32_t sr_len = (uint32_t)sr->ident.name_len;
+                while (i < node->block.stmt_count) {
+                    emit_stmt(e, node->block.stmts[i]);
+                    /* Check if NEXT statement also accesses same shared root */
+                    if (i + 1 < node->block.stmt_count) {
+                        Node *next_sr = find_shared_root_in_stmt(e, node->block.stmts[i + 1]);
+                        if (next_sr && next_sr->kind == NODE_IDENT &&
+                            (uint32_t)next_sr->ident.name_len == sr_len &&
+                            memcmp(next_sr->ident.name, sr_name, sr_len) == 0) {
+                            i++;
+                            continue; /* same shared root — keep going */
+                        }
+                    }
+                    break;
+                }
+                emit_shared_unlock(e, sr);
+            } else {
+                emit_stmt(e, node->block.stmts[i]);
+            }
         }
         /* emit only THIS block's defers at block end */
         emit_defers_from(e, defer_base);
@@ -3233,13 +3278,9 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_EXPR_STMT: {
         /* auto-guard: emit bounds guards before the statement */
         emit_auto_guards(e, node->expr_stmt.expr);
-        /* shared struct auto-locking */
-        Node *_shared_root = find_shared_root(e, node->expr_stmt.expr);
-        if (_shared_root) emit_shared_lock(e, _shared_root);
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");
-        if (_shared_root) emit_shared_unlock(e, _shared_root);
         /* Level 2: poison-after-free — set pointer to NULL after free() */
         if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
             node->expr_stmt.expr->call.callee &&

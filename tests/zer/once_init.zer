@@ -1,0 +1,19 @@
+// @once: execute body exactly once, thread-safe
+u32 init_count;
+
+void maybe_init() {
+    @once {
+        init_count = 1;
+    }
+    init_count += 10;
+}
+
+u32 main() {
+    init_count = 0;
+    maybe_init();
+    maybe_init();
+    maybe_init();
+    // 1 (once) + 10 + 10 + 10 = 31
+    if (init_count != 31) { return 1; }
+    return 0;
+}

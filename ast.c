@@ -87,6 +87,7 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_EXPR_STMT:    return "EXPR_STMT";
     case NODE_ASM:          return "ASM";
     case NODE_CRITICAL:     return "CRITICAL";
+    case NODE_ONCE:         return "ONCE";
     case NODE_SPAWN:        return "SPAWN";
     case NODE_INT_LIT:      return "INT_LIT";
     case NODE_FLOAT_LIT:    return "FLOAT_LIT";

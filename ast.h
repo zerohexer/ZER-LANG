@@ -162,6 +162,7 @@ typedef enum {
     NODE_EXPR_STMT,         /* expression as statement: foo(); */
     NODE_ASM,               /* asm("nop"); or extended asm */
     NODE_CRITICAL,          /* @critical { body } — interrupt-disabled block */
+    NODE_ONCE,              /* @once { body } — execute exactly once, thread-safe */
     NODE_SPAWN,             /* spawn func(args); — thread creation */
 
     /* === Expressions === */
@@ -404,6 +405,9 @@ struct Node {
 
         /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */
         struct { Node *body; } critical;
+
+        /* NODE_ONCE: @once { body } — execute exactly once, thread-safe */
+        struct { Node *body; } once;
 
         /* NODE_SPAWN: spawn func(args); or ThreadHandle th = spawn func(args); */
         struct {

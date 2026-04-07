@@ -280,6 +280,9 @@ static bool block_always_exits(Node *node) {
     if (node->kind == NODE_CRITICAL) {
         return block_always_exits(node->critical.body);
     }
+    if (node->kind == NODE_ONCE) {
+        return false; /* @once body may not execute — can't assume it always exits */
+    }
     return false;
 }
 
@@ -1309,7 +1312,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL: case NODE_SPAWN:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
         break;
     }
 }
@@ -1585,6 +1588,12 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         /* @critical { body } — check body for handle operations */
         if (node->critical.body)
             zc_check_stmt(zc, ps, node->critical.body);
+        break;
+
+    case NODE_ONCE:
+        /* @once { body } — check body for handle operations */
+        if (node->once.body)
+            zc_check_stmt(zc, ps, node->once.body);
         break;
 
     case NODE_SWITCH: {
@@ -2029,6 +2038,12 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
                     stmt->critical.body->kind == NODE_BLOCK && scan_depth < 31) {
                     scan_stack[scan_depth].stmts = stmt->critical.body->block.stmts;
                     scan_stack[scan_depth].count = stmt->critical.body->block.stmt_count;
+                    scan_depth++;
+                }
+                if (stmt->kind == NODE_ONCE && stmt->once.body &&
+                    stmt->once.body->kind == NODE_BLOCK && scan_depth < 31) {
+                    scan_stack[scan_depth].stmts = stmt->once.body->block.stmts;
+                    scan_stack[scan_depth].count = stmt->once.body->block.stmt_count;
                     scan_depth++;
                 }
             }

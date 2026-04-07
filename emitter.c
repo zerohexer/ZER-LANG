@@ -276,7 +276,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL: case NODE_SPAWN:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
         break;
     }
 }
@@ -2721,9 +2721,35 @@ static void emit_expr(Emitter *e, Node *node) {
             const char *cop = name + 5;
             int coplen = nlen - 5;
             bool is_wait = (coplen == 4 && memcmp(cop, "wait", 4) == 0);
+            bool is_timedwait = (coplen == 9 && memcmp(cop, "timedwait", 9) == 0);
             bool is_signal = (coplen == 6 && memcmp(cop, "signal", 6) == 0);
 
-            if (is_wait && node->intrinsic.arg_count >= 2) {
+            if (is_timedwait && node->intrinsic.arg_count >= 3) {
+                /* @cond_timedwait(var, cond, timeout_ms) → returns ?void (null=timeout) */
+                Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
+                const char *ar = vp ? "->" : ".";
+                int tmp = e->temp_count++;
+                emit(e, "({ struct timespec _zer_ts%d; clock_gettime(CLOCK_REALTIME, &_zer_ts%d); ", tmp, tmp);
+                emit(e, "{ uint64_t _zer_ms%d = ", tmp);
+                emit_expr(e, node->intrinsic.args[2]);
+                emit(e, "; _zer_ts%d.tv_sec += _zer_ms%d / 1000; ", tmp, tmp);
+                emit(e, "_zer_ts%d.tv_nsec += (_zer_ms%d %% 1000) * 1000000L; ", tmp, tmp);
+                emit(e, "if (_zer_ts%d.tv_nsec >= 1000000000L) { _zer_ts%d.tv_sec++; _zer_ts%d.tv_nsec -= 1000000000L; } } ", tmp, tmp, tmp);
+                emit(e, "int _zer_twrc%d = 0; ", tmp);
+                emit(e, "pthread_mutex_lock(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx); while (!(", ar);
+                emit_expr(e, node->intrinsic.args[1]);
+                emit(e, ")) { _zer_twrc%d = pthread_cond_timedwait(&", tmp);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx, &_zer_ts%d); if (_zer_twrc%d) break; } ", ar, tmp, tmp);
+                emit(e, "pthread_mutex_unlock(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx); (_zer_opt_void){ .has_value = (_zer_twrc%d == 0) }; })", ar, tmp);
+            } else if (is_wait && node->intrinsic.arg_count >= 2) {
                 /* pthread_mutex_lock → while (!(condition)) { pthread_cond_wait } → pthread_mutex_unlock
                  * The mutex is held while checking condition, released by cond_wait during sleep,
                  * re-acquired after wake, released after condition is true. */
@@ -2756,6 +2782,24 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "pthread_cond_broadcast(&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_cond)", ar);
+            } else {
+                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+            }
+        } else if (nlen >= 8 && memcmp(name, "barrier_", 8) == 0) {
+            const char *bop = name + 8;
+            int boplen = nlen - 8;
+            if (boplen == 4 && memcmp(bop, "init", 4) == 0 && node->intrinsic.arg_count >= 2) {
+                /* @barrier_init(var, count) → _zer_barrier_init(&var, count) */
+                emit(e, "_zer_barrier_init(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ", ");
+                emit_expr(e, node->intrinsic.args[1]);
+                emit(e, ")");
+            } else if (boplen == 4 && memcmp(bop, "wait", 4) == 0 && node->intrinsic.arg_count >= 1) {
+                /* @barrier_wait(var) → _zer_barrier_wait(&var) */
+                emit(e, "_zer_barrier_wait(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
             } else {
                 emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
             }
@@ -3521,6 +3565,28 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit(e, "}\n");
         break;
 
+    case NODE_ONCE: {
+        /* @once { body } — execute exactly once using atomic CAS */
+        static int once_id = 0;
+        int oid = once_id++;
+        emit_indent(e);
+        emit(e, "{ /* @once */\n");
+        e->indent++;
+        emit_indent(e);
+        emit(e, "static uint32_t _zer_once_%d = 0;\n", oid);
+        emit_indent(e);
+        emit(e, "if (!__atomic_exchange_n(&_zer_once_%d, 1, __ATOMIC_ACQ_REL)) {\n", oid);
+        e->indent++;
+        if (node->once.body) emit_stmt(e, node->once.body);
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
+        break;
+    }
+
     case NODE_SPAWN: {
         /* spawn func(args); — emit pthread_create using pre-scanned wrapper */
         int sid = -1;
@@ -4270,6 +4336,9 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
     case NODE_CRITICAL:
         prescan_spawn_in_node(e, node->critical.body);
         break;
+    case NODE_ONCE:
+        prescan_spawn_in_node(e, node->once.body);
+        break;
     default: break;
     }
 }
@@ -4546,7 +4615,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
     case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_SPAWN:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
@@ -4576,6 +4645,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "#include <stdlib.h>\n");
     emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
     emit(e, "#include <pthread.h>\n");
+    emit(e, "#include <time.h>\n");
     emit(e, "#endif\n");
     emit(e, "\n");
 
@@ -4694,6 +4764,38 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "static inline void _zer_lock_release(uint32_t *lock) {\n");
     emit(e, "    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);\n");
     emit(e, "}\n\n");
+
+    /* ZER thread barrier — portable (mutex + condvar, like Rust) */
+    emit(e, "/* ZER thread barrier */\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "typedef struct {\n");
+    emit(e, "    pthread_mutex_t mtx;\n");
+    emit(e, "    pthread_cond_t cond;\n");
+    emit(e, "    uint32_t count;\n");
+    emit(e, "    uint32_t target;\n");
+    emit(e, "    uint32_t generation;\n");
+    emit(e, "} _zer_barrier;\n");
+    emit(e, "static inline void _zer_barrier_init(_zer_barrier *b, uint32_t n) {\n");
+    emit(e, "    memset(b, 0, sizeof(*b));\n");
+    emit(e, "    pthread_mutex_init(&b->mtx, NULL);\n");
+    emit(e, "    pthread_cond_init(&b->cond, NULL);\n");
+    emit(e, "    b->target = n;\n");
+    emit(e, "}\n");
+    emit(e, "static inline void _zer_barrier_wait(_zer_barrier *b) {\n");
+    emit(e, "    pthread_mutex_lock(&b->mtx);\n");
+    emit(e, "    uint32_t gen = b->generation;\n");
+    emit(e, "    b->count++;\n");
+    emit(e, "    if (b->count >= b->target) {\n");
+    emit(e, "        b->count = 0;\n");
+    emit(e, "        b->generation++;\n");
+    emit(e, "        pthread_cond_broadcast(&b->cond);\n");
+    emit(e, "    } else {\n");
+    emit(e, "        while (gen == b->generation)\n");
+    emit(e, "            pthread_cond_wait(&b->cond, &b->mtx);\n");
+    emit(e, "    }\n");
+    emit(e, "    pthread_mutex_unlock(&b->mtx);\n");
+    emit(e, "}\n");
+    emit(e, "#endif\n\n");
 
     /* Universal fault handler + @probe — uses C standard signal() everywhere.
      * No platform-specific #ifdef. Works on any OS and bare-metal with libc.

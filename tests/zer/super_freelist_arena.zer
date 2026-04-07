@@ -1,0 +1,119 @@
+// Real program: Freelist allocator built on Arena
+// *opaque round-trips through function boundary (clears provenance),
+// ?*T linked list, defer cleanup
+// Tests: cast safety, interior pointer concepts, arena + linked list
+
+struct FreeNode {
+    ?*FreeNode next;
+}
+
+struct Block {
+    u32 data_a;
+    u32 data_b;
+    u32 data_c;
+    u32 data_d;
+}
+
+Arena backing;
+
+// Helper: cast *opaque to *Block — function boundary clears provenance
+*Block opaque_to_block(*opaque raw) {
+    return (*Block)raw;
+}
+
+*FreeNode opaque_to_freenode(*opaque raw) {
+    return (*FreeNode)raw;
+}
+
+u32 main() {
+    ?*FreeNode free_head = null;
+    u32 alloc_count = 0;
+    u32 free_count = 0;
+
+    // === Allocate 4 blocks from arena ===
+    ?*Block mb1 = backing.alloc(Block);
+    *Block b1 = mb1 orelse return;
+    b1.data_a = 10;
+    b1.data_b = 20;
+    alloc_count += 1;
+
+    ?*Block mb2 = backing.alloc(Block);
+    *Block b2 = mb2 orelse return;
+    b2.data_a = 30;
+    b2.data_b = 40;
+    alloc_count += 1;
+
+    ?*Block mb3 = backing.alloc(Block);
+    *Block b3 = mb3 orelse return;
+    b3.data_a = 50;
+    alloc_count += 1;
+
+    ?*Block mb4 = backing.alloc(Block);
+    *Block b4 = mb4 orelse return;
+    b4.data_a = 60;
+    alloc_count += 1;
+
+    if (alloc_count != 4) { return 1; }
+    if (b1.data_a != 10) { return 2; }
+    if (b2.data_b != 40) { return 3; }
+
+    // === "Free" b2 — add to freelist via *opaque type-pun ===
+    {
+        *opaque raw = (*opaque)b2;
+        *FreeNode node = opaque_to_freenode(raw);
+        node.next = free_head;
+        free_head = node;
+        free_count += 1;
+    }
+
+    // === "Free" b3 ===
+    {
+        *opaque raw = (*opaque)b3;
+        *FreeNode node = opaque_to_freenode(raw);
+        node.next = free_head;
+        free_head = node;
+        free_count += 1;
+    }
+
+    if (free_count != 2) { return 4; }
+
+    // === Re-allocate from freelist ===
+    *Block b5 = b1; // placeholder
+    if (free_head) |node| {
+        free_head = node.next;
+        *opaque raw = (*opaque)node;
+        b5 = opaque_to_block(raw);
+        b5.data_a = 0;
+        b5.data_b = 0;
+        b5.data_c = 0;
+        b5.data_d = 0;
+        alloc_count += 1;
+    }
+
+    // Verify recycled block is zeroed
+    if (b5.data_a != 0) { return 5; }
+    b5.data_a = 70;
+
+    // Second re-alloc from freelist
+    *Block b6 = b1; // placeholder
+    if (free_head) |node| {
+        free_head = node.next;
+        *opaque raw = (*opaque)node;
+        b6 = opaque_to_block(raw);
+        b6.data_a = 0;
+        alloc_count += 1;
+    }
+    b6.data_a = 80;
+
+    if (alloc_count != 6) { return 7; }
+
+    // === Verify all blocks ===
+    if (b1.data_a != 10) { return 8; }
+    if (b4.data_a != 60) { return 9; }
+    if (b5.data_a != 70) { return 10; }
+    if (b6.data_a != 80) { return 11; }
+
+    // Arena reset frees all memory
+    defer backing.reset();
+    return 0;
+}

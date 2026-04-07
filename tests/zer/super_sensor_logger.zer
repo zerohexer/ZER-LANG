@@ -1,0 +1,122 @@
+// Real program: Sensor data logger
+// Arena scratch + Pool handles + defer cleanup + function pointer callbacks
+// Simulates reading sensors, buffering in arena, processing via callbacks
+
+struct Sample { u32 timestamp; u32 value; u32 sensor_id; }
+struct SensorConfig { u32 id; u32 threshold; u32 (*process)(u32 raw); }
+
+Pool(Sample, 16) sample_pool;
+Arena scratch;
+
+u32 scale_temp(u32 raw) {
+    // raw ADC → millidegrees: raw * 1000 / 4096
+    // Simplified: raw / 4 for testing
+    return raw / 4;
+}
+
+u32 scale_pressure(u32 raw) {
+    return raw / 2;
+}
+
+u32 identity(u32 raw) {
+    return raw;
+}
+
+struct LogEntry { u32 sensor_id; u32 processed; bool over_threshold; }
+
+// Process a batch of samples, write results to arena scratch buffer
+u32 process_batch(*SensorConfig configs, u32 config_count,
+                  Handle(Sample)[16] samples, u32 sample_count) {
+    u32 alerts = 0;
+
+    for (u32 i = 0; i < sample_count; i += 1) {
+        Handle(Sample) h = samples[i];
+        u32 sid = sample_pool.get(h).sensor_id;
+        u32 raw = sample_pool.get(h).value;
+
+        // Find matching config
+        for (u32 c = 0; c < config_count; c += 1) {
+            if (configs[c].id == sid) {
+                u32 processed = configs[c].process(raw);
+                if (processed > configs[c].threshold) {
+                    alerts += 1;
+                }
+            }
+        }
+    }
+    return alerts;
+}
+
+u32 main() {
+    // Setup sensor configs with function pointer callbacks
+    SensorConfig[3] configs;
+    configs[0].id = 1;
+    configs[0].threshold = 500;
+    configs[0].process = scale_temp;
+
+    configs[1].id = 2;
+    configs[1].threshold = 1000;
+    configs[1].process = scale_pressure;
+
+    configs[2].id = 3;
+    configs[2].threshold = 100;
+    configs[2].process = identity;
+
+    // Simulate sensor readings
+    Handle(Sample)[16] batch;
+    u32 batch_count = 0;
+
+    // Sensor 1: temp = 2400 → scaled = 600 → over threshold (500)
+    ?Handle(Sample) ms1 = sample_pool.alloc();
+    Handle(Sample) s1 = ms1 orelse return;
+    sample_pool.get(s1).timestamp = 1000;
+    sample_pool.get(s1).value = 2400;
+    sample_pool.get(s1).sensor_id = 1;
+    batch[0] = s1;
+    batch_count += 1;
+
+    // Sensor 2: pressure = 1500 → scaled = 750 → under threshold (1000)
+    ?Handle(Sample) ms2 = sample_pool.alloc();
+    Handle(Sample) s2 = ms2 orelse return;
+    sample_pool.get(s2).timestamp = 1001;
+    sample_pool.get(s2).value = 1500;
+    sample_pool.get(s2).sensor_id = 2;
+    batch[1] = s2;
+    batch_count += 1;
+
+    // Sensor 3: raw = 150 → identity = 150 → over threshold (100)
+    ?Handle(Sample) ms3 = sample_pool.alloc();
+    Handle(Sample) s3 = ms3 orelse return;
+    sample_pool.get(s3).timestamp = 1002;
+    sample_pool.get(s3).value = 150;
+    sample_pool.get(s3).sensor_id = 3;
+    batch[2] = s3;
+    batch_count += 1;
+
+    // Sensor 1: temp = 800 → scaled = 200 → under threshold (500)
+    ?Handle(Sample) ms4 = sample_pool.alloc();
+    Handle(Sample) s4 = ms4 orelse return;
+    sample_pool.get(s4).timestamp = 1003;
+    sample_pool.get(s4).value = 800;
+    sample_pool.get(s4).sensor_id = 1;
+    batch[3] = s4;
+    batch_count += 1;
+
+    // Process batch — expect 2 alerts (sensor 1 first reading + sensor 3)
+    u32 alerts = process_batch(&configs[0], 3, batch, batch_count);
+    if (alerts != 2) {
+        sample_pool.free(s1);
+        sample_pool.free(s2);
+        sample_pool.free(s3);
+        sample_pool.free(s4);
+        return 1;
+    }
+
+    // Cleanup
+    sample_pool.free(s1);
+    sample_pool.free(s2);
+    sample_pool.free(s3);
+    sample_pool.free(s4);
+
+    return 0;
+}

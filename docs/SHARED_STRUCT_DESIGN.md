@@ -11,15 +11,24 @@
 - Lock primitives in preamble: `_zer_lock_acquire` (atomic exchange), `_zer_lock_release` (atomic store)
 - Tests: `shared_struct.zer` (positive), `shared_field_ptr.zer` (negative)
 
-### TO IMPLEMENT (this session):
-- `spawn` keyword for thread creation
+### IMPLEMENTED (v0.2.14, session 2):
+- `spawn` keyword for thread creation (fire-and-forget)
 - `HS_TRANSFERRED` state for ownership transfer
-- Deadlock detection for nested shared struct access
+- Deadlock detection for nested shared struct access (lock ordering)
+- `threadlocal` keyword (__thread emission)
+
+### IMPLEMENTED (v0.2.15):
+- Scoped spawn: `ThreadHandle th = spawn func(args);` + `th.join()`
+- *T (non-shared pointer) args allowed in scoped spawn (joined before scope exit)
+- zercheck: ThreadHandle tracked — not-joined = compile error
+- Condvar: `@cond_wait(shared_var, condition)`, `@cond_signal(shared_var)`, `@cond_broadcast(shared_var)`
+- Smart lock upgrade: shared structs using condvar auto-upgrade from spinlock to pthread_mutex_t
+- Ring channel safety: warning when pushing pointers through Ring buffer
+- Proper spawn wrappers: file-scope wrapper functions with forward declarations (fixes UB)
 
 ### FUTURE (v0.4+):
 - Reader-writer locks
 - Lock-free patterns
-- Thread join/detach
 
 ---
 

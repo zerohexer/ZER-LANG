@@ -2650,15 +2650,26 @@ Without (2), `*opaque raw = (*opaque)&a` didn't propagate `*A` provenance to `ra
 
 Both propagate through aliases, if-unwrap captures, switch captures, orelse unwrap, struct copy.
 
-### func_returns_arena — Arena Wrapper Exclusion (zercheck.c, 2026-04-07)
+### Allocation Coloring (zercheck.c, 2026-04-07)
 
-**Problem:** Wrapper functions like `?*Block arena_alloc_block() { return backing.alloc(Block); }` triggered false "handle never freed" errors. zercheck saw `?*T` return and tracked it as an allocation needing free.
+**Problem:** Wrapper functions returning `?*T` from arena triggered false "handle never freed" errors. Chained wrappers (app → driver → hal → arena.alloc) made it worse — each layer hid the arena source.
 
-**Fix:** `func_returns_arena(zc, call)` — lightweight pre-scan of callee's body. Checks if return statements are `arena.alloc()` / `arena.alloc_slice()` calls. If yes, skips handle tracking for the caller's variable.
+**Solution — three-layer coloring system:**
 
-**Called from:** `zc_check_var_init`, between `is_arena_alloc` direct check and wrapper allocator detection (line ~573).
+1. **`source_color` on HandleInfo** (`ZC_COLOR_UNKNOWN/POOL/ARENA/MALLOC`): set at allocation, propagated through all alias paths (alloc_id copies, struct copies, if-unwrap, interior pointers). Leak check skips `ZC_COLOR_ARENA`.
 
-**Limitation:** Only works for simple wrappers where return is directly `arena.alloc()`. Complex patterns (freelist returning type-punned recycled memory OR fresh arena alloc) have a non-arena return path, so the helper returns false. Full fix would require alias analysis (tracking memory identity through `*opaque` round-trips), planned for v0.3+.
+2. **`func_returns_color_by_name()`**: recursive body scan. Walks return statements — direct `arena.alloc()` → ARENA, `pool.alloc()` → POOL, call to function with known color → inherit transitively. Depth-limited to 8. Cached on `Symbol.returns_color_cached/value`. Handles chained wrappers: `app()` returns `driver()` returns `hal()` returns `arena.alloc()` → all ARENA.
+
+3. **Param color inference** (`Symbol.returns_param_color`): when a function returns a cast of its parameter (e.g., `*Block opaque_to_block(*opaque raw) { return (*Block)raw; }`), the summary records "return inherits param[0]'s color." At call site, the arg's `source_color` is copied to the result. This makes freelist type-punning work: `opaque_to_block(raw)` where `raw` is ARENA-colored → result is ARENA-colored.
+
+**Alias walker updated:** `NODE_TYPECAST` added to the alias source walker (alongside `NODE_INTRINSIC` and `NODE_ORELSE`). `*opaque raw = (*opaque)b` now copies `b`'s alloc_id AND source_color to `raw`.
+
+**Coverage:**
+- Direct arena wrapper: 100%
+- Chained arena wrapper (any depth up to 8): 100%
+- Freelist type-punning through `*opaque` adapter functions: 100%
+- Pool/malloc leaks: still caught
+- Mixed-source functions (one path arena, one path pool): conservative → tracked
 
 ### Exhaustive Switch on NodeKind (RF14, 2026-04-07)
 

@@ -2950,7 +2950,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Tests:** `arena_global_escape.zer` (global arena ptr to global — rejected).
 
 ### Enhancement: func_returns_arena — arena wrapper functions excluded from handle tracking
-- **Problem:** Wrapper functions like `?*Block arena_alloc_block() { return backing.alloc(Block); }` triggered false "handle never freed" errors because zercheck saw `?*T` return and tracked it as an allocation.
-- **Fix:** Added `func_returns_arena()` helper in zercheck.c. Before registering a wrapper allocator call as tracked, checks if the callee's body returns `arena.alloc()`. If so, skips tracking — arena allocs don't need individual free.
-- **Limitation:** Only works for simple wrappers where ALL return statements come from arena.alloc(). Complex wrappers (freelist with recycling path + arena path) still trigger false positives because the recycling path returns type-punned memory, not directly from arena.
-- **Workaround for complex wrappers:** Use inline arena.alloc() instead of wrapper functions. The inline pattern is correctly tracked.
+- **Problem:** Wrapper functions returning `?*T` from arena triggered false "handle never freed" errors. Chained wrappers (app → driver → hal → arena.alloc) and freelist type-punning through `*opaque` adapter functions also affected.
+- **Fix:** Three-layer allocation coloring system:
+  1. `source_color` on HandleInfo — set at alloc, propagated through all aliases
+  2. `func_returns_color_by_name()` — recursive transitive color resolution through call chains, cached on Symbol
+  3. Param color inference (`returns_param_color`) — when function returns cast of param, caller's arg color flows to result. Covers `*opaque → *T` adapter functions.
+- **Coverage:** Direct arena wrapper (100%), chained wrappers up to 8 levels (100%), freelist type-punning through `*opaque` adapters (100%), pool/malloc leaks still caught.
+- **Alias walker updated:** NODE_TYPECAST added to alias source walker for alloc_id + source_color propagation through C-style casts.

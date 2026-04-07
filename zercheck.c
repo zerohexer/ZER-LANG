@@ -536,8 +536,37 @@ static int func_returns_color_by_name(ZerCheck *zc, const char *fname, uint32_t 
             if (cfn) this_color = func_returns_color_by_name(zc, cfn, cfl);
         }
 
+        /* Param color inference: return is cast/direct of a parameter.
+         * Walk through casts to find root ident, check if it's a param. */
+        if (this_color == ZC_COLOR_UNKNOWN) {
+            Node *root = ret_expr;
+            while (root) {
+                if (root->kind == NODE_TYPECAST) root = root->typecast.expr;
+                else if (root->kind == NODE_INTRINSIC && root->intrinsic.arg_count > 0)
+                    root = root->intrinsic.args[root->intrinsic.arg_count - 1];
+                else break;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                Node *fn = sym->func_node;
+                for (int pi = 0; pi < fn->func_decl.param_count; pi++) {
+                    if (fn->func_decl.params[pi].name_len == root->ident.name_len &&
+                        memcmp(fn->func_decl.params[pi].name, root->ident.name,
+                               root->ident.name_len) == 0) {
+                        /* return is cast of param[pi] — mark for color passthrough */
+                        if (sym->returns_param_color == 0)
+                            sym->returns_param_color = pi + 1; /* +1 so 0 = unset */
+                        else if (sym->returns_param_color != pi + 1)
+                            sym->returns_param_color = -1; /* mixed params */
+                        this_color = -2; /* sentinel: "inherits from caller" */
+                        break;
+                    }
+                }
+            }
+        }
+
         /* Merge: first return sets color, mismatch → UNKNOWN */
-        if (result_color == -1) result_color = this_color;
+        if (this_color == -2) { /* param color — don't merge with alloc color */ }
+        else if (result_color == -1) result_color = this_color;
         else if (result_color != this_color) { result_color = ZC_COLOR_UNKNOWN; break; }
     }
 
@@ -547,6 +576,7 @@ static int func_returns_color_by_name(ZerCheck *zc, const char *fname, uint32_t 
     /* Cache result */
     sym->returns_color_cached = true;
     sym->returns_color_value = result_color;
+    /* returns_param_color already set during scan (0 = unset, -1 = mixed, 1+ = param index + 1) */
     return result_color;
 }
 
@@ -660,6 +690,35 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
     if (!is_arena_alloc && alloc_call && alloc_call->kind == NODE_CALL) {
         callee_color = func_returns_color(zc, alloc_call);
         if (callee_color == ZC_COLOR_ARENA) is_arena_alloc = true;
+
+        /* Param color inference: if callee returns cast of param[N],
+         * inherit the arg's color at the call site. */
+        if (callee_color == ZC_COLOR_UNKNOWN) {
+            Node *cc = alloc_call->call.callee;
+            const char *cfn = NULL; uint32_t cfl = 0;
+            if (cc && cc->kind == NODE_IDENT) { cfn = cc->ident.name; cfl = (uint32_t)cc->ident.name_len; }
+            else if (cc && cc->kind == NODE_FIELD) { cfn = cc->field.field_name; cfl = (uint32_t)cc->field.field_name_len; }
+            if (cfn) {
+                Symbol *callee_sym = scope_lookup(zc->checker->global_scope, cfn, cfl);
+                if (callee_sym && callee_sym->returns_color_cached &&
+                    callee_sym->returns_param_color > 0) {
+                    int param_idx = callee_sym->returns_param_color - 1;
+                    if (param_idx < alloc_call->call.arg_count) {
+                        /* Find the arg's color from handle tracking */
+                        char akey[128];
+                        int aklen = handle_key_from_expr(alloc_call->call.args[param_idx],
+                            akey, sizeof(akey));
+                        if (aklen > 0) {
+                            HandleInfo *arg_h = find_handle(ps, akey, (uint32_t)aklen);
+                            if (arg_h) {
+                                callee_color = arg_h->source_color;
+                                if (callee_color == ZC_COLOR_ARENA) is_arena_alloc = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     if (alloc_call && alloc_call->kind == NODE_CALL &&
         !find_handle(ps, vname, vlen) && !is_arena_alloc) {
@@ -732,18 +791,16 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
      * makes r an alias of handle. Freeing r = freeing handle. */
     {
         Node *alias_src = init;
-        /* Walk through @ptrcast/@bitcast to find the actual source */
-        while (alias_src && alias_src->kind == NODE_INTRINSIC &&
-               alias_src->intrinsic.arg_count > 0) {
-            /* @ptrcast(*T, expr) — source is the last arg */
-            alias_src = alias_src->intrinsic.args[alias_src->intrinsic.arg_count - 1];
+        /* Walk through @ptrcast/@bitcast/NODE_TYPECAST to find the actual source */
+        while (alias_src) {
+            if (alias_src->kind == NODE_INTRINSIC && alias_src->intrinsic.arg_count > 0)
+                alias_src = alias_src->intrinsic.args[alias_src->intrinsic.arg_count - 1];
+            else if (alias_src->kind == NODE_TYPECAST)
+                alias_src = alias_src->typecast.expr;
+            else if (alias_src->kind == NODE_ORELSE)
+                alias_src = alias_src->orelse.expr;
+            else break;
         }
-        /* Also walk through orelse */
-        if (alias_src && alias_src->kind == NODE_ORELSE)
-            alias_src = alias_src->orelse.expr;
-        if (alias_src && alias_src->kind == NODE_INTRINSIC &&
-            alias_src->intrinsic.arg_count > 0)
-            alias_src = alias_src->intrinsic.args[alias_src->intrinsic.arg_count - 1];
 
         char src_key[128];
         int sklen = handle_key_from_expr(alias_src, src_key, sizeof(src_key));

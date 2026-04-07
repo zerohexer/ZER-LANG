@@ -1,0 +1,33 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-11.rs
+// Safety scenario: child creates a new channel and sends the sender back to parent.
+// In Rust this tests channel-of-channels (sending channel endpoints across threads).
+// In ZER, channels can't be sent across threads. Equivalent scenario:
+// child signals "ready" via shared struct, parent waits and reads child's data.
+// This preserves the core safety property: parent blocks until child is set up.
+
+shared struct Signal {
+    u32 ready;
+    u32 data;
+}
+
+Signal gsig;
+
+void child(*Signal s) {
+    s.data = 42;
+    s.ready = 1;
+    @cond_signal(s);
+}
+
+u32 main() {
+    gsig.ready = 0;
+    gsig.data = 0;
+
+    ThreadHandle th = spawn child(&gsig);
+
+    @cond_wait(gsig, gsig.ready > 0);
+    th.join();
+
+    u32 v = gsig.data;
+    if (v != 42) { return 1; }
+    return 0;
+}

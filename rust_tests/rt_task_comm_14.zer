@@ -1,0 +1,47 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-14.rs
+// Safety scenario: 10 threads each send their own ID back to main.
+// Verifies that each thread can identify itself and communicate that identity.
+// In Rust: 10 threads each send i back through channel. Main receives 10 values.
+// Sum of 0..9 = 45. ZER: shared struct with sum. Each thread adds its ID.
+// Verifies all 10 threads ran and contributed their unique value.
+
+shared struct Sum {
+    u32 value;
+}
+
+Sum gsum;
+
+void thread_work(*Sum s, u32 id) {
+    s.value += id;
+}
+
+u32 main() {
+    gsum.value = 0;
+
+    ThreadHandle t0 = spawn thread_work(&gsum, 0);
+    ThreadHandle t1 = spawn thread_work(&gsum, 1);
+    ThreadHandle t2 = spawn thread_work(&gsum, 2);
+    ThreadHandle t3 = spawn thread_work(&gsum, 3);
+    ThreadHandle t4 = spawn thread_work(&gsum, 4);
+    ThreadHandle t5 = spawn thread_work(&gsum, 5);
+    ThreadHandle t6 = spawn thread_work(&gsum, 6);
+    ThreadHandle t7 = spawn thread_work(&gsum, 7);
+    ThreadHandle t8 = spawn thread_work(&gsum, 8);
+    ThreadHandle t9 = spawn thread_work(&gsum, 9);
+
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    t5.join();
+    t6.join();
+    t7.join();
+    t8.join();
+    t9.join();
+
+    // 0+1+2+...+9 = 45
+    u32 v = gsum.value;
+    if (v != 45) { return 1; }
+    return 0;
+}

@@ -1,0 +1,25 @@
+// Rust source: tests/ui/threads-sendsync/spawn.rs
+// Safety scenario: simple thread::spawn + join. Thread runs a function,
+// parent joins and continues. Fundamental concurrency correctness test.
+// ZER: ThreadHandle + join. Verifies thread ran by checking shared state.
+
+shared struct Flag {
+    u32 done;
+}
+
+Flag gflag;
+
+void thread_fn(*Flag f) {
+    f.done = 1;
+}
+
+u32 main() {
+    gflag.done = 0;
+
+    ThreadHandle th = spawn thread_fn(&gflag);
+    th.join();
+
+    u32 v = gflag.done;
+    if (v != 1) { return 1; }
+    return 0;
+}

@@ -1,0 +1,39 @@
+// Rust source: tests/ui/threads-sendsync/clone-with-exterior.rs
+// Safety scenario: clone data before sending to thread, keep original.
+// Rust: Arc::clone() — both thread and parent get independent ownership.
+// ZER: value parameters are automatically copied on spawn — no clone needed.
+// Parent keeps original value, thread gets independent copy.
+// Safety property: thread mutation of its copy does not affect parent's value.
+
+shared struct Box {
+    u32 value;
+}
+
+Box goriginal;
+Box gthread_copy;
+
+void worker(*Box b, u32 original_val) {
+    // Thread modifies its shared slot — original is separate
+    b.value = original_val * 2;
+}
+
+u32 main() {
+    goriginal.value = 21;
+    gthread_copy.value = 0;
+
+    // Pass value (copy) to thread, keep original
+    u32 original = goriginal.value;
+    ThreadHandle th = spawn worker(&gthread_copy, original);
+
+    th.join();
+
+    // Original is unchanged
+    u32 orig_v = goriginal.value;
+    if (orig_v != 21) { return 1; }
+
+    // Thread's copy was doubled
+    u32 copy_v = gthread_copy.value;
+    if (copy_v != 42) { return 2; }
+
+    return 0;
+}

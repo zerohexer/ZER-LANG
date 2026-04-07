@@ -1,0 +1,32 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-12.rs
+// Safety scenario: spawn thread, busy-wait until thread appears to have run,
+// then join an already-finished thread. Verifies join is safe on completed thread.
+// ZER: ThreadHandle th = spawn start(); th.join() — join always safe regardless
+// of whether thread is still running or already done.
+
+u32 gdone;
+
+void start() {
+    @atomic_store(&gdone, 1);
+}
+
+u32 main() {
+    gdone = 0;
+
+    ThreadHandle th = spawn start();
+
+    // Busy-wait to let thread run (simulates the Rust busy-loop)
+    u32 spin = 0;
+    while (spin < 1000000) {
+        u32 v = @atomic_load(&gdone);
+        if (v != 0) { spin = 1000001; }
+        spin += 1;
+    }
+
+    // Join already-finished (or finishing) thread — must not deadlock or crash
+    th.join();
+
+    u32 v = @atomic_load(&gdone);
+    if (v != 1) { return 1; }
+    return 0;
+}

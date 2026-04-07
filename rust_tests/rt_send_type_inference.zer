@@ -1,0 +1,23 @@
+// Rust source: tests/ui/threads-sendsync/send-type-inference.rs
+// Safety scenario: type inference with Send — compiler infers type of channel value.
+// Rust: let (tx, rx) = channel(); tx.send(1u32); — type inferred as u32.
+// ZER: Ring with explicit type (no inference needed — ZER is explicitly typed).
+// Safety property: the type is correct and consistent between push and pop ends.
+// This verifies the type system correctly handles the value at both ends.
+
+Ring(u32, 8) chan;
+
+u32 main() {
+    // Type explicitly declared as u32 — no inference ambiguity possible
+    u32 sent = 42;
+    chan.push(sent);
+
+    ?u32 received = chan.pop();
+    if (received) |v| {
+        if (v != sent) { return 1; }
+    } else {
+        return 2;
+    }
+
+    return 0;
+}

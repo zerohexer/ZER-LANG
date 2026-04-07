@@ -1,0 +1,40 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-7.rs
+// Safety scenario: 4 threads each send 10 messages with different value ranges.
+// Messages interleave arbitrarily. Verifies correct accumulation despite ordering.
+// Thread 0: sends 0..9 (sum=45), Thread 1: sends 10..19 (sum=145),
+// Thread 2: sends 20..29 (sum=245), Thread 3: sends 30..39 (sum=345)
+// Total expected sum = 45+145+245+345 = 780
+// ZER: shared struct accumulator. Each thread adds its own offset range.
+
+shared struct Totals {
+    u32 sum;
+}
+
+Totals gtotals;
+
+void sender(u32 base) {
+    u32 i = 0;
+    while (i < 10) {
+        gtotals.sum += base + i;
+        i += 1;
+    }
+}
+
+u32 main() {
+    gtotals.sum = 0;
+
+    ThreadHandle t0 = spawn sender(0);
+    ThreadHandle t1 = spawn sender(10);
+    ThreadHandle t2 = spawn sender(20);
+    ThreadHandle t3 = spawn sender(30);
+
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // 0..9=45, 10..19=145, 20..29=245, 30..39=345 => total=780
+    u32 v = gtotals.sum;
+    if (v != 780) { return 1; }
+    return 0;
+}

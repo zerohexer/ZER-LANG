@@ -1,0 +1,49 @@
+// Rust source: tests/ui/threads-sendsync/issue-8827.rs
+// Safety scenario: FizzBuzz with 3 channel-producing threads (fizz, buzz, fizzbuzz).
+// Three producer threads signal divisibility. Consumer combines them for FizzBuzz logic.
+// ZER: No thread producers needed — FizzBuzz is deterministic. We run 15 iterations
+// in main, checking modulo 3 and 5. This preserves the "15 iteration" safety boundary
+// and verifies the FizzBuzz classification produces exactly the right pattern.
+// Pattern over 1..15: fizzbuzz(15), fizz(3,6,9,12), buzz(5,10), plain(1,2,4,7,8,11,13,14)
+
+u32 is_fizz(u32 n) {
+    u32 m = n % 3;
+    if (m == 0) { return 1; }
+    return 0;
+}
+
+u32 is_buzz(u32 n) {
+    u32 m = n % 5;
+    if (m == 0) { return 1; }
+    return 0;
+}
+
+u32 main() {
+    u32 fizz_count = 0;
+    u32 buzz_count = 0;
+    u32 fizzbuzz_count = 0;
+    u32 plain_count = 0;
+
+    u32 i = 1;
+    while (i <= 15) {
+        u32 f = is_fizz(i);
+        u32 b = is_buzz(i);
+        if (f != 0 && b != 0) {
+            fizzbuzz_count += 1;
+        } else if (f != 0) {
+            fizz_count += 1;
+        } else if (b != 0) {
+            buzz_count += 1;
+        } else {
+            plain_count += 1;
+        }
+        i += 1;
+    }
+
+    // Over 1..15: fizzbuzz=1 (15), fizz=4 (3,6,9,12), buzz=2 (5,10), plain=8
+    if (fizzbuzz_count != 1) { return 1; }
+    if (fizz_count != 4) { return 2; }
+    if (buzz_count != 2) { return 3; }
+    if (plain_count != 8) { return 4; }
+    return 0;
+}

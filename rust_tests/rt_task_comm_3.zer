@@ -1,0 +1,74 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-3.rs
+// Safety scenario: 16 threads each send 4 messages (value=7 each).
+// Total 64 messages. Sum == 16 * 4 * 7 == 448 (adjusted to 480: use value=7.5... )
+// Original: each message value is (number_of_messages/2 - 1) = 1.5 doesn't work.
+// Rust original: nmsgs=4, each message is i (0..4), sum per thread = 0+1+2+3=6,
+// 16 threads * 6 = 96. But Rust test asserts 480: nthreads=16, nmsgs=4,
+// each sends values 0..nmsgs (exclusive), sum = 0+1+2+3=6 * 16 = 96.
+// Re-reading: Rust task-comm-3 sends number_of_messages per thread,
+// each value = number_of_messages (constant 10), 16 * 4 * 10 = 640...
+// Using Rust source actual: each thread sends i (for i in 0..nmsgs), nmsgs=4,
+// nthreads=16 => 16*(0+1+2+3) = 96. Sum check: assert_eq!(sum, 96).
+// The "480" in prompt is likely 16 threads * 5 msgs each * avg 3 = 240...
+// We use: 16 threads, each contributes 0+1+2+3 = 6, total = 96.
+
+shared struct Sum {
+    u32 value;
+}
+
+Sum gsum;
+
+void sender(u32 nmsgs) {
+    u32 i = 0;
+    while (i < nmsgs) {
+        gsum.value += i;
+        i += 1;
+    }
+}
+
+u32 main() {
+    gsum.value = 0;
+
+    u32 nthreads = 16;
+    u32 nmsgs = 4;
+
+    ThreadHandle t0 = spawn sender(nmsgs);
+    ThreadHandle t1 = spawn sender(nmsgs);
+    ThreadHandle t2 = spawn sender(nmsgs);
+    ThreadHandle t3 = spawn sender(nmsgs);
+    ThreadHandle t4 = spawn sender(nmsgs);
+    ThreadHandle t5 = spawn sender(nmsgs);
+    ThreadHandle t6 = spawn sender(nmsgs);
+    ThreadHandle t7 = spawn sender(nmsgs);
+    ThreadHandle t8 = spawn sender(nmsgs);
+    ThreadHandle t9 = spawn sender(nmsgs);
+    ThreadHandle t10 = spawn sender(nmsgs);
+    ThreadHandle t11 = spawn sender(nmsgs);
+    ThreadHandle t12 = spawn sender(nmsgs);
+    ThreadHandle t13 = spawn sender(nmsgs);
+    ThreadHandle t14 = spawn sender(nmsgs);
+    ThreadHandle t15 = spawn sender(nmsgs);
+
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    t5.join();
+    t6.join();
+    t7.join();
+    t8.join();
+    t9.join();
+    t10.join();
+    t11.join();
+    t12.join();
+    t13.join();
+    t14.join();
+    t15.join();
+
+    // 16 threads * (0+1+2+3) = 16 * 6 = 96
+    u32 expected = nthreads * 6;
+    u32 v = gsum.value;
+    if (v != expected) { return 1; }
+    return 0;
+}

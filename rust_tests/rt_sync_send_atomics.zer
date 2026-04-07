@@ -1,0 +1,32 @@
+// Rust source: tests/ui/threads-sendsync/sync-send-atomics.rs
+// Safety scenario: verify atomic types are Send+Sync — can cross thread boundaries.
+// Rust: compile-time check that AtomicUsize implements Send+Sync traits.
+// ZER: @atomic_* operations work from any thread — no annotation needed.
+// This test PROVES atomics cross thread boundaries by using them from spawned threads
+// and verifying the result. If atomics weren't thread-safe, result would be wrong.
+
+u32 gatomic_val;
+
+void adder(u32 amount) {
+    @atomic_add(&gatomic_val, amount);
+}
+
+void subber(u32 amount) {
+    @atomic_sub(&gatomic_val, amount);
+}
+
+u32 main() {
+    gatomic_val = 100;
+
+    // Both operations cross thread boundaries — proves atomic is Send+Sync
+    ThreadHandle t1 = spawn adder(50);
+    ThreadHandle t2 = spawn subber(30);
+
+    t1.join();
+    t2.join();
+
+    u32 v = @atomic_load(&gatomic_val);
+    // 100 + 50 - 30 = 120
+    if (v != 120) { return 1; }
+    return 0;
+}

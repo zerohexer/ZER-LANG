@@ -1,0 +1,30 @@
+// Rust source: tests/ui/threads-sendsync/threads.rs
+// Safety scenario: basic threading correctness test.
+// Spawn multiple threads, join all, verify combined effect.
+// ZER: multiple threads each increment a shared counter. Final value confirms all ran.
+
+shared struct Counter {
+    u32 value;
+}
+
+Counter gctr;
+
+void increment(*Counter c) {
+    c.value += 1;
+}
+
+u32 main() {
+    gctr.value = 0;
+
+    ThreadHandle t1 = spawn increment(&gctr);
+    ThreadHandle t2 = spawn increment(&gctr);
+    ThreadHandle t3 = spawn increment(&gctr);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 v = gctr.value;
+    if (v != 3) { return 1; }
+    return 0;
+}

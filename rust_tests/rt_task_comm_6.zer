@@ -1,0 +1,37 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-6.rs
+// Safety scenario: 4 senders each send 0..999 (1000 messages each, 4000 total).
+// Verifies multiple producers can safely write to shared state concurrently.
+// Each sender contributes sum(0..999) = 499500. Total = 4 * 499500 = 1998000.
+// ZER: shared struct sum. 4 threads each add 0..999 atomically to shared sum.
+
+shared struct Accumulator {
+    u32 total;
+}
+
+Accumulator gacc;
+
+void sender() {
+    u32 i = 0;
+    while (i < 1000) {
+        gacc.total += i;
+        i += 1;
+    }
+}
+
+u32 main() {
+    gacc.total = 0;
+
+    ThreadHandle t0 = spawn sender();
+    ThreadHandle t1 = spawn sender();
+    ThreadHandle t2 = spawn sender();
+    ThreadHandle t3 = spawn sender();
+
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 v = gacc.total;
+    if (v != 1998000) { return 1; }
+    return 0;
+}

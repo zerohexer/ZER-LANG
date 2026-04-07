@@ -1,0 +1,22 @@
+// Rust source: tests/ui/threads-sendsync/trivial-message.rs
+// Safety scenario: send a single trivial value (unit type '()') through channel.
+// Rust: tx.send(()); rx.recv().unwrap() — the simplest possible channel use.
+// ZER: Ring(u32, 4). Push 1 as sentinel (unit has no value, use 1 as signal).
+// Pop and verify. Proves channel round-trip works for the minimal case.
+
+Ring(u32, 4) chan;
+
+u32 main() {
+    // Send trivial message (unit type () in Rust = sentinel 1 in ZER)
+    chan.push(1);
+
+    ?u32 msg = chan.pop();
+    if (msg) |v| {
+        // Received the trivial message — verify sentinel
+        if (v != 1) { return 1; }
+    } else {
+        return 2;
+    }
+
+    return 0;
+}

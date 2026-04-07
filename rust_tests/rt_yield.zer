@@ -1,0 +1,35 @@
+// Rust source: tests/ui/threads-sendsync/yield.rs
+// Safety scenario: thread yields execution to scheduler, then continues.
+// Rust: thread::yield_now() — hint to scheduler to context-switch.
+// ZER: OS thread yield not available. Equivalent using async coroutine:
+// async function that yields once, then completes.
+// Safety property: state is preserved across yield point (async state machine).
+
+u32 gresult;
+u32 gdone;
+
+async void yielder() {
+    gresult = 1;
+    yield;
+    gresult = 2;
+    gdone = 1;
+}
+
+u32 main() {
+    gresult = 0;
+    gdone = 0;
+
+    _zer_async_yielder task;
+    _zer_async_yielder_init(&task);
+
+    // First poll: runs until yield
+    _zer_async_yielder_poll(&task);
+    if (gresult != 1) { return 1; }
+
+    // Second poll: runs from yield to completion
+    _zer_async_yielder_poll(&task);
+    if (gresult != 2) { return 2; }
+    if (gdone != 1) { return 3; }
+
+    return 0;
+}

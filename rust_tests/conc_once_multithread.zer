@@ -1,0 +1,22 @@
+// Rust: std::sync::Once — initialize exactly once from any thread
+// ZER: @once { } — atomic CAS ensures single execution
+
+u32 init_value;
+
+void worker(u32 id) {
+    @once {
+        init_value = 42;
+    }
+}
+
+u32 main() {
+    init_value = 0;
+    ThreadHandle t1 = spawn worker(1);
+    ThreadHandle t2 = spawn worker(2);
+    ThreadHandle t3 = spawn worker(3);
+    t1.join();
+    t2.join();
+    t3.join();
+    if (init_value != 42) { return 1; }
+    return 0;
+}

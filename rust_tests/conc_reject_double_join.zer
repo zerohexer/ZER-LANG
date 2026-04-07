@@ -1,0 +1,15 @@
+// Rust: JoinHandle consumed on join — can't join twice
+// ZER: ThreadHandle joined twice — zercheck double-free equivalent
+// EXPECTED: compile error
+
+shared struct State { u32 x; }
+State g;
+void worker(*State s) { s.x = 1; }
+
+u32 main() {
+    g.x = 0;
+    ThreadHandle th = spawn worker(&g);
+    th.join();
+    th.join();  // ERROR: already joined
+    return 0;
+}

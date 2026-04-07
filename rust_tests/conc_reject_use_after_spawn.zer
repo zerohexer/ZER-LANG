@@ -1,0 +1,14 @@
+// Rust: use after move into thread — borrow checker rejects
+// ZER: non-shared pointer to fire-and-forget spawn → compile error
+// EXPECTED: compile error (checker rejects non-shared *T to spawn)
+
+struct Data { u32 x; }
+
+void worker(*Data d) { d.x = 42; }
+
+u32 main() {
+    Data d;
+    d.x = 0;
+    spawn worker(&d);
+    return 0;
+}

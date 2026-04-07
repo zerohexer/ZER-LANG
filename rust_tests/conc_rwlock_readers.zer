@@ -1,0 +1,37 @@
+// Rust: RwLock — multiple concurrent readers, exclusive writer
+// ZER: shared(rw) struct — auto rdlock for reads, wrlock for writes
+
+shared(rw) struct Config {
+    u32 port;
+    u32 timeout;
+    u32 retries;
+}
+
+Config cfg;
+
+void reader(*Config c) {
+    // Read-only access → rdlock (multiple readers OK)
+    u32 p = c.port;
+    u32 t = c.timeout;
+    u32 r = c.retries;
+}
+
+u32 main() {
+    // Write access → wrlock (exclusive)
+    cfg.port = 8080;
+    cfg.timeout = 30;
+    cfg.retries = 3;
+
+    // Spawn multiple readers — all get rdlock concurrently
+    ThreadHandle t1 = spawn reader(&cfg);
+    ThreadHandle t2 = spawn reader(&cfg);
+    ThreadHandle t3 = spawn reader(&cfg);
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // Verify data intact
+    u32 p = cfg.port;
+    if (p != 8080) { return 1; }
+    return 0;
+}

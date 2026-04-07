@@ -1,0 +1,27 @@
+// Rust: thread_local! — each thread has its own copy
+// ZER: threadlocal — __thread storage class
+
+threadlocal u32 tls_counter;
+
+shared struct Result { u32 sum; }
+Result g;
+
+void worker(*Result r, u32 id) {
+    tls_counter = id * 10;
+    // Each thread sees its own tls_counter
+    r.sum += tls_counter;
+}
+
+u32 main() {
+    g.sum = 0;
+    ThreadHandle t1 = spawn worker(&g, 1);
+    ThreadHandle t2 = spawn worker(&g, 2);
+    ThreadHandle t3 = spawn worker(&g, 3);
+    t1.join();
+    t2.join();
+    t3.join();
+    // 10 + 20 + 30 = 60
+    u32 s = g.sum;
+    if (s != 60) { return 1; }
+    return 0;
+}

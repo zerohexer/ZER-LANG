@@ -335,6 +335,7 @@ struct Node {
             Node *init;             /* initializer, or NULL */
             bool is_const;
             bool is_static;         /* static storage duration */
+            bool is_threadlocal;    /* thread-local storage — __thread */
             bool is_volatile;
             const char *section;    /* section(".rodata") or NULL */
             size_t section_len;

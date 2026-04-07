@@ -2035,6 +2035,14 @@ static Node *parse_declaration(Parser *p) {
         return parse_func_or_var(p, true);
     }
 
+    /* threadlocal — per-thread storage */
+    if (match(p, TOK_THREADLOCAL)) {
+        Node *n = parse_func_or_var(p, false);
+        if (n->kind == NODE_GLOBAL_VAR || n->kind == NODE_VAR_DECL)
+            n->var_decl.is_threadlocal = true;
+        return n;
+    }
+
     /* const global variable or function with const return type */
     if (check(p, TOK_CONST)) {
         /* peek ahead: const TYPE NAME '(' → function with const return type */

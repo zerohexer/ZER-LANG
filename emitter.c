@@ -3874,6 +3874,10 @@ static void emit_func_decl(Emitter *e, Node *node) {
 
 static void emit_global_var(Emitter *e, Node *node) {
     Type *type = checker_get_type(e->checker,node);
+    /* threadlocal */
+    if (node->var_decl.is_threadlocal) {
+        emit(e, "__thread ");
+    }
     /* section attribute */
     if (node->var_decl.section) {
         emit(e, "__attribute__((section(\"%.*s\"))) ",

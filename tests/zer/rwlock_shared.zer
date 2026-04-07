@@ -1,0 +1,36 @@
+// shared(rw) struct: reader-writer lock
+// Multiple readers or one writer, auto-detected by compiler
+
+shared(rw) struct Config {
+    u32 threshold;
+    u32 max_retries;
+    u32 version;
+}
+
+Config cfg;
+
+void reader(*Config c) {
+    // Read-only access → rdlock (multiple readers allowed)
+    u32 t = c.threshold;
+    u32 m = c.max_retries;
+    u32 v = c.version;
+}
+
+u32 main() {
+    // Write access → wrlock (exclusive)
+    cfg.threshold = 100;
+    cfg.max_retries = 3;
+    cfg.version = 1;
+
+    // Read access → rdlock
+    u32 t = cfg.threshold;
+    u32 m = cfg.max_retries;
+
+    // Spawn reader thread (gets rdlock)
+    ThreadHandle th = spawn reader(&cfg);
+    th.join();
+
+    if (t != 100) { return 1; }
+    if (m != 3) { return 2; }
+    return 0;
+}

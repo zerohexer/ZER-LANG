@@ -1928,9 +1928,23 @@ static Node *parse_declaration(Parser *p) {
         return parse_struct_decl(p, true);
     }
     if (match(p, TOK_SHARED)) {
+        /* shared struct or shared(rw) struct */
+        bool is_rw = false;
+        if (match(p, TOK_LPAREN)) {
+            /* expect "rw" identifier */
+            if (check(p, TOK_IDENT) && p->current.length == 2 &&
+                memcmp(p->current.start, "rw", 2) == 0) {
+                advance(p);
+                is_rw = true;
+            } else {
+                error(p, "expected 'rw' in shared(rw)");
+            }
+            consume(p, TOK_RPAREN, "expected ')' after shared(rw");
+        }
         consume(p, TOK_STRUCT, "expected 'struct' after 'shared'");
         Node *n = parse_struct_decl(p, false);
         n->struct_decl.is_shared = true;
+        n->struct_decl.is_shared_rw = is_rw;
         return n;
     }
     if (match(p, TOK_STRUCT)) {

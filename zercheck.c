@@ -596,6 +596,44 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         }
     }
 
+    /* Interior pointer aliasing: *u32 p = &b.field — p is derived from b.
+     * If b is tracked (alloc_ptr), p gets same alloc_id. When b is freed,
+     * p is also FREED. Catches UAF via field-derived interior pointers. */
+    {
+        Node *addr_src = init;
+        if (addr_src && addr_src->kind == NODE_UNARY &&
+            addr_src->unary.op == TOK_AMP && addr_src->unary.operand) {
+            Node *operand = addr_src->unary.operand;
+            /* Walk to the root ident through field/index chains */
+            Node *root = operand;
+            while (root) {
+                if (root->kind == NODE_FIELD) root = root->field.object;
+                else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+                    root = root->unary.operand;
+                else break;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                char rkey[128];
+                int rklen = handle_key_from_expr(root, rkey, sizeof(rkey));
+                if (rklen > 0) {
+                    HandleInfo *src = find_handle(ps, rkey, (uint32_t)rklen);
+                    if (src) {
+                        HandleInfo *dst = find_handle(ps, vname, vlen);
+                        if (!dst) dst = add_handle(ps, vname, vlen);
+                        if (dst) {
+                            dst->state = src->state;
+                            dst->pool_id = src->pool_id;
+                            dst->alloc_line = src->alloc_line;
+                            dst->free_line = src->free_line;
+                            dst->alloc_id = src->alloc_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /* Handle aliasing: Handle(T) alias = existing_handle;
      * BUG-357: also match NODE_INDEX and NODE_FIELD on init side.
      * Also: @ptrcast alias — *RealData r = @ptrcast(*RealData, handle)
@@ -834,6 +872,42 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         }
                     }
                 }
+                /* Interior pointer aliasing via assignment: p = &b.field
+                 * If b is tracked, p gets same alloc_id. */
+                if (val && val->kind == NODE_UNARY &&
+                    val->unary.op == TOK_AMP && val->unary.operand) {
+                    Node *operand = val->unary.operand;
+                    Node *root = operand;
+                    while (root) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                        else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+                            root = root->unary.operand;
+                        else break;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        char rkey[128];
+                        int rklen = handle_key_from_expr(root, rkey, sizeof(rkey));
+                        if (rklen > 0) {
+                            HandleInfo *src = find_handle(ps, rkey, (uint32_t)rklen);
+                            if (src) {
+                                char *akey = (char *)arena_alloc(zc->arena, tklen + 1);
+                                if (akey) {
+                                    memcpy(akey, tkey, tklen + 1);
+                                    HandleInfo *dst = find_handle(ps, akey, (uint32_t)tklen);
+                                    if (!dst) dst = add_handle(ps, akey, (uint32_t)tklen);
+                                    if (dst) {
+                                        dst->state = src->state;
+                                        dst->pool_id = src->pool_id;
+                                        dst->alloc_line = src->alloc_line;
+                                        dst->free_line = src->free_line;
+                                        dst->alloc_id = src->alloc_id;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 /* Handle aliasing via assignment: alias = tracked_handle
                  * BUG-357: supports arr[0] = h, s.h = other_h, etc. */
                 {
@@ -971,6 +1045,30 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             zc_check_expr(zc, ps, node->intrinsic.args[i]);
         break;
     }
+    case NODE_INDEX:
+        /* Check if object being indexed is a freed pointer — p[0] after free.
+         * Catches interior pointer UAF: *u32 p = &b.field; free(b); p[0]. */
+        {
+            Node *obj = node->index_expr.object;
+            char ikey[128];
+            int iklen = handle_key_from_expr(obj, ikey, sizeof(ikey));
+            if (iklen > 0) {
+                HandleInfo *h = find_handle(ps, ikey, (uint32_t)iklen);
+                if (h && h->state == HS_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "use-after-free: '%.*s' freed at line %d",
+                        iklen, ikey, h->free_line);
+                } else if (h && h->state == HS_MAYBE_FREED) {
+                    zc_error(zc, node->loc.line,
+                        "use-after-free: '%.*s' may have been freed at line %d",
+                        iklen, ikey, h->free_line);
+                }
+            }
+        }
+        zc_check_expr(zc, ps, node->index_expr.object);
+        if (node->index_expr.index)
+            zc_check_expr(zc, ps, node->index_expr.index);
+        break;
     case NODE_UNARY:
         /* Level 1: check deref on freed *opaque — *ptr after free */
         if (node->unary.op == TOK_STAR) {

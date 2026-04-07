@@ -2570,3 +2570,23 @@ Central function for detecting local pointer escape through function calls. Chec
 8. Struct field from call — NODE_FIELD chain walking to NODE_CALL root, recurse
 9. Field of local-derived — NODE_FIELD chain to NODE_IDENT root, check `is_local_derived`
 If adding a new expression type that can carry a local pointer, ADD A CASE HERE. This is the most-patched function in the checker (9 cases added across audit rounds 5-11).
+
+### Interior Pointer UAF Tracking (zercheck.c, 2026-04-07)
+
+**Problem:** `*u32 p = &b.field; free_ptr(b); p[0]` — field-derived pointer used after parent allocation freed. zercheck tracked `b` as FREED but didn't know `p` was derived from `b`.
+
+**Fix — two changes:**
+
+1. **Interior pointer alias tracking in `zc_check_var_init` and NODE_ASSIGN:**
+   When init/value is `NODE_UNARY(TOK_AMP)`, walk the operand through field/index/deref chains to the root ident. If root is a tracked handle, assign the same `alloc_id` to the new variable. Uses the same alloc_id mechanism as handle aliasing (`h2 = h1`).
+
+2. **NODE_INDEX UAF check in `zc_check_expr`:**
+   Added `case NODE_INDEX:` — checks if the indexed object (`p` in `p[0]`) is a freed handle. Same pattern as existing NODE_FIELD and NODE_UNARY/TOK_STAR UAF checks. Also recurses into object and index sub-expressions.
+
+**Why NODE_INDEX was missing:** zercheck had UAF checks on NODE_FIELD (`b.x`), NODE_UNARY/deref (`*p`), and NODE_CALL args (`func(p)`), but pointer indexing (`p[0]`) fell through to the default case which doesn't check handle state.
+
+**Design note:** Holding a dangling pointer is not itself UB — only dereferencing it is. So NODE_IDENT doesn't need a UAF check. The three dereference paths (field, deref, index) plus the call-arg path cover all actual memory access.
+
+**Tests:** `interior_ptr_safe.zer` (field ptr used before free — compiles), `interior_ptr_uaf.zer` (field ptr used after free — rejected), `interior_ptr_func.zer` (field ptr passed to function after free — rejected).
+
+**Remaining gap:** `@ptrtoint` + integer math + `@inttoptr` creates a pointer with no link to the original allocation. This is guarded by the `mmio` declaration requirement — `@inttoptr` without mmio ranges is a compile error. The `mmio` requirement is the defense, not pointer tracking.

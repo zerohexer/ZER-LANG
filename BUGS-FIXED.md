@@ -2872,3 +2872,12 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Recursive defer scan:** Finds defers inside loops, if-bodies, blocks — not just top-level. `defer_scan_all_frees()` walks ALL statements (BUG-443 fix for first-match-only).
 - **if-unwrap propagation:** `if (mh) |t| { free(t); }` — freed alloc_id from then_state propagated to mark `mh` as covered in main state.
 - **Tests:** `super_defer_complex.zer` (10 patterns), `defer_deep.zer` + `defer_deep_user.zer` (cross-module 3-layer).
+
+### BUG-444: Interior pointer UAF not caught — `&b.field` after `free_ptr(b)`
+- **Symptom:** `*u32 p = &b.c; heap.free_ptr(b); u32 val = p[0];` — compiles without error. `p` is a dangling interior pointer to freed memory.
+- **Root cause (1):** zercheck's `zc_check_var_init` and NODE_ASSIGN alias tracking didn't recognize `NODE_UNARY(TOK_AMP)` on a field expression as deriving from a tracked allocation. `p` was untracked, so freeing `b` didn't affect `p`.
+- **Root cause (2):** zercheck's `zc_check_expr` had no `case NODE_INDEX:`. Pointer indexing `p[0]` fell through without checking if `p` was freed. NODE_FIELD (`b.x`) and NODE_UNARY/TOK_STAR (`*p`) had UAF checks, but NODE_INDEX was missing.
+- **Fix (1):** Added interior pointer alias tracking: when init/value is `&expr`, walk through field/index/deref chains to root ident, look up in handle table, copy alloc_id to new variable. Same alloc_id mechanism as handle aliasing.
+- **Fix (2):** Added `case NODE_INDEX:` to `zc_check_expr` — checks if indexed object is a freed handle, same pattern as NODE_FIELD UAF check. Also recurses into object and index sub-expressions.
+- **Tests:** `interior_ptr_safe.zer` (field ptr used before free — compiles), `interior_ptr_uaf.zer` (field ptr after free — rejected), `interior_ptr_func.zer` (field ptr passed to function after free — rejected).
+- **Remaining gap:** `@ptrtoint` + math + `@inttoptr` creates pointer with no allocation link. Guarded by `mmio` declaration requirement (not pointer tracking).

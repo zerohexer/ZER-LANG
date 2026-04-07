@@ -1134,6 +1134,7 @@ t.id = 1;             // COMPILE ERROR — zercheck FuncSummary knows destroy fr
 **NOTES**
 - `alloc_ptr()` returns `?*T` (null sentinel). Use `orelse` to unwrap.
 - `free_ptr(*T)` finds the slot by pointer address and frees it. Argument type must match pool/slab element type — `*Motor` to `Task` pool is a compile error.
+- Interior pointers tracked: `*u32 p = &t.id; free_ptr(t); p[0]` → compile error. Field-derived pointers share alloc_id with parent allocation.
 - Can mix Handle and alloc_ptr on the same Slab/Pool.
 - `const Handle(Task)` prevents mutation through auto-deref — `h.id = 42` on const Handle is a compile error.
 - For `*opaque` (C interop), Level 2+3+5 runtime checks (~1ns) cover the remaining cases zercheck can't track.

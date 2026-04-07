@@ -1,0 +1,26 @@
+// Rust equivalent: conditional ownership — one branch takes, other doesn't
+// ZER: if-branch frees handle, else-branch keeps it → MAYBE_FREED
+
+struct Task { u32 priority; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).priority = 5;
+
+    bool high_priority = true;
+    if (high_priority) {
+        // Fast path: process and free immediately
+        u32 p = pool.get(h).priority;
+        pool.free(h);
+        if (p != 5) { return 1; }
+    } else {
+        // Slow path: keep for later
+        pool.get(h).priority += 1;
+        pool.free(h);
+    }
+
+    // h is freed on BOTH branches — this is fine
+    return 0;
+}

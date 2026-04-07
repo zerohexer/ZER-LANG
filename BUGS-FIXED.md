@@ -2977,3 +2977,15 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `shared` and `spawn` added as reserved keywords in lexer. Any use as variable/method name broke.
 - **Fix:** `spawn` made contextual (detected by ident match in parser, not lexer keyword). `shared` kept as keyword but `.shared` accepted as field name in field access parser. Renamed `shared` variable in atomic_ops.zer to `shared_val`.
 - **Lesson:** New keywords can break existing code. Prefer contextual keywords when the syntax is unambiguous at the call site.
+
+### BUG-459: shared struct pointer uses -> not . for lock access
+- **Symptom:** `void worker(*State s) { s.count += 1; }` where State is shared → GCC error "c is a pointer; did you mean to use ->?"
+- **Root cause:** `emit_shared_lock/unlock` emitted `c._zer_lock` for pointer parameters. Should be `c->_zer_lock`.
+- **Fix:** Check `checker_get_type(root)` — if TYPE_POINTER, use `->`, else use `.`. Same fix for both lock and unlock.
+- **Found by:** Rust concurrency test `conc_shared_counter.zer` — first test to pass *shared struct through a function parameter.
+
+### BUG-460: spawn emitter uses UB function pointer cast for multi-arg functions
+- **Symptom:** `spawn worker(42, &shared_state)` — the function expects `(u32, *State)` but `pthread_create` casts it to `void*(*)(void*)`. UB for multi-arg functions on some platforms.
+- **Root cause:** Old emitter used `(void*(*)(void*))func_name` — casts the function directly. Works on x86 by accident but UB per C standard.
+- **Fix:** Proper file-scope wrapper functions. Pre-scan phase assigns unique IDs to all NODE_SPAWN nodes. Wrapper emitted at file scope: `static void *_zer_spawn_wrap_N(void *_raw) { struct args *a = _raw; func(a->a0, a->a1); free(a); return NULL; }`. Forward declarations emitted for target functions.
+- **Lesson:** Never cast function pointers to incompatible types. Always use a wrapper with the correct signature.

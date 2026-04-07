@@ -1,0 +1,27 @@
+// Rust equivalent: ownership transfer chain A → B → C
+// A creates resource, passes to B, B passes to C
+// A cannot use after passing to B
+
+struct Resource { u32 data; }
+Slab(Resource) heap;
+
+void step_c(*Resource r) {
+    r.data += 100;
+    heap.free_ptr(r);
+}
+
+void step_b(*Resource r) {
+    r.data += 10;
+    step_c(r);
+    // r is freed by step_c — use here would be UAF
+}
+
+u32 main() {
+    ?*Resource mr = heap.alloc_ptr();
+    *Resource r = mr orelse return;
+    r.data = 1;
+    step_b(r);
+    // r is freed by step_b → step_c chain
+    // Attempting r.data here would be zercheck error
+    return 0;
+}

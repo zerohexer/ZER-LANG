@@ -1,0 +1,23 @@
+// Rust equivalent: ownership in loop — alloc per iteration, free per iteration
+// Each iteration creates and destroys a resource
+
+struct Item { u32 id; u32 value; }
+Slab(Item) heap;
+
+u32 main() {
+    u32 total = 0;
+
+    for (u32 i = 0; i < 5; i += 1) {
+        ?*Item mi = heap.alloc_ptr();
+        *Item item = mi orelse return;
+        item.id = i;
+        item.value = i * 10;
+        total += item.value;
+        heap.free_ptr(item);
+        // item is freed — next iteration allocates fresh
+    }
+
+    // total = 0 + 10 + 20 + 30 + 40 = 100
+    if (total != 100) { return 1; }
+    return 0;
+}

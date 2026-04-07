@@ -1,0 +1,19 @@
+// Rust: *const T / *mut T are !Send unless wrapped in unsafe impl Send
+// ZER: any non-shared pointer to spawn → error, no escape hatch
+
+struct RawData { u32 x; u32 y; }
+Slab(RawData) heap;
+
+void process_raw(*RawData r) {
+    r.x += 1;
+}
+
+u32 main() {
+    ?*RawData mr = heap.alloc_ptr();
+    *RawData r = mr orelse return;
+    defer heap.free_ptr(r);
+    r.x = 10;
+    // MUST FAIL: alloc_ptr pointer is not shared
+    spawn process_raw(r);
+    return 0;
+}

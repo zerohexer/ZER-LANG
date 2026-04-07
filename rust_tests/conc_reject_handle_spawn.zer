@@ -1,0 +1,19 @@
+// Rust: no equivalent — Rust doesn't have Handle type
+// ZER-specific: Handle(T) cannot cross thread boundary
+// because pool.get(h) is not thread-safe (no lock on pool)
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void worker(Handle(Task) h) {
+    pool.get(h).id = 42;
+}
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    defer pool.free(h);
+    // MUST FAIL: Handle to spawn — pool.get not thread-safe
+    spawn worker(h);
+    return 0;
+}

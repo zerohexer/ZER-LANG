@@ -356,7 +356,12 @@ static void emit_shared_lock(Emitter *e, Node *root) {
     emit_indent(e);
     emit(e, "_zer_lock_acquire(&");
     emit_expr(e, root);
-    emit(e, "._zer_lock);\n");
+    /* Use -> for pointers, . for direct structs */
+    Type *rt = checker_get_type(e->checker, root);
+    if (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER)
+        emit(e, "->_zer_lock);\n");
+    else
+        emit(e, "._zer_lock);\n");
 }
 
 /* Emit lock release for shared struct variable */
@@ -364,7 +369,11 @@ static void emit_shared_unlock(Emitter *e, Node *root) {
     emit_indent(e);
     emit(e, "_zer_lock_release(&");
     emit_expr(e, root);
-    emit(e, "._zer_lock);\n");
+    Type *rt2 = checker_get_type(e->checker, root);
+    if (rt2 && type_unwrap_distinct(rt2)->kind == TYPE_POINTER)
+        emit(e, "->_zer_lock);\n");
+    else
+        emit(e, "._zer_lock);\n");
 }
 
 /* RF3: resolve TypeNode via checker's typemap (set during resolve_type).

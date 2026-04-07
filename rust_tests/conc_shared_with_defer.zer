@@ -1,0 +1,29 @@
+// Rust: Arc<Mutex<T>> + Drop → cleanup on last reference
+// ZER: shared struct + defer — auto-locked cleanup
+
+shared struct Connection {
+    u32 fd;
+    bool active;
+}
+
+Connection conn;
+
+void handle_client(*Connection c) {
+    c.active = true;
+    c.fd = 42;
+    // Process...
+    c.active = false;
+}
+
+u32 main() {
+    conn.fd = 0;
+    conn.active = false;
+
+    spawn handle_client(&conn);
+
+    // Main thread checks status — auto-locked reads
+    // Grouped: both reads under one lock
+    u32 fd = conn.fd;
+    bool active = conn.active;
+    return 0;
+}

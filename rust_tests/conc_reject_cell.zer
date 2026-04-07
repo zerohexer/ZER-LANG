@@ -1,0 +1,16 @@
+// Rust: Cell<T> / RefCell<T> is !Sync — cannot be shared between threads
+// ZER equivalent: mutable struct without shared → spawn rejects
+
+struct Cell { u32 inner; }
+
+void mutate(*Cell c) {
+    c.inner = 99;
+}
+
+u32 main() {
+    Cell c;
+    c.inner = 0;
+    // MUST FAIL: interior mutability without thread safety
+    spawn mutate(&c);
+    return 0;
+}

@@ -1,0 +1,40 @@
+// Rust source: tests/ui/threads-sendsync/sendfn-spawn-with-fn-arg.rs
+// Spawn with function argument. Pass a function as argument to spawned thread.
+// ZER: Cannot pass funcptrs directly to spawn. Use value arg dispatch instead:
+//      dispatch integer selects which operation to run.
+
+shared struct Result { u32 value; }
+Result res;
+
+u32 double_it(u32 x) {
+    return x * 2;
+}
+
+u32 add_ten(u32 x) {
+    return x + 10;
+}
+
+// dispatch: 0 = double_it, 1 = add_ten
+void dispatcher(*Result r, u32 op, u32 arg) {
+    if (op == 0) {
+        r.value = double_it(arg);
+    } else {
+        r.value = add_ten(arg);
+    }
+}
+
+u32 main() {
+    res.value = 0;
+
+    // Spawn with op=0 (double_it), arg=21 → expected 42
+    ThreadHandle th = spawn dispatcher(&res, 0, 21);
+    th.join();
+    if (res.value != 42) { return 1; }
+
+    // Spawn with op=1 (add_ten), arg=32 → expected 42
+    ThreadHandle th2 = spawn dispatcher(&res, 1, 32);
+    th2.join();
+    if (res.value != 42) { return 2; }
+
+    return 0;
+}

@@ -1,0 +1,22 @@
+// Rust source: tests/ui/threads-sendsync/spawn-types.rs
+// Spawn with different parameter types. Issue #520.
+// ZER: ThreadHandle th = spawn iotask(port, timeout); th.join() — value params of different types.
+
+shared struct Result { u32 sum; }
+Result res;
+
+void iotask(*Result r, u32 port, u32 timeout) {
+    // Simulate receiving on port with timeout
+    r.sum = port + timeout;
+}
+
+u32 main() {
+    res.sum = 0;
+
+    // Different types passed as values: u32 port=42, u32 timeout=100
+    ThreadHandle th = spawn iotask(&res, 42, 100);
+    th.join();
+
+    if (res.sum != 142) { return 1; }
+    return 0;
+}

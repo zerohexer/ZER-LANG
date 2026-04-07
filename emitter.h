@@ -61,6 +61,14 @@ typedef struct {
     int spawn_wrapper_capacity;
     int next_spawn_id;      /* counter for unique spawn wrapper IDs */
 
+    /* async function emission state */
+    bool in_async;              /* true when emitting inside an async function body */
+    int async_yield_id;         /* counter for yield/await state IDs */
+    const char **async_locals;  /* local variable names promoted to state struct */
+    size_t *async_local_lens;   /* lengths of local variable names */
+    int async_local_count;
+    int async_local_capacity;
+
     /* condvar types — shared structs that use @cond_wait/@cond_signal.
      * These need pthread_mutex_t instead of spinlock. Tracked by type_id. */
     uint32_t *condvar_type_ids;

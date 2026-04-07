@@ -146,6 +146,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
     case 'a':
         if (word_len == 2 && word[1] == 's') return TOK_AS;
         if (word_len == 3 && memcmp(word+1, "sm", 2) == 0) return TOK_ASM;
+        if (word_len == 5 && memcmp(word+1, "sync", 4) == 0) return TOK_ASYNC;
         break;
     case 'b':
         if (word_len == 4 && memcmp(word+1, "ool", 3) == 0) return TOK_BOOL;
@@ -584,6 +585,7 @@ const char *token_type_name(TokenType type) {
     case TOK_MMIO: return "mmio";
     case TOK_COMPTIME: return "comptime";
     case TOK_THREADLOCAL: return "threadlocal";
+    case TOK_ASYNC: return "async";
     case TOK_IDENT: return "IDENT";
     case TOK_NUMBER_INT: return "INT";
     case TOK_NUMBER_FLOAT: return "FLOAT";

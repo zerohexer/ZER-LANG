@@ -277,6 +277,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
     case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT:
         break;
     }
 }
@@ -352,6 +353,7 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
 }
 
 static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
+static bool is_async_local(Emitter *e, const char *name, size_t len); /* forward decl */
 
 /* Check if a shared struct type uses condvar (needs mutex instead of spinlock) */
 static bool shared_needs_condvar(Emitter *e, Type *t) {
@@ -646,8 +648,14 @@ static void emit_type(Emitter *e, Type *t) {
     }
 
     case TYPE_STRUCT:
-        emit(e, "struct ");
-        EMIT_STRUCT_NAME(e, t);
+        /* Async state structs are emitted as typedef, not struct tag */
+        if (t->struct_type.name_len >= 11 &&
+            memcmp(t->struct_type.name, "_zer_async_", 11) == 0) {
+            emit(e, "%.*s", (int)t->struct_type.name_len, t->struct_type.name);
+        } else {
+            emit(e, "struct ");
+            EMIT_STRUCT_NAME(e, t);
+        }
         break;
 
     case TYPE_ENUM:
@@ -848,6 +856,11 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_IDENT: {
+        /* Async local promotion: emit self->name for promoted locals */
+        if (is_async_local(e, node->ident.name, node->ident.name_len)) {
+            emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
+            break;
+        }
         /* BUG-218/222/229/233: module-aware identifier emission.
          * When inside a module body (current_module set), PREFER the mangled key
          * for the current module. This prevents cross-module collision where raw
@@ -2905,6 +2918,17 @@ static void emit_stmt(Emitter *e, Node *node) {
     }
 
     case NODE_VAR_DECL: {
+        /* Async mode: locals are in the state struct — just assign, don't declare */
+        if (e->in_async && is_async_local(e, node->var_decl.name, node->var_decl.name_len)) {
+            if (node->var_decl.init) {
+                emit_auto_guards(e, node->var_decl.init);
+                emit_indent(e);
+                emit(e, "self->%.*s = ", (int)node->var_decl.name_len, node->var_decl.name);
+                emit_expr(e, node->var_decl.init);
+                emit(e, ";\n");
+            }
+            break;
+        }
         /* auto-guard: emit bounds guards before var init */
         if (node->var_decl.init) emit_auto_guards(e, node->var_decl.init);
         Type *type = checker_get_type(e->checker,node);
@@ -3587,6 +3611,30 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
     }
 
+    case NODE_YIELD:
+        /* yield — pause coroutine, resume here on next poll */
+        if (e->in_async) {
+            emit_indent(e);
+            emit(e, "self->_zer_state = %d; return 0;\n", e->async_yield_id);
+            emit_indent(e);
+            emit(e, "case %d:;\n", e->async_yield_id);
+            e->async_yield_id++;
+        }
+        break;
+
+    case NODE_AWAIT:
+        /* await expr — yield until condition is true */
+        if (e->in_async) {
+            emit_indent(e);
+            emit(e, "case %d:;\n", e->async_yield_id);
+            emit_indent(e);
+            emit(e, "if (!(");
+            emit_expr(e, node->await_stmt.cond);
+            emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
+            e->async_yield_id++;
+        }
+        break;
+
     case NODE_SPAWN: {
         /* spawn func(args); — emit pthread_create using pre-scanned wrapper */
         int sid = -1;
@@ -4058,7 +4106,109 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     emit(e, ";\n\n");
 }
 
+/* ================================================================
+ * ASYNC FUNCTION EMISSION
+ * Transforms async functions into state machine struct + poll function.
+ * Uses Duff's device: switch(state) { case 0: ... case N: ... }
+ * can jump INTO loops — valid C since 1983.
+ * ================================================================ */
+
+/* Collect local variable declarations from a block (non-recursive — top level only) */
+static void collect_async_locals(Emitter *e, Node *body) {
+    if (!body || body->kind != NODE_BLOCK) return;
+    for (int i = 0; i < body->block.stmt_count; i++) {
+        Node *s = body->block.stmts[i];
+        if (s->kind == NODE_VAR_DECL) {
+            if (e->async_local_count >= e->async_local_capacity) {
+                int nc = e->async_local_capacity < 8 ? 8 : e->async_local_capacity * 2;
+                const char **nls = (const char **)arena_alloc(e->arena, nc * sizeof(const char *));
+                size_t *nlens = (size_t *)arena_alloc(e->arena, nc * sizeof(size_t));
+                if (e->async_locals) {
+                    memcpy(nls, e->async_locals, e->async_local_count * sizeof(const char *));
+                    memcpy(nlens, e->async_local_lens, e->async_local_count * sizeof(size_t));
+                }
+                e->async_locals = nls;
+                e->async_local_lens = nlens;
+                e->async_local_capacity = nc;
+            }
+            e->async_locals[e->async_local_count] = s->var_decl.name;
+            e->async_local_lens[e->async_local_count] = s->var_decl.name_len;
+            e->async_local_count++;
+        }
+    }
+}
+
+/* Check if an ident name is an async-promoted local */
+static bool is_async_local(Emitter *e, const char *name, size_t len) {
+    if (!e->in_async) return false;
+    for (int i = 0; i < e->async_local_count; i++) {
+        if (e->async_local_lens[i] == len &&
+            memcmp(e->async_locals[i], name, len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void emit_async_func(Emitter *e, Node *node) {
+    const char *fname = node->func_decl.name;
+    int flen = (int)node->func_decl.name_len;
+    Node *body = node->func_decl.body;
+    if (!body) return;
+
+    /* Collect local variables for the state struct */
+    e->async_local_count = 0;
+    collect_async_locals(e, body);
+
+    /* Emit state struct typedef */
+    emit(e, "typedef struct {\n");
+    emit(e, "    int _zer_state;\n");
+    /* Emit each local as a struct field */
+    if (body->kind == NODE_BLOCK) {
+        for (int i = 0; i < body->block.stmt_count; i++) {
+            Node *s = body->block.stmts[i];
+            if (s->kind == NODE_VAR_DECL) {
+                Type *vt = checker_get_type(e->checker, s);
+                if (vt) {
+                    emit(e, "    ");
+                    emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
+                    emit(e, ";\n");
+                }
+            }
+        }
+    }
+    emit(e, "} _zer_async_%.*s;\n\n", flen, fname);
+
+    /* Emit init function */
+    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self) {\n",
+         flen, fname, flen, fname);
+    emit(e, "    memset(self, 0, sizeof(*self));\n");
+    emit(e, "}\n\n");
+
+    /* Emit poll function */
+    emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self) {\n",
+         flen, fname, flen, fname);
+    emit(e, "    switch (self->_zer_state) { case 0:;\n");
+
+    /* Emit the body with async transformations active */
+    e->in_async = true;
+    e->async_yield_id = 1; /* state 0 is the entry point */
+    e->indent = 1;
+    emit_stmt(e, body);
+    e->in_async = false;
+
+    emit(e, "    }\n");
+    emit(e, "    self->_zer_state = -1;\n");
+    emit(e, "    return 1; /* done */\n");
+    emit(e, "}\n\n");
+}
+
 static void emit_func_decl(Emitter *e, Node *node) {
+
+    /* Async functions get special emission */
+    if (node->func_decl.is_async && node->func_decl.body) {
+        emit_async_func(e, node);
+        return;
+    }
 
     Type *func_type = checker_get_type(e->checker,node);
     Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
@@ -4339,6 +4489,8 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
     case NODE_ONCE:
         prescan_spawn_in_node(e, node->once.body);
         break;
+    case NODE_YIELD: case NODE_AWAIT:
+        break;
     default: break;
     }
 }
@@ -4616,6 +4768,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
     case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:

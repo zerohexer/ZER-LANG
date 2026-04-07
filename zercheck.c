@@ -479,6 +479,55 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
     }
 }
 
+/* Check if a function's return statements all come from arena.alloc().
+ * Used to exclude wrapper functions from handle tracking — arena allocs
+ * don't need individual free (arena.reset() frees everything). */
+static bool func_returns_arena(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    /* Look up the callee's function body */
+    Node *callee = call->call.callee;
+    const char *fname = NULL;
+    uint32_t flen = 0;
+    if (callee && callee->kind == NODE_IDENT) {
+        fname = callee->ident.name;
+        flen = (uint32_t)callee->ident.name_len;
+    } else if (callee && callee->kind == NODE_FIELD) {
+        fname = callee->field.field_name;
+        flen = (uint32_t)callee->field.field_name_len;
+    }
+    if (!fname) return false;
+    Symbol *sym = scope_lookup(zc->checker->global_scope, fname, flen);
+    if (!sym || !sym->func_node || !sym->func_node->func_decl.body) return false;
+    /* Scan return statements for arena.alloc() */
+    Node *body = sym->func_node->func_decl.body;
+    if (body->kind != NODE_BLOCK) return false;
+    for (int i = 0; i < body->block.stmt_count; i++) {
+        Node *stmt = body->block.stmts[i];
+        if (stmt->kind != NODE_RETURN || !stmt->ret.expr) continue;
+        Node *ret_expr = stmt->ret.expr;
+        /* Walk through orelse */
+        if (ret_expr->kind == NODE_ORELSE) ret_expr = ret_expr->orelse.expr;
+        /* Check if it's arena.alloc() or arena.alloc_slice() */
+        if (ret_expr->kind == NODE_CALL && ret_expr->call.callee &&
+            ret_expr->call.callee->kind == NODE_FIELD) {
+            Node *obj = ret_expr->call.callee->field.object;
+            const char *mname = ret_expr->call.callee->field.field_name;
+            uint32_t mlen = (uint32_t)ret_expr->call.callee->field.field_name_len;
+            if (obj && ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                        (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
+                Type *obj_type = checker_get_type(zc->checker, obj);
+                if (!obj_type && obj->kind == NODE_IDENT) {
+                    Symbol *osym = scope_lookup(zc->checker->global_scope,
+                        obj->ident.name, (uint32_t)obj->ident.name_len);
+                    if (osym) obj_type = osym->type;
+                }
+                if (obj_type && obj_type->kind == TYPE_ARENA) return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* check if an assignment is h = pool.alloc() — register handle */
 static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
     if (!var_node) return;
@@ -569,6 +618,11 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             }
             if (atype && atype->kind == TYPE_ARENA) is_arena_alloc = true;
         }
+    }
+    /* Also check if the callee function returns an arena.alloc() — wrapper
+     * functions like freelist_alloc() that internally use arena don't need tracking */
+    if (!is_arena_alloc && alloc_call && alloc_call->kind == NODE_CALL) {
+        if (func_returns_arena(zc, alloc_call)) is_arena_alloc = true;
     }
     if (alloc_call && alloc_call->kind == NODE_CALL &&
         !find_handle(ps, vname, vlen) && !is_arena_alloc) {

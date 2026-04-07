@@ -2948,3 +2948,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** `is_arena_derived` flag only set for LOCAL arena allocs (had `!arena_is_global` guard). Global arena allocs were considered "safe" — wrong, because global arenas can still be reset().
 - **Fix:** Added `is_from_arena` flag on Symbol (set for ALL arena allocs, global or local). Assignment-to-global check uses `is_from_arena`. Return/keep/call checks still use `is_arena_derived` (only local arenas — global arena pointers CAN be returned from functions safely).
 - **Tests:** `arena_global_escape.zer` (global arena ptr to global — rejected).
+
+### Enhancement: func_returns_arena — arena wrapper functions excluded from handle tracking
+- **Problem:** Wrapper functions like `?*Block arena_alloc_block() { return backing.alloc(Block); }` triggered false "handle never freed" errors because zercheck saw `?*T` return and tracked it as an allocation.
+- **Fix:** Added `func_returns_arena()` helper in zercheck.c. Before registering a wrapper allocator call as tracked, checks if the callee's body returns `arena.alloc()`. If so, skips tracking — arena allocs don't need individual free.
+- **Limitation:** Only works for simple wrappers where ALL return statements come from arena.alloc(). Complex wrappers (freelist with recycling path + arena path) still trigger false positives because the recycling path returns type-punned memory, not directly from arena.
+- **Workaround for complex wrappers:** Use inline arena.alloc() instead of wrapper functions. The inline pattern is correctly tracked.

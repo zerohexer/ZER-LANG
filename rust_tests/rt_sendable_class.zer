@@ -1,0 +1,24 @@
+// Rust source: tests/ui/threads-sendsync/sendable-class.rs
+// Test that a struct with only sendable fields can be sent through a channel.
+// Rust: send foo{i:42, j:'c'} through mpsc::channel
+// ZER: Ring with struct element — push and pop, verify fields
+
+struct Foo {
+    u32 i;
+    u8 j;
+}
+
+Ring(Foo, 8) chan;
+
+u32 main() {
+    Foo item;
+    item.i = 42;
+    item.j = 99;
+    chan.push(item);
+
+    ?Foo result = chan.pop();
+    Foo got = result orelse return;
+    if (got.i != 42) { return 1; }
+    if (got.j != 99) { return 2; }
+    return 0;
+}

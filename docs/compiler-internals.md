@@ -2649,3 +2649,22 @@ Without (2), `*opaque raw = (*opaque)&a` didn't propagate `*A` provenance to `ra
 - `is_from_arena` = pointer from ANY arena → cannot store in global (but CAN return, CAN pass to functions)
 
 Both propagate through aliases, if-unwrap captures, switch captures, orelse unwrap, struct copy.
+
+### Exhaustive Switch on NodeKind (RF14, 2026-04-07)
+
+**Problem:** The most common bug class across 12 audit sessions was "AST walker doesn't handle NODE_X" (BUG-433, 434, 435, 437, 452). Each is 2 lines to fix but 10-30 minutes to find. Root cause: `default: break;` in switch statements silently skips new node types.
+
+**Fix:** Converted 5 critical walker functions from `default: break;` to exhaustive case lists covering all 35 NodeKind values. No `default:` means GCC `-Wswitch` (enabled by `-Wall`) warns immediately when a new NODE_ type is added and any walker doesn't handle it.
+
+**Functions converted:**
+1. `scan_frame` (checker.c) — stack depth / recursion detection. Also gained recursion into NODE_SWITCH, NODE_DEFER, NODE_CRITICAL, NODE_INTRINSIC, NODE_FIELD, NODE_INDEX, NODE_TYPECAST, NODE_SLICE (all were previously missed via `default: break;`).
+2. `collect_labels` (checker.c) — converted from if/else chain to switch.
+3. `validate_gotos` (checker.c) — converted from if/else chain to switch.
+4. `zc_check_expr` (zercheck.c) — gained NODE_TYPECAST, NODE_SLICE recursion.
+5. `zc_check_stmt` (zercheck.c) — all statement nodes explicit.
+
+**Pattern for new walkers:** Always use `switch (node->kind)` with NO `default:`. List every NodeKind explicitly — active cases with logic, inactive cases grouped with `break;`. GCC enforces completeness.
+
+**Remaining walkers with `default:`:** `check_expr`, `check_stmt`, `emit_expr`, `emit_stmt` — these are large (100+ cases) and use `default:` for "unsupported" error messages. Converting these is lower priority since they're less likely to silently skip nodes (they error on unknown kinds).
+
+**Impact:** Prevents ~10-12 bugs per version. The single highest-value refactor for long-term maintainability.

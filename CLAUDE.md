@@ -659,7 +659,14 @@ New node types require changes in FIVE places:
 4. **Checker** — validate (label exists, not in defer block, etc.)
 5. **Emitter** — emit the C equivalent
 
-Also: update EVERY recursive AST walker that handles all node types. This session found that `collect_labels()` and `validate_gotos()` missed NODE_SWITCH/NODE_DEFER/NODE_CRITICAL. Zercheck's `zc_check_stmt()` may also need updating.
+Also: update EVERY recursive AST walker that handles all node types. **5 critical walkers now use exhaustive switch (no `default:`)** — GCC `-Wswitch` warns automatically when a new NODE_ type is missing:
+- `scan_frame` (checker.c) — stack depth analysis
+- `collect_labels` (checker.c) — goto label collection
+- `validate_gotos` (checker.c) — goto target validation
+- `zc_check_expr` (zercheck.c) — expression UAF/double-free checks
+- `zc_check_stmt` (zercheck.c) — statement-level handle tracking
+
+When adding a new NODE_ type, compile and check for `-Wswitch` warnings — they show exactly which walkers need updating. This prevents the entire class of "walker missing node type" bugs (BUG-433/434/435/437/452).
 
 ### Two-Pass Emission Pattern
 `emit_file()` uses two-pass emission:

@@ -69,6 +69,7 @@ typedef struct {
     bool *frees_param;        /* definite free (all paths) */
     bool *maybe_frees_param;  /* conditional free (some paths) */
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
+    int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
 } FuncSummary;
 
 /* ZER-CHECK context */

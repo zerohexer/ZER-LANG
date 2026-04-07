@@ -2590,3 +2590,39 @@ If adding a new expression type that can carry a local pointer, ADD A CASE HERE.
 **Tests:** `interior_ptr_safe.zer` (field ptr used before free — compiles), `interior_ptr_uaf.zer` (field ptr used after free — rejected), `interior_ptr_func.zer` (field ptr passed to function after free — rejected).
 
 **Remaining gap:** `@ptrtoint` + integer math + `@inttoptr` creates a pointer with no link to the original allocation. This is guarded by the `mmio` declaration requirement — `@inttoptr` without mmio ranges is a compile error. The `mmio` requirement is the defense, not pointer tracking.
+
+### C-Style Cast Safety Audit (checker.c, 2026-04-07)
+
+**Problem:** NODE_TYPECAST handler only validated cast direction (int↔int OK, struct→int NO) but didn't apply the safety checks that `@ptrcast` enforces for pointer casts.
+
+**7 bugs found in audit (BUG-445 through BUG-451):**
+All same root cause — NODE_TYPECAST was a "dumb cast" that bypassed ZER's safety layer.
+
+**Fix — one unified block in NODE_TYPECAST handler:**
+When source and target are both pointers:
+1. **Qualifier preservation** — const/volatile cannot be stripped (same as @ptrcast BUG-258/304)
+2. **Provenance check** — *opaque with known provenance must match target type (same as @ptrcast BUG-393)
+3. **Direct *A→*B rejection** — must go through *opaque round-trip for provenance tracking
+4. **Provenance propagation** — `(*opaque)sensor` sets provenance on source symbol, AND var-decl walker now follows NODE_TYPECAST (was only following NODE_INTRINSIC)
+
+When crossing pointer/integer boundary:
+5. **int→ptr rejected** — must use `@inttoptr` (mmio range validation)
+6. **ptr→int rejected** — must use `@ptrtoint` (portability warning)
+
+**Key principle:** C-style cast is syntax sugar for safe operations. It must NEVER bypass a safety check that `@ptrcast`/`@inttoptr`/`@ptrtoint` enforce. If a cast needs to bypass safety, use the explicit intrinsic.
+
+**Allowed C-style casts:** int↔int (widening/narrowing), int↔float, float↔float, bool↔int, *T↔*opaque (with provenance), distinct↔base (with @cast semantics).
+
+**Tests:** `typecast_safe_complex.zer` (multi-layer safe patterns), `typecast_provenance.zer`, `typecast_volatile_strip.zer`, `typecast_const_strip.zer`, `typecast_direct_ptr.zer`, `typecast_int_to_ptr.zer`, `typecast_ptr_to_int.zer`.
+
+### checker_post_passes Not Called (BUG-453, 2026-04-07)
+
+**Problem:** `zerc_main.c` called `checker_check_bodies` (Pass 2 only), not `checker_check` (all passes). Pass 3 (whole-program provenance), Pass 4 (interrupt safety), Pass 5 (stack depth) never ran in the real compiler — only in unit tests.
+
+**Fix:** Added `checker_post_passes()` function that runs Pass 3+4+5, called from `zerc_main.c` after body checking. Same class of integration bug as zercheck (2026-04-03).
+
+### scan_frame Missing Expression Nodes (BUG-452, 2026-04-07)
+
+**Problem:** `return fibonacci(n-1) + fibonacci(n-2)` — function calls inside NODE_BINARY invisible to stack depth analysis. No recursion warning emitted.
+
+**Fix:** Added NODE_BINARY (recurse left+right), NODE_UNARY (recurse operand), NODE_ORELSE (recurse expr) to `scan_frame`. Now all function calls in any expression position are found.

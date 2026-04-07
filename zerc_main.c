@@ -437,6 +437,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Post-passes on main file: stack depth + interrupt safety */
+    checker_post_passes(&checker, main_mod->ast);
+
     /* ZER-CHECK: path-sensitive handle + *opaque tracking */
     {
         ZerCheck zc;

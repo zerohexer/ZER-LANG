@@ -1,0 +1,9 @@
+// C-style cast const strip — must be rejected
+// const *u32 cast to *u32 allows mutation of const data
+
+u32 main() {
+    u32 x = 42;
+    const *u32 cp = &x;
+    *u32 bad = (*u32)cp;
+    return 0;
+}

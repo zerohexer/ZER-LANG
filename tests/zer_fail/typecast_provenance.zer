@@ -1,0 +1,16 @@
+// C-style cast provenance violation — wrong type through *opaque
+// Must be rejected: (*B)raw where raw has *A provenance
+
+struct Motor { u32 speed; }
+struct Sensor { u32 reading; }
+Slab(Motor) motors;
+
+u32 main() {
+    ?*Motor mm = motors.alloc_ptr();
+    *Motor m = mm orelse return;
+    defer motors.free_ptr(m);
+    m.speed = 100;
+    *opaque raw = (*opaque)m;
+    *Sensor wrong = (*Sensor)raw;
+    return 0;
+}

@@ -164,6 +164,8 @@ typedef enum {
     NODE_CRITICAL,          /* @critical { body } — interrupt-disabled block */
     NODE_ONCE,              /* @once { body } — execute exactly once, thread-safe */
     NODE_SPAWN,             /* spawn func(args); — thread creation */
+    NODE_YIELD,             /* yield; — pause async coroutine */
+    NODE_AWAIT,             /* await expr; — yield until condition true */
 
     /* === Expressions === */
     NODE_INT_LIT,           /* 42, 0xFF, 0b1010 */
@@ -263,6 +265,7 @@ struct Node {
             bool is_static;         /* static = module-private */
             bool is_comptime;       /* comptime = compile-time evaluated */
             bool is_naked;          /* naked = no prologue/epilogue, asm-only body */
+            bool is_async;          /* async = coroutine, transformed to state machine */
             const char *section;    /* section(".text.startup") or NULL */
             size_t section_len;
         } func_decl;
@@ -408,6 +411,9 @@ struct Node {
 
         /* NODE_ONCE: @once { body } — execute exactly once, thread-safe */
         struct { Node *body; } once;
+
+        /* NODE_AWAIT: await expr; — yield until condition is true */
+        struct { Node *cond; } await_stmt;
 
         /* NODE_SPAWN: spawn func(args); or ThreadHandle th = spawn func(args); */
         struct {

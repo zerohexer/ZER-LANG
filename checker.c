@@ -154,6 +154,14 @@ static void pop_scope(Checker *c) {
     c->current_scope = c->current_scope->parent;
 }
 
+static Symbol *add_symbol_internal(Checker *c, const char *name, uint32_t name_len,
+                                   Type *type, int line) {
+    /* Internal: no _zer_ prefix check — used for compiler-generated symbols */
+    Symbol *sym = scope_add(c->arena, c->current_scope, name, name_len,
+                            type, line, c->file_name);
+    return sym;
+}
+
 static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
                           Type *type, int line) {
     /* BUG-276: warn on _zer_ prefixed names — reserved for compiler internals */
@@ -6723,6 +6731,18 @@ static void check_stmt(Checker *c, Node *node) {
         }
         break;
 
+    case NODE_YIELD:
+        /* yield — suspend current async task, no operands */
+        break;
+
+    case NODE_AWAIT: {
+        /* await expr — check the condition expression */
+        if (node->await_stmt.cond) {
+            check_expr(c, node->await_stmt.cond);
+        }
+        break;
+    }
+
     case NODE_SPAWN: {
         /* spawn func(args); — validate function, check arg safety */
         Symbol *func_sym = scope_lookup(c->global_scope,
@@ -7056,6 +7076,50 @@ static void register_decl(Checker *c, Node *node) {
             sym->module_prefix_len = c->current_module_len;
         }
         typemap_set(c, node,func_type);
+
+        /* Async function: register state struct type + init/poll functions */
+        if (node->func_decl.is_async && sym) {
+            /* Build mangled name: _zer_async_funcname */
+            char aname[256];
+            int alen = snprintf(aname, sizeof(aname), "_zer_async_%.*s",
+                (int)node->func_decl.name_len, node->func_decl.name);
+            /* Register state struct as an opaque type (fields not accessible from ZER) */
+            Type *async_type = (Type *)arena_alloc(c->arena, sizeof(Type));
+            async_type->kind = TYPE_STRUCT;
+            async_type->struct_type.name = arena_alloc(c->arena, alen + 1);
+            memcpy((char *)async_type->struct_type.name, aname, alen + 1);
+            async_type->struct_type.name_len = alen;
+            async_type->struct_type.field_count = 0;
+            async_type->struct_type.fields = NULL;
+            async_type->struct_type.type_id = c->next_type_id++;
+            char *aname_copy = arena_alloc(c->arena, alen + 1);
+            memcpy(aname_copy, aname, alen + 1);
+            add_symbol_internal(c, aname_copy, alen, async_type, node->loc.line);
+
+            /* Register _zer_async_funcname_init as function taking *async_type */
+            char iname[256];
+            int ilen = snprintf(iname, sizeof(iname), "_zer_async_%.*s_init",
+                (int)node->func_decl.name_len, node->func_decl.name);
+            Type **ip = (Type **)arena_alloc(c->arena, sizeof(Type *));
+            ip[0] = type_pointer(c->arena, async_type);
+            Type *init_ft = type_func_ptr(c->arena, ip, 1, ty_void);
+            char *iname_copy = arena_alloc(c->arena, ilen + 1);
+            memcpy(iname_copy, iname, ilen + 1);
+            Symbol *isym = add_symbol_internal(c, iname_copy, ilen, init_ft, node->loc.line);
+            if (isym) isym->is_function = true;
+
+            /* Register _zer_async_funcname_poll as function taking *async_type, returning i32 */
+            char pname[256];
+            int plen = snprintf(pname, sizeof(pname), "_zer_async_%.*s_poll",
+                (int)node->func_decl.name_len, node->func_decl.name);
+            Type **pp = (Type **)arena_alloc(c->arena, sizeof(Type *));
+            pp[0] = type_pointer(c->arena, async_type);
+            Type *poll_ft = type_func_ptr(c->arena, pp, 1, ty_i32);
+            char *pname_copy = arena_alloc(c->arena, plen + 1);
+            memcpy(pname_copy, pname, plen + 1);
+            Symbol *psym = add_symbol_internal(c, pname_copy, plen, poll_ft, node->loc.line);
+            if (psym) psym->is_function = true;
+        }
         break;
     }
 
@@ -7204,6 +7268,7 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
@@ -7265,6 +7330,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
@@ -7333,6 +7399,10 @@ static bool contains_break(Node *node) {
         return contains_break(node->once.body);
     case NODE_DEFER:
         return false; /* break banned in defer — checker rejects it */
+    case NODE_YIELD:
+        return false; /* yield is a leaf, cannot contain break */
+    case NODE_AWAIT:
+        return node->await_stmt.cond ? contains_break(node->await_stmt.cond) : false;
     default: return false;
     }
 }
@@ -7873,6 +7943,13 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_ASM:
     case NODE_CAST:
     case NODE_SIZEOF:
+        break;
+    case NODE_YIELD:
+        break; /* leaf — no children */
+    case NODE_AWAIT:
+        /* await expr — scan the condition expression */
+        if (node->await_stmt.cond)
+            scan_frame(c, frame, node->await_stmt.cond);
         break;
     case NODE_SPAWN:
         /* spawn func(args) — scan args for function calls */

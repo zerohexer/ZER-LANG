@@ -1282,6 +1282,25 @@ static Node *parse_statement(Parser *p) {
         return n;
     }
 
+    /* yield; — pause async coroutine */
+    if (check(p, TOK_IDENT) && p->current.length == 5 &&
+        memcmp(p->current.start, "yield", 5) == 0) {
+        advance(p);
+        Node *n = new_node(p, NODE_YIELD);
+        consume(p, TOK_SEMICOLON, "expected ';' after yield");
+        return n;
+    }
+
+    /* await expr; — yield until condition is true */
+    if (check(p, TOK_IDENT) && p->current.length == 5 &&
+        memcmp(p->current.start, "await", 5) == 0) {
+        advance(p);
+        Node *n = new_node(p, NODE_AWAIT);
+        n->await_stmt.cond = parse_expression(p);
+        consume(p, TOK_SEMICOLON, "expected ';' after await expression");
+        return n;
+    }
+
     /* ThreadHandle name = spawn func(args); — scoped spawn with join handle.
      * Detected by ident "ThreadHandle" at statement position. */
     if (check(p, TOK_IDENT) && p->current.length == 12 &&
@@ -2098,6 +2117,17 @@ static Node *parse_declaration(Parser *p) {
             error_at(p, &p->previous, "comptime can only be applied to functions");
         } else {
             n->func_decl.is_comptime = true;
+        }
+        return n;
+    }
+
+    /* async — coroutine function */
+    if (match(p, TOK_ASYNC)) {
+        Node *n = parse_func_or_var(p, false);
+        if (n->kind != NODE_FUNC_DECL) {
+            error_at(p, &p->previous, "async can only be applied to functions");
+        } else {
+            n->func_decl.is_async = true;
         }
         return n;
     }

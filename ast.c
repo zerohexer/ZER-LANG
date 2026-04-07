@@ -89,6 +89,8 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_CRITICAL:     return "CRITICAL";
     case NODE_ONCE:         return "ONCE";
     case NODE_SPAWN:        return "SPAWN";
+    case NODE_YIELD:        return "YIELD";
+    case NODE_AWAIT:        return "AWAIT";
     case NODE_INT_LIT:      return "INT_LIT";
     case NODE_FLOAT_LIT:    return "FLOAT_LIT";
     case NODE_STRING_LIT:   return "STRING_LIT";
@@ -359,6 +361,16 @@ void ast_print(Node *node, int depth) {
                node->spawn_stmt.func_name, node->spawn_stmt.arg_count);
         for (int i = 0; i < node->spawn_stmt.arg_count; i++)
             ast_print(node->spawn_stmt.args[i], depth + 1);
+        break;
+
+    case NODE_YIELD:
+        printf("Yield\n");
+        break;
+
+    case NODE_AWAIT:
+        printf("Await\n");
+        if (node->await_stmt.cond)
+            ast_print(node->await_stmt.cond, depth + 1);
         break;
 
     case NODE_INT_LIT:

@@ -2665,6 +2665,12 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 
 **Pattern for new walkers:** Always use `switch (node->kind)` with NO `default:`. List every NodeKind explicitly — active cases with logic, inactive cases grouped with `break;`. GCC enforces completeness.
 
-**Remaining walkers with `default:`:** `check_expr`, `check_stmt`, `emit_expr`, `emit_stmt` — these are large (100+ cases) and use `default:` for "unsupported" error messages. Converting these is lower priority since they're less likely to silently skip nodes (they error on unknown kinds).
+**Also converted (emitter.c):**
+6. `emit_auto_guards` — bounds check guard emission
+7. `emit_top_level_decl` — top-level declaration emission
+
+**Remaining with intentional `default:`:** `emit_expr` (emits `/* unhandled expr */` diagnostic), `emit_stmt` (emits `/* unhandled stmt */` diagnostic), `resolve_type_for_emit` (returns `ty_void` fallback). These are safe — unknown nodes produce visible output in emitted C, not silent skips.
+
+**Total: 7 exhaustive walkers.** GCC `-Wswitch` warns on ALL of them when a new NODE_ type is added.
 
 **Impact:** Prevents ~10-12 bugs per version. The single highest-value refactor for long-term maintainability.

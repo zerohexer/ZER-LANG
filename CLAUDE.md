@@ -659,12 +659,16 @@ New node types require changes in FIVE places:
 4. **Checker** — validate (label exists, not in defer block, etc.)
 5. **Emitter** — emit the C equivalent
 
-Also: update EVERY recursive AST walker that handles all node types. **5 critical walkers now use exhaustive switch (no `default:`)** — GCC `-Wswitch` warns automatically when a new NODE_ type is missing:
+Also: update EVERY recursive AST walker that handles all node types. **7 walkers now use exhaustive switch (no `default:`)** — GCC `-Wswitch` warns automatically when a new NODE_ type is missing:
 - `scan_frame` (checker.c) — stack depth analysis
 - `collect_labels` (checker.c) — goto label collection
 - `validate_gotos` (checker.c) — goto target validation
 - `zc_check_expr` (zercheck.c) — expression UAF/double-free checks
 - `zc_check_stmt` (zercheck.c) — statement-level handle tracking
+- `emit_auto_guards` (emitter.c) — bounds check guard emission
+- `emit_top_level_decl` (emitter.c) — top-level declaration emission
+
+3 walkers keep intentional `default:`: `emit_expr`/`emit_stmt` (emit `/* unhandled */` diagnostic), `resolve_type_for_emit` (returns `ty_void` fallback). These produce visible output on unknown nodes, not silent skips.
 
 When adding a new NODE_ type, compile and check for `-Wswitch` warnings — they show exactly which walkers need updating. This prevents the entire class of "walker missing node type" bugs (BUG-433/434/435/437/452).
 

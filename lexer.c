@@ -249,6 +249,9 @@ static TokenType check_keyword(const char *word, size_t word_len) {
             case 'y':
                 if (word_len == 7 && memcmp(word+2, "pedef", 5) == 0) return TOK_TYPEDEF;
                 break;
+            case 'h':
+                if (word_len == 11 && memcmp(word+2, "readlocal", 9) == 0) return TOK_THREADLOCAL;
+                break;
             }
         }
         break;
@@ -580,6 +583,7 @@ const char *token_type_name(TokenType type) {
     case TOK_AS: return "as";
     case TOK_MMIO: return "mmio";
     case TOK_COMPTIME: return "comptime";
+    case TOK_THREADLOCAL: return "threadlocal";
     case TOK_IDENT: return "IDENT";
     case TOK_NUMBER_INT: return "INT";
     case TOK_NUMBER_FLOAT: return "FLOAT";

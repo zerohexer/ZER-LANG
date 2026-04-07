@@ -1,0 +1,15 @@
+// Atomic: @atomic_store and @atomic_load round-trip
+
+u32 shared_val;
+
+u32 main() {
+    shared_val = 0;
+    @atomic_store(&shared_val, 42);
+    u32 v = @atomic_load(&shared_val);
+    if (v != 42) { return 1; }
+
+    @atomic_store(&shared_val, 99);
+    u32 v2 = @atomic_load(&shared_val);
+    if (v2 != 99) { return 2; }
+    return 0;
+}

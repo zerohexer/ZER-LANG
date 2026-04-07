@@ -1,0 +1,45 @@
+// Rust: thread::spawn with value (Copy) argument — no borrow needed
+// ZER: spawn with u32 value arg, result via shared struct
+// Equivalent to: Rust thread::spawn capturing Copy values
+
+shared struct Results {
+    u32 a;
+    u32 b;
+    u32 c;
+}
+
+Results gres;
+
+void compute_a(*Results r, u32 x) {
+    r.a = x * x;
+}
+
+void compute_b(*Results r, u32 x) {
+    r.b = x + x;
+}
+
+void compute_c(*Results r, u32 x) {
+    r.c = x * 3;
+}
+
+u32 main() {
+    gres.a = 0;
+    gres.b = 0;
+    gres.c = 0;
+
+    ThreadHandle t1 = spawn compute_a(&gres, 7);
+    ThreadHandle t2 = spawn compute_b(&gres, 7);
+    ThreadHandle t3 = spawn compute_c(&gres, 7);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 a = gres.a;
+    u32 b = gres.b;
+    u32 c = gres.c;
+    if (a != 49) { return 1; }
+    if (b != 14) { return 2; }
+    if (c != 21) { return 3; }
+    return 0;
+}

@@ -1,0 +1,43 @@
+// Rust: Once + lazy initialization of shared config
+// ZER: @once initializes shared struct fields — subsequent reads see init
+// Equivalent to: Rust lazy_static / OnceLock pattern
+
+shared struct Config {
+    u32 port;
+    u32 workers;
+    u32 initialized;
+}
+
+Config gcfg;
+
+void ensure_init(*Config c) {
+    @once {
+        c.port = 8080;
+        c.workers = 4;
+        c.initialized = 1;
+    }
+}
+
+void use_config(*Config c, *u32 out_port) {
+    ensure_init(c);
+    *out_port = c.port;
+}
+
+u32 main() {
+    gcfg.port = 0;
+    gcfg.workers = 0;
+    gcfg.initialized = 0;
+
+    u32 p1 = 0;
+    u32 p2 = 0;
+
+    use_config(&gcfg, &p1);
+    use_config(&gcfg, &p2);
+
+    if (p1 != 8080) { return 1; }
+    if (p2 != 8080) { return 2; }
+
+    u32 init = gcfg.initialized;
+    if (init != 1) { return 3; }
+    return 0;
+}

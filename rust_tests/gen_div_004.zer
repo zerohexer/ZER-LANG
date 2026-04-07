@@ -1,0 +1,14 @@
+// Division safe with explicit nonzero guard — compiles and runs
+
+u32 safe_div(u32 a, u32 b) {
+    if (b == 0) { return 0; }
+    return a / b;
+}
+
+u32 main() {
+    u32 r1 = safe_div(10, 2);
+    if (r1 != 5) { return 1; }
+    u32 r2 = safe_div(7, 0);
+    if (r2 != 0) { return 2; }
+    return 0;
+}

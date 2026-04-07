@@ -1,0 +1,49 @@
+// Rust: async fn — two alternating coroutines via cooperative yield
+// ZER: two async tasks polled in turn — interleaved execution
+// Equivalent to: Rust tokio::spawn two alternating tasks
+
+u32 ga_steps;
+u32 gb_steps;
+u32 ga_done;
+u32 gb_done;
+
+async void task_even() {
+    u32 i = 0;
+    while (i < 4) {
+        ga_steps += 1;
+        i += 1;
+        yield;
+    }
+    ga_done = 1;
+}
+
+async void task_odd() {
+    u32 i = 0;
+    while (i < 4) {
+        gb_steps += 1;
+        i += 1;
+        yield;
+    }
+    gb_done = 1;
+}
+
+u32 main() {
+    ga_steps = 0;
+    gb_steps = 0;
+    ga_done = 0;
+    gb_done = 0;
+
+    _zer_async_task_even ta;
+    _zer_async_task_odd tb;
+    _zer_async_task_even_init(&ta);
+    _zer_async_task_odd_init(&tb);
+
+    while (ga_done == 0 || gb_done == 0) {
+        if (ga_done == 0) { _zer_async_task_even_poll(&ta); }
+        if (gb_done == 0) { _zer_async_task_odd_poll(&tb); }
+    }
+
+    if (ga_steps != 4) { return 1; }
+    if (gb_steps != 4) { return 2; }
+    return 0;
+}

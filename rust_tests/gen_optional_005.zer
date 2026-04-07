@@ -1,0 +1,19 @@
+// Optional: mutable if-unwrap capture writes through to original
+
+struct Counter { u32 val; }
+Pool(Counter, 4) pool;
+
+u32 main() {
+    ?Handle(Counter) mh = pool.alloc();
+    Handle(Counter) h = mh orelse return;
+    pool.get(h).val = 0;
+
+    if (mh) |h2| {
+        pool.get(h2).val = 55;
+    }
+
+    u32 v = pool.get(h).val;
+    pool.free(h);
+    if (v != 55) { return 1; }
+    return 0;
+}

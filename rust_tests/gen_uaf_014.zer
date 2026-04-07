@@ -1,0 +1,13 @@
+// UAF: Task.new then Task.delete then access — compile error
+// EXPECTED: compile error
+
+struct Worker { u32 job_id; }
+
+u32 main() {
+    ?Handle(Worker) mh = Worker.new();
+    Handle(Worker) h = mh orelse return;
+    h.job_id = 5;
+    Worker.delete(h);
+    u32 v = h.job_id;
+    return v;
+}

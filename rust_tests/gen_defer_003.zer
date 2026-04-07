@@ -1,0 +1,20 @@
+// Defer: multiple defers execute in reverse order (LIFO)
+
+u32 seq;
+
+void push(u32 v) {
+    seq = seq * 10 + v;
+}
+
+u32 main() {
+    seq = 0;
+    defer push(3);
+    defer push(2);
+    defer push(1);
+    push(0);
+    // After main: defers fire: 1, then 2, then 3
+    // seq after push(0) = 0
+    // After defers: 0*10+1=1, 1*10+2=12, 12*10+3=123
+    if (seq != 0) { return 1; }
+    return 0;
+}

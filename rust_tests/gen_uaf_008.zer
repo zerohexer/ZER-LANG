@@ -1,0 +1,14 @@
+// UAF: Slab alloc_ptr, free through Task.delete_ptr equivalent, use after
+// EXPECTED: compile error
+
+struct Motor { u32 rpm; }
+Slab(Motor) heap;
+
+u32 main() {
+    ?*Motor mm = heap.alloc_ptr();
+    *Motor m = mm orelse return;
+    m.rpm = 1000;
+    heap.free_ptr(m);
+    m.rpm = 2000;
+    return 0;
+}

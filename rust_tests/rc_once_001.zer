@@ -1,0 +1,26 @@
+// Rust: Once::call_once — init from main thread only
+// ZER: @once { } — atomic CAS ensures single execution from main
+// Equivalent to: Rust std::sync::Once basic usage
+
+u32 ginit_count;
+u32 ginit_value;
+
+u32 main() {
+    ginit_count = 0;
+    ginit_value = 0;
+
+    @once {
+        ginit_value = 100;
+        ginit_count += 1;
+    }
+
+    // Try to trigger @once a second time — should not execute
+    @once {
+        ginit_value = 999;
+        ginit_count += 1;
+    }
+
+    if (ginit_count != 1) { return 1; }
+    if (ginit_value != 100) { return 2; }
+    return 0;
+}

@@ -1,0 +1,29 @@
+// Rust: Once::call_once — multiple threads race, only one wins
+// ZER: @once from multiple spawned threads — exactly one executes body
+// Equivalent to: Rust Once multithread race test
+
+u32 gonce_count;
+
+void racer(u32 id) {
+    @once {
+        gonce_count += 1;
+    }
+}
+
+u32 main() {
+    gonce_count = 0;
+
+    ThreadHandle t1 = spawn racer(1);
+    ThreadHandle t2 = spawn racer(2);
+    ThreadHandle t3 = spawn racer(3);
+    ThreadHandle t4 = spawn racer(4);
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    // Exactly one thread should have incremented
+    if (gonce_count != 1) { return 1; }
+    return 0;
+}

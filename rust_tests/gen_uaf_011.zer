@@ -1,0 +1,14 @@
+// UAF: slab alloc_ptr, free, read field — compile error
+// EXPECTED: compile error
+
+struct Msg { u32 code; u32 payload; }
+Slab(Msg) heap;
+
+u32 main() {
+    ?*Msg mm = heap.alloc_ptr();
+    *Msg m = mm orelse return;
+    m.code = 200;
+    m.payload = 1234;
+    heap.free_ptr(m);
+    return m.code;
+}

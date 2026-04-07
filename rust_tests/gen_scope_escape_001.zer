@@ -1,0 +1,15 @@
+// Scope escape: return pointer to local variable — compile error
+// EXPECTED: compile error
+
+struct Tmp { u32 v; }
+
+*Tmp make() {
+    Tmp local;
+    local.v = 42;
+    return &local;
+}
+
+u32 main() {
+    *Tmp p = make();
+    return p.v;
+}

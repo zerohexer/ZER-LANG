@@ -1,0 +1,8 @@
+// Division by zero literal — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u32 x = 10;
+    u32 y = x / 0;
+    return y;
+}

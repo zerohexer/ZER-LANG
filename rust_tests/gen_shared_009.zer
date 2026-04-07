@@ -1,0 +1,15 @@
+// Shared struct: threadlocal per-thread counter isolation
+
+threadlocal u32 tl_counter;
+
+void increment_local() {
+    tl_counter += 1;
+}
+
+u32 main() {
+    tl_counter = 0;
+    increment_local();
+    increment_local();
+    if (tl_counter != 2) { return 1; }
+    return 0;
+}

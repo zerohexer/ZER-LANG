@@ -1,0 +1,47 @@
+// Rust: thread::scope — multiple handles joined in order
+// ZER: multiple ThreadHandles joined sequentially
+// Equivalent to: Rust scoped threads multiple join
+
+struct Task {
+    u32 id;
+    u32 done;
+    u32 result;
+}
+
+void run_task(*Task t) {
+    t.result = t.id * 10;
+    t.done = 1;
+}
+
+u32 main() {
+    Task t1;
+    t1.id = 1;
+    t1.done = 0;
+    t1.result = 0;
+
+    Task t2;
+    t2.id = 2;
+    t2.done = 0;
+    t2.result = 0;
+
+    Task t3;
+    t3.id = 3;
+    t3.done = 0;
+    t3.result = 0;
+
+    ThreadHandle h1 = spawn run_task(&t1);
+    ThreadHandle h2 = spawn run_task(&t2);
+    ThreadHandle h3 = spawn run_task(&t3);
+
+    h1.join();
+    h2.join();
+    h3.join();
+
+    if (t1.done != 1) { return 1; }
+    if (t2.done != 1) { return 2; }
+    if (t3.done != 1) { return 3; }
+    if (t1.result != 10) { return 4; }
+    if (t2.result != 20) { return 5; }
+    if (t3.result != 30) { return 6; }
+    return 0;
+}

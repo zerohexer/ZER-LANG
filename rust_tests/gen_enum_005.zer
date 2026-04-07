@@ -1,0 +1,27 @@
+// Enum: nested enum in struct field — switch dispatch
+
+enum Phase { init, running, paused, done }
+
+struct Machine { Phase phase; u32 cycles; }
+
+u32 run_machine(*Machine m) {
+    switch (m.phase) {
+        .init => { m.phase = Phase.running; m.cycles = 0; return 0; }
+        .running => { m.cycles += 1; return 1; }
+        .paused => { return 2; }
+        .done => { return 3; }
+    }
+}
+
+u32 main() {
+    Machine m;
+    m.phase = Phase.init;
+    m.cycles = 0;
+
+    u32 r1 = run_machine(&m);
+    if (r1 != 0) { return 1; }
+    u32 r2 = run_machine(&m);
+    if (r2 != 1) { return 2; }
+    if (m.cycles != 1) { return 3; }
+    return 0;
+}

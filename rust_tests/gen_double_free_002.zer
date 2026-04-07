@@ -1,0 +1,15 @@
+// Double free: free alias, then free original
+// EXPECTED: compile error
+
+struct Slot { u32 val; }
+Pool(Slot, 4) pool;
+
+u32 main() {
+    ?Handle(Slot) mh = pool.alloc();
+    Handle(Slot) h = mh orelse return;
+    Handle(Slot) copy = h;
+    pool.get(h).val = 9;
+    pool.free(copy);
+    pool.free(h);
+    return 0;
+}

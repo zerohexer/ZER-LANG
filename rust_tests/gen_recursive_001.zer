@@ -1,0 +1,14 @@
+// Recursive: factorial — basic recursion compiles and runs
+
+u32 factorial(u32 n) {
+    if (n == 0) { return 1; }
+    return n * factorial(n - 1);
+}
+
+u32 main() {
+    if (factorial(0) != 1) { return 1; }
+    if (factorial(1) != 1) { return 2; }
+    if (factorial(5) != 120) { return 3; }
+    if (factorial(6) != 720) { return 4; }
+    return 0;
+}

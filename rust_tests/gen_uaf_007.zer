@@ -1,0 +1,15 @@
+// UAF: interior pointer — derive field pointer, free parent, use interior ptr
+// EXPECTED: compile error
+
+struct Pair { u32 a; u32 b; }
+Slab(Pair) heap;
+
+u32 main() {
+    ?*Pair mp = heap.alloc_ptr();
+    *Pair p = mp orelse return;
+    p.a = 10;
+    *u32 field_ptr = &p.a;
+    heap.free_ptr(p);
+    u32 v = field_ptr[0];
+    return v;
+}

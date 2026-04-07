@@ -1,0 +1,19 @@
+// Comptime: MAX and MIN helpers
+
+comptime u32 MAX(u32 a, u32 b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+comptime u32 MIN(u32 a, u32 b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+u32 main() {
+    u32 big = MAX(10, 20);
+    if (big != 20) { return 1; }
+    u32 small = MIN(10, 20);
+    if (small != 10) { return 2; }
+    return 0;
+}

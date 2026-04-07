@@ -1,0 +1,12 @@
+// Const: const slice return — function returns const [*]u8
+
+const [*]u8 get_name() {
+    return "ZER";
+}
+
+u32 main() {
+    const [*]u8 name = get_name();
+    if (name.len != 3) { return 1; }
+    if (name[0] != 90) { return 2; }  // 'Z' = 90
+    return 0;
+}

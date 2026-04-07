@@ -1,0 +1,21 @@
+// Async: task updates shared counter (single-threaded, no race)
+
+shared struct SharedCount { u32 n; }
+SharedCount g_count;
+
+async void inc_task() {
+    g_count.n += 1;
+    yield;
+    g_count.n += 1;
+}
+
+u32 main() {
+    g_count.n = 0;
+    _zer_async_inc_task t;
+    _zer_async_inc_task_init(&t);
+    _zer_async_inc_task_poll(&t);
+    if (g_count.n != 1) { return 1; }
+    _zer_async_inc_task_poll(&t);
+    if (g_count.n != 2) { return 2; }
+    return 0;
+}

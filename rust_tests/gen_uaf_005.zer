@@ -1,0 +1,15 @@
+// UAF: free through alias handle variable
+// EXPECTED: compile error
+
+struct Point { u32 x; u32 y; }
+Pool(Point, 4) pool;
+
+u32 main() {
+    ?Handle(Point) mh = pool.alloc();
+    Handle(Point) h = mh orelse return;
+    Handle(Point) alias = h;
+    pool.get(h).x = 3;
+    pool.free(alias);
+    u32 v = pool.get(h).x;
+    return v;
+}

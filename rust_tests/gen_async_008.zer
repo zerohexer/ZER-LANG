@@ -1,0 +1,49 @@
+// Async: three tasks, each counting to different values
+
+u32 ca;
+u32 cb;
+u32 cc;
+u32 da;
+u32 db;
+u32 dc;
+
+async void ta() {
+    u32 i = 0;
+    while (i < 2) { ca += 1; i += 1; yield; }
+    da = 1;
+}
+
+async void tb() {
+    u32 i = 0;
+    while (i < 3) { cb += 1; i += 1; yield; }
+    db = 1;
+}
+
+async void tc() {
+    u32 i = 0;
+    while (i < 1) { cc += 1; i += 1; yield; }
+    dc = 1;
+}
+
+u32 main() {
+    ca = 0; cb = 0; cc = 0;
+    da = 0; db = 0; dc = 0;
+
+    _zer_async_ta a;
+    _zer_async_tb b;
+    _zer_async_tc c;
+    _zer_async_ta_init(&a);
+    _zer_async_tb_init(&b);
+    _zer_async_tc_init(&c);
+
+    while (da == 0 || db == 0 || dc == 0) {
+        if (da == 0) { _zer_async_ta_poll(&a); }
+        if (db == 0) { _zer_async_tb_poll(&b); }
+        if (dc == 0) { _zer_async_tc_poll(&c); }
+    }
+
+    if (ca != 2) { return 1; }
+    if (cb != 3) { return 2; }
+    if (cc != 1) { return 3; }
+    return 0;
+}

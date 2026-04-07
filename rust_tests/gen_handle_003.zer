@@ -1,0 +1,15 @@
+// Handle: if-unwrap on optional handle — safe pattern
+
+struct Msg { u32 len; u32 type; }
+Pool(Msg, 4) pool;
+
+u32 main() {
+    ?Handle(Msg) mh = pool.alloc();
+    if (mh) |h| {
+        pool.get(h).len = 64;
+        pool.get(h).type = 2;
+        if (pool.get(h).len != 64) { pool.free(h); return 1; }
+        pool.free(h);
+    }
+    return 0;
+}

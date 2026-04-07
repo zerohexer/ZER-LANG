@@ -1,0 +1,16 @@
+// Arena: global escape check — arena ptr cannot escape to global — compile error
+// EXPECTED: compile error
+
+struct Box { u32 v; }
+Arena ar;
+u8[128] mem;
+*Box g_box;
+
+u32 main() {
+    ar.over(mem);
+    ?*Box mb = ar.alloc(Box);
+    *Box b = mb orelse return;
+    b.v = 5;
+    g_box = b;
+    return 0;
+}

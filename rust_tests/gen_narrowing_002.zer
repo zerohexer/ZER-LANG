@@ -1,0 +1,8 @@
+// Narrowing: i32 to u32 signed-unsigned implicit — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    i32 signed_val = -1;
+    u32 unsigned_val = signed_val;
+    return unsigned_val;
+}

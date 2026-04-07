@@ -1,0 +1,21 @@
+// Arena: bump allocator — alloc struct, use, reset
+
+struct Vec2 { u32 x; u32 y; }
+
+Arena scratch;
+u8[256] backing;
+
+u32 main() {
+    scratch.over(backing);
+
+    ?*Vec2 mv = scratch.alloc(Vec2);
+    *Vec2 v = mv orelse return;
+    v.x = 3;
+    v.y = 4;
+
+    if (v.x != 3) { return 1; }
+    if (v.y != 4) { return 2; }
+
+    scratch.reset();
+    return 0;
+}

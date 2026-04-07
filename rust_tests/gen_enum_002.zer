@@ -1,0 +1,16 @@
+// Enum: missing switch arm — compile error
+// EXPECTED: compile error
+
+enum Dir { north, south, east, west }
+
+u32 to_num(Dir d) {
+    switch (d) {
+        .north => { return 0; }
+        .south => { return 1; }
+        .east => { return 2; }
+    }
+}
+
+u32 main() {
+    return to_num(Dir.north);
+}

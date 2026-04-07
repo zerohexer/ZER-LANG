@@ -1,0 +1,8 @@
+// Narrowing: widening is always safe (u8 to u32)
+
+u32 main() {
+    u8 small = 200;
+    u32 wide = (u32)small;
+    if (wide != 200) { return 1; }
+    return 0;
+}

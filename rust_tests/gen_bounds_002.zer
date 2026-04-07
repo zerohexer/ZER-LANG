@@ -1,0 +1,12 @@
+// Bounds: compile-time constant index within bounds — safe
+
+u32 main() {
+    u32[4] buf;
+    buf[0] = 10;
+    buf[1] = 20;
+    buf[2] = 30;
+    buf[3] = 40;
+    if (buf[0] != 10) { return 1; }
+    if (buf[3] != 40) { return 2; }
+    return 0;
+}

@@ -1,0 +1,19 @@
+// Handle: reuse after free — generation check prevents stale access
+
+struct Slot { u32 data; }
+Pool(Slot, 2) pool;
+
+u32 main() {
+    ?Handle(Slot) mh1 = pool.alloc();
+    Handle(Slot) h1 = mh1 orelse return;
+    pool.get(h1).data = 10;
+    pool.free(h1);
+
+    // Re-alloc same slot — new generation
+    ?Handle(Slot) mh2 = pool.alloc();
+    Handle(Slot) h2 = mh2 orelse return;
+    pool.get(h2).data = 20;
+    if (pool.get(h2).data != 20) { return 1; }
+    pool.free(h2);
+    return 0;
+}

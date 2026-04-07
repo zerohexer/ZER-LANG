@@ -1,0 +1,27 @@
+// Rust: async fn — coroutine that completes immediately (no yield)
+// ZER: async task that runs to completion on first poll
+// Equivalent to: Rust async fn that returns Poll::Ready immediately
+
+u32 gresult;
+u32 gdone;
+
+async void instant_task() {
+    gresult = 42;
+    gdone = 1;
+    // No yield — completes on first poll
+}
+
+u32 main() {
+    gresult = 0;
+    gdone = 0;
+
+    _zer_async_instant_task task;
+    _zer_async_instant_task_init(&task);
+
+    // Single poll should complete it
+    _zer_async_instant_task_poll(&task);
+
+    if (gdone != 1) { return 1; }
+    if (gresult != 42) { return 2; }
+    return 0;
+}

@@ -1,0 +1,40 @@
+// Rust: mpsc — channel with struct messages
+// ZER: Ring buffer with struct element type
+// Equivalent to: task-comm-4 (structured message passing)
+
+struct Msg {
+    u32 id;
+    u32 value;
+}
+
+Ring(Msg, 8) chan;
+
+u32 main() {
+    Msg m1;
+    m1.id = 1;
+    m1.value = 100;
+    chan.push(m1);
+
+    Msg m2;
+    m2.id = 2;
+    m2.value = 200;
+    chan.push(m2);
+
+    ?Msg r1 = chan.pop();
+    if (r1) |v| {
+        if (v.id != 1) { return 1; }
+        if (v.value != 100) { return 2; }
+    } else {
+        return 3;
+    }
+
+    ?Msg r2 = chan.pop();
+    if (r2) |v| {
+        if (v.id != 2) { return 4; }
+        if (v.value != 200) { return 5; }
+    } else {
+        return 6;
+    }
+
+    return 0;
+}

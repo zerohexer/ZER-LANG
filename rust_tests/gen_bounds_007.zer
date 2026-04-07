@@ -1,0 +1,9 @@
+// Bounds OOB: large constant index into small array — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u8[16] buf;
+    buf[0] = 1;
+    u8 v = buf[100];
+    return (u32)v;
+}

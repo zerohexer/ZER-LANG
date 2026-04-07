@@ -1,0 +1,18 @@
+// UAF: free inside loop body, use after loop
+// EXPECTED: compile error
+
+struct Item { u32 id; }
+Pool(Item, 4) pool;
+
+u32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    pool.get(h).id = 1;
+
+    for (u32 i = 0; i < 1; i += 1) {
+        pool.free(h);
+    }
+
+    u32 x = pool.get(h).id;
+    return x;
+}

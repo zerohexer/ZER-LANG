@@ -1,0 +1,43 @@
+// Async: two tasks interleaved via round-robin polling
+
+u32 a_steps;
+u32 b_steps;
+u32 a_done;
+u32 b_done;
+
+async void task_a() {
+    a_steps += 1;
+    yield;
+    a_steps += 1;
+    a_done = 1;
+}
+
+async void task_b() {
+    b_steps += 1;
+    yield;
+    b_steps += 1;
+    yield;
+    b_steps += 1;
+    b_done = 1;
+}
+
+u32 main() {
+    a_steps = 0;
+    b_steps = 0;
+    a_done = 0;
+    b_done = 0;
+
+    _zer_async_task_a ta;
+    _zer_async_task_b tb;
+    _zer_async_task_a_init(&ta);
+    _zer_async_task_b_init(&tb);
+
+    while (a_done == 0 || b_done == 0) {
+        if (a_done == 0) { _zer_async_task_a_poll(&ta); }
+        if (b_done == 0) { _zer_async_task_b_poll(&tb); }
+    }
+
+    if (a_steps != 2) { return 1; }
+    if (b_steps != 3) { return 2; }
+    return 0;
+}

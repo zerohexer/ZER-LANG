@@ -1,0 +1,24 @@
+// Arena: multiple allocations, all valid until reset
+
+struct Point { u32 x; u32 y; }
+
+Arena arena;
+u8[512] mem;
+
+u32 main() {
+    arena.over(mem);
+
+    ?*Point pa = arena.alloc(Point);
+    *Point a = pa orelse return;
+    a.x = 1; a.y = 2;
+
+    ?*Point pb = arena.alloc(Point);
+    *Point b = pb orelse return;
+    b.x = 3; b.y = 4;
+
+    if (a.x != 1) { return 1; }
+    if (b.y != 4) { return 2; }
+
+    arena.reset();
+    return 0;
+}

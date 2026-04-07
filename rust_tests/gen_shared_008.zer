@@ -1,0 +1,13 @@
+// Shared struct: deadlock detection — descending lock order — compile error
+// EXPECTED: compile error
+
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A ga;
+B gb;
+
+u32 main() {
+    gb.y = 2;
+    ga.x = 1;
+    return 0;
+}

@@ -1,0 +1,18 @@
+// Handle: const Handle allows data mutation (const key, not const data)
+
+struct Record { u32 val; }
+Pool(Record, 4) pool;
+
+void write_record(const Handle(Record) h, u32 v) {
+    pool.get(h).val = v;
+}
+
+u32 main() {
+    ?Handle(Record) mh = pool.alloc();
+    Handle(Record) h = mh orelse return;
+    write_record(h, 99);
+    u32 v = pool.get(h).val;
+    pool.free(h);
+    if (v != 99) { return 1; }
+    return 0;
+}

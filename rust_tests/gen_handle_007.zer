@@ -1,0 +1,12 @@
+// Handle: leak — allocate but never free — compile error
+// EXPECTED: compile error
+
+struct Leak { u32 v; }
+Pool(Leak, 4) pool;
+
+u32 main() {
+    ?Handle(Leak) mh = pool.alloc();
+    Handle(Leak) h = mh orelse return;
+    pool.get(h).v = 1;
+    return 0;
+}

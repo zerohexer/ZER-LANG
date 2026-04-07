@@ -1,0 +1,10 @@
+// Modulo by unguarded variable — compile error
+// EXPECTED: compile error
+
+u32 hash(u32 key, u32 table_size) {
+    return key % table_size;
+}
+
+u32 main() {
+    return hash(42, 16);
+}

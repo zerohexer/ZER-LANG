@@ -1,0 +1,16 @@
+// Volatile: volatile field array — reads always happen
+
+struct Reg { volatile u32 status; volatile u32 data; }
+
+u32 main() {
+    Reg reg;
+    reg.status = 0;
+    reg.data = 0xDEAD;
+
+    volatile u32 s = reg.status;
+    volatile u32 d = reg.data;
+
+    if (s != 0) { return 1; }
+    if (d != 0xDEAD) { return 2; }
+    return 0;
+}

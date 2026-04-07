@@ -1,0 +1,12 @@
+// Comptime: nested comptime calls
+
+comptime u32 DOUBLE(u32 x) { return x * 2; }
+comptime u32 QUAD(u32 x) { return DOUBLE(DOUBLE(x)); }
+
+u32 main() {
+    u32 d = DOUBLE(5);
+    if (d != 10) { return 1; }
+    u32 q = QUAD(3);
+    if (q != 12) { return 2; }
+    return 0;
+}

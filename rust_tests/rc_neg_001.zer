@@ -1,0 +1,20 @@
+// Rust: Rc<T> is not Send — cannot send non-thread-safe pointer to spawn
+// ZER: spawn with raw pointer to local stack variable — compile error
+// EXPECTED: compile error
+
+struct LocalData {
+    u32 value;
+}
+
+void worker(*LocalData d) {
+    d.value = 42;
+}
+
+u32 main() {
+    LocalData local;
+    local.value = 0;
+    // ERROR: fire-and-forget spawn with non-shared *T
+    // (only ThreadHandle scoped spawn allows *T)
+    spawn worker(&local);
+    return 0;
+}

@@ -1,0 +1,8 @@
+// Narrowing: u16 to u8 without truncate — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u16 mid = 1000;
+    u8 small = mid;
+    return (u32)small;
+}

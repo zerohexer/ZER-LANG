@@ -1,0 +1,8 @@
+// Narrowing: u64 to u32 without truncate — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u64 big = 0xFFFFFFFF00000001;
+    u32 small = big;
+    return small;
+}

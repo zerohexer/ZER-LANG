@@ -1,0 +1,21 @@
+// Bounds: slice access within proven range
+
+u32 sum_slice([*]u32 data) {
+    u32 total = 0;
+    for (u32 i = 0; i < data.len; i += 1) {
+        total += data[i];
+    }
+    return total;
+}
+
+u32 main() {
+    u32[5] arr;
+    arr[0] = 1;
+    arr[1] = 2;
+    arr[2] = 3;
+    arr[3] = 4;
+    arr[4] = 5;
+    u32 s = sum_slice(arr);
+    if (s != 15) { return 1; }
+    return 0;
+}

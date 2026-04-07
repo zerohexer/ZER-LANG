@@ -1,0 +1,13 @@
+// Narrowing: @truncate chain — u64 to u32 to u16 to u8
+
+u32 main() {
+    u64 v64 = 0xFEDCBA9876543210;
+    u32 v32 = @truncate(u32, v64);
+    u16 v16 = @truncate(u16, v32);
+    u8 v8 = @truncate(u8, v16);
+
+    if (v32 != 0x76543210) { return 1; }
+    if (v16 != 0x3210) { return 2; }
+    if (v8 != 0x10) { return 3; }
+    return 0;
+}

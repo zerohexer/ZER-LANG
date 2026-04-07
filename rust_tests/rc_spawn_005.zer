@@ -1,0 +1,33 @@
+// Rust: thread::scope — two scoped threads work on different data independently
+// ZER: two ThreadHandles operate on separate local structs
+// Equivalent to: Rust scoped threads disjoint borrows
+
+struct Counter {
+    u32 val;
+}
+
+void count_up(*Counter c, u32 n) {
+    u32 i = 0;
+    while (i < n) {
+        c.val += 1;
+        i += 1;
+    }
+}
+
+u32 main() {
+    Counter ca;
+    ca.val = 0;
+
+    Counter cb;
+    cb.val = 100;
+
+    ThreadHandle ha = spawn count_up(&ca, 10);
+    ThreadHandle hb = spawn count_up(&cb, 5);
+
+    ha.join();
+    hb.join();
+
+    if (ca.val != 10) { return 1; }
+    if (cb.val != 105) { return 2; }
+    return 0;
+}

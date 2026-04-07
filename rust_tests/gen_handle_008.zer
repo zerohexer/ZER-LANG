@@ -1,0 +1,19 @@
+// Handle: Slab alloc_ptr — safe alloc, use, free
+
+struct Buffer { u32 capacity; u32 used; }
+Slab(Buffer) heap;
+
+u32 main() {
+    ?*Buffer mb = heap.alloc_ptr();
+    *Buffer b = mb orelse return;
+
+    b.capacity = 256;
+    b.used = 0;
+
+    b.used = 64;
+    if (b.capacity != 256) { return 1; }
+    if (b.used != 64) { return 2; }
+
+    heap.free_ptr(b);
+    return 0;
+}

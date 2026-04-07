@@ -1,0 +1,14 @@
+// UAF: write to field after free — compile error
+// EXPECTED: compile error
+
+struct Config { u32 timeout; }
+Pool(Config, 4) pool;
+
+u32 main() {
+    ?Handle(Config) mh = pool.alloc();
+    Handle(Config) h = mh orelse return;
+    pool.get(h).timeout = 30;
+    pool.free(h);
+    pool.get(h).timeout = 60;
+    return 0;
+}

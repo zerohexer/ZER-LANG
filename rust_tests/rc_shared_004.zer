@@ -1,0 +1,40 @@
+// Rust: Arc<Mutex<T>> + RAII guard (like MutexGuard drop)
+// ZER: shared struct + defer cleanup pattern
+// Equivalent to: Rust lock-with-drop/cleanup pattern
+
+shared struct Resource {
+    u32 acquired;
+    u32 released;
+    u32 work_done;
+}
+
+Resource gres;
+
+void worker(*Resource r, u32 work) {
+    r.acquired += 1;
+    defer r.released += 1;
+    r.work_done += work;
+    // defer fires here — auto-unlock + release count
+}
+
+u32 main() {
+    gres.acquired = 0;
+    gres.released = 0;
+    gres.work_done = 0;
+
+    ThreadHandle t1 = spawn worker(&gres, 5);
+    ThreadHandle t2 = spawn worker(&gres, 10);
+    ThreadHandle t3 = spawn worker(&gres, 15);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 acq = gres.acquired;
+    u32 rel = gres.released;
+    u32 work = gres.work_done;
+    if (acq != 3) { return 1; }
+    if (rel != 3) { return 2; }
+    if (work != 30) { return 3; }
+    return 0;
+}

@@ -1,0 +1,29 @@
+// Rust: AtomicU32::fetch_add — atomic counter from multiple threads
+// ZER: @atomic_add — increment shared counter without mutex
+// Equivalent to: Rust AtomicU32 fetch_add from threads
+
+u32 gcounter;
+
+void atomic_inc(u32 n) {
+    u32 i = 0;
+    while (i < n) {
+        @atomic_add(&gcounter, 1);
+        i += 1;
+    }
+}
+
+u32 main() {
+    gcounter = 0;
+
+    ThreadHandle t1 = spawn atomic_inc(10);
+    ThreadHandle t2 = spawn atomic_inc(10);
+    ThreadHandle t3 = spawn atomic_inc(10);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    u32 v = @atomic_load(&gcounter);
+    if (v != 30) { return 1; }
+    return 0;
+}

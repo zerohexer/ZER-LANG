@@ -1,0 +1,19 @@
+// Shared: condvar signal — wait for condition
+
+shared struct Queue { u32 count; u32 item; }
+Queue g_queue;
+
+void producer() {
+    g_queue.item = 42;
+    g_queue.count = 1;
+    @cond_signal(g_queue);
+}
+
+u32 main() {
+    g_queue.count = 0;
+    g_queue.item = 0;
+    producer();
+    if (g_queue.item != 42) { return 1; }
+    if (g_queue.count != 1) { return 2; }
+    return 0;
+}

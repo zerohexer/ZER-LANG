@@ -1,0 +1,16 @@
+// Scope escape: store pointer to local in global — compile error
+// EXPECTED: compile error
+
+struct Box { u32 val; }
+*Box g_ptr;
+
+void store_local() {
+    Box local;
+    local.val = 5;
+    g_ptr = &local;
+}
+
+u32 main() {
+    store_local();
+    return g_ptr.val;
+}

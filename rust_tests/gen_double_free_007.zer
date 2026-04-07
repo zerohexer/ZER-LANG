@@ -1,0 +1,13 @@
+// Double free: Task.delete called twice — compile error
+// EXPECTED: compile error
+
+struct Session { u32 id; }
+
+u32 main() {
+    ?Handle(Session) mh = Session.new();
+    Handle(Session) h = mh orelse return;
+    h.id = 1;
+    Session.delete(h);
+    Session.delete(h);
+    return 0;
+}

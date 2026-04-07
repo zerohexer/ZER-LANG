@@ -1,0 +1,18 @@
+// Atomic: compare-and-swap (CAS) for lock-free flag
+
+u32 flag;
+
+u32 main() {
+    flag = 0;
+    u32 expected = 0;
+    bool swapped = @atomic_cas(&flag, expected, 1);
+    if (!swapped) { return 1; }
+    if (flag != 1) { return 2; }
+
+    // Second CAS should fail — flag is now 1
+    u32 expected2 = 0;
+    bool swapped2 = @atomic_cas(&flag, expected2, 2);
+    if (swapped2) { return 3; }
+    if (flag != 1) { return 4; }
+    return 0;
+}

@@ -1,0 +1,26 @@
+// Arena: alloc_slice for struct array
+
+struct Vec3 { u32 x; u32 y; u32 z; }
+
+Arena ar;
+u8[1024] mem;
+
+u32 main() {
+    ar.over(mem);
+
+    ?[*]Vec3 mverts = ar.alloc_slice(Vec3, 4);
+    [*]Vec3 verts = mverts orelse return;
+
+    for (u32 i = 0; i < 4; i += 1) {
+        verts[i].x = i;
+        verts[i].y = i * 2;
+        verts[i].z = i * 3;
+    }
+
+    if (verts[3].x != 3) { return 1; }
+    if (verts[3].y != 6) { return 2; }
+    if (verts[3].z != 9) { return 3; }
+
+    ar.reset();
+    return 0;
+}

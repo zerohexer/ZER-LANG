@@ -1,0 +1,16 @@
+// Function pointer: basic callback pattern
+
+u32 apply(u32 (*op)(u32, u32), u32 a, u32 b) {
+    return op(a, b);
+}
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+
+u32 main() {
+    u32 sum = apply(add, 3, 4);
+    if (sum != 7) { return 1; }
+    u32 product = apply(mul, 3, 4);
+    if (product != 12) { return 2; }
+    return 0;
+}

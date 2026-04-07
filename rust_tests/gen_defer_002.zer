@@ -1,0 +1,31 @@
+// Defer: fires on early return path
+
+u32 order;
+
+void record(u32 step) {
+    order = order * 10 + step;
+}
+
+u32 test(bool early) {
+    record(1);
+    defer record(9);
+    if (early) {
+        record(2);
+        return 1;
+    }
+    record(3);
+    return 0;
+}
+
+u32 main() {
+    order = 0;
+    u32 r = test(true);
+    if (r != 1) { return 1; }
+    if (order != 129) { return 2; }
+
+    order = 0;
+    r = test(false);
+    if (r != 0) { return 3; }
+    if (order != 139) { return 4; }
+    return 0;
+}

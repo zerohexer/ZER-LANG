@@ -1,0 +1,29 @@
+// Ring: struct push/pop — value elements, not pointers
+
+struct Event { u32 type; u32 data; }
+Ring(Event, 16) events;
+
+u32 main() {
+    Event e1;
+    e1.type = 1;
+    e1.data = 100;
+    events.push(e1);
+
+    Event e2;
+    e2.type = 2;
+    e2.data = 200;
+    events.push(e2);
+
+    ?Event ve1 = events.pop();
+    if (ve1) |ev| {
+        if (ev.type != 1) { return 1; }
+        if (ev.data != 100) { return 2; }
+    }
+
+    ?Event ve2 = events.pop();
+    if (ve2) |ev| {
+        if (ev.type != 2) { return 3; }
+        if (ev.data != 200) { return 4; }
+    }
+    return 0;
+}

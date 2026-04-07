@@ -1,0 +1,13 @@
+// Narrowing: @bitcast reinterprets f32 bits as u32
+
+u32 main() {
+    f32 pi = 3.14159;
+    u32 bits = @bitcast(u32, pi);
+    // bits must be non-zero for any non-zero float
+    if (bits == 0) { return 1; }
+    // bitcast back should recover original
+    f32 recovered = @bitcast(f32, bits);
+    if (recovered < 3.0) { return 2; }
+    if (recovered > 4.0) { return 3; }
+    return 0;
+}

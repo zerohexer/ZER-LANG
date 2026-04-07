@@ -1,0 +1,16 @@
+// Scope escape: non-keep pointer parameter stored in global — compile error
+// EXPECTED: compile error
+
+struct Dev { u32 id; }
+*Dev g_dev;
+
+void register_dev(*Dev d) {
+    g_dev = d;
+}
+
+u32 main() {
+    Dev local;
+    local.id = 1;
+    register_dev(&local);
+    return 0;
+}

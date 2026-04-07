@@ -1,0 +1,21 @@
+// Defer: inside nested function scope
+
+u32 outer_ran;
+u32 inner_ran;
+
+void inner() {
+    defer inner_ran = 1;
+    u32 x = 5;
+    if (x > 3) { return; }
+    inner_ran = 99;
+}
+
+u32 main() {
+    outer_ran = 0;
+    inner_ran = 0;
+    defer outer_ran = 1;
+    inner();
+    if (inner_ran != 1) { return 1; }
+    if (outer_ran != 0) { return 2; }
+    return 0;
+}

@@ -1,0 +1,21 @@
+// Rust: JoinHandle can only be joined once (consumed by join)
+// ZER: ThreadHandle joined twice — zercheck double-join error
+// EXPECTED: compile error
+
+shared struct State {
+    u32 x;
+}
+
+State gst;
+
+void worker(*State s) {
+    s.x = 1;
+}
+
+u32 main() {
+    gst.x = 0;
+    ThreadHandle th = spawn worker(&gst);
+    th.join();
+    th.join();  // ERROR: already joined
+    return 0;
+}

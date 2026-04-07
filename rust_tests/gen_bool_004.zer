@@ -1,0 +1,14 @@
+// Bool: switch on bool — exhaustive (true + false)
+
+u32 bool_to_num(bool b) {
+    switch (b) {
+        true => { return 1; }
+        false => { return 0; }
+    }
+}
+
+u32 main() {
+    if (bool_to_num(true) != 1) { return 1; }
+    if (bool_to_num(false) != 0) { return 2; }
+    return 0;
+}

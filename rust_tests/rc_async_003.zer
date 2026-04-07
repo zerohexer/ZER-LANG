@@ -1,0 +1,46 @@
+// Rust: async fn — producer fills buffer across yields
+// ZER: async producer writes to Ring buffer, yielding between pushes
+// Equivalent to: Rust async generator/stream filling buffer
+
+Ring(u32, 16) gchan;
+u32 gproduced;
+u32 gprod_done;
+
+async void async_producer() {
+    u32 i = 0;
+    while (i < 8) {
+        gchan.push(i * 2);
+        gproduced += 1;
+        i += 1;
+        yield;
+    }
+    gprod_done = 1;
+}
+
+u32 main() {
+    gproduced = 0;
+    gprod_done = 0;
+
+    _zer_async_async_producer prod;
+    _zer_async_async_producer_init(&prod);
+
+    while (gprod_done == 0) {
+        _zer_async_async_producer_poll(&prod);
+    }
+
+    if (gproduced != 8) { return 1; }
+
+    u32 sum = 0;
+    u32 i = 0;
+    while (i < 8) {
+        ?u32 v = gchan.pop();
+        if (v) |val| {
+            sum += val;
+        }
+        i += 1;
+    }
+
+    // 0+2+4+6+8+10+12+14 = 56
+    if (sum != 56) { return 2; }
+    return 0;
+}

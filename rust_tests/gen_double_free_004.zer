@@ -1,0 +1,14 @@
+// Double free: alloc_ptr free then free_ptr again
+// EXPECTED: compile error
+
+struct Conn { u32 fd; }
+Slab(Conn) heap;
+
+u32 main() {
+    ?*Conn mc = heap.alloc_ptr();
+    *Conn c = mc orelse return;
+    c.fd = 3;
+    heap.free_ptr(c);
+    heap.free_ptr(c);
+    return 0;
+}

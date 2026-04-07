@@ -1,0 +1,32 @@
+// Rust: mpsc — wrap-around behavior (circular semantics)
+// ZER: Ring wraps around after filling and draining
+// Equivalent to: task-comm-8 (wrap-around / circular)
+
+Ring(u32, 4) chan;
+
+u32 main() {
+    // Fill, drain, fill again — tests wrap-around
+    chan.push(1);
+    chan.push(2);
+    ?u32 a = chan.pop();
+    ?u32 b = chan.pop();
+
+    chan.push(3);
+    chan.push(4);
+    chan.push(5);
+    chan.push(6);
+
+    ?u32 c = chan.pop();
+    ?u32 d = chan.pop();
+    ?u32 e = chan.pop();
+    ?u32 f = chan.pop();
+
+    if (a) |v| { if (v != 1) { return 1; } } else { return 2; }
+    if (b) |v| { if (v != 2) { return 3; } } else { return 4; }
+    if (c) |v| { if (v != 3) { return 5; } } else { return 6; }
+    if (d) |v| { if (v != 4) { return 7; } } else { return 8; }
+    if (e) |v| { if (v != 5) { return 9; } } else { return 10; }
+    if (f) |v| { if (v != 6) { return 11; } } else { return 12; }
+
+    return 0;
+}

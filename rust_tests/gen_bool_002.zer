@@ -1,0 +1,9 @@
+// Bool: no int-to-bool coercion — compile error
+// EXPECTED: compile error
+
+u32 main() {
+    u32 x = 1;
+    bool b = x;
+    if (b) { return 0; }
+    return 1;
+}

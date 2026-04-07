@@ -1,0 +1,33 @@
+// Rust: Arc<Mutex<u32>> — multiple threads increment shared counter
+// ZER: shared struct — auto-locked, spawn multiple incrementors
+// Equivalent to: Rust shared_counter test
+
+shared struct Counter {
+    u32 value;
+}
+
+Counter gctr;
+
+void inc(*Counter c) {
+    c.value += 1;
+}
+
+u32 main() {
+    gctr.value = 0;
+
+    ThreadHandle t1 = spawn inc(&gctr);
+    ThreadHandle t2 = spawn inc(&gctr);
+    ThreadHandle t3 = spawn inc(&gctr);
+    ThreadHandle t4 = spawn inc(&gctr);
+    ThreadHandle t5 = spawn inc(&gctr);
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    t5.join();
+
+    u32 v = gctr.value;
+    if (v != 5) { return 1; }
+    return 0;
+}

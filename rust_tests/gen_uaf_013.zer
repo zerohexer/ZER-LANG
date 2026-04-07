@@ -1,0 +1,20 @@
+// UAF: conditional free without early return causes maybe_freed — compile error
+// EXPECTED: compile error
+
+struct Node { u32 v; }
+Pool(Node, 4) pool;
+
+u32 main() {
+    ?Handle(Node) mh = pool.alloc();
+    Handle(Node) h = mh orelse return;
+    pool.get(h).v = 1;
+
+    bool x = false;
+    if (x) {
+        pool.free(h);
+    }
+
+    u32 val = pool.get(h).v;
+    pool.free(h);
+    return val;
+}

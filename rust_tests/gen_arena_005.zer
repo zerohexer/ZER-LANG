@@ -1,0 +1,25 @@
+// Arena: reset and reuse — memory recycled after reset
+
+struct Temp { u32 v; }
+Arena ar;
+u8[128] mem;
+
+u32 alloc_and_use(u32 val) {
+    ar.over(mem);
+    ?*Temp mt = ar.alloc(Temp);
+    *Temp t = mt orelse return;
+    t.v = val;
+    u32 r = t.v;
+    ar.reset();
+    return r;
+}
+
+u32 main() {
+    u32 r1 = alloc_and_use(11);
+    if (r1 != 11) { return 1; }
+    u32 r2 = alloc_and_use(22);
+    if (r2 != 22) { return 2; }
+    u32 r3 = alloc_and_use(33);
+    if (r3 != 33) { return 3; }
+    return 0;
+}

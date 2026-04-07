@@ -1,0 +1,37 @@
+// Rust: AtomicU32 with ordering — load/store with barrier
+// ZER: @atomic_load/@atomic_store + @barrier() for ordering
+// Equivalent to: Rust Ordering::SeqCst load/store
+
+u32 ga;
+u32 gb;
+u32 gresult;
+
+void writer_thread(u32 val) {
+    @atomic_store(&ga, val);
+    @barrier();
+    @atomic_store(&gb, 1);
+}
+
+void reader_thread(u32 ignored) {
+    u32 b = 0;
+    while (b == 0) {
+        b = @atomic_load(&gb);
+    }
+    @barrier();
+    gresult = @atomic_load(&ga);
+}
+
+u32 main() {
+    ga = 0;
+    gb = 0;
+    gresult = 0;
+
+    ThreadHandle tw = spawn writer_thread(77);
+    ThreadHandle tr = spawn reader_thread(0);
+
+    tw.join();
+    tr.join();
+
+    if (gresult != 77) { return 1; }
+    return 0;
+}

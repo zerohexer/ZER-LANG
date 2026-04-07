@@ -1,0 +1,14 @@
+// UAF: alloc_ptr — free_ptr then dereference
+// EXPECTED: compile error
+
+struct Sensor { u32 reading; }
+Slab(Sensor) heap;
+
+u32 main() {
+    ?*Sensor ms = heap.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s.reading = 42;
+    heap.free_ptr(s);
+    u32 v = s.reading;
+    return v;
+}

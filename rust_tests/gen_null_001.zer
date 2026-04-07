@@ -1,0 +1,10 @@
+// Null safety: uninitialized non-null pointer — compile error
+// EXPECTED: compile error
+
+struct Obj { u32 v; }
+
+u32 main() {
+    *Obj ptr;
+    ptr.v = 1;
+    return 0;
+}

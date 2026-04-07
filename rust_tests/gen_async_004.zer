@@ -1,0 +1,29 @@
+// Async: task with local state preserved across yield
+
+u32 final_sum;
+
+async void accumulator() {
+    u32 sum = 0;
+    u32 i = 0;
+    while (i < 5) {
+        sum += i;
+        i += 1;
+        yield;
+    }
+    final_sum = sum;
+}
+
+u32 main() {
+    final_sum = 0;
+    _zer_async_accumulator t;
+    _zer_async_accumulator_init(&t);
+
+    u32 polls = 0;
+    while (polls < 6) {
+        _zer_async_accumulator_poll(&t);
+        polls += 1;
+    }
+    // sum = 0+1+2+3+4 = 10
+    if (final_sum != 10) { return 1; }
+    return 0;
+}

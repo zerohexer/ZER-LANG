@@ -1,0 +1,15 @@
+// Null safety: non-null pointer guaranteed by construction — no null check needed
+
+struct Val { u32 n; }
+
+u32 read_val(*Val v) {
+    return v.n;
+}
+
+u32 main() {
+    Val local;
+    local.n = 55;
+    u32 r = read_val(&local);
+    if (r != 55) { return 1; }
+    return 0;
+}

@@ -1,0 +1,41 @@
+// Rust: AtomicU32::fetch_or / fetch_and — bitwise atomics
+// ZER: @atomic_or / @atomic_and on shared flag word
+// Equivalent to: Rust fetch_or/fetch_and atomic bitwise ops
+
+u32 gbits;
+
+void set_bits(u32 mask) {
+    @atomic_or(&gbits, mask);
+}
+
+void clear_bits(u32 mask) {
+    @atomic_and(&gbits, mask);
+}
+
+u32 main() {
+    gbits = 0;
+
+    // Set bits 0,1,2,3 from 4 threads
+    ThreadHandle t1 = spawn set_bits(0x1);
+    ThreadHandle t2 = spawn set_bits(0x2);
+    ThreadHandle t3 = spawn set_bits(0x4);
+    ThreadHandle t4 = spawn set_bits(0x8);
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    u32 v = @atomic_load(&gbits);
+    if (v != 0xF) { return 1; }
+
+    // Now clear bits 1 and 3
+    ThreadHandle tc1 = spawn clear_bits(0xFFFFFFFD);  // clear bit 1
+    ThreadHandle tc2 = spawn clear_bits(0xFFFFFFF7);  // clear bit 3
+    tc1.join();
+    tc2.join();
+
+    u32 v2 = @atomic_load(&gbits);
+    if (v2 != 0x5) { return 2; }
+    return 0;
+}

@@ -1,0 +1,31 @@
+// Rust: AtomicBool — flag signaling between threads
+// ZER: @atomic_store/@atomic_load for flag-based signaling
+// Equivalent to: Rust AtomicBool::store/load (SeqCst)
+
+u32 gflag;
+u32 gdata;
+
+void producer_thread(u32 val) {
+    gdata = val;
+    @barrier();
+    @atomic_store(&gflag, 1);
+}
+
+u32 main() {
+    gflag = 0;
+    gdata = 0;
+
+    ThreadHandle th = spawn producer_thread(42);
+
+    // Spin until flag is set
+    u32 f = 0;
+    while (f == 0) {
+        f = @atomic_load(&gflag);
+    }
+    @barrier();
+
+    th.join();
+
+    if (gdata != 42) { return 1; }
+    return 0;
+}

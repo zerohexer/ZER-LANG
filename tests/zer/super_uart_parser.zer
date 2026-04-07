@@ -1,0 +1,164 @@
+// Real program: UART protocol parser
+// Ring buffer + state machine + packed structs + casts + defer
+// Protocol: [0xAA] [len:u8] [cmd:u8] [payload...] [crc:u8]
+
+Ring(u8, 64) rx_buf;
+
+enum ParseState { wait_header, read_len, read_cmd, read_payload, read_crc }
+
+packed struct Packet {
+    u8 cmd;
+    u8 len;
+    u8[16] payload;
+    u8 crc;
+}
+
+struct Parser {
+    ParseState state;
+    Packet current;
+    u8 payload_idx;
+    u32 good_count;
+    u32 bad_count;
+}
+
+u8 compute_crc(u8 cmd, u8 len, u8[16] payload) {
+    u32 sum = (u32)cmd + (u32)len;
+    for (u32 i = 0; i < (u32)len; i += 1) {
+        sum += (u32)payload[i];
+    }
+    return (u8)sum;
+}
+
+void parser_init(*Parser p) {
+    p.state = ParseState.wait_header;
+    p.payload_idx = 0;
+    p.good_count = 0;
+    p.bad_count = 0;
+}
+
+// Returns true if a complete valid packet was parsed
+bool parser_feed(*Parser p, u8 byte) {
+    switch (p.state) {
+        .wait_header => {
+            if (byte == 0xAA) {
+                p.state = ParseState.read_len;
+                p.payload_idx = 0;
+            }
+        }
+        .read_len => {
+            if (byte > 16) {
+                // Invalid length — reset
+                p.state = ParseState.wait_header;
+                p.bad_count += 1;
+            } else {
+                p.current.len = byte;
+                p.state = ParseState.read_cmd;
+            }
+        }
+        .read_cmd => {
+            p.current.cmd = byte;
+            if (p.current.len == 0) {
+                p.state = ParseState.read_crc;
+            } else {
+                p.state = ParseState.read_payload;
+            }
+        }
+        .read_payload => {
+            p.current.payload[(u32)p.payload_idx] = byte;
+            p.payload_idx += 1;
+            if ((u32)p.payload_idx >= (u32)p.current.len) {
+                p.state = ParseState.read_crc;
+            }
+        }
+        .read_crc => {
+            p.current.crc = byte;
+            u8 expected = compute_crc(p.current.cmd, p.current.len, p.current.payload);
+            if (byte == expected) {
+                p.good_count += 1;
+                p.state = ParseState.wait_header;
+                return true;
+            } else {
+                p.bad_count += 1;
+                p.state = ParseState.wait_header;
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+u32 main() {
+    Parser p;
+    parser_init(&p);
+
+    // === Test 1: valid packet — cmd=0x01, len=3, payload=[10,20,30] ===
+    u8[16] pay1;
+    pay1[0] = 10; pay1[1] = 20; pay1[2] = 30;
+    u8 crc1 = compute_crc(0x01, 3, pay1);
+
+    rx_buf.push(0xAA);
+    rx_buf.push(3);
+    rx_buf.push(0x01);
+    rx_buf.push(10);
+    rx_buf.push(20);
+    rx_buf.push(30);
+    rx_buf.push(crc1);
+
+    // Feed bytes from ring to parser
+    for (u32 i = 0; i < 7; i += 1) {
+        ?u8 mb = rx_buf.pop();
+        u8 byte = mb orelse return;
+        parser_feed(&p, byte);
+    }
+
+    if (p.good_count != 1) { return 1; }
+    if (p.current.cmd != 0x01) { return 2; }
+    if (p.current.len != 3) { return 3; }
+    if (p.current.payload[0] != 10) { return 4; }
+
+    // === Test 2: invalid CRC ===
+    rx_buf.push(0xAA);
+    rx_buf.push(1);
+    rx_buf.push(0x02);
+    rx_buf.push(42);
+    rx_buf.push(0xFF);
+
+    for (u32 i = 0; i < 5; i += 1) {
+        ?u8 mb = rx_buf.pop();
+        u8 byte = mb orelse return;
+        parser_feed(&p, byte);
+    }
+
+    if (p.bad_count != 1) { return 5; }
+
+    // === Test 3: zero-length payload ===
+    u8[16] pay3;
+    u8 crc3 = compute_crc(0x03, 0, pay3);
+    rx_buf.push(0xAA);
+    rx_buf.push(0);
+    rx_buf.push(0x03);
+    rx_buf.push(crc3);
+
+    for (u32 i = 0; i < 4; i += 1) {
+        ?u8 mb = rx_buf.pop();
+        u8 byte = mb orelse return;
+        parser_feed(&p, byte);
+    }
+
+    if (p.good_count != 2) { return 6; }
+    if (p.current.cmd != 0x03) { return 7; }
+
+    // === Test 4: oversized length rejected ===
+    rx_buf.push(0xAA);
+    rx_buf.push(20);
+
+    for (u32 i = 0; i < 2; i += 1) {
+        ?u8 mb = rx_buf.pop();
+        u8 byte = mb orelse return;
+        parser_feed(&p, byte);
+    }
+
+    if (p.bad_count != 2) { return 8; }
+
+    return 0;
+}

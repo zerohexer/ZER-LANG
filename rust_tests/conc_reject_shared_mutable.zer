@@ -1,0 +1,17 @@
+// Rust equivalent: shared mutable state without lock → compile error
+// In Rust: non-Send type across thread boundary
+// In ZER: non-shared struct pointer to spawn → compile error
+
+struct Counter { u32 value; }
+
+void increment(*Counter c) {
+    c.value += 1;
+}
+
+u32 main() {
+    Counter c;
+    c.value = 0;
+    // This MUST fail — non-shared pointer to spawn = data race
+    spawn increment(&c);
+    return 0;
+}

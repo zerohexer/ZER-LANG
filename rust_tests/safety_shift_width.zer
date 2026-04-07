@@ -1,0 +1,19 @@
+// Rust: shift-near-oflo.rs — shift by type width is UB in C, runtime panic in Rust debug
+// ZER: shift >= width = 0 (defined behavior, never UB)
+
+u32 main() {
+    u8 a = 1;
+    u8 b = a << 7;
+    if (b != 128) { return 1; }
+
+    // Shift by width — Rust panics, C is UB, ZER returns 0
+    u32 x = 1;
+    u32 y = x << 32;
+    if (y != 0) { return 2; }
+
+    // Shift by more than width — same
+    u32 z = x << 33;
+    if (z != 0) { return 3; }
+
+    return 0;
+}

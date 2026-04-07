@@ -1,0 +1,12 @@
+// Rust: overflowing-add.rs — runtime panic (debug) or wrapping (release)
+// ZER: always wraps (defined behavior, never UB, never panic)
+// Result: 200u8 + 200u8 = 144 (wraps at 256)
+
+u32 main() {
+    u8 a = 200;
+    u8 b = 200;
+    u8 c = a + b;
+    // 200 + 200 = 400, wraps to 400 - 256 = 144
+    if (c != 144) { return 1; }
+    return 0;
+}

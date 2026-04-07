@@ -1,0 +1,15 @@
+// Rust: borrowck use-after-free patterns — borrow checker rejects
+// ZER: zercheck rejects use-after-free on Pool handles
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).id = 42;
+    pool.free(h);
+    pool.get(h).id = 99;
+    return 0;
+}

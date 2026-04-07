@@ -80,6 +80,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@cd test_modules && ./run_tests.sh
 	@echo "=== ZER integration tests ==="
 	@bash tests/test_zer.sh
+	@echo "=== Rust-equivalent safety tests ==="
+	@bash rust_tests/run_tests.sh ./zerc
 	@echo "=== Conversion tool tests ==="
 	@bash tests/test_convert.sh
 

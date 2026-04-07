@@ -1,0 +1,9 @@
+// Rust: implicit narrowing not allowed (u32 → u8 needs explicit cast)
+// ZER: must use @truncate or @saturate for narrowing
+// EXPECTED: compile error
+
+u32 main() {
+    u32 big = 1000;
+    u8 small = big;
+    return 0;
+}

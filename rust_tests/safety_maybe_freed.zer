@@ -1,0 +1,20 @@
+// Rust: borrow checker — conditional free makes subsequent use unsafe
+// ZER: zercheck MAYBE_FREED — use after conditional free is compile error
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).id = 1;
+
+    bool should_free = true;
+    if (should_free) {
+        pool.free(h);
+    }
+    // h may or may not be freed here — MAYBE_FREED
+    pool.get(h).id = 2;
+    return 0;
+}

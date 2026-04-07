@@ -8316,6 +8316,120 @@ bool checker_check(Checker *c, Node *file_node) {
     return c->error_count == 0;
 }
 
+/* Find the shared struct type accessed in an expression (for lock ordering) */
+static Type *find_shared_type_in_expr(Checker *c, Node *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == NODE_FIELD) {
+        Node *root = expr;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        if (root->kind == NODE_IDENT) {
+            Type *t = typemap_get(c, root);
+            if (!t) {
+                Symbol *sym = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (sym) t = sym->type;
+            }
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return eff;
+                if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                        return inner;
+                }
+            }
+        }
+    }
+    /* Recurse */
+    if (expr->kind == NODE_BINARY) {
+        Type *l = find_shared_type_in_expr(c, expr->binary.left);
+        return l ? l : find_shared_type_in_expr(c, expr->binary.right);
+    }
+    if (expr->kind == NODE_ASSIGN) {
+        Type *l = find_shared_type_in_expr(c, expr->assign.target);
+        return l ? l : find_shared_type_in_expr(c, expr->assign.value);
+    }
+    if (expr->kind == NODE_UNARY) return find_shared_type_in_expr(c, expr->unary.operand);
+    if (expr->kind == NODE_CALL) {
+        for (int i = 0; i < expr->call.arg_count; i++) {
+            Type *r = find_shared_type_in_expr(c, expr->call.args[i]);
+            if (r) return r;
+        }
+    }
+    return NULL;
+}
+
+/* Find shared type in a statement */
+static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
+    if (!stmt) return NULL;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: return find_shared_type_in_expr(c, stmt->expr_stmt.expr);
+    case NODE_VAR_DECL: return find_shared_type_in_expr(c, stmt->var_decl.init);
+    case NODE_RETURN: return find_shared_type_in_expr(c, stmt->ret.expr);
+    case NODE_IF: return find_shared_type_in_expr(c, stmt->if_stmt.cond);
+    case NODE_WHILE: return find_shared_type_in_expr(c, stmt->while_stmt.cond);
+    case NODE_FOR: {
+        Type *r = find_shared_type_in_expr(c, stmt->for_stmt.init);
+        if (!r && stmt->for_stmt.cond) r = find_shared_type_in_expr(c, stmt->for_stmt.cond);
+        return r;
+    }
+    case NODE_SWITCH: return find_shared_type_in_expr(c, stmt->switch_stmt.expr);
+    default: return NULL;
+    }
+}
+
+/* Check lock ordering within a block: shared struct accesses must be in ascending type_id.
+ * Walks into nested blocks recursively. */
+static void check_block_lock_ordering(Checker *c, Node *block) {
+    if (!block || block->kind != NODE_BLOCK) return;
+
+    uint32_t last_shared_id = 0; /* 0 = no shared access yet */
+    const char *last_shared_name = NULL;
+    uint32_t last_shared_name_len = 0;
+
+    for (int i = 0; i < block->block.stmt_count; i++) {
+        Node *stmt = block->block.stmts[i];
+        Type *shared_type = find_shared_type_in_stmt(c, stmt);
+
+        if (shared_type) {
+            uint32_t sid = shared_type->struct_type.type_id;
+            if (last_shared_id > 0 && sid != last_shared_id && sid < last_shared_id) {
+                checker_warning(c, stmt->loc.line,
+                    "potential deadlock: shared struct '%.*s' (order %u) accessed after '%.*s' (order %u) — "
+                    "always access shared structs in consistent order",
+                    (int)shared_type->struct_type.name_len, shared_type->struct_type.name, sid,
+                    (int)last_shared_name_len, last_shared_name, last_shared_id);
+            }
+            if (sid > last_shared_id || last_shared_id == 0) {
+                last_shared_id = sid;
+                last_shared_name = shared_type->struct_type.name;
+                last_shared_name_len = shared_type->struct_type.name_len;
+            }
+        }
+
+        /* Recurse into nested blocks */
+        if (stmt->kind == NODE_BLOCK) check_block_lock_ordering(c, stmt);
+        if (stmt->kind == NODE_IF) {
+            check_block_lock_ordering(c, stmt->if_stmt.then_body);
+            check_block_lock_ordering(c, stmt->if_stmt.else_body);
+        }
+        if (stmt->kind == NODE_FOR) check_block_lock_ordering(c, stmt->for_stmt.body);
+        if (stmt->kind == NODE_WHILE) check_block_lock_ordering(c, stmt->while_stmt.body);
+    }
+}
+
+/* Walk all functions and check lock ordering */
+static void check_lock_ordering(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *decl = file_node->file.decls[i];
+        if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body) {
+            check_block_lock_ordering(c, decl->func_decl.body);
+        }
+    }
+}
+
 void checker_post_passes(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
 
@@ -8333,4 +8447,10 @@ void checker_post_passes(Checker *c, Node *file_node) {
 
     /* Stack depth analysis — detect recursion */
     check_stack_depth(c, file_node);
+
+    /* Deadlock detection — lock ordering on shared structs.
+     * Within any block, shared struct accesses must be in ascending type_id order.
+     * If A (type_id=1) is accessed, then B (type_id=2), then A again after B → OK.
+     * But if B is accessed first, then A → "potential deadlock: lock ordering violation." */
+    check_lock_ordering(c, file_node);
 }

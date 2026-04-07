@@ -4136,16 +4136,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-446: set provenance when casting *T → *opaque */
+            /* BUG-446: set provenance when casting *T → *opaque.
+             * Walk through &expr to find root ident for provenance. */
             if (src_eff->kind == TYPE_POINTER &&
                 src_eff->pointer.inner->kind != TYPE_OPAQUE &&
                 (tgt_eff->kind == TYPE_OPAQUE ||
                  (tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner->kind == TYPE_OPAQUE))) {
-                /* propagate provenance to result — same as @ptrcast */
-                if (node->typecast.expr->kind == NODE_IDENT) {
+                Node *prov_src = node->typecast.expr;
+                /* walk through &, field, index to find root ident */
+                while (prov_src) {
+                    if (prov_src->kind == NODE_UNARY && prov_src->unary.op == TOK_AMP)
+                        prov_src = prov_src->unary.operand;
+                    else if (prov_src->kind == NODE_FIELD)
+                        prov_src = prov_src->field.object;
+                    else if (prov_src->kind == NODE_INDEX)
+                        prov_src = prov_src->index_expr.object;
+                    else break;
+                }
+                if (prov_src && prov_src->kind == NODE_IDENT) {
                     Symbol *src_sym = scope_lookup(c->current_scope,
-                        node->typecast.expr->ident.name,
-                        (uint32_t)node->typecast.expr->ident.name_len);
+                        prov_src->ident.name,
+                        (uint32_t)prov_src->ident.name_len);
                     if (src_sym) {
                         src_sym->provenance_type = source;
                     }
@@ -5225,6 +5236,15 @@ static void check_stmt(Checker *c, Node *node) {
                     if (eff && eff->kind == TYPE_POINTER &&
                         eff->pointer.inner->kind == TYPE_OPAQUE) {
                         Type *src_type = typemap_get(c, init->intrinsic.args[0]);
+                        if (src_type) sym->provenance_type = src_type;
+                    }
+                }
+                /* C-style cast to *opaque — same provenance as @ptrcast */
+                if (init->kind == NODE_TYPECAST) {
+                    Type *eff = type_unwrap_distinct(type);
+                    if (eff && eff->kind == TYPE_POINTER &&
+                        eff->pointer.inner->kind == TYPE_OPAQUE) {
+                        Type *src_type = typemap_get(c, init->typecast.expr);
                         if (src_type) sym->provenance_type = src_type;
                     }
                 }

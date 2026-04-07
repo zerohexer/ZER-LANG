@@ -458,7 +458,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 **Roadmap:**
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
-- **v0.2.2 (CURRENT):** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 460+ bug fixes, 2,800+ tests
+- **v0.2.2 (CURRENT):** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 460+ bug fixes, 3,100+ tests (incl. 305 Rust-equivalent safety/concurrency tests)
 - **v0.3:** better error messages, stdlib completion (io/fmt/conv)
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -666,6 +666,19 @@ ZER SYNTAX RULES (not C — these differ):
 - Optional: ?*T (null sentinel), ?T (struct with .value/.has_value), ?void (has_value ONLY, no .value)
 - Unwrap: if (opt) |val| { use(val); }  or  val = opt orelse default;
 - goto label; and label: are supported (forward + backward). Banned inside defer and @critical blocks.
+- shared struct = auto-locked mutex. shared(rw) struct = reader-writer lock.
+- spawn func(args) = fire-and-forget thread (shared ptr or value args only)
+- ThreadHandle th = spawn func(args); th.join(); = scoped spawn (allows *T)
+- @cond_wait(shared_var, condition), @cond_signal(shared_var), @cond_broadcast(shared_var)
+- @cond_timedwait(shared_var, condition, timeout_ms) returns ?void
+- @once { body } = execute exactly once (thread-safe)
+- @barrier_init(var, N) + @barrier_wait(var) = thread sync barrier
+- threadlocal u32 var = per-thread storage (__thread)
+- async void func() { yield; await cond; } = stackless coroutine
+- _zer_async_NAME type, _zer_async_NAME_init(&task), _zer_async_NAME_poll(&task)
+- Ring(T, N) = circular buffer channel (T must be struct name, push/pop)
+- @atomic_load/store/add/sub/or/and/xor/cas for atomics
+- No malloc/free — use Pool(T, N), Slab(T), Arena
 ```
 
 Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).

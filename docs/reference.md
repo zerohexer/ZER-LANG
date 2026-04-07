@@ -1997,6 +1997,102 @@ make docker-install    # build Windows binaries, install to PATH
 
 ---
 
+## CONCURRENCY
+
+### shared struct — Auto-Locked Thread-Safe Data
+```zer
+shared struct Counter { u32 value; u32 total; }
+Counter g;
+g.value = 42;              // auto: lock → write → unlock
+g.total = g.value + 1;     // same lock scope (consecutive access grouped)
+```
+
+### shared(rw) struct — Reader-Writer Lock
+```zer
+shared(rw) struct Config { u32 threshold; u32 retries; }
+Config cfg;
+cfg.threshold = 100;       // auto write lock (exclusive)
+u32 t = cfg.threshold;     // auto read lock (multiple readers OK)
+```
+
+### spawn — Thread Creation
+```zer
+// Fire-and-forget (only shared ptr or value args):
+spawn worker(&shared_state);    // OK — shared struct auto-locked
+spawn handler(42, true);        // OK — value args copied
+
+// Scoped spawn (allows *T — thread joined before scope exit):
+ThreadHandle th = spawn compute(&local_data);
+th.join();                      // MUST join — zercheck error if not
+```
+
+### Condvar — Thread Synchronization
+```zer
+@cond_wait(shared_var, shared_var.count > 0);  // wait for condition
+@cond_signal(shared_var);                       // wake one waiter
+@cond_broadcast(shared_var);                    // wake all waiters
+@cond_timedwait(shared_var, condition, 1000);   // timeout in ms → ?void
+```
+
+### threadlocal — Per-Thread Storage
+```zer
+threadlocal u32 counter;    // each thread has its own copy
+```
+
+### @once — Thread-Safe Init
+```zer
+@once {
+    global_config = load_defaults();
+}
+```
+
+### @barrier_init / @barrier_wait — Thread Barrier
+```zer
+_zer_barrier bar;
+@barrier_init(bar, 3);     // 3 threads must arrive
+@barrier_wait(bar);         // blocks until all 3 call wait
+```
+
+### Atomics
+```zer
+@atomic_store(&flag, 1);
+u32 val = @atomic_load(&flag);
+@atomic_add(&counter, 1);
+bool swapped = @atomic_cas(&lock, 0, 1);
+```
+
+### async/await — Stackless Coroutines
+```zer
+async void blink() {
+    while (true) {
+        led_on();
+        yield;              // pause, resume on next poll
+        led_off();
+        yield;
+    }
+}
+
+u32 main() {
+    _zer_async_blink task;
+    _zer_async_blink_init(&task);
+    while (true) {
+        _zer_async_blink_poll(&task);   // advance one step
+    }
+}
+```
+Zero heap, zero runtime. Each task is a stack-allocated struct (~4-50 bytes).
+
+### Deadlock Detection (Compile-Time)
+```zer
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+a.x = 1; b.y = 2;          // OK — ascending order
+b.y = 2; a.x = 1;          // COMPILE ERROR — descending order = deadlock
+```
+
+---
+
 ## WHAT ZER DOES NOT HAVE
 
 - No classes, inheritance, templates, generics

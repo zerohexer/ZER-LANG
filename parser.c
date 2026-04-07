@@ -1436,7 +1436,14 @@ static Node *parse_statement(Parser *p) {
             n->critical.body = parse_block(p);
             return n;
         }
-        /* not @critical — restore and fall through to expression parser */
+        if (check(p, TOK_IDENT) && p->current.length == 4 &&
+            memcmp(p->current.start, "once", 4) == 0) {
+            advance(p); /* consume "once" */
+            Node *n = new_node(p, NODE_ONCE);
+            n->once.body = parse_block(p);
+            return n;
+        }
+        /* not @critical/@once — restore and fall through to expression parser */
         *p->scanner = saved_s;
         p->current = saved_c;
         p->previous = saved_p2;

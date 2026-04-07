@@ -4876,17 +4876,29 @@ static Type *check_expr(Checker *c, Node *node) {
             const char *cop = name + 5;
             int coplen = nlen - 5;
             bool is_wait = (coplen == 4 && memcmp(cop, "wait", 4) == 0);
+            bool is_timedwait = (coplen == 9 && memcmp(cop, "timedwait", 9) == 0);
             bool is_signal = (coplen == 6 && memcmp(cop, "signal", 6) == 0);
             bool is_broadcast = (coplen == 9 && memcmp(cop, "broadcast", 9) == 0);
-            if (!is_wait && !is_signal && !is_broadcast) {
+            if (!is_wait && !is_timedwait && !is_signal && !is_broadcast) {
                 checker_error(c, node->loc.line,
-                    "unknown condvar intrinsic '@%.*s' — use @cond_wait, @cond_signal, or @cond_broadcast",
+                    "unknown condvar intrinsic '@%.*s' — use @cond_wait, @cond_timedwait, @cond_signal, or @cond_broadcast",
                     (int)nlen, name);
             }
             if (is_wait) {
                 if (node->intrinsic.arg_count != 2)
                     checker_error(c, node->loc.line,
                         "@cond_wait requires 2 arguments: @cond_wait(shared_var, condition)");
+            } else if (is_timedwait) {
+                if (node->intrinsic.arg_count != 3)
+                    checker_error(c, node->loc.line,
+                        "@cond_timedwait requires 3 arguments: @cond_timedwait(shared_var, condition, timeout_ms)");
+                /* Type-check the timeout arg (must be integer) */
+                if (node->intrinsic.arg_count >= 3) {
+                    Type *tt = check_expr(c, node->intrinsic.args[2]);
+                    if (tt && !type_is_integer(type_unwrap_distinct(tt)))
+                        checker_error(c, node->loc.line,
+                            "@cond_timedwait timeout must be an integer (milliseconds)");
+                }
             } else {
                 if (node->intrinsic.arg_count != 1)
                     checker_error(c, node->loc.line,
@@ -4912,7 +4924,12 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             /* Type-check the condition expression for @cond_wait */
-            if (is_wait && node->intrinsic.arg_count >= 2) {
+            /* @cond_timedwait returns ?void — null on timeout, has_value on success.
+             * Also register condvar type for cond_timedwait */
+            if (is_timedwait) {
+                result = type_optional(c->arena, ty_void);
+            }
+            if ((is_wait || is_timedwait) && node->intrinsic.arg_count >= 2) {
                 Type *ct = check_expr(c, node->intrinsic.args[1]);
                 if (ct) {
                     Type *ceff = type_unwrap_distinct(ct);
@@ -4921,6 +4938,36 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@cond_wait condition must be bool or integer expression");
                     }
                 }
+            }
+            if (!is_timedwait) result = ty_void;
+        } else if (nlen >= 8 && memcmp(name, "barrier_", 8) == 0) {
+            /* @barrier_init(var, count), @barrier_wait(var) */
+            const char *bop = name + 8;
+            int boplen = nlen - 8;
+            bool is_binit = (boplen == 4 && memcmp(bop, "init", 4) == 0);
+            bool is_bwait = (boplen == 4 && memcmp(bop, "wait", 4) == 0);
+            if (!is_binit && !is_bwait) {
+                checker_error(c, node->loc.line,
+                    "unknown barrier intrinsic '@%.*s' — use @barrier_init or @barrier_wait",
+                    (int)nlen, name);
+            }
+            if (is_binit) {
+                if (node->intrinsic.arg_count != 2)
+                    checker_error(c, node->loc.line,
+                        "@barrier_init requires 2 arguments: @barrier_init(barrier_var, thread_count)");
+                if (node->intrinsic.arg_count >= 2) {
+                    check_expr(c, node->intrinsic.args[0]);
+                    Type *ct = check_expr(c, node->intrinsic.args[1]);
+                    if (ct && !type_is_integer(type_unwrap_distinct(ct)))
+                        checker_error(c, node->loc.line,
+                            "@barrier_init count must be an integer");
+                }
+            } else if (is_bwait) {
+                if (node->intrinsic.arg_count != 1)
+                    checker_error(c, node->loc.line,
+                        "@barrier_wait requires 1 argument: @barrier_wait(barrier_var)");
+                if (node->intrinsic.arg_count >= 1)
+                    check_expr(c, node->intrinsic.args[0]);
             }
             result = ty_void;
         } else {
@@ -6669,6 +6716,13 @@ static void check_stmt(Checker *c, Node *node) {
         c->critical_depth--;
         break;
 
+    case NODE_ONCE:
+        /* @once { body } — check body */
+        if (node->once.body) {
+            check_stmt(c, node->once.body);
+        }
+        break;
+
     case NODE_SPAWN: {
         /* spawn func(args); — validate function, check arg safety */
         Symbol *func_sym = scope_lookup(c->global_scope,
@@ -7141,6 +7195,9 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     case NODE_CRITICAL:
         collect_labels(node->critical.body, labels, count, max);
         break;
+    case NODE_ONCE:
+        collect_labels(node->once.body, labels, count, max);
+        break;
     /* Nodes that cannot contain labels */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
     case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
@@ -7198,6 +7255,9 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
         break;
     case NODE_CRITICAL:
         validate_gotos(c, node->critical.body, labels, label_count);
+        break;
+    case NODE_ONCE:
+        validate_gotos(c, node->once.body, labels, label_count);
         break;
     /* Nodes that cannot contain goto */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
@@ -7269,6 +7329,8 @@ static bool contains_break(Node *node) {
         return node->expr_stmt.expr ? contains_break(node->expr_stmt.expr) : false;
     case NODE_CRITICAL:
         return contains_break(node->critical.body);
+    case NODE_ONCE:
+        return contains_break(node->once.body);
     case NODE_DEFER:
         return false; /* break banned in defer — checker rejects it */
     default: return false;
@@ -7337,6 +7399,8 @@ static bool all_paths_return(Node *node) {
         return false;
     case NODE_CRITICAL:
         return all_paths_return(node->critical.body);
+    case NODE_ONCE:
+        return all_paths_return(node->once.body);
     default:
         return false;
     }
@@ -7773,6 +7837,9 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_CRITICAL:
         scan_frame(c, frame, node->critical.body);
         break;
+    case NODE_ONCE:
+        scan_frame(c, frame, node->once.body);
+        break;
     case NODE_INTRINSIC:
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             scan_frame(c, frame, node->intrinsic.args[i]);
@@ -8042,6 +8109,9 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
     }
     if (node->kind == NODE_CRITICAL) {
         return find_return_range(c, node->critical.body, out_min, out_max, found);
+    }
+    if (node->kind == NODE_ONCE) {
+        return find_return_range(c, node->once.body, out_min, out_max, found);
     }
     return true; /* non-return statement — ok */
 }

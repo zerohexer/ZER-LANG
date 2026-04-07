@@ -2724,3 +2724,61 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 **This means:** `defer slab.free_ptr(s); ... *Src back = unwrap((*opaque)s);` — `back` has same alloc_id as `s`, so when `s` is freed by defer, `back` is covered. No false "never freed" error.
 
 **Alias walker updated:** NODE_TYPECAST now followed in the alias source walker (same loop as NODE_INTRINSIC and NODE_ORELSE). `*opaque raw = (*opaque)b` copies alloc_id + source_color from `b` to `raw`.
+
+### shared struct — Auto-Locked Thread-Safe Data (2026-04-07)
+
+**Keyword:** `shared struct Name { fields... }` — adds hidden `uint32_t _zer_lock` field. Every field access auto-locked via spinlock.
+
+**Lexer:** `TOK_SHARED` keyword. **Parser:** `shared struct` prefix (same pattern as `packed struct`). **AST:** `is_shared` on struct_decl. **Types:** `is_shared` on TYPE_STRUCT.
+
+**Emitter — block-level grouping:** NODE_BLOCK emitter scans consecutive statements with `find_shared_root_in_stmt()`. When consecutive statements access the same shared variable, ONE lock scope wraps the group. When a non-matching statement is encountered, the lock is released. Covers NODE_EXPR_STMT, NODE_VAR_DECL, NODE_RETURN, NODE_IF, NODE_WHILE, NODE_FOR, NODE_SWITCH.
+
+**Emitter — lock primitives:** `_zer_lock_acquire` (atomic exchange spinlock), `_zer_lock_release` (atomic store). Emitted in preamble.
+
+**Checker — &shared.field ban:** In NODE_UNARY TOK_AMP handler, if operand is NODE_FIELD on shared struct → compile error "pointer would bypass auto-locking."
+
+**Design doc:** `docs/SHARED_STRUCT_DESIGN.md` — full specification including interactions with defer, goto, Handle, orelse, const, arrays, function parameters.
+
+### spawn — Thread Creation (2026-04-07)
+
+**Contextual keyword:** `spawn` is NOT a reserved keyword (not TOK_SPAWN in lexer). Detected by ident match at statement position in parser. This allows `spawn` as a method name (e.g., `ecs_world.spawn()`).
+
+**Parser:** `spawn func(args);` → NODE_SPAWN with func_name + args array (arena-allocated).
+
+**Checker validation:**
+- Function must exist and be is_function
+- Pointer args: only `*shared_struct` allowed (auto-locked, safe)
+- Non-shared pointer args → compile error "data race"
+- Handle args → compile error "pool.get() not thread-safe"
+- Value args (u32, bool, struct by value) → OK, copied
+- Banned inside @critical → compile error
+
+**Emitter:** Generates pthread_create call with arg struct:
+```c
+{ struct _zer_spawn_args_N { ... }; ... pthread_create(...); pthread_detach(...); }
+```
+`#include <pthread.h>` added to preamble (guarded by `__STDC_HOSTED__`).
+
+**NODE_SPAWN in exhaustive switches:** Added to all 7 walkers + scan_frame. CRITICAL: NODE_SPAWN must NOT fall through from leaf nodes (NODE_SIZEOF, NODE_CONTINUE, etc.) — caused segfault crash (accessing spawn_stmt union member on wrong node type).
+
+### HS_TRANSFERRED — Ownership Transfer (zercheck.c, 2026-04-07)
+
+**New HandleState:** `HS_TRANSFERRED` — set when a non-shared pointer is passed to spawn (if the checker somehow allows it via future changes).
+
+**Check sites:** NODE_FIELD, NODE_INDEX, NODE_UNARY/deref, NODE_INTRINSIC/ptrcast — all check `h->state == HS_TRANSFERRED` alongside HS_FREED/HS_MAYBE_FREED. Error: "use after transfer: ownership transferred to thread at line N."
+
+**Note:** Currently, the CHECKER prevents non-shared pointers from reaching spawn, so HS_TRANSFERRED is rarely triggered. It exists as defense-in-depth for future features that might relax the checker constraint.
+
+### Deadlock Detection — Lock Ordering (checker.c, 2026-04-07)
+
+**Pass 7:** `check_lock_ordering()` runs after stack depth analysis. Walks each function body's blocks.
+
+**Algorithm:** Within any block, track the highest `type_id` of shared structs accessed. If a subsequent access has a LOWER type_id → compile error "deadlock: always access shared structs in consistent ascending order."
+
+**Helpers:** `find_shared_type_in_expr()` walks expression tree to find shared struct type. `find_shared_type_in_stmt()` dispatches by statement kind. `check_block_lock_ordering()` walks block statements and recurses into nested blocks/if/for/while.
+
+**Declaration order = lock order:** `type_id` is assigned during `register_decl` in declaration order. Earlier declared struct = lower ID = must be locked first.
+
+**Mathematically proven:** If all code acquires locks in the same total order, deadlock is impossible (Dijkstra, 1965). Same principle as Linux kernel lockdep.
+
+**Post-passes error check:** `zerc_main.c` now checks `checker.error_count` after `checker_post_passes()`. Deadlock errors prevent compilation.

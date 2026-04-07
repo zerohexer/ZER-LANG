@@ -2964,3 +2964,16 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** Param color inference now creates full ALIAS — copies alloc_id, state, pool_id, free_line, source_color from arg's HandleInfo. Result shares allocation identity with the arg.
 - **Found by:** Semantic fuzzer (`test_semantic_fuzz.c`) — `safe_opaque_*` pattern with Slab + adapter function + defer.
 - **Tests:** 1000 semantic fuzz tests across 5 seeds — zero failures after fix.
+
+### BUG-457: scan_frame NODE_SPAWN fallthrough crash (segfault)
+- **Symptom:** Compiler segfaults on any file with `continue;` or `break;` when NODE_SPAWN exists in enum. Exit code 139.
+- **Root cause:** NODE_SPAWN case placed in exhaustive switch after NODE_CONTINUE without a `break;`. NODE_CONTINUE fell through to NODE_SPAWN handler, which accessed `node->spawn_stmt.arg_count` on a NODE_CONTINUE node — wrong union member → NULL dereference.
+- **Fix:** Added `break;` between NODE_SIZEOF leaf group and NODE_SPAWN active case. NODE_SPAWN now has its own isolated case with proper break.
+- **Lesson:** When adding active cases (with logic) to exhaustive switches, NEVER place them adjacent to leaf case groups without explicit breaks. The exhaustive switch pattern prevents MISSING cases but doesn't prevent FALLTHROUGH within existing cases.
+- **Found by:** `comptime_const_arg.zer` and `comptime_if_call.zer` crashing with exit 139. ASan pinpointed exact line.
+
+### BUG-458: `shared` keyword conflicts with variable/method name `shared`
+- **Symptom:** `u32 shared;` in atomic_ops.zer → parse error. `ecs_world.spawn()` method → parse error.
+- **Root cause:** `shared` and `spawn` added as reserved keywords in lexer. Any use as variable/method name broke.
+- **Fix:** `spawn` made contextual (detected by ident match in parser, not lexer keyword). `shared` kept as keyword but `.shared` accepted as field name in field access parser. Renamed `shared` variable in atomic_ops.zer to `shared_val`.
+- **Lesson:** New keywords can break existing code. Prefer contextual keywords when the syntax is unambiguous at the call site.

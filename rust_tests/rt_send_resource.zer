@@ -1,0 +1,30 @@
+// Rust source: tests/ui/threads-sendsync/send-resource.rs
+// Safety scenario: move unique resource into thread; parent cannot use it after.
+// Rust: Box<T> moved into thread — parent's binding is consumed.
+// ZER: scoped spawn (ThreadHandle) with *T parameter — thread gets pointer to
+// the resource, join ensures parent waits before resource goes out of scope.
+// Safety property: join() before return ensures *T is valid throughout thread lifetime.
+
+struct Resource {
+    u32 id;
+    u32 processed;
+}
+
+void use_resource(*Resource r) {
+    // Thread "consumes" the resource
+    r.processed = 1;
+}
+
+u32 main() {
+    Resource res;
+    res.id = 7;
+    res.processed = 0;
+
+    // Scoped spawn: *Resource passed to thread, must join before res goes out of scope
+    ThreadHandle th = spawn use_resource(&res);
+    th.join();
+
+    // After join, we can safely inspect the resource
+    if (res.processed != 1) { return 1; }
+    return 0;
+}

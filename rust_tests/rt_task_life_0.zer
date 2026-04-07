@@ -1,0 +1,35 @@
+// Rust source: tests/ui/threads-sendsync/task-life-0.rs
+// Safety scenario: thread starts, runs to completion, parent continues independently.
+// Rust: fire-and-forget thread — parent doesn't join, continues its own work.
+// ZER: fire-and-forget spawn with value arguments (safe: no shared pointers).
+// Safety property: value args are copied — parent's stack is untouched by thread.
+// Thread lifetime is independent of parent after spawn with value args.
+
+u32 gthread_done;
+
+void worker(u32 val) {
+    // Thread works independently with its own copy of val
+    if (val == 5) {
+        @atomic_store(&gthread_done, 1);
+    }
+}
+
+u32 main() {
+    gthread_done = 0;
+
+    // Fire-and-forget: value arg (5) is copied, parent continues
+    spawn worker(5);
+
+    // Parent continues independently — doesn't need to join
+    // Wait for thread to finish so we can verify (in real fire-and-forget, we wouldn't)
+    u32 tries = 0;
+    while (tries < 10000000) {
+        u32 v = @atomic_load(&gthread_done);
+        if (v != 0) { tries = 10000001; }
+        tries += 1;
+    }
+
+    u32 v = @atomic_load(&gthread_done);
+    if (v != 1) { return 1; }
+    return 0;
+}

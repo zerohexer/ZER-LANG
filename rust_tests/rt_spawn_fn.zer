@@ -1,0 +1,27 @@
+// Rust source: tests/ui/threads-sendsync/spawn-fn.rs
+// Safety scenario: spawn a bare named function (not a closure).
+// Rust: thread::spawn(bare_function) — function passed by name, no captures.
+// ZER: spawn func() — ZER spawn always takes a function name directly.
+// Safety property: bare function spawn has no capture hazards — all state
+// must be passed explicitly or via shared globals. Verified by running to completion.
+
+shared struct Result {
+    u32 value;
+}
+
+Result gresult;
+
+void bare_function(*Result r) {
+    r.value = 100;
+}
+
+u32 main() {
+    gresult.value = 0;
+
+    ThreadHandle th = spawn bare_function(&gresult);
+    th.join();
+
+    u32 v = gresult.value;
+    if (v != 100) { return 1; }
+    return 0;
+}

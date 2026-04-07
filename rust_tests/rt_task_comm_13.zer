@@ -1,0 +1,29 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-13.rs
+// Safety scenario: spawn thread sending 10 messages, join it.
+// Verifies no deadlock: producer and consumer both finish cleanly.
+// ZER: shared counter, thread increments 10 times. Join. Verify count == 10.
+
+shared struct Counter {
+    u32 count;
+}
+
+Counter gctr;
+
+void worker(*Counter c) {
+    u32 i = 0;
+    while (i < 10) {
+        c.count += 1;
+        i += 1;
+    }
+}
+
+u32 main() {
+    gctr.count = 0;
+
+    ThreadHandle th = spawn worker(&gctr);
+    th.join();
+
+    u32 v = gctr.count;
+    if (v != 10) { return 1; }
+    return 0;
+}

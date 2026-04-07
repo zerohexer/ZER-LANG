@@ -1,0 +1,39 @@
+// Rust source: tests/ui/threads-sendsync/yield1.rs
+// Safety scenario: thread yields multiple times in a loop.
+// Rust: for _ in 0..10 { thread::yield_now(); }
+// ZER: async coroutine that yields multiple times. State (counter) preserved
+// across each yield point — proves state machine correctness.
+// Safety property: local variables survive across yield suspension points.
+
+u32 gyield_count;
+u32 gdone;
+
+async void multi_yielder() {
+    u32 i = 0;
+    while (i < 5) {
+        gyield_count += 1;
+        yield;
+        i += 1;
+    }
+    gdone = 1;
+}
+
+u32 main() {
+    gyield_count = 0;
+    gdone = 0;
+
+    _zer_async_multi_yielder task;
+    _zer_async_multi_yielder_init(&task);
+
+    // Drive to completion: 5 yields + 1 final poll to reach done
+    u32 polls = 0;
+    while (gdone == 0 && polls < 20) {
+        _zer_async_multi_yielder_poll(&task);
+        polls += 1;
+    }
+
+    if (gdone != 1) { return 1; }
+    // gyield_count incremented once per yield iteration (5 times)
+    if (gyield_count != 5) { return 2; }
+    return 0;
+}

@@ -1,0 +1,24 @@
+// Rust source: tests/ui/threads-sendsync/child-outlives-parent.rs
+// Safety scenario: thread takes ownership of data; parent must not use data after move.
+// In Rust: move closure captures owned String — parent can't access after spawn.
+// ZER equivalent: scoped spawn takes value parameter (copied into thread).
+// Parent only uses its own local state after spawn — no shared access.
+// Safety property: ZER enforces that non-shared pointers can't be sent to fire-and-forget
+// spawn. Use ThreadHandle + join for *T params, or pass by value (copy).
+
+void child2(u32 data) {
+    // Thread "owns" its copy of data — parent's original is untouched
+    if (data != 42) { return; }
+}
+
+u32 main() {
+    u32 my_data = 42;
+
+    ThreadHandle th = spawn child2(my_data);
+
+    // Parent does NOT access my_data after spawn (ownership transferred semantically)
+    // In ZER, value params are copied — this demonstrates the safe pattern
+    th.join();
+
+    return 0;
+}

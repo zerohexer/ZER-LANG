@@ -1,0 +1,35 @@
+// Rust source: tests/ui/threads-sendsync/issue-9396.rs
+// Safety scenario: try_recv polling — main busy-polls until thread sends a message.
+// Rust: try_recv() returns Err(Empty) until message arrives, then Ok(val).
+// Safety property: polling loop never races — message is either there or not.
+// ZER: atomic ready flag + value in plain globals. Poll @atomic_load in tight loop.
+
+u32 gchan_ready;
+u32 gchan_value;
+
+void sender() {
+    gchan_value = 99;
+    @atomic_store(&gchan_ready, 1);
+}
+
+u32 main() {
+    gchan_ready = 0;
+    gchan_value = 0;
+
+    ThreadHandle th = spawn sender();
+
+    // Busy-poll until message arrives (equivalent to try_recv loop)
+    u32 received = 0;
+    while (received == 0) {
+        u32 r = @atomic_load(&gchan_ready);
+        if (r != 0) {
+            received = 1;
+        }
+    }
+
+    th.join();
+
+    u32 v = gchan_value;
+    if (v != 99) { return 1; }
+    return 0;
+}

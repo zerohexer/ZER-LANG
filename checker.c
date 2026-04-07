@@ -511,7 +511,7 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
         if (arg->kind == NODE_IDENT) {
             Symbol *src = scope_lookup(c->current_scope,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
-            if (src && (src->is_local_derived || src->is_arena_derived))
+            if (src && src->is_local_derived)
                 return true;
             /* local array passed as slice → points to stack */
             if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
@@ -550,7 +550,7 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
             if (fb && fb->kind == NODE_IDENT) {
                 Symbol *src = scope_lookup(c->current_scope,
                     fb->ident.name, (uint32_t)fb->ident.name_len);
-                if (src && (src->is_local_derived || src->is_arena_derived))
+                if (src && src->is_local_derived)
                     return true;
             }
             /* recurse into nested orelse: o1 orelse o2 orelse &x */
@@ -576,7 +576,7 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                     if (ifb && ifb->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             ifb->ident.name, (uint32_t)ifb->ident.name_len);
-                        if (src && (src->is_local_derived || src->is_arena_derived))
+                        if (src && src->is_local_derived)
                             return true;
                     }
                     inner = ifb;
@@ -615,7 +615,7 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
             if (froot && froot->kind == NODE_IDENT && froot != arg) {
                 Symbol *src = scope_lookup(c->current_scope,
                     froot->ident.name, (uint32_t)froot->ident.name_len);
-                if (src && (src->is_local_derived || src->is_arena_derived))
+                if (src && src->is_local_derived)
                     return true;
             }
         }
@@ -1860,6 +1860,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     fb->ident.name, (uint32_t)fb->ident.name_len);
                                 if (src && src->is_local_derived) tsym->is_local_derived = true;
                                 if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                                if (src && src->is_from_arena) tsym->is_from_arena = true;
                             }
                             vcheck = vcheck->orelse.expr;
                         }
@@ -1884,6 +1885,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src && src->is_local_derived) tsym->is_local_derived = true;
                             if (src && src->is_arena_derived) tsym->is_arena_derived = true;
+                                if (src && src->is_from_arena) tsym->is_from_arena = true;
                             /* provenance propagation through alias (compile-time belt) */
                             if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
                             if (src && src->container_struct) {
@@ -2184,22 +2186,19 @@ static Type *check_expr(Checker *c, Node *node) {
                            (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
                     Type *obj_type = typemap_get(c, obj);
                     if (obj_type && obj_type->kind == TYPE_ARENA) {
-                        bool arena_is_global = false;
-                        if (obj->kind == NODE_IDENT) {
-                            arena_is_global = scope_lookup_local(c->global_scope,
-                                obj->ident.name, (uint32_t)obj->ident.name_len) != NULL;
+                        /* mark target root as arena-derived — ALL arenas,
+                         * including global. arena.reset() invalidates all pointers. */
+                        Node *root = node->assign.target;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                            if (root->kind == NODE_FIELD) root = root->field.object;
+                            else root = root->index_expr.object;
                         }
-                        if (!arena_is_global) {
-                            /* mark target root as arena-derived */
-                            Node *root = node->assign.target;
-                            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                                if (root->kind == NODE_FIELD) root = root->field.object;
-                                else root = root->index_expr.object;
-                            }
-                            if (root && root->kind == NODE_IDENT) {
-                                Symbol *tsym = scope_lookup(c->current_scope,
-                                    root->ident.name, (uint32_t)root->ident.name_len);
-                                if (tsym) tsym->is_arena_derived = true;
+                        if (root && root->kind == NODE_IDENT) {
+                            Symbol *tsym = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            if (tsym) {
+                                tsym->is_arena_derived = true;
+                                tsym->is_from_arena = true;
                             }
                         }
                     }
@@ -2211,7 +2210,7 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *val_sym = scope_lookup(c->current_scope,
                 node->assign.value->ident.name,
                 (uint32_t)node->assign.value->ident.name_len);
-            if (val_sym && val_sym->is_arena_derived) {
+            if (val_sym && (val_sym->is_arena_derived || val_sym->is_from_arena)) {
                 /* walk target to find root */
                 Node *root = node->assign.target;
                 while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -2236,6 +2235,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* propagate arena-derived flag to target (alias tracking) */
                     if (target_sym && !target_is_global) {
                         target_sym->is_arena_derived = true;
+                        target_sym->is_from_arena = true;
                     }
                 }
             }
@@ -5070,6 +5070,9 @@ static void check_stmt(Checker *c, Node *node) {
                             }
                             if (!arena_is_global)
                                 sym->is_arena_derived = true;
+                            /* BUG-455: ALL arena allocs (including global arena)
+                             * cannot be stored in globals. Flag separately. */
+                            sym->is_from_arena = true;
                         }
                         /* Handle auto-deref: track slab_source from pool/slab.alloc() */
                         if (obj_type && (obj_type->kind == TYPE_POOL || obj_type->kind == TYPE_SLAB)) {
@@ -5127,6 +5130,8 @@ static void check_stmt(Checker *c, Node *node) {
                                 sym_eff->kind == TYPE_OPAQUE);
                             if (src && src->is_arena_derived && can_carry_ptr)
                                 sym->is_arena_derived = true;
+                            if (src && src->is_from_arena && can_carry_ptr)
+                                sym->is_from_arena = true;
                             if (src && src->is_local_derived && can_carry_ptr)
                                 sym->is_local_derived = true;
                         }
@@ -5518,6 +5523,7 @@ static void check_stmt(Checker *c, Node *node) {
                                 croot->ident.name, (uint32_t)croot->ident.name_len);
                             if (csym && csym->is_local_derived) cap->is_local_derived = true;
                             if (csym && csym->is_arena_derived) cap->is_arena_derived = true;
+                            if (csym && csym->is_from_arena) cap->is_from_arena = true;
                         }
                     }
 
@@ -5535,6 +5541,7 @@ static void check_stmt(Checker *c, Node *node) {
                                 ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
                                  (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
                                 cap->is_arena_derived = true;
+                                cap->is_from_arena = true;
                             }
                         }
                     }
@@ -5925,6 +5932,7 @@ static void check_stmt(Checker *c, Node *node) {
                             sw_root->ident.name, (uint32_t)sw_root->ident.name_len);
                         if (src && src->is_local_derived) cap->is_local_derived = true;
                         if (src && src->is_arena_derived) cap->is_arena_derived = true;
+                        if (src && src->is_from_arena) cap->is_from_arena = true;
                     }
                 }
 

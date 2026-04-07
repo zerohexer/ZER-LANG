@@ -2942,3 +2942,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix (1):** Walk through `&`, field, index chains to find root ident in NODE_TYPECAST provenance setter.
 - **Fix (2):** Added NODE_TYPECAST case to var-decl provenance handler — extracts source type from `init->typecast.expr` via typemap, same as @ptrcast does with `init->intrinsic.args[0]`.
 - **Tests:** Existing `typecast_provenance.zer` covers named-ptr path. `(*opaque)&a` path verified manually.
+
+### BUG-455: Global arena pointer stored in global variable not caught
+- **Symptom:** `Arena scratch; ?*Cfg g = null; ... g = scratch.alloc(Cfg) orelse return;` compiles — arena pointer stored in global, dangles after `scratch.reset()`.
+- **Root cause:** `is_arena_derived` flag only set for LOCAL arena allocs (had `!arena_is_global` guard). Global arena allocs were considered "safe" — wrong, because global arenas can still be reset().
+- **Fix:** Added `is_from_arena` flag on Symbol (set for ALL arena allocs, global or local). Assignment-to-global check uses `is_from_arena`. Return/keep/call checks still use `is_arena_derived` (only local arenas — global arena pointers CAN be returned from functions safely).
+- **Tests:** `arena_global_escape.zer` (global arena ptr to global — rejected).

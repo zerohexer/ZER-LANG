@@ -181,8 +181,9 @@ struct Symbol {
     bool is_const;          /* const qualifier */
     bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
     bool is_static;         /* static storage duration */
-    bool is_arena_derived;  /* pointer from arena.alloc() — cannot escape to global/static */
+    bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
+    bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
 
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */

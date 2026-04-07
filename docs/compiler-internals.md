@@ -2695,3 +2695,27 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 **Total: 7 exhaustive walkers.** GCC `-Wswitch` warns on ALL of them when a new NODE_ type is added.
 
 **Impact:** Prevents ~10-12 bugs per version. The single highest-value refactor for long-term maintainability.
+
+### Semantic Fuzzer (tests/test_semantic_fuzz.c, 2026-04-07)
+
+**Purpose:** Generates random valid ZER programs combining safety-critical patterns, compiles with zerc, runs, and verifies: safe programs must compile AND run (exit 0), unsafe programs must be REJECTED by zerc.
+
+**Patterns tested:** Pool/Slab alloc + defer, arena wrappers (chained 1-4 levels), *opaque roundtrip with adapter functions, cast narrowing chains, interior pointer (use before free), UAF, double free, leaks, wrong-type casts, provenance violations.
+
+**Architecture:** C program with generator functions (`gen_safe_*`, `gen_unsafe_*`). RNG selects pattern, generates ZER source, writes to `/tmp/_zer_fuzz.zer`, runs `zerc --run` or `zerc -o /dev/null`. 200 tests per run, deterministic via seed.
+
+**Found bugs:** Param color aliasing for `*opaque` adapter functions — `unwrap(*opaque raw)` returning `(*T)raw` was treated as new allocation instead of alias. Fixed: param color inference copies alloc_id from arg to result.
+
+**When adding new features:** Add `gen_safe_<feature>()` + `gen_unsafe_<feature>()` to the fuzzer. Add case to the switch in main. The RNG automatically combines new patterns with existing ones — combinatorial coverage grows with each feature.
+
+**Run:** Part of `make check`. Also: `./test_semantic_fuzz [seed] [count]` for custom runs. Default: seed=42, count=200. Tested with 1000 tests across 5 seeds — zero failures.
+
+### Param Color Aliasing (zercheck.c, 2026-04-07)
+
+**Problem:** `*Src back = unwrap(raw)` where `unwrap(*opaque r) { return (*Src)r; }` — zercheck treated `back` as a new allocation needing free, even though it's the SAME memory as the arg (just re-cast).
+
+**Fix:** When param color inference detects "function returns cast of param[N]", at the call site: instead of just copying color, create a full ALIAS — copy alloc_id, state, pool_id, free_line, source_color from the arg's HandleInfo. The result shares the same allocation identity as the arg.
+
+**This means:** `defer slab.free_ptr(s); ... *Src back = unwrap((*opaque)s);` — `back` has same alloc_id as `s`, so when `s` is freed by defer, `back` is covered. No false "never freed" error.
+
+**Alias walker updated:** NODE_TYPECAST now followed in the alias source walker (same loop as NODE_INTRINSIC and NODE_ORELSE). `*opaque raw = (*opaque)b` copies alloc_id + source_color from `b` to `raw`.

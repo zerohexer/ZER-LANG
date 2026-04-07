@@ -56,8 +56,11 @@ test_production: test_production.c $(LIB_SRCS)
 test_fuzz: test_fuzz.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+test_semantic_fuzz: tests/test_semantic_fuzz.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware test_firmware2 test_firmware3 test_production test_fuzz
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -72,6 +75,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_firmware3
 	./test_production
 	./test_fuzz
+	./test_semantic_fuzz
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh
 	@echo "=== ZER integration tests ==="
@@ -111,6 +115,7 @@ clean:
 	      test_firmware3 test_firmware3.exe \
 	      test_production test_production.exe \
 	      test_fuzz test_fuzz.exe \
+	      test_semantic_fuzz test_semantic_fuzz.exe \
 	      demo_lexer demo_lexer.exe \
 	      _zer_test_out.c _zer_test_out.exe _zer_test_out.o _zer_gcc_err.txt
 	rm -rf release

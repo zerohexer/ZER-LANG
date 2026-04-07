@@ -692,7 +692,8 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         if (callee_color == ZC_COLOR_ARENA) is_arena_alloc = true;
 
         /* Param color inference: if callee returns cast of param[N],
-         * inherit the arg's color at the call site. */
+         * the result is an ALIAS of the arg — same alloc_id, same color.
+         * Covers *opaque adapter functions like opaque_to_block(). */
         if (callee_color == ZC_COLOR_UNKNOWN) {
             Node *cc = alloc_call->call.callee;
             const char *cfn = NULL; uint32_t cfl = 0;
@@ -704,15 +705,27 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     callee_sym->returns_param_color > 0) {
                     int param_idx = callee_sym->returns_param_color - 1;
                     if (param_idx < alloc_call->call.arg_count) {
-                        /* Find the arg's color from handle tracking */
                         char akey[128];
                         int aklen = handle_key_from_expr(alloc_call->call.args[param_idx],
                             akey, sizeof(akey));
                         if (aklen > 0) {
                             HandleInfo *arg_h = find_handle(ps, akey, (uint32_t)aklen);
                             if (arg_h) {
+                                /* Make result an alias of the arg — same allocation */
+                                HandleInfo *dst = find_handle(ps, vname, vlen);
+                                if (!dst) dst = add_handle(ps, vname, vlen);
+                                if (dst) {
+                                    dst->state = arg_h->state;
+                                    dst->pool_id = arg_h->pool_id;
+                                    dst->alloc_line = arg_h->alloc_line;
+                                    dst->free_line = arg_h->free_line;
+                                    dst->alloc_id = arg_h->alloc_id;
+                                    dst->source_color = arg_h->source_color;
+                                }
                                 callee_color = arg_h->source_color;
                                 if (callee_color == ZC_COLOR_ARENA) is_arena_alloc = true;
+                                /* Skip wrapper allocator — already aliased */
+                                is_arena_alloc = true; /* prevent double-registration below */
                             }
                         }
                     }

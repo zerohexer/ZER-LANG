@@ -269,6 +269,126 @@ transitive lock-order tracking in function summaries — v0.4+.
 8. `zercheck.c` — NODE_SPAWN handler, HS_TRANSFERRED checks at use sites
 9. `checker.c` — lock ordering IDs on shared struct types, ordering check in emitter grouping
 
+---
+
+## Design: Scoped Spawn (join before scope exit)
+
+### Syntax
+```zer
+ThreadHandle th = spawn worker(&shared_state);
+// ... do other work ...
+th.join();  // MUST call before function returns
+```
+
+### Semantics
+- `spawn` returns `ThreadHandle` (opaque u64 wrapping pthread_t)
+- `th.join()` blocks until thread finishes
+- zercheck tracks ThreadHandle like Handle — ALIVE at function exit without join → compile error "thread not joined"
+- This allows passing `*T` to scoped threads (non-shared) because the thread is guaranteed to finish before the caller's scope exits
+
+### Implementation
+1. **AST:** spawn_stmt gets `bool has_handle` + capture variable name
+2. **Parser:** `ThreadHandle th = spawn func(args);` parsed as var-decl with spawn init
+3. **Checker:** ThreadHandle type (TYPE_THREAD_HANDLE), must be joined before scope exit
+4. **Emitter:** `pthread_t th; pthread_create(&th, ...); ... pthread_join(th, NULL);`
+5. **zercheck:** Track ThreadHandle as ALIVE, `th.join()` marks as FREED (joined). ALIVE at exit → error "thread not joined"
+
+### Key rule
+If spawn returns ThreadHandle → *T (non-shared) args ALLOWED (scoped, will be joined).
+If spawn is fire-and-forget (no handle) → only shared struct or value args (current behavior).
+
+---
+
+## Design: Condvar (@cond_wait / @cond_signal)
+
+### Syntax
+```zer
+shared struct Queue {
+    u32[16] data;
+    u32 count;
+    // hidden: _zer_lock (spinlock) + _zer_cond (pthread_cond_t)
+}
+
+Queue q;
+
+// Producer:
+q.count += 1;
+@cond_signal(q);  // wake one waiter
+
+// Consumer:
+@cond_wait(q, q.count > 0);  // atomically: unlock, sleep, re-lock when condition true
+u32 item = q.data[q.count - 1];
+```
+
+### Semantics
+- `@cond_wait(shared_var, condition)` — must be inside shared struct access scope
+- Atomically: release lock, wait for signal, re-acquire lock, check condition
+- `@cond_signal(shared_var)` — wake one waiting thread
+- `@cond_broadcast(shared_var)` — wake all waiting threads
+
+### Implementation
+1. **Lexer:** No new tokens — @cond_wait/@cond_signal are intrinsics (like @atomic_*)
+2. **Parser:** Parsed as NODE_INTRINSIC with name "cond_wait"/"cond_signal"
+3. **Checker:** Validate arg is shared struct variable. @cond_wait requires 2 args (var + condition expr)
+4. **Emitter:**
+   - shared struct gets `pthread_cond_t _zer_cond;` field (alongside _zer_lock)
+   - `@cond_wait` → `while (!(condition)) { pthread_cond_wait(&var._zer_cond, &var._zer_lock_mtx); }`
+   - `@cond_signal` → `pthread_cond_signal(&var._zer_cond);`
+5. **Lock type:** For condvar, spinlock won't work (can't sleep on spinlock). Need pthread_mutex_t alongside spinlock. Use mutex when condvar is present, spinlock otherwise.
+
+### Detection
+If any `@cond_wait` or `@cond_signal` references a shared struct → that struct uses `pthread_mutex_t` instead of spinlock. Emitter decides based on whether the struct has condvar usage (scan file for @cond_wait/@cond_signal on that type).
+
+---
+
+## Design: Thread-Aware Ring (Typed Channel)
+
+### Syntax
+```zer
+shared Ring(Message, 16) channel;  // shared Ring = thread-safe channel
+
+// Producer thread:
+channel.push(msg);  // auto-locked (shared struct)
+
+// Consumer thread:
+?Message m = channel.pop();  // auto-locked
+Message msg = m orelse continue;  // empty = try again
+```
+
+### Semantics
+- `shared Ring(T, N)` = Ring buffer with auto-locking
+- push/pop already have memory barriers (RELEASE/ACQUIRE fence)
+- Adding `shared` wraps each operation in spinlock
+- For SPSC (single producer, single consumer), barriers alone are sufficient — shared adds unnecessary overhead. Allow `Ring(T, N)` without `shared` for SPSC pattern.
+
+### Implementation
+- Already works! `shared` on any struct adds auto-locking. Ring is a builtin that emits as a struct. Mark it `shared` → auto-locked push/pop.
+- Checker: validate that `shared Ring` push/pop args are value types (not pointers) — prevents pointer escape through channel
+- No new code needed — just documentation + checker validation on push arg type
+
+### Key insight
+Ring is ALREADY a channel. `shared Ring` is ALREADY thread-safe. The only missing piece is the checker validation that prevents sending pointers through the channel (same as spawn's non-shared-pointer check, but for Ring.push args).
+
+---
+
+## Files to modify (next session)
+
+### Scoped spawn:
+- types.h: TYPE_THREAD_HANDLE
+- checker.c: ThreadHandle type, join tracking
+- zercheck.c: ThreadHandle as trackable (ALIVE → join → FREED)
+- emitter.c: pthread_join emission
+- parser.c: ThreadHandle var-decl from spawn
+
+### Condvar:
+- checker.c: @cond_wait/@cond_signal intrinsic validation
+- emitter.c: pthread_cond_t field, pthread_cond_wait/signal emission
+- emitter.c: detect shared structs that need mutex vs spinlock
+
+### Thread-aware Ring:
+- checker.c: validate Ring.push arg is value type when Ring is shared
+- No emitter changes needed (shared auto-locking already works)
+
 ## Testing Strategy
 
 ### Positive (must compile + run):

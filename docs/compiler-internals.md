@@ -2782,3 +2782,103 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 **Mathematically proven:** If all code acquires locks in the same total order, deadlock is impossible (Dijkstra, 1965). Same principle as Linux kernel lockdep.
 
 **Post-passes error check:** `zerc_main.c` now checks `checker.error_count` after `checker_post_passes()`. Deadlock errors prevent compilation.
+
+### Scoped Spawn — ThreadHandle + join (2026-04-08)
+
+**Syntax:** `ThreadHandle th = spawn worker(&data);` + `th.join();`
+
+**Key rule:** Scoped spawn (with ThreadHandle capture) allows `*T` (non-shared pointer) args because the thread is guaranteed to be joined before the scope exits. Fire-and-forget spawn still requires `*shared_struct` or value args.
+
+**Parser:** `ThreadHandle` is a contextual ident (12 chars), detected at statement position. Parsed as NODE_SPAWN with `handle_name`/`handle_name_len` fields. `yield` and `await` are also contextual idents (5 chars).
+
+**Checker:** Registers ThreadHandle variable in scope as `u64` with `sym->is_thread_handle = true`. `th.join()` intercepted in builtin method dispatch (checks `is_thread_handle` on symbol). Scoped spawn skips the non-shared pointer error.
+
+**Emitter — proper spawn wrappers:** Pre-scan phase (`prescan_spawn_in_node`) walks entire AST, assigns unique IDs to NODE_SPAWN nodes. Wrapper functions (`_zer_spawn_wrap_N`) emitted at file scope between struct declarations and user functions. Forward declarations emitted for target functions. At NODE_SPAWN emission site, references the wrapper by ID. Scoped spawn emits `pthread_t handle_name;` + `pthread_create` (no detach). Fire-and-forget emits local `pthread_t` + detach.
+
+**zercheck:** ThreadHandle registered as ALIVE with `is_thread_handle = true`. `th.join()` detected in NODE_CALL handler — marks FREED. At function exit, ALIVE ThreadHandle → error "thread not joined: 'th' spawned but never joined — add 'th.join()' before function returns."
+
+**Previous spawn UB fixed:** Old emitter cast function pointer `(void*(*)(void*))func_name` — UB for multi-arg functions. New approach: proper wrapper function unpacks arg struct and calls the real function with typed args.
+
+### Condvar — @cond_wait / @cond_signal / @cond_broadcast / @cond_timedwait (2026-04-08)
+
+**Intrinsics:** `@cond_wait(shared_var, condition)`, `@cond_signal(shared_var)`, `@cond_broadcast(shared_var)`, `@cond_timedwait(shared_var, condition, timeout_ms)`.
+
+**Smart lock upgrade:** Pre-scan phase detects which shared struct types are referenced by @cond_* intrinsics. Those types get `pthread_mutex_t _zer_mtx` + `pthread_cond_t _zer_cond` instead of `uint32_t _zer_lock`. Lock/unlock functions (`emit_shared_lock_mode`, `emit_shared_unlock`) check `shared_needs_condvar()` to emit the correct lock type.
+
+**@cond_wait emission:** `({ pthread_mutex_lock(&var._zer_mtx); while (!(condition)) { pthread_cond_wait(&var._zer_cond, &var._zer_mtx); } pthread_mutex_unlock(&var._zer_mtx); (void)0; })`
+
+**@cond_timedwait emission:** Same pattern but uses `clock_gettime` + `pthread_cond_timedwait`. Returns `_zer_opt_void` — `.has_value = 1` if condition met, `.has_value = 0` on timeout. Requires `#include <time.h>` in preamble.
+
+**Checker:** Validates first arg is shared struct variable. @cond_wait requires 2 args, @cond_timedwait requires 3 args (last is integer timeout_ms). @cond_timedwait returns `?void`.
+
+### shared(rw) struct — Reader-Writer Locks (2026-04-08)
+
+**Syntax:** `shared(rw) struct Config { u32 threshold; }` — uses `pthread_rwlock_t` instead of spinlock.
+
+**Parser:** After consuming `TOK_SHARED`, checks for `TOK_LPAREN` + ident "rw" + `TOK_RPAREN`. Sets `is_shared_rw = true` on struct_decl.
+
+**AST/Types:** `bool is_shared_rw` added to both `struct_decl` (AST) and `struct_type` (Type).
+
+**Emitter — auto read/write detection:** Block-level grouping pre-scans the statement group to determine if ANY statement writes. `stmt_writes_shared()` checks for NODE_ASSIGN targets and NODE_CALL (conservative: any call might mutate). If group has writes → `pthread_rwlock_wrlock`. All reads → `pthread_rwlock_rdlock`. Unlock is always `pthread_rwlock_unlock`.
+
+**Preamble:** `#define _POSIX_C_SOURCE 200112L` added before includes for `pthread_rwlock_t` support.
+
+### @once { body } — Thread-Safe Init (2026-04-08)
+
+**Syntax:** `@once { body }` — executes body exactly once, thread-safe.
+
+**Parser:** Detected alongside `@critical` in the `@` + ident pattern. Creates NODE_ONCE with `once.body`.
+
+**Emitter:** `static uint32_t _zer_once_N = 0; if (!__atomic_exchange_n(&_zer_once_N, 1, __ATOMIC_ACQ_REL)) { body }` — atomic CAS ensures only one thread enters.
+
+**NODE_ONCE added to ALL exhaustive walkers:** collect_labels, validate_gotos, contains_break, all_paths_return, scan_frame, find_return_range, emit_auto_guards, prescan_spawn_in_node, emit_top_level_decl, zc_check_expr, zc_check_stmt, block_always_exits, defer free scan.
+
+### @barrier_init / @barrier_wait — Thread Barrier (2026-04-08)
+
+**Intrinsics:** `@barrier_init(var, N)` + `@barrier_wait(var)` — N threads wait until all arrive.
+
+**Implementation:** Portable (mutex + condvar, same as Rust's `std::sync::Barrier`). `_zer_barrier` struct emitted in preamble with `pthread_mutex_t`, `pthread_cond_t`, `count`, `target`, `generation` fields. `_zer_barrier_wait` increments count, broadcasts when target reached, otherwise waits on condvar with generation check for spurious wakeup.
+
+### async/await — Stackless Coroutines (2026-04-08)
+
+**Syntax:** `async void func() { yield; await cond; }` — zero-cost cooperative multitasking.
+
+**Keyword:** `TOK_ASYNC` in lexer. `yield` and `await` are contextual idents (not reserved keywords).
+
+**AST:** `func_decl.is_async` flag. NODE_YIELD (leaf, no operands). NODE_AWAIT with `await_stmt.cond` expression.
+
+**Checker — auto-registration:** When an async function is registered, checker also registers:
+- `_zer_async_NAME` — struct type (state machine)
+- `_zer_async_NAME_init` — function taking `*_zer_async_NAME`, returns void
+- `_zer_async_NAME_poll` — function taking `*_zer_async_NAME`, returns i32
+Uses `add_symbol_internal()` to bypass BUG-276 `_zer_` prefix check.
+
+**Emitter — Duff's device transformation:**
+1. `collect_async_locals()` — scans body for NODE_VAR_DECL, collects names + lengths
+2. Emits `typedef struct { int _zer_state; type field1; type field2; ... } _zer_async_NAME;`
+3. Emits `_init` function (memset 0)
+4. Emits `_poll` function with `switch (self->_zer_state) { case 0:; body }`
+5. NODE_YIELD emits: `self->_zer_state = N; return 0; case N:;`
+6. NODE_AWAIT emits: `case N:; if (!(cond)) { self->_zer_state = N; return 0; }`
+7. NODE_VAR_DECL in async mode: emits `self->name = init;` (no type declaration)
+8. NODE_IDENT in async mode: `is_async_local()` check → emits `self->name`
+
+**Duff's device:** The switch/case labels can jump INTO while/for loops — this is valid C since 1983. Enables yield/await inside loops without special loop handling. The compiler's normal while/for emission works unchanged.
+
+**TYPE_STRUCT for async types:** Emitter checks `_zer_async_` prefix in TYPE_STRUCT emission — skips `struct` keyword (uses typedef name directly).
+
+**Zero overhead:** No heap allocation, no runtime scheduler. Each task is a stack-allocated struct (~4-50 bytes). Poll function is a flat switch — branch predictor handles it efficiently.
+
+### Ring Channel Pointer Warning (2026-04-08)
+
+**Checker:** In Ring.push() and Ring.push_checked() method handling, checks if the Ring's element type is TYPE_POINTER or TYPE_OPAQUE. If so, emits warning: "pushing pointer through Ring channel — pointer may not be valid in receiver context."
+
+### threadlocal Keyword (2026-04-07)
+
+**Keyword:** `TOK_THREADLOCAL` in lexer, recognized for 't' case, 11 chars.
+
+**AST:** `bool is_threadlocal` on var_decl.
+
+**Parser:** `threadlocal` prefix handled before `const` in `parse_declaration`. Sets `is_threadlocal = true`.
+
+**Emitter:** `emit_global_var` emits `__thread` prefix for threadlocal globals.

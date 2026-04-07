@@ -479,53 +479,85 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
     }
 }
 
-/* Check if a function's return statements all come from arena.alloc().
- * Used to exclude wrapper functions from handle tracking — arena allocs
- * don't need individual free (arena.reset() frees everything). */
-static bool func_returns_arena(ZerCheck *zc, Node *call) {
-    if (!call || call->kind != NODE_CALL) return false;
-    /* Look up the callee's function body */
-    Node *callee = call->call.callee;
-    const char *fname = NULL;
-    uint32_t flen = 0;
-    if (callee && callee->kind == NODE_IDENT) {
-        fname = callee->ident.name;
-        flen = (uint32_t)callee->ident.name_len;
-    } else if (callee && callee->kind == NODE_FIELD) {
-        fname = callee->field.field_name;
-        flen = (uint32_t)callee->field.field_name_len;
-    }
-    if (!fname) return false;
+/* Determine allocation color of a function's return value.
+ * Transitive: if f() returns g(), and g() returns arena.alloc(), f is ARENA.
+ * Cached on Symbol.returns_color_cache to avoid re-scanning. Depth-limited. */
+static int _returns_color_depth = 0;
+
+static int func_returns_color_by_name(ZerCheck *zc, const char *fname, uint32_t flen) {
+    if (_returns_color_depth > 8) return ZC_COLOR_UNKNOWN;
     Symbol *sym = scope_lookup(zc->checker->global_scope, fname, flen);
-    if (!sym || !sym->func_node || !sym->func_node->func_decl.body) return false;
-    /* Scan return statements for arena.alloc() */
+    if (!sym || !sym->func_node || !sym->func_node->func_decl.body) return ZC_COLOR_UNKNOWN;
+    /* Check cache — returns_color_cached is stored on Symbol */
+    if (sym->returns_color_cached) return sym->returns_color_value;
+
     Node *body = sym->func_node->func_decl.body;
-    if (body->kind != NODE_BLOCK) return false;
+    if (body->kind != NODE_BLOCK) return ZC_COLOR_UNKNOWN;
+
+    int result_color = -1; /* -1 = no returns seen */
+    _returns_color_depth++;
+
     for (int i = 0; i < body->block.stmt_count; i++) {
         Node *stmt = body->block.stmts[i];
         if (stmt->kind != NODE_RETURN || !stmt->ret.expr) continue;
         Node *ret_expr = stmt->ret.expr;
-        /* Walk through orelse */
         if (ret_expr->kind == NODE_ORELSE) ret_expr = ret_expr->orelse.expr;
-        /* Check if it's arena.alloc() or arena.alloc_slice() */
+        if (ret_expr->kind == NODE_NULL_LIT) continue;
+
+        int this_color = ZC_COLOR_UNKNOWN;
+
+        /* Direct arena/pool/slab.alloc() */
         if (ret_expr->kind == NODE_CALL && ret_expr->call.callee &&
             ret_expr->call.callee->kind == NODE_FIELD) {
             Node *obj = ret_expr->call.callee->field.object;
-            const char *mname = ret_expr->call.callee->field.field_name;
-            uint32_t mlen = (uint32_t)ret_expr->call.callee->field.field_name_len;
-            if (obj && ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
-                        (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
+            const char *mn = ret_expr->call.callee->field.field_name;
+            uint32_t ml = (uint32_t)ret_expr->call.callee->field.field_name_len;
+            if (obj && ((ml == 5 && memcmp(mn, "alloc", 5) == 0) ||
+                        (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) ||
+                        (ml == 11 && memcmp(mn, "alloc_slice", 11) == 0))) {
                 Type *obj_type = checker_get_type(zc->checker, obj);
                 if (!obj_type && obj->kind == NODE_IDENT) {
                     Symbol *osym = scope_lookup(zc->checker->global_scope,
                         obj->ident.name, (uint32_t)obj->ident.name_len);
                     if (osym) obj_type = osym->type;
                 }
-                if (obj_type && obj_type->kind == TYPE_ARENA) return true;
+                if (obj_type && obj_type->kind == TYPE_ARENA) this_color = ZC_COLOR_ARENA;
+                else if (obj_type && (obj_type->kind == TYPE_POOL || obj_type->kind == TYPE_SLAB))
+                    this_color = ZC_COLOR_POOL;
             }
         }
+
+        /* Transitive: return calls another function — recurse */
+        if (this_color == ZC_COLOR_UNKNOWN && ret_expr->kind == NODE_CALL) {
+            Node *cc = ret_expr->call.callee;
+            const char *cfn = NULL; uint32_t cfl = 0;
+            if (cc && cc->kind == NODE_IDENT) { cfn = cc->ident.name; cfl = (uint32_t)cc->ident.name_len; }
+            else if (cc && cc->kind == NODE_FIELD) { cfn = cc->field.field_name; cfl = (uint32_t)cc->field.field_name_len; }
+            if (cfn) this_color = func_returns_color_by_name(zc, cfn, cfl);
+        }
+
+        /* Merge: first return sets color, mismatch → UNKNOWN */
+        if (result_color == -1) result_color = this_color;
+        else if (result_color != this_color) { result_color = ZC_COLOR_UNKNOWN; break; }
     }
-    return false;
+
+    _returns_color_depth--;
+    if (result_color == -1) result_color = ZC_COLOR_UNKNOWN;
+
+    /* Cache result */
+    sym->returns_color_cached = true;
+    sym->returns_color_value = result_color;
+    return result_color;
+}
+
+static int func_returns_color(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return ZC_COLOR_UNKNOWN;
+    Node *callee = call->call.callee;
+    const char *fname = NULL; uint32_t flen = 0;
+    if (callee && callee->kind == NODE_IDENT) { fname = callee->ident.name; flen = (uint32_t)callee->ident.name_len; }
+    else if (callee && callee->kind == NODE_FIELD) { fname = callee->field.field_name; flen = (uint32_t)callee->field.field_name_len; }
+    if (!fname) return ZC_COLOR_UNKNOWN;
+    return func_returns_color_by_name(zc, fname, flen);
 }
 
 /* check if an assignment is h = pool.alloc() — register handle */
@@ -579,6 +611,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                 h->pool_id = pool_id;
                 h->alloc_line = var_node->loc.line;
                 h->alloc_id = zc->next_alloc_id++;
+                h->source_color = ZC_COLOR_POOL;
             }
             } /* end else (not arena) */
         }
@@ -598,6 +631,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             h->pool_id = -2; /* -2 = malloc'd (not pool, not param) */
             h->alloc_line = var_node->loc.line;
             h->alloc_id = zc->next_alloc_id++;
+            h->source_color = ZC_COLOR_MALLOC;
         }
     }
 
@@ -619,10 +653,13 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             if (atype && atype->kind == TYPE_ARENA) is_arena_alloc = true;
         }
     }
-    /* Also check if the callee function returns an arena.alloc() — wrapper
-     * functions like freelist_alloc() that internally use arena don't need tracking */
+    /* Allocation coloring: check callee's return color transitively.
+     * Arena wrappers (even chained: app → driver → hal → arena.alloc)
+     * return ZC_COLOR_ARENA → skip handle tracking. */
+    int callee_color = ZC_COLOR_UNKNOWN;
     if (!is_arena_alloc && alloc_call && alloc_call->kind == NODE_CALL) {
-        if (func_returns_arena(zc, alloc_call)) is_arena_alloc = true;
+        callee_color = func_returns_color(zc, alloc_call);
+        if (callee_color == ZC_COLOR_ARENA) is_arena_alloc = true;
     }
     if (alloc_call && alloc_call->kind == NODE_CALL &&
         !find_handle(ps, vname, vlen) && !is_arena_alloc) {
@@ -681,6 +718,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                             dst->alloc_line = src->alloc_line;
                             dst->free_line = src->free_line;
                             dst->alloc_id = src->alloc_id;
+                            dst->source_color = src->source_color;
                         }
                     }
                 }
@@ -719,7 +757,8 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     dst->pool_id = src->pool_id;
                     dst->alloc_line = src->alloc_line;
                     dst->free_line = src->free_line;
-                    dst->alloc_id = src->alloc_id; /* same allocation */
+                    dst->alloc_id = src->alloc_id;
+                            dst->source_color = src->source_color; /* same allocation */
                 }
             }
             /* Struct copy aliasing: if source has tracked fields like "s1.h",
@@ -745,6 +784,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                             dst->alloc_line = ps->handles[hi].alloc_line;
                             dst->free_line = ps->handles[hi].free_line;
                             dst->alloc_id = ps->handles[hi].alloc_id;
+                            dst->source_color = ps->handles[hi].source_color;
                         }
                     }
                 }
@@ -956,6 +996,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                         dst->alloc_line = src->alloc_line;
                                         dst->free_line = src->free_line;
                                         dst->alloc_id = src->alloc_id;
+                            dst->source_color = src->source_color;
                                     }
                                 }
                             }
@@ -981,6 +1022,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                     dst->alloc_line = src->alloc_line;
                                     dst->free_line = src->free_line;
                                     dst->alloc_id = src->alloc_id;
+                            dst->source_color = src->source_color;
                                 }
                             }
                         }
@@ -1883,6 +1925,8 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
         bool is_param = (ps.handles[i].pool_id == -1 &&
                          ps.handles[i].alloc_line == (int)func->loc.line);
         if (is_param) continue;
+        /* Arena-colored allocations don't need individual free */
+        if (ps.handles[i].source_color == ZC_COLOR_ARENA) continue;
         if (ps.handles[i].state != HS_ALIVE && ps.handles[i].state != HS_MAYBE_FREED) continue;
         /* check if this allocation is covered */
         bool covered = false;

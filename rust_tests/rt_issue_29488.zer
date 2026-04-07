@@ -1,0 +1,40 @@
+// Rust source: tests/ui/threads-sendsync/issue-29488.rs
+// TLS with Drop, thread-local init order.
+// ZER: threadlocal u32 — each thread has its own copy; verify isolation.
+
+threadlocal u32 tls_val;
+
+shared struct Result { u32 main_saw; u32 t1_saw; u32 t2_saw; }
+Result res;
+
+void worker1(*Result r) {
+    tls_val = 111;
+    r.t1_saw = tls_val;
+}
+
+void worker2(*Result r) {
+    tls_val = 222;
+    r.t2_saw = tls_val;
+}
+
+u32 main() {
+    res.main_saw = 0;
+    res.t1_saw = 0;
+    res.t2_saw = 0;
+
+    tls_val = 99;
+
+    ThreadHandle t1 = spawn worker1(&res);
+    ThreadHandle t2 = spawn worker2(&res);
+    t1.join();
+    t2.join();
+
+    res.main_saw = tls_val;
+
+    // Main thread still sees 99 (its own TLS)
+    if (res.main_saw != 99) { return 1; }
+    // Each worker saw its own value
+    if (res.t1_saw != 111) { return 2; }
+    if (res.t2_saw != 222) { return 3; }
+    return 0;
+}

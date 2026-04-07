@@ -1,0 +1,39 @@
+// Rust source: tests/ui/threads-sendsync/recursive-thread-spawn.rs
+// 1024+ recursive thread spawns. Each spawns the next, 1457 generations deep.
+// ZER: Iterative translation — spawn 10 threads sequentially, each incrementing counter.
+
+shared struct Counter { u32 n; }
+Counter ctr;
+
+void step(*Counter c) {
+    c.n += 1;
+}
+
+u32 main() {
+    ctr.n = 0;
+
+    ThreadHandle t0 = spawn step(&ctr);
+    t0.join();
+    ThreadHandle t1 = spawn step(&ctr);
+    t1.join();
+    ThreadHandle t2 = spawn step(&ctr);
+    t2.join();
+    ThreadHandle t3 = spawn step(&ctr);
+    t3.join();
+    ThreadHandle t4 = spawn step(&ctr);
+    t4.join();
+    ThreadHandle t5 = spawn step(&ctr);
+    t5.join();
+    ThreadHandle t6 = spawn step(&ctr);
+    t6.join();
+    ThreadHandle t7 = spawn step(&ctr);
+    t7.join();
+    ThreadHandle t8 = spawn step(&ctr);
+    t8.join();
+    ThreadHandle t9 = spawn step(&ctr);
+    t9.join();
+
+    u32 n = ctr.n;
+    if (n != 10) { return 1; }
+    return 0;
+}

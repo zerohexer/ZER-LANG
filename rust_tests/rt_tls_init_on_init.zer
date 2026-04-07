@@ -1,0 +1,49 @@
+// Rust source: tests/ui/threads-sendsync/tls-init-on-init.rs
+// TLS re-entrant initialization — TLS init function accesses same TLS again.
+// ZER: threadlocal with @once for init; access from thread, verify count.
+
+threadlocal u32 tls_count;
+
+u32 g_initialized;
+
+void ensure_init() {
+    @once {
+        g_initialized = 1;
+    }
+    // Re-entrant: accessing tls_count from within the init-once block is safe
+    // because threadlocal is per-thread and @once is global.
+    tls_count += 1;
+}
+
+shared struct Result { u32 t1_count; u32 t2_count; }
+Result res;
+
+void worker1(*Result r) {
+    ensure_init();
+    ensure_init();
+    r.t1_count = tls_count;
+}
+
+void worker2(*Result r) {
+    ensure_init();
+    r.t2_count = tls_count;
+}
+
+u32 main() {
+    g_initialized = 0;
+    res.t1_count = 0;
+    res.t2_count = 0;
+
+    ThreadHandle t1 = spawn worker1(&res);
+    ThreadHandle t2 = spawn worker2(&res);
+    t1.join();
+    t2.join();
+
+    // worker1 called ensure_init twice → tls_count = 2
+    if (res.t1_count != 2) { return 1; }
+    // worker2 called ensure_init once → tls_count = 1
+    if (res.t2_count != 1) { return 2; }
+    // @once fired exactly once across both threads
+    if (g_initialized != 1) { return 3; }
+    return 0;
+}

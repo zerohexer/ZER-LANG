@@ -1,0 +1,64 @@
+// Rust source: tests/ui/threads-sendsync/sync-send-in-std.rs
+// All std sync types are Send+Sync: Mutex, RwLock, Condvar, Barrier, Arc, Once.
+// ZER: shared struct is always thread-safe by construction. shared(rw) for rwlock.
+// @once for Once. Just verify usage compiles and works correctly.
+
+shared struct Mutex { u32 value; }
+shared(rw) struct RwData { u32 readers; u32 data; }
+shared struct BarrierState { u32 count; u32 generation; }
+
+Mutex mtx;
+RwData rwd;
+BarrierState bar;
+
+u32 g_once_val;
+
+void mutex_worker(*Mutex m) {
+    m.value += 1;
+}
+
+void rwlock_reader(*RwData r) {
+    u32 v = r.data;
+    if (v > 0) {
+        r.readers += 1;
+    }
+}
+
+void once_worker(u32 id) {
+    @once {
+        g_once_val = 42;
+    }
+}
+
+u32 main() {
+    // Mutex: shared struct — auto-locked
+    mtx.value = 0;
+    ThreadHandle t1 = spawn mutex_worker(&mtx);
+    ThreadHandle t2 = spawn mutex_worker(&mtx);
+    t1.join();
+    t2.join();
+    u32 mv = mtx.value;
+    if (mv != 2) { return 1; }
+
+    // RwLock: shared(rw) struct — multiple readers, exclusive writer
+    rwd.data = 10;
+    rwd.readers = 0;
+    ThreadHandle r1 = spawn rwlock_reader(&rwd);
+    ThreadHandle r2 = spawn rwlock_reader(&rwd);
+    ThreadHandle r3 = spawn rwlock_reader(&rwd);
+    r1.join();
+    r2.join();
+    r3.join();
+    u32 rc = rwd.readers;
+    if (rc != 3) { return 2; }
+
+    // Once: @once — init exactly once across all threads
+    g_once_val = 0;
+    ThreadHandle o1 = spawn once_worker(1);
+    ThreadHandle o2 = spawn once_worker(2);
+    o1.join();
+    o2.join();
+    if (g_once_val != 42) { return 3; }
+
+    return 0;
+}

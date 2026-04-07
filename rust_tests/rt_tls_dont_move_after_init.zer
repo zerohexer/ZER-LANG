@@ -1,0 +1,34 @@
+// Rust source: tests/ui/threads-sendsync/tls-dont-move-after-init.rs
+// TLS pointer stability — TLS stores self-pointer in Cell.
+// ZER: threadlocal u32 with multiple accesses, verify consistency.
+
+threadlocal u32 tls_data;
+
+shared struct Result { u32 ok; }
+Result res;
+
+void worker(*Result r) {
+    // Set TLS value
+    tls_data = 0xCAFE;
+
+    // Access multiple times — must see same value (stable, not moved)
+    u32 first = tls_data;
+    u32 second = tls_data;
+    u32 third = tls_data;
+
+    if (first == 0xCAFE && second == 0xCAFE && third == 0xCAFE) {
+        r.ok = 1;
+    } else {
+        r.ok = 0;
+    }
+}
+
+u32 main() {
+    res.ok = 0;
+
+    ThreadHandle th = spawn worker(&res);
+    th.join();
+
+    if (res.ok != 1) { return 1; }
+    return 0;
+}

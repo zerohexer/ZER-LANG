@@ -1,0 +1,20 @@
+// Rust source: tests/ui/threads-sendsync/task-spawn-barefn.rs
+// Spawn bare function (not closure). thread::spawn(startfn).
+// ZER: spawn startfn() — already how ZER works.
+
+shared struct Result { u32 value; }
+Result res;
+
+void startfn(*Result r) {
+    r.value = 1;
+}
+
+u32 main() {
+    res.value = 0;
+
+    ThreadHandle th = spawn startfn(&res);
+    th.join();
+
+    if (res.value != 1) { return 1; }
+    return 0;
+}

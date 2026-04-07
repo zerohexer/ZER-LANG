@@ -1,0 +1,29 @@
+// Rust source: tests/ui/threads-sendsync/comm.rs
+// Basic channel: child sends 10, parent receives and asserts == 10.
+// ZER: shared struct with value + ready flag; thread sets value, signals; main reads.
+
+shared struct Chan {
+    u32 value;
+    u32 ready;
+}
+
+Chan ch;
+
+void child(*Chan c) {
+    c.value = 10;
+    c.ready = 1;
+    @cond_signal(c);
+}
+
+u32 main() {
+    ch.value = 0;
+    ch.ready = 0;
+
+    ThreadHandle th = spawn child(&ch);
+    @cond_wait(ch, ch.ready > 0);
+    u32 v = ch.value;
+    th.join();
+
+    if (v != 10) { return 1; }
+    return 0;
+}

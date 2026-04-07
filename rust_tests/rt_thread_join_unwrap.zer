@@ -1,0 +1,14 @@
+// Rust source: tests/ui/threads-sendsync/thread-join-unwrap.rs
+// Unwrap result of join. Issue #21291.
+// thread::spawn(|| {}).join().unwrap() — minimal join test.
+// ZER: ThreadHandle th = spawn noop(); th.join(); — minimal.
+
+void noop() {
+    // intentionally empty
+}
+
+u32 main() {
+    ThreadHandle th = spawn noop();
+    th.join();
+    return 0;
+}

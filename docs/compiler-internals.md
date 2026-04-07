@@ -2700,15 +2700,20 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 
 **Purpose:** Generates random valid ZER programs combining safety-critical patterns, compiles with zerc, runs, and verifies: safe programs must compile AND run (exit 0), unsafe programs must be REJECTED by zerc.
 
-**Patterns tested:** Pool/Slab alloc + defer, arena wrappers (chained 1-4 levels), *opaque roundtrip with adapter functions, cast narrowing chains, interior pointer (use before free), UAF, double free, leaks, wrong-type casts, provenance violations.
+**32 generators (safe + unsafe):**
+- Memory: Pool+defer (1-4 handles), arena wrappers (1-4 depth), *opaque roundtrip, interior ptr, Task.new/delete, handle alias, Slab alloc_ptr
+- Casts: narrowing chain, bool↔int, signed↔unsigned, wrong-type, wrong-provenance, direct *A→*B
+- Control: goto+defer, while+break, enum switch, defer+orelse block
+- Types: union mutable capture, packed struct, distinct typedef, function pointer callback, nested struct deref, bit extraction, slice subslice, ring buffer
+- Unsafe: UAF (handle, interior, alias, goto backward), double free, leak, non-keep param escape, arena global escape
 
-**Architecture:** C program with generator functions (`gen_safe_*`, `gen_unsafe_*`). RNG selects pattern, generates ZER source, writes to `/tmp/_zer_fuzz.zer`, runs `zerc --run` or `zerc -o /dev/null`. 200 tests per run, deterministic via seed.
+**Architecture:** C program with generator functions (`gen_safe_*`, `gen_unsafe_*`). RNG selects from 32 patterns, generates ZER source, writes to `/tmp/_zer_fuzz.zer`, runs `zerc --run` or `zerc -o /dev/null`. 200 tests per `make check`, deterministic via seed. Auto-detects zerc binary or builds from source.
 
 **Found bugs:** Param color aliasing for `*opaque` adapter functions — `unwrap(*opaque raw)` returning `(*T)raw` was treated as new allocation instead of alias. Fixed: param color inference copies alloc_id from arg to result.
 
 **When adding new features:** Add `gen_safe_<feature>()` + `gen_unsafe_<feature>()` to the fuzzer. Add case to the switch in main. The RNG automatically combines new patterns with existing ones — combinatorial coverage grows with each feature.
 
-**Run:** Part of `make check`. Also: `./test_semantic_fuzz [seed] [count]` for custom runs. Default: seed=42, count=200. Tested with 1000 tests across 5 seeds — zero failures.
+**Run:** Part of `make check`. Also: `./test_semantic_fuzz [seed] [count]` for custom runs. Default: seed=42, count=200. Verified with 2,500 tests across 5 seeds — zero failures.
 
 ### Param Color Aliasing (zercheck.c, 2026-04-07)
 

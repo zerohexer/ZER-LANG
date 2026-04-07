@@ -2881,3 +2881,56 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix (2):** Added `case NODE_INDEX:` to `zc_check_expr` — checks if indexed object is a freed handle, same pattern as NODE_FIELD UAF check. Also recurses into object and index sub-expressions.
 - **Tests:** `interior_ptr_safe.zer` (field ptr used before free — compiles), `interior_ptr_uaf.zer` (field ptr after free — rejected), `interior_ptr_func.zer` (field ptr passed to function after free — rejected).
 - **Remaining gap:** `@ptrtoint` + math + `@inttoptr` creates pointer with no allocation link. Guarded by `mmio` declaration requirement (not pointer tracking).
+
+### BUG-445: C-style cast in comptime function body fails
+- **Symptom:** `comptime u32 TO_U32(u8 x) { return (u32)x; }` — "body could not be evaluated at compile time."
+- **Root cause:** `eval_const_expr` doesn't handle NODE_TYPECAST. Comptime body evaluator can't fold casts.
+- **Status:** Known, deferred. Workaround: use implicit widening (`return x;`) or `@truncate`.
+
+### BUG-446: C-style cast skips provenance check through *opaque
+- **Symptom:** `*opaque raw = (*opaque)a; *B wrong = (*B)raw;` compiles — wrong type through *opaque not caught.
+- **Root cause:** NODE_TYPECAST handler only validated cast direction (ptr↔ptr OK) but didn't check provenance. Also, var-decl provenance propagation only walked NODE_INTRINSIC, not NODE_TYPECAST.
+- **Fix:** (1) Added provenance check to NODE_TYPECAST — same logic as @ptrcast. (2) Added NODE_TYPECAST to var-decl provenance walker (line ~5236) so `*opaque raw = (*opaque)a` propagates `a`'s provenance to `raw`.
+- **Tests:** `typecast_provenance.zer` (wrong type through *opaque — rejected), `typecast_safe_complex.zer` (same-type round-trip — works).
+
+### BUG-447: C-style cast strips volatile qualifier silently
+- **Symptom:** `volatile *u32 reg = ...; *u32 bad = (*u32)reg;` compiles — volatile stripped.
+- **Root cause:** NODE_TYPECAST handler didn't check volatile qualifier on pointer casts.
+- **Fix:** Added volatile check — same logic as @ptrcast BUG-258. Checks both type-level and symbol-level volatile.
+- **Tests:** `typecast_volatile_strip.zer` (volatile strip — rejected).
+
+### BUG-448: C-style cast strips const qualifier silently
+- **Symptom:** `const *u32 cp = &x; *u32 bad = (*u32)cp;` compiles — const stripped.
+- **Root cause:** NODE_TYPECAST handler didn't check const qualifier on pointer casts.
+- **Fix:** Added const check — same logic as @ptrcast BUG-304.
+- **Tests:** `typecast_const_strip.zer` (const strip — rejected).
+
+### BUG-449: C-style cast allows *A to *B directly (no *opaque)
+- **Symptom:** `*A pa = &a; *B pb = (*B)pa;` compiles — type-punning without *opaque round-trip.
+- **Root cause:** NODE_TYPECAST handler only checked valid=true for ptr↔ptr, without verifying inner types match.
+- **Fix:** Added check: when both source and target are pointers (neither *opaque), inner types must match. Error message: "use *opaque round-trip for type-punning."
+- **Tests:** `typecast_direct_ptr.zer` (*A to *B — rejected).
+
+### BUG-450: C-style cast allows integer → pointer (bypasses @inttoptr)
+- **Symptom:** `*u32 p = (*u32)addr;` compiles — bypasses mmio range validation that @inttoptr enforces.
+- **Root cause:** NODE_TYPECAST handler had `valid = true` for int→ptr casts.
+- **Fix:** Reject int→ptr casts with error message directing to @inttoptr.
+- **Tests:** `typecast_int_to_ptr.zer` (int→ptr — rejected).
+
+### BUG-451: C-style cast allows pointer → integer (bypasses @ptrtoint)
+- **Symptom:** `u32 addr = (u32)p;` compiles — bypasses portability warnings that @ptrtoint provides.
+- **Root cause:** NODE_TYPECAST handler had `valid = true` for ptr→int casts.
+- **Fix:** Reject ptr→int casts with error message directing to @ptrtoint.
+- **Tests:** `typecast_ptr_to_int.zer` (ptr→int — rejected).
+
+### BUG-452: scan_frame missing NODE_BINARY — recursion not detected in expressions
+- **Symptom:** `return fibonacci(n-1) + fibonacci(n-2);` — no recursion warning. `fibonacci` not found as callee.
+- **Root cause:** `scan_frame` (Pass 5 stack depth) only handled NODE_CALL, NODE_BLOCK, NODE_IF, etc. Missed NODE_BINARY, NODE_UNARY, NODE_ORELSE — calls inside expressions invisible.
+- **Fix:** Added NODE_BINARY (recurse left+right), NODE_UNARY (recurse operand), NODE_ORELSE (recurse expr) to scan_frame.
+- **Tests:** Verified with `fibonacci` and mutual recursion (`is_even`/`is_odd`).
+
+### BUG-453: checker_post_passes not called from zerc_main.c
+- **Symptom:** Recursion warning, interrupt safety, and whole-program provenance never ran in actual compiler — only in unit tests via `checker_check`.
+- **Root cause:** `zerc_main.c` calls `checker_check_bodies` (Pass 2 only), not `checker_check` (all passes). Pass 3/4/5 never executed in the real pipeline.
+- **Fix:** Added `checker_post_passes()` function (runs Pass 3+4+5), called from `zerc_main.c` after `checker_check_bodies`.
+- **Impact:** Same class as zercheck integration bug (2026-04-03). Post-passes existed and passed unit tests but were never called from the actual compiler.

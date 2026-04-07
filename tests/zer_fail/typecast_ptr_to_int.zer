@@ -1,0 +1,9 @@
+// C-style cast pointer to int — must be rejected
+// Use @ptrtoint(ptr) instead
+
+u32 main() {
+    u32 x = 42;
+    *u32 p = &x;
+    u32 addr = (u32)p;
+    return 0;
+}

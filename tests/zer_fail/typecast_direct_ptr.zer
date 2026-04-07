@@ -1,0 +1,14 @@
+// C-style cast *A to *B directly — must be rejected
+// Must go through *opaque for provenance tracking
+
+struct MotorCmd { u32 speed; u32 dir; }
+struct SensorData { u32 temp; u32 pressure; }
+
+u32 main() {
+    MotorCmd cmd;
+    cmd.speed = 100;
+    cmd.dir = 1;
+    *MotorCmd p = &cmd;
+    *SensorData wrong = (*SensorData)p;
+    return 0;
+}

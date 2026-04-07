@@ -4058,15 +4058,111 @@ static Type *check_expr(Checker *c, Node *node) {
         /* bool ↔ integer */
         if ((tgt_eff->kind == TYPE_BOOL && type_is_integer(source)) ||
             (type_is_integer(target) && src_eff->kind == TYPE_BOOL)) valid = true;
-        /* pointer ↔ pointer: (*Motor)ctx, (*opaque)sensor */
-        if (tgt_eff->kind == TYPE_POINTER && src_eff->kind == TYPE_POINTER) valid = true;
-        if (tgt_eff->kind == TYPE_POINTER && src_eff->kind == TYPE_OPAQUE) valid = true;
-        if (tgt_eff->kind == TYPE_OPAQUE && src_eff->kind == TYPE_POINTER) valid = true;
-        /* integer → pointer: (*u32)0x40020000 (MMIO) */
-        if (tgt_eff->kind == TYPE_POINTER && type_is_integer(source)) valid = true;
-        /* pointer → integer: (usize)ptr */
-        if (type_is_integer(target) && src_eff->kind == TYPE_POINTER) valid = true;
-        if (tgt_eff->kind == TYPE_USIZE && src_eff->kind == TYPE_POINTER) valid = true;
+        /* pointer ↔ pointer: (*Motor)ctx, (*opaque)sensor — with safety checks */
+        if ((tgt_eff->kind == TYPE_POINTER || tgt_eff->kind == TYPE_OPAQUE) &&
+            (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE)) {
+            valid = true;
+
+            /* BUG-448: const stripping — same check as @ptrcast BUG-304 */
+            if (src_eff->kind == TYPE_POINTER && src_eff->pointer.is_const &&
+                tgt_eff->kind == TYPE_POINTER && !tgt_eff->pointer.is_const) {
+                checker_error(c, node->loc.line,
+                    "cast cannot strip const qualifier — target must be const pointer");
+            }
+
+            /* BUG-447: volatile stripping — same check as @ptrcast BUG-258 */
+            if (src_eff->kind == TYPE_POINTER &&
+                tgt_eff->kind == TYPE_POINTER && !tgt_eff->pointer.is_volatile) {
+                bool src_volatile = src_eff->pointer.is_volatile;
+                if (!src_volatile && node->typecast.expr->kind == NODE_IDENT) {
+                    Symbol *src_sym = scope_lookup(c->current_scope,
+                        node->typecast.expr->ident.name,
+                        (uint32_t)node->typecast.expr->ident.name_len);
+                    if (src_sym && src_sym->is_volatile) src_volatile = true;
+                }
+                if (src_volatile) {
+                    checker_error(c, node->loc.line,
+                        "cast cannot strip volatile qualifier — target must be volatile pointer");
+                }
+            }
+
+            /* BUG-446: provenance check — same as @ptrcast provenance tracking.
+             * When source is *opaque with known provenance, target must match. */
+            if (src_eff->kind == TYPE_POINTER &&
+                src_eff->pointer.inner->kind == TYPE_OPAQUE &&
+                tgt_eff->kind == TYPE_POINTER) {
+                Type *prov_type = NULL;
+                if (node->typecast.expr->kind == NODE_IDENT) {
+                    Symbol *src_sym = scope_lookup(c->current_scope,
+                        node->typecast.expr->ident.name,
+                        (uint32_t)node->typecast.expr->ident.name_len);
+                    if (src_sym) prov_type = src_sym->provenance_type;
+                }
+                if (!prov_type) {
+                    ExprKey skey = build_expr_key_a(c, node->typecast.expr);
+                    if (skey.len > 0)
+                        prov_type = prov_map_get(c, skey.str, (uint32_t)skey.len);
+                }
+                if (prov_type) {
+                    Type *prov = type_unwrap_distinct(prov_type);
+                    if (tgt_eff->kind == TYPE_POINTER && prov &&
+                        prov->kind == TYPE_POINTER) {
+                        Type *prov_inner = type_unwrap_distinct(prov->pointer.inner);
+                        Type *tgt_inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                        if (prov_inner && tgt_inner &&
+                            tgt_inner->kind != TYPE_OPAQUE &&
+                            !type_equals(prov_inner, tgt_inner)) {
+                            checker_error(c, node->loc.line,
+                                "cast type mismatch: source has provenance '*%s' "
+                                "but target is '*%s'",
+                                type_name(prov_inner), type_name(tgt_inner));
+                        }
+                    }
+                }
+            }
+
+            /* BUG-449: *A to *B direct cast (not through *opaque) — reject.
+             * Must go through *opaque round-trip for provenance tracking. */
+            if (src_eff->kind == TYPE_POINTER && tgt_eff->kind == TYPE_POINTER &&
+                src_eff->pointer.inner->kind != TYPE_OPAQUE &&
+                tgt_eff->pointer.inner->kind != TYPE_OPAQUE) {
+                Type *src_inner = type_unwrap_distinct(src_eff->pointer.inner);
+                Type *tgt_inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                if (src_inner && tgt_inner && !type_equals(src_inner, tgt_inner)) {
+                    checker_error(c, node->loc.line,
+                        "cannot cast '*%s' to '*%s' — use *opaque round-trip "
+                        "for type-punning",
+                        type_name(src_inner), type_name(tgt_inner));
+                }
+            }
+
+            /* BUG-446: set provenance when casting *T → *opaque */
+            if (src_eff->kind == TYPE_POINTER &&
+                src_eff->pointer.inner->kind != TYPE_OPAQUE &&
+                (tgt_eff->kind == TYPE_OPAQUE ||
+                 (tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner->kind == TYPE_OPAQUE))) {
+                /* propagate provenance to result — same as @ptrcast */
+                if (node->typecast.expr->kind == NODE_IDENT) {
+                    Symbol *src_sym = scope_lookup(c->current_scope,
+                        node->typecast.expr->ident.name,
+                        (uint32_t)node->typecast.expr->ident.name_len);
+                    if (src_sym) {
+                        src_sym->provenance_type = source;
+                    }
+                }
+            }
+        }
+        /* BUG-450: integer → pointer — reject, use @inttoptr for MMIO safety */
+        if (tgt_eff->kind == TYPE_POINTER && type_is_integer(source)) {
+            checker_error(c, node->loc.line,
+                "cannot cast integer to pointer — use @inttoptr(*T, addr) "
+                "with mmio range declaration");
+        }
+        /* BUG-451: pointer → integer — reject, use @ptrtoint */
+        if (type_is_integer(target) && (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE)) {
+            checker_error(c, node->loc.line,
+                "cannot cast pointer to integer — use @ptrtoint(ptr)");
+        }
         /* distinct typedef: (Celsius)raw_u32, (u32)celsius */
         if (target->kind == TYPE_DISTINCT || source->kind == TYPE_DISTINCT) valid = true;
 
@@ -5133,13 +5229,17 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
                 /* alias propagation for provenance + @container
-                 * BUG-358: walk through @bitcast/@cast to find root ident */
+                 * BUG-358: walk through @bitcast/@cast/NODE_TYPECAST to find root ident */
                 {
                     Node *prov_root = init;
                     if (init->kind == NODE_ORELSE) prov_root = init->orelse.expr;
-                    while (prov_root && prov_root->kind == NODE_INTRINSIC &&
-                           prov_root->intrinsic.arg_count > 0)
-                        prov_root = prov_root->intrinsic.args[prov_root->intrinsic.arg_count - 1];
+                    while (prov_root) {
+                        if (prov_root->kind == NODE_INTRINSIC && prov_root->intrinsic.arg_count > 0)
+                            prov_root = prov_root->intrinsic.args[prov_root->intrinsic.arg_count - 1];
+                        else if (prov_root->kind == NODE_TYPECAST)
+                            prov_root = prov_root->typecast.expr;
+                        else break;
+                    }
                     if (prov_root && prov_root->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             prov_root->ident.name, (uint32_t)prov_root->ident.name_len);
@@ -7415,6 +7515,16 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_ASSIGN:
         scan_frame(c, frame, node->assign.value);
         break;
+    case NODE_BINARY:
+        scan_frame(c, frame, node->binary.left);
+        scan_frame(c, frame, node->binary.right);
+        break;
+    case NODE_UNARY:
+        scan_frame(c, frame, node->unary.operand);
+        break;
+    case NODE_ORELSE:
+        scan_frame(c, frame, node->orelse.expr);
+        break;
     default: break;
     }
 }
@@ -8013,4 +8123,23 @@ bool checker_check(Checker *c, Node *file_node) {
     check_stack_depth(c, file_node);
 
     return c->error_count == 0;
+}
+
+void checker_post_passes(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+
+    /* Whole-program *opaque param provenance validation */
+    if (c->param_expect_count > 0) {
+        for (int i = 0; i < file_node->file.decl_count; i++) {
+            check_call_provenance(c, file_node->file.decls[i]);
+        }
+    }
+
+    /* Interrupt safety — validate shared globals */
+    if (c->isr_global_count > 0) {
+        check_interrupt_safety(c);
+    }
+
+    /* Stack depth analysis — detect recursion */
+    check_stack_depth(c, file_node);
 }

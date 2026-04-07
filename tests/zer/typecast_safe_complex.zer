@@ -1,0 +1,80 @@
+// Complex C-style cast test — all safe patterns, multi-layer
+// Verifies: narrowing, widening, float, bool, *opaque round-trip, defer
+
+struct Sensor { u32 id; u32 reading; f32 calibration; }
+struct Config { u32 flags; u8 mode; }
+Slab(Sensor) sensors;
+Slab(Config) configs;
+
+u32 process_reading(*opaque ctx, u32 raw) {
+    *Sensor s = (*Sensor)ctx;
+    s.reading = raw;
+    u8 low = (u8)raw;
+    u16 mid = (u16)raw;
+    return (u32)low + (u32)mid;
+}
+
+u32 main() {
+    // === Layer 1: basic numeric casts ===
+    u32 big = 65538;
+    u16 trunc = (u16)big;
+    if (trunc != 2) { return 1; }
+
+    u8 byte = (u8)big;
+    if (byte != 2) { return 2; }
+
+    i32 neg = -1;
+    u32 wrap = (u32)neg;
+    if (wrap != 4294967295) { return 3; }
+
+    // === Layer 2: float conversions ===
+    f32 pi = 3.14;
+    u32 rounded = (u32)pi;
+    if (rounded != 3) { return 4; }
+
+    u32 count = 100;
+    f32 ratio = (f32)count;
+    u32 back = (u32)ratio;
+    if (back != 100) { return 5; }
+
+    // === Layer 3: bool conversions ===
+    bool flag = true;
+    u32 bval = (u32)flag;
+    if (bval != 1) { return 6; }
+
+    u32 five = 5;
+    bool b2 = (bool)five;
+    if (b2 != true) { return 7; }
+
+    u32 zero = 0;
+    bool b3 = (bool)zero;
+    if (b3 != false) { return 8; }
+
+    // === Layer 4: *opaque round-trip with defer ===
+    ?*Sensor ms = sensors.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer sensors.free_ptr(s);
+    s.id = 99;
+    s.reading = 0;
+    s.calibration = 1.5;
+
+    *opaque ctx = (*opaque)s;
+    u32 result = process_reading(ctx, 300);
+    // low=44, mid=300, sum=344
+    if (result != 344) { return 9; }
+    if (s.reading != 300) { return 10; }
+
+    // Cast back — same type, provenance OK
+    *Sensor restored = (*Sensor)ctx;
+    if (restored.id != 99) { return 11; }
+
+    // === Layer 5: chained narrowing ===
+    u32 chain_val = 100000;
+    u16 chain_mid = (u16)chain_val;
+    u8 chain_low = (u8)chain_mid;
+    u32 chain_wide = (u32)chain_low;
+    // 100000 = 0x186A0, u16 = 0x86A0 = 34464, u8 = 0xA0 = 160
+    if (chain_wide != 160) { return 12; }
+
+    return 0;
+}

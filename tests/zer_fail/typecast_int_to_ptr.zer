@@ -1,0 +1,8 @@
+// C-style cast int to pointer — must be rejected
+// Use @inttoptr with mmio range declaration instead
+
+u32 main() {
+    u32 addr = 0x40020000;
+    *u32 reg = (*u32)addr;
+    return 0;
+}

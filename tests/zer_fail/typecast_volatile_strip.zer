@@ -1,0 +1,10 @@
+// C-style cast volatile strip — must be rejected
+// volatile *u32 cast to *u32 loses volatile semantics
+
+mmio 0x40020000..0x40020FFF;
+
+u32 main() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40020000);
+    *u32 bad = (*u32)reg;
+    return 0;
+}

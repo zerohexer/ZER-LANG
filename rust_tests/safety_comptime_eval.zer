@@ -1,0 +1,19 @@
+// Rust: const fn — compile-time evaluation
+// ZER: comptime functions — same, all args must be constants
+
+comptime u32 square(u32 x) { return x * x; }
+comptime u32 add(u32 a, u32 b) { return a + b; }
+comptime u32 combined(u32 x) { return add(square(x), 1); }
+
+u32 main() {
+    u32 a = square(5);
+    if (a != 25) { return 1; }
+
+    u32 b = add(10, 20);
+    if (b != 30) { return 2; }
+
+    u32 c = combined(3);
+    if (c != 10) { return 3; }
+
+    return 0;
+}

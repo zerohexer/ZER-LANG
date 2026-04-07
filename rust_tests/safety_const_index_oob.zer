@@ -1,0 +1,10 @@
+// Rust: array_const_index-1.rs — compile-time OOB on const array
+// ZER: compile error (bounds check at compile time)
+// EXPECTED: compile error
+
+u32 main() {
+    u32[3] arr;
+    arr[0] = 1;
+    u32 val = arr[5];
+    return val;
+}

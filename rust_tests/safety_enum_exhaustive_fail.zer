@@ -1,0 +1,15 @@
+// Rust: non-exhaustive match — compile error
+// ZER: non-exhaustive switch on enum — compile error
+// EXPECTED: compile error (missing .blue case)
+
+enum Color { red, green, blue }
+
+u32 main() {
+    Color c = Color.red;
+    u32 result = 0;
+    switch (c) {
+        .red => { result = 1; }
+        .green => { result = 2; }
+    }
+    return result;
+}

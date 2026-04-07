@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run all rust_tests/*.zer — translated from Rust test suite
-# Positive tests (no "reject" in name): must compile + run + exit 0
-# Negative tests ("reject" in name): must fail to compile
+# Positive tests: must compile + run + exit 0
+# Negative tests: must fail to compile
+# Detection: "reject" in filename OR "EXPECTED: compile error" in file content
 
 ZERC="${1:-./zerc}"
 PASS=0
@@ -13,7 +14,15 @@ for f in "$(dirname "$0")"/*.zer; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .zer)
 
-    if echo "$name" | grep -qE "reject|div_zero|mod_zero|bounds_oob|uaf_handle|double_free|dangling_return|narrowing_reject|null_deref|maybe_freed"; then
+    # Check if this is a negative test (should be rejected by compiler)
+    is_negative=false
+    if echo "$name" | grep -q "reject"; then
+        is_negative=true
+    elif grep -q "EXPECTED: compile error" "$f" 2>/dev/null; then
+        is_negative=true
+    fi
+
+    if $is_negative; then
         # Negative test — must be rejected
         if $ZERC "$f" -o /dev/null 2>/dev/null; then
             echo "  FAIL (should reject): $name"

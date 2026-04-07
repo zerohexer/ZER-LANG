@@ -2650,6 +2650,16 @@ Without (2), `*opaque raw = (*opaque)&a` didn't propagate `*A` provenance to `ra
 
 Both propagate through aliases, if-unwrap captures, switch captures, orelse unwrap, struct copy.
 
+### func_returns_arena — Arena Wrapper Exclusion (zercheck.c, 2026-04-07)
+
+**Problem:** Wrapper functions like `?*Block arena_alloc_block() { return backing.alloc(Block); }` triggered false "handle never freed" errors. zercheck saw `?*T` return and tracked it as an allocation needing free.
+
+**Fix:** `func_returns_arena(zc, call)` — lightweight pre-scan of callee's body. Checks if return statements are `arena.alloc()` / `arena.alloc_slice()` calls. If yes, skips handle tracking for the caller's variable.
+
+**Called from:** `zc_check_var_init`, between `is_arena_alloc` direct check and wrapper allocator detection (line ~573).
+
+**Limitation:** Only works for simple wrappers where return is directly `arena.alloc()`. Complex patterns (freelist returning type-punned recycled memory OR fresh arena alloc) have a non-arena return path, so the helper returns false. Full fix would require alias analysis (tracking memory identity through `*opaque` round-trips), planned for v0.3+.
+
 ### Exhaustive Switch on NodeKind (RF14, 2026-04-07)
 
 **Problem:** The most common bug class across 12 audit sessions was "AST walker doesn't handle NODE_X" (BUG-433, 434, 435, 437, 452). Each is 2 lines to fix but 10-30 minutes to find. Root cause: `default: break;` in switch statements silently skips new node types.

@@ -37,6 +37,7 @@ typedef struct {
     int alloc_line;         /* where allocated */
     int free_line;          /* where freed (if FREED) */
     int alloc_id;           /* unique allocation ID — aliases share same ID */
+    int source_color;       /* ZC_COLOR_* — where the memory came from */
     bool escaped;           /* true if returned, stored in global, or stored in param field */
 } HandleInfo;
 
@@ -54,6 +55,12 @@ typedef struct {
     int id;
 } ZcPool;
 
+/* Allocation source color — tracks where memory came from */
+#define ZC_COLOR_UNKNOWN  0  /* param, cinclude, can't determine */
+#define ZC_COLOR_POOL     1  /* Pool/Slab — needs individual free */
+#define ZC_COLOR_ARENA    2  /* Arena — freed by arena.reset(), no individual free */
+#define ZC_COLOR_MALLOC   3  /* malloc/calloc — needs free() */
+
 /* cross-function summary: what a function does to its Handle params */
 typedef struct {
     const char *func_name;
@@ -61,6 +68,7 @@ typedef struct {
     int param_count;
     bool *frees_param;        /* definite free (all paths) */
     bool *maybe_frees_param;  /* conditional free (some paths) */
+    int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
 } FuncSummary;
 
 /* ZER-CHECK context */

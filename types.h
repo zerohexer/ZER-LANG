@@ -198,6 +198,8 @@ struct Symbol {
     bool is_function;
     bool is_comptime;       /* comptime function — evaluated at compile time */
     Node *func_node;        /* AST node for function body, if applicable */
+    bool returns_color_cached;  /* zercheck: return color already computed */
+    int returns_color_value;    /* zercheck: cached ZC_COLOR_* for return value */
 
     /* Handle auto-deref: which Slab/Pool this handle was allocated from */
     Symbol *slab_source;        /* NULL = unknown (parameter, conditional) */

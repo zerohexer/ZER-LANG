@@ -1,0 +1,27 @@
+// Rust pattern: borrowck-bad-nested-calls-free.rs
+// add(&*a, rewrite(&mut a)) — rewrite frees the Box that &*a points to.
+// ZER: alloc_ptr, pass to func that frees it, then use after → cross-function UAF.
+// EXPECTED: compile error
+
+struct Node {
+    u32 value;
+}
+
+Slab(Node) nodes;
+
+void destroy_node(*Node n) {
+    nodes.free_ptr(n);
+}
+
+u32 read_node(*Node n) {
+    return n.value;
+}
+
+i32 main() {
+    ?*Node mn = nodes.alloc_ptr();
+    *Node n = mn orelse return;
+    n.value = 42;
+    destroy_node(n);
+    u32 v = read_node(n);
+    return (i32)v;
+}

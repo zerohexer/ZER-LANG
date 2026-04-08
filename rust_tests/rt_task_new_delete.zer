@@ -1,0 +1,35 @@
+// Rust pattern: Simple new/drop pattern — Task.new() / Task.delete() auto-slab sugar.
+// ZER: Task.new(), use handle, Task.delete(h). POSITIVE.
+
+struct Job {
+    u32 job_id;
+    u32 priority;
+    u32 status;
+}
+
+i32 main() {
+    ?Handle(Job) mh = Job.new();
+    Handle(Job) h = mh orelse return;
+
+    h.job_id = 1001;
+    h.priority = 5;
+    h.status = 0;
+
+    h.status = 1;
+
+    if (h.job_id != 1001) {
+        Job.delete(h);
+        return 1;
+    }
+    if (h.priority != 5) {
+        Job.delete(h);
+        return 1;
+    }
+    if (h.status != 1) {
+        Job.delete(h);
+        return 1;
+    }
+
+    Job.delete(h);
+    return 0;
+}

@@ -1,0 +1,29 @@
+// Rust pattern: moves-based-on-type-exprs.rs
+// let _y = Foo{f:x}; touch(&x) — x moved into struct, then used.
+// ZER: alloc_ptr, store in another struct, free original, use original → UAF.
+// EXPECTED: compile error
+
+struct Item {
+    u32 val;
+}
+
+struct Wrapper {
+    *Item inner;
+}
+
+Slab(Item) items;
+Slab(Wrapper) wrappers;
+
+i32 main() {
+    ?*Item mi = items.alloc_ptr();
+    *Item x = mi orelse return;
+    x.val = 100;
+
+    ?*Wrapper mw = wrappers.alloc_ptr();
+    *Wrapper w = mw orelse return;
+    w.inner = x;
+
+    items.free_ptr(x);
+    u32 v = x.val;
+    return (i32)v;
+}

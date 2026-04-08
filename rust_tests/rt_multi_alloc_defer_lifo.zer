@@ -1,0 +1,27 @@
+// Rust pattern: Multiple Boxes dropped in reverse order (LIFO).
+// ZER: 3 allocs with 3 defers using direct pool.free. POSITIVE.
+
+struct Slot { u32 order; }
+
+Pool(Slot, 8) pool;
+
+u32 main() {
+    ?Handle(Slot) ma = pool.alloc();
+    Handle(Slot) a = ma orelse return;
+    pool.get(a).order = 1;
+    defer pool.free(a);
+
+    ?Handle(Slot) mb = pool.alloc();
+    Handle(Slot) b = mb orelse return;
+    pool.get(b).order = 2;
+    defer pool.free(b);
+
+    ?Handle(Slot) mc = pool.alloc();
+    Handle(Slot) c = mc orelse return;
+    pool.get(c).order = 3;
+    defer pool.free(c);
+
+    // Defers fire in LIFO: free(c), free(b), free(a)
+    // All handles properly freed
+    return 0;
+}

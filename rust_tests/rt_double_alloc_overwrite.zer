@@ -1,0 +1,25 @@
+// Rust pattern: Overwrite Box without dropping — handle leak.
+// ZER: alloc_ptr twice to same variable without free → handle leak error.
+// EXPECTED: compile error
+
+struct Frame {
+    u32 index;
+    u32 data;
+}
+
+Slab(Frame) frames;
+
+i32 main() {
+    ?*Frame mf = frames.alloc_ptr();
+    *Frame f = mf orelse return;
+    f.index = 0;
+    f.data = 100;
+
+    ?*Frame mf2 = frames.alloc_ptr();
+    f = mf2 orelse return;
+    f.index = 1;
+    f.data = 200;
+
+    frames.free_ptr(f);
+    return 0;
+}

@@ -1,0 +1,22 @@
+// Rust pattern: borrowck-borrow-from-owned-ptr.rs
+// &mut foo.bar1 then &mut foo.bar1 again — double mutable borrow.
+// ZER: alloc struct, take interior field pointer, free struct, use field pointer → UAF.
+// EXPECTED: compile error
+
+struct Foo {
+    u32 bar1;
+    u32 bar2;
+}
+
+Slab(Foo) foos;
+
+i32 main() {
+    ?*Foo mf = foos.alloc_ptr();
+    *Foo f = mf orelse return;
+    f.bar1 = 10;
+    f.bar2 = 20;
+    *u32 field_ptr = &f.bar1;
+    foos.free_ptr(f);
+    field_ptr[0] = 99;
+    return 0;
+}

@@ -1,0 +1,19 @@
+// Rust source: tests/ui/threads-sendsync/rc-is-not-send.rs
+// Rc<T> is !Send — cannot cross thread boundary.
+// ZER: non-shared struct pointer to fire-and-forget spawn → compile error.
+// EXPECTED: compile error
+
+struct Port { u32 value; }
+
+struct Foo { u32 x; }
+
+void worker(*Foo f) {
+    f.x = 42;
+}
+
+u32 main() {
+    Foo f;
+    f.x = 0;
+    spawn worker(&f);
+    return 0;
+}

@@ -1,0 +1,38 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-10.rs
+// Child creates channel, sends sender back to parent. Parent sends "A","B".
+// ZER: shared struct for bidirectional signaling (no channel-of-channels)
+
+shared struct Bidir {
+    u32 child_ready;
+    u32 msg_a;
+    u32 msg_b;
+    u32 msgs_sent;
+}
+
+Bidir bidir;
+
+void child(*Bidir b) {
+    b.child_ready = 1;
+    @cond_signal(b);
+    @cond_wait(b, b.msgs_sent >= 2);
+    if (b.msg_a != 65) { return; }
+    if (b.msg_b != 66) { return; }
+}
+
+u32 main() {
+    bidir.child_ready = 0;
+    bidir.msg_a = 0;
+    bidir.msg_b = 0;
+    bidir.msgs_sent = 0;
+
+    ThreadHandle th = spawn child(&bidir);
+    @cond_wait(bidir, bidir.child_ready > 0);
+
+    bidir.msg_a = 65;
+    bidir.msg_b = 66;
+    bidir.msgs_sent = 2;
+    @cond_signal(bidir);
+
+    th.join();
+    return 0;
+}

@@ -1,0 +1,26 @@
+// Rust source: tests/ui/threads-sendsync/send-is-not-static-par-for.rs
+// Iterator with Mutex — parallel-for pattern.
+// ZER: shared struct accumulator, iterate and accumulate under lock.
+
+shared struct Sum { u32 total; }
+Sum g_sum;
+
+void add_range(*Sum s, u32 start, u32 count) {
+    for (u32 i = start; i < start + count; i += 1) {
+        s.total += i;
+    }
+}
+
+u32 main() {
+    g_sum.total = 0;
+
+    ThreadHandle t1 = spawn add_range(&g_sum, 0, 5);
+    ThreadHandle t2 = spawn add_range(&g_sum, 5, 5);
+    t1.join();
+    t2.join();
+
+    // 0+1+2+3+4+5+6+7+8+9 = 45
+    u32 val = g_sum.total;
+    if (val != 45) { return 1; }
+    return 0;
+}

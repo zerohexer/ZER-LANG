@@ -1,0 +1,32 @@
+// Rust source: tests/ui/borrowck/borrowck-union-borrow.rs
+// Safety intent: union borrow safety — can't mutate during capture.
+// ZER: union switch variant lock prevents mutation during capture.
+
+union Data {
+    u32 small;
+    u64 large;
+}
+
+u32 main() {
+    Data d;
+    d.small = 42;
+
+    // Read via switch — safe immutable capture
+    switch (d) {
+        .small => |v| {
+            if (v != 42) { return 1; }
+        }
+        .large => { }
+    }
+
+    // Write then read different variant — safe
+    d.large = 1000;
+    switch (d) {
+        .small => { }
+        .large => |v| {
+            if (v != 1000) { return 2; }
+        }
+    }
+
+    return 0;
+}

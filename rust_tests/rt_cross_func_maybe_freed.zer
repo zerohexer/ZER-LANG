@@ -1,0 +1,24 @@
+// Rust pattern: function conditionally frees — caller sees MAYBE_FREED.
+// ZER: FuncSummary maybe_frees_param propagates to caller.
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void maybe_cleanup(Handle(Task) h, bool do_free) {
+    if (do_free) {
+        pool.free(h);
+    }
+}
+
+u32 main() {
+    ?Handle(Task) mt = pool.alloc();
+    Handle(Task) h = mt orelse return;
+    pool.get(h).id = 1;
+
+    maybe_cleanup(h, true);
+
+    // h is MAYBE_FREED — use is error
+    u32 val = pool.get(h).id;
+    return val;
+}

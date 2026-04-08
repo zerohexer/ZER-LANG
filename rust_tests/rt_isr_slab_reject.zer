@@ -1,0 +1,14 @@
+// Rust pattern: allocation in interrupt context = deadlock risk.
+// ZER: Slab.alloc in interrupt handler = compile error.
+// EXPECTED: compile error
+
+struct Event { u32 code; }
+Slab(Event) events;
+
+interrupt USART1 {
+    ?*Event me = events.alloc_ptr();   // ERROR: slab alloc in ISR
+}
+
+u32 main() {
+    return 0;
+}

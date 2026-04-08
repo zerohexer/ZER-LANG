@@ -1,0 +1,42 @@
+// Rust pattern: Vec<Box<T>> — multiple owned handles with lifecycle.
+// ZER: individual Handle tracking with alloc/use/free cycle.
+
+struct Entity { u32 id; u32 hp; }
+Pool(Entity, 8) pool;
+
+u32 main() {
+    // Allocate 4 entities with individual handles
+    ?Handle(Entity) m0 = pool.alloc();
+    Handle(Entity) h0 = m0 orelse return;
+    pool.get(h0).id = 0;
+    pool.get(h0).hp = 100;
+
+    ?Handle(Entity) m1 = pool.alloc();
+    Handle(Entity) h1 = m1 orelse return;
+    pool.get(h1).id = 1;
+    pool.get(h1).hp = 80;
+
+    ?Handle(Entity) m2 = pool.alloc();
+    Handle(Entity) h2 = m2 orelse return;
+    pool.get(h2).id = 2;
+    pool.get(h2).hp = 60;
+
+    ?Handle(Entity) m3 = pool.alloc();
+    Handle(Entity) h3 = m3 orelse return;
+    pool.get(h3).id = 3;
+    pool.get(h3).hp = 40;
+
+    // Verify all
+    if (pool.get(h0).hp != 100) { return 1; }
+    if (pool.get(h3).hp != 40) { return 2; }
+    if (pool.get(h1).hp != 80) { return 3; }
+    if (pool.get(h2).hp != 60) { return 4; }
+
+    // Free all
+    pool.free(h0);
+    pool.free(h1);
+    pool.free(h2);
+    pool.free(h3);
+
+    return 0;
+}

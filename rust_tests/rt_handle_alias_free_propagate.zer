@@ -1,0 +1,22 @@
+// Rust pattern: alias of owned value — free one, all invalidated.
+// ZER: handle aliases share alloc_id — free propagates to all.
+// EXPECTED: compile error
+
+struct Slot { u32 data; }
+Pool(Slot, 4) pool;
+
+u32 main() {
+    ?Handle(Slot) ms = pool.alloc();
+    Handle(Slot) original = ms orelse return;
+    pool.get(original).data = 42;
+
+    // Create alias
+    Handle(Slot) alias = original;
+
+    // Free through original
+    pool.free(original);
+
+    // Use through alias — both share alloc_id, both FREED
+    u32 val = pool.get(alias).data;
+    return val;
+}

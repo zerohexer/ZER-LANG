@@ -1,0 +1,32 @@
+// Rust pattern: multiple RAII resources — drop order matters.
+// ZER: defers from different pools fire in LIFO order.
+
+struct Conn { u32 fd; }
+struct Lock { u32 id; }
+
+Pool(Conn, 4) conns;
+Pool(Lock, 4) locks;
+
+u32 order;
+
+u32 main() {
+    order = 0;
+
+    ?Handle(Conn) mc = conns.alloc();
+    Handle(Conn) c = mc orelse return;
+    defer conns.free(c);
+    defer { order = order * 10 + 1; }
+    conns.get(c).fd = 5;
+
+    ?Handle(Lock) ml = locks.alloc();
+    Handle(Lock) l = ml orelse return;
+    defer locks.free(l);
+    defer { order = order * 10 + 2; }
+    locks.get(l).id = 99;
+
+    if (conns.get(c).fd != 5) { return 1; }
+    if (locks.get(l).id != 99) { return 2; }
+
+    // Defers fire LIFO: 2, 1 → order = 21
+    return 0;
+}

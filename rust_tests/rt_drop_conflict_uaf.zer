@@ -1,0 +1,27 @@
+// Rust source: tests/ui/nll/issue-52059-report-when-borrow-and-drop-conflict.rs
+// Safety intent: borrow still in use when destructor runs.
+// ZER: interior pointer to struct freed by defer = UAF on return path.
+// EXPECTED: compile error
+
+struct Session { u32 id; u32 status; }
+Slab(Session) heap;
+
+*u32 extract_status(*Session s) {
+    return &s.status;   // returns interior pointer
+}
+
+u32 main() {
+    ?*Session ms = heap.alloc_ptr();
+    *Session s = ms orelse return;
+    s.id = 1;
+    s.status = 200;
+
+    *u32 p = extract_status(s);
+
+    // Free the session — interior pointer p becomes dangling
+    heap.free_ptr(s);
+
+    // Use dangling interior pointer — UAF
+    u32 val = p[0];
+    return val;
+}

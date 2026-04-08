@@ -1,0 +1,35 @@
+// Rust source: tests/ui/borrowck/borrowck-borrow-from-stack-variable.rs
+// Safety intent: field-level borrow analysis — disjoint fields are safe.
+// ZER: struct fields from same allocation are independently accessible.
+
+struct Foo {
+    u32 bar1_a;
+    u32 bar1_b;
+    u32 bar2_a;
+    u32 bar2_b;
+}
+
+u32 main() {
+    Foo foo;
+    foo.bar1_a = 1;
+    foo.bar1_b = 2;
+    foo.bar2_a = 3;
+    foo.bar2_b = 4;
+
+    // Access disjoint fields — safe (like Rust's split borrowing)
+    u32 a = foo.bar1_a;
+    u32 b = foo.bar2_a;
+    if (a != 1) { return 1; }
+    if (b != 3) { return 2; }
+
+    // Modify one field, read another — safe
+    foo.bar1_a = 10;
+    if (foo.bar2_b != 4) { return 3; }
+
+    // Modify nested — doesn't affect siblings
+    foo.bar1_b = 20;
+    foo.bar2_b = 40;
+    if (foo.bar1_a != 10) { return 4; }
+
+    return 0;
+}

@@ -1,0 +1,18 @@
+// Rust source: tests/ui/nll/borrowed-local-error.rs
+// Safety intent: pointer to local that doesn't live long enough.
+// ZER: returning &local.field = scope escape error.
+// EXPECTED: compile error
+
+struct Pair { u32 first; u32 second; }
+
+*u32 get_first() {
+    Pair v;
+    v.first = 22;
+    v.second = 33;
+    return &v.first;   // ERROR: pointer to local field
+}
+
+u32 main() {
+    *u32 x = get_first();
+    return x[0];
+}

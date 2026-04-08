@@ -1,0 +1,24 @@
+// Rust source: tests/ui/nll/issue-45696-scribble-on-boxed-borrow.rs
+// Safety intent: destructor modifies data between borrow and return.
+// ZER: defer + return expression evaluated BEFORE defers (BUG-442).
+
+struct Scribble { u32 value; }
+Pool(Scribble, 4) pool;
+
+u32 borrowed_value() {
+    ?Handle(Scribble) ms = pool.alloc();
+    Handle(Scribble) h = ms orelse return;
+    defer pool.free(h);
+
+    pool.get(h).value = 100;
+
+    // Return expression evaluated BEFORE defer fires
+    // (defer would free h, but value is captured first)
+    return pool.get(h).value;
+}
+
+u32 main() {
+    u32 result = borrowed_value();
+    if (result != 100) { return 1; }
+    return 0;
+}

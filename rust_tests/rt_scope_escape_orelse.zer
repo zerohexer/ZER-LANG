@@ -1,0 +1,22 @@
+// Rust pattern: dangling pointer through orelse fallback.
+// ZER: orelse &local = scope escape error.
+// EXPECTED: compile error
+
+struct Sensor { u32 reading; }
+
+?*Sensor get_sensor() {
+    return null;
+}
+
+*Sensor fallback_local() {
+    Sensor local;
+    local.reading = 0;
+    ?*Sensor ms = get_sensor();
+    *Sensor s = ms orelse return;
+    return s;
+}
+
+u32 main() {
+    *Sensor s = fallback_local();
+    return s.reading;
+}

@@ -1,0 +1,40 @@
+// Rust pattern: *opaque stored in struct field — lifecycle tracking.
+// ZER: struct field *opaque with provenance through alloc/free cycle.
+
+struct Driver {
+    *opaque device;
+    u32 status;
+}
+
+struct Motor { u32 speed; u32 torque; }
+
+void driver_init(*Driver drv, *opaque dev) {
+    drv.device = dev;
+    drv.status = 1;
+}
+
+u32 driver_read_speed(*Driver drv) {
+    *Motor m = @ptrcast(*Motor, drv.device);
+    return m.speed;
+}
+
+u32 main() {
+    Motor m;
+    m.speed = 3000;
+    m.torque = 50;
+
+    Driver drv;
+    driver_init(&drv, @ptrcast(*opaque, &m));
+
+    u32 spd = driver_read_speed(&drv);
+    if (spd != 3000) { return 1; }
+
+    // Modify original, read through driver
+    m.speed = 6000;
+    spd = driver_read_speed(&drv);
+    if (spd != 6000) { return 2; }
+
+    if (drv.status != 1) { return 3; }
+
+    return 0;
+}

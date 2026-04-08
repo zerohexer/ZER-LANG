@@ -1,0 +1,29 @@
+// Rust source: tests/ui/borrowck/borrowck-bad-nested-calls-free.rs
+// Safety intent: nested call frees pointer used by outer call argument.
+// ZER: cross-function free summary detects this pattern.
+// EXPECTED: compile error
+
+struct Data { u32 value; }
+Slab(Data) heap;
+
+void rewrite(*Data d) {
+    // This function frees and reallocates — invalidating any alias
+    heap.free_ptr(d);
+}
+
+u32 add(*Data d, u32 extra) {
+    return d.value + extra;
+}
+
+u32 main() {
+    ?*Data md = heap.alloc_ptr();
+    *Data a = md orelse return;
+    a.value = 10;
+
+    // rewrite(a) frees a — but add() still holds alias
+    rewrite(a);
+
+    // a is now FREED — use after free
+    u32 result = a.value;
+    return result;
+}

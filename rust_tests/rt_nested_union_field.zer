@@ -1,0 +1,38 @@
+// Rust source: tests/ui/nll/issue-57100.rs
+// Safety intent: nested union field access — variant safety.
+// ZER: union switch with nested struct fields.
+
+struct Leaf { u8 a; u8 b; }
+
+union Inner {
+    Leaf s1;
+    Leaf s2;
+}
+
+u32 main() {
+    Inner u;
+    u.s1.a = 8;
+    u.s1.b = 4;
+
+    // Read through switch — safe immutable capture
+    switch (u) {
+        .s1 => |v| {
+            if (v.a != 8) { return 1; }
+            if (v.b != 4) { return 2; }
+        }
+        .s2 => { }
+    }
+
+    // Write different variant
+    u.s2.a = 22;
+    u.s2.b = 33;
+
+    switch (u) {
+        .s1 => { }
+        .s2 => |v| {
+            if (v.a != 22) { return 3; }
+        }
+    }
+
+    return 0;
+}

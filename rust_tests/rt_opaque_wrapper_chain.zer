@@ -1,0 +1,53 @@
+// Rust pattern: multiple layers of type erasure — wrapper around wrapper.
+// ZER: *opaque provenance tracked through function chain.
+
+struct HwTimer { u32 prescaler; u32 period; }
+
+struct Driver {
+    *opaque hw;
+    u32 (*read_period)(*opaque);
+}
+
+u32 read_timer_period(*opaque ctx) {
+    *HwTimer t = @ptrcast(*HwTimer, ctx);
+    return t.period;
+}
+
+struct System {
+    *opaque driver_ctx;
+    u32 (*get_tick)(*opaque);
+}
+
+u32 system_tick(*opaque ctx) {
+    *Driver d = @ptrcast(*Driver, ctx);
+    return d.read_period(d.hw);
+}
+
+u32 main() {
+    HwTimer timer;
+    timer.prescaler = 8;
+    timer.period = 1000;
+
+    Driver drv;
+    drv.hw = @ptrcast(*opaque, &timer);
+    drv.read_period = read_timer_period;
+
+    // Verify direct call
+    u32 p = drv.read_period(drv.hw);
+    if (p != 1000) { return 1; }
+
+    // Verify through System wrapper
+    System sys;
+    sys.driver_ctx = @ptrcast(*opaque, &drv);
+    sys.get_tick = system_tick;
+
+    u32 tick = sys.get_tick(sys.driver_ctx);
+    if (tick != 1000) { return 2; }
+
+    // Modify original, verify propagates
+    timer.period = 2000;
+    tick = sys.get_tick(sys.driver_ctx);
+    if (tick != 2000) { return 3; }
+
+    return 0;
+}

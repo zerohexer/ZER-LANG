@@ -1,0 +1,46 @@
+// Rust source: tests/ui/nll/match-on-borrowed.rs
+// Safety intent: switch on value while field is borrowed — safe if disjoint.
+// ZER: switch on enum while struct fields are independently accessed.
+
+enum Kind { read, write, close }
+
+struct Request { Kind kind; u32 payload; }
+
+u32 process(Request req) {
+    switch (req.kind) {
+        .read => {
+            return req.payload;
+        }
+        .write => {
+            return req.payload + 1;
+        }
+        .close => {
+            return 0;
+        }
+    }
+}
+
+u32 main() {
+    Request r1;
+    r1.kind = Kind.read;
+    r1.payload = 42;
+
+    u32 result = process(r1);
+    if (result != 42) { return 1; }
+
+    Request r2;
+    r2.kind = Kind.write;
+    r2.payload = 10;
+
+    result = process(r2);
+    if (result != 11) { return 2; }
+
+    Request r3;
+    r3.kind = Kind.close;
+    r3.payload = 99;
+
+    result = process(r3);
+    if (result != 0) { return 3; }
+
+    return 0;
+}

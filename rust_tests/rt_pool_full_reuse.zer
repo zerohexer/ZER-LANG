@@ -1,0 +1,31 @@
+// Rust pattern: fixed-capacity collection — full then free then reuse.
+// ZER: Pool(T, N) with capacity tracking — exhaustion + recovery.
+
+struct Slot { u32 id; }
+Pool(Slot, 2) pool;
+
+u32 main() {
+    // Fill pool to capacity
+    ?Handle(Slot) m1 = pool.alloc();
+    Handle(Slot) h1 = m1 orelse return;
+    pool.get(h1).id = 1;
+
+    ?Handle(Slot) m2 = pool.alloc();
+    Handle(Slot) h2 = m2 orelse return;
+    pool.get(h2).id = 2;
+
+    // Free one slot
+    pool.free(h1);
+
+    // Now alloc succeeds — reuses freed slot
+    ?Handle(Slot) m3 = pool.alloc();
+    Handle(Slot) h3 = m3 orelse return;
+    pool.get(h3).id = 3;
+
+    if (pool.get(h3).id != 3) { return 1; }
+    if (pool.get(h2).id != 2) { return 2; }
+
+    pool.free(h2);
+    pool.free(h3);
+    return 0;
+}

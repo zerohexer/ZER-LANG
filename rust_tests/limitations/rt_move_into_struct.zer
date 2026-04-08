@@ -1,0 +1,35 @@
+// Rust source: tests/ui/moves/moves-based-on-type-exprs.rs (f10 pattern)
+// Safety intent: move into struct field, then use original = error.
+// ZER: alloc_ptr, store in struct, free original — struct field dangling.
+//
+// LIMITATION: zercheck does NOT track pointer aliasing through struct fields.
+// h.inner = w creates an alias, but zercheck doesn't know h.inner points to
+// the same allocation as w. After free_ptr(w), h.inner.data is UAF but
+// zercheck only tracks w (not h.inner) as FREED.
+//
+// Fix complexity: ~200 lines — extend zercheck to propagate alloc_id through
+// struct field pointer assignments (NODE_ASSIGN where target is field chain
+// and value is tracked pointer → create alias "h.inner" with same alloc_id).
+//
+// Runtime safety: Level 2 poison-after-free (w = NULL after free) catches this.
+// EXPECTED: compile error (currently passes — LIMITATION)
+
+struct Wrapper { u32 data; }
+struct Holder { *Wrapper inner; }
+Slab(Wrapper) heap;
+
+u32 main() {
+    ?*Wrapper mw = heap.alloc_ptr();
+    *Wrapper w = mw orelse return;
+    w.data = 42;
+
+    Holder h;
+    h.inner = w;
+
+    // Free the original — holder.inner becomes dangling
+    heap.free_ptr(w);
+
+    // Use through holder — UAF (alias of freed pointer)
+    u32 val = h.inner.data;
+    return val;
+}

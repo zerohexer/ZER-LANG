@@ -1,0 +1,36 @@
+// Rust pattern: ownership transfer to function — callee keeps alive.
+// ZER: pass *T from Slab to function, function uses but doesn't free.
+
+struct Config { u32 port; u32 max_conn; }
+Slab(Config) configs;
+
+u32 read_port(*Config c) {
+    return c.port;
+}
+
+void set_max(*Config c, u32 max) {
+    c.max_conn = max;
+}
+
+u32 main() {
+    ?*Config mc = configs.alloc_ptr();
+    *Config c = mc orelse return;
+    defer configs.free_ptr(c);
+
+    c.port = 443;
+    c.max_conn = 100;
+
+    // Pass to reader — doesn't free, safe
+    u32 port = read_port(c);
+    if (port != 443) { return 1; }
+
+    // Pass to writer — modifies but doesn't free, safe
+    set_max(c, 500);
+    if (c.max_conn != 500) { return 2; }
+
+    // Still alive — read again
+    port = read_port(c);
+    if (port != 443) { return 3; }
+
+    return 0;
+}

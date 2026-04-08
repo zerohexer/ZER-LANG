@@ -1,0 +1,21 @@
+// Rust pattern: storing arena-allocated pointer in global = escape.
+// ZER: arena-derived pointer stored in global = compile error.
+// EXPECTED: compile error
+
+struct Node { u32 value; }
+
+*Node global_node;
+
+u32 main() {
+    u8[256] backing;
+    Arena scratch = Arena.over(backing);
+
+    ?*Node mn = scratch.alloc(Node);
+    *Node n = mn orelse return;
+    n.value = 42;
+
+    // Store arena pointer in global — arena resets invalidate it
+    global_node = n;   // ERROR: arena-derived pointer escapes to global
+
+    return 0;
+}

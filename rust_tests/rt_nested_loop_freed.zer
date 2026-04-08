@@ -1,0 +1,30 @@
+// Rust source: tests/ui/moves/nested-loop-moved-value-wrong-continue.rs
+// Safety intent: value freed in inner loop, used in outer loop.
+// ZER: MAYBE_FREED from inner loop propagates to outer loop use.
+// EXPECTED: compile error
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+u32 main() {
+    ?Handle(Item) mi = pool.alloc();
+    Handle(Item) h = mi orelse return;
+    pool.get(h).val = 10;
+
+    u32 outer = 0;
+    while (outer < 2) {
+        u32 inner = 0;
+        while (inner < 2) {
+            if (inner == 1) {
+                pool.free(h);   // freed in inner loop
+            }
+            inner += 1;
+        }
+        // h is MAYBE_FREED here — depends on inner loop path
+        // Using it is an error
+        u32 v = pool.get(h).val;
+        outer += 1;
+    }
+
+    return 0;
+}

@@ -1,0 +1,28 @@
+// Rust pattern: Box<Box<T>> double indirection through *opaque.
+// ZER: nested *opaque round-trip with provenance tracking.
+
+struct Inner { u32 x; }
+struct Outer { *opaque payload; }
+
+u32 extract(Outer o) {
+    *Inner i = @ptrcast(*Inner, o.payload);
+    return i.x;
+}
+
+u32 main() {
+    Inner data;
+    data.x = 77;
+
+    Outer wrapper;
+    wrapper.payload = @ptrcast(*opaque, &data);
+
+    u32 result = extract(wrapper);
+    if (result != 77) { return 1; }
+
+    // Modify through original, verify through wrapper
+    data.x = 88;
+    result = extract(wrapper);
+    if (result != 88) { return 2; }
+
+    return 0;
+}

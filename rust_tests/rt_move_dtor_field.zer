@@ -1,0 +1,29 @@
+// Rust source: tests/ui/borrowck/borrowck-move-out-of-struct-with-dtor.rs
+// Safety intent: can't move field out of struct with destructor.
+// ZER: struct with defer-registered cleanup — field extraction is safe
+// (ZER copies scalars, doesn't move them).
+
+struct Config { u32 port; u32 timeout; }
+Pool(Config, 4) pool;
+
+u32 main() {
+    ?Handle(Config) mc = pool.alloc();
+    Handle(Config) h = mc orelse return;
+    defer pool.free(h);
+
+    pool.get(h).port = 8080;
+    pool.get(h).timeout = 30;
+
+    // Extract field values — safe (scalar copy, not move)
+    u32 port = pool.get(h).port;
+    u32 timeout = pool.get(h).timeout;
+
+    if (port != 8080) { return 1; }
+    if (timeout != 30) { return 2; }
+
+    // Original struct still fully valid
+    pool.get(h).port = 9090;
+    if (pool.get(h).port != 9090) { return 3; }
+
+    return 0;
+}

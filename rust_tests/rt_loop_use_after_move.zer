@@ -1,0 +1,22 @@
+// Rust source: tests/ui/moves/issue-72649-uninit-in-loop.rs
+// Safety intent: value consumed in loop iteration, used in next.
+// ZER: free in loop body = compile error (UAF on next iteration).
+// EXPECTED: compile error
+
+struct Token { u32 kind; }
+Slab(Token) heap;
+
+u32 main() {
+    ?*Token mt = heap.alloc_ptr();
+    *Token t = mt orelse return;
+    t.kind = 1;
+
+    u32 i = 0;
+    while (i < 3) {
+        u32 k = t.kind;   // second iteration: UAF
+        heap.free_ptr(t);  // freed on first iteration
+        i += 1;
+    }
+
+    return 0;
+}

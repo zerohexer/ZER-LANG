@@ -1,0 +1,21 @@
+// Rust source: tests/ui/nll/move-subpaths-moves-root.rs
+// Safety intent: moving sub-field invalidates parent.
+// ZER: free interior pointer, then use parent = UAF.
+// EXPECTED: compile error
+
+struct Container { u32 id; u32 data; }
+Slab(Container) heap;
+
+u32 main() {
+    ?*Container mc = heap.alloc_ptr();
+    *Container c = mc orelse return;
+    c.id = 1;
+    c.data = 42;
+
+    // Free the whole container
+    heap.free_ptr(c);
+
+    // Attempt to use parent after free — root invalidated
+    u32 val = c.id;
+    return val;
+}

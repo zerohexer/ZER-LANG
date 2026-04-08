@@ -1,0 +1,28 @@
+// LIMITATION: ?*T[N] syntax — parser can't express "array of N optional pointers"
+//
+// ?*Device[2] slots;  → parser sees ?*Device as complete type, [2] as index
+// *opaque[2] slots;   → parser sees *(opaque[2]) — pointer to array, not array of pointers
+//
+// Workaround: use typedef
+//   typedef ?*Device OptDev;
+//   OptDev[2] slots;   → works correctly
+//
+// Fix complexity: ~50 lines in parser.c — after parsing ?*T, check for [N] suffix
+// and swap to ARRAY(OPTIONAL(POINTER(T)), N). Same precedence fix as BUG-413
+// (?Handle(T)[N] had the same issue and was fixed).
+//
+// This blocks the natural pattern for arrays of optional pointers / opaque pointers.
+// The typedef workaround is functional but non-obvious.
+
+struct Device { u32 id; }
+
+u32 main() {
+    // This should work but doesn't:
+    // ?*Device[2] slots;
+
+    // Workaround that works:
+    // typedef ?*Device OptDev;
+    // OptDev[2] slots;
+
+    return 0;
+}

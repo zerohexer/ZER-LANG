@@ -4569,8 +4569,13 @@ static void emit_spawn_wrappers(Emitter *e) {
             for (int i = 0; i < ac; i++) {
                 Type *at = checker_get_type(e->checker, sn->spawn_stmt.args[i]);
                 if (at) {
-                    emit_type_and_name(e, at, NULL, 0);
-                    emit(e, " a%d; ", i);
+                    /* BUG-465: use emit_type_and_name with actual field name.
+                     * For function pointers, name must be inside (*name)(params).
+                     * Passing NULL + separate name breaks funcptr emission. */
+                    char fname[8];
+                    int flen = snprintf(fname, sizeof(fname), "a%d", i);
+                    emit_type_and_name(e, at, fname, flen);
+                    emit(e, "; ");
                 }
             }
             emit(e, "};\n");

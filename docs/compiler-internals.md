@@ -1205,6 +1205,40 @@ If-unwrap captures (`if (pool.alloc()) |h| { ... }`) must register `h` as HS_ALI
 ### Union Variant Lock via Pointer Alias (BUG-337)
 The variant lock must detect mutations through struct field chains: `s.ptr.b = 10` where `s.ptr` is `*U` (pointer to locked union). During the assignment target walk, check if any NODE_FIELD's object has type `TYPE_POINTER` whose inner type matches `union_switch_type`. Only triggers for pointer-typed fields (could alias external memory), not direct local variables of same union type (those are distinct values).
 
+### Constant-Indexed Handle Array Aliasing (BUG-462, 2026-04-08)
+
+`Handle(T)[4] ents; ents[0] = m0 orelse return;` — the assignment aliasing code at NODE_ASSIGN (line ~1102) called `handle_key_from_expr(node->assign.value)` but value was NODE_ORELSE. `handle_key_from_expr` returns 0 for NODE_ORELSE → alias never created → `m0` seen as leaked.
+
+**Fix:** Unwrap NODE_ORELSE/NODE_INTRINSIC/NODE_TYPECAST before extracting key. Same unwrap chain as the var-decl alias path (line 811-818). Now `ents[0]` gets same alloc_id as `m0` — free propagates correctly.
+
+**Pattern:** Any zercheck code extracting source keys from assignment values must unwrap orelse/intrinsic/typecast first. The var-decl path already did this; the NODE_ASSIGN path was missing it.
+
+### Struct Field Pointer Alias UAF (BUG-463, 2026-04-08)
+
+`h.inner = w; free_ptr(w); h.inner.data` — NODE_FIELD UAF check walked to root ident (`h`) and only checked that. Root `h` is an untracked stack struct. The tracked key `"h.inner"` (alias of `w` with same alloc_id) was never checked.
+
+**Fix:** Walk EVERY prefix of the field/index chain, not just root. For `h.inner.data`, check: `"h.inner.data"`, `"h.inner"`, `"h"`. Any tracked prefix that is FREED catches the UAF. Added `free_line < cur_line` guard to exclude the free call's own arguments (pool.free(s.h) marks s.h FREED, then expression check re-visits s.h on same line → false positive without the guard).
+
+**Pattern:** NODE_FIELD UAF now catches pointer aliasing through struct fields at any depth. The prefix walk handles `a.b.c.d` by checking `a.b.c.d`, `a.b.c`, `a.b`, `a` — first tracked FREED prefix triggers the error.
+
+### Deadlock Detection Redesign (BUG-464, 2026-04-08)
+
+**Old model (overly conservative):** `check_block_lock_ordering` tracked `last_shared_id` across an entire block. `a.x = 10; b.y = 20; if (a.x != 10)` → false deadlock error. The third statement accesses Alpha after Beta — "descending order."
+
+**Why old model was wrong:** The emitter does lock→op→unlock PER STATEMENT GROUP. No two different shared types are ever locked simultaneously. The ABBA deadlock pattern requires NESTED locks (lock A, then lock B while A still held). ZER's emitter never nests locks.
+
+**New model:** Only detect same-statement multi-lock — when ONE expression/statement accesses TWO DIFFERENT shared types. The emitter can only lock ONE type per group, so the second type is unprotected. `collect_shared_types_in_expr()` finds ALL shared types in an expression tree. If ≥2 distinct types found → compile error.
+
+**What changed:**
+- Removed: cross-statement ordering check (safe by construction — locks released between statements)
+- Added: `collect_shared_types_in_expr()` and `collect_shared_types_in_stmt()` — walk expression tree, collect all shared types
+- Updated: 3 existing deadlock tests to use same-statement pattern (`a.x = b.y;` instead of `b.y = 1; a.x = 2;`)
+
+**Test patterns:**
+- `a.x = 10; b.y = 20; if (a.x != 10)` → **OK** (cross-statement, independent locks)
+- `a.x = b.y;` → **ERROR** (same statement, two shared types)
+- `a.x = 10; a.x = 20;` → **OK** (same type, grouped under one lock)
+
 ## C-to-ZER Conversion Tools (moved from CLAUDE.md)
 
 ### C-to-ZER Conversion Tools (implemented v0.2)

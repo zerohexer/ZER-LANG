@@ -271,12 +271,13 @@ th.join();                  // MUST call before function returns
 // threadlocal — per-thread storage:
 threadlocal u32 counter;    // each thread has its own copy (__thread)
 
-// Lock ordering — deadlock prevention:
+// Lock ordering — deadlock prevention (BUG-464 redesign):
 shared struct A { u32 x; }
 shared struct B { u32 y; }
 A a; B b;
-a.x = 1; b.y = 2;          // OK — ascending order (A before B)
-b.y = 2; a.x = 1;          // ERROR — descending order, potential deadlock
+a.x = 1; b.y = 2;          // OK — separate statements, no nested locks
+b.y = 2; a.x = 1;          // OK — separate statements, locks released between
+a.x = b.y;                 // ERROR — same statement accesses both A and B
 ```
 
 ### Hardware Support
@@ -328,7 +329,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | @critical escape | `return`/`break`/`continue`/`goto` inside `@critical` → compile error (would skip interrupt re-enable) |
 | Interior pointer UAF | `*u32 p = &b.field; free(b); p[0]` → compile error. Field-derived pointers share alloc_id with parent. NODE_INDEX UAF check. |
 | Thread data race | `shared struct` auto-locked. Non-shared pointer to `spawn` → compile error (unless scoped with ThreadHandle+join). Handle to `spawn` → compile error. |
-| Deadlock | Lock ordering on shared structs — descending type_id order → compile error. Mathematically prevents deadlock. |
+| Deadlock | Same-statement multi-shared-type access → compile error. Emitter does lock-per-statement (no nested locks), so cross-statement ordering is safe. Only same-statement access to 2+ shared types is a real deadlock risk. |
 | Ownership transfer | `spawn` with non-shared pointer marks variable HS_TRANSFERRED — use after transfer → compile error. |
 | Thread not joined | Scoped spawn `ThreadHandle` not joined before function exit → zercheck compile error. |
 | Spawn in ISR | `spawn` inside `@critical` block → compile error (thread creation with interrupts disabled). |
@@ -458,8 +459,9 @@ diff zerc zerc2                  ← identical = v1.0 proven
 **Roadmap:**
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
-- **v0.2.2 (CURRENT):** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3:** better error messages, stdlib completion (io/fmt/conv)
+- **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
+- **v0.3.0 (CURRENT):** 512 Rust-equivalent tests (0 failures), BUG-462 (handle array orelse alias), BUG-463 (struct field pointer UAF via prefix walk), BUG-464 (deadlock model redesign: same-statement multi-lock detection), constant-indexed handle arrays compile-time tracked, 464+ bug fixes, 3,400+ tests
+- **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
 
@@ -804,7 +806,7 @@ When starting a new session or lacking context:
 
 1. Read `CLAUDE.md` (this file) — has FULL language reference above, rules, conventions
 2. **MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
-3. Read `BUGS-FIXED.md` — 41 past bugs with root causes. Prevents re-introducing fixed bugs.
+3. Read `BUGS-FIXED.md` — 464+ past bugs with root causes. Prevents re-introducing fixed bugs. Read `docs/future_plans.md` for architecture roadmap (table-driven compiler, container keyword, monomorphization).
 4. `ZER-LANG.md` — full language spec (only if CLAUDE.md quick reference is insufficient)
 5. Read the relevant header files: `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
 4. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
@@ -916,7 +918,7 @@ When a test fails due to a **compiler limitation** (not a test bug):
 - `tests/ui/drop/` — 15 patterns (struct-as-object, dynamic drop, defer ordering)
 - `tests/ui/unsafe/` — 10 patterns (mmio, inttoptr, provenance)
 - `tests/ui/nll/` — 10 patterns (interior ptr, drop conflict, subpath invalidation)
-- Total: 493 Rust-equivalent tests in `rust_tests/`
+- Total: 512 Rust-equivalent tests in `rust_tests/`
 
 ### High-Value Test Categories for Finding Bugs
 From analysis of Rust's test tree, these categories stress ZER's model the hardest:

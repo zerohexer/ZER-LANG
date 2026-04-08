@@ -5,6 +5,36 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-08 — Zercheck Prefix Walk + Deadlock Model Redesign
+
+### BUG-465: Function pointer as spawn argument — struct field name outside parens
+- **Symptom:** `spawn worker(&res, double_it, 21)` where `worker` takes `u32 (*op)(u32)` → GCC error: `uint32_t (*)(uint32_t) a1;` (name outside parens).
+- **Root cause:** Spawn wrapper arg struct emission at emitter.c ~line 4572 used `emit_type_and_name(e, at, NULL, 0)` then `emit(e, " a%d; ")` — separate name placement. Function pointers require name inside `(*name)(params)`.
+- **Fix:** Pass the field name (`"a0"`, `"a1"`, etc.) directly to `emit_type_and_name` instead of NULL. Same pattern as BUG-412 (funcptr array emission).
+- **Found by:** Auditing existing tests for hidden rewrites. `rt_sendfn_spawn_with_fn_arg.zer` had been rewritten to use integer dispatch instead of funcptr args — the "limitation" was actually this bug.
+- **Test:** `rust_tests/rt_sendfn_spawn_with_fn_arg.zer` — now uses actual funcptr arg to spawn.
+
+### BUG-462: Constant-indexed handle arrays — orelse unwrap missing in assignment aliasing
+- **Symptom:** `Handle(T)[4] ents; ents[0] = m0 orelse return;` → false "handle leaked" on `m0`
+- **Root cause:** Assignment aliasing in zercheck (NODE_ASSIGN, ~line 1102) called `handle_key_from_expr(node->assign.value)` directly, but value was `NODE_ORELSE(m0, return)`. `handle_key_from_expr` doesn't handle NODE_ORELSE → returns 0 → alias `"ents[0]"` never created → `m0` appears leaked.
+- **Fix:** Unwrap NODE_ORELSE/NODE_INTRINSIC/NODE_TYPECAST before extracting key (8 lines, matching var-decl path at line 811-818 which already did this).
+- **Test:** `rust_tests/rt_handle_array_const_idx.zer` — constant-indexed handle array with alloc/use/free cycle.
+
+### BUG-463: Struct field pointer aliasing — UAF through h.inner not caught
+- **Symptom:** `h.inner = w; heap.free_ptr(w); h.inner.data` compiled clean — UAF not detected.
+- **Root cause:** NODE_FIELD UAF check (zercheck.c ~line 1190) walked expression chain to the ROOT ident (`h`) and only checked that. For `h.inner.data`, root is `h` (untracked stack struct). The tracked key `"h.inner"` (alias of `w`) was never checked.
+- **Fix:** Walk EVERY prefix of the field/index chain, not just root. For `h.inner.data`, check `"h.inner.data"`, `"h.inner"`, `"h"` — any tracked prefix that is FREED catches the UAF. Added `free_line < cur_line` guard to avoid false positive when `pool.free(s.h)` marks `s.h` FREED then expression check re-visits same line.
+- **Test:** `rust_tests/rt_move_into_struct.zer` — struct field pointer alias, free original, use through struct field.
+
+### BUG-464: Deadlock detection — overly conservative cross-statement ordering
+- **Symptom:** `a.x = 10; b.y = 20; if (a.x != 10) { return 1; }` → false "deadlock" error. Pattern is safe — each statement is lock→op→unlock, no nested locks.
+- **Root cause:** `check_block_lock_ordering` tracked `last_shared_id` across entire block. Once Beta accessed, any subsequent Alpha access = "descending order" error. But the emitter does lock-per-statement — no two locks held simultaneously.
+- **Fix:** Redesigned deadlock detection to match emitter's actual locking model. Only same-statement multi-shared-type access is a real deadlock (emitter can only lock ONE type per statement). New `collect_shared_types_in_expr` finds ALL shared types in one expression. Cross-statement ordering removed entirely — safe by construction.
+- **Tests:** `rust_tests/rt_deadlock_order_interleave.zer` (positive — cross-statement safe), `rust_tests/rt_deadlock_order_reject.zer` (negative — same-statement multi-lock).
+- **Updated:** 3 existing deadlock tests (`conc_reject_deadlock_abba`, `conc_reject_deadlock_ordering`, `gen_shared_008`) now test same-statement pattern.
+
+---
+
 ## Session 2026-04-06 — Dynamic Array UAF Auto-Guard
 
 ### NEW FEATURE: Compile-time dynamic array Handle UAF protection

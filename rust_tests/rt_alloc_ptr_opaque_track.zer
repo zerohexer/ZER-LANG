@@ -1,0 +1,20 @@
+// Critical: alloc_ptr cast to *opaque, free via *opaque, use original
+// EXPECTED: compile error
+
+struct Sensor { u32 reading; }
+Slab(Sensor) heap;
+
+void destroy(*opaque raw) {
+    *Sensor s = @ptrcast(*Sensor, raw);
+    heap.free_ptr(s);
+}
+
+u32 main() {
+    ?*Sensor ms = heap.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s.reading = 42;
+    *opaque raw = @ptrcast(*opaque, s);
+    destroy(raw);
+    s.reading = 99;
+    return 0;
+}

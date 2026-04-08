@@ -1,0 +1,16 @@
+// Critical: local pointer stored in struct field that escapes scope
+// EXPECTED: compile error
+
+struct Wrapper { *u32 ptr; }
+
+Wrapper make_wrapper() {
+    u32 local = 42;
+    Wrapper w;
+    w.ptr = &local;
+    return w;
+}
+
+u32 main() {
+    Wrapper w = make_wrapper();
+    return 0;
+}

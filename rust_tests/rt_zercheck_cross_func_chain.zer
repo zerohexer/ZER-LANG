@@ -1,0 +1,23 @@
+// Critical: cross-function free chain — A calls B which calls C which frees
+// zercheck must track through FuncSummary chain
+// EXPECTED: compile error
+
+struct Data { u32 value; }
+Slab(Data) heap;
+
+void inner_free(*Data d) {
+    heap.free_ptr(d);
+}
+
+void outer_free(*Data d) {
+    inner_free(d);
+}
+
+u32 main() {
+    ?*Data md = heap.alloc_ptr();
+    *Data d = md orelse return;
+    d.value = 42;
+    outer_free(d);
+    d.value = 99;
+    return 0;
+}

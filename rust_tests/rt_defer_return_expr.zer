@@ -1,0 +1,20 @@
+// Critical: defer free + return h.field — return expression evaluates BEFORE defer
+// The return value must be captured before defer fires the free.
+
+struct Config { u32 port; u32 timeout; }
+Pool(Config, 4) pool;
+
+u32 get_port() {
+    ?Handle(Config) mh = pool.alloc();
+    Handle(Config) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).port = 8080;
+    pool.get(h).timeout = 30;
+    return pool.get(h).port;
+}
+
+u32 main() {
+    u32 port = get_port();
+    if (port != 8080) { return 1; }
+    return 0;
+}

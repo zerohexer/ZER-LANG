@@ -1,0 +1,15 @@
+// Critical: double free through aliased pointer
+// EXPECTED: compile error
+
+struct Block { u32 size; }
+Slab(Block) heap;
+
+u32 main() {
+    ?*Block mb = heap.alloc_ptr();
+    *Block b = mb orelse return;
+    *Block alias = b;
+    b.size = 100;
+    heap.free_ptr(b);
+    heap.free_ptr(alias);
+    return 0;
+}

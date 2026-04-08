@@ -1,35 +1,35 @@
 // Rust pattern: Vec<Box<dyn Any>> — collection of type-erased pointers
-// ZER: *opaque stored and retrieved from struct fields
+// ZER: *opaque array using typedef workaround for ?*opaque[N] syntax limitation.
 
 struct Device { u32 id; u32 status; }
 Slab(Device) heap;
 
-struct Registry {
-    ?*opaque slot0;
-    ?*opaque slot1;
-}
+typedef ?*opaque OptOpaque;
 
 u32 main() {
     ?*Device m0 = heap.alloc_ptr();
     *Device d0 = m0 orelse return;
     defer heap.free_ptr(d0);
-    d0.id = 0; d0.status = 10;
+    d0.id = 0;
+    d0.status = 10;
 
     ?*Device m1 = heap.alloc_ptr();
     *Device d1 = m1 orelse return;
     defer heap.free_ptr(d1);
-    d1.id = 1; d1.status = 20;
+    d1.id = 1;
+    d1.status = 20;
 
-    Registry reg;
-    reg.slot0 = @ptrcast(*opaque, d0);
-    reg.slot1 = @ptrcast(*opaque, d1);
+    // Array of optional opaque pointers via typedef
+    OptOpaque[2] slots;
+    slots[0] = @ptrcast(*opaque, d0);
+    slots[1] = @ptrcast(*opaque, d1);
 
     // Retrieve and cast back
-    *opaque raw0 = reg.slot0 orelse return;
+    *opaque raw0 = slots[0] orelse return;
     *Device r0 = @ptrcast(*Device, raw0);
     if (r0.status != 10) { return 1; }
 
-    *opaque raw1 = reg.slot1 orelse return;
+    *opaque raw1 = slots[1] orelse return;
     *Device r1 = @ptrcast(*Device, raw1);
     if (r1.status != 20) { return 2; }
 

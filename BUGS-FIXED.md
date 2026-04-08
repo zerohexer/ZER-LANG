@@ -2989,3 +2989,10 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Root cause:** Old emitter used `(void*(*)(void*))func_name` — casts the function directly. Works on x86 by accident but UB per C standard.
 - **Fix:** Proper file-scope wrapper functions. Pre-scan phase assigns unique IDs to all NODE_SPAWN nodes. Wrapper emitted at file scope: `static void *_zer_spawn_wrap_N(void *_raw) { struct args *a = _raw; func(a->a0, a->a1); free(a); return NULL; }`. Forward declarations emitted for target functions.
 - **Lesson:** Never cast function pointers to incompatible types. Always use a wrapper with the correct signature.
+
+### BUG-461: const global with shift operator fails (GCC statement expression in global scope)
+- **Symptom:** `const u32 X = 1 << 2;` at global scope → GCC error "braced-group within expression allowed only inside a function."
+- **Root cause:** `_zer_shl` safety macro uses GCC statement expression `({...})` which is invalid in global initializer context. The emitter used `emit_expr()` for const global inits, which always emits the safety macro.
+- **Fix:** In `emit_global_var`, if `node->var_decl.is_const`, try `eval_const_expr()` first. If evaluation succeeds (both operands are compile-time constants), emit the pre-computed numeric result directly instead of the expression. Falls back to `emit_expr()` for non-const expressions.
+- **Found by:** `rt_const_binops.zer` translated from Rust's `tests/ui/consts/const-binops.rs`.
+- **Lesson:** Const global initializers must not use GCC extensions (statement expressions, typeof in expression position). Pre-evaluate when possible — it's both safer (compile-time verified) and more portable.

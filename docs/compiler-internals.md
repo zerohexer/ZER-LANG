@@ -2882,3 +2882,39 @@ Uses `add_symbol_internal()` to bypass BUG-276 `_zer_` prefix check.
 **Parser:** `threadlocal` prefix handled before `const` in `parse_declaration`. Sets `is_threadlocal = true`.
 
 **Emitter:** `emit_global_var` emits `__thread` prefix for threadlocal globals.
+
+### Const Global Pre-Evaluation (BUG-461, 2026-04-08)
+
+**Problem:** `const u32 X = 1 << 2;` at global scope fails because `_zer_shl` safety macro uses GCC statement expression `({...})` — invalid in global initializer context.
+
+**Fix:** In `emit_global_var`, when `node->var_decl.is_const`, try `eval_const_expr(node->var_decl.init)` first. If evaluation succeeds (returns != CONST_EVAL_FAIL), emit the pre-computed numeric result directly: `uint32_t X = 4;`. Falls back to `emit_expr()` for non-evaluable expressions.
+
+**Safety:** Compile-time evaluation is SAFER than runtime macro — shift amount verified at compile time, not runtime. All const global initializers with arithmetic (including <<, >>) are now pre-evaluated.
+
+### Rust Test Suite Coverage (2026-04-08)
+
+**400 Rust-equivalent tests** in `rust_tests/`, all passing, integrated into `make check` via `rust_tests/run_tests.sh`.
+
+**Directories fully covered:**
+- `tests/ui/threads-sendsync/` — COMPLETE (51/67 translated, 16 not-applicable)
+
+**Directories partially covered:**
+- `tests/ui/borrowck/` — 8 patterns (cross-func UAF, interior ptr, alias, autoref)
+- `tests/ui/moves/` — 8 patterns (move chain, guard, loop, arc reuse)
+- `tests/ui/drop/` — 8 patterns (scope exit, LIFO order, conditional, count, trait object)
+- `tests/ui/unsafe/` — 4 patterns (@inttoptr safety, pointer deref, assignability)
+- `tests/ui/consts/` — 10 patterns (const fn, binops, array OOB, enum values, comptime if)
+
+**Test detection:** Negative tests auto-detected by "EXPECTED: compile error" in file content. run_tests.sh handles both positive (compile+run+exit 0) and negative (must fail to compile).
+
+**Critical zercheck edge cases verified (15 tests):**
+- Cross-function free chain (A→B→C frees)
+- MAYBE_FREED in loop, nested if, switch arm
+- Interior pointer to nested field chain
+- Handle alias tracking (free one var, use other = error)
+- *opaque provenance through free call
+- defer + return expression evaluation order
+- goto fires pending defers
+- if-exit-not-MAYBE_FREED (free+return in branch = safe after)
+- Double free via alias, ghost handle, handle leak overwrite
+- Cross-type slab free, scope escape via struct field return

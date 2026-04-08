@@ -1,0 +1,50 @@
+// Rust borrowck patterns — safe versions that should compile and run.
+// Tests multiple safe ownership patterns in one file.
+
+struct Node { u32 id; u32 next_id; }
+Pool(Node, 8) pool;
+
+u32 main() {
+    // Pattern 1: alloc, use, free — basic lifecycle
+    ?Handle(Node) m1 = pool.alloc();
+    Handle(Node) h1 = m1 orelse return;
+    pool.get(h1).id = 1;
+    pool.get(h1).next_id = 0;
+    pool.free(h1);
+
+    // Pattern 2: alloc, defer free, use — RAII
+    ?Handle(Node) m2 = pool.alloc();
+    Handle(Node) h2 = m2 orelse return;
+    defer pool.free(h2);
+    pool.get(h2).id = 2;
+
+    // Pattern 3: alloc two, link them, free both
+    ?Handle(Node) m3 = pool.alloc();
+    Handle(Node) h3 = m3 orelse return;
+    defer pool.free(h3);
+
+    ?Handle(Node) m4 = pool.alloc();
+    Handle(Node) h4 = m4 orelse return;
+    defer pool.free(h4);
+
+    pool.get(h3).id = 3;
+    pool.get(h4).id = 4;
+    pool.get(h3).next_id = pool.get(h4).id;
+
+    if (pool.get(h3).next_id != 4) { return 1; }
+
+    // Pattern 4: if-exit free (no MAYBE_FREED since branch exits)
+    ?Handle(Node) m5 = pool.alloc();
+    Handle(Node) h5 = m5 orelse return;
+    bool error = false;
+    if (error) {
+        pool.free(h5);
+        return 99;
+    }
+    // h5 still ALIVE here — safe to use
+    pool.get(h5).id = 5;
+    if (pool.get(h5).id != 5) { return 2; }
+    pool.free(h5);
+
+    return 0;
+}

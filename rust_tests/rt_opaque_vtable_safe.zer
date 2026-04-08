@@ -1,0 +1,41 @@
+// Rust pattern: trait object vtable dispatch — safe version.
+// ZER: function pointer + *opaque context with proper cleanup.
+
+struct Dog { u32 tricks; }
+struct Cat { u32 lives; }
+
+u32 dog_speak(*opaque ctx) {
+    *Dog d = @ptrcast(*Dog, ctx);
+    return d.tricks;
+}
+
+u32 cat_speak(*opaque ctx) {
+    *Cat c = @ptrcast(*Cat, ctx);
+    return c.lives;
+}
+
+struct Animal {
+    *opaque ctx;
+    u32 (*speak)(*opaque);
+}
+
+u32 main() {
+    Dog d;
+    d.tricks = 7;
+    Animal a1;
+    a1.ctx = @ptrcast(*opaque, &d);
+    a1.speak = dog_speak;
+
+    Cat c;
+    c.lives = 9;
+    Animal a2;
+    a2.ctx = @ptrcast(*opaque, &c);
+    a2.speak = cat_speak;
+
+    u32 r1 = a1.speak(a1.ctx);
+    u32 r2 = a2.speak(a2.ctx);
+
+    if (r1 != 7) { return 1; }
+    if (r2 != 9) { return 2; }
+    return 0;
+}

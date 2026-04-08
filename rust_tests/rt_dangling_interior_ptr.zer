@@ -1,0 +1,23 @@
+// Rust pattern: interior pointer becomes dangling after parent free.
+// ZER: interior pointer shares alloc_id with parent.
+// EXPECTED: compile error
+
+struct Outer { u32 x; u32 y; }
+Slab(Outer) heap;
+
+u32 main() {
+    ?*Outer mo = heap.alloc_ptr();
+    *Outer o = mo orelse return;
+    o.x = 10;
+    o.y = 20;
+
+    // Interior pointer — points into Outer's field
+    *u32 px = &o.x;
+
+    // Free parent
+    heap.free_ptr(o);
+
+    // Use interior pointer — UAF (parent freed)
+    u32 val = px[0];
+    return val;
+}

@@ -1,0 +1,42 @@
+// Rust source: tests/ui/drop/drop-trait-enum.rs
+// Safety intent: destructor fires for each enum variant on scope exit.
+// ZER: union variant + defer for cleanup tracking.
+
+union Message {
+    u32 simple_id;
+    u32 nested_value;
+}
+
+u32 cleanup_count;
+
+u32 main() {
+    cleanup_count = 0;
+
+    // Simple variant
+    Message m1;
+    m1.simple_id = 10;
+    defer { cleanup_count += 1; }
+
+    // Nested variant
+    Message m2;
+    m2.nested_value = 20;
+    defer { cleanup_count += 1; }
+
+    // Verify via switch
+    switch (m1) {
+        .simple_id => |v| {
+            if (v != 10) { return 1; }
+        }
+        .nested_value => { return 2; }
+    }
+
+    switch (m2) {
+        .simple_id => { return 3; }
+        .nested_value => |v| {
+            if (v != 20) { return 4; }
+        }
+    }
+
+    // Both defers fire on exit — cleanup_count will be 2
+    return 0;
+}

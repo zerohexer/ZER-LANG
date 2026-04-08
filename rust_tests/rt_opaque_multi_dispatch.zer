@@ -1,0 +1,45 @@
+// Rust pattern: dynamic dispatch with multiple trait objects.
+// ZER: separate vtable structs with *opaque context (not array — heterogeneous).
+
+struct Adder { u32 base; }
+struct Multiplier { u32 factor; }
+
+u32 add_compute(*opaque ctx, u32 x) {
+    *Adder a = @ptrcast(*Adder, ctx);
+    return x + a.base;
+}
+
+u32 mul_compute(*opaque ctx, u32 x) {
+    *Multiplier m = @ptrcast(*Multiplier, ctx);
+    return x * m.factor;
+}
+
+struct Op {
+    *opaque ctx;
+    u32 (*compute)(*opaque, u32);
+}
+
+u32 main() {
+    Adder a;
+    a.base = 10;
+    Multiplier m;
+    m.factor = 3;
+
+    Op op1;
+    op1.ctx = @ptrcast(*opaque, &a);
+    op1.compute = add_compute;
+
+    Op op2;
+    op2.ctx = @ptrcast(*opaque, &m);
+    op2.compute = mul_compute;
+
+    // Chain: 5 + 10 = 15, 15 * 3 = 45
+    u32 val = 5;
+    val = op1.compute(op1.ctx, val);
+    if (val != 15) { return 1; }
+
+    val = op2.compute(op2.ctx, val);
+    if (val != 45) { return 2; }
+
+    return 0;
+}

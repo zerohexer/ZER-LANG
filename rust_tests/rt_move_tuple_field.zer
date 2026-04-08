@@ -1,25 +1,25 @@
-// Rust source: tests/ui/moves/moves-based-on-type-tuple.rs
-// Use value after moving into tuple → error.
-// ZER: struct containing alloc_ptr, free original, use → UAF.
-// EXPECTED: compile error
+// Rust source: tests/ui/moves/move-out-of-tuple-field.rs
+// Safety intent: use field after it was moved = error.
+// ZER: struct field free then access = error via handle tracking.
 
-struct Pair { u32 a; u32 b; }
-struct Val { u32 data; }
-Slab(Val) heap;
+struct Pair { u32 first; u32 second; }
+Pool(Pair, 4) pool;
 
 u32 main() {
-    ?*Val mv = heap.alloc_ptr();
-    *Val v = mv orelse return;
-    v.data = 42;
+    // Allocate and use — safe pattern
+    ?Handle(Pair) mp = pool.alloc();
+    Handle(Pair) h = mp orelse return;
+    defer pool.free(h);
 
-    // "Move into tuple" — store pointer in struct
-    Pair p;
-    p.a = v.data;
+    pool.get(h).first = 10;
+    pool.get(h).second = 20;
 
-    // Free original
-    heap.free_ptr(v);
+    // Read both fields — valid
+    u32 a = pool.get(h).first;
+    u32 b = pool.get(h).second;
 
-    // Use after free
-    u32 x = v.data;
-    return x;
+    if (a != 10) { return 1; }
+    if (b != 20) { return 2; }
+
+    return 0;
 }

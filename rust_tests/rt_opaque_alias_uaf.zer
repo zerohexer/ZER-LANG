@@ -1,0 +1,23 @@
+// Rust pattern: type-erased pointer use after free via alias.
+// ZER: @ptrcast alias tracking — free original, use alias = error.
+// EXPECTED: compile error
+
+struct Sensor { u32 reading; }
+Slab(Sensor) heap;
+
+u32 main() {
+    ?*Sensor ms = heap.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s.reading = 99;
+
+    // Type-erase to *opaque
+    *opaque raw = @ptrcast(*opaque, s);
+
+    // Free through original typed pointer
+    heap.free_ptr(s);
+
+    // Try to cast back and use — UAF through alias
+    *Sensor alias = @ptrcast(*Sensor, raw);
+    u32 val = alias.reading;
+    return val;
+}

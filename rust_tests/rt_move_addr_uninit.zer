@@ -1,0 +1,23 @@
+// Rust source: tests/ui/moves/move-of-addr-of-mut.rs
+// Safety intent: taking address of uninitialized variable is rejected.
+// ZER: *T requires init — non-null guarantee. Auto-zero handles this.
+
+struct Sensor { u32 id; u32 reading; }
+
+u32 main() {
+    // ZER auto-zeros everything — no uninitialized memory
+    Sensor s;
+    // s.id and s.reading are 0 (auto-zeroed)
+
+    if (s.id != 0) { return 1; }
+    if (s.reading != 0) { return 2; }
+
+    // Now assign and verify
+    s.id = 42;
+    s.reading = 100;
+
+    if (s.id != 42) { return 3; }
+    if (s.reading != 100) { return 4; }
+
+    return 0;
+}

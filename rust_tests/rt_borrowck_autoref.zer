@@ -1,0 +1,16 @@
+// Rust source: tests/ui/borrowck/borrowck-autoref-3261.rs
+// Mutable borrow + closure that mutates → double mutable borrow error.
+// ZER: alloc, take field ptr, free, use field ptr → interior UAF.
+// EXPECTED: compile error
+
+struct Config { u32 mode; u32 value; }
+Slab(Config) heap;
+
+u32 main() {
+    ?*Config mc = heap.alloc_ptr();
+    *Config c = mc orelse return;
+    *u32 mode_ptr = &c.mode;
+    heap.free_ptr(c);
+    u32 x = mode_ptr[0];
+    return x;
+}

@@ -1,0 +1,17 @@
+// Rust source: tests/ui/borrowck/borrowck-binding-mutbl.rs
+// Match with mutable ref binding — modify through pattern.
+// ZER: Struct field access through pointer, modify via deref.
+
+struct Frame { u32 count; }
+
+void process(*Frame f) {
+    f.count += 1;
+}
+
+u32 main() {
+    Frame x;
+    x.count = 3;
+    process(&x);
+    if (x.count != 4) { return 1; }
+    return 0;
+}

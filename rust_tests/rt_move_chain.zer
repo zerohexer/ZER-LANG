@@ -1,0 +1,24 @@
+// Rust source: tests/ui/moves/move-4.rs
+// Chain of variable assignments with Box — ownership passes through.
+// ZER: Struct passed through multiple variables by value, verify fields.
+
+struct Triple { u32 a; u32 b; u32 c; }
+
+Triple chain(Triple t) {
+    Triple foo = t;
+    Triple bar = foo;
+    Triple baz = bar;
+    return baz;
+}
+
+u32 main() {
+    Triple t;
+    t.a = 1;
+    t.b = 2;
+    t.c = 3;
+
+    Triple result = chain(t);
+    if (result.c != 3) { return 1; }
+    if (result.a != 1) { return 2; }
+    return 0;
+}

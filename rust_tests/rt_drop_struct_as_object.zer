@@ -1,0 +1,26 @@
+// Rust source: tests/ui/drop/drop-struct-as-object.rs
+// Drop runs after struct boxed and cast to trait object.
+// ZER: alloc_ptr, cast to *opaque, original defer still fires.
+
+struct Cat { u32 name; }
+Slab(Cat) heap;
+
+u32 drop_value;
+
+u32 main() {
+    drop_value = 0;
+    {
+        ?*Cat mc = heap.alloc_ptr();
+        *Cat c = mc orelse return;
+        defer heap.free_ptr(c);
+        c.name = 22;
+
+        // Cast to *opaque (like trait object)
+        *opaque obj = @ptrcast(*opaque, c);
+
+        // Defer fires at scope exit — cleanup happens
+        drop_value = c.name;
+    }
+    if (drop_value != 22) { return 1; }
+    return 0;
+}

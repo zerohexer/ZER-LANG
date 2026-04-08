@@ -1,0 +1,22 @@
+// Rust pattern: Box<T> auto-deref — access fields through Box transparently.
+// ZER: Handle auto-deref — h.field compiles to pool.get(h).field.
+
+struct Motor { u32 speed; u32 torque; u32 enabled; }
+Pool(Motor, 4) motors;
+
+u32 main() {
+    ?Handle(Motor) mh = motors.alloc();
+    Handle(Motor) h = mh orelse return;
+    defer motors.free(h);
+
+    // Auto-deref: h.speed → motors.get(h).speed
+    h.speed = 100;
+    h.torque = 50;
+    h.enabled = 1;
+
+    u32 power = h.speed * h.torque;
+    if (power != 5000) { return 1; }
+    if (h.enabled != 1) { return 2; }
+
+    return 0;
+}

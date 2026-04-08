@@ -2083,13 +2083,19 @@ u32 main() {
 Zero heap, zero runtime. Each task is a stack-allocated struct (~4-50 bytes).
 
 ### Deadlock Detection (Compile-Time)
+
+ZER detects when a single statement accesses TWO different shared types — the emitter can only lock one per statement, leaving the other unprotected.
+
 ```zer
 shared struct A { u32 x; }
 shared struct B { u32 y; }
 A a; B b;
-a.x = 1; b.y = 2;          // OK — ascending order
-b.y = 2; a.x = 1;          // COMPILE ERROR — descending order = deadlock
+a.x = 1; b.y = 2;          // OK — separate statements, independent locks
+b.y = 2; a.x = 1;          // OK — each statement locks/unlocks independently
+a.x = b.y;                 // COMPILE ERROR — one statement accesses both A and B
 ```
+
+Cross-statement ordering is safe because the emitter does lock→op→unlock per statement group — no two different shared types are ever locked simultaneously.
 
 ---
 

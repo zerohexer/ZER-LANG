@@ -460,7 +460,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** 512 Rust-equivalent tests (0 failures), BUG-462 (handle array orelse alias), BUG-463 (struct field pointer UAF via prefix walk), BUG-464 (deadlock model redesign: same-statement multi-lock detection), constant-indexed handle arrays compile-time tracked, 464+ bug fixes, 3,400+ tests
+- **v0.3.0 (CURRENT):** 512 Rust-equivalent tests (0 failures), BUG-462 (handle array orelse alias), BUG-463 (struct field pointer UAF via prefix walk), BUG-464 (deadlock model redesign: same-statement multi-lock only), BUG-465 (funcptr as spawn arg), BUG-466 (heterogeneous *opaque array constant-index), BUG-467 (?*T[N] parser precedence), 467+ bug fixes, 3,400+ tests
 - **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -908,17 +908,27 @@ When a test fails due to a **compiler limitation** (not a test bug):
 
 **Why this matters:** Every rewritten test is a limitation we forgot about. When we later claim "493 tests pass, 0 failures," it should mean the compiler handles ALL those patterns — not that we rewrote the hard ones to be easy.
 
-**BUG-462 was found this way:** The handle array test was initially rewritten to avoid constant-indexed arrays. On review, the original pattern was investigated, root cause found (orelse unwrap missing in assignment aliasing), and fixed in 8 lines. The "limitation" was actually a bug.
+**This rule found 6 bugs in one session (BUG-462 through BUG-467):**
+- BUG-462: handle array test rewritten to named vars → orelse unwrap missing in assignment aliasing
+- BUG-463: struct field alias test labeled "limitation" → NODE_FIELD only checked root, not prefixes
+- BUG-464: deadlock interleave test labeled "limitation" → lock ordering model was wrong
+- BUG-465: funcptr spawn test rewritten to integer dispatch → emit_type_and_name not used for spawn struct
+- BUG-466: *opaque vtable array rewritten to separate vars → constant-index homogeneity check too strict
+- BUG-467: `?*T[N]` array test used typedef workaround → parser precedence swap missing for pointer-wrapped arrays
 
-### Coverage status (as of v0.3.0)
+Every single "limitation" was a fixable bug. The `limitations/` directory is now empty.
+
+### Coverage status (as of v0.3.0, fully audited 2026-04-08)
 - `tests/ui/threads-sendsync/` — **COMPLETE** (51/67)
-- `tests/ui/consts/` — 15 patterns
-- `tests/ui/borrowck/` — 20 patterns (field sensitivity, nested call free, scope escape, union borrow)
-- `tests/ui/moves/` — 15 patterns (ownership chain, conditional, loop, cross-function)
-- `tests/ui/drop/` — 15 patterns (struct-as-object, dynamic drop, defer ordering)
-- `tests/ui/unsafe/` — 10 patterns (mmio, inttoptr, provenance)
-- `tests/ui/nll/` — 10 patterns (interior ptr, drop conflict, subpath invalidation)
-- Total: 512 Rust-equivalent tests in `rust_tests/`
+- `tests/ui/consts/` — 15 patterns (shift safety, div-by-zero, OOB, overflow wraps, comptime)
+- `tests/ui/borrowck/` — 25 patterns (field sensitivity, nested call free, scope escape, union borrow, struct field alias UAF, interior pointer prefix walk)
+- `tests/ui/moves/` — 20 patterns (ownership chain, conditional, loop, cross-function, struct field move)
+- `tests/ui/drop/` — 15 patterns (struct-as-object, dynamic drop, defer ordering, LIFO cleanup)
+- `tests/ui/unsafe/` — 12 patterns (mmio, inttoptr, provenance, mmio OOB, ISR slab reject)
+- `tests/ui/nll/` — 12 patterns (interior ptr, drop conflict, subpath invalidation, borrowed-local escape)
+- Generated tests: 164 `gen_*` + 43 `rc_*` + 27 `safety_*` + 21 `conc_*` = 255 (all audited)
+- Total: 512 Rust-equivalent tests in `rust_tests/`, 0 limitations remaining
+- **Full audit completed:** All 512 tests verified — no hidden rewrites, no masked limitations
 
 ### High-Value Test Categories for Finding Bugs
 From analysis of Rust's test tree, these categories stress ZER's model the hardest:

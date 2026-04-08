@@ -1,9 +1,9 @@
-// Comptime: pool size from comptime expression
+// Comptime: pool size from comptime expression — actually uses comptime call
 
 comptime u32 POOL_SIZE() { return 8; }
 
 struct Worker { u32 id; }
-Pool(Worker, 8) workers;
+Pool(Worker, POOL_SIZE()) workers;
 
 u32 main() {
     ?Handle(Worker) mh = workers.alloc();

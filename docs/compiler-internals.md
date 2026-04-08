@@ -1239,6 +1239,34 @@ The variant lock must detect mutations through struct field chains: `s.ptr.b = 1
 - `a.x = b.y;` → **ERROR** (same statement, two shared types)
 - `a.x = 10; a.x = 20;` → **OK** (same type, grouped under one lock)
 
+### Function Pointer as Spawn Argument (BUG-465, 2026-04-08)
+
+Spawn wrapper arg struct emitted funcptr field name outside parens: `uint32_t (*)(uint32_t) a1;` instead of `uint32_t (*a1)(uint32_t);`. The `emit_spawn_wrappers` function used `emit_type_and_name(e, at, NULL, 0)` then `emit(e, " a%d; ")` — separate name placement breaks function pointer syntax.
+
+**Fix:** Pass the field name (`"a0"`, `"a1"`, etc.) to `emit_type_and_name` directly instead of NULL. Same class of bug as BUG-412 (funcptr array emission). **Pattern:** Any site emitting a type+name pair must use `emit_type_and_name()` with the actual name — never emit type and name separately. Function pointers and arrays require the name inside the type syntax.
+
+**Found by:** Auditing existing tests — `rt_sendfn_spawn_with_fn_arg.zer` had been rewritten to use integer dispatch instead of funcptr args to work around the bug.
+
+### Heterogeneous *opaque Array Constant-Index Exemption (BUG-466, 2026-04-08)
+
+`Op[2] ops; ops[0].ctx = @ptrcast(*opaque, &adder); ops[1].ctx = @ptrcast(*opaque, &multiplier);` was rejected with "heterogeneous *opaque array." This is the fundamental vtable array pattern (Linux kernel `file_operations[]`).
+
+**Root cause:** `prov_map_set` forced root-level homogeneous provenance for ALL array keys containing `[`. Didn't distinguish constant indices (compiler knows which element) from variable indices (can't distinguish at compile time).
+
+**Fix:** In `prov_map_set`, check if bracket content is all digits. Constant index → skip root homogeneity check (per-element provenance tracked individually). Variable index → enforce homogeneity (can't know which element at compile time).
+
+**Found by:** Auditing `rt_opaque_multi_dispatch.zer` which had been rewritten to use separate `op1`, `op2` variables instead of an `Op[2]` array.
+
+### `?*T[N]` Parser Precedence (BUG-467, 2026-04-08)
+
+`?*Device[2] slots;` produced `struct Device[2]* slots` in emitted C — parsed as `OPTIONAL(POINTER(ARRAY(Device,2)))` instead of `ARRAY(OPTIONAL(POINTER(Device)),2)`.
+
+**Root cause:** Nested `parse_type` calls consumed `[N]` inside the `*T` handler before the `?` handler could swap. Flow: `?` → `parse_type` → `*` → `parse_type` → base type `Device` + `[2]` → `ARRAY(Device,2)` → `*` wraps as `POINTER(ARRAY)` → `?` wraps as `OPTIONAL(POINTER(ARRAY))`.
+
+**Fix:** In `?` handler, after getting inner type, check for `POINTER(ARRAY(...))` pattern and restructure: unwrap pointer, extract array, rewrap as `ARRAY(OPTIONAL(POINTER(elem)),N)`. Same swap pattern as BUG-413 (`?Handle(T)[N]`) but through the pointer wrapper. Also handles `?const *T[N]` and `?volatile *T[N]`.
+
+**Found by:** Auditing `rt_opaque_array_homogeneous.zer` which used struct fields (`slot0`, `slot1`) instead of `?*Device[2]` array syntax.
+
 ## C-to-ZER Conversion Tools (moved from CLAUDE.md)
 
 ### C-to-ZER Conversion Tools (implemented v0.2)

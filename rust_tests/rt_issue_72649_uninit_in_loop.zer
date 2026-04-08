@@ -1,0 +1,23 @@
+// rt_issue_72649_uninit_in_loop.zer
+// Translated from: issue-72649-uninit-in-loop.rs
+// Rust: value used in loop, consumed, used again next iteration → error.
+// ZER: Handle freed in loop body, used again next iteration → zercheck UAF. NEGATIVE.
+// EXPECTED: compile error
+
+struct Item {
+    u32 data;
+}
+
+Pool(Item, 4) item_pool;
+
+i32 main() {
+    ?Handle(Item) mh = item_pool.alloc(Item);
+    Handle(Item) h = mh orelse return;
+
+    for (u32 i = 0; i < 3; i += 1) {
+        // Free h inside loop, then try to use it again next iteration
+        item_pool.free(h);
+        h.data = i;  // UAF: h was freed above
+    }
+    return 0;
+}

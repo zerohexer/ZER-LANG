@@ -1,0 +1,26 @@
+// Rust pattern: Arc<Mutex<u32>> shared counter from 4 threads
+// ZER: shared struct with 4 spawned workers
+
+shared struct Counter { u32 value; }
+Counter g_counter;
+
+void add_100(*Counter c) {
+    for (u32 i = 0; i < 100; i += 1) {
+        c.value += 1;
+    }
+}
+
+u32 main() {
+    g_counter.value = 0;
+    ThreadHandle t1 = spawn add_100(&g_counter);
+    ThreadHandle t2 = spawn add_100(&g_counter);
+    ThreadHandle t3 = spawn add_100(&g_counter);
+    ThreadHandle t4 = spawn add_100(&g_counter);
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    u32 val = g_counter.value;
+    if (val != 400) { return 1; }
+    return 0;
+}

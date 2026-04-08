@@ -1,0 +1,19 @@
+// Rust pattern: Loop with Box::new per iteration, dropped at end
+// ZER: Pool alloc + free per iteration — no leak
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+u32 main() {
+    u32 total = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        ?Handle(Item) mh = pool.alloc();
+        Handle(Item) h = mh orelse return;
+        pool.get(h).val = i * 10;
+        total += pool.get(h).val;
+        pool.free(h);
+    }
+    // 0 + 10 + 20 + 30 + 40 = 100
+    if (total != 100) { return 1; }
+    return 0;
+}

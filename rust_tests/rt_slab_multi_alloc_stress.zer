@@ -1,0 +1,27 @@
+// Rust pattern: Multiple Box allocations — allocate many, free all
+// ZER: Slab alloc_ptr 5 items, use all, defer free all
+
+struct Widget { u32 id; u32 value; }
+Slab(Widget) heap;
+
+u32 main() {
+    ?*Widget m0 = heap.alloc_ptr();
+    *Widget w0 = m0 orelse return;
+    defer heap.free_ptr(w0);
+    w0.id = 0; w0.value = 10;
+
+    ?*Widget m1 = heap.alloc_ptr();
+    *Widget w1 = m1 orelse return;
+    defer heap.free_ptr(w1);
+    w1.id = 1; w1.value = 20;
+
+    ?*Widget m2 = heap.alloc_ptr();
+    *Widget w2 = m2 orelse return;
+    defer heap.free_ptr(w2);
+    w2.id = 2; w2.value = 30;
+
+    if (w0.value != 10) { return 1; }
+    if (w1.value != 20) { return 2; }
+    if (w2.value != 30) { return 3; }
+    return 0;
+}

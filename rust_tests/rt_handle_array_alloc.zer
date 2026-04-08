@@ -1,0 +1,23 @@
+// Rust pattern: Vec<Box<T>> — array of heap allocations
+// ZER: Handle(Task)[4] with Pool
+
+struct Task { u32 id; }
+Pool(Task, 8) pool;
+
+u32 main() {
+    Handle(Task)[4] handles;
+
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Task) mh = pool.alloc();
+        handles[i] = mh orelse return;
+        pool.get(handles[i]).id = i * 10;
+    }
+
+    if (pool.get(handles[0]).id != 0) { return 1; }
+    if (pool.get(handles[3]).id != 30) { return 2; }
+
+    for (u32 i = 0; i < 4; i += 1) {
+        pool.free(handles[i]);
+    }
+    return 0;
+}

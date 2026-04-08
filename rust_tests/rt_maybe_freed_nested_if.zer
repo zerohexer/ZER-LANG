@@ -1,0 +1,23 @@
+// Critical: MAYBE_FREED in nested if without else
+// EXPECTED: compile error
+
+struct Task { u32 priority; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).priority = 5;
+
+    bool outer = true;
+    if (outer) {
+        bool inner = true;
+        if (inner) {
+            pool.free(h);
+        }
+        // inner might not be true — h is MAYBE_FREED
+    }
+    // h is MAYBE_FREED here
+    pool.get(h).priority = 10;
+    return 0;
+}

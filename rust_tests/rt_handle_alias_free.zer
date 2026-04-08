@@ -1,0 +1,15 @@
+// Critical: handle aliased to two variables, free one, use other
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    Handle(Task) alias = h;
+    pool.get(h).id = 42;
+    pool.free(alias);
+    pool.get(h).id = 99;
+    return 0;
+}

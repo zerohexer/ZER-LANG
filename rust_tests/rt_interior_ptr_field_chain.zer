@@ -1,0 +1,19 @@
+// Critical: interior pointer to nested field — parent freed, field ptr dangling
+// EXPECTED: compile error
+
+struct Inner { u32 x; u32 y; }
+struct Outer { Inner pos; u32 id; }
+Slab(Outer) heap;
+
+u32 main() {
+    ?*Outer mo = heap.alloc_ptr();
+    *Outer o = mo orelse return;
+    o.pos.x = 10;
+    o.pos.y = 20;
+    o.id = 1;
+
+    *u32 px = &o.pos.x;
+    heap.free_ptr(o);
+    u32 val = px[0];
+    return val;
+}

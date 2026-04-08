@@ -1,0 +1,28 @@
+// Critical: goto fires pending defers before jumping.
+// ZER: goto cleanup fires all defers in current scope.
+
+struct Res { u32 data; }
+Pool(Res, 4) pool;
+
+u32 freed_count;
+
+u32 main() {
+    freed_count = 0;
+
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    defer pool.free(h);
+    defer { freed_count += 1; }
+
+    pool.get(h).data = 42;
+
+    if (true) {
+        goto cleanup;
+    }
+
+    pool.get(h).data = 99;
+
+    cleanup:
+    if (freed_count != 1) { return 1; }
+    return 0;
+}

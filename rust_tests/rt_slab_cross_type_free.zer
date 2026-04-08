@@ -1,0 +1,16 @@
+// Critical: free_ptr with wrong slab type
+// EXPECTED: compile error
+
+struct Motor { u32 speed; }
+struct Sensor { u32 reading; }
+Slab(Motor) motor_heap;
+Slab(Sensor) sensor_heap;
+
+u32 main() {
+    ?*Motor mm = motor_heap.alloc_ptr();
+    *Motor m = mm orelse return;
+    m.speed = 100;
+    // Try to free Motor pointer on Sensor slab — type mismatch
+    sensor_heap.free_ptr(m);
+    return 0;
+}

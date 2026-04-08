@@ -1,0 +1,19 @@
+// Critical: overwrite alive handle without freeing — leak detection
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh1 = pool.alloc();
+    Handle(Task) h = mh1 orelse return;
+    pool.get(h).id = 1;
+
+    // Overwrite h without freeing — first allocation leaked
+    ?Handle(Task) mh2 = pool.alloc();
+    h = mh2 orelse return;
+    pool.get(h).id = 2;
+
+    pool.free(h);
+    return 0;
+}

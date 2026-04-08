@@ -1,0 +1,23 @@
+// Critical: if-branch frees AND returns → not MAYBE_FREED after if
+// This is the SAFE pattern: free + exit means the handle is definitively freed on that path.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).id = 42;
+
+    bool error = false;
+    if (error) {
+        pool.free(h);
+        return 1;
+    }
+
+    // h is definitely ALIVE here (error path returned)
+    u32 val = pool.get(h).id;
+    pool.free(h);
+    if (val != 42) { return 2; }
+    return 0;
+}

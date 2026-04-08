@@ -1,0 +1,23 @@
+// Critical: free in one switch arm, use after switch
+// EXPECTED: compile error
+
+enum Action { keep, discard, update }
+
+struct Obj { u32 data; }
+Pool(Obj, 4) pool;
+
+u32 main() {
+    ?Handle(Obj) mh = pool.alloc();
+    Handle(Obj) h = mh orelse return;
+    pool.get(h).data = 42;
+
+    Action act = Action.discard;
+    switch (act) {
+        .keep => { pool.get(h).data = 1; }
+        .discard => { pool.free(h); }
+        .update => { pool.get(h).data = 2; }
+    }
+    // h might be freed (discard arm)
+    pool.get(h).data = 99;
+    return 0;
+}

@@ -1,0 +1,68 @@
+// Test #400: Full lifecycle — alloc, use, defer free, cross-function, *opaque round-trip,
+// shared struct concurrency, async coroutine, comptime — all in one test.
+
+struct Sensor { u32 reading; u32 calibration; }
+Slab(Sensor) heap;
+
+shared struct Result { u32 total; }
+Result g_result;
+
+comptime u32 THRESHOLD() { return 50; }
+
+*Sensor create_sensor(u32 reading, u32 cal) {
+    ?*Sensor ms = heap.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s.reading = reading;
+    s.calibration = cal;
+    return s;
+}
+
+u32 process_opaque(*opaque raw) {
+    *Sensor s = @ptrcast(*Sensor, raw);
+    return s.reading + s.calibration;
+}
+
+void accumulate(*Result r, u32 val) {
+    r.total += val;
+}
+
+async void background_task() {
+    u32 count = 0;
+    while (count < 3) {
+        count += 1;
+        yield;
+    }
+}
+
+u32 main() {
+    g_result.total = 0;
+
+    // Slab lifecycle
+    *Sensor s = create_sensor(30, 25);
+    defer heap.free_ptr(s);
+
+    // *opaque round-trip
+    u32 val = process_opaque(@ptrcast(*opaque, s));
+    if (val != 55) { return 1; }
+
+    // Comptime
+    if (val > THRESHOLD()) {
+        // Shared struct concurrency
+        ThreadHandle th = spawn accumulate(&g_result, val);
+        th.join();
+    }
+
+    u32 total = g_result.total;
+    if (total != 55) { return 2; }
+
+    // Async coroutine
+    _zer_async_background_task task;
+    _zer_async_background_task_init(&task);
+    u32 polls = 0;
+    while (_zer_async_background_task_poll(&task) == 0) {
+        polls += 1;
+    }
+    if (polls != 3) { return 3; }
+
+    return 0;
+}

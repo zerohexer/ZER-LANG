@@ -888,14 +888,44 @@ When adding more tests from Rust's test suite (`rust-lang/rust/tests/ui/`):
 - `Arena.buf = ...` — WRONG, use `Arena.over(buf)`
 - Accessing `.has_value`/`.value` on optionals directly — not allowed
 
-### Coverage status (as of v0.2.2)
+### CRITICAL: Never Hide Limitations by Rewriting Tests
+
+When a test fails due to a **compiler limitation** (not a test bug):
+
+1. **DO NOT rewrite the test** to use a different ZER pattern that avoids the limitation. This hides the gap and creates a false positive — you think the feature works when it doesn't.
+2. **Only rewrite if the pattern genuinely doesn't exist in ZER** (e.g., closures → function pointers, generics → concrete types). If ZER HAS the feature but the compiler doesn't handle it correctly, that's a bug to fix — not a test to rewrite.
+3. **Keep the failing test as-is** — move it to `rust_tests/limitations/` with a comment explaining what zercheck/checker can't handle.
+4. **Write a SECOND test** using the workaround pattern if needed for coverage, but keep the original.
+5. **Log the limitation** in `docs/compiler-internals.md` with: what pattern fails, why it fails, estimated fix complexity.
+6. **Investigate the root cause** — most "limitations" are actually bugs (like BUG-462). Try to fix before labeling as limitation.
+
+**Example of what NOT to do:**
+- Test: `ents[0] = m0 orelse return; ... pool.free(ents[0]);` — fails with false "handle leaked"
+- WRONG: Rewrite to use named variables `h0 = m0 orelse return` (hides the limitation)
+- RIGHT: Keep original, investigate why `handle_key_from_expr` fails through `orelse`, fix zercheck
+
+**Why this matters:** Every rewritten test is a limitation we forgot about. When we later claim "493 tests pass, 0 failures," it should mean the compiler handles ALL those patterns — not that we rewrote the hard ones to be easy.
+
+**BUG-462 was found this way:** The handle array test was initially rewritten to avoid constant-indexed arrays. On review, the original pattern was investigated, root cause found (orelse unwrap missing in assignment aliasing), and fixed in 8 lines. The "limitation" was actually a bug.
+
+### Coverage status (as of v0.3.0)
 - `tests/ui/threads-sendsync/` — **COMPLETE** (51/67)
-- `tests/ui/consts/` — 10 patterns
-- `tests/ui/borrowck/` — 10 patterns
-- `tests/ui/moves/` — 10 patterns
-- `tests/ui/drop/` — 10 patterns
-- `tests/ui/unsafe/` — 5 patterns
-- Total: 400+ Rust-equivalent tests in `rust_tests/`
+- `tests/ui/consts/` — 15 patterns
+- `tests/ui/borrowck/` — 20 patterns (field sensitivity, nested call free, scope escape, union borrow)
+- `tests/ui/moves/` — 15 patterns (ownership chain, conditional, loop, cross-function)
+- `tests/ui/drop/` — 15 patterns (struct-as-object, dynamic drop, defer ordering)
+- `tests/ui/unsafe/` — 10 patterns (mmio, inttoptr, provenance)
+- `tests/ui/nll/` — 10 patterns (interior ptr, drop conflict, subpath invalidation)
+- Total: 493 Rust-equivalent tests in `rust_tests/`
+
+### High-Value Test Categories for Finding Bugs
+From analysis of Rust's test tree, these categories stress ZER's model the hardest:
+- **borrowck/**: UAF, cross-function free (FuncSummary), field sensitivity (interior pointers), scope escape, union borrow safety
+- **moves/**: Ownership transfer, conditional free (MAYBE_FREED), loop UAF, nested loop propagation
+- **nll/**: Drop+borrow conflict (defer ordering), borrowed-local escape, subpath invalidation
+- **unsafe/**: `@inttoptr` without mmio, provenance mismatch, MMIO bounds
+
+When adding new tests, prioritize these categories. Skip: closures, generics, traits, iterators, async runtime (Rust-specific features ZER doesn't have).
 
 ## Git Rules
 

@@ -1186,31 +1186,66 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
         break;
     case NODE_FIELD:
         /* Level 9: check if a tracked pointer (from alloc_ptr) is accessed after free.
-         * t.field where t is freed → use-after-free. Check the root ident. */
+         * BUG-463: check EVERY prefix of the field/index chain, not just root.
+         * For h.inner.data: check "h", "h.inner", "h.inner.data" — any tracked
+         * prefix that is FREED means the entire expression is UAF.
+         * This catches struct field pointer aliases: h.inner = w; free(w); h.inner.data */
         {
-            Node *root = node->field.object;
-            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                if (root->kind == NODE_FIELD) root = root->field.object;
-                else root = root->index_expr.object;
+            /* First: check the full expression (handles the simple case) */
+            char fkey[128];
+            int fklen = handle_key_from_expr(node, fkey, sizeof(fkey));
+            bool found_uaf = false;
+            int cur_line = node->loc.line;
+            if (fklen > 0) {
+                HandleInfo *h = find_handle(ps, fkey, (uint32_t)fklen);
+                /* Only report if free happened on a STRICTLY earlier line.
+                 * Same-line free = likely the free call's own argument (pool.free(s.h)
+                 * marks s.h FREED then expression check re-visits s.h on same line). */
+                if (h && h->state == HS_FREED && h->free_line < cur_line) {
+                    zc_error(zc, cur_line,
+                        "use-after-free: '%.*s' freed at line %d",
+                        fklen, fkey, h->free_line);
+                    found_uaf = true;
+                } else if (h && h->state == HS_MAYBE_FREED) {
+                    zc_error(zc, cur_line,
+                        "use-after-free: '%.*s' may have been freed at line %d",
+                        fklen, fkey, h->free_line);
+                    found_uaf = true;
+                } else if (h && h->state == HS_TRANSFERRED) {
+                    zc_error(zc, cur_line,
+                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                        fklen, fkey, h->transfer_line);
+                    found_uaf = true;
+                }
             }
-            if (root && root->kind == NODE_IDENT) {
-                char fkey[128];
-                int fklen = handle_key_from_expr(root, fkey, sizeof(fkey));
-                if (fklen > 0) {
-                    HandleInfo *h = find_handle(ps, fkey, (uint32_t)fklen);
-                    if (h && h->state == HS_FREED) {
-                        zc_error(zc, node->loc.line,
-                            "use-after-free: '%.*s' freed at line %d",
-                            fklen, fkey, h->free_line);
-                    } else if (h && h->state == HS_MAYBE_FREED) {
-                        zc_error(zc, node->loc.line,
-                            "use-after-free: '%.*s' may have been freed at line %d",
-                            fklen, fkey, h->free_line);
-                    } else if (h && h->state == HS_TRANSFERRED) {
-                        zc_error(zc, node->loc.line,
-                            "use after transfer: '%.*s' ownership transferred to thread at line %d",
-                            fklen, fkey, h->transfer_line);
+            /* Walk every prefix: for h.inner.data, check h.inner then h */
+            if (!found_uaf) {
+                Node *cur = node->field.object;
+                while (cur && !found_uaf) {
+                    int cklen = handle_key_from_expr(cur, fkey, sizeof(fkey));
+                    if (cklen > 0) {
+                        HandleInfo *h = find_handle(ps, fkey, (uint32_t)cklen);
+                        if (h && h->state == HS_FREED && h->free_line < cur_line) {
+                            zc_error(zc, cur_line,
+                                "use-after-free: '%.*s' freed at line %d",
+                                cklen, fkey, h->free_line);
+                            found_uaf = true;
+                        } else if (h && h->state == HS_MAYBE_FREED) {
+                            zc_error(zc, cur_line,
+                                "use-after-free: '%.*s' may have been freed at line %d",
+                                cklen, fkey, h->free_line);
+                            found_uaf = true;
+                        } else if (h && h->state == HS_TRANSFERRED) {
+                            zc_error(zc, cur_line,
+                                "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                                cklen, fkey, h->transfer_line);
+                            found_uaf = true;
+                        }
                     }
+                    /* Step up one level in the chain */
+                    if (cur->kind == NODE_FIELD) cur = cur->field.object;
+                    else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
+                    else break;
                 }
             }
         }

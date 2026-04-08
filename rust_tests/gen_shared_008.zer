@@ -1,4 +1,5 @@
-// Shared struct: deadlock detection — descending lock order — compile error
+// Shared struct: same-statement multi-lock deadlock — compile error
+// BUG-464: cross-statement is safe, same-statement is the real danger.
 // EXPECTED: compile error
 
 shared struct A { u32 x; }
@@ -7,7 +8,6 @@ A ga;
 B gb;
 
 u32 main() {
-    gb.y = 2;
-    ga.x = 1;
+    ga.x = gb.y;   // ERROR: accesses both A and B in one statement
     return 0;
 }

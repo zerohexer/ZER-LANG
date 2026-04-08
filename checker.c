@@ -8636,30 +8636,118 @@ static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
 
 /* Check lock ordering within a block: shared struct accesses must be in ascending type_id.
  * Walks into nested blocks recursively. */
+/* Collect ALL shared types in an expression (not just the first).
+ * Returns count of distinct shared types found (max 2 for deadlock check). */
+static int collect_shared_types_in_expr(Checker *c, Node *expr,
+                                         Type **types, int max_types, int count) {
+    if (!expr || count >= max_types) return count;
+    if (expr->kind == NODE_FIELD) {
+        Node *root = expr;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        if (root->kind == NODE_IDENT) {
+            Type *t = typemap_get(c, root);
+            if (!t) {
+                Symbol *sym = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (sym) t = sym->type;
+            }
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                Type *shared = NULL;
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) shared = eff;
+                if (!shared && eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                        shared = inner;
+                }
+                if (shared) {
+                    /* Check if already in the list */
+                    bool dup = false;
+                    for (int i = 0; i < count; i++) {
+                        if (types[i]->struct_type.type_id == shared->struct_type.type_id) {
+                            dup = true; break;
+                        }
+                    }
+                    if (!dup && count < max_types) {
+                        types[count++] = shared;
+                    }
+                }
+            }
+        }
+    }
+    /* Recurse */
+    if (expr->kind == NODE_BINARY) {
+        count = collect_shared_types_in_expr(c, expr->binary.left, types, max_types, count);
+        count = collect_shared_types_in_expr(c, expr->binary.right, types, max_types, count);
+    }
+    if (expr->kind == NODE_ASSIGN) {
+        count = collect_shared_types_in_expr(c, expr->assign.target, types, max_types, count);
+        count = collect_shared_types_in_expr(c, expr->assign.value, types, max_types, count);
+    }
+    if (expr->kind == NODE_UNARY)
+        count = collect_shared_types_in_expr(c, expr->unary.operand, types, max_types, count);
+    if (expr->kind == NODE_CALL) {
+        for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
+            count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
+    }
+    return count;
+}
+
+static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, int max_types) {
+    if (!stmt) return 0;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: return collect_shared_types_in_expr(c, stmt->expr_stmt.expr, types, max_types, 0);
+    case NODE_VAR_DECL: return collect_shared_types_in_expr(c, stmt->var_decl.init, types, max_types, 0);
+    case NODE_RETURN: return collect_shared_types_in_expr(c, stmt->ret.expr, types, max_types, 0);
+    case NODE_IF: return collect_shared_types_in_expr(c, stmt->if_stmt.cond, types, max_types, 0);
+    case NODE_WHILE: return collect_shared_types_in_expr(c, stmt->while_stmt.cond, types, max_types, 0);
+    case NODE_FOR: {
+        int n = collect_shared_types_in_expr(c, stmt->for_stmt.init, types, max_types, 0);
+        if (stmt->for_stmt.cond)
+            n = collect_shared_types_in_expr(c, stmt->for_stmt.cond, types, max_types, n);
+        return n;
+    }
+    case NODE_SWITCH: return collect_shared_types_in_expr(c, stmt->switch_stmt.expr, types, max_types, 0);
+    default: return 0;
+    }
+}
+
 static void check_block_lock_ordering(Checker *c, Node *block) {
     if (!block || block->kind != NODE_BLOCK) return;
 
-    uint32_t last_shared_id = 0; /* 0 = no shared access yet */
-    const char *last_shared_name = NULL;
-    uint32_t last_shared_name_len = 0;
+    /* BUG-464: Deadlock detection based on the correct locking model.
+     *
+     * The emitter wraps each shared struct access in lock→op→unlock per statement
+     * group. Groups contain consecutive accesses to the SAME shared variable.
+     * Different shared types are NEVER locked simultaneously across statements.
+     *
+     * The ONLY real deadlock scenario: a SINGLE statement/expression accesses
+     * TWO DIFFERENT shared types — the emitter only locks one, leaving the other
+     * unprotected, and another thread locking them in opposite order deadlocks.
+     *
+     * Cross-statement ordering (A then B then A) is safe because locks are fully
+     * released between groups. */
 
     for (int i = 0; i < block->block.stmt_count; i++) {
         Node *stmt = block->block.stmts[i];
-        Type *shared_type = find_shared_type_in_stmt(c, stmt);
 
-        if (shared_type) {
-            uint32_t sid = shared_type->struct_type.type_id;
-            if (last_shared_id > 0 && sid != last_shared_id && sid < last_shared_id) {
+        /* Check for multi-shared-type expressions within a single statement */
+        Type *found[4];
+        int n = collect_shared_types_in_stmt(c, stmt, found, 4);
+        if (n >= 2) {
+            /* Two different shared types in one statement — potential deadlock.
+             * Report with ordering info so user knows which to access first. */
+            uint32_t id0 = found[0]->struct_type.type_id;
+            uint32_t id1 = found[1]->struct_type.type_id;
+            if (id0 != id1) {
+                Type *lo = (id0 < id1) ? found[0] : found[1];
+                Type *hi = (id0 < id1) ? found[1] : found[0];
                 checker_error(c, stmt->loc.line,
-                    "deadlock: shared struct '%.*s' (order %u) accessed after '%.*s' (order %u) — "
-                    "always access shared structs in consistent ascending order",
-                    (int)shared_type->struct_type.name_len, shared_type->struct_type.name, sid,
-                    (int)last_shared_name_len, last_shared_name, last_shared_id);
-            }
-            if (sid > last_shared_id || last_shared_id == 0) {
-                last_shared_id = sid;
-                last_shared_name = shared_type->struct_type.name;
-                last_shared_name_len = shared_type->struct_type.name_len;
+                    "deadlock: single statement accesses both '%.*s' (order %u) and '%.*s' (order %u) — "
+                    "split into separate statements to avoid holding two locks",
+                    (int)lo->struct_type.name_len, lo->struct_type.name, lo->struct_type.type_id,
+                    (int)hi->struct_type.name_len, hi->struct_type.name, hi->struct_type.type_id);
             }
         }
 

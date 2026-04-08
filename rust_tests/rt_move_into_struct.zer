@@ -1,0 +1,27 @@
+// Rust source: tests/ui/moves/moves-based-on-type-exprs.rs (f10 pattern)
+// Safety intent: move into struct field, then use original = error.
+// ZER: alloc_ptr, store in struct, free original — struct field dangling.
+// BUG-463: NODE_FIELD UAF check now walks every prefix of the chain.
+// h.inner = w creates alias "h.inner". free(w) propagates to "h.inner".
+// h.inner.data checks "h.inner" which is FREED → compile error.
+// EXPECTED: compile error
+
+struct Wrapper { u32 data; }
+struct Holder { *Wrapper inner; }
+Slab(Wrapper) heap;
+
+u32 main() {
+    ?*Wrapper mw = heap.alloc_ptr();
+    *Wrapper w = mw orelse return;
+    w.data = 42;
+
+    Holder h;
+    h.inner = w;
+
+    // Free the original — holder.inner becomes dangling
+    heap.free_ptr(w);
+
+    // Use through holder — UAF (alias of freed pointer)
+    u32 val = h.inner.data;
+    return val;
+}

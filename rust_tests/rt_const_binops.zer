@@ -1,7 +1,9 @@
 // Rust source: tests/ui/consts/const-binops.rs
-// Compile-time binary operations on constants.
-// ZER: const globals with comptime arithmetic (no shift in global — known limitation)
+// Compile-time binary operations on constants including shift.
+// ZER: const globals with comptime arithmetic — all evaluated at compile time
 
+const u32 LSL = 1 << 2;
+const u32 RSH = 256 >> 3;
 const u32 ADD = 1 + 2;
 const u32 SUB = 10 - 3;
 const u32 MUL = 4 * 5;
@@ -10,20 +12,19 @@ const u32 MOD = 17 % 5;
 const u32 BOR = 0x0F | 0xF0;
 const u32 BAND = 0xFF & 0x0F;
 const u32 BXOR = 0xFF ^ 0x0F;
+const u32 COMBO = (1 << 8) - 1;
 
 u32 main() {
-    if (ADD != 3) { return 1; }
-    if (SUB != 7) { return 2; }
-    if (MUL != 20) { return 3; }
-    if (DIV != 5) { return 4; }
-    if (MOD != 2) { return 5; }
-    if (BOR != 0xFF) { return 6; }
-    if (BAND != 0x0F) { return 7; }
-    if (BXOR != 0xF0) { return 8; }
-
-    // Shift works inside functions (statement expr OK)
-    u32 lsl = 1 << 2;
-    if (lsl != 4) { return 9; }
-
+    if (LSL != 4) { return 1; }
+    if (RSH != 32) { return 2; }
+    if (ADD != 3) { return 3; }
+    if (SUB != 7) { return 4; }
+    if (MUL != 20) { return 5; }
+    if (DIV != 5) { return 6; }
+    if (MOD != 2) { return 7; }
+    if (BOR != 0xFF) { return 8; }
+    if (BAND != 0x0F) { return 9; }
+    if (BXOR != 0xF0) { return 10; }
+    if (COMBO != 255) { return 11; }
     return 0;
 }

@@ -4350,8 +4350,25 @@ static void emit_global_var(Emitter *e, Node *node) {
             else
                 emit(e, " = {0}");
         } else {
-            emit(e, " = ");
-            emit_expr(e, node->var_decl.init);
+            /* For const globals: try compile-time evaluation first.
+             * This avoids GCC statement expression errors from _zer_shl/shr
+             * macros which can't be used in global initializers. */
+            bool emitted_const = false;
+            if (node->var_decl.is_const) {
+                int64_t cval = eval_const_expr(node->var_decl.init);
+                if (cval != CONST_EVAL_FAIL) {
+                    if (cval < 0) {
+                        emit(e, " = (%lld)", (long long)cval);
+                    } else {
+                        emit(e, " = %llu", (unsigned long long)cval);
+                    }
+                    emitted_const = true;
+                }
+            }
+            if (!emitted_const) {
+                emit(e, " = ");
+                emit_expr(e, node->var_decl.init);
+            }
         }
     } else {
         /* auto-zero — unwrap distinct to check if compound init needed */

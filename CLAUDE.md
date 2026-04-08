@@ -856,6 +856,47 @@ The codebase is **cross-platform** (Windows + Linux/Docker):
 - `zerc_main.c --run`: platform-appropriate exe path and run command
 - `Dockerfile`: uses `gcc:13`, copies sources, runs `make check`
 
+## Rust Test Translation Workflow
+
+When adding more tests from Rust's test suite (`rust-lang/rust/tests/ui/`):
+
+### Process
+1. **Fetch Rust source** — use WebFetch on `https://raw.githubusercontent.com/rust-lang/rust/master/tests/ui/CATEGORY/FILE.rs`
+2. **Assess applicability** — skip tests that use Rust-specific features (closures, traits, generics, iterators, HashMap, Debug, Drop trait destructors, lifetime annotations)
+3. **Translate the SAFETY INTENT** — not the syntax. Map Rust patterns to ZER equivalents:
+   - `Box<T>` → `Slab(T)` alloc_ptr / `Pool(T, N)` alloc
+   - `Drop` trait → `defer`
+   - `Rc<T>` / non-Send → non-shared `*T` to spawn (should fail)
+   - `Arc<Mutex<T>>` → `shared struct`
+   - `RwLock<T>` → `shared(rw) struct`
+   - `mpsc::channel` → `Ring(T, N)`
+   - `thread::spawn` → `spawn` / `ThreadHandle`
+   - `Condvar` → `@cond_wait` / `@cond_signal`
+   - `unsafe` raw pointer → `@inttoptr` / `@ptrcast`
+   - `Box<dyn Any>` → `*opaque` + `@ptrcast`
+   - `const fn` → `comptime`
+   - `#[cfg]` → `comptime if`
+4. **Write as hand-written ZER** — do NOT use agents for Pool/Slab/Arena patterns (agents get `pool.alloc()` wrong 80% of the time). Write yourself.
+5. **Mark negative tests** — add `// EXPECTED: compile error` comment in file
+6. **Test** — `docker run --rm -v ... gcc:13 bash -c '... /tmp/zerc file.zer --run 2>&1'`
+7. **File naming** — `rt_RUST_FILE_NAME.zer` for source-translated, `gen_CATEGORY_NNN.zer` for generated
+
+### Common agent mistakes (avoid these)
+- `pool.alloc(Type)` — WRONG, should be `pool.alloc()` (no args)
+- `orelse return 1` — WRONG, must be bare `orelse return`
+- `*Widget ptrs[10]` — WRONG, use `Widget[10] arr` or struct wrapper
+- `Arena.buf = ...` — WRONG, use `Arena.over(buf)`
+- Accessing `.has_value`/`.value` on optionals directly — not allowed
+
+### Coverage status (as of v0.2.2)
+- `tests/ui/threads-sendsync/` — **COMPLETE** (51/67)
+- `tests/ui/consts/` — 10 patterns
+- `tests/ui/borrowck/` — 10 patterns
+- `tests/ui/moves/` — 10 patterns
+- `tests/ui/drop/` — 10 patterns
+- `tests/ui/unsafe/` — 5 patterns
+- Total: 400+ Rust-equivalent tests in `rust_tests/`
+
 ## Git Rules
 
 - NEVER add Co-Authored-By or any Claude/AI attribution to commits

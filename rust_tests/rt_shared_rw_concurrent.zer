@@ -1,0 +1,38 @@
+// Rust pattern: RwLock — concurrent readers, exclusive writer.
+// ZER: shared(rw) struct with spawned readers and writer.
+
+shared(rw) struct Database { u32 version; u32 records; }
+Database db;
+
+void reader(*Database d) {
+    u32 v = d.version;
+    u32 r = d.records;
+}
+
+void writer(*Database d) {
+    d.version += 1;
+    d.records += 100;
+}
+
+u32 main() {
+    db.version = 1;
+    db.records = 0;
+
+    // Writer first
+    ThreadHandle tw = spawn writer(&db);
+    tw.join();
+
+    // Then concurrent readers
+    ThreadHandle tr1 = spawn reader(&db);
+    ThreadHandle tr2 = spawn reader(&db);
+    ThreadHandle tr3 = spawn reader(&db);
+    tr1.join();
+    tr2.join();
+    tr3.join();
+
+    u32 v = db.version;
+    u32 r = db.records;
+    if (v != 2) { return 1; }
+    if (r != 100) { return 2; }
+    return 0;
+}

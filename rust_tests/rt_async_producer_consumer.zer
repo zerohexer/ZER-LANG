@@ -1,0 +1,43 @@
+// Rust pattern: async producer/consumer with shared state.
+// ZER: two async coroutines — producer fills, consumer reads.
+
+u32 buffer;
+u32 produced;
+u32 consumed;
+
+async void producer() {
+    u32 i = 0;
+    while (i < 5) {
+        buffer = i * 10;
+        produced += 1;
+        i += 1;
+        yield;
+    }
+}
+
+async void consumer() {
+    u32 total = 0;
+    u32 i = 0;
+    while (i < 5) {
+        await produced > i;
+        total += buffer;
+        consumed += 1;
+        i += 1;
+        yield;
+    }
+}
+
+u32 main() {
+    buffer = 0;
+    produced = 0;
+    consumed = 0;
+
+    _zer_async_producer p;
+    _zer_async_producer_init(&p);
+
+    // Run producer to completion
+    while (_zer_async_producer_poll(&p) == 0) { }
+
+    if (produced != 5) { return 1; }
+    return 0;
+}

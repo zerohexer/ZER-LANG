@@ -1,0 +1,25 @@
+// Rust source: tests/ui/moves/moves-based-on-type-tuple.rs
+// Use value after moving into tuple → error.
+// ZER: struct containing alloc_ptr, free original, use → UAF.
+// EXPECTED: compile error
+
+struct Pair { u32 a; u32 b; }
+struct Val { u32 data; }
+Slab(Val) heap;
+
+u32 main() {
+    ?*Val mv = heap.alloc_ptr();
+    *Val v = mv orelse return;
+    v.data = 42;
+
+    // "Move into tuple" — store pointer in struct
+    Pair p;
+    p.a = v.data;
+
+    // Free original
+    heap.free_ptr(v);
+
+    // Use after free
+    u32 x = v.data;
+    return x;
+}

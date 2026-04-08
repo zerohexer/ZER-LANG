@@ -1,0 +1,21 @@
+// Rust source: tests/ui/borrowck/borrowck-assign-to-subfield.rs
+// Mutable struct — all fields modifiable including nested.
+
+struct Inner { u32 a; }
+struct Outer { u32 a; Inner w; }
+
+u32 main() {
+    Outer p;
+    p.a = 1;
+    p.w.a = 1;
+
+    // Modify direct field
+    p.a = 2;
+    if (p.a != 2) { return 1; }
+
+    // Modify nested field
+    p.w.a = 2;
+    if (p.w.a != 2) { return 2; }
+
+    return 0;
+}

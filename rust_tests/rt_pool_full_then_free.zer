@@ -1,0 +1,29 @@
+// Rust pattern: allocation fails when full, succeeds after free.
+
+struct Slot { u32 data; }
+Pool(Slot, 2) pool;
+
+u32 main() {
+    ?Handle(Slot) m1 = pool.alloc();
+    Handle(Slot) h1 = m1 orelse return;
+    ?Handle(Slot) m2 = pool.alloc();
+    Handle(Slot) h2 = m2 orelse return;
+
+    pool.get(h1).data = 10;
+    pool.get(h2).data = 20;
+
+    // Free one slot
+    pool.free(h1);
+
+    // Now alloc succeeds — reuses freed slot
+    ?Handle(Slot) m3 = pool.alloc();
+    Handle(Slot) h3 = m3 orelse return;
+    pool.get(h3).data = 30;
+
+    if (pool.get(h3).data != 30) { return 1; }
+    if (pool.get(h2).data != 20) { return 2; }
+
+    pool.free(h2);
+    pool.free(h3);
+    return 0;
+}

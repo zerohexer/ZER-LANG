@@ -11,7 +11,7 @@ Requires GCC (MinGW on Windows, gcc on Linux/Mac):
 ```bash
 make           # build zerc compiler
 make zer-lsp   # build language server
-make check     # run all 1766 tests + 491 fuzz
+make check     # run all 3,200+ tests
 make release   # build release binaries in release/
 ```
 
@@ -180,6 +180,13 @@ ZER guarantees **zero silent memory corruption**. Every memory bug is either a c
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables |
 | Wrong pool | ZER-CHECK detects handle used on wrong pool |
+| Division by zero | Forced guard — compile error if divisor not proven nonzero |
+| Thread data race | `shared struct` auto-locked, non-shared pointer to `spawn` = compile error |
+| Deadlock | Lock ordering on shared structs — compile error (Rust has NO deadlock detection) |
+| Thread not joined | Scoped spawn `ThreadHandle` not joined = compile error |
+| Handle leak | Allocated but never freed = compile error |
+| Interior pointer UAF | `*u32 p = &b.field; free(b); p[0]` = compile error |
+| Wrong pointer cast | `@ptrcast` provenance tracking — wrong type = compile error |
 
 ### Safety Passes
 
@@ -193,26 +200,59 @@ SILENT CORRUPTION:        0%. impossible. never.
 ```
 
 
+### Concurrency — Full Rust Parity
+
+```c
+// Auto-locked shared data — no Arc<Mutex<T>> boilerplate
+shared struct Counter { u32 value; }
+Counter g;
+g.value += 1;                              // auto: lock → write → unlock
+
+// Thread creation with safety enforcement
+spawn worker(&g);                          // OK — shared struct, auto-locked
+ThreadHandle th = spawn compute(&data);    // scoped — allows *T
+th.join();                                 // MUST join (compile error if not)
+
+// Condvar synchronization
+@cond_wait(g, g.value > 0);               // wait for condition
+@cond_signal(g);                           // wake waiter
+
+// Stackless coroutines — zero heap, zero runtime
+async void blink() {
+    while (true) { led_on(); yield; led_off(); yield; }
+}
+
+// Reader-writer locks
+shared(rw) struct Config { u32 port; }     // auto rdlock/wrlock
+
+// Thread-local, init-once, barriers, atomics
+threadlocal u32 counter;
+@once { init_hardware(); }
+@atomic_add(&flag, 1);
+```
+
 ## Tests
 
-Stress-tested against real production code: MODBUS CRC, CAN bus, USB state machines, SPI flash drivers, bootloaders, RTOS schedulers, I2C sensors, DMA buffers, protocol parsers, hash maps, linked lists, page allocators, VFS, IPC pipes, network stacks, block caches, and multi-module diamond imports.
+3,200+ tests across all dimensions, including 415 tests translated from Rust's test suite:
 
 ```
-Lexer:                      218 tests
-Parser:                     168 tests
-Type Checker:               474 tests
-ZER-CHECK:                   24 tests
-C Emitter:                  213 end-to-end tests
-Module Imports:              10 patterns
-Firmware Patterns (3 rounds): 102 end-to-end tests
-Production Firmware:          14 end-to-end tests
-Parser Fuzz:                 491 adversarial inputs
-Conversion Tools:            75 tests (zer-convert + zer-upgrade)
+Lexer:                        218 tests
+Parser:                       168 tests
+Type Checker:                 584 tests
+ZER-CHECK:                     54 tests
+C Emitter:                    238 end-to-end tests
+Firmware Patterns (4 rounds): 116 end-to-end tests
+Parser Fuzz:                  491 adversarial inputs
+Semantic Fuzzer:              200 tests/run (32 generators)
+Module Imports:                23 patterns
+ZER Integration:              120+ .zer E2E tests
+Rust-Equivalent:              415 tests (from Rust's tests/ui/)
+Conversion Tools:             139 tests
 ──────────────────────────────────────────────────
-Total:                     1841 tests + 491 fuzz, all passing
+Total:                       3,200+ tests, all passing
 ```
 
-313 compiler bugs found and fixed across 30+ rounds of testing.
+461 compiler bugs found and fixed. 415 Rust-equivalent tests covering threads, UAF, bounds, division, null safety, narrowing, scope escape, defer, handles, *opaque provenance, async, atomics, condvar, shared struct, and deadlock detection.
 
 ## Editor Support
 
@@ -226,22 +266,17 @@ VS Code extension in `editors/vscode/` with full syntax highlighting.
 
 Works with: VS Code, Neovim (nvim-lspconfig), Emacs (eglot/lsp-mode), Helix, Zed.
 
-## Status: v0.2.0
+## Status: v0.3.0
 
 ZER compiles to C99 and runs on any target GCC supports.
+
+**Full concurrency model** — shared struct (auto-locked), spawn (fire-and-forget + scoped), condvar, RwLock, threadlocal, @once, @barrier, async/await (stackless coroutines), atomics, compile-time deadlock detection. Passes 415 tests translated from Rust's test suite.
 
 **Proven on real hardware:** ARM Cortex-M3 firmware running on QEMU — bounds-checked arrays, optional types, exhaustive enums — all freestanding, no OS, no libc, 1225 bytes total. See [`examples/qemu-cortex-m3/`](examples/qemu-cortex-m3/).
 
 **Proven against real CVEs:** Heartbleed (CVE-2014-0160) and Baron Samedit (CVE-2021-3156) reproduced side-by-side — C silently leaks memory, ZER traps at the bounds check. See [`examples/cve-demos/`](examples/cve-demos/).
 
-**1,775 tests across 7 dimensions:**
-- **Lexer** — 218 tests: every token type, edge cases, error recovery
-- **Parser** — 168 tests: every AST node kind, adversarial inputs
-- **Type Checker** — 474 tests: every type coercion, every rejection rule, security/audit tests
-- **C Emitter** — 213 end-to-end tests: ZER source → C → GCC → run → verify exit code
-- **ZER-CHECK** — 24 tests: handle tracking, use-after-free detection, double-free, alias tracking, params
-- **Firmware Patterns** — 102 tests: real embedded patterns (UART, SPI, CAN, DMA, state machines, interrupt handlers, packed structs, MMIO registers)
-- **Parser Fuzz** — 491 adversarial inputs: random/malformed input, zero crashes
+**3,200+ tests, 461 bugs fixed, zero failures.**
 
 ## License
 

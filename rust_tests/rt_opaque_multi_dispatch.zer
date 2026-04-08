@@ -1,5 +1,6 @@
-// Rust pattern: dynamic dispatch with multiple trait objects.
-// ZER: separate vtable structs with *opaque context (not array — heterogeneous).
+// Rust pattern: dynamic dispatch with multiple trait objects in array.
+// ZER: Op[N] array with *opaque context — each element has different provenance.
+// BUG-466: constant-indexed *opaque arrays now allow per-element provenance.
 
 struct Adder { u32 base; }
 struct Multiplier { u32 factor; }
@@ -25,20 +26,18 @@ u32 main() {
     Multiplier m;
     m.factor = 3;
 
-    Op op1;
-    op1.ctx = @ptrcast(*opaque, &a);
-    op1.compute = add_compute;
-
-    Op op2;
-    op2.ctx = @ptrcast(*opaque, &m);
-    op2.compute = mul_compute;
+    Op[2] ops;
+    ops[0].ctx = @ptrcast(*opaque, &a);
+    ops[0].compute = add_compute;
+    ops[1].ctx = @ptrcast(*opaque, &m);
+    ops[1].compute = mul_compute;
 
     // Chain: 5 + 10 = 15, 15 * 3 = 45
     u32 val = 5;
-    val = op1.compute(op1.ctx, val);
+    val = ops[0].compute(ops[0].ctx, val);
     if (val != 15) { return 1; }
 
-    val = op2.compute(op2.ctx, val);
+    val = ops[1].compute(ops[1].ctx, val);
     if (val != 45) { return 2; }
 
     return 0;

@@ -461,22 +461,37 @@ static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *pr
 
 set_array_root:
     /* Array-level provenance: if key contains '[', also set root key.
-     * "callbacks[0]" → root "callbacks". Forces homogeneous *opaque arrays.
-     * If root already has different provenance → compile error. */
+     * "callbacks[0]" → root "callbacks".
+     * BUG-466: Only enforce homogeneous provenance for VARIABLE-index access.
+     * Constant-indexed access (e.g., ops[0].ctx = *Adder, ops[1].ctx = *Multiplier)
+     * is safe — compiler knows which element at compile time.
+     * Variable-index access would mean we can't distinguish elements. */
     {
         const char *bracket = memchr(key, '[', key_len);
         if (bracket) {
             uint32_t root_len = (uint32_t)(bracket - key);
             if (root_len > 0) {
-                Type *existing = prov_map_get(c, key, root_len);
-                if (existing && !type_equals(existing, prov)) {
-                    checker_error(c, 0,
-                        "heterogeneous *opaque array: '%.*s' has provenance '%s' but element assigned '%s'",
-                        (int)root_len, key, type_name(existing), type_name(prov));
-                } else if (!existing) {
-                    /* set root-level provenance (recurse but won't hit '[' again) */
-                    prov_map_set(c, key, root_len, prov);
+                /* Check if index is constant (all digits between [ and ]) */
+                const char *after_bracket = bracket + 1;
+                const char *close = memchr(after_bracket, ']', key_len - root_len - 1);
+                bool is_const_index = (close != NULL && close > after_bracket);
+                if (is_const_index) {
+                    for (const char *p = after_bracket; p < close; p++) {
+                        if (*p < '0' || *p > '9') { is_const_index = false; break; }
+                    }
                 }
+                if (!is_const_index) {
+                    /* Variable index — enforce homogeneous root provenance */
+                    Type *existing = prov_map_get(c, key, root_len);
+                    if (existing && !type_equals(existing, prov)) {
+                        checker_error(c, 0,
+                            "heterogeneous *opaque array: '%.*s' has provenance '%s' but element assigned '%s'",
+                            (int)root_len, key, type_name(existing), type_name(prov));
+                    } else if (!existing) {
+                        prov_map_set(c, key, root_len, prov);
+                    }
+                }
+                /* Constant index: per-element provenance stored above, root left polymorphic */
             }
         }
     }

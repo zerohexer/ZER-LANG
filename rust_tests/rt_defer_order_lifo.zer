@@ -1,0 +1,19 @@
+// Rust pattern: Multiple Drops fire in LIFO (reverse declaration) order
+// ZER: Multiple defers fire in reverse order
+
+u32 order_tracker;
+
+u32 main() {
+    order_tracker = 0;
+
+    {
+        defer { order_tracker = order_tracker * 10 + 1; }
+        defer { order_tracker = order_tracker * 10 + 2; }
+        defer { order_tracker = order_tracker * 10 + 3; }
+    }
+
+    // Defers fire: 3 first → 03, then 2 → 032, then 1 → 0321
+    // 0*10+3=3, 3*10+2=32, 32*10+1=321
+    if (order_tracker != 321) { return 1; }
+    return 0;
+}

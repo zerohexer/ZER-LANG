@@ -1,0 +1,26 @@
+// Rust source: tests/ui/drop/drop-scope-exit.rs
+// Drop called when value goes out of scope — counter decremented.
+// ZER: defer fires at scope exit, shared counter tracks cleanup.
+
+shared struct DropCount { u32 count; }
+DropCount dc;
+
+struct Tracked { u32 id; }
+Pool(Tracked, 4) pool;
+
+void create_and_drop(*DropCount d) {
+    ?Handle(Tracked) mh = pool.alloc();
+    Handle(Tracked) h = mh orelse return;
+    defer pool.free(h);
+    defer { d.count += 1; }
+    pool.get(h).id = 42;
+}
+
+u32 main() {
+    dc.count = 0;
+    create_and_drop(&dc);
+    create_and_drop(&dc);
+    u32 c = dc.count;
+    if (c != 2) { return 1; }
+    return 0;
+}

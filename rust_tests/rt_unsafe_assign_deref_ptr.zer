@@ -1,0 +1,14 @@
+// Rust source: tests/ui/unsafe/unsafe-fn-assign-deref-ptr.rs
+// Deref raw pointer without unsafe → compile error.
+// ZER: @inttoptr without mmio declaration → compile error.
+// EXPECTED: compile error
+
+void f(u32 addr) {
+    volatile *u32 p = @inttoptr(*u32, addr);
+    p[0] = 0;
+}
+
+u32 main() {
+    f(0x40020000);
+    return 0;
+}

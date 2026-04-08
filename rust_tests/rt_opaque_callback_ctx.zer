@@ -1,0 +1,44 @@
+// Rust pattern: Box<dyn Any> as callback context — type-erased state
+// ZER: *opaque field in callback struct, @ptrcast for type-safe access
+
+struct Sensor { u32 reading; u32 calibration; }
+struct Motor { u32 speed; u32 torque; }
+Slab(Sensor) sensor_heap;
+Slab(Motor) motor_heap;
+
+struct Handler {
+    *opaque ctx;
+    u32 type_tag;
+}
+
+u32 process_sensor(*opaque raw) {
+    *Sensor s = @ptrcast(*Sensor, raw);
+    return s.reading + s.calibration;
+}
+
+u32 process_motor(*opaque raw) {
+    *Motor m = @ptrcast(*Motor, raw);
+    return m.speed * m.torque;
+}
+
+u32 main() {
+    ?*Sensor ms = sensor_heap.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer sensor_heap.free_ptr(s);
+    s.reading = 100;
+    s.calibration = 5;
+
+    ?*Motor mm = motor_heap.alloc_ptr();
+    *Motor m = mm orelse return;
+    defer motor_heap.free_ptr(m);
+    m.speed = 10;
+    m.torque = 3;
+
+    u32 sr = process_sensor(@ptrcast(*opaque, s));
+    if (sr != 105) { return 1; }
+
+    u32 mr = process_motor(@ptrcast(*opaque, m));
+    if (mr != 30) { return 2; }
+
+    return 0;
+}

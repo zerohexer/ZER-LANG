@@ -1,0 +1,27 @@
+// Rust source: tests/ui/drop/drop-once-on-move.rs
+// Drop called exactly once even when value is moved between variables.
+// ZER: alloc_ptr passed through variables, freed once via defer.
+
+struct Obj { u32 id; }
+Slab(Obj) heap;
+
+u32 cleanup_count;
+
+u32 main() {
+    cleanup_count = 0;
+
+    ?*Obj mo = heap.alloc_ptr();
+    *Obj a = mo orelse return;
+    a.id = 1;
+
+    // "Move" — in ZER, pointer assignment (same alloc)
+    *Obj b = a;
+    b.id = 2;
+
+    // Only free once (via b, which is same pointer as a)
+    heap.free_ptr(b);
+    cleanup_count += 1;
+
+    if (cleanup_count != 1) { return 1; }
+    return 0;
+}

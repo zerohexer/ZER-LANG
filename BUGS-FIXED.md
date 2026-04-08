@@ -7,6 +7,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-08 — Zercheck Prefix Walk + Deadlock Model Redesign
 
+### BUG-466: Heterogeneous *opaque array blocked for constant-indexed vtable pattern
+- **Symptom:** `Op[2] ops; ops[0].ctx = @ptrcast(*opaque, &adder); ops[1].ctx = @ptrcast(*opaque, &multiplier);` → "heterogeneous *opaque array" error. Pattern is safe — each element is self-contained vtable entry.
+- **Root cause:** `prov_map_set` in checker.c forced root-level homogeneous provenance for ALL array keys containing `[`. Didn't distinguish constant indices (compiler knows which element) from variable indices (compiler can't distinguish).
+- **Fix:** Check if bracket content is all digits. Constant index → skip root homogeneity check (per-element provenance is fine). Variable index → enforce homogeneity (can't track at compile time).
+- **Found by:** Auditing existing tests — `rt_opaque_multi_dispatch.zer` had been rewritten to use separate variables instead of array. The "limitation" was this overly conservative check.
+- **Test:** `rust_tests/rt_opaque_multi_dispatch.zer` — now uses `Op[2] ops` array with different *opaque types per element.
+
 ### BUG-465: Function pointer as spawn argument — struct field name outside parens
 - **Symptom:** `spawn worker(&res, double_it, 21)` where `worker` takes `u32 (*op)(u32)` → GCC error: `uint32_t (*)(uint32_t) a1;` (name outside parens).
 - **Root cause:** Spawn wrapper arg struct emission at emitter.c ~line 4572 used `emit_type_and_name(e, at, NULL, 0)` then `emit(e, " a%d; ")` — separate name placement. Function pointers require name inside `(*name)(params)`.

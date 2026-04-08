@@ -1,0 +1,25 @@
+// Rust pattern: Arc<Mutex<T>> for shared thread-safe data.
+// ZER: shared struct auto-locking — same safety, zero boilerplate.
+
+shared struct Counter { u32 value; }
+Counter g;
+
+void increment(*Counter c) {
+    c.value = c.value + 1;
+}
+
+u32 main() {
+    g.value = 0;
+
+    // Direct access — auto-locked
+    g.value = 10;
+    g.value = g.value + 5;
+
+    if (g.value != 15) { return 1; }
+
+    // Through pointer — still auto-locked (shared struct)
+    increment(&g);
+    if (g.value != 16) { return 2; }
+
+    return 0;
+}

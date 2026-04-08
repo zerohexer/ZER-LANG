@@ -1,0 +1,19 @@
+// Rust pattern: scoped threads with join guarantee.
+// ZER: ThreadHandle + th.join() — must join before exit.
+
+shared struct Work { u32 result; }
+Work w;
+
+void compute(*Work data) {
+    data.result = 42;
+}
+
+u32 main() {
+    w.result = 0;
+
+    ThreadHandle th = spawn compute(&w);
+    th.join();
+
+    if (w.result != 42) { return 1; }
+    return 0;
+}

@@ -1,0 +1,17 @@
+// Rust source: tests/ui/borrowck/borrowck-ref-into-rvalue.rs
+// Safety intent: reference to temporary = dangling pointer.
+// ZER: returning pointer to local = compile error.
+// EXPECTED: compile error
+
+struct Message { u32 code; }
+
+*Message get_msg() {
+    Message m;
+    m.code = 42;
+    return &m;   // ERROR: pointer to local
+}
+
+u32 main() {
+    *Message p = get_msg();
+    return p.code;
+}

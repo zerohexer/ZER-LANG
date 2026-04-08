@@ -1,0 +1,39 @@
+// Rust source: tests/ui/drop/dynamic-drop.rs (simplified)
+// Safety intent: destructors fire on ALL control flow paths.
+// ZER: defer fires on return, break, continue, goto — LIFO order.
+
+struct Res { u32 id; }
+Pool(Res, 8) pool;
+
+u32 drop_order;
+
+u32 main() {
+    drop_order = 0;
+
+    // Allocate 3 resources with defers — LIFO cleanup
+    ?Handle(Res) m1 = pool.alloc();
+    Handle(Res) h1 = m1 orelse return;
+    defer pool.free(h1);
+    defer { drop_order = drop_order * 10 + 1; }
+    pool.get(h1).id = 100;
+
+    ?Handle(Res) m2 = pool.alloc();
+    Handle(Res) h2 = m2 orelse return;
+    defer pool.free(h2);
+    defer { drop_order = drop_order * 10 + 2; }
+    pool.get(h2).id = 200;
+
+    ?Handle(Res) m3 = pool.alloc();
+    Handle(Res) h3 = m3 orelse return;
+    defer pool.free(h3);
+    defer { drop_order = drop_order * 10 + 3; }
+    pool.get(h3).id = 300;
+
+    // Verify values
+    if (pool.get(h1).id != 100) { return 1; }
+    if (pool.get(h2).id != 200) { return 2; }
+    if (pool.get(h3).id != 300) { return 3; }
+
+    // Defers fire LIFO: 3, 2, 1 → drop_order = 321
+    return 0;
+}

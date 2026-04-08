@@ -1,0 +1,31 @@
+// Rust source: tests/ui/drop/drop-struct-as-object.rs
+// Safety intent: destructor fires on type-erased object leaving scope.
+// ZER: Slab alloc + *opaque cast + defer cleanup.
+
+struct Cat { u32 name; }
+Slab(Cat) cats;
+
+u32 cleanup_value;
+
+void destroy_cat(*opaque ctx) {
+    *Cat c = @ptrcast(*Cat, ctx);
+    cleanup_value = c.name;
+    cats.free_ptr(c);
+}
+
+u32 main() {
+    cleanup_value = 0;
+
+    ?*Cat mc = cats.alloc_ptr();
+    *Cat x = mc orelse return;
+    x.name = 22;
+
+    // Type-erase to *opaque (like Box<dyn Dummy>)
+    *opaque erased = @ptrcast(*opaque, x);
+
+    // Cleanup via type-erased pointer
+    destroy_cat(erased);
+
+    if (cleanup_value != 22) { return 1; }
+    return 0;
+}

@@ -1,0 +1,25 @@
+// Rust source: tests/ui/unsafe/unsafe-fn-called-from-safe.rs
+// Safety intent: unsafe operations from safe context = compile error.
+// ZER: @inttoptr without mmio declaration = compile error.
+// This positive test shows SAFE patterns that work.
+
+struct Sensor { u32 reading; }
+Pool(Sensor, 4) sensors;
+
+u32 main() {
+    // Safe allocation — no unsafe needed
+    ?Handle(Sensor) ms = sensors.alloc();
+    Handle(Sensor) h = ms orelse return;
+    defer sensors.free(h);
+
+    sensors.get(h).reading = 42;
+
+    // Read through handle auto-deref — safe, no raw pointers needed
+    if (h.reading != 42) { return 1; }
+
+    // Modify through auto-deref
+    h.reading = 99;
+    if (sensors.get(h).reading != 99) { return 2; }
+
+    return 0;
+}

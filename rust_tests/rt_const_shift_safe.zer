@@ -1,0 +1,36 @@
+// Rust source: tests/ui/consts/overflowing-consts.rs (shift portion)
+// Safety intent: shift overflow is defined behavior.
+// ZER: shift >= width = 0 (defined, not UB). Wrapping arithmetic.
+
+comptime u32 SHL(u32 a, u32 b) {
+    return a << b;
+}
+
+comptime u32 SHR(u32 a, u32 b) {
+    return a >> b;
+}
+
+u32 main() {
+    // Normal shifts work
+    u32 a = SHL(1, 4);
+    if (a != 16) { return 1; }
+
+    u32 b = SHR(256, 4);
+    if (b != 16) { return 2; }
+
+    // Shift by 0 = identity
+    u32 c = SHL(42, 0);
+    if (c != 42) { return 3; }
+
+    // Runtime shifts — ZER defines: shift >= width = 0
+    u32 x = 1;
+    u32 shift_amt = 32;
+    u32 result = x << shift_amt;
+    if (result != 0) { return 4; }
+
+    // Shift by 31 — last valid bit
+    u32 d = 1 << 31;
+    if (d == 0) { return 5; }
+
+    return 0;
+}

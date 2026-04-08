@@ -1,0 +1,17 @@
+// Rust source: tests/ui/typeck/typeck-unsafe-always-share.rs
+// Safety intent: non-Sync types cannot be shared between threads.
+// ZER: non-shared pointer to spawn = compile error.
+// EXPECTED: compile error
+
+struct NoSync { u32 value; }
+
+void worker(*NoSync data) {
+    data.value = 42;
+}
+
+u32 main() {
+    NoSync ns;
+    ns.value = 0;
+    spawn worker(&ns);   // ERROR: non-shared *T to spawn
+    return 0;
+}

@@ -1,0 +1,20 @@
+// Rust source: tests/ui/consts/const-fn-val.rs
+// Safety intent: function pointer stored in struct, called correctly.
+// ZER: function pointer in struct field + global init.
+
+u32 foo() {
+    return 42;
+}
+
+struct Bar {
+    u32 (*f)();
+}
+
+u32 main() {
+    Bar b;
+    b.f = foo;
+
+    u32 result = b.f();
+    if (result != 42) { return 1; }
+    return 0;
+}

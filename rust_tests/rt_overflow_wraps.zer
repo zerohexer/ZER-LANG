@@ -1,0 +1,27 @@
+// Rust source: tests/ui/consts/overflowing-consts.rs (arithmetic portion)
+// Safety intent: integer overflow behavior.
+// ZER: overflow wraps (defined behavior, never UB).
+
+u32 main() {
+    // u8 wrapping
+    u8 a = 255;
+    u8 b = a + 1;  // wraps to 0
+    if (b != 0) { return 1; }
+
+    // u32 wrapping
+    u32 big = 4294967295;  // UINT32_MAX
+    u32 c = big + 1;      // wraps to 0
+    if (c != 0) { return 2; }
+
+    // Subtraction underflow wraps
+    u32 d = 0;
+    u32 e = d - 1;  // wraps to UINT32_MAX
+    if (e != 4294967295) { return 3; }
+
+    // Multiplication overflow wraps
+    u32 f = 1000000;
+    u32 g = f * 5000;  // 5,000,000,000 wraps
+    // Just verify it doesn't crash — wrapping is defined
+
+    return 0;
+}

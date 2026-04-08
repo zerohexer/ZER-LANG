@@ -1,0 +1,17 @@
+// Rust pattern: forgetting to join a scoped thread.
+// ZER: ThreadHandle not joined = compile error.
+// EXPECTED: compile error
+
+shared struct Work { u32 result; }
+Work w;
+
+void compute(*Work data) {
+    data.result = 42;
+}
+
+u32 main() {
+    w.result = 0;
+    ThreadHandle th = spawn compute(&w);
+    // MISSING: th.join()
+    return 0;
+}

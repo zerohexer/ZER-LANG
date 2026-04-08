@@ -1,0 +1,13 @@
+// Rust source: tests/ui/consts/overflowing-consts.rs (OOB portion)
+// Safety intent: out of bounds array index = compile error.
+// ZER: constant index >= array size = compile error.
+// EXPECTED: compile error
+
+u32 main() {
+    u32[3] arr;
+    arr[0] = 1;
+    arr[1] = 2;
+    arr[2] = 3;
+    u32 x = arr[4];   // ERROR: index 4 out of bounds for size 3
+    return x;
+}

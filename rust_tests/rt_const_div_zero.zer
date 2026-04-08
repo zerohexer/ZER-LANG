@@ -1,0 +1,9 @@
+// Rust source: tests/ui/consts/overflowing-consts.rs (division portion)
+// Safety intent: division by zero = compile error.
+// ZER: forced division guard — divisor not proven nonzero = error.
+// EXPECTED: compile error
+
+u32 main() {
+    u32 x = 10 / 0;   // ERROR: division by zero
+    return x;
+}

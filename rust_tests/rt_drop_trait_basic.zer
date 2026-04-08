@@ -1,0 +1,15 @@
+// Rust source: tests/ui/drop/drop-trait.rs
+// Drop impl prints "bye" on scope exit.
+// ZER: defer block at scope exit.
+
+u32 bye_count;
+
+u32 main() {
+    bye_count = 0;
+    {
+        defer { bye_count += 1; }
+        u32 x = 3;
+    }
+    if (bye_count != 1) { return 1; }
+    return 0;
+}

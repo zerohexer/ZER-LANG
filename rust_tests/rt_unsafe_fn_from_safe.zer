@@ -1,0 +1,13 @@
+// Rust source: tests/ui/unsafe/unsafe-fn-called-from-safe.rs
+// Calling unsafe fn from safe context → compile error.
+// ZER: No unsafe keyword. @inttoptr without mmio → compile error.
+// EXPECTED: compile error
+
+u32 do_unsafe() {
+    volatile *u32 p = @inttoptr(*u32, 0x40020000);
+    return p[0];
+}
+
+u32 main() {
+    return do_unsafe();
+}

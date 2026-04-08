@@ -1,0 +1,30 @@
+// Rust source: tests/ui/drop/drop-count-assertion-16151.rs (issue #16151)
+// 3 items created, all 3 dropped. Drop count == 3.
+// ZER: 3 Pool allocs with defer free, counter tracks cleanup.
+
+struct Fragment { u32 id; }
+Pool(Fragment, 8) pool;
+
+u32 drop_count;
+
+u32 main() {
+    drop_count = 0;
+    {
+        ?Handle(Fragment) m0 = pool.alloc();
+        Handle(Fragment) h0 = m0 orelse return;
+        defer pool.free(h0);
+        defer { drop_count += 1; }
+
+        ?Handle(Fragment) m1 = pool.alloc();
+        Handle(Fragment) h1 = m1 orelse return;
+        defer pool.free(h1);
+        defer { drop_count += 1; }
+
+        ?Handle(Fragment) m2 = pool.alloc();
+        Handle(Fragment) h2 = m2 orelse return;
+        defer pool.free(h2);
+        defer { drop_count += 1; }
+    }
+    if (drop_count != 3) { return 1; }
+    return 0;
+}

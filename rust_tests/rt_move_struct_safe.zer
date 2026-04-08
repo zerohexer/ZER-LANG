@@ -1,0 +1,32 @@
+// Move struct: safe usage patterns — use before move, use receiver after move.
+
+move struct Resource { u32 id; u32 status; }
+
+u32 extract_id(Resource r) {
+    return r.id;
+}
+
+u32 main() {
+    Resource r;
+    r.id = 42;
+    r.status = 1;
+
+    // Use before move — safe
+    if (r.id != 42) { return 1; }
+
+    // Move to function
+    u32 id = extract_id(r);
+    if (id != 42) { return 2; }
+
+    // Create new resource — independent
+    Resource r2;
+    r2.id = 99;
+    r2.status = 2;
+
+    // Move via assignment
+    Resource r3 = r2;
+    if (r3.id != 99) { return 3; }
+    if (r3.status != 2) { return 4; }
+
+    return 0;
+}

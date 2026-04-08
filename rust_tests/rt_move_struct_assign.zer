@@ -1,0 +1,16 @@
+// Move struct: assignment transfers ownership — source invalid.
+// EXPECTED: compile error
+
+move struct Token { u32 kind; u32 value; }
+
+u32 main() {
+    Token a;
+    a.kind = 1;
+    a.value = 42;
+
+    Token b = a;   // ownership transfers to b
+
+    // a is now moved — use is error
+    u32 val = a.value;
+    return val;
+}

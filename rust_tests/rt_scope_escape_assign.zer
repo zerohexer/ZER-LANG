@@ -1,0 +1,11 @@
+// Rust pattern: storing reference to local in global = dangling.
+// ZER: scope escape via assignment to global = compile error.
+// EXPECTED: compile error
+
+*u32 global_ptr;
+
+u32 main() {
+    u32 local = 42;
+    global_ptr = &local;   // ERROR: storing pointer to local in global
+    return 0;
+}

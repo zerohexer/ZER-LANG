@@ -1,0 +1,38 @@
+// Rust pattern: Box<dyn Trait> full lifecycle — alloc, use, type-erase, recover, free.
+// ZER: Slab alloc_ptr + *opaque round-trip with proper cleanup.
+
+struct Config { u32 port; u32 timeout; }
+Slab(Config) configs;
+
+void configure(*opaque ctx) {
+    *Config c = @ptrcast(*Config, ctx);
+    c.port = 8080;
+    c.timeout = 30;
+}
+
+u32 read_port(*opaque ctx) {
+    *Config c = @ptrcast(*Config, ctx);
+    return c.port;
+}
+
+u32 main() {
+    ?*Config mc = configs.alloc_ptr();
+    *Config c = mc orelse return;
+    defer configs.free_ptr(c);
+
+    c.port = 0;
+    c.timeout = 0;
+
+    // Type-erase and configure through *opaque
+    *opaque raw = @ptrcast(*opaque, c);
+    configure(raw);
+
+    // Read back through *opaque
+    u32 port = read_port(raw);
+    if (port != 8080) { return 1; }
+
+    // Read directly through typed pointer — still valid
+    if (c.timeout != 30) { return 2; }
+
+    return 0;
+}

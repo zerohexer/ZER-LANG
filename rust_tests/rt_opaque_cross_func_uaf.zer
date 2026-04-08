@@ -1,0 +1,22 @@
+// Rust pattern: cross-function UAF through *opaque.
+// ZER: FuncSummary detects free, caller marks as FREED.
+// EXPECTED: compile error
+
+struct Motor { u32 speed; }
+Slab(Motor) heap;
+
+void motor_destroy(*Motor m) {
+    heap.free_ptr(m);
+}
+
+u32 main() {
+    ?*Motor mm = heap.alloc_ptr();
+    *Motor m = mm orelse return;
+    m.speed = 100;
+
+    motor_destroy(m);
+
+    // Use after cross-function free
+    u32 val = m.speed;
+    return val;
+}

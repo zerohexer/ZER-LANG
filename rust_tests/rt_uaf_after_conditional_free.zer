@@ -1,0 +1,21 @@
+// Rust pattern: conditional free makes handle MAYBE_FREED.
+// ZER: use after conditional free = compile error.
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) mt = pool.alloc();
+    Handle(Task) h = mt orelse return;
+    pool.get(h).id = 1;
+
+    bool should_free = true;
+    if (should_free) {
+        pool.free(h);
+    }
+
+    // h is MAYBE_FREED — use is rejected
+    u32 val = pool.get(h).id;
+    return val;
+}

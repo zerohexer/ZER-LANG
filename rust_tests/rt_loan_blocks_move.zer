@@ -1,0 +1,23 @@
+// Rust source: tests/ui/borrowck/borrowck-loan-blocks-move.rs
+// Safety intent: cannot move (free) while borrow (pointer) exists.
+// ZER: free while alias pointer exists = compile error.
+// EXPECTED: compile error
+
+struct Resource { u32 id; }
+Slab(Resource) heap;
+
+u32 main() {
+    ?*Resource mr = heap.alloc_ptr();
+    *Resource v = mr orelse return;
+    v.id = 42;
+
+    // Create alias pointer (like a borrow)
+    *Resource w = v;
+
+    // Free through original — alias becomes dangling
+    heap.free_ptr(v);
+
+    // Use through alias — UAF
+    u32 val = w.id;
+    return val;
+}

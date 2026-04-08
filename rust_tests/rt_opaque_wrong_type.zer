@@ -1,29 +1,17 @@
-// Rust pattern: Box<dyn Any> downcast to wrong type → panic.
-// ZER: @ptrcast Sensor to *opaque, @ptrcast back as *Motor → compile error (provenance violation).
+// Rust pattern: wrong downcast from dyn Any.
+// ZER: @ptrcast to wrong type = compile error (provenance mismatch).
 // EXPECTED: compile error
 
-struct Sensor {
-    u32 id;
-    u32 reading;
-}
+struct Dog { u32 tricks; }
+struct Cat { u32 lives; }
 
-struct Motor {
-    u32 speed;
-    u32 torque;
-}
+u32 main() {
+    Dog d;
+    d.tricks = 5;
 
-Slab(Sensor) sensors;
+    *opaque raw = @ptrcast(*opaque, &d);
 
-i32 main() {
-    ?*Sensor ms = sensors.alloc_ptr();
-    *Sensor s = ms orelse return;
-    s.id = 1;
-    s.reading = 500;
-
-    *opaque ctx = @ptrcast(*opaque, s);
-    *Motor m = @ptrcast(*Motor, ctx);
-
-    u32 spd = m.speed;
-    sensors.free_ptr(s);
-    return (i32)spd;
+    // Cast back to WRONG type — provenance says Dog, casting to Cat
+    *Cat wrong = @ptrcast(*Cat, raw);
+    return wrong.lives;
 }

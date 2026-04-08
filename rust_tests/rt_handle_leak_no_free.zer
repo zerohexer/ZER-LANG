@@ -1,0 +1,14 @@
+// Rust pattern: Drop not implemented = resource leak.
+// ZER: handle allocated but never freed = compile error.
+// EXPECTED: compile error
+
+struct Connection { u32 fd; }
+Pool(Connection, 4) pool;
+
+u32 main() {
+    ?Handle(Connection) mc = pool.alloc();
+    Handle(Connection) h = mc orelse return;
+    pool.get(h).fd = 42;
+    // MISSING: pool.free(h) or defer pool.free(h)
+    return 0;
+}

@@ -1,0 +1,17 @@
+// Rust source: tests/ui/borrowck/borrowck-field-sensitivity.rs
+// Safety intent: use field after struct partially moved = error.
+// ZER: free then access field = compile error (zercheck UAF).
+// EXPECTED: compile error
+
+struct Item { u32 a; u32 b; }
+Slab(Item) heap;
+
+u32 main() {
+    ?*Item mi = heap.alloc_ptr();
+    *Item x = mi orelse return;
+    x.a = 1;
+    x.b = 2;
+    heap.free_ptr(x);
+    u32 val = x.b;   // UAF — must be rejected
+    return val;
+}

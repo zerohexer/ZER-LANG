@@ -1,0 +1,25 @@
+// Rust source: tests/ui/borrowck/borrowck-reinit.rs
+// Safety intent: reinit after move then use = OK, but use after second move = error.
+// ZER: free, alloc new, use new = OK. Free new, use new = error.
+
+struct Data { u32 value; }
+Slab(Data) heap;
+
+u32 main() {
+    // First allocation
+    ?*Data md = heap.alloc_ptr();
+    *Data x = md orelse return;
+    x.value = 10;
+    heap.free_ptr(x);
+
+    // Reinit — new allocation
+    ?*Data md2 = heap.alloc_ptr();
+    *Data y = md2 orelse return;
+    y.value = 20;
+
+    // Use after reinit — OK
+    if (y.value != 20) { return 1; }
+
+    heap.free_ptr(y);
+    return 0;
+}

@@ -1,0 +1,22 @@
+// Rust source: borrowck-reinit.rs (use after second move pattern)
+// Safety intent: reinit then move again then use = error.
+// ZER: alloc, free, alloc new, free new, use new = compile error.
+// EXPECTED: compile error
+
+struct Data { u32 value; }
+Slab(Data) heap;
+
+u32 main() {
+    ?*Data md = heap.alloc_ptr();
+    *Data x = md orelse return;
+    x.value = 10;
+    heap.free_ptr(x);
+
+    ?*Data md2 = heap.alloc_ptr();
+    *Data y = md2 orelse return;
+    y.value = 20;
+    heap.free_ptr(y);
+
+    u32 val = y.value;   // UAF after second free
+    return val;
+}

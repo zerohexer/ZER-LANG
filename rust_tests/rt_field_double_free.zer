@@ -1,0 +1,16 @@
+// Rust source: borrowck-field-sensitivity.rs (move_after_move pattern)
+// Safety intent: double free on same allocation = error.
+// ZER: free twice = compile error.
+// EXPECTED: compile error
+
+struct Item { u32 a; u32 b; }
+Slab(Item) heap;
+
+u32 main() {
+    ?*Item mi = heap.alloc_ptr();
+    *Item x = mi orelse return;
+    x.a = 1;
+    heap.free_ptr(x);
+    heap.free_ptr(x);   // DOUBLE FREE
+    return 0;
+}

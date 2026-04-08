@@ -1,0 +1,41 @@
+// Rust pattern: trait object vtable dispatch — Box<dyn Trait>.method()
+// ZER: function pointer + *opaque context for type-erased dispatch.
+
+struct Circle { u32 radius; }
+struct Square { u32 side; }
+
+u32 circle_area(*opaque ctx) {
+    *Circle c = @ptrcast(*Circle, ctx);
+    return c.radius * c.radius * 3;
+}
+
+u32 square_area(*opaque ctx) {
+    *Square s = @ptrcast(*Square, ctx);
+    return s.side * s.side;
+}
+
+struct Shape {
+    *opaque ctx;
+    u32 (*area_fn)(*opaque);
+}
+
+u32 main() {
+    Circle c;
+    c.radius = 5;
+    Shape s1;
+    s1.ctx = @ptrcast(*opaque, &c);
+    s1.area_fn = circle_area;
+
+    Square sq;
+    sq.side = 4;
+    Shape s2;
+    s2.ctx = @ptrcast(*opaque, &sq);
+    s2.area_fn = square_area;
+
+    u32 a1 = s1.area_fn(s1.ctx);
+    u32 a2 = s2.area_fn(s2.ctx);
+
+    if (a1 != 75) { return 1; }
+    if (a2 != 16) { return 2; }
+    return 0;
+}

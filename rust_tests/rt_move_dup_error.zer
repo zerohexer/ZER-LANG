@@ -1,0 +1,21 @@
+// Rust source: tests/ui/moves/move-2.rs
+// Use moved value twice — error. ZER: alloc_ptr, free, use → UAF.
+// EXPECTED: compile error
+
+struct Data { u32 x; u32 y; u32 z; }
+Slab(Data) heap;
+
+u32 main() {
+    ?*Data md = heap.alloc_ptr();
+    *Data d = md orelse return;
+    d.x = 1;
+    d.y = 2;
+    d.z = 3;
+
+    // "Move" — free the pointer
+    heap.free_ptr(d);
+
+    // Try to use again — UAF
+    u32 val = d.y;
+    return val;
+}

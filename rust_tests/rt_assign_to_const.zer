@@ -1,0 +1,11 @@
+// Rust source: tests/ui/borrowck/borrowck-assign-to-constants.rs
+// Assign to immutable static → compile error.
+// ZER: const global assignment → compile error.
+// EXPECTED: compile error
+
+const u32 foo = 5;
+
+u32 main() {
+    foo = 6;
+    return 0;
+}

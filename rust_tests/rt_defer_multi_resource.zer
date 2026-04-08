@@ -1,0 +1,40 @@
+// Rust pattern: multiple resources with Drop — all cleaned up on exit.
+// ZER: multiple allocs with individual defers — LIFO cleanup guaranteed.
+
+struct File { u32 fd; }
+struct Socket { u32 port; }
+struct Buffer { u32 size; }
+Slab(File) file_heap;
+Slab(Socket) sock_heap;
+Slab(Buffer) buf_heap;
+
+u32 cleanup_order;
+
+u32 main() {
+    cleanup_order = 0;
+
+    ?*File mf = file_heap.alloc_ptr();
+    *File f = mf orelse return;
+    defer file_heap.free_ptr(f);
+    defer { cleanup_order = cleanup_order * 10 + 1; }
+    f.fd = 42;
+
+    ?*Socket ms = sock_heap.alloc_ptr();
+    *Socket s = ms orelse return;
+    defer sock_heap.free_ptr(s);
+    defer { cleanup_order = cleanup_order * 10 + 2; }
+    s.port = 8080;
+
+    ?*Buffer mb = buf_heap.alloc_ptr();
+    *Buffer b = mb orelse return;
+    defer buf_heap.free_ptr(b);
+    defer { cleanup_order = cleanup_order * 10 + 3; }
+    b.size = 4096;
+
+    if (f.fd != 42) { return 1; }
+    if (s.port != 8080) { return 2; }
+    if (b.size != 4096) { return 3; }
+
+    // Defers fire LIFO: 3, 2, 1 → cleanup_order = 321
+    return 0;
+}

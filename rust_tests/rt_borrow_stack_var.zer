@@ -1,0 +1,21 @@
+// Rust source: tests/ui/borrowck/borrowck-borrow-from-stack-variable.rs
+// Borrow field, modify parent → conflict. Borrow ends, modify OK.
+// ZER: pointer to local, modify local → safe (pointer still valid until scope exit).
+
+u32 main() {
+    u32[3] arr;
+    arr[0] = 1;
+    arr[1] = 2;
+    arr[2] = 3;
+
+    // Take pointer to element
+    *u32 p = &arr[0];
+
+    // In ZER, arr is still modifiable (no borrow checker)
+    // but p becomes dangling only if arr goes out of scope
+    arr[0] = 5;
+
+    // p still points to same location (stack, same scope)
+    if (p[0] != 5) { return 1; }
+    return 0;
+}

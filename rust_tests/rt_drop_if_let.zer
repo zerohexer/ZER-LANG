@@ -1,0 +1,16 @@
+// Rust source: tests/ui/drop/drop-if-let-binding.rs
+// if let with Option — drop fires on scope exit.
+// ZER: if-unwrap with pool.free inside capture block.
+
+struct Config { u32 value; }
+Pool(Config, 4) pool;
+
+u32 main() {
+    ?Handle(Config) mh = pool.alloc();
+    Handle(Config) h = mh orelse return;
+    defer pool.free(h);
+
+    h.value = 42;
+    if (h.value != 42) { return 1; }
+    return 0;
+}

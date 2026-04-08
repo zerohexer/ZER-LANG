@@ -1,0 +1,21 @@
+// Rust source: tests/ui/moves/move-into-dead-array-1.rs
+// Assign to uninitialized array element → error in Rust.
+// ZER: arrays auto-zeroed, so arr[i] = val always works.
+
+struct Item { u8 x; }
+
+Item make_item() {
+    Item d;
+    d.x = 0;
+    return d;
+}
+
+u32 main() {
+    Item[4] arr;
+    // In ZER, array is auto-zeroed — can assign to any index
+    arr[1] = make_item();
+    arr[3] = make_item();
+    if (arr[0].x != 0) { return 1; }
+    if (arr[1].x != 0) { return 2; }
+    return 0;
+}

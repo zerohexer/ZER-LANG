@@ -1,0 +1,19 @@
+// Rust source: tests/ui/moves/move-2.rs (run-pass variant)
+// Box ownership transfer — move to new variable, access through new var.
+
+struct XYZ { u32 x; u32 y; u32 z; }
+Slab(XYZ) heap;
+
+u32 main() {
+    ?*XYZ mx = heap.alloc_ptr();
+    *XYZ x = mx orelse return;
+    defer heap.free_ptr(x);
+    x.x = 1;
+    x.y = 2;
+    x.z = 3;
+
+    // "Move" — alias (same pointer)
+    *XYZ y = x;
+    if (y.y != 2) { return 1; }
+    return 0;
+}

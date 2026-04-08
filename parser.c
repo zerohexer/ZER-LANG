@@ -399,6 +399,33 @@ static TypeNode *parse_type(Parser *p) {
             inner_array->array.elem = t;
             return inner_array;
         }
+        /* BUG-467: ?*T[N] — the * handler parsed T[N] as ARRAY, wrapped in POINTER.
+         * Result: OPTIONAL(POINTER(ARRAY(T, N))). Need: ARRAY(OPTIONAL(POINTER(T)), N).
+         * Same swap pattern but through the pointer wrapper. */
+        if (t->optional.inner->kind == TYNODE_POINTER &&
+            t->optional.inner->pointer.inner &&
+            t->optional.inner->pointer.inner->kind == TYNODE_ARRAY) {
+            TypeNode *ptr = t->optional.inner;                /* POINTER(ARRAY(T,N)) */
+            TypeNode *inner_array = ptr->pointer.inner;       /* ARRAY(T, N) */
+            ptr->pointer.inner = inner_array->array.elem;     /* POINTER(T) */
+            t->optional.inner = ptr;                          /* OPTIONAL(POINTER(T)) */
+            inner_array->array.elem = t;                      /* ARRAY(OPTIONAL(POINTER(T)), N) */
+            return inner_array;
+        }
+        /* Also: ?const *T[N] and ?volatile *T[N] — unwrap qualifier first */
+        if (t->optional.inner->kind == TYNODE_CONST || t->optional.inner->kind == TYNODE_VOLATILE) {
+            TypeNode *qual = t->optional.inner;
+            if (qual->qualified.inner && qual->qualified.inner->kind == TYNODE_POINTER &&
+                qual->qualified.inner->pointer.inner &&
+                qual->qualified.inner->pointer.inner->kind == TYNODE_ARRAY) {
+                TypeNode *ptr = qual->qualified.inner;
+                TypeNode *inner_array = ptr->pointer.inner;
+                ptr->pointer.inner = inner_array->array.elem;
+                /* t = OPTIONAL(QUAL(POINTER(T))) */
+                inner_array->array.elem = t;
+                return inner_array;
+            }
+        }
         /* Also handle ?T[N] where [N] is a suffix after the inner type
          * (for named types like ?MyStruct[4]) */
         if (match(p, TOK_LBRACKET)) {

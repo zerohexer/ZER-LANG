@@ -7,6 +7,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-08 — Zercheck Prefix Walk + Deadlock Model Redesign
 
+### BUG-467: `?*T[N]` parsed as `POINTER(ARRAY(T,N))` instead of `ARRAY(OPTIONAL(POINTER(T)),N)`
+- **Symptom:** `?*Device[2] slots;` → GCC error `struct Device[2]* slots`. Parser produced pointer-to-array instead of array-of-optional-pointers.
+- **Root cause:** `?` handler calls `parse_type()` → `*` handler calls `parse_type()` → base parser sees `Device` then `[2]` → wraps as `ARRAY(Device,2)`. `*` wraps as `POINTER(ARRAY(Device,2))`. `?` wraps as `OPTIONAL(POINTER(ARRAY(Device,2)))`. The `[N]` gets consumed inside the nested `parse_type` before `?` handler can swap.
+- **Fix:** In `?` handler, after getting inner type, check for `POINTER(ARRAY(...))` pattern and restructure to `ARRAY(OPTIONAL(POINTER(...)),N)`. Same swap as BUG-413 but through pointer wrapper. Also handles `?const *T[N]` and `?volatile *T[N]`.
+- **Found by:** Auditing `rt_opaque_array_homogeneous` which used struct fields instead of arrays to work around this.
+- **Test:** `rust_tests/rt_opaque_array_homogeneous.zer` — now uses native `?*Device[2]` syntax.
+
 ### BUG-466: Heterogeneous *opaque array blocked for constant-indexed vtable pattern
 - **Symptom:** `Op[2] ops; ops[0].ctx = @ptrcast(*opaque, &adder); ops[1].ctx = @ptrcast(*opaque, &multiplier);` → "heterogeneous *opaque array" error. Pattern is safe — each element is self-contained vtable entry.
 - **Root cause:** `prov_map_set` in checker.c forced root-level homogeneous provenance for ALL array keys containing `[`. Didn't distinguish constant indices (compiler knows which element) from variable indices (compiler can't distinguish).

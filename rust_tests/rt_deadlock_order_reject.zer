@@ -1,5 +1,6 @@
 // Rust pattern: Rust has NO deadlock detection — ZER does.
-// ZER: lock ordering by type_id — descending order = compile error.
+// ZER: single statement accessing TWO different shared types = deadlock risk.
+// BUG-464: properly detects same-statement multi-lock, not cross-statement.
 // EXPECTED: compile error
 
 shared struct Alpha { u32 x; }
@@ -9,9 +10,8 @@ Alpha a;
 Beta b;
 
 u32 main() {
-    // Ascending order — OK (not tested here, that's the safe case)
-    // Descending order — deadlock risk
-    b.y = 1;
-    a.x = 2;   // ERROR: lock ordering violation (Beta before Alpha)
+    // Single statement accessing both Alpha and Beta — deadlock risk
+    // Emitter can only lock ONE shared type per statement group.
+    a.x = b.y;   // ERROR: accesses both Alpha and Beta in one statement
     return 0;
 }

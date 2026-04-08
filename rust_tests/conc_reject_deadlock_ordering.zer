@@ -1,6 +1,7 @@
 // Rust equivalent: Mutex deadlock (ABBA pattern)
-// In Rust: detected at runtime by thread poisoning / actual deadlock
-// In ZER: detected at COMPILE TIME by lock ordering
+// ZER: detected at COMPILE TIME — same-statement multi-shared access.
+// BUG-464: cross-statement ordering is safe (lock→op→unlock per statement).
+// EXPECTED: compile error
 
 shared struct AccountA { u32 balance; }
 shared struct AccountB { u32 balance; }
@@ -8,11 +9,9 @@ shared struct AccountB { u32 balance; }
 AccountA a;
 AccountB b;
 
-// This function accesses B then A — WRONG ORDER
-// Should be compile error: deadlock
+// This function accesses BOTH in one expression — DEADLOCK RISK
 void bad_transfer() {
-    b.balance += 100;
-    a.balance += 50;   // ERROR: A (order lower) after B (order higher)
+    a.balance = b.balance + 100;  // ERROR: both AccountA and AccountB in one statement
 }
 
 u32 main() {

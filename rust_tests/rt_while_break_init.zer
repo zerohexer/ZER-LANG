@@ -1,0 +1,25 @@
+// Rust source: tests/ui/borrowck/borrowck-while-break.rs
+// Safety intent: variable set inside while+break may not execute.
+// ZER: auto-zero means variable is always initialized.
+
+u32 test(bool cond) {
+    u32 v = 0;  // auto-zeroed
+    u32 i = 0;
+    while (cond) {
+        v = 3;
+        break;
+    }
+    // In Rust: E0381 if cond is false (v never set).
+    // In ZER: v is auto-zeroed to 0, always safe to read.
+    return v;
+}
+
+u32 main() {
+    u32 r1 = test(true);
+    if (r1 != 3) { return 1; }
+
+    u32 r2 = test(false);
+    if (r2 != 0) { return 2; }
+
+    return 0;
+}

@@ -1,0 +1,27 @@
+// Rust pattern: const generics for bounds — array size from comptime.
+// ZER: comptime function as array size + bounds proven at compile time.
+
+comptime u32 TABLE_SIZE() { return 16; }
+comptime u32 HASH(u32 key) { return key % TABLE_SIZE(); }
+
+u32 main() {
+    u32[16] table;
+
+    // Initialize via comptime hash — indices proven safe at compile time
+    table[HASH(0)] = 100;
+    table[HASH(5)] = 200;
+    table[HASH(15)] = 300;
+    table[HASH(31)] = 400;
+
+    if (table[0] != 100) { return 1; }
+    if (table[5] != 200) { return 2; }
+    if (table[15] != 300) { return 3; }
+
+    // Runtime hash — range propagation proves safe
+    u32 key = 42;
+    u32 slot = key % 16;
+    table[slot] = 500;
+    if (table[slot] != 500) { return 4; }
+
+    return 0;
+}

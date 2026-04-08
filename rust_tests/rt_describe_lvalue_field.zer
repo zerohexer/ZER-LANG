@@ -1,0 +1,27 @@
+// Rust source: tests/ui/borrowck/borrowck-describe-lvalue.rs
+// Safety intent: struct/union field access while parent mutably borrowed.
+// ZER: field-level access on Pool handles — safe pattern (Handle is index, not ref).
+
+struct Foo { u32 x; u32 y; }
+Pool(Foo, 4) pool;
+
+u32 main() {
+    ?Handle(Foo) mf = pool.alloc();
+    Handle(Foo) h = mf orelse return;
+    defer pool.free(h);
+
+    pool.get(h).x = 22;
+    pool.get(h).y = 33;
+
+    // In Rust, mutable borrow of field blocks access to other fields.
+    // In ZER, Handle is an index — each pool.get() is a fresh lookup.
+    // No aliasing problem.
+    u32 x = pool.get(h).x;
+    pool.get(h).y = 44;
+    u32 y = pool.get(h).y;
+
+    if (x != 22) { return 1; }
+    if (y != 44) { return 2; }
+
+    return 0;
+}

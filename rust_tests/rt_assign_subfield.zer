@@ -1,5 +1,6 @@
 // Rust source: tests/ui/borrowck/borrowck-assign-to-subfield.rs
-// Mutable struct — all fields modifiable including nested.
+// Safety intent: mutable struct allows nested field mutation.
+// ZER: stack struct with nested field assignment — auto-zeroed, safe.
 
 struct Inner { u32 a; }
 struct Outer { u32 a; Inner w; }
@@ -9,13 +10,16 @@ u32 main() {
     p.a = 1;
     p.w.a = 1;
 
-    // Modify direct field
+    // Modify top-level field
     p.a = 2;
     if (p.a != 2) { return 1; }
 
     // Modify nested field
     p.w.a = 2;
     if (p.w.a != 2) { return 2; }
+
+    // Both modifications independent
+    if (p.a != 2) { return 3; }
 
     return 0;
 }

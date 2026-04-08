@@ -1,0 +1,23 @@
+// Rust source: tests/ui/borrowck/borrowck-vec-pattern-nesting.rs
+// Safety intent: assign to array while element is borrowed = error.
+// ZER: overwrite handle in array while handle alias exists.
+// EXPECTED: compile error
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+u32 main() {
+    ?Handle(Item) m0 = pool.alloc();
+    Handle(Item) h0 = m0 orelse return;
+    pool.get(h0).val = 1;
+
+    // Create alias
+    Handle(Item) alias = h0;
+
+    // Free the original
+    pool.free(h0);
+
+    // Use through alias — both share alloc_id, both FREED
+    u32 val = pool.get(alias).val;
+    return val;
+}

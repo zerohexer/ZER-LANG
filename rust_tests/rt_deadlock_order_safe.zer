@@ -1,0 +1,17 @@
+// Rust pattern: Rust has NO deadlock detection — ZER does.
+// ZER: lock ordering — access shared structs in one consistent order.
+
+shared struct Mutex1 { u32 count; }
+Mutex1 m;
+
+u32 main() {
+    // Single shared struct — no ordering issue possible
+    m.count = 0;
+    m.count = m.count + 1;
+    m.count = m.count + 1;
+    m.count = m.count + 1;
+
+    if (m.count != 3) { return 1; }
+
+    return 0;
+}

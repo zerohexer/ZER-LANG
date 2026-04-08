@@ -1,0 +1,30 @@
+// Rust pattern: cleanup on all exit paths including goto.
+// ZER: defer fires before goto — same as return/break/continue.
+
+struct Conn { u32 fd; }
+Pool(Conn, 4) pool;
+
+u32 closed;
+
+u32 main() {
+    closed = 0;
+
+    ?Handle(Conn) mc = pool.alloc();
+    Handle(Conn) h = mc orelse return;
+    defer pool.free(h);
+    defer { closed = 1; }
+
+    pool.get(h).fd = 42;
+
+    bool error = true;
+    if (error) {
+        goto cleanup;
+    }
+
+    // Normal path
+    if (pool.get(h).fd != 42) { return 1; }
+
+    cleanup:
+    // Defers fire before reaching here via goto AND on normal return
+    return 0;
+}

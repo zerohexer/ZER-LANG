@@ -1,0 +1,14 @@
+// Rust source: tests/ui/nll/return-ref-mut-issue-46557.rs
+// Safety intent: cannot return reference to temporary.
+// ZER: return &local = scope escape error.
+// EXPECTED: compile error
+
+*u32 gimme_static_mut() {
+    u32 x = 1234543;
+    return &x;   // ERROR: pointer to local
+}
+
+u32 main() {
+    *u32 p = gimme_static_mut();
+    return p[0];
+}

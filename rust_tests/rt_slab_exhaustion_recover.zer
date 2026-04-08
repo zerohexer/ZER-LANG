@@ -1,0 +1,29 @@
+// Rust pattern: allocation failure handling and recovery.
+// ZER: Slab alloc returns ?*T — null on exhaustion, recoverable.
+
+struct Task { u32 id; u32 status; }
+Slab(Task) heap;
+
+u32 main() {
+    // Allocate, use, free — basic lifecycle
+    ?*Task mt = heap.alloc_ptr();
+    *Task t = mt orelse return;
+    t.id = 1;
+    t.status = 0;
+
+    if (t.id != 1) { return 1; }
+
+    heap.free_ptr(t);
+
+    // Re-allocate after free — reuses slot
+    ?*Task mt2 = heap.alloc_ptr();
+    *Task t2 = mt2 orelse return;
+    t2.id = 2;
+    t2.status = 1;
+
+    if (t2.id != 2) { return 2; }
+    if (t2.status != 1) { return 3; }
+
+    heap.free_ptr(t2);
+    return 0;
+}

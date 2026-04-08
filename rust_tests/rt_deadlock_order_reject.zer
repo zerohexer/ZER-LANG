@@ -1,0 +1,17 @@
+// Rust pattern: Rust has NO deadlock detection — ZER does.
+// ZER: lock ordering by type_id — descending order = compile error.
+// EXPECTED: compile error
+
+shared struct Alpha { u32 x; }
+shared struct Beta { u32 y; }
+
+Alpha a;
+Beta b;
+
+u32 main() {
+    // Ascending order — OK (not tested here, that's the safe case)
+    // Descending order — deadlock risk
+    b.y = 1;
+    a.x = 2;   // ERROR: lock ordering violation (Beta before Alpha)
+    return 0;
+}

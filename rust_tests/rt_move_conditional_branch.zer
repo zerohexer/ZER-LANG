@@ -1,0 +1,29 @@
+// Rust source: tests/ui/moves/moves-based-on-type-exprs.rs (f30 pattern)
+// Safety intent: move in both if/else branches, then use = error.
+// ZER: free in both branches → FREED → use after = error.
+// EXPECTED: compile error
+
+struct Msg { u32 code; }
+Pool(Msg, 4) pool;
+
+u32 main() {
+    ?Handle(Msg) mx = pool.alloc();
+    Handle(Msg) x = mx orelse return;
+    pool.get(x).code = 1;
+
+    ?Handle(Msg) my = pool.alloc();
+    Handle(Msg) y = my orelse return;
+    pool.get(y).code = 2;
+
+    bool cond = true;
+    if (cond) {
+        pool.free(x);
+    } else {
+        pool.free(x);
+    }
+
+    // x freed on ALL paths — use is error
+    u32 val = pool.get(x).code;
+    pool.free(y);
+    return val;
+}

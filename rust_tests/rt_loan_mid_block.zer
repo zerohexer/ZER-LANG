@@ -1,0 +1,25 @@
+// Rust source: tests/ui/nll/loan_ends_mid_block_pair.rs
+// Safety intent: mutable borrow ends mid-block, later mutation OK.
+// ZER: handle lifecycle — free then re-alloc is new lifecycle.
+
+struct Data { u8 a; u8 b; u8 c; }
+Pool(Data, 4) pool;
+
+u32 main() {
+    ?Handle(Data) md = pool.alloc();
+    Handle(Data) h = md orelse return;
+    pool.get(h).a = 1;
+    pool.get(h).b = 2;
+    pool.get(h).c = 3;
+
+    // Modify field, then read — no borrow conflict with Handles
+    pool.get(h).a = 10;
+    pool.get(h).a = 20;
+    pool.get(h).a = 30;
+
+    if (pool.get(h).a != 30) { return 1; }
+    if (pool.get(h).b != 2) { return 2; }
+
+    pool.free(h);
+    return 0;
+}

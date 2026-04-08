@@ -1,0 +1,33 @@
+// Rust pattern: RwLock<T> — multiple readers, exclusive writer.
+// ZER: shared(rw) struct — auto rdlock/wrlock detection.
+
+shared(rw) struct Config { u32 port; u32 max_conn; }
+Config g;
+
+u32 read_port(*Config c) {
+    return c.port;
+}
+
+void set_port(*Config c, u32 p) {
+    c.port = p;
+}
+
+u32 main() {
+    g.port = 8080;
+    g.max_conn = 100;
+
+    // Read — auto rdlock
+    u32 port = g.port;
+    if (port != 8080) { return 1; }
+
+    // Write — auto wrlock
+    g.port = 9090;
+    if (g.port != 9090) { return 2; }
+
+    // Through function — still auto-locked
+    set_port(&g, 443);
+    u32 result = read_port(&g);
+    if (result != 443) { return 3; }
+
+    return 0;
+}

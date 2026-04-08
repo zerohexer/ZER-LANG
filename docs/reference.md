@@ -439,7 +439,45 @@ packed struct SensorPacket {
 ```
 
 **SEE ALSO**
-struct
+struct, move struct
+
+---
+
+### move struct
+
+**DESCRIPTION**
+Struct with ownership transfer semantics. Passing to a function or assigning to another variable transfers ownership — the original variable becomes invalid. Use after transfer is a compile error.
+
+Used for types representing unique resources: file descriptors, hardware handles, DMA buffers, one-shot tokens. Prevents double-close, double-use, and accidental aliasing of unique resources.
+
+ZER is copy-by-default (opposite of Rust). `move struct` opts IN to ownership tracking for the ~5% of types that need it.
+
+**SYNTAX**
+```zer
+move struct FileHandle { i32 fd; }
+
+FileHandle f;
+f.fd = 42;
+
+// Pass to function — ownership transferred
+consume(f);
+f.fd;                // COMPILE ERROR — use after move
+
+// Assignment — ownership transferred
+move struct Token { u32 kind; }
+Token a;
+a.kind = 1;
+Token b = a;         // a transferred to b
+a.kind;              // COMPILE ERROR — use after move
+```
+
+**SAFETY**
+- Use after move → compile error (zercheck HS_TRANSFERRED)
+- Double move (pass twice) → compile error
+- No interaction with other features — independent zercheck flag
+
+**SEE ALSO**
+struct, shared struct
 
 ---
 

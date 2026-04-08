@@ -280,6 +280,27 @@ b.y = 2; a.x = 1;          // OK — separate statements, locks released between
 a.x = b.y;                 // ERROR — same statement accesses both A and B
 ```
 
+### Move Struct — Ownership Transfer
+```
+// move struct: passing or assigning transfers ownership, original invalid
+move struct FileHandle { i32 fd; }
+FileHandle f;
+f.fd = 42;
+consume(f);          // ownership transferred
+f.fd;                // COMPILE ERROR — use after move
+
+// Assignment also transfers:
+move struct Token { u32 kind; }
+Token a;
+a.kind = 1;
+Token b = a;         // ownership transfers to b
+a.kind;              // COMPILE ERROR — use after move
+```
+
+ZER is copy-by-default (opposite of Rust). `move struct` opts IN to ownership tracking.
+Only for types representing unique resources (file descriptors, hardware handles, one-shot tokens).
+Uses zercheck's existing HS_TRANSFERRED state — zero new infrastructure.
+
 ### Hardware Support
 ```
 volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);  // MMIO register
@@ -331,6 +352,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Thread data race | `shared struct` auto-locked. Non-shared pointer to `spawn` → compile error (unless scoped with ThreadHandle+join). Handle to `spawn` → compile error. |
 | Deadlock | Same-statement multi-shared-type access → compile error. Emitter does lock-per-statement (no nested locks), so cross-statement ordering is safe. Only same-statement access to 2+ shared types is a real deadlock risk. |
 | Ownership transfer | `spawn` with non-shared pointer marks variable HS_TRANSFERRED — use after transfer → compile error. |
+| Move semantics | `move struct` — pass to function or assign transfers ownership, use after transfer → compile error. Compile-time via zercheck. |
 | Thread not joined | Scoped spawn `ThreadHandle` not joined before function exit → zercheck compile error. |
 | Spawn in ISR | `spawn` inside `@critical` block → compile error (thread creation with interrupts disabled). |
 | Pointer through channel | Ring.push with pointer element type → compile warning (pointer may be invalid in receiver). |
@@ -414,6 +436,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | @barrier_init/wait (sync point) | Done | Done (mutex+condvar, like Rust) |
 | async/await (stackless coroutines) | Done | Done (Duff's device state machine) |
 | Allocation coloring (source_color) | Done | N/A (compile-time — arena wrappers, param inference) |
+| `move struct` (ownership transfer) | Done | N/A (compile-time — zercheck HS_TRANSFERRED) |
 | Semantic fuzzer (32 generators) | Done | N/A (200 tests per make check) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
@@ -460,7 +483,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** 512 Rust-equivalent tests (0 failures), BUG-462 (handle array orelse alias), BUG-463 (struct field pointer UAF via prefix walk), BUG-464 (deadlock model redesign: same-statement multi-lock only), BUG-465 (funcptr as spawn arg), BUG-466 (heterogeneous *opaque array constant-index), BUG-467 (?*T[N] parser precedence), 467+ bug fixes, 3,400+ tests
+- **v0.3.0 (CURRENT):** `move struct` (compile-time ownership transfer), 516 Rust-equivalent tests (0 failures), BUG-462 through BUG-467 (6 bugs found by auditing test rewrites), deadlock model redesigned (same-statement multi-lock only), `?*T[N]` parser precedence fixed, heterogeneous *opaque array constant-index exemption, full 512-test audit with 0 hidden limitations, 468+ bug fixes, 3,400+ tests
 - **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -681,6 +704,7 @@ ZER SYNTAX RULES (not C — these differ):
 - Ring(T, N) = circular buffer channel (T must be struct name, push/pop)
 - @atomic_load/store/add/sub/or/and/xor/cas for atomics
 - No malloc/free — use Pool(T, N), Slab(T), Arena
+- move struct Name { } = ownership transfer on pass/assign, use after move = error
 ```
 
 Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).

@@ -1267,6 +1267,31 @@ Spawn wrapper arg struct emitted funcptr field name outside parens: `uint32_t (*
 
 **Found by:** Auditing `rt_opaque_array_homogeneous.zer` which used struct fields (`slot0`, `slot1`) instead of `?*Device[2]` array syntax.
 
+### Move Struct — Compile-Time Ownership Transfer (2026-04-09)
+
+`move struct FileHandle { i32 fd; }` — passing to function or assigning transfers ownership. Use after transfer = compile error. Closes the gap for stack-allocated value types representing unique resources (file descriptors, hardware handles, DMA buffers, one-shot tokens).
+
+**Parser:** Contextual keyword `move` (4 chars, not reserved). Scanner save/restore to peek: if `move` followed by `struct`, parse as move struct. Otherwise restore and continue as ident.
+
+**AST/Types:** `bool is_move` on `struct_decl` (ast.h) and `struct_type` (types.h). Checker propagates in `register_decl`.
+
+**zercheck:** Reuses existing `HS_TRANSFERRED` state (originally for spawn). Key design decisions:
+- `pool_id = -3` distinguishes move structs from pool handles (-1), malloc (-2), params (-1)
+- **Lazy registration:** Move struct vars registered at first use via `checker_get_type()` on NODE_IDENT, not at var-decl time (checker scopes are gone when zercheck runs — typemap is the only reliable source)
+- **Two-pass transfer in NODE_CALL:** First pass checks UAF + use-after-transfer. Second pass marks args as TRANSFERRED. This prevents false positives where the arg NODE_IDENT check fires on the same line as the transfer.
+- **Var-decl transfer after zc_check_expr:** `Token b = a;` — transfer of `a` happens AFTER `zc_check_expr(init)` recurses into `a`. Otherwise NODE_IDENT sees `a` as already-transferred (false positive).
+- **Excluded from leak detection:** `pool_id == -3` skipped in leak check. Move structs are stack values — auto-cleaned, no free needed.
+- **HS_TRANSFERRED counted as "covered"** in alloc_id grouping — prevents false leak errors.
+
+**Design choice: copy-by-default, move opt-in.** Opposite of Rust. ZER copies all types by default. `move struct` opts into ownership tracking for types where copying would be a bug (double-close, double-free, hardware aliasing). This means MOST structs don't need move — only the ~5% that wrap unique resources.
+
+**Why not add other Rust features:**
+- Closures: would need captured environment + 3 closure kinds + lifetime interaction → O(N²) coupling
+- Generics: `container` keyword (v0.4) covers it via text substitution → O(1) per stamp
+- Traits: function pointer vtable + `*opaque` already covers dispatch → 0 new features
+- Destructuring: `|v|` capture + `v.field` does the same thing in 1 extra line → not worth compiler complexity
+- Lifetimes: that IS the borrow checker → never add
+
 ## C-to-ZER Conversion Tools (moved from CLAUDE.md)
 
 ### C-to-ZER Conversion Tools (implemented v0.2)

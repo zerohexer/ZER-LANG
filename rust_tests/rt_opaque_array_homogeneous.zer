@@ -1,10 +1,9 @@
 // Rust pattern: Vec<Box<dyn Any>> — collection of type-erased pointers
-// ZER: *opaque array using typedef workaround for ?*opaque[N] syntax limitation.
+// BUG-467 fixed: ?*T[N] now parses as ARRAY(OPTIONAL(POINTER(T)), N).
+// No typedef workaround needed.
 
 struct Device { u32 id; u32 status; }
 Slab(Device) heap;
-
-typedef ?*opaque OptOpaque;
 
 u32 main() {
     ?*Device m0 = heap.alloc_ptr();
@@ -19,18 +18,16 @@ u32 main() {
     d1.id = 1;
     d1.status = 20;
 
-    // Array of optional opaque pointers via typedef
-    OptOpaque[2] slots;
-    slots[0] = @ptrcast(*opaque, d0);
-    slots[1] = @ptrcast(*opaque, d1);
+    // Array of optional pointers — native syntax
+    ?*Device[2] slots;
+    slots[0] = d0;
+    slots[1] = d1;
 
-    // Retrieve and cast back
-    *opaque raw0 = slots[0] orelse return;
-    *Device r0 = @ptrcast(*Device, raw0);
+    // Retrieve via unwrap
+    *Device r0 = slots[0] orelse return;
     if (r0.status != 10) { return 1; }
 
-    *opaque raw1 = slots[1] orelse return;
-    *Device r1 = @ptrcast(*Device, raw1);
+    *Device r1 = slots[1] orelse return;
     if (r1.status != 20) { return 2; }
 
     return 0;

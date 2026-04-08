@@ -1,0 +1,18 @@
+// Rust source: tests/ui/threads-sendsync/task-comm-chan-nil.rs
+// Send unit () through channel — trivial message.
+// ZER: Ring with single-field struct (minimal message)
+
+struct Unit { u8 dummy; }
+
+Ring(Unit, 4) chan;
+
+u32 main() {
+    Unit msg;
+    msg.dummy = 1;
+    chan.push(msg);
+
+    ?Unit result = chan.pop();
+    Unit got = result orelse return;
+    if (got.dummy != 1) { return 1; }
+    return 0;
+}

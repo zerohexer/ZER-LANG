@@ -1,0 +1,27 @@
+// Rust pattern: const fn for generic capacity
+// ZER: comptime function as Pool/array size
+
+comptime u32 MAX_TASKS() { return 8; }
+comptime u32 BUF_SIZE() { return 4 * MAX_TASKS(); }
+
+struct Task { u32 id; }
+Pool(Task, MAX_TASKS()) tasks;
+
+u8[BUF_SIZE()] buffer;
+
+u32 main() {
+    // Pool has 8 slots
+    ?Handle(Task) mh = tasks.alloc();
+    Handle(Task) h = mh orelse return;
+    tasks.get(h).id = 42;
+    if (tasks.get(h).id != 42) { return 1; }
+    tasks.free(h);
+
+    // Buffer has 32 bytes
+    buffer[0] = 1;
+    buffer[31] = 2;
+    if (buffer[0] != 1) { return 2; }
+    if (buffer[31] != 2) { return 3; }
+
+    return 0;
+}

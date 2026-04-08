@@ -1,0 +1,11 @@
+// Rust source: tests/ui/consts/const-call.rs
+// Cannot call non-const function in const context.
+// ZER: cannot use runtime function as array size
+// EXPECTED: compile error
+
+u32 f(u32 x) { return x; }
+
+u32 main() {
+    u32[f(2)] arr;
+    return 0;
+}

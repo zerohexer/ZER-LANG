@@ -1,0 +1,19 @@
+// Rust pattern: reassigning owned value without dropping = leak.
+// ZER: overwriting ALIVE handle = compile error (first handle leaked).
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 main() {
+    ?Handle(Task) m1 = pool.alloc();
+    Handle(Task) h = m1 orelse return;
+    pool.get(h).id = 1;
+
+    // Overwrite without freeing first — leak!
+    ?Handle(Task) m2 = pool.alloc();
+    h = m2 orelse return;   // ERROR: h was ALIVE, now overwritten
+    pool.get(h).id = 2;
+    pool.free(h);
+    return 0;
+}

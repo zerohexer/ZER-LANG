@@ -1,0 +1,11 @@
+// Rust pattern: discarding allocation result = resource leak.
+// ZER: pool.alloc() as bare expression = compile error (ghost handle).
+// EXPECTED: compile error
+
+struct Widget { u32 x; }
+Pool(Widget, 4) pool;
+
+u32 main() {
+    pool.alloc();   // ERROR: ghost handle — allocation result discarded
+    return 0;
+}

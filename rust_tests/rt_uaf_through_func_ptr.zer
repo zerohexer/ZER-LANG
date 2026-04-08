@@ -1,0 +1,23 @@
+// Rust pattern: UAF through function pointer callback after free.
+// ZER: zercheck tracks freed state across callback invocation.
+// EXPECTED: compile error
+
+struct Device { u32 id; }
+Slab(Device) devices;
+
+void reset_device(*Device d) {
+    devices.free_ptr(d);
+}
+
+u32 main() {
+    ?*Device md = devices.alloc_ptr();
+    *Device d = md orelse return;
+    d.id = 10;
+
+    void (*callback)(*Device) = reset_device;
+    callback(d);
+
+    // d freed by callback — UAF
+    u32 val = d.id;
+    return val;
+}

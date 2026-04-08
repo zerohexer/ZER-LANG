@@ -1,0 +1,30 @@
+// Rust pattern: nested type erasure — struct containing *opaque.
+// ZER: *opaque in struct field with provenance tracking.
+
+struct Wrapper {
+    *opaque inner;
+    u32 type_tag;
+}
+
+struct Payload { u32 x; u32 y; }
+
+u32 unwrap_and_sum(Wrapper w) {
+    if (w.type_tag != 1) { return 0; }
+    *Payload p = @ptrcast(*Payload, w.inner);
+    return p.x + p.y;
+}
+
+u32 main() {
+    Payload data;
+    data.x = 30;
+    data.y = 12;
+
+    Wrapper w;
+    w.inner = @ptrcast(*opaque, &data);
+    w.type_tag = 1;
+
+    u32 result = unwrap_and_sum(w);
+    if (result != 42) { return 1; }
+
+    return 0;
+}

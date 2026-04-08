@@ -1,0 +1,42 @@
+// Rust pattern: trait object through multiple layers of indirection.
+// ZER: *opaque provenance tracked through function call chain.
+
+struct Engine { u32 hp; }
+struct Chassis { u32 weight; }
+
+u32 get_power(*opaque ctx) {
+    *Engine e = @ptrcast(*Engine, ctx);
+    return e.hp;
+}
+
+u32 get_weight(*opaque ctx) {
+    *Chassis c = @ptrcast(*Chassis, ctx);
+    return c.weight;
+}
+
+u32 compute(*opaque ctx, u32 (*reader)(*opaque)) {
+    return reader(ctx);
+}
+
+u32 main() {
+    Engine eng;
+    eng.hp = 200;
+    Chassis body;
+    body.weight = 1500;
+
+    *opaque e_ctx = @ptrcast(*opaque, &eng);
+    *opaque c_ctx = @ptrcast(*opaque, &body);
+
+    u32 power = compute(e_ctx, get_power);
+    u32 weight = compute(c_ctx, get_weight);
+
+    if (power != 200) { return 1; }
+    if (weight != 1500) { return 2; }
+
+    // Power-to-weight ratio (guard for div safety)
+    if (power == 0) { return 3; }
+    u32 ratio = weight / power;
+    if (ratio != 7) { return 4; }
+
+    return 0;
+}

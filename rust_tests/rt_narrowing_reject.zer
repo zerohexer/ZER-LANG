@@ -1,0 +1,9 @@
+// Rust pattern: implicit narrowing conversion rejected.
+// ZER: narrowing without @truncate = compile error.
+// EXPECTED: compile error
+
+u32 main() {
+    u32 big = 1000;
+    u8 small = big;   // ERROR: narrowing u32 → u8 requires @truncate
+    return small;
+}

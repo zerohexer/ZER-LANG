@@ -1,0 +1,36 @@
+// Rust pattern: callback with *opaque context — full lifecycle.
+// ZER: register callback, invoke it, cleanup properly.
+
+struct Timer { u32 interval; u32 count; }
+
+void timer_tick(*opaque ctx) {
+    *Timer t = @ptrcast(*Timer, ctx);
+    t.count += 1;
+}
+
+struct Callback {
+    *opaque ctx;
+    void (*handler)(*opaque);
+}
+
+u32 main() {
+    Timer t;
+    t.interval = 100;
+    t.count = 0;
+
+    Callback cb;
+    cb.ctx = @ptrcast(*opaque, &t);
+    cb.handler = timer_tick;
+
+    // Simulate 5 ticks
+    cb.handler(cb.ctx);
+    cb.handler(cb.ctx);
+    cb.handler(cb.ctx);
+    cb.handler(cb.ctx);
+    cb.handler(cb.ctx);
+
+    if (t.count != 5) { return 1; }
+    if (t.interval != 100) { return 2; }
+
+    return 0;
+}

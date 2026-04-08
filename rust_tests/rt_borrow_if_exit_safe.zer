@@ -1,0 +1,33 @@
+// Rust pattern: free in if-branch that always returns is safe.
+// ZER: if-exit free does NOT cause MAYBE_FREED on continuation.
+
+struct Resource { u32 id; }
+Pool(Resource, 4) pool;
+
+u32 process(bool error) {
+    ?Handle(Resource) mr = pool.alloc();
+    Handle(Resource) h = mr orelse return;
+    pool.get(h).id = 42;
+
+    if (error) {
+        pool.free(h);
+        return 1;
+    }
+
+    // h still ALIVE here — the freeing branch exits
+    u32 result = pool.get(h).id;
+    pool.free(h);
+    return result;
+}
+
+u32 main() {
+    // Normal path — should return 42
+    u32 r = process(false);
+    if (r != 42) { return 1; }
+
+    // Error path — should return 1
+    u32 e = process(true);
+    if (e != 1) { return 2; }
+
+    return 0;
+}

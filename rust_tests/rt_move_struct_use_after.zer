@@ -1,0 +1,22 @@
+// Rust pattern: use struct after passing to consuming function.
+// ZER: cross-function free summary marks handle FREED.
+// EXPECTED: compile error
+
+struct Msg { u32 code; u32 data; }
+Pool(Msg, 4) pool;
+
+void consume(Handle(Msg) h) {
+    pool.free(h);
+}
+
+u32 main() {
+    ?Handle(Msg) mm = pool.alloc();
+    Handle(Msg) h = mm orelse return;
+    pool.get(h).code = 42;
+
+    consume(h);
+
+    // h freed by consume — use after free
+    u32 val = pool.get(h).code;
+    return val;
+}

@@ -1,0 +1,15 @@
+// Rust pattern: use handle after pool.free.
+// ZER: pool.get on freed handle = compile error.
+// EXPECTED: compile error
+
+struct Job { u32 priority; }
+Pool(Job, 4) jobs;
+
+u32 main() {
+    ?Handle(Job) mj = jobs.alloc();
+    Handle(Job) h = mj orelse return;
+    jobs.get(h).priority = 5;
+    jobs.free(h);
+    u32 p = jobs.get(h).priority;   // UAF
+    return p;
+}

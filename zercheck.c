@@ -1096,10 +1096,20 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     }
                 }
                 /* Handle aliasing via assignment: alias = tracked_handle
-                 * BUG-357: supports arr[0] = h, s.h = other_h, etc. */
+                 * BUG-357: supports arr[0] = h, s.h = other_h, etc.
+                 * BUG-462: unwrap orelse/ptrcast/typecast to find source ident
+                 * (ents[0] = m0 orelse return → source is m0, not the orelse node) */
                 {
+                    Node *alias_val = node->assign.value;
+                    while (alias_val) {
+                        if (alias_val->kind == NODE_ORELSE) alias_val = alias_val->orelse.expr;
+                        else if (alias_val->kind == NODE_INTRINSIC && alias_val->intrinsic.arg_count > 0)
+                            alias_val = alias_val->intrinsic.args[alias_val->intrinsic.arg_count - 1];
+                        else if (alias_val->kind == NODE_TYPECAST) alias_val = alias_val->typecast.expr;
+                        else break;
+                    }
                     char skey[128];
-                    int sklen = handle_key_from_expr(node->assign.value, skey, sizeof(skey));
+                    int sklen = handle_key_from_expr(alias_val, skey, sizeof(skey));
                     if (sklen > 0) {
                         HandleInfo *src = find_handle(ps, skey, (uint32_t)sklen);
                         if (src) {

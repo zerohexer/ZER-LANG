@@ -1,0 +1,44 @@
+// BUG-462: Handle array with constant indices — compile-time tracked.
+// Previously failed: zercheck didn't unwrap orelse in assignment aliasing,
+// so ents[0] = m0 orelse return didn't create the alias.
+
+struct Entity { u32 id; u32 hp; }
+Pool(Entity, 8) pool;
+
+u32 main() {
+    Handle(Entity)[4] ents;
+
+    ?Handle(Entity) m0 = pool.alloc();
+    ents[0] = m0 orelse return;
+    pool.get(ents[0]).id = 0;
+    pool.get(ents[0]).hp = 100;
+
+    ?Handle(Entity) m1 = pool.alloc();
+    ents[1] = m1 orelse return;
+    pool.get(ents[1]).id = 1;
+    pool.get(ents[1]).hp = 80;
+
+    ?Handle(Entity) m2 = pool.alloc();
+    ents[2] = m2 orelse return;
+    pool.get(ents[2]).id = 2;
+    pool.get(ents[2]).hp = 60;
+
+    ?Handle(Entity) m3 = pool.alloc();
+    ents[3] = m3 orelse return;
+    pool.get(ents[3]).id = 3;
+    pool.get(ents[3]).hp = 40;
+
+    // Verify all
+    if (pool.get(ents[0]).hp != 100) { return 1; }
+    if (pool.get(ents[1]).hp != 80) { return 2; }
+    if (pool.get(ents[2]).hp != 60) { return 3; }
+    if (pool.get(ents[3]).hp != 40) { return 4; }
+
+    // Free all via constant indices — compile-time tracked
+    pool.free(ents[0]);
+    pool.free(ents[1]);
+    pool.free(ents[2]);
+    pool.free(ents[3]);
+
+    return 0;
+}

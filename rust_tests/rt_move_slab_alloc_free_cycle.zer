@@ -1,0 +1,32 @@
+// Rust pattern: alloc/free cycle reuses memory.
+// ZER: Slab reuses freed slots — safe lifecycle test.
+
+struct Node { u32 value; u32 next; }
+Slab(Node) heap;
+
+u32 main() {
+    // Cycle 1: alloc, use, free
+    ?*Node m1 = heap.alloc_ptr();
+    *Node n1 = m1 orelse return;
+    n1.value = 10;
+    heap.free_ptr(n1);
+
+    // Cycle 2: alloc reuses freed slot
+    ?*Node m2 = heap.alloc_ptr();
+    *Node n2 = m2 orelse return;
+    n2.value = 20;
+
+    if (n2.value != 20) { return 1; }
+
+    heap.free_ptr(n2);
+
+    // Cycle 3: another reuse
+    ?*Node m3 = heap.alloc_ptr();
+    *Node n3 = m3 orelse return;
+    n3.value = 30;
+
+    if (n3.value != 30) { return 2; }
+
+    heap.free_ptr(n3);
+    return 0;
+}

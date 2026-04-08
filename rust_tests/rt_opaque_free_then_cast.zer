@@ -1,0 +1,19 @@
+// Rust pattern: free *opaque then cast back.
+// ZER: @ptrcast on freed *opaque = compile error.
+// EXPECTED: compile error
+
+struct Buffer { u32 size; }
+Slab(Buffer) heap;
+
+u32 main() {
+    ?*Buffer mb = heap.alloc_ptr();
+    *Buffer b = mb orelse return;
+    b.size = 1024;
+
+    *opaque raw = @ptrcast(*opaque, b);
+    heap.free_ptr(b);
+
+    // Cast freed *opaque back — UAF
+    *Buffer recovered = @ptrcast(*Buffer, raw);
+    return recovered.size;
+}

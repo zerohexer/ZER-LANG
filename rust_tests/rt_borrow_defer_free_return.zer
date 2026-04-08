@@ -1,0 +1,22 @@
+// Rust pattern: Drop fires before return value evaluated.
+// ZER: defer + return expression — return expr evaluated BEFORE defers.
+
+struct Counter { u32 value; }
+Pool(Counter, 4) pool;
+
+u32 get_and_cleanup() {
+    ?Handle(Counter) mc = pool.alloc();
+    Handle(Counter) h = mc orelse return;
+    defer pool.free(h);
+
+    pool.get(h).value = 77;
+
+    // Return expression evaluated BEFORE defer fires (BUG-442 fixed)
+    return pool.get(h).value;
+}
+
+u32 main() {
+    u32 result = get_and_cleanup();
+    if (result != 77) { return 1; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// Rust pattern: out of bounds MMIO register access.
+// ZER: mmio range check — index beyond declared range = compile error.
+// EXPECTED: compile error
+
+mmio 0x40020000..0x4002001F;
+
+u32 main() {
+    volatile *u32 gpio = @inttoptr(*u32, 0x40020000);
+    // Range is 32 bytes = 8 u32 slots (indices 0-7)
+    gpio[8] = 0xFF;   // ERROR: index 8 >= bound 8
+    return 0;
+}

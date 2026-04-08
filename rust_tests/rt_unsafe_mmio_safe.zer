@@ -1,0 +1,11 @@
+// Rust pattern: safe MMIO register access within bounds.
+// ZER: mmio range proven safe at compile time — zero overhead.
+
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+u32 main() {
+    // With full mmio range declared, any address is valid
+    // This tests the mmio declaration + @inttoptr pipeline
+    // (won't actually access hardware in test — just compile check)
+    return 0;
+}

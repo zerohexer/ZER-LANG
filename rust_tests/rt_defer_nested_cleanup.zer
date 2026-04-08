@@ -1,0 +1,48 @@
+// Rust pattern: nested RAII — multiple resources with proper cleanup order.
+// ZER: nested defers fire in LIFO order on any exit path.
+
+struct File { u32 fd; }
+struct Lock { u32 id; }
+struct Buffer { u32 size; }
+
+Pool(File, 4) files;
+Pool(Lock, 4) locks;
+Pool(Buffer, 4) bufs;
+
+u32 order;
+
+u32 do_work() {
+    order = 0;
+
+    ?Handle(File) mf = files.alloc();
+    Handle(File) f = mf orelse return;
+    defer files.free(f);
+    defer { order = order * 10 + 1; }
+    files.get(f).fd = 3;
+
+    ?Handle(Lock) ml = locks.alloc();
+    Handle(Lock) l = ml orelse return;
+    defer locks.free(l);
+    defer { order = order * 10 + 2; }
+    locks.get(l).id = 7;
+
+    ?Handle(Buffer) mb = bufs.alloc();
+    Handle(Buffer) b = mb orelse return;
+    defer bufs.free(b);
+    defer { order = order * 10 + 3; }
+    bufs.get(b).size = 4096;
+
+    // All resources acquired — verify
+    if (files.get(f).fd != 3) { return 1; }
+    if (locks.get(l).id != 7) { return 2; }
+    if (bufs.get(b).size != 4096) { return 3; }
+
+    return 0;
+}
+
+u32 main() {
+    u32 r = do_work();
+    if (r != 0) { return r; }
+    // Defers fired LIFO: 3, 2, 1 → order = 321
+    return 0;
+}

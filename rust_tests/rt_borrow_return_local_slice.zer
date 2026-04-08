@@ -1,0 +1,18 @@
+// Rust pattern: returning slice of local array = dangling.
+// ZER: scope escape analysis catches local array → slice return.
+// EXPECTED: compile error
+
+[*]u8 get_data() {
+    u8[4] buf;
+    buf[0] = 1;
+    buf[1] = 2;
+    buf[2] = 3;
+    buf[3] = 4;
+    [*]u8 s = buf;
+    return s;   // ERROR: slice points to local array
+}
+
+u32 main() {
+    [*]u8 data = get_data();
+    return 0;
+}

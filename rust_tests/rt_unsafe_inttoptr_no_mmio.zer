@@ -1,0 +1,9 @@
+// Rust pattern: unsafe raw pointer creation from integer.
+// ZER: @inttoptr without mmio declaration = compile error.
+// EXPECTED: compile error
+
+u32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40020000);
+    u32 val = reg[0];
+    return val;
+}

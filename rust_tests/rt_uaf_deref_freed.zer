@@ -1,0 +1,19 @@
+// Rust pattern: dereference freed pointer.
+// ZER: deref after free_ptr = compile error.
+// EXPECTED: compile error
+
+struct Packet { u32 seq; u32 len; }
+Slab(Packet) packets;
+
+u32 main() {
+    ?*Packet mp = packets.alloc_ptr();
+    *Packet p = mp orelse return;
+    p.seq = 1;
+    p.len = 64;
+
+    packets.free_ptr(p);
+
+    // Dereference freed pointer
+    *Packet alias = p;
+    return alias.seq;
+}

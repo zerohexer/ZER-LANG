@@ -1,0 +1,18 @@
+// Rust source: tests/ui/consts/const-fn-const-eval.rs
+// const fn used in array size — compile-time function evaluation.
+// ZER: comptime function used in array size
+
+comptime u32 add(u32 x, u32 y) { return x + y; }
+
+u32[add(2, 3)] arr;
+
+u32 main() {
+    // Array has 5 elements (add(2,3) = 5)
+    arr[0] = 10;
+    arr[1] = 20;
+    arr[2] = 30;
+    arr[3] = 40;
+    arr[4] = 50;
+    if (arr[4] != 50) { return 1; }
+    return 0;
+}

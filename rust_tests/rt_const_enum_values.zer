@@ -1,0 +1,35 @@
+// Rust source: tests/ui/consts/const-big-enum.rs
+// Enum with explicit values, static matching.
+// ZER: enum with values, switch verification
+
+enum Foo { bar = 10, baz = 20, quux = 30 }
+
+u32 main() {
+    Foo x = Foo.bar;
+    Foo y = Foo.baz;
+    Foo z = Foo.quux;
+
+    u32 result = 0;
+    switch (x) {
+        .bar => { result = 10; }
+        .baz => { result = 20; }
+        .quux => { result = 30; }
+    }
+    if (result != 10) { return 1; }
+
+    switch (y) {
+        .bar => { result = 10; }
+        .baz => { result = 20; }
+        .quux => { result = 30; }
+    }
+    if (result != 20) { return 2; }
+
+    switch (z) {
+        .bar => { result = 10; }
+        .baz => { result = 20; }
+        .quux => { result = 30; }
+    }
+    if (result != 30) { return 3; }
+
+    return 0;
+}

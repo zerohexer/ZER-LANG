@@ -1,0 +1,14 @@
+// Rust source: tests/ui/consts/const-contents.rs
+// Static constants evaluated at compile time.
+// ZER: const globals (shift inside function — global shift is known limitation)
+
+const u32 ADD = 1 + 2;
+const i32 NEG = -(1);
+
+u32 main() {
+    u32 lsl = 1 << 2;
+    if (lsl != 4) { return 1; }
+    if (ADD != 3) { return 2; }
+    if (NEG != -1) { return 3; }
+    return 0;
+}

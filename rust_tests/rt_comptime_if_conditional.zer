@@ -1,0 +1,24 @@
+// Rust pattern: #[cfg] conditional compilation
+// ZER: comptime if — conditional compilation
+
+comptime u32 PLATFORM() { return 1; }
+
+u32 main() {
+    u32 result = 0;
+
+    comptime if (PLATFORM()) {
+        result = 42;
+    } else {
+        result = 99;
+    }
+
+    if (result != 42) { return 1; }
+
+    comptime if (0) {
+        // Dead branch — not compiled
+        result = 999;
+    }
+
+    if (result != 42) { return 2; }
+    return 0;
+}

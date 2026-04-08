@@ -1,0 +1,13 @@
+// Rust source: tests/ui/consts/const-array-oob.rs
+// Compile-time array OOB detection on const array.
+// ZER: compile-time bounds check on constant index
+// EXPECTED: compile error
+
+u32 main() {
+    u32[3] arr;
+    arr[0] = 1;
+    arr[1] = 2;
+    arr[2] = 3;
+    u32 x = arr[5];
+    return x;
+}

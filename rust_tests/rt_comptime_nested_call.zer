@@ -1,0 +1,24 @@
+// Rust pattern: const fn calling another const fn
+// ZER: comptime functions with nested calls
+
+comptime u32 square(u32 x) { return x * x; }
+comptime u32 double(u32 x) { return x * 2; }
+comptime u32 quad(u32 x) { return double(double(x)); }
+comptime u32 combined(u32 x) { return square(x) + double(x); }
+
+u32 main() {
+    u32 a = square(5);
+    if (a != 25) { return 1; }
+
+    u32 b = double(7);
+    if (b != 14) { return 2; }
+
+    u32 c = quad(3);
+    if (c != 12) { return 3; }
+
+    u32 d = combined(4);
+    // square(4) + double(4) = 16 + 8 = 24
+    if (d != 24) { return 4; }
+
+    return 0;
+}

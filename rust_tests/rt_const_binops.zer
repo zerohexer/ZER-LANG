@@ -1,0 +1,29 @@
+// Rust source: tests/ui/consts/const-binops.rs
+// Compile-time binary operations on constants.
+// ZER: const globals with comptime arithmetic (no shift in global — known limitation)
+
+const u32 ADD = 1 + 2;
+const u32 SUB = 10 - 3;
+const u32 MUL = 4 * 5;
+const u32 DIV = 20 / 4;
+const u32 MOD = 17 % 5;
+const u32 BOR = 0x0F | 0xF0;
+const u32 BAND = 0xFF & 0x0F;
+const u32 BXOR = 0xFF ^ 0x0F;
+
+u32 main() {
+    if (ADD != 3) { return 1; }
+    if (SUB != 7) { return 2; }
+    if (MUL != 20) { return 3; }
+    if (DIV != 5) { return 4; }
+    if (MOD != 2) { return 5; }
+    if (BOR != 0xFF) { return 6; }
+    if (BAND != 0x0F) { return 7; }
+    if (BXOR != 0xF0) { return 8; }
+
+    // Shift works inside functions (statement expr OK)
+    u32 lsl = 1 << 2;
+    if (lsl != 4) { return 9; }
+
+    return 0;
+}

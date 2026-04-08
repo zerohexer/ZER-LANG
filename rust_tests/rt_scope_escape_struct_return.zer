@@ -1,0 +1,22 @@
+// rt_scope_escape_struct_return.zer
+// Scope escape via struct return: Struct with *u32 field, fill from local, return struct.
+// → scope escape error. NEGATIVE.
+// EXPECTED: compile error
+
+struct Box {
+    *u32 inner;
+    u32 tag;
+}
+
+Box make_box() {
+    u32 local_val = 42;
+    Box b;
+    b.inner = &local_val;  // pointer to local
+    b.tag = 1;
+    return b;  // escapes: b.inner points to local that goes out of scope
+}
+
+i32 main() {
+    Box b = make_box();
+    return 0;
+}

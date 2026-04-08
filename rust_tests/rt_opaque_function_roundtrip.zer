@@ -1,0 +1,25 @@
+// Rust pattern: Box<dyn Any> → downcast through function boundary
+// ZER: *opaque round-trip through function with provenance
+
+struct Sensor { u32 reading; }
+Slab(Sensor) heap;
+
+*opaque wrap(*Sensor s) {
+    return @ptrcast(*opaque, s);
+}
+
+*Sensor unwrap(*opaque raw) {
+    return @ptrcast(*Sensor, raw);
+}
+
+u32 main() {
+    ?*Sensor ms = heap.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer heap.free_ptr(s);
+
+    s.reading = 42;
+    *opaque ctx = wrap(s);
+    *Sensor back = unwrap(ctx);
+    if (back.reading != 42) { return 1; }
+    return 0;
+}

@@ -1,0 +1,20 @@
+// rt_borrowck_borrow_from_temporary.zer
+// Translated from: borrowck-borrow-from-temporary.rs
+// Rust: return &id(Foo(3)).field → "cannot return reference to temporary."
+// ZER: returning pointer to local struct = scope escape error. NEGATIVE.
+// EXPECTED: compile error
+
+struct Foo {
+    u32 value;
+}
+
+*u32 get_field_ptr() {
+    Foo local;
+    local.value = 3;
+    return &local.value;
+}
+
+i32 main() {
+    *u32 p = get_field_ptr();
+    return 0;
+}

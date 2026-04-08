@@ -1,0 +1,35 @@
+// Rust pattern: Two threads alternate via Condvar signaling
+// ZER: shared struct with turn flag, two threads alternate
+
+shared struct PingPong { u32 turn; u32 count; }
+PingPong pp;
+
+void player_a(*PingPong p) {
+    for (u32 i = 0; i < 3; i += 1) {
+        @cond_wait(p, p.turn == 0);
+        p.count += 1;
+        p.turn = 1;
+        @cond_signal(p);
+    }
+}
+
+void player_b(*PingPong p) {
+    for (u32 i = 0; i < 3; i += 1) {
+        @cond_wait(p, p.turn == 1);
+        p.count += 1;
+        p.turn = 0;
+        @cond_signal(p);
+    }
+}
+
+u32 main() {
+    pp.turn = 0;
+    pp.count = 0;
+    ThreadHandle ta = spawn player_a(&pp);
+    ThreadHandle tb = spawn player_b(&pp);
+    ta.join();
+    tb.join();
+    u32 c = pp.count;
+    if (c != 6) { return 1; }
+    return 0;
+}

@@ -1,0 +1,15 @@
+// Rust pattern: borrowck-block-uninit.rs — use uninitialized var = error
+// ZER: auto-zero — uninitialized variables are 0 (SAFER than Rust)
+
+u32 main() {
+    u32 x;
+    if (x != 0) { return 1; }
+
+    u8 y;
+    if (y != 0) { return 2; }
+
+    bool b;
+    if (b) { return 3; }
+
+    return 0;
+}

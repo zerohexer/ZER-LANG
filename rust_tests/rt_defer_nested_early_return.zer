@@ -1,0 +1,27 @@
+// Rust pattern: Drop fires on early return from nested scope
+// ZER: defer + early return from inner if
+
+struct Res { u32 data; }
+Pool(Res, 4) pool;
+
+u32 process(bool fail) {
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).data = 42;
+
+    if (fail) {
+        return 1;
+    }
+
+    if (pool.get(h).data != 42) { return 2; }
+    return 0;
+}
+
+u32 main() {
+    u32 r1 = process(false);
+    if (r1 != 0) { return 1; }
+    u32 r2 = process(true);
+    if (r2 != 1) { return 2; }
+    return 0;
+}

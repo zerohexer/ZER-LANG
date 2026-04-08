@@ -1,0 +1,19 @@
+// Rust pattern: Box reuse after drop — same memory recycled
+// ZER: Pool free then alloc reuses same slot
+
+struct Slot { u32 data; }
+Pool(Slot, 2) pool;
+
+u32 main() {
+    ?Handle(Slot) ma = pool.alloc();
+    Handle(Slot) a = ma orelse return;
+    pool.get(a).data = 42;
+    pool.free(a);
+
+    ?Handle(Slot) mb = pool.alloc();
+    Handle(Slot) b = mb orelse return;
+    pool.get(b).data = 99;
+    if (pool.get(b).data != 99) { return 1; }
+    pool.free(b);
+    return 0;
+}

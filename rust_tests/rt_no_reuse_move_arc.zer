@@ -1,0 +1,30 @@
+// rt_no_reuse_move_arc.zer
+// Translated from: no-reuse-move-arc.rs
+// Rust: Arc moved into closure, used after → error.
+// ZER: shared struct pointer passed to spawn, original still usable (auto-locked). POSITIVE.
+
+shared struct Counter {
+    u32 value;
+}
+
+Counter g_counter;
+
+void increment(*Counter c) {
+    c.value += 1;
+}
+
+i32 main() {
+    g_counter.value = 0;
+
+    // Both spawned threads share &g_counter — auto-locked, no data race
+    ThreadHandle th1 = spawn increment(&g_counter);
+    ThreadHandle th2 = spawn increment(&g_counter);
+    th1.join();
+    th2.join();
+
+    // Original g_counter still accessible — shared, not moved
+    if (g_counter.value == 2) {
+        return 0;
+    }
+    return 1;
+}

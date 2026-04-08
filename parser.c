@@ -1975,10 +1975,27 @@ static Node *parse_declaration(Parser *p) {
         return n;
     }
 
-    /* struct / packed struct / shared struct */
+    /* struct / packed struct / shared struct / move struct */
     if (match(p, TOK_PACKED)) {
         consume(p, TOK_STRUCT, "expected 'struct' after 'packed'");
         return parse_struct_decl(p, true);
+    }
+    /* move struct — contextual keyword (not reserved — 'move' is 4 chars) */
+    if (check(p, TOK_IDENT) && p->current.length == 4 &&
+        memcmp(p->current.start, "move", 4) == 0) {
+        Scanner saved_s = *p->scanner;
+        Token saved_c = p->current;
+        Token saved_p = p->previous;
+        advance(p);
+        if (check(p, TOK_STRUCT)) {
+            advance(p);
+            Node *n = parse_struct_decl(p, false);
+            n->struct_decl.is_move = true;
+            return n;
+        }
+        *p->scanner = saved_s;
+        p->current = saved_c;
+        p->previous = saved_p;
     }
     if (match(p, TOK_SHARED)) {
         /* shared struct or shared(rw) struct */

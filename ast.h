@@ -279,6 +279,7 @@ struct Node {
             bool is_packed;
             bool is_shared;
             bool is_shared_rw;      /* shared(rw) — reader-writer lock */
+            bool is_move;           /* move struct — ownership transfer on pass/assign */
         } struct_decl;
 
         /* NODE_ENUM_DECL: enum State { idle, running, ... } */

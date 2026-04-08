@@ -6839,6 +6839,7 @@ static void register_decl(Checker *c, Node *node) {
         t->struct_type.is_packed = node->struct_decl.is_packed;
         t->struct_type.is_shared = node->struct_decl.is_shared;
         t->struct_type.is_shared_rw = node->struct_decl.is_shared_rw;
+        t->struct_type.is_move = node->struct_decl.is_move;
         t->struct_type.field_count = (uint32_t)node->struct_decl.field_count;
         t->struct_type.type_id = c->next_type_id++;
         t->struct_type.module_prefix = c->current_module;

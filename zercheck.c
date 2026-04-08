@@ -174,8 +174,11 @@ static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
     return 0;
 }
 
-/* forward declaration for use in zc_check_expr */
+/* forward declarations */
 static FuncSummary *find_summary(ZerCheck *zc, const char *name, uint32_t name_len);
+static bool is_move_struct_type(Type *t);
+static HandleInfo *zc_ensure_move_registered(ZerCheck *zc, PathState *ps,
+                                              const char *name, uint32_t len, int line);
 
 /* ---- *opaque alloc/free detection (Level 1) ---- */
 
@@ -864,6 +867,33 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             }
         }
     }
+
+    /* Move struct transfer handled AFTER zc_check_expr in zc_check_stmt(NODE_VAR_DECL)
+     * to avoid false positive (source checked as ALIVE during expr walk). */
+}
+
+/* Check if a type is a move struct */
+static bool is_move_struct_type(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
+}
+
+/* Lazily register a move struct variable in PathState if not already tracked.
+ * Called when we encounter a NODE_IDENT whose type is a move struct. */
+static HandleInfo *zc_ensure_move_registered(ZerCheck *zc, PathState *ps,
+                                              const char *name, uint32_t len, int line) {
+    HandleInfo *h = find_handle(ps, name, len);
+    if (h) return h;
+    h = add_handle(ps, name, len);
+    if (h) {
+        h->state = HS_ALIVE;
+        h->pool_id = -3;
+        h->alloc_line = line;
+        h->alloc_id = zc->next_alloc_id++;
+        h->source_color = ZC_COLOR_UNKNOWN;
+    }
+    return h;
 }
 
 static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
@@ -978,6 +1008,9 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
             if (!is_free_site) {
+                /* Two passes: first check+recurse, then transfer.
+                 * Can't transfer during check — NODE_IDENT recurse would see
+                 * the arg as already-transferred (false positive). */
                 for (int i = 0; i < node->call.arg_count; i++) {
                     Node *arg = node->call.args[i];
                     if (arg && arg->kind == NODE_IDENT) {
@@ -992,9 +1025,37 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                     ah->state == HS_FREED ? "freed" : "may have been freed",
                                     ah->free_line);
                             }
+                            /* Move struct: check use-after-transfer */
+                            if (!ah) {
+                                Type *arg_type = checker_get_type(zc->checker, arg);
+                                if (arg_type && is_move_struct_type(arg_type))
+                                    ah = zc_ensure_move_registered(zc, ps,
+                                        arg->ident.name, (uint32_t)arg->ident.name_len,
+                                        node->loc.line);
+                            }
+                            if (ah && ah->state == HS_TRANSFERRED && ah->pool_id == -3) {
+                                zc_error(zc, node->loc.line,
+                                    "use after move: '%.*s' ownership transferred at line %d",
+                                    aklen, akey, ah->transfer_line);
+                            }
                         }
                     }
                     zc_check_expr(zc, ps, arg);
+                }
+                /* Second pass: mark move struct args as transferred AFTER check */
+                for (int i = 0; i < node->call.arg_count; i++) {
+                    Node *arg = node->call.args[i];
+                    if (arg && arg->kind == NODE_IDENT) {
+                        char akey[128];
+                        int aklen = handle_key_from_expr(arg, akey, sizeof(akey));
+                        if (aklen > 0) {
+                            HandleInfo *ah = find_handle(ps, akey, (uint32_t)aklen);
+                            if (ah && ah->state == HS_ALIVE && ah->pool_id == -3) {
+                                ah->state = HS_TRANSFERRED;
+                                ah->transfer_line = node->loc.line;
+                            }
+                        }
+                    }
                 }
             } else {
                 for (int i = 0; i < node->call.arg_count; i++)
@@ -1125,6 +1186,50 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                                     dst->free_line = src->free_line;
                                     dst->alloc_id = src->alloc_id;
                             dst->source_color = src->source_color;
+                                }
+                            }
+                        }
+                    }
+                }
+                /* Move struct: assignment transfers ownership from source.
+                 * y = x where x is a move struct → x becomes HS_TRANSFERRED.
+                 * y is registered as new ALIVE owner. */
+                {
+                    Node *alias_val = node->assign.value;
+                    while (alias_val) {
+                        if (alias_val->kind == NODE_ORELSE) alias_val = alias_val->orelse.expr;
+                        else break;
+                    }
+                    if (alias_val && alias_val->kind == NODE_IDENT) {
+                        char skey[128];
+                        int sklen = handle_key_from_expr(alias_val, skey, sizeof(skey));
+                        if (sklen > 0) {
+                            HandleInfo *src = find_handle(ps, skey, (uint32_t)sklen);
+                            /* Lazy-register if this is a move struct we haven't seen yet */
+                            if (!src) {
+                                Type *val_type = checker_get_type(zc->checker, alias_val);
+                                if (val_type && is_move_struct_type(val_type)) {
+                                    src = zc_ensure_move_registered(zc, ps,
+                                        alias_val->ident.name, (uint32_t)alias_val->ident.name_len,
+                                        node->loc.line);
+                                }
+                            }
+                            if (src && src->pool_id == -3 && src->state == HS_ALIVE) {
+                                /* Source is a move struct — transfer ownership */
+                                src->state = HS_TRANSFERRED;
+                                src->transfer_line = node->loc.line;
+                                /* Register target as new owner */
+                                char *akey = (char *)arena_alloc(zc->arena, tklen + 1);
+                                if (akey) {
+                                    memcpy(akey, tkey, tklen + 1);
+                                    HandleInfo *dst = find_handle(ps, akey, (uint32_t)tklen);
+                                    if (!dst) dst = add_handle(ps, akey, (uint32_t)tklen);
+                                    if (dst) {
+                                        dst->state = HS_ALIVE;
+                                        dst->pool_id = -3;
+                                        dst->alloc_line = src->alloc_line;
+                                        dst->alloc_id = src->alloc_id;
+                                    }
                                 }
                             }
                         }
@@ -1344,10 +1449,26 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_SLICE:
         zc_check_expr(zc, ps, node->slice.object);
         break;
+    case NODE_IDENT:
+        /* Move struct: lazy registration + use-after-transfer check */
+        {
+            Type *ident_type = checker_get_type(zc->checker, node);
+            if (ident_type && is_move_struct_type(ident_type)) {
+                const char *iname = node->ident.name;
+                uint32_t ilen = (uint32_t)node->ident.name_len;
+                HandleInfo *h = zc_ensure_move_registered(zc, ps, iname, ilen, node->loc.line);
+                if (h && h->state == HS_TRANSFERRED) {
+                    zc_error(zc, node->loc.line,
+                        "use after move: '%.*s' ownership transferred at line %d",
+                        (int)ilen, iname, h->transfer_line);
+                }
+            }
+        }
+        break;
     /* Leaf expressions — no children with handle state */
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_CAST: case NODE_SIZEOF:
     /* Statements — handled by zc_check_stmt, not zc_check_expr */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
@@ -1425,6 +1546,35 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         zc_check_var_init(zc, ps, node);
         if (node->var_decl.init)
             zc_check_expr(zc, ps, node->var_decl.init);
+        /* Move struct transfer AFTER expr check to avoid false positive:
+         * Token b = a; — zc_check_expr sees a as ALIVE, then we transfer. */
+        if (node->var_decl.init) {
+            Node *move_src = node->var_decl.init;
+            if (move_src->kind == NODE_ORELSE) move_src = move_src->orelse.expr;
+            if (move_src && move_src->kind == NODE_IDENT) {
+                Type *src_type = checker_get_type(zc->checker, move_src);
+                if (src_type && is_move_struct_type(src_type)) {
+                    const char *sn = move_src->ident.name;
+                    uint32_t sl = (uint32_t)move_src->ident.name_len;
+                    HandleInfo *src = zc_ensure_move_registered(zc, ps, sn, sl, node->loc.line);
+                    if (src && src->state == HS_ALIVE) {
+                        src->state = HS_TRANSFERRED;
+                        src->transfer_line = node->loc.line;
+                        /* Register destination */
+                        HandleInfo *dst = find_handle(ps, node->var_decl.name,
+                            (uint32_t)node->var_decl.name_len);
+                        if (!dst) dst = add_handle(ps, node->var_decl.name,
+                            (uint32_t)node->var_decl.name_len);
+                        if (dst) {
+                            dst->state = HS_ALIVE;
+                            dst->pool_id = -3;
+                            dst->alloc_line = src->alloc_line;
+                            dst->alloc_id = src->alloc_id;
+                        }
+                    }
+                }
+            }
+        }
         break;
 
     case NODE_EXPR_STMT:
@@ -2128,7 +2278,8 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
     int covered_ids[64];
     int covered_count = 0;
     for (int i = 0; i < ps.handle_count; i++) {
-        if (ps.handles[i].state == HS_FREED || ps.handles[i].escaped) {
+        if (ps.handles[i].state == HS_FREED || ps.handles[i].escaped ||
+            ps.handles[i].state == HS_TRANSFERRED) {
             /* check if already in covered list */
             bool already = false;
             for (int c = 0; c < covered_count; c++) {
@@ -2145,6 +2296,8 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
         if (is_param) continue;
         /* Arena-colored allocations don't need individual free */
         if (ps.handles[i].source_color == ZC_COLOR_ARENA) continue;
+        /* Move struct vars don't need free — they're stack values */
+        if (ps.handles[i].pool_id == -3) continue;
         if (ps.handles[i].state != HS_ALIVE && ps.handles[i].state != HS_MAYBE_FREED) continue;
         /* check if this allocation is covered */
         bool covered = false;

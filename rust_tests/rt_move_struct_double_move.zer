@@ -1,0 +1,17 @@
+// Move struct: double move — second move is use-after-move.
+// EXPECTED: compile error
+
+move struct Connection { u32 fd; }
+
+void close_conn(Connection c) {
+    u32 x = (u32)c.fd;
+}
+
+u32 main() {
+    Connection c;
+    c.fd = 5;
+
+    close_conn(c);    // first move — OK
+    close_conn(c);    // ERROR: c already moved
+    return 0;
+}

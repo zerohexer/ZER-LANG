@@ -1,0 +1,16 @@
+// Move struct: basic ownership transfer — use after move = compile error.
+// EXPECTED: compile error
+
+move struct FileHandle { i32 fd; }
+
+void consume(FileHandle f) {
+    u32 x = (u32)f.fd;
+}
+
+u32 main() {
+    FileHandle f;
+    f.fd = 42;
+    consume(f);
+    u32 val = (u32)f.fd;   // ERROR: use after move
+    return val;
+}

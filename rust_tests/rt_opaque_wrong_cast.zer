@@ -1,0 +1,15 @@
+// Rust pattern: Box<dyn Any> downcast to wrong type → panic
+// ZER: @ptrcast with wrong provenance → compile error
+// EXPECTED: compile error
+
+struct Sensor { u32 reading; }
+struct Motor { u32 speed; }
+
+u32 main() {
+    Sensor s;
+    s.reading = 42;
+    *opaque ctx = @ptrcast(*opaque, &s);
+    // Cast back as wrong type — provenance mismatch
+    *Motor m = @ptrcast(*Motor, ctx);
+    return 0;
+}

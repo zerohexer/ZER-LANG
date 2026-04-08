@@ -1,0 +1,36 @@
+// Rust source: tests/ui/drop/conditional-drop-10734.rs (issue #10734)
+// Drop fires in both branches of if/else.
+// ZER: alloc in both branches, defer in both — cleanup on all paths.
+
+struct Foo { u32 value; }
+Pool(Foo, 4) pool;
+
+u32 drop_count;
+
+u32 main() {
+    drop_count = 0;
+
+    // if true branch
+    if (true) {
+        ?Handle(Foo) mh = pool.alloc();
+        Handle(Foo) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).value = 1;
+        drop_count += 1;
+    }
+    if (drop_count != 1) { return 1; }
+
+    // else branch
+    if (false) {
+        return 99;
+    } else {
+        ?Handle(Foo) mh = pool.alloc();
+        Handle(Foo) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).value = 2;
+        drop_count += 1;
+    }
+    if (drop_count != 2) { return 2; }
+
+    return 0;
+}

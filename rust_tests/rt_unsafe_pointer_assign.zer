@@ -1,0 +1,13 @@
+// Rust source: tests/ui/unsafe/unsafe-pointer-assignability.rs
+// Pass pointer to function, deref safely.
+// ZER: pointer passed and accessed safely — auto bounds check.
+
+void f(*u32 x) {
+    u32 val = x[0];
+}
+
+u32 main() {
+    u32 value = 3;
+    f(&value);
+    return 0;
+}

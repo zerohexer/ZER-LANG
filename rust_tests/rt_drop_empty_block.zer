@@ -1,0 +1,22 @@
+// Rust source: tests/ui/drop/drop-on-empty-block-exit.rs
+// Value dropped on empty block exit.
+// ZER: Handle freed by defer at block exit.
+
+struct Item { u32 data; }
+Pool(Item, 4) pool;
+
+u32 freed;
+
+u32 main() {
+    freed = 0;
+    {
+        ?Handle(Item) mh = pool.alloc();
+        Handle(Item) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).data = 99;
+        freed = 1;
+    }
+    // Block exited, defer fired, handle freed
+    if (freed != 1) { return 1; }
+    return 0;
+}

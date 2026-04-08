@@ -1,0 +1,37 @@
+// Rust pattern: Vec<Box<dyn Any>> — collection of type-erased pointers
+// ZER: *opaque stored and retrieved from struct fields
+
+struct Device { u32 id; u32 status; }
+Slab(Device) heap;
+
+struct Registry {
+    ?*opaque slot0;
+    ?*opaque slot1;
+}
+
+u32 main() {
+    ?*Device m0 = heap.alloc_ptr();
+    *Device d0 = m0 orelse return;
+    defer heap.free_ptr(d0);
+    d0.id = 0; d0.status = 10;
+
+    ?*Device m1 = heap.alloc_ptr();
+    *Device d1 = m1 orelse return;
+    defer heap.free_ptr(d1);
+    d1.id = 1; d1.status = 20;
+
+    Registry reg;
+    reg.slot0 = @ptrcast(*opaque, d0);
+    reg.slot1 = @ptrcast(*opaque, d1);
+
+    // Retrieve and cast back
+    *opaque raw0 = reg.slot0 orelse return;
+    *Device r0 = @ptrcast(*Device, raw0);
+    if (r0.status != 10) { return 1; }
+
+    *opaque raw1 = reg.slot1 orelse return;
+    *Device r1 = @ptrcast(*Device, raw1);
+    if (r1.status != 20) { return 2; }
+
+    return 0;
+}

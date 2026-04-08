@@ -1,0 +1,34 @@
+// Rust pattern: Box reuse after drop — allocate, free, allocate again.
+// ZER: Pool alloc, free, alloc again (may get same slot), use new handle. POSITIVE.
+
+struct Entry {
+    u32 value;
+    u32 version;
+}
+
+Pool(Entry, 4) pool;
+
+i32 main() {
+    ?Handle(Entry) mh1 = pool.alloc();
+    Handle(Entry) h1 = mh1 orelse return;
+    h1.value = 10;
+    h1.version = 1;
+    pool.free(h1);
+
+    ?Handle(Entry) mh2 = pool.alloc();
+    Handle(Entry) h2 = mh2 orelse return;
+    h2.value = 20;
+    h2.version = 2;
+
+    if (h2.value != 20) {
+        pool.free(h2);
+        return 1;
+    }
+    if (h2.version != 2) {
+        pool.free(h2);
+        return 1;
+    }
+
+    pool.free(h2);
+    return 0;
+}

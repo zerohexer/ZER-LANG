@@ -1,0 +1,29 @@
+// Rust pattern: Box<dyn Any> downcast to wrong type → panic.
+// ZER: @ptrcast Sensor to *opaque, @ptrcast back as *Motor → compile error (provenance violation).
+// EXPECTED: compile error
+
+struct Sensor {
+    u32 id;
+    u32 reading;
+}
+
+struct Motor {
+    u32 speed;
+    u32 torque;
+}
+
+Slab(Sensor) sensors;
+
+i32 main() {
+    ?*Sensor ms = sensors.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s.id = 1;
+    s.reading = 500;
+
+    *opaque ctx = @ptrcast(*opaque, s);
+    *Motor m = @ptrcast(*Motor, ctx);
+
+    u32 spd = m.speed;
+    sensors.free_ptr(s);
+    return (i32)spd;
+}

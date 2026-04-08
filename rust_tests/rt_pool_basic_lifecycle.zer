@@ -1,0 +1,26 @@
+// Rust pattern: Box::new → use → drop. Basic ownership lifecycle.
+// ZER: Pool alloc, use via handle auto-deref, defer free. POSITIVE.
+
+struct Widget {
+    u32 width;
+    u32 height;
+    u32 color;
+}
+
+Pool(Widget, 8) pool;
+
+i32 main() {
+    ?Handle(Widget) mh = pool.alloc();
+    Handle(Widget) h = mh orelse return;
+    defer pool.free(h);
+
+    h.width = 100;
+    h.height = 200;
+    h.color = 0xFF0000;
+
+    u32 area = h.width * h.height;
+    if (area != 20000) {
+        return 1;
+    }
+    return 0;
+}

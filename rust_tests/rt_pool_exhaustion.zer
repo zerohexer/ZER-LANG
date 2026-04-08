@@ -1,0 +1,33 @@
+// Rust pattern: OOM handling — allocate until pool is full.
+// ZER: Pool(T, 2), alloc 2, third returns null, orelse handles it. POSITIVE.
+
+struct Ticket {
+    u32 number;
+}
+
+Pool(Ticket, 2) pool;
+
+i32 main() {
+    ?Handle(Ticket) mh1 = pool.alloc();
+    Handle(Ticket) h1 = mh1 orelse return;
+    h1.number = 1;
+
+    ?Handle(Ticket) mh2 = pool.alloc();
+    Handle(Ticket) h2 = mh2 orelse {
+        pool.free(h1);
+        return 1;
+    };
+    h2.number = 2;
+
+    ?Handle(Ticket) mh3 = pool.alloc();
+    if (mh3) |h3| {
+        pool.free(h3);
+        pool.free(h2);
+        pool.free(h1);
+        return 1;
+    }
+
+    pool.free(h2);
+    pool.free(h1);
+    return 0;
+}

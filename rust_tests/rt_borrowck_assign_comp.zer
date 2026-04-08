@@ -1,0 +1,22 @@
+// Rust pattern: borrowck-assign-comp.rs
+// let q = &p; p.x = 5 — write to borrowed field after free.
+// ZER: alloc struct, take field pointer, free struct, use field pointer → interior pointer UAF.
+// EXPECTED: compile error
+
+struct Point {
+    u32 x;
+    u32 y;
+}
+
+Slab(Point) points;
+
+i32 main() {
+    ?*Point mp = points.alloc_ptr();
+    *Point p = mp orelse return;
+    p.x = 3;
+    p.y = 7;
+    *u32 qx = &p.x;
+    points.free_ptr(p);
+    qx[0] = 5;
+    return 0;
+}

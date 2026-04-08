@@ -1,0 +1,26 @@
+// Rust pattern: Pass Box to function that drops it. Caller must not use after.
+// ZER: alloc_ptr, pass to destroy(), use after → cross-function UAF.
+// EXPECTED: compile error
+
+struct Record {
+    u32 key;
+    u32 data;
+}
+
+Slab(Record) records;
+
+void destroy_record(*Record r) {
+    records.free_ptr(r);
+}
+
+i32 main() {
+    ?*Record mr = records.alloc_ptr();
+    *Record r = mr orelse return;
+    r.key = 7;
+    r.data = 99;
+
+    destroy_record(r);
+
+    u32 k = r.key;
+    return (i32)k;
+}

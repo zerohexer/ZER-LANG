@@ -1,0 +1,22 @@
+// Rust pattern: No direct Rust equivalent (Rust uses lifetimes to prevent this).
+// ZER: Arena alloc, store pointer in global → compile error (arena escape).
+// EXPECTED: compile error
+
+struct Config {
+    u32 mode;
+    u32 flags;
+}
+
+u8[1024] arena_buf;
+Arena scratch;
+
+*Config g_config;
+
+i32 main() {
+    scratch = Arena.over(arena_buf);
+    *Config cfg = scratch.alloc(Config) orelse return;
+    cfg.mode = 1;
+    cfg.flags = 0xFF;
+    g_config = cfg;
+    return 0;
+}

@@ -1,0 +1,29 @@
+// Rust pattern: move-in-guard-1.rs
+// match guard consumes x, second guard tries to use x again.
+// ZER: Handle freed in if-branch, used after → MAYBE_FREED.
+// EXPECTED: compile error
+
+struct Task {
+    u32 id;
+    u32 priority;
+}
+
+Pool(Task, 4) pool;
+
+bool should_free(u32 id) {
+    return id == 0;
+}
+
+i32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    h.id = 5;
+    h.priority = 3;
+
+    if (should_free(h.id)) {
+        pool.free(h);
+    }
+
+    u32 p = h.priority;
+    return (i32)p;
+}

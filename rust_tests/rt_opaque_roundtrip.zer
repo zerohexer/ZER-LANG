@@ -1,0 +1,39 @@
+// Rust pattern: Box<dyn Any> → downcast. Type-checked at compile/runtime.
+// ZER: @ptrcast to *opaque, @ptrcast back to correct type. POSITIVE.
+
+struct Sensor {
+    u32 id;
+    u32 reading;
+}
+
+Slab(Sensor) sensors;
+
+*opaque sensor_to_opaque(*Sensor s) {
+    return @ptrcast(*opaque, s);
+}
+
+*Sensor opaque_to_sensor(*opaque ctx) {
+    return @ptrcast(*Sensor, ctx);
+}
+
+i32 main() {
+    ?*Sensor ms = sensors.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s.id = 42;
+    s.reading = 1337;
+
+    *opaque ctx = sensor_to_opaque(s);
+    *Sensor s2 = opaque_to_sensor(ctx);
+
+    if (s2.id != 42) {
+        sensors.free_ptr(s);
+        return 1;
+    }
+    if (s2.reading != 1337) {
+        sensors.free_ptr(s);
+        return 1;
+    }
+
+    sensors.free_ptr(s);
+    return 0;
+}

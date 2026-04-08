@@ -1,0 +1,29 @@
+// Rust pattern: move-out-of-field.rs
+// Move field out of struct via to_string(sb), sb consumed — caller doesn't use after.
+// ZER: alloc struct, pass to function that frees it, caller does not use after. POSITIVE.
+
+struct Buffer {
+    u32 len;
+    u32 capacity;
+}
+
+Slab(Buffer) bufs;
+
+u32 consume_buffer(*Buffer b) {
+    u32 result = b.len;
+    bufs.free_ptr(b);
+    return result;
+}
+
+i32 main() {
+    ?*Buffer mb = bufs.alloc_ptr();
+    *Buffer b = mb orelse return;
+    b.len = 42;
+    b.capacity = 128;
+
+    u32 result = consume_buffer(b);
+    if (result == 42) {
+        return 0;
+    }
+    return 1;
+}

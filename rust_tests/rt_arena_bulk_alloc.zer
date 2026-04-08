@@ -1,0 +1,39 @@
+// Rust pattern: Arena/bump allocator — allocate many, free all at once.
+// ZER: Arena alloc multiple structs, use all, arena.reset(). POSITIVE.
+
+struct Vec2 {
+    u32 x;
+    u32 y;
+}
+
+u8[4096] arena_buf;
+Arena scratch;
+
+i32 main() {
+    scratch = Arena.over(arena_buf);
+
+    *Vec2 a = scratch.alloc(Vec2) orelse return;
+    a.x = 1;
+    a.y = 2;
+
+    *Vec2 b = scratch.alloc(Vec2) orelse return;
+    b.x = 3;
+    b.y = 4;
+
+    *Vec2 c = scratch.alloc(Vec2) orelse return;
+    c.x = 5;
+    c.y = 6;
+
+    u32 sum = a.x + b.x + c.x + a.y + b.y + c.y;
+    if (sum != 21) {
+        return 1;
+    }
+
+    scratch.reset();
+
+    *Vec2 fresh = scratch.alloc(Vec2) orelse return;
+    fresh.x = 0;
+    fresh.y = 0;
+
+    return 0;
+}

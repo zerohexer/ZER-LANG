@@ -1,0 +1,32 @@
+// Rust pattern: Option<Box<T>> → if let Some(x) = opt { x.field }.
+// ZER: ?Handle → if (mh) |h| { h.field = 42; } — auto-deref through if-unwrap. POSITIVE.
+
+struct Counter {
+    u32 count;
+    u32 max_count;
+}
+
+Pool(Counter, 4) pool;
+
+i32 main() {
+    ?Handle(Counter) mh = pool.alloc();
+
+    if (mh) |h| {
+        h.count = 0;
+        h.max_count = 10;
+        h.count = 42;
+
+        if (h.count != 42) {
+            pool.free(h);
+            return 1;
+        }
+        if (h.max_count != 10) {
+            pool.free(h);
+            return 1;
+        }
+        pool.free(h);
+        return 0;
+    }
+
+    return 1;
+}

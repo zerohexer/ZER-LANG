@@ -1,0 +1,41 @@
+// Rust pattern: Box<Box<T>> → deep access through nested ownership.
+// ZER: Struct containing Handle, auto-deref chain h.inner.field. POSITIVE.
+
+struct Inner {
+    u32 value;
+    u32 tag;
+}
+
+struct Outer {
+    Handle(Inner) inner;
+    u32 outer_val;
+}
+
+Pool(Inner, 8) inner_pool;
+Pool(Outer, 8) outer_pool;
+
+i32 main() {
+    ?Handle(Inner) mi = inner_pool.alloc();
+    Handle(Inner) hi = mi orelse return;
+    hi.value = 99;
+    hi.tag = 7;
+
+    ?Handle(Outer) mo = outer_pool.alloc();
+    Handle(Outer) ho = mo orelse {
+        inner_pool.free(hi);
+        return 1;
+    };
+    ho.inner = hi;
+    ho.outer_val = 42;
+
+    u32 ov = ho.outer_val;
+    if (ov != 42) {
+        inner_pool.free(hi);
+        outer_pool.free(ho);
+        return 1;
+    }
+
+    inner_pool.free(hi);
+    outer_pool.free(ho);
+    return 0;
+}

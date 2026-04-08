@@ -1,0 +1,14 @@
+// Rust pattern: Box::new() without binding (memory leak).
+// ZER: pool.alloc() as bare expression → compile error (ghost handle).
+// EXPECTED: compile error
+
+struct Node {
+    u32 val;
+}
+
+Pool(Node, 8) pool;
+
+i32 main() {
+    pool.alloc();
+    return 0;
+}

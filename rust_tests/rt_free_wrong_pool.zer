@@ -1,0 +1,23 @@
+// Rust pattern: No direct Rust equivalent — type-safe allocator.
+// ZER: free_ptr with wrong type → compile error.
+// EXPECTED: compile error
+
+struct Cat {
+    u32 lives;
+}
+
+struct Dog {
+    u32 bones;
+}
+
+Slab(Cat) cats;
+Slab(Dog) dogs;
+
+i32 main() {
+    ?*Cat mc = cats.alloc_ptr();
+    *Cat c = mc orelse return;
+    c.lives = 9;
+
+    dogs.free_ptr(c);
+    return 0;
+}

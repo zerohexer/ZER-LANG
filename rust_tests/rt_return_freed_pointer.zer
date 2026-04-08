@@ -1,0 +1,25 @@
+// Rust pattern: Return reference to dropped Box — dangling return.
+// ZER: alloc_ptr, free_ptr, return ptr → compile error (return freed pointer).
+// EXPECTED: compile error
+
+struct Buffer {
+    u32 size;
+    u32 used;
+}
+
+Slab(Buffer) bufs;
+
+*Buffer make_and_free() {
+    ?*Buffer mb = bufs.alloc_ptr();
+    *Buffer b = mb orelse return b;
+    b.size = 64;
+    b.used = 0;
+    bufs.free_ptr(b);
+    return b;
+}
+
+i32 main() {
+    *Buffer dangling = make_and_free();
+    u32 s = dangling.size;
+    return (i32)s;
+}

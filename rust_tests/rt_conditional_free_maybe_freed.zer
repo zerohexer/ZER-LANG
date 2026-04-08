@@ -1,0 +1,28 @@
+// Rust pattern: Drop in one branch of if, use after if → maybe dangling.
+// ZER: Free in if without else, use after → MAYBE_FREED error.
+// EXPECTED: compile error
+
+struct Packet {
+    u32 seq;
+    u32 len;
+}
+
+Pool(Packet, 4) pool;
+
+bool is_corrupt(u32 seq) {
+    return seq == 0xDEAD;
+}
+
+i32 main() {
+    ?Handle(Packet) mh = pool.alloc();
+    Handle(Packet) h = mh orelse return;
+    h.seq = 1;
+    h.len = 64;
+
+    if (is_corrupt(h.seq)) {
+        pool.free(h);
+    }
+
+    u32 s = h.seq;
+    return (i32)s;
+}

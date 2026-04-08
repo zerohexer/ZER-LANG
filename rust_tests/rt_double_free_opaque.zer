@@ -1,0 +1,21 @@
+// Rust pattern: double free through type-erased pointer.
+// ZER: zercheck catches double free on *opaque.
+// EXPECTED: compile error
+
+struct Data { u32 value; }
+Slab(Data) heap;
+
+void destroy(*opaque ctx) {
+    *Data d = @ptrcast(*Data, ctx);
+    heap.free_ptr(d);
+}
+
+u32 main() {
+    ?*Data md = heap.alloc_ptr();
+    *Data d = md orelse return;
+    d.value = 42;
+    *opaque raw = @ptrcast(*opaque, d);
+    destroy(raw);
+    destroy(raw);   // ERROR: double free
+    return 0;
+}

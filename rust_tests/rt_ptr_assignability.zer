@@ -1,0 +1,25 @@
+// Rust source: tests/ui/unsafe/unsafe-pointer-assignability.rs
+// Safety intent: pointer coercion with type tracking.
+// ZER: *T → *opaque → *T with provenance tracking.
+
+struct Point { u32 x; u32 y; }
+
+u32 read_opaque(*opaque ctx) {
+    *Point p = @ptrcast(*Point, ctx);
+    return p.x + p.y;
+}
+
+u32 main() {
+    Point pt;
+    pt.x = 3;
+    pt.y = 4;
+
+    // Coerce *Point to *opaque — provenance tracked
+    *opaque raw = @ptrcast(*opaque, &pt);
+
+    // Pass to function that casts back
+    u32 result = read_opaque(raw);
+
+    if (result != 7) { return 1; }
+    return 0;
+}

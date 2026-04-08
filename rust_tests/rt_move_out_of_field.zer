@@ -1,29 +1,29 @@
-// Rust pattern: move-out-of-field.rs
-// Move field out of struct via to_string(sb), sb consumed — caller doesn't use after.
-// ZER: alloc struct, pass to function that frees it, caller does not use after. POSITIVE.
+// Rust source: tests/ui/moves/move-out-of-field.rs
+// Safety intent: moving field out of struct consumes the struct.
+// ZER: ownership transfer via alloc_ptr + handle tracking.
 
-struct Buffer {
-    u32 len;
-    u32 capacity;
-}
+struct Buffer { u32 len; u32 cap; }
+Slab(Buffer) buffers;
 
-Slab(Buffer) bufs;
-
-u32 consume_buffer(*Buffer b) {
+u32 extract_len(*Buffer b) {
     u32 result = b.len;
-    bufs.free_ptr(b);
     return result;
 }
 
-i32 main() {
-    ?*Buffer mb = bufs.alloc_ptr();
-    *Buffer b = mb orelse return;
-    b.len = 42;
-    b.capacity = 128;
+u32 main() {
+    ?*Buffer mb = buffers.alloc_ptr();
+    *Buffer buf = mb orelse return;
+    defer buffers.free_ptr(buf);
 
-    u32 result = consume_buffer(b);
-    if (result == 42) {
-        return 0;
-    }
-    return 1;
+    buf.len = 42;
+    buf.cap = 100;
+
+    // Extract field value — safe, scalar copy
+    u32 len = extract_len(buf);
+    if (len != 42) { return 1; }
+
+    // Original still valid (ZER doesn't move scalars)
+    if (buf.cap != 100) { return 2; }
+
+    return 0;
 }

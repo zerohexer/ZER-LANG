@@ -1,0 +1,31 @@
+// Rust source: tests/ui/borrowck/borrowck-use-mut-borrow.rs
+// Safety intent: using a value after mutable borrow is rejected.
+// ZER: alloc_ptr gives ownership — use after free = compile error.
+
+struct Item { u32 a; u32 b; }
+Slab(Item) heap;
+
+u32 main() {
+    ?*Item mi = heap.alloc_ptr();
+    *Item p = mi orelse return;
+    p.a = 1;
+    p.b = 2;
+
+    // "borrow" = take ownership via pointer
+    // free = relinquish ownership
+    heap.free_ptr(p);
+
+    // Use after free — ZER catches at compile time
+    // (this is the positive test — we verify the SAFE pattern works)
+    // Allocate fresh, use it, free it properly
+    ?*Item mi2 = heap.alloc_ptr();
+    *Item p2 = mi2 orelse return;
+    p2.a = 10;
+    p2.b = 20;
+
+    if (p2.a != 10) { return 1; }
+    if (p2.b != 20) { return 2; }
+
+    heap.free_ptr(p2);
+    return 0;
+}

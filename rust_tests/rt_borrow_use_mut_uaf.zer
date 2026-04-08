@@ -1,0 +1,16 @@
+// Rust source: tests/ui/borrowck/borrowck-use-mut-borrow.rs
+// Safety intent: use after mutable borrow = compile error.
+// ZER: free then use = compile error (zercheck UAF).
+// EXPECTED: compile error
+
+struct Item { u32 a; u32 b; }
+Slab(Item) heap;
+
+u32 main() {
+    ?*Item mi = heap.alloc_ptr();
+    *Item p = mi orelse return;
+    p.a = 1;
+    heap.free_ptr(p);
+    p.a = 2;    // USE AFTER FREE — must be rejected
+    return 0;
+}

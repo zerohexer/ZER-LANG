@@ -1,0 +1,26 @@
+// Rust source: tests/ui/moves/move-4.rs
+// Safety intent: ownership transfers through chain of assignments.
+// ZER: Handle aliased through chain, all point to same allocation.
+
+struct Triple { u32 a; u32 b; u32 c; }
+Pool(Triple, 4) pool;
+
+u32 main() {
+    ?Handle(Triple) mx = pool.alloc();
+    Handle(Triple) x = mx orelse return;
+    pool.get(x).a = 1;
+    pool.get(x).b = 2;
+    pool.get(x).c = 3;
+
+    // Chain of aliases — all refer to same allocation
+    Handle(Triple) foo = x;
+    Handle(Triple) bar = foo;
+    Handle(Triple) baz = bar;
+    Handle(Triple) quux = baz;
+
+    if (pool.get(quux).c != 3) { return 1; }
+    if (pool.get(quux).a != 1) { return 2; }
+
+    pool.free(quux);
+    return 0;
+}

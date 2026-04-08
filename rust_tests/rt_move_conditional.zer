@@ -1,0 +1,39 @@
+// Rust source: tests/ui/moves/move-3-unique.rs
+// Safety intent: conditional ownership — different paths, same result type.
+// ZER: Pool alloc with conditional logic, proper cleanup.
+
+struct Triple { u32 x; u32 y; u32 z; }
+Pool(Triple, 4) pool;
+
+u32 main() {
+    // Test 1: use the original allocation
+    ?Handle(Triple) mx = pool.alloc();
+    Handle(Triple) h1 = mx orelse return;
+    pool.get(h1).x = 1;
+    pool.get(h1).y = 2;
+    pool.get(h1).z = 3;
+
+    if (pool.get(h1).y != 2) { return 1; }
+    pool.free(h1);
+
+    // Test 2: replace with new allocation
+    ?Handle(Triple) mx2 = pool.alloc();
+    Handle(Triple) h2 = mx2 orelse return;
+    pool.get(h2).x = 10;
+    pool.get(h2).y = 20;
+    pool.get(h2).z = 30;
+
+    // Free original, allocate replacement
+    pool.free(h2);
+
+    ?Handle(Triple) mx3 = pool.alloc();
+    Handle(Triple) h3 = mx3 orelse return;
+    pool.get(h3).x = 4;
+    pool.get(h3).y = 5;
+    pool.get(h3).z = 6;
+
+    if (pool.get(h3).y != 5) { return 2; }
+    pool.free(h3);
+
+    return 0;
+}

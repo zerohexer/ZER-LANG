@@ -49,6 +49,7 @@ typedef struct {
     HandleInfo *handles;    /* arena-allocated, grows as needed */
     int handle_count;
     int handle_capacity;
+    bool terminated;        /* true if block hit return/break/continue/goto — doesn't fall through */
 } PathState;
 
 /* pool registry entry */

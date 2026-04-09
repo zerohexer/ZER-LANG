@@ -1,0 +1,33 @@
+// CFG test: switch arm returns after free — other arm doesn't free.
+// Post-switch should see handle ALIVE (only non-exiting arm matters).
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+enum Op { read, destroy }
+
+u32 process(Op op) {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).val = 42;
+
+    switch (op) {
+        .read => {
+            return h.val;   // terminates — defer fires
+        }
+        .destroy => {
+            // falls through — handle still alive via defer
+        }
+    }
+    // Only .destroy reaches here — h is alive (defer handles cleanup)
+    return h.val + 1;
+}
+
+i32 main() {
+    u32 r1 = process(Op.read);
+    u32 r2 = process(Op.destroy);
+    if (r1 != 42) { return 1; }
+    if (r2 != 43) { return 2; }
+    return 0;
+}

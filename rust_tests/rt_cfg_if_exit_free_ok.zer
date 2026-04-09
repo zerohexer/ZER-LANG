@@ -1,0 +1,27 @@
+// CFG test: if-branch frees handle AND returns — post-if handle is ALIVE.
+// Classic pattern: if (err) { free(h); return; } use(h);
+
+struct Buf { u32 len; u32 cap; }
+Pool(Buf, 4) pool;
+
+u32 safe_read(u32 err) {
+    ?Handle(Buf) mh = pool.alloc();
+    Handle(Buf) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).len = 10;
+    pool.get(h).cap = 100;
+
+    if (err > 0) {
+        return 0;   // terminates — defer fires
+    }
+    // Only reach here if err == 0 — h is alive
+    return h.len + h.cap;
+}
+
+i32 main() {
+    u32 r1 = safe_read(0);
+    u32 r2 = safe_read(1);
+    if (r1 != 110) { return 1; }
+    if (r2 != 0) { return 2; }
+    return 0;
+}

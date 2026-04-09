@@ -1,0 +1,27 @@
+// CFG test: both if/else branches return — code after if is unreachable.
+// Handle allocated before if, freed in both branches via defer.
+
+struct Conn { u32 fd; }
+Pool(Conn, 4) pool;
+
+u32 connect(u32 mode) {
+    ?Handle(Conn) mh = pool.alloc();
+    Handle(Conn) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).fd = mode;
+
+    if (mode > 0) {
+        return h.fd * 10;   // terminates — defer fires
+    } else {
+        return h.fd * 20;   // terminates — defer fires
+    }
+    // unreachable — but no false "handle leaked" error
+}
+
+i32 main() {
+    u32 r1 = connect(5);
+    u32 r2 = connect(0);
+    if (r1 != 50) { return 1; }
+    if (r2 != 0) { return 2; }
+    return 0;
+}

@@ -220,12 +220,7 @@ static void emit_zero_value(Emitter *e, Type *t) {
     if (!t || t->kind == TYPE_VOID) return;
     Type *inner = type_unwrap_distinct(t);
     if (inner->kind == TYPE_OPTIONAL && !is_null_sentinel(inner->optional.inner)) {
-        emit(e, "(");
-        emit_type(e, t);
-        if (type_unwrap_distinct(inner->optional.inner)->kind == TYPE_VOID)
-            emit(e, "){ 0 }");
-        else
-            emit(e, "){ 0, 0 }");
+        emit_opt_null_literal(e, t);
     } else if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR ||
                (inner->kind == TYPE_OPTIONAL && is_null_sentinel(inner->optional.inner))) {
         emit(e, "NULL");
@@ -2201,9 +2196,7 @@ static void emit_expr(Emitter *e, Node *node) {
             orelse_eff->kind == TYPE_OPTIONAL &&
             is_null_sentinel(orelse_eff->optional.inner);
 
-        bool is_void_optional = orelse_eff &&
-            orelse_eff->kind == TYPE_OPTIONAL &&
-            type_unwrap_distinct(orelse_eff->optional.inner)->kind == TYPE_VOID;
+        bool is_void_optional = is_void_opt(orelse_type);
 
         if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
@@ -3024,8 +3017,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (or_is_ptr) {
                 emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
                 emit(e, " = _zer_or%d;\n", tmp);
-            } else if (type && type->kind == TYPE_OPTIONAL &&
-                       type_unwrap_distinct(type->optional.inner)->kind == TYPE_VOID) {
+            } else if (is_void_opt(type)) {
                 /* ?void has no .value — keep as ?void (has_value only) */
                 emit(e, "_zer_opt_void %.*s = _zer_or%d;\n",
                      (int)node->var_decl.name_len, node->var_decl.name, tmp);
@@ -3052,10 +3044,8 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (type && type->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(type->optional.inner)) {
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
-                    if (type_unwrap_distinct(type->optional.inner)->kind == TYPE_VOID)
-                        emit(e, " = { 0 }");
-                    else
-                        emit(e, " = {0}");
+                    emit(e, " = ");
+                    emit_opt_null_literal(e, type);
                 } else if (node->var_decl.init->kind == NODE_CALL ||
                            node->var_decl.init->kind == NODE_ORELSE ||
                            node->var_decl.init->kind == NODE_INTRINSIC) {
@@ -3063,8 +3053,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                      * BUG-408: ?void from void function — hoist void call to statement,
                      * then init with { 1 }. Can't put void expression in initializer. */
                     Type *call_ret = checker_get_type(e->checker, node->var_decl.init);
-                    if (call_ret && call_ret->kind == TYPE_VOID &&
-                        type_unwrap_distinct(type->optional.inner)->kind == TYPE_VOID) {
+                    if (call_ret && call_ret->kind == TYPE_VOID && is_void_opt(type)) {
                         emit(e, ";\n");
                         emit_indent(e);
                         emit_expr(e, node->var_decl.init);
@@ -3255,8 +3244,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                          tmp,
                          (int)node->if_stmt.capture_name_len,
                          node->if_stmt.capture_name, tmp);
-                } else if (cond_type && cond_type->kind == TYPE_OPTIONAL &&
-                           type_unwrap_distinct(cond_type->optional.inner)->kind == TYPE_VOID) {
+                } else if (is_void_opt(cond_type)) {
                     /* ?void has no .value field — capture is just a dummy */
                     emit(e, "uint8_t %.*s = 1;\n",
                          (int)node->if_stmt.capture_name_len,
@@ -3407,7 +3395,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(ret_eff->optional.inner) &&
                 expr_type && !type_equals(expr_type, e->current_func_ret)) {
-                if (type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_VOID) {
+                if (is_void_opt(e->current_func_ret)) {
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
                     emit_indent(e);
@@ -3437,13 +3425,9 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(ret_eff->optional.inner) &&
                 node->ret.expr->kind == NODE_NULL_LIT) {
-                emit(e, "return (");
-                emit_type(e, e->current_func_ret);
-                if (type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_VOID) {
-                    emit(e, "){ 0 };\n");
-                } else {
-                    emit(e, "){ 0, 0 };\n");
-                }
+                emit(e, "return ");
+                emit_opt_null_literal(e, e->current_func_ret);
+                emit(e, ";\n");
             }
             /* return value from ?T function → return {value, 1} */
             else if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
@@ -3456,7 +3440,7 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "return ");
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
-                } else if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID) {
+                } else if (is_void_opt(e->current_func_ret)) {
                     /* ?void: emit void expr as statement, then return {1} */
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
@@ -3497,7 +3481,7 @@ static void emit_stmt(Emitter *e, Node *node) {
             } else if (bare_ret && bare_ret->kind == TYPE_OPTIONAL) {
                 emit(e, "return (");
                 emit_type(e, e->current_func_ret);
-                if (type_unwrap_distinct(bare_ret->optional.inner)->kind == TYPE_VOID) {
+                if (is_void_opt(e->current_func_ret)) {
                     emit(e, "){ 1 };\n");
                 } else {
                     emit(e, "){ 0, 1 };\n");
@@ -4373,10 +4357,8 @@ static void emit_global_var(Emitter *e, Node *node) {
         if (type && type->kind == TYPE_OPTIONAL &&
             !is_null_sentinel(type->optional.inner) &&
             node->var_decl.init->kind == NODE_NULL_LIT) {
-            if (type_unwrap_distinct(type->optional.inner)->kind == TYPE_VOID)
-                emit(e, " = { 0 }");
-            else
-                emit(e, " = {0}");
+            emit(e, " = ");
+            emit_opt_null_literal(e, type);
         } else {
             /* For const globals: try compile-time evaluation first.
              * This avoids GCC statement expression errors from _zer_shl/shr

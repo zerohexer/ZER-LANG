@@ -721,6 +721,32 @@ static Symbol *find_or_create_auto_slab(Checker *c, Type *struct_type) {
     return auto_sym;
 }
 
+/* ---- Volatile stripping check helper ---- */
+
+/* Check if a cast/intrinsic strips volatile from source pointer.
+ * Returns true if violation detected (error emitted). */
+static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
+                                  Type *tgt_type, int line, const char *context) {
+    Type *seff = type_unwrap_distinct(src_type);
+    Type *teff = type_unwrap_distinct(tgt_type);
+    if (!seff || seff->kind != TYPE_POINTER) return false;
+    if (!teff || teff->kind != TYPE_POINTER) return false;
+    if (teff->pointer.is_volatile) return false; /* target keeps volatile — ok */
+    bool src_vol = seff->pointer.is_volatile;
+    if (!src_vol && src_expr && src_expr->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope,
+            src_expr->ident.name, (uint32_t)src_expr->ident.name_len);
+        if (s && s->is_volatile) src_vol = true;
+    }
+    if (src_vol) {
+        checker_error(c, line,
+            "%s cannot strip volatile qualifier — "
+            "target must be volatile pointer", context);
+        return true;
+    }
+    return false;
+}
+
 /* ================================================================
  * TYPE RESOLUTION: TypeNode (syntactic) → Type (semantic)
  * ================================================================ */
@@ -4131,20 +4157,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
 
             /* BUG-447: volatile stripping — same check as @ptrcast BUG-258 */
-            if (src_eff->kind == TYPE_POINTER &&
-                tgt_eff->kind == TYPE_POINTER && !tgt_eff->pointer.is_volatile) {
-                bool src_volatile = src_eff->pointer.is_volatile;
-                if (!src_volatile && node->typecast.expr->kind == NODE_IDENT) {
-                    Symbol *src_sym = scope_lookup(c->current_scope,
-                        node->typecast.expr->ident.name,
-                        (uint32_t)node->typecast.expr->ident.name_len);
-                    if (src_sym && src_sym->is_volatile) src_volatile = true;
-                }
-                if (src_volatile) {
-                    checker_error(c, node->loc.line,
-                        "cast cannot strip volatile qualifier — target must be volatile pointer");
-                }
-            }
+            check_volatile_strip(c, node->typecast.expr, source, target, node->loc.line, "cast");
 
             /* BUG-446: provenance check — same as @ptrcast provenance tracking.
              * When source is *opaque with known provenance, target must match. */
@@ -4354,28 +4367,9 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "@ptrcast cannot strip const qualifier — "
                                 "target must be const pointer");
                         }
-                        /* BUG-258: volatile stripping via @ptrcast.
-                         * Cannot cast volatile pointer to non-volatile — writes may
-                         * be optimized away by GCC, causing silent hardware failure.
-                         * Check both type-level volatile (pointer.is_volatile) and
-                         * symbol-level volatile (var_decl.is_volatile on the source ident). */
-                        if (eff->kind == TYPE_POINTER &&
-                            result && result->kind == TYPE_POINTER &&
-                            !result->pointer.is_volatile) {
-                            bool src_volatile = eff->pointer.is_volatile;
-                            /* also check if source ident has sym->is_volatile */
-                            if (!src_volatile && node->intrinsic.args[0]->kind == NODE_IDENT) {
-                                Symbol *src_sym = scope_lookup(c->current_scope,
-                                    node->intrinsic.args[0]->ident.name,
-                                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                                if (src_sym && src_sym->is_volatile) src_volatile = true;
-                            }
-                            if (src_volatile) {
-                                checker_error(c, node->loc.line,
-                                    "@ptrcast cannot strip volatile qualifier — "
-                                    "target must be volatile pointer");
-                            }
-                        }
+                        /* BUG-258: volatile stripping via @ptrcast */
+                        check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
+                                             node->loc.line, "@ptrcast");
                         /* provenance check: compile-time belt.
                          * Simple idents: check Symbol. Compound paths (h.p, arr[0]):
                          * check prov_map. BUG-393 runtime type_id is the suspenders. */
@@ -4441,24 +4435,8 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
                     }
                     /* BUG-341: volatile stripping via @bitcast (same as @ptrcast BUG-258) */
-                    Type *veff = type_unwrap_distinct(val_type);
-                    Type *reff = type_unwrap_distinct(result);
-                    if (veff && veff->kind == TYPE_POINTER &&
-                        reff && reff->kind == TYPE_POINTER &&
-                        !reff->pointer.is_volatile) {
-                        bool src_vol = veff->pointer.is_volatile;
-                        if (!src_vol && node->intrinsic.args[0]->kind == NODE_IDENT) {
-                            Symbol *vs = scope_lookup(c->current_scope,
-                                node->intrinsic.args[0]->ident.name,
-                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                            if (vs && vs->is_volatile) src_vol = true;
-                        }
-                        if (src_vol) {
-                            checker_error(c, node->loc.line,
-                                "@bitcast cannot strip volatile qualifier — "
-                                "target must be volatile pointer");
-                        }
-                    }
+                    check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
+                                         node->loc.line, "@bitcast");
                 }
             } else {
                 result = ty_void;
@@ -4781,27 +4759,10 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* BUG-381: volatile check — if source pointer is volatile,
                  * target must also be volatile. Same pattern as @ptrcast BUG-258. */
                 if (node->intrinsic.arg_count > 0 && result) {
-                    Type *res_eff = type_unwrap_distinct(result);
-                    if (res_eff->kind == TYPE_POINTER && !res_eff->pointer.is_volatile) {
-                        Type *ptr_type = typemap_get(c, node->intrinsic.args[0]);
-                        bool src_volatile = false;
-                        if (ptr_type) {
-                            Type *pe = type_unwrap_distinct(ptr_type);
-                            if (pe->kind == TYPE_POINTER && pe->pointer.is_volatile)
-                                src_volatile = true;
-                        }
-                        if (!src_volatile && node->intrinsic.args[0]->kind == NODE_IDENT) {
-                            Symbol *src_sym = scope_lookup(c->current_scope,
-                                node->intrinsic.args[0]->ident.name,
-                                (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                            if (src_sym && src_sym->is_volatile) src_volatile = true;
-                        }
-                        if (src_volatile) {
-                            checker_error(c, node->loc.line,
-                                "@container cannot strip volatile qualifier — "
-                                "target must be volatile pointer");
-                        }
-                    }
+                    Type *ptr_type = typemap_get(c, node->intrinsic.args[0]);
+                    if (ptr_type)
+                        check_volatile_strip(c, node->intrinsic.args[0], ptr_type, result,
+                                             node->loc.line, "@container");
                 }
             } else {
                 result = ty_void;
@@ -4849,30 +4810,17 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* BUG-343: @cast cannot strip volatile or const qualifier
-                     * (same pattern as @ptrcast BUG-258 and @bitcast BUG-341) */
-                    Type *veff = type_unwrap_distinct(val_type);
-                    Type *reff = type_unwrap_distinct(result);
-                    if (veff && veff->kind == TYPE_POINTER &&
-                        reff && reff->kind == TYPE_POINTER) {
-                        /* volatile check */
-                        if (!reff->pointer.is_volatile) {
-                            bool src_vol = veff->pointer.is_volatile;
-                            if (!src_vol && node->intrinsic.arg_count > 0 &&
-                                node->intrinsic.args[0]->kind == NODE_IDENT) {
-                                Symbol *vs = scope_lookup(c->current_scope,
-                                    node->intrinsic.args[0]->ident.name,
-                                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                                if (vs && vs->is_volatile) src_vol = true;
-                            }
-                            if (src_vol) {
-                                checker_error(c, node->loc.line,
-                                    "@cast cannot strip volatile qualifier — "
-                                    "target must be volatile pointer");
-                            }
-                        }
-                        /* const check */
-                        if (veff->pointer.is_const && !reff->pointer.is_const) {
+                    /* BUG-343: @cast cannot strip volatile or const qualifier */
+                    if (node->intrinsic.arg_count > 0)
+                        check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
+                                             node->loc.line, "@cast");
+                    /* const check */
+                    {
+                        Type *veff = type_unwrap_distinct(val_type);
+                        Type *reff = type_unwrap_distinct(result);
+                        if (veff && veff->kind == TYPE_POINTER &&
+                            reff && reff->kind == TYPE_POINTER &&
+                            veff->pointer.is_const && !reff->pointer.is_const) {
                             checker_error(c, node->loc.line,
                                 "@cast cannot strip const qualifier — "
                                 "target must be const pointer");

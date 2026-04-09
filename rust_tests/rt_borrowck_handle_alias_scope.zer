@@ -1,0 +1,23 @@
+// Rust NLL: alias scoped to block — original still usable after block.
+// ZER: handle alias via orelse in inner block, original handle alive after.
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+i32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).val = 42;
+
+    // Inner block reads through handle — doesn't consume it
+    {
+        u32 v = h.val;
+        if (v != 42) { return 1; }
+    }
+
+    // h still alive after block
+    u32 v2 = h.val;
+    if (v2 != 42) { return 2; }
+    return 0;
+}

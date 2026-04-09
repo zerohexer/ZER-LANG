@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Rust borrowck: cannot move field out of struct with Drop (destructor runs on whole).
+// ZER: move struct — passing field to function leaves parent in partial state.
+// After consuming whole struct, field access is use-after-move.
+
+move struct Connection { u32 fd; u32 flags; }
+
+u32 extract_fd(Connection c) { return c.fd; }
+
+i32 main() {
+    Connection c;
+    c.fd = 5;
+    c.flags = 0;
+    u32 fd = extract_fd(c);   // c moved
+    u32 f = c.flags;          // error: use after move
+    return 0;
+}

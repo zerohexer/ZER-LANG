@@ -1,0 +1,17 @@
+// Rust moves: struct with move field — consume outer, inner moves with it.
+// ZER: move struct inside regular struct. Passing outer consumes inner. Safe pattern.
+
+move struct Key { u32 id; }
+struct Envelope { Key key; u32 priority; }
+
+void process(Envelope e) {
+    u32 p = e.priority;
+}
+
+i32 main() {
+    Envelope env;
+    env.key.id = 42;
+    env.priority = 5;
+    process(env);   // env (including env.key) transferred
+    return 0;
+}

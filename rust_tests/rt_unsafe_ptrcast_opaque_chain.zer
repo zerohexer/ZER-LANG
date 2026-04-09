@@ -1,0 +1,25 @@
+// Rust unsafe: multi-step type-erased dispatch — *T → *opaque → *T.
+// ZER: @ptrcast provenance chain through function boundary.
+
+struct Sensor { u32 id; u32 reading; }
+struct Motor { u32 speed; u32 torque; }
+Slab(Sensor) sensor_slab;
+
+void update_sensor(*opaque ctx, u32 value) {
+    *Sensor s = (*Sensor)ctx;
+    s[0].reading = value;
+}
+
+i32 main() {
+    ?*Sensor ms = sensor_slab.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer sensor_slab.free_ptr(s);
+    s[0].id = 1;
+    s[0].reading = 0;
+
+    *opaque ctx = (*opaque)s;
+    update_sensor(ctx, 42);
+
+    if (s[0].reading != 42) { return 1; }
+    return 0;
+}

@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// Regular struct with move struct field — pass outer to TWO functions.
+// Second call = use after move (outer contains moved inner).
+
+move struct Token { u32 id; }
+struct Wrapper { Token tok; u32 tag; }
+
+void first(Wrapper w) { u32 t = w.tag; }
+void second(Wrapper w) { u32 t = w.tag; }
+
+i32 main() {
+    Wrapper w;
+    w.tok.id = 1;
+    w.tag = 99;
+    first(w);      // w (containing move struct) transferred
+    second(w);     // error: w already transferred
+    return 0;
+}

@@ -1,0 +1,31 @@
+// CFG test: nested if/else with returns at different levels.
+// Tests that terminated propagates correctly through nesting.
+
+struct Sensor { u32 id; u32 val; }
+Pool(Sensor, 4) pool;
+
+u32 multi_check(u32 a, u32 b) {
+    ?Handle(Sensor) mh = pool.alloc();
+    Handle(Sensor) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).id = 1;
+    pool.get(h).val = a + b;
+
+    if (a == 0) {
+        if (b == 0) {
+            return 0;     // both zero — early return
+        } else {
+            return b;     // a=0, b!=0
+        }
+        // unreachable after nested if/else that both return
+    }
+    // a != 0 — h is alive
+    return h.val;
+}
+
+i32 main() {
+    if (multi_check(0, 0) != 0) { return 1; }
+    if (multi_check(0, 5) != 5) { return 2; }
+    if (multi_check(3, 4) != 7) { return 3; }
+    return 0;
+}

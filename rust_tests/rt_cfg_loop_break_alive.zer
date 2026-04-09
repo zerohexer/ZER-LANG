@@ -1,0 +1,28 @@
+// CFG test: handle used inside loop, break exits loop, handle still alive after.
+// Tests that loop terminated flag doesn't leak to enclosing scope.
+
+struct Timer { u32 count; u32 limit; }
+Pool(Timer, 4) pool;
+
+u32 count_until(u32 limit) {
+    ?Handle(Timer) mh = pool.alloc();
+    Handle(Timer) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).count = 0;
+    pool.get(h).limit = limit;
+
+    for (u32 i = 0; i < 100; i += 1) {
+        pool.get(h).count = i;
+        if (i >= h.limit) {
+            break;   // exits loop — but NOT the function
+        }
+    }
+    // h is still alive after loop — break doesn't terminate function scope
+    return h.count;
+}
+
+i32 main() {
+    u32 r = count_until(5);
+    if (r != 5) { return 1; }
+    return 0;
+}

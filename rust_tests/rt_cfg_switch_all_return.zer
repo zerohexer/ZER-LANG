@@ -1,0 +1,28 @@
+// CFG test: all switch arms return — post-switch is unreachable.
+// Handle freed via defer on all paths. No leak.
+
+struct Cmd { u32 code; }
+Pool(Cmd, 4) pool;
+
+enum Action { start, stop, reset }
+
+u32 execute(Action a) {
+    ?Handle(Cmd) mh = pool.alloc();
+    Handle(Cmd) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).code = 0;
+
+    switch (a) {
+        .start => { pool.get(h).code = 1; return h.code; }
+        .stop =>  { pool.get(h).code = 2; return h.code; }
+        .reset => { pool.get(h).code = 3; return h.code; }
+    }
+    // unreachable — all arms return
+}
+
+i32 main() {
+    if (execute(Action.start) != 1) { return 1; }
+    if (execute(Action.stop) != 2) { return 2; }
+    if (execute(Action.reset) != 3) { return 3; }
+    return 0;
+}

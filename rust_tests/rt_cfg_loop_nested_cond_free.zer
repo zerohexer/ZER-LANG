@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// CFG test: 3-level nested conditional free inside loop — needs multiple
+// fixed-point iterations to detect. Tests dynamic convergence.
+
+struct Res { u32 val; }
+Pool(Res, 4) pool;
+
+i32 main() {
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    pool.get(h).val = 1;
+
+    u32 a = 1;
+    u32 b = 1;
+    u32 c = 1;
+    for (u32 i = 0; i < 5; i += 1) {
+        if (a > 0) {
+            if (b > 0) {
+                if (c > 0) {
+                    pool.free(h);   // 3 levels deep — conditional free
+                }
+            }
+        }
+        u32 v = pool.get(h).val;    // UAF if any iteration freed h
+    }
+    return 0;
+}

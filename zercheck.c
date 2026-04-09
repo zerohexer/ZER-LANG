@@ -1560,9 +1560,11 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                     }
                 }
                 if (label_idx >= 0 && label_idx < i) {
-                    /* backward goto = loop equivalent. Fixed-point iteration
-                     * over label..goto region until states stabilize. */
-                    for (int iter = 0; iter < 4; iter++) {
+                    /* backward goto = loop equivalent. Dynamic fixed-point:
+                     * iterate until convergence. States form a finite lattice
+                     * (5 values per handle, monotone transitions) so convergence
+                     * is guaranteed. Ceiling of 32 is crash protection only. */
+                    for (int iter = 0; iter < 32; iter++) {
                         PathState pre_goto = pathstate_copy(ps);
                         for (int j = label_idx; j <= i; j++)
                             zc_check_stmt(zc, ps, node->block.stmts[j]);
@@ -1571,23 +1573,6 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                             break;  /* converged */
                         }
                         pathstate_free(&pre_goto);
-                        if (iter == 3) {
-                            /* widen remaining unstable states */
-                            for (int h = 0; h < ps->handle_count; h++) {
-                                if (ps->handles[h].state != HS_MAYBE_FREED &&
-                                    ps->handles[h].state != HS_FREED) {
-                                    /* Only widen states that changed — compare against pre-loop */
-                                    PathState check = pathstate_copy(ps);
-                                    for (int j = label_idx; j <= i; j++)
-                                        zc_check_stmt(zc, &check, node->block.stmts[j]);
-                                    if (check.handle_count > h &&
-                                        check.handles[h].state != ps->handles[h].state) {
-                                        ps->handles[h].state = HS_MAYBE_FREED;
-                                    }
-                                    pathstate_free(&check);
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -1780,11 +1765,12 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
         PathState pre_loop = pathstate_copy(ps);
 
-        /* Fixed-point iteration: run loop body until handle states stabilize.
-         * Max 4 iterations then widen remaining unstable states to MAYBE_FREED.
-         * This replaces the old 2-pass + widen hack with proper convergence. */
+        /* Dynamic fixed-point iteration: run loop body until handle states
+         * stabilize. States form a finite lattice (5 values per handle,
+         * monotone transitions) so convergence is mathematically guaranteed.
+         * Ceiling of 32 is crash protection only — real code converges in 1-3. */
         bool first_pass = true;
-        for (int iter = 0; iter < 4; iter++) {
+        for (int iter = 0; iter < 32; iter++) {
             PathState iter_pre = pathstate_copy(ps);
             ps->terminated = false;  /* loop body can break/continue but loop itself continues */
             zc_check_stmt(zc, ps, body);
@@ -1820,18 +1806,6 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 break;  /* converged — states stable */
             }
             pathstate_free(&iter_pre);
-
-            /* Last iteration: widen unstable states to MAYBE_FREED */
-            if (iter == 3) {
-                for (int i = 0; i < ps->handle_count; i++) {
-                    HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
-                                                  ps->handles[i].name_len);
-                    if (pre && pre->state != ps->handles[i].state &&
-                        ps->handles[i].state != HS_MAYBE_FREED) {
-                        ps->handles[i].state = HS_MAYBE_FREED;
-                    }
-                }
-            }
         }
 
         pathstate_free(&pre_loop);

@@ -1,0 +1,34 @@
+// Stress test: loop with conditional that needs multiple fixed-point iterations.
+// Uses nested if inside loop — the state should stabilize naturally.
+// Tests that dynamic fixed-point (ceiling 32) converges correctly.
+
+struct Val { u32 n; }
+Pool(Val, 8) pool;
+
+i32 main() {
+    ?Handle(Val) mh = pool.alloc();
+    Handle(Val) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).n = 0;
+
+    // Loop with deep nesting — fixed-point should converge in 1-2 iterations
+    // because no handle state actually changes (h stays ALIVE throughout)
+    u32 sum = 0;
+    for (u32 i = 0; i < 10; i += 1) {
+        u32 x = h.n;
+        if (x == 0) {
+            if (i > 5) {
+                if (i > 8) {
+                    sum += 100;
+                } else {
+                    sum += 10;
+                }
+            } else {
+                sum += 1;
+            }
+        }
+    }
+    // sum = 1*6 + 10*3 + 100*1 = 6+30+100 = 136
+    if (sum != 136) { return 1; }
+    return 0;
+}

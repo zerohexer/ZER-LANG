@@ -483,7 +483,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct` (compile-time ownership transfer), 567 Rust-equivalent tests (0 failures), BUG-462 through BUG-470 (9 bugs fixed), deadlock model redesigned, systematic refactoring (13 unified helpers in zercheck/checker/emitter — see `docs/refactoring_gaps.md`), 471+ bug fixes, 3,400+ tests
+- **v0.3.0 (CURRENT):** `move struct` (compile-time ownership transfer), 567 Rust-equivalent tests (0 failures), BUG-462 through BUG-470 (9 bugs fixed), deadlock model redesigned, systematic refactoring (16 unified helpers in zercheck/checker/emitter — see `docs/refactoring_gaps.md`), 471+ bug fixes, 3,400+ tests
 - **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -988,7 +988,7 @@ Every single "limitation" was a fixable bug. The `limitations/` directory is now
 - Generated tests: 164 `gen_*` + 43 `rc_*` + 27 `safety_*` + 21 `conc_*` = 255 (all audited)
 - Total: 567 Rust-equivalent tests in `rust_tests/`, 0 limitations remaining
 - **All limitations from this session fixed:** BUG-468 (conditional move), BUG-469 (nested move in struct), BUG-470 (return transfer)
-- **Systematic refactoring:** 13 unified helpers across zercheck.c/checker.c/emitter.c. See `docs/refactoring_gaps.md` for full analysis.
+- **Systematic refactoring:** 16 unified helpers across zercheck.c/checker.c/emitter.c. See `docs/refactoring_gaps.md` for full analysis.
 
 ### High-Value Test Categories for Finding Bugs
 From analysis of Rust's test tree, these categories stress ZER's model the hardest:

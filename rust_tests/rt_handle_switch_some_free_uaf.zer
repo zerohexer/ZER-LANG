@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// Handle freed in 2 of 3 enum arms, used after switch = MAYBE_FREED.
+
+struct Entry { u32 key; u32 val; }
+Pool(Entry, 4) pool;
+
+enum Op { get, remove, clear }
+
+i32 main() {
+    ?Handle(Entry) mh = pool.alloc();
+    Handle(Entry) h = mh orelse return;
+    pool.get(h).key = 1;
+    pool.get(h).val = 42;
+
+    Op op = Op.get;
+    switch (op) {
+        .get => { }
+        .remove => { pool.free(h); }
+        .clear => { pool.free(h); }
+    }
+    // h: get=alive, remove=freed, clear=freed → MAYBE_FREED
+    u32 v = pool.get(h).val;
+    return 0;
+}

@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// if/else BOTH consume move struct → definitely transferred → use after = error.
+
+move struct FileDesc { u32 fd; }
+
+void close_fast(FileDesc h) { u32 f = h.fd; }
+void close_slow(FileDesc h) { u32 f = h.fd; }
+
+i32 main() {
+    FileDesc h;
+    h.fd = 5;
+    u32 mode = 1;
+    if (mode > 0) {
+        close_fast(h);
+    } else {
+        close_slow(h);
+    }
+    // Both branches consumed h → definitely TRANSFERRED
+    u32 fd = h.fd;   // error: use after move
+    return 0;
+}

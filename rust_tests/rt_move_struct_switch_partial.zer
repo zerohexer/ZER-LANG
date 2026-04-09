@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Only 2 of 3 switch arms consume — use after switch = MAYBE_TRANSFERRED.
+
+move struct Key { u32 val; }
+enum Action { use_key, store_key, ignore }
+
+void consume(Key k) { u32 v = k.val; }
+
+i32 main() {
+    Key k;
+    k.val = 42;
+    Action a = Action.use_key;
+    switch (a) {
+        .use_key => { consume(k); }
+        .store_key => { consume(k); }
+        .ignore => { }
+    }
+    u32 v = k.val;   // error: maybe transferred (ignore arm didn't consume)
+    return 0;
+}

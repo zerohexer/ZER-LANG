@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Move struct consumed in while body — condition re-evaluates, uses moved struct.
+
+move struct Sensor { u32 value; }
+
+void read_sensor(Sensor s) { u32 v = s.value; }
+
+i32 main() {
+    Sensor s;
+    s.value = 10;
+    u32 i = 0;
+    while (i < 2) {
+        read_sensor(s);   // first iter ok, second = use after move
+        i += 1;
+    }
+    return 0;
+}

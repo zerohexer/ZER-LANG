@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Rust borrowck: field-sensitivity — move field, then move again = error.
+// ZER: function frees handle (cross-func summary), caller also frees → double free.
+
+Pool(u32, 4) pool;
+
+struct Item { u32 val; }
+
+void destroy(Handle(Item) h) {
+    pool.free(h);
+}
+
+i32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    pool.get(h).val = 42;
+    destroy(h);       // h freed by cross-function summary
+    pool.free(h);     // double free — zercheck catches via summary
+    return 0;
+}

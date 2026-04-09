@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// Rust borrowck: function conditionally drops — caller use is error.
+// ZER: cross-function summary detects maybe-free → use after is MAYBE_FREED.
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+void maybe_destroy(Handle(Item) h, u32 should_free) {
+    if (should_free > 0) {
+        pool.free(h);
+    }
+}
+
+i32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    pool.get(h).val = 99;
+
+    maybe_destroy(h, 1);
+    // h may have been freed — use is MAYBE_FREED error
+    u32 v = pool.get(h).val;
+    return 0;
+}

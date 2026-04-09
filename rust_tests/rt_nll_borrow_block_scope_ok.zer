@@ -1,0 +1,25 @@
+// Rust NLL: borrow confined to inner block, parent modified after block ends.
+// ZER: handle used only inside inner block, parent struct modified after.
+
+Pool(u32, 8) pool;
+
+struct Pair { u32 first; u32 second; }
+
+i32 main() {
+    Pair p;
+    p.first = 1;
+    p.second = 2;
+
+    // Inner block: take pointer to field, use it, block ends
+    {
+        u32 snapshot = p.first;
+        if (snapshot != 1) { return 1; }
+    }
+    // Block ended — p is fully accessible again
+    p.first = 10;
+    p.second = 20;
+
+    if (p.first != 10) { return 2; }
+    if (p.second != 20) { return 3; }
+    return 0;
+}

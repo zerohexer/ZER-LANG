@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Rust unsafe: cast to wrong type = UB. ZER catches at compile time.
+// @ptrcast provenance: cast *opaque to wrong type → compile error.
+
+struct Motor { u32 speed; u32 torque; }
+struct Sensor { u32 id; u32 value; }
+Slab(Sensor) slab;
+
+i32 main() {
+    ?*Sensor ms = slab.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer slab.free_ptr(s);
+
+    s[0].id = 1;
+    s[0].value = 42;
+
+    *opaque ctx = @ptrcast(*opaque, s);   // provenance = Sensor
+    *Motor m = @ptrcast(*Motor, ctx);     // ERROR: provenance mismatch
+    return 0;
+}

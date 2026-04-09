@@ -646,6 +646,81 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
     return false;
 }
 
+/* ---- Unified escape flag helpers (prevents BUG-421 class) ---- */
+
+/* Can this type carry a pointer? Only propagate escape flags to types that
+ * can actually hold a reference to stack/arena memory. Scalar types (u32,
+ * bool, enum, handle) cannot carry pointers — propagating flags to them
+ * causes false positives (BUG-421). */
+static bool type_can_carry_pointer(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+                   eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+                   eff->kind == TYPE_OPAQUE);
+}
+
+/* Propagate is_local_derived / is_arena_derived / is_from_arena from src to dst,
+ * but ONLY if dst's type can carry a pointer. Centralizes the 3-flag propagation
+ * pattern that was scattered at 5+ sites (4 of which were missing the type guard). */
+static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
+    if (!dst || !src || !type_can_carry_pointer(dst_type)) return;
+    if (src->is_local_derived) dst->is_local_derived = true;
+    if (src->is_arena_derived) dst->is_arena_derived = true;
+    if (src->is_from_arena) dst->is_from_arena = true;
+}
+
+/* ---- ISR ban helper ---- */
+
+/* Check if we're inside an interrupt handler and reject heap allocation.
+ * Returns true if banned (error emitted). Centralizes the 4 ISR check sites. */
+static bool check_isr_ban(Checker *c, int line, const char *method) {
+    if (!c->in_interrupt) return false;
+    checker_error(c, line,
+        "%s not allowed in interrupt handler — "
+        "malloc/calloc may deadlock. Use Pool(T, N) instead", method);
+    return true;
+}
+
+/* ---- Auto-slab helper ---- */
+
+/* Find or create an auto-Slab for a struct type (used by Task.new/new_ptr).
+ * Returns the auto-slab Symbol. Deduplicates the 40-line creation block. */
+static Symbol *find_or_create_auto_slab(Checker *c, Type *struct_type) {
+    /* Check existing */
+    for (int i = 0; i < c->auto_slab_count; i++) {
+        if (type_equals(c->auto_slabs[i].elem_type, struct_type))
+            return c->auto_slabs[i].slab_sym;
+    }
+    /* Create new */
+    char slab_name[128];
+    int sn_len = snprintf(slab_name, sizeof(slab_name),
+        "_zer_auto_slab_%.*s",
+        (int)struct_type->struct_type.name_len, struct_type->struct_type.name);
+    Type *slab_type = (Type *)arena_alloc(c->arena, sizeof(Type));
+    memset(slab_type, 0, sizeof(Type));
+    slab_type->kind = TYPE_SLAB;
+    slab_type->slab.elem = struct_type;
+    char *name_copy = (char *)arena_alloc(c->arena, sn_len + 1);
+    memcpy(name_copy, slab_name, sn_len + 1);
+    Symbol *auto_sym = scope_add(c->arena, c->global_scope,
+        name_copy, (uint32_t)sn_len, slab_type, 0, c->file_name);
+    /* Register in auto_slabs array */
+    if (c->auto_slab_count >= c->auto_slab_capacity) {
+        int nc = c->auto_slab_capacity * 2;
+        if (nc < 8) nc = 8;
+        void *new_arr = arena_alloc(c->arena, nc * sizeof(c->auto_slabs[0]));
+        if (c->auto_slab_count > 0)
+            memcpy(new_arr, c->auto_slabs, c->auto_slab_count * sizeof(c->auto_slabs[0]));
+        c->auto_slabs = new_arr;
+        c->auto_slab_capacity = nc;
+    }
+    c->auto_slabs[c->auto_slab_count].elem_type = struct_type;
+    c->auto_slabs[c->auto_slab_count].slab_sym = auto_sym;
+    c->auto_slab_count++;
+    return auto_sym;
+}
+
 /* ================================================================
  * TYPE RESOLUTION: TypeNode (syntactic) → Type (semantic)
  * ================================================================ */
@@ -1891,9 +1966,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             if (fb && fb->kind == NODE_IDENT) {
                                 Symbol *src = scope_lookup(c->current_scope,
                                     fb->ident.name, (uint32_t)fb->ident.name_len);
-                                if (src && src->is_local_derived) tsym->is_local_derived = true;
-                                if (src && src->is_arena_derived) tsym->is_arena_derived = true;
-                                if (src && src->is_from_arena) tsym->is_from_arena = true;
+                                if (src) propagate_escape_flags(tsym, src, tsym->type);
                             }
                             vcheck = vcheck->orelse.expr;
                         }
@@ -1916,9 +1989,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (vcheck->kind == NODE_IDENT) {
                             Symbol *src = scope_lookup(c->current_scope,
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
-                            if (src && src->is_local_derived) tsym->is_local_derived = true;
-                            if (src && src->is_arena_derived) tsym->is_arena_derived = true;
-                                if (src && src->is_from_arena) tsym->is_from_arena = true;
+                            if (src) propagate_escape_flags(tsym, src, tsym->type);
                             /* provenance propagation through alias (compile-time belt) */
                             if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
                             if (src && src->container_struct) {
@@ -2708,10 +2779,7 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Slab methods — same API as Pool but dynamically growable */
             if (obj->kind == TYPE_SLAB) {
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
-                    if (c->in_interrupt)
-                        checker_error(c, node->loc.line,
-                            "slab.alloc() not allowed in interrupt handler — "
-                            "malloc/calloc may deadlock. Use Pool(T, N) instead");
+                    check_isr_ban(c, node->loc.line, "slab.alloc()");
                     if (obj_is_const)
                         checker_error(c, node->loc.line,
                             "cannot call mutating method 'alloc' on const Slab");
@@ -2763,10 +2831,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
-                    if (c->in_interrupt)
-                        checker_error(c, node->loc.line,
-                            "slab.alloc_ptr() not allowed in interrupt handler — "
-                            "malloc/calloc may deadlock. Use Pool instead");
+                    check_isr_ban(c, node->loc.line, "slab.alloc_ptr()");
                     if (obj_is_const)
                         checker_error(c, node->loc.line,
                             "cannot call mutating method 'alloc_ptr' on const Slab");
@@ -2897,98 +2962,21 @@ static Type *check_expr(Checker *c, Node *node) {
             obj = type_unwrap_distinct(obj);
             if (obj->kind == TYPE_STRUCT) {
                 if (mlen == 3 && memcmp(mname, "new", 3) == 0) {
-                    if (c->in_interrupt)
-                        checker_error(c, node->loc.line,
-                            "%.*s.new() not allowed in interrupt handler — uses calloc. Use Pool instead",
-                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                    check_isr_ban(c, node->loc.line, "Task.new()");
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "%.*s.new() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
-                    /* find or create auto-Slab for this struct type */
-                    Symbol *auto_sym = NULL;
-                    for (int asi = 0; asi < c->auto_slab_count; asi++) {
-                        if (type_equals(c->auto_slabs[asi].elem_type, obj)) {
-                            auto_sym = c->auto_slabs[asi].slab_sym;
-                            break;
-                        }
-                    }
-                    if (!auto_sym) {
-                        /* create auto-slab symbol in global scope */
-                        char slab_name[128];
-                        int sn_len = snprintf(slab_name, sizeof(slab_name),
-                            "_zer_auto_slab_%.*s",
-                            (int)obj->struct_type.name_len, obj->struct_type.name);
-                        Type *slab_type = (Type *)arena_alloc(c->arena, sizeof(Type));
-                        memset(slab_type, 0, sizeof(Type));
-                        slab_type->kind = TYPE_SLAB;
-                        slab_type->slab.elem = obj;
-                        char *name_copy = (char *)arena_alloc(c->arena, sn_len + 1);
-                        memcpy(name_copy, slab_name, sn_len + 1);
-                        auto_sym = scope_add(c->arena, c->global_scope,
-                            name_copy, (uint32_t)sn_len, slab_type, 0, c->file_name);
-                        /* register in auto_slabs array */
-                        if (c->auto_slab_count >= c->auto_slab_capacity) {
-                            int nc = c->auto_slab_capacity * 2;
-                            if (nc < 8) nc = 8;
-                            void *new_arr = arena_alloc(c->arena, nc * sizeof(c->auto_slabs[0]));
-                            if (c->auto_slab_count > 0)
-                                memcpy(new_arr, c->auto_slabs, c->auto_slab_count * sizeof(c->auto_slabs[0]));
-                            c->auto_slabs = new_arr;
-                            c->auto_slab_capacity = nc;
-                        }
-                        c->auto_slabs[c->auto_slab_count].elem_type = obj;
-                        c->auto_slabs[c->auto_slab_count].slab_sym = auto_sym;
-                        c->auto_slab_count++;
-                    }
-                    /* return ?Handle(T) — same as slab.alloc() */
+                    find_or_create_auto_slab(c, obj);
                     result = type_optional(c->arena, type_handle(c->arena, obj));
                     typemap_set(c, field_node, result);
                     break;
                 }
                 if (mlen == 7 && memcmp(mname, "new_ptr", 7) == 0) {
-                    /* Task.new_ptr() → ?*Task — same as slab.alloc_ptr() */
-                    if (c->in_interrupt)
-                        checker_error(c, node->loc.line,
-                            "%.*s.new_ptr() not allowed in interrupt handler — uses calloc. Use Pool instead",
-                            (int)obj->struct_type.name_len, obj->struct_type.name);
+                    check_isr_ban(c, node->loc.line, "Task.new_ptr()");
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "%.*s.new_ptr() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
-                    /* find or create auto-slab (same as .new) */
-                    Symbol *auto_sym = NULL;
-                    for (int asi = 0; asi < c->auto_slab_count; asi++) {
-                        if (type_equals(c->auto_slabs[asi].elem_type, obj)) {
-                            auto_sym = c->auto_slabs[asi].slab_sym;
-                            break;
-                        }
-                    }
-                    if (!auto_sym) {
-                        /* same auto-slab creation as .new — reuse when both called */
-                        char slab_name[128];
-                        int sn_len = snprintf(slab_name, sizeof(slab_name),
-                            "_zer_auto_slab_%.*s",
-                            (int)obj->struct_type.name_len, obj->struct_type.name);
-                        Type *slab_type = (Type *)arena_alloc(c->arena, sizeof(Type));
-                        memset(slab_type, 0, sizeof(Type));
-                        slab_type->kind = TYPE_SLAB;
-                        slab_type->slab.elem = obj;
-                        char *name_copy = (char *)arena_alloc(c->arena, sn_len + 1);
-                        memcpy(name_copy, slab_name, sn_len + 1);
-                        auto_sym = scope_add(c->arena, c->global_scope,
-                            name_copy, (uint32_t)sn_len, slab_type, 0, c->file_name);
-                        if (c->auto_slab_count >= c->auto_slab_capacity) {
-                            int nc = c->auto_slab_capacity * 2;
-                            if (nc < 8) nc = 8;
-                            void *new_arr = arena_alloc(c->arena, nc * sizeof(c->auto_slabs[0]));
-                            if (c->auto_slab_count > 0)
-                                memcpy(new_arr, c->auto_slabs, c->auto_slab_count * sizeof(c->auto_slabs[0]));
-                            c->auto_slabs = new_arr;
-                            c->auto_slab_capacity = nc;
-                        }
-                        c->auto_slabs[c->auto_slab_count].elem_type = obj;
-                        c->auto_slabs[c->auto_slab_count].slab_sym = auto_sym;
-                        c->auto_slab_count++;
-                    }
+                    find_or_create_auto_slab(c, obj);
                     result = type_optional(c->arena, type_pointer(c->arena, obj));
                     typemap_set(c, field_node, result);
                     break;
@@ -5294,17 +5282,7 @@ static void check_stmt(Checker *c, Node *node) {
                              * (u32, bool, etc.) can't escape local memory even if the
                              * source struct was marked local-derived. Without this check,
                              * u32 val = struct_result.field falsely inherits the flag. */
-                            Type *sym_eff = type ? type_unwrap_distinct(type) : NULL;
-                            bool can_carry_ptr = sym_eff && (
-                                sym_eff->kind == TYPE_POINTER || sym_eff->kind == TYPE_SLICE ||
-                                sym_eff->kind == TYPE_STRUCT || sym_eff->kind == TYPE_UNION ||
-                                sym_eff->kind == TYPE_OPAQUE);
-                            if (src && src->is_arena_derived && can_carry_ptr)
-                                sym->is_arena_derived = true;
-                            if (src && src->is_from_arena && can_carry_ptr)
-                                sym->is_from_arena = true;
-                            if (src && src->is_local_derived && can_carry_ptr)
-                                sym->is_local_derived = true;
+                            if (src) propagate_escape_flags(sym, src, type);
                         }
                     }
                 }
@@ -5692,9 +5670,7 @@ static void check_stmt(Checker *c, Node *node) {
                         if (croot && croot->kind == NODE_IDENT) {
                             Symbol *csym = scope_lookup(c->current_scope,
                                 croot->ident.name, (uint32_t)croot->ident.name_len);
-                            if (csym && csym->is_local_derived) cap->is_local_derived = true;
-                            if (csym && csym->is_arena_derived) cap->is_arena_derived = true;
-                            if (csym && csym->is_from_arena) cap->is_from_arena = true;
+                            if (csym) propagate_escape_flags(cap, csym, cap->type);
                         }
                     }
 
@@ -6101,9 +6077,7 @@ static void check_stmt(Checker *c, Node *node) {
                     if (sw_root && sw_root->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             sw_root->ident.name, (uint32_t)sw_root->ident.name_len);
-                        if (src && src->is_local_derived) cap->is_local_derived = true;
-                        if (src && src->is_arena_derived) cap->is_arena_derived = true;
-                        if (src && src->is_from_arena) cap->is_from_arena = true;
+                        if (src) propagate_escape_flags(cap, src, cap->type);
                     }
                 }
 

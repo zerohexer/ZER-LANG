@@ -1,0 +1,30 @@
+// Rust borrowck: all match arms drop → value definitely dropped.
+// ZER: all switch arms free handle → FREED after switch. No leak.
+
+struct Task { u32 kind; u32 data; }
+Pool(Task, 4) pool;
+
+enum Action { process, store, discard }
+
+i32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    pool.get(h).kind = 1;
+    pool.get(h).data = 99;
+
+    Action act = Action.process;
+    switch (act) {
+        .process => {
+            u32 d = h.data;
+            pool.free(h);
+        }
+        .store => {
+            pool.free(h);
+        }
+        .discard => {
+            pool.free(h);
+        }
+    }
+    // All 3 arms freed h → clean, no leak
+    return 0;
+}

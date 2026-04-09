@@ -1,0 +1,30 @@
+// Rust drop: nested struct with multiple Drop — inner drops before outer.
+// ZER: nested defers in inner blocks fire before outer defers. LIFO order.
+
+
+struct Inner { u32 id; }
+struct Outer { u32 id; }
+Slab(Outer) slab_outer;
+Slab(Inner) slab_inner;
+
+i32 main() {
+    ?Handle(Outer) mo = slab_outer.alloc();
+    Handle(Outer) ho = mo orelse return;
+    defer slab_outer.free(ho);
+    slab_outer.get(ho).id = 1;
+
+    // Inner block with its own resource
+    {
+        ?Handle(Inner) mi = slab_inner.alloc();
+        Handle(Inner) hi = mi orelse return;
+        defer slab_inner.free(hi);
+        slab_inner.get(hi).id = 2;
+        // hi freed here when block exits (inner defer)
+    }
+
+    // ho still alive — inner defer didn't affect outer
+    u32 outer_id = ho.id;
+    if (outer_id != 1) { return 1; }
+    // ho freed when main exits (outer defer)
+    return 0;
+}

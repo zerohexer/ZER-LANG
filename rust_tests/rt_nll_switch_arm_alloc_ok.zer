@@ -1,0 +1,38 @@
+// Rust NLL: each match arm has independent borrows — no conflict.
+// ZER: each switch arm allocates+defers independently, all clean.
+
+
+struct Item { u32 kind; u32 data; }
+Pool(Item, 4) pool;
+
+u32 process(u32 mode) {
+    switch (mode) {
+        0 => {
+            ?Handle(Item) mh = pool.alloc();
+            Handle(Item) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).data = 10;
+            return h.data;
+        }
+        1 => {
+            ?Handle(Item) mh = pool.alloc();
+            Handle(Item) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).data = 20;
+            return h.data;
+        }
+        default => {
+            return 0;
+        }
+    }
+}
+
+i32 main() {
+    u32 r0 = process(0);
+    u32 r1 = process(1);
+    u32 r2 = process(2);
+    if (r0 != 10) { return 1; }
+    if (r1 != 20) { return 2; }
+    if (r2 != 0) { return 3; }
+    return 0;
+}

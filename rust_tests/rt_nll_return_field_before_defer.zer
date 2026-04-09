@@ -1,0 +1,23 @@
+// Rust NLL: Drop+borrow conflict — borrow used before destructor runs.
+// ZER: defer free(h) + return h.field → BUG-442 hoists return expr into temp.
+// Scalar field read before defer fires — safe pattern.
+
+
+struct Data { u32 value; u32 flags; }
+Pool(Data, 4) pool;
+
+u32 extract_value() {
+    ?Handle(Data) mh = pool.alloc();
+    Handle(Data) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).value = 42;
+    pool.get(h).flags = 1;
+    // h.value read is hoisted into temp BEFORE defer fires (BUG-442)
+    return h.value;
+}
+
+i32 main() {
+    u32 v = extract_value();
+    if (v != 42) { return 1; }
+    return 0;
+}

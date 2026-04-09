@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Rust: let b = a; use(a) → error (a moved by assignment)
+// ZER: assign move struct = transfer ownership, use original = error
+// This is the ASSIGN variant — different from function-call transfer
+
+move struct Handle { u32 fd; u32 flags; }
+
+i32 main() {
+    Handle a;
+    a.fd = 5;
+    a.flags = 0;
+    Handle b = a;       // a transferred to b
+    u32 f = a.fd;       // error: a is transferred
+    return 0;
+}

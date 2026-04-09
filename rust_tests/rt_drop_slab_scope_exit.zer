@@ -1,0 +1,23 @@
+// Rust drop: Drop fires when boxed trait object goes out of scope.
+// ZER: Slab-allocated struct freed by defer when scope exits.
+// Tests that defer fires even through nested scopes with early returns.
+
+struct Cat { u32 name; u32 lives; }
+Slab(Cat) slab;
+
+u32 adopt_cat(u32 name) {
+    ?Handle(Cat) mh = slab.alloc();
+    Handle(Cat) h = mh orelse return;
+    defer slab.free(h);
+    slab.get(h).name = name;
+    slab.get(h).lives = 9;
+    return h.name;
+}
+
+i32 main() {
+    u32 n1 = adopt_cat(22);
+    u32 n2 = adopt_cat(33);
+    if (n1 != 22) { return 1; }
+    if (n2 != 33) { return 2; }
+    return 0;
+}

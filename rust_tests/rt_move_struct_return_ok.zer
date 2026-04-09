@@ -1,0 +1,29 @@
+// Rust equivalent: fn make() -> Resource { Resource { id: 42 } }
+// Function creates and returns a move struct — caller gets ownership.
+// Tests the return path: returning a move struct is a move to caller.
+
+move struct Resource { u32 id; u32 version; }
+
+Resource create(u32 id, u32 ver) {
+    Resource r;
+    r.id = id;
+    r.version = ver;
+    return r;
+}
+
+u32 get_id(Resource r) {
+    return r.id;
+}
+
+i32 main() {
+    Resource r = create(42, 1);
+    u32 id = get_id(r);       // r moved into get_id
+    if (id != 42) { return 1; }
+
+    // Create another — caller gets fresh ownership each time
+    Resource r2 = create(100, 2);
+    u32 id2 = get_id(r2);
+    if (id2 != 100) { return 2; }
+
+    return 0;
+}

@@ -1,158 +1,127 @@
-# Rust Test Suite → ZER-LANG Safety Test Mapping
+# ZER Safety Test Suite
 
-## Purpose
-Translate Rust's tests/ui/ safety tests to ZER equivalents. Each test
-preserves the SAFETY INTENT from the original Rust test, using ZER's
-memory model (Pool/Slab/Handle/Arena instead of Box/Rc/Arc).
+527 tests (361 positive, 166 negative), 0 failures. Updated 2026-04-09.
+Runner: `run_tests.sh` — auto-detects negative tests via `reject` in name or `EXPECTED: compile error` in file.
 
-## Test Count: 350 tests, 0 failures
+## How to Use This File
 
-## Rust Directory Coverage
+**Adding tests:** Drop `.zer` files in this directory. Runner picks them up automatically.
+**Negative tests:** Add `// EXPECTED: compile error` as first or second line.
+**Naming:** `rt_<category>_<description>.zer` for Rust-translated, `gen_<category>_NNN.zer` for generated.
+**Limitations:** Tests that expose unimplemented compiler checks go in `limitations/` (excluded from runner).
 
-### tests/ui/threads-sendsync/ — COMPLETE (51/67 translated)
+## Coverage by Safety Property
 
-All 67 .rs files reviewed. 51 translated to ZER. 16 not translatable
-(Rust-specific features with no ZER equivalent).
+Each row = one safety property ZER enforces. Count = how many tests exercise it.
 
-**Translated (51 files):**
+| Safety Property | Positive | Negative | Total | Key Test Prefixes |
+|---|---|---|---|---|
+| Use-after-free (handle) | 15 | 25 | 40 | gen_uaf_, rt_uaf_, rt_handle_, safety_uaf_ |
+| Use-after-move (move struct) | 8 | 8 | 16 | rt_move_struct_ |
+| Double free | 3 | 10 | 13 | gen_double_free_, rt_double_free_ |
+| Maybe-freed (conditional) | 3 | 6 | 9 | rt_maybe_freed_, rt_conditional_ |
+| Handle leak / overwrite | 2 | 8 | 10 | rt_handle_leak_, rt_ghost_, safety_handle_ |
+| Scope escape (dangling ptr) | 2 | 10 | 12 | gen_scope_escape_, rt_scope_, rt_dangling_ |
+| Interior pointer UAF | 2 | 3 | 5 | rt_interior_, rt_subpath_, safety_interior_ |
+| Bounds / OOB | 8 | 8 | 16 | gen_bounds_, safety_bounds_, rt_const_oob |
+| Division by zero | 3 | 9 | 12 | gen_div_, safety_div_, safety_mod_ |
+| Null safety | 3 | 4 | 7 | gen_null_, safety_null_ |
+| Narrowing / truncation | 1 | 9 | 10 | gen_narrowing_, rt_narrowing_, safety_narrowing_ |
+| Overflow (wraps, no UB) | 4 | 0 | 4 | gen_overflow_, safety_overflow_, rt_overflow_ |
+| *opaque provenance | 12 | 7 | 19 | rt_opaque_, safety_opaque_ |
+| Shared struct / locking | 12 | 4 | 16 | gen_shared_, rt_shared_, conc_shared_ |
+| Spawn / thread safety | 15 | 9 | 24 | rt_spawn_, conc_reject_, rt_send_ |
+| Deadlock detection | 3 | 3 | 6 | rt_deadlock_, conc_reject_deadlock_ |
+| Defer / cleanup ordering | 15 | 2 | 17 | gen_defer_, rt_defer_, rt_drop_, safety_defer_ |
+| Pool / Slab / Handle ops | 20 | 6 | 26 | rt_pool_, rt_slab_, gen_handle_ |
+| Arena (alloc/escape) | 6 | 4 | 10 | rt_arena_, gen_arena_, safety_arena_ |
+| Async / coroutines | 14 | 2 | 16 | gen_async_, rc_async_, conc_async_ |
+| Comptime | 8 | 2 | 10 | rt_comptime_, gen_comptime_, safety_comptime_ |
+| Volatile / MMIO | 3 | 2 | 5 | rt_unsafe_mmio_, gen_volatile_ |
+| Ring channel | 7 | 1 | 8 | gen_ring_, rc_ring_ |
+| Enum / union / switch | 6 | 2 | 8 | gen_enum_, rt_union_, safety_enum_ |
+| Funcptr / typedef | 5 | 0 | 5 | gen_funcptr_ |
+| Goto / labels | 3 | 0 | 3 | gen_goto_ |
+| Borrowck patterns (NLL) | 10 | 13 | 23 | rt_borrowck_, rt_borrow_, rt_nll_ |
+| Drop ordering (Rust Drop) | 10 | 4 | 14 | rt_drop_ |
+| Cross-function analysis | 5 | 5 | 10 | rt_cross_, rt_zercheck_, rt_slab_cross_ |
+| Thread comms (Ring/shared) | 22 | 0 | 22 | rt_task_comm_ |
 
-| Rust File | ZER Test | Pattern |
-|---|---|---|
-| task-comm-0.rs | rt_task_comm_0 | 3 messages through Ring, verify FIFO |
-| task-comm-1.rs | rt_task_comm_1 | Basic spawn + join |
-| task-comm-3.rs | rt_task_comm_3 | 16 threads, shared counter, sum=480 |
-| task-comm-4.rs | rt_task_comm_4 | Single-thread Ring: push 8, pop 8, sum=36 |
-| task-comm-5.rs | rt_task_comm_5 | 100 messages through Ring, sum=4950 |
-| task-comm-6.rs | rt_task_comm_6 | 4 senders, shared accumulator, sum=1998000 |
-| task-comm-7.rs | rt_task_comm_7 | 4 threads with offsets, verify sum |
-| task-comm-9.rs | rt_task_comm_9 | Thread sends 0..9, main sums=45 |
-| task-comm-10.rs | rt_task_comm_10 | Bidirectional signaling via shared struct |
-| task-comm-11.rs | rt_task_comm_11 | Channel-of-channels → shared condvar |
-| task-comm-12.rs | rt_task_comm_12 | Spawn, yield, join finished thread |
-| task-comm-13.rs | rt_task_comm_13 | Thread sends 10 msgs, join, no deadlock |
-| task-comm-14.rs | rt_task_comm_14 | 10 threads send IDs, sum=45 |
-| task-comm-15.rs | rt_task_comm_15 | Graceful receiver death handling |
-| task-comm-16.rs | rt_task_comm_16 | Struct/Packet through Ring, FIFO verify |
-| task-comm-17.rs | rt_task_comm_17 | Spawn temp closure (issue #922) |
-| task-comm-chan-nil.rs | rt_task_comm_chan_nil | Send unit through Ring |
-| issue-4446.rs | rt_issue_4446 | Send string → shared struct signal |
-| issue-4448.rs | rt_issue_4448 | Thread receives message, asserts |
-| issue-8827.rs | rt_issue_8827 | FizzBuzz with modulo logic |
-| issue-9396.rs | rt_issue_9396 | try_recv polling → atomic flag poll |
-| issue-29488.rs | rt_issue_29488 | TLS with Drop order → threadlocal |
-| child-outlives-parent.rs | rt_child_outlives_parent | Thread takes owned data |
-| clone-with-exterior.rs | rt_clone_with_exterior | Clone for thread, keep original |
-| comm.rs | rt_comm | Basic channel: child sends 10 |
-| mpsc_stress.rs | rt_mpsc_stress | 4 writers stress test |
-| rc-is-not-send.rs | rt_rc_is_not_send | Non-Send → spawn rejects (NEGATIVE) |
-| recursive-thread-spawn.rs | rt_recursive_thread_spawn | 10 sequential spawns |
-| send-is-not-static-par-for.rs | rt_send_is_not_static | par_for → shared accumulator |
-| send-resource.rs | rt_send_resource | Move resource to thread |
-| send-type-inference.rs | rt_send_type_inference | Type inference with Ring |
-| sendable-class.rs | rt_sendable_class | Struct through Ring |
-| sendfn-spawn-with-fn-arg.rs | rt_sendfn_spawn_with_fn_arg | Function dispatch via value arg |
-| spawn-fn.rs | rt_spawn_fn | Spawn bare function |
-| spawn-types.rs | rt_spawn_types | Different parameter types |
-| spawn.rs | rt_spawn | Basic spawn + join |
-| spawn2.rs | rt_spawn2 | Spawn with captured value |
-| std-sync-right-kind-impls.rs | rt_sync_send_in_std | Verify sync types compile |
-| sync-send-atomics.rs | rt_sync_send_atomics | Atomics cross-thread |
-| task-life-0.rs | rt_task_life_0 | Thread starts/finishes, main continues |
-| task-spawn-barefn.rs | rt_task_spawn_barefn | Spawn bare fn |
-| task-spawn-move-and-copy.rs | rt_task_spawn_move_and_copy | Value preserved across thread |
-| thread-join-unwrap.rs | rt_thread_join_unwrap | Minimal join |
-| threads.rs | rt_threads | Basic threading |
-| tls-dont-move-after-init.rs | rt_tls_dont_move_after_init | TLS pointer stability |
-| tls-init-on-init.rs | rt_tls_init_on_init | TLS re-entrant init |
-| trivial-message.rs | rt_trivial_message | Send one trivial message |
-| unwind-resource.rs | rt_unwind_resource | Drop on panic → defer cleanup |
-| yield.rs | rt_yield | Thread yield → async yield |
-| yield1.rs | rt_yield1 | Multiple yields |
-| yield2.rs | rt_yield2 | Parent yields for child |
+## Rust tests/ui/ Category Mapping
 
-**Not translatable (16 files) — Rust-specific features:**
+Status of translation from Rust's test suite directories:
 
-| Rust File | Why Not Translatable |
+| Rust Directory | Status | ZER Tests | Notes |
+|---|---|---|---|
+| threads-sendsync/ | **COMPLETE** | 51/67 | 16 not translatable (closures, HashMap, TLS destructors) |
+| borrowck/ | Partial | ~23 | UAF, field sensitivity, scope escape, interior ptr |
+| moves/ | Good | ~37 | move struct, conditional move, loop move, ownership chain |
+| drop/ | Partial | ~14 | defer ordering, cleanup on all paths, struct-as-object |
+| unsafe/ | Partial | ~8 | MMIO, @inttoptr, provenance |
+| consts/ | Partial | ~16 | shift safety, div-by-zero, OOB, overflow wraps, comptime |
+| nll/ | Minimal | ~4 | interior ptr, subpath invalidation, scope-limited borrow |
+
+### Not-translatable Rust patterns (skip these)
+Closures, traits (Send/Sync/Drop as trait), generics, iterators, HashMap/BTreeMap,
+Debug formatting, lifetime annotations, async runtime (tokio), Pin/Unpin,
+custom allocators, TLS destructors, stderr macros, subprocess testing.
+
+### High-value gaps to fill next
+1. **nll/** — two-phase borrows, polonius subsets, more subpath patterns
+2. **borrowck/** — field-level borrow isolation, reborrow sequences
+3. **moves/** — partial struct moves, move in match arms
+4. **unsafe/** — more MMIO patterns, provenance chains through *opaque
+5. **drop/** — conditional Drop, nested resource cleanup ordering
+
+## Rust → ZER Pattern Translation
+
+| Rust Pattern | ZER Equivalent |
 |---|---|
-| sendfn-is-a-block.rs | Closures (ZER has no closures) |
-| send_str_hashmap.rs | HashMap (ZER has no stdlib collections) |
-| send_str_treemap.rs | BTreeMap (ZER has no stdlib collections) |
-| spawning-with-debug.rs | Debug trait (no formatting equivalent) |
-| sync-send-iterators-in-libcollections.rs | Iterator trait bounds |
-| sync-send-iterators-in-libcore.rs | Iterator trait bounds |
-| thread-local-syntax.rs | TLS macro syntax (ZER uses keyword) |
-| thread-local-extern-static.rs | extern TLS |
-| tls-dtors-are-run-in-a-static-binary.rs | TLS destructors (no Drop trait) |
-| tls-in-global-alloc.rs | Custom global allocator + TLS |
-| tls-try-with.rs | TLS try_with during Drop |
-| eprint-on-tls-drop.rs | stderr + TLS drop |
-| task-stderr.rs | stderr access |
-| test-tasks-invalid-value.rs | Rust test harness env var parsing |
-| issue-24313.rs | TLS destructor panic in subprocess |
+| `Box<T>` | `Slab(T)` + `alloc_ptr` / `Pool(T,N)` + `alloc` |
+| `Drop` trait | `defer` |
+| `Rc<T>` / non-Send | non-shared `*T` to spawn → rejected |
+| `Arc<Mutex<T>>` | `shared struct` |
+| `RwLock<T>` | `shared(rw) struct` |
+| `mpsc::channel` | `Ring(T, N)` |
+| `thread::spawn` + join | `ThreadHandle th = spawn f(); th.join()` |
+| `thread::spawn` fire-forget | `spawn f()` (shared ptr or value args only) |
+| `Condvar` | `@cond_wait/signal/broadcast` |
+| `unsafe { *raw_ptr }` | `@inttoptr / @ptrcast` (always checked) |
+| `Box<dyn Any>` | `*opaque` + `@ptrcast` |
+| `const fn` | `comptime` |
+| `#[cfg]` | `comptime if` |
+| `move \|\|` closure | function + value args to spawn |
+| `mem::forget` | (no equivalent — ZER forces cleanup via zercheck) |
 
-### tests/ui/borrowck/ — Partial (13 patterns translated)
+## Test Naming Convention
 
-| Pattern | ZER Test | Safety Property |
-|---|---|---|
-| nested-calls-free | rt_borrowck_nested_calls_free | Cross-function UAF |
-| borrow-from-owned-ptr | rt_borrowck_borrow_from_owned_ptr | Interior pointer UAF |
-| assign-comp | rt_borrowck_assign_comp | Field pointer after free |
-| borrow-from-temporary | rt_borrowck_borrow_from_temporary | Return ptr to local |
-| block-uninit | rt_auto_zero_init | Auto-zero (ZER safer) |
-| and-init | rt_borrowck_and_init | Short-circuit auto-zero |
+| Prefix | Source | Count | Description |
+|---|---|---|---|
+| `rt_` | Rust tests/ui/ | ~280 | Direct translations preserving safety intent |
+| `gen_` | Generated | ~164 | Category coverage (UAF, bounds, defer, etc.) |
+| `rc_` | Rust concurrency | ~43 | Concurrency: shared, spawn, ring, atomic, cond |
+| `safety_` | Hand-written | ~27 | Core safety property demonstrations |
+| `conc_` | Hand-written | ~22 | Concurrency edge cases + reject patterns |
+| `ownership_` | Hand-written | ~3 | Ownership chain / loop / conditional |
 
-### tests/ui/moves/ — Partial (6 patterns translated)
+## Known Limitations
 
-| Pattern | ZER Test | Safety Property |
-|---|---|---|
-| moves-based-on-type-exprs | rt_moves_based_on_type_exprs | UAF after store in struct |
-| move-in-guard-1 | rt_move_in_guard_1 | MAYBE_FREED in branch |
-| move-out-of-field | rt_move_out_of_field | Consume via function |
-| no-reuse-move-arc | rt_no_reuse_move_arc | Shared struct safe after spawn |
-| issue-72649-uninit-in-loop | rt_issue_72649_uninit_in_loop | UAF in loop iteration |
-| move-3-unique | rt_move_3_unique | Conditional ownership |
+Tests in `limitations/` are correct (should reject) but the compiler doesn't catch them yet.
+Each file documents the root cause and fix direction.
 
-### tests/ui/unsafe/ — Partial (1 pattern translated)
+Currently: **empty** (all prior limitations fixed, last: BUG-468 conditional move).
 
-| Pattern | ZER Test | Safety Property |
-|---|---|---|
-| unsafe-fn-deref-ptr | rt_unsafe_fn_deref_ptr | @inttoptr without mmio decl |
+## File Counts by Category (for duplicate checking)
 
-## Other Test Categories
-
-### Generated tests (gen_*, rc_*) — 161 tests
-Category-based generation covering UAF, double-free, bounds, division,
-null safety, narrowing, scope escape, defer, handles, shared struct,
-async, arena, comptime, enum, union, funcptr, goto, overflow, Ring.
-
-### Hand-written safety tests (safety_*) — 27 tests
-Direct translations of Rust safety patterns: div-zero, mod-zero,
-overflow wrap, shift width, bounds OOB, UAF, double-free, dangling
-return, narrowing, null deref, union variant, exhaustive switch,
-defer cleanup, comptime eval, opaque provenance, arena escape.
-
-### Hand-written concurrency tests (conc_*) — 22 tests
-Shared counter, value transfer, deadlock ordering, atomic flag,
-multi-field shared, scoped pointer, async yield/multi-task,
-condvar producer-consumer, rwlock readers, threadlocal isolation,
-@once multithread, reject patterns (non-shared spawn, double join).
-
-### Hand-written ZER-specific (rt_ extra) — 15 tests
-Pool slot reuse, slab stress, handle array, shared counter 4-thread,
-condvar ping-pong, atomic CAS spinlock, *opaque round-trip, defer
-nested return, auto-zero init, alloc/free loop cycle.
-
-## Key Differences: ZER vs Rust
-
-| Aspect | Rust | ZER |
-|---|---|---|
-| UAF prevention | Borrow checker (lifetimes) | zercheck (ALIVE/FREED + gen counter) |
-| Leak detection | Drop trait (runtime) | zercheck (compile error) |
-| Null safety | Option<T> | ?*T / ?T |
-| Thread safety | Send/Sync traits | shared struct + spawn checker |
-| Deadlock | Runtime (thread poisoning) | Compile-time (lock ordering) |
-| Division by zero | Runtime panic | Compile error (forced guard) |
-| Buffer overflow | Runtime panic | Auto-guard or range-proven skip |
-| Unsafe escape | unsafe {} blocks | No unsafe — all ops checked |
-| Uninitialized vars | Compile error | Auto-zero (always 0) |
-| Integer overflow | Panic (debug) / wrap (release) | Always wrap (defined) |
+```
+164 gen_*          43 rc_*           29 rt_move_*
+ 27 safety_*       22 rt_task_*      19 rt_opaque_*
+ 14 rt_drop_*      13 conc_*         10 rt_handle_*
+ 10 rt_const_*      9 rt_defer_*      8 rt_unsafe_*
+  7 rt_slab_*       7 rt_borrowck_*   7 rt_borrow_*
+  6 rt_pool_*       6 rt_issue_*      5 rt_uaf_*
+  5 rt_comptime_*   4 rt_shared_*     4 rt_scope_*
+  4 rt_arena_*      4 rt_spawn_*      3 rt_send_*
+  3 rt_maybe_*      3 rt_ghost_*      3 rt_double_*
+  3 rt_deadlock_*   3 rt_nll_*
+```

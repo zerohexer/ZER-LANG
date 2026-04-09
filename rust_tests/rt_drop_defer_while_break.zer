@@ -1,0 +1,29 @@
+// Rust drop: Drop fires when break exits scope containing owned value.
+// ZER: defer inside while body — break exits loop, defer fires for that iteration.
+
+struct Work { u32 id; u32 cost; }
+Slab(Work) slab;
+
+u32 find_expensive() {
+    u32 i = 0;
+    while (i < 10) {
+        ?Handle(Work) mh = slab.alloc();
+        Handle(Work) h = mh orelse return;
+        defer slab.free(h);
+        slab.get(h).id = i;
+        slab.get(h).cost = i * 5;
+        if (h.cost > 20) {
+            return h.id;   // defer fires, h freed
+        }
+        // defer fires at end of iteration
+        i += 1;
+    }
+    return 0;
+}
+
+i32 main() {
+    u32 id = find_expensive();
+    // cost > 20 first at i=5 (cost=25)
+    if (id != 5) { return 1; }
+    return 0;
+}

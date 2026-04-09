@@ -1,0 +1,17 @@
+// Rust moves: create fresh value each iteration — no use-after-move.
+// ZER: create+consume fresh move struct each while iteration. Clean.
+
+move struct Msg { u32 code; }
+
+void send(Msg m) { u32 c = m.code; }
+
+i32 main() {
+    u32 i = 0;
+    while (i < 4) {
+        Msg m;
+        m.code = i;
+        send(m);    // fresh m each iteration — no conflict
+        i += 1;
+    }
+    return 0;
+}

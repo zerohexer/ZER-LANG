@@ -1,0 +1,28 @@
+// Rust borrowck: break out of loop with live borrow — borrow scoped to loop.
+// ZER: alloc + defer before loop, break early, defer fires at function exit.
+
+struct Config { u32 retries; u32 timeout; }
+Pool(Config, 4) pool;
+
+u32 find_config() {
+    ?Handle(Config) mh = pool.alloc();
+    Handle(Config) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).retries = 3;
+    pool.get(h).timeout = 100;
+
+    u32 result = 0;
+    for (u32 i = 0; i < 10; i += 1) {
+        if (i == h.retries) {
+            result = h.timeout;
+            break;
+        }
+    }
+    return result;
+}
+
+i32 main() {
+    u32 r = find_config();
+    if (r != 100) { return 1; }
+    return 0;
+}

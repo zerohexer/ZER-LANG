@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Rust NLL: cannot return reference to dropped value.
+// ZER: free handle then return field value via freed handle = UAF.
+
+Slab(u32) slab;
+
+struct Data { u32 value; }
+
+u32 bad_extract() {
+    ?Handle(Data) mh = slab.alloc();
+    Handle(Data) h = mh orelse return;
+    slab.get(h).value = 42;
+    slab.free(h);
+    // h is freed — accessing field through freed handle = UAF
+    return h.value;
+}
+
+i32 main() {
+    u32 v = bad_extract();
+    return 0;
+}

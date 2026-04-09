@@ -1,0 +1,25 @@
+// Rust unsafe: cast *const T to *const U with correct alignment.
+// ZER: *opaque round-trip with matching provenance — safe pattern.
+
+struct Sensor { u32 id; u32 value; u32 status; }
+Slab(Sensor) slab;
+
+void process_opaque(*opaque ctx) {
+    *Sensor s = (*Sensor)ctx;
+    u32 v = s[0].value;
+}
+
+i32 main() {
+    ?*Sensor ms = slab.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer slab.free_ptr(s);
+
+    s[0].id = 1;
+    s[0].value = 42;
+    s[0].status = 0;
+
+    *opaque ctx = (*opaque)s;
+    process_opaque(ctx);
+
+    return 0;
+}

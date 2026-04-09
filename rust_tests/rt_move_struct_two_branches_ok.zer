@@ -1,0 +1,26 @@
+// Both if/else branches create fresh move structs and consume them.
+// No path has a use-after-move — should compile and run.
+// Rust equivalent: if c { drop(make()); } else { drop(make()); }
+
+move struct Permit { u32 code; u32 expiry; }
+
+void use_permit(Permit p) {
+    u32 c = p.code;
+}
+
+i32 main() {
+    u32 x = 5;
+    if (x > 3) {
+        Permit p;
+        p.code = 1;
+        p.expiry = 100;
+        use_permit(p);
+    } else {
+        Permit p;
+        p.code = 2;
+        p.expiry = 200;
+        use_permit(p);
+    }
+    // Both branches consumed their own fresh Permit — clean state
+    return 0;
+}

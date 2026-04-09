@@ -65,9 +65,79 @@ static inline bool is_null_sentinel(Type *inner) {
 /* NOTE: Use is_null_sentinel(type) for full distinct-aware check.
  * IS_NULL_SENTINEL macro kept for backward compat where only kind is available. */
 
+static void emit_type(Emitter *e, Type *t); /* forward decl for optional helpers */
+
+/* ---- Unified optional emission helpers (prevents BUG-042/145/408/409 class) ----
+ * ?void has ONE field (has_value). ?T has TWO (value, has_value). ?*T uses null sentinel.
+ * These helpers centralize the branching so new optional paths can't get it wrong. */
+
+/* Is this type ?void (optional wrapping void)? ?void has NO .value field. */
+static bool is_void_opt(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    if (eff->kind != TYPE_OPTIONAL) return false;
+    Type *inner = type_unwrap_distinct(eff->optional.inner);
+    return inner && inner->kind == TYPE_VOID;
+}
+
+/* Emit null check for optional: "!tmp" for null sentinel, "!tmp.has_value" for struct */
+static void emit_opt_null_check(Emitter *e, int tmp_id, Type *opt_type) {
+    Type *eff = type_unwrap_distinct(opt_type);
+    if (is_null_sentinel(eff->optional.inner))
+        emit(e, "!_zer_tmp%d", tmp_id);
+    else
+        emit(e, "!_zer_tmp%d.has_value", tmp_id);
+}
+
+/* Emit unwrap for optional: "tmp" for null sentinel, "tmp.value" for struct, "(void)0" for ?void */
+static void emit_opt_unwrap(Emitter *e, int tmp_id, Type *opt_type) {
+    Type *eff = type_unwrap_distinct(opt_type);
+    if (is_null_sentinel(eff->optional.inner))
+        emit(e, "_zer_tmp%d", tmp_id);
+    else if (is_void_opt(opt_type))
+        emit(e, "(void)0");
+    else
+        emit(e, "_zer_tmp%d.value", tmp_id);
+}
+
+/* Emit null literal for optional type: "(T*)0" / "{ 0 }" / "{ 0, 0 }" */
+static void emit_opt_null_literal(Emitter *e, Type *opt_type) {
+    Type *eff = type_unwrap_distinct(opt_type);
+    if (is_null_sentinel(eff->optional.inner)) {
+        emit(e, "(");
+        emit_type(e, eff->optional.inner);
+        emit(e, ")0");
+    } else if (is_void_opt(opt_type)) {
+        emit(e, "(");
+        emit_type(e, opt_type);
+        emit(e, "){ 0 }");
+    } else {
+        emit(e, "(");
+        emit_type(e, opt_type);
+        emit(e, "){ 0, 0 }");
+    }
+}
+
+/* Emit return-null for current function's return type.
+ * Handles ?void, ?T struct, ?*T null sentinel, void, and scalar. */
+static void emit_return_null(Emitter *e) {
+    Type *ret = e->current_func_ret;
+    if (!ret || ret->kind == TYPE_VOID) {
+        emit(e, "return; ");
+        return;
+    }
+    Type *eff = type_unwrap_distinct(ret);
+    if (eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
+        emit(e, "return ");
+        emit_opt_null_literal(e, ret);
+        emit(e, "; ");
+    } else {
+        emit(e, "return 0; ");
+    }
+}
+
 /* ---- Array size emission helper (BUG-275) ---- */
 /* Emit array size — uses sizeof() for target-dependent sizes, numeric for constant */
-static void emit_type(Emitter *e, Type *t); /* forward decl */
 static void emit_array_size(Emitter *e, Type *arr_type) {
     if (arr_type->array.sizeof_type) {
         emit(e, "sizeof(");
@@ -1275,12 +1345,7 @@ static void emit_expr(Emitter *e, Node *node) {
                    tgt_eff->kind == TYPE_OPTIONAL &&
                    !is_null_sentinel(tgt_eff->optional.inner) &&
                    node->assign.value->kind == NODE_NULL_LIT) {
-            emit(e, "(");
-            emit_type(e, tgt_type);
-            if (type_unwrap_distinct(tgt_type->optional.inner)->kind == TYPE_VOID)
-                emit(e, "){ 0 }");
-            else
-                emit(e, "){ 0, 0 }");
+            emit_opt_null_literal(e, tgt_type);
         } else if (node->assign.op == TOK_EQ && tgt_eff && val_type &&
                    tgt_eff->kind == TYPE_SLICE &&
                    type_unwrap_distinct(val_type)->kind == TYPE_ARRAY) {
@@ -2155,19 +2220,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* emit defers before return/break/continue */
                 if (node->orelse.fallback_is_return) {
                     emit_defers(e);
-                    if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                        !is_null_sentinel(e->current_func_ret->optional.inner)) {
-                        emit(e, "return (");
-                        emit_type(e, e->current_func_ret);
-                        if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID)
-                            emit(e, "){ 0 }; ");
-                        else
-                            emit(e, "){ 0, 0 }; ");
-                    } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                        emit(e, "return 0; ");
-                    } else {
-                        emit(e, "return; ");
-                    }
+                    emit_return_null(e);
                 } else if (node->orelse.fallback_is_break) {
                     emit_defers_from(e, e->loop_defer_base);
                     emit(e, "break; ");
@@ -2192,19 +2245,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* emit defers before return/break/continue */
                 if (node->orelse.fallback_is_return) {
                     emit_defers(e);
-                    if (e->current_func_ret && e->current_func_ret->kind == TYPE_OPTIONAL &&
-                        !is_null_sentinel(e->current_func_ret->optional.inner)) {
-                        emit(e, "return (");
-                        emit_type(e, e->current_func_ret);
-                        if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID)
-                            emit(e, "){ 0 }; ");
-                        else
-                            emit(e, "){ 0, 0 }; ");
-                    } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                        emit(e, "return 0; ");
-                    } else {
-                        emit(e, "return; ");
-                    }
+                    emit_return_null(e);
                 } else if (node->orelse.fallback_is_break) {
                     emit_defers_from(e, e->loop_defer_base);
                     emit(e, "break; ");
@@ -2972,21 +3013,8 @@ static void emit_stmt(Emitter *e, Node *node) {
             }
             if (node->var_decl.init->orelse.fallback_is_return) {
                 emit(e, "{\n"); emit_defers(e);
-                Type *vd_ret = e->current_func_ret ? type_unwrap_distinct(e->current_func_ret) : NULL;
-                if (vd_ret && vd_ret->kind == TYPE_OPTIONAL &&
-                    !is_null_sentinel(vd_ret->optional.inner)) {
-                    /* ?T function: return null optional */
-                    emit(e, "return (");
-                    emit_type(e, e->current_func_ret);
-                    if (type_unwrap_distinct(e->current_func_ret->optional.inner)->kind == TYPE_VOID)
-                        emit(e, "){ 0 }; }\n");
-                    else
-                        emit(e, "){ 0, 0 }; }\n");
-                } else if (vd_ret && vd_ret->kind != TYPE_VOID) {
-                    emit(e, "return 0; }\n");
-                } else {
-                    emit(e, "return; }\n");
-                }
+                emit_return_null(e);
+                emit(e, "}\n");
             } else if (node->var_decl.init->orelse.fallback_is_break) {
                 emit(e, "{\n"); emit_defers_from(e, e->loop_defer_base); emit(e, "break; }\n");
             } else {

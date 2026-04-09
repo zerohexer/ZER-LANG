@@ -1,0 +1,20 @@
+// Rust borrowck: alloc+drop inside loop body — each iteration is clean.
+// ZER: Pool alloc+free per iteration. Slot reused each time.
+
+struct Counter { u32 n; }
+Pool(Counter, 4) pool;
+
+i32 main() {
+    u32 total = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        ?Handle(Counter) mh = pool.alloc();
+        Handle(Counter) h = mh orelse return;
+        pool.get(h).n = i;
+        total += h.n;
+        pool.free(h);
+        // h freed — next iteration allocates fresh
+    }
+    // total = 0+1+2+3+4 = 10
+    if (total != 10) { return 1; }
+    return 0;
+}

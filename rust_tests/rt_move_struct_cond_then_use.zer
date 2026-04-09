@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// LIMITATION (2026-04-09): zercheck does not track MAYBE_TRANSFERRED for
+// conditional moves. HS_TRANSFERRED in if-without-else should merge to a
+// "maybe" state and reject subsequent use. Currently it falls through as ALIVE.
+//
+// Fix direction: treat HS_TRANSFERRED like HS_FREED in path merge —
+// one path transfers, other doesn't → MAYBE_FREED equivalent.
+
+move struct Token { u32 kind; }
+
+void consume(Token t) { u32 k = t.kind; }
+
+i32 main() {
+    Token t;
+    t.kind = 42;
+    u32 flag = 1;
+    if (flag > 0) {
+        consume(t);   // moved on this path only
+    }
+    // t is MAYBE_TRANSFERRED — use should be an error, currently is not
+    u32 k = t.kind;
+    return 0;
+}

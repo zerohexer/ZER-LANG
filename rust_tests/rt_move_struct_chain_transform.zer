@@ -1,0 +1,24 @@
+// Rust: fn transform(r: Raw) -> Cooked { Cooked { val: r.data * 2 } }
+// Chain: Raw created → moved into transform → Cooked returned → consumed.
+
+move struct Raw { u32 data; }
+move struct Cooked { u32 result; }
+
+Cooked transform(Raw r) {
+    Cooked c;
+    c.result = r.data * 2;
+    return c;
+}
+
+u32 read(Cooked c) {
+    return c.result;
+}
+
+i32 main() {
+    Raw raw;
+    raw.data = 21;
+    Cooked cooked = transform(raw);  // raw moved into transform
+    u32 val = read(cooked);          // cooked moved into read
+    if (val != 42) { return 1; }
+    return 0;
+}

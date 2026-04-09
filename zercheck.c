@@ -1891,10 +1891,14 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
     case NODE_SWITCH: {
         zc_check_expr(zc, ps, node->switch_stmt.expr);
-        /* track which handles are freed in each arm */
-        bool *freed_all = NULL;
-        bool *freed_any = NULL;
+        /* CFG-aware switch merge: only non-terminated arms count for post-switch state.
+         * Arms that return/break/goto don't reach post-switch — their freed state
+         * shouldn't cause false MAYBE_FREED on the continuation path. */
+        bool *freed_all = NULL;   /* freed in ALL non-terminated arms */
+        bool *freed_any = NULL;   /* freed in SOME non-terminated arms */
         int *freed_line = NULL;
+        bool all_arms_terminated = true;
+        int fallthrough_count = 0;
         if (ps->handle_count > 0 && node->switch_stmt.arm_count > 0) {
             freed_all = calloc(ps->handle_count, sizeof(bool));
             freed_any = calloc(ps->handle_count, sizeof(bool));
@@ -1904,23 +1908,43 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             PathState arm_state = pathstate_copy(ps);
             zc_check_stmt(zc, &arm_state, node->switch_stmt.arms[i].body);
-            if (freed_all) {
-                for (int j = 0; j < ps->handle_count; j++) {
-                    HandleInfo *ah = find_handle(&arm_state, ps->handles[j].name,
-                                                 ps->handles[j].name_len);
-                    bool arm_freed = ah && is_handle_consumed(ah);
-                    if (!arm_freed) {
-                        freed_all[j] = false;
-                    } else {
-                        freed_any[j] = true;
-                        if (i == 0) freed_line[j] = ah->free_line;
+            if (arm_state.terminated) {
+                /* arm exits — doesn't reach post-switch, don't count for merge */
+                /* BUT still check if it consumed handles (for all-arms-freed detection) */
+                if (freed_all) {
+                    for (int j = 0; j < ps->handle_count; j++) {
+                        HandleInfo *ah = find_handle(&arm_state, ps->handles[j].name,
+                                                     ps->handles[j].name_len);
+                        bool arm_freed = ah && is_handle_consumed(ah);
+                        if (arm_freed && !freed_line[j])
+                            freed_line[j] = ah->free_line;
+                    }
+                }
+            } else {
+                /* arm falls through — its state matters for merge */
+                all_arms_terminated = false;
+                fallthrough_count++;
+                if (freed_all) {
+                    for (int j = 0; j < ps->handle_count; j++) {
+                        HandleInfo *ah = find_handle(&arm_state, ps->handles[j].name,
+                                                     ps->handles[j].name_len);
+                        bool arm_freed = ah && is_handle_consumed(ah);
+                        if (!arm_freed) {
+                            freed_all[j] = false;
+                        } else {
+                            freed_any[j] = true;
+                            if (!freed_line[j]) freed_line[j] = ah->free_line;
+                        }
                     }
                 }
             }
             pathstate_free(&arm_state);
         }
-        /* merge: ALL arms freed → FREED, SOME arms freed → MAYBE_FREED */
-        if (freed_all) {
+        if (all_arms_terminated) {
+            ps->terminated = true;
+        }
+        /* merge: among non-terminated arms: ALL freed → FREED, SOME → MAYBE_FREED */
+        if (freed_all && fallthrough_count > 0) {
             for (int j = 0; j < ps->handle_count; j++) {
                 if (freed_all[j]) {
                     ps->handles[j].state = HS_FREED;
@@ -1930,10 +1954,10 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                     ps->handles[j].free_line = freed_line[j];
                 }
             }
-            free(freed_all);
-            free(freed_any);
-            free(freed_line);
         }
+        if (freed_all) free(freed_all);
+        if (freed_any) free(freed_any);
+        if (freed_line) free(freed_line);
         break;
     }
 

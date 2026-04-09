@@ -1,0 +1,28 @@
+// CFG test: deeply nested conditions in loop — handle NOT freed.
+// Fixed-point should converge quickly (no state change per iteration).
+
+struct Cfg { u32 a; u32 b; u32 c; }
+Pool(Cfg, 4) pool;
+
+i32 main() {
+    ?Handle(Cfg) mh = pool.alloc();
+    Handle(Cfg) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).a = 1;
+    pool.get(h).b = 2;
+    pool.get(h).c = 3;
+
+    u32 total = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        if (h.a > 0) {
+            if (h.b > 0) {
+                if (h.c > 0) {
+                    total += h.a + h.b + h.c;
+                }
+            }
+        }
+    }
+    // total = 6 * 4 = 24
+    if (total != 24) { return 1; }
+    return 0;
+}

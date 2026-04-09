@@ -5,7 +5,15 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-04-09 — Move Struct Bugs, Systematic Refactoring, 567 Rust Tests
+## Session 2026-04-09 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 601 Tests
+
+### CFG-Aware Zercheck
+- **Problem:** Linear AST walk with per-construct merge hacks (block_always_exits, 2-pass+widen, backward goto re-walk). Adding new control flow required new hacks.
+- **Fix:** `PathState.terminated` flag + dynamic fixed-point iteration (ceiling 32). if/else/switch merge uses terminated to determine which paths reach post-construct. Loops and backward goto converge naturally via lattice monotonicity.
+- **Improvement:** Switch arms that return no longer cause false MAYBE_FREED on post-switch continuation. Nested if/else with returns on all paths correctly marks post-if as unreachable.
+- **Tests:** `rt_cfg_*` (9 tests), `tests/zer/cfg_fixedpoint_stress` (stress test).
+
+## Bugs Fixed This Session
 
 ### BUG-468: `move struct` conditional transfer not caught — MAYBE_TRANSFERRED not tracked
 - **Symptom:** `if (c) { consume(t); } t.field;` — zercheck allowed use after conditional move.

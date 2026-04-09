@@ -760,6 +760,15 @@ Pre-scan builds `FuncSummary` for each function with Handle params:
 
 **Flow in `zercheck_run`:** (1) register pools, (2) pre-scan: build summaries, (3) main analysis: check functions.
 
+### CFG-Aware Analysis (2026-04-09)
+zercheck uses CFG-aware path merging instead of linear AST walk hacks:
+- `PathState.terminated` flag — set on return/break/continue/goto. Used by merge logic to determine which paths reach post-if/switch.
+- **if/else merge:** 4-way — both-exit (post-if unreachable), then-exit (only else state), else-exit (only then state), both-fallthrough (merge).
+- **switch merge:** terminated arms excluded from post-switch state. Only non-exiting arms count for FREED/MAYBE_FREED.
+- **Loop:** dynamic fixed-point iteration (ceiling 32) until states stabilize. Convergence guaranteed by finite lattice (5 states per handle, monotone transitions). No manual widen step.
+- **Backward goto:** same dynamic fixed-point over label..goto region.
+- `pathstate_equal(a, b)` — checks if all handle states match (convergence test).
+
 ### Unified Helpers (Option A refactor, 2026-04-09)
 All state/type checks go through centralized helpers. New states or move-like types only need updating in ONE place:
 - `should_track_move(Type *t)` — `is_move_struct_type(t) || contains_move_struct_field(t)`. Used at 5 sites.

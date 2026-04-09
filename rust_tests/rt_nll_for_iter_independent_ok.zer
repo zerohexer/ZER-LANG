@@ -1,0 +1,23 @@
+// Rust NLL: each loop iteration's borrow is independent.
+// ZER: accumulate values from pool handles across iterations — each alloc/free cycle clean.
+
+struct Point { u32 x; u32 y; }
+Pool(Point, 4) pool;
+
+i32 main() {
+    u32 sum_x = 0;
+    u32 sum_y = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Point) mh = pool.alloc();
+        Handle(Point) h = mh orelse return;
+        pool.get(h).x = i * 2;
+        pool.get(h).y = i * 3;
+        sum_x += h.x;
+        sum_y += h.y;
+        pool.free(h);
+    }
+    // sum_x = 0+2+4+6 = 12, sum_y = 0+3+6+9 = 18
+    if (sum_x != 12) { return 1; }
+    if (sum_y != 18) { return 2; }
+    return 0;
+}

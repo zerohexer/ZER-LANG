@@ -1,0 +1,28 @@
+// EXPECTED: compile error
+// Rust borrowck: 3-layer call chain frees resource — caller use = UAF.
+// ZER: a() calls b() calls c() which frees. Summary chains through all 3 layers.
+
+struct Res { u32 val; }
+Slab(Res) slab;
+
+void free_res(*Res r) {
+    slab.free_ptr(r);
+}
+
+void cleanup(*Res r) {
+    free_res(r);
+}
+
+void shutdown(*Res r) {
+    cleanup(r);
+}
+
+i32 main() {
+    ?*Res mr = slab.alloc_ptr();
+    *Res r = mr orelse return;
+    r[0].val = 99;
+    shutdown(r);
+    // r freed through 3-layer chain — UAF
+    u32 v = r[0].val;
+    return 0;
+}

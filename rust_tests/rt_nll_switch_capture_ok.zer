@@ -1,0 +1,29 @@
+// Rust NLL: match arm captures are scoped to the arm — no leak across arms.
+// ZER: switch arm with if-unwrap capture, handle freed in each arm independently.
+
+struct Msg { u32 code; u32 data; }
+Pool(Msg, 8) pool;
+
+u32 dispatch(u32 action) {
+    ?Handle(Msg) mh = pool.alloc();
+    Handle(Msg) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).code = action;
+    pool.get(h).data = action * 10;
+
+    switch (action) {
+        0 => { return h.data; }
+        1 => { return h.code + h.data; }
+        default => { return 0; }
+    }
+}
+
+i32 main() {
+    u32 r0 = dispatch(0);
+    u32 r1 = dispatch(1);
+    u32 r2 = dispatch(5);
+    if (r0 != 0) { return 1; }
+    if (r1 != 11) { return 2; }
+    if (r2 != 0) { return 3; }
+    return 0;
+}

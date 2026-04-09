@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Rust moves: consume in one switch arm, use after switch = error.
+// ZER: move struct consumed in one arm, used after switch = MAYBE_TRANSFERRED.
+
+move struct Token { u32 kind; }
+
+void consume(Token t) { u32 k = t.kind; }
+
+i32 main() {
+    Token t;
+    t.kind = 1;
+    u32 action = 0;
+    switch (action) {
+        0 => { consume(t); }
+        default => { }
+    }
+    // t may have been consumed in arm 0 but not default
+    u32 k = t.kind;   // error: maybe transferred
+    return 0;
+}

@@ -1,0 +1,17 @@
+// Rust moves: move-out-of-field — consuming struct extracts field value.
+// ZER: pass struct to function that returns a field. Safe — struct consumed.
+
+struct Buffer { u32 len; u32 cap; }
+
+u32 get_length(Buffer b) {
+    return b.len;
+}
+
+i32 main() {
+    Buffer buf;
+    buf.len = 42;
+    buf.cap = 100;
+    u32 len = get_length(buf);
+    if (len != 42) { return 1; }
+    return 0;
+}

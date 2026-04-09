@@ -1,0 +1,21 @@
+// Rust NLL: resource scoped to loop body — Drop runs each iteration.
+// ZER: alloc+defer inside loop body. Defer fires at end of each iteration block.
+
+struct Entry { u32 key; u32 val; }
+Pool(Entry, 8) pool;
+
+i32 main() {
+    u32 sum = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Entry) mh = pool.alloc();
+        Handle(Entry) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).key = i;
+        pool.get(h).val = i * 10;
+        sum += h.val;
+        // defer fires here — h freed, slot available for next iteration
+    }
+    // sum = 0 + 10 + 20 + 30 = 60
+    if (sum != 60) { return 1; }
+    return 0;
+}

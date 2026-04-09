@@ -760,9 +760,35 @@ Pre-scan builds `FuncSummary` for each function with Handle params:
 
 **Flow in `zercheck_run`:** (1) register pools, (2) pre-scan: build summaries, (3) main analysis: check functions.
 
+### Unified Helpers (Option A refactor, 2026-04-09)
+All state/type checks go through centralized helpers. New states or move-like types only need updating in ONE place:
+- `should_track_move(Type *t)` — `is_move_struct_type(t) || contains_move_struct_field(t)`. Used at 5 sites.
+- `is_handle_invalid(HandleInfo *h)` — `HS_FREED || HS_MAYBE_FREED || HS_TRANSFERRED`. Used at 5 use-check sites.
+- `is_handle_consumed(HandleInfo *h)` — same states, for path merge (if/else/switch/loop). Used at 4 merge sites.
+- `zc_report_invalid_use(zc, h, line, key, len)` — emits correct error message by state + pool_id. Used at 5 error sites.
+
 ### Scope
 - Looks up Pool types via `checker_get_type()` first, then `global_scope` fallback
 - Checks `NODE_FUNC_DECL` and `NODE_INTERRUPT` bodies
+
+## Unified Helpers — Checker (checker.c, 2026-04-09)
+
+### Escape Flag Propagation
+- `type_can_carry_pointer(Type *t)` — TYPE_POINTER/SLICE/STRUCT/UNION/OPAQUE. Scalars return false.
+- `propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type)` — propagates `is_local_derived`, `is_arena_derived`, `is_from_arena` from src to dst, but ONLY if `type_can_carry_pointer(dst_type)`. Prevents BUG-421 (scalar false positive). Used at all 5 grouped propagation sites.
+
+### ISR Ban + Auto-Slab
+- `check_isr_ban(Checker *c, int line, const char *method)` — rejects heap allocation in interrupt handler. Used at 4 sites (slab.alloc, slab.alloc_ptr, Task.new, Task.new_ptr).
+- `find_or_create_auto_slab(Checker *c, Type *struct_type)` — finds or creates auto-Slab for a struct type. Used by Task.new() and Task.new_ptr() — eliminates 40-line duplication.
+
+## Unified Helpers — Emitter (emitter.c, 2026-04-09)
+
+### Optional Emission
+- `is_void_opt(Type *t)` — true if type is `?void` (unwraps distinct). `?void` has NO `.value` field. 16 sites need this check.
+- `emit_opt_null_check(e, tmp_id, type)` — emits `!tmp` (null sentinel) or `!tmp.has_value` (struct optional).
+- `emit_opt_unwrap(e, tmp_id, type)` — emits `tmp` (null sentinel), `tmp.value` (struct), or `(void)0` (?void).
+- `emit_opt_null_literal(e, type)` — emits `(T*)0`, `{ 0 }` (?void), or `{ 0, 0 }` (?T struct).
+- `emit_return_null(e)` — emits `return <zero>` for current function's return type. Handles ?void, ?T struct, ?*T, void, scalar. Replaces 6 duplicate code blocks.
 
 ## Value Range Propagation (checker.c)
 

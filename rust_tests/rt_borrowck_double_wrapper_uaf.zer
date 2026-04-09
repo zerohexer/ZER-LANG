@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// Rust borrowck: two-layer wrapper — outer calls inner which frees.
+// ZER: chained cross-function free — inner frees, outer calls inner, caller uses = UAF.
+
+struct Data { u32 val; }
+Slab(Data) slab;
+
+void inner_destroy(*Data d) {
+    slab.free_ptr(d);
+}
+
+void outer_destroy(*Data d) {
+    inner_destroy(d);
+}
+
+i32 main() {
+    ?*Data md = slab.alloc_ptr();
+    *Data d = md orelse return;
+    d[0].val = 99;
+    outer_destroy(d);
+    // d freed through 2-layer wrapper chain — UAF
+    u32 v = d[0].val;
+    return 0;
+}

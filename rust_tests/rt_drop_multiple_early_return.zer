@@ -1,0 +1,29 @@
+// Rust drop: multiple early returns — Drop fires on all paths.
+// ZER: defer ensures cleanup regardless of which return path taken.
+
+struct Res { u32 id; }
+Pool(Res, 8) pool;
+
+u32 work(u32 step) {
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).id = step;
+
+    if (step == 0) { return 10; }
+    if (step == 1) { return 20; }
+    if (step == 2) { return 30; }
+    return 40;
+}
+
+i32 main() {
+    u32 r0 = work(0);
+    u32 r1 = work(1);
+    u32 r2 = work(2);
+    u32 r3 = work(3);
+    if (r0 != 10) { return 1; }
+    if (r1 != 20) { return 2; }
+    if (r2 != 30) { return 3; }
+    if (r3 != 40) { return 4; }
+    return 0;
+}

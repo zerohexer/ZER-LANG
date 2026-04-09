@@ -1,0 +1,28 @@
+// Rust NLL: borrow expires, reborrow is safe.
+// ZER: alloc → use → free → alloc again. Second alloc reuses slot cleanly.
+
+
+struct Sensor { u32 id; u32 value; }
+Pool(Sensor, 4) pool;
+
+i32 main() {
+    // First lifecycle
+    ?Handle(Sensor) mh1 = pool.alloc();
+    Handle(Sensor) h1 = mh1 orelse return;
+    pool.get(h1).id = 1;
+    pool.get(h1).value = 100;
+    u32 v1 = h1.value;
+    pool.free(h1);
+
+    // Second lifecycle — slot reused, no conflict
+    ?Handle(Sensor) mh2 = pool.alloc();
+    Handle(Sensor) h2 = mh2 orelse return;
+    pool.get(h2).id = 2;
+    pool.get(h2).value = 200;
+    u32 v2 = h2.value;
+    pool.free(h2);
+
+    if (v1 != 100) { return 1; }
+    if (v2 != 200) { return 2; }
+    return 0;
+}

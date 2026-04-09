@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Rust borrowck: use moved field — drop(x.b); use(x.b) = error.
+// ZER: free handle, then access through same handle = UAF.
+
+Pool(u32, 4) pool;
+
+struct Pair { u32 tag; }
+
+i32 main() {
+    ?Handle(Pair) mh = pool.alloc();
+    Handle(Pair) h = mh orelse return;
+    pool.get(h).tag = 99;
+
+    pool.free(h);
+
+    // Use after free — zercheck catches this
+    u32 val = pool.get(h).tag;
+    return 0;
+}

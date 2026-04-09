@@ -1,0 +1,20 @@
+// Rust NLL: both match arms drop → value is definitely dropped after match.
+// ZER: if/else both free handle → state is FREED (not MAYBE_FREED). Clean.
+
+struct Slot { u32 val; }
+Pool(Slot, 4) pool;
+
+i32 main() {
+    ?Handle(Slot) mh = pool.alloc();
+    Handle(Slot) h = mh orelse return;
+    pool.get(h).val = 42;
+
+    u32 flag = 1;
+    if (flag > 0) {
+        pool.free(h);
+    } else {
+        pool.free(h);
+    }
+    // Both paths freed h → definitively FREED → no leak, no MAYBE_FREED
+    return 0;
+}

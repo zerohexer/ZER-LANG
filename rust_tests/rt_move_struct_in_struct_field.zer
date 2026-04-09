@@ -1,0 +1,33 @@
+// EXPECTED: compile error
+// Rust: struct containing non-Copy field — move outer, use inner = error.
+// ZER: move struct as field of regular struct. Passing outer should move inner too.
+// After consuming outer, accessing inner's field is use-after-move.
+
+move struct Key { u32 val; }
+struct Wrapper { Key k; u32 tag; }
+
+void consume_wrapper(Wrapper w) { u32 v = w.tag; }
+
+i32 main() {
+    Wrapper w;
+    w.k.val = 42;
+    w.tag = 1;
+    consume_wrapper(w);
+    // w was passed to function — if Wrapper contains a move struct field,
+    // accessing w.k.val should be an error
+    u32 v = w.k.val;
+    return 0;
+}
+
+// LIMITATION (2026-04-09): zercheck only tracks move struct variables
+// that are directly of move struct type. When a regular struct contains
+// a move struct field, passing the outer struct doesn't propagate
+// HS_TRANSFERRED to the inner move struct.
+//
+// Root cause: zc_check_expr(NODE_CALL) only checks is_move_struct_type()
+// on the argument's direct type. It doesn't walk struct fields to find
+// nested move struct members.
+//
+// Fix direction: In NODE_CALL move struct arg check, also check if the
+// argument type is TYPE_STRUCT and any field has is_move type. If so,
+// mark the argument as HS_TRANSFERRED (the whole outer struct is moved).

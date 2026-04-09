@@ -1,0 +1,24 @@
+// Rust partial move: move one field, then use struct → error.
+// ZER: move struct is all-or-nothing. Field READ copies the value (doesn't move).
+// Field read, then consume whole struct — should be safe.
+
+move struct Pair { u32 first; u32 second; }
+
+void consume(Pair p) { u32 x = p.first; }
+
+i32 main() {
+    Pair p;
+    p.first = 10;
+    p.second = 20;
+
+    // Field reads are COPIES — they don't transfer the move struct
+    u32 a = p.first;
+    u32 b = p.second;
+    if (a != 10) { return 1; }
+    if (b != 20) { return 2; }
+
+    // Now consume the whole struct — this is the actual move
+    consume(p);
+
+    return 0;
+}

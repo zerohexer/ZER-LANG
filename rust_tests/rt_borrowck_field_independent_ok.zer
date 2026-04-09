@@ -1,0 +1,31 @@
+// Rust borrowck: field sensitivity — borrow field A, field B is independent.
+// ZER: two handles in scope, free one, the other is still alive and usable.
+
+
+struct Widget { u32 width; u32 height; }
+Pool(Widget, 8) pool;
+
+i32 main() {
+    // Allocate two independent handles
+    ?Handle(Widget) ma = pool.alloc();
+    Handle(Widget) a = ma orelse return;
+    pool.get(a).width = 100;
+    pool.get(a).height = 50;
+
+    ?Handle(Widget) mb = pool.alloc();
+    Handle(Widget) b = mb orelse return;
+    pool.get(b).width = 200;
+    pool.get(b).height = 75;
+
+    // Free handle a — handle b is independent, still alive
+    pool.free(a);
+
+    // b is still usable
+    u32 w = b.width;
+    u32 h = b.height;
+    pool.free(b);
+
+    if (w != 200) { return 1; }
+    if (h != 75) { return 2; }
+    return 0;
+}

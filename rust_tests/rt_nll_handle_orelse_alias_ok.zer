@@ -1,0 +1,19 @@
+// Rust NLL: Option unwrap creates alias — both track same allocation.
+// ZER: ?Handle → Handle via orelse. alloc_id shared, defer frees correctly.
+
+struct Node { u32 val; u32 next; }
+Pool(Node, 8) pool;
+
+i32 main() {
+    ?Handle(Node) maybe = pool.alloc();
+    // Unwrap creates alias: h has same alloc_id as maybe
+    Handle(Node) h = maybe orelse return;
+    defer pool.free(h);
+
+    pool.get(h).val = 42;
+    pool.get(h).next = 0;
+
+    u32 v = h.val;
+    if (v != 42) { return 1; }
+    return 0;
+}

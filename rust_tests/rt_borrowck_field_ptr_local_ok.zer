@@ -1,0 +1,24 @@
+// Rust borrowck: take references to different struct fields — both valid.
+// ZER: two pointers to different fields coexist without aliasing.
+
+struct Counters { u32 hits; u32 misses; u32 total; }
+
+void inc(*u32 p) {
+    u32 v = p[0];
+    p[0] = v + 1;
+}
+
+i32 main() {
+    Counters c;
+    c.hits = 0;
+    c.misses = 0;
+    c.total = 0;
+    inc(&c.hits);
+    inc(&c.hits);
+    inc(&c.misses);
+    c.total = c.hits + c.misses;
+    if (c.hits != 2) { return 1; }
+    if (c.misses != 1) { return 2; }
+    if (c.total != 3) { return 3; }
+    return 0;
+}

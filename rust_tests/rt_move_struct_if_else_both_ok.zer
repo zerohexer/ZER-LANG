@@ -1,0 +1,22 @@
+// Rust moves: both match arms consume → value definitely moved after match.
+// ZER: if/else both consume move struct → clean state after if/else.
+
+move struct Ticket { u32 id; u32 priority; }
+
+void use_normal(Ticket t) { u32 x = t.id; }
+void use_express(Ticket t) { u32 x = t.priority; }
+
+i32 main() {
+    Ticket t;
+    t.id = 1;
+    t.priority = 5;
+
+    u32 mode = 1;
+    if (mode > 0) {
+        use_express(t);
+    } else {
+        use_normal(t);
+    }
+    // Both paths consumed t → definitively TRANSFERRED → no use possible, but clean
+    return 0;
+}

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Rust: consume(a); consume(a); → second use is error
+// ZER: pass move struct to two different functions — second is use-after-move
+
+move struct Secret { u32 key; u32 nonce; }
+
+void encrypt(Secret s) { u32 k = s.key; }
+void archive(Secret s) { u32 n = s.nonce; }
+
+i32 main() {
+    Secret s;
+    s.key = 12345;
+    s.nonce = 67890;
+    encrypt(s);     // s transferred
+    archive(s);     // error: s already transferred
+    return 0;
+}

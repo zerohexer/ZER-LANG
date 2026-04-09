@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Rust: if c { drop(a); } else { drop(a); } use(a) → error (definitely moved)
+// ZER: if/else BOTH consume move struct → use after is error (TRANSFERRED on both paths)
+
+move struct Lock { u32 id; }
+
+void release(Lock l) { u32 x = l.id; }
+
+i32 main() {
+    Lock l;
+    l.id = 1;
+    u32 flag = 1;
+    if (flag > 0) {
+        release(l);
+    } else {
+        release(l);
+    }
+    // Both paths consumed l → definitely TRANSFERRED
+    u32 v = l.id;   // error: use after move
+    return 0;
+}

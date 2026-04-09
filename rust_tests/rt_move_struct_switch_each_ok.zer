@@ -1,0 +1,33 @@
+// Rust moves: each match arm creates and consumes its own value.
+// ZER: each switch arm creates fresh move struct, consumes it. Clean.
+
+move struct Token { u32 kind; u32 val; }
+
+void consume(Token t) { u32 k = t.kind; }
+
+enum Mode { alpha, beta, gamma }
+
+i32 main() {
+    Mode m = Mode.beta;
+    switch (m) {
+        .alpha => {
+            Token t;
+            t.kind = 1;
+            t.val = 10;
+            consume(t);
+        }
+        .beta => {
+            Token t;
+            t.kind = 2;
+            t.val = 20;
+            consume(t);
+        }
+        .gamma => {
+            Token t;
+            t.kind = 3;
+            t.val = 30;
+            consume(t);
+        }
+    }
+    return 0;
+}

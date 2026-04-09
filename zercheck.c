@@ -879,6 +879,74 @@ static bool is_move_struct_type(Type *t) {
     return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
 }
 
+/* Check if a type contains a move struct field (one level deep).
+ * A regular struct with a move struct field should propagate transfer
+ * when the outer struct is passed to a function or assigned. */
+static bool contains_move_struct_field(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    if (eff->kind != TYPE_STRUCT) return false;
+    for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
+        if (is_move_struct_type(eff->struct_type.fields[i].type))
+            return true;
+    }
+    return false;
+}
+
+/* ---- Unified helpers (Option A refactor) ----
+ * These prevent the BUG-468/469 class of bugs where a new state or type
+ * pattern is added but not propagated to all check/merge sites.
+ * New states: add to is_handle_invalid + is_handle_consumed.
+ * New move-like types: add to should_track_move.
+ * Error messages: update zc_report_invalid_use ONCE. */
+
+/* Should this type be tracked for move/transfer semantics?
+ * Covers: move struct directly, or regular struct containing move struct field. */
+static bool should_track_move(Type *t) {
+    return t && (is_move_struct_type(t) || contains_move_struct_field(t));
+}
+
+/* Is this handle in any state where use is invalid?
+ * Used for all use-after-free/move/transfer checks. */
+static bool is_handle_invalid(HandleInfo *h) {
+    if (!h) return false;
+    return h->state == HS_FREED || h->state == HS_MAYBE_FREED ||
+           h->state == HS_TRANSFERRED;
+}
+
+/* Is this handle consumed (freed, maybe-freed, or transferred)?
+ * Used for path merge decisions (if/else, switch, loop). */
+static bool is_handle_consumed(HandleInfo *h) {
+    return h->state == HS_FREED || h->state == HS_MAYBE_FREED ||
+           h->state == HS_TRANSFERRED;
+}
+
+/* Report invalid use with correct message based on handle state.
+ * Centralizes error messages — add new states here ONCE. */
+static void zc_report_invalid_use(ZerCheck *zc, HandleInfo *h, int line,
+                                   const char *key, int key_len) {
+    if (h->state == HS_FREED) {
+        zc_error(zc, line, "use-after-free: '%.*s' freed at line %d",
+                 key_len, key, h->free_line);
+    } else if (h->state == HS_MAYBE_FREED) {
+        if (h->pool_id == -3) {
+            zc_error(zc, line, "use after move: '%.*s' may have been moved on a previous path",
+                     key_len, key);
+        } else {
+            zc_error(zc, line, "use-after-free: '%.*s' may have been freed at line %d",
+                     key_len, key, h->free_line);
+        }
+    } else if (h->state == HS_TRANSFERRED) {
+        if (h->pool_id == -3) {
+            zc_error(zc, line, "use after move: '%.*s' ownership transferred at line %d",
+                     key_len, key, h->transfer_line);
+        } else {
+            zc_error(zc, line, "use after transfer: '%.*s' ownership transferred to thread at line %d",
+                     key_len, key, h->transfer_line);
+        }
+    }
+}
+
 /* Lazily register a move struct variable in PathState if not already tracked.
  * Called when we encounter a NODE_IDENT whose type is a move struct. */
 static HandleInfo *zc_ensure_move_registered(ZerCheck *zc, PathState *ps,
@@ -1028,7 +1096,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                             /* Move struct: check use-after-transfer */
                             if (!ah) {
                                 Type *arg_type = checker_get_type(zc->checker, arg);
-                                if (arg_type && is_move_struct_type(arg_type))
+                                if (should_track_move(arg_type))
                                     ah = zc_ensure_move_registered(zc, ps,
                                         arg->ident.name, (uint32_t)arg->ident.name_len,
                                         node->loc.line);
@@ -1050,9 +1118,23 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         int aklen = handle_key_from_expr(arg, akey, sizeof(akey));
                         if (aklen > 0) {
                             HandleInfo *ah = find_handle(ps, akey, (uint32_t)aklen);
+                            /* Direct move struct — already tracked */
                             if (ah && ah->state == HS_ALIVE && ah->pool_id == -3) {
                                 ah->state = HS_TRANSFERRED;
                                 ah->transfer_line = node->loc.line;
+                            }
+                            /* Struct containing move field — lazy register + transfer */
+                            if (!ah) {
+                                Type *arg_type = checker_get_type(zc->checker, arg);
+                                if (should_track_move(arg_type)) {
+                                    ah = zc_ensure_move_registered(zc, ps,
+                                        arg->ident.name, (uint32_t)arg->ident.name_len,
+                                        node->loc.line);
+                                    if (ah && ah->state == HS_ALIVE) {
+                                        ah->state = HS_TRANSFERRED;
+                                        ah->transfer_line = node->loc.line;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1303,23 +1385,12 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             int cur_line = node->loc.line;
             if (fklen > 0) {
                 HandleInfo *h = find_handle(ps, fkey, (uint32_t)fklen);
-                /* Only report if free happened on a STRICTLY earlier line.
+                /* Only report FREED if free happened on a STRICTLY earlier line.
                  * Same-line free = likely the free call's own argument (pool.free(s.h)
                  * marks s.h FREED then expression check re-visits s.h on same line). */
-                if (h && h->state == HS_FREED && h->free_line < cur_line) {
-                    zc_error(zc, cur_line,
-                        "use-after-free: '%.*s' freed at line %d",
-                        fklen, fkey, h->free_line);
-                    found_uaf = true;
-                } else if (h && h->state == HS_MAYBE_FREED) {
-                    zc_error(zc, cur_line,
-                        "use-after-free: '%.*s' may have been freed at line %d",
-                        fklen, fkey, h->free_line);
-                    found_uaf = true;
-                } else if (h && h->state == HS_TRANSFERRED) {
-                    zc_error(zc, cur_line,
-                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
-                        fklen, fkey, h->transfer_line);
+                if (is_handle_invalid(h) &&
+                    (h->state != HS_FREED || h->free_line < cur_line)) {
+                    zc_report_invalid_use(zc, h, cur_line, fkey, fklen);
                     found_uaf = true;
                 }
             }
@@ -1330,20 +1401,9 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                     int cklen = handle_key_from_expr(cur, fkey, sizeof(fkey));
                     if (cklen > 0) {
                         HandleInfo *h = find_handle(ps, fkey, (uint32_t)cklen);
-                        if (h && h->state == HS_FREED && h->free_line < cur_line) {
-                            zc_error(zc, cur_line,
-                                "use-after-free: '%.*s' freed at line %d",
-                                cklen, fkey, h->free_line);
-                            found_uaf = true;
-                        } else if (h && h->state == HS_MAYBE_FREED) {
-                            zc_error(zc, cur_line,
-                                "use-after-free: '%.*s' may have been freed at line %d",
-                                cklen, fkey, h->free_line);
-                            found_uaf = true;
-                        } else if (h && h->state == HS_TRANSFERRED) {
-                            zc_error(zc, cur_line,
-                                "use after transfer: '%.*s' ownership transferred to thread at line %d",
-                                cklen, fkey, h->transfer_line);
+                        if (is_handle_invalid(h) &&
+                            (h->state != HS_FREED || h->free_line < cur_line)) {
+                            zc_report_invalid_use(zc, h, cur_line, fkey, cklen);
                             found_uaf = true;
                         }
                     }
@@ -1371,19 +1431,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             int sklen = handle_key_from_expr(src, skey, sizeof(skey));
             if (sklen > 0) {
                 HandleInfo *h = find_handle(ps, skey, (uint32_t)sklen);
-                if (h && h->state == HS_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' freed at line %d",
-                        sklen, skey, h->free_line);
-                } else if (h && h->state == HS_MAYBE_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' may have been freed at line %d",
-                        sklen, skey, h->free_line);
-                } else if (h && h->state == HS_TRANSFERRED) {
-                    zc_error(zc, node->loc.line,
-                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
-                        sklen, skey, h->transfer_line);
-                }
+                if (is_handle_invalid(h))
+                    zc_report_invalid_use(zc, h, node->loc.line, skey, sklen);
             }
         }
         /* recurse into intrinsic args */
@@ -1400,19 +1449,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             int iklen = handle_key_from_expr(obj, ikey, sizeof(ikey));
             if (iklen > 0) {
                 HandleInfo *h = find_handle(ps, ikey, (uint32_t)iklen);
-                if (h && h->state == HS_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' freed at line %d",
-                        iklen, ikey, h->free_line);
-                } else if (h && h->state == HS_MAYBE_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' may have been freed at line %d",
-                        iklen, ikey, h->free_line);
-                } else if (h && h->state == HS_TRANSFERRED) {
-                    zc_error(zc, node->loc.line,
-                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
-                        iklen, ikey, h->transfer_line);
-                }
+                if (is_handle_invalid(h))
+                    zc_report_invalid_use(zc, h, node->loc.line, ikey, iklen);
             }
         }
         zc_check_expr(zc, ps, node->index_expr.object);
@@ -1426,19 +1464,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             int dklen = handle_key_from_expr(node->unary.operand, dkey, sizeof(dkey));
             if (dklen > 0) {
                 HandleInfo *h = find_handle(ps, dkey, (uint32_t)dklen);
-                if (h && h->state == HS_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' freed at line %d",
-                        dklen, dkey, h->free_line);
-                } else if (h && h->state == HS_MAYBE_FREED) {
-                    zc_error(zc, node->loc.line,
-                        "use-after-free: '%.*s' may have been freed at line %d",
-                        dklen, dkey, h->free_line);
-                } else if (h && h->state == HS_TRANSFERRED) {
-                    zc_error(zc, node->loc.line,
-                        "use after transfer: '%.*s' ownership transferred to thread at line %d",
-                        dklen, dkey, h->transfer_line);
-                }
+                if (is_handle_invalid(h))
+                    zc_report_invalid_use(zc, h, node->loc.line, dkey, dklen);
             }
         }
         zc_check_expr(zc, ps, node->unary.operand);
@@ -1453,15 +1480,12 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
         /* Move struct: lazy registration + use-after-transfer check */
         {
             Type *ident_type = checker_get_type(zc->checker, node);
-            if (ident_type && is_move_struct_type(ident_type)) {
+            if (should_track_move(ident_type)) {
                 const char *iname = node->ident.name;
                 uint32_t ilen = (uint32_t)node->ident.name_len;
                 HandleInfo *h = zc_ensure_move_registered(zc, ps, iname, ilen, node->loc.line);
-                if (h && h->state == HS_TRANSFERRED) {
-                    zc_error(zc, node->loc.line,
-                        "use after move: '%.*s' ownership transferred at line %d",
-                        (int)ilen, iname, h->transfer_line);
-                }
+                if (is_handle_invalid(h))
+                    zc_report_invalid_use(zc, h, node->loc.line, iname, (int)ilen);
             }
         }
         break;
@@ -1650,15 +1674,15 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             PathState else_state = pathstate_copy(ps);
             zc_check_stmt(zc, &else_state, node->if_stmt.else_body);
 
-            /* merge: if freed on BOTH → FREED, if freed on ONE → MAYBE_FREED */
+            /* merge: if consumed on BOTH → FREED, if on ONE → MAYBE_FREED */
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
                 HandleInfo *eh = find_handle(&else_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
                 if (!th || !eh) continue;
-                bool t_freed = (th->state == HS_FREED || th->state == HS_MAYBE_FREED);
-                bool e_freed = (eh->state == HS_FREED || eh->state == HS_MAYBE_FREED);
+                bool t_freed = is_handle_consumed(th);
+                bool e_freed = is_handle_consumed(eh);
                 if (t_freed && e_freed) {
                     ps->handles[i].state = HS_FREED;
                     ps->handles[i].free_line = th->free_line;
@@ -1679,7 +1703,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
-                if (th && (th->state == HS_FREED || th->state == HS_MAYBE_FREED)) {
+                if (th && is_handle_consumed(th)) {
                     if (then_exits) {
                         /* branch exits — handle still alive on continuation path */
                         /* don't change state — it stays ALIVE */
@@ -1710,16 +1734,24 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         PathState pre_loop = pathstate_copy(ps);
         zc_check_stmt(zc, ps, body);
 
-        /* unconditional free inside loop — definite error */
+        /* unconditional free/transfer inside loop — definite error */
         for (int i = 0; i < ps->handle_count; i++) {
             HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
                                           ps->handles[i].name_len);
-            if (pre && pre->state == HS_ALIVE && ps->handles[i].state == HS_FREED) {
-                zc_error(zc, ps->handles[i].free_line,
-                    "handle '%.*s' freed inside loop — may cause use-after-free "
-                    "on next iteration (allocated at line %d)",
-                    (int)ps->handles[i].name_len, ps->handles[i].name,
-                    ps->handles[i].alloc_line);
+            if (pre && pre->state == HS_ALIVE && is_handle_consumed(&ps->handles[i]) &&
+                ps->handles[i].state != HS_MAYBE_FREED) {
+                if (ps->handles[i].state == HS_TRANSFERRED) {
+                    zc_error(zc, ps->handles[i].transfer_line,
+                        "use after move: '%.*s' moved inside loop — ownership "
+                        "already transferred on next iteration",
+                        (int)ps->handles[i].name_len, ps->handles[i].name);
+                } else {
+                    zc_error(zc, ps->handles[i].free_line,
+                        "handle '%.*s' freed inside loop — may cause use-after-free "
+                        "on next iteration (allocated at line %d)",
+                        (int)ps->handles[i].name_len, ps->handles[i].name,
+                        ps->handles[i].alloc_line);
+                }
             }
         }
 
@@ -1774,6 +1806,19 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                         rklen, rkey, h->free_line);
                 }
             }
+            /* BUG-470: return move struct marks it as transferred */
+            if (node->ret.expr->kind == NODE_IDENT) {
+                Type *rt = checker_get_type(zc->checker, node->ret.expr);
+                if (should_track_move(rt)) {
+                    const char *rn = node->ret.expr->ident.name;
+                    uint32_t rl = (uint32_t)node->ret.expr->ident.name_len;
+                    HandleInfo *mh = zc_ensure_move_registered(zc, ps, rn, rl, node->loc.line);
+                    if (mh && mh->state == HS_ALIVE) {
+                        mh->state = HS_TRANSFERRED;
+                        mh->transfer_line = node->loc.line;
+                    }
+                }
+            }
         }
         break;
 
@@ -1811,7 +1856,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 for (int j = 0; j < ps->handle_count; j++) {
                     HandleInfo *ah = find_handle(&arm_state, ps->handles[j].name,
                                                  ps->handles[j].name_len);
-                    bool arm_freed = ah && (ah->state == HS_FREED || ah->state == HS_MAYBE_FREED);
+                    bool arm_freed = ah && is_handle_consumed(ah);
                     if (!arm_freed) {
                         freed_all[j] = false;
                     } else {

@@ -1,0 +1,29 @@
+// EXPECTED: compile error
+// Rust: return a; use(a) → error (a moved by return)
+// ZER: return move struct, then access field after return = dead code, but
+// if zercheck tracks return as transfer... test it.
+
+move struct Token { u32 kind; }
+
+Token make() {
+    Token t;
+    t.kind = 99;
+    return t;       // t transferred to caller
+    u32 k = t.kind; // dead code — but is this caught?
+}
+
+i32 main() {
+    Token r = make();
+    return 0;
+}
+
+// LIMITATION (2026-04-09): zercheck doesn't track NODE_RETURN as
+// transferring a move struct. Code after return is unreachable, but
+// zercheck still doesn't mark the variable as HS_TRANSFERRED.
+//
+// Root cause: zc_check_stmt(NODE_RETURN) doesn't check if the returned
+// expression is a move struct ident and mark it HS_TRANSFERRED.
+//
+// Fix direction: In NODE_RETURN handler, if expr is NODE_IDENT with
+// move struct type, mark as HS_TRANSFERRED. Low priority since code
+// after return is already dead.

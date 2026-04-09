@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Rust borrowck: nested function frees resource, caller uses after.
+// ZER: wrapper function frees handle (cross-func summary), then caller uses = UAF.
+
+struct Sensor { u32 id; u32 reading; }
+Slab(Sensor) slab;
+
+void shutdown_sensor(*Sensor s) {
+    slab.free_ptr(s);
+}
+
+i32 main() {
+    ?*Sensor ms = slab.alloc_ptr();
+    *Sensor s = ms orelse return;
+    s[0].id = 1;
+    s[0].reading = 42;
+    shutdown_sensor(s);
+    // s freed by cross-function summary — use after free
+    u32 r = s[0].reading;
+    return 0;
+}

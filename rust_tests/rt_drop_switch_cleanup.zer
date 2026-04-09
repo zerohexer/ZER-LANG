@@ -1,0 +1,42 @@
+// Rust drop: each match arm acquires+drops resources independently.
+// ZER: switch arms allocate+defer cleanup. All arms are clean.
+
+
+struct Job { u32 kind; u32 result; }
+Pool(Job, 4) pool;
+
+enum Mode { fast, slow, skip }
+
+u32 run_job(Mode m) {
+    switch (m) {
+        .fast => {
+            ?Handle(Job) mh = pool.alloc();
+            Handle(Job) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).kind = 1;
+            pool.get(h).result = 10;
+            return h.result;
+        }
+        .slow => {
+            ?Handle(Job) mh = pool.alloc();
+            Handle(Job) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).kind = 2;
+            pool.get(h).result = 20;
+            return h.result;
+        }
+        .skip => {
+            return 0;
+        }
+    }
+}
+
+i32 main() {
+    u32 r1 = run_job(Mode.fast);
+    u32 r2 = run_job(Mode.slow);
+    u32 r3 = run_job(Mode.skip);
+    if (r1 != 10) { return 1; }
+    if (r2 != 20) { return 2; }
+    if (r3 != 0) { return 3; }
+    return 0;
+}

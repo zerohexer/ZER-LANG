@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Field access after move struct transferred — same as basic but tests field path.
+
+move struct Key { u32 id; u32 secret; }
+
+void consume(Key k) { u32 x = k.id; }
+
+i32 main() {
+    Key k;
+    k.id = 1;
+    k.secret = 99;
+    consume(k);
+    u32 s = k.secret;   // error: use after move
+    return 0;
+}

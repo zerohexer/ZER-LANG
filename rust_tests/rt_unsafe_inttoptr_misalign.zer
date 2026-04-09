@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Rust unsafe: unaligned pointer dereference = UB.
+// ZER: @inttoptr checks alignment — u32 requires 4-byte alignment.
+// Address 0x40020003 is NOT aligned to 4 → compile error.
+
+mmio 0x40020000..0x40020FFF;
+
+i32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40020003);
+    return 0;
+}

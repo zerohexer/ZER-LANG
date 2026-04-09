@@ -1,0 +1,29 @@
+// Rust moves: if-branch moves and exits, else path is safe.
+// ZER: if (err) { consume(t); return; } use(t); — safe because branch exits.
+// Tests that if-exit pattern doesn't cause false MAYBE_TRANSFERRED.
+
+move struct Token { u32 kind; u32 val; }
+
+void consume(Token t) { u32 k = t.kind; }
+
+u32 process(u32 err) {
+    Token t;
+    t.kind = 1;
+    t.val = 42;
+    if (err > 0) {
+        consume(t);
+        return 0;
+    }
+    // Only reach here if branch NOT taken — t is still alive
+    u32 result = t.val;
+    consume(t);
+    return result;
+}
+
+i32 main() {
+    u32 r = process(0);
+    if (r != 42) { return 1; }
+    u32 r2 = process(1);
+    if (r2 != 0) { return 2; }
+    return 0;
+}

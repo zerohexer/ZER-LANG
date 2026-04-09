@@ -1,0 +1,24 @@
+// Rust borrowck: loop_aliased_mut_break — break exits loop, post-loop use OK.
+// ZER: alloc + defer, loop with break, defer fires at function exit regardless.
+
+struct Slot { u32 val; }
+Pool(Slot, 4) pool;
+
+i32 main() {
+    ?Handle(Slot) mh = pool.alloc();
+    Handle(Slot) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).val = 42;
+
+    u32 found = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        if (h.val == 42) {
+            found = 1;
+            break;
+        }
+    }
+    // break exited loop — h still alive (defer handles cleanup)
+    if (found != 1) { return 1; }
+    if (h.val != 42) { return 2; }
+    return 0;
+}

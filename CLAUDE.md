@@ -483,7 +483,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct` (compile-time ownership transfer), 516 Rust-equivalent tests (0 failures), BUG-462 through BUG-467 (6 bugs found by auditing test rewrites), deadlock model redesigned (same-statement multi-lock only), `?*T[N]` parser precedence fixed, heterogeneous *opaque array constant-index exemption, full 512-test audit with 0 hidden limitations, 468+ bug fixes, 3,400+ tests
+- **v0.3.0 (CURRENT):** `move struct` (compile-time ownership transfer), 567 Rust-equivalent tests (0 failures), BUG-462 through BUG-470 (9 bugs fixed), deadlock model redesigned, systematic refactoring (13 unified helpers in zercheck/checker/emitter — see `docs/refactoring_gaps.md`), 471+ bug fixes, 3,400+ tests
 - **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -914,6 +914,41 @@ When adding more tests from Rust's test suite (`rust-lang/rust/tests/ui/`):
 - `Arena.buf = ...` — WRONG, use `Arena.over(buf)`
 - Accessing `.has_value`/`.value` on optionals directly — not allowed
 
+### CRITICAL: How to Write Tests That Actually Find Bugs
+
+**The natural instinct is to write tests that pass. Fight it.** The goal is to BREAK the compiler.
+
+**Rule 1: For every positive test, write the negative counterpart.**
+You wrote `rt_move_struct_return_ok` (return move struct, caller uses it). Good.
+Now write: what happens if caller uses the original AFTER returning it? What if both if/else arms consume, then you use it after the if? Every safe pattern has an unsafe mirror — write both.
+
+**Rule 2: Test through indirection, not just direct use.**
+Direct: `consume(move_struct)` → use after move. Easy to catch.
+Indirect: `consume(wrapper_containing_move_struct)` → use inner field. HARDER to catch.
+These find real bugs: BUG-468 session found that `move struct` inside a regular struct wasn't tracked.
+Always test: nested structs, array elements, function return values, orelse unwrap results.
+
+**Rule 3: Test at merge points — if/else, switch, loops.**
+- if WITHOUT else + transfer → MAYBE state (found BUG-468)
+- if/else BOTH transfer → DEFINITELY transferred
+- Loop body transfers → next iteration is use-after-move
+- Switch: some arms transfer, others don't → MAYBE state
+These are where zercheck path merging has bugs. Direct transfers are easy; conditional transfers are hard.
+
+**Rule 4: Test dead code paths.**
+`return t; u32 k = t.kind;` — code after return is unreachable. Does zercheck still flag `t.kind` as use-after-move? (Answer: no — this is a current limitation.) These edge cases reveal tracking gaps.
+
+**Rule 5: After writing all tests, verify negative tests ACTUALLY reject.**
+Run each negative test manually: `./zerc test.zer -o /dev/null`. If exit code is 0, the test compiled when it shouldn't have — you found a bug/limitation. Do NOT just trust `make check` green output; the runner marks non-compiling tests as "pass (correctly rejected)" but you need to confirm the rejection is for the RIGHT reason.
+
+**Rule 6: Don't only test the feature — test its interaction with OTHER features.**
+Move struct + defer, move struct + orelse, move struct + switch capture, move struct inside Pool handle field. The feature works in isolation; the bugs are in combinations.
+
+**Patterns that found bugs in practice (2026-04-09):**
+- `if (c) { consume(move_struct); } use(move_struct)` → found BUG-468 (HS_TRANSFERRED not merged)
+- `consume(regular_struct_containing_move_field)` → found nested move struct limitation
+- `return move_struct; use_after_return` → found return-doesn't-transfer limitation
+
 ### CRITICAL: Never Hide Limitations by Rewriting Tests
 
 When a test fails due to a **compiler limitation** (not a test bug):
@@ -942,17 +977,18 @@ When a test fails due to a **compiler limitation** (not a test bug):
 
 Every single "limitation" was a fixable bug. The `limitations/` directory is now empty.
 
-### Coverage status (as of v0.3.0, fully audited 2026-04-08)
+### Coverage status (as of v0.3.0+, updated 2026-04-09)
 - `tests/ui/threads-sendsync/` — **COMPLETE** (51/67)
-- `tests/ui/consts/` — 15 patterns (shift safety, div-by-zero, OOB, overflow wraps, comptime)
-- `tests/ui/borrowck/` — 25 patterns (field sensitivity, nested call free, scope escape, union borrow, struct field alias UAF, interior pointer prefix walk)
-- `tests/ui/moves/` — 20 patterns (ownership chain, conditional, loop, cross-function, struct field move)
-- `tests/ui/drop/` — 15 patterns (struct-as-object, dynamic drop, defer ordering, LIFO cleanup)
-- `tests/ui/unsafe/` — 12 patterns (mmio, inttoptr, provenance, mmio OOB, ISR slab reject)
-- `tests/ui/nll/` — 12 patterns (interior ptr, drop conflict, subpath invalidation, borrowed-local escape)
+- `tests/ui/consts/` — 16 patterns (shift safety, div-by-zero, OOB, overflow wraps, comptime)
+- `tests/ui/borrowck/` — 30 patterns (field sensitivity, nested call free, scope escape, union borrow, struct field alias UAF, interior pointer prefix walk, cross-func double/maybe free, loop alloc/free, switch all-arms free)
+- `tests/ui/moves/` — 37 patterns (ownership chain, conditional, loop, cross-function, struct field move, move struct: return/nested/compose/switch/while/if-else-both/partial-field)
+- `tests/ui/drop/` — 18 patterns (struct-as-object, dynamic drop, defer ordering, LIFO cleanup, nested defer, switch cleanup, multiple early return)
+- `tests/ui/unsafe/` — 11 patterns (mmio, inttoptr, provenance, mmio OOB, ISR slab reject, volatile rw, ptrcast correct/wrong)
+- `tests/ui/nll/` — 9 patterns (interior ptr, drop conflict, subpath invalidation, borrowed-local escape, return-before-defer, sequential alloc, switch arm alloc, block scope, cross-block reuse)
 - Generated tests: 164 `gen_*` + 43 `rc_*` + 27 `safety_*` + 21 `conc_*` = 255 (all audited)
-- Total: 512 Rust-equivalent tests in `rust_tests/`, 0 limitations remaining
-- **Full audit completed:** All 512 tests verified — no hidden rewrites, no masked limitations
+- Total: 567 Rust-equivalent tests in `rust_tests/`, 0 limitations remaining
+- **All limitations from this session fixed:** BUG-468 (conditional move), BUG-469 (nested move in struct), BUG-470 (return transfer)
+- **Systematic refactoring:** 13 unified helpers across zercheck.c/checker.c/emitter.c. See `docs/refactoring_gaps.md` for full analysis.
 
 ### High-Value Test Categories for Finding Bugs
 From analysis of Rust's test tree, these categories stress ZER's model the hardest:

@@ -5,6 +5,42 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-09 — Move Struct Bugs, Systematic Refactoring, 567 Rust Tests
+
+### BUG-468: `move struct` conditional transfer not caught — MAYBE_TRANSFERRED not tracked
+- **Symptom:** `if (c) { consume(t); } t.field;` — zercheck allowed use after conditional move.
+- **Root cause:** Path merge logic checked only `HS_FREED || HS_MAYBE_FREED`. `HS_TRANSFERRED` excluded.
+- **Fix (zercheck.c):** 4 sites: if/else merge, if-no-else merge, loop check, NODE_IDENT move check.
+- **Test:** `rust_tests/rt_move_struct_cond_then_use.zer`, `rt_move_struct_loop_reuse.zer`.
+
+### BUG-469: Regular struct containing `move struct` field — passing outer doesn't transfer inner
+- **Symptom:** `consume_wrapper(w); w.k.val;` where `Wrapper` has `Key` (move struct) field — compiled when it should reject.
+- **Root cause:** zercheck `NODE_CALL` only checked `is_move_struct_type()` on direct arg type. Didn't walk struct fields.
+- **Fix (zercheck.c):** Added `contains_move_struct_field()` helper, then unified into `should_track_move()`. Applied at NODE_CALL first/second pass + NODE_IDENT + NODE_RETURN.
+- **Test:** `rust_tests/rt_move_struct_in_struct_field.zer` (negative).
+
+### BUG-470: `return move_struct;` doesn't mark variable as transferred
+- **Symptom:** `return t; u32 k = t.kind;` — dead code after return not flagged as use-after-move.
+- **Root cause:** `NODE_RETURN` handler didn't check if returned expression is a move struct ident.
+- **Fix (zercheck.c):** NODE_RETURN now marks move struct ident as `HS_TRANSFERRED` using `should_track_move()`.
+- **Test:** `rust_tests/rt_move_struct_return_then_use.zer` (negative).
+
+### Systematic Refactoring: Option A unified helpers (zercheck.c)
+- **Problem:** 5+ state check sites each had their own list of `HS_FREED || HS_MAYBE_FREED || HS_TRANSFERRED`. Adding a new state required finding all sites.
+- **Fix:** 4 helpers: `should_track_move()`, `is_handle_invalid()`, `is_handle_consumed()`, `zc_report_invalid_use()`. 15 scattered sites unified.
+
+### Systematic Refactoring: Escape flag propagation (checker.c)
+- **Problem:** 4 of 5 grouped escape flag propagation sites were missing `can_carry_ptr` type guard (BUG-421 class — scalar false positives).
+- **Fix:** 2 helpers: `type_can_carry_pointer()`, `propagate_escape_flags()`. All 5 grouped sites replaced.
+
+### Systematic Refactoring: Emitter optional helpers (emitter.c)
+- **Problem:** `?void` check (16 sites), optional null literal (12 sites), return-null (6 duplicate blocks).
+- **Fix:** 5 helpers: `is_void_opt()`, `emit_opt_null_check()`, `emit_opt_unwrap()`, `emit_opt_null_literal()`, `emit_return_null()`. 4 scattered sites replaced (more can be migrated incrementally).
+
+### Systematic Refactoring: Checker cleanup (checker.c)
+- **Problem:** ISR ban check at 4 sites, auto-slab creation duplicated (40 lines × 2).
+- **Fix:** `check_isr_ban()` (4 sites), `find_or_create_auto_slab()` (2 sites, ~80 lines eliminated).
+
 ## Session 2026-04-08 — Zercheck Prefix Walk + Deadlock Model Redesign
 
 ### BUG-467: `?*T[N]` parsed as `POINTER(ARRAY(T,N))` instead of `ARRAY(OPTIONAL(POINTER(T)),N)`

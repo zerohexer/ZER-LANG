@@ -1,0 +1,17 @@
+// Rust NLL: resource freed in inner scope, outer scope clean.
+// ZER: handle allocated+freed in block, new alloc in outer is independent.
+
+Pool(u32, 8) pool;
+
+i32 main() {
+    {
+        ?Handle(u32) mh = pool.alloc();
+        Handle(u32) h = mh orelse return;
+        pool.free(h);
+    }
+    // Slot reused — clean alloc
+    ?Handle(u32) mh2 = pool.alloc();
+    Handle(u32) h2 = mh2 orelse return;
+    defer pool.free(h2);
+    return 0;
+}

@@ -1,0 +1,21 @@
+// Rust drop: three resources, all cleaned in LIFO order via defer.
+// All early-return paths covered — no leak on any path.
+
+Slab(u32) slab;
+
+i32 main() {
+    ?Handle(u32) mh1 = slab.alloc();
+    Handle(u32) h1 = mh1 orelse return;
+    defer slab.free(h1);
+
+    ?Handle(u32) mh2 = slab.alloc();
+    Handle(u32) h2 = mh2 orelse return;
+    defer slab.free(h2);
+
+    ?Handle(u32) mh3 = slab.alloc();
+    Handle(u32) h3 = mh3 orelse return;
+    defer slab.free(h3);
+
+    // All three freed in LIFO: h3, h2, h1
+    return 0;
+}

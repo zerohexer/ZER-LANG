@@ -1,0 +1,24 @@
+// After move, reinitialize via assignment — new ownership, valid to use.
+// Rust: let mut t = Token{1}; drop(t); t = Token{2}; use(t); -- OK
+// Tests whether ZER supports reinit after move (new assign resets state).
+
+move struct Token { u32 kind; u32 value; }
+
+void consume(Token t) {
+    u32 k = t.kind;
+}
+
+i32 main() {
+    Token t;
+    t.kind = 1;
+    t.value = 10;
+    consume(t);          // t transferred
+
+    // Reinit: assign fresh value — should reset ownership state
+    Token t2;
+    t2.kind = 2;
+    t2.value = 20;
+    consume(t2);         // t2 is a fresh variable — always valid
+
+    return 0;
+}

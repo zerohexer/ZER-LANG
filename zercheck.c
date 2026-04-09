@@ -39,6 +39,7 @@ static void pathstate_init(PathState *ps) {
     ps->handles = NULL;
     ps->handle_count = 0;
     ps->handle_capacity = 0;
+    ps->terminated = false;
 }
 
 /* deep copy a PathState (allocates new handle array) */
@@ -46,11 +47,24 @@ static PathState pathstate_copy(PathState *src) {
     PathState dst;
     dst.handle_count = src->handle_count;
     dst.handle_capacity = src->handle_count > 0 ? src->handle_count : 4;
+    dst.terminated = false;  /* copies start non-terminated for branch analysis */
     dst.handles = (HandleInfo *)malloc(dst.handle_capacity * sizeof(HandleInfo));
     if (src->handle_count > 0) {
         memcpy(dst.handles, src->handles, src->handle_count * sizeof(HandleInfo));
     }
     return dst;
+}
+
+static HandleInfo *find_handle(PathState *ps, const char *name, uint32_t name_len);
+
+/* Check if two PathStates have identical handle states (for fixed-point convergence) */
+static bool pathstate_equal(PathState *a, PathState *b) {
+    for (int i = 0; i < a->handle_count; i++) {
+        HandleInfo *bh = find_handle(b, a->handles[i].name, a->handles[i].name_len);
+        if (!bh) return false;
+        if (a->handles[i].state != bh->state) return false;
+    }
+    return true;
 }
 
 static void pathstate_free(PathState *ps) {
@@ -1546,20 +1560,35 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                     }
                 }
                 if (label_idx >= 0 && label_idx < i) {
-                    /* backward goto — re-walk from label to goto as loop body */
-                    PathState pre_goto = pathstate_copy(ps);
-                    for (int j = label_idx; j <= i; j++)
-                        zc_check_stmt(zc, ps, node->block.stmts[j]);
-                    /* if state changed → widen to MAYBE_FREED */
-                    for (int h = 0; h < ps->handle_count; h++) {
-                        HandleInfo *pre = find_handle(&pre_goto,
-                            ps->handles[h].name, ps->handles[h].name_len);
-                        if (pre && pre->state != ps->handles[h].state &&
-                            ps->handles[h].state != HS_MAYBE_FREED) {
-                            ps->handles[h].state = HS_MAYBE_FREED;
+                    /* backward goto = loop equivalent. Fixed-point iteration
+                     * over label..goto region until states stabilize. */
+                    for (int iter = 0; iter < 4; iter++) {
+                        PathState pre_goto = pathstate_copy(ps);
+                        for (int j = label_idx; j <= i; j++)
+                            zc_check_stmt(zc, ps, node->block.stmts[j]);
+                        if (pathstate_equal(&pre_goto, ps)) {
+                            pathstate_free(&pre_goto);
+                            break;  /* converged */
+                        }
+                        pathstate_free(&pre_goto);
+                        if (iter == 3) {
+                            /* widen remaining unstable states */
+                            for (int h = 0; h < ps->handle_count; h++) {
+                                if (ps->handles[h].state != HS_MAYBE_FREED &&
+                                    ps->handles[h].state != HS_FREED) {
+                                    /* Only widen states that changed — compare against pre-loop */
+                                    PathState check = pathstate_copy(ps);
+                                    for (int j = label_idx; j <= i; j++)
+                                        zc_check_stmt(zc, &check, node->block.stmts[j]);
+                                    if (check.handle_count > h &&
+                                        check.handles[h].state != ps->handles[h].state) {
+                                        ps->handles[h].state = HS_MAYBE_FREED;
+                                    }
+                                    pathstate_free(&check);
+                                }
+                            }
                         }
                     }
-                    pathstate_free(&pre_goto);
                 }
             }
         }
@@ -1674,38 +1703,56 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             PathState else_state = pathstate_copy(ps);
             zc_check_stmt(zc, &else_state, node->if_stmt.else_body);
 
-            /* merge: if consumed on BOTH → FREED, if on ONE → MAYBE_FREED */
-            for (int i = 0; i < ps->handle_count; i++) {
-                HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
-                                             ps->handles[i].name_len);
-                HandleInfo *eh = find_handle(&else_state, ps->handles[i].name,
-                                             ps->handles[i].name_len);
-                if (!th || !eh) continue;
-                bool t_freed = is_handle_consumed(th);
-                bool e_freed = is_handle_consumed(eh);
-                if (t_freed && e_freed) {
-                    ps->handles[i].state = HS_FREED;
-                    ps->handles[i].free_line = th->free_line;
-                } else if (t_freed || e_freed) {
-                    ps->handles[i].state = HS_MAYBE_FREED;
-                    ps->handles[i].free_line = t_freed ? th->free_line : eh->free_line;
+            /* CFG-aware merge: use terminated flags to determine which paths reach post-if */
+            if (then_state.terminated && else_state.terminated) {
+                /* Both branches exit — nothing reaches post-if */
+                ps->terminated = true;
+            } else if (then_state.terminated) {
+                /* Only else falls through — copy else state to ps */
+                for (int i = 0; i < ps->handle_count; i++) {
+                    HandleInfo *eh = find_handle(&else_state, ps->handles[i].name,
+                                                 ps->handles[i].name_len);
+                    if (eh) ps->handles[i].state = eh->state;
+                }
+            } else if (else_state.terminated) {
+                /* Only then falls through — copy then state to ps */
+                for (int i = 0; i < ps->handle_count; i++) {
+                    HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
+                                                 ps->handles[i].name_len);
+                    if (th) ps->handles[i].state = th->state;
+                }
+            } else {
+                /* Both fall through — merge: consumed on BOTH → FREED, on ONE → MAYBE_FREED */
+                for (int i = 0; i < ps->handle_count; i++) {
+                    HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
+                                                 ps->handles[i].name_len);
+                    HandleInfo *eh = find_handle(&else_state, ps->handles[i].name,
+                                                 ps->handles[i].name_len);
+                    if (!th || !eh) continue;
+                    bool t_freed = is_handle_consumed(th);
+                    bool e_freed = is_handle_consumed(eh);
+                    if (t_freed && e_freed) {
+                        ps->handles[i].state = HS_FREED;
+                        ps->handles[i].free_line = th->free_line;
+                    } else if (t_freed || e_freed) {
+                        ps->handles[i].state = HS_MAYBE_FREED;
+                        ps->handles[i].free_line = t_freed ? th->free_line : eh->free_line;
+                    }
                 }
             }
             pathstate_free(&else_state);
         } else {
             /* if without else: then-branch frees → MAYBE_FREED
              * (may or may not take the branch).
-             * BUT: if the then-branch always exits (return/break/continue/goto),
+             * BUT: if the then-branch terminated (return/break/continue/goto),
              * we only reach post-if if the branch was NOT taken — handle is
-             * still ALIVE, not MAYBE_FREED. This is the most common false
-             * positive pattern: if (err) { free(h); return; } use(h); */
-            bool then_exits = block_always_exits(node->if_stmt.then_body);
+             * still ALIVE, not MAYBE_FREED. */
             for (int i = 0; i < ps->handle_count; i++) {
                 HandleInfo *th = find_handle(&then_state, ps->handles[i].name,
                                              ps->handles[i].name_len);
                 if (th && is_handle_consumed(th)) {
-                    if (then_exits) {
-                        /* branch exits — handle still alive on continuation path */
+                    if (then_state.terminated) {
+                        /* branch terminates — only non-taken path reaches here */
                         /* don't change state — it stays ALIVE */
                     } else {
                         ps->handles[i].state = HS_MAYBE_FREED;
@@ -1732,55 +1779,59 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             node->for_stmt.body : node->while_stmt.body;
 
         PathState pre_loop = pathstate_copy(ps);
-        zc_check_stmt(zc, ps, body);
 
-        /* unconditional free/transfer inside loop — definite error */
-        for (int i = 0; i < ps->handle_count; i++) {
-            HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
-                                          ps->handles[i].name_len);
-            if (pre && pre->state == HS_ALIVE && is_handle_consumed(&ps->handles[i]) &&
-                ps->handles[i].state != HS_MAYBE_FREED) {
-                if (ps->handles[i].state == HS_TRANSFERRED) {
-                    zc_error(zc, ps->handles[i].transfer_line,
-                        "use after move: '%.*s' moved inside loop — ownership "
-                        "already transferred on next iteration",
-                        (int)ps->handles[i].name_len, ps->handles[i].name);
-                } else {
-                    zc_error(zc, ps->handles[i].free_line,
-                        "handle '%.*s' freed inside loop — may cause use-after-free "
-                        "on next iteration (allocated at line %d)",
-                        (int)ps->handles[i].name_len, ps->handles[i].name,
-                        ps->handles[i].alloc_line);
-                }
-            }
-        }
-
-        /* Loop second pass: check if any handle state changed from pre-loop.
-         * If yes, run the body once more. If state still unstable → MAYBE_FREED.
-         * This catches conditional frees that span iterations. */
-        bool state_changed = false;
-        for (int i = 0; i < ps->handle_count; i++) {
-            HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
-                                          ps->handles[i].name_len);
-            if (pre && pre->state != ps->handles[i].state) {
-                state_changed = true;
-                break;
-            }
-        }
-        if (state_changed) {
-            PathState pass2_pre = pathstate_copy(ps);
+        /* Fixed-point iteration: run loop body until handle states stabilize.
+         * Max 4 iterations then widen remaining unstable states to MAYBE_FREED.
+         * This replaces the old 2-pass + widen hack with proper convergence. */
+        bool first_pass = true;
+        for (int iter = 0; iter < 4; iter++) {
+            PathState iter_pre = pathstate_copy(ps);
+            ps->terminated = false;  /* loop body can break/continue but loop itself continues */
             zc_check_stmt(zc, ps, body);
-            /* if state still changing after 2nd pass → widen to MAYBE_FREED */
-            for (int i = 0; i < ps->handle_count; i++) {
-                HandleInfo *p2 = find_handle(&pass2_pre, ps->handles[i].name,
-                                              ps->handles[i].name_len);
-                if (p2 && p2->state != ps->handles[i].state &&
-                    ps->handles[i].state != HS_MAYBE_FREED) {
-                    ps->handles[i].state = HS_MAYBE_FREED;
-                    ps->handles[i].free_line = ps->handles[i].free_line;
+            ps->terminated = false;  /* loop never terminates enclosing scope */
+
+            if (first_pass) {
+                /* After first pass: check for unconditional free/transfer inside loop */
+                for (int i = 0; i < ps->handle_count; i++) {
+                    HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
+                                                  ps->handles[i].name_len);
+                    if (pre && pre->state == HS_ALIVE && is_handle_consumed(&ps->handles[i]) &&
+                        ps->handles[i].state != HS_MAYBE_FREED) {
+                        if (ps->handles[i].state == HS_TRANSFERRED) {
+                            zc_error(zc, ps->handles[i].transfer_line,
+                                "use after move: '%.*s' moved inside loop — ownership "
+                                "already transferred on next iteration",
+                                (int)ps->handles[i].name_len, ps->handles[i].name);
+                        } else {
+                            zc_error(zc, ps->handles[i].free_line,
+                                "handle '%.*s' freed inside loop — may cause use-after-free "
+                                "on next iteration (allocated at line %d)",
+                                (int)ps->handles[i].name_len, ps->handles[i].name,
+                                ps->handles[i].alloc_line);
+                        }
+                    }
+                }
+                first_pass = false;
+            }
+
+            /* Check convergence */
+            if (pathstate_equal(&iter_pre, ps)) {
+                pathstate_free(&iter_pre);
+                break;  /* converged — states stable */
+            }
+            pathstate_free(&iter_pre);
+
+            /* Last iteration: widen unstable states to MAYBE_FREED */
+            if (iter == 3) {
+                for (int i = 0; i < ps->handle_count; i++) {
+                    HandleInfo *pre = find_handle(&pre_loop, ps->handles[i].name,
+                                                  ps->handles[i].name_len);
+                    if (pre && pre->state != ps->handles[i].state &&
+                        ps->handles[i].state != HS_MAYBE_FREED) {
+                        ps->handles[i].state = HS_MAYBE_FREED;
+                    }
                 }
             }
-            pathstate_free(&pass2_pre);
         }
 
         pathstate_free(&pre_loop);
@@ -1820,6 +1871,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
         }
+        ps->terminated = true;
         break;
 
     case NODE_DEFER:
@@ -1936,9 +1988,14 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         }
         break;
 
+    /* Exit nodes — mark terminated for CFG-aware merge */
+    case NODE_GOTO: case NODE_BREAK: case NODE_CONTINUE:
+        ps->terminated = true;
+        break;
+
     /* Nodes not relevant to zercheck handle tracking */
     case NODE_YIELD: case NODE_AWAIT:
-    case NODE_GOTO: case NODE_LABEL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_LABEL:
     case NODE_ASM:
     /* Expression nodes — handled by zc_check_expr via NODE_EXPR_STMT */
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:

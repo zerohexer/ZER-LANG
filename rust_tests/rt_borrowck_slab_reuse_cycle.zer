@@ -1,0 +1,20 @@
+// Rust borrowck: allocate-use-free cycle repeated — each cycle independent.
+// ZER: Slab alloc_ptr/free_ptr in a loop, each iteration clean.
+
+struct Node { u32 val; u32 next; }
+Slab(Node) slab;
+
+i32 main() {
+    u32 total = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        ?*Node mn = slab.alloc_ptr();
+        *Node n = mn orelse return;
+        n[0].val = i * 3;
+        n[0].next = 0;
+        total += n[0].val;
+        slab.free_ptr(n);
+    }
+    // total = 0 + 3 + 6 + 9 + 12 = 30
+    if (total != 30) { return 1; }
+    return 0;
+}

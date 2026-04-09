@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Rust NLL issue-51268: borrow self.thing while also borrowing self.number.
+// ZER: free handle from struct field, then use another field through same handle = UAF.
+
+struct Device { u32 sensor_id; u32 motor_id; }
+Pool(Device, 4) pool;
+
+void stop_motor(Handle(Device) h) {
+    pool.free(h);
+}
+
+i32 main() {
+    ?Handle(Device) mh = pool.alloc();
+    Handle(Device) h = mh orelse return;
+    pool.get(h).sensor_id = 1;
+    pool.get(h).motor_id = 2;
+
+    stop_motor(h);           // h freed by cross-func summary
+    u32 sid = h.sensor_id;   // error: use after free
+    return 0;
+}

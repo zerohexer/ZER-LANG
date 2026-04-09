@@ -1,0 +1,17 @@
+// Rust borrowck: use of uninitialized slice — E0381.
+// ZER: auto-zero means ALL variables start at 0. No uninitialized access.
+// This is a ZER STRENGTH — what Rust rejects, ZER handles safely via auto-zero.
+
+struct Point { u32 x; u32 y; }
+
+i32 main() {
+    u32[8] arr;          // auto-zeroed to all 0s
+    u32 val = arr[5];    // safe — reads 0
+    if (val != 0) { return 1; }
+
+    // Even struct fields are auto-zeroed
+    Point p;
+    if (p.x != 0) { return 2; }
+    if (p.y != 0) { return 3; }
+    return 0;
+}

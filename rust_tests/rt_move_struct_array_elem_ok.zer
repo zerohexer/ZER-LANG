@@ -1,0 +1,21 @@
+// Rust moves: create array of values, consume each independently.
+// ZER: create multiple move structs, each consumed separately. No aliasing.
+
+move struct Token { u32 id; }
+
+void consume(Token t) { u32 x = t.id; }
+
+i32 main() {
+    Token a;
+    a.id = 1;
+    Token b;
+    b.id = 2;
+    Token c;
+    c.id = 3;
+
+    consume(a);
+    consume(b);
+    consume(c);
+    // All three consumed independently — clean
+    return 0;
+}

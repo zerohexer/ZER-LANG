@@ -1,0 +1,31 @@
+// Rust NLL: resource cleanup on ALL control flow paths.
+// ZER: defer fires regardless of which branch taken — comprehensive path test.
+
+struct Config { u32 timeout; u32 retries; }
+Slab(Config) slab;
+
+u32 try_connect(u32 attempt) {
+    ?Handle(Config) mh = slab.alloc();
+    Handle(Config) h = mh orelse return;
+    defer slab.free(h);
+    slab.get(h).timeout = 100;
+    slab.get(h).retries = 3;
+
+    if (attempt == 0) { return h.timeout; }
+
+    u32 i = 0;
+    while (i < h.retries) {
+        if (i == attempt) { return i * 10; }
+        i += 1;
+    }
+
+    return 99;
+}
+
+i32 main() {
+    if (try_connect(0) != 100) { return 1; }
+    if (try_connect(1) != 10) { return 2; }
+    if (try_connect(2) != 20) { return 3; }
+    if (try_connect(5) != 99) { return 4; }
+    return 0;
+}

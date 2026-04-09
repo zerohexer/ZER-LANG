@@ -1,0 +1,35 @@
+// Rust drop: temporaries dropped in reverse order (LIFO).
+// ZER: 4 defers in sequence — all fire in reverse order on return.
+
+struct Res { u32 id; }
+Pool(Res, 8) pool;
+
+u32 four_resources() {
+    ?Handle(Res) m1 = pool.alloc();
+    Handle(Res) h1 = m1 orelse return;
+    defer pool.free(h1);
+    pool.get(h1).id = 1;
+
+    ?Handle(Res) m2 = pool.alloc();
+    Handle(Res) h2 = m2 orelse return;
+    defer pool.free(h2);
+    pool.get(h2).id = 2;
+
+    ?Handle(Res) m3 = pool.alloc();
+    Handle(Res) h3 = m3 orelse return;
+    defer pool.free(h3);
+    pool.get(h3).id = 3;
+
+    ?Handle(Res) m4 = pool.alloc();
+    Handle(Res) h4 = m4 orelse return;
+    defer pool.free(h4);
+    pool.get(h4).id = 4;
+
+    return h1.id + h2.id + h3.id + h4.id;
+}
+
+i32 main() {
+    u32 sum = four_resources();
+    if (sum != 10) { return 1; }
+    return 0;
+}

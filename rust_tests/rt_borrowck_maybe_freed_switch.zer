@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// Rust borrowck: some match arms drop, others don't → maybe-freed after match.
+// ZER: some switch arms free handle, default doesn't → MAYBE_FREED.
+
+struct Job { u32 id; }
+Pool(Job, 4) pool;
+
+i32 main() {
+    ?Handle(Job) mh = pool.alloc();
+    Handle(Job) h = mh orelse return;
+    pool.get(h).id = 1;
+
+    u32 action = 0;
+    switch (action) {
+        0 => { pool.free(h); }
+        1 => { pool.free(h); }
+        default => { }
+    }
+    // h maybe freed (arms 0,1 free, default doesn't) → MAYBE_FREED
+    u32 id = pool.get(h).id;
+    return 0;
+}

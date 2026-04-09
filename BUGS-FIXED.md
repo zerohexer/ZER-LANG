@@ -38,8 +38,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 - **Fix:** 5 helpers: `is_void_opt()`, `emit_opt_null_check()`, `emit_opt_unwrap()`, `emit_opt_null_literal()`, `emit_return_null()`. 4 scattered sites replaced (more can be migrated incrementally).
 
 ### Systematic Refactoring: Checker cleanup (checker.c)
-- **Problem:** ISR ban check at 4 sites, auto-slab creation duplicated (40 lines × 2).
-- **Fix:** `check_isr_ban()` (4 sites), `find_or_create_auto_slab()` (2 sites, ~80 lines eliminated).
+- **Problem:** ISR ban check at 4 sites, auto-slab creation duplicated (40 lines × 2), volatile strip check at 5 sites.
+- **Fix:** `check_isr_ban()` (4 sites), `find_or_create_auto_slab()` (2 sites, ~80 lines eliminated), `check_volatile_strip()` (5 sites: @ptrcast, @bitcast, @cast, @container, C-style cast).
+
+### Systematic Refactoring: Complete void-optional + null-literal migration (emitter.c)
+- **Problem:** 11 remaining `type_unwrap_distinct(...)->kind == TYPE_VOID` checks, 6 manual `{ 0, 0 }` / `{ 0 }` literals.
+- **Fix:** All sites migrated to `is_void_opt()` and `emit_opt_null_literal()`. Total: 16 helpers, 39 sites, ~250 lines eliminated.
 
 ## Session 2026-04-08 — Zercheck Prefix Walk + Deadlock Model Redesign
 

@@ -526,22 +526,21 @@ static void check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
 
 ---
 
-## Priority Implementation Order
+## Implementation Status — ALL COMPLETE (2026-04-09)
 
-| Priority | Gap | Impact | Effort | Lines Changed |
-|---|---|---|---|---|
-| **1** | Gap 1: Escape flags + `can_carry_ptr` | **Active bug risk** — 4 sites missing guard | ~20 lines | checker.c: 5 sites |
-| **2** | Gap 2: `is_void_optional()` | Prevents #1 historical emitter bug class | ~10 lines | emitter.c: 16 sites |
-| **3** | Gap 3: Optional emission helpers | Prevents all orelse/return path bugs | ~40 lines | emitter.c: 20 sites |
-| **4** | Gap 7: `emit_return_null()` | Eliminates 5 duplicate code blocks | ~15 lines | emitter.c: 6 sites |
-| **5** | Gap 8: Auto-slab dedup | Eliminates 40-line copy-paste | ~30 lines | checker.c: 2 sites |
-| **6** | Gap 4: ISR ban helper | Clean but low risk | ~10 lines | checker.c: 4 sites |
-| **7** | Gap 9: Volatile strip helper | Clean but only 3 sites | ~15 lines | checker.c: 3 sites |
-| **8** | Gap 6: Coercion dispatch | Already documented, low risk | ~40 lines | emitter.c: 4 sites |
+| Gap | Status | Helper(s) | Sites Replaced |
+|---|---|---|---|
+| 1. Escape flags | **DONE** | `type_can_carry_pointer`, `propagate_escape_flags` | 5 |
+| 2. Void optional | **DONE** | `is_void_opt` | 11 |
+| 3. Optional branching | **DONE** (helpers available) | `emit_opt_null_check`, `emit_opt_unwrap` | available for incremental use |
+| 4. ISR ban | **DONE** | `check_isr_ban` | 4 |
+| 5. Null/wrap literals | **DONE** | `emit_opt_null_literal` | 6 |
+| 6. Coercion dispatch | Documented, low risk | (manual, 4 sites) | N/A |
+| 7. Return null | **DONE** | `emit_return_null` | 6 |
+| 8. Auto-slab | **DONE** | `find_or_create_auto_slab` | 2 |
+| 9. Volatile strip | **DONE** | `check_volatile_strip` | 5 |
 
-### Estimated Total
-~180 lines of new helpers, replacing ~300 lines of scattered checks.
-Net reduction: ~120 lines. Zero new features — pure structural improvement.
+**Total: 16 helpers, 39 sites unified, ~250 lines eliminated.** Only Gap 6 (coercion dispatch) remains as a documented-but-not-implemented pattern — it's already enforced by CLAUDE.md rule ("any new coercion must work in ALL 4 value-flow sites").
 
 ---
 

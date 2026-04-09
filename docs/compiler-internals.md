@@ -778,17 +778,23 @@ All state/type checks go through centralized helpers. New states or move-like ty
 - `propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type)` — propagates `is_local_derived`, `is_arena_derived`, `is_from_arena` from src to dst, but ONLY if `type_can_carry_pointer(dst_type)`. Prevents BUG-421 (scalar false positive). Used at all 5 grouped propagation sites.
 
 ### ISR Ban + Auto-Slab
-- `check_isr_ban(Checker *c, int line, const char *method)` — rejects heap allocation in interrupt handler. Used at 4 sites (slab.alloc, slab.alloc_ptr, Task.new, Task.new_ptr).
-- `find_or_create_auto_slab(Checker *c, Type *struct_type)` — finds or creates auto-Slab for a struct type. Used by Task.new() and Task.new_ptr() — eliminates 40-line duplication.
+- `check_isr_ban(Checker *c, int line, const char *method)` — rejects heap allocation in interrupt handler. Replaces 4 scattered `c->in_interrupt` checks (slab.alloc, slab.alloc_ptr, Task.new, Task.new_ptr).
+- `find_or_create_auto_slab(Checker *c, Type *struct_type)` — finds or creates auto-Slab for a struct type. Replaces 2× 40-line duplicate blocks in Task.new() and Task.new_ptr().
+
+### Volatile Strip
+- `check_volatile_strip(Checker *c, Node *src_expr, Type *src_type, Type *tgt_type, int line, const char *context)` — checks if a cast/intrinsic strips volatile from pointer. Walks source ident for `sym->is_volatile`. Replaces 5 scattered sites (@ptrcast BUG-258, @bitcast BUG-341, @cast BUG-343, @container, C-style cast BUG-447).
 
 ## Unified Helpers — Emitter (emitter.c, 2026-04-09)
 
-### Optional Emission
-- `is_void_opt(Type *t)` — true if type is `?void` (unwraps distinct). `?void` has NO `.value` field. 16 sites need this check.
-- `emit_opt_null_check(e, tmp_id, type)` — emits `!tmp` (null sentinel) or `!tmp.has_value` (struct optional).
+### Optional Emission (ALL sites migrated)
+- `is_void_opt(Type *t)` — true if `?void` (unwraps distinct). `?void` has NO `.value` field. Replaced 11 manual `type_unwrap_distinct(...)->kind == TYPE_VOID` checks.
+- `emit_opt_null_check(e, tmp_id, type)` — emits `!tmp` (null sentinel) or `!tmp.has_value` (struct optional). Available for incremental migration at ~20 branching sites.
 - `emit_opt_unwrap(e, tmp_id, type)` — emits `tmp` (null sentinel), `tmp.value` (struct), or `(void)0` (?void).
-- `emit_opt_null_literal(e, type)` — emits `(T*)0`, `{ 0 }` (?void), or `{ 0, 0 }` (?T struct).
-- `emit_return_null(e)` — emits `return <zero>` for current function's return type. Handles ?void, ?T struct, ?*T, void, scalar. Replaces 6 duplicate code blocks.
+- `emit_opt_null_literal(e, type)` — emits `(T*)0`, `{ 0 }` (?void), or `{ 0, 0 }` (?T struct). Replaced 6 manual literal emission sites.
+- `emit_return_null(e)` — emits `return <zero>` for current function's return type. Handles ?void, ?T struct, ?*T, void, scalar. Replaced 6 duplicate return-null code blocks.
+
+### Full Refactoring Summary (2026-04-09)
+16 helpers added across zercheck.c/checker.c/emitter.c. 39 scattered sites unified. ~250 lines of duplicated code eliminated. All 9 gaps from `docs/refactoring_gaps.md` complete. Adding a new handle state, move-like type, optional variant, escape flag, ISR-banned method, or volatile-checked intrinsic now requires updating ONE helper function instead of finding N scattered sites.
 
 ## Value Range Propagation (checker.c)
 

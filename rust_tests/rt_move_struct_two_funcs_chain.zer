@@ -1,0 +1,35 @@
+// Rust moves: value passed through chain of 3 functions — ownership transfers at each step.
+
+move struct Packet { u32 src; u32 dst; u32 payload; }
+
+Packet route(Packet p) {
+    Packet routed;
+    routed.src = p.src;
+    routed.dst = p.dst + 1;
+    routed.payload = p.payload;
+    return routed;
+}
+
+Packet encrypt(Packet p) {
+    Packet enc;
+    enc.src = p.src;
+    enc.dst = p.dst;
+    enc.payload = p.payload + 100;
+    return enc;
+}
+
+u32 deliver(Packet p) {
+    return p.payload;
+}
+
+i32 main() {
+    Packet pkt;
+    pkt.src = 1;
+    pkt.dst = 2;
+    pkt.payload = 42;
+    Packet routed = route(pkt);
+    Packet encrypted = encrypt(routed);
+    u32 result = deliver(encrypted);
+    if (result != 142) { return 1; }
+    return 0;
+}

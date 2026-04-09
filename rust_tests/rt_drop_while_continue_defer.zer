@@ -1,0 +1,25 @@
+// Rust drop: continue in loop skips rest of body — Drop still fires for scoped values.
+// ZER: defer in loop body fires on continue — resource cleaned up each iteration.
+
+struct Task { u32 id; u32 cost; }
+Pool(Task, 4) pool;
+
+i32 main() {
+    u32 processed = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        ?Handle(Task) mh = pool.alloc();
+        Handle(Task) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).id = i;
+        pool.get(h).cost = i * 2;
+
+        // Skip expensive tasks
+        if (h.cost > 4) {
+            continue;   // defer fires — h freed
+        }
+        processed += 1;
+    }
+    // cost > 4 at i=3 (cost=6) and i=4 (cost=8), so processed = 3
+    if (processed != 3) { return 1; }
+    return 0;
+}

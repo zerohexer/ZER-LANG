@@ -1,0 +1,28 @@
+// Rust drop: reassigning variable with Drop — old value dropped first.
+// ZER: handle with defer. Reassigning handle var doesn't affect defer target.
+// Defer captures handle VALUE at declaration time.
+
+struct State { u32 phase; }
+Pool(State, 4) pool;
+
+u32 multi_phase() {
+    ?Handle(State) mh = pool.alloc();
+    Handle(State) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).phase = 1;
+
+    u32 result = h.phase;
+    pool.get(h).phase = 2;
+    result += h.phase;
+    pool.get(h).phase = 3;
+    result += h.phase;
+
+    return result;
+}
+
+i32 main() {
+    u32 r = multi_phase();
+    // result = 1 + 2 + 3 = 6
+    if (r != 6) { return 1; }
+    return 0;
+}

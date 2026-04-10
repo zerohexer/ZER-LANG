@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Rust unsafe: dereference raw pointer from arbitrary integer.
+// ZER: @inttoptr without mmio range declaration — strict mode rejects.
+// Must declare mmio range first to prove address is valid hardware.
+
+i32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0xDEADBEEF);
+    return 0;
+}

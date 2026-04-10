@@ -1,0 +1,30 @@
+// Rust NLL: multiple sequential borrows — each ends before next starts.
+// ZER: alloc, use, free, alloc, use, free — 3 cycles, each independent.
+
+struct Msg { u32 seq; u32 data; }
+Pool(Msg, 4) pool;
+
+i32 main() {
+    u32 total = 0;
+
+    ?Handle(Msg) m1 = pool.alloc();
+    Handle(Msg) h1 = m1 orelse return;
+    pool.get(h1).data = 10;
+    total += h1.data;
+    pool.free(h1);
+
+    ?Handle(Msg) m2 = pool.alloc();
+    Handle(Msg) h2 = m2 orelse return;
+    pool.get(h2).data = 20;
+    total += h2.data;
+    pool.free(h2);
+
+    ?Handle(Msg) m3 = pool.alloc();
+    Handle(Msg) h3 = m3 orelse return;
+    pool.get(h3).data = 30;
+    total += h3.data;
+    pool.free(h3);
+
+    if (total != 60) { return 1; }
+    return 0;
+}

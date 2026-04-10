@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// Rust borrowck: use resource from wrong allocator.
+// ZER: zercheck tracks pool_id — free with wrong pool detected.
+
+struct A { u32 x; }
+struct B { u32 y; }
+Pool(A, 4) pool_a;
+Pool(B, 4) pool_b;
+
+i32 main() {
+    ?Handle(A) ma = pool_a.alloc();
+    Handle(A) ha = ma orelse return;
+    pool_a.get(ha).x = 1;
+
+    // Try to free handle from pool_a using pool_b — type mismatch
+    pool_b.free(ha);
+    return 0;
+}
+
+// LIMITATION (2026-04-10): pool.free() does not type-check Handle element type
+// against Pool element type. Handle(A) can be freed with Pool(B).
+// pool.free_ptr() DOES type-check (checker.c line ~2631), but pool.free() skips it.
+// Fix: In checker.c Pool.free handler, validate that arg type's handle.elem
+// matches pool.elem via type_equals(). ~5 line fix.

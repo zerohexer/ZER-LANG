@@ -1,0 +1,37 @@
+// Rust drop: enum with Drop — each variant has its own destructor logic.
+// ZER: union switch arms with defer cleanup per variant pattern.
+
+struct Payload { u32 data; }
+Pool(Payload, 4) pool;
+
+enum MsgKind { simple, nested }
+
+u32 process_msg(MsgKind kind) {
+    ?Handle(Payload) mh = pool.alloc();
+    Handle(Payload) h = mh orelse return;
+    defer pool.free(h);
+
+    switch (kind) {
+        .simple => {
+            pool.get(h).data = 10;
+            return h.data;
+        }
+        .nested => {
+            pool.get(h).data = 20;
+            // nested: allocate second resource
+            ?Handle(Payload) mh2 = pool.alloc();
+            Handle(Payload) h2 = mh2 orelse return;
+            defer pool.free(h2);
+            pool.get(h2).data = 30;
+            return h.data + h2.data;
+        }
+    }
+}
+
+i32 main() {
+    u32 r1 = process_msg(MsgKind.simple);
+    u32 r2 = process_msg(MsgKind.nested);
+    if (r1 != 10) { return 1; }
+    if (r2 != 50) { return 2; }
+    return 0;
+}

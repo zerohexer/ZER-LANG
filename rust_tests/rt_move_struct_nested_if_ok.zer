@@ -1,0 +1,31 @@
+// Rust moves: value consumed only in deeply nested path — outer paths safe.
+// ZER: move struct consumed inside nested if that returns — outer path h alive.
+
+move struct Permit { u32 level; }
+
+void revoke(Permit p) { u32 l = p.level; }
+
+u32 check_access(u32 user, u32 role) {
+    Permit p;
+    p.level = role;
+
+    if (user == 0) {
+        if (role == 0) {
+            revoke(p);
+            return 0;    // terminated — p consumed + exited
+        }
+        // role != 0, user == 0 — p still alive
+        return p.level;
+    }
+    // user != 0 — p still alive
+    u32 result = p.level * 10;
+    revoke(p);
+    return result;
+}
+
+i32 main() {
+    if (check_access(0, 0) != 0) { return 1; }
+    if (check_access(0, 3) != 3) { return 2; }
+    if (check_access(1, 5) != 50) { return 3; }
+    return 0;
+}

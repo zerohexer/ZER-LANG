@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Rust: move value to thread, use after = error.
+// ZER: non-shared pointer passed to spawn → HS_TRANSFERRED → use after = error.
+
+struct Work { u32 data; }
+
+void process(*Work w) {
+    w[0].data += 1;
+}
+
+i32 main() {
+    Work w;
+    w.data = 42;
+    spawn process(&w);    // w transferred to thread
+    u32 d = w.data;       // error: use after transfer
+    return 0;
+}

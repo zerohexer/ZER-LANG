@@ -1,0 +1,30 @@
+// Rust: RwLock — writer gets exclusive access.
+// ZER: shared(rw) struct — auto reader-writer lock.
+
+shared(rw) struct Database { u32 version; u32 entries; }
+Database db;
+
+void writer(*Database d) {
+    d.version += 1;
+    d.entries += 10;
+}
+
+void reader(*Database d, *u32 out) {
+    out[0] = d.version;
+}
+
+i32 main() {
+    db.version = 1;
+    db.entries = 0;
+
+    ThreadHandle tw = spawn writer(&db);
+    tw.join();
+
+    u32 ver = 0;
+    ThreadHandle tr = spawn reader(&db, &ver);
+    tr.join();
+
+    if (db.version != 2) { return 1; }
+    if (db.entries != 10) { return 2; }
+    return 0;
+}

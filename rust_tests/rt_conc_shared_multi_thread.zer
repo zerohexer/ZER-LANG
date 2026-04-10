@@ -1,0 +1,29 @@
+// Rust: Arc<Mutex<T>> with 4 threads incrementing counter.
+// ZER: shared struct with 4 scoped spawns, each incrementing.
+
+shared struct Counter { u32 val; }
+Counter g_counter;
+
+void increment(*Counter c) {
+    for (u32 i = 0; i < 100; i += 1) {
+        c.val += 1;
+    }
+}
+
+i32 main() {
+    g_counter.val = 0;
+
+    ThreadHandle t1 = spawn increment(&g_counter);
+    ThreadHandle t2 = spawn increment(&g_counter);
+    ThreadHandle t3 = spawn increment(&g_counter);
+    ThreadHandle t4 = spawn increment(&g_counter);
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    // 4 threads × 100 increments = 400
+    if (g_counter.val != 400) { return 1; }
+    return 0;
+}

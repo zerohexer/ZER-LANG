@@ -1,0 +1,20 @@
+// Rust: AtomicU32::compare_exchange() — lock-free state transition.
+// ZER: @atomic_cas(&var, expected, desired) — returns bool.
+
+u32 state;
+
+void try_acquire(*u32 s) {
+    // CAS: if state==0 (unlocked), set to 1 (locked)
+    bool acquired = @atomic_cas(s, 0, 1);
+    if (acquired) {
+        // critical section
+        @atomic_store(s, 0);  // release
+    }
+}
+
+i32 main() {
+    state = 0;
+    try_acquire(&state);
+    if (state != 0) { return 1; }  // should be released
+    return 0;
+}

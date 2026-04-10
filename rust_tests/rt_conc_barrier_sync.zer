@@ -1,0 +1,31 @@
+// Rust: Barrier::wait() — N threads sync at a point before continuing.
+// ZER: @barrier_init(var, N) + @barrier_wait(var) — thread sync barrier.
+
+shared struct Counter { u32 val; }
+Counter g;
+u32 barrier;
+
+void worker(*Counter c) {
+    c.val += 1;
+    @barrier_wait(barrier);
+    // All threads have incremented before any continues past here
+}
+
+i32 main() {
+    g.val = 0;
+    @barrier_init(barrier, 3);
+
+    ThreadHandle t1 = spawn worker(&g);
+    ThreadHandle t2 = spawn worker(&g);
+
+    // Main thread also participates
+    g.val += 1;
+    @barrier_wait(barrier);
+
+    t1.join();
+    t2.join();
+
+    // All 3 threads incremented — val should be 3
+    if (g.val != 3) { return 1; }
+    return 0;
+}

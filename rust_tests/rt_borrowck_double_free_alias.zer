@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Rust borrowck: alias then free both = double free.
+// ZER: Handle alias via assignment, free original, free alias = double free.
+
+struct Node { u32 val; }
+Pool(Node, 4) pool;
+
+i32 main() {
+    ?Handle(Node) mh = pool.alloc();
+    Handle(Node) h = mh orelse return;
+    pool.get(h).val = 42;
+
+    Handle(Node) alias = h;   // alias — same alloc_id
+    pool.free(h);             // free via original
+    pool.free(alias);         // double free via alias — zercheck catches
+    return 0;
+}

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Rust borrowck: after moving container, accessing elements = error.
+// ZER: free slab-allocated struct, then access field = UAF.
+
+struct List { u32 head; u32 count; }
+Slab(List) slab;
+
+i32 main() {
+    ?*List ml = slab.alloc_ptr();
+    *List l = ml orelse return;
+    l[0].head = 1;
+    l[0].count = 5;
+    slab.free_ptr(l);
+    // l freed — accessing field = UAF
+    u32 c = l[0].count;
+    return 0;
+}

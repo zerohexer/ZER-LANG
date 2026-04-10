@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// CFG test: free handle then continue in loop — next iteration uses freed handle.
+
+struct Item { u32 val; }
+Pool(Item, 4) pool;
+
+i32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    pool.get(h).val = 1;
+
+    for (u32 i = 0; i < 5; i += 1) {
+        if (i == 2) {
+            pool.free(h);
+            continue;   // skip to next iteration — h freed
+        }
+        u32 v = pool.get(h).val;   // UAF after i==2
+    }
+    return 0;
+}

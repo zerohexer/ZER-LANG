@@ -5337,6 +5337,13 @@ void emit_file(Emitter *e, Node *file_node) {
 /* RF2: unified — uses same emit_top_level_decl as emit_file */
 void emit_file_no_preamble(Emitter *e, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
+    /* BUG-472: prescan for spawn in ALL modules, not just the first.
+     * In multi-module builds, the main module is emitted via this function
+     * (not emit_file) because topo order puts dependencies first. */
+    for (int i = 0; i < file_node->file.decl_count; i++)
+        prescan_spawn_in_node(e, file_node->file.decls[i]);
+    /* Emit spawn wrappers if any found in this module */
+    emit_spawn_wrappers(e);
     emit(e, "\n/* --- imported module --- */\n\n");
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];

@@ -1,0 +1,5 @@
+// Module: comptime functions for cross-module constant evaluation
+
+comptime u32 MAX_ITEMS() { return 16; }
+comptime u32 HEADER_SIZE() { return 4; }
+comptime u32 BUF_SIZE() { return MAX_ITEMS() * HEADER_SIZE(); }

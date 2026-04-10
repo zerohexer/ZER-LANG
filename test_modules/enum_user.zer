@@ -1,0 +1,26 @@
+// Multi-module test: enum imported from module, used in switch + function call.
+
+import enum_mod;
+
+u32 main() {
+    u32 r1 = execute(Command.start);
+    u32 r2 = execute(Command.stop);
+    u32 r3 = execute(Command.reset);
+    u32 r4 = execute(Command.status);
+
+    if (r1 != 1) { return 1; }
+    if (r2 != 2) { return 2; }
+    if (r3 != 3) { return 3; }
+    if (r4 != 4) { return 4; }
+
+    // Local switch on imported enum
+    Command c = Command.reset;
+    switch (c) {
+        .start => { return 10; }
+        .stop => { return 11; }
+        .reset => { }
+        .status => { return 12; }
+    }
+
+    return 0;
+}

@@ -944,10 +944,15 @@ Run each negative test manually: `./zerc test.zer -o /dev/null`. If exit code is
 **Rule 6: Don't only test the feature — test its interaction with OTHER features.**
 Move struct + defer, move struct + orelse, move struct + switch capture, move struct inside Pool handle field. The feature works in isolation; the bugs are in combinations.
 
-**Patterns that found bugs in practice (2026-04-09):**
+**Patterns that found bugs in practice (2026-04-09/10):**
 - `if (c) { consume(move_struct); } use(move_struct)` → found BUG-468 (HS_TRANSFERRED not merged)
 - `consume(regular_struct_containing_move_field)` → found nested move struct limitation
 - `return move_struct; use_after_return` → found return-doesn't-transfer limitation
+- `pool_b.free(handle_from_pool_a)` → found BUG-471 (pool.free missing type check)
+- `spawn local_func_with_cross_module_shared_param` → found BUG-472 (spawn wrapper can't find local func with cross-module type)
+
+**Rule 7: NEVER "simplify" a failing test to make it pass.**
+When a test hits a compiler bug, the instinct is to simplify the test (remove spawn, remove cross-module type, use single-thread instead). THIS IS THE SAME AS REWRITING. The test found a bug — keep it exactly as written, move to limitations. Write a SEPARATE simpler test if you want coverage for the non-broken path. This rule was violated in this session (shared_user.zer simplified to remove spawn) and immediately caught by the user.
 
 ### CRITICAL: Never Hide Limitations by Rewriting Tests
 

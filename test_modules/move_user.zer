@@ -1,0 +1,16 @@
+// Multi-module test: move struct created in one module, consumed in another.
+// Tests that HS_TRANSFERRED works across module boundaries.
+
+import move_mod;
+
+u32 main() {
+    Token t = create_token(42);
+    u32 id = verify_token(t);
+    if (id != 42) { return 1; }
+
+    // Chain: create in module → verify in module
+    u32 id2 = verify_token(create_token(10));
+    if (id2 != 10) { return 2; }
+
+    return 0;
+}

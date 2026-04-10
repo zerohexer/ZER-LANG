@@ -1,0 +1,20 @@
+// Module: Pool-based resource with handle lifecycle functions
+
+struct Device { u32 id; u32 status; }
+Pool(Device, 8) device_pool;
+
+?Handle(Device) device_create(u32 id) {
+    ?Handle(Device) mh = device_pool.alloc();
+    Handle(Device) h = mh orelse return;
+    device_pool.get(h).id = id;
+    device_pool.get(h).status = 1;
+    return mh;
+}
+
+u32 device_get_id(Handle(Device) h) {
+    return h.id;
+}
+
+void device_destroy(Handle(Device) h) {
+    device_pool.free(h);
+}

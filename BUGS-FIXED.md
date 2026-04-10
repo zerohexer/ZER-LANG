@@ -7,6 +7,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-09/10 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 661 Tests
 
+### BUG-472: spawn wrapper can't find local function with cross-module struct param (OPEN)
+- **Symptom:** `spawn worker(&g_counter)` where `worker` takes `*SharedCounter` from imported module → emits `/* spawn: wrapper not found */` → GCC error.
+- **Root cause:** Emitter spawn handler looks up function by name but can't resolve the cross-module struct type for the wrapper struct generation. The function IS local but its parameter type is from another module.
+- **Fix direction:** In emitter spawn wrapper generation, resolve parameter types through checker's type system (which already has the cross-module type registered). ~20-30 line fix in emitter.c spawn handler.
+- **Test:** `test_modules/shared_user.zer` (not in run_tests.sh — known failing).
+
 ### BUG-471: pool.free()/slab.free() missing Handle element type check
 - **Symptom:** `pool_b.free(handle_from_pool_a)` compiled — Handle is u64, no type mismatch at C level.
 - **Root cause:** Pool/Slab `.free()` handler didn't validate handle's element type against pool's element type. `.free_ptr()` already had the check.

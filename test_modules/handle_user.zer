@@ -1,0 +1,23 @@
+// Multi-module test: Handle lifecycle across module boundary.
+// Create, use, destroy — all through imported functions.
+
+import handle_mod;
+
+u32 main() {
+    ?Handle(Device) mh = device_create(42);
+    Handle(Device) h = mh orelse return;
+    defer device_destroy(h);
+
+    u32 id = device_get_id(h);
+    if (id != 42) { return 1; }
+
+    // Second device
+    ?Handle(Device) mh2 = device_create(99);
+    Handle(Device) h2 = mh2 orelse return;
+    defer device_destroy(h2);
+
+    u32 id2 = device_get_id(h2);
+    if (id2 != 99) { return 2; }
+
+    return 0;
+}

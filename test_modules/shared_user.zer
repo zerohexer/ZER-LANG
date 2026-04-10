@@ -1,0 +1,27 @@
+// Multi-module test: shared struct defined in one module, used in another.
+// Tests that auto-locking + spawn works across module boundaries.
+
+import shared_mod;
+
+SharedCounter g_counter;
+
+void worker(*SharedCounter c) {
+    for (u32 i = 0; i < 10; i += 1) {
+        counter_inc(c);
+    }
+}
+
+u32 main() {
+    g_counter.val = 0;
+    g_counter.ops = 0;
+
+    ThreadHandle t1 = spawn worker(&g_counter);
+    ThreadHandle t2 = spawn worker(&g_counter);
+    t1.join();
+    t2.join();
+
+    // 2 threads × 10 incs = 20
+    if (counter_get(&g_counter) != 20) { return 1; }
+    if (g_counter.ops != 20) { return 2; }
+    return 0;
+}

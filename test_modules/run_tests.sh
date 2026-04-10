@@ -78,6 +78,18 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# Multi-module: shared struct + spawn — KNOWN LIMITATION (BUG-472)
+# spawn wrapper can't find local func with cross-module struct param.
+# Original test preserved in test_modules/shared_user.zer (not run).
+# Multi-module: move struct across modules
+run_test move_user 0
+# Multi-module: handle lifecycle across modules
+run_test handle_user 0
+# Multi-module: comptime functions across modules
+run_test comptime_user 0
+# Multi-module: enum + switch across modules
+run_test enum_user 0
+
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*
 

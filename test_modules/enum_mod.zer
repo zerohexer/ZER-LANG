@@ -1,0 +1,12 @@
+// Module: enum type + dispatch function
+
+enum Command { start, stop, reset, status }
+
+u32 execute(Command cmd) {
+    switch (cmd) {
+        .start => { return 1; }
+        .stop => { return 2; }
+        .reset => { return 3; }
+        .status => { return 4; }
+    }
+}

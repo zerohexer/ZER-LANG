@@ -5,7 +5,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-04-09 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 601 Tests
+## Session 2026-04-09/10 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 661 Tests
+
+### BUG-471: pool.free()/slab.free() missing Handle element type check
+- **Symptom:** `pool_b.free(handle_from_pool_a)` compiled — Handle is u64, no type mismatch at C level.
+- **Root cause:** Pool/Slab `.free()` handler didn't validate handle's element type against pool's element type. `.free_ptr()` already had the check.
+- **Fix (checker.c):** Added `type_equals(handle.elem, pool.elem)` check to both Pool and Slab `.free()` handlers. ~5 lines each.
+- **Test:** `rust_tests/rt_borrowck_free_wrong_pool_uaf.zer` (negative).
 
 ### CFG-Aware Zercheck
 - **Problem:** Linear AST walk with per-construct merge hacks (block_always_exits, 2-pass+widen, backward goto re-walk). Adding new control flow required new hacks.

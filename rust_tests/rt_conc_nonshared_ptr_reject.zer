@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Rust: *const T is !Send — can't pass non-Send to thread.
+// ZER: spawn with non-shared struct pointer = compile error (data race).
+
+struct Local { u32 val; }
+
+void worker(*Local l) {
+    l[0].val += 1;
+}
+
+i32 main() {
+    Local x;
+    x.val = 0;
+    spawn worker(&x);   // error: non-shared pointer to spawn
+    return 0;
+}

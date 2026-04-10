@@ -1,0 +1,36 @@
+// Rust: Mutex — two different functions access same shared data.
+// ZER: shared struct accessed by two thread functions — auto-locked.
+
+shared struct Bank { u32 balance; u32 transactions; }
+Bank g_bank;
+
+void deposit(*Bank b) {
+    for (u32 i = 0; i < 100; i += 1) {
+        b.balance += 10;
+        b.transactions += 1;
+    }
+}
+
+void withdraw(*Bank b) {
+    for (u32 i = 0; i < 50; i += 1) {
+        b.balance -= 5;
+        b.transactions += 1;
+    }
+}
+
+i32 main() {
+    g_bank.balance = 1000;
+    g_bank.transactions = 0;
+
+    ThreadHandle td = spawn deposit(&g_bank);
+    ThreadHandle tw = spawn withdraw(&g_bank);
+
+    td.join();
+    tw.join();
+
+    // 1000 + 100*10 - 50*5 = 1000 + 1000 - 250 = 1750
+    if (g_bank.balance != 1750) { return 1; }
+    // 100 + 50 = 150 transactions
+    if (g_bank.transactions != 150) { return 2; }
+    return 0;
+}

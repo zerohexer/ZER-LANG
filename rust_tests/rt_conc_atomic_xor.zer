@@ -1,0 +1,19 @@
+// Rust: AtomicU32::fetch_xor — atomic XOR toggle.
+// ZER: @atomic_xor — toggle bits atomically.
+
+u32 toggle;
+
+i32 main() {
+    toggle = 0;
+
+    @atomic_xor(&toggle, 0xFF);   // 0 ^ 0xFF = 0xFF
+    if (@atomic_load(&toggle) != 0xFF) { return 1; }
+
+    @atomic_xor(&toggle, 0x0F);   // 0xFF ^ 0x0F = 0xF0
+    if (@atomic_load(&toggle) != 0xF0) { return 2; }
+
+    @atomic_xor(&toggle, 0xF0);   // 0xF0 ^ 0xF0 = 0
+    if (@atomic_load(&toggle) != 0) { return 3; }
+
+    return 0;
+}

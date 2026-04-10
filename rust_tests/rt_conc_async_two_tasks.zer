@@ -1,0 +1,46 @@
+// Rust: two async tasks polled interleaved.
+// ZER: two coroutines, poll alternately, each advances independently.
+
+u32 g_a;
+u32 g_b;
+
+async void task_a() {
+    g_a = 1;
+    yield;
+    g_a = 2;
+    yield;
+    g_a = 3;
+}
+
+async void task_b() {
+    g_b = 10;
+    yield;
+    g_b = 20;
+}
+
+i32 main() {
+    g_a = 0;
+    g_b = 0;
+
+    _zer_async_task_a ta;
+    _zer_async_task_b tb;
+    _zer_async_task_a_init(&ta);
+    _zer_async_task_b_init(&tb);
+
+    _zer_async_task_a_poll(&ta);
+    if (g_a != 1) { return 1; }
+
+    _zer_async_task_b_poll(&tb);
+    if (g_b != 10) { return 2; }
+
+    _zer_async_task_a_poll(&ta);
+    if (g_a != 2) { return 3; }
+
+    _zer_async_task_b_poll(&tb);
+    if (g_b != 20) { return 4; }
+
+    _zer_async_task_a_poll(&ta);
+    if (g_a != 3) { return 5; }
+
+    return 0;
+}

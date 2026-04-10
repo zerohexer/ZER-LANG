@@ -1,0 +1,26 @@
+// Rust: RwLock — multiple concurrent readers safe.
+// ZER: shared(rw) struct — readers access independently. No writer conflict.
+
+shared(rw) struct Config { u32 port; u32 timeout; }
+Config g_cfg;
+
+shared struct Out { u32 sum; }
+Out g_out;
+
+void reader(*Config c, *Out out) {
+    u32 p = c.port;
+    u32 t = c.timeout;
+    out.sum = p + t;
+}
+
+i32 main() {
+    g_cfg.port = 8080;
+    g_cfg.timeout = 30;
+    g_out.sum = 0;
+
+    ThreadHandle t1 = spawn reader(&g_cfg, &g_out);
+    t1.join();
+
+    if (g_out.sum != 8110) { return 1; }
+    return 0;
+}

@@ -1,0 +1,24 @@
+// Rust: thread::spawn without join — fire-and-forget.
+// ZER: spawn without ThreadHandle — fire-and-forget (shared args only).
+
+shared struct Log { u32 count; }
+Log g_log;
+
+void log_event(*Log l) {
+    l.count += 1;
+}
+
+i32 main() {
+    g_log.count = 0;
+
+    // Fire-and-forget — no ThreadHandle, no join needed
+    spawn log_event(&g_log);
+    spawn log_event(&g_log);
+    spawn log_event(&g_log);
+
+    // Wait a bit for threads to finish (no join available)
+    for (u32 i = 0; i < 100000; i += 1) { }
+
+    // Can't guarantee count == 3 without join, but test compiles + runs
+    return 0;
+}

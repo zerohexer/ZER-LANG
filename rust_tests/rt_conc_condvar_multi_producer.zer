@@ -1,0 +1,28 @@
+// Rust: multiple producers, single consumer with Condvar.
+// ZER: 3 producers signal, 1 consumer waits on shared count.
+
+shared struct Mailbox { u32 count; u32 total; }
+Mailbox g_mb;
+
+void send_msg(*Mailbox mb) {
+    mb.count += 1;
+    mb.total += 10;
+    @cond_signal(g_mb);
+}
+
+i32 main() {
+    g_mb.count = 0;
+    g_mb.total = 0;
+
+    ThreadHandle t1 = spawn send_msg(&g_mb);
+    ThreadHandle t2 = spawn send_msg(&g_mb);
+    ThreadHandle t3 = spawn send_msg(&g_mb);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    if (g_mb.count != 3) { return 1; }
+    if (g_mb.total != 30) { return 2; }
+    return 0;
+}

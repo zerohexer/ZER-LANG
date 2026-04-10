@@ -1,0 +1,21 @@
+// Rust: spawn threads sequentially — each finishes before next starts.
+// ZER: spawn + join in sequence, 5 rounds.
+
+shared struct Counter { u32 val; }
+Counter g;
+
+void bump(*Counter c) {
+    c.val += 1;
+}
+
+i32 main() {
+    g.val = 0;
+
+    for (u32 i = 0; i < 5; i += 1) {
+        ThreadHandle t = spawn bump(&g);
+        t.join();
+    }
+
+    if (g.val != 5) { return 1; }
+    return 0;
+}

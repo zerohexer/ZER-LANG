@@ -1,0 +1,17 @@
+// Module: shared struct definition + accessor functions
+
+shared struct SharedCounter { u32 val; u32 ops; }
+
+void counter_inc(*SharedCounter c) {
+    c.val += 1;
+    c.ops += 1;
+}
+
+void counter_add(*SharedCounter c, u32 n) {
+    c.val += n;
+    c.ops += 1;
+}
+
+u32 counter_get(*SharedCounter c) {
+    return c.val;
+}

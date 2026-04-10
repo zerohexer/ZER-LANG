@@ -1,0 +1,17 @@
+// Multi-module test: comptime functions imported and used at compile time.
+
+import comptime_mod;
+
+u32 main() {
+    u32 max = MAX_ITEMS();
+    if (max != 16) { return 1; }
+
+    u32 buf = BUF_SIZE();
+    if (buf != 64) { return 2; }
+
+    // Use in array size
+    u8[BUF_SIZE()] buffer;
+    if (@size(u8) * 64 != 64) { return 3; }
+
+    return 0;
+}

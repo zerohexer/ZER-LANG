@@ -1,0 +1,15 @@
+// Module: move struct definition + factory function
+
+move struct Token { u32 id; u32 nonce; }
+
+Token create_token(u32 id) {
+    Token t;
+    t.id = id;
+    t.nonce = id * 7;
+    return t;
+}
+
+u32 verify_token(Token t) {
+    if (t.nonce != t.id * 7) { return 0; }
+    return t.id;
+}

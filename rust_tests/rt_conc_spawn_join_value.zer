@@ -1,0 +1,27 @@
+// Rust: thread::spawn returns JoinHandle — join() gets result.
+// ZER: ThreadHandle + join(). Result passed through shared struct.
+
+shared struct Output { u32 result; u32 done; }
+Output g_out;
+
+void compute(*Output out) {
+    u32 sum = 0;
+    for (u32 i = 1; i <= 10; i += 1) {
+        sum += i;
+    }
+    out.result = sum;
+    out.done = 1;
+}
+
+i32 main() {
+    g_out.result = 0;
+    g_out.done = 0;
+
+    ThreadHandle t = spawn compute(&g_out);
+    t.join();
+
+    if (g_out.done != 1) { return 1; }
+    // sum 1..10 = 55
+    if (g_out.result != 55) { return 2; }
+    return 0;
+}

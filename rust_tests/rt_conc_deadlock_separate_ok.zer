@@ -1,0 +1,20 @@
+// Rust: sequential lock acquisition — safe (no ABBA).
+// ZER: separate statements accessing different shared types — safe.
+// Lock released between statements, no nested locks.
+
+shared struct Sensor { u32 val; }
+shared struct Motor { u32 speed; }
+Sensor g_sensor;
+Motor g_motor;
+
+i32 main() {
+    g_sensor.val = 100;
+    g_motor.speed = 0;
+
+    // Separate statements — each locks/unlocks independently
+    u32 reading = g_sensor.val;
+    g_motor.speed = reading;
+
+    if (g_motor.speed != 100) { return 1; }
+    return 0;
+}

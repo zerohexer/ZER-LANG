@@ -1,0 +1,29 @@
+// Rust: Arc<Mutex<T>> with Drop — cleanup when last reference dropped.
+// ZER: shared struct with scoped spawn + defer. Thread modifies, defer logs.
+
+shared struct Resource { u32 active; u32 ops; }
+Resource g_res;
+
+void do_work(*Resource r) {
+    for (u32 i = 0; i < 50; i += 1) {
+        r.ops += 1;
+    }
+}
+
+i32 main() {
+    g_res.active = 1;
+    g_res.ops = 0;
+
+    ThreadHandle t1 = spawn do_work(&g_res);
+    ThreadHandle t2 = spawn do_work(&g_res);
+
+    t1.join();
+    t2.join();
+
+    // 2 threads × 50 ops = 100
+    if (g_res.ops != 100) { return 1; }
+
+    g_res.active = 0;
+    if (g_res.active != 0) { return 2; }
+    return 0;
+}

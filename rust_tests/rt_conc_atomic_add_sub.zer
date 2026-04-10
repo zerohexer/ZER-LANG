@@ -1,0 +1,32 @@
+// Rust: AtomicU32::fetch_add/fetch_sub — atomic increment/decrement.
+// ZER: @atomic_add/@atomic_sub — returns old value.
+
+u32 counter;
+
+void incrementer() {
+    for (u32 i = 0; i < 100; i += 1) {
+        @atomic_add(&counter, 1);
+    }
+}
+
+void decrementer() {
+    for (u32 i = 0; i < 50; i += 1) {
+        @atomic_sub(&counter, 1);
+    }
+}
+
+i32 main() {
+    counter = 0;
+
+    ThreadHandle t1 = spawn incrementer();
+    ThreadHandle t2 = spawn incrementer();
+    ThreadHandle t3 = spawn decrementer();
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // 200 adds - 50 subs = 150
+    if (@atomic_load(&counter) != 150) { return 1; }
+    return 0;
+}

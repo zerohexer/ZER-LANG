@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Rust: JoinHandle dropped without join = detached thread (warning).
+// ZER: ThreadHandle not joined = compile error (zercheck leak detection).
+
+shared struct Data { u32 val; }
+Data g;
+
+void worker(*Data d) {
+    d.val += 1;
+}
+
+i32 main() {
+    g.val = 0;
+    ThreadHandle t = spawn worker(&g);
+    // t not joined — zercheck: "thread not joined"
+    return 0;
+}

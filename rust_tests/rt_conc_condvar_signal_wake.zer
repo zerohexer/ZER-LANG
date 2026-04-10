@@ -1,0 +1,31 @@
+// Rust: Condvar::notify_one() — wake one waiting thread.
+// ZER: @cond_signal wakes one thread blocked on @cond_wait.
+
+shared struct Queue { u32 count; u32 data; }
+Queue g_queue;
+
+void producer(*Queue q) {
+    q.data = 42;
+    q.count = 1;
+    @cond_signal(g_queue);
+}
+
+void consumer(*Queue q) {
+    @cond_wait(g_queue, g_queue.count > 0);
+    // woken — data is ready
+}
+
+i32 main() {
+    g_queue.count = 0;
+    g_queue.data = 0;
+
+    ThreadHandle tc = spawn consumer(&g_queue);
+    ThreadHandle tp = spawn producer(&g_queue);
+
+    tp.join();
+    tc.join();
+
+    if (g_queue.data != 42) { return 1; }
+    if (g_queue.count != 1) { return 2; }
+    return 0;
+}

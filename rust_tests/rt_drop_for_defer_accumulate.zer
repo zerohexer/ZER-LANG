@@ -1,0 +1,27 @@
+// Rust drop: accumulate results across iterations, each with scoped Drop.
+// ZER: for loop, each iteration allocs+defers, accumulates before defer fires.
+
+struct Sample { u32 value; u32 weight; }
+Pool(Sample, 4) pool;
+
+i32 main() {
+    u32 weighted_sum = 0;
+    u32 total_weight = 0;
+
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Handle(Sample) mh = pool.alloc();
+        Handle(Sample) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).value = (i + 1) * 10;
+        pool.get(h).weight = i + 1;
+
+        weighted_sum += h.value * h.weight;
+        total_weight += h.weight;
+        // defer fires — h freed, slot available next iteration
+    }
+    // weighted_sum = 10*1 + 20*2 + 30*3 + 40*4 = 10+40+90+160 = 300
+    // total_weight = 1+2+3+4 = 10
+    if (weighted_sum != 300) { return 1; }
+    if (total_weight != 10) { return 2; }
+    return 0;
+}

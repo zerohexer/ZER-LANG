@@ -1,0 +1,25 @@
+// Rust borrowck: two mutable borrows of different objects — safe.
+// ZER: two handles from same pool, used independently. No aliasing.
+
+struct Entry { u32 key; u32 val; }
+Pool(Entry, 8) pool;
+
+i32 main() {
+    ?Handle(Entry) ma = pool.alloc();
+    Handle(Entry) a = ma orelse return;
+    defer pool.free(a);
+
+    ?Handle(Entry) mb = pool.alloc();
+    Handle(Entry) b = mb orelse return;
+    defer pool.free(b);
+
+    pool.get(a).key = 1;
+    pool.get(a).val = 100;
+    pool.get(b).key = 2;
+    pool.get(b).val = 200;
+
+    // Both handles alive and independent
+    u32 sum = a.val + b.val;
+    if (sum != 300) { return 1; }
+    return 0;
+}

@@ -1,0 +1,27 @@
+// Rust moves: function returns move struct, caller passes to another function.
+// ZER: chain of ownership transfers through return values. Each step clean.
+
+move struct Token { u32 id; u32 nonce; }
+
+Token create(u32 id) {
+    Token t;
+    t.id = id;
+    t.nonce = id * 7;
+    return t;
+}
+
+u32 verify(Token t) {
+    if (t.nonce != t.id * 7) { return 0; }
+    return t.id;
+}
+
+i32 main() {
+    Token t = create(6);
+    u32 id = verify(t);
+    if (id != 6) { return 1; }
+
+    // Second round — fresh token
+    u32 id2 = verify(create(12));
+    if (id2 != 12) { return 2; }
+    return 0;
+}

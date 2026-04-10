@@ -1,0 +1,31 @@
+// CFG test: while loop with early return inside — handle alive on all paths.
+
+struct Req { u32 id; u32 retries; }
+Slab(Req) slab;
+
+u32 retry_request(u32 max_retries) {
+    ?Handle(Req) mh = slab.alloc();
+    Handle(Req) h = mh orelse return;
+    defer slab.free(h);
+    slab.get(h).id = 42;
+    slab.get(h).retries = 0;
+
+    u32 i = 0;
+    while (i < max_retries) {
+        slab.get(h).retries = i;
+        if (i == 2) {
+            return h.id;   // early return — defer fires
+        }
+        i += 1;
+    }
+    // exhausted retries — h still alive
+    return 0;
+}
+
+i32 main() {
+    u32 r1 = retry_request(5);
+    u32 r2 = retry_request(1);
+    if (r1 != 42) { return 1; }
+    if (r2 != 0) { return 2; }
+    return 0;
+}

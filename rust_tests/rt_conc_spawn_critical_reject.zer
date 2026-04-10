@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// ZER: spawn inside @critical block = compile error.
+// Thread creation with interrupts disabled is unsafe (may deadlock scheduler).
+
+shared struct Data { u32 val; }
+Data g;
+
+void worker(*Data d) {
+    d.val += 1;
+}
+
+i32 main() {
+    g.val = 0;
+    @critical {
+        spawn worker(&g);   // error: spawn inside @critical
+    }
+    return 0;
+}

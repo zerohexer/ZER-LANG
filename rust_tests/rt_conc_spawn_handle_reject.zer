@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Rust: Handle/index types are not Send — can't pass to thread.
+// ZER: passing Handle to spawn = compile error (Handle is pool index,
+// meaningless in another thread without the pool).
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void worker(Handle(Task) h) {
+    u32 id = pool.get(h).id;
+}
+
+i32 main() {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).id = 42;
+
+    spawn worker(h);   // error: Handle to spawn
+    return 0;
+}

@@ -1,0 +1,33 @@
+// Rust: std::sync::Once — execute init exactly once, thread-safe.
+// ZER: @once { body } — atomic CAS, body runs exactly once.
+
+shared struct Config { u32 initialized; u32 value; }
+Config g_config;
+
+void ensure_init(*Config cfg) {
+    @once {
+        cfg.value = 42;
+        cfg.initialized = 1;
+    }
+}
+
+void worker(*Config cfg) {
+    ensure_init(cfg);
+}
+
+i32 main() {
+    g_config.initialized = 0;
+    g_config.value = 0;
+
+    ThreadHandle t1 = spawn worker(&g_config);
+    ThreadHandle t2 = spawn worker(&g_config);
+    ensure_init(&g_config);
+
+    t1.join();
+    t2.join();
+
+    // @once ensures init ran exactly once — value should be 42
+    if (g_config.value != 42) { return 1; }
+    if (g_config.initialized != 1) { return 2; }
+    return 0;
+}

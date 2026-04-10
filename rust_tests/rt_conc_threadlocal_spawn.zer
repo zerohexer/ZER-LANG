@@ -1,0 +1,38 @@
+// Rust: thread_local! — each thread has its own copy.
+// ZER: threadlocal keyword — __thread storage, independent per thread.
+
+threadlocal u32 tls_counter;
+
+shared struct Result { u32 thread1_val; u32 thread2_val; }
+Result g_result;
+
+void worker1(*Result r) {
+    tls_counter = 10;
+    tls_counter += 5;
+    r.thread1_val = tls_counter;
+}
+
+void worker2(*Result r) {
+    tls_counter = 100;
+    tls_counter += 50;
+    r.thread2_val = tls_counter;
+}
+
+i32 main() {
+    tls_counter = 0;
+    g_result.thread1_val = 0;
+    g_result.thread2_val = 0;
+
+    ThreadHandle t1 = spawn worker1(&g_result);
+    ThreadHandle t2 = spawn worker2(&g_result);
+    t1.join();
+    t2.join();
+
+    // Each thread had independent tls_counter
+    if (g_result.thread1_val != 15) { return 1; }
+    if (g_result.thread2_val != 150) { return 2; }
+
+    // Main thread's tls_counter is still 0
+    if (tls_counter != 0) { return 3; }
+    return 0;
+}

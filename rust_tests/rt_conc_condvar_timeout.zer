@@ -1,0 +1,25 @@
+// Rust: Condvar::wait_timeout() — wait with timeout.
+// ZER: @cond_timedwait returns ?void — null if timed out.
+// Simple test: condition already true → returns immediately.
+
+shared struct Flag { u32 ready; }
+Flag g_flag;
+
+void setter(*Flag f) {
+    f.ready = 1;
+    @cond_signal(g_flag);
+}
+
+i32 main() {
+    g_flag.ready = 1;   // already set
+
+    // Condition already true — should return immediately (not null)
+    ?void result = @cond_timedwait(g_flag, g_flag.ready > 0, 100);
+    if (result) |v| {
+        // success — condition was already true
+    } else {
+        return 1;   // timed out — shouldn't happen
+    }
+
+    return 0;
+}

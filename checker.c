@@ -2681,6 +2681,20 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'free' on const Pool");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "pool.free() takes exactly 1 argument");
+                    /* BUG-471: type-check handle element against pool element */
+                    if (node->call.arg_count == 1) {
+                        Type *arg_t = check_expr(c, node->call.args[0]);
+                        if (arg_t) {
+                            Type *aeff = type_unwrap_distinct(arg_t);
+                            if (aeff->kind == TYPE_HANDLE &&
+                                !type_equals(type_unwrap_distinct(aeff->handle.elem),
+                                             type_unwrap_distinct(obj->pool.elem))) {
+                                checker_error(c, node->loc.line,
+                                    "pool.free() expects Handle(%s), got Handle(%s)",
+                                    type_name(obj->pool.elem), type_name(aeff->handle.elem));
+                            }
+                        }
+                    }
                     /* Track dynamic-index free for auto-guard:
                      * pool.free(handles[k]) where k is variable */
                     if (node->call.arg_count == 1) {
@@ -2829,6 +2843,20 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'free' on const Slab");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "slab.free() takes exactly 1 argument");
+                    /* BUG-471: type-check handle element against slab element */
+                    if (node->call.arg_count == 1) {
+                        Type *arg_t = check_expr(c, node->call.args[0]);
+                        if (arg_t) {
+                            Type *aeff = type_unwrap_distinct(arg_t);
+                            if (aeff->kind == TYPE_HANDLE &&
+                                !type_equals(type_unwrap_distinct(aeff->handle.elem),
+                                             type_unwrap_distinct(obj->slab.elem))) {
+                                checker_error(c, node->loc.line,
+                                    "slab.free() expects Handle(%s), got Handle(%s)",
+                                    type_name(obj->slab.elem), type_name(aeff->handle.elem));
+                            }
+                        }
+                    }
                     /* Track dynamic-index free (same as pool.free above) */
                     if (node->call.arg_count == 1) {
                         Node *arg = node->call.args[0];

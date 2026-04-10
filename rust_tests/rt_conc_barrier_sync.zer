@@ -3,7 +3,7 @@
 
 shared struct Counter { u32 val; }
 Counter g;
-u32 barrier;
+Barrier barrier;
 
 void worker(*Counter c) {
     c.val += 1;

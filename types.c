@@ -26,6 +26,7 @@ Type *ty_f32;
 Type *ty_f64;
 Type *ty_opaque;
 Type *ty_arena;
+Type *ty_barrier;
 
 static Type *make_primitive(Arena *a, TypeKind kind) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
@@ -48,7 +49,8 @@ void types_init(Arena *a) {
     ty_f32    = make_primitive(a, TYPE_F32);
     ty_f64    = make_primitive(a, TYPE_F64);
     ty_opaque = make_primitive(a, TYPE_OPAQUE);
-    ty_arena  = make_primitive(a, TYPE_ARENA);
+    ty_arena   = make_primitive(a, TYPE_ARENA);
+    ty_barrier = make_primitive(a, TYPE_BARRIER);
 }
 
 /* ================================================================
@@ -414,7 +416,8 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_F32:    return pos + snprintf(buf + pos, max - pos, "f32");
     case TYPE_F64:    return pos + snprintf(buf + pos, max - pos, "f64");
     case TYPE_OPAQUE: return pos + snprintf(buf + pos, max - pos, "opaque");
-    case TYPE_ARENA:  return pos + snprintf(buf + pos, max - pos, "Arena");
+    case TYPE_ARENA:   return pos + snprintf(buf + pos, max - pos, "Arena");
+    case TYPE_BARRIER: return pos + snprintf(buf + pos, max - pos, "Barrier");
     case TYPE_POINTER:
         pos += snprintf(buf + pos, max - pos, "*");
         return type_name_write(t->pointer.inner, buf, pos, max);

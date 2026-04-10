@@ -1,0 +1,36 @@
+// Rust: Mutex<Struct> — lock protects all fields atomically.
+// ZER: shared struct with multiple fields — all accessed under same lock.
+
+shared struct Stats { u32 total; u32 errors; u32 successes; }
+Stats g_stats;
+
+void record_success(*Stats s) {
+    s.successes += 1;
+    s.total += 1;
+}
+
+void record_error(*Stats s) {
+    s.errors += 1;
+    s.total += 1;
+}
+
+i32 main() {
+    g_stats.total = 0;
+    g_stats.errors = 0;
+    g_stats.successes = 0;
+
+    ThreadHandle t1 = spawn record_success(&g_stats);
+    ThreadHandle t2 = spawn record_success(&g_stats);
+    ThreadHandle t3 = spawn record_error(&g_stats);
+    ThreadHandle t4 = spawn record_success(&g_stats);
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    if (g_stats.total != 4) { return 1; }
+    if (g_stats.successes != 3) { return 2; }
+    if (g_stats.errors != 1) { return 3; }
+    return 0;
+}

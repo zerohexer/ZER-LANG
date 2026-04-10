@@ -1,0 +1,24 @@
+// Rust: Arc<Mutex<u32>> incremented in loop across threads.
+// ZER: shared struct, each thread loops 1000 times. Tests lock contention.
+
+shared struct Acc { u32 val; }
+Acc g_acc;
+
+void loop_inc(*Acc a) {
+    for (u32 i = 0; i < 1000; i += 1) {
+        a.val += 1;
+    }
+}
+
+i32 main() {
+    g_acc.val = 0;
+
+    ThreadHandle t1 = spawn loop_inc(&g_acc);
+    ThreadHandle t2 = spawn loop_inc(&g_acc);
+
+    t1.join();
+    t2.join();
+
+    if (g_acc.val != 2000) { return 1; }
+    return 0;
+}

@@ -1,0 +1,31 @@
+// Rust: move closure captures values — copied to thread.
+// ZER: spawn with value args — copied, no sharing. Safe by construction.
+
+shared struct Out { u32 r1; u32 r2; }
+Out g_out;
+
+void compute_a(u32 x, u32 y, *Out out) {
+    out.r1 = x + y;
+}
+
+void compute_b(u32 x, u32 y, *Out out) {
+    out.r2 = x * y;
+}
+
+i32 main() {
+    g_out.r1 = 0;
+    g_out.r2 = 0;
+
+    u32 a = 10;
+    u32 b = 20;
+
+    ThreadHandle t1 = spawn compute_a(a, b, &g_out);
+    ThreadHandle t2 = spawn compute_b(a, b, &g_out);
+
+    t1.join();
+    t2.join();
+
+    if (g_out.r1 != 30) { return 1; }
+    if (g_out.r2 != 200) { return 2; }
+    return 0;
+}

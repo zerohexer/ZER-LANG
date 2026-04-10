@@ -1,0 +1,27 @@
+// Rust: AtomicU32::fetch_or/fetch_and — atomic bitwise ops.
+// ZER: @atomic_or/@atomic_and — returns old value.
+
+u32 flags;
+
+void set_bit(u32 bit) {
+    @atomic_or(&flags, 1 << bit);
+}
+
+void clear_bit(u32 bit) {
+    @atomic_and(&flags, ~(1 << bit));
+}
+
+i32 main() {
+    flags = 0;
+
+    set_bit(0);   // flags = 1
+    set_bit(2);   // flags = 5
+    set_bit(4);   // flags = 21
+
+    if (@atomic_load(&flags) != 21) { return 1; }
+
+    clear_bit(2); // flags = 17
+
+    if (@atomic_load(&flags) != 17) { return 2; }
+    return 0;
+}

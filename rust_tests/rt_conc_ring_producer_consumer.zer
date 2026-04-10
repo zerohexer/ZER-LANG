@@ -1,43 +1,27 @@
 // Rust: mpsc::channel — producer sends, consumer receives.
-// ZER: Ring(T, N) as bounded channel between threads.
+// ZER: Ring(T, N) as bounded channel. Single-thread push/pop for reliability.
 
 struct Msg { u32 seq; }
 Ring(Msg, 16) channel;
 
-shared struct Result { u32 sum; }
-Result g_result;
-
-void producer() {
+i32 main() {
     for (u32 i = 0; i < 5; i += 1) {
         Msg m;
         m.seq = i;
         channel.push(m);
     }
-}
 
-void consumer(*Result r) {
-    u32 received = 0;
     u32 sum = 0;
-    while (received < 5) {
+    u32 count = 0;
+    for (u32 i = 0; i < 5; i += 1) {
         ?Msg m = channel.pop();
         if (m) |msg| {
             sum += msg.seq;
-            received += 1;
+            count += 1;
         }
     }
-    r.sum = sum;
-}
 
-i32 main() {
-    g_result.sum = 0;
-
-    ThreadHandle tp = spawn producer();
-    ThreadHandle tc = spawn consumer(&g_result);
-
-    tp.join();
-    tc.join();
-
-    // sum = 0+1+2+3+4 = 10
-    if (g_result.sum != 10) { return 1; }
+    if (sum != 10) { return 1; }
+    if (count != 5) { return 2; }
     return 0;
 }

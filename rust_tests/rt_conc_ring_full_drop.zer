@@ -1,0 +1,38 @@
+// Rust: bounded channel — send blocks when full.
+// ZER: Ring push on full overwrites oldest. push_checked returns ?void.
+
+struct Evt { u32 id; }
+Ring(Evt, 4) ring;
+
+i32 main() {
+    // Fill ring to capacity
+    for (u32 i = 0; i < 4; i += 1) {
+        Evt e;
+        e.id = i;
+        ring.push(e);
+    }
+
+    // push_checked on full ring — returns null (?void with has_value=0)
+    Evt overflow;
+    overflow.id = 99;
+    ?void result = ring.push_checked(overflow);
+    if (result) |v| {
+        return 1;   // should have failed — ring is full
+    }
+
+    // Pop all and verify FIFO
+    ?Evt m0 = ring.pop();
+    if (m0) |e| {
+        if (e.id != 0) { return 2; }
+    } else { return 3; }
+
+    // Now push_checked succeeds (one slot free)
+    ?void result2 = ring.push_checked(overflow);
+    if (result2) |v| {
+        // success
+    } else {
+        return 4;   // should have succeeded
+    }
+
+    return 0;
+}

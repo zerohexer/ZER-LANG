@@ -1,0 +1,34 @@
+// Rust: async task with shared state.
+// ZER: async coroutine yields, resumes, modifies state at each step.
+
+u32 g_step;
+u32 g_result;
+
+async void process() {
+    g_step = 1;
+    yield;
+    g_step = 2;
+    g_result = 42;
+    yield;
+    g_step = 3;
+}
+
+i32 main() {
+    g_step = 0;
+    g_result = 0;
+
+    _zer_async_process task;
+    _zer_async_process_init(&task);
+
+    _zer_async_process_poll(&task);
+    if (g_step != 1) { return 1; }
+
+    _zer_async_process_poll(&task);
+    if (g_step != 2) { return 2; }
+    if (g_result != 42) { return 3; }
+
+    _zer_async_process_poll(&task);
+    if (g_step != 3) { return 4; }
+
+    return 0;
+}

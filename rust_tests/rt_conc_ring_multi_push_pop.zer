@@ -1,0 +1,32 @@
+// Rust: channel — push multiple, pop in order (FIFO).
+// ZER: Ring push/pop maintains FIFO ordering.
+
+struct Event { u32 kind; u32 data; }
+Ring(Event, 8) events;
+
+i32 main() {
+    // Push 4 events
+    for (u32 i = 0; i < 4; i += 1) {
+        Event e;
+        e.kind = i;
+        e.data = i * 100;
+        events.push(e);
+    }
+
+    // Pop and verify FIFO order
+    for (u32 i = 0; i < 4; i += 1) {
+        ?Event me = events.pop();
+        if (me) |e| {
+            if (e.kind != i) { return (i32)(i * 10 + 1); }
+            if (e.data != i * 100) { return (i32)(i * 10 + 2); }
+        } else {
+            return (i32)(i * 10 + 3);
+        }
+    }
+
+    // Pop from empty — should return null
+    ?Event empty = events.pop();
+    if (empty) |e| { return 50; }
+
+    return 0;
+}

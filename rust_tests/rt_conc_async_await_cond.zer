@@ -1,0 +1,31 @@
+// Rust: async/await — yield until condition.
+// ZER: await expr — yields until expr is true.
+
+u32 g_ready;
+u32 g_result;
+
+async void waiter() {
+    await g_ready > 0;
+    g_result = 99;
+}
+
+i32 main() {
+    g_ready = 0;
+    g_result = 0;
+
+    _zer_async_waiter task;
+    _zer_async_waiter_init(&task);
+
+    // Poll — condition false, should yield
+    _zer_async_waiter_poll(&task);
+    if (g_result != 0) { return 1; }
+
+    // Set condition
+    g_ready = 1;
+
+    // Poll — condition true, should complete
+    _zer_async_waiter_poll(&task);
+    if (g_result != 99) { return 2; }
+
+    return 0;
+}

@@ -1,0 +1,19 @@
+// Rust: Mutex guarded conditional logic.
+// ZER: shared struct — read and write in separate statements.
+
+shared struct Gauge { u32 val; }
+Gauge g_gauge;
+
+i32 main() {
+    g_gauge.val = 0;
+
+    for (u32 i = 0; i < 10; i += 1) {
+        u32 v = g_gauge.val;
+        if (v < 5) {
+            g_gauge.val = v + 1;
+        }
+    }
+
+    if (g_gauge.val != 5) { return 1; }
+    return 0;
+}

@@ -1,0 +1,34 @@
+// Rust: thread_local! counter — each thread counts independently.
+// ZER: threadlocal u32 — each thread has own copy.
+
+threadlocal u32 tls_count;
+
+shared struct Total { u32 val; }
+Total g_total;
+
+void count_things(*Total t) {
+    tls_count = 0;
+    for (u32 i = 0; i < 10; i += 1) {
+        tls_count += 1;
+    }
+    t.val += tls_count;
+}
+
+i32 main() {
+    tls_count = 0;
+    g_total.val = 0;
+
+    ThreadHandle t1 = spawn count_things(&g_total);
+    ThreadHandle t2 = spawn count_things(&g_total);
+    ThreadHandle t3 = spawn count_things(&g_total);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // Each thread counted to 10, added to total
+    if (g_total.val != 30) { return 1; }
+    // Main thread's tls_count unaffected
+    if (tls_count != 0) { return 2; }
+    return 0;
+}

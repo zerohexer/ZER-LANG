@@ -1,0 +1,26 @@
+// Rust: Once::call_once — lazy init guarded by Once.
+// ZER: @once inside function — init runs exactly once across all calls.
+
+u32 g_initialized;
+u32 g_config_val;
+
+void lazy_init() {
+    @once {
+        g_initialized = 1;
+        g_config_val = 42;
+    }
+}
+
+i32 main() {
+    g_initialized = 0;
+    g_config_val = 0;
+
+    // Call 3 times — @once body runs only first time
+    lazy_init();
+    lazy_init();
+    lazy_init();
+
+    if (g_initialized != 1) { return 1; }
+    if (g_config_val != 42) { return 2; }
+    return 0;
+}

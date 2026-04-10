@@ -78,7 +78,8 @@ typedef struct {
 
 /* ---- API ---- */
 void emitter_init(Emitter *e, FILE *out, Arena *arena, Checker *checker);
-void emit_file(Emitter *e, Node *file_node);
-void emit_file_no_preamble(Emitter *e, Node *file_node); /* for imported modules */
+void emit_file_module(Emitter *e, Node *file_node, bool with_preamble); /* unified */
+void emit_file(Emitter *e, Node *file_node);              /* backward compat: with preamble */
+void emit_file_no_preamble(Emitter *e, Node *file_node);  /* backward compat: without preamble */
 
 #endif /* ZER_EMITTER_H */

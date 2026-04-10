@@ -1,0 +1,18 @@
+// Rust consts: integer overflow in debug = panic.
+// ZER: overflow always wraps (defined behavior, never UB). Test at runtime.
+
+i32 main() {
+    u8 a = 255;
+    u8 b = a + 1;    // wraps to 0
+    if (b != 0) { return 1; }
+
+    u32 c = 0;
+    u32 d = c - 1;   // wraps to 4294967295
+    if (d != 4294967295) { return 2; }
+
+    i8 e = 127;
+    i8 f = e + 1;    // wraps to -128
+    if (f != (i8)-128) { return 3; }
+
+    return 0;
+}

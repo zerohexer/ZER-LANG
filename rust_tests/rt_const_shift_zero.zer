@@ -1,0 +1,18 @@
+// Rust consts: shift by >= width = UB in C, panic in Rust.
+// ZER: shift by >= width = 0 (defined behavior, safe macro).
+
+i32 main() {
+    u32 a = 1;
+    u32 b = a << 32;   // shift by width → 0 in ZER
+    if (b != 0) { return 1; }
+
+    u32 c = 100;
+    u32 d = c >> 33;   // shift by > width → 0 in ZER
+    if (d != 0) { return 2; }
+
+    u8 e = 1;
+    u8 f = e << 8;     // shift by width → 0
+    if (f != 0) { return 3; }
+
+    return 0;
+}

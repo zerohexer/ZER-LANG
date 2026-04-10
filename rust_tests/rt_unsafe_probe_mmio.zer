@@ -1,0 +1,14 @@
+// Rust unsafe: dereferencing arbitrary MMIO address may fault.
+// ZER: @probe safely reads MMIO — returns ?u32, null if address faults.
+// Tests the safe MMIO read pattern (no crash on bad address).
+
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+i32 main() {
+    // @probe returns ?u32 — null if fault, value if readable
+    ?u32 val = @probe(0x00000000);
+    // We don't know if address 0 is readable on this platform
+    // but @probe won't crash — it catches the fault
+    // Just verify it returns something (the test proves it doesn't crash)
+    return 0;
+}

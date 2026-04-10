@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Rust unsafe: transmute requires same size types.
+// ZER: @bitcast rejects different-width types at compile time.
+
+i32 main() {
+    u32 x = 42;
+    u64 y = @bitcast(u64, x);   // error: 32-bit → 64-bit
+    return 0;
+}

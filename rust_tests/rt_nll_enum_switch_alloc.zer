@@ -1,0 +1,37 @@
+// Rust NLL: match on enum, each arm has independent resource lifecycle.
+// ZER: enum switch with alloc+defer per arm — each arm isolated.
+
+struct Payload { u32 size; u32 checksum; }
+Pool(Payload, 4) pool;
+
+enum PacketKind { data, control, heartbeat }
+
+u32 handle_packet(PacketKind kind) {
+    switch (kind) {
+        .data => {
+            ?Handle(Payload) mh = pool.alloc();
+            Handle(Payload) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).size = 100;
+            pool.get(h).checksum = 0xFF;
+            return h.size;
+        }
+        .control => {
+            ?Handle(Payload) mh = pool.alloc();
+            Handle(Payload) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).size = 10;
+            return h.size;
+        }
+        .heartbeat => {
+            return 1;
+        }
+    }
+}
+
+i32 main() {
+    if (handle_packet(PacketKind.data) != 100) { return 1; }
+    if (handle_packet(PacketKind.control) != 10) { return 2; }
+    if (handle_packet(PacketKind.heartbeat) != 1) { return 3; }
+    return 0;
+}

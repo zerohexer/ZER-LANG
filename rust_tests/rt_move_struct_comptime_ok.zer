@@ -1,0 +1,20 @@
+// Move struct + comptime interaction: comptime function returns value
+// used as move struct field. Tests feature interaction.
+
+move struct Config { u32 baud; u32 parity; }
+
+comptime u32 DEFAULT_BAUD() { return 9600; }
+comptime u32 PARITY_NONE() { return 0; }
+
+void apply_config(Config c) {
+    u32 b = c.baud;
+}
+
+i32 main() {
+    Config cfg;
+    cfg.baud = DEFAULT_BAUD();
+    cfg.parity = PARITY_NONE();
+    if (cfg.baud != 9600) { return 1; }
+    apply_config(cfg);
+    return 0;
+}

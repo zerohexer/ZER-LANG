@@ -1,0 +1,28 @@
+// Rust drop: goto fires pending defers (same as return/break/continue).
+// ZER: goto label; fires all defers between declaration and goto.
+
+struct Conn { u32 fd; }
+Pool(Conn, 4) pool;
+
+u32 connect_or_fail(u32 should_fail) {
+    ?Handle(Conn) mh = pool.alloc();
+    Handle(Conn) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).fd = 42;
+
+    if (should_fail > 0) {
+        goto cleanup;
+    }
+    return h.fd;
+
+cleanup:
+    return 0;
+}
+
+i32 main() {
+    u32 r1 = connect_or_fail(0);
+    u32 r2 = connect_or_fail(1);
+    if (r1 != 42) { return 1; }
+    if (r2 != 0) { return 2; }
+    return 0;
+}

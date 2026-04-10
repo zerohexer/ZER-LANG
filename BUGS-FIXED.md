@@ -7,11 +7,17 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-09/10 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 661 Tests
 
-### BUG-472: spawn wrapper can't find local function with cross-module struct param (OPEN)
-- **Symptom:** `spawn worker(&g_counter)` where `worker` takes `*SharedCounter` from imported module → emits `/* spawn: wrapper not found */` → GCC error.
-- **Root cause:** Emitter spawn handler looks up function by name but can't resolve the cross-module struct type for the wrapper struct generation. The function IS local but its parameter type is from another module.
-- **Fix direction:** In emitter spawn wrapper generation, resolve parameter types through checker's type system (which already has the cross-module type registered). ~20-30 line fix in emitter.c spawn handler.
-- **Test:** `test_modules/shared_user.zer` (not in run_tests.sh — known failing).
+### BUG-473: shared struct auto-lock self-deadlock through cross-module function calls (OPEN)
+- **Symptom:** `worker` calls `counter_inc(c)` where c is `*SharedCounter`. `counter_inc` does `c.val += 1` (auto-lock). Non-recursive spinlock deadlocks.
+- **Root cause:** Each statement auto-locks/unlocks independently. Cross-function call to another function that also auto-locks the same shared struct = double lock = hang.
+- **Fix direction:** Use recursive mutex (PTHREAD_MUTEX_RECURSIVE) instead of spinlock for shared structs, ~5 line preamble change.
+- **Test:** `test_modules/shared_user.zer` (hangs at runtime).
+
+### BUG-472: spawn wrapper missing in multi-module builds (FIXED)
+- **Symptom:** `spawn worker(&g_counter)` in main module → `/* spawn: wrapper not found */`.
+- **Root cause:** `emit_file_no_preamble` didn't prescan for spawn. In topo order, main module is emitted last via `emit_file_no_preamble`, not `emit_file`.
+- **Fix (emitter.c):** Added prescan + wrapper emission to `emit_file_no_preamble`.
+- **Test:** `test_modules/shared_user.zer` (spawn emits correctly — blocked by BUG-473).
 
 ### BUG-471: pool.free()/slab.free() missing Handle element type check
 - **Symptom:** `pool_b.free(handle_from_pool_a)` compiled — Handle is u64, no type mismatch at C level.

@@ -78,9 +78,10 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# Multi-module: shared struct + spawn — KNOWN LIMITATION (BUG-472)
-# spawn wrapper can't find local func with cross-module struct param.
-# Original test preserved in test_modules/shared_user.zer (not run).
+# Multi-module: shared struct + spawn — BUG-472 fixed (spawn wrapper),
+# but BUG-473 OPEN: cross-module function call on shared struct causes
+# self-deadlock (non-recursive spinlock locked twice). Test preserved as-is.
+# run_test shared_user 0
 # Multi-module: move struct across modules
 run_test move_user 0
 # Multi-module: handle lifecycle across modules

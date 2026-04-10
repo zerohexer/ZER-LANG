@@ -1,6 +1,6 @@
 # ZER Safety Test Suite
 
-527 tests (361 positive, 166 negative), 0 failures. Updated 2026-04-09.
+611 tests (418 positive, 193 negative), 0 failures. Updated 2026-04-10.
 Runner: `run_tests.sh` — auto-detects negative tests via `reject` in name or `EXPECTED: compile error` in file.
 
 ## How to Use This File
@@ -109,19 +109,19 @@ custom allocators, TLS destructors, stderr macros, subprocess testing.
 Tests in `limitations/` are correct (should reject) but the compiler doesn't catch them yet.
 Each file documents the root cause and fix direction.
 
-Currently: **empty** (all prior limitations fixed, last: BUG-468 conditional move).
+Currently: **empty** (all limitations fixed: BUG-468 conditional move, BUG-469 nested move, BUG-470 return transfer, BUG-471 pool.free type check).
 
 ## File Counts by Category (for duplicate checking)
 
 ```
-164 gen_*          43 rc_*           29 rt_move_*
- 27 safety_*       22 rt_task_*      19 rt_opaque_*
- 14 rt_drop_*      13 conc_*         10 rt_handle_*
- 10 rt_const_*      9 rt_defer_*      8 rt_unsafe_*
-  7 rt_slab_*       7 rt_borrowck_*   7 rt_borrow_*
-  6 rt_pool_*       6 rt_issue_*      5 rt_uaf_*
-  5 rt_comptime_*   4 rt_shared_*     4 rt_scope_*
-  4 rt_arena_*      4 rt_spawn_*      3 rt_send_*
-  3 rt_maybe_*      3 rt_ghost_*      3 rt_double_*
-  3 rt_deadlock_*   3 rt_nll_*
+164 gen_*          50 rt_move_*      43 rc_*
+ 27 safety_*       26 rt_borrowck_*  24 rt_drop_*
+ 22 rt_task_*      19 rt_opaque_*    16 rt_nll_*
+ 15 rt_unsafe_*    11 rt_handle_*    10 rt_const_*
+ 10 rt_cfg_*        9 rt_defer_*      9 conc_reject_*
+  7 rt_slab_*       7 rt_borrow_*    6 rt_pool_*
+  6 rt_issue_*      5 rt_uaf_*       5 rt_comptime_*
+  4 rt_shared_*     4 rt_scope_*     4 rt_spawn_*
+  4 rt_arena_*      3 rt_send_*      3 rt_maybe_*
+  3 rt_ghost_*      3 rt_double_*    3 rt_deadlock_*
 ```

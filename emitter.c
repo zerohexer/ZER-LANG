@@ -477,14 +477,17 @@ static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
         }
         emit_expr(e, root);
         emit(e, "%s_zer_rwlock);\n", arrow);
-    } else if (shared_needs_condvar(e, rt)) {
+    } else {
+        /* BUG-473: all shared structs use recursive pthread_mutex (lazy init) */
+        emit(e, "_zer_mtx_ensure_init(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx, &", arrow);
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx_inited);\n", arrow);
+        emit_indent(e);
         emit(e, "pthread_mutex_lock(&");
         emit_expr(e, root);
         emit(e, "%s_zer_mtx);\n", arrow);
-    } else {
-        emit(e, "_zer_lock_acquire(&");
-        emit_expr(e, root);
-        emit(e, "%s_zer_lock);\n", arrow);
     }
 }
 
@@ -502,14 +505,11 @@ static void emit_shared_unlock(Emitter *e, Node *root) {
         emit(e, "pthread_rwlock_unlock(&");
         emit_expr(e, root);
         emit(e, "%s_zer_rwlock);\n", arrow);
-    } else if (shared_needs_condvar(e, rt)) {
+    } else {
+        /* BUG-473: all shared structs use recursive pthread_mutex */
         emit(e, "pthread_mutex_unlock(&");
         emit_expr(e, root);
         emit(e, "%s_zer_mtx);\n", arrow);
-    } else {
-        emit(e, "_zer_lock_release(&");
-        emit_expr(e, root);
-        emit(e, "%s_zer_lock);\n", arrow);
     }
 }
 
@@ -4074,11 +4074,12 @@ static void emit_struct_decl(Emitter *e, Node *node) {
             bool needs_condvar = false;
             if (st && st->kind == TYPE_STRUCT)
                 needs_condvar = is_condvar_type(e, st->struct_type.type_id);
+            /* BUG-473: all shared structs use recursive pthread_mutex_t.
+             * Lazy-init via _zer_mtx_inited flag (auto-zeroed). */
+            emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
+            emit_indent(e); emit(e, "uint8_t _zer_mtx_inited;\n");
             if (needs_condvar) {
-                emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
                 emit_indent(e); emit(e, "pthread_cond_t _zer_cond;\n");
-            } else {
-                emit_indent(e); emit(e, "uint32_t _zer_lock;\n");
             }
         }
     }
@@ -4822,6 +4823,7 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "/* Compile with: gcc -std=c99 -fwrapv -fno-strict-aliasing */\n");
     emit(e, "#ifndef _POSIX_C_SOURCE\n");
     emit(e, "#define _POSIX_C_SOURCE 200112L\n");
+    emit(e, "#define _XOPEN_SOURCE 500\n"); /* BUG-473: PTHREAD_MUTEX_RECURSIVE */
     emit(e, "#endif\n");
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
@@ -4941,13 +4943,20 @@ void emit_file(Emitter *e, Node *file_node) {
     emit(e, "#endif\n");
     emit(e, "}\n\n");
 
-    /* ZER shared struct lock primitives */
-    emit(e, "/* ZER shared struct auto-locking */\n");
-    emit(e, "static inline void _zer_lock_acquire(uint32_t *lock) {\n");
-    emit(e, "    while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE)) {}\n");
-    emit(e, "}\n");
-    emit(e, "static inline void _zer_lock_release(uint32_t *lock) {\n");
-    emit(e, "    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);\n");
+    /* ZER shared struct auto-locking — BUG-473: use recursive mutex.
+     * Recursive mutex handles re-entrant locking when function A calls
+     * function B that also auto-locks the same shared struct.
+     * Lazy init: first lock call initializes with PTHREAD_MUTEX_RECURSIVE. */
+    emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
+    emit(e, "static inline void _zer_mtx_ensure_init(pthread_mutex_t *mtx, uint8_t *inited) {\n");
+    emit(e, "    if (!__atomic_load_n(inited, __ATOMIC_ACQUIRE)) {\n");
+    emit(e, "        pthread_mutexattr_t attr;\n");
+    emit(e, "        pthread_mutexattr_init(&attr);\n");
+    emit(e, "        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);\n");
+    emit(e, "        pthread_mutex_init(mtx, &attr);\n");
+    emit(e, "        pthread_mutexattr_destroy(&attr);\n");
+    emit(e, "        __atomic_store_n(inited, 1, __ATOMIC_RELEASE);\n");
+    emit(e, "    }\n");
     emit(e, "}\n\n");
 
     /* ZER thread barrier — portable (mutex + condvar, like Rust) */

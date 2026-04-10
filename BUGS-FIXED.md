@@ -7,11 +7,11 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ## Session 2026-04-09/10 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 661 Tests
 
-### BUG-473: shared struct auto-lock self-deadlock through cross-module function calls (OPEN)
-- **Symptom:** `worker` calls `counter_inc(c)` where c is `*SharedCounter`. `counter_inc` does `c.val += 1` (auto-lock). Non-recursive spinlock deadlocks.
-- **Root cause:** Each statement auto-locks/unlocks independently. Cross-function call to another function that also auto-locks the same shared struct = double lock = hang.
-- **Fix direction:** Use recursive mutex (PTHREAD_MUTEX_RECURSIVE) instead of spinlock for shared structs, ~5 line preamble change.
-- **Test:** `test_modules/shared_user.zer` (hangs at runtime).
+### BUG-473: shared struct auto-lock self-deadlock through cross-module function calls (FIXED)
+- **Symptom:** `worker` calls `counter_inc(c)` where c is `*SharedCounter`. `counter_inc` does `c.val += 1` (auto-lock). Non-recursive spinlock deadlocks on re-entrant lock.
+- **Root cause:** Spinlock (`__atomic_exchange_n`) is non-recursive. Cross-function auto-lock = same thread locks twice = hang.
+- **Fix (emitter.c):** Replaced spinlock with `pthread_mutex_t` (recursive, lazy-init via `_zer_mtx_ensure_init`). All shared structs now use recursive mutex. Added `_XOPEN_SOURCE 500` for `PTHREAD_MUTEX_RECURSIVE`. `_zer_mtx_inited` field added to shared structs for lazy init.
+- **Test:** `test_modules/shared_user.zer` (now passes — 2 threads × 10 increments = 20).
 
 ### BUG-472: spawn wrapper missing in multi-module builds (FIXED)
 - **Symptom:** `spawn worker(&g_counter)` in main module → `/* spawn: wrapper not found */`.

@@ -44,6 +44,7 @@ typedef enum {
     TYPE_POOL,          /* Pool(T, N) — elem type + count */
     TYPE_RING,          /* Ring(T, N) — elem type + count */
     TYPE_ARENA,         /* Arena — no parameters */
+    TYPE_BARRIER,       /* Barrier — thread sync point, no parameters */
     TYPE_HANDLE,        /* Handle(T) — elem type */
     TYPE_SLAB,          /* Slab(T) — dynamic growable pool, elem type */
 
@@ -258,6 +259,7 @@ extern Type *ty_f32;
 extern Type *ty_f64;
 extern Type *ty_opaque;
 extern Type *ty_arena;
+extern Type *ty_barrier;
 
 /* ================================================================
  * Type API

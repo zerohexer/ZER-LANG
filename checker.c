@@ -913,7 +913,8 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
     case TYNODE_BOOL:   return ty_bool;
     case TYNODE_VOID:   return ty_void;
     case TYNODE_OPAQUE: return ty_opaque;
-    case TYNODE_ARENA:  return ty_arena;
+    case TYNODE_ARENA:   return ty_arena;
+    case TYNODE_BARRIER: return ty_barrier;
 
     case TYNODE_POINTER: {
         Type *inner = resolve_type(c, tn->pointer.inner);
@@ -4943,7 +4944,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "@barrier_init requires 2 arguments: @barrier_init(barrier_var, thread_count)");
                 if (node->intrinsic.arg_count >= 2) {
-                    check_expr(c, node->intrinsic.args[0]);
+                    Type *bt = check_expr(c, node->intrinsic.args[0]);
+                    /* Validate first arg is Barrier type */
+                    if (bt && type_unwrap_distinct(bt)->kind != TYPE_BARRIER)
+                        checker_error(c, node->loc.line,
+                            "@barrier_init first argument must be Barrier type, got '%s'",
+                            type_name(bt));
                     Type *ct = check_expr(c, node->intrinsic.args[1]);
                     if (ct && !type_is_integer(type_unwrap_distinct(ct)))
                         checker_error(c, node->loc.line,
@@ -4953,8 +4959,13 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (node->intrinsic.arg_count != 1)
                     checker_error(c, node->loc.line,
                         "@barrier_wait requires 1 argument: @barrier_wait(barrier_var)");
-                if (node->intrinsic.arg_count >= 1)
-                    check_expr(c, node->intrinsic.args[0]);
+                if (node->intrinsic.arg_count >= 1) {
+                    Type *bt = check_expr(c, node->intrinsic.args[0]);
+                    if (bt && type_unwrap_distinct(bt)->kind != TYPE_BARRIER)
+                        checker_error(c, node->loc.line,
+                            "@barrier_wait argument must be Barrier type, got '%s'",
+                            type_name(bt));
+                }
             }
             result = ty_void;
         } else {

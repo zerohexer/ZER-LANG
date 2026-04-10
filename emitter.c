@@ -740,6 +740,10 @@ static void emit_type(Emitter *e, Type *t) {
         emit(e, "_zer_arena");
         break;
 
+    case TYPE_BARRIER:
+        emit(e, "_zer_barrier");
+        break;
+
     case TYPE_SLAB:
         emit(e, "_zer_slab");
         break;
@@ -3132,7 +3136,8 @@ static void emit_stmt(Emitter *e, Node *node) {
             Type *eff_local = type_unwrap_distinct(type);
             if (eff_local && (eff_local->kind == TYPE_STRUCT || eff_local->kind == TYPE_ARRAY ||
                          eff_local->kind == TYPE_OPTIONAL || eff_local->kind == TYPE_UNION ||
-                         eff_local->kind == TYPE_ARENA || eff_local->kind == TYPE_SLICE)) {
+                         eff_local->kind == TYPE_ARENA || eff_local->kind == TYPE_BARRIER ||
+                         eff_local->kind == TYPE_SLICE)) {
                 /* BUG-411: empty struct {0} warns — use {} for zero-field structs */
                 if (eff_local->kind == TYPE_STRUCT && eff_local->struct_type.field_count == 0)
                     emit(e, " = {}");
@@ -4386,7 +4391,7 @@ static void emit_global_var(Emitter *e, Node *node) {
         Type *eff_type = type_unwrap_distinct(type);
         if (eff_type && (eff_type->kind == TYPE_STRUCT || eff_type->kind == TYPE_ARRAY ||
                      eff_type->kind == TYPE_OPTIONAL || eff_type->kind == TYPE_UNION ||
-                     eff_type->kind == TYPE_SLICE)) {
+                     eff_type->kind == TYPE_BARRIER || eff_type->kind == TYPE_SLICE)) {
             /* BUG-411: empty struct {0} warns — use {} for zero-field structs */
             if (eff_type->kind == TYPE_STRUCT && eff_type->struct_type.field_count == 0)
                 emit(e, " = {}");

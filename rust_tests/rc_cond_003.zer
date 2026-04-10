@@ -2,14 +2,14 @@
 // ZER: @cond_wait with counter increment condition
 // Equivalent to: Rust Condvar::wait_while pattern
 
-shared struct Barrier {
+shared struct CondBarrier {
     u32 count;
     u32 target;
 }
 
-Barrier gbar;
+CondBarrier gbar;
 
-void increment_and_signal(*Barrier b) {
+void increment_and_signal(*CondBarrier b) {
     b.count += 1;
     @cond_signal(b);
 }

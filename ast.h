@@ -62,6 +62,7 @@ typedef enum {
     TYNODE_POOL,            /* Pool(T, N) */
     TYNODE_RING,            /* Ring(T, N) */
     TYNODE_ARENA,           /* Arena */
+    TYNODE_BARRIER,         /* Barrier — thread sync point */
     TYNODE_HANDLE,          /* Handle(T) */
     TYNODE_SLAB,            /* Slab(T) — dynamic growable pool */
 

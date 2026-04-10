@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Rust: deadlock from lock ordering — runtime hang, no detection.
+// ZER: same-statement access to 2 shared types → compile error.
+
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A ga;
+B gb;
+
+i32 main() {
+    ga.x = 1;
+    gb.y = 2;
+    // Same statement accesses both A and B — potential deadlock
+    u32 sum = ga.x + gb.y;   // error: two shared types in one statement
+    return 0;
+}

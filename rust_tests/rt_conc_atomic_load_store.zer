@@ -1,0 +1,30 @@
+// Rust: AtomicU32::load/store — atomic read/write for thread signaling.
+// ZER: @atomic_load/@atomic_store — sequential consistency.
+
+u32 flag;
+u32 data;
+
+void writer() {
+    data = 42;
+    @atomic_store(&flag, 1);   // release — data visible to reader
+}
+
+void reader(*u32 out) {
+    while (@atomic_load(&flag) == 0) { }   // spin until flag set
+    out[0] = data;   // data guaranteed visible after flag
+}
+
+i32 main() {
+    flag = 0;
+    data = 0;
+    u32 result = 0;
+
+    ThreadHandle tw = spawn writer();
+    ThreadHandle tr = spawn reader(&result);
+
+    tw.join();
+    tr.join();
+
+    if (result != 42) { return 1; }
+    return 0;
+}

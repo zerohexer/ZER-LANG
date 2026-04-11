@@ -1,0 +1,33 @@
+// Translated from: rust/tests/ui/threads-sendsync/sync-send-atomics.rs
+// Rust: AtomicBool CAS pattern
+// ZER: @atomic_cas for lock-free flag
+
+u32 lock;
+
+void acquire() {
+    while (!@atomic_cas(&lock, 0, 1)) { }
+}
+
+void release() {
+    @atomic_store(&lock, 0);
+}
+
+shared struct Data { u32 value; }
+Data g_data;
+
+void critical_section(*Data d) {
+    acquire();
+    d.value += 1;
+    release();
+}
+
+i32 main() {
+    lock = 0;
+    g_data.value = 0;
+    ThreadHandle t1 = spawn critical_section(&g_data);
+    ThreadHandle t2 = spawn critical_section(&g_data);
+    t1.join();
+    t2.join();
+    if (g_data.value != 2) { return 1; }
+    return 0;
+}

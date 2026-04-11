@@ -1,0 +1,15 @@
+// Translated from: rust/tests/ui/threads-sendsync/threads.rs
+// Rust: spawns threads with copied value args sequentially
+// ZER: spawn with value args — values copied, no sharing
+
+void child(u32 x) {
+    u32 result = x * 2;
+}
+
+i32 main() {
+    for (u32 i = 0; i < 5; i += 1) {
+        ThreadHandle th = spawn child(i);
+        th.join();
+    }
+    return 0;
+}

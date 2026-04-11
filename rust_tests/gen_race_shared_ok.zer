@@ -1,0 +1,14 @@
+// Safe: shared struct global accessed from spawn — auto-locked
+shared struct Counter { u32 value; }
+Counter g;
+
+void worker(u32 inc) {
+    g.value += inc;
+}
+
+i32 main() {
+    g.value = 0;
+    spawn worker(1);
+    spawn worker(2);
+    return 0;
+}

@@ -1,0 +1,19 @@
+// Translated from: rust/tests/ui/threads-sendsync/child-outlives-parent.rs
+// Rust: scoped threads allow &T across thread boundary
+// ZER: ThreadHandle (scoped spawn) allows *T — must join before scope exit
+
+struct Work { u32 input; u32 output; }
+
+void compute(*Work w) {
+    w.output = w.input * w.input;
+}
+
+i32 main() {
+    Work w;
+    w.input = 7;
+    w.output = 0;
+    ThreadHandle th = spawn compute(&w);
+    th.join();
+    if (w.output != 49) { return 1; }
+    return 0;
+}

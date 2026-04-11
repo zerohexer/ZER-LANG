@@ -1,0 +1,20 @@
+// Translated from: rust/tests/ui/threads-sendsync/issue-9396.rs
+// Rust: channel try_recv busy-wait loop
+// ZER: condvar signal wakeup
+
+shared struct Signal { u32 ready; }
+Signal g_sig;
+
+void sender() {
+    g_sig.ready = 1;
+    @cond_signal(g_sig);
+}
+
+i32 main() {
+    g_sig.ready = 0;
+    ThreadHandle th = spawn sender();
+    @cond_wait(g_sig, g_sig.ready == 1);
+    th.join();
+    if (g_sig.ready != 1) { return 1; }
+    return 0;
+}

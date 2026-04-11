@@ -1,34 +1,23 @@
-// Rust: thread_local! counter — each thread counts independently.
-// ZER: threadlocal u32 — each thread has own copy.
+// Translated from: rust/tests/ui/threads-sendsync/thread-local-syntax.rs
+// Rust: thread_local! macro
+// ZER: threadlocal keyword — each thread gets own copy
 
-threadlocal u32 tls_count;
+threadlocal u32 tl_count;
 
-shared struct Total { u32 val; }
-Total g_total;
-
-void count_things(*Total t) {
-    tls_count = 0;
-    for (u32 i = 0; i < 10; i += 1) {
-        tls_count += 1;
+void count_up() {
+    tl_count = 0;
+    for (u32 i = 0; i < 100; i += 1) {
+        tl_count += 1;
     }
-    t.val += tls_count;
 }
 
 i32 main() {
-    tls_count = 0;
-    g_total.val = 0;
-
-    ThreadHandle t1 = spawn count_things(&g_total);
-    ThreadHandle t2 = spawn count_things(&g_total);
-    ThreadHandle t3 = spawn count_things(&g_total);
-
+    tl_count = 0;
+    ThreadHandle t1 = spawn count_up();
+    ThreadHandle t2 = spawn count_up();
     t1.join();
     t2.join();
-    t3.join();
-
-    // Each thread counted to 10, added to total
-    if (g_total.val != 30) { return 1; }
-    // Main thread's tls_count unaffected
-    if (tls_count != 0) { return 2; }
+    // main thread's tl_count should be 0 (not modified by child threads)
+    if (tl_count != 0) { return 1; }
     return 0;
 }

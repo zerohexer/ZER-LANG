@@ -1,0 +1,18 @@
+// Data race: spawned function calls helper that writes non-shared global
+// EXPECTED: compile error
+
+u32 total;
+
+void add_to_total(u32 val) {
+    total += val;
+}
+
+void worker(u32 v) {
+    add_to_total(v);
+}
+
+i32 main() {
+    total = 0;
+    spawn worker(42);
+    return 0;
+}

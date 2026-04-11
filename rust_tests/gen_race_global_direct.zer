@@ -1,0 +1,14 @@
+// Data race: spawned function writes non-shared global directly
+// EXPECTED: compile error
+
+u32 counter;
+
+void worker() {
+    counter += 1;
+}
+
+i32 main() {
+    counter = 0;
+    spawn worker();
+    return 0;
+}

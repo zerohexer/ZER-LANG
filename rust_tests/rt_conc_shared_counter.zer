@@ -1,0 +1,22 @@
+// Translated from: rust/tests/ui/threads-sendsync/send-is-not-static-par-for.rs
+// Rust: Mutex<i32> shared between threads
+// ZER: shared struct auto-locked counter
+
+shared struct Counter { u32 value; }
+Counter g_counter;
+
+void increment(*Counter c) {
+    c.value += 1;
+}
+
+i32 main() {
+    g_counter.value = 0;
+    ThreadHandle t1 = spawn increment(&g_counter);
+    ThreadHandle t2 = spawn increment(&g_counter);
+    ThreadHandle t3 = spawn increment(&g_counter);
+    t1.join();
+    t2.join();
+    t3.join();
+    if (g_counter.value != 3) { return 1; }
+    return 0;
+}

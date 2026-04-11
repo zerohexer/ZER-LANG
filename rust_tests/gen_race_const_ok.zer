@@ -1,0 +1,11 @@
+// Safe: const global — read-only, no race possible
+const u32 MAX_SIZE = 100;
+
+void worker(u32 v) {
+    u32 x = MAX_SIZE + v;
+}
+
+i32 main() {
+    spawn worker(1);
+    return 0;
+}

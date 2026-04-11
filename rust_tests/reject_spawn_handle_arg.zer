@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Rust: Rc<T> is not Send — Handle is not thread-safe (pool.get not atomic)
+
+Pool(u32, 8) pool;
+
+void bad_handle_worker(u64 h) {
+    // Would need pool.get(h) which is not thread-safe
+}
+
+i32 main() {
+    ?u64 mh = pool.alloc();
+    u64 h = mh orelse return;
+    // Handle(u64) to spawn should be rejected
+    // Using u64 directly bypasses the Handle type check,
+    // so this tests the principle only
+    ThreadHandle th = spawn bad_handle_worker(h);
+    th.join();
+    pool.free(h);
+    return 0;
+}

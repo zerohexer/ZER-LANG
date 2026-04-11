@@ -1,0 +1,12 @@
+// Safe: atomic intrinsics on global — thread-safe by definition
+u32 atomic_flag;
+
+void worker(u32 v) {
+    @atomic_store(&atomic_flag, v);
+}
+
+u32 main() {
+    atomic_flag = 0;
+    spawn worker(1);
+    return 0;
+}

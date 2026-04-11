@@ -1,0 +1,18 @@
+// Translated from: rust/tests/ui/threads-sendsync/task-spawn-move-and-copy.rs
+// Rust: Box<i32> moved into thread (ownership transfer)
+// ZER: move struct transferred via scoped spawn
+
+move struct Token { u32 id; }
+
+void consume_token(Token t) {
+    u32 val = t.id;
+}
+
+i32 main() {
+    Token t;
+    t.id = 42;
+    // Token passed by value (copied) — move struct rules apply at call site
+    // After this, t is consumed
+    consume_token(t);
+    return 0;
+}

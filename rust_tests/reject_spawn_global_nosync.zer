@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Rust equivalent: Rc is not Send — non-shared data to thread = error
+// ZER: non-shared global accessed from spawn target without any sync
+
+u32 unsafe_counter;
+
+void bad_worker() {
+    unsafe_counter += 1;
+}
+
+i32 main() {
+    unsafe_counter = 0;
+    spawn bad_worker();
+    return 0;
+}

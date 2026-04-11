@@ -1,0 +1,12 @@
+// Safe: threadlocal global — each thread has its own copy
+threadlocal u32 tl_counter;
+
+void worker(u32 v) {
+    tl_counter += v;
+}
+
+i32 main() {
+    tl_counter = 0;
+    spawn worker(42);
+    return 0;
+}

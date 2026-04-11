@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// Transitive data race: spawn target calls helper accessing non-shared global
+
+u32 shared_state;
+
+void modify_state() {
+    shared_state = 42;
+}
+
+void worker_calls_helper() {
+    modify_state();
+}
+
+i32 main() {
+    shared_state = 0;
+    spawn worker_calls_helper();
+    return 0;
+}

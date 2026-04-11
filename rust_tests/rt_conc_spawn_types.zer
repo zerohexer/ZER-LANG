@@ -1,0 +1,25 @@
+// Translated from: rust/tests/ui/threads-sendsync/spawn-types.rs
+// Rust: spawn with different parameter types
+// ZER: spawn with u32, bool, u8 args — all copied by value
+
+void worker_u32(u32 x) {
+    u32 r = x + 1;
+}
+
+void worker_bool(bool flag) {
+    if (flag) { u32 x = 1; }
+}
+
+void worker_multi(u32 a, u32 b, bool c) {
+    u32 sum = a + b;
+}
+
+i32 main() {
+    ThreadHandle t1 = spawn worker_u32(42);
+    ThreadHandle t2 = spawn worker_bool(true);
+    ThreadHandle t3 = spawn worker_multi(10, 20, false);
+    t1.join();
+    t2.join();
+    t3.join();
+    return 0;
+}

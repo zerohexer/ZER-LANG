@@ -1,0 +1,8 @@
+enum Reg { ctrl, status = 4, data = 8 }
+static_assert(Reg.ctrl == 0, "a");
+static_assert(Reg.status == 4, "b");
+static_assert(Reg.data == 8, "c");
+i32 main() {
+    u32[16] m;
+    return 0;
+}

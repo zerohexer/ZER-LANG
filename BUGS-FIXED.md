@@ -3147,3 +3147,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **Comptime array indexing:** ComptimeParam extended with array_values/array_size. ct_ctx_set_array creates binding, ct_eval_assign handles arr[i]=val, eval_const_expr_subst handles arr[i] read. Memory managed: arrays freed on scope pop and ctx_free. CRITICAL: all ComptimeParam stack arrays must be memset-zeroed to prevent freeing garbage pointers (caused munmap_chunk crash before fix).
 
 **Comptime struct return:** comptime functions can return `{ .x = a, .y = b }`. When eval_comptime_block returns CONST_EVAL_FAIL, checker tries find_comptime_struct_return + eval_comptime_struct_return as fallback. Creates constant NODE_STRUCT_INIT stored as call.comptime_struct_init. Emitter delegates to emit_expr (existing compound literal path). Also required adding NODE_STRUCT_INIT validation in NODE_RETURN (4th value-flow site — was missing, caused "return type 'void' doesn't match" error).
+
+### Comptime enum values + comptime float (2026-04-11)
+
+**Comptime enum values:** `Color.red` resolves to integer at compile time. `resolve_enum_field` helper + `eval_const_expr_scoped` extended to recurse through binary expressions containing enum fields. Works in `static_assert`, array indices, comptime function args.
+
+**Comptime float:** `comptime f64 PI_HALF() { return 3.14 / 2.0; }` — parallel eval path at call site. `eval_comptime_float_expr` handles float literal/param/arithmetic. Float params stored as bits in int64 via memcpy. Emitter outputs `%.17g`.
+
+**Design decision: no array literal syntax.** `u32[4] t = {1,2,3,4}` not added because: (1) C doesn't have array literals in expression position either, (2) element-by-element is clearer for large arrays, (3) would create NODE_ARRAY_INIT with parser ambiguity vs NODE_STRUCT_INIT, (4) ~100 lines for convenience-only feature.

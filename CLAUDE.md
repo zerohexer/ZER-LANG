@@ -483,6 +483,8 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime array indexing | Done | N/A (compile-time — array bindings in ComptimeCtx) |
 | Comptime struct return | Done | Done (NODE_STRUCT_INIT inlined at call site) |
 | Compound literals in call args | Done | Done (struct_init validated in NODE_CALL) |
+| Comptime enum values | Done | N/A (compile-time — resolve_enum_field in eval_const_expr_scoped) |
+| Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

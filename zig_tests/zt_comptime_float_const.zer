@@ -1,0 +1,26 @@
+// Comptime float — compile-time floating point constants
+// Translated from: Rust const fn f64 patterns (stable since 1.82)
+
+comptime f64 DEG_TO_RAD(f64 deg) {
+    return deg * 3.14159265358979 / 180.0;
+}
+
+comptime f64 LERP(f64 a, f64 b, f64 t) {
+    return a + (b - a) * t;
+}
+
+i32 main() {
+    f64 r90 = DEG_TO_RAD(90.0);
+    if (r90 < 1.57) { return 1; }
+    if (r90 > 1.58) { return 2; }
+
+    f64 r180 = DEG_TO_RAD(180.0);
+    if (r180 < 3.14) { return 3; }
+    if (r180 > 3.15) { return 4; }
+
+    f64 mid = LERP(0.0, 100.0, 0.5);
+    if (mid < 49.9) { return 5; }
+    if (mid > 50.1) { return 6; }
+
+    return 0;
+}

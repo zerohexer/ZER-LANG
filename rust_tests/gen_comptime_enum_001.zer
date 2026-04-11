@@ -1,0 +1,24 @@
+// Comptime enum values in static_assert and array index
+// Translated from Rust: const fn with enum discriminant
+
+enum Dir { north, east = 2, south, west }
+
+static_assert(Dir.north == 0, "north");
+static_assert(Dir.east == 2, "east");
+static_assert(Dir.south == 3, "south");
+static_assert(Dir.west == 4, "west");
+
+i32 main() {
+    i32[5] dx;
+    i32[5] dy;
+    dx[Dir.north] = 0;  dy[Dir.north] = -1;
+    dx[Dir.east] = 1;   dy[Dir.east] = 0;
+    dx[Dir.south] = 0;  dy[Dir.south] = 1;
+    dx[Dir.west] = -1;  dy[Dir.west] = 0;
+
+    if (dx[0] != 0) { return 1; }
+    if (dy[0] != -1) { return 2; }
+    if (dx[2] != 1) { return 3; }
+    if (dy[4] != 0) { return 4; }
+    return 0;
+}

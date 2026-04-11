@@ -3169,3 +3169,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **@ptrtoint escape:** Two checks needed — direct `return @ptrtoint(&x)` (no intermediate var, caught in NODE_RETURN) and indirect `usize a = @ptrtoint(&x); return a` (is_local_derived propagation at var-decl, caught by existing return escape check). Initial attempt removed direct check thinking indirect covered both — it doesn't (no var-decl = no symbol to flag). Both checks are complementary, not redundant.
 
 **Funcptr call graph:** scan_frame NODE_CALL now checks TYPE_FUNC_PTR variables. If init was a function ident, adds that function as callee. Enables indirect recursion detection through function pointers.
+
+### Local funcptr init required + division by zero call divisors (2026-04-12)
+
+**Local funcptr init:** Local `void (*cb)(u32)` without init auto-zeros to NULL — calling segfaults. Now requires init or `?` nullable prefix. Global funcptrs exempt (C convention: assigned in init functions). Matches existing *T pointer init requirement.
+
+**Division by zero call divisors:** `x / func()` where func() has no proven nonzero return range → compile error. Extended forced division guard from NODE_IDENT/NODE_FIELD to also cover NODE_CALL. Functions with `has_return_range && return_range_min > 0` pass.
+
+**Stack overflow indirect calls:** `has_indirect_call` flag on StackFrame propagated through call chain. Without --stack-limit: warning. With --stack-limit: error on entry points with unresolvable funcptr calls.

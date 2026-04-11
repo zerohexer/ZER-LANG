@@ -911,6 +911,35 @@ When array index is not proven by range propagation, compiler auto-inserts `if (
 
 **Cross-function provenance summaries:** `find_return_provenance()` scans function body for return expression provenance. `ProvSummary` stored on Checker. At NODE_VAR_DECL init from function call returning *opaque, `lookup_prov_summary()` sets `sym->provenance_type`.
 
+## ZER vs Rust — Concurrency Primitives Comparison
+
+Every ZER concurrency feature is a **language primitive** (keyword, intrinsic, or type). Rust implements most as library code (std). This table is the authoritative reference for what ZER has, what it doesn't, and why.
+
+| Primitive | Rust (std library) | ZER (language) | Who's better |
+|---|---|---|---|
+| Mutex | `Mutex<T>` | `shared struct` (auto-lock) | ZER — no boilerplate |
+| RwLock | `RwLock<T>` | `shared(rw) struct` | ZER — keyword |
+| Thread spawn | `thread::spawn` | `spawn` keyword | ZER — compile-time safety |
+| Thread join | `JoinHandle::join` | `ThreadHandle.join()` | Equal |
+| Condvar | `Condvar` | `@cond_wait/signal/broadcast` | ZER — intrinsic |
+| Condvar timeout | `wait_timeout` | `@cond_timedwait` | ZER — intrinsic |
+| Barrier | `Barrier` (std) | `Barrier` keyword type | ZER — type-checked |
+| Atomics | `AtomicU32` (std) | `@atomic_*` intrinsics | Equal |
+| Thread-local | `thread_local!` macro | `threadlocal` keyword | ZER — no macro |
+| Once init | `Once` (std) | `@once { }` intrinsic | ZER — block syntax |
+| Async | `async/await` + `Future` + `Pin` | `async/await` (Duff's device) | ZER simpler — no Pin/Future |
+| Channel | `mpsc::channel` (unbounded) | `Ring(T, N)` (bounded) | Different — ZER bounded by design |
+| Send/Sync | Trait bounds | spawn checker | Equal — both compile-time |
+| Deadlock detect | None | same-statement check | **ZER only** |
+| Scoped threads | `thread::scope` (std) | `ThreadHandle` must-join | ZER — enforced at compile-time |
+
+**Not in ZER (by design):**
+- `Arc<T>` — Pool/Slab/Handle covers allocation, no ref counting needed
+- `park/unpark` — condvar is the primitive, park is sugar
+- `Future/Pin` — coroutines are concrete types, no trait abstraction needed
+- Unbounded channel — bounded `Ring` prevents OOM on embedded
+- Async runtime — user writes poll loop (freestanding) or library wraps epoll
+
 ## Test Files
 | File | What | Count |
 |---|---|---|

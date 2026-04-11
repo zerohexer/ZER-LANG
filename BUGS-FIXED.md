@@ -3193,3 +3193,13 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **V5 — Thread-unsafe Slab/Pool/Ring from spawn:** `scan_unsafe_global_access` skipped TYPE_POOL/TYPE_SLAB/TYPE_RING. These allocators have non-atomic metadata — alloc/free from multiple threads is a data race. Fix: only skip TYPE_ARENA and TYPE_BARRIER. Also fixed two scanner gaps: NODE_FIELD not in recursion switch (callee `global_slab.alloc()` has slab as NODE_FIELD object), and NODE_CALL not scanning callee expression. 6 tests that used Ring/Pool from spawn correctly reclassified as negative tests.
 
 **V6 — Container infinite recursion:** `container Node(T) { ?*Node(T) next; }` caused infinite type resolution. Fix: `_container_depth` limit (32) + `subst_typenode()` recursive TypeNode substitution replacing 5 one-level pattern matches with single recursive function. Handles T at any nesting depth.
+
+### Red Team V9-V12 (2026-04-12, Gemini round 3)
+
+**V9 — Async defer bypass:** NOT a bug. Defer fires correctly on async completion — Duff's device state machine handles defers properly. Verified with test (EXIT 0, g_cleaned == 1).
+
+**V10 — Move struct in shared struct:** CONFIRMED + FIXED. `move struct Token` as field of `shared struct Vault` allows ownership breach across threads. Fix: checker rejects move struct fields in shared struct declarations at register_decl time.
+
+**V11 — Same-type instance deadlock:** NOT a real deadlock. ZER's per-statement locking means locks never overlap — each statement acquires/releases before the next. Atomicity concern (partial transfer visible) is a design limitation, same as Rust (use single shared struct for atomic multi-field ops).
+
+**V12 — Container type-id collision:** Already caught. Each container stamp gets unique type_id (c->next_type_id++). @ptrcast provenance check catches Wrapper(u32) → Wrapper(i32) mismatch.

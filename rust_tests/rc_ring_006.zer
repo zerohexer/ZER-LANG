@@ -1,3 +1,4 @@
+// EXPECTED: compile error
 // Rust: mpsc — producer thread sends, main receives
 // ZER: spawn producer that pushes to Ring, main pops
 // Equivalent to: task-comm-1 (threaded producer)

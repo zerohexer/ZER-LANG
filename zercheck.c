@@ -1516,7 +1516,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_VAR_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
@@ -1755,7 +1755,8 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
     }
 
     case NODE_FOR:
-    case NODE_WHILE: {
+    case NODE_WHILE:
+    case NODE_DO_WHILE: {
         /* check init/cond/step for handle use-after-free */
         if (node->kind == NODE_FOR) {
             if (node->for_stmt.init) zc_check_stmt(zc, ps, node->for_stmt.init);

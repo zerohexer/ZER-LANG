@@ -178,6 +178,7 @@ typedef enum {
     NODE_SPAWN,             /* spawn func(args); — thread creation */
     NODE_YIELD,             /* yield; — pause async coroutine */
     NODE_AWAIT,             /* await expr; — yield until condition true */
+    NODE_DO_WHILE,          /* do { body } while (cond); */
     NODE_STATIC_ASSERT,     /* static_assert(expr, "msg"); — compile-time assertion */
 
     /* === Expressions === */

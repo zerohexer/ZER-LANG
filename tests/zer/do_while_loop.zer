@@ -1,0 +1,41 @@
+// do-while loop: execute body at least once, then check condition
+
+i32 main() {
+    // Basic do-while
+    u32 count = 0;
+    do {
+        count += 1;
+    } while (count < 5);
+    if (count != 5) { return 1; }
+
+    // Body executes before condition check
+    u32 val = 100;
+    do {
+        val += 1;
+    } while (false);
+    if (val != 101) { return 2; }
+
+    // Nested do-while
+    u32 outer = 0;
+    u32 total = 0;
+    do {
+        u32 inner = 0;
+        do {
+            inner += 1;
+            total += 1;
+        } while (inner < 3);
+        outer += 1;
+    } while (outer < 2);
+    if (outer != 2) { return 3; }
+    if (total != 6) { return 4; }
+
+    // do-while with break
+    u32 x = 0;
+    do {
+        x += 1;
+        if (x == 3) { break; }
+    } while (x < 10);
+    if (x != 3) { return 5; }
+
+    return 0;
+}

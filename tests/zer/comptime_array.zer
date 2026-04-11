@@ -1,0 +1,36 @@
+// Comptime array indexing: arrays in comptime function bodies
+
+comptime u32 LUT(u32 i) {
+    u32[4] t;
+    t[0] = 10;
+    t[1] = 20;
+    t[2] = 30;
+    t[3] = 40;
+    return t[i];
+}
+
+comptime u32 SUM_ARR() {
+    u32[3] a;
+    a[0] = 1;
+    a[1] = 2;
+    a[2] = 3;
+    u32 total = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        total += a[i];
+    }
+    return total;
+}
+
+i32 main() {
+    u32 v0 = LUT(0);
+    u32 v2 = LUT(2);
+    u32 v3 = LUT(3);
+    if (v0 != 10) { return 1; }
+    if (v2 != 30) { return 2; }
+    if (v3 != 40) { return 3; }
+
+    u32 s = SUM_ARR();
+    if (s != 6) { return 4; }
+
+    return 0;
+}

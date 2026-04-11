@@ -881,7 +881,13 @@ static int64_t compute_type_size(Type *t) {
 static Type *resolve_type_inner(Checker *c, TypeNode *tn);
 
 /* BUG-391: forward declarations for comptime evaluation in array sizes */
-typedef struct { const char *name; uint32_t name_len; int64_t value; } ComptimeParam;
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    int64_t value;
+    int64_t *array_values;  /* non-NULL for array bindings */
+    int array_size;         /* element count (0 = scalar) */
+} ComptimeParam;
 
 /* Mutable comptime evaluation context — shared across block/loop boundaries.
  * Locals added in inner blocks are popped via saved_count on block exit.
@@ -897,6 +903,7 @@ static void ct_ctx_init(ComptimeCtx *ctx, ComptimeParam *params, int param_count
     ctx->capacity = 8;
     ctx->locals = ctx->stack;
     ctx->count = 0;
+    memset(ctx->stack, 0, sizeof(ctx->stack));
     if (param_count > 8) {
         ctx->capacity = param_count + 8;
         ctx->locals = (ComptimeParam *)malloc(ctx->capacity * sizeof(ComptimeParam));
@@ -904,11 +911,16 @@ static void ct_ctx_init(ComptimeCtx *ctx, ComptimeParam *params, int param_count
     }
     for (int i = 0; i < param_count && i < ctx->capacity; i++) {
         ctx->locals[i] = params[i];
+        ctx->locals[i].array_values = NULL;
+        ctx->locals[i].array_size = 0;
         ctx->count++;
     }
 }
 
 static void ct_ctx_free(ComptimeCtx *ctx) {
+    for (int i = 0; i < ctx->count; i++) {
+        if (ctx->locals[i].array_values) free(ctx->locals[i].array_values);
+    }
     if (ctx->locals != ctx->stack) free(ctx->locals);
 }
 
@@ -934,6 +946,8 @@ static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, in
     ctx->locals[ctx->count].name = name;
     ctx->locals[ctx->count].name_len = name_len;
     ctx->locals[ctx->count].value = value;
+    ctx->locals[ctx->count].array_values = NULL;
+    ctx->locals[ctx->count].array_size = 0;
     ctx->count++;
 }
 
@@ -1414,6 +1428,23 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         }
         return CONST_EVAL_FAIL;
     }
+    /* Array indexing: arr[i] — look up array binding */
+    if (n->kind == NODE_INDEX && n->index_expr.object &&
+        n->index_expr.object->kind == NODE_IDENT) {
+        const char *aname = n->index_expr.object->ident.name;
+        uint32_t alen = (uint32_t)n->index_expr.object->ident.name_len;
+        for (int i = 0; i < param_count; i++) {
+            if (params[i].name_len == alen &&
+                memcmp(params[i].name, aname, alen) == 0 &&
+                params[i].array_values && params[i].array_size > 0) {
+                int64_t idx = eval_const_expr_subst(n->index_expr.index, params, param_count);
+                if (idx == CONST_EVAL_FAIL || idx < 0 || idx >= params[i].array_size)
+                    return CONST_EVAL_FAIL;
+                return params[i].array_values[idx];
+            }
+        }
+        return CONST_EVAL_FAIL;
+    }
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_BOOL_LIT) return n->bool_lit.value ? 1 : 0;
     /* nested comptime function calls — depth guard prevents stack overflow */
@@ -1464,7 +1495,29 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
 
 /* Evaluate a comptime assignment: compute RHS, apply operator, update ctx */
 static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
-    if (!asgn || asgn->kind != NODE_ASSIGN || asgn->assign.target->kind != NODE_IDENT)
+    if (!asgn || asgn->kind != NODE_ASSIGN) return CONST_EVAL_FAIL;
+
+    /* Array element assignment: arr[i] = val */
+    if (asgn->assign.target->kind == NODE_INDEX &&
+        asgn->assign.target->index_expr.object->kind == NODE_IDENT) {
+        const char *aname = asgn->assign.target->index_expr.object->ident.name;
+        uint32_t alen = (uint32_t)asgn->assign.target->index_expr.object->ident.name_len;
+        int64_t idx = eval_const_expr_subst(asgn->assign.target->index_expr.index,
+                                             ctx->locals, ctx->count);
+        int64_t rhs = eval_const_expr_subst(asgn->assign.value, ctx->locals, ctx->count);
+        if (idx == CONST_EVAL_FAIL || rhs == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        for (int k = 0; k < ctx->count; k++) {
+            if (ctx->locals[k].name_len == alen &&
+                memcmp(ctx->locals[k].name, aname, alen) == 0 &&
+                ctx->locals[k].array_values && idx >= 0 && idx < ctx->locals[k].array_size) {
+                ctx->locals[k].array_values[idx] = rhs;
+                return 0;
+            }
+        }
+        return CONST_EVAL_FAIL;
+    }
+
+    if (asgn->assign.target->kind != NODE_IDENT)
         return CONST_EVAL_FAIL;
     const char *name = asgn->assign.target->ident.name;
     uint32_t nlen = (uint32_t)asgn->assign.target->ident.name_len;
@@ -1496,6 +1549,27 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
     return 0; /* success (not a return value) */
 }
 
+/* Create an array binding in comptime context */
+static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_len,
+                              int64_t *values, int size) {
+    /* grow if needed */
+    if (ctx->count >= ctx->capacity) {
+        int nc = ctx->capacity * 2;
+        ComptimeParam *nl = (ComptimeParam *)malloc(nc * sizeof(ComptimeParam));
+        if (!nl) return;
+        memcpy(nl, ctx->locals, ctx->count * sizeof(ComptimeParam));
+        if (ctx->locals != ctx->stack) free(ctx->locals);
+        ctx->locals = nl;
+        ctx->capacity = nc;
+    }
+    ctx->locals[ctx->count].name = name;
+    ctx->locals[ctx->count].name_len = name_len;
+    ctx->locals[ctx->count].value = 0;
+    ctx->locals[ctx->count].array_values = values;
+    ctx->locals[ctx->count].array_size = size;
+    ctx->count++;
+}
+
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
     static int depth = 0;
     if (!block) return CONST_EVAL_FAIL;
@@ -1511,10 +1585,24 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             Node *stmt = block->block.stmts[i];
 
             /* Variable declaration */
-            if (stmt->kind == NODE_VAR_DECL && stmt->var_decl.init) {
-                int64_t val = eval_const_expr_subst(stmt->var_decl.init, ctx->locals, ctx->count);
-                if (val == CONST_EVAL_FAIL) { depth--; return CONST_EVAL_FAIL; }
-                ct_ctx_set(ctx, stmt->var_decl.name, (uint32_t)stmt->var_decl.name_len, val);
+            if (stmt->kind == NODE_VAR_DECL) {
+                /* Array var-decl: T[N] arr; → create zero-filled array binding */
+                if (stmt->var_decl.type && stmt->var_decl.type->kind == TYNODE_ARRAY) {
+                    int64_t sz = eval_const_expr(stmt->var_decl.type->array.size_expr);
+                    if (sz > 0 && sz <= 1024) {
+                        int64_t *arr = (int64_t *)calloc((size_t)sz, sizeof(int64_t));
+                        if (arr) {
+                            ct_ctx_set_array(ctx, stmt->var_decl.name,
+                                (uint32_t)stmt->var_decl.name_len, arr, (int)sz);
+                        }
+                    }
+                    continue;
+                }
+                if (stmt->var_decl.init) {
+                    int64_t val = eval_const_expr_subst(stmt->var_decl.init, ctx->locals, ctx->count);
+                    if (val == CONST_EVAL_FAIL) { depth--; return CONST_EVAL_FAIL; }
+                    ct_ctx_set(ctx, stmt->var_decl.name, (uint32_t)stmt->var_decl.name_len, val);
+                }
                 continue;
             }
 
@@ -1553,12 +1641,19 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             }
 
             /* While loop */
-            if (stmt->kind == NODE_WHILE) {
+            if (stmt->kind == NODE_WHILE || stmt->kind == NODE_DO_WHILE) {
                 for (int iter = 0; iter < 10000; iter++) {
+                    /* do-while: execute body before checking condition on first iteration */
+                    if (stmt->kind == NODE_DO_WHILE && iter == 0) {
+                        int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
+                        if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    }
                     int64_t cond = eval_const_expr_subst(stmt->while_stmt.cond, ctx->locals, ctx->count);
                     if (cond == CONST_EVAL_FAIL || !cond) break;
-                    int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
-                    if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    if (stmt->kind == NODE_WHILE || iter > 0) {
+                        int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
+                        if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    }
                 }
                 continue;
             }
@@ -1627,6 +1722,13 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
         }
     }
 ct_done:
+    /* Free array bindings before popping block-local vars */
+    for (int pi = saved_count; pi < ctx->count; pi++) {
+        if (ctx->locals[pi].array_values) {
+            free(ctx->locals[pi].array_values);
+            ctx->locals[pi].array_values = NULL;
+        }
+    }
     ctx->count = saved_count; /* pop block-local vars */
     depth--;
     return result;
@@ -6390,11 +6492,14 @@ static void check_stmt(Checker *c, Node *node) {
         break;
     }
 
-    case NODE_WHILE: {
+    case NODE_WHILE:
+    case NODE_DO_WHILE: {
         Type *cond = check_expr(c, node->while_stmt.cond);
         if (!type_equals(cond, ty_bool)) {
             checker_error(c, node->loc.line,
-                "while condition must be bool, got '%s'", type_name(cond));
+                "%s condition must be bool, got '%s'",
+                node->kind == NODE_DO_WHILE ? "do-while" : "while",
+                type_name(cond));
         }
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
@@ -7705,7 +7810,7 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     case NODE_FOR:
         collect_labels(node->for_stmt.body, labels, count, max);
         break;
-    case NODE_WHILE:
+    case NODE_WHILE: case NODE_DO_WHILE:
         collect_labels(node->while_stmt.body, labels, count, max);
         break;
     case NODE_SWITCH:
@@ -7767,7 +7872,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     case NODE_FOR:
         validate_gotos(c, node->for_stmt.body, labels, label_count);
         break;
-    case NODE_WHILE:
+    case NODE_WHILE: case NODE_DO_WHILE:
         validate_gotos(c, node->while_stmt.body, labels, label_count);
         break;
     case NODE_SWITCH:
@@ -7831,7 +7936,7 @@ static bool contains_break(Node *node) {
     if (!node) return false;
     switch (node->kind) {
     case NODE_BREAK: return true;
-    case NODE_WHILE: case NODE_FOR: return false; /* nested loop — break targets it */
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_FOR: return false; /* nested loop — break targets it */
     case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++) {
             if (contains_break(node->block.stmts[i])) return true;
@@ -7906,7 +8011,8 @@ static bool all_paths_return(Node *node) {
         return has_default || arm_count > 0;
     }
     case NODE_WHILE:
-        /* while(true) is an infinite loop — never exits normally.
+    case NODE_DO_WHILE:
+        /* while(true) / do...while(true) is an infinite loop — never exits normally.
          * BUT: if the body contains a break, the loop CAN exit,
          * so it's NOT a terminator. (BUG-200) */
         if (node->while_stmt.cond &&
@@ -8334,7 +8440,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         scan_frame(c, frame, node->for_stmt.init);
         scan_frame(c, frame, node->for_stmt.body);
         break;
-    case NODE_WHILE:
+    case NODE_WHILE: case NODE_DO_WHILE:
         scan_frame(c, frame, node->while_stmt.body);
         break;
     case NODE_RETURN:
@@ -9005,7 +9111,7 @@ static void check_call_provenance(Checker *c, Node *node) {
     case NODE_FOR:
         check_call_provenance(c, node->for_stmt.body);
         break;
-    case NODE_WHILE:
+    case NODE_WHILE: case NODE_DO_WHILE:
         check_call_provenance(c, node->while_stmt.body);
         break;
     case NODE_FUNC_DECL:
@@ -9105,7 +9211,7 @@ static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
     case NODE_VAR_DECL: return find_shared_type_in_expr(c, stmt->var_decl.init);
     case NODE_RETURN: return find_shared_type_in_expr(c, stmt->ret.expr);
     case NODE_IF: return find_shared_type_in_expr(c, stmt->if_stmt.cond);
-    case NODE_WHILE: return find_shared_type_in_expr(c, stmt->while_stmt.cond);
+    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_type_in_expr(c, stmt->while_stmt.cond);
     case NODE_FOR: {
         Type *r = find_shared_type_in_expr(c, stmt->for_stmt.init);
         if (!r && stmt->for_stmt.cond) r = find_shared_type_in_expr(c, stmt->for_stmt.cond);
@@ -9183,7 +9289,7 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
     case NODE_VAR_DECL: return collect_shared_types_in_expr(c, stmt->var_decl.init, types, max_types, 0);
     case NODE_RETURN: return collect_shared_types_in_expr(c, stmt->ret.expr, types, max_types, 0);
     case NODE_IF: return collect_shared_types_in_expr(c, stmt->if_stmt.cond, types, max_types, 0);
-    case NODE_WHILE: return collect_shared_types_in_expr(c, stmt->while_stmt.cond, types, max_types, 0);
+    case NODE_WHILE: case NODE_DO_WHILE: return collect_shared_types_in_expr(c, stmt->while_stmt.cond, types, max_types, 0);
     case NODE_FOR: {
         int n = collect_shared_types_in_expr(c, stmt->for_stmt.init, types, max_types, 0);
         if (stmt->for_stmt.cond)

@@ -961,7 +961,37 @@ Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call o
 
 **Emitter:** Always emits as C99 compound literal: `(StructType){ .field = val, ... }`. Works in both var-decl init and assignment contexts. The type cast prefix is read from `checker_get_type(node)`.
 
-**Both var-decl and assignment work:** `p = { .x = 1 };` emits `p = (Point){ .x = 1 };`. Partial init (unmentioned fields) auto-zero per C99 rules.
+**All 4 value-flow sites validated:** var-decl init, assignment, call arg (NODE_CALL), return (NODE_RETURN). Same pattern at each site: when expression is NODE_STRUCT_INIT, validate field names against target struct type, check field value types, set `typemap_set(node, target_type)`.
+
+## do-while Loop (2026-04-11)
+
+`do { body } while (cond);` — C-style execute-at-least-once loop.
+- Lexer: `TOK_DO` keyword. Parser: `NODE_DO_WHILE` reuses `while_stmt` union member (same cond+body).
+- Checker: merged with `case NODE_WHILE:` everywhere (same validation). Comptime evaluator handles do-while by executing body before first condition check.
+- Emitter: `do { body } while (cond);` — direct C pass-through.
+- zercheck: merged with `case NODE_FOR: case NODE_WHILE:` loop handler (same fixed-point iteration).
+
+## Comptime Array Indexing (2026-04-11)
+
+`ComptimeParam` extended with `int64_t *array_values` and `int array_size` for array bindings.
+- `ct_ctx_set_array(ctx, name, len, values, size)` — creates zero-filled array binding (max 1024 elements).
+- `eval_comptime_block` NODE_VAR_DECL: detects TYNODE_ARRAY, allocates array via `calloc`, registers binding.
+- `ct_eval_assign`: handles `NODE_INDEX` targets (`arr[i] = val`) — looks up array binding, sets element.
+- `eval_const_expr_subst`: handles `NODE_INDEX` reads (`arr[i]`) — looks up array binding, returns element.
+- Memory: array_values freed in `ct_ctx_free` and on block scope pop (`saved_count` restore).
+- **CRITICAL:** All `ComptimeParam` arrays (stack and malloc'd) must be zero-initialized (`memset`) to prevent `ct_ctx_free` from freeing garbage `array_values` pointers.
+
+## Comptime Struct Return (2026-04-11)
+
+`comptime Point MAKE(i32 a, i32 b) { return { .x = a, .y = b }; }` — comptime functions returning structs.
+
+**Architecture:** Does NOT change `eval_comptime_block` return type (stays `int64_t`). Instead, when scalar eval returns `CONST_EVAL_FAIL`, the checker tries struct return as a parallel path:
+1. `find_comptime_struct_return(body)` — recursively finds `return { .field = expr }` (NODE_STRUCT_INIT) in function body
+2. `eval_comptime_struct_return(arena, struct_init, params, count)` — evaluates each field value via `eval_const_expr_subst`, creates new NODE_STRUCT_INIT with NODE_INT_LIT constant values
+3. Result stored as `node->call.comptime_struct_init` (new field on NODE_CALL)
+4. Emitter: when `comptime_struct_init` is set, emits via `emit_expr` (reuses existing NODE_STRUCT_INIT compound literal emission)
+
+**Design decision:** Avoids changing `eval_comptime_block`'s return type to a tagged union. The struct path is handled entirely at the call site in the checker. Simpler, no architectural disruption, handles all cases where return expression is a designated initializer with comptime-evaluable field values.
 
 ## Value Range Propagation (checker.c)
 

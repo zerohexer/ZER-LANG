@@ -3139,3 +3139,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 
 **Stale forward declaration removed:**
 - `eval_comptime_stmt` forward declaration was leftover from pre-ComptimeCtx refactor. Removed to eliminate -Wunused-function warning.
+
+### do-while, comptime array indexing, comptime struct return (2026-04-11)
+
+**do-while:** `do { body } while (cond);` — NODE_DO_WHILE reuses while_stmt data. All walkers updated. Merged with NODE_WHILE case in checker/emitter/zercheck.
+
+**Comptime array indexing:** ComptimeParam extended with array_values/array_size. ct_ctx_set_array creates binding, ct_eval_assign handles arr[i]=val, eval_const_expr_subst handles arr[i] read. Memory managed: arrays freed on scope pop and ctx_free. CRITICAL: all ComptimeParam stack arrays must be memset-zeroed to prevent freeing garbage pointers (caused munmap_chunk crash before fix).
+
+**Comptime struct return:** comptime functions can return `{ .x = a, .y = b }`. When eval_comptime_block returns CONST_EVAL_FAIL, checker tries find_comptime_struct_return + eval_comptime_struct_return as fallback. Creates constant NODE_STRUCT_INIT stored as call.comptime_struct_init. Emitter delegates to emit_expr (existing compound literal path). Also required adding NODE_STRUCT_INIT validation in NODE_RETURN (4th value-flow site — was missing, caused "return type 'void' doesn't match" error).

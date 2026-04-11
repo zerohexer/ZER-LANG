@@ -961,7 +961,7 @@ Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call o
 
 **Emitter:** Always emits as C99 compound literal: `(StructType){ .field = val, ... }`. Works in both var-decl init and assignment contexts. The type cast prefix is read from `checker_get_type(node)`.
 
-**All 4 value-flow sites validated:** var-decl init, assignment, call arg (NODE_CALL), return (NODE_RETURN). Same pattern at each site: when expression is NODE_STRUCT_INIT, validate field names against target struct type, check field value types, set `typemap_set(node, target_type)`.
+**All 4 value-flow sites validated** via unified `validate_struct_init(c, sinit, target_type, line)` helper. ONE function, 4 call sites — var-decl, assignment, call arg, return. Checks field names exist on struct, value types match. Returns bool (true = valid struct). Caller sets `typemap_set(node, target_type)` on success. Audit found this was duplicated 4x (~120 lines), extracted to helper (-76 net lines).
 
 ## do-while Loop (2026-04-11)
 

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// @ptrtoint(&local) returned — address dangles after function returns
+
+usize leak_addr() {
+    u32 x = 42;
+    return @ptrtoint(&x);
+}
+
+i32 main() {
+    usize a = leak_addr();
+    return 0;
+}

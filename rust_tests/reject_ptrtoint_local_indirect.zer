@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// @ptrtoint(&local) stored in variable then returned — indirect escape
+
+usize leak_indirect() {
+    u32 x = 42;
+    usize addr = @ptrtoint(&x);
+    return addr;
+}
+
+i32 main() {
+    usize a = leak_indirect();
+    return 0;
+}

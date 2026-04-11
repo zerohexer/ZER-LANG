@@ -6191,6 +6191,32 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* @ptrtoint(&local) — mark result as local-derived.
+             * The integer carries the local's address; if it escapes (return, global store)
+             * and is later used with @inttoptr, the pointer dangles. */
+            if (node->var_decl.init && node->var_decl.init->kind == NODE_INTRINSIC &&
+                node->var_decl.init->intrinsic.name_len == 8 &&
+                memcmp(node->var_decl.init->intrinsic.name, "ptrtoint", 8) == 0 &&
+                node->var_decl.init->intrinsic.arg_count > 0) {
+                Node *ptarg = node->var_decl.init->intrinsic.args[0];
+                if (ptarg && ptarg->kind == NODE_UNARY && ptarg->unary.op == TOK_AMP) {
+                    Node *root = ptarg->unary.operand;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        bool is_global = scope_lookup_local(c->global_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                        Symbol *src = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (src && !src->is_static && !is_global) {
+                            sym->is_local_derived = true;
+                        }
+                    }
+                }
+            }
+
             /* BUG-203/207/377: slice from local array — mark as local-derived.
              * []T s = local_array OR []T s = local_array[1..4]
              * Both create a slice pointing to stack memory.
@@ -7197,6 +7223,33 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "cannot return volatile pointer as non-volatile — "
                             "writes through result may be optimized away");
+                    }
+                }
+            }
+
+            /* scope escape: return @ptrtoint(&local) — address of local escapes as integer.
+             * Catches direct return without intermediate variable.
+             * Indirect case (usize a = @ptrtoint(&x); return a) caught by is_local_derived. */
+            if (node->ret.expr->kind == NODE_INTRINSIC &&
+                node->ret.expr->intrinsic.name_len == 8 &&
+                memcmp(node->ret.expr->intrinsic.name, "ptrtoint", 8) == 0 &&
+                node->ret.expr->intrinsic.arg_count > 0) {
+                Node *ptarg = node->ret.expr->intrinsic.args[0];
+                if (ptarg && ptarg->kind == NODE_UNARY && ptarg->unary.op == TOK_AMP) {
+                    Node *root = ptarg->unary.operand;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        bool is_global = scope_lookup_local(c->global_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                        if (!is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot return @ptrtoint of local '%.*s' — "
+                                "address will dangle after function returns",
+                                (int)root->ident.name_len, root->ident.name);
+                        }
                     }
                 }
             }
@@ -8781,13 +8834,26 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     }
     case NODE_CALL:
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            /* only track direct function calls (not method calls) */
             Symbol *sym = scope_lookup(c->global_scope,
                 node->call.callee->ident.name,
                 (uint32_t)node->call.callee->ident.name_len);
             if (sym && sym->is_function) {
+                /* Direct function call */
                 add_callee(frame, node->call.callee->ident.name,
                            (uint32_t)node->call.callee->ident.name_len);
+            } else if (sym && sym->type && type_unwrap_distinct(sym->type)->kind == TYPE_FUNC_PTR) {
+                /* Function pointer call: check if variable was initialized with a known function.
+                 * Enables indirect recursion detection: void (*fp)() = func_a; fp(); */
+                if (sym->func_node &&
+                    (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
+                    sym->func_node->var_decl.init &&
+                    sym->func_node->var_decl.init->kind == NODE_IDENT) {
+                    const char *target = sym->func_node->var_decl.init->ident.name;
+                    uint32_t tlen = (uint32_t)sym->func_node->var_decl.init->ident.name_len;
+                    Symbol *tsym = scope_lookup(c->global_scope, target, tlen);
+                    if (tsym && tsym->is_function)
+                        add_callee(frame, target, tlen);
+                }
             }
         }
         for (int i = 0; i < node->call.arg_count; i++)

@@ -1,0 +1,19 @@
+container Optional(T) {
+    ?T value;
+}
+
+container PtrWrap(T) {
+    *T ptr;
+}
+
+i32 main() {
+    Optional(u32) o;
+    o.value = null;
+
+    u32 data = 42;
+    PtrWrap(u32) w;
+    w.ptr = &data;
+    if (w.ptr[0] != 42) { return 1; }
+
+    return 0;
+}

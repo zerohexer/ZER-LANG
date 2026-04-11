@@ -1,0 +1,19 @@
+struct Vec2 { f32 x; f32 y; }
+
+container Pair(T) {
+    T a;
+    T b;
+}
+
+i32 main() {
+    Pair(u32) ints;
+    ints.a = 10;
+    ints.b = 20;
+    if (ints.a + ints.b != 30) { return 1; }
+
+    Pair(Vec2) vecs;
+    vecs.a = { .x = 1.0, .y = 2.0 };
+    vecs.b = { .x = 3.0, .y = 4.0 };
+
+    return 0;
+}

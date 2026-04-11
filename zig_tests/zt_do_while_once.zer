@@ -1,0 +1,8 @@
+i32 main() {
+    u32 count = 0;
+    do {
+        count += 1;
+    } while (false);
+    if (count != 1) { return 1; }
+    return 0;
+}

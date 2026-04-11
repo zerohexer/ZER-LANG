@@ -1,0 +1,12 @@
+struct Point { i32 x; i32 y; }
+
+Point make_point(i32 a, i32 b) {
+    return { .x = a, .y = b };
+}
+
+i32 main() {
+    Point p = make_point(10, 20);
+    if (p.x != 10) { return 1; }
+    if (p.y != 20) { return 2; }
+    return 0;
+}

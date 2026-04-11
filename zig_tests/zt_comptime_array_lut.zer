@@ -1,0 +1,22 @@
+comptime u32 CRC_ENTRY(u32 idx) {
+    u32[8] table;
+    table[0] = 0;
+    table[1] = 0x77073096;
+    table[2] = 0xEE0E612C;
+    table[3] = 0x990951BA;
+    table[4] = 0x076DC419;
+    table[5] = 0x706AF48F;
+    table[6] = 0xE963A535;
+    table[7] = 0x9E6495A3;
+    return table[idx];
+}
+
+i32 main() {
+    u32 v0 = CRC_ENTRY(0);
+    u32 v1 = CRC_ENTRY(1);
+    u32 v7 = CRC_ENTRY(7);
+    if (v0 != 0) { return 1; }
+    if (v1 != 0x77073096) { return 2; }
+    if (v7 != 0x9E6495A3) { return 3; }
+    return 0;
+}

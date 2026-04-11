@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// Comptime array out of bounds
+comptime u32 BAD(u32 i) {
+    u32[2] t;
+    t[0] = 1;
+    t[1] = 2;
+    return t[i];
+}
+
+i32 main() {
+    u32 v = BAD(5);
+    return 0;
+}

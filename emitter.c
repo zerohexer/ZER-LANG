@@ -1370,6 +1370,11 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->call.comptime_struct_init);
                 break;
             }
+            /* Comptime float return — emit double literal */
+            if (node->call.is_comptime_float) {
+                emit(e, "%.17g", node->call.comptime_float_value);
+                break;
+            }
             Type *ct = checker_get_type(e->checker, node);
             if (ct && ct->kind == TYPE_OPTIONAL) {
                 emit(e, "(");

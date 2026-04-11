@@ -1031,6 +1031,16 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Local Function Pointer Init Required (2026-04-12)
+
+Local `void (*cb)(u32)` without initializer → compile error. Auto-zero creates NULL funcptr; calling it segfaults. Must either initialize (`= handler`) or use nullable `?void (*cb)(u32) = null`.
+
+Global funcptrs exempt — commonly assigned in init functions following C convention. Matches existing `*T` pointer rule (BUG-239/253).
+
+## Division by Zero — Function Call Divisors (2026-04-12)
+
+Forced division guard extended to NODE_CALL divisors. `x / func()` where `func()` has no proven return range (min > 0) → compile error. Developer must store result in variable and add zero-guard. Proven nonzero return functions (via `find_return_range`) pass without error.
+
 ## Comptime Enum Values (2026-04-11)
 
 `Color.red` resolves to the enum variant's integer value at compile time.

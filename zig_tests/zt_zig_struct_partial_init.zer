@@ -1,0 +1,18 @@
+// Translated from: zig/test/behavior/struct.zig — "default struct initialization fields"
+// Zig: const S = struct { a: i32 = 1234, b: i32 };
+// ZER: no default values, but partial init zeros unmentioned fields
+
+struct Config { u32 a; u32 b; u32 c; }
+
+i32 main() {
+    Config x = { .b = 5 };
+    if (x.a != 0) { return 1; }
+    if (x.b != 5) { return 2; }
+    if (x.c != 0) { return 3; }
+
+    Config y = { .a = 100, .c = 300 };
+    if (y.a != 100) { return 4; }
+    if (y.b != 0) { return 5; }
+    if (y.c != 300) { return 6; }
+    return 0;
+}

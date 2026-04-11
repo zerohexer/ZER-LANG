@@ -1,0 +1,10 @@
+// Translated from: zig/test/behavior/struct.zig — "struct initializer"
+// Zig: const val = Val{ .x = 42 };
+
+struct Val { i32 x; }
+
+i32 main() {
+    Val v = { .x = 42 };
+    if (v.x != 42) { return 1; }
+    return 0;
+}

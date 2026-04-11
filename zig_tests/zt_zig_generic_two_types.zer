@@ -1,0 +1,28 @@
+// Translated from: zig/test/behavior/generics.zig — "function with return type type"
+// Zig: fn SmallList(comptime T: type, comptime STATIC_SIZE: usize) type { ... }
+// ZER: container with fixed size (single type param), separate containers for different sizes
+
+container SmallBuf(T) {
+    T[8] prealloc;
+    u32 length;
+}
+
+container LargeBuf(T) {
+    T[64] prealloc;
+    u32 length;
+}
+
+i32 main() {
+    SmallBuf(i32) list1;
+    SmallBuf(i32) list2;
+    list1.length = 10;
+    list2.length = 10;
+    if (list1.length != 10) { return 1; }
+    if (list2.length != 10) { return 2; }
+
+    LargeBuf(u8) big;
+    big.length = 0;
+    big.prealloc[0] = 42;
+    if (big.prealloc[0] != 42) { return 3; }
+    return 0;
+}

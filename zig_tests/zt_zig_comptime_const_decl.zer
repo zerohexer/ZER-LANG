@@ -1,0 +1,19 @@
+// Translated from: zig/test/behavior/generics.zig — "const decls in struct"
+// Zig: fn GenericDataThing(comptime count: isize) type { return struct { const count_plus_one = count + 1; }; }
+// ZER: comptime function with arithmetic on params
+
+comptime u32 COUNT_PLUS_ONE(u32 count) {
+    return count + 1;
+}
+
+comptime u32 DOUBLED(u32 x) {
+    return x * 2;
+}
+
+i32 main() {
+    u32 v = COUNT_PLUS_ONE(3);
+    if (v != 4) { return 1; }
+    u32 d = DOUBLED(COUNT_PLUS_ONE(5));
+    if (d != 12) { return 2; }
+    return 0;
+}

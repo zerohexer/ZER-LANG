@@ -1,0 +1,18 @@
+// Translated from: zig/test/behavior/struct.zig — "struct byval assign"
+// Zig: foo2 = foo1; (struct copy by value)
+
+struct Foo { i32 a; i32 b; }
+
+i32 main() {
+    Foo foo1;
+    Foo foo2;
+    foo1.a = 1234;
+    foo1.b = 5678;
+    foo2.a = 0;
+    foo2.b = 0;
+    if (foo2.a != 0) { return 1; }
+    foo2 = foo1;
+    if (foo2.a != 1234) { return 2; }
+    if (foo2.b != 5678) { return 3; }
+    return 0;
+}

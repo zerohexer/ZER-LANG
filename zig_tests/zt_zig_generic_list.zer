@@ -1,0 +1,18 @@
+// Translated from: zig/test/behavior/generics.zig — "type constructed by comptime function call"
+// Zig: fn SimpleList(comptime L: usize) type { return struct { array: [L]T }; }
+// ZER: container with fixed array field (size param not supported yet — use concrete size)
+
+container FixedList(T) {
+    T[10] array;
+}
+
+i32 main() {
+    FixedList(u8) l;
+    l.array[0] = 10;
+    l.array[1] = 11;
+    l.array[2] = 12;
+    if (l.array[0] != 10) { return 1; }
+    if (l.array[1] != 11) { return 2; }
+    if (l.array[2] != 12) { return 3; }
+    return 0;
+}

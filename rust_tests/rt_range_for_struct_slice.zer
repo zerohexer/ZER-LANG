@@ -1,0 +1,21 @@
+// Range-based for over struct slice — access fields of each element.
+
+struct Sensor { u32 id; u32 val; }
+
+i32 main() {
+    Sensor[3] sensors;
+    sensors[0].id = 1; sensors[0].val = 100;
+    sensors[1].id = 2; sensors[1].val = 200;
+    sensors[2].id = 3; sensors[2].val = 300;
+
+    [*]Sensor s = sensors;
+    u32 total_val = 0;
+    u32 total_id = 0;
+    for (Sensor item in s) {
+        total_val += item.val;
+        total_id += item.id;
+    }
+    if (total_val != 600) { return 1; }
+    if (total_id != 6) { return 2; }
+    return 0;
+}

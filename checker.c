@@ -1394,9 +1394,49 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
                         int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, locals, local_count);
                         if (cond == CONST_EVAL_FAIL || !cond) break;
                     }
-                    /* execute body */
-                    int64_t r = eval_comptime_block(stmt->for_stmt.body, locals, local_count);
-                    if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    /* execute body — inline walk to share locals (not copy) */
+                    Node *fbody = stmt->for_stmt.body;
+                    if (fbody && fbody->kind == NODE_BLOCK) {
+                        bool body_returned = false;
+                        for (int bi = 0; bi < fbody->block.stmt_count; bi++) {
+                            Node *bs = fbody->block.stmts[bi];
+                            if (bs->kind == NODE_RETURN) {
+                                int64_t rv = eval_const_expr_subst(bs->ret.expr, locals, local_count);
+                                if (rv != CONST_EVAL_FAIL) { result = rv; goto ct_done; }
+                            }
+                            /* Assignment in body: total += i */
+                            if (bs->kind == NODE_EXPR_STMT && bs->expr_stmt.expr &&
+                                bs->expr_stmt.expr->kind == NODE_ASSIGN &&
+                                bs->expr_stmt.expr->assign.target->kind == NODE_IDENT) {
+                                Node *ba = bs->expr_stmt.expr;
+                                const char *bn = ba->assign.target->ident.name;
+                                uint32_t bl = (uint32_t)ba->assign.target->ident.name_len;
+                                int64_t brhs = eval_const_expr_subst(ba->assign.value, locals, local_count);
+                                if (brhs == CONST_EVAL_FAIL) CT_FAIL();
+                                int64_t bcur = 0;
+                                for (int bk = 0; bk < local_count; bk++) {
+                                    if (locals[bk].name_len == bl && memcmp(locals[bk].name, bn, bl) == 0) {
+                                        bcur = locals[bk].value; break;
+                                    }
+                                }
+                                int64_t bnv;
+                                switch (ba->assign.op) {
+                                case TOK_EQ:       bnv = brhs; break;
+                                case TOK_PLUSEQ:   bnv = bcur + brhs; break;
+                                case TOK_MINUSEQ:  bnv = bcur - brhs; break;
+                                case TOK_STAREQ:   bnv = bcur * brhs; break;
+                                default: bnv = brhs; break;
+                                }
+                                CT_ADD_LOCAL(bn, bl, bnv);
+                            }
+                            /* Var decl in body */
+                            if (bs->kind == NODE_VAR_DECL && bs->var_decl.init) {
+                                int64_t bv = eval_const_expr_subst(bs->var_decl.init, locals, local_count);
+                                if (bv == CONST_EVAL_FAIL) CT_FAIL();
+                                CT_ADD_LOCAL(bs->var_decl.name, bs->var_decl.name_len, bv);
+                            }
+                        }
+                    }
                     /* step (e.g., i += 1) — handle as assignment */
                     if (stmt->for_stmt.step && stmt->for_stmt.step->kind == NODE_ASSIGN &&
                         stmt->for_stmt.step->assign.target->kind == NODE_IDENT) {
@@ -1429,8 +1469,46 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
                 for (int iter = 0; iter < 10000; iter++) {
                     int64_t cond = eval_const_expr_subst(stmt->while_stmt.cond, locals, local_count);
                     if (cond == CONST_EVAL_FAIL || !cond) break;
-                    int64_t r = eval_comptime_block(stmt->while_stmt.body, locals, local_count);
-                    if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    /* inline body walk — share locals (same as for loop) */
+                    Node *wbody = stmt->while_stmt.body;
+                    if (wbody && wbody->kind == NODE_BLOCK) {
+                        for (int bi = 0; bi < wbody->block.stmt_count; bi++) {
+                            Node *bs = wbody->block.stmts[bi];
+                            if (bs->kind == NODE_RETURN) {
+                                int64_t rv = eval_const_expr_subst(bs->ret.expr, locals, local_count);
+                                if (rv != CONST_EVAL_FAIL) { result = rv; goto ct_done; }
+                            }
+                            if (bs->kind == NODE_EXPR_STMT && bs->expr_stmt.expr &&
+                                bs->expr_stmt.expr->kind == NODE_ASSIGN &&
+                                bs->expr_stmt.expr->assign.target->kind == NODE_IDENT) {
+                                Node *ba = bs->expr_stmt.expr;
+                                const char *bn = ba->assign.target->ident.name;
+                                uint32_t bl = (uint32_t)ba->assign.target->ident.name_len;
+                                int64_t brhs = eval_const_expr_subst(ba->assign.value, locals, local_count);
+                                if (brhs == CONST_EVAL_FAIL) CT_FAIL();
+                                int64_t bcur = 0;
+                                for (int bk = 0; bk < local_count; bk++) {
+                                    if (locals[bk].name_len == bl && memcmp(locals[bk].name, bn, bl) == 0) {
+                                        bcur = locals[bk].value; break;
+                                    }
+                                }
+                                int64_t bnv;
+                                switch (ba->assign.op) {
+                                case TOK_EQ:       bnv = brhs; break;
+                                case TOK_PLUSEQ:   bnv = bcur + brhs; break;
+                                case TOK_MINUSEQ:  bnv = bcur - brhs; break;
+                                case TOK_STAREQ:   bnv = bcur * brhs; break;
+                                default: bnv = brhs; break;
+                                }
+                                CT_ADD_LOCAL(bn, bl, bnv);
+                            }
+                            if (bs->kind == NODE_VAR_DECL && bs->var_decl.init) {
+                                int64_t bv = eval_const_expr_subst(bs->var_decl.init, locals, local_count);
+                                if (bv == CONST_EVAL_FAIL) CT_FAIL();
+                                CT_ADD_LOCAL(bs->var_decl.name, bs->var_decl.name_len, bv);
+                            }
+                        }
+                    }
                 }
                 continue;
             }

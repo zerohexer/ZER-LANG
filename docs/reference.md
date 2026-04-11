@@ -765,6 +765,42 @@ while (running) {
 
 ---
 
+### do-while
+
+**DESCRIPTION**
+Execute body at least once, then check condition. C-style `do { } while (cond);`.
+
+**SYNTAX**
+```zer
+do {
+    val = read_register();
+} while (val & BUSY_FLAG);
+```
+
+**NOTES**
+- Braces required around body.
+- `break` and `continue` work as expected.
+
+---
+
+### for (range-based)
+
+**DESCRIPTION**
+Iterate over slice elements. `in` is a contextual keyword (not reserved).
+
+**SYNTAX**
+```zer
+for (u32 item in data_slice) {
+    process(item);
+}
+```
+
+**NOTES**
+- Collection must be a variable or field access — function calls rejected at parse time.
+- Desugars to indexed for loop with bounds-checked access.
+
+---
+
 ### switch
 
 **DESCRIPTION**
@@ -1890,6 +1926,109 @@ comptime if (DEBUG) {
     void log([*]u8 msg) { }    // no-op in release
 }
 ```
+
+---
+
+### static_assert
+
+**DESCRIPTION**
+Compile-time assertion. Condition must evaluate to a compile-time constant. False → compile error with optional message.
+
+**SYNTAX**
+```zer
+static_assert(SIZE > 0, "size must be positive");
+static_assert(Color.red == 0);
+```
+
+---
+
+### Comptime Advanced Features
+
+**DESCRIPTION**
+Comptime functions support: local variables, loops (for/while), switch, arrays, struct return, float arithmetic, and enum values.
+
+**SYNTAX**
+```zer
+// Locals and loops
+comptime u32 SUM(u32 n) {
+    u32 total = 0;
+    for (u32 i = 0; i <= n; i += 1) { total += i; }
+    return total;
+}
+
+// Array indexing
+comptime u32 LUT(u32 i) {
+    u32[4] t;
+    t[0] = 10; t[1] = 20; t[2] = 30; t[3] = 40;
+    return t[i];
+}
+
+// Struct return
+comptime Point ORIGIN() { return { .x = 0, .y = 0 }; }
+
+// Float arithmetic
+comptime f64 DEG_TO_RAD(f64 deg) { return deg * 3.14159 / 180.0; }
+
+// Enum values (compile-time evaluable)
+static_assert(Color.red == 0, "red is 0");
+```
+
+---
+
+### Designated Initializers
+
+**DESCRIPTION**
+Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, and return.
+
+**SYNTAX**
+```zer
+Point p = { .x = 10, .y = 20 };
+p = { .x = 100, .y = 200 };
+func({ .x = 1, .y = 2 });
+Point make() { return { .x = 0, .y = 0 }; }
+```
+
+---
+
+### container — Parameterized Struct
+
+**DESCRIPTION**
+User-defined parameterized struct template. Stamps concrete struct per type argument (monomorphization). No methods — use free functions.
+
+**SYNTAX**
+```zer
+container Stack(T) {
+    T[64] data;
+    u32 top;
+}
+
+Stack(u32) s;
+void stack_push(*Stack(u32) s, u32 val) {
+    s.data[s.top] = val;
+    s.top += 1;
+}
+```
+
+**NOTES**
+- T substitution works in: T, *T, ?T, []T, T[N] field types.
+- Instances cached — same `Stack(u32)` reuses cached stamp.
+- NOT generics — no type constraints, no SFINAE.
+
+---
+
+### --stack-limit N
+
+**DESCRIPTION**
+Compile error when estimated stack usage exceeds N bytes. Checks per-function frame size and entry-point call chain depth.
+
+**SYNTAX**
+```
+zerc main.zer --run --stack-limit 2048
+```
+
+**NOTES**
+- Recursive functions get warning (can't compute max depth).
+- Function pointer calls with unknown target → error with --stack-limit (can't verify depth).
 
 ---
 

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Rust borrowck-move-error-with-note: move from borrowed reference.
+// Cannot move out of type that implements Drop → ZER: free handle then use = UAF.
+
+struct Entry { u32 key; u32 val; }
+Pool(Entry, 4) pool;
+
+i32 main() {
+    ?Handle(Entry) mh = pool.alloc();
+    Handle(Entry) h = mh orelse return;
+    pool.get(h).key = 1;
+    pool.get(h).val = 42;
+
+    // "Move" — free the handle
+    pool.free(h);
+
+    // Try to use after move/free — UAF
+    u32 k = pool.get(h).key;
+    return 0;
+}

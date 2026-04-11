@@ -1,0 +1,21 @@
+// Rust drop-on-empty-block-exit: Drop fires when value leaves scope of empty block.
+// Source: tests/ui/drop/drop-on-empty-block-exit.rs
+// ZER: defer fires when scope exits, even for trivial blocks.
+
+struct Wrapper { u32 val; }
+Pool(Wrapper, 4) pool;
+
+i32 main() {
+    u32 result = 0;
+    {
+        ?Handle(Wrapper) mh = pool.alloc();
+        Handle(Wrapper) h = mh orelse return;
+        defer pool.free(h);
+        pool.get(h).val = 10;
+        result = h.val;
+        // block exits — defer fires, h freed
+    }
+    // h no longer in scope — result captured before defer
+    if (result != 10) { return 1; }
+    return 0;
+}

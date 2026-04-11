@@ -1,0 +1,26 @@
+// Rust borrowck-reborrow-from-mut: borrow_both_mut — borrow two DIFFERENT fields is OK.
+// Source: tests/ui/borrowck/borrowck-reborrow-from-mut.rs (borrow_both_mut function)
+// ZER: access bar1.int1 and bar2.int2 independently — safe.
+
+struct Bar { u32 int1; u32 int2; }
+struct Foo { Bar bar1; Bar bar2; }
+
+i32 main() {
+    Foo f;
+    f.bar1.int1 = 10;
+    f.bar1.int2 = 20;
+    f.bar2.int1 = 30;
+    f.bar2.int2 = 40;
+
+    // Access different sub-fields — independent, safe
+    u32 a = f.bar1.int1;
+    u32 b = f.bar2.int2;
+    if (a != 10) { return 1; }
+    if (b != 40) { return 2; }
+
+    // Modify one, read other — still independent
+    f.bar1.int1 = 100;
+    if (f.bar2.int2 != 40) { return 3; }
+    if (f.bar1.int1 != 100) { return 4; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Rust unsafe: out-of-bounds MMIO access — UB in C, caught at compile time in ZER.
+// ZER: constant index exceeds mmio range → compile error.
+
+mmio 0x40020000..0x4002001F;
+
+i32 main() {
+    volatile *u32 base = @inttoptr(*u32, 0x40020000);
+    // Range is 0x20 bytes = 8 u32 slots (indices 0..7)
+    u32 val = base[8];   // index 8 = out of range → compile error
+    return 0;
+}

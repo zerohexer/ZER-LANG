@@ -1,0 +1,21 @@
+// Rust const-err-multi: -i8::MIN overflows (128 doesn't fit in i8).
+// Source: tests/ui/consts/const-err-multi.rs
+// ZER: overflow wraps — -(-128) wraps to -128 for i8 (defined, not UB).
+
+i32 main() {
+    i8 min = (i8)-128;
+    i8 neg = (i8)0 - min;   // 0 - (-128) = 128 → wraps to -128
+    if (neg != (i8)-128) { return 1; }
+
+    // u8: 255 + 1 wraps to 0
+    u8 max = 255;
+    u8 over = max + 1;
+    if (over != 0) { return 2; }
+
+    // i32: MAX + 1 wraps to MIN
+    i32 imax = 2147483647;
+    i32 iover = imax + 1;
+    if (iover != (i32)-2147483648) { return 3; }
+
+    return 0;
+}

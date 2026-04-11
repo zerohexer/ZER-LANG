@@ -208,13 +208,56 @@ Any future changes to orelse must update ALL THREE paths consistently. Check `is
 - All `optional.inner->kind == TYPE_VOID` checks wrapped with `type_unwrap_distinct()` (14 sites in emitter + 1 in checker). Same for `pointer.inner->kind == TYPE_OPAQUE` (6 sites in emitter).
 - Optional null init changed from `{ {0} }` to `{ 0, 0 }` (6 sites) — eliminates GCC "braces around scalar initializer" warning.
 
-### Comptime Local Variables (2026-04-11)
+### Comptime Evaluator Architecture (2026-04-11)
 
-`eval_comptime_block` now handles `NODE_VAR_DECL` as local bindings:
-```zer
-comptime u32 COMPUTE() { u32 x = 4; u32 y = x * 3; return y + 1; } // → 13
+The comptime evaluator is a compile-time interpreter for `comptime` function bodies. It evaluates to a single `int64_t` constant.
+
+**Entry points (3 call sites in checker.c):**
+1. `check_expr` NODE_CALL handler (line ~3575) — resolves comptime call during expression type checking
+2. `eval_comptime_call_subst` (line ~1013) — resolves nested comptime calls from within `eval_const_expr_subst`
+3. `checker_check_bodies` NODE_STATIC_ASSERT handler — resolves comptime calls in static_assert conditions
+
+**Call chain:** `check_expr(NODE_CALL)` → `eval_comptime_block(body, params, count)` → walks statements.
+
+**`eval_comptime_block` handles:**
+- `NODE_VAR_DECL` — evaluate init, add `{name, value}` to locals array
+- `NODE_EXPR_STMT(NODE_ASSIGN)` — update existing binding (compound: `+=`, `-=`, `*=`, etc.)
+- `NODE_FOR` — init + condition + body + step, max 10000 iterations
+- `NODE_WHILE` — condition + body, max 10000 iterations
+- `NODE_SWITCH` — evaluate expr, match arms, execute matching body
+- `NODE_RETURN` — evaluate expression, return value
+- `NODE_IF` — conditional branching (delegates to `eval_comptime_stmt`)
+- `NODE_BLOCK` — recursive walk
+
+**CRITICAL: Loop body shares locals (not copies).**
+`eval_comptime_block` normally COPIES the locals array on entry (to scope variables). But for/while loop bodies must SHARE the outer locals to allow mutations (`total += i`). Loop body statements are walked INLINE within the for/while handler, not via recursive `eval_comptime_block` call. This was a bug found in this session — `eval_comptime_block` copy semantics broke loop variable mutation.
+
+**Bindings: `ComptimeParam` array.**
+Stack-first [8] with malloc+double overflow. `CT_ADD_LOCAL(name, len, val)` macro adds or updates. No fixed limit on locals.
+
+**`eval_const_expr_subst` vs `eval_const_expr_scoped`:**
+- `eval_const_expr_subst(expr, params, count)` — evaluates expression with parameter substitution. Used inside comptime evaluator.
+- `eval_const_expr_scoped(checker, expr)` — evaluates via `eval_const_expr_ex` with const ident resolver callback. Used by static_assert and array size evaluation.
+- For static_assert with comptime calls: `check_expr` must run FIRST to set `call.is_comptime_resolved`, then `eval_const_expr_scoped` reads `call.comptime_value`.
+
+**Debugging comptime issues:**
+1. Check if `is_comptime_resolved` is set on the NODE_CALL after `check_expr`
+2. Check if `eval_comptime_block` returns CONST_EVAL_FAIL — trace which statement fails
+3. For loops: verify locals are shared (not copied) between iterations
+4. For top-level static_assert: verify `check_expr` runs before `eval_const_expr_scoped`
+
+### static_assert (2026-04-11)
+
+New keyword: `static_assert(expr, "message");` — compile-time assertion. Handled as NODE_STATIC_ASSERT. Checker evaluates condition via `check_expr` + `eval_const_expr_scoped`. False → compile error. Emitter emits nothing.
+
+### Range-based for (2026-04-11)
+
+`for (Type item in slice) { body }` — parser desugars to:
+```c
+for (usize __ri = 0; __ri < slice.len; __ri += 1) { Type item = slice[__ri]; body }
 ```
-Implementation: stack-first `ComptimeParam[8]` array with malloc+double on overflow (no fixed limit). Each var_decl evaluates init expression via `eval_const_expr_subst`, adds `{name, value}` to bindings, continues to next statement. NODE_RETURN evaluates with all bindings available. Same dynamic pattern as parser arrays (RF9).
+`in` is a contextual keyword (only detected in for-loop context, not reserved).
+Known limitation: `collection` expression reused in 3 AST positions — side-effectful expressions evaluated 3 times. Use a variable for complex expressions.
 
 ### Comptime Call In-Place Conversion (BUG-402/403/404, 2026-04-05)
 

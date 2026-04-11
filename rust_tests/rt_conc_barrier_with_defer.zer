@@ -1,0 +1,44 @@
+// Rust: Barrier + resource cleanup — Drop fires after barrier sync.
+// ZER: Barrier sync point + defer cleanup. Resource alive during sync.
+
+struct Res { u32 val; }
+Pool(Res, 8) pool;
+Barrier bar;
+
+shared struct Sum { u32 total; }
+Sum g;
+
+void sync_worker(*Sum s) {
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).val = 10;
+
+    @barrier_wait(bar);
+    // All threads past barrier — resource still alive via defer
+    s.total += h.val;
+}
+
+i32 main() {
+    g.total = 0;
+    @barrier_init(bar, 3);
+
+    ThreadHandle t1 = spawn sync_worker(&g);
+    ThreadHandle t2 = spawn sync_worker(&g);
+
+    // Main is 3rd participant
+    ?Handle(Res) mh = pool.alloc();
+    Handle(Res) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).val = 10;
+
+    @barrier_wait(bar);
+    g.total += h.val;
+
+    t1.join();
+    t2.join();
+
+    // 3 threads × 10 = 30
+    if (g.total != 30) { return 1; }
+    return 0;
+}

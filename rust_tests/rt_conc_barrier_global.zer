@@ -1,0 +1,29 @@
+// Rust: static Barrier — global sync point shared across functions.
+// ZER: Barrier as global variable — accessible from multiple functions.
+
+Barrier g_bar;
+
+shared struct Status { u32 ready_count; }
+Status g_status;
+
+void signal_ready(*Status s) {
+    s.ready_count += 1;
+    @barrier_wait(g_bar);
+}
+
+i32 main() {
+    g_status.ready_count = 0;
+    @barrier_init(g_bar, 3);
+
+    ThreadHandle t1 = spawn signal_ready(&g_status);
+    ThreadHandle t2 = spawn signal_ready(&g_status);
+
+    g_status.ready_count += 1;
+    @barrier_wait(g_bar);
+
+    t1.join();
+    t2.join();
+
+    if (g_status.ready_count != 3) { return 1; }
+    return 0;
+}

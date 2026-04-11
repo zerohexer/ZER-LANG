@@ -1,0 +1,36 @@
+// Rust: Barrier::new(4) — 4 threads sync at barrier point.
+// ZER: 4 threads + main, barrier count 4.
+
+shared struct Work { u32 phase1; u32 phase2; }
+Work g;
+Barrier bar;
+
+void worker(*Work w) {
+    w.phase1 += 1;
+    @barrier_wait(bar);
+    // All threads completed phase1 before any starts phase2
+    w.phase2 += 1;
+}
+
+i32 main() {
+    g.phase1 = 0;
+    g.phase2 = 0;
+    @barrier_init(bar, 4);
+
+    ThreadHandle t1 = spawn worker(&g);
+    ThreadHandle t2 = spawn worker(&g);
+    ThreadHandle t3 = spawn worker(&g);
+
+    // Main is the 4th participant
+    g.phase1 += 1;
+    @barrier_wait(bar);
+    g.phase2 += 1;
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    if (g.phase1 != 4) { return 1; }
+    if (g.phase2 != 4) { return 2; }
+    return 0;
+}

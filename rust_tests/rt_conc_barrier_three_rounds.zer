@@ -1,0 +1,43 @@
+// Rust: Barrier reused across 3 phases — same barrier, multiple wait calls.
+// ZER: Barrier supports multiple rounds — counter resets after all arrive.
+
+shared struct Phases { u32 p1; u32 p2; u32 p3; }
+Phases g;
+Barrier bar;
+
+void phased_worker(*Phases p) {
+    p.p1 += 1;
+    @barrier_wait(bar);
+    p.p2 += 1;
+    @barrier_wait(bar);
+    p.p3 += 1;
+    @barrier_wait(bar);
+}
+
+i32 main() {
+    g.p1 = 0;
+    g.p2 = 0;
+    g.p3 = 0;
+    @barrier_init(bar, 2);
+
+    ThreadHandle t = spawn phased_worker(&g);
+
+    g.p1 += 1;
+    @barrier_wait(bar);
+    // Phase 1 complete — both threads incremented p1
+
+    g.p2 += 1;
+    @barrier_wait(bar);
+    // Phase 2 complete
+
+    g.p3 += 1;
+    @barrier_wait(bar);
+    // Phase 3 complete
+
+    t.join();
+
+    if (g.p1 != 2) { return 1; }
+    if (g.p2 != 2) { return 2; }
+    if (g.p3 != 2) { return 3; }
+    return 0;
+}

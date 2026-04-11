@@ -1050,10 +1050,23 @@ Pool, Slab, Ring alloc/free/push/pop have non-atomic metadata access. Accessing 
 ### Container Monomorphization Depth Limit (V6)
 `_container_depth` static counter in TYNODE_CONTAINER resolution. Cap: 32. Prevents compiler hang/crash from self-referential containers like `container Node(T) { ?*Node(T) next; }`. Also: `subst_typenode()` recursive TypeNode substitution replaces 5 one-level pattern matches — handles T at any nesting depth (`?*Container(T)`, `[]*T`, etc.).
 
-### Already Caught (V2, V7, V8)
+### Move Struct Value Capture Banned (V13)
+`if (opt) |k|` where unwrapped type is move struct → compile error. Value capture copies the move struct, creating two owners. Fix: checker detects `should_track_move(unwrapped)` in non-pointer capture path of if-unwrap, forces `|*k|` pointer capture instead.
+
+### Async Shared Struct Access Banned (V14)
+Shared struct field access inside async function body → compile error. Lock acquired by auto-locking may be held across yield/await = deadlock. `c->in_async` flag set during async function body check. Same approach as Rust (MutexGuard not Send across .await).
+
+### Already Caught (V2, V7, V8, V12, V15, V16)
 - V2: Union mutation via *opaque inside switch arm → "cannot take address of union inside switch arm"
 - V7: Union containing move struct → "cannot read union variant directly — must use switch"
 - V8: @ptrtoint(&local) returned → "cannot return @ptrtoint of local" (fixed earlier this session)
+- V12: Container type-id collision → each stamp gets unique `c->next_type_id++`, @ptrcast catches mismatch
+- V15: Comptime @ptrtoint → eval fails (can't resolve pointer addresses at compile time)
+- V16: Move struct partial field access → zercheck marks entire struct as HS_TRANSFERRED, any field access errors
+
+### Not Bugs (V9, V11)
+- V9: Async defer bypass → NOT a bug, defer fires correctly on async completion (Duff's device handles it)
+- V11: Same-type instance deadlock → NOT a real deadlock. Per-statement locking means locks never overlap. Atomicity concern is design limitation (use single shared struct for atomic multi-field ops)
 
 ## Local Function Pointer Init Required (2026-04-12)
 

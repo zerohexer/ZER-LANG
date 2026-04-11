@@ -2275,17 +2275,6 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (sym && sym->is_const) {
                         result->pointer.is_const = true;
                     }
-                    /* Red Team V26: ban &move_struct — pointer bypasses ownership tracking.
-                     * move struct must be passed by value (transfers ownership). */
-                    if (sym && sym->type) {
-                        Type *st = type_unwrap_distinct(sym->type);
-                        if (st->kind == TYPE_STRUCT && st->struct_type.is_move) {
-                            checker_error(c, node->loc.line,
-                                "cannot take address of move struct '%.*s' — "
-                                "pointer would bypass ownership tracking. Pass by value instead",
-                                (int)sym->name_len, sym->name);
-                        }
-                    }
                     /* BUG-208: block &union_var inside mutable capture arm. */
                     if (c->union_switch_var &&
                         root->ident.name_len == c->union_switch_var_len &&

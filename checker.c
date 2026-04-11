@@ -1146,6 +1146,128 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         return type_slab(c->arena, elem);
     }
 
+    case TYNODE_CONTAINER: {
+        /* Container instantiation: Stack(u32) → stamp concrete struct */
+        const char *cname = tn->container.name;
+        uint32_t cnlen = (uint32_t)tn->container.name_len;
+        Type *concrete = resolve_type(c, tn->container.type_arg);
+
+        /* Check cache first */
+        for (int ci = 0; ci < c->container_inst_count; ci++) {
+            if (c->container_instances[ci].tmpl_name_len == cnlen &&
+                memcmp(c->container_instances[ci].tmpl_name, cname, cnlen) == 0 &&
+                type_equals(c->container_instances[ci].concrete_type, concrete)) {
+                return c->container_instances[ci].stamped_struct;
+            }
+        }
+
+        /* Find template */
+        struct ContainerTemplate *tmpl = NULL;
+        for (int ci = 0; ci < c->container_tmpl_count; ci++) {
+            if (c->container_templates[ci].name_len == cnlen &&
+                memcmp(c->container_templates[ci].name, cname, cnlen) == 0) {
+                tmpl = &c->container_templates[ci];
+                break;
+            }
+        }
+        if (!tmpl) {
+            checker_error(c, tn->loc.line, "undefined container '%.*s'", (int)cnlen, cname);
+            return ty_void;
+        }
+
+        /* Stamp: create TYPE_STRUCT with mangled name "Name_ConcreteType" */
+        char mangled[256];
+        const char *ctype_name = type_name(concrete);
+        int mlen = snprintf(mangled, sizeof(mangled), "%.*s_%s", (int)cnlen, cname, ctype_name);
+        char *mname = (char *)arena_alloc(c->arena, mlen + 1);
+        memcpy(mname, mangled, mlen + 1);
+
+        Type *st = (Type *)arena_alloc(c->arena, sizeof(Type));
+        st->kind = TYPE_STRUCT;
+        st->struct_type.name = mname;
+        st->struct_type.name_len = (uint32_t)mlen;
+        st->struct_type.is_packed = false;
+        st->struct_type.is_shared = false;
+        st->struct_type.is_shared_rw = false;
+        st->struct_type.is_move = false;
+        st->struct_type.field_count = (uint32_t)tmpl->field_count;
+        st->struct_type.type_id = c->next_type_id++;
+        st->struct_type.module_prefix = c->current_module;
+        st->struct_type.module_prefix_len = c->current_module_len;
+
+        /* Register in scope so field access works */
+        add_symbol(c, mname, (uint32_t)mlen, st, tn->loc.line);
+
+        /* Resolve fields with T substituted */
+        if (tmpl->field_count > 0) {
+            st->struct_type.fields = (SField *)arena_alloc(c->arena,
+                tmpl->field_count * sizeof(SField));
+            for (int fi = 0; fi < tmpl->field_count; fi++) {
+                FieldDecl *fd = &tmpl->fields[fi];
+                SField *sf = &st->struct_type.fields[fi];
+                sf->name = fd->name;
+                sf->name_len = (uint32_t)fd->name_len;
+                sf->is_keep = false;
+                sf->is_volatile = (fd->type && fd->type->kind == TYNODE_VOLATILE);
+                /* Substitute type param: if field type is TYNODE_NAMED matching T, use concrete */
+                TypeNode *ftn = fd->type;
+                if (ftn && ftn->kind == TYNODE_NAMED &&
+                    ftn->named.name_len == tmpl->type_param_len &&
+                    memcmp(ftn->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
+                    sf->type = concrete;
+                } else if (ftn && ftn->kind == TYNODE_ARRAY && ftn->array.elem &&
+                    ftn->array.elem->kind == TYNODE_NAMED &&
+                    ftn->array.elem->named.name_len == tmpl->type_param_len &&
+                    memcmp(ftn->array.elem->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
+                    /* T[N] → concrete[N] */
+                    int64_t sz = eval_const_expr(ftn->array.size_expr);
+                    sf->type = type_array(c->arena, concrete, sz > 0 ? (uint32_t)sz : 0);
+                } else if (ftn && ftn->kind == TYNODE_POINTER && ftn->pointer.inner &&
+                    ftn->pointer.inner->kind == TYNODE_NAMED &&
+                    ftn->pointer.inner->named.name_len == tmpl->type_param_len &&
+                    memcmp(ftn->pointer.inner->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
+                    /* *T → *concrete */
+                    sf->type = type_pointer(c->arena, concrete);
+                } else if (ftn && ftn->kind == TYNODE_OPTIONAL && ftn->optional.inner &&
+                    ftn->optional.inner->kind == TYNODE_NAMED &&
+                    ftn->optional.inner->named.name_len == tmpl->type_param_len &&
+                    memcmp(ftn->optional.inner->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
+                    /* ?T → ?concrete */
+                    sf->type = type_optional(c->arena, concrete);
+                } else if (ftn && ftn->kind == TYNODE_SLICE && ftn->slice.inner &&
+                    ftn->slice.inner->kind == TYNODE_NAMED &&
+                    ftn->slice.inner->named.name_len == tmpl->type_param_len &&
+                    memcmp(ftn->slice.inner->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
+                    /* []T → []concrete */
+                    sf->type = type_slice(c->arena, concrete);
+                } else {
+                    /* No substitution needed — resolve normally */
+                    sf->type = resolve_type(c, ftn);
+                }
+            }
+        } else {
+            st->struct_type.fields = NULL;
+        }
+
+        /* Cache the instance */
+        if (c->container_inst_count >= c->container_inst_capacity) {
+            int nc = c->container_inst_capacity < 8 ? 8 : c->container_inst_capacity * 2;
+            struct ContainerInstance *na = (struct ContainerInstance *)arena_alloc(c->arena,
+                nc * sizeof(struct ContainerInstance));
+            if (c->container_instances && c->container_inst_count > 0)
+                memcpy(na, c->container_instances, c->container_inst_count * sizeof(struct ContainerInstance));
+            c->container_instances = na;
+            c->container_inst_capacity = nc;
+        }
+        struct ContainerInstance *ci = &c->container_instances[c->container_inst_count++];
+        ci->tmpl_name = cname;
+        ci->tmpl_name_len = cnlen;
+        ci->concrete_type = concrete;
+        ci->stamped_struct = st;
+
+        return st;
+    }
+
     case TYNODE_FUNC_PTR: {
         Type *ret = resolve_type(c, tn->func_ptr.return_type);
         uint32_t pc = (uint32_t)tn->func_ptr.param_count;
@@ -7493,6 +7615,27 @@ static void register_decl(Checker *c, Node *node) {
         break;
     }
 
+    case NODE_CONTAINER_DECL: {
+        /* Store container template — stamped on use via TYNODE_CONTAINER */
+        if (c->container_tmpl_count >= c->container_tmpl_capacity) {
+            int nc = c->container_tmpl_capacity < 8 ? 8 : c->container_tmpl_capacity * 2;
+            struct ContainerTemplate *na = (struct ContainerTemplate *)arena_alloc(c->arena,
+                nc * sizeof(struct ContainerTemplate));
+            if (c->container_templates && c->container_tmpl_count > 0)
+                memcpy(na, c->container_templates, c->container_tmpl_count * sizeof(struct ContainerTemplate));
+            c->container_templates = na;
+            c->container_tmpl_capacity = nc;
+        }
+        struct ContainerTemplate *ct = &c->container_templates[c->container_tmpl_count++];
+        ct->name = node->container_decl.name;
+        ct->name_len = (uint32_t)node->container_decl.name_len;
+        ct->type_param = node->container_decl.type_param;
+        ct->type_param_len = (uint32_t)node->container_decl.type_param_len;
+        ct->fields = node->container_decl.fields;
+        ct->field_count = node->container_decl.field_count;
+        break;
+    }
+
     default:
         break;
     }
@@ -7546,7 +7689,7 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     /* Nodes that cannot contain labels */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
     case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
-    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
     case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
@@ -7608,7 +7751,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     /* Nodes that cannot contain goto */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
     case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
-    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
     case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
@@ -8252,6 +8395,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_CINCLUDE:
     case NODE_INTERRUPT:
     case NODE_MMIO:
+    case NODE_CONTAINER_DECL:
     case NODE_GLOBAL_VAR:
     case NODE_STATIC_ASSERT:
         break;

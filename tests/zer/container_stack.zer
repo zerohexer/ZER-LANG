@@ -1,0 +1,49 @@
+// Container keyword: parameterized struct stamping (monomorphization)
+
+struct Point { i32 x; i32 y; }
+
+container Stack(T) {
+    T[64] data;
+    u32 top;
+}
+
+container Pair(T) {
+    T first;
+    T second;
+}
+
+void stack_push(*Stack(u32) s, u32 val) {
+    s.data[s.top] = val;
+    s.top += 1;
+}
+
+u32 stack_peek(*Stack(u32) s) {
+    return s.data[s.top - 1];
+}
+
+i32 main() {
+    // Stack(u32) — stamps concrete struct Stack_u32
+    Stack(u32) s;
+    s.top = 0;
+    stack_push(&s, 10);
+    stack_push(&s, 20);
+    stack_push(&s, 30);
+    if (s.top != 3) { return 1; }
+    if (stack_peek(&s) != 30) { return 2; }
+    if (s.data[0] != 10) { return 3; }
+
+    // Pair(u32) — different container, same type param
+    Pair(u32) nums;
+    nums.first = 100;
+    nums.second = 200;
+    if (nums.first + nums.second != 300) { return 4; }
+
+    // Pair(Point) — same container, struct type param
+    Pair(Point) pts;
+    pts.first = { .x = 1, .y = 2 };
+    pts.second = { .x = 3, .y = 4 };
+    if (pts.first.x + pts.second.x != 4) { return 5; }
+    if (pts.first.y + pts.second.y != 6) { return 6; }
+
+    return 0;
+}

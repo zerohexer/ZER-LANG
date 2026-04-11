@@ -110,7 +110,8 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_CAST:         return "CAST";
     case NODE_TYPECAST:     return "TYPECAST";
     case NODE_SIZEOF:       return "SIZEOF";
-    case NODE_STRUCT_INIT:  return "STRUCT_INIT";
+    case NODE_STRUCT_INIT:     return "STRUCT_INIT";
+    case NODE_CONTAINER_DECL:  return "CONTAINER_DECL";
     case NODE_CINCLUDE:     return "CINCLUDE";
     }
     return "UNKNOWN";

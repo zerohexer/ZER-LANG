@@ -349,9 +349,30 @@ static TypeNode *parse_base_type(Parser *p) {
 
     case TOK_IDENT: {
         advance(p);
+        const char *id_name = tok_text(&p->previous);
+        size_t id_len = tok_len(&p->previous);
+        /* Container instantiation: Name(Type) — e.g., Stack(u32) */
+        if (check(p, TOK_LPAREN)) {
+            /* Peek ahead: if ( is followed by a type token or ident, treat as container */
+            Scanner saved = *p->scanner;
+            Token saved_cur = p->current;
+            advance(p); /* consume ( */
+            bool is_container = is_type_token(p->current.type);
+            *p->scanner = saved;
+            p->current = saved_cur;
+            if (is_container) {
+                advance(p); /* consume ( */
+                TypeNode *t = new_type_node(p, TYNODE_CONTAINER);
+                t->container.name = id_name;
+                t->container.name_len = id_len;
+                t->container.type_arg = parse_type(p);
+                consume(p, TOK_RPAREN, "expected ')' after container type argument");
+                return t;
+            }
+        }
         TypeNode *t = new_type_node(p, TYNODE_NAMED);
-        t->named.name = tok_text(&p->previous);
-        t->named.name_len = tok_len(&p->previous);
+        t->named.name = id_name;
+        t->named.name_len = id_len;
         return t;
     }
 
@@ -744,7 +765,10 @@ static Node *parse_primary(Parser *p) {
 
     /* intrinsic: @name(args...) */
     if (match(p, TOK_AT)) {
-        consume(p, TOK_IDENT, "expected intrinsic name after '@'");
+        /* Accept TOK_CONTAINER as intrinsic name — @container is the container_of builtin */
+        if (!match(p, TOK_IDENT) && !match(p, TOK_CONTAINER)) {
+            error(p, "expected intrinsic name after '@'");
+        }
         Node *n = new_node(p, NODE_INTRINSIC);
         n->intrinsic.name = tok_text(&p->previous);
         n->intrinsic.name_len = tok_len(&p->previous);
@@ -1750,12 +1774,29 @@ static Node *parse_statement(Parser *p) {
                 /* after all ] — if IDENT follows, it's an array var decl */
                 is_var = check(p, TOK_IDENT);
             } else if (check(p, TOK_LPAREN)) {
-                /* IDENT ( — could be func ptr type or function call.
-                 * Peek: ( * means function pointer declaration. */
+                /* IDENT ( — could be func ptr type, container type, or function call.
+                 * Peek: ( * means function pointer declaration.
+                 * ( TypeToken ) IDENT means container instantiation: Stack(u32) s; */
                 Scanner saved2 = *p->scanner;
                 Token saved2_cur = p->current;
                 advance(p); /* consume ( */
-                is_var = check(p, TOK_STAR);
+                if (check(p, TOK_STAR)) {
+                    is_var = true; /* function pointer decl */
+                } else if (is_type_token(p->current.type)) {
+                    /* Could be container: Stack(u32) varname
+                     * Skip past type + ) and check if IDENT follows */
+                    bool sv_err = p->had_error;
+                    bool sv_pan = p->panic_mode;
+                    p->had_error = false;
+                    p->panic_mode = true;
+                    parse_type(p);
+                    if (!p->had_error && check(p, TOK_RPAREN)) {
+                        advance(p); /* consume ) */
+                        is_var = check(p, TOK_IDENT);
+                    }
+                    p->had_error = sv_err;
+                    p->panic_mode = sv_pan;
+                }
                 *p->scanner = saved2;
                 p->current = saved2_cur;
             }
@@ -2212,6 +2253,39 @@ static Node *parse_declaration(Parser *p) {
     /* union */
     if (match(p, TOK_UNION))
         return parse_union_decl(p);
+
+    /* container Name(T) { fields } — parameterized struct template */
+    if (match(p, TOK_CONTAINER)) {
+        Node *n = new_node(p, NODE_CONTAINER_DECL);
+        consume(p, TOK_IDENT, "expected container name");
+        n->container_decl.name = tok_text(&p->previous);
+        n->container_decl.name_len = tok_len(&p->previous);
+        consume(p, TOK_LPAREN, "expected '(' after container name");
+        consume(p, TOK_IDENT, "expected type parameter name");
+        n->container_decl.type_param = tok_text(&p->previous);
+        n->container_decl.type_param_len = tok_len(&p->previous);
+        consume(p, TOK_RPAREN, "expected ')' after type parameter");
+        consume(p, TOK_LBRACE, "expected '{' after container declaration");
+        /* Parse fields — same as struct fields */
+        FieldDecl fields[128];
+        int fc = 0;
+        while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+            if (fc >= 128) { error(p, "too many container fields (max 128)"); break; }
+            fields[fc].type = parse_type(p);
+            fields[fc].loc = (SrcLoc){ p->previous.line, NULL };
+            fields[fc].is_keep = false;
+            consume(p, TOK_IDENT, "expected field name");
+            fields[fc].name = tok_text(&p->previous);
+            fields[fc].name_len = tok_len(&p->previous);
+            consume(p, TOK_SEMICOLON, "expected ';' after field");
+            fc++;
+        }
+        consume(p, TOK_RBRACE, "expected '}' after container body");
+        n->container_decl.field_count = fc;
+        n->container_decl.fields = (FieldDecl *)arena_alloc(p->arena, fc * sizeof(FieldDecl));
+        for (int i = 0; i < fc; i++) n->container_decl.fields[i] = fields[i];
+        return n;
+    }
 
     /* typedef / distinct typedef */
     if (match(p, TOK_DISTINCT)) {

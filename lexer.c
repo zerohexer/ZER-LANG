@@ -160,6 +160,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
         if (word_len == 8 && memcmp(word+1, "ontinue", 7) == 0) return TOK_CONTINUE;
         if (word_len == 8 && memcmp(word+1, "include", 7) == 0) return TOK_CINCLUDE;
         if (word_len == 8 && memcmp(word+1, "omptime", 7) == 0) return TOK_COMPTIME;
+        if (word_len == 9 && memcmp(word+1, "ontainer", 8) == 0) return TOK_CONTAINER;
         break;
     case 'd':
         if (word_len == 5 && memcmp(word+1, "efer", 4) == 0) return TOK_DEFER;
@@ -586,6 +587,7 @@ const char *token_type_name(TokenType type) {
     case TOK_ASM: return "asm";
     case TOK_STATIC: return "static";
     case TOK_STATIC_ASSERT: return "static_assert";
+    case TOK_CONTAINER: return "container";
     case TOK_KEEP: return "keep";
     case TOK_AS: return "as";
     case TOK_MMIO: return "mmio";

@@ -4375,18 +4375,20 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
-        /* Red Team V14/V18: ban shared struct access in async functions.
-         * Lock held across yield/await = potential deadlock.
+        /* Red Team V14/V18: shared struct access in async functions.
+         * Only ban if we're inside `c->in_async_yield_stmt` — a statement
+         * that contains yield/await. Shared access in non-yielding statements
+         * is safe (lock acquired and released within same poll call).
          * V18: also check through pointers (*shared_struct).field */
-        if (c->in_async) {
+        if (c->in_async_yield_stmt) {
             Type *check_shared = obj;
             if (check_shared->kind == TYPE_POINTER)
                 check_shared = type_unwrap_distinct(check_shared->pointer.inner);
             if (check_shared->kind == TYPE_STRUCT &&
                 (check_shared->struct_type.is_shared || check_shared->struct_type.is_shared_rw)) {
                 checker_error(c, node->loc.line,
-                    "cannot access shared struct in async function — "
-                    "lock may be held across yield/await, causing deadlock");
+                    "cannot access shared struct in statement containing yield/await — "
+                    "lock would be held across suspension, causing deadlock");
             }
         }
 
@@ -5956,8 +5958,37 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     }
 }
 
+/* Check if an expression tree contains yield or await */
+static bool expr_contains_yield(Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_YIELD || n->kind == NODE_AWAIT) return true;
+    switch (n->kind) {
+    case NODE_BINARY: return expr_contains_yield(n->binary.left) || expr_contains_yield(n->binary.right);
+    case NODE_UNARY: return expr_contains_yield(n->unary.operand);
+    case NODE_CALL:
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (expr_contains_yield(n->call.args[i])) return true;
+        return false;
+    case NODE_ASSIGN: return expr_contains_yield(n->assign.target) || expr_contains_yield(n->assign.value);
+    case NODE_FIELD: return expr_contains_yield(n->field.object);
+    case NODE_INDEX: return expr_contains_yield(n->index_expr.object) || expr_contains_yield(n->index_expr.index);
+    case NODE_ORELSE: return expr_contains_yield(n->orelse.expr);
+    default: return false;
+    }
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
+
+    /* In async functions, set in_async_yield_stmt for statements containing yield/await.
+     * Shared struct access is only banned in these statements (lock held across suspension). */
+    bool saved_yield_stmt = c->in_async_yield_stmt;
+    if (c->in_async && !c->in_async_yield_stmt) {
+        if (node->kind == NODE_EXPR_STMT && expr_contains_yield(node->expr_stmt.expr))
+            c->in_async_yield_stmt = true;
+        else if (node->kind == NODE_VAR_DECL && expr_contains_yield(node->var_decl.init))
+            c->in_async_yield_stmt = true;
+    }
 
     switch (node->kind) {
     case NODE_BLOCK:
@@ -7803,16 +7834,28 @@ static void check_stmt(Checker *c, Node *node) {
                 (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
             break;
         }
-        /* Red Team V23: spawn target must return void — return value is lost.
-         * Move struct or Handle return would leak the resource. */
+        /* Red Team V23: spawn target return type check.
+         * Move struct or Handle return = resource leak (error).
+         * Other non-void return = lost value (warning). */
         if (func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL) {
             Type *ret = resolve_type(c, func_sym->func_node->func_decl.return_type);
             if (ret && ret->kind != TYPE_VOID) {
-                checker_error(c, node->loc.line,
-                    "spawn target '%.*s' returns '%s' — return value would be lost. "
-                    "Use void return type for spawn targets",
-                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
-                    type_name(ret));
+                Type *ret_eff = type_unwrap_distinct(ret);
+                bool is_resource = (ret_eff->kind == TYPE_HANDLE) ||
+                    (ret_eff->kind == TYPE_STRUCT && ret_eff->struct_type.is_move) ||
+                    (ret_eff->kind == TYPE_OPTIONAL && type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE);
+                if (is_resource) {
+                    checker_error(c, node->loc.line,
+                        "spawn target '%.*s' returns '%s' — resource would leak. "
+                        "Use void return type for spawn targets",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        type_name(ret));
+                } else {
+                    checker_warning(c, node->loc.line,
+                        "spawn target '%.*s' returns '%s' — return value lost",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        type_name(ret));
+                }
             }
         }
         bool is_scoped = (node->spawn_stmt.handle_name != NULL);
@@ -7896,6 +7939,7 @@ static void check_stmt(Checker *c, Node *node) {
     default:
         break;
     }
+    c->in_async_yield_stmt = saved_yield_stmt;
 }
 
 /* ================================================================

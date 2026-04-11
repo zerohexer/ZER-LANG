@@ -1,4 +1,3 @@
-// EXPECTED: compile error
 // Async: task updates shared counter (single-threaded, no race)
 
 shared struct SharedCount { u32 n; }

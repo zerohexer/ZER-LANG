@@ -4375,14 +4375,19 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
-        /* Red Team V14: ban shared struct access in async functions.
-         * Lock held across yield/await = potential deadlock. */
-        if (obj->kind == TYPE_STRUCT &&
-            (obj->struct_type.is_shared || obj->struct_type.is_shared_rw) &&
-            c->in_async) {
-            checker_error(c, node->loc.line,
-                "cannot access shared struct in async function — "
-                "lock may be held across yield/await, causing deadlock");
+        /* Red Team V14/V18: ban shared struct access in async functions.
+         * Lock held across yield/await = potential deadlock.
+         * V18: also check through pointers (*shared_struct).field */
+        if (c->in_async) {
+            Type *check_shared = obj;
+            if (check_shared->kind == TYPE_POINTER)
+                check_shared = type_unwrap_distinct(check_shared->pointer.inner);
+            if (check_shared->kind == TYPE_STRUCT &&
+                (check_shared->struct_type.is_shared || check_shared->struct_type.is_shared_rw)) {
+                checker_error(c, node->loc.line,
+                    "cannot access shared struct in async function — "
+                    "lock may be held across yield/await, causing deadlock");
+            }
         }
 
         /* struct field lookup */

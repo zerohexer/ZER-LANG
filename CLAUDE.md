@@ -371,7 +371,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
 | Missing switch case | Exhaustive check for enums and bools |
-| Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns) |
+| Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
@@ -530,7 +530,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 713 Rust-equivalent tests + 36 Zig tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,800+ tests
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 725 Rust-equivalent tests + 36 Zig tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,800+ tests
 - **v0.4:** table-driven compiler architecture, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 

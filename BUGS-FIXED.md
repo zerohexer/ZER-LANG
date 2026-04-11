@@ -3163,3 +3163,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **--stack-limit N:** Per-function frame size + entry-point call chain depth checked against limit. Two separate checks catch different failure modes (big local array vs deep call chain).
 
 **Audit fixes:** `find_comptime_struct_return` was duplicate of `find_comptime_return_expr` — removed (-19 lines). `#include <math.h>` moved from mid-file to top. Missing `-Wswitch` cases for TYNODE_CONTAINER, NODE_CONTAINER_DECL, NODE_DO_WHILE in ast_print fixed.
+
+### @ptrtoint(&local) escape + funcptr indirect recursion (2026-04-12)
+
+**@ptrtoint escape:** Two checks needed — direct `return @ptrtoint(&x)` (no intermediate var, caught in NODE_RETURN) and indirect `usize a = @ptrtoint(&x); return a` (is_local_derived propagation at var-decl, caught by existing return escape check). Initial attempt removed direct check thinking indirect covered both — it doesn't (no var-decl = no symbol to flag). Both checks are complementary, not redundant.
+
+**Funcptr call graph:** scan_frame NODE_CALL now checks TYPE_FUNC_PTR variables. If init was a function ident, adds that function as callee. Enables indirect recursion detection through function pointers.

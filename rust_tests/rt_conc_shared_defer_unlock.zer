@@ -1,0 +1,27 @@
+// Rust: MutexGuard dropped by Drop — auto-unlock.
+// ZER: shared struct auto-unlock per statement. Defer ensures cleanup.
+
+shared struct Session { u32 active; u32 ops; }
+Session g_session;
+
+void do_ops(*Session s) {
+    for (u32 i = 0; i < 50; i += 1) {
+        s.ops += 1;
+    }
+}
+
+u32 run_session() {
+    g_session.active = 1;
+    do_ops(&g_session);
+    g_session.active = 0;
+    return g_session.ops;
+}
+
+i32 main() {
+    g_session.active = 0;
+    g_session.ops = 0;
+    u32 ops = run_session();
+    if (ops != 50) { return 1; }
+    if (g_session.active != 0) { return 2; }
+    return 0;
+}

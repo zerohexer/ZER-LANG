@@ -1,0 +1,29 @@
+// Rust: channel recv on empty — returns None/Err.
+// ZER: Ring pop on empty → returns null (?T with has_value=0).
+
+struct Cmd { u32 code; }
+Ring(Cmd, 4) cmds;
+
+i32 main() {
+    // Pop from empty ring — should return null
+    ?Cmd m = cmds.pop();
+    if (m) |c| { return 1; }
+
+    // Push one, pop one — should work
+    Cmd c;
+    c.code = 42;
+    cmds.push(c);
+
+    ?Cmd m2 = cmds.pop();
+    if (m2) |got| {
+        if (got.code != 42) { return 2; }
+    } else {
+        return 3;
+    }
+
+    // Pop again — empty again
+    ?Cmd m3 = cmds.pop();
+    if (m3) |c2| { return 4; }
+
+    return 0;
+}

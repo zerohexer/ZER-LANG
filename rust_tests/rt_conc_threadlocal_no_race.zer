@@ -1,0 +1,41 @@
+// Rust: thread_local! prevents data races — each thread has own copy.
+// ZER: threadlocal — proves no cross-thread interference.
+
+threadlocal u32 tls_seq;
+
+shared struct Verify { u32 t1_final; u32 t2_final; }
+Verify g_verify;
+
+void thread1(*Verify v) {
+    tls_seq = 0;
+    for (u32 i = 0; i < 100; i += 1) {
+        tls_seq += 1;
+    }
+    v.t1_final = tls_seq;
+}
+
+void thread2(*Verify v) {
+    tls_seq = 0;
+    for (u32 i = 0; i < 200; i += 1) {
+        tls_seq += 1;
+    }
+    v.t2_final = tls_seq;
+}
+
+i32 main() {
+    tls_seq = 0;
+    g_verify.t1_final = 0;
+    g_verify.t2_final = 0;
+
+    ThreadHandle t1 = spawn thread1(&g_verify);
+    ThreadHandle t2 = spawn thread2(&g_verify);
+    t1.join();
+    t2.join();
+
+    // Each thread counted independently
+    if (g_verify.t1_final != 100) { return 1; }
+    if (g_verify.t2_final != 200) { return 2; }
+    // Main thread's tls_seq untouched
+    if (tls_seq != 0) { return 3; }
+    return 0;
+}

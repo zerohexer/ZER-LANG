@@ -1,0 +1,33 @@
+// Rust: Once::call_once from multiple threads — exactly one executes.
+// ZER: @once from multiple threads — atomic CAS ensures single execution.
+
+u32 g_init_count;
+
+shared struct Result { u32 val; }
+Result g_result;
+
+void try_init(*Result r) {
+    @once {
+        g_init_count += 1;
+        r.val = 42;
+    }
+}
+
+i32 main() {
+    g_init_count = 0;
+    g_result.val = 0;
+
+    ThreadHandle t1 = spawn try_init(&g_result);
+    ThreadHandle t2 = spawn try_init(&g_result);
+    ThreadHandle t3 = spawn try_init(&g_result);
+    try_init(&g_result);
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // @once body ran exactly once
+    if (g_init_count != 1) { return 1; }
+    if (g_result.val != 42) { return 2; }
+    return 0;
+}

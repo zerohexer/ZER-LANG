@@ -1,0 +1,32 @@
+// Rust: Barrier reused across multiple rounds of synchronization.
+// ZER: Barrier re-init and reuse for second sync round.
+
+shared struct Acc { u32 round1; u32 round2; }
+Acc g;
+Barrier bar;
+
+void worker(*Acc a) {
+    a.round1 += 1;
+    @barrier_wait(bar);
+    a.round2 += 1;
+    @barrier_wait(bar);
+}
+
+i32 main() {
+    g.round1 = 0;
+    g.round2 = 0;
+    @barrier_init(bar, 2);
+
+    ThreadHandle t = spawn worker(&g);
+    g.round1 += 1;
+    @barrier_wait(bar);
+    // round1 done — both threads incremented
+    g.round2 += 1;
+    @barrier_wait(bar);
+    // round2 done
+    t.join();
+
+    if (g.round1 != 2) { return 1; }
+    if (g.round2 != 2) { return 2; }
+    return 0;
+}

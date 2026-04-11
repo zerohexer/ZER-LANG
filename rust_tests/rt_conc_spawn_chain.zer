@@ -1,0 +1,29 @@
+// Rust: thread spawns another thread — chain of 3 sequential spawns.
+// ZER: scoped spawn in sequence — each waits for previous.
+
+shared struct Chain { u32 depth; }
+Chain g_chain;
+
+void step3(*Chain c) {
+    c.depth += 1;
+}
+
+void step2(*Chain c) {
+    c.depth += 1;
+    ThreadHandle t = spawn step3(c);
+    t.join();
+}
+
+void step1(*Chain c) {
+    c.depth += 1;
+    ThreadHandle t = spawn step2(c);
+    t.join();
+}
+
+i32 main() {
+    g_chain.depth = 0;
+    ThreadHandle t = spawn step1(&g_chain);
+    t.join();
+    if (g_chain.depth != 3) { return 1; }
+    return 0;
+}

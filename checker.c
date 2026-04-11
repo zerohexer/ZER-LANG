@@ -8780,11 +8780,42 @@ static void check_stack_depth(Checker *c, Node *file_node) {
         bool *visited = calloc(c->stack_frame_count, sizeof(bool));
         for (int i = 0; i < c->stack_frame_count; i++) {
             struct StackFrame *f = &c->stack_frames[i];
-            compute_max_depth(c, f, visited, 0);
+            uint32_t max_depth = compute_max_depth(c, f, visited, 0);
             if (f->is_recursive) {
                 checker_warning(c, 0,
                     "function '%.*s' is recursive — unbounded stack growth on embedded",
                     (int)f->name_len, f->name);
+            }
+            /* Stack limit check (like GCC -Wstack-usage=N):
+             * --stack-limit N → error when any function's frame OR
+             * entry point's total call chain exceeds N bytes. */
+            if (c->stack_limit > 0) {
+                /* Per-function frame size check (catches big local arrays) */
+                if (f->frame_size > c->stack_limit) {
+                    checker_error(c, 0,
+                        "function '%.*s' local stack %u bytes exceeds --stack-limit %u",
+                        (int)f->name_len, f->name,
+                        (unsigned)f->frame_size, (unsigned)c->stack_limit);
+                }
+                /* Entry point total depth check (catches deep call chains) */
+                if (!f->is_recursive && max_depth > c->stack_limit) {
+                    bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
+                    bool is_isr = false;
+                    for (int d = 0; d < file_node->file.decl_count; d++) {
+                        if (file_node->file.decls[d]->kind == NODE_INTERRUPT &&
+                            file_node->file.decls[d]->interrupt.name_len == f->name_len &&
+                            memcmp(file_node->file.decls[d]->interrupt.name, f->name, f->name_len) == 0) {
+                            is_isr = true; break;
+                        }
+                    }
+                    if (is_main || is_isr) {
+                        checker_error(c, 0,
+                            "%s '%.*s' max call chain stack %u bytes exceeds --stack-limit %u",
+                            is_isr ? "interrupt" : "entry",
+                            (int)f->name_len, f->name,
+                            (unsigned)max_depth, (unsigned)c->stack_limit);
+                    }
+                }
             }
         }
         free(visited);

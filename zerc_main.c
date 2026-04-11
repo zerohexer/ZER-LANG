@@ -192,6 +192,7 @@ int main(int argc, char **argv) {
     bool release_mode = false;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
+    uint32_t zer_stack_limit = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -213,6 +214,8 @@ int main(int argc, char **argv) {
             target_bits_explicit = true;
         } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
             gcc_override = argv[++i];
+        } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
+            zer_stack_limit = (uint32_t)atoi(argv[++i]);
         }
     }
 
@@ -392,6 +395,7 @@ int main(int argc, char **argv) {
     checker_init(&checker, &cc.arena, input_path);
     checker.source = main_mod->source;
     checker.no_strict_mmio = no_strict_mmio;
+    checker.stack_limit = zer_stack_limit;
 
     /* register in topo order: dependencies first, main last */
     for (int ti = 0; ti < topo_count; ti++) {

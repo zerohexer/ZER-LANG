@@ -5,7 +5,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-04-09/10 — Move Struct Bugs, Systematic Refactoring, CFG Zercheck, 661 Tests
+## Session 2026-04-09/10/11 — Move Struct, CFG Zercheck, Barrier Type, 661 Tests
+
+### Barrier keyword type — eliminates pre-existing UB
+- **Problem:** `u32 barrier` with `@barrier_init` — 4-byte variable for ~120-byte struct. UB: `memset` overflows stack. Was masked by old spinlock stack layout, exposed by BUG-473 mutex change.
+- **Fix:** Added `Barrier` keyword type (lexer/parser/types/checker/emitter). Checker rejects non-Barrier args to `@barrier_init`/`@barrier_wait`. Compile-time safety instead of silent stack corruption.
+- **Test:** `rust_tests/rt_conc_barrier_sync.zer` — now uses `Barrier b;`.
 
 ### BUG-473: shared struct auto-lock self-deadlock through cross-module function calls (FIXED)
 - **Symptom:** `worker` calls `counter_inc(c)` where c is `*SharedCounter`. `counter_inc` does `c.val += 1` (auto-lock). Non-recursive spinlock deadlocks on re-entrant lock.

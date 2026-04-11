@@ -33,6 +33,7 @@ Pool(Task, 8) tasks;     fixed-slot allocator — compile-time count, ALWAYS glo
 Slab(Task) tasks;         dynamic slab allocator — grows on demand, ALWAYS global
 Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global
 Arena scratch;            bump allocator — (over, alloc, alloc_slice, reset)
+Barrier b;               thread sync point — (@barrier_init, @barrier_wait)
 Handle(Task) h;          u64: index(32) + generation(32), not a pointer
 ```
 
@@ -433,7 +434,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 | Ring channel pointer warning | Done | N/A (compile-time warning) |
 | @once { } (init once) | Done | Done (atomic CAS) |
 | @cond_timedwait (timeout) | Done | Done (pthread_cond_timedwait) |
-| @barrier_init/wait (sync point) | Done | Done (mutex+condvar, like Rust) |
+| @barrier_init/wait (sync point) | Done | Done (mutex+condvar, Barrier keyword type) |
 | async/await (stackless coroutines) | Done | Done (Duff's device state machine) |
 | Allocation coloring (source_color) | Done | N/A (compile-time — arena wrappers, param inference) |
 | `move struct` (ownership transfer) | Done | N/A (compile-time — zercheck HS_TRANSFERRED) |
@@ -483,7 +484,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct` (compile-time ownership transfer), 661 Rust-equivalent tests (0 failures), BUG-462 through BUG-471 (10 bugs fixed), deadlock model redesigned, systematic refactoring (16 unified helpers — see `docs/refactoring_gaps.md`), CFG-aware zercheck (terminated flag + dynamic fixed-point, ceiling 32), 472+ bug fixes, 3,600+ tests
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, 661 Rust-equivalent tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers — `docs/refactoring_gaps.md`), CFG-aware zercheck (terminated + dynamic fixed-point), recursive mutex for shared structs, unified `emit_file_module`, 474+ bug fixes, 3,600+ tests
 - **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 

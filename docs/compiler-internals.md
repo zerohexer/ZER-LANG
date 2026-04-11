@@ -793,6 +793,30 @@ All state/type checks go through centralized helpers. New states or move-like ty
 ### Volatile Strip
 - `check_volatile_strip(Checker *c, Node *src_expr, Type *src_type, Type *tgt_type, int line, const char *context)` — checks if a cast/intrinsic strips volatile from pointer. Walks source ident for `sym->is_volatile`. Replaces 5 scattered sites (@ptrcast BUG-258, @bitcast BUG-341, @cast BUG-343, @container, C-style cast BUG-447).
 
+## Barrier Type (2026-04-11)
+
+`Barrier` is a keyword type (like Arena, Pool, Ring, Slab). Emits as `_zer_barrier` (pthread_mutex_t + pthread_cond_t + counters).
+- Lexer: `TOK_BARRIER`, Parser: `TYNODE_BARRIER`, Types: `TYPE_BARRIER` + `ty_barrier` singleton
+- Checker: `@barrier_init`/`@barrier_wait` validate first arg is `TYPE_BARRIER` (rejects `u32`)
+- Emitter: `TYPE_BARRIER` → `_zer_barrier`, zero-init uses `{0}` (compound)
+- Usage: `Barrier b; @barrier_init(b, 3); @barrier_wait(b);`
+
+## Shared Struct Locking (2026-04-11 — BUG-473 fix)
+
+All shared structs now use **recursive pthread_mutex** instead of spinlock:
+- Struct field: `pthread_mutex_t _zer_mtx` + `uint8_t _zer_mtx_inited` (lazy init)
+- Lock: `_zer_mtx_ensure_init(&obj._zer_mtx, &obj._zer_mtx_inited); pthread_mutex_lock(&obj._zer_mtx);`
+- Unlock: `pthread_mutex_unlock(&obj._zer_mtx);`
+- `PTHREAD_MUTEX_RECURSIVE` via `_XOPEN_SOURCE 500` — allows re-entrant locking for cross-function auto-lock.
+- Condvar types still use same mutex (condvar was already pthread_mutex). rwlock types unchanged.
+- `shared_needs_condvar()` check removed from lock/unlock — all paths use pthread_mutex now.
+
+## Unified emit_file_module (2026-04-11 — BUG-472 fix)
+
+`emit_file_module(Emitter *e, Node *file_node, bool with_preamble)` — single flow for both preamble and non-preamble modules. Prevents setup steps being forgotten in one of two parallel functions.
+- `emit_file()` and `emit_file_no_preamble()` are thin wrappers calling `emit_file_module`.
+- Both paths do: prescan for spawn → pass 1 (struct/enum/union/typedef) → spawn wrappers → pass 2 (functions/globals).
+
 ## Unified Helpers — Emitter (emitter.c, 2026-04-09)
 
 ### Optional Emission (ALL sites migrated)

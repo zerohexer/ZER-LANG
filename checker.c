@@ -1489,6 +1489,21 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         }
         return CONST_EVAL_FAIL;
     }
+    /* Enum variant: State.idle → variant int value */
+    if (n->kind == NODE_FIELD && n->field.object &&
+        n->field.object->kind == NODE_IDENT && _comptime_global_scope) {
+        Symbol *esym = scope_lookup(_comptime_global_scope,
+            n->field.object->ident.name, (uint32_t)n->field.object->ident.name_len);
+        if (esym && esym->type && esym->type->kind == TYPE_ENUM) {
+            const char *vname = n->field.field_name;
+            uint32_t vlen = (uint32_t)n->field.field_name_len;
+            for (uint32_t i = 0; i < esym->type->enum_type.variant_count; i++) {
+                SEVariant *v = &esym->type->enum_type.variants[i];
+                if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0)
+                    return (int64_t)v->value;
+            }
+        }
+    }
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_BOOL_LIT) return n->bool_lit.value ? 1 : 0;
     /* nested comptime function calls — depth guard prevents stack overflow */
@@ -1591,6 +1606,63 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
     }
     ct_ctx_set(ctx, name, nlen, newval);
     return 0; /* success (not a return value) */
+}
+
+/* Evaluate a comptime float expression with parameter substitution.
+ * Returns NAN on failure. Handles: float literals, +, -, *, /, param refs. */
+#include <math.h>
+static double eval_comptime_float_expr(Node *n, ComptimeParam *params, int param_count) {
+    if (!n) return NAN;
+    if (n->kind == NODE_FLOAT_LIT) return n->float_lit.value;
+    if (n->kind == NODE_INT_LIT) return (double)n->int_lit.value;
+    if (n->kind == NODE_IDENT) {
+        for (int i = 0; i < param_count; i++) {
+            if (n->ident.name_len == params[i].name_len &&
+                memcmp(n->ident.name, params[i].name, params[i].name_len) == 0) {
+                /* Params are int64 — cast to double (float params passed as bits) */
+                double d;
+                memcpy(&d, &params[i].value, sizeof(d));
+                return d;
+            }
+        }
+        return NAN;
+    }
+    if (n->kind == NODE_UNARY && n->unary.op == TOK_MINUS) {
+        double v = eval_comptime_float_expr(n->unary.operand, params, param_count);
+        return isnan(v) ? NAN : -v;
+    }
+    if (n->kind == NODE_BINARY) {
+        double l = eval_comptime_float_expr(n->binary.left, params, param_count);
+        double r = eval_comptime_float_expr(n->binary.right, params, param_count);
+        if (isnan(l) || isnan(r)) return NAN;
+        switch (n->binary.op) {
+        case TOK_PLUS:  return l + r;
+        case TOK_MINUS: return l - r;
+        case TOK_STAR:  return l * r;
+        case TOK_SLASH: return r != 0.0 ? l / r : NAN;
+        default: return NAN;
+        }
+    }
+    return NAN;
+}
+
+/* Find the return expression in a comptime function body (for float/struct eval). */
+static Node *find_comptime_return_expr(Node *block) {
+    if (!block) return NULL;
+    if (block->kind == NODE_RETURN && block->ret.expr)
+        return block->ret.expr;
+    if (block->kind == NODE_BLOCK) {
+        for (int i = 0; i < block->block.stmt_count; i++) {
+            Node *r = find_comptime_return_expr(block->block.stmts[i]);
+            if (r) return r;
+        }
+    }
+    if (block->kind == NODE_IF) {
+        Node *r = find_comptime_return_expr(block->if_stmt.then_body);
+        if (r) return r;
+        return find_comptime_return_expr(block->if_stmt.else_body);
+    }
+    return NULL;
 }
 
 /* Find the return NODE_STRUCT_INIT in a comptime function body (recursive).
@@ -1850,8 +1922,54 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
     return CONST_EVAL_FAIL;
 }
 
-/* Evaluate constant expression with scope access for const symbol lookup. */
+/* Resolve enum variant: State.idle → int value. Returns CONST_EVAL_FAIL if not an enum field. */
+static int64_t resolve_enum_field(Checker *c, Node *n) {
+    if (!n || n->kind != NODE_FIELD || !n->field.object ||
+        n->field.object->kind != NODE_IDENT) return CONST_EVAL_FAIL;
+    Symbol *esym = scope_lookup(c->current_scope,
+        n->field.object->ident.name, (uint32_t)n->field.object->ident.name_len);
+    if (!esym) esym = scope_lookup(c->global_scope,
+        n->field.object->ident.name, (uint32_t)n->field.object->ident.name_len);
+    if (!esym || !esym->type || esym->type->kind != TYPE_ENUM) return CONST_EVAL_FAIL;
+    uint32_t vlen = (uint32_t)n->field.field_name_len;
+    for (uint32_t i = 0; i < esym->type->enum_type.variant_count; i++) {
+        SEVariant *v = &esym->type->enum_type.variants[i];
+        if (v->name_len == vlen && memcmp(v->name, n->field.field_name, vlen) == 0)
+            return (int64_t)v->value;
+    }
+    return CONST_EVAL_FAIL;
+}
+
+/* Evaluate constant expression with scope access for const symbol lookup.
+ * Also resolves enum variant dot access: State.idle → variant int value.
+ * Handles binary/unary expressions containing enum fields by recursing. */
 static int64_t eval_const_expr_scoped(Checker *c, Node *n) {
+    if (!n) return CONST_EVAL_FAIL;
+    /* Enum field: State.idle → int */
+    if (n->kind == NODE_FIELD) {
+        int64_t ev = resolve_enum_field(c, n);
+        if (ev != CONST_EVAL_FAIL) return ev;
+    }
+    /* Binary: recurse with enum support (eval_const_expr_ex can't see enum fields) */
+    if (n->kind == NODE_BINARY) {
+        int64_t l = eval_const_expr_scoped(c, n->binary.left);
+        int64_t r = eval_const_expr_scoped(c, n->binary.right);
+        if (l != CONST_EVAL_FAIL && r != CONST_EVAL_FAIL) {
+            /* Delegate to eval_const_expr_ex binary handler by creating temp */
+            Node tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            tmp.kind = NODE_BINARY;
+            tmp.binary.op = n->binary.op;
+            Node lit_l, lit_r;
+            memset(&lit_l, 0, sizeof(lit_l));
+            memset(&lit_r, 0, sizeof(lit_r));
+            lit_l.kind = NODE_INT_LIT; lit_l.int_lit.value = (uint64_t)l;
+            lit_r.kind = NODE_INT_LIT; lit_r.int_lit.value = (uint64_t)r;
+            tmp.binary.left = &lit_l;
+            tmp.binary.right = &lit_r;
+            return eval_const_expr_ex(&tmp, 0, NULL, NULL);
+        }
+    }
     return eval_const_expr_ex(n, 0, resolve_const_ident, c);
 }
 
@@ -3908,7 +4026,20 @@ static Type *check_expr(Checker *c, Node *node) {
                     for (int ci = 0; ci < node->call.arg_count && ci < pc && all_const; ci++) {
                         /* BUG-430: use scoped eval to resolve const idents */
                         int64_t v = eval_const_expr_scoped(c, node->call.args[ci]);
-                        if (v == CONST_EVAL_FAIL) { all_const = false; break; }
+                        if (v == CONST_EVAL_FAIL) {
+                            /* Float literal: store double bits as int64 for float comptime */
+                            if (node->call.args[ci]->kind == NODE_FLOAT_LIT) {
+                                double d = node->call.args[ci]->float_lit.value;
+                                memcpy(&v, &d, sizeof(v));
+                            } else if (node->call.args[ci]->kind == NODE_UNARY &&
+                                       node->call.args[ci]->unary.op == TOK_MINUS &&
+                                       node->call.args[ci]->unary.operand->kind == NODE_FLOAT_LIT) {
+                                double d = -node->call.args[ci]->unary.operand->float_lit.value;
+                                memcpy(&v, &d, sizeof(v));
+                            } else {
+                                all_const = false; break;
+                            }
+                        }
                         cparams[ci].name = fn->func_decl.params[ci].name;
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
                         cparams[ci].value = v;
@@ -3948,9 +4079,24 @@ static Type *check_expr(Checker *c, Node *node) {
                                         (int)callee_sym->name_len, callee_sym->name);
                                 }
                             } else {
-                                checker_error(c, node->loc.line,
-                                    "comptime function '%.*s' body could not be evaluated at compile time",
-                                    (int)callee_sym->name_len, callee_sym->name);
+                                /* Try float return: comptime f32/f64 functions */
+                                Type *fret = resolve_type(c, fn->func_decl.return_type);
+                                if (fret && (fret->kind == TYPE_F32 || fret->kind == TYPE_F64)) {
+                                    Node *ret_expr = find_comptime_return_expr(fn->func_decl.body);
+                                    if (ret_expr) {
+                                        double fval = eval_comptime_float_expr(ret_expr, cparams, pc);
+                                        if (!isnan(fval)) {
+                                            node->call.comptime_float_value = fval;
+                                            node->call.is_comptime_float = true;
+                                            node->call.is_comptime_resolved = true;
+                                        }
+                                    }
+                                }
+                                if (!node->call.is_comptime_resolved) {
+                                    checker_error(c, node->loc.line,
+                                        "comptime function '%.*s' body could not be evaluated at compile time",
+                                        (int)callee_sym->name_len, callee_sym->name);
+                                }
                             }
                         }
                     }

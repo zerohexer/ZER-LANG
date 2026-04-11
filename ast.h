@@ -518,6 +518,8 @@ struct Node {
             int64_t comptime_value;  /* result of comptime evaluation (if is_comptime_resolved) */
             bool is_comptime_resolved; /* true if this call was resolved at compile time */
             Node *comptime_struct_init; /* non-NULL for comptime struct return (NODE_STRUCT_INIT with constants) */
+            double comptime_float_value; /* result for float comptime functions */
+            bool is_comptime_float;      /* true if comptime_float_value is valid */
         } call;
 
         /* NODE_FIELD: expr.field */

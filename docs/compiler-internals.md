@@ -1031,7 +1031,9 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
-## Red Team Audit Fixes (2026-04-12, Gemini red team)
+## Red Team Audit Fixes (2026-04-12, Gemini red team — 8 attempts, 5 real bugs)
+
+**Summary:** External AI (Gemini) performed red team audit on ZER-LANG safety guarantees. 8 attack vectors tested: 5 were real bugs (V1,V3,V4,V5,V6), 3 were already caught by existing checks (V2,V7,V8).
 
 ### Transitive Deadlock Detection
 `collect_shared_types_in_expr` now scans called function bodies transitively (depth 4) for shared type field accesses. Catches: `a.x = helper()` where `helper()` accesses `b.y` — different shared type in same statement = potential AB-BA deadlock. Required adding NODE_RETURN/NODE_EXPR_STMT/NODE_VAR_DECL handling in the expression scanner (callee body statements were being skipped).
@@ -1039,8 +1041,19 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 ### Comptime Global Instruction Budget
 `_comptime_ops` counter in `eval_comptime_block`. Incremented per loop iteration (both for and while/do-while). Cap: 1,000,000 total operations per comptime call. Prevents nested loop DoS (10000×10000 = 100M iterations). Resets on depth==1 (top-level call). Returns CONST_EVAL_FAIL on budget exceeded.
 
-### Naked Function Body Validation
+### Naked Function Body Validation (V4)
 Naked functions (`__attribute__((naked))`) must only contain `asm` and `return` statements. Non-asm code (var-decl, assignment, etc.) uses stack that was never allocated (no prologue). Checker scans body block and errors on first non-asm, non-return statement.
+
+### Thread-Unsafe Slab/Pool/Ring from Spawn (V5)
+Pool, Slab, Ring alloc/free/push/pop have non-atomic metadata access. Accessing global Pool/Slab/Ring from spawned thread is a data race. `scan_unsafe_global_access` no longer skips TYPE_POOL/TYPE_SLAB/TYPE_RING — only TYPE_ARENA (bump allocator, single-threaded reset) and TYPE_BARRIER (has own mutex) are safe. Also fixed: NODE_FIELD and callee expression scanning were missing from the spawn global scanner.
+
+### Container Monomorphization Depth Limit (V6)
+`_container_depth` static counter in TYNODE_CONTAINER resolution. Cap: 32. Prevents compiler hang/crash from self-referential containers like `container Node(T) { ?*Node(T) next; }`. Also: `subst_typenode()` recursive TypeNode substitution replaces 5 one-level pattern matches — handles T at any nesting depth (`?*Container(T)`, `[]*T`, etc.).
+
+### Already Caught (V2, V7, V8)
+- V2: Union mutation via *opaque inside switch arm → "cannot take address of union inside switch arm"
+- V7: Union containing move struct → "cannot read union variant directly — must use switch"
+- V8: @ptrtoint(&local) returned → "cannot return @ptrtoint of local" (fixed earlier this session)
 
 ## Local Function Pointer Init Required (2026-04-12)
 

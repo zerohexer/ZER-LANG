@@ -654,6 +654,43 @@ static Node *parse_primary(Parser *p) {
         return new_node(p, NODE_NULL_LIT);
     }
 
+    /* designated initializer: { .field = expr, ... } */
+    if (check(p, TOK_LBRACE)) {
+        /* Lookahead: { followed by . means designated init, not block */
+        Scanner saved = *p->scanner;
+        Token saved_cur = p->current;
+        advance(p); /* consume { */
+        if (check(p, TOK_DOT)) {
+            /* Restore scanner but keep { consumed — parse fields */
+            Node *n = new_node(p, NODE_STRUCT_INIT);
+            DesigField fields[128];
+            int count = 0;
+            while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+                if (count >= 128) {
+                    error(p, "too many designated initializer fields (max 128)");
+                    break;
+                }
+                consume(p, TOK_DOT, "expected '.' before field name");
+                consume(p, TOK_IDENT, "expected field name after '.'");
+                fields[count].name = tok_text(&p->previous);
+                fields[count].name_len = tok_len(&p->previous);
+                consume(p, TOK_EQ, "expected '=' after field name");
+                fields[count].value = parse_expression(p);
+                count++;
+                if (!match(p, TOK_COMMA)) break;
+            }
+            consume(p, TOK_RBRACE, "expected '}' after designated initializer");
+            n->struct_init.field_count = count;
+            n->struct_init.fields = (DesigField *)arena_alloc(p->arena, count * sizeof(DesigField));
+            for (int i = 0; i < count; i++)
+                n->struct_init.fields[i] = fields[i];
+            return n;
+        }
+        /* Not a designated init — restore scanner state */
+        *p->scanner = saved;
+        p->current = saved_cur;
+    }
+
     /* identifier */
     if (match(p, TOK_IDENT)) {
         Node *n = new_node(p, NODE_IDENT);

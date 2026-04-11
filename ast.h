@@ -189,6 +189,7 @@ typedef enum {
     NODE_CAST,              /* implicit cast inserted by type checker */
     NODE_TYPECAST,          /* (Type)expr — explicit C-style cast */
     NODE_SIZEOF,            /* @size(T) — resolved from intrinsic */
+    NODE_STRUCT_INIT,       /* { .x = 1, .y = 2 } — designated initializer */
 } NodeKind;
 
 /* ---- Switch arm ---- */
@@ -206,6 +207,13 @@ typedef struct {
     Node *body;             /* arm body (block or expression) */
     SrcLoc loc;
 } SwitchArm;
+
+/* ---- Designated initializer field ---- */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    Node *value;            /* initializer expression */
+} DesigField;
 
 /* ---- Struct field declaration ---- */
 typedef struct {
@@ -532,6 +540,12 @@ struct Node {
             TypeNode *target_type;
             Node *expr;
         } typecast;
+
+        /* NODE_STRUCT_INIT: { .x = 1, .y = 2 } — designated initializer */
+        struct {
+            DesigField *fields;
+            int field_count;
+        } struct_init;
     };
 };
 

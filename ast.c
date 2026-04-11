@@ -110,6 +110,7 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_CAST:         return "CAST";
     case NODE_TYPECAST:     return "TYPECAST";
     case NODE_SIZEOF:       return "SIZEOF";
+    case NODE_STRUCT_INIT:  return "STRUCT_INIT";
     case NODE_CINCLUDE:     return "CINCLUDE";
     }
     return "UNKNOWN";
@@ -461,6 +462,16 @@ void ast_print(Node *node, int depth) {
     case NODE_TYPECAST:
     case NODE_SIZEOF:
         printf("%s\n", node_kind_name(node->kind));
+        break;
+
+    case NODE_STRUCT_INIT:
+        printf("STRUCT_INIT (%d fields)\n", node->struct_init.field_count);
+        for (int i = 0; i < node->struct_init.field_count; i++) {
+            indent(depth + 1);
+            printf(".%.*s = \n", (int)node->struct_init.fields[i].name_len,
+                   node->struct_init.fields[i].name);
+            ast_print(node->struct_init.fields[i].value, depth + 2);
+        }
         break;
     }
 }

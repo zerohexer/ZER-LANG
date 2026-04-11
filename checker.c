@@ -1339,7 +1339,6 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     return CONST_EVAL_FAIL;
 }
 
-static int64_t eval_comptime_stmt(Node *n, ComptimeParam *params, int param_count);
 
 /* Evaluate a comptime assignment: compute RHS, apply operator, update ctx */
 static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
@@ -2665,6 +2664,45 @@ static Type *check_expr(Checker *c, Node *node) {
                         "use 'volatile []%s' to preserve volatile qualifier",
                         type_name(target->slice.inner));
                 }
+            }
+        }
+
+        /* Designated initializer in assignment: validate fields */
+        if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT && target) {
+            Type *st = type_unwrap_distinct(target);
+            if (st->kind != TYPE_STRUCT) {
+                checker_error(c, node->loc.line,
+                    "designated initializer requires struct type, got '%s'",
+                    type_name(target));
+            } else {
+                for (int fi = 0; fi < node->assign.value->struct_init.field_count; fi++) {
+                    DesigField *df = &node->assign.value->struct_init.fields[fi];
+                    bool found = false;
+                    for (int si = 0; si < st->struct_type.field_count; si++) {
+                        if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
+                            memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
+                            found = true;
+                            Type *ft = st->struct_type.fields[si].type;
+                            Type *vt = checker_get_type(c, df->value);
+                            if (vt && ft && !type_equals(ft, vt) &&
+                                !can_implicit_coerce(vt, ft) &&
+                                !is_literal_compatible(df->value, ft)) {
+                                checker_error(c, node->loc.line,
+                                    "field '.%.*s' expects '%s', got '%s'",
+                                    (int)df->name_len, df->name,
+                                    type_name(ft), type_name(vt));
+                            }
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        checker_error(c, node->loc.line,
+                            "struct '%s' has no field '%.*s'",
+                            type_name(target), (int)df->name_len, df->name);
+                    }
+                }
+                value = target;
+                typemap_set(c, node->assign.value, target);
             }
         }
 
@@ -4481,6 +4519,19 @@ static Type *check_expr(Checker *c, Node *node) {
         break;
     }
 
+    /* ---- Designated struct init ---- */
+    case NODE_STRUCT_INIT: {
+        /* Type-check all field value expressions.
+         * Actual struct field validation is deferred to var-decl/assign
+         * because the target struct type is only known from context. */
+        for (int i = 0; i < node->struct_init.field_count; i++) {
+            check_expr(c, node->struct_init.fields[i].value);
+        }
+        /* No type returned — context (var-decl, assign) sets the real type */
+        result = ty_void;
+        break;
+    }
+
     /* ---- Intrinsic ---- */
     case NODE_INTRINSIC: {
         const char *name = node->intrinsic.name;
@@ -5321,6 +5372,46 @@ static void check_stmt(Checker *c, Node *node) {
                             "use 'volatile []%s' to preserve volatile qualifier",
                             type_name(type->slice.inner));
                     }
+                }
+            }
+
+            /* Designated initializer: validate fields against target struct type */
+            if (node->var_decl.init->kind == NODE_STRUCT_INIT && type) {
+                Type *st = type_unwrap_distinct(type);
+                if (st->kind != TYPE_STRUCT) {
+                    checker_error(c, node->loc.line,
+                        "designated initializer requires struct type, got '%s'",
+                        type_name(type));
+                } else {
+                    for (int fi = 0; fi < node->var_decl.init->struct_init.field_count; fi++) {
+                        DesigField *df = &node->var_decl.init->struct_init.fields[fi];
+                        bool found = false;
+                        for (int si = 0; si < st->struct_type.field_count; si++) {
+                            if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
+                                memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
+                                found = true;
+                                Type *ft = st->struct_type.fields[si].type;
+                                Type *vt = checker_get_type(c, df->value);
+                                if (vt && ft && !type_equals(ft, vt) &&
+                                    !can_implicit_coerce(vt, ft) &&
+                                    !is_literal_compatible(df->value, ft)) {
+                                    checker_error(c, node->loc.line,
+                                        "field '.%.*s' expects '%s', got '%s'",
+                                        (int)df->name_len, df->name,
+                                        type_name(ft), type_name(vt));
+                                }
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            checker_error(c, node->loc.line,
+                                "struct '%s' has no field '%.*s'",
+                                type_name(type), (int)df->name_len, df->name);
+                        }
+                    }
+                    /* Set the struct_init node type to the target struct type */
+                    init_type = type;
+                    typemap_set(c, node->var_decl.init, type);
                 }
             }
 
@@ -7463,7 +7554,7 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
     case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
         break;
     }
 }
@@ -7525,7 +7616,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
     case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
         break;
     }
 }
@@ -8114,6 +8205,10 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         break;
     case NODE_TYPECAST:
         scan_frame(c, frame, node->typecast.expr);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            scan_frame(c, frame, node->struct_init.fields[i].value);
         break;
     case NODE_SLICE:
         scan_frame(c, frame, node->slice.object);

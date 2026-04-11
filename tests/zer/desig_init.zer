@@ -1,0 +1,35 @@
+// Designated initializer: { .field = value } syntax
+
+struct Point { i32 x; i32 y; }
+struct Config { u32 baud; u8 parity; bool flow; }
+
+i32 main() {
+    // var-decl init
+    Point p = { .x = 10, .y = 20 };
+    if (p.x != 10) { return 1; }
+    if (p.y != 20) { return 2; }
+
+    // partial init — unmentioned fields auto-zero (C99 behavior)
+    Config c = { .baud = 9600 };
+    if (c.baud != 9600) { return 3; }
+    if (c.parity != 0) { return 4; }
+
+    // all fields
+    Config c2 = { .baud = 115200, .parity = 1, .flow = true };
+    if (c2.baud != 115200) { return 5; }
+    if (c2.parity != 1) { return 6; }
+    if (c2.flow != true) { return 7; }
+
+    // assignment (not just var-decl)
+    Point q;
+    q = { .x = 42, .y = 99 };
+    if (q.x != 42) { return 8; }
+    if (q.y != 99) { return 9; }
+
+    // reassignment
+    p = { .x = 100, .y = 200 };
+    if (p.x != 100) { return 10; }
+    if (p.y != 200) { return 11; }
+
+    return 0;
+}

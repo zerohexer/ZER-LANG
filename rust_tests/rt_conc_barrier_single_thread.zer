@@ -1,0 +1,15 @@
+// Rust: Barrier with 1 thread — wait returns immediately.
+// ZER: @barrier_init(b, 1) + @barrier_wait(b) — single thread passes through.
+
+Barrier b;
+
+i32 main() {
+    @barrier_init(b, 1);
+
+    // Single thread — wait should return immediately
+    @barrier_wait(b);
+    @barrier_wait(b);
+    @barrier_wait(b);
+
+    return 0;
+}

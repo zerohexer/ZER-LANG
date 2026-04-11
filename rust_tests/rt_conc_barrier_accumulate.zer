@@ -1,0 +1,29 @@
+// Rust: Barrier used to ensure all threads computed before aggregating.
+// ZER: Each thread computes locally, barrier syncs, then shared accumulate.
+
+shared struct Result { u32 sum; }
+Result g;
+Barrier bar;
+
+void compute_and_sync(u32 id, *Result r) {
+    u32 local = id * 10;
+    @barrier_wait(bar);
+    // All threads computed — safe to accumulate
+    r.sum += local;
+}
+
+i32 main() {
+    g.sum = 0;
+    @barrier_init(bar, 3);
+
+    ThreadHandle t1 = spawn compute_and_sync(1, &g);
+    ThreadHandle t2 = spawn compute_and_sync(2, &g);
+    compute_and_sync(3, &g);
+
+    t1.join();
+    t2.join();
+
+    // 10 + 20 + 30 = 60
+    if (g.sum != 60) { return 1; }
+    return 0;
+}

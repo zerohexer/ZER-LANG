@@ -1,0 +1,40 @@
+// Rust: Barrier ensures data is fully written before readers access it.
+// ZER: Writer fills shared data, barrier syncs, readers verify.
+
+shared struct Buffer { u32[4] data; u32 filled; }
+Buffer g_buf;
+Barrier bar;
+
+void writer(*Buffer b) {
+    b.data[0] = 10;
+    b.data[1] = 20;
+    b.data[2] = 30;
+    b.data[3] = 40;
+    b.filled = 1;
+    @barrier_wait(bar);
+}
+
+void reader(*Buffer b, *u32 out) {
+    @barrier_wait(bar);
+    // Writer guaranteed to have finished
+    out[0] = b.data[0] + b.data[1] + b.data[2] + b.data[3];
+}
+
+i32 main() {
+    g_buf.filled = 0;
+    g_buf.data[0] = 0;
+    g_buf.data[1] = 0;
+    g_buf.data[2] = 0;
+    g_buf.data[3] = 0;
+    @barrier_init(bar, 2);
+
+    u32 sum = 0;
+    ThreadHandle tw = spawn writer(&g_buf);
+    reader(&g_buf, &sum);
+
+    tw.join();
+
+    if (sum != 100) { return 1; }
+    if (g_buf.filled != 1) { return 2; }
+    return 0;
+}

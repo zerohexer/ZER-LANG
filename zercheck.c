@@ -1160,6 +1160,22 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                             }
                         }
                     }
+                    /* Red Team V26: &move_struct as call arg → conservatively mark
+                     * source as transferred. Pointer lets callee consume content. */
+                    if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP &&
+                        arg->unary.operand && arg->unary.operand->kind == NODE_IDENT) {
+                        Node *src = arg->unary.operand;
+                        Type *src_type = checker_get_type(zc->checker, src);
+                        if (should_track_move(src_type)) {
+                            HandleInfo *mh = zc_ensure_move_registered(zc, ps,
+                                src->ident.name, (uint32_t)src->ident.name_len,
+                                node->loc.line);
+                            if (mh && mh->state == HS_ALIVE) {
+                                mh->state = HS_TRANSFERRED;
+                                mh->transfer_line = node->loc.line;
+                            }
+                        }
+                    }
                 }
             } else {
                 for (int i = 0; i < node->call.arg_count; i++)

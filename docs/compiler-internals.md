@@ -993,6 +993,30 @@ Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call o
 
 **Design decision:** Avoids changing `eval_comptime_block`'s return type to a tagged union. The struct path is handled entirely at the call site in the checker. Simpler, no architectural disruption, handles all cases where return expression is a designated initializer with comptime-evaluable field values.
 
+## Spawn Global Data Race Detection (2026-04-11)
+
+When `spawn func()` is used, the checker scans the spawned function's body for non-shared, non-const, non-volatile, non-threadlocal global variable access.
+
+**`scan_unsafe_global_access(c, node, &name, &len)`** — recursive AST walker. Finds NODE_IDENT matching global scope symbols that are not safe for concurrent access. Skips: const, volatile (explicit opt-in), threadlocal, shared/shared(rw) structs, Pool/Slab/Ring/Arena/Barrier. Skips `@atomic_*` intrinsic arguments (atomic ops are thread-safe).
+
+**Transitive scanning:** When NODE_CALL is encountered, follows the callee into its function body (depth limit 8). Catches `spawn worker()` where `worker()` calls `helper()` which accesses a global.
+
+**Error vs Warning:** `has_atomic_or_barrier(node)` scans the spawned function body for `@atomic_*` or `@barrier*` intrinsics. If found → **warning** (developer is doing manual synchronization, lock-free pattern possible). If not found → **error** (no synchronization at all, definitely unsafe).
+
+**Escape hatches:** `volatile` global (explicit opt-in, like `#[allow(data_race)]`), `shared struct` (auto-locked), `threadlocal` (per-thread copy), `@atomic_*` (thread-safe by definition), `const` (read-only).
+
+## --stack-limit N (2026-04-11)
+
+`zerc --stack-limit 2048` — compile error when estimated stack usage exceeds N bytes.
+
+**Two checks:**
+1. **Per-function frame size** — catches big local arrays (`u8[4096] buf` in a function with 2048 limit). `estimate_type_size()` sums local variable sizes.
+2. **Entry point total call chain** — `compute_max_depth()` DFS through call graph from `main()` and interrupt handlers. Catches deep call chains where no single function is over-limit but the total exceeds it.
+
+**Recursive functions:** Warning only (can't compute max depth for unbounded recursion). `--stack-limit` check skipped for recursive entry points.
+
+**Added to Checker struct:** `uint32_t stack_limit` (0 = disabled). Set from CLI via `--stack-limit N` in zerc_main.c.
+
 ## Comptime Enum Values (2026-04-11)
 
 `Color.red` resolves to the enum variant's integer value at compile time.

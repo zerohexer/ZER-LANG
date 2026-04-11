@@ -1,0 +1,52 @@
+// Comprehensive comptime test — locals, loops, switch, nested calls.
+
+comptime u32 CLAMP(u32 val, u32 lo, u32 hi) {
+    if (val < lo) { return lo; }
+    if (val > hi) { return hi; }
+    return val;
+}
+
+comptime u32 SUM_TO(u32 n) {
+    u32 total = 0;
+    for (u32 i = 1; i <= n; i += 1) {
+        total += i;
+    }
+    return total;
+}
+
+comptime u32 FACTORIAL(u32 n) {
+    u32 result = 1;
+    for (u32 i = 2; i <= n; i += 1) {
+        result *= i;
+    }
+    return result;
+}
+
+comptime u32 DISPATCH(u32 code) {
+    switch (code) {
+        0 => { return 100; }
+        1 => { return 200; }
+        2 => { return SUM_TO(10); }
+        default => { return 0; }
+    }
+}
+
+static_assert(SUM_TO(10) == 55, "sum 1..10 = 55");
+static_assert(FACTORIAL(5) == 120, "5! = 120");
+static_assert(CLAMP(5, 0, 10) == 5, "clamp mid");
+static_assert(CLAMP(0, 3, 10) == 3, "clamp lo");
+static_assert(CLAMP(99, 0, 10) == 10, "clamp hi");
+static_assert(DISPATCH(0) == 100, "dispatch 0");
+static_assert(DISPATCH(2) == 55, "dispatch 2 = sum(10)");
+
+i32 main() {
+    if (FACTORIAL(6) != 720) { return 1; }
+    if (SUM_TO(5) != 15) { return 2; }
+    if (DISPATCH(1) != 200) { return 3; }
+    if (DISPATCH(99) != 0) { return 4; }
+
+    u8[SUM_TO(4)] buf;  // 10-element array
+    if (@size(u8) * 10 != 10) { return 5; }
+
+    return 0;
+}

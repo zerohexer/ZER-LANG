@@ -190,6 +190,7 @@ typedef struct {
         int callee_count;
         int callee_capacity;
         bool is_recursive;      /* part of a call cycle */
+        bool has_indirect_call; /* calls through function pointer with unknown target */
     } *stack_frames;
     int stack_frame_count;
     int stack_frame_capacity;

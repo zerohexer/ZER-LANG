@@ -8885,6 +8885,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
             } else if (sym && sym->type && type_unwrap_distinct(sym->type)->kind == TYPE_FUNC_PTR) {
                 /* Function pointer call: check if variable was initialized with a known function.
                  * Enables indirect recursion detection: void (*fp)() = func_a; fp(); */
+                bool resolved = false;
                 if (sym->func_node &&
                     (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
                     sym->func_node->var_decl.init &&
@@ -8892,9 +8893,15 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
                     const char *target = sym->func_node->var_decl.init->ident.name;
                     uint32_t tlen = (uint32_t)sym->func_node->var_decl.init->ident.name_len;
                     Symbol *tsym = scope_lookup(c->global_scope, target, tlen);
-                    if (tsym && tsym->is_function)
+                    if (tsym && tsym->is_function) {
                         add_callee(frame, target, tlen);
+                        resolved = true;
+                    }
                 }
+                if (!resolved) frame->has_indirect_call = true;
+            } else if (!sym || !sym->is_function) {
+                /* Unknown callee (parameter, field, etc.) — can't compute stack depth */
+                frame->has_indirect_call = true;
             }
         }
         for (int i = 0; i < node->call.arg_count; i++)
@@ -9041,6 +9048,8 @@ static uint32_t compute_max_depth(Checker *c, struct StackFrame *frame,
         if (callee) {
             uint32_t child_depth = compute_max_depth(c, callee, visited, depth + 1);
             if (child_depth > max_child) max_child = child_depth;
+            /* Propagate indirect call flag up the call chain */
+            if (callee->has_indirect_call) frame->has_indirect_call = true;
         }
     }
     visited[idx] = false;
@@ -9112,6 +9121,24 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                             (unsigned)max_depth, (unsigned)c->stack_limit);
                     }
                 }
+                /* Indirect call check: if entry point's call chain contains
+                 * unresolvable function pointer calls, stack depth is unverifiable */
+                if (f->has_indirect_call && !f->is_recursive) {
+                    bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
+                    if (is_main) {
+                        checker_error(c, 0,
+                            "entry '%.*s' call chain contains function pointer call with "
+                            "unknown target — stack depth unverifiable with --stack-limit",
+                            (int)f->name_len, f->name);
+                    }
+                }
+            }
+            /* Without --stack-limit: warn about indirect calls in any function */
+            if (c->stack_limit == 0 && f->has_indirect_call && !f->is_recursive) {
+                checker_warning(c, 0,
+                    "function '%.*s' calls through function pointer with unknown target — "
+                    "stack depth not verifiable",
+                    (int)f->name_len, f->name);
             }
         }
         free(visited);

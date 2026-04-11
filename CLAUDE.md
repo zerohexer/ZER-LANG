@@ -751,21 +751,44 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 **Every change — add, fix, remove — MUST be the correct solution, not a shortcut.**
 
+### Before Writing ANY Code: Read First, Implement Second
+
+**DO NOT start implementing immediately.** The natural instinct is to write code as soon as the problem is understood. Fight it. This session proved that jumping to implementation causes:
+- Comptime loop body: implemented with `eval_comptime_block` call (copies locals) → broke mutations → had to refactor to `ComptimeCtx` (the correct architecture). 3 rounds of fix.
+- Range-for: implemented with shared AST node pointer → triple evaluation → had to refactor to clone + reject. 2 rounds of fix.
+- static_assert: implemented without `check_expr` first → comptime calls unresolved → had to add ordering fix.
+
+**The correct workflow:**
+1. **Read the relevant code** — not just the function you'll change, but its callers, its callees, and the data flow. Understand HOW the data moves before changing WHERE it moves.
+2. **Identify the architecture** — is this copy-on-call? Pass-by-reference? Who owns the memory? What's the scope lifetime?
+3. **Design the fix** — write the approach in your head. Ask: "Does this create duplicate code? Does this share mutable state? Does this have ordering dependencies?"
+4. **Then implement** — with the architecture already decided, the code writes itself.
+
+### Implementation Checks
+
 Before implementing ANY change, verify:
 1. **No duplicate code.** If the same logic appears in 2+ places, extract a helper FIRST. Do NOT copy-paste and plan to "refactor later." Later never comes.
-2. **No shared mutable AST nodes.** Parser desugaring must create SEPARATE node copies for each use site. The SAME Node pointer in multiple AST positions causes double-evaluation bugs. Always deep-copy or hoist to temp.
+2. **No shared mutable AST nodes.** Parser desugaring must create SEPARATE node copies for each use site. The SAME Node pointer in multiple AST positions causes double-evaluation bugs. Always deep-copy or clone.
 3. **No ordering dependencies without comments.** If function A must run before function B (e.g., `check_expr` before `eval_const_expr_scoped`), document WHY with a comment at both sites.
-4. **No copy-on-call for mutable state.** If a recursive function copies its input but callers need mutations to propagate back, the architecture is WRONG. Either pass by reference or inline the walk.
+4. **No copy-on-call for mutable state.** If a recursive function copies its input but callers need mutations to propagate back, the architecture is WRONG. Either pass by reference (like `ComptimeCtx*`) or use save/restore pattern (like `saved_count`).
 5. **Test the REAL pattern, not just the simple case.** If you add `for (item in slice)`, test with struct slices, nested loops, and side-effectful expressions — not just `u32[5]`.
+6. **100% coverage, not 99%.** Don't say "works for the common case." If an edge case exists, either handle it or reject it at compile time with a clear error. Never silently produce wrong behavior.
 
-**Before committing, ask:** "If I read this code in 6 months, would I know WHY it's structured this way? Would I accidentally break it by changing one of the N sites?"
+### Before Committing
+
+Ask: "If I read this code in 6 months, would I know WHY it's structured this way? Would I accidentally break it by changing one of the N sites?"
 
 If the answer is no → extract helper, add comment, or restructure. Do NOT commit debt.
 
-**Violations found in this session:**
-- Comptime loop body used `eval_comptime_block` (copies locals) → loop mutations lost. Fixed by inlining — but created duplicate code. Should have been a helper.
-- Range-for reuses same `collection` node pointer in 3 AST positions → triple evaluation. Should hoist to temp var.
-- Both were committed as "working" then caught during testing/audit. The rule: audit BEFORE commit.
+### Anti-Patterns Found in This Session
+
+| Anti-Pattern | What Happened | Correct Approach |
+|---|---|---|
+| Copy-on-call for mutable state | `eval_comptime_block` copied locals → loop mutations lost | `ComptimeCtx*` passed by pointer with save/restore |
+| Shared AST node pointer | range-for `collection` reused in 3 positions → triple eval | Clone ident node + reject non-trivial expressions |
+| Missing ordering dependency | static_assert called `eval_const_expr_scoped` before `check_expr` → comptime unresolved | `check_expr` FIRST (resolves comptime), then eval |
+| Inline duplicate code | for/while loop body walk copy-pasted | `CT_WALK_BODY_STMT` macro → then proper `ComptimeCtx` refactor |
+| Quick fix then "refactor later" | Macro band-aid for duplicate code | Refactor NOW while you have context |
 
 ## Implementation Workflow — Lessons Learned
 

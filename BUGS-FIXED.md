@@ -3233,3 +3233,13 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **V23 — Spawn non-void return:** CONFIRMED + FIXED. `spawn produce()` where produce returns non-void → return value lost. Fix: checker errors if spawn target has non-void return type.
 
 **V24 — Comptime const bypass:** NOT applicable. Comptime evaluator is pure computation — no const concept. Re-assignment is valid for building values.
+
+### Red Team V25-V28 (2026-04-12, Gemini round 7)
+
+**V25 — Async defer in loop:** NOT a bug. Defer fires correctly per loop iteration (g_count == 3). Duff's device handles loop+defer+yield correctly.
+
+**V26 — Move struct return-alias via pointer:** CONFIRMED + FIXED. `wash_key(&a)` takes pointer to move struct, copies content, original still accessible. Fix: ban `&move_struct` — pointer bypasses ownership tracking. Without borrow checker, pointer aliases are untrackable. Same design point as Rust (needs &mut exclusivity via borrow checker) — ZER bans it instead.
+
+**V27 — Atomic on non-volatile:** NOT an issue. GCC `__atomic_*` builtins handle memory ordering regardless of volatile qualifier. Volatile is for hardware registers, not atomics.
+
+**V28 — Container nested:** NOT applicable. ZER doesn't support nested container definitions. Simple containers work correctly.

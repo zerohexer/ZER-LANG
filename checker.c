@@ -3542,6 +3542,41 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
+                    /* Designated init as call arg: validate fields against param struct type */
+                    if (node->call.args[i]->kind == NODE_STRUCT_INIT && param) {
+                        Type *st = type_unwrap_distinct(param);
+                        if (st->kind == TYPE_STRUCT) {
+                            for (int fi = 0; fi < node->call.args[i]->struct_init.field_count; fi++) {
+                                DesigField *df = &node->call.args[i]->struct_init.fields[fi];
+                                bool found = false;
+                                for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
+                                    if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
+                                        memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
+                                        found = true;
+                                        Type *ft = st->struct_type.fields[si].type;
+                                        Type *vt = checker_get_type(c, df->value);
+                                        if (vt && ft && !type_equals(ft, vt) &&
+                                            !can_implicit_coerce(vt, ft) &&
+                                            !is_literal_compatible(df->value, ft)) {
+                                            checker_error(c, node->loc.line,
+                                                "argument %u field '.%.*s' expects '%s', got '%s'",
+                                                i + 1, (int)df->name_len, df->name,
+                                                type_name(ft), type_name(vt));
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    checker_error(c, node->loc.line,
+                                        "argument %u: struct '%s' has no field '%.*s'",
+                                        i + 1, type_name(param), (int)df->name_len, df->name);
+                                }
+                            }
+                            arg = param;
+                            typemap_set(c, node->call.args[i], param);
+                        }
+                    }
+
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&
                         !is_literal_compatible(node->call.args[i], param) &&

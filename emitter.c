@@ -323,6 +323,10 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_TYPECAST:
         emit_auto_guards(e, node->typecast.expr);
         break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            emit_auto_guards(e, node->struct_init.fields[i].value);
+        break;
     case NODE_SLICE:
         emit_auto_guards(e, node->slice.object);
         emit_auto_guards(e, node->slice.start);
@@ -2367,6 +2371,26 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->typecast.expr);
             emit(e, "))");
         }
+        break;
+    }
+
+    case NODE_STRUCT_INIT: {
+        /* Designated initializer: emit as C99 compound literal (Type){ .x = 1 }
+         * Works in both var-decl init and assignment contexts. */
+        Type *si_type = checker_get_type(e->checker, node);
+        if (si_type) {
+            emit(e, "(");
+            emit_type(e, si_type);
+            emit(e, ")");
+        }
+        emit(e, "{ ");
+        for (int i = 0; i < node->struct_init.field_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
+                 node->struct_init.fields[i].name);
+            emit_expr(e, node->struct_init.fields[i].value);
+        }
+        emit(e, " }");
         break;
     }
 
@@ -4816,7 +4840,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
     case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
     case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_FILE:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_FILE:
         break;
     }
 }

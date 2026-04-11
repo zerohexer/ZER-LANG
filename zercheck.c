@@ -1487,6 +1487,10 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_TYPECAST:
         zc_check_expr(zc, ps, node->typecast.expr);
         break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            zc_check_expr(zc, ps, node->struct_init.fields[i].value);
+        break;
     case NODE_SLICE:
         zc_check_expr(zc, ps, node->slice.object);
         break;
@@ -2000,7 +2004,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_CALL:
     case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
     case NODE_ASSIGN:
     /* Top-level decls — zercheck only runs on function bodies */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:

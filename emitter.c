@@ -1365,6 +1365,11 @@ static void emit_expr(Emitter *e, Node *node) {
         /* comptime call — emit constant value directly.
          * BUG-388: if target type is optional, wrap in {value, 1}. */
         if (node->call.is_comptime_resolved) {
+            /* Comptime struct return — emit as compound literal */
+            if (node->call.comptime_struct_init) {
+                emit_expr(e, node->call.comptime_struct_init);
+                break;
+            }
             Type *ct = checker_get_type(e->checker, node);
             if (ct && ct->kind == TYPE_OPTIONAL) {
                 emit(e, "(");

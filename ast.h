@@ -517,6 +517,7 @@ struct Node {
             int arg_count;
             int64_t comptime_value;  /* result of comptime evaluation (if is_comptime_resolved) */
             bool is_comptime_resolved; /* true if this call was resolved at compile time */
+            Node *comptime_struct_init; /* non-NULL for comptime struct return (NODE_STRUCT_INIT with constants) */
         } call;
 
         /* NODE_FIELD: expr.field */

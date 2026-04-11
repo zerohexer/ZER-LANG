@@ -1,0 +1,36 @@
+// Comptime struct return: comptime functions returning struct values
+
+struct Point { i32 x; i32 y; }
+struct Config { u32 baud; u8 bits; }
+
+comptime Point ORIGIN() {
+    return { .x = 0, .y = 0 };
+}
+
+comptime Point MAKE_POINT(i32 a, i32 b) {
+    return { .x = a, .y = b };
+}
+
+comptime Config DEFAULT_CONFIG() {
+    return { .baud = 9600, .bits = 8 };
+}
+
+i32 main() {
+    Point o = ORIGIN();
+    if (o.x != 0) { return 1; }
+    if (o.y != 0) { return 2; }
+
+    Point p = MAKE_POINT(10, 20);
+    if (p.x != 10) { return 3; }
+    if (p.y != 20) { return 4; }
+
+    Point q = MAKE_POINT(100, 200);
+    if (q.x != 100) { return 5; }
+    if (q.y != 200) { return 6; }
+
+    Config c = DEFAULT_CONFIG();
+    if (c.baud != 9600) { return 7; }
+    if (c.bits != 8) { return 8; }
+
+    return 0;
+}

@@ -1066,6 +1066,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                     Node *fn = csym->func_node;
                     int pc = fn->func_decl.param_count;
                     ComptimeParam stack_cp[8];
+                    memset(stack_cp, 0, sizeof(stack_cp));
                     ComptimeParam *cparams = pc <= 8 ? stack_cp :
                         (ComptimeParam *)arena_alloc(c->arena, pc * sizeof(ComptimeParam));
                     bool all_const = cparams != NULL;
@@ -1397,9 +1398,11 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     int pc = fn->func_decl.param_count;
     if (pc != call->call.arg_count) return CONST_EVAL_FAIL;
     ComptimeParam stack_cp[8];
+    memset(stack_cp, 0, sizeof(stack_cp));
     ComptimeParam *cparams = pc <= 8 ? stack_cp :
         (ComptimeParam *)malloc(pc * sizeof(ComptimeParam));
     if (!cparams) return CONST_EVAL_FAIL;
+    if (cparams != stack_cp) memset(cparams, 0, pc * sizeof(ComptimeParam));
     bool need_free = (cparams != stack_cp);
     for (int i = 0; i < pc; i++) {
         int64_t av = eval_const_expr_subst(call->call.args[i], outer_params, outer_count);
@@ -1547,6 +1550,61 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
     }
     ct_ctx_set(ctx, name, nlen, newval);
     return 0; /* success (not a return value) */
+}
+
+/* Find the return NODE_STRUCT_INIT in a comptime function body (recursive).
+ * Returns the NODE_STRUCT_INIT node from the first return statement found. */
+static Node *find_comptime_struct_return(Node *block) {
+    if (!block) return NULL;
+    if (block->kind == NODE_RETURN && block->ret.expr &&
+        block->ret.expr->kind == NODE_STRUCT_INIT)
+        return block->ret.expr;
+    if (block->kind == NODE_BLOCK) {
+        for (int i = 0; i < block->block.stmt_count; i++) {
+            Node *r = find_comptime_struct_return(block->block.stmts[i]);
+            if (r) return r;
+        }
+    }
+    if (block->kind == NODE_IF) {
+        Node *r = find_comptime_struct_return(block->if_stmt.then_body);
+        if (r) return r;
+        return find_comptime_struct_return(block->if_stmt.else_body);
+    }
+    return NULL;
+}
+
+/* Evaluate a comptime struct return: evaluate each field value in the
+ * NODE_STRUCT_INIT, produce a new NODE_STRUCT_INIT with constant field values.
+ * Returns arena-allocated NODE_STRUCT_INIT with NODE_INT_LIT values, or NULL. */
+static Node *eval_comptime_struct_return(Arena *arena, Node *struct_init,
+                                          ComptimeParam *params, int param_count) {
+    if (!struct_init || struct_init->kind != NODE_STRUCT_INIT) return NULL;
+    int fc = struct_init->struct_init.field_count;
+    if (fc == 0) return NULL;
+
+    DesigField *fields = (DesigField *)arena_alloc(arena, fc * sizeof(DesigField));
+    if (!fields) return NULL;
+
+    for (int i = 0; i < fc; i++) {
+        DesigField *src = &struct_init->struct_init.fields[i];
+        fields[i].name = src->name;
+        fields[i].name_len = src->name_len;
+        int64_t val = eval_const_expr_subst(src->value, params, param_count);
+        if (val == CONST_EVAL_FAIL) return NULL;
+        /* Create constant NODE_INT_LIT for the evaluated value */
+        Node *lit = (Node *)arena_alloc(arena, sizeof(Node));
+        memset(lit, 0, sizeof(Node));
+        lit->kind = NODE_INT_LIT;
+        lit->int_lit.value = (uint64_t)val;
+        fields[i].value = lit;
+    }
+
+    Node *result = (Node *)arena_alloc(arena, sizeof(Node));
+    memset(result, 0, sizeof(Node));
+    result->kind = NODE_STRUCT_INIT;
+    result->struct_init.fields = fields;
+    result->struct_init.field_count = fc;
+    return result;
 }
 
 /* Create an array binding in comptime context */
@@ -3858,8 +3916,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* all args must be compile-time constant */
                     int pc = fn->func_decl.param_count;
                     ComptimeParam stack_cp2[8];
+                    memset(stack_cp2, 0, sizeof(stack_cp2));
                     ComptimeParam *cparams = pc <= 8 ? stack_cp2 :
                         (ComptimeParam *)arena_alloc(c->arena, pc * sizeof(ComptimeParam));
+                    if (cparams && cparams != stack_cp2)
+                        memset(cparams, 0, pc * sizeof(ComptimeParam));
                     bool all_const = cparams != NULL;
                     for (int ci = 0; ci < node->call.arg_count && ci < pc && all_const; ci++) {
                         /* BUG-430: use scoped eval to resolve const idents */
@@ -3884,19 +3945,30 @@ static Type *check_expr(Checker *c, Node *node) {
                         ct_ctx_init(&cctx, cparams, pc);
                         int64_t val = eval_comptime_block(fn->func_decl.body, &cctx);
                         ct_ctx_free(&cctx);
-                        if (val == CONST_EVAL_FAIL) {
-                            checker_error(c, node->loc.line,
-                                "comptime function '%.*s' body could not be evaluated at compile time",
-                                (int)callee_sym->name_len, callee_sym->name);
-                        } else {
+                        if (val != CONST_EVAL_FAIL) {
                             node->call.comptime_value = val;
                             node->call.is_comptime_resolved = true;
-                            /* BUG-415 cleanup: always keep as NODE_CALL with
-                             * is_comptime_resolved. eval_const_expr in ast.h
-                             * reads comptime_value for both positive and negative.
-                             * Previous approach converted positive to NODE_INT_LIT
-                             * but not negative (uint64_t can't represent -1), creating
-                             * a fragile two-path split. Single path is simpler. */
+                        } else {
+                            /* Scalar eval failed — try struct return.
+                             * Find return { .x = val } in body, evaluate field values. */
+                            Node *si = find_comptime_struct_return(fn->func_decl.body);
+                            if (si) {
+                                Node *csi = eval_comptime_struct_return(c->arena, si, cparams, pc);
+                                if (csi) {
+                                    node->call.comptime_struct_init = csi;
+                                    node->call.is_comptime_resolved = true;
+                                    /* Set type on the struct_init for emitter */
+                                    typemap_set(c, csi, result);
+                                } else {
+                                    checker_error(c, node->loc.line,
+                                        "comptime function '%.*s' body could not be evaluated at compile time",
+                                        (int)callee_sym->name_len, callee_sym->name);
+                                }
+                            } else {
+                                checker_error(c, node->loc.line,
+                                    "comptime function '%.*s' body could not be evaluated at compile time",
+                                    (int)callee_sym->name_len, callee_sym->name);
+                            }
                         }
                     }
                 }
@@ -7131,6 +7203,41 @@ static void check_stmt(Checker *c, Node *node) {
                                 (int)vlen, vname);
                         }
                     }
+                }
+            }
+
+            /* Designated init in return: validate against function return type */
+            if (node->ret.expr->kind == NODE_STRUCT_INIT && c->current_func_ret) {
+                Type *st = type_unwrap_distinct(c->current_func_ret);
+                if (st->kind == TYPE_STRUCT) {
+                    for (int fi = 0; fi < node->ret.expr->struct_init.field_count; fi++) {
+                        DesigField *df = &node->ret.expr->struct_init.fields[fi];
+                        bool found = false;
+                        for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
+                            if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
+                                memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
+                                found = true;
+                                Type *ft = st->struct_type.fields[si].type;
+                                Type *vt = checker_get_type(c, df->value);
+                                if (vt && ft && !type_equals(ft, vt) &&
+                                    !can_implicit_coerce(vt, ft) &&
+                                    !is_literal_compatible(df->value, ft)) {
+                                    checker_error(c, node->loc.line,
+                                        "return field '.%.*s' expects '%s', got '%s'",
+                                        (int)df->name_len, df->name,
+                                        type_name(ft), type_name(vt));
+                                }
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            checker_error(c, node->loc.line,
+                                "struct '%s' has no field '%.*s'",
+                                type_name(c->current_func_ret), (int)df->name_len, df->name);
+                        }
+                    }
+                    ret_type = c->current_func_ret;
+                    typemap_set(c, node->ret.expr, c->current_func_ret);
                 }
             }
 

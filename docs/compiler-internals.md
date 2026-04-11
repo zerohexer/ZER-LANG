@@ -208,6 +208,14 @@ Any future changes to orelse must update ALL THREE paths consistently. Check `is
 - All `optional.inner->kind == TYPE_VOID` checks wrapped with `type_unwrap_distinct()` (14 sites in emitter + 1 in checker). Same for `pointer.inner->kind == TYPE_OPAQUE` (6 sites in emitter).
 - Optional null init changed from `{ {0} }` to `{ 0, 0 }` (6 sites) — eliminates GCC "braces around scalar initializer" warning.
 
+### Comptime Local Variables (2026-04-11)
+
+`eval_comptime_block` now handles `NODE_VAR_DECL` as local bindings:
+```zer
+comptime u32 COMPUTE() { u32 x = 4; u32 y = x * 3; return y + 1; } // → 13
+```
+Implementation: stack-first `ComptimeParam[8]` array with malloc+double on overflow (no fixed limit). Each var_decl evaluates init expression via `eval_const_expr_subst`, adds `{name, value}` to bindings, continues to next statement. NODE_RETURN evaluates with all bindings available. Same dynamic pattern as parser arrays (RF9).
+
 ### Comptime Call In-Place Conversion (BUG-402/403/404, 2026-04-05)
 
 **BUG-402:** `const u32 P = PLATFORM(); comptime if (P) { ... }` failed — comptime if condition resolver required `is_comptime` flag (only on comptime functions, not const vars from comptime calls). Fix: relaxed to `is_const`, also checks `call.is_comptime_resolved` on init expression.

@@ -1,0 +1,26 @@
+container Stack(T) {
+    T[32] data;
+    u32 top;
+}
+
+void push(*Stack(u32) s, u32 val) {
+    s.data[s.top] = val;
+    s.top += 1;
+}
+
+u32 pop(*Stack(u32) s) {
+    s.top -= 1;
+    return s.data[s.top];
+}
+
+i32 main() {
+    Stack(u32) s;
+    s.top = 0;
+    push(&s, 42);
+    push(&s, 99);
+    u32 v = pop(&s);
+    if (v != 99) { return 1; }
+    v = pop(&s);
+    if (v != 42) { return 2; }
+    return 0;
+}

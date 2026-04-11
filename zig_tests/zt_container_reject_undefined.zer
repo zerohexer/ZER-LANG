@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// Undefined container name
+
+i32 main() {
+    Nonexistent(u32) x;
+    return 0;
+}

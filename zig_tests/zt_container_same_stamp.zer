@@ -1,0 +1,28 @@
+container Counter(T) {
+    T value;
+    u32 count;
+}
+
+void increment(*Counter(u32) c, u32 amount) {
+    c.value += amount;
+    c.count += 1;
+}
+
+i32 main() {
+    Counter(u32) a;
+    a.value = 0;
+    a.count = 0;
+    Counter(u32) b;
+    b.value = 100;
+    b.count = 0;
+
+    increment(&a, 5);
+    increment(&a, 3);
+    increment(&b, 10);
+
+    if (a.value != 8) { return 1; }
+    if (a.count != 2) { return 2; }
+    if (b.value != 110) { return 3; }
+    if (b.count != 1) { return 4; }
+    return 0;
+}

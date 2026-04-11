@@ -1,0 +1,19 @@
+struct Point { i32 x; i32 y; }
+
+i32 manhattan(Point p) {
+    i32 ax = p.x;
+    i32 ay = p.y;
+    if (ax < 0) { ax = 0 - ax; }
+    if (ay < 0) { ay = 0 - ay; }
+    return ax + ay;
+}
+
+i32 main() {
+    i32 d = manhattan({ .x = 3, .y = 4 });
+    if (d != 7) { return 1; }
+
+    d = manhattan({ .x = -5, .y = 10 });
+    if (d != 15) { return 2; }
+
+    return 0;
+}

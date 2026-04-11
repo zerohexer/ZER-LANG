@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+struct Point { i32 x; i32 y; }
+
+i32 main() {
+    Point p = { .x = 1, .z = 2 };
+    return 0;
+}

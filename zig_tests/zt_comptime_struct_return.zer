@@ -1,0 +1,21 @@
+struct Config { u32 baud; u8 bits; u8 parity; }
+
+comptime Config UART_DEFAULT() {
+    return { .baud = 115200, .bits = 8, .parity = 0 };
+}
+
+comptime Config UART_SLOW() {
+    return { .baud = 9600, .bits = 7, .parity = 1 };
+}
+
+i32 main() {
+    Config fast = UART_DEFAULT();
+    if (fast.baud != 115200) { return 1; }
+    if (fast.bits != 8) { return 2; }
+
+    Config slow = UART_SLOW();
+    if (slow.baud != 9600) { return 3; }
+    if (slow.parity != 1) { return 4; }
+
+    return 0;
+}

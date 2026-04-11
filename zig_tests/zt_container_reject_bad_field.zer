@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Container used with wrong field name
+
+container Box(T) {
+    T value;
+}
+
+i32 main() {
+    Box(u32) b = { .data = 42 };
+    return 0;
+}

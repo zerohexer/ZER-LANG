@@ -1,0 +1,14 @@
+struct RGB { u8 r; u8 g; u8 b; }
+
+i32 main() {
+    RGB red = { .r = 255, .g = 0, .b = 0 };
+    if (red.r != 255) { return 1; }
+    if (red.g != 0) { return 2; }
+    if (red.b != 0) { return 3; }
+
+    RGB blue = { .b = 255 };
+    if (blue.r != 0) { return 4; }
+    if (blue.b != 255) { return 5; }
+
+    return 0;
+}

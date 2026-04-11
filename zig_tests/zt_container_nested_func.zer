@@ -1,0 +1,29 @@
+container Buffer(T) {
+    T[16] data;
+    u32 len;
+}
+
+void buf_append(*Buffer(u32) b, u32 val) {
+    b.data[b.len] = val;
+    b.len += 1;
+}
+
+u32 buf_sum(*Buffer(u32) b) {
+    u32 total = 0;
+    for (u32 i = 0; i < b.len; i += 1) {
+        total += b.data[i];
+    }
+    return total;
+}
+
+i32 main() {
+    Buffer(u32) b;
+    b.len = 0;
+    buf_append(&b, 10);
+    buf_append(&b, 20);
+    buf_append(&b, 30);
+    u32 s = buf_sum(&b);
+    if (s != 60) { return 1; }
+    if (b.len != 3) { return 2; }
+    return 0;
+}

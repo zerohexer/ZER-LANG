@@ -1,0 +1,12 @@
+struct Vec2 { i32 x; i32 y; }
+
+comptime Vec2 VEC_ADD(i32 ax, i32 ay, i32 bx, i32 by) {
+    return { .x = ax + bx, .y = ay + by };
+}
+
+i32 main() {
+    Vec2 v = VEC_ADD(1, 2, 3, 4);
+    if (v.x != 4) { return 1; }
+    if (v.y != 6) { return 2; }
+    return 0;
+}

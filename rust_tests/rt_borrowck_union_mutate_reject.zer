@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Rust borrowck-union-borrow: cannot mutate union variant inside switch arm.
+// Source: tests/ui/borrowck/borrowck-union-borrow.rs
+// ZER: mutation of union inside its own switch arm → compile error.
+
+union Msg { u32 code; u8 flag; }
+
+i32 main() {
+    Msg m;
+    m.code = 42;
+
+    switch (m) {
+        .code => |val| {
+            m.flag = 1;   // error: cannot mutate union inside its own switch arm
+        }
+        .flag => |val| { }
+    }
+    return 0;
+}

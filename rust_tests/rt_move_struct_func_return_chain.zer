@@ -1,0 +1,39 @@
+// Rust moves: move through function return — ownership transferred cleanly.
+// ZER: move struct returned from function, passed to another, chain of 4.
+
+move struct Ticket { u32 id; u32 seq; }
+
+Ticket create(u32 id, u32 seq) {
+    Ticket t;
+    t.id = id;
+    t.seq = seq;
+    return t;
+}
+
+Ticket stamp(Ticket t) {
+    Ticket stamped;
+    stamped.id = t.id;
+    stamped.seq = t.seq + 1;
+    return stamped;
+}
+
+Ticket validate(Ticket t) {
+    Ticket valid;
+    valid.id = t.id;
+    valid.seq = t.seq + 10;
+    return valid;
+}
+
+u32 consume(Ticket t) {
+    return t.id + t.seq;
+}
+
+i32 main() {
+    Ticket t = create(5, 0);
+    Ticket s = stamp(t);
+    Ticket v = validate(s);
+    u32 result = consume(v);
+    // id=5, seq=0 → stamp: seq=1 → validate: seq=11 → 5+11=16
+    if (result != 16) { return 1; }
+    return 0;
+}

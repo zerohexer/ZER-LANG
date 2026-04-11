@@ -1,0 +1,33 @@
+// Rust const-block-non-item-statement: const expressions with block statements.
+// Source: tests/ui/consts/const-block-non-item-statement.rs
+// ZER: comptime functions with local computation.
+
+comptime u32 COMPUTE() {
+    u32 x = 4;
+    u32 y = x * 3;
+    return y + 1;
+}
+
+comptime u32 NESTED() {
+    u32 a = 2;
+    u32 b = a + 3;
+    u32 c = b * b;
+    return c;
+}
+
+i32 main() {
+    u32 v1 = COMPUTE();   // 4*3+1 = 13
+    u32 v2 = NESTED();    // (2+3)^2 = 25
+    if (v1 != 13) { return 1; }
+    if (v2 != 25) { return 2; }
+
+    // Use in array size
+    u8[COMPUTE()] buf;
+    if (@size(u8) * 13 != 13) { return 3; }
+    return 0;
+}
+
+// LIMITATION: comptime function body evaluator only handles simple
+// expressions (arithmetic, nested calls, if/return). Local variable
+// declarations (u32 x = 4;) inside comptime body are not evaluated.
+// Fix: extend eval_comptime_block to handle NODE_VAR_DECL + NODE_BLOCK.

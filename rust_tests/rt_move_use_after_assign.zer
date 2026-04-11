@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Rust repeat-drop-2: use of moved value after assignment to another var.
+// Source: tests/ui/drop/repeat-drop-2.rs (borrowck_catch)
+// ZER: move struct assigned then original used = compile error.
+
+move struct Resource { u32 id; }
+
+i32 main() {
+    Resource foo;
+    foo.id = 1;
+    Resource bar = foo;     // foo moved to bar
+    u32 id = foo.id;        // error: use after move
+    return 0;
+}

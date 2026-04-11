@@ -1,0 +1,22 @@
+// Rust borrowck-overloaded-index-autoderef: borrow through index + field.
+// Source: tests/ui/borrowck/borrowck-overloaded-index-autoderef.rs
+// ZER: access array element's field, then modify different element — safe.
+
+struct Foo { u32 x; u32 y; }
+
+i32 main() {
+    Foo[4] arr;
+    arr[0].x = 10;
+    arr[0].y = 20;
+    arr[1].x = 30;
+    arr[1].y = 40;
+
+    // Read one element's field, modify another — independent
+    u32 v = arr[0].x;
+    arr[1].y = 99;
+
+    if (v != 10) { return 1; }
+    if (arr[1].y != 99) { return 2; }
+    if (arr[0].y != 20) { return 3; }   // untouched
+    return 0;
+}

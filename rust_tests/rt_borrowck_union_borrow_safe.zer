@@ -1,0 +1,21 @@
+// Rust borrowck-union-borrow: union fields share memory — borrow one, can't mutate other.
+// Source: tests/ui/borrowck/borrowck-union-borrow.rs
+// ZER: union switch captures are scoped — mutation blocked inside switch arm.
+
+union Data { u32 as_int; u8 as_byte; }
+
+i32 main() {
+    Data d;
+    d.as_int = 0x12345678;
+
+    // Read through switch — safe pattern
+    switch (d) {
+        .as_int => |val| {
+            if (val != 0x12345678) { return 1; }
+        }
+        .as_byte => |val| {
+            // little-endian: low byte = 0x78
+        }
+    }
+    return 0;
+}

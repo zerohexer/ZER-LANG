@@ -1,0 +1,22 @@
+// Rust const-big-enum: enum with large explicit values, static init + pattern match.
+// Source: tests/ui/consts/const-big-enum.rs
+// ZER: enum with explicit values + switch dispatch.
+
+enum Status { ok = 0, warn = 100, err = 200, fatal = 999 }
+
+u32 severity(Status s) {
+    switch (s) {
+        .ok => { return 0; }
+        .warn => { return 1; }
+        .err => { return 2; }
+        .fatal => { return 3; }
+    }
+}
+
+i32 main() {
+    if (severity(Status.ok) != 0) { return 1; }
+    if (severity(Status.warn) != 1) { return 2; }
+    if (severity(Status.err) != 2) { return 3; }
+    if (severity(Status.fatal) != 3) { return 4; }
+    return 0;
+}

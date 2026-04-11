@@ -1,0 +1,40 @@
+// Rust drop: Drop fires in each match arm independently.
+// ZER: defer in switch arm — fires when arm exits.
+
+struct Work { u32 cost; }
+Pool(Work, 4) pool;
+
+enum Priority { low, medium, high }
+
+u32 process(Priority p) {
+    switch (p) {
+        .low => {
+            ?Handle(Work) mh = pool.alloc();
+            Handle(Work) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).cost = 1;
+            return h.cost;
+        }
+        .medium => {
+            ?Handle(Work) mh = pool.alloc();
+            Handle(Work) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).cost = 5;
+            return h.cost;
+        }
+        .high => {
+            ?Handle(Work) mh = pool.alloc();
+            Handle(Work) h = mh orelse return;
+            defer pool.free(h);
+            pool.get(h).cost = 10;
+            return h.cost;
+        }
+    }
+}
+
+i32 main() {
+    if (process(Priority.low) != 1) { return 1; }
+    if (process(Priority.medium) != 5) { return 2; }
+    if (process(Priority.high) != 10) { return 3; }
+    return 0;
+}

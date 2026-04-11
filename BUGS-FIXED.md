@@ -3203,3 +3203,23 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **V11 — Same-type instance deadlock:** NOT a real deadlock. ZER's per-statement locking means locks never overlap — each statement acquires/releases before the next. Atomicity concern (partial transfer visible) is a design limitation, same as Rust (use single shared struct for atomic multi-field ops).
 
 **V12 — Container type-id collision:** Already caught. Each container stamp gets unique type_id (c->next_type_id++). @ptrcast provenance check catches Wrapper(u32) → Wrapper(i32) mismatch.
+
+### Red Team V13-V16 (2026-04-12, Gemini round 4)
+
+**V13 — Move struct value capture:** CONFIRMED + FIXED. `if (opt) |k|` copies move struct, creating two owners. Fix: checker errors on value capture of move struct — must use `|*k|` pointer capture.
+
+**V14 — Async shared struct lock-hold:** CONFIRMED + FIXED. Shared struct access in async function → lock held across yield/await = deadlock. Fix: `c->in_async` flag, checker errors on shared struct field access in async body. Same approach as Rust (MutexGuard not Send across await).
+
+**V15 — Comptime @ptrtoint:** NOT a bug. `@ptrtoint` in comptime returns CONST_EVAL_FAIL — comptime evaluator can't resolve pointer addresses.
+
+**V16 — Move struct partial field access:** NOT a bug. zercheck marks entire struct as HS_TRANSFERRED, any field access errors.
+
+### Red Team V17-V20 (2026-04-12, Gemini round 5)
+
+**V17 — Async return + defer:** NOT a bug. Emitter handles async return correctly — defers fire on completion.
+
+**V18 — Shared pointer in async:** CONFIRMED + FIXED. `*Bus b` parameter in async function bypassed V14 check because NODE_FIELD checked TYPE_POINTER (the object type), not the pointed-to shared struct. Fix: unwrap pointer before checking is_shared. Also revealed emitter bug: async transformer doesn't carry function parameters into poll function (GCC error 'b' undeclared) — the safety check prevents reaching that code generation bug.
+
+**V19 — Spawn move bypass:** NOT a bug. zercheck already tracks move struct args to spawn as HS_TRANSFERRED.
+
+**V20 — Container pointer-to-array decay:** NOT a bug. Container *T substitution produces correct *concrete type.

@@ -178,6 +178,8 @@ typedef struct {
     int container_inst_count;
     int container_inst_capacity;
 
+    uint32_t stack_limit;   /* --stack-limit N: error when estimated stack > N bytes (0 = disabled) */
+
     /* Stack depth analysis: call graph + frame sizes */
     struct StackFrame {
         const char *name;

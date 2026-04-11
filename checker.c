@@ -4375,6 +4375,16 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
         }
 
+        /* Red Team V14: ban shared struct access in async functions.
+         * Lock held across yield/await = potential deadlock. */
+        if (obj->kind == TYPE_STRUCT &&
+            (obj->struct_type.is_shared || obj->struct_type.is_shared_rw) &&
+            c->in_async) {
+            checker_error(c, node->loc.line,
+                "cannot access shared struct in async function — "
+                "lock may be held across yield/await, causing deadlock");
+        }
+
         /* struct field lookup */
         if (obj->kind == TYPE_STRUCT) {
             for (uint32_t i = 0; i < obj->struct_type.field_count; i++) {
@@ -6629,6 +6639,14 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 } else {
+                    /* Red Team V13: move struct value capture creates duplicate owner.
+                     * Force pointer capture for move types. */
+                    Type *uw_eff = type_unwrap_distinct(unwrapped);
+                    if (uw_eff && uw_eff->kind == TYPE_STRUCT && uw_eff->struct_type.is_move) {
+                        checker_error(c, node->loc.line,
+                            "move struct cannot be captured by value — use |*%.*s| for pointer capture",
+                            (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name);
+                    }
                     cap_type = unwrapped;
                     cap_const = true;
                 }
@@ -8609,9 +8627,12 @@ static void check_func_body(Checker *c, Node *node) {
             }
         }
         bool saved_comptime = c->in_comptime_body;
+        bool saved_async = c->in_async;
         if (node->func_decl.is_comptime) c->in_comptime_body = true;
+        if (node->func_decl.is_async) c->in_async = true;
         check_stmt(c, node->func_decl.body);
         c->in_comptime_body = saved_comptime;
+        c->in_async = saved_async;
         c->in_naked = false;
 
         /* check that all paths return for non-void functions */

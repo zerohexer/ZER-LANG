@@ -901,8 +901,31 @@ All shared structs now use **recursive pthread_mutex** instead of spinlock:
 - `emit_opt_null_literal(e, type)` — emits `(T*)0`, `{ 0 }` (?void), or `{ 0, 0 }` (?T struct). Replaced 6 manual literal emission sites.
 - `emit_return_null(e)` — emits `return <zero>` for current function's return type. Handles ?void, ?T struct, ?*T, void, scalar. Replaced 6 duplicate return-null code blocks.
 
-### Full Refactoring Summary (2026-04-09)
+### Full Refactoring Summary (2026-04-09/10/11)
 16 helpers added across zercheck.c/checker.c/emitter.c. 39 scattered sites unified. ~250 lines of duplicated code eliminated. All 9 gaps from `docs/refactoring_gaps.md` complete. Adding a new handle state, move-like type, optional variant, escape flag, ISR-banned method, or volatile-checked intrinsic now requires updating ONE helper function instead of finding N scattered sites.
+
+## Bugs Fixed This Session (2026-04-09/10/11)
+
+### BUG-468: move struct conditional transfer not caught
+`if (c) { consume(t); }` then `t.field` — zercheck path merge only checked `HS_FREED || HS_MAYBE_FREED`, not `HS_TRANSFERRED`. Fix: `is_handle_consumed()` helper includes all three states. Applied to if/else merge, if-no-else merge, switch merge, loop check.
+
+### BUG-469: struct containing move struct field not tracked
+`consume_wrapper(w)` where `Wrapper` has `Key` (move struct) field — compiled. Fix: `contains_move_struct_field()` helper walks struct fields for move types. Unified into `should_track_move()`. Applied at NODE_CALL (first/second pass), NODE_IDENT, NODE_RETURN.
+
+### BUG-470: return move struct not marked as transferred
+`return t; t.kind;` — dead code not flagged. Fix: NODE_RETURN handler marks move struct ident as `HS_TRANSFERRED` using `should_track_move()`.
+
+### BUG-471: pool.free()/slab.free() missing Handle element type check
+`pool_b.free(handle_from_pool_a)` compiled — Handle is `u64` at C level, no type mismatch. Fix: checker Pool/Slab `.free()` handler validates `type_equals(handle.elem, pool.elem)`. Same pattern as existing `.free_ptr()` check. ~5 lines each.
+
+### BUG-472: spawn wrapper missing in multi-module builds
+`emit_file_no_preamble` didn't prescan for spawn. In topo order, main module emitted last via this function. Fix: added prescan + `emit_spawn_wrappers()` to `emit_file_no_preamble`. Then unified into `emit_file_module(e, file, with_preamble)` — one function, one flow.
+
+### BUG-473: shared struct recursive mutex
+Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call on shared struct). Fix: all shared structs use `pthread_mutex_t` with `PTHREAD_MUTEX_RECURSIVE`. Lazy init via `_zer_mtx_ensure_init`. `_XOPEN_SOURCE 500` for portability.
+
+### Barrier keyword type — eliminates pre-existing UB
+`u32 barrier` with `@barrier_init` was 4-byte variable for ~120-byte struct. `memset` overflow caused silent stack corruption. Fix: `Barrier` keyword type (lexer/parser/types/checker/emitter). Checker rejects non-Barrier args to `@barrier_init`/`@barrier_wait`.
 
 ## Value Range Propagation (checker.c)
 

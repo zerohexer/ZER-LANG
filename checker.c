@@ -7923,6 +7923,18 @@ static void register_decl(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
                 }
+                /* Red Team V10: move struct inside shared struct → ownership breach.
+                 * A thread can "move" the field out, leaving shared struct in zombie state. */
+                if (node->struct_decl.is_shared && sf->type) {
+                    Type *ft = type_unwrap_distinct(sf->type);
+                    if (ft->kind == TYPE_STRUCT && ft->struct_type.is_move) {
+                        checker_error(c, node->loc.line,
+                            "move struct '%.*s' cannot be a field of shared struct '%.*s' — "
+                            "ownership transfer from shared memory creates data race",
+                            (int)sf->name_len, sf->name,
+                            (int)node->struct_decl.name_len, node->struct_decl.name);
+                    }
+                }
                 /* BUG-227/232/314: reject recursive struct by value (incomplete type in C).
                  * Unwrap arrays AND distinct — S[1] or distinct S contains S by value too. */
                 {

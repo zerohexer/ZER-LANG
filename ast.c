@@ -190,6 +190,11 @@ static void print_type(TypeNode *t, int depth) {
         printf("const ");
         print_type(t->qualified.inner, depth);
         break;
+    case TYNODE_CONTAINER:
+        printf("%.*s(", (int)t->container.name_len, t->container.name);
+        print_type(t->container.type_arg, depth);
+        printf(")");
+        break;
     case TYNODE_VOLATILE:
         printf("volatile ");
         print_type(t->qualified.inner, depth);
@@ -474,6 +479,21 @@ void ast_print(Node *node, int depth) {
                    node->struct_init.fields[i].name);
             ast_print(node->struct_init.fields[i].value, depth + 2);
         }
+        break;
+
+    case NODE_CONTAINER_DECL:
+        printf("CONTAINER '%.*s'(%.*s) (%d fields)\n",
+               (int)node->container_decl.name_len, node->container_decl.name,
+               (int)node->container_decl.type_param_len, node->container_decl.type_param,
+               node->container_decl.field_count);
+        break;
+
+    case NODE_DO_WHILE:
+        printf("DO_WHILE\n");
+        ast_print(node->while_stmt.body, depth + 1);
+        indent(depth + 1);
+        printf("COND: ");
+        ast_print(node->while_stmt.cond, depth + 2);
         break;
     }
 }

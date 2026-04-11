@@ -1148,12 +1148,35 @@ static Node *parse_for_stmt(Parser *p) {
             advance(p); /* consume 'in' */
             Node *collection = parse_expression(p);
             consume(p, TOK_RPAREN, "expected ')' after for-in expression");
+            Node *user_body = parse_block(p);
 
-            /* Build: for (usize _zer_ri = 0; _zer_ri < collection.len; _zer_ri += 1) */
-            /* init: usize _zer_ri = 0 */
+            /* Desugar: for (usize __ri = 0; __ri < collection.len; __ri += 1) { T item = collection[__ri]; body }
+             * Each use of collection creates a SEPARATE ident node (no shared pointers).
+             * For simple idents: zero overhead. For function calls: checker rejects
+             * non-ident/non-field collection expressions (enforced below). */
+
+            /* Reject non-trivial collection expressions — must be ident or field access */
+            if (collection->kind != NODE_IDENT && collection->kind != NODE_FIELD) {
+                error(p, "for-in collection must be a variable or field — "
+                      "assign complex expression to a variable first");
+            }
+
+            /* Helper: clone collection ident/field for separate AST positions */
+            #define CLONE_COLLECTION() ({ \
+                Node *_c = new_node(p, collection->kind); \
+                if (collection->kind == NODE_IDENT) { \
+                    _c->ident.name = collection->ident.name; \
+                    _c->ident.name_len = collection->ident.name_len; \
+                } else { \
+                    _c->field.object = collection->field.object; \
+                    _c->field.field_name = collection->field.field_name; \
+                    _c->field.field_name_len = collection->field.field_name_len; \
+                } _c; })
+            #define MKREF_RI() ({ Node *_r = new_node(p, NODE_IDENT); _r->ident.name = "__ri"; _r->ident.name_len = 4; _r; })
+
+            /* for init: usize __ri = 0 */
             Node *idx_init = new_node(p, NODE_VAR_DECL);
-            TypeNode *usize_tn = new_type_node(p, TYNODE_USIZE);
-            idx_init->var_decl.type = usize_tn;
+            idx_init->var_decl.type = new_type_node(p, TYNODE_USIZE);
             idx_init->var_decl.name = "__ri";
             idx_init->var_decl.name_len = 4;
             Node *zero = new_node(p, NODE_INT_LIT);
@@ -1161,63 +1184,53 @@ static Node *parse_for_stmt(Parser *p) {
             idx_init->var_decl.init = zero;
             n->for_stmt.init = idx_init;
 
-            /* cond: _zer_ri < collection.len */
-            Node *idx_ref = new_node(p, NODE_IDENT);
-            idx_ref->ident.name = "__ri";
-            idx_ref->ident.name_len = 4;
+            /* cond: __ri < collection.len */
             Node *len_access = new_node(p, NODE_FIELD);
-            len_access->field.object = collection;
+            len_access->field.object = CLONE_COLLECTION();
             len_access->field.field_name = "len";
             len_access->field.field_name_len = 3;
             Node *cond = new_node(p, NODE_BINARY);
             cond->binary.op = TOK_LT;
-            cond->binary.left = idx_ref;
+            cond->binary.left = MKREF_RI();
             cond->binary.right = len_access;
             n->for_stmt.cond = cond;
 
-            /* step: _zer_ri += 1 */
-            Node *idx_ref2 = new_node(p, NODE_IDENT);
-            idx_ref2->ident.name = "__ri";
-            idx_ref2->ident.name_len = 4;
+            /* step: __ri += 1 */
             Node *one = new_node(p, NODE_INT_LIT);
             one->int_lit.value = 1;
             Node *step = new_node(p, NODE_ASSIGN);
             step->assign.op = TOK_PLUSEQ;
-            step->assign.target = idx_ref2;
+            step->assign.target = MKREF_RI();
             step->assign.value = one;
             n->for_stmt.step = step;
 
-            /* body: { Type item = collection.ptr[_zer_ri]; ... original body ... } */
-            Node *user_body = parse_block(p);
-
-            /* Build var decl: Type item = collection[__ri] (bounds-checked) */
+            /* body item decl: T item = collection[__ri] (bounds-checked) */
             Node *item_decl = new_node(p, NODE_VAR_DECL);
             item_decl->var_decl.type = elem_type;
             item_decl->var_decl.name = item_name.start;
             item_decl->var_decl.name_len = item_name.length;
-            /* collection[__ri] — uses slice bounds-checked indexing */
-            Node *idx_ref3 = new_node(p, NODE_IDENT);
-            idx_ref3->ident.name = "__ri";
-            idx_ref3->ident.name_len = 4;
             Node *indexed = new_node(p, NODE_INDEX);
-            indexed->index_expr.object = collection;
-            indexed->index_expr.index = idx_ref3;
+            indexed->index_expr.object = CLONE_COLLECTION();
+            indexed->index_expr.index = MKREF_RI();
             item_decl->var_decl.init = indexed;
 
-            /* Wrap: { item_decl; ...user_body_stmts... } */
-            int total_stmts = 1 + (user_body->kind == NODE_BLOCK ? user_body->block.stmt_count : 1);
-            Node **stmts = (Node **)arena_alloc(p->arena, total_stmts * sizeof(Node *));
-            stmts[0] = item_decl;
+            /* Wrap body: { item_decl; ...user_body_stmts... } */
+            int body_count = 1 + (user_body->kind == NODE_BLOCK ? user_body->block.stmt_count : 1);
+            Node **body_stmts = (Node **)arena_alloc(p->arena, body_count * sizeof(Node *));
+            body_stmts[0] = item_decl;
             if (user_body->kind == NODE_BLOCK) {
                 for (int si = 0; si < user_body->block.stmt_count; si++)
-                    stmts[1 + si] = user_body->block.stmts[si];
+                    body_stmts[1 + si] = user_body->block.stmts[si];
             } else {
-                stmts[1] = user_body;
+                body_stmts[1] = user_body;
             }
-            Node *wrapper = new_node(p, NODE_BLOCK);
-            wrapper->block.stmts = stmts;
-            wrapper->block.stmt_count = total_stmts;
-            n->for_stmt.body = wrapper;
+            Node *for_body = new_node(p, NODE_BLOCK);
+            for_body->block.stmts = body_stmts;
+            for_body->block.stmt_count = body_count;
+            n->for_stmt.body = for_body;
+
+            #undef CLONE_COLLECTION
+            #undef MKREF_RI
 
             return n;
         }

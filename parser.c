@@ -1454,6 +1454,25 @@ static Node *parse_statement(Parser *p) {
         return n;
     }
 
+    /* static_assert */
+    if (match(p, TOK_STATIC_ASSERT)) {
+        Node *n = new_node(p, NODE_STATIC_ASSERT);
+        consume(p, TOK_LPAREN, "expected '(' after static_assert");
+        n->static_assert_stmt.cond = parse_expression(p);
+        n->static_assert_stmt.message = NULL;
+        n->static_assert_stmt.message_len = 0;
+        if (match(p, TOK_COMMA)) {
+            if (p->current.type == TOK_STRING) {
+                n->static_assert_stmt.message = p->current.start + 1;
+                n->static_assert_stmt.message_len = p->current.length > 2 ? p->current.length - 2 : 0;
+                advance(p);
+            }
+        }
+        consume(p, TOK_RPAREN, "expected ')' after static_assert");
+        consume(p, TOK_SEMICOLON, "expected ';' after static_assert");
+        return n;
+    }
+
     /* defer */
     if (match(p, TOK_DEFER)) {
         Node *n = new_node(p, NODE_DEFER);
@@ -1953,6 +1972,25 @@ static Node *parse_declaration(Parser *p) {
         memcmp(p->current.start, "naked", 5) == 0) {
         advance(p); /* consume "naked" */
         is_naked = true;
+    }
+
+    /* static_assert at top level */
+    if (match(p, TOK_STATIC_ASSERT)) {
+        Node *n = new_node(p, NODE_STATIC_ASSERT);
+        consume(p, TOK_LPAREN, "expected '(' after static_assert");
+        n->static_assert_stmt.cond = parse_expression(p);
+        n->static_assert_stmt.message = NULL;
+        n->static_assert_stmt.message_len = 0;
+        if (match(p, TOK_COMMA)) {
+            if (p->current.type == TOK_STRING) {
+                n->static_assert_stmt.message = p->current.start + 1;
+                n->static_assert_stmt.message_len = p->current.length > 2 ? p->current.length - 2 : 0;
+                advance(p);
+            }
+        }
+        consume(p, TOK_RPAREN, "expected ')' after static_assert");
+        consume(p, TOK_SEMICOLON, "expected ';' after static_assert");
+        return n;
     }
 
     /* import */

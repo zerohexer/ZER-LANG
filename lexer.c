@@ -241,6 +241,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
         if (word_len == 6 && memcmp(word+1, "truct", 5) == 0) return TOK_STRUCT;
         if (word_len == 6 && memcmp(word+1, "witch", 5) == 0) return TOK_SWITCH;
         if (word_len == 6 && memcmp(word+1, "tatic", 5) == 0) return TOK_STATIC;
+        if (word_len == 13 && memcmp(word+1, "tatic_assert", 12) == 0) return TOK_STATIC_ASSERT;
         if (word_len == 6 && memcmp(word+1, "hared", 5) == 0) return TOK_SHARED;
         /* spawn is contextual — NOT a keyword, parsed as ident */
         break;
@@ -584,6 +585,7 @@ const char *token_type_name(TokenType type) {
     case TOK_INTERRUPT: return "interrupt";
     case TOK_ASM: return "asm";
     case TOK_STATIC: return "static";
+    case TOK_STATIC_ASSERT: return "static_assert";
     case TOK_KEEP: return "keep";
     case TOK_AS: return "as";
     case TOK_MMIO: return "mmio";

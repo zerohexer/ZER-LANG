@@ -1435,6 +1435,34 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
                 continue;
             }
 
+            /* Switch — evaluate expr, match against arm values */
+            if (stmt->kind == NODE_SWITCH) {
+                int64_t sw_val = eval_const_expr_subst(stmt->switch_stmt.expr, locals, local_count);
+                if (sw_val != CONST_EVAL_FAIL) {
+                    bool matched = false;
+                    for (int ai = 0; ai < stmt->switch_stmt.arm_count; ai++) {
+                        SwitchArm *arm = &stmt->switch_stmt.arms[ai];
+                        if (arm->is_default) {
+                            int64_t r = eval_comptime_block(arm->body, locals, local_count);
+                            if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                            matched = true;
+                            break;
+                        }
+                        for (int vi = 0; vi < arm->value_count; vi++) {
+                            int64_t arm_val = eval_const_expr_subst(arm->values[vi], locals, local_count);
+                            if (arm_val != CONST_EVAL_FAIL && arm_val == sw_val) {
+                                int64_t r = eval_comptime_block(arm->body, locals, local_count);
+                                if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (matched) break;
+                    }
+                }
+                continue;
+            }
+
             int64_t r = eval_comptime_stmt(stmt, locals, local_count);
             if (r != CONST_EVAL_FAIL) { result = r; break; }
         }
@@ -6804,6 +6832,26 @@ static void check_stmt(Checker *c, Node *node) {
         c->defer_depth--;
         break;
 
+    case NODE_STATIC_ASSERT: {
+        /* Type-check the condition first — resolves comptime calls */
+        check_expr(c, node->static_assert_stmt.cond);
+        int64_t val = eval_const_expr_scoped(c, node->static_assert_stmt.cond);
+        if (val == CONST_EVAL_FAIL) {
+            checker_error(c, node->loc.line,
+                "static_assert condition must be a compile-time constant");
+        } else if (!val) {
+            if (node->static_assert_stmt.message) {
+                checker_error(c, node->loc.line,
+                    "static_assert failed: %.*s",
+                    (int)node->static_assert_stmt.message_len,
+                    node->static_assert_stmt.message);
+            } else {
+                checker_error(c, node->loc.line, "static_assert failed");
+            }
+        }
+        break;
+    }
+
     case NODE_EXPR_STMT:
         check_expr(c, node->expr_stmt.expr);
         /* Ghost handle: warn if pool.alloc()/slab.alloc() result is discarded.
@@ -7396,7 +7444,7 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
@@ -7458,7 +7506,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
     case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
     case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
     case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT:
     case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL:
@@ -8096,6 +8144,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_INTERRUPT:
     case NODE_MMIO:
     case NODE_GLOBAL_VAR:
+    case NODE_STATIC_ASSERT:
         break;
     }
 }
@@ -8541,6 +8590,23 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         check_func_body(c, decl);
+        /* Top-level static_assert — evaluate during body checking phase */
+        if (decl->kind == NODE_STATIC_ASSERT) {
+            check_expr(c, decl->static_assert_stmt.cond);
+            int64_t val = eval_const_expr_scoped(c, decl->static_assert_stmt.cond);
+            if (val == CONST_EVAL_FAIL) {
+                checker_error(c, decl->loc.line,
+                    "static_assert condition must be a compile-time constant");
+            } else if (!val) {
+                if (decl->static_assert_stmt.message) {
+                    checker_error(c, decl->loc.line, "static_assert failed: %.*s",
+                        (int)decl->static_assert_stmt.message_len,
+                        decl->static_assert_stmt.message);
+                } else {
+                    checker_error(c, decl->loc.line, "static_assert failed");
+                }
+            }
+        }
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
             Type *type = resolve_type(c, decl->var_decl.type);
             Type *init = check_expr(c, decl->var_decl.init);

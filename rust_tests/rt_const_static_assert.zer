@@ -1,0 +1,17 @@
+// C11 static_assert — compile-time validation of constants.
+
+comptime u32 BUF_SIZE() { return 64; }
+comptime u32 MAX_ITEMS() { return 16; }
+
+// These should all pass (condition is true)
+static_assert(1, "one is true");
+static_assert(BUF_SIZE() > 0, "buffer size must be positive");
+static_assert(MAX_ITEMS() <= 256, "max items must fit in u8 index");
+static_assert(BUF_SIZE() >= MAX_ITEMS(), "buffer must hold all items");
+
+i32 main() {
+    // static_assert in function body
+    static_assert(1 + 1 == 2, "math works");
+    static_assert(BUF_SIZE() == 64, "buf size is 64");
+    return 0;
+}

@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// static_assert with false condition — must be rejected at compile time.
+
+comptime u32 SIZE() { return 0; }
+
+static_assert(SIZE() > 0, "size must be positive");
+
+i32 main() { return 0; }

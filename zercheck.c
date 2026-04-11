@@ -1517,7 +1517,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
     case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
         break;
     }
 }
@@ -1992,7 +1992,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         break;
 
     /* Nodes not relevant to zercheck handle tracking */
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_LABEL:
     case NODE_ASM:
     /* Expression nodes — handled by zc_check_expr via NODE_EXPR_STMT */

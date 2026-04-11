@@ -2137,6 +2137,10 @@ reg[7..4] = 0x0F;          // Set bits 7:4
 | Division by zero | Forced guard — compile error if divisor not proven nonzero |
 | Invalid MMIO address | mmio range declarations + alignment check + boot probe |
 | ISR data race | Shared globals without volatile → compile error |
+| Thread data race | Spawn target body scanned for non-shared global access → error/warning |
+| Dangling @ptrtoint | `return @ptrtoint(&local)` → compile error (direct + indirect via struct fields) |
+| Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
+| Division by zero (call) | `x / func()` where func() return range unknown → compile error |
 | Wrong pointer cast | Provenance tracking through *opaque round-trips |
 
 ---
@@ -2201,6 +2205,16 @@ spawn handler(42, true);        // OK — value args copied
 ThreadHandle th = spawn compute(&local_data);
 th.join();                      // MUST join — zercheck error if not
 ```
+
+**SAFETY CHECKS**
+- Non-shared `*T` to fire-and-forget spawn → compile error
+- Handle to spawn → compile error (pool.get not thread-safe)
+- Spawn target body scanned for non-shared global access:
+  - No atomic/barrier in function → compile **error**
+  - Has atomic/barrier → compile **warning** (lock-free pattern possible)
+  - Transitive: follows callees 8 levels deep
+- Escape hatches: `volatile` global, `shared struct`, `threadlocal`, `@atomic_*`, `const`
+- spawn inside `@critical` → compile error
 
 ### Condvar — Thread Synchronization
 ```zer

@@ -1,3 +1,4 @@
+// EXPECTED: compile error
 // Rust source: tests/ui/threads-sendsync/task-comm-0.rs
 // Thread sends 10, 20, 30 through channel. Main receives all 3, asserts last == 30.
 

@@ -1,3 +1,4 @@
+// EXPECTED: compile error
 // Rust source: tests/ui/threads-sendsync/task-comm-9.rs
 // One thread sends 0..9. Main receives and sums. Assert sum == 45.
 

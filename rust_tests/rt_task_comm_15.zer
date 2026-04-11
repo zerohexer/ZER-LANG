@@ -1,3 +1,4 @@
+// EXPECTED: compile error
 // Rust source: tests/ui/threads-sendsync/task-comm-15.rs
 // Safety scenario: thread sends 10 messages, receiver may exit early (after 1).
 // Verifies graceful handling when receiver disconnects before producer finishes.

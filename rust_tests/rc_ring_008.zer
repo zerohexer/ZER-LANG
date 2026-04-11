@@ -1,3 +1,4 @@
+// EXPECTED: compile error
 // Rust: mpsc — multiple senders, single consumer
 // ZER: two spawned producers push to shared Ring, main drains
 // Equivalent to: task-comm-17 (multi-sender)

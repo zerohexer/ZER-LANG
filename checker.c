@@ -996,6 +996,62 @@ static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, in
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx);
 static Scope *_comptime_global_scope; /* set before eval for nested comptime calls */
 
+/* Recursive TypeNode substitution: clone the TypeNode tree with type param T replaced.
+ * Used by container monomorphization to handle arbitrarily nested T references:
+ * ?*Container(T), *T, []T, T[N], etc. */
+static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
+                                 const char *param_name, uint32_t param_len,
+                                 TypeNode *replacement) {
+    if (!tn) return NULL;
+    /* Leaf: if this is the type param, return the replacement */
+    if (tn->kind == TYNODE_NAMED &&
+        tn->named.name_len == param_len &&
+        memcmp(tn->named.name, param_name, param_len) == 0) {
+        return replacement;
+    }
+    /* Recurse into wrappers */
+    switch (tn->kind) {
+    case TYNODE_POINTER: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->pointer.inner = subst_typenode(a, tn->pointer.inner, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_OPTIONAL: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->optional.inner = subst_typenode(a, tn->optional.inner, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_SLICE: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->slice.inner = subst_typenode(a, tn->slice.inner, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_ARRAY: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->array.elem = subst_typenode(a, tn->array.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_CONST: case TYNODE_VOLATILE: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->qualified.inner = subst_typenode(a, tn->qualified.inner, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_CONTAINER: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->container.type_arg = subst_typenode(a, tn->container.type_arg, param_name, param_len, replacement);
+        return r;
+    }
+    default:
+        return tn; /* no substitution needed (primitives, named non-param types) */
+    }
+}
+
 /* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
 static Type *resolve_type(Checker *c, TypeNode *tn) {
     if (!tn) return ty_void;
@@ -1204,7 +1260,16 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
     }
 
     case TYNODE_CONTAINER: {
-        /* Container instantiation: Stack(u32) → stamp concrete struct */
+        /* Container instantiation: Stack(u32) → stamp concrete struct.
+         * Depth limit prevents infinite recursion from self-referential containers. */
+        static int _container_depth = 0;
+        if (++_container_depth > 32) {
+            _container_depth--;
+            checker_error(c, tn->loc.line,
+                "container instantiation depth exceeded (max 32) — "
+                "possible infinite recursive container type");
+            return ty_void;
+        }
         const char *cname = tn->container.name;
         uint32_t cnlen = (uint32_t)tn->container.name_len;
         Type *concrete = resolve_type(c, tn->container.type_arg);
@@ -1266,41 +1331,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 sf->name_len = (uint32_t)fd->name_len;
                 sf->is_keep = false;
                 sf->is_volatile = (fd->type && fd->type->kind == TYNODE_VOLATILE);
-                /* Substitute type param: if field type is TYNODE_NAMED matching T, use concrete */
-                TypeNode *ftn = fd->type;
-                if (ftn && ftn->kind == TYNODE_NAMED &&
-                    ftn->named.name_len == tmpl->type_param_len &&
-                    memcmp(ftn->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
-                    sf->type = concrete;
-                } else if (ftn && ftn->kind == TYNODE_ARRAY && ftn->array.elem &&
-                    ftn->array.elem->kind == TYNODE_NAMED &&
-                    ftn->array.elem->named.name_len == tmpl->type_param_len &&
-                    memcmp(ftn->array.elem->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
-                    /* T[N] → concrete[N] */
-                    int64_t sz = eval_const_expr(ftn->array.size_expr);
-                    sf->type = type_array(c->arena, concrete, sz > 0 ? (uint32_t)sz : 0);
-                } else if (ftn && ftn->kind == TYNODE_POINTER && ftn->pointer.inner &&
-                    ftn->pointer.inner->kind == TYNODE_NAMED &&
-                    ftn->pointer.inner->named.name_len == tmpl->type_param_len &&
-                    memcmp(ftn->pointer.inner->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
-                    /* *T → *concrete */
-                    sf->type = type_pointer(c->arena, concrete);
-                } else if (ftn && ftn->kind == TYNODE_OPTIONAL && ftn->optional.inner &&
-                    ftn->optional.inner->kind == TYNODE_NAMED &&
-                    ftn->optional.inner->named.name_len == tmpl->type_param_len &&
-                    memcmp(ftn->optional.inner->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
-                    /* ?T → ?concrete */
-                    sf->type = type_optional(c->arena, concrete);
-                } else if (ftn && ftn->kind == TYNODE_SLICE && ftn->slice.inner &&
-                    ftn->slice.inner->kind == TYNODE_NAMED &&
-                    ftn->slice.inner->named.name_len == tmpl->type_param_len &&
-                    memcmp(ftn->slice.inner->named.name, tmpl->type_param, tmpl->type_param_len) == 0) {
-                    /* []T → []concrete */
-                    sf->type = type_slice(c->arena, concrete);
-                } else {
-                    /* No substitution needed — resolve normally */
-                    sf->type = resolve_type(c, ftn);
-                }
+                /* Substitute type param T at any depth in the TypeNode tree.
+                 * Recursive clone: replaces TYNODE_NAMED matching T with concrete type's TypeNode.
+                 * Handles: T, *T, ?T, []T, T[N], ?*Container(T), etc. */
+                sf->type = resolve_type(c, subst_typenode(c->arena, fd->type,
+                    tmpl->type_param, tmpl->type_param_len, tn->container.type_arg));
             }
         } else {
             st->struct_type.fields = NULL;
@@ -1322,6 +1357,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         ci->concrete_type = concrete;
         ci->stamped_struct = st;
 
+        _container_depth--;
         return st;
     }
 
@@ -5803,8 +5839,11 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             Type *t = type_unwrap_distinct(sym->type);
             if (t->kind == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw))
                 return false;
-            if (t->kind == TYPE_POOL || t->kind == TYPE_SLAB ||
-                t->kind == TYPE_RING || t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER)
+            /* Arena (bump allocator) and Barrier (has own mutex) are safe.
+             * Pool, Slab, Ring are NOT thread-safe — alloc/free/push/pop have
+             * non-atomic metadata access. Must use from single thread or wrap
+             * in shared struct. */
+            if (t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER)
                 return false;
             /* Non-shared global — potential data race */
             *out_name = node->ident.name;
@@ -5845,7 +5884,14 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         return scan_unsafe_global_access(c, node->binary.right, out_name, out_len);
     case NODE_UNARY:
         return scan_unsafe_global_access(c, node->unary.operand, out_name, out_len);
+    case NODE_FIELD:
+        return scan_unsafe_global_access(c, node->field.object, out_name, out_len);
+    case NODE_INDEX:
+        if (scan_unsafe_global_access(c, node->index_expr.object, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->index_expr.index, out_name, out_len);
     case NODE_CALL:
+        /* Check callee expression (e.g., global_slab.alloc() — global_slab is in callee) */
+        if (scan_unsafe_global_access(c, node->call.callee, out_name, out_len)) return true;
         /* Check call arguments for global access */
         for (int i = 0; i < node->call.arg_count; i++)
             if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
@@ -5869,11 +5915,6 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             }
         }
         return false;
-    case NODE_FIELD:
-        return scan_unsafe_global_access(c, node->field.object, out_name, out_len);
-    case NODE_INDEX:
-        if (scan_unsafe_global_access(c, node->index_expr.object, out_name, out_len)) return true;
-        return scan_unsafe_global_access(c, node->index_expr.index, out_name, out_len);
     case NODE_INTRINSIC: {
         /* Skip @atomic_* intrinsic arguments — atomic ops are thread-safe.
          * This prevents false warnings for @atomic_store(&gflag, 1). */

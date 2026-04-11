@@ -899,10 +899,18 @@ static bool is_move_struct_type(Type *t) {
 static bool contains_move_struct_field(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
-    if (eff->kind != TYPE_STRUCT) return false;
-    for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
-        if (is_move_struct_type(eff->struct_type.fields[i].type))
-            return true;
+    if (eff->kind == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
+            if (is_move_struct_type(eff->struct_type.fields[i].type))
+                return true;
+        }
+    }
+    /* Red Team V22: union containing move struct variant */
+    if (eff->kind == TYPE_UNION) {
+        for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
+            if (is_move_struct_type(eff->union_type.variants[i].type))
+                return true;
+        }
     }
     return false;
 }

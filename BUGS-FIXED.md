@@ -3223,3 +3223,13 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **V19 — Spawn move bypass:** NOT a bug. zercheck already tracks move struct args to spawn as HS_TRANSFERRED.
 
 **V20 — Container pointer-to-array decay:** NOT a bug. Container *T substitution produces correct *concrete type.
+
+### Red Team V21-V24 (2026-04-12, Gemini round 6)
+
+**V21 — Async cancellation leak:** Design limitation (same as Rust Future drop). Dropping async state struct without completing leaks resources. Not fixable at compile time — would need cancel protocol. Documented.
+
+**V22 — Move-union bypass:** NOT exploitable. Union variant read requires switch — direct `w1.k.id` blocked by "cannot read union variant directly." `contains_move_struct_field` extended to check TYPE_UNION variants as defense-in-depth.
+
+**V23 — Spawn non-void return:** CONFIRMED + FIXED. `spawn produce()` where produce returns non-void → return value lost. Fix: checker errors if spawn target has non-void return type.
+
+**V24 — Comptime const bypass:** NOT applicable. Comptime evaluator is pure computation — no const concept. Re-assignment is valid for building values.

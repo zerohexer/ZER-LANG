@@ -1,0 +1,30 @@
+// Rust: AtomicBool spinlock — manual lock implementation.
+// ZER: @atomic_cas spinlock protecting a non-shared counter.
+
+u32 lock;
+u32 counter;
+
+void spin_inc() {
+    // Acquire
+    while (!@atomic_cas(&lock, 0, 1)) { }
+    // Critical section
+    counter += 1;
+    // Release
+    @atomic_store(&lock, 0);
+}
+
+i32 main() {
+    lock = 0;
+    counter = 0;
+
+    ThreadHandle t1 = spawn spin_inc();
+    ThreadHandle t2 = spawn spin_inc();
+    ThreadHandle t3 = spawn spin_inc();
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    if (counter != 3) { return 1; }
+    return 0;
+}

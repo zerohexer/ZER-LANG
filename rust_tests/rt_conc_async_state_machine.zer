@@ -1,0 +1,45 @@
+// Rust: async state machine — multiple states with transitions.
+// ZER: async coroutine with state tracked via global.
+
+u32 g_state;
+u32 g_output;
+
+async void state_machine() {
+    g_state = 1;
+    g_output = 0;
+    yield;
+
+    g_state = 2;
+    g_output = 10;
+    yield;
+
+    g_state = 3;
+    g_output = g_output + 20;
+    yield;
+
+    g_state = 0;
+}
+
+i32 main() {
+    g_state = 0;
+    g_output = 0;
+
+    _zer_async_state_machine sm;
+    _zer_async_state_machine_init(&sm);
+
+    _zer_async_state_machine_poll(&sm);
+    if (g_state != 1) { return 1; }
+
+    _zer_async_state_machine_poll(&sm);
+    if (g_state != 2) { return 2; }
+    if (g_output != 10) { return 3; }
+
+    _zer_async_state_machine_poll(&sm);
+    if (g_state != 3) { return 4; }
+    if (g_output != 30) { return 5; }
+
+    _zer_async_state_machine_poll(&sm);
+    if (g_state != 0) { return 6; }
+
+    return 0;
+}

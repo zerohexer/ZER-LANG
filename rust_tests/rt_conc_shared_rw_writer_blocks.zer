@@ -1,0 +1,29 @@
+// Rust: RwLock — writer gets exclusive access, no concurrent readers.
+// ZER: shared(rw) struct — writer thread modifies, reader verifies after.
+
+shared(rw) struct Table { u32 rows; u32 cols; u32 checksum; }
+Table g_table;
+
+void writer(*Table t) {
+    t.rows = 10;
+    t.cols = 20;
+    t.checksum = 10 + 20;
+}
+
+i32 main() {
+    g_table.rows = 0;
+    g_table.cols = 0;
+    g_table.checksum = 0;
+
+    ThreadHandle tw = spawn writer(&g_table);
+    tw.join();
+
+    // After writer completes, verify consistency
+    u32 r = g_table.rows;
+    u32 c = g_table.cols;
+    u32 cs = g_table.checksum;
+    if (r != 10) { return 1; }
+    if (c != 20) { return 2; }
+    if (cs != 30) { return 3; }
+    return 0;
+}

@@ -1,0 +1,38 @@
+// Rust: Condvar ping-pong — two threads alternate via condvar signals.
+// ZER: @cond_wait + @cond_signal for turn-based handoff.
+
+shared struct Turn { u32 whose; u32 count; }
+Turn g_turn;
+
+void player_a(*Turn t) {
+    for (u32 i = 0; i < 3; i += 1) {
+        @cond_wait(g_turn, g_turn.whose == 0);
+        t.count += 1;
+        t.whose = 1;
+        @cond_signal(g_turn);
+    }
+}
+
+void player_b(*Turn t) {
+    for (u32 i = 0; i < 3; i += 1) {
+        @cond_wait(g_turn, g_turn.whose == 1);
+        t.count += 1;
+        t.whose = 0;
+        @cond_signal(g_turn);
+    }
+}
+
+i32 main() {
+    g_turn.whose = 0;
+    g_turn.count = 0;
+
+    ThreadHandle ta = spawn player_a(&g_turn);
+    ThreadHandle tb = spawn player_b(&g_turn);
+
+    ta.join();
+    tb.join();
+
+    // 3 rounds × 2 players = 6 increments
+    if (g_turn.count != 6) { return 1; }
+    return 0;
+}

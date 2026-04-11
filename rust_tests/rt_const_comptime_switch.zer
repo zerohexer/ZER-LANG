@@ -1,0 +1,42 @@
+// Comptime with switch — dispatch on compile-time value.
+
+comptime u32 PRIORITY(u32 level) {
+    switch (level) {
+        0 => { return 1; }
+        1 => { return 10; }
+        2 => { return 100; }
+        default => { return 0; }
+    }
+}
+
+comptime u32 CLASSIFY(u32 code) {
+    u32 base = code;
+    switch (base) {
+        0 => { return 0; }
+        1, 2 => { return 1; }
+        default => {
+            if (base > 10) { return 3; }
+            return 2;
+        }
+    }
+}
+
+i32 main() {
+    u32 p0 = PRIORITY(0);
+    u32 p1 = PRIORITY(1);
+    u32 p2 = PRIORITY(2);
+    u32 p3 = PRIORITY(99);
+
+    if (p0 != 1) { return 1; }
+    if (p1 != 10) { return 2; }
+    if (p2 != 100) { return 3; }
+    if (p3 != 0) { return 4; }
+
+    if (CLASSIFY(0) != 0) { return 5; }
+    if (CLASSIFY(1) != 1) { return 6; }
+    if (CLASSIFY(2) != 1) { return 7; }
+    if (CLASSIFY(5) != 2) { return 8; }
+    if (CLASSIFY(15) != 3) { return 9; }
+
+    return 0;
+}

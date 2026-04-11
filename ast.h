@@ -167,6 +167,7 @@ typedef enum {
     NODE_SPAWN,             /* spawn func(args); — thread creation */
     NODE_YIELD,             /* yield; — pause async coroutine */
     NODE_AWAIT,             /* await expr; — yield until condition true */
+    NODE_STATIC_ASSERT,     /* static_assert(expr, "msg"); — compile-time assertion */
 
     /* === Expressions === */
     NODE_INT_LIT,           /* 42, 0xFF, 0b1010 */
@@ -416,6 +417,13 @@ struct Node {
 
         /* NODE_AWAIT: await expr; — yield until condition is true */
         struct { Node *cond; } await_stmt;
+
+        /* NODE_STATIC_ASSERT: static_assert(expr, "msg"); */
+        struct {
+            Node *cond;
+            const char *message;
+            size_t message_len;
+        } static_assert_stmt;
 
         /* NODE_SPAWN: spawn func(args); or ThreadHandle th = spawn func(args); */
         struct {

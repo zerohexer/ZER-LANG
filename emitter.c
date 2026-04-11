@@ -342,7 +342,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
     case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
         break;
     }
 }
@@ -3710,6 +3710,10 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
     }
 
+    case NODE_STATIC_ASSERT:
+        /* compile-time only — nothing to emit */
+        break;
+
     case NODE_DEFER:
         /* push onto defer stack — will be emitted at block end in reverse */
         /* grow defer stack if needed */
@@ -4522,7 +4526,7 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
     case NODE_ONCE:
         prescan_spawn_in_node(e, node->once.body);
         break;
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
         break;
     default: break;
     }
@@ -4806,7 +4810,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
     case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:

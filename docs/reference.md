@@ -1,8 +1,7 @@
 # ZER(C) Language Reference
 
 **Zero Error Risk C Extension**
-**Version:** 0.2.1 | **Compiler:** `zerc` | **Target:** Any platform GCC supports
-**1700+ tests, all passing**
+**Compiler:** `zerc` | **Target:** Any platform GCC supports
 
 ---
 
@@ -2084,12 +2083,14 @@ threadlocal u32 counter;    // each thread has its own copy
 }
 ```
 
-### @barrier_init / @barrier_wait — Thread Barrier
+### Barrier — Thread Sync Point
 ```zer
-_zer_barrier bar;
+Barrier bar;                // keyword type (like Arena, Pool)
 @barrier_init(bar, 3);     // 3 threads must arrive
 @barrier_wait(bar);         // blocks until all 3 call wait
 ```
+- `Barrier` is a builtin type — checker validates `@barrier_init`/`@barrier_wait` args are `Barrier` type.
+- Using wrong type (e.g., `u32`) → compile error.
 
 ### Atomics
 ```zer

@@ -1,0 +1,21 @@
+// Rust borrowck-reborrow-from-mut: borrow same field twice = error,
+// borrow different fields = OK.
+// ZER: two handles from same pool are independent (different fields pattern).
+
+struct Pair { u32 a; u32 b; }
+Pool(Pair, 4) pool;
+
+i32 main() {
+    ?Handle(Pair) mh = pool.alloc();
+    Handle(Pair) h = mh orelse return;
+    defer pool.free(h);
+
+    // Access different fields — independent, safe
+    pool.get(h).a = 10;
+    pool.get(h).b = 20;
+    u32 va = h.a;
+    u32 vb = h.b;
+    if (va != 10) { return 1; }
+    if (vb != 20) { return 2; }
+    return 0;
+}

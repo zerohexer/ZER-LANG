@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Rust unsafe-fn-deref-ptr: dereference of raw pointer requires unsafe block.
+// Source: tests/ui/unsafe/unsafe-fn-deref-ptr.rs
+// ZER: @inttoptr from arbitrary address without mmio declaration = compile error.
+// ZER has NO unsafe escape hatch — all pointer operations are checked.
+
+i32 main() {
+    volatile *u32 p = @inttoptr(*u32, 0x12345678);  // no mmio decl → error
+    return 0;
+}

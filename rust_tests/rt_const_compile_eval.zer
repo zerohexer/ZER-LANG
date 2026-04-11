@@ -1,0 +1,23 @@
+// Rust consts: compile-time constant evaluation with arithmetic.
+// ZER: comptime functions evaluate at compile time — zero runtime cost.
+
+comptime u32 SQUARE(u32 x) { return x * x; }
+comptime u32 ADD(u32 a, u32 b) { return a + b; }
+comptime u32 TABLE_SIZE() { return SQUARE(4); }
+
+struct Entry { u32 key; u32 val; }
+Pool(Entry, TABLE_SIZE()) pool;
+
+i32 main() {
+    // TABLE_SIZE = 4*4 = 16 — pool has 16 slots
+    ?Handle(Entry) mh = pool.alloc();
+    Handle(Entry) h = mh orelse return;
+    defer pool.free(h);
+
+    pool.get(h).key = ADD(10, 20);
+    pool.get(h).val = SQUARE(5);
+
+    if (h.key != 30) { return 1; }
+    if (h.val != 25) { return 2; }
+    return 0;
+}

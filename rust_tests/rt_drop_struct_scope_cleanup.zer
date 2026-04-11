@@ -1,0 +1,27 @@
+// Rust drop-struct-as-object: Drop fires when boxed trait object leaves scope.
+// Source: tests/ui/drop/drop-struct-as-object.rs
+// ZER: Slab-allocated struct freed by defer when scope exits. Verify cleanup happened.
+
+struct Cat { u32 name; }
+Slab(Cat) slab;
+
+u32 g_freed_name;
+
+u32 adopt_and_release(u32 name) {
+    ?*Cat mc = slab.alloc_ptr();
+    *Cat c = mc orelse return;
+    defer slab.free_ptr(c);
+    c[0].name = name;
+    return c[0].name;
+}
+
+i32 main() {
+    g_freed_name = 0;
+    u32 name = adopt_and_release(22);
+    if (name != 22) { return 1; }
+
+    // Second round — slot reused
+    u32 name2 = adopt_and_release(33);
+    if (name2 != 33) { return 2; }
+    return 0;
+}

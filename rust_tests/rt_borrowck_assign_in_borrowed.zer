@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Rust borrowck-assign-to-andmut-in-borrowed-loc: assign to borrowed mutable = error.
+// Source: tests/ui/borrowck/borrowck-assign-to-andmut-in-borrowed-loc.rs
+// ZER: free handle then use through alias = UAF via zercheck cross-function summary.
+
+struct S { u32 val; }
+Slab(S) slab;
+
+void modify(*S p) {
+    slab.free_ptr(p);
+}
+
+i32 main() {
+    ?*S ms = slab.alloc_ptr();
+    *S s = ms orelse return;
+    s[0].val = 42;
+
+    modify(s);           // s freed by cross-function summary
+    u32 v = s[0].val;    // UAF — s freed by modify
+    return 0;
+}

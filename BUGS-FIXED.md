@@ -3155,3 +3155,11 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **Comptime float:** `comptime f64 PI_HALF() { return 3.14 / 2.0; }` — parallel eval path at call site. `eval_comptime_float_expr` handles float literal/param/arithmetic. Float params stored as bits in int64 via memcpy. Emitter outputs `%.17g`.
 
 **Design decision: no array literal syntax.** `u32[4] t = {1,2,3,4}` not added because: (1) C doesn't have array literals in expression position either, (2) element-by-element is clearer for large arrays, (3) would create NODE_ARRAY_INIT with parser ambiguity vs NODE_STRUCT_INIT, (4) ~100 lines for convenience-only feature.
+
+### Spawn global data race detection + --stack-limit (2026-04-11)
+
+**Spawn global data race:** `scan_unsafe_global_access` scans spawned function body (+ transitive callees, 8 levels) for non-shared global access. No sync → error. Has @atomic/@barrier → warning. Escape: volatile, shared, threadlocal, @atomic_*, const. `has_atomic_or_barrier` needed full expression tree recursion (was missing binary/unary/call/assign initially — caused false error on `@atomic_load` in while condition).
+
+**--stack-limit N:** Per-function frame size + entry-point call chain depth checked against limit. Two separate checks catch different failure modes (big local array vs deep call chain).
+
+**Audit fixes:** `find_comptime_struct_return` was duplicate of `find_comptime_return_expr` — removed (-19 lines). `#include <math.h>` moved from mid-file to top. Missing `-Wswitch` cases for TYNODE_CONTAINER, NODE_CONTAINER_DECL, NODE_DO_WHILE in ast_print fixed.

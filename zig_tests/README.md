@@ -1,6 +1,6 @@
 # ZER Zig-Equivalent Test Suite
 
-33 tests (28 positive, 5 negative), 0 failures. Updated 2026-04-11.
+36 tests (31 positive, 5 negative), 0 failures. Updated 2026-04-11.
 Runner: same pattern as rust_tests — positive must exit 0, negative must fail to compile.
 
 ## How to Use This File

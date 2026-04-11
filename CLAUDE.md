@@ -384,11 +384,11 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
 | Volatile/const strip | `@ptrcast`, `@bitcast`, `@cast` all check qualifier preservation |
 | ISR data race | Shared global without volatile → error. Compound assign on shared volatile → error (non-atomic read-modify-write) |
-| Stack overflow | Recursion detection via call graph DFS → warning. Stack frame size estimation per function |
+| Stack overflow | Recursion detection via call graph DFS → warning. `--stack-limit N` → error when per-function frame or entry-point call chain exceeds N bytes |
 | Misaligned MMIO | `@inttoptr` alignment check — address must match target type alignment (u32=4, u16=2, u64=8) |
 | @critical escape | `return`/`break`/`continue`/`goto` inside `@critical` → compile error (would skip interrupt re-enable) |
 | Interior pointer UAF | `*u32 p = &b.field; free(b); p[0]` → compile error. Field-derived pointers share alloc_id with parent. NODE_INDEX UAF check. |
-| Thread data race | `shared struct` auto-locked. Non-shared pointer to `spawn` → compile error (unless scoped with ThreadHandle+join). Handle to `spawn` → compile error. |
+| Thread data race | `shared struct` auto-locked. Non-shared pointer to `spawn` → compile error (unless scoped with ThreadHandle+join). Handle to `spawn` → compile error. Spawn target body scanned for non-shared global access: error (no sync) or warning (has @atomic/@barrier). Transitive through callees (8 levels). Escape: volatile, shared, threadlocal, @atomic_*. |
 | Deadlock | Same-statement multi-shared-type access → compile error. Emitter does lock-per-statement (no nested locks), so cross-statement ordering is safe. Only same-statement access to 2+ shared types is a real deadlock risk. |
 | Ownership transfer | `spawn` with non-shared pointer marks variable HS_TRANSFERRED — use after transfer → compile error. |
 | Move semantics | `move struct` — pass to function or assign transfers ownership, use after transfer → compile error. Compile-time via zercheck. |
@@ -530,7 +530,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), 705 Rust-equivalent tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,700+ tests
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 713 Rust-equivalent tests + 36 Zig tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,800+ tests
 - **v0.4:** table-driven compiler architecture, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -940,7 +940,7 @@ When starting a new session or lacking context:
 - Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
 - **Default behavior:** `zerc main.zer` compiles to `main.exe` (or `main` on Linux) — the `.c` intermediate is temp, deleted after GCC. No `.c` visible to user. Looks native.
-- Compiler flags: `--run` (compile+execute), `--emit-c` (keep `.c` output, old behavior), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations), `--target-bits N` (usize width override), `--gcc PATH` (specify cross-compiler for auto-detect)
+- Compiler flags: `--run` (compile+execute), `--emit-c` (keep `.c` output, old behavior), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations), `--target-bits N` (usize width override), `--gcc PATH` (specify cross-compiler for auto-detect), `--stack-limit N` (error when estimated stack usage exceeds N bytes)
 - `-o file.c` → emits C (kept). `-o file.exe` or `-o file` → compiles to exe (temp .c deleted).
 - usize width: auto-detected from GCC via `__SIZEOF_SIZE_T__` probe at startup. Falls back to 32 if GCC not found. `--target-bits` overrides.
 - GCC flags: emitted C requires `-fwrapv` (ZER defines signed overflow as wrapping). `zerc --run` adds this automatically.

@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// Rust unsafe: type confusion through void* cast chain.
+// ZER: @ptrcast provenance tracking — cast *opaque to wrong type = error.
+
+struct Sensor { u32 id; u32 reading; }
+struct Motor { u32 speed; }
+Slab(Sensor) slab;
+
+i32 main() {
+    ?*Sensor ms = slab.alloc_ptr();
+    *Sensor s = ms orelse return;
+    defer slab.free_ptr(s);
+    s[0].id = 1;
+    s[0].reading = 42;
+
+    // *Sensor → *opaque — provenance = Sensor
+    *opaque ctx = @ptrcast(*opaque, s);
+
+    // *opaque → *Motor — provenance mismatch! Should be *Sensor.
+    *Motor m = @ptrcast(*Motor, ctx);   // error: provenance Sensor != Motor
+
+    return 0;
+}

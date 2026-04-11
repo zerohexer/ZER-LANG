@@ -1285,11 +1285,18 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
     if (!block) return CONST_EVAL_FAIL;
     if (depth++ > 32) { depth--; return CONST_EVAL_FAIL; }
 
-    /* Extend params with local variable bindings.
-     * Stack array holds original params + up to 16 locals.
+    /* Extend params with local variable bindings — dynamic, no limit.
+     * Stack-first: use stack array for small cases (≤8 bindings), malloc for more.
      * Each NODE_VAR_DECL adds a binding; NODE_RETURN evaluates with all bindings. */
-    ComptimeParam locals[24];
-    int local_count = param_count < 24 ? param_count : 24;
+    ComptimeParam stack_locals[8];
+    ComptimeParam *locals = stack_locals;
+    int local_count = param_count;
+    int local_capacity = 8;
+    if (param_count > 8) {
+        local_capacity = param_count + 8;
+        locals = (ComptimeParam *)malloc(local_capacity * sizeof(ComptimeParam));
+        if (!locals) { depth--; return CONST_EVAL_FAIL; }
+    }
     if (local_count > 0)
         memcpy(locals, params, local_count * sizeof(ComptimeParam));
 
@@ -1301,14 +1308,21 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
             /* Handle local variable declarations: evaluate init, add binding */
             if (stmt->kind == NODE_VAR_DECL && stmt->var_decl.init) {
                 int64_t val = eval_const_expr_subst(stmt->var_decl.init, locals, local_count);
-                if (val == CONST_EVAL_FAIL) { depth--; return CONST_EVAL_FAIL; }
-                if (local_count < 24) {
-                    locals[local_count].name = stmt->var_decl.name;
-                    locals[local_count].name_len = (uint32_t)stmt->var_decl.name_len;
-                    locals[local_count].value = val;
-                    local_count++;
+                if (val == CONST_EVAL_FAIL) { if (locals != stack_locals) free(locals); depth--; return CONST_EVAL_FAIL; }
+                if (local_count >= local_capacity) {
+                    int nc = local_capacity * 2;
+                    ComptimeParam *nl = (ComptimeParam *)malloc(nc * sizeof(ComptimeParam));
+                    if (!nl) { if (locals != stack_locals) free(locals); depth--; return CONST_EVAL_FAIL; }
+                    memcpy(nl, locals, local_count * sizeof(ComptimeParam));
+                    if (locals != stack_locals) free(locals);
+                    locals = nl;
+                    local_capacity = nc;
                 }
-                continue; /* don't break — continue to next statement */
+                locals[local_count].name = stmt->var_decl.name;
+                locals[local_count].name_len = (uint32_t)stmt->var_decl.name_len;
+                locals[local_count].value = val;
+                local_count++;
+                continue;
             }
 
             int64_t r = eval_comptime_stmt(stmt, locals, local_count);
@@ -1317,6 +1331,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
     } else {
         result = eval_comptime_stmt(block, locals, local_count);
     }
+    if (locals != stack_locals) free(locals);
     depth--;
     return result;
 }

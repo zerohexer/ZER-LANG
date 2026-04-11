@@ -927,6 +927,42 @@ Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call o
 ### Barrier keyword type — eliminates pre-existing UB
 `u32 barrier` with `@barrier_init` was 4-byte variable for ~120-byte struct. `memset` overflow caused silent stack corruption. Fix: `Barrier` keyword type (lexer/parser/types/checker/emitter). Checker rejects non-Barrier args to `@barrier_init`/`@barrier_wait`.
 
+## Container Keyword — Parameterized Struct Monomorphization (2026-04-11)
+
+`container Name(T) { fields }` defines a parameterized struct template. `Name(ConcreteType)` stamps a concrete `struct Name_ConcreteType` with T substituted. No methods, no `this` — functions take `*Container(T)`.
+
+**Lexer:** `TOK_CONTAINER` keyword. Also accepted after `@` for the `@container` (container_of) intrinsic — parser's `@` handler matches both `TOK_IDENT` and `TOK_CONTAINER`.
+
+**AST:** `NODE_CONTAINER_DECL` (template definition with name, type_param, fields). `TYNODE_CONTAINER` (instantiation: name + type_arg TypeNode).
+
+**Parser:**
+- Top-level: `container Name(T) { fields }` → NODE_CONTAINER_DECL. Fields parsed same as struct fields.
+- Type position: After TYNODE_NAMED, if `(` followed by type token → parse as TYNODE_CONTAINER `{ name, type_arg }`.
+- Statement lookahead: `IDENT(TypeToken) IDENT` pattern detected in the statement heuristic (line ~1773) — skips past `(Type)` to check if IDENT follows, confirming var-decl.
+
+**Checker:**
+- `ContainerTemplate` stored on Checker struct (name, type_param, fields). Registered in `register_decl(NODE_CONTAINER_DECL)`.
+- `ContainerInstance` cache: `(tmpl_name, concrete_type) → TYPE_STRUCT`. Checked before stamping to avoid duplicates.
+- `resolve_type(TYNODE_CONTAINER)`: looks up template by name, stamps by creating TYPE_STRUCT with mangled name (`Stack_u32`), substitutes T in field types. Handles T, *T, ?T, []T, T[N] field patterns. Registers stamped struct in scope for field access.
+
+**Emitter:** `emit_container_structs(e)` iterates `checker->container_instances`, emits each stamped struct as regular C struct declaration. Called between pass 1 (regular structs) and spawn wrappers in both preamble and non-preamble paths.
+
+**zercheck:** No special handling — stamped containers are regular TYPE_STRUCT, tracked same as any struct.
+
+**Limitation:** T substitution currently handles direct field type, one-level pointer/optional/slice/array wrapping. Nested containers (`container Map(K) { Pair(K)[64] entries; }`) would need recursive TypeNode substitution — not implemented yet. Add when needed.
+
+## Designated Initializers — NODE_STRUCT_INIT (2026-04-11)
+
+`Point p = { .x = 10, .y = 20 };` — C99-style designated struct initialization.
+
+**Parser:** `parse_primary` detects `{` followed by `.` → parses `{ .field = expr, ... }` as NODE_STRUCT_INIT. Up to 128 fields. `DesigField` struct: `{name, name_len, value}`.
+
+**Checker:** `check_expr(NODE_STRUCT_INIT)` type-checks all value expressions. Field validation deferred to context (var-decl or assignment) where target struct type is known. Validates: field names exist on struct, value types match field types. Sets `init_type = target_type` and stores in typemap.
+
+**Emitter:** Always emits as C99 compound literal: `(StructType){ .field = val, ... }`. Works in both var-decl init and assignment contexts. The type cast prefix is read from `checker_get_type(node)`.
+
+**Both var-decl and assignment work:** `p = { .x = 1 };` emits `p = (Point){ .x = 1 };`. Partial init (unmentioned fields) auto-zero per C99 rules.
+
 ## Value Range Propagation (checker.c)
 
 Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entries shadow older, save/restore via count for scoped narrowing. `push_var_range()` intersects with existing (only narrows), clamps min to 0 for unsigned types.

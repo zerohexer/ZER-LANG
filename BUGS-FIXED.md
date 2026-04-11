@@ -5,7 +5,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-04-09/10/11 — Move Struct, CFG Zercheck, Barrier Type, 661 Tests
+## Session 2026-04-09/10/11 — Move Struct, CFG Zercheck, Barrier Type, Comptime Locals, 690 Tests
+
+### Comptime local variables — eval_comptime_block handles NODE_VAR_DECL
+- **Problem:** `comptime u32 F() { u32 x = 4; return x * 3; }` — body evaluator couldn't handle local variable declarations. Only simple expressions/returns worked.
+- **Fix (checker.c):** `eval_comptime_block` now evaluates NODE_VAR_DECL init expressions and adds `{name, value}` bindings to a dynamic array (stack-first [8], malloc on overflow). Subsequent statements see all bindings. No fixed limit.
+- **Test:** `rust_tests/rt_const_block_eval.zer`.
 
 ### Barrier keyword type — eliminates pre-existing UB
 - **Problem:** `u32 barrier` with `@barrier_init` — 4-byte variable for ~120-byte struct. UB: `memset` overflows stack. Was masked by old spinlock stack layout, exposed by BUG-473 mutex change.

@@ -340,7 +340,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_VAR_DECL:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
     case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
@@ -4069,6 +4069,25 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
  * TOP-LEVEL DECLARATION EMISSION
  * ================================================================ */
 
+/* Emit all stamped container struct declarations */
+static void emit_container_structs(Emitter *e) {
+    if (!e->checker || e->checker->container_inst_count == 0) return;
+    for (int ci = 0; ci < e->checker->container_inst_count; ci++) {
+        Type *st = e->checker->container_instances[ci].stamped_struct;
+        if (!st || st->kind != TYPE_STRUCT) continue;
+        emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
+        e->indent++;
+        for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+            SField *sf = &st->struct_type.fields[fi];
+            emit_indent(e);
+            emit_type_and_name(e, sf->type, sf->name, sf->name_len);
+            emit(e, ";\n");
+        }
+        e->indent--;
+        emit(e, "};\n\n");
+    }
+}
+
 static void emit_struct_decl(Emitter *e, Node *node) {
     Type *st = checker_get_type(e->checker,node);
     if (node->struct_decl.is_packed) {
@@ -4840,7 +4859,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
     case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
     case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_FILE:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_CONTAINER_DECL: case NODE_FILE:
         break;
     }
 }
@@ -4870,6 +4889,9 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
                 emit_top_level_decl(e, d, file_node, i);
         }
 
+        /* Emit stamped container struct declarations */
+        emit_container_structs(e);
+
         /* Spawn wrappers (between struct decls and functions) */
         emit_spawn_wrappers(e);
 
@@ -4878,7 +4900,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
             Node *d = file_node->file.decls[i];
             if (d->kind == NODE_IMPORT || d->kind == NODE_CINCLUDE) continue;
             if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
-                d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF)
+                d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
+                d->kind != NODE_CONTAINER_DECL)
                 emit_top_level_decl(e, d, file_node, i);
         }
         return;
@@ -5384,6 +5407,9 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
             emit_top_level_decl(e, d, file_node, i);
     }
 
+    /* Emit stamped container struct declarations — after regular structs */
+    emit_container_structs(e);
+
     /* emit auto-Slab globals for Task.new() / Task.delete() — after structs, before functions */
     if (e->checker->auto_slab_count > 0) {
         emit(e, "\n/* ZER auto-Slab globals (Task.new/delete) */\n");
@@ -5404,7 +5430,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
-            d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF)
+            d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
+            d->kind != NODE_CONTAINER_DECL)
             emit_top_level_decl(e, d, file_node, i);
     }
 }

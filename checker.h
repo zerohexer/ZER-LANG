@@ -156,6 +156,28 @@ typedef struct {
     int isr_global_count;
     int isr_global_capacity;
 
+    /* Container templates: parameterized struct definitions */
+    struct ContainerTemplate {
+        const char *name;
+        uint32_t name_len;
+        const char *type_param;
+        uint32_t type_param_len;
+        FieldDecl *fields;
+        int field_count;
+    } *container_templates;
+    int container_tmpl_count;
+    int container_tmpl_capacity;
+
+    /* Stamped container instances: cached (name, concrete_type) → TYPE_STRUCT */
+    struct ContainerInstance {
+        const char *tmpl_name;
+        uint32_t tmpl_name_len;
+        Type *concrete_type;
+        Type *stamped_struct;
+    } *container_instances;
+    int container_inst_count;
+    int container_inst_capacity;
+
     /* Stack depth analysis: call graph + frame sizes */
     struct StackFrame {
         const char *name;

@@ -66,6 +66,9 @@ typedef enum {
     TYNODE_HANDLE,          /* Handle(T) */
     TYNODE_SLAB,            /* Slab(T) — dynamic growable pool */
 
+    /* user-defined parameterized */
+    TYNODE_CONTAINER,       /* Stack(u32) — container instantiation */
+
     /* qualifiers */
     TYNODE_CONST,           /* const T */
     TYNODE_VOLATILE,        /* volatile T */
@@ -124,6 +127,13 @@ struct TypeNode {
         /* TYNODE_SLAB: Slab(T) — no count, grows dynamically */
         struct { TypeNode *elem; } slab;
 
+        /* TYNODE_CONTAINER: Stack(u32) — container name + type argument */
+        struct {
+            const char *name;
+            size_t name_len;
+            TypeNode *type_arg;     /* the concrete type parameter */
+        } container;
+
         /* TYNODE_CONST / TYNODE_VOLATILE: qualifier wrapping inner type */
         struct { TypeNode *inner; } qualified;
     };
@@ -146,6 +156,7 @@ typedef enum {
     NODE_INTERRUPT,         /* interrupt USART1 { ... } */
     NODE_MMIO,              /* mmio 0x40020000..0x40020FFF; */
     NODE_GLOBAL_VAR,        /* top-level variable declaration */
+    NODE_CONTAINER_DECL,    /* container Stack(T) { fields } — parameterized struct template */
 
     /* === Statements === */
     NODE_VAR_DECL,          /* u32 x = 5; */
@@ -342,6 +353,16 @@ struct Node {
             uint64_t range_start;
             uint64_t range_end;
         } mmio_decl;
+
+        /* NODE_CONTAINER_DECL: container Stack(T) { fields } */
+        struct {
+            const char *name;
+            size_t name_len;
+            const char *type_param;     /* "T" */
+            size_t type_param_len;
+            FieldDecl *fields;
+            int field_count;
+        } container_decl;
 
         /* NODE_GLOBAL_VAR / NODE_VAR_DECL: type name = value; */
         struct {

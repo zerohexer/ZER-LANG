@@ -2079,16 +2079,34 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* Forced division guard: if divisor is ident or struct field and
-                     * not proven nonzero → compile error. */
-                    if (div_val != 0 && !checker_is_proven(c, node) &&
-                        (node->binary.right->kind == NODE_IDENT ||
-                         node->binary.right->kind == NODE_FIELD)) {
-                        ExprKey dname = build_expr_key_a(c, node->binary.right);
-                        if (dname.len > 0) {
-                            checker_error(c, node->loc.line,
-                                "divisor '%.*s' not proven nonzero — add 'if (%.*s == 0) { return; }' before division",
-                                dname.len, dname.str, dname.len, dname.str);
+                    /* Forced division guard: if divisor is ident, struct field, or
+                     * function call and not proven nonzero → compile error.
+                     * Covers all cases: variables, struct fields, function returns. */
+                    if (div_val != 0 && !checker_is_proven(c, node)) {
+                        if (node->binary.right->kind == NODE_IDENT ||
+                            node->binary.right->kind == NODE_FIELD) {
+                            ExprKey dname = build_expr_key_a(c, node->binary.right);
+                            if (dname.len > 0) {
+                                checker_error(c, node->loc.line,
+                                    "divisor '%.*s' not proven nonzero — add 'if (%.*s == 0) { return; }' before division",
+                                    dname.len, dname.str, dname.len, dname.str);
+                            }
+                        } else if (node->binary.right->kind == NODE_CALL) {
+                            /* Function call as divisor: check if callee has proven return range */
+                            bool call_proven = false;
+                            if (node->binary.right->call.callee &&
+                                node->binary.right->call.callee->kind == NODE_IDENT) {
+                                Symbol *csym = scope_lookup(c->current_scope,
+                                    node->binary.right->call.callee->ident.name,
+                                    (uint32_t)node->binary.right->call.callee->ident.name_len);
+                                if (csym && csym->has_return_range && csym->return_range_min > 0)
+                                    call_proven = true;
+                            }
+                            if (!call_proven) {
+                                checker_error(c, node->loc.line,
+                                    "divisor from function call not proven nonzero — "
+                                    "store result in variable and add 'if (d == 0) { return; }' guard");
+                            }
                         }
                     }
                 }

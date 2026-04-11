@@ -1284,15 +1284,38 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
     static int depth = 0;
     if (!block) return CONST_EVAL_FAIL;
     if (depth++ > 32) { depth--; return CONST_EVAL_FAIL; }
-    int64_t result;
+
+    /* Extend params with local variable bindings.
+     * Stack array holds original params + up to 16 locals.
+     * Each NODE_VAR_DECL adds a binding; NODE_RETURN evaluates with all bindings. */
+    ComptimeParam locals[24];
+    int local_count = param_count < 24 ? param_count : 24;
+    if (local_count > 0)
+        memcpy(locals, params, local_count * sizeof(ComptimeParam));
+
+    int64_t result = CONST_EVAL_FAIL;
     if (block->kind == NODE_BLOCK) {
-        result = CONST_EVAL_FAIL;
         for (int i = 0; i < block->block.stmt_count; i++) {
-            int64_t r = eval_comptime_stmt(block->block.stmts[i], params, param_count);
+            Node *stmt = block->block.stmts[i];
+
+            /* Handle local variable declarations: evaluate init, add binding */
+            if (stmt->kind == NODE_VAR_DECL && stmt->var_decl.init) {
+                int64_t val = eval_const_expr_subst(stmt->var_decl.init, locals, local_count);
+                if (val == CONST_EVAL_FAIL) { depth--; return CONST_EVAL_FAIL; }
+                if (local_count < 24) {
+                    locals[local_count].name = stmt->var_decl.name;
+                    locals[local_count].name_len = (uint32_t)stmt->var_decl.name_len;
+                    locals[local_count].value = val;
+                    local_count++;
+                }
+                continue; /* don't break — continue to next statement */
+            }
+
+            int64_t r = eval_comptime_stmt(stmt, locals, local_count);
             if (r != CONST_EVAL_FAIL) { result = r; break; }
         }
     } else {
-        result = eval_comptime_stmt(block, params, param_count);
+        result = eval_comptime_stmt(block, locals, local_count);
     }
     depth--;
     return result;

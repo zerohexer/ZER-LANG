@@ -1451,6 +1451,18 @@ static Node *parse_statement(Parser *p) {
     if (match(p, TOK_WHILE))
         return parse_while_stmt(p);
 
+    /* do-while */
+    if (match(p, TOK_DO)) {
+        Node *n = new_node(p, NODE_DO_WHILE);
+        n->while_stmt.body = parse_block(p);
+        consume(p, TOK_WHILE, "expected 'while' after do body");
+        consume(p, TOK_LPAREN, "expected '(' after 'while'");
+        n->while_stmt.cond = parse_expression(p);
+        consume(p, TOK_RPAREN, "expected ')' after do-while condition");
+        consume(p, TOK_SEMICOLON, "expected ';' after do-while");
+        return n;
+    }
+
     /* switch */
     if (match(p, TOK_SWITCH))
         return parse_switch_stmt(p);

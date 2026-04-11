@@ -39,6 +39,7 @@ typedef enum {
     TOK_ASM, TOK_STATIC, TOK_KEEP, TOK_AS, TOK_MMIO, TOK_COMPTIME, TOK_THREADLOCAL, TOK_ASYNC,
     TOK_STATIC_ASSERT,
     TOK_CONTAINER,
+    TOK_DO,
 
     /* === Literals === */
     TOK_IDENT,          /* user identifier */

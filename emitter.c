@@ -341,7 +341,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
@@ -363,7 +363,7 @@ static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
     case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
     case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
     case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
-    case NODE_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
+    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
     case NODE_FOR: {
         Node *r = find_shared_root(e, stmt->for_stmt.init);
         if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
@@ -3395,6 +3395,20 @@ static void emit_stmt(Emitter *e, Node *node) {
         break;
     }
 
+    case NODE_DO_WHILE: {
+        int saved_loop_base = e->loop_defer_base;
+        e->loop_defer_base = e->defer_stack.count;
+        emit_indent(e);
+        emit(e, "do ");
+        emit_stmt(e, node->while_stmt.body);
+        emit_indent(e);
+        emit(e, "while (");
+        emit_expr(e, node->while_stmt.cond);
+        emit(e, ");\n");
+        e->loop_defer_base = saved_loop_base;
+        break;
+    }
+
     case NODE_RETURN: {
         /* BUG-409: unwrap distinct on return type for optional dispatch */
         Type *ret_eff = e->current_func_ret ? type_unwrap_distinct(e->current_func_ret) : NULL;
@@ -4549,7 +4563,7 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
         prescan_spawn_in_node(e, node->if_stmt.else_body);
         break;
     case NODE_FOR: prescan_spawn_in_node(e, node->for_stmt.body); break;
-    case NODE_WHILE: prescan_spawn_in_node(e, node->while_stmt.body); break;
+    case NODE_WHILE: case NODE_DO_WHILE: prescan_spawn_in_node(e, node->while_stmt.body); break;
     case NODE_SWITCH:
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             prescan_spawn_in_node(e, node->switch_stmt.arms[i].body);

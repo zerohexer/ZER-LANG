@@ -2679,6 +2679,29 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        /* @ptrtoint(&local) on assignment → mark target as local-derived.
+                         * Catches: b.addr = @ptrtoint(&x) where b is a struct. */
+                        if (vcheck->kind == NODE_INTRINSIC &&
+                            vcheck->intrinsic.name_len == 8 &&
+                            memcmp(vcheck->intrinsic.name, "ptrtoint", 8) == 0 &&
+                            vcheck->intrinsic.arg_count > 0) {
+                            Node *ptarg = vcheck->intrinsic.args[0];
+                            if (ptarg && ptarg->kind == NODE_UNARY && ptarg->unary.op == TOK_AMP) {
+                                Node *root = ptarg->unary.operand;
+                                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                                    if (root->kind == NODE_FIELD) root = root->field.object;
+                                    else root = root->index_expr.object;
+                                }
+                                if (root && root->kind == NODE_IDENT) {
+                                    bool is_global = scope_lookup_local(c->global_scope,
+                                        root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                                    Symbol *src = scope_lookup(c->current_scope,
+                                        root->ident.name, (uint32_t)root->ident.name_len);
+                                    if (src && !src->is_static && !is_global)
+                                        tsym->is_local_derived = true;
+                                }
+                            }
+                        }
                     }
                 }
             }

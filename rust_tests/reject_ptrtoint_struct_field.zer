@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// @ptrtoint(&local) stored in struct field then struct returned — dangles
+
+struct Bag { usize addr; }
+
+Bag wrap() {
+    u32 x = 42;
+    Bag b;
+    b.addr = @ptrtoint(&x);
+    return b;
+}
+
+i32 main() {
+    Bag b = wrap();
+    return 0;
+}

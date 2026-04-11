@@ -747,6 +747,26 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 10. **`bool` return via `orelse` needs restructuring.** Can't do `*opaque f = mf orelse return false;`. Instead: `?*opaque mf = io_open(...); *opaque f = mf orelse return;` for void, or use an if-unwrap pattern for bool returns.
 
+## STRICT: No-Debt Implementation Rule
+
+**Every change — add, fix, remove — MUST be the correct solution, not a shortcut.**
+
+Before implementing ANY change, verify:
+1. **No duplicate code.** If the same logic appears in 2+ places, extract a helper FIRST. Do NOT copy-paste and plan to "refactor later." Later never comes.
+2. **No shared mutable AST nodes.** Parser desugaring must create SEPARATE node copies for each use site. The SAME Node pointer in multiple AST positions causes double-evaluation bugs. Always deep-copy or hoist to temp.
+3. **No ordering dependencies without comments.** If function A must run before function B (e.g., `check_expr` before `eval_const_expr_scoped`), document WHY with a comment at both sites.
+4. **No copy-on-call for mutable state.** If a recursive function copies its input but callers need mutations to propagate back, the architecture is WRONG. Either pass by reference or inline the walk.
+5. **Test the REAL pattern, not just the simple case.** If you add `for (item in slice)`, test with struct slices, nested loops, and side-effectful expressions — not just `u32[5]`.
+
+**Before committing, ask:** "If I read this code in 6 months, would I know WHY it's structured this way? Would I accidentally break it by changing one of the N sites?"
+
+If the answer is no → extract helper, add comment, or restructure. Do NOT commit debt.
+
+**Violations found in this session:**
+- Comptime loop body used `eval_comptime_block` (copies locals) → loop mutations lost. Fixed by inlining — but created duplicate code. Should have been a helper.
+- Range-for reuses same `collection` node pointer in 3 AST positions → triple evaluation. Should hoist to temp var.
+- Both were committed as "working" then caught during testing/audit. The rule: audit BEFORE commit.
+
 ## Implementation Workflow — Lessons Learned
 
 These patterns were discovered through repeated mistakes. Follow them to avoid wasting turns.

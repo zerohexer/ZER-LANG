@@ -1109,8 +1109,9 @@ static Node *parse_for_stmt(Parser *p) {
 
     /* init */
     if (!check(p, TOK_SEMICOLON)) {
-        /* use same lookahead: try parse type, check if followed by ident */
+        /* Lookahead: try parse type, check if followed by ident */
         bool init_is_var_decl = false;
+        bool is_range_for = false;
         if (is_type_token(p->current.type)) {
             Scanner saved_scanner = *p->scanner;
             Token saved_cur = p->current;
@@ -1120,13 +1121,107 @@ static Node *parse_for_stmt(Parser *p) {
             p->had_error = false;
             p->panic_mode = true;
             parse_type(p);
-            init_is_var_decl = !p->had_error && check(p, TOK_IDENT);
+            if (!p->had_error && check(p, TOK_IDENT)) {
+                init_is_var_decl = true;
+                /* Check for range-based for: Type ident in expr */
+                Token ident_tok = p->current;
+                advance(p);
+                if (check(p, TOK_IDENT) && p->current.length == 2 &&
+                    memcmp(p->current.start, "in", 2) == 0) {
+                    is_range_for = true;
+                }
+            }
             *p->scanner = saved_scanner;
             p->current = saved_cur;
             p->previous = saved_prev;
             p->had_error = saved_error;
             p->panic_mode = saved_panic;
         }
+
+        /* Range-based for: for (Type item in slice) { body }
+         * Desugar to: { usize _i = 0; for (; _i < slice.len; _i += 1) { Type item = slice.ptr[_i]; body } }
+         * For simplicity, emit as a block wrapping a normal for. */
+        if (is_range_for) {
+            TypeNode *elem_type = parse_type(p);
+            Token item_name = p->current;
+            advance(p); /* consume item ident */
+            advance(p); /* consume 'in' */
+            Node *collection = parse_expression(p);
+            consume(p, TOK_RPAREN, "expected ')' after for-in expression");
+
+            /* Build: for (usize _zer_ri = 0; _zer_ri < collection.len; _zer_ri += 1) */
+            /* init: usize _zer_ri = 0 */
+            Node *idx_init = new_node(p, NODE_VAR_DECL);
+            TypeNode *usize_tn = new_type_node(p, TYNODE_USIZE);
+            idx_init->var_decl.type = usize_tn;
+            idx_init->var_decl.name = "__ri";
+            idx_init->var_decl.name_len = 4;
+            Node *zero = new_node(p, NODE_INT_LIT);
+            zero->int_lit.value = 0;
+            idx_init->var_decl.init = zero;
+            n->for_stmt.init = idx_init;
+
+            /* cond: _zer_ri < collection.len */
+            Node *idx_ref = new_node(p, NODE_IDENT);
+            idx_ref->ident.name = "__ri";
+            idx_ref->ident.name_len = 4;
+            Node *len_access = new_node(p, NODE_FIELD);
+            len_access->field.object = collection;
+            len_access->field.field_name = "len";
+            len_access->field.field_name_len = 3;
+            Node *cond = new_node(p, NODE_BINARY);
+            cond->binary.op = TOK_LT;
+            cond->binary.left = idx_ref;
+            cond->binary.right = len_access;
+            n->for_stmt.cond = cond;
+
+            /* step: _zer_ri += 1 */
+            Node *idx_ref2 = new_node(p, NODE_IDENT);
+            idx_ref2->ident.name = "__ri";
+            idx_ref2->ident.name_len = 4;
+            Node *one = new_node(p, NODE_INT_LIT);
+            one->int_lit.value = 1;
+            Node *step = new_node(p, NODE_ASSIGN);
+            step->assign.op = TOK_PLUSEQ;
+            step->assign.target = idx_ref2;
+            step->assign.value = one;
+            n->for_stmt.step = step;
+
+            /* body: { Type item = collection.ptr[_zer_ri]; ... original body ... } */
+            Node *user_body = parse_block(p);
+
+            /* Build var decl: Type item = collection[__ri] (bounds-checked) */
+            Node *item_decl = new_node(p, NODE_VAR_DECL);
+            item_decl->var_decl.type = elem_type;
+            item_decl->var_decl.name = item_name.start;
+            item_decl->var_decl.name_len = item_name.length;
+            /* collection[__ri] — uses slice bounds-checked indexing */
+            Node *idx_ref3 = new_node(p, NODE_IDENT);
+            idx_ref3->ident.name = "__ri";
+            idx_ref3->ident.name_len = 4;
+            Node *indexed = new_node(p, NODE_INDEX);
+            indexed->index_expr.object = collection;
+            indexed->index_expr.index = idx_ref3;
+            item_decl->var_decl.init = indexed;
+
+            /* Wrap: { item_decl; ...user_body_stmts... } */
+            int total_stmts = 1 + (user_body->kind == NODE_BLOCK ? user_body->block.stmt_count : 1);
+            Node **stmts = (Node **)arena_alloc(p->arena, total_stmts * sizeof(Node *));
+            stmts[0] = item_decl;
+            if (user_body->kind == NODE_BLOCK) {
+                for (int si = 0; si < user_body->block.stmt_count; si++)
+                    stmts[1 + si] = user_body->block.stmts[si];
+            } else {
+                stmts[1] = user_body;
+            }
+            Node *wrapper = new_node(p, NODE_BLOCK);
+            wrapper->block.stmts = stmts;
+            wrapper->block.stmt_count = total_stmts;
+            n->for_stmt.body = wrapper;
+
+            return n;
+        }
+
         if (init_is_var_decl) {
             n->for_stmt.init = parse_var_decl(p, false, false, false);
         } else {

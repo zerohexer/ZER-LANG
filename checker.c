@@ -5695,6 +5695,91 @@ static Type *check_expr(Checker *c, Node *node) {
  * STATEMENT TYPE CHECKING
  * ================================================================ */
 
+/* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
+ * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
+static bool scan_unsafe_global_access(Checker *c, Node *node,
+                                       const char **out_name, uint32_t *out_len) {
+    if (!node) return false;
+    if (node->kind == NODE_IDENT) {
+        Symbol *sym = scope_lookup(c->global_scope,
+            node->ident.name, (uint32_t)node->ident.name_len);
+        if (sym && !sym->is_function && sym->type) {
+            /* Skip: const, volatile (explicit opt-in), threadlocal, shared, Pool/Slab/Ring/Arena/Barrier */
+            if (sym->is_const) return false;
+            if (sym->is_volatile) return false; /* volatile = explicit shared access opt-in */
+            /* threadlocal: check the AST node for is_threadlocal flag */
+            if (sym->func_node &&
+                (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
+                sym->func_node->var_decl.is_threadlocal) return false;
+            Type *t = type_unwrap_distinct(sym->type);
+            if (t->kind == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw))
+                return false;
+            if (t->kind == TYPE_POOL || t->kind == TYPE_SLAB ||
+                t->kind == TYPE_RING || t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER)
+                return false;
+            /* Non-shared global — potential data race */
+            *out_name = node->ident.name;
+            *out_len = (uint32_t)node->ident.name_len;
+            return true;
+        }
+        return false;
+    }
+    /* Recurse into children */
+    switch (node->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            if (scan_unsafe_global_access(c, node->block.stmts[i], out_name, out_len)) return true;
+        return false;
+    case NODE_IF:
+        if (scan_unsafe_global_access(c, node->if_stmt.cond, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->if_stmt.then_body, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->if_stmt.else_body, out_name, out_len);
+    case NODE_FOR:
+        if (scan_unsafe_global_access(c, node->for_stmt.init, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->for_stmt.cond, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->for_stmt.step, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->for_stmt.body, out_name, out_len);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        if (scan_unsafe_global_access(c, node->while_stmt.cond, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->while_stmt.body, out_name, out_len);
+    case NODE_RETURN:
+        return scan_unsafe_global_access(c, node->ret.expr, out_name, out_len);
+    case NODE_EXPR_STMT:
+        return scan_unsafe_global_access(c, node->expr_stmt.expr, out_name, out_len);
+    case NODE_VAR_DECL:
+        return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
+    case NODE_ASSIGN:
+        if (scan_unsafe_global_access(c, node->assign.target, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->assign.value, out_name, out_len);
+    case NODE_BINARY:
+        if (scan_unsafe_global_access(c, node->binary.left, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->binary.right, out_name, out_len);
+    case NODE_UNARY:
+        return scan_unsafe_global_access(c, node->unary.operand, out_name, out_len);
+    case NODE_CALL:
+        if (scan_unsafe_global_access(c, node->call.callee, out_name, out_len)) return true;
+        for (int i = 0; i < node->call.arg_count; i++)
+            if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
+        return false;
+    case NODE_FIELD:
+        return scan_unsafe_global_access(c, node->field.object, out_name, out_len);
+    case NODE_INDEX:
+        if (scan_unsafe_global_access(c, node->index_expr.object, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->index_expr.index, out_name, out_len);
+    case NODE_ORELSE:
+        return scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len);
+    case NODE_DEFER:
+        return scan_unsafe_global_access(c, node->defer.body, out_name, out_len);
+    case NODE_SWITCH:
+        if (scan_unsafe_global_access(c, node->switch_stmt.expr, out_name, out_len)) return true;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            if (scan_unsafe_global_access(c, node->switch_stmt.arms[i].body, out_name, out_len)) return true;
+        return false;
+    default:
+        return false;
+    }
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
@@ -7463,7 +7548,8 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_SPAWN: {
-        /* spawn func(args); — validate function, check arg safety */
+        /* spawn func(args); — validate function, check arg safety.
+         * Also: scan spawned function body for non-shared global access (data race). */
         Symbol *func_sym = scope_lookup(c->global_scope,
             node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
         if (!func_sym || !func_sym->is_function) {
@@ -7511,6 +7597,22 @@ static void check_stmt(Checker *c, Node *node) {
                 sym->is_const = false;
                 sym->is_thread_handle = true;
                 typemap_set(c, node, ty_u64);
+            }
+        }
+        /* Scan spawned function body for non-shared global access (data race).
+         * Like Rust's Send/Sync check — spawned code can't touch non-shared globals. */
+        if (func_sym && func_sym->func_node &&
+            func_sym->func_node->kind == NODE_FUNC_DECL &&
+            func_sym->func_node->func_decl.body) {
+            const char *bad_name = NULL;
+            uint32_t bad_len = 0;
+            if (scan_unsafe_global_access(c, func_sym->func_node->func_decl.body,
+                                           &bad_name, &bad_len)) {
+                checker_warning(c, node->loc.line,
+                    "spawn target '%.*s' accesses non-shared global '%.*s' — "
+                    "potential data race. Use shared struct, threadlocal, @atomic_*, or volatile",
+                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                    (int)bad_len, bad_name);
             }
         }
         /* Ban spawn inside @critical */

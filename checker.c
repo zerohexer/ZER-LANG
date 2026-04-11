@@ -7803,6 +7803,18 @@ static void check_stmt(Checker *c, Node *node) {
                 (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name);
             break;
         }
+        /* Red Team V23: spawn target must return void — return value is lost.
+         * Move struct or Handle return would leak the resource. */
+        if (func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL) {
+            Type *ret = resolve_type(c, func_sym->func_node->func_decl.return_type);
+            if (ret && ret->kind != TYPE_VOID) {
+                checker_error(c, node->loc.line,
+                    "spawn target '%.*s' returns '%s' — return value would be lost. "
+                    "Use void return type for spawn targets",
+                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                    type_name(ret));
+            }
+        }
         bool is_scoped = (node->spawn_stmt.handle_name != NULL);
         /* Check each argument — type-check + pointer safety */
         for (int i = 0; i < node->spawn_stmt.arg_count; i++) {

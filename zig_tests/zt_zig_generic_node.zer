@@ -1,0 +1,26 @@
+// Translated from: zig/test/behavior/generics.zig — "generic struct"
+// Zig: fn GenNode(comptime T: type) type { return struct { value: T, next: ?*@This() }; }
+// ZER: container without self-referential pointer (limitation — stamp not in scope during parse)
+
+container ValueBox(T) {
+    T value;
+    u32 tag;
+}
+
+u32 get_value(*ValueBox(u32) box) {
+    return box.value;
+}
+
+i32 main() {
+    ValueBox(u32) a;
+    a.value = 13;
+    a.tag = 1;
+    if (a.value != 13) { return 1; }
+    if (get_value(&a) != 13) { return 2; }
+
+    ValueBox(bool) b;
+    b.value = true;
+    b.tag = 2;
+    if (b.value != true) { return 3; }
+    return 0;
+}

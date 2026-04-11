@@ -1,0 +1,21 @@
+// Translated from: zig/test/behavior/comptime_memory.zig patterns
+// Zig: comptime { var buf: [3]u8 = undefined; ... }
+// ZER: comptime function building array with loop
+
+comptime u32 BUILD_AND_SUM() {
+    u32[5] buf;
+    for (u32 i = 0; i < 5; i += 1) {
+        buf[i] = i * i;
+    }
+    u32 total = 0;
+    for (u32 i = 0; i < 5; i += 1) {
+        total += buf[i];
+    }
+    return total;
+}
+
+i32 main() {
+    u32 s = BUILD_AND_SUM();
+    if (s != 30) { return 1; }
+    return 0;
+}

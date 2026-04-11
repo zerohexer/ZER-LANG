@@ -1,0 +1,19 @@
+// Translated from: zig/test/behavior/comptime_memory.zig — "comptime store of struct into array"
+// ZER: comptime function returning struct with computed fields
+
+struct Pair { u32 first; u32 second; }
+
+comptime Pair MAKE_PAIR(u32 a, u32 b) {
+    return { .first = a * 2, .second = b + 10 };
+}
+
+i32 main() {
+    Pair p = MAKE_PAIR(5, 3);
+    if (p.first != 10) { return 1; }
+    if (p.second != 13) { return 2; }
+
+    Pair q = MAKE_PAIR(0, 0);
+    if (q.first != 0) { return 3; }
+    if (q.second != 10) { return 4; }
+    return 0;
+}

@@ -1,0 +1,15 @@
+// Translated from: zig/test/behavior/struct.zig — "return struct byval from function"
+// Zig: fn makeBar2(x: i32, y: i32) @This() { return .{ .x = x, .y = y }; }
+
+struct Bar { i32 x; i32 y; }
+
+Bar make_bar(i32 x, i32 y) {
+    return { .x = x, .y = y };
+}
+
+i32 main() {
+    Bar b = make_bar(1234, 5678);
+    if (b.x != 1234) { return 1; }
+    if (b.y != 5678) { return 2; }
+    return 0;
+}

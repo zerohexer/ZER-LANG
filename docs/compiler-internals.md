@@ -1017,6 +1017,20 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 **Added to Checker struct:** `uint32_t stack_limit` (0 = disabled). Set from CLI via `--stack-limit N` in zerc_main.c.
 
+## @ptrtoint(&local) Escape Detection (2026-04-12)
+
+`return @ptrtoint(&local)` — address of stack variable escapes as integer. Two checks:
+
+**Direct return:** `return @ptrtoint(&x)` — NODE_RETURN handler detects @ptrtoint intrinsic wrapping `&local_ident`. Walks field/index chains to root. Error if root is non-global, non-static.
+
+**Indirect return:** `usize a = @ptrtoint(&x); return a` — NODE_VAR_DECL handler detects @ptrtoint init with `&local`, sets `sym->is_local_derived = true`. Existing return escape check (line ~7338) catches `is_local_derived` on return ident.
+
+**Both paths needed:** Direct has no intermediate variable (no symbol to flag). Indirect has a symbol but the @ptrtoint is not in the return expression.
+
+## Function Pointer Indirect Recursion in Call Graph (2026-04-12)
+
+`scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
+
 ## Comptime Enum Values (2026-04-11)
 
 `Color.red` resolves to the enum variant's integer value at compile time.

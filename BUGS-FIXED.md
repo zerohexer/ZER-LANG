@@ -3177,3 +3177,13 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **Division by zero call divisors:** `x / func()` where func() has no proven nonzero return range → compile error. Extended forced division guard from NODE_IDENT/NODE_FIELD to also cover NODE_CALL. Functions with `has_return_range && return_range_min > 0` pass.
 
 **Stack overflow indirect calls:** `has_indirect_call` flag on StackFrame propagated through call chain. Without --stack-limit: warning. With --stack-limit: error on entry points with unresolvable funcptr calls.
+
+### Red Team audit fixes: transitive deadlock, comptime budget, naked validation (2026-04-12)
+
+**V1 — Transitive deadlock (Gemini red team):** `a.x = sneaky_helper()` where `sneaky_helper()` accesses different shared struct `b.y`. The `collect_shared_types_in_expr` was statement-local — didn't scan callee function bodies. Fix: transitive scanning of called function bodies (depth 4) for shared type accesses. Also added NODE_RETURN/NODE_EXPR_STMT/NODE_VAR_DECL handling in the expression scanner (were missing, caused callee body statements to be skipped).
+
+**V3 — Comptime nested loop DoS:** Nested `for (10000) { for (10000) }` = 100M iterations. Per-loop limit was 10000 but didn't account for nesting. Fix: global `_comptime_ops` counter incremented per loop iteration, cap at 1M total operations. Resets on top-level eval_comptime_block call.
+
+**V4 — Naked function with non-asm:** `naked void f() { u32[16] buf; }` compiled — GCC skips prologue but emitted code uses stack. Fix: checker scans naked function body, errors on any non-NODE_ASM, non-NODE_RETURN statement.
+
+**V2 — Union mutation via *opaque (NOT a bug):** Already caught — "cannot take address of union inside its switch arm — pointer alias would bypass variant lock." Gemini's test was invalid.

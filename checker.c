@@ -1723,8 +1723,10 @@ static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_l
 
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
     static int depth = 0;
+    static int64_t _comptime_ops = 0;  /* global instruction budget */
     if (!block) return CONST_EVAL_FAIL;
     if (depth++ > 32) { depth--; return CONST_EVAL_FAIL; }
+    if (depth == 1) _comptime_ops = 0;  /* reset on top-level call */
 
     /* Save count for block scoping — locals added inside are popped on exit.
      * Loop bodies do NOT save/restore (mutations must persist across iterations). */
@@ -1775,6 +1777,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                         (uint32_t)stmt->for_stmt.init->var_decl.name_len, val);
                 }
                 for (int iter = 0; iter < 10000; iter++) {
+                    if (++_comptime_ops > 1000000) { depth--; return CONST_EVAL_FAIL; }
                     if (stmt->for_stmt.cond) {
                         int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, ctx->locals, ctx->count);
                         if (cond == CONST_EVAL_FAIL || !cond) break;
@@ -1794,6 +1797,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             /* While loop */
             if (stmt->kind == NODE_WHILE || stmt->kind == NODE_DO_WHILE) {
                 for (int iter = 0; iter < 10000; iter++) {
+                    if (++_comptime_ops > 1000000) { depth--; return CONST_EVAL_FAIL; }
                     /* do-while: execute body before checking condition on first iteration */
                     if (stmt->kind == NODE_DO_WHILE && iter == 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
@@ -8535,7 +8539,22 @@ static void check_func_body(Checker *c, Node *node) {
             }
         }
 
-        if (node->func_decl.is_naked) c->in_naked = true;
+        if (node->func_decl.is_naked) {
+            c->in_naked = true;
+            /* MISRA Dir 4.3: naked functions must only contain asm statements.
+             * Non-asm code uses stack that was never allocated (no prologue). */
+            if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {
+                for (int si = 0; si < node->func_decl.body->block.stmt_count; si++) {
+                    Node *s = node->func_decl.body->block.stmts[si];
+                    if (s->kind != NODE_ASM && s->kind != NODE_RETURN) {
+                        checker_error(c, s->loc.line,
+                            "naked function must only contain asm and return — "
+                            "non-asm code uses stack that was never allocated");
+                        break;
+                    }
+                }
+            }
+        }
         bool saved_comptime = c->in_comptime_body;
         if (node->func_decl.is_comptime) c->in_comptime_body = true;
         check_stmt(c, node->func_decl.body);
@@ -9814,9 +9833,37 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
     }
     if (expr->kind == NODE_UNARY)
         count = collect_shared_types_in_expr(c, expr->unary.operand, types, max_types, count);
+    /* Statement nodes that may appear when scanning callee bodies transitively */
+    if (expr->kind == NODE_RETURN && expr->ret.expr)
+        return collect_shared_types_in_expr(c, expr->ret.expr, types, max_types, count);
+    if (expr->kind == NODE_EXPR_STMT)
+        return collect_shared_types_in_expr(c, expr->expr_stmt.expr, types, max_types, count);
+    if (expr->kind == NODE_VAR_DECL && expr->var_decl.init)
+        return collect_shared_types_in_expr(c, expr->var_decl.init, types, max_types, count);
     if (expr->kind == NODE_CALL) {
         for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
+        /* Transitive: scan called function body for shared type accesses.
+         * Catches: a.x = helper() where helper() accesses b.y (different shared type). */
+        if (count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
+            Symbol *csym = scope_lookup(c->global_scope,
+                expr->call.callee->ident.name, (uint32_t)expr->call.callee->ident.name_len);
+            if (csym && csym->is_function && csym->func_node &&
+                csym->func_node->kind == NODE_FUNC_DECL &&
+                csym->func_node->func_decl.body) {
+                /* Scan callee body for shared type field accesses */
+                static int _shared_scan_depth = 0;
+                if (_shared_scan_depth < 4) {
+                    _shared_scan_depth++;
+                    Node *body = csym->func_node->func_decl.body;
+                    if (body->kind == NODE_BLOCK) {
+                        for (int si = 0; si < body->block.stmt_count && count < max_types; si++)
+                            count = collect_shared_types_in_expr(c, body->block.stmts[si], types, max_types, count);
+                    }
+                    _shared_scan_depth--;
+                }
+            }
+        }
     }
     return count;
 }

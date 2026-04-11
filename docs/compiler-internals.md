@@ -1031,6 +1031,17 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes (2026-04-12, Gemini red team)
+
+### Transitive Deadlock Detection
+`collect_shared_types_in_expr` now scans called function bodies transitively (depth 4) for shared type field accesses. Catches: `a.x = helper()` where `helper()` accesses `b.y` — different shared type in same statement = potential AB-BA deadlock. Required adding NODE_RETURN/NODE_EXPR_STMT/NODE_VAR_DECL handling in the expression scanner (callee body statements were being skipped).
+
+### Comptime Global Instruction Budget
+`_comptime_ops` counter in `eval_comptime_block`. Incremented per loop iteration (both for and while/do-while). Cap: 1,000,000 total operations per comptime call. Prevents nested loop DoS (10000×10000 = 100M iterations). Resets on depth==1 (top-level call). Returns CONST_EVAL_FAIL on budget exceeded.
+
+### Naked Function Body Validation
+Naked functions (`__attribute__((naked))`) must only contain `asm` and `return` statements. Non-asm code (var-decl, assignment, etc.) uses stack that was never allocated (no prologue). Checker scans body block and errors on first non-asm, non-return statement.
+
 ## Local Function Pointer Init Required (2026-04-12)
 
 Local `void (*cb)(u32)` without initializer → compile error. Auto-zero creates NULL funcptr; calling it segfaults. Must either initialize (`= handler`) or use nullable `?void (*cb)(u32) = null`.

@@ -5695,6 +5695,68 @@ static Type *check_expr(Checker *c, Node *node) {
  * STATEMENT TYPE CHECKING
  * ================================================================ */
 
+/* Check if a function body contains any @atomic_* or @barrier calls.
+ * If yes, the developer is doing manual synchronization — race warnings not errors. */
+static bool has_atomic_or_barrier(Node *node) {
+    if (!node) return false;
+    if (node->kind == NODE_INTRINSIC) {
+        const char *n = node->intrinsic.name;
+        uint32_t nl = (uint32_t)node->intrinsic.name_len;
+        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
+            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
+            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
+            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
+            return true;
+    }
+    switch (node->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
+        return false;
+    case NODE_IF:
+        return has_atomic_or_barrier(node->if_stmt.cond) ||
+               has_atomic_or_barrier(node->if_stmt.then_body) ||
+               has_atomic_or_barrier(node->if_stmt.else_body);
+    case NODE_FOR:
+        return has_atomic_or_barrier(node->for_stmt.init) ||
+               has_atomic_or_barrier(node->for_stmt.cond) ||
+               has_atomic_or_barrier(node->for_stmt.step) ||
+               has_atomic_or_barrier(node->for_stmt.body);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return has_atomic_or_barrier(node->while_stmt.cond) ||
+               has_atomic_or_barrier(node->while_stmt.body);
+    case NODE_EXPR_STMT:
+        return has_atomic_or_barrier(node->expr_stmt.expr);
+    case NODE_RETURN:
+        return has_atomic_or_barrier(node->ret.expr);
+    case NODE_DEFER:
+        return has_atomic_or_barrier(node->defer.body);
+    case NODE_BINARY:
+        return has_atomic_or_barrier(node->binary.left) ||
+               has_atomic_or_barrier(node->binary.right);
+    case NODE_UNARY:
+        return has_atomic_or_barrier(node->unary.operand);
+    case NODE_CALL:
+        if (has_atomic_or_barrier(node->call.callee)) return true;
+        for (int i = 0; i < node->call.arg_count; i++)
+            if (has_atomic_or_barrier(node->call.args[i])) return true;
+        return false;
+    case NODE_ASSIGN:
+        return has_atomic_or_barrier(node->assign.target) ||
+               has_atomic_or_barrier(node->assign.value);
+    case NODE_VAR_DECL:
+        return has_atomic_or_barrier(node->var_decl.init);
+    case NODE_ORELSE:
+        return has_atomic_or_barrier(node->orelse.expr);
+    case NODE_SWITCH:
+        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
+        return false;
+    default: return false;
+    }
+}
+
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
  * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -5704,9 +5766,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         Symbol *sym = scope_lookup(c->global_scope,
             node->ident.name, (uint32_t)node->ident.name_len);
         if (sym && !sym->is_function && sym->type) {
-            /* Skip: const, volatile (explicit opt-in), threadlocal, shared, Pool/Slab/Ring/Arena/Barrier */
+            /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
+             * shared, Pool/Slab/Ring/Arena/Barrier */
             if (sym->is_const) return false;
-            if (sym->is_volatile) return false; /* volatile = explicit shared access opt-in */
+            if (sym->is_volatile) return false;
             /* threadlocal: check the AST node for is_threadlocal flag */
             if (sym->func_node &&
                 (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
@@ -5757,15 +5820,46 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_UNARY:
         return scan_unsafe_global_access(c, node->unary.operand, out_name, out_len);
     case NODE_CALL:
-        if (scan_unsafe_global_access(c, node->call.callee, out_name, out_len)) return true;
+        /* Check call arguments for global access */
         for (int i = 0; i < node->call.arg_count; i++)
             if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
+        /* Transitive: follow direct function calls into callee body.
+         * This catches helper() accessing non-shared globals from spawned context. */
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            Symbol *csym = scope_lookup(c->global_scope,
+                node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
+            if (csym && csym->is_function && csym->func_node &&
+                csym->func_node->kind == NODE_FUNC_DECL &&
+                csym->func_node->func_decl.body) {
+                /* Depth limit to prevent infinite recursion on recursive call chains */
+                static int _scan_depth = 0;
+                if (_scan_depth < 8) {
+                    _scan_depth++;
+                    bool found = scan_unsafe_global_access(c,
+                        csym->func_node->func_decl.body, out_name, out_len);
+                    _scan_depth--;
+                    if (found) return true;
+                }
+            }
+        }
         return false;
     case NODE_FIELD:
         return scan_unsafe_global_access(c, node->field.object, out_name, out_len);
     case NODE_INDEX:
         if (scan_unsafe_global_access(c, node->index_expr.object, out_name, out_len)) return true;
         return scan_unsafe_global_access(c, node->index_expr.index, out_name, out_len);
+    case NODE_INTRINSIC: {
+        /* Skip @atomic_* intrinsic arguments — atomic ops are thread-safe.
+         * This prevents false warnings for @atomic_store(&gflag, 1). */
+        const char *iname = node->intrinsic.name;
+        uint32_t ilen = (uint32_t)node->intrinsic.name_len;
+        if (ilen >= 7 && memcmp(iname, "atomic_", 7) == 0)
+            return false; /* all atomic args are safe */
+        /* Non-atomic intrinsics: scan arguments normally */
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            if (scan_unsafe_global_access(c, node->intrinsic.args[i], out_name, out_len)) return true;
+        return false;
+    }
     case NODE_ORELSE:
         return scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len);
     case NODE_DEFER:
@@ -7608,11 +7702,23 @@ static void check_stmt(Checker *c, Node *node) {
             uint32_t bad_len = 0;
             if (scan_unsafe_global_access(c, func_sym->func_node->func_decl.body,
                                            &bad_name, &bad_len)) {
-                checker_warning(c, node->loc.line,
-                    "spawn target '%.*s' accesses non-shared global '%.*s' — "
-                    "potential data race. Use shared struct, threadlocal, @atomic_*, or volatile",
-                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
-                    (int)bad_len, bad_name);
+                /* If function uses @atomic_* or @barrier — developer is doing manual
+                 * synchronization (lock-free pattern). Warn, don't error.
+                 * If NO synchronization at all — definitely unsafe, error. */
+                bool has_sync = has_atomic_or_barrier(func_sym->func_node->func_decl.body);
+                if (has_sync) {
+                    checker_warning(c, node->loc.line,
+                        "spawn target '%.*s' accesses non-shared global '%.*s' — "
+                        "potential data race (atomic/barrier present, verify ordering)",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        (int)bad_len, bad_name);
+                } else {
+                    checker_error(c, node->loc.line,
+                        "spawn target '%.*s' accesses non-shared global '%.*s' — "
+                        "data race. Use shared struct, threadlocal, @atomic_*, or volatile",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        (int)bad_len, bad_name);
+                }
             }
         }
         /* Ban spawn inside @critical */

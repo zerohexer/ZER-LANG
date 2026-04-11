@@ -5948,6 +5948,14 @@ static void check_stmt(Checker *c, Node *node) {
                 "use '?*%s' for nullable pointers",
                 type_name(type->pointer.inner), type_name(type->pointer.inner));
         }
+        /* Function pointer without initializer — auto-zero creates NULL funcptr.
+         * Calling it would segfault. Require init or use ?FuncPtr for nullable. */
+        if (!node->var_decl.init && type &&
+            type_unwrap_distinct(type)->kind == TYPE_FUNC_PTR) {
+            checker_error(c, node->loc.line,
+                "function pointer requires an initializer — "
+                "use '?' prefix for nullable function pointer");
+        }
 
         typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
 

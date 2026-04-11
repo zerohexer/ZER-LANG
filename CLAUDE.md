@@ -37,6 +37,31 @@ Barrier b;               thread sync point — (@barrier_init, @barrier_wait)
 Handle(Task) h;          u64: index(32) + generation(32), not a pointer
 ```
 
+### User-Defined Containers (Monomorphization)
+```
+// Define parameterized struct template — NOT generics, just type stamping
+container Stack(T) {
+    T[64] data;
+    u32 top;
+}
+
+Stack(u32) s;                // stamps concrete struct Stack_u32
+Stack(Point) ps;             // stamps separate struct Stack_Point
+
+// Functions are regular free functions, NOT methods (no `this`)
+void stack_push(*Stack(u32) s, u32 val) { s.data[s.top] = val; s.top += 1; }
+
+// T substitution works in: T, *T, ?T, []T, T[N] field types
+container Wrapper(T) { *T ptr; ?T maybe; T[4] arr; }
+```
+
+### Designated Initializers
+```
+Point p = { .x = 10, .y = 20 };     // var-decl init
+p = { .x = 100, .y = 200 };         // assignment (C99 compound literal)
+Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
+```
+
 ### CRITICAL Syntax Differences from C
 
 **These cause the most wasted turns in fresh sessions:**
@@ -311,7 +336,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ```
 
 ### What ZER Does NOT Have
-- No classes, inheritance, templates, generics
+- No classes, inheritance, templates, generics (use `container` keyword for type-stamped containers)
 - No exceptions, try/catch
 - No garbage collector
 - No heap/malloc/free (use Pool/Slab/Ring/Arena)
@@ -332,7 +357,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 - **Arc (ref counting)** — DON'T ADD. Pool/Slab/Handle covers allocation. Ref counting adds runtime overhead and cycle leak risk.
 - **Async runtime** — DON'T ADD as language feature. User writes the poll loop (bare-metal) or wraps with epoll (Linux). Library concern, not language.
 - **Unbounded channel** — DON'T ADD. `Ring(T, N)` is bounded by design — prevents OOM on embedded. Unbounded is a library-level choice.
-- **Generics** — v0.4 roadmap. Needed for user-defined containers. This IS a language feature gap.
+- **Generics** — DON'T ADD. `container` keyword covers user-defined containers via monomorphization (type stamping). No type constraints, no SFINAE, no template metaprogramming — just text substitution + type checking on the result.
 - **Whole-program analysis** — BANNED from architecture. zercheck is per-file with summaries. Heuristics cover callbacks. See design decisions.
 - **Partial moves** — DON'T ADD. Copy field value before consuming whole struct. Adds 200 lines of per-field tracking for a one-line workaround.
 
@@ -452,6 +477,8 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Allocation coloring (source_color) | Done | N/A (compile-time — arena wrappers, param inference) |
 | `move struct` (ownership transfer) | Done | N/A (compile-time — zercheck HS_TRANSFERRED) |
 | Semantic fuzzer (32 generators) | Done | N/A (200 tests per make check) |
+| Designated initializers (`{ .x = 10 }`) | Done | Done (C99 compound literal) |
+| `container` keyword (monomorphization) | Done | Done (stamped struct per type arg) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 
@@ -497,8 +524,8 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals (dynamic, no limit), comptime loops (for/while + assignment in comptime function bodies), `static_assert`, range-based `for (T item in slice)`, 705 Rust-equivalent tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers — `docs/refactoring_gaps.md`), CFG-aware zercheck (terminated + dynamic fixed-point), recursive mutex for shared structs, unified `emit_file_module`, 474+ bug fixes, 3,700+ tests
-- **v0.4:** table-driven compiler architecture, container keyword + monomorphization, better error messages
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals (dynamic, no limit), comptime loops (for/while + assignment in comptime function bodies), `static_assert`, range-based `for (T item in slice)`, designated initializers (`{ .x = 10 }`), `container` keyword (parameterized struct monomorphization), 705 Rust-equivalent tests (0 failures), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers — `docs/refactoring_gaps.md`), CFG-aware zercheck (terminated + dynamic fixed-point), recursive mutex for shared structs, unified `emit_file_module`, 474+ bug fixes, 3,700+ tests
+- **v0.4:** table-driven compiler architecture, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
 
@@ -632,7 +659,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **ZER Integration Tests (`tests/zer/`):**
 - Real `.zer` files compiled with `zerc --run`, must exit 0
 - Runner: `tests/test_zer.sh`, added to `make check`
-- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained, tracked_malloc, arena_alloc, comptime_eval, bit_fields, optional_patterns, star_slice, goto_label, goto_switch_label, goto_defer, handle_autoderef, handle_autoderef_pool, alloc_ptr, alloc_ptr_pool, alloc_ptr_mixed, alloc_ptr_stress, handle_complex, handle_array, opaque_safe_patterns, task_new, task_new_ptr, task_new_complex, orelse_block_ptr, task_new_orelse, const_handle_ok, handle_if_unwrap, volatile_div, orelse_void_block, volatile_orelse, comptime_const_if, optional_null_init, comptime_if_call, opaque_level1, opaque_level2, opaque_level345, opaque_level9_complex, opaque_cross_func, opaque_mixed_features, handle_scalar_store, const_slice_return, distinct_funcptr_nested, void_optional_init, distinct_optional, distinct_optional_full, distinct_types, distinct_slice_ops, funcptr_array, defer_free, if_exit_free, optional_array, distinct_optional_ptr, volatile_field_array, comptime_negative, comptime_pool_size, const_slice_field, comptime_nested_call, funcptr_struct_reduce, alloc_ptr_func, multi_slab_cross, nested_struct_deref2, nullable_funcptr, recursive_functions, pool_exhaustion, comptime_signed, slice_subslice, bit_extract_set, packed_struct, atomic_ops, container_offset, bang_integer, forward_decl, critical_block, bitcast_int, array_3d, union_array_variant, comptime_const_arg, opaque_ptrcast_roundtrip, dyn_array_guard, autoguard_intrinsic, critical_handle, distinct_union_assign, goto_backward_safe, inline_call_range, inline_range_deep, guard_clamp_range, keep_store_global, driver_registry, defer_return_order, typecast_cstyle, defer_multi_free, super_defer_complex, super_plugin, super_ecs, super_interpreter, super_freelist, super_state_machine, super_hashmap, goto_spaghetti_safe, interior_ptr_safe, typecast_safe_complex, super_uart_parser, super_sensor_logger, super_freelist_arena, shared_struct, scoped_spawn, condvar_signal, rwlock_shared, once_init, async_coroutine
+- Current tests: hash_map, ring_buffer, pool_handle, enum_switch, union_variant, defer_cleanup, extern_puts, hash_map_chained, tracked_malloc, arena_alloc, comptime_eval, bit_fields, optional_patterns, star_slice, goto_label, goto_switch_label, goto_defer, handle_autoderef, handle_autoderef_pool, alloc_ptr, alloc_ptr_pool, alloc_ptr_mixed, alloc_ptr_stress, handle_complex, handle_array, opaque_safe_patterns, task_new, task_new_ptr, task_new_complex, orelse_block_ptr, task_new_orelse, const_handle_ok, handle_if_unwrap, volatile_div, orelse_void_block, volatile_orelse, comptime_const_if, optional_null_init, comptime_if_call, opaque_level1, opaque_level2, opaque_level345, opaque_level9_complex, opaque_cross_func, opaque_mixed_features, handle_scalar_store, const_slice_return, distinct_funcptr_nested, void_optional_init, distinct_optional, distinct_optional_full, distinct_types, distinct_slice_ops, funcptr_array, defer_free, if_exit_free, optional_array, distinct_optional_ptr, volatile_field_array, comptime_negative, comptime_pool_size, const_slice_field, comptime_nested_call, funcptr_struct_reduce, alloc_ptr_func, multi_slab_cross, nested_struct_deref2, nullable_funcptr, recursive_functions, pool_exhaustion, comptime_signed, slice_subslice, bit_extract_set, packed_struct, atomic_ops, container_offset, bang_integer, forward_decl, critical_block, bitcast_int, array_3d, union_array_variant, comptime_const_arg, opaque_ptrcast_roundtrip, dyn_array_guard, autoguard_intrinsic, critical_handle, distinct_union_assign, goto_backward_safe, inline_call_range, inline_range_deep, guard_clamp_range, keep_store_global, driver_registry, defer_return_order, typecast_cstyle, defer_multi_free, super_defer_complex, super_plugin, super_ecs, super_interpreter, super_freelist, super_state_machine, super_hashmap, goto_spaghetti_safe, interior_ptr_safe, typecast_safe_complex, super_uart_parser, super_sensor_logger, super_freelist_arena, shared_struct, scoped_spawn, condvar_signal, rwlock_shared, once_init, async_coroutine, desig_init, container_stack
 - Negative tests: uaf_handle, double_free, maybe_freed, bounds_oob, div_zero, null_ptr, dangling_return, isr_slab_alloc, ghost_handle, goto_bad_label, alloc_ptr_uaf, alloc_ptr_double_free, opaque_struct_uaf, opaque_return_freed, opaque_alias_uaf, opaque_maybe_freed, opaque_double_free, cross_func_free_ptr, free_ptr_wrong_type, handle_no_allocator, ghost_alloc_ptr, task_delete_double, task_delete_uaf, opaque_cross_func_uaf, opaque_task_delete_ptr_uaf, bitcast_width, array_return, float_switch, return_in_defer, asm_not_naked, ptrcast_strip_volatile, narrowing_coerce, dyn_array_loop_freed, critical_return, critical_break, goto_backward_uaf, nonkeep_store_global, goto_spaghetti_uaf, goto_spaghetti_swap, goto_circular_swap_uaf, goto_maybe_freed_branch, interior_ptr_uaf, interior_ptr_func, typecast_provenance, typecast_volatile_strip, typecast_const_strip, typecast_direct_ptr, typecast_int_to_ptr, typecast_ptr_to_int, arena_global_escape, shared_field_ptr, spawn_nonshared_ptr, spawn_no_join
 - Module tests (`test_modules/`): main, app, diamond, use_types, use_defs, diamond2, collision_test, static_coll, gcoll, transitive, use_hal, opaque_wrap, opaque_wrap_df (negative), opaque_wrap_uaf (negative)
 - Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
@@ -719,6 +746,9 @@ ZER SYNTAX RULES (not C — these differ):
 - @atomic_load/store/add/sub/or/and/xor/cas for atomics
 - No malloc/free — use Pool(T, N), Slab(T), Arena
 - move struct Name { } = ownership transfer on pass/assign, use after move = error
+- container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)
+- Name(ConcreteType) var; = stamps concrete struct, functions take *Name(Type) explicitly
+- Designated init: Point p = { .x = 10, .y = 20 }; or p = { .x = 1 };
 ```
 
 Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).

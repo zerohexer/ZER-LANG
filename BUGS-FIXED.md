@@ -3116,3 +3116,26 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 - **Fix:** In `emit_global_var`, if `node->var_decl.is_const`, try `eval_const_expr()` first. If evaluation succeeds (both operands are compile-time constants), emit the pre-computed numeric result directly instead of the expression. Falls back to `emit_expr()` for non-const expressions.
 - **Found by:** `rt_const_binops.zer` translated from Rust's `tests/ui/consts/const-binops.rs`.
 - **Lesson:** Const global initializers must not use GCC extensions (statement expressions, typeof in expression position). Pre-evaluate when possible — it's both safer (compile-time verified) and more portable.
+
+### Designated Initializers + Container Keyword (2026-04-11, new features)
+
+**Designated initializers:**
+- `Point p = { .x = 10, .y = 20 };` — NODE_STRUCT_INIT parsed in `parse_primary` when `{` followed by `.`.
+- Checker validates field names against target struct, emitter produces C99 compound literal `(Type){ .field = val }`.
+- Works in both var-decl init and assignment contexts.
+
+**Container keyword (monomorphization):**
+- `container Stack(T) { T[64] data; u32 top; }` defines parameterized struct template.
+- `Stack(u32)` stamps concrete `struct Stack_u32` with T→u32.
+- No methods, no `this` — functions take `*Container(T)` explicitly.
+- Template stored on Checker, stamped on TYNODE_CONTAINER resolution, instances cached per (name, concrete_type).
+- T substitution handles: direct T, *T, ?T, []T, T[N] field types.
+
+**@container intrinsic conflict resolved:**
+- `TOK_CONTAINER` keyword conflicted with `@container` intrinsic (container_of). Fix: parser's `@` handler accepts both `TOK_IDENT` and `TOK_CONTAINER` as intrinsic name.
+
+**Statement lookahead for container types:**
+- `Stack(u32) s;` — parser statement heuristic for `IDENT(` case extended: after consuming `(`, checks if type token follows, speculatively parses `Type)` and checks for trailing IDENT. This detects container var-decls vs function calls.
+
+**Stale forward declaration removed:**
+- `eval_comptime_stmt` forward declaration was leftover from pre-ComptimeCtx refactor. Removed to eliminate -Wunused-function warning.

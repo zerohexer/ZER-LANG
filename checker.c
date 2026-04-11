@@ -1300,28 +1300,138 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
     if (local_count > 0)
         memcpy(locals, params, local_count * sizeof(ComptimeParam));
 
+    /* Helper: add or update a binding in locals array */
+    #define CT_ADD_LOCAL(name_p, name_l, val) do { \
+        /* try update existing */ \
+        bool _found = false; \
+        for (int _k = 0; _k < local_count; _k++) { \
+            if (locals[_k].name_len == (uint32_t)(name_l) && \
+                memcmp(locals[_k].name, (name_p), (name_l)) == 0) { \
+                locals[_k].value = (val); _found = true; break; \
+            } \
+        } \
+        if (!_found) { \
+            if (local_count >= local_capacity) { \
+                int nc = local_capacity * 2; \
+                ComptimeParam *nl = (ComptimeParam *)malloc(nc * sizeof(ComptimeParam)); \
+                if (!nl) { if (locals != stack_locals) free(locals); depth--; return CONST_EVAL_FAIL; } \
+                memcpy(nl, locals, local_count * sizeof(ComptimeParam)); \
+                if (locals != stack_locals) free(locals); \
+                locals = nl; local_capacity = nc; \
+            } \
+            locals[local_count].name = (name_p); \
+            locals[local_count].name_len = (uint32_t)(name_l); \
+            locals[local_count].value = (val); \
+            local_count++; \
+        } \
+    } while(0)
+
+    #define CT_FAIL() do { if (locals != stack_locals) free(locals); depth--; return CONST_EVAL_FAIL; } while(0)
+
     int64_t result = CONST_EVAL_FAIL;
     if (block->kind == NODE_BLOCK) {
         for (int i = 0; i < block->block.stmt_count; i++) {
             Node *stmt = block->block.stmts[i];
 
-            /* Handle local variable declarations: evaluate init, add binding */
+            /* Variable declaration: evaluate init, add binding */
             if (stmt->kind == NODE_VAR_DECL && stmt->var_decl.init) {
                 int64_t val = eval_const_expr_subst(stmt->var_decl.init, locals, local_count);
-                if (val == CONST_EVAL_FAIL) { if (locals != stack_locals) free(locals); depth--; return CONST_EVAL_FAIL; }
-                if (local_count >= local_capacity) {
-                    int nc = local_capacity * 2;
-                    ComptimeParam *nl = (ComptimeParam *)malloc(nc * sizeof(ComptimeParam));
-                    if (!nl) { if (locals != stack_locals) free(locals); depth--; return CONST_EVAL_FAIL; }
-                    memcpy(nl, locals, local_count * sizeof(ComptimeParam));
-                    if (locals != stack_locals) free(locals);
-                    locals = nl;
-                    local_capacity = nc;
+                if (val == CONST_EVAL_FAIL) CT_FAIL();
+                CT_ADD_LOCAL(stmt->var_decl.name, stmt->var_decl.name_len, val);
+                continue;
+            }
+
+            /* Assignment: update existing binding */
+            if (stmt->kind == NODE_EXPR_STMT && stmt->expr_stmt.expr &&
+                stmt->expr_stmt.expr->kind == NODE_ASSIGN) {
+                Node *asgn = stmt->expr_stmt.expr;
+                if (asgn->assign.target->kind == NODE_IDENT) {
+                    const char *tname = asgn->assign.target->ident.name;
+                    uint32_t tlen = (uint32_t)asgn->assign.target->ident.name_len;
+                    int64_t rhs = eval_const_expr_subst(asgn->assign.value, locals, local_count);
+                    if (rhs == CONST_EVAL_FAIL) CT_FAIL();
+                    /* find existing binding to get current value for compound assign */
+                    int64_t cur = 0;
+                    for (int k = 0; k < local_count; k++) {
+                        if (locals[k].name_len == tlen && memcmp(locals[k].name, tname, tlen) == 0) {
+                            cur = locals[k].value; break;
+                        }
+                    }
+                    int64_t newval;
+                    switch (asgn->assign.op) {
+                    case TOK_EQ:        newval = rhs; break;
+                    case TOK_PLUSEQ:    newval = cur + rhs; break;
+                    case TOK_MINUSEQ:   newval = cur - rhs; break;
+                    case TOK_STAREQ:    newval = cur * rhs; break;
+                    case TOK_SLASHEQ:   newval = rhs ? cur / rhs : 0; break;
+                    case TOK_PERCENTEQ: newval = rhs ? cur % rhs : 0; break;
+                    case TOK_LSHIFTEQ:  newval = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; break;
+                    case TOK_RSHIFTEQ:  newval = (rhs >= 0 && rhs < 64) ? cur >> rhs : 0; break;
+                    case TOK_AMPEQ:     newval = cur & rhs; break;
+                    case TOK_PIPEEQ:    newval = cur | rhs; break;
+                    case TOK_CARETEQ:   newval = cur ^ rhs; break;
+                    default: CT_FAIL();
+                    }
+                    CT_ADD_LOCAL(tname, tlen, newval);
+                    continue;
                 }
-                locals[local_count].name = stmt->var_decl.name;
-                locals[local_count].name_len = (uint32_t)stmt->var_decl.name_len;
-                locals[local_count].value = val;
-                local_count++;
+            }
+
+            /* For loop: init; cond; step; body */
+            if (stmt->kind == NODE_FOR) {
+                /* init */
+                if (stmt->for_stmt.init) {
+                    if (stmt->for_stmt.init->kind == NODE_VAR_DECL && stmt->for_stmt.init->var_decl.init) {
+                        int64_t val = eval_const_expr_subst(stmt->for_stmt.init->var_decl.init, locals, local_count);
+                        if (val == CONST_EVAL_FAIL) CT_FAIL();
+                        CT_ADD_LOCAL(stmt->for_stmt.init->var_decl.name, stmt->for_stmt.init->var_decl.name_len, val);
+                    }
+                }
+                /* iterate: max 10000 to prevent infinite loops */
+                for (int iter = 0; iter < 10000; iter++) {
+                    /* check condition */
+                    if (stmt->for_stmt.cond) {
+                        int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, locals, local_count);
+                        if (cond == CONST_EVAL_FAIL || !cond) break;
+                    }
+                    /* execute body */
+                    int64_t r = eval_comptime_block(stmt->for_stmt.body, locals, local_count);
+                    if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    /* step (e.g., i += 1) — handle as assignment */
+                    if (stmt->for_stmt.step && stmt->for_stmt.step->kind == NODE_ASSIGN &&
+                        stmt->for_stmt.step->assign.target->kind == NODE_IDENT) {
+                        Node *step = stmt->for_stmt.step;
+                        const char *sn = step->assign.target->ident.name;
+                        uint32_t sl = (uint32_t)step->assign.target->ident.name_len;
+                        int64_t rhs = eval_const_expr_subst(step->assign.value, locals, local_count);
+                        if (rhs == CONST_EVAL_FAIL) CT_FAIL();
+                        int64_t cur = 0;
+                        for (int k = 0; k < local_count; k++) {
+                            if (locals[k].name_len == sl && memcmp(locals[k].name, sn, sl) == 0) {
+                                cur = locals[k].value; break;
+                            }
+                        }
+                        int64_t nv;
+                        switch (step->assign.op) {
+                        case TOK_EQ:      nv = rhs; break;
+                        case TOK_PLUSEQ:  nv = cur + rhs; break;
+                        case TOK_MINUSEQ: nv = cur - rhs; break;
+                        default: nv = rhs; break;
+                        }
+                        CT_ADD_LOCAL(sn, sl, nv);
+                    }
+                }
+                continue;
+            }
+
+            /* While loop */
+            if (stmt->kind == NODE_WHILE) {
+                for (int iter = 0; iter < 10000; iter++) {
+                    int64_t cond = eval_const_expr_subst(stmt->while_stmt.cond, locals, local_count);
+                    if (cond == CONST_EVAL_FAIL || !cond) break;
+                    int64_t r = eval_comptime_block(stmt->while_stmt.body, locals, local_count);
+                    if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                }
                 continue;
             }
 
@@ -1331,6 +1441,9 @@ static int64_t eval_comptime_block(Node *block, ComptimeParam *params, int param
     } else {
         result = eval_comptime_stmt(block, locals, local_count);
     }
+ct_done:
+    #undef CT_ADD_LOCAL
+    #undef CT_FAIL
     if (locals != stack_locals) free(locals);
     depth--;
     return result;

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <math.h>
 
 /* ================================================================
  * ZER Type Checker — walks AST, resolves types, checks correctness
@@ -1610,7 +1611,6 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
 
 /* Evaluate a comptime float expression with parameter substitution.
  * Returns NAN on failure. Handles: float literals, +, -, *, /, param refs. */
-#include <math.h>
 static double eval_comptime_float_expr(Node *n, ComptimeParam *params, int param_count) {
     if (!n) return NAN;
     if (n->kind == NODE_FLOAT_LIT) return n->float_lit.value;
@@ -1665,26 +1665,6 @@ static Node *find_comptime_return_expr(Node *block) {
     return NULL;
 }
 
-/* Find the return NODE_STRUCT_INIT in a comptime function body (recursive).
- * Returns the NODE_STRUCT_INIT node from the first return statement found. */
-static Node *find_comptime_struct_return(Node *block) {
-    if (!block) return NULL;
-    if (block->kind == NODE_RETURN && block->ret.expr &&
-        block->ret.expr->kind == NODE_STRUCT_INIT)
-        return block->ret.expr;
-    if (block->kind == NODE_BLOCK) {
-        for (int i = 0; i < block->block.stmt_count; i++) {
-            Node *r = find_comptime_struct_return(block->block.stmts[i]);
-            if (r) return r;
-        }
-    }
-    if (block->kind == NODE_IF) {
-        Node *r = find_comptime_struct_return(block->if_stmt.then_body);
-        if (r) return r;
-        return find_comptime_struct_return(block->if_stmt.else_body);
-    }
-    return NULL;
-}
 
 /* Evaluate a comptime struct return: evaluate each field value in the
  * NODE_STRUCT_INIT, produce a new NODE_STRUCT_INIT with constant field values.
@@ -4065,7 +4045,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         } else {
                             /* Scalar eval failed — try struct return.
                              * Find return { .x = val } in body, evaluate field values. */
-                            Node *si = find_comptime_struct_return(fn->func_decl.body);
+                            Node *ret_expr = find_comptime_return_expr(fn->func_decl.body);
+                            Node *si = (ret_expr && ret_expr->kind == NODE_STRUCT_INIT) ? ret_expr : NULL;
                             if (si) {
                                 Node *csi = eval_comptime_struct_return(c->arena, si, cparams, pc);
                                 if (csi) {

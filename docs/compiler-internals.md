@@ -993,6 +993,29 @@ Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call o
 
 **Design decision:** Avoids changing `eval_comptime_block`'s return type to a tagged union. The struct path is handled entirely at the call site in the checker. Simpler, no architectural disruption, handles all cases where return expression is a designated initializer with comptime-evaluable field values.
 
+## Comptime Enum Values (2026-04-11)
+
+`Color.red` resolves to the enum variant's integer value at compile time.
+
+- `resolve_enum_field(c, node)` — looks up NODE_FIELD on enum type, returns `SEVariant.value` as int64.
+- `eval_const_expr_scoped` extended: handles NODE_FIELD directly, and handles NODE_BINARY containing enum fields by recursing on left/right before delegating to `eval_const_expr_ex`.
+- Works in: `static_assert(Color.red == 0)`, array index `table[Color.green]`, comptime function args (when type matches).
+- Also available in `eval_const_expr_subst` (comptime evaluator) via `_comptime_global_scope` lookup.
+
+## Comptime Float Arithmetic (2026-04-11)
+
+`comptime f64 PI_HALF() { return 3.14159 / 2.0; }` — comptime functions with float return types.
+
+**Architecture:** Parallel eval path at call site (same approach as comptime struct return). When `eval_comptime_block` returns CONST_EVAL_FAIL and return type is f32/f64:
+1. `find_comptime_return_expr(body)` — finds the return expression
+2. `eval_comptime_float_expr(expr, params, count)` — evaluates float expression tree. Handles: NODE_FLOAT_LIT, NODE_INT_LIT (cast to double), NODE_IDENT (param lookup — float bits stored as int64 via memcpy), NODE_UNARY(MINUS), NODE_BINARY(+, -, *, /).
+3. Result stored as `node->call.comptime_float_value` (double) + `is_comptime_float` flag.
+4. Emitter: `%.17g` format for full double precision.
+
+**Float params:** At call arg collection, when `eval_const_expr_scoped` fails but arg is NODE_FLOAT_LIT (or negated float), the double value is stored as bits in int64 via `memcpy`. The float evaluator reconverts via `memcpy` on lookup.
+
+**Design decision:** Does NOT extend ComptimeCtx to support float locals/arrays/loops. Only handles simple float expressions in return statements. This covers the embedded use case (compile-time math constants like PI, conversion factors, sensor calibration). Full float comptime (float locals, float arrays) would require a tagged ComptimeValue union — not needed yet.
+
 ## Value Range Propagation (checker.c)
 
 Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entries shadow older, save/restore via count for scoped narrowing. `push_var_range()` intersects with existing (only narrows), clamps min to 0 for unsigned types.

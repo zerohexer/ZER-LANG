@@ -1,0 +1,21 @@
+// Comptime float with negative values
+
+comptime f64 CELSIUS_TO_F(f64 c) {
+    return c * 1.8 + 32.0;
+}
+
+i32 main() {
+    f64 boil = CELSIUS_TO_F(100.0);
+    if (boil < 211.9) { return 1; }
+    if (boil > 212.1) { return 2; }
+
+    f64 freeze = CELSIUS_TO_F(0.0);
+    if (freeze < 31.9) { return 3; }
+    if (freeze > 32.1) { return 4; }
+
+    f64 cold = CELSIUS_TO_F(-40.0);
+    if (cold < -40.1) { return 5; }
+    if (cold > -39.9) { return 6; }
+
+    return 0;
+}

@@ -1,0 +1,22 @@
+// Comptime float arithmetic
+// Translated from Rust: const fn f64 (stable since 1.82)
+
+comptime f64 SQUARE(f64 x) {
+    return x * x;
+}
+
+comptime f64 HYPOTENUSE_SQ(f64 a, f64 b) {
+    return a * a + b * b;
+}
+
+i32 main() {
+    f64 s = SQUARE(5.0);
+    if (s < 24.9) { return 1; }
+    if (s > 25.1) { return 2; }
+
+    f64 h = HYPOTENUSE_SQ(3.0, 4.0);
+    if (h < 24.9) { return 3; }
+    if (h > 25.1) { return 4; }
+
+    return 0;
+}

@@ -682,6 +682,47 @@ static bool check_isr_ban(Checker *c, int line, const char *method) {
     return true;
 }
 
+/* ---- Designated init field validation ---- */
+/* Validates a NODE_STRUCT_INIT against a target struct type.
+ * Checks: all field names exist, all field value types match.
+ * Used at 4 value-flow sites: var-decl, assignment, call arg, return. */
+static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int line) {
+    Type *st = type_unwrap_distinct(target_type);
+    if (st->kind != TYPE_STRUCT) {
+        checker_error(c, line,
+            "designated initializer requires struct type, got '%s'",
+            type_name(target_type));
+        return false;
+    }
+    for (int fi = 0; fi < sinit->struct_init.field_count; fi++) {
+        DesigField *df = &sinit->struct_init.fields[fi];
+        bool found = false;
+        for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
+            if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
+                memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
+                found = true;
+                Type *ft = st->struct_type.fields[si].type;
+                Type *vt = checker_get_type(c, df->value);
+                if (vt && ft && !type_equals(ft, vt) &&
+                    !can_implicit_coerce(vt, ft) &&
+                    !is_literal_compatible(df->value, ft)) {
+                    checker_error(c, line,
+                        "field '.%.*s' expects '%s', got '%s'",
+                        (int)df->name_len, df->name,
+                        type_name(ft), type_name(vt));
+                }
+                break;
+            }
+        }
+        if (!found) {
+            checker_error(c, line,
+                "struct '%s' has no field '%.*s'",
+                type_name(target_type), (int)df->name_len, df->name);
+        }
+    }
+    return true;
+}
+
 /* ---- Auto-slab helper ---- */
 
 /* Find or create an auto-Slab for a struct type (used by Task.new/new_ptr).
@@ -2951,38 +2992,7 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* Designated initializer in assignment: validate fields */
         if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT && target) {
-            Type *st = type_unwrap_distinct(target);
-            if (st->kind != TYPE_STRUCT) {
-                checker_error(c, node->loc.line,
-                    "designated initializer requires struct type, got '%s'",
-                    type_name(target));
-            } else {
-                for (int fi = 0; fi < node->assign.value->struct_init.field_count; fi++) {
-                    DesigField *df = &node->assign.value->struct_init.fields[fi];
-                    bool found = false;
-                    for (int si = 0; si < st->struct_type.field_count; si++) {
-                        if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
-                            memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
-                            found = true;
-                            Type *ft = st->struct_type.fields[si].type;
-                            Type *vt = checker_get_type(c, df->value);
-                            if (vt && ft && !type_equals(ft, vt) &&
-                                !can_implicit_coerce(vt, ft) &&
-                                !is_literal_compatible(df->value, ft)) {
-                                checker_error(c, node->loc.line,
-                                    "field '.%.*s' expects '%s', got '%s'",
-                                    (int)df->name_len, df->name,
-                                    type_name(ft), type_name(vt));
-                            }
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        checker_error(c, node->loc.line,
-                            "struct '%s' has no field '%.*s'",
-                            type_name(target), (int)df->name_len, df->name);
-                    }
-                }
+            if (validate_struct_init(c, node->assign.value, target, node->loc.line)) {
                 value = target;
                 typemap_set(c, node->assign.value, target);
             }
@@ -3704,34 +3714,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* Designated init as call arg: validate fields against param struct type */
                     if (node->call.args[i]->kind == NODE_STRUCT_INIT && param) {
-                        Type *st = type_unwrap_distinct(param);
-                        if (st->kind == TYPE_STRUCT) {
-                            for (int fi = 0; fi < node->call.args[i]->struct_init.field_count; fi++) {
-                                DesigField *df = &node->call.args[i]->struct_init.fields[fi];
-                                bool found = false;
-                                for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
-                                    if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
-                                        memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
-                                        found = true;
-                                        Type *ft = st->struct_type.fields[si].type;
-                                        Type *vt = checker_get_type(c, df->value);
-                                        if (vt && ft && !type_equals(ft, vt) &&
-                                            !can_implicit_coerce(vt, ft) &&
-                                            !is_literal_compatible(df->value, ft)) {
-                                            checker_error(c, node->loc.line,
-                                                "argument %u field '.%.*s' expects '%s', got '%s'",
-                                                i + 1, (int)df->name_len, df->name,
-                                                type_name(ft), type_name(vt));
-                                        }
-                                        break;
-                                    }
-                                }
-                                if (!found) {
-                                    checker_error(c, node->loc.line,
-                                        "argument %u: struct '%s' has no field '%.*s'",
-                                        i + 1, type_name(param), (int)df->name_len, df->name);
-                                }
-                            }
+                        if (validate_struct_init(c, node->call.args[i], param, node->loc.line)) {
                             arg = param;
                             typemap_set(c, node->call.args[i], param);
                         }
@@ -5708,39 +5691,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* Designated initializer: validate fields against target struct type */
             if (node->var_decl.init->kind == NODE_STRUCT_INIT && type) {
-                Type *st = type_unwrap_distinct(type);
-                if (st->kind != TYPE_STRUCT) {
-                    checker_error(c, node->loc.line,
-                        "designated initializer requires struct type, got '%s'",
-                        type_name(type));
-                } else {
-                    for (int fi = 0; fi < node->var_decl.init->struct_init.field_count; fi++) {
-                        DesigField *df = &node->var_decl.init->struct_init.fields[fi];
-                        bool found = false;
-                        for (int si = 0; si < st->struct_type.field_count; si++) {
-                            if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
-                                memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
-                                found = true;
-                                Type *ft = st->struct_type.fields[si].type;
-                                Type *vt = checker_get_type(c, df->value);
-                                if (vt && ft && !type_equals(ft, vt) &&
-                                    !can_implicit_coerce(vt, ft) &&
-                                    !is_literal_compatible(df->value, ft)) {
-                                    checker_error(c, node->loc.line,
-                                        "field '.%.*s' expects '%s', got '%s'",
-                                        (int)df->name_len, df->name,
-                                        type_name(ft), type_name(vt));
-                                }
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            checker_error(c, node->loc.line,
-                                "struct '%s' has no field '%.*s'",
-                                type_name(type), (int)df->name_len, df->name);
-                        }
-                    }
-                    /* Set the struct_init node type to the target struct type */
+                if (validate_struct_init(c, node->var_decl.init, type, node->loc.line)) {
                     init_type = type;
                     typemap_set(c, node->var_decl.init, type);
                 }
@@ -7208,34 +7159,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* Designated init in return: validate against function return type */
             if (node->ret.expr->kind == NODE_STRUCT_INIT && c->current_func_ret) {
-                Type *st = type_unwrap_distinct(c->current_func_ret);
-                if (st->kind == TYPE_STRUCT) {
-                    for (int fi = 0; fi < node->ret.expr->struct_init.field_count; fi++) {
-                        DesigField *df = &node->ret.expr->struct_init.fields[fi];
-                        bool found = false;
-                        for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
-                            if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
-                                memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
-                                found = true;
-                                Type *ft = st->struct_type.fields[si].type;
-                                Type *vt = checker_get_type(c, df->value);
-                                if (vt && ft && !type_equals(ft, vt) &&
-                                    !can_implicit_coerce(vt, ft) &&
-                                    !is_literal_compatible(df->value, ft)) {
-                                    checker_error(c, node->loc.line,
-                                        "return field '.%.*s' expects '%s', got '%s'",
-                                        (int)df->name_len, df->name,
-                                        type_name(ft), type_name(vt));
-                                }
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            checker_error(c, node->loc.line,
-                                "struct '%s' has no field '%.*s'",
-                                type_name(c->current_func_ret), (int)df->name_len, df->name);
-                        }
-                    }
+                if (validate_struct_init(c, node->ret.expr, c->current_func_ret, node->loc.line)) {
                     ret_type = c->current_func_ret;
                     typemap_set(c, node->ret.expr, c->current_func_ret);
                 }

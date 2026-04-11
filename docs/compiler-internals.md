@@ -208,56 +208,80 @@ Any future changes to orelse must update ALL THREE paths consistently. Check `is
 - All `optional.inner->kind == TYPE_VOID` checks wrapped with `type_unwrap_distinct()` (14 sites in emitter + 1 in checker). Same for `pointer.inner->kind == TYPE_OPAQUE` (6 sites in emitter).
 - Optional null init changed from `{ {0} }` to `{ 0, 0 }` (6 sites) — eliminates GCC "braces around scalar initializer" warning.
 
-### Comptime Evaluator Architecture (2026-04-11)
+### Comptime Evaluator Architecture (2026-04-11, refactored)
 
-The comptime evaluator is a compile-time interpreter for `comptime` function bodies. It evaluates to a single `int64_t` constant.
+The comptime evaluator is a compile-time interpreter for `comptime` function bodies. Evaluates to `int64_t`.
 
 **Entry points (3 call sites in checker.c):**
-1. `check_expr` NODE_CALL handler (line ~3575) — resolves comptime call during expression type checking
-2. `eval_comptime_call_subst` (line ~1013) — resolves nested comptime calls from within `eval_const_expr_subst`
-3. `checker_check_bodies` NODE_STATIC_ASSERT handler — resolves comptime calls in static_assert conditions
+1. `check_expr` NODE_CALL handler — resolves comptime call during expression type checking
+2. `eval_comptime_call_subst` — resolves nested comptime calls from within `eval_const_expr_subst`
+3. `checker_check_bodies` NODE_STATIC_ASSERT handler — resolves comptime calls in static_assert
 
-**Call chain:** `check_expr(NODE_CALL)` → `eval_comptime_block(body, params, count)` → walks statements.
+**Call chain:** caller creates `ComptimeCtx` with params → `eval_comptime_block(body, &ctx)` → walks statements → `ct_ctx_free(&ctx)`.
 
-**`eval_comptime_block` handles:**
-- `NODE_VAR_DECL` — evaluate init, add `{name, value}` to locals array
-- `NODE_EXPR_STMT(NODE_ASSIGN)` — update existing binding (compound: `+=`, `-=`, `*=`, etc.)
-- `NODE_FOR` — init + condition + body + step, max 10000 iterations
-- `NODE_WHILE` — condition + body, max 10000 iterations
-- `NODE_SWITCH` — evaluate expr, match arms, execute matching body
+**`ComptimeCtx` — mutable shared evaluation context:**
+```c
+typedef struct {
+    ComptimeParam stack[8];    // stack-first small buffer
+    ComptimeParam *locals;     // points to stack or malloc'd
+    int count, capacity;
+} ComptimeCtx;
+```
+- `ct_ctx_init(ctx, params, count)` — initialize from function parameters
+- `ct_ctx_set(ctx, name, len, value)` — add or update binding
+- `ct_ctx_free(ctx)` — free if malloc'd
+- Block scoping via `saved_count` — pop locals on block exit
+- Loop bodies share ctx (mutations persist across iterations — NO copy)
+
+**`ct_eval_assign(ctx, assign_node)` — compound assignment helper:**
+Handles all compound operators (`+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`, `&=`, `|=`, `^=`, `=`). ONE function, used by both block-level assignment and for-loop step. No duplicate code.
+
+**`eval_comptime_block` handles (all via recursive `ComptimeCtx`):**
+- `NODE_VAR_DECL` — evaluate init, `ct_ctx_set`
+- `NODE_EXPR_STMT(NODE_ASSIGN)` — `ct_eval_assign(ctx, ...)`
+- `NODE_FOR` — init + condition + recursive body + step, max 10000 iterations
+- `NODE_WHILE` — condition + recursive body, max 10000 iterations
+- `NODE_SWITCH` — evaluate expr, match arms, execute matching arm body
 - `NODE_RETURN` — evaluate expression, return value
-- `NODE_IF` — conditional branching (delegates to `eval_comptime_stmt`)
-- `NODE_BLOCK` — recursive walk
+- `NODE_IF` — conditional branching, recursive
+- `NODE_BLOCK` — recursive walk with scope save/restore
 
-**CRITICAL: Loop body shares locals (not copies).**
-`eval_comptime_block` normally COPIES the locals array on entry (to scope variables). But for/while loop bodies must SHARE the outer locals to allow mutations (`total += i`). Loop body statements are walked INLINE within the for/while handler, not via recursive `eval_comptime_block` call. This was a bug found in this session — `eval_comptime_block` copy semantics broke loop variable mutation.
-
-**Bindings: `ComptimeParam` array.**
-Stack-first [8] with malloc+double overflow. `CT_ADD_LOCAL(name, len, val)` macro adds or updates. No fixed limit on locals.
+**CRITICAL design decision: `ComptimeCtx` is passed by POINTER (mutable).**
+Previous design copied locals on each `eval_comptime_block` call. This broke loop body mutations — `total += i` modified the copy, outer `total` stayed 0. The refactored design passes `ComptimeCtx*` so all mutations propagate. Block scoping uses `saved_count` to pop block-local variables without losing loop state.
 
 **`eval_const_expr_subst` vs `eval_const_expr_scoped`:**
-- `eval_const_expr_subst(expr, params, count)` — evaluates expression with parameter substitution. Used inside comptime evaluator.
-- `eval_const_expr_scoped(checker, expr)` — evaluates via `eval_const_expr_ex` with const ident resolver callback. Used by static_assert and array size evaluation.
-- For static_assert with comptime calls: `check_expr` must run FIRST to set `call.is_comptime_resolved`, then `eval_const_expr_scoped` reads `call.comptime_value`.
+- `eval_const_expr_subst(expr, params, count)` — expression evaluation with parameter substitution. Used inside comptime evaluator. Takes raw `ComptimeParam*` array (read-only).
+- `eval_const_expr_scoped(checker, expr)` — uses `eval_const_expr_ex` with const ident resolver callback. Used by static_assert and array size evaluation.
+- For static_assert with comptime calls: `check_expr` MUST run FIRST to set `call.is_comptime_resolved`, then `eval_const_expr_scoped` reads `call.comptime_value`.
 
 **Debugging comptime issues:**
 1. Check if `is_comptime_resolved` is set on the NODE_CALL after `check_expr`
 2. Check if `eval_comptime_block` returns CONST_EVAL_FAIL — trace which statement fails
-3. For loops: verify locals are shared (not copied) between iterations
+3. For loops: verify ctx is passed by pointer (not copied) — mutations must persist
 4. For top-level static_assert: verify `check_expr` runs before `eval_const_expr_scoped`
+5. For block scoping: verify `saved_count` is restored — block-local vars must be popped
 
 ### static_assert (2026-04-11)
 
-New keyword: `static_assert(expr, "message");` — compile-time assertion. Handled as NODE_STATIC_ASSERT. Checker evaluates condition via `check_expr` + `eval_const_expr_scoped`. False → compile error. Emitter emits nothing.
+New keyword: `static_assert(expr, "message");` — compile-time assertion.
+- Lexer: `TOK_STATIC_ASSERT` (13-char keyword with underscore)
+- Parser: `NODE_STATIC_ASSERT` with `cond` (expression) and `message` (optional string)
+- Checker: `check_expr(cond)` then `eval_const_expr_scoped(cond)`. False → compile error with message.
+- Emitter: emits nothing (compile-time only)
+- Works at both top-level and inside function bodies
+- Top-level handled in `checker_check_bodies` (after comptime functions registered)
 
-### Range-based for (2026-04-11)
+### Range-based for (2026-04-11, fixed)
 
 `for (Type item in slice) { body }` — parser desugars to:
 ```c
-for (usize __ri = 0; __ri < slice.len; __ri += 1) { Type item = slice[__ri]; body }
+for (usize __ri = 0; __ri < collection.len; __ri += 1) { Type item = collection[__ri]; body }
 ```
-`in` is a contextual keyword (only detected in for-loop context, not reserved).
-Known limitation: `collection` expression reused in 3 AST positions — side-effectful expressions evaluated 3 times. Use a variable for complex expressions.
+- `in` is a contextual keyword (only detected in for-loop `Type ident` context, not reserved)
+- Collection expression CLONED for each AST position (no shared node pointers)
+- Non-ident/non-field collection expressions REJECTED at parse time with clear error: "assign complex expression to a variable first"
+- This ensures 100% correctness — no triple-evaluation of function calls
+- Bounds-checked slice indexing (not raw pointer)
 
 ### Comptime Call In-Place Conversion (BUG-402/403/404, 2026-04-05)
 

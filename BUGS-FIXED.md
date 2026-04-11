@@ -3187,3 +3187,9 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **V4 — Naked function with non-asm:** `naked void f() { u32[16] buf; }` compiled — GCC skips prologue but emitted code uses stack. Fix: checker scans naked function body, errors on any non-NODE_ASM, non-NODE_RETURN statement.
 
 **V2 — Union mutation via *opaque (NOT a bug):** Already caught — "cannot take address of union inside its switch arm — pointer alias would bypass variant lock." Gemini's test was invalid.
+
+### Red Team V5-V6 (2026-04-12, Gemini round 2)
+
+**V5 — Thread-unsafe Slab/Pool/Ring from spawn:** `scan_unsafe_global_access` skipped TYPE_POOL/TYPE_SLAB/TYPE_RING. These allocators have non-atomic metadata — alloc/free from multiple threads is a data race. Fix: only skip TYPE_ARENA and TYPE_BARRIER. Also fixed two scanner gaps: NODE_FIELD not in recursion switch (callee `global_slab.alloc()` has slab as NODE_FIELD object), and NODE_CALL not scanning callee expression. 6 tests that used Ring/Pool from spawn correctly reclassified as negative tests.
+
+**V6 — Container infinite recursion:** `container Node(T) { ?*Node(T) next; }` caused infinite type resolution. Fix: `_container_depth` limit (32) + `subst_typenode()` recursive TypeNode substitution replacing 5 one-level pattern matches with single recursive function. Handles T at any nesting depth.

@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-12 — Gemini Red Team Round 7 (2 real bugs from 5 reports)
+
+### BUG-488: Zercheck variable shadowing false positive (scope-aware refactor)
+**Symptom:** Inner `Handle(Item) h` freed → outer `Handle(Item) h` falsely marked as freed. `pool.get(h)` at outer scope rejected as UAF.
+**Root cause:** zercheck used flat name matching in `find_handle` with no scope concept. Inner and outer variables with same name collided in the PathState handle array.
+**Why patches failed:** Three attempts (last-match, scope_depth flag, shadow cleanup) each required patching 5-10 sites because the flat array assumption was baked into every function. The `zc_check_var_init` pattern `find_handle → if (!h) add_handle` conflated "exists in any scope" with "exists in current scope."
+**Proper fix:** Scope-aware handle tracking via two-function separation:
+- `find_handle(ps, name, len)` — source lookup, returns highest scope_depth match (any scope). Used for UAF/alias checks (~20 call sites, unchanged).
+- `find_handle_local(ps, name, len)` — destination registration, returns only current-scope match. Returns NULL for outer-scope handles → `add_handle` creates shadow. Used for var-decl alloc/alias (~6 call sites changed).
+- `scope_depth` field on PathState (NODE_BLOCK increments/decrements) + HandleInfo (set by add_handle).
+- Block exit: removes inner-scope handles that shadow outer handles. Propagates state only if same alloc_id (alias).
+- `pathstate_copy` preserves scope_depth for if/else branch analysis.
+**Pattern:** Mirrors checker's `scope_lookup` (any scope) vs `scope_lookup_local` (current scope only).
+**Test:** `tests/zer/handle_shadow_scope.zer`
+
+### BUG-489: Runtime @inttoptr missing alignment check
+**Symptom:** `@inttoptr(*u32, 0x40000000 + offset)` with variable address — range check emitted but no alignment check. Constant addresses validated at compile time, runtime addresses skipped.
+**Fix:** Emitter runtime @inttoptr path emits `if (_zer_ma0 % align != 0) _zer_trap("unaligned address")` after range check. Alignment from target pointer type width (u32=4, u16=2, u64=8, u8=any).
+**Test:** `tests/zer/mmio_runtime_align.zer`
+
+### Not bugs (V33, V34, V37)
+- V33 (VRP compound parent alias): Bounds check NOT eliminated — VRP conservative for compound keys. `_zer_bounds_check` present.
+- V34 (Async cancellation leak): Design limitation (known, accepted). No async cancel for firmware. User polls to completion. Same as Rust's `mem::forget` being safe.
+- V37 (Union alias confusion): Union variant access requires switch — "cannot read union variant directly." Attack blocked by existing rules.
+
 ## Session 2026-04-12 — Gemini Red Team Round 6 (3 real bugs from 4 reports)
 
 ### BUG-485: *opaque comparison fails with track_cptrs

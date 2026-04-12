@@ -8061,6 +8061,51 @@ static void check_stmt(Checker *c, Node *node) {
                     i + 1);
             }
         }
+        /* BUG-491: type-check spawn args against function parameter types.
+         * The pointer safety check above validates shared vs non-shared,
+         * but doesn't check const/volatile qualifier preservation.
+         * spawn worker(&const_val) must fail like a normal call would. */
+        if (func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL) {
+            int pc = func_sym->func_node->func_decl.param_count;
+            for (int i = 0; i < node->spawn_stmt.arg_count && i < pc; i++) {
+                Type *arg_type = checker_get_type(c, node->spawn_stmt.args[i]);
+                Type *param_type = resolve_type(c, func_sym->func_node->func_decl.params[i].type);
+                if (!arg_type || !param_type) continue;
+                /* const pointer → mutable param: reject */
+                if (arg_type->kind == TYPE_POINTER && param_type->kind == TYPE_POINTER &&
+                    arg_type->pointer.is_const && !param_type->pointer.is_const) {
+                    checker_error(c, node->loc.line,
+                        "spawn argument %d: cannot pass const pointer to mutable parameter",
+                        i + 1);
+                }
+                /* volatile pointer → non-volatile param: reject */
+                if (arg_type->kind == TYPE_POINTER && param_type->kind == TYPE_POINTER &&
+                    !param_type->pointer.is_volatile) {
+                    bool arg_vol = arg_type->pointer.is_volatile;
+                    if (!arg_vol && node->spawn_stmt.args[i]->kind == NODE_UNARY &&
+                        node->spawn_stmt.args[i]->unary.op == TOK_AMP &&
+                        node->spawn_stmt.args[i]->unary.operand->kind == NODE_IDENT) {
+                        Symbol *as = scope_lookup(c->current_scope,
+                            node->spawn_stmt.args[i]->unary.operand->ident.name,
+                            (uint32_t)node->spawn_stmt.args[i]->unary.operand->ident.name_len);
+                        if (as && as->is_volatile) arg_vol = true;
+                    }
+                    if (arg_vol) {
+                        checker_error(c, node->loc.line,
+                            "spawn argument %d: cannot pass volatile pointer to non-volatile parameter",
+                            i + 1);
+                    }
+                }
+                /* Type mismatch */
+                if (!type_equals(param_type, arg_type) &&
+                    !can_implicit_coerce(arg_type, param_type)) {
+                    checker_error(c, node->loc.line,
+                        "spawn argument %d: expected '%s', got '%s'",
+                        i + 1, type_name(param_type), type_name(arg_type));
+                }
+            }
+        }
+
         /* Register ThreadHandle variable in scope */
         if (is_scoped) {
             /* ThreadHandle is u64 wrapping pthread_t */

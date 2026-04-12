@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Gemini Red Team Round 8 (3 real bugs from 4 reports)
+
+### BUG-490: Async sub-block locals not promoted to state struct
+**Symptom:** `u32 sub_block = 2; yield; u32 check = sub_block;` inside nested `{ }` block — `sub_block` on stack, stale after yield.
+**Root cause:** `collect_async_locals` only scanned top-level statements, not recursive into sub-blocks, if bodies, loops, switch arms.
+**Fix:** Made `collect_async_locals` fully recursive — scans NODE_BLOCK, NODE_IF, NODE_FOR, NODE_WHILE, NODE_SWITCH, NODE_DEFER, NODE_CRITICAL, NODE_ONCE. Extracted `add_async_local` helper with dedup by name. State struct field emission also made recursive (iterative stack-based traversal). Same approach as Rust's MIR generator — ALL locals promoted regardless of scope depth.
+**Test:** `tests/zer/async_subblock_yield.zer`
+
+### BUG-491: Spawn doesn't validate const/volatile qualifiers on pointer args
+**Symptom:** `spawn worker(&const_val)` where worker takes `*u32` — compiles without error. GCC warns "discards const qualifier" but ZER checker doesn't catch it.
+**Root cause:** NODE_SPAWN handler validated shared vs non-shared pointer safety but never compared argument types against function parameter types for qualifier preservation.
+**Fix:** After pointer safety checks, resolve function param types and validate: const pointer → mutable param = error, volatile pointer → non-volatile param = error, type mismatch = error. Same checks as normal NODE_CALL handler.
+**Test:** `tests/zer_fail/spawn_const_bypass.zer`
+
+### BUG-492: Leak detection covered_ids[64] fixed buffer
+**Symptom:** Functions with 65+ allocations silently skip leak detection for allocations beyond the 64th.
+**Root cause:** `covered_ids[64]` stack buffer with `if (covered_count < 64)` guard — silently drops coverage.
+**Fix:** Stack-first dynamic pattern: `int covered_stack[64]; int *covered_ids = covered_stack;` with malloc overflow when count exceeds capacity. Same pattern as parser RF9.
+**Test:** Covered by existing tests (pattern fix, not behavior change for <64 allocations).
+
+### V39 (Round 8): NOT A BUG — shared group deadlock on return
+Same as V12 (round 4) and V39 (round 7). Per-statement-group locking. Unlock before control flow. Gemini keeps making this same false claim.
+
 ## Session 2026-04-12 — Gemini Red Team Round 7 (2 real bugs from 5 reports)
 
 ### BUG-488: Zercheck variable shadowing false positive (scope-aware refactor)

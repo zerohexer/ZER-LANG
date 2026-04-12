@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Spawn must validate const/volatile qualifiers (BUG-491)
+void worker(*u32 p) { p[0] = 100; }
+u32 main() {
+    const u32 val = 42;
+    ThreadHandle th = spawn worker(&val);
+    th.join();
+    return 0;
+}

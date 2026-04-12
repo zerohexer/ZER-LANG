@@ -4435,31 +4435,63 @@ static void prescan_async_temps(Emitter *e, Node *node) {
     if (node->kind == NODE_DEFER) prescan_async_temps(e, node->defer.body);
 }
 
-/* Collect local variable declarations from a block (non-recursive — top level only) */
-static void collect_async_locals(Emitter *e, Node *body) {
-    if (!body || body->kind != NODE_BLOCK) return;
-    for (int i = 0; i < body->block.stmt_count; i++) {
-        Node *s = body->block.stmts[i];
-        if (s->kind == NODE_VAR_DECL && !s->var_decl.is_static) {
-            /* BUG-486: skip static locals — they must stay as global C statics,
-             * not be promoted to the instance state struct. */
-            if (e->async_local_count >= e->async_local_capacity) {
-                int nc = e->async_local_capacity < 8 ? 8 : e->async_local_capacity * 2;
-                const char **nls = (const char **)arena_alloc(e->arena, nc * sizeof(const char *));
-                size_t *nlens = (size_t *)arena_alloc(e->arena, nc * sizeof(size_t));
-                if (e->async_locals) {
-                    memcpy(nls, e->async_locals, e->async_local_count * sizeof(const char *));
-                    memcpy(nlens, e->async_local_lens, e->async_local_count * sizeof(size_t));
-                }
-                e->async_locals = nls;
-                e->async_local_lens = nlens;
-                e->async_local_capacity = nc;
-            }
-            e->async_locals[e->async_local_count] = s->var_decl.name;
-            e->async_local_lens[e->async_local_count] = s->var_decl.name_len;
-            e->async_local_count++;
-        }
+/* BUG-490: helper to add one async local (dedup by name) */
+static void add_async_local(Emitter *e, const char *name, size_t name_len) {
+    /* dedup — same name already promoted (shadowing or repeated) */
+    for (int i = 0; i < e->async_local_count; i++) {
+        if (e->async_local_lens[i] == name_len &&
+            memcmp(e->async_locals[i], name, name_len) == 0)
+            return;
     }
+    if (e->async_local_count >= e->async_local_capacity) {
+        int nc = e->async_local_capacity < 8 ? 8 : e->async_local_capacity * 2;
+        const char **nls = (const char **)arena_alloc(e->arena, nc * sizeof(const char *));
+        size_t *nlens = (size_t *)arena_alloc(e->arena, nc * sizeof(size_t));
+        if (e->async_locals) {
+            memcpy(nls, e->async_locals, e->async_local_count * sizeof(const char *));
+            memcpy(nlens, e->async_local_lens, e->async_local_count * sizeof(size_t));
+        }
+        e->async_locals = nls;
+        e->async_local_lens = nlens;
+        e->async_local_capacity = nc;
+    }
+    e->async_locals[e->async_local_count] = name;
+    e->async_local_lens[e->async_local_count] = name_len;
+    e->async_local_count++;
+}
+
+/* BUG-490: collect local variable declarations RECURSIVELY from all blocks.
+ * Sub-block locals must be promoted to state struct — they live on the C stack
+ * which is destroyed on yield. Same fix as Rust's MIR generator transform. */
+static void collect_async_locals(Emitter *e, Node *node) {
+    if (!node) return;
+    if (node->kind == NODE_VAR_DECL && !node->var_decl.is_static) {
+        add_async_local(e, node->var_decl.name, node->var_decl.name_len);
+    }
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++)
+            collect_async_locals(e, node->block.stmts[i]);
+    }
+    if (node->kind == NODE_IF) {
+        collect_async_locals(e, node->if_stmt.then_body);
+        collect_async_locals(e, node->if_stmt.else_body);
+    }
+    if (node->kind == NODE_FOR) {
+        collect_async_locals(e, node->for_stmt.init);
+        collect_async_locals(e, node->for_stmt.body);
+    }
+    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE)
+        collect_async_locals(e, node->while_stmt.body);
+    if (node->kind == NODE_SWITCH) {
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            collect_async_locals(e, node->switch_stmt.arms[i].body);
+    }
+    if (node->kind == NODE_DEFER)
+        collect_async_locals(e, node->defer.body);
+    if (node->kind == NODE_CRITICAL)
+        collect_async_locals(e, node->critical.body);
+    if (node->kind == NODE_ONCE)
+        collect_async_locals(e, node->once.body);
 }
 
 /* Check if an ident name is an async-promoted local */
@@ -4534,17 +4566,68 @@ static void emit_async_func(Emitter *e, Node *node) {
             emit(e, ";\n");
         }
     }
-    /* Emit each local as a struct field (skip static — stays as C static) */
-    if (body->kind == NODE_BLOCK) {
-        for (int i = 0; i < body->block.stmt_count; i++) {
-            Node *s = body->block.stmts[i];
-            if (s->kind == NODE_VAR_DECL && !s->var_decl.is_static) {
-                Type *vt = checker_get_type(e->checker, s);
-                if (vt) {
-                    emit(e, "    ");
-                    emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
-                    emit(e, ";\n");
+    /* BUG-490: emit ALL collected locals as struct fields.
+     * collect_async_locals is now recursive — finds vars in sub-blocks,
+     * if/while/for/switch bodies. Use the async_locals list (dedup'd)
+     * and resolve types via scope lookup. Skip params (already emitted). */
+    {
+        /* Collect all var-decl nodes recursively for type resolution */
+        struct { Node *node; } var_nodes[256];
+        int var_node_count = 0;
+        /* Recursive scan — same traversal as collect_async_locals */
+        struct { Node *n; } stack[256];
+        int sp = 0;
+        if (body) stack[sp++].n = body;
+        while (sp > 0 && var_node_count < 256) {
+            Node *n = stack[--sp].n;
+            if (!n) continue;
+            if (n->kind == NODE_VAR_DECL && !n->var_decl.is_static) {
+                /* Check if this name is in async_locals (dedup'd, skips params) */
+                bool is_param = false;
+                for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+                    if (node->func_decl.params[pi].name_len == n->var_decl.name_len &&
+                        memcmp(node->func_decl.params[pi].name, n->var_decl.name,
+                               n->var_decl.name_len) == 0) {
+                        is_param = true; break;
+                    }
                 }
+                /* Check if already emitted (dedup for same-name in different blocks) */
+                bool dup = false;
+                for (int vi = 0; vi < var_node_count; vi++) {
+                    if (var_nodes[vi].node->var_decl.name_len == n->var_decl.name_len &&
+                        memcmp(var_nodes[vi].node->var_decl.name, n->var_decl.name,
+                               n->var_decl.name_len) == 0) {
+                        dup = true; break;
+                    }
+                }
+                if (!is_param && !dup)
+                    var_nodes[var_node_count++].node = n;
+            }
+            /* Push children — reverse order so left-to-right processing */
+            if (n->kind == NODE_BLOCK) {
+                for (int i = n->block.stmt_count - 1; i >= 0 && sp < 255; i--)
+                    stack[sp++].n = n->block.stmts[i];
+            }
+            if (n->kind == NODE_IF) {
+                if (sp < 254) { stack[sp++].n = n->if_stmt.else_body; stack[sp++].n = n->if_stmt.then_body; }
+            }
+            if (n->kind == NODE_FOR && sp < 254) { stack[sp++].n = n->for_stmt.body; stack[sp++].n = n->for_stmt.init; }
+            if ((n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE) && sp < 255) stack[sp++].n = n->while_stmt.body;
+            if (n->kind == NODE_SWITCH) {
+                for (int i = n->switch_stmt.arm_count - 1; i >= 0 && sp < 255; i--)
+                    stack[sp++].n = n->switch_stmt.arms[i].body;
+            }
+            if (n->kind == NODE_DEFER && sp < 255) stack[sp++].n = n->defer.body;
+            if (n->kind == NODE_CRITICAL && sp < 255) stack[sp++].n = n->critical.body;
+            if (n->kind == NODE_ONCE && sp < 255) stack[sp++].n = n->once.body;
+        }
+        for (int vi = 0; vi < var_node_count; vi++) {
+            Node *s = var_nodes[vi].node;
+            Type *vt = checker_get_type(e->checker, s);
+            if (vt) {
+                emit(e, "    ");
+                emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
+                emit(e, ";\n");
             }
         }
     }

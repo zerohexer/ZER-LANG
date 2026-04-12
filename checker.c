@@ -1083,6 +1083,17 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
     case TYNODE_ARENA:   return ty_arena;
     case TYNODE_BARRIER: return ty_barrier;
 
+    case TYNODE_SEMAPHORE: {
+        uint32_t count = 0;
+        if (tn->semaphore.count_expr) {
+            check_expr(c, tn->semaphore.count_expr);
+            int64_t val = eval_const_expr(tn->semaphore.count_expr);
+            if (val > 0) count = (uint32_t)val;
+            else checker_error(c, tn->loc.line, "Semaphore count must be a positive compile-time constant");
+        }
+        return type_semaphore(c->arena, count);
+    }
+
     case TYNODE_POINTER: {
         Type *inner = resolve_type(c, tn->pointer.inner);
         /* BUG-372: *void is invalid — use *opaque for type-erased pointers */
@@ -5751,6 +5762,32 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = ty_void;
+        } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0) {
+            /* @sem_acquire(semaphore_var) — decrement, block if zero */
+            if (node->intrinsic.arg_count != 1)
+                checker_error(c, node->loc.line,
+                    "@sem_acquire requires 1 argument");
+            if (node->intrinsic.arg_count >= 1) {
+                Type *st = check_expr(c, node->intrinsic.args[0]);
+                if (st && type_unwrap_distinct(st)->kind != TYPE_SEMAPHORE)
+                    checker_error(c, node->loc.line,
+                        "@sem_acquire argument must be Semaphore type, got '%s'",
+                        type_name(st));
+            }
+            result = ty_void;
+        } else if (nlen == 11 && memcmp(name, "sem_release", 11) == 0) {
+            /* @sem_release(semaphore_var) — increment, wake one waiter */
+            if (node->intrinsic.arg_count != 1)
+                checker_error(c, node->loc.line,
+                    "@sem_release requires 1 argument");
+            if (node->intrinsic.arg_count >= 1) {
+                Type *st = check_expr(c, node->intrinsic.args[0]);
+                if (st && type_unwrap_distinct(st)->kind != TYPE_SEMAPHORE)
+                    checker_error(c, node->loc.line,
+                        "@sem_release argument must be Semaphore type, got '%s'",
+                        type_name(st));
+            }
+            result = ty_void;
         } else {
             checker_error(c, node->loc.line,
                 "unknown intrinsic '@%.*s'", (int)nlen, name);
@@ -5860,7 +5897,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * Pool, Slab, Ring are NOT thread-safe — alloc/free/push/pop have
              * non-atomic metadata access. Must use from single thread or wrap
              * in shared struct. */
-            if (t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER)
+            if (t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
                 return false;
             /* Non-shared global — potential data race */
             *out_name = node->ident.name;

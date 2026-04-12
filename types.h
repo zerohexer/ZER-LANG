@@ -47,6 +47,7 @@ typedef enum {
     TYPE_BARRIER,       /* Barrier — thread sync point, no parameters */
     TYPE_HANDLE,        /* Handle(T) — elem type */
     TYPE_SLAB,          /* Slab(T) — dynamic growable pool, elem type */
+    TYPE_SEMAPHORE,     /* Semaphore(N) — counting semaphore, count */
 
     /* distinct typedef */
     TYPE_DISTINCT,      /* distinct typedef — nominal wrapper around underlying type */
@@ -148,6 +149,9 @@ struct Type {
 
         /* TYPE_SLAB */
         struct { Type *elem; } slab;
+
+        /* TYPE_SEMAPHORE */
+        struct { uint32_t count; } semaphore;
 
         /* TYPE_DISTINCT */
         struct {
@@ -280,6 +284,7 @@ Type *type_pool(Arena *a, Type *elem, uint64_t count);
 Type *type_ring(Arena *a, Type *elem, uint64_t count);
 Type *type_handle(Arena *a, Type *elem);
 Type *type_slab(Arena *a, Type *elem);
+Type *type_semaphore(Arena *a, uint32_t count);
 Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret);
 
 /* queries */

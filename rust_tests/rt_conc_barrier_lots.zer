@@ -1,0 +1,21 @@
+// Translated from: tokio/tests/sync_barrier.rs — lots
+// Rust: Barrier::new(4) — 4 tasks synchronize
+
+Barrier gate;
+
+void sync_worker() {
+    @barrier_wait(gate);
+}
+
+u32 main() {
+    @barrier_init(gate, 4);
+    ThreadHandle t1 = spawn sync_worker();
+    ThreadHandle t2 = spawn sync_worker();
+    ThreadHandle t3 = spawn sync_worker();
+    ThreadHandle t4 = spawn sync_worker();
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    return 0;
+}

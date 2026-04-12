@@ -1,0 +1,19 @@
+// Translated from: tokio/tests/sync_mutex.rs — straight_execution
+// Rust: Mutex<u32> sequential lock/modify/unlock
+// ZER: shared struct sequential access
+
+shared struct Value { u32 n; }
+Value g_val;
+
+void modify(*Value v, u32 new_val) {
+    v.n = new_val;
+}
+
+u32 main() {
+    g_val.n = 100;
+    modify(&g_val, 99);
+    if (g_val.n != 99) { return 1; }
+    modify(&g_val, 98);
+    if (g_val.n != 98) { return 2; }
+    return 0;
+}

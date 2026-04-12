@@ -538,7 +538,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 786 Rust tests + 36 Zig tests + 160 ZER integration + 59 ZER negative (0 failures), red team audit: 22/48 Gemini attacks fixed (5 rounds), `Semaphore(N)` builtin, BUG-462 through BUG-484 (23 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex with CAS lazy init, unified `emit_file_module`, VRP 100% via address_taken at TOK_AMP, deadlock call graph DFS, async state struct temp promotion (Rust MIR-equivalent), move struct orelse fallback tracking, C interop safety model (`cinclude` + `*opaque` + `shared struct`), 484+ bug fixes, 3,800+ tests
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 786 Rust tests + 36 Zig tests + 162 ZER integration + 60 ZER negative (0 failures), red team audit: 25/52 Gemini attacks fixed (6 rounds), `Semaphore(N)` builtin, BUG-462 through BUG-487 (26 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex with CAS lazy init, unified `emit_file_module`, VRP 100% via address_taken at TOK_AMP, deadlock call graph DFS, async state struct temp promotion (Rust MIR-equivalent), `*opaque` comparison `.ptr` extraction, async static local preservation, union move variant overwrite ban, C interop safety model (`cinclude` + `*opaque` + `shared struct`), 487+ bug fixes, 3,800+ tests
 - **v0.4:** table-driven compiler architecture, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -682,8 +682,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 160 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 59 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 162 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 60 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 66 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |

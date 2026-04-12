@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-12 — Gemini Red Team Round 6 (3 real bugs from 4 reports)
+
+### BUG-485: *opaque comparison fails with track_cptrs
+**Symptom:** `if (p1 == p2)` where p1/p2 are `*opaque` → GCC error "invalid operands to binary ==" because `_zer_opaque` is a struct.
+**Root cause:** Emitter NODE_BINARY `==`/`!=` emits raw C operator. With `--track-cptrs`, `*opaque` is `_zer_opaque` struct (not `void*`). C forbids struct comparison.
+**Fix:** In emitter NODE_BINARY, detect TYPE_POINTER(TYPE_OPAQUE) on either operand when `e->track_cptrs`. Emit `p1.ptr == p2.ptr` (compare raw pointer inside struct). Without track_cptrs, `*opaque` = `void*` — no change needed.
+**Test:** `tests/zer/opaque_comparison.zer`
+
+### BUG-486: Async static local promoted to instance struct
+**Symptom:** `static u32 count` inside async function emits as `self->count` — per-instance instead of shared global. Breaks `static` semantics.
+**Root cause:** `collect_async_locals` didn't check `is_static` flag. All NODE_VAR_DECL were promoted to state struct.
+**Fix:** `collect_async_locals` and state struct field emission skip `is_static` vars. Static locals stay as C `static` in poll function (shared across all instances, as intended).
+**Test:** `tests/zer/async_static_local.zer`
+
+### BUG-487: Union variant assignment overwrites move struct resource
+**Symptom:** `m.k.fd = 42; m.id = 100;` compiles — move struct Key overwritten in memory without being freed/consumed. Silent resource leak.
+**Root cause:** Neither checker nor zercheck tracked union "active variant" state. Assigning to a different variant silently overwrites the previous one.
+**Fix:** Checker NODE_ASSIGN: when target is union field and the union contains ANY move struct variant, compile error. Error guides user to switch for safe variant transitions. Same approach as Rust's enum Drop — can't overwrite without handling destructor.
+**Test:** `tests/zer_fail/union_move_overwrite.zer`
+
+### V32 (Round 6): NOT A BUG — `u8[@size(usize)]` compiles correctly
+`@size(usize)` resolves via `sizeof(size_t)` in emitted C. Works on all targets.
+
 ## Session 2026-04-12 — Gemini Red Team Round 5 (3 real bugs from 5 reports)
 
 ### BUG-482: Async struct names not module-mangled

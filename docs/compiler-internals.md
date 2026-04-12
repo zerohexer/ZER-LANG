@@ -1031,6 +1031,24 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 6 (2026-04-12, Gemini — 4 claims, 3 real bugs)
+
+**Summary:** Sixth Gemini audit. 3 real bugs (BUG-485/486/487), 1 false.
+
+### BUG-485: *opaque comparison — .ptr extraction for track_cptrs
+With `--track-cptrs`, `*opaque` is `_zer_opaque` struct (not `void*`). C can't compare structs with `==`/`!=`. Fix: emitter NODE_BINARY detects `TYPE_POINTER(TYPE_OPAQUE)` and emits `.ptr` on both sides. Only fires when `e->track_cptrs` — without it, `*opaque` is plain `void*`.
+
+### BUG-486: Async static locals — skip state struct promotion
+`static u32 count` inside async must stay as C `static` in poll function (shared across instances). `collect_async_locals` and struct field emission now check `!is_static`.
+
+### BUG-487: Union move variant — ban assignment to prevent resource leak
+`m.k.fd = 42; m.id = 100;` silently overwrites move struct resource. Fix: checker NODE_ASSIGN scans union type for move struct variants → compile error. Same as Rust's enum Drop — must use switch for safe variant transitions.
+
+**Pattern from rounds 5-6:** Feature interactions are the primary bug source. `*opaque` + `==` (emitter vs type representation), `async` + `static` (promotion vs persistence), `union` + `move struct` (variant vs ownership). Each feature works alone; bugs appear at intersections.
+
+### Not a bug (V32): `u8[@size(usize)]` compiles correctly
+`@size(usize)` resolves to `sizeof(size_t)` in emitted C. Target-portable.
+
 ## Red Team Audit Fixes — Round 5 (2026-04-12, Gemini — 5 claims, 3 real bugs)
 
 **Summary:** Fifth Gemini audit. 3 real bugs (BUG-482/483/484), 2 false.

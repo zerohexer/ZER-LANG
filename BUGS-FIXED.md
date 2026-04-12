@@ -5,6 +5,26 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-12 — Gemini Red Team Round 2 (3 bugs from 7 reports)
+
+### BUG-474: Transitive deadlock detection limited to depth 4
+**Symptom:** `ga.x = deep1()` where `deep1()→deep2()→deep3()→deep4()→deep5()` accesses `gb.y` — not caught as deadlock.
+**Root cause:** `_shared_scan_depth < 4` limit in `collect_shared_types_in_expr` — depth 5+ calls escape analysis.
+**Fix:** Increased to `< 8`, matching spawn transitive scan depth.
+**Test:** `rust_tests/reject_deadlock_depth5.zer`
+
+### BUG-475: VRP not invalidated when &variable passed to function
+**Symptom:** `idx=2; if (idx>=4) return; modify(&idx); arr[idx]=42;` — bounds check on `arr[idx]` eliminated by VRP despite `modify()` setting idx to 100 through pointer.
+**Root cause:** Value range propagation narrowed `idx` to [0,3] after the guard, but never invalidated the range when `&idx` was passed to `modify()`. Function call could mutate `idx` through the pointer.
+**Fix:** After processing NODE_CALL in `check_expr`, scan args for `NODE_UNARY(TOK_AMP)` patterns, walk to root ident, wipe VRP range to [INT64_MIN, INT64_MAX]. Same invalidation pattern as direct assignment (line ~2596).
+**Test:** `rust_tests/rt_vrp_ptr_alias_safe.zer` (auto-guard inserted, runs safely)
+
+### BUG-476: Move struct from array element not tracked
+**Symptom:** `Token copy = arr[0]; arr[0].kind;` compiled — use-after-move not caught.
+**Root cause:** zercheck NODE_VAR_DECL move transfer handler only matched `NODE_IDENT` sources. `arr[0]` is `NODE_INDEX`, which fell through without marking the transfer.
+**Fix:** Extended move transfer to use `handle_key_from_expr()` for compound keys (array indices, struct fields). Registers `arr[0]` as tracked move struct, marks HS_TRANSFERRED on copy. Also detects move struct type via array element type for NODE_INDEX sources.
+**Test:** `rust_tests/reject_move_array_elem.zer`, `rust_tests/rt_move_array_safe.zer`
+
 ## Session 2026-04-09/10/11 — Move Struct, CFG Zercheck, Barrier Type, Comptime Locals, 690 Tests
 
 ### Comptime local variables — eval_comptime_block handles NODE_VAR_DECL

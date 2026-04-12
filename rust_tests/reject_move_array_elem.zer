@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Move struct from array element must mark element as transferred
+
+move struct Token { u32 kind; }
+
+u32 main() {
+    Token[4] arr;
+    arr[0].kind = 42;
+    Token copy = arr[0];
+    u32 val = arr[0].kind;
+    return 0;
+}

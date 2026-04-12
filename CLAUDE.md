@@ -538,7 +538,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 786 Rust-equivalent tests + 36 Zig tests (0 failures), red team audit: 11/28 Gemini attacks fixed, `Semaphore(N)` builtin (5 already caught, 2 not bugs), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,800+ tests
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 792 Rust-equivalent tests + 36 Zig tests (0 failures), red team audit: 14/35 Gemini attacks fixed (2 rounds), `Semaphore(N)` builtin, BUG-462 through BUG-476 (15 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, VRP pointer alias invalidation, move struct array element tracking, 476+ bug fixes, 3,800+ tests
 - **v0.4:** table-driven compiler architecture, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -678,6 +678,18 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Module tests (`test_modules/`): main, app, diamond, use_types, use_defs, diamond2, collision_test, static_coll, gcoll, transitive, use_hal, opaque_wrap, opaque_wrap_df (negative), opaque_wrap_uaf (negative)
 - Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
 - Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
+
+### Test Locations Summary
+| Directory | What | Count | Runner |
+|---|---|---|---|
+| `tests/zer/` | ZER integration tests (positive + negative) | ~120 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | ~7 | `tests/test_zer.sh` |
+| `test_modules/` | Multi-file module tests | ~14 | `test_modules/run_tests.sh` |
+| `rust_tests/` | Rust-equivalent safety tests | 792 | `rust_tests/run_tests.sh` |
+| `zig_tests/` | Zig-equivalent tests | 36 | `zig_tests/run_tests.sh` |
+| `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
+
+All runners auto-detect positive vs negative tests. `make check` runs everything.
 
 **Bugs Fixed This Session (2026-04-02):**
 - `?Handle(T)` struct field double-wrap: emitter var-decl init wrapped already-optional value in `{value, 1}`. Fix: check `init_type->kind == TYPE_OPTIONAL` before wrapping (same pattern as BUG-032 for NODE_IDENT). `hash_map_chained.zer` now uses `?Handle(Node) next` directly.

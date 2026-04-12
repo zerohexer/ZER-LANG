@@ -1031,7 +1031,28 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
-## Red Team Audit Fixes (2026-04-12, Gemini red team — 8 attempts, 5 real bugs)
+## Red Team Audit Fixes — Round 2 (2026-04-12, Gemini — 7 claims, 3 real bugs)
+
+**Summary:** Second Gemini red team audit. 7 attack vectors tested, 3 real bugs found (BUG-474/475/476), 4 false or already-handled.
+
+### BUG-474: Transitive deadlock depth limit too shallow
+`_shared_scan_depth < 4` → `< 8`. Deep call chains (5+ levels) between shared struct accesses now detected. Matches spawn transitive scan depth.
+
+### BUG-475: VRP not invalidated on &variable passed to function call
+When `&var` is passed as a function argument, `var`'s value range MUST be wiped — the callee may modify it through the pointer. Fix: NODE_CALL handler in `check_expr` scans args for `NODE_UNARY(TOK_AMP)`, walks to root ident, sets range to `[INT64_MIN, INT64_MAX]`. Without this fix, bounds checks were eliminated based on stale ranges.
+
+**Pattern for future VRP additions:** Any code path where a variable's value could change through an alias (pointer arg, struct field mutation) must invalidate the VRP range. Currently handled: direct assignment, compound assignment, function call with `&var` arg.
+
+### BUG-476: Move struct from array element / struct field not tracked
+`Token copy = arr[0]; arr[0].kind` compiled — zercheck only tracked NODE_IDENT sources for move transfer. Extended to use `handle_key_from_expr()` for compound keys. Also detects move struct type through TYPE_ARRAY element type.
+
+### Not Bugs (4 claims)
+- V2 (Slot retirement DoS): Gen counter wraps (`gen++; if (gen==0) gen=1`), no retirement. Slots always reuse. Gemini fabricated "permanently retired" mechanism.
+- V5 (Async defer bypass): Defer fires at function completion (after all yields), not per-yield. Correct by design — Duff's device places defer block at body end.
+- V6 (Zero-handle collision): Gen starts at 1 (`if (gen[i]==0) gen[i]=1`). Auto-zeroed handle gen=0 never matches gen=1. Already fixed.
+- V7 (Comptime budget global): Budget resets per top-level call (`if (depth==1) _comptime_ops=0`). Per-call, not per-compilation.
+
+## Red Team Audit Fixes — Round 1 (2026-04-12, Gemini red team — 8 attempts, 5 real bugs)
 
 **Summary:** External AI (Gemini) performed red team audit on ZER-LANG safety guarantees. 8 attack vectors tested: 5 were real bugs (V1,V3,V4,V5,V6), 3 were already caught by existing checks (V2,V7,V8).
 

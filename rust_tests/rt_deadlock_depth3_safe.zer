@@ -1,0 +1,13 @@
+// Separate statements accessing different shared types — no deadlock
+shared struct Alpha { u32 x; }
+shared struct Beta { u32 y; }
+Alpha ga;
+Beta gb;
+
+u32 main() {
+    ga.x = 10;
+    gb.y = 20;
+    u32 tmp = gb.y;
+    ga.x = tmp;
+    return 0;
+}

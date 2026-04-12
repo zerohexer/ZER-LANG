@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// Deadlock: transitive shared access through 5 function calls
+
+shared struct Alpha { u32 x; }
+shared struct Beta { u32 y; }
+Alpha ga;
+Beta gb;
+
+u32 deep5() { gb.y += 1; return gb.y; }
+u32 deep4() { return deep5(); }
+u32 deep3() { return deep4(); }
+u32 deep2() { return deep3(); }
+u32 deep1() { return deep2(); }
+
+u32 main() {
+    ga.x = deep1();
+    return 0;
+}

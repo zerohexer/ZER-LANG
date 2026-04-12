@@ -1,0 +1,14 @@
+// Move struct from array element — safe use of destination
+move struct Token { u32 kind; }
+
+void consume(Token t) {
+    u32 k = t.kind;
+}
+
+u32 main() {
+    Token[4] arr;
+    arr[0].kind = 42;
+    Token copy = arr[0];
+    consume(copy);
+    return 0;
+}

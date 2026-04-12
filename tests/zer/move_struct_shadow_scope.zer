@@ -1,0 +1,14 @@
+// Move struct shadowing — inner consume doesn't affect outer (BUG-494)
+move struct K { u32 id; }
+void consume(K k) { u32 x = k.id; }
+u32 main() {
+    K x;
+    x.id = 1;
+    {
+        K x;
+        x.id = 2;
+        consume(x);
+    }
+    consume(x);
+    return 0;
+}

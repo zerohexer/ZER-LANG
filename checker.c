@@ -5567,6 +5567,33 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
             }
+            /* BUG-493: reject @atomic_* on packed struct fields.
+             * Packed fields can be misaligned. GCC __atomic builtins
+             * require natural alignment — misaligned = hard fault on ARM/RISC-V. */
+            if (node->intrinsic.arg_count >= 1) {
+                Node *aarg = node->intrinsic.args[0];
+                if (aarg->kind == NODE_UNARY && aarg->unary.op == TOK_AMP &&
+                    aarg->unary.operand->kind == NODE_FIELD) {
+                    /* Walk to root ident to find if struct is packed */
+                    Node *root = aarg->unary.operand;
+                    while (root->kind == NODE_FIELD) root = root->field.object;
+                    while (root->kind == NODE_INDEX) root = root->index_expr.object;
+                    if (root->kind == NODE_IDENT) {
+                        Symbol *sym = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (sym && sym->type) {
+                            Type *st = type_unwrap_distinct(sym->type);
+                            if (st->kind == TYPE_STRUCT && st->struct_type.is_packed) {
+                                checker_error(c, node->loc.line,
+                                    "@%.*s on packed struct field — may be misaligned. "
+                                    "Atomic operations require natural alignment. "
+                                    "Use a non-packed struct or copy to aligned local first",
+                                    (int)nlen, name);
+                            }
+                        }
+                    }
+                }
+            }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
             /* BUG-238: reject @cstr to const destination */
             if (node->intrinsic.arg_count >= 1 &&

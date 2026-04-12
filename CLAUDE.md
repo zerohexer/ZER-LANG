@@ -35,6 +35,7 @@ Ring(u8, 256) rx_buf;    circular buffer — ALWAYS global
 Arena scratch;            bump allocator — (over, alloc, alloc_slice, reset)
 Barrier b;               thread sync point — (@barrier_init, @barrier_wait)
 Handle(Task) h;          u64: index(32) + generation(32), not a pointer
+Semaphore(3) slots;      counting semaphore — @sem_acquire/@sem_release, thread-safe
 ```
 
 ### User-Defined Containers (Monomorphization)
@@ -491,6 +492,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Compound literals in call args | Done | Done (struct_init validated in NODE_CALL) |
 | Comptime enum values | Done | N/A (compile-time — resolve_enum_field in eval_const_expr_scoped) |
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
+| `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 
@@ -536,7 +538,7 @@ diff zerc zerc2                  ← identical = v1.0 proven
 - **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
 - **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
 - **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 726 Rust-equivalent tests + 36 Zig tests (0 failures), red team audit: 9/16 Gemini attacks fixed (5 already caught, 2 not bugs), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,800+ tests
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 734 Rust-equivalent tests + 36 Zig tests (0 failures), red team audit: 11/28 Gemini attacks fixed, `Semaphore(N)` builtin (5 already caught, 2 not bugs), BUG-462 through BUG-473 (12 bugs fixed), systematic refactoring (16 unified helpers), CFG-aware zercheck, recursive mutex, unified `emit_file_module`, 474+ bug fixes, 3,800+ tests
 - **v0.4:** table-driven compiler architecture, better error messages
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
 
@@ -751,6 +753,8 @@ ZER SYNTAX RULES (not C — these differ):
 - @cond_timedwait(shared_var, condition, timeout_ms) returns ?void
 - @once { body } = execute exactly once (thread-safe)
 - @barrier_init(var, N) + @barrier_wait(var) = thread sync barrier
+- Semaphore(N) var; = counting semaphore, @sem_acquire(var)/@sem_release(var)
+- Both Barrier and Semaphore accept *Barrier/*Semaphore pointer params
 - threadlocal u32 var = per-thread storage (__thread)
 - async void func() { yield; await cond; } = stackless coroutine
 - _zer_async_NAME type, _zer_async_NAME_init(&task), _zer_async_NAME_poll(&task)

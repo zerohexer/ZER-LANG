@@ -2245,6 +2245,22 @@ Barrier bar;                // keyword type (like Arena, Pool)
 - `Barrier` is a builtin type — checker validates `@barrier_init`/`@barrier_wait` args are `Barrier` type.
 - Using wrong type (e.g., `u32`) → compile error.
 
+### Semaphore — Counting Semaphore
+```zer
+Semaphore(3) dma_channels;    // 3 resources available
+@sem_acquire(dma_channels);   // blocks until count > 0, decrements
+@sem_release(dma_channels);   // increments, wakes one waiter
+
+// Pointer param support:
+void use_resource(*Semaphore s) {
+    @sem_acquire(s);
+    @sem_release(s);
+}
+```
+- `Semaphore(0)` valid — producer-consumer pattern (start empty, producer releases).
+- Thread-safe: has own mutex + condvar internally.
+- Type-checked: `@sem_acquire` only accepts `Semaphore` or `*Semaphore`.
+
 ### Atomics
 ```zer
 @atomic_store(&flag, 1);

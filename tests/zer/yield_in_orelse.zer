@@ -1,5 +1,3 @@
-// EXPECTED: compile error
-// BUG-481: yield inside orelse block — stack ghost corruption
 
 ?u32 maybe_get() { return null; }
 

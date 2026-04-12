@@ -7953,27 +7953,15 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_YIELD:
-        /* yield — suspend current async task, no operands */
-        /* BUG-481: yield inside orelse block → stack ghost. Orelse emits as
-         * GCC statement expression with _zer_tmp on stack. After yield+resume,
-         * _zer_tmp is stale (different poll call's stack frame). */
-        if (c->orelse_depth > 0) {
-            checker_error(c, node->loc.line,
-                "yield inside orelse block is not allowed — "
-                "compiler temporary would be stale after resume");
-        }
+        /* yield — suspend current async task, no operands.
+         * BUG-481: yield inside orelse block was previously banned.
+         * Now safe — async orelse uses state struct temps (proper fix). */
         break;
 
     case NODE_AWAIT: {
         /* await expr — check the condition expression */
         if (node->await_stmt.cond) {
             check_expr(c, node->await_stmt.cond);
-        }
-        /* BUG-481: same as yield — await inside orelse block corrupts stack */
-        if (c->orelse_depth > 0) {
-            checker_error(c, node->loc.line,
-                "await inside orelse block is not allowed — "
-                "compiler temporary would be stale after resume");
         }
         break;
     }

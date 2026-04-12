@@ -69,6 +69,16 @@ typedef struct {
     int async_local_count;
     int async_local_capacity;
 
+    /* async orelse/capture temps promoted to state struct (BUG-481 proper fix).
+     * Pre-scanned from async body — compiler temps that might straddle yield. */
+    struct AsyncTemp {
+        Type *type;             /* the optional type (e.g., _zer_opt_u32) */
+        int temp_id;            /* maps to _zer_async_tmp<id> in state struct */
+    } *async_temps;
+    int async_temp_count;
+    int async_temp_capacity;
+    int async_temp_next_id;
+
     /* condvar types — shared structs that use @cond_wait/@cond_signal.
      * These need pthread_mutex_t instead of spinlock. Tracked by type_id. */
     uint32_t *condvar_type_ids;

@@ -1,0 +1,21 @@
+// Embedded pattern: DMA channel semaphore
+// 4 DMA channels available, threads acquire before transfer
+
+Semaphore(4) dma_channels;
+
+void dma_transfer(u32 channel) {
+    @sem_acquire(dma_channels);
+    @sem_release(dma_channels);
+}
+
+u32 main() {
+    ThreadHandle t1 = spawn dma_transfer(0);
+    ThreadHandle t2 = spawn dma_transfer(1);
+    ThreadHandle t3 = spawn dma_transfer(2);
+    ThreadHandle t4 = spawn dma_transfer(3);
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    return 0;
+}

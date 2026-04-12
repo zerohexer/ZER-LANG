@@ -1088,8 +1088,8 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (tn->semaphore.count_expr) {
             check_expr(c, tn->semaphore.count_expr);
             int64_t val = eval_const_expr(tn->semaphore.count_expr);
-            if (val > 0) count = (uint32_t)val;
-            else checker_error(c, tn->loc.line, "Semaphore count must be a positive compile-time constant");
+            if (val >= 0) count = (uint32_t)val;
+            else checker_error(c, tn->loc.line, "Semaphore count must be a non-negative compile-time constant");
         }
         return type_semaphore(c->arena, count);
     }

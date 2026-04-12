@@ -1,0 +1,25 @@
+// Translated from: tokio pattern — producer/consumer with semaphore
+// Semaphore(0) starts empty, producer releases, consumer acquires
+
+Semaphore(0) items_ready;
+shared struct Data { u32 value; }
+Data g_data;
+
+void producer() {
+    g_data.value = 42;
+    @sem_release(items_ready);
+}
+
+void consumer() {
+    @sem_acquire(items_ready);
+}
+
+u32 main() {
+    g_data.value = 0;
+    ThreadHandle tp = spawn producer();
+    ThreadHandle tc = spawn consumer();
+    tp.join();
+    tc.join();
+    if (g_data.value != 42) { return 1; }
+    return 0;
+}

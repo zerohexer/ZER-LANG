@@ -1,0 +1,19 @@
+// Semaphore concurrent init — CAS ensures only one thread inits (BUG-483)
+Semaphore(2) slots;
+
+void worker() {
+    @sem_acquire(slots);
+    @sem_release(slots);
+}
+
+u32 main() {
+    ThreadHandle t1 = spawn worker();
+    ThreadHandle t2 = spawn worker();
+    ThreadHandle t3 = spawn worker();
+    ThreadHandle t4 = spawn worker();
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    return 0;
+}

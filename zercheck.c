@@ -1614,10 +1614,15 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             zc_check_expr(zc, ps, node->var_decl.init);
         /* Move struct transfer AFTER expr check to avoid false positive:
          * Token b = a; — zc_check_expr sees a as ALIVE, then we transfer.
-         * Also handles: Token b = arr[0]; and Token b = s.field; (compound keys) */
+         * Also handles: Token b = arr[0]; and Token b = s.field; (compound keys)
+         * BUG-484: orelse fallback — Token b = opt orelse a; must transfer a. */
         if (node->var_decl.init) {
             Node *move_src = node->var_decl.init;
-            if (move_src->kind == NODE_ORELSE) move_src = move_src->orelse.expr;
+            Node *move_fallback = NULL; /* orelse fallback — also needs transfer */
+            if (move_src->kind == NODE_ORELSE) {
+                move_fallback = move_src->orelse.fallback;
+                move_src = move_src->orelse.expr;
+            }
             /* Check move struct type on the source expression */
             Type *src_type = move_src ? checker_get_type(zc->checker, move_src) : NULL;
             if (!src_type && move_src) {
@@ -1666,6 +1671,49 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                             dst->pool_id = -3;
                             dst->alloc_line = src->alloc_line;
                             dst->alloc_id = src->alloc_id;
+                        }
+                    }
+                }
+            }
+            /* BUG-484: orelse fallback — Token b = opt orelse a; transfers a.
+             * The fallback is used when opt is null. Must mark as transferred
+             * so subsequent use of a is caught as use-after-move. */
+            if (move_fallback && !node->var_decl.init->orelse.fallback_is_return &&
+                !node->var_decl.init->orelse.fallback_is_break &&
+                !node->var_decl.init->orelse.fallback_is_continue) {
+                Node *fb = move_fallback;
+                /* unwrap block: orelse { expr } — last expr is the value */
+                if (fb->kind == NODE_BLOCK && fb->block.stmt_count > 0) {
+                    Node *last = fb->block.stmts[fb->block.stmt_count - 1];
+                    if (last->kind == NODE_EXPR_STMT) fb = last->expr_stmt.expr;
+                }
+                Type *fb_type = fb ? checker_get_type(zc->checker, fb) : NULL;
+                bool fb_is_move = fb_type && is_move_struct_type(fb_type);
+                if (!fb_is_move && fb && fb->kind == NODE_INDEX) {
+                    Type *obj_type = checker_get_type(zc->checker, fb->index_expr.object);
+                    if (obj_type) {
+                        Type *eff = type_unwrap_distinct(obj_type);
+                        if (eff && eff->kind == TYPE_ARRAY && is_move_struct_type(eff->array.inner))
+                            fb_is_move = true;
+                    }
+                }
+                if (fb_is_move) {
+                    char fb_key[128];
+                    int fbklen = handle_key_from_expr(fb, fb_key, sizeof(fb_key));
+                    if (fbklen > 0) {
+                        HandleInfo *fbh = find_handle(ps, fb_key, (uint32_t)fbklen);
+                        if (!fbh) {
+                            fbh = add_handle(ps, fb_key, (uint32_t)fbklen);
+                            if (fbh) {
+                                fbh->state = HS_ALIVE;
+                                fbh->pool_id = -3;
+                                fbh->alloc_line = node->loc.line;
+                                fbh->alloc_id = zc->next_alloc_id++;
+                            }
+                        }
+                        if (fbh && fbh->state == HS_ALIVE) {
+                            fbh->state = HS_TRANSFERRED;
+                            fbh->transfer_line = node->loc.line;
                         }
                     }
                 }

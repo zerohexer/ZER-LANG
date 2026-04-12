@@ -1,0 +1,12 @@
+// Move via orelse — safe: only use destination, not source
+move struct Token { u32 id; }
+void consume(Token t) { u32 x = t.id; }
+
+u32 main() {
+    ?Token opt = null;
+    Token a;
+    a.id = 42;
+    Token b = opt orelse a;
+    consume(b);
+    return 0;
+}

@@ -1,6 +1,7 @@
 # ZER Safety Test Suite
 
-796 tests (556 positive, 240 negative), 0 failures. Updated 2026-04-12.
+786 tests (549 positive, 237 negative), 0 failures. Updated 2026-04-12.
+Note: ZER-specific safety tests (deadlock DFS, VRP alias, move array/switch, async param) moved to `tests/zer/` and `tests/zer_fail/`.
 Runner: `run_tests.sh` — auto-detects negative tests via `reject` in name or `EXPECTED: compile error` in file.
 
 ## How to Use This File

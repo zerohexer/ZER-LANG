@@ -691,6 +691,26 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.
 
+### Test Organization Rules — Where to Put New Tests
+
+**By origin — which folder:**
+| Test Origin | Positive → | Negative → |
+|---|---|---|
+| Bug fix / red team audit / ZER-specific safety | `tests/zer/` | `tests/zer_fail/` |
+| Multi-module / import / cross-file | `test_modules/` | `test_modules/` (with `_negative` suffix) |
+| Translated from Rust `tests/ui/` | `rust_tests/rt_*.zer` | `rust_tests/reject_*.zer` |
+| Translated from Zig test suite | `zig_tests/zt_*.zer` | `zig_tests/zt_reject_*.zer` |
+| C unit test (parser/checker/emitter) | `test_*.c` | `test_*.c` (err() helper) |
+
+**The rule:** If a test is translated from Rust/Zig source, it goes in `rust_tests/` or `zig_tests/`. If it's a ZER-original test (bug fix, red team finding, feature test), it goes in `tests/zer/` or `tests/zer_fail/`. Don't put ZER-specific tests in `rust_tests/` — that directory is for Rust-equivalent translations only.
+
+**Naming:**
+- `tests/zer/feature_name.zer` — positive (compile + run + exit 0)
+- `tests/zer_fail/feature_name.zer` — negative (must fail to compile, add `// EXPECTED: compile error` as first line)
+- `rust_tests/rt_category_desc.zer` — positive Rust translation
+- `rust_tests/reject_category_desc.zer` — negative Rust translation
+- `test_modules/name.zer` — multi-file module test
+
 **Bugs Fixed This Session (2026-04-02):**
 - `?Handle(T)` struct field double-wrap: emitter var-decl init wrapped already-optional value in `{value, 1}`. Fix: check `init_type->kind == TYPE_OPTIONAL` before wrapping (same pattern as BUG-032 for NODE_IDENT). `hash_map_chained.zer` now uses `?Handle(Node) next` directly.
 - Cross-function range propagation: `find_return_range()` scans function bodies for return expressions with `% N` or `& MASK`. Stores `return_range_min/max` on Symbol. Call sites propagate range to variables. `slot = hash(key)` where `hash()` returns `h % TABLE_SIZE` → slot proven `[0, TABLE_SIZE-1]`.

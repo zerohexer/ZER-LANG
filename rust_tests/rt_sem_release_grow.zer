@@ -1,0 +1,8 @@
+// Release grows count beyond initial
+Semaphore(1) s;
+u32 main() {
+    @sem_release(s); @sem_release(s);
+    @sem_acquire(s); @sem_acquire(s); @sem_acquire(s);
+    @sem_release(s);
+    return 0;
+}

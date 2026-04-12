@@ -1,0 +1,7 @@
+// Large initial count
+Semaphore(100) big;
+u32 main() {
+    for (u32 i = 0; i < 50; i += 1) { @sem_acquire(big); }
+    for (u32 i = 0; i < 50; i += 1) { @sem_release(big); }
+    return 0;
+}

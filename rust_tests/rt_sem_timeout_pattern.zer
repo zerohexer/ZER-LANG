@@ -1,0 +1,5 @@
+// Timeout pattern: acquire with volatile flag
+Semaphore(1) resource;
+volatile u32 g_acquired;
+void try_worker() { @sem_acquire(resource); g_acquired = 1; @sem_release(resource); }
+u32 main() { g_acquired = 0; ThreadHandle t = spawn try_worker(); t.join(); if (g_acquired != 1) { return 1; } return 0; }

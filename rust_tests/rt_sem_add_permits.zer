@@ -1,0 +1,11 @@
+// tokio: add_permits — release without prior acquire
+Semaphore(0) items;
+void producer() { @sem_release(items); @sem_release(items); @sem_release(items); }
+void consumer() { @sem_acquire(items); @sem_acquire(items); @sem_acquire(items); }
+u32 main() {
+    ThreadHandle tp = spawn producer();
+    ThreadHandle tc = spawn consumer();
+    tp.join();
+    tc.join();
+    return 0;
+}

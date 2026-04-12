@@ -1,0 +1,12 @@
+// Different semaphore sizes in same program
+Semaphore(1) binary;
+Semaphore(4) quad;
+Semaphore(0) notify;
+void sig_worker() { @sem_acquire(binary); @sem_release(notify); @sem_release(binary); }
+u32 main() {
+    @sem_acquire(quad); @sem_acquire(quad); @sem_release(quad); @sem_release(quad);
+    ThreadHandle t = spawn sig_worker();
+    @sem_acquire(notify);
+    t.join();
+    return 0;
+}

@@ -1,0 +1,9 @@
+// Same thread acquires all permits
+Semaphore(5) multi;
+u32 main() {
+    @sem_acquire(multi); @sem_acquire(multi); @sem_acquire(multi);
+    @sem_acquire(multi); @sem_acquire(multi);
+    @sem_release(multi); @sem_release(multi); @sem_release(multi);
+    @sem_release(multi); @sem_release(multi);
+    return 0;
+}

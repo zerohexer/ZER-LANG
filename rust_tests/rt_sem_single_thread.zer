@@ -1,0 +1,9 @@
+// tokio: try_acquire — sequential acquire/release
+Semaphore(1) lock;
+u32 main() {
+    @sem_acquire(lock);
+    @sem_release(lock);
+    @sem_acquire(lock);
+    @sem_release(lock);
+    return 0;
+}

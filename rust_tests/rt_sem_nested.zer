@@ -1,0 +1,5 @@
+// Nested acquire from different semaphores
+Semaphore(1) outer;
+Semaphore(1) inner;
+void nested_worker() { @sem_acquire(outer); @sem_acquire(inner); @sem_release(inner); @sem_release(outer); }
+u32 main() { ThreadHandle t = spawn nested_worker(); t.join(); return 0; }

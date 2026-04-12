@@ -1,0 +1,3 @@
+// tokio: no_permits — Semaphore(0) valid
+Semaphore(0) empty;
+u32 main() { return 0; }

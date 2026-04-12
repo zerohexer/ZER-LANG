@@ -1,0 +1,15 @@
+// Sequential thread creation with semaphore sync
+Semaphore(0) step;
+shared struct Seq { u32 val; }
+Seq g_seq;
+void step1() { g_seq.val = 10; @sem_release(step); }
+void step2() { @sem_acquire(step); g_seq.val += 20; @sem_release(step); }
+void step3() { @sem_acquire(step); g_seq.val += 30; }
+u32 main() {
+    g_seq.val = 0;
+    ThreadHandle t1 = spawn step1(); t1.join();
+    ThreadHandle t2 = spawn step2(); t2.join();
+    ThreadHandle t3 = spawn step3(); t3.join();
+    if (g_seq.val != 60) { return 1; }
+    return 0;
+}

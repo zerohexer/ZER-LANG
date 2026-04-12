@@ -1,0 +1,15 @@
+// FIFO wake: two waiters get permits in order
+Semaphore(0) gate;
+shared struct Order { u32 n; }
+Order g_order;
+void waiter_x() { @sem_acquire(gate); g_order.n += 1; }
+void waiter_y() { @sem_acquire(gate); g_order.n += 1; }
+u32 main() {
+    g_order.n = 0;
+    ThreadHandle ta = spawn waiter_x();
+    ThreadHandle tb = spawn waiter_y();
+    @sem_release(gate); @sem_release(gate);
+    ta.join(); tb.join();
+    if (g_order.n != 2) { return 1; }
+    return 0;
+}

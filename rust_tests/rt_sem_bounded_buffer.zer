@@ -1,0 +1,15 @@
+// Bounded buffer: producer waits for empty, consumer waits for full
+Semaphore(4) empty_slots;
+Semaphore(0) full_slots;
+shared struct Buf { u32 count; }
+Buf g_buf;
+void producer_bb() { for (u32 i = 0; i < 4; i += 1) { @sem_acquire(empty_slots); g_buf.count += 1; @sem_release(full_slots); } }
+void consumer_bb() { for (u32 i = 0; i < 4; i += 1) { @sem_acquire(full_slots); g_buf.count -= 1; @sem_release(empty_slots); } }
+u32 main() {
+    g_buf.count = 0;
+    ThreadHandle tp = spawn producer_bb();
+    ThreadHandle tc = spawn consumer_bb();
+    tp.join(); tc.join();
+    if (g_buf.count != 0) { return 1; }
+    return 0;
+}

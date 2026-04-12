@@ -896,6 +896,8 @@ Before implementing ANY change, verify:
 6. **100% coverage, not 99%.** Don't say "works for the common case." If an edge case exists, either handle it or reject it at compile time with a clear error. Never silently produce wrong behavior.
 7. **NEVER use fixed-size buffers for dynamic data.** No `int arr[64]`, `char buf[128]`, `Node *items[256]` for arrays that could grow. Use stack-first dynamic pattern: `int stack[64]; int *arr = stack; int cap = 64;` with `realloc` overflow. Fixed buffers silently drop data beyond the limit (BUG-492: `covered_ids[64]` silently ignored allocations 65+). Same pattern as parser RF9 (stack-first `[32]` with arena overflow). GCC and all production compilers use dynamic allocation — ZER must too.
 
+8. **Scope-sensitive changes at DECLARATION sites, not USE sites.** When tracking variables across scopes (zercheck handles, VRP ranges, escape flags), modifications that depend on "which scope is this variable from?" must happen at NODE_VAR_DECL (declaration), never at NODE_IDENT/NODE_CALL (use). Uses read from any scope (find_handle), declarations write to current scope (find_handle_local). Trying to add scope logic at use sites breaks cross-scope access — loops and if bodies accessing outer variables get incorrectly treated as shadows. Proven by BUG-488 (3 failed patches at use sites before proper declaration-site fix) and BUG-494 (same pattern, same lesson).
+
 ### Before Committing
 
 Ask: "If I read this code in 6 months, would I know WHY it's structured this way? Would I accidentally break it by changing one of the N sites?"

@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Move struct passed by pointer then used — conservative transfer
+
+move struct Key { u32 val; }
+
+void process(*Key k) {
+    k.val = 99;
+}
+
+i32 main() {
+    Key k;
+    k.val = 1;
+    process(&k);
+    u32 leak = k.val;
+    return 0;
+}

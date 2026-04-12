@@ -1,0 +1,24 @@
+// Semaphore passed by pointer to function
+
+Semaphore(2) slots;
+
+void acquire_slot(*Semaphore s) {
+    @sem_acquire(s);
+}
+
+void release_slot(*Semaphore s) {
+    @sem_release(s);
+}
+
+void worker(*Semaphore s) {
+    acquire_slot(s);
+    release_slot(s);
+}
+
+u32 main() {
+    ThreadHandle t1 = spawn worker(&slots);
+    ThreadHandle t2 = spawn worker(&slots);
+    t1.join();
+    t2.join();
+    return 0;
+}

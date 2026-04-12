@@ -1,0 +1,23 @@
+// Binary semaphore (mutex equivalent) — Semaphore(1)
+
+Semaphore(1) lock;
+shared struct Data { u32 val; }
+Data g_data;
+
+void critical_work() {
+    @sem_acquire(lock);
+    g_data.val += 1;
+    @sem_release(lock);
+}
+
+u32 main() {
+    g_data.val = 0;
+    ThreadHandle t1 = spawn critical_work();
+    ThreadHandle t2 = spawn critical_work();
+    ThreadHandle t3 = spawn critical_work();
+    t1.join();
+    t2.join();
+    t3.join();
+    if (g_data.val != 3) { return 1; }
+    return 0;
+}

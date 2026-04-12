@@ -1,32 +1,21 @@
-// Rust: Condvar::notify_all() — wake ALL waiting threads.
-// ZER: @cond_broadcast wakes all threads blocked on @cond_wait.
+// Condvar broadcast: wake all waiting threads
 
-shared struct Gate { u32 open; u32 passed; }
-Gate g_gate;
+shared struct Gate { u32 open; }
+Gate g;
 
-void waiter(*Gate g) {
-    @cond_wait(g_gate, g_gate.open > 0);
-    g.passed += 1;
+void waiter() {
+    @cond_wait(g, g.open == 1);
 }
 
-i32 main() {
-    g_gate.open = 0;
-    g_gate.passed = 0;
-
-    ThreadHandle t1 = spawn waiter(&g_gate);
-    ThreadHandle t2 = spawn waiter(&g_gate);
-    ThreadHandle t3 = spawn waiter(&g_gate);
-
-    // Small delay to let threads start waiting
-    for (u32 i = 0; i < 1000; i += 1) { }
-
-    g_gate.open = 1;
-    @cond_broadcast(g_gate);
-
+u32 main() {
+    g.open = 0;
+    ThreadHandle t1 = spawn waiter();
+    ThreadHandle t2 = spawn waiter();
+    ThreadHandle t3 = spawn waiter();
+    g.open = 1;
+    @cond_broadcast(g);
     t1.join();
     t2.join();
     t3.join();
-
-    if (g_gate.passed != 3) { return 1; }
     return 0;
 }

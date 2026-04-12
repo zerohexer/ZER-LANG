@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Return pointer to local — dangles after function returns
+
+*u32 bad() {
+    u32 x = 42;
+    return &x;
+}
+
+i32 main() {
+    *u32 p = bad();
+    return 0;
+}

@@ -303,6 +303,14 @@ bool type_equals(Type *a, Type *b) {
     case TYPE_SLAB:
         return type_equals(a->slab.elem, b->slab.elem);
 
+    /* semaphore: all semaphores are structurally identical (count is init-time) */
+    case TYPE_SEMAPHORE:
+        return true;
+
+    /* barrier: all barriers are structurally identical */
+    case TYPE_BARRIER:
+        return true;
+
     /* distinct: nominal — pointer identity (same definition = same type) */
     case TYPE_DISTINCT:
         return a == b;

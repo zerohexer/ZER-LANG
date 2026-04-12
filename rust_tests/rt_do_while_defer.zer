@@ -1,0 +1,12 @@
+// do-while with defer inside loop
+u32 g_defer_count = 0;
+void inc_count() { g_defer_count += 1; }
+u32 main() {
+    u32 i = 0;
+    do {
+        defer inc_count();
+        i += 1;
+    } while (i < 3);
+    if (g_defer_count != 3) { return 1; }
+    return 0;
+}

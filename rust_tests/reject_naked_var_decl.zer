@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// Naked function with variable declaration
+naked void handler() {
+    u32 x = 42;
+    asm("nop");
+}
+i32 main() { return 0; }

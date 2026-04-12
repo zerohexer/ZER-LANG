@@ -1,0 +1,8 @@
+// Shared struct access in async with yield in same statement
+shared struct Locked { u32 val; }
+Locked g_locked;
+async void bad_async() {
+    g_locked.val = 1;
+    yield;
+}
+u32 main() { return 0; }

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Comptime nested loops exceeding 1M budget
+comptime u32 heavy() {
+    u32 x = 0;
+    for (u32 i = 0; i < 1000; i += 1) {
+        for (u32 j = 0; j < 1001; j += 1) {
+            x += 1;
+        }
+    }
+    return x;
+}
+i32 main() { u32 v = heavy(); return 0; }

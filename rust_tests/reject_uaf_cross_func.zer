@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// UAF: function frees handle, caller uses after
+Pool(u32, 8) pool;
+void destroy(Handle(u32) h) { pool.free(h); }
+i32 main() {
+    ?Handle(u32) mh = pool.alloc();
+    Handle(u32) h = mh orelse return;
+    destroy(h);
+    pool.get(h);
+    return 0;
+}

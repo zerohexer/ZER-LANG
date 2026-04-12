@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// UAF: free inside loop, use on next iteration
+Pool(u32, 8) pool;
+i32 main() {
+    ?Handle(u32) mh = pool.alloc();
+    Handle(u32) h = mh orelse return;
+    for (u32 i = 0; i < 2; i += 1) {
+        pool.get(h);
+        pool.free(h);
+    }
+    return 0;
+}

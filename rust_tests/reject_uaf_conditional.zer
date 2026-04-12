@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// UAF: handle freed in one branch, used after if
+Pool(u32, 8) pool;
+i32 main() {
+    ?Handle(u32) mh = pool.alloc();
+    Handle(u32) h = mh orelse return;
+    bool cond = true;
+    if (cond) { pool.free(h); }
+    pool.get(h);
+    return 0;
+}

@@ -1,0 +1,19 @@
+// Async with yield inside loop
+u32 g_count = 0;
+async void loop_yielder() {
+    for (u32 i = 0; i < 3; i += 1) {
+        g_count += 1;
+        yield;
+    }
+}
+u32 main() {
+    g_count = 0;
+    _zer_async_loop_yielder t;
+    _zer_async_loop_yielder_init(&t);
+    _zer_async_loop_yielder_poll(&t);
+    _zer_async_loop_yielder_poll(&t);
+    _zer_async_loop_yielder_poll(&t);
+    _zer_async_loop_yielder_poll(&t);
+    if (g_count != 3) { return 1; }
+    return 0;
+}

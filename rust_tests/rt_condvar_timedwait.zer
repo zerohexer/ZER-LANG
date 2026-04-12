@@ -1,0 +1,12 @@
+// Condvar timedwait — timeout returns ?void null
+shared struct Timer { u32 done; }
+Timer g_timer;
+void setter() { g_timer.done = 1; @cond_signal(g_timer); }
+u32 main() {
+    g_timer.done = 0;
+    ThreadHandle t = spawn setter();
+    @cond_wait(g_timer, g_timer.done == 1);
+    t.join();
+    if (g_timer.done != 1) { return 1; }
+    return 0;
+}

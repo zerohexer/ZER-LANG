@@ -1,0 +1,20 @@
+// Async with multiple yield points
+u32 g_step = 0;
+async void stepper() {
+    g_step = 1;
+    yield;
+    g_step = 2;
+    yield;
+    g_step = 3;
+}
+u32 main() {
+    _zer_async_stepper t;
+    _zer_async_stepper_init(&t);
+    _zer_async_stepper_poll(&t);
+    if (g_step != 1) { return 1; }
+    _zer_async_stepper_poll(&t);
+    if (g_step != 2) { return 2; }
+    _zer_async_stepper_poll(&t);
+    if (g_step != 3) { return 3; }
+    return 0;
+}

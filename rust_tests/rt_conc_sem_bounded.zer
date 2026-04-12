@@ -1,0 +1,29 @@
+// Translated from: tokio/tests/sync_semaphore.rs — bounded resource access
+// Rust: Semaphore limits concurrent access to N resources
+
+Semaphore(2) resource_slots;
+shared struct Counter { u32 active; u32 max_active; }
+Counter g_counter;
+
+void worker() {
+    @sem_acquire(resource_slots);
+    g_counter.active += 1;
+    if (g_counter.active > g_counter.max_active) {
+        g_counter.max_active = g_counter.active;
+    }
+    g_counter.active -= 1;
+    @sem_release(resource_slots);
+}
+
+u32 main() {
+    g_counter.active = 0;
+    g_counter.max_active = 0;
+    ThreadHandle t1 = spawn worker();
+    ThreadHandle t2 = spawn worker();
+    ThreadHandle t3 = spawn worker();
+    t1.join();
+    t2.join();
+    t3.join();
+    if (g_counter.max_active > 2) { return 1; }
+    return 0;
+}

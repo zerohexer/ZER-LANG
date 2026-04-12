@@ -1,0 +1,17 @@
+// Translated from: tokio/tests/sync_semaphore.rs — try_acquire + basic counting
+// Rust: Semaphore::new(3), acquire reduces count, release restores
+
+Semaphore(3) sem;
+
+void acquire_two() {
+    @sem_acquire(sem);
+    @sem_acquire(sem);
+    @sem_release(sem);
+    @sem_release(sem);
+}
+
+u32 main() {
+    ThreadHandle t = spawn acquire_two();
+    t.join();
+    return 0;
+}

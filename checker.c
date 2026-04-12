@@ -1800,7 +1800,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 }
                 if (stmt->var_decl.init) {
                     int64_t val = eval_const_expr_subst(stmt->var_decl.init, ctx->locals, ctx->count);
-                    if (val == CONST_EVAL_FAIL) { depth--; return CONST_EVAL_FAIL; }
+                    if (val == CONST_EVAL_FAIL) { goto ct_done; }
                     ct_ctx_set(ctx, stmt->var_decl.name, (uint32_t)stmt->var_decl.name_len, val);
                 }
                 continue;
@@ -1810,7 +1810,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             if (stmt->kind == NODE_EXPR_STMT && stmt->expr_stmt.expr &&
                 stmt->expr_stmt.expr->kind == NODE_ASSIGN) {
                 if (ct_eval_assign(ctx, stmt->expr_stmt.expr) == CONST_EVAL_FAIL)
-                    { depth--; return CONST_EVAL_FAIL; }
+                    { goto ct_done; }
                 continue;
             }
 
@@ -1819,12 +1819,12 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 if (stmt->for_stmt.init && stmt->for_stmt.init->kind == NODE_VAR_DECL &&
                     stmt->for_stmt.init->var_decl.init) {
                     int64_t val = eval_const_expr_subst(stmt->for_stmt.init->var_decl.init, ctx->locals, ctx->count);
-                    if (val == CONST_EVAL_FAIL) { depth--; return CONST_EVAL_FAIL; }
+                    if (val == CONST_EVAL_FAIL) { goto ct_done; }
                     ct_ctx_set(ctx, stmt->for_stmt.init->var_decl.name,
                         (uint32_t)stmt->for_stmt.init->var_decl.name_len, val);
                 }
                 for (int iter = 0; iter < 10000; iter++) {
-                    if (++_comptime_ops > 1000000) { depth--; return CONST_EVAL_FAIL; }
+                    if (++_comptime_ops > 1000000) { goto ct_done; }
                     if (stmt->for_stmt.cond) {
                         int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, ctx->locals, ctx->count);
                         if (cond == CONST_EVAL_FAIL || !cond) break;
@@ -1835,7 +1835,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                     /* step */
                     if (stmt->for_stmt.step && stmt->for_stmt.step->kind == NODE_ASSIGN) {
                         if (ct_eval_assign(ctx, stmt->for_stmt.step) == CONST_EVAL_FAIL)
-                            { depth--; return CONST_EVAL_FAIL; }
+                            { goto ct_done; }
                     }
                 }
                 continue;
@@ -1844,7 +1844,7 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             /* While loop */
             if (stmt->kind == NODE_WHILE || stmt->kind == NODE_DO_WHILE) {
                 for (int iter = 0; iter < 10000; iter++) {
-                    if (++_comptime_ops > 1000000) { depth--; return CONST_EVAL_FAIL; }
+                    if (++_comptime_ops > 1000000) { goto ct_done; }
                     /* do-while: execute body before checking condition on first iteration */
                     if (stmt->kind == NODE_DO_WHILE && iter == 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
@@ -2371,6 +2371,58 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "cannot assign to variant of union containing move struct — "
                                 "previous variant's resource may be leaked. "
                                 "Use switch to safely read+destroy before changing variant");
+                        }
+                    }
+                }
+            }
+        }
+
+        /* BUG-496: Arena value escape to global — Arena.over(local_buf) stores
+         * a pointer to stack memory in the Arena struct. Storing that Arena
+         * VALUE in a global means the buf pointer dangles after function returns.
+         * Only reject when the Arena VALUE comes from a LOCAL variable
+         * (Arena.over(stack_buf)). Global Arena = global buffer = safe. */
+        if (node->assign.op == TOK_EQ && value) {
+            Type *val_eff = type_unwrap_distinct(value);
+            bool has_arena = (val_eff && val_eff->kind == TYPE_ARENA);
+            if (!has_arena && val_eff && val_eff->kind == TYPE_STRUCT) {
+                for (uint32_t fi = 0; fi < val_eff->struct_type.field_count; fi++) {
+                    Type *ft = type_unwrap_distinct(val_eff->struct_type.fields[fi].type);
+                    if (ft && ft->kind == TYPE_ARENA) { has_arena = true; break; }
+                }
+            }
+            if (has_arena) {
+                /* Check if value source is LOCAL (not global/static) */
+                Node *vroot = node->assign.value;
+                while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                    if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                    else vroot = vroot->index_expr.object;
+                }
+                bool val_is_local = false;
+                if (vroot && vroot->kind == NODE_IDENT) {
+                    Symbol *vsym = scope_lookup(c->current_scope,
+                        vroot->ident.name, (uint32_t)vroot->ident.name_len);
+                    val_is_local = vsym && !vsym->is_static &&
+                        !scope_lookup_local(c->global_scope, vsym->name, vsym->name_len);
+                }
+                if (val_is_local) {
+                    /* Check if target is global/static */
+                    Node *troot = node->assign.target;
+                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                        else troot = troot->index_expr.object;
+                    }
+                    if (troot && troot->kind == NODE_IDENT) {
+                        Symbol *tsym = scope_lookup(c->current_scope,
+                            troot->ident.name, (uint32_t)troot->ident.name_len);
+                        bool target_is_global = tsym &&
+                            (tsym->is_static || scope_lookup_local(c->global_scope,
+                                tsym->name, tsym->name_len) != NULL);
+                        if (target_is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot store local Arena value in global/static — "
+                                "Arena.over(local_buf) contains pointer to stack memory "
+                                "that will dangle when function returns");
                         }
                     }
                 }

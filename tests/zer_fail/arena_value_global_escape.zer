@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// BUG-496: Local Arena value stored in global — dangling buf pointer
+struct Box { Arena a; }
+Box g_box;
+void exploit() {
+    u8[1024] local_buf;
+    Arena a = Arena.over(local_buf);
+    g_box.a = a;
+}
+u32 main() { return 0; }

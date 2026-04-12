@@ -4377,62 +4377,107 @@ static void emit_struct_decl(Emitter *e, Node *node) {
  * can jump INTO loops — valid C since 1983.
  * ================================================================ */
 
-/* Pre-scan async body for orelse blocks that need promoted temps (BUG-481).
- * Recursively finds NODE_ORELSE with block fallback in var-decl/expr contexts.
- * Each one gets a temp slot in the state struct. */
+/* Forward declaration — prescan_async_temps and prescan_expr_for_orelse are mutually recursive */
+static void prescan_async_temps(Emitter *e, Node *node);
+
+/* BUG-495: helper — register one async orelse temp */
+static void register_async_orelse_temp(Emitter *e, Node *orelse_expr) {
+    Type *ot = checker_get_type(e->checker, orelse_expr);
+    if (!ot) return;
+    if (e->async_temp_count >= e->async_temp_capacity) {
+        int nc = e->async_temp_capacity < 4 ? 4 : e->async_temp_capacity * 2;
+        e->async_temps = realloc(e->async_temps, nc * sizeof(struct AsyncTemp));
+        e->async_temp_capacity = nc;
+    }
+    e->async_temps[e->async_temp_count].type = ot;
+    e->async_temps[e->async_temp_count].temp_id = e->async_temp_next_id++;
+    e->async_temp_count++;
+}
+
+/* BUG-495: scan expression tree for orelse with block fallback.
+ * Recurses into ALL expression nodes — NODE_BINARY, NODE_CALL, NODE_ASSIGN,
+ * NODE_UNARY, NODE_ORELSE, NODE_INTRINSIC, etc. Finds orelse blocks nested
+ * at any depth in expression trees (e.g., 10 + (opt orelse { yield; 42; })). */
+static void prescan_expr_for_orelse(Emitter *e, Node *expr) {
+    if (!expr) return;
+    if (expr->kind == NODE_ORELSE && expr->orelse.fallback &&
+        expr->orelse.fallback->kind == NODE_BLOCK) {
+        register_async_orelse_temp(e, expr->orelse.expr);
+        /* Also recurse into the orelse block's statements */
+        prescan_async_temps(e, expr->orelse.fallback);
+    }
+    /* Recurse into expression children */
+    if (expr->kind == NODE_BINARY) {
+        prescan_expr_for_orelse(e, expr->binary.left);
+        prescan_expr_for_orelse(e, expr->binary.right);
+    }
+    if (expr->kind == NODE_UNARY) prescan_expr_for_orelse(e, expr->unary.operand);
+    if (expr->kind == NODE_ASSIGN) {
+        prescan_expr_for_orelse(e, expr->assign.target);
+        prescan_expr_for_orelse(e, expr->assign.value);
+    }
+    if (expr->kind == NODE_CALL) {
+        for (int i = 0; i < expr->call.arg_count; i++)
+            prescan_expr_for_orelse(e, expr->call.args[i]);
+    }
+    if (expr->kind == NODE_ORELSE) {
+        prescan_expr_for_orelse(e, expr->orelse.expr);
+        prescan_expr_for_orelse(e, expr->orelse.fallback);
+    }
+    if (expr->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < expr->intrinsic.arg_count; i++)
+            prescan_expr_for_orelse(e, expr->intrinsic.args[i]);
+    }
+    if (expr->kind == NODE_FIELD) prescan_expr_for_orelse(e, expr->field.object);
+    if (expr->kind == NODE_INDEX) {
+        prescan_expr_for_orelse(e, expr->index_expr.object);
+        prescan_expr_for_orelse(e, expr->index_expr.index);
+    }
+    if (expr->kind == NODE_TYPECAST) prescan_expr_for_orelse(e, expr->typecast.expr);
+}
+
+/* Pre-scan async body for orelse blocks that need promoted temps (BUG-481/495).
+ * Recursively finds NODE_ORELSE with block fallback at ANY depth — including
+ * inside expression trees (NODE_BINARY, NODE_CALL, etc.). */
 static void prescan_async_temps(Emitter *e, Node *node) {
     if (!node) return;
-    /* var-decl with orelse block init: u32 x = opt orelse { yield; return; }; */
-    if (node->kind == NODE_VAR_DECL && node->var_decl.init &&
-        node->var_decl.init->kind == NODE_ORELSE &&
-        node->var_decl.init->orelse.fallback &&
-        node->var_decl.init->orelse.fallback->kind == NODE_BLOCK) {
-        Type *ot = checker_get_type(e->checker, node->var_decl.init->orelse.expr);
-        if (ot) {
-            if (e->async_temp_count >= e->async_temp_capacity) {
-                int nc = e->async_temp_capacity < 4 ? 4 : e->async_temp_capacity * 2;
-                e->async_temps = realloc(e->async_temps, nc * sizeof(struct AsyncTemp));
-                e->async_temp_capacity = nc;
-            }
-            e->async_temps[e->async_temp_count].type = ot;
-            e->async_temps[e->async_temp_count].temp_id = e->async_temp_next_id++;
-            e->async_temp_count++;
-        }
-    }
-    /* Also scan orelse block in expression statements */
-    if (node->kind == NODE_EXPR_STMT && node->expr_stmt.expr &&
-        node->expr_stmt.expr->kind == NODE_ORELSE &&
-        node->expr_stmt.expr->orelse.fallback &&
-        node->expr_stmt.expr->orelse.fallback->kind == NODE_BLOCK) {
-        Type *ot = checker_get_type(e->checker, node->expr_stmt.expr->orelse.expr);
-        if (ot) {
-            if (e->async_temp_count >= e->async_temp_capacity) {
-                int nc = e->async_temp_capacity < 4 ? 4 : e->async_temp_capacity * 2;
-                e->async_temps = realloc(e->async_temps, nc * sizeof(struct AsyncTemp));
-                e->async_temp_capacity = nc;
-            }
-            e->async_temps[e->async_temp_count].type = ot;
-            e->async_temps[e->async_temp_count].temp_id = e->async_temp_next_id++;
-            e->async_temp_count++;
-        }
-    }
-    /* Recurse into blocks, if, for, while, switch */
+    /* Scan var-decl init expression tree for nested orelse */
+    if (node->kind == NODE_VAR_DECL && node->var_decl.init)
+        prescan_expr_for_orelse(e, node->var_decl.init);
+    /* Scan expr-stmt expression tree */
+    if (node->kind == NODE_EXPR_STMT && node->expr_stmt.expr)
+        prescan_expr_for_orelse(e, node->expr_stmt.expr);
+    /* Scan return expression */
+    if (node->kind == NODE_RETURN && node->ret.expr)
+        prescan_expr_for_orelse(e, node->ret.expr);
+    /* Recurse into statement children */
     if (node->kind == NODE_BLOCK) {
         for (int i = 0; i < node->block.stmt_count; i++)
             prescan_async_temps(e, node->block.stmts[i]);
     }
     if (node->kind == NODE_IF) {
+        prescan_expr_for_orelse(e, node->if_stmt.cond);
         prescan_async_temps(e, node->if_stmt.then_body);
         prescan_async_temps(e, node->if_stmt.else_body);
     }
-    if (node->kind == NODE_FOR) prescan_async_temps(e, node->for_stmt.body);
-    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE)
+    if (node->kind == NODE_FOR) {
+        prescan_async_temps(e, node->for_stmt.init);
+        prescan_expr_for_orelse(e, node->for_stmt.cond);
+        prescan_expr_for_orelse(e, node->for_stmt.step);
+        prescan_async_temps(e, node->for_stmt.body);
+    }
+    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE) {
+        prescan_expr_for_orelse(e, node->while_stmt.cond);
         prescan_async_temps(e, node->while_stmt.body);
+    }
     if (node->kind == NODE_SWITCH) {
+        prescan_expr_for_orelse(e, node->switch_stmt.expr);
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             prescan_async_temps(e, node->switch_stmt.arms[i].body);
     }
     if (node->kind == NODE_DEFER) prescan_async_temps(e, node->defer.body);
+    if (node->kind == NODE_CRITICAL) prescan_async_temps(e, node->critical.body);
+    if (node->kind == NODE_ONCE) prescan_async_temps(e, node->once.body);
 }
 
 /* BUG-490: helper to add one async local (dedup by name) */

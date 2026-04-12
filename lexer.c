@@ -145,6 +145,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
         break;
     case 'S':
         if (word_len == 4 && memcmp(word+1, "lab", 3) == 0) return TOK_SLAB;
+        if (word_len == 9 && memcmp(word+1, "emaphore", 8) == 0) return TOK_SEMAPHORE;
         break;
     case 'a':
         if (word_len == 2 && word[1] == 's') return TOK_AS;
@@ -590,6 +591,7 @@ const char *token_type_name(TokenType type) {
     case TOK_STATIC_ASSERT: return "static_assert";
     case TOK_CONTAINER: return "container";
     case TOK_DO: return "do";
+    case TOK_SEMAPHORE: return "Semaphore";
     case TOK_KEEP: return "keep";
     case TOK_AS: return "as";
     case TOK_MMIO: return "mmio";

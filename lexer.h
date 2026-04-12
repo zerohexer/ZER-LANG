@@ -40,6 +40,7 @@ typedef enum {
     TOK_STATIC_ASSERT,
     TOK_CONTAINER,
     TOK_DO,
+    TOK_SEMAPHORE,
 
     /* === Literals === */
     TOK_IDENT,          /* user identifier */

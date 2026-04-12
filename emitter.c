@@ -748,6 +748,10 @@ static void emit_type(Emitter *e, Type *t) {
         emit(e, "_zer_barrier");
         break;
 
+    case TYPE_SEMAPHORE:
+        emit(e, "_zer_semaphore");
+        break;
+
     case TYPE_SLAB:
         emit(e, "_zer_slab");
         break;
@@ -2888,6 +2892,46 @@ static void emit_expr(Emitter *e, Node *node) {
             } else {
                 emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
             }
+        } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* @sem_acquire(s) → init condvar if needed; lock; while(count==0) wait; count--; unlock */
+            emit(e, "({ if (!");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx_inited) { pthread_cond_init(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_cond, NULL); } _zer_mtx_ensure_init(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx, &");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx_inited); pthread_mutex_lock(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx); while (");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ".count == 0) { pthread_cond_wait(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_cond, &");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx); } ");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ".count--; pthread_mutex_unlock(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx); })");
+        } else if (nlen == 11 && memcmp(name, "sem_release", 11) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* @sem_release(s) → lock; s.count++; cond_signal; unlock */
+            emit(e, "({ _zer_mtx_ensure_init(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx, &");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx_inited); pthread_mutex_lock(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx); ");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ".count++; pthread_cond_signal(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_cond); pthread_mutex_unlock(&");
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, "._zer_mtx); })");
         } else {
             emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
         }
@@ -3171,9 +3215,11 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (eff_local && (eff_local->kind == TYPE_STRUCT || eff_local->kind == TYPE_ARRAY ||
                          eff_local->kind == TYPE_OPTIONAL || eff_local->kind == TYPE_UNION ||
                          eff_local->kind == TYPE_ARENA || eff_local->kind == TYPE_BARRIER ||
-                         eff_local->kind == TYPE_SLICE)) {
+                         eff_local->kind == TYPE_SEMAPHORE || eff_local->kind == TYPE_SLICE)) {
                 /* BUG-411: empty struct {0} warns — use {} for zero-field structs */
-                if (eff_local->kind == TYPE_STRUCT && eff_local->struct_type.field_count == 0)
+                if (eff_local->kind == TYPE_SEMAPHORE)
+                    emit(e, " = { .count = %u }", (unsigned)eff_local->semaphore.count);
+                else if (eff_local->kind == TYPE_STRUCT && eff_local->struct_type.field_count == 0)
                     emit(e, " = {}");
                 else
                     emit(e, " = {0}");
@@ -4462,9 +4508,11 @@ static void emit_global_var(Emitter *e, Node *node) {
         Type *eff_type = type_unwrap_distinct(type);
         if (eff_type && (eff_type->kind == TYPE_STRUCT || eff_type->kind == TYPE_ARRAY ||
                      eff_type->kind == TYPE_OPTIONAL || eff_type->kind == TYPE_UNION ||
-                     eff_type->kind == TYPE_BARRIER || eff_type->kind == TYPE_SLICE)) {
-            /* BUG-411: empty struct {0} warns — use {} for zero-field structs */
-            if (eff_type->kind == TYPE_STRUCT && eff_type->struct_type.field_count == 0)
+                     eff_type->kind == TYPE_BARRIER || eff_type->kind == TYPE_SEMAPHORE ||
+                     eff_type->kind == TYPE_SLICE)) {
+            if (eff_type->kind == TYPE_SEMAPHORE)
+                emit(e, " = { .count = %u }", (unsigned)eff_type->semaphore.count);
+            else if (eff_type->kind == TYPE_STRUCT && eff_type->struct_type.field_count == 0)
                 emit(e, " = {}");
             else
                 emit(e, " = {0}");
@@ -5102,6 +5150,13 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    }\n");
     emit(e, "    pthread_mutex_unlock(&b->mtx);\n");
     emit(e, "}\n");
+    /* Semaphore(N) — counting semaphore: shared struct with count + condvar */
+    emit(e, "typedef struct {\n");
+    emit(e, "    uint32_t count;\n");
+    emit(e, "    pthread_mutex_t _zer_mtx;\n");
+    emit(e, "    uint8_t _zer_mtx_inited;\n");
+    emit(e, "    pthread_cond_t _zer_cond;\n");
+    emit(e, "} _zer_semaphore;\n");
     emit(e, "#endif\n\n");
 
     /* Universal fault handler + @probe — uses C standard signal() everywhere.

@@ -140,6 +140,13 @@ Type *type_slab(Arena *a, Type *elem) {
     return t;
 }
 
+Type *type_semaphore(Arena *a, uint32_t count) {
+    Type *t = (Type *)arena_alloc(a, sizeof(Type));
+    t->kind = TYPE_SEMAPHORE;
+    t->semaphore.count = count;
+    return t;
+}
+
 Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret) {
     Type *t = (Type *)arena_alloc(a, sizeof(Type));
     t->kind = TYPE_FUNC_PTR;
@@ -418,6 +425,7 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_OPAQUE: return pos + snprintf(buf + pos, max - pos, "opaque");
     case TYPE_ARENA:   return pos + snprintf(buf + pos, max - pos, "Arena");
     case TYPE_BARRIER: return pos + snprintf(buf + pos, max - pos, "Barrier");
+    case TYPE_SEMAPHORE: return pos + snprintf(buf + pos, max - pos, "Semaphore(%u)", t->semaphore.count);
     case TYPE_POINTER:
         pos += snprintf(buf + pos, max - pos, "*");
         return type_name_write(t->pointer.inner, buf, pos, max);

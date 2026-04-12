@@ -65,6 +65,7 @@ typedef enum {
     TYNODE_BARRIER,         /* Barrier — thread sync point */
     TYNODE_HANDLE,          /* Handle(T) */
     TYNODE_SLAB,            /* Slab(T) — dynamic growable pool */
+    TYNODE_SEMAPHORE,       /* Semaphore(N) — counting semaphore */
 
     /* user-defined parameterized */
     TYNODE_CONTAINER,       /* Stack(u32) — container instantiation */
@@ -126,6 +127,9 @@ struct TypeNode {
 
         /* TYNODE_SLAB: Slab(T) — no count, grows dynamically */
         struct { TypeNode *elem; } slab;
+
+        /* TYNODE_SEMAPHORE: Semaphore(N) — counting semaphore */
+        struct { Node *count_expr; } semaphore;
 
         /* TYNODE_CONTAINER: Stack(u32) — container name + type argument */
         struct {

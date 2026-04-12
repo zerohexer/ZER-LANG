@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-12 — Gemini Red Team Round 5 (3 real bugs from 5 reports)
+
+### BUG-482: Async struct names not module-mangled
+**Symptom:** Two modules with `async void init()` both emit `_zer_async_init` → GCC redefinition error.
+**Root cause:** `emit_async_func` used raw function name for struct/init/poll names. No module prefix.
+**Fix:** Build mangled name at top of `emit_async_func` using `e->current_module` — same `module__name` pattern as `EMIT_MANGLED_NAME`. `_zer_async_init` → `_zer_async_mod_a__init` in module scope.
+**Test:** Multi-module async would demonstrate; main module (no prefix) unchanged.
+
+### BUG-483: Semaphore/Barrier condvar init race
+**Symptom:** `if (!s->_zer_mtx_inited) { pthread_cond_init(...); }` after `_zer_mtx_ensure_init` — always false because ensure_init already set inited to 1. Condvar never initialized (works on Linux via zero-init, UB on other POSIX).
+**Root cause:** Condvar init was after ensure_init instead of inside the CAS winner path.
+**Fix:** Added `_zer_mtx_ensure_init_cv(mtx, inited, cond)` — condvar initialized alongside mutex in CAS winner. `_zer_mtx_ensure_init` is now a wrapper calling `_cv(..., NULL)`. Semaphore acquire/release use `_cv` with condvar pointer.
+**Test:** `tests/zer/sem_concurrent_init.zer` (4 threads concurrent sem acquire/release)
+
+### BUG-484: Move struct orelse fallback not tracked
+**Symptom:** `Token b = opt orelse a; consume(a);` compiled — `a` not marked as transferred via orelse fallback path.
+**Root cause:** Move transfer handler at NODE_VAR_DECL only unwrapped `orelse.expr` (the optional), not `orelse.fallback` (the default value used when null).
+**Fix:** After primary move_src transfer, also check `orelse.fallback` for move struct types. Same type detection logic (direct type, array element type). Marks fallback as HS_TRANSFERRED.
+**Test:** `tests/zer_fail/move_orelse_fallback.zer`, `tests/zer/move_orelse_safe.zer`
+
+### Not bugs (V16, V20)
+- V16 (Union corpse): Union variant access requires switch. Tag check prevents reading inactive variant. `m.val` outside switch → "cannot read union variant directly"
+- V20 (VRP u64 sign): Unsigned clamp in `push_var_range` makes large u64 values unprovable (min clamped to 0, but int64_t representation is negative → min > max → empty range). Bounds check stays.
+
+## Session 2026-04-12 — Mutex init CAS race fix + C interop concurrency
+
+### Mutex lazy init race condition (found during C interop testing)
+**Symptom:** Two C library threads calling ZER callback simultaneously for first time → both see `inited==0`, both init mutex, second destroys first's lock state.
+**Fix:** `_zer_mtx_ensure_init` uses CAS (compare-and-swap): `__atomic_compare_exchange_n(inited, &expected, 2, ...)`. States: 0=uninit, 2=in-progress, 1=ready. CAS 0→2 = winner inits, losers spin until 1.
+**Test:** `tests/zer/cinclude_callback_shared.zer` (C pthread callback + shared struct)
+
 ## Session 2026-04-12 — Gemini Red Team Round 4 (1 real bug, 1 doc fix from 4 reports)
 
 ### BUG-481: Async yield inside orelse block — stack ghost corruption (proper fix)

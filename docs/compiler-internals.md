@@ -1031,6 +1031,37 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 5 (2026-04-12, Gemini — 5 claims, 3 real bugs)
+
+**Summary:** Fifth Gemini audit. 3 real bugs (BUG-482/483/484), 2 false.
+
+### BUG-482: Async struct names module-mangled
+`_zer_async_init` collides when two modules have `async void init()`. Fix: `emit_async_func` builds mangled name `module__funcname` at top, uses throughout all `_zer_async_` emissions. Same pattern as `EMIT_MANGLED_NAME`.
+
+### BUG-483: Condvar init inside CAS winner path
+`_zer_mtx_ensure_init` sets `inited=1`, then `if (!inited) condvar_init()` is always false — condvar never initialized. Fix: `_zer_mtx_ensure_init_cv(mtx, inited, cond)` initializes condvar alongside mutex in CAS winner. `_zer_mtx_ensure_init` is wrapper calling `_cv(..., NULL)`. Semaphore acquire/release pass `&s->_zer_cond`.
+
+### BUG-484: Move struct orelse fallback transfer
+`Token b = opt orelse a` — `a` not marked HS_TRANSFERRED. Fix: after primary move_src transfer, also check `orelse.fallback` for move struct types. Handles direct ident, array element, struct field. Same type detection as primary path.
+
+### Not bugs (V16, V20)
+- V16: Union variant access requires switch + tag check — "corpse read" impossible
+- V20: VRP unsigned clamp makes large u64 unprovable — bounds check stays
+
+## Mutex Lazy Init Race Fix (2026-04-12)
+
+Found during C interop testing (C library callback + shared struct). `_zer_mtx_ensure_init` uses CAS: `__atomic_compare_exchange_n(inited, &expected, 2, ...)`. States: 0=uninit, 2=in-progress, 1=ready. CAS 0→2 = winner initializes mutex (+condvar). Losers spin `while (inited != 1) {}`. Prevents double-init when two threads hit first shared struct access simultaneously.
+
+## C Interop Safety Model — `cinclude` + `*opaque` + `shared struct`
+
+Complete C library interop requires two keywords:
+- `*opaque` for memory safety (pointer lifecycle tracking via zercheck + runtime type_id)
+- `shared struct` for concurrency safety (auto-lock fires from ANY thread — ZER spawn, C pthread, OS callback)
+
+The auto-lock is on the DATA (shared struct's mutex), not on the thread creation mechanism. C library threads calling ZER callbacks are automatically serialized when accessing shared struct fields. No annotations needed — same `shared struct` keyword used for ZER-to-ZER concurrency.
+
+**Safety boundary:** C library internal bugs (their own data races, UAF) are outside ZER's scope — same as Rust's `unsafe extern`.
+
 ## Red Team Audit Fixes — Round 4 (2026-04-12, Gemini — 4 claims, 1 real bug)
 
 **Summary:** Fourth Gemini audit. 1 real bug (async orelse stack ghost), 1 doc fix (ABA gen counter), 2 false (auto-lock group + VRP coercion).

@@ -1,0 +1,17 @@
+// VRP range invalidated when &var passed to function — auto-guard inserted
+// idx range wiped after modify(&idx), bounds check NOT skipped
+
+u32[4] arr;
+
+void modify(*u32 p) {
+    p[0] = 3;
+}
+
+u32 main() {
+    u32 idx = 2;
+    if (idx >= 4) { return 1; }
+    modify(&idx);
+    arr[idx] = 42;
+    if (arr[3] != 42) { return 1; }
+    return 0;
+}

@@ -4181,6 +4181,33 @@ static Type *check_expr(Checker *c, Node *node) {
                 type_name(effective_callee));
             result = ty_void;
         }
+
+        /* VRP invalidation: when &var is passed to a function, the function
+         * might modify var through the pointer, making the VRP range stale.
+         * Wipe the range for any variable whose address is taken as an arg.
+         * Without this: if (idx < 4) { modify(&idx); arr[idx]; } skips
+         * bounds check even though modify() may have set idx = 100. */
+        for (int ai = 0; ai < node->call.arg_count; ai++) {
+            Node *arg = node->call.args[ai];
+            if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+                Node *operand = arg->unary.operand;
+                /* walk through field/index to root ident */
+                while (operand && (operand->kind == NODE_FIELD || operand->kind == NODE_INDEX)) {
+                    if (operand->kind == NODE_FIELD) operand = operand->field.object;
+                    else operand = operand->index_expr.object;
+                }
+                if (operand && operand->kind == NODE_IDENT) {
+                    struct VarRange *r = find_var_range(c, operand->ident.name,
+                        (uint32_t)operand->ident.name_len);
+                    if (r) {
+                        r->min_val = INT64_MIN;
+                        r->max_val = INT64_MAX;
+                        r->known_nonzero = false;
+                    }
+                }
+            }
+        }
+
         break;
     }
 
@@ -10037,7 +10064,7 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                 csym->func_node->func_decl.body) {
                 /* Scan callee body for shared type field accesses */
                 static int _shared_scan_depth = 0;
-                if (_shared_scan_depth < 4) {
+                if (_shared_scan_depth < 8) {
                     _shared_scan_depth++;
                     Node *body = csym->func_node->func_decl.body;
                     if (body->kind == NODE_BLOCK) {

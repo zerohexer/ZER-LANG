@@ -1613,16 +1613,46 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         if (node->var_decl.init)
             zc_check_expr(zc, ps, node->var_decl.init);
         /* Move struct transfer AFTER expr check to avoid false positive:
-         * Token b = a; — zc_check_expr sees a as ALIVE, then we transfer. */
+         * Token b = a; — zc_check_expr sees a as ALIVE, then we transfer.
+         * Also handles: Token b = arr[0]; and Token b = s.field; (compound keys) */
         if (node->var_decl.init) {
             Node *move_src = node->var_decl.init;
             if (move_src->kind == NODE_ORELSE) move_src = move_src->orelse.expr;
-            if (move_src && move_src->kind == NODE_IDENT) {
-                Type *src_type = checker_get_type(zc->checker, move_src);
-                if (src_type && is_move_struct_type(src_type)) {
-                    const char *sn = move_src->ident.name;
-                    uint32_t sl = (uint32_t)move_src->ident.name_len;
-                    HandleInfo *src = zc_ensure_move_registered(zc, ps, sn, sl, node->loc.line);
+            /* Check move struct type on the source expression */
+            Type *src_type = move_src ? checker_get_type(zc->checker, move_src) : NULL;
+            if (!src_type && move_src) {
+                /* For NODE_INDEX/NODE_FIELD, resolve via the variable type */
+                Node *root = move_src;
+                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root) src_type = checker_get_type(zc->checker, root);
+            }
+            bool src_is_move = src_type && is_move_struct_type(src_type);
+            /* For array element: arr[0] where arr is T[N] and T is move struct */
+            if (!src_is_move && move_src && move_src->kind == NODE_INDEX) {
+                Type *obj_type = checker_get_type(zc->checker, move_src->index_expr.object);
+                if (obj_type) {
+                    Type *eff = type_unwrap_distinct(obj_type);
+                    if (eff && eff->kind == TYPE_ARRAY && is_move_struct_type(eff->array.inner))
+                        src_is_move = true;
+                }
+            }
+            if (src_is_move) {
+                char src_key[128];
+                int sklen = handle_key_from_expr(move_src, src_key, sizeof(src_key));
+                if (sklen > 0) {
+                    HandleInfo *src = find_handle(ps, src_key, (uint32_t)sklen);
+                    if (!src) {
+                        src = add_handle(ps, src_key, (uint32_t)sklen);
+                        if (src) {
+                            src->state = HS_ALIVE;
+                            src->pool_id = -3;
+                            src->alloc_line = node->loc.line;
+                            src->alloc_id = zc->next_alloc_id++;
+                        }
+                    }
                     if (src && src->state == HS_ALIVE) {
                         src->state = HS_TRANSFERRED;
                         src->transfer_line = node->loc.line;

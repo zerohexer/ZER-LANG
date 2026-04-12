@@ -5312,13 +5312,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * Lazy init: first lock call initializes with PTHREAD_MUTEX_RECURSIVE. */
     emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
     emit(e, "static inline void _zer_mtx_ensure_init(pthread_mutex_t *mtx, uint8_t *inited) {\n");
-    emit(e, "    if (!__atomic_load_n(inited, __ATOMIC_ACQUIRE)) {\n");
+    emit(e, "    if (__atomic_load_n(inited, __ATOMIC_ACQUIRE) == 1) return;\n");
+    emit(e, "    /* CAS 0→2: winner initializes mutex. Losers spin until done (1). */\n");
+    emit(e, "    uint8_t expected = 0;\n");
+    emit(e, "    if (__atomic_compare_exchange_n(inited, &expected, 2, 0,\n");
+    emit(e, "                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {\n");
     emit(e, "        pthread_mutexattr_t attr;\n");
     emit(e, "        pthread_mutexattr_init(&attr);\n");
     emit(e, "        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);\n");
     emit(e, "        pthread_mutex_init(mtx, &attr);\n");
     emit(e, "        pthread_mutexattr_destroy(&attr);\n");
     emit(e, "        __atomic_store_n(inited, 1, __ATOMIC_RELEASE);\n");
+    emit(e, "    } else {\n");
+    emit(e, "        while (__atomic_load_n(inited, __ATOMIC_ACQUIRE) != 1) {}\n");
     emit(e, "    }\n");
     emit(e, "}\n\n");
 

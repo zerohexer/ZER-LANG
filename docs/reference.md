@@ -1857,6 +1857,57 @@ u32 main() {
 - C macros (stderr, stdout, etc.) are NOT accessible. Wrap in a C helper function.
 - `_zer_` prefix is reserved — name helpers `zer_get_stderr`, not `_zer_stderr`.
 
+### Safe C Library Interop — `cinclude` + `*opaque` + `shared struct`
+
+Two keywords make ANY C library fully safe from ZER:
+
+**Memory safety** — wrap C pointers in `*opaque`:
+```zer
+cinclude "sensor.h";
+*opaque sensor_open([*]u8 path);
+void sensor_close(*opaque dev);
+u32 sensor_read(*opaque dev);
+
+u32 main() {
+    *opaque dev = sensor_open("/dev/spi0");
+    defer sensor_close(dev);          // zercheck: leak prevented
+    u32 val = sensor_read(dev);       // zercheck: dev is ALIVE
+    return 0;
+}
+// sensor_close(dev) fires via defer
+// sensor_read(dev) after close = COMPILE ERROR (use after free)
+```
+
+**Concurrency safety** — wrap shared data in `shared struct`:
+```zer
+cinclude "event_lib.h";
+void event_register(void (*cb)());
+
+shared struct State { u32 counter; *opaque handle; }
+State g;
+
+void on_event() {
+    g.counter += 1;    // auto-locked — safe from ANY thread
+}
+
+u32 main() {
+    g.counter = 0;
+    event_register(on_event);    // C library calls on_event from its own thread
+    return 0;
+}
+```
+
+The auto-lock fires regardless of which thread calls the function — ZER `spawn`, C `pthread_create`, OS callback, interrupt handler. The lock is on the DATA (the `shared struct`'s mutex), not on the thread creation mechanism.
+
+**The complete safety model:**
+| Tool | Protects | Mechanism |
+|---|---|---|
+| `*opaque` | Pointer lifecycle (UAF, double-free, leak) | zercheck compile-time + runtime type_id |
+| `shared struct` | Data race prevention | Auto-lock (recursive pthread_mutex) |
+| `spawn` checker | Thread creation safety | Compile-time arg validation |
+
+**What ZER cannot protect:** C library internal bugs. If the C library itself has data races or UAF in its own code, ZER can't fix that — same boundary as Rust's `unsafe extern`.
+
 **SEE ALSO**
 import, *opaque
 

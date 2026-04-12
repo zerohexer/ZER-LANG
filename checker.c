@@ -4975,8 +4975,12 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (node->orelse.fallback) {
             if (node->orelse.fallback->kind == NODE_BLOCK) {
                 /* orelse { block } — statement-only, no result type.
-                 * Block runs on null. Per spec: cannot be used as expression. */
+                 * Block runs on null. Per spec: cannot be used as expression.
+                 * BUG-481: ban yield/await inside — orelse emits as GCC statement
+                 * expression with stack temps that are stale after yield/resume. */
+                c->orelse_depth++;
                 check_stmt(c, node->orelse.fallback);
+                c->orelse_depth--;
                 result = unwrapped;
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
@@ -7950,12 +7954,26 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_YIELD:
         /* yield — suspend current async task, no operands */
+        /* BUG-481: yield inside orelse block → stack ghost. Orelse emits as
+         * GCC statement expression with _zer_tmp on stack. After yield+resume,
+         * _zer_tmp is stale (different poll call's stack frame). */
+        if (c->orelse_depth > 0) {
+            checker_error(c, node->loc.line,
+                "yield inside orelse block is not allowed — "
+                "compiler temporary would be stale after resume");
+        }
         break;
 
     case NODE_AWAIT: {
         /* await expr — check the condition expression */
         if (node->await_stmt.cond) {
             check_expr(c, node->await_stmt.cond);
+        }
+        /* BUG-481: same as yield — await inside orelse block corrupts stack */
+        if (c->orelse_depth > 0) {
+            checker_error(c, node->loc.line,
+                "await inside orelse block is not allowed — "
+                "compiler temporary would be stale after resume");
         }
         break;
     }

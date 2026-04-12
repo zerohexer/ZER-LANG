@@ -1,0 +1,16 @@
+// Async with orelse (no yield inside) — safe
+?u32 maybe_get() { return null; }
+
+async void good() {
+    u32 x = maybe_get() orelse 42;
+    yield;
+    u32 y = x;
+}
+
+u32 main() {
+    _zer_async_good task;
+    _zer_async_good_init(&task);
+    _zer_async_good_poll(&task);
+    _zer_async_good_poll(&task);
+    return 0;
+}

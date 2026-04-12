@@ -914,6 +914,68 @@ If the answer is no → extract helper, add comment, or restructure. Do NOT comm
 | Inline duplicate code | for/while loop body walk copy-pasted | `CT_WALK_BODY_STMT` macro → then proper `ComptimeCtx` refactor |
 | Quick fix then "refactor later" | Macro band-aid for duplicate code | Refactor NOW while you have context |
 
+## Fix Methodology — Proper vs Pragmatic (learned from 8 red team rounds)
+
+**MANDATORY: read this before fixing ANY bug.** Fresh sessions default to pragmatic patches. This section explains when that's wrong and how to identify the proper fix.
+
+### The Decision Flow
+
+```
+Bug found → Can it be fixed in ONE location?
+  YES → Is that location a DECLARATION site (not use site)?
+    YES → Fix there. Done.
+    NO  → STOP. You're patching a use site. Read "Declaration vs Use" below.
+  NO  → How many sites need changing?
+    2-3 → Fix each, add comment linking them.
+    4+  → STOP. You need a REFACTOR, not a patch. Read "Refactor Triggers" below.
+```
+
+### Declaration vs Use Site Rule
+
+When tracking state across scopes (handles, VRP ranges, escape flags, move structs):
+- **DECLARATION site** (NODE_VAR_DECL): "a new variable enters scope" → WRITE to tracking system at CURRENT scope
+- **USE site** (NODE_IDENT, NODE_CALL): "an existing variable is referenced" → READ from tracking system at ANY scope
+
+**Never add scope-aware logic at use sites.** It breaks cross-scope access (loops, if bodies accessing outer variables). Proven by 4 failed patches across BUG-488 and BUG-494.
+
+**Pattern:** `find_handle_local` for declarations, `find_handle` for uses. Same as checker's `scope_lookup_local` vs `scope_lookup`.
+
+### Refactor Triggers — When Patching Won't Work
+
+Stop patching and refactor when:
+1. **Same fix needed at 4+ sites** → Extract helper function. One change point.
+2. **Patch fixes bug A but breaks test B** → The assumption being patched is architectural, not local. Need new abstraction (e.g., `find_handle_local` was the abstraction that fixed BUG-488).
+3. **Three failed attempts at the same bug** → Your mental model of the code is wrong. Read the full function, not just the bug site. (BUG-488: 3 patches failed because `find_handle` was used everywhere for both reads and writes — needed two-function split.)
+4. **Fixed buffer hits limit** → Replace with stack-first dynamic pattern. Never increase the constant (rule #7).
+
+### Pragmatic Fix vs Proper Fix
+
+| Indicator | Pragmatic (avoid) | Proper (do this) |
+|---|---|---|
+| Fix location | Patching at the call site where bug manifests | Fixing at the root (declaration, data structure, helper) |
+| Scope of change | 1 line change, 1 site | New helper/abstraction, all sites use it |
+| Test impact | Fixes the test case, might break others | Fixes the class of bugs, no regressions |
+| Example | `if (depth < 8)` depth limit | Call graph DFS with memoization (BUG-474) |
+| Example | Ban yield in orelse (flag) | Promote temps to state struct (BUG-481) |
+| Example | `find_handle` + scope check at use site | `find_handle_local` at declaration site (BUG-488) |
+
+### The "Ban vs Track" Decision
+
+When a pattern is unsafe, the AI's default instinct is to BAN it (compile error). The proper ZER approach is to TRACK it (add to a tracking system).
+
+```
+AI instinct: "Ban &move_struct in function calls"
+Proper:      "Track &move_struct — mark source as HS_TRANSFERRED"
+
+AI instinct: "Ban yield inside orelse blocks"
+Proper:      "Promote orelse temps to async state struct"
+
+AI instinct: "Ban variable shadowing in zercheck"
+Proper:      "Add scope_depth to PathState, find_handle_local for declarations"
+```
+
+**Only ban when NO tracking system can cover the case** (e.g., naked non-asm = hardware constraint, not a tracking gap). If the user pushes back on a ban, they're usually right — look for a tracking solution.
+
 ## Implementation Workflow — Lessons Learned
 
 These patterns were discovered through repeated mistakes. Follow them to avoid wasting turns.

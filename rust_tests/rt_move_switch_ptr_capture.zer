@@ -1,0 +1,13 @@
+// Move struct pointer capture in switch — safe (BUG-480)
+move struct Key { u32 id; }
+union Msg { Key k; u32 other; }
+
+u32 main() {
+    Msg m;
+    m.k.id = 42;
+    switch (m) {
+        .k => |*val| { val.id = 99; }
+        .other => { }
+    }
+    return 0;
+}

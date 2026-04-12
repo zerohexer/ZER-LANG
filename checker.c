@@ -4182,16 +4182,14 @@ static Type *check_expr(Checker *c, Node *node) {
             result = ty_void;
         }
 
-        /* VRP invalidation: when &var is passed to a function, the function
-         * might modify var through the pointer, making the VRP range stale.
-         * Wipe the range for any variable whose address is taken as an arg.
-         * Without this: if (idx < 4) { modify(&idx); arr[idx]; } skips
-         * bounds check even though modify() may have set idx = 100. */
+        /* VRP invalidation on function call:
+         * 1. (BUG-475) &var passed as arg — function might modify through pointer
+         * 2. (BUG-478) Global variables — function might modify any global
+         * 3. (BUG-479) Local vars with address taken — pointer alias may exist */
         for (int ai = 0; ai < node->call.arg_count; ai++) {
             Node *arg = node->call.args[ai];
             if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
                 Node *operand = arg->unary.operand;
-                /* walk through field/index to root ident */
                 while (operand && (operand->kind == NODE_FIELD || operand->kind == NODE_INDEX)) {
                     if (operand->kind == NODE_FIELD) operand = operand->field.object;
                     else operand = operand->index_expr.object;
@@ -4204,6 +4202,21 @@ static Type *check_expr(Checker *c, Node *node) {
                         r->max_val = INT64_MAX;
                         r->known_nonzero = false;
                     }
+                }
+            }
+        }
+        /* BUG-478: Any function call might modify global variables.
+         * Invalidate VRP ranges for all globals in the range stack.
+         * Skip comptime calls (pure, no side effects). */
+        if (!node->call.is_comptime_resolved) {
+            for (int ri = 0; ri < c->var_range_count; ri++) {
+                struct VarRange *r = &c->var_ranges[ri];
+                /* Check if this range entry is for a global variable */
+                Symbol *rsym = scope_lookup_local(c->global_scope, r->name, r->name_len);
+                if (rsym && !rsym->is_function && !rsym->is_const) {
+                    r->min_val = INT64_MIN;
+                    r->max_val = INT64_MAX;
+                    r->known_nonzero = false;
                 }
             }
         }
@@ -6638,6 +6651,40 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-479: VRP invalidation when address of local is taken.
+         * *u32 p = &idx — idx's range becomes permanently unreliable
+         * (p[0] = X can change it at any time). Mark address_taken so
+         * push_var_range won't re-narrow after guards. */
+        if (node->var_decl.init && type &&
+            type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+            Node *init_val = node->var_decl.init;
+            if (init_val->kind == NODE_UNARY && init_val->unary.op == TOK_AMP) {
+                Node *operand = init_val->unary.operand;
+                while (operand && (operand->kind == NODE_FIELD || operand->kind == NODE_INDEX)) {
+                    if (operand->kind == NODE_FIELD) operand = operand->field.object;
+                    else operand = operand->index_expr.object;
+                }
+                if (operand && operand->kind == NODE_IDENT) {
+                    struct VarRange *r = find_var_range(c, operand->ident.name,
+                        (uint32_t)operand->ident.name_len);
+                    if (r) {
+                        r->min_val = INT64_MIN;
+                        r->max_val = INT64_MAX;
+                        r->known_nonzero = false;
+                        r->address_taken = true;
+                    } else {
+                        /* No existing range — push one with address_taken flag */
+                        push_var_range(c, operand->ident.name,
+                            (uint32_t)operand->ident.name_len,
+                            INT64_MIN, INT64_MAX, false);
+                        r = find_var_range(c, operand->ident.name,
+                            (uint32_t)operand->ident.name_len);
+                        if (r) r->address_taken = true;
+                    }
+                }
+            }
+        }
+
         /* Value range propagation: track literal init values */
         if (node->var_decl.init && type && type_is_integer(type)) {
             int64_t val = eval_const_expr(node->var_decl.init);
@@ -7147,6 +7194,18 @@ static void check_stmt(Checker *c, Node *node) {
                         cap_const = switch_src_const; /* BUG-326 */
                         if (cap_const) cap_type->pointer.is_const = true;
                     } else {
+                        /* BUG-480: move struct value capture in switch creates copy —
+                         * two owners of unique resource. Force pointer capture.
+                         * Same pattern as V13 if-unwrap (line ~6794). */
+                        {
+                            Type *vt_eff = type_unwrap_distinct(variant_type);
+                            if (vt_eff && vt_eff->kind == TYPE_STRUCT && vt_eff->struct_type.is_move) {
+                                checker_error(c, arm->loc.line,
+                                    "move struct cannot be captured by value in switch — "
+                                    "use |*%.*s| for pointer capture",
+                                    (int)arm->capture_name_len, arm->capture_name);
+                            }
+                        }
                         cap_type = variant_type;
                         cap_const = true;
                     }
@@ -7158,6 +7217,16 @@ static void check_stmt(Checker *c, Node *node) {
                         cap_const = switch_src_const; /* BUG-326 */
                         if (cap_const) cap_type->pointer.is_const = true;
                     } else {
+                        /* BUG-480: same move struct check for optional switch */
+                        {
+                            Type *uw_eff = type_unwrap_distinct(unwrapped);
+                            if (uw_eff && uw_eff->kind == TYPE_STRUCT && uw_eff->struct_type.is_move) {
+                                checker_error(c, arm->loc.line,
+                                    "move struct cannot be captured by value in switch — "
+                                    "use |*%.*s| for pointer capture",
+                                    (int)arm->capture_name_len, arm->capture_name);
+                            }
+                        }
                         cap_type = unwrapped;
                         cap_const = true;
                     }
@@ -8319,13 +8388,17 @@ static void register_decl(Checker *c, Node *node) {
             memcpy(aname_copy, aname, alen + 1);
             add_symbol_internal(c, aname_copy, alen, async_type, node->loc.line);
 
-            /* Register _zer_async_funcname_init as function taking *async_type */
+            /* Register _zer_async_funcname_init as function taking *async_type + original params (BUG-477) */
             char iname[256];
             int ilen = snprintf(iname, sizeof(iname), "_zer_async_%.*s_init",
                 (int)node->func_decl.name_len, node->func_decl.name);
-            Type **ip = (Type **)arena_alloc(c->arena, sizeof(Type *));
+            int init_pc = 1 + node->func_decl.param_count; /* *self + original params */
+            Type **ip = (Type **)arena_alloc(c->arena, init_pc * sizeof(Type *));
             ip[0] = type_pointer(c->arena, async_type);
-            Type *init_ft = type_func_ptr(c->arena, ip, 1, ty_void);
+            for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+                ip[1 + pi] = resolve_type(c, node->func_decl.params[pi].type);
+            }
+            Type *init_ft = type_func_ptr(c->arena, ip, init_pc, ty_void);
             char *iname_copy = arena_alloc(c->arena, ilen + 1);
             memcpy(iname_copy, iname, ilen + 1);
             Symbol *isym = add_symbol_internal(c, iname_copy, ilen, init_ft, node->loc.line);
@@ -8901,6 +8974,11 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
  * For unsigned types, min is clamped to 0 (can't be negative). */
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero) {
+    /* BUG-479: skip narrowing for address-taken variables — pointer alias
+     * may modify the value, so guard-narrowed range is unreliable. */
+    struct VarRange *existing = find_var_range(c, name, name_len);
+    if (existing && existing->address_taken) return;
+
     /* clamp min to 0 for unsigned variables */
     if (min_val < 0) {
         Symbol *sym = scope_lookup(c->current_scope, name, name_len);
@@ -8909,7 +8987,6 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
         }
     }
     /* intersect with existing range if present */
-    struct VarRange *existing = find_var_range(c, name, name_len);
     if (existing) {
         if (existing->min_val > min_val) min_val = existing->min_val;
         if (existing->max_val < max_val) max_val = existing->max_val;
@@ -8927,6 +9004,7 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
     r->min_val = min_val;
     r->max_val = max_val;
     r->known_nonzero = known_nonzero;
+    r->address_taken = false;
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */

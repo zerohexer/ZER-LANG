@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-12 — Gemini Red Team Round 3 (4 bugs from 4 reports)
+
+### BUG-477: Async function parameters not promoted to state struct
+**Symptom:** `async void worker(u32 x) { yield; u32 after = x; }` — GCC error "undeclared identifier 'x'" in poll function. Parameter not in state struct.
+**Root cause:** `collect_async_locals` only scanned NODE_VAR_DECL — function params (ParamDecl) were skipped. After yield, `x` referenced in poll but never declared.
+**Fix:** In `emit_async_func`: (1) add params to `async_locals` list so `is_async_local()` emits `self->x`, (2) add params as fields in state struct typedef, (3) update init function signature to accept original params and store in struct. Checker auto-registration updated: init takes `*self + original params`.
+**Test:** `rust_tests/rt_async_param_yield.zer`
+
+### BUG-478: VRP not invalidated for global variables after function call
+**Symptom:** `if (g_idx < 10) { sneaky(); arr[g_idx] = 42; }` where `sneaky()` sets g_idx=100 — bounds check eliminated based on stale range [0,9].
+**Root cause:** VRP only invalidated ranges for variables passed via `&var` (BUG-475). Any function call can modify globals through direct access, but globals weren't invalidated.
+**Fix:** After NODE_CALL processing, scan VRP stack for global variables (via `scope_lookup_local(global_scope)`). Invalidate non-const globals' ranges. Skip comptime calls (pure, no side effects).
+**Test:** `rust_tests/rt_vrp_global_safe.zer`
+
+### BUG-479: VRP range re-narrowed after address taken via pointer alias
+**Symptom:** `*u32 p = &idx; if (idx >= 4) return; p[0] = 100; arr[idx]` — guard re-narrowed idx to [0,3] after `&idx` invalidation, but `p[0]=100` changed idx through alias.
+**Root cause:** VRP invalidation at var-decl time was overridden by subsequent guard narrowing. Once a pointer to a variable exists, the variable's range can never be trusted.
+**Fix:** Added `bool address_taken` flag to `struct VarRange`. When `*T p = &var` is detected, the aliased variable's range is set to [INT64_MIN, INT64_MAX] with `address_taken=true`. `push_var_range` skips narrowing for `address_taken` entries — guards cannot re-narrow.
+**Test:** `rust_tests/rt_vrp_ptr_alias_safe.zer`
+
+### BUG-480: Move struct value capture in switch creates copy
+**Symptom:** `switch (m) { .k => |val| { consume(val); } }` compiled — `val` is a copy of move struct Key, creating two owners. Double switch extraction allowed.
+**Root cause:** NODE_SWITCH capture handler didn't check for move struct types. Only if-unwrap (V13) had the check.
+**Fix:** Both union-switch and optional-switch value capture paths now check `type_unwrap_distinct(type)->kind == TYPE_STRUCT && struct_type.is_move`. Move struct → compile error "use |*val| for pointer capture". Same pattern as V13 if-unwrap.
+**Test:** `rust_tests/reject_move_switch_capture.zer`, `rust_tests/rt_move_switch_ptr_capture.zer`
+
 ## Session 2026-04-12 — Gemini Red Team Round 2 (3 bugs from 7 reports)
 
 ### BUG-474: Transitive deadlock detection limited to depth 4

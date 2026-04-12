@@ -1031,6 +1031,28 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 3 (2026-04-12, Gemini — 4 claims, 4 real bugs)
+
+**Summary:** Third Gemini red team audit. All 4 claims were real bugs.
+
+### BUG-477: Async function parameters not in state struct
+`async void worker(u32 x) { yield; u32 after = x; }` — `x` undeclared in poll function. `collect_async_locals` only scanned NODE_VAR_DECL. Fix: add params to async_locals list + state struct fields + init function signature. Checker init registration updated to include original params.
+
+### BUG-478: VRP global variable ranges not invalidated after function call
+`if (g_idx < 10) { sneaky(); arr[g_idx]; }` where `sneaky()` sets g_idx=100. Fix: after NODE_CALL, scan VRP stack for global variables and wipe their ranges. Skip comptime calls (pure).
+
+### BUG-479: VRP address-taken flag for pointer aliasing
+`*u32 p = &idx; if (idx >= 4) return; p[0] = 100; arr[idx]` — guard re-narrowed idx after invalidation. Fix: `address_taken` flag on `struct VarRange`. When `*T p = &var`, flag the aliased variable. `push_var_range` skips narrowing for `address_taken` entries — guards cannot override.
+
+**VRP architecture after BUG-475/478/479:**
+Three invalidation triggers:
+1. `&var` passed to function call → wipe var's range (BUG-475)
+2. Any function call → wipe all global variable ranges (BUG-478)
+3. `*T p = &var` in var-decl → mark var as `address_taken`, permanently prevent narrowing (BUG-479)
+
+### BUG-480: Move struct value capture in switch
+`switch (m) { .k => |val| { ... } }` where val is move struct — creates copy, two owners. Fix: same check as V13 (if-unwrap): `type_unwrap_distinct(type)->kind == TYPE_STRUCT && is_move` → error "use |*val|". Applied to both union-switch and optional-switch capture paths.
+
 ## Red Team Audit Fixes — Round 2 (2026-04-12, Gemini — 7 claims, 3 real bugs)
 
 **Summary:** Second Gemini red team audit. 7 attack vectors tested, 3 real bugs found (BUG-474/475/476), 4 false or already-handled.

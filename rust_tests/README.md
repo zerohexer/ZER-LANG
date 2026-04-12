@@ -1,6 +1,6 @@
 # ZER Safety Test Suite
 
-792 tests (553 positive, 239 negative), 0 failures. Updated 2026-04-12.
+796 tests (556 positive, 240 negative), 0 failures. Updated 2026-04-12.
 Runner: `run_tests.sh` — auto-detects negative tests via `reject` in name or `EXPECTED: compile error` in file.
 
 ## How to Use This File

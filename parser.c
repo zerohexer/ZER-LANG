@@ -301,10 +301,15 @@ static TypeNode *parse_base_type(Parser *p) {
 
     case TOK_SEMAPHORE: {
         advance(p);
-        consume(p, TOK_LPAREN, "expected '(' after 'Semaphore'");
         TypeNode *t = new_type_node(p, TYNODE_SEMAPHORE);
-        t->semaphore.count_expr = parse_expression(p);
-        consume(p, TOK_RPAREN, "expected ')' after Semaphore(N)");
+        t->semaphore.count_expr = NULL;
+        if (check(p, TOK_LPAREN)) {
+            /* Semaphore(N) — declaration with count */
+            advance(p);
+            t->semaphore.count_expr = parse_expression(p);
+            consume(p, TOK_RPAREN, "expected ')' after Semaphore(N)");
+        }
+        /* bare Semaphore — pointer/param type reference (count from original) */
         return t;
     }
 

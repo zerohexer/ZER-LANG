@@ -2286,6 +2286,28 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (sym && sym->is_const) {
                         result->pointer.is_const = true;
                     }
+                    /* BUG-479: mark variable as address-taken in VRP.
+                     * Once &var exists ANYWHERE, VRP range is permanently
+                     * unreliable — pointer writes can change value at any time.
+                     * Covers ALL paths: var-decl init, assignment, call args,
+                     * struct field store, return. Single check point = 100%. */
+                    {
+                        struct VarRange *r = find_var_range(c,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (r) {
+                            r->min_val = INT64_MIN;
+                            r->max_val = INT64_MAX;
+                            r->known_nonzero = false;
+                            r->address_taken = true;
+                        } else {
+                            push_var_range(c, root->ident.name,
+                                (uint32_t)root->ident.name_len,
+                                INT64_MIN, INT64_MAX, false);
+                            r = find_var_range(c, root->ident.name,
+                                (uint32_t)root->ident.name_len);
+                            if (r) r->address_taken = true;
+                        }
+                    }
                     /* BUG-208: block &union_var inside mutable capture arm. */
                     if (c->union_switch_var &&
                         root->ident.name_len == c->union_switch_var_len &&
@@ -6651,39 +6673,9 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-479: VRP invalidation when address of local is taken.
-         * *u32 p = &idx — idx's range becomes permanently unreliable
-         * (p[0] = X can change it at any time). Mark address_taken so
-         * push_var_range won't re-narrow after guards. */
-        if (node->var_decl.init && type &&
-            type_unwrap_distinct(type)->kind == TYPE_POINTER) {
-            Node *init_val = node->var_decl.init;
-            if (init_val->kind == NODE_UNARY && init_val->unary.op == TOK_AMP) {
-                Node *operand = init_val->unary.operand;
-                while (operand && (operand->kind == NODE_FIELD || operand->kind == NODE_INDEX)) {
-                    if (operand->kind == NODE_FIELD) operand = operand->field.object;
-                    else operand = operand->index_expr.object;
-                }
-                if (operand && operand->kind == NODE_IDENT) {
-                    struct VarRange *r = find_var_range(c, operand->ident.name,
-                        (uint32_t)operand->ident.name_len);
-                    if (r) {
-                        r->min_val = INT64_MIN;
-                        r->max_val = INT64_MAX;
-                        r->known_nonzero = false;
-                        r->address_taken = true;
-                    } else {
-                        /* No existing range — push one with address_taken flag */
-                        push_var_range(c, operand->ident.name,
-                            (uint32_t)operand->ident.name_len,
-                            INT64_MIN, INT64_MAX, false);
-                        r = find_var_range(c, operand->ident.name,
-                            (uint32_t)operand->ident.name_len);
-                        if (r) r->address_taken = true;
-                    }
-                }
-            }
-        }
+        /* BUG-479: address_taken VRP invalidation now handled in check_expr
+         * TOK_AMP handler — covers ALL &var sites (var-decl, assign, call arg,
+         * struct field, return). No per-site duplicate code needed. */
 
         /* Value range propagation: track literal init values */
         if (node->var_decl.init && type && type_is_integer(type)) {

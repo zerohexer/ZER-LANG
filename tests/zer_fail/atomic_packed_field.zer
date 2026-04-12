@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// BUG-493: Atomic on packed struct field — misaligned on ARM/RISC-V
+packed struct Regs { u8 status; u32 counter; }
+Regs r;
+u32 main() {
+    @atomic_add(&r.counter, 1);
+    return 0;
+}

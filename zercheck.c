@@ -991,7 +991,9 @@ static void zc_report_invalid_use(ZerCheck *zc, HandleInfo *h, int line,
 }
 
 /* Lazily register a move struct variable in PathState if not already tracked.
- * Called when we encounter a NODE_IDENT whose type is a move struct. */
+ * Called when we encounter a NODE_IDENT whose type is a move struct.
+ * Uses find_handle (any scope) — this is a USE site, not a declaration site.
+ * Shadow handling only at NODE_VAR_DECL (via find_handle_local). */
 static HandleInfo *zc_ensure_move_registered(ZerCheck *zc, PathState *ps,
                                               const char *name, uint32_t len, int line) {
     HandleInfo *h = find_handle(ps, name, len);
@@ -1704,6 +1706,28 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
         zc_check_var_init(zc, ps, node);
         if (node->var_decl.init)
             zc_check_expr(zc, ps, node->var_decl.init);
+        /* BUG-494: eagerly register move struct var-decl at current scope.
+         * Without this, inner K x shadows outer K x but has no handle.
+         * find_handle in consume(x) finds the OUTER handle → wrong transfer.
+         * Eager registration at var-decl ensures inner scope handle exists
+         * BEFORE any use. find_handle (highest depth) then returns inner. */
+        {
+            Type *vt = checker_get_type(zc->checker, node);
+            if (vt && is_move_struct_type(type_unwrap_distinct(vt))) {
+                HandleInfo *eh = find_handle_local(ps, node->var_decl.name,
+                    (uint32_t)node->var_decl.name_len);
+                if (!eh) {
+                    eh = add_handle(ps, node->var_decl.name,
+                        (uint32_t)node->var_decl.name_len);
+                    if (eh) {
+                        eh->state = HS_ALIVE;
+                        eh->pool_id = -3;
+                        eh->alloc_line = node->loc.line;
+                        eh->alloc_id = zc->next_alloc_id++;
+                    }
+                }
+            }
+        }
         /* Move struct transfer AFTER expr check to avoid false positive:
          * Token b = a; — zc_check_expr sees a as ALIVE, then we transfer.
          * Also handles: Token b = arr[0]; and Token b = s.field; (compound keys)

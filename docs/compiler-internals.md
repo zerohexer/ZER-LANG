@@ -1031,6 +1031,44 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 4 (2026-04-12, Gemini — 4 claims, 1 real bug)
+
+**Summary:** Fourth Gemini audit. 1 real bug (async orelse stack ghost), 1 doc fix (ABA gen counter), 2 false (auto-lock group + VRP coercion).
+
+### BUG-481: Async yield in orelse — state struct temp promotion (proper fix)
+`u32 x = maybe_get() orelse { yield; 42; }` — `_zer_tmp0` is stack local, stale after yield+resume.
+
+**Architecture (same as Rust's MIR generator transform):**
+1. `prescan_async_temps(e, body)` — recursive pre-scan finds NODE_ORELSE with block fallback in async body. Records `AsyncTemp` entries with type + temp_id.
+2. `emit_async_func` adds `_zer_async_tmpN` fields to state struct typedef.
+3. In async var-decl orelse path: split GCC statement expression into separate statements using `self->_zer_async_tmpN`. Temp survives yield.
+
+Non-async code unchanged (efficient GCC statement expression). No language restriction — yield inside orelse blocks now works correctly.
+
+### Not bugs (V12, V15)
+- V12: auto-lock group — per-statement locking, unlock before return
+- V15: VRP array coercion — slice doesn't alias local variables
+
+## Proper Fixes — BUG-474 Call Graph DFS + BUG-479 VRP 100% (2026-04-12)
+
+### BUG-474 proper: Deadlock detection via call graph DFS
+Replaced `_shared_scan_depth < 8` depth limit with memoized DFS.
+
+**`FuncSharedTypes` cache on Checker struct:** `func_name → set of shared type_ids`. `compute_func_shared_types()` does DFS with `in_progress` (cycle detection) + `computed` (memoization). `scan_body_shared_types()` walks full AST. Each function computed once. `collect_shared_types_in_expr` NODE_CALL does O(1) cache lookup.
+
+Handles: any call depth (tested at 20), mutual recursion (ping/pong cycles), no false positives on separate statements.
+
+### BUG-479 proper: VRP address_taken at TOK_AMP handler
+Moved from per-site invalidation to SINGLE check point at `check_expr(NODE_UNARY, TOK_AMP)`. Every `&var` expression marks root variable's VarRange as `address_taken=true`. `push_var_range` skips narrowing for `address_taken` entries.
+
+**Correctness argument:** ZER has no pointer arithmetic. `&var` is the ONLY way to create a pointer to a variable. Single check point = 100% alias coverage without points-to analysis.
+
+**VRP architecture after all fixes (BUG-475/478/479):**
+1. `&var` in any expression → `address_taken=true`, range permanently invalid (TOK_AMP handler)
+2. `&var` passed to function call → range wiped (NODE_CALL handler, redundant with #1 but defense-in-depth)
+3. Any function call → global variable ranges wiped (NODE_CALL handler)
+4. Comptime calls exempt (pure, no side effects)
+
 ## Red Team Audit Fixes — Round 3 (2026-04-12, Gemini — 4 claims, 4 real bugs)
 
 **Summary:** Third Gemini red team audit. All 4 claims were real bugs.

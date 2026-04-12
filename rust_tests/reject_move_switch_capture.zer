@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Move struct cannot be value-captured in switch — creates copy (BUG-480)
+
+move struct Key { u32 id; }
+union Msg { Key k; u32 other; }
+
+u32 main() {
+    Msg m;
+    m.k.id = 1;
+    switch (m) {
+        .k => |val| { u32 x = val.id; }
+        .other => { }
+    }
+    return 0;
+}

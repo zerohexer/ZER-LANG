@@ -1,0 +1,12 @@
+// Async function parameter preserved after yield (BUG-477)
+async void worker(u32 x) {
+    yield;
+    u32 after = x;
+}
+u32 main() {
+    _zer_async_worker task;
+    _zer_async_worker_init(&task, 42);
+    _zer_async_worker_poll(&task);
+    _zer_async_worker_poll(&task);
+    return 0;
+}

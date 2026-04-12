@@ -92,6 +92,7 @@ typedef struct {
         int64_t min_val;
         int64_t max_val;
         bool known_nonzero;
+        bool address_taken;  /* BUG-479: &var taken — range permanently invalid, cannot be narrowed */
     } *var_ranges;
     int var_range_count;
     int var_range_capacity;

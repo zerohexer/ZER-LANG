@@ -1,16 +1,10 @@
-// VRP range invalidated when &var passed to function — auto-guard inserted
-// idx range wiped after modify(&idx), bounds check NOT skipped
-
+// VRP invalidated when &var taken — pointer can modify via alias (BUG-479)
 u32[4] arr;
-
-void modify(*u32 p) {
-    p[0] = 3;
-}
-
 u32 main() {
-    u32 idx = 2;
+    u32 idx = 0;
+    *u32 p = &idx;
     if (idx >= 4) { return 1; }
-    modify(&idx);
+    p[0] = 3;
     arr[idx] = 42;
     if (arr[3] != 42) { return 1; }
     return 0;

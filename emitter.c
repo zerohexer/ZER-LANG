@@ -4275,11 +4275,41 @@ static void emit_async_func(Emitter *e, Node *node) {
 
     /* Collect local variables for the state struct */
     e->async_local_count = 0;
+    /* BUG-477: also promote function parameters to state struct.
+     * Without this, params are undeclared in the poll function after yield. */
+    for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+        ParamDecl *p = &node->func_decl.params[pi];
+        if (e->async_local_count >= e->async_local_capacity) {
+            int nc = e->async_local_capacity < 8 ? 8 : e->async_local_capacity * 2;
+            const char **nls = (const char **)arena_alloc(e->arena, nc * sizeof(const char *));
+            size_t *nlens = (size_t *)arena_alloc(e->arena, nc * sizeof(size_t));
+            if (e->async_locals) {
+                memcpy(nls, e->async_locals, e->async_local_count * sizeof(const char *));
+                memcpy(nlens, e->async_local_lens, e->async_local_count * sizeof(size_t));
+            }
+            e->async_locals = nls;
+            e->async_local_lens = nlens;
+            e->async_local_capacity = nc;
+        }
+        e->async_locals[e->async_local_count] = p->name;
+        e->async_local_lens[e->async_local_count] = p->name_len;
+        e->async_local_count++;
+    }
     collect_async_locals(e, body);
 
     /* Emit state struct typedef */
     emit(e, "typedef struct {\n");
     emit(e, "    int _zer_state;\n");
+    /* Emit function parameters as struct fields (BUG-477) */
+    for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+        ParamDecl *p = &node->func_decl.params[pi];
+        Type *pt = resolve_tynode(e, p->type);
+        if (pt) {
+            emit(e, "    ");
+            emit_type_and_name(e, pt, p->name, p->name_len);
+            emit(e, ";\n");
+        }
+    }
     /* Emit each local as a struct field */
     if (body->kind == NODE_BLOCK) {
         for (int i = 0; i < body->block.stmt_count; i++) {
@@ -4296,10 +4326,23 @@ static void emit_async_func(Emitter *e, Node *node) {
     }
     emit(e, "} _zer_async_%.*s;\n\n", flen, fname);
 
-    /* Emit init function */
-    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self) {\n",
-         flen, fname, flen, fname);
+    /* Emit init function — accepts async function params (BUG-477) */
+    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self", flen, fname, flen, fname);
+    for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+        ParamDecl *p = &node->func_decl.params[pi];
+        Type *pt = resolve_tynode(e, p->type);
+        if (pt) {
+            emit(e, ", ");
+            emit_type_and_name(e, pt, p->name, p->name_len);
+        }
+    }
+    emit(e, ") {\n");
     emit(e, "    memset(self, 0, sizeof(*self));\n");
+    for (int pi = 0; pi < node->func_decl.param_count; pi++) {
+        ParamDecl *p = &node->func_decl.params[pi];
+        emit(e, "    self->%.*s = %.*s;\n", (int)p->name_len, p->name,
+             (int)p->name_len, p->name);
+    }
     emit(e, "}\n\n");
 
     /* Emit poll function */

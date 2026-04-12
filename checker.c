@@ -5058,12 +5058,10 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (node->orelse.fallback) {
             if (node->orelse.fallback->kind == NODE_BLOCK) {
                 /* orelse { block } — statement-only, no result type.
-                 * Block runs on null. Per spec: cannot be used as expression.
-                 * BUG-481: ban yield/await inside — orelse emits as GCC statement
-                 * expression with stack temps that are stale after yield/resume. */
-                c->orelse_depth++;
+                 * Yield inside: safe at var-decl level (BUG-481 state struct temps).
+                 * Unsafe at expression level — caught by GCC ("switch jumps into
+                 * statement expression"). No checker ban needed. */
                 check_stmt(c, node->orelse.fallback);
-                c->orelse_depth--;
                 result = unwrapped;
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
@@ -8063,9 +8061,12 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_YIELD:
-        /* yield — suspend current async task, no operands.
-         * BUG-481: yield inside orelse block was previously banned.
-         * Now safe — async orelse uses state struct temps (proper fix). */
+        /* yield — suspend current async task.
+         * BUG-481: yield in orelse at var-decl level = safe (state struct temps).
+         * BUG-495: yield in orelse at expression level = GCC error
+         * ("switch jumps into statement expression"). This is a GCC limitation —
+         * case labels can't be inside ({...}). The developer must extract to var-decl.
+         * No checker ban needed — GCC catches it with a clear error message. */
         break;
 
     case NODE_AWAIT: {

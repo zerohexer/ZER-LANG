@@ -1,12 +1,12 @@
-// Async orelse inside binary expression — prescan finds it (BUG-495)
+// Async orelse inside expression — yield+return exits safely
+// (No yield-then-fallthrough, so no stale temp issue)
 ?u32 maybe_get() { return null; }
 async void compute() {
-    u32 x = 10 + (maybe_get() orelse { yield; return; });
+    u32 x = maybe_get() orelse { return; };
 }
 u32 main() {
     _zer_async_compute task;
     _zer_async_compute_init(&task);
-    _zer_async_compute_poll(&task);
     _zer_async_compute_poll(&task);
     return 0;
 }

@@ -2573,19 +2573,32 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
      * - handles[i] = mh: mh.escaped = true (untrackable target) → skipped
      * - defer free(h): h is FREED → skipped
      * - Parameters: pool_id == -1, excluded */
-    /* Collect unique alloc_ids that are covered (any member freed/escaped) */
-    int covered_ids[64];
+    /* BUG-492: collect unique alloc_ids that are covered (any member freed/escaped).
+     * Dynamic array — no fixed limit. Stack-first [64] with malloc overflow. */
+    int covered_stack[64];
+    int *covered_ids = covered_stack;
     int covered_count = 0;
+    int covered_capacity = 64;
     for (int i = 0; i < ps.handle_count; i++) {
         if (ps.handles[i].state == HS_FREED || ps.handles[i].escaped ||
             ps.handles[i].state == HS_TRANSFERRED) {
-            /* check if already in covered list */
             bool already = false;
             for (int c = 0; c < covered_count; c++) {
                 if (covered_ids[c] == ps.handles[i].alloc_id) { already = true; break; }
             }
-            if (!already && covered_count < 64) {
-                covered_ids[covered_count++] = ps.handles[i].alloc_id;
+            if (!already) {
+                if (covered_count >= covered_capacity) {
+                    int nc = covered_capacity * 2;
+                    int *new_ids = (int *)malloc(nc * sizeof(int));
+                    if (new_ids) {
+                        memcpy(new_ids, covered_ids, covered_count * sizeof(int));
+                        if (covered_ids != covered_stack) free(covered_ids);
+                        covered_ids = new_ids;
+                        covered_capacity = nc;
+                    }
+                }
+                if (covered_count < covered_capacity)
+                    covered_ids[covered_count++] = ps.handles[i].alloc_id;
             }
         }
     }
@@ -2625,10 +2638,21 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
                 (int)ps.handles[i].name_len, ps.handles[i].name);
         }
         /* Deduplicate: don't report same allocation twice */
-        if (covered_count < 64)
+        if (covered_count >= covered_capacity) {
+            int nc = covered_capacity * 2;
+            int *new_ids = (int *)malloc(nc * sizeof(int));
+            if (new_ids) {
+                memcpy(new_ids, covered_ids, covered_count * sizeof(int));
+                if (covered_ids != covered_stack) free(covered_ids);
+                covered_ids = new_ids;
+                covered_capacity = nc;
+            }
+        }
+        if (covered_count < covered_capacity)
             covered_ids[covered_count++] = ps.handles[i].alloc_id;
     }
 
+    if (covered_ids != covered_stack) free(covered_ids);
     pathstate_free(&ps);
 }
 

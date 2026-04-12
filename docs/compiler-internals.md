@@ -1031,6 +1031,19 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 8 (2026-04-13, Gemini — 4 claims, 3 real bugs)
+
+**Summary:** Eighth Gemini audit. 3 real bugs (BUG-490/491/492), 1 false (V39 = per-statement-group locking, same as V12).
+
+### BUG-490: Async sub-block locals — recursive collect_async_locals
+`collect_async_locals` was top-level only. Sub-block, if-body, loop-body locals stayed on C stack — stale after yield. Fix: fully recursive scan into all block types. `add_async_local` helper with dedup by name. State struct field emission also recursive (iterative stack traversal). Every local in an async function is now promoted regardless of scope depth.
+
+### BUG-491: Spawn qualifier validation
+NODE_SPAWN validated shared vs non-shared but skipped const/volatile qualifier checks. Fix: after pointer safety check, resolve function param types and validate qualifiers. Same checks as NODE_CALL handler (const→mutable = error, volatile→non-volatile = error).
+
+### BUG-492: Dynamic covered_ids (no fixed buffers)
+`covered_ids[64]` silently dropped allocations 65+. Fix: stack-first dynamic pattern (`int stack[64]; int *arr = stack; int cap = 64;` with realloc). **Rule added to CLAUDE.md: NEVER use fixed-size buffers for dynamic data.** Same pattern as parser RF9.
+
 ## Red Team Audit Fixes — Round 7 (2026-04-12, Gemini — 5 claims, 2 real bugs)
 
 **Summary:** Seventh Gemini audit. 2 real bugs (BUG-488/489), 3 false/design.

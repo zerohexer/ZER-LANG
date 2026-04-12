@@ -485,7 +485,10 @@ int main(int argc, char **argv) {
     Emitter emitter;
     emitter_init(&emitter, out, &cc.arena, &checker);
     emitter.lib_mode = no_preamble;
-    emitter.track_cptrs = track_cptrs || (!release_mode && do_run);
+    /* track_cptrs: _zer_opaque wrapping + _zer_check_alive + --wrap=malloc.
+     * Always on for --run (including --release) — compiled-in safety, not debug.
+     * Only disabled without explicit --track-cptrs when emitting C library (--lib). */
+    emitter.track_cptrs = track_cptrs || do_run;
     emitter.source_file = input_path;
 
     /* emit in topological order (reuse topo_order from registration):

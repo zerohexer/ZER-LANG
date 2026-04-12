@@ -1186,6 +1186,42 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_ASSIGN:
         zc_check_expr(zc, ps, node->assign.target);
         zc_check_expr(zc, ps, node->assign.value);
+        /* BUG-487: union variant overwrite leaks move struct.
+         * m.id = 100 when m.k (move struct) is ALIVE → resource leaked.
+         * Check if target is union field and any sibling variant is tracked+ALIVE. */
+        if (node->assign.target->kind == NODE_FIELD) {
+            Node *obj = node->assign.target->field.object;
+            if (obj && obj->kind == NODE_IDENT) {
+                Type *obj_type = checker_get_type(zc->checker, obj);
+                Type *obj_eff = obj_type ? type_unwrap_distinct(obj_type) : NULL;
+                if (obj_eff && obj_eff->kind == TYPE_UNION) {
+                    /* Check if any variant of this union has a tracked move struct */
+                    const char *uname = obj->ident.name;
+                    uint32_t ulen = (uint32_t)obj->ident.name_len;
+                    const char *assigned_variant = node->assign.target->field.field_name;
+                    uint32_t av_len = (uint32_t)node->assign.target->field.field_name_len;
+                    for (int hi = 0; hi < ps->handle_count; hi++) {
+                        HandleInfo *h = &ps->handles[hi];
+                        if (h->state != HS_ALIVE || h->pool_id != -3) continue;
+                        /* Check if this handle is a variant of the same union: "m.k" */
+                        if (h->name_len > ulen + 1 &&
+                            memcmp(h->name, uname, ulen) == 0 &&
+                            h->name[ulen] == '.') {
+                            /* Different variant than what we're assigning? */
+                            const char *tracked_variant = h->name + ulen + 1;
+                            uint32_t tv_len = h->name_len - ulen - 1;
+                            if (tv_len != av_len || memcmp(tracked_variant, assigned_variant, av_len) != 0) {
+                                zc_error(zc, node->loc.line,
+                                    "union variant overwrite leaks move struct: '%.*s' is alive "
+                                    "(allocated at line %d) — assigning to '%.*s.%.*s' overwrites it",
+                                    (int)h->name_len, h->name, h->alloc_line,
+                                    (int)ulen, uname, (int)av_len, assigned_variant);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         /* BUG-361/357: handle assignment from pool.alloc() — works for globals,
          * array elements, struct fields.
          * arr[0] = pool.alloc() orelse return → register "arr[0]" in PathState */

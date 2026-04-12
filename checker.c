@@ -2346,6 +2346,37 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = false;
         Type *value = check_expr(c, node->assign.value);
 
+        /* BUG-487: union variant assignment may overwrite move struct.
+         * m.id = 100 when m.k (move struct variant) might be active → resource leak.
+         * Only fires for unions that contain at least one move struct variant. */
+        if (node->assign.target->kind == NODE_FIELD) {
+            Node *uobj = node->assign.target->field.object;
+            if (uobj && uobj->kind == NODE_IDENT) {
+                Symbol *usym = scope_lookup(c->current_scope, uobj->ident.name,
+                    (uint32_t)uobj->ident.name_len);
+                if (usym && usym->type) {
+                    Type *ueff = type_unwrap_distinct(usym->type);
+                    if (ueff && ueff->kind == TYPE_UNION) {
+                        /* check if ANY variant is a move struct */
+                        bool has_move_variant = false;
+                        for (uint32_t vi = 0; vi < ueff->union_type.variant_count; vi++) {
+                            Type *vt = type_unwrap_distinct(ueff->union_type.variants[vi].type);
+                            if (vt && vt->kind == TYPE_STRUCT && vt->struct_type.is_move) {
+                                has_move_variant = true;
+                                break;
+                            }
+                        }
+                        if (has_move_variant) {
+                            checker_error(c, node->loc.line,
+                                "cannot assign to variant of union containing move struct — "
+                                "previous variant's resource may be leaked. "
+                                "Use switch to safely read+destroy before changing variant");
+                        }
+                    }
+                }
+            }
+        }
+
         /* interrupt safety: track compound assignment (|=, +=, etc.) on globals.
          * Walk field/index chains to root ident (catches g_state.flags |= 1). */
         if (node->assign.op != TOK_EQ) {

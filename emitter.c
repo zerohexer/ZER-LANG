@@ -1066,6 +1066,33 @@ static void emit_expr(Emitter *e, Node *node) {
                     break;
                 }
             }
+            /* BUG-485: *opaque comparison — _zer_opaque is a struct when track_cptrs
+             * is active. C can't use == on structs. Compare .ptr fields instead.
+             * *opaque is TYPE_POINTER(TYPE_OPAQUE) in the type system. */
+            if (e->track_cptrs &&
+                (node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ) &&
+                node->binary.left->kind != NODE_NULL_LIT &&
+                node->binary.right->kind != NODE_NULL_LIT) {
+                Type *lt = checker_get_type(e->checker, node->binary.left);
+                Type *rt = checker_get_type(e->checker, node->binary.right);
+                lt = lt ? type_unwrap_distinct(lt) : NULL;
+                rt = rt ? type_unwrap_distinct(rt) : NULL;
+                /* *opaque = TYPE_POINTER with inner TYPE_OPAQUE */
+                bool l_opaque = lt && lt->kind == TYPE_POINTER &&
+                    lt->pointer.inner && lt->pointer.inner->kind == TYPE_OPAQUE;
+                bool r_opaque = rt && rt->kind == TYPE_POINTER &&
+                    rt->pointer.inner && rt->pointer.inner->kind == TYPE_OPAQUE;
+                if (l_opaque || r_opaque) {
+                    emit(e, "(");
+                    emit_expr(e, node->binary.left);
+                    if (l_opaque) emit(e, ".ptr");
+                    emit(e, " %s ", node->binary.op == TOK_EQEQ ? "==" : "!=");
+                    emit_expr(e, node->binary.right);
+                    if (r_opaque) emit(e, ".ptr");
+                    emit(e, ")");
+                    break;
+                }
+            }
             if (needs_narrow_cast) emit(e, "%s", narrow_cast);
             emit(e, "(");
             emit_expr(e, node->binary.left);
@@ -4399,7 +4426,9 @@ static void collect_async_locals(Emitter *e, Node *body) {
     if (!body || body->kind != NODE_BLOCK) return;
     for (int i = 0; i < body->block.stmt_count; i++) {
         Node *s = body->block.stmts[i];
-        if (s->kind == NODE_VAR_DECL) {
+        if (s->kind == NODE_VAR_DECL && !s->var_decl.is_static) {
+            /* BUG-486: skip static locals — they must stay as global C statics,
+             * not be promoted to the instance state struct. */
             if (e->async_local_count >= e->async_local_capacity) {
                 int nc = e->async_local_capacity < 8 ? 8 : e->async_local_capacity * 2;
                 const char **nls = (const char **)arena_alloc(e->arena, nc * sizeof(const char *));
@@ -4491,11 +4520,11 @@ static void emit_async_func(Emitter *e, Node *node) {
             emit(e, ";\n");
         }
     }
-    /* Emit each local as a struct field */
+    /* Emit each local as a struct field (skip static — stays as C static) */
     if (body->kind == NODE_BLOCK) {
         for (int i = 0; i < body->block.stmt_count; i++) {
             Node *s = body->block.stmts[i];
-            if (s->kind == NODE_VAR_DECL) {
+            if (s->kind == NODE_VAR_DECL && !s->var_decl.is_static) {
                 Type *vt = checker_get_type(e->checker, s);
                 if (vt) {
                     emit(e, "    ");

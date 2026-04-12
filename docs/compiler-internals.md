@@ -1031,6 +1031,32 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Rounds 9-10 (2026-04-13, Gemini — 10 claims, 5 real bugs)
+
+### BUG-493: Packed struct atomic → compile error
+@atomic_* on packed struct fields causes hard fault on ARM/RISC-V (misaligned atomics). Checker walks &field operand to root, checks `is_packed`.
+
+### BUG-494: Move struct eager var-decl registration
+Lazy registration (`zc_ensure_move_registered`) found outer handle for inner shadow. Fix: NODE_VAR_DECL eagerly registers move structs at current `scope_depth`. `find_handle` (highest depth) returns inner for inner use. First attempt (shadow logic in `zc_ensure_move_registered`) broke 7 loop tests — declaration-site is the correct location per rule #8.
+
+### BUG-495: Async orelse prescan into expression trees
+`prescan_expr_for_orelse` recursively scans NODE_BINARY, NODE_CALL, NODE_ASSIGN, etc. for nested orelse blocks. Registers state struct temp. Expression-level yield in orelse is a GCC limitation ("switch jumps into statement expression") — not fixable, GCC error message is clear. Var-decl level safe via BUG-481 restructured emission.
+
+### BUG-496: Arena value escape + comptime cleanup
+Arena VALUE (not pointer) stored in global → dangling buf pointer. Fix: checker checks TYPE_ARENA (and struct fields containing Arena), only rejects LOCAL source → global target. Global arena → global = safe.
+
+Comptime `eval_comptime_block`: 6 early return paths skipped `ct_done` cleanup label. Array bindings leaked. All changed to `goto ct_done`.
+
+### Async architecture summary after rounds 4-10
+
+All async locals now promoted to state struct regardless of scope depth:
+- **collect_async_locals**: fully recursive (NODE_BLOCK, NODE_IF, NODE_FOR, NODE_WHILE, NODE_SWITCH, NODE_DEFER, NODE_CRITICAL, NODE_ONCE)
+- **prescan_async_temps**: recursive + `prescan_expr_for_orelse` for expression trees
+- **State struct fields**: params (BUG-477) + all locals (BUG-490) + orelse temps (BUG-481/495) + static excluded (BUG-486)
+- **Emission paths**: var-decl orelse = restructured statements. Expression-level orelse = GCC statement expression (yield = GCC error). Regular locals = `self->name`.
+
+Same approach as Rust's MIR generator transform — promote everything that lives across yield.
+
 ## Red Team Audit Fixes — Round 8 (2026-04-13, Gemini — 4 claims, 3 real bugs)
 
 **Summary:** Eighth Gemini audit. 3 real bugs (BUG-490/491/492), 1 false (V39 = per-statement-group locking, same as V12).

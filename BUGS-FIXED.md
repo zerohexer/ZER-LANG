@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Gemini Red Team Rounds 9-10
+
+### BUG-493: Packed struct atomic rejection
+@atomic_* on packed struct fields causes hard fault on ARM/RISC-V (misaligned). Checker walks &field operand to root struct, checks is_packed → compile error.
+**Test:** `tests/zer_fail/atomic_packed_field.zer`
+
+### BUG-494: Move struct eager var-decl registration
+Inner `K x` shadows outer `K x` — inner `consume(x)` transferred the outer handle because inner had no PathState entry (lazy registration found outer). Fix: NODE_VAR_DECL eagerly registers move struct handles at current scope_depth. find_handle (highest depth) returns inner for inner use.
+**Test:** `tests/zer/move_struct_shadow_scope.zer`
+
+### BUG-495: Async orelse prescan into expression trees
+`prescan_async_temps` only checked direct NODE_ORELSE at var-decl/expr-stmt level. Orelse inside NODE_BINARY/NODE_CALL/etc. missed. Fix: `prescan_expr_for_orelse` recursively scans ALL expression nodes. Var-decl level = state struct temps (BUG-481). Expression level = GCC limitation ("switch jumps into statement expression") — developer extracts to var-decl.
+**Test:** `tests/zer/async_orelse_in_expr.zer`
+
+### BUG-496: Arena value escape to global
+`g_box.a = a` where `a = Arena.over(local_buf)` — Arena struct's buf pointer dangles after function returns. Fix: checker NODE_ASSIGN rejects LOCAL Arena value → global/static target. Global Arena → global is safe (both outlive function). Checks TYPE_ARENA directly and through struct fields.
+**Test:** `tests/zer_fail/arena_value_global_escape.zer`
+
+### BUG-497: Comptime eval_comptime_block early-exit cleanup
+6 error paths in eval_comptime_block did `depth--; return CONST_EVAL_FAIL` skipping array binding cleanup at ct_done label. Fix: all changed to `goto ct_done`. Array bindings freed on all paths.
+
+### Not bugs (Round 9: V43-V45, Round 10: V49-V50)
+- V43: ?*opaque bare return works correctly (emitter handles struct optional)
+- V44: Distinct typedef provenance — type_unwrap_distinct gets underlying type_id
+- V45: Async defer fires correctly before return in resume (emitted before return stmt)
+- V49: VRP conservative for optional unwrap — bounds check present
+- V50: Comptime recursion caught by depth guard (32). Sequential is O(N)
+
 ## Session 2026-04-13 — Gemini Red Team Round 8 (3 real bugs from 4 reports)
 
 ### BUG-490: Async sub-block locals not promoted to state struct

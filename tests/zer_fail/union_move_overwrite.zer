@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// BUG-487: union variant overwrite leaks move struct resource
+
+move struct Key { u32 fd; }
+union Msg { Key k; u32 id; }
+
+u32 main() {
+    Msg m;
+    m.k.fd = 42;
+    m.id = 100;
+    return 0;
+}

@@ -1,0 +1,16 @@
+// *opaque comparison compiles correctly (BUG-485)
+// With track_cptrs, *opaque is _zer_opaque struct — must compare .ptr
+
+void check(*opaque p1, *opaque p2) {
+    if (p1 == p2) { return; }
+    if (p1 != p2) { return; }
+}
+
+u32 main() {
+    u32 a;
+    u32 b;
+    *opaque pa = (*opaque)&a;
+    *opaque pb = (*opaque)&b;
+    check(pa, pb);
+    return 0;
+}

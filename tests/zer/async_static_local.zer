@@ -1,0 +1,15 @@
+// Async static local stays as C static (BUG-486)
+
+async void counter() {
+    static u32 count = 0;
+    count += 1;
+    yield;
+}
+
+u32 main() {
+    _zer_async_counter task;
+    _zer_async_counter_init(&task);
+    _zer_async_counter_poll(&task);
+    _zer_async_counter_poll(&task);
+    return 0;
+}

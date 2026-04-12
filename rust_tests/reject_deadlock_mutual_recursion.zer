@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Deadlock: mutual recursion with shared type access
+
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A ga;
+B gb;
+u32 ping(u32 n);
+u32 pong(u32 n) {
+    if (n == 0) { gb.y = 1; return gb.y; }
+    return ping(n - 1);
+}
+u32 ping(u32 n) {
+    if (n == 0) { return 0; }
+    return pong(n - 1);
+}
+u32 main() {
+    ga.x = ping(5);
+    return 0;
+}

@@ -10061,8 +10061,180 @@ static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
     }
 }
 
-/* Check lock ordering within a block: shared struct accesses must be in ascending type_id.
- * Walks into nested blocks recursively. */
+/* ---- Per-function shared type cache for deadlock detection (BUG-474 proper fix) ----
+ * DFS with memoization + cycle detection. No depth limit. Each function
+ * computed once, result cached. Call graph traversal visits each function
+ * at most once per query chain (in_progress flag = cycle = stop). */
+
+static struct FuncSharedTypes *find_func_shared_cache(Checker *c,
+    const char *name, uint32_t len) {
+    for (int i = 0; i < c->func_shared_cache_count; i++) {
+        if (c->func_shared_cache[i].func_name_len == len &&
+            memcmp(c->func_shared_cache[i].func_name, name, len) == 0)
+            return &c->func_shared_cache[i];
+    }
+    return NULL;
+}
+
+static struct FuncSharedTypes *add_func_shared_cache(Checker *c,
+    const char *name, uint32_t len) {
+    if (c->func_shared_cache_count >= c->func_shared_cache_capacity) {
+        int nc = c->func_shared_cache_capacity < 16 ? 16 : c->func_shared_cache_capacity * 2;
+        c->func_shared_cache = realloc(c->func_shared_cache, nc * sizeof(struct FuncSharedTypes));
+        c->func_shared_cache_capacity = nc;
+    }
+    struct FuncSharedTypes *entry = &c->func_shared_cache[c->func_shared_cache_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->func_name = name;
+    entry->func_name_len = len;
+    return entry;
+}
+
+static void fsc_add_type_id(struct FuncSharedTypes *fsc, uint32_t type_id) {
+    for (int i = 0; i < fsc->type_count; i++)
+        if (fsc->type_ids[i] == type_id) return; /* dedup */
+    if (fsc->type_count >= fsc->type_capacity) {
+        int nc = fsc->type_capacity < 8 ? 8 : fsc->type_capacity * 2;
+        uint32_t *nids = realloc(fsc->type_ids, nc * sizeof(uint32_t));
+        if (!nids) return;
+        fsc->type_ids = nids;
+        fsc->type_capacity = nc;
+    }
+    fsc->type_ids[fsc->type_count++] = type_id;
+}
+
+/* Scan a function body for direct shared struct field accesses (non-transitive).
+ * Collects type_ids into the FuncSharedTypes entry. */
+static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedTypes *fsc);
+
+/* Compute shared types for a function transitively via DFS.
+ * Uses in_progress flag for cycle detection, computed flag for memoization. */
+static void compute_func_shared_types(Checker *c, const char *fname, uint32_t flen) {
+    struct FuncSharedTypes *fsc = find_func_shared_cache(c, fname, flen);
+    if (!fsc) fsc = add_func_shared_cache(c, fname, flen);
+    if (fsc->computed || fsc->in_progress) return; /* memoized or cycle */
+    fsc->in_progress = true;
+
+    Symbol *sym = scope_lookup(c->global_scope, fname, flen);
+    if (!sym || !sym->is_function || !sym->func_node ||
+        sym->func_node->kind != NODE_FUNC_DECL || !sym->func_node->func_decl.body) {
+        fsc->computed = true;
+        fsc->in_progress = false;
+        return;
+    }
+
+    /* 1. Scan body for direct shared accesses */
+    scan_body_shared_types(c, sym->func_node->func_decl.body, fsc);
+
+    /* 2. For each callee, compute transitively and merge */
+    Node *body = sym->func_node->func_decl.body;
+    if (body->kind == NODE_BLOCK) {
+        for (int i = 0; i < body->block.stmt_count; i++)
+            scan_body_shared_types(c, body->block.stmts[i], fsc);
+    }
+
+    fsc->computed = true;
+    fsc->in_progress = false;
+}
+
+/* Recursive body scanner — finds shared field accesses + callee calls */
+static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedTypes *fsc) {
+    if (!node) return;
+    /* Direct shared field access */
+    if (node->kind == NODE_FIELD) {
+        Node *root = node;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        if (root->kind == NODE_IDENT) {
+            Symbol *sym = scope_lookup(c->global_scope,
+                root->ident.name, (uint32_t)root->ident.name_len);
+            if (!sym) sym = scope_lookup(c->current_scope,
+                root->ident.name, (uint32_t)root->ident.name_len);
+            if (sym && sym->type) {
+                Type *eff = type_unwrap_distinct(sym->type);
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
+                    fsc_add_type_id(fsc, eff->struct_type.type_id);
+                if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                        fsc_add_type_id(fsc, inner->struct_type.type_id);
+                }
+            }
+        }
+    }
+    /* Function call — compute callee transitively and merge */
+    if (node->kind == NODE_CALL && node->call.callee &&
+        node->call.callee->kind == NODE_IDENT) {
+        const char *cn = node->call.callee->ident.name;
+        uint32_t cl = (uint32_t)node->call.callee->ident.name_len;
+        compute_func_shared_types(c, cn, cl);
+        struct FuncSharedTypes *callee_fsc = find_func_shared_cache(c, cn, cl);
+        if (callee_fsc) {
+            for (int i = 0; i < callee_fsc->type_count; i++)
+                fsc_add_type_id(fsc, callee_fsc->type_ids[i]);
+        }
+    }
+    /* Recurse into all children */
+    if (node->kind == NODE_BINARY) {
+        scan_body_shared_types(c, node->binary.left, fsc);
+        scan_body_shared_types(c, node->binary.right, fsc);
+    }
+    if (node->kind == NODE_ASSIGN) {
+        scan_body_shared_types(c, node->assign.target, fsc);
+        scan_body_shared_types(c, node->assign.value, fsc);
+    }
+    if (node->kind == NODE_UNARY)
+        scan_body_shared_types(c, node->unary.operand, fsc);
+    if (node->kind == NODE_CALL) {
+        for (int i = 0; i < node->call.arg_count; i++)
+            scan_body_shared_types(c, node->call.args[i], fsc);
+    }
+    if (node->kind == NODE_BLOCK) {
+        for (int i = 0; i < node->block.stmt_count; i++)
+            scan_body_shared_types(c, node->block.stmts[i], fsc);
+    }
+    if (node->kind == NODE_RETURN && node->ret.expr)
+        scan_body_shared_types(c, node->ret.expr, fsc);
+    if (node->kind == NODE_EXPR_STMT)
+        scan_body_shared_types(c, node->expr_stmt.expr, fsc);
+    if (node->kind == NODE_VAR_DECL && node->var_decl.init)
+        scan_body_shared_types(c, node->var_decl.init, fsc);
+    if (node->kind == NODE_IF) {
+        scan_body_shared_types(c, node->if_stmt.cond, fsc);
+        scan_body_shared_types(c, node->if_stmt.then_body, fsc);
+        scan_body_shared_types(c, node->if_stmt.else_body, fsc);
+    }
+    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE) {
+        scan_body_shared_types(c, node->while_stmt.cond, fsc);
+        scan_body_shared_types(c, node->while_stmt.body, fsc);
+    }
+    if (node->kind == NODE_FOR) {
+        scan_body_shared_types(c, node->for_stmt.init, fsc);
+        scan_body_shared_types(c, node->for_stmt.cond, fsc);
+        scan_body_shared_types(c, node->for_stmt.step, fsc);
+        scan_body_shared_types(c, node->for_stmt.body, fsc);
+    }
+    if (node->kind == NODE_SWITCH) {
+        scan_body_shared_types(c, node->switch_stmt.expr, fsc);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            scan_body_shared_types(c, node->switch_stmt.arms[i].body, fsc);
+    }
+    if (node->kind == NODE_DEFER)
+        scan_body_shared_types(c, node->defer.body, fsc);
+    if (node->kind == NODE_CRITICAL)
+        scan_body_shared_types(c, node->critical.body, fsc);
+    if (node->kind == NODE_ONCE)
+        scan_body_shared_types(c, node->once.body, fsc);
+    if (node->kind == NODE_ORELSE) {
+        scan_body_shared_types(c, node->orelse.expr, fsc);
+        scan_body_shared_types(c, node->orelse.fallback, fsc);
+    }
+    if (node->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            scan_body_shared_types(c, node->intrinsic.args[i], fsc);
+    }
+}
+
 /* Collect ALL shared types in an expression (not just the first).
  * Returns count of distinct shared types found (max 2 for deadlock check). */
 static int collect_shared_types_in_expr(Checker *c, Node *expr,
@@ -10124,24 +10296,37 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
     if (expr->kind == NODE_CALL) {
         for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
-        /* Transitive: scan called function body for shared type accesses.
-         * Catches: a.x = helper() where helper() accesses b.y (different shared type). */
+        /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
+         * Uses DFS with memoization — no depth limit, handles mutual recursion.
+         * Each function computed once via compute_func_shared_types(). */
         if (count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
-            Symbol *csym = scope_lookup(c->global_scope,
-                expr->call.callee->ident.name, (uint32_t)expr->call.callee->ident.name_len);
-            if (csym && csym->is_function && csym->func_node &&
-                csym->func_node->kind == NODE_FUNC_DECL &&
-                csym->func_node->func_decl.body) {
-                /* Scan callee body for shared type field accesses */
-                static int _shared_scan_depth = 0;
-                if (_shared_scan_depth < 8) {
-                    _shared_scan_depth++;
-                    Node *body = csym->func_node->func_decl.body;
-                    if (body->kind == NODE_BLOCK) {
-                        for (int si = 0; si < body->block.stmt_count && count < max_types; si++)
-                            count = collect_shared_types_in_expr(c, body->block.stmts[si], types, max_types, count);
+            const char *cn = expr->call.callee->ident.name;
+            uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
+            compute_func_shared_types(c, cn, cl);
+            struct FuncSharedTypes *fsc = find_func_shared_cache(c, cn, cl);
+            if (fsc) {
+                for (int fi = 0; fi < fsc->type_count && count < max_types; fi++) {
+                    /* Check if already in the output list */
+                    bool dup = false;
+                    for (int di = 0; di < count; di++) {
+                        if (types[di]->struct_type.type_id == fsc->type_ids[fi]) {
+                            dup = true; break;
+                        }
                     }
-                    _shared_scan_depth--;
+                    if (!dup) {
+                        /* Find the Type* for this type_id — scan global scope */
+                        for (uint32_t si = 0; si < c->global_scope->symbol_count; si++) {
+                            Symbol *s = &c->global_scope->symbols[si];
+                            if (s->type) {
+                                Type *eff = type_unwrap_distinct(s->type);
+                                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared &&
+                                    eff->struct_type.type_id == fsc->type_ids[fi]) {
+                                    types[count++] = eff;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

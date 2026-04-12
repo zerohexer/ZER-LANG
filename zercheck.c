@@ -48,6 +48,7 @@ static PathState pathstate_copy(PathState *src) {
     dst.handle_count = src->handle_count;
     dst.handle_capacity = src->handle_count > 0 ? src->handle_count : 4;
     dst.terminated = false;  /* copies start non-terminated for branch analysis */
+    dst.scope_depth = src->scope_depth; /* BUG-488: preserve scope depth for branch copies */
     dst.handles = (HandleInfo *)malloc(dst.handle_capacity * sizeof(HandleInfo));
     if (src->handle_count > 0) {
         memcpy(dst.handles, src->handles, src->handle_count * sizeof(HandleInfo));
@@ -75,13 +76,32 @@ static void pathstate_free(PathState *ps) {
 }
 
 static HandleInfo *find_handle(PathState *ps, const char *name, uint32_t name_len) {
+    /* BUG-488: return highest scope_depth match (innermost scope).
+     * When variables shadow, inner scope has higher depth. */
+    HandleInfo *result = NULL;
     for (int i = 0; i < ps->handle_count; i++) {
         if (ps->handles[i].name_len == name_len &&
             memcmp(ps->handles[i].name, name, name_len) == 0) {
-            return &ps->handles[i];
+            if (!result || ps->handles[i].scope_depth >= result->scope_depth)
+                result = &ps->handles[i];
         }
     }
-    return NULL;
+    return result;
+}
+
+/* BUG-488: find handle only at current scope depth (for var-decl registration).
+ * Returns NULL if the handle exists only in an outer scope — caller must add_handle
+ * to create a new shadow. Source lookups (UAF check) use find_handle (any scope). */
+static HandleInfo *find_handle_local(PathState *ps, const char *name, uint32_t name_len) {
+    HandleInfo *result = NULL;
+    for (int i = 0; i < ps->handle_count; i++) {
+        if (ps->handles[i].name_len == name_len &&
+            memcmp(ps->handles[i].name, name, name_len) == 0 &&
+            ps->handles[i].scope_depth == ps->scope_depth) {
+            result = &ps->handles[i];
+        }
+    }
+    return result;
 }
 
 static HandleInfo *add_handle(PathState *ps, const char *name, uint32_t name_len) {
@@ -100,6 +120,7 @@ static HandleInfo *add_handle(PathState *ps, const char *name, uint32_t name_len
     h->name_len = name_len;
     h->state = HS_UNKNOWN;
     h->pool_id = -1;
+    h->scope_depth = ps->scope_depth; /* BUG-488: track lexical scope */
     return h;
 }
 
@@ -649,7 +670,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             /* this is h = pool.alloc() */
             int pool_id = register_pool(zc, obj->ident.name,
                 (uint32_t)obj->ident.name_len);
-            HandleInfo *h = find_handle(ps, vname, vlen);
+            HandleInfo *h = find_handle_local(ps, vname, vlen);
             if (h && h->state == HS_ALIVE) {
                 zc_error(zc, var_node->loc.line,
                     "handle leak: '%.*s' overwritten while alive (allocated at line %d) — previous handle leaked",
@@ -669,7 +690,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
 
     /* Level 1: *opaque p = malloc/calloc/strdup(...) — register as ALIVE */
     if (alloc_call && is_alloc_call(zc, alloc_call)) {
-        HandleInfo *h = find_handle(ps, vname, vlen);
+        HandleInfo *h = find_handle_local(ps, vname, vlen);
         if (h && h->state == HS_ALIVE) {
             zc_error(zc, var_node->loc.line,
                 "pointer leak: '%.*s' overwritten while alive (allocated at line %d)",
@@ -732,7 +753,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                             HandleInfo *arg_h = find_handle(ps, akey, (uint32_t)aklen);
                             if (arg_h) {
                                 /* Make result an alias of the arg — same allocation */
-                                HandleInfo *dst = find_handle(ps, vname, vlen);
+                                HandleInfo *dst = find_handle_local(ps, vname, vlen);
                                 if (!dst) dst = add_handle(ps, vname, vlen);
                                 if (dst) {
                                     dst->state = arg_h->state;
@@ -754,7 +775,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         }
     }
     if (alloc_call && alloc_call->kind == NODE_CALL &&
-        !find_handle(ps, vname, vlen) && !is_arena_alloc) {
+        !find_handle_local(ps, vname, vlen) && !is_arena_alloc) {
         Type *ret_type = checker_get_type(zc->checker, alloc_call);
         if (ret_type) {
             Type *ret_eff = type_unwrap_distinct(ret_type);
@@ -802,7 +823,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                 if (rklen > 0) {
                     HandleInfo *src = find_handle(ps, rkey, (uint32_t)rklen);
                     if (src) {
-                        HandleInfo *dst = find_handle(ps, vname, vlen);
+                        HandleInfo *dst = find_handle_local(ps, vname, vlen);
                         if (!dst) dst = add_handle(ps, vname, vlen);
                         if (dst) {
                             dst->state = src->state;
@@ -840,7 +861,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         if (sklen > 0) {
             HandleInfo *src = find_handle(ps, src_key, (uint32_t)sklen);
             if (src) {
-                HandleInfo *dst = find_handle(ps, vname, vlen);
+                HandleInfo *dst = find_handle_local(ps, vname, vlen);
                 if (!dst) dst = add_handle(ps, vname, vlen);
                 if (dst) {
                     dst->state = src->state;
@@ -1591,6 +1612,13 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
 
     switch (node->kind) {
     case NODE_BLOCK: {
+        /* BUG-488: scope depth tracking for variable shadowing.
+         * Increment depth on entry, decrement on exit. Handles added
+         * during this block get the new depth. On exit, remove handles
+         * with depth > parent (inner scope variables out of scope). */
+        int saved_handle_count = ps->handle_count;
+        ps->scope_depth++;
+
         /* Backward goto UAF: scan block for labels, detect backward jumps.
          * A backward goto (label before goto) is like a loop body from
          * label to goto. Apply same 2-pass + widen-to-MAYBE_FREED pattern. */
@@ -1641,6 +1669,34 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
         }
+
+        /* BUG-488: scope-exit — remove handles from this scope that shadow
+         * outer handles. Keep non-shadowing handles (they need leak checking).
+         * For shadowing handles: if same alloc_id as outer (alias), propagate
+         * state. Otherwise, just remove (independent inner variable). */
+        ps->scope_depth--;
+        for (int hi = ps->handle_count - 1; hi >= 0; hi--) {
+            HandleInfo *h = &ps->handles[hi];
+            if (h->scope_depth <= ps->scope_depth) continue; /* not from this block */
+            /* Check if this handle shadows an outer one with same name */
+            for (int oi = 0; oi < ps->handle_count; oi++) {
+                if (oi == hi) continue;
+                if (ps->handles[oi].name_len == h->name_len &&
+                    memcmp(ps->handles[oi].name, h->name, h->name_len) == 0 &&
+                    ps->handles[oi].scope_depth < h->scope_depth) {
+                    /* Shadows outer — propagate state only if same alloc (alias) */
+                    if (ps->handles[oi].alloc_id == h->alloc_id) {
+                        ps->handles[oi].state = h->state;
+                        ps->handles[oi].free_line = h->free_line;
+                    }
+                    /* Remove inner shadow */
+                    ps->handles[hi] = ps->handles[ps->handle_count - 1];
+                    ps->handle_count--;
+                    break;
+                }
+            }
+        }
+
         break;
     }
 

@@ -42,6 +42,7 @@ typedef struct {
     int transfer_line;      /* where ownership was transferred (spawn) */
     bool escaped;           /* true if returned, stored in global, or stored in param field */
     bool is_thread_handle;  /* ThreadHandle from scoped spawn — leak = "thread not joined" */
+    int scope_depth;        /* BUG-488: lexical scope depth for variable shadowing */
 } HandleInfo;
 
 /* one execution path's view of all handles — dynamic array */
@@ -50,6 +51,7 @@ typedef struct {
     int handle_count;
     int handle_capacity;
     bool terminated;        /* true if block hit return/break/continue/goto — doesn't fall through */
+    int scope_depth;        /* BUG-488: current lexical scope depth — set by NODE_BLOCK handler */
 } PathState;
 
 /* pool registry entry */

@@ -1,0 +1,11 @@
+// tokio: acquire — multiple acquires up to count
+Semaphore(3) slots;
+u32 main() {
+    @sem_acquire(slots);
+    @sem_acquire(slots);
+    @sem_acquire(slots);
+    @sem_release(slots);
+    @sem_release(slots);
+    @sem_release(slots);
+    return 0;
+}

@@ -1,0 +1,11 @@
+// Semaphore + Barrier combined
+Semaphore(2) slots;
+Barrier sync;
+void combo_worker() { @sem_acquire(slots); @barrier_wait(sync); @sem_release(slots); }
+u32 main() {
+    @barrier_init(sync, 2);
+    ThreadHandle t1 = spawn combo_worker();
+    ThreadHandle t2 = spawn combo_worker();
+    t1.join(); t2.join();
+    return 0;
+}

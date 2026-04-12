@@ -1,0 +1,15 @@
+// Worker pool: 4 workers, 2 slots
+Semaphore(2) slots;
+shared struct Done { u32 count; }
+Done g_done;
+void pool_worker(u32 id) { @sem_acquire(slots); g_done.count += 1; @sem_release(slots); }
+u32 main() {
+    g_done.count = 0;
+    ThreadHandle t1 = spawn pool_worker(1);
+    ThreadHandle t2 = spawn pool_worker(2);
+    ThreadHandle t3 = spawn pool_worker(3);
+    ThreadHandle t4 = spawn pool_worker(4);
+    t1.join(); t2.join(); t3.join(); t4.join();
+    if (g_done.count != 4) { return 1; }
+    return 0;
+}

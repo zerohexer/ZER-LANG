@@ -1,0 +1,20 @@
+// tokio: stress_test — 5 permits, 8 threads
+Semaphore(5) pool;
+shared struct Counter { u32 n; }
+Counter g;
+void stress_worker() { @sem_acquire(pool); g.n += 1; @sem_release(pool); }
+u32 main() {
+    g.n = 0;
+    ThreadHandle t1 = spawn stress_worker();
+    ThreadHandle t2 = spawn stress_worker();
+    ThreadHandle t3 = spawn stress_worker();
+    ThreadHandle t4 = spawn stress_worker();
+    ThreadHandle t5 = spawn stress_worker();
+    ThreadHandle t6 = spawn stress_worker();
+    ThreadHandle t7 = spawn stress_worker();
+    ThreadHandle t8 = spawn stress_worker();
+    t1.join(); t2.join(); t3.join(); t4.join();
+    t5.join(); t6.join(); t7.join(); t8.join();
+    if (g.n != 8) { return 1; }
+    return 0;
+}

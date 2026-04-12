@@ -1,0 +1,13 @@
+// Semaphore + Condvar combined
+Semaphore(1) lock;
+shared struct State { u32 ready; }
+State g_state;
+void setup_worker() { @sem_acquire(lock); g_state.ready = 1; @cond_signal(g_state); @sem_release(lock); }
+u32 main() {
+    g_state.ready = 0;
+    ThreadHandle t = spawn setup_worker();
+    @cond_wait(g_state, g_state.ready == 1);
+    t.join();
+    if (g_state.ready != 1) { return 1; }
+    return 0;
+}

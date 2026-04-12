@@ -1,0 +1,17 @@
+// Chain: A releases for B, B releases for C
+Semaphore(0) ab;
+Semaphore(0) bc;
+shared struct Chain { u32 step; }
+Chain g_chain;
+void worker_a() { g_chain.step = 1; @sem_release(ab); }
+void worker_b() { @sem_acquire(ab); g_chain.step = 2; @sem_release(bc); }
+void worker_c() { @sem_acquire(bc); g_chain.step = 3; }
+u32 main() {
+    g_chain.step = 0;
+    ThreadHandle ta = spawn worker_a();
+    ThreadHandle tb = spawn worker_b();
+    ThreadHandle tc = spawn worker_c();
+    ta.join(); tb.join(); tc.join();
+    if (g_chain.step != 3) { return 1; }
+    return 0;
+}

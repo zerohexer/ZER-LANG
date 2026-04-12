@@ -1,0 +1,15 @@
+// Two threads ping-pong via two semaphores
+Semaphore(0) ping;
+Semaphore(0) pong;
+shared struct Result { u32 val; }
+Result g_r;
+void player_a() { g_r.val = 1; @sem_release(ping); @sem_acquire(pong); g_r.val = 3; @sem_release(ping); }
+void player_b() { @sem_acquire(ping); g_r.val = 2; @sem_release(pong); @sem_acquire(ping); }
+u32 main() {
+    g_r.val = 0;
+    ThreadHandle ta = spawn player_a();
+    ThreadHandle tb = spawn player_b();
+    ta.join(); tb.join();
+    if (g_r.val != 3) { return 1; }
+    return 0;
+}

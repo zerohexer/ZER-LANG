@@ -1031,6 +1031,33 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 7 (2026-04-12, Gemini — 5 claims, 2 real bugs)
+
+**Summary:** Seventh Gemini audit. 2 real bugs (BUG-488/489), 3 false/design.
+
+### BUG-488: Zercheck scope-aware handle tracking (refactor)
+Variable shadowing caused false positive: inner `Handle h` freed → outer `Handle h` falsely FREED. Root cause: flat name matching in `find_handle` with no scope concept.
+
+**Architecture after refactor:**
+- `find_handle(ps, name, len)` — source lookup, returns highest `scope_depth` match. For UAF/alias checks. ~20 call sites.
+- `find_handle_local(ps, name, len)` — destination registration, returns CURRENT scope match only. For var-decl alloc/alias. ~6 call sites. Returns NULL for outer-scope handles → `add_handle` creates new shadow.
+- `scope_depth` on PathState: NODE_BLOCK increments on entry, decrements on exit.
+- `scope_depth` on HandleInfo: set by `add_handle` from `ps->scope_depth`.
+- Block exit: removes inner-scope handles shadowing outer handles. Propagates state only if same `alloc_id` (aliases of same allocation).
+- `pathstate_copy` preserves `scope_depth` for if/else branch copies.
+
+**Pattern:** Mirrors checker's `scope_lookup` (any scope chain) vs `scope_lookup_local` (current scope only). Same two-function separation, same semantics.
+
+**Why multiple patch attempts failed:** The flat array assumption was in `find_handle`, called 25 times. Patching individual call sites (last-match, scope_depth flag on one path) broke other paths. The proper fix was the two-function separation — clean architectural boundary between "reading handle state" and "registering new handles."
+
+### BUG-489: Runtime @inttoptr alignment check
+Variable-address `@inttoptr` had range check but no alignment check. Fix: emitter emits `if (_zer_ma0 % align != 0) _zer_trap("unaligned")` after range check. Alignment from target type width.
+
+### Not bugs (V33, V34, V37)
+- V33: VRP conservative for compound keys — bounds check NOT eliminated
+- V34: Async cancellation — design limitation, accepted for firmware
+- V37: Union variant access requires switch — attack blocked
+
 ## Red Team Audit Fixes — Round 6 (2026-04-12, Gemini — 4 claims, 3 real bugs)
 
 **Summary:** Sixth Gemini audit. 3 real bugs (BUG-485/486/487), 1 false.

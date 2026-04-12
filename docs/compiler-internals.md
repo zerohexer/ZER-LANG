@@ -1068,6 +1068,16 @@ Shared struct field access inside async function body → compile error. Lock ac
 - V9: Async defer bypass → NOT a bug, defer fires correctly on async completion (Duff's device handles it)
 - V11: Same-type instance deadlock → NOT a real deadlock. Per-statement locking means locks never overlap. Atomicity concern is design limitation (use single shared struct for atomic multi-field ops)
 
+## Semaphore(N) Builtin Type (2026-04-12)
+
+Counting semaphore. `Semaphore(3) slots;` declares with initial count 3. `Semaphore(0)` valid (producer-consumer pattern).
+
+**Lexer:** `TOK_SEMAPHORE` (capital S, case 'S' with Slab). **Parser:** `TYNODE_SEMAPHORE` with optional `count_expr`. `(N)` optional — bare `Semaphore` allowed for pointer params (`*Semaphore p`).
+**Types:** `TYPE_SEMAPHORE` with `uint32_t count`. **Checker:** `@sem_acquire`/`@sem_release` validate arg is `TYPE_SEMAPHORE` or `*TYPE_SEMAPHORE` (pointer unwrap). Skipped by spawn global scan (thread-safe by design — has own mutex/condvar).
+**Emitter:** `_zer_semaphore` struct (count + pthread_mutex + condvar). `_zer_sem_acquire`/`_zer_sem_release` helper functions (same pattern as `_zer_barrier_init`/`_zer_barrier_wait`). Auto-zero emits `{ .count = N }`.
+
+**Barrier/Semaphore pointer support:** Checker accepts both `TYPE_X` and `*TYPE_X`. Emitter conditionally adds `&` for direct access, omits for pointer. Enables: `void func(*Barrier b) { @barrier_wait(b); }`.
+
 ## Local Function Pointer Init Required (2026-04-12)
 
 Local `void (*cb)(u32)` without initializer → compile error. Auto-zero creates NULL funcptr; calling it segfaults. Must either initialize (`= handler`) or use nullable `?void (*cb)(u32) = null`.

@@ -3243,3 +3243,15 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **V27 — Atomic on non-volatile:** NOT an issue. GCC `__atomic_*` builtins handle memory ordering regardless of volatile qualifier. Volatile is for hardware registers, not atomics.
 
 **V28 — Container nested:** NOT applicable. ZER doesn't support nested container definitions. Simple containers work correctly.
+
+### Semaphore(N) builtin + pointer param support (2026-04-12)
+
+**Semaphore:** New builtin type. TOK_SEMAPHORE lexer keyword (capital S). TYNODE_SEMAPHORE with optional (N) — bare Semaphore allowed for *Semaphore pointer params. TYPE_SEMAPHORE in types. _zer_semaphore struct + _zer_sem_acquire/_zer_sem_release helper functions.
+
+**Semaphore(0) allowed:** Initial check rejected count ≤ 0. Fixed to accept ≥ 0 for producer-consumer pattern (start empty, producer releases).
+
+**Pointer params for Barrier/Semaphore:** Checker unwraps pointer before checking builtin type. Emitter conditionally adds & for direct access, omits for pointer. Fixes: `void func(*Barrier b) { @barrier_wait(b); }`.
+
+**Parser Semaphore(N) optional:** `(N)` only parsed if `(` follows. Without `(`, returns bare TYNODE_SEMAPHORE — needed for `*Semaphore` function param type.
+
+**Spawn global scan:** TYPE_SEMAPHORE added to skip list (thread-safe, has own mutex/condvar).

@@ -2303,11 +2303,14 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         } else if (node->orelse.fallback &&
                    node->orelse.fallback->kind == NODE_BLOCK) {
-            /* orelse { block } — statement-only form
-             * → { auto _t = expr; if (!_t.has_value) { block } }
-             * BUG-481: In async mode, this path is handled at NODE_VAR_DECL level
-             * using state struct temps. This expression-level path only fires
-             * for non-var-decl contexts (rare in async). */
+            /* orelse { block } — statement-only form.
+             * BUG-495: In async mode, use state struct temp (survives yield).
+             * Prescan registered the temp — find and use it. */
+            /* Non-async: use stack temp. Async orelse-with-yield inside
+             * expressions is rejected at checker level (can't split statement
+             * expression — GCC forbids case labels inside ({...})).
+             * Async orelse at var-decl level is handled by BUG-481 path. */
+            {
             int tmp = e->temp_count++;
             /* BUG-401: use __typeof__ to preserve volatile qualifier */
             emit(e, "({__typeof__(");
@@ -2328,6 +2331,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, " (void)0; })");
             } else {
                 emit(e, " _zer_tmp%d.value; })", tmp);
+            }
             }
         } else {
             int tmp = e->temp_count++;

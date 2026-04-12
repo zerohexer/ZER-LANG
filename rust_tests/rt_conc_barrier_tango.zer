@@ -1,0 +1,18 @@
+// Translated from: tokio/tests/sync_barrier.rs — tango
+// Rust: Barrier::new(2) — two tasks meet at checkpoint
+// ZER: Barrier with 2 participants
+
+Barrier sync_point;
+
+void participant() {
+    @barrier_wait(sync_point);
+}
+
+u32 main() {
+    @barrier_init(sync_point, 2);
+    ThreadHandle t1 = spawn participant();
+    ThreadHandle t2 = spawn participant();
+    t1.join();
+    t2.join();
+    return 0;
+}

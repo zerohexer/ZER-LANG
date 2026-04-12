@@ -1,0 +1,20 @@
+// Translated from: tokio/tests/sync_mutex.rs — readiness (contended)
+// Rust: two tasks contend for same Mutex
+// ZER: two threads contend for same shared struct
+
+shared struct Ticket { u32 holder; }
+Ticket g_ticket;
+
+void claim(*Ticket t, u32 id) {
+    t.holder = id;
+}
+
+u32 main() {
+    g_ticket.holder = 0;
+    ThreadHandle t1 = spawn claim(&g_ticket, 1);
+    ThreadHandle t2 = spawn claim(&g_ticket, 2);
+    t1.join();
+    t2.join();
+    if (g_ticket.holder != 1 && g_ticket.holder != 2) { return 1; }
+    return 0;
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// BUG-481: yield inside orelse block — stack ghost corruption
+
+?u32 maybe_get() { return null; }
+
+async void bad() {
+    u32 x = maybe_get() orelse {
+        yield;
+        return;
+    };
+}
+
+u32 main() { return 0; }

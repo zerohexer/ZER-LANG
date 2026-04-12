@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// UAF: alloc_ptr then free then use
+
+Slab(u32) heap;
+
+i32 main() {
+    ?*u32 mp = heap.alloc_ptr();
+    *u32 p = mp orelse return;
+    p[0] = 42;
+    heap.free_ptr(p);
+    u32 leak = p[0];
+    return 0;
+}

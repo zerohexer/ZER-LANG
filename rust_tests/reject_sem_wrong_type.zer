@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// @sem_acquire on non-Semaphore type
+
+u32 not_a_sem;
+
+i32 main() {
+    @sem_acquire(not_a_sem);
+    return 0;
+}

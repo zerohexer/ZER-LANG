@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Double free on Pool handle
+
+Pool(u32, 8) pool;
+
+i32 main() {
+    ?Handle(u32) mh = pool.alloc();
+    Handle(u32) h = mh orelse return;
+    pool.free(h);
+    pool.free(h);
+    return 0;
+}

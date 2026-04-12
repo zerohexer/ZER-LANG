@@ -5739,8 +5739,11 @@ static Type *check_expr(Checker *c, Node *node) {
                         "@barrier_init requires 2 arguments: @barrier_init(barrier_var, thread_count)");
                 if (node->intrinsic.arg_count >= 2) {
                     Type *bt = check_expr(c, node->intrinsic.args[0]);
-                    /* Validate first arg is Barrier type */
-                    if (bt && type_unwrap_distinct(bt)->kind != TYPE_BARRIER)
+                    /* Validate first arg is Barrier or *Barrier */
+                    Type *bt_eff = bt ? type_unwrap_distinct(bt) : NULL;
+                    if (bt_eff && bt_eff->kind == TYPE_POINTER)
+                        bt_eff = type_unwrap_distinct(bt_eff->pointer.inner);
+                    if (bt_eff && bt_eff->kind != TYPE_BARRIER)
                         checker_error(c, node->loc.line,
                             "@barrier_init first argument must be Barrier type, got '%s'",
                             type_name(bt));
@@ -5755,7 +5758,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         "@barrier_wait requires 1 argument: @barrier_wait(barrier_var)");
                 if (node->intrinsic.arg_count >= 1) {
                     Type *bt = check_expr(c, node->intrinsic.args[0]);
-                    if (bt && type_unwrap_distinct(bt)->kind != TYPE_BARRIER)
+                    Type *bt_eff = bt ? type_unwrap_distinct(bt) : NULL;
+                    if (bt_eff && bt_eff->kind == TYPE_POINTER)
+                        bt_eff = type_unwrap_distinct(bt_eff->pointer.inner);
+                    if (bt_eff && bt_eff->kind != TYPE_BARRIER)
                         checker_error(c, node->loc.line,
                             "@barrier_wait argument must be Barrier type, got '%s'",
                             type_name(bt));
@@ -5769,7 +5775,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     "@sem_acquire requires 1 argument");
             if (node->intrinsic.arg_count >= 1) {
                 Type *st = check_expr(c, node->intrinsic.args[0]);
-                if (st && type_unwrap_distinct(st)->kind != TYPE_SEMAPHORE)
+                Type *st_eff = st ? type_unwrap_distinct(st) : NULL;
+                if (st_eff && st_eff->kind == TYPE_POINTER)
+                    st_eff = type_unwrap_distinct(st_eff->pointer.inner);
+                if (st_eff && st_eff->kind != TYPE_SEMAPHORE)
                     checker_error(c, node->loc.line,
                         "@sem_acquire argument must be Semaphore type, got '%s'",
                         type_name(st));
@@ -5782,7 +5791,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     "@sem_release requires 1 argument");
             if (node->intrinsic.arg_count >= 1) {
                 Type *st = check_expr(c, node->intrinsic.args[0]);
-                if (st && type_unwrap_distinct(st)->kind != TYPE_SEMAPHORE)
+                Type *st_eff = st ? type_unwrap_distinct(st) : NULL;
+                if (st_eff && st_eff->kind == TYPE_POINTER)
+                    st_eff = type_unwrap_distinct(st_eff->pointer.inner);
+                if (st_eff && st_eff->kind != TYPE_SEMAPHORE)
                     checker_error(c, node->loc.line,
                         "@sem_release argument must be Semaphore type, got '%s'",
                         type_name(st));

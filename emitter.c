@@ -2878,15 +2878,20 @@ static void emit_expr(Emitter *e, Node *node) {
             const char *bop = name + 8;
             int boplen = nlen - 8;
             if (boplen == 4 && memcmp(bop, "init", 4) == 0 && node->intrinsic.arg_count >= 2) {
-                /* @barrier_init(var, count) → _zer_barrier_init(&var, count) */
-                emit(e, "_zer_barrier_init(&");
+                /* @barrier_init(var, count) — &var if direct, var if pointer */
+                Type *bt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                bool is_ptr = bt && type_unwrap_distinct(bt)->kind == TYPE_POINTER;
+                emit(e, "_zer_barrier_init(");
+                if (!is_ptr) emit(e, "&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
                 emit(e, ")");
             } else if (boplen == 4 && memcmp(bop, "wait", 4) == 0 && node->intrinsic.arg_count >= 1) {
-                /* @barrier_wait(var) → _zer_barrier_wait(&var) */
-                emit(e, "_zer_barrier_wait(&");
+                Type *bt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                bool is_ptr = bt && type_unwrap_distinct(bt)->kind == TYPE_POINTER;
+                emit(e, "_zer_barrier_wait(");
+                if (!is_ptr) emit(e, "&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ")");
             } else {
@@ -2894,44 +2899,22 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 &&
                    node->intrinsic.arg_count >= 1) {
-            /* @sem_acquire(s) → init condvar if needed; lock; while(count==0) wait; count--; unlock */
-            emit(e, "({ if (!");
+            /* @sem_acquire(s) → _zer_sem_acquire(&s) or _zer_sem_acquire(s) */
+            Type *sat = checker_get_type(e->checker, node->intrinsic.args[0]);
+            bool sa_ptr = sat && type_unwrap_distinct(sat)->kind == TYPE_POINTER;
+            emit(e, "_zer_sem_acquire(");
+            if (!sa_ptr) emit(e, "&");
             emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx_inited) { pthread_cond_init(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_cond, NULL); } _zer_mtx_ensure_init(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx, &");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx_inited); pthread_mutex_lock(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx); while (");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ".count == 0) { pthread_cond_wait(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_cond, &");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx); } ");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ".count--; pthread_mutex_unlock(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx); })");
+            emit(e, ")");
         } else if (nlen == 11 && memcmp(name, "sem_release", 11) == 0 &&
                    node->intrinsic.arg_count >= 1) {
-            /* @sem_release(s) → lock; s.count++; cond_signal; unlock */
-            emit(e, "({ _zer_mtx_ensure_init(&");
+            /* @sem_release(s) → _zer_sem_release(&s) or _zer_sem_release(s) */
+            Type *srt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            bool sr_ptr = srt && type_unwrap_distinct(srt)->kind == TYPE_POINTER;
+            emit(e, "_zer_sem_release(");
+            if (!sr_ptr) emit(e, "&");
             emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx, &");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx_inited); pthread_mutex_lock(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx); ");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ".count++; pthread_cond_signal(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_cond); pthread_mutex_unlock(&");
-            emit_expr(e, node->intrinsic.args[0]);
-            emit(e, "._zer_mtx); })");
+            emit(e, ")");
         } else {
             emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
         }
@@ -5157,6 +5140,22 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    uint8_t _zer_mtx_inited;\n");
     emit(e, "    pthread_cond_t _zer_cond;\n");
     emit(e, "} _zer_semaphore;\n");
+    emit(e, "static inline void _zer_sem_acquire(_zer_semaphore *s) {\n");
+    emit(e, "    _zer_mtx_ensure_init(&s->_zer_mtx, &s->_zer_mtx_inited);\n");
+    emit(e, "    if (!s->_zer_mtx_inited) { pthread_cond_init(&s->_zer_cond, NULL); }\n");
+    emit(e, "    pthread_mutex_lock(&s->_zer_mtx);\n");
+    emit(e, "    while (s->count == 0) pthread_cond_wait(&s->_zer_cond, &s->_zer_mtx);\n");
+    emit(e, "    s->count--;\n");
+    emit(e, "    pthread_mutex_unlock(&s->_zer_mtx);\n");
+    emit(e, "}\n");
+    emit(e, "static inline void _zer_sem_release(_zer_semaphore *s) {\n");
+    emit(e, "    _zer_mtx_ensure_init(&s->_zer_mtx, &s->_zer_mtx_inited);\n");
+    emit(e, "    if (!s->_zer_mtx_inited) { pthread_cond_init(&s->_zer_cond, NULL); }\n");
+    emit(e, "    pthread_mutex_lock(&s->_zer_mtx);\n");
+    emit(e, "    s->count++;\n");
+    emit(e, "    pthread_cond_signal(&s->_zer_cond);\n");
+    emit(e, "    pthread_mutex_unlock(&s->_zer_mtx);\n");
+    emit(e, "}\n");
     emit(e, "#endif\n\n");
 
     /* Universal fault handler + @probe — uses C standard signal() everywhere.

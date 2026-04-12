@@ -1,0 +1,21 @@
+// C library callback + shared struct — concurrency safe
+// Tests: C thread calls ZER callback, shared struct auto-locks
+
+cinclude "cinclude_callback_test.h";
+void clib_set_cb(void (*cb)());
+void clib_fire();
+
+shared struct Counter { u32 n; }
+Counter g;
+
+void on_event() {
+    g.n += 1;
+}
+
+u32 main() {
+    g.n = 0;
+    clib_set_cb(on_event);
+    clib_fire();
+    if (g.n != 1) { return 1; }
+    return 0;
+}

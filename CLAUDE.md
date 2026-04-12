@@ -789,6 +789,49 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 10. **`bool` return via `orelse` needs restructuring.** Can't do `*opaque f = mf orelse return false;`. Instead: `?*opaque mf = io_open(...); *opaque f = mf orelse return;` for void, or use an if-unwrap pattern for bool returns.
 
+## ZER Safety Tracking Systems — MANDATORY REFERENCE
+
+**Before implementing ANY safety feature, check this table.** ZER has 28 independent tracking systems. Use existing ones — don't reinvent. When a feature seems impossible, check if combining existing systems solves it. **NEVER ban when you can track.**
+
+| # | System | Location | What It Tracks | Use When |
+|---|---|---|---|---|
+| 1 | **Typemap** | checker.c | `Node* → Type*` for every AST node | Emitter needs resolved types |
+| 2 | **Type ID** | checker.c | `next_type_id++` per struct/enum/union | Runtime `*opaque` provenance tag |
+| 3 | **Provenance** | checker.c | `Symbol.provenance_type` — original type of `*opaque` | `@ptrcast` compile-time check |
+| 4 | **Prov Summaries** | checker.c | What provenance a function's return carries | Cross-function `*opaque` tracking |
+| 5 | **Param Provenance** | checker.c | What type each `*opaque` param expects inside callee | Whole-program call-site validation |
+| 6 | **Alloc Coloring** | zercheck.c | `ZC_COLOR_POOL/ARENA/MALLOC/UNKNOWN` per handle | Distinguish alloc source — arena vs pool |
+| 7 | **Handle States** | zercheck.c | `HS_UNKNOWN→ALIVE→FREED/MAYBE_FREED/TRANSFERRED` | UAF, double-free, leak, move semantics |
+| 8 | **Alloc ID** | zercheck.c | Unique per allocation, shared by aliases | Group `?Handle` + `Handle` as same alloc |
+| 9 | **Func Summaries** | zercheck.c | `frees_param[i]` — does function free param? | Cross-function UAF/leak detection |
+| 10 | **Move Tracking** | zercheck.c | `should_track_move()` — move struct or contains one | Ownership transfer, use-after-move |
+| 11 | **Escape Flags** | checker.c | `is_local_derived`, `is_arena_derived`, `is_from_arena` | Prevent returning/storing stack/arena ptrs |
+| 12 | **Range Propagation** | checker.c | `VarRange {min, max, known_nonzero}` per variable | Prove bounds safe, prove divisor nonzero |
+| 13 | **Return Range** | checker.c | `return_range_min/max` per function | Cross-function: `arr[func()]` zero-overhead |
+| 14 | **Auto-Guard** | checker.c | Unproven array accesses needing runtime guard | Emitter inserts `if (idx >= size) return;` |
+| 15 | **Dynamic Freed** | checker.c | `pool.free(arr[k])` — which index was freed | Emitter inserts UAF guard for `arr[j]` |
+| 16 | **Non-Storable** | checker.c | `pool.get()` results that can't be stored | Prevent caching invalidatable pointers |
+| 17 | **ISR Tracking** | checker.c | Globals shared between ISR and main code | Detect missing volatile on ISR-shared globals |
+| 18 | **Stack Frames** | checker.c | Frame sizes, callees, recursion, indirect calls | `--stack-limit`, recursion detection |
+| 19 | **MMIO Ranges** | checker.c | Declared valid address ranges | `@inttoptr` validation |
+| 20 | **Qualifier Tracking** | checker.c | `is_volatile`, `is_const` on Symbol + Type | Prevent stripping volatile/const through casts |
+| 21 | **Keep Parameters** | checker.c | `is_keep` — pointer param can be stored | Non-keep ptr stored to global = error |
+| 22 | **Union Switch Lock** | checker.c | Which union is currently being switched on | Prevent mutation during mutable capture |
+| 23 | **Defer Stack** | emitter.c | Pending defer blocks at each scope level | LIFO cleanup on return/break/continue |
+| 24 | **Context Flags** | checker.c | `in_loop`, `in_interrupt`, `in_naked`, `in_async`, etc. | Contextual validation (break needs loop, etc.) |
+| 25 | **Container Templates** | checker.c | `ContainerTemplate` + `ContainerInstance` cache | Monomorphization stamping |
+| 26 | **Comptime Evaluator** | checker.c | `ComptimeCtx` with locals, arrays, floats | Compile-time function evaluation |
+| 27 | **Spawn Global Scan** | checker.c | Non-shared global access from spawned function | Data race detection (error/warning) |
+| 28 | **Shared Type Collect** | checker.c | Which shared types a statement touches | Deadlock: 2+ shared types in one statement |
+
+**Design principle:** Safety = tracking, not banning. If a pattern is unsafe, find which tracking system can detect the violation. Only ban when NO tracking system can cover the case (e.g., naked non-asm — hardware constraint).
+
+**`*opaque` safety coverage:**
+- Pure ZER: 100% compile-time (zercheck #7 handle states)
+- `*opaque` alone: 100% compile-time (zercheck + #3 provenance)
+- `*opaque` + `cinclude`: 100% (zercheck + `--wrap=malloc` compiled-in)
+- `cinclude` alone (raw `*u8`): NOT tracked — developer wraps with `*opaque` for safety
+
 ## STRICT: No-Debt Implementation Rule
 
 **Every change — add, fix, remove — MUST be the correct solution, not a shortcut.**

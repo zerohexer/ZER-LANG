@@ -4431,10 +4431,23 @@ static bool is_async_local(Emitter *e, const char *name, size_t len) {
 }
 
 static void emit_async_func(Emitter *e, Node *node) {
-    const char *fname = node->func_decl.name;
-    int flen = (int)node->func_decl.name_len;
     Node *body = node->func_decl.body;
     if (!body) return;
+
+    /* BUG-482: build module-mangled function name for async struct/init/poll.
+     * Without module prefix, two modules with same async function name collide.
+     * Uses same module__name pattern as EMIT_MANGLED_NAME. */
+    char mname_buf[256];
+    int flen;
+    if (e->current_module) {
+        flen = snprintf(mname_buf, sizeof(mname_buf), "%.*s__%.*s",
+            (int)e->current_module_len, e->current_module,
+            (int)node->func_decl.name_len, node->func_decl.name);
+    } else {
+        flen = snprintf(mname_buf, sizeof(mname_buf), "%.*s",
+            (int)node->func_decl.name_len, node->func_decl.name);
+    }
+    const char *fname = mname_buf;
 
     /* Collect local variables for the state struct */
     e->async_local_count = 0;
@@ -5311,9 +5324,11 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * function B that also auto-locks the same shared struct.
      * Lazy init: first lock call initializes with PTHREAD_MUTEX_RECURSIVE. */
     emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
-    emit(e, "static inline void _zer_mtx_ensure_init(pthread_mutex_t *mtx, uint8_t *inited) {\n");
+    /* BUG-483: accept optional condvar pointer — init alongside mutex in CAS winner.
+     * Fixes race where condvar init after ensure_init was always false. */
+    emit(e, "static inline void _zer_mtx_ensure_init_cv(pthread_mutex_t *mtx, uint8_t *inited, pthread_cond_t *cond) {\n");
     emit(e, "    if (__atomic_load_n(inited, __ATOMIC_ACQUIRE) == 1) return;\n");
-    emit(e, "    /* CAS 0→2: winner initializes mutex. Losers spin until done (1). */\n");
+    emit(e, "    /* CAS 0→2: winner initializes mutex (+condvar). Losers spin until done (1). */\n");
     emit(e, "    uint8_t expected = 0;\n");
     emit(e, "    if (__atomic_compare_exchange_n(inited, &expected, 2, 0,\n");
     emit(e, "                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {\n");
@@ -5322,10 +5337,14 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);\n");
     emit(e, "        pthread_mutex_init(mtx, &attr);\n");
     emit(e, "        pthread_mutexattr_destroy(&attr);\n");
+    emit(e, "        if (cond) pthread_cond_init(cond, NULL);\n");
     emit(e, "        __atomic_store_n(inited, 1, __ATOMIC_RELEASE);\n");
     emit(e, "    } else {\n");
     emit(e, "        while (__atomic_load_n(inited, __ATOMIC_ACQUIRE) != 1) {}\n");
     emit(e, "    }\n");
+    emit(e, "}\n");
+    emit(e, "static inline void _zer_mtx_ensure_init(pthread_mutex_t *mtx, uint8_t *inited) {\n");
+    emit(e, "    _zer_mtx_ensure_init_cv(mtx, inited, NULL);\n");
     emit(e, "}\n\n");
 
     /* ZER thread barrier — portable (mutex + condvar, like Rust) */
@@ -5366,16 +5385,14 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    pthread_cond_t _zer_cond;\n");
     emit(e, "} _zer_semaphore;\n");
     emit(e, "static inline void _zer_sem_acquire(_zer_semaphore *s) {\n");
-    emit(e, "    _zer_mtx_ensure_init(&s->_zer_mtx, &s->_zer_mtx_inited);\n");
-    emit(e, "    if (!s->_zer_mtx_inited) { pthread_cond_init(&s->_zer_cond, NULL); }\n");
+    emit(e, "    _zer_mtx_ensure_init_cv(&s->_zer_mtx, &s->_zer_mtx_inited, &s->_zer_cond);\n");
     emit(e, "    pthread_mutex_lock(&s->_zer_mtx);\n");
     emit(e, "    while (s->count == 0) pthread_cond_wait(&s->_zer_cond, &s->_zer_mtx);\n");
     emit(e, "    s->count--;\n");
     emit(e, "    pthread_mutex_unlock(&s->_zer_mtx);\n");
     emit(e, "}\n");
     emit(e, "static inline void _zer_sem_release(_zer_semaphore *s) {\n");
-    emit(e, "    _zer_mtx_ensure_init(&s->_zer_mtx, &s->_zer_mtx_inited);\n");
-    emit(e, "    if (!s->_zer_mtx_inited) { pthread_cond_init(&s->_zer_cond, NULL); }\n");
+    emit(e, "    _zer_mtx_ensure_init_cv(&s->_zer_mtx, &s->_zer_mtx_inited, &s->_zer_cond);\n");
     emit(e, "    pthread_mutex_lock(&s->_zer_mtx);\n");
     emit(e, "    s->count++;\n");
     emit(e, "    pthread_cond_signal(&s->_zer_cond);\n");

@@ -183,6 +183,21 @@ typedef struct {
 
     uint32_t stack_limit;   /* --stack-limit N: error when estimated stack > N bytes (0 = disabled) */
 
+    /* Deadlock analysis: per-function shared type cache (BUG-474 proper fix).
+     * Pre-computed set of shared struct type_ids each function transitively touches.
+     * Uses call graph DFS with visited set — no depth limit, handles cycles. */
+    struct FuncSharedTypes {
+        const char *func_name;
+        uint32_t func_name_len;
+        uint32_t *type_ids;     /* array of shared struct type_ids */
+        int type_count;
+        int type_capacity;
+        bool computed;          /* true if DFS completed (memoized) */
+        bool in_progress;       /* true during DFS (cycle detection) */
+    } *func_shared_cache;
+    int func_shared_cache_count;
+    int func_shared_cache_capacity;
+
     /* Stack depth analysis: call graph + frame sizes */
     struct StackFrame {
         const char *name;

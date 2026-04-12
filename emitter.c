@@ -2636,7 +2636,21 @@ static void emit_expr(Emitter *e, Node *node) {
                          tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
                          tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
                 }
-                emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); (");
+                emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
+                /* BUG-489: runtime alignment check — variable addresses must be
+                 * aligned to target type. Constant addresses checked at compile time,
+                 * but runtime addresses (0x40000000 + offset) need runtime check. */
+                if (node->intrinsic.type_arg) {
+                    Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                    Type *inner = t ? type_unwrap_distinct(t) : NULL;
+                    if (inner && inner->kind == TYPE_POINTER) inner = inner->pointer.inner;
+                    int align = inner ? type_width(inner) / 8 : 0;
+                    if (align > 1) {
+                        emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
+                             tmp, align);
+                    }
+                }
+                emit(e, "(");
                 if (node->intrinsic.type_arg) {
                     Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                     emit_type(e, t);

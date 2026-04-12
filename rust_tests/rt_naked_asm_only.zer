@@ -1,0 +1,5 @@
+// Naked function with only asm — valid
+naked void nop_handler() {
+    asm("nop");
+}
+i32 main() { return 0; }

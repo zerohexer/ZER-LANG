@@ -1,0 +1,13 @@
+// Scoped spawn with *T — safe because joined
+// Translated from: rust/tests/ui/threads-sendsync/child-outlives-parent.rs
+struct Work { u32 x; u32 y; }
+void compute(*Work w) { w.y = w.x * w.x; }
+u32 main() {
+    Work w;
+    w.x = 7;
+    w.y = 0;
+    ThreadHandle t = spawn compute(&w);
+    t.join();
+    if (w.y != 49) { return 1; }
+    return 0;
+}

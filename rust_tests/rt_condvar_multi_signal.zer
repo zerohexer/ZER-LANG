@@ -1,0 +1,13 @@
+// Multiple signals — only one waiter woken per signal
+shared struct Multi { u32 count; }
+Multi g_m;
+void waiter_ms() { @cond_wait(g_m, g_m.count > 0); g_m.count -= 1; }
+void signaler() { g_m.count += 1; @cond_signal(g_m); }
+u32 main() {
+    g_m.count = 0;
+    ThreadHandle tw = spawn waiter_ms();
+    ThreadHandle ts = spawn signaler();
+    ts.join();
+    tw.join();
+    return 0;
+}

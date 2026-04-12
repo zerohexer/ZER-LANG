@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// Spawn target returns move struct — resource leaked
+move struct Token { u32 id; }
+Token make_token() { Token t; t.id = 42; return t; }
+i32 main() { spawn make_token(); return 0; }

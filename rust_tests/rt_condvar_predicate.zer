@@ -1,0 +1,12 @@
+// Condvar with complex predicate
+shared struct Status { u32 phase; u32 ready; }
+Status g_s;
+void advance_phase() { g_s.phase = 2; g_s.ready = 1; @cond_broadcast(g_s); }
+u32 main() {
+    g_s.phase = 1; g_s.ready = 0;
+    ThreadHandle t = spawn advance_phase();
+    @cond_wait(g_s, g_s.ready == 1);
+    t.join();
+    if (g_s.phase != 2) { return 1; }
+    return 0;
+}

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// Fire-and-forget spawn with non-shared pointer — data race
+struct Unsafe { u32 val; }
+Unsafe g_data;
+void bad_worker(*Unsafe d) { d.val = 42; }
+i32 main() { spawn bad_worker(&g_data); return 0; }

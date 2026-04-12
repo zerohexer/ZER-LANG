@@ -1,0 +1,11 @@
+// Safe: free in branch that always exits, use in continuation
+struct Item { u32 val; }
+Pool(Item, 8) pool;
+i32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    defer pool.free(h);
+    pool.get(h).val = 42;
+    if (pool.get(h).val != 42) { return 1; }
+    return 0;
+}

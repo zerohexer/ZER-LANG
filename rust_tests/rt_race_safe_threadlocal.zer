@@ -1,0 +1,10 @@
+// Translated from: rust/tests/ui/threads-sendsync/thread-local-syntax.rs
+threadlocal u32 tl_x;
+void tl_worker() { tl_x = 42; }
+u32 main() {
+    tl_x = 0;
+    ThreadHandle t = spawn tl_worker();
+    t.join();
+    if (tl_x != 0) { return 1; }
+    return 0;
+}

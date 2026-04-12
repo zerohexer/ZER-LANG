@@ -1,0 +1,19 @@
+// Async with multiple defers — fire in LIFO order
+u32 g_order = 0;
+void set1() { g_order = g_order * 10 + 1; }
+void set2() { g_order = g_order * 10 + 2; }
+void set3() { g_order = g_order * 10 + 3; }
+async void multi_defer() {
+    defer set1();
+    defer set2();
+    yield;
+    defer set3();
+}
+u32 main() {
+    g_order = 0;
+    _zer_async_multi_defer t;
+    _zer_async_multi_defer_init(&t);
+    _zer_async_multi_defer_poll(&t);
+    _zer_async_multi_defer_poll(&t);
+    return 0;
+}

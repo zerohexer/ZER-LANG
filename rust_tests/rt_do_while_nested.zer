@@ -1,0 +1,16 @@
+// Nested do-while
+u32 main() {
+    u32 outer = 0;
+    u32 total = 0;
+    do {
+        u32 inner = 0;
+        do {
+            inner += 1;
+            total += 1;
+        } while (inner < 3);
+        outer += 1;
+    } while (outer < 4);
+    if (total != 12) { return 1; }
+    if (outer != 4) { return 2; }
+    return 0;
+}

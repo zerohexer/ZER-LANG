@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-12 — Gemini Red Team Round 4 (1 real bug, 1 doc fix from 4 reports)
+
+### BUG-481: Async yield inside orelse block — stack ghost corruption (proper fix)
+**Symptom:** `u32 x = maybe_get() orelse { yield; 42; };` — `_zer_tmp0` on stack, stale after yield+resume. Reads garbage from previous poll call's stack frame.
+**Root cause:** Orelse emits as GCC statement expression with stack temp. After yield (poll returns), temp destroyed. Resume (next poll call) reads stale stack.
+**Pragmatic fix (reverted):** Ban yield inside orelse blocks via `orelse_depth` flag — same pattern as defer_depth/critical_depth.
+**Proper fix:** Restructured async orelse emission. Pre-scan async body via `prescan_async_temps()` to find orelse blocks. Add `AsyncTemp` entries to Emitter — type recorded for state struct field. In async var-decl orelse path, emit as separate statements: `self->_zer_async_tmp0 = expr; if (!self->_zer_async_tmp0.has_value) { block } self->x = self->_zer_async_tmp0.value;` — temp survives yield. Non-async code unchanged (efficient GCC statement expression). Same approach as Rust's MIR generator transform.
+**Test:** `tests/zer/yield_in_orelse.zer`, `tests/zer/async_orelse_no_yield.zer`
+
+### V13 (Round 4): ABA gen counter documentation desync (doc fix, not code)
+**Symptom:** compiler-internals.md claimed "gen counter capped at 0xFFFFFFFF, never wraps, permanently retired slots." Code does `gen++; if (gen==0) gen=1` — wraps, no retirement.
+**Fix:** Updated documentation to match reality. Gen wraps after ~4B cycles, no slot retirement, ABA window acceptable for embedded (71 min continuous alloc/free at 1MHz per slot).
+
+### V12 (Round 4): NOT A BUG — auto-lock group deadlock on return
+Per-statement-group locking: `g.flag=1` gets lock+unlock BEFORE the if statement. Return doesn't skip any unlock.
+
+### V15 (Round 4): NOT A BUG — VRP coercion blindspot
+Slice coercion passes array data, not local variable addresses. `idx` has no alias via array→slice. Attack requires @ptrtoint stack scanning which ZER blocks.
+
+## Session 2026-04-12 — Proper fixes for BUG-474 and BUG-479
+
+### BUG-474 proper fix: Deadlock detection via call graph DFS (replaces depth limit)
+**Previous:** `_shared_scan_depth < 4` (then 8) — arbitrary depth limit, bypassed at N+1 levels.
+**Proper fix:** `FuncSharedTypes` cache on Checker struct — per-function set of shared struct type_ids touched transitively. `compute_func_shared_types()` does DFS with `in_progress` flag (cycle detection) and `computed` flag (memoization). `scan_body_shared_types()` walks full AST recursively. `collect_shared_types_in_expr` NODE_CALL now does O(1) cache lookup. Handles mutual recursion, any call depth, each function computed once.
+**Test:** `tests/zer_fail/deadlock_depth20.zer`, `tests/zer_fail/deadlock_mutual_recursion.zer`, `tests/zer/deadlock_separate_safe.zer`
+
+### BUG-479 proper fix: VRP 100% via address_taken in TOK_AMP handler
+**Previous:** address_taken only set in NODE_VAR_DECL init (`*u32 p = &idx`). Missed: pointer reassignment (`p = &b`), struct field (`h.ptr = &idx`), call args.
+**Proper fix:** Moved address_taken marking to the SINGLE `TOK_AMP` handler in `check_expr` (line ~2280). Every `&var` expression — var-decl, assignment, call arg, struct field store, return — marks the root variable as `address_taken` in VRP. `push_var_range` skips narrowing for address_taken entries. Correctness argument: ZER has no pointer arithmetic, so `&var` is the ONLY way to create a pointer to a variable. Single check point = 100% coverage.
+**Test:** `tests/zer/vrp_ptr_alias_safe.zer`, `tests/zer/vrp_safe_no_alias.zer`, `tests/zer/vrp_global_safe.zer`
+
 ## Session 2026-04-12 — Gemini Red Team Round 3 (4 bugs from 4 reports)
 
 ### BUG-477: Async function parameters not promoted to state struct

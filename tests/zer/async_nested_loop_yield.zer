@@ -1,0 +1,19 @@
+// Nested loop with yield
+async void counter() {
+    u32 total = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        for (u32 j = 0; j < 2; j += 1) {
+            total += 1;
+            yield;
+        }
+    }
+}
+
+u32 main() {
+    _zer_async_counter task;
+    _zer_async_counter_init(&task);
+    for (u32 k = 0; k < 5; k += 1) {
+        _zer_async_counter_poll(&task);
+    }
+    return 0;
+}

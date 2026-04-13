@@ -1,0 +1,20 @@
+// Defer fires once after multiple yields
+volatile u32 defer_fired;
+
+async void session() {
+    defer_fired = 0;
+    defer { defer_fired += 1; }
+    yield;
+    yield;
+}
+
+u32 main() {
+    defer_fired = 0;
+    _zer_async_session task;
+    _zer_async_session_init(&task);
+    _zer_async_session_poll(&task);
+    _zer_async_session_poll(&task);
+    _zer_async_session_poll(&task);
+    if (defer_fired != 1) { return 1; }
+    return 0;
+}

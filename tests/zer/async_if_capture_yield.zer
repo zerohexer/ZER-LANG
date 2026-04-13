@@ -1,0 +1,18 @@
+// If-unwrap capture survives yield
+?u32 get_val() { return 42; }
+
+async void worker() {
+    ?u32 opt = get_val();
+    if (opt) |v| {
+        yield;
+        u32 check = v;
+    }
+}
+
+u32 main() {
+    _zer_async_worker task;
+    _zer_async_worker_init(&task);
+    _zer_async_worker_poll(&task);
+    _zer_async_worker_poll(&task);
+    return 0;
+}

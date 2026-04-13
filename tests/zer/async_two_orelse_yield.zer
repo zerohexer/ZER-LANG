@@ -1,0 +1,16 @@
+// Two orelse blocks with yield in same function — separate temps
+?u32 get_a() { return null; }
+?u32 get_b() { return null; }
+
+async void dual() {
+    u32 a = get_a() orelse { yield; return; };
+    u32 b = get_b() orelse { yield; return; };
+}
+
+u32 main() {
+    _zer_async_dual task;
+    _zer_async_dual_init(&task);
+    _zer_async_dual_poll(&task);
+    _zer_async_dual_poll(&task);
+    return 0;
+}

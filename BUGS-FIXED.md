@@ -5,6 +5,16 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Codebase Analysis Audit (2 bugs found by code reading)
+
+### BUG-505: Optional enum switch bare ident emission
+`switch (?Color c) { .red => {...} }` emitted `_zer_sw0.value == red` — bare `red` undeclared in C. Regular enum switch emits `_ZER_Color_red`. Fix: optional switch path uses `EMIT_ENUM_NAME` + variant for enum dot values. Also added `type_unwrap_distinct` on `is_opt_switch` detection and tracks `opt_inner_enum` type.
+**Test:** `tests/zer/optional_enum_switch.zer`
+
+### *opaque comparison unconditional (BUG-485 fix correction)
+`_zer_opaque` is ALWAYS a struct (BUG-393 unconditional). BUG-485 fix gated `.ptr` comparison on `e->track_cptrs` — wrong. Without `--run`, `*opaque == *opaque` still emitted raw struct `==`. Fix: removed `e->track_cptrs` guard.
+**Found by:** reading `emit_type(TYPE_POINTER)` code — line 593 emits `_zer_opaque` unconditionally, not gated by track_cptrs.
+
 ## Session 2026-04-13 — Refactors R1-R3 (3 helpers, 3 latent bugs fixed)
 
 ### R1: vrp_invalidate_for_assign (checker.c)

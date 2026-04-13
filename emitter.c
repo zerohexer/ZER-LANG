@@ -2885,6 +2885,14 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "_zer_ts%d.tv_nsec += (_zer_ms%d %% 1000) * 1000000L; ", tmp, tmp);
                 emit(e, "if (_zer_ts%d.tv_nsec >= 1000000000L) { _zer_ts%d.tv_sec++; _zer_ts%d.tv_nsec -= 1000000000L; } } ", tmp, tmp, tmp);
                 emit(e, "int _zer_twrc%d = 0; ", tmp);
+                /* BUG-504: ensure init before timedwait */
+                emit(e, "_zer_mtx_ensure_init_cv(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx_inited, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond); ", ar);
                 emit(e, "pthread_mutex_lock(&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_mtx); while (!(", ar);
@@ -2898,13 +2906,19 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_mtx); (_zer_opt_void){ .has_value = (_zer_twrc%d == 0) }; })", ar, tmp);
             } else if (is_wait && node->intrinsic.arg_count >= 2) {
-                /* pthread_mutex_lock → while (!(condition)) { pthread_cond_wait } → pthread_mutex_unlock
-                 * The mutex is held while checking condition, released by cond_wait during sleep,
-                 * re-acquired after wake, released after condition is true. */
+                /* BUG-504: ensure mutex+condvar initialized before first use.
+                 * If @cond_wait is the first access to this shared struct,
+                 * the mutex/condvar are uninitialized → crash. */
                 Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
                 bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
                 const char *ar = vp ? "->" : ".";
-                emit(e, "({ pthread_mutex_lock(&");
+                emit(e, "({ _zer_mtx_ensure_init_cv(&");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx_inited, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond); pthread_mutex_lock(&", ar);
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_mtx); while (!(", ar);
                 emit_expr(e, node->intrinsic.args[1]);
@@ -2919,17 +2933,31 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
                 bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
                 const char *ar = vp ? "->" : ".";
-                emit(e, "pthread_cond_signal(&");
+                /* BUG-504: ensure init before signal */
+                emit(e, "({ _zer_mtx_ensure_init_cv(&");
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_cond)", ar);
+                emit(e, "%s_zer_mtx, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx_inited, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond); pthread_cond_signal(&", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond); (void)0; })", ar);
             } else if (node->intrinsic.arg_count >= 1) {
                 /* broadcast */
                 Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
                 bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
                 const char *ar = vp ? "->" : ".";
-                emit(e, "pthread_cond_broadcast(&");
+                /* BUG-504: ensure init before broadcast */
+                emit(e, "({ _zer_mtx_ensure_init_cv(&");
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_cond)", ar);
+                emit(e, "%s_zer_mtx, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_mtx_inited, &", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond); pthread_cond_broadcast(&", ar);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "%s_zer_cond); (void)0; })", ar);
             } else {
                 emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
             }
@@ -3761,6 +3789,44 @@ static void emit_stmt(Emitter *e, Node *node) {
     case NODE_EXPR_STMT: {
         /* auto-guard: emit bounds guards before the statement */
         emit_auto_guards(e, node->expr_stmt.expr);
+
+        /* BUG-503: async expr-stmt with orelse block + yield.
+         * Can't use GCC statement expression (case labels forbidden inside).
+         * Restructure to separate statements using state struct temp.
+         * Result is discarded (expr-stmt) so no assignment needed. */
+        if (e->in_async && node->expr_stmt.expr &&
+            node->expr_stmt.expr->kind == NODE_ORELSE &&
+            node->expr_stmt.expr->orelse.fallback &&
+            node->expr_stmt.expr->orelse.fallback->kind == NODE_BLOCK) {
+            int atid = -1;
+            for (int ati = 0; ati < e->async_temp_count; ati++) {
+                if (e->async_temps[ati].temp_id >= 0) {
+                    atid = e->async_temps[ati].temp_id;
+                    e->async_temps[ati].temp_id = -1;
+                    break;
+                }
+            }
+            if (atid >= 0) {
+                Type *orelse_type = checker_get_type(e->checker, node->expr_stmt.expr->orelse.expr);
+                Type *or_eff = orelse_type ? type_unwrap_distinct(orelse_type) : NULL;
+                bool or_is_ptr = or_eff && or_eff->kind == TYPE_OPTIONAL &&
+                    is_null_sentinel(or_eff->optional.inner);
+                emit_indent(e);
+                emit(e, "self->_zer_async_tmp%d = ", atid);
+                emit_expr(e, node->expr_stmt.expr->orelse.expr);
+                emit(e, ";\n");
+                emit_indent(e);
+                if (or_is_ptr) {
+                    emit(e, "if (!self->_zer_async_tmp%d) ", atid);
+                } else {
+                    emit(e, "if (!self->_zer_async_tmp%d.has_value) ", atid);
+                }
+                emit_stmt(e, node->expr_stmt.expr->orelse.fallback);
+                emit(e, "\n");
+                break;
+            }
+        }
+
         emit_indent(e);
         emit_expr(e, node->expr_stmt.expr);
         emit(e, ";\n");

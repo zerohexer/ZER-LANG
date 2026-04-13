@@ -3960,12 +3960,20 @@ static void emit_stmt(Emitter *e, Node *node) {
         bool is_union_switch = sw_eff && sw_eff->kind == TYPE_UNION;
         /* BUG-274: detect volatile switch expression (RF11 helper) */
         bool sw_volatile = expr_is_volatile(e, node->switch_stmt.expr);
-        /* BUG-196b: detect struct-based optional in switch */
+        /* BUG-196b: detect struct-based optional in switch.
+         * BUG-505: unwrap distinct + track inner enum type for dot-value emission. */
         bool is_opt_switch = false;
-        if (sw_type && sw_type->kind == TYPE_OPTIONAL) {
-            Type *inner = sw_type->optional.inner;
-            if (!is_null_sentinel(inner)) {
-                is_opt_switch = true;
+        Type *opt_inner_enum = NULL; /* non-NULL if optional wraps an enum */
+        {
+            Type *sw_check = sw_type ? type_unwrap_distinct(sw_type) : NULL;
+            if (sw_check && sw_check->kind == TYPE_OPTIONAL) {
+                Type *inner = sw_check->optional.inner;
+                if (!is_null_sentinel(inner)) {
+                    is_opt_switch = true;
+                    Type *inner_eff = type_unwrap_distinct(inner);
+                    if (inner_eff && inner_eff->kind == TYPE_ENUM)
+                        opt_inner_enum = inner_eff;
+                }
             }
         }
 
@@ -4032,13 +4040,23 @@ static void emit_stmt(Emitter *e, Node *node) {
                 }
                 emit(e, ") ");
             } else if (is_opt_switch) {
-                /* optional switch: compare .value (and require .has_value) */
+                /* optional switch: compare .value (and require .has_value).
+                 * BUG-505: for enum dot values, emit _ZER_EnumName_variant
+                 * (not bare ident which is undeclared in C). */
                 if (i > 0) emit(e, "else ");
                 emit(e, "if (");
                 for (int j = 0; j < arm->value_count; j++) {
                     if (j > 0) emit(e, " || ");
                     emit(e, "(_zer_sw%d.has_value && _zer_sw%d.value == ", sw_tmp, sw_tmp);
-                    emit_expr(e, arm->values[j]);
+                    if (arm->is_enum_dot && opt_inner_enum) {
+                        /* emit fully qualified enum constant */
+                        emit(e, "_ZER_");
+                        EMIT_ENUM_NAME(e, opt_inner_enum);
+                        emit(e, "_%.*s",
+                             (int)arm->values[j]->ident.name_len, arm->values[j]->ident.name);
+                    } else {
+                        emit_expr(e, arm->values[j]);
+                    }
                     emit(e, ")");
                 }
                 emit(e, ") ");

@@ -1,0 +1,13 @@
+// Optional enum switch — enum dot values emitted correctly (BUG-505)
+enum Color { red, green, blue }
+u32 main() {
+    ?Color c = Color.green;
+    u32 result = 0;
+    switch (c) {
+        .red => { result = 1; }
+        .green => { result = 2; }
+        .blue => { result = 3; }
+    }
+    if (result != 2) { return 1; }
+    return 0;
+}

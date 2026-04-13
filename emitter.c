@@ -210,9 +210,37 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
 static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static void prescan_async_temps(Emitter *e, Node *node);
+static bool is_condvar_type(Emitter *e, uint32_t type_id);
 static bool emit_async_orelse_block(Emitter *e, Node *orelse_expr, Node *fallback,
                                      const char *dest_name, size_t dest_len,
                                      Type *dest_type);
+
+/* Refactor 3: unified shared struct ensure-init emission.
+ * Emits _zer_mtx_ensure_init[_cv] for a shared struct access.
+ * Handles both condvar and non-condvar types, pointer and direct access.
+ * All shared lock sites use this — one place to update for new lock patterns. */
+static void emit_shared_ensure_init(Emitter *e, Node *root, const char *arrow) {
+    Type *rt = checker_get_type(e->checker, root);
+    Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
+    if (rte && rte->kind == TYPE_POINTER) rte = type_unwrap_distinct(rte->pointer.inner);
+    bool needs_cv = rte && rte->kind == TYPE_STRUCT &&
+        is_condvar_type(e, rte->struct_type.type_id);
+    if (needs_cv) {
+        emit(e, "_zer_mtx_ensure_init_cv(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx, &", arrow);
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx_inited, &", arrow);
+        emit_expr(e, root);
+        emit(e, "%s_zer_cond)", arrow);
+    } else {
+        emit(e, "_zer_mtx_ensure_init(&");
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx, &", arrow);
+        emit_expr(e, root);
+        emit(e, "%s_zer_mtx_inited)", arrow);
+    }
+}
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
 static void emit_auto_guards(Emitter *e, Node *node);
 static void emit_defers(Emitter *e);
@@ -486,29 +514,9 @@ static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
         emit_expr(e, root);
         emit(e, "%s_zer_rwlock);\n", arrow);
     } else {
-        /* BUG-473/504: all shared structs use recursive pthread_mutex (lazy init).
-         * For condvar-type shared structs, use _cv variant to also init condvar.
-         * Otherwise first auto-lock CAS sets inited=1 without condvar init,
-         * and subsequent _zer_mtx_ensure_init_cv sees inited=1 → skips condvar. */
-        Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
-        if (rte && rte->kind == TYPE_POINTER) rte = type_unwrap_distinct(rte->pointer.inner);
-        bool needs_cv = rte && rte->kind == TYPE_STRUCT &&
-            is_condvar_type(e, rte->struct_type.type_id);
-        if (needs_cv) {
-            emit(e, "_zer_mtx_ensure_init_cv(&");
-            emit_expr(e, root);
-            emit(e, "%s_zer_mtx, &", arrow);
-            emit_expr(e, root);
-            emit(e, "%s_zer_mtx_inited, &", arrow);
-            emit_expr(e, root);
-            emit(e, "%s_zer_cond);\n", arrow);
-        } else {
-            emit(e, "_zer_mtx_ensure_init(&");
-            emit_expr(e, root);
-            emit(e, "%s_zer_mtx, &", arrow);
-            emit_expr(e, root);
-            emit(e, "%s_zer_mtx_inited);\n", arrow);
-        }
+        /* Refactor 3: unified shared ensure-init + lock */
+        emit_shared_ensure_init(e, root, arrow);
+        emit(e, ";\n");
         emit_indent(e);
         emit(e, "pthread_mutex_lock(&");
         emit_expr(e, root);
@@ -2906,14 +2914,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "_zer_ts%d.tv_nsec += (_zer_ms%d %% 1000) * 1000000L; ", tmp, tmp);
                 emit(e, "if (_zer_ts%d.tv_nsec >= 1000000000L) { _zer_ts%d.tv_sec++; _zer_ts%d.tv_nsec -= 1000000000L; } } ", tmp, tmp, tmp);
                 emit(e, "int _zer_twrc%d = 0; ", tmp);
-                /* BUG-504: ensure init before timedwait */
-                emit(e, "_zer_mtx_ensure_init_cv(&");
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx_inited, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_cond); ", ar);
+                /* Refactor 3: unified ensure-init */
+                emit_shared_ensure_init(e, node->intrinsic.args[0], ar);
+                emit(e, "; ");
                 emit(e, "pthread_mutex_lock(&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_mtx); while (!(", ar);
@@ -2927,19 +2930,13 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_mtx); (_zer_opt_void){ .has_value = (_zer_twrc%d == 0) }; })", ar, tmp);
             } else if (is_wait && node->intrinsic.arg_count >= 2) {
-                /* BUG-504: ensure mutex+condvar initialized before first use.
-                 * If @cond_wait is the first access to this shared struct,
-                 * the mutex/condvar are uninitialized → crash. */
                 Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
                 bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
                 const char *ar = vp ? "->" : ".";
-                emit(e, "({ _zer_mtx_ensure_init_cv(&");
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx_inited, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_cond); pthread_mutex_lock(&", ar);
+                /* Refactor 3: unified ensure-init */
+                emit(e, "({ ");
+                emit_shared_ensure_init(e, node->intrinsic.args[0], ar);
+                emit(e, "; pthread_mutex_lock(&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_mtx); while (!(", ar);
                 emit_expr(e, node->intrinsic.args[1]);
@@ -2954,14 +2951,10 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
                 bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
                 const char *ar = vp ? "->" : ".";
-                /* BUG-504: ensure init before signal */
-                emit(e, "({ _zer_mtx_ensure_init_cv(&");
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx_inited, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_cond); pthread_cond_signal(&", ar);
+                /* Refactor 3: unified ensure-init */
+                emit(e, "({ ");
+                emit_shared_ensure_init(e, node->intrinsic.args[0], ar);
+                emit(e, "; pthread_cond_signal(&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_cond); (void)0; })", ar);
             } else if (node->intrinsic.arg_count >= 1) {
@@ -2969,14 +2962,10 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *vt = checker_get_type(e->checker, node->intrinsic.args[0]);
                 bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
                 const char *ar = vp ? "->" : ".";
-                /* BUG-504: ensure init before broadcast */
-                emit(e, "({ _zer_mtx_ensure_init_cv(&");
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_mtx_inited, &", ar);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "%s_zer_cond); pthread_cond_broadcast(&", ar);
+                /* Refactor 3: unified ensure-init */
+                emit(e, "({ ");
+                emit_shared_ensure_init(e, node->intrinsic.args[0], ar);
+                emit(e, "; pthread_cond_broadcast(&");
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_cond); (void)0; })", ar);
             } else {

@@ -1,0 +1,17 @@
+// Goto + yield interaction
+async void retry_loop() {
+    u32 attempts = 0;
+    retry:
+    attempts += 1;
+    yield;
+    if (attempts < 3) { goto retry; }
+}
+
+u32 main() {
+    _zer_async_retry_loop task;
+    _zer_async_retry_loop_init(&task);
+    for (u32 i = 0; i < 6; i += 1) {
+        _zer_async_retry_loop_poll(&task);
+    }
+    return 0;
+}

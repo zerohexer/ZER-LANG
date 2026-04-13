@@ -1,0 +1,22 @@
+// Switch capture survives yield
+union Msg { u32 val; u32 code; }
+
+async void handler() {
+    Msg m;
+    m.val = 42;
+    switch (m) {
+        .val => |*v| {
+            yield;
+            v[0] = 99;
+        }
+        .code => { }
+    }
+}
+
+u32 main() {
+    _zer_async_handler task;
+    _zer_async_handler_init(&task);
+    _zer_async_handler_poll(&task);
+    _zer_async_handler_poll(&task);
+    return 0;
+}

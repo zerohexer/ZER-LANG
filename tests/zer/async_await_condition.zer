@@ -1,0 +1,18 @@
+// Await with condition check
+volatile u32 g_ready;
+
+async void waiter() {
+    g_ready = 0;
+    await g_ready == 1;
+    u32 val = g_ready;
+}
+
+u32 main() {
+    g_ready = 0;
+    _zer_async_waiter task;
+    _zer_async_waiter_init(&task);
+    _zer_async_waiter_poll(&task);
+    g_ready = 1;
+    _zer_async_waiter_poll(&task);
+    return 0;
+}

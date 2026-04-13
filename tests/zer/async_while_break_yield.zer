@@ -1,0 +1,18 @@
+// While loop with break after yield
+async void scanner() {
+    u32 count = 0;
+    while (true) {
+        count += 1;
+        yield;
+        if (count >= 3) { break; }
+    }
+}
+
+u32 main() {
+    _zer_async_scanner task;
+    _zer_async_scanner_init(&task);
+    for (u32 i = 0; i < 7; i += 1) {
+        _zer_async_scanner_poll(&task);
+    }
+    return 0;
+}

@@ -5,6 +5,27 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Gemini Red Team Round 11 (4 real bugs from 5 reports)
+
+### BUG-498: Sync primitives in packed struct → misaligned hard fault
+Semaphore/Barrier/shared struct inside `packed struct` → `pthread_mutex_t` at unaligned offset → hard fault on ARM/RISC-V. Checker rejects in struct field registration when `is_packed && (TYPE_SEMAPHORE || TYPE_BARRIER || shared struct)`.
+**Test:** `tests/zer_fail/packed_semaphore.zer`
+
+### BUG-499: Async param shadowing destroys param value
+`u32 id = 100` in async function shadows param `id` — both map to `self->id` in state struct. Local init overwrites param. Checker rejects variable shadowing of params in async functions. Regular functions unaffected (separate stack slots).
+**Test:** `tests/zer_fail/async_param_shadow.zer`
+
+### BUG-500: shared(rw) read-only multi-type false positive
+`u32 x = g1.val + g2.val` where g1/g2 are different `shared(rw)` types → deadlock error. But rwlock allows concurrent readers — no deadlock possible. Fix: deadlock check skips when both types are `is_shared_rw` AND statement is read-only (no NODE_ASSIGN to shared field).
+**Test:** `tests/zer/shared_rw_multi_read.zer`
+
+### BUG-501: Range-for array.len emission
+`for (T item in arr)` where `arr` is fixed array → desugared `arr.len` invalid in C (arrays don't have `.len`). Checker correctly resolves `array.len` to `ty_usize`, but emitter emitted raw `.len` field access. Fix: emitter NODE_FIELD checks TYPE_ARRAY + "len" → emits array size as literal.
+**Test:** `tests/zer/range_for_array.zer`
+
+### V55: NOT A BUG — mutual recursion
+`struct A { B b; } struct B { A a; }` → `error: undefined type 'B'`. Declaration order blocks forward reference. Use `*B` pointer for cross-references.
+
 ## Session 2026-04-13 — Gemini Red Team Rounds 9-10
 
 ### BUG-493: Packed struct atomic rejection

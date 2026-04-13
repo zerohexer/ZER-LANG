@@ -293,6 +293,14 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
  * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+/* Refactor 1: unified VRP range invalidation for assignments.
+ * Handles both simple ident keys and compound keys (s.x).
+ * For TOK_EQ: tries literal, derive_expr_range, call return range.
+ * For compound ops (+=, -=, etc.): always wipes.
+ * Prevents BUG-502 class: compound key path was missing compound op check. */
+static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
+                                       TokenType op, Node *value);
+
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
     Node *rhs = expr->binary.right;
@@ -2685,74 +2693,18 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *tsym = scope_lookup(c->current_scope,
                     troot->ident.name, (uint32_t)troot->ident.name_len);
                 if (tsym) {
-                    /* invalidate value range — assignment makes old range stale.
-                     * For TOK_EQ: try to derive new range from value.
-                     * For compound (+=, -=, etc.): always wipe (can't easily compute new range).
-                     * Also invalidate compound keys (s.x) for struct field assignments. */
-                    {
-                        /* simple ident range */
-                        struct VarRange *existing = find_var_range(c, troot->ident.name,
-                            (uint32_t)troot->ident.name_len);
-                        if (existing) {
-                            if (node->assign.op == TOK_EQ) {
-                                /* direct assignment: try to derive new range */
-                                if (node->assign.value->kind == NODE_INT_LIT) {
-                                    int64_t v = (int64_t)node->assign.value->int_lit.value;
-                                    existing->min_val = v;
-                                    existing->max_val = v;
-                                    existing->known_nonzero = (v != 0);
-                                } else {
-                                    int64_t rmin, rmax;
-                                    if (derive_expr_range(c, node->assign.value, &rmin, &rmax)) {
-                                        existing->min_val = rmin;
-                                        existing->max_val = rmax;
-                                        existing->known_nonzero = (rmin > 0);
-                                    } else if (node->assign.value->kind == NODE_CALL &&
-                                               node->assign.value->call.callee->kind == NODE_IDENT) {
-                                        Symbol *csym = scope_lookup(c->current_scope,
-                                            node->assign.value->call.callee->ident.name,
-                                            (uint32_t)node->assign.value->call.callee->ident.name_len);
-                                        if (csym && csym->has_return_range) {
-                                            existing->min_val = csym->return_range_min;
-                                            existing->max_val = csym->return_range_max;
-                                            existing->known_nonzero = (csym->return_range_min > 0);
-                                        } else {
-                                            existing->min_val = INT64_MIN;
-                                            existing->max_val = INT64_MAX;
-                                            existing->known_nonzero = false;
-                                        }
-                                    } else {
-                                        existing->min_val = INT64_MIN;
-                                        existing->max_val = INT64_MAX;
-                                        existing->known_nonzero = false;
-                                    }
-                                }
-                            } else {
-                                /* BUG-502: compound assignment (+=, -=, etc.)
-                                 * — always wipe range (can't compute new value easily) */
-                                existing->min_val = INT64_MIN;
-                                existing->max_val = INT64_MAX;
-                                existing->known_nonzero = false;
-                            }
-                        }
-                        /* compound key range (e.g., "s.x" for struct field) */
-                        if (node->assign.target->kind == NODE_FIELD) {
-                            ExprKey ckey = build_expr_key_a(c, node->assign.target);
-                            if (ckey.len > 0) {
-                                struct VarRange *cexist = find_var_range(c, ckey.str, (uint32_t)ckey.len);
-                                if (cexist) {
-                                    if (node->assign.value->kind == NODE_INT_LIT) {
-                                        int64_t v = (int64_t)node->assign.value->int_lit.value;
-                                        cexist->min_val = v;
-                                        cexist->max_val = v;
-                                        cexist->known_nonzero = (v != 0);
-                                    } else {
-                                        cexist->min_val = INT64_MIN;
-                                        cexist->max_val = INT64_MAX;
-                                        cexist->known_nonzero = false;
-                                    }
-                                }
-                            }
+                    /* Refactor 1: unified VRP invalidation via helper.
+                     * One call for simple ident, one for compound key.
+                     * Both use same logic — no more inconsistency between paths. */
+                    vrp_invalidate_for_assign(c, troot->ident.name,
+                        (uint32_t)troot->ident.name_len,
+                        node->assign.op, node->assign.value);
+                    /* compound key range (e.g., "s.x" for struct field) */
+                    if (node->assign.target->kind == NODE_FIELD) {
+                        ExprKey ckey = build_expr_key_a(c, node->assign.target);
+                        if (ckey.len > 0) {
+                            vrp_invalidate_for_assign(c, ckey.str, (uint32_t)ckey.len,
+                                node->assign.op, node->assign.value);
                         }
                     }
                     /* clear — will be re-set below if new value is unsafe.
@@ -9199,6 +9151,57 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
     r->max_val = max_val;
     r->known_nonzero = known_nonzero;
     r->address_taken = false;
+}
+
+/* Refactor 1: unified VRP range update on assignment.
+ * One function handles both simple ident keys ("i") and compound keys ("s.x").
+ * For TOK_EQ: try literal → derive_expr_range → call return range → wipe.
+ * For compound ops (+=, -=, etc.): always wipe.
+ * Eliminates BUG-502 class: compound key path previously had different logic
+ * from simple ident path (missing compound op check, missing call return range). */
+static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
+                                       TokenType op, Node *value) {
+    struct VarRange *r = find_var_range(c, key, key_len);
+    if (!r) return;
+    if (op == TOK_EQ && value) {
+        /* Direct assignment: try to derive new range from value */
+        if (value->kind == NODE_INT_LIT) {
+            int64_t v = (int64_t)value->int_lit.value;
+            r->min_val = v;
+            r->max_val = v;
+            r->known_nonzero = (v != 0);
+        } else {
+            int64_t rmin, rmax;
+            if (derive_expr_range(c, value, &rmin, &rmax)) {
+                r->min_val = rmin;
+                r->max_val = rmax;
+                r->known_nonzero = (rmin > 0);
+            } else if (value->kind == NODE_CALL &&
+                       value->call.callee && value->call.callee->kind == NODE_IDENT) {
+                Symbol *csym = scope_lookup(c->current_scope,
+                    value->call.callee->ident.name,
+                    (uint32_t)value->call.callee->ident.name_len);
+                if (csym && csym->has_return_range) {
+                    r->min_val = csym->return_range_min;
+                    r->max_val = csym->return_range_max;
+                    r->known_nonzero = (csym->return_range_min > 0);
+                } else {
+                    r->min_val = INT64_MIN;
+                    r->max_val = INT64_MAX;
+                    r->known_nonzero = false;
+                }
+            } else {
+                r->min_val = INT64_MIN;
+                r->max_val = INT64_MAX;
+                r->known_nonzero = false;
+            }
+        }
+    } else {
+        /* Compound assignment (+=, -=, etc.) — always wipe */
+        r->min_val = INT64_MIN;
+        r->max_val = INT64_MAX;
+        r->known_nonzero = false;
+    }
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */

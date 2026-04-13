@@ -1031,6 +1031,22 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 11 (2026-04-13, Gemini — 5 claims, 4 real bugs)
+
+### BUG-498: Packed struct sync primitive rejection
+Semaphore/Barrier/shared struct fields banned inside `packed struct`. `pthread_mutex_t` requires natural alignment — packed offsets cause hard fault on ARM/RISC-V. Added to struct field validation alongside existing Pool/Ring/Slab rejection.
+
+### BUG-499: Async param shadowing rejection
+Variable shadowing of function params banned in async functions. Params and locals share state struct (`self->name`) — shadowing overwrites param value. Regular functions unaffected. Check at NODE_VAR_DECL: if `c->in_async` and name matches existing symbol at different line.
+
+### BUG-500: shared(rw) read-only multi-type allowed
+Deadlock check now skips when BOTH shared types are `is_shared_rw` AND statement is read-only. `pthread_rwlock_rdlock` allows concurrent readers — no deadlock. Write statements still trigger deadlock check.
+
+### BUG-501: array.len emitter fix
+Range-for desugaring generates `collection.len` for loop condition. For TYPE_ARRAY, emitter now emits the compile-time array size as literal (`4U`) instead of invalid C `.len` field access. Checker already handled `array.len` → `ty_usize` — emitter was the missing piece.
+
+**Pattern:** Parser desugaring can generate AST that's semantically valid but emitter-invalid. The checker validates types correctly (array.len → usize), but the emitter must handle the C representation difference (slice = struct with .len, array = raw C array without .len).
+
 ## Red Team Audit Fixes — Rounds 9-10 (2026-04-13, Gemini — 10 claims, 5 real bugs)
 
 ### BUG-493: Packed struct atomic → compile error

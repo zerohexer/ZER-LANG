@@ -1,0 +1,17 @@
+// Orelse with yield then return — var-decl level safe (BUG-481)
+?u32 maybe_get() { return null; }
+
+async void compute() {
+    u32 x = maybe_get() orelse {
+        yield;
+        return;
+    };
+}
+
+u32 main() {
+    _zer_async_compute task;
+    _zer_async_compute_init(&task);
+    _zer_async_compute_poll(&task);
+    _zer_async_compute_poll(&task);
+    return 0;
+}

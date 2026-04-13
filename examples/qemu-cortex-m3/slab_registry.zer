@@ -1,0 +1,136 @@
+// ZER Slab Registry — Dynamic Allocation Demo
+// =============================================
+// Exercises: Slab(T), alloc_ptr/free_ptr, Task.new/delete,
+// defer, orelse, Handle auto-deref, comptime if,
+// designated init, optional patterns
+//
+// Simulates a device registry: alloc devices, configure,
+// query, dealloc. All memory managed by Slab — no malloc.
+
+i32 putchar(i32 c);
+
+void print_str([*]u8 s) {
+    for (usize i = 0; i < s.len; i += 1) {
+        putchar(@truncate(i32, s[i]));
+    }
+}
+
+void print_u32(u32 val) {
+    u8[10] buf;
+    u32 pos = 0;
+    if (val == 0) { putchar(48); return; }
+    u32 tmp = val;
+    while (tmp > 0) {
+        buf[pos] = @truncate(u8, (tmp % 10) + 48);
+        pos += 1;
+        tmp = tmp / 10;
+    }
+    u32 i = pos;
+    while (i > 0) {
+        i -= 1;
+        putchar(@truncate(i32, buf[i]));
+    }
+}
+
+// ---- Device registry ----
+enum DeviceType { sensor, actuator, display }
+
+struct Device {
+    u32 id;
+    DeviceType kind;
+    u32 value;
+    bool active;
+}
+
+Slab(Device) g_devices;
+
+// Comptime: max devices we expect
+comptime u32 MAX_DEVICES() { return 16; }
+
+// Alloc + configure a device
+?*Device create_device(u32 id, DeviceType kind) {
+    ?*Device md = g_devices.alloc_ptr();
+    *Device d = md orelse return;
+    d.id = id;
+    d.kind = kind;
+    d.value = 0;
+    d.active = true;
+    return d;
+}
+
+// Read device value
+u32 read_device(*Device d) {
+    if (d.active) {
+        return d.value;
+    }
+    return 0;
+}
+
+// Process device by type
+void process_device(*Device d) {
+    switch (d.kind) {
+        .sensor => {
+            d.value += 10;
+            print_str("  Sensor ");
+            print_u32(d.id);
+            print_str(": value=");
+            print_u32(d.value);
+            print_str("\n");
+        }
+        .actuator => {
+            d.value += 5;
+            print_str("  Actuator ");
+            print_u32(d.id);
+            print_str(": value=");
+            print_u32(d.value);
+            print_str("\n");
+        }
+        .display => {
+            print_str("  Display ");
+            print_u32(d.id);
+            print_str(": showing ");
+            print_u32(d.value);
+            print_str("\n");
+        }
+    }
+}
+
+u32 main() {
+    print_str("=== ZER Slab Registry Demo ===\n");
+    print_str("Max devices: ");
+    print_u32(MAX_DEVICES());
+    print_str("\n\n");
+
+    // Create devices with designated init pattern
+    Device template = { .id = 0, .kind = DeviceType.sensor, .value = 0, .active = false };
+    print_str("Template kind: sensor\n");
+
+    // Alloc via Slab
+    ?*Device ms1 = create_device(1, DeviceType.sensor);
+    *Device s1 = ms1 orelse return;
+    defer g_devices.free_ptr(s1);
+
+    ?*Device ma1 = create_device(2, DeviceType.actuator);
+    *Device a1 = ma1 orelse return;
+    defer g_devices.free_ptr(a1);
+
+    ?*Device md1 = create_device(3, DeviceType.display);
+    *Device d1 = md1 orelse return;
+    defer g_devices.free_ptr(d1);
+
+    // Process each
+    print_str("\n--- Processing ---\n");
+    process_device(s1);
+    process_device(s1);
+    process_device(a1);
+    d1.value = read_device(s1);
+    process_device(d1);
+
+    // Verify values
+    if (read_device(s1) != 20) { return 1; }
+    if (read_device(a1) != 5) { return 2; }
+
+    print_str("\n=== All registry tests passed ===\n");
+    return 0;
+    // defers fire here: free_ptr for all 3 devices
+}

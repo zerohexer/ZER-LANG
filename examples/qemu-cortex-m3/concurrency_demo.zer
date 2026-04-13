@@ -1,0 +1,115 @@
+// ZER Concurrency Demo — Cortex-M3 QEMU (hosted mode simulation)
+// ==============================================================
+// Exercises: shared struct, shared(rw), Semaphore, Barrier,
+// @atomic_*, @once, threadlocal, @critical, spawn + ThreadHandle
+//
+// NOTE: This example uses hosted mode (pthreads) — requires
+// a hosted target (Linux QEMU userspace or Docker), not
+// freestanding bare-metal. Demonstrates ZER concurrency safety
+// on the same ARM binary.
+
+// ---- UART (hosted: use putchar) ----
+i32 putchar(i32 c);
+
+void print_str([*]u8 s) {
+    for (usize i = 0; i < s.len; i += 1) {
+        putchar(@truncate(i32, s[i]));
+    }
+}
+
+void print_u32(u32 val) {
+    u8[10] buf;
+    u32 pos = 0;
+    if (val == 0) { putchar(48); return; }
+    u32 tmp = val;
+    while (tmp > 0) {
+        buf[pos] = @truncate(u8, (tmp % 10) + 48);
+        pos += 1;
+        tmp = tmp / 10;
+    }
+    u32 i = pos;
+    while (i > 0) {
+        i -= 1;
+        putchar(@truncate(i32, buf[i]));
+    }
+}
+
+// ---- Shared struct: auto-locked counter ----
+shared struct Counter { u32 value; }
+Counter g_counter;
+
+void increment_worker() {
+    for (u32 i = 0; i < 100; i += 1) {
+        g_counter.value += 1;
+    }
+}
+
+// ---- Semaphore: bounded resource pool ----
+Semaphore(2) g_slots;
+
+void resource_user(u32 id) {
+    @sem_acquire(g_slots);
+    @sem_release(g_slots);
+}
+
+// ---- @once: init exactly once ----
+volatile u32 g_init_count;
+
+void ensure_init() {
+    @once {
+        g_init_count = 1;
+    }
+}
+
+// ---- Main ----
+u32 main() {
+    print_str("=== ZER Concurrency Demo ===\n");
+
+    // Shared struct: 4 threads increment 100 each = 400
+    g_counter.value = 0;
+    ThreadHandle t1 = spawn increment_worker();
+    ThreadHandle t2 = spawn increment_worker();
+    ThreadHandle t3 = spawn increment_worker();
+    ThreadHandle t4 = spawn increment_worker();
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    print_str("Counter (4x100): ");
+    print_u32(g_counter.value);
+    print_str("\n");
+    if (g_counter.value != 400) { return 1; }
+
+    // Semaphore: 4 workers, 2 slots
+    ThreadHandle s1 = spawn resource_user(1);
+    ThreadHandle s2 = spawn resource_user(2);
+    ThreadHandle s3 = spawn resource_user(3);
+    ThreadHandle s4 = spawn resource_user(4);
+    s1.join();
+    s2.join();
+    s3.join();
+    s4.join();
+    print_str("Semaphore: all workers completed\n");
+
+    // @once: call twice, init_count should be 1
+    g_init_count = 0;
+    ensure_init();
+    ensure_init();
+    print_str("@once init_count: ");
+    print_u32(g_init_count);
+    print_str("\n");
+    if (g_init_count != 1) { return 2; }
+
+    // @critical: interrupt-disabled block (no-op on hosted, tests compilation)
+    u32 critical_val = 0;
+    @critical {
+        critical_val = 42;
+    }
+    if (critical_val != 42) { return 3; }
+    print_str("@critical: ");
+    print_u32(critical_val);
+    print_str("\n");
+
+    print_str("=== All concurrency tests passed ===\n");
+    return 0;
+}

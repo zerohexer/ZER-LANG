@@ -482,12 +482,29 @@ static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
         emit_expr(e, root);
         emit(e, "%s_zer_rwlock);\n", arrow);
     } else {
-        /* BUG-473: all shared structs use recursive pthread_mutex (lazy init) */
-        emit(e, "_zer_mtx_ensure_init(&");
-        emit_expr(e, root);
-        emit(e, "%s_zer_mtx, &", arrow);
-        emit_expr(e, root);
-        emit(e, "%s_zer_mtx_inited);\n", arrow);
+        /* BUG-473/504: all shared structs use recursive pthread_mutex (lazy init).
+         * For condvar-type shared structs, use _cv variant to also init condvar.
+         * Otherwise first auto-lock CAS sets inited=1 without condvar init,
+         * and subsequent _zer_mtx_ensure_init_cv sees inited=1 → skips condvar. */
+        Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
+        if (rte && rte->kind == TYPE_POINTER) rte = type_unwrap_distinct(rte->pointer.inner);
+        bool needs_cv = rte && rte->kind == TYPE_STRUCT &&
+            is_condvar_type(e, rte->struct_type.type_id);
+        if (needs_cv) {
+            emit(e, "_zer_mtx_ensure_init_cv(&");
+            emit_expr(e, root);
+            emit(e, "%s_zer_mtx, &", arrow);
+            emit_expr(e, root);
+            emit(e, "%s_zer_mtx_inited, &", arrow);
+            emit_expr(e, root);
+            emit(e, "%s_zer_cond);\n", arrow);
+        } else {
+            emit(e, "_zer_mtx_ensure_init(&");
+            emit_expr(e, root);
+            emit(e, "%s_zer_mtx, &", arrow);
+            emit_expr(e, root);
+            emit(e, "%s_zer_mtx_inited);\n", arrow);
+        }
         emit_indent(e);
         emit(e, "pthread_mutex_lock(&");
         emit_expr(e, root);

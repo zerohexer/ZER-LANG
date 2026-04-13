@@ -209,6 +209,10 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
 
 static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
+static void prescan_async_temps(Emitter *e, Node *node);
+static bool emit_async_orelse_block(Emitter *e, Node *orelse_expr, Node *fallback,
+                                     const char *dest_name, size_t dest_len,
+                                     Type *dest_type);
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
 static void emit_auto_guards(Emitter *e, Node *node);
 static void emit_defers(Emitter *e);
@@ -3131,47 +3135,12 @@ static void emit_stmt(Emitter *e, Node *node) {
                 if (node->var_decl.init->kind == NODE_ORELSE &&
                     node->var_decl.init->orelse.fallback &&
                     node->var_decl.init->orelse.fallback->kind == NODE_BLOCK) {
-                    Type *or_expr_type = checker_get_type(e->checker, node->var_decl.init->orelse.expr);
-                    Type *or_eff = or_expr_type ? type_unwrap_distinct(or_expr_type) : NULL;
-                    bool or_is_ptr = or_eff && or_eff->kind == TYPE_OPTIONAL &&
-                        is_null_sentinel(or_eff->optional.inner);
-
-                    int atid = -1;
-                    for (int ati = 0; ati < e->async_temp_count; ati++) {
-                        if (e->async_temps[ati].temp_id >= 0) {
-                            atid = e->async_temps[ati].temp_id;
-                            e->async_temps[ati].temp_id = -1;
-                            break;
-                        }
-                    }
-                    if (atid >= 0) {
-                        /* self->_zer_async_tmpN = expr; */
-                        emit_indent(e);
-                        emit(e, "self->_zer_async_tmp%d = ", atid);
-                        emit_expr(e, node->var_decl.init->orelse.expr);
-                        emit(e, ";\n");
-                        /* if (!self->_zer_async_tmpN.has_value) { block } */
-                        emit_indent(e);
-                        if (or_is_ptr) {
-                            emit(e, "if (!self->_zer_async_tmp%d) ", atid);
-                        } else {
-                            emit(e, "if (!self->_zer_async_tmp%d.has_value) ", atid);
-                        }
-                        emit_stmt(e, node->var_decl.init->orelse.fallback);
-                        emit(e, "\n");
-                        /* self->varname = self->_zer_async_tmpN.value; */
-                        emit_indent(e);
-                        if (or_is_ptr) {
-                            emit(e, "self->%.*s = self->_zer_async_tmp%d;\n",
-                                 (int)node->var_decl.name_len, node->var_decl.name, atid);
-                        } else if (is_void_opt(checker_get_type(e->checker, node))) {
-                            /* ?void — no value */
-                        } else {
-                            emit(e, "self->%.*s = self->_zer_async_tmp%d.value;\n",
-                                 (int)node->var_decl.name_len, node->var_decl.name, atid);
-                        }
+                    /* Refactor 2: unified async orelse emission */
+                    if (emit_async_orelse_block(e, node->var_decl.init->orelse.expr,
+                            node->var_decl.init->orelse.fallback,
+                            node->var_decl.name, node->var_decl.name_len,
+                            checker_get_type(e->checker, node)))
                         break;
-                    }
                     /* fallthrough to generic emit_expr if no async temp */
                 }
 
@@ -3251,55 +3220,15 @@ static void emit_stmt(Emitter *e, Node *node) {
             break;
         }
 
-        /* BUG-481: async orelse { block } — emit as separate statements with
-         * temp in state struct. Avoids GCC statement expression with stack temp
-         * that would be stale after yield/resume. */
+        /* BUG-481: async orelse { block } — Refactor 2: unified helper */
         if (e->in_async && node->var_decl.init &&
             node->var_decl.init->kind == NODE_ORELSE &&
             node->var_decl.init->orelse.fallback &&
             node->var_decl.init->orelse.fallback->kind == NODE_BLOCK) {
-            Type *or_expr_type = checker_get_type(e->checker, node->var_decl.init->orelse.expr);
-            Type *or_eff = or_expr_type ? type_unwrap_distinct(or_expr_type) : NULL;
-            bool or_is_ptr = or_eff && or_eff->kind == TYPE_OPTIONAL &&
-                is_null_sentinel(or_eff->optional.inner);
-
-            /* Find a pre-scanned async temp */
-            int atid = -1;
-            for (int ati = 0; ati < e->async_temp_count; ati++) {
-                if (e->async_temps[ati].temp_id >= 0) {
-                    atid = e->async_temps[ati].temp_id;
-                    e->async_temps[ati].temp_id = -1; /* mark used */
-                    break;
-                }
-            }
-            if (atid >= 0) {
-                /* Emit: self->_zer_async_tmpN = expr; */
-                emit_indent(e);
-                emit(e, "self->_zer_async_tmp%d = ", atid);
-                emit_expr(e, node->var_decl.init->orelse.expr);
-                emit(e, ";\n");
-                /* Emit: if (!self->_zer_async_tmpN.has_value) { block } */
-                emit_indent(e);
-                if (or_is_ptr) {
-                    emit(e, "if (!self->_zer_async_tmp%d) ", atid);
-                } else {
-                    emit(e, "if (!self->_zer_async_tmp%d.has_value) ", atid);
-                }
-                emit_stmt(e, node->var_decl.init->orelse.fallback);
-                emit(e, "\n");
-                /* Emit: self->varname = self->_zer_async_tmpN.value; */
-                emit_indent(e);
-                if (or_is_ptr) {
-                    emit(e, "self->%.*s = self->_zer_async_tmp%d;\n",
-                         (int)node->var_decl.name_len, node->var_decl.name, atid);
-                } else if (is_void_opt(type)) {
-                    emit(e, "/* ?void — no value to extract */\n");
-                } else {
-                    emit(e, "self->%.*s = self->_zer_async_tmp%d.value;\n",
-                         (int)node->var_decl.name_len, node->var_decl.name, atid);
-                }
+            if (emit_async_orelse_block(e, node->var_decl.init->orelse.expr,
+                    node->var_decl.init->orelse.fallback,
+                    node->var_decl.name, node->var_decl.name_len, type))
                 break;
-            }
             /* fallthrough to normal path if no async temp available */
         }
 
@@ -3807,41 +3736,16 @@ static void emit_stmt(Emitter *e, Node *node) {
         /* auto-guard: emit bounds guards before the statement */
         emit_auto_guards(e, node->expr_stmt.expr);
 
-        /* BUG-503: async expr-stmt with orelse block + yield.
-         * Can't use GCC statement expression (case labels forbidden inside).
-         * Restructure to separate statements using state struct temp.
-         * Result is discarded (expr-stmt) so no assignment needed. */
+        /* BUG-503: async expr-stmt orelse — Refactor 2: unified helper.
+         * dest_name=NULL → result discarded (expr-stmt). */
         if (e->in_async && node->expr_stmt.expr &&
             node->expr_stmt.expr->kind == NODE_ORELSE &&
             node->expr_stmt.expr->orelse.fallback &&
             node->expr_stmt.expr->orelse.fallback->kind == NODE_BLOCK) {
-            int atid = -1;
-            for (int ati = 0; ati < e->async_temp_count; ati++) {
-                if (e->async_temps[ati].temp_id >= 0) {
-                    atid = e->async_temps[ati].temp_id;
-                    e->async_temps[ati].temp_id = -1;
-                    break;
-                }
-            }
-            if (atid >= 0) {
-                Type *orelse_type = checker_get_type(e->checker, node->expr_stmt.expr->orelse.expr);
-                Type *or_eff = orelse_type ? type_unwrap_distinct(orelse_type) : NULL;
-                bool or_is_ptr = or_eff && or_eff->kind == TYPE_OPTIONAL &&
-                    is_null_sentinel(or_eff->optional.inner);
-                emit_indent(e);
-                emit(e, "self->_zer_async_tmp%d = ", atid);
-                emit_expr(e, node->expr_stmt.expr->orelse.expr);
-                emit(e, ";\n");
-                emit_indent(e);
-                if (or_is_ptr) {
-                    emit(e, "if (!self->_zer_async_tmp%d) ", atid);
-                } else {
-                    emit(e, "if (!self->_zer_async_tmp%d.has_value) ", atid);
-                }
-                emit_stmt(e, node->expr_stmt.expr->orelse.fallback);
-                emit(e, "\n");
+            if (emit_async_orelse_block(e, node->expr_stmt.expr->orelse.expr,
+                    node->expr_stmt.expr->orelse.fallback,
+                    NULL, 0, NULL))
                 break;
-            }
         }
 
         emit_indent(e);
@@ -4475,8 +4379,59 @@ static void emit_struct_decl(Emitter *e, Node *node) {
  * can jump INTO loops — valid C since 1983.
  * ================================================================ */
 
-/* Forward declaration — prescan_async_temps and prescan_expr_for_orelse are mutually recursive */
-static void prescan_async_temps(Emitter *e, Node *node);
+/* Refactor 2: unified async orelse block emission (implementation).
+ * Forward-declared near top of file. */
+static bool emit_async_orelse_block(Emitter *e, Node *orelse_expr, Node *fallback,
+                                     const char *dest_name, size_t dest_len,
+                                     Type *dest_type) {
+    if (!e->in_async) return false;
+
+    int atid = -1;
+    for (int ati = 0; ati < e->async_temp_count; ati++) {
+        if (e->async_temps[ati].temp_id >= 0) {
+            atid = e->async_temps[ati].temp_id;
+            e->async_temps[ati].temp_id = -1; /* mark used */
+            break;
+        }
+    }
+    if (atid < 0) return false;
+
+    Type *or_expr_type = checker_get_type(e->checker, orelse_expr);
+    Type *or_eff = or_expr_type ? type_unwrap_distinct(or_expr_type) : NULL;
+    bool or_is_ptr = or_eff && or_eff->kind == TYPE_OPTIONAL &&
+        is_null_sentinel(or_eff->optional.inner);
+
+    /* self->_zer_async_tmpN = expr; */
+    emit_indent(e);
+    emit(e, "self->_zer_async_tmp%d = ", atid);
+    emit_expr(e, orelse_expr);
+    emit(e, ";\n");
+
+    /* if (!self->_zer_async_tmpN.has_value) { block } */
+    emit_indent(e);
+    if (or_is_ptr) {
+        emit(e, "if (!self->_zer_async_tmp%d) ", atid);
+    } else {
+        emit(e, "if (!self->_zer_async_tmp%d.has_value) ", atid);
+    }
+    emit_stmt(e, fallback);
+    emit(e, "\n");
+
+    /* self->dest = self->_zer_async_tmpN.value; (skip if dest_name is NULL = discard) */
+    if (dest_name) {
+        emit_indent(e);
+        if (or_is_ptr) {
+            emit(e, "self->%.*s = self->_zer_async_tmp%d;\n",
+                 (int)dest_len, dest_name, atid);
+        } else if (dest_type && is_void_opt(dest_type)) {
+            /* ?void — no value to extract */
+        } else {
+            emit(e, "self->%.*s = self->_zer_async_tmp%d.value;\n",
+                 (int)dest_len, dest_name, atid);
+        }
+    }
+    return true;
+}
 
 /* BUG-495: helper — register one async orelse temp */
 static void register_async_orelse_temp(Emitter *e, Node *orelse_expr) {

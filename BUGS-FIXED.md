@@ -5,6 +5,17 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Refactors R1-R3 (3 helpers, 3 latent bugs fixed)
+
+### R1: vrp_invalidate_for_assign (checker.c)
+Unified VRP range invalidation for simple ident and compound key paths. One helper replaces 2 duplicated blocks (68→45 lines). **Latent bug fixed:** compound key path was missing BUG-502 compound op check (`s.idx += 20` didn't wipe "s.idx" range).
+
+### R2: emit_async_orelse_block (emitter.c)
+Unified async orelse emission for var-decl (2 paths) and expr-stmt (1 path). One helper replaces 3 duplicated blocks (116→45 lines). **Latent bug fixed:** void check inconsistency between site 1 (`checker_get_type`) and site 2 (local `type` variable).
+
+### R3: emit_shared_ensure_init (emitter.c)
+Unified shared struct ensure-init for auto-lock + 4 condvar intrinsics. One helper replaces 5 duplicated patterns (57→20 lines). **Latent bug fixed:** auto-lock for condvar-type shared structs used `_zer_mtx_ensure_init` (no condvar) instead of `_cv` variant. CAS winner set `inited=1` without initializing condvar → subsequent `@cond_wait` saw `inited=1` and skipped.
+
 ## Session 2026-04-13 — Gemini Red Team Round 12 (3 real bugs from 5 reports)
 
 ### BUG-502: VRP compound assign range invalidation

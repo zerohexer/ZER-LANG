@@ -1,0 +1,13 @@
+// Multiple params all survive yield (BUG-477)
+async void process(u32 a, u32 b, u32 c) {
+    yield;
+    u32 sum = a + b + c;
+}
+
+u32 main() {
+    _zer_async_process task;
+    _zer_async_process_init(&task, 10, 20, 30);
+    _zer_async_process_poll(&task);
+    _zer_async_process_poll(&task);
+    return 0;
+}

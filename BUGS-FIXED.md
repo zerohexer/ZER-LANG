@@ -5,6 +5,23 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Gemini Red Team Round 12 (3 real bugs from 5 reports)
+
+### BUG-502: VRP compound assign range invalidation
+`i += 20` after guard `if (i < 5)` left stale range [0,4]. Fix: range invalidation for ALL assignment ops, not just `TOK_EQ`. Compound ops wipe unconditionally. Direct `=` tries to derive new range.
+**Test:** `tests/zer/vrp_compound_assign.zer`
+
+### BUG-503: Async expr-stmt orelse restructured emission
+`maybe_get() orelse { yield; return; };` as expr-stmt → GCC "switch jumps into statement expression." Fix: NODE_EXPR_STMT intercepts orelse+block in async mode before `emit_expr`. Uses state struct temp, separate statements. Same approach as BUG-481 var-decl path.
+**Test:** `tests/zer/async_exprstmt_orelse.zer`
+
+### BUG-504: Condvar intrinsics call _zer_mtx_ensure_init_cv
+@cond_wait/@cond_timedwait/@cond_signal/@cond_broadcast emitted `pthread_mutex_lock` without `_zer_mtx_ensure_init_cv`. First access via condvar intrinsic → uninitialized mutex/condvar → crash. Fix: all 4 condvar intrinsics now call `_zer_mtx_ensure_init_cv` before `pthread_mutex_lock`.
+
+### Not bugs (V56, V60)
+- V56: VRP parent alias — bounds check present. VRP conservative for compound keys.
+- V60: Optional enum switch — GCC emission error (separate issue), not exhaustiveness gap.
+
 ## Session 2026-04-13 — Gemini Red Team Round 11 (4 real bugs from 5 reports)
 
 ### BUG-498: Sync primitives in packed struct → misaligned hard fault

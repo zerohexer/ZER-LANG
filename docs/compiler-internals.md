@@ -1031,6 +1031,29 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Refactors R1-R3 (2026-04-13) — Duplication elimination, 3 latent bugs found
+
+Analysis of 12 red team rounds identified 3 areas where code duplication was CAUSING bugs (not just aesthetic debt). Each refactor extracted a helper that unified duplicated logic and fixed a latent inconsistency.
+
+### R1: `vrp_invalidate_for_assign(c, key, key_len, op, value)` (checker.c)
+**What:** Unified VRP range invalidation for assignments. Called with simple ident key AND compound key.
+**Why:** Compound key path was missing compound op check (latent BUG-502: `s.idx += 20` didn't wipe `s.idx` range). Both paths now use identical logic.
+**Impact:** 2 blocks (68 lines) → 1 helper (45 lines). Future assignment forms automatically covered.
+
+### R2: `emit_async_orelse_block(e, expr, fallback, dest, len, type)` (emitter.c)
+**What:** Unified async orelse emission. `dest=NULL` for expr-stmt (discard), `dest` set for var-decl (assign).
+**Why:** 3 near-identical blocks had void check inconsistency (one used `checker_get_type`, another used local `type` variable). Helper uses `dest_type` parameter consistently.
+**Impact:** 3 blocks (116 lines) → 1 helper (45 lines). Adding a new orelse context = one call.
+
+### R3: `emit_shared_ensure_init(e, root, arrow)` (emitter.c)
+**What:** Unified shared struct mutex+condvar initialization. Checks `is_condvar_type` internally.
+**Why:** Auto-lock path used `_zer_mtx_ensure_init` (no condvar) for condvar-type shared structs. CAS winner set `inited=1` without condvar init → `@cond_wait` saw `inited=1` → skipped → uninitialized condvar.
+**Impact:** 5 sites (57 lines) → 1 helper (20 lines). Adding a new condvar intrinsic = one call.
+
+**Total: 10 duplicated sites → 3 helpers. ~80 lines removed. 3 latent bugs fixed by unification.**
+
+**Lesson:** Code duplication in compilers isn't just debt — it's a bug factory. When two code paths implement the same concept independently, they WILL diverge. The refactor doesn't just clean up code — it makes future divergence impossible.
+
 ## Red Team Audit Fixes — Round 12 (2026-04-13, Gemini — 5 claims, 3 real bugs)
 
 ### BUG-502: VRP compound assignment range invalidation

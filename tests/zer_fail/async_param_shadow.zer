@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// BUG-499: Async param shadowing overwrites param in state struct
+async void process(u32 id) {
+    yield;
+    u32 id = 100;
+    yield;
+}
+u32 main() { return 0; }

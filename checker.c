@@ -6417,6 +6417,23 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-499: reject variable shadowing of function parameters in async functions.
+         * In async, params and locals share the state struct — same field name.
+         * Shadowing would overwrite the param value. Regular functions are fine
+         * (separate stack slots for param and local). */
+        if (c->in_async && c->current_func_ret) {
+            /* Walk parent scope chain to check if name matches a param */
+            Symbol *existing = scope_lookup(c->current_scope,
+                node->var_decl.name, (uint32_t)node->var_decl.name_len);
+            if (existing && existing->line != node->loc.line) {
+                checker_error(c, node->loc.line,
+                    "variable '%.*s' shadows function parameter in async function — "
+                    "async locals share state struct with params, shadowing overwrites param value. "
+                    "Use a different name",
+                    (int)node->var_decl.name_len, node->var_decl.name);
+            }
+        }
+
         Symbol *sym = add_symbol(c, node->var_decl.name,
                                  (uint32_t)node->var_decl.name_len,
                                  type, node->loc.line);
@@ -8300,6 +8317,19 @@ static void register_decl(Checker *c, Node *node) {
                 if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB)) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
+                }
+                /* BUG-498: synchronization primitives in packed struct → misaligned.
+                 * pthread_mutex_t requires natural alignment. Packed structs can place
+                 * fields at unaligned offsets → hard fault on ARM/RISC-V. */
+                if (node->struct_decl.is_packed && sf->type) {
+                    Type *ft = type_unwrap_distinct(sf->type);
+                    if (ft->kind == TYPE_SEMAPHORE || ft->kind == TYPE_BARRIER ||
+                        (ft->kind == TYPE_STRUCT && ft->struct_type.is_shared)) {
+                        checker_error(c, node->loc.line,
+                            "synchronization primitive '%.*s' cannot be inside packed struct — "
+                            "pthread_mutex_t requires natural alignment",
+                            (int)sf->name_len, sf->name);
+                    }
                 }
                 /* Red Team V10: move struct inside shared struct → ownership breach.
                  * A thread can "move" the field out, leaving shared struct in zombie state. */
@@ -10539,10 +10569,20 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
         int n = collect_shared_types_in_stmt(c, stmt, found, 4);
         if (n >= 2) {
             /* Two different shared types in one statement — potential deadlock.
-             * Report with ordering info so user knows which to access first. */
+             * BUG-500: skip for shared(rw) read-only statements. rwlock allows
+             * concurrent readers — no deadlock. Only writes need exclusive lock. */
             uint32_t id0 = found[0]->struct_type.type_id;
             uint32_t id1 = found[1]->struct_type.type_id;
-            if (id0 != id1) {
+            bool both_rw = found[0]->struct_type.is_shared_rw &&
+                           found[1]->struct_type.is_shared_rw;
+            /* Check if statement is read-only (no NODE_ASSIGN to shared field) */
+            bool is_read_only = (stmt->kind != NODE_EXPR_STMT ||
+                !stmt->expr_stmt.expr || stmt->expr_stmt.expr->kind != NODE_ASSIGN) &&
+                stmt->kind != NODE_ASSIGN;
+            if (stmt->kind == NODE_VAR_DECL) is_read_only = true; /* reading into local */
+            if (both_rw && is_read_only) {
+                /* Safe: two shared(rw) read-only accesses — concurrent readers OK */
+            } else if (id0 != id1) {
                 Type *lo = (id0 < id1) ? found[0] : found[1];
                 Type *hi = (id0 < id1) ? found[1] : found[0];
                 checker_error(c, stmt->loc.line,

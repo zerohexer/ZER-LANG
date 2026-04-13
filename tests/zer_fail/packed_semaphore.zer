@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// BUG-498: Sync primitive in packed struct — misaligned on ARM/RISC-V
+packed struct Device {
+    u8 status;
+    Semaphore(1) lock;
+}
+Device d;
+u32 main() { return 0; }

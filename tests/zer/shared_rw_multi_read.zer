@@ -1,0 +1,12 @@
+// shared(rw) two different types read-only — no deadlock (BUG-500)
+shared(rw) struct Config1 { u32 val; }
+shared(rw) struct Config2 { u32 val; }
+Config1 g1;
+Config2 g2;
+u32 main() {
+    g1.val = 10;
+    g2.val = 20;
+    u32 x = g1.val + g2.val;
+    if (x != 30) { return 1; }
+    return 0;
+}

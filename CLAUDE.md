@@ -688,8 +688,19 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 | `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
+| `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.
+
+**Firmware examples (v0.3 feature coverage):**
+- `hello.zer` — MMIO, UART, enum, orelse, bounds check (v0.2)
+- `rtos.zer` — Pool, Ring, Arena, Handle, spawn, union, defer (v0.2)
+- `shell.zer` — Pool, Ring, Arena, spawn, switch (v0.2)
+- `ringbuf_protocol.zer` — Ring, Arena, Handle, enum (v0.2)
+- `stress_test.zer` — Arena, Handle, union, defer (v0.2)
+- `async_sensor.zer` — async/yield, comptime, container(T), move struct, designated init (v0.3)
+- `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
+- `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
 
 ### Test Organization Rules — Where to Put New Tests
 

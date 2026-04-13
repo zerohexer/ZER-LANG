@@ -1031,6 +1031,21 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Firmware Examples + Polish (2026-04-13)
+
+3 new firmware examples exercising ALL v0.3 features. Zero bugs found — confirms compiler readiness.
+
+| Example | Features Exercised |
+|---|---|
+| `async_sensor.zer` | async/yield, comptime, container(T), move struct, designated init, do-while |
+| `concurrency_demo.zer` | shared struct, Semaphore, @once, @critical, spawn+ThreadHandle |
+| `slab_registry.zer` | Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch |
+
+### cinclude angle bracket fix
+`cinclude "<stdio.h>"` now emits `#include <stdio.h>` (system header). Previously emitted `#include "<stdio.h>"` (double-quoted angles — GCC error). Detects `<` at start and `>` at end of path string. Local headers (`cinclude "myheader.h"`) unchanged.
+
+**Found by:** writing firmware examples, not adversarial testing. Real usage finds feature gaps that red team rounds don't probe (they attack safety logic, not basic emission).
+
 ## Codebase Analysis Audit (2026-04-13) — 2 bugs found by code reading
 
 Targeted analysis of 3 risk areas identified by 12 red team rounds. Read code flows to understand coupling before deciding what to fix.

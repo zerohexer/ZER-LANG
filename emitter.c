@@ -5333,8 +5333,17 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         break;
 
     case NODE_CINCLUDE:
-        emit(e, "#include \"%.*s\"\n",
-             (int)decl->cinclude.path_len, decl->cinclude.path);
+        /* cinclude "<stdio.h>" → #include <stdio.h>  (system header)
+         * cinclude "myheader.h" → #include "myheader.h" (local header) */
+        if (decl->cinclude.path_len >= 2 &&
+            decl->cinclude.path[0] == '<' &&
+            decl->cinclude.path[decl->cinclude.path_len - 1] == '>') {
+            emit(e, "#include %.*s\n",
+                 (int)decl->cinclude.path_len, decl->cinclude.path);
+        } else {
+            emit(e, "#include \"%.*s\"\n",
+                 (int)decl->cinclude.path_len, decl->cinclude.path);
+        }
         break;
 
     case NODE_INTERRUPT:

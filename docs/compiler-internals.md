@@ -1031,6 +1031,23 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Codebase Analysis Audit (2026-04-13) — 2 bugs found by code reading
+
+Targeted analysis of 3 risk areas identified by 12 red team rounds. Read code flows to understand coupling before deciding what to fix.
+
+### BUG-505: Optional enum switch emission
+`is_opt_switch` path emitted `emit_expr(arm->values[j])` for enum dot values → bare ident `red` (undeclared in C). Regular enum switch path at line 4022 uses `EMIT_ENUM_NAME`. Optional path was a copy that diverged. Fix: optional path uses same `_ZER_EnumName_variant` pattern. Also: `type_unwrap_distinct` on detection, `opt_inner_enum` tracked.
+
+### *opaque comparison unconditional
+`emit_type(TYPE_POINTER)` at line 593 emits `_zer_opaque` unconditionally (not gated by `track_cptrs`). BUG-485 fix incorrectly gated `.ptr` comparison on `e->track_cptrs`. Found by reading the type emission code flow — the struct representation is always active.
+
+**Method:** Read 3 targeted areas based on bug distribution data:
+1. Async + untested features → code analysis showed all should work (recursive local collection covers for-init, blocks, etc.)
+2. *opaque emission → found unconditional struct, incorrect guard
+3. Optional enum switch → found bare ident divergence from regular enum path
+
+**Lesson:** Code reading targeted by bug pattern data finds bugs that testing misses. The *opaque bug was invisible to tests because `--run` enables `track_cptrs` — the guard happened to be true in all test scenarios. Only reading the code reveals the unconditional struct emission.
+
 ## Refactors R1-R3 (2026-04-13) — Duplication elimination, 3 latent bugs found
 
 Analysis of 12 red team rounds identified 3 areas where code duplication was CAUSING bugs (not just aesthetic debt). Each refactor extracted a helper that unified duplicated logic and fixed a latent inconsistency.

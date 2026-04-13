@@ -1,0 +1,12 @@
+// Async expr-stmt orelse with yield (BUG-503)
+?u32 maybe_get() { return null; }
+async void task() {
+    maybe_get() orelse { yield; return; };
+}
+u32 main() {
+    _zer_async_task t;
+    _zer_async_task_init(&t);
+    _zer_async_task_poll(&t);
+    _zer_async_task_poll(&t);
+    return 0;
+}

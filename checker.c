@@ -2672,7 +2672,10 @@ static Type *check_expr(Checker *c, Node *node) {
         /* BUG-194: On plain assignment, clear+recompute safety flags on target.
          * Without this: p = &local; p = &global; return p → false positive.
          * Also: p = &global; p = &local; return p → false negative. */
-        if (node->assign.op == TOK_EQ) {
+        /* BUG-502: range invalidation for ALL assignment ops, not just TOK_EQ.
+         * Compound assignments (+=, -=, *=, etc.) also change the value.
+         * if (i < 5) { i += 20; arr[i]; } → stale range without this fix. */
+        {
             Node *troot = node->assign.target;
             while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
                 if (troot->kind == NODE_FIELD) troot = troot->field.object;
@@ -2682,47 +2685,54 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *tsym = scope_lookup(c->current_scope,
                     troot->ident.name, (uint32_t)troot->ident.name_len);
                 if (tsym) {
-                    /* invalidate value range — reassignment makes old range stale.
-                     * Without this: if (i < 10) { i = get_input(); arr[i]; }
-                     * would use stale range [0,9] for i after reassignment.
-                     * Override existing range directly (don't intersect).
+                    /* invalidate value range — assignment makes old range stale.
+                     * For TOK_EQ: try to derive new range from value.
+                     * For compound (+=, -=, etc.): always wipe (can't easily compute new range).
                      * Also invalidate compound keys (s.x) for struct field assignments. */
                     {
                         /* simple ident range */
                         struct VarRange *existing = find_var_range(c, troot->ident.name,
                             (uint32_t)troot->ident.name_len);
                         if (existing) {
-                            if (node->assign.value->kind == NODE_INT_LIT) {
-                                int64_t v = (int64_t)node->assign.value->int_lit.value;
-                                existing->min_val = v;
-                                existing->max_val = v;
-                                existing->known_nonzero = (v != 0);
-                            } else {
-                                /* try derive range from expression: x % N, x & MASK */
-                                int64_t rmin, rmax;
-                                if (derive_expr_range(c, node->assign.value, &rmin, &rmax)) {
-                                    existing->min_val = rmin;
-                                    existing->max_val = rmax;
-                                    existing->known_nonzero = (rmin > 0);
-                                } else if (node->assign.value->kind == NODE_CALL &&
-                                           node->assign.value->call.callee->kind == NODE_IDENT) {
-                                    Symbol *csym = scope_lookup(c->current_scope,
-                                        node->assign.value->call.callee->ident.name,
-                                        (uint32_t)node->assign.value->call.callee->ident.name_len);
-                                    if (csym && csym->has_return_range) {
-                                        existing->min_val = csym->return_range_min;
-                                        existing->max_val = csym->return_range_max;
-                                        existing->known_nonzero = (csym->return_range_min > 0);
+                            if (node->assign.op == TOK_EQ) {
+                                /* direct assignment: try to derive new range */
+                                if (node->assign.value->kind == NODE_INT_LIT) {
+                                    int64_t v = (int64_t)node->assign.value->int_lit.value;
+                                    existing->min_val = v;
+                                    existing->max_val = v;
+                                    existing->known_nonzero = (v != 0);
+                                } else {
+                                    int64_t rmin, rmax;
+                                    if (derive_expr_range(c, node->assign.value, &rmin, &rmax)) {
+                                        existing->min_val = rmin;
+                                        existing->max_val = rmax;
+                                        existing->known_nonzero = (rmin > 0);
+                                    } else if (node->assign.value->kind == NODE_CALL &&
+                                               node->assign.value->call.callee->kind == NODE_IDENT) {
+                                        Symbol *csym = scope_lookup(c->current_scope,
+                                            node->assign.value->call.callee->ident.name,
+                                            (uint32_t)node->assign.value->call.callee->ident.name_len);
+                                        if (csym && csym->has_return_range) {
+                                            existing->min_val = csym->return_range_min;
+                                            existing->max_val = csym->return_range_max;
+                                            existing->known_nonzero = (csym->return_range_min > 0);
+                                        } else {
+                                            existing->min_val = INT64_MIN;
+                                            existing->max_val = INT64_MAX;
+                                            existing->known_nonzero = false;
+                                        }
                                     } else {
                                         existing->min_val = INT64_MIN;
                                         existing->max_val = INT64_MAX;
                                         existing->known_nonzero = false;
                                     }
-                                } else {
-                                    existing->min_val = INT64_MIN;
-                                    existing->max_val = INT64_MAX;
-                                    existing->known_nonzero = false;
                                 }
+                            } else {
+                                /* BUG-502: compound assignment (+=, -=, etc.)
+                                 * — always wipe range (can't compute new value easily) */
+                                existing->min_val = INT64_MIN;
+                                existing->max_val = INT64_MAX;
+                                existing->known_nonzero = false;
                             }
                         }
                         /* compound key range (e.g., "s.x" for struct field) */

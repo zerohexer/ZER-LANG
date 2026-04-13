@@ -1095,11 +1095,10 @@ static void emit_expr(Emitter *e, Node *node) {
                     break;
                 }
             }
-            /* BUG-485: *opaque comparison — _zer_opaque is a struct when track_cptrs
-             * is active. C can't use == on structs. Compare .ptr fields instead.
-             * *opaque is TYPE_POINTER(TYPE_OPAQUE) in the type system. */
-            if (e->track_cptrs &&
-                (node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ) &&
+            /* BUG-485: *opaque comparison — _zer_opaque is ALWAYS a struct
+             * (not just when track_cptrs). C can't use == on structs.
+             * Compare .ptr fields instead. */
+            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ) &&
                 node->binary.left->kind != NODE_NULL_LIT &&
                 node->binary.right->kind != NODE_NULL_LIT) {
                 Type *lt = checker_get_type(e->checker, node->binary.left);

@@ -1824,6 +1824,17 @@ static void emit_expr(Emitter *e, Node *node) {
         }
         /* BUG-410: unwrap distinct for field access dispatch */
         Type *obj_eff = obj_type ? type_unwrap_distinct(obj_type) : NULL;
+
+        /* BUG-501: array.len → emit array size as literal.
+         * Fixed arrays in C don't have .len field. range-for desugaring
+         * generates collection.len for both slices and arrays. */
+        if (obj_eff && obj_eff->kind == TYPE_ARRAY &&
+            node->field.field_name_len == 3 &&
+            memcmp(node->field.field_name, "len", 3) == 0) {
+            emit(e, "%lluU", (unsigned long long)obj_eff->array.size);
+            break;
+        }
+
         if (obj_eff && obj_eff->kind == TYPE_ENUM) {
             emit(e, "_ZER_");
             EMIT_ENUM_NAME(e, obj_eff);

@@ -1031,6 +1031,29 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Red Team Audit Fixes — Round 12 (2026-04-13, Gemini — 5 claims, 3 real bugs)
+
+### BUG-502: VRP compound assignment range invalidation
+Range invalidation was gated by `if (node->assign.op == TOK_EQ)`. Compound ops (`+=`, `-=`, `*=`, etc.) skipped — left stale proven ranges. Fix: ALL assignment ops trigger invalidation. `TOK_EQ` tries to derive new range from value. Compound ops wipe unconditionally.
+
+**VRP architecture after BUG-475/478/479/502:**
+1. `&var` → `address_taken=true`, permanently invalid (TOK_AMP handler)
+2. Function call → global variable ranges wiped (NODE_CALL handler)
+3. Direct assignment `=` → derive new range or wipe (NODE_ASSIGN handler)
+4. Compound assignment `+=/-=/*=` → wipe unconditionally (NODE_ASSIGN handler)
+5. Comptime calls exempt (pure)
+
+### BUG-503: Async expr-stmt orelse restructured
+NODE_EXPR_STMT handler intercepts orelse+block in async mode before `emit_expr`. Uses pre-scanned state struct temp. Separate statements (no GCC statement expression). Result discarded (expr-stmt).
+
+**Async orelse emission summary (3 paths):**
+- **Var-decl init** (BUG-481): `self->tmp = expr; if (!tmp.has_value) { block } self->x = tmp.value;`
+- **Expr-stmt** (BUG-503): `self->tmp = expr; if (!tmp.has_value) { block }`
+- **Expression level** (V46): GCC limitation — can't fix, GCC error is clear
+
+### BUG-504: Condvar intrinsic initialization
+All 4 condvar intrinsics (@cond_wait, @cond_timedwait, @cond_signal, @cond_broadcast) now call `_zer_mtx_ensure_init_cv` before `pthread_mutex_lock`. Previously, if the first access to a shared struct was via condvar intrinsic (no prior field access to trigger auto-lock init), the mutex/condvar were uninitialized.
+
 ## Red Team Audit Fixes — Round 11 (2026-04-13, Gemini — 5 claims, 4 real bugs)
 
 ### BUG-498: Packed struct sync primitive rejection

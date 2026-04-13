@@ -5,6 +5,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-13 — Firmware Examples + Polish
+
+### cinclude angle bracket emission
+`cinclude "<stdio.h>"` emitted `#include "<stdio.h>"` (double-quoted angles). Fix: detect `<` at start and `>` at end → emit `#include <stdio.h>` without outer quotes. Local headers unchanged.
+**Found by:** writing firmware examples (not safety bug — feature incompleteness).
+
 ## Session 2026-04-13 — Codebase Analysis Audit (2 bugs found by code reading)
 
 ### BUG-505: Optional enum switch bare ident emission

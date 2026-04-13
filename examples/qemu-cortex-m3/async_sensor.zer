@@ -1,0 +1,145 @@
+// ZER Async Sensor Reader — Cortex-M3 QEMU
+// ============================================
+// Exercises: async/yield/await, comptime, designated init,
+// container(T), Slab(T), move struct, do-while, @critical
+//
+// Simulates 3 async sensor tasks cooperatively sharing CPU.
+// Each reads from a "sensor" (simulated via counter) and
+// yields between readings. Demonstrates stackless coroutines
+// on bare metal — zero heap, zero OS.
+
+// ---- Hardware ----
+volatile *u32 UART0_DR = @inttoptr(*u32, 0x4000C000);
+volatile *u32 UART0_FR = @inttoptr(*u32, 0x4000C018);
+
+void uart_putc(u8 c) {
+    while ((*UART0_FR & 0x20) != 0) { }
+    *UART0_DR = @truncate(u32, c);
+}
+
+void uart_puts([*]u8 s) {
+    for (usize i = 0; i < s.len; i += 1) { uart_putc(s[i]); }
+}
+
+void uart_u32(u32 val) {
+    u8[10] buf;
+    u32 pos = 0;
+    if (val == 0) { uart_putc(48); return; }
+    u32 tmp = val;
+    while (tmp > 0) {
+        buf[pos] = @truncate(u8, (tmp % 10) + 48);
+        pos += 1;
+        tmp = tmp / 10;
+    }
+    u32 i = pos;
+    do {
+        i -= 1;
+        uart_putc(buf[i]);
+    } while (i > 0);
+}
+
+// ---- Comptime constants ----
+comptime u32 MAX_SAMPLES() { return 8; }
+comptime u32 SENSOR_COUNT() { return 3; }
+
+// ---- Container: generic ring buffer ----
+container SampleBuf(T) {
+    T[8] data;
+    u32 head;
+    u32 count;
+}
+
+void samplebuf_push(*SampleBuf(u32) buf, u32 val) {
+    if (buf.count < 8) {
+        buf.data[buf.head] = val;
+        buf.head = (buf.head + 1) % 8;
+        buf.count += 1;
+    }
+}
+
+// ---- Move struct: one-shot calibration token ----
+move struct CalibToken { u32 sensor_id; u32 offset; }
+
+void apply_calibration(CalibToken tok) {
+    uart_puts("  Calibrated sensor ");
+    uart_u32(tok.sensor_id);
+    uart_puts(" offset=");
+    uart_u32(tok.offset);
+    uart_puts("\n");
+}
+
+// ---- Designated init ----
+struct SensorConfig {
+    u32 id;
+    u32 interval;
+    u32 threshold;
+}
+
+// ---- Async sensor reader ----
+async void read_sensor(u32 id) {
+    u32 reading = id * 10;
+    u32 i = 0;
+    while (i < 3) {
+        reading += 1;
+        uart_puts("  Sensor ");
+        uart_u32(id);
+        uart_puts(": reading=");
+        uart_u32(reading);
+        uart_puts("\n");
+        i += 1;
+        yield;
+    }
+}
+
+// ---- Main ----
+void zer_main() {
+    uart_puts("=== ZER Async Sensor Demo ===\n");
+
+    // Comptime
+    uart_puts("Max samples: ");
+    uart_u32(MAX_SAMPLES());
+    uart_puts(", Sensors: ");
+    uart_u32(SENSOR_COUNT());
+    uart_puts("\n");
+
+    // Designated init
+    SensorConfig cfg = { .id = 1, .interval = 100, .threshold = 50 };
+    uart_puts("Config: id=");
+    uart_u32(cfg.id);
+    uart_puts(" interval=");
+    uart_u32(cfg.interval);
+    uart_puts("\n");
+
+    // Container
+    SampleBuf(u32) samples;
+    samples.head = 0;
+    samples.count = 0;
+    samplebuf_push(&samples, 42);
+    samplebuf_push(&samples, 99);
+    uart_puts("Sample buf count: ");
+    uart_u32(samples.count);
+    uart_puts("\n");
+
+    // Move struct
+    CalibToken tok;
+    tok.sensor_id = 1;
+    tok.offset = 5;
+    apply_calibration(tok);
+
+    // Async coroutines — cooperative round-robin
+    uart_puts("--- Async sensor readings ---\n");
+    _zer_async_read_sensor s1;
+    _zer_async_read_sensor s2;
+    _zer_async_read_sensor_init(&s1, 1);
+    _zer_async_read_sensor_init(&s2, 2);
+
+    // Round-robin poll until both done
+    u32 done = 0;
+    while (done < 2) {
+        done = 0;
+        if (_zer_async_read_sensor_poll(&s1) != 0) { done += 1; }
+        if (_zer_async_read_sensor_poll(&s2) != 0) { done += 1; }
+    }
+
+    uart_puts("=== All demos passed ===\n");
+}

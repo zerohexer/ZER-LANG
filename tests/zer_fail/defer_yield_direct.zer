@@ -1,0 +1,12 @@
+// Direct yield inside defer body — must reject
+// EXPECTED: compile error
+
+async void task() {
+    defer {
+        yield;
+    }
+}
+
+i32 main() {
+    return 0;
+}

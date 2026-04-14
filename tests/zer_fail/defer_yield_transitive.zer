@@ -1,0 +1,19 @@
+// Function summaries: yield inside function called from defer — must reject
+// EXPECTED: compile error
+
+async void yielder() {
+    yield;
+}
+
+void cleanup() {
+    yielder();
+}
+
+async void task() {
+    defer cleanup();
+    yield;
+}
+
+i32 main() {
+    return 0;
+}

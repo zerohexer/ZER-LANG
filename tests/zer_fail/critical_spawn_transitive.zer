@@ -1,0 +1,15 @@
+// Function summaries: spawn inside function called from @critical — must reject
+// EXPECTED: compile error
+
+void worker() { }
+
+void spawner() {
+    spawn worker();
+}
+
+i32 main() {
+    @critical {
+        spawner();
+    }
+    return 0;
+}

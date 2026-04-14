@@ -4589,6 +4589,12 @@ static void collect_async_locals(Emitter *e, Node *node) {
             collect_async_locals(e, node->block.stmts[i]);
     }
     if (node->kind == NODE_IF) {
+        /* Async capture promotion: if (opt) |val| introduces implicit local 'val'.
+         * Must be promoted to state struct — lives on C stack, invalid after yield. */
+        if (node->if_stmt.capture_name) {
+            add_async_local(e, node->if_stmt.capture_name,
+                            node->if_stmt.capture_name_len);
+        }
         collect_async_locals(e, node->if_stmt.then_body);
         collect_async_locals(e, node->if_stmt.else_body);
     }
@@ -4599,6 +4605,7 @@ static void collect_async_locals(Emitter *e, Node *node) {
     if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE)
         collect_async_locals(e, node->while_stmt.body);
     if (node->kind == NODE_SWITCH) {
+        /* Switch arm captures in async deferred to v0.4 (type resolution complex) */
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             collect_async_locals(e, node->switch_stmt.arms[i].body);
     }
@@ -4745,6 +4752,68 @@ static void emit_async_func(Emitter *e, Node *node) {
                 emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
                 emit(e, ";\n");
             }
+        }
+    }
+    /* Emit capture variables from if-unwrap |val| and switch |val| as struct fields.
+     * These are implicit locals — not NODE_VAR_DECL, so the above loop misses them.
+     * The capture type is the optional's inner type (value capture) or pointer to it (|*val|). */
+    {
+        struct { Node *n; } cstack[256];
+        int csp = 0;
+        if (body) cstack[csp++].n = body;
+        while (csp > 0) {
+            Node *cn = cstack[--csp].n;
+            if (!cn) continue;
+            /* If-unwrap capture */
+            if (cn->kind == NODE_IF && cn->if_stmt.capture_name) {
+                Type *cond_type = checker_get_type(e->checker, cn->if_stmt.cond);
+                if (cond_type) {
+                    Type *ceff = type_unwrap_distinct(cond_type);
+                    Type *inner = NULL;
+                    if (ceff && ceff->kind == TYPE_OPTIONAL) {
+                        inner = ceff->optional.inner;
+                        if (cn->if_stmt.capture_is_ptr && inner) {
+                            inner = type_pointer(e->arena, inner);
+                        }
+                    } else if (ceff && is_null_sentinel(ceff->optional.inner)) {
+                        inner = ceff->optional.inner;
+                    }
+                    if (inner) {
+                        /* Dedup against params and var_nodes */
+                        bool skip = false;
+                        for (int pi = 0; pi < node->func_decl.param_count && !skip; pi++)
+                            if (node->func_decl.params[pi].name_len == cn->if_stmt.capture_name_len &&
+                                memcmp(node->func_decl.params[pi].name, cn->if_stmt.capture_name,
+                                       cn->if_stmt.capture_name_len) == 0) skip = true;
+                        if (!skip) {
+                            emit(e, "    ");
+                            emit_type_and_name(e, inner, cn->if_stmt.capture_name,
+                                               cn->if_stmt.capture_name_len);
+                            emit(e, ";\n");
+                        }
+                    }
+                }
+            }
+            /* Switch arm captures: type resolution is complex (depends on union variant).
+             * Deferred to v0.4 — switch captures in async are rare and need proper
+             * variant type lookup. If-unwrap captures (above) cover the common case. */
+            /* Recurse into children */
+            if (cn->kind == NODE_BLOCK) {
+                for (int i = cn->block.stmt_count - 1; i >= 0 && csp < 255; i--)
+                    cstack[csp++].n = cn->block.stmts[i];
+            }
+            if (cn->kind == NODE_IF && csp < 254) {
+                cstack[csp++].n = cn->if_stmt.else_body;
+                cstack[csp++].n = cn->if_stmt.then_body;
+            }
+            if (cn->kind == NODE_FOR && csp < 254) { cstack[csp++].n = cn->for_stmt.body; cstack[csp++].n = cn->for_stmt.init; }
+            if ((cn->kind == NODE_WHILE || cn->kind == NODE_DO_WHILE) && csp < 255) cstack[csp++].n = cn->while_stmt.body;
+            if (cn->kind == NODE_SWITCH) {
+                for (int i = cn->switch_stmt.arm_count - 1; i >= 0 && csp < 255; i--)
+                    cstack[csp++].n = cn->switch_stmt.arms[i].body;
+            }
+            if (cn->kind == NODE_DEFER && csp < 255) cstack[csp++].n = cn->defer.body;
+            if (cn->kind == NODE_CRITICAL && csp < 255) cstack[csp++].n = cn->critical.body;
         }
     }
     /* BUG-481: emit promoted orelse/capture temp fields */

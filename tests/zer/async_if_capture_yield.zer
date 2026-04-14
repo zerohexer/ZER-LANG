@@ -1,11 +1,15 @@
-// If-unwrap capture survives yield
+// If-unwrap capture survives yield — val must be in state struct, not C stack
+// Bug found by Gemini chaos audit: capture was C stack local, reads garbage after yield
 ?u32 get_val() { return 42; }
+
+u32 g_result = 99;
 
 async void worker() {
     ?u32 opt = get_val();
     if (opt) |v| {
         yield;
-        u32 check = v;
+        // After resume, v must still be 42 (not garbage from stale stack)
+        g_result = v;
     }
 }
 
@@ -14,5 +18,6 @@ u32 main() {
     _zer_async_worker_init(&task);
     _zer_async_worker_poll(&task);
     _zer_async_worker_poll(&task);
+    if (g_result != 42) { return 1; }
     return 0;
 }

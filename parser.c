@@ -952,6 +952,12 @@ static Node *parse_postfix(Parser *p, Node *left) {
 /* ---- Precedence climbing for binary operators ---- */
 
 static Node *parse_precedence(Parser *p, Precedence min_prec) {
+    /* Expression depth guard — prevents stack exhaustion from (((((...))))) */
+    if (++p->depth > 256) {
+        error(p, "expression nesting too deep (limit 256)");
+        p->depth--;
+        return new_node(p, NODE_INT_LIT); /* dummy node */
+    }
     Node *left = parse_unary(p);
     left = parse_postfix(p, left);
 
@@ -1012,6 +1018,7 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
         left = n;
     }
 
+    p->depth--;
     return left;
 }
 

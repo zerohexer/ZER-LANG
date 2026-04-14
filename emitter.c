@@ -1,4 +1,5 @@
 #include "emitter.h"
+#include "ir.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -6075,4 +6076,424 @@ void emit_file(Emitter *e, Node *file_node) {
 
 void emit_file_no_preamble(Emitter *e, Node *file_node) {
     emit_file_module(e, file_node, false);
+}
+
+/* ================================================================
+ * IR-BASED C EMISSION (Phase 5)
+ *
+ * Emits C code from IRFunc instead of AST. Reuses existing helpers
+ * (emit_type, emit_expr, emit_type_and_name) for expressions.
+ * Only statement/control-flow emission reads from IR.
+ *
+ * This is the incremental replacement for emit_stmt/emit_async_func.
+ * During migration, both paths coexist. When IR emission is complete,
+ * the AST-based emit_stmt path is deleted.
+ * ================================================================ */
+
+/* Emit one IR instruction as C code */
+static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
+    switch (inst->op) {
+
+    case IR_ASSIGN: {
+        if (inst->dest_local >= 0 && inst->expr) {
+            IRLocal *dest = &func->locals[inst->dest_local];
+            emit_indent(e);
+            if (func->is_async) {
+                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+            } else {
+                /* First assignment = declaration */
+                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
+                emit(e, " = ");
+            }
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        } else if (inst->expr) {
+            /* Assignment to non-local (field, index) or void expr */
+            emit_indent(e);
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_CALL: {
+        emit_indent(e);
+        if (inst->dest_local >= 0) {
+            IRLocal *dest = &func->locals[inst->dest_local];
+            if (func->is_async) {
+                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+            } else {
+                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
+                emit(e, " = ");
+            }
+        }
+        if (inst->expr) {
+            emit_expr(e, inst->expr);
+        } else if (inst->func_name) {
+            emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+            for (int i = 0; i < inst->arg_count; i++) {
+                if (i > 0) emit(e, ", ");
+                if (inst->args && inst->args[i]) emit_expr(e, inst->args[i]);
+            }
+            emit(e, ")");
+        }
+        emit(e, ";\n");
+        break;
+    }
+
+    case IR_BRANCH: {
+        emit_indent(e);
+        emit(e, "if (");
+        if (inst->expr) emit_expr(e, inst->expr);
+        else emit(e, "1");
+        emit(e, ") goto _zer_bb%d; else goto _zer_bb%d;\n",
+             inst->true_block, inst->false_block);
+        break;
+    }
+
+    case IR_GOTO: {
+        emit_indent(e);
+        emit(e, "goto _zer_bb%d;\n", inst->goto_block);
+        break;
+    }
+
+    case IR_RETURN: {
+        emit_indent(e);
+        if (inst->expr) {
+            emit(e, "return ");
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        } else {
+            emit(e, "return;\n");
+        }
+        break;
+    }
+
+    case IR_YIELD: {
+        if (func->is_async) {
+            emit_indent(e);
+            emit(e, "self->_zer_state = %d; return 0;\n", e->async_yield_id);
+            emit_indent(e);
+            emit(e, "case %d:;\n", e->async_yield_id);
+            e->async_yield_id++;
+        }
+        break;
+    }
+
+    case IR_AWAIT: {
+        if (func->is_async) {
+            emit_indent(e);
+            emit(e, "case %d:;\n", e->async_yield_id);
+            emit_indent(e);
+            emit(e, "if (!(");
+            if (inst->expr) emit_expr(e, inst->expr);
+            emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
+            e->async_yield_id++;
+        }
+        break;
+    }
+
+    case IR_SPAWN: {
+        /* Spawn uses the existing AST-based spawn emission (complex wrapper structs).
+         * For now, fall through to AST emission via the expression. */
+        emit_indent(e);
+        emit(e, "/* IR_SPAWN %.*s — TODO: emit from IR */\n",
+             (int)inst->func_name_len, inst->func_name);
+        break;
+    }
+
+    case IR_LOCK: {
+        emit_indent(e);
+        emit(e, "/* IR_LOCK — TODO */\n");
+        break;
+    }
+
+    case IR_UNLOCK: {
+        emit_indent(e);
+        emit(e, "/* IR_UNLOCK — TODO */\n");
+        break;
+    }
+
+    case IR_POOL_ALLOC: case IR_SLAB_ALLOC: case IR_SLAB_ALLOC_PTR:
+    case IR_POOL_FREE: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
+    case IR_POOL_GET:
+    case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
+    case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
+        /* Builtin methods — currently emit via AST expression tree.
+         * The existing emit_expr handles these via NODE_CALL dispatch. */
+        emit_indent(e);
+        if (inst->dest_local >= 0) {
+            IRLocal *dest = &func->locals[inst->dest_local];
+            if (func->is_async) {
+                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+            } else {
+                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
+                emit(e, " = ");
+            }
+        }
+        if (inst->expr) emit_expr(e, inst->expr);
+        emit(e, ";\n");
+        break;
+    }
+
+    case IR_CRITICAL_BEGIN: {
+        emit_indent(e);
+        emit(e, "{ /* @critical */\n");
+        e->indent++;
+        emit_indent(e);
+        emit(e, "#if defined(__ARM_ARCH)\n");
+        emit_indent(e);
+        emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask));\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__AVR__)\n");
+        emit_indent(e);
+        emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__riscv)\n");
+        emit_indent(e);
+        emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus));\n");
+        emit_indent(e);
+        emit(e, "#else\n");
+        emit_indent(e);
+        emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
+        emit_indent(e);
+        emit(e, "#endif\n");
+        break;
+    }
+
+    case IR_CRITICAL_END: {
+        emit_indent(e);
+        emit(e, "#if defined(__ARM_ARCH)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask));\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__AVR__)\n");
+        emit_indent(e);
+        emit(e, "SREG = _zer_sreg;\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__riscv)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus));\n");
+        emit_indent(e);
+        emit(e, "#else\n");
+        emit_indent(e);
+        emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
+        emit_indent(e);
+        emit(e, "#endif\n");
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
+        break;
+    }
+
+    case IR_DEFER_PUSH: {
+        /* Push defer body onto emitter's defer stack (same as AST path) */
+        if (inst->defer_body) {
+            if (e->defer_stack.count >= e->defer_stack.capacity) {
+                int new_cap = e->defer_stack.capacity * 2;
+                if (new_cap < 16) new_cap = 16;
+                Node **new_stmts = (Node **)malloc(new_cap * sizeof(Node *));
+                if (e->defer_stack.stmts) {
+                    memcpy(new_stmts, e->defer_stack.stmts,
+                           e->defer_stack.count * sizeof(Node *));
+                    free(e->defer_stack.stmts);
+                }
+                e->defer_stack.stmts = new_stmts;
+                e->defer_stack.capacity = new_cap;
+            }
+            e->defer_stack.stmts[e->defer_stack.count++] = inst->defer_body;
+        }
+        break;
+    }
+
+    case IR_DEFER_FIRE: {
+        /* Fire all pending defers in LIFO order */
+        for (int di = e->defer_stack.count - 1; di >= 0; di--) {
+            emit_stmt(e, e->defer_stack.stmts[di]);
+        }
+        break;
+    }
+
+    case IR_INTRINSIC: {
+        emit_indent(e);
+        if (inst->dest_local >= 0) {
+            IRLocal *dest = &func->locals[inst->dest_local];
+            if (func->is_async) {
+                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+            } else {
+                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
+                emit(e, " = ");
+            }
+        }
+        if (inst->expr) emit_expr(e, inst->expr);
+        emit(e, ";\n");
+        break;
+    }
+
+    case IR_NOP:
+        /* ASM pass-through or no-op */
+        if (inst->expr) {
+            emit_indent(e);
+            emit_stmt(e, inst->expr); /* ASM nodes emit via stmt */
+        }
+        break;
+
+    default:
+        emit_indent(e);
+        emit(e, "/* IR op %d not yet implemented */\n", inst->op);
+        break;
+    }
+}
+
+/* Emit a regular (non-async) function from IR */
+static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
+    /* Emit function signature (from AST node) */
+    Node *fn = func->ast_node;
+    if (!fn) return;
+
+    /* Emit source mapping */
+    if (e->source_file) {
+        emit(e, "#line %d \"%s\"\n", fn->loc.line, e->source_file);
+    }
+
+    /* Return type + name */
+    Type *ret = func->return_type;
+    if (ret) emit_type(e, ret);
+    else emit(e, "void");
+    emit(e, " ");
+
+    /* Mangled name */
+    if (func->module_prefix) {
+        emit(e, "%.*s__%.*s", (int)func->module_prefix_len, func->module_prefix,
+             (int)func->name_len, func->name);
+    } else {
+        emit(e, "%.*s", (int)func->name_len, func->name);
+    }
+
+    /* Parameters (from AST) */
+    emit(e, "(");
+    for (int i = 0; i < fn->func_decl.param_count; i++) {
+        if (i > 0) emit(e, ", ");
+        ParamDecl *p = &fn->func_decl.params[i];
+        int lid = ir_find_local(func, p->name, (uint32_t)p->name_len);
+        if (lid >= 0 && func->locals[lid].type) {
+            emit_type_and_name(e, func->locals[lid].type, p->name, p->name_len);
+        }
+    }
+    if (fn->func_decl.param_count == 0) emit(e, "void");
+    emit(e, ") {\n");
+    e->indent++;
+
+    /* Declare local variables (skip params — they're parameters) */
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (l->is_param || l->is_static) continue;
+        if (!l->type) continue;
+        emit_indent(e);
+        emit_type_and_name(e, l->type, l->name, l->name_len);
+        emit(e, " = {0};\n"); /* auto-zero */
+    }
+
+    /* Emit basic blocks */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+
+        /* Label (skip for entry block) */
+        if (bi > 0) {
+            emit(e, "_zer_bb%d:;\n", bb->id);
+        }
+
+        /* Instructions */
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            emit_ir_inst(e, &bb->insts[ii], func);
+        }
+    }
+
+    e->indent--;
+    emit(e, "}\n\n");
+}
+
+/* Emit an async function from IR — state struct + init + poll */
+static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
+    Node *fn = func->ast_node;
+    if (!fn) return;
+
+    /* Build mangled name */
+    char mname[256];
+    int flen;
+    if (func->module_prefix) {
+        flen = snprintf(mname, sizeof(mname), "%.*s__%.*s",
+            (int)func->module_prefix_len, func->module_prefix,
+            (int)func->name_len, func->name);
+    } else {
+        flen = snprintf(mname, sizeof(mname), "%.*s",
+            (int)func->name_len, func->name);
+    }
+    if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
+
+    /* State struct = ALL locals */
+    emit(e, "typedef struct {\n");
+    emit(e, "    int _zer_state;\n");
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (l->is_static) continue;
+        if (!l->type) continue;
+        emit(e, "    ");
+        emit_type_and_name(e, l->type, l->name, l->name_len);
+        emit(e, ";\n");
+    }
+    emit(e, "} _zer_async_%.*s;\n\n", flen, mname);
+
+    /* Init function */
+    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
+         flen, mname, flen, mname);
+    for (int li = 0; li < func->local_count; li++) {
+        if (!func->locals[li].is_param) continue;
+        emit(e, ", ");
+        emit_type_and_name(e, func->locals[li].type,
+                           func->locals[li].name, func->locals[li].name_len);
+    }
+    emit(e, ") {\n");
+    emit(e, "    memset(self, 0, sizeof(*self));\n");
+    for (int li = 0; li < func->local_count; li++) {
+        if (!func->locals[li].is_param) continue;
+        emit(e, "    self->%.*s = %.*s;\n",
+             (int)func->locals[li].name_len, func->locals[li].name,
+             (int)func->locals[li].name_len, func->locals[li].name);
+    }
+    emit(e, "}\n\n");
+
+    /* Poll function = Duff's device */
+    emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self) {\n",
+         flen, mname, flen, mname);
+    emit(e, "    switch (self->_zer_state) { case 0:;\n");
+
+    e->indent = 1;
+    e->async_yield_id = 1;
+
+    /* Emit basic blocks */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        if (bi > 0) {
+            emit_indent(e);
+            emit(e, "_zer_bb%d:;\n", bb->id);
+        }
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            emit_ir_inst(e, &bb->insts[ii], func);
+        }
+    }
+
+    emit(e, "    } self->_zer_state = -1; return 1;\n");
+    emit(e, "}\n\n");
+}
+
+/* Public: emit a function from its IR representation */
+void emit_func_from_ir(Emitter *e, void *ir_func_ptr) {
+    IRFunc *func = (IRFunc *)ir_func_ptr;
+    if (!func) return;
+    if (func->is_async) {
+        emit_async_func_from_ir(e, func);
+    } else {
+        emit_regular_func_from_ir(e, func);
+    }
 }

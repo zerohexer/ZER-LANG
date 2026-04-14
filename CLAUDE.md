@@ -837,41 +837,117 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 10. **`bool` return via `orelse` needs restructuring.** Can't do `*opaque f = mf orelse return false;`. Instead: `?*opaque mf = io_open(...); *opaque f = mf orelse return;` for void, or use an if-unwrap pattern for bool returns.
 
-## ZER Safety Tracking Systems — MANDATORY REFERENCE
+## ZER Safety Architecture — 4 Models, 29 Systems
 
-**Before implementing ANY safety feature, check this table.** ZER has 28 independent tracking systems. Use existing ones — don't reinvent. When a feature seems impossible, check if combining existing systems solves it. **NEVER ban when you can track.**
+**ZER's safety is built on 4 analysis models**, each covering a different dimension of what the compiler can observe. All 29 tracking systems map to one of these 4 models (verified against actual code). When implementing ANY new safety feature, identify which model it belongs to and follow that model's pattern.
 
-| # | System | Location | What It Tracks | Use When |
-|---|---|---|---|---|
-| 1 | **Typemap** | checker.c | `Node* → Type*` for every AST node | Emitter needs resolved types |
-| 2 | **Type ID** | checker.c | `next_type_id++` per struct/enum/union | Runtime `*opaque` provenance tag |
-| 3 | **Provenance** | checker.c | `Symbol.provenance_type` — original type of `*opaque` | `@ptrcast` compile-time check |
-| 4 | **Prov Summaries** | checker.c | What provenance a function's return carries | Cross-function `*opaque` tracking |
-| 5 | **Param Provenance** | checker.c | What type each `*opaque` param expects inside callee | Whole-program call-site validation |
-| 6 | **Alloc Coloring** | zercheck.c | `ZC_COLOR_POOL/ARENA/MALLOC/UNKNOWN` per handle | Distinguish alloc source — arena vs pool |
-| 7 | **Handle States** | zercheck.c | `HS_UNKNOWN→ALIVE→FREED/MAYBE_FREED/TRANSFERRED` | UAF, double-free, leak, move semantics |
-| 8 | **Alloc ID** | zercheck.c | Unique per allocation, shared by aliases | Group `?Handle` + `Handle` as same alloc |
-| 9 | **Func Summaries** | zercheck.c | `frees_param[i]` — does function free param? | Cross-function UAF/leak detection |
-| 10 | **Move Tracking** | zercheck.c | `should_track_move()` — move struct or contains one | Ownership transfer, use-after-move |
-| 11 | **Escape Flags** | checker.c | `is_local_derived`, `is_arena_derived`, `is_from_arena` | Prevent returning/storing stack/arena ptrs |
-| 12 | **Range Propagation** | checker.c | `VarRange {min, max, known_nonzero}` per variable | Prove bounds safe, prove divisor nonzero |
-| 13 | **Return Range** | checker.c | `return_range_min/max` per function | Cross-function: `arr[func()]` zero-overhead |
-| 14 | **Auto-Guard** | checker.c | Unproven array accesses needing runtime guard | Emitter inserts `if (idx >= size) return;` |
-| 15 | **Dynamic Freed** | checker.c | `pool.free(arr[k])` — which index was freed | Emitter inserts UAF guard for `arr[j]` |
-| 16 | **Non-Storable** | checker.c | `pool.get()` results that can't be stored | Prevent caching invalidatable pointers |
-| 17 | **ISR Tracking** | checker.c | Globals shared between ISR and main code | Detect missing volatile on ISR-shared globals |
-| 18 | **Stack Frames** | checker.c | Frame sizes, callees, recursion, indirect calls | `--stack-limit`, recursion detection |
-| 19 | **MMIO Ranges** | checker.c | Declared valid address ranges | `@inttoptr` validation |
-| 20 | **Qualifier Tracking** | checker.c | `is_volatile`, `is_const` on Symbol + Type | Prevent stripping volatile/const through casts |
-| 21 | **Keep Parameters** | checker.c | `is_keep` — pointer param can be stored | Non-keep ptr stored to global = error |
-| 22 | **Union Switch Lock** | checker.c | Which union is currently being switched on | Prevent mutation during mutable capture |
-| 23 | **Defer Stack** | emitter.c | Pending defer blocks at each scope level | LIFO cleanup on return/break/continue |
-| 24 | **Context Flags** | checker.c | `in_loop`, `in_interrupt`, `in_naked`, `in_async`, etc. | Contextual validation (break needs loop, etc.) |
-| 25 | **Container Templates** | checker.c | `ContainerTemplate` + `ContainerInstance` cache | Monomorphization stamping |
-| 26 | **Comptime Evaluator** | checker.c | `ComptimeCtx` with locals, arrays, floats | Compile-time function evaluation |
-| 27 | **Spawn Global Scan** | checker.c | Non-shared global access from spawned function | Data race detection (error/warning) |
-| 28 | **Shared Type Collect** | checker.c | Which shared types a statement touches | Deadlock: 2+ shared types in one statement |
-| 29 | **Function Summaries** | checker.c (FuncProps on Symbol) | can_yield, can_spawn, can_alloc, has_sync per function | Context safety: @critical/defer/interrupt ban yield/spawn/alloc transitively. Lazy DFS, cached on Symbol. Absorbs `has_atomic_or_barrier`. See `docs/FunctionSummaries.md` |
+**The 4 models exist because ZER uses C syntax.** Rust encodes all safety in ONE model (ownership types) because programmers annotate lifetimes/borrows. ZER programmers write plain C — the compiler must INFER everything. Each model infers a different kind of information. This is the same architecture as GCC/LLVM (multiple independent IPA passes), applied at the language level.
+
+### Model 1: State Machines — entity lifecycle tracking
+**What it answers:** "What STATE is this tracked entity in at this program point?"
+**Pattern:** Define states (ALIVE, FREED, TRANSFERRED), define valid transitions, error on invalid transition or bad terminal state.
+**When to use:** New tracked entity with a lifecycle (file handle, socket, lock, resource).
+
+| # | System | States / Transitions |
+|---|---|---|
+| 7 | **Handle States** | `UNKNOWN→ALIVE→FREED/MAYBE_FREED/TRANSFERRED` — UAF, double-free, leak |
+| 10 | **Move Tracking** | Uses `HS_TRANSFERRED` — ownership transfer, use-after-move |
+| 6 | **Alloc Coloring** (supporting) | `ZC_COLOR_POOL/ARENA/MALLOC` — set at alloc, propagated to aliases |
+| 8 | **Alloc ID** (supporting) | Unique per alloc, shared by aliases — groups `?Handle`+`Handle` as same alloc |
+
+### Model 2: Program Point Properties — values change at control flow
+**What it answers:** "What PROPERTY does this value/context have at THIS specific program point?"
+**Pattern:** Property set at declaration, updated at assignments/branches, checked at use sites. Can propagate, widen (MAYBE_FREED), or invalidate (&var taken).
+**When to use:** New value property that changes during execution (range, taint, escape status, provenance).
+
+| # | System | Property tracked |
+|---|---|---|
+| 12 | **Range Propagation** | `VarRange {min, max, known_nonzero}` — bounds safety, division safety |
+| 3 | **Provenance** | `Symbol.provenance_type` — propagates through assigns, clears on re-derive |
+| 11 | **Escape Flags** | `is_local_derived`, `is_arena_derived` — propagates, clears on reassignment |
+| 24 | **Context Flags** | `in_loop`, `defer_depth`, `critical_depth`, `in_async` — scope-exit validation |
+| 22 | **Union Switch Lock** | `union_switch_var` — set entering switch, cleared leaving, checked during body |
+| 14 | **Auto-Guard** (output) | Nodes where VRP couldn't prove safety → emitter inserts runtime guard |
+| 15 | **Dynamic Freed** (output) | `pool.free(arr[k])` event → emitter inserts UAF guard for `arr[j]` |
+
+### Model 3: Function Summaries — per-function computed properties
+**What it answers:** "What does this FUNCTION do?" (cached, used at call sites)
+**Pattern:** Scan function body (lazy, on first access), cache result on Symbol, check at call sites or context entry. DFS cycle detection for recursion.
+**When to use:** New function-level property (purity, can_panic, can_io, touches resource X).
+
+| # | System | Function property |
+|---|---|---|
+| 29 | **FuncProps** | `can_yield`, `can_spawn`, `can_alloc`, `has_sync` — context safety |
+| 9 | **Func Summaries** (zercheck) | `frees_param[i]` — cross-function UAF/leak detection |
+| 4 | **Prov Summaries** | Return provenance — cross-function `*opaque` tracking |
+| 5 | **Param Provenance** | What type each `*opaque` param expects — call-site validation |
+| 13 | **Return Range** | `return_range_min/max` — cross-function bounds: `arr[func()]` zero-overhead |
+| 18 | **Stack Frames** | Frame size, callees, recursion — `--stack-limit`, recursion detection |
+| 27 | **Spawn Global Scan** | Non-shared global access — data race detection |
+| 28 | **Shared Type Collect** | Shared types touched — deadlock detection |
+| 17 | **ISR Tracking** | Globals accessed from ISR vs main — collect-then-check for missing volatile |
+
+### Model 4: Static Annotations — set once at declaration, checked at use
+**What it answers:** "What was DECLARED about this entity?" (never changes)
+**Pattern:** Set at declaration site, checked at every use site. No propagation, no state changes.
+**When to use:** New declaration-level constraint (alignment, section, visibility, capability).
+
+| # | System | Annotation |
+|---|---|---|
+| 16 | **Non-Storable** | `pool.get()` result — can't be stored in variables |
+| 19 | **MMIO Ranges** | Declared valid address ranges — `@inttoptr` validation |
+| 20 | **Qualifier Tracking** | `is_volatile`, `is_const` — prevent stripping through casts |
+| 21 | **Keep Parameters** | `is_keep` — pointer param can be stored in globals |
+
+### Infrastructure (not safety models — supports the 4 models above)
+| # | System | Purpose |
+|---|---|---|
+| 1 | **Typemap** | `Node* → Type*` — emitter reads resolved types |
+| 2 | **Type ID** | `next_type_id++` — runtime `*opaque` provenance tag |
+| 23 | **Defer Stack** | Pending defer blocks — LIFO cleanup emission |
+| 25 | **Container Templates** | Monomorphization stamping — type system infrastructure |
+| 26 | **Comptime Evaluator** | Compile-time function evaluation — metaprogramming |
+
+### Development Decision Flow
+
+```
+New safety feature → Which model?
+
+Entity with lifecycle (alloc/free/move)?     → Model 1: State Machine
+Value property that changes at assignments?  → Model 2: Point Properties
+Per-function property used at call sites?    → Model 3: Function Summary
+Declaration-level constraint, never changes? → Model 4: Static Annotation
+
+Doesn't fit any? → STOP. Either:
+  (a) It's a combination of existing models (most likely)
+  (b) Document why a new model is needed (unlikely — these 4 cover
+      what a compiler can observe: entities, points, functions, declarations)
+```
+
+### Safety Coverage by Model
+
+| Safety guarantee | Model(s) used |
+|---|---|
+| Buffer overflow | **2** (VRP ranges) |
+| Use-after-free | **1** (handle states) + **3** (cross-func summary) |
+| Null dereference | **4** (*T non-null) + **2** (optional unwrap check) |
+| Dangling pointer | **2** (escape flags at program points) |
+| Division by zero | **2** (VRP: proven nonzero?) |
+| Data races | **4** (shared annotation) + **3** (spawn scan, shared types) |
+| Deadlock | **3** (shared type collect per function) |
+| Move semantics | **1** (HS_TRANSFERRED state) |
+| Context safety | **3** (FuncProps) + **2** (context flags for scope-exit) |
+| Wrong pointer cast | **2** (provenance at point) + **3** (prov summaries) |
+| Handle leak | **1** (ALIVE at exit = error) |
+| ISR safety | **3** (FuncProps can_alloc, ISR tracking) |
+| MMIO safety | **4** (mmio ranges) |
+| Stack overflow | **3** (stack frames) |
+| Volatile/const strip | **4** (qualifiers) |
+
+**Unconditional safety (no model needed — always on):**
+- Auto-zero: every variable initialized to zero (emitter rule)
+- Integer overflow wraps: `-fwrapv` (GCC flag, defined behavior)
+- Shift safety: ternary emitted (no UB on over-width shift)
 
 **Design principle:** Safety = tracking, not banning. If a pattern is unsafe, find which tracking system can detect the violation. Only ban when NO tracking system can cover the case.
 

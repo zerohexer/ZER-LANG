@@ -92,8 +92,35 @@ echo "GAPS FOUND (- where Y expected):"
 echo "================================================================"
 echo ""
 
-# Automated gap detection
-for node in $NODES; do
+# Automated gap detection — safety contracts encoded as rules
+# Each rule: "node MUST check flag — reason"
+# Format: NODE_NAME:flag_name:reason
+RULES="
+NODE_RETURN:defer_depth:return in defer corrupts control flow
+NODE_RETURN:critical_depth:return in @critical skips interrupt re-enable
+NODE_BREAK:defer_depth:break in defer corrupts control flow
+NODE_BREAK:critical_depth:break in @critical skips interrupt re-enable
+NODE_BREAK:in_loop:break outside loop is meaningless
+NODE_CONTINUE:defer_depth:continue in defer corrupts control flow
+NODE_CONTINUE:critical_depth:continue in @critical skips interrupt re-enable
+NODE_CONTINUE:in_loop:continue outside loop is meaningless
+NODE_GOTO:defer_depth:goto in defer corrupts control flow
+NODE_GOTO:critical_depth:goto in @critical skips interrupt re-enable
+NODE_YIELD:defer_depth:yield in defer corrupts Duff device state machine
+NODE_YIELD:critical_depth:yield in @critical holds lock across suspend
+NODE_AWAIT:defer_depth:await in defer corrupts Duff device state machine
+NODE_AWAIT:critical_depth:await in @critical holds lock across suspend
+NODE_SPAWN:critical_depth:thread creation with interrupts disabled
+NODE_SPAWN:in_interrupt:pthread_create in ISR is unsafe
+"
+
+bug_count=0
+for rule in $RULES; do
+    [ -z "$rule" ] && continue
+    node=$(echo "$rule" | cut -d: -f1)
+    flag=$(echo "$rule" | cut -d: -f2)
+    reason=$(echo "$rule" | sed 's/^[^:]*:[^:]*://')
+
     case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 6700 && $1 < 8200 {print $1; exit}')
     [ -z "$case_line" ] && continue
 
@@ -105,18 +132,18 @@ for node in $NODES; do
     fi
 
     short=$(echo $node | sed 's/NODE_//')
-
-    # yield/await must check defer_depth and critical_depth
-    if [ "$short" = "YIELD" ] || [ "$short" = "AWAIT" ]; then
-        echo "$handler" | grep -q "defer_depth" || echo "  BUG: $short missing defer_depth check (line $case_line)"
-        echo "$handler" | grep -q "critical_depth" || echo "  BUG: $short missing critical_depth check (line $case_line)"
-    fi
-
-    # spawn must check in_interrupt
-    if [ "$short" = "SPAWN" ]; then
-        echo "$handler" | grep -q "in_interrupt" || echo "  BUG: $short missing in_interrupt check (line $case_line)"
+    if ! echo "$handler" | grep -q "$flag"; then
+        echo "  BUG: $short missing $flag check (line $case_line)"
+        echo "       reason: $reason"
+        bug_count=$((bug_count + 1))
     fi
 done
+
+if [ "$bug_count" -eq 0 ]; then
+    echo "  CLEAN — all safety contracts satisfied"
+fi
+echo ""
+echo "Total gaps: $bug_count"
 
 echo ""
 echo "Done."

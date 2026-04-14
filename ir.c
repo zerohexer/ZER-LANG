@@ -1,0 +1,418 @@
+/*
+ * ZER IR — Construction, validation, and pretty-printing
+ *
+ * This file implements the IR data structure operations.
+ * The lowering pass (AST → IR) is in ir_lower.c.
+ * The IR-based C emitter will be in ir_emit.c (future).
+ */
+
+#include "ir.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* ================================================================
+ * Construction API
+ * ================================================================ */
+
+IRFunc *ir_func_new(Arena *arena, const char *name, uint32_t name_len, Type *ret_type) {
+    IRFunc *func = (IRFunc *)arena_alloc(arena, sizeof(IRFunc));
+    memset(func, 0, sizeof(IRFunc));
+    func->name = name;
+    func->name_len = name_len;
+    func->return_type = ret_type;
+
+    /* Pre-allocate locals and blocks */
+    func->local_capacity = 16;
+    func->locals = (IRLocal *)arena_alloc(arena, func->local_capacity * sizeof(IRLocal));
+    memset(func->locals, 0, func->local_capacity * sizeof(IRLocal));
+
+    func->block_capacity = 8;
+    func->blocks = (IRBlock *)arena_alloc(arena, func->block_capacity * sizeof(IRBlock));
+    memset(func->blocks, 0, func->block_capacity * sizeof(IRBlock));
+
+    return func;
+}
+
+int ir_add_local(IRFunc *func, Arena *arena,
+                 const char *name, uint32_t name_len, Type *type,
+                 bool is_param, bool is_capture, bool is_temp, int line) {
+    /* Dedup: if local with same name already exists, return its ID */
+    for (int i = 0; i < func->local_count; i++) {
+        if (func->locals[i].name_len == name_len &&
+            memcmp(func->locals[i].name, name, name_len) == 0) {
+            return func->locals[i].id;
+        }
+    }
+
+    /* Grow if needed */
+    if (func->local_count >= func->local_capacity) {
+        int new_cap = func->local_capacity * 2;
+        IRLocal *new_locals = (IRLocal *)arena_alloc(arena, new_cap * sizeof(IRLocal));
+        memcpy(new_locals, func->locals, func->local_count * sizeof(IRLocal));
+        memset(new_locals + func->local_count, 0,
+               (new_cap - func->local_count) * sizeof(IRLocal));
+        func->locals = new_locals;
+        func->local_capacity = new_cap;
+    }
+
+    int id = func->local_count;
+    IRLocal *local = &func->locals[func->local_count++];
+    local->id = id;
+    local->name = name;
+    local->name_len = name_len;
+    local->type = type;
+    local->is_param = is_param;
+    local->is_capture = is_capture;
+    local->is_temp = is_temp;
+    local->source_line = line;
+    return id;
+}
+
+int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
+    for (int i = 0; i < func->local_count; i++) {
+        if (func->locals[i].name_len == name_len &&
+            memcmp(func->locals[i].name, name, name_len) == 0)
+            return func->locals[i].id;
+    }
+    return -1;
+}
+
+int ir_add_block(IRFunc *func, Arena *arena) {
+    if (func->block_count >= func->block_capacity) {
+        int new_cap = func->block_capacity * 2;
+        IRBlock *new_blocks = (IRBlock *)arena_alloc(arena, new_cap * sizeof(IRBlock));
+        memcpy(new_blocks, func->blocks, func->block_count * sizeof(IRBlock));
+        memset(new_blocks + func->block_count, 0,
+               (new_cap - func->block_count) * sizeof(IRBlock));
+        func->blocks = new_blocks;
+        func->block_capacity = new_cap;
+    }
+
+    int id = func->block_count;
+    IRBlock *block = &func->blocks[func->block_count++];
+    memset(block, 0, sizeof(IRBlock));
+    block->id = id;
+
+    /* Pre-allocate instruction array */
+    block->inst_capacity = 8;
+    block->insts = (IRInst *)arena_alloc(arena, block->inst_capacity * sizeof(IRInst));
+    memset(block->insts, 0, block->inst_capacity * sizeof(IRInst));
+
+    return id;
+}
+
+void ir_block_add_inst(IRBlock *block, Arena *arena, IRInst inst) {
+    if (block->inst_count >= block->inst_capacity) {
+        int new_cap = block->inst_capacity * 2;
+        IRInst *new_insts = (IRInst *)arena_alloc(arena, new_cap * sizeof(IRInst));
+        memcpy(new_insts, block->insts, block->inst_count * sizeof(IRInst));
+        memset(new_insts + block->inst_count, 0,
+               (new_cap - block->inst_count) * sizeof(IRInst));
+        block->insts = new_insts;
+        block->inst_capacity = new_cap;
+    }
+    block->insts[block->inst_count++] = inst;
+}
+
+/* ================================================================
+ * CFG Analysis
+ * ================================================================ */
+
+static void add_pred(IRBlock *block, Arena *arena, int pred_id) {
+    /* Dedup */
+    for (int i = 0; i < block->pred_count; i++)
+        if (block->preds[i] == pred_id) return;
+
+    if (block->pred_count >= block->pred_capacity) {
+        int new_cap = block->pred_capacity < 4 ? 4 : block->pred_capacity * 2;
+        int *new_preds = (int *)arena_alloc(arena, new_cap * sizeof(int));
+        if (block->preds)
+            memcpy(new_preds, block->preds, block->pred_count * sizeof(int));
+        block->preds = new_preds;
+        block->pred_capacity = new_cap;
+    }
+    block->preds[block->pred_count++] = pred_id;
+}
+
+void ir_compute_preds(IRFunc *func, Arena *arena) {
+    /* Clear existing preds */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        func->blocks[bi].pred_count = 0;
+    }
+
+    /* Walk all blocks, add edges from terminators */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *block = &func->blocks[bi];
+        if (block->inst_count == 0) continue;
+
+        IRInst *last = &block->insts[block->inst_count - 1];
+        switch (last->op) {
+        case IR_BRANCH:
+            if (last->true_block >= 0 && last->true_block < func->block_count)
+                add_pred(&func->blocks[last->true_block], arena, bi);
+            if (last->false_block >= 0 && last->false_block < func->block_count)
+                add_pred(&func->blocks[last->false_block], arena, bi);
+            break;
+        case IR_GOTO:
+            if (last->goto_block >= 0 && last->goto_block < func->block_count)
+                add_pred(&func->blocks[last->goto_block], arena, bi);
+            break;
+        case IR_YIELD:
+            /* Yield → next block is resume point (implicit edge) */
+            if (bi + 1 < func->block_count)
+                add_pred(&func->blocks[bi + 1], arena, bi);
+            break;
+        case IR_RETURN:
+            /* No successor */
+            break;
+        default:
+            /* Non-terminator last instruction — implicit fallthrough to next block */
+            if (bi + 1 < func->block_count)
+                add_pred(&func->blocks[bi + 1], arena, bi);
+            break;
+        }
+    }
+}
+
+bool ir_block_is_terminated(IRBlock *block) {
+    if (block->inst_count == 0) return false;
+    IROpKind op = block->insts[block->inst_count - 1].op;
+    return op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN || op == IR_YIELD;
+}
+
+/* ================================================================
+ * Validation
+ * ================================================================ */
+
+bool ir_validate(IRFunc *func) {
+    bool valid = true;
+
+    if (func->block_count == 0) {
+        fprintf(stderr, "IR VALIDATION ERROR: function '%.*s' has no basic blocks\n",
+                (int)func->name_len, func->name);
+        return false;
+    }
+
+    /* Check each block */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *block = &func->blocks[bi];
+
+        /* Block must have at least one instruction (even if just a terminator) */
+        if (block->inst_count == 0) {
+            fprintf(stderr, "IR VALIDATION ERROR: bb%d is empty in '%.*s'\n",
+                    bi, (int)func->name_len, func->name);
+            valid = false;
+            continue;
+        }
+
+        /* Last instruction must be a terminator (except last block which may fallthrough) */
+        if (bi < func->block_count - 1 && !ir_block_is_terminated(block)) {
+            /* Non-terminated non-last block — could be implicit fallthrough, which is OK */
+        }
+
+        /* Validate branch targets */
+        for (int ii = 0; ii < block->inst_count; ii++) {
+            IRInst *inst = &block->insts[ii];
+
+            if (inst->op == IR_BRANCH) {
+                if (inst->true_block < 0 || inst->true_block >= func->block_count) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d BRANCH true_block=%d out of range in '%.*s'\n",
+                            bi, inst->true_block, (int)func->name_len, func->name);
+                    valid = false;
+                }
+                if (inst->false_block < 0 || inst->false_block >= func->block_count) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d BRANCH false_block=%d out of range in '%.*s'\n",
+                            bi, inst->false_block, (int)func->name_len, func->name);
+                    valid = false;
+                }
+            }
+            if (inst->op == IR_GOTO) {
+                if (inst->goto_block < 0 || inst->goto_block >= func->block_count) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d GOTO target=%d out of range in '%.*s'\n",
+                            bi, inst->goto_block, (int)func->name_len, func->name);
+                    valid = false;
+                }
+            }
+
+            /* Validate local references */
+            if (inst->dest_local >= 0 && inst->dest_local >= func->local_count) {
+                fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d references local %d but only %d locals in '%.*s'\n",
+                        bi, ii, inst->dest_local, func->local_count,
+                        (int)func->name_len, func->name);
+                valid = false;
+            }
+            if (inst->obj_local > 0 && inst->obj_local >= func->local_count) {
+                fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d obj_local %d out of range in '%.*s'\n",
+                        bi, ii, inst->obj_local, (int)func->name_len, func->name);
+                valid = false;
+            }
+            if (inst->handle_local > 0 && inst->handle_local >= func->local_count) {
+                fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d handle_local %d out of range in '%.*s'\n",
+                        bi, ii, inst->handle_local, (int)func->name_len, func->name);
+                valid = false;
+            }
+        }
+    }
+
+    /* Check for duplicate local IDs */
+    for (int i = 0; i < func->local_count; i++) {
+        for (int j = i + 1; j < func->local_count; j++) {
+            if (func->locals[i].id == func->locals[j].id) {
+                fprintf(stderr, "IR VALIDATION ERROR: duplicate local id %d in '%.*s'\n",
+                        func->locals[i].id, (int)func->name_len, func->name);
+                valid = false;
+            }
+        }
+    }
+
+    return valid;
+}
+
+/* ================================================================
+ * Pretty-Printer
+ * ================================================================ */
+
+static const char *ir_op_name(IROpKind op) {
+    switch (op) {
+    case IR_ASSIGN:           return "ASSIGN";
+    case IR_CALL:             return "CALL";
+    case IR_BRANCH:           return "BRANCH";
+    case IR_GOTO:             return "GOTO";
+    case IR_RETURN:           return "RETURN";
+    case IR_YIELD:            return "YIELD";
+    case IR_AWAIT:            return "AWAIT";
+    case IR_SPAWN:            return "SPAWN";
+    case IR_LOCK:             return "LOCK";
+    case IR_UNLOCK:           return "UNLOCK";
+    case IR_POOL_ALLOC:       return "POOL_ALLOC";
+    case IR_POOL_FREE:        return "POOL_FREE";
+    case IR_POOL_GET:         return "POOL_GET";
+    case IR_SLAB_ALLOC:       return "SLAB_ALLOC";
+    case IR_SLAB_FREE:        return "SLAB_FREE";
+    case IR_SLAB_FREE_PTR:    return "SLAB_FREE_PTR";
+    case IR_SLAB_ALLOC_PTR:   return "SLAB_ALLOC_PTR";
+    case IR_ARENA_ALLOC:      return "ARENA_ALLOC";
+    case IR_ARENA_ALLOC_SLICE:return "ARENA_ALLOC_SLICE";
+    case IR_ARENA_RESET:      return "ARENA_RESET";
+    case IR_RING_PUSH:        return "RING_PUSH";
+    case IR_RING_POP:         return "RING_POP";
+    case IR_RING_PUSH_CHECKED:return "RING_PUSH_CHECKED";
+    case IR_CRITICAL_BEGIN:   return "CRITICAL_BEGIN";
+    case IR_CRITICAL_END:     return "CRITICAL_END";
+    case IR_DEFER_PUSH:       return "DEFER_PUSH";
+    case IR_DEFER_FIRE:       return "DEFER_FIRE";
+    case IR_INTRINSIC:        return "INTRINSIC";
+    case IR_NOP:              return "NOP";
+    }
+    return "???";
+}
+
+void ir_print(FILE *out, IRFunc *func) {
+    /* Function header */
+    fprintf(out, "FUNC %.*s(", (int)func->name_len, func->name);
+    bool first = true;
+    for (int i = 0; i < func->local_count; i++) {
+        if (!func->locals[i].is_param) continue;
+        if (!first) fprintf(out, ", ");
+        first = false;
+        fprintf(out, "%%%d:%.*s", func->locals[i].id,
+                (int)func->locals[i].name_len, func->locals[i].name);
+        if (func->locals[i].type)
+            fprintf(out, " : %s", type_name(func->locals[i].type));
+    }
+    fprintf(out, ")");
+    if (func->return_type)
+        fprintf(out, " -> %s", type_name(func->return_type));
+    if (func->is_async) fprintf(out, " [async]");
+    if (func->is_interrupt) fprintf(out, " [interrupt]");
+    fprintf(out, "\n");
+
+    /* Locals */
+    fprintf(out, "  LOCALS:\n");
+    for (int i = 0; i < func->local_count; i++) {
+        IRLocal *l = &func->locals[i];
+        fprintf(out, "    %%%d: %.*s", l->id, (int)l->name_len, l->name);
+        if (l->type) fprintf(out, " : %s", type_name(l->type));
+        if (l->is_param)   fprintf(out, " [param]");
+        if (l->is_capture) fprintf(out, " [capture]");
+        if (l->is_temp)    fprintf(out, " [temp]");
+        if (l->is_static)  fprintf(out, " [static]");
+        fprintf(out, " (line %d)\n", l->source_line);
+    }
+    fprintf(out, "\n");
+
+    /* Basic blocks */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        fprintf(out, "  bb%d:", bb->id);
+        if (bb->label) fprintf(out, " (%.*s)", (int)bb->label_len, bb->label);
+
+        /* Print predecessors */
+        if (bb->pred_count > 0) {
+            fprintf(out, "  ; preds:");
+            for (int pi = 0; pi < bb->pred_count; pi++)
+                fprintf(out, " bb%d", bb->preds[pi]);
+        }
+        fprintf(out, "\n");
+
+        /* Print instructions */
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *inst = &bb->insts[ii];
+            fprintf(out, "    ");
+
+            /* Destination */
+            if (inst->dest_local >= 0)
+                fprintf(out, "%%%d = ", inst->dest_local);
+
+            /* Operation */
+            fprintf(out, "%s", ir_op_name(inst->op));
+
+            /* Operands */
+            switch (inst->op) {
+            case IR_BRANCH:
+                fprintf(out, " -> bb%d, bb%d", inst->true_block, inst->false_block);
+                break;
+            case IR_GOTO:
+                fprintf(out, " -> bb%d", inst->goto_block);
+                break;
+            case IR_CALL:
+            case IR_SPAWN:
+                if (inst->func_name)
+                    fprintf(out, " %.*s", (int)inst->func_name_len, inst->func_name);
+                fprintf(out, "(%d args)", inst->arg_count);
+                if (inst->op == IR_SPAWN && inst->is_scoped_spawn)
+                    fprintf(out, " [scoped]");
+                break;
+            case IR_POOL_ALLOC: case IR_SLAB_ALLOC: case IR_SLAB_ALLOC_PTR:
+                fprintf(out, " obj=%%%d", inst->obj_local);
+                break;
+            case IR_POOL_FREE: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
+                fprintf(out, " obj=%%%d handle=%%%d", inst->obj_local, inst->handle_local);
+                break;
+            case IR_POOL_GET:
+                fprintf(out, " obj=%%%d handle=%%%d", inst->obj_local, inst->handle_local);
+                break;
+            case IR_LOCK: case IR_UNLOCK:
+                fprintf(out, " obj=%%%d", inst->obj_local);
+                break;
+            case IR_INTRINSIC:
+                if (inst->intrinsic_name)
+                    fprintf(out, " @%.*s", (int)inst->intrinsic_name_len, inst->intrinsic_name);
+                break;
+            case IR_DEFER_PUSH:
+                fprintf(out, " <body>");
+                break;
+            case IR_RETURN:
+                if (inst->expr) fprintf(out, " <expr>");
+                break;
+            default:
+                if (inst->expr) fprintf(out, " <expr>");
+                break;
+            }
+
+            fprintf(out, "  ; line %d\n", inst->source_line);
+        }
+        fprintf(out, "\n");
+    }
+}

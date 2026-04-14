@@ -908,6 +908,40 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 | 25 | **Container Templates** | Monomorphization stamping — type system infrastructure |
 | 26 | **Comptime Evaluator** | Compile-time function evaluation — metaprogramming |
 
+### Quick Lookup — All 29 Systems (flat)
+
+| # | System | Location | What It Tracks | Model |
+|---|---|---|---|---|
+| 1 | **Typemap** | checker.c | `Node* → Type*` for every AST node | Infra |
+| 2 | **Type ID** | checker.c | `next_type_id++` per struct/enum/union | Infra |
+| 3 | **Provenance** | checker.c | `Symbol.provenance_type` — original type of `*opaque` | 2 |
+| 4 | **Prov Summaries** | checker.c | What provenance a function's return carries | 3 |
+| 5 | **Param Provenance** | checker.c | What type each `*opaque` param expects inside callee | 3 |
+| 6 | **Alloc Coloring** | zercheck.c | `ZC_COLOR_POOL/ARENA/MALLOC/UNKNOWN` per handle | 1 |
+| 7 | **Handle States** | zercheck.c | `HS_UNKNOWN→ALIVE→FREED/MAYBE_FREED/TRANSFERRED` | 1 |
+| 8 | **Alloc ID** | zercheck.c | Unique per allocation, shared by aliases | 1 |
+| 9 | **Func Summaries** | zercheck.c | `frees_param[i]` — does function free param? | 3 |
+| 10 | **Move Tracking** | zercheck.c | `should_track_move()` — move struct or contains one | 1 |
+| 11 | **Escape Flags** | checker.c | `is_local_derived`, `is_arena_derived`, `is_from_arena` | 2 |
+| 12 | **Range Propagation** | checker.c | `VarRange {min, max, known_nonzero}` per variable | 2 |
+| 13 | **Return Range** | checker.c | `return_range_min/max` per function | 3 |
+| 14 | **Auto-Guard** | checker.c | Unproven array accesses needing runtime guard | 2 |
+| 15 | **Dynamic Freed** | checker.c | `pool.free(arr[k])` — which index was freed | 2 |
+| 16 | **Non-Storable** | checker.c | `pool.get()` results that can't be stored | 4 |
+| 17 | **ISR Tracking** | checker.c | Globals shared between ISR and main code | 3 |
+| 18 | **Stack Frames** | checker.c | Frame sizes, callees, recursion, indirect calls | 3 |
+| 19 | **MMIO Ranges** | checker.c | Declared valid address ranges | 4 |
+| 20 | **Qualifier Tracking** | checker.c | `is_volatile`, `is_const` on Symbol + Type | 4 |
+| 21 | **Keep Parameters** | checker.c | `is_keep` — pointer param can be stored | 4 |
+| 22 | **Union Switch Lock** | checker.c | Which union is currently being switched on | 2 |
+| 23 | **Defer Stack** | emitter.c | Pending defer blocks at each scope level | Infra |
+| 24 | **Context Flags** | checker.c | `in_loop`, `in_interrupt`, `in_naked`, `in_async`, etc. | 2 |
+| 25 | **Container Templates** | checker.c | `ContainerTemplate` + `ContainerInstance` cache | Infra |
+| 26 | **Comptime Evaluator** | checker.c | `ComptimeCtx` with locals, arrays, floats | Infra |
+| 27 | **Spawn Global Scan** | checker.c | Non-shared global access from spawned function | 3 |
+| 28 | **Shared Type Collect** | checker.c | Which shared types a statement touches | 3 |
+| 29 | **Function Summaries** | checker.c | `FuncProps` on Symbol: can_yield/spawn/alloc/has_sync | 3 |
+
 ### Development Decision Flow
 
 ```

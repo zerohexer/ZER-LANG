@@ -209,6 +209,20 @@ static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
     return 0;
 }
 
+/* B10: Arena-allocated handle key — no fixed buffer limit.
+ * Uses stack buffer for common case, arena-copies the result.
+ * Returns key length, or 0 on failure. Sets *out_key to arena-allocated string. */
+static int handle_key_arena(ZerCheck *zc, Node *expr, const char **out_key) {
+    char stack_buf[128];
+    int len = handle_key_from_expr(expr, stack_buf, sizeof(stack_buf));
+    if (len <= 0) { *out_key = NULL; return 0; }
+    char *key = (char *)arena_alloc(zc->arena, len + 1);
+    if (!key) { *out_key = NULL; return 0; }
+    memcpy(key, stack_buf, len + 1);
+    *out_key = key;
+    return len;
+}
+
 /* forward declarations */
 static FuncSummary *find_summary(ZerCheck *zc, const char *name, uint32_t name_len);
 static bool is_move_struct_type(Type *t);
@@ -405,8 +419,8 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
         if ((mlen == 6 && memcmp(method, "delete", 6) == 0) ||
             (mlen == 10 && memcmp(method, "delete_ptr", 10) == 0)) {
             if (node->call.arg_count > 0) {
-                char hkey[128];
-                int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
+                const char *hkey;
+                int hklen = handle_key_arena(zc, node->call.args[0], &hkey);
                 if (hklen > 0) {
                     HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
                     if (h) {
@@ -460,8 +474,8 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
     if ((mlen == 4 && memcmp(method, "free", 4) == 0) ||
         (mlen == 8 && memcmp(method, "free_ptr", 8) == 0)) {
         if (node->call.arg_count > 0) {
-            char hkey[128];
-            int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
+            const char *hkey;
+            int hklen = handle_key_arena(zc, node->call.args[0], &hkey);
             if (hklen > 0) {
                 HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
                 if (h) {
@@ -495,8 +509,8 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
      * BUG-357: also handles arr[0], s.h via handle_key_from_expr */
     if (mlen == 3 && memcmp(method, "get", 3) == 0) {
         if (node->call.arg_count > 0) {
-            char hkey[128];
-            int hklen = handle_key_from_expr(node->call.args[0], hkey, sizeof(hkey));
+            const char *hkey;
+            int hklen = handle_key_arena(zc, node->call.args[0], &hkey);
             if (hklen > 0) {
                 HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
                 if (h) {
@@ -746,9 +760,8 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                     callee_sym->returns_param_color > 0) {
                     int param_idx = callee_sym->returns_param_color - 1;
                     if (param_idx < alloc_call->call.arg_count) {
-                        char akey[128];
-                        int aklen = handle_key_from_expr(alloc_call->call.args[param_idx],
-                            akey, sizeof(akey));
+                        const char *akey;
+                        int aklen = handle_key_arena(zc, alloc_call->call.args[param_idx], &akey);
                         if (aklen > 0) {
                             HandleInfo *arg_h = find_handle(ps, akey, (uint32_t)aklen);
                             if (arg_h) {
@@ -818,8 +831,8 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
                 else break;
             }
             if (root && root->kind == NODE_IDENT) {
-                char rkey[128];
-                int rklen = handle_key_from_expr(root, rkey, sizeof(rkey));
+                const char *rkey;
+                int rklen = handle_key_arena(zc, root, &rkey);
                 if (rklen > 0) {
                     HandleInfo *src = find_handle(ps, rkey, (uint32_t)rklen);
                     if (src) {
@@ -856,8 +869,8 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
             else break;
         }
 
-        char src_key[128];
-        int sklen = handle_key_from_expr(alias_src, src_key, sizeof(src_key));
+        const char *src_key;
+        int sklen = handle_key_arena(zc, alias_src, &src_key);
         if (sklen > 0) {
             HandleInfo *src = find_handle(ps, src_key, (uint32_t)sklen);
             if (src) {
@@ -1127,8 +1140,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                 for (int i = 0; i < node->call.arg_count; i++) {
                     Node *arg = node->call.args[i];
                     if (arg && arg->kind == NODE_IDENT) {
-                        char akey[128];
-                        int aklen = handle_key_from_expr(arg, akey, sizeof(akey));
+                        const char *akey;
+                        int aklen = handle_key_arena(zc, arg, &akey);
                         if (aklen > 0) {
                             HandleInfo *ah = find_handle(ps, akey, (uint32_t)aklen);
                             if (ah && (ah->state == HS_FREED || ah->state == HS_MAYBE_FREED)) {
@@ -1159,8 +1172,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                 for (int i = 0; i < node->call.arg_count; i++) {
                     Node *arg = node->call.args[i];
                     if (arg && arg->kind == NODE_IDENT) {
-                        char akey[128];
-                        int aklen = handle_key_from_expr(arg, akey, sizeof(akey));
+                        const char *akey;
+                        int aklen = handle_key_arena(zc, arg, &akey);
                         if (aklen > 0) {
                             HandleInfo *ah = find_handle(ps, akey, (uint32_t)aklen);
                             /* Direct move struct — already tracked */
@@ -1249,8 +1262,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
          * array elements, struct fields.
          * arr[0] = pool.alloc() orelse return → register "arr[0]" in PathState */
         {
-            char tkey[128];
-            int tklen = handle_key_from_expr(node->assign.target, tkey, sizeof(tkey));
+            const char *tkey;
+            int tklen = handle_key_arena(zc, node->assign.target, &tkey);
             if (tklen > 0) {
                 Node *val = node->assign.value;
                 if (val->kind == NODE_ORELSE) val = val->orelse.expr;
@@ -1312,8 +1325,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         else break;
                     }
                     if (root && root->kind == NODE_IDENT) {
-                        char rkey[128];
-                        int rklen = handle_key_from_expr(root, rkey, sizeof(rkey));
+                        const char *rkey;
+                        int rklen = handle_key_arena(zc, root, &rkey);
                         if (rklen > 0) {
                             HandleInfo *src = find_handle(ps, rkey, (uint32_t)rklen);
                             if (src) {
@@ -1348,8 +1361,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         else if (alias_val->kind == NODE_TYPECAST) alias_val = alias_val->typecast.expr;
                         else break;
                     }
-                    char skey[128];
-                    int sklen = handle_key_from_expr(alias_val, skey, sizeof(skey));
+                    const char *skey;
+                    int sklen = handle_key_arena(zc, alias_val, &skey);
                     if (sklen > 0) {
                         HandleInfo *src = find_handle(ps, skey, (uint32_t)sklen);
                         if (src) {
@@ -1380,8 +1393,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         else break;
                     }
                     if (alias_val && alias_val->kind == NODE_IDENT) {
-                        char skey[128];
-                        int sklen = handle_key_from_expr(alias_val, skey, sizeof(skey));
+                        const char *skey;
+                        int sklen = handle_key_arena(zc, alias_val, &skey);
                         if (sklen > 0) {
                             HandleInfo *src = find_handle(ps, skey, (uint32_t)sklen);
                             /* Lazy-register if this is a move struct we haven't seen yet */
@@ -1440,8 +1453,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                         if (is_global || is_param_ptr) {
                             Node *val = node->assign.value;
                             if (val->kind == NODE_ORELSE) val = val->orelse.expr;
-                            char vkey[128];
-                            int vklen = handle_key_from_expr(val, vkey, sizeof(vkey));
+                            const char *vkey;
+                            int vklen = handle_key_arena(zc, val, &vkey);
                             if (vklen > 0) {
                                 HandleInfo *vh = find_handle(ps, vkey, (uint32_t)vklen);
                                 if (vh) vh->escaped = true;
@@ -1455,8 +1468,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                  * the allocation went somewhere we can't follow. */
                 Node *val = node->assign.value;
                 if (val->kind == NODE_ORELSE) val = val->orelse.expr;
-                char vkey[128];
-                int vklen = handle_key_from_expr(val, vkey, sizeof(vkey));
+                const char *vkey;
+                int vklen = handle_key_arena(zc, val, &vkey);
                 if (vklen > 0) {
                     HandleInfo *vh = find_handle(ps, vkey, (uint32_t)vklen);
                     if (vh) vh->escaped = true;
@@ -1476,8 +1489,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
          * This catches struct field pointer aliases: h.inner = w; free(w); h.inner.data */
         {
             /* First: check the full expression (handles the simple case) */
-            char fkey[128];
-            int fklen = handle_key_from_expr(node, fkey, sizeof(fkey));
+            const char *fkey;
+            int fklen = handle_key_arena(zc, node, &fkey);
             bool found_uaf = false;
             int cur_line = node->loc.line;
             if (fklen > 0) {
@@ -1495,7 +1508,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             if (!found_uaf) {
                 Node *cur = node->field.object;
                 while (cur && !found_uaf) {
-                    int cklen = handle_key_from_expr(cur, fkey, sizeof(fkey));
+                    int cklen = handle_key_arena(zc, cur, &fkey);
                     if (cklen > 0) {
                         HandleInfo *h = find_handle(ps, fkey, (uint32_t)cklen);
                         if (is_handle_invalid(h) &&
@@ -1524,8 +1537,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
             memcmp(node->intrinsic.name, "ptrcast", 7) == 0 &&
             node->intrinsic.arg_count > 0) {
             Node *src = node->intrinsic.args[0];
-            char skey[128];
-            int sklen = handle_key_from_expr(src, skey, sizeof(skey));
+            const char *skey;
+            int sklen = handle_key_arena(zc, src, &skey);
             if (sklen > 0) {
                 HandleInfo *h = find_handle(ps, skey, (uint32_t)sklen);
                 if (is_handle_invalid(h))
@@ -1542,8 +1555,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
          * Catches interior pointer UAF: *u32 p = &b.field; free(b); p[0]. */
         {
             Node *obj = node->index_expr.object;
-            char ikey[128];
-            int iklen = handle_key_from_expr(obj, ikey, sizeof(ikey));
+            const char *ikey;
+            int iklen = handle_key_arena(zc, obj, &ikey);
             if (iklen > 0) {
                 HandleInfo *h = find_handle(ps, ikey, (uint32_t)iklen);
                 if (is_handle_invalid(h))
@@ -1557,8 +1570,8 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
     case NODE_UNARY:
         /* Level 1: check deref on freed *opaque — *ptr after free */
         if (node->unary.op == TOK_STAR) {
-            char dkey[128];
-            int dklen = handle_key_from_expr(node->unary.operand, dkey, sizeof(dkey));
+            const char *dkey;
+            int dklen = handle_key_arena(zc, node->unary.operand, &dkey);
             if (dklen > 0) {
                 HandleInfo *h = find_handle(ps, dkey, (uint32_t)dklen);
                 if (is_handle_invalid(h))
@@ -1761,8 +1774,8 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
             if (src_is_move) {
-                char src_key[128];
-                int sklen = handle_key_from_expr(move_src, src_key, sizeof(src_key));
+                const char *src_key;
+                int sklen = handle_key_arena(zc, move_src, &src_key);
                 if (sklen > 0) {
                     HandleInfo *src = find_handle(ps, src_key, (uint32_t)sklen);
                     if (!src) {
@@ -1814,8 +1827,8 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                     }
                 }
                 if (fb_is_move) {
-                    char fb_key[128];
-                    int fbklen = handle_key_from_expr(fb, fb_key, sizeof(fb_key));
+                    const char *fb_key;
+                    int fbklen = handle_key_arena(zc, fb, &fb_key);
                     if (fbklen > 0) {
                         HandleInfo *fbh = find_handle(ps, fb_key, (uint32_t)fbklen);
                         if (!fbh) {
@@ -1868,8 +1881,8 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                 }
             }
             /* if (mh) |t| or if (arr[0]) |h| — capture is alias of condition */
-            char cond_key[128];
-            int cklen = handle_key_from_expr(cond, cond_key, sizeof(cond_key));
+            const char *cond_key;
+            int cklen = handle_key_arena(zc, cond, &cond_key);
             if (cklen > 0) {
                 HandleInfo *src = find_handle(ps, cond_key, (uint32_t)cklen);
                 if (src) {
@@ -2040,8 +2053,8 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             zc_check_expr(zc, ps, node->ret.expr);
         /* 9c: check if returning a freed/maybe-freed pointer */
         if (node->ret.expr) {
-            char rkey[128];
-            int rklen = handle_key_from_expr(node->ret.expr, rkey, sizeof(rkey));
+            const char *rkey;
+            int rklen = handle_key_arena(zc, node->ret.expr, &rkey);
             if (rklen > 0) {
                 HandleInfo *h = find_handle(ps, rkey, (uint32_t)rklen);
                 if (h && h->state == HS_FREED) {
@@ -2181,8 +2194,8 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                             is_shared_type = true;
                     }
                     if (!is_shared_type) {
-                        char akey[128];
-                        int aklen = handle_key_from_expr(root, akey, sizeof(akey));
+                        const char *akey;
+                        int aklen = handle_key_arena(zc, root, &akey);
                         if (aklen > 0) {
                             HandleInfo *h = find_handle(ps, akey, (uint32_t)aklen);
                             if (h && h->state == HS_ALIVE) {
@@ -2384,8 +2397,8 @@ static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
     if (!s && !heuristic_free) return;
     /* If heuristic free, treat param 0 as freed */
     if (heuristic_free && !s) {
-        char hkey[128];
-        int hklen = handle_key_from_expr(call_node->call.args[0], hkey, sizeof(hkey));
+        const char *hkey;
+        int hklen = handle_key_arena(zc, call_node->call.args[0], &hkey);
         if (hklen > 0) {
             HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
             if (h) {
@@ -2408,8 +2421,8 @@ static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
         if (!s->frees_param[i] && !s->maybe_frees_param[i]) continue;
 
         /* get the handle key for this argument */
-        char hkey[128];
-        int hklen = handle_key_from_expr(call_node->call.args[i], hkey, sizeof(hkey));
+        const char *hkey;
+        int hklen = handle_key_arena(zc, call_node->call.args[i], &hkey);
         if (hklen <= 0) continue;
 
         HandleInfo *h = find_handle(ps, hkey, (uint32_t)hklen);
@@ -2576,8 +2589,8 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
         for (int si = 0; si < func->func_decl.body->block.stmt_count; si++) {
             Node *stmt = func->func_decl.body->block.stmts[si];
             if (stmt->kind == NODE_RETURN && stmt->ret.expr) {
-                char rkey[128];
-                int rklen = handle_key_from_expr(stmt->ret.expr, rkey, sizeof(rkey));
+                const char *rkey;
+                int rklen = handle_key_arena(zc, stmt->ret.expr, &rkey);
                 if (rklen > 0) {
                     HandleInfo *rh = find_handle(&ps, rkey, (uint32_t)rklen);
                     if (rh) rh->escaped = true;

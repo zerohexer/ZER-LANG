@@ -118,6 +118,20 @@ static void emit_opt_null_literal(Emitter *e, Type *opt_type) {
     }
 }
 
+/* forward declaration needed by emit_opt_wrap_value */
+static void emit_expr(Emitter *e, Node *node);
+
+/* B4: Emit value wrapped in optional struct: (Type){ val, 1 }.
+ * Used for T → ?T wrapping at assignment, var-decl init.
+ * opt_type is the target optional type (may be distinct). */
+static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
+    emit(e, "(");
+    emit_type(e, opt_type);
+    emit(e, "){ ");
+    emit_expr(e, value_expr);
+    emit(e, ", 1 }");
+}
+
 /* Emit return-null for current function's return type.
  * Handles ?void, ?T struct, ?*T null sentinel, void, and scalar. */
 static void emit_return_null(Emitter *e) {
@@ -206,8 +220,6 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
 }
 
 /* ---- Type emission ---- */
-
-static void emit_expr(Emitter *e, Node *node);
 static void emit_stmt(Emitter *e, Node *node);
 static void prescan_async_temps(Emitter *e, Node *node);
 static bool is_condvar_type(Emitter *e, uint32_t type_id);
@@ -886,6 +898,22 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* A19: distinct wrapping optional wrapping funcptr — unwrap distinct first */
+    if (t->kind == TYPE_DISTINCT) {
+        Type *dt = type_unwrap_distinct(t);
+        if (dt->kind == TYPE_OPTIONAL && type_unwrap_distinct(dt->optional.inner)->kind == TYPE_FUNC_PTR) {
+            Type *fp = type_unwrap_distinct(dt->optional.inner);
+            emit_type(e, fp->func_ptr.ret);
+            emit(e, " (*%.*s)(", (int)name_len, name);
+            for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_type(e, fp->func_ptr.params[i]);
+            }
+            emit(e, ")");
+            return;
+        }
+    }
+
     /* optional function pointer: ?ret (*name)(params) → ret (*name)(params) (null sentinel) */
     if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_FUNC_PTR) {
         Type *fp = t->optional.inner;
@@ -1398,11 +1426,7 @@ static void emit_expr(Emitter *e, Node *node) {
             !is_null_sentinel(tgt_eff->optional.inner) &&
             val_type->kind != TYPE_OPTIONAL &&
             node->assign.value->kind != NODE_NULL_LIT) {
-            emit(e, "(");
-            emit_type(e, tgt_type);
-            emit(e, "){ ");
-            emit_expr(e, node->assign.value);
-            emit(e, ", 1 }");
+            emit_opt_wrap_value(e, tgt_type, node->assign.value);
         } else if (node->assign.op == TOK_EQ && tgt_eff &&
                    tgt_eff->kind == TYPE_OPTIONAL &&
                    !is_null_sentinel(tgt_eff->optional.inner) &&
@@ -3271,11 +3295,8 @@ static void emit_stmt(Emitter *e, Node *node) {
                         emit(e, " = ");
                         emit_expr(e, node->var_decl.init);
                     } else {
-                        emit(e, " = (");
-                        emit_type(e, type);
-                        emit(e, "){ ");
-                        emit_expr(e, node->var_decl.init);
-                        emit(e, ", 1 }");
+                        emit(e, " = ");
+                        emit_opt_wrap_value(e, type, node->var_decl.init);
                     }
                 } else {
                     /* check if init expression is already ?T (e.g. struct field of ?Handle type).
@@ -3285,11 +3306,8 @@ static void emit_stmt(Emitter *e, Node *node) {
                         emit(e, " = ");
                         emit_expr(e, node->var_decl.init);
                     } else {
-                        emit(e, " = (");
-                        emit_type(e, type);
-                        emit(e, "){ ");
-                        emit_expr(e, node->var_decl.init);
-                        emit(e, ", 1 }");
+                        emit(e, " = ");
+                        emit_opt_wrap_value(e, type, node->var_decl.init);
                     }
                 }
             } else {

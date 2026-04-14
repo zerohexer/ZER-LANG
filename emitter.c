@@ -2318,95 +2318,50 @@ static void emit_expr(Emitter *e, Node *node) {
 
         bool is_void_optional = is_void_opt(orelse_type);
 
+        /* B3 refactor: all orelse paths share the opening temp pattern.
+         * Use emit_opt_null_check/emit_opt_unwrap helpers for dispatch. */
         if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
-            if (is_void_optional) {
-                /* ?void orelse return/break/continue — no .value to extract,
-                 * just check has_value and branch */
-                int tmp = e->temp_count++;
-                /* BUG-289: use __typeof__ to preserve volatile in orelse temp */
-                emit(e, "({__typeof__(");
-                emit_expr(e, node->orelse.expr);
-                emit(e, ") _zer_tmp%d = ", tmp);
-                emit_expr(e, node->orelse.expr);
-                emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
-                /* emit defers before return/break/continue */
-                if (node->orelse.fallback_is_return) {
-                    emit_defers(e);
-                    emit_return_null(e);
-                } else if (node->orelse.fallback_is_break) {
-                    emit_defers_from(e, e->loop_defer_base);
-                    emit(e, "break; ");
-                } else {
-                    emit_defers_from(e, e->loop_defer_base);
-                    emit(e, "continue; ");
-                }
-                emit(e, "} (void)0; })");
-            } else {
-                /* ?T (non-void, non-pointer) orelse return/break/continue */
-                int tmp = e->temp_count++;
-                /* BUG-289: use __typeof__ to preserve volatile in orelse temp */
-                emit(e, "({__typeof__(");
-                emit_expr(e, node->orelse.expr);
-                emit(e, ") _zer_tmp%d = ", tmp);
-                emit_expr(e, node->orelse.expr);
-                if (is_ptr_optional) {
-                    emit(e, "; if (!_zer_tmp%d) { ", tmp);
-                } else {
-                    emit(e, "; if (!_zer_tmp%d.has_value) { ", tmp);
-                }
-                /* emit defers before return/break/continue */
-                if (node->orelse.fallback_is_return) {
-                    emit_defers(e);
-                    emit_return_null(e);
-                } else if (node->orelse.fallback_is_break) {
-                    emit_defers_from(e, e->loop_defer_base);
-                    emit(e, "break; ");
-                } else {
-                    emit_defers_from(e, e->loop_defer_base);
-                    emit(e, "continue; ");
-                }
-                if (is_ptr_optional) {
-                    emit(e, "} _zer_tmp%d; })", tmp);
-                } else {
-                    emit(e, "} _zer_tmp%d.value; })", tmp);
-                }
-            }
-        } else if (node->orelse.fallback &&
-                   node->orelse.fallback->kind == NODE_BLOCK) {
-            /* orelse { block } — statement-only form.
-             * BUG-495: In async mode, use state struct temp (survives yield).
-             * Prescan registered the temp — find and use it. */
-            /* Non-async: use stack temp. Async orelse-with-yield inside
-             * expressions is rejected at checker level (can't split statement
-             * expression — GCC forbids case labels inside ({...})).
-             * Async orelse at var-decl level is handled by BUG-481 path. */
-            {
+            /* orelse return/break/continue — check, emit defers + flow, unwrap */
             int tmp = e->temp_count++;
-            /* BUG-401: use __typeof__ to preserve volatile qualifier */
             emit(e, "({__typeof__(");
             emit_expr(e, node->orelse.expr);
             emit(e, ") _zer_tmp%d = ", tmp);
             emit_expr(e, node->orelse.expr);
-            emit(e, "; ");
-            if (is_ptr_optional) {
-                emit(e, "if (!_zer_tmp%d) ", tmp);
+            emit(e, "; if (");
+            emit_opt_null_check(e, tmp, orelse_type);
+            emit(e, ") { ");
+            if (node->orelse.fallback_is_return) {
+                emit_defers(e);
+                emit_return_null(e);
+            } else if (node->orelse.fallback_is_break) {
+                emit_defers_from(e, e->loop_defer_base);
+                emit(e, "break; ");
             } else {
-                emit(e, "if (!_zer_tmp%d.has_value) ", tmp);
+                emit_defers_from(e, e->loop_defer_base);
+                emit(e, "continue; ");
             }
-            emit_stmt(e, node->orelse.fallback);
-            if (is_ptr_optional) {
-                emit(e, " _zer_tmp%d; })", tmp);
-            } else if (is_void_optional) {
-                /* ?void has no .value — just return the struct */
-                emit(e, " (void)0; })");
-            } else {
-                emit(e, " _zer_tmp%d.value; })", tmp);
-            }
-            }
-        } else {
+            emit(e, "} ");
+            emit_opt_unwrap(e, tmp, orelse_type);
+            emit(e, "; })");
+        } else if (node->orelse.fallback &&
+                   node->orelse.fallback->kind == NODE_BLOCK) {
+            /* orelse { block } — check, emit block, unwrap */
             int tmp = e->temp_count++;
-            /* BUG-401: use __typeof__ to preserve volatile qualifier */
+            emit(e, "({__typeof__(");
+            emit_expr(e, node->orelse.expr);
+            emit(e, ") _zer_tmp%d = ", tmp);
+            emit_expr(e, node->orelse.expr);
+            emit(e, "; if (");
+            emit_opt_null_check(e, tmp, orelse_type);
+            emit(e, ") ");
+            emit_stmt(e, node->orelse.fallback);
+            emit(e, " ");
+            emit_opt_unwrap(e, tmp, orelse_type);
+            emit(e, "; })");
+        } else {
+            /* orelse default_value — ternary */
+            int tmp = e->temp_count++;
             emit(e, "({__typeof__(");
             emit_expr(e, node->orelse.expr);
             emit(e, ") _zer_tmp%d = ", tmp);
@@ -2414,7 +2369,6 @@ static void emit_expr(Emitter *e, Node *node) {
             if (is_ptr_optional) {
                 emit(e, "; _zer_tmp%d ? _zer_tmp%d : ", tmp, tmp);
             } else if (is_void_optional) {
-                /* ?void has no .value — check has_value, fallback is (void)0 */
                 emit(e, "; _zer_tmp%d.has_value ? (void)0 : ", tmp);
             } else {
                 emit(e, "; _zer_tmp%d.has_value ? _zer_tmp%d.value : ", tmp, tmp);
@@ -3632,17 +3586,15 @@ static void emit_stmt(Emitter *e, Node *node) {
             if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(ret_eff->optional.inner) &&
                 expr_type && !type_equals(expr_type, e->current_func_ret)) {
+                /* B7: use emit_opt_wrap_value for wrapping */
                 if (is_void_opt(e->current_func_ret)) {
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
                     emit_indent(e);
                     emit(e, "_zer_ret%d = (_zer_opt_void){ 1 };\n", ret_tmp);
                 } else {
-                    emit(e, "(");
-                    emit_type(e, e->current_func_ret);
-                    emit(e, "){ ");
-                    emit_expr(e, node->ret.expr);
-                    emit(e, ", 1 };\n");
+                    emit_opt_wrap_value(e, e->current_func_ret, node->ret.expr);
+                    emit(e, ";\n");
                 }
             } else {
                 emit_expr(e, node->ret.expr);
@@ -3677,18 +3629,16 @@ static void emit_stmt(Emitter *e, Node *node) {
                     emit(e, "return ");
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
+                /* B7: use emit_opt_wrap_value for wrapping */
                 } else if (is_void_opt(e->current_func_ret)) {
-                    /* ?void: emit void expr as statement, then return {1} */
                     emit_expr(e, node->ret.expr);
                     emit(e, ";\n");
                     emit_indent(e);
                     emit(e, "return (_zer_opt_void){ 1 };\n");
                 } else {
-                    emit(e, "return (");
-                    emit_type(e, e->current_func_ret);
-                    emit(e, "){ ");
-                    emit_expr(e, node->ret.expr);
-                    emit(e, ", 1 };\n");
+                    emit(e, "return ");
+                    emit_opt_wrap_value(e, e->current_func_ret, node->ret.expr);
+                    emit(e, ";\n");
                 }
             } else {
                 /* array→slice coercion on return */
@@ -5279,58 +5229,44 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
 
     case NODE_UNION_DECL: {
         Type *ut = checker_get_type(e->checker, decl);
+        /* B8: macro for the 12× repeated union name emission pattern */
+        #define EMIT_UNAME() do { \
+            if (ut) EMIT_UNION_NAME(e, ut); \
+            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name); \
+        } while(0)
         emit(e, "/* tagged union %.*s */\n",
              (int)decl->union_decl.name_len, decl->union_decl.name);
         for (int j = 0; j < decl->union_decl.variant_count; j++) {
             UnionVariant *v = &decl->union_decl.variants[j];
             emit(e, "#define _ZER_");
-            if (ut) EMIT_UNION_NAME(e, ut);
-            else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+            EMIT_UNAME();
             emit(e, "_TAG_%.*s %d\n", (int)v->name_len, v->name, j);
         }
-        emit(e, "struct _union_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "struct _union_"); EMIT_UNAME();
         emit(e, " {\n    int32_t _tag;\n    union {\n");
         for (int j = 0; j < decl->union_decl.variant_count; j++) {
             UnionVariant *v = &decl->union_decl.variants[j];
             Type *vtype = resolve_tynode(e,v->type);
             emit(e, "        ");
-            /* BUG-429: use emit_type_and_name for arrays/funcptrs in union variants */
             emit_type_and_name(e, vtype, v->name, (int)v->name_len);
             emit(e, ";\n");
         }
         emit(e, "    };\n};\n");
         /* optional/slice/opt-slice typedefs */
-        emit(e, "typedef struct { struct _union_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-        emit(e, " value; uint8_t has_value; } _zer_opt_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "typedef struct { struct _union_"); EMIT_UNAME();
+        emit(e, " value; uint8_t has_value; } _zer_opt_"); EMIT_UNAME();
         emit(e, ";\n");
-        emit(e, "typedef struct { struct _union_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-        emit(e, "* ptr; size_t len; } _zer_slice_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "typedef struct { struct _union_"); EMIT_UNAME();
+        emit(e, "* ptr; size_t len; } _zer_slice_"); EMIT_UNAME();
         emit(e, ";\n");
-        emit(e, "typedef struct { volatile struct _union_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-        emit(e, "* ptr; size_t len; } _zer_vslice_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "typedef struct { volatile struct _union_"); EMIT_UNAME();
+        emit(e, "* ptr; size_t len; } _zer_vslice_"); EMIT_UNAME();
         emit(e, ";\n");
-        emit(e, "typedef struct { _zer_slice_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
-        emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
-        if (ut) EMIT_UNION_NAME(e, ut);
-        else emit(e, "%.*s", (int)decl->union_decl.name_len, decl->union_decl.name);
+        emit(e, "typedef struct { _zer_slice_"); EMIT_UNAME();
+        emit(e, " value; uint8_t has_value; } _zer_opt_slice_"); EMIT_UNAME();
         emit(e, ";\n\n");
         break;
+        #undef EMIT_UNAME
     }
 
     case NODE_ENUM_DECL: {

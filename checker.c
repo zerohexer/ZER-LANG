@@ -179,9 +179,10 @@ static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
         Symbol *existing = scope_lookup(c->current_scope, name, name_len);
         if (existing && existing->type && type && c->current_module) {
             const char *existing_mod = NULL;
-            if (existing->type->kind == TYPE_STRUCT) existing_mod = existing->type->struct_type.module_prefix;
-            else if (existing->type->kind == TYPE_ENUM) existing_mod = existing->type->enum_type.module_prefix;
-            else if (existing->type->kind == TYPE_UNION) existing_mod = existing->type->union_type.module_prefix;
+            Type *et = type_unwrap_distinct(existing->type);
+            if (et->kind == TYPE_STRUCT) existing_mod = et->struct_type.module_prefix;
+            else if (et->kind == TYPE_ENUM) existing_mod = et->enum_type.module_prefix;
+            else if (et->kind == TYPE_UNION) existing_mod = et->union_type.module_prefix;
 
             if (existing_mod != c->current_module) {
                 /* cross-module type collision — allowed, per-module scope resolves it.
@@ -1132,8 +1133,9 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_POINTER: {
         Type *inner = resolve_type(c, tn->pointer.inner);
-        /* BUG-372: *void is invalid — use *opaque for type-erased pointers */
-        if (inner && inner->kind == TYPE_VOID) {
+        /* BUG-372: *void is invalid — use *opaque for type-erased pointers.
+         * BUG-506: unwrap distinct — distinct typedef void is still void. */
+        if (inner && type_unwrap_distinct(inner)->kind == TYPE_VOID) {
             checker_error(c, tn->loc.line,
                 "cannot create pointer to void — use '*opaque' for type-erased pointers");
         }
@@ -1142,7 +1144,8 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_OPTIONAL: {
         Type *inner = resolve_type(c, tn->optional.inner);
-        if (inner->kind == TYPE_OPTIONAL) {
+        /* BUG-506: unwrap distinct — ?distinct(?T) is still nested optional */
+        if (type_unwrap_distinct(inner)->kind == TYPE_OPTIONAL) {
             checker_error(c, tn->loc.line,
                 "nested optional '??T' is not supported");
             return inner; /* return the inner ?T, not ??T */
@@ -1152,8 +1155,9 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_SLICE: {
         Type *inner = resolve_type(c, tn->slice.inner);
-        /* BUG-372: []void is invalid — void has no size */
-        if (inner && inner->kind == TYPE_VOID) {
+        /* BUG-372: []void is invalid — void has no size.
+         * BUG-506: unwrap distinct. */
+        if (inner && type_unwrap_distinct(inner)->kind == TYPE_VOID) {
             checker_error(c, tn->loc.line,
                 "cannot create slice of void — void has no size");
         }
@@ -1430,12 +1434,14 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_CONST: {
         Type *inner = resolve_type(c, tn->qualified.inner);
-        /* propagate const through pointer/slice */
-        if (inner->kind == TYPE_POINTER) {
-            return type_const_pointer(c->arena, inner->pointer.inner);
+        /* propagate const through pointer/slice.
+         * BUG-506: unwrap distinct — const distinct(*T) should propagate. */
+        Type *inner_eff = type_unwrap_distinct(inner);
+        if (inner_eff->kind == TYPE_POINTER) {
+            return type_const_pointer(c->arena, inner_eff->pointer.inner);
         }
-        if (inner->kind == TYPE_SLICE) {
-            return type_const_slice(c->arena, inner->slice.inner);
+        if (inner_eff->kind == TYPE_SLICE) {
+            return type_const_slice(c->arena, inner_eff->slice.inner);
         }
         /* for value types, const is a variable qualifier, not a type property */
         return inner;
@@ -1443,17 +1449,21 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_VOLATILE: {
         Type *inner = resolve_type(c, tn->qualified.inner);
-        /* propagate volatile to pointer/slice type for codegen */
-        if (inner && inner->kind == TYPE_POINTER) {
-            Type *vp = type_pointer(c->arena, inner->pointer.inner);
+        /* propagate volatile to pointer/slice type for codegen.
+         * BUG-506: unwrap distinct. */
+        {
+        Type *iv = inner ? type_unwrap_distinct(inner) : NULL;
+        if (iv && iv->kind == TYPE_POINTER) {
+            Type *vp = type_pointer(c->arena, iv->pointer.inner);
             vp->pointer.is_volatile = true;
-            if (inner->pointer.is_const) vp->pointer.is_const = true;
+            if (iv->pointer.is_const) vp->pointer.is_const = true;
             return vp;
         }
-        if (inner && inner->kind == TYPE_SLICE) {
-            Type *vs = type_volatile_slice(c->arena, inner->slice.inner);
-            if (inner->slice.is_const) vs->slice.is_const = true;
+        if (iv && iv->kind == TYPE_SLICE) {
+            Type *vs = type_volatile_slice(c->arena, iv->slice.inner);
+            if (iv->slice.is_const) vs->slice.is_const = true;
             return vs;
+        }
         }
         return inner;
     }
@@ -1579,11 +1589,13 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         n->field.object->kind == NODE_IDENT && _comptime_global_scope) {
         Symbol *esym = scope_lookup(_comptime_global_scope,
             n->field.object->ident.name, (uint32_t)n->field.object->ident.name_len);
-        if (esym && esym->type && esym->type->kind == TYPE_ENUM) {
+        /* BUG-506: unwrap distinct for enum variant resolution */
+        Type *esym_eff = (esym && esym->type) ? type_unwrap_distinct(esym->type) : NULL;
+        if (esym_eff && esym_eff->kind == TYPE_ENUM) {
             const char *vname = n->field.field_name;
             uint32_t vlen = (uint32_t)n->field.field_name_len;
-            for (uint32_t i = 0; i < esym->type->enum_type.variant_count; i++) {
-                SEVariant *v = &esym->type->enum_type.variants[i];
+            for (uint32_t i = 0; i < esym_eff->enum_type.variant_count; i++) {
+                SEVariant *v = &esym_eff->enum_type.variants[i];
                 if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0)
                     return (int64_t)v->value;
             }
@@ -2638,13 +2650,15 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-225: reject Pool/Ring/Slab assignment — unique resource types */
-        if (node->assign.op == TOK_EQ && target &&
-            (target->kind == TYPE_POOL || target->kind == TYPE_RING || target->kind == TYPE_SLAB)) {
+        /* BUG-225: reject Pool/Ring/Slab assignment — unique resource types.
+         * BUG-506: unwrap distinct. */
+        { Type *teff = target ? type_unwrap_distinct(target) : NULL;
+        if (node->assign.op == TOK_EQ && teff &&
+            (teff->kind == TYPE_POOL || teff->kind == TYPE_RING || teff->kind == TYPE_SLAB)) {
             checker_error(c, node->loc.line,
                 "cannot assign %s — resource types are not copyable",
-                target->kind == TYPE_POOL ? "Pool" : target->kind == TYPE_RING ? "Ring" : "Slab");
-        }
+                teff->kind == TYPE_POOL ? "Pool" : teff->kind == TYPE_RING ? "Ring" : "Slab");
+        } }
 
         /* string literal to mutable slice: runtime crash on write.
          * BUG-424: allow assignment to const slice fields (const []u8 is safe). */
@@ -7546,11 +7560,12 @@ static void check_stmt(Checker *c, Node *node) {
              * Covers both []u8 and ?[]u8 return types.
              * BUG-406: allow return from const []u8 functions (string literals are const). */
             if (node->ret.expr->kind == NODE_STRING_LIT && c->current_func_ret) {
-                Type *ret = c->current_func_ret;
+                /* BUG-506: unwrap distinct on return type for mutable slice check */
+                Type *ret = type_unwrap_distinct(c->current_func_ret);
                 if ((ret->kind == TYPE_SLICE && !ret->slice.is_const) ||
                     (ret->kind == TYPE_OPTIONAL &&
-                     ret->optional.inner->kind == TYPE_SLICE &&
-                     !ret->optional.inner->slice.is_const)) {
+                     type_unwrap_distinct(ret->optional.inner)->kind == TYPE_SLICE &&
+                     !type_unwrap_distinct(ret->optional.inner)->slice.is_const)) {
                     checker_error(c, node->loc.line,
                         "cannot return string literal as mutable slice — data is read-only");
                 }

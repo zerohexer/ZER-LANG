@@ -1,0 +1,12 @@
+// A13: distinct typedef Pool — assignment must still be rejected
+// EXPECTED: compile error
+
+distinct typedef Pool(u32, 8) MyPool;
+
+MyPool a;
+MyPool b;
+
+u32 main() {
+    a = b;
+    return 0;
+}

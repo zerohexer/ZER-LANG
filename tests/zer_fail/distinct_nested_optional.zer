@@ -1,0 +1,9 @@
+// A10: distinct wrapping optional — nested ??T must be rejected
+// EXPECTED: compile error
+
+distinct typedef ?u32 MaybeId;
+
+u32 main() {
+    ?MaybeId nested = null;
+    return 0;
+}

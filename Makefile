@@ -82,6 +82,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tests/test_zer.sh
 	@echo "=== Rust-equivalent safety tests ==="
 	@bash rust_tests/run_tests.sh ./zerc
+	@echo "=== Zig-translated tests ==="
+	@bash zig_tests/run_tests.sh ./zerc
 	@echo "=== Conversion tool tests ==="
 	@bash tests/test_convert.sh
 

@@ -3453,12 +3453,14 @@ static Type *check_expr(Checker *c, Node *node) {
             uint32_t maybe_mod_len = (uint32_t)node->call.callee->field.object->ident.name_len;
             const char *func_name = node->call.callee->field.field_name;
             uint32_t func_len = (uint32_t)node->call.callee->field.field_name_len;
-            /* check if this is a module name (not a variable/type) */
+            /* check if this is a module name (not a variable/type).
+             * A20: unwrap distinct — distinct struct variable is still a type, not a module. */
             Symbol *var_sym = scope_lookup(c->current_scope, maybe_mod, maybe_mod_len);
-            if (!var_sym || (var_sym->type && var_sym->type->kind != TYPE_STRUCT &&
-                var_sym->type->kind != TYPE_ENUM && var_sym->type->kind != TYPE_UNION &&
-                var_sym->type->kind != TYPE_POOL && var_sym->type->kind != TYPE_SLAB &&
-                var_sym->type->kind != TYPE_RING && var_sym->type->kind != TYPE_ARENA)) {
+            Type *vs_eff = (var_sym && var_sym->type) ? type_unwrap_distinct(var_sym->type) : NULL;
+            if (!var_sym || (vs_eff && vs_eff->kind != TYPE_STRUCT &&
+                vs_eff->kind != TYPE_ENUM && vs_eff->kind != TYPE_UNION &&
+                vs_eff->kind != TYPE_POOL && vs_eff->kind != TYPE_SLAB &&
+                vs_eff->kind != TYPE_RING && vs_eff->kind != TYPE_ARENA)) {
                 /* try as module-qualified call — look up module__func in global scope */
                 uint32_t mang_len = maybe_mod_len + 2 + func_len;
                 char *mangled = (char *)arena_alloc(c->arena, mang_len + 1);
@@ -8117,8 +8119,16 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
                 /* Type mismatch */
+                /* A15: add is_literal_compatible + validate_struct_init (match regular call) */
+                if (node->spawn_stmt.args[i]->kind == NODE_STRUCT_INIT && param_type) {
+                    if (validate_struct_init(c, node->spawn_stmt.args[i], param_type, node->loc.line)) {
+                        arg_type = param_type;
+                        typemap_set(c, node->spawn_stmt.args[i], param_type);
+                    }
+                }
                 if (!type_equals(param_type, arg_type) &&
-                    !can_implicit_coerce(arg_type, param_type)) {
+                    !can_implicit_coerce(arg_type, param_type) &&
+                    !is_literal_compatible(node->spawn_stmt.args[i], param_type)) {
                     checker_error(c, node->loc.line,
                         "spawn argument %d: expected '%s', got '%s'",
                         i + 1, type_name(param_type), type_name(arg_type));

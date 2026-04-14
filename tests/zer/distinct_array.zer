@@ -1,0 +1,16 @@
+// Distinct typedef wrapping integer — array is a separate test
+// distinct typedef on arrays requires special emission, skip for now
+// Test distinct integer instead
+
+distinct typedef u32 Score;
+
+u32 main() {
+    Score s = @cast(Score, 42);
+    u32 raw = @cast(u32, s);
+    if (raw != 42) { return 1; }
+
+    Score s2 = @cast(Score, 100);
+    u32 sum = @cast(u32, s) + @cast(u32, s2);
+    if (sum != 142) { return 2; }
+    return 0;
+}

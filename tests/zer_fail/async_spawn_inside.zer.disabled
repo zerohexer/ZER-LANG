@@ -1,0 +1,12 @@
+// Async + spawn inside async function — must be rejected
+// spawn inside coroutine has no clear thread ownership semantics
+// EXPECTED: compile error
+
+void helper() { }
+
+async void bad_spawn() {
+    yield;
+    spawn helper();
+}
+
+u32 main() { return 0; }

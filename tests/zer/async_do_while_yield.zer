@@ -1,0 +1,26 @@
+// Async + do-while with yield — local promoted to state struct
+i32 putchar(i32 c);
+
+async void counter() {
+    u32 count = 0;
+    do {
+        count += 1;
+        yield;
+    } while (count < 3);
+}
+
+u32 main() {
+    _zer_async_counter task;
+    _zer_async_counter_init(&task);
+    // poll 3 iterations (each yield returns 0 = not done)
+    i32 r1 = _zer_async_counter_poll(&task);
+    if (r1 != 0) { return 1; }
+    i32 r2 = _zer_async_counter_poll(&task);
+    if (r2 != 0) { return 2; }
+    i32 r3 = _zer_async_counter_poll(&task);
+    if (r3 != 0) { return 3; }
+    // 4th poll: count=3, condition false, function completes
+    i32 r4 = _zer_async_counter_poll(&task);
+    if (r4 != 1) { return 4; }
+    return 0;
+}

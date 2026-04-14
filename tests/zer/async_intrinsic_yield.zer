@@ -1,0 +1,23 @@
+// Async + intrinsic (@truncate, @size) with yield
+
+async void truncator() {
+    u32 big = 300;
+    yield;
+    u8 small = @truncate(u8, big);
+    yield;
+    if (small != 44) { return; } // 300 % 256 = 44
+    usize sz = @size(u32);
+    if (sz != 4) { return; }
+}
+
+u32 main() {
+    _zer_async_truncator task;
+    _zer_async_truncator_init(&task);
+    i32 r1 = _zer_async_truncator_poll(&task);
+    if (r1 != 0) { return 1; }
+    i32 r2 = _zer_async_truncator_poll(&task);
+    if (r2 != 0) { return 2; }
+    i32 r3 = _zer_async_truncator_poll(&task);
+    if (r3 != 1) { return 3; }
+    return 0;
+}

@@ -1,0 +1,15 @@
+// Distinct typedef wrapping bool
+
+distinct typedef bool Flag;
+
+u32 main() {
+    Flag on = @cast(Flag, true);
+    Flag off = @cast(Flag, false);
+
+    bool raw_on = @cast(bool, on);
+    bool raw_off = @cast(bool, off);
+
+    if (!raw_on) { return 1; }
+    if (raw_off) { return 2; }
+    return 0;
+}

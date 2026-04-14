@@ -940,3 +940,584 @@ Sits between checker and emitter. Still emits C → GCC.
 
 ### Status
 **Planned for v0.4.** Design document complete. Implementation not started.
+
+---
+
+## Part 15: Concrete Lowering Examples for Tricky Patterns
+
+These are the patterns that a fresh session implementing the lowering pass will
+struggle with. Each shows the ZER source, the AST shape, and the expected IR output.
+
+### 15.1: orelse (3 forms)
+
+**orelse return (bare):**
+```zer
+*Task t = pool.alloc() orelse return;
+```
+AST: `NODE_VAR_DECL { init: NODE_ORELSE { expr: NODE_CALL(pool.alloc), fallback_is_return: true } }`
+
+IR:
+```
+  %_or0 = IR_POOL_ALLOC pool
+  BRANCH %_or0.has_value -> bb_ok, bb_fail
+
+bb_fail:
+  IR_DEFER_FIRE
+  RETURN void
+
+bb_ok:
+  %t = %_or0.value
+  ... continue ...
+```
+
+**orelse { block }:**
+```zer
+*Task t = pool.alloc() orelse { cleanup(); return; };
+```
+IR:
+```
+  %_or0 = IR_POOL_ALLOC pool
+  BRANCH %_or0.has_value -> bb_ok, bb_fail
+
+bb_fail:
+  IR_CALL cleanup()
+  IR_DEFER_FIRE
+  RETURN void
+
+bb_ok:
+  %t = %_or0.value
+  ... continue ...
+```
+
+**orelse default_value:**
+```zer
+u32 val = maybe_func() orelse 0;
+```
+IR:
+```
+  %_or0 = IR_CALL maybe_func()
+  BRANCH %_or0.has_value -> bb_has, bb_default
+
+bb_has:
+  %val = %_or0.value
+  GOTO bb_join
+
+bb_default:
+  %val = 0
+  GOTO bb_join
+
+bb_join:
+  ... continue using %val ...
+```
+
+Note: all three orelse forms produce the same IR PATTERN (branch on has_value).
+The variation is in the fallback block content. This eliminates the emitter's
+current 3-path orelse dispatch.
+
+### 15.2: Handle Auto-Deref
+
+```zer
+Pool(Task, 8) pool;
+Handle(Task) h = pool.alloc() orelse return;
+u32 id = h.id;
+h.id = 42;
+```
+AST: `h.id` is `NODE_FIELD(NODE_IDENT(h), "id")` with Handle auto-deref.
+Checker resolves `h.id` → `pool.get(h).id`.
+
+IR (lowering inserts the get):
+```
+LOCALS:
+  %0: h    : Handle(Task)
+  %1: id   : u32
+  %2: _get : *Task          ← temp for pool.get result
+
+bb0:
+  %0 = IR_POOL_ALLOC pool   → orelse lowering (branch on has_value)
+  ...
+bb_ok:
+  %2 = IR_POOL_GET pool, %0           ← explicit get
+  %1 = FIELD_READ %2, "id"            ← read through pointer
+  ...
+  %2 = IR_POOL_GET pool, %0           ← another get for write
+  FIELD_WRITE %2, "id", 42            ← write through pointer
+```
+
+The lowering makes the pool.get EXPLICIT. Currently the emitter discovers this
+at emission time by checking TYPE_HANDLE. With IR, the lowering does it once.
+
+Note: `_get` temp is non-storable — same as current. But in IR it's just a LOCAL
+that zercheck knows is from IR_POOL_GET (transient, not cacheable).
+
+### 15.3: Shared Struct Auto-Locking
+
+```zer
+shared struct Counter { u32 value; }
+Counter g;
+g.value += 1;
+```
+Currently the emitter wraps each statement accessing `g` with lock/unlock.
+The checker detects shared struct access and groups by statement.
+
+IR (lowering inserts lock/unlock):
+```
+bb0:
+  IR_LOCK g                            ← mutex lock
+  %_tmp = FIELD_READ &g, "value"
+  %_tmp2 = %_tmp + 1
+  FIELD_WRITE &g, "value", %_tmp2
+  IR_UNLOCK g                          ← mutex unlock
+```
+
+The lowering pass determines lock scope (per-statement grouping, same as current
+checker's `Shared Type Collect`). Lock/unlock become explicit IR instructions.
+Deadlock detection: scan for two IR_LOCK without intervening IR_UNLOCK in same block.
+
+### 15.4: Spawn Wrapper
+
+```zer
+void worker(u32 x, *Task t) { ... }
+spawn worker(42, &task);
+```
+Currently the emitter pre-scans for NODE_SPAWN, creates wrapper structs and
+functions, then references them at spawn emission.
+
+IR:
+```
+bb0:
+  IR_SPAWN worker, args=[42, &task], is_scoped=false
+```
+
+The IR_SPAWN instruction carries the function name and args. The C emitter
+handles wrapper struct generation — this is EMISSION concern, not analysis concern.
+The IR doesn't need to know about wrappers. zercheck sees IR_SPAWN and checks
+args for non-shared pointers, marks variables as HS_TRANSFERRED.
+
+### 15.5: Defer Chains
+
+```zer
+void transfer() {
+    mutex_lock(&lock);
+    defer mutex_unlock(&lock);
+    *Task t = pool.alloc() orelse return;
+    defer pool.free(t);
+    process(t);
+}
+```
+IR:
+```
+LOCALS:
+  %0: t : Handle(Task)
+
+bb0:
+  IR_CALL mutex_lock(&lock)
+  IR_DEFER_PUSH [IR_CALL mutex_unlock(&lock)]     ← defer #0
+
+  %_or0 = IR_POOL_ALLOC pool
+  BRANCH %_or0.has_value -> bb_ok, bb_fail
+
+bb_fail:
+  IR_DEFER_FIRE                                     ← fires defer #0 (mutex_unlock)
+  RETURN void
+
+bb_ok:
+  %0 = %_or0.value
+  IR_DEFER_PUSH [IR_POOL_FREE pool, %0]            ← defer #1
+
+  IR_CALL process(%0)
+
+  IR_DEFER_FIRE                                     ← fires defer #1 then #0 (LIFO)
+  RETURN void
+```
+
+Key: IR_DEFER_FIRE fires ALL pending defers in LIFO order. The lowering pass
+inserts IR_DEFER_FIRE before EVERY exit (return, goto-out-of-scope, break, continue).
+Currently the emitter does this in `emit_defers()`. With IR, the lowering does it
+once, and the emitter just emits the deferred calls.
+
+### 15.6: Switch with Union Capture
+
+```zer
+union Data { u32 num; f32 flt; }
+Data d;
+switch (d) {
+    .num => |val| { process_int(val); }
+    .flt => |*v| { v[0] = 3.14; }
+}
+```
+IR:
+```
+LOCALS:
+  %0: d       : Data (union)
+  %1: val     : u32           ← value capture
+  %2: v       : *f32          ← pointer capture
+
+bb0:
+  %_tag = FIELD_READ &d, "_tag"
+  BRANCH (%_tag == 0) -> bb_num, bb_check_flt
+
+bb_check_flt:
+  BRANCH (%_tag == 1) -> bb_flt, bb_exit
+
+bb_num:
+  %1 = FIELD_READ &d, "num"              ← value capture: copy
+  IR_CALL process_int(%1)
+  GOTO bb_exit
+
+bb_flt:
+  %2 = FIELD_ADDR &d, "flt"              ← pointer capture: address
+  FIELD_WRITE %2, [0], 3.14
+  GOTO bb_exit
+
+bb_exit:
+  ... continue ...
+```
+
+Both capture types (value |val| and pointer |*v|) become explicit LOCALs.
+The lowering determines capture type from the AST (capture_is_ptr flag).
+
+### 15.7: Async Function with Multiple Yield Points
+
+```zer
+async void pipeline(?u32 input) {
+    if (input) |val| {
+        u32 doubled = val * 2;
+        yield;
+        u32 result = doubled + 1;
+        yield;
+        output(result);
+    }
+}
+```
+IR:
+```
+LOCALS:
+  %0: input    : ?u32    (param)
+  %1: val      : u32     (capture)    ← in state struct
+  %2: doubled  : u32     (variable)   ← in state struct
+  %3: result   : u32     (variable)   ← in state struct
+
+bb0:                                   ← state 0
+  BRANCH %0.has_value -> bb1, bb_end
+
+bb1:
+  %1 = %0.value
+  %2 = %1 * 2
+  YIELD                                ← state 1 — splits block
+
+bb2:                                   ← resume point (state 1)
+  %3 = %2 + 1
+  YIELD                                ← state 2 — splits block
+
+bb3:                                   ← resume point (state 2)
+  IR_CALL output(%3)
+  GOTO bb_end
+
+bb_end:
+  RETURN
+```
+
+ALL locals (%0-%3) are in the state struct. YIELD splits blocks. The Duff's device
+emitter maps state N to case N:. No enumeration of which locals need promotion —
+the LOCAL list IS the struct.
+
+### 15.8: Nested @critical + Defer + Return
+
+```zer
+u32 read_safe() {
+    @critical {
+        u32 val = read_hw_reg();
+        if (val == 0) { return 0; }
+    }
+    return 1;
+}
+```
+IR:
+```
+LOCALS:
+  %0: val : u32
+
+bb0:
+  IR_CRITICAL_BEGIN
+  %0 = IR_CALL read_hw_reg()
+  BRANCH (%0 == 0) -> bb_early_ret, bb_continue
+
+bb_early_ret:
+  IR_CRITICAL_END                      ← must re-enable before return!
+  RETURN 0
+
+bb_continue:
+  IR_CRITICAL_END                      ← normal exit
+  RETURN 1
+```
+
+Key: the lowering pass inserts IR_CRITICAL_END before EVERY exit from the @critical
+block (same as IR_DEFER_FIRE pattern). Currently the emitter does this with
+`critical_depth` tracking. With IR, it's explicit instructions — can't be forgotten.
+
+Note: the checker's existing `critical_depth > 0` check for return/break/continue/goto
+is REPLACED by the lowering pass inserting IR_CRITICAL_END. The ban on
+`return in @critical` becomes unnecessary — the lowering makes it safe by inserting
+the re-enable. BUT — this changes the language semantics (currently banned, would
+become allowed). Decision: keep the ban for now, revisit post-IR.
+
+---
+
+## Part 16: Cross-Module IR
+
+### Question: Does Each Imported Module Get IR?
+
+**Answer: No.** Only the function being analyzed gets lowered to IR.
+
+The checker processes ALL modules (imported + main) on AST. The typemap covers
+all modules. When lowering a function in the main module, and it calls a function
+from an imported module, the lowering just emits IR_CALL with the callee name.
+
+FuncProps (function summaries) handle the transitive analysis. If zercheck needs
+to know "does callee free its parameter?", it reads the callee's FuncSummary
+(already computed). It does NOT need the callee's IR.
+
+**Cross-module flow:**
+```
+imported module → AST → checker → FuncSummary (on Symbol)
+                                    ↑
+main module → AST → checker → lower to IR → zercheck reads FuncSummary for callees
+                                           → emit C from IR
+```
+
+The imported module's C emission still goes through AST (emit_file_no_preamble).
+Only the main module (or all modules, incrementally) moves to IR emission.
+
+**Future:** lower ALL modules to IR. But not required for Phase 1. Start with
+main module only. Imported modules still use AST emission path.
+
+### What About Inlining?
+
+ZER doesn't inline (GCC handles inlining after C emission). The IR never needs
+to inline a callee's body. IR_CALL is always a call, never expanded.
+
+---
+
+## Part 17: Comptime and IR
+
+### Question: Do Comptime Functions Get Lowered to IR?
+
+**Answer: No.** Comptime functions are evaluated at COMPILE TIME by the checker's
+`eval_comptime_block()`. They produce constant values that are inlined at call sites.
+By the time lowering runs, comptime calls are already resolved to NODE_INT_LIT
+or comptime_struct_init values.
+
+```zer
+comptime u32 MAX(u32 a, u32 b) { if (a > b) { return a; } return b; }
+u32 x = MAX(10, 20);  // checker resolves to: u32 x = 20;
+```
+
+The lowering pass sees `NODE_VAR_DECL x = NODE_INT_LIT(20)`. No comptime involved.
+The comptime function body is never lowered to IR.
+
+### What About comptime if?
+
+```zer
+comptime if (PLATFORM() == 1) {
+    // this code is emitted
+} else {
+    // this code is stripped
+}
+```
+
+The checker resolves comptime if at check time. Only the taken branch appears
+in the AST that reaches the lowering pass. The dead branch is already gone.
+
+### What About static_assert?
+
+```zer
+static_assert(BUF_SIZE() >= 64, "buffer too small");
+```
+
+Evaluated by checker. Never reaches lowering. Not in IR.
+
+### Summary: Comptime is Checker-Only
+
+```
+comptime function → checker evaluates → constant value in AST → lowering sees constant
+comptime if       → checker strips dead branch → lowering sees only taken branch
+static_assert     → checker checks → nothing in AST for lowering
+```
+
+The IR never handles comptime. The checker resolves everything before lowering starts.
+
+---
+
+## Part 18: The Design Journey — From Flags to IR
+
+This section captures the REASONING that led to the IR decision. A fresh session
+should understand not just WHAT we're building but WHY we arrived here.
+
+### Stage 1: Flag Checks (initial approach)
+
+When NODE_YIELD was added (v0.2.2), the checker used context flags:
+```c
+case NODE_YIELD:
+    // Should check: c->critical_depth, c->defer_depth
+    // But nobody added these checks
+    break;
+```
+
+The flag-handler matrix audit found 5 missing checks. Root cause: N operations ×
+M contexts = N×M manual checks. Each new operation or context requires updating
+all handlers. Forgettable.
+
+### Stage 2: Function Summaries (FuncProps)
+
+Instead of checking flags at each NODE_ handler, scan function bodies for
+properties (can_yield, can_spawn, can_alloc) and check at context entry points
+(@critical, defer, interrupt). One scan, transitive, cached.
+
+This fixed the 5 bugs and added transitive detection (calling a function that
+yields inside @critical = error). Implemented as tracking system #29.
+
+BUT: FuncProps only covers context safety. Doesn't fix zercheck CFG hacks,
+VRP manual tracking, emitter complexity, async capture enumeration.
+
+### Stage 3: The Model Question
+
+We asked: what's ZER's safety MODEL? Investigated:
+- Rust: one model (ownership types) — requires trait system ZER doesn't have
+- Zig: philosophy + runtime checks — ZER has no runtime
+- Effects: language feature — ZER sees all bodies, inference sufficient
+- Function summaries: inferred properties — works for context safety
+
+Discovered: ZER has 4 implicit models (verified against all 29 systems):
+1. State Machines — entity lifecycle (handle states, move tracking)
+2. Program Point Properties — values at control flow points (VRP, escape, provenance)
+3. Function Summaries — per-function properties (FuncProps, zercheck summaries)
+4. Static Annotations — set-once declarations (qualifiers, MMIO, keep)
+
+The 4 models are correct and sufficient. The problem isn't the models — it's
+the IMPLEMENTATION (29 AST walkers).
+
+### Stage 4: The IR Decision
+
+Analysis of 500+ bugs showed 60-70% are caused by AST-direct analysis:
+- Incomplete enumeration (async captures, TYNODE gaps, flag checks)
+- zercheck CFG hacks (linear walk, backward goto workaround)
+- VRP manual tracking (string keys, permanent address_taken)
+- Emitter complexity (3 orelse paths, optional variants, Handle dispatch)
+
+Every production compiler at ZER's scale has an IR. ZER outgrew AST-only.
+MIR-inspired design: flat locals + basic blocks + tree expressions.
+Still emits C → GCC. The IR is internal — replaces AST walking, not GCC.
+
+### The Key Insight
+
+The 4 safety models don't change. The IR changes HOW they're implemented:
+- State machines: zercheck on IR (LOCAL ids, not string keys)
+- Point properties: VRP on IR (per-block ranges, not manual tracking)
+- Function summaries: scan IR instructions (not recursive AST walk)
+- Static annotations: unchanged (checker-level, stays on AST)
+
+The models are the WHAT. AST vs IR is the HOW.
+
+### Why Not Earlier?
+
+ZER started from chibicc (no IR, no safety analysis). Safety passes were added
+incrementally onto the AST-direct architecture. Each pass was small (~200 lines)
+and worked. The pain accumulated gradually — no single moment said "add IR now."
+
+The trigger was the async capture ghost bug: a memory safety violation caused by
+incomplete AST enumeration. Combined with the bug history analysis (60-70% from
+AST walking), the case became clear.
+
+Rust had the same journey: AST-direct → MIR added 4 years into development.
+Same trigger (AST too complex for analysis). Same solution (mid-level IR).
+
+---
+
+## Part 19: Testing Strategy for IR
+
+### Differential Testing (Phase 4 migration)
+
+During migration, both paths exist (AST emission + IR emission). For each test:
+```bash
+./zerc test.zer --emit-c -o test_ast.c    # old path (AST)
+./zerc test.zer --emit-ir-c -o test_ir.c  # new path (IR)
+diff test_ast.c test_ir.c                  # should be identical (or equivalent)
+```
+
+"Equivalent" not "identical" — the IR path may produce different variable names
+or slightly different C structure (goto/labels vs if/else). But the BEHAVIOR
+must be identical (same test exit code).
+
+### IR-Specific Tests
+
+```
+tests/ir/lower_basic.zer         — basic function lowers correctly
+tests/ir/lower_if_capture.zer    — if-unwrap capture becomes LOCAL
+tests/ir/lower_orelse.zer        — all 3 orelse forms produce correct IR
+tests/ir/lower_async.zer         — async locals complete in struct
+tests/ir/lower_defer_chain.zer   — defer fire inserted at all exits
+tests/ir/lower_switch_capture.zer — union switch captures become LOCALs
+tests/ir/lower_handle_deref.zer  — Handle auto-deref lowered to pool.get
+tests/ir/lower_shared_lock.zer   — shared struct access gets lock/unlock
+tests/ir/lower_spawn.zer         — spawn args in IR_SPAWN instruction
+tests/ir/lower_critical.zer      — critical begin/end at all exits
+tests/ir/lower_goto.zer          — goto/label → basic block edges
+tests/ir/lower_nested.zer        — nested if/for/while/switch all correct
+```
+
+### IR Validation as Continuous Check
+
+```c
+/* In zerc_main.c pipeline, after lowering: */
+IRFunc *ir = lower_func(arena, &checker, func_node);
+if (!validate_ir(ir)) {
+    fprintf(stderr, "INTERNAL ERROR: IR validation failed for %s\n", func_name);
+    abort();  /* lowering bug — fail loud */
+}
+```
+
+Validation runs on EVERY compilation, not just in test mode. If lowering ever
+produces malformed IR, the compiler crashes with a clear message instead of
+emitting wrong C that causes confusing GCC errors.
+
+### Existing Tests as Regression Suite
+
+All 4000+ existing tests exercise the full pipeline. During migration, every
+test must produce the same exit code through the IR path. The test suite IS
+the regression suite — no separate IR test suite needed for correctness.
+The IR-specific tests (above) are for DEVELOPMENT (testing individual lowering
+patterns during implementation), not for ongoing regression.
+
+---
+
+## Part 20: Open Questions for Implementation
+
+These are decisions that will be made during implementation, not upfront:
+
+1. **Should IR_ASSIGN keep expression trees or decompose?**
+   Design says: keep trees. But if zercheck needs to inspect sub-expressions
+   (e.g., `x = pool.get(h).field` — need to see pool.get), some decomposition
+   may be needed. Decide during zercheck rewrite.
+
+2. **Should basic blocks use array indices or pointers?**
+   Design shows int IDs. Pointers avoid array resizing but complicate serialization.
+   Decide during Phase 1 (data structures).
+
+3. **Should defer bodies be inlined or referenced?**
+   IR_DEFER_PUSH could store a pointer to the defer body AST (emitter walks it)
+   or a reference to a separate IR block sequence (fully lowered). Inline is
+   simpler but means the same defer body appears at every exit point.
+   Decide during Phase 2 (lowering).
+
+4. **Should the IR pretty-printer use text or graphviz?**
+   Text is simpler for terminal debugging. Graphviz (dot format) shows CFG
+   visually. Both are useful. Start with text, add graphviz later.
+
+5. **Should IR be a separate compilation unit or part of checker.c?**
+   Recommendation: `ir.h` (data structures) + `ir_lower.c` (lowering) +
+   `ir_emit.c` (C emission). Keep zercheck in `zercheck.c` but reading IR
+   instead of AST. Clean file boundaries.
+
+6. **How to handle the `--emit-c` flag during migration?**
+   Recommendation: `--emit-c` always uses current path (AST initially, IR later).
+   Add `--emit-ir` for debugging (prints IR text format). No user-visible change.

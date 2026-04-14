@@ -92,4 +92,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble); /* unifi
 void emit_file(Emitter *e, Node *file_node);              /* backward compat: with preamble */
 void emit_file_no_preamble(Emitter *e, Node *file_node);  /* backward compat: without preamble */
 
+/* IR-based emission (Phase 5) — emit one function from IR representation.
+ * Include ir.h before calling this. Uses IRFunc typedef from ir.h. */
+void emit_func_from_ir(Emitter *e, void *ir_func);
+
 #endif /* ZER_EMITTER_H */

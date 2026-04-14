@@ -5909,8 +5909,236 @@ static Type *check_expr(Checker *c, Node *node) {
  * STATEMENT TYPE CHECKING
  * ================================================================ */
 
+/* ================================================================
+ * FUNCTION SUMMARIES (FuncProps) — inferred function properties
+ *
+ * Lazy DFS: scan function body, follow callees transitively, cache on Symbol.
+ * Used by @critical/defer/interrupt to check for banned operations.
+ * Replaces has_atomic_or_barrier() standalone scanner.
+ * See docs/FunctionSummaries.md for full design.
+ * ================================================================ */
+
+/* Forward declaration — mutual recursion with scan_func_props */
+static void ensure_func_props(Checker *c, Symbol *sym);
+
+/* Recursive AST walker: collect all function properties in one pass.
+ * Sets bools on props for: yield, spawn, alloc, sync.
+ * Follows direct function calls transitively via ensure_func_props. */
+static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
+    if (!node) return;
+    /* Short-circuit: if all properties already found, stop scanning */
+    if (parent_sym->props.can_yield && parent_sym->props.can_spawn &&
+        parent_sym->props.can_alloc && parent_sym->props.has_sync)
+        return;
+
+    switch (node->kind) {
+    /* --- Direct effect detection --- */
+    case NODE_YIELD:
+    case NODE_AWAIT:
+        parent_sym->props.can_yield = true;
+        return;
+
+    case NODE_SPAWN:
+        parent_sym->props.can_spawn = true;
+        /* Also scan spawn args for effects */
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            scan_func_props(c, node->spawn_stmt.args[i], parent_sym);
+        return;
+
+    /* --- Sync detection (absorbs has_atomic_or_barrier) --- */
+    case NODE_INTRINSIC: {
+        const char *n = node->intrinsic.name;
+        uint32_t nl = (uint32_t)node->intrinsic.name_len;
+        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
+            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
+            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
+            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
+            parent_sym->props.has_sync = true;
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            scan_func_props(c, node->intrinsic.args[i], parent_sym);
+        return;
+    }
+
+    /* --- Call: detect alloc + follow callee transitively --- */
+    case NODE_CALL:
+        /* Scan callee expression and arguments */
+        if (node->call.callee)
+            scan_func_props(c, node->call.callee, parent_sym);
+        for (int i = 0; i < node->call.arg_count; i++)
+            scan_func_props(c, node->call.args[i], parent_sym);
+
+        /* Detect alloc: slab.alloc(), slab.alloc_ptr(), Task.new(), Task.new_ptr() */
+        if (node->call.callee && node->call.callee->kind == NODE_FIELD) {
+            const char *mn = node->call.callee->field.field_name;
+            uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
+            if ((ml == 5 && memcmp(mn, "alloc", 5) == 0) ||
+                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) ||
+                (ml == 3 && memcmp(mn, "new", 3) == 0) ||
+                (ml == 7 && memcmp(mn, "new_ptr", 7) == 0))
+                parent_sym->props.can_alloc = true;
+        }
+
+        /* Transitive: follow direct function calls */
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            Symbol *callee = scope_lookup(c->global_scope,
+                node->call.callee->ident.name,
+                (uint32_t)node->call.callee->ident.name_len);
+            if (callee && callee->is_function) {
+                ensure_func_props(c, callee);
+                if (callee->props.can_yield) parent_sym->props.can_yield = true;
+                if (callee->props.can_spawn) parent_sym->props.can_spawn = true;
+                if (callee->props.can_alloc) parent_sym->props.can_alloc = true;
+                if (callee->props.has_sync)  parent_sym->props.has_sync = true;
+            }
+        }
+
+        /* Module-qualified calls: config.func() rewritten to NODE_FIELD(NODE_IDENT, field).
+         * The field name is the function name after module prefix rewrite. */
+        if (node->call.callee && node->call.callee->kind == NODE_FIELD &&
+            node->call.callee->field.object &&
+            node->call.callee->field.object->kind == NODE_IDENT) {
+            /* Try mangled name: module__func */
+            const char *mod = node->call.callee->field.object->ident.name;
+            uint32_t modl = (uint32_t)node->call.callee->field.object->ident.name_len;
+            const char *fn = node->call.callee->field.field_name;
+            uint32_t fnl = (uint32_t)node->call.callee->field.field_name_len;
+            char mangled[256];
+            if (modl + 2 + fnl < sizeof(mangled)) {
+                memcpy(mangled, mod, modl);
+                mangled[modl] = '_'; mangled[modl+1] = '_';
+                memcpy(mangled + modl + 2, fn, fnl);
+                Symbol *callee = scope_lookup(c->global_scope, mangled, modl + 2 + fnl);
+                if (callee && callee->is_function) {
+                    ensure_func_props(c, callee);
+                    if (callee->props.can_yield) parent_sym->props.can_yield = true;
+                    if (callee->props.can_spawn) parent_sym->props.can_spawn = true;
+                    if (callee->props.can_alloc) parent_sym->props.can_alloc = true;
+                    if (callee->props.has_sync)  parent_sym->props.has_sync = true;
+                }
+            }
+        }
+        return;
+
+    /* --- Recursive walk into child nodes --- */
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            scan_func_props(c, node->block.stmts[i], parent_sym);
+        return;
+    case NODE_IF:
+        scan_func_props(c, node->if_stmt.cond, parent_sym);
+        scan_func_props(c, node->if_stmt.then_body, parent_sym);
+        scan_func_props(c, node->if_stmt.else_body, parent_sym);
+        return;
+    case NODE_FOR:
+        scan_func_props(c, node->for_stmt.init, parent_sym);
+        scan_func_props(c, node->for_stmt.cond, parent_sym);
+        scan_func_props(c, node->for_stmt.step, parent_sym);
+        scan_func_props(c, node->for_stmt.body, parent_sym);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        scan_func_props(c, node->while_stmt.cond, parent_sym);
+        scan_func_props(c, node->while_stmt.body, parent_sym);
+        return;
+    case NODE_SWITCH:
+        scan_func_props(c, node->switch_stmt.expr, parent_sym);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            scan_func_props(c, node->switch_stmt.arms[i].body, parent_sym);
+        return;
+    case NODE_RETURN:
+        scan_func_props(c, node->ret.expr, parent_sym);
+        return;
+    case NODE_EXPR_STMT:
+        scan_func_props(c, node->expr_stmt.expr, parent_sym);
+        return;
+    case NODE_VAR_DECL:
+        scan_func_props(c, node->var_decl.init, parent_sym);
+        return;
+    case NODE_ASSIGN:
+        scan_func_props(c, node->assign.target, parent_sym);
+        scan_func_props(c, node->assign.value, parent_sym);
+        return;
+    case NODE_BINARY:
+        scan_func_props(c, node->binary.left, parent_sym);
+        scan_func_props(c, node->binary.right, parent_sym);
+        return;
+    case NODE_UNARY:
+        scan_func_props(c, node->unary.operand, parent_sym);
+        return;
+    case NODE_FIELD:
+        scan_func_props(c, node->field.object, parent_sym);
+        return;
+    case NODE_INDEX:
+        scan_func_props(c, node->index_expr.object, parent_sym);
+        scan_func_props(c, node->index_expr.index, parent_sym);
+        return;
+    case NODE_ORELSE:
+        scan_func_props(c, node->orelse.expr, parent_sym);
+        return;
+    case NODE_DEFER:
+        scan_func_props(c, node->defer.body, parent_sym);
+        return;
+    case NODE_CRITICAL:
+        scan_func_props(c, node->critical.body, parent_sym);
+        return;
+    case NODE_ONCE:
+        scan_func_props(c, node->once.body, parent_sym);
+        return;
+    default:
+        return;
+    }
+}
+
+/* Lazy compute function properties with DFS cycle detection.
+ * Call this before reading sym->props. Idempotent — second call is O(1). */
+static void ensure_func_props(Checker *c, Symbol *sym) {
+    if (!sym || !sym->is_function) return;
+    if (sym->props.computed) return;
+    if (sym->props.in_progress) return; /* cycle — conservative (no additional effects) */
+    if (!sym->func_node) return;        /* no body (cinclude, forward decl without body) */
+
+    sym->props.in_progress = true;
+
+    Node *body = NULL;
+    if (sym->func_node->kind == NODE_FUNC_DECL)
+        body = sym->func_node->func_decl.body;
+    else if (sym->func_node->kind == NODE_INTERRUPT)
+        body = sym->func_node->interrupt.body;
+
+    if (body) {
+        scan_func_props(c, body, sym);
+    }
+
+    sym->props.in_progress = false;
+    sym->props.computed = true;
+}
+
+/* Check a body subtree for banned effects. Used at context entry points
+ * (@critical, defer, interrupt). Creates a temporary scan, follows callees. */
+static void check_body_effects(Checker *c, Node *body, int line,
+                                bool ban_yield, const char *yield_msg,
+                                bool ban_spawn, const char *spawn_msg,
+                                bool ban_alloc, const char *alloc_msg) {
+    if (!body) return;
+    /* Create a temporary "pseudo-symbol" for scanning this body subtree.
+     * We can't use the real function's Symbol because this might be a
+     * sub-block (@critical body), not the whole function. */
+    Symbol tmp = {0};
+    tmp.is_function = true;  /* enable transitive following */
+    tmp.props.computed = false;
+    tmp.props.in_progress = true; /* prevent re-entry into this temp */
+    scan_func_props(c, body, &tmp);
+
+    if (ban_yield && tmp.props.can_yield)
+        checker_error(c, line, "%s", yield_msg);
+    if (ban_spawn && tmp.props.can_spawn)
+        checker_error(c, line, "%s", spawn_msg);
+    if (ban_alloc && tmp.props.can_alloc)
+        checker_error(c, line, "%s", alloc_msg);
+}
+
 /* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors. */
+ * If yes, the developer is doing manual synchronization — race warnings not errors.
+ * LEGACY wrapper — uses FuncProps internally now. */
 static bool has_atomic_or_barrier(Node *node) {
     if (!node) return false;
     if (node->kind == NODE_INTRINSIC) {
@@ -7911,6 +8139,12 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_DEFER:
+        /* Ban yield/await in defer body — corrupts Duff's device state machine.
+         * Function summaries catch both direct and transitive cases. */
+        check_body_effects(c, node->defer.body, node->loc.line,
+            true, "cannot yield inside defer block — corrupts coroutine state machine",
+            false, NULL,
+            false, NULL);
         c->defer_depth++;
         check_stmt(c, node->defer.body);
         c->defer_depth--;
@@ -7975,7 +8209,12 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_CRITICAL:
         /* @critical { body } — check body, ban return/break/continue/goto
-         * (jumping out skips interrupt re-enable — leaves system broken) */
+         * (jumping out skips interrupt re-enable — leaves system broken).
+         * Also ban yield/spawn via function summaries (direct + transitive). */
+        check_body_effects(c, node->critical.body, node->loc.line,
+            true, "cannot yield inside @critical block — interrupts stay disabled across suspend",
+            true, "cannot spawn inside @critical block — thread creation with interrupts disabled",
+            false, NULL);
         c->critical_depth++;
         if (node->critical.body) {
             check_stmt(c, node->critical.body);
@@ -8160,7 +8399,8 @@ static void check_stmt(Checker *c, Node *node) {
                 /* If function uses @atomic_* or @barrier — developer is doing manual
                  * synchronization (lock-free pattern). Warn, don't error.
                  * If NO synchronization at all — definitely unsafe, error. */
-                bool has_sync = has_atomic_or_barrier(func_sym->func_node->func_decl.body);
+                ensure_func_props(c, func_sym);
+                bool has_sync = func_sym->props.has_sync;
                 if (has_sync) {
                     checker_warning(c, node->loc.line,
                         "spawn target '%.*s' accesses non-shared global '%.*s' — "
@@ -8176,11 +8416,18 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
         }
-        /* Ban spawn inside @critical */
+        /* Ban spawn inside @critical (now also covered by check_body_effects on @critical,
+         * but keep direct check for clear error message at the spawn site) */
         if (c->critical_depth > 0) {
             checker_error(c, node->loc.line,
                 "cannot use 'spawn' inside @critical block — "
                 "thread creation with interrupts disabled is unsafe");
+        }
+        /* Ban spawn inside async function — spawned thread outlives coroutine */
+        if (c->in_async) {
+            checker_error(c, node->loc.line,
+                "cannot use 'spawn' inside async function — "
+                "spawned thread may outlive coroutine lifetime");
         }
         break;
     }
@@ -9050,6 +9297,12 @@ static void check_func_body(Checker *c, Node *node) {
     }
 
     if (node->kind == NODE_INTERRUPT && node->interrupt.body) {
+        /* Ban spawn and heap alloc in interrupt handlers via function summaries.
+         * Catches transitive cases: interrupt calls helper() which calls slab.alloc(). */
+        check_body_effects(c, node->interrupt.body, node->loc.line,
+            false, NULL,
+            true, "cannot spawn inside interrupt handler — pthread_create in ISR is unsafe",
+            true, "cannot allocate inside interrupt handler — heap allocation may deadlock");
         c->current_func_ret = ty_void;
         c->in_interrupt = true;
         push_scope(c);

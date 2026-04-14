@@ -207,6 +207,18 @@ struct Symbol {
     bool is_function;
     bool is_comptime;       /* comptime function — evaluated at compile time */
     Node *func_node;        /* AST node for function body, if applicable */
+
+    /* Function summaries: computed properties of function bodies (lazy, cached).
+     * Used for context safety — @critical/defer/interrupt check callee properties.
+     * See docs/FunctionSummaries.md for full design. */
+    struct {
+        bool computed;       /* true = cached, don't re-scan */
+        bool in_progress;    /* true = DFS in progress (cycle detection) */
+        bool can_yield;      /* body contains yield/await (directly or transitively) */
+        bool can_spawn;      /* body contains spawn (directly or transitively) */
+        bool can_alloc;      /* body contains slab.alloc/Task.new (directly or transitively) */
+        bool has_sync;       /* body contains @atomic_* or @barrier (absorbs has_atomic_or_barrier) */
+    } props;
     bool returns_color_cached;  /* zercheck: return color already computed */
     int returns_color_value;    /* zercheck: cached ZC_COLOR_* for return value */
     int returns_param_color;    /* zercheck: -1 = N/A, 0+ = return inherits param[N]'s color */

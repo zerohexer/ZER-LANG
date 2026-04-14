@@ -1,0 +1,17 @@
+// Function summaries: yield inside function called from @critical — must reject
+// EXPECTED: compile error
+
+async void yielder() {
+    yield;
+}
+
+void wrapper() {
+    yielder();
+}
+
+i32 main() {
+    @critical {
+        wrapper();
+    }
+    return 0;
+}

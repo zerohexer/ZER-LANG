@@ -1046,8 +1046,50 @@ Unified Pool.free/Slab.free DynFreed tracking into single helper. Was exact 20-l
 ### Buffer over-read fix (5 sites)
 `snprintf` return value used unclamped in `memcpy`. Clamp added: `if (sn_len >= sizeof(buf)) sn_len = sizeof(buf) - 1;` at lines 746, 1320, 8521, 8538, 8554.
 
+### Refactor B2: `check_union_switch_mutation()` (checker.c)
+Union switch lock check was duplicated between pointer-auto-deref union and direct union field (~50 lines each, identical). Extracted to `check_union_switch_mutation(c, field_object)`. Walks mut_root, checks name match + pointer alias + precise key, emits error. Both sites now: `if (check_union_switch_mutation(c, node->field.object)) { result = ty_void; break; }`. Net -38 lines.
+
+### A7: Spawn string literal safety check (checker.c)
+Added string-literal-to-mutable-slice check in NODE_SPAWN arg loop. Same check as regular NODE_CALL (line 3871). Without it, `spawn process("hello")` where `process([]u8 data)` would let spawned thread write to .rodata.
+
+### A16/A17: Fixed arrays → stack-first dynamic
+- `LabelInfo labels[128]` in `check_goto_labels` → stack-first with arena overflow
+- `FieldDecl fields[128]` in `parse_container_decl` → stack-first with `parser_alloc` overflow (matches `parse_struct_decl` pattern)
+
+### A18: Volatile bounds check temps
+`__auto_type` strips volatile. Bounds check slice temps (emitter.c:2028, 2204) now use `__typeof__(expr)` to preserve volatile. Same fix pattern as BUG-319 captures.
+
+### C1/C2: Zig test runner
+Created `zig_tests/run_tests.sh` (36 tests: 31 positive, 5 negative). Added to Makefile `check` target. Previously existed but never automated.
+
 ### Remaining refactors documented in `docs/ZER_Refactor.md`
-Complete plan with line numbers, code context, execution order for: B2 (union switch lock helper), B3 (orelse emission → use helpers), B4 (optional wrapping helper), B5-B8 (emitter duplication), B10 (zercheck arena keys), A7 (spawn string literal), A15-A20 (spawn gaps, fixed arrays, volatile temps). Fresh session reads ZER_Refactor.md and executes directly.
+Complete plan with line numbers, code context, execution order for remaining items: B3 (orelse emission → use helpers), B4 (optional wrapping helper), B5-B8 (emitter duplication), B10 (zercheck arena keys), A15 (spawn validation gaps), A19-A20 (distinct edge cases). B1, B2, A1-A14, A16-A18, A7, C1-C2 are DONE. Fresh session reads ZER_Refactor.md and executes remaining phases directly.
+
+### Full list of unified helpers after this session (22 total)
+| # | Helper | File | What |
+|---|---|---|---|
+| 1 | `vrp_invalidate_for_assign` | checker.c | VRP range invalidation (R1) |
+| 2 | `emit_async_orelse_block` | emitter.c | Async orelse emission (R2) |
+| 3 | `emit_shared_ensure_init` | emitter.c | Shared struct mutex+condvar init (R3) |
+| 4 | `track_dyn_freed_index` | checker.c | Pool/Slab dynamic-index free tracking (B1) |
+| 5 | `check_union_switch_mutation` | checker.c | Union switch lock check (B2) |
+| 6 | `should_track_move` | zercheck.c | Move struct type detection |
+| 7 | `is_handle_invalid` | zercheck.c | Handle use-check (FREED/MAYBE/TRANSFERRED) |
+| 8 | `is_handle_consumed` | zercheck.c | Handle merge-check |
+| 9 | `zc_report_invalid_use` | zercheck.c | Error message by handle state |
+| 10 | `is_void_opt` | emitter.c | ?void type detection |
+| 11 | `emit_opt_null_check` | emitter.c | Optional null check emission |
+| 12 | `emit_opt_unwrap` | emitter.c | Optional value unwrap emission |
+| 13 | `emit_opt_null_literal` | emitter.c | Optional null literal emission |
+| 14 | `emit_return_null` | emitter.c | Return null for current function |
+| 15 | `type_can_carry_pointer` | checker.c | Escape flag propagation filter |
+| 16 | `propagate_escape_flags` | checker.c | Local/arena-derived flag copy |
+| 17 | `check_isr_ban` | checker.c | ISR heap allocation ban |
+| 18 | `find_or_create_auto_slab` | checker.c | Task.new auto-slab |
+| 19 | `check_volatile_strip` | checker.c | Cast/intrinsic volatile check |
+| 20 | `validate_struct_init` | checker.c | Designated init field validation |
+| 21 | `find_handle_local` | zercheck.c | Scope-aware handle registration |
+| 22 | `emit_zero_value` | emitter.c | Zero value for any return type |
 
 ## Firmware Examples + Polish (2026-04-13)
 

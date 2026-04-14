@@ -31,8 +31,28 @@ Safety checks bypassed for distinct-wrapped types:
 Pool.free and Slab.free had identical 20-line DynFreed tracking blocks (lines 3478 vs 3639). This duplication caused BUG-471 (type check added to one but not the other). Extracted to unified helper `track_dyn_freed_index()`. Both sites now call the helper.
 **Prevention:** Future DynFreed logic changes apply to ONE function.
 
+### Refactor B2: check_union_switch_mutation() helper
+Union switch lock check was duplicated between pointer-auto-deref union (line ~4577) and direct union field (line ~4683) — ~50 lines each, identical logic (walk mut_root, name match, type alias, precise key). Extracted to `check_union_switch_mutation()`. Net -38 lines.
+**Prevention:** Future union lock logic changes apply to ONE function.
+
+### A7: Spawn missing string-literal-to-mutable-slice check
+`spawn process("hello")` where `process([]u8 data)` — regular call catches this at line 3871, spawn didn't. Spawned thread writing to .rodata string = segfault.
+**Fix:** Added string literal check in spawn arg loop before pointer safety check.
+
+### A16: labels[128] → stack-first dynamic
+`LabelInfo labels[128]` in `check_goto_labels` silently dropped labels >128. Fix: stack-first dynamic with arena overflow (re-collect if limit hit).
+
+### A17: container fields[128] → stack-first dynamic
+`FieldDecl fields[128]` in `parse_container_decl` silently truncated beyond 128 fields. Fix: stack-first dynamic with `parser_alloc` overflow (same pattern as `parse_struct_decl`).
+
+### A18: __auto_type → __typeof__ for volatile bounds temps
+Bounds check slice temps (emitter.c:2028, 2204) used `__auto_type` which strips volatile. Volatile slice with side-effect index lost MMIO semantics. Fix: `__typeof__(expr)` preserves volatile (same pattern as BUG-319 captures).
+
+### C1/C2: Zig test runner + Makefile integration
+Created `zig_tests/run_tests.sh` — 36 tests (31 positive `zt_*.zer`, 5 negative `zt_*reject*.zer`). Added to `make check` target. Previously these 36 files existed but were never automated.
+
 ### Refactor plan document
-Created `docs/ZER_Refactor.md` — complete context dump with all remaining refactors (B2-B11, A7, A15-A20), exact line numbers, surrounding code context, execution order. Enables fresh session to execute remaining phases without re-reading 25K lines.
+Created `docs/ZER_Refactor.md` — complete context dump with all remaining refactors (B3-B11, A15, A19-A20), exact line numbers, surrounding code context, execution order. Enables fresh session to execute remaining phases without re-reading 25K lines.
 
 ## Session 2026-04-13 — Firmware Examples + Polish
 

@@ -1355,7 +1355,10 @@ These are where zercheck path merging has bugs. Direct transfers are easy; condi
 **Rule 5: After writing all tests, verify negative tests ACTUALLY reject.**
 Run each negative test manually: `./zerc test.zer -o /dev/null`. If exit code is 0, the test compiled when it shouldn't have — you found a bug/limitation. Do NOT just trust `make check` green output; the runner marks non-compiling tests as "pass (correctly rejected)" but you need to confirm the rejection is for the RIGHT reason.
 
-**Rule 6: Don't only test the feature — test its interaction with OTHER features.**
+**Rule 6: Tests must verify VALUES, not just "compiles and runs."**
+`return 0` at the end is a smoke test — it passes even if every computation produces garbage. Tests MUST check computed results: `if (result != expected) { return 1; }`. The async capture ghost bug hid for weeks because the test only checked "compiles and runs" without verifying the captured value survived yield+resume. A smoke test that "passes" is worse than no test — it gives false confidence.
+
+**Rule 7: Don't only test the feature — test its interaction with OTHER features.**
 Move struct + defer, move struct + orelse, move struct + switch capture, move struct inside Pool handle field. The feature works in isolation; the bugs are in combinations.
 
 **Patterns that found bugs in practice (2026-04-09/10):**

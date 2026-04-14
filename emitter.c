@@ -1435,7 +1435,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 break;
             }
             Type *ct = checker_get_type(e->checker, node);
-            if (ct && ct->kind == TYPE_OPTIONAL) {
+            /* BUG-506: unwrap distinct for optional wrapping check */
+            Type *ct_eff = ct ? type_unwrap_distinct(ct) : NULL;
+            if (ct_eff && ct_eff->kind == TYPE_OPTIONAL) {
                 emit(e, "(");
                 emit_type(e, ct);
                 emit(e, "){%lld, 1}", (long long)node->call.comptime_value);
@@ -3228,9 +3230,11 @@ static void emit_stmt(Emitter *e, Node *node) {
         emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
         if (node->var_decl.init) {
             /* Optional init: null → {0, 0}, value → {val, 1}
-             * But if init is a function call returning ?T, just assign directly */
-            if (type && type->kind == TYPE_OPTIONAL &&
-                !is_null_sentinel(type->optional.inner)) {
+             * But if init is a function call returning ?T, just assign directly.
+             * BUG-506: unwrap distinct — distinct typedef ?T is still optional. */
+            Type *type_eff_opt = type ? type_unwrap_distinct(type) : NULL;
+            if (type_eff_opt && type_eff_opt->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(type_eff_opt->optional.inner)) {
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
                     emit(e, " = ");
                     emit_opt_null_literal(e, type);
@@ -3254,9 +3258,10 @@ static void emit_stmt(Emitter *e, Node *node) {
                         emit_expr(e, node->var_decl.init);
                     }
                 } else if (node->var_decl.init->kind == NODE_IDENT) {
-                    /* check if ident is already ?T or needs wrapping */
+                    /* check if ident is already ?T or needs wrapping.
+                     * BUG-506: unwrap distinct — distinct ?T is still optional. */
                     Type *init_type = checker_get_type(e->checker,node->var_decl.init);
-                    if (init_type && init_type->kind == TYPE_OPTIONAL) {
+                    if (init_type && type_unwrap_distinct(init_type)->kind == TYPE_OPTIONAL) {
                         emit(e, " = ");
                         emit_expr(e, node->var_decl.init);
                     } else {
@@ -3267,9 +3272,10 @@ static void emit_stmt(Emitter *e, Node *node) {
                         emit(e, ", 1 }");
                     }
                 } else {
-                    /* check if init expression is already ?T (e.g. struct field of ?Handle type) */
+                    /* check if init expression is already ?T (e.g. struct field of ?Handle type).
+                     * BUG-506: unwrap distinct. */
                     Type *init_type = checker_get_type(e->checker,node->var_decl.init);
-                    if (init_type && init_type->kind == TYPE_OPTIONAL) {
+                    if (init_type && type_unwrap_distinct(init_type)->kind == TYPE_OPTIONAL) {
                         emit(e, " = ");
                         emit_expr(e, node->var_decl.init);
                     } else {
@@ -3358,9 +3364,11 @@ static void emit_stmt(Emitter *e, Node *node) {
              * ?*T (ptr): { auto _tmp = expr; if (_tmp) { auto val = _tmp; ... } } */
             int tmp = e->temp_count++;
             Type *cond_type = checker_get_type(e->checker,node->if_stmt.cond);
-            bool is_ptr_opt = cond_type &&
-                cond_type->kind == TYPE_OPTIONAL &&
-                is_null_sentinel(cond_type->optional.inner);
+            /* BUG-506: unwrap distinct for null-sentinel detection */
+            Type *cond_eff = cond_type ? type_unwrap_distinct(cond_type) : NULL;
+            bool is_ptr_opt = cond_eff &&
+                cond_eff->kind == TYPE_OPTIONAL &&
+                is_null_sentinel(cond_eff->optional.inner);
 
             /* auto-guard: emit bounds guards before if-unwrap condition */
             emit_auto_guards(e, node->if_stmt.cond);
@@ -4921,9 +4929,11 @@ static void emit_global_var(Emitter *e, Node *node) {
     }
 
     if (node->var_decl.init) {
-        /* optional null init needs struct literal, not scalar 0 */
-        if (type && type->kind == TYPE_OPTIONAL &&
-            !is_null_sentinel(type->optional.inner) &&
+        /* optional null init needs struct literal, not scalar 0.
+         * BUG-506: unwrap distinct — distinct typedef ?T is still optional. */
+        Type *gtype_eff = type ? type_unwrap_distinct(type) : NULL;
+        if (gtype_eff && gtype_eff->kind == TYPE_OPTIONAL &&
+            !is_null_sentinel(gtype_eff->optional.inner) &&
             node->var_decl.init->kind == NODE_NULL_LIT) {
             emit(e, " = ");
             emit_opt_null_literal(e, type);

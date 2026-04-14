@@ -441,6 +441,33 @@ static ExprKey build_expr_key_a(Checker *c, Node *expr) {
     return (ExprKey){ key, len };
 }
 
+/* Track dynamic-index free for auto-guard (B1 refactor: unified helper).
+ * When pool.free(arr[k]) or slab.free(arr[k]) is called with variable index k,
+ * record the array+index so the emitter can auto-guard later arr[j].field access.
+ * Previously duplicated in pool.free and slab.free handlers — caused BUG-471. */
+static void track_dyn_freed_index(Checker *c, Node *call_node) {
+    if (call_node->call.arg_count != 1) return;
+    Node *arg = call_node->call.args[0];
+    if (arg->kind != NODE_INDEX || arg->index_expr.object->kind != NODE_IDENT ||
+        arg->index_expr.index->kind == NODE_INT_LIT) return;
+    if (c->dyn_freed_count >= c->dyn_freed_capacity) {
+        int newcap = c->dyn_freed_capacity ? c->dyn_freed_capacity * 2 : 8;
+        struct DynFreed *nf = (struct DynFreed *)arena_alloc(c->arena, newcap * sizeof(struct DynFreed));
+        if (nf) {
+            if (c->dyn_freed) memcpy(nf, c->dyn_freed, c->dyn_freed_count * sizeof(struct DynFreed));
+            c->dyn_freed = nf;
+            c->dyn_freed_capacity = newcap;
+        }
+    }
+    if (c->dyn_freed && c->dyn_freed_count < c->dyn_freed_capacity) {
+        struct DynFreed *df = &c->dyn_freed[c->dyn_freed_count++];
+        df->array_name = arg->index_expr.object->ident.name;
+        df->array_name_len = (uint32_t)arg->index_expr.object->ident.name_len;
+        df->freed_idx = arg->index_expr.index;
+        df->all_freed = c->in_loop;
+    }
+}
+
 /* BUG-393: compound key provenance map — set/get for struct fields and array elements */
 static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *prov) {
     /* check if key already exists — update in place */
@@ -747,6 +774,7 @@ static Symbol *find_or_create_auto_slab(Checker *c, Type *struct_type) {
     int sn_len = snprintf(slab_name, sizeof(slab_name),
         "_zer_auto_slab_%.*s",
         (int)struct_type->struct_type.name_len, struct_type->struct_type.name);
+    if (sn_len >= (int)sizeof(slab_name)) sn_len = (int)sizeof(slab_name) - 1;
     Type *slab_type = (Type *)arena_alloc(c->arena, sizeof(Type));
     memset(slab_type, 0, sizeof(Type));
     slab_type->kind = TYPE_SLAB;
@@ -1320,6 +1348,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         char mangled[256];
         const char *ctype_name = type_name(concrete);
         int mlen = snprintf(mangled, sizeof(mangled), "%.*s_%s", (int)cnlen, cname, ctype_name);
+        if (mlen >= (int)sizeof(mangled)) mlen = (int)sizeof(mangled) - 1;
         char *mname = (char *)arena_alloc(c->arena, mlen + 1);
         memcpy(mname, mangled, mlen + 1);
 
@@ -3473,30 +3502,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* Track dynamic-index free for auto-guard:
-                     * pool.free(handles[k]) where k is variable */
-                    if (node->call.arg_count == 1) {
-                        Node *arg = node->call.args[0];
-                        if (arg->kind == NODE_INDEX && arg->index_expr.object->kind == NODE_IDENT &&
-                            arg->index_expr.index->kind != NODE_INT_LIT) {
-                            if (c->dyn_freed_count >= c->dyn_freed_capacity) {
-                                int newcap = c->dyn_freed_capacity ? c->dyn_freed_capacity * 2 : 8;
-                                struct DynFreed *nf = (struct DynFreed *)arena_alloc(c->arena, newcap * sizeof(struct DynFreed));
-                                if (nf) {
-                                    if (c->dyn_freed) memcpy(nf, c->dyn_freed, c->dyn_freed_count * sizeof(struct DynFreed));
-                                    c->dyn_freed = nf;
-                                    c->dyn_freed_capacity = newcap;
-                                }
-                            }
-                            if (c->dyn_freed && c->dyn_freed_count < c->dyn_freed_capacity) {
-                                struct DynFreed *df = &c->dyn_freed[c->dyn_freed_count++];
-                                df->array_name = arg->index_expr.object->ident.name;
-                                df->array_name_len = (uint32_t)arg->index_expr.object->ident.name_len;
-                                df->freed_idx = arg->index_expr.index;
-                                df->all_freed = c->in_loop;
-                            }
-                        }
-                    }
+                    track_dyn_freed_index(c, node);
                     result = ty_void;
                     typemap_set(c, field_node,result);
                     break;
@@ -3635,29 +3641,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* Track dynamic-index free (same as pool.free above) */
-                    if (node->call.arg_count == 1) {
-                        Node *arg = node->call.args[0];
-                        if (arg->kind == NODE_INDEX && arg->index_expr.object->kind == NODE_IDENT &&
-                            arg->index_expr.index->kind != NODE_INT_LIT) {
-                            if (c->dyn_freed_count >= c->dyn_freed_capacity) {
-                                int newcap = c->dyn_freed_capacity ? c->dyn_freed_capacity * 2 : 8;
-                                struct DynFreed *nf = (struct DynFreed *)arena_alloc(c->arena, newcap * sizeof(struct DynFreed));
-                                if (nf) {
-                                    if (c->dyn_freed) memcpy(nf, c->dyn_freed, c->dyn_freed_count * sizeof(struct DynFreed));
-                                    c->dyn_freed = nf;
-                                    c->dyn_freed_capacity = newcap;
-                                }
-                            }
-                            if (c->dyn_freed && c->dyn_freed_count < c->dyn_freed_capacity) {
-                                struct DynFreed *df = &c->dyn_freed[c->dyn_freed_count++];
-                                df->array_name = arg->index_expr.object->ident.name;
-                                df->array_name_len = (uint32_t)arg->index_expr.object->ident.name_len;
-                                df->freed_idx = arg->index_expr.index;
-                                df->all_freed = c->in_loop;
-                            }
-                        }
-                    }
+                    track_dyn_freed_index(c, node);
                     result = ty_void;
                     typemap_set(c, field_node,result);
                     break;
@@ -8521,6 +8505,7 @@ static void register_decl(Checker *c, Node *node) {
             char aname[256];
             int alen = snprintf(aname, sizeof(aname), "_zer_async_%.*s",
                 (int)node->func_decl.name_len, node->func_decl.name);
+            if (alen >= (int)sizeof(aname)) alen = (int)sizeof(aname) - 1;
             /* Register state struct as an opaque type (fields not accessible from ZER) */
             Type *async_type = (Type *)arena_alloc(c->arena, sizeof(Type));
             async_type->kind = TYPE_STRUCT;
@@ -8538,6 +8523,7 @@ static void register_decl(Checker *c, Node *node) {
             char iname[256];
             int ilen = snprintf(iname, sizeof(iname), "_zer_async_%.*s_init",
                 (int)node->func_decl.name_len, node->func_decl.name);
+            if (ilen >= (int)sizeof(iname)) ilen = (int)sizeof(iname) - 1;
             int init_pc = 1 + node->func_decl.param_count; /* *self + original params */
             Type **ip = (Type **)arena_alloc(c->arena, init_pc * sizeof(Type *));
             ip[0] = type_pointer(c->arena, async_type);
@@ -8554,6 +8540,7 @@ static void register_decl(Checker *c, Node *node) {
             char pname[256];
             int plen = snprintf(pname, sizeof(pname), "_zer_async_%.*s_poll",
                 (int)node->func_decl.name_len, node->func_decl.name);
+            if (plen >= (int)sizeof(pname)) plen = (int)sizeof(pname) - 1;
             Type **pp = (Type **)arena_alloc(c->arena, sizeof(Type *));
             pp[0] = type_pointer(c->arena, async_type);
             Type *poll_ft = type_func_ptr(c->arena, pp, 1, ty_i32);

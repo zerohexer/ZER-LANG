@@ -1,0 +1,37 @@
+// BUG-506: distinct typedef ?T — null init, value init, orelse
+// Tests all emitter paths fixed by A2-A6 in the refactor audit.
+
+distinct typedef ?u32 MaybeId;
+
+MaybeId make_some(u32 val) {
+    ?u32 inner = val;
+    return @cast(MaybeId, inner);
+}
+
+MaybeId make_none() {
+    return null;
+}
+
+u32 main() {
+    // A2: local var null init of distinct ?T
+    MaybeId x = null;
+    u32 v1 = x orelse 99;
+    if (v1 != 99) { return 1; }
+
+    // A2: local var from function returning distinct ?T
+    MaybeId y = make_some(42);
+    u32 v2 = y orelse 0;
+    if (v2 != 42) { return 2; }
+
+    // A3: init from ident (already distinct ?T)
+    MaybeId z = y;
+    u32 v3 = z orelse 0;
+    if (v3 != 42) { return 3; }
+
+    // orelse block form
+    MaybeId w = make_none();
+    u32 v4 = w orelse { return 0; };
+
+    // should not reach here
+    return 4;
+}

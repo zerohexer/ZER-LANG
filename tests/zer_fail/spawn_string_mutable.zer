@@ -1,0 +1,11 @@
+// A7: spawn with string literal to mutable slice param must fail
+// EXPECTED: compile error
+
+void worker([*]u8 data) {
+    data[0] = 65;
+}
+
+u32 main() {
+    spawn worker("hello");
+    return 0;
+}

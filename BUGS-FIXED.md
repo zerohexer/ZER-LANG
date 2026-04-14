@@ -51,8 +51,32 @@ Bounds check slice temps (emitter.c:2028, 2204) used `__auto_type` which strips 
 ### C1/C2: Zig test runner + Makefile integration
 Created `zig_tests/run_tests.sh` — 36 tests (31 positive `zt_*.zer`, 5 negative `zt_*reject*.zer`). Added to `make check` target. Previously these 36 files existed but were never automated.
 
+### Refactor B3: Orelse emission → use centralized helpers
+4 orelse blocks (void/non-void return, block, default) manually dispatched on ptr/struct/void optional kind. Replaced inline checks with `emit_opt_null_check()` and `emit_opt_unwrap()` helpers. Net -64 lines.
+
+### Refactor B4: emit_opt_wrap_value() helper
+3 identical `(Type){ val, 1 }` optional wrapping sites (assignment, var-decl ident, var-decl expr) → single helper. Forward declaration of `emit_expr` added to resolve ordering.
+
+### Refactor B7: Return optional wrapping → emit_opt_wrap_value
+Non-void return wrapping (hoisted and non-hoisted paths) now uses `emit_opt_wrap_value` instead of inline `(Type){ expr, 1 }`.
+
+### Refactor B8: Union typedef EMIT_UNAME() macro
+12× repeated `if (ut) EMIT_UNION_NAME(e, ut); else emit(...)` pattern → local `EMIT_UNAME()` macro scoped to NODE_UNION_DECL case. `#undef` at case end.
+
+### Refactor B10: zercheck handle keys → arena-allocated
+27 `char key[128]` sites in zercheck.c → `const char *key` with `handle_key_arena(zc, expr, &key)`. Deep expression chains (>128 chars) no longer silently untracked. `is_free_call` external buffer and `mkey[256]` mangling buffer kept as local arrays (they write into the buffer).
+
+### A15: Spawn validation gaps
+Spawn arg validation now includes `is_literal_compatible()` (integer literal range check) and `validate_struct_init()` (designated init field validation) — matches regular NODE_CALL handler.
+
+### A19: emit_type_and_name distinct-optional-funcptr
+`distinct typedef ?Callback SafeCallback` — emit_type_and_name now detects `TYPE_DISTINCT` wrapping `TYPE_OPTIONAL` wrapping `TYPE_FUNC_PTR` and places name inside `(*)`.
+
+### A20: Module-qualified call distinct unwrap
+Module-qualified call rewrite checked `var_sym->type->kind != TYPE_STRUCT` without unwrap. `distinct typedef struct S MyS; MyS.method()` incorrectly triggered module lookup. Fix: unwrap before kind check.
+
 ### Refactor plan document
-Created `docs/ZER_Refactor.md` — complete context dump with all remaining refactors (B3-B11, A15, A19-A20), exact line numbers, surrounding code context, execution order. Enables fresh session to execute remaining phases without re-reading 25K lines.
+Created `docs/ZER_Refactor.md` — complete context dump. All items executed except B5-B6 and B11 (deferred to v0.4 table-driven architecture — intentional structural differences, not pure duplication).
 
 ## Session 2026-04-13 — Firmware Examples + Polish
 

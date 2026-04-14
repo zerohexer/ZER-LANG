@@ -1063,7 +1063,21 @@ Added string-literal-to-mutable-slice check in NODE_SPAWN arg loop. Same check a
 Created `zig_tests/run_tests.sh` (36 tests: 31 positive, 5 negative). Added to Makefile `check` target. Previously existed but never automated.
 
 ### Remaining refactors documented in `docs/ZER_Refactor.md`
-Complete plan with line numbers, code context, execution order for remaining items: B3 (orelse emission → use helpers), B4 (optional wrapping helper), B5-B8 (emitter duplication), B10 (zercheck arena keys), A15 (spawn validation gaps), A19-A20 (distinct edge cases). B1, B2, A1-A14, A16-A18, A7, C1-C2 are DONE. Fresh session reads ZER_Refactor.md and executes remaining phases directly.
+**ALL REFACTORS EXECUTED** except B5-B6 and B11 (deferred to v0.4 — intentional structural differences between Pool/Slab, not pure duplication).
+
+### Completed refactors (second batch, same session):
+- **B3:** Orelse emission → `emit_opt_null_check`/`emit_opt_unwrap` helpers. 4 blocks consolidated. Net -64 lines.
+- **B4:** `emit_opt_wrap_value()` helper — 3 identical `{val, 1}` wrapping sites consolidated.
+- **B7:** Return optional wrapping → `emit_opt_wrap_value`.
+- **B8:** Union typedef emission → `EMIT_UNAME()` local macro (12 repetitions → 12 calls).
+- **B10:** `handle_key_arena()` in zercheck.c — 27 `char key[128]` sites → arena-allocated. Deep expressions no longer silently untracked.
+- **A15:** Spawn validation: `is_literal_compatible` + `validate_struct_init` added.
+- **A19:** `emit_type_and_name` handles `distinct(?funcptr)`.
+- **A20:** Module-qualified call rewrite unwraps distinct.
+
+### Why B5-B6 and B11 are deferred (NOT pure duplication):
+- **B5-B6:** Pool alloc emits 6 inline args (`slots, sizeof(slots[0]), gen, used, count, &ok`). Slab emits 2 (`&slab, &ok`). A helper needs `is_pool` flag = same line count, worse readability. v0.4 table-driven solves this properly.
+- **B11:** Pool uses `pool.elem`/`pool.count`, Slab uses `slab.elem` + ISR ban. Helper needs type flag + element accessor + optional count + ISR flag = more parameters than the code it replaces.
 
 ### Full list of unified helpers after this session (22 total)
 | # | Helper | File | What |

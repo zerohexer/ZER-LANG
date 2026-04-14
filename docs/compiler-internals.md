@@ -1085,6 +1085,23 @@ Used `make tags` (Universal Ctags) to query codebase structure instead of readin
 
 **For fresh sessions:** Run `make tags` first. Use `grep "function_name" tags` to find locations. Use `grep "pattern" file.c` to find specific code. Never read full files speculatively.
 
+### Flag-Handler Matrix Audit (2026-04-14, automated)
+`bash tools/audit_matrix.sh checker.c` — cross-references control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
+
+| Node | Missing Flag | Why it's a bug |
+|---|---|---|
+| YIELD | `defer_depth` | yield in defer corrupts Duff's device state machine |
+| YIELD | `critical_depth` | yield in @critical = lock held across suspend = deadlock |
+| AWAIT | `defer_depth` | same as yield |
+| AWAIT | `critical_depth` | same as yield |
+| SPAWN | `in_interrupt` | pthread_create in ISR = unsafe |
+
+**How it works:** Extracts each NODE_ handler body from check_stmt via grep+sed, scans for flag references. Missing reference where safety contract requires one = BUG. Takes <5 seconds, finds bugs that manual reading misses.
+
+**Extend to other subsystems:** Define rows (handlers) and columns (flags/preconditions). Same grep-based cross-reference pattern works for emitter type dispatch, zercheck state checks, any flag×handler matrix.
+
+**Run after adding:** any new NODE_ type, any new context flag, any new control-flow statement. The matrix exposes gaps automatically.
+
 ### Why B5-B6 and B11 are deferred (NOT pure duplication):
 - **B5-B6:** Pool alloc emits 6 inline args (`slots, sizeof(slots[0]), gen, used, count, &ok`). Slab emits 2 (`&slab, &ok`). A helper needs `is_pool` flag = same line count, worse readability. v0.4 table-driven solves this properly.
 - **B11:** Pool uses `pool.elem`/`pool.count`, Slab uses `slab.elem` + ISR ban. Helper needs type flag + element accessor + optional count + ISR flag = more parameters than the code it replaces.

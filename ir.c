@@ -198,12 +198,10 @@ bool ir_validate(IRFunc *func) {
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *block = &func->blocks[bi];
 
-        /* Block must have at least one instruction (even if just a terminator) */
+        /* Empty blocks are OK — they can be join points that just fall through.
+         * The emitter handles them (emit label, continue to next block). */
         if (block->inst_count == 0) {
-            fprintf(stderr, "IR VALIDATION ERROR: bb%d is empty in '%.*s'\n",
-                    bi, (int)func->name_len, func->name);
-            valid = false;
-            continue;
+            continue; /* skip further checks for empty blocks */
         }
 
         /* Last instruction must be a terminator (except last block which may fallthrough) */

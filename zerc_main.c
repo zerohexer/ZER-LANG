@@ -13,6 +13,7 @@
 #include "checker.h"
 #include "emitter.h"
 #include "zercheck.h"
+#include "ir.h"
 
 /* ================================================================
  * ZER Compiler Driver — zerc
@@ -178,7 +179,7 @@ static bool parse_module(Compiler *cc, Module *m) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: zerc <input.zer> [-o output] [--run] [--emit-c]\n");
+        fprintf(stderr, "Usage: zerc <input.zer> [-o output] [--run] [--emit-c] [--emit-ir]\n");
         return 1;
     }
 
@@ -186,6 +187,7 @@ int main(int argc, char **argv) {
     const char *output_path = NULL;
     bool do_run = false;
     bool emit_c = false;
+    bool emit_ir = false;
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
@@ -201,6 +203,8 @@ int main(int argc, char **argv) {
             do_run = true;
         } else if (strcmp(argv[i], "--emit-c") == 0) {
             emit_c = true;
+        } else if (strcmp(argv[i], "--emit-ir") == 0) {
+            emit_ir = true;
         } else if (strcmp(argv[i], "--lib") == 0) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
@@ -448,6 +452,34 @@ int main(int argc, char **argv) {
         free(cc.modules);
         arena_free(&cc.arena);
         return 1;
+    }
+
+    /* IR lowering: AST → flat IR (for --emit-ir debugging + future analysis) */
+    if (emit_ir) {
+        Node *file = main_mod->ast;
+        if (file && file->kind == NODE_FILE) {
+            for (int i = 0; i < file->file.decl_count; i++) {
+                Node *decl = file->file.decls[i];
+                IRFunc *ir = NULL;
+                if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body)
+                    ir = ir_lower_func(&cc.arena, &checker, decl);
+                else if (decl->kind == NODE_INTERRUPT && decl->interrupt.body)
+                    ir = ir_lower_interrupt(&cc.arena, &checker, decl);
+                if (ir) {
+                    if (!ir_validate(ir)) {
+                        fprintf(stderr, "INTERNAL ERROR: IR validation failed\n");
+                        free(cc.modules);
+                        arena_free(&cc.arena);
+                        return 1;
+                    }
+                    ir_print(stdout, ir);
+                    fprintf(stdout, "\n");
+                }
+            }
+        }
+        free(cc.modules);
+        arena_free(&cc.arena);
+        return 0;
     }
 
     /* ZER-CHECK: path-sensitive handle + *opaque tracking */

@@ -226,4 +226,16 @@ bool ir_validate(IRFunc *func);
 /* Print human-readable IR to FILE* (stdout or file) */
 void ir_print(FILE *out, IRFunc *func);
 
+/* ================================================================
+ * IR Lowering (AST → IR)
+ * ================================================================ */
+
+/* Lower one function's typed AST to IR. Requires checker to have run.
+ * Returns NULL if node is not a function or has no body.
+ * Note: Checker is an opaque type here — include checker.h in the calling code. */
+IRFunc *ir_lower_func(Arena *arena, void *checker, Node *func_decl);
+
+/* Lower an interrupt handler body to IR. */
+IRFunc *ir_lower_interrupt(Arena *arena, void *checker, Node *interrupt);
+
 #endif /* ZER_IR_H */

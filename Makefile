@@ -13,6 +13,10 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 zerc: $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o zerc $^
 
+# ---- Code index (for LLM context — query with grep, don't load fully) ----
+tags: $(CORE_SRCS) $(LIB_SRCS) *.h
+	ctags --fields=+nS --extras=+q -R $(CORE_SRCS) *.h
+
 # ---- Test binaries ----
 test_lexer: test_lexer.c lexer.c
 	$(CC) $(CFLAGS) -o $@ $^

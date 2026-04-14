@@ -4208,11 +4208,19 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return resolve_tynode(e,tn->qualified.inner);
     case TYNODE_VOLATILE: {
         Type *inner = resolve_tynode(e,tn->qualified.inner);
-        /* propagate volatile to pointer type */
-        if (inner && inner->kind == TYPE_POINTER) {
-            Type *vp = type_pointer(e->arena, inner->pointer.inner);
+        /* propagate volatile to pointer/slice type.
+         * ctags audit: unwrap distinct (same fix as A11 in checker). */
+        Type *iv = inner ? type_unwrap_distinct(inner) : NULL;
+        if (iv && iv->kind == TYPE_POINTER) {
+            Type *vp = type_pointer(e->arena, iv->pointer.inner);
             vp->pointer.is_volatile = true;
+            if (iv->pointer.is_const) vp->pointer.is_const = true;
             return vp;
+        }
+        if (iv && iv->kind == TYPE_SLICE) {
+            Type *vs = type_volatile_slice(e->arena, iv->slice.inner);
+            if (iv->slice.is_const) vs->slice.is_const = true;
+            return vs;
         }
         return inner;
     }
@@ -4248,6 +4256,28 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
                 params[i] = resolve_tynode(e,tn->func_ptr.param_types[i]);
         }
         return type_func_ptr(e->arena, params, pc, ret);
+    }
+    /* ctags audit: these 4 TYNODE types were missing — silently returned ty_void */
+    case TYNODE_SLAB: {
+        Type *elem = resolve_tynode(e,tn->slab.elem);
+        return type_slab(e->arena, elem);
+    }
+    case TYNODE_BARRIER:
+        return ty_barrier;
+    case TYNODE_SEMAPHORE: {
+        uint32_t count = 0;
+        if (tn->semaphore.count_expr) {
+            int64_t val = eval_const_expr(tn->semaphore.count_expr);
+            if (val >= 0) count = (uint32_t)val;
+        }
+        return type_semaphore(e->arena, count);
+    }
+    case TYNODE_CONTAINER: {
+        /* container instantiation — look up stamped struct from checker */
+        Symbol *sym = scope_lookup(e->checker->global_scope,
+            tn->container.name, (uint32_t)tn->container.name_len);
+        if (sym) return sym->type;
+        return ty_void;
     }
     default:
         return ty_void;

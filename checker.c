@@ -1566,8 +1566,8 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count);
 
 /* Resolve a comptime NODE_CALL within eval_const_expr_subst.
- * Looks up the callee as a comptime function and recursively evaluates. */
-static Scope *_comptime_global_scope; /* set by caller before eval */
+ * Looks up the callee as a comptime function and recursively evaluates.
+ * Uses _comptime_global_scope (declared above, line ~1082) and _comptime_call_depth. */
 static int _comptime_call_depth = 0;  /* recursion guard for nested comptime calls */
 static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params, int outer_count) {
     if (!call || call->kind != NODE_CALL || !call->call.callee ||

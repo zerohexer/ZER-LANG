@@ -2292,11 +2292,20 @@ static Node *parse_declaration(Parser *p) {
         n->container_decl.type_param_len = tok_len(&p->previous);
         consume(p, TOK_RPAREN, "expected ')' after type parameter");
         consume(p, TOK_LBRACE, "expected '{' after container declaration");
-        /* Parse fields — same as struct fields */
-        FieldDecl fields[128];
-        int fc = 0;
+        /* Parse fields — stack-first dynamic pattern (same as parse_struct_decl).
+         * A17: was fixed FieldDecl fields[128] — silent truncation beyond 128. */
+        FieldDecl stack_fields[32];
+        FieldDecl *fields = stack_fields;
+        int fc = 0, field_cap = 32;
         while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-            if (fc >= 128) { error(p, "too many container fields (max 128)"); break; }
+            if (fc >= field_cap) {
+                int new_cap = field_cap * 2;
+                FieldDecl *nf = (FieldDecl *)parser_alloc(p, new_cap * sizeof(FieldDecl));
+                if (!nf) break;
+                memcpy(nf, fields, fc * sizeof(FieldDecl));
+                fields = nf;
+                field_cap = new_cap;
+            }
             fields[fc].type = parse_type(p);
             fields[fc].loc = (SrcLoc){ p->previous.line, NULL };
             fields[fc].is_keep = false;

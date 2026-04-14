@@ -8768,9 +8768,19 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
 }
 
 static void check_goto_labels(Checker *c, Node *func_body) {
-    LabelInfo labels[128];
+    /* A16: stack-first dynamic pattern — no fixed limit on labels per function */
+    LabelInfo stack_labels[128];
+    LabelInfo *labels = stack_labels;
     int label_count = 0;
-    collect_labels(func_body, labels, &label_count, 128);
+    int label_cap = 128;
+    collect_labels(func_body, labels, &label_count, label_cap);
+    /* If we hit the limit, grow and re-collect */
+    if (label_count >= label_cap) {
+        label_cap = label_count * 2;
+        labels = (LabelInfo *)arena_alloc(c->arena, label_cap * sizeof(LabelInfo));
+        label_count = 0;
+        collect_labels(func_body, labels, &label_count, label_cap);
+    }
 
     /* Check for duplicate labels */
     for (int i = 0; i < label_count; i++) {

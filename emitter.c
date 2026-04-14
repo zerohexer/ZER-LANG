@@ -2023,9 +2023,12 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         } else if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
             if (idx_has_side_effects || obj_has_side_effects) {
-                /* hoist both object and index for single-eval */
+                /* hoist both object and index for single-eval.
+                 * A18: use __typeof__ to preserve volatile (BUG-319 pattern). */
                 int tmp = e->temp_count++;
-                emit(e, "*({ __auto_type _zer_obj%d = ", tmp);
+                emit(e, "*({ __typeof__(");
+                emit_expr(e, node->index_expr.object);
+                emit(e, ") _zer_obj%d = ", tmp);
                 emit_expr(e, node->index_expr.object);
                 emit(e, "; size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
@@ -2198,7 +2201,10 @@ static void emit_expr(Emitter *e, Node *node) {
         if (slice_obj_side_effect && obj_is_slice) {
             /* hoist entire object into temp, build slice from temp */
             int sl_tmp = e->temp_count++;
-            emit(e, "({ __auto_type _zer_so%d = ", sl_tmp);
+            /* A18: __typeof__ preserves volatile */
+            emit(e, "({ __typeof__(");
+            emit_expr(e, node->slice.object);
+            emit(e, ") _zer_so%d = ", sl_tmp);
             emit_expr(e, node->slice.object);
             emit(e, "; ");
             if (slice_type_emitted) { /* re-emit type name for inner struct */ }

@@ -5245,7 +5245,11 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
                                   (nl == 6 && memcmp(n, "memset", 6) == 0) ||
                                   (nl == 6 && memcmp(n, "strlen", 6) == 0) ||
                                   (nl == 7 && memcmp(n, "putchar", 7) == 0) ||
-                                  (nl == 5 && memcmp(n, "fputc", 5) == 0);
+                                  (nl == 5 && memcmp(n, "fputc", 5) == 0) ||
+                                  (nl == 7 && memcmp(n, "memmove", 7) == 0) ||
+                                  (nl == 6 && memcmp(n, "memchr", 6) == 0) ||
+                                  (nl == 7 && memcmp(n, "bsearch", 7) == 0) ||
+                                  (nl == 5 && memcmp(n, "qsort", 5) == 0);
                 if (!is_cstdlib) emit_func_decl(e, decl);
             }
             break;

@@ -1102,11 +1102,38 @@ Used `make tags` (Universal Ctags) to query codebase structure instead of readin
 
 **Run after adding:** any new NODE_ type, any new context flag, any new control-flow statement. The matrix exposes gaps automatically.
 
+**Note:** The 5 matrix bugs are now FIXED by FuncProps (function summaries). The audit matrix remains useful for scope-exit flag checks (return/break/continue/goto) which FuncProps doesn't cover.
+
+### Function Summaries — FuncProps (2026-04-14, tracking system #29)
+
+Inferred function properties on Symbol, lazily computed via DFS with cycle detection.
+Fixes the 5 matrix audit bugs (direct + transitive) and absorbs `has_atomic_or_barrier()`.
+
+**Data structure:** `Symbol.props` — `{computed, in_progress, can_yield, can_spawn, can_alloc, has_sync}`
+
+**Key functions:**
+- `scan_func_props(c, node, parent_sym)` — recursive AST walker, sets all bools in one pass, follows callees transitively via `ensure_func_props`
+- `ensure_func_props(c, sym)` — lazy compute + DFS cycle detection (`computed` + `in_progress` flags, same pattern as `FuncSharedTypes` deadlock DFS)
+- `check_body_effects(c, body, line, ban_yield, msg, ban_spawn, msg, ban_alloc, msg)` — called at @critical, defer, interrupt entry points. Creates temp scan of the restricted body subtree.
+
+**Where checks happen:**
+- NODE_CRITICAL handler — bans can_yield, can_spawn (before `check_stmt`)
+- NODE_DEFER handler — bans can_yield (before `check_stmt`)
+- NODE_INTERRUPT in check_func_body — bans can_spawn, can_alloc (before `check_stmt`)
+- NODE_SPAWN handler — bans `c->in_async` (direct flag, not FuncProps — spawn in async is about ownership, not transitivity)
+- NODE_SPAWN handler — reads `func_sym->props.has_sync` (replaces `has_atomic_or_barrier()` call)
+
+**Transitive following:** NODE_CALL in scanner → `scope_lookup` callee → `ensure_func_props(callee)` → merge callee props. Also follows module-qualified calls (`module__func` mangled name). Function pointer calls: conservative (assumed no effects).
+
+**Ban decision framework:** Hardware/OS constraint → emission impossibility → needs runtime → needs type system → if none, track. All current bans justified. See CLAUDE.md.
+
+**Design doc:** `docs/FunctionSummaries.md` — full problem statement, rejected approaches (flags, table-driven, effect annotations), architecture, edge cases, testing strategy.
+
 ### Why B5-B6 and B11 are deferred (NOT pure duplication):
 - **B5-B6:** Pool alloc emits 6 inline args (`slots, sizeof(slots[0]), gen, used, count, &ok`). Slab emits 2 (`&slab, &ok`). A helper needs `is_pool` flag = same line count, worse readability. v0.4 table-driven solves this properly.
 - **B11:** Pool uses `pool.elem`/`pool.count`, Slab uses `slab.elem` + ISR ban. Helper needs type flag + element accessor + optional count + ISR flag = more parameters than the code it replaces.
 
-### Full list of unified helpers after this session (25 total)
+### Full list of unified helpers after this session (28 total)
 | # | Helper | File | What |
 |---|---|---|---|
 | 1 | `vrp_invalidate_for_assign` | checker.c | VRP range invalidation (R1) |
@@ -1131,6 +1158,9 @@ Used `make tags` (Universal Ctags) to query codebase structure instead of readin
 | 20 | `validate_struct_init` | checker.c | Designated init field validation |
 | 21 | `find_handle_local` | zercheck.c | Scope-aware handle registration |
 | 22 | `emit_zero_value` | emitter.c | Zero value for any return type |
+| 23 | `scan_func_props` | checker.c | Recursive AST walker for function properties (FuncProps) |
+| 24 | `ensure_func_props` | checker.c | Lazy DFS compute + cache for FuncProps |
+| 25 | `check_body_effects` | checker.c | Context entry point effect checker (@critical/defer/interrupt) |
 
 ## Firmware Examples + Polish (2026-04-13)
 

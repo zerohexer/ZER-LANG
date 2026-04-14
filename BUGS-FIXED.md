@@ -5,6 +5,19 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-14 — FuncProps: Function Summaries Implementation
+
+### Tracking system #29: FuncProps on Symbol
+Inferred function properties (can_yield, can_spawn, can_alloc, has_sync) cached on Symbol via lazy DFS with proper cycle detection. Scans function bodies transitively — follows callees, caches results. Replaces `has_atomic_or_barrier()` standalone scanner.
+
+**All 5 bugs from the matrix audit fixed** — both direct AND transitive cases. @critical, defer, and interrupt handlers now call `check_body_effects()` which uses the scanner.
+
+Added `in_async` check for NODE_SPAWN (BUG-508: spawn in async function).
+
+6 new negative tests: async_critical_yield, async_spawn_inside (moved from limitations/), critical_yield_transitive, critical_spawn_transitive, defer_yield_direct, defer_yield_transitive. 0 limitations remaining.
+
+**Ban decision framework** added to CLAUDE.md — 4-step checklist (hardware/OS → emission impossibility → needs runtime → needs type system → if none, track). Cross-check: follow Zig and Rust. All bans justified.
+
 ## Session 2026-04-14 — Flag-Handler Matrix Audit (5 bugs found automatically)
 
 ### BUG-507: yield missing critical_depth check

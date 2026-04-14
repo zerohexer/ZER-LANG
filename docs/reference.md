@@ -848,6 +848,8 @@ Fires on ALL exit paths (return, break, continue, end of block).
 
 Handle leaks are **compile errors** — allocating without `defer free()` (or returning/storing the handle) is rejected. The compiler error tells you exactly what to add.
 
+`yield` and `await` are **banned** inside defer bodies — both directly and transitively (calling a function that yields is also rejected). Defer cleanup must be atomic; suspending mid-cleanup corrupts the coroutine state machine.
+
 **SYNTAX**
 ```zer
 defer statement;
@@ -1674,6 +1676,8 @@ Per-architecture interrupt disable/enable.
 
 `return`, `break`, `continue`, and `goto` are **banned** inside `@critical` blocks — jumping out would skip the interrupt re-enable, leaving the system with interrupts permanently disabled.
 
+`yield`, `await`, and `spawn` are also **banned** inside `@critical` — both directly and transitively (calling a function that yields/spawns is also rejected). Yield/await would suspend with interrupts disabled (system hang). Spawn would create a thread with interrupts disabled (hardware-unsafe).
+
 **EXAMPLE**
 ```zer
 @critical {
@@ -2265,7 +2269,9 @@ th.join();                      // MUST join — zercheck error if not
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)
   - Transitive: follows callees 8 levels deep
 - Escape hatches: `volatile` global, `shared struct`, `threadlocal`, `@atomic_*`, `const`
-- spawn inside `@critical` → compile error
+- spawn inside `@critical` → compile error (direct + transitive via function summaries)
+- spawn inside `async` function → compile error (thread may outlive coroutine)
+- spawn inside interrupt handler → compile error (direct + transitive)
 
 ### Condvar — Thread Synchronization
 ```zer

@@ -30,7 +30,7 @@ static void find_zerc(void) {
     if (system("./zerc --help >/dev/null 2>&1") == 0) { zerc_path = "./zerc"; return; }
     if (system("/tmp/zerc --help >/dev/null 2>&1") == 0) { zerc_path = "/tmp/zerc"; return; }
     /* Build it if needed */
-    if (system("gcc -std=c99 -O2 -I. -o /tmp/zerc lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c 2>/dev/null") == 0) {
+    if (system("gcc -std=c99 -O2 -I. -o /tmp/zerc lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c 2>/dev/null") == 0) {
         zerc_path = "/tmp/zerc";
         return;
     }

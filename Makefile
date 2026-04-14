@@ -2,11 +2,11 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 -I.
 
 # Core source files for the compiler
-CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c
+CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c
 CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 # Library sources (everything except zerc_main)
-LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c
+LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # ---- Compiler binary ----

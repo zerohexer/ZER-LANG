@@ -834,7 +834,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
  * Entry Point: lower one function
  * ================================================================ */
 
-IRFunc *ir_lower_func(Arena *arena, Checker *checker, Node *func_decl) {
+IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
+    Checker *checker = (Checker *)checker_ptr;
     if (!func_decl || func_decl->kind != NODE_FUNC_DECL || !func_decl->func_decl.body)
         return NULL;
 
@@ -860,13 +861,39 @@ IRFunc *ir_lower_func(Arena *arena, Checker *checker, Node *func_decl) {
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
 
-    /* Phase 1: Collect params as locals */
+    /* Phase 1: Collect params as locals.
+     * Param types resolved from TypeNode using basic primitive mapping.
+     * Complex types (struct, pointer) fall back to ty_void — emitter reads AST. */
     for (int i = 0; i < func_decl->func_decl.param_count; i++) {
         ParamDecl *p = &func_decl->func_decl.params[i];
-        Type *pt = checker_get_type(checker, func_decl); /* param types from checker */
-        /* Try to get param type from scope */
-        Symbol *psym = scope_lookup(checker->global_scope, p->name, (uint32_t)p->name_len);
-        if (psym && psym->type) pt = psym->type;
+        Type *pt = NULL;
+        /* Try to resolve type from TypeNode */
+        if (p->type) {
+            switch (p->type->kind) {
+            case TYNODE_U8:  pt = ty_u8;  break;
+            case TYNODE_U16: pt = ty_u16; break;
+            case TYNODE_U32: pt = ty_u32; break;
+            case TYNODE_U64: pt = ty_u64; break;
+            case TYNODE_I8:  pt = ty_i8;  break;
+            case TYNODE_I16: pt = ty_i16; break;
+            case TYNODE_I32: pt = ty_i32; break;
+            case TYNODE_I64: pt = ty_i64; break;
+            case TYNODE_USIZE: pt = ty_usize; break;
+            case TYNODE_F32: pt = ty_f32; break;
+            case TYNODE_F64: pt = ty_f64; break;
+            case TYNODE_BOOL: pt = ty_bool; break;
+            case TYNODE_VOID: pt = ty_void; break;
+            default: {
+                /* Complex type — look up in global scope by param name.
+                 * This works because checker registered all symbols. */
+                Symbol *psym = scope_lookup(checker->global_scope,
+                    p->name, (uint32_t)p->name_len);
+                if (psym && psym->type) pt = psym->type;
+                break;
+            }
+            }
+        }
+        if (!pt) pt = ty_void; /* fallback */
         ir_add_local(func, arena, p->name, (uint32_t)p->name_len,
                      pt, true, false, false, p->loc.line);
     }
@@ -896,7 +923,8 @@ IRFunc *ir_lower_func(Arena *arena, Checker *checker, Node *func_decl) {
 }
 
 /* Also handle interrupt bodies */
-IRFunc *ir_lower_interrupt(Arena *arena, Checker *checker, Node *interrupt) {
+IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
+    Checker *checker = (Checker *)checker_ptr;
     if (!interrupt || interrupt->kind != NODE_INTERRUPT || !interrupt->interrupt.body)
         return NULL;
 

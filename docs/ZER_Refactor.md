@@ -1,8 +1,32 @@
 # ZER Compiler Refactor Plan — Complete Context Dump
 
-**Generated:** 2026-04-14
+**Generated:** 2026-04-14 (updated after execution)
 **Session:** Full codebase audit — 25,757 compiler lines, ~15,000 lines read directly, 100% pattern-searched
-**Purpose:** Enable a fresh Claude session to execute ALL refactors without re-reading the codebase
+**Status:** Phases 1-5 COMPLETE. Only emitter duplication cleanup remaining (B3, B5-B8, B11).
+
+## COMPLETED (this session)
+- B1: `track_dyn_freed_index()` — checker.c
+- B2: `check_union_switch_mutation()` — checker.c
+- B4: `emit_opt_wrap_value()` — emitter.c
+- B10: `handle_key_arena()` — zercheck.c (27 sites converted)
+- A1: 5 snprintf clamp fixes — checker.c
+- A2-A6: 6 emitter distinct optional unwrap — emitter.c (BUG-506)
+- A7: spawn string literal check — checker.c
+- A8-A14: 7 checker distinct unwrap — checker.c (BUG-506)
+- A15: spawn validation gaps (is_literal_compatible + validate_struct_init) — checker.c
+- A16: labels[128] → dynamic — checker.c
+- A17: container fields[128] → dynamic — parser.c
+- A18: volatile bounds temps — emitter.c
+- A19: emit_type_and_name distinct-optional-funcptr — emitter.c
+- A20: module-qualified call distinct unwrap — checker.c
+- C1-C2: zig test runner + Makefile
+
+## REMAINING (emitter code quality — no bugs, maintenance risk only)
+- B3: Orelse emission → use existing helpers (4 blocks, ~40 lines each)
+- B5-B6: Pool/Slab/Task alloc emission pattern consolidation (6 sites)
+- B7: Return optional wrapping consolidation (2 blocks)
+- B8: Union typedef emission 12× pattern → helper
+- B11: Pool vs Slab method dispatch unification in checker (largest)
 
 **MANDATORY:** Read CLAUDE.md and docs/compiler-internals.md FIRST. This document supplements those — it does NOT replace them. CLAUDE.md has the language spec, compiler-internals.md has the emission patterns.
 

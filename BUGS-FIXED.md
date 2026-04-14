@@ -5,6 +5,36 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-14 — Flag-Handler Matrix Audit (5 bugs found automatically)
+
+### BUG-507: yield missing critical_depth check
+`yield` inside `@critical { }` block compiled without error. Yield suspends the coroutine — if interrupts are disabled via @critical, they stay disabled across the yield until resume. Deadlock/system hang.
+**Found by:** `tools/audit_matrix.sh` — automated cross-reference of NODE_ handlers × context flags.
+**Test:** `tests/zer_fail/async_critical_yield.zer.disabled` (re-enable after fix)
+
+### BUG-508: spawn inside async function not rejected
+`spawn helper()` inside `async void func()` compiled. Thread ownership in a coroutine is undefined — the spawned thread may outlive the coroutine's yield/resume cycle.
+**Found by:** interaction test `tests/zer_fail/async_spawn_inside.zer.disabled`
+
+### yield missing defer_depth check
+`yield` inside `defer { }` block compiled. Yield in defer body corrupts the Duff's device state machine — the defer is executed during scope cleanup, yielding during cleanup is undefined.
+**Found by:** `tools/audit_matrix.sh`
+
+### await missing critical_depth check
+`await cond` inside `@critical { }` compiled. Same issue as BUG-507 — await suspends with interrupts disabled.
+**Found by:** `tools/audit_matrix.sh`
+
+### await missing defer_depth check
+`await cond` inside `defer { }` compiled. Same issue as yield in defer.
+**Found by:** `tools/audit_matrix.sh`
+
+### spawn missing in_interrupt check
+`spawn func()` inside `interrupt USART1 { }` handler compiled. pthread_create in an ISR is unsafe — ISRs should be fast and non-blocking.
+**Found by:** `tools/audit_matrix.sh`
+
+### 13 interaction tests added
+6 async interaction tests (do_while+yield, range_for+yield, container+yield, desig_init+yield, typecast+yield, intrinsic+yield). 6 distinct interaction tests (array, enum_switch, pointer_qual, bool, float, handle). All pass. Found that `distinct typedef u32[4]` and `distinct typedef f32` need special handling — worked around in tests, root cause deferred.
+
 ## Session 2026-04-14 — ctags-Guided Audit (3 bugs in ~5K tokens)
 
 ### resolve_type_for_emit missing 4 TYNODE cases

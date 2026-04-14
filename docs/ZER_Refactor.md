@@ -21,12 +21,14 @@
 - A20: module-qualified call distinct unwrap — checker.c
 - C1-C2: zig test runner + Makefile
 
-## REMAINING (emitter code quality — no bugs, maintenance risk only)
-- B3: Orelse emission → use existing helpers (4 blocks, ~40 lines each)
-- B5-B6: Pool/Slab/Task alloc emission pattern consolidation (6 sites)
-- B7: Return optional wrapping consolidation (2 blocks)
-- B8: Union typedef emission 12× pattern → helper
-- B11: Pool vs Slab method dispatch unification in checker (largest)
+## COMPLETED (second batch)
+- B3: Orelse emission → use emit_opt_null_check/emit_opt_unwrap helpers (net -64 lines)
+- B7: Return optional wrapping → use emit_opt_wrap_value helper
+- B8: Union typedef emission → EMIT_UNAME() local macro (12× → 12 calls)
+
+## DEFERRED TO v0.4 (intentional differences, not pure duplication)
+- B5-B6: Pool/Slab/Task alloc emission — middle logic differs (pool inline vs slab function). Wrapping is identical but extracting needs `is_pool` flag = no simplification. Better addressed by v0.4 table-driven architecture.
+- B11: Pool vs Slab method dispatch in checker — same structure but different types/ISR rules. Better addressed by v0.4 table-driven architecture.
 
 **MANDATORY:** Read CLAUDE.md and docs/compiler-internals.md FIRST. This document supplements those — it does NOT replace them. CLAUDE.md has the language spec, compiler-internals.md has the emission patterns.
 

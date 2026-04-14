@@ -469,6 +469,54 @@ static void track_dyn_freed_index(Checker *c, Node *call_node) {
     }
 }
 
+/* B2 refactor: Check if union mutation is blocked by switch arm lock.
+ * Walks field_object to root ident, checks name match + pointer alias + precise key.
+ * Returns true if mutation should be blocked (caller emits error + breaks).
+ * Previously duplicated in pointer-auto-deref union (line ~4577) and direct union (line ~4683). */
+static bool check_union_switch_mutation(Checker *c, Node *field_object) {
+    if (!c->union_switch_var) return false;
+    Node *mut_root = field_object;
+    while (mut_root) {
+        if (mut_root->kind == NODE_UNARY && mut_root->unary.op == TOK_STAR)
+            mut_root = mut_root->unary.operand;
+        else if (mut_root->kind == NODE_FIELD) mut_root = mut_root->field.object;
+        else if (mut_root->kind == NODE_INDEX) mut_root = mut_root->index_expr.object;
+        else break;
+    }
+    if (!mut_root || mut_root->kind != NODE_IDENT) return false;
+    bool name_match = (mut_root->ident.name_len == c->union_switch_var_len &&
+        memcmp(mut_root->ident.name, c->union_switch_var, c->union_switch_var_len) == 0);
+    bool type_match = false;
+    if (!name_match && c->union_switch_type) {
+        Symbol *ms = scope_lookup(c->current_scope,
+            mut_root->ident.name, (uint32_t)mut_root->ident.name_len);
+        if (ms && ms->type) {
+            Type *mt = type_unwrap_distinct(ms->type);
+            if (mt->kind == TYPE_POINTER) {
+                Type *inner_t = type_unwrap_distinct(mt->pointer.inner);
+                if (inner_t == c->union_switch_type) type_match = true;
+            }
+        }
+    }
+    if (!(name_match || type_match)) return false;
+    bool blocked = true;
+    if (name_match && c->union_switch_key && c->union_switch_key_len > 0 && !type_match) {
+        ExprKey tgt_key = build_expr_key_a(c, field_object);
+        if (tgt_key.len > 0 &&
+            ((int)c->union_switch_key_len != tgt_key.len ||
+             memcmp(tgt_key.str, c->union_switch_key, tgt_key.len) != 0))
+            blocked = false;
+    }
+    if (blocked) {
+        checker_error(c, field_object->loc.line,
+            "cannot mutate union '%.*s' inside its own switch arm — "
+            "active capture would become invalid",
+            (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
+            name_match ? c->union_switch_var : mut_root->ident.name);
+    }
+    return blocked;
+}
+
 /* BUG-393: compound key provenance map — set/get for struct fields and array elements */
 static void prov_map_set(Checker *c, const char *key, uint32_t key_len, Type *prov) {
     /* check if key already exists — update in place */
@@ -4573,58 +4621,10 @@ static Type *check_expr(Checker *c, Node *node) {
             /* union switch lock applies to pointer auto-deref too.
              * BUG-211: walk to root for field-based access */
             if (c->in_assign_target && c->union_switch_var) {
-                /* BUG-244: walk ALL deref/field/index levels to find root */
-                Node *mut_root = node->field.object;
-                while (mut_root) {
-                    if (mut_root->kind == NODE_UNARY && mut_root->unary.op == TOK_STAR)
-                        mut_root = mut_root->unary.operand;
-                    else if (mut_root->kind == NODE_FIELD)
-                        mut_root = mut_root->field.object;
-                    else if (mut_root->kind == NODE_INDEX)
-                        mut_root = mut_root->index_expr.object;
-                    else break;
-                }
-                if (mut_root && mut_root->kind == NODE_IDENT) {
-                    bool name_match = (mut_root->ident.name_len == c->union_switch_var_len &&
-                        memcmp(mut_root->ident.name, c->union_switch_var,
-                               c->union_switch_var_len) == 0);
-                    /* BUG-261: block mutation through pointer alias of same union type.
-                     * Only applies to pointers — they might alias the locked variable.
-                     * Direct locals of the same type are safe (different memory). */
-                    bool type_match = false;
-                    if (!name_match && c->union_switch_type) {
-                        Symbol *ms = scope_lookup(c->current_scope,
-                            mut_root->ident.name, (uint32_t)mut_root->ident.name_len);
-                        if (ms && ms->type) {
-                            Type *mt = type_unwrap_distinct(ms->type);
-                            if (mt->kind == TYPE_POINTER) {
-                                Type *inner_t = type_unwrap_distinct(mt->pointer.inner);
-                                if (inner_t == c->union_switch_type) type_match = true;
-                            }
-                        }
-                    }
-                    if (name_match || type_match) {
-                        /* BUG-392: precise key check — different array elements are safe */
-                        bool blocked = true;
-                        if (name_match && c->union_switch_key &&
-                            c->union_switch_key_len > 0 && !type_match) {
-                            ExprKey tgt_key = build_expr_key_a(c, node->field.object);
-                            if (tgt_key.len > 0 &&
-                                ((int)c->union_switch_key_len != tgt_key.len ||
-                                 memcmp(tgt_key.str, c->union_switch_key, tgt_key.len) != 0)) {
-                                blocked = false;
-                            }
-                        }
-                        if (blocked) {
-                            checker_error(c, node->loc.line,
-                                "cannot mutate union '%.*s' inside its own switch arm — "
-                                "active capture would become invalid",
-                                (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
-                                name_match ? c->union_switch_var : mut_root->ident.name);
-                            result = ty_void;
-                            break;
-                        }
-                    }
+                /* B2 refactor: unified union switch lock check */
+                if (check_union_switch_mutation(c, node->field.object)) {
+                    result = ty_void;
+                    break;
                 }
             }
             Type *inner = type_unwrap_distinct(obj->pointer.inner);
@@ -4677,60 +4677,10 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* prevent mutating union variant while inside a switch arm on same variable.
              * BUG-211: walk field/index chain to find root ident for field-based unions */
-            /* BUG-244: walk ALL deref/field/index levels to find root */
-            if (c->union_switch_var) {
-                Node *mut_root = node->field.object;
-                while (mut_root) {
-                    if (mut_root->kind == NODE_UNARY && mut_root->unary.op == TOK_STAR)
-                        mut_root = mut_root->unary.operand;
-                    else if (mut_root->kind == NODE_FIELD)
-                        mut_root = mut_root->field.object;
-                    else if (mut_root->kind == NODE_INDEX)
-                        mut_root = mut_root->index_expr.object;
-                    else break;
-                }
-                if (mut_root && mut_root->kind == NODE_IDENT) {
-                    bool name_match = (mut_root->ident.name_len == c->union_switch_var_len &&
-                        memcmp(mut_root->ident.name, c->union_switch_var,
-                               c->union_switch_var_len) == 0);
-                    /* BUG-261: block mutation through pointer alias of same union type.
-                     * Only applies to pointers — they might alias the locked variable.
-                     * Direct locals of the same type are safe (different memory). */
-                    bool type_match = false;
-                    if (!name_match && c->union_switch_type) {
-                        Symbol *ms = scope_lookup(c->current_scope,
-                            mut_root->ident.name, (uint32_t)mut_root->ident.name_len);
-                        if (ms && ms->type) {
-                            Type *mt = type_unwrap_distinct(ms->type);
-                            if (mt->kind == TYPE_POINTER) {
-                                Type *inner_t = type_unwrap_distinct(mt->pointer.inner);
-                                if (inner_t == c->union_switch_type) type_match = true;
-                            }
-                        }
-                    }
-                    if (name_match || type_match) {
-                        /* BUG-392: precise key check — different array elements are safe */
-                        bool blocked = true;
-                        if (name_match && c->union_switch_key &&
-                            c->union_switch_key_len > 0 && !type_match) {
-                            ExprKey tgt_key = build_expr_key_a(c, node->field.object);
-                            if (tgt_key.len > 0 &&
-                                ((int)c->union_switch_key_len != tgt_key.len ||
-                                 memcmp(tgt_key.str, c->union_switch_key, tgt_key.len) != 0)) {
-                                blocked = false;
-                            }
-                        }
-                        if (blocked) {
-                            checker_error(c, node->loc.line,
-                                "cannot mutate union '%.*s' inside its own switch arm — "
-                                "active capture would become invalid",
-                                (int)(name_match ? c->union_switch_var_len : mut_root->ident.name_len),
-                                name_match ? c->union_switch_var : mut_root->ident.name);
-                            result = ty_void;
-                            break;
-                        }
-                    }
-                }
+            /* B2 refactor: unified union switch lock check */
+            if (check_union_switch_mutation(c, node->field.object)) {
+                result = ty_void;
+                break;
             }
             for (uint32_t i = 0; i < obj->union_type.variant_count; i++) {
                 SUVariant *v = &obj->union_type.variants[i];
@@ -8095,6 +8045,18 @@ static void check_stmt(Checker *c, Node *node) {
         for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
             Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
             if (!arg_type) continue;
+            /* A7: string literal to mutable slice — same check as regular call (line 3871).
+             * String data is in .rodata, spawned thread writing it = segfault. */
+            if (node->spawn_stmt.args[i]->kind == NODE_STRING_LIT &&
+                func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL &&
+                i < func_sym->func_node->func_decl.param_count) {
+                Type *param_type = resolve_type(c, func_sym->func_node->func_decl.params[i].type);
+                if (param_type && param_type->kind == TYPE_SLICE && !param_type->slice.is_const) {
+                    checker_error(c, node->loc.line,
+                        "spawn argument %d: cannot pass string literal to mutable []u8 parameter — "
+                        "string data is read-only, use const []u8", i + 1);
+                }
+            }
             Type *eff = type_unwrap_distinct(arg_type);
             /* Pointer args: scoped spawn allows *T (will be joined), fire-and-forget requires *shared */
             if (eff->kind == TYPE_POINTER) {

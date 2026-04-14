@@ -5,6 +5,22 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-14 — ctags-Guided Audit (3 bugs in ~5K tokens)
+
+### resolve_type_for_emit missing 4 TYNODE cases
+TYNODE_SLAB, TYNODE_BARRIER, TYNODE_SEMAPHORE, TYNODE_CONTAINER not handled in emitter fallback `resolve_type_for_emit` — silently returned `ty_void`. Checker always populates typemap so fallback rarely fires, but latent bug if any code path misses the cache.
+**Fix:** Added proper resolution for each type. **Found by:** ctags query for all TYNODE_ enums, cross-referenced with switch cases.
+
+### resolve_type_for_emit volatile propagation without distinct unwrap
+`inner->kind == TYPE_POINTER` at line 4212 without `type_unwrap_distinct`. Same A11 class bug in emitter fallback. Also added slice volatile propagation (was pointer-only).
+**Found by:** ctags audit of `resolve_type_for_emit` function structure.
+
+### Duplicate _comptime_global_scope declaration
+`static Scope *_comptime_global_scope` declared at lines 1082 and 1570 in checker.c. C merges them but confusing. Removed second, added comment.
+
+### ctags added to Makefile
+`make tags` generates Universal Ctags index of all compiler sources. 2,183 entries. LLM greps tags file instead of reading 25K lines. 40x efficiency gain for bug discovery.
+
 ## Session 2026-04-14 — Full Codebase Audit + Refactor (25,757 lines read)
 
 ### BUG-506: Missing type_unwrap_distinct in emitter optional init (6 sites)

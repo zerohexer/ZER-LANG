@@ -1075,11 +1075,21 @@ Created `zig_tests/run_tests.sh` (36 tests: 31 positive, 5 negative). Added to M
 - **A19:** `emit_type_and_name` handles `distinct(?funcptr)`.
 - **A20:** Module-qualified call rewrite unwraps distinct.
 
+### ctags-Guided Audit (2026-04-14, second pass)
+Used `make tags` (Universal Ctags) to query codebase structure instead of reading source. Found 3 bugs in ~5K tokens:
+1. `resolve_type_for_emit` missing TYNODE_SLAB/BARRIER/SEMAPHORE/CONTAINER — fallback returned `ty_void`
+2. `resolve_type_for_emit` volatile propagation without `type_unwrap_distinct` (same A11 class)
+3. Duplicate `_comptime_global_scope` declaration (lines 1082/1570)
+
+**Methodology:** Query ctags for functions returning `Type*`, cross-reference with TYNODE enum values, grep for missing switch cases. 40x more efficient than brute-force reading.
+
+**For fresh sessions:** Run `make tags` first. Use `grep "function_name" tags` to find locations. Use `grep "pattern" file.c` to find specific code. Never read full files speculatively.
+
 ### Why B5-B6 and B11 are deferred (NOT pure duplication):
 - **B5-B6:** Pool alloc emits 6 inline args (`slots, sizeof(slots[0]), gen, used, count, &ok`). Slab emits 2 (`&slab, &ok`). A helper needs `is_pool` flag = same line count, worse readability. v0.4 table-driven solves this properly.
 - **B11:** Pool uses `pool.elem`/`pool.count`, Slab uses `slab.elem` + ISR ban. Helper needs type flag + element accessor + optional count + ISR flag = more parameters than the code it replaces.
 
-### Full list of unified helpers after this session (22 total)
+### Full list of unified helpers after this session (25 total)
 | # | Helper | File | What |
 |---|---|---|---|
 | 1 | `vrp_invalidate_for_assign` | checker.c | VRP range invalidation (R1) |

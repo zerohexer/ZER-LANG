@@ -1084,11 +1084,20 @@ When starting a new session or lacking context:
 
 1. Read `CLAUDE.md` (this file) — has FULL language reference above, rules, conventions
 2. **MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
-3. Read `BUGS-FIXED.md` — 464+ past bugs with root causes. Prevents re-introducing fixed bugs. Read `docs/future_plans.md` for architecture roadmap (table-driven compiler, container keyword, monomorphization).
+3. Read `BUGS-FIXED.md` — 506+ past bugs with root causes. Prevents re-introducing fixed bugs. Read `docs/future_plans.md` for architecture roadmap (table-driven compiler, container keyword, monomorphization).
 4. `ZER-LANG.md` — full language spec (only if CLAUDE.md quick reference is insufficient)
-5. Read the relevant header files: `lexer.h` → `parser.h` → `ast.h` → `types.h` → `checker.h` → `emitter.h` → `zercheck.h`
-4. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
-5. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
+5. **Use `make tags` + grep for code navigation** — generates ctags index (2,183 entries). Use `grep "function_name" tags` to find file+line+signature. NEVER read full source files speculatively. Read only the specific lines around grep results. This is 40x more efficient than brute-force reading.
+6. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
+7. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
+
+### Bug Hunting Workflow (principle-first, not brute-force)
+
+When looking for bugs, do NOT read entire files. Instead:
+1. Find ONE instance of the bug (from user report, test failure, or targeted grep)
+2. Derive the GENERAL PRINCIPLE the bug violates (e.g., "TYPE_DISTINCT must be unwrapped")
+3. Grep for ALL violations of that principle (`grep "->kind == TYPE_" file.c`)
+4. Fix all instances, not just the reported one
+This approach found 13 bugs in ~5K tokens. Brute-force reading of the same code found the same bugs in ~200K tokens.
 
 ## Project Architecture
 

@@ -1462,6 +1462,19 @@ Add one debug print to confirm the root cause.
 Do not restructure. Do not fix yet. Just confirm.
 ```
 
+## Confirmed NOT Bugs — DO NOT Re-Investigate
+
+These were thoroughly investigated during the 2026-04-14 full codebase audit (25,757 lines) and confirmed correct:
+
+1. **`types.c can_implicit_coerce` missing distinct unwrap** — BY DESIGN. Distinct types intentionally block implicit conversion. Only T→?T (line 367) unwraps.
+2. **`type_equals` nominal for distinct** — BY DESIGN. Pointer identity = same definition.
+3. **Const/volatile laundering checks without unwrap** (checker.c lines 3179, 3190, 3888, 3896, 6278, 6286, 7577, 7588) — Belt-and-suspenders. `can_implicit_coerce` catches at type level. Missing unwrap gives generic error instead of specific message. NOT safety holes.
+4. **`pathstate_equal` asymmetric check** (zercheck.c:62) — Correct for loop convergence. New handles from loop body are expected.
+5. **`import_asts[64]`** (zerc_main.c:460) — Graceful degradation, not crash.
+6. **Emitter `asname[128]`** (emitter.c:1746) — Used with `%.*s` which stops at null. Safe.
+7. **`@offset` struct type check** (checker.c:5254) — Cosmetic only, not safety.
+8. **`scan_unsafe_global_access` static depth counter** (checker.c:6109) — Safe, LSP is single-threaded.
+
 ## Agent-Verify Workflow — Bug Hunting & Test Writing
 
 When looking for bugs or writing new tests, use the spawn-then-verify pattern:

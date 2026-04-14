@@ -1,0 +1,21 @@
+// Async + C-style typecast with yield — cast result across yield
+
+async void widener() {
+    u8 small = 200;
+    yield;
+    u32 big = (u32)small;
+    yield;
+    if (big != 200) { return; }
+}
+
+u32 main() {
+    _zer_async_widener task;
+    _zer_async_widener_init(&task);
+    i32 r1 = _zer_async_widener_poll(&task);
+    if (r1 != 0) { return 1; }
+    i32 r2 = _zer_async_widener_poll(&task);
+    if (r2 != 0) { return 2; }
+    i32 r3 = _zer_async_widener_poll(&task);
+    if (r3 != 1) { return 3; }
+    return 0;
+}

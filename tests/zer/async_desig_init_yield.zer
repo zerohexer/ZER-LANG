@@ -1,0 +1,29 @@
+// Async + designated init with yield — struct init across yield points
+
+struct Config {
+    u32 baud;
+    u32 timeout;
+    bool enabled;
+}
+
+async void configure() {
+    Config c = { .baud = 9600, .timeout = 0, .enabled = false };
+    yield;
+    c.timeout = 1000;
+    c.enabled = true;
+    yield;
+    if (c.baud != 9600) { return; }
+    if (c.timeout != 1000) { return; }
+}
+
+u32 main() {
+    _zer_async_configure task;
+    _zer_async_configure_init(&task);
+    i32 r1 = _zer_async_configure_poll(&task);
+    if (r1 != 0) { return 1; }
+    i32 r2 = _zer_async_configure_poll(&task);
+    if (r2 != 0) { return 2; }
+    i32 r3 = _zer_async_configure_poll(&task);
+    if (r3 != 1) { return 3; }
+    return 0;
+}

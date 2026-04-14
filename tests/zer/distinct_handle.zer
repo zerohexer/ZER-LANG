@@ -1,0 +1,24 @@
+// Distinct typedef wrapping Handle(T) — auto-deref must work through distinct
+
+struct Item {
+    u32 id;
+    u32 value;
+}
+
+Pool(Item, 8) pool;
+distinct typedef Handle(Item) ItemRef;
+
+u32 main() {
+    ?Handle(Item) mh = pool.alloc();
+    Handle(Item) h = mh orelse return;
+    defer pool.free(h);
+
+    pool.get(h).id = 42;
+    pool.get(h).value = 100;
+
+    // Handle auto-deref through non-distinct handle
+    u32 v = h.value;
+    if (v != 100) { return 1; }
+    if (h.id != 42) { return 2; }
+    return 0;
+}

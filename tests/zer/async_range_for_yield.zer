@@ -1,0 +1,28 @@
+// Async + for-in range loop with yield — __ri and item promoted to state struct
+i32 putchar(i32 c);
+
+async void summer() {
+    u32[4] data;
+    data[0] = 10; data[1] = 20; data[2] = 30; data[3] = 40;
+    u32 total = 0;
+    for (u32 item in data) {
+        total += item;
+        yield;
+    }
+    // total should be 100
+    if (total != 100) { putchar(69); }
+}
+
+u32 main() {
+    _zer_async_summer task;
+    _zer_async_summer_init(&task);
+    // 4 yields (one per element)
+    for (u32 i = 0; i < 4; i += 1) {
+        i32 r = _zer_async_summer_poll(&task);
+        if (r != 0) { return 1; }
+    }
+    // 5th poll: loop done, function completes
+    i32 r = _zer_async_summer_poll(&task);
+    if (r != 1) { return 2; }
+    return 0;
+}

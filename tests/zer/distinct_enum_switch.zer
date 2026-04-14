@@ -1,0 +1,21 @@
+// Distinct typedef wrapping enum — switch exhaustiveness must work
+
+enum Direction { north, south, east, west }
+distinct typedef Direction Heading;
+
+u32 dir_to_num(Heading h) {
+    Direction d = @cast(Direction, h);
+    switch (d) {
+        .north => { return 0; }
+        .south => { return 1; }
+        .east => { return 2; }
+        .west => { return 3; }
+    }
+}
+
+u32 main() {
+    Heading h = @cast(Heading, Direction.east);
+    u32 n = dir_to_num(h);
+    if (n != 2) { return 1; }
+    return 0;
+}

@@ -1,0 +1,11 @@
+// Async + @critical with yield — must be rejected
+// yield inside @critical would skip interrupt re-enable
+// EXPECTED: compile error
+
+async void bad_critical() {
+    @critical {
+        yield;
+    }
+}
+
+u32 main() { return 0; }

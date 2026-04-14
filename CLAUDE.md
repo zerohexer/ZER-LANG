@@ -871,7 +871,26 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 | 27 | **Spawn Global Scan** | checker.c | Non-shared global access from spawned function | Data race detection (error/warning) |
 | 28 | **Shared Type Collect** | checker.c | Which shared types a statement touches | Deadlock: 2+ shared types in one statement |
 
-**Design principle:** Safety = tracking, not banning. If a pattern is unsafe, find which tracking system can detect the violation. Only ban when NO tracking system can cover the case (e.g., naked non-asm — hardware constraint).
+**Design principle:** Safety = tracking, not banning. If a pattern is unsafe, find which tracking system can detect the violation. Only ban when NO tracking system can cover the case.
+
+**Ban Decision Framework — when banning IS correct (check in order):**
+1. **Hardware/OS constraint?** → Ban. No compiler trick fixes this. (malloc in ISR = kernel deadlock, pthread_create with interrupts disabled = hardware-unsafe)
+2. **Emission impossibility?** → Ban. Can't generate valid C. (yield in defer = duplicate Duff's device case labels)
+3. **Needs runtime?** → Ban. ZER has no scheduler/GC. (Go allows yield-in-critical because its runtime handles it — ZER can't)
+4. **Needs type system?** → Ban. ZER has no traits/lifetimes. (Rust prevents lock-across-await via !Send — ZER can't express this in types)
+5. **None of the above?** → **Track.** ZER sees all bodies, can generate correct code, no constraint prevents it.
+
+**Cross-check references:** Zig (same quadrant — no runtime, no traits) and Rust. If both ban it, ZER should too. If Rust tracks it via types that ZER can't express, ban is correct. If Zig allows it with comptime, investigate how.
+
+**Current bans justified by this framework:**
+- `yield/await in defer` — emission impossibility (duplicate case labels in Duff's device)
+- `yield/await in @critical` — needs runtime (save/restore interrupt state across suspend requires scheduler awareness)
+- `spawn in @critical` — hardware constraint (pthread_create with interrupts disabled)
+- `spawn in async` — needs type system (thread lifetime tracking requires borrow checker or GC)
+- `alloc in interrupt` — OS constraint (malloc lock + interrupted malloc = deadlock)
+- `naked non-asm` — hardware constraint (no prologue = no stack)
+- `return/break/continue/goto in @critical` — hardware constraint (skips interrupt re-enable)
+- `return/break/continue/goto in defer` — emission impossibility (corrupts cleanup flow)
 
 **`*opaque` safety coverage:**
 - Pure ZER: 100% compile-time (zercheck #7 handle states)

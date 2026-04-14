@@ -529,6 +529,23 @@ direct return inside @critical is a problem.
 
 This is a clean separation. No overlap, no redundancy.
 
+## Why These Are Bans, Not Tracking
+
+ZER's principle is "track, not ban." But these operations in restricted contexts are
+correctly banned because they fail the Ban Decision Framework (see CLAUDE.md):
+
+| Ban | Framework reason | Reference |
+|---|---|---|
+| yield in @critical | Needs runtime — interrupt save/restore across suspend requires scheduler | Go allows (has runtime), Zig bans |
+| yield in defer | Emission impossibility — duplicate Duff's device case labels | Zig bans, Rust bans (no async Drop) |
+| spawn in @critical | Hardware constraint — pthread_create with interrupts disabled | All languages ban or prevent via types |
+| spawn in async | Needs type system — thread lifetime requires borrow checker | Rust tracks (Send/Sync), Zig bans |
+| alloc in interrupt | OS constraint — malloc lock deadlock | All languages ban for ISR context |
+
+**Cross-check:** ZER and Zig are in the same quadrant (no runtime, no traits, C-level).
+Both ban the same patterns. Rust prevents via types where possible, bans where not
+(async Drop). Go allows everything via runtime — not applicable to bare metal.
+
 ## What Changes In Each File
 
 ### types.h

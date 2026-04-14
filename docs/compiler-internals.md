@@ -1031,6 +1031,24 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 `scan_frame` NODE_CALL now tracks function pointer calls. When callee is NODE_IDENT resolving to TYPE_FUNC_PTR variable, checks if the variable's init was a known function name. If so, adds that function as a callee in the call graph. Enables recursion detection through `void (*fp)() = func_a;` patterns.
 
+## Full Codebase Audit + Refactor (2026-04-14)
+
+Deep audit of all 25,757 compiler lines. 15,000 lines read directly, 100% pattern-searched.
+
+### Refactor B1: `track_dyn_freed_index()` (checker.c)
+Unified Pool.free/Slab.free DynFreed tracking into single helper. Was exact 20-line copy-paste (caused BUG-471). Both `pool.free` and `slab.free` handlers now call `track_dyn_freed_index(c, node)`.
+
+### BUG-506: 13 missing `type_unwrap_distinct` sites
+**Emitter (6 sites):** var-decl optional init (3232), init_type ident/expr (3259, 3272), comptime call (1438), global var null init (4925), if-unwrap condition (3362). All checked `type->kind == TYPE_OPTIONAL` without unwrapping distinct. `distinct typedef ?u32 MaybeId; MaybeId x = null;` failed.
+
+**Checker (7 sites):** cross-module collision (182), `*void`/`[]void` (1108/1128), `??T` nesting (1117), const/volatile propagation (1405-1424), comptime enum resolve (1553), resource assignment (2614), string return mutable slice (7566).
+
+### Buffer over-read fix (5 sites)
+`snprintf` return value used unclamped in `memcpy`. Clamp added: `if (sn_len >= sizeof(buf)) sn_len = sizeof(buf) - 1;` at lines 746, 1320, 8521, 8538, 8554.
+
+### Remaining refactors documented in `docs/ZER_Refactor.md`
+Complete plan with line numbers, code context, execution order for: B2 (union switch lock helper), B3 (orelse emission → use helpers), B4 (optional wrapping helper), B5-B8 (emitter duplication), B10 (zercheck arena keys), A7 (spawn string literal), A15-A20 (spawn gaps, fixed arrays, volatile temps). Fresh session reads ZER_Refactor.md and executes directly.
+
 ## Firmware Examples + Polish (2026-04-13)
 
 3 new firmware examples exercising ALL v0.3 features. Zero bugs found — confirms compiler readiness.

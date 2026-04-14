@@ -5,6 +5,35 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-14 — Full Codebase Audit + Refactor (25,757 lines read)
+
+### BUG-506: Missing type_unwrap_distinct in emitter optional init (6 sites)
+`distinct typedef ?u32 MaybeId; MaybeId x = null;` emitted `= 0` instead of `= { 0, 0 }` — GCC error. Root cause: `type->kind == TYPE_OPTIONAL` without `type_unwrap_distinct()` at 6 emitter sites: var-decl null init (3232), init_type ident (3259), init_type expr (3272), comptime call (1438), global var null init (4925), if-unwrap condition (3362).
+**Fix:** Add `type_unwrap_distinct()` before each `->kind == TYPE_OPTIONAL` check.
+**Test:** `tests/zer/distinct_optional_null_init.zer`
+
+### BUG-506: Missing type_unwrap_distinct in checker (7 sites)
+Safety checks bypassed for distinct-wrapped types:
+- A8: cross-module collision `->kind == TYPE_STRUCT/ENUM/UNION` (line 182)
+- A9: `*void` / `[]void` rejection (lines 1108, 1128)
+- A10: `??T` nesting rejection (line 1117)
+- A11: const/volatile propagation through pointer/slice (lines 1405-1424)
+- A12: comptime enum variant resolution (line 1553)
+- A13: Pool/Ring/Slab assignment rejection (line 2614)
+- A14: string return mutable slice check (line 7566)
+**Fix:** Add `type_unwrap_distinct()` at each site.
+
+### Buffer over-read: snprintf + memcpy (5 sites in checker.c)
+`snprintf` returns would-be length. `memcpy(dst, buf, sn_len + 1)` reads past stack buffer when formatted string exceeds buffer. Sites: slab_name[128] (746), mangled[256] (1320), aname/iname/pname[256] (8521/8538/8554).
+**Fix:** Clamp: `if (sn_len >= (int)sizeof(buf)) sn_len = (int)sizeof(buf) - 1;`
+
+### Refactor B1: track_dyn_freed_index() helper
+Pool.free and Slab.free had identical 20-line DynFreed tracking blocks (lines 3478 vs 3639). This duplication caused BUG-471 (type check added to one but not the other). Extracted to unified helper `track_dyn_freed_index()`. Both sites now call the helper.
+**Prevention:** Future DynFreed logic changes apply to ONE function.
+
+### Refactor plan document
+Created `docs/ZER_Refactor.md` — complete context dump with all remaining refactors (B2-B11, A7, A15-A20), exact line numbers, surrounding code context, execution order. Enables fresh session to execute remaining phases without re-reading 25K lines.
+
 ## Session 2026-04-13 — Firmware Examples + Polish
 
 ### cinclude angle bracket emission

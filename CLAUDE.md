@@ -494,7 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
-| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir, **195/195 compile + runtime**. 760/761 rust. 1 remaining: same-name-diff-type locals (needs three-address-code, see `docs/ThreeAddressCode.md`). Next: Phase 8 = three-address-code transition. |
+| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir, **195/195 compile + runtime**. 760/761 rust. 1 remaining: same-name-diff-type locals. **NEXT: Phase 8 = three-address-code transition** (see `docs/ThreeAddressCode.md`). Industry standard — decompose ALL expressions to local-ID operands. ~600 lines. DO NOT try shortcuts (scope tracking, name suffix, type widening — all tried, all failed). The ONLY fix is expression decomposition. |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

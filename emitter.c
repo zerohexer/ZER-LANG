@@ -6172,13 +6172,41 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_RETURN: {
-        emit_indent(e);
-        if (inst->expr) {
-            emit(e, "return ");
-            emit_expr(e, inst->expr);
-            emit(e, ";\n");
+        /* Delegate to AST emit_stmt for returns — handles optional wrapping,
+         * defer hoisting, null returns, ?void, and all the complex patterns.
+         * The AST return node is in inst->expr->parent or we construct one. */
+        if (inst->expr && inst->expr->kind == NODE_RETURN) {
+            /* inst->expr IS a NODE_RETURN from the AST — emit via AST path */
+            emit_stmt(e, inst->expr);
         } else {
-            emit(e, "return;\n");
+            /* Simple return — emit directly */
+            emit_indent(e);
+            if (inst->expr) {
+                /* Check if we need optional wrapping */
+                Type *ret = e->current_func_ret;
+                Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+                Type *expr_type = inst->expr ? checker_get_type(e->checker, inst->expr) : NULL;
+                if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+                    !is_null_sentinel(ret_eff->optional.inner) &&
+                    expr_type && !type_equals(expr_type, ret)) {
+                    /* Wrap value in optional struct */
+                    emit(e, "return ");
+                    emit_opt_wrap_value(e, inst->expr, ret_eff);
+                    emit(e, ";\n");
+                } else {
+                    emit(e, "return ");
+                    emit_expr(e, inst->expr);
+                    emit(e, ";\n");
+                }
+            } else {
+                /* Void or bare return */
+                if (e->current_func_ret) {
+                    emit(e, "return ");
+                    emit_return_null(e);
+                } else {
+                    emit(e, "return;\n");
+                }
+            }
         }
         break;
     }
@@ -6385,19 +6413,25 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         emit(e, "%.*s", (int)func->name_len, func->name);
     }
 
-    /* Parameters (from AST) */
+    /* Parameters — use AST types (same resolution as AST emitter).
+     * IR local types may be ty_void for complex params (struct, pointer). */
     emit(e, "(");
-    for (int i = 0; i < fn->func_decl.param_count; i++) {
-        if (i > 0) emit(e, ", ");
-        ParamDecl *p = &fn->func_decl.params[i];
-        int lid = ir_find_local(func, p->name, (uint32_t)p->name_len);
-        if (lid >= 0 && func->locals[lid].type) {
-            emit_type_and_name(e, func->locals[lid].type, p->name, p->name_len);
+    Type *func_type = checker_get_type(e->checker, fn);
+    if (fn->func_decl.param_count == 0) {
+        emit(e, "void");
+    } else {
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            ParamDecl *p = &fn->func_decl.params[i];
+            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                          (uint32_t)i < func_type->func_ptr.param_count) ?
+                func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            emit_type_and_name(e, ptype, p->name, p->name_len);
         }
     }
-    if (fn->func_decl.param_count == 0) emit(e, "void");
     emit(e, ") {\n");
     e->indent++;
+    e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
 
     /* Declare local variables (skip params — they're parameters) */
     for (int li = 0; li < func->local_count; li++) {
@@ -6424,6 +6458,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    e->current_func_ret = NULL;
     e->indent--;
     emit(e, "}\n\n");
 }

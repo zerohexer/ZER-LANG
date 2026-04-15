@@ -20,7 +20,10 @@ Total: ~2042 new lines. All 4000+ tests pass.
 
 **Phases 6-7 (now done):** zercheck_ir.c (452 lines — handle tracking on CFG, integer LOCAL IDs, real merge at predecessors, fixed-point iteration, leak detection). vrp_ir.c (349 lines — range per LOCAL per block, scoped address_taken, merge at join points). Total IR: ~2870 new lines across 6 files.
 
-**Migration progress:** `--use-ir` flag wired. **163/195 (84%)** ZER tests compile on IR path. Fixes applied: param types from checker func_type, return optional wrapping (emit_opt_wrap_value), IR_BRANCH optional (.has_value + cond_local), IR_ASSIGN .value unwrap (source optional → dest non-optional), bb0 label, async self-> context, emit_opt_wrap_value arg order. Remaining 32: union switch tag (7), async yield in stmt expr (4), defer #line (4), type wrapping edge cases (17).
+**Migration progress:** `--use-ir` flag wired. **165/195 (85%)** ZER tests compile on IR path.
+Fixes applied: param types from checker func_type, return optional wrapping, IR_BRANCH optional (.has_value + cond_local), IR_ASSIGN .value unwrap, bb0 label, async self-> context, emit_opt_wrap_value arg order, #line disabled during IR blocks.
+Remaining 30: union switch (7), async orelse/yield (6), optional/distinct edge cases (10), defer locals (4), misc (3).
+Failing tests: async_exprstmt_orelse, async_orelse_value_yield, async_static_local, async_switch_capture_yield, async_two_orelse_yield, callback_system, comptime_const_if, condvar_signal, defer_free, defer_return_order, distinct_optional, distinct_optional_full, distinct_optional_null_init, distinct_union_assign, event_system, move_orelse_safe, move_switch_ptr_capture, optional_enum_switch, optional_patterns, resource_manager, rwlock_shared, scoped_spawn, sem_concurrent_init, slice_subslice, super_defer_complex, tagged_values, union_array_variant, union_variant, void_optional_init, yield_in_orelse.
 
 23 of 29 safety systems on IR, 6 on checker (pre-IR infrastructure). Rule: "what does it mean?" → checker, "is it safe?" → IR.
 

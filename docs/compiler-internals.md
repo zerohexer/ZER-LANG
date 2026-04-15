@@ -1193,7 +1193,7 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 
 **Current status:** All 7 phases implemented. Migration in progress via `--use-ir` flag.
 - `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block.
-- `--use-ir` routes function body emission through IR path. **178/195 (91%) ZER tests compile.** AST path is default, all 4000+ pass.
+- `--use-ir` routes function body emission through IR path. **180/195 (92%) ZER tests compile.** AST path is default, all 4000+ pass.
 - **Remaining 32 failures** (characterized):
   - Union switch: struct used as scalar (7) — IR_BRANCH emits raw union value, needs `._tag` access
   - Async yield in GCC statement expression (4) — Duff's device case label inside `({...})`
@@ -1214,11 +1214,18 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - IR_ASSIGN null literal: dest optional + source null → emit_opt_null_literal
   - Spawn handle: ThreadHandle from scoped spawn collected as IR local
   - #line disabled during IR block emission (save/restore e->source_file)
-- **Remaining 17 failures:**
-  - Union switch: struct as scalar (7) — IR_BRANCH emits raw union, needs ._tag
+- **Additional fixes applied (91%→92%):**
+  - Async static locals: `static` declaration in poll function, excluded from self-> prefix
+  - Void capture skip: ?void if-unwrap capture not added as IR local
+  - Comptime-if: dead branch stripped in collect_locals + lower_stmt
+- **Remaining 15 failures:**
+  - Union switch: struct as scalar (7) — IR_BRANCH emits raw union, needs ._tag access
   - Async yield in GCC stmt expr (4) — Duff's device case inside ({...})
-  - Misc (6): async_static_local (static local not in IR), comptime_const_if (dead branch not stripped), void_optional_init (?void type), optional_patterns (struct Result unwrap), slice_subslice (array→slice coercion), callback_system (continue scope)
-- **Next:** fix remaining 17. Then flip default to IR, delete AST emission.
+  - callback_system (continue in defer body — no C loop in IR context)
+  - optional_patterns (struct Result unwrap)
+  - slice_subslice (array→slice coercion in assignment)
+  - void_optional_init (?void other emission issue)
+- **Next:** fix remaining 15. Then flip default to IR, delete AST emission.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

@@ -6628,16 +6628,38 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_BINOP: {
-        /* Emit: dest = src1 OP src2
-         * For now, uses emit_expr on the original expression for correctness.
-         * TODO: emit from local IDs once all type adaptation is handled. */
-        if (inst->dest_local >= 0 && inst->expr) {
+        /* Emit: dest = src1 OP src2 — from local IDs */
+        if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->src2_local >= 0) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            IRLocal *s1 = &func->locals[inst->src1_local];
+            IRLocal *s2 = &func->locals[inst->src2_local];
+            const char *sp = func->is_async ? "self->" : "";
+            const char *op = "?";
+            switch (inst->op_token) {
+            case TOK_PLUS: op = "+"; break; case TOK_MINUS: op = "-"; break;
+            case TOK_STAR: op = "*"; break; case TOK_SLASH: op = "/"; break;
+            case TOK_PERCENT: op = "%"; break;
+            case TOK_AMP: op = "&"; break; case TOK_PIPE: op = "|"; break;
+            case TOK_CARET: op = "^"; break;
+            case TOK_LSHIFT: op = "<<"; break; case TOK_RSHIFT: op = ">>"; break;
+            case TOK_EQEQ: op = "=="; break; case TOK_BANGEQ: op = "!="; break;
+            case TOK_LT: op = "<"; break; case TOK_GT: op = ">"; break;
+            case TOK_LTEQ: op = "<="; break; case TOK_GTEQ: op = ">="; break;
+            case TOK_AMPAMP: op = "&&"; break; case TOK_PIPEPIPE: op = "||"; break;
+            default: break;
+            }
+            emit_indent(e);
+            emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
+                 sp, (int)dst->name_len, dst->name,
+                 sp, (int)s1->name_len, s1->name,
+                 op,
+                 sp, (int)s2->name_len, s2->name);
+        } else if (inst->dest_local >= 0 && inst->expr) {
+            /* Fallback: one side wasn't a local (passthrough) */
             IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
-            if (func->is_async)
-                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else
-                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
             emit_expr(e, inst->expr);
             emit(e, ";\n");
         }
@@ -6645,27 +6667,73 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_UNOP: {
-        if (inst->dest_local >= 0 && inst->expr) {
+        /* Emit: dest = OP src — from local IDs */
+        if (inst->dest_local >= 0 && inst->src1_local >= 0) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            IRLocal *s1 = &func->locals[inst->src1_local];
+            const char *sp = func->is_async ? "self->" : "";
+            const char *op = "";
+            switch (inst->op_token) {
+            case TOK_MINUS: op = "-"; break;
+            case TOK_BANG: op = "!"; break;
+            case TOK_TILDE: op = "~"; break;
+            case TOK_STAR: /* deref */
+                emit_indent(e);
+                emit(e, "%s%.*s = *%s%.*s;\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name);
+                goto unop_done;
+            case TOK_AMP: /* addr-of */
+                emit_indent(e);
+                emit(e, "%s%.*s = &%s%.*s;\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name);
+                goto unop_done;
+            default: break;
+            }
+            emit_indent(e);
+            emit(e, "%s%.*s = %s%s%.*s;\n",
+                 sp, (int)dst->name_len, dst->name,
+                 op, sp, (int)s1->name_len, s1->name);
+        } else if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
-            if (func->is_async)
-                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else
-                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
             emit_expr(e, inst->expr);
             emit(e, ";\n");
         }
+        unop_done:
         break;
     }
 
     case IR_FIELD_READ: {
-        if (inst->dest_local >= 0 && inst->expr) {
+        /* Emit: dest = src.field — from local IDs.
+         * Complex cases (handle auto-deref, volatile, bounds) → emit_expr fallback. */
+        if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->field_name) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            IRLocal *s1 = &func->locals[inst->src1_local];
+            Type *st = s1->type ? type_unwrap_distinct(s1->type) : NULL;
+            /* Handle/opaque/complex → emit_expr (has auto-deref, gen check, etc.) */
+            if (st && (st->kind == TYPE_HANDLE || st->kind == TYPE_OPAQUE ||
+                       st->kind == TYPE_POOL || st->kind == TYPE_SLAB ||
+                       st->kind == TYPE_RING || st->kind == TYPE_ARENA)) {
+                goto field_read_fallback;
+            }
+            const char *sp = func->is_async ? "self->" : "";
+            const char *accessor = ".";
+            if (st && st->kind == TYPE_POINTER) accessor = "->";
+            emit_indent(e);
+            emit(e, "%s%.*s = %s%.*s%s%.*s;\n",
+                 sp, (int)dst->name_len, dst->name,
+                 sp, (int)s1->name_len, s1->name,
+                 accessor,
+                 (int)inst->field_name_len, inst->field_name);
+        } else field_read_fallback: if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
-            if (func->is_async)
-                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else
-                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
             emit_expr(e, inst->expr);
             emit(e, ";\n");
         }
@@ -6673,13 +6741,32 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_INDEX_READ: {
-        if (inst->dest_local >= 0 && inst->expr) {
+        /* Emit: dest = src[idx] — from local IDs */
+        if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->src2_local >= 0) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            IRLocal *s1 = &func->locals[inst->src1_local];
+            IRLocal *s2 = &func->locals[inst->src2_local];
+            const char *sp = func->is_async ? "self->" : "";
+            /* Slice uses .ptr[] */
+            Type *st = s1->type ? type_unwrap_distinct(s1->type) : NULL;
+            if (st && st->kind == TYPE_SLICE) {
+                emit_indent(e);
+                emit(e, "%s%.*s = %s%.*s.ptr[%s%.*s];\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name,
+                     sp, (int)s2->name_len, s2->name);
+            } else {
+                emit_indent(e);
+                emit(e, "%s%.*s = %s%.*s[%s%.*s];\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name,
+                     sp, (int)s2->name_len, s2->name);
+            }
+        } else if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
-            if (func->is_async)
-                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else
-                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
             emit_expr(e, inst->expr);
             emit(e, ";\n");
         }

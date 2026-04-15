@@ -1371,11 +1371,19 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
             case TYNODE_BOOL: pt = ty_bool; break;
             case TYNODE_VOID: pt = ty_void; break;
             default: {
-                /* Complex type — look up in global scope by param name.
-                 * This works because checker registered all symbols. */
-                Symbol *psym = scope_lookup(checker->global_scope,
-                    p->name, (uint32_t)p->name_len);
-                if (psym && psym->type) pt = psym->type;
+                /* Complex type — use checker's func_type for accurate param types.
+                 * The TypeNode switch above only handles primitives.
+                 * Pointer, struct, optional, etc. need checker resolution. */
+                Type *func_type = checker_get_type(checker, func_decl);
+                if (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                    (uint32_t)i < func_type->func_ptr.param_count) {
+                    pt = func_type->func_ptr.params[i];
+                } else {
+                    /* Fallback: look up in scope */
+                    Symbol *psym = scope_lookup(checker->global_scope,
+                        p->name, (uint32_t)p->name_len);
+                    if (psym && psym->type) pt = psym->type;
+                }
                 break;
             }
             }

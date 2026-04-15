@@ -58,6 +58,8 @@ static IRInst make_inst(IROpKind op, int line) {
     inst.false_block = -1;
     inst.goto_block = -1;
     inst.cond_local = -1;
+    inst.src1_local = -1;
+    inst.src2_local = -1;
     inst.source_line = line;
     return inst;
 }
@@ -96,141 +98,9 @@ static int find_label_block(LowerCtx *ctx, const char *name, uint32_t len) {
     return bid;
 }
 
-/* ================================================================
- * Phase 1: Collect ALL locals from function body
- *
- * This is the key advantage of IR — complete local list.
- * Walks entire AST, finds params + var_decls + captures + temps.
- * No enumeration to forget — collects everything recursively.
- * ================================================================ */
-
-static void collect_locals(LowerCtx *ctx, Node *node) {
-    if (!node) return;
-
-    switch (node->kind) {
-    case NODE_VAR_DECL:
-        if (!node->var_decl.is_static) {
-            Type *vt = checker_get_type(ctx->checker, node);
-            ir_add_local(ctx->func, ctx->arena,
-                         node->var_decl.name, (uint32_t)node->var_decl.name_len,
-                         vt, false, false, false, node->loc.line);
-        }
-        /* Also collect from initializer (may contain nested var_decls in blocks) */
-        collect_locals(ctx, node->var_decl.init);
-        break;
-
-    case NODE_IF:
-        /* comptime if: only collect locals from the taken branch */
-        if (node->if_stmt.is_comptime) {
-            int64_t cval = eval_const_expr(node->if_stmt.cond);
-            if (cval) {
-                collect_locals(ctx, node->if_stmt.then_body);
-            } else {
-                collect_locals(ctx, node->if_stmt.else_body);
-            }
-            break;
-        }
-        /* If-unwrap capture — THE fix for async capture ghost */
-        if (node->if_stmt.capture_name) {
-            Type *cond_type = checker_get_type(ctx->checker, node->if_stmt.cond);
-            Type *cap_type = NULL;
-            if (cond_type) {
-                Type *eff = type_unwrap_distinct(cond_type);
-                if (eff && eff->kind == TYPE_OPTIONAL) {
-                    cap_type = eff->optional.inner;
-                    if (node->if_stmt.capture_is_ptr && cap_type) {
-                        cap_type = type_pointer(ctx->arena, cap_type);
-                    }
-                }
-            }
-            if (cap_type && cap_type->kind != TYPE_VOID) {
-                /* Skip void captures (?void has no value field) */
-                ir_add_local(ctx->func, ctx->arena,
-                             node->if_stmt.capture_name,
-                             (uint32_t)node->if_stmt.capture_name_len,
-                             cap_type, false, true, false, node->loc.line);
-            }
-        }
-        collect_locals(ctx, node->if_stmt.cond);
-        collect_locals(ctx, node->if_stmt.then_body);
-        collect_locals(ctx, node->if_stmt.else_body);
-        break;
-
-    case NODE_SWITCH:
-        collect_locals(ctx, node->switch_stmt.expr);
-        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
-            /* Switch arm captures */
-            if (node->switch_stmt.arms[i].capture_name) {
-                /* For union switch captures, we need the variant type.
-                 * Use checker typemap on the arm body for type info. */
-                Type *sw_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
-                Type *cap_type = NULL;
-                if (sw_type) {
-                    Type *sw_eff = type_unwrap_distinct(sw_type);
-                    if (sw_eff && sw_eff->kind == TYPE_UNION) {
-                        /* Find variant type from arm values */
-                        for (int vi = 0; vi < node->switch_stmt.arms[i].value_count; vi++) {
-                            Node *val = node->switch_stmt.arms[i].values[vi];
-                            if (val && val->kind == NODE_FIELD) {
-                                /* .variant_name → find field in union */
-                                const char *vn = val->field.field_name;
-                                uint32_t vl = (uint32_t)val->field.field_name_len;
-                                for (uint32_t fi = 0; fi < sw_eff->union_type.variant_count; fi++) {
-                                    if (sw_eff->union_type.variants[fi].name_len == vl &&
-                                        memcmp(sw_eff->union_type.variants[fi].name, vn, vl) == 0) {
-                                        cap_type = sw_eff->union_type.variants[fi].type;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (cap_type && node->switch_stmt.arms[i].capture_is_ptr) {
-                            cap_type = type_pointer(ctx->arena, cap_type);
-                        }
-                    } else if (sw_eff && sw_eff->kind == TYPE_OPTIONAL) {
-                        cap_type = sw_eff->optional.inner;
-                    }
-                }
-                if (cap_type) {
-                    ir_add_local(ctx->func, ctx->arena,
-                                 node->switch_stmt.arms[i].capture_name,
-                                 (uint32_t)node->switch_stmt.arms[i].capture_name_len,
-                                 cap_type, false, true, false, node->loc.line);
-                }
-            }
-            collect_locals(ctx, node->switch_stmt.arms[i].body);
-        }
-        break;
-
-    case NODE_SPAWN:
-        /* Spawn passed through to AST emit_stmt which declares pthread_t.
-         * DON'T add handle local here — would conflict with AST's declaration. */
-        break;
-
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            collect_locals(ctx, node->block.stmts[i]);
-        break;
-    case NODE_FOR:
-        collect_locals(ctx, node->for_stmt.init);
-        collect_locals(ctx, node->for_stmt.body);
-        break;
-    case NODE_WHILE: case NODE_DO_WHILE:
-        collect_locals(ctx, node->while_stmt.body);
-        break;
-    case NODE_DEFER:
-        collect_locals(ctx, node->defer.body);
-        break;
-    case NODE_CRITICAL:
-        collect_locals(ctx, node->critical.body);
-        break;
-    case NODE_ONCE:
-        collect_locals(ctx, node->once.body);
-        break;
-    default:
-        break;
-    }
-}
+/* collect_locals REMOVED — locals now created on-demand in lower_stmt.
+ * This ensures sequential processing order for scope conflict resolution.
+ * See ir_add_local: same name + different type → suffixed unique local. */
 
 /* ================================================================
  * Phase 2: Pre-scan for labels (goto targets need blocks created early)
@@ -267,8 +137,213 @@ static void collect_labels(LowerCtx *ctx, Node *node) {
  * Phase 3: Lower statements → IR instructions + basic blocks
  * ================================================================ */
 
-/* Forward declaration */
+/* Forward declarations */
 static void lower_stmt(LowerCtx *ctx, Node *node);
+static void rewrite_idents(LowerCtx *ctx, Node *expr);
+/* lower_expr decomposes expressions into three-address-code.
+ * Used during incremental migration — not all paths call it yet. */
+static int lower_expr(LowerCtx *ctx, Node *expr) __attribute__((unused));
+
+/* ================================================================
+ * Three-address-code expression decomposition
+ *
+ * lower_expr(ctx, node) → returns local_id holding the result.
+ * Every sub-expression is decomposed into a temp local + instruction.
+ * Variable references use local IDs (ir_find_local), not source names.
+ * This is the core of the three-address-code transition.
+ * ================================================================ */
+
+/* Create a temp local for intermediate results */
+static int create_temp(LowerCtx *ctx, Type *type, int line) {
+    char buf[32];
+    int tl = snprintf(buf, sizeof(buf), "_zer_t%d", ctx->temp_count++);
+    char *name = (char *)arena_alloc(ctx->arena, tl + 1);
+    memcpy(name, buf, tl + 1);
+    return ir_add_local(ctx->func, ctx->arena,
+                        name, (uint32_t)tl, type,
+                        false, false, true, line);
+}
+
+/* Emit helper: creates instruction, adds to current block */
+static void emit_3ac(LowerCtx *ctx, IRInst inst) {
+    ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
+}
+
+/* Lower one expression to a local ID.
+ * Creates temp locals and emits instructions for each sub-expression.
+ * Returns the local ID holding the result, or -1 for void/error. */
+static int lower_expr(LowerCtx *ctx, Node *expr) {
+    if (!expr) return -1;
+
+    switch (expr->kind) {
+
+    /* ---- Variable reference: just return the local ID ---- */
+    case NODE_IDENT: {
+        int id = ir_find_local(ctx->func,
+                               expr->ident.name,
+                               (uint32_t)expr->ident.name_len);
+        if (id >= 0) return id;
+        /* Not a local (could be a global, enum value, function name, etc.)
+         * Fall through to passthrough — emit_expr handles these. */
+        goto passthrough;
+    }
+
+    /* ---- Literals: create temp with constant value ---- */
+    case NODE_INT_LIT: {
+        Type *lt = checker_get_type(ctx->checker, expr);
+        if (!lt) lt = ty_u64;
+        int tmp = create_temp(ctx, lt, expr->loc.line);
+        IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.literal_int = (int64_t)expr->int_lit.value;
+        inst.literal_kind = 0; /* int */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+    case NODE_FLOAT_LIT: {
+        Type *lt = checker_get_type(ctx->checker, expr);
+        if (!lt) lt = ty_f64;
+        int tmp = create_temp(ctx, lt, expr->loc.line);
+        IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.literal_float = expr->float_lit.value;
+        inst.literal_kind = 1; /* float */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+    case NODE_BOOL_LIT: {
+        int tmp = create_temp(ctx, ty_bool, expr->loc.line);
+        IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.literal_int = expr->bool_lit.value ? 1 : 0;
+        inst.literal_kind = 3; /* bool */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+    case NODE_CHAR_LIT: {
+        int tmp = create_temp(ctx, ty_u8, expr->loc.line);
+        IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.literal_int = (int64_t)expr->char_lit.value;
+        inst.literal_kind = 5; /* char */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+    case NODE_NULL_LIT: {
+        Type *lt = checker_get_type(ctx->checker, expr);
+        int tmp = create_temp(ctx, lt, expr->loc.line);
+        IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.literal_kind = 4; /* null */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+    case NODE_STRING_LIT: {
+        Type *lt = checker_get_type(ctx->checker, expr);
+        int tmp = create_temp(ctx, lt, expr->loc.line);
+        IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.literal_str = expr->string_lit.value;
+        inst.literal_str_len = (uint32_t)expr->string_lit.length;
+        inst.literal_kind = 2; /* string */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Binary operations: decompose both sides ---- */
+    case NODE_BINARY: {
+        int left = lower_expr(ctx, expr->binary.left);
+        int right = lower_expr(ctx, expr->binary.right);
+        Type *rt = checker_get_type(ctx->checker, expr);
+        if (!rt) rt = ty_i32;
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        IRInst inst = make_inst(IR_BINOP, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.src1_local = left;
+        inst.src2_local = right;
+        inst.op_token = expr->binary.op;
+        inst.expr = expr; /* keep for type info during emission */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Unary operations: decompose operand ---- */
+    case NODE_UNARY: {
+        int operand = lower_expr(ctx, expr->unary.operand);
+        Type *rt = checker_get_type(ctx->checker, expr);
+        if (!rt) rt = ty_i32;
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        IRInst inst = make_inst(IR_UNOP, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.src1_local = operand;
+        inst.op_token = expr->unary.op;
+        inst.expr = expr; /* keep for address-of (&) detection */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Field access: decompose object ---- */
+    case NODE_FIELD: {
+        int obj = lower_expr(ctx, expr->field.object);
+        Type *rt = checker_get_type(ctx->checker, expr);
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        IRInst inst = make_inst(IR_FIELD_READ, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.src1_local = obj;
+        inst.field_name = expr->field.field_name;
+        inst.field_name_len = (uint32_t)expr->field.field_name_len;
+        inst.expr = expr; /* keep for emit_expr fallback during migration */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Index access: decompose object and index ---- */
+    case NODE_INDEX: {
+        int obj = lower_expr(ctx, expr->index_expr.object);
+        int idx = lower_expr(ctx, expr->index_expr.index);
+        Type *rt = checker_get_type(ctx->checker, expr);
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        IRInst inst = make_inst(IR_INDEX_READ, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.src1_local = obj;
+        inst.src2_local = idx;
+        inst.expr = expr; /* keep for bounds check info */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Complex expressions: passthrough to emit_expr during migration ---- */
+    /* These keep Node *expr and use emit_expr. They'll be decomposed
+     * incrementally as the three-address-code migration continues. */
+    case NODE_CALL:
+    case NODE_INTRINSIC:
+    case NODE_ORELSE:
+    case NODE_SLICE:
+    case NODE_STRUCT_INIT:
+    case NODE_TYPECAST:
+    default:
+    passthrough: {
+        /* Create temp, emit IR_ASSIGN with expr (passthrough to emit_expr).
+         * This is the migration bridge — allows incremental transition. */
+        rewrite_idents(ctx, expr);
+        Type *rt = checker_get_type(ctx->checker, expr);
+        if (!rt) rt = ty_void;
+        /* Void expressions don't produce a value */
+        if (rt->kind == TYPE_VOID) {
+            IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
+            inst.expr = expr;
+            emit_3ac(ctx, inst);
+            return -1;
+        }
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.expr = expr;
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+    }
+}
 
 /* Check if a block always exits (return/break/continue/goto)
  * Used by future analysis passes on IR. */
@@ -386,6 +461,81 @@ static void emit_defer_fire(LowerCtx *ctx, int line) {
 }
 
 /* ================================================================
+ * Expression ident rewriting — three-address-code foundation
+ *
+ * When ir_add_local creates a suffixed local (same name, different type),
+ * expression trees still reference the original source name. This function
+ * walks an expression tree and rewrites NODE_IDENTs to use the IR local's
+ * actual C name (which may be suffixed). Safe because IR lowering is the
+ * last consumer of these AST nodes.
+ * ================================================================ */
+
+static void rewrite_idents(LowerCtx *ctx, Node *expr) {
+    if (!expr) return;
+
+    switch (expr->kind) {
+    case NODE_IDENT: {
+        int id = ir_find_local(ctx->func, expr->ident.name,
+                               (uint32_t)expr->ident.name_len);
+        if (id >= 0) {
+            IRLocal *l = &ctx->func->locals[id];
+            /* If C name differs from source name, rewrite the AST node */
+            if (l->name_len != (uint32_t)expr->ident.name_len ||
+                memcmp(l->name, expr->ident.name, l->name_len) != 0) {
+                expr->ident.name = l->name;
+                expr->ident.name_len = (int)l->name_len;
+            }
+        }
+        break;
+    }
+    case NODE_BINARY:
+        rewrite_idents(ctx, expr->binary.left);
+        rewrite_idents(ctx, expr->binary.right);
+        break;
+    case NODE_UNARY:
+        rewrite_idents(ctx, expr->unary.operand);
+        break;
+    case NODE_CALL:
+        rewrite_idents(ctx, expr->call.callee);
+        for (int i = 0; i < expr->call.arg_count; i++)
+            rewrite_idents(ctx, expr->call.args[i]);
+        break;
+    case NODE_FIELD:
+        rewrite_idents(ctx, expr->field.object);
+        break;
+    case NODE_INDEX:
+        rewrite_idents(ctx, expr->index_expr.object);
+        rewrite_idents(ctx, expr->index_expr.index);
+        break;
+    case NODE_ASSIGN:
+        rewrite_idents(ctx, expr->assign.target);
+        rewrite_idents(ctx, expr->assign.value);
+        break;
+    case NODE_ORELSE:
+        rewrite_idents(ctx, expr->orelse.expr);
+        rewrite_idents(ctx, expr->orelse.fallback);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < expr->intrinsic.arg_count; i++)
+            rewrite_idents(ctx, expr->intrinsic.args[i]);
+        break;
+    case NODE_SLICE:
+        rewrite_idents(ctx, expr->slice.object);
+        rewrite_idents(ctx, expr->slice.start);
+        rewrite_idents(ctx, expr->slice.end);
+        break;
+    /* NODE_ADDR_OF and NODE_DEREF are both NODE_UNARY — handled above */
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            rewrite_idents(ctx, expr->struct_init.fields[i].value);
+        break;
+    default:
+        /* Literals, null, etc. — no idents to rewrite */
+        break;
+    }
+}
+
+/* ================================================================
  * Orelse lowering — proper branch pattern, not expression hack
  *
  * val = expr orelse return;  →
@@ -423,6 +573,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
 
     /* Emit: tmp = expr */
     Node *inner = orelse_node->orelse.expr;
+    rewrite_idents(ctx, inner);
     int obj_local, handle_local;
     IROpKind builtin = classify_builtin_call(ctx, inner, &obj_local, &handle_local);
     if (builtin != IR_NOP) {
@@ -545,9 +696,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     /* ---- Variable declaration: assign to local ---- */
     case NODE_VAR_DECL: {
         if (node->var_decl.is_static) break; /* static handled differently */
-        int local_id = ir_find_local(ctx->func,
-            node->var_decl.name, (uint32_t)node->var_decl.name_len);
+        /* On-demand local creation — creates at the point encountered during
+         * sequential lowering. For scope conflicts (same name, different type),
+         * ir_add_local creates a suffixed local. */
+        Type *vt = checker_get_type(ctx->checker, node);
+        int local_id = ir_add_local(ctx->func, ctx->arena,
+            node->var_decl.name, (uint32_t)node->var_decl.name_len,
+            vt, false, false, false, node->loc.line);
         if (local_id >= 0 && node->var_decl.init) {
+            /* Rewrite idents in init expression to use correct local names */
+            rewrite_idents(ctx, node->var_decl.init);
             /* Orelse lowered to IR branches when GCC stmt expr won't work:
              * - Async (Duff's case can't go inside ({...}))
              * - Inside loop (IR uses gotos — C break/continue won't work)
@@ -586,6 +744,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_EXPR_STMT: {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
+
+        /* Rewrite idents in expression to use correct local names */
+        rewrite_idents(ctx, expr);
 
         /* Orelse to IR branches when async or inside loop */
         {
@@ -656,8 +817,29 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                       ir_add_block(ctx->func, ctx->arena) : -1;
         int bb_join = ir_add_block(ctx->func, ctx->arena);
 
-        /* If-unwrap capture: emit assignment in then-block */
+        /* If-unwrap capture: create local on-demand */
         bool has_capture = (node->if_stmt.capture_name != NULL);
+        if (has_capture) {
+            Type *cond_type = checker_get_type(ctx->checker, node->if_stmt.cond);
+            Type *cap_type = NULL;
+            if (cond_type) {
+                Type *eff = type_unwrap_distinct(cond_type);
+                if (eff && eff->kind == TYPE_OPTIONAL) {
+                    cap_type = eff->optional.inner;
+                    if (node->if_stmt.capture_is_ptr && cap_type)
+                        cap_type = type_pointer(ctx->arena, cap_type);
+                }
+            }
+            if (cap_type && cap_type->kind != TYPE_VOID) {
+                ir_add_local(ctx->func, ctx->arena,
+                    node->if_stmt.capture_name,
+                    (uint32_t)node->if_stmt.capture_name_len,
+                    cap_type, false, true, false, node->loc.line);
+            }
+        }
+
+        /* Rewrite idents in condition expression */
+        rewrite_idents(ctx, node->if_stmt.cond);
 
         /* Branch on condition */
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
@@ -719,6 +901,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Cond block */
         ctx->current_block = bb_cond;
         if (node->for_stmt.cond) {
+            rewrite_idents(ctx, node->for_stmt.cond);
             IRInst br = make_inst(IR_BRANCH, node->loc.line);
             br.expr = node->for_stmt.cond;
             br.true_block = bb_body;
@@ -739,6 +922,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Step block */
         ctx->current_block = bb_step;
         if (node->for_stmt.step) {
+            rewrite_idents(ctx, node->for_stmt.step);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             emit_inst(ctx, step);
@@ -771,11 +955,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ensure_terminated(ctx, bb_cond);
 
         ctx->current_block = bb_cond;
+        rewrite_idents(ctx, node->while_stmt.cond);
+        {
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.expr = node->while_stmt.cond;
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
+        }
 
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->while_stmt.body);
@@ -811,11 +998,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         /* Then condition */
         ctx->current_block = bb_cond;
+        rewrite_idents(ctx, node->while_stmt.cond);
+        {
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.expr = node->while_stmt.cond;
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
+        }
 
         ctx->current_block = bb_exit;
 
@@ -864,8 +1054,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Arm body */
             ctx->current_block = bb_arm;
 
-            /* Switch capture assignment */
+            /* Switch capture: create local on-demand + assignment */
             if (node->switch_stmt.arms[i].capture_name) {
+                /* Create capture local if not already present */
+                Type *cap_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
+                if (cap_type) {
+                    ir_add_local(ctx->func, ctx->arena,
+                        node->switch_stmt.arms[i].capture_name,
+                        (uint32_t)node->switch_stmt.arms[i].capture_name_len,
+                        cap_type, false, true, false, node->loc.line);
+                }
                 int cap_id = ir_find_local(ctx->func,
                     node->switch_stmt.arms[i].capture_name,
                     (uint32_t)node->switch_stmt.arms[i].capture_name_len);
@@ -959,19 +1157,24 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Yield ---- */
     case NODE_YIELD: {
+        /* Create resume block FIRST so we know its ID */
+        int resume_bb = ir_add_block(ctx->func, ctx->arena);
         IRInst y = make_inst(IR_YIELD, node->loc.line);
+        y.goto_block = resume_bb; /* emitter uses this for goto after case label */
         emit_inst(ctx, y);
-        /* Yield terminates block — start new block for resume point */
-        start_block(ctx);
+        ctx->current_block = resume_bb;
         break;
     }
 
     /* ---- Await ---- */
     case NODE_AWAIT: {
+        int resume_bb = ir_add_block(ctx->func, ctx->arena);
         IRInst aw = make_inst(IR_AWAIT, node->loc.line);
         aw.expr = node->await_stmt.cond;
+        rewrite_idents(ctx, node->await_stmt.cond);
+        aw.goto_block = resume_bb;
         emit_inst(ctx, aw);
-        start_block(ctx);
+        ctx->current_block = resume_bb;
         break;
     }
 
@@ -1108,8 +1311,11 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
                      pt, true, false, false, p->loc.line);
     }
 
-    /* Phase 1b: Collect all var_decls + captures recursively */
-    collect_locals(&ctx, func_decl->func_decl.body);
+    /* Phase 1b: Locals created on-demand during lower_stmt.
+     * This ensures sequential processing order — scope-conflicting locals
+     * (same name, different type) are created at the right time.
+     * With upfront collect_locals, both would exist before any lowering,
+     * making ir_find_local (last-match) return the wrong one. */
 
     /* Phase 2: Pre-scan for labels */
     collect_labels(&ctx, func_decl->func_decl.body);
@@ -1153,7 +1359,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
 
-    collect_locals(&ctx, interrupt->interrupt.body);
+    /* Locals created on-demand during lower_stmt */
     collect_labels(&ctx, interrupt->interrupt.body);
 
     start_block(&ctx);

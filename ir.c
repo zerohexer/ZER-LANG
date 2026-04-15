@@ -37,11 +37,32 @@ IRFunc *ir_func_new(Arena *arena, const char *name, uint32_t name_len, Type *ret
 int ir_add_local(IRFunc *func, Arena *arena,
                  const char *name, uint32_t name_len, Type *type,
                  bool is_param, bool is_capture, bool is_temp, int line) {
-    /* Dedup: if local with same name already exists, return its ID */
+    /* Save original name before potential suffix */
+    const char *orig_name = name;
+    uint32_t orig_name_len = name_len;
+
+    /* Dedup: same name AND same type → return existing.
+     * Same name, DIFFERENT type (e.g., Msg m vs ?Msg m in different scopes)
+     * → create new local with unique suffix. This is the key to solving
+     * scope conflicts without full scope tracking. */
     for (int i = 0; i < func->local_count; i++) {
-        if (func->locals[i].name_len == name_len &&
-            memcmp(func->locals[i].name, name, name_len) == 0) {
-            return func->locals[i].id;
+        if (func->locals[i].orig_name_len == name_len &&
+            memcmp(func->locals[i].orig_name, name, name_len) == 0) {
+            /* Same type (or either is NULL) → dedup */
+            if (!type || !func->locals[i].type || type == func->locals[i].type) {
+                return func->locals[i].id;
+            }
+            /* Different type → create new local with suffixed name.
+             * Arena-allocate so it persists. */
+            char buf[64];
+            int slen = snprintf(buf, sizeof(buf), "%.*s_%d",
+                                (int)name_len, name, func->local_count);
+            if (slen >= (int)sizeof(buf)) slen = (int)sizeof(buf) - 1;
+            char *sname = (char *)arena_alloc(arena, slen + 1);
+            memcpy(sname, buf, slen + 1);
+            name = sname;
+            name_len = (uint32_t)slen;
+            break; /* fall through to create new local */
         }
     }
 
@@ -61,6 +82,8 @@ int ir_add_local(IRFunc *func, Arena *arena,
     local->id = id;
     local->name = name;
     local->name_len = name_len;
+    local->orig_name = orig_name;
+    local->orig_name_len = orig_name_len;
     local->type = type;
     local->is_param = is_param;
     local->is_capture = is_capture;
@@ -70,12 +93,18 @@ int ir_add_local(IRFunc *func, Arena *arena,
 }
 
 int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
+    /* Search by orig_name (source name before any suffix).
+     * Return LAST match — most recently created local with this source name.
+     * With on-demand local creation, later-scoped locals are created after
+     * earlier ones. Returning last match gives innermost scope naturally. */
+    int best = -1;
     for (int i = 0; i < func->local_count; i++) {
-        if (func->locals[i].name_len == name_len &&
-            memcmp(func->locals[i].name, name, name_len) == 0)
-            return func->locals[i].id;
+        if (func->locals[i].orig_name_len == name_len &&
+            memcmp(func->locals[i].orig_name, name, name_len) == 0) {
+            best = func->locals[i].id;
+        }
     }
-    return -1;
+    return best;
 }
 
 int ir_add_block(IRFunc *func, Arena *arena) {
@@ -301,6 +330,22 @@ static const char *ir_op_name(IROpKind op) {
     case IR_DEFER_PUSH:       return "DEFER_PUSH";
     case IR_DEFER_FIRE:       return "DEFER_FIRE";
     case IR_INTRINSIC:        return "INTRINSIC";
+    case IR_COPY:             return "COPY";
+    case IR_BINOP:            return "BINOP";
+    case IR_UNOP:             return "UNOP";
+    case IR_FIELD_READ:       return "FIELD_READ";
+    case IR_FIELD_WRITE:      return "FIELD_WRITE";
+    case IR_INDEX_READ:       return "INDEX_READ";
+    case IR_INDEX_WRITE:      return "INDEX_WRITE";
+    case IR_LITERAL:          return "LITERAL";
+    case IR_ADDR_OF:          return "ADDR_OF";
+    case IR_DEREF_READ:       return "DEREF_READ";
+    case IR_CALL_DECOMP:      return "CALL_DECOMP";
+    case IR_CAST:             return "CAST";
+    case IR_INTRINSIC_DECOMP: return "INTRINSIC_DECOMP";
+    case IR_ORELSE_DECOMP:    return "ORELSE_DECOMP";
+    case IR_SLICE_READ:       return "SLICE_READ";
+    case IR_STRUCT_INIT_DECOMP: return "STRUCT_INIT_DECOMP";
     case IR_NOP:              return "NOP";
     }
     return "???";

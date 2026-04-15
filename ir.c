@@ -94,13 +94,20 @@ int ir_add_local(IRFunc *func, Arena *arena,
 
 int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
     /* Search by orig_name (source name before any suffix).
-     * Return LAST match — most recently created local with this source name.
+     * Also search by C name (after suffix) for rewritten idents.
+     * Return LAST match — most recently created local with this name.
      * With on-demand local creation, later-scoped locals are created after
      * earlier ones. Returning last match gives innermost scope naturally. */
     int best = -1;
     for (int i = 0; i < func->local_count; i++) {
+        /* Match by original source name */
         if (func->locals[i].orig_name_len == name_len &&
             memcmp(func->locals[i].orig_name, name, name_len) == 0) {
+            best = func->locals[i].id;
+        }
+        /* Also match by C emission name (for rewritten idents) */
+        if (func->locals[i].name_len == name_len &&
+            memcmp(func->locals[i].name, name, name_len) == 0) {
             best = func->locals[i].id;
         }
     }

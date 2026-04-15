@@ -143,7 +143,8 @@ static void collect_locals(LowerCtx *ctx, Node *node) {
                     }
                 }
             }
-            if (cap_type) {
+            if (cap_type && cap_type->kind != TYPE_VOID) {
+                /* Skip void captures (?void has no value field) */
                 ir_add_local(ctx->func, ctx->arena,
                              node->if_stmt.capture_name,
                              (uint32_t)node->if_stmt.capture_name_len,

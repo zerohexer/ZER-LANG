@@ -24,7 +24,10 @@ Total: ~2042 new lines. All 4000+ tests pass.
 All fixes: param types from AST, return optional wrapping, IR_BRANCH .has_value + cond_local, IR_ASSIGN unwrap/wrap/null, bb0 label, async self->, arg order, #line disabled, defer stack clear, spawn handle, comptime-if dead branch, async static locals, void capture skip, union/optional switch passthrough.
 **195/195 (100%).** All ZER positive tests compile on IR path.
 Final fixes: scoped captures with C `{ }` for type-conflicting if-unwrap (optional_patterns), dangling orelse temp name arena-allocated (super_uart_parser), ?void hoist before `dest =` prefix (void_optional_init), ?void return wrapping hoist (try_validate).
-51 commits this session. IR from 0% to 100%. Next: test 786 rust + 36 zig + 74 negative + module tests on --use-ir path.
+53 commits this session. IR from 0% to 100% compile, 96% runtime.
+Runtime tested: 187/195 correct, 8 hang. Hangs: async_do_while_yield, async_if_capture_yield, async_while_break_yield, bytecode_vm, circular_log, condvar_signal, mini_ecs, tokenizer.
+Root cause: do-while+yield extra back-edge, while(true)+enum switch break targets nothing.
+Other suites: 74/74 negative, 21/21 rust negative, 541/761 rust positive compile, 31/36 zig compile.
 
 23 of 29 safety systems on IR, 6 on checker (pre-IR infrastructure). Rule: "what does it mean?" → checker, "is it safe?" → IR.
 

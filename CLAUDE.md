@@ -494,7 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
-| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir flag, **195/195 (100%)** compile. Ready to flip default. Still need: run 786 rust_tests + 36 zig_tests + 74 negative tests on IR path to confirm full coverage. |
+| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir flag, **195/195 compile, 187/195 runtime (96%)**. 8 runtime hangs: async loops + while(true) with enum switch. 74/74 negative + 21/21 rust negative pass. 541/761 rust positive compile (71%). |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

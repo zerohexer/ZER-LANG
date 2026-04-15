@@ -541,24 +541,29 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int local_id = ir_find_local(ctx->func,
             node->var_decl.name, (uint32_t)node->var_decl.name_len);
         if (local_id >= 0 && node->var_decl.init) {
-            /* Check if init is a builtin call */
-            int obj_local, handle_local;
-            IROpKind builtin = classify_builtin_call(ctx, node->var_decl.init,
-                                                      &obj_local, &handle_local);
-            if (builtin != IR_NOP) {
-                IRInst inst = make_inst(builtin, node->loc.line);
-                inst.dest_local = local_id;
-                inst.obj_local = obj_local;
-                inst.handle_local = handle_local;
-                inst.expr = node->var_decl.init;
-                emit_inst(ctx, inst);
+            /* In async functions: orelse must be lowered to IR branches
+             * (can't use GCC stmt expr — Duff's case labels can't go inside ({...})) */
+            Node *orelse = find_orelse(node->var_decl.init);
+            if (orelse && ctx->func->is_async) {
+                lower_orelse_to_dest(ctx, local_id, orelse, node->loc.line);
             } else {
-                /* For orelse: emit_expr handles it via GCC statement expression.
-                 * IR_ASSIGN unwrap (.value) handles type mismatch at emission. */
-                IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-                inst.dest_local = local_id;
-                inst.expr = node->var_decl.init;
-                emit_inst(ctx, inst);
+                /* Check if init is a builtin call */
+                int obj_local, handle_local;
+                IROpKind builtin = classify_builtin_call(ctx, node->var_decl.init,
+                                                          &obj_local, &handle_local);
+                if (builtin != IR_NOP) {
+                    IRInst inst = make_inst(builtin, node->loc.line);
+                    inst.dest_local = local_id;
+                    inst.obj_local = obj_local;
+                    inst.handle_local = handle_local;
+                    inst.expr = node->var_decl.init;
+                    emit_inst(ctx, inst);
+                } else {
+                    IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
+                    inst.dest_local = local_id;
+                    inst.expr = node->var_decl.init;
+                    emit_inst(ctx, inst);
+                }
             }
         }
         break;
@@ -568,6 +573,18 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_EXPR_STMT: {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
+
+        /* Async orelse in expr-stmt: lower to IR branches */
+        if (ctx->func->is_async) {
+            Node *orelse = find_orelse(expr);
+            if (!orelse && expr->kind == NODE_CALL) {
+                /* Check if call result has orelse */
+            }
+            if (orelse) {
+                lower_orelse_to_dest(ctx, -1, orelse, node->loc.line);
+                break;
+            }
+        }
 
         if (expr->kind == NODE_CALL) {
             int obj_local, handle_local;

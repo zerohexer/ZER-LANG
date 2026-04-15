@@ -836,10 +836,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * Pass through as AST node — emitter handles via emit_stmt. */
         Type *sw_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
         Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
-        /* ALL switch types pass through to AST emission. The IR_BRANCH
-         * can't express multi-arm value comparison (enum variants, integer
-         * cases). AST emit_stmt handles all switch patterns correctly. */
-        {
+        /* Enum/union/optional switch: pass through to AST emission.
+         * IR_BRANCH can't express enum variant/union tag comparison.
+         * Integer/bool switch: lowered to IR branches (simple value compare). */
+        if (sw_eff && (sw_eff->kind == TYPE_UNION || sw_eff->kind == TYPE_OPTIONAL ||
+                       sw_eff->kind == TYPE_ENUM)) {
             IRInst pass = make_inst(IR_NOP, node->loc.line);
             pass.expr = node; /* emit_stmt handles union/optional switch */
             emit_inst(ctx, pass);

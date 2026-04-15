@@ -494,7 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
-| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir flag, **165/195 (85%)** compile. Remaining 30: union switch (7), async orelse/yield (6), optional/distinct edge cases (10), defer locals (4), misc (3). |
+| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir flag, **178/195 (91%)** compile. Remaining 17: union switch tag (7), async yield in stmt expr (4), misc (6: static local, comptime-if, ?void, struct unwrap, slice coercion, continue scope). |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

@@ -6486,6 +6486,15 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     e->indent = 1;
     e->async_yield_id = 1;
 
+    /* Set up async context so emit_expr uses self-> for locals */
+    bool saved_async = e->in_async;
+    e->in_async = true;
+    e->async_local_count = 0;
+    for (int li = 0; li < func->local_count; li++) {
+        if (func->locals[li].is_static) continue;
+        add_async_local(e, func->locals[li].name, func->locals[li].name_len);
+    }
+
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
@@ -6500,6 +6509,9 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
 
     emit(e, "    } self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");
+
+    /* Restore async context */
+    e->in_async = saved_async;
 }
 
 /* Public: emit a function from its IR representation */

@@ -1191,7 +1191,16 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 - Checker type as void* in ir.h (anonymous struct can't be forward-declared)
 - Empty blocks allowed (join points)
 
-**Current status:** All 7 phases implemented. `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block. AST path still active default — migration (wiring IR path as default) is next.
+**Current status:** All 7 phases implemented. Migration in progress via `--use-ir` flag.
+- `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block.
+- `--use-ir` routes function body emission through IR path. **115/195 (59%) ZER tests compile.** AST path is default, all 4000+ pass.
+- **Remaining 80 failures** (characterized):
+  - "expected expression before return" (~20) — IR_BRANCH for optional conditions needs `.has_value` check instead of raw value
+  - "used struct type value where scalar is required" (~10) — same: optional in branch condition emitted as struct, needs `.has_value`
+  - "switch jumps into statement expression" (~3) — async yield inside GCC `({...})` statement expression
+  - Various pattern-specific gaps (comptime_if dead branch not stripped, goto label emission, etc.)
+- **Fixed so far:** param types from AST (not IR fallback), return optional wrapping (delegates to AST emit_stmt), async self-> context setup
+- **Next:** fix optional branch condition emission in IR_BRANCH, then pattern-by-pattern for remaining gaps
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

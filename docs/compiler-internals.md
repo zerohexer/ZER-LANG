@@ -1227,14 +1227,10 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - void_optional_init — ?void function call result emission
 - **Additional fixes (95%→99%):** Async orelse→IR branches (4 tests), orelse in loops→IR branches (2 tests), slice coercion in IR_ASSIGN, ?void hoist from void call, unwrap type_equals guard
 - **Final fixes (99%→100%):** scoped captures with C `{ }` for type-conflicting if-unwrap, dangling orelse temp name (arena-alloc), ?void hoist moved before `dest =` prefix, ?void return wrapping (hoist + `{1}`)
-- **195/195 compile, 187/195 runtime (96%).** 8 runtime hangs — loops produce infinite back-edges:
-  - async_do_while_yield: yield splits do-while body, extra goto to condition after exit
-  - async_if_capture_yield, async_while_break_yield: async + loop + yield interaction
-  - bytecode_vm, circular_log, mini_ecs, tokenizer: while(true) + enum switch — break inside AST-emitted switch doesn't exit IR loop
-  - condvar_signal: spawn + shared struct + condvar — hang in thread sync
-- **Other test suites on IR:** 74/74 negative pass, 21/21 rust negative pass, 541/761 rust positive compile (71%), 31/36 zig compile (86%)
-- **Root cause analysis:** do-while + yield creates extra back-edge block. while(true) relies on break-from-switch which becomes C break without enclosing C loop. Enum switch AST-passthrough inside IR loop = break targets nothing.
-- **Next:** fix 8 runtime hangs (priority — worse than compile errors). Then test rust/zig runtime. Then flip default.
+- **195/195 compile, 194/195 runtime (99.5%).** 7 of 8 hangs fixed by implicit-return-on-current-block fix. 1 remaining:
+  - condvar_signal: spawn + shared struct + @cond_wait/@cond_signal — hangs (AST path works, IR path doesn't). Threading-specific emission bug.
+- **7 hangs FIXED:** implicit return was added to `func->blocks[block_count - 1]` but should be `func->blocks[ctx.current_block]`. Yield creates resume blocks AFTER exit block → empty exit fell through to resume → infinite loop back to condition.
+- **Next:** fix condvar_signal hang. Then test rust/zig runtime. Then flip default.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

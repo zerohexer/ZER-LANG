@@ -1193,12 +1193,13 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 
 **Current status:** All 7 phases implemented. Migration in progress via `--use-ir` flag.
 - `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block.
-- `--use-ir` routes function body emission through IR path. **163/195 (84%) ZER tests compile.** AST path is default, all 4000+ pass.
+- `--use-ir` routes function body emission through IR path. **165/195 (85%) ZER tests compile.** AST path is default, all 4000+ pass.
 - **Remaining 32 failures** (characterized):
   - Union switch: struct used as scalar (7) — IR_BRANCH emits raw union value, needs `._tag` access
   - Async yield in GCC statement expression (4) — Duff's device case label inside `({...})`
   - Defer + #line stray (4) — `#line` directive collides with IR block label in defer body
   - Various type wrapping edge cases (17) — optional→value, value→optional, distinct, slice coercion
+  - #line stray FIXED: source mapping disabled during IR block emission (save/restore e->source_file)
 - **Fixes applied (59%→84%):**
   - Param types from checker's func_type (not IR local fallback) — fixes all struct/pointer params
   - Return optional wrapping: extract NODE_RETURN, emit_opt_wrap_value / emit_opt_null_literal / emit_return_null

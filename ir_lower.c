@@ -408,7 +408,12 @@ static Node *find_orelse(Node *expr) {
 }
 
 /* Lower: dest_local = orelse_expr
- * Creates temp, branches, assigns unwrapped value to dest on success path. */
+ * Creates temp, branches, assigns unwrapped value on ok path.
+ * Three patterns:
+ *   val = expr orelse return;        → fail: return
+ *   val = expr orelse { block };     → fail: block (may terminate)
+ *   val = expr orelse default_value; → fail: dest = default, join
+ */
 static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line) {
     /* Create temp for the optional result */
     char tmp_name[32];
@@ -436,83 +441,87 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         emit_inst(ctx, assign_tmp);
     }
 
-    /* Branch on has_value */
+    /* Determine if fallback always terminates (return/break/continue/goto) */
+    bool fallback_terminates = orelse_node->orelse.fallback_is_return ||
+                               orelse_node->orelse.fallback_is_break ||
+                               orelse_node->orelse.fallback_is_continue;
+
+    /* Create blocks */
     int bb_ok = ir_add_block(ctx->func, ctx->arena);
     int bb_fail = ir_add_block(ctx->func, ctx->arena);
+    int bb_join = -1;
+    if (!fallback_terminates) {
+        bb_join = ir_add_block(ctx->func, ctx->arena);
+    }
 
+    /* Branch on has_value */
     IRInst br = make_inst(IR_BRANCH, line);
-    br.cond_local = tmp_id; /* branch on this local's has_value */
+    br.cond_local = tmp_id;
     br.true_block = bb_ok;
     br.false_block = bb_fail;
     emit_inst(ctx, br);
 
-    /* Fail block: execute fallback */
+    /* === Fail block === */
     ctx->current_block = bb_fail;
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
         IRInst ret = make_inst(IR_RETURN, line);
         emit_inst(ctx, ret);
-    } else if (orelse_node->orelse.fallback_is_break) {
-        if (ctx->loop_exit_block >= 0) {
-            IRInst go = make_inst(IR_GOTO, line);
-            go.goto_block = ctx->loop_exit_block;
-            emit_inst(ctx, go);
-        }
-    } else if (orelse_node->orelse.fallback_is_continue) {
-        if (ctx->loop_continue_block >= 0) {
-            IRInst go = make_inst(IR_GOTO, line);
-            go.goto_block = ctx->loop_continue_block;
-            emit_inst(ctx, go);
-        }
+    } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
+        IRInst go = make_inst(IR_GOTO, line);
+        go.goto_block = ctx->loop_exit_block;
+        emit_inst(ctx, go);
+    } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
+        IRInst go = make_inst(IR_GOTO, line);
+        go.goto_block = ctx->loop_continue_block;
+        emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback) {
-        /* Block fallback: orelse { cleanup(); return; } */
+        /* Block or default value fallback.
+         * Lower the fallback as a statement — it may contain break/return/goto
+         * which terminates the block. If it doesn't terminate, it's a default value. */
         lower_stmt(ctx, orelse_node->orelse.fallback);
-        /* If fallback doesn't terminate, need a goto to skip ok block */
-    }
-    /* Ensure fail block is terminated */
-    IRBlock *fail_bb = &ctx->func->blocks[bb_fail];
-    if (fail_bb->inst_count == 0 || !ir_block_is_terminated(fail_bb)) {
-        /* Default value orelse: val = expr orelse default */
-        if (orelse_node->orelse.fallback && !orelse_node->orelse.fallback_is_return &&
-            !orelse_node->orelse.fallback_is_break && !orelse_node->orelse.fallback_is_continue) {
-            /* Assign default value to dest */
-            if (dest_local >= 0) {
-                IRInst def_assign = make_inst(IR_ASSIGN, line);
-                def_assign.dest_local = dest_local;
-                def_assign.expr = orelse_node->orelse.fallback;
-                emit_inst(ctx, def_assign);
+        /* Check if the fallback actually terminated (break, return, etc.) */
+        IRBlock *fb = &ctx->func->blocks[ctx->current_block];
+        if (fb->inst_count == 0 || !ir_block_is_terminated(fb)) {
+            /* Fallback didn't terminate — it's a default value expression.
+             * But we already lowered it as statements. Need to assign result.
+             * For simple default values (literals), the lowered stmt is an
+             * IR_ASSIGN. For blocks with break/return, it terminated above. */
+            if (bb_join >= 0) {
+                IRInst go = make_inst(IR_GOTO, line);
+                go.goto_block = bb_join;
+                emit_inst(ctx, go);
             }
         }
-        int bb_join = bb_ok; /* join at ok block for default-value orelse */
-        /* Actually need a separate join block after ok for default value pattern */
-        int bb_post = ir_add_block(ctx->func, ctx->arena);
-        IRInst go = make_inst(IR_GOTO, line);
-        go.goto_block = bb_post;
-        emit_inst(ctx, go);
-
-        /* Ok block: unwrap */
-        ctx->current_block = bb_ok;
-        if (dest_local >= 0) {
-            IRInst unwrap = make_inst(IR_ASSIGN, line);
-            unwrap.dest_local = dest_local;
-            unwrap.expr = orelse_node->orelse.expr; /* emitter unwraps .value based on type */
-            emit_inst(ctx, unwrap);
+    }
+    /* If fail block still not terminated (bare orelse with no fallback = shouldn't happen) */
+    {
+        IRBlock *fb = &ctx->func->blocks[bb_fail];
+        if (fb->inst_count == 0 || !ir_block_is_terminated(fb)) {
+            if (bb_join >= 0) {
+                IRInst go = make_inst(IR_GOTO, line);
+                go.goto_block = bb_join;
+                emit_inst(ctx, go);
+            }
         }
-        IRInst go2 = make_inst(IR_GOTO, line);
-        go2.goto_block = bb_post;
-        emit_inst(ctx, go2);
-
-        ctx->current_block = bb_post;
-        return;
     }
 
-    /* Ok block: unwrap value to destination */
+    /* === Ok block: unwrap value === */
     ctx->current_block = bb_ok;
     if (dest_local >= 0) {
         IRInst unwrap = make_inst(IR_ASSIGN, line);
         unwrap.dest_local = dest_local;
-        unwrap.expr = orelse_node->orelse.expr; /* emitter unwraps .value based on type */
+        unwrap.expr = orelse_node->orelse.expr; /* emitter appends .value */
         emit_inst(ctx, unwrap);
+    }
+    if (fallback_terminates) {
+        /* No join needed — fail path exits, ok path continues */
+    } else {
+        /* Join block after both paths */
+        IRInst go = make_inst(IR_GOTO, line);
+        go.goto_block = bb_join;
+        emit_inst(ctx, go);
+        ctx->current_block = bb_join;
     }
 }
 
@@ -544,7 +553,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Orelse lowered to IR branches when GCC stmt expr won't work:
              * - Async (Duff's case can't go inside ({...}))
              * - Inside loop (IR uses gotos — C break/continue won't work)
-             * Other orelse stays in emit_expr (GCC stmt expr handles correctly). */
+             * Full orelse→IR (Rust-style) deferred: lower_orelse_to_dest default-value
+             * join path needs fixing for complex expression patterns. */
             Node *orelse = find_orelse(node->var_decl.init);
             bool need_ir_orelse = orelse && (ctx->func->is_async ||
                 ctx->loop_exit_block >= 0 ||

@@ -756,7 +756,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     bool try_decompose = (init->kind == NODE_IDENT ||
                         init->kind == NODE_INT_LIT || init->kind == NODE_FLOAT_LIT ||
                         init->kind == NODE_BOOL_LIT || init->kind == NODE_CHAR_LIT ||
-                        init->kind == NODE_BINARY || init->kind == NODE_UNARY);
+                        init->kind == NODE_STRING_LIT ||
+                        init->kind == NODE_BINARY || init->kind == NODE_UNARY ||
+                        init->kind == NODE_FIELD || init->kind == NODE_INDEX);
                     if (try_decompose && vt) {
                         Type *vt_eff = type_unwrap_distinct(vt);
                         if (vt_eff->kind == TYPE_ARRAY || vt_eff->kind == TYPE_VOID)
@@ -836,7 +838,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 bool try_decompose = val && (val->kind == NODE_IDENT ||
                     val->kind == NODE_INT_LIT || val->kind == NODE_FLOAT_LIT ||
                     val->kind == NODE_BOOL_LIT || val->kind == NODE_CHAR_LIT ||
-                    val->kind == NODE_BINARY || val->kind == NODE_UNARY);
+                    val->kind == NODE_STRING_LIT ||
+                    val->kind == NODE_BINARY || val->kind == NODE_UNARY ||
+                    val->kind == NODE_FIELD || val->kind == NODE_INDEX);
                 /* Exclude array types — can't C-assign arrays */
                 if (try_decompose && dest >= 0) {
                     Type *dt = ctx->func->locals[dest].type;

@@ -6113,6 +6113,40 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_ASSIGN: {
         if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dest = &func->locals[inst->dest_local];
+
+            /* Captures with type conflict: block-scoped typed declaration.
+             * Only for captures inside { } scope blocks (name_conflict detected). */
+            if (dest->is_capture && !func->is_async) {
+                Type *cap_src = checker_get_type(e->checker, inst->expr);
+                Type *cap_eff = cap_src ? type_unwrap_distinct(cap_src) : NULL;
+                /* Check if type differs from declared local type */
+                bool type_mismatch = false;
+                if (cap_eff && cap_eff->kind == TYPE_OPTIONAL) {
+                    Type *inner = cap_eff->optional.inner;
+                    if (inner && !is_null_sentinel(inner) &&
+                        inner->kind != TYPE_VOID &&
+                        !type_equals(type_unwrap_distinct(inner),
+                                     type_unwrap_distinct(dest->type))) {
+                        type_mismatch = true;
+                    }
+                }
+                if (type_mismatch) {
+                    /* Emit scoped declaration with correct inner type */
+                    Type *inner = cap_eff->optional.inner;
+                    emit_indent(e);
+                    emit_type_and_name(e, inner, dest->name, dest->name_len);
+                    emit(e, " = ");
+                    emit_expr(e, inst->expr);
+                    emit(e, ".value;\n");
+                    break;
+                }
+                if (cap_eff && cap_eff->kind == TYPE_OPTIONAL &&
+                    cap_eff->optional.inner->kind == TYPE_VOID) {
+                    break; /* ?void: skip capture (void can't be var) */
+                }
+                /* No conflict: fall through to normal assignment (with .value unwrap) */
+            }
+
             emit_indent(e);
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
@@ -6522,6 +6556,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     for (int li = 0; li < func->local_count; li++) {
         IRLocal *l = &func->locals[li];
         if (l->is_param || l->is_static) continue;
+        /* Skip captures with void type (can't be C variables) */
+        if (l->is_capture && l->type && l->type->kind == TYPE_VOID) continue;
         if (!l->type) continue;
         emit_indent(e);
         emit_type_and_name(e, l->type, l->name, l->name_len);
@@ -6540,9 +6576,56 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         /* Label for every block (including bb0 — goto may target entry) */
         emit(e, "_zer_bb%d:;\n", bb->id);
 
+        /* Check if block has a capture that conflicts with another capture
+         * of the same name but different type — wrap in C { } scope.
+         * Only needed when same name is reused for different optional types. */
+        bool has_capture_scope = false;
+        if (bb->inst_count > 0 && bb->insts[0].op == IR_ASSIGN &&
+            bb->insts[0].dest_local >= 0 &&
+            func->locals[bb->insts[0].dest_local].is_capture) {
+            /* Check if ANY other capture has the same name but different source */
+            int cap_id = bb->insts[0].dest_local;
+            IRLocal *cap = &func->locals[cap_id];
+            bool name_conflict = false;
+            for (int ci = 0; ci < func->local_count; ci++) {
+                if (ci == cap_id) continue;
+                if (!func->locals[ci].is_capture) continue;
+                if (func->locals[ci].name_len == cap->name_len &&
+                    memcmp(func->locals[ci].name, cap->name, cap->name_len) == 0) {
+                    name_conflict = true; break;
+                }
+            }
+            /* Wait — dedup means there's only ONE local per name.
+             * The conflict is between the DECLARED type (first capture) and
+             * ACTUAL type (current capture source). Check if source type differs. */
+            if (!name_conflict) {
+                Type *src = checker_get_type(e->checker, bb->insts[0].expr);
+                Type *src_eff = src ? type_unwrap_distinct(src) : NULL;
+                if (src_eff && src_eff->kind == TYPE_OPTIONAL) {
+                    Type *inner = src_eff->optional.inner;
+                    if (inner && !type_equals(type_unwrap_distinct(inner),
+                                              type_unwrap_distinct(cap->type))) {
+                        name_conflict = true; /* source inner != declared capture type */
+                    }
+                }
+            }
+            if (name_conflict) {
+                has_capture_scope = true;
+                emit_indent(e);
+                emit(e, "{\n");
+                e->indent++;
+            }
+        }
+
         /* Instructions */
         for (int ii = 0; ii < bb->inst_count; ii++) {
             emit_ir_inst(e, &bb->insts[ii], func);
+        }
+
+        if (has_capture_scope) {
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}\n");
         }
     }
 

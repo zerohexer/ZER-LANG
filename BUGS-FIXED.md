@@ -3848,3 +3848,23 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** In IR_CALL emitter, look up callee's function type from checker. For each arg, check if arg type is TYPE_ARRAY and param type is TYPE_SLICE → emit coercion wrapper `(SliceType){ local, size }`.
 
 **Test:** tests/zer/star_slice.zer, tests/zer/super_plugin.zer
+
+### BUG-520: IR_CALL callee emission for function pointer arrays (2026-04-16)
+
+**Symptom:** `pipeline[i](val)` — array-indexed funcptr call. Emitter produced `/* unknown callee */(val)` because callee NODE_INDEX wasn't handled — only NODE_IDENT and NODE_FIELD callees had emission logic.
+
+**Root cause:** Phase 9 IR_CALL decomposed call handles NODE_IDENT callees (simple `func(args)`) and NODE_FIELD callees (struct method `obj.method(args)`). NODE_INDEX callees (`arr[i](args)`) were unhandled → emitted placeholder comment.
+
+**Fix:** Added NODE_INDEX callee handler in IR_CALL emitter. Emits `arr_local[idx_local](args)` from local IDs. Handles both local and global array names.
+
+**Test:** tests/zer/func_pipeline.zer (funcptr array call)
+
+### BUG-521: IR_CALL builtin detection inconsistency (lowering vs emitter) (2026-04-16)
+
+**Symptom:** 28-30 tests fail when removing IR_CALL emit_expr fallback. Builtins detected in lowering (skipping arg decomposition) but not in emitter → `call_arg_locals=NULL` → no path to emit the call.
+
+**Root cause:** Lowering detects builtins via `checker_get_type(callee->field.object)` + `scope_lookup` fallback. Emitter only used `checker_get_type` without the `scope_lookup` fallback — global pool/slab variables not in typemap were missed.
+
+**Fix:** Added `scope_lookup(global_scope, ...)` fallback to emitter's builtin detection, matching the lowering path. **Still not sufficient for all 30 tests** — deeper investigation needed for remaining inconsistencies. Fallback `emit_expr` kept as safety net.
+
+**Test:** Regression: removing fallback breaks 28+ tests. Fallback restored.

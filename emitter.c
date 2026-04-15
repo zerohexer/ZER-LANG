@@ -6200,8 +6200,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         /* Detect builtins: callee is NODE_FIELD on pool/slab/ring/arena/Task type */
         if (inst->expr && inst->expr->kind == NODE_CALL) {
             Node *callee = inst->expr->call.callee;
-            if (callee && callee->kind == NODE_FIELD && callee->field.object) {
+            if (callee && callee->kind == NODE_FIELD && callee->field.object &&
+                callee->field.object->kind == NODE_IDENT) {
                 Type *ot = checker_get_type(e->checker, callee->field.object);
+                /* Fallback: look up in global scope (globals may not be in typemap) */
+                if (!ot) {
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        callee->field.object->ident.name,
+                        (uint32_t)callee->field.object->ident.name_len);
+                    if (sym) ot = sym->type;
+                }
                 if (ot) {
                     Type *ot_eff = type_unwrap_distinct(ot);
                     if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
@@ -6224,8 +6232,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (is_builtin || is_comptime) {
             /* Builtins/comptime need emit_expr for inline C generation */
             if (inst->expr) emit_expr(e, inst->expr);
-        } else if (inst->func_name && inst->call_arg_locals) {
-            /* Simple call: emit func_name(local1, local2, ...) from local IDs.
+        } else if (inst->call_arg_locals) {
+            /* Decomposed call: emit callee(local1, local2, ...) from local IDs.
              * Handle array→slice coercion for args when param expects slice. */
             /* Look up callee's function type for param types */
             Type *callee_ft = NULL;
@@ -6236,7 +6244,88 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     if (ct_eff->kind == TYPE_FUNC_PTR) callee_ft = ct_eff;
                 }
             }
-            emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+            /* Emit callee: simple ident or field access (funcptr through struct) */
+            if (inst->func_name) {
+                emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+                       inst->expr->call.callee &&
+                       inst->expr->call.callee->kind == NODE_FIELD) {
+                /* Struct field callee: obj.method or obj->method */
+                Node *callee = inst->expr->call.callee;
+                /* Emit object name from local or rewritten ident */
+                if (callee->field.object && callee->field.object->kind == NODE_IDENT) {
+                    int obj_id = -1;
+                    for (int li = 0; li < func->local_count; li++) {
+                        if (func->locals[li].name_len == (uint32_t)callee->field.object->ident.name_len &&
+                            memcmp(func->locals[li].name, callee->field.object->ident.name,
+                                   func->locals[li].name_len) == 0) {
+                            obj_id = li; break;
+                        }
+                    }
+                    if (obj_id >= 0) {
+                        Type *ot = func->locals[obj_id].type;
+                        Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
+                        emit_local_name(e, func, obj_id);
+                        emit(e, "%s%.*s(",
+                             (ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
+                             (int)callee->field.field_name_len, callee->field.field_name);
+                    } else {
+                        /* Global/extern funcptr */
+                        emit(e, "%.*s.%.*s(",
+                             (int)callee->field.object->ident.name_len,
+                             callee->field.object->ident.name,
+                             (int)callee->field.field_name_len, callee->field.field_name);
+                    }
+                } else {
+                    emit(e, "/* complex callee */(");
+                }
+            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+                       inst->expr->call.callee &&
+                       inst->expr->call.callee->kind == NODE_INDEX) {
+                /* Array-indexed funcptr: arr[i](args) */
+                Node *idx_callee = inst->expr->call.callee;
+                if (idx_callee->index_expr.object->kind == NODE_IDENT) {
+                    int arr_id = -1;
+                    for (int li = 0; li < func->local_count; li++) {
+                        if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.object->ident.name_len &&
+                            memcmp(func->locals[li].name, idx_callee->index_expr.object->ident.name,
+                                   func->locals[li].name_len) == 0) {
+                            arr_id = li; break;
+                        }
+                    }
+                    if (arr_id >= 0) {
+                        emit_local_name(e, func, arr_id);
+                    } else {
+                        /* Global array */
+                        emit(e, "%.*s", (int)idx_callee->index_expr.object->ident.name_len,
+                             idx_callee->index_expr.object->ident.name);
+                    }
+                    emit(e, "[");
+                    /* Index expression — find local if decomposed */
+                    if (idx_callee->index_expr.index->kind == NODE_IDENT) {
+                        int idx_id = -1;
+                        for (int li = 0; li < func->local_count; li++) {
+                            if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.index->ident.name_len &&
+                                memcmp(func->locals[li].name, idx_callee->index_expr.index->ident.name,
+                                       func->locals[li].name_len) == 0) {
+                                idx_id = li; break;
+                            }
+                        }
+                        if (idx_id >= 0)
+                            emit_local_name(e, func, idx_id);
+                        else
+                            emit(e, "%.*s", (int)idx_callee->index_expr.index->ident.name_len,
+                                 idx_callee->index_expr.index->ident.name);
+                    } else {
+                        emit(e, "0"); /* non-ident index fallback */
+                    }
+                    emit(e, "](");
+                } else {
+                    emit(e, "/* complex index callee */(");
+                }
+            } else {
+                emit(e, "/* unknown callee */(");
+            }
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");
                 if (inst->call_arg_locals[i] >= 0) {
@@ -6260,7 +6349,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
             emit(e, ")");
         } else if (inst->expr) {
-            /* Complex callee (function pointer through field, etc.) */
+            /* Safety net for calls with NULL call_arg_locals */
             emit_expr(e, inst->expr);
         }
         emit(e, ";\n");

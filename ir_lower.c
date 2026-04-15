@@ -688,7 +688,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_RETURN: {
         emit_defer_fire(ctx, node->loc.line);
         IRInst ret = make_inst(IR_RETURN, node->loc.line);
-        ret.expr = node->ret.expr;
+        ret.expr = node; /* pass full NODE_RETURN for emit_stmt delegation */
         emit_inst(ctx, ret);
         break;
     }

@@ -1264,7 +1264,15 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - **`emit_expr` in `emit_ir_inst`: 2 remaining** (both in IR_ASSIGN):
     1. Main passthrough: `dest = emit_expr(expr)` — handles calls, builtins, intrinsics, casts, orelse, struct_init, index+bounds, handle auto-deref
     2. Void expression: `emit_expr(expr)` as statement — field writes, compound assigns, void calls
-  - **What remains for Phase 9 (zero emit_expr):** Each expression type reaching IR_ASSIGN needs its own IR op emission. Each builtin/intrinsic/cast → 50-200 lines. Would eliminate IR_ASSIGN passthrough entirely → emit_expr only for top-level declarations.
+  - **Phase 9 started (2026-04-16): NODE_TYPECAST, NODE_STRUCT_INIT, NODE_CALL decomposed.**
+    - NODE_TYPECAST → IR_CAST{src_local, cast_type}: 3 paths (to-*opaque wrap, from-*opaque unwrap+check, simple C cast). All from local IDs.
+    - NODE_STRUCT_INIT → IR_STRUCT_INIT_DECOMP{field_locals[], cast_type}: field values decomposed. Emits `(Type){ .f1 = local1, .f2 = local2 }`.
+    - NODE_CALL → IR_CALL{func_name, call_arg_locals[]}: simple calls from local IDs. Array→slice arg coercion via callee func_type param lookup. Builtins/comptime detected at lowering (check callee object type) — skip arg decomposition, keep expr for emit_expr.
+    - BUG-518: builtin type-name args (arena.alloc(T)) can't be decomposed — detect and skip.
+    - BUG-519: array→slice arg coercion missing — look up callee param types, emit wrapper.
+    - **4 `emit_expr` calls remain:** 2 in IR_ASSIGN (main passthrough + void expr), 2 in IR_CALL (builtin + module-qualified fallback).
+    - **Remaining to decompose:** NODE_INTRINSIC, NODE_ORELSE, NODE_SLICE, NODE_ASSIGN (field/index write, compound), NODE_FIELD (complex types), NODE_INDEX (bounds check), NODE_BINARY (opaque). Plus: builtin inline C emission from local IDs, module-qualified call mangling.
+  - **Architecture after Phase 9 partial:** Simple expressions (ident, literal, binary, unary, field, index, typecast, struct_init, simple call) → decomposed to IR ops with local IDs. Complex expressions (builtins, intrinsics, orelse, complex calls) → IR_ASSIGN/IR_CALL passthrough to emit_expr. The passthrough shrinks as each expression type is decomposed.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

@@ -6308,9 +6308,41 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_RETURN: {
-        /* IR_RETURN: inst->expr is the full NODE_RETURN from AST.
-         * Extract return expression, handle optional wrapping. */
         emit_indent(e);
+
+        /* Local-ID path: return expression decomposed by lower_expr */
+        if (inst->src1_local >= 0) {
+            IRLocal *src = &func->locals[inst->src1_local];
+            Type *ret = e->current_func_ret;
+            Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+            Type *src_eff = src->type ? type_unwrap_distinct(src->type) : NULL;
+            const char *sp = func->is_async ? "self->" : "";
+
+            bool need_wrap = (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+                             !is_null_sentinel(ret_eff->optional.inner) &&
+                             src_eff && src_eff->kind != TYPE_OPTIONAL);
+            bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
+                               ret_eff && ret_eff->kind != TYPE_OPTIONAL &&
+                               !is_null_sentinel(src_eff->optional.inner));
+
+            if (need_wrap) {
+                if (is_void_opt(ret_eff)) {
+                    emit(e, "%s%.*s;\n", sp, (int)src->name_len, src->name);
+                    emit_indent(e);
+                    emit(e, "return (_zer_opt_void){ 1 };\n");
+                } else {
+                    emit(e, "return (");
+                    emit_type(e, ret_eff);
+                    emit(e, "){ %s%.*s, 1 };\n", sp, (int)src->name_len, src->name);
+                }
+            } else if (need_unwrap) {
+                emit(e, "return %s%.*s.value;\n", sp, (int)src->name_len, src->name);
+            } else {
+                emit(e, "return %s%.*s;\n", sp, (int)src->name_len, src->name);
+            }
+        }
+        /* AST fallback path */
+        else {
         Node *ret_expr = NULL;
         if (inst->expr) {
             if (inst->expr->kind == NODE_RETURN) {
@@ -6329,20 +6361,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(ret_eff->optional.inner) &&
                 expr_type && !type_is_optional(expr_type)) {
-                /* ?void: hoist void expr, return { 1 } */
                 if (is_void_opt(ret_eff)) {
                     emit_ir_value(e, ret_expr);
                     emit(e, ";\n");
                     emit_indent(e);
                     emit(e, "return (_zer_opt_void){ 1 };\n");
                 } else {
-                    /* Wrap non-optional value in optional struct */
                     emit(e, "return ");
                     emit_opt_wrap_value(e, ret_eff, ret_expr);
                     emit(e, ";\n");
                 }
             } else if (ret_expr->kind == NODE_NULL_LIT && ret_eff) {
-                /* return null → optional null literal */
                 emit(e, "return ");
                 emit_opt_null_literal(e, ret_eff);
                 emit(e, ";\n");
@@ -6354,13 +6383,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         } else {
             /* Void or bare return */
             if (func->is_async) {
-                /* Async poll function returns int: 1 = complete */
                 emit(e, "self->_zer_state = -1; return 1;\n");
             } else {
                 emit_return_null(e);
                 emit(e, "\n");
             }
         }
+        } /* end AST fallback */
         break;
     }
 
@@ -6388,7 +6417,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, "case %d:;\n", e->async_yield_id);
             emit_indent(e);
             emit(e, "if (!(");
-            if (inst->expr) emit_ir_value(e, inst->expr);
+            if (inst->cond_local >= 0) {
+                /* Local-ID path */
+                IRLocal *cl = &func->locals[inst->cond_local];
+                emit(e, "self->%.*s", (int)cl->name_len, cl->name);
+            } else if (inst->expr) {
+                emit_ir_value(e, inst->expr);
+            }
             emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
             e->async_yield_id++;
             /* Same as yield — goto resume block */

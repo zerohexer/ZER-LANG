@@ -4866,7 +4866,23 @@ static void emit_async_func(Emitter *e, Node *node) {
 
 static void emit_func_decl(Emitter *e, Node *node) {
 
-    /* Async functions get special emission */
+    /* IR emission path — lower to IR, emit from IR */
+    if (e->use_ir && node->func_decl.body) {
+        IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
+        if (ir) {
+            ir->module_prefix = e->current_module;
+            ir->module_prefix_len = e->current_module_len;
+            if (ir_validate(ir)) {
+                emit_func_from_ir(e, ir);
+                return;
+            }
+            /* Validation failed — fall through to AST emission */
+            fprintf(stderr, "IR validation failed for '%.*s' — falling back to AST emission\n",
+                    (int)node->func_decl.name_len, node->func_decl.name);
+        }
+    }
+
+    /* Async functions get special emission (AST path) */
     if (node->func_decl.is_async && node->func_decl.body) {
         emit_async_func(e, node);
         return;
@@ -6101,9 +6117,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
-                /* First assignment = declaration */
-                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
-                emit(e, " = ");
+                /* Locals already declared at function top — just assign */
+                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
             emit_expr(e, inst->expr);
             emit(e, ";\n");
@@ -6123,8 +6138,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
-                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
-                emit(e, " = ");
+                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
         }
         if (inst->expr) {
@@ -6227,8 +6241,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
-                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
-                emit(e, " = ");
+                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
         }
         if (inst->expr) emit_expr(e, inst->expr);
@@ -6321,8 +6334,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
-                emit_type_and_name(e, dest->type, dest->name, dest->name_len);
-                emit(e, " = ");
+                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
         }
         if (inst->expr) emit_expr(e, inst->expr);
@@ -6356,8 +6368,11 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         emit(e, "#line %d \"%s\"\n", fn->loc.line, e->source_file);
     }
 
-    /* Return type + name */
+    /* Return type + name.
+     * func->return_type may be the function TYPE (func_ptr) from typemap.
+     * Extract the actual return type from func_ptr.ret. */
     Type *ret = func->return_type;
+    if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
     if (ret) emit_type(e, ret);
     else emit(e, "void");
     emit(e, " ");

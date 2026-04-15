@@ -122,13 +122,21 @@ LOCALS:
 (innermost scope). The lowering pushes/pops scope depth to
 track which `m` is current.
 
-## Current Status (Phase 8a COMPLETE, Phase 8b PENDING)
+## Current Status (Phase 8a COMPLETE, Phase 8b PARTIAL)
 
 **Phase 8a (done):** Scope conflict resolved. On-demand locals, ident rewriting, orig_name tracking.
-- `lower_expr()` EXISTS (decomposes ident/literal/binary/unary/field/index)
-- New IR ops EXIST (IR_COPY, IR_BINOP, IR_LITERAL, etc.) with emission handlers
-- 195/195 ZER + 761/761 rust pass (0 hang)
-- BUT: `lower_expr` is NOT WIRED into `lower_stmt`. `emit_expr` still used everywhere.
+- BUG-507 (scope conflict), BUG-508 (yield resume), BUG-509 (async bare return) — all fixed
+- `lower_expr()` decomposes ident/literal/binary/unary/field/index
+- New IR ops (IR_COPY, IR_BINOP, IR_LITERAL, etc.) with emission handlers
+
+**Phase 8b (partial):** `lower_expr()` wired into `lower_stmt()` for simple expressions.
+- NODE_VAR_DECL default init: `lower_expr(init)` → IR_COPY(dest, src)
+- NODE_EXPR_STMT simple assign (ident = expr with TOK_EQ): `lower_expr(value)` → IR_COPY(dest, src)
+- IR_COPY emission: type adaptation (optional wrap/unwrap, array→slice coercion)
+- Guards: array types, void, null literals, struct inits → fall back to IR_ASSIGN with expr
+- NODE_FIELD: non-local objects (enum/module), array results → passthrough
+- **20 `emit_expr` calls remain** in emit_ir_inst. IR_ASSIGN/IR_CALL/IR_BRANCH/builtins still use expr trees.
+- 195/195 ZER + 761/761 rust pass (0 fail, 0 hang)
 
 **Phase 8b (pending):** Wire lower_expr into lower_stmt. Eliminate emit_expr from emit_ir_inst.
 

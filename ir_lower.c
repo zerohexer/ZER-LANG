@@ -57,6 +57,7 @@ static IRInst make_inst(IROpKind op, int line) {
     inst.true_block = -1;
     inst.false_block = -1;
     inst.goto_block = -1;
+    inst.cond_local = -1;
     inst.source_line = line;
     return inst;
 }
@@ -368,6 +369,132 @@ static void emit_defer_fire(LowerCtx *ctx, int line) {
     }
 }
 
+/* ================================================================
+ * Orelse lowering — proper branch pattern, not expression hack
+ *
+ * val = expr orelse return;  →
+ *   %tmp = expr
+ *   BRANCH %tmp.has_value → bb_ok, bb_fail
+ *   bb_fail: DEFER_FIRE; RETURN
+ *   bb_ok: %val = %tmp  (emitter unwraps .value)
+ * ================================================================ */
+
+/* Check if an expression contains NODE_ORELSE at the top level */
+static Node *find_orelse(Node *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == NODE_ORELSE) return expr;
+    return NULL;
+}
+
+/* Lower: dest_local = orelse_expr
+ * Creates temp, branches, assigns unwrapped value to dest on success path. */
+static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line) {
+    /* Create temp for the optional result */
+    char tmp_name[32];
+    int tn = ctx->temp_count++;
+    int tl = snprintf(tmp_name, sizeof(tmp_name), "_zer_or%d", tn);
+    Type *opt_type = checker_get_type(ctx->checker, orelse_node->orelse.expr);
+    int tmp_id = ir_add_local(ctx->func, ctx->arena,
+        tmp_name, (uint32_t)tl, opt_type, false, false, true, line);
+
+    /* Emit: tmp = expr */
+    Node *inner = orelse_node->orelse.expr;
+    int obj_local, handle_local;
+    IROpKind builtin = classify_builtin_call(ctx, inner, &obj_local, &handle_local);
+    if (builtin != IR_NOP) {
+        IRInst alloc = make_inst(builtin, line);
+        alloc.dest_local = tmp_id;
+        alloc.obj_local = obj_local;
+        alloc.handle_local = handle_local;
+        alloc.expr = inner;
+        emit_inst(ctx, alloc);
+    } else {
+        IRInst assign_tmp = make_inst(IR_ASSIGN, line);
+        assign_tmp.dest_local = tmp_id;
+        assign_tmp.expr = inner;
+        emit_inst(ctx, assign_tmp);
+    }
+
+    /* Branch on has_value */
+    int bb_ok = ir_add_block(ctx->func, ctx->arena);
+    int bb_fail = ir_add_block(ctx->func, ctx->arena);
+
+    IRInst br = make_inst(IR_BRANCH, line);
+    br.cond_local = tmp_id; /* branch on this local's has_value */
+    br.true_block = bb_ok;
+    br.false_block = bb_fail;
+    emit_inst(ctx, br);
+
+    /* Fail block: execute fallback */
+    ctx->current_block = bb_fail;
+    if (orelse_node->orelse.fallback_is_return) {
+        emit_defer_fire(ctx, line);
+        IRInst ret = make_inst(IR_RETURN, line);
+        emit_inst(ctx, ret);
+    } else if (orelse_node->orelse.fallback_is_break) {
+        if (ctx->loop_exit_block >= 0) {
+            IRInst go = make_inst(IR_GOTO, line);
+            go.goto_block = ctx->loop_exit_block;
+            emit_inst(ctx, go);
+        }
+    } else if (orelse_node->orelse.fallback_is_continue) {
+        if (ctx->loop_continue_block >= 0) {
+            IRInst go = make_inst(IR_GOTO, line);
+            go.goto_block = ctx->loop_continue_block;
+            emit_inst(ctx, go);
+        }
+    } else if (orelse_node->orelse.fallback) {
+        /* Block fallback: orelse { cleanup(); return; } */
+        lower_stmt(ctx, orelse_node->orelse.fallback);
+        /* If fallback doesn't terminate, need a goto to skip ok block */
+    }
+    /* Ensure fail block is terminated */
+    IRBlock *fail_bb = &ctx->func->blocks[bb_fail];
+    if (fail_bb->inst_count == 0 || !ir_block_is_terminated(fail_bb)) {
+        /* Default value orelse: val = expr orelse default */
+        if (orelse_node->orelse.fallback && !orelse_node->orelse.fallback_is_return &&
+            !orelse_node->orelse.fallback_is_break && !orelse_node->orelse.fallback_is_continue) {
+            /* Assign default value to dest */
+            if (dest_local >= 0) {
+                IRInst def_assign = make_inst(IR_ASSIGN, line);
+                def_assign.dest_local = dest_local;
+                def_assign.expr = orelse_node->orelse.fallback;
+                emit_inst(ctx, def_assign);
+            }
+        }
+        int bb_join = bb_ok; /* join at ok block for default-value orelse */
+        /* Actually need a separate join block after ok for default value pattern */
+        int bb_post = ir_add_block(ctx->func, ctx->arena);
+        IRInst go = make_inst(IR_GOTO, line);
+        go.goto_block = bb_post;
+        emit_inst(ctx, go);
+
+        /* Ok block: unwrap */
+        ctx->current_block = bb_ok;
+        if (dest_local >= 0) {
+            IRInst unwrap = make_inst(IR_ASSIGN, line);
+            unwrap.dest_local = dest_local;
+            unwrap.expr = orelse_node->orelse.expr; /* emitter unwraps .value based on type */
+            emit_inst(ctx, unwrap);
+        }
+        IRInst go2 = make_inst(IR_GOTO, line);
+        go2.goto_block = bb_post;
+        emit_inst(ctx, go2);
+
+        ctx->current_block = bb_post;
+        return;
+    }
+
+    /* Ok block: unwrap value to destination */
+    ctx->current_block = bb_ok;
+    if (dest_local >= 0) {
+        IRInst unwrap = make_inst(IR_ASSIGN, line);
+        unwrap.dest_local = dest_local;
+        unwrap.expr = orelse_node->orelse.expr; /* emitter unwraps .value based on type */
+        emit_inst(ctx, unwrap);
+    }
+}
+
 /* Lower a single statement */
 static void lower_stmt(LowerCtx *ctx, Node *node) {
     if (!node) return;
@@ -405,6 +532,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 inst.expr = node->var_decl.init;
                 emit_inst(ctx, inst);
             } else {
+                /* For orelse: emit_expr handles it via GCC statement expression.
+                 * IR_ASSIGN unwrap (.value) handles type mismatch at emission. */
                 IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
                 inst.dest_local = local_id;
                 inst.expr = node->var_decl.init;

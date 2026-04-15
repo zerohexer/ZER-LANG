@@ -120,6 +120,16 @@ static void collect_locals(LowerCtx *ctx, Node *node) {
         break;
 
     case NODE_IF:
+        /* comptime if: only collect locals from the taken branch */
+        if (node->if_stmt.is_comptime) {
+            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval) {
+                collect_locals(ctx, node->if_stmt.then_body);
+            } else {
+                collect_locals(ctx, node->if_stmt.else_body);
+            }
+            break;
+        }
         /* If-unwrap capture — THE fix for async capture ghost */
         if (node->if_stmt.capture_name) {
             Type *cond_type = checker_get_type(ctx->checker, node->if_stmt.cond);
@@ -600,6 +610,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- If/else: branch + basic blocks ---- */
     case NODE_IF: {
+        /* comptime if: evaluate condition, only lower the taken branch */
+        if (node->if_stmt.is_comptime) {
+            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval) {
+                if (node->if_stmt.then_body) lower_stmt(ctx, node->if_stmt.then_body);
+            } else {
+                if (node->if_stmt.else_body) lower_stmt(ctx, node->if_stmt.else_body);
+            }
+            break;
+        }
         int bb_then = ir_add_block(ctx->func, ctx->arena);
         int bb_else = node->if_stmt.else_body ?
                       ir_add_block(ctx->func, ctx->arena) : -1;

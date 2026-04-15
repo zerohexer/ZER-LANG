@@ -3818,3 +3818,13 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Added result-type guard in `lower_expr(NODE_INDEX)`: when element type is `TYPE_ARRAY`, go to passthrough (let `emit_expr` handle nested array indexing in-place).
 
 **Test:** tests/zer/array_3d.zer
+
+### BUG-517: Capture IR_COPY on ?void produced type mismatch (2026-04-16)
+
+**Symptom:** `if (check) |v|` where `check` is `?void` — IR_COPY assigned `_zer_opt_void` to `Result` capture variable. GCC "incompatible types" error.
+
+**Root cause:** Phase 8d capture change routed all if-unwrap captures through IR_COPY{cap_id, cond_local}. But `?void` captures have no value to unwrap — the capture should be skipped entirely.
+
+**Fix:** In lower_stmt(NODE_IF) capture, detect `?void` condition type and skip IR_COPY creation. `?void` captures are no-ops — they only prove presence, no value.
+
+**Test:** tests/zer/optional_patterns.zer (test 8: ?void if-unwrap)

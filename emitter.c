@@ -6135,59 +6135,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dest = &func->locals[inst->dest_local];
 
-            /* Captures with type conflict: block-scoped typed declaration. */
-            if (dest->is_capture && !func->is_async) {
-                Type *cap_src = checker_get_type(e->checker, inst->expr);
-                Type *cap_eff = cap_src ? type_unwrap_distinct(cap_src) : NULL;
-                bool type_mismatch = false;
-                if (cap_eff && cap_eff->kind == TYPE_OPTIONAL) {
-                    Type *inner = cap_eff->optional.inner;
-                    if (inner && !is_null_sentinel(inner) &&
-                        inner->kind != TYPE_VOID &&
-                        !type_equals(type_unwrap_distinct(inner),
-                                     type_unwrap_distinct(dest->type))) {
-                        type_mismatch = true;
-                    }
-                }
-                if (type_mismatch) {
-                    Type *inner = cap_eff->optional.inner;
-                    emit_indent(e);
-                    emit_type_and_name(e, inner, dest->name, dest->name_len);
-                    emit(e, " = ");
-                    emit_expr(e, inst->expr);
-                    emit(e, ".value;\n");
-                    break;
-                }
-                if (cap_eff && cap_eff->kind == TYPE_OPTIONAL &&
-                    cap_eff->optional.inner->kind == TYPE_VOID) {
-                    break; /* ?void: skip capture */
-                }
-            }
+            /* Captures now go through IR_COPY (lowered at if-unwrap site).
+             * ?void captures skipped at lowering time. No emit_expr needed. */
 
-            /* ?void from void call: hoist call before assignment (BUG-408).
-             * MUST check BEFORE emitting "dest = " prefix. */
-            {
-                Type *pre_src = checker_get_type(e->checker, inst->expr);
-                Type *pre_src_eff = pre_src ? type_unwrap_distinct(pre_src) : NULL;
-                Type *pre_dst = dest->type;
-                Type *pre_dst_eff = pre_dst ? type_unwrap_distinct(pre_dst) : NULL;
-                bool pre_void_opt = (pre_dst_eff && pre_dst_eff->kind == TYPE_OPTIONAL &&
-                                    pre_dst_eff->optional.inner &&
-                                    type_unwrap_distinct(pre_dst_eff->optional.inner)->kind == TYPE_VOID);
-                bool pre_src_void = (pre_src_eff && pre_src_eff->kind == TYPE_VOID);
-                if (pre_void_opt && pre_src_void && inst->expr->kind == NODE_CALL) {
-                    emit_indent(e);
-                    emit_expr(e, inst->expr);
-                    emit(e, ";\n");
-                    emit_indent(e);
-                    if (func->is_async)
-                        emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
-                    else
-                        emit(e, "%.*s = ", (int)dest->name_len, dest->name);
-                    emit(e, "(_zer_opt_void){ 1 };\n");
-                    break;
-                }
-            }
+            /* ?void from void call now handled at lowering time:
+             * void call → IR_ASSIGN(void), then IR_LITERAL(kind=6) for {1}. */
 
             emit_indent(e);
             if (func->is_async) {
@@ -6239,15 +6191,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CALL: {
-        /* IR_CALL no longer created by lowering (all calls → IR_ASSIGN passthrough).
-         * Kept as dead code guard — if reached, emit via IR_ASSIGN fallback. */
+        /* IR_CALL no longer created by lowering — all calls go through IR_ASSIGN.
+         * Dead code guard: emit comment if somehow reached. */
         emit_indent(e);
-        if (inst->dest_local >= 0) {
-            emit_local_name(e, func, inst->dest_local);
-            emit(e, " = ");
-        }
-        if (inst->expr) emit_expr(e, inst->expr);
-        emit(e, ";\n");
+        emit(e, "/* IR_CALL dead — should be IR_ASSIGN */\n");
         break;
     }
 
@@ -6397,15 +6344,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_POOL_GET:
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
     case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
-        /* Builtin ops no longer created by lowering (all → IR_ASSIGN passthrough).
-         * Kept as dead code guard — if reached, emit via fallback. */
+        /* Builtin ops no longer created by lowering — all go through IR_ASSIGN.
+         * Dead code guard. */
         emit_indent(e);
-        if (inst->dest_local >= 0) {
-            emit_local_name(e, func, inst->dest_local);
-            emit(e, " = ");
-        }
-        if (inst->expr) emit_expr(e, inst->expr);
-        emit(e, ";\n");
+        emit(e, "/* IR builtin dead — should be IR_ASSIGN */\n");
         break;
     }
 
@@ -6488,15 +6430,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_INTRINSIC: {
-        /* IR_INTRINSIC no longer created by lowering (all → IR_ASSIGN passthrough).
-         * Kept as dead code guard. */
+        /* IR_INTRINSIC no longer created by lowering — all go through IR_ASSIGN.
+         * Dead code guard. */
         emit_indent(e);
-        if (inst->dest_local >= 0) {
-            emit_local_name(e, func, inst->dest_local);
-            emit(e, " = ");
-        }
-        if (inst->expr) emit_expr(e, inst->expr);
-        emit(e, ";\n");
+        emit(e, "/* IR_INTRINSIC dead — should be IR_ASSIGN */\n");
         break;
     }
 
@@ -6591,6 +6528,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "'%c'", (char)inst->literal_int);
                 else
                     emit(e, "%d", (int)inst->literal_int);
+                break;
+            case 6: /* ?void has_value */
+                emit(e, "(_zer_opt_void){ %d }", (int)inst->literal_int);
                 break;
             }
             emit(e, ";\n");

@@ -380,12 +380,113 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
     /* ---- Complex expressions: passthrough to emit_expr during migration ---- */
     /* These keep Node *expr and use emit_expr. They'll be decomposed
      * incrementally as the three-address-code migration continues. */
-    case NODE_CALL:
+    /* ---- Typecast: decompose inner expr, create IR_CAST ---- */
+    case NODE_TYPECAST: {
+        rewrite_idents(ctx, expr->typecast.expr);
+        int src = lower_expr(ctx, expr->typecast.expr);
+        Type *tgt = checker_get_type(ctx->checker, expr);
+        if (!tgt) tgt = ty_i32;
+        Type *tgt_eff = type_unwrap_distinct(tgt);
+        if (tgt_eff->kind == TYPE_VOID) goto passthrough;
+        int tmp = create_temp(ctx, tgt, expr->loc.line);
+        IRInst inst = make_inst(IR_CAST, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.src1_local = src;
+        inst.cast_type = tgt;
+        inst.expr = expr; /* keep for *opaque type_id logic in emitter */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Struct init: decompose field values ---- */
+    case NODE_STRUCT_INIT: {
+        Type *rt = checker_get_type(ctx->checker, expr);
+        if (!rt) goto passthrough;
+        Type *rt_eff = type_unwrap_distinct(rt);
+        if (rt_eff->kind == TYPE_VOID || rt_eff->kind == TYPE_ARRAY) goto passthrough;
+        /* Decompose field value expressions to locals */
+        int *field_locals = NULL;
+        if (expr->struct_init.field_count > 0) {
+            field_locals = (int *)arena_alloc(ctx->arena,
+                expr->struct_init.field_count * sizeof(int));
+            for (int i = 0; i < expr->struct_init.field_count; i++) {
+                rewrite_idents(ctx, expr->struct_init.fields[i].value);
+                field_locals[i] = lower_expr(ctx, expr->struct_init.fields[i].value);
+            }
+        }
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        IRInst inst = make_inst(IR_STRUCT_INIT_DECOMP, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.expr = expr; /* keep for field names + target type */
+        inst.call_arg_locals = field_locals;
+        inst.call_arg_local_count = expr->struct_init.field_count;
+        inst.cast_type = rt; /* target struct type for compound literal */
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
+    /* ---- Function calls: decompose args, create IR_CALL with local IDs ---- */
+    case NODE_CALL: {
+        rewrite_idents(ctx, expr);
+
+        /* Detect builtins — these have type-name args that can't be decomposed.
+         * Route builtins through IR_CALL with expr (emitter uses emit_expr). */
+        bool call_is_builtin = false;
+        bool call_is_comptime = expr->call.is_comptime_resolved;
+        if (expr->call.callee && expr->call.callee->kind == NODE_FIELD &&
+            expr->call.callee->field.object) {
+            Type *ot = checker_get_type(ctx->checker, expr->call.callee->field.object);
+            if (!ot && expr->call.callee->field.object->kind == NODE_IDENT) {
+                Symbol *s = scope_lookup(ctx->checker->global_scope,
+                    expr->call.callee->field.object->ident.name,
+                    (uint32_t)expr->call.callee->field.object->ident.name_len);
+                if (s) ot = s->type;
+            }
+            if (ot) {
+                Type *ot_eff = type_unwrap_distinct(ot);
+                if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+                    ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+                    ot_eff->kind == TYPE_STRUCT /* Task.new/delete */)
+                    call_is_builtin = true;
+            }
+        }
+
+        /* Decompose arguments to locals (skip for builtins — type-name args) */
+        int *arg_locals = NULL;
+        int arg_count = expr->call.arg_count;
+        if (arg_count > 0 && !call_is_builtin && !call_is_comptime) {
+            arg_locals = (int *)arena_alloc(ctx->arena, arg_count * sizeof(int));
+            for (int i = 0; i < arg_count; i++) {
+                arg_locals[i] = lower_expr(ctx, expr->call.args[i]);
+            }
+        }
+        Type *rt = checker_get_type(ctx->checker, expr);
+        if (!rt) rt = ty_i32;
+        Type *rt_eff = type_unwrap_distinct(rt);
+        /* Void calls don't produce storable value */
+        int tmp = -1;
+        if (rt_eff->kind != TYPE_VOID && rt_eff->kind != TYPE_ARRAY) {
+            tmp = create_temp(ctx, rt, expr->loc.line);
+        }
+        IRInst inst = make_inst(IR_CALL, expr->loc.line);
+        inst.dest_local = tmp;
+        inst.call_arg_locals = arg_locals;
+        inst.call_arg_local_count = arg_count;
+        inst.expr = expr; /* keep for builtin dispatch, module mangling, comptime */
+        inst.args = expr->call.args; /* keep for non-decomposable args */
+        inst.arg_count = arg_count;
+        /* Extract func name for simple calls */
+        if (expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
+            inst.func_name = expr->call.callee->ident.name;
+            inst.func_name_len = (uint32_t)expr->call.callee->ident.name_len;
+        }
+        emit_3ac(ctx, inst);
+        return tmp;
+    }
+
     case NODE_INTRINSIC:
     case NODE_ORELSE:
     case NODE_SLICE:
-    case NODE_STRUCT_INIT:
-    case NODE_TYPECAST:
     default:
     passthrough: {
         /* Create temp, emit IR_ASSIGN with expr (passthrough to emit_expr).

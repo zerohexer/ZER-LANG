@@ -6191,10 +6191,79 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CALL: {
-        /* IR_CALL no longer created by lowering — all calls go through IR_ASSIGN.
-         * Dead code guard: emit comment if somehow reached. */
+        /* Function call — emit from local IDs.
+         * Simple calls: func_name(local1, local2, ...) from decomposed args.
+         * Builtin/complex: delegated to emit_expr on rewritten AST. */
+        bool is_builtin = false;
+        bool is_comptime = false;
+
+        /* Detect builtins: callee is NODE_FIELD on pool/slab/ring/arena/Task type */
+        if (inst->expr && inst->expr->kind == NODE_CALL) {
+            Node *callee = inst->expr->call.callee;
+            if (callee && callee->kind == NODE_FIELD && callee->field.object) {
+                Type *ot = checker_get_type(e->checker, callee->field.object);
+                if (ot) {
+                    Type *ot_eff = type_unwrap_distinct(ot);
+                    if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+                        ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+                        ot_eff->kind == TYPE_STRUCT /* Task.new */)
+                        is_builtin = true;
+                }
+            }
+            /* Detect comptime calls */
+            if (inst->expr->call.is_comptime_resolved)
+                is_comptime = true;
+        }
+
         emit_indent(e);
-        emit(e, "/* IR_CALL dead — should be IR_ASSIGN */\n");
+        if (inst->dest_local >= 0) {
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
+        }
+
+        if (is_builtin || is_comptime) {
+            /* Builtins/comptime need emit_expr for inline C generation */
+            if (inst->expr) emit_expr(e, inst->expr);
+        } else if (inst->func_name && inst->call_arg_locals) {
+            /* Simple call: emit func_name(local1, local2, ...) from local IDs.
+             * Handle array→slice coercion for args when param expects slice. */
+            /* Look up callee's function type for param types */
+            Type *callee_ft = NULL;
+            if (inst->expr && inst->expr->kind == NODE_CALL && inst->expr->call.callee) {
+                Type *ct = checker_get_type(e->checker, inst->expr->call.callee);
+                if (ct) {
+                    Type *ct_eff = type_unwrap_distinct(ct);
+                    if (ct_eff->kind == TYPE_FUNC_PTR) callee_ft = ct_eff;
+                }
+            }
+            emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+            for (int i = 0; i < inst->call_arg_local_count; i++) {
+                if (i > 0) emit(e, ", ");
+                if (inst->call_arg_locals[i] >= 0) {
+                    IRLocal *al = &func->locals[inst->call_arg_locals[i]];
+                    Type *at = al->type ? type_unwrap_distinct(al->type) : NULL;
+                    /* Check if param expects slice but arg is array → coerce */
+                    Type *pt = (callee_ft && (uint32_t)i < callee_ft->func_ptr.param_count) ?
+                        type_unwrap_distinct(callee_ft->func_ptr.params[i]) : NULL;
+                    if (at && pt && at->kind == TYPE_ARRAY && pt->kind == TYPE_SLICE) {
+                        emit(e, "(");
+                        emit_type(e, pt);
+                        emit(e, "){ ");
+                        emit_local_name(e, func, inst->call_arg_locals[i]);
+                        emit(e, ", %u }", (unsigned)at->array.size);
+                    } else {
+                        emit_local_name(e, func, inst->call_arg_locals[i]);
+                    }
+                } else {
+                    emit(e, "0"); /* void/undecomposable arg */
+                }
+            }
+            emit(e, ")");
+        } else if (inst->expr) {
+            /* Fallback for module-qualified calls or complex callees */
+            emit_expr(e, inst->expr);
+        }
+        emit(e, ";\n");
         break;
     }
 
@@ -6642,17 +6711,111 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_FIELD_WRITE:
+    case IR_CAST: {
+        /* (Type)expr — emit from src_local + cast_type.
+         * 3 paths: to *opaque (wrap), from *opaque (unwrap+check), simple C cast. */
+        if (inst->dest_local >= 0 && inst->cast_type) {
+            Type *tgt = inst->cast_type;
+            Type *tgt_eff = type_unwrap_distinct(tgt);
+            Type *src_type = (inst->src1_local >= 0) ? func->locals[inst->src1_local].type : NULL;
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+
+            emit_indent(e);
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
+
+            /* To *opaque: wrap with type_id */
+            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
+                type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
+                src_eff && src_eff->kind == TYPE_POINTER) {
+                uint32_t tid = 0;
+                if (src_eff->pointer.inner) {
+                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
+                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
+                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
+                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                }
+                emit(e, "(_zer_opaque){(void*)(");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, "), %u}", (unsigned)tid);
+            }
+            /* From *opaque: unwrap .ptr with type check */
+            else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                     src_eff &&
+                     ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+                       type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
+                      src_eff->kind == TYPE_OPAQUE)) {
+                uint32_t expected_tid = 0;
+                if (tgt_eff->pointer.inner) {
+                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
+                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
+                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                }
+                if (expected_tid > 0 && inst->src1_local >= 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
+                         "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); (",
+                         tmp, (unsigned)expected_tid, tmp);
+                    emit_type(e, tgt);
+                    emit(e, ")_zer_pc%d.ptr; })", tmp);
+                } else if (inst->src1_local >= 0) {
+                    emit(e, "((");
+                    emit_type(e, tgt);
+                    emit(e, ")(");
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, ").ptr)");
+                }
+            }
+            /* Simple C cast */
+            else if (inst->src1_local >= 0) {
+                emit(e, "((");
+                emit_type(e, tgt);
+                emit(e, ")");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ")");
+            }
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_STRUCT_INIT_DECOMP: {
+        /* { .x = val1, .y = val2 } — emit compound literal from field locals.
+         * Field names from inst->expr (NODE_STRUCT_INIT), values from call_arg_locals[]. */
+        if (inst->dest_local >= 0 && inst->expr &&
+            inst->expr->kind == NODE_STRUCT_INIT && inst->cast_type) {
+            emit_indent(e);
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = (");
+            emit_type(e, inst->cast_type);
+            emit(e, "){ ");
+            for (int i = 0; i < inst->expr->struct_init.field_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit(e, ".%.*s = ", (int)inst->expr->struct_init.fields[i].name_len,
+                     inst->expr->struct_init.fields[i].name);
+                if (inst->call_arg_locals && i < inst->call_arg_local_count &&
+                    inst->call_arg_locals[i] >= 0) {
+                    emit_local_name(e, func, inst->call_arg_locals[i]);
+                } else {
+                    emit(e, "0"); /* fallback */
+                }
+            }
+            emit(e, " };\n");
+        }
+        break;
+    }
+
     case IR_INDEX_WRITE:
     case IR_ADDR_OF:
     case IR_DEREF_READ:
     case IR_CALL_DECOMP:
-    case IR_CAST:
     case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP:
-    case IR_SLICE_READ:
-    case IR_STRUCT_INIT_DECOMP: {
-        /* Future: emit from local IDs.
-         * Currently these go through passthrough (IR_ASSIGN with expr). */
+    case IR_SLICE_READ: {
+        /* Future: emit from local IDs. */
         emit_indent(e);
         emit(e, "/* 3AC op %d — TODO */\n", inst->op);
         break;

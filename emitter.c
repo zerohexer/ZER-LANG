@@ -6332,9 +6332,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ";\n");
             }
         } else {
-            /* Void or bare return — emit_return_null handles the full "return X;" */
-            emit_return_null(e);
-            emit(e, "\n");
+            /* Void or bare return */
+            if (func->is_async) {
+                /* Async poll function returns int: 1 = complete */
+                emit(e, "self->_zer_state = -1; return 1;\n");
+            } else {
+                emit_return_null(e);
+                emit(e, "\n");
+            }
         }
         break;
     }
@@ -6346,6 +6351,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             emit(e, "case %d:;\n", e->async_yield_id);
             e->async_yield_id++;
+            /* After resume, goto the NEXT block (resume point created by start_block).
+             * Without this, Duff's device falls through to the sequentially next block
+             * which may be the loop exit, not the resume continuation. */
+            if (inst->goto_block >= 0) {
+                emit_indent(e);
+                emit(e, "goto _zer_bb%d;\n", inst->goto_block);
+            }
         }
         break;
     }
@@ -6359,6 +6371,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (inst->expr) emit_expr(e, inst->expr);
             emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
             e->async_yield_id++;
+            /* Same as yield — goto resume block */
+            if (inst->goto_block >= 0) {
+                emit_indent(e);
+                emit(e, "goto _zer_bb%d;\n", inst->goto_block);
+            }
         }
         break;
     }
@@ -6519,6 +6536,145 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_stmt(e, inst->expr); /* ASM nodes emit via stmt */
         }
         break;
+
+    /* ================================================================
+     * Three-address-code ops — emit from local IDs, NOT emit_expr
+     * ================================================================ */
+
+    case IR_COPY: {
+        if (inst->dest_local >= 0 && inst->src1_local >= 0) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            IRLocal *src = &func->locals[inst->src1_local];
+            emit_indent(e);
+            if (func->is_async)
+                emit(e, "self->%.*s = self->%.*s;\n",
+                     (int)dst->name_len, dst->name,
+                     (int)src->name_len, src->name);
+            else
+                emit(e, "%.*s = %.*s;\n",
+                     (int)dst->name_len, dst->name,
+                     (int)src->name_len, src->name);
+        }
+        break;
+    }
+
+    case IR_LITERAL: {
+        if (inst->dest_local >= 0) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            emit_indent(e);
+            if (func->is_async)
+                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else
+                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            switch (inst->literal_kind) {
+            case 0: /* int */
+                if (inst->literal_int < 0)
+                    emit(e, "(%lld)", (long long)inst->literal_int);
+                else
+                    emit(e, "%lluULL", (unsigned long long)(uint64_t)inst->literal_int);
+                break;
+            case 1: /* float */
+                emit(e, "%.17g", inst->literal_float);
+                break;
+            case 2: /* string */
+                emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", %u }",
+                     (int)inst->literal_str_len, inst->literal_str,
+                     inst->literal_str_len);
+                break;
+            case 3: /* bool */
+                emit(e, "%s", inst->literal_int ? "1" : "0");
+                break;
+            case 4: /* null */
+                emit(e, "0");
+                break;
+            case 5: /* char */
+                if (inst->literal_int >= 32 && inst->literal_int < 127 &&
+                    inst->literal_int != '\'' && inst->literal_int != '\\')
+                    emit(e, "'%c'", (char)inst->literal_int);
+                else
+                    emit(e, "%d", (int)inst->literal_int);
+                break;
+            }
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_BINOP: {
+        /* Emit: dest = src1 OP src2
+         * For now, uses emit_expr on the original expression for correctness.
+         * TODO: emit from local IDs once all type adaptation is handled. */
+        if (inst->dest_local >= 0 && inst->expr) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            emit_indent(e);
+            if (func->is_async)
+                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else
+                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_UNOP: {
+        if (inst->dest_local >= 0 && inst->expr) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            emit_indent(e);
+            if (func->is_async)
+                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else
+                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_FIELD_READ: {
+        if (inst->dest_local >= 0 && inst->expr) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            emit_indent(e);
+            if (func->is_async)
+                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else
+                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_INDEX_READ: {
+        if (inst->dest_local >= 0 && inst->expr) {
+            IRLocal *dst = &func->locals[inst->dest_local];
+            emit_indent(e);
+            if (func->is_async)
+                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+            else
+                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            emit_expr(e, inst->expr);
+            emit(e, ";\n");
+        }
+        break;
+    }
+
+    case IR_FIELD_WRITE:
+    case IR_INDEX_WRITE:
+    case IR_ADDR_OF:
+    case IR_DEREF_READ:
+    case IR_CALL_DECOMP:
+    case IR_CAST:
+    case IR_INTRINSIC_DECOMP:
+    case IR_ORELSE_DECOMP:
+    case IR_SLICE_READ:
+    case IR_STRUCT_INIT_DECOMP: {
+        /* Future: emit from local IDs.
+         * Currently these go through passthrough (IR_ASSIGN with expr). */
+        emit_indent(e);
+        emit(e, "/* 3AC op %d — TODO */\n", inst->op);
+        break;
+    }
 
     default:
         emit_indent(e);

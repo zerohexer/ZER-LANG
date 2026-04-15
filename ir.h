@@ -23,8 +23,10 @@
  * ================================================================ */
 typedef struct {
     int id;                  /* unique within function, 0-based */
-    const char *name;        /* source name (for C emission + debugging) */
+    const char *name;        /* C emission name (may be suffixed for scope conflicts) */
     uint32_t name_len;
+    const char *orig_name;   /* original source name (for ir_find_local lookup) */
+    uint32_t orig_name_len;
     Type *type;              /* resolved type from checker */
 
     /* Classification (for analysis passes) */
@@ -86,6 +88,24 @@ typedef enum {
     /* --- Intrinsics --- */
     IR_INTRINSIC,        /* @ptrcast, @size, @truncate, @bitcast, etc. */
 
+    /* --- Three-address-code ops (Phase 8) --- */
+    IR_COPY,             /* dest = src (local-to-local) */
+    IR_BINOP,            /* dest = src1 OP src2 */
+    IR_UNOP,             /* dest = OP src */
+    IR_FIELD_READ,       /* dest = src.field */
+    IR_FIELD_WRITE,      /* src1.field = src2 */
+    IR_INDEX_READ,       /* dest = src[index] */
+    IR_INDEX_WRITE,      /* src1[index] = src2 */
+    IR_LITERAL,          /* dest = immediate value */
+    IR_ADDR_OF,          /* dest = &src */
+    IR_DEREF_READ,       /* dest = *src */
+    IR_CALL_DECOMP,      /* dest = func(arg locals) — decomposed call */
+    IR_CAST,             /* dest = (Type)src — C-style cast */
+    IR_INTRINSIC_DECOMP, /* dest = @intrinsic(arg locals) — decomposed intrinsic */
+    IR_ORELSE_DECOMP,    /* dest = src orelse fallback — decomposed */
+    IR_SLICE_READ,       /* dest = src[start..end] */
+    IR_STRUCT_INIT_DECOMP, /* dest = { .field = val, ... } */
+
     /* --- No-op (for IR structure) --- */
     IR_NOP,              /* placeholder — no code emitted */
 } IROpKind;
@@ -122,6 +142,25 @@ typedef struct IRInst {
     /* Intrinsic operand */
     const char *intrinsic_name;
     uint32_t intrinsic_name_len;
+
+    /* Three-address-code operands (Phase 8) */
+    int src1_local;          /* first source operand local ID (-1 = none) */
+    int src2_local;          /* second source operand local ID (-1 = none) */
+    int op_token;            /* operator token (TOK_PLUS, TOK_MINUS, etc.) for IR_BINOP/UNOP */
+    const char *field_name;  /* field name for IR_FIELD_READ/WRITE */
+    uint32_t field_name_len;
+    int64_t literal_int;     /* integer literal value for IR_LITERAL */
+    double literal_float;    /* float literal value for IR_LITERAL */
+    const char *literal_str; /* string literal for IR_LITERAL */
+    uint32_t literal_str_len;
+    uint8_t literal_kind;    /* 0=int, 1=float, 2=string, 3=bool, 4=null, 5=char */
+
+    /* Decomposed call args (local IDs) */
+    int *call_arg_locals;    /* array of local IDs for call arguments */
+    int call_arg_local_count;
+
+    /* Type info for emission (needed when emitting from local IDs) */
+    Type *cast_type;         /* target type for IR_CAST */
 } IRInst;
 
 /* ================================================================

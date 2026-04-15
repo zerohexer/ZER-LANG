@@ -6210,7 +6210,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 expr_type && !type_is_optional(expr_type)) {
                 /* Wrap non-optional value in optional struct */
                 emit(e, "return ");
-                emit_opt_wrap_value(e, ret_expr, ret_eff);
+                emit_opt_wrap_value(e, ret_eff, ret_expr);
                 emit(e, ";\n");
             } else if (ret_expr->kind == NODE_NULL_LIT && ret_eff) {
                 /* return null → optional null literal */
@@ -6466,10 +6466,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
 
-        /* Label (skip for entry block) */
-        if (bi > 0) {
-            emit(e, "_zer_bb%d:;\n", bb->id);
-        }
+        /* Label for every block (including bb0 — goto may target entry) */
+        emit(e, "_zer_bb%d:;\n", bb->id);
 
         /* Instructions */
         for (int ii = 0; ii < bb->inst_count; ii++) {
@@ -6552,7 +6550,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
-        if (bi > 0) {
+        {
             emit_indent(e);
             emit(e, "_zer_bb%d:;\n", bb->id);
         }

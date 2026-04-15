@@ -6577,12 +6577,34 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     /* Poll function = Duff's device */
     emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self) {\n",
          flen, mname, flen, mname);
+
+    /* Emit static locals BEFORE the switch (C static, not in state struct) */
+    {
+        Node *body = func->ast_node ? func->ast_node->func_decl.body : NULL;
+        if (body && body->kind == NODE_BLOCK) {
+            for (int si = 0; si < body->block.stmt_count; si++) {
+                Node *s = body->block.stmts[si];
+                if (s && s->kind == NODE_VAR_DECL && s->var_decl.is_static) {
+                    emit(e, "    static ");
+                    Type *vt = checker_get_type(e->checker, s);
+                    if (vt) emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
+                    if (s->var_decl.init) {
+                        emit(e, " = ");
+                        emit_expr(e, s->var_decl.init);
+                    }
+                    emit(e, ";\n");
+                }
+            }
+        }
+    }
+
     emit(e, "    switch (self->_zer_state) { case 0:;\n");
 
     e->indent = 1;
     e->async_yield_id = 1;
 
-    /* Set up async context so emit_expr uses self-> for locals */
+    /* Set up async context so emit_expr uses self-> for locals.
+     * Skip static locals — they're NOT self-> prefixed. */
     bool saved_async = e->in_async;
     e->in_async = true;
     e->async_local_count = 0;

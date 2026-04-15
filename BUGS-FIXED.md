@@ -3748,3 +3748,13 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** IR_RETURN bare return checks func->is_async — emits `self->_zer_state = -1; return 1;`
 
 **Test:** same as BUG-508
+
+### BUG-510: IR param types resolved as ty_void for complex types (2026-04-15)
+
+**Symptom:** `*Logger log` pointer param in function — IR local for `log` has `ty_void` type instead of `TYPE_POINTER`. IR_FIELD_READ emits `log.head` instead of `log->head`. GCC error: "'log' is a pointer; did you mean to use '->'?"
+
+**Root cause:** `ir_lower_func` param type resolution uses TYNODE switch for primitives, falls back to `scope_lookup(global_scope, param_name)` for complex types. Param names aren't in global scope → NULL → ty_void.
+
+**Fix:** Use `checker_get_type(func_decl)` to get func_type, extract param types from `func_type->func_ptr.params[i]`. Accurate types for all params including pointers, structs, optionals.
+
+**Test:** tests/zer/circular_log.zer (pointer param field access)

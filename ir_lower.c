@@ -1118,10 +1118,10 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     start_block(&ctx);
     lower_stmt(&ctx, func_decl->func_decl.body);
 
-    /* Ensure last block is terminated */
-    IRBlock *last = &func->blocks[func->block_count - 1];
-    if (last->inst_count == 0 || !ir_block_is_terminated(last)) {
-        /* Add implicit return */
+    /* Ensure CURRENT block is terminated (not last block — yield may
+     * create blocks after the current one, making last != current). */
+    IRBlock *cur = &func->blocks[ctx.current_block];
+    if (cur->inst_count == 0 || !ir_block_is_terminated(cur)) {
         IRInst ret = make_inst(IR_RETURN, func_decl->loc.line);
         emit_inst(&ctx, ret);
     }
@@ -1159,8 +1159,8 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     start_block(&ctx);
     lower_stmt(&ctx, interrupt->interrupt.body);
 
-    IRBlock *last = &func->blocks[func->block_count - 1];
-    if (last->inst_count == 0 || !ir_block_is_terminated(last)) {
+    IRBlock *cur = &func->blocks[ctx.current_block];
+    if (cur->inst_count == 0 || !ir_block_is_terminated(cur)) {
         IRInst ret = make_inst(IR_RETURN, interrupt->loc.line);
         emit_inst(&ctx, ret);
     }

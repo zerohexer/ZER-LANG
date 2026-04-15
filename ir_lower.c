@@ -1003,12 +1003,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             }
         }
 
-        /* Branch on condition — decompose if safe, else rewrite idents */
+        /* ALWAYS rewrite idents (captures may reference the condition expr).
+         * Then decompose if safe. */
+        rewrite_idents(ctx, node->if_stmt.cond);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         if (can_lower_expr(ctx, node->if_stmt.cond)) {
             br.cond_local = lower_expr(ctx, node->if_stmt.cond);
         } else {
-            rewrite_idents(ctx, node->if_stmt.cond);
             br.expr = node->if_stmt.cond;
         }
         br.true_block = bb_then;

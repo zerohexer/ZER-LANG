@@ -138,21 +138,29 @@ track which `m` is current.
 - 195/195 ZER + 761/761 rust pass (0 fail, 0 hang)
 
 **Phase 8c (done):** ZERO `emit_expr` in `emit_ir_inst`.
-- `emit_ast_bridge(e, expr)` — IR-aware wrapper isolating AST dependency
-- All 17 `emit_expr(e,...)` calls replaced with `emit_ast_bridge`
-- `grep "emit_expr(e," emit_ir_inst` = 0 (VERIFIED)
-- 17 `emit_ast_bridge` calls remain — these are the AST bridge for complex expressions
-- Future: replace bridge calls with local-ID emission per expression type
+- ZERO `emit_expr` in `emit_ir_inst`. `emit_ir_value(e, expr)` delegates to emit_expr on rewritten AST.
+- `can_lower_expr()` gates decomposition — blocks opaque, struct, array, slice, handle, builtin, global, call, intrinsic, cast expressions.
+- Conditions (if/for/while/do-while): `cond_local` via lower_expr when safe. Emitter: local name + `.has_value`.
+- Returns: `src1_local` via lower_expr when safe. Emitter: local-ID return with type adaptation.
+- Awaits: `cond_local` via lower_expr when safe. Emitter: `self->local_name`.
+- **17 `emit_ir_value` calls remain as FALLBACK** for complex expressions can_lower_expr rejects.
 
-## Phase 8b — Concrete Steps
+## Remaining work — replace emit_ir_value with local-ID emission
 
-### The wiring (lower_stmt changes):
+Each fallback `emit_ir_value` call needs its own C emission logic:
 
-1. `NODE_VAR_DECL` default init: replace `inst.expr = init` with `src = lower_expr(ctx, init); IR_COPY(dest, src)`
-2. `NODE_EXPR_STMT` simple assign: replace `inst.expr = expr` with `src = lower_expr(ctx, value); IR_COPY(dest, src)`
-3. `NODE_EXPR_STMT` call: replace `inst.expr = expr` with `lower_expr(ctx, expr)` (void result)
-4. `NODE_IF` condition: already has `br.expr = cond` → replace with `cond_local = lower_expr(ctx, cond)`
-5. `NODE_FOR` condition/step: replace `br.expr = cond` and `step.expr = step`
+| Category | Calls | Lines needed | What emit_expr does |
+|----------|-------|-------------|---------------------|
+| IR_ASSIGN (capture, ?void, main, void) | 4 | ~100 | Type adaptation, optional patterns |
+| IR_CALL + args | 2 | ~200 | Builtin dispatch, module mangling |
+| IR_BRANCH condition | 2 | ~30 | Optional .has_value, null-sentinel |
+| IR_RETURN expression | 2 | ~50 | Optional wrap, null literal |
+| IR_AWAIT condition | 1 | ~10 | Condition expression |
+| Builtins (pool/slab/ring/arena) | 1 | ~400 | Inline allocation/free/get/push/pop |
+| IR_INTRINSIC | 1 | ~100 | @ptrcast/@size/@truncate etc. |
+| 3AC fallbacks (BINOP/UNOP/FIELD_READ/INDEX_READ) | 4 | ~20 | Non-local ident emission |
+
+Total: ~910 lines. Each independently testable. 195/195 must pass after each.
 6. `NODE_WHILE/DO_WHILE` condition: replace `br.expr = cond`
 7. `NODE_RETURN` expression: replace `ret.expr = node` with `src = lower_expr(ctx, ret_expr)`
 

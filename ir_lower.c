@@ -203,13 +203,8 @@ static void collect_locals(LowerCtx *ctx, Node *node) {
         break;
 
     case NODE_SPAWN:
-        /* Scoped spawn: ThreadHandle th = spawn func(args) */
-        if (node->spawn_stmt.handle_name) {
-            ir_add_local(ctx->func, ctx->arena,
-                         node->spawn_stmt.handle_name,
-                         (uint32_t)node->spawn_stmt.handle_name_len,
-                         ty_u64, false, false, false, node->loc.line);
-        }
+        /* Spawn passed through to AST emit_stmt which declares pthread_t.
+         * DON'T add handle local here — would conflict with AST's declaration. */
         break;
 
     case NODE_BLOCK:
@@ -982,15 +977,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Spawn ---- */
     case NODE_SPAWN: {
-        IRInst sp = make_inst(IR_SPAWN, node->loc.line);
-        sp.func_name = node->spawn_stmt.func_name;
-        sp.func_name_len = (uint32_t)node->spawn_stmt.func_name_len;
-        sp.arg_count = node->spawn_stmt.arg_count;
-        sp.args = node->spawn_stmt.args;
-        sp.is_scoped_spawn = (node->spawn_stmt.handle_name != NULL);
-        sp.handle_name = node->spawn_stmt.handle_name;
-        sp.handle_name_len = (uint32_t)node->spawn_stmt.handle_name_len;
+        /* Spawn uses complex wrapper structs + pthread_create.
+         * Pass through as AST node for emit_stmt to handle. */
+        IRInst sp = make_inst(IR_NOP, node->loc.line);
+        sp.expr = node; /* emit_stmt handles NODE_SPAWN */
         emit_inst(ctx, sp);
+        /* For scoped spawn, assign ThreadHandle */
+        if (node->spawn_stmt.handle_name) {
+            int th_id = ir_find_local(ctx->func,
+                node->spawn_stmt.handle_name,
+                (uint32_t)node->spawn_stmt.handle_name_len);
+            if (th_id >= 0) {
+                /* emit_stmt already assigned the pthread_t */
+            }
+        }
         break;
     }
 

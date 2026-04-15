@@ -6114,12 +6114,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dest = &func->locals[inst->dest_local];
 
-            /* Captures with type conflict: block-scoped typed declaration.
-             * Only for captures inside { } scope blocks (name_conflict detected). */
+            /* Captures with type conflict: block-scoped typed declaration. */
             if (dest->is_capture && !func->is_async) {
                 Type *cap_src = checker_get_type(e->checker, inst->expr);
                 Type *cap_eff = cap_src ? type_unwrap_distinct(cap_src) : NULL;
-                /* Check if type differs from declared local type */
                 bool type_mismatch = false;
                 if (cap_eff && cap_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = cap_eff->optional.inner;
@@ -6131,7 +6129,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     }
                 }
                 if (type_mismatch) {
-                    /* Emit scoped declaration with correct inner type */
                     Type *inner = cap_eff->optional.inner;
                     emit_indent(e);
                     emit_type_and_name(e, inner, dest->name, dest->name_len);
@@ -6142,9 +6139,33 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 }
                 if (cap_eff && cap_eff->kind == TYPE_OPTIONAL &&
                     cap_eff->optional.inner->kind == TYPE_VOID) {
-                    break; /* ?void: skip capture (void can't be var) */
+                    break; /* ?void: skip capture */
                 }
-                /* No conflict: fall through to normal assignment (with .value unwrap) */
+            }
+
+            /* ?void from void call: hoist call before assignment (BUG-408).
+             * MUST check BEFORE emitting "dest = " prefix. */
+            {
+                Type *pre_src = checker_get_type(e->checker, inst->expr);
+                Type *pre_src_eff = pre_src ? type_unwrap_distinct(pre_src) : NULL;
+                Type *pre_dst = dest->type;
+                Type *pre_dst_eff = pre_dst ? type_unwrap_distinct(pre_dst) : NULL;
+                bool pre_void_opt = (pre_dst_eff && pre_dst_eff->kind == TYPE_OPTIONAL &&
+                                    pre_dst_eff->optional.inner &&
+                                    type_unwrap_distinct(pre_dst_eff->optional.inner)->kind == TYPE_VOID);
+                bool pre_src_void = (pre_src_eff && pre_src_eff->kind == TYPE_VOID);
+                if (pre_void_opt && pre_src_void && inst->expr->kind == NODE_CALL) {
+                    emit_indent(e);
+                    emit_expr(e, inst->expr);
+                    emit(e, ";\n");
+                    emit_indent(e);
+                    if (func->is_async)
+                        emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+                    else
+                        emit(e, "%.*s = ", (int)dest->name_len, dest->name);
+                    emit(e, "(_zer_opt_void){ 1 };\n");
+                    break;
+                }
             }
 
             emit_indent(e);
@@ -6175,26 +6196,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             bool need_slice = (dst_eff && dst_eff->kind == TYPE_SLICE &&
                               src_eff && src_eff->kind == TYPE_ARRAY);
 
-            /* ?void from void call: hoist call, assign {1} (BUG-408 pattern) */
-            bool is_void_opt = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
-                               dst_eff->optional.inner &&
-                               type_unwrap_distinct(dst_eff->optional.inner)->kind == TYPE_VOID);
-            /* Only hoist when source is void (not ?void) — if source already
-             * returns ?void, direct assignment works. */
-            bool src_is_void = (src_eff && src_eff->kind == TYPE_VOID);
-            if (is_void_opt && src_is_void && inst->expr && inst->expr->kind == NODE_CALL) {
-                emit_expr(e, inst->expr);
-                emit(e, ";\n");
-                emit_indent(e);
-                if (func->is_async) {
-                    emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
-                } else {
-                    emit(e, "%.*s = ", (int)dest->name_len, dest->name);
-                }
-                emit(e, "(_zer_opt_void){ 1 };\n");
-                break;
-            }
-
+            /* ?void hoist moved BEFORE "dest = " prefix (above) */
             if (need_null) {
                 emit_opt_null_literal(e, dst_eff);
             } else if (need_wrap) {
@@ -6307,10 +6309,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(ret_eff->optional.inner) &&
                 expr_type && !type_is_optional(expr_type)) {
-                /* Wrap non-optional value in optional struct */
-                emit(e, "return ");
-                emit_opt_wrap_value(e, ret_eff, ret_expr);
-                emit(e, ";\n");
+                /* ?void: hoist void expr, return { 1 } */
+                if (is_void_opt(ret_eff)) {
+                    emit_expr(e, ret_expr);
+                    emit(e, ";\n");
+                    emit_indent(e);
+                    emit(e, "return (_zer_opt_void){ 1 };\n");
+                } else {
+                    /* Wrap non-optional value in optional struct */
+                    emit(e, "return ");
+                    emit_opt_wrap_value(e, ret_eff, ret_expr);
+                    emit(e, ";\n");
+                }
             } else if (ret_expr->kind == NODE_NULL_LIT && ret_eff) {
                 /* return null → optional null literal */
                 emit(e, "return ");

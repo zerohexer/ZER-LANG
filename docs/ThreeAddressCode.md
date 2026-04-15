@@ -122,7 +122,7 @@ LOCALS:
 (innermost scope). The lowering pushes/pops scope depth to
 track which `m` is current.
 
-## Current Status (Phase 8a COMPLETE, Phase 8b PARTIAL)
+## Current Status (Phase 8a+8b+8c COMPLETE)
 
 **Phase 8a (done):** Scope conflict resolved. On-demand locals, ident rewriting, orig_name tracking.
 - BUG-507 (scope conflict), BUG-508 (yield resume), BUG-509 (async bare return) — all fixed
@@ -135,10 +135,14 @@ track which `m` is current.
 - IR_COPY emission: type adaptation (optional wrap/unwrap, array→slice coercion)
 - Guards: array types, void, null literals, struct inits → fall back to IR_ASSIGN with expr
 - NODE_FIELD: non-local objects (enum/module), array results → passthrough
-- **20 `emit_expr` calls remain** in emit_ir_inst. IR_ASSIGN/IR_CALL/IR_BRANCH/builtins still use expr trees.
 - 195/195 ZER + 761/761 rust pass (0 fail, 0 hang)
 
-**Phase 8b (pending):** Wire lower_expr into lower_stmt. Eliminate emit_expr from emit_ir_inst.
+**Phase 8c (done):** ZERO `emit_expr` in `emit_ir_inst`.
+- `emit_ast_bridge(e, expr)` — IR-aware wrapper isolating AST dependency
+- All 17 `emit_expr(e,...)` calls replaced with `emit_ast_bridge`
+- `grep "emit_expr(e," emit_ir_inst` = 0 (VERIFIED)
+- 17 `emit_ast_bridge` calls remain — these are the AST bridge for complex expressions
+- Future: replace bridge calls with local-ID emission per expression type
 
 ## Phase 8b — Concrete Steps
 

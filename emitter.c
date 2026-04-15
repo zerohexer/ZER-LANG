@@ -6145,7 +6145,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             bool is_void_opt = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
                                dst_eff->optional.inner &&
                                type_unwrap_distinct(dst_eff->optional.inner)->kind == TYPE_VOID);
-            if (is_void_opt && inst->expr && inst->expr->kind == NODE_CALL) {
+            /* Only hoist when source is void (not ?void) — if source already
+             * returns ?void, direct assignment works. */
+            bool src_is_void = (src_eff && src_eff->kind == TYPE_VOID);
+            if (is_void_opt && src_is_void && inst->expr && inst->expr->kind == NODE_CALL) {
                 emit_expr(e, inst->expr);
                 emit(e, ";\n");
                 emit_indent(e);

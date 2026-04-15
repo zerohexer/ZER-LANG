@@ -6474,6 +6474,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     emit(e, ") {\n");
     e->indent++;
     e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
+    e->defer_stack.count = 0; /* clear defer stack from previous function */
 
     /* Declare local variables (skip params — they're parameters) */
     for (int li = 0; li < func->local_count; li++) {

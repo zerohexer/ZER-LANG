@@ -494,7 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
-| IR Phase 1-8 (data structures, lowering, 3AC, emission, zercheck, VRP) | Done | Done. Migration: --use-ir, **195/195 ZER + 761/761 rust, 0 fail, 0 hang**. Phase 8a: on-demand locals, ident rewriting, scope conflict (BUG-507), async yield resume (BUG-508/509). Phase 8b: `lower_expr()` wired for ident/literal/binary/unary → IR_COPY with type adaptation. 3AC ops (IR_BINOP/UNOP/FIELD_READ/INDEX_READ) emit from local IDs. Param types from checker func_type (BUG-510). **21 `emit_expr` calls remain** in old instruction types (IR_ASSIGN/IR_CALL/IR_BRANCH/IR_RETURN/builtins) + fallback paths. See `docs/ThreeAddressCode.md`. |
+| IR Phase 1-8 (data structures, lowering, 3AC, emission, zercheck, VRP) | Done | Done. Migration: --use-ir, **195/195 ZER + 761/761 rust, 0 fail, 0 hang**. Phase 8 complete: (a) on-demand locals, ident rewriting, scope conflict BUG-507, async yield BUG-508/509. (b) `lower_expr()` wired for ident/literal/binary/unary/field/index/string → IR_COPY. 3AC ops emit from local IDs. (c) **ZERO `emit_expr` in `emit_ir_inst`** — all replaced with `emit_ast_bridge()`. AST dependency isolated into one bridge function. Future: replace bridge calls with local-ID emission per expression type. |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

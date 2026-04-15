@@ -20,9 +20,9 @@ Total: ~2042 new lines. All 4000+ tests pass.
 
 **Phases 6-7 (now done):** zercheck_ir.c (452 lines — handle tracking on CFG, integer LOCAL IDs, real merge at predecessors, fixed-point iteration, leak detection). vrp_ir.c (349 lines — range per LOCAL per block, scoped address_taken, merge at join points). Total IR: ~2870 new lines across 6 files.
 
-**Migration progress:** `--use-ir` flag wired. **178/195 (91%)** ZER tests compile on IR path.
-All fixes: param types from AST, return optional wrapping, IR_BRANCH .has_value + cond_local, IR_ASSIGN .value unwrap + optional wrap + null literal, bb0 label, async self->, arg order, #line disabled, defer stack clear, spawn handle local.
-Remaining 17: async_exprstmt_orelse, async_orelse_value_yield, async_static_local, async_switch_capture_yield, async_two_orelse_yield, callback_system, comptime_const_if, distinct_union_assign, event_system, move_switch_ptr_capture, optional_patterns, slice_subslice, tagged_values, union_array_variant, union_variant, void_optional_init, yield_in_orelse.
+**Migration progress:** `--use-ir` flag wired. **180/195 (92%)** ZER tests compile on IR path.
+All fixes: param types from AST, return optional wrapping, IR_BRANCH .has_value + cond_local, IR_ASSIGN unwrap/wrap/null, bb0 label, async self->, arg order, #line disabled, defer stack clear, spawn handle, comptime-if dead branch, async static locals, void capture skip.
+Remaining 15: async_exprstmt_orelse, async_orelse_value_yield, async_switch_capture_yield, async_two_orelse_yield, callback_system, distinct_union_assign, event_system, move_switch_ptr_capture, optional_patterns, slice_subslice, tagged_values, union_array_variant, union_variant, void_optional_init, yield_in_orelse.
 
 23 of 29 safety systems on IR, 6 on checker (pre-IR infrastructure). Rule: "what does it mean?" → checker, "is it safe?" → IR.
 

@@ -541,10 +541,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int local_id = ir_find_local(ctx->func,
             node->var_decl.name, (uint32_t)node->var_decl.name_len);
         if (local_id >= 0 && node->var_decl.init) {
-            /* In async functions: orelse must be lowered to IR branches
-             * (can't use GCC stmt expr — Duff's case labels can't go inside ({...})) */
+            /* Orelse must be lowered to IR branches when:
+             * - Async function (Duff's case labels can't go inside GCC stmt expr)
+             * - Inside a loop (IR loops use gotos — C break/continue won't work in stmt expr)
+             * - Orelse fallback is break/continue (needs C loop, but IR uses gotos) */
             Node *orelse = find_orelse(node->var_decl.init);
-            if (orelse && ctx->func->is_async) {
+            bool need_ir_orelse = orelse && (ctx->func->is_async ||
+                ctx->loop_exit_block >= 0 || /* inside a loop = IR gotos for loop */
+                orelse->orelse.fallback_is_break || orelse->orelse.fallback_is_continue);
+            if (need_ir_orelse) {
                 lower_orelse_to_dest(ctx, local_id, orelse, node->loc.line);
             } else {
                 /* Check if init is a builtin call */
@@ -574,13 +579,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
 
-        /* Async orelse in expr-stmt: lower to IR branches */
-        if (ctx->func->is_async) {
+        /* Orelse in expr-stmt: lower to IR branches when async, inside loop, or break/continue */
+        {
             Node *orelse = find_orelse(expr);
-            if (!orelse && expr->kind == NODE_CALL) {
-                /* Check if call result has orelse */
-            }
-            if (orelse) {
+            bool need_ir = orelse && (ctx->func->is_async ||
+                ctx->loop_exit_block >= 0 ||
+                orelse->orelse.fallback_is_break || orelse->orelse.fallback_is_continue);
+            if (need_ir) {
                 lower_orelse_to_dest(ctx, -1, orelse, node->loc.line);
                 break;
             }

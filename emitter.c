@@ -6127,7 +6127,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
             bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
                                dst_eff && dst_eff->kind != TYPE_OPTIONAL &&
-                               !is_null_sentinel(src_eff->optional.inner));
+                               !is_null_sentinel(src_eff->optional.inner) &&
+                               src_eff->optional.inner->kind != TYPE_VOID &&
+                               type_equals(type_unwrap_distinct(src_eff->optional.inner), dst_eff));
             bool need_wrap = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
                              !is_null_sentinel(dst_eff->optional.inner) &&
                              src_eff && src_eff->kind != TYPE_OPTIONAL);

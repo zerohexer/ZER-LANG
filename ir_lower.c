@@ -416,9 +416,12 @@ static Node *find_orelse(Node *expr) {
  */
 static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line) {
     /* Create temp for the optional result */
-    char tmp_name[32];
+    char tmp_buf[32];
     int tn = ctx->temp_count++;
-    int tl = snprintf(tmp_name, sizeof(tmp_name), "_zer_or%d", tn);
+    int tl = snprintf(tmp_buf, sizeof(tmp_buf), "_zer_or%d", tn);
+    /* Arena-allocate the name — stack buffer would dangle after this function returns */
+    char *tmp_name = (char *)arena_alloc(ctx->arena, tl + 1);
+    memcpy(tmp_name, tmp_buf, tl + 1);
     Type *opt_type = checker_get_type(ctx->checker, orelse_node->orelse.expr);
     int tmp_id = ir_add_local(ctx->func, ctx->arena,
         tmp_name, (uint32_t)tl, opt_type, false, false, true, line);

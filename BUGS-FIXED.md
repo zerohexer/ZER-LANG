@@ -18,7 +18,9 @@ Total: ~2042 new lines. All 4000+ tests pass.
 **Phase 4:** Pipeline hookup — `--emit-ir` flag in zerc_main.c. Lowers + validates + prints IR for all functions.
 **Phase 5:** `emit_func_from_ir()` — IR → C emission. Regular + async functions. Reuses existing emit_expr for expression trees.
 
-**Phases 6-7 (remaining):** zercheck on IR (real CFG), VRP on IR (per-LOCAL ranges).
+**Phases 6-7 (now done):** zercheck_ir.c (452 lines — handle tracking on CFG, integer LOCAL IDs, real merge at predecessors, fixed-point iteration, leak detection). vrp_ir.c (349 lines — range per LOCAL per block, scoped address_taken, merge at join points). Total IR: ~2870 new lines across 6 files.
+
+**Next:** Wire IR path as default (migration). 23 of 29 safety systems on IR, 6 on checker (pre-IR infrastructure). Rule: "what does it mean?" → checker, "is it safe?" → IR.
 
 ### Async capture ghost bug fixed
 If-unwrap capture (`if (opt) |val|`) was emitted as C stack local in async poll function. After yield+resume, `val` read garbage from stale stack. Fix: `collect_async_locals` now adds capture names. State struct emission adds capture fields. Test updated to verify value survives yield+resume.

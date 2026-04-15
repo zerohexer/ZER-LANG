@@ -1191,7 +1191,17 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 - Checker type as void* in ir.h (anonymous struct can't be forward-declared)
 - Empty blocks allowed (join points)
 
-**Current status:** `--emit-ir` prints IR. `emit_func_from_ir` available for incremental migration. AST path still active default. Phases 6-7 (zercheck + VRP on IR) are next.
+**Current status:** All 7 phases implemented. `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block. AST path still active default — migration (wiring IR path as default) is next.
+
+**New files from Phase 6+7:**
+- `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.
+- `vrp_ir.c` (349 lines) — value range per LOCAL id per block. Merge at join points (range widening). Derive from literals, `x % N`, `x & MASK`. Scoped address_taken (not permanent like AST VRP). Function calls invalidate only address-taken locals.
+
+**Checker vs IR system split (23/6):**
+- **Checker (6 systems):** Typemap (#1), Type ID (#2), MMIO Ranges (#19), Qualifiers (#20), Containers (#25), Comptime (#26). These run BEFORE IR exists — they CREATE the typed AST that IR is lowered from.
+- **IR (23 systems):** Everything else. Safety analysis that needs data flow, paths, or CFG.
+- **Rule:** "What does it MEAN?" → checker (AST). "Is it SAFE?" → IR. Types/scopes first, safety second.
+- Non-storable (#16) and Keep params (#21) should move from checker to IR (data flow checks, not type checks). Defer stack (#23) already moved (IR_DEFER_PUSH/FIRE).
 
 ## Firmware Examples + Polish (2026-04-13)
 

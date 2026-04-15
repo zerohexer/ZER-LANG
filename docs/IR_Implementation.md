@@ -939,7 +939,50 @@ Sits between checker and emitter. Still emits C → GCC.
 ~5200 new lines, ~3500 removed. 2-3 months for solo developer.
 
 ### Status
-**Planned for v0.4.** Design document complete. Implementation not started.
+**All 7 phases implemented (2026-04-15).** ~2870 new lines. All 4000+ tests pass.
+
+| Phase | File | Lines | Status |
+|---|---|---|---|
+| 1 | ir.h | 241 | Data structures, API ✓ |
+| 1 | ir.c | 416 | Construction, validation, pretty-printer ✓ |
+| 2 | ir_lower.c | 960 | AST → IR lowering ✓ |
+| 3 | (in ir.c) | — | Validation ✓ |
+| 4 | (in zerc_main.c) | +25 | --emit-ir flag ✓ |
+| 5 | (in emitter.c) | +425 | emit_func_from_ir ✓ |
+| 6 | zercheck_ir.c | 452 | Handle tracking on CFG ✓ |
+| 7 | vrp_ir.c | 349 | Range propagation on locals ✓ |
+
+**Next:** Wire IR path as default (migration). Route functions through IR, compare output with AST path, delete AST path when all tests pass.
+
+### Checker vs IR System Split (23/6)
+
+**Rule:** "What does it MEAN?" → checker (AST). "Is it SAFE?" → IR.
+
+**Checker (6 systems, run before IR exists):**
+These CREATE the typed AST that IR is lowered from. Can't move to IR.
+- #1 Typemap — Node → Type resolution
+- #2 Type ID — runtime provenance tags
+- #19 MMIO Ranges — constant address validation
+- #20 Qualifiers — const/volatile type-level checks
+- #25 Containers — monomorphization stamping
+- #26 Comptime — compile-time evaluation
+
+**IR (23 systems, run after lowering):**
+Everything that needs data flow, paths, or CFG.
+- All of Model 1 (handle states, move tracking, alloc coloring, alloc ID)
+- Most of Model 2 (VRP, provenance, escape flags, auto-guard, dynamic freed, context flags for scope-exit, union lock)
+- All of Model 3 (FuncProps, FuncSummary, ProvSummary, ParamProv, RetRange, StackFrames, SpawnScan, SharedTypes, ISR)
+- Most of Model 4 (non-storable, keep params → should move to IR)
+- Defer stack (#23) already moved (IR_DEFER_PUSH/FIRE)
+
+**Analogy:** Same architecture as Rust (HIR type check → MIR borrow check), Go (type check → SSA analysis), Swift (Sema → SIL). Types first, safety second. Every compiler does this.
+
+**ZER vs Rust pipeline comparison:**
+```
+Rust: AST → HIR → type check → MIR → borrow check → LLVM IR  (4 representations)
+ZER:  AST →        type check → IR  → zercheck      → C        (2 representations)
+```
+ZER skips HIR because ZER syntax has minimal sugar (no closures, pattern matching, lifetime elision). The AST IS simple enough to type-check directly.
 
 ---
 

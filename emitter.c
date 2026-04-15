@@ -6117,10 +6117,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
-                /* Locals already declared at function top — just assign */
                 emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
+            /* Check if unwrap needed: source is optional, dest is not */
+            Type *src_type = checker_get_type(e->checker, inst->expr);
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+            Type *dst_type = dest->type;
+            Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
+            bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
+                               dst_eff && dst_eff->kind != TYPE_OPTIONAL &&
+                               !is_null_sentinel(src_eff->optional.inner));
             emit_expr(e, inst->expr);
+            if (need_unwrap) emit(e, ".value");
             emit(e, ";\n");
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
@@ -6158,14 +6166,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_BRANCH: {
         emit_indent(e);
         emit(e, "if (");
-        if (inst->expr) {
-            /* Check if condition is an optional type — needs special emission.
-             * Optional structs: emit .has_value. Null-sentinel (?*T): emit as-is. */
+        if (inst->cond_local >= 0) {
+            /* Branch on a LOCAL's value (orelse pattern).
+             * Check type: optional struct → .has_value, null-sentinel → as-is. */
+            IRLocal *cl = &func->locals[inst->cond_local];
+            Type *cond_eff = cl->type ? type_unwrap_distinct(cl->type) : NULL;
+            if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(cond_eff->optional.inner)) {
+                if (func->is_async)
+                    emit(e, "self->%.*s.has_value", (int)cl->name_len, cl->name);
+                else
+                    emit(e, "%.*s.has_value", (int)cl->name_len, cl->name);
+            } else {
+                if (func->is_async)
+                    emit(e, "self->%.*s", (int)cl->name_len, cl->name);
+                else
+                    emit(e, "%.*s", (int)cl->name_len, cl->name);
+            }
+        } else if (inst->expr) {
+            /* Branch on AST expression — check optional type */
             Type *cond_type = checker_get_type(e->checker, inst->expr);
             Type *cond_eff = cond_type ? type_unwrap_distinct(cond_type) : NULL;
             if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(cond_eff->optional.inner)) {
-                /* Struct optional — check .has_value */
                 emit(e, "(");
                 emit_expr(e, inst->expr);
                 emit(e, ").has_value");

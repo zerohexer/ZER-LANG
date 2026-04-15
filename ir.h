@@ -100,6 +100,7 @@ typedef struct IRInst {
     int true_block;          /* IR_BRANCH: target if true */
     int false_block;         /* IR_BRANCH: target if false */
     int goto_block;          /* IR_GOTO: target block */
+    int cond_local;          /* IR_BRANCH: if >= 0, branch on this LOCAL's has_value (orelse pattern) */
 
     /* Call/spawn operands */
     const char *func_name;

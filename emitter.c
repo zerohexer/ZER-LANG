@@ -6106,6 +6106,24 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
  * the AST-based emit_stmt path is deleted.
  * ================================================================ */
 
+/* ================================================================
+ * AST Bridge — IR-aware expression emission
+ *
+ * Handles expressions that can't be decomposed to local-ID operands:
+ * function calls (builtins, module-qualified), intrinsics, orelse,
+ * casts, opaque comparison, handle auto-deref, volatile, bounds checks.
+ *
+ * All NODE_IDENTs in the expression tree have been rewritten by
+ * rewrite_idents() to use the correct (possibly suffixed) local names.
+ * This function delegates to emit_expr which uses those rewritten names.
+ *
+ * Phase 8c: isolates AST dependency into one bridge. Future sessions
+ * replace bridge calls with local-ID emission one expression type at a time.
+ * ================================================================ */
+static void emit_ast_bridge(Emitter *e, Node *expr) {
+    emit_expr(e, expr);
+}
+
 /* Emit one IR instruction as C code */
 static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     switch (inst->op) {
@@ -6133,7 +6151,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit_indent(e);
                     emit_type_and_name(e, inner, dest->name, dest->name_len);
                     emit(e, " = ");
-                    emit_expr(e, inst->expr);
+                    emit_ast_bridge(e, inst->expr);
                     emit(e, ".value;\n");
                     break;
                 }
@@ -6156,7 +6174,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 bool pre_src_void = (pre_src_eff && pre_src_eff->kind == TYPE_VOID);
                 if (pre_void_opt && pre_src_void && inst->expr->kind == NODE_CALL) {
                     emit_indent(e);
-                    emit_expr(e, inst->expr);
+                    emit_ast_bridge(e, inst->expr);
                     emit(e, ";\n");
                     emit_indent(e);
                     if (func->is_async)
@@ -6204,14 +6222,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else if (need_slice) {
                 emit_array_as_slice(e, inst->expr, src_type, dst_type);
             } else {
-                emit_expr(e, inst->expr);
+                emit_ast_bridge(e, inst->expr);
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
             emit(e, ";\n");
         }
         break;
@@ -6228,12 +6246,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
         }
         if (inst->expr) {
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
         } else if (inst->func_name) {
             emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
             for (int i = 0; i < inst->arg_count; i++) {
                 if (i > 0) emit(e, ", ");
-                if (inst->args && inst->args[i]) emit_expr(e, inst->args[i]);
+                if (inst->args && inst->args[i]) emit_ast_bridge(e, inst->args[i]);
             }
             emit(e, ")");
         }
@@ -6268,10 +6286,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(cond_eff->optional.inner)) {
                 emit(e, "(");
-                emit_expr(e, inst->expr);
+                emit_ast_bridge(e, inst->expr);
                 emit(e, ").has_value");
             } else {
-                emit_expr(e, inst->expr);
+                emit_ast_bridge(e, inst->expr);
             }
         } else {
             emit(e, "1");
@@ -6311,7 +6329,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 expr_type && !type_is_optional(expr_type)) {
                 /* ?void: hoist void expr, return { 1 } */
                 if (is_void_opt(ret_eff)) {
-                    emit_expr(e, ret_expr);
+                    emit_ast_bridge(e, ret_expr);
                     emit(e, ";\n");
                     emit_indent(e);
                     emit(e, "return (_zer_opt_void){ 1 };\n");
@@ -6328,7 +6346,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ";\n");
             } else {
                 emit(e, "return ");
-                emit_expr(e, ret_expr);
+                emit_ast_bridge(e, ret_expr);
                 emit(e, ";\n");
             }
         } else {
@@ -6368,7 +6386,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, "case %d:;\n", e->async_yield_id);
             emit_indent(e);
             emit(e, "if (!(");
-            if (inst->expr) emit_expr(e, inst->expr);
+            if (inst->expr) emit_ast_bridge(e, inst->expr);
             emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
             e->async_yield_id++;
             /* Same as yield — goto resume block */
@@ -6407,7 +6425,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
     case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
         /* Builtin methods — emit via AST expression tree.
-         * emit_expr handles inline code generation for pool/slab/ring/arena. */
+         * emit_ast_bridge handles inline code generation for pool/slab/ring/arena. */
         emit_indent(e);
         if (inst->dest_local >= 0) {
             IRLocal *dest = &func->locals[inst->dest_local];
@@ -6418,7 +6436,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
         }
         if (inst->expr) {
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
             /* Unwrap .value if builtin returns optional but dest is not */
             if (inst->dest_local >= 0) {
                 IRLocal *bd = &func->locals[inst->dest_local];
@@ -6524,7 +6542,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
         }
-        if (inst->expr) emit_expr(e, inst->expr);
+        if (inst->expr) emit_ast_bridge(e, inst->expr);
         emit(e, ";\n");
         break;
     }
@@ -6538,7 +6556,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
 
     /* ================================================================
-     * Three-address-code ops — emit from local IDs, NOT emit_expr
+     * Three-address-code ops — emit from local IDs, NOT emit_expr (uses emit_ast_bridge)
      * ================================================================ */
 
     case IR_COPY: {
@@ -6660,7 +6678,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
             else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
             emit(e, ";\n");
         }
         break;
@@ -6700,7 +6718,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
             else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
             emit(e, ";\n");
         }
         unop_done:
@@ -6709,12 +6727,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_FIELD_READ: {
         /* Emit: dest = src.field — from local IDs.
-         * Complex cases (handle auto-deref, volatile, bounds) → emit_expr fallback. */
+         * Complex cases (handle auto-deref, volatile, bounds) → emit_ast_bridge fallback. */
         if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->field_name) {
             IRLocal *dst = &func->locals[inst->dest_local];
             IRLocal *s1 = &func->locals[inst->src1_local];
             Type *st = s1->type ? type_unwrap_distinct(s1->type) : NULL;
-            /* Handle/opaque/complex → emit_expr (has auto-deref, gen check, etc.) */
+            /* Handle/opaque/complex → emit_ast_bridge (has auto-deref, gen check, etc.) */
             if (st && (st->kind == TYPE_HANDLE || st->kind == TYPE_OPAQUE ||
                        st->kind == TYPE_POOL || st->kind == TYPE_SLAB ||
                        st->kind == TYPE_RING || st->kind == TYPE_ARENA)) {
@@ -6734,7 +6752,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
             else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
             emit(e, ";\n");
         }
         break;
@@ -6767,7 +6785,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
             else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_expr(e, inst->expr);
+            emit_ast_bridge(e, inst->expr);
             emit(e, ";\n");
         }
         break;

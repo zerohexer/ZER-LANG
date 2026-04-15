@@ -3758,3 +3758,23 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Use `checker_get_type(func_decl)` to get func_type, extract param types from `func_type->func_ptr.params[i]`. Accurate types for all params including pointers, structs, optionals.
 
 **Test:** tests/zer/circular_log.zer (pointer param field access)
+
+### BUG-511: ir_find_local didn't match rewritten ident names (2026-04-16)
+
+**Symptom:** After rewrite_idents changed `m` to `m_12`, lower_expr(NODE_IDENT("m_12")) called ir_find_local("m_12") which searched by orig_name "m" — name_len mismatch → returned -1 → fell back to emit_expr passthrough → wrong variable used.
+
+**Root cause:** ir_find_local only searched by orig_name (source name before suffix). Rewritten idents have the C emission name (e.g., "m_12") which doesn't match orig_name ("m").
+
+**Fix:** ir_find_local searches by BOTH orig_name AND C emission name. Returns last match from either.
+
+**Test:** rust_tests/rt_conc_ring_producer_consumer.zer
+
+### BUG-512: can_lower_expr path skipped rewrite_idents (2026-04-16)
+
+**Symptom:** `msg = m.value` used wrong `m` (Msg instead of ?Msg m_12). The capture assignment `cap.expr = node->if_stmt.cond` stored the original (unrewritten) condition expression.
+
+**Root cause:** NODE_IF handler called rewrite_idents ONLY in the fallback path (when can_lower_expr returned false). When can_lower_expr returned true, it called lower_expr directly — the condition expr was NOT rewritten. But the capture assignment shares the same expr pointer.
+
+**Fix:** ALWAYS call rewrite_idents on the condition BEFORE can_lower_expr/lower_expr. Rewriting is a prerequisite for both paths — the capture assignment needs the rewritten names.
+
+**Test:** rust_tests/rt_conc_ring_producer_consumer.zer

@@ -142,92 +142,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node);
 static void rewrite_idents(LowerCtx *ctx, Node *expr);
 static int lower_expr(LowerCtx *ctx, Node *expr);
 
-/* Check if expression is safe for lower_expr decomposition.
- * Returns false for expressions with complex emission needs:
- * - opaque struct comparison (needs .ptr)
- * - array-type results (can't assign)
- * - void results (can't store in temp)
- * - non-local idents (globals, enums — need full emit_expr)
- * - function calls (builtins, module mangling)
- * - intrinsics, casts, orelse, struct init */
-static bool can_lower_expr(LowerCtx *ctx, Node *expr) {
-    if (!expr) return false;
-    switch (expr->kind) {
-    case NODE_IDENT: {
-        int id = ir_find_local(ctx->func, expr->ident.name,
-                               (uint32_t)expr->ident.name_len);
-        return id >= 0; /* only locals, not globals/enum/module */
-    }
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_BOOL_LIT:
-    case NODE_CHAR_LIT: case NODE_STRING_LIT:
-        return true;
-    case NODE_BINARY: {
-        /* Check both operands can be decomposed AND types aren't complex */
-        Type *rt = checker_get_type(ctx->checker, expr);
-        if (rt) {
-            Type *rt_eff = type_unwrap_distinct(rt);
-            if (rt_eff->kind == TYPE_OPAQUE || rt_eff->kind == TYPE_ARRAY ||
-                rt_eff->kind == TYPE_VOID)
-                return false;
-        }
-        /* Check operand types — opaque needs .ptr, struct needs special compare */
-        Type *lt = checker_get_type(ctx->checker, expr->binary.left);
-        Type *rtt = checker_get_type(ctx->checker, expr->binary.right);
-        if (lt) { Type *le = type_unwrap_distinct(lt);
-            if (le->kind == TYPE_OPAQUE || le->kind == TYPE_STRUCT) return false;
-            /* *opaque = pointer to opaque */
-            if (le->kind == TYPE_POINTER && le->pointer.inner &&
-                type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE) return false; }
-        if (rtt) { Type *re = type_unwrap_distinct(rtt);
-            if (re->kind == TYPE_OPAQUE || re->kind == TYPE_STRUCT) return false;
-            if (re->kind == TYPE_POINTER && re->pointer.inner &&
-                type_unwrap_distinct(re->pointer.inner)->kind == TYPE_OPAQUE) return false; }
-        /* Also check via IR local types (typemap may not have type for idents) */
-        if (expr->binary.left && expr->binary.left->kind == NODE_IDENT) {
-            int lid = ir_find_local(ctx->func, expr->binary.left->ident.name,
-                                    (uint32_t)expr->binary.left->ident.name_len);
-            if (lid >= 0 && ctx->func->locals[lid].type) {
-                Type *le = type_unwrap_distinct(ctx->func->locals[lid].type);
-                if (le->kind == TYPE_OPAQUE) return false;
-                if (le->kind == TYPE_POINTER && le->pointer.inner &&
-                    type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE) return false;
-            }
-        }
-        return can_lower_expr(ctx, expr->binary.left) &&
-               can_lower_expr(ctx, expr->binary.right);
-    }
-    case NODE_UNARY:
-        return can_lower_expr(ctx, expr->unary.operand);
-    case NODE_FIELD: {
-        /* Only if object is a local with non-complex type */
-        if (!expr->field.object || expr->field.object->kind != NODE_IDENT)
-            return false;
-        int id = ir_find_local(ctx->func, expr->field.object->ident.name,
-                               (uint32_t)expr->field.object->ident.name_len);
-        if (id < 0) return false;
-        Type *rt = checker_get_type(ctx->checker, expr);
-        if (rt) {
-            Type *rt_eff = type_unwrap_distinct(rt);
-            if (rt_eff->kind == TYPE_ARRAY) return false;
-        }
-        /* Check object type — handles, opaques, arrays, slices need emit_expr */
-        Type *ot = ctx->func->locals[id].type;
-        if (ot) {
-            Type *ot_eff = type_unwrap_distinct(ot);
-            if (ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_OPAQUE ||
-                ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
-                ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
-                ot_eff->kind == TYPE_ARRAY || ot_eff->kind == TYPE_SLICE)
-                return false;
-        }
-        return true;
-    }
-    case NODE_INDEX:
-        return false; /* bounds checks need emit_expr */
-    default:
-        return false;
-    }
-}
+/* can_lower_expr removed — lower_expr is now unconditional.
+ * ALL expressions get decomposed to local IDs. Complex expressions
+ * (calls, intrinsics, builtins, casts, orelse, struct_init) go through
+ * the passthrough path in lower_expr which creates IR_ASSIGN{dest,expr}.
+ * The emitter handles IR_ASSIGN by calling emit_expr directly.
+ * All OTHER IR ops (BRANCH, RETURN, CALL, BINOP, etc.) use local IDs only. */
 
 /* lower_expr decomposes expressions into three-address-code. */
 
@@ -318,6 +238,9 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
     }
     case NODE_NULL_LIT: {
         Type *lt = checker_get_type(ctx->checker, expr);
+        /* null has no inherent type — use pointer placeholder to avoid void temp */
+        if (!lt || type_unwrap_distinct(lt)->kind == TYPE_VOID)
+            lt = type_pointer(ctx->arena, ty_void);
         int tmp = create_temp(ctx, lt, expr->loc.line);
         IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
         inst.dest_local = tmp;
@@ -339,6 +262,29 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Binary operations: decompose both sides ---- */
     case NODE_BINARY: {
+        /* Complex operand types need emit_expr (opaque .ptr, struct compare, etc.) */
+        Type *lt = checker_get_type(ctx->checker, expr->binary.left);
+        Type *rty = checker_get_type(ctx->checker, expr->binary.right);
+        if (lt) { Type *le = type_unwrap_distinct(lt);
+            if (le->kind == TYPE_OPAQUE || le->kind == TYPE_STRUCT ||
+                le->kind == TYPE_OPTIONAL || le->kind == TYPE_UNION)
+                goto passthrough;
+            if (le->kind == TYPE_POINTER && le->pointer.inner &&
+                type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE)
+                goto passthrough;
+        }
+        if (rty) { Type *re = type_unwrap_distinct(rty);
+            if (re->kind == TYPE_OPAQUE || re->kind == TYPE_STRUCT ||
+                re->kind == TYPE_OPTIONAL || re->kind == TYPE_UNION)
+                goto passthrough;
+        }
+        /* Result type void/array → can't store */
+        {
+            Type *brt = checker_get_type(ctx->checker, expr);
+            if (brt) { Type *eff = type_unwrap_distinct(brt);
+                if (eff->kind == TYPE_VOID || eff->kind == TYPE_ARRAY) goto passthrough;
+            }
+        }
         int left = lower_expr(ctx, expr->binary.left);
         int right = lower_expr(ctx, expr->binary.right);
         Type *rt = checker_get_type(ctx->checker, expr);
@@ -369,7 +315,9 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         return tmp;
     }
 
-    /* ---- Field access: decompose only for local objects with non-array result ---- */
+    /* ---- Field access: decompose for simple struct/pointer field read.
+     * Complex types (Handle auto-deref, opaque, builtins, slices, arrays,
+     * enums) go to passthrough → emit_expr handles the full logic. ---- */
     case NODE_FIELD: {
         /* Non-local objects (enum type, module prefix) → passthrough */
         if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
@@ -377,6 +325,19 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 expr->field.object->ident.name,
                 (uint32_t)expr->field.object->ident.name_len);
             if (obj_id < 0) goto passthrough;
+            /* Check object type — complex types need emit_expr */
+            Type *ot = ctx->func->locals[obj_id].type;
+            if (ot) {
+                Type *ot_eff = type_unwrap_distinct(ot);
+                if (ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_OPAQUE ||
+                    ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+                    ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+                    ot_eff->kind == TYPE_ARRAY || ot_eff->kind == TYPE_SLICE)
+                    goto passthrough;
+            }
+        } else {
+            /* Non-ident object (nested field etc.) → passthrough */
+            goto passthrough;
         }
         /* Array result → can't store in temp */
         Type *frt = checker_get_type(ctx->checker, expr);
@@ -399,9 +360,13 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Index access: decompose object and index ---- */
     case NODE_INDEX: {
+        Type *rt = checker_get_type(ctx->checker, expr);
+        /* Array-result index (3D array) → can't C-assign */
+        if (rt) { Type *rt_eff = type_unwrap_distinct(rt);
+            if (rt_eff->kind == TYPE_ARRAY) goto passthrough;
+        }
         int obj = lower_expr(ctx, expr->index_expr.object);
         int idx = lower_expr(ctx, expr->index_expr.index);
-        Type *rt = checker_get_type(ctx->checker, expr);
         int tmp = create_temp(ctx, rt, expr->loc.line);
         IRInst inst = make_inst(IR_INDEX_READ, expr->loc.line);
         inst.dest_local = tmp;
@@ -427,7 +392,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
          * This is the migration bridge — allows incremental transition. */
         rewrite_idents(ctx, expr);
         Type *rt = checker_get_type(ctx->checker, expr);
-        if (!rt) rt = ty_void;
+        if (!rt) rt = ty_i32; /* fallback — most expressions have some value type */
         /* Void/array expressions don't produce a storable value */
         Type *rt_eff = type_unwrap_distinct(rt);
         if (rt_eff->kind == TYPE_VOID || rt_eff->kind == TYPE_ARRAY) {
@@ -1007,11 +972,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * Then decompose if safe. */
         rewrite_idents(ctx, node->if_stmt.cond);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
-        if (can_lower_expr(ctx, node->if_stmt.cond)) {
-            br.cond_local = lower_expr(ctx, node->if_stmt.cond);
-        } else {
-            br.expr = node->if_stmt.cond;
-        }
+        br.cond_local = lower_expr(ctx, node->if_stmt.cond);
         br.true_block = bb_then;
         br.false_block = bb_else >= 0 ? bb_else : bb_join;
         emit_inst(ctx, br);
@@ -1069,13 +1030,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Cond block */
         ctx->current_block = bb_cond;
         if (node->for_stmt.cond) {
+            rewrite_idents(ctx, node->for_stmt.cond);
             IRInst br = make_inst(IR_BRANCH, node->loc.line);
-            if (can_lower_expr(ctx, node->for_stmt.cond)) {
-                br.cond_local = lower_expr(ctx, node->for_stmt.cond);
-            } else {
-                rewrite_idents(ctx, node->for_stmt.cond);
-                br.expr = node->for_stmt.cond;
-            }
+            br.cond_local = lower_expr(ctx, node->for_stmt.cond);
             br.true_block = bb_body;
             br.false_block = bb_exit;
             emit_inst(ctx, br);
@@ -1128,13 +1085,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         ctx->current_block = bb_cond;
         {
+        rewrite_idents(ctx, node->while_stmt.cond);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
-        if (can_lower_expr(ctx, node->while_stmt.cond)) {
-            br.cond_local = lower_expr(ctx, node->while_stmt.cond);
-        } else {
-            rewrite_idents(ctx, node->while_stmt.cond);
-            br.expr = node->while_stmt.cond;
-        }
+        br.cond_local = lower_expr(ctx, node->while_stmt.cond);
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
@@ -1175,13 +1128,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Then condition */
         ctx->current_block = bb_cond;
         {
+        rewrite_idents(ctx, node->while_stmt.cond);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
-        if (can_lower_expr(ctx, node->while_stmt.cond)) {
-            br.cond_local = lower_expr(ctx, node->while_stmt.cond);
-        } else {
-            rewrite_idents(ctx, node->while_stmt.cond);
-            br.expr = node->while_stmt.cond;
-        }
+        br.cond_local = lower_expr(ctx, node->while_stmt.cond);
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
@@ -1271,12 +1220,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_RETURN: {
         emit_defer_fire(ctx, node->loc.line);
         IRInst ret = make_inst(IR_RETURN, node->loc.line);
-        /* Decompose return expression to local ID when safe */
+        /* Decompose return expression to local ID unconditionally */
         Node *ret_expr = node->ret.expr;
-        if (ret_expr && can_lower_expr(ctx, ret_expr)) {
+        if (ret_expr) {
+            rewrite_idents(ctx, ret_expr);
             ret.src1_local = lower_expr(ctx, ret_expr);
-        } else {
-            ret.expr = node; /* fallback: full NODE_RETURN for emitter */
         }
         emit_inst(ctx, ret);
         break;
@@ -1356,12 +1304,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_AWAIT: {
         int resume_bb = ir_add_block(ctx->func, ctx->arena);
         IRInst aw = make_inst(IR_AWAIT, node->loc.line);
-        if (can_lower_expr(ctx, node->await_stmt.cond)) {
-            aw.cond_local = lower_expr(ctx, node->await_stmt.cond);
-        } else {
-            rewrite_idents(ctx, node->await_stmt.cond);
-            aw.expr = node->await_stmt.cond;
-        }
+        rewrite_idents(ctx, node->await_stmt.cond);
+        aw.cond_local = lower_expr(ctx, node->await_stmt.cond);
         aw.goto_block = resume_bb;
         emit_inst(ctx, aw);
         ctx->current_block = resume_bb;

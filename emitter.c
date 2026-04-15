@@ -6260,7 +6260,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
             emit(e, ")");
         } else if (inst->expr) {
-            /* Fallback for module-qualified calls or complex callees */
+            /* Complex callee (function pointer through field, etc.) */
             emit_expr(e, inst->expr);
         }
         emit(e, ";\n");

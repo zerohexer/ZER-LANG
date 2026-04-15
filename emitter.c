@@ -6580,7 +6580,6 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     for (int li = 0; li < func->local_count; li++) {
         IRLocal *l = &func->locals[li];
         if (l->is_param || l->is_static) continue;
-        /* Skip captures with void type (can't be C variables) */
         if (l->is_capture && l->type && l->type->kind == TYPE_VOID) continue;
         if (!l->type) continue;
         emit_indent(e);

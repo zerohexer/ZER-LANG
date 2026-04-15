@@ -6,6 +6,16 @@ source.zer → Scanner (lexer.c) → Parser (parser.c) → AST (ast.h)
            → Checker (checker.c) → ZER-CHECK (zercheck.c)
            → Emitter (emitter.c) → output.c → GCC
 
+NEW IR path (v0.4, Phases 1-5 implemented):
+source.zer → Scanner → Parser → AST → Checker
+           → IR Lowering (ir_lower.c) → IRFunc (ir.h)
+           → zercheck on IR (Phase 6, planned)
+           → C Emission from IR (emit_func_from_ir in emitter.c)
+           → output.c → GCC
+
+Use --emit-ir to print human-readable IR for debugging.
+IR and AST paths coexist during migration. AST path is still active default.
+
 NOTE: zercheck integrated into zerc_main.c pipeline on 2026-04-03.
 Before this date, zercheck only ran in test_zercheck.c test harness.
 Now: checker_check() → zercheck_run() → emit_file(). UAF and
@@ -1161,6 +1171,27 @@ Fixes the 5 matrix audit bugs (direct + transitive) and absorbs `has_atomic_or_b
 | 23 | `scan_func_props` | checker.c | Recursive AST walker for function properties (FuncProps) |
 | 24 | `ensure_func_props` | checker.c | Lazy DFS compute + cache for FuncProps |
 | 25 | `check_body_effects` | checker.c | Context entry point effect checker (@critical/defer/interrupt) |
+
+## IR Implementation (2026-04-15, Phases 1-5)
+
+MIR-inspired intermediate representation. Flat locals, basic blocks, tree expressions.
+Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementation.md`.
+
+**Files:**
+- `ir.h` (241 lines) — IRLocal, IRInst (26 ops), IRBlock, IRFunc, construction API, validation, pretty-printer declarations
+- `ir.c` (416 lines) — construction, CFG predecessor computation, validation, pretty-printer
+- `ir_lower.c` (960 lines) — AST → IR lowering: collect_locals (params + var_decls + captures), create basic blocks (if/for/while/switch/goto/yield), classify builtins (pool/slab/ring/arena → specific IR ops)
+- `emitter.c` (+425 lines) — `emit_func_from_ir()`: IR → C emission for regular + async functions
+
+**Key design decisions:**
+- Expressions kept as AST trees (Node*) in IRInst.expr — clean C output, reuses emit_expr
+- Control flow decomposed into basic blocks — real CFG for zercheck
+- Locals are flat list — captures and temps explicit, no enumeration
+- 26 IR op kinds: core (assign/call/branch/goto/return), async (yield/await), concurrency (spawn/lock/unlock), builtins (pool/slab/ring/arena), interrupt (critical begin/end), defer (push/fire)
+- Checker type as void* in ir.h (anonymous struct can't be forward-declared)
+- Empty blocks allowed (join points)
+
+**Current status:** `--emit-ir` prints IR. `emit_func_from_ir` available for incremental migration. AST path still active default. Phases 6-7 (zercheck + VRP on IR) are next.
 
 ## Firmware Examples + Polish (2026-04-13)
 

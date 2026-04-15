@@ -494,6 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
+| IR Phase 1-5 (data structures, lowering, emission) | Done | Done (--emit-ir flag, ir_lower_func, emit_func_from_ir) |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 
@@ -1219,7 +1220,7 @@ When starting a new session or lacking context:
 4. `ZER-LANG.md` — full language spec (only if CLAUDE.md quick reference is insufficient)
 5. **Use `make tags` + grep for code navigation** — generates ctags index (2,183 entries). Use `grep "function_name" tags` to find file+line+signature. NEVER read full source files speculatively. Read only the specific lines around grep results. This is 40x more efficient than brute-force reading.
 6. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
-7. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC
+7. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC. New IR path (v0.4): AST → Checker → IR (flat locals + basic blocks) → zercheck on IR → emit C from IR → GCC. Use `--emit-ir` to see IR output.
 
 ### Bug Hunting Workflow (principle-first, not brute-force)
 
@@ -1254,14 +1255,14 @@ Bug-producing pairs (from history): async × orelse, distinct × optional, spawn
 
 - **zerc** = the compiler binary (`zerc_main.c` + all lib sources)
 - **zer-lsp** = LSP server (`zer_lsp.c` + all lib sources)
-- Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`
+- Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`, `ir.c/h` (IR data structures + validation), `ir_lower.c` (AST → IR lowering)
 - Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`, `test_fuzz.c`, `tests/test_semantic_fuzz.c`
 - **Semantic fuzzer** (`tests/test_semantic_fuzz.c`): **32 generators** covering every ZER feature — alloc, cast, defer, interior ptr, *opaque, arena wrappers, pool/slab, goto+defer, comptime, handle alias, enum switch, while+break, Task.new, funcptr callback, union capture, ring buffer, nested struct deref, defer+orelse block, packed struct, slice subslice, bool/int cast, signed/unsigned cast, distinct typedef, bit extraction, non-keep escape, arena global escape. 200 tests per `make check` run, verified with 2,500 tests across 5 seeds. **When adding new features, add generator functions** — `gen_safe_<feature>()` + `gen_unsafe_<feature>()` + new case in switch.
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
 - Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
 - **Default behavior:** `zerc main.zer` compiles to `main.exe` (or `main` on Linux) — the `.c` intermediate is temp, deleted after GCC. No `.c` visible to user. Looks native.
-- Compiler flags: `--run` (compile+execute), `--emit-c` (keep `.c` output, old behavior), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations), `--target-bits N` (usize width override), `--gcc PATH` (specify cross-compiler for auto-detect), `--stack-limit N` (error when estimated stack usage exceeds N bytes)
+- Compiler flags: `--run` (compile+execute), `--emit-c` (keep `.c` output, old behavior), `--emit-ir` (print IR to stdout, exit — debugging), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations), `--target-bits N` (usize width override), `--gcc PATH` (specify cross-compiler for auto-detect), `--stack-limit N` (error when estimated stack usage exceeds N bytes)
 - `-o file.c` → emits C (kept). `-o file.exe` or `-o file` → compiles to exe (temp .c deleted).
 - usize width: auto-detected from GCC via `__SIZEOF_SIZE_T__` probe at startup. Falls back to 32 if GCC not found. `--target-bits` overrides.
 - GCC flags: emitted C requires `-fwrapv` (ZER defines signed overflow as wrapping). `zerc --run` adds this automatically.

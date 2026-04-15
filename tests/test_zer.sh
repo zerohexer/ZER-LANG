@@ -2,19 +2,22 @@
 # Run all .zer integration tests
 # tests/zer/     — must compile + run + exit 0 (positive tests)
 # tests/zer_fail/ — must FAIL to compile (negative tests)
+# Usage: test_zer.sh [extra-flags]
+#   e.g. test_zer.sh --use-ir
 
 ZERC="./zerc"
+EXTRA_FLAGS="$1"
 PASS=0
 FAIL=0
 TOTAL=0
 
-echo "=== ZER Integration Tests (positive) ==="
+echo "=== ZER Integration Tests (positive) ${EXTRA_FLAGS:+[$EXTRA_FLAGS]} ==="
 
 for f in tests/zer/*.zer; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .zer)
     TOTAL=$((TOTAL + 1))
-    $ZERC "$f" --run 2>/dev/null
+    $ZERC "$f" $EXTRA_FLAGS --run 2>/dev/null
     ret=$?
     if [ $ret -eq 0 ]; then
         PASS=$((PASS + 1))
@@ -22,7 +25,7 @@ for f in tests/zer/*.zer; do
     else
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (exit $ret)"
-        $ZERC "$f" --run 2>&1 | head -5
+        $ZERC "$f" $EXTRA_FLAGS --run 2>&1 | head -5
     fi
     rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
 done

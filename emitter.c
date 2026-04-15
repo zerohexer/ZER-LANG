@@ -6107,174 +6107,25 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
  * ================================================================ */
 
 /* ================================================================
- * IR Expression Emitter — THE IR path's expression handler
+ * IR Local Name Emitter — helper for emitting local variable names
  *
- * Emits C code from rewritten AST expressions. NODE_IDENTs have been
- * rewritten by ir_lower.c's rewrite_idents() to use IR local names.
- *
- * Handles common expression types directly (ident, literal, binary,
- * unary, field, call, assign, cast, intrinsic). Complex patterns that
- * need emit_expr's full logic (builtins with inline code, handle
- * auto-deref, bounds checks, opaque .ptr) delegate to emit_expr.
- *
- * The goal: emit_ir_value handles 100% of expressions. emit_expr is
- * only used for top-level declarations (struct fields, global inits).
+ * All IR instruction emission uses local IDs. This helper emits
+ * the C name for a local, with async self-> prefix when needed.
  * ================================================================ */
-static void emit_ir_value(Emitter *e, Node *expr) {
-    if (!expr) return;
-
-    switch (expr->kind) {
-    /* ---- Identifiers: emit the (rewritten) name directly ---- */
-    case NODE_IDENT:
-        /* async locals get self-> prefix from emit_expr. Check e->in_async. */
-        if (e->in_async) {
-            /* Check if this ident is an async local */
-            for (int i = 0; i < e->async_local_count; i++) {
-                if (e->async_local_lens[i] == (size_t)expr->ident.name_len &&
-                    memcmp(e->async_locals[i], expr->ident.name, expr->ident.name_len) == 0) {
-                    emit(e, "self->%.*s", (int)expr->ident.name_len, expr->ident.name);
-                    return;
-                }
-            }
-        }
-        emit(e, "%.*s", (int)expr->ident.name_len, expr->ident.name);
-        return;
-
-    /* ---- Literals ---- */
-    case NODE_INT_LIT:
-        if (expr->int_lit.value > 0x7FFFFFFF)
-            emit(e, "%lluULL", (unsigned long long)expr->int_lit.value);
-        else
-            emit(e, "%llu", (unsigned long long)expr->int_lit.value);
-        return;
-    case NODE_FLOAT_LIT:
-        emit(e, "%.17g", expr->float_lit.value);
-        return;
-    case NODE_BOOL_LIT:
-        emit(e, "%d", expr->bool_lit.value ? 1 : 0);
-        return;
-    case NODE_CHAR_LIT:
-        if (expr->char_lit.value >= 32 && expr->char_lit.value < 127 &&
-            expr->char_lit.value != '\'' && expr->char_lit.value != '\\')
-            emit(e, "'%c'", (char)expr->char_lit.value);
-        else
-            emit(e, "%u", (unsigned)expr->char_lit.value);
-        return;
-    case NODE_NULL_LIT:
-        emit(e, "0");
-        return;
-    case NODE_STRING_LIT:
-        /* String literals need slice wrapper — delegate to emit_expr */
-        break;
-
-    /* ---- Binary: emit left OP right ---- */
-    case NODE_BINARY: {
-        const char *op = "?";
-        switch (expr->binary.op) {
-        case TOK_PLUS: op = "+"; break; case TOK_MINUS: op = "-"; break;
-        case TOK_STAR: op = "*"; break; case TOK_SLASH: op = "/"; break;
-        case TOK_PERCENT: op = "%"; break;
-        case TOK_AMP: op = "&"; break; case TOK_PIPE: op = "|"; break;
-        case TOK_CARET: op = "^"; break;
-        case TOK_LSHIFT: op = "<<"; break; case TOK_RSHIFT: op = ">>"; break;
-        case TOK_EQEQ: op = "=="; break; case TOK_BANGEQ: op = "!="; break;
-        case TOK_LT: op = "<"; break; case TOK_GT: op = ">"; break;
-        case TOK_LTEQ: op = "<="; break; case TOK_GTEQ: op = ">="; break;
-        case TOK_AMPAMP: op = "&&"; break; case TOK_PIPEPIPE: op = "||"; break;
-        default: break;
-        }
-        /* Check if operands need special handling — delegate to emit_expr */
-        Type *lt = checker_get_type(e->checker, expr->binary.left);
-        Type *rty = checker_get_type(e->checker, expr->binary.right);
-        if (lt) { Type *le = type_unwrap_distinct(lt);
-            if (le->kind == TYPE_OPAQUE || le->kind == TYPE_OPTIONAL ||
-                le->kind == TYPE_STRUCT || le->kind == TYPE_UNION ||
-                (le->kind == TYPE_POINTER && le->pointer.inner &&
-                 type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE))
-                break; /* delegate to emit_expr */
-        }
-        if (rty) { Type *re = type_unwrap_distinct(rty);
-            if (re->kind == TYPE_OPAQUE || re->kind == TYPE_OPTIONAL ||
-                re->kind == TYPE_STRUCT || re->kind == TYPE_UNION)
-                break;
-        }
-        emit(e, "(");
-        emit_ir_value(e, expr->binary.left);
-        emit(e, " %s ", op);
-        emit_ir_value(e, expr->binary.right);
-        emit(e, ")");
-        return;
-    }
-
-    /* ---- Unary: emit OP operand ---- */
-    case NODE_UNARY:
-        switch (expr->unary.op) {
-        case TOK_MINUS: emit(e, "-"); emit_ir_value(e, expr->unary.operand); return;
-        case TOK_BANG: emit(e, "!"); emit_ir_value(e, expr->unary.operand); return;
-        case TOK_TILDE: emit(e, "~"); emit_ir_value(e, expr->unary.operand); return;
-        case TOK_STAR: emit(e, "*"); emit_ir_value(e, expr->unary.operand); return;
-        case TOK_AMP: emit(e, "&"); emit_ir_value(e, expr->unary.operand); return;
-        default: break; /* delegate */
-        }
-        break;
-
-    /* ---- Assignment: delegate (needs optional wrapping, array memcpy, bit extract) ---- */
-    case NODE_ASSIGN:
-        break; /* delegate — emit_expr handles type adaptation + special targets */
-
-    /* ---- Field access: obj.field or obj->field ---- */
-    case NODE_FIELD: {
-        /* Check if this is an enum qualified access (State.idle) — delegate */
-        if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
-            Type *ot = checker_get_type(e->checker, expr->field.object);
-            if (!ot) break; /* unknown type — delegate to emit_expr */
-            Type *ot_eff = type_unwrap_distinct(ot);
-            if (ot_eff->kind == TYPE_ENUM || ot_eff->kind == TYPE_HANDLE ||
-                ot_eff->kind == TYPE_OPAQUE || ot_eff->kind == TYPE_POOL ||
-                ot_eff->kind == TYPE_SLAB || ot_eff->kind == TYPE_RING ||
-                ot_eff->kind == TYPE_ARENA || ot_eff->kind == TYPE_SLICE ||
-                ot_eff->kind == TYPE_ARRAY)
-                break; /* delegate to emit_expr for complex types */
-            emit_ir_value(e, expr->field.object);
-            emit(e, "%s%.*s",
-                 ot_eff->kind == TYPE_POINTER ? "->" : ".",
-                 (int)expr->field.field_name_len, expr->field.field_name);
-            return;
-        }
-        break; /* non-ident object — delegate */
-    }
-
-    /* ---- Index: delegate (needs bounds check logic) ---- */
-    case NODE_INDEX:
-        break; /* delegate — emit_expr handles bounds checks */
-
-    /* ---- Call: delegate (needs builtin dispatch, module mangling) ---- */
-    case NODE_CALL:
-        break; /* delegate — emit_expr handles builtins + mangling */
-
-    /* ---- Cast: emit (Type)expr ---- */
-    case NODE_TYPECAST:
-        break; /* delegate — emit_expr handles cast type resolution */
-
-    /* ---- Intrinsic: delegate (complex @ptrcast/@size/etc) ---- */
-    case NODE_INTRINSIC:
-        break; /* delegate — emit_expr handles intrinsic-specific code */
-
-    /* ---- Orelse: delegate (complex ternary/if pattern) ---- */
-    case NODE_ORELSE:
-        break; /* delegate — emit_expr handles orelse patterns */
-
-    /* ---- Struct init: delegate (compound literal) ---- */
-    case NODE_STRUCT_INIT:
-        break; /* delegate — emit_expr handles compound literal */
-
-    default:
-        break; /* delegate to emit_expr */
-    }
-
-    /* Fallback: delegate to emit_expr for complex expressions */
-    emit_expr(e, expr);
+static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
+    if (local_id < 0 || local_id >= func->local_count) return;
+    IRLocal *l = &func->locals[local_id];
+    if (func->is_async)
+        emit(e, "self->%.*s", (int)l->name_len, l->name);
+    else
+        emit(e, "%.*s", (int)l->name_len, l->name);
 }
+
+/* emit_ir_value DELETED — zero calls remain.
+ * IR_ASSIGN uses emit_expr directly for complex passthrough expressions.
+ * All other IR ops use local IDs via emit_local_name.
+ * emit_expr remains for: top-level declarations, IR_ASSIGN passthrough,
+ * IR_CALL/IR_INTRINSIC/builtins (complex emission logic). */
 
 /* Emit one IR instruction as C code */
 static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
@@ -6303,7 +6154,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit_indent(e);
                     emit_type_and_name(e, inner, dest->name, dest->name_len);
                     emit(e, " = ");
-                    emit_ir_value(e, inst->expr);
+                    emit_expr(e, inst->expr);
                     emit(e, ".value;\n");
                     break;
                 }
@@ -6326,7 +6177,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 bool pre_src_void = (pre_src_eff && pre_src_eff->kind == TYPE_VOID);
                 if (pre_void_opt && pre_src_void && inst->expr->kind == NODE_CALL) {
                     emit_indent(e);
-                    emit_ir_value(e, inst->expr);
+                    emit_expr(e, inst->expr);
                     emit(e, ";\n");
                     emit_indent(e);
                     if (func->is_async)
@@ -6374,14 +6225,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else if (need_slice) {
                 emit_array_as_slice(e, inst->expr, src_type, dst_type);
             } else {
-                emit_ir_value(e, inst->expr);
+                emit_expr(e, inst->expr);
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
-            emit_ir_value(e, inst->expr);
+            emit_expr(e, inst->expr);
             emit(e, ";\n");
         }
         break;
@@ -6390,20 +6241,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_CALL: {
         emit_indent(e);
         if (inst->dest_local >= 0) {
-            IRLocal *dest = &func->locals[inst->dest_local];
-            if (func->is_async) {
-                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
-            } else {
-                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
-            }
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
         }
+        /* Call expressions use emit_expr — handles builtins, module mangling, etc. */
         if (inst->expr) {
-            emit_ir_value(e, inst->expr);
+            emit_expr(e, inst->expr);
         } else if (inst->func_name) {
             emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
             for (int i = 0; i < inst->arg_count; i++) {
                 if (i > 0) emit(e, ", ");
-                if (inst->args && inst->args[i]) emit_ir_value(e, inst->args[i]);
+                if (inst->args && inst->args[i]) emit_expr(e, inst->args[i]);
             }
             emit(e, ")");
         }
@@ -6415,36 +6263,19 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "if (");
         if (inst->cond_local >= 0) {
-            /* Branch on a LOCAL's value (orelse pattern).
+            /* Branch on a LOCAL's value — all conditions decomposed at lowering time.
              * Check type: optional struct → .has_value, null-sentinel → as-is. */
             IRLocal *cl = &func->locals[inst->cond_local];
             Type *cond_eff = cl->type ? type_unwrap_distinct(cl->type) : NULL;
             if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
                 !is_null_sentinel(cond_eff->optional.inner)) {
-                if (func->is_async)
-                    emit(e, "self->%.*s.has_value", (int)cl->name_len, cl->name);
-                else
-                    emit(e, "%.*s.has_value", (int)cl->name_len, cl->name);
+                emit_local_name(e, func, inst->cond_local);
+                emit(e, ".has_value");
             } else {
-                if (func->is_async)
-                    emit(e, "self->%.*s", (int)cl->name_len, cl->name);
-                else
-                    emit(e, "%.*s", (int)cl->name_len, cl->name);
-            }
-        } else if (inst->expr) {
-            /* Branch on AST expression — check optional type */
-            Type *cond_type = checker_get_type(e->checker, inst->expr);
-            Type *cond_eff = cond_type ? type_unwrap_distinct(cond_type) : NULL;
-            if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
-                !is_null_sentinel(cond_eff->optional.inner)) {
-                emit(e, "(");
-                emit_ir_value(e, inst->expr);
-                emit(e, ").has_value");
-            } else {
-                emit_ir_value(e, inst->expr);
+                emit_local_name(e, func, inst->cond_local);
             }
         } else {
-            emit(e, "1");
+            emit(e, "1"); /* unconditional (shouldn't happen — lowering always sets cond_local) */
         }
         emit(e, ") goto _zer_bb%d; else goto _zer_bb%d;\n",
              inst->true_block, inst->false_block);
@@ -6460,13 +6291,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_RETURN: {
         emit_indent(e);
 
-        /* Local-ID path: return expression decomposed by lower_expr */
+        /* All return expressions decomposed to local ID by lower_expr */
         if (inst->src1_local >= 0) {
             IRLocal *src = &func->locals[inst->src1_local];
             Type *ret = e->current_func_ret;
             Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
             Type *src_eff = src->type ? type_unwrap_distinct(src->type) : NULL;
-            const char *sp = func->is_async ? "self->" : "";
 
             bool need_wrap = (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
                              !is_null_sentinel(ret_eff->optional.inner) &&
@@ -6477,57 +6307,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
             if (need_wrap) {
                 if (is_void_opt(ret_eff)) {
-                    emit(e, "%s%.*s;\n", sp, (int)src->name_len, src->name);
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, ";\n");
                     emit_indent(e);
                     emit(e, "return (_zer_opt_void){ 1 };\n");
                 } else {
                     emit(e, "return (");
                     emit_type(e, ret_eff);
-                    emit(e, "){ %s%.*s, 1 };\n", sp, (int)src->name_len, src->name);
+                    emit(e, "){ ");
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, ", 1 };\n");
                 }
             } else if (need_unwrap) {
-                emit(e, "return %s%.*s.value;\n", sp, (int)src->name_len, src->name);
-            } else {
-                emit(e, "return %s%.*s;\n", sp, (int)src->name_len, src->name);
-            }
-        }
-        /* AST fallback path */
-        else {
-        Node *ret_expr = NULL;
-        if (inst->expr) {
-            if (inst->expr->kind == NODE_RETURN) {
-                ret_expr = inst->expr->ret.expr;
-            } else {
-                ret_expr = inst->expr;
-            }
-        }
-
-        if (ret_expr) {
-            Type *ret = e->current_func_ret;
-            Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
-            Type *expr_type = checker_get_type(e->checker, ret_expr);
-
-            /* Check if optional wrapping needed */
-            if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
-                !is_null_sentinel(ret_eff->optional.inner) &&
-                expr_type && !type_is_optional(expr_type)) {
-                if (is_void_opt(ret_eff)) {
-                    emit_ir_value(e, ret_expr);
-                    emit(e, ";\n");
-                    emit_indent(e);
-                    emit(e, "return (_zer_opt_void){ 1 };\n");
-                } else {
-                    emit(e, "return ");
-                    emit_opt_wrap_value(e, ret_eff, ret_expr);
-                    emit(e, ";\n");
-                }
-            } else if (ret_expr->kind == NODE_NULL_LIT && ret_eff) {
                 emit(e, "return ");
-                emit_opt_null_literal(e, ret_eff);
-                emit(e, ";\n");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ".value;\n");
             } else {
                 emit(e, "return ");
-                emit_ir_value(e, ret_expr);
+                emit_local_name(e, func, inst->src1_local);
                 emit(e, ";\n");
             }
         } else {
@@ -6539,7 +6336,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "\n");
             }
         }
-        } /* end AST fallback */
         break;
     }
 
@@ -6568,11 +6364,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             emit(e, "if (!(");
             if (inst->cond_local >= 0) {
-                /* Local-ID path */
-                IRLocal *cl = &func->locals[inst->cond_local];
-                emit(e, "self->%.*s", (int)cl->name_len, cl->name);
-            } else if (inst->expr) {
-                emit_ir_value(e, inst->expr);
+                emit_local_name(e, func, inst->cond_local);
+            } else {
+                emit(e, "1"); /* shouldn't happen — lowering always sets cond_local */
             }
             emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
             e->async_yield_id++;
@@ -6612,18 +6406,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
     case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
         /* Builtin methods — emit via AST expression tree.
-         * emit_ir_value handles inline code generation for pool/slab/ring/arena. */
+         * emit_expr handles inline code generation for pool/slab/ring/arena. */
         emit_indent(e);
         if (inst->dest_local >= 0) {
-            IRLocal *dest = &func->locals[inst->dest_local];
-            if (func->is_async) {
-                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
-            } else {
-                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
-            }
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
         }
         if (inst->expr) {
-            emit_ir_value(e, inst->expr);
+            emit_expr(e, inst->expr);
             /* Unwrap .value if builtin returns optional but dest is not */
             if (inst->dest_local >= 0) {
                 IRLocal *bd = &func->locals[inst->dest_local];
@@ -6722,14 +6512,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_INTRINSIC: {
         emit_indent(e);
         if (inst->dest_local >= 0) {
-            IRLocal *dest = &func->locals[inst->dest_local];
-            if (func->is_async) {
-                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
-            } else {
-                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
-            }
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
         }
-        if (inst->expr) emit_ir_value(e, inst->expr);
+        if (inst->expr) emit_expr(e, inst->expr);
         emit(e, ";\n");
         break;
     }
@@ -6743,7 +6529,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
 
     /* ================================================================
-     * Three-address-code ops — emit from local IDs, NOT emit_expr (uses emit_ir_value for rewritten expressions)
+     * Three-address-code ops — emit from local IDs exclusively, zero emit_ir_value
      * ================================================================ */
 
     case IR_COPY: {
@@ -6859,14 +6645,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                  sp, (int)s1->name_len, s1->name,
                  op,
                  sp, (int)s2->name_len, s2->name);
-        } else if (inst->dest_local >= 0 && inst->expr) {
-            /* Fallback: one side wasn't a local (passthrough) */
-            IRLocal *dst = &func->locals[inst->dest_local];
-            emit_indent(e);
-            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_ir_value(e, inst->expr);
-            emit(e, ";\n");
         }
         break;
     }
@@ -6874,9 +6652,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_UNOP: {
         /* Emit: dest = OP src — from local IDs */
         if (inst->dest_local >= 0 && inst->src1_local >= 0) {
-            IRLocal *dst = &func->locals[inst->dest_local];
-            IRLocal *s1 = &func->locals[inst->src1_local];
-            const char *sp = func->is_async ? "self->" : "";
             const char *op = "";
             switch (inst->op_token) {
             case TOK_MINUS: op = "-"; break;
@@ -6884,28 +6659,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             case TOK_TILDE: op = "~"; break;
             case TOK_STAR: /* deref */
                 emit_indent(e);
-                emit(e, "%s%.*s = *%s%.*s;\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name);
+                emit_local_name(e, func, inst->dest_local);
+                emit(e, " = *");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ";\n");
                 goto unop_done;
             case TOK_AMP: /* addr-of */
                 emit_indent(e);
-                emit(e, "%s%.*s = &%s%.*s;\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name);
+                emit_local_name(e, func, inst->dest_local);
+                emit(e, " = &");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ";\n");
                 goto unop_done;
             default: break;
             }
             emit_indent(e);
-            emit(e, "%s%.*s = %s%s%.*s;\n",
-                 sp, (int)dst->name_len, dst->name,
-                 op, sp, (int)s1->name_len, s1->name);
-        } else if (inst->dest_local >= 0 && inst->expr) {
-            IRLocal *dst = &func->locals[inst->dest_local];
-            emit_indent(e);
-            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_ir_value(e, inst->expr);
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = %s", op);
+            emit_local_name(e, func, inst->src1_local);
             emit(e, ";\n");
         }
         unop_done:
@@ -6914,66 +6685,38 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_FIELD_READ: {
         /* Emit: dest = src.field — from local IDs.
-         * Complex cases (handle auto-deref, volatile, bounds) → emit_ir_value fallback. */
+         * Complex types (handle auto-deref, opaque, builtins) use emit_expr via
+         * the passthrough path (lower_expr creates IR_ASSIGN for those). */
         if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->field_name) {
-            IRLocal *dst = &func->locals[inst->dest_local];
             IRLocal *s1 = &func->locals[inst->src1_local];
             Type *st = s1->type ? type_unwrap_distinct(s1->type) : NULL;
-            /* Handle/opaque/complex → emit_ir_value (has auto-deref, gen check, etc.) */
-            if (st && (st->kind == TYPE_HANDLE || st->kind == TYPE_OPAQUE ||
-                       st->kind == TYPE_POOL || st->kind == TYPE_SLAB ||
-                       st->kind == TYPE_RING || st->kind == TYPE_ARENA)) {
-                goto field_read_fallback;
-            }
-            const char *sp = func->is_async ? "self->" : "";
             const char *accessor = ".";
             if (st && st->kind == TYPE_POINTER) accessor = "->";
             emit_indent(e);
-            emit(e, "%s%.*s = %s%.*s%s%.*s;\n",
-                 sp, (int)dst->name_len, dst->name,
-                 sp, (int)s1->name_len, s1->name,
-                 accessor,
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
+            emit_local_name(e, func, inst->src1_local);
+            emit(e, "%s%.*s;\n", accessor,
                  (int)inst->field_name_len, inst->field_name);
-        } else field_read_fallback: if (inst->dest_local >= 0 && inst->expr) {
-            IRLocal *dst = &func->locals[inst->dest_local];
-            emit_indent(e);
-            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_ir_value(e, inst->expr);
-            emit(e, ";\n");
         }
         break;
     }
 
     case IR_INDEX_READ: {
-        /* Emit: dest = src[idx] — from local IDs */
+        /* Emit: dest = src[idx] — from local IDs.
+         * Bounds checks are in the AST path (emit_expr via IR_ASSIGN passthrough). */
         if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->src2_local >= 0) {
-            IRLocal *dst = &func->locals[inst->dest_local];
             IRLocal *s1 = &func->locals[inst->src1_local];
-            IRLocal *s2 = &func->locals[inst->src2_local];
-            const char *sp = func->is_async ? "self->" : "";
             /* Slice uses .ptr[] */
             Type *st = s1->type ? type_unwrap_distinct(s1->type) : NULL;
-            if (st && st->kind == TYPE_SLICE) {
-                emit_indent(e);
-                emit(e, "%s%.*s = %s%.*s.ptr[%s%.*s];\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name,
-                     sp, (int)s2->name_len, s2->name);
-            } else {
-                emit_indent(e);
-                emit(e, "%s%.*s = %s%.*s[%s%.*s];\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name,
-                     sp, (int)s2->name_len, s2->name);
-            }
-        } else if (inst->dest_local >= 0 && inst->expr) {
-            IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
-            if (func->is_async) emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
-            else emit(e, "%.*s = ", (int)dst->name_len, dst->name);
-            emit_ir_value(e, inst->expr);
-            emit(e, ";\n");
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, " = ");
+            emit_local_name(e, func, inst->src1_local);
+            if (st && st->kind == TYPE_SLICE) emit(e, ".ptr");
+            emit(e, "[");
+            emit_local_name(e, func, inst->src2_local);
+            emit(e, "];\n");
         }
         break;
     }

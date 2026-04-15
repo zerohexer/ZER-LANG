@@ -1246,9 +1246,21 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - NODE_IF/FOR/WHILE/DO_WHILE conditions: `cond_local` set when `can_lower_expr` passes. IR_BRANCH emitter uses local name + optional `.has_value`.
   - NODE_RETURN: `src1_local` set when safe. IR_RETURN emitter: local-ID return with optional wrap/unwrap.
   - NODE_AWAIT: `cond_local` set. Emitter: `self->local_name` for async condition.
-  - **17 `emit_ir_value` calls remain** as fallback paths. These fire for expressions `can_lower_expr` rejects. Each would need 50-400 lines of emission logic to replace (bounds checks, handle auto-deref, pool/slab inline code, @ptrcast, opaque `.ptr` extraction, volatile, module mangling). These are the remaining architectural bridge between AST and IR emission.
-  - **emit_ir_value expanded:** Handles NODE_IDENT (async self-> prefix), NODE_INT/FLOAT/BOOL/CHAR/NULL_LIT, NODE_BINARY (18 ops with opaque/optional/struct guard), NODE_UNARY (5 ops), NODE_FIELD (struct `.` / pointer `->` from type) DIRECTLY. Delegates to emit_expr fallback for: NODE_STRING_LIT (slice wrapper), NODE_ASSIGN (optional wrap, array memcpy), NODE_CALL (builtins, module mangling), NODE_INDEX (bounds checks), NODE_INTRINSIC, NODE_ORELSE, NODE_TYPECAST, NODE_STRUCT_INIT.
   - **Edge cases found during Phase 8c:** (1) `*opaque` params have TYPE_POINTER(TYPE_OPAQUE) — must check both layers. (2) Array/slice field objects need emit_expr for `.len`/`.ptr` access. (3) Struct/optional comparison invalid in C — must delegate. (4) checker_get_type on NODE_IDENT may return NULL for params — use IR local type instead. (5) BUG-511: ir_find_local must search by C name too (rewritten idents use suffix). (6) BUG-512: ALWAYS rewrite_idents before lower_expr — captures share condition expr. rewrite is a prerequisite, not an alternative to decomposition.
+- **Phase 8d: `emit_ir_value` DELETED, `can_lower_expr` DELETED (2026-04-16):**
+  - **Architecture change:** `lower_expr` is now UNCONDITIONAL — every expression gets a local ID. Complex expressions (calls, intrinsics, builtins, orelse, casts, struct_init, slices) go through passthrough path: `IR_ASSIGN{dest_local, expr}`. Emitter calls `emit_expr` directly on IR_ASSIGN. ALL other IR ops use local IDs exclusively.
+  - **`emit_local_name(e, func, local_id)` helper** — emits local name with async `self->` prefix. Replaces 20+ manual `sp, name_len, name` patterns.
+  - **`emit_ir_value` function DELETED** (~160 lines removed). Zero calls remain. Zero references in `emit_ir_inst`.
+  - **IR ops updated:** IR_BRANCH always uses `cond_local`, IR_RETURN always uses `src1_local`, IR_AWAIT always uses `cond_local`, IR_CALL/IR_INTRINSIC/builtins use `emit_expr` directly (not through emit_ir_value), IR_BINOP/IR_UNOP/IR_FIELD_READ/IR_INDEX_READ have no fallback paths.
+  - **`lower_stmt` sites updated:** 7 sites (if/for/while/do-while/return/await) changed from `if (can_lower_expr) { lower_expr } else { expr fallback }` to unconditional `lower_expr`.
+  - **Type guards added in `lower_expr`:** (1) NODE_FIELD: Handle/opaque/pool/slab/ring/arena/array/slice → passthrough (need emit_expr for auto-deref/gen-check/bounds-check). (2) NODE_BINARY: opaque/struct/optional/union operands → passthrough (need .ptr extraction, struct compare). (3) NODE_INDEX: array result type → passthrough (can't C-assign arrays). (4) NODE_NULL_LIT: use `*void` type when checker_get_type returns NULL.
+  - **BUG-513:** null literal void temp. **BUG-514:** handle auto-deref bypass. **BUG-515:** opaque comparison bypass. **BUG-516:** array index temp.
+  - **Result: 195/195 ZER tests, 0 fail, 0 hang. AST path (make check): 786/786 rust, 0 regressions.**
+  - **Emission architecture after Phase 8d:**
+    - `emit_expr` — used by: IR_ASSIGN passthrough (complex expressions), IR_CALL, IR_INTRINSIC, builtins, top-level declarations
+    - `emit_local_name` — used by: IR_BRANCH, IR_RETURN, IR_AWAIT, IR_COPY, IR_LITERAL, IR_BINOP, IR_UNOP, IR_FIELD_READ, IR_INDEX_READ
+    - `emit_ir_value` — DELETED
+  - **What remains for Phase 9 (full decomposition):** Move emit_expr logic for calls/intrinsics/builtins INTO `lower_expr` as proper IR ops. Each builtin method becomes its own IR op kind (already defined: IR_POOL_ALLOC etc.), each intrinsic its own handler. This would eliminate the IR_ASSIGN passthrough entirely. Estimated: ~500 lines of lowering code, ~300 lines of emission code. Benefit: emit_expr only used for top-level declarations.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

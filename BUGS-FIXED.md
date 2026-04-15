@@ -3778,3 +3778,43 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** ALWAYS call rewrite_idents on the condition BEFORE can_lower_expr/lower_expr. Rewriting is a prerequisite for both paths — the capture assignment needs the rewritten names.
 
 **Test:** rust_tests/rt_conc_ring_producer_consumer.zer
+
+### BUG-513: emit_ir_value deletion — void temp from NULL literal (2026-04-16)
+
+**Symptom:** `return null` in function returning `?u32` — IR lowering creates `_zer_t2` temp for null literal. `checker_get_type(NODE_NULL_LIT)` returns NULL → temp declared as `void` → GCC "variable declared void" error.
+
+**Root cause:** `lower_expr` passthrough case defaulted to `ty_void` when `checker_get_type` returned NULL. NULL literals have no inherent type — they need context-dependent typing. Making `lower_expr` unconditional (removing `can_lower_expr`) exposed this because NULL literals previously went through `emit_ir_value` which emitted bare `0`.
+
+**Fix:** (1) `NODE_NULL_LIT` in `lower_expr`: when type is NULL or void, use `type_pointer(arena, ty_void)` (pointer placeholder — null is always a pointer-like value). (2) Passthrough case: default to `ty_i32` instead of `ty_void` (most expressions have value type).
+
+**Test:** tests/zer/optional_null_init.zer, tests/zer/optional_patterns.zer
+
+### BUG-514: emit_ir_value deletion — Handle auto-deref emitted as plain field access (2026-04-16)
+
+**Symptom:** `h.priority` where `h` is `Handle(Task)` — emitted as `h.priority` instead of `((Task*)_zer_slab_get(&slab, h))->priority`. GCC "request for member in something not a structure or union" error.
+
+**Root cause:** Making `lower_expr` unconditional meant `NODE_FIELD` on Handle-typed objects was decomposed into `IR_FIELD_READ {src1=handle_local, field="priority"}`. The IR emitter emitted a plain field access — no auto-deref gen-check code.
+
+**Fix:** Added type guards in `lower_expr(NODE_FIELD)`: Handle, opaque, Pool, Slab, Ring, Arena, Array, Slice types → passthrough to `emit_expr` which has the full auto-deref/gen-check/bounds-check logic. Same for non-ident objects (nested field chains).
+
+**Test:** tests/zer/handle_autoderef.zer, tests/zer/handle_autoderef_pool.zer
+
+### BUG-515: emit_ir_value deletion — *opaque comparison missing .ptr extraction (2026-04-16)
+
+**Symptom:** `ptr1 == ptr2` where both are `*opaque` — decomposed into `IR_BINOP` which emitted `ptr1 == ptr2`. With `track_cptrs`, `*opaque` is `_zer_opaque` struct — C can't compare structs with `==`. Needed `.ptr` extraction on both sides.
+
+**Root cause:** `lower_expr(NODE_BINARY)` decomposed opaque pointer comparisons into `IR_BINOP` without checking operand types. `emit_expr` has special handling for opaque `.ptr` extraction.
+
+**Fix:** Added type guards in `lower_expr(NODE_BINARY)`: opaque, struct, optional, union operands → passthrough. Also checks `*opaque` (TYPE_POINTER wrapping TYPE_OPAQUE). Result type void/array → passthrough.
+
+**Test:** tests/zer/opaque_comparison.zer, tests/zer/opaque_safe_patterns.zer
+
+### BUG-516: emit_ir_value deletion — 3D array index produces array-typed temp (2026-04-16)
+
+**Symptom:** `cube[i]` where `cube` is `u32[4][4][4]` — `lower_expr(NODE_INDEX)` creates temp with type `u32[4][4]`. C can't assign arrays. GCC "assignment to expression with array type" error.
+
+**Root cause:** Index into multi-dimensional array produces an array element type. `lower_expr` created a temp and tried `temp = cube[i]` which is invalid C for array types.
+
+**Fix:** Added result-type guard in `lower_expr(NODE_INDEX)`: when element type is `TYPE_ARRAY`, go to passthrough (let `emit_expr` handle nested array indexing in-place).
+
+**Test:** tests/zer/array_3d.zer

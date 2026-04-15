@@ -494,7 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
-| IR Phase 1-7 (data structures, lowering, emission, zercheck, VRP) | Done | Done. Migration: --use-ir, **195/195 compile + runtime, 761/761 rust, 0 hangs**. Phase 8a complete: on-demand locals, ident rewriting, scope conflict resolution, 3AC op kinds declared. **NEXT: Phase 8b** = wire `lower_expr()` into `lower_stmt()`, emit from local IDs (not `emit_expr()`). Verification: `grep emit_expr emit_ir_inst` must return zero. See `docs/ThreeAddressCode.md`. |
+| IR Phase 1-8 (data structures, lowering, 3AC, emission, zercheck, VRP) | Done | Done. Migration: --use-ir, **195/195 ZER + 761/761 rust, 0 fail, 0 hang**. Phase 8a: on-demand locals, ident rewriting, scope conflict (BUG-507), async yield resume (BUG-508/509). Phase 8b partial: `lower_expr()` wired into `lower_stmt()` for ident/literal/binary/unary — creates IR_COPY with type adaptation (optional wrap/unwrap, array→slice). **20 `emit_expr` calls remain** in `emit_ir_inst` — IR_ASSIGN/IR_CALL/IR_BRANCH/builtins still use expr trees. Guards: array/void/null excluded from decomposition, non-local NODE_FIELD passthrough. See `docs/ThreeAddressCode.md` for Phase 8b remaining steps + edge cases from failed attempt. |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 

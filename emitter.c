@@ -6137,10 +6137,33 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              !is_null_sentinel(dst_eff->optional.inner) &&
                              inst->expr->kind == NODE_NULL_LIT);
 
+            /* Array→slice coercion */
+            bool need_slice = (dst_eff && dst_eff->kind == TYPE_SLICE &&
+                              src_eff && src_eff->kind == TYPE_ARRAY);
+
+            /* ?void from void call: hoist call, assign {1} (BUG-408 pattern) */
+            bool is_void_opt = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
+                               dst_eff->optional.inner &&
+                               type_unwrap_distinct(dst_eff->optional.inner)->kind == TYPE_VOID);
+            if (is_void_opt && inst->expr && inst->expr->kind == NODE_CALL) {
+                emit_expr(e, inst->expr);
+                emit(e, ";\n");
+                emit_indent(e);
+                if (func->is_async) {
+                    emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+                } else {
+                    emit(e, "%.*s = ", (int)dest->name_len, dest->name);
+                }
+                emit(e, "(_zer_opt_void){ 1 };\n");
+                break;
+            }
+
             if (need_null) {
                 emit_opt_null_literal(e, dst_eff);
             } else if (need_wrap) {
                 emit_opt_wrap_value(e, dst_eff, inst->expr);
+            } else if (need_slice) {
+                emit_array_as_slice(e, inst->expr, src_type, dst_type);
             } else {
                 emit_expr(e, inst->expr);
                 if (need_unwrap) emit(e, ".value");

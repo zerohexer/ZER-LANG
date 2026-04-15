@@ -282,17 +282,30 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         return tmp;
     }
 
-    /* ---- Field access: decompose object ---- */
+    /* ---- Field access: decompose only for local objects with non-array result ---- */
     case NODE_FIELD: {
+        /* Non-local objects (enum type, module prefix) → passthrough */
+        if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
+            int obj_id = ir_find_local(ctx->func,
+                expr->field.object->ident.name,
+                (uint32_t)expr->field.object->ident.name_len);
+            if (obj_id < 0) goto passthrough;
+        }
+        /* Array result → can't store in temp */
+        Type *frt = checker_get_type(ctx->checker, expr);
+        if (frt) {
+            Type *frt_eff = type_unwrap_distinct(frt);
+            if (frt_eff->kind == TYPE_ARRAY) goto passthrough;
+        }
         int obj = lower_expr(ctx, expr->field.object);
-        Type *rt = checker_get_type(ctx->checker, expr);
-        int tmp = create_temp(ctx, rt, expr->loc.line);
+        if (obj < 0) goto passthrough;
+        int tmp = create_temp(ctx, frt, expr->loc.line);
         IRInst inst = make_inst(IR_FIELD_READ, expr->loc.line);
         inst.dest_local = tmp;
         inst.src1_local = obj;
         inst.field_name = expr->field.field_name;
         inst.field_name_len = (uint32_t)expr->field.field_name_len;
-        inst.expr = expr; /* keep for emit_expr fallback during migration */
+        inst.expr = expr; /* keep for type info during emission */
         emit_3ac(ctx, inst);
         return tmp;
     }
@@ -328,8 +341,9 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         rewrite_idents(ctx, expr);
         Type *rt = checker_get_type(ctx->checker, expr);
         if (!rt) rt = ty_void;
-        /* Void expressions don't produce a value */
-        if (rt->kind == TYPE_VOID) {
+        /* Void/array expressions don't produce a storable value */
+        Type *rt_eff = type_unwrap_distinct(rt);
+        if (rt_eff->kind == TYPE_VOID || rt_eff->kind == TYPE_ARRAY) {
             IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
             inst.expr = expr;
             emit_3ac(ctx, inst);
@@ -730,10 +744,40 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     inst.expr = node->var_decl.init;
                     emit_inst(ctx, inst);
                 } else {
-                    IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-                    inst.dest_local = local_id;
-                    inst.expr = node->var_decl.init;
-                    emit_inst(ctx, inst);
+                    /* Three-address-code: try decomposing via lower_expr.
+                     * Only for expressions that lower_expr can handle
+                     * (ident, literal, binary, unary, field on local).
+                     * Complex/void → fallback to IR_ASSIGN with expr. */
+                    Node *init = node->var_decl.init;
+                    int src = -1;
+                    /* Only decompose simple value expressions.
+                     * Exclude: array types (can't assign in C), void,
+                     * null literals (no inherent type), struct inits. */
+                    bool try_decompose = (init->kind == NODE_IDENT ||
+                        init->kind == NODE_INT_LIT || init->kind == NODE_FLOAT_LIT ||
+                        init->kind == NODE_BOOL_LIT || init->kind == NODE_CHAR_LIT ||
+                        init->kind == NODE_BINARY || init->kind == NODE_UNARY);
+                    if (try_decompose && vt) {
+                        Type *vt_eff = type_unwrap_distinct(vt);
+                        if (vt_eff->kind == TYPE_ARRAY || vt_eff->kind == TYPE_VOID)
+                            try_decompose = false;
+                    }
+                    if (try_decompose) {
+                        src = lower_expr(ctx, init);
+                    }
+                    if (src >= 0 && src != local_id) {
+                        IRInst inst = make_inst(IR_COPY, node->loc.line);
+                        inst.dest_local = local_id;
+                        inst.src1_local = src;
+                        emit_inst(ctx, inst);
+                    } else {
+                        /* Fallback: IR_ASSIGN with expr tree */
+                        rewrite_idents(ctx, init);
+                        IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
+                        inst.dest_local = local_id;
+                        inst.expr = init;
+                        emit_inst(ctx, inst);
+                    }
                 }
             }
         }
@@ -782,8 +826,38 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 emit_inst(ctx, inst);
             }
         } else if (expr->kind == NODE_ASSIGN) {
+            /* Simple ident = decomposable_expr: use lower_expr + IR_COPY */
+            if (expr->assign.target && expr->assign.target->kind == NODE_IDENT &&
+                expr->assign.op == TOK_EQ) {
+                int dest = ir_find_local(ctx->func,
+                    expr->assign.target->ident.name,
+                    (uint32_t)expr->assign.target->ident.name_len);
+                Node *val = expr->assign.value;
+                bool try_decompose = val && (val->kind == NODE_IDENT ||
+                    val->kind == NODE_INT_LIT || val->kind == NODE_FLOAT_LIT ||
+                    val->kind == NODE_BOOL_LIT || val->kind == NODE_CHAR_LIT ||
+                    val->kind == NODE_BINARY || val->kind == NODE_UNARY);
+                /* Exclude array types — can't C-assign arrays */
+                if (try_decompose && dest >= 0) {
+                    Type *dt = ctx->func->locals[dest].type;
+                    Type *dt_eff = dt ? type_unwrap_distinct(dt) : NULL;
+                    if (dt_eff && (dt_eff->kind == TYPE_ARRAY || dt_eff->kind == TYPE_VOID))
+                        try_decompose = false;
+                }
+                if (dest >= 0 && try_decompose) {
+                    int src = lower_expr(ctx, val);
+                    if (src >= 0) {
+                        IRInst inst = make_inst(IR_COPY, node->loc.line);
+                        inst.dest_local = dest;
+                        inst.src1_local = src;
+                        emit_inst(ctx, inst);
+                        break;
+                    }
+                }
+            }
+            /* Fallback: IR_ASSIGN with full expr */
+            rewrite_idents(ctx, expr);
             IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-            /* If target is an ident, set dest_local */
             if (expr->assign.target && expr->assign.target->kind == NODE_IDENT) {
                 inst.dest_local = ir_find_local(ctx->func,
                     expr->assign.target->ident.name,

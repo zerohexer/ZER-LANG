@@ -796,8 +796,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     inst.src1_local = src;
                     emit_inst(ctx, inst);
                 } else if (src < 0) {
-                    /* lower_expr returned -1 (void expression) — no assignment needed.
-                     * The expression was already emitted as a side-effect IR_ASSIGN. */
+                    /* lower_expr returned -1 (void expression).
+                     * The call was already emitted as a side-effect IR_ASSIGN.
+                     * If dest is ?void, assign {has_value=1} (BUG-408 pattern). */
+                    Type *vt_eff = vt ? type_unwrap_distinct(vt) : NULL;
+                    if (vt_eff && vt_eff->kind == TYPE_OPTIONAL &&
+                        vt_eff->optional.inner &&
+                        type_unwrap_distinct(vt_eff->optional.inner)->kind == TYPE_VOID) {
+                        /* dest = (_zer_opt_void){1} via IR_LITERAL */
+                        IRInst lit = make_inst(IR_LITERAL, node->loc.line);
+                        lit.dest_local = local_id;
+                        lit.literal_int = 1;
+                        lit.literal_kind = 6; /* ?void has_value=1 */
+                        emit_inst(ctx, lit);
+                    }
                 }
             }
         }
@@ -934,12 +946,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int cap_id = ir_find_local(ctx->func,
                 node->if_stmt.capture_name,
                 (uint32_t)node->if_stmt.capture_name_len);
-            if (cap_id >= 0) {
-                /* capture = condition.value (or condition itself for null-sentinel) */
-                IRInst cap = make_inst(IR_ASSIGN, node->loc.line);
-                cap.dest_local = cap_id;
-                cap.expr = node->if_stmt.cond; /* emitter knows to unwrap */
-                emit_inst(ctx, cap);
+            if (cap_id >= 0 && br.cond_local >= 0) {
+                /* Skip ?void captures — no value to unwrap */
+                Type *cond_t = ctx->func->locals[br.cond_local].type;
+                Type *cond_eff = cond_t ? type_unwrap_distinct(cond_t) : NULL;
+                bool is_void_cap = (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
+                    cond_eff->optional.inner &&
+                    type_unwrap_distinct(cond_eff->optional.inner)->kind == TYPE_VOID);
+                if (!is_void_cap) {
+                    /* capture = condition (IR_COPY handles unwrap via type adaptation) */
+                    IRInst cap = make_inst(IR_COPY, node->loc.line);
+                    cap.dest_local = cap_id;
+                    cap.src1_local = br.cond_local;
+                    emit_inst(ctx, cap);
+                }
             }
         }
         lower_stmt(ctx, node->if_stmt.then_body);

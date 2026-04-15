@@ -1260,8 +1260,11 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
     - `emit_expr` — used by: IR_ASSIGN passthrough (complex expressions), IR_CALL, IR_INTRINSIC, builtins, top-level declarations
     - `emit_local_name` — used by: IR_BRANCH, IR_RETURN, IR_AWAIT, IR_COPY, IR_LITERAL, IR_BINOP, IR_UNOP, IR_FIELD_READ, IR_INDEX_READ
     - `emit_ir_value` — DELETED
-  - **Phase 8d continued: IR_CALL/builtins/IR_INTRINSIC collapsed into IR_ASSIGN (2026-04-16).** `lower_stmt(NODE_EXPR_STMT)` and `lower_stmt(NODE_VAR_DECL)` no longer create IR_CALL, IR_POOL_ALLOC, IR_SLAB_ALLOC, IR_RING_*, IR_ARENA_*, or IR_INTRINSIC ops. ALL calls/builtins/intrinsics go through `lower_expr` passthrough → `IR_ASSIGN{dest, expr}`. The emitter's IR_CALL/builtin/IR_INTRINSIC handlers are dead code guards (kept for safety). `emit_expr` in `emit_ir_inst`: 4 active calls in IR_ASSIGN + 3 dead code guards = 7 total. The 4 IR_ASSIGN calls are the ONE consolidated passthrough point for all complex expressions.
-  - **What remains for Phase 9 (dedicated IR ops):** Replace each `emit_expr` call in IR_ASSIGN with dedicated emission per expression type. IR_POOL_ALLOC would emit pool alloc inline C from local IDs. @ptrcast would emit type_id check from local IDs. Each is ~50-200 lines. Would eliminate the IR_ASSIGN passthrough entirely → emit_expr only for top-level declarations.
+  - **Phase 8d continued: IR_CALL/builtins/IR_INTRINSIC collapsed + capture/hoist eliminated (2026-04-16).** `lower_stmt(NODE_EXPR_STMT)` and `lower_stmt(NODE_VAR_DECL)` no longer create IR_CALL, IR_POOL_ALLOC, IR_SLAB_*, IR_RING_*, IR_ARENA_*, or IR_INTRINSIC ops. Dead code guards emit comments (zero emit_expr). Capture unwrap → IR_COPY (lowered at if-unwrap site, ?void skipped). ?void from void call → lowering emits void IR_ASSIGN + IR_LITERAL(kind=6, `(_zer_opt_void){1}`). BUG-517: ?void capture skip.
+  - **`emit_expr` in `emit_ir_inst`: 2 remaining** (both in IR_ASSIGN):
+    1. Main passthrough: `dest = emit_expr(expr)` — handles calls, builtins, intrinsics, casts, orelse, struct_init, index+bounds, handle auto-deref
+    2. Void expression: `emit_expr(expr)` as statement — field writes, compound assigns, void calls
+  - **What remains for Phase 9 (zero emit_expr):** Each expression type reaching IR_ASSIGN needs its own IR op emission. Each builtin/intrinsic/cast → 50-200 lines. Would eliminate IR_ASSIGN passthrough entirely → emit_expr only for top-level declarations.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

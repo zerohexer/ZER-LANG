@@ -797,6 +797,17 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Switch: chain of branches ---- */
     case NODE_SWITCH: {
+        /* Union/optional switch: complex tag-based dispatch.
+         * Pass through as AST node — emitter handles via emit_stmt. */
+        Type *sw_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
+        Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
+        if (sw_eff && (sw_eff->kind == TYPE_UNION || sw_eff->kind == TYPE_OPTIONAL)) {
+            IRInst pass = make_inst(IR_NOP, node->loc.line);
+            pass.expr = node; /* emit_stmt handles union/optional switch */
+            emit_inst(ctx, pass);
+            break;
+        }
+
         int bb_exit = ir_add_block(ctx->func, ctx->arena);
 
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {

@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-15 — IR Implementation (Phases 1-5)
+
+### IR foundation implemented
+MIR-inspired intermediate representation: flat locals, basic blocks, tree expressions.
+Files: `ir.h` (241 lines), `ir.c` (416 lines), `ir_lower.c` (960 lines), + 425 lines in emitter.c.
+Total: ~2042 new lines. All 4000+ tests pass.
+
+**Phase 1:** IRLocal, IRInst (26 op kinds), IRBlock, IRFunc data structures. Arena-allocated. Construction API, validation, pretty-printer.
+**Phase 2:** `ir_lower_func()` — AST → IR lowering. Collects ALL locals (params + var_decls + captures — no enumeration). Creates basic blocks for if/else/for/while/do-while/switch/goto. Lowers builtins to specific IR ops.
+**Phase 3:** IR validation — checks block structure, branch targets, local references.
+**Phase 4:** Pipeline hookup — `--emit-ir` flag in zerc_main.c. Lowers + validates + prints IR for all functions.
+**Phase 5:** `emit_func_from_ir()` — IR → C emission. Regular + async functions. Reuses existing emit_expr for expression trees.
+
+**Phases 6-7 (remaining):** zercheck on IR (real CFG), VRP on IR (per-LOCAL ranges).
+
+### Async capture ghost bug fixed
+If-unwrap capture (`if (opt) |val|`) was emitted as C stack local in async poll function. After yield+resume, `val` read garbage from stale stack. Fix: `collect_async_locals` now adds capture names. State struct emission adds capture fields. Test updated to verify value survives yield+resume.
+
+### Parser expression depth guard
+`parse_precedence` had no recursion guard — `((((...))))` caused stack exhaustion. Added depth guard (limit 256), matching existing block depth guard (64). Found by Gemini audit.
+
+### is_cstdlib skip list expanded
+Added `memmove`, `memchr`, `bsearch`, `qsort` — void* functions that conflict with `_zer_opaque` struct when `--track-cptrs` active.
+
+### Gemini audit round 14 results
+4 findings: 1 real bug (async capture ghost), 3 false positives (volatile provenance wash — already caught, goto skips alloc — runtime trapped, container name blowup — linear not exponential).
+
 ## Session 2026-04-14 — FuncProps: Function Summaries Implementation
 
 ### Tracking system #29: FuncProps on Symbol

@@ -6485,6 +6485,11 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         emit(e, " = {0};\n"); /* auto-zero */
     }
 
+    /* Disable source mapping during IR block emission — #line directives
+     * collide with goto labels and statement expressions (BUG-418 class). */
+    const char *saved_source = e->source_file;
+    e->source_file = NULL;
+
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
@@ -6498,6 +6503,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    e->source_file = saved_source;
     e->current_func_ret = NULL;
     e->indent--;
     emit(e, "}\n\n");
@@ -6570,6 +6576,10 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         add_async_local(e, func->locals[li].name, func->locals[li].name_len);
     }
 
+    /* Disable source mapping during IR blocks */
+    const char *saved_source = e->source_file;
+    e->source_file = NULL;
+
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
@@ -6582,6 +6592,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    e->source_file = saved_source;
     emit(e, "    } self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");
 

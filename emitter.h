@@ -84,6 +84,9 @@ typedef struct {
     uint32_t *condvar_type_ids;
     int condvar_type_count;
     int condvar_type_capacity;
+
+    /* IR emission mode (v0.4 migration) */
+    bool use_ir;            /* true = lower to IR then emit from IR. false = AST emission (default). */
 } Emitter;
 
 /* ---- API ---- */

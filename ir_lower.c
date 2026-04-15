@@ -191,6 +191,16 @@ static void collect_locals(LowerCtx *ctx, Node *node) {
         }
         break;
 
+    case NODE_SPAWN:
+        /* Scoped spawn: ThreadHandle th = spawn func(args) */
+        if (node->spawn_stmt.handle_name) {
+            ir_add_local(ctx->func, ctx->arena,
+                         node->spawn_stmt.handle_name,
+                         (uint32_t)node->spawn_stmt.handle_name_len,
+                         ty_u64, false, false, false, node->loc.line);
+        }
+        break;
+
     case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
             collect_locals(ctx, node->block.stmts[i]);

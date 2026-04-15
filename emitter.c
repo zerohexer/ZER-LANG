@@ -6545,15 +6545,42 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->dest_local >= 0 && inst->src1_local >= 0) {
             IRLocal *dst = &func->locals[inst->dest_local];
             IRLocal *src = &func->locals[inst->src1_local];
+            Type *dst_eff = dst->type ? type_unwrap_distinct(dst->type) : NULL;
+            Type *src_eff = src->type ? type_unwrap_distinct(src->type) : NULL;
+
+            /* Type adaptation */
+            bool need_wrap = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
+                             !is_null_sentinel(dst_eff->optional.inner) &&
+                             src_eff && src_eff->kind != TYPE_OPTIONAL);
+            bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
+                               dst_eff && dst_eff->kind != TYPE_OPTIONAL &&
+                               !is_null_sentinel(src_eff->optional.inner) &&
+                               src_eff->optional.inner->kind != TYPE_VOID);
+            bool need_slice = (dst_eff && dst_eff->kind == TYPE_SLICE &&
+                              src_eff && src_eff->kind == TYPE_ARRAY);
+
+            const char *sp = func->is_async ? "self->" : "";
             emit_indent(e);
-            if (func->is_async)
-                emit(e, "self->%.*s = self->%.*s;\n",
-                     (int)dst->name_len, dst->name,
-                     (int)src->name_len, src->name);
-            else
-                emit(e, "%.*s = %.*s;\n",
-                     (int)dst->name_len, dst->name,
-                     (int)src->name_len, src->name);
+            emit(e, "%s%.*s = ", sp, (int)dst->name_len, dst->name);
+
+            if (need_slice) {
+                emit(e, "(");
+                emit_type(e, dst_eff);
+                emit(e, "){ %s%.*s, %u };\n",
+                     sp, (int)src->name_len, src->name,
+                     src_eff ? (unsigned)src_eff->array.size : 0);
+            } else if (need_wrap) {
+                emit(e, "(");
+                emit_type(e, dst_eff);
+                emit(e, "){ %s%.*s, 1 };\n",
+                     sp, (int)src->name_len, src->name);
+            } else if (need_unwrap) {
+                emit(e, "%s%.*s.value;\n",
+                     sp, (int)src->name_len, src->name);
+            } else {
+                emit(e, "%s%.*s;\n",
+                     sp, (int)src->name_len, src->name);
+            }
         }
         break;
     }

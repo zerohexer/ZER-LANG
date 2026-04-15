@@ -6119,16 +6119,30 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else {
                 emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
-            /* Check if unwrap needed: source is optional, dest is not */
+            /* Type adaptation between source and dest */
             Type *src_type = checker_get_type(e->checker, inst->expr);
             Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
             Type *dst_type = dest->type;
             Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
+
             bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
                                dst_eff && dst_eff->kind != TYPE_OPTIONAL &&
                                !is_null_sentinel(src_eff->optional.inner));
-            emit_expr(e, inst->expr);
-            if (need_unwrap) emit(e, ".value");
+            bool need_wrap = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
+                             !is_null_sentinel(dst_eff->optional.inner) &&
+                             src_eff && src_eff->kind != TYPE_OPTIONAL);
+            bool need_null = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
+                             !is_null_sentinel(dst_eff->optional.inner) &&
+                             inst->expr->kind == NODE_NULL_LIT);
+
+            if (need_null) {
+                emit_opt_null_literal(e, dst_eff);
+            } else if (need_wrap) {
+                emit_opt_wrap_value(e, dst_eff, inst->expr);
+            } else {
+                emit_expr(e, inst->expr);
+                if (need_unwrap) emit(e, ".value");
+            }
             emit(e, ";\n");
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */

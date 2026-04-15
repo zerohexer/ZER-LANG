@@ -1187,7 +1187,9 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 - Expressions kept as AST trees (Node*) in IRInst.expr — clean C output, reuses emit_expr
 - Control flow decomposed into basic blocks — real CFG for zercheck
 - Locals are flat list — captures and temps explicit, no enumeration
-- 26 IR op kinds: core (assign/call/branch/goto/return), async (yield/await), concurrency (spawn/lock/unlock), builtins (pool/slab/ring/arena), interrupt (critical begin/end), defer (push/fire)
+- 42 IR op kinds: core (assign/call/branch/goto/return), async (yield/await), concurrency (spawn/lock/unlock), builtins (pool/slab/ring/arena), interrupt (critical begin/end), defer (push/fire), 3AC (copy/binop/unop/field_read/field_write/index_read/index_write/literal/addr_of/deref_read/call_decomp/cast/intrinsic_decomp/orelse_decomp/slice_read/struct_init_decomp)
+- IRLocal has `orig_name`/`orig_name_len` — source name before suffix. `ir_find_local` uses orig_name for lookup. `name` is the C emission name (may be suffixed for scope conflicts).
+- IRInst has `src1_local`/`src2_local`/`op_token`/`field_name`/`literal_*`/`call_arg_locals` for 3AC operands
 - Checker type as void* in ir.h (anonymous struct can't be forward-declared)
 - Empty blocks allowed (join points)
 
@@ -1230,7 +1232,13 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 - **195/195 compile, 194/195 runtime (99.5%).** 7 of 8 hangs fixed by implicit-return-on-current-block fix. 1 remaining:
   - condvar_signal: spawn + shared struct + @cond_wait/@cond_signal — hangs (AST path works, IR path doesn't). Threading-specific emission bug.
 - **7 hangs FIXED:** implicit return was added to `func->blocks[block_count - 1]` but should be `func->blocks[ctx.current_block]`. Yield creates resume blocks AFTER exit block → empty exit fell through to resume → infinite loop back to condition.
-- **Next:** fix condvar_signal hang. Then test rust/zig runtime. Then flip default.
+- **Phase 8a (scope conflict resolution + async hang fixes):**
+  - **BUG-507 scope conflict:** `ir_add_local` deduplicates by name regardless of type. `Msg m` (loop 1) + `?Msg m` (loop 2) → both get type `Msg`. Fix: (1) don't dedup when types differ — create suffixed local (2) `IRLocal.orig_name` for source→C name mapping (3) `ir_find_local` searches by `orig_name`, returns LAST match (4) `collect_locals` REMOVED — locals created on-demand in `lower_stmt` (sequential order ensures later-scoped locals don't exist during earlier processing) (5) `rewrite_idents()` walks expression trees and rewrites `NODE_IDENT` to use correct suffixed name
+  - **BUG-508 async yield resume:** Duff's device `case N:` emitted inline after `return 0`. Sequential block emission puts exit block right after case label → resume falls through to return instead of loop back-edge. Fix: yield/await store resume block ID in `goto_block`. Emitter emits `goto _zer_bb<resume>` after case label.
+  - **BUG-509 async bare return:** IR_RETURN for void async function emitted `return;` (undefined int value). Caller `while(poll() == 0)` never exits. Fix: `func->is_async` → emit `self->_zer_state = -1; return 1;`
+  - **3AC foundation:** `lower_expr()` function added (decomposes ident/literal/binary/unary/field/index to temp locals + IR instructions). New op kinds: IR_COPY, IR_BINOP, IR_UNOP, IR_FIELD_READ, IR_INDEX_READ, IR_LITERAL, etc. Emission handlers added. NOT YET WIRED into `lower_stmt` — `emit_expr` still used. Phase 8b wires it.
+  - **Result: 195/195 ZER + 761/761 rust, 0 fail, 0 hang on IR path.**
+- **Next: Phase 8b** — wire `lower_expr()` into `lower_stmt()`, replace `emit_expr()` calls with local-ID emission. Verification: `grep emit_expr` in `emit_ir_inst` must return zero results.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

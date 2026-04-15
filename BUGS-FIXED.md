@@ -3698,3 +3698,53 @@ Gemini-prompted deep review of compiler safety guarantees. Found 6 structural bu
 **Parser Semaphore(N) optional:** `(N)` only parsed if `(` follows. Without `(`, returns bare TYNODE_SEMAPHORE — needed for `*Semaphore` function param type.
 
 **Spawn global scan:** TYPE_SEMAPHORE added to skip list (thread-safe, has own mutex/condvar).
+
+## Session 2026-04-15 — IR Phase 8: Same-Name Different-Type Locals + Async Fixes
+
+### BUG-507: IR scope conflict — same-name different-type locals
+`Msg m` (loop 1) and `?Msg m` (loop 2) — `ir_add_local` dedup by name gives first type. Second loop's `?Msg` usage gets `Msg` type → GCC error "struct Msg has no member 'has_value'."
+**Root cause:** `ir_add_local` deduplicates by name regardless of type. Flat IR locals can't represent C block-scoped variables with same name but different types.
+**Fix:** (1) `ir_add_local` creates suffixed local when same name + different type detected. (2) `IRLocal` gains `orig_name`/`orig_name_len` for source→C name mapping. (3) `ir_find_local` searches by `orig_name`, returns LAST match (innermost scope). (4) `collect_locals` removed — locals created on-demand during `lower_stmt` (sequential processing order). (5) `rewrite_idents()` walks expression trees and rewrites NODE_IDENTs to use correct suffixed local names.
+**Test:** `rust_tests/rt_conc_ring_producer_consumer.zer` (was the 1 failing rust test, now passes)
+
+### BUG-508: IR async yield resume jumps to wrong block
+Async functions with yield inside while-loop hang — poll never returns 1 (complete). `rt_async_producer_consumer` and `rt_test_400_full_lifecycle` both hang on IR path.
+**Root cause:** Duff's device case label emitted inline after yield return. Sequential block emission puts exit block (return) right after case label, not the resume continuation. The resume falls through to the exit block instead of the loop back-edge.
+**Fix:** yield/await instructions record resume block ID in `goto_block` field. Emitter emits `goto _zer_bb<resume>` after case label to jump to the correct resume block.
+**Test:** `rust_tests/rt_async_producer_consumer.zer`, `rust_tests/rt_test_400_full_lifecycle.zer`
+
+### BUG-509: IR async bare return emits `return;` instead of `return 1;`
+Async poll function returns int (0=pending, 1=done). Bare return from void async function emitted `return;` → undefined return value → caller's `while(poll() == 0)` never exits.
+**Root cause:** IR_RETURN handler called `emit_return_null()` for bare returns, which emits `return;` for void functions. But async poll functions return int, not void.
+**Fix:** IR_RETURN bare return path checks `func->is_async` — if true, emits `self->_zer_state = -1; return 1;`
+**Test:** same as BUG-508
+
+### BUG-507: IR scope conflict — same-name different-type locals (2026-04-15)
+
+**Symptom:** `Msg m` (loop 1) and `?Msg m` (loop 2) in same function — ir_add_local dedup by name gives first type. Second loop's `?Msg` gets `Msg` type → GCC error "struct Msg has no member 'has_value'". Only 1 rust test failed (rt_conc_ring_producer_consumer).
+
+**Root cause:** ir_add_local deduplicates by name regardless of type. Flat IR locals can't represent C block-scoped variables with same name but different types.
+
+**Fix:** (1) ir_add_local creates suffixed local when same name + different type (2) IRLocal gains orig_name/orig_name_len for source→C name mapping (3) ir_find_local searches by orig_name, returns LAST match (4) collect_locals REMOVED — locals created on-demand during lower_stmt (5) rewrite_idents() walks expression trees and rewrites NODE_IDENTs to use correct suffixed local names.
+
+**Test:** rust_tests/rt_conc_ring_producer_consumer.zer
+
+### BUG-508: IR async yield resume jumps to wrong block (2026-04-15)
+
+**Symptom:** Async functions with yield inside while-loop hang — poll never returns 1. rt_async_producer_consumer and rt_test_400_full_lifecycle both hang on IR path, pass on AST path.
+
+**Root cause:** Duff's device `case N:` emitted inline after `return 0`. Sequential block emission puts exit block (return) right after case label. Resume falls through to exit instead of loop back-edge.
+
+**Fix:** Yield/await instructions store resume block ID in goto_block. Emitter emits `goto _zer_bb<resume>` after case label.
+
+**Test:** rust_tests/rt_async_producer_consumer.zer, rust_tests/rt_test_400_full_lifecycle.zer
+
+### BUG-509: IR async bare return emits `return;` instead of `return 1;` (2026-04-15)
+
+**Symptom:** Async poll function returns int (0=pending, 1=done). Bare return from void async function emitted `return;` → undefined return value → caller's `while(poll() == 0)` never exits.
+
+**Root cause:** IR_RETURN handler called emit_return_null() for bare returns which emits `return;` for void functions. Async poll functions return int.
+
+**Fix:** IR_RETURN bare return checks func->is_async — emits `self->_zer_state = -1; return 1;`
+
+**Test:** same as BUG-508

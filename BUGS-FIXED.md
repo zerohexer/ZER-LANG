@@ -3828,3 +3828,23 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** In lower_stmt(NODE_IF) capture, detect `?void` condition type and skip IR_COPY creation. `?void` captures are no-ops — they only prove presence, no value.
 
 **Test:** tests/zer/optional_patterns.zer (test 8: ?void if-unwrap)
+
+### BUG-518: IR call arg decomposition on builtin type-name args (2026-04-16)
+
+**Symptom:** `arena.alloc(Sensor)` — `lower_expr` tried to decompose the type-name argument `Sensor`. Not a variable → created void temp → GCC "'Sensor' undeclared" error.
+
+**Root cause:** Phase 9 NODE_CALL decomposition called `lower_expr` on ALL call args. Builtin calls like `arena.alloc(T)`, `arena.alloc_slice(T, n)` have type-name args that aren't expressions — they're type identifiers consumed by `emit_expr`'s builtin handler.
+
+**Fix:** Detect builtins at lowering time (same pattern as emitter): check if callee is NODE_FIELD on pool/slab/ring/arena/struct type. Skip arg decomposition for builtins. Builtins keep `inst->expr` for `emit_expr`.
+
+**Test:** tests/zer/arena_alloc.zer, tests/zer/super_freelist_arena.zer
+
+### BUG-519: IR call simple emission missing array→slice arg coercion (2026-04-16)
+
+**Symptom:** `sum_points(arr)` where `arr` is `Point[5]` and param is `[*]Point` — simple call emitted `sum_points(arr)` which is `uint8_t[]` not `_zer_slice_Point`. GCC "incompatible type for argument" error.
+
+**Root cause:** IR_CALL simple path emitted `func(local1, local2)` from local names. `emit_expr` has array→slice coercion at call args (wraps in `(_zer_slice_T){ arr, N }`). Simple local-ID emission didn't.
+
+**Fix:** In IR_CALL emitter, look up callee's function type from checker. For each arg, check if arg type is TYPE_ARRAY and param type is TYPE_SLICE → emit coercion wrapper `(SliceType){ local, size }`.
+
+**Test:** tests/zer/star_slice.zer, tests/zer/super_plugin.zer

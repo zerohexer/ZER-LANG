@@ -6239,22 +6239,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CALL: {
+        /* IR_CALL no longer created by lowering (all calls → IR_ASSIGN passthrough).
+         * Kept as dead code guard — if reached, emit via IR_ASSIGN fallback. */
         emit_indent(e);
         if (inst->dest_local >= 0) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
         }
-        /* Call expressions use emit_expr — handles builtins, module mangling, etc. */
-        if (inst->expr) {
-            emit_expr(e, inst->expr);
-        } else if (inst->func_name) {
-            emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
-            for (int i = 0; i < inst->arg_count; i++) {
-                if (i > 0) emit(e, ", ");
-                if (inst->args && inst->args[i]) emit_expr(e, inst->args[i]);
-            }
-            emit(e, ")");
-        }
+        if (inst->expr) emit_expr(e, inst->expr);
         emit(e, ";\n");
         break;
     }
@@ -6405,28 +6397,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_POOL_GET:
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
     case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
-        /* Builtin methods — emit via AST expression tree.
-         * emit_expr handles inline code generation for pool/slab/ring/arena. */
+        /* Builtin ops no longer created by lowering (all → IR_ASSIGN passthrough).
+         * Kept as dead code guard — if reached, emit via fallback. */
         emit_indent(e);
         if (inst->dest_local >= 0) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
         }
-        if (inst->expr) {
-            emit_expr(e, inst->expr);
-            /* Unwrap .value if builtin returns optional but dest is not */
-            if (inst->dest_local >= 0) {
-                IRLocal *bd = &func->locals[inst->dest_local];
-                Type *bs = checker_get_type(e->checker, inst->expr);
-                Type *bse = bs ? type_unwrap_distinct(bs) : NULL;
-                Type *bde = bd->type ? type_unwrap_distinct(bd->type) : NULL;
-                if (bse && bse->kind == TYPE_OPTIONAL && bde &&
-                    bde->kind != TYPE_OPTIONAL &&
-                    !is_null_sentinel(bse->optional.inner) &&
-                    bse->optional.inner->kind != TYPE_VOID)
-                    emit(e, ".value");
-            }
-        }
+        if (inst->expr) emit_expr(e, inst->expr);
         emit(e, ";\n");
         break;
     }
@@ -6510,6 +6488,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_INTRINSIC: {
+        /* IR_INTRINSIC no longer created by lowering (all → IR_ASSIGN passthrough).
+         * Kept as dead code guard. */
         emit_indent(e);
         if (inst->dest_local >= 0) {
             emit_local_name(e, func, inst->dest_local);

@@ -1218,14 +1218,14 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - Async static locals: `static` declaration in poll function, excluded from self-> prefix
   - Void capture skip: ?void if-unwrap capture not added as IR local
   - Comptime-if: dead branch stripped in collect_locals + lower_stmt
-- **Remaining 15 failures:**
-  - Union switch: struct as scalar (7) — IR_BRANCH emits raw union, needs ._tag access
-  - Async yield in GCC stmt expr (4) — Duff's device case inside ({...})
-  - callback_system (continue in defer body — no C loop in IR context)
-  - optional_patterns (struct Result unwrap)
-  - slice_subslice (array→slice coercion in assignment)
-  - void_optional_init (?void other emission issue)
-- **Next:** fix remaining 15. Then flip default to IR, delete AST emission.
+- **Additional fixes (92%→95%):** Union/optional switch passthrough (detected by type, AST-emitted via IR_NOP)
+- **Remaining 9 failures (structural):**
+  - async_exprstmt_orelse, async_orelse_value_yield, async_two_orelse_yield, yield_in_orelse — Duff's case inside GCC `({...})` stmt expr. Fix: lower orelse to IR branches in async mode.
+  - callback_system, event_system — continue/break inside defer body, no C loop in IR (gotos/labels). Fix: emit C `while(1)` for loops that have defer+break/continue.
+  - optional_patterns — struct Result not unwrapped by .value (custom struct optional)
+  - slice_subslice — array→slice coercion missing in IR_ASSIGN
+  - void_optional_init — ?void function call result emission
+- **Next:** fix remaining 9. Then flip default to IR, delete AST emission.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

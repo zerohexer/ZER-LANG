@@ -6389,8 +6389,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_POOL_GET:
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
     case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
-        /* Builtin methods — currently emit via AST expression tree.
-         * The existing emit_expr handles these via NODE_CALL dispatch. */
+        /* Builtin methods — emit via AST expression tree.
+         * emit_expr handles inline code generation for pool/slab/ring/arena. */
         emit_indent(e);
         if (inst->dest_local >= 0) {
             IRLocal *dest = &func->locals[inst->dest_local];
@@ -6400,7 +6400,21 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
         }
-        if (inst->expr) emit_expr(e, inst->expr);
+        if (inst->expr) {
+            emit_expr(e, inst->expr);
+            /* Unwrap .value if builtin returns optional but dest is not */
+            if (inst->dest_local >= 0) {
+                IRLocal *bd = &func->locals[inst->dest_local];
+                Type *bs = checker_get_type(e->checker, inst->expr);
+                Type *bse = bs ? type_unwrap_distinct(bs) : NULL;
+                Type *bde = bd->type ? type_unwrap_distinct(bd->type) : NULL;
+                if (bse && bse->kind == TYPE_OPTIONAL && bde &&
+                    bde->kind != TYPE_OPTIONAL &&
+                    !is_null_sentinel(bse->optional.inner) &&
+                    bse->optional.inner->kind != TYPE_VOID)
+                    emit(e, ".value");
+            }
+        }
         emit(e, ";\n");
         break;
     }

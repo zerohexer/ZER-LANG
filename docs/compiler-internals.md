@@ -1193,14 +1193,21 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 
 **Current status:** All 7 phases implemented. Migration in progress via `--use-ir` flag.
 - `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block.
-- `--use-ir` routes function body emission through IR path. **115/195 (59%) ZER tests compile.** AST path is default, all 4000+ pass.
-- **Remaining 80 failures** (characterized):
-  - "expected expression before return" (~20) — IR_BRANCH for optional conditions needs `.has_value` check instead of raw value
-  - "used struct type value where scalar is required" (~10) — same: optional in branch condition emitted as struct, needs `.has_value`
-  - "switch jumps into statement expression" (~3) — async yield inside GCC `({...})` statement expression
-  - Various pattern-specific gaps (comptime_if dead branch not stripped, goto label emission, etc.)
-- **Fixed so far:** param types from AST (not IR fallback), return optional wrapping (delegates to AST emit_stmt), async self-> context setup
-- **Next:** fix optional branch condition emission in IR_BRANCH, then pattern-by-pattern for remaining gaps
+- `--use-ir` routes function body emission through IR path. **163/195 (84%) ZER tests compile.** AST path is default, all 4000+ pass.
+- **Remaining 32 failures** (characterized):
+  - Union switch: struct used as scalar (7) — IR_BRANCH emits raw union value, needs `._tag` access
+  - Async yield in GCC statement expression (4) — Duff's device case label inside `({...})`
+  - Defer + #line stray (4) — `#line` directive collides with IR block label in defer body
+  - Various type wrapping edge cases (17) — optional→value, value→optional, distinct, slice coercion
+- **Fixes applied (59%→84%):**
+  - Param types from checker's func_type (not IR local fallback) — fixes all struct/pointer params
+  - Return optional wrapping: extract NODE_RETURN, emit_opt_wrap_value / emit_opt_null_literal / emit_return_null
+  - IR_BRANCH optional: struct optional → .has_value, null-sentinel → as-is, cond_local for temp locals
+  - IR_ASSIGN .value unwrap: source optional + dest non-optional → append `.value` — fixed 21 tests
+  - bb0 label always emitted (goto _zer_bb0 needs it)
+  - Async self-> context: set e->in_async + populate async_locals from IR local list before poll emission
+  - emit_opt_wrap_value argument order (type, expr) was swapped
+- **Next:** union switch tag emission, defer #line fix, remaining type wrapping. Then flip default to IR, delete AST emission.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

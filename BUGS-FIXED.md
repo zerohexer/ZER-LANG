@@ -20,7 +20,7 @@ Total: ~2042 new lines. All 4000+ tests pass.
 
 **Phases 6-7 (now done):** zercheck_ir.c (452 lines — handle tracking on CFG, integer LOCAL IDs, real merge at predecessors, fixed-point iteration, leak detection). vrp_ir.c (349 lines — range per LOCAL per block, scoped address_taken, merge at join points). Total IR: ~2870 new lines across 6 files.
 
-**Migration started:** `--use-ir` flag wired. 115/195 (59%) ZER tests compile on IR path. Fixed: param types from AST, return optional wrapping, async self-> context. Remaining 80: optional branch conditions (~30), async yield in stmt expr (~3), comptime_if dead branch (~5), various pattern gaps.
+**Migration progress:** `--use-ir` flag wired. **163/195 (84%)** ZER tests compile on IR path. Fixes applied: param types from checker func_type, return optional wrapping (emit_opt_wrap_value), IR_BRANCH optional (.has_value + cond_local), IR_ASSIGN .value unwrap (source optional → dest non-optional), bb0 label, async self-> context, emit_opt_wrap_value arg order. Remaining 32: union switch tag (7), async yield in stmt expr (4), defer #line (4), type wrapping edge cases (17).
 
 23 of 29 safety systems on IR, 6 on checker (pre-IR infrastructure). Rule: "what does it mean?" → checker, "is it safe?" → IR.
 

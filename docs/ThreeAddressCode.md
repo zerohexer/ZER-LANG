@@ -122,27 +122,62 @@ LOCALS:
 (innermost scope). The lowering pushes/pops scope depth to
 track which `m` is current.
 
-## Migration Strategy
+## Current Status (Phase 8a COMPLETE, Phase 8b PENDING)
 
-1. Add `lower_expr()` function that decomposes trees → temp locals + instructions
-2. Change `lower_stmt` to call `lower_expr` instead of storing `Node *expr`
-3. Change `IRInst` to use `src1/src2` local IDs instead of `Node *expr`
-4. Change `emit_ir_inst` to emit from local IDs instead of `emit_expr`
-5. Delete `emit_expr` calls from IR emission path
-6. Verify all tests pass at each step
+**Phase 8a (done):** Scope conflict resolved. On-demand locals, ident rewriting, orig_name tracking.
+- `lower_expr()` EXISTS (decomposes ident/literal/binary/unary/field/index)
+- New IR ops EXIST (IR_COPY, IR_BINOP, IR_LITERAL, etc.) with emission handlers
+- 195/195 ZER + 761/761 rust pass (0 hang)
+- BUT: `lower_expr` is NOT WIRED into `lower_stmt`. `emit_expr` still used everywhere.
 
-## Impact
+**Phase 8b (pending):** Wire lower_expr into lower_stmt. Eliminate emit_expr from emit_ir_inst.
 
-- Eliminates the last architectural gap (scope vs flat locals)
-- `emit_expr` no longer needed for IR path (can be deleted when AST path removed)
-- All 761/761 rust tests should pass
-- Foundation for SSA form (future: phi nodes at merge points)
+## Phase 8b — Concrete Steps
 
-## Estimated Size
+### The wiring (lower_stmt changes):
 
-- `lower_expr()`: ~300 lines (recursive tree → instruction decomposition)
-- `IRInst` changes: ~50 lines (new fields, remove `Node *expr`)
-- `emit_ir_inst` changes: ~200 lines (emit from local IDs)
-- New IR op kinds: ~20 (ADD, SUB, MUL, DIV, GT, LT, EQ, NE, FIELD_READ, INDEX, CALL, etc.)
-- Total: ~600 lines new, ~400 lines removed (emit_expr calls)
-- Net: ~200 lines added
+1. `NODE_VAR_DECL` default init: replace `inst.expr = init` with `src = lower_expr(ctx, init); IR_COPY(dest, src)`
+2. `NODE_EXPR_STMT` simple assign: replace `inst.expr = expr` with `src = lower_expr(ctx, value); IR_COPY(dest, src)`
+3. `NODE_EXPR_STMT` call: replace `inst.expr = expr` with `lower_expr(ctx, expr)` (void result)
+4. `NODE_IF` condition: already has `br.expr = cond` → replace with `cond_local = lower_expr(ctx, cond)`
+5. `NODE_FOR` condition/step: replace `br.expr = cond` and `step.expr = step`
+6. `NODE_WHILE/DO_WHILE` condition: replace `br.expr = cond`
+7. `NODE_RETURN` expression: replace `ret.expr = node` with `src = lower_expr(ctx, ret_expr)`
+
+### Edge cases that BROKE during first attempt:
+
+1. **Void type temps:** `checker_get_type(NODE_NULL_LIT)` returns NULL → void temp → GCC error.
+   Fix: DON'T decompose null literals, struct inits, or expressions with NULL/void type.
+   Use `can_decompose` check: `init_type && init_type->kind != TYPE_VOID && init->kind != NODE_NULL_LIT`.
+
+2. **Type adaptation in IR_COPY:** dest `?u32` + src `u32` needs `{val, 1}` wrapping.
+   Already fixed in Phase 8a IR_COPY handler (wrap/unwrap/slice coercion).
+
+3. **Enum/module qualified access:** `Color.red` — NODE_FIELD with non-local object.
+   `lower_expr(NODE_FIELD)` must check if object is a local before decomposing.
+   If not local (enum type, module prefix) → passthrough to emit_expr.
+
+4. **Builtins (pool/slab/ring/arena):** Emit inline C code. Can't be decomposed.
+   Keep as IR_POOL_ALLOC etc. with expr passthrough.
+
+5. **Orelse:** Already lowered to IR branches in async/loop contexts.
+   Non-async orelse uses GCC statement expressions → keep as expr passthrough.
+
+### Emission changes (emit_ir_inst):
+
+For each new op kind, the emitter uses `func->locals[id].name` instead of `emit_expr(expr)`:
+- IR_COPY: `dest_name = src_name;` (with type adaptation)
+- IR_BINOP: `dest_name = src1_name OP src2_name;`
+- IR_LITERAL: `dest_name = literal_value;`
+- IR_FIELD_READ: `dest_name = src_name.field;`
+- IR_INDEX_READ: `dest_name = src_name[idx_name];` (with bounds check)
+
+### Verification
+
+After Phase 8b: `grep emit_expr` in `emit_ir_inst` function body must return ZERO results.
+(Except IR_NOP passthrough for spawn/asm/union-switch which deliberately delegates to AST.)
+
+### Estimated effort
+
+~500 lines of changes across ir_lower.c + emitter.c. Main risk: type adaptation edge cases
+in IR_COPY emission. Test after EACH expression type conversion. Do NOT batch changes.

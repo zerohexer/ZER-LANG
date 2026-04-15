@@ -22,8 +22,9 @@ Total: ~2042 new lines. All 4000+ tests pass.
 
 **Migration progress:** `--use-ir` flag wired. **186/195 (95%)** ZER tests compile on IR path.
 All fixes: param types from AST, return optional wrapping, IR_BRANCH .has_value + cond_local, IR_ASSIGN unwrap/wrap/null, bb0 label, async self->, arg order, #line disabled, defer stack clear, spawn handle, comptime-if dead branch, async static locals, void capture skip, union/optional switch passthrough.
-**193/195 (99%).** Fixed since 85%: async orelse→IR branches (4), orelse in loops (2), union switch passthrough (6), slice coercion, ?void hoist, unwrap guard, static locals, comptime-if, void capture, defer stack clear, bb0 label.
-Remaining 2: optional_patterns, void_optional_init. Need full orelse→IR branch lowering in all contexts.
+**195/195 (100%).** All ZER positive tests compile on IR path.
+Final fixes: scoped captures with C `{ }` for type-conflicting if-unwrap (optional_patterns), dangling orelse temp name arena-allocated (super_uart_parser), ?void hoist before `dest =` prefix (void_optional_init), ?void return wrapping hoist (try_validate).
+51 commits this session. IR from 0% to 100%. Next: test 786 rust + 36 zig + 74 negative + module tests on --use-ir path.
 
 23 of 29 safety systems on IR, 6 on checker (pre-IR infrastructure). Rule: "what does it mean?" → checker, "is it safe?" → IR.
 

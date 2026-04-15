@@ -1193,7 +1193,7 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 
 **Current status:** All 7 phases implemented. Migration in progress via `--use-ir` flag.
 - `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block.
-- `--use-ir` routes function body emission through IR path. **180/195 (92%) ZER tests compile.** AST path is default, all 4000+ pass.
+- `--use-ir` routes function body emission through IR path. **193/195 (99%) ZER tests compile.** AST path is default, all 4000+ pass.
 - **Remaining 32 failures** (characterized):
   - Union switch: struct used as scalar (7) — IR_BRANCH emits raw union value, needs `._tag` access
   - Async yield in GCC statement expression (4) — Duff's device case label inside `({...})`
@@ -1225,7 +1225,9 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - optional_patterns — struct Result not unwrapped by .value (custom struct optional)
   - slice_subslice — array→slice coercion missing in IR_ASSIGN
   - void_optional_init — ?void function call result emission
-- **Next:** fix remaining 9. Then flip default to IR, delete AST emission.
+- **Additional fixes (95%→99%):** Async orelse→IR branches (4 tests), orelse in loops→IR branches (2 tests), slice coercion in IR_ASSIGN, ?void hoist from void call, unwrap type_equals guard
+- **Remaining 2 failures:** optional_patterns (orelse in complex expr), void_optional_init (?void initializer). Need full orelse→IR branch lowering in ALL contexts.
+- **Next:** lower ALL orelse to IR branches. Then flip default to IR, delete AST emission.
 
 **New files from Phase 6+7:**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.

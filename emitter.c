@@ -6158,8 +6158,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_BRANCH: {
         emit_indent(e);
         emit(e, "if (");
-        if (inst->expr) emit_expr(e, inst->expr);
-        else emit(e, "1");
+        if (inst->expr) {
+            /* Check if condition is an optional type — needs special emission.
+             * Optional structs: emit .has_value. Null-sentinel (?*T): emit as-is. */
+            Type *cond_type = checker_get_type(e->checker, inst->expr);
+            Type *cond_eff = cond_type ? type_unwrap_distinct(cond_type) : NULL;
+            if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(cond_eff->optional.inner)) {
+                /* Struct optional — check .has_value */
+                emit(e, "(");
+                emit_expr(e, inst->expr);
+                emit(e, ").has_value");
+            } else {
+                emit_expr(e, inst->expr);
+            }
+        } else {
+            emit(e, "1");
+        }
         emit(e, ") goto _zer_bb%d; else goto _zer_bb%d;\n",
              inst->true_block, inst->false_block);
         break;
@@ -6172,41 +6187,45 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_RETURN: {
-        /* Delegate to AST emit_stmt for returns — handles optional wrapping,
-         * defer hoisting, null returns, ?void, and all the complex patterns.
-         * The AST return node is in inst->expr->parent or we construct one. */
-        if (inst->expr && inst->expr->kind == NODE_RETURN) {
-            /* inst->expr IS a NODE_RETURN from the AST — emit via AST path */
-            emit_stmt(e, inst->expr);
-        } else {
-            /* Simple return — emit directly */
-            emit_indent(e);
-            if (inst->expr) {
-                /* Check if we need optional wrapping */
-                Type *ret = e->current_func_ret;
-                Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
-                Type *expr_type = inst->expr ? checker_get_type(e->checker, inst->expr) : NULL;
-                if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
-                    !is_null_sentinel(ret_eff->optional.inner) &&
-                    expr_type && !type_equals(expr_type, ret)) {
-                    /* Wrap value in optional struct */
-                    emit(e, "return ");
-                    emit_opt_wrap_value(e, inst->expr, ret_eff);
-                    emit(e, ";\n");
-                } else {
-                    emit(e, "return ");
-                    emit_expr(e, inst->expr);
-                    emit(e, ";\n");
-                }
+        /* IR_RETURN: inst->expr is the full NODE_RETURN from AST.
+         * Extract return expression, handle optional wrapping. */
+        emit_indent(e);
+        Node *ret_expr = NULL;
+        if (inst->expr) {
+            if (inst->expr->kind == NODE_RETURN) {
+                ret_expr = inst->expr->ret.expr;
             } else {
-                /* Void or bare return */
-                if (e->current_func_ret) {
-                    emit(e, "return ");
-                    emit_return_null(e);
-                } else {
-                    emit(e, "return;\n");
-                }
+                ret_expr = inst->expr;
             }
+        }
+
+        if (ret_expr) {
+            Type *ret = e->current_func_ret;
+            Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+            Type *expr_type = checker_get_type(e->checker, ret_expr);
+
+            /* Check if optional wrapping needed */
+            if (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(ret_eff->optional.inner) &&
+                expr_type && !type_is_optional(expr_type)) {
+                /* Wrap non-optional value in optional struct */
+                emit(e, "return ");
+                emit_opt_wrap_value(e, ret_expr, ret_eff);
+                emit(e, ";\n");
+            } else if (ret_expr->kind == NODE_NULL_LIT && ret_eff) {
+                /* return null → optional null literal */
+                emit(e, "return ");
+                emit_opt_null_literal(e, ret_eff);
+                emit(e, ";\n");
+            } else {
+                emit(e, "return ");
+                emit_expr(e, ret_expr);
+                emit(e, ";\n");
+            }
+        } else {
+            /* Void or bare return — emit_return_null handles the full "return X;" */
+            emit_return_null(e);
+            emit(e, "\n");
         }
         break;
     }

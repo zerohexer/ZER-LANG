@@ -784,54 +784,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             if (need_ir_orelse) {
                 lower_orelse_to_dest(ctx, local_id, orelse, node->loc.line);
             } else {
-                /* Check if init is a builtin call */
-                int obj_local, handle_local;
-                IROpKind builtin = classify_builtin_call(ctx, node->var_decl.init,
-                                                          &obj_local, &handle_local);
-                if (builtin != IR_NOP) {
-                    IRInst inst = make_inst(builtin, node->loc.line);
+                /* Unified: lower_expr decomposes all inits.
+                 * Simple expressions → local ID + IR_COPY.
+                 * Complex expressions (calls, builtins, intrinsics, casts,
+                 * orelse, struct_init) → IR_ASSIGN passthrough via lower_expr. */
+                Node *init = node->var_decl.init;
+                int src = lower_expr(ctx, init);
+                if (src >= 0 && src != local_id) {
+                    IRInst inst = make_inst(IR_COPY, node->loc.line);
                     inst.dest_local = local_id;
-                    inst.obj_local = obj_local;
-                    inst.handle_local = handle_local;
-                    inst.expr = node->var_decl.init;
+                    inst.src1_local = src;
                     emit_inst(ctx, inst);
-                } else {
-                    /* Three-address-code: try decomposing via lower_expr.
-                     * Only for expressions that lower_expr can handle
-                     * (ident, literal, binary, unary, field on local).
-                     * Complex/void → fallback to IR_ASSIGN with expr. */
-                    Node *init = node->var_decl.init;
-                    int src = -1;
-                    /* Only decompose simple value expressions.
-                     * Exclude: array types (can't assign in C), void,
-                     * null literals (no inherent type), struct inits. */
-                    bool try_decompose = (init->kind == NODE_IDENT ||
-                        init->kind == NODE_INT_LIT || init->kind == NODE_FLOAT_LIT ||
-                        init->kind == NODE_BOOL_LIT || init->kind == NODE_CHAR_LIT ||
-                        init->kind == NODE_STRING_LIT ||
-                        init->kind == NODE_BINARY || init->kind == NODE_UNARY ||
-                        init->kind == NODE_FIELD || init->kind == NODE_INDEX);
-                    if (try_decompose && vt) {
-                        Type *vt_eff = type_unwrap_distinct(vt);
-                        if (vt_eff->kind == TYPE_ARRAY || vt_eff->kind == TYPE_VOID)
-                            try_decompose = false;
-                    }
-                    if (try_decompose) {
-                        src = lower_expr(ctx, init);
-                    }
-                    if (src >= 0 && src != local_id) {
-                        IRInst inst = make_inst(IR_COPY, node->loc.line);
-                        inst.dest_local = local_id;
-                        inst.src1_local = src;
-                        emit_inst(ctx, inst);
-                    } else {
-                        /* Fallback: IR_ASSIGN with expr tree */
-                        rewrite_idents(ctx, init);
-                        IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-                        inst.dest_local = local_id;
-                        inst.expr = init;
-                        emit_inst(ctx, inst);
-                    }
+                } else if (src < 0) {
+                    /* lower_expr returned -1 (void expression) — no assignment needed.
+                     * The expression was already emitted as a side-effect IR_ASSIGN. */
                 }
             }
         }
@@ -859,26 +825,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
 
         if (expr->kind == NODE_CALL) {
-            int obj_local, handle_local;
-            IROpKind builtin = classify_builtin_call(ctx, expr, &obj_local, &handle_local);
-            if (builtin != IR_NOP) {
-                IRInst inst = make_inst(builtin, node->loc.line);
-                inst.obj_local = obj_local;
-                inst.handle_local = handle_local;
-                inst.expr = expr;
-                emit_inst(ctx, inst);
-            } else {
-                /* Regular function call */
-                IRInst inst = make_inst(IR_CALL, node->loc.line);
-                inst.expr = expr;
-                if (expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
-                    inst.func_name = expr->call.callee->ident.name;
-                    inst.func_name_len = (uint32_t)expr->call.callee->ident.name_len;
-                }
-                inst.arg_count = expr->call.arg_count;
-                inst.args = expr->call.args;
-                emit_inst(ctx, inst);
-            }
+            /* All calls (builtins + regular) → IR_ASSIGN passthrough.
+             * emit_expr handles builtin dispatch, module mangling, etc. */
+            IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
+            inst.expr = expr;
+            emit_inst(ctx, inst);
         } else if (expr->kind == NODE_ASSIGN) {
             /* Simple ident = decomposable_expr: use lower_expr + IR_COPY */
             if (expr->assign.target && expr->assign.target->kind == NODE_IDENT &&

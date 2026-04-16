@@ -6839,46 +6839,6 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
             emit(e, ")");
             return;
-        } else if (0 && nlen == 4 && memcmp(name, "size_DISABLED", 4) == 0) {
-            /* Disabled — kept for reference. Direct sizeof emission. */
-            emit(e, "sizeof(");
-            if (node->intrinsic.type_arg) {
-                Type *t = NULL;
-                if (node->intrinsic.type_arg->kind == TYNODE_NAMED) {
-                    Symbol *sym = scope_lookup(e->checker->global_scope,
-                        node->intrinsic.type_arg->named.name,
-                        (uint32_t)node->intrinsic.type_arg->named.name_len);
-                    if (sym) t = sym->type;
-                }
-                if (t) {
-                    Type *te = type_unwrap_distinct(t);
-                    if (te->kind == TYPE_STRUCT) {
-                        if (te->struct_type.is_packed) emit(e, "struct __attribute__((packed)) ");
-                        else emit(e, "struct ");
-                        emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
-                    } else if (te->kind == TYPE_ENUM) {
-                        emit(e, "int32_t"); /* enums are int32_t */
-                    } else if (te->kind == TYPE_UNION) {
-                        emit(e, "struct "); /* unions emit as struct with _tag */
-                        emit(e, "%.*s", (int)te->union_type.name_len, te->union_type.name);
-                    } else {
-                        emit_type(e, t); /* primitives, pointers, etc. */
-                    }
-                } else if (node->intrinsic.type_arg->kind == TYNODE_NAMED) {
-                    /* Last resort: emit struct prefix + name */
-                    emit(e, "struct %.*s",
-                         (int)node->intrinsic.type_arg->named.name_len,
-                         node->intrinsic.type_arg->named.name);
-                } else {
-                    /* Primitive type — resolve_tynode handles these */
-                    t = resolve_tynode(e, node->intrinsic.type_arg);
-                    if (t) emit_type(e, t);
-                }
-            } else if (node->intrinsic.arg_count > 0) {
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
-            }
-            emit(e, ")");
-            return;
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
             /* @truncate(T, val) → (T)(val) */
             emit(e, "(");
@@ -7191,7 +7151,6 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *obj_type = checker_get_type(e->checker, node->slice.object);
         bool obj_slice = obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_SLICE;
         if (obj_slice) {
-            Type *elem = type_unwrap_distinct(obj_type)->slice.inner;
             emit(e, "(");
             emit_type(e, obj_type);
             emit(e, "){ &(");

@@ -7956,10 +7956,197 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "}\n");
                 }
             } else if (inst->expr->kind == NODE_SWITCH) {
-                /* Complex switch passthrough (union/optional/enum) —
-                 * emit via emit_stmt for now. These will be lowered
-                 * to IR branches when union tag comparison is added. */
-                emit_stmt(e, inst->expr);
+                /* Enum/union/optional switch — emit if/else chain directly.
+                 * Uses emit_rewritten_node for sub-expressions. */
+                Node *sw = inst->expr;
+                int sw_tmp = e->temp_count++;
+                Type *sw_type = checker_get_type(e->checker, sw->switch_stmt.expr);
+                Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
+                bool is_union = sw_eff && sw_eff->kind == TYPE_UNION;
+                bool is_opt = sw_eff && sw_eff->kind == TYPE_OPTIONAL &&
+                              !is_null_sentinel(sw_eff->optional.inner);
+                bool is_enum = sw_eff && sw_eff->kind == TYPE_ENUM;
+
+                /* Hoist switch expression into temp */
+                emit_indent(e);
+                emit(e, "{ __typeof__(");
+                emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                emit(e, ") _zer_sw%d = ", sw_tmp);
+                emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                emit(e, ";\n");
+
+                for (int ai = 0; ai < sw->switch_stmt.arm_count; ai++) {
+                    SwitchArm *arm = &sw->switch_stmt.arms[ai];
+                    emit_indent(e);
+                    if (arm->is_default) {
+                        if (ai > 0) emit(e, "else ");
+                        emit(e, "{\n");
+                    } else {
+                        if (ai > 0) emit(e, "else ");
+                        emit(e, "if (");
+                        if (is_union) {
+                            emit(e, "_zer_sw%d._tag == %d", sw_tmp, ai);
+                        } else if (is_opt) {
+                            /* Optional: first arm = has_value, second = !has_value (or vice versa) */
+                            if (arm->value_count > 0 && arm->values[0]->kind == NODE_NULL_LIT) {
+                                emit(e, "!_zer_sw%d.has_value", sw_tmp);
+                            } else {
+                                emit(e, "_zer_sw%d.has_value", sw_tmp);
+                            }
+                        } else if (is_enum && arm->is_enum_dot) {
+                            /* Enum: .variant → compare against _ZER_EnumName_variant */
+                            const char *ename = sw_eff->enum_type.name;
+                            uint32_t elen = sw_eff->enum_type.name_len;
+                            for (int vi = 0; vi < arm->value_count; vi++) {
+                                if (vi > 0) emit(e, " || ");
+                                emit(e, "_zer_sw%d == ", sw_tmp);
+                                /* Emit _ZER_EnumName_variant */
+                                /* Arm value is NODE_IDENT with variant name */
+                                if (arm->values[vi]->kind == NODE_IDENT) {
+                                    if (sw_eff->enum_type.module_prefix) {
+                                        emit(e, "_ZER_%.*s__%.*s_%.*s",
+                                             (int)sw_eff->enum_type.module_prefix_len,
+                                             sw_eff->enum_type.module_prefix,
+                                             (int)elen, ename,
+                                             (int)arm->values[vi]->ident.name_len,
+                                             arm->values[vi]->ident.name);
+                                    } else {
+                                        emit(e, "_ZER_%.*s_%.*s",
+                                             (int)elen, ename,
+                                             (int)arm->values[vi]->ident.name_len,
+                                             arm->values[vi]->ident.name);
+                                    }
+                                } else {
+                                    emit_rewritten_node(e, arm->values[vi], func);
+                                }
+                            }
+                        } else {
+                            /* Integer/other values */
+                            for (int vi = 0; vi < arm->value_count; vi++) {
+                                if (vi > 0) emit(e, " || ");
+                                emit(e, "_zer_sw%d == ", sw_tmp);
+                                emit_rewritten_node(e, arm->values[vi], func);
+                            }
+                        }
+                        emit(e, ") {\n");
+                    }
+                    e->indent++;
+
+                    /* Capture */
+                    if (arm->capture_name) {
+                        emit_indent(e);
+                        if (is_union && arm->capture_is_ptr) {
+                            /* Mutable union capture: Type *v = &_sw.variant */
+                            if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
+                                emit(e, "__typeof__(_zer_sw%d.%.*s) *%.*s = &_zer_sw%d.%.*s;\n",
+                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                     arm->values[0]->ident.name,
+                                     (int)arm->capture_name_len, arm->capture_name,
+                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                     arm->values[0]->ident.name);
+                            }
+                        } else if (is_union) {
+                            /* Immutable union capture: copy variant value.
+                             * Arrays can't be assigned — use memcpy. */
+                            if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
+                                emit(e, "__typeof__(_zer_sw%d.%.*s) %.*s; memcpy(&%.*s, &_zer_sw%d.%.*s, sizeof(%.*s));\n",
+                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                     arm->values[0]->ident.name,
+                                     (int)arm->capture_name_len, arm->capture_name,
+                                     (int)arm->capture_name_len, arm->capture_name,
+                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                     arm->values[0]->ident.name,
+                                     (int)arm->capture_name_len, arm->capture_name);
+                            }
+                        } else if (is_opt) {
+                            /* Optional capture: unwrap .value */
+                            if (is_void_opt(sw_eff)) {
+                                /* ?void: no capture value */
+                            } else {
+                                emit(e, "__typeof__(_zer_sw%d.value) %.*s = _zer_sw%d.value;\n",
+                                     sw_tmp, (int)arm->capture_name_len, arm->capture_name,
+                                     sw_tmp);
+                            }
+                        } else {
+                            /* Enum/integer capture */
+                            emit(e, "__typeof__(_zer_sw%d) %.*s = _zer_sw%d;\n",
+                                 sw_tmp, (int)arm->capture_name_len, arm->capture_name,
+                                 sw_tmp);
+                        }
+                    }
+
+                    /* Arm body — emit via emit_stmt (contains IR-lowered statements) */
+                    /* Actually arm body is AST — it wasn't lowered because the whole
+                     * switch went through NOP. Use emit_stmt for arm bodies. */
+                    if (arm->body) {
+                        if (arm->body->kind == NODE_BLOCK) {
+                            for (int si = 0; si < arm->body->block.stmt_count; si++) {
+                                Node *bs = arm->body->block.stmts[si];
+                                if (bs->kind == NODE_EXPR_STMT && bs->expr_stmt.expr) {
+                                    emit_indent(e);
+                                    emit_rewritten_node(e, bs->expr_stmt.expr, func);
+                                    emit(e, ";\n");
+                                } else if (bs->kind == NODE_RETURN) {
+                                    emit_indent(e);
+                                    /* Check if function returns optional → wrap */
+                                    Type *fret = e->current_func_ret;
+                                    Type *fret_eff = fret ? type_unwrap_distinct(fret) : NULL;
+                                    if (bs->ret.expr && fret_eff &&
+                                        fret_eff->kind == TYPE_OPTIONAL &&
+                                        !is_null_sentinel(fret_eff->optional.inner)) {
+                                        Type *expr_type = checker_get_type(e->checker, bs->ret.expr);
+                                        if (expr_type && !type_is_optional(expr_type)) {
+                                            if (is_void_opt(fret_eff)) {
+                                                emit_rewritten_node(e, bs->ret.expr, func);
+                                                emit(e, ";\n");
+                                                emit_indent(e);
+                                                emit(e, "return (_zer_opt_void){ 1 };\n");
+                                            } else {
+                                                emit(e, "return (");
+                                                emit_type(e, fret_eff);
+                                                emit(e, "){ ");
+                                                emit_rewritten_node(e, bs->ret.expr, func);
+                                                emit(e, ", 1 };\n");
+                                            }
+                                        } else if (bs->ret.expr->kind == NODE_NULL_LIT) {
+                                            emit(e, "return ");
+                                            emit_opt_null_literal(e, fret_eff);
+                                            emit(e, ";\n");
+                                        } else {
+                                            emit(e, "return ");
+                                            emit_rewritten_node(e, bs->ret.expr, func);
+                                            emit(e, ";\n");
+                                        }
+                                    } else {
+                                        emit(e, "return");
+                                        if (bs->ret.expr) {
+                                            emit(e, " ");
+                                            emit_rewritten_node(e, bs->ret.expr, func);
+                                        }
+                                        emit(e, ";\n");
+                                    }
+                                } else if (bs->kind == NODE_BREAK) {
+                                    /* break in switch → just end arm (no C break needed, using if/else) */
+                                } else {
+                                    /* Complex statement — use emit_rewritten_node */
+                                    emit_indent(e);
+                                    emit_rewritten_node(e, bs, func);
+                                    emit(e, ";\n");
+                                }
+                            }
+                        } else {
+                            emit_indent(e);
+                            emit_rewritten_node(e, arm->body, func);
+                            emit(e, ";\n");
+                        }
+                    }
+
+                    e->indent--;
+                    emit_indent(e);
+                    emit(e, "}\n");
+                }
+                emit_indent(e);
+                emit(e, "}\n");
             } else {
                 /* Other passthrough — emit as expression */
                 emit_indent(e);

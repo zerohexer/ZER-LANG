@@ -6196,10 +6196,17 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         case TOK_AMPAMP: op = "&&"; break; case TOK_PIPEPIPE: op = "||"; break;
         default: break;
         }
-        /* Check for *opaque comparison → .ptr extraction */
+        /* Check for complex operand types → delegate to emit_expr */
         Type *lt = checker_get_type(e->checker, node->binary.left);
+        Type *rt = checker_get_type(e->checker, node->binary.right);
         if (lt) {
             Type *le = type_unwrap_distinct(lt);
+            /* Optional, struct, union can't use == in C — delegate */
+            if (le->kind == TYPE_OPTIONAL || le->kind == TYPE_STRUCT ||
+                le->kind == TYPE_UNION) {
+                emit_expr(e, node);
+                return;
+            }
             if (le->kind == TYPE_POINTER && le->pointer.inner &&
                 type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE) {
                 emit(e, "(");
@@ -6231,7 +6238,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         return;
 
     case NODE_FIELD: {
-        /* Check object type — complex types delegate to emit_expr */
+        /* Check object type for accessor: struct uses '.', pointer uses '->' */
         if (node->field.object && node->field.object->kind == NODE_IDENT) {
             Type *ot = checker_get_type(e->checker, node->field.object);
             if (!ot) {
@@ -6334,9 +6341,17 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
         }
-        /* Default: struct field access with . */
-        emit_rewritten_node(e, node->field.object, func);
-        emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
+        /* Default: determine accessor from object type (. or ->) */
+        {
+            Type *obj_type = checker_get_type(e->checker, node->field.object);
+            const char *acc = ".";
+            if (obj_type) {
+                Type *oe = type_unwrap_distinct(obj_type);
+                if (oe->kind == TYPE_POINTER) acc = "->";
+            }
+            emit_rewritten_node(e, node->field.object, func);
+            emit(e, "%s%.*s", acc, (int)node->field.field_name_len, node->field.field_name);
+        }
         return;
     }
 
@@ -6365,16 +6380,38 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, "%lld", (long long)node->call.comptime_value);
             return;
         }
-        /* Detect builtins: callee NODE_FIELD on pool/slab/ring/arena/struct */
+        /* Detect builtins + ThreadHandle.join: callee NODE_FIELD */
         if (node->call.callee && node->call.callee->kind == NODE_FIELD &&
             node->call.callee->field.object &&
             node->call.callee->field.object->kind == NODE_IDENT) {
+            /* ThreadHandle.join() → pthread_join(th, NULL).
+             * Detect: field name "join" + object type is thread handle.
+             * Thread handles are emitted as pthread_t — check checker_get_type. */
+            if (node->call.callee->field.field_name_len == 4 &&
+                memcmp(node->call.callee->field.field_name, "join", 4) == 0) {
+                /* ThreadHandle — emit pthread_join directly */
+                emit(e, "pthread_join(");
+                emit_rewritten_node(e, node->call.callee->field.object, func);
+                emit(e, ", NULL)");
+                return;
+            }
             Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
             if (!ot) {
                 Symbol *sym = scope_lookup(e->checker->global_scope,
                     node->call.callee->field.object->ident.name,
                     (uint32_t)node->call.callee->field.object->ident.name_len);
                 if (sym) ot = sym->type;
+            }
+            /* IR locals fallback */
+            if (!ot && func) {
+                for (int li = 0; li < func->local_count; li++) {
+                    if (func->locals[li].name_len == (uint32_t)node->call.callee->field.object->ident.name_len &&
+                        memcmp(func->locals[li].name, node->call.callee->field.object->ident.name,
+                               func->locals[li].name_len) == 0) {
+                        ot = func->locals[li].type;
+                        break;
+                    }
+                }
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);

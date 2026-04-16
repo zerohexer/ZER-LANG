@@ -221,5 +221,4 @@ u32 main() {
 - [GitHub](https://github.com/zerohexer/ZER-LANG)
 - [Language Reference](https://github.com/zerohexer/ZER-LANG/blob/main/docs/reference.md)
 - [Language Specification](https://github.com/zerohexer/ZER-LANG/blob/main/ZER-LANG.md)
-- [LLM Reference](https://github.com/zerohexer/ZER-LANG/blob/main/ZER-LANG-LLM.md) — feed to any LLM for ZER code generation
 - License: MPL-2.0

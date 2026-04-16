@@ -366,7 +366,13 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         if (rt) { Type *rt_eff = type_unwrap_distinct(rt);
             if (rt_eff->kind == TYPE_ARRAY) goto passthrough;
         }
+        /* Check if object is an array type (global arrays return -1 from lower_expr) */
+        Type *obj_type = checker_get_type(ctx->checker, expr->index_expr.object);
+        if (obj_type) { Type *oe = type_unwrap_distinct(obj_type);
+            if (oe->kind == TYPE_ARRAY) goto passthrough; /* global array index → passthrough */
+        }
         int obj = lower_expr(ctx, expr->index_expr.object);
+        if (obj < 0) goto passthrough; /* object couldn't be decomposed → passthrough */
         int idx = lower_expr(ctx, expr->index_expr.index);
         int tmp = create_temp(ctx, rt, expr->loc.line);
         IRInst inst = make_inst(IR_INDEX_READ, expr->loc.line);

@@ -6344,6 +6344,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         /* Default: determine accessor from object type (. or ->) */
         {
             Type *obj_type = checker_get_type(e->checker, node->field.object);
+            /* NODE_CALL results (e.g. Handle auto-deref get()) are typically pointers */
+            if (!obj_type && node->field.object &&
+                node->field.object->kind == NODE_CALL) {
+                /* Auto-deref get() returns pointer — use -> */
+                emit_rewritten_node(e, node->field.object, func);
+                emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
+                return;
+            }
             /* IR local fallback for object type */
             if (!obj_type && node->field.object && node->field.object->kind == NODE_IDENT && func) {
                 for (int li = 0; li < func->local_count; li++) {
@@ -6456,20 +6464,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) → sizeof(CType) */
-            emit(e, "sizeof(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                if (t) {
-                    emit_type(e, t);
-                } else if (node->intrinsic.type_arg->kind == TYNODE_NAMED) {
-                    /* Named type not in typemap — emit struct name directly */
-                    emit(e, "struct %.*s",
-                         (int)node->intrinsic.type_arg->named.name_len,
-                         node->intrinsic.type_arg->named.name);
-                }
-            }
-            emit(e, ")");
+            /* @size(T) → delegate to emit_expr (handles all type resolution) */
+            emit_expr(e, node);
+            return;
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
             /* @truncate(T, val) → (T)(val) */
             emit(e, "(");

@@ -6239,8 +6239,43 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);
-                /* Handle auto-deref, opaque, builtins → emit_expr */
-                if (ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_OPAQUE ||
+                /* Handle auto-deref: h.field → ((T*)_zer_*_get(&slab, h))->field */
+                if (ot_eff->kind == TYPE_HANDLE) {
+                    Type *elem = ot_eff->handle.elem;
+                    /* Find allocator for this handle */
+                    Symbol *alloc_sym = find_unique_allocator(e->checker->global_scope, elem);
+                    if (alloc_sym) {
+                        Type *alloc_type = type_unwrap_distinct(alloc_sym->type);
+                        if (alloc_type->kind == TYPE_SLAB) {
+                            emit(e, "((");
+                            emit_type(e, type_pointer(e->arena, elem));
+                            emit(e, ")_zer_slab_get(&%.*s, ",
+                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit_rewritten_node(e, node->field.object);
+                            emit(e, "))->%.*s",
+                                 (int)node->field.field_name_len, node->field.field_name);
+                        } else if (alloc_type->kind == TYPE_POOL) {
+                            emit(e, "((");
+                            emit_type(e, type_pointer(e->arena, elem));
+                            emit(e, ")_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
+                                 "sizeof(%.*s.slots[0]), ",
+                                 (int)alloc_sym->name_len, alloc_sym->name,
+                                 (int)alloc_sym->name_len, alloc_sym->name,
+                                 (int)alloc_sym->name_len, alloc_sym->name,
+                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit_rewritten_node(e, node->field.object);
+                            emit(e, ", %llu))->%.*s",
+                                 (unsigned long long)alloc_type->pool.count,
+                                 (int)node->field.field_name_len, node->field.field_name);
+                        }
+                    } else {
+                        /* No allocator found — fallback */
+                        emit(e, "/* handle auto-deref no alloc */ 0");
+                    }
+                    return;
+                }
+                /* Opaque, builtins → emit_expr */
+                if (ot_eff->kind == TYPE_OPAQUE ||
                     ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
                     ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA) {
                     emit_expr(e, node);

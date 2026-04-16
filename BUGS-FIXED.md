@@ -3960,3 +3960,33 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Check `checker_get_type(arg)` — if TYPE_POINTER, use `->`, otherwise `.`. Applied to all 3 condvar intrinsics (wait/signal/broadcast).
 
 **Test:** tests/zer/condvar_signal.zer (shared struct pointer arg)
+
+### BUG-531: IR NODE_RETURN fired defers BEFORE evaluating return expression (2026-04-16)
+
+**Symptom:** `return sessions.get(sess).total_bytes + conn_fd(c1)` — defer fires `conn_close(c1)` BEFORE `conn_fd(c1)` is evaluated. Runtime trap (gen-check fail on freed handle). Exit 133 (SIGTRAP).
+
+**Root cause:** `lower_stmt(NODE_RETURN)` called `emit_defer_fire()` BEFORE `lower_expr(ret_expr)`. The return expression evaluation happened AFTER defers freed the handles used in the expression.
+
+**Fix:** Evaluate return expression via `lower_expr(ret_expr)` FIRST (stores in temp local), THEN fire defers, THEN emit IR_RETURN with the pre-computed temp. Same pattern as AST path's BUG-442 hoist.
+
+**Test:** test_modules/defer_deep_user.zer (cross-module defer + return through Handle)
+
+### BUG-532: IR NODE_INDEX on global array created broken IR_INDEX_READ (2026-04-16)
+
+**Symptom:** `slots[hash_slot(42)]` where `slots` is global `u32[16]` — emitted bare `slots;` instead of array index. `v1 = _zer_t6` where `_zer_t6` was never assigned (zero).
+
+**Root cause:** `lower_expr(NODE_INDEX)` called `lower_expr(object)` on the array. For global arrays, `lower_expr(NODE_IDENT)` → passthrough → TYPE_ARRAY → returns -1 (void). Then `IR_INDEX_READ{src1=-1}` → emitter can't emit the index access.
+
+**Fix:** Check object type before calling `lower_expr`. If object is TYPE_ARRAY, go to passthrough (let emit_rewritten_node handle the full index expression with bounds check). Also added `if (obj < 0) goto passthrough` guard.
+
+**Test:** test_modules/range_user.zer (cross-module array index with proven range)
+
+### BUG-533: Missing builtins in emit_builtin_inline (2026-04-16)
+
+**Symptom:** `arena.alloc_slice(Vec3, n)` → "'_zer_arena' has no member named 'alloc_slice'". `ring.push_checked(val)` → "no member named 'push_checked'". `@cond_timedwait` → "incompatible types".
+
+**Root cause:** `emit_builtin_inline` didn't handle `arena.alloc_slice`, `ring.push_checked`, or `@cond_timedwait`. These went through the regular call path which emits `obj.method(args)` — invalid C.
+
+**Fix:** Added arena.alloc_slice (with ?[]T wrapping), ring.push_checked (with ?void count check), @cond_timedwait (with timespec + pthread_cond_timedwait + pointer vs struct accessor).
+
+**Test:** rust_tests/gen_arena_004.zer, rt_conc_ring_full_drop.zer, rc_cond_006.zer, rt_conc_condvar_timeout.zer

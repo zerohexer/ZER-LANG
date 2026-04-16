@@ -3888,3 +3888,53 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Replaced `emit_opt_wrap_value` in IR_ASSIGN with inline emission: `(OptType){ emit_rewritten_node(expr), 1 }`. Now the optional wrapping goes through emit_rewritten_node which has the corrected Handle auto-deref (`->` not `.`).
 
 **Test:** tests/zer/defer_return_order.zer (Handle field in optional context)
+
+### BUG-524: NODE_FIELD default accessor wrong for pointer-returning objects (2026-04-16)
+
+**Symptom:** `((struct Data*)_zer_slab_get(&store, h)).val` — `.val` on pointer result. GCC "is a pointer; did you mean '->'" error. 17 Handle auto-deref tests failed.
+
+**Root cause:** `emit_rewritten_node(NODE_FIELD)` default path used `.` accessor. Handle auto-deref rewrites field object to `_zer_slab_get()` call (NODE_CALL) returning `*T`. The default path didn't detect pointer result type.
+
+**Fix:** Check `checker_get_type(object)` — if TYPE_POINTER, use `->`. If object is NODE_CALL and type unknown, assume pointer (auto-deref get() always returns pointer). If TYPE_HANDLE, emit full `((T*)_zer_*_get(...))->field` auto-deref.
+
+**Test:** 17 Handle tests (defer_return_order, pool_handle, handle_autoderef, etc.)
+
+### BUG-525: emit_opt_wrap_value called emit_expr bypassing emit_rewritten_node (2026-04-16)
+
+**Symptom:** Handle field access wrapped in optional used `.` instead of `->`. The optional wrapping went through `emit_opt_wrap_value` which calls `emit_expr` internally, bypassing emit_rewritten_node's corrected Handle auto-deref.
+
+**Root cause:** IR_ASSIGN's `need_wrap` path called `emit_opt_wrap_value(e, type, inst->expr)` which internally calls `emit_expr`. For Handle fields, emit_expr's auto-deref didn't work correctly on rewritten AST.
+
+**Fix:** Inline optional wrapping in IR_ASSIGN: `(OptType){ emit_rewritten_node(expr), 1 }`.
+
+**Test:** tests/zer/defer_return_order.zer, tests/zer/volatile_orelse.zer
+
+### BUG-526: ThreadHandle.join() not detected in emit_rewritten_node (2026-04-16)
+
+**Symptom:** `th.join()` emitted as `th.join()` instead of `pthread_join(th, NULL)`. GCC "member 'join' not found" on pthread_t.
+
+**Root cause:** emit_rewritten_node(NODE_CALL) didn't detect ThreadHandle.join() method. ThreadHandle is a local variable — scope_lookup(global_scope) can't find it.
+
+**Fix:** Detect "join" field name on any NODE_FIELD callee. In ZER, `.join()` is ONLY used for ThreadHandle — no other type has this method.
+
+**Test:** tests/zer/scoped_spawn.zer, condvar_signal.zer, rwlock_shared.zer, sem_concurrent_init.zer
+
+### BUG-527: @size(NamedType) emitted sizeof() empty in emit_rewritten_node (2026-04-16)
+
+**Symptom:** `@size(Header)` emitted `sizeof()` — empty parentheses. GCC "expected expression before ')'" error.
+
+**Root cause:** `resolve_tynode` returned NULL for TYNODE_NAMED in the IR path. The TypeNode pointer cast to Node* for checker_get_type lookup doesn't match typemap keys (Node* vs TypeNode*).
+
+**Fix:** Delegate @size to emit_expr (handles all type resolution including packed structs, container types, module-qualified types).
+
+**Test:** tests/zer/packed_struct.zer, tests/zer/comptime_pool_size.zer
+
+### BUG-528: Handle auto-deref through array index in default field path (2026-04-16)
+
+**Symptom:** `tasks[0].id` where `tasks` is `Handle(Task)[4]` — emitted `tasks[0].id` (direct field) instead of auto-deref `((Task*)_zer_slab_get(&heap, tasks[0]))->id`. GCC "member not a struct" error.
+
+**Root cause:** emit_rewritten_node(NODE_FIELD) default path detected TYPE_POINTER for `->` but not TYPE_HANDLE. Handle through array index has `checker_get_type(NODE_INDEX)` returning TYPE_HANDLE — need to emit full get() auto-deref.
+
+**Fix:** Added TYPE_HANDLE detection in default field accessor path. Emits `((T*)_zer_*_get(alloc, obj))->field` same as the ident-object Handle path.
+
+**Test:** tests/zer/handle_array.zer, dyn_array_guard.zer, dyn_array_autoguard_crash.zer, scheduler.zer, super_freelist.zer, orelse_block_ptr.zer

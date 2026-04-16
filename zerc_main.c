@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
     bool do_run = false;
     bool emit_c = false;
     bool emit_ir = false;
-    bool use_ir = true; /* IR default — Phase 9 complete, module mangling handled */
+    bool use_ir = false; /* IR: 195/195 single-file, 25/28 multi-module. 3 remaining: global forward-decl ordering. --use-ir to enable. */
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;

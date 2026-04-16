@@ -6344,6 +6344,17 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         /* Default: determine accessor from object type (. or ->) */
         {
             Type *obj_type = checker_get_type(e->checker, node->field.object);
+            /* IR local fallback for object type */
+            if (!obj_type && node->field.object && node->field.object->kind == NODE_IDENT && func) {
+                for (int li = 0; li < func->local_count; li++) {
+                    if (func->locals[li].name_len == (uint32_t)node->field.object->ident.name_len &&
+                        memcmp(func->locals[li].name, node->field.object->ident.name,
+                               func->locals[li].name_len) == 0) {
+                        obj_type = func->locals[li].type;
+                        break;
+                    }
+                }
+            }
             const char *acc = ".";
             if (obj_type) {
                 Type *oe = type_unwrap_distinct(obj_type);
@@ -6374,6 +6385,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * Builtins (pool/slab/ring/arena) MUST go through emit_expr
          * for inline C generation. Detect and delegate. */
         if (node->call.is_comptime_resolved) {
+            if (node->call.comptime_struct_init) {
+                /* Comptime struct return — emit the struct init */
+                emit_rewritten_node(e, node->call.comptime_struct_init, func);
+                return;
+            }
             if (node->call.is_comptime_float)
                 emit(e, "%.17g", node->call.comptime_float_value);
             else
@@ -6444,7 +6460,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "sizeof(");
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                emit_type(e, t);
+                if (t) {
+                    emit_type(e, t);
+                } else if (node->intrinsic.type_arg->kind == TYNODE_NAMED) {
+                    /* Named type not in typemap — emit struct name directly */
+                    emit(e, "struct %.*s",
+                         (int)node->intrinsic.type_arg->named.name_len,
+                         node->intrinsic.type_arg->named.name);
+                }
             }
             emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
@@ -6509,7 +6532,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")");
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
-            /* @offset(T, field) → offsetof */
+            /* @offset(T, field) → offsetof(T, field) */
             emit(e, "offsetof(");
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
@@ -6517,6 +6540,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, ", ");
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
+            } else if (node->intrinsic.arg_count >= 2) {
+                /* Named type: args[0] = type name, args[1] = field name */
+                emit(e, "struct ");
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", ");
+                emit_rewritten_node(e, node->intrinsic.args[1], func);
             }
             emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
@@ -6662,8 +6691,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
             emit(e, " }");
         } else {
-            /* Array sub-slice or complex — basic fallback */
-            emit(e, "/* slice */ 0");
+            /* Array sub-slice or complex — delegate to emit_expr */
+            emit_expr(e, node);
         }
         return;
     }

@@ -6601,10 +6601,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         /* Intrinsics — handle each type from rewritten AST */
         const char *name = node->intrinsic.name;
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
-
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) → sizeof(CType) — direct type name emission.
-             * Don't use resolve_tynode (TypeNode*→Node* hash collision). */
+            /* @size(T) → sizeof(CType) — direct type name emission. */
             emit(e, "sizeof(");
             if (node->intrinsic.type_arg) {
                 TypeNode *ta = node->intrinsic.type_arg;
@@ -6612,6 +6610,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     /* Named type: look up in scope for C name */
                     Symbol *sym = scope_lookup(e->checker->global_scope,
                         ta->named.name, (uint32_t)ta->named.name_len);
+                    fprintf(stderr, "  @size NAMED '%.*s' sym=%p type_kind=%d\n",
+                            (int)ta->named.name_len, ta->named.name,
+                            (void*)sym,
+                            (sym && sym->type) ? type_unwrap_distinct(sym->type)->kind : -1);
                     if (sym && sym->type) {
                         Type *te = type_unwrap_distinct(sym->type);
                         if (te->kind == TYPE_STRUCT) {
@@ -6637,6 +6639,27 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     /* Keyword type (u32, i8, etc.) */
                     Type *t = resolve_type_for_emit(e, ta);
                     if (t) emit_type(e, t);
+                }
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT) {
+                /* @size(TypeName) — type name passed as ident arg */
+                const char *tn = node->intrinsic.args[0]->ident.name;
+                uint32_t tl = (uint32_t)node->intrinsic.args[0]->ident.name_len;
+                Symbol *sym = scope_lookup(e->checker->global_scope, tn, tl);
+                if (sym && sym->type) {
+                    Type *te = type_unwrap_distinct(sym->type);
+                    if (te->kind == TYPE_STRUCT) {
+                        if (te->struct_type.is_packed)
+                            emit(e, "struct __attribute__((packed)) ");
+                        else emit(e, "struct ");
+                        emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
+                    } else if (te->kind == TYPE_UNION) {
+                        emit(e, "struct %.*s", (int)te->union_type.name_len, te->union_type.name);
+                    } else {
+                        emit_type(e, sym->type);
+                    }
+                } else {
+                    emit(e, "struct %.*s", (int)tl, tn);
                 }
             } else if (node->intrinsic.arg_count > 0) {
                 emit_rewritten_node(e, node->intrinsic.args[0], func);

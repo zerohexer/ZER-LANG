@@ -1,0 +1,81 @@
+// Verify critical emitter bug patterns work on IR path
+// Covers: BUG-145 (?void return), BUG-139 (if optional struct),
+// BUG-051 (?void null init), BUG-064 (volatile), BUG-150 (array),
+// BUG-112 (auto-zero), BUG-076 (union mutable capture),
+// BUG-075 (?Handle), BUG-174 (const global)
+
+struct Point { u32 x; u32 y; }
+
+union Shape {
+    Point circle;
+    u32 square;
+}
+
+?void check_valid(u32 x) {
+    if (x > 100) { return null; }
+    return;
+}
+
+?u32 maybe_get(bool ok) {
+    if (ok) { return 42; }
+    return null;
+}
+
+volatile u32 hw_reg;
+const u32 MAGIC = 0xDEAD;
+
+u32 main() {
+    // BUG-145: ?void return
+    check_valid(50) orelse return;
+    ?void bad = check_valid(200);
+    if (bad) |x| { return 1; }
+
+    // BUG-139: if (optional) struct
+    ?u32 m = maybe_get(true);
+    if (m) |v| {
+        if (v != 42) { return 2; }
+    } else {
+        return 3;
+    }
+
+    // BUG-051: ?void null init
+    ?void vnull = null;
+    if (vnull) |x| { return 4; }
+
+    // BUG-064: volatile read/write
+    hw_reg = 0xFF;
+    u32 r = hw_reg;
+    if (r != 0xFF) { return 5; }
+
+    // BUG-150: array init + access
+    u32[4] arr;
+    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;
+    if (arr[0] != 10) { return 6; }
+    if (arr[3] != 40) { return 7; }
+
+    // BUG-112: auto-zero
+    Point p;
+    if (p.x != 0) { return 8; }
+    if (p.y != 0) { return 9; }
+
+    // BUG-076: union mutable capture
+    Shape s;
+    s.square = 99;
+    switch (s) {
+        .square => |*v| {
+            *v = 100;
+        }
+        .circle => |c| {}
+    }
+
+    // BUG-174: const global
+    if (MAGIC != 0xDEAD) { return 10; }
+
+    // BUG-075: ?u32 optional patterns
+    ?u32 none = null;
+    if (none) |v| { return 11; }
+    u32 val = maybe_get(true) orelse return;
+    if (val != 42) { return 12; }
+
+    return 0;
+}

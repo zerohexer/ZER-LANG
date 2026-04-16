@@ -6252,11 +6252,22 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
             if (lid < 0) {
-                /* Not a local — check scope for module-prefixed symbol */
+                /* Not a local — apply module name mangling.
+                 * Same logic as EMIT_MANGLED_NAME: if we're emitting code
+                 * from an imported module, ALL non-local idents from that
+                 * module need the module__ prefix in C. */
                 Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
                 if (sym && sym->module_prefix) {
                     emit(e, "%.*s__%.*s",
                          (int)sym->module_prefix_len, sym->module_prefix,
+                         (int)ilen, iname);
+                    return;
+                }
+                /* For idents in the CURRENT module context (imported module
+                 * function referencing its own globals), use current_module */
+                if (!sym && e->current_module) {
+                    emit(e, "%.*s__%.*s",
+                         (int)e->current_module_len, e->current_module,
                          (int)ilen, iname);
                     return;
                 }

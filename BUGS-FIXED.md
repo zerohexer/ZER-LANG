@@ -3950,3 +3950,13 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Why hard to debug:** Debug trace on @size handler showed it WAS reached, but `type_arg` was NULL (skipping the scope lookup). The `args[0]` path was a simple `emit_rewritten_node` call that emitted bare ident — no obvious "wrong" output until GCC reported undeclared.
 
 **Test:** tests/zer/packed_struct.zer, tests/zer/comptime_pool_size.zer
+
+### BUG-530: @cond_wait/signal/broadcast pointer accessor (2026-04-16)
+
+**Symptom:** `@cond_signal(c)` where `c` is `*SharedCounter` (pointer) — emitted `c._zer_mtx` with `.` instead of `->`. GCC "'c' is a pointer; did you mean to use '->'?" error.
+
+**Root cause:** emit_rewritten_node's condvar emission used hardcoded `.` accessor. Condvar intrinsic args can be either struct (direct) or pointer (passed by reference). Pointer args need `->`.
+
+**Fix:** Check `checker_get_type(arg)` — if TYPE_POINTER, use `->`, otherwise `.`. Applied to all 3 condvar intrinsics (wait/signal/broadcast).
+
+**Test:** tests/zer/condvar_signal.zer (shared struct pointer arg)

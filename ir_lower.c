@@ -141,6 +141,7 @@ static void collect_labels(LowerCtx *ctx, Node *node) {
 static void lower_stmt(LowerCtx *ctx, Node *node);
 static void rewrite_idents(LowerCtx *ctx, Node *expr);
 static int lower_expr(LowerCtx *ctx, Node *expr);
+static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line);
 
 /* can_lower_expr removed — lower_expr is now unconditional.
  * ALL expressions get decomposed to local IDs. Complex expressions
@@ -484,8 +485,22 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         return tmp;
     }
 
+    /* ---- Orelse: lower to IR branches unconditionally ---- */
+    case NODE_ORELSE: {
+        Type *rt = checker_get_type(ctx->checker, expr);
+        if (!rt) rt = ty_i32;
+        Type *rt_eff = type_unwrap_distinct(rt);
+        if (rt_eff->kind == TYPE_VOID) {
+            /* Void orelse (statement-level) — lower as branches, no result */
+            lower_orelse_to_dest(ctx, -1, expr, expr->loc.line);
+            return -1;
+        }
+        int tmp = create_temp(ctx, rt, expr->loc.line);
+        lower_orelse_to_dest(ctx, tmp, expr, expr->loc.line);
+        return tmp;
+    }
+
     case NODE_INTRINSIC:
-    case NODE_ORELSE:
     case NODE_SLICE:
     default:
     passthrough: {
@@ -937,60 +952,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             }
         }
 
-        if (expr->kind == NODE_CALL) {
-            /* All calls (builtins + regular) → IR_ASSIGN passthrough.
-             * emit_expr handles builtin dispatch, module mangling, etc. */
-            IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-            inst.expr = expr;
-            emit_inst(ctx, inst);
-        } else if (expr->kind == NODE_ASSIGN) {
-            /* Simple ident = decomposable_expr: use lower_expr + IR_COPY */
-            if (expr->assign.target && expr->assign.target->kind == NODE_IDENT &&
-                expr->assign.op == TOK_EQ) {
-                int dest = ir_find_local(ctx->func,
-                    expr->assign.target->ident.name,
-                    (uint32_t)expr->assign.target->ident.name_len);
-                Node *val = expr->assign.value;
-                bool try_decompose = val && (val->kind == NODE_IDENT ||
-                    val->kind == NODE_INT_LIT || val->kind == NODE_FLOAT_LIT ||
-                    val->kind == NODE_BOOL_LIT || val->kind == NODE_CHAR_LIT ||
-                    val->kind == NODE_STRING_LIT ||
-                    val->kind == NODE_BINARY || val->kind == NODE_UNARY ||
-                    val->kind == NODE_FIELD || val->kind == NODE_INDEX);
-                /* Exclude array types — can't C-assign arrays */
-                if (try_decompose && dest >= 0) {
-                    Type *dt = ctx->func->locals[dest].type;
-                    Type *dt_eff = dt ? type_unwrap_distinct(dt) : NULL;
-                    if (dt_eff && (dt_eff->kind == TYPE_ARRAY || dt_eff->kind == TYPE_VOID))
-                        try_decompose = false;
-                }
-                if (dest >= 0 && try_decompose) {
-                    int src = lower_expr(ctx, val);
-                    if (src >= 0) {
-                        IRInst inst = make_inst(IR_COPY, node->loc.line);
-                        inst.dest_local = dest;
-                        inst.src1_local = src;
-                        emit_inst(ctx, inst);
-                        break;
-                    }
-                }
-            }
-            /* Fallback: IR_ASSIGN with full expr */
-            rewrite_idents(ctx, expr);
-            IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-            if (expr->assign.target && expr->assign.target->kind == NODE_IDENT) {
-                inst.dest_local = ir_find_local(ctx->func,
-                    expr->assign.target->ident.name,
-                    (uint32_t)expr->assign.target->ident.name_len);
-            }
-            inst.expr = expr;
-            emit_inst(ctx, inst);
-        } else {
-            /* Other expression (rare — orelse as statement, etc.) */
-            IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
-            inst.expr = expr;
-            emit_inst(ctx, inst);
-        }
+        /* Unified: route ALL expressions through lower_expr.
+         * Calls → IR_CALL, assignments → IR_ASSIGN passthrough,
+         * everything else → decomposed or passthrough. */
+        lower_expr(ctx, expr);
         break;
     }
 

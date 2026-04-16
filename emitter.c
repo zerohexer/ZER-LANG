@@ -6338,11 +6338,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *pt = (callee_ft && (uint32_t)i < callee_ft->func_ptr.param_count) ?
                         type_unwrap_distinct(callee_ft->func_ptr.params[i]) : NULL;
                     if (at && pt && at->kind == TYPE_ARRAY && pt->kind == TYPE_SLICE) {
+                        /* Array → slice coercion */
                         emit(e, "(");
                         emit_type(e, pt);
                         emit(e, "){ ");
                         emit_local_name(e, func, inst->call_arg_locals[i]);
                         emit(e, ", %u }", (unsigned)at->array.size);
+                    } else if (at && pt && at->kind == TYPE_SLICE && pt->kind == TYPE_POINTER) {
+                        /* Slice → pointer coercion (C interop: []T → *T via .ptr) */
+                        emit_local_name(e, func, inst->call_arg_locals[i]);
+                        emit(e, ".ptr");
                     } else {
                         emit_local_name(e, func, inst->call_arg_locals[i]);
                     }

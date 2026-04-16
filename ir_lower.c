@@ -1261,14 +1261,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Return ---- */
     case NODE_RETURN: {
-        emit_defer_fire(ctx, node->loc.line);
         IRInst ret = make_inst(IR_RETURN, node->loc.line);
-        /* Decompose return expression to local ID unconditionally */
+        /* Evaluate return expression BEFORE firing defers (BUG-442).
+         * Defers may free handles used in the return expression. */
         Node *ret_expr = node->ret.expr;
         if (ret_expr) {
             rewrite_idents(ctx, ret_expr);
             ret.src1_local = lower_expr(ctx, ret_expr);
         }
+        emit_defer_fire(ctx, node->loc.line);
         emit_inst(ctx, ret);
         break;
     }

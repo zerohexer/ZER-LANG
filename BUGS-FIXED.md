@@ -3878,3 +3878,13 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Added slice→pointer coercion in IR_CALL arg emission: when arg type is TYPE_SLICE and param type is TYPE_POINTER, emit `local.ptr`. Same coercion pattern as array→slice but in the opposite direction (slice to raw pointer for C interop).
 
 **Test:** tests/zer/extern_puts.zer, tests/zer/star_slice.zer
+
+### BUG-523: emit_opt_wrap_value called emit_expr in IR path (2026-04-16)
+
+**Symptom:** Handle auto-deref `h.val` wrapped in optional emitted `((struct Data*)_zer_slab_get(&store, h)).val` with `.` instead of `->`. The Handle auto-deref in emit_rewritten_node was correct but never reached — `emit_opt_wrap_value` intercepted the expression and called `emit_expr` instead.
+
+**Root cause:** IR_ASSIGN's `need_wrap` path called `emit_opt_wrap_value(e, type, inst->expr)` which internally calls `emit_expr`. For Handle field expressions, emit_expr's Handle auto-deref uses `.` in some contexts (pre-existing emit_expr bug with rewritten AST).
+
+**Fix:** Replaced `emit_opt_wrap_value` in IR_ASSIGN with inline emission: `(OptType){ emit_rewritten_node(expr), 1 }`. Now the optional wrapping goes through emit_rewritten_node which has the corrected Handle auto-deref (`->` not `.`).
+
+**Test:** tests/zer/defer_return_order.zer (Handle field in optional context)

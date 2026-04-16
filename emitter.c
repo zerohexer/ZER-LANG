@@ -6122,6 +6122,96 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
 }
 
 /* ================================================================
+ * Builtin Call Emitter — emit pool/slab/ring/arena/Task inline C
+ * Extracted from emit_expr NODE_CALL. Uses emit_rewritten_node for args.
+ * Returns true if handled, false if not a recognized builtin.
+ * ================================================================ */
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward */
+static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
+    if (!node || node->kind != NODE_CALL || !node->call.callee ||
+        node->call.callee->kind != NODE_FIELD || !node->call.callee->field.object ||
+        node->call.callee->field.object->kind != NODE_IDENT) return false;
+    const char *mn = node->call.callee->field.field_name;
+    uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
+    const char *on = node->call.callee->field.object->ident.name;
+    uint32_t ol = (uint32_t)node->call.callee->field.object->ident.name_len;
+    Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
+    if (!ot) { Symbol *s = scope_lookup(e->checker->global_scope, on, ol); if (s) ot = s->type; }
+    if (!ot) return false;
+    Type *te = type_unwrap_distinct(ot);
+    #define BA(i) emit_rewritten_node(e, node->call.args[i], func)
+    /* Pool */
+    if (te->kind == TYPE_POOL) {
+        if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count==0) {
+            int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_pool_alloc(%.*s.slots,sizeof(%.*s.slots[0]),%.*s.gen,%.*s.used,%llu,&_zer_aok%d);(_zer_opt_u64){_zer_ah%d,_zer_aok%d};})",t,t,(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->pool.count,t,t,t); return true;
+        }
+        if (ml==3 && !memcmp(mn,"get",3) && node->call.arg_count>0) {
+            emit(e,"(("); emit_type(e,type_pointer(e->arena,te->pool.elem)); emit(e,")_zer_pool_get(%.*s.slots,%.*s.gen,%.*s.used,sizeof(%.*s.slots[0]),",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on); BA(0); emit(e,",%llu))",(unsigned long long)te->pool.count); return true;
+        }
+        if (ml==4 && !memcmp(mn,"free",4) && node->call.arg_count>0) {
+            emit(e,"_zer_pool_free(%.*s.gen,%.*s.used,",(int)ol,on,(int)ol,on); BA(0); emit(e,",%llu)",(unsigned long long)te->pool.count); return true;
+        }
+        if (ml==9 && !memcmp(mn,"alloc_ptr",9) && node->call.arg_count==0) {
+            int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_pool_alloc(%.*s.slots,sizeof(%.*s.slots[0]),%.*s.gen,%.*s.used,%llu,&_zer_aok%d);_zer_aok%d?(",t,t,(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->pool.count,t,t); emit_type(e,type_pointer(e->arena,te->pool.elem)); emit(e,")_zer_pool_get(%.*s.slots,%.*s.gen,%.*s.used,sizeof(%.*s.slots[0]),_zer_ah%d,%llu):(void*)0;})",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,t,(unsigned long long)te->pool.count); return true;
+        }
+        if (ml==8 && !memcmp(mn,"free_ptr",8) && node->call.arg_count>0) {
+            emit(e,"_zer_pool_free(%.*s.gen,%.*s.used,((uint64_t)((char*)(",(int)ol,on,(int)ol,on); BA(0); emit(e,")-(char*)%.*s.slots)/sizeof(%.*s.slots[0])),%llu)",(int)ol,on,(int)ol,on,(unsigned long long)te->pool.count); return true;
+        }
+    }
+    /* Slab */
+    if (te->kind == TYPE_SLAB) {
+        if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count==0) {
+            int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&%.*s,&_zer_aok%d);_zer_aok%d?(_zer_opt_u64){_zer_ah%d,1}:(_zer_opt_u64){0,0};})",t,t,(int)ol,on,t,t,t); return true;
+        }
+        if (ml==9 && !memcmp(mn,"alloc_ptr",9) && node->call.arg_count==0) {
+            int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&%.*s,&_zer_aok%d);_zer_aok%d?(",t,t,(int)ol,on,t,t); emit_type(e,type_pointer(e->arena,te->slab.elem)); emit(e,")_zer_slab_get(&%.*s,_zer_ah%d):(void*)0;})",(int)ol,on,t); return true;
+        }
+        if (ml==3 && !memcmp(mn,"get",3) && node->call.arg_count>0) {
+            emit(e,"(("); emit_type(e,type_pointer(e->arena,te->slab.elem)); emit(e,")_zer_slab_get(&%.*s,",(int)ol,on); BA(0); emit(e,"))"); return true;
+        }
+        if (ml==4 && !memcmp(mn,"free",4) && node->call.arg_count>0) {
+            emit(e,"_zer_slab_free(&%.*s,",(int)ol,on); BA(0); emit(e,")"); return true;
+        }
+        if (ml==8 && !memcmp(mn,"free_ptr",8) && node->call.arg_count>0) {
+            emit(e,"_zer_slab_free_ptr(&%.*s,(void*)",(int)ol,on); BA(0); emit(e,")"); return true;
+        }
+    }
+    /* Ring */
+    if (te->kind == TYPE_RING) {
+        if (ml==4 && !memcmp(mn,"push",4) && node->call.arg_count>0) {
+            int t=e->temp_count++; emit(e,"({"); emit_type(e,te->ring.elem); emit(e," _zer_rp%d=",t); BA(0); emit(e,";_zer_ring_push(%.*s.data,&%.*s.head,&%.*s.tail,&%.*s.count,%llu,&_zer_rp%d,sizeof(_zer_rp%d));})",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,t,t); return true;
+        }
+        if (ml==3 && !memcmp(mn,"pop",3)) {
+            int t=e->temp_count++; Type *opt=type_optional(e->arena,te->ring.elem); emit(e,"({"); emit_type(e,opt); emit(e," _zer_ro%d={0};if(%.*s.count>0){_zer_ro%d.value=%.*s.data[%.*s.tail];_zer_ro%d.has_value=1;%.*s.tail=(%.*s.tail+1)%%%llu;%.*s.count--;}_zer_ro%d;})",t,(int)ol,on,t,(int)ol,on,(int)ol,on,t,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,(int)ol,on,t); return true;
+        }
+    }
+    /* Arena */
+    if (te->kind == TYPE_ARENA) {
+        if (ml==5 && !memcmp(mn,"reset",5)) { emit(e,"(%.*s.offset=0)",(int)ol,on); return true; }
+        if (ml==12 && !memcmp(mn,"unsafe_reset",12)) { emit(e,"(%.*s.offset=0)",(int)ol,on); return true; }
+        if (ml==4 && !memcmp(mn,"over",4) && node->call.arg_count>0) {
+            emit(e,"((_zer_arena){(uint8_t*)"); BA(0); emit(e,",sizeof("); BA(0); emit(e,"),0})"); return true;
+        }
+        if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count>0 && node->call.args[0]->kind==NODE_IDENT) {
+            Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
+            if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
+                if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type);
+                emit(e,"),_Alignof("); if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type); emit(e,")))"); return true; }
+        }
+    }
+    /* Task.new/delete (auto-slab) */
+    if (te->kind == TYPE_STRUCT) {
+        const char *sn=te->struct_type.name; uint32_t sl=te->struct_type.name_len;
+        if (ml==3 && !memcmp(mn,"new",3)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(_zer_opt_u64){_zer_ah%d,1}:(_zer_opt_u64){0,0};})",t,t,(int)sl,sn,t,t,t); return true; }
+        if (ml==7 && !memcmp(mn,"new_ptr",7)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(struct %.*s*)_zer_slab_get(&_zer_auto_slab_%.*s,_zer_ah%d):(void*)0;})",t,t,(int)sl,sn,t,t,(int)sl,sn,(int)sl,sn,t); return true; }
+        if (ml==6 && !memcmp(mn,"delete",6) && node->call.arg_count>0) { emit(e,"_zer_slab_free(&_zer_auto_slab_%.*s,",(int)sl,sn); BA(0); emit(e,")"); return true; }
+        if (ml==10 && !memcmp(mn,"delete_ptr",10) && node->call.arg_count>0) { emit(e,"_zer_slab_free_ptr(&_zer_auto_slab_%.*s,(void*)",(int)sl,sn); BA(0); emit(e,")"); return true; }
+    }
+    #undef BA
+    return false;
+}
+
+/* ================================================================
  * Rewritten AST Node Emitter — emits C from rewritten AST nodes
  *
  * This function handles expressions that lower_expr sends through
@@ -6131,9 +6221,6 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
  * DOES NOT CALL emit_expr. Each node type emitted directly.
  * For sub-expressions, calls itself recursively.
  * ================================================================ */
-/* Forward declaration for recursive calls */
-static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func);
-
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
@@ -6667,9 +6754,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
                     ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
                     ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_STRUCT) {
-                    /* Builtin — delegate to emit_expr for inline C */
-                    emit_expr(e, node);
-                    return;
+                    /* Builtin — emit inline C via emit_builtin_inline */
+                    if (emit_builtin_inline(e, node, func)) return;
+                    /* Unhandled builtin falls through to regular call */
                 }
             }
         }

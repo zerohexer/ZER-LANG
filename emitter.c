@@ -6727,11 +6727,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (!inst->call_arg_locals) is_builtin = true;
 
         if (is_builtin || is_comptime) {
-            /* Builtins/comptime — builtins NEED emit_expr for inline C
-             * (pool.alloc = 15-line GCC statement expression).
-             * emit_rewritten_node can't handle builtins without duplicating
-             * the 600-line builtin handler from emit_expr. */
-            if (inst->expr) emit_expr(e, inst->expr);
+            /* Builtins/comptime — emit_rewritten_node(NODE_CALL) detects
+             * builtins and delegates to emit_expr for inline C generation. */
+            if (inst->expr) emit_rewritten_node(e, inst->expr);
         } else if (inst->call_arg_locals) {
             /* Decomposed call: emit callee(local1, local2, ...) from local IDs.
              * Handle array→slice coercion for args when param expects slice. */

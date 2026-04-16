@@ -6464,14 +6464,47 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_expr(e, node);
             return;
         }
-        /* Volatile array assignment — needs byte loop */
+        /* Array assignment — memcpy/byte-loop */
         if (tgt_eff && tgt_eff->kind == TYPE_ARRAY) {
-            emit_expr(e, node);
+            int tmp = e->temp_count++;
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, node->assign.target, func);
+            emit(e, ") *_zer_ma%d = &(", tmp);
+            emit_rewritten_node(e, node->assign.target, func);
+            emit(e, "); memmove(_zer_ma%d, ", tmp);
+            emit_rewritten_node(e, node->assign.value, func);
+            emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
             return;
         }
-        /* Shared struct locking */
+        /* Shared struct locking — emit lock + assign + unlock */
         if (tgt_eff && tgt_eff->kind == TYPE_STRUCT && tgt_eff->struct_type.is_shared) {
-            emit_expr(e, node);
+            /* Extract root shared struct for locking.
+             * Target is like `shared_var.field` — root is `shared_var`. */
+            Node *root = node->assign.target;
+            while (root && root->kind == NODE_FIELD) root = root->field.object;
+            if (root) {
+                emit(e, "({ ");
+                emit(e, "_zer_mtx_ensure_init(&(");
+                emit_rewritten_node(e, root, func);
+                emit(e, "._zer_mtx), &(");
+                emit_rewritten_node(e, root, func);
+                emit(e, "._zer_mtx_inited)); ");
+                emit(e, "pthread_mutex_lock(&(");
+                emit_rewritten_node(e, root, func);
+                emit(e, "._zer_mtx)); ");
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, " = ");
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, "; ");
+                emit(e, "pthread_mutex_unlock(&(");
+                emit_rewritten_node(e, root, func);
+                emit(e, "._zer_mtx)); })");
+            } else {
+                /* Fallback for complex targets */
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, " = ");
+                emit_rewritten_node(e, node->assign.value, func);
+            }
             return;
         }
         /* Simple assignment: target op= value */

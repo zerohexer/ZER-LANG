@@ -3868,3 +3868,13 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Added `scope_lookup(global_scope, ...)` fallback to emitter's builtin detection, matching the lowering path. **Still not sufficient for all 30 tests** — deeper investigation needed for remaining inconsistencies. Fallback `emit_expr` kept as safety net.
 
 **Test:** Regression: removing fallback breaks 28+ tests. Fallback restored.
+
+### BUG-522: Unified expr-stmt lowering — slice→ptr arg coercion (2026-04-16)
+
+**Symptom:** `puts("hello")` — string literal arg `_zer_slice_u8` passed where `const char*` expected. GCC "incompatible type for argument" error.
+
+**Root cause:** Unified expr-stmt lowering routes ALL expressions through `lower_expr`, which decomposes call args to locals. String literals become `_zer_slice_u8` temp locals. The IR_CALL simple path emits `puts(local)` without slice→pointer coercion. The old `emit_expr` path handled this automatically.
+
+**Fix:** Added slice→pointer coercion in IR_CALL arg emission: when arg type is TYPE_SLICE and param type is TYPE_POINTER, emit `local.ptr`. Same coercion pattern as array→slice but in the opposite direction (slice to raw pointer for C interop).
+
+**Test:** tests/zer/extern_puts.zer, tests/zer/star_slice.zer

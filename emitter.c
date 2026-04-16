@@ -6121,11 +6121,505 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "%.*s", (int)l->name_len, l->name);
 }
 
-/* emit_ir_value DELETED — zero calls remain.
- * IR_ASSIGN uses emit_expr directly for complex passthrough expressions.
- * All other IR ops use local IDs via emit_local_name.
- * emit_expr remains for: top-level declarations, IR_ASSIGN passthrough,
- * IR_CALL/IR_INTRINSIC/builtins (complex emission logic). */
+/* ================================================================
+ * Rewritten AST Node Emitter — emits C from rewritten AST nodes
+ *
+ * This function handles expressions that lower_expr sends through
+ * the passthrough path (IR_ASSIGN{dest, expr}). NODE_IDENTs in the
+ * AST have been rewritten to IR local C names by rewrite_idents().
+ *
+ * DOES NOT CALL emit_expr. Each node type emitted directly.
+ * For sub-expressions, calls itself recursively.
+ * ================================================================ */
+static void emit_rewritten_node(Emitter *e, Node *node) {
+    if (!node) return;
+
+    switch (node->kind) {
+    case NODE_IDENT:
+        /* Rewritten ident — just emit the name (may be IR local or global) */
+        if (e->in_async) {
+            /* Check if this is an async local */
+            for (int i = 0; i < e->async_local_count; i++) {
+                if (e->async_local_lens[i] == (size_t)node->ident.name_len &&
+                    memcmp(e->async_locals[i], node->ident.name, node->ident.name_len) == 0) {
+                    emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
+                    return;
+                }
+            }
+        }
+        emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
+        return;
+
+    case NODE_INT_LIT:
+        if (node->int_lit.value > 0xFFFFFFFF)
+            emit(e, "%lluULL", (unsigned long long)node->int_lit.value);
+        else
+            emit(e, "%llu", (unsigned long long)node->int_lit.value);
+        return;
+    case NODE_FLOAT_LIT:
+        emit(e, "%.17g", node->float_lit.value);
+        return;
+    case NODE_BOOL_LIT:
+        emit(e, "%d", node->bool_lit.value ? 1 : 0);
+        return;
+    case NODE_CHAR_LIT:
+        if (node->char_lit.value >= 32 && node->char_lit.value < 127 &&
+            node->char_lit.value != '\'' && node->char_lit.value != '\\')
+            emit(e, "'%c'", (char)node->char_lit.value);
+        else
+            emit(e, "%u", (unsigned)node->char_lit.value);
+        return;
+    case NODE_NULL_LIT:
+        emit(e, "0");
+        return;
+    case NODE_STRING_LIT:
+        emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", %u }",
+             (int)node->string_lit.length, node->string_lit.value,
+             (unsigned)node->string_lit.length);
+        return;
+
+    case NODE_BINARY: {
+        const char *op = "?";
+        switch (node->binary.op) {
+        case TOK_PLUS: op = "+"; break; case TOK_MINUS: op = "-"; break;
+        case TOK_STAR: op = "*"; break; case TOK_SLASH: op = "/"; break;
+        case TOK_PERCENT: op = "%"; break;
+        case TOK_AMP: op = "&"; break; case TOK_PIPE: op = "|"; break;
+        case TOK_CARET: op = "^"; break;
+        case TOK_LSHIFT: op = "<<"; break; case TOK_RSHIFT: op = ">>"; break;
+        case TOK_EQEQ: op = "=="; break; case TOK_BANGEQ: op = "!="; break;
+        case TOK_LT: op = "<"; break; case TOK_GT: op = ">"; break;
+        case TOK_LTEQ: op = "<="; break; case TOK_GTEQ: op = ">="; break;
+        case TOK_AMPAMP: op = "&&"; break; case TOK_PIPEPIPE: op = "||"; break;
+        default: break;
+        }
+        /* Check for *opaque comparison → .ptr extraction */
+        Type *lt = checker_get_type(e->checker, node->binary.left);
+        if (lt) {
+            Type *le = type_unwrap_distinct(lt);
+            if (le->kind == TYPE_POINTER && le->pointer.inner &&
+                type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE) {
+                emit(e, "(");
+                emit_rewritten_node(e, node->binary.left);
+                emit(e, ".ptr %s ", op);
+                emit_rewritten_node(e, node->binary.right);
+                emit(e, ".ptr)");
+                return;
+            }
+        }
+        emit(e, "(");
+        emit_rewritten_node(e, node->binary.left);
+        emit(e, " %s ", op);
+        emit_rewritten_node(e, node->binary.right);
+        emit(e, ")");
+        return;
+    }
+
+    case NODE_UNARY:
+        switch (node->unary.op) {
+        case TOK_MINUS: emit(e, "-"); break;
+        case TOK_BANG: emit(e, "!"); break;
+        case TOK_TILDE: emit(e, "~"); break;
+        case TOK_STAR: emit(e, "*"); break;
+        case TOK_AMP: emit(e, "&"); break;
+        default: break;
+        }
+        emit_rewritten_node(e, node->unary.operand);
+        return;
+
+    case NODE_FIELD: {
+        /* Check object type — complex types delegate to emit_expr */
+        if (node->field.object && node->field.object->kind == NODE_IDENT) {
+            Type *ot = checker_get_type(e->checker, node->field.object);
+            if (!ot) {
+                Symbol *sym = scope_lookup(e->checker->global_scope,
+                    node->field.object->ident.name,
+                    (uint32_t)node->field.object->ident.name_len);
+                if (sym) ot = sym->type;
+            }
+            if (ot) {
+                Type *ot_eff = type_unwrap_distinct(ot);
+                /* Handle auto-deref, opaque, builtins → emit_expr */
+                if (ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_OPAQUE ||
+                    ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+                    ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA) {
+                    emit_expr(e, node);
+                    return;
+                }
+                if (ot_eff->kind == TYPE_ENUM) {
+                    /* Emit enum value: _ZER_EnumName_variant */
+                    const char *ename = ot_eff->enum_type.name;
+                    uint32_t elen = ot_eff->enum_type.name_len;
+                    if (ot_eff->enum_type.module_prefix) {
+                        emit(e, "_ZER_%.*s__%.*s_%.*s",
+                             (int)ot_eff->enum_type.module_prefix_len,
+                             ot_eff->enum_type.module_prefix,
+                             (int)elen, ename,
+                             (int)node->field.field_name_len, node->field.field_name);
+                    } else {
+                        emit(e, "_ZER_%.*s_%.*s",
+                             (int)elen, ename,
+                             (int)node->field.field_name_len, node->field.field_name);
+                    }
+                    return;
+                }
+                /* Slice .ptr/.len */
+                if (ot_eff->kind == TYPE_SLICE) {
+                    emit_rewritten_node(e, node->field.object);
+                    emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
+                    return;
+                }
+                /* Array .len → emit compile-time size */
+                if (ot_eff->kind == TYPE_ARRAY) {
+                    if (node->field.field_name_len == 3 &&
+                        memcmp(node->field.field_name, "len", 3) == 0) {
+                        emit(e, "%uU", (unsigned)ot_eff->array.size);
+                        return;
+                    }
+                }
+                /* Pointer → use -> */
+                if (ot_eff->kind == TYPE_POINTER) {
+                    emit_rewritten_node(e, node->field.object);
+                    emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
+                    return;
+                }
+            }
+        }
+        /* Default: struct field access with . */
+        emit_rewritten_node(e, node->field.object);
+        emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
+        return;
+    }
+
+    case NODE_INDEX: {
+        /* Index: delegate to emit_expr for bounds checks + volatile + handle */
+        emit_expr(e, node);
+        return;
+    }
+
+    case NODE_ASSIGN: {
+        /* Assignments: delegate to emit_expr for full logic
+         * (field writes, compound ops, bit extract, volatile, optional wrap,
+         * array memcpy, shared struct locking). */
+        emit_expr(e, node);
+        return;
+    }
+
+    case NODE_CALL: {
+        /* Call: callee(args) — rewritten idents, emit directly.
+         * Builtins (pool/slab/ring/arena) MUST go through emit_expr
+         * for inline C generation. Detect and delegate. */
+        if (node->call.is_comptime_resolved) {
+            if (node->call.is_comptime_float)
+                emit(e, "%.17g", node->call.comptime_float_value);
+            else
+                emit(e, "%lld", (long long)node->call.comptime_value);
+            return;
+        }
+        /* Detect builtins: callee NODE_FIELD on pool/slab/ring/arena/struct */
+        if (node->call.callee && node->call.callee->kind == NODE_FIELD &&
+            node->call.callee->field.object &&
+            node->call.callee->field.object->kind == NODE_IDENT) {
+            Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
+            if (!ot) {
+                Symbol *sym = scope_lookup(e->checker->global_scope,
+                    node->call.callee->field.object->ident.name,
+                    (uint32_t)node->call.callee->field.object->ident.name_len);
+                if (sym) ot = sym->type;
+            }
+            if (ot) {
+                Type *ot_eff = type_unwrap_distinct(ot);
+                if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+                    ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+                    ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_STRUCT) {
+                    /* Builtin — delegate to emit_expr for inline C */
+                    emit_expr(e, node);
+                    return;
+                }
+            }
+        }
+        emit_rewritten_node(e, node->call.callee);
+        emit(e, "(");
+        for (int i = 0; i < node->call.arg_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_rewritten_node(e, node->call.args[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+
+    case NODE_INTRINSIC: {
+        /* Intrinsics — handle each type from rewritten AST */
+        const char *name = node->intrinsic.name;
+        uint32_t nlen = (uint32_t)node->intrinsic.name_len;
+
+        if (nlen == 4 && memcmp(name, "size", 4) == 0) {
+            /* @size(T) → sizeof(CType) */
+            emit(e, "sizeof(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
+            /* @truncate(T, val) → (T)(val) */
+            emit(e, "(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")(");
+            if (node->intrinsic.arg_count > 0)
+                emit_rewritten_node(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
+            /* @saturate(T, val) → clamp to T range */
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                int tmp = e->temp_count++;
+                emit(e, "({__auto_type _zer_sat%d = ", tmp);
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit(e, "; ");
+                int w = type_width(t);
+                bool is_signed = type_is_signed(t);
+                if (is_signed) {
+                    int64_t min_v = -(1LL << (w - 1));
+                    int64_t max_v = (1LL << (w - 1)) - 1;
+                    emit(e, "_zer_sat%d < %lldLL ? (%lldLL) : _zer_sat%d > %lldLL ? (%lldLL) : (",
+                         tmp, (long long)min_v, (long long)min_v,
+                         tmp, (long long)max_v, (long long)max_v);
+                } else {
+                    uint64_t max_v = w >= 64 ? UINT64_MAX : ((1ULL << w) - 1);
+                    emit(e, "_zer_sat%d > %lluULL ? (%lluULL) : (",
+                         tmp, (unsigned long long)max_v, (unsigned long long)max_v);
+                }
+                emit_type(e, t);
+                emit(e, ")_zer_sat%d; })", tmp);
+            }
+        } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
+            /* @bitcast(T, val) → memcpy type punning */
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                int tmp = e->temp_count++;
+                int tmp2 = e->temp_count++;
+                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit(e, "; ");
+                emit_type(e, t);
+                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
+                     tmp, tmp, tmp2, tmp, tmp);
+            }
+        } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
+            /* @cast(T, val) → (T)(val) for distinct typedefs */
+            emit(e, "(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+            }
+            emit(e, ")(");
+            if (node->intrinsic.arg_count > 0)
+                emit_rewritten_node(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
+            /* @offset(T, field) → offsetof */
+            emit(e, "offsetof(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                emit_type(e, t);
+                emit(e, ", ");
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0]);
+            }
+            emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
+            /* @ptrtoint(ptr) → (uintptr_t)(ptr) */
+            emit(e, "(uintptr_t)(");
+            if (node->intrinsic.arg_count > 0)
+                emit_rewritten_node(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
+            emit(e, "_zer_trap(\"trap\", __FILE__, __LINE__)");
+        } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
+            /* @ptrcast(*T, expr) — cast with type_id check */
+            Type *tgt_type = node->intrinsic.type_arg ?
+                resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            Type *src_type = (node->intrinsic.arg_count > 0) ?
+                checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+            Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+
+            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
+                type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
+                src_eff && src_eff->kind == TYPE_POINTER) {
+                /* To *opaque — wrap with type_id */
+                uint32_t tid = 0;
+                if (src_eff->pointer.inner) {
+                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
+                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
+                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
+                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                }
+                emit(e, "(_zer_opaque){(void*)(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit(e, "), %u}", (unsigned)tid);
+            } else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                       src_eff &&
+                       ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+                         type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
+                        src_eff->kind == TYPE_OPAQUE)) {
+                /* From *opaque — unwrap .ptr with type check */
+                uint32_t expected_tid = 0;
+                if (tgt_eff->pointer.inner) {
+                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
+                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
+                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                }
+                if (expected_tid > 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
+                         "_zer_trap(\"@ptrcast type mismatch\", __FILE__, __LINE__); (",
+                         tmp, (unsigned)expected_tid, tmp);
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")_zer_pc%d.ptr; })", tmp);
+                } else {
+                    emit(e, "((");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit(e, ").ptr)");
+                }
+            } else {
+                /* Neither side is *opaque — plain cast */
+                emit(e, "(");
+                if (tgt_type) emit_type(e, tgt_type);
+                emit(e, ")(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit(e, ")");
+            }
+        } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
+            /* @inttoptr(*T, addr) — integer to pointer */
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                emit(e, "((");
+                emit_type(e, t);
+                emit(e, ")(uintptr_t)(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit(e, "))");
+            }
+        } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
+            /* @container(*T, ptr, field) → container_of */
+            if (node->intrinsic.type_arg && node->intrinsic.arg_count >= 2) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                emit(e, "((");
+                emit_type(e, t);
+                emit(e, ")((char*)(");
+                emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit(e, ") - offsetof(");
+                /* Emit the struct type for offsetof */
+                if (t) {
+                    Type *inner = type_unwrap_distinct(t);
+                    if (inner->kind == TYPE_POINTER) inner = type_unwrap_distinct(inner->pointer.inner);
+                    emit_type(e, inner);
+                }
+                emit(e, ", ");
+                emit_rewritten_node(e, node->intrinsic.args[1]);
+                emit(e, ")))");
+            }
+        } else {
+            /* Remaining complex intrinsics: @cstr, @barrier*, @atomic_*, @cond_*,
+             * @sem_*, @probe, @once — too complex for rewritten emission.
+             * Emit as passthrough to emit_expr. */
+            emit_expr(e, node);
+        }
+        return;
+    }
+
+    case NODE_SLICE: {
+        /* Sub-slice: obj[start..end] → (SliceType){ &obj.ptr[start], end-start } */
+        Type *obj_type = checker_get_type(e->checker, node->slice.object);
+        bool obj_slice = obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_SLICE;
+        if (obj_slice) {
+            Type *elem = type_unwrap_distinct(obj_type)->slice.inner;
+            emit(e, "(");
+            emit_type(e, obj_type);
+            emit(e, "){ &(");
+            emit_rewritten_node(e, node->slice.object);
+            emit(e, ".ptr)[");
+            if (node->slice.start) emit_rewritten_node(e, node->slice.start);
+            else emit(e, "0");
+            emit(e, "], ");
+            if (node->slice.end && node->slice.start) {
+                emit(e, "(");
+                emit_rewritten_node(e, node->slice.end);
+                emit(e, ") - (");
+                emit_rewritten_node(e, node->slice.start);
+                emit(e, ")");
+            } else if (node->slice.end) {
+                emit_rewritten_node(e, node->slice.end);
+            } else {
+                emit_rewritten_node(e, node->slice.object);
+                emit(e, ".len");
+                if (node->slice.start) {
+                    emit(e, " - ");
+                    emit_rewritten_node(e, node->slice.start);
+                }
+            }
+            emit(e, " }");
+        } else {
+            /* Array sub-slice or complex — basic fallback */
+            emit(e, "/* slice */ 0");
+        }
+        return;
+    }
+
+    case NODE_TYPECAST: {
+        /* Should be handled by IR_CAST, but in case it reaches here */
+        emit(e, "((");
+        if (node->typecast.target_type) {
+            Type *t = resolve_tynode(e, node->typecast.target_type);
+            emit_type(e, t);
+        }
+        emit(e, ")");
+        emit_rewritten_node(e, node->typecast.expr);
+        emit(e, ")");
+        return;
+    }
+
+    case NODE_STRUCT_INIT: {
+        /* Should be handled by IR_STRUCT_INIT_DECOMP, but fallback */
+        Type *si_type = checker_get_type(e->checker, node);
+        if (si_type) {
+            emit(e, "(");
+            emit_type(e, si_type);
+            emit(e, ")");
+        }
+        emit(e, "{ ");
+        for (int i = 0; i < node->struct_init.field_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
+                 node->struct_init.fields[i].name);
+            emit_rewritten_node(e, node->struct_init.fields[i].value);
+        }
+        emit(e, " }");
+        return;
+    }
+
+    default:
+        /* Fallback: emit as C identifier or literal */
+        emit(e, "/* unhandled node %d */0", node->kind);
+        return;
+    }
+}
 
 /* Emit one IR instruction as C code */
 static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
@@ -6177,14 +6671,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else if (need_slice) {
                 emit_array_as_slice(e, inst->expr, src_type, dst_type);
             } else {
-                emit_expr(e, inst->expr);
+                emit_rewritten_node(e, inst->expr);
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
-            emit_expr(e, inst->expr);
+            emit_rewritten_node(e, inst->expr);
             emit(e, ";\n");
         }
         break;
@@ -6233,7 +6727,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (!inst->call_arg_locals) is_builtin = true;
 
         if (is_builtin || is_comptime) {
-            /* Builtins/comptime need emit_expr for inline C generation */
+            /* Builtins/comptime — builtins NEED emit_expr for inline C
+             * (pool.alloc = 15-line GCC statement expression).
+             * emit_rewritten_node can't handle builtins without duplicating
+             * the 600-line builtin handler from emit_expr. */
             if (inst->expr) emit_expr(e, inst->expr);
         } else if (inst->call_arg_locals) {
             /* Decomposed call: emit callee(local1, local2, ...) from local IDs.

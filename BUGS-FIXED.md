@@ -3938,3 +3938,15 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Added TYPE_HANDLE detection in default field accessor path. Emits `((T*)_zer_*_get(alloc, obj))->field` same as the ident-object Handle path.
 
 **Test:** tests/zer/handle_array.zer, dyn_array_guard.zer, dyn_array_autoguard_crash.zer, scheduler.zer, super_freelist.zer, orelse_block_ptr.zer
+
+### BUG-529: @size(UserType) ident arg path missing struct prefix (2026-04-16)
+
+**Symptom:** `@size(Packet)` emitted `sizeof(Packet)` — bare name without `struct` prefix. GCC "'Packet' undeclared" error.
+
+**Root cause:** Parser stores `@size(TypeName)` as `args[0]` (NODE_IDENT) for user-defined types, not `type_arg` (TypeNode, only for keyword types like u32). emit_rewritten_node's @size handler only checked `type_arg` path, fell to `args[0]` path which emitted bare ident via `emit_rewritten_node(args[0])`.
+
+**Fix:** Added `args[0]` ident path: look up type name in scope, emit `struct [packed] Name` for TYPE_STRUCT, `struct Name` for TYPE_UNION, `emit_type` for others.
+
+**Why hard to debug:** Debug trace on @size handler showed it WAS reached, but `type_arg` was NULL (skipping the scope lookup). The `args[0]` path was a simple `emit_rewritten_node` call that emitted bare ident — no obvious "wrong" output until GCC reported undeclared.
+
+**Test:** tests/zer/packed_struct.zer, tests/zer/comptime_pool_size.zer

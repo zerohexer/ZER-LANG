@@ -6459,9 +6459,62 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         /* Check for complex patterns that need emit_expr */
         Type *tgt_type = checker_get_type(e->checker, node->assign.target);
         Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
-        /* Bit extract (reg[hi..lo] = val) — has NODE_SLICE target */
+        /* Bit extract SET: reg[hi..lo] = val → shift/mask.
+         * Replicates emit_expr's BUG-210/216 handler using emit_rewritten_node. */
         if (node->assign.target && node->assign.target->kind == NODE_SLICE) {
-            emit_expr(e, node);
+            Node *obj = node->assign.target->slice.object;
+            Node *hi_node = node->assign.target->slice.start;
+            Node *lo_node = node->assign.target->slice.end;
+            int btmp = e->temp_count++;
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, obj, func);
+            emit(e, ") *_zer_bp%d = &(", btmp);
+            emit_rewritten_node(e, obj, func);
+            emit(e, "); ");
+            int64_t const_hi = hi_node ? eval_const_expr(hi_node) : CONST_EVAL_FAIL;
+            int64_t const_lo = lo_node ? eval_const_expr(lo_node) : CONST_EVAL_FAIL;
+            bool bits_const = (const_hi != CONST_EVAL_FAIL && const_lo != CONST_EVAL_FAIL &&
+                               const_hi >= 0 && const_lo >= 0);
+            if (!bits_const && hi_node && lo_node) {
+                emit(e, "uint64_t _zer_bh%d = (uint64_t)(", btmp);
+                emit_rewritten_node(e, hi_node, func);
+                emit(e, "); uint64_t _zer_bl%d = (uint64_t)(", btmp);
+                emit_rewritten_node(e, lo_node, func);
+                emit(e, "); ");
+            }
+            emit(e, "*_zer_bp%d = (*_zer_bp%d & ~(", btmp, btmp);
+            if (hi_node && lo_node) {
+                if (bits_const) {
+                    int64_t width = const_hi - const_lo + 1;
+                    if (width >= 64) emit(e, "~(uint64_t)0");
+                    else emit(e, "((1ull << %lld) - 1)", (long long)width);
+                    emit(e, " << %lld", (long long)const_lo);
+                } else {
+                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
+                         btmp, btmp, btmp, btmp, btmp);
+                }
+            }
+            emit(e, ")) | (((uint64_t)(");
+            emit_rewritten_node(e, node->assign.value, func);
+            emit(e, ") << ");
+            if (bits_const) emit(e, "%lld", (long long)const_lo);
+            else if (lo_node) emit(e, "_zer_bl%d", btmp);
+            else emit(e, "0");
+            emit(e, ") & (");
+            if (hi_node && lo_node) {
+                if (bits_const) {
+                    int64_t width = const_hi - const_lo + 1;
+                    if (width >= 64) emit(e, "~(uint64_t)0");
+                    else emit(e, "((1ull << %lld) - 1)", (long long)width);
+                    emit(e, " << %lld", (long long)const_lo);
+                } else {
+                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
+                         btmp, btmp, btmp, btmp, btmp);
+                }
+            }
+            emit(e, ")); })");
             return;
         }
         /* Array assignment — memcpy/byte-loop */

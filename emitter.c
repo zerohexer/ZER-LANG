@@ -7843,9 +7843,49 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_DEFER_FIRE: {
-        /* Fire all pending defers in LIFO order */
+        /* Fire all pending defers in LIFO order.
+         * Defer bodies are AST nodes — emit via emit_rewritten_node
+         * for expressions, handle blocks by walking statements. */
         for (int di = e->defer_stack.count - 1; di >= 0; di--) {
-            emit_stmt(e, e->defer_stack.stmts[di]);
+            Node *db = e->defer_stack.stmts[di];
+            if (!db) continue;
+            if (db->kind == NODE_BLOCK) {
+                for (int si = 0; si < db->block.stmt_count; si++) {
+                    Node *s = db->block.stmts[si];
+                    if (!s) continue;
+                    if (s->kind == NODE_EXPR_STMT && s->expr_stmt.expr) {
+                        emit_indent(e);
+                        emit_rewritten_node(e, s->expr_stmt.expr, func);
+                        emit(e, ";\n");
+                    } else if (s->kind == NODE_RETURN) {
+                        emit_indent(e);
+                        emit(e, "return");
+                        if (s->ret.expr) {
+                            emit(e, " ");
+                            emit_rewritten_node(e, s->ret.expr, func);
+                        }
+                        emit(e, ";\n");
+                    } else if (s->kind == NODE_ASM) {
+                        emit_indent(e);
+                        emit(e, "__asm__ __volatile__(%.*s);\n",
+                             (int)s->asm_stmt.code_len, s->asm_stmt.code);
+                    } else {
+                        /* Unhandled statement in defer — emit as expression */
+                        emit_indent(e);
+                        emit_rewritten_node(e, s, func);
+                        emit(e, ";\n");
+                    }
+                }
+            } else if (db->kind == NODE_EXPR_STMT && db->expr_stmt.expr) {
+                emit_indent(e);
+                emit_rewritten_node(e, db->expr_stmt.expr, func);
+                emit(e, ";\n");
+            } else {
+                /* Single non-block defer */
+                emit_indent(e);
+                emit_rewritten_node(e, db, func);
+                emit(e, ";\n");
+            }
         }
         break;
     }
@@ -7859,10 +7899,73 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_NOP:
-        /* ASM pass-through or no-op */
+        /* ASM, spawn, or switch pass-through */
         if (inst->expr) {
-            emit_indent(e);
-            emit_stmt(e, inst->expr); /* ASM nodes emit via stmt */
+            if (inst->expr->kind == NODE_ASM) {
+                /* Inline assembly — emit directly */
+                emit_indent(e);
+                emit(e, "__asm__ __volatile__(%.*s);\n",
+                     (int)inst->expr->asm_stmt.code_len,
+                     inst->expr->asm_stmt.code);
+            } else if (inst->expr->kind == NODE_SPAWN) {
+                /* Spawn — emit pthread_create with wrapper struct.
+                 * Find pre-scanned spawn wrapper by node pointer. */
+                Node *sp = inst->expr;
+                int sid = -1;
+                for (int wi = 0; wi < e->spawn_wrapper_count; wi++) {
+                    if (e->spawn_wrappers[wi].spawn_node == sp) {
+                        sid = e->spawn_wrappers[wi].id; break;
+                    }
+                }
+                if (sid >= 0) {
+                    int ac = sp->spawn_stmt.arg_count;
+                    bool is_scoped = (sp->spawn_stmt.handle_name != NULL);
+                    if (is_scoped) {
+                        emit_indent(e);
+                        emit(e, "pthread_t %.*s;\n",
+                             (int)sp->spawn_stmt.handle_name_len, sp->spawn_stmt.handle_name);
+                    }
+                    emit_indent(e);
+                    emit(e, "{ /* spawn %.*s */\n", (int)sp->spawn_stmt.func_name_len, sp->spawn_stmt.func_name);
+                    e->indent++;
+                    if (ac > 0) {
+                        emit_indent(e);
+                        emit(e, "struct _zer_spawn_args_%d *_sa = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid);
+                        for (int ai = 0; ai < ac; ai++) {
+                            emit_indent(e);
+                            emit(e, "_sa->a%d = ", ai);
+                            emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
+                            emit(e, ";\n");
+                        }
+                    }
+                    if (is_scoped) {
+                        emit_indent(e);
+                        emit(e, "pthread_create(&%.*s, NULL, _zer_spawn_wrap_%d, ",
+                             (int)sp->spawn_stmt.handle_name_len, sp->spawn_stmt.handle_name, sid);
+                    } else {
+                        emit_indent(e);
+                        emit(e, "{ pthread_t _t; pthread_create(&_t, NULL, _zer_spawn_wrap_%d, ", sid);
+                    }
+                    emit(e, "%s);\n", ac > 0 ? "(void*)_sa" : "NULL");
+                    if (!is_scoped) {
+                        emit_indent(e);
+                        emit(e, "pthread_detach(_t); }\n");
+                    }
+                    e->indent--;
+                    emit_indent(e);
+                    emit(e, "}\n");
+                }
+            } else if (inst->expr->kind == NODE_SWITCH) {
+                /* Complex switch passthrough (union/optional/enum) —
+                 * emit via emit_stmt for now. These will be lowered
+                 * to IR branches when union tag comparison is added. */
+                emit_stmt(e, inst->expr);
+            } else {
+                /* Other passthrough — emit as expression */
+                emit_indent(e);
+                emit_rewritten_node(e, inst->expr, func);
+                emit(e, ";\n");
+            }
         }
         break;
 

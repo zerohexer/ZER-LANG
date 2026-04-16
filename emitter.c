@@ -4866,8 +4866,10 @@ static void emit_async_func(Emitter *e, Node *node) {
 
 static void emit_func_decl(Emitter *e, Node *node) {
 
-    /* IR emission path — lower to IR, emit from IR */
-    if (e->use_ir && node->func_decl.body) {
+    /* IR emission path — lower to IR, emit from IR.
+     * Only for main module — imported modules use AST path
+     * (IR lowering doesn't handle cross-module name mangling yet). */
+    if (e->use_ir && node->func_decl.body && !e->current_module) {
         IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
         if (ir) {
             ir->module_prefix = e->current_module;

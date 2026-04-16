@@ -85,8 +85,8 @@ typedef struct {
     int condvar_type_count;
     int condvar_type_capacity;
 
-    /* IR emission mode (v0.4 migration) */
-    bool use_ir;            /* true = lower to IR then emit from IR. false = AST emission (default). */
+    /* IR emission mode — single-file ready, multi-module needs mangling */
+    bool use_ir;            /* true = IR emission (--use-ir). false = AST emission (default). */
 } Emitter;
 
 /* ---- API ---- */

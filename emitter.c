@@ -4866,10 +4866,8 @@ static void emit_async_func(Emitter *e, Node *node) {
 
 static void emit_func_decl(Emitter *e, Node *node) {
 
-    /* IR emission path — lower to IR, emit from IR.
-     * Only for main module — imported modules use AST path
-     * (IR lowering doesn't handle cross-module name mangling yet). */
-    if (e->use_ir && node->func_decl.body && !e->current_module) {
+    /* IR emission path — lower to IR, emit from IR */
+    if (e->use_ir && node->func_decl.body) {
         IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
         if (ir) {
             ir->module_prefix = e->current_module;
@@ -6227,20 +6225,46 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
     switch (node->kind) {
-    case NODE_IDENT:
-        /* Rewritten ident — just emit the name (may be IR local or global) */
+    case NODE_IDENT: {
+        /* Rewritten ident — emit name (IR local, global, or mangled cross-module) */
+        const char *iname = node->ident.name;
+        uint32_t ilen = (uint32_t)node->ident.name_len;
         if (e->in_async) {
-            /* Check if this is an async local */
             for (int i = 0; i < e->async_local_count; i++) {
-                if (e->async_local_lens[i] == (size_t)node->ident.name_len &&
-                    memcmp(e->async_locals[i], node->ident.name, node->ident.name_len) == 0) {
-                    emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
+                if (e->async_local_lens[i] == (size_t)ilen &&
+                    memcmp(e->async_locals[i], iname, ilen) == 0) {
+                    emit(e, "self->%.*s", (int)ilen, iname);
                     return;
                 }
             }
         }
-        emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
+        /* Check if this is a cross-module function needing mangled name.
+         * If the ident is NOT an IR local, look up in scope. If the symbol
+         * has a module_prefix, emit module__name instead of bare name. */
+        if (func) {
+            int lid = -1;
+            for (int li = 0; li < func->local_count; li++) {
+                if ((func->locals[li].name_len == ilen &&
+                     memcmp(func->locals[li].name, iname, ilen) == 0) ||
+                    (func->locals[li].orig_name_len == ilen &&
+                     memcmp(func->locals[li].orig_name, iname, ilen) == 0)) {
+                    lid = li; break;
+                }
+            }
+            if (lid < 0) {
+                /* Not a local — check scope for module-prefixed symbol */
+                Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
+                if (sym && sym->is_function && sym->module_prefix) {
+                    emit(e, "%.*s__%.*s",
+                         (int)sym->module_prefix_len, sym->module_prefix,
+                         (int)ilen, iname);
+                    return;
+                }
+            }
+        }
+        emit(e, "%.*s", (int)ilen, iname);
         return;
+    }
 
     case NODE_INT_LIT:
         if (node->int_lit.value > 0xFFFFFFFF)
@@ -7377,7 +7401,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
             /* Emit callee: simple ident or field access (funcptr through struct) */
             if (inst->func_name) {
-                emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+                /* Check for cross-module function needing mangled name */
+                Symbol *fsym = scope_lookup(e->checker->global_scope,
+                    inst->func_name, inst->func_name_len);
+                if (fsym && fsym->is_function && fsym->module_prefix) {
+                    emit(e, "%.*s__%.*s(",
+                         (int)fsym->module_prefix_len, fsym->module_prefix,
+                         (int)inst->func_name_len, inst->func_name);
+                } else {
+                    emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+                }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
                        inst->expr->call.callee->kind == NODE_FIELD) {

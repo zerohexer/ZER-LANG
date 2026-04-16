@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
     bool do_run = false;
     bool emit_c = false;
     bool emit_ir = false;
-    bool use_ir = false; /* IR path ready for single-file (195/195). Multi-module needs mangling work. --use-ir to enable. */
+    bool use_ir = true; /* IR default — Phase 9 complete, module mangling handled */
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;

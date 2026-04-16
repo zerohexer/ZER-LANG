@@ -82,10 +82,10 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_semantic_fuzz
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh
-	@echo "=== ZER integration tests ==="
+	@echo "=== ZER integration tests (IR default) ==="
 	@bash tests/test_zer.sh
-	@echo "=== ZER IR path tests (--use-ir) ==="
-	@bash tests/test_zer.sh --use-ir
+	@echo "=== ZER AST path tests (--no-ir) ==="
+	@bash tests/test_zer.sh --no-ir
 	@echo "=== Rust-equivalent safety tests ==="
 	@bash rust_tests/run_tests.sh ./zerc
 	@echo "=== Zig-translated tests ==="

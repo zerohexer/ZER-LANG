@@ -8127,8 +8127,56 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                     }
                                 } else if (bs->kind == NODE_BREAK) {
                                     /* break in switch → just end arm (no C break needed, using if/else) */
+                                } else if (bs->kind == NODE_VAR_DECL) {
+                                    /* Variable declaration inside switch arm */
+                                    Type *vt = checker_get_type(e->checker, bs);
+                                    emit_indent(e);
+                                    if (vt) emit_type_and_name(e, vt, bs->var_decl.name, bs->var_decl.name_len);
+                                    else emit(e, "uint32_t %.*s", (int)bs->var_decl.name_len, bs->var_decl.name);
+                                    if (bs->var_decl.init) {
+                                        emit(e, " = ");
+                                        emit_rewritten_node(e, bs->var_decl.init, func);
+                                    } else {
+                                        emit(e, " = {0}");
+                                    }
+                                    emit(e, ";\n");
+                                } else if (bs->kind == NODE_DEFER) {
+                                    /* Defer inside switch arm — push to defer stack */
+                                    if (e->defer_stack.count >= e->defer_stack.capacity) {
+                                        int nc = e->defer_stack.capacity * 2;
+                                        if (nc < 16) nc = 16;
+                                        Node **ns = (Node **)malloc(nc * sizeof(Node *));
+                                        if (e->defer_stack.stmts) {
+                                            memcpy(ns, e->defer_stack.stmts, e->defer_stack.count * sizeof(Node *));
+                                            free(e->defer_stack.stmts);
+                                        }
+                                        e->defer_stack.stmts = ns;
+                                        e->defer_stack.capacity = nc;
+                                    }
+                                    e->defer_stack.stmts[e->defer_stack.count++] = bs->defer.body;
+                                } else if (bs->kind == NODE_IF) {
+                                    /* If inside switch arm — emit condition + bodies */
+                                    emit_indent(e);
+                                    emit(e, "if (");
+                                    emit_rewritten_node(e, bs->if_stmt.cond, func);
+                                    emit(e, ") {\n");
+                                    e->indent++;
+                                    if (bs->if_stmt.then_body) {
+                                        if (bs->if_stmt.then_body->kind == NODE_BLOCK) {
+                                            for (int bi = 0; bi < bs->if_stmt.then_body->block.stmt_count; bi++) {
+                                                Node *is = bs->if_stmt.then_body->block.stmts[bi];
+                                                if (is && is->kind == NODE_EXPR_STMT && is->expr_stmt.expr) {
+                                                    emit_indent(e); emit_rewritten_node(e, is->expr_stmt.expr, func); emit(e, ";\n");
+                                                } else if (is && is->kind == NODE_RETURN) {
+                                                    emit_indent(e); emit(e, "return"); if (is->ret.expr) { emit(e, " "); emit_rewritten_node(e, is->ret.expr, func); } emit(e, ";\n");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    e->indent--;
+                                    emit_indent(e); emit(e, "}\n");
                                 } else {
-                                    /* Complex statement — use emit_rewritten_node */
+                                    /* Other statement — use emit_rewritten_node */
                                     emit_indent(e);
                                     emit_rewritten_node(e, bs, func);
                                     emit(e, ";\n");

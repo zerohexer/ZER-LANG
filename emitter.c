@@ -6190,6 +6190,16 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
         if (ml==3 && !memcmp(mn,"pop",3)) {
             int t=e->temp_count++; Type *opt=type_optional(e->arena,te->ring.elem); emit(e,"({"); emit_type(e,opt); emit(e," _zer_ro%d={0};if(%.*s.count>0){_zer_ro%d.value=%.*s.data[%.*s.tail];_zer_ro%d.has_value=1;%.*s.tail=(%.*s.tail+1)%%%llu;%.*s.count--;}_zer_ro%d;})",t,(int)ol,on,t,(int)ol,on,(int)ol,on,t,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,(int)ol,on,t); return true;
         }
+        if (ml==12 && !memcmp(mn,"push_checked",12) && node->call.arg_count>0) {
+            /* ring.push_checked(val) → ?void (null if full) */
+            int t=e->temp_count++;
+            emit(e,"({"); emit_type(e,te->ring.elem); emit(e," _zer_rp%d=",t); BA(0);
+            emit(e,";_zer_opt_void _zer_rc%d;if(%.*s.count<%llu){",t,(int)ol,on,(unsigned long long)te->ring.count);
+            emit(e,"_zer_ring_push(%.*s.data,&%.*s.head,&%.*s.tail,&%.*s.count,%llu,&_zer_rp%d,sizeof(_zer_rp%d));",
+                 (int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,t,t);
+            emit(e,"_zer_rc%d=(_zer_opt_void){1};}else{_zer_rc%d=(_zer_opt_void){0};}_zer_rc%d;})",t,t,t);
+            return true;
+        }
     }
     /* Arena */
     if (te->kind == TYPE_ARENA) {
@@ -6203,6 +6213,25 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
                 if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type);
                 emit(e,"),_Alignof("); if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type); emit(e,")))"); return true; }
+        }
+        if (ml==11 && !memcmp(mn,"alloc_slice",11) && node->call.arg_count>1 && node->call.args[0]->kind==NODE_IDENT) {
+            /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
+            Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
+            if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
+                emit(e,"({size_t _zer_an%d=",t); BA(1); emit(e,";");
+                emit(e,"uint8_t *_zer_ap%d=(uint8_t*)_zer_arena_alloc(&%.*s,",t,(int)ol,on);
+                /* sizeof(T)*n */
+                emit(e,"sizeof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,")*_zer_an%d,",t);
+                /* _Alignof(T) */
+                emit(e,"_Alignof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,"));");
+                /* wrap in ?[]T */
+                emit(e,"_zer_ap%d?(",t);
+                Type *slice_t=type_slice(e->arena,ts->type); Type *opt_t=type_optional(e->arena,slice_t);
+                emit_type(e,opt_t); emit(e,"){("); emit_type(e,slice_t); emit(e,"){(");
+                emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_ap%d,_zer_an%d},1}:(",t,t);
+                emit_type(e,opt_t); emit(e,"){0};})");
+                return true;
+            }
         }
     }
     /* Task.new/delete (auto-slab) */
@@ -7183,6 +7212,38 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")%s_zer_cond); pthread_mutex_unlock(&(", cba);
             emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")%s_zer_mtx); })", cba);
+        } else if (nlen == 14 && memcmp(name, "cond_timedwait", 14) == 0 && node->intrinsic.arg_count >= 3) {
+            /* @cond_timedwait(shared_var, cond, timeout_ms) → ?void */
+            Type *ctt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            const char *cta = (ctt && type_unwrap_distinct(ctt)->kind == TYPE_POINTER) ? "->" : ".";
+            int t = e->temp_count++;
+            emit(e, "({ _zer_mtx_ensure_init_cv(&(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx, &(", cta);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx_inited, &(", cta);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond); pthread_mutex_lock(&(", cta);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); struct timespec _zer_ts%d; clock_gettime(CLOCK_REALTIME, &_zer_ts%d); ", cta, t, t);
+            emit(e, "{ uint64_t _zer_ms%d = ", t);
+            emit_rewritten_node(e, node->intrinsic.args[2], func);
+            emit(e, "; _zer_ts%d.tv_sec += _zer_ms%d / 1000; _zer_ts%d.tv_nsec += (_zer_ms%d %% 1000) * 1000000; ", t, t, t, t);
+            emit(e, "if (_zer_ts%d.tv_nsec >= 1000000000) { _zer_ts%d.tv_sec++; _zer_ts%d.tv_nsec -= 1000000000; } } ", t, t, t);
+            emit(e, "_zer_opt_void _zer_tw%d = {0}; ", t);
+            emit(e, "while (!(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ")) { int _zer_tr%d = pthread_cond_timedwait(&(", t);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond, &(", cta);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx, &_zer_ts%d); if (_zer_tr%d) break; } ", cta, t, t);
+            emit(e, "if (");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ") _zer_tw%d.has_value = 1; ", t);
+            emit(e, "pthread_mutex_unlock(&(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); _zer_tw%d; })", cta, t);
         } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 && node->intrinsic.arg_count >= 1) {
             Type *sat = checker_get_type(e->checker, node->intrinsic.args[0]);
             bool sa_ptr = sat && type_unwrap_distinct(sat)->kind == TYPE_POINTER;

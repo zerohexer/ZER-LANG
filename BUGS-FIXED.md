@@ -3990,3 +3990,83 @@ Async poll function returns int (0=pending, 1=done). Bare return from void async
 **Fix:** Added arena.alloc_slice (with ?[]T wrapping), ring.push_checked (with ?void count check), @cond_timedwait (with timespec + pthread_cond_timedwait + pointer vs struct accessor).
 
 **Test:** rust_tests/gen_arena_004.zer, rt_conc_ring_full_drop.zer, rc_cond_006.zer, rt_conc_condvar_timeout.zer
+
+### BUG-534: Switch arm NODE_IDENT values not NODE_FIELD for enum dot syntax (2026-04-16)
+
+**Symptom:** `.red => { }` in enum switch — emitted bare `red` instead of `_ZER_Color_red`. GCC "'red' undeclared" error.
+
+**Root cause:** Parser creates arm values as NODE_IDENT (variant name), not NODE_FIELD. The emitter's direct switch emission checked `arm->values[vi]->kind == NODE_FIELD` — wrong. Same issue for union captures.
+
+**Fix:** Check `NODE_IDENT` for arm values. Emit `_ZER_EnumName_variant` using enum type's name + variant ident name. Union captures: same fix for variant name access.
+
+**Test:** tests/zer/enum_switch.zer, union_variant.zer, state_machine.zer + 15 ZER tests
+
+### BUG-535: Switch arm return without optional wrapping (2026-04-16)
+
+**Symptom:** `return 42` inside enum switch arm in function returning `?u32` — emitted `return 42` but function expects `_zer_opt_u32`. GCC "incompatible types" error.
+
+**Root cause:** Direct switch arm body emission used bare `return expr` without checking if function returns optional. The AST emit_stmt(NODE_RETURN) handles optional wrapping.
+
+**Fix:** In switch arm return handler: check `e->current_func_ret` for TYPE_OPTIONAL, emit `return (OptType){ expr, 1 }` for non-optional expressions, `return null_literal` for NODE_NULL_LIT.
+
+**Test:** rust_tests/rt_drop_defer_in_switch.zer, rt_move_struct_switch_each_ok.zer, scalar_from_struct_call.zer
+
+### BUG-536: Union array variant capture uses C assignment (invalid for arrays) (2026-04-16)
+
+**Symptom:** `__typeof__(_zer_sw0.quad) v = _zer_sw0.quad;` — GCC "invalid initializer" because `quad` is `u32[4]` (array). C can't assign arrays.
+
+**Root cause:** Direct switch emission used `Type v = value` for union captures. Array variants need memcpy.
+
+**Fix:** Emit `Type v; memcpy(&v, &_sw.variant, sizeof(v));` for ALL union captures (safe for both scalar and array types).
+
+**Test:** tests/zer/union_array_variant.zer
+
+### BUG-537: Switch arm bodies missing var-decl/defer/if emission (2026-04-16)
+
+**Symptom:** `Handle h = pool.alloc()` inside switch arm — `'h' undeclared`. Variables declared in arm bodies weren't emitted as C declarations.
+
+**Root cause:** Direct switch arm body walker only handled NODE_EXPR_STMT and NODE_RETURN. NODE_VAR_DECL, NODE_DEFER, NODE_IF were unhandled → fell to `emit_rewritten_node` which emits expressions, not declarations.
+
+**Fix:** Added NODE_VAR_DECL (emit_type_and_name + init), NODE_DEFER (push to defer stack), NODE_IF (condition + then body) handlers in switch arm body walker. All without emit_stmt.
+
+**Test:** rust_tests/rt_drop_defer_in_switch.zer, rt_drop_enum_variant_cleanup.zer, rt_drop_switch_cleanup.zer, rt_nll_enum_switch_alloc.zer
+
+### BUG-534: Switch arm enum values are NODE_IDENT not NODE_FIELD (2026-04-16)
+
+**Symptom:** `switch (color) { .red => ... }` — emitted bare `red` instead of `_ZER_Color_red`. GCC "'red' undeclared" error.
+
+**Root cause:** Parser stores enum dot-syntax arm values as NODE_IDENT (variant name string), not NODE_FIELD. The emitter's switch handler checked `arm->values[vi]->kind == NODE_FIELD` — always false for enum arms.
+
+**Fix:** Check `NODE_IDENT` instead, emit `_ZER_EnumName_variant` from the enum type's name + variant ident name.
+
+**Test:** tests/zer/enum_switch.zer, distinct_enum_switch.zer, state_machine.zer, event_system.zer
+
+### BUG-535: Union immutable capture uses array assignment (invalid C) (2026-04-16)
+
+**Symptom:** `switch (d) { .quad => |v| { ... } }` where quad is `u32[4]` — emitted `__typeof__(...) v = _zer_sw.quad;` which is invalid C (can't assign arrays).
+
+**Root cause:** Union immutable capture used `= value` initialization. Array types can't be C-assigned — need memcpy.
+
+**Fix:** Use `__typeof__(...) v; memcpy(&v, &_zer_sw.variant, sizeof(v));` for all union immutable captures (works for both array and non-array variants).
+
+**Test:** tests/zer/union_array_variant.zer
+
+### BUG-536: Return inside switch arm missing optional wrapping (2026-04-16)
+
+**Symptom:** `return val;` inside enum switch arm where function returns `?u32` — emitted bare `return val;` instead of `return (_zer_opt_u32){ val, 1 };`. GCC "incompatible types" error.
+
+**Root cause:** Switch arm body return emission didn't check function return type for optional wrapping. The AST path's emit_stmt(NODE_RETURN) handles this — the IR switch direct emission didn't.
+
+**Fix:** Check `e->current_func_ret` for TYPE_OPTIONAL in switch arm return. Emit optional wrap `(OptType){ val, 1 }`, null literal, or ?void hoist as appropriate.
+
+**Test:** rust_tests/rt_drop_defer_in_switch.zer, rt_drop_switch_cleanup.zer, rt_move_struct_switch_each_ok.zer
+
+### BUG-537: Switch arm var-decl/defer/if not handled in IR direct emission (2026-04-16)
+
+**Symptom:** `Handle h = alloc();` inside switch arm — `'h' undeclared`. Defer + if inside switch arms also missing.
+
+**Root cause:** IR switch direct emission only handled NODE_EXPR_STMT and NODE_RETURN in arm bodies. NODE_VAR_DECL, NODE_DEFER, NODE_IF were passed to emit_rewritten_node which doesn't emit C declarations.
+
+**Fix:** Added NODE_VAR_DECL (emit type + name + init), NODE_DEFER (push to defer stack), NODE_IF (emit condition + then body) handling in switch arm body walker. All without emit_stmt.
+
+**Test:** rust_tests/rt_drop_defer_in_switch.zer, rt_nll_enum_switch_alloc.zer

@@ -6201,10 +6201,46 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *rt = checker_get_type(e->checker, node->binary.right);
         if (lt) {
             Type *le = type_unwrap_distinct(lt);
-            /* Optional, struct, union can't use == in C — delegate */
-            if (le->kind == TYPE_OPTIONAL || le->kind == TYPE_STRUCT ||
-                le->kind == TYPE_UNION) {
-                emit_expr(e, node);
+            /* Optional: compare against null → has_value check */
+            if (le->kind == TYPE_OPTIONAL && !is_null_sentinel(le->optional.inner)) {
+                if (node->binary.right->kind == NODE_NULL_LIT) {
+                    /* opt == null → (!opt.has_value), opt != null → (opt.has_value) */
+                    if (node->binary.op == TOK_EQEQ) emit(e, "(!");
+                    else emit(e, "(");
+                    emit_rewritten_node(e, node->binary.left, func);
+                    emit(e, ".has_value)");
+                    return;
+                }
+                /* opt == value — compare .value */
+                emit(e, "(");
+                emit_rewritten_node(e, node->binary.left, func);
+                emit(e, ".value %s ", op);
+                emit_rewritten_node(e, node->binary.right, func);
+                emit(e, ")");
+                return;
+            }
+            /* Right side optional */
+            if (rt) {
+                Type *re = type_unwrap_distinct(rt);
+                if (re->kind == TYPE_OPTIONAL && !is_null_sentinel(re->optional.inner)) {
+                    if (node->binary.left->kind == NODE_NULL_LIT) {
+                        if (node->binary.op == TOK_EQEQ) emit(e, "(!");
+                        else emit(e, "(");
+                        emit_rewritten_node(e, node->binary.right, func);
+                        emit(e, ".has_value)");
+                        return;
+                    }
+                    emit(e, "(");
+                    emit_rewritten_node(e, node->binary.left, func);
+                    emit(e, " %s ", op);
+                    emit_rewritten_node(e, node->binary.right, func);
+                    emit(e, ".value)");
+                    return;
+                }
+            }
+            /* Struct, union can't use == in C — not supported in IR path */
+            if (le->kind == TYPE_STRUCT || le->kind == TYPE_UNION) {
+                emit(e, "/* struct/union compare unsupported */ 0");
                 return;
             }
             if (le->kind == TYPE_POINTER && le->pointer.inner &&
@@ -6491,8 +6527,42 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) → delegate to emit_expr (handles all type resolution) */
-            emit_expr(e, node);
+            /* @size(T) → sizeof(CType).
+             * emit_type doesn't handle TYPE_STRUCT/ENUM/UNION directly —
+             * need to emit "struct Name" ourselves. */
+            emit(e, "sizeof(");
+            if (node->intrinsic.type_arg) {
+                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                if (!t && node->intrinsic.type_arg->kind == TYNODE_NAMED) {
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        node->intrinsic.type_arg->named.name,
+                        (uint32_t)node->intrinsic.type_arg->named.name_len);
+                    if (sym) t = sym->type;
+                }
+                if (t) {
+                    Type *te = type_unwrap_distinct(t);
+                    if (te->kind == TYPE_STRUCT) {
+                        if (te->struct_type.is_packed) emit(e, "struct __attribute__((packed)) ");
+                        else emit(e, "struct ");
+                        emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
+                    } else if (te->kind == TYPE_ENUM) {
+                        emit(e, "int32_t"); /* enums are int32_t */
+                    } else if (te->kind == TYPE_UNION) {
+                        emit(e, "struct "); /* unions emit as struct with _tag */
+                        emit(e, "%.*s", (int)te->union_type.name_len, te->union_type.name);
+                    } else {
+                        emit_type(e, t); /* primitives, pointers, etc. */
+                    }
+                } else if (node->intrinsic.type_arg->kind == TYNODE_NAMED) {
+                    /* Last resort: emit struct prefix + name */
+                    emit(e, "struct %.*s",
+                         (int)node->intrinsic.type_arg->named.name_len,
+                         node->intrinsic.type_arg->named.name);
+                }
+            } else if (node->intrinsic.arg_count > 0) {
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+            }
+            emit(e, ")");
             return;
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
             /* @truncate(T, val) → (T)(val) */

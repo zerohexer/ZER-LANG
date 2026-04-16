@@ -6331,11 +6331,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     }
                     return;
                 }
-                /* Opaque, builtins → emit_expr */
+                /* Opaque, builtins — simple . field access */
                 if (ot_eff->kind == TYPE_OPAQUE ||
                     ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
                     ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA) {
-                    emit_expr(e, node);
+                    emit_rewritten_node(e, node->field.object, func);
+                    emit(e, ".%.*s", (int)node->field.field_name_len,
+                         node->field.field_name);
                     return;
                 }
                 if (ot_eff->kind == TYPE_ENUM) {
@@ -6438,16 +6440,90 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_INDEX: {
-        /* Index: delegate to emit_expr for bounds checks + volatile + handle */
-        emit_expr(e, node);
+        /* Index: emit obj[idx] with .ptr for slices.
+         * Bounds checks were already inserted by the checker as auto-guard
+         * instructions — emitted before this expression via emit_auto_guards. */
+        Type *idx_obj_type = checker_get_type(e->checker, node->index_expr.object);
+        bool idx_slice = idx_obj_type && type_unwrap_distinct(idx_obj_type)->kind == TYPE_SLICE;
+        emit_rewritten_node(e, node->index_expr.object, func);
+        if (idx_slice) emit(e, ".ptr");
+        emit(e, "[");
+        emit_rewritten_node(e, node->index_expr.index, func);
+        emit(e, "]");
         return;
     }
 
     case NODE_ASSIGN: {
-        /* Assignments: delegate to emit_expr for full logic
-         * (field writes, compound ops, bit extract, volatile, optional wrap,
-         * array memcpy, shared struct locking). */
-        emit_expr(e, node);
+        /* Assignments: emit target op= value from rewritten AST.
+         * Complex patterns (bit extract, volatile array, shared lock) need emit_expr. */
+        /* Check for complex patterns that need emit_expr */
+        Type *tgt_type = checker_get_type(e->checker, node->assign.target);
+        Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+        /* Bit extract (reg[hi..lo] = val) — has NODE_SLICE target */
+        if (node->assign.target && node->assign.target->kind == NODE_SLICE) {
+            emit_expr(e, node);
+            return;
+        }
+        /* Volatile array assignment — needs byte loop */
+        if (tgt_eff && tgt_eff->kind == TYPE_ARRAY) {
+            emit_expr(e, node);
+            return;
+        }
+        /* Shared struct locking */
+        if (tgt_eff && tgt_eff->kind == TYPE_STRUCT && tgt_eff->struct_type.is_shared) {
+            emit_expr(e, node);
+            return;
+        }
+        /* Simple assignment: target op= value */
+        const char *aop = "=";
+        switch (node->assign.op) {
+        case TOK_EQ: aop = "="; break;
+        case TOK_PLUSEQ: aop = "+="; break; case TOK_MINUSEQ: aop = "-="; break;
+        case TOK_STAREQ: aop = "*="; break; case TOK_SLASHEQ: aop = "/="; break;
+        case TOK_PERCENTEQ: aop = "%="; break;
+        case TOK_AMPEQ: aop = "&="; break; case TOK_PIPEEQ: aop = "|="; break;
+        case TOK_CARETEQ: aop = "^="; break;
+        case TOK_LSHIFTEQ: aop = "<<="; break; case TOK_RSHIFTEQ: aop = ">>="; break;
+        default: break;
+        }
+        /* Optional wrapping on assignment: target = (OptType){ value, 1 } */
+        if (node->assign.op == TOK_EQ && tgt_eff &&
+            tgt_eff->kind == TYPE_OPTIONAL && !is_null_sentinel(tgt_eff->optional.inner)) {
+            Type *val_type = checker_get_type(e->checker, node->assign.value);
+            Type *val_eff = val_type ? type_unwrap_distinct(val_type) : NULL;
+            if (node->assign.value->kind == NODE_NULL_LIT) {
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, " = ");
+                emit_opt_null_literal(e, tgt_eff);
+                return;
+            }
+            if (val_eff && val_eff->kind != TYPE_OPTIONAL) {
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, " = (");
+                emit_type(e, tgt_eff);
+                emit(e, "){ ");
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ", 1 }");
+                return;
+            }
+        }
+        /* Array → slice coercion on assignment */
+        if (node->assign.op == TOK_EQ && tgt_eff && tgt_eff->kind == TYPE_SLICE) {
+            Type *val_type = checker_get_type(e->checker, node->assign.value);
+            Type *val_eff = val_type ? type_unwrap_distinct(val_type) : NULL;
+            if (val_eff && val_eff->kind == TYPE_ARRAY) {
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, " = (");
+                emit_type(e, tgt_eff);
+                emit(e, "){ ");
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ", %u }", (unsigned)val_eff->array.size);
+                return;
+            }
+        }
+        emit_rewritten_node(e, node->assign.target, func);
+        emit(e, " %s ", aop);
+        emit_rewritten_node(e, node->assign.value, func);
         return;
     }
 
@@ -6527,13 +6603,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) → sizeof(CType).
-             * emit_type doesn't handle TYPE_STRUCT/ENUM/UNION directly —
-             * need to emit "struct Name" ourselves. */
+            /* @size(T) — delegate to emit_expr for reliable type resolution.
+             * resolve_tynode has hash collision issues with TypeNode* cast to Node*. */
+            emit_expr(e, node);
+            return;
+        } else if (0 && nlen == 4 && memcmp(name, "size_DISABLED", 4) == 0) {
+            /* Disabled — kept for reference. Direct sizeof emission. */
             emit(e, "sizeof(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                if (!t && node->intrinsic.type_arg->kind == TYNODE_NAMED) {
+                Type *t = NULL;
+                if (node->intrinsic.type_arg->kind == TYNODE_NAMED) {
                     Symbol *sym = scope_lookup(e->checker->global_scope,
                         node->intrinsic.type_arg->named.name,
                         (uint32_t)node->intrinsic.type_arg->named.name_len);
@@ -6558,6 +6637,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit(e, "struct %.*s",
                          (int)node->intrinsic.type_arg->named.name_len,
                          node->intrinsic.type_arg->named.name);
+                } else {
+                    /* Primitive type — resolve_tynode handles these */
+                    t = resolve_tynode(e, node->intrinsic.type_arg);
+                    if (t) emit_type(e, t);
                 }
             } else if (node->intrinsic.arg_count > 0) {
                 emit_rewritten_node(e, node->intrinsic.args[0], func);

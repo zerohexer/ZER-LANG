@@ -1198,6 +1198,38 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
         if (sw_eff && (sw_eff->kind == TYPE_UNION || sw_eff->kind == TYPE_OPTIONAL ||
                        sw_eff->kind == TYPE_ENUM)) {
+            /* Deep-rewrite idents in switch expression AND all arm bodies.
+             * rewrite_idents only walks expressions — need to walk statements too. */
+            rewrite_idents(ctx, node->switch_stmt.expr);
+            for (int ai = 0; ai < node->switch_stmt.arm_count; ai++) {
+                Node *ab = node->switch_stmt.arms[ai].body;
+                if (!ab) continue;
+                if (ab->kind == NODE_BLOCK) {
+                    for (int si = 0; si < ab->block.stmt_count; si++) {
+                        Node *s = ab->block.stmts[si];
+                        if (!s) continue;
+                        if (s->kind == NODE_EXPR_STMT)
+                            rewrite_idents(ctx, s->expr_stmt.expr);
+                        else if (s->kind == NODE_RETURN)
+                            rewrite_idents(ctx, s->ret.expr);
+                        else if (s->kind == NODE_VAR_DECL)
+                            rewrite_idents(ctx, s->var_decl.init);
+                        else if (s->kind == NODE_DEFER && s->defer.body) {
+                            if (s->defer.body->kind == NODE_BLOCK) {
+                                for (int di = 0; di < s->defer.body->block.stmt_count; di++) {
+                                    Node *ds = s->defer.body->block.stmts[di];
+                                    if (ds && ds->kind == NODE_EXPR_STMT)
+                                        rewrite_idents(ctx, ds->expr_stmt.expr);
+                                }
+                            } else if (s->defer.body->kind == NODE_EXPR_STMT) {
+                                rewrite_idents(ctx, s->defer.body->expr_stmt.expr);
+                            }
+                        }
+                    }
+                } else {
+                    rewrite_idents(ctx, ab);
+                }
+            }
             IRInst pass = make_inst(IR_NOP, node->loc.line);
             pass.expr = node;
             emit_inst(ctx, pass);

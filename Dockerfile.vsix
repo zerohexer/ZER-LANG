@@ -32,9 +32,9 @@ RUN mkdir -p /ext/bin/win32-x64 /ext/bin/linux-x64 /ext/bin/darwin-x64 /ext/bin/
 
 # ---- Windows x64 ----
 RUN x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zerc.exe \
-    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && \
+    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c && \
     x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zer-lsp.exe \
-    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c
+    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c
 
 # Bundle portable GCC for Windows
 RUN cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
@@ -42,22 +42,22 @@ RUN cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
 
 # ---- Linux x64 (native gcc:13) ----
 RUN gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zerc \
-    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && \
+    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c && \
     gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zer-lsp \
-    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c
+    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c
 # Linux users have gcc installed — no need to bundle
 
 # ---- macOS x64 + arm64 ----
 # macOS cross-compilation requires osxcross + macOS SDK (legal gray area).
 # Instead: build as C source bundle — macOS users compile on first run.
-RUN cp lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c zer_lsp.c \
-       lexer.h parser.h ast.h types.h checker.h emitter.h zercheck.h \
+RUN cp lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c zer_lsp.c \
+       lexer.h parser.h ast.h types.h checker.h emitter.h zercheck.h ir.h \
        /ext/bin/darwin-x64/ && \
     cp /ext/bin/darwin-x64/* /ext/bin/darwin-arm64/ 2>/dev/null; true && \
     echo '#!/bin/bash' > /ext/bin/darwin-x64/build.sh && \
     echo 'DIR="$(cd "$(dirname "$0")" && pwd)"' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zerc" "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/zerc_main.c' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zer-lsp" "$DIR"/zer_lsp.c "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zerc" "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/ir.c "$DIR"/ir_lower.c "$DIR"/zerc_main.c' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zer-lsp" "$DIR"/zer_lsp.c "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/ir.c "$DIR"/ir_lower.c' >> /ext/bin/darwin-x64/build.sh && \
     echo 'echo "ZER: compiled zerc and zer-lsp for macOS"' >> /ext/bin/darwin-x64/build.sh && \
     chmod +x /ext/bin/darwin-x64/build.sh && \
     cp /ext/bin/darwin-x64/build.sh /ext/bin/darwin-arm64/build.sh

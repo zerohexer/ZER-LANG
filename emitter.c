@@ -6254,7 +6254,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (lid < 0) {
                 /* Not a local — check scope for module-prefixed symbol */
                 Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
-                if (sym && sym->is_function && sym->module_prefix) {
+                if (sym && sym->module_prefix) {
                     emit(e, "%.*s__%.*s",
                          (int)sym->module_prefix_len, sym->module_prefix,
                          (int)ilen, iname);

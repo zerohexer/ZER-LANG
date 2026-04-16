@@ -5511,13 +5511,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         /* Spawn wrappers (between struct decls and functions) */
         emit_spawn_wrappers(e);
 
-        /* Pass 2: functions, globals */
+        /* Pass 2a: globals first (ensures cross-module references work) */
+        for (int i = 0; i < file_node->file.decl_count; i++) {
+            Node *d = file_node->file.decls[i];
+            if (d->kind == NODE_GLOBAL_VAR)
+                emit_top_level_decl(e, d, file_node, i);
+        }
+        /* Pass 2b: functions */
         for (int i = 0; i < file_node->file.decl_count; i++) {
             Node *d = file_node->file.decls[i];
             if (d->kind == NODE_IMPORT || d->kind == NODE_CINCLUDE) continue;
             if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
                 d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
-                d->kind != NODE_CONTAINER_DECL)
+                d->kind != NODE_CONTAINER_DECL && d->kind != NODE_GLOBAL_VAR)
                 emit_top_level_decl(e, d, file_node, i);
         }
         return;
@@ -6253,18 +6259,37 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
             if (lid < 0) {
                 /* Not a local — apply module name mangling.
-                 * Same logic as EMIT_MANGLED_NAME: if we're emitting code
-                 * from an imported module, ALL non-local idents from that
-                 * module need the module__ prefix in C. */
+                 * For functions: use symbol's module_prefix (functions are
+                 * unique per name across modules).
+                 * For variables in current module: use e->current_module
+                 * (same-named variables in different modules need correct prefix).
+                 * This matches EMIT_MANGLED_NAME for the current module's own
+                 * symbols, and symbol->module_prefix for cross-module calls. */
                 Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
                 if (sym && sym->module_prefix) {
-                    emit(e, "%.*s__%.*s",
-                         (int)sym->module_prefix_len, sym->module_prefix,
-                         (int)ilen, iname);
+                    /* Symbol found in scope with module prefix.
+                     * If it's a function, always use its own module_prefix.
+                     * If it's a variable and we're in a module, use current_module
+                     * (prevents wrong module's same-named variable being used). */
+                    if (sym->is_function) {
+                        emit(e, "%.*s__%.*s",
+                             (int)sym->module_prefix_len, sym->module_prefix,
+                             (int)ilen, iname);
+                    } else if (e->current_module) {
+                        /* Variable in current module context */
+                        emit(e, "%.*s__%.*s",
+                             (int)e->current_module_len, e->current_module,
+                             (int)ilen, iname);
+                    } else {
+                        /* Main module referencing imported variable */
+                        emit(e, "%.*s__%.*s",
+                             (int)sym->module_prefix_len, sym->module_prefix,
+                             (int)ilen, iname);
+                    }
                     return;
                 }
-                /* For idents in the CURRENT module context (imported module
-                 * function referencing its own globals), use current_module */
+                /* No symbol found — if in a module context, assume
+                 * module-private (static) variable → use current_module prefix */
                 if (!sym && e->current_module) {
                     emit(e, "%.*s__%.*s",
                          (int)e->current_module_len, e->current_module,

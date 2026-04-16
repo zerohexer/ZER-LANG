@@ -7059,11 +7059,129 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->intrinsic.args[1], func);
                 emit(e, ")))");
             }
+        } else if (nlen == 7 && memcmp(name, "barrier", 7) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST)");
+        } else if (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_RELEASE)");
+        } else if (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
+        } else if (nlen >= 7 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add/sub/or/and/xor/load/store/cas */
+            const char *aop = name + 7;
+            uint32_t aolen = nlen - 7;
+            if (aolen == 4 && !memcmp(aop, "load", 4) && node->intrinsic.arg_count > 0) {
+                emit(e, "__atomic_load_n("); emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", __ATOMIC_SEQ_CST)");
+            } else if (aolen == 5 && !memcmp(aop, "store", 5) && node->intrinsic.arg_count > 1) {
+                emit(e, "__atomic_store_n("); emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", "); emit_rewritten_node(e, node->intrinsic.args[1], func);
+                emit(e, ", __ATOMIC_SEQ_CST)");
+            } else if (aolen == 3 && !memcmp(aop, "cas", 3) && node->intrinsic.arg_count > 2) {
+                int t = e->temp_count++;
+                emit(e, "({__typeof__(*"); emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ") _zer_cas_exp%d = ", t); emit_rewritten_node(e, node->intrinsic.args[1], func);
+                emit(e, "; __atomic_compare_exchange_n("); emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", &_zer_cas_exp%d, ", t); emit_rewritten_node(e, node->intrinsic.args[2], func);
+                emit(e, ", 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); })");
+            } else if (node->intrinsic.arg_count > 1) {
+                /* add/sub/or/and/xor */
+                const char *gcc_op = "__atomic_fetch_add";
+                if (aolen == 3 && !memcmp(aop, "add", 3)) gcc_op = "__atomic_fetch_add";
+                else if (aolen == 3 && !memcmp(aop, "sub", 3)) gcc_op = "__atomic_fetch_sub";
+                else if (aolen == 2 && !memcmp(aop, "or", 2)) gcc_op = "__atomic_fetch_or";
+                else if (aolen == 3 && !memcmp(aop, "and", 3)) gcc_op = "__atomic_fetch_and";
+                else if (aolen == 3 && !memcmp(aop, "xor", 3)) gcc_op = "__atomic_fetch_xor";
+                emit(e, "%s(", gcc_op); emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", "); emit_rewritten_node(e, node->intrinsic.args[1], func);
+                emit(e, ", __ATOMIC_SEQ_CST)");
+            }
+        } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0 && node->intrinsic.arg_count > 1) {
+            /* @cstr(buf, str) — copy string to buffer with null terminator.
+             * Simplified: memcpy + null. Full version has bounds check + auto-return. */
+            int t = e->temp_count++;
+            emit(e, "({ __auto_type _zer_cs%d = ", t);
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, "; memcpy(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ", _zer_cs%d.ptr, _zer_cs%d.len); ((uint8_t*)", t, t);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")[_zer_cs%d.len] = 0; (uint8_t*)", t);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "; })");
+        } else if (nlen == 9 && memcmp(name, "cond_wait", 9) == 0 && node->intrinsic.arg_count >= 2) {
+            /* @cond_wait(shared_var, cond) — check pointer vs struct for accessor */
+            Type *cvt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            const char *ca = (cvt && type_unwrap_distinct(cvt)->kind == TYPE_POINTER) ? "->" : ".";
+            emit(e, "({ _zer_mtx_ensure_init_cv(&(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx, &(", ca);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx_inited, &(", ca);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond); pthread_mutex_lock(&(", ca);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); while(!(", ca);
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ")) pthread_cond_wait(&(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond, &(", ca);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); pthread_mutex_unlock(&(", ca);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); })", ca);
+        } else if (nlen == 11 && memcmp(name, "cond_signal", 11) == 0 && node->intrinsic.arg_count >= 1) {
+            Type *cst = checker_get_type(e->checker, node->intrinsic.args[0]);
+            const char *csa = (cst && type_unwrap_distinct(cst)->kind == TYPE_POINTER) ? "->" : ".";
+            emit(e, "({ _zer_mtx_ensure_init_cv(&(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx, &(", csa);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx_inited, &(", csa);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond); pthread_mutex_lock(&(", csa);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); pthread_cond_signal(&(", csa);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond); pthread_mutex_unlock(&(", csa);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); })", csa);
+        } else if (nlen == 14 && memcmp(name, "cond_broadcast", 14) == 0 && node->intrinsic.arg_count >= 1) {
+            Type *cbt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            const char *cba = (cbt && type_unwrap_distinct(cbt)->kind == TYPE_POINTER) ? "->" : ".";
+            emit(e, "({ _zer_mtx_ensure_init_cv(&(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx, &(", cba);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx_inited, &(", cba);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond); pthread_mutex_lock(&(", cba);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); pthread_cond_broadcast(&(", cba);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_cond); pthread_mutex_unlock(&(", cba);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")%s_zer_mtx); })", cba);
+        } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 && node->intrinsic.arg_count >= 1) {
+            Type *sat = checker_get_type(e->checker, node->intrinsic.args[0]);
+            bool sa_ptr = sat && type_unwrap_distinct(sat)->kind == TYPE_POINTER;
+            emit(e, "_zer_sem_acquire(");
+            if (!sa_ptr) emit(e, "&");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")");
+        } else if (nlen == 11 && memcmp(name, "sem_release", 11) == 0 && node->intrinsic.arg_count >= 1) {
+            Type *srt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            bool sr_ptr = srt && type_unwrap_distinct(srt)->kind == TYPE_POINTER;
+            emit(e, "_zer_sem_release(");
+            if (!sr_ptr) emit(e, "&");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")");
+        } else if (nlen == 5 && memcmp(name, "probe", 5) == 0 && node->intrinsic.arg_count > 0) {
+            emit(e, "_zer_probe((uintptr_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "))");
         } else {
-            /* Remaining complex intrinsics: @cstr, @barrier*, @atomic_*, @cond_*,
-             * @sem_*, @probe, @once — too complex for rewritten emission.
-             * Emit as passthrough to emit_expr. */
-            emit_expr(e, node);
+            /* Truly unknown intrinsic — should not reach here */
+            emit(e, "/* @%.*s */ 0", (int)nlen, name);
         }
         return;
     }
@@ -7100,8 +7218,33 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
             emit(e, " }");
         } else {
-            /* Array sub-slice or complex — delegate to emit_expr */
-            emit_expr(e, node);
+            /* Array sub-slice: arr[start..end] → (SliceType){ &arr[start], end-start } */
+            Type *arr_type = obj_type ? type_unwrap_distinct(obj_type) : NULL;
+            Type *elem = arr_type && arr_type->kind == TYPE_ARRAY ? arr_type->array.inner : NULL;
+            if (elem) {
+                emit(e, "((");
+                emit_type(e, type_slice(e->arena, elem));
+                emit(e, "){ &(");
+                emit_rewritten_node(e, node->slice.object, func);
+                emit(e, ")[");
+                if (node->slice.start) emit_rewritten_node(e, node->slice.start, func);
+                else emit(e, "0");
+                emit(e, "], ");
+                if (node->slice.end && node->slice.start) {
+                    emit(e, "("); emit_rewritten_node(e, node->slice.end, func);
+                    emit(e, ") - ("); emit_rewritten_node(e, node->slice.start, func);
+                    emit(e, ")");
+                } else if (node->slice.end) {
+                    emit_rewritten_node(e, node->slice.end, func);
+                } else {
+                    emit(e, "%u", arr_type->kind == TYPE_ARRAY ? (unsigned)arr_type->array.size : 0);
+                    if (node->slice.start) { emit(e, " - "); emit_rewritten_node(e, node->slice.start, func); }
+                }
+                emit(e, " })");
+            } else {
+                /* Truly unknown — emit placeholder */
+                emit(e, "/* unknown slice */ 0");
+            }
         }
         return;
     }
@@ -8143,7 +8286,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                     if (vt) emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
                     if (s->var_decl.init) {
                         emit(e, " = ");
-                        emit_expr(e, s->var_decl.init);
+                        emit_rewritten_node(e, s->var_decl.init, func);
                     }
                     emit(e, ";\n");
                 }

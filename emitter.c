@@ -6229,6 +6229,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, " = ");
         }
 
+        /* If no decomposed args, must be builtin/comptime (lowering skipped decomposition) */
+        if (!inst->call_arg_locals) is_builtin = true;
+
         if (is_builtin || is_comptime) {
             /* Builtins/comptime need emit_expr for inline C generation */
             if (inst->expr) emit_expr(e, inst->expr);
@@ -6348,9 +6351,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 }
             }
             emit(e, ")");
-        } else if (inst->expr) {
-            /* Safety net for calls with NULL call_arg_locals */
-            emit_expr(e, inst->expr);
         }
         emit(e, ";\n");
         break;

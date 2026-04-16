@@ -1189,17 +1189,17 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Switch: chain of branches ---- */
     case NODE_SWITCH: {
-        /* Union/optional switch: complex tag-based dispatch.
-         * Pass through as AST node — emitter handles via emit_stmt. */
+        /* Union/optional/enum switch: complex tag/has_value dispatch.
+         * Pass through as AST node — emitter handles via emit_stmt.
+         * This is the ONLY remaining emit_stmt in the IR function body path.
+         * Eliminating requires: lower tag comparison to IR_BRANCH, union
+         * capture to IR_ASSIGN, arm bodies already lowered. ~150 lines. */
         Type *sw_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
         Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
-        /* Enum/union/optional switch: pass through to AST emission.
-         * IR_BRANCH can't express enum variant/union tag comparison.
-         * Integer/bool switch: lowered to IR branches (simple value compare). */
         if (sw_eff && (sw_eff->kind == TYPE_UNION || sw_eff->kind == TYPE_OPTIONAL ||
                        sw_eff->kind == TYPE_ENUM)) {
             IRInst pass = make_inst(IR_NOP, node->loc.line);
-            pass.expr = node; /* emit_stmt handles union/optional switch */
+            pass.expr = node;
             emit_inst(ctx, pass);
             break;
         }

@@ -6367,6 +6367,33 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (obj_type) {
                 Type *oe = type_unwrap_distinct(obj_type);
                 if (oe->kind == TYPE_POINTER) acc = "->";
+                /* Handle auto-deref: emit get() → -> */
+                if (oe->kind == TYPE_HANDLE) {
+                    Type *elem = oe->handle.elem;
+                    Symbol *alloc_sym = find_unique_allocator(e->checker->global_scope, elem);
+                    if (alloc_sym) {
+                        Type *alloc_type = type_unwrap_distinct(alloc_sym->type);
+                        emit(e, "((");
+                        emit_type(e, type_pointer(e->arena, elem));
+                        if (alloc_type->kind == TYPE_SLAB) {
+                            emit(e, ")_zer_slab_get(&%.*s, ",
+                                 (int)alloc_sym->name_len, alloc_sym->name);
+                        } else if (alloc_type->kind == TYPE_POOL) {
+                            emit(e, ")_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
+                                 "sizeof(%.*s.slots[0]), ",
+                                 (int)alloc_sym->name_len, alloc_sym->name,
+                                 (int)alloc_sym->name_len, alloc_sym->name,
+                                 (int)alloc_sym->name_len, alloc_sym->name,
+                                 (int)alloc_sym->name_len, alloc_sym->name);
+                        }
+                        emit_rewritten_node(e, node->field.object, func);
+                        if (alloc_type->kind == TYPE_POOL)
+                            emit(e, ", %llu", (unsigned long long)alloc_type->pool.count);
+                        emit(e, "))->%.*s",
+                             (int)node->field.field_name_len, node->field.field_name);
+                        return;
+                    }
+                }
             }
             emit_rewritten_node(e, node->field.object, func);
             emit(e, "%s%.*s", acc, (int)node->field.field_name_len, node->field.field_name);

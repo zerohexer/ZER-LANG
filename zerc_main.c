@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
     bool do_run = false;
     bool emit_c = false;
     bool emit_ir = false;
-    bool use_ir = false;
+    bool use_ir = false; /* IR path ready for single-file (195/195). Multi-module needs mangling work. --use-ir to enable. */
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
@@ -207,7 +207,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             emit_ir = true;
         } else if (strcmp(argv[i], "--use-ir") == 0) {
-            use_ir = true;
+            use_ir = true; /* explicit — same as default now */
+        } else if (strcmp(argv[i], "--no-ir") == 0) {
+            use_ir = false; /* fallback to AST emission for debugging */
         } else if (strcmp(argv[i], "--lib") == 0) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {

@@ -6603,9 +6603,45 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) — delegate to emit_expr for reliable type resolution.
-             * resolve_tynode has hash collision issues with TypeNode* cast to Node*. */
-            emit_expr(e, node);
+            /* @size(T) → sizeof(CType) — direct type name emission.
+             * Don't use resolve_tynode (TypeNode*→Node* hash collision). */
+            emit(e, "sizeof(");
+            if (node->intrinsic.type_arg) {
+                TypeNode *ta = node->intrinsic.type_arg;
+                if (ta->kind == TYNODE_NAMED) {
+                    /* Named type: look up in scope for C name */
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        ta->named.name, (uint32_t)ta->named.name_len);
+                    if (sym && sym->type) {
+                        Type *te = type_unwrap_distinct(sym->type);
+                        if (te->kind == TYPE_STRUCT) {
+                            if (te->struct_type.is_packed)
+                                emit(e, "struct __attribute__((packed)) ");
+                            else emit(e, "struct ");
+                            if (te->struct_type.module_prefix) {
+                                emit(e, "%.*s__%.*s",
+                                     (int)te->struct_type.module_prefix_len, te->struct_type.module_prefix,
+                                     (int)te->struct_type.name_len, te->struct_type.name);
+                            } else {
+                                emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
+                            }
+                        } else if (te->kind == TYPE_UNION) {
+                            emit(e, "struct %.*s", (int)te->union_type.name_len, te->union_type.name);
+                        } else {
+                            emit_type(e, sym->type);
+                        }
+                    } else {
+                        emit(e, "struct %.*s", (int)ta->named.name_len, ta->named.name);
+                    }
+                } else {
+                    /* Keyword type (u32, i8, etc.) */
+                    Type *t = resolve_type_for_emit(e, ta);
+                    if (t) emit_type(e, t);
+                }
+            } else if (node->intrinsic.arg_count > 0) {
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+            }
+            emit(e, ")");
             return;
         } else if (0 && nlen == 4 && memcmp(name, "size_DISABLED", 4) == 0) {
             /* Disabled — kept for reference. Direct sizeof emission. */

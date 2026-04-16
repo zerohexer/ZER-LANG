@@ -6131,7 +6131,10 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
  * DOES NOT CALL emit_expr. Each node type emitted directly.
  * For sub-expressions, calls itself recursively.
  * ================================================================ */
-static void emit_rewritten_node(Emitter *e, Node *node) {
+/* Forward declaration for recursive calls */
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func);
+
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
     switch (node->kind) {
@@ -6200,17 +6203,17 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             if (le->kind == TYPE_POINTER && le->pointer.inner &&
                 type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE) {
                 emit(e, "(");
-                emit_rewritten_node(e, node->binary.left);
+                emit_rewritten_node(e, node->binary.left, func);
                 emit(e, ".ptr %s ", op);
-                emit_rewritten_node(e, node->binary.right);
+                emit_rewritten_node(e, node->binary.right, func);
                 emit(e, ".ptr)");
                 return;
             }
         }
         emit(e, "(");
-        emit_rewritten_node(e, node->binary.left);
+        emit_rewritten_node(e, node->binary.left, func);
         emit(e, " %s ", op);
-        emit_rewritten_node(e, node->binary.right);
+        emit_rewritten_node(e, node->binary.right, func);
         emit(e, ")");
         return;
     }
@@ -6224,7 +6227,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
         case TOK_AMP: emit(e, "&"); break;
         default: break;
         }
-        emit_rewritten_node(e, node->unary.operand);
+        emit_rewritten_node(e, node->unary.operand, func);
         return;
 
     case NODE_FIELD: {
@@ -6236,6 +6239,17 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                     node->field.object->ident.name,
                     (uint32_t)node->field.object->ident.name_len);
                 if (sym) ot = sym->type;
+            }
+            /* Fallback: look up in IR locals (rewritten idents use IR local C names) */
+            if (!ot && func) {
+                for (int li = 0; li < func->local_count; li++) {
+                    if (func->locals[li].name_len == (uint32_t)node->field.object->ident.name_len &&
+                        memcmp(func->locals[li].name, node->field.object->ident.name,
+                               func->locals[li].name_len) == 0) {
+                        ot = func->locals[li].type;
+                        break;
+                    }
+                }
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);
@@ -6251,7 +6265,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                             emit_type(e, type_pointer(e->arena, elem));
                             emit(e, ")_zer_slab_get(&%.*s, ",
                                  (int)alloc_sym->name_len, alloc_sym->name);
-                            emit_rewritten_node(e, node->field.object);
+                            emit_rewritten_node(e, node->field.object, func);
                             emit(e, "))->%.*s",
                                  (int)node->field.field_name_len, node->field.field_name);
                         } else if (alloc_type->kind == TYPE_POOL) {
@@ -6263,7 +6277,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                                  (int)alloc_sym->name_len, alloc_sym->name,
                                  (int)alloc_sym->name_len, alloc_sym->name,
                                  (int)alloc_sym->name_len, alloc_sym->name);
-                            emit_rewritten_node(e, node->field.object);
+                            emit_rewritten_node(e, node->field.object, func);
                             emit(e, ", %llu))->%.*s",
                                  (unsigned long long)alloc_type->pool.count,
                                  (int)node->field.field_name_len, node->field.field_name);
@@ -6300,7 +6314,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 }
                 /* Slice .ptr/.len */
                 if (ot_eff->kind == TYPE_SLICE) {
-                    emit_rewritten_node(e, node->field.object);
+                    emit_rewritten_node(e, node->field.object, func);
                     emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
                     return;
                 }
@@ -6314,14 +6328,14 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 }
                 /* Pointer → use -> */
                 if (ot_eff->kind == TYPE_POINTER) {
-                    emit_rewritten_node(e, node->field.object);
+                    emit_rewritten_node(e, node->field.object, func);
                     emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
                     return;
                 }
             }
         }
         /* Default: struct field access with . */
-        emit_rewritten_node(e, node->field.object);
+        emit_rewritten_node(e, node->field.object, func);
         emit(e, ".%.*s", (int)node->field.field_name_len, node->field.field_name);
         return;
     }
@@ -6373,11 +6387,11 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 }
             }
         }
-        emit_rewritten_node(e, node->call.callee);
+        emit_rewritten_node(e, node->call.callee, func);
         emit(e, "(");
         for (int i = 0; i < node->call.arg_count; i++) {
             if (i > 0) emit(e, ", ");
-            emit_rewritten_node(e, node->call.args[i]);
+            emit_rewritten_node(e, node->call.args[i], func);
         }
         emit(e, ")");
         return;
@@ -6405,7 +6419,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             }
             emit(e, ")(");
             if (node->intrinsic.arg_count > 0)
-                emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp to T range */
@@ -6414,7 +6428,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, "; ");
                 int w = type_width(t);
                 bool is_signed = type_is_signed(t);
@@ -6440,7 +6454,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 int tmp2 = e->temp_count++;
                 emit(e, "({__auto_type _zer_bci%d = ", tmp2);
                 if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, "; ");
                 emit_type(e, t);
                 emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
@@ -6455,7 +6469,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             }
             emit(e, ")(");
             if (node->intrinsic.arg_count > 0)
-                emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")");
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
             /* @offset(T, field) → offsetof */
@@ -6465,14 +6479,14 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 emit_type(e, t);
                 emit(e, ", ");
                 if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
             }
             emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
             /* @ptrtoint(ptr) → (uintptr_t)(ptr) */
             emit(e, "(uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
-                emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"trap\", __FILE__, __LINE__)");
@@ -6498,7 +6512,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, "), %u}", (unsigned)tid);
             } else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
                        src_eff &&
@@ -6517,7 +6531,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
                     if (node->intrinsic.arg_count > 0)
-                        emit_rewritten_node(e, node->intrinsic.args[0]);
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
                     emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
                          "_zer_trap(\"@ptrcast type mismatch\", __FILE__, __LINE__); (",
                          tmp, (unsigned)expected_tid, tmp);
@@ -6528,7 +6542,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                     if (tgt_type) emit_type(e, tgt_type);
                     emit(e, ")(");
                     if (node->intrinsic.arg_count > 0)
-                        emit_rewritten_node(e, node->intrinsic.args[0]);
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
                     emit(e, ").ptr)");
                 }
             } else {
@@ -6537,7 +6551,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 if (tgt_type) emit_type(e, tgt_type);
                 emit(e, ")(");
                 if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, ")");
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
@@ -6548,7 +6562,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 emit_type(e, t);
                 emit(e, ")(uintptr_t)(");
                 if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0]);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, "))");
             }
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
@@ -6558,7 +6572,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                 emit(e, "((");
                 emit_type(e, t);
                 emit(e, ")((char*)(");
-                emit_rewritten_node(e, node->intrinsic.args[0]);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, ") - offsetof(");
                 /* Emit the struct type for offsetof */
                 if (t) {
@@ -6567,7 +6581,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
                     emit_type(e, inner);
                 }
                 emit(e, ", ");
-                emit_rewritten_node(e, node->intrinsic.args[1]);
+                emit_rewritten_node(e, node->intrinsic.args[1], func);
                 emit(e, ")))");
             }
         } else {
@@ -6588,25 +6602,25 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             emit(e, "(");
             emit_type(e, obj_type);
             emit(e, "){ &(");
-            emit_rewritten_node(e, node->slice.object);
+            emit_rewritten_node(e, node->slice.object, func);
             emit(e, ".ptr)[");
-            if (node->slice.start) emit_rewritten_node(e, node->slice.start);
+            if (node->slice.start) emit_rewritten_node(e, node->slice.start, func);
             else emit(e, "0");
             emit(e, "], ");
             if (node->slice.end && node->slice.start) {
                 emit(e, "(");
-                emit_rewritten_node(e, node->slice.end);
+                emit_rewritten_node(e, node->slice.end, func);
                 emit(e, ") - (");
-                emit_rewritten_node(e, node->slice.start);
+                emit_rewritten_node(e, node->slice.start, func);
                 emit(e, ")");
             } else if (node->slice.end) {
-                emit_rewritten_node(e, node->slice.end);
+                emit_rewritten_node(e, node->slice.end, func);
             } else {
-                emit_rewritten_node(e, node->slice.object);
+                emit_rewritten_node(e, node->slice.object, func);
                 emit(e, ".len");
                 if (node->slice.start) {
                     emit(e, " - ");
-                    emit_rewritten_node(e, node->slice.start);
+                    emit_rewritten_node(e, node->slice.start, func);
                 }
             }
             emit(e, " }");
@@ -6625,7 +6639,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             emit_type(e, t);
         }
         emit(e, ")");
-        emit_rewritten_node(e, node->typecast.expr);
+        emit_rewritten_node(e, node->typecast.expr, func);
         emit(e, ")");
         return;
     }
@@ -6643,7 +6657,7 @@ static void emit_rewritten_node(Emitter *e, Node *node) {
             if (i > 0) emit(e, ", ");
             emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
                  node->struct_init.fields[i].name);
-            emit_rewritten_node(e, node->struct_init.fields[i].value);
+            emit_rewritten_node(e, node->struct_init.fields[i].value, func);
         }
         emit(e, " }");
         return;
@@ -6702,18 +6716,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (need_null) {
                 emit_opt_null_literal(e, dst_eff);
             } else if (need_wrap) {
-                emit_opt_wrap_value(e, dst_eff, inst->expr);
+                /* Inline wrap: (OptType){ value, 1 } — uses emit_rewritten_node */
+                emit(e, "(");
+                emit_type(e, dst_eff);
+                emit(e, "){ ");
+                emit_rewritten_node(e, inst->expr, func);
+                emit(e, ", 1 }");
             } else if (need_slice) {
                 emit_array_as_slice(e, inst->expr, src_type, dst_type);
             } else {
-                emit_rewritten_node(e, inst->expr);
+                emit_rewritten_node(e, inst->expr, func);
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
-            emit_rewritten_node(e, inst->expr);
+            emit_rewritten_node(e, inst->expr, func);
             emit(e, ";\n");
         }
         break;
@@ -6764,7 +6783,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (is_builtin || is_comptime) {
             /* Builtins/comptime — emit_rewritten_node(NODE_CALL) detects
              * builtins and delegates to emit_expr for inline C generation. */
-            if (inst->expr) emit_rewritten_node(e, inst->expr);
+            if (inst->expr) emit_rewritten_node(e, inst->expr, func);
         } else if (inst->call_arg_locals) {
             /* Decomposed call: emit callee(local1, local2, ...) from local IDs.
              * Handle array→slice coercion for args when param expects slice. */

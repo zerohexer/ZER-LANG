@@ -1062,13 +1062,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 }
             }
         }
+        /* Save defer count so if-scoped defers fire at block exit */
+        int then_defer_base = ctx->defer_count;
         lower_stmt(ctx, node->if_stmt.then_body);
+        emit_defer_fire_scoped(ctx, then_defer_base, true, node->loc.line);
+        ctx->defer_count = then_defer_base;
         ensure_terminated(ctx, bb_join);
 
         /* Else block */
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
+            int else_defer_base = ctx->defer_count;
             lower_stmt(ctx, node->if_stmt.else_body);
+            emit_defer_fire_scoped(ctx, else_defer_base, true, node->loc.line);
+            ctx->defer_count = else_defer_base;
             ensure_terminated(ctx, bb_join);
         }
 
@@ -1339,7 +1346,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 }
             }
 
+            /* Save defer count so arm-local defers fire at arm exit */
+            int arm_defer_base = ctx->defer_count;
             lower_stmt(ctx, node->switch_stmt.arms[i].body);
+            /* Fire + pop arm-local defers before arm exit */
+            emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
+            ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
 
             if (!node->switch_stmt.arms[i].is_default) {

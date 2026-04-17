@@ -1,0 +1,81 @@
+// Exhaustive orelse position test — every known context where NODE_ORELSE
+// can appear inside a function body. Each helper returns a distinct expected
+// value so main's exit code pinpoints which context regresses.
+
+?u32 maybe_ok() { return 42; }
+?u32 maybe_null() { return null; }
+?u32 maybe_by_i(u32 i) { if (i == 1) { return null; } return 42; }
+u32 sink(u32 x) { return x * 2; }
+struct Box { u32 v; }
+
+// var-decl init — value fallback
+u32 c1_vardecl_value() { u32 x = maybe_ok() orelse 99; return x; }
+
+// expr-stmt assign ident — value fallback
+u32 c3_assign_ident() { u32 x = 0; x = maybe_ok() orelse 99; return x; }
+
+// expr-stmt assign field — value fallback
+u32 c4_assign_field() { Box b; b.v = 0; b.v = maybe_ok() orelse 99; return b.v; }
+
+// expr-stmt assign field — terminating fallback in loop
+u32 c5_assign_field_break() {
+    Box b; b.v = 999;
+    for (u32 i = 0; i < 3; i += 1) { b.v = maybe_by_i(i) orelse break; }
+    return b.v;
+}
+
+// call argument — value fallback
+u32 c6_call_arg_value() { return sink(maybe_ok() orelse 99); }
+
+// call argument — terminating fallback in loop
+u32 c7_call_arg_break() {
+    u32 t = 0;
+    for (u32 i = 0; i < 3; i += 1) { t += sink(maybe_by_i(i) orelse break); }
+    return t;
+}
+
+// binary operand — value fallback
+u32 c8_binary_operand() { u32 r = (maybe_ok() orelse 0) + 100; return r; }
+
+// index expression — value fallback
+u32 c10_index() {
+    u32[4] arr;
+    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;
+    u32 r = arr[(maybe_ok() orelse 0) % 4];
+    return r;
+}
+
+// return expression — value fallback (has_value path)
+u32 c11_return_value() { return maybe_ok() orelse 99; }
+
+// return expression — value fallback (null path)
+u32 c12_return_null_fallback() { return maybe_null() orelse 99; }
+
+// if condition — value fallback
+u32 c13_if_cond() {
+    if ((maybe_ok() orelse 0) == 42) { return 1; }
+    return 0;
+}
+
+// nested orelse chain at value context
+u32 c14_nested_chain() { u32 r = maybe_null() orelse maybe_null() orelse 77; return r; }
+
+// assign with nested orelse chain
+u32 c15_assign_nested() { u32 x = 0; x = maybe_null() orelse maybe_ok() orelse 99; return x; }
+
+u32 main() {
+    if (c1_vardecl_value() != 42) { return 1; }
+    if (c3_assign_ident() != 42) { return 3; }
+    if (c4_assign_field() != 42) { return 4; }
+    if (c5_assign_field_break() != 42) { return 5; }
+    if (c6_call_arg_value() != 84) { return 6; }
+    if (c7_call_arg_break() != 84) { return 7; }
+    if (c8_binary_operand() != 142) { return 8; }
+    if (c10_index() != 30) { return 10; }
+    if (c11_return_value() != 42) { return 11; }
+    if (c12_return_null_fallback() != 99) { return 12; }
+    if (c13_if_cond() != 1) { return 13; }
+    if (c14_nested_chain() != 77) { return 14; }
+    if (c15_assign_nested() != 42) { return 15; }
+    return 0;
+}

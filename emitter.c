@@ -6207,7 +6207,29 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
         if (ml==5 && !memcmp(mn,"reset",5)) { emit(e,"(%.*s.offset=0)",(int)ol,on); return true; }
         if (ml==12 && !memcmp(mn,"unsafe_reset",12)) { emit(e,"(%.*s.offset=0)",(int)ol,on); return true; }
         if (ml==4 && !memcmp(mn,"over",4) && node->call.arg_count>0) {
-            emit(e,"((_zer_arena){(uint8_t*)"); BA(0); emit(e,",sizeof("); BA(0); emit(e,"),0})"); return true;
+            /* Single-eval consideration:
+             *   - Array arg: can't hoist (C can't assign arrays). Arg must be an
+             *     lvalue (ident, field) — no side effect. Emit directly twice.
+             *   - Slice arg: hoist to temp to avoid double-call (hoist lets
+             *     function-call args like next_buf() run exactly once). */
+            Type *at = checker_get_type(e->checker, node->call.args[0]);
+            Type *ae = at ? type_unwrap_distinct(at) : NULL;
+            bool is_slice = ae && ae->kind == TYPE_SLICE;
+            if (is_slice) {
+                int t = e->temp_count++;
+                emit(e, "({ ");
+                emit_type(e, ae);
+                emit(e, " _zer_ob%d = ", t);
+                BA(0);
+                emit(e, "; (_zer_arena){(uint8_t*)_zer_ob%d.ptr, _zer_ob%d.len, 0}; })", t, t);
+            } else {
+                emit(e,"((_zer_arena){(uint8_t*)");
+                BA(0);
+                emit(e,",sizeof(");
+                BA(0);
+                emit(e,"),0})");
+            }
+            return true;
         }
         if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count>0 && node->call.args[0]->kind==NODE_IDENT) {
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
@@ -6875,10 +6897,6 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     /* Named type: look up in scope for C name */
                     Symbol *sym = scope_lookup(e->checker->global_scope,
                         ta->named.name, (uint32_t)ta->named.name_len);
-                    fprintf(stderr, "  @size NAMED '%.*s' sym=%p type_kind=%d\n",
-                            (int)ta->named.name_len, ta->named.name,
-                            (void*)sym,
-                            (sym && sym->type) ? type_unwrap_distinct(sym->type)->kind : -1);
                     if (sym && sym->type) {
                         Type *te = type_unwrap_distinct(sym->type);
                         if (te->kind == TYPE_STRUCT) {
@@ -6893,7 +6911,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                                 emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
                             }
                         } else if (te->kind == TYPE_UNION) {
-                            emit(e, "struct %.*s", (int)te->union_type.name_len, te->union_type.name);
+                            emit(e, "struct _union_%.*s", (int)te->union_type.name_len, te->union_type.name);
                         } else {
                             emit_type(e, sym->type);
                         }
@@ -6919,7 +6937,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                         else emit(e, "struct ");
                         emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
                     } else if (te->kind == TYPE_UNION) {
-                        emit(e, "struct %.*s", (int)te->union_type.name_len, te->union_type.name);
+                        emit(e, "struct _union_%.*s", (int)te->union_type.name_len, te->union_type.name);
                     } else {
                         emit_type(e, sym->type);
                     }
@@ -7266,6 +7284,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "_zer_probe((uintptr_t)(");
             emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, "))");
+        } else if (nlen == 6 && memcmp(name, "config", 6) == 0) {
+            /* @config(key, default) → emit the default value (last arg) */
+            if (node->intrinsic.arg_count > 0)
+                emit_rewritten_node(e, node->intrinsic.args[node->intrinsic.arg_count - 1], func);
+            else
+                emit(e, "0");
         } else {
             /* Truly unknown intrinsic — should not reach here */
             emit(e, "/* @%.*s */ 0", (int)nlen, name);
@@ -7290,56 +7314,73 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             return;
         }
         bool obj_slice = obj_eff && obj_eff->kind == TYPE_SLICE;
+        /* Single-eval via GCC statement expression: hoist start/end to temps
+         * so subtraction (end - start) reuses the temps, not re-evaluates exprs. */
         if (obj_slice) {
+            int t = e->temp_count++;
+            emit(e, "({ ");
+            if (node->slice.start) {
+                emit(e, "size_t _zer_ss%d = (size_t)(", t);
+                emit_rewritten_node(e, node->slice.start, func);
+                emit(e, "); ");
+            }
+            if (node->slice.end) {
+                emit(e, "size_t _zer_se%d = (size_t)(", t);
+                emit_rewritten_node(e, node->slice.end, func);
+                emit(e, "); ");
+            }
             emit(e, "(");
             emit_type(e, obj_type);
             emit(e, "){ &(");
             emit_rewritten_node(e, node->slice.object, func);
             emit(e, ".ptr)[");
-            if (node->slice.start) emit_rewritten_node(e, node->slice.start, func);
+            if (node->slice.start) emit(e, "_zer_ss%d", t);
             else emit(e, "0");
             emit(e, "], ");
             if (node->slice.end && node->slice.start) {
-                emit(e, "(");
-                emit_rewritten_node(e, node->slice.end, func);
-                emit(e, ") - (");
-                emit_rewritten_node(e, node->slice.start, func);
-                emit(e, ")");
+                emit(e, "_zer_se%d - _zer_ss%d", t, t);
             } else if (node->slice.end) {
-                emit_rewritten_node(e, node->slice.end, func);
+                emit(e, "_zer_se%d", t);
             } else {
                 emit_rewritten_node(e, node->slice.object, func);
                 emit(e, ".len");
-                if (node->slice.start) {
-                    emit(e, " - ");
-                    emit_rewritten_node(e, node->slice.start, func);
-                }
+                if (node->slice.start) emit(e, " - _zer_ss%d", t);
             }
-            emit(e, " }");
+            emit(e, " }; })");
         } else {
             /* Array sub-slice: arr[start..end] → (SliceType){ &arr[start], end-start } */
             Type *arr_type = obj_type ? type_unwrap_distinct(obj_type) : NULL;
             Type *elem = arr_type && arr_type->kind == TYPE_ARRAY ? arr_type->array.inner : NULL;
             if (elem) {
+                int t = e->temp_count++;
+                emit(e, "({ ");
+                if (node->slice.start) {
+                    emit(e, "size_t _zer_ss%d = (size_t)(", t);
+                    emit_rewritten_node(e, node->slice.start, func);
+                    emit(e, "); ");
+                }
+                if (node->slice.end) {
+                    emit(e, "size_t _zer_se%d = (size_t)(", t);
+                    emit_rewritten_node(e, node->slice.end, func);
+                    emit(e, "); ");
+                }
                 emit(e, "((");
                 emit_type(e, type_slice(e->arena, elem));
                 emit(e, "){ &(");
                 emit_rewritten_node(e, node->slice.object, func);
                 emit(e, ")[");
-                if (node->slice.start) emit_rewritten_node(e, node->slice.start, func);
+                if (node->slice.start) emit(e, "_zer_ss%d", t);
                 else emit(e, "0");
                 emit(e, "], ");
                 if (node->slice.end && node->slice.start) {
-                    emit(e, "("); emit_rewritten_node(e, node->slice.end, func);
-                    emit(e, ") - ("); emit_rewritten_node(e, node->slice.start, func);
-                    emit(e, ")");
+                    emit(e, "_zer_se%d - _zer_ss%d", t, t);
                 } else if (node->slice.end) {
-                    emit_rewritten_node(e, node->slice.end, func);
+                    emit(e, "_zer_se%d", t);
                 } else {
                     emit(e, "%u", arr_type->kind == TYPE_ARRAY ? (unsigned)arr_type->array.size : 0);
-                    if (node->slice.start) { emit(e, " - "); emit_rewritten_node(e, node->slice.start, func); }
+                    if (node->slice.start) emit(e, " - _zer_ss%d", t);
                 }
-                emit(e, " })");
+                emit(e, " }); })");
             } else {
                 /* Truly unknown — emit placeholder */
                 emit(e, "/* unknown slice */ 0");
@@ -7627,7 +7668,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         emit_local_name(e, func, inst->call_arg_locals[i]);
                     }
                 } else {
-                    emit(e, "0"); /* void/undecomposable arg */
+                    /* lower_expr returned -1 (void/array passthrough). For arrays,
+                     * check the original AST arg — if param wants slice, emit
+                     * array→slice coercion directly. */
+                    Node *arg_expr = (inst->args && i < inst->arg_count) ? inst->args[i] : NULL;
+                    Type *at_ast = arg_expr ? checker_get_type(e->checker, arg_expr) : NULL;
+                    Type *at_eff = at_ast ? type_unwrap_distinct(at_ast) : NULL;
+                    Type *pt = (callee_ft && (uint32_t)i < callee_ft->func_ptr.param_count) ?
+                        type_unwrap_distinct(callee_ft->func_ptr.params[i]) : NULL;
+                    if (at_eff && at_eff->kind == TYPE_ARRAY &&
+                        pt && pt->kind == TYPE_SLICE && arg_expr) {
+                        emit_array_as_slice(e, arg_expr, at_ast, callee_ft->func_ptr.params[i]);
+                    } else if (arg_expr) {
+                        emit_rewritten_node(e, arg_expr, func);
+                    } else {
+                        emit(e, "0");
+                    }
                 }
             }
             emit(e, ")");
@@ -7719,12 +7775,48 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ";\n");
             }
         } else {
-            /* Void or bare return */
+            /* Void or bare return, or array→slice return via expr */
             if (func->is_async) {
                 emit(e, "self->_zer_state = -1; return 1;\n");
+            } else if (inst->expr) {
+                /* lower_expr returned -1 but expr was kept (array/void passthrough).
+                 * Array→slice coercion at return site: emit slice wrapper. */
+                Type *expr_type = checker_get_type(e->checker, inst->expr);
+                Type *expr_eff = expr_type ? type_unwrap_distinct(expr_type) : NULL;
+                Type *ret = e->current_func_ret;
+                Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+                if (expr_eff && ret_eff &&
+                    expr_eff->kind == TYPE_ARRAY && ret_eff->kind == TYPE_SLICE) {
+                    emit(e, "return ");
+                    emit_array_as_slice(e, inst->expr, expr_type, ret);
+                    emit(e, ";\n");
+                } else {
+                    /* Void expression in return — emit side effect, then bare return */
+                    emit_rewritten_node(e, inst->expr, func);
+                    emit(e, ";\n");
+                    emit_indent(e);
+                    emit(e, "return;\n");
+                }
             } else {
-                emit_return_null(e);
-                emit(e, "\n");
+                /* Bare `return;` from `?void` function means SUCCESS: { has_value=1 }.
+                 * For ?T struct optional, bare return also = success (emit {0, 1}).
+                 * For plain void return, emit `return;`. For ?*T null-sentinel,
+                 * bare return has no natural value — emit null.
+                 * Only explicit `return null` should emit null literal. */
+                Type *ret = e->current_func_ret;
+                Type *eff = ret ? type_unwrap_distinct(ret) : NULL;
+                if (eff && eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
+                    if (is_void_opt(eff)) {
+                        emit(e, "return (_zer_opt_void){ 1 };\n");
+                    } else {
+                        emit(e, "return (");
+                        emit_type(e, eff);
+                        emit(e, "){ 0, 1 };\n");
+                    }
+                } else {
+                    emit_return_null(e);
+                    emit(e, "\n");
+                }
             }
         }
         break;
@@ -7876,11 +7968,19 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_DEFER_FIRE: {
         /* Fire pending defers in LIFO order.
          * cond_local >= 0: scoped fire from top down to base (cond_local).
-         * src2_local == 1: do NOT pop (for break/continue mid-body).
-         * src2_local == 0 (default): pop on scoped fire.
+         * src2_local == 0 (default): emit bodies + pop.
+         * src2_local == 1: emit bodies, no pop (for break/continue/orelse-exits).
+         * src2_local == 2: pop only (no emit) — used at loop exit to clean up
+         *                  after divergent paths already emitted their fire-no-pop.
          * cond_local == -1: fire all (no pop — function exit). */
         int base = (inst->cond_local >= 0) ? inst->cond_local : 0;
+        /* src2_local: 0 = emit+pop, 1 = emit, no pop, 2 = pop only */
         bool pop = (inst->cond_local >= 0) && (inst->src2_local != 1);
+        bool emit_bodies = (inst->src2_local != 2);
+        if (!emit_bodies) {
+            if (pop) e->defer_stack.count = base;
+            break;
+        }
         for (int di = e->defer_stack.count - 1; di >= base; di--) {
             Node *db = e->defer_stack.stmts[di];
             if (!db) continue;
@@ -8003,13 +8103,38 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                               !is_null_sentinel(sw_eff->optional.inner);
                 bool is_enum = sw_eff && sw_eff->kind == TYPE_ENUM;
 
-                /* Hoist switch expression into temp */
+                /* Hoist switch expression.
+                 * For unions: use pointer to original so `|*v|` captures can modify it.
+                 * For enum/optional: hoist into temp (value semantics fine). */
                 emit_indent(e);
-                emit(e, "{ __typeof__(");
-                emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                emit(e, ") _zer_sw%d = ", sw_tmp);
-                emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                emit(e, ";\n");
+                if (is_union) {
+                    bool sw_is_rvalue = (sw->switch_stmt.expr->kind == NODE_CALL);
+                    if (sw_is_rvalue) {
+                        /* rvalue: hoist into temp FIRST, then take its address */
+                        emit(e, "{ __typeof__(");
+                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                        emit(e, ") _zer_swt%d = ", sw_tmp);
+                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                        emit(e, ";\n");
+                        emit_indent(e);
+                        emit(e, "__typeof__(_zer_swt%d) *_zer_sw%d = &_zer_swt%d;\n",
+                             sw_tmp, sw_tmp, sw_tmp);
+                    } else {
+                        emit(e, "{ __typeof__(");
+                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                        emit(e, ") *_zer_sw%d = &(", sw_tmp);
+                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                        emit(e, ");\n");
+                    }
+                } else {
+                    emit(e, "{ __typeof__(");
+                    emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                    emit(e, ") _zer_sw%d = ", sw_tmp);
+                    emit_rewritten_node(e, sw->switch_stmt.expr, func);
+                    emit(e, ";\n");
+                }
+                /* Accessor: unions use `->` (pointer), others use `.` (value) */
+                const char *sw_acc = is_union ? "->" : ".";
 
                 for (int ai = 0; ai < sw->switch_stmt.arm_count; ai++) {
                     SwitchArm *arm = &sw->switch_stmt.arms[ai];
@@ -8021,7 +8146,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         if (ai > 0) emit(e, "else ");
                         emit(e, "if (");
                         if (is_union) {
-                            emit(e, "_zer_sw%d._tag == %d", sw_tmp, ai);
+                            emit(e, "_zer_sw%d%s_tag == %d", sw_tmp, sw_acc, ai);
                         } else if (is_opt) {
                             /* Optional: first arm = has_value, second = !has_value (or vice versa) */
                             if (arm->value_count > 0 && arm->values[0]->kind == NODE_NULL_LIT) {
@@ -8072,25 +8197,25 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     if (arm->capture_name) {
                         emit_indent(e);
                         if (is_union && arm->capture_is_ptr) {
-                            /* Mutable union capture: Type *v = &_sw.variant */
+                            /* Mutable union capture: Type *v = &_sw->variant (pointer to ORIGINAL) */
                             if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
-                                emit(e, "__typeof__(_zer_sw%d.%.*s) *%.*s = &_zer_sw%d.%.*s;\n",
-                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                emit(e, "__typeof__(_zer_sw%d%s%.*s) *%.*s = &_zer_sw%d%s%.*s;\n",
+                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
                                      arm->values[0]->ident.name,
                                      (int)arm->capture_name_len, arm->capture_name,
-                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
                                      arm->values[0]->ident.name);
                             }
                         } else if (is_union) {
                             /* Immutable union capture: copy variant value.
                              * Arrays can't be assigned — use memcpy. */
                             if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
-                                emit(e, "__typeof__(_zer_sw%d.%.*s) %.*s; memcpy(&%.*s, &_zer_sw%d.%.*s, sizeof(%.*s));\n",
-                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                emit(e, "__typeof__(_zer_sw%d%s%.*s) %.*s; memcpy(&%.*s, &_zer_sw%d%s%.*s, sizeof(%.*s));\n",
+                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
                                      arm->values[0]->ident.name,
                                      (int)arm->capture_name_len, arm->capture_name,
                                      (int)arm->capture_name_len, arm->capture_name,
-                                     sw_tmp, (int)arm->values[0]->ident.name_len,
+                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
                                      arm->values[0]->ident.name,
                                      (int)arm->capture_name_len, arm->capture_name);
                             }
@@ -8831,7 +8956,18 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* Instructions */
         for (int ii = 0; ii < bb->inst_count; ii++) {
-            emit_ir_inst(e, &bb->insts[ii], func);
+            /* Emit auto-guards before statement-producing IR ops (bounds + UAF).
+             * Checker marks NODE_INDEX with auto_guard_size when VRP can't prove
+             * index in bounds; the guard returns zero before the OOB access. */
+            IRInst *ins = &bb->insts[ii];
+            if (ins->expr) {
+                IROpKind k = ins->op;
+                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
+                    k == IR_INTRINSIC || k == IR_CALL_DECOMP) {
+                    emit_auto_guards(e, ins->expr);
+                }
+            }
+            emit_ir_inst(e, ins, func);
         }
 
         if (has_capture_scope) {

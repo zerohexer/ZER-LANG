@@ -63,6 +63,19 @@ u32 c14_nested_chain() { u32 r = maybe_null() orelse maybe_null() orelse 77; ret
 // assign with nested orelse chain
 u32 c15_assign_nested() { u32 x = 0; x = maybe_null() orelse maybe_ok() orelse 99; return x; }
 
+// orelse fallback containing nested orelse — requires pre_lower_orelse on fb too
+u32 c16_nested_in_fallback() {
+    u32 r = maybe_null() orelse (maybe_null() orelse 77);
+    return r;
+}
+
+// orelse fallback calling a function with another orelse argument
+u32 helper(u32 x) { return x + 100; }
+u32 c17_call_in_fallback() {
+    u32 r = maybe_null() orelse helper(maybe_null() orelse 7);
+    return r;  // helper(7) = 107
+}
+
 u32 main() {
     if (c1_vardecl_value() != 42) { return 1; }
     if (c3_assign_ident() != 42) { return 3; }
@@ -77,5 +90,7 @@ u32 main() {
     if (c13_if_cond() != 1) { return 13; }
     if (c14_nested_chain() != 77) { return 14; }
     if (c15_assign_nested() != 42) { return 15; }
+    if (c16_nested_in_fallback() != 77) { return 16; }
+    if (c17_call_in_fallback() != 107) { return 17; }
     return 0;
 }

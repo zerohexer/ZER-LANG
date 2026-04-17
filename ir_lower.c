@@ -982,9 +982,12 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
 
     /* Emit: tmp = expr.
      * Phase 8d: builtins (pool/slab/ring/arena) emit via IR_ASSIGN passthrough.
-     * emit_rewritten_node detects builtins and calls emit_builtin_inline. */
+     * emit_rewritten_node detects builtins and calls emit_builtin_inline.
+     * inner may contain nested orelse (e.g., `(A orelse B) orelse C` — outer's
+     * inner is another orelse). pre_lower_orelse decomposes before emission. */
     Node *inner = orelse_node->orelse.expr;
     rewrite_idents(ctx, inner);
+    pre_lower_orelse(ctx, &inner, line);
     IRInst assign_tmp = make_inst(IR_ASSIGN, line);
     assign_tmp.dest_local = tmp_id;
     assign_tmp.expr = inner;
@@ -1035,8 +1038,12 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         if (fb->kind == NODE_ORELSE) {
             lower_orelse_to_dest(ctx, dest_local, fb, line);
         } else if (fb->kind != NODE_BLOCK) {
-            /* Value fallback: dest_local = fallback_value; */
+            /* Value fallback: dest_local = fallback_value;
+             * The fallback expression may contain nested orelse (e.g.,
+             * `A orelse bar(B orelse 7)`). Pre-lower any orelse inside
+             * before handing the AST to the passthrough emitter. */
             if (dest_local >= 0) {
+                pre_lower_orelse(ctx, &fb, line);
                 IRInst assign = make_inst(IR_ASSIGN, line);
                 assign.dest_local = dest_local;
                 assign.expr = fb;
@@ -1152,6 +1159,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 if (init_eff && init_eff->kind == TYPE_ARRAY &&
                     vt_unwrap && vt_unwrap->kind == TYPE_SLICE) {
                     rewrite_idents(ctx, init);
+                    pre_lower_orelse(ctx, &init, node->loc.line);
                     IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
                     inst.dest_local = local_id;
                     inst.expr = init;
@@ -1252,6 +1260,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         new_assign->assign.op = TOK_EQ;
                         new_assign->assign.target = tgt;
                         new_assign->assign.value = tmp_id;
+                        /* Target may contain orelse in an index/field path —
+                         * pre-lower before emission. */
+                        pre_lower_orelse(ctx, &new_assign->assign.target, node->loc.line);
                         IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
                         inst.expr = new_assign;
                         emit_inst(ctx, inst);
@@ -1419,6 +1430,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->current_block = bb_step;
         if (node->for_stmt.step) {
             rewrite_idents(ctx, node->for_stmt.step);
+            /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
+            pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             emit_inst(ctx, step);

@@ -73,6 +73,12 @@ static IRInst make_inst(IROpKind op, int line) {
     inst.cond_local = -1;
     inst.src1_local = -1;
     inst.src2_local = -1;
+    /* BUG-578 fix: obj_local/handle_local used by deprecated builtin IR ops
+     * (IR_POOL_ALLOC etc. — collapsed to IR_ASSIGN in Phase 8d). Default to
+     * sentinel -1 so BUG-576's tightened ir_validate (>= 0 check) doesn't
+     * reject every IR_RETURN / IR_GOTO (they leave these fields unused). */
+    inst.obj_local = -1;
+    inst.handle_local = -1;
     inst.source_line = line;
     return inst;
 }

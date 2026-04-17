@@ -1,0 +1,43 @@
+// BUG-577 proper: `target = X orelse break/continue` must write to target
+// even when target is NOT a simple local (struct field, array index, pointer deref).
+// Before fix: lower_orelse_to_dest(-1) ran but ok-path assignment was skipped —
+// target kept its old value, silent data corruption.
+
+struct Box { u32 v; u32 v2; }
+
+?u32 maybe(u32 i) {
+    if (i == 2) { return null; }
+    return i * 10;
+}
+
+u32 test_struct_field() {
+    Box b;
+    b.v = 999;
+    for (u32 i = 0; i < 5; i += 1) {
+        b.v = maybe(i) orelse break;
+    }
+    // Expected sequence:
+    //   i=0: maybe(0)=0   → b.v = 0
+    //   i=1: maybe(1)=10  → b.v = 10
+    //   i=2: maybe(2)=null → break (b.v stays 10)
+    return b.v;
+}
+
+u32 test_array_index() {
+    u32[3] arr;
+    arr[0] = 999; arr[1] = 999; arr[2] = 999;
+    for (u32 i = 0; i < 5; i += 1) {
+        arr[i] = maybe(i) orelse break;
+    }
+    // Expected:
+    //   i=0 → arr[0] = 0
+    //   i=1 → arr[1] = 10
+    //   i=2 → null, break. arr[2] untouched = 999
+    return arr[0] + arr[1] + arr[2];  // 0 + 10 + 999 = 1009
+}
+
+u32 main() {
+    if (test_struct_field() != 10) { return 1; }
+    if (test_array_index() != 1009) { return 2; }
+    return 0;
+}

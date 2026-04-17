@@ -1065,19 +1065,62 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 ctx->loop_exit_block >= 0 ||
                 orelse->orelse.fallback_is_break || orelse->orelse.fallback_is_continue);
             if (need_ir) {
-                /* BUG-577: if the expression is `target = X orelse break`,
-                 * route the orelse result to target's local so the assignment
-                 * actually happens. Without this, lower_orelse_to_dest(-1)
-                 * leaves target unassigned → null deref in subsequent use. */
-                int dest_local = -1;
+                /* BUG-577 proper: handle `target = X orelse break/continue;`
+                 * for all target kinds.
+                 *
+                 *   target is NODE_IDENT (local)
+                 *     → route orelse result directly to target's local.
+                 *   target is NODE_FIELD / NODE_INDEX / NODE_UNARY-deref
+                 *     → lower orelse to a fresh tmp local, then emit an IR_ASSIGN
+                 *       whose expr is a synthetic `target = tmp_ident` AST so the
+                 *       emitter writes the unwrapped value through the non-local lvalue.
+                 *   otherwise (void/no-target orelse statement)
+                 *     → lower_orelse_to_dest with -1. */
                 if (expr->kind == NODE_ASSIGN && expr->assign.op == TOK_EQ &&
-                    expr->assign.target && expr->assign.target->kind == NODE_IDENT &&
-                    expr->assign.value == orelse) {
-                    dest_local = ir_find_local(ctx->func,
-                        expr->assign.target->ident.name,
-                        (uint32_t)expr->assign.target->ident.name_len);
+                    expr->assign.target && expr->assign.value == orelse) {
+                    Node *tgt = expr->assign.target;
+                    if (tgt->kind == NODE_IDENT) {
+                        int dest_local = ir_find_local(ctx->func,
+                            tgt->ident.name,
+                            (uint32_t)tgt->ident.name_len);
+                        lower_orelse_to_dest(ctx, dest_local, orelse, node->loc.line);
+                    } else {
+                        /* Non-local target — decompose into tmp + synthesized assign. */
+                        Type *rt = checker_get_type(ctx->checker, orelse);
+                        if (!rt) {
+                            /* Fallback: use the optional inner's type via orelse.expr */
+                            Type *ot = checker_get_type(ctx->checker, orelse->orelse.expr);
+                            if (ot) {
+                                Type *oe = type_unwrap_distinct(ot);
+                                if (oe && oe->kind == TYPE_OPTIONAL) rt = oe->optional.inner;
+                            }
+                            if (!rt) rt = ty_i32;
+                        }
+                        int tmp = create_temp(ctx, rt, node->loc.line);
+                        lower_orelse_to_dest(ctx, tmp, orelse, node->loc.line);
+                        /* Build `target = tmp_ident` AST. `tgt` already rewritten by
+                         * rewrite_idents above so nested idents point at correct locals. */
+                        IRLocal *tloc = &ctx->func->locals[tmp];
+                        Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(tmp_id, 0, sizeof(Node));
+                        tmp_id->kind = NODE_IDENT;
+                        tmp_id->loc = node->loc;
+                        tmp_id->ident.name = tloc->name;
+                        tmp_id->ident.name_len = (size_t)tloc->name_len;
+                        Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(new_assign, 0, sizeof(Node));
+                        new_assign->kind = NODE_ASSIGN;
+                        new_assign->loc = node->loc;
+                        new_assign->assign.op = TOK_EQ;
+                        new_assign->assign.target = tgt;
+                        new_assign->assign.value = tmp_id;
+                        IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
+                        inst.expr = new_assign;
+                        emit_inst(ctx, inst);
+                    }
+                } else {
+                    lower_orelse_to_dest(ctx, -1, orelse, node->loc.line);
                 }
-                lower_orelse_to_dest(ctx, dest_local, orelse, node->loc.line);
                 break;
             }
         }

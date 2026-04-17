@@ -8111,9 +8111,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         }
                     }
 
-                    /* Arm body — emit via emit_stmt (contains IR-lowered statements) */
-                    /* Actually arm body is AST — it wasn't lowered because the whole
-                     * switch went through NOP. Use emit_stmt for arm bodies. */
+                    /* Arm body — emit statements directly.
+                     * Save defer_stack.count so we can fire+pop arm-scoped defers at arm end
+                     * (defers declared inside arm reference arm-local vars; must not leak). */
+                    int arm_defer_base = e->defer_stack.count;
                     if (arm->body) {
                         if (arm->body->kind == NODE_BLOCK) {
                             for (int si = 0; si < arm->body->block.stmt_count; si++) {
@@ -8164,18 +8165,81 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                 } else if (bs->kind == NODE_BREAK) {
                                     /* break in switch → just end arm (no C break needed, using if/else) */
                                 } else if (bs->kind == NODE_VAR_DECL) {
-                                    /* Variable declaration inside switch arm */
+                                    /* Variable declaration inside switch arm.
+                                     * NODE_ORELSE init requires special emission: the fallback
+                                     * may be `return`/`break`/`continue` which can't be inside
+                                     * a compound literal assignment expression. */
                                     Type *vt = checker_get_type(e->checker, bs);
-                                    emit_indent(e);
-                                    if (vt) emit_type_and_name(e, vt, bs->var_decl.name, bs->var_decl.name_len);
-                                    else emit(e, "uint32_t %.*s", (int)bs->var_decl.name_len, bs->var_decl.name);
-                                    if (bs->var_decl.init) {
-                                        emit(e, " = ");
-                                        emit_rewritten_node(e, bs->var_decl.init, func);
+                                    if (bs->var_decl.init && bs->var_decl.init->kind == NODE_ORELSE) {
+                                        Node *or_node = bs->var_decl.init;
+                                        Type *opt_type = checker_get_type(e->checker, or_node->orelse.expr);
+                                        Type *opt_eff = opt_type ? type_unwrap_distinct(opt_type) : NULL;
+                                        bool nullsent = opt_eff && opt_eff->kind == TYPE_OPTIONAL &&
+                                                        is_null_sentinel(opt_eff->optional.inner);
+                                        int tmp = e->temp_count++;
+                                        /* Declare target */
+                                        emit_indent(e);
+                                        if (vt) emit_type_and_name(e, vt, bs->var_decl.name, bs->var_decl.name_len);
+                                        else emit(e, "uint32_t %.*s", (int)bs->var_decl.name_len, bs->var_decl.name);
+                                        emit(e, " = {0};\n");
+                                        /* Emit: __typeof__(expr) tmp = expr; if (!tmp.has_value) { fallback } target = tmp.value; */
+                                        emit_indent(e);
+                                        emit(e, "{ __typeof__(");
+                                        emit_rewritten_node(e, or_node->orelse.expr, func);
+                                        emit(e, ") _zer_or%d = ", tmp);
+                                        emit_rewritten_node(e, or_node->orelse.expr, func);
+                                        emit(e, "; if (");
+                                        if (nullsent) emit(e, "!_zer_or%d", tmp);
+                                        else emit(e, "!_zer_or%d.has_value", tmp);
+                                        emit(e, ") { ");
+                                        if (or_node->orelse.fallback_is_return) {
+                                            /* Fire pending defers (including outer ones), then return appropriate value */
+                                            Type *fret = e->current_func_ret;
+                                            Type *fret_eff = fret ? type_unwrap_distinct(fret) : NULL;
+                                            /* Fire defers BEFORE return (skip arm-scoped since we're jumping out) */
+                                            for (int di = e->defer_stack.count - 1; di >= 0; di--) {
+                                                Node *db = e->defer_stack.stmts[di];
+                                                if (db && db->kind == NODE_EXPR_STMT && db->expr_stmt.expr) {
+                                                    emit_rewritten_node(e, db->expr_stmt.expr, func); emit(e, "; ");
+                                                }
+                                            }
+                                            emit(e, "return");
+                                            if (fret_eff) {
+                                                if (fret_eff->kind == TYPE_OPTIONAL) {
+                                                    emit(e, " "); emit_opt_null_literal(e, fret_eff);
+                                                } else if (fret_eff->kind != TYPE_VOID) {
+                                                    emit(e, " 0");
+                                                }
+                                            }
+                                            emit(e, "; ");
+                                        } else if (or_node->orelse.fallback && or_node->orelse.fallback->kind != NODE_BLOCK) {
+                                            /* Value fallback: assign fallback to target */
+                                            emit(e, "%.*s = ", (int)bs->var_decl.name_len, bs->var_decl.name);
+                                            emit_rewritten_node(e, or_node->orelse.fallback, func);
+                                            emit(e, "; goto _zer_arm_done%d; ", tmp);
+                                        }
+                                        emit(e, "} ");
+                                        /* Success: assign .value (or plain for null sentinel) */
+                                        emit(e, "%.*s = ", (int)bs->var_decl.name_len, bs->var_decl.name);
+                                        if (nullsent) emit(e, "_zer_or%d", tmp);
+                                        else emit(e, "_zer_or%d.value", tmp);
+                                        emit(e, "; }\n");
+                                        if (or_node->orelse.fallback && or_node->orelse.fallback->kind != NODE_BLOCK &&
+                                            !or_node->orelse.fallback_is_return) {
+                                            emit(e, "_zer_arm_done%d:;\n", tmp);
+                                        }
                                     } else {
-                                        emit(e, " = {0}");
+                                        emit_indent(e);
+                                        if (vt) emit_type_and_name(e, vt, bs->var_decl.name, bs->var_decl.name_len);
+                                        else emit(e, "uint32_t %.*s", (int)bs->var_decl.name_len, bs->var_decl.name);
+                                        if (bs->var_decl.init) {
+                                            emit(e, " = ");
+                                            emit_rewritten_node(e, bs->var_decl.init, func);
+                                        } else {
+                                            emit(e, " = {0}");
+                                        }
+                                        emit(e, ";\n");
                                     }
-                                    emit(e, ";\n");
                                 } else if (bs->kind == NODE_DEFER) {
                                     /* Defer inside switch arm — push to defer stack */
                                     if (e->defer_stack.count >= e->defer_stack.capacity) {
@@ -8224,6 +8288,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                             emit(e, ";\n");
                         }
                     }
+                    /* Fire + pop arm-scoped defers — declared inside arm reference
+                     * arm-local vars that are out of scope after the arm block ends. */
+                    if (e->defer_stack.count > arm_defer_base) {
+                        for (int di = e->defer_stack.count - 1; di >= arm_defer_base; di--) {
+                            Node *db = e->defer_stack.stmts[di];
+                            if (!db) continue;
+                            if (db->kind == NODE_EXPR_STMT && db->expr_stmt.expr) {
+                                emit_indent(e);
+                                emit_rewritten_node(e, db->expr_stmt.expr, func);
+                                emit(e, ";\n");
+                            } else if (db->kind == NODE_BLOCK) {
+                                for (int bi = 0; bi < db->block.stmt_count; bi++) {
+                                    Node *bs2 = db->block.stmts[bi];
+                                    if (bs2 && bs2->kind == NODE_EXPR_STMT && bs2->expr_stmt.expr) {
+                                        emit_indent(e);
+                                        emit_rewritten_node(e, bs2->expr_stmt.expr, func);
+                                        emit(e, ";\n");
+                                    }
+                                }
+                            }
+                        }
+                        e->defer_stack.count = arm_defer_base;
+                    }
 
                     e->indent--;
                     emit_indent(e);
@@ -8261,6 +8348,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                src_eff->optional.inner->kind != TYPE_VOID);
             bool need_slice = (dst_eff && dst_eff->kind == TYPE_SLICE &&
                               src_eff && src_eff->kind == TYPE_ARRAY);
+            /* Mutable capture: dst is *T, src is ?T (struct optional).
+             * Emit v = &src.value to take pointer to the optional's storage. */
+            bool need_addr_capture = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_eff && src_eff->kind == TYPE_OPTIONAL &&
+                                     !is_null_sentinel(src_eff->optional.inner));
 
             const char *sp = func->is_async ? "self->" : "";
 
@@ -8287,7 +8380,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                src_eff->pointer.inner &&
                                type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
-            if (need_slice) {
+            if (need_addr_capture) {
+                emit(e, "&%s%.*s.value;\n",
+                     sp, (int)src->name_len, src->name);
+            } else if (need_slice) {
                 emit(e, "(");
                 emit_type(e, dst_eff);
                 emit(e, "){ %s%.*s, %u };\n",

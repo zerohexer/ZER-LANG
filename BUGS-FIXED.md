@@ -5,6 +5,108 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-18 — BUG-579: enum/union/optional switch arm body gaps (v0.4.9)
+
+Fresh audit turned up a whole class of silent bugs in how the IR path handles
+enum/union/optional switch arm bodies. The IR_NOP passthrough (promised as
+tech debt in `ir_lower.c:1578-1580`) had been masking these for as long as
+the IR path has existed — no existing test exercised the gap, so regressions
+went undetected.
+
+### BUG-579: Switch arm body emission dropped most statement kinds
+
+**Symptom:** ZER programs that combine enum/union/optional switches with
+real-world arm body patterns silently produce wrong output. Examples verified:
+
+- `switch (s) { .a => { x = foo() orelse 42; } }` — emits `x = 0;` (orelse dropped)
+- `switch (s) { .a => { r = sink(foo() orelse 42); } }` — emits `sink(0)` (orelse dropped)
+- `switch (s) { .a => { x = foo() orelse break; } }` — emits `x = 0;` (orelse + break dropped)
+- `switch (s) { .a => { for (...) { ... } } }` — emits `0;` (whole loop dropped)
+- `switch (o) { .first => { switch (i) { ... } } }` — nested switch dropped
+
+**Root cause:** For enum/union/optional switches, `ir_lower.c` emitted an
+`IR_NOP{expr=NODE_SWITCH}` passthrough; the emitter's `IR_NOP` NODE_SWITCH
+handler had a mini-`emit_stmt` covering only 6 of ~20 statement kinds
+(`NODE_EXPR_STMT`, `NODE_RETURN`, `NODE_BREAK`, `NODE_VAR_DECL`, `NODE_DEFER`,
+`NODE_IF`). Missing kinds fell through to `emit_rewritten_node`'s
+unhandled-default which emits `/* unhandled node N */0;`. `NODE_EXPR_STMT` was
+itself incomplete — any NODE_ORELSE inside the expression hit the same
+unhandled-default because `emit_rewritten_node` has no NODE_ORELSE case (BUG-577).
+`NODE_BREAK` was silently dropped as no-op even when the switch was nested in
+a loop (break target wrong).
+
+No existing test exercised these patterns — `tests/zer/state_machine.zer` and
+`tests/zer/tokenizer.zer` only use simple `if`/assignments/returns inside arms.
+
+**Fix:** Promote enum/union/optional switches to full IR lowering, following
+the integer switch pattern at `ir_lower.c:1623+`. Per-type modifications:
+
+- **Enum**: build `NODE_BINARY(sw_ref, TOK_EQEQ, NODE_INT_LIT(variant.value))`
+  where `variant.value` is resolved from `sw_eff->enum_type.variants[vi].value`.
+  Handles both `.west` (NODE_IDENT) and `Dir.west` (NODE_FIELD) arm syntaxes
+  by reading the variant name from whichever node kind is present.
+- **Union**: build `NODE_BINARY(NODE_FIELD(sw_ref, "_tag"), TOK_EQEQ,
+  NODE_INT_LIT(variant_index))`. `sw_ref` is a pointer-to-union local, so
+  `NODE_FIELD` emits as `->_tag`. Capture handling: `|v|` via NODE_FIELD into
+  IR_ASSIGN (array variants emit memcpy via the new IR_ASSIGN array-to-array
+  handling); `|*v|` via `NODE_UNARY(TOK_AMP, NODE_FIELD(sw_ref, variant))`
+  which preserves pointer to the original (mutations persist for lvalue switch
+  expressions). For rvalue expressions, the value is copied to a tmp first
+  so `&tmp` is a valid address.
+- **Optional**: non-null arm builds `NODE_FIELD(sw_ref, "has_value")`; null arm
+  wraps in `NODE_UNARY(TOK_BANG, ...)`. For null-sentinel optionals (`?*T`),
+  uses the pointer local directly (truthy test). Captures via IR_COPY with
+  type adaptation — BUG-552 handles `|*v|` as `&src.value`.
+- Arm bodies all go through `lower_stmt` which correctly handles every
+  statement kind (for, while, nested switch, orelse, continue, goto, etc.).
+
+**Supporting fixes:**
+
+1. **`checker_set_type(Checker*, Node*, Type*)`** — new public API exporting
+   `typemap_set` so IR lowering can annotate synthesized AST nodes
+   (comparison builders, address-of wrappers) with their correct types.
+   Without this, `lower_expr` falls back to `ty_i32` and creates wrongly-typed
+   IR locals (e.g., pointer-to-union temp declared as `int32_t`).
+
+2. **`lower_expr(NODE_FIELD)` type inference** — when `checker_get_type`
+   returns NULL for a freshly-synthesized field node, infer from object type +
+   field name. Covers has_value, value, _tag, struct fields, union variant
+   fields. Prevents creating null-typed temps that the emitter skips
+   declaring — which produced "_zer_tN undeclared" GCC errors.
+
+3. **`IR_ASSIGN` array-to-array memcpy** — emitter now detects
+   `dst is TYPE_ARRAY && src is TYPE_ARRAY` and emits
+   `memcpy(dst, src, sizeof(dst))` instead of `dst = src` (invalid C).
+   Mirrors the existing BUG-548 fix for `IR_COPY`. Needed for union array
+   variants: `|v|` captures the entire array field.
+
+**Tests added (regression coverage):**
+
+- `tests/zer/switch_arm_orelse_value.zer` — value fallback orelse in enum arm
+- `tests/zer/switch_arm_for_loop.zer` — for-loop in arm body
+- `tests/zer/switch_arm_orelse_break.zer` — orelse break inside loop+switch
+- `tests/zer/switch_arm_nested_switch.zer` — switch inside switch arm
+- `tests/zer/switch_arm_while_continue.zer` — while+continue in arm body
+
+All verify real exit codes (not just `--run` which masks failures — see
+`docs/limitations.md`).
+
+**Architectural impact:** The IR_NOP `NODE_SWITCH` passthrough is still in
+the emitter for backward compatibility, but no longer reached from
+`ir_lower.c` (which emits normal IR blocks for all switch types now). The
+emitter's ~500 lines of mini-emit_stmt for switch arm bodies become dead code
+— keeping for now, will remove in a follow-up. The last remaining `emit_stmt`
+reference in the IR function body path is gone.
+
+**Pattern lesson:** "Mini-emit_stmt inside IR_NOP passthrough" is a seductive
+shortcut that silently accrues gaps as new statement kinds are added. The
+`tools/walker_audit.sh` only compares `emit_expr` vs `emit_rewritten_node`;
+it doesn't cover nested sub-switches inside IR op handlers. Future audits
+should grep for `inst->expr->kind ==` / `NODE_` sub-switches in emitter
+op handlers and check them against the full NodeKind list.
+
+---
+
 ## Session 2026-04-17 (night) — BUG-577: universal orelse pre-lowering
 
 Triggered by a real ZER program (linked_list.zer) that hung on

@@ -1,0 +1,35 @@
+// BUG-579d — for-loop inside enum switch arm body
+enum S { sum, product }
+
+u32 main() {
+    S op = S.sum;
+    u32 r = 0;
+    switch (op) {
+        .sum => {
+            for (u32 i = 1; i <= 4; i += 1) {
+                r += i;
+            }
+        }
+        .product => {
+            r = 1;
+            for (u32 i = 1; i <= 4; i += 1) {
+                r *= i;
+            }
+        }
+    }
+    if (r != 10) { return 1; }
+
+    op = S.product;
+    r = 0;
+    switch (op) {
+        .sum => { r = 99; }
+        .product => {
+            r = 1;
+            for (u32 i = 1; i <= 4; i += 1) {
+                r *= i;
+            }
+        }
+    }
+    if (r != 24) { return 2; }
+    return 0;
+}

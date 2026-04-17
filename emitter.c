@@ -7460,17 +7460,30 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             /* ?void from void call now handled at lowering time:
              * void call → IR_ASSIGN(void), then IR_LITERAL(kind=6) for {1}. */
 
+            /* Type adaptation between source and dest */
+            Type *src_type = checker_get_type(e->checker, inst->expr);
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+            Type *dst_type = dest->type;
+            Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
+
+            /* Array→array assignment: use memcpy (BUG-579: union array variant
+             * capture needs this). Must emit BEFORE "dst = " prefix. */
+            if (dst_eff && dst_eff->kind == TYPE_ARRAY &&
+                src_eff && src_eff->kind == TYPE_ARRAY) {
+                const char *sp = func->is_async ? "self->" : "";
+                emit_indent(e);
+                emit(e, "memcpy(%s%.*s, ", sp, (int)dest->name_len, dest->name);
+                emit_rewritten_node(e, inst->expr, func);
+                emit(e, ", sizeof(%s%.*s));\n", sp, (int)dest->name_len, dest->name);
+                break;
+            }
+
             emit_indent(e);
             if (func->is_async) {
                 emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
                 emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
-            /* Type adaptation between source and dest */
-            Type *src_type = checker_get_type(e->checker, inst->expr);
-            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
-            Type *dst_type = dest->type;
-            Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
 
             bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
                                dst_eff && dst_eff->kind != TYPE_OPTIONAL &&

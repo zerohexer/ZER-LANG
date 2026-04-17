@@ -1,0 +1,24 @@
+// BUG-579a — orelse with value fallback inside enum switch arm
+?u32 maybe_null() { return null; }
+?u32 maybe_ok() { return 42; }
+
+enum S { a, b }
+
+u32 main() {
+    S s = S.a;
+    u32 x = 0;
+    switch (s) {
+        .a => { x = maybe_null() orelse 42; }
+        .b => {}
+    }
+    if (x != 42) { return 1; }
+
+    s = S.b;
+    x = 0;
+    switch (s) {
+        .a => { x = 1; }
+        .b => { x = maybe_ok() orelse 99; }
+    }
+    if (x != 42) { return 2; }
+    return 0;
+}

@@ -1,0 +1,39 @@
+// BUG-579e — nested switch inside enum switch arm
+enum Outer { first, second }
+enum Inner { alpha, beta }
+
+u32 main() {
+    Outer o = Outer.first;
+    Inner i = Inner.beta;
+    u32 r = 0;
+    switch (o) {
+        .first => {
+            switch (i) {
+                .alpha => { r = 10; }
+                .beta => { r = 20; }
+            }
+        }
+        .second => {
+            switch (i) {
+                .alpha => { r = 30; }
+                .beta => { r = 40; }
+            }
+        }
+    }
+    if (r != 20) { return 1; }
+
+    o = Outer.second;
+    i = Inner.alpha;
+    r = 0;
+    switch (o) {
+        .first => { r = 99; }
+        .second => {
+            switch (i) {
+                .alpha => { r = 30; }
+                .beta => { r = 40; }
+            }
+        }
+    }
+    if (r != 30) { return 2; }
+    return 0;
+}

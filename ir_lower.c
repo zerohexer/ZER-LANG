@@ -303,6 +303,10 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Unary operations: decompose operand ---- */
     case NODE_UNARY: {
+        /* Address-of (&) must preserve the operand's lvalue. Decomposing
+         * `arr[0]` to a temp then taking &temp gives a pointer to the copy,
+         * not the array element. Passthrough keeps `&arr[0]` intact. */
+        if (expr->unary.op == TOK_AMP) goto passthrough;
         int operand = lower_expr(ctx, expr->unary.operand);
         Type *rt = checker_get_type(ctx->checker, expr);
         if (!rt) rt = ty_i32;
@@ -818,8 +822,11 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback) {
         Node *fb = orelse_node->orelse.fallback;
         /* Value expression fallback — assign to dest_local.
-         * Block fallback — lower statements (may terminate via break/return/goto). */
-        if (fb->kind != NODE_BLOCK) {
+         * Block fallback — lower statements (may terminate via break/return/goto).
+         * Nested orelse (e.g., `a() orelse b() orelse 0`) — recurse to lower the inner. */
+        if (fb->kind == NODE_ORELSE) {
+            lower_orelse_to_dest(ctx, dest_local, fb, line);
+        } else if (fb->kind != NODE_BLOCK) {
             /* Value fallback: dest_local = fallback_value; */
             if (dest_local >= 0) {
                 IRInst assign = make_inst(IR_ASSIGN, line);

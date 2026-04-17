@@ -4,17 +4,6 @@ Memory-safe C. Same syntax, same mental model — but the compiler prevents buff
 
 **Zero setup.** Compiler, LSP, and portable GCC are bundled. Install the extension, open a `.zer` file, start coding.
 
-## Features
-
-- **Syntax highlighting** — keywords, types, intrinsics, operators, string literals
-- **LSP diagnostics** — real-time errors and warnings as you type
-- **Hover info** — type information on hover
-- **Go-to-definition** — jump to function/struct/enum declarations
-- **Completions** — keywords, intrinsics (`@ptrcast`, `@size`, etc.), types, builtins
-- **Bundled compiler** — `zerc` available from VS Code terminal
-- **Bundled GCC** — `zerc --run` compiles and executes directly, no toolchain setup
-- **Cross-platform** — Windows (bundled w64devkit GCC), Linux, macOS
-
 ## Quick Start
 
 1. Install the extension
@@ -35,7 +24,7 @@ u32 main() {
 
 | Bug Class | Prevention | Cost |
 |---|---|---|
-| Buffer overflow | Bounds check on every array/slice access (proven-safe = zero overhead) | ~0-4% |
+| Buffer overflow | Proven-safe indices skip checks; unproven get compile-time auto-guard | 0% |
 | Use-after-free | Handle generation counter + compile-time zercheck | 0% (compile) |
 | Null dereference | `*T` non-null by default, `?T` requires unwrap | 0% |
 | Integer overflow | Wraps (defined behavior), never UB | 0% |
@@ -130,7 +119,7 @@ async void sensor_poll() {
 @barrier_wait(sync_point);
 ```
 
-## Hardware Support — Embedded First
+## Hardware Support — GCC Supported Architectures
 
 ```zer
 // MMIO registers
@@ -205,21 +194,6 @@ u32 main() {
 |---|---|---|
 | `zer.lspPath` | (bundled) | Path to `zer-lsp` executable. Leave empty to use bundled. |
 | `zer.lspArgs` | `[]` | Additional arguments for `zer-lsp` |
-
-## v0.4.1 Changelog
-
-- **IR path at 100% across every test suite** — every pattern validated end-to-end through IR emission (not just integration tests)
-- 35 IR bug fixes (BUG-538 through BUG-572) covering null/optional handling, defer lifecycle across loops/if-bodies/switch arms, array→slice coercion, single-eval guarantees, union mutable captures, nested orelse chains, auto-guard wiring, address-of lvalue preservation, `?void` return semantics, bit extraction, static locals
-- Three-state `IR_DEFER_FIRE` encoding (emit+pop / emit,no-pop / pop-only) to correctly handle defers in loops with divergent paths (break, continue, orelse-continue)
-- **4,000+ tests — all passing:** 238 E2E emit tests, 102 firmware patterns, 14 production CRC/bootloader, 584 type checker, 786 Rust-equivalent safety translations, 277 integration, 36 Zig, 28 multi-module
-
-## v0.4.0 Changelog
-
-- **MIR-inspired IR emission pipeline** — 100% IR for function bodies
-- IR is now the default emission path (`--no-ir` for AST fallback)
-- Cross-module function and variable name mangling
-- `emit_builtin_inline` — pool/slab/ring/arena/Task builtins from local IDs
-- `emit_rewritten_node` — all expression types emitted directly, zero `emit_expr`
 
 ## Links
 

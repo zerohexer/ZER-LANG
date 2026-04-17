@@ -640,10 +640,22 @@ static IROpKind classify_builtin_call(LowerCtx *ctx, Node *call,
     return IR_NOP; /* Not a builtin — regular method call */
 }
 
-/* Emit IR_DEFER_FIRE for pending defers */
+/* Emit IR_DEFER_FIRE for pending defers (fire all, no pop — function/return exit) */
 static void emit_defer_fire(LowerCtx *ctx, int line) {
     if (ctx->defer_count > 0) {
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        emit_inst(ctx, fire);
+    }
+}
+
+/* Emit scoped IR_DEFER_FIRE: fire defers from top down to base.
+ * pop=true: remove them from emitter stack (for end of loop iteration).
+ * pop=false: keep on stack (for mid-body break/continue). */
+static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) {
+    if (ctx->defer_count > base) {
+        IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        fire.cond_local = base;
+        fire.src2_local = pop ? 0 : 1;
         emit_inst(ctx, fire);
     }
 }
@@ -759,24 +771,15 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     int tmp_id = ir_add_local(ctx->func, ctx->arena,
         tmp_name, (uint32_t)tl, opt_type, false, false, true, line);
 
-    /* Emit: tmp = expr */
+    /* Emit: tmp = expr.
+     * Phase 8d: builtins (pool/slab/ring/arena) emit via IR_ASSIGN passthrough.
+     * emit_rewritten_node detects builtins and calls emit_builtin_inline. */
     Node *inner = orelse_node->orelse.expr;
     rewrite_idents(ctx, inner);
-    int obj_local, handle_local;
-    IROpKind builtin = classify_builtin_call(ctx, inner, &obj_local, &handle_local);
-    if (builtin != IR_NOP) {
-        IRInst alloc = make_inst(builtin, line);
-        alloc.dest_local = tmp_id;
-        alloc.obj_local = obj_local;
-        alloc.handle_local = handle_local;
-        alloc.expr = inner;
-        emit_inst(ctx, alloc);
-    } else {
-        IRInst assign_tmp = make_inst(IR_ASSIGN, line);
-        assign_tmp.dest_local = tmp_id;
-        assign_tmp.expr = inner;
-        emit_inst(ctx, assign_tmp);
-    }
+    IRInst assign_tmp = make_inst(IR_ASSIGN, line);
+    assign_tmp.dest_local = tmp_id;
+    assign_tmp.expr = inner;
+    emit_inst(ctx, assign_tmp);
 
     /* Determine if fallback always terminates (return/break/continue/goto) */
     bool fallback_terminates = orelse_node->orelse.fallback_is_return ||
@@ -813,17 +816,23 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         go.goto_block = ctx->loop_continue_block;
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback) {
-        /* Block or default value fallback.
-         * Lower the fallback as a statement — it may contain break/return/goto
-         * which terminates the block. If it doesn't terminate, it's a default value. */
-        lower_stmt(ctx, orelse_node->orelse.fallback);
-        /* Check if the fallback actually terminated (break, return, etc.) */
-        IRBlock *fb = &ctx->func->blocks[ctx->current_block];
-        if (fb->inst_count == 0 || !ir_block_is_terminated(fb)) {
-            /* Fallback didn't terminate — it's a default value expression.
-             * But we already lowered it as statements. Need to assign result.
-             * For simple default values (literals), the lowered stmt is an
-             * IR_ASSIGN. For blocks with break/return, it terminated above. */
+        Node *fb = orelse_node->orelse.fallback;
+        /* Value expression fallback — assign to dest_local.
+         * Block fallback — lower statements (may terminate via break/return/goto). */
+        if (fb->kind != NODE_BLOCK) {
+            /* Value fallback: dest_local = fallback_value; */
+            if (dest_local >= 0) {
+                IRInst assign = make_inst(IR_ASSIGN, line);
+                assign.dest_local = dest_local;
+                assign.expr = fb;
+                emit_inst(ctx, assign);
+            }
+        } else {
+            lower_stmt(ctx, fb);
+        }
+        /* Check if fallback terminated; if not, goto join */
+        IRBlock *fb_blk = &ctx->func->blocks[ctx->current_block];
+        if (fb_blk->inst_count == 0 || !ir_block_is_terminated(fb_blk)) {
             if (bb_join >= 0) {
                 IRInst go = make_inst(IR_GOTO, line);
                 go.goto_block = bb_join;
@@ -843,12 +852,14 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         }
     }
 
-    /* === Ok block: unwrap value === */
+    /* === Ok block: unwrap value from tmp (NOT re-emit inner expr — side effects!) ===
+     * IR_COPY src=tmp, dst=dest_local: emitter detects src=optional+dst=non-optional
+     * and appends .value for unwrap. */
     ctx->current_block = bb_ok;
     if (dest_local >= 0) {
-        IRInst unwrap = make_inst(IR_ASSIGN, line);
+        IRInst unwrap = make_inst(IR_COPY, line);
         unwrap.dest_local = dest_local;
-        unwrap.expr = orelse_node->orelse.expr; /* emitter appends .value */
+        unwrap.src1_local = tmp_id;
         emit_inst(ctx, unwrap);
     }
     if (fallback_terminates) {
@@ -883,7 +894,17 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Variable declaration: assign to local ---- */
     case NODE_VAR_DECL: {
-        if (node->var_decl.is_static) break; /* static handled differently */
+        /* Static locals: declare as `static T name = {0};`. Init only at declaration
+         * (C semantics — runs once). Skip lowering init expression — user must use a
+         * compile-time constant (enforced by checker). */
+        if (node->var_decl.is_static) {
+            Type *vt = checker_get_type(ctx->checker, node);
+            int sid = ir_add_local(ctx->func, ctx->arena,
+                node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                vt, false, false, false, node->loc.line);
+            if (sid >= 0) ctx->func->locals[sid].is_static = true;
+            break;
+        }
         /* On-demand local creation — creates at the point encountered during
          * sequential lowering. For scope conflicts (same name, different type),
          * ir_add_local creates a suffixed local. */
@@ -1089,6 +1110,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Body block */
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->for_stmt.body);
+        /* Fire and pop loop-scoped defers at end of body (per-iteration fire) */
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, true, node->loc.line);
+        ctx->defer_count = ctx->loop_defer_base;
         ensure_terminated(ctx, bb_step);
 
         /* Step block */
@@ -1138,6 +1162,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->while_stmt.body);
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, true, node->loc.line);
+        ctx->defer_count = ctx->loop_defer_base;
         ensure_terminated(ctx, bb_cond);
 
         ctx->current_block = bb_exit;
@@ -1166,6 +1192,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Body first (execute at least once) */
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->while_stmt.body);
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, true, node->loc.line);
+        ctx->defer_count = ctx->loop_defer_base;
         ensure_terminated(ctx, bb_cond);
 
         /* Then condition */
@@ -1248,8 +1276,33 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 /* Default arm — unconditional */
                 ensure_terminated(ctx, bb_arm);
             } else {
+                /* Build comparison: (sw_expr == val[0]) || (sw_expr == val[1]) || ... */
+                SwitchArm *arm = &node->switch_stmt.arms[i];
+                Node *cmp = NULL;
+                for (int vi = 0; vi < arm->value_count; vi++) {
+                    Node *eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(eq, 0, sizeof(Node));
+                    eq->kind = NODE_BINARY;
+                    eq->loc = node->loc;
+                    eq->binary.op = TOK_EQEQ;
+                    eq->binary.left = node->switch_stmt.expr;
+                    eq->binary.right = arm->values[vi];
+                    if (!cmp) {
+                        cmp = eq;
+                    } else {
+                        Node *or_node = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(or_node, 0, sizeof(Node));
+                        or_node->kind = NODE_BINARY;
+                        or_node->loc = node->loc;
+                        or_node->binary.op = TOK_PIPEPIPE;
+                        or_node->binary.left = cmp;
+                        or_node->binary.right = eq;
+                        cmp = or_node;
+                    }
+                }
+                rewrite_idents(ctx, cmp);
                 IRInst br = make_inst(IR_BRANCH, node->loc.line);
-                br.expr = node->switch_stmt.expr; /* emitter handles value comparison */
+                br.cond_local = lower_expr(ctx, cmp);
                 br.true_block = bb_arm;
                 br.false_block = bb_next;
                 emit_inst(ctx, br);
@@ -1309,11 +1362,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     /* ---- Break ---- */
     case NODE_BREAK: {
         if (ctx->loop_exit_block >= 0) {
-            /* Fire loop-local defers */
-            if (ctx->defer_count > ctx->loop_defer_base) {
-                IRInst fire = make_inst(IR_DEFER_FIRE, node->loc.line);
-                emit_inst(ctx, fire);
-            }
+            /* Fire loop-scoped defers (emit bodies, DO NOT pop — other paths may need them) */
+            emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_exit_block;
             emit_inst(ctx, go);
@@ -1324,10 +1374,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     /* ---- Continue ---- */
     case NODE_CONTINUE: {
         if (ctx->loop_continue_block >= 0) {
-            if (ctx->defer_count > ctx->loop_defer_base) {
-                IRInst fire = make_inst(IR_DEFER_FIRE, node->loc.line);
-                emit_inst(ctx, fire);
-            }
+            emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_continue_block;
             emit_inst(ctx, go);
@@ -1543,9 +1590,11 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     lower_stmt(&ctx, func_decl->func_decl.body);
 
     /* Ensure CURRENT block is terminated (not last block — yield may
-     * create blocks after the current one, making last != current). */
+     * create blocks after the current one, making last != current).
+     * Fire pending defers before the implicit return (same as explicit NODE_RETURN). */
     IRBlock *cur = &func->blocks[ctx.current_block];
     if (cur->inst_count == 0 || !ir_block_is_terminated(cur)) {
+        emit_defer_fire(&ctx, func_decl->loc.line);
         IRInst ret = make_inst(IR_RETURN, func_decl->loc.line);
         emit_inst(&ctx, ret);
     }

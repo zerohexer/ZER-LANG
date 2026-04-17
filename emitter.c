@@ -5077,6 +5077,7 @@ void emitter_init(Emitter *e, FILE *out, Arena *arena, Checker *checker) {
     e->out = out;
     e->arena = arena;
     e->checker = checker;
+    e->use_ir = true;  /* IR is default — AST path retained only for --no-ir fallback in zerc_main */
 }
 
 /* ================================================================
@@ -6959,9 +6960,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                          tmp, (long long)min_v, (long long)min_v,
                          tmp, (long long)max_v, (long long)max_v);
                 } else {
+                    /* Unsigned target: clamp below 0 AND above max */
                     uint64_t max_v = w >= 64 ? UINT64_MAX : ((1ULL << w) - 1);
-                    emit(e, "_zer_sat%d > %lluULL ? (%lluULL) : (",
-                         tmp, (unsigned long long)max_v, (unsigned long long)max_v);
+                    emit(e, "(int64_t)_zer_sat%d < 0 ? 0 : "
+                             "(int64_t)_zer_sat%d > %lluLL ? (%lluULL) : (",
+                         tmp, tmp, (unsigned long long)max_v,
+                         (unsigned long long)max_v);
                 }
                 emit_type(e, t);
                 emit(e, ")_zer_sat%d; })", tmp);
@@ -7270,9 +7274,22 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_SLICE: {
-        /* Sub-slice: obj[start..end] → (SliceType){ &obj.ptr[start], end-start } */
+        /* Integer bit extraction: val[hi..lo] → ((val >> lo) & ((1 << (hi-lo+1)) - 1)) */
         Type *obj_type = checker_get_type(e->checker, node->slice.object);
-        bool obj_slice = obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_SLICE;
+        Type *obj_eff = obj_type ? type_unwrap_distinct(obj_type) : NULL;
+        if (obj_eff && type_is_integer(obj_eff) && node->slice.start && node->slice.end) {
+            /* Bit extraction: val[hi..lo] with safety when hi < lo → 0 */
+            int t = e->temp_count++;
+            emit(e, "({ int _zer_hi%d = (", t);
+            emit_rewritten_node(e, node->slice.start, func);
+            emit(e, "); int _zer_lo%d = (", t);
+            emit_rewritten_node(e, node->slice.end, func);
+            emit(e, "); _zer_hi%d >= _zer_lo%d ? (((", t, t);
+            emit_rewritten_node(e, node->slice.object, func);
+            emit(e, ") >> _zer_lo%d) & ((1U << (_zer_hi%d - _zer_lo%d + 1)) - 1)) : 0U; })", t, t, t);
+            return;
+        }
+        bool obj_slice = obj_eff && obj_eff->kind == TYPE_SLICE;
         if (obj_slice) {
             emit(e, "(");
             emit_type(e, obj_type);
@@ -7666,11 +7683,25 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                !is_null_sentinel(src_eff->optional.inner));
 
             if (need_wrap) {
+                /* Detect null literal source — lower_expr(NODE_NULL_LIT) creates
+                 * a local of type *void as placeholder. Wrapping that into ?T
+                 * must emit has_value=0, not 1. */
+                bool is_null_src = src_eff && src_eff->kind == TYPE_POINTER &&
+                                   src_eff->pointer.inner &&
+                                   type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
                 if (is_void_opt(ret_eff)) {
-                    emit_local_name(e, func, inst->src1_local);
-                    emit(e, ";\n");
-                    emit_indent(e);
-                    emit(e, "return (_zer_opt_void){ 1 };\n");
+                    if (is_null_src) {
+                        emit(e, "return (_zer_opt_void){ 0 };\n");
+                    } else {
+                        emit_local_name(e, func, inst->src1_local);
+                        emit(e, ";\n");
+                        emit_indent(e);
+                        emit(e, "return (_zer_opt_void){ 1 };\n");
+                    }
+                } else if (is_null_src) {
+                    emit(e, "return (");
+                    emit_type(e, ret_eff);
+                    emit(e, "){ 0, 0 };\n");
                 } else {
                     emit(e, "return (");
                     emit_type(e, ret_eff);
@@ -7843,10 +7874,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_DEFER_FIRE: {
-        /* Fire all pending defers in LIFO order.
-         * Defer bodies are AST nodes — emit via emit_rewritten_node
-         * for expressions, handle blocks by walking statements. */
-        for (int di = e->defer_stack.count - 1; di >= 0; di--) {
+        /* Fire pending defers in LIFO order.
+         * cond_local >= 0: scoped fire from top down to base (cond_local).
+         * src2_local == 1: do NOT pop (for break/continue mid-body).
+         * src2_local == 0 (default): pop on scoped fire.
+         * cond_local == -1: fire all (no pop — function exit). */
+        int base = (inst->cond_local >= 0) ? inst->cond_local : 0;
+        bool pop = (inst->cond_local >= 0) && (inst->src2_local != 1);
+        for (int di = e->defer_stack.count - 1; di >= base; di--) {
             Node *db = e->defer_stack.stmts[di];
             if (!db) continue;
             if (db->kind == NODE_BLOCK) {
@@ -7887,6 +7922,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ";\n");
             }
         }
+        if (pop) e->defer_stack.count = base;
         break;
     }
 
@@ -8227,8 +8263,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                               src_eff && src_eff->kind == TYPE_ARRAY);
 
             const char *sp = func->is_async ? "self->" : "";
+
+            /* Array→array copy: use memcpy (C can't assign arrays).
+             * Handle BEFORE emitting "dst = " prefix. */
+            bool need_arr_copy = (dst_eff && dst_eff->kind == TYPE_ARRAY &&
+                                  src_eff && src_eff->kind == TYPE_ARRAY);
+            if (need_arr_copy) {
+                emit_indent(e);
+                emit(e, "memcpy(%s%.*s, %s%.*s, sizeof(%s%.*s));\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)src->name_len, src->name,
+                     sp, (int)src->name_len, src->name);
+                break;
+            }
+
             emit_indent(e);
             emit(e, "%s%.*s = ", sp, (int)dst->name_len, dst->name);
+
+            /* Detect null literal source — lower_expr(NODE_NULL_LIT) creates
+             * a local of type *void as placeholder. Wrapping that into ?T
+             * must emit has_value=0, not 1. */
+            bool is_null_src = src_eff && src_eff->kind == TYPE_POINTER &&
+                               src_eff->pointer.inner &&
+                               type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
             if (need_slice) {
                 emit(e, "(");
@@ -8236,6 +8293,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "){ %s%.*s, %u };\n",
                      sp, (int)src->name_len, src->name,
                      src_eff ? (unsigned)src_eff->array.size : 0);
+            } else if (need_wrap && is_null_src) {
+                if (is_void_opt(dst_eff)) {
+                    emit(e, "(_zer_opt_void){ 0 };\n");
+                } else {
+                    emit(e, "(");
+                    emit_type(e, dst_eff);
+                    emit(e, "){ 0, 0 };\n");
+                }
             } else if (need_wrap) {
                 emit(e, "(");
                 emit_type(e, dst_eff);
@@ -8567,13 +8632,15 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
     e->defer_stack.count = 0; /* clear defer stack from previous function */
 
-    /* Declare local variables (skip params — they're parameters) */
+    /* Declare local variables (skip params — they're parameters).
+     * Static locals declared with static keyword (persists across calls). */
     for (int li = 0; li < func->local_count; li++) {
         IRLocal *l = &func->locals[li];
-        if (l->is_param || l->is_static) continue;
+        if (l->is_param) continue;
         if (l->is_capture && l->type && l->type->kind == TYPE_VOID) continue;
         if (!l->type) continue;
         emit_indent(e);
+        if (l->is_static) emit(e, "static ");
         emit_type_and_name(e, l->type, l->name, l->name_len);
         emit(e, " = {0};\n"); /* auto-zero */
     }

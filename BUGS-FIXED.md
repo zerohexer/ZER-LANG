@@ -5,6 +5,231 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-17 — IR path validation: flip `use_ir=true` in test harnesses (20 bugs)
+
+**Root discovery:** `emitter_init` does `memset(e, 0, sizeof(Emitter))` — `use_ir` defaulted to `false`. The `zerc` binary overrides this (sets `use_ir = true` in `zerc_main.c`), but C unit tests (test_emit.c, test_firmware*.c, test_production.c, test_zercheck.c) called `emit_file` directly after `emitter_init` and never set the flag — they ran the **AST path** despite IR being "default". Only shell-script integration tests (`tests/test_zer.sh`, `rust_tests/`, `zig_tests/`, `test_modules/`) validated IR. About 3,000 of the 4,000+ tests were silently AST-only.
+
+Flipping `emitter_init` default to `use_ir = true` surfaced **61 hidden IR bugs** in test_emit alone, plus 15 more in firmware/production tests. 20 root-cause fixes reduced failures to 18 (70% reduction). All integration tests stay green.
+
+**Also discovered:** `zerc --run` historically returned exit code 0 even when the compiled program trapped (SIGTRAP, exit 133). Many rust_tests/ were "passing" while the emitted binary actually UAF-trapped at runtime. Post-fix, tests that previously trapped silently now fail loudly with GCC compile errors — forcing real fixes instead of masked regressions.
+
+### BUG-538: `return null` from `?T` emitted `{val, 1}` instead of `{0, 0}` (2026-04-17)
+
+**Symptom:** `?u32 nothing() { return null; }` emitted `return (_zer_opt_u32){ _zer_t0, 1 };` with `has_value=1`. Every `orelse` then treated null as a valid value, taking the wrong branch.
+
+**Root cause:** `lower_expr(NODE_NULL_LIT)` creates a local of type `*void` as placeholder (line 244 in ir_lower.c). IR_RETURN emitter's `need_wrap` path saw `src_eff->kind != TYPE_OPTIONAL` (pointer-to-void, not optional) and wrapped with has_value=1 unconditionally.
+
+**Fix:** Detect null-literal placeholder by checking src type is `*void`, emit `{0, 0}` for struct optional / `{0}` for ?void in IR_RETURN and IR_COPY.
+
+**Test:** test_emit.c "?u32 function returns value and null correctly" — exposed by flipping `use_ir=true`.
+
+### BUG-539: `orelse <value>` fallback block never assigned value to dest (2026-04-17)
+
+**Symptom:** `u32 result = @probe(0xDEAD) orelse 42;` returned 0 instead of 42. The bb_fail block had `goto bb_join` but no `_zer_t = 42` assignment.
+
+**Root cause:** `lower_orelse_to_dest` line 819 called `lower_stmt(ctx, orelse_node->orelse.fallback)` on the value expression. `lower_stmt` is for statements (var-decl, if, return, etc.) — a bare NODE_INT_LIT produces no assignment.
+
+**Fix:** In `lower_orelse_to_dest`, if fallback kind is not NODE_BLOCK, create IR_ASSIGN(dest_local, fallback) explicitly. Block fallbacks still go through lower_stmt (for `orelse { cleanup(); break; }`).
+
+**Test:** test_emit.c "@probe E2E: invalid address → orelse returns 42" and similar orelse-value tests.
+
+### BUG-540: `lower_orelse_to_dest` used legacy `classify_builtin_call` creating dead IR ops (2026-04-17)
+
+**Symptom:** `Handle h = tasks.alloc() orelse return;` emitted `/* IR builtin dead — should be IR_ASSIGN */` with no actual allocation, then branched on an uninitialized `_zer_or` (always 0/null path). Return-0 instead of allocation result.
+
+**Root cause:** Phase 8d collapsed all builtin IR ops (IR_POOL_ALLOC, IR_SLAB_*, IR_RING_*, IR_ARENA_*) into IR_ASSIGN passthrough — emit_rewritten_node detects builtins via callee type and routes to emit_builtin_inline. But `lower_orelse_to_dest` (line 767) still called `classify_builtin_call` and created the now-deprecated IR_POOL_ALLOC ops, which the emitter treats as dead code.
+
+**Fix:** Remove the `classify_builtin_call` branch in `lower_orelse_to_dest`. Always use `IR_ASSIGN { dest: tmp, expr: inner }` — emitter handles builtins via emit_rewritten_node → emit_builtin_inline.
+
+**Test:** test_emit.c "pool alloc → set pid → get pid → free = 42" + 10 other pool/slab/ring orelse patterns.
+
+### BUG-541: Implicit function-end return didn't fire defers (2026-04-17)
+
+**Symptom:** `void f() { defer cleanup(); do_work(); }` — cleanup() never called. Function body ends without explicit return, IR appends an implicit IR_RETURN but doesn't fire pending defers.
+
+**Root cause:** `ir_lower_func` at line 1544 appends IR_RETURN if current block isn't terminated. It didn't call `emit_defer_fire` like `NODE_RETURN` handler does.
+
+**Fix:** Add `emit_defer_fire(&ctx, ...)` before the implicit IR_RETURN, matching the explicit NODE_RETURN handler.
+
+**Test:** test_emit.c "3 defers executed = counter 3".
+
+### BUG-542: `NODE_SLICE` on integer (bit extraction) emitted "unknown slice" (2026-04-17)
+
+**Symptom:** `u32 bits = val[3..0];` — emitted `/* unknown slice */ 0`. All bit extraction returned 0.
+
+**Root cause:** `emit_rewritten_node` NODE_SLICE only handled TYPE_SLICE and TYPE_ARRAY objects. Integer bit extraction (`val[hi..lo]` where val is u32/u64) had no case.
+
+**Fix:** Added integer bit extraction path: `({ int _hi = (start); int _lo = (end); _hi >= _lo ? ((val >> _lo) & ((1U << (_hi - _lo + 1)) - 1)) : 0U; })`. Uses GCC statement expression with runtime guard for hi < lo (returns 0 safely per BUG-337 spec).
+
+**Test:** test_emit.c bit extraction tests: `0xABCD[7..4] = 0xC`, `0xFF[3..0] = 0xF`, `0xDEADBEEF[7..0] = 0xEF`.
+
+### BUG-543: `orelse` ok-path re-emitted expression causing double side-effect (2026-04-17)
+
+**Symptom:** `u32 v = buf.pop() orelse return;` — when ring has elements, pop() executed TWICE: once to check has_value, again to get .value. Ring counter decremented by 2 per call.
+
+**Root cause:** `lower_orelse_to_dest` ok-block emitted IR_ASSIGN with `expr = orelse_node->orelse.expr` (the original inner expression). emit_rewritten_node re-emits the call. For ring.pop, this pops a second time.
+
+**Fix:** In the ok block, emit IR_COPY from tmp_id to dest_local (the already-stored optional). Emitter's IR_COPY handles unwrap via type adaptation (appends `.value` when src is optional + dst is not).
+
+**Test:** test_emit.c "ring push 42,99 → pop = 42" (FIFO order verified).
+
+### BUG-544: Loop body defers don't fire per-iteration (2026-04-17)
+
+**Symptom:** `for (i = 0; i < 3; i += 1) { defer tick(); }` — tick() fired 0 times (at function exit, not per iteration).
+
+**Root cause:** Emitter's defer_stack is COMPILE-TIME, not runtime. `IR_DEFER_PUSH` adds to stack once during emission. `IR_DEFER_FIRE` at function exit fires everything on stack once. For loops, each iteration should fire the body defers but there's only one PUSH visit compile-time and one FIRE at function end.
+
+**Fix:** Added `emit_defer_fire_scoped(ctx, base, pop, line)` helper. Emits `IR_DEFER_FIRE` with `cond_local = base` (scoped) and `src2_local = pop ? 0 : 1` flag. Loop body lowering emits scoped fire+pop at end of body block (loops through body block in emitted C = runtime fire per iteration, compile-time pop once). Break/continue emit scoped fire WITHOUT pop (other paths still reach end-of-body fire+pop).
+
+Applied to: NODE_FOR, NODE_WHILE, NODE_DO_WHILE body exits. NODE_BREAK/NODE_CONTINUE (no-pop variant). Also extended to NODE_IF bodies and integer switch arm bodies (BUG-556, BUG-557).
+
+**Test:** test_emit.c "defer in loop fires 3 times" + 7 other defer-in-loop/switch/if-body tests.
+
+### BUG-545: Integer switch `IR_BRANCH br.expr` ignored by emitter (2026-04-17)
+
+**Symptom:** `switch (x) { 1 => result = 10, 2 => result = 20, default => result = 99; }` with x=2 → returned 10 (always first arm). Every switch arm fired unconditionally.
+
+**Root cause:** Integer switch lowering emitted `IR_BRANCH { expr: switch_expr, true: bb_arm, false: bb_next }`. But IR_BRANCH emitter only reads `cond_local`, not `expr`. When cond_local is unset, emitter fell back to `if (1)` → always-true branch.
+
+**Fix:** Build AST comparison at lowering time: `(sw_expr == arm_value)` for single-value arms, OR'd together for multi-value arms. Lower the comparison via `lower_expr` → get a cond_local. Set `br.cond_local = cond_local`.
+
+**Test:** test_emit.c "switch on 2 returns 20", "3,4 => 20 multi-value arm", "integer switch, no arm matches, default = 99".
+
+### BUG-546: `@saturate(UnsignedT, signed_val)` missed lower-bound clamp (2026-04-17)
+
+**Symptom:** `@saturate(u8, -5)` returned 255 instead of 0. Signed-to-unsigned saturation should clamp negative values to 0 for unsigned target.
+
+**Root cause:** IR path's saturate emission only checked `> max_v`, not `< 0`. Also `__auto_type` on signed int + ULL comparison promoted to unsigned → -5 became huge positive → took upper-bound path → 255.
+
+**Fix:** For unsigned target, emit `(int64_t)_zer_sat < 0 ? 0 : (int64_t)_zer_sat > max ? max : (uint8_t)_zer_sat`. Explicit `(int64_t)` cast prevents signed/unsigned comparison promotion.
+
+**Test:** test_emit.c "@saturate(u8, -5) = 0" — BUG-188 regression surfaced by IR path flip.
+
+### BUG-547: Static locals skipped entirely from IR lowering (2026-04-17)
+
+**Symptom:** `static u32 c = 0;` inside function — emitted no declaration. Uses of `c` below failed with "undeclared".
+
+**Root cause:** `lower_stmt(NODE_VAR_DECL)` had `if (node->var_decl.is_static) break;` — static vars skipped. `IRLocal` had an `is_static` field (unused) but no path to set it.
+
+**Fix:** For static var-decl, register an IRLocal with `is_static = true`. Emitter declares with `static T name = {0};` (zero-init since C requires static init to be a compile-time constant; BUG-399 tier restricts complex initializers).
+
+**Test:** test_emit.c "static local retains value across calls".
+
+### BUG-548: Array-to-array copy emitted invalid `dst = src` (2026-04-17)
+
+**Symptom:** `u8[4] dst = src;` (both arrays) emitted `dst = src;` — GCC "assignment to expression with array type" error.
+
+**Root cause:** IR_COPY's type adaptation didn't handle array→array copies. C can't assign arrays — need memcpy.
+
+**Fix:** Detect `dst_eff->kind == TYPE_ARRAY && src_eff->kind == TYPE_ARRAY`, emit `memcpy(dst, src, sizeof(src));` directly (skip the usual `dst = ` prefix).
+
+**Test:** test_emit.c "array init from array → memcpy, 1+4=5".
+
+### BUG-549: Enum switch arm-scoped defers leaked out of arm (2026-04-17)
+
+**Symptom:** Test `rt_drop_enum_variant_cleanup.zer`: defer `pool.free(h2)` declared inside `.nested` arm body fired at function exit, where `h2` is out of scope → GCC "'h2' undeclared".
+
+**Root cause:** Enum switch IR_NOP passthrough walks arm bodies and handles NODE_DEFER by pushing to emitter's compile-time defer_stack. Never popped at arm end. My BUG-541 fix (fire defers at implicit function exit) exposed this: previously the leaked h2 defer was silently dropped, now it fires after scope end.
+
+**Hidden impact:** BEFORE this session, `rt_drop_enum_variant_cleanup` was reported "passing" in rust_tests but actually trapped with SIGTRAP (UAF in pool.get(h2=0)). `zerc --run` returned 0 ignoring child exit code → false-pass. Post-fix, the test actually passes.
+
+**Fix:** In the arm body walker, save `arm_defer_base = e->defer_stack.count` at arm start. After arm body, emit all defers pushed during arm (in LIFO order) as inline statements, then restore `defer_stack.count = arm_defer_base`.
+
+**Test:** rust_tests/rt_drop_enum_variant_cleanup.zer.
+
+### BUG-550: NODE_ORELSE inside switch arm var-decl hit "unhandled node" (2026-04-17)
+
+**Symptom:** `Handle h = pool.alloc() orelse return;` inside enum switch arm — emitted `Handle h = /* unhandled node 47 */0;`. GCC warning + runtime trap on h=0.
+
+**Root cause:** Switch arm var-decl walker emitted `= <init_expr>` via emit_rewritten_node. NODE_ORELSE has no case in emit_rewritten_node (goes to default "unhandled"). The IR lowering normally converts NODE_ORELSE to branch+assign, but arm bodies are NOT lowered through IR — they're passthrough AST emitted directly.
+
+**Fix:** In switch arm NODE_VAR_DECL, detect init kind == NODE_ORELSE. Emit block pattern: `Type name; { __typeof__(expr) tmp = expr; if (!tmp.has_value) { defers+return } name = tmp.value; }`. Handles fallback_is_return (fires outer defers + appropriate return value) and value fallback.
+
+**Test:** rust_tests/rt_drop_enum_variant_cleanup.zer.
+
+### BUG-551: `&arr[0]` took address of temp copy, not array element (2026-04-17)
+
+**Symptom:** `sum_three(&arr[0])` where sum_three reads data[0..2] — got garbage values. IR emitted `_zer_t3 = arr[0]; _zer_t4 = &_zer_t3;` — pointer to temp copy, not to arr[0].
+
+**Root cause:** `lower_expr(NODE_UNARY)` unconditionally decomposed the operand via `lower_expr(operand)` first, creating a temp local holding the operand's VALUE. Then `&_zer_t3` took address of the temp. For `&arr[0]`, arr[0] is an lvalue that got copied to a temp → pointer to copy.
+
+**Fix:** In `lower_expr(NODE_UNARY)`, if op is `TOK_AMP` (address-of), go to passthrough (keep the original expression intact). Emit via emit_rewritten_node which preserves lvalue semantics: `&arr[0]`, `&obj.field`, `&g_var` all emitted correctly.
+
+**Test:** test_firmware_patterns2.c "array passed via &arr[0]", "?*T passed between functions" (uses `&g_buf`).
+
+### BUG-552: Mutable capture `if (x) |*v| { *v = 42 }` copied value instead of taking address (2026-04-17)
+
+**Symptom:** `?u32 x = get_val(); if (x) |*v| { *v = 42; } return x orelse 0;` returned 10 (original) not 42. Modifying through v had no effect on x.
+
+**Root cause:** If-unwrap lowering emitted IR_COPY from `br.cond_local` (optional) to capture local (declared as `*T`). IR_COPY emitter appended `.value` to unwrap — `v = x.value` copied the scalar, not `v = &x.value` (pointer to optional's storage).
+
+**Fix:** Added `need_addr_capture` detection in IR_COPY: `dst->is_capture && dst_eff->kind == TYPE_POINTER && src_eff is non-null-sentinel optional` → emit `v = &src.value;`.
+
+**Test:** test_firmware_patterns2.c "|*val| modifies original".
+
+### BUG-553: Nested `orelse` chain `a() orelse b() orelse 0` unhandled (2026-04-17)
+
+**Symptom:** `u32 val = try_a() orelse try_b() orelse 0;` — outer orelse's fallback is another NODE_ORELSE. emit_rewritten_node default emitted `/* unhandled node 47 */0`.
+
+**Root cause:** `lower_orelse_to_dest` fallback handling (after BUG-539 fix) created IR_ASSIGN(dest, fallback) for non-block fallbacks. For nested orelse, emitter tried to emit the NODE_ORELSE as a value expression → unhandled.
+
+**Fix:** Detect `fb->kind == NODE_ORELSE` in fallback branch — recursively call `lower_orelse_to_dest(ctx, dest_local, fb, line)`. Chains of any depth now lower correctly via recursion.
+
+**Test:** test_emit.c "3-level orelse chain: fail→fail→succeed=77", test_firmware_patterns.c "nested orelse chain", test_firmware_patterns3.c "optional chain: A fails, B succeeds".
+
+### BUG-554: Enum switch single-expression arm emitted "unhandled node" (2026-04-17)
+
+**Symptom:** `Dir.west => result = 4` (no braces) — arm->body is NODE_EXPR_STMT (not NODE_BLOCK). Non-BLOCK path called `emit_rewritten_node(arm->body, ...)` which hit unhandled-default for NODE_EXPR_STMT.
+
+**Root cause:** The non-BLOCK arm body branch assumed `arm->body` was an expression, but parser actually wraps single-statement arms in NODE_EXPR_STMT.
+
+**Fix:** Before falling through to emit_rewritten_node(arm->body), check for `NODE_EXPR_STMT` (emit `.expr_stmt.expr` + `;`) and `NODE_RETURN` (emit `return ...;` with optional wrapping).
+
+**Test:** test_emit.c "enum Dir with 5 variants, switch to west = 4".
+
+### BUG-555: if-else inside switch arm silently dropped else-body (2026-04-17)
+
+**Symptom:** Bootloader test: `switch (state) { .init => { if (force_dfu) { ... } else { state = check_app } } }` — the else branch was never emitted. State transition didn't happen.
+
+**Root cause:** The NODE_IF handler in switch arm body walker emitted only the then-body. Else-body was silently dropped.
+
+**Fix:** Extracted EMIT_ARM_IF_BODY macro to emit a body (block or single stmt). Emit then-body + `} else {` + else-body (if present). Macro keeps the two paths in sync — any future NODE_IF body statement kind added is handled in both branches.
+
+**Test:** test_production.c "bootloader: init→check→validate(match)→jump" — surfaced only in end-to-end state machine flow.
+
+### BUG-556: Defers inside if-body didn't fire at block exit (2026-04-17)
+
+**Symptom:** `if (maybe()) |val| { defer inc(); counter += 10; }` — inc() fired at function exit, not if-body exit. Caused off-by-defers in subsequent reads of counter.
+
+**Root cause:** NODE_IF lowering didn't save/restore defer count around then_body / else_body.
+
+**Fix:** In NODE_IF lowering, save `then_defer_base` before lowering then_body, emit scoped fire+pop after. Same for else_body. Now matches loop-body and switch-arm patterns.
+
+**Test:** test_emit.c "defer fires inside if-unwrap block, counter=11 before after_if".
+
+### BUG-557: Defers inside integer switch arm didn't fire at arm exit (2026-04-17)
+
+**Symptom:** `switch (x) { 1 => { defer bump(); result = 1; } }` — bump() fired at function exit, not arm exit. Off-by-N in subsequent reads.
+
+**Root cause:** Integer switch arm (emitted via IR branches) lowered arm body via `lower_stmt(arm->body)` without scoped defer bracketing. Enum switch PASSTHROUGH handles arm defers (via emitter's defer_stack save/restore, BUG-549) but integer switch arms use IR lowering which didn't.
+
+**Fix:** In integer switch arm lowering, save `arm_defer_base = ctx->defer_count` before `lower_stmt`, emit scoped fire+pop after, restore `ctx->defer_count`.
+
+**Test:** test_emit.c "defer in switch arm 1: result=1 + g=10 = 11".
+
+### Summary
+
+- 20 IR path bugs fixed
+- test_emit: 177/238 → 220/238 (+43)
+- test_firmware: 37/39 → 39/39
+- test_firmware2: 38/41 → 41/41
+- test_firmware3: 21/22 → 22/22
+- test_production: 7/14 → 14/14
+- Integration tests: rust 786/786, zer 277/277, zig 36/36, module 28/28 — all green
+- Remaining test_emit failures (18): volatile slice tracking (4), auto-guard (3), array-slice coercion in var-decl/call (2), single-eval guarantees (3), union switch `|*v|` mutable capture, ?void function (2), @config, @size(union), defer+orelse+for interaction — all specialized features needing larger changes
+
+---
+
 ## Session 2026-04-15 — IR Implementation (Phases 1-5)
 
 ### IR foundation implemented

@@ -494,7 +494,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime float arithmetic | Done | Done (parallel float eval path, %.17g emission) |
 | `Semaphore(N)` builtin type | Done | Done (@sem_acquire/@sem_release, *Semaphore pointer params) |
 | Function summaries (FuncProps) | Done | N/A (compile-time — context safety: transitive yield/spawn/alloc detection) |
-| IR Phase 1-9 (data structures, lowering, 3AC, emission, zercheck, VRP) | Done | Done. **IR IS DEFAULT (`use_ir=true`). `--no-ir` for AST fallback.** Phase 8: (a) on-demand locals, ident rewriting, scope conflict BUG-507, async yield BUG-508/509/510. (b) `lower_expr()` wired for ident/literal/binary/unary/field/index/string → IR_COPY + 3AC ops emit from local IDs. (c) **`can_lower_expr()` DELETED, `emit_ir_value()` DELETED (Phase 8d).** `lower_expr` is unconditional — ALL expressions get local IDs. Complex expressions (calls, intrinsics, builtins, orelse, casts, struct-init) passthrough via `IR_ASSIGN{dest,expr}` → emitter calls `emit_expr` directly. All other IR ops (BRANCH, RETURN, CALL, AWAIT, BINOP, UNOP, FIELD_READ, INDEX_READ, builtins, INTRINSIC) use local IDs exclusively via `emit_local_name()` helper. Zero `emit_ir_value` calls. BUG-513 through BUG-530. **`emit_expr` in `emit_ir_inst`: ZERO.** `emit_rewritten_node(e, node, func)` handles ALL expression types directly. `emit_builtin_inline(e, node, func)` handles pool/slab/ring/arena/Task builtins + arena.alloc_slice + ring.push_checked. Condvar pointer vs struct accessor detection. @atomic_* via __atomic builtins. @cstr/@cond_wait/signal/broadcast/timedwait/@sem_*/@probe direct emission. **Cross-module name mangling:** functions use symbol->module_prefix, variables use e->current_module, static vars fallback to current_module. NODE_RETURN evaluates expr BEFORE defers (BUG-531). NODE_INDEX on global arrays → passthrough (BUG-532). BUG-513 through BUG-537. **100% IR for function bodies: ZERO emit_stmt, ZERO emit_expr.** AST (`emit_expr`/`emit_stmt`) ONLY for top-level declarations. Switch (enum/union/optional) emitted directly: enum `_ZER_Name_variant` if/else chain, union `._tag` comparison + memcpy capture, optional `.has_value`/`.value` unwrap. Arm bodies handle var-decl/defer/if/return(optional wrap). **196/196 ZER, 28/28 module, 786/786 rust, 36/36 zig. make check ALL TESTS PASSED.** |
+| IR Phase 1-9 (data structures, lowering, 3AC, emission, zercheck, VRP) | Done | Done. **IR IS DEFAULT for all emission paths (binary AND test harnesses) since 2026-04-17.** Phase 8: (a) on-demand locals, ident rewriting, scope conflict BUG-507, async yield BUG-508/509/510. (b) `lower_expr()` wired for ident/literal/binary/unary/field/index/string → IR_COPY + 3AC ops emit from local IDs. (c) **`can_lower_expr()` DELETED, `emit_ir_value()` DELETED (Phase 8d).** `lower_expr` is unconditional — ALL expressions get local IDs. Complex expressions (calls, intrinsics, builtins, orelse, casts, struct-init) passthrough via `IR_ASSIGN{dest,expr}` → emitter calls `emit_expr` directly. All other IR ops (BRANCH, RETURN, CALL, AWAIT, BINOP, UNOP, FIELD_READ, INDEX_READ, builtins, INTRINSIC) use local IDs exclusively via `emit_local_name()` helper. **`emit_expr` in `emit_ir_inst`: ZERO.** `emit_rewritten_node(e, node, func)` handles ALL expression types directly. `emit_builtin_inline(e, node, func)` handles pool/slab/ring/arena/Task builtins. Condvar pointer vs struct accessor detection. @atomic_* via __atomic builtins. @cstr/@cond_wait/signal/broadcast/timedwait/@sem_*/@probe direct emission. **Cross-module name mangling:** functions use symbol->module_prefix, variables use e->current_module, static vars fallback to current_module. **100% IR for function bodies: ZERO emit_stmt, ZERO emit_expr.** AST ONLY for top-level declarations. Switch (enum/union/optional) emitted directly: enum `_ZER_Name_variant` if/else chain, union `._tag` + memcpy capture, optional `.has_value`/`.value`. Arm bodies handle var-decl/defer/if(+else)/return(optional wrap)/expr-stmt. **Scoped defer fire:** loops, if-bodies, switch arms all save `defer_count` at entry, emit scoped `IR_DEFER_FIRE` + pop at exit. `src2_local=1` flag on IR_DEFER_FIRE = no-pop variant for break/continue. BUG-513 through BUG-557. **All integration tests green: 277 ZER, 28 module, 786 rust, 36 zig, 584 checker, 54 zercheck, 39+41+22 firmware, 14 production.** |
 
 ### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
 
@@ -1209,6 +1209,61 @@ The audit round found 6 bugs, real code found 5 more, real-code session 2 found 
 - `zer.lspPath` in VS Code settings overrides bundled binary detection — clear it if LSP fails
 - `where zerc` check must run BEFORE `process.env.PATH` injection in extension.js
 - Multiple extension versions can coexist — remove old ones from `.vscode/extensions/`
+
+## IR Path Validation — MANDATORY context for fresh sessions (2026-04-17)
+
+`emitter_init` sets `use_ir = true` by default. ALL test harnesses (test_emit.c, test_firmware*.c, test_production.c, test_zercheck.c) exercise the IR path via `emit_file`. **Before 2026-04-17, they silently ran AST** because `memset(e, 0)` zero-initialized `use_ir=false`. Flipping the default surfaced 20 latent IR bugs (BUG-538 through BUG-557, see BUGS-FIXED.md).
+
+**Lesson for future IR changes:** The integration tests (`tests/test_zer.sh`, `rust_tests/`, `zig_tests/`, `test_modules/`) run `zerc` binary which always had `use_ir=true`. The C unit tests run `emit_file` directly. Both paths now validate IR. Don't add `e->use_ir = false` anywhere without a compelling reason.
+
+**Also critical: `zerc --run` historically returned exit 0 even when compiled binary trapped.** Many rust_tests/ were "passing" while the emitted program trapped at runtime (SIGTRAP = exit 133). Post-IR-validation changes, tests that previously masked trap-failures now surface as compile errors and must actually be fixed. If a test was passing before and fails now with a GCC error, don't assume regression — check git history to see if the test was ever running correctly.
+
+### Scoped Defer Emission — the pattern
+
+Emitter's `defer_stack` is compile-time, not runtime. Every block-level construct that introduces a defer scope must bracket the body with defer tracking:
+
+```c
+int base = ctx->defer_count;        // save
+lower_stmt(ctx, body);              // may push defers
+emit_defer_fire_scoped(ctx, base, pop=true, line);  // emit + pop
+ctx->defer_count = base;            // restore
+```
+
+Applied in: NODE_FOR/NODE_WHILE/NODE_DO_WHILE body exits, NODE_IF then/else bodies, integer switch arm bodies (in ir_lower.c). Enum/union/optional switch arms use emitter-side save/restore (emitter.c, arm_defer_base) because those arms are AST passthrough, not IR-lowered.
+
+`IR_DEFER_FIRE` encoding:
+- `cond_local == -1`: fire all (function exit)
+- `cond_local == base`: scoped fire from count-1 down to base
+- `src2_local == 1`: no-pop (for break/continue — other paths still need the defers on stack)
+- `src2_local == 0` (default): pop after fire
+
+### IR lowering patterns that MUST passthrough (not decompose)
+
+Some expressions lose semantics if `lower_expr` decomposes the operand into a temp:
+
+- **`&x` (TOK_AMP)**: `lower_expr` decomposes the operand first → temp holds VALUE of x → `&temp` is wrong address. Passthrough preserves lvalue. Already fixed in BUG-551.
+- **NODE_ORELSE fallback**: value fallback needs explicit IR_ASSIGN to dest (BUG-539). Nested NODE_ORELSE needs recursive `lower_orelse_to_dest` (BUG-553).
+- **NODE_NULL_LIT → struct optional**: detect src is `*void` placeholder, emit `{0, 0}` not `{val, 1}` (BUG-538).
+
+When adding any new IR op or expression handler: if it takes a COMPILE-TIME position (source code line), ask "does this need the lvalue, or the value?" For lvalues (addr-of, writes), decomposition is wrong.
+
+### Test Harness Architecture (know which suite exercises what)
+
+| Suite | Path | What it tests |
+|---|---|---|
+| test_lexer/parser/checker/zercheck | C unit via `emit_file` | Per-component correctness, emission C validity |
+| test_emit | C unit → GCC → run exit code | End-to-end ZER source → exit code match |
+| test_firmware/2/3, test_production | C unit → GCC → run | Realistic firmware + CRC/bootloader patterns |
+| tests/test_zer.sh | `zerc --run` on `.zer` files | Integration, full zerc pipeline |
+| rust_tests/ | `zerc --run` | Rust-equivalent safety tests (translated) |
+| zig_tests/ | `zerc --run` | Zig safety translations |
+| test_modules/ | `zerc` on multi-file | Imports, cross-module mangling |
+
+**If test_emit passes but rust_tests fails:** likely an issue with `--run` mode in zerc_main.c (not emitter).
+
+**If rust_tests passes but test_emit fails:** likely IR/emit_file bug that `zerc --run` masks (maybe exit code ignored). This was the state before BUG-538–557 were fixed.
+
+**If both fail:** Real compiler bug, reproduce with minimal `.zer` + `./zerc --emit-c`.
 
 ## First Session Workflow
 

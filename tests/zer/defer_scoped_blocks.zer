@@ -1,0 +1,70 @@
+// BUG-544/556/557: defers declared inside a block-scoped construct
+// (loop body, if-body, switch arm) must fire at BLOCK EXIT, not function exit.
+// Emitter's defer_stack is compile-time — each scope needs its own fire+pop.
+
+u32 counter = 0;
+void bump() { counter = counter + 1; }
+
+u32 in_for() {
+    u32 before = counter;
+    for (u32 i = 0; i < 3; i += 1) {
+        defer bump();
+    }
+    // Each iteration fires one defer → counter should be before+3.
+    return counter - before;
+}
+
+u32 in_if() {
+    u32 before = counter;
+    ?u32 maybe = 42;
+    if (maybe) |v| {
+        defer bump();
+        // Counter unchanged during if body until defer fires at block exit.
+        if (counter != before) { return 99; }
+    }
+    // After if block, defer has fired once → counter = before + 1.
+    return counter - before;
+}
+
+u32 in_switch_arm(u32 x) {
+    u32 before = counter;
+    switch (x) {
+        1 => {
+            defer bump();
+            defer bump();
+            // Both defers fire in LIFO order at arm exit.
+        }
+        default => { }
+    }
+    return counter - before;
+}
+
+?u32 null_src() { return null; }
+?u32 real() { return 42; }
+
+u32 nested_orelse_chain() {
+    // BUG-553: nested orelse must recurse in lower_orelse_to_dest.
+    u32 a = null_src() orelse null_src() orelse 77;
+    return a;
+}
+
+u32 chain_real() {
+    u32 v = null_src() orelse real() orelse 0;
+    return v;
+}
+
+u32 main() {
+    // Defers in for-loop body fire 3 times.
+    if (in_for() != 3) { return 1; }
+
+    // Defer inside if-unwrap body fires at block exit (BUG-556).
+    if (in_if() != 1) { return 2; }
+
+    // Defers inside integer switch arm fire at arm exit (BUG-557).
+    if (in_switch_arm(1) != 2) { return 3; }
+
+    // Multi-level orelse chain (BUG-553).
+    if (chain_real() != 42) { return 4; }
+
+    return 0;
+}

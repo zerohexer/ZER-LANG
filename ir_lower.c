@@ -373,7 +373,26 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         /* Check if object is an array type (global arrays return -1 from lower_expr) */
         Type *obj_type = checker_get_type(ctx->checker, expr->index_expr.object);
         if (obj_type) { Type *oe = type_unwrap_distinct(obj_type);
-            if (oe->kind == TYPE_ARRAY) goto passthrough; /* global array index → passthrough */
+            if (oe->kind == TYPE_ARRAY) {
+                /* Global array passthrough, but first decompose complex index
+                 * (orelse, call chains) to a local — emit_rewritten_node can't
+                 * handle orelse. Rewrite the index AST node to reference the local. */
+                if (expr->index_expr.index &&
+                    expr->index_expr.index->kind == NODE_ORELSE) {
+                    int idx_id = lower_expr(ctx, expr->index_expr.index);
+                    if (idx_id >= 0) {
+                        IRLocal *il = &ctx->func->locals[idx_id];
+                        Node *new_idx = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(new_idx, 0, sizeof(Node));
+                        new_idx->kind = NODE_IDENT;
+                        new_idx->loc = expr->loc;
+                        new_idx->ident.name = il->name;
+                        new_idx->ident.name_len = (size_t)il->name_len;
+                        expr->index_expr.index = new_idx;
+                    }
+                }
+                goto passthrough; /* global array index → passthrough */
+            }
         }
         int obj = lower_expr(ctx, expr->index_expr.object);
         if (obj < 0) goto passthrough; /* object couldn't be decomposed → passthrough */
@@ -664,6 +683,18 @@ static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) 
     }
 }
 
+/* Emit "pop only" op — doesn't emit defer bodies, just decrements emitter's
+ * compile-time defer_stack count. Used at loop exit after all body paths have
+ * already emitted their defer bodies (with no-pop). */
+static void emit_defer_pop_only(LowerCtx *ctx, int base, int line) {
+    if (ctx->defer_count > base) {
+        IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        fire.cond_local = base;
+        fire.src2_local = 2;
+        emit_inst(ctx, fire);
+    }
+}
+
 /* ================================================================
  * Expression ident rewriting — three-address-code foundation
  *
@@ -812,10 +843,13 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         IRInst ret = make_inst(IR_RETURN, line);
         emit_inst(ctx, ret);
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
+        /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_exit_block;
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_continue_block;
         emit_inst(ctx, go);
@@ -934,11 +968,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             if (need_ir_orelse) {
                 lower_orelse_to_dest(ctx, local_id, orelse, node->loc.line);
             } else {
+                /* Array→slice coercion: lower_expr can't return a local for
+                 * array-typed exprs (C can't assign arrays). Emit IR_ASSIGN
+                 * passthrough — emitter's need_slice path handles coercion. */
+                Node *init = node->var_decl.init;
+                Type *init_type = checker_get_type(ctx->checker, init);
+                Type *init_eff = init_type ? type_unwrap_distinct(init_type) : NULL;
+                Type *vt_unwrap = vt ? type_unwrap_distinct(vt) : NULL;
+                if (init_eff && init_eff->kind == TYPE_ARRAY &&
+                    vt_unwrap && vt_unwrap->kind == TYPE_SLICE) {
+                    rewrite_idents(ctx, init);
+                    IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
+                    inst.dest_local = local_id;
+                    inst.expr = init;
+                    emit_inst(ctx, inst);
+                    break;
+                }
                 /* Unified: lower_expr decomposes all inits.
                  * Simple expressions → local ID + IR_COPY.
                  * Complex expressions (calls, builtins, intrinsics, casts,
                  * orelse, struct_init) → IR_ASSIGN passthrough via lower_expr. */
-                Node *init = node->var_decl.init;
                 int src = lower_expr(ctx, init);
                 if (src >= 0 && src != local_id) {
                     IRInst inst = make_inst(IR_COPY, node->loc.line);
@@ -1124,9 +1173,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Body block */
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->for_stmt.body);
-        /* Fire and pop loop-scoped defers at end of body (per-iteration fire) */
-        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, true, node->loc.line);
-        ctx->defer_count = ctx->loop_defer_base;
+        /* End of body: emit defer bodies inline (for normal iteration path),
+         * but DO NOT pop. Divergent paths (break/continue/orelse-continue)
+         * also emit their own defer bodies with no-pop.
+         * Pop happens once in the POST block — created AFTER all body blocks
+         * so it's emitted LAST. */
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
         ensure_terminated(ctx, bb_step);
 
         /* Step block */
@@ -1139,8 +1191,23 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         ensure_terminated(ctx, bb_cond); /* back edge */
 
-        /* Exit block */
+        /* Create post-exit block AFTER body (including orelse-created blocks).
+         * Block IDs are monotonic — this block is emitted LAST of loop blocks.
+         * POP_ONLY here ensures all body/continue/break fire sites already
+         * emitted their defer bodies before we clear the compile-time stack. */
+        int bb_post = -1;
+        if (ctx->defer_count > ctx->loop_defer_base) {
+            bb_post = ir_add_block(ctx->func, ctx->arena);
+        }
         ctx->current_block = bb_exit;
+        if (bb_post >= 0) {
+            IRInst go = make_inst(IR_GOTO, node->loc.line);
+            go.goto_block = bb_post;
+            emit_inst(ctx, go);
+            ctx->current_block = bb_post;
+            emit_defer_pop_only(ctx, ctx->loop_defer_base, node->loc.line);
+        }
+        ctx->defer_count = ctx->loop_defer_base;
 
         /* Restore loop context */
         ctx->loop_exit_block = saved_exit;
@@ -1176,11 +1243,25 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->while_stmt.body);
-        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, true, node->loc.line);
-        ctx->defer_count = ctx->loop_defer_base;
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
         ensure_terminated(ctx, bb_cond);
 
-        ctx->current_block = bb_exit;
+        /* Post-exit block for POP_ONLY — created AFTER all body blocks */
+        {
+            int bb_post = -1;
+            if (ctx->defer_count > ctx->loop_defer_base) {
+                bb_post = ir_add_block(ctx->func, ctx->arena);
+            }
+            ctx->current_block = bb_exit;
+            if (bb_post >= 0) {
+                IRInst go = make_inst(IR_GOTO, node->loc.line);
+                go.goto_block = bb_post;
+                emit_inst(ctx, go);
+                ctx->current_block = bb_post;
+                emit_defer_pop_only(ctx, ctx->loop_defer_base, node->loc.line);
+            }
+            ctx->defer_count = ctx->loop_defer_base;
+        }
 
         ctx->loop_exit_block = saved_exit;
         ctx->loop_continue_block = saved_cont;
@@ -1206,8 +1287,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Body first (execute at least once) */
         ctx->current_block = bb_body;
         lower_stmt(ctx, node->while_stmt.body);
-        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, true, node->loc.line);
-        ctx->defer_count = ctx->loop_defer_base;
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
         ensure_terminated(ctx, bb_cond);
 
         /* Then condition */
@@ -1221,7 +1301,22 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         emit_inst(ctx, br);
         }
 
-        ctx->current_block = bb_exit;
+        /* Post-exit block for POP_ONLY */
+        {
+            int bb_post = -1;
+            if (ctx->defer_count > ctx->loop_defer_base) {
+                bb_post = ir_add_block(ctx->func, ctx->arena);
+            }
+            ctx->current_block = bb_exit;
+            if (bb_post >= 0) {
+                IRInst go = make_inst(IR_GOTO, node->loc.line);
+                go.goto_block = bb_post;
+                emit_inst(ctx, go);
+                ctx->current_block = bb_post;
+                emit_defer_pop_only(ctx, ctx->loop_defer_base, node->loc.line);
+            }
+            ctx->defer_count = ctx->loop_defer_base;
+        }
 
         ctx->loop_exit_block = saved_exit;
         ctx->loop_continue_block = saved_cont;
@@ -1372,6 +1467,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (ret_expr) {
             rewrite_idents(ctx, ret_expr);
             ret.src1_local = lower_expr(ctx, ret_expr);
+            /* Keep expr for cases lower_expr returns -1 (void/array passthrough).
+             * Emitter's IR_RETURN checks expr for array→slice coercion. */
+            if (ret.src1_local < 0) ret.expr = ret_expr;
         }
         emit_defer_fire(ctx, node->loc.line);
         emit_inst(ctx, ret);

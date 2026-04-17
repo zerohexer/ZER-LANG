@@ -8255,26 +8255,48 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                     }
                                     e->defer_stack.stmts[e->defer_stack.count++] = bs->defer.body;
                                 } else if (bs->kind == NODE_IF) {
-                                    /* If inside switch arm — emit condition + bodies */
+                                    /* If inside switch arm — emit condition + then/else bodies.
+                                     * Helper walks a then/else body (block or single stmt). */
+                                    #define EMIT_ARM_IF_BODY(body) do { \
+                                        Node *_b = (body); \
+                                        if (!_b) break; \
+                                        if (_b->kind == NODE_BLOCK) { \
+                                            for (int _bi = 0; _bi < _b->block.stmt_count; _bi++) { \
+                                                Node *_is = _b->block.stmts[_bi]; \
+                                                if (!_is) continue; \
+                                                if (_is->kind == NODE_EXPR_STMT && _is->expr_stmt.expr) { \
+                                                    emit_indent(e); emit_rewritten_node(e, _is->expr_stmt.expr, func); emit(e, ";\n"); \
+                                                } else if (_is->kind == NODE_RETURN) { \
+                                                    emit_indent(e); emit(e, "return"); \
+                                                    if (_is->ret.expr) { emit(e, " "); emit_rewritten_node(e, _is->ret.expr, func); } \
+                                                    emit(e, ";\n"); \
+                                                } \
+                                            } \
+                                        } else if (_b->kind == NODE_EXPR_STMT && _b->expr_stmt.expr) { \
+                                            emit_indent(e); emit_rewritten_node(e, _b->expr_stmt.expr, func); emit(e, ";\n"); \
+                                        } else if (_b->kind == NODE_RETURN) { \
+                                            emit_indent(e); emit(e, "return"); \
+                                            if (_b->ret.expr) { emit(e, " "); emit_rewritten_node(e, _b->ret.expr, func); } \
+                                            emit(e, ";\n"); \
+                                        } \
+                                    } while (0)
                                     emit_indent(e);
                                     emit(e, "if (");
                                     emit_rewritten_node(e, bs->if_stmt.cond, func);
                                     emit(e, ") {\n");
                                     e->indent++;
-                                    if (bs->if_stmt.then_body) {
-                                        if (bs->if_stmt.then_body->kind == NODE_BLOCK) {
-                                            for (int bi = 0; bi < bs->if_stmt.then_body->block.stmt_count; bi++) {
-                                                Node *is = bs->if_stmt.then_body->block.stmts[bi];
-                                                if (is && is->kind == NODE_EXPR_STMT && is->expr_stmt.expr) {
-                                                    emit_indent(e); emit_rewritten_node(e, is->expr_stmt.expr, func); emit(e, ";\n");
-                                                } else if (is && is->kind == NODE_RETURN) {
-                                                    emit_indent(e); emit(e, "return"); if (is->ret.expr) { emit(e, " "); emit_rewritten_node(e, is->ret.expr, func); } emit(e, ";\n");
-                                                }
-                                            }
-                                        }
-                                    }
+                                    EMIT_ARM_IF_BODY(bs->if_stmt.then_body);
                                     e->indent--;
-                                    emit_indent(e); emit(e, "}\n");
+                                    emit_indent(e); emit(e, "}");
+                                    if (bs->if_stmt.else_body) {
+                                        emit(e, " else {\n");
+                                        e->indent++;
+                                        EMIT_ARM_IF_BODY(bs->if_stmt.else_body);
+                                        e->indent--;
+                                        emit_indent(e); emit(e, "}");
+                                    }
+                                    emit(e, "\n");
+                                    #undef EMIT_ARM_IF_BODY
                                 } else {
                                     /* Other statement — use emit_rewritten_node */
                                     emit_indent(e);
@@ -8282,6 +8304,19 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                     emit(e, ";\n");
                                 }
                             }
+                        } else if (arm->body->kind == NODE_EXPR_STMT && arm->body->expr_stmt.expr) {
+                            /* Single-expression arm: `Dir.north => result = 1` */
+                            emit_indent(e);
+                            emit_rewritten_node(e, arm->body->expr_stmt.expr, func);
+                            emit(e, ";\n");
+                        } else if (arm->body->kind == NODE_RETURN) {
+                            emit_indent(e);
+                            emit(e, "return");
+                            if (arm->body->ret.expr) {
+                                emit(e, " ");
+                                emit_rewritten_node(e, arm->body->ret.expr, func);
+                            }
+                            emit(e, ";\n");
                         } else {
                             emit_indent(e);
                             emit_rewritten_node(e, arm->body, func);

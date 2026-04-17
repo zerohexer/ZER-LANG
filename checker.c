@@ -9340,6 +9340,10 @@ Type *checker_get_type(Checker *c, Node *node) {
     return typemap_get(c, node);
 }
 
+void checker_set_type(Checker *c, Node *node, Type *type) {
+    typemap_set(c, node, type);
+}
+
 /* ---- Value Range Propagation helpers ---- */
 
 /* Find the most recent range entry for a variable (stack: scan from end) */

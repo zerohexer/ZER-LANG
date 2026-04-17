@@ -378,6 +378,59 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             Type *frt_eff = type_unwrap_distinct(frt);
             if (frt_eff->kind == TYPE_ARRAY) goto passthrough;
         }
+        /* BUG-580 fix: if type unknown (freshly synthesized NODE_FIELD from
+         * NODE_SWITCH lowering or similar), infer from object + field name.
+         * Without a type, create_temp makes a typeless local that the emitter
+         * skips declaring — leading to undefined C identifiers. */
+        if (!frt) {
+            Type *ot = NULL;
+            if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
+                int obj_id_pre = ir_find_local(ctx->func,
+                    expr->field.object->ident.name,
+                    (uint32_t)expr->field.object->ident.name_len);
+                if (obj_id_pre >= 0) ot = ctx->func->locals[obj_id_pre].type;
+            }
+            Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
+            /* Unwrap pointer for sw_ptr->_tag / sw_ptr->variant cases */
+            if (ot_eff && ot_eff->kind == TYPE_POINTER && ot_eff->pointer.inner)
+                ot_eff = type_unwrap_distinct(ot_eff->pointer.inner);
+            if (ot_eff && ot_eff->kind == TYPE_OPTIONAL) {
+                if (expr->field.field_name_len == 9 &&
+                    memcmp(expr->field.field_name, "has_value", 9) == 0) {
+                    frt = ty_bool;
+                } else if (expr->field.field_name_len == 5 &&
+                           memcmp(expr->field.field_name, "value", 5) == 0) {
+                    frt = ot_eff->optional.inner;
+                }
+            } else if (ot_eff && ot_eff->kind == TYPE_UNION) {
+                if (expr->field.field_name_len == 4 &&
+                    memcmp(expr->field.field_name, "_tag", 4) == 0) {
+                    frt = ty_i32;
+                } else {
+                    /* Look up variant type by name */
+                    for (uint32_t ui = 0; ui < ot_eff->union_type.variant_count; ui++) {
+                        if (ot_eff->union_type.variants[ui].name_len == expr->field.field_name_len &&
+                            memcmp(ot_eff->union_type.variants[ui].name,
+                                   expr->field.field_name,
+                                   expr->field.field_name_len) == 0) {
+                            frt = ot_eff->union_type.variants[ui].type;
+                            break;
+                        }
+                    }
+                }
+            } else if (ot_eff && ot_eff->kind == TYPE_STRUCT) {
+                for (uint32_t fi = 0; fi < ot_eff->struct_type.field_count; fi++) {
+                    if (ot_eff->struct_type.fields[fi].name_len == expr->field.field_name_len &&
+                        memcmp(ot_eff->struct_type.fields[fi].name,
+                               expr->field.field_name,
+                               expr->field.field_name_len) == 0) {
+                        frt = ot_eff->struct_type.fields[fi].type;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!frt) goto passthrough; /* still no type → can't decompose safely */
         int obj = lower_expr(ctx, expr->field.object);
         if (obj < 0) goto passthrough;
         int tmp = create_temp(ctx, frt, expr->loc.line);
@@ -1573,76 +1626,242 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Switch: chain of branches ---- */
     case NODE_SWITCH: {
-        /* Union/optional/enum switch: complex tag/has_value dispatch.
-         * Pass through as AST node — emitter handles via emit_stmt.
-         * This is the ONLY remaining emit_stmt in the IR function body path.
-         * Eliminating requires: lower tag comparison to IR_BRANCH, union
-         * capture to IR_ASSIGN, arm bodies already lowered. ~150 lines. */
+        /* Full IR lowering for ALL switch types (integer, enum, union, optional).
+         * BUG-579: Previously enum/union/optional went through IR_NOP passthrough
+         * where a mini-emit_stmt in the emitter handled arm bodies — that path
+         * silently dropped NODE_FOR/NODE_WHILE/nested NODE_SWITCH/NODE_ORELSE
+         * and NODE_BREAK/NODE_CONTINUE (target was wrong).
+         *
+         * Strategy: hoist switch expression into a local (pointer for unions,
+         * value for others), build per-arm comparison AST referencing that local,
+         * lower via IR_BRANCH, and lower arm bodies via lower_stmt (which handles
+         * every statement kind correctly). */
         Type *sw_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
         Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
-        if (sw_eff && (sw_eff->kind == TYPE_UNION || sw_eff->kind == TYPE_OPTIONAL ||
-                       sw_eff->kind == TYPE_ENUM)) {
-            /* Deep-rewrite idents in switch expression AND all arm bodies.
-             * rewrite_idents only walks expressions — need to walk statements too. */
-            rewrite_idents(ctx, node->switch_stmt.expr);
-            for (int ai = 0; ai < node->switch_stmt.arm_count; ai++) {
-                Node *ab = node->switch_stmt.arms[ai].body;
-                if (!ab) continue;
-                if (ab->kind == NODE_BLOCK) {
-                    for (int si = 0; si < ab->block.stmt_count; si++) {
-                        Node *s = ab->block.stmts[si];
-                        if (!s) continue;
-                        if (s->kind == NODE_EXPR_STMT)
-                            rewrite_idents(ctx, s->expr_stmt.expr);
-                        else if (s->kind == NODE_RETURN)
-                            rewrite_idents(ctx, s->ret.expr);
-                        else if (s->kind == NODE_VAR_DECL)
-                            rewrite_idents(ctx, s->var_decl.init);
-                        else if (s->kind == NODE_DEFER && s->defer.body) {
-                            if (s->defer.body->kind == NODE_BLOCK) {
-                                for (int di = 0; di < s->defer.body->block.stmt_count; di++) {
-                                    Node *ds = s->defer.body->block.stmts[di];
-                                    if (ds && ds->kind == NODE_EXPR_STMT)
-                                        rewrite_idents(ctx, ds->expr_stmt.expr);
-                                }
-                            } else if (s->defer.body->kind == NODE_EXPR_STMT) {
-                                rewrite_idents(ctx, s->defer.body->expr_stmt.expr);
-                            }
-                        }
-                    }
-                } else {
-                    rewrite_idents(ctx, ab);
-                }
+        bool is_enum = sw_eff && sw_eff->kind == TYPE_ENUM;
+        bool is_union = sw_eff && sw_eff->kind == TYPE_UNION;
+        bool is_optional = sw_eff && sw_eff->kind == TYPE_OPTIONAL;
+        /* Null-sentinel optional: ?*T or ?FuncPtr. Inner unwrap distinct. */
+        bool is_null_sent_opt = false;
+        if (is_optional && sw_eff->optional.inner) {
+            Type *inner_eff = type_unwrap_distinct(sw_eff->optional.inner);
+            is_null_sent_opt = inner_eff && (inner_eff->kind == TYPE_POINTER ||
+                                             inner_eff->kind == TYPE_FUNC_PTR);
+        }
+        bool is_void_opt = is_optional && sw_eff->optional.inner &&
+                           type_unwrap_distinct(sw_eff->optional.inner)->kind == TYPE_VOID;
+
+        rewrite_idents(ctx, node->switch_stmt.expr);
+
+        /* Hoist switch expression.
+         *   sw_ref = AST reference used in comparisons/captures.
+         *   For unions: sw_ref is NODE_IDENT to a pointer local (→ &sw_expr),
+         *   so NODE_FIELD(sw_ref, name) emits as sw_ref->name and mutable
+         *   captures &sw_ref->variant persist to the original.
+         *   For everything else: sw_ref is NODE_IDENT to a value local. */
+        Node *sw_ref = NULL;
+        if (is_union) {
+            Node *sw_expr = node->switch_stmt.expr;
+            bool is_lvalue = (sw_expr->kind == NODE_IDENT ||
+                              sw_expr->kind == NODE_FIELD ||
+                              sw_expr->kind == NODE_INDEX ||
+                              (sw_expr->kind == NODE_UNARY && sw_expr->unary.op == TOK_STAR));
+            Node *addr_expr;
+            if (is_lvalue) {
+                /* Build &sw_expr — TOK_AMP passthrough in lower_expr preserves lvalue */
+                addr_expr = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(addr_expr, 0, sizeof(Node));
+                addr_expr->kind = NODE_UNARY;
+                addr_expr->loc = node->loc;
+                addr_expr->unary.op = TOK_AMP;
+                addr_expr->unary.operand = sw_expr;
+            } else {
+                /* Rvalue (call, binary, etc.): copy into tmp first, then &tmp */
+                int val_local = lower_expr(ctx, sw_expr);
+                if (val_local < 0) break; /* void/array — shouldn't happen for union */
+                IRLocal *vl = &ctx->func->locals[val_local];
+                Node *ident = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(ident, 0, sizeof(Node));
+                ident->kind = NODE_IDENT;
+                ident->loc = node->loc;
+                ident->ident.name = vl->name;
+                ident->ident.name_len = (size_t)vl->name_len;
+                /* Set type on synthesized ident so lower_expr and type inference
+                 * see the correct union type (not ty_i32 fallback). */
+                checker_set_type(ctx->checker, ident, sw_type);
+                addr_expr = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(addr_expr, 0, sizeof(Node));
+                addr_expr->kind = NODE_UNARY;
+                addr_expr->loc = node->loc;
+                addr_expr->unary.op = TOK_AMP;
+                addr_expr->unary.operand = ident;
             }
-            IRInst pass = make_inst(IR_NOP, node->loc.line);
-            pass.expr = node;
-            emit_inst(ctx, pass);
-            break;
+            /* Annotate addr_expr with pointer-to-union type so lower_expr
+             * creates a properly-typed temp (not ty_i32 fallback). */
+            Type *ptr_to_union = type_pointer(ctx->arena, sw_type);
+            checker_set_type(ctx->checker, addr_expr, ptr_to_union);
+            int ptr_local = lower_expr(ctx, addr_expr);
+            if (ptr_local < 0) break;
+            IRLocal *pl = &ctx->func->locals[ptr_local];
+            sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+            memset(sw_ref, 0, sizeof(Node));
+            sw_ref->kind = NODE_IDENT;
+            sw_ref->loc = node->loc;
+            sw_ref->ident.name = pl->name;
+            sw_ref->ident.name_len = (size_t)pl->name_len;
+        } else {
+            int val_local = lower_expr(ctx, node->switch_stmt.expr);
+            if (val_local < 0) break;
+            IRLocal *vl = &ctx->func->locals[val_local];
+            sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+            memset(sw_ref, 0, sizeof(Node));
+            sw_ref->kind = NODE_IDENT;
+            sw_ref->loc = node->loc;
+            sw_ref->ident.name = vl->name;
+            sw_ref->ident.name_len = (size_t)vl->name_len;
         }
 
         int bb_exit = ir_add_block(ctx->func, ctx->arena);
 
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            SwitchArm *arm = &node->switch_stmt.arms[i];
             int bb_arm = ir_add_block(ctx->func, ctx->arena);
             int bb_next = (i + 1 < node->switch_stmt.arm_count) ?
                           ir_add_block(ctx->func, ctx->arena) : bb_exit;
 
-            /* Branch: if matches → arm body, else → next check */
-            if (node->switch_stmt.arms[i].is_default) {
-                /* Default arm — unconditional */
+            if (arm->is_default) {
                 ensure_terminated(ctx, bb_arm);
             } else {
-                /* Build comparison: (sw_expr == val[0]) || (sw_expr == val[1]) || ... */
-                SwitchArm *arm = &node->switch_stmt.arms[i];
+                /* Build per-arm comparison: OR of equality checks */
                 Node *cmp = NULL;
                 for (int vi = 0; vi < arm->value_count; vi++) {
-                    Node *eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                    memset(eq, 0, sizeof(Node));
-                    eq->kind = NODE_BINARY;
-                    eq->loc = node->loc;
-                    eq->binary.op = TOK_EQEQ;
-                    eq->binary.left = node->switch_stmt.expr;
-                    eq->binary.right = arm->values[vi];
+                    Node *eq;
+                    if (is_enum) {
+                        /* Extract variant name: arm values can be
+                         *  - NODE_IDENT("west") for `.west` dot syntax
+                         *  - NODE_FIELD(Dir, "west") for `Dir.west` qualified syntax */
+                        const char *vname = NULL;
+                        size_t vlen = 0;
+                        if (arm->values[vi]->kind == NODE_IDENT) {
+                            vname = arm->values[vi]->ident.name;
+                            vlen = arm->values[vi]->ident.name_len;
+                        } else if (arm->values[vi]->kind == NODE_FIELD) {
+                            vname = arm->values[vi]->field.field_name;
+                            vlen = arm->values[vi]->field.field_name_len;
+                        }
+                        /* Look up variant numeric value */
+                        int64_t variant_value = 0;
+                        if (vname) {
+                            for (uint32_t ei = 0; ei < sw_eff->enum_type.variant_count; ei++) {
+                                if (sw_eff->enum_type.variants[ei].name_len == vlen &&
+                                    memcmp(sw_eff->enum_type.variants[ei].name, vname, vlen) == 0) {
+                                    variant_value = (int64_t)sw_eff->enum_type.variants[ei].value;
+                                    break;
+                                }
+                            }
+                        }
+                        Node *lit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(lit, 0, sizeof(Node));
+                        lit->kind = NODE_INT_LIT;
+                        lit->loc = node->loc;
+                        lit->int_lit.value = (uint64_t)variant_value;
+                        eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(eq, 0, sizeof(Node));
+                        eq->kind = NODE_BINARY;
+                        eq->loc = node->loc;
+                        eq->binary.op = TOK_EQEQ;
+                        eq->binary.left = sw_ref;
+                        eq->binary.right = lit;
+                    } else if (is_union) {
+                        /* Extract variant name (either NODE_IDENT or NODE_FIELD) */
+                        const char *vname = NULL;
+                        size_t vlen = 0;
+                        if (arm->values[vi]->kind == NODE_IDENT) {
+                            vname = arm->values[vi]->ident.name;
+                            vlen = arm->values[vi]->ident.name_len;
+                        } else if (arm->values[vi]->kind == NODE_FIELD) {
+                            vname = arm->values[vi]->field.field_name;
+                            vlen = arm->values[vi]->field.field_name_len;
+                        }
+                        /* Compare sw_ref->_tag == variant_index */
+                        int variant_index = 0;
+                        if (vname) {
+                            for (uint32_t ui = 0; ui < sw_eff->union_type.variant_count; ui++) {
+                                if (sw_eff->union_type.variants[ui].name_len == vlen &&
+                                    memcmp(sw_eff->union_type.variants[ui].name, vname, vlen) == 0) {
+                                    variant_index = (int)ui;
+                                    break;
+                                }
+                            }
+                        }
+                        Node *tag_field = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(tag_field, 0, sizeof(Node));
+                        tag_field->kind = NODE_FIELD;
+                        tag_field->loc = node->loc;
+                        tag_field->field.object = sw_ref;
+                        tag_field->field.field_name = "_tag";
+                        tag_field->field.field_name_len = 4;
+                        Node *lit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(lit, 0, sizeof(Node));
+                        lit->kind = NODE_INT_LIT;
+                        lit->loc = node->loc;
+                        lit->int_lit.value = (uint64_t)variant_index;
+                        eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(eq, 0, sizeof(Node));
+                        eq->kind = NODE_BINARY;
+                        eq->loc = node->loc;
+                        eq->binary.op = TOK_EQEQ;
+                        eq->binary.left = tag_field;
+                        eq->binary.right = lit;
+                    } else if (is_optional) {
+                        bool is_null = (arm->values[vi]->kind == NODE_NULL_LIT);
+                        if (is_null_sent_opt) {
+                            /* Raw pointer — null arm uses !ptr, non-null uses ptr
+                             * (comparing ptr to bool works, but build an explicit
+                             * comparison to NULL for clarity / type correctness). */
+                            if (is_null) {
+                                eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                memset(eq, 0, sizeof(Node));
+                                eq->kind = NODE_UNARY;
+                                eq->loc = node->loc;
+                                eq->unary.op = TOK_BANG;
+                                eq->unary.operand = sw_ref;
+                            } else {
+                                /* Truthy test on pointer local — lower_expr will
+                                 * produce a bool/int result usable as branch cond. */
+                                eq = sw_ref;
+                            }
+                        } else {
+                            /* Struct optional — check .has_value field */
+                            Node *hv_field = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                            memset(hv_field, 0, sizeof(Node));
+                            hv_field->kind = NODE_FIELD;
+                            hv_field->loc = node->loc;
+                            hv_field->field.object = sw_ref;
+                            hv_field->field.field_name = "has_value";
+                            hv_field->field.field_name_len = 9;
+                            if (is_null) {
+                                eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                memset(eq, 0, sizeof(Node));
+                                eq->kind = NODE_UNARY;
+                                eq->loc = node->loc;
+                                eq->unary.op = TOK_BANG;
+                                eq->unary.operand = hv_field;
+                            } else {
+                                eq = hv_field;
+                            }
+                        }
+                    } else {
+                        /* Integer / other — direct equality */
+                        eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(eq, 0, sizeof(Node));
+                        eq->kind = NODE_BINARY;
+                        eq->loc = node->loc;
+                        eq->binary.op = TOK_EQEQ;
+                        eq->binary.left = sw_ref;
+                        eq->binary.right = arm->values[vi];
+                    }
+
                     if (!cmp) {
                         cmp = eq;
                     } else {
@@ -1656,7 +1875,6 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         cmp = or_node;
                     }
                 }
-                rewrite_idents(ctx, cmp);
                 IRInst br = make_inst(IR_BRANCH, node->loc.line);
                 br.cond_local = lower_expr(ctx, cmp);
                 br.true_block = bb_arm;
@@ -1667,36 +1885,124 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Arm body */
             ctx->current_block = bb_arm;
 
-            /* Switch capture: create local on-demand + assignment */
-            if (node->switch_stmt.arms[i].capture_name) {
-                /* Create capture local if not already present */
-                Type *cap_type = checker_get_type(ctx->checker, node->switch_stmt.expr);
-                if (cap_type) {
-                    ir_add_local(ctx->func, ctx->arena,
-                        node->switch_stmt.arms[i].capture_name,
-                        (uint32_t)node->switch_stmt.arms[i].capture_name_len,
-                        cap_type, false, true, false, node->loc.line);
+            /* Capture */
+            if (arm->capture_name && !is_void_opt) {
+                /* Determine capture type and source expression */
+                Type *cap_type = NULL;
+                Node *cap_src = NULL;
+                bool cap_is_ptr = arm->capture_is_ptr;
+
+                if (is_enum) {
+                    cap_type = sw_eff;
+                    cap_src = sw_ref;
+                } else if (is_optional) {
+                    Type *inner = sw_eff->optional.inner;
+                    if (cap_is_ptr) {
+                        cap_type = type_pointer(ctx->arena, inner);
+                    } else {
+                        cap_type = inner;
+                    }
+                    if (is_null_sent_opt) {
+                        /* ?*T : sw_ref already pointer-valued */
+                        cap_src = sw_ref;
+                    } else {
+                        /* Struct optional: sw_ref.value for |v|,
+                         * &sw_ref.value for |*v| — BUG-552 IR_COPY handles */
+                        cap_src = sw_ref;
+                    }
+                } else if (is_union) {
+                    /* Find variant type by name (arm->values[0]) — supports both
+                     * NODE_IDENT and NODE_FIELD (.variant vs Union.variant) */
+                    const char *vname = NULL;
+                    size_t vlen = 0;
+                    if (arm->value_count > 0) {
+                        if (arm->values[0]->kind == NODE_IDENT) {
+                            vname = arm->values[0]->ident.name;
+                            vlen = arm->values[0]->ident.name_len;
+                        } else if (arm->values[0]->kind == NODE_FIELD) {
+                            vname = arm->values[0]->field.field_name;
+                            vlen = arm->values[0]->field.field_name_len;
+                        }
+                    }
+                    if (vname) {
+                        for (uint32_t ui = 0; ui < sw_eff->union_type.variant_count; ui++) {
+                            if (sw_eff->union_type.variants[ui].name_len == vlen &&
+                                memcmp(sw_eff->union_type.variants[ui].name, vname, vlen) == 0) {
+                                Type *vt = sw_eff->union_type.variants[ui].type;
+                                cap_type = cap_is_ptr ? type_pointer(ctx->arena, vt) : vt;
+                                /* sw_ref->variant_name via NODE_FIELD. Annotate
+                                 * with variant type so IR_ASSIGN emitter can
+                                 * detect array-to-array and emit memcpy. */
+                                Node *field = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                memset(field, 0, sizeof(Node));
+                                field->kind = NODE_FIELD;
+                                field->loc = node->loc;
+                                field->field.object = sw_ref;
+                                field->field.field_name = vname;
+                                field->field.field_name_len = vlen;
+                                checker_set_type(ctx->checker, field, vt);
+                                if (cap_is_ptr) {
+                                    /* &sw_ref->variant */
+                                    Node *addr = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                    memset(addr, 0, sizeof(Node));
+                                    addr->kind = NODE_UNARY;
+                                    addr->loc = node->loc;
+                                    addr->unary.op = TOK_AMP;
+                                    addr->unary.operand = field;
+                                    checker_set_type(ctx->checker, addr, cap_type);
+                                    cap_src = addr;
+                                } else {
+                                    cap_src = field;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
-                int cap_id = ir_find_local(ctx->func,
-                    node->switch_stmt.arms[i].capture_name,
-                    (uint32_t)node->switch_stmt.arms[i].capture_name_len);
-                if (cap_id >= 0) {
-                    IRInst cap = make_inst(IR_ASSIGN, node->loc.line);
-                    cap.dest_local = cap_id;
-                    cap.expr = node->switch_stmt.expr;
-                    emit_inst(ctx, cap);
+
+                if (cap_type && cap_src) {
+                    int cap_id = ir_add_local(ctx->func, ctx->arena,
+                        arm->capture_name, (uint32_t)arm->capture_name_len,
+                        cap_type, false, true, false, node->loc.line);
+                    if (cap_id >= 0) {
+                        /* For optional value captures: IR_COPY with type adaptation
+                         * handles .value unwrap (src ?T → dst T). For |*v| optional:
+                         * IR_COPY with dst=*T + src=?T emits &src.value (BUG-552).
+                         * For union/enum: emit normal IR_ASSIGN or IR_COPY. */
+                        if (is_optional) {
+                            /* IR_COPY src=sw_ref_local, dest=cap — type adaptation */
+                            int src_local = ir_find_local(ctx->func,
+                                sw_ref->ident.name, (uint32_t)sw_ref->ident.name_len);
+                            if (src_local >= 0) {
+                                IRInst cop = make_inst(IR_COPY, node->loc.line);
+                                cop.dest_local = cap_id;
+                                cop.src1_local = src_local;
+                                emit_inst(ctx, cop);
+                            } else {
+                                /* Fallback: passthrough IR_ASSIGN with cap_src */
+                                IRInst cap = make_inst(IR_ASSIGN, node->loc.line);
+                                cap.dest_local = cap_id;
+                                cap.expr = cap_src;
+                                emit_inst(ctx, cap);
+                            }
+                        } else {
+                            /* Enum/union: emit the cap_src AST directly */
+                            IRInst cap = make_inst(IR_ASSIGN, node->loc.line);
+                            cap.dest_local = cap_id;
+                            cap.expr = cap_src;
+                            emit_inst(ctx, cap);
+                        }
+                    }
                 }
             }
 
-            /* Save defer count so arm-local defers fire at arm exit */
             int arm_defer_base = ctx->defer_count;
-            lower_stmt(ctx, node->switch_stmt.arms[i].body);
-            /* Fire + pop arm-local defers before arm exit */
+            lower_stmt(ctx, arm->body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
 
-            if (!node->switch_stmt.arms[i].is_default) {
+            if (!arm->is_default) {
                 ctx->current_block = bb_next;
             }
         }

@@ -227,6 +227,12 @@ void checker_pop_module_scope(Checker *c); /* pop module scope */
 /* returns the resolved Type* for an expression node (set during check) */
 Type *checker_get_type(Checker *c, Node *node);
 
+/* Sets the resolved Type* for an AST node in the typemap.
+ * Used by IR lowering to annotate synthesized AST nodes (e.g., comparison
+ * builders for switch lowering) so subsequent lower_expr calls find the
+ * right type instead of falling back to ty_i32. */
+void checker_set_type(Checker *c, Node *node, Type *type);
+
 /* returns true if this node was proven safe by value range propagation */
 bool checker_is_proven(Checker *c, Node *node);
 

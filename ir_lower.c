@@ -163,6 +163,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node);
 static void rewrite_idents(LowerCtx *ctx, Node *expr);
 static int lower_expr(LowerCtx *ctx, Node *expr);
 static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line);
+static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line);
 
 /* can_lower_expr removed — lower_expr is now unconditional.
  * ALL expressions get decomposed to local IDs. Complex expressions
@@ -550,6 +551,40 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         return tmp;
     }
 
+    /* Compound assignment (+=, -=, etc.) with complex value — decompose the
+     * value so nested orelse inside the RHS gets properly lowered. Without
+     * this, `t += sink(e orelse break)` passes passthrough, emitter emits
+     * the call arg via emit_rewritten_node which has no NODE_ORELSE case.
+     * Simple `x = Y` is handled at statement level; here we focus on
+     * compound ops which need the original target + op preserved. */
+    case NODE_ASSIGN: {
+        if (expr->assign.op == TOK_EQ) goto passthrough;
+        /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
+         * passthrough emitter emits a simple compound assign with no nested
+         * orelse visible. */
+        int val_local = lower_expr(ctx, expr->assign.value);
+        if (val_local < 0) goto passthrough; /* void/array RHS — can't decompose */
+        IRLocal *vloc = &ctx->func->locals[val_local];
+        Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+        memset(tmp_id, 0, sizeof(Node));
+        tmp_id->kind = NODE_IDENT;
+        tmp_id->loc = expr->loc;
+        tmp_id->ident.name = vloc->name;
+        tmp_id->ident.name_len = (size_t)vloc->name_len;
+        Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+        memset(new_assign, 0, sizeof(Node));
+        new_assign->kind = NODE_ASSIGN;
+        new_assign->loc = expr->loc;
+        new_assign->assign.op = expr->assign.op;
+        new_assign->assign.target = expr->assign.target;
+        new_assign->assign.value = tmp_id;
+        /* Emit as void IR_ASSIGN — compound assign result is statement-like. */
+        IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
+        inst.expr = new_assign;
+        emit_3ac(ctx, inst);
+        return -1;
+    }
+
     case NODE_INTRINSIC:
     case NODE_SLICE:
     default:
@@ -557,6 +592,10 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         /* Create temp, emit IR_ASSIGN with expr (passthrough to emit_expr).
          * This is the migration bridge — allows incremental transition. */
         rewrite_idents(ctx, expr);
+        /* Any NODE_ORELSE in this expression must be pre-lowered — emit_rewritten_node
+         * has no NODE_ORELSE case. Walks the AST and replaces each orelse with a
+         * NODE_IDENT referencing a tmp local that gets the orelse result. */
+        pre_lower_orelse(ctx, &expr, expr->loc.line);
         Type *rt = checker_get_type(ctx->checker, expr);
         if (!rt) rt = ty_i32; /* fallback — most expressions have some value type */
         /* Void/array expressions don't produce a storable value */
@@ -816,10 +855,104 @@ static Node *find_orelse(Node *expr) {
     /* BUG-577: `target = <something> orelse break;` — the orelse is the
      * VALUE of an assignment. Without recursing, NODE_EXPR_STMT's
      * find_orelse returns NULL and the orelse isn't lowered, leaving
-     * emitter with an unhandled NODE_ORELSE → writes bogus `0`. */
+     * emitter with an unhandled NODE_ORELSE. */
     if (expr->kind == NODE_ASSIGN && expr->assign.op == TOK_EQ)
         return find_orelse(expr->assign.value);
     return NULL;
+}
+
+/* Walk an expression tree; for every NODE_ORELSE found at any depth, lower
+ * it to a fresh tmp (via lower_orelse_to_dest) and rewrite the slot to a
+ * NODE_IDENT referencing the tmp. After this call, the expression is
+ * guaranteed to contain no NODE_ORELSE — passthrough emission via
+ * emit_rewritten_node won't hit the unhandled-node default.
+ *
+ * Takes Node** so it can REPLACE the caller's slot. Used before passthrough
+ * in lower_expr (default path) and at other sites where AST survives to
+ * emission. Handles terminating fallbacks (break/continue/return) correctly
+ * via lower_orelse_to_dest which emits IR gotos. */
+static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
+    if (!pp || !*pp) return;
+    Node *n = *pp;
+    if (n->kind == NODE_ORELSE) {
+        /* Determine result type. For non-void orelse, lower to tmp. */
+        Type *rt = checker_get_type(ctx->checker, n);
+        if (!rt) {
+            Type *it = checker_get_type(ctx->checker, n->orelse.expr);
+            if (it) {
+                Type *ie = type_unwrap_distinct(it);
+                if (ie && ie->kind == TYPE_OPTIONAL) rt = ie->optional.inner;
+            }
+            if (!rt) rt = ty_i32;
+        }
+        Type *rt_eff = type_unwrap_distinct(rt);
+        if (rt_eff->kind == TYPE_VOID) {
+            /* Void orelse at expression position — shouldn't normally happen,
+             * but lower for side effects and replace with 0 constant. */
+            lower_orelse_to_dest(ctx, -1, n, line);
+            Node *lit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+            memset(lit, 0, sizeof(Node));
+            lit->kind = NODE_INT_LIT;
+            lit->loc = n->loc;
+            *pp = lit;
+            return;
+        }
+        int tmp = create_temp(ctx, rt, line);
+        lower_orelse_to_dest(ctx, tmp, n, line);
+        IRLocal *tloc = &ctx->func->locals[tmp];
+        Node *id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+        memset(id, 0, sizeof(Node));
+        id->kind = NODE_IDENT;
+        id->loc = n->loc;
+        id->ident.name = tloc->name;
+        id->ident.name_len = (size_t)tloc->name_len;
+        *pp = id;
+        return;
+    }
+    /* Recurse into children containing expressions */
+    switch (n->kind) {
+    case NODE_BINARY:
+        pre_lower_orelse(ctx, &n->binary.left, line);
+        pre_lower_orelse(ctx, &n->binary.right, line);
+        break;
+    case NODE_UNARY:
+        pre_lower_orelse(ctx, &n->unary.operand, line);
+        break;
+    case NODE_CALL:
+        pre_lower_orelse(ctx, &n->call.callee, line);
+        for (int i = 0; i < n->call.arg_count; i++)
+            pre_lower_orelse(ctx, &n->call.args[i], line);
+        break;
+    case NODE_FIELD:
+        pre_lower_orelse(ctx, &n->field.object, line);
+        break;
+    case NODE_INDEX:
+        pre_lower_orelse(ctx, &n->index_expr.object, line);
+        pre_lower_orelse(ctx, &n->index_expr.index, line);
+        break;
+    case NODE_SLICE:
+        pre_lower_orelse(ctx, &n->slice.object, line);
+        if (n->slice.start) pre_lower_orelse(ctx, &n->slice.start, line);
+        if (n->slice.end) pre_lower_orelse(ctx, &n->slice.end, line);
+        break;
+    case NODE_TYPECAST:
+        pre_lower_orelse(ctx, &n->typecast.expr, line);
+        break;
+    case NODE_ASSIGN:
+        pre_lower_orelse(ctx, &n->assign.target, line);
+        pre_lower_orelse(ctx, &n->assign.value, line);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            pre_lower_orelse(ctx, &n->intrinsic.args[i], line);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            pre_lower_orelse(ctx, &n->struct_init.fields[i].value, line);
+        break;
+    default:
+        break;
+    }
 }
 
 /* Lower: dest_local = orelse_expr
@@ -1058,24 +1191,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Rewrite idents in expression to use correct local names */
         rewrite_idents(ctx, expr);
 
-        /* Orelse to IR branches when async or inside loop */
+        /* Orelse lowering — ALL orelse patterns, not just terminating ones.
+         *
+         * emit_rewritten_node has no NODE_ORELSE case (pre-lowered by design).
+         * Any NODE_ORELSE that survives to emission becomes an unhandled-node
+         * default emission (wrong value). Ensure every orelse at statement
+         * level is pre-lowered here.
+         *
+         * Case A: `target = X orelse Y;` — NODE_ASSIGN wrapping NODE_ORELSE
+         *   target is NODE_IDENT   : route orelse result to target's local
+         *   target is field/index  : lower to tmp, synth `target = tmp_ident`
+         * Case B: `X orelse Y;` — bare orelse expression statement
+         *   lower with dest=-1 (void; side effects only, for orelse return etc.)
+         * Case C: orelse buried deeper (inside call arg, binary, etc.)
+         *   lower_expr(NODE_ORELSE) handles this naturally — no special case.
+         *
+         * Works uniformly for value fallbacks, block fallbacks, and terminating
+         * fallbacks (return/break/continue). Fixes BUG-577 and BUG-577-v2. */
         {
             Node *orelse = find_orelse(expr);
-            bool need_ir = orelse && (ctx->func->is_async ||
-                ctx->loop_exit_block >= 0 ||
-                orelse->orelse.fallback_is_break || orelse->orelse.fallback_is_continue);
-            if (need_ir) {
-                /* BUG-577 proper: handle `target = X orelse break/continue;`
-                 * for all target kinds.
-                 *
-                 *   target is NODE_IDENT (local)
-                 *     → route orelse result directly to target's local.
-                 *   target is NODE_FIELD / NODE_INDEX / NODE_UNARY-deref
-                 *     → lower orelse to a fresh tmp local, then emit an IR_ASSIGN
-                 *       whose expr is a synthetic `target = tmp_ident` AST so the
-                 *       emitter writes the unwrapped value through the non-local lvalue.
-                 *   otherwise (void/no-target orelse statement)
-                 *     → lower_orelse_to_dest with -1. */
+            if (orelse) {
                 if (expr->kind == NODE_ASSIGN && expr->assign.op == TOK_EQ &&
                     expr->assign.target && expr->assign.value == orelse) {
                     Node *tgt = expr->assign.target;
@@ -1088,7 +1223,6 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         /* Non-local target — decompose into tmp + synthesized assign. */
                         Type *rt = checker_get_type(ctx->checker, orelse);
                         if (!rt) {
-                            /* Fallback: use the optional inner's type via orelse.expr */
                             Type *ot = checker_get_type(ctx->checker, orelse->orelse.expr);
                             if (ot) {
                                 Type *oe = type_unwrap_distinct(ot);
@@ -1098,8 +1232,6 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         }
                         int tmp = create_temp(ctx, rt, node->loc.line);
                         lower_orelse_to_dest(ctx, tmp, orelse, node->loc.line);
-                        /* Build `target = tmp_ident` AST. `tgt` already rewritten by
-                         * rewrite_idents above so nested idents point at correct locals. */
                         IRLocal *tloc = &ctx->func->locals[tmp];
                         Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
                         memset(tmp_id, 0, sizeof(Node));
@@ -1118,10 +1250,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         inst.expr = new_assign;
                         emit_inst(ctx, inst);
                     }
-                } else {
-                    lower_orelse_to_dest(ctx, -1, orelse, node->loc.line);
+                    break;
                 }
-                break;
+                if (expr == orelse) {
+                    /* Bare orelse expression statement — side effects only. */
+                    lower_orelse_to_dest(ctx, -1, orelse, node->loc.line);
+                    break;
+                }
+                /* Otherwise: orelse buried in a sub-expression (NODE_CALL arg,
+                 * NODE_BINARY operand, etc.). lower_expr decomposes those via
+                 * its NODE_ORELSE case — no pre-lowering needed here. */
             }
         }
 

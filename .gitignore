@@ -21,6 +21,7 @@ test_firmware
 test_firmware2
 test_firmware3
 test_production
+test_semantic_fuzz
 
 # Editor/IDE
 .idea/

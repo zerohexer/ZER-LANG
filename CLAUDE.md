@@ -1247,6 +1247,43 @@ Some expressions lose semantics if `lower_expr` decomposes the operand into a te
 
 When adding any new IR op or expression handler: if it takes a COMPILE-TIME position (source code line), ask "does this need the lvalue, or the value?" For lvalues (addr-of, writes), decomposition is wrong.
 
+### "Walker missing node kind" — recurring bug class
+
+Multiple tree walkers must recurse through expression node kinds. Missing one node kind = silent bug. Confirmed instances:
+
+| Walker | Bug | Class |
+|---|---|---|
+| `rewrite_idents` (ir_lower.c) | BUG-573: missed NODE_TYPECAST → shadowed locals leaked original name | Audit |
+| `find_orelse` (ir_lower.c) | BUG-577: missed NODE_ASSIGN and all deeper contexts → orelse reached emit_rewritten_node with "unhandled" default | Today |
+| `pre_lower_orelse` (ir_lower.c, new in v0.4.6) | The *fix* — universal tree walker that replaces every orelse with a tmp-ident before emission | Prevention |
+| `emit_auto_guards` (emitter.c) | Prior gap (BUG-565) — fixed by adding auto-guard call in IR block loop | v0.4.0 era |
+
+**Prevention tool:** `tools/walker_audit.sh` cross-references cases in `emit_expr` (AST emitter) vs `emit_rewritten_node` (IR emitter). Run before release. Missing NODE_X in IR emitter = either add it, or add it to the known-pre-lowered list with documentation explaining why it never reaches emission.
+
+**NODE_ORELSE is a KNOWN pre-lowered exception** — intentionally NOT in emit_rewritten_node. `pre_lower_orelse` walks every AST expression before passthrough, replaces orelse with `NODE_IDENT(tmp)`. Adding a NODE_ORELSE case to emit_rewritten_node was tried (v0.4.4 attempt) and REVERTED — it introduced regressions with block-return fallbacks. Pre-lowering is the correct model.
+
+### `emit_rewritten_node` is NOT a "fake emit_expr"
+
+The IR path uses `emit_rewritten_node` to emit C from AST fragments in IR_ASSIGN passthrough. A natural question: isn't this just emit_expr under another name?
+
+**No — key differences:**
+- `emit_expr` operates on raw source AST (all node kinds possible).
+- `emit_rewritten_node` operates on PRE-LOWERED AST (simpler shape; orelse already replaced, shadowed idents already renamed, compound orelse-in-call-arg already decomposed).
+- `emit_rewritten_node` has no dependency on emit_expr (zero `emit_expr(` calls in its range — verified by `grep -c` in tools/walker_audit.sh).
+- IR loop structure uses goto basic blocks (no C while/for). Terminating orelse fallbacks `break`/`continue`/`return` go through IR_GOTO to basic blocks, NOT C statements. That's why they need pre-lowering at statement level — IR's CFG has no enclosing C loop to break from.
+
+**The IR invariant: zero `emit_expr` calls in IR function body emission.** All complexity lives in lowering (ir_lower.c). Emitter stays minimal.
+
+### Pre-lowering architecture for expression-wrapping constructs
+
+When a new language construct can contain an expression with complex sub-semantics (orelse, if-unwrap, etc.), two choices:
+
+**Option A — recurse in emit_rewritten_node**: Add a case that handles the construct inline as a GCC statement expression. Simple but limited — can't express IR-level control flow (break to basic block, goto label, etc.).
+
+**Option B — pre-lower in ir_lower.c**: Add a transform that replaces the construct with a simpler AST shape (e.g., tmp-ident) before emission. More code but fully general — supports IR control flow.
+
+ZER chose **Option B for orelse** (`pre_lower_orelse`). New constructs that involve CFG (loops, async, defer-in-block) should follow the same pattern. Option A is acceptable for value-only constructs that never need to emit IR gotos.
+
 ### Test Harness Architecture (know which suite exercises what)
 
 | Suite | Path | What it tests |

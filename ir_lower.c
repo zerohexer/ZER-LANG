@@ -813,6 +813,12 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
 static Node *find_orelse(Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_ORELSE) return expr;
+    /* BUG-577: `target = <something> orelse break;` — the orelse is the
+     * VALUE of an assignment. Without recursing, NODE_EXPR_STMT's
+     * find_orelse returns NULL and the orelse isn't lowered, leaving
+     * emitter with an unhandled NODE_ORELSE → writes bogus `0`. */
+    if (expr->kind == NODE_ASSIGN && expr->assign.op == TOK_EQ)
+        return find_orelse(expr->assign.value);
     return NULL;
 }
 
@@ -1059,7 +1065,19 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 ctx->loop_exit_block >= 0 ||
                 orelse->orelse.fallback_is_break || orelse->orelse.fallback_is_continue);
             if (need_ir) {
-                lower_orelse_to_dest(ctx, -1, orelse, node->loc.line);
+                /* BUG-577: if the expression is `target = X orelse break`,
+                 * route the orelse result to target's local so the assignment
+                 * actually happens. Without this, lower_orelse_to_dest(-1)
+                 * leaves target unassigned → null deref in subsequent use. */
+                int dest_local = -1;
+                if (expr->kind == NODE_ASSIGN && expr->assign.op == TOK_EQ &&
+                    expr->assign.target && expr->assign.target->kind == NODE_IDENT &&
+                    expr->assign.value == orelse) {
+                    dest_local = ir_find_local(ctx->func,
+                        expr->assign.target->ident.name,
+                        (uint32_t)expr->assign.target->ident.name_len);
+                }
+                lower_orelse_to_dest(ctx, dest_local, orelse, node->loc.line);
                 break;
             }
         }

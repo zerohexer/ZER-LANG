@@ -1347,9 +1347,11 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 - `?void` return from void call (2): hoist + wrap pattern
 - @config, @size(union), defer+orelse+for interaction
 
-**New files from Phase 6+7:**
+**New files from Phase 6+7 (FOUNDATION — not yet wired in):**
 - `zercheck_ir.c` (452 lines) — handle tracking on basic blocks. IRHandleState per LOCAL id. Real CFG merge via predecessor states. Fixed-point iteration. Alias tracking via alloc_id. Leak detection at return blocks.
 - `vrp_ir.c` (349 lines) — value range per LOCAL id per block. Merge at join points (range widening). Derive from literals, `x % N`, `x & MASK`. Scoped address_taken (not permanent like AST VRP). Function calls invalidate only address-taken locals.
+
+**Status (2026-04-17):** Both files are dead code — entry points `zercheck_ir()` and `vrp_ir()` exist but are NOT called from zerc_main.c, not in the Makefile's LIB_SRCS/CORE_SRCS, and not compiled into the binary. They are paused infrastructure from the original Phase 6/7 plan. The AST zercheck + AST VRP remain authoritative. Keep the files as reference; DO NOT rely on them for safety. Before wiring in, audit for gaps vs AST zercheck (see agent findings 2026-04-17: IR_RETURN escape check reads `inst->expr` but IR lowering writes `src1_local` — wrong path; NODE_FIELD/NODE_CALL aliasing missing; malloc has no NULL check).
 
 **Checker vs IR system split (23/6):**
 - **Checker (6 systems):** Typemap (#1), Type ID (#2), MMIO Ranges (#19), Qualifiers (#20), Containers (#25), Comptime (#26). These run BEFORE IR exists — they CREATE the typed AST that IR is lowered from.

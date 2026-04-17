@@ -21,6 +21,14 @@
 /* ================================================================
  * Lowering Context — state maintained during AST → IR translation
  * ================================================================ */
+
+/* Label → block mapping entry (BUG-575: stack-first dynamic buffer) */
+typedef struct {
+    const char *name;
+    uint32_t len;
+    int block_id;
+} IRLabelMap;
+
 typedef struct {
     IRFunc *func;
     Arena *arena;
@@ -35,9 +43,14 @@ typedef struct {
     /* Defer tracking */
     int defer_count;          /* number of pending defers */
 
-    /* Label → block mapping (for goto/label) */
-    struct { const char *name; uint32_t len; int block_id; } labels[128];
+    /* Label → block mapping (for goto/label).
+     * Stack-first dynamic pattern (CLAUDE.md rule #7): start with inline
+     * 32-slot array; overflow to arena-allocated doubling buffer. A function
+     * with thousands of labels is rare but must not silently drop entries. */
+    IRLabelMap label_inline[32];
+    IRLabelMap *labels;       /* points to label_inline or arena buffer */
     int label_count;
+    int label_capacity;
 
     /* Temp counter for generated names */
     int temp_count;
@@ -80,7 +93,9 @@ static void ensure_terminated(LowerCtx *ctx, int target_block) {
     emit_inst(ctx, go);
 }
 
-/* Find or create label → block mapping */
+/* Find or create label → block mapping.
+ * BUG-575: grows via arena-allocated doubling buffer when inline 32-slot
+ * overflows. Fixes CLAUDE.md rule #7 violation (silent drop past 128). */
 static int find_label_block(LowerCtx *ctx, const char *name, uint32_t len) {
     for (int i = 0; i < ctx->label_count; i++) {
         if (ctx->labels[i].len == len &&
@@ -89,12 +104,18 @@ static int find_label_block(LowerCtx *ctx, const char *name, uint32_t len) {
     }
     /* Create new block for this label */
     int bid = ir_add_block(ctx->func, ctx->arena);
-    if (ctx->label_count < 128) {
-        ctx->labels[ctx->label_count].name = name;
-        ctx->labels[ctx->label_count].len = len;
-        ctx->labels[ctx->label_count].block_id = bid;
-        ctx->label_count++;
+    if (ctx->label_count >= ctx->label_capacity) {
+        int new_cap = ctx->label_capacity * 2;
+        IRLabelMap *new_labels = (IRLabelMap *)arena_alloc(
+            ctx->arena, new_cap * sizeof(IRLabelMap));
+        memcpy(new_labels, ctx->labels, ctx->label_count * sizeof(IRLabelMap));
+        ctx->labels = new_labels;
+        ctx->label_capacity = new_cap;
     }
+    ctx->labels[ctx->label_count].name = name;
+    ctx->labels[ctx->label_count].len = len;
+    ctx->labels[ctx->label_count].block_id = bid;
+    ctx->label_count++;
     return bid;
 }
 
@@ -759,7 +780,15 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
         rewrite_idents(ctx, expr->slice.start);
         rewrite_idents(ctx, expr->slice.end);
         break;
+    case NODE_TYPECAST:
+        /* BUG-573: (Type)expr nested in passthrough routes (e.g., NODE_ASSIGN
+         * with complex rvalue) must rewrite the inner expr to reach suffixed
+         * locals created by scope shadowing. Without this, `d.f = (u32)m`
+         * after `?u32 m` is shadowed by `u32 m` emits stale `m` name. */
+        rewrite_idents(ctx, expr->typecast.expr);
+        break;
     /* NODE_ADDR_OF and NODE_DEREF are both NODE_UNARY — handled above */
+    /* NODE_CAST and NODE_SIZEOF are unused (see docs/compiler-internals.md) */
     case NODE_STRUCT_INIT:
         for (int i = 0; i < expr->struct_init.field_count; i++)
             rewrite_idents(ctx, expr->struct_init.fields[i].value);
@@ -1647,6 +1676,8 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.checker = checker;
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
+    ctx.labels = ctx.label_inline;
+    ctx.label_capacity = (int)(sizeof(ctx.label_inline) / sizeof(ctx.label_inline[0]));
 
     /* Phase 1: Collect params as locals.
      * Param types resolved from TypeNode using basic primitive mapping.
@@ -1742,6 +1773,8 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.checker = checker;
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
+    ctx.labels = ctx.label_inline;
+    ctx.label_capacity = (int)(sizeof(ctx.label_inline) / sizeof(ctx.label_inline[0]));
 
     /* Locals created on-demand during lower_stmt */
     collect_labels(&ctx, interrupt->interrupt.body);

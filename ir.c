@@ -269,22 +269,44 @@ bool ir_validate(IRFunc *func) {
                 }
             }
 
-            /* Validate local references */
+            /* Validate local references.
+             * Note: obj_local/handle_local use 0 as "unset" (memset sentinel),
+             * dest_local/cond_local/src*_local use -1. Both forms are OK as
+             * long as the out-of-range check doesn't accept negative values. */
             if (inst->dest_local >= 0 && inst->dest_local >= func->local_count) {
                 fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d references local %d but only %d locals in '%.*s'\n",
                         bi, ii, inst->dest_local, func->local_count,
                         (int)func->name_len, func->name);
                 valid = false;
             }
-            if (inst->obj_local > 0 && inst->obj_local >= func->local_count) {
+            if (inst->obj_local >= 0 && inst->obj_local >= func->local_count) {
                 fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d obj_local %d out of range in '%.*s'\n",
                         bi, ii, inst->obj_local, (int)func->name_len, func->name);
                 valid = false;
             }
-            if (inst->handle_local > 0 && inst->handle_local >= func->local_count) {
+            if (inst->handle_local >= 0 && inst->handle_local >= func->local_count) {
                 fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d handle_local %d out of range in '%.*s'\n",
                         bi, ii, inst->handle_local, (int)func->name_len, func->name);
                 valid = false;
+            }
+            if (inst->cond_local >= 0 && inst->cond_local >= func->local_count) {
+                fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d cond_local %d out of range in '%.*s'\n",
+                        bi, ii, inst->cond_local, (int)func->name_len, func->name);
+                valid = false;
+            }
+            if (inst->src1_local >= 0 && inst->src1_local >= func->local_count) {
+                fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d src1_local %d out of range in '%.*s'\n",
+                        bi, ii, inst->src1_local, (int)func->name_len, func->name);
+                valid = false;
+            }
+            if (inst->src2_local >= 0 && inst->src2_local >= func->local_count) {
+                /* Note: for IR_DEFER_FIRE, src2_local is a flag (0/1/2), not
+                 * a local id. Skip validation for that op to avoid false warns. */
+                if (inst->op != IR_DEFER_FIRE) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d src2_local %d out of range in '%.*s'\n",
+                            bi, ii, inst->src2_local, (int)func->name_len, func->name);
+                    valid = false;
+                }
             }
         }
     }

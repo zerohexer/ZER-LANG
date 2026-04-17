@@ -1,0 +1,24 @@
+// BUG-574: @barrier_init / @barrier_wait emitted as no-op comments
+// ("/* @barrier_init */ 0") through the IR passthrough path. The AST
+// emitter had both handlers; emit_rewritten_node (used for IR_ASSIGN
+// with intrinsic expr) was missing them. Without real barrier calls,
+// threads don't synchronize — silent correctness failure.
+Barrier b;
+
+threadlocal u32 tls_done;
+
+void worker(i32 tid) {
+    tls_done = 1;
+    @barrier_wait(b);           // IR passthrough path
+}
+
+u32 main() {
+    @barrier_init(b, 2);        // IR passthrough path
+    ThreadHandle th = spawn worker(0);
+    @barrier_wait(b);
+    th.join();
+    // If barrier_init was emitted as no-op, the child's barrier_wait
+    // returned immediately (count=0) and both ran without sync — OK for
+    // this trivial test, but emitter must still emit the real call.
+    return 0;
+}

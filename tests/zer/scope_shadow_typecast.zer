@@ -1,0 +1,34 @@
+// BUG-573: rewrite_idents missed NODE_TYPECAST, causing suffixed-local leak.
+// Before fix: `d.a = (u32)m` in the 2nd scope emitted `(uint32_t)m` (the
+// outer ?u32 optional) instead of `(uint32_t)m_N` (the inner u32).
+// Exercises the NODE_ASSIGN-passthrough path where rewrite_idents must
+// recurse through typecasts to reach shadowed identifiers.
+struct Data { u32 a; u32 b; }
+
+u32 sink(u32 x) { return x + 1; }
+
+u32 main() {
+    Data d;
+    d.a = 0;
+    d.b = 0;
+    // Outer scope — m is ?u32 (optional)
+    {
+        ?u32 m = 42;
+        u32 v = m orelse 0;
+        if (v != 42) { return 10; }
+    }
+    // Inner scope — m is u32 (suffixed to m_N by ir_add_local).
+    // The rewrite_idents walk must reach idents nested inside typecasts.
+    {
+        u32 m = 99;
+        d.a = (u32)m;            // ASSIGN passthrough + TYPECAST
+        if (d.a != 99) { return 1; }
+
+        d.b = sink((u32)m);       // CALL arg + TYPECAST
+        if (d.b != 100) { return 2; }
+
+        u32 k = (u32)m + 1;       // BINARY decompose + TYPECAST
+        if (k != 100) { return 3; }
+    }
+    return 0;
+}

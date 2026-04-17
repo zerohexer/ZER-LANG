@@ -3999,3 +3999,116 @@ Uses `add_symbol_internal()` to bypass BUG-276 `_zer_` prefix check.
 - if-exit-not-MAYBE_FREED (free+return in branch = safe after)
 - Double free via alias, ghost handle, handle leak overwrite
 - Cross-type slab free, scope escape via struct field return
+
+## BUG-577: Universal orelse pre-lowering (v0.4.6, 2026-04-17)
+
+Triggered by a real ZER program (linked_list.zer) that hung on `current = current.next orelse break;`. UBSan pinpointed null deref. Three fix rounds landed the universal solution.
+
+### The architectural problem
+
+`emit_rewritten_node` (IR path emitter) has NO `NODE_ORELSE` case by design — orelse is supposed to be pre-lowered at the statement level by `lower_orelse_to_dest` (emits IR branches + IR_COPY for unwrap).
+
+The gap: `find_orelse` only detected orelse at the TOP of the expression. Orelse wrapped in NODE_ASSIGN value, buried in call args, binary operands, or index sub-expressions escaped detection. Raw AST reached `emit_rewritten_node` which hit the default `/* unhandled node 47 */0`.
+
+### Three-round fix
+
+**Round 1:** `find_orelse` recurses into `NODE_ASSIGN.assign.value` (TOK_EQ only). Catches `ident = X orelse break;`. Pre-lowers via `lower_orelse_to_dest(target_local, orelse)`.
+
+**Round 2:** for non-local targets (`field/index/deref = X orelse break`), `lower_orelse_to_dest` can't write to them (only IR local IDs). Fix: lower orelse to tmp, synthesize `target = tmp_ident` as a new NODE_ASSIGN, emit via IR_ASSIGN passthrough — emitter's standard NODE_ASSIGN handling does the field/index/deref write.
+
+**Round 3 — `pre_lower_orelse` walker (universal fix):**
+
+```c
+/* Takes Node** so it can REPLACE the slot in the parent. */
+static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line);
+```
+
+Tree walker that recursively visits expression children. When it finds NODE_ORELSE:
+1. Determines result type (from checker or orelse.expr's optional inner).
+2. Creates fresh tmp local of that type.
+3. Calls `lower_orelse_to_dest(ctx, tmp, orelse, line)` — emits IR branches, IR_GOTO for terminating fallbacks, IR_COPY for value path.
+4. Replaces `*pp` with new `NODE_IDENT` referencing the tmp.
+
+After the walk, the expression tree is guaranteed orelse-free. Passthrough emits safely.
+
+Called in `lower_expr`'s `passthrough:` block:
+```c
+passthrough: {
+    rewrite_idents(ctx, expr);
+    pre_lower_orelse(ctx, &expr, expr->loc.line);  // NEW
+    // ... emit IR_ASSIGN with expr ...
+}
+```
+
+Recurses into: NODE_BINARY, NODE_UNARY, NODE_CALL (callee + args), NODE_FIELD, NODE_INDEX, NODE_SLICE, NODE_TYPECAST, NODE_ASSIGN, NODE_INTRINSIC, NODE_STRUCT_INIT.
+
+### Compound assign decomposition
+
+Added `lower_expr(NODE_ASSIGN)` for compound ops (`+=`, `-=`, etc.):
+
+```c
+case NODE_ASSIGN: {
+    if (expr->assign.op == TOK_EQ) goto passthrough;
+    int val_local = lower_expr(ctx, expr->assign.value);  // decomposes nested orelse
+    // synthesize `target op= tmp_ident` and emit as IR_ASSIGN
+}
+```
+
+Produces cleaner IR: call runs first, stores result, then `t += tmp` emits simply.
+
+### `emit_rewritten_node` vs `emit_expr` — not the same
+
+Fresh sessions often confuse these. The distinction is the INPUT:
+
+- `emit_expr` sees raw source AST. All node kinds possible. Used only for top-level declarations now.
+- `emit_rewritten_node` sees PRE-LOWERED AST — after `rewrite_idents` renamed shadowed locals, after `pre_lower_orelse` replaced orelse with tmp-ident, after compound assign's RHS was decomposed.
+
+IR invariant "zero `emit_expr` calls in IR function body path" verified:
+```bash
+sed -n '6282,7500p' emitter.c | grep -c "emit_expr("   # 0
+sed -n '7520,8800p' emitter.c | grep -c "emit_expr("   # 0
+```
+
+`tools/walker_audit.sh` automates this.
+
+### Walker audit tool
+
+`tools/walker_audit.sh` compares AST emit_expr cases vs IR emit_rewritten_node cases. NODE_ORELSE is documented as a known pre-lowered exception. Current output:
+```
+emit_expr (AST path)        handles 18 node kinds
+emit_rewritten_node (IR)    handles 17 node kinds (excluding pre-lowered)
+OK — no gaps.
+```
+
+Run before releasing. If the tool flags a gap, decide whether to add a case to `emit_rewritten_node` (Option A: for value-only constructs) or pre-lower (Option B: for constructs involving IR control flow).
+
+### Test coverage
+
+Three regression tests in `tests/zer/` guard BUG-577 permanently:
+
+- **`orelse_assign_nonlocal.zer`** — non-local targets (field + index) with orelse break in loop.
+- **`orelse_stress.zer`** — 14 orelse positions, each a separate function returning a distinct expected value. Any regression causes main() to exit with a distinct code pinpointing the broken context.
+- **`defer_scoped_blocks.zer`** — complementary defer lifecycle coverage inside loop/if/switch arms.
+
+### Pre-lowering pattern as the universal answer for IR path
+
+When a new AST construct can contain an expression (new statement kinds, new expression-wrapping operators):
+
+1. `rewrite_idents` must recurse into it (scope-shadow renaming).
+2. `pre_lower_orelse` must recurse into it (orelse decomposition).
+3. `emit_auto_guards` must recurse into it (bounds check injection — for NODE_INDEX primarily).
+4. Verify via `tools/walker_audit.sh`.
+
+If the new construct involves CFG (breaks, continues, gotos, yields), use Option B (pre-lower to IR). If it's a value-only expression, Option A (add case to emit_rewritten_node) is acceptable.
+
+## VSIX PATH management (v0.4.3, not compiler-internal but notable)
+
+Extension UX bug hit in real usage. Iterative VSIX installs (0.2.6 → 0.3.0 → 0.4.0 → 0.4.1 → …) accumulated PATH entries. `where zerc` resolved to the first-installed (0.2.6), not the newest. Reinstalls of the SAME version didn't re-prompt because `zer.pathAdded` was in VS Code's global state (persists across uninstalls).
+
+Fix in `editors/vscode/extension.js`:
+- Per-version globalState key `zer.pathHandled.{version}` instead of single flag.
+- Compare `where zerc` path against the CURRENT extension's bundled zerc.exe. If mismatch, prompt.
+- On Yes, strip ALL `zerc-language` entries from User PATH before prepending current version's platDir + gcc/bin. Auto-cleans up dead entries from uninstalled extension dirs.
+- Use `powershell -EncodedCommand` base64 to avoid quoting issues when writing PATH.
+
+Users upgrading through multiple versions may need to clean up ONCE; the per-version key handles subsequent upgrades cleanly.

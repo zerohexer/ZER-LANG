@@ -5,6 +5,114 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-17 (night) — BUG-577: universal orelse pre-lowering
+
+Triggered by a real ZER program (linked_list.zer) that hung on
+`current = current.next orelse break;` inside a `while(true)` loop. UBSan
+pinpointed the null dereference. The fix went through three iterations, and
+the final universal solution eliminated an entire class of
+"walker missing node kind" bugs for orelse.
+
+Also built `tools/walker_audit.sh` as a standing CI gate against this class.
+
+### BUG-577: orelse pre-lowering incomplete across expression positions
+
+**Symptom:** `current = current.next orelse break;` emitted
+`current = /* unhandled node 47 */0;` — assigning null to current. Next
+iteration dereferenced null → hang / UBSan trap / segfault.
+
+More variants of the same bug surfaced while writing a stress test:
+- `target = X orelse break;` with non-local target (field, index, deref)
+- `t += sink(X orelse break);` — orelse in compound assign's call arg
+- `arr[X orelse 0]` — orelse in an index sub-expression
+- `(X orelse 0) + 100` — orelse in binary operand
+
+**Root cause chain:**
+1. `emit_rewritten_node` (IR path emitter) has NO NODE_ORELSE case by design —
+   orelse is expected to be pre-lowered to IR branches before emission.
+2. `find_orelse` (detector for pre-lowering) only checked the top level of the
+   expression. It missed orelse wrapped in NODE_ASSIGN value, NODE_CALL args,
+   NODE_BINARY, NODE_INDEX, etc.
+3. When find_orelse missed, `need_ir` was false, pre-lowering was SKIPPED,
+   raw AST reached emit_rewritten_node, hit the default unhandled-node
+   emission that writes `0`.
+
+**Fix (three rounds):**
+
+*Round 1 — initial:* Extend `find_orelse` to recurse into
+`NODE_ASSIGN.assign.value` so `ident = X orelse break` is detected.
+Pre-lower via `lower_orelse_to_dest(target_local, orelse)`.
+
+*Round 2 — non-local targets:* For `field/index/deref = X orelse break`,
+`lower_orelse_to_dest` can't write to non-local targets. Fix: lower orelse
+to a fresh tmp, then synthesize `target = tmp_ident` as a new NODE_ASSIGN
+and emit it as IR_ASSIGN passthrough.
+
+*Round 3 — universal `pre_lower_orelse` walker:* Orelse nested deeper (call
+args, binary operands, index sub-expressions) still bypassed detection.
+Added `pre_lower_orelse(ctx, Node **pp, line)` — a tree walker that
+recursively finds every NODE_ORELSE in an expression and replaces the slot
+with a NODE_IDENT referencing a fresh tmp local. Called in `lower_expr`'s
+passthrough. After this walk, the AST reaching emit_rewritten_node is
+guaranteed orelse-free.
+
+Also: `lower_expr(NODE_ASSIGN)` for compound ops (`+=`, `-=`, etc.).
+Decomposes the RHS (which may contain orelse deep inside a call), then
+synthesizes `target op= tmp_ident` for emission. Without this, compound
+assigns with nested orelse hit passthrough directly and bypassed
+`pre_lower_orelse`.
+
+**Architectural invariant preserved:** emit_rewritten_node still has ZERO
+NODE_ORELSE case. IR emission path has ZERO emit_expr calls (verified via
+grep, see tools/walker_audit.sh). The fix is purely in the lowering phase —
+it transforms the AST so emission stays simple.
+
+**Tests (in tests/zer/):**
+- `orelse_assign_nonlocal.zer` — struct field + array index targets with
+  orelse break in loop.
+- `orelse_stress.zer` — 14 orelse positions: var-decl init (value/return),
+  assign ident/field, call arg (value/break), binary operand, index,
+  return expr, if cond, nested chain, etc. Distinct exit codes pinpoint
+  any regression.
+- `defer_scoped_blocks.zer` — defer in loop/if/switch arm bodies.
+
+**Prevention:** `tools/walker_audit.sh` — compares AST emit_expr cases
+against IR emit_rewritten_node cases. Flags any NODE_ kind handled in AST
+but missing from IR. Current output: "no gaps" (NODE_ORELSE documented as
+a known pre-lowered exception).
+
+**Lesson for future work:** "walker missing node kind" is a recurring bug
+class in IR path (BUG-573 was the rewrite_idents version, BUG-567 was
+index-specific). The fix is usually recursive descent. When adding a new
+AST node kind that can appear inside expressions, verify both
+`rewrite_idents` and `pre_lower_orelse`-style transforms cover it.
+
+### VSIX extension: PATH cleanup on reinstall (v0.4.3)
+
+Not a compiler bug — an extension UX bug. User installed VSIX 0.2.6, then
+0.3.0, 0.4.0, 0.4.1 successively. `where zerc` still resolved to 0.2.6's
+bundled binary. Reinstalling 0.4.2 didn't even trigger the "add to PATH"
+prompt.
+
+**Root cause:**
+1. `extension.js` stored a global `zer.pathAdded` flag in VS Code's
+   globalState after the first prompt. globalState persists across extension
+   uninstalls. Once set, prompt never re-fires.
+2. `where zerc` only checked "is SOME zerc on PATH" — didn't verify it was
+   the CURRENT version's bundled zerc.
+3. Each install APPENDED to User PATH without cleaning previous versions.
+   First-match wins → oldest installed version.
+
+**Fix (editors/vscode/extension.js):**
+- Per-version key `zer.pathHandled.{version}`. Upgrades get one prompt.
+- Compare `where zerc` result path against CURRENT version's bundled zerc.exe.
+  If different, prompt.
+- On Yes: strip ALL `zerc-language` entries from User PATH (cleans stale
+  entries from uninstalled versions), prepend the current version's platDir
+  + gcc/bin. Use PowerShell `-EncodedCommand` base64 to avoid quoting issues.
+
+---
+
 ## Session 2026-04-17 (late) — IR audit pass: 4 bugs + dead-code tech debt
 
 Two-agent parallel audit of IR lowering + emitter-from-IR path surfaced four

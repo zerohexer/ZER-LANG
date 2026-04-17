@@ -5,6 +5,102 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-17 (late) — IR audit pass: 4 bugs + dead-code tech debt
+
+Two-agent parallel audit of IR lowering + emitter-from-IR path surfaced four
+actionable bugs. All confirmed via minimal repros; all fixed. No regressions
+— all 3,100+ tests still pass.
+
+Also identified 801 lines of dead code (`zercheck_ir.c` + `vrp_ir.c`) left over
+from paused Phase 6/7 IR analysis work — entry points exist but nothing calls
+them, and they're not in the Makefile. Documented in
+`docs/compiler-internals.md` rather than deleted; they are reference material
+for future IR-analysis work.
+
+### BUG-573: rewrite_idents missed NODE_TYPECAST — suffixed locals leak original name (2026-04-17)
+
+**Symptom:** After a scope shadow (`?u32 m` then `u32 m` in sibling scopes),
+an assignment like `d.a = (u32)m;` emitted `d.a = (uint32_t)m;` where `m`
+referred to the outer optional — GCC rejected with "aggregate value used where
+an integer was expected." The inner local was suffixed to `m_N` by
+`ir_add_local`, but the emitted C still said `m`.
+
+**Root cause:** `rewrite_idents` in `ir_lower.c` walks expression trees to
+rename idents pointing at suffixed locals. The switch handled BINARY, UNARY,
+CALL, FIELD, INDEX, ASSIGN, ORELSE, INTRINSIC, SLICE, STRUCT_INIT — but not
+NODE_TYPECAST. When an ASSIGN or complex expression went through passthrough
+(IR_ASSIGN with expr=AST node), the typecast's inner ident was not rewritten.
+`lower_expr` NODE_TYPECAST catches the case when TYPECAST is the whole
+expression, but not when nested inside a passthrough-routed construct.
+
+**Fix:** Add NODE_TYPECAST case to `rewrite_idents` — recurse into
+`typecast.expr`. NODE_CAST and NODE_SIZEOF are marked unused in
+`docs/compiler-internals.md`; no change.
+
+**Test:** `tests/zer/scope_shadow_typecast.zer` — three positions that route
+through different passthrough paths (NODE_ASSIGN, CALL arg, BINARY decompose).
+
+### BUG-574: @barrier_init / @barrier_wait silently became no-ops on IR path (2026-04-17)
+
+**Symptom:** In IR-path emission, `@barrier_init(b, 2)` and `@barrier_wait(b)`
+emitted as `/* @barrier_init */ 0` (literal zero placeholder). Program
+compiled and ran, but threads never synchronized. Silent correctness failure.
+
+**Root cause:** `emit_rewritten_node` in `emitter.c` (the IR passthrough
+emitter for NODE_INTRINSIC) handled `barrier` (length 7), `barrier_store`
+(13), `barrier_load` (12), `atomic_*`, `cond_*`, `sem_*`, `probe`, `config` —
+but NOT `barrier_init` (12) or `barrier_wait` (12). The AST emitter
+`emit_expr` handled them correctly. When IR lowering routed an intrinsic call
+through IR_ASSIGN passthrough, the emitter dropped through to the "unknown
+intrinsic" fallback `/* @name */ 0`.
+
+**Fix:** Add explicit `barrier_init` and `barrier_wait` cases in
+`emit_rewritten_node`, mirroring the AST emit_expr shape (auto-address-of
+when operand is non-pointer).
+
+**Test:** `tests/zer/barrier_ir_emit.zer` — barrier + spawn + threadlocal.
+
+### BUG-575: labels[128] silently dropped entries past 128 (CLAUDE.md rule #7) (2026-04-17)
+
+**Symptom:** None observed in test suite — the violation is a silent drop
+rather than a crash. A function with >128 distinct goto labels would create a
+new block per entry past the limit (lookup fails, falls through to `if
+(label_count < 128)` which skips the mapping store), producing wrong C with
+branches to different blocks for the "same" label.
+
+**Root cause:** `LowerCtx.labels` was a fixed `[128]` array in `ir_lower.c`.
+CLAUDE.md rule #7 explicitly prohibits fixed-size buffers for dynamic data.
+Matches the pattern of prior silent-drop bugs (BUG-492 `covered_ids[64]`).
+
+**Fix:** Stack-first dynamic pattern. Inline `label_inline[32]` slot array
+plus `labels` pointer + `label_capacity`; overflow via `arena_alloc` doubling,
+same pattern as parser RF9. Initialized in both `ir_lower_func` and
+`ir_lower_interrupt`.
+
+**Test:** No explicit regression — >128 labels in one function is impractical
+to author but synthesizable. CLAUDE.md rule #7 audits cover this class.
+
+### BUG-576: ir_validate gaps — missing cond_local/src*_local checks, off-by-one sentinel (2026-04-17)
+
+**Symptom:** None observed (validation is informational; errors printed to
+stderr and `valid=false` returned, never fails the build). But validation
+quietly skipped checks for `obj_local == 0` (sentinel), and did not check
+`cond_local`, `src1_local`, or `src2_local` at all. Bugs in lowering that
+referenced out-of-range locals went undetected.
+
+**Root cause:** Check used `inst->obj_local > 0 && inst->obj_local >= func->local_count`
+— the `> 0` skipped the sentinel-0 case. Same pattern for `handle_local`.
+`cond_local`, `src1_local`, `src2_local` had no checks.
+
+**Fix:** Switch to `>= 0` bounds, matching `dest_local`'s pattern. Add
+validation for `cond_local` and `src1_local`/`src2_local`. Exception:
+IR_DEFER_FIRE overloads `src2_local` as a flag (0=pop, 1=no-pop, 2=pop-only),
+not a local ID — skip for that op.
+
+**Test:** No regression test (validation is internal).
+
+---
+
 ## Session 2026-04-17 (continued) — Close remaining IR gaps: 238/238 passing (15 bugs)
 
 Closed the remaining 18 test_emit failures from the IR path validation session.

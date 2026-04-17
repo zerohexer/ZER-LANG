@@ -7138,6 +7138,24 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "__atomic_thread_fence(__ATOMIC_RELEASE)");
         } else if (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
+        } else if (nlen == 12 && memcmp(name, "barrier_init", 12) == 0 && node->intrinsic.arg_count >= 2) {
+            /* BUG-574: thread barrier init on IR path — same shape as AST emit_expr */
+            Type *bt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            bool is_ptr = bt && type_unwrap_distinct(bt)->kind == TYPE_POINTER;
+            emit(e, "_zer_barrier_init(");
+            if (!is_ptr) emit(e, "&");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ", ");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ")");
+        } else if (nlen == 12 && memcmp(name, "barrier_wait", 12) == 0 && node->intrinsic.arg_count >= 1) {
+            /* BUG-574: thread barrier wait on IR path */
+            Type *bt = checker_get_type(e->checker, node->intrinsic.args[0]);
+            bool is_ptr = bt && type_unwrap_distinct(bt)->kind == TYPE_POINTER;
+            emit(e, "_zer_barrier_wait(");
+            if (!is_ptr) emit(e, "&");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")");
         } else if (nlen >= 7 && memcmp(name, "atomic_", 7) == 0) {
             /* @atomic_add/sub/or/and/xor/load/store/cas */
             const char *aop = name + 7;

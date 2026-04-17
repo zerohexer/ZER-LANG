@@ -5,6 +5,170 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-17 (continued) — Close remaining IR gaps: 238/238 passing (15 bugs)
+
+Closed the remaining 18 test_emit failures from the IR path validation session.
+test_emit: 220/238 → **238/238**. `make check` ALL TESTS PASSED.
+
+All integration tests unchanged (rust 786/786, zer 277, zig 36, module 28).
+All C unit tests at 100%: firmware 39+41+22, production 14, checker 584,
+zercheck 54, emit 238.
+
+### BUG-558: Array→slice coercion at var-decl (2026-04-17)
+
+**Symptom:** `[]u8 sl = arr;` (where arr is `u8[3]`) emitted `arr;` as a useless statement, sl stayed zero-init.
+
+**Root cause:** Global array `arr` has TYPE_ARRAY. `lower_expr` returns -1 for arrays (can't store in a temp — C can't assign arrays). NODE_VAR_DECL handler didn't detect this case; falls through with src=-1 and no assignment emitted.
+
+**Fix:** In NODE_VAR_DECL, check if init type is TYPE_ARRAY and target is TYPE_SLICE. If so, use IR_ASSIGN passthrough — emitter's `need_slice` path calls `emit_array_as_slice`.
+
+**Test:** test_emit.c "array→slice coercion at var-decl: u8[3] → []u8 = 30".
+
+### BUG-559: Array→slice coercion at call site (2026-04-17)
+
+**Symptom:** `sum(buf)` where buf=`u8[4]`, param=`[]u8` emitted `sum(0);` — arg lost.
+
+**Root cause:** `lower_expr(arg)` returns -1 for array args. IR_CALL emitter's -1 path emitted bare `0`.
+
+**Fix:** In IR_CALL emitter's -1 arg path, look up original AST arg type. If array AND param is slice, call `emit_array_as_slice` directly.
+
+**Test:** test_emit.c "array→slice coercion at call: u8[4] → []u8 param = 42".
+
+### BUG-560: Array→slice coercion at return (2026-04-17)
+
+**Symptom:** `[]u8 f() { return arr; }` emitted bare return — value lost. Called function returned garbage.
+
+**Root cause:** NODE_RETURN lowering calls `lower_expr(ret_expr)`. For array ret_expr, returns -1. IR_RETURN went to bare-return path.
+
+**Fix:** NODE_RETURN lowering keeps `ret.expr = ret_expr` when `src1_local = -1`. IR_RETURN emitter checks — if expr is TYPE_ARRAY and return is TYPE_SLICE, emit `return <array_as_slice>;`.
+
+**Test:** Firmware example that returns a global array slice.
+
+### BUG-561: @config intrinsic not handled in IR path (2026-04-17)
+
+**Symptom:** `@config("KEY", 42)` emitted `/* @config */ 0` — always zero.
+
+**Root cause:** `emit_rewritten_node`'s intrinsic dispatch had no case for `config`. Hit "unknown intrinsic" default.
+
+**Fix:** Added `config` case — emits the default value (last arg). Matches AST path behavior.
+
+**Test:** test_emit.c "@config default value = 42".
+
+### BUG-562: @size(union) emitted wrong C type name (2026-04-17)
+
+**Symptom:** `@size(Msg)` for union Msg emitted `sizeof(struct Msg)` — GCC "incomplete type". Unions are emitted as `struct _union_Name` in C.
+
+**Root cause:** Two sites in `@size` handler in emit_rewritten_node had `emit(e, "struct %.*s", ..., union_type.name)` — missing `_union_` prefix.
+
+**Fix:** Both sites now emit `struct _union_%.*s`.
+
+**Test:** test_emit.c "@size(union) = 16 (tag=4 + pad=4 + u64=8)".
+
+### BUG-563: Bare return from `?void` emitted failure instead of success (2026-04-17)
+
+**Symptom:** `?void f() { return; }` emitted `return (_zer_opt_void){0};` — receiver saw failure (has_value=0). Only `return null` should mean failure.
+
+**Root cause:** IR_RETURN's bare-return path called `emit_return_null` unconditionally. For ?void, bare return means SUCCESS.
+
+**Fix:** Detect `ret_eff->kind == TYPE_OPTIONAL`: emit `{ 1 }` for ?void, `{ 0, 1 }` for ?T struct (success value).
+
+**Test:** test_emit.c "?void function: bare return = success, return null = failure".
+
+### BUG-564: `return void_func()` from ?void emitted failure (2026-04-17)
+
+**Symptom:** `?void wrapper() { return do_stuff(); }` — do_stuff was called but wrapper returned `{0}` (failure).
+
+**Root cause:** `lower_expr(call)` returns -1 for void calls. IR_RETURN went to bare-return path. Combined with BUG-563 behavior — now returning success.
+
+**Fix:** IR_RETURN bare-return path, when `inst->expr` is set and is a void expression, emits the expression as a statement, then `return;` (for void functions) or bare success return (for ?void).
+
+**Test:** test_emit.c "?void return void_func() → valid C".
+
+### BUG-565: Auto-guard not wired into IR path (2026-04-17)
+
+**Symptom:** `u32 idx = 10; arr[idx] = 99; return arr[0];` — unproven OOB access was NOT auto-guarded. Should return 0 early; returned 42 (arr[0] before OOB corruption — or segfault in practice).
+
+**Root cause:** `emit_auto_guards()` was called from emit_stmt paths (NODE_VAR_DECL, NODE_IF cond, NODE_RETURN, NODE_EXPR_STMT). In IR path, these statement kinds go through IR ops — `emit_stmt` never runs.
+
+**Fix:** In the IR block emission loop, for every IR op carrying an expr (IR_ASSIGN, IR_CALL, IR_RETURN, IR_INTRINSIC, IR_CALL_DECOMP), call `emit_auto_guards(e, inst->expr)` BEFORE `emit_ir_inst`. Recursively walks the expression tree, emits `if (idx >= size) { return 0; }` for each NODE_INDEX with auto_guard_size set.
+
+**Test:** test_emit.c "auto-guard: idx=10 >= 4", "auto-guard E2E: param idx=99", "auto-guard E2E: global OOB".
+
+### BUG-566: Union switch hoist used value, broke `|*v|` capture (2026-04-17)
+
+**Symptom:** `switch (g_union) { .a => |*v| { v.x = 99; } }` — modified a COPY of g_union.a, not the original. Subsequent read of g_union.a.x returned old value.
+
+**Root cause:** Union switch IR emission hoisted via `__typeof__(expr) _sw = expr;` (value). `|*v| = &_sw.variant` pointed to the COPY.
+
+**Fix:** For unions, hoist as POINTER: `__typeof__(expr) *_sw = &(expr);`. All accesses use `->`. For rvalue switch expr (NODE_CALL), hoist the rvalue to a temp first, then take its address (temp is lvalue).
+
+**Test:** test_emit.c "union switch |*v| modifies original (not copy)".
+
+### BUG-567: orelse inside array index — double-eval via NODE_INDEX passthrough (2026-04-17)
+
+**Symptom:** `arr[next() orelse 0]` — next() called TWICE. Expected called once.
+
+**Root cause:** NODE_INDEX with global array object → passthrough. Emitter's emit_rewritten_node for NODE_INDEX emits `arr[...].` The `...` is the index expression — emit_rewritten_node hits NODE_ORELSE → "unhandled". Index evaluation fails, tests show garbage.
+
+**Fix:** In NODE_INDEX lowering (passthrough for global array path), if index is NODE_ORELSE, decompose via `lower_expr` to get a local. Rewrite the NODE_INDEX's index AST to reference the local. Now emit_rewritten_node sees a clean ident.
+
+**Test:** test_emit.c "orelse index single-eval (next() called once, arr[1]=20)".
+
+### BUG-568: Sub-slice start/end double-eval (2026-04-17)
+
+**Symptom:** `arr[get_start()..get_end()]` — get_start() called TWICE (for index and for subtraction `end - start`).
+
+**Root cause:** emit_rewritten_node NODE_SLICE emitted `emit_rewritten_node(start)` at both the index position AND inside the length calculation.
+
+**Fix:** Hoist start/end to temps via GCC statement expression: `({ size_t _ss = (start); size_t _se = (end); (Slice){ &arr[_ss], _se - _ss }; })`. Each side called exactly once.
+
+**Test:** test_emit.c "slice start/end single-eval (counter=2, not 4+)".
+
+### BUG-569: Arena.over(next_buf()) double-eval (2026-04-17)
+
+**Symptom:** `Arena.over(next_buf())` — next_buf() called TWICE (`(uint8_t*)arg, sizeof(arg)`). Expected once.
+
+**Root cause:** emit_builtin_inline emitted `(_zer_arena){(uint8_t*)ARG,sizeof(ARG),0}` with `BA(0)` (arg) emitted twice.
+
+**Fix:** For slice args (side-effect possible), hoist to a typed local (slice can be assigned) then use `.ptr`/`.len`. For array args (lvalue, no side effect), emit directly twice — C can't assign arrays.
+
+**Test:** test_emit.c "Arena.over single-eval (counter=1, not 2)".
+
+### BUG-570: Mutable capture `|*v|` on if-unwrap (re-verified) (2026-04-17)
+
+Already fixed previously — verified still working via regression testing.
+
+### BUG-571: Mutable capture `|*v|` on union switch arm (2026-04-17)
+
+Fixed by BUG-566 (hoist as pointer + use `->` accessor). Union switch `|*v|` now correctly takes address of the ORIGINAL variant.
+
+**Test:** test_emit.c "union switch |*v| modifies original".
+
+### BUG-572: Defer + orelse continue in for loop — compile-time stack vs CFG (2026-04-17)
+
+**Symptom:** `for { defer cleanup(); maybe(i) orelse continue; }` — cleanup() fired for every iteration EXCEPT the null iteration (orelse-continue path).
+
+**Root cause:** The fundamental compile-time defer_stack limitation. Emitter's `defer_stack` is compile-time (walked during emission). Block emission order is by block ID. For a loop body with orelse-continue:
+- bb2 (body entry): `IR_DEFER_PUSH` → stack += cleanup
+- bb3, bb4 (step, exit): nothing
+- bb5 (orelse-ok): `IR_DEFER_FIRE` — should fire cleanup
+- bb6 (orelse-continue): `IR_DEFER_FIRE` — should fire cleanup
+
+If we pop at bb5 (body-end fire with pop=true), bb6 sees empty stack. If we don't pop, function-exit fire-all duplicates.
+
+Previous patch attempts: pop at bb_exit (ID 4) cleared stack BEFORE bb5/bb6 (IDs 5, 6) were emitted — same bug in reverse.
+
+**Fix:** Three-state IR_DEFER_FIRE encoding via src2_local:
+- `0`: emit bodies + pop (default scoped fire)
+- `1`: emit bodies, NO pop (break/continue/orelse-exits mid-flow)
+- `2`: pop ONLY, no emit (scope cleanup after all fire sites emitted)
+
+Loop body end uses mode 1 (emit, keep stack for divergent paths). Break/continue/orelse-exit use mode 1 (emit). Pop-only happens in a NEW "post-exit" block created AFTER body lowering — since block IDs are monotonic, this block is emitted LAST of loop blocks, guaranteeing all fire sites ran first.
+
+**Test:** test_emit.c "defer+orelse+for: sum=0+2+3=5, cleanup=4, total=9".
+
+---
+
 ## Session 2026-04-17 — IR path validation: flip `use_ir=true` in test harnesses (20 bugs)
 
 **Root discovery:** `emitter_init` does `memset(e, 0, sizeof(Emitter))` — `use_ir` defaulted to `false`. The `zerc` binary overrides this (sets `use_ir = true` in `zerc_main.c`), but C unit tests (test_emit.c, test_firmware*.c, test_production.c, test_zercheck.c) called `emit_file` directly after `emitter_init` and never set the flag — they ran the **AST path** despite IR being "default". Only shell-script integration tests (`tests/test_zer.sh`, `rust_tests/`, `zig_tests/`, `test_modules/`) validated IR. About 3,000 of the 4,000+ tests were silently AST-only.

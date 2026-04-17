@@ -206,6 +206,13 @@ u32 main() {
 | `zer.lspPath` | (bundled) | Path to `zer-lsp` executable. Leave empty to use bundled. |
 | `zer.lspArgs` | `[]` | Additional arguments for `zer-lsp` |
 
+## v0.4.1 Changelog
+
+- **IR path at 100% across every test suite** — every pattern validated end-to-end through IR emission (not just integration tests)
+- 35 IR bug fixes (BUG-538 through BUG-572) covering null/optional handling, defer lifecycle across loops/if-bodies/switch arms, array→slice coercion, single-eval guarantees, union mutable captures, nested orelse chains, auto-guard wiring, address-of lvalue preservation, `?void` return semantics, bit extraction, static locals
+- Three-state `IR_DEFER_FIRE` encoding (emit+pop / emit,no-pop / pop-only) to correctly handle defers in loops with divergent paths (break, continue, orelse-continue)
+- **4,000+ tests — all passing:** 238 E2E emit tests, 102 firmware patterns, 14 production CRC/bootloader, 584 type checker, 786 Rust-equivalent safety translations, 277 integration, 36 Zig, 28 multi-module
+
 ## v0.4.0 Changelog
 
 - **MIR-inspired IR emission pipeline** — 100% IR for function bodies
@@ -213,8 +220,6 @@ u32 main() {
 - Cross-module function and variable name mangling
 - `emit_builtin_inline` — pool/slab/ring/arena/Task builtins from local IDs
 - `emit_rewritten_node` — all expression types emitted directly, zero `emit_expr`
-- 25 bug fixes (BUG-513 through BUG-537)
-- 196 ZER + 786 Rust-equivalent + 36 Zig + 28 module tests passing
 
 ## Links
 

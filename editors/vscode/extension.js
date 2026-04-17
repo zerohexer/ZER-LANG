@@ -49,22 +49,33 @@ function activate(context) {
         lspPath = findBundled(context, lspName);
     }
 
-    // Check if zerc is on system PATH BEFORE we inject bundled dir
+    // --- PATH resolution: check what `where zerc` resolves to BEFORE we inject ---
     const platDir = path.join(context.extensionPath, 'bin', getPlatformDir());
     const sep = process.platform === 'win32' ? ';' : ':';
-    let zercOnSystemPath = false;
-    try { execSync('where zerc', { stdio: 'ignore' }); zercOnSystemPath = true; } catch(e) {}
+    const exeExt = process.platform === 'win32' ? '.exe' : '';
+    const bundledZercPath = path.join(platDir, 'zerc' + exeExt);
+    const gccBinDir = process.platform === 'win32' ? path.join(platDir, 'gcc', 'bin') : null;
 
-    // Add bundled bin/ to PATH for zerc and gcc
+    const pathsEqual = (a, b) =>
+        a && b && path.normalize(a).toLowerCase() === path.normalize(b).toLowerCase();
+
+    // What does `where zerc` resolve to on the user's actual PATH?
+    let resolvedZercPath = null;
+    try {
+        const cmd = process.platform === 'win32' ? 'where zerc' : 'which zerc';
+        resolvedZercPath = execSync(cmd, { encoding: 'utf-8' }).trim().split(/\r?\n/)[0] || null;
+    } catch (e) { /* zerc not on PATH at all */ }
+
+    // "PATH is fine" = the resolved zerc IS our bundled one for this version.
+    // If resolved is from a different extension version (or doesn't resolve), we need update.
+    const pathIsCurrent = pathsEqual(resolvedZercPath, bundledZercPath);
+
+    // Add bundled bin/ to PATH for zerc and gcc (process + integrated terminal)
     if (fs.existsSync(platDir)) {
         process.env.PATH = platDir + sep + process.env.PATH;
     }
-    // Windows: add bundled GCC
-    if (process.platform === 'win32') {
-        const gccDir = path.join(platDir, 'gcc', 'bin');
-        if (fs.existsSync(gccDir)) {
-            process.env.PATH = gccDir + sep + process.env.PATH;
-        }
+    if (process.platform === 'win32' && gccBinDir && fs.existsSync(gccBinDir)) {
+        process.env.PATH = gccBinDir + sep + process.env.PATH;
     }
 
     // Propagate bundled bin/ to integrated terminal so zerc is available there
@@ -72,32 +83,56 @@ function activate(context) {
     if (fs.existsSync(platDir)) {
         envVar.prepend('PATH', platDir + sep);
     }
-    if (process.platform === 'win32') {
-        const gccBinDir = path.join(platDir, 'gcc', 'bin');
-        if (fs.existsSync(gccBinDir)) {
-            envVar.prepend('PATH', gccBinDir + sep);
-        }
+    if (process.platform === 'win32' && gccBinDir && fs.existsSync(gccBinDir)) {
+        envVar.prepend('PATH', gccBinDir + sep);
+    }
 
-        // First-time: offer to add zerc to user PATH permanently
-        const addedKey = 'zer.pathAdded';
-        const alreadyAdded = context.globalState.get(addedKey);
+    // Windows: offer to install to user PATH.
+    // Per-version flag — prompts once per extension version. Reinstalls of the
+    // same version don't re-prompt; upgrades prompt once, so stale paths from
+    // old versions get replaced. Clicking "No" is remembered for that version.
+    if (process.platform === 'win32' && !pathIsCurrent) {
+        const version = context.extension.packageJSON.version;
+        const versionKey = `zer.pathHandled.${version}`;
+        const handled = context.globalState.get(versionKey);
 
-        if (!alreadyAdded && !zercOnSystemPath) {
-            vscode.window.showWarningMessage(
-                'ZER: zerc not found on PATH. Add bundled zerc + gcc to your system PATH?',
-                'Yes', 'No'
-            ).then(choice => {
+        if (!handled) {
+            const msg = resolvedZercPath
+                ? `ZER: your PATH zerc points to a different version:\n${resolvedZercPath}\nUpdate to this extension's bundled zerc?`
+                : 'ZER: zerc not on PATH. Add bundled zerc + gcc to your user PATH?';
+            vscode.window.showWarningMessage(msg, 'Yes', 'No').then(choice => {
                 if (choice === 'Yes') {
                     try {
-                        const psCmd = `[Environment]::SetEnvironmentVariable('Path', '${platDir};${gccBinDir};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')`;
-                        execSync(`powershell -Command "${psCmd}"`, { stdio: 'ignore' });
-                        context.globalState.update(addedKey, true);
-                        vscode.window.showInformationMessage('ZER: Added to PATH. Restart VS Code to use zerc in terminal.');
+                        // Read current user PATH, strip dead/stale zerc-language entries,
+                        // then prepend this version's platDir + gccBinDir.
+                        const readCmd = `powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('Path', 'User')"`;
+                        const currentPath = execSync(readCmd, { encoding: 'utf-8' }).trim();
+                        const entries = currentPath.split(';').filter(e => {
+                            if (!e) return false;
+                            // Remove any zerc-language entry (we're replacing with current version).
+                            // Also auto-cleans entries pointing to uninstalled extension dirs.
+                            if (e.toLowerCase().includes('zerc-language')) return false;
+                            return true;
+                        });
+                        const newEntries = [platDir, gccBinDir, ...entries].join(';');
+                        // Write via base64 to avoid quoting issues
+                        const b64 = Buffer.from(
+                            `[Environment]::SetEnvironmentVariable('Path', @'\n${newEntries}\n'@, 'User')`,
+                            'utf-16le'
+                        ).toString('base64');
+                        execSync(`powershell -NoProfile -EncodedCommand ${b64}`, { stdio: 'ignore' });
+                        context.globalState.update(versionKey, true);
+                        vscode.window.showInformationMessage(
+                            'ZER: PATH updated. Restart terminal (and VS Code) for the change to apply.'
+                        );
                     } catch (err) {
-                        vscode.window.showErrorMessage('ZER: Failed to update PATH — add manually: ' + platDir);
+                        vscode.window.showErrorMessage(
+                            'ZER: Failed to update PATH. Add manually: ' + platDir
+                        );
                     }
                 } else {
-                    context.globalState.update(addedKey, true);
+                    // Remember "No" for this version — don't nag again unless upgraded.
+                    context.globalState.update(versionKey, true);
                 }
             });
         }

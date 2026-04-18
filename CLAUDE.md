@@ -1218,6 +1218,34 @@ The audit round found 6 bugs, real code found 5 more, real-code session 2 found 
 
 **Also critical: `zerc --run` historically returned exit 0 even when compiled binary trapped.** Many rust_tests/ were "passing" while the emitted program trapped at runtime (SIGTRAP = exit 133). Post-IR-validation changes, tests that previously masked trap-failures now surface as compile errors and must actually be fixed. If a test was passing before and fails now with a GCC error, don't assume regression — check git history to see if the test was ever running correctly.
 
+**FIXED 2026-04-18 (BUG-581).** `zerc_main.c` now uses `WEXITSTATUS(run_ret)` on POSIX. Fresh sessions can now trust `--run` exit codes. But this is what EXPOSED the other latent bugs below — don't assume "test passes via `--run`" means the test is correct; many tests had wrong behavior that was masked for ~8 months. If you see test runners with `KNOWN_FAIL` skip lists (`tests/test_zer.sh`, `rust_tests/run_tests.sh`, `zig_tests/run_tests.sh`), those entries are pre-existing failures surfaced by BUG-581 — see `docs/limitations.md`.
+
+### IR Path Architectural Invariants — CRITICAL for fresh sessions
+
+These are the non-obvious rules that took multiple sessions + bug fixes to discover. Violating any of them causes silent miscompilation.
+
+**1. Entry block MUST be `bb0`** (BUG-588). In `ir_lower_func` / `ir_lower_interrupt`, call `start_block(&ctx)` BEFORE `collect_labels(&ctx, body)`. If you swap the order, label blocks get IDs 0, 1, 2... and the entry gets a higher ID. The emitter iterates blocks in ID order so C linear execution starts at a random label, not the function body. Manifests as SIGTRAP or garbage reads (any function with a label goes wrong).
+
+**2. `checker_set_type(c, node, type)` is PUBLIC — use it when synthesizing AST in IR lowering.** Added BUG-582/579 session. Without it, `lower_expr` on synthesized NODE_BINARY / NODE_FIELD / NODE_UNARY nodes falls back to `ty_i32` because `checker_get_type` returns NULL for nodes not in the typemap. Wrong-typed IR locals get declared (e.g., pointer-to-union emitted as int32_t), and C compilation gives nonsense errors. Rule: every synthesized AST node that will be lowered should get its type annotated via `checker_set_type` at creation.
+
+**3. Switch lowering: enum/union/optional now full IR-lower** (BUG-579). No more IR_NOP passthrough. Arm bodies go through `lower_stmt` — for/while/nested-switch/orelse/continue/break all work automatically. See `ir_lower.c` NODE_SWITCH for template (build comparison AST, lower_expr it, IR_BRANCH, lower arm body).
+
+**4. Union variant writes must update `_tag`** (BUG-582). `u.variant = val` AND `u.variant[i] = val` (and deeper chains) — `emit_rewritten_node` NODE_ASSIGN walks target through NODE_INDEX/NODE_FIELD/NODE_UNARY to find the NODE_FIELD whose object is union, then emits `{_p->_tag = N; target = val;}` statement expression. AST path had simple case at `emitter.c:1210`; IR path (`emit_rewritten_node`) was missing it until BUG-582.
+
+**5. Switch arm captures need UNIQUE names across all switches in a function** (BUG-585). `|v|` captures from different switches would collide in IR's flat namespace. Lowering now generates `v_capN` unique names and uses `rewrite_capture_name()` to replace the source name ONLY inside that arm's body. Do not dedup arm captures even with same name+type.
+
+**6. Non-null optional switch arms need value comparison** (BUG-584). `switch (?u32 v) { 5 => ..., 10 => ... }` must check `has_value && (value == arm_lit)`, not just `has_value`. For `?Enum` arms, resolve the variant name to its numeric value via `sw_eff->optional.inner->enum_type.variants[i].value`.
+
+**7. `@once` IR_BRANCH marker pattern** (BUG-583). `NODE_ONCE` lowers to an `IR_BRANCH` with `expr=node` and `cond_local=-1`. The emitter detects this marker and emits the atomic CAS pattern (`static flag + __atomic_exchange_n ACQ_REL`). Don't assume all IR_BRANCH instructions use cond_local.
+
+**8. `IR_ASSIGN` handles array-to-array via memcpy.** Mirror of BUG-548 for IR_COPY. Needed for union array-variant captures. When `dst_eff = TYPE_ARRAY && src_eff = TYPE_ARRAY`, emit `memcpy(dst, expr, sizeof(dst));` — C can't assign arrays directly.
+
+**9. `(bool)integer` must truthy-convert** (BUG-586). ZER's bool is `uint8_t`, so `(uint8_t)5` gives 5, not 1. IR_CAST emitter checks target_eff = TYPE_BOOL and uses `(uint8_t)!!(x)` instead of plain cast.
+
+**10. Funcptr array call indices support more than NODE_IDENT** (BUG-587). `arr[0](...)`, `arr[i](...)`, `arr[i+1](...)` all need to emit correctly. The IR_CALL NODE_INDEX-callee path now handles NODE_INT_LIT + falls back to `emit_rewritten_node` for complex indices.
+
+**11. `lower_expr(NODE_FIELD)` has type inference fallback.** When `checker_get_type(field)` is NULL (synthesized node), infer from object type + field name: `has_value` → bool, `value` → optional.inner, `_tag` → i32, struct fields → field.type, union variants → variant.type. Without this, temps get NULL type and the emitter skips declaring them → "_zer_tN undeclared" GCC error.
+
 ### Scoped Defer Emission — the pattern
 
 Emitter's `defer_stack` is compile-time, not runtime. Every block-level construct that introduces a defer scope must bracket the body with defer tracking:

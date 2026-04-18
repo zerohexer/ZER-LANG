@@ -1071,11 +1071,16 @@ Slab(Task) heap;           // global only
 ```
 
 **METHODS**
-- `.alloc()` → `?Handle(T)` — Allocate a slot (Handle). Returns null if OOM.
-- `.alloc_ptr()` → `?*T` — Allocate a slot (pointer). Returns null if OOM.
+- `.alloc()` → `?Handle(T)` or `?*T` — target type picks the variant (see note below).
+- `.alloc_ptr()` → `?*T` — explicit pointer form.
 - `.get(h)` → `*T` — Access by handle. Traps if gen mismatch.
-- `.free(h)` → `void` — Free slot by handle, increment generation.
-- `.free_ptr(p)` → `void` — Free slot by pointer.
+- `.free(x)` → `void` — Handle or `*T` — arg type picks the variant.
+- `.free_ptr(p)` → `void` — explicit pointer form.
+
+**Target-type routing:** `slab.alloc()` returns a Handle when the target
+variable is `Handle(T)` / `?Handle(T)`, and a pointer when the target is
+`*T` / `?*T`. `slab.free(x)` dispatches on the argument type. Explicit
+`_ptr` forms remain supported.
 
 **EXAMPLE**
 ```zer
@@ -1223,26 +1228,32 @@ Handle(T), Pool(T,N), Slab(T)
 
 **DESCRIPTION**
 Allocate a struct without declaring a Slab. The compiler auto-creates a global
-Slab per struct type behind the scenes. Same safety as explicit Slab.
+Slab per struct type behind the scenes. Same safety as explicit Slab. The
+target type (or argument type for `free`) picks between Handle and `*T`
+automatically — you write the same method name in both cases.
 
 **SYNOPSIS**
 ```zer
-// Handle path:
+// Handle path — target is Handle(T), routes to auto-Slab alloc:
 Handle(Task) t = Task.alloc() orelse { return 1; };
 t.id = 42;           // auto-deref
-Task.free(t);
+Task.free(t);        // arg is Handle → free
 
-// Pointer path:
-*Task t = Task.alloc_ptr() orelse { return 1; };
+// Pointer path — target is *T, routes to auto-Slab alloc_ptr:
+*Task t = Task.alloc() orelse { return 1; };
 t.id = 42;           // direct deref
+Task.free(t);        // arg is *T → free_ptr
+
+// Explicit forms still work (same result as target-type routing):
+*Task t = Task.alloc_ptr() orelse { return 1; };
 Task.free_ptr(t);
 ```
 
 **METHODS**
-- `T.alloc()` → `?Handle(T)` — allocate via auto-Slab, returns Handle
-- `T.alloc_ptr()` → `?*T` — allocate via auto-Slab, returns pointer
-- `T.free(h)` → `void` — free Handle
-- `T.free_ptr(p)` → `void` — free pointer (type-checked)
+- `T.alloc()` → `?Handle(T)` or `?*T` — variant picked from target type
+- `T.free(x)` → `void` — Handle or `*T` — variant picked from arg type
+- `T.alloc_ptr()` → `?*T` — explicit pointer form (same as `T.alloc()` with `*T` target)
+- `T.free_ptr(p)` → `void` — explicit pointer form (same as `T.free(p)` when p is `*T`)
 
 **EXAMPLE**
 ```zer
@@ -1250,15 +1261,16 @@ struct Task { u32 id; u32 priority; }
 struct Node { u32 value; }
 
 u32 main() {
-    // No Slab declaration needed — auto-created per struct type
+    // No Slab declaration needed — auto-created per struct type.
+    // One method name for both forms; target type picks the variant.
     Handle(Task) t = Task.alloc() orelse { return 1; };
     t.id = 42;
 
-    *Node n = Node.alloc_ptr() orelse { return 2; };
+    *Node n = Node.alloc() orelse { return 2; };
     n.value = 99;
 
-    Task.free(t);
-    Node.free_ptr(n);
+    Task.free(t);   // Handle arg
+    Node.free(n);   // *T arg
     return 0;
 }
 ```
@@ -1266,8 +1278,9 @@ u32 main() {
 **NOTES**
 - One auto-Slab per struct type, program-wide (shared across modules like C's malloc heap).
 - Uses `calloc` internally — same ISR restriction as Slab.
-- `delete_ptr()` type-checks argument — `*Motor` to `Task.free_ptr()` is a compile error.
+- `T.free()` type-checks argument — `*Motor` passed to `Task.free()` is a compile error.
 - Can mix with explicit Slab/Pool in the same program.
+- Uniform allocator vocabulary across ZER: Pool / Slab / Arena / Task sugar all use `alloc` / `free` (no `new` / `delete`).
 
 **SEE ALSO**
 Slab(T), Pool(T,N), Handle(T), alloc_ptr

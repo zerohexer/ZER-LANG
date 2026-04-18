@@ -7,7 +7,9 @@ u32 main() {
     if (high_byte != 0xDE) { return 2; }
     u32 mid = reg[15..8];
     if (mid != 0xBE) { return 3; }
-    u32 nibble = reg[19..16];
+    // Test bug fix: bits 19..16 of 0xDEADBEEF are 0xD, not 0xA.
+    // 0xA is at bits 23..20. Use that range.
+    u32 nibble = reg[23..20];
     if (nibble != 0xA) { return 4; }
 
     // Bit set

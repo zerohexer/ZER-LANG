@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/wait.h>  /* WEXITSTATUS, WIFEXITED, WIFSIGNALED */
+#include <signal.h>    /* WTERMSIG */
+#endif
 #include "lexer.h"
 #include "ast.h"
 #include "parser.h"
@@ -687,7 +691,18 @@ int main(int argc, char **argv) {
             int run_ret = system(run_cmd);
             free(cc.modules);
             arena_free(&cc.arena);
+            /* BUG-581: system() returns wait status on POSIX (encoded with
+             * high bits for signals). Returning raw status → shell sees
+             * `status & 255` so exit code 3 shows as 0, silently masking
+             * test failures. Extract the real exit code.
+             * On Windows MSVCRT system() already returns the exit code directly. */
+#ifdef _WIN32
             return run_ret;
+#else
+            if (WIFEXITED(run_ret)) return WEXITSTATUS(run_ret);
+            if (WIFSIGNALED(run_ret)) return 128 + WTERMSIG(run_ret);
+            return run_ret ? 1 : 0;
+#endif
         }
     }
 

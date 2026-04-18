@@ -167,6 +167,12 @@ static void collect_labels(LowerCtx *ctx, Node *node) {
 /* Forward declarations */
 static void lower_stmt(LowerCtx *ctx, Node *node);
 static void rewrite_idents(LowerCtx *ctx, Node *expr);
+/* Targeted rewrite: walk AST and rewrite every NODE_IDENT matching
+ * `from_name` to `to_name`. Used by switch arm lowering to scope captures —
+ * arm captures get unique C names so they don't shadow same-named captures
+ * from other switches in the function. */
+static void rewrite_capture_name(Node *node, const char *from_name, uint32_t from_len,
+                                 const char *to_name, uint32_t to_len);
 static int lower_expr(LowerCtx *ctx, Node *expr);
 static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line);
 static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line);
@@ -930,6 +936,130 @@ static Node *find_orelse(Node *expr) {
  * in lower_expr (default path) and at other sites where AST survives to
  * emission. Handles terminating fallbacks (break/continue/return) correctly
  * via lower_orelse_to_dest which emits IR gotos. */
+
+/* Targeted rewrite: NODE_IDENT("v") → NODE_IDENT("v_unique") in an AST subtree.
+ * Used by switch arm lowering: the arm's capture gets a unique C name
+ * (to avoid shadowing same-named captures from other switches in the same
+ * function via IR's flat local namespace), and this walker replaces every
+ * reference to the bare source name inside the arm body. */
+static void rewrite_capture_name(Node *node, const char *from_name, uint32_t from_len,
+                                 const char *to_name, uint32_t to_len) {
+    if (!node) return;
+    switch (node->kind) {
+    case NODE_IDENT:
+        if (node->ident.name_len == (size_t)from_len &&
+            memcmp(node->ident.name, from_name, from_len) == 0) {
+            node->ident.name = to_name;
+            node->ident.name_len = (size_t)to_len;
+        }
+        break;
+    case NODE_BINARY:
+        rewrite_capture_name(node->binary.left, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->binary.right, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_UNARY:
+        rewrite_capture_name(node->unary.operand, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_CALL:
+        rewrite_capture_name(node->call.callee, from_name, from_len, to_name, to_len);
+        for (int i = 0; i < node->call.arg_count; i++)
+            rewrite_capture_name(node->call.args[i], from_name, from_len, to_name, to_len);
+        break;
+    case NODE_FIELD:
+        rewrite_capture_name(node->field.object, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_INDEX:
+        rewrite_capture_name(node->index_expr.object, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->index_expr.index, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_SLICE:
+        rewrite_capture_name(node->slice.object, from_name, from_len, to_name, to_len);
+        if (node->slice.start) rewrite_capture_name(node->slice.start, from_name, from_len, to_name, to_len);
+        if (node->slice.end) rewrite_capture_name(node->slice.end, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_ASSIGN:
+        rewrite_capture_name(node->assign.target, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->assign.value, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_ORELSE:
+        rewrite_capture_name(node->orelse.expr, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->orelse.fallback, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            rewrite_capture_name(node->intrinsic.args[i], from_name, from_len, to_name, to_len);
+        break;
+    case NODE_TYPECAST:
+        rewrite_capture_name(node->typecast.expr, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            rewrite_capture_name(node->struct_init.fields[i].value, from_name, from_len, to_name, to_len);
+        break;
+    /* Statement-level nodes — recurse into their expression/body children */
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            rewrite_capture_name(node->block.stmts[i], from_name, from_len, to_name, to_len);
+        break;
+    case NODE_EXPR_STMT:
+        rewrite_capture_name(node->expr_stmt.expr, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_VAR_DECL:
+        rewrite_capture_name(node->var_decl.init, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_RETURN:
+        rewrite_capture_name(node->ret.expr, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_IF:
+        rewrite_capture_name(node->if_stmt.cond, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->if_stmt.then_body, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->if_stmt.else_body, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_FOR:
+        rewrite_capture_name(node->for_stmt.init, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->for_stmt.cond, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->for_stmt.step, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->for_stmt.body, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        rewrite_capture_name(node->while_stmt.cond, from_name, from_len, to_name, to_len);
+        rewrite_capture_name(node->while_stmt.body, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_SWITCH:
+        rewrite_capture_name(node->switch_stmt.expr, from_name, from_len, to_name, to_len);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            /* Don't recurse into an inner arm if it captures the SAME name —
+             * its own capture shadows the outer one for its scope. */
+            SwitchArm *ia = &node->switch_stmt.arms[i];
+            if (ia->capture_name && ia->capture_name_len == (size_t)from_len &&
+                memcmp(ia->capture_name, from_name, from_len) == 0) {
+                continue;
+            }
+            rewrite_capture_name(ia->body, from_name, from_len, to_name, to_len);
+        }
+        break;
+    case NODE_DEFER:
+        rewrite_capture_name(node->defer.body, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_CRITICAL:
+        rewrite_capture_name(node->critical.body, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_ONCE:
+        rewrite_capture_name(node->once.body, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_AWAIT:
+        rewrite_capture_name(node->await_stmt.cond, from_name, from_len, to_name, to_len);
+        break;
+    case NODE_STATIC_ASSERT:
+        rewrite_capture_name(node->static_assert_stmt.cond, from_name, from_len, to_name, to_len);
+        break;
+    /* Leaf / no-expr-children nodes — nothing to rewrite */
+    default:
+        break;
+    }
+}
+
 static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
     if (!pp || !*pp) return;
     Node *n = *pp;
@@ -1816,9 +1946,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     } else if (is_optional) {
                         bool is_null = (arm->values[vi]->kind == NODE_NULL_LIT);
                         if (is_null_sent_opt) {
-                            /* Raw pointer — null arm uses !ptr, non-null uses ptr
-                             * (comparing ptr to bool works, but build an explicit
-                             * comparison to NULL for clarity / type correctness). */
+                            /* Raw pointer (?*T) — null arm = !ptr, non-null = ptr.
+                             * Only null/non-null matching is meaningful here; arm
+                             * values are all NULL or pointer-valued (the user
+                             * doesn't write literal pointer addresses as arm
+                             * values). */
                             if (is_null) {
                                 eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
                                 memset(eq, 0, sizeof(Node));
@@ -1827,12 +1959,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                                 eq->unary.op = TOK_BANG;
                                 eq->unary.operand = sw_ref;
                             } else {
-                                /* Truthy test on pointer local — lower_expr will
-                                 * produce a bool/int result usable as branch cond. */
                                 eq = sw_ref;
                             }
                         } else {
-                            /* Struct optional — check .has_value field */
+                            /* Struct optional — null arm: !has_value.
+                             * Non-null arm: has_value AND value == arm_value.
+                             * Value comparison matters for `?u32` with `5 => ...`
+                             * and `?Color` with `.red => ...`. */
                             Node *hv_field = (Node *)arena_alloc(ctx->arena, sizeof(Node));
                             memset(hv_field, 0, sizeof(Node));
                             hv_field->kind = NODE_FIELD;
@@ -1848,7 +1981,65 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                                 eq->unary.op = TOK_BANG;
                                 eq->unary.operand = hv_field;
                             } else {
-                                eq = hv_field;
+                                /* Build: has_value && (value == arm_value).
+                                 * For enum inner type, resolve arm value to
+                                 * variant.value literal. */
+                                Node *val_field = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                memset(val_field, 0, sizeof(Node));
+                                val_field->kind = NODE_FIELD;
+                                val_field->loc = node->loc;
+                                val_field->field.object = sw_ref;
+                                val_field->field.field_name = "value";
+                                val_field->field.field_name_len = 5;
+
+                                /* Determine RHS of value comparison */
+                                Node *rhs = arm->values[vi];
+                                Type *inner_eff = type_unwrap_distinct(sw_eff->optional.inner);
+                                if (inner_eff && inner_eff->kind == TYPE_ENUM) {
+                                    /* Resolve variant name → numeric value */
+                                    const char *vn = NULL;
+                                    size_t vl = 0;
+                                    if (rhs->kind == NODE_IDENT) {
+                                        vn = rhs->ident.name;
+                                        vl = rhs->ident.name_len;
+                                    } else if (rhs->kind == NODE_FIELD) {
+                                        vn = rhs->field.field_name;
+                                        vl = rhs->field.field_name_len;
+                                    }
+                                    int64_t vv = 0;
+                                    if (vn) {
+                                        for (uint32_t ei = 0; ei < inner_eff->enum_type.variant_count; ei++) {
+                                            if (inner_eff->enum_type.variants[ei].name_len == vl &&
+                                                memcmp(inner_eff->enum_type.variants[ei].name, vn, vl) == 0) {
+                                                vv = (int64_t)inner_eff->enum_type.variants[ei].value;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Node *lit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                    memset(lit, 0, sizeof(Node));
+                                    lit->kind = NODE_INT_LIT;
+                                    lit->loc = node->loc;
+                                    lit->int_lit.value = (uint64_t)vv;
+                                    rhs = lit;
+                                }
+
+                                Node *val_eq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                memset(val_eq, 0, sizeof(Node));
+                                val_eq->kind = NODE_BINARY;
+                                val_eq->loc = node->loc;
+                                val_eq->binary.op = TOK_EQEQ;
+                                val_eq->binary.left = val_field;
+                                val_eq->binary.right = rhs;
+
+                                Node *and_node = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                                memset(and_node, 0, sizeof(Node));
+                                and_node->kind = NODE_BINARY;
+                                and_node->loc = node->loc;
+                                and_node->binary.op = TOK_AMPAMP;
+                                and_node->binary.left = hv_field;
+                                and_node->binary.right = val_eq;
+                                eq = and_node;
                             }
                         }
                     } else {
@@ -1961,9 +2152,35 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 }
 
                 if (cap_type && cap_src) {
+                    /* Build a UNIQUE capture name per arm so this capture doesn't
+                     * shadow same-named captures in other switches. The IR has a
+                     * flat local namespace (no scopes), so two arms both using |v|
+                     * across different switches would both map to the LAST "v"
+                     * local via ir_find_local — wrong. Give each arm's capture a
+                     * unique suffix (e.g., "v_sw3_arm0") and rewrite references
+                     * to the source name in THIS arm's body before lowering it. */
+                    char uniq_buf[96];
+                    int ulen = snprintf(uniq_buf, sizeof(uniq_buf),
+                        "%.*s_cap%d",
+                        (int)arm->capture_name_len, arm->capture_name,
+                        ctx->temp_count++);
+                    if (ulen < 0) ulen = 0;
+                    if (ulen >= (int)sizeof(uniq_buf)) ulen = (int)sizeof(uniq_buf) - 1;
+                    char *uniq_name = (char *)arena_alloc(ctx->arena, ulen + 1);
+                    memcpy(uniq_name, uniq_buf, ulen);
+                    uniq_name[ulen] = '\0';
+
                     int cap_id = ir_add_local(ctx->func, ctx->arena,
-                        arm->capture_name, (uint32_t)arm->capture_name_len,
+                        uniq_name, (uint32_t)ulen,
                         cap_type, false, true, false, node->loc.line);
+
+                    /* Rewrite references to the source capture name in arm body */
+                    if (cap_id >= 0 && arm->body) {
+                        rewrite_capture_name(arm->body,
+                            arm->capture_name, (uint32_t)arm->capture_name_len,
+                            uniq_name, (uint32_t)ulen);
+                    }
+
                     if (cap_id >= 0) {
                         /* For optional value captures: IR_COPY with type adaptation
                          * handles .value unwrap (src ?T → dst T). For |*v| optional:
@@ -2136,11 +2353,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- @once ---- */
     case NODE_ONCE: {
-        /* Lower as: branch on atomic flag → body or skip */
+        /* Lower as: branch on atomic flag → body or skip.
+         * The IR_BRANCH emitter detects expr=NODE_ONCE and emits a CAS
+         * exchange gate instead of a plain condition. */
         int bb_body = ir_add_block(ctx->func, ctx->arena);
         int bb_skip = ir_add_block(ctx->func, ctx->arena);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
-        br.expr = NULL; /* emitter handles @once CAS pattern */
+        br.expr = node; /* NODE_ONCE marker for emitter's CAS pattern */
+        br.cond_local = -1;
         br.true_block = bb_body;
         br.false_block = bb_skip;
         emit_inst(ctx, br);
@@ -2254,11 +2474,17 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
      * With upfront collect_locals, both would exist before any lowering,
      * making ir_find_local (last-match) return the wrong one. */
 
-    /* Phase 2: Pre-scan for labels */
-    collect_labels(&ctx, func_decl->func_decl.body);
-
-    /* Phase 3: Create entry block and lower body */
+    /* Phase 2: Create entry block FIRST so it's block 0.
+     * BUG-588: previously collect_labels ran before start_block, so if the
+     * function body had a label (e.g., goto target), the label's block got
+     * ID 0 and the entry block got a higher ID. The emitter emits blocks
+     * in ID order, so C execution would start at the LABEL's code instead
+     * of the entry — reading uninitialized state. Masked by --run exit
+     * code bug (BUG-581); surfaced by that fix as runtime SIGTRAP. */
     start_block(&ctx);
+
+    /* Phase 3: Pre-scan for labels (now get IDs >= 1) and lower body */
+    collect_labels(&ctx, func_decl->func_decl.body);
     lower_stmt(&ctx, func_decl->func_decl.body);
 
     /* Ensure CURRENT block is terminated (not last block — yield may
@@ -2300,10 +2526,10 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.labels = ctx.label_inline;
     ctx.label_capacity = (int)(sizeof(ctx.label_inline) / sizeof(ctx.label_inline[0]));
 
-    /* Locals created on-demand during lower_stmt */
-    collect_labels(&ctx, interrupt->interrupt.body);
-
+    /* Locals created on-demand during lower_stmt. Entry block MUST be first
+     * (see BUG-588 note above for the function variant). */
     start_block(&ctx);
+    collect_labels(&ctx, interrupt->interrupt.body);
     lower_stmt(&ctx, interrupt->interrupt.body);
 
     IRBlock *cur = &func->blocks[ctx.current_block];

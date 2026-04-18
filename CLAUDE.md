@@ -1246,6 +1246,18 @@ These are the non-obvious rules that took multiple sessions + bug fixes to disco
 
 **11. `lower_expr(NODE_FIELD)` has type inference fallback.** When `checker_get_type(field)` is NULL (synthesized node), infer from object type + field name: `has_value` → bool, `value` → optional.inner, `_tag` → i32, struct fields → field.type, union variants → variant.type. Without this, temps get NULL type and the emitter skips declaring them → "_zer_tN undeclared" GCC error.
 
+**12. `IRLocal.scope_depth` + `IRLocal.hidden` for variable shadowing** (BUG-590). `IRFunc.current_scope` is incremented/decremented by `NODE_BLOCK` in ir_lower. `ir_add_local` sets `scope_depth` on creation and creates a suffixed local when name/type/scope_depth doesn't match an existing local. `NODE_BLOCK` on exit marks all locals created within (skipping temps + captures) as `hidden=true`. `ir_find_local` prefers non-hidden matches; falls back to LAST hidden match if nothing in-scope (preserves existing behavior for emitter passes outside normal traversal). Without this, inner `Handle h` shadowing outer made outer references after the block resolve to the freed inner local → UAF.
+
+**13. `NODE_BLOCK` defer semantics + POP_ONLY pattern** (BUG-590). Standalone `{ }` blocks fire their own defers at block exit. Enclosing constructs (loop body, if-branch, switch arm) MUST set `ctx->block_defers_managed++` before calling `lower_stmt` on the body — otherwise NODE_BLOCK double-fires defers. NODE_BLOCK uses the POP_ONLY trick: emit no-pop scoped fire in the current block, then create a bb_post and switch to it for the POP_ONLY op. Mirrors BUG-544 loop pattern — keeps defer bodies on the emit-time stack for early-exit paths (return/break/continue/orelse-return) that have earlier block IDs than the current position.
+
+**14. `await` condition re-evaluated on every poll** (BUG-591). IR_AWAIT's lowering stores the cond AST on `inst->expr` (NOT a pre-computed cond_local). The emitter emits `case N:;` then a FRESH evaluation via `emit_rewritten_node(cond)`. Without this, resume (state=N) skips past the cond evaluation — stale value used, task never completes.
+
+**15. Signed vs unsigned comparison in IR_BINOP** (BUG-592). When IR_BINOP detects a comparison op and one operand is signed while the other is unsigned, cast the unsigned side to the signed side's type before emitting. Otherwise C's usual-arithmetic-conversion promotes the signed side to unsigned → `(int32_t)-5 < (uint32_t)0` is `false`. Also IR_LITERAL emits `(DstType)N` cast (not `N_ULL`) so comparisons downstream see the right signedness.
+
+**16. `@once` is per-declaration, not per-function** (BUG-583 related). Each `@once { body }` block declares its OWN one-shot flag — matching Rust's `std::sync::Once`. Multiple `@once` blocks in the same function are INDEPENDENT (each fires once). To test "fire once across multiple invocations", wrap `@once` in a helper function and call it multiple times (the SAME flag prevents re-execution across calls).
+
+**17. `Arena.over(buf)` returns an Arena VALUE** — it does not mutate an existing arena in place. Usage: `Arena ar = Arena.over(buf);` to initialize. Bare `ar.over(buf)` as a method call discards the return value and does nothing useful.
+
 ### Scoped Defer Emission — the pattern
 
 Emitter's `defer_stack` is compile-time, not runtime. Every block-level construct that introduces a defer scope must bracket the body with defer tracking:

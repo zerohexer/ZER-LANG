@@ -42,6 +42,13 @@ typedef struct {
 
     /* Defer tracking */
     int defer_count;          /* number of pending defers */
+    /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
+     * defers — the enclosing construct (loop body, if-branch, switch arm)
+     * already does it with the correct semantics (no-pop for loops so
+     * break/continue can still fire; scoped fire for branches). Set by
+     * for/while/do-while/if/switch handlers before lowering their body;
+     * decremented by NODE_BLOCK. */
+    int block_defers_managed;
 
     /* Label → block mapping (for goto/label).
      * Stack-first dynamic pattern (CLAUDE.md rule #7): start with inline
@@ -1290,12 +1297,62 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     switch (node->kind) {
 
-    /* ---- Block: lower each statement ---- */
-    case NODE_BLOCK:
+    /* ---- Block: lower each statement. BUG-590: track scope for
+     * variable shadowing. Inner locals get scope_depth = outer+1 (for
+     * dedup decisions) and are created during the block. On exit, mark
+     * all locals created within this block as `hidden` so subsequent
+     * ir_find_local lookups skip them — after inner `Handle h` goes out
+     * of scope, outer references to `h` resolve to the outer local.
+     *
+     * Note: hidden locals still exist in func->locals and get C
+     * declarations at function top — they just aren't findable by name. */
+    case NODE_BLOCK: {
+        int saved_local_count = ctx->func->local_count;
+        int saved_defer = ctx->defer_count;
+        /* If the enclosing construct (loop/if/switch arm) already manages
+         * defers for this body, skip our own fire — their semantics differ
+         * (no-pop for loops so break/continue paths still have defers
+         * available; scoped fire for branches). See BUG-590 note. */
+        bool managed_by_enclosing = (ctx->block_defers_managed > 0);
+        if (managed_by_enclosing) ctx->block_defers_managed--;
+        ctx->func->current_scope++;
         for (int i = 0; i < node->block.stmt_count; i++) {
             lower_stmt(ctx, node->block.stmts[i]);
         }
+        /* Fire defers pushed inside THIS block at block exit.
+         *
+         * Same ordering problem as loops (BUG-544): if we fire+POP here and
+         * an early-exit path (e.g., `orelse return` with an earlier block
+         * ID) hasn't been emitted yet, its DEFER_FIRE finds the emit-time
+         * stack empty → silent miscompile. Solution mirrors the loop POP_ONLY
+         * trick: fire with no-pop in the reachable path, then create a
+         * bb_post block that's emitted LAST (highest block ID) with POP_ONLY
+         * to clear the emit-time stack after all early-exit paths have
+         * already read their defers.
+         *
+         * Skipped when the enclosing construct manages defers itself. */
+        if (!managed_by_enclosing && ctx->defer_count > saved_defer) {
+            emit_defer_fire_scoped(ctx, saved_defer, false, node->loc.line);
+            int bb_post = ir_add_block(ctx->func, ctx->arena);
+            ensure_terminated(ctx, bb_post);
+            ctx->current_block = bb_post;
+            emit_defer_pop_only(ctx, saved_defer, node->loc.line);
+            ctx->defer_count = saved_defer;
+        }
+        ctx->func->current_scope--;
+        /* Mark locals declared inside this block as out-of-scope. Skip
+         * temps (they're compiler-generated, shouldn't shadow user names).
+         * Skip captures (if-unwrap / switch captures are attached to the
+         * enclosing construct, not the block; keeping them visible lets
+         * the then-body or arm body reference them after block re-entry
+         * if needed). */
+        for (int li = saved_local_count; li < ctx->func->local_count; li++) {
+            if (ctx->func->locals[li].is_temp) continue;
+            if (ctx->func->locals[li].is_capture) continue;
+            ctx->func->locals[li].hidden = true;
+        }
         break;
+    }
 
     /* ---- Variable declaration: assign to local ---- */
     case NODE_VAR_DECL: {
@@ -1541,6 +1598,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         /* Save defer count so if-scoped defers fire at block exit */
         int then_defer_base = ctx->defer_count;
+        ctx->block_defers_managed++;  /* if-body block: we manage */
         lower_stmt(ctx, node->if_stmt.then_body);
         emit_defer_fire_scoped(ctx, then_defer_base, true, node->loc.line);
         ctx->defer_count = then_defer_base;
@@ -1550,6 +1608,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
             int else_defer_base = ctx->defer_count;
+            ctx->block_defers_managed++;  /* else-body block: we manage */
             lower_stmt(ctx, node->if_stmt.else_body);
             emit_defer_fire_scoped(ctx, else_defer_base, true, node->loc.line);
             ctx->defer_count = else_defer_base;
@@ -1600,6 +1659,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         /* Body block */
         ctx->current_block = bb_body;
+        ctx->block_defers_managed++;  /* for-body block: we manage (no-pop semantics) */
         lower_stmt(ctx, node->for_stmt.body);
         /* End of body: emit defer bodies inline (for normal iteration path),
          * but DO NOT pop. Divergent paths (break/continue/orelse-continue)
@@ -1672,6 +1732,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
 
         ctx->current_block = bb_body;
+        ctx->block_defers_managed++;  /* while-body block: we manage */
         lower_stmt(ctx, node->while_stmt.body);
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
         ensure_terminated(ctx, bb_cond);
@@ -1716,6 +1777,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         /* Body first (execute at least once) */
         ctx->current_block = bb_body;
+        ctx->block_defers_managed++;  /* do-while body: we manage */
         lower_stmt(ctx, node->while_stmt.body);
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
         ensure_terminated(ctx, bb_cond);
@@ -2214,6 +2276,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             }
 
             int arm_defer_base = ctx->defer_count;
+            ctx->block_defers_managed++;  /* switch arm body: we manage */
             lower_stmt(ctx, arm->body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
@@ -2312,10 +2375,22 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Await ---- */
     case NODE_AWAIT: {
+        /* BUG-591: await condition must be RE-EVALUATED on every poll.
+         * Previously we lowered the cond to a local in the current block,
+         * then emitted IR_AWAIT which placed `case N:;` AFTER the eval.
+         * On resume (state=N), the switch jumped past the eval so the
+         * stale cond_local value was used.
+         *
+         * Fix: store the cond AST on IR_AWAIT and let the emitter emit
+         * `case N:;` followed by a FRESH evaluation of the cond expression
+         * via emit_rewritten_node. The cond value is computed inline in
+         * the generated C — no IR local, so each poll re-reads globals /
+         * fields and correctly re-evaluates. */
         int resume_bb = ir_add_block(ctx->func, ctx->arena);
         IRInst aw = make_inst(IR_AWAIT, node->loc.line);
         rewrite_idents(ctx, node->await_stmt.cond);
-        aw.cond_local = lower_expr(ctx, node->await_stmt.cond);
+        aw.cond_local = -1;                     /* don't use pre-computed local */
+        aw.expr = node->await_stmt.cond;        /* emitter re-evaluates fresh */
         aw.goto_block = resume_bb;
         emit_inst(ctx, aw);
         ctx->current_block = resume_bb;

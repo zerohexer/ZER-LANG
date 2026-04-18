@@ -30,8 +30,15 @@ u32 main() {
         _zer_async_fib_task_poll(&t);
     }
 
-    // After 6 steps: 0,1,1,2,3,5,8 -> fib_b=8
-    if (fib_b != 8) { return 1; }
+    // Sequence starts from fib_a=0, fib_b=1. Each iter: next=a+b; a=b; b=next.
+    //   iter1: next=1;  a=1, b=1  (fib_b=1)
+    //   iter2: next=2;  a=1, b=2
+    //   iter3: next=3;  a=2, b=3
+    //   iter4: next=5;  a=3, b=5
+    //   iter5: next=8;  a=5, b=8
+    //   iter6: next=13; a=8, b=13
+    // After 6 iterations: fib_b=13, fib_steps=6.
+    if (fib_b != 13) { return 1; }
     if (fib_steps != 6) { return 2; }
     return 0;
 }

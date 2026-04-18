@@ -41,28 +41,50 @@ int ir_add_local(IRFunc *func, Arena *arena,
     const char *orig_name = name;
     uint32_t orig_name_len = name_len;
 
-    /* Dedup: same name AND same type → return existing.
-     * Same name, DIFFERENT type (e.g., Msg m vs ?Msg m in different scopes)
-     * → create new local with unique suffix. This is the key to solving
-     * scope conflicts without full scope tracking. */
-    for (int i = 0; i < func->local_count; i++) {
-        if (func->locals[i].orig_name_len == name_len &&
-            memcmp(func->locals[i].orig_name, name, name_len) == 0) {
-            /* Same type (or either is NULL) → dedup */
-            if (!type || !func->locals[i].type || type == func->locals[i].type) {
-                return func->locals[i].id;
+    /* Dedup rules (BUG-590 scope-aware):
+     *   - Same orig_name + same type + SAME scope_depth → dedup (return existing).
+     *     Repeated references to the same var-decl shouldn't create extra locals.
+     *   - Same orig_name + different type OR different scope_depth → create NEW
+     *     local with a unique suffix. Shadowing across scopes must produce
+     *     distinct locals so ir_find_local's scope-aware lookup can pick the
+     *     right one after block exits.
+     *   - is_temp, is_capture, is_param skip dedup entirely (callers already
+     *     build unique names). */
+    int cur_depth = func->current_scope;
+    /* Dedup rules:
+     *   - is_param, is_temp: skip dedup. Params are fresh at entry; temps
+     *     already have unique `_zer_tN` names.
+     *   - Others (including is_capture): dedup if same orig_name + same type
+     *     + same scope_depth. Otherwise create new with suffix.
+     *
+     * is_capture needs dedup: two if-unwraps in the same outer scope
+     * (`if (a) |v| ...; if (b) |v| ...;`) legitimately share a local — C
+     * would otherwise see "uint32_t v" declared twice at function top.
+     *
+     * scope_depth differentiation: outer `Handle h` + inner `Handle h`
+     * (shadowing in nested block) no longer collapses. Inner local is
+     * suffixed; ir_find_local's scope-aware lookup picks the right one. */
+    if (!is_temp && !is_param) {
+        for (int i = 0; i < func->local_count; i++) {
+            if (func->locals[i].orig_name_len == name_len &&
+                memcmp(func->locals[i].orig_name, name, name_len) == 0) {
+                bool same_type = (!type || !func->locals[i].type ||
+                                  type == func->locals[i].type);
+                bool same_scope = (func->locals[i].scope_depth == cur_depth);
+                if (same_type && same_scope) return func->locals[i].id;
+                /* Different type OR different scope → fall through to create
+                 * new suffixed local. Use `_%d` with the count to ensure
+                 * uniqueness across suffixed + unsuffixed variants. */
+                char buf[64];
+                int slen = snprintf(buf, sizeof(buf), "%.*s_%d",
+                                    (int)name_len, name, func->local_count);
+                if (slen >= (int)sizeof(buf)) slen = (int)sizeof(buf) - 1;
+                char *sname = (char *)arena_alloc(arena, slen + 1);
+                memcpy(sname, buf, slen + 1);
+                name = sname;
+                name_len = (uint32_t)slen;
+                break;
             }
-            /* Different type → create new local with suffixed name.
-             * Arena-allocate so it persists. */
-            char buf[64];
-            int slen = snprintf(buf, sizeof(buf), "%.*s_%d",
-                                (int)name_len, name, func->local_count);
-            if (slen >= (int)sizeof(buf)) slen = (int)sizeof(buf) - 1;
-            char *sname = (char *)arena_alloc(arena, slen + 1);
-            memcpy(sname, buf, slen + 1);
-            name = sname;
-            name_len = (uint32_t)slen;
-            break; /* fall through to create new local */
         }
     }
 
@@ -88,30 +110,37 @@ int ir_add_local(IRFunc *func, Arena *arena,
     local->is_param = is_param;
     local->is_capture = is_capture;
     local->is_temp = is_temp;
+    local->scope_depth = cur_depth;
     local->source_line = line;
     return id;
 }
 
 int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
-    /* Search by orig_name (source name before any suffix).
-     * Also search by C name (after suffix) for rewritten idents.
-     * Return LAST match — most recently created local with this name.
-     * With on-demand local creation, later-scoped locals are created after
-     * earlier ones. Returning last match gives innermost scope naturally. */
+    /* Search by orig_name (source name before any suffix) OR by C emission
+     * name (for already-rewritten idents).
+     *
+     * BUG-590 scope-aware: skip locals whose scope has already exited
+     * (`hidden=true`). Among the visible ones, return the LAST match —
+     * later same-scope declarations / suffixed shadows of outer locals
+     * naturally win. The `hidden` flag is set on NODE_BLOCK exit.
+     *
+     * Fallback: if no visible match, try LAST match regardless of hidden —
+     * preserves pre-BUG-590 behavior for callers that query names outside
+     * normal scope traversal (e.g., emitter passes after lowering). */
     int best = -1;
+    int fallback = -1;
     for (int i = 0; i < func->local_count; i++) {
-        /* Match by original source name */
+        bool match = false;
         if (func->locals[i].orig_name_len == name_len &&
-            memcmp(func->locals[i].orig_name, name, name_len) == 0) {
-            best = func->locals[i].id;
-        }
-        /* Also match by C emission name (for rewritten idents) */
-        if (func->locals[i].name_len == name_len &&
-            memcmp(func->locals[i].name, name, name_len) == 0) {
-            best = func->locals[i].id;
-        }
+            memcmp(func->locals[i].orig_name, name, name_len) == 0) match = true;
+        if (!match && func->locals[i].name_len == name_len &&
+            memcmp(func->locals[i].name, name, name_len) == 0) match = true;
+        if (!match) continue;
+
+        fallback = func->locals[i].id;
+        if (!func->locals[i].hidden) best = func->locals[i].id;
     }
-    return best;
+    return (best >= 0) ? best : fallback;
 }
 
 int ir_add_block(IRFunc *func, Arena *arena) {

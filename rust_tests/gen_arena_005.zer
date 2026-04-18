@@ -1,11 +1,13 @@
 // Arena: reset and reuse — memory recycled after reset
+// ZER: `Arena.over(buf)` RETURNS an Arena struct initialized over `buf`.
+// Assign it to initialize. Bare `ar.over(mem)` discards the return value
+// and does nothing useful.
 
 struct Temp { u32 v; }
-Arena ar;
 u8[128] mem;
 
 u32 alloc_and_use(u32 val) {
-    ar.over(mem);
+    Arena ar = Arena.over(mem);
     ?*Temp mt = ar.alloc(Temp);
     *Temp t = mt orelse return;
     t.v = val;

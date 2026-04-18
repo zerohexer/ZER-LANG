@@ -13,16 +13,7 @@ SKIP=0
 # Previously silently "passed" via swallowed non-zero exit codes.
 # See docs/limitations.md for tracking.
 KNOWN_FAIL=" \
-    gen_arena_005 \
-    gen_async_010 \
     gen_comptime_float_001 \
-    gen_shared_010 \
-    rc_once_001 \
-    rt_comptime_guard_bounds \
-    rt_conc_async_await_cond \
-    rt_defer_order_lifo \
-    rt_drop_count_3 \
-    rt_drop_trait_basic \
     rt_unsafe_mmio_multi_reg \
     rt_unsafe_mmio_volatile_rw \
 "

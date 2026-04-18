@@ -7968,14 +7968,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_AWAIT: {
         if (func->is_async) {
+            /* BUG-591: case label is the resume entry. Cond expression is
+             * RE-EVALUATED on each poll via emit_rewritten_node so updates
+             * to globals / fields between polls are visible. If cond_local
+             * is set (legacy), fall back to the pre-computed local. */
             emit_indent(e);
             emit(e, "case %d:;\n", e->async_yield_id);
             emit_indent(e);
             emit(e, "if (!(");
-            if (inst->cond_local >= 0) {
+            if (inst->expr) {
+                emit_rewritten_node(e, inst->expr, func);
+            } else if (inst->cond_local >= 0) {
                 emit_local_name(e, func, inst->cond_local);
             } else {
-                emit(e, "1"); /* shouldn't happen — lowering always sets cond_local */
+                emit(e, "1"); /* shouldn't happen */
             }
             emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
             e->async_yield_id++;
@@ -8708,12 +8714,21 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             else
                 emit(e, "%.*s = ", (int)dst->name_len, dst->name);
             switch (inst->literal_kind) {
-            case 0: /* int */
-                if (inst->literal_int < 0)
-                    emit(e, "(%lld)", (long long)inst->literal_int);
-                else
-                    emit(e, "%lluULL", (unsigned long long)(uint64_t)inst->literal_int);
+            case 0: /* int */ {
+                /* BUG-592: emit a type-matched literal. Always-ULL emission
+                 * made `signed_local < 0ULL` wrong (C promotes signed
+                 * operand to unsigned → huge value, never < 0).
+                 *
+                 * Emit as `(CType)N` so the literal has the target's exact
+                 * type. For signed targets, this gives a signed value; for
+                 * unsigned, unsigned. Subsequent comparisons with the temp
+                 * have matching signedness on both sides. */
+                emit(e, "(");
+                if (dst->type) emit_type(e, dst->type);
+                else emit(e, "uint64_t");
+                emit(e, ")%lld", (long long)inst->literal_int);
                 break;
+            }
             case 1: /* float */
                 emit(e, "%.17g", inst->literal_float);
                 break;
@@ -8765,12 +8780,41 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             case TOK_AMPAMP: op = "&&"; break; case TOK_PIPEPIPE: op = "||"; break;
             default: break;
             }
+            /* BUG-592: cast one side when comparing signed vs unsigned.
+             * Without the cast, C promotes the signed operand to unsigned,
+             * making e.g. `(int32_t)-5 < (uint32_t)0` evaluate to false
+             * (since -5 becomes 0xFFFFFFFB > 0).
+             *
+             * Pick the signed type when one side is signed: cast the
+             * unsigned operand to the signed side's type. This matches
+             * ZER's integer semantics where `x < 0` means signed less-than
+             * regardless of the `0` literal's IR type. */
+            bool is_cmp = (inst->op_token == TOK_LT || inst->op_token == TOK_GT ||
+                           inst->op_token == TOK_LTEQ || inst->op_token == TOK_GTEQ ||
+                           inst->op_token == TOK_EQEQ || inst->op_token == TOK_BANGEQ);
+            Type *t1 = s1->type ? type_unwrap_distinct(s1->type) : NULL;
+            Type *t2 = s2->type ? type_unwrap_distinct(s2->type) : NULL;
+            bool s1_signed = t1 && type_is_signed(t1);
+            bool s2_signed = t2 && type_is_signed(t2);
             emit_indent(e);
-            emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
-                 sp, (int)dst->name_len, dst->name,
-                 sp, (int)s1->name_len, s1->name,
-                 op,
-                 sp, (int)s2->name_len, s2->name);
+            if (is_cmp && s1_signed && !s2_signed) {
+                emit(e, "%s%.*s = (%s%.*s %s (", sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name, op);
+                emit_type(e, s1->type);
+                emit(e, ")%s%.*s);\n", sp, (int)s2->name_len, s2->name);
+            } else if (is_cmp && !s1_signed && s2_signed) {
+                emit(e, "%s%.*s = ((", sp, (int)dst->name_len, dst->name);
+                emit_type(e, s2->type);
+                emit(e, ")%s%.*s %s %s%.*s);\n",
+                     sp, (int)s1->name_len, s1->name, op,
+                     sp, (int)s2->name_len, s2->name);
+            } else {
+                emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name,
+                     op,
+                     sp, (int)s2->name_len, s2->name);
+            }
         }
         break;
     }

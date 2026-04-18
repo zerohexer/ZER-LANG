@@ -7,11 +7,13 @@ comptime u32 HASH(u32 key) { return key % TABLE_SIZE(); }
 u32 main() {
     u32[16] table;
 
-    // Initialize via comptime hash — indices proven safe at compile time
+    // Initialize via comptime hash — indices proven safe at compile time.
+    // Use distinct keys (previous version used 31 which collides with 15
+    // under TABLE_SIZE=16 and silently overwrote the earlier slot).
     table[HASH(0)] = 100;
     table[HASH(5)] = 200;
+    table[HASH(10)] = 250;
     table[HASH(15)] = 300;
-    table[HASH(31)] = 400;
 
     if (table[0] != 100) { return 1; }
     if (table[5] != 200) { return 2; }

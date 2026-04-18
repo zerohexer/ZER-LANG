@@ -10,7 +10,7 @@ u32 hash_key(u32 key) {
     return ((key * 2654435761) >> 16) % BUCKET_COUNT();
 }
 
-bool map_put(HashMap map, u32 key, u32 value) {
+bool map_put(*HashMap map, u32 key, u32 value) {
     u32 idx = hash_key(key);
     for (u32 i = 0; i < BUCKET_COUNT(); i += 1) {
         u32 probe = (idx + i) % BUCKET_COUNT();
@@ -28,7 +28,7 @@ bool map_put(HashMap map, u32 key, u32 value) {
     return false;
 }
 
-?u32 map_get(HashMap map, u32 key) {
+?u32 map_get(*HashMap map, u32 key) {
     u32 idx = hash_key(key);
     for (u32 i = 0; i < BUCKET_COUNT(); i += 1) {
         u32 probe = (idx + i) % BUCKET_COUNT();
@@ -47,25 +47,25 @@ u32 main() {
         m.buckets[i].occupied = false;
     }
 
-    map_put(m, 42, 100);
-    map_put(m, 99, 200);
-    map_put(m, 7, 300);
+    map_put(&m, 42, 100);
+    map_put(&m, 99, 200);
+    map_put(&m, 7, 300);
 
-    u32 v1 = map_get(m, 42) orelse { return 1; };
+    u32 v1 = map_get(&m, 42) orelse { return 1; };
     if (v1 != 100) { return 2; }
 
-    u32 v2 = map_get(m, 99) orelse { return 3; };
+    u32 v2 = map_get(&m, 99) orelse { return 3; };
     if (v2 != 200) { return 4; }
 
-    u32 v3 = map_get(m, 7) orelse { return 5; };
+    u32 v3 = map_get(&m, 7) orelse { return 5; };
     if (v3 != 300) { return 6; }
 
-    ?u32 missing = map_get(m, 999);
+    ?u32 missing = map_get(&m, 999);
     if (missing) |v| { return 7; }
 
     // Overwrite
-    map_put(m, 42, 999);
-    u32 v4 = map_get(m, 42) orelse { return 8; };
+    map_put(&m, 42, 999);
+    u32 v4 = map_get(&m, 42) orelse { return 8; };
     if (v4 != 999) { return 9; }
 
     return 0;

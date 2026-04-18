@@ -181,8 +181,8 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 - Handle auto-deref verifies allocator exists at check time. No allocator in scope → compile error (was: emitter silently output `0`).
 - const Handle semantics: `const Handle(Task) h; h.id = 42` is ALLOWED. Handle is a key (like const file descriptor), const key ≠ const data. Assignment checker sets `through_pointer = true` when TYPE_HANDLE found in field chain. This also fixes if-unwrap `|t|` + Handle auto-deref (capture is const but data mutation allowed).
 - Ghost handle check extended to `alloc_ptr()` (was `alloc` only).
-- zercheck recognizes `Task.delete()`/`Task.delete_ptr()` as free (TYPE_STRUCT method in `zc_check_call`). `Task.new()`/`Task.new_ptr()` recognized as alloc in `zc_check_var_init`.
-- `Task.new()`/`Task.new_ptr()` banned in interrupt handler (same ISR check as slab.alloc).
+- zercheck recognizes `Task.free()`/`Task.free_ptr()` as free (TYPE_STRUCT method in `zc_check_call`). `Task.alloc()`/`Task.alloc_ptr()` recognized as alloc in `zc_check_var_init`.
+- `Task.alloc()`/`Task.alloc_ptr()` banned in interrupt handler (same ISR check as slab.alloc).
 
 ### Handle(T)[N] — Array of Handles
 
@@ -317,7 +317,7 @@ This makes `eval_const_expr` work universally for comptime results — no specia
 
 **Finding: raw `malloc/free` with `*opaque` and `--track-cptrs`:** When `--track-cptrs` is active (default for `--run`), `*opaque` emits as `_zer_opaque` (struct with type_id), not `void*`. C's `malloc()` returns `void*` — type mismatch with `_zer_opaque`. Positive tests using raw malloc/free must use `--release` mode OR (preferred) use Slab/Pool instead. The existing negative tests work because they fail at zercheck before reaching GCC.
 
-**Finding: Task.new() + explicit Slab for same type = ambiguous allocator.** `Slab(Task) heap;` + `Task.new()` creates two Slabs for the same struct type. Handle auto-deref can't pick which one → compile error. This is correct behavior — use one or the other, not both.
+**Finding: Task.alloc() + explicit Slab for same type = ambiguous allocator.** `Slab(Task) heap;` + `Task.alloc()` creates two Slabs for the same struct type. Handle auto-deref can't pick which one → compile error. This is correct behavior — use one or the other, not both.
 
 ### Handle Auto-Deref Scalar Store (BUG-405, 2026-04-05)
 
@@ -527,11 +527,11 @@ Auto-guard `if (idx >= size) { return 0; }` in a function returning struct/union
 
 `const [*]u8 get() { return "hello"; }` was rejected — checker fired "cannot return string literal as mutable slice" without checking if the return type was `const`. Fix: added `!ret->slice.is_const` condition. Also handles `?const [*]u8` optional return path.
 
-### Task.new() / Task.delete() — Auto-Slab Sugar
+### Task.alloc() / Task.free() — Auto-Slab Sugar
 
 **Checker:** When NODE_FIELD on TYPE_STRUCT with method `new`/`new_ptr`/`delete`/`delete_ptr`, checker creates/finds auto-Slab in `checker.auto_slabs[]`. One auto-Slab per struct type (program-wide). `auto_slabs` is an arena-allocated dynamic array on the Checker struct.
 
-**Auto-Slab creation:** On first `Task.new()`, creates `_zer_auto_slab_Task` as a Symbol in global scope with TYPE_SLAB. Subsequent `Task.new()` calls reuse the same auto-Slab. `Task.new_ptr()` shares the same auto-Slab.
+**Auto-Slab creation:** On first `Task.alloc()`, creates `_zer_auto_slab_Task` as a Symbol in global scope with TYPE_SLAB. Subsequent `Task.alloc()` calls reuse the same auto-Slab. `Task.alloc_ptr()` shares the same auto-Slab.
 
 **Emitter:** Two-pass declaration emission in `emit_file()`:
 1. Pass 1: emit struct/enum/union/typedef declarations
@@ -543,10 +543,10 @@ The two-pass ensures `sizeof(Task)` is available (struct declared in pass 1). Th
 **CRITICAL: use designated initializers for auto-slab.** The emission MUST be `{ .slot_size = sizeof(T) }`, NOT `{sizeof(T), 0, 0, ...}`. Positional init put sizeof into `pages` field (wrong) because `_zer_slab` struct field order doesn't start with `slot_size`. Normal Slab emission (line ~3422) already uses `.slot_size =` — auto-slab must match.
 
 **Method emission:**
-- `Task.new()` → `_zer_slab_alloc(&_zer_auto_slab_Task, &ok)` wrapped in optional u64
-- `Task.new_ptr()` → `_zer_slab_alloc` + `_zer_slab_get` combined, returns pointer
-- `Task.delete(h)` → `_zer_slab_free(&_zer_auto_slab_Task, h)`
-- `Task.delete_ptr(p)` → `_zer_slab_free_ptr(&_zer_auto_slab_Task, p)`
+- `Task.alloc()` → `_zer_slab_alloc(&_zer_auto_slab_Task, &ok)` wrapped in optional u64
+- `Task.alloc_ptr()` → `_zer_slab_alloc` + `_zer_slab_get` combined, returns pointer
+- `Task.free(h)` → `_zer_slab_free(&_zer_auto_slab_Task, h)`
+- `Task.free_ptr(p)` → `_zer_slab_free_ptr(&_zer_auto_slab_Task, p)`
 
 ## Checker (checker.c) — ~1800 lines
 
@@ -596,8 +596,9 @@ Global hash map: `Node* → Type*`. Set during checking via `typemap_set()`. Rea
 ### Key Patterns
 - `emit_type(Type*)` — emits C type. For TYPE_FUNC_PTR emits complete anonymous `ret (*)(params)`.
 - `emit_type_and_name(Type*, name, len)` — handles arrays (`T name[N]`) and func ptrs (`ret (*name)(params)`)
-- `emit_expr(Node*)` — emits C expression
-- `emit_stmt(Node*)` — emits C statement
+- `emit_expr(Node*)` — emits C expression (top-level constants + global initializers only since 2026-04-19)
+- `emit_ir_inst(IRInst*, IRFunc*)` + `emit_rewritten_node(Node*, IRFunc*)` — IR-path emitters for function bodies. `emit_stmt` was DELETED.
+- `emit_func_from_ir(IRFunc*)` — emits one function body from IR. Dispatches to `emit_async_func_from_ir` or `emit_regular_func_from_ir` (which handles `is_interrupt` flag too).
 - `emit_file(Node*)` — emits complete C file with preamble
 
 ### Preamble (emitted at top of every .c file)
@@ -827,7 +828,7 @@ At function exit, any handle that is `HS_ALIVE` or `HS_MAYBE_FREED` and was allo
 
 **Error deduplication:** One error per allocation (alloc_id), not per variable name. After reporting, alloc_id added to covered set.
 
-**Defer free scanning (2026-04-06, recursive):** Before leak detection, zercheck scans the ENTIRE function body recursively (not just top-level) for defer blocks containing free calls. Handles freed in defer are marked HS_FREED. `defer_scan_all_frees()` walks ALL statements in a defer block (not just the first — BUG-443 fix). Recognizes pool.free, slab.free, slab.free_ptr, Task.delete, Task.delete_ptr, and bare free() calls.
+**Defer free scanning (2026-04-06, recursive):** Before leak detection, zercheck scans the ENTIRE function body recursively (not just top-level) for defer blocks containing free calls. Handles freed in defer are marked HS_FREED. `defer_scan_all_frees()` walks ALL statements in a defer block (not just the first — BUG-443 fix). Recognizes pool.free, slab.free, slab.free_ptr, Task.free, Task.free_ptr, and bare free() calls.
 
 **If-exit MAYBE_FREED fix (2026-04-05):** In if-without-else merging, `block_always_exits()` checks if the then-branch always exits (NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, or NODE_IF with both branches exiting). If the freeing branch always exits, handles stay ALIVE on the continuation path — the pattern `if (err) { free(h); return; } use(h);` is now correctly safe.
 
@@ -872,8 +873,8 @@ All state/type checks go through centralized helpers. New states or move-like ty
 - `propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type)` — propagates `is_local_derived`, `is_arena_derived`, `is_from_arena` from src to dst, but ONLY if `type_can_carry_pointer(dst_type)`. Prevents BUG-421 (scalar false positive). Used at all 5 grouped propagation sites.
 
 ### ISR Ban + Auto-Slab
-- `check_isr_ban(Checker *c, int line, const char *method)` — rejects heap allocation in interrupt handler. Replaces 4 scattered `c->in_interrupt` checks (slab.alloc, slab.alloc_ptr, Task.new, Task.new_ptr).
-- `find_or_create_auto_slab(Checker *c, Type *struct_type)` — finds or creates auto-Slab for a struct type. Replaces 2× 40-line duplicate blocks in Task.new() and Task.new_ptr().
+- `check_isr_ban(Checker *c, int line, const char *method)` — rejects heap allocation in interrupt handler. Replaces 4 scattered `c->in_interrupt` checks (slab.alloc, slab.alloc_ptr, Task.alloc, Task.alloc_ptr).
+- `find_or_create_auto_slab(Checker *c, Type *struct_type)` — finds or creates auto-Slab for a struct type. Replaces 2× 40-line duplicate blocks in Task.alloc() and Task.alloc_ptr().
 
 ### Volatile Strip
 - `check_volatile_strip(Checker *c, Node *src_expr, Type *src_type, Type *tgt_type, int line, const char *context)` — checks if a cast/intrinsic strips volatile from pointer. Walks source ident for `sym->is_volatile`. Replaces 5 scattered sites (@ptrcast BUG-258, @bitcast BUG-341, @cast BUG-343, @container, C-style cast BUG-447).
@@ -1163,7 +1164,7 @@ Fixes the 5 matrix audit bugs (direct + transitive) and absorbs `has_atomic_or_b
 | 15 | `type_can_carry_pointer` | checker.c | Escape flag propagation filter |
 | 16 | `propagate_escape_flags` | checker.c | Local/arena-derived flag copy |
 | 17 | `check_isr_ban` | checker.c | ISR heap allocation ban |
-| 18 | `find_or_create_auto_slab` | checker.c | Task.new auto-slab |
+| 18 | `find_or_create_auto_slab` | checker.c | Task.alloc auto-slab |
 | 19 | `check_volatile_strip` | checker.c | Cast/intrinsic volatile check |
 | 20 | `validate_struct_init` | checker.c | Designated init field validation |
 | 21 | `find_handle_local` | zercheck.c | Scope-aware handle registration |
@@ -1193,8 +1194,19 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
 - Checker type as void* in ir.h (anonymous struct can't be forward-declared)
 - Empty blocks allowed (join points)
 
-**Current status:** All 7 phases implemented. Migration in progress via `--use-ir` flag.
-- `--emit-ir` prints IR. `emit_func_from_ir` emits C from IR. `zercheck_ir` tracks handles on CFG. `vrp_ir` tracks ranges per LOCAL per block.
+**Current status (2026-04-19): IR migration COMPLETE. AST emission for function bodies DELETED.**
+- `--no-ir` / `--use-ir` CLI flags REMOVED. IR is mandatory for all function bodies.
+- `Emitter.use_ir` field DELETED.
+- `emit_stmt` function DELETED (~1125 lines). Entire AST statement emitter gone.
+- `emit_async_func` DELETED. Replaced by `emit_async_func_from_ir`.
+- Interrupt handlers route through IR (`ir_lower_interrupt` + `emit_func_from_ir`).
+- `emit_func_decl` path: body exists → `ir_lower_func` → `ir_validate` → `emit_func_from_ir` + return. Failure at any step = `abort()`. No silent fallback.
+- `--emit-ir` prints IR. `zercheck_ir` tracks handles on CFG (Phase 8-9 WIP, not linked). `vrp_ir` tracks ranges per LOCAL per block (Phase 8-9 WIP, not linked).
+- `emit_expr` KEPT — used by top-level declarations for constant expressions + global initializers.
+
+**The long migration log below (Phases 1-9) is HISTORICAL.** Dates, BUG numbers, and "current status" snippets in it reflect what was true at the time. The log is preserved for context on why the IR was built the way it was; do not read it as describing current compiler state. For current state see the line above.
+
+*Historical log follows:*
 - `--use-ir` routes function body emission through IR path. **195/195 (100%) ZER positive tests compile.** AST path is default, all 4000+ pass. Ready to flip default after testing rust/zig/negative/module tests.
 - **Remaining 32 failures** (characterized):
   - Union switch: struct used as scalar (7) — IR_BRANCH emits raw union value, needs `._tag` access
@@ -1283,7 +1295,7 @@ Sits between checker and emitter. Still emits C → GCC. See `docs/IR_Implementa
   - **196/196 ZER, 28/28 module, 786/786 rust, 36/36 zig. make check ALL TESTS PASSED.**
   - **Phase 9 COMPLETE: `emit_expr` in IR function body path = ZERO (from 17).** `emit_ir_inst`: 0. `emit_rewritten_node`: 0. `emit_builtin_inline`: 0. Full decomposition achieved. 195/195 ZER --use-ir.
   - **`emit_rewritten_node(Emitter*, Node*, IRFunc*)`** (~700 lines) handles ALL expression types directly: ident (async self->), literals (string→slice), binary (opaque .ptr, optional .has_value/.value), unary, field (enum, slice .len/.ptr, array .len, pointer ->, Handle auto-deref Slab/Pool get(), NODE_CALL ->, TYPE_HANDLE default with get()), call (builtin detect + emit_builtin_inline, ThreadHandle.join→pthread_join, comptime, field/index callee, coercions), typecast, struct_init, @size (type_arg + ident-arg with struct/packed prefix), @truncate/@saturate/@bitcast/@cast/@offset/@ptrtoint/@trap/@ptrcast/@inttoptr/@container, @barrier*/__atomic_thread_fence, @atomic_* (load/store/add/sub/or/and/xor/cas) via __atomic builtins, @cstr (memcpy+null), @cond_wait/signal/broadcast (mutex init+lock+cond+unlock, pointer vs struct accessor), @sem_acquire/release, @probe, slice (sub-slice on both slice and array), NODE_ASSIGN (simple op=, optional wrap, null assign, array→slice, volatile array memmove, shared struct lock/unlock, bit-extract shift/mask 83 lines), NODE_INDEX (simple .ptr[]).
-  - **`emit_builtin_inline(Emitter*, Node*, IRFunc*)`** (~100 lines) handles pool/slab/ring/arena/Task builtins: pool.alloc/get/free/alloc_ptr/free_ptr, slab.alloc/alloc_ptr/get/free/free_ptr, ring.push/pop, arena.alloc(T)/reset/unsafe_reset/over(buf), Task.new/new_ptr/delete/delete_ptr. Key: pool.alloc uses capacity integer (NOT &pool.count), Arena.over is static constructor, Task.new/delete use _zer_auto_slab_TypeName.
+  - **`emit_builtin_inline(Emitter*, Node*, IRFunc*)`** (~100 lines) handles pool/slab/ring/arena/Task builtins: pool.alloc/get/free/alloc_ptr/free_ptr, slab.alloc/alloc_ptr/get/free/free_ptr, ring.push/pop, arena.alloc(T)/reset/unsafe_reset/over(buf), Task.alloc/new_ptr/delete/delete_ptr. Key: pool.alloc uses capacity integer (NOT &pool.count), Arena.over is static constructor, Task.alloc/delete use _zer_auto_slab_TypeName.
   - **BUG-513 through BUG-529** (17 bugs fixed). Key lessons: parser stores @size(UserType) as args[0] not type_arg; Handle auto-deref rewrites object to NODE_CALL; emit_type doesn't handle TYPE_STRUCT; resolve_tynode has TypeNode*→Node* hash collision; condvar intrinsics need pointer vs struct accessor detection.
 
 ### IR Path Validation Session (2026-04-17) — `use_ir=true` in test harnesses
@@ -2153,7 +2165,7 @@ Parser accepts `[*]T` as alias for `[]T`. Both resolve to `TYNODE_SLICE`. Same i
 
 **Deprecation warning:** Parser emits `warn()` when `[]T` is used. Warning suppressed when `parser.source == NULL` (test harness mode) to avoid noise from 200+ test strings that still use `[]T`. Real `.zer` files always see the warning. The `warn()` function (parser.c line ~57) uses same `print_source_line_p()` as errors.
 
-**Full design documents:** `docs/ZER_STARS.md` (syntax), `docs/ZER_SUGAR.md` (Handle auto-deref + Task.new())
+**Full design documents:** `docs/ZER_STARS.md` (syntax), `docs/ZER_SUGAR.md` (Handle auto-deref + Task.alloc())
 
 ### Why ZER doesn't need a borrow checker
 
@@ -3782,7 +3794,7 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 **Purpose:** Generates random valid ZER programs combining safety-critical patterns, compiles with zerc, runs, and verifies: safe programs must compile AND run (exit 0), unsafe programs must be REJECTED by zerc.
 
 **32 generators (safe + unsafe):**
-- Memory: Pool+defer (1-4 handles), arena wrappers (1-4 depth), *opaque roundtrip, interior ptr, Task.new/delete, handle alias, Slab alloc_ptr
+- Memory: Pool+defer (1-4 handles), arena wrappers (1-4 depth), *opaque roundtrip, interior ptr, Task.alloc/delete, handle alias, Slab alloc_ptr
 - Casts: narrowing chain, bool↔int, signed↔unsigned, wrong-type, wrong-provenance, direct *A→*B
 - Control: goto+defer, while+break, enum switch, defer+orelse block
 - Types: union mutable capture, packed struct, distinct typedef, function pointer callback, nested struct deref, bit extraction, slice subslice, ring buffer
@@ -4445,3 +4457,130 @@ every multi-module output went unnoticed for ~4 weeks because the
 emitted C still compiled — the comment was just ugly, not broken.
 
 Full protocol details in CLAUDE.md "Diff-Based Post-Release Audit".
+
+## 2026-04-19: IR-only function bodies, V3 routing, Task.alloc/free rename
+
+### IR-only enforcement (no AST fallback for function bodies)
+
+- `--no-ir` / `--use-ir` CLI flags DELETED from zerc_main.c.
+- `Emitter.use_ir` field DELETED from emitter.h.
+- `emit_func_decl`: IR lowering is load-bearing. If `ir_lower_func`
+  returns NULL or `ir_validate` fails, `abort()` with
+  "INTERNAL ERROR — please report" message. No silent AST fallback.
+- `emit_stmt` DELETED (~1125 lines). Truly unreachable after the
+  fallback removal; verified via abort-probe + full `make check`.
+- `emit_async_func` DELETED (~234 lines) — replaced by
+  `emit_async_func_from_ir` (called from `emit_func_from_ir`
+  when `func->is_async`).
+- `emit_async_orelse_block` DELETED (~51 lines).
+- Interrupts route through IR: `emit_top_level_decl` NODE_INTERRUPT
+  calls `ir_lower_interrupt` + `emit_func_from_ir`.
+  `emit_regular_func_from_ir` detects `func->is_interrupt` and
+  emits `void __attribute__((interrupt)) NAME_IRQHandler(void)`
+  signature; body emits as normal IR blocks.
+- `emit_expr` KEPT — still used by top-level declarations
+  (struct/enum/union definitions, global initializer expressions,
+  cinclude, mmio). Top-level constructs aren't code; IR (which is
+  CFG + basic blocks + locals) is the wrong shape for them.
+
+**`tools/walker_audit.sh` update:** was using `emit_stmt` as the
+end-of-span marker for emit_expr's switch. Now uses
+`emit_defers_from` (next static function) with `[^;]*{` anchor.
+
+**Old bug-fix history references `emit_stmt`:** several places in
+this doc describe bugs in the former AST statement emitter (e.g.
+"#line stray in else_body" at lines 476/480). These are preserved
+as historical context. The code paths they describe no longer
+exist. Do not try to reproduce the described behavior in the
+current codebase.
+
+### Validator flag-use exceptions (surfaced by IR-only enforcement)
+
+Two IR ops reuse `cond_local`/`src2_local` fields as encoded FLAGS
+rather than local-id references. Validator must skip range check:
+
+| Op | Field | Flag meaning |
+|---|---|---|
+| `IR_DEFER_FIRE` | `cond_local` | defer-stack base index (0..N) |
+| `IR_DEFER_FIRE` | `src2_local` | pop mode (0=pop, 1=no-pop, 2=pop-only) |
+| `IR_LOCK` | `src2_local` | 0=read-lock, 1=write-lock |
+
+When adding a new IR op that reuses these fields as flags, add it
+to the exception list in `ir_validate` (ir.c lines ~320 and ~335).
+Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
+as flag values fell into the validator's "out of range" check for
+functions with local_count == 0.
+
+### V3 target-type routing
+
+`route_alloc_to_ptr_if_needed(call, target)` and
+`route_free_to_ptr_if_needed(call)` in checker.c. Called BEFORE
+the builtin dispatch so existing matchers see the rewritten method
+name. Hooks:
+
+- `check_var_decl` init (line ~6428)
+- `check_assign` value (line ~2443)
+- TYPE_SLAB builtin dispatch entry (line ~3764)
+- TYPE_STRUCT builtin dispatch entry (line ~3946)
+
+Receiver-type guards are critical:
+- alloc-routing only applies when receiver is a struct-type ident
+  (Task sugar) or TYPE_SLAB value (slab).
+- Pool (TYPE_POOL) and Arena (TYPE_ARENA) have no `_ptr` variant.
+  Initial version wrongly rewrote `arena.alloc(T)` → `arena.alloc_ptr`
+  (doesn't exist) until the guards were added.
+
+free-routing lives INSIDE the TYPE_SLAB / TYPE_STRUCT dispatch
+branches, so it naturally skips Pool/Arena.
+
+Orelse unwrapping: the helper walks through `NODE_ORELSE` wrappers
+to find the underlying NODE_CALL, so `*T p = Task.alloc() orelse
+return;` routes correctly.
+
+### Task.alloc / Task.free rename (no alias)
+
+`new`/`delete` removed entirely, not kept as aliases. ZER has no
+constructors or destructors; C++ verbs were a misnomer. All four
+allocators now use consistent `alloc`/`free` vocabulary:
+
+```
+Pool(T, N):  pool.alloc()    pool.free(h)
+Slab(T):     slab.alloc()    slab.free(h)    (+ V3 _ptr routing)
+Arena:       arena.alloc(T)                  (bulk reset)
+Task sugar:  Task.alloc()    Task.free(h)    (+ V3 _ptr routing)
+```
+
+Checker/emitter/zercheck all have `new`/`delete`/`new_ptr`/`delete_ptr`
+REMOVED from their name matchers. `alloc`/`free`/`alloc_ptr`/`free_ptr`
+detection shared across Slab and Task sugar.
+
+Test migration: 15 test files sed'd, 9 renamed. All `tests/zer/task_new*.zer`
+→ `task_alloc*`, `tests/zer_fail/task_delete_*` → `task_free_*`,
+`rust_tests/rt_task_new_delete*` → `rt_task_alloc_free*`.
+
+### QEMU MMIO test infrastructure
+
+Previously-skipped tests (rt_unsafe_mmio_multi_reg and
+rt_unsafe_mmio_volatile_rw) used STM32 addresses (0x40020000)
+unmapped on hosted Linux. Now run under QEMU Cortex-M3 with
+Stellaris GPIO_E base (0x40024000) which IS mapped on
+`qemu-system-arm -machine lm3s6965evb`. Compiler behavior tested
+is identical — only the address changed.
+
+Directory `rust_tests/qemu/`:
+- Two `.zer` tests adapted to Stellaris addresses
+- `startup.c` — Cortex-M3 reset handler with ARM semihosting exit
+  (`SYS_EXIT_EXTENDED 0x20` → qemu-system-arm terminates with
+  main's return code)
+- `link.ld` — memory map for LM3S6965 (256K flash + 64K SRAM)
+- `run_tests.sh` — per-test pipeline: `zerc --lib` →
+  `arm-none-eabi-gcc -include stdint.h` → QEMU semihosting.
+  Gracefully skips if arm-none-eabi-gcc or qemu-system-arm
+  aren't installed.
+
+Dockerfile adds `qemu-system-arm` + `gcc-arm-none-eabi`. Makefile
+`check` target calls `rust_tests/qemu/run_tests.sh` as a new
+section.
+
+Result: ZERO skipped tests across the entire suite. Every test
+runs to a real outcome.

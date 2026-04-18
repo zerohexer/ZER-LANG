@@ -1258,6 +1258,8 @@ These are the non-obvious rules that took multiple sessions + bug fixes to disco
 
 **17. `Arena.over(buf)` returns an Arena VALUE** — it does not mutate an existing arena in place. Usage: `Arena ar = Arena.over(buf);` to initialize. Bare `ar.over(buf)` as a method call discards the return value and does nothing useful.
 
+**18. IR path auto-locks shared struct access via IR_LOCK/IR_UNLOCK** (BUG-594). AST path wraps each shared-struct-touching statement with `pthread_mutex_lock`/`unlock` (or rwlock equivalents) in `emit_stmt` NODE_BLOCK. IR path does the same via `ir_lower.c` NODE_BLOCK: for each source statement, `find_shared_root_in_stmt_ir` detects the root ident of a shared struct (directly or via pointer param), emits `IR_LOCK` with `expr=root, src2_local=is_write?1:0` before lowering, and `IR_UNLOCK` after. Emitter IR_LOCK/IR_UNLOCK cases call the same `emit_shared_lock_mode`/`emit_shared_unlock` helpers the AST path uses. Without this, function bodies with `*SharedStruct` parameters emit raw field access → data races. This was latent for the entire v0.4.0 IR transition and only surfaced after BUG-581 made exit codes honest — low-contention single-increment tests "passed" by luck even while racing.
+
 ### Scoped Defer Emission — the pattern
 
 Emitter's `defer_stack` is compile-time, not runtime. Every block-level construct that introduces a defer scope must bracket the body with defer tracking:

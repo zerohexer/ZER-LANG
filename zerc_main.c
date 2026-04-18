@@ -477,6 +477,7 @@ int main(int argc, char **argv) {
                 if (ir) {
                     if (!ir_validate(ir)) {
                         fprintf(stderr, "INTERNAL ERROR: IR validation failed\n");
+                        free(topo_order);
                         free(cc.modules);
                         arena_free(&cc.arena);
                         return 1;
@@ -486,6 +487,7 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        free(topo_order);
         free(cc.modules);
         arena_free(&cc.arena);
         return 0;
@@ -532,29 +534,6 @@ int main(int argc, char **argv) {
      * Only disabled without explicit --track-cptrs when emitting C library (--lib). */
     emitter.track_cptrs = track_cptrs || do_run;
     emitter.source_file = input_path;
-
-    /* Forward-declare ALL imported module globals so cross-module
-     * references work regardless of emission order. */
-    for (int ti = 0; ti < topo_count; ti++) {
-        int mi = topo_order[ti];
-        if (mi == 0) continue; /* main module — no prefix needed */
-        Module *m = &cc.modules[mi];
-        if (!m->ast) continue;
-        for (int i = 0; i < m->ast->file.decl_count; i++) {
-            Node *d = m->ast->file.decls[i];
-            if (d->kind == NODE_GLOBAL_VAR && !d->var_decl.is_static) {
-                /* Non-static global — needs extern forward declaration.
-                 * Static globals are module-private, no cross-module access. */
-                /* Emit as: extern TYPE MODULE__NAME; */
-                /* Use emitter for proper type emission */
-                emitter.current_module = m->name;
-                emitter.current_module_len = (uint32_t)strlen(m->name);
-                fprintf(out, "/* forward */ ");
-                /* Simple: just declare with the mangled name.
-                 * The actual definition will follow in the module's emission. */
-            }
-        }
-    }
 
     /* emit in topological order — dependencies first, main last.
      * When IR is active, emit ALL modules' structs+globals first,

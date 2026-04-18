@@ -5,6 +5,166 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-19 — AST emission deletion, QEMU MMIO tests, V3 + Option A rename
+
+Not a bug-fix session per se — architectural consolidation + ergonomic
+refactoring. Documented here because the IR-only enforcement (steps
+1+2+3) surfaced two latent validator bugs, and the changes are
+load-bearing for every future session.
+
+### Step 1+2: IR made load-bearing (no AST fallback for function bodies)
+
+Motivation: running the test suite with `--no-ir` showed 9 tests
+failing on the AST path (async captures, atomic ops, star_slice,
+typecasts, union array variants). AST drifted behind IR as features
+landed IR-only; silent fallback on `ir_validate` failure masked bugs.
+
+Changes:
+- Removed `--no-ir` and `--use-ir` CLI flags (zerc_main.c).
+- Removed `Emitter.use_ir` field entirely (emitter.c, emitter.h).
+- `emit_func_decl`: function bodies now go through IR only. If
+  `ir_lower_func` returns NULL or `ir_validate` fails, `abort()`
+  with a clear "INTERNAL ERROR — please report" message.
+- `make check` redundant `tests/test_zer.sh --use-ir` line removed.
+
+Latent bugs surfaced by the IR-only enforcement:
+
+**Validator bug 1 — IR_DEFER_FIRE cond_local false positive:**
+`emit_defer_fire_scoped` uses `cond_local` as a defer-stack base
+INDEX (0..defer_count), not a local-id. Validator was treating any
+non-negative `cond_local` as a local reference. Void function with
+no locals + scoped defer (base=0, local_count=0) triggered the
+false-positive abort. Fix: skip cond_local range check for
+IR_DEFER_FIRE in ir_validate.
+
+**Validator bug 2 — IR_LOCK src2_local false positive:**
+IR_LOCK uses `src2_local` as a write-lock flag (0/1), not a local-id
+— same pattern IR_DEFER_FIRE has with its flag-use src2_local. Void
+shared-struct callback (on_event in cinclude_callback_shared.zer)
+hit this. Fix: add IR_LOCK to the existing src2_local flag-op
+exception list alongside IR_DEFER_FIRE.
+
+### Step 3: Deleted dead AST emission (~1540 lines)
+
+After steps 1+2, `emit_stmt` (the AST statement emitter) became
+unreachable. Instrumented with an `abort()` probe at function entry;
+full `make check` didn't hit it. Verified dead.
+
+Removed:
+- `emit_stmt` (~1125 lines): block / if / for / while / return /
+  defer / orelse / switch / critical / spawn / once / var_decl AST
+  emission. All replaced by `ir_lower` + `emit_ir_inst`.
+- `emit_async_func` (~234 lines): old AST-path coroutine emission.
+  Replaced by `emit_async_func_from_ir`.
+- `emit_async_orelse_block` (~51 lines + forward decl): async
+  orelse helper used only by AST path.
+
+Migrated to IR:
+- `NODE_INTERRUPT` in `emit_top_level_decl` now routes through
+  `ir_lower_interrupt` + `emit_func_from_ir`. `emit_regular_func_from_ir`
+  detects `func->is_interrupt` and emits
+  `void __attribute__((interrupt)) NAME_IRQHandler(void)` signature.
+  Body emits via normal IR blocks. Verified against hal.zer.
+
+Residual guards:
+- `emit_defers_from` replaced emit_stmt with an `abort()` — defer
+  stack is populated only by the now-deleted AST emission, so
+  `defer_stack.count` is always 0 at top-level. If anything ever
+  pushes a defer outside a function, we fail loudly.
+- Dead "orelse { block }" branch removed from emit_expr.
+
+Tool fix:
+- `tools/walker_audit.sh` used emit_stmt as end-of-span marker
+  for emit_expr's switch. Switched to `emit_defers_from` (next
+  static after emit_expr) with `[^;]*{` anchor to match the
+  definition, not the forward decl.
+
+### QEMU MMIO tests (eliminate last skipped tests)
+
+`rt_unsafe_mmio_multi_reg` and `rt_unsafe_mmio_volatile_rw` access
+STM32 GPIOB base (0x40020000), unmapped on hosted Linux → SIGSEGV.
+Previously skipped via KNOWN_FAIL, documented as "hardware
+simulation needed."
+
+Now run under QEMU Cortex-M3 with ARM semihosting exit:
+- `rust_tests/qemu/` — adapted tests use Stellaris GPIO_E base
+  (0x40024000), actually mapped on `qemu-system-arm -machine
+  lm3s6965evb`. Compiler behavior tested is identical (mmio range
+  check, volatile emission, bit ops).
+- `startup.c` with SYS_EXIT_EXTENDED (0x20) semihosting calls so
+  qemu-system-arm terminates with the test's main() return code.
+- `link.ld` copied from existing examples/qemu-cortex-m3/.
+- `run_tests.sh` per-test pipeline: `zerc --lib` → `arm-none-eabi-gcc
+  -include stdint.h` → `qemu-system-arm -semihosting-config
+  enable=on,target=native`. Gracefully skips if toolchain missing.
+- `Dockerfile` adds `qemu-system-arm` + `gcc-arm-none-eabi` via apt.
+- `Makefile` wires new "Rust MMIO tests (QEMU Cortex-M3)" section
+  into `check`.
+
+Result: zero skipped tests across the entire suite.
+
+### V3 target-type routing for allocators
+
+Before: two method names per operation (`new`/`new_ptr`, `delete`/
+`delete_ptr`, `alloc`/`alloc_ptr`, `free`/`free_ptr`). The `_ptr`
+suffix was redundant — the programmer already declared the target
+type on the LHS.
+
+After: one method name, compiler picks variant from target/arg type.
+
+Implementation (~140 lines in checker.c):
+- `route_alloc_to_ptr_if_needed(call, target)`: walks through
+  `NODE_ORELSE` wrappers to find the underlying NODE_CALL, checks
+  receiver-type eligibility (struct-type-ident for Task sugar,
+  TYPE_SLAB for slab), mutates `NODE_FIELD.field_name` to the
+  `_ptr` variant. Pool/Arena have no `_ptr` form and are skipped.
+- `route_free_to_ptr_if_needed(call)`: peeks at arg type via
+  `check_expr` (typemap-cached, idempotent), rewrites name if
+  arg is `*T`.
+- Hooks: `check_var_decl` init, `check_assign` value, TYPE_SLAB
+  and TYPE_STRUCT builtin dispatch branches.
+
+Latent bug caught: initial version didn't check receiver type,
+wrongly rewrote `arena.alloc(T)` (which natively returns `?*T`)
+to `arena.alloc_ptr` (doesn't exist). Fixed by adding the
+receiver-type guards.
+
+### Option A rename: Task.new/delete → Task.alloc/free
+
+Motivation: `new`/`delete` is C++ object-lifecycle vocabulary
+(implies constructor/destructor calls). ZER has no constructors or
+destructors — auto-zero is just `memset(0)`. `alloc`/`free` describes
+the actual behavior. Also matches Pool/Slab/Arena which all use
+`alloc`/`free`. One vocabulary across the language.
+
+Full rename, no alias — ZER is pre-1.0, zero external users.
+
+Changes:
+- checker.c TYPE_STRUCT builtin dispatch: 4 string matchers +
+  error messages renamed.
+- V3 helpers updated: `is_new` check removed, `alloc` receiver
+  discriminates struct-type (Task sugar) vs slab-value. `delete`
+  check removed from route_free_to_ptr_if_needed.
+- emitter.c: 2 dispatch sites renamed (emit_expr Task sugar path
+  + emit_builtin_inline fast path).
+- zercheck.c: 4 detection sites had `new`/`delete`/`new_ptr`/
+  `delete_ptr` removed from name matchers. `alloc`/`free` etc.
+  detection kept (shared with Slab path).
+- 15 test files sed'd (.new → .alloc, .delete → .free, plus _ptr).
+- 9 test files renamed (task_new* → task_alloc*, task_delete_* →
+  task_free_*, etc.).
+- 3 doc files sed'd (CLAUDE.md, ZER_SUGAR.md, reference.md).
+
+All 1,400+ tests green end-to-end. Makes ZER's allocator vocabulary
+fully uniform:
+
+    Pool:  pool.alloc()    pool.free(h)
+    Slab:  slab.alloc()    slab.free(h)    (+ V3 _ptr routing)
+    Arena: arena.alloc(T)                  (bulk reset, no free)
+    Task:  Task.alloc()    Task.free(h)    (+ V3 _ptr routing)
+
+---
+
 ## Session 2026-04-18 (late, part 5) — BUG-594: IR path missing shared struct auto-locks
 
 ### BUG-594: IR-path function bodies emit shared struct access without locks

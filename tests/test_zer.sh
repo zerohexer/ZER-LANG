@@ -13,12 +13,9 @@ SKIP=0
 TOTAL=0
 
 # Tests with known pre-existing failures, documented in docs/limitations.md.
-# Were silently "passing" before BUG-581 (--run exit code fix) because --run
-# swallowed the non-zero exit codes. Surfaced by the fix but orthogonal to it.
-# Each entry: basename (no .zer) + limitations.md tracker for context.
-KNOWN_FAIL_POSITIVE=" \
-    handle_shadow_scope \
-"
+# Empty — BUG-590 closed the shadowing case, everything in tests/zer/
+# compiles + runs + exits 0.
+KNOWN_FAIL_POSITIVE=""
 
 is_known_fail() {
     local needle="$1"

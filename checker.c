@@ -2101,6 +2101,135 @@ static int64_t eval_const_expr_scoped(Checker *c, Node *n) {
     return eval_const_expr_ex(n, 0, resolve_const_ident, c);
 }
 
+/* ================================================================
+ * V3 allocator sugar — target-type based routing (2026-04-19)
+ *
+ * ZER has two forms per allocator: one returning Handle(T), one
+ * returning *T. Historically they were two separate method names
+ * (new/new_ptr, alloc/alloc_ptr, delete/delete_ptr, free/free_ptr).
+ *
+ * V3: one method name per operation. Target type (for alloc) or
+ * argument type (for free) picks the variant. The rewrite happens
+ * at the checker level by mutating the NODE_FIELD method name
+ * before the builtin dispatch sees it — downstream code keeps
+ * working with the explicit _ptr form.
+ *
+ *   Handle(T) h = Task.new()       → dispatches Task.new     (today)
+ *   *T        t = Task.new()       → dispatches Task.new_ptr (NEW)
+ *   Task.delete(h: Handle)         → dispatches Task.delete     (today)
+ *   Task.delete(t: *T)             → dispatches Task.delete_ptr (NEW)
+ *   Same for slab.alloc / slab.alloc_ptr / slab.free / slab.free_ptr.
+ *
+ * Pool has no *_ptr variant so routing skips it.
+ * ================================================================ */
+
+/* If this expression is `obj.new()` or `obj.alloc()` (possibly wrapped in
+ * an orelse) and the TARGET type is a pointer shape (*T or ?*T), rewrite
+ * the method name to the _ptr variant so the existing dispatch returns ?*T.
+ *
+ * IMPORTANT: only applies to receivers that HAVE a Handle-vs-pointer split
+ * — struct types (Task.new/new_ptr) and Slab (slab.alloc/alloc_ptr). Pool
+ * has no pointer form, and Arena.alloc already returns ?*T, so rewriting
+ * those would break dispatch. */
+static void route_alloc_to_ptr_if_needed(Checker *c, Node *call, Type *target) {
+    if (!call || !target) return;
+    /* Unwrap orelse wrappers — the LHS of an orelse carries the alloc call. */
+    while (call && call->kind == NODE_ORELSE) {
+        call = call->orelse.expr;
+    }
+    if (!call || call->kind != NODE_CALL) return;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return;
+
+    /* Target must be *T or ?*T; otherwise keep Handle default. */
+    Type *eff = type_unwrap_distinct(target);
+    if (eff && eff->kind == TYPE_OPTIONAL) {
+        eff = type_unwrap_distinct(eff->optional.inner);
+    }
+    if (!eff || eff->kind != TYPE_POINTER) return;
+
+    /* Only rewrite base names — don't double-suffix an already _ptr form. */
+    const char *base = NULL;
+    int base_len = 0;
+    uint32_t name_len = (uint32_t)callee->field.field_name_len;
+    bool is_new = (name_len == 3 && memcmp(callee->field.field_name, "new", 3) == 0);
+    bool is_alloc = (name_len == 5 && memcmp(callee->field.field_name, "alloc", 5) == 0);
+    if (is_new) {
+        base = "new"; base_len = 3;
+    } else if (is_alloc) {
+        base = "alloc"; base_len = 5;
+    }
+    if (!base) return;
+
+    /* Receiver discriminant: Task.new/new_ptr is on a struct TYPE (ident
+     * resolving to TYPE_STRUCT); slab.alloc/alloc_ptr is on a Slab value.
+     * Arena.alloc is on an Arena value — SKIP (no _ptr form).
+     * Pool.alloc is on a Pool value — SKIP (no _ptr form). */
+    Node *obj = callee->field.object;
+    if (!obj) return;
+    /* Peek at object type via check_expr (idempotent). For struct-type
+     * idents we need scope_lookup to classify as type-reference. */
+    if (is_new) {
+        /* Task.new(): object must be a struct type name (not a value). */
+        if (obj->kind != NODE_IDENT) return;
+        Symbol *sym = scope_lookup(c->current_scope,
+            obj->ident.name, (uint32_t)obj->ident.name_len);
+        if (!sym || !sym->type) return;
+        Type *stype = type_unwrap_distinct(sym->type);
+        if (!stype || stype->kind != TYPE_STRUCT) return;
+    } else if (is_alloc) {
+        /* slab.alloc(): object must be a Slab value. Arena/Pool skip. */
+        Type *ot = check_expr(c, obj);
+        if (!ot) return;
+        Type *oeff = type_unwrap_distinct(ot);
+        if (!oeff || oeff->kind != TYPE_SLAB) return;
+    }
+
+    /* Write "{base}_ptr" into an arena-allocated buffer. */
+    int new_len = base_len + 4;  /* _ptr */
+    char *rewritten = (char *)arena_alloc(c->arena, (size_t)new_len + 1);
+    memcpy(rewritten, base, (size_t)base_len);
+    memcpy(rewritten + base_len, "_ptr", 4);
+    rewritten[new_len] = '\0';
+    callee->field.field_name = rewritten;
+    callee->field.field_name_len = new_len;
+}
+
+/* If this call is `obj.delete(arg)` or `obj.free(arg)` and the argument
+ * is a *T (not a Handle), rewrite to the _ptr variant. Called at the
+ * top of the builtin dispatch so the existing matchers see the correct
+ * method name. */
+static void route_free_to_ptr_if_needed(Checker *c, Node *call) {
+    if (!call || call->kind != NODE_CALL) return;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return;
+    if (call->call.arg_count != 1) return;
+
+    uint32_t name_len = (uint32_t)callee->field.field_name_len;
+    const char *base = NULL;
+    int base_len = 0;
+    if (name_len == 6 && memcmp(callee->field.field_name, "delete", 6) == 0) {
+        base = "delete"; base_len = 6;
+    } else if (name_len == 4 && memcmp(callee->field.field_name, "free", 4) == 0) {
+        base = "free"; base_len = 4;
+    }
+    if (!base) return;
+
+    /* Peek at arg type — check_expr is idempotent (typemap caches). */
+    Type *at = check_expr(c, call->call.args[0]);
+    if (!at) return;
+    Type *aeff = type_unwrap_distinct(at);
+    if (!aeff || aeff->kind != TYPE_POINTER) return;
+
+    int new_len = base_len + 4;  /* _ptr */
+    char *rewritten = (char *)arena_alloc(c->arena, (size_t)new_len + 1);
+    memcpy(rewritten, base, (size_t)base_len);
+    memcpy(rewritten + base_len, "_ptr", 4);
+    rewritten[new_len] = '\0';
+    callee->field.field_name = rewritten;
+    callee->field.field_name_len = new_len;
+}
+
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
@@ -2441,6 +2570,9 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
+        /* V3: route Task.new()/slab.alloc() RHS to _ptr variant when
+         * target is a pointer type. Same logic as var_decl hook. */
+        route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
 
         /* BUG-487: union variant assignment may overwrite move struct.
@@ -3666,6 +3798,13 @@ static Type *check_expr(Checker *c, Node *node) {
 
             /* Slab methods — same API as Pool but dynamically growable */
             if (obj->kind == TYPE_SLAB) {
+                /* V3: route slab.free(arg) to slab.free_ptr when arg is *T.
+                 * Must happen before the method-name dispatch below so the
+                 * existing free/free_ptr matchers pick up the rewrite. */
+                route_free_to_ptr_if_needed(c, node);
+                /* mname may have been rewritten — refresh local copies. */
+                mname = node->call.callee->field.field_name;
+                mlen = (uint32_t)node->call.callee->field.field_name_len;
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
                     check_isr_ban(c, node->loc.line, "slab.alloc()");
                     if (obj_is_const)
@@ -3841,6 +3980,10 @@ static Type *check_expr(Checker *c, Node *node) {
             /* Task.new() / Task.delete() — auto-Slab sugar */
             obj = type_unwrap_distinct(obj);
             if (obj->kind == TYPE_STRUCT) {
+                /* V3: route Task.delete(arg) to Task.delete_ptr when arg is *T. */
+                route_free_to_ptr_if_needed(c, node);
+                mname = node->call.callee->field.field_name;
+                mlen = (uint32_t)node->call.callee->field.field_name_len;
                 if (mlen == 3 && memcmp(mname, "new", 3) == 0) {
                     check_isr_ban(c, node->loc.line, "Task.new()");
                     if (node->call.arg_count != 0)
@@ -6426,6 +6569,10 @@ static void check_stmt(Checker *c, Node *node) {
         typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
 
         if (node->var_decl.init) {
+            /* V3: if init is Task.new()/slab.alloc() and declared type is
+             * *T/?*T, rewrite to the _ptr variant BEFORE dispatch. */
+            route_alloc_to_ptr_if_needed(c, node->var_decl.init, type);
+
             Type *init_type = check_expr(c, node->var_decl.init);
 
             /* non-storable check: pool.get(h) pointer result.

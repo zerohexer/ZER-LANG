@@ -920,6 +920,115 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
  *   bb_ok: %val = %tmp  (emitter unwraps .value)
  * ================================================================ */
 
+/* ================================================================
+ * BUG-594: Shared struct auto-locking for IR path
+ *
+ * The AST emitter does auto lock/unlock around statements that touch
+ * `shared struct` fields (see emit_stmt NODE_BLOCK in emitter.c). The
+ * IR path went through emit_ir_inst instead and lost this wrapping —
+ * shared access was emitted without any mutex, causing data races
+ * under thread contention (rt_sync_send_in_std flaky failure).
+ *
+ * Fix: detect the shared root of each source statement at lowering
+ * time and wrap with IR_LOCK / IR_UNLOCK. The emitter then calls the
+ * same emit_shared_lock_mode / emit_shared_unlock helpers the AST
+ * path uses.
+ *
+ * Per-statement (not grouped across consecutive statements): simpler,
+ * correct, slightly less efficient than AST's grouping. Optimization
+ * for grouping can be added later if profiling shows it matters.
+ * ================================================================ */
+
+/* Walk the field/index/deref chain to the root ident, check if that
+ * root's type is `shared struct` (directly or via pointer param). */
+static Node *find_shared_root_expr(Checker *c, Node *expr);
+
+static Node *find_shared_root_expr(Checker *c, Node *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == NODE_FIELD) {
+        Node *root = expr;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        if (root->kind == NODE_IDENT) {
+            Type *t = checker_get_type(c, root);
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
+                if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+                        return root;
+                }
+            }
+        }
+    }
+    /* Recurse into sub-expressions */
+    Node *found = NULL;
+    if (expr->kind == NODE_BINARY) {
+        found = find_shared_root_expr(c, expr->binary.left);
+        if (!found) found = find_shared_root_expr(c, expr->binary.right);
+    } else if (expr->kind == NODE_ASSIGN) {
+        found = find_shared_root_expr(c, expr->assign.target);
+        if (!found) found = find_shared_root_expr(c, expr->assign.value);
+    } else if (expr->kind == NODE_CALL) {
+        for (int i = 0; i < expr->call.arg_count && !found; i++)
+            found = find_shared_root_expr(c, expr->call.args[i]);
+    } else if (expr->kind == NODE_UNARY) {
+        found = find_shared_root_expr(c, expr->unary.operand);
+    } else if (expr->kind == NODE_INDEX) {
+        found = find_shared_root_expr(c, expr->index_expr.object);
+    } else if (expr->kind == NODE_ORELSE) {
+        found = find_shared_root_expr(c, expr->orelse.expr);
+    } else if (expr->kind == NODE_TYPECAST) {
+        found = find_shared_root_expr(c, expr->typecast.expr);
+    }
+    return found;
+}
+
+static Node *find_shared_root_in_stmt_ir(Checker *c, Node *stmt) {
+    if (!stmt) return NULL;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: return find_shared_root_expr(c, stmt->expr_stmt.expr);
+    case NODE_VAR_DECL:  return find_shared_root_expr(c, stmt->var_decl.init);
+    case NODE_RETURN:    return find_shared_root_expr(c, stmt->ret.expr);
+    /* IF / WHILE / FOR / SWITCH conditions: don't wrap here — the
+     * lowering of those constructs decomposes the cond separately.
+     * Only wrap the simple statement shapes where the whole stmt is
+     * covered by one lock scope. */
+    default: return NULL;
+    }
+}
+
+/* Does this source statement WRITE to a shared field? */
+static bool stmt_writes_shared_ir(Node *stmt) {
+    if (!stmt) return false;
+    if (stmt->kind == NODE_EXPR_STMT && stmt->expr_stmt.expr &&
+        stmt->expr_stmt.expr->kind == NODE_ASSIGN)
+        return true;
+    /* Conservative default for VAR_DECL init: reads shared — the decl
+     * itself writes to a local, not the shared field. So read lock. */
+    return false;
+}
+
+static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_root) {
+    Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
+    *out_root = root;
+    if (!root) return;
+    IRInst lock = make_inst(IR_LOCK, stmt->loc.line);
+    lock.expr = root;
+    lock.src2_local = stmt_writes_shared_ir(stmt) ? 1 : 0;
+    emit_inst(ctx, lock);
+}
+
+static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *stmt, Node *root) {
+    if (!root) return;
+    IRInst unlock = make_inst(IR_UNLOCK, stmt->loc.line);
+    unlock.expr = root;
+    emit_inst(ctx, unlock);
+}
+
 /* Check if an expression contains NODE_ORELSE at the top level */
 static Node *find_orelse(Node *expr) {
     if (!expr) return NULL;
@@ -1317,7 +1426,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (managed_by_enclosing) ctx->block_defers_managed--;
         ctx->func->current_scope++;
         for (int i = 0; i < node->block.stmt_count; i++) {
+            Node *shared_root;
+            emit_shared_lock_if_needed(ctx, node->block.stmts[i], &shared_root);
             lower_stmt(ctx, node->block.stmts[i]);
+            emit_shared_unlock_if_needed(ctx, node->block.stmts[i], shared_root);
         }
         /* Fire defers pushed inside THIS block at block exit.
          *

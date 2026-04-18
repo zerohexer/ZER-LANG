@@ -5,6 +5,109 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-18 (late, part 5) — BUG-594: IR path missing shared struct auto-locks
+
+### BUG-594: IR-path function bodies emit shared struct access without locks
+
+**Symptom**: `rt_sync_send_in_std` failed roughly 40% of runs in `make
+check` (transient). Standalone single-test runs always passed. Classic
+data race signature.
+
+The test does:
+- 2 threads `spawn mutex_worker(&mtx)` where each does `m.value += 1`
+- 3 threads `spawn rwlock_reader(&rwd)` reading/writing shared(rw) fields
+- 2 threads `spawn once_worker(id)` doing `@once { init }`
+
+When it failed: `if (mv != 2) { return 1; }` — the mutex counter ended
+up 1 instead of 2 (lost increment), or readers count was < 3.
+
+**Root cause**: The AST emitter wraps each statement that touches a
+`shared struct` field with `pthread_mutex_lock`/`unlock` (or
+`pthread_rwlock_rdlock`/`wrlock` for `shared(rw)`). This is done in
+`emit_stmt` NODE_BLOCK at emitter.c:3053 via `find_shared_root_in_stmt`
++ `emit_shared_lock_mode` + `emit_shared_unlock`.
+
+The IR path never goes through `emit_stmt` for function bodies — it
+uses `emit_ir_inst`. Nothing in the IR emission path did the same
+auto-lock wrapping. Every function that accessed a shared struct via
+a pointer parameter (like `*Mutex m` or `*RwData r`) was emitted with
+raw field access and zero locks.
+
+Diff between AST and IR emission of `mutex_worker`:
+
+```
+AST path:
+  void mutex_worker(struct Mutex* m) {
+      _zer_mtx_ensure_init(&m->_zer_mtx, &m->_zer_mtx_inited);
+      pthread_mutex_lock(&m->_zer_mtx);
+      m->value += 1;
+      pthread_mutex_unlock(&m->_zer_mtx);
+  }
+
+IR path (before fix):
+  void mutex_worker(struct Mutex* m) {
+      uint32_t _zer_t0 = {0};
+      _zer_t0 = (uint32_t)1;
+      m->value += _zer_t0;   /* NO LOCK */
+      return;
+  }
+```
+
+The test often "passed" because two threads incrementing a uint32 can
+happen to produce 2 even without locks (the window for lost-update is
+short). Under higher contention (more threads, slower CPU,
+ThreadSanitizer-instrumented builds) the race manifests reliably.
+
+**Fix**: Port the auto-lock detection to the IR lowering side.
+
+1. Added `find_shared_root_expr` + `find_shared_root_in_stmt_ir` +
+   `stmt_writes_shared_ir` helpers to `ir_lower.c` (mirror of the
+   AST-side static helpers but take `Checker *` directly). These
+   walk the field/index/deref chain to find the root ident and check
+   if its type is a `shared struct` (directly or via pointer param).
+
+2. `ir_lower.c` NODE_BLOCK handler: for each source statement, call
+   the helper. If it returns a shared root, emit `IR_LOCK` before
+   lowering the statement and `IR_UNLOCK` after. `IR_LOCK.expr` =
+   root ident, `IR_LOCK.src2_local` = 1 for write / 0 for read
+   (based on whether the statement is an assignment).
+
+3. `emitter.c` IR_LOCK / IR_UNLOCK cases (previously TODO stubs)
+   now call the existing `emit_shared_lock_mode(e, root, is_write)`
+   and `emit_shared_unlock(e, root)` helpers — same emission as the
+   AST path uses.
+
+Per-statement locking (not grouped across consecutive statements).
+Slightly less efficient than AST's grouping, but safe and matches the
+straightforward semantics. Grouping optimization can be added later
+if profiling shows it matters.
+
+**After fix**: 5 consecutive runs of `bash rust_tests/run_tests.sh`
+all show `784 passed, 0 failed, 2 skipped`. Emitted C now contains
+correct `pthread_mutex_lock`/`unlock` and `pthread_rwlock_rdlock`/
+`wrlock`/`unlock` calls around shared struct accesses on both AST
+and IR paths.
+
+**Scope of bug**: Every function on the IR path (i.e., all function
+bodies since 82335c3 flipped `use_ir=true` default) that touched a
+shared struct field was emitting un-locked access. The bug was
+masked because:
+- Most `shared struct` test programs use globals (handled in a
+  different AST path that still ran).
+- Low-contention increments often race-safe by luck (2 threads,
+  simple `x += 1`, small window).
+- ThreadSanitizer isn't in CI.
+
+If you write production ZER code using shared structs via pointer
+params on v0.4.0–v0.4.8, rebuild with the fix before deploying.
+
+**Test**: the existing `rt_sync_send_in_std` now passes reliably
+(previously 40% failure rate). No new test added — existing one
+was sufficient to find the bug once exit codes propagated honestly
+(BUG-581 enabled this).
+
+---
+
 ## Session 2026-04-18 (late, part 4) — Full diff audit 029919e..HEAD
 
 After BUG-579/581-589/590-593 a full audit of the IR-transition diff was

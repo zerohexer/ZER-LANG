@@ -8004,14 +8004,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_LOCK: {
-        emit_indent(e);
-        emit(e, "/* IR_LOCK — TODO */\n");
+        /* BUG-594: IR path shared struct auto-locking. ir_lower.c
+         * NODE_BLOCK wraps each statement that touches a shared root
+         * with IR_LOCK (before) + IR_UNLOCK (after). inst->expr is
+         * the root ident; src2_local encodes write-lock (1) vs
+         * read-lock (0) for shared(rw) structs. Reuses the same
+         * emit_shared_lock_mode helper the AST path uses. */
+        if (inst->expr) {
+            emit_shared_lock_mode(e, inst->expr, inst->src2_local != 0);
+        }
         break;
     }
 
     case IR_UNLOCK: {
-        emit_indent(e);
-        emit(e, "/* IR_UNLOCK — TODO */\n");
+        if (inst->expr) {
+            emit_shared_unlock(e, inst->expr);
+        }
         break;
     }
 

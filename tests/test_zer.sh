@@ -18,8 +18,6 @@ TOTAL=0
 # Each entry: basename (no .zer) + limitations.md tracker for context.
 KNOWN_FAIL_POSITIVE=" \
     handle_shadow_scope \
-    hash_map_chained \
-    super_hashmap \
 "
 
 is_known_fail() {

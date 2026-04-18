@@ -9,114 +9,71 @@ Entries removed once fixed.
 
 Switch arm body gaps — enum/union/optional switches now fully lower to IR.
 
+## ~~BUG-581~~ (FIXED 2026-04-18)
+
+`zerc --run` now propagates exit codes via `WEXITSTATUS` on POSIX.
+
+## ~~BUG-582~~ (FIXED 2026-04-18)
+
+Union variant tag update is emitted on the IR path for all target chain
+shapes (`u.v = x`, `u.v[i] = x`, nested fields).
+
+## ~~BUG-590 group — per-block defer firing, variable shadowing, capture scoping~~ (FIXED 2026-04-18)
+
+`IRLocal.scope_depth` + `IRLocal.hidden` + scope-aware `ir_find_local`
+handle variable shadowing correctly. `NODE_BLOCK` fires+pops its own defers
+at block exit using the same POP_ONLY bb_post trick as loops, so
+early-exit paths (return/break/continue/orelse-return) that emit earlier
+blocks still find the defer bodies on the emit-time stack. When the
+enclosing construct manages defers itself (loop, if-branch, switch arm),
+`block_defers_managed` suppresses the block's own fire to avoid duplicates.
+
+## ~~BUG-591~~ (FIXED 2026-04-18)
+
+`await` condition is now re-evaluated on every poll. The IR_AWAIT emitter
+emits `case N:;` followed by a fresh evaluation of the AST cond via
+`emit_rewritten_node`, instead of reusing a stale pre-computed local.
+
+## ~~BUG-592~~ (FIXED 2026-04-18)
+
+Signed/unsigned comparison in IR_BINOP: when one side is signed and the
+other unsigned, cast the unsigned side to the signed type before
+emitting the operator. Without this, `signed_local < 0ULL` evaluated to
+`false` because C promoted the signed operand to unsigned first. Also
+IR_LITERAL now emits `(CType)N` cast to match the local's type instead
+of always-ULL suffix.
+
 ---
 
-## ~~BUG-581: `zerc --run` exit code propagation~~ (FIXED 2026-04-18)
+## Remaining known failures (all pre-existing, surfaced by BUG-581)
 
-`zerc file.zer --run` now correctly returns the program's exit code via
-`WEXITSTATUS` on POSIX (already worked on Windows). Previously returned the
-raw `system()` wait status, causing shell `$?` to see `status & 255` —
-silently masking test failures.
+### 3 rust_tests skipped
 
----
+- `rt_unsafe_mmio_multi_reg`, `rt_unsafe_mmio_volatile_rw` — access real
+  hardware addresses (`0x40020000...`). On a hosted Linux test runner
+  these cause SIGSEGV/SIGTRAP. Need a QEMU-like environment or mocked
+  MMIO to actually run. Not a compiler bug.
 
-## ~~BUG-582: Union variant tag missing on IR path~~ (FIXED 2026-04-18)
+- `gen_comptime_float_001` — comptime `f64` function calls inside binary
+  expressions (`SQUARE(5.0)` where SQUARE returns `f64`) resolve to 0
+  instead of 25.0. The checker doesn't set `is_comptime_float` +
+  `comptime_float_value` for this call pattern. Needs investigation in
+  `eval_const_expr_subst` / `find_comptime_return_expr` float paths in
+  checker.c. Existing simpler float tests (constant folding inside
+  `comptime f64 PI() { return 3.14; }` at top level) still work — this
+  is specifically about nested binary expressions with comptime float
+  calls.
 
-`emit_rewritten_node` NODE_ASSIGN now handles union variant assignments:
-`u.variant = val` and `u.variant[i] = val` both update `u._tag` first. The
-handler walks the assign target through NODE_INDEX / NODE_FIELD chains to
-find the NODE_FIELD whose object is a TYPE_UNION.
+### 1 zig_tests skipped
 
----
-
-## Pre-existing failures surfaced by BUG-581 fix
-
-Surfacing the real exit codes via BUG-581's fix exposed a number of tests
-that were silently "passing" (non-zero exit swallowed). The majority were
-fixed in the same session; three remain. They are skipped in
-`tests/test_zer.sh` via the `KNOWN_FAIL_POSITIVE` list.
-
-### handle_shadow_scope — variable shadowing in IR flat namespace
-
-```zer
-?Handle(Item) mh = pool.alloc();
-Handle(Item) h = mh orelse return;
-defer pool.free(h);
-{
-    ?Handle(Item) mh2 = pool.alloc();
-    Handle(Item) h = mh2 orelse return;  // inner shadows outer
-    pool.free(h);                          // frees inner
-}
-pool.get(h).val = 42;  // should access OUTER h (still alive)
-```
-
-**Problem**: IR's flat local namespace has no concept of scope. When the
-inner block declares a same-name `h`, IR either dedups to the outer local
-(corrupting outer) or creates a suffixed `h_N` local. Either way, after the
-inner block ends, `rewrite_idents` looks up `"h"` via `ir_find_local` which
-returns the LAST match — the inner `h_N` (now freed). Outer-scope references
-to `h` after the inner block get incorrectly rewritten to `h_N`, causing
-use-after-free at runtime.
-
-**Fix approach**: introduce scope depth on `IRLocal` and `LowerCtx`. Each
-local gets `scope_depth` at creation. `NODE_BLOCK` enter/exit adjusts the
-context. `rewrite_idents` / `ir_find_local` must prefer the highest
-`scope_depth` ≤ current context depth (not absolute last). Requires changes
-to `ir_lower.c` (scope tracking), `ir.h` (IRLocal field), `ir.c`
-(`ir_find_local` scope-aware variant).
-
-**Not touched this session**: the fix is structural and non-trivial. No
-regression in existing tests (shadowing rarely occurs in real code).
-
-### hash_map_chained & super_hashmap — struct pass-by-value
-
-Both tests pass a `HashMap` struct by value to `map_put`/`map_get`/etc.
-and expect mutations to persist to the caller. In ZER, structs are
-copy-by-default. The tests mutate a copy; the original stays untouched.
-`map_put(m, 42, 100); map_get(m, 42)` returns `null`.
-
-**Root cause**: test design — the tests were written assuming reference
-semantics. They need `*HashMap` (pointer) parameters to actually modify
-the caller's map. This was masked by BUG-581.
-
-**Fix**: update the tests to use `*HashMap` + take-address at call sites.
-Not purely a compiler issue.
+- `zt_comptime_float_const` — same underlying issue as
+  `gen_comptime_float_001`. Will be fixed together.
 
 ---
 
 ## Tracking notes
 
-Additional bonus fixes in the same session (BUG-581 exposure):
-
-- **BUG-583**: `@once { }` emitted `if (1)` in IR path — lost CAS semantics.
-  Fixed: IR_BRANCH emitter detects `expr = NODE_ONCE` and emits the atomic
-  exchange pattern (matching the AST path).
-- **BUG-584**: Optional switch value comparison — arms like `42 => ...`
-  on `?u32` only checked `has_value`, not the actual value. Fixed: build
-  `has_value && (value == arm_value)` with enum variant value lookup for
-  `?Enum` arms.
-- **BUG-585**: Switch arm capture scoping — same-name `|v|` captures across
-  multiple switches in one function collided in IR's flat namespace via
-  `ir_find_local` last-match. Fixed: generate unique arm-local names (e.g.
-  `v_cap17`) and rewrite the capture name only within the arm body.
-- **BUG-586**: `(bool)integer` didn't truthy-convert — emitted as
-  `(uint8_t)5` giving `5`, not `1`. Fixed: IR_CAST emitter uses
-  `((uint8_t)!!(x))` when target is bool and source is integer/float/pointer.
-- **BUG-587**: Funcptr array indexing via literal — `ops[0](...)` and
-  `ops[1](...)` both emitted as `arr[0](...)` because the IR_CALL index
-  handler had a "non-ident fallback" that emitted literal `0`. Fixed:
-  handle NODE_INT_LIT explicitly, fall back to `emit_rewritten_node` for
-  complex index expressions.
-- **BUG-588**: Entry block was not `bb0` when the function body contained
-  labels. `collect_labels` ran before `start_block` so label blocks got
-  IDs `0, 1, 2...` and the entry block got a higher ID. The emitter iterates
-  blocks in order so C execution started at a label, reading uninitialized
-  state and trapping. Fixed: start the entry block FIRST, then pre-scan
-  labels. Fuzz tests `safe_goto_defer_*` that previously crashed at runtime
-  now pass.
-- **BUG-589** (test): the semantic fuzzer's `gen_safe_goto_defer` produced
-  a self-contradictory pattern: `defer free(h)` followed by `goto done`
-  followed by a read of `h` after the label. ZER's `goto` fires pending
-  defers (see `tests/zer/goto_defer.zer`), so the read hits a freed handle.
-  Updated the generator to manage lifetime explicitly (no defer; free just
-  before return).
+All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,
+rust_tests/run_tests.sh, zig_tests/run_tests.sh) are back-referenced here.
+When fixing an entry, remove it from the relevant list to prevent
+regression-hiding.

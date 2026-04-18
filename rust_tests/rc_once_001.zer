@@ -1,24 +1,29 @@
 // Rust: Once::call_once — init from main thread only
 // ZER: @once { } — atomic CAS ensures single execution from main
 // Equivalent to: Rust std::sync::Once basic usage
+//
+// Each @once block declares its OWN one-shot flag (matches Rust's
+// per-declaration Once). Repeated entries to the SAME @once fire once.
+// To test single-execution across multiple invocations, wrap @once in a
+// helper function and call it multiple times.
 
 u32 ginit_count;
 u32 ginit_value;
+
+void init_helper() {
+    @once {
+        ginit_value = 100;
+        ginit_count += 1;
+    }
+}
 
 u32 main() {
     ginit_count = 0;
     ginit_value = 0;
 
-    @once {
-        ginit_value = 100;
-        ginit_count += 1;
-    }
-
-    // Try to trigger @once a second time — should not execute
-    @once {
-        ginit_value = 999;
-        ginit_count += 1;
-    }
+    init_helper();  // first call — @once fires, sets value=100
+    init_helper();  // second call — @once flag set, skipped
+    init_helper();  // third call — still skipped
 
     if (ginit_count != 1) { return 1; }
     if (ginit_value != 100) { return 2; }

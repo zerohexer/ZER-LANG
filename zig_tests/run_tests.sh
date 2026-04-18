@@ -13,7 +13,6 @@ TOTAL=0
 # See docs/limitations.md.
 KNOWN_FAIL=" \
     zt_comptime_float_const \
-    zt_desig_init_call_arg \
 "
 
 is_known_fail() {

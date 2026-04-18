@@ -5,6 +5,97 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-18 (late, part 2) — BUG-590 through BUG-592: variable shadowing + await + signed comparison
+
+### BUG-590: Variable shadowing across nested blocks
+
+**Symptom**: Inner block `Handle h` shadowing outer `Handle h` → after
+inner block exits, outer references to `h` resolved to the inner (now
+freed) local. UAF at runtime, masked by BUG-581. Also: standalone `{ }`
+block defers were never fired (runs at function exit only, not block exit).
+
+**Root cause**: IR's flat local namespace + `ir_find_local` LAST-MATCH
+strategy. Inner `h` got a suffixed local (e.g. `h_7`) but remained at
+higher scope_depth than outer `h`. Name lookups after the inner block
+still returned `h_7` because it was "most recently created".
+
+**Fix**: `IRLocal.scope_depth` + `IRLocal.hidden` + scope-aware
+`ir_find_local`. `LowerCtx.block_defers_managed` flag so outer
+constructs (loop/if/switch arm) can suppress NODE_BLOCK's own
+fire+pop. NODE_BLOCK also emits a bb_post POP_ONLY block (mirror of
+the loop POP_ONLY trick) so earlier blocks' DEFER_FIRE can still find
+the defer bodies on the emit-time stack.
+
+Four additional rust_tests pass after this: `rt_defer_order_lifo`,
+`rt_drop_count_3`, `rt_drop_trait_basic`, `rt_conc_ring_full_drop` (the
+last was a regression from the intermediate scope fix, caught and fixed
+in the same session).
+
+### BUG-591: `await` condition not re-evaluated on resume
+
+**Symptom**: `await g_ready > 0;` — `_zer_async_waiter_poll` returned
+right condition value on first poll, but on resume, the `case N:;` was
+placed AFTER the cond evaluation so the switch-case entry skipped the
+re-eval. Subsequent polls saw stale cond value.
+
+**Root cause**: `IR_AWAIT` lowering called `lower_expr(cond)` to compute
+a `cond_local` BEFORE emitting `IR_AWAIT`. At emit time, the cond eval
+IR instructions emitted first, then `case N:;` from IR_AWAIT — so
+resume entered BELOW the evaluation.
+
+**Fix**: IR_AWAIT now carries the cond AST (`inst->expr`) not a
+pre-computed local. Emitter emits `case N:;` then
+`emit_rewritten_node(cond)` — fresh evaluation every poll.
+
+### BUG-592: Signed/unsigned comparison in IR_BINOP
+
+**Symptom**: `signed_local < 0` evaluated `false` when signed_local was
+negative. `manhattan({-5, 10})` returned 5 instead of 15 because
+`if (ax < 0)` never fired.
+
+**Root cause**: IR_LITERAL temp for `0` declared as `uint32_t` (default
+literal type). `int32_t < uint32_t` in C promotes the signed side to
+unsigned → `(uint32_t)-5 = 0xFFFFFFFB > 0`. Never less than 0.
+
+**Fix**: Two-pronged —
+  1. `IR_LITERAL` emitter uses `(dst_type)N` cast instead of `N_ULL`,
+     matching the target's signedness.
+  2. `IR_BINOP` emitter detects comparison with signed/unsigned
+     mismatch and casts the unsigned side to the signed side's type
+     before the op. Preserves the caller's intent for `x < 0`-style
+     checks regardless of the `0` literal's type.
+
+### Bonus fixes in the same session
+
+- `@once` with multiple blocks: each declares its own one-shot flag
+  (matches Rust's `std::sync::Once` per-declaration semantics).
+  Updated two rust_tests (`rc_once_001`, `gen_shared_010`) to match
+  this semantic — wrap `@once` in a helper function and call it
+  multiple times to test single-execution behavior.
+- `Arena.over(buf)` returns an Arena VALUE; `ar.over(buf)` as bare
+  method call discarded the result. Fixed `gen_arena_005` to use
+  `Arena ar = Arena.over(mem);` (proper init).
+- `gen_async_010`: fibonacci expected value was wrong in the comment
+  (0,1,1,2,3,5,8 is only 6 values starting from 0,1 — the actual
+  iteration starts AFTER 0,1, producing 1,1,2,3,5,8,13 for 6 iters).
+  Updated expected to fib_b=13.
+- `rt_comptime_guard_bounds`: used keys 0, 5, 15, 31 but HASH(31)=15
+  collided with HASH(15), silently overwriting the earlier slot.
+  Updated to keys 0, 5, 10, 15 (all distinct slots).
+- `hash_map_chained`: `map_delete` only checked bucket head, didn't
+  walk the chain. Updated to walk the full chain (buckets[8] with
+  key collisions produces chains).
+- `super_hashmap`: pass-by-value `HashMap` can't mutate caller. Updated
+  to use `*HashMap` pointer param with `&m` at call sites.
+
+After this session, `make check` passes. 4 tests remain skipped (all
+pre-existing, documented in `docs/limitations.md`): 2 mmio tests need
+a hardware-simulator environment, and 2 comptime-float tests hit a
+checker-level eval gap for comptime `f64` calls inside binary
+expressions.
+
+---
+
 ## Session 2026-04-18 (later) — BUG-581 through BUG-589: `--run` exit code + cascaded surfaced bugs
 
 ### BUG-581: `zerc --run` exit code propagation

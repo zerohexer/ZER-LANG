@@ -35,6 +35,20 @@ typedef struct {
     bool is_temp;            /* compiler-generated temp (_zer_or0, _zer_uw0) */
     bool is_static;          /* static local — NOT promoted to async state struct */
 
+    /* BUG-590: scope tracking for variable shadowing.
+     * `scope_depth` — depth at creation. Used only for dedup decisions
+     *   (same name + same type + same depth → dedup; otherwise fresh local).
+     *   Siblings blocks both reuse the same depth, so this alone can't
+     *   answer "is this local currently in scope" — that's what `hidden`
+     *   is for.
+     * `hidden` — true once the block that created this local has been
+     *   exited. ir_find_local skips hidden locals. The local still exists
+     *   for C declaration (we can't remove it from the array because IR
+     *   instructions already reference it by ID), just no longer visible
+     *   to name-based lookups. */
+    int scope_depth;
+    bool hidden;
+
     int source_line;         /* for error messages + #line directives */
 } IRLocal;
 
@@ -218,6 +232,12 @@ typedef struct {
     /* Module context */
     const char *module_prefix;
     uint32_t module_prefix_len;
+
+    /* BUG-590: current scope depth — set by ir_lower during NODE_BLOCK
+     * traversal. ir_find_local reads this to perform scope-aware lookup
+     * (returns highest scope_depth ≤ current, so inner block locals don't
+     * shadow outer locals in subsequent outer-block lookups). */
+    int current_scope;
 } IRFunc;
 
 /* ================================================================

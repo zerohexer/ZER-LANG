@@ -61,12 +61,33 @@ bool map_put(u32 key, u32 value) {
 
 bool map_delete(u32 key) {
     u32 slot = hash(key);
+    // Head case
     if (buckets[slot].head) |h| {
         if (nodes.get(h).key == key) {
             ?Handle(Node) nxt = nodes.get(h).next;
             nodes.free(h);
             buckets[slot].head = nxt;
             return true;
+        }
+    }
+    // Chain case — walk, rewire `prev.next = curr.next`, free curr.
+    // Note: buckets can hold longer chains when collisions occur (buckets[8]
+    // with keys like 10+100 at slot 6). Walk the full chain for delete.
+    if (buckets[slot].head) |head| {
+        Handle(Node) prev = head;
+        ?Handle(Node) maybe_curr = nodes.get(prev).next;
+        for (u32 step = 0; step < 64; step += 1) {
+            if (maybe_curr) |curr| {
+                if (nodes.get(curr).key == key) {
+                    nodes.get(prev).next = nodes.get(curr).next;
+                    nodes.free(curr);
+                    return true;
+                }
+                prev = curr;
+                maybe_curr = nodes.get(curr).next;
+            } else {
+                return false;
+            }
         }
     }
     return false;

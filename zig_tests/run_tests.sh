@@ -9,11 +9,8 @@ FAIL=0
 SKIP=0
 TOTAL=0
 
-# Known pre-existing failures surfaced by BUG-581 (--run exit code fix).
-# See docs/limitations.md.
-KNOWN_FAIL=" \
-    zt_comptime_float_const \
-"
+# Known pre-existing failures. See docs/limitations.md.
+KNOWN_FAIL=""
 
 is_known_fail() {
     for n in $KNOWN_FAIL; do

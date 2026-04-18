@@ -13,7 +13,6 @@ SKIP=0
 # Previously silently "passed" via swallowed non-zero exit codes.
 # See docs/limitations.md for tracking.
 KNOWN_FAIL=" \
-    gen_comptime_float_001 \
     rt_unsafe_mmio_multi_reg \
     rt_unsafe_mmio_volatile_rw \
 "

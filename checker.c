@@ -4242,10 +4242,22 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     } else if (fn->func_decl.body) {
                         _comptime_global_scope = c->global_scope;
-                        ComptimeCtx cctx;
-                        ct_ctx_init(&cctx, cparams, pc);
-                        int64_t val = eval_comptime_block(fn->func_decl.body, &cctx);
-                        ct_ctx_free(&cctx);
+                        /* BUG-593: for float-returning comptime functions, skip
+                         * the integer eval_comptime_block path entirely. Float
+                         * args are stored as int64 bit-patterns in cparams;
+                         * integer multiply on those bits returns non-FAIL
+                         * garbage and short-circuits past the float path.
+                         * Dispatch to eval_comptime_float_expr directly. */
+                        Type *ret_ty_check = resolve_type(c, fn->func_decl.return_type);
+                        bool ret_is_float = ret_ty_check &&
+                            (ret_ty_check->kind == TYPE_F32 || ret_ty_check->kind == TYPE_F64);
+                        int64_t val = CONST_EVAL_FAIL;
+                        if (!ret_is_float) {
+                            ComptimeCtx cctx;
+                            ct_ctx_init(&cctx, cparams, pc);
+                            val = eval_comptime_block(fn->func_decl.body, &cctx);
+                            ct_ctx_free(&cctx);
+                        }
                         if (val != CONST_EVAL_FAIL) {
                             node->call.comptime_value = val;
                             node->call.is_comptime_resolved = true;

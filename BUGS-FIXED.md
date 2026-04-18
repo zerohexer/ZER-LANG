@@ -5,6 +5,20 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-18 (late, part 3) — BUG-593: comptime float eval short-circuit
+
+### BUG-593: Comptime float function returns garbage instead of float value
+
+**Symptom**: `comptime f64 SQUARE(f64 x) { return x * x; }` called as `f64 s = SQUARE(5.0);` produced `s = 0` instead of 25.0. Compiled C had `s = 0` for the comptime result.
+
+**Root cause**: `check_call` at checker.c:4247 ran `eval_comptime_block` unconditionally. Float args are stored in `ComptimeParam.value` as int64 bit-patterns (via memcpy of the double bits). `eval_comptime_block` evaluated the body using integer arithmetic: `return x * x` did integer multiply on the raw bit-pattern of 5.0 (0x4014000000000000), returning some non-zero int64. Because the result was not `CONST_EVAL_FAIL`, the code took the success path and set `is_comptime_resolved=true` with `comptime_value=<garbage>`, never reaching the float evaluation path at line 4272.
+
+**Fix**: Before calling `eval_comptime_block`, check the function's return type. If it's `f32`/`f64`, skip the integer eval entirely and fall through to the float path (which uses `eval_comptime_float_expr` with the correct bit-pattern-to-double conversion).
+
+After this: `gen_comptime_float_001` and `zt_comptime_float_const` pass. Only remaining skipped tests are 2 mmio hardware-simulation tests (`rt_unsafe_mmio_multi_reg`, `rt_unsafe_mmio_volatile_rw`) which access real hardware addresses and SIGSEGV on hosted Linux — not a compiler bug.
+
+---
+
 ## Session 2026-04-18 (late, part 2) — BUG-590 through BUG-592: variable shadowing + await + signed comparison
 
 ### BUG-590: Variable shadowing across nested blocks

@@ -319,9 +319,15 @@ bool ir_validate(IRFunc *func) {
                 valid = false;
             }
             if (inst->cond_local >= 0 && inst->cond_local >= func->local_count) {
-                fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d cond_local %d out of range in '%.*s'\n",
-                        bi, ii, inst->cond_local, (int)func->name_len, func->name);
-                valid = false;
+                /* For IR_DEFER_FIRE, cond_local is a defer-stack base INDEX
+                 * (0..defer_count), not a local id. Skip the local-range
+                 * check for this op. (src2_local has the same exception a
+                 * few lines down.) */
+                if (inst->op != IR_DEFER_FIRE) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d cond_local %d out of range in '%.*s'\n",
+                            bi, ii, inst->cond_local, (int)func->name_len, func->name);
+                    valid = false;
+                }
             }
             if (inst->src1_local >= 0 && inst->src1_local >= func->local_count) {
                 fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d src1_local %d out of range in '%.*s'\n",
@@ -329,9 +335,11 @@ bool ir_validate(IRFunc *func) {
                 valid = false;
             }
             if (inst->src2_local >= 0 && inst->src2_local >= func->local_count) {
-                /* Note: for IR_DEFER_FIRE, src2_local is a flag (0/1/2), not
-                 * a local id. Skip validation for that op to avoid false warns. */
-                if (inst->op != IR_DEFER_FIRE) {
+                /* Skip ops that use src2_local as a FLAG, not a local id:
+                 *   IR_DEFER_FIRE: 0/1/2 (pop mode)
+                 *   IR_LOCK: 0/1 (read vs write lock — BUG-594)
+                 * All other ops treat src2_local as a local-id reference. */
+                if (inst->op != IR_DEFER_FIRE && inst->op != IR_LOCK) {
                     fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d src2_local %d out of range in '%.*s'\n",
                             bi, ii, inst->src2_local, (int)func->name_len, func->name);
                     valid = false;

@@ -192,7 +192,6 @@ int main(int argc, char **argv) {
     bool do_run = false;
     bool emit_c = false;
     bool emit_ir = false;
-    bool use_ir = true; /* IR default — testing multi-module */
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
@@ -210,10 +209,6 @@ int main(int argc, char **argv) {
             emit_c = true;
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             emit_ir = true;
-        } else if (strcmp(argv[i], "--use-ir") == 0) {
-            use_ir = true; /* explicit — same as default now */
-        } else if (strcmp(argv[i], "--no-ir") == 0) {
-            use_ir = false; /* fallback to AST emission for debugging */
         } else if (strcmp(argv[i], "--lib") == 0) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
@@ -528,7 +523,6 @@ int main(int argc, char **argv) {
     Emitter emitter;
     emitter_init(&emitter, out, &cc.arena, &checker);
     emitter.lib_mode = no_preamble;
-    emitter.use_ir = use_ir;
     /* track_cptrs: _zer_opaque wrapping + _zer_check_alive + --wrap=malloc.
      * Always on for --run (including --release) — compiled-in safety, not debug.
      * Only disabled without explicit --track-cptrs when emitting C library (--lib). */

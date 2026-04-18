@@ -3,7 +3,7 @@
 # tests/zer/     — must compile + run + exit 0 (positive tests)
 # tests/zer_fail/ — must FAIL to compile (negative tests)
 # Usage: test_zer.sh [extra-flags]
-#   e.g. test_zer.sh --use-ir
+#   e.g. test_zer.sh --some-future-flag
 
 ZERC="./zerc"
 EXTRA_FLAGS="$1"

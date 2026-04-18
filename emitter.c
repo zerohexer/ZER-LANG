@@ -4866,25 +4866,33 @@ static void emit_async_func(Emitter *e, Node *node) {
 
 static void emit_func_decl(Emitter *e, Node *node) {
 
-    /* IR emission path — lower to IR, emit from IR */
-    if (e->use_ir && node->func_decl.body) {
+    /* Function bodies are IR-only (no AST fallback). The AST emission
+     * path drifted behind IR as features landed — silent fallback
+     * masked bugs. Post-2026-04-19 policy: IR correctness is
+     * load-bearing. Lowering or validation failure = abort. */
+    if (node->func_decl.body) {
         IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
-        if (ir) {
-            ir->module_prefix = e->current_module;
-            ir->module_prefix_len = e->current_module_len;
-            if (ir_validate(ir)) {
-                emit_func_from_ir(e, ir);
-                return;
-            }
-            /* Validation failed — fall through to AST emission */
-            fprintf(stderr, "IR validation failed for '%.*s' — falling back to AST emission\n",
-                    (int)node->func_decl.name_len, node->func_decl.name);
+        if (!ir) {
+            fprintf(stderr,
+                    "INTERNAL ERROR: IR lowering returned NULL for '%.*s' "
+                    "at %s:%d — please report with a minimal reproducer.\n",
+                    (int)node->func_decl.name_len, node->func_decl.name,
+                    e->source_file ? e->source_file : "<unknown>",
+                    node->loc.line);
+            abort();
         }
-    }
-
-    /* Async functions get special emission (AST path) */
-    if (node->func_decl.is_async && node->func_decl.body) {
-        emit_async_func(e, node);
+        ir->module_prefix = e->current_module;
+        ir->module_prefix_len = e->current_module_len;
+        if (!ir_validate(ir)) {
+            fprintf(stderr,
+                    "INTERNAL ERROR: IR validation failed for '%.*s' "
+                    "at %s:%d — please report with a minimal reproducer.\n",
+                    (int)node->func_decl.name_len, node->func_decl.name,
+                    e->source_file ? e->source_file : "<unknown>",
+                    node->loc.line);
+            abort();
+        }
+        emit_func_from_ir(e, ir);
         return;
     }
 
@@ -5077,7 +5085,6 @@ void emitter_init(Emitter *e, FILE *out, Arena *arena, Checker *checker) {
     e->out = out;
     e->arena = arena;
     e->checker = checker;
-    e->use_ir = true;  /* IR is default — AST path retained only for --no-ir fallback in zerc_main */
 }
 
 /* ================================================================

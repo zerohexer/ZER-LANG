@@ -1831,3 +1831,96 @@ For pre-release auditing, run multiple rounds. Each round gets more targeted as 
 - Verification step catches agent mistakes (wrong syntax, false positives)
 - Multi-round convergence proves stability — each round finds fewer bugs
 - You get both breadth (agent exploration) and depth (your verification)
+
+## Diff-Based Post-Release Audit (when you suspect drift)
+
+After a large structural change (IR transition, major refactor, multi-session
+work), don't only rely on green tests. Green can mean "test passed" OR "test
+skipped silently" OR "test passed for the wrong reason." The 2026-04-18 audit
+of the 029919e..HEAD diff (141 commits, ~10k new lines) found three real
+issues that no test suite caught. Use this checklist before declaring a
+milestone done.
+
+### The audit protocol (run before claiming a milestone complete)
+
+1. **Stat the diff**: `git diff <anchor>..HEAD --stat | sort -t'|' -k2 -rn` —
+   lists the biggest-delta files first. Focus audit effort there.
+2. **Grep the new code for drift markers**:
+   - `TODO|FIXME|XXX|HACK` in new additions (`git diff <anchor>..HEAD -- file.c | grep "^+" | grep TODO`)
+   - `unhandled|shouldn't happen|should not happen` — default cases that emit garbage if hit
+   - `fprintf\(out|emit\(e,` with comment-only content and no following emit
+3. **Compile a real .zer → emitted C** and grep the output for stray tokens.
+   Dead stubs leave fingerprints: `grep "/\* " output.c | head` catches
+   comment-only emissions with no payload. The 2026-04-18 audit found
+   `/* forward */ ` on line 1 of every multi-module output this way.
+4. **Check skip lists hygiene**: `grep -A2 KNOWN_FAIL tests/test_zer.sh
+   rust_tests/run_tests.sh zig_tests/run_tests.sh`. Every entry must
+   correspond to a still-active issue in `docs/limitations.md`. Entries
+   that refer to bugs since fixed are falsely masking green status.
+5. **Verify every new .c file is linked**: `grep -E "\\.c\\b" Makefile`
+   vs `ls *.c`. Unlinked .c files are either WIP (check the roadmap
+   doc — `docs/IR_Implementation.md` etc.) or forgotten.
+6. **Run `bash tools/walker_audit.sh`** — this catches the #1 silent-bug
+   class (missing NODE_ kind in `emit_rewritten_node`) by cross-referencing
+   the IR emitter against the AST emitter.
+
+### Dead-stub pattern (the most dangerous drift)
+
+A "dead stub" is code that writes a comment prefix but never completes
+the emission:
+
+```c
+/* BAD — prints the comment then exits the branch */
+if (cond) {
+    fprintf(out, "/* forward */ ");
+    /* "The actual definition will follow below" — except it never does */
+}
+```
+
+This pollutes emitted output silently because `/* forward */` followed
+by the next line's real code is still valid C — just ugly. Tests pass.
+grep-for-comments in emitted output catches it.
+
+**Prevention**: when you catch yourself writing a partial emit ("I'll
+fill this in after I finish the loop"), either commit with the emit
+complete OR add a compile-error `#error` so the code can't build. Never
+leave "will follow" stubs.
+
+### Real-code output grep (catches things tests don't)
+
+After any emitter change, run:
+
+```bash
+./zerc some_real_test.zer --emit-c -o /tmp/r.c
+grep -nE "/\* (TODO|forward|unhandled|stub|placeholder) \*/" /tmp/r.c
+grep -nE "^/\* [a-z]+ \*/$" /tmp/r.c   # comment-only lines
+```
+
+Anything matching is a signal: either a dead stub, or a code path that
+fell through an `/* unhandled node %d */0` fallback — both are silent
+miscompiles the test harness can't detect because `0` is a valid C
+literal that compiles clean.
+
+### When WIP files are NOT dead code
+
+Two files in the repo (as of 2026-04-18) compile cleanly but are NOT
+in the Makefile: `zercheck_ir.c` (452 lines) and `vrp_ir.c` (349
+lines). These are Phase 8-9 placeholders per the IR roadmap — the
+IR-native equivalents of the current AST-based `zercheck.c` and VRP.
+**Don't delete them.** The pattern "compile-clean but unlinked" is
+usually intentional WIP; check `docs/future_plans.md` and
+`docs/IR_Implementation.md` before concluding dead code.
+
+### What this audit found (reference for calibration)
+
+2 real bugs + 1 stale skip-list entry in +10,000 lines across 141
+commits. That's ~0.02% defect density, which is what "green tests"
+*should* mean but rarely does without this kind of audit.
+
+Key insight: the bugs weren't in code that had been validated — they
+were in code paths the tests thought they were exercising but weren't.
+`zerc --run` returning 0 for a SIGTRAP'd program (BUG-581 era) and
+`/* forward */` never emitting its body (this audit) both fell into
+the same category: the validation story, not the code, was broken.
+
+When the next "everything passes" milestone happens, run this audit.

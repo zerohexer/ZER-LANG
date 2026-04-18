@@ -1,5 +1,13 @@
 FROM gcc:13
 
+# QEMU + ARM cross-toolchain for rust_tests/qemu/ (MMIO tests that need
+# mapped hardware addresses — can't run on hosted Linux).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        qemu-system-arm \
+        gcc-arm-none-eabi \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /zer
 
 # Copy source files

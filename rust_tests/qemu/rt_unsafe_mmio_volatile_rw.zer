@@ -1,0 +1,21 @@
+// QEMU variant of rt_unsafe_mmio_volatile_rw.
+//
+// Original used STM32 GPIOB base (0x40020000) which isn't mapped on
+// QEMU's lm3s6965evb (Stellaris LM3S). Adapted to Stellaris GPIO_E
+// base (0x40024000) so a volatile read/write actually hits mapped
+// memory and returns cleanly.
+//
+// The compiler behavior being tested is the same — mmio range check,
+// @inttoptr from a range-declared address, volatile qualifier
+// preservation, bit manipulation via indexed access.
+
+mmio 0x40024000..0x40024FFF;
+
+i32 main() {
+    volatile *u32 gpio_odr = @inttoptr(*u32, 0x40024014);
+    // Read-modify-write: set bit 5
+    u32 val = gpio_odr[0];
+    val = val | 32;
+    gpio_odr[0] = val;
+    return 0;
+}

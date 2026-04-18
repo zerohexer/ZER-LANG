@@ -9,13 +9,10 @@ PASS=0
 FAIL=0
 SKIP=0
 
-# Known pre-existing failures surfaced by BUG-581 (--run exit code fix).
-# Previously silently "passed" via swallowed non-zero exit codes.
-# See docs/limitations.md for tracking.
-KNOWN_FAIL=" \
-    rt_unsafe_mmio_multi_reg \
-    rt_unsafe_mmio_volatile_rw \
-"
+# Known pre-existing failures. See docs/limitations.md.
+# Empty — mmio hardware-address tests moved to rust_tests/qemu/ and
+# now run under QEMU Cortex-M3.
+KNOWN_FAIL=""
 
 is_known_fail() {
     for n in $KNOWN_FAIL; do

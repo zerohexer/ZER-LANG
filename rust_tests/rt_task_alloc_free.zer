@@ -1,5 +1,5 @@
-// Rust pattern: Simple new/drop pattern — Task.new() / Task.delete() auto-slab sugar.
-// ZER: Task.new(), use handle, Task.delete(h). POSITIVE.
+// Rust pattern: Simple new/drop pattern — Task.alloc() / Task.free() auto-slab sugar.
+// ZER: Task.alloc(), use handle, Task.free(h). POSITIVE.
 
 struct Job {
     u32 job_id;
@@ -8,7 +8,7 @@ struct Job {
 }
 
 i32 main() {
-    ?Handle(Job) mh = Job.new();
+    ?Handle(Job) mh = Job.alloc();
     Handle(Job) h = mh orelse return;
 
     h.job_id = 1001;
@@ -18,18 +18,18 @@ i32 main() {
     h.status = 1;
 
     if (h.job_id != 1001) {
-        Job.delete(h);
+        Job.free(h);
         return 1;
     }
     if (h.priority != 5) {
-        Job.delete(h);
+        Job.free(h);
         return 1;
     }
     if (h.status != 1) {
-        Job.delete(h);
+        Job.free(h);
         return 1;
     }
 
-    Job.delete(h);
+    Job.free(h);
     return 0;
 }

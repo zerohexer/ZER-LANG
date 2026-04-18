@@ -424,8 +424,8 @@ When considering new features, apply the **primitives test**: if the use case ca
 | zercheck 9a: struct field *opaque tracking | Done | N/A (compile-time) |
 | zercheck 9b: cross-func *T/pointer summary | Done | N/A (compile-time) |
 | zercheck 9c: return freed pointer detection | Done | N/A (compile-time) |
-| Task.new() / Task.delete() (auto-Slab) | Done | Done (auto global Slab per struct) |
-| Task.new_ptr() / Task.delete_ptr() | Done | Done (auto-Slab + alloc_ptr) |
+| Task.alloc() / Task.free() (auto-Slab) | Done | Done (auto global Slab per struct) |
+| Task.alloc_ptr() / Task.free_ptr() | Done | Done (auto-Slab + alloc_ptr) |
 | ZER-CHECK (MAYBE_FREED, leaks, loops) | Done | N/A (analysis pass) |
 | ?FuncPtr (optional function pointers) | Done | Done (null sentinel) |
 | Function pointer typedef | Done | Done |
@@ -621,15 +621,15 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - goto + defer interaction: goto fires all pending defers before jumping (same as return/break/continue). goto/label validation covers switch arms, defer bodies, @critical bodies.
 - **Known limitation (partially resolved):** zercheck is linear (not CFG-based). Same-block backward goto UAF now caught via 2-pass re-walk (2026-04-06). Cross-block backward goto (goto from nested if-body to parent label) still falls back to runtime gen check.
 - **Interior pointer UAF tracking (2026-04-07):** `*u32 p = &b.field; free_ptr(b); p[0]` — field-derived pointer shares alloc_id with parent. When parent freed, all interior pointers marked FREED. NODE_INDEX added to zercheck UAF checks (was missing — only NODE_FIELD and NODE_UNARY/deref were checked). Remaining gap: `@ptrtoint` + math + `@inttoptr` — guarded by mmio declaration requirement, not pointer tracking.
-- `Task.new()` / `Task.delete()` — auto-creates a global `Slab(T)` per struct type. No Slab declaration needed. Returns `?Handle(T)`. `Task.new_ptr()` returns `?*T`. `Task.delete_ptr()` type-checks argument. Auto-slabs emitted after struct declarations, before function bodies (two-pass emission). One auto-Slab per struct type, program-wide.
+- `Task.alloc()` / `Task.free()` — auto-creates a global `Slab(T)` per struct type. No Slab declaration needed. Returns `?Handle(T)`. `Task.alloc_ptr()` returns `?*T`. `Task.free_ptr()` type-checks argument. Auto-slabs emitted after struct declarations, before function bodies (two-pass emission). One auto-Slab per struct type, program-wide.
 - **Emitter two-pass:** `emit_file` now emits struct/enum/union/typedef declarations first (pass 1), then auto-slab globals, then functions/globals (pass 2). This ensures auto-slabs can use `sizeof(StructType)`.
 - **CRITICAL BUG (fixed):** orelse block path (`orelse { return; }`) emitted `0` as final statement expression value for null-sentinel `?*T`. This made ALL `*T = alloc_ptr() orelse { return; }` assign 0 instead of the pointer. The bare form (`orelse return`) was correct — only the block form was broken. Fixed: emit `_zer_tmp` for null-sentinel, `_zer_tmp.value` for struct optional.
 - **Real code finds real bugs:** Writing a 60-line HTTP server in ZER found this orelse bug that 1,700+ tests missed. All tests used bare `orelse return`, none used block `orelse { return; }`. Lesson: write real programs in ZER, not just tests.
 - zercheck now scans defer bodies for free/delete calls — `defer pool.free(h)` no longer triggers false "never freed" warning. Also: if-branch that always exits (return/break/continue) doesn't cause MAYBE_FREED — `if (err) { free(h); return; } use(h);` is correctly seen as safe.
-- **CRITICAL BUG (fixed):** Auto-slab initializer used positional `{sizeof(T), 0, 0, ...}` which put sizeof into wrong field (`pages` instead of `slot_size`). Fix: designated initializer `{ .slot_size = sizeof(T) }`. Same pattern as normal Slab emission. All `Task.new()` was broken until this fix.
+- **CRITICAL BUG (fixed):** Auto-slab initializer used positional `{sizeof(T), 0, 0, ...}` which put sizeof into wrong field (`pages` instead of `slot_size`). Fix: designated initializer `{ .slot_size = sizeof(T) }`. Same pattern as normal Slab emission. All `Task.alloc()` was broken until this fix.
 - **Lesson: always use designated initializers for emitted struct init.** Positional initializers are fragile — field order in `_zer_slab` doesn't match naive assumption. Future emitter code MUST use `.field = value` syntax, never positional.
 - `const Handle(Task)` allows data mutation through auto-deref. Handle is a KEY (like `const int fd`), not a pointer. const key ≠ const data. Assignment checker sets `through_pointer = true` for TYPE_HANDLE in field chain. This also fixes if-unwrap `|t|` + Handle auto-deref (capture is const but data mutation is allowed).
-- zercheck recognizes `Task.delete()` / `Task.delete_ptr()` as free calls (TYPE_STRUCT method detection). Also `Task.new()` / `Task.new_ptr()` as alloc calls. ISR ban applied to Task.new/new_ptr same as slab.alloc.
+- zercheck recognizes `Task.free()` / `Task.free_ptr()` as free calls (TYPE_STRUCT method detection). Also `Task.alloc()` / `Task.alloc_ptr()` as alloc calls. ISR ban applied to Task.alloc/new_ptr same as slab.alloc.
 - Pool/Slab/Arena are NOT the same thing with different names — Pool (fixed, ISR-safe, no malloc), Slab (dynamic, grows via calloc, NOT ISR-safe), Arena (bump allocator, bulk reset). Don't rename or unify them.
 - `pool.get()` is non-storable — `*Task t = pool.get(h)` is a checker error. Must use inline: `pool.get(h).field`. BUT scalar field values CAN be stored: `u32 v = h.value;` works (Handle auto-deref reads the value, not the pointer). Only pointer/slice/struct/union results from get() are blocked.
 - Array→slice auto-coercion at call sites already works: `process(arr)` where `process([]u8 data)` auto-converts `u8[N]` to `[]u8 {ptr, len}`.
@@ -1123,7 +1123,7 @@ Proper:      "Add scope_depth to PathState, find_handle_local for declarations"
 
 These patterns were discovered through repeated mistakes. Follow them to avoid wasting turns.
 
-### Adding New Builtin Methods (alloc_ptr, Task.new, etc.)
+### Adding New Builtin Methods (alloc_ptr, Task.alloc, etc.)
 Every new builtin method requires changes in THREE places:
 1. **Checker** — type-check the call, return correct type, validate args
 2. **Emitter** — emit the correct C code for the call
@@ -1188,12 +1188,12 @@ Unit tests find syntax bugs. REAL CODE finds interaction bugs. After implementin
 2. Compile with `zerc --run` in Docker
 3. If it crashes or gives wrong output → you found a bug unit tests missed
 
-This session's proof: writing a 60-line HTTP server found the orelse block null-sentinel bug that 1,700+ unit tests missed. Testing `Task.new()` with both orelse forms found the auto-slab initializer bug.
+This session's proof: writing a 60-line HTTP server found the orelse block null-sentinel bug that 1,700+ unit tests missed. Testing `Task.alloc()` with both orelse forms found the auto-slab initializer bug.
 
 **Bug patterns found ONLY by real code (not unit tests):**
 - `orelse { return; }` (block form) emitting 0 instead of pointer — tests all used bare `orelse return`
 - Auto-slab `{sizeof(T), 0, 0}` positional init putting sizeof in wrong field — tests used explicit Slab
-- zercheck not recognizing `Task.delete()` as free — tests used `heap.free()` directly
+- zercheck not recognizing `Task.free()` as free — tests used `heap.free()` directly
 - const Handle blocking if-unwrap capture writes — tests didn't combine if-unwrap + Handle + assign
 - `else if` chain emitting `else #line N` (stray # in GCC) — tests had source=NULL, skipping #line
 - `slice = array` assignment missing coercion — tests only used var-decl init, not assignment
@@ -1391,7 +1391,7 @@ Bug-producing pairs (from history): async × orelse, distinct × optional, spawn
 - **zer-lsp** = LSP server (`zer_lsp.c` + all lib sources)
 - Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`, `ir.c/h` (IR data structures + validation), `ir_lower.c` (AST → IR lowering), `zercheck_ir.c` (handle tracking on CFG), `vrp_ir.c` (value range on IR)
 - Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`, `test_fuzz.c`, `tests/test_semantic_fuzz.c`
-- **Semantic fuzzer** (`tests/test_semantic_fuzz.c`): **32 generators** covering every ZER feature — alloc, cast, defer, interior ptr, *opaque, arena wrappers, pool/slab, goto+defer, comptime, handle alias, enum switch, while+break, Task.new, funcptr callback, union capture, ring buffer, nested struct deref, defer+orelse block, packed struct, slice subslice, bool/int cast, signed/unsigned cast, distinct typedef, bit extraction, non-keep escape, arena global escape. 200 tests per `make check` run, verified with 2,500 tests across 5 seeds. **When adding new features, add generator functions** — `gen_safe_<feature>()` + `gen_unsafe_<feature>()` + new case in switch.
+- **Semantic fuzzer** (`tests/test_semantic_fuzz.c`): **32 generators** covering every ZER feature — alloc, cast, defer, interior ptr, *opaque, arena wrappers, pool/slab, goto+defer, comptime, handle alias, enum switch, while+break, Task.alloc, funcptr callback, union capture, ring buffer, nested struct deref, defer+orelse block, packed struct, slice subslice, bool/int cast, signed/unsigned cast, distinct typedef, bit extraction, non-keep escape, arena global escape. 200 tests per `make check` run, verified with 2,500 tests across 5 seeds. **When adding new features, add generator functions** — `gen_safe_<feature>()` + `gen_unsafe_<feature>()` + new case in switch.
 - E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
 - Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
 - Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)

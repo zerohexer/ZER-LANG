@@ -1,23 +1,23 @@
-// Task.new() with both orelse forms — regression test for auto-slab init bug
+// Task.alloc() with both orelse forms — regression test for auto-slab init bug
 
 struct Task { u32 id; u32 priority; }
 struct Sensor { u32 val; }
 
 u32 main() {
     // Handle with bare orelse
-    Handle(Task) t1 = Task.new() orelse return;
+    Handle(Task) t1 = Task.alloc() orelse return;
     t1.id = 10;
 
     // Handle with block orelse
-    Handle(Task) t2 = Task.new() orelse { return 1; };
+    Handle(Task) t2 = Task.alloc() orelse { return 1; };
     t2.id = 20;
 
     // Pointer with bare orelse
-    *Sensor s1 = Sensor.new_ptr() orelse return;
+    *Sensor s1 = Sensor.alloc_ptr() orelse return;
     s1.val = 100;
 
     // Pointer with block orelse
-    *Sensor s2 = Sensor.new_ptr() orelse { return 2; };
+    *Sensor s2 = Sensor.alloc_ptr() orelse { return 2; };
     s2.val = 200;
 
     // Verify all values
@@ -26,9 +26,9 @@ u32 main() {
     if (s1.val != 100) { return 5; }
     if (s2.val != 200) { return 6; }
 
-    Task.delete(t1);
-    Task.delete(t2);
-    Sensor.delete_ptr(s1);
-    Sensor.delete_ptr(s2);
+    Task.free(t1);
+    Task.free(t2);
+    Sensor.free_ptr(s1);
+    Sensor.free_ptr(s2);
     return 0;
 }

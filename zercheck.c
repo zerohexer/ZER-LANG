@@ -349,9 +349,7 @@ static int defer_stmt_is_free(Node *node, char *key_buf, int key_bufsize) {
             const char *method = call->call.callee->field.field_name;
             uint32_t mlen = (uint32_t)call->call.callee->field.field_name_len;
             if ((mlen == 4 && memcmp(method, "free", 4) == 0) ||
-                (mlen == 8 && memcmp(method, "free_ptr", 8) == 0) ||
-                (mlen == 6 && memcmp(method, "delete", 6) == 0) ||
-                (mlen == 10 && memcmp(method, "delete_ptr", 10) == 0)) {
+                (mlen == 8 && memcmp(method, "free_ptr", 8) == 0)) {
                 if (call->call.arg_count > 0) {
                     return handle_key_from_expr(call->call.args[0], key_buf, key_bufsize);
                 }
@@ -414,10 +412,10 @@ static void zc_check_call(ZerCheck *zc, PathState *ps, Node *node) {
         Symbol *sym = scope_lookup(zc->checker->global_scope, pool_name, plen);
         if (sym) pool_type = sym->type;
     }
-    /* Task.delete(h) / Task.delete_ptr(p) — auto-Slab free via struct method */
+    /* Task.free(h) / Task.free_ptr(p) — auto-Slab free via struct method */
     if (pool_type && pool_type->kind == TYPE_STRUCT) {
-        if ((mlen == 6 && memcmp(method, "delete", 6) == 0) ||
-            (mlen == 10 && memcmp(method, "delete_ptr", 10) == 0)) {
+        if ((mlen == 4 && memcmp(method, "free", 4) == 0) ||
+            (mlen == 8 && memcmp(method, "free_ptr", 8) == 0)) {
             if (node->call.arg_count > 0) {
                 const char *hkey;
                 int hklen = handle_key_arena(zc, node->call.args[0], &hkey);
@@ -667,9 +665,7 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
         uint32_t mlen = (uint32_t)alloc_call->call.callee->field.field_name_len;
 
         if (((mlen == 5 && memcmp(method, "alloc", 5) == 0) ||
-             (mlen == 9 && memcmp(method, "alloc_ptr", 9) == 0) ||
-             (mlen == 3 && memcmp(method, "new", 3) == 0) ||
-             (mlen == 7 && memcmp(method, "new_ptr", 7) == 0)) &&
+             (mlen == 9 && memcmp(method, "alloc_ptr", 9) == 0)) &&
             obj->kind == NODE_IDENT) {
             /* check if object is Pool/Slab (not Arena — arena allocs don't need individual free) */
             Type *obj_type = checker_get_type(zc->checker, obj);
@@ -1104,9 +1100,7 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                 const char *mn = cc->field.field_name;
                 uint32_t ml = (uint32_t)cc->field.field_name_len;
                 if ((ml == 4 && memcmp(mn, "free", 4) == 0) ||
-                    (ml == 8 && memcmp(mn, "free_ptr", 8) == 0) ||
-                    (ml == 6 && memcmp(mn, "delete", 6) == 0) ||
-                    (ml == 10 && memcmp(mn, "delete_ptr", 10) == 0))
+                    (ml == 8 && memcmp(mn, "free_ptr", 8) == 0))
                     is_free_site = true;
             }
             /* Also skip if callee has a summary or heuristic that frees params */

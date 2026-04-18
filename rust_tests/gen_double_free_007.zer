@@ -4,10 +4,10 @@
 struct Session { u32 id; }
 
 u32 main() {
-    ?Handle(Session) mh = Session.new();
+    ?Handle(Session) mh = Session.alloc();
     Handle(Session) h = mh orelse return;
     h.id = 1;
-    Session.delete(h);
-    Session.delete(h);
+    Session.free(h);
+    Session.free(h);
     return 0;
 }

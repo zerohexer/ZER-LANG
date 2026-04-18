@@ -2148,42 +2148,41 @@ static void route_alloc_to_ptr_if_needed(Checker *c, Node *call, Type *target) {
     }
     if (!eff || eff->kind != TYPE_POINTER) return;
 
-    /* Only rewrite base names — don't double-suffix an already _ptr form. */
+    /* Only rewrite the base "alloc" name — don't double-suffix an already
+     * _ptr form. After the 2026-04-19 rename, Task sugar and Slab both use
+     * `alloc`/`free` as their canonical verbs. */
     const char *base = NULL;
     int base_len = 0;
     uint32_t name_len = (uint32_t)callee->field.field_name_len;
-    bool is_new = (name_len == 3 && memcmp(callee->field.field_name, "new", 3) == 0);
-    bool is_alloc = (name_len == 5 && memcmp(callee->field.field_name, "alloc", 5) == 0);
-    if (is_new) {
-        base = "new"; base_len = 3;
-    } else if (is_alloc) {
+    if (name_len == 5 && memcmp(callee->field.field_name, "alloc", 5) == 0) {
         base = "alloc"; base_len = 5;
     }
     if (!base) return;
 
-    /* Receiver discriminant: Task.new/new_ptr is on a struct TYPE (ident
-     * resolving to TYPE_STRUCT); slab.alloc/alloc_ptr is on a Slab value.
-     * Arena.alloc is on an Arena value — SKIP (no _ptr form).
+    /* Receiver discriminant: Task.alloc/alloc_ptr is on a struct TYPE
+     * (ident resolving to TYPE_STRUCT); slab.alloc/alloc_ptr is on a Slab
+     * value. Arena.alloc is on an Arena value — SKIP (no _ptr form).
      * Pool.alloc is on a Pool value — SKIP (no _ptr form). */
     Node *obj = callee->field.object;
     if (!obj) return;
-    /* Peek at object type via check_expr (idempotent). For struct-type
-     * idents we need scope_lookup to classify as type-reference. */
-    if (is_new) {
-        /* Task.new(): object must be a struct type name (not a value). */
-        if (obj->kind != NODE_IDENT) return;
+    bool is_struct_type_ref = false;
+    bool is_slab_value = false;
+    if (obj->kind == NODE_IDENT) {
         Symbol *sym = scope_lookup(c->current_scope,
             obj->ident.name, (uint32_t)obj->ident.name_len);
-        if (!sym || !sym->type) return;
-        Type *stype = type_unwrap_distinct(sym->type);
-        if (!stype || stype->kind != TYPE_STRUCT) return;
-    } else if (is_alloc) {
-        /* slab.alloc(): object must be a Slab value. Arena/Pool skip. */
-        Type *ot = check_expr(c, obj);
-        if (!ot) return;
-        Type *oeff = type_unwrap_distinct(ot);
-        if (!oeff || oeff->kind != TYPE_SLAB) return;
+        if (sym && sym->type) {
+            Type *stype = type_unwrap_distinct(sym->type);
+            if (stype && stype->kind == TYPE_STRUCT) is_struct_type_ref = true;
+        }
     }
+    if (!is_struct_type_ref) {
+        Type *ot = check_expr(c, obj);
+        if (ot) {
+            Type *oeff = type_unwrap_distinct(ot);
+            if (oeff && oeff->kind == TYPE_SLAB) is_slab_value = true;
+        }
+    }
+    if (!is_struct_type_ref && !is_slab_value) return;
 
     /* Write "{base}_ptr" into an arena-allocated buffer. */
     int new_len = base_len + 4;  /* _ptr */
@@ -2208,9 +2207,7 @@ static void route_free_to_ptr_if_needed(Checker *c, Node *call) {
     uint32_t name_len = (uint32_t)callee->field.field_name_len;
     const char *base = NULL;
     int base_len = 0;
-    if (name_len == 6 && memcmp(callee->field.field_name, "delete", 6) == 0) {
-        base = "delete"; base_len = 6;
-    } else if (name_len == 4 && memcmp(callee->field.field_name, "free", 4) == 0) {
+    if (name_len == 4 && memcmp(callee->field.field_name, "free", 4) == 0) {
         base = "free"; base_len = 4;
     }
     if (!base) return;
@@ -3977,53 +3974,53 @@ static Type *check_expr(Checker *c, Node *node) {
                 break;
             }
 
-            /* Task.new() / Task.delete() — auto-Slab sugar */
+            /* Task.alloc() / Task.free() — auto-Slab sugar */
             obj = type_unwrap_distinct(obj);
             if (obj->kind == TYPE_STRUCT) {
-                /* V3: route Task.delete(arg) to Task.delete_ptr when arg is *T. */
+                /* V3: route Task.free(arg) to Task.free_ptr when arg is *T. */
                 route_free_to_ptr_if_needed(c, node);
                 mname = node->call.callee->field.field_name;
                 mlen = (uint32_t)node->call.callee->field.field_name_len;
-                if (mlen == 3 && memcmp(mname, "new", 3) == 0) {
-                    check_isr_ban(c, node->loc.line, "Task.new()");
+                if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
+                    check_isr_ban(c, node->loc.line, "Task.alloc()");
                     if (node->call.arg_count != 0)
-                        checker_error(c, node->loc.line, "%.*s.new() takes no arguments",
+                        checker_error(c, node->loc.line, "%.*s.alloc() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
                     find_or_create_auto_slab(c, obj);
                     result = type_optional(c->arena, type_handle(c->arena, obj));
                     typemap_set(c, field_node, result);
                     break;
                 }
-                if (mlen == 7 && memcmp(mname, "new_ptr", 7) == 0) {
-                    check_isr_ban(c, node->loc.line, "Task.new_ptr()");
+                if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
+                    check_isr_ban(c, node->loc.line, "Task.alloc_ptr()");
                     if (node->call.arg_count != 0)
-                        checker_error(c, node->loc.line, "%.*s.new_ptr() takes no arguments",
+                        checker_error(c, node->loc.line, "%.*s.alloc_ptr() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
                     find_or_create_auto_slab(c, obj);
                     result = type_optional(c->arena, type_pointer(c->arena, obj));
                     typemap_set(c, field_node, result);
                     break;
                 }
-                if (mlen == 6 && memcmp(mname, "delete", 6) == 0) {
-                    /* Task.delete(h) → void — same as slab.free(h) */
+                if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                    /* Task.free(h) → void — same as slab.free(h) */
                     if (node->call.arg_count != 1)
-                        checker_error(c, node->loc.line, "%.*s.delete() takes exactly 1 argument",
+                        checker_error(c, node->loc.line, "%.*s.free() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
                     result = ty_void;
                     typemap_set(c, field_node, result);
                     break;
                 }
-                if (mlen == 10 && memcmp(mname, "delete_ptr", 10) == 0) {
-                    /* Task.delete_ptr(p) → void — same as slab.free_ptr(p) */
+                if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
+                    /* Task.free_ptr(p) → void — same as slab.free_ptr(p) */
                     if (node->call.arg_count != 1)
-                        checker_error(c, node->loc.line, "%.*s.delete_ptr() takes exactly 1 argument",
+                        checker_error(c, node->loc.line, "%.*s.free_ptr() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
                     if (node->call.arg_count == 1) {
                         Type *arg_t = check_expr(c, node->call.args[0]);
                         Type *expected = type_pointer(c->arena, obj);
                         if (arg_t && !type_equals(type_unwrap_distinct(arg_t), type_unwrap_distinct(expected))) {
                             checker_error(c, node->loc.line,
-                                "%.*s.delete_ptr() expects '*%.*s', got '%s'",
+                                "%.*s.free_ptr() expects '*%.*s', got '%s'",
                                 (int)obj->struct_type.name_len, obj->struct_type.name,
                                 (int)obj->struct_type.name_len, obj->struct_type.name,
                                 type_name(arg_t));
@@ -6122,14 +6119,12 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         for (int i = 0; i < node->call.arg_count; i++)
             scan_func_props(c, node->call.args[i], parent_sym);
 
-        /* Detect alloc: slab.alloc(), slab.alloc_ptr(), Task.new(), Task.new_ptr() */
+        /* Detect alloc: slab.alloc(), slab.alloc_ptr(), Task.alloc(), Task.alloc_ptr() */
         if (node->call.callee && node->call.callee->kind == NODE_FIELD) {
             const char *mn = node->call.callee->field.field_name;
             uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
             if ((ml == 5 && memcmp(mn, "alloc", 5) == 0) ||
-                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) ||
-                (ml == 3 && memcmp(mn, "new", 3) == 0) ||
-                (ml == 7 && memcmp(mn, "new_ptr", 7) == 0))
+                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0))
                 parent_sym->props.can_alloc = true;
         }
 

@@ -1,12 +1,12 @@
 // Rust pattern: simple new/drop sugar — like Rust's Box::new / implicit drop.
-// ZER: Task.new() / Task.delete() — auto-slab sugar.
+// ZER: Task.alloc() / Task.free() — auto-slab sugar.
 
 struct Entity { u32 id; u32 health; u32 damage; }
 
 u32 main() {
-    ?Handle(Entity) me = Entity.new();
+    ?Handle(Entity) me = Entity.alloc();
     Handle(Entity) e = me orelse return;
-    defer Entity.delete(e);
+    defer Entity.free(e);
 
     e.id = 1;
     e.health = 100;

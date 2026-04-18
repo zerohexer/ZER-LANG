@@ -25,7 +25,9 @@ EMITTER="emitter.c"
 AST_START=$(grep -n '^static void emit_expr(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
 IR_START=$(grep -n '^static void emit_rewritten_node(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
 # Function-body switch ends where the next top-level function begins.
-AST_END=$(grep -n '^static void emit_stmt(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
+# emit_stmt was removed 2026-04-19 (IR-only for function bodies) — use the
+# next definition in the file instead.
+AST_END=$(grep -n '^static void emit_defers_from(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
 IR_END=$(grep -n '^static void emit_ir_inst(Emitter' "$EMITTER" | head -1 | cut -d: -f1)
 
 AST_CASES=$(mktemp)

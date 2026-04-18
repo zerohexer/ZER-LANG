@@ -148,11 +148,11 @@ file.zer:3: error: array index 10 is out of bounds for array of size 4
 
 **Emitter:** `NODE_GOTO` → `goto label;`. `NODE_LABEL` → `label:;` (empty statement after colon for C compliance). Direct pass-through to C — no transformation needed.
 
-**Design:** Both forward and backward goto allowed. Safe because: (1) auto-zero prevents uninitialized memory from skipped declarations, (2) defer fires before every goto (emitter calls `emit_defers(e)` before `goto label;`). The only restriction is no goto inside defer blocks.
+**Design:** Both forward and backward goto allowed. Safe because: (1) auto-zero prevents uninitialized memory from skipped declarations, (2) defer fires before every goto (IR path emits `IR_DEFER_FIRE` before the goto). The only restriction is no goto inside defer blocks.
 
 **Audit fixes (2026-04-04):**
 - `collect_labels()` / `validate_gotos()` now recurse into NODE_SWITCH arms, NODE_DEFER body, NODE_CRITICAL body (was missing — labels inside switch arms were invisible).
-- `NODE_GOTO` emitter now calls `emit_defers(e)` before emitting `goto` — defers fire on goto same as return/break/continue.
+- `NODE_GOTO` lowering emits `IR_DEFER_FIRE` before the goto so defers fire on goto same as return/break/continue.
 
 **Known limitation:** zercheck is linear — backward goto UAF (`free(h); goto retry;` looping back) not caught at compile time. Runtime gen check catches it. Full CFG analysis would require ~500+ lines of refactoring zercheck to work on control-flow graphs instead of linear statement lists.
 
@@ -311,7 +311,7 @@ This makes `eval_const_expr` work universally for comptime results — no specia
 2. `eval_const_expr(cond)` — evaluates literals and binary expressions
 3. Const ident fallback — looks up `is_const` symbol init value + `call.is_comptime_resolved`
 
-**Also:** After resolution, checker sets `cond->kind = NODE_INT_LIT` so emitter's `eval_const_expr` in `emit_stmt(NODE_IF)` correctly strips dead branches.
+**Also:** After resolution, checker sets `cond->kind = NODE_INT_LIT` so the IR lowering of NODE_IF can evaluate the condition as a constant and strip the dead branch at lowering time.
 
 ### *opaque Test Coverage (2026-04-05)
 
@@ -470,14 +470,6 @@ Auto-guard `if (idx >= size) { return 0; }` in a function returning struct/union
 **Design decision:** The `?` prefix is inherently ambiguous for raw function pointer declarations. The typedef rule resolves it: at typedef you specify the *signature* (including optional return), and at usage sites you wrap the *pointer* (including nullable). Both `?RetType` and `?FuncPtr` are expressible — just through different syntax paths.
 
 **Implementation:** `parse_funcptr_with_opt(p, type, &name, &len, is_typedef)` helper enforces the invariant in one place. All 6 funcptr declaration sites call it with `is_typedef=false` (local/global/field/param) or `is_typedef=true` (typedef/distinct typedef). The helper unwraps+re-wraps `?` for non-typedef sites, passes through for typedef sites.
-
-### Else-If Chain #line Directive (BUG-418, 2026-04-05)
-
-`if (a) { } else if (b) { }` emitted `else #line N "file"` on the same line — GCC error "stray '#' in program." Root cause: `emit_stmt` emits `#line` before each non-block statement. When else_body is NODE_IF, the `#line` follows `else ` without a newline.
-
-**Fix:** Both regular-if and if-unwrap else paths: when `else_body->kind == NODE_IF && e->source_file`, emit `"else\n"` instead of `"else "`. Same class of bug as BUG-396 (orelse defer #line).
-
-**Pattern:** Any site that emits text followed by `emit_stmt()` on the same line risks `#line` collision when source mapping is active. The text before `emit_stmt` must end with `\n` if the child statement might emit `#line`.
 
 ### Array→Slice Coercion Missing in Assignment (BUG-419, 2026-04-05)
 
@@ -1554,7 +1546,7 @@ With `--track-cptrs`, `*opaque` is `_zer_opaque` struct (not `void*`). C can't c
 **Summary:** Fifth Gemini audit. 3 real bugs (BUG-482/483/484), 2 false.
 
 ### BUG-482: Async struct names module-mangled
-`_zer_async_init` collides when two modules have `async void init()`. Fix: `emit_async_func` builds mangled name `module__funcname` at top, uses throughout all `_zer_async_` emissions. Same pattern as `EMIT_MANGLED_NAME`.
+`_zer_async_init` collides when two modules have `async void init()`. Fix: `emit_async_func_from_ir` builds mangled name `module__funcname` at top, uses throughout all `_zer_async_` emissions. Same pattern as `EMIT_MANGLED_NAME`.
 
 ### BUG-483: Condvar init inside CAS winner path
 `_zer_mtx_ensure_init` sets `inited=1`, then `if (!inited) condvar_init()` is always false — condvar never initialized. Fix: `_zer_mtx_ensure_init_cv(mtx, inited, cond)` initializes condvar alongside mutex in CAS winner. `_zer_mtx_ensure_init` is wrapper calling `_cv(..., NULL)`. Semaphore acquire/release pass `&s->_zer_cond`.
@@ -1589,7 +1581,7 @@ The auto-lock is on the DATA (shared struct's mutex), not on the thread creation
 
 **Architecture (same as Rust's MIR generator transform):**
 1. `prescan_async_temps(e, body)` — recursive pre-scan finds NODE_ORELSE with block fallback in async body. Records `AsyncTemp` entries with type + temp_id.
-2. `emit_async_func` adds `_zer_async_tmpN` fields to state struct typedef.
+2. `emit_async_func_from_ir` adds `_zer_async_tmpN` fields to the state struct typedef.
 3. In async var-decl orelse path: split GCC statement expression into separate statements using `self->_zer_async_tmpN`. Temp survives yield.
 
 Non-async code unchanged (efficient GCC statement expression). No language restriction — yield inside orelse blocks now works correctly.
@@ -1803,7 +1795,7 @@ When array index is not proven by range propagation, compiler auto-inserts `if (
 
 **Checker:** `mark_auto_guard(c, node, array_size)` stores in `auto_guards` array. `checker_auto_guard_size()` exposed to emitter. Warning emitted so programmer can add explicit guard for zero overhead.
 
-**Emitter:** `emit_auto_guards(e, node)` walks expression tree, finds auto-guarded NODE_INDEX, emits `if` guard as preceding statement. Called from emit_stmt for NODE_EXPR_STMT, NODE_VAR_DECL, NODE_RETURN. Uses `emit_zero_value()` for return type's zero value. Runtime `_zer_bounds_check` stays as belt-and-suspenders backup.
+**Emitter:** `emit_auto_guards(e, node)` walks expression tree, finds auto-guarded NODE_INDEX, emits `if` guard as preceding statement. Called from the IR emitter per IR_ASSIGN whose `expr` may contain an auto-guarded index. Uses `emit_zero_value()` for return type's zero value. Runtime `_zer_bounds_check` stays as belt-and-suspenders backup.
 
 ## Auto-Keep, @cstr Auto-Orelse, Provenance Extensions
 
@@ -1886,7 +1878,7 @@ Every ZER concurrency feature is a **language primitive** (keyword, intrinsic, o
 12. **`is_null_sentinel()` must unwrap TYPE_DISTINCT** — `?DistinctFuncPtr` must be treated as null sentinel. Use `is_null_sentinel(type)` function, not `IS_NULL_SENTINEL(kind)` macro.
 13. **NODE_SLICE must use named typedefs for ALL primitives** — not just u8/u32. Anonymous structs create type mismatches with named `_zer_slice_T`.
 14. **Struct field lookup must error on miss** — don't silently return ty_void (old UFCS fallback). Same for field access on non-struct types.
-15. **If-unwrap and switch capture defer scope** — these paths unwrap blocks to inject captures. Must save `defer_stack.count` before, emit `emit_defers_from()` after, then restore count. Without this, defers fire at function exit instead of block exit.
+15. **If-unwrap and switch capture defer scope** — the IR lowering path saves `ctx->defer_count` at block entry, emits `IR_DEFER_FIRE` with `cond_local = base` at block exit, then restores the count. See `emit_defer_fire_scoped` in ir_lower.c. (The old AST `emit_defers_from(e, base)` helper was removed with emit_stmt.)
 16. **Use `type_unwrap_distinct(t)` helper for ALL type dispatch** — defined in `types.h`. Applies to: emit_type inner switches (optional, slice, optional-slice element), NODE_FIELD handler (struct/union/pointer dispatch), switch exhaustiveness checks, auto-zero paths (global + local), intrinsic validation, NODE_SLICE expression emission. Always unwrap: `Type *inner = type_unwrap_distinct(t);`. Never write the unwrap manually.
 17. **ZER-CHECK must track Handle parameters** — `zc_check_function` scans params for TYNODE_HANDLE and registers as HS_ALIVE. Without this, use-after-free on param handles goes undetected.
 18. **`[]bool` needs TYPE_BOOL in all slice type switches** — bool = uint8_t, maps to `_zer_slice_u8`. Missing from any emit_type slice switch causes anonymous struct mismatch.
@@ -2036,9 +2028,6 @@ Every ZER concurrency feature is a **language primitive** (keyword, intrinsic, o
 
 ### Const Global Division Guard (BUG-395)
 `const u32 MAP_SIZE = 16; h % MAP_SIZE` falsely errored "not proven nonzero." Two root causes: (1) `eval_const_expr` (in ast.h) doesn't resolve `NODE_IDENT` — it only handles literals and binary ops. (2) `sym->func_node` was never set for `NODE_GLOBAL_VAR` in `register_decl`, so the const init lookup had nothing to read. Fix: add const symbol init lookup in both `/` `%` (NODE_BINARY) and `/=` `%=` (NODE_ASSIGN) division guard paths. Also set `sym->func_node = node` for global vars in `register_decl`. **Pattern for future const lookups:** scope_lookup the ident → check `is_const` + `func_node` → read `func_node->var_decl.init` → `eval_const_expr(init)`.
-
-### #line Directive in Orelse Defer (BUG-396)
-`emit(e, "{ "); emit_defers(e);` emitted `#line` on the same line as `{` — GCC requires `#line` at the start of a line. Fix: change all `"{ "` to `"{\n"` before `emit_defers`/`emit_defers_from`. 6 sites: var-decl orelse return (1), auto-guard return (2), orelse break (1), orelse continue (1). **Pattern:** never emit code + `emit_defers` on the same line when `source_file` is set (defers call `emit_stmt` which emits `#line`).
 
 ### Windows `zerc --run` GCC Quoting (BUG-397)
 `system("\"gcc\" -std=c99 ...")` fails on Windows `cmd.exe` — outer quotes treated as the entire command string. Fix: only quote gcc_path when it contains spaces (bundled GCC path). Plain `gcc` from system PATH emitted without quotes. Same fix for run command: `.\hash_map.exe` not `.\"hash_map.exe"`.
@@ -2562,7 +2551,7 @@ When a variable is initialized from `arena.alloc(T)` (including through orelse),
 `types.h` provides `type_unwrap_distinct(Type *t)` — returns `t->distinct.underlying` if TYPE_DISTINCT, otherwise `t` unchanged. Call this before ANY `switch (type->kind)` that maps to named typedefs or validates type categories. This was the #1 bug pattern (BUG-074, 088, 089, 104, 105, 110). Never write `if (t->kind == TYPE_DISTINCT) t = t->distinct.underlying;` manually — use the helper.
 
 **12. If-unwrap and switch capture arms must manage their own defer scope.**
-These code paths unwrap the block body to inject capture variables. Without saving/restoring `defer_stack.count`, defers inside the block accumulate at function scope and fire at function exit instead of block exit. Save `defer_base` before emitting block contents, call `emit_defers_from(e, defer_base)` after, restore count.
+In the IR path: save `ctx->defer_count` at arm entry, emit scoped `IR_DEFER_FIRE` with `cond_local = base` + `src2_local = 1` (no-pop) at arm exit, then restore the count. See `emit_defer_fire_scoped` in ir_lower.c. Without this, defers inside the block would fire at function exit instead of block exit.
 
 **13. `@cast` supports wrap AND unwrap — both directions.**
 `@cast(Celsius, u32_val)` wraps underlying → distinct. `@cast(u32, celsius_val)` unwraps distinct → underlying. Cross-distinct (`@cast(Fahrenheit, celsius_val)`) is rejected. The old code only allowed wrapping (target must be distinct).
@@ -3429,8 +3418,8 @@ This is invisible to the programmer — no annotation needed. The compiler enfor
 ## @cstr Overflow Auto-Return
 
 Previously, `@cstr` buffer overflow (source slice too long for destination) called `_zer_trap()`. Now it uses the same `emit_zero_value()` pattern as bounds auto-guard:
-- If destination buffer too small: emit `if (src.len + 1 > dest_size) { emit_defers(); return <zero_value>; }` instead of trap.
-- `emit_defers()` is called before the return so pending defers fire on this path.
+- If destination buffer too small: emit `if (src.len + 1 > dest_size) { /* fire defers */ return <zero_value>; }` instead of trap.
+- IR path emits `IR_DEFER_FIRE` before the synthesized return so pending defers fire on this path.
 - Applies to both array destination and slice destination overflow checks.
 
 ## *opaque Array Homogeneous Provenance
@@ -3783,7 +3772,7 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 6. `emit_auto_guards` — bounds check guard emission
 7. `emit_top_level_decl` — top-level declaration emission
 
-**Remaining with intentional `default:`:** `emit_expr` (emits `/* unhandled expr */` diagnostic), `emit_stmt` (emits `/* unhandled stmt */` diagnostic), `resolve_type_for_emit` (returns `ty_void` fallback). These are safe — unknown nodes produce visible output in emitted C, not silent skips.
+**Remaining with intentional `default:`:** `emit_expr` (emits `/* unhandled expr */` diagnostic — only used for top-level constant expressions now), `emit_rewritten_node` (emits `/* unhandled node %d */0` — IR passthrough path), `resolve_type_for_emit` (returns `ty_void` fallback). These are safe — unknown nodes produce visible output in emitted C, not silent skips.
 
 **Total: 7 exhaustive walkers.** GCC `-Wswitch` warns on ALL of them when a new NODE_ type is added.
 

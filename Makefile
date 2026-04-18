@@ -92,6 +92,10 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash zig_tests/run_tests.sh ./zerc
 	@echo "=== Conversion tool tests ==="
 	@bash tests/test_convert.sh
+	@echo "=== Walker audit (IR vs AST emitter parity) ==="
+	@bash tools/walker_audit.sh
+	@echo "=== Emit audit (dead-stub fingerprints) ==="
+	@bash tools/emit_audit.sh ./zerc
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

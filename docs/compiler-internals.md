@@ -4343,3 +4343,105 @@ honestly surfacing the remaining issues.
 
 When fixing a `KNOWN_FAIL` entry, REMOVE it from the list. Don't leave
 entries for tests that now pass — otherwise real regressions slip through.
+
+## BUG-590 through BUG-593 (2026-04-18)
+
+Four more bugs surfaced by BUG-581's exit-code fix + one pre-existing
+comptime float gap, documented together because they share a root
+cause: stale tests became visible only after exit codes were honest.
+
+### BUG-590 group: variable shadowing + NODE_BLOCK defer semantics
+
+IR's flat local namespace had no scope concept. Inner `Handle h`
+shadowing outer `Handle h` dedup'd or got a suffixed name, then
+`ir_find_local` LAST-MATCH returned the (freed) inner local for
+outer references after the block closed → UAF.
+
+**Fix** added to IR:
+- `IRLocal.scope_depth` set at creation from `IRFunc.current_scope`
+- `IRLocal.hidden` bit marked on locals when NODE_BLOCK exits
+- `ir_find_local` prefers non-hidden matches; falls back to LAST
+  hidden match (preserves emitter-pass lookups outside normal flow)
+- `ir_add_local` creates a suffixed local when name+type exists at
+  a different scope_depth
+- `NODE_BLOCK` in ir_lower increments/decrements `current_scope`
+  and fires scoped defers at block exit — mirror of loops' POP_ONLY
+  bb_post pattern so early-exit paths (break/continue/return/
+  orelse-return) with earlier block IDs still find defers on the
+  emit-time stack
+- `LowerCtx.block_defers_managed` — when an outer construct
+  (loop/if/switch arm) already manages defers, it sets this flag
+  before calling `lower_stmt(body)`, suppressing NODE_BLOCK's own
+  fire to avoid double-firing
+
+The cascade effect: once defer-at-block-exit worked, four more
+rust_tests started passing as a side effect (rt_defer_order_lifo,
+rt_drop_count_3, rt_drop_trait_basic, rt_conc_ring_full_drop).
+
+### BUG-591: `await` condition not re-evaluated on resume
+
+`IR_AWAIT` lowering emitted cond eval instructions into the current
+block THEN `IR_AWAIT` (which places `case N:;`). On resume, the
+switch-case entry landed BELOW the evaluation → stale cond_local.
+
+**Fix**: IR_AWAIT carries the cond AST on `inst->expr`
+(cond_local=-1 as sentinel). Emitter emits `case N:;` followed by
+a fresh `emit_rewritten_node(cond)` on every poll.
+
+### BUG-592: signed vs unsigned comparison
+
+`signed_local < 0` evaluated `false` for negative values because
+the `0` literal had type `uint32_t` (or `uint64_t`), and C's usual
+arithmetic conversion promoted the signed operand to unsigned.
+
+Two-pronged fix in the IR emitter:
+1. `IR_LITERAL` emits `(DstType)N` cast instead of `N_ULL`, so the
+   temp holds exactly the target's type (signed if target is signed).
+2. `IR_BINOP` detects comparison with signed/unsigned mismatch and
+   inserts a cast of the unsigned side to the signed side's type.
+
+### BUG-593: comptime float eval short-circuit
+
+`check_call` at `checker.c:4243` ran `eval_comptime_block`
+unconditionally. Float args are stored in `ComptimeParam.value` as
+int64 bit-patterns (memcpy of double). `eval_comptime_block`
+evaluated the body as INTEGER arithmetic: `return x * x` did int
+multiply on the raw bits of 5.0, producing garbage, not
+`CONST_EVAL_FAIL`. Because the result was non-FAIL, the success
+branch ran, setting `is_comptime_resolved=true` with
+`comptime_value=<garbage>` — so the float eval path was never reached.
+
+**Fix**: before calling `eval_comptime_block`, check the function's
+return type. If `f32`/`f64`, skip integer eval entirely and fall
+through to the float branch which uses `eval_comptime_float_expr`.
+
+### The per-declaration `@once` semantic
+
+Two tests in the BUG-590 session had wrong expectations — they
+called multiple `@once` blocks and expected them to share state.
+ZER's `@once` is per-declaration (matches Rust's `std::sync::Once`):
+each `@once { body }` gets its OWN flag. To fire once across
+multiple invocations, wrap `@once` in a helper function and call
+the helper multiple times.
+
+## Audit protocol for large structural changes (2026-04-18)
+
+After the IR transition audit (diff 029919e..HEAD, 141 commits,
++10k lines) found 3 real issues that green tests had missed, a
+formal diff-based audit protocol was added to CLAUDE.md. Summary:
+
+1. `git diff <anchor>..HEAD --stat` — rank files by change size
+2. Grep new code for TODO/FIXME/HACK/unhandled/"shouldn't happen"
+3. Compile real `.zer` files with `--emit-c` and grep output for
+   stray comments (catches dead-stub pattern)
+4. Check all 3 `KNOWN_FAIL` lists for entries to remove
+5. Verify every new `.c` file is in the Makefile (unlinked files
+   are WIP per roadmap, or forgotten)
+6. Run `bash tools/walker_audit.sh` for NODE_ kind gaps
+
+The dead-stub pattern is the most pernicious drift: code that writes
+a comment prefix but never emits the payload. `/* forward */` in
+every multi-module output went unnoticed for ~4 weeks because the
+emitted C still compiled — the comment was just ugly, not broken.
+
+Full protocol details in CLAUDE.md "Diff-Based Post-Release Audit".

@@ -5,6 +5,84 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-18 (late, part 4) — Full diff audit 029919e..HEAD
+
+After BUG-579/581-589/590-593 a full audit of the IR-transition diff was
+run (141 commits, ~10,000 new lines: emitter.c +3217, ir_lower.c +2618,
+ir.c/ir.h +820, zercheck_ir.c 452, vrp_ir.c 349). Three real issues
+found; rest of the new code was correct.
+
+### Audit finding 1: dead `/* forward */` stub in zerc_main.c
+
+**Symptom**: Every multi-module emitted C file had `/* forward */ ` at
+the start of line 1 (before the real header comment). 13 test_modules
+outputs contained the stray comment.
+
+**Root cause**: `zerc_main.c:536-557` ran a loop over imported modules'
+non-static GLOBAL_VAR declarations, set up emitter state, and called
+`fprintf(out, "/* forward */ ")` — then did nothing. The comment said
+"Emit as: extern TYPE MODULE__NAME" but the emission was never written.
+Half-finished code that pollutes output.
+
+**Fix**: Remove the entire loop. The topological emit loop already
+orders modules dependencies-first, so no forward declarations are
+needed — the real definitions always precede their users.
+
+### Audit finding 2: `topo_order` leak on `--emit-ir`
+
+**Symptom**: `free(topo_order)` was missing from two return paths in
+the `--emit-ir` early-exit block. Cosmetic leak (process exits), but
+inconsistent with how other early-exits in the same file clean up.
+
+**Fix**: Added `free(topo_order)` before each return in the
+`emit_ir` block.
+
+### Audit finding 3: stale `handle_shadow_scope` skip
+
+**Symptom**: `KNOWN_FAIL_POSITIVE` in `tests/test_zer.sh` still
+listed `handle_shadow_scope`, which was skipped with a
+"pre-existing failure" note. After BUG-590 (scope-aware
+`ir_find_local` + `IRLocal.hidden`) the test actually passes.
+
+**Fix**: Removed from skip list. `KNOWN_FAIL_POSITIVE` is now empty
+— every `tests/zer/` positive test compiles + runs + exits 0
+(288/288).
+
+### Intentionally not fixed (not dead code)
+
+- `zercheck_ir.c` (452 lines) + `vrp_ir.c` (349 lines) compile cleanly
+  but are NOT linked into `zerc`. They are unfinished Phase 8-9 work
+  per the IR roadmap (`docs/IR_Implementation.md`) — the IR-native
+  equivalents of `zercheck.c` + VRP-on-AST. Leave as WIP placeholders.
+- `IR_SPAWN` / `IR_LOCK` / `IR_UNLOCK` emitter TODO stubs — the
+  opcodes exist in the enum + name tables, but `ir_lower` never
+  produces them (spawn / lock flow through `IR_NOP` + AST
+  passthrough). Fully removing them would touch 3 files for zero
+  functional gain. Left as markers.
+
+### Audit methodology (for future sessions)
+
+The diff-based audit technique that surfaced these findings:
+
+1. `git diff <anchor>..HEAD --stat` — identify biggest-delta files
+2. For each hot file (emitter.c, ir_lower.c, new files) spot-check
+   the diff: look for TODO / FIXME / HACK / "shouldn't happen" /
+   "unhandled" markers added in the new code.
+3. Compile a few real-world tests with `--emit-c` and grep the
+   output for unexpected tokens. Stray comments like `/* forward */`
+   are the smoking gun for dead-stub patterns.
+4. Check skip lists (`KNOWN_FAIL*` in all 3 test runners) — any
+   entry still there after the bug it documented was fixed is
+   falsely masking green status.
+5. Verify every newly-added .c file is in the Makefile. Unlinked
+   .c files are either WIP (check roadmap docs) or forgotten.
+
+Running `bash tools/walker_audit.sh` catches the most common IR-path
+bug class (missing NODE_ kind in emit_rewritten_node) before it
+causes silent misemission. Run before any release.
+
+---
+
 ## Session 2026-04-18 (late, part 3) — BUG-593: comptime float eval short-circuit
 
 ### BUG-593: Comptime float function returns garbage instead of float value

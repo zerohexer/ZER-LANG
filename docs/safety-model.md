@@ -212,8 +212,11 @@ until fixed point (ceiling 32 iterations).
 **EDGE CASES**:
 - Same-block backward `goto` across a free: handled via 2-pass
   re-walk (BUG-404).
-- Cross-block backward goto (jump from nested if-body to parent
-  label): not fully tracked; defers to runtime generation check.
+- **Cross-block backward goto** (free then `goto` back to a label
+  before a use at a different block): not tracked; runtime gen
+  check traps with `ZER TRAP: slab: use-after-free or invalid
+  handle`. **Verified 2026-04-19**: compile accepts the program;
+  runtime exit 133 (SIGTRAP). Test reproducer exists.
 - Variable shadowing across blocks: handled via `scope_depth`
   + `find_handle_local` (BUG-488 fix).
 
@@ -309,7 +312,11 @@ is audited against the TRANSFERRED state.
 - If-unwrap capture of move-struct optional must be pointer
   capture `|*k|`, not value capture `|k|` (latter would copy and
   leave original valid — rejected).
-- Return value is not considered a transfer (known limit).
+- Verified 2026-04-19: pass-by-value to a function correctly
+  transitions the source variable to HS_TRANSFERRED. Subsequent
+  use at the call site is a compile error. The previously-documented
+  "return value is not a transfer" limit was vacuous — after
+  `return`, function scope ends, nothing to catch.
 
 **TESTS**: `move_array_elem.zer`, `move_switch_capture.zer`,
 `move_orelse_fallback.zer`, `union_move_overwrite.zer`,
@@ -491,8 +498,15 @@ of freeing + reusing an array slot. More general patterns fall
 back to `alloc_id` matching (System 8).
 
 **EDGE CASES**:
-- Multi-dimensional array indexing not fully covered.
-- Index expression complexity limits what can be tracked.
+- Verified 2026-04-19: simple 2D arrays of handles (e.g.,
+  `Handle(Task)[2][2]`) correctly track UAF via alloc_id
+  sharing (System 8). The "multi-dimensional not covered"
+  claim was wrong for the simple case.
+- Index expression complexity limits what can be tracked —
+  when the index is a non-trivial runtime value and the
+  allocation stored there is freed through the same expression,
+  the exact match isn't always proven. Runtime generation check
+  is the fallback.
 
 **TESTS**: `dyn_array_loop_freed.zer`.
 
@@ -633,6 +647,13 @@ Branch merges update states correctly.
 **EDGE CASES**:
 - Indirect / virtual calls: no summary available.
 - Recursive functions: DFS with memoization breaks cycles.
+- **Mutual recursion where free happens on a recursion-return path**:
+  verified 2026-04-19 — FuncSummary does NOT reliably propagate
+  the free. Two observable symptoms: (1) false-positive "handle
+  never freed" error at the caller, AND (2) missed UAF on
+  subsequent use of the handle. Workaround: factor out the free
+  into a non-recursive helper, or pass an explicit handle-return
+  value so the caller knows the state. Test reproducer exists.
 
 **TESTS**: `cross_func_free_ptr.zer`,
 `opaque_cross_func_uaf.zer`, `opaque_return_freed.zer`.
@@ -695,7 +716,13 @@ record. Called transitively for chained function calls.
 **EDGE CASES**:
 - Functions with no return range: default to `[INT64_MIN,
   INT64_MAX]` at call site.
-- Mutual recursion: not handled — range cleared.
+- Verified 2026-04-19: mutual recursion IS handled correctly
+  when the return range is bounded via `% N` / `& MASK`.
+  Tested `fa(x) { return fb(x-1) % MAP; }` / `fb(x) { return
+  fa(x-1) % MAP; }` with MAP=16 — `arr[fa(10)]` on a size-16
+  array elided the bounds check. Same pattern on a size-8
+  array correctly inserted auto-guard. The "mutual recursion
+  clears the range" claim was wrong.
 
 **TESTS**: `inline_call_range.zer`, `inline_range_deep.zer`.
 
@@ -969,11 +996,28 @@ ZER's model does NOT guarantee:
 - Runtime fallbacks are listed where present; pure compile-time
   systems have no runtime cost.
 
-Gaps found during writing (bugs or soundness questions):
-- Cross-block backward goto beyond 2-pass re-walk (System 7 limit).
-- Mutual recursion handle tracking (System 9 limit).
-- Return-value transfer for `move struct` (System 10 limit).
+Gaps found during writing, then empirically verified on 2026-04-19:
 
-These are listed as EDGE CASES rather than being quietly accepted.
+**Confirmed real gaps** (fallback to runtime check):
+- System 7: cross-block backward `goto` across a free. Runtime
+  gen check traps (exit 133 / SIGTRAP). Compile accepts.
+- System 9: mutual recursion where the free happens on the
+  recursion-return path. Two observable symptoms — false-positive
+  "handle never freed" error + missed UAF on subsequent use.
+  Workaround: factor free into a non-recursive helper.
+
+**Refuted during verification** (the spec was over-pessimistic;
+updated the edge cases):
+- System 10: pass-by-value transfer IS correctly caught. The
+  "return not a transfer" claim was vacuous (scope ends at return).
+- System 13: mutual recursion WITH `% N` range bounding IS
+  propagated correctly. Only unbounded recursion clears the range.
+- System 15: simple 2D-array UAF IS caught via alloc_id sharing
+  (System 8). Only non-trivial runtime-indexed cases fall back.
+
+Remaining known unverified edge cases:
+- Function-pointer indirection through opaque callees (conservative by design).
+- Complex alias patterns through nested globals with escape attempts.
+
 If a program in the wild trips one, add to the test suite and
 refine the spec.

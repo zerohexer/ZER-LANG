@@ -266,18 +266,26 @@ static void gen_unsafe_provenance(char *buf, int id) {
 /* ---- New generators: goto, comptime, handle alias, enum, while+break ---- */
 
 static void gen_safe_goto_defer(char *buf, int id) {
+    /* BUG-589 test fix: the original pattern used `defer free(h)` plus
+     * `goto done` plus a read of `h` after the label. In ZER, `goto` fires
+     * pending defers (see tests/zer/goto_defer.zer) — so by the time we
+     * reach `done:`, h has been freed and reading h.v traps. Mask masked
+     * this with --run exit swallowing. The pattern is self-contradictory.
+     *
+     * New pattern: do goto-past-code without a defer on the value we read
+     * after. Free explicitly before returning instead. */
     char *p = buf;
     p += sprintf(p, "struct Gd%d { u32 v; }\n", id);
     p += sprintf(p, "Pool(Gd%d, 4) gdpool%d;\n", id, id);
     p += sprintf(p, "u32 test_goto_defer_%d() {\n", id);
     p += sprintf(p, "    ?Handle(Gd%d) mh = gdpool%d.alloc();\n", id, id);
     p += sprintf(p, "    Handle(Gd%d) h = mh orelse return;\n", id);
-    p += sprintf(p, "    defer gdpool%d.free(h);\n", id);
     p += sprintf(p, "    gdpool%d.get(h).v = %d;\n", id, id * 7);
     p += sprintf(p, "    goto done%d;\n", id);
     p += sprintf(p, "    gdpool%d.get(h).v = 0;\n", id);
     p += sprintf(p, "done%d:\n", id);
-    p += sprintf(p, "    if (gdpool%d.get(h).v != %d) { return 1; }\n", id, id * 7);
+    p += sprintf(p, "    if (gdpool%d.get(h).v != %d) { gdpool%d.free(h); return 1; }\n", id, id * 7, id);
+    p += sprintf(p, "    gdpool%d.free(h);\n", id);
     p += sprintf(p, "    return 0;\n");
     p += sprintf(p, "}\n");
 }

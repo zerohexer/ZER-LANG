@@ -6660,6 +6660,72 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         /* Check for complex patterns that need emit_expr */
         Type *tgt_type = checker_get_type(e->checker, node->assign.target);
         Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+
+        /* BUG-582: Union variant assignment — port from emit_expr (line 1210+)
+         * with extension: also handle `u.variant[i] = val` and deeper chains
+         * by walking up the target through NODE_INDEX/NODE_FIELD until we
+         * find a NODE_FIELD whose object is a union. Emits a statement
+         * expression that hoists the union pointer, sets `_tag`, then does
+         * the actual target assignment through the same pointer.
+         *
+         * Without this, `u._tag` stays at its zero-init value, and subsequent
+         * `switch (u)` takes the wrong arm. The AST path had the plain-field
+         * case but missed index/nested-field chains — same bug, different
+         * manifestation. Fix here covers both. */
+        if (node->assign.op == TOK_EQ && node->assign.target) {
+            /* Walk up: find the NODE_FIELD whose object is a union. */
+            Node *walk = node->assign.target;
+            Node *union_field = NULL;  /* the NODE_FIELD(union, variant) */
+            while (walk) {
+                if (walk->kind == NODE_FIELD) {
+                    Type *ot = checker_get_type(e->checker, walk->field.object);
+                    Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
+                    if (ot_eff && ot_eff->kind == TYPE_UNION) {
+                        union_field = walk;
+                        break;
+                    }
+                    walk = walk->field.object;
+                } else if (walk->kind == NODE_INDEX) {
+                    walk = walk->index_expr.object;
+                } else if (walk->kind == NODE_UNARY && walk->unary.op == TOK_STAR) {
+                    /* Deref — keep walking */
+                    walk = walk->unary.operand;
+                } else {
+                    break;
+                }
+            }
+            if (union_field) {
+                Node *obj_node = union_field->field.object;
+                Type *obj_type_raw = checker_get_type(e->checker, obj_node);
+                Type *obj_type = obj_type_raw ? type_unwrap_distinct(obj_type_raw) : NULL;
+                const char *vname = union_field->field.field_name;
+                uint32_t vlen = (uint32_t)union_field->field.field_name_len;
+                for (uint32_t i = 0; i < obj_type->union_type.variant_count; i++) {
+                    SUVariant *v = &obj_type->union_type.variants[i];
+                    if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0) {
+                        int tmp = e->temp_count++;
+                        emit(e, "({ __typeof__(");
+                        emit_rewritten_node(e, obj_node, func);
+                        emit(e, ") *_zer_up%d = &(", tmp);
+                        emit_rewritten_node(e, obj_node, func);
+                        emit(e, "); _zer_up%d->_tag = %u; ", tmp, i);
+                        /* Re-emit the target but replacing the hoisted
+                         * union object with *_zer_up%d. For `u.variant = v`
+                         * this is `_zer_up%d->variant = v`. For
+                         * `u.variant[i] = v` this is `_zer_up%d->variant[i] = v`.
+                         * Simplest: emit the full target via emit_rewritten_node
+                         * (uses same object expr — not single-eval ideal but
+                         * same as pre-fix behavior for other complex targets). */
+                        emit_rewritten_node(e, node->assign.target, func);
+                        emit(e, " = ");
+                        emit_rewritten_node(e, node->assign.value, func);
+                        emit(e, "; })");
+                        return;
+                    }
+                }
+            }
+        }
+
         /* Bit extract SET: reg[hi..lo] = val → shift/mask.
          * Replicates emit_expr's BUG-210/216 handler using emit_rewritten_node. */
         if (node->assign.target && node->assign.target->kind == NODE_SLICE) {
@@ -7651,12 +7717,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              idx_callee->index_expr.object->ident.name);
                     }
                     emit(e, "[");
-                    /* Index expression — find local if decomposed */
-                    if (idx_callee->index_expr.index->kind == NODE_IDENT) {
+                    /* Index expression — support NODE_IDENT (local or global)
+                     * and NODE_INT_LIT (constant). BUG-587: the old "non-ident
+                     * fallback" emitted literal `0` for every non-ident index,
+                     * so `ops[0](...)` and `ops[1](...)` both became `ops[0](...)`. */
+                    Node *idx_node = idx_callee->index_expr.index;
+                    if (idx_node->kind == NODE_IDENT) {
                         int idx_id = -1;
                         for (int li = 0; li < func->local_count; li++) {
-                            if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.index->ident.name_len &&
-                                memcmp(func->locals[li].name, idx_callee->index_expr.index->ident.name,
+                            if (func->locals[li].name_len == (uint32_t)idx_node->ident.name_len &&
+                                memcmp(func->locals[li].name, idx_node->ident.name,
                                        func->locals[li].name_len) == 0) {
                                 idx_id = li; break;
                             }
@@ -7664,10 +7734,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         if (idx_id >= 0)
                             emit_local_name(e, func, idx_id);
                         else
-                            emit(e, "%.*s", (int)idx_callee->index_expr.index->ident.name_len,
-                                 idx_callee->index_expr.index->ident.name);
+                            emit(e, "%.*s", (int)idx_node->ident.name_len,
+                                 idx_node->ident.name);
+                    } else if (idx_node->kind == NODE_INT_LIT) {
+                        emit(e, "%llu", (unsigned long long)idx_node->int_lit.value);
                     } else {
-                        emit(e, "0"); /* non-ident index fallback */
+                        /* Fallback: emit the index expression via the rewritten
+                         * AST emitter. Handles complex cases like arr[i+1] or
+                         * arr[func()]. */
+                        emit_rewritten_node(e, idx_node, func);
                     }
                     emit(e, "](");
                 } else {
@@ -7724,6 +7799,26 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_BRANCH: {
+        /* @once branch: expr is NODE_ONCE, cond_local is -1 — emit atomic CAS
+         * exchange so the body runs exactly once across all threads. Uses a
+         * file-static uint32_t flag per @once (inst->source_line seeds the id
+         * via a static counter).
+         *
+         * Pattern mirrors emit_stmt NODE_ONCE at emitter.c:3806:
+         *   static uint32_t _zer_once_N = 0;
+         *   if (!__atomic_exchange_n(&_zer_once_N, 1, __ATOMIC_ACQ_REL)) { body } */
+        if (inst->expr && inst->expr->kind == NODE_ONCE && inst->cond_local < 0) {
+            static int once_id_counter = 0;
+            int oid = once_id_counter++;
+            emit_indent(e);
+            emit(e, "{ static uint32_t _zer_once_%d = 0;\n", oid);
+            emit_indent(e);
+            emit(e, "if (!__atomic_exchange_n(&_zer_once_%d, 1, __ATOMIC_ACQ_REL)) goto _zer_bb%d; else goto _zer_bb%d;\n",
+                 oid, inst->true_block, inst->false_block);
+            emit_indent(e);
+            emit(e, "}\n");
+            break;
+        }
         emit_indent(e);
         emit(e, "if (");
         if (inst->cond_local >= 0) {
@@ -8810,6 +8905,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit_local_name(e, func, inst->src1_local);
                     emit(e, ").ptr)");
                 }
+            }
+            /* To bool: use truthy conversion (!!x), not plain integer cast.
+             * In C, `_Bool` has special conversion rules (non-zero → 1), but
+             * ZER emits bool as uint8_t so a plain `(uint8_t)5` gives 5, not 1.
+             * BUG-586: test expects `(bool)5 == true`. */
+            else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && inst->src1_local >= 0 &&
+                     src_eff && (type_is_integer(src_eff) || type_is_float(src_eff) ||
+                                 src_eff->kind == TYPE_POINTER)) {
+                emit(e, "((uint8_t)!!(");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, "))");
             }
             /* Simple C cast */
             else if (inst->src1_local >= 0) {

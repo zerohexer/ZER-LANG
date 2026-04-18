@@ -43,31 +43,24 @@ emitting the operator. Without this, `signed_local < 0ULL` evaluated to
 IR_LITERAL now emits `(CType)N` cast to match the local's type instead
 of always-ULL suffix.
 
+## ~~BUG-593~~ (FIXED 2026-04-18)
+
+Comptime float functions now dispatch to `eval_comptime_float_expr`
+directly when return type is `f32`/`f64`. The integer `eval_comptime_block`
+path was doing integer arithmetic on raw double bit-patterns and
+returning garbage instead of `CONST_EVAL_FAIL`, short-circuiting past
+the float path.
+
 ---
 
-## Remaining known failures (all pre-existing, surfaced by BUG-581)
+## Remaining known failures
 
-### 3 rust_tests skipped
+### 2 rust_tests skipped (hardware constraint, not a compiler bug)
 
 - `rt_unsafe_mmio_multi_reg`, `rt_unsafe_mmio_volatile_rw` — access real
   hardware addresses (`0x40020000...`). On a hosted Linux test runner
   these cause SIGSEGV/SIGTRAP. Need a QEMU-like environment or mocked
   MMIO to actually run. Not a compiler bug.
-
-- `gen_comptime_float_001` — comptime `f64` function calls inside binary
-  expressions (`SQUARE(5.0)` where SQUARE returns `f64`) resolve to 0
-  instead of 25.0. The checker doesn't set `is_comptime_float` +
-  `comptime_float_value` for this call pattern. Needs investigation in
-  `eval_const_expr_subst` / `find_comptime_return_expr` float paths in
-  checker.c. Existing simpler float tests (constant folding inside
-  `comptime f64 PI() { return 3.14; }` at top level) still work — this
-  is specifically about nested binary expressions with comptime float
-  calls.
-
-### 1 zig_tests skipped
-
-- `zt_comptime_float_const` — same underlying issue as
-  `gen_comptime_float_001`. Will be fixed together.
 
 ---
 

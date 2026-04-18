@@ -85,8 +85,6 @@ typedef struct {
     int condvar_type_count;
     int condvar_type_capacity;
 
-    /* IR emission mode — IR is default, --no-ir for AST fallback */
-    bool use_ir;            /* true = IR emission (default). false = AST emission (--no-ir). */
 } Emitter;
 
 /* ---- API ---- */

@@ -1,5 +1,5 @@
 // zercheck recognizes defer free — no false "never freed" warning
-// Tests: defer pool.free(h), defer slab.free_ptr(p), defer Task.delete()
+// Tests: defer pool.free(h), defer slab.free_ptr(p), defer Task.free()
 
 struct Res { u32 id; }
 struct Worker { u32 jobs; }
@@ -25,8 +25,8 @@ u32 test_defer_free_handle() {
 }
 
 u32 test_defer_task_delete() {
-    Handle(Job) h = Job.new() orelse { return 1; };
-    defer Job.delete(h);
+    Handle(Job) h = Job.alloc() orelse { return 1; };
+    defer Job.free(h);
     h.priority = 5;
     return 0;
 }

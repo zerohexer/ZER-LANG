@@ -1,4 +1,4 @@
-# ZER Syntactic Sugar — Handle Auto-Deref + Task.new() + [*]T
+# ZER Syntactic Sugar — Handle Auto-Deref + Task.alloc() + [*]T
 
 ## The Problem
 
@@ -227,23 +227,23 @@ void set_id(Handle(Task) h, u32 id) {
 | scope walker | ~20 | find_unique_allocator helper |
 | **Total** | **~70** | Pure sugar, no new types or concepts |
 
-## Design 2: Task.new() / Task.delete() — Implicit Slab
+## Design 2: Task.alloc() / Task.free() — Implicit Slab
 
 ### What the user writes:
 ```zer
 // No Slab declaration needed:
-Handle(Task) t = Task.new() orelse return;
+Handle(Task) t = Task.alloc() orelse return;
 t.id = 1;
 t.name = "worker";
-Task.delete(t);
+Task.free(t);
 ```
 
 ### What the compiler does:
 
-1. Sees `Task.new()` — no explicit Slab(Task) in scope
+1. Sees `Task.alloc()` — no explicit Slab(Task) in scope
 2. Auto-generates a hidden module-level global: `Slab(Task) _zer_auto_slab_Task;`
-3. Routes `Task.new()` → `_zer_auto_slab_Task.alloc()`
-4. Routes `Task.delete(h)` → `_zer_auto_slab_Task.free(h)`
+3. Routes `Task.alloc()` → `_zer_auto_slab_Task.alloc()`
+4. Routes `Task.free(h)` → `_zer_auto_slab_Task.free(h)`
 5. Handle auto-deref uses the auto-generated slab as slab_source
 
 ### The emitted C:
@@ -251,7 +251,7 @@ Task.delete(t);
 // Auto-generated at module level:
 _zer_slab _zer_auto_slab_Task = {0};
 
-// Task.new() becomes:
+// Task.alloc() becomes:
 uint8_t _zer_aok0 = 0;
 uint64_t _zer_ah0 = _zer_slab_alloc(&_zer_auto_slab_Task, sizeof(Task), &_zer_aok0);
 // ... same slab alloc pattern as explicit Slab
@@ -259,7 +259,7 @@ uint64_t _zer_ah0 = _zer_slab_alloc(&_zer_auto_slab_Task, sizeof(Task), &_zer_ao
 // t.id = 1 becomes:
 ((Task*)_zer_slab_get(&_zer_auto_slab_Task, t))->id = 1;
 
-// Task.delete(t) becomes:
+// Task.free(t) becomes:
 _zer_slab_free(&_zer_auto_slab_Task, t);
 ```
 
@@ -278,12 +278,12 @@ Handle(Task) t1 = isr_tasks.alloc() orelse return;
 t1.id = 1;    // auto-deref uses isr_tasks
 
 // Implicit — for OS, application, convenience:
-Handle(Task) t2 = Task.new() orelse return;
+Handle(Task) t2 = Task.alloc() orelse return;
 t2.id = 2;    // auto-deref uses auto-generated Slab
-Task.delete(t2);
+Task.free(t2);
 ```
 
-No conflict. Explicit allocators are used when declared. `Task.new()` creates an auto-Slab only if needed.
+No conflict. Explicit allocators are used when declared. `Task.alloc()` creates an auto-Slab only if needed.
 
 ### --no-heap flag (optional safety net):
 
@@ -291,18 +291,18 @@ No conflict. Explicit allocators are used when declared. `Task.new()` creates an
 zerc --no-heap main.zer
 ```
 
-With this flag, `Task.new()` is a compile error:
+With this flag, `Task.alloc()` is a compile error:
 ```
-error: Task.new() requires heap allocation (calloc)
+error: Task.alloc() requires heap allocation (calloc)
        use --no-heap to enforce no dynamic allocation
        fix: use Pool(Task, N) for fixed allocation
 ```
 
-Without the flag (default), `Task.new()` just works. The flag exists for MISRA compliance and tiny bare-metal targets where malloc/calloc truly doesn't exist.
+Without the flag (default), `Task.alloc()` just works. The flag exists for MISRA compliance and tiny bare-metal targets where malloc/calloc truly doesn't exist.
 
 ### When is --no-heap needed?
 
-| Environment | Has heap? | Task.new() works? |
+| Environment | Has heap? | Task.alloc() works? |
 |---|---|---|
 | Linux/macOS/Windows app | Yes | Yes |
 | Linux kernel module | Yes (kmalloc) | Yes |
@@ -312,19 +312,19 @@ Without the flag (default), `Task.new()` just works. The flag exists for MISRA c
 | Cortex-M0, 2KB RAM | Maybe | User decides |
 | MISRA C certified | Banned by spec | Use --no-heap |
 
-95%+ of use cases: `Task.new()` works out of the box. The `--no-heap` flag is opt-in for the 5% that truly can't use dynamic allocation.
+95%+ of use cases: `Task.alloc()` works out of the box. The `--no-heap` flag is opt-in for the 5% that truly can't use dynamic allocation.
 
 ### Checker implementation:
 
 In `check_expr` for `NODE_FIELD` where object is a type name (NODE_IDENT resolving to a struct type):
 
 ```
-1. See Task.new() — callee is NODE_FIELD where object = "Task" (struct type)
+1. See Task.alloc() — callee is NODE_FIELD where object = "Task" (struct type)
 2. Check if --no-heap → error
 3. Look for existing Slab(Task) auto-slab in module scope
 4. If not found → create one, add to module scope as _zer_auto_slab_Task
 5. Return ?Handle(Task) as result (same as slab.alloc())
-6. For Task.delete(h) → route to auto-slab.free(h)
+6. For Task.free(h) → route to auto-slab.free(h)
 ```
 
 ### One auto-Slab per type, program-wide (like C's malloc):
@@ -333,17 +333,17 @@ C has ONE global heap — `malloc()` goes to the same pool no matter which `.c` 
 
 ```zer
 // module_a.zer:
-Handle(Task) t = Task.new() orelse return;
+Handle(Task) t = Task.alloc() orelse return;
 send_to_b(t);    // pass handle to another module — works
 
 // module_b.zer:
 void process(Handle(Task) t) {
     t.id = 1;     // works — same global auto-Slab(Task)
-    Task.delete(t);  // works — same slab
+    Task.free(t);  // works — same slab
 }
 ```
 
-The emitter generates one `_zer_auto_slab_Task` as a program-level global, same as how libc's heap is process-wide. Multiple modules using `Task.new()` all route to the same slab.
+The emitter generates one `_zer_auto_slab_Task` as a program-level global, same as how libc's heap is process-wide. Multiple modules using `Task.alloc()` all route to the same slab.
 
 If you want SEPARATE allocation pools (e.g., ISR pool vs application pool), use explicit allocators:
 ```zer
@@ -402,12 +402,12 @@ struct TaskQueue {
 }
 
 // Usage — no Slab declaration, no .get(), [*]T syntax:
-Handle(Task) t = Task.new() orelse return;
+Handle(Task) t = Task.alloc() orelse return;
 t.task_id = 1;
 t.name = "worker";
 t.priority = 0;
 t.next = null;
-Task.delete(t);
+Task.free(t);
 ```
 
 ### C equivalent:
@@ -441,9 +441,9 @@ free(t);
 | String field | `char *name;` | `[*]u8 name;` | Bounds checked |
 | Nullable ptr | `struct task *next;` | `?*Task next;` | Must unwrap |
 | Array of ptrs | `struct task **lanes;` | `[*]?*Task lanes;` | Bounds checked |
-| Allocate | `malloc(sizeof(...))` | `Task.new() orelse return;` | Gen-checked Handle |
+| Allocate | `malloc(sizeof(...))` | `Task.alloc() orelse return;` | Gen-checked Handle |
 | Field access | `t->id = 1;` | `t.id = 1;` | Gen check on every access |
-| Free | `free(t);` | `Task.delete(t);` | Double-free = compile error |
+| Free | `free(t);` | `Task.free(t);` | Double-free = compile error |
 | UAF | Silent corruption | Compile error (zercheck) | 100% caught |
 
 Same line count. Same mental model. ZER just catches the bugs C doesn't.
@@ -559,7 +559,7 @@ lib_store(p);    // currently: not checked here (checked later at @ptrcast)
 4. **zercheck 9a+9b+9c** — DONE (~70 lines)
 5. **Handle(T)[N] arrays** — DONE (parser, ~10 lines)
 6. **Audit fixes** — 6 bugs found and fixed (goto/switch/defer, free_ptr type check, const Handle, ghost alloc_ptr, no-allocator error)
-7. **Task.new()** — NOT YET (auto-Slab creation, ~50 lines)
+7. **Task.alloc()** — NOT YET (auto-Slab creation, ~50 lines)
 
 ## Why This Matters
 

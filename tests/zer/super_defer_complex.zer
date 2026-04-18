@@ -118,9 +118,9 @@ u32 ptr_defer() {
 // Layer 8: Task.new + Task.delete with defer
 struct Entity { u32 hp; u32 atk; }
 u32 task_defer() {
-    ?Handle(Entity) me = Entity.new();
+    ?Handle(Entity) me = Entity.alloc();
     Handle(Entity) e = me orelse return;
-    defer Entity.delete(e);
+    defer Entity.free(e);
     e.hp = 100;
     e.atk = 25;
     return e.hp + e.atk;

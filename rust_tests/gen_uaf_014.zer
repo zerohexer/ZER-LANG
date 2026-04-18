@@ -4,10 +4,10 @@
 struct Worker { u32 job_id; }
 
 u32 main() {
-    ?Handle(Worker) mh = Worker.new();
+    ?Handle(Worker) mh = Worker.alloc();
     Handle(Worker) h = mh orelse return;
     h.job_id = 5;
-    Worker.delete(h);
+    Worker.free(h);
     u32 v = h.job_id;
     return v;
 }

@@ -30,14 +30,14 @@ u32 test_alloc_ptr() {
 }
 
 u32 test_task_new_ptr() {
-    *Worker w = Worker.new_ptr() orelse { return 1; };
+    *Worker w = Worker.alloc_ptr() orelse { return 1; };
     w.id = 1;
     w.jobs_done = 0;
     w.busy = true;
     w.jobs_done += 1;
     w.jobs_done += 1;
     w.jobs_done += 1;
-    Worker.delete_ptr(w);
+    Worker.free_ptr(w);
     return 0;
 }
 

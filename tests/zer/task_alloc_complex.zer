@@ -1,4 +1,4 @@
-// Complex: multiple struct types with Task.new(), mixed Handle + ptr
+// Complex: multiple struct types with Task.alloc(), mixed Handle + ptr
 
 struct Task {
     u32 id;
@@ -12,8 +12,8 @@ struct Node {
 
 u32 main() {
     // Two different types — auto-creates two separate slabs
-    Handle(Task) t = Task.new() orelse { return 1; };
-    Handle(Node) n = Node.new() orelse { return 2; };
+    Handle(Task) t = Task.alloc() orelse { return 1; };
+    Handle(Node) n = Node.alloc() orelse { return 2; };
 
     t.id = 10;
     t.priority = 3;
@@ -25,13 +25,13 @@ u32 main() {
     if (n.depth != 5) { return 5; }
 
     // Mix Handle and ptr on same type
-    *Task t2 = Task.new_ptr() orelse { return 6; };
+    *Task t2 = Task.alloc_ptr() orelse { return 6; };
     t2.id = 77;
     if (t2.id != 77) { return 7; }
 
-    Task.delete(t);
-    Node.delete(n);
-    Task.delete_ptr(t2);
+    Task.free(t);
+    Node.free(n);
+    Task.free_ptr(t2);
 
     return 0;
 }

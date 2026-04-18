@@ -1,9 +1,9 @@
-// Handle: Task.new() auto-slab allocation
+// Handle: Task.alloc() auto-slab allocation
 
 struct Task { u32 id; u32 state; }
 
 u32 main() {
-    ?Handle(Task) mh = Task.new();
+    ?Handle(Task) mh = Task.alloc();
     Handle(Task) h = mh orelse return;
 
     pool_of_task: {
@@ -13,7 +13,7 @@ u32 main() {
 
     u32 id = h.id;
     u32 st = h.state;
-    Task.delete(h);
+    Task.free(h);
 
     if (id != 1) { return 1; }
     if (st != 0) { return 2; }

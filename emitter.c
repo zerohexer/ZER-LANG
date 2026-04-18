@@ -1757,7 +1757,7 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         }
 
-        /* Task.new() / Task.delete() — auto-Slab sugar */
+        /* Task.alloc() / Task.free() — auto-Slab sugar */
         if (!handled && node->call.callee->kind == NODE_FIELD) {
             Node *obj_n = node->call.callee->field.object;
             Type *ot = checker_get_type(e->checker, obj_n);
@@ -1769,16 +1769,16 @@ static void emit_expr(Emitter *e, Node *node) {
                 char asname[128];
                 int aslen = snprintf(asname, sizeof(asname), "_zer_auto_slab_%.*s",
                     (int)ot->struct_type.name_len, ot->struct_type.name);
-                if (ml == 3 && memcmp(mn, "new", 3) == 0) {
-                    /* Task.new() → slab.alloc() */
+                if (ml == 5 && memcmp(mn, "alloc", 5) == 0) {
+                    /* Task.alloc() → slab.alloc() */
                     int tmp = e->temp_count++;
                     emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
                          "_zer_slab_alloc(&%.*s, &_zer_aok%d); "
                          "(_zer_opt_u64){_zer_ah%d, _zer_aok%d}; })",
                          tmp, tmp, aslen, asname, tmp, tmp, tmp);
                     handled = true;
-                } else if (ml == 7 && memcmp(mn, "new_ptr", 7) == 0) {
-                    /* Task.new_ptr() → slab.alloc_ptr() */
+                } else if (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) {
+                    /* Task.alloc_ptr() → slab.alloc_ptr() */
                     int tmp = e->temp_count++;
                     emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
                          "_zer_slab_alloc(&%.*s, &_zer_aok%d); ",
@@ -1788,15 +1788,15 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit(e, "*)_zer_slab_get(&%.*s, _zer_ah%d) : (void*)0; })",
                          aslen, asname, tmp);
                     handled = true;
-                } else if (ml == 6 && memcmp(mn, "delete", 6) == 0) {
-                    /* Task.delete(h) → slab.free(h) */
+                } else if (ml == 4 && memcmp(mn, "free", 4) == 0) {
+                    /* Task.free(h) → slab.free(h) */
                     emit(e, "_zer_slab_free(&%.*s, ", aslen, asname);
                     if (node->call.arg_count > 0)
                         emit_expr(e, node->call.args[0]);
                     emit(e, ")");
                     handled = true;
-                } else if (ml == 10 && memcmp(mn, "delete_ptr", 10) == 0) {
-                    /* Task.delete_ptr(p) → slab.free_ptr(p) */
+                } else if (ml == 8 && memcmp(mn, "free_ptr", 8) == 0) {
+                    /* Task.free_ptr(p) → slab.free_ptr(p) */
                     emit(e, "_zer_slab_free_ptr(&%.*s, ", aslen, asname);
                     if (node->call.arg_count > 0)
                         emit_expr(e, node->call.args[0]);
@@ -4872,13 +4872,13 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             }
         }
     }
-    /* Task.new/delete (auto-slab) */
+    /* Task.alloc/free (auto-slab) */
     if (te->kind == TYPE_STRUCT) {
         const char *sn=te->struct_type.name; uint32_t sl=te->struct_type.name_len;
-        if (ml==3 && !memcmp(mn,"new",3)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(_zer_opt_u64){_zer_ah%d,1}:(_zer_opt_u64){0,0};})",t,t,(int)sl,sn,t,t,t); return true; }
-        if (ml==7 && !memcmp(mn,"new_ptr",7)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(struct %.*s*)_zer_slab_get(&_zer_auto_slab_%.*s,_zer_ah%d):(void*)0;})",t,t,(int)sl,sn,t,t,(int)sl,sn,(int)sl,sn,t); return true; }
-        if (ml==6 && !memcmp(mn,"delete",6) && node->call.arg_count>0) { emit(e,"_zer_slab_free(&_zer_auto_slab_%.*s,",(int)sl,sn); BA(0); emit(e,")"); return true; }
-        if (ml==10 && !memcmp(mn,"delete_ptr",10) && node->call.arg_count>0) { emit(e,"_zer_slab_free_ptr(&_zer_auto_slab_%.*s,(void*)",(int)sl,sn); BA(0); emit(e,")"); return true; }
+        if (ml==5 && !memcmp(mn,"alloc",5)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(_zer_opt_u64){_zer_ah%d,1}:(_zer_opt_u64){0,0};})",t,t,(int)sl,sn,t,t,t); return true; }
+        if (ml==9 && !memcmp(mn,"alloc_ptr",9)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(struct %.*s*)_zer_slab_get(&_zer_auto_slab_%.*s,_zer_ah%d):(void*)0;})",t,t,(int)sl,sn,t,t,(int)sl,sn,(int)sl,sn,t); return true; }
+        if (ml==4 && !memcmp(mn,"free",4) && node->call.arg_count>0) { emit(e,"_zer_slab_free(&_zer_auto_slab_%.*s,",(int)sl,sn); BA(0); emit(e,")"); return true; }
+        if (ml==8 && !memcmp(mn,"free_ptr",8) && node->call.arg_count>0) { emit(e,"_zer_slab_free_ptr(&_zer_auto_slab_%.*s,(void*)",(int)sl,sn); BA(0); emit(e,")"); return true; }
     }
     #undef BA
     return false;

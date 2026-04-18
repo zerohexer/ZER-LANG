@@ -1,0 +1,11 @@
+// Task.free() double free — zercheck must catch
+
+struct Task { u32 id; }
+
+u32 main() {
+    Handle(Task) t = Task.alloc() orelse { return 1; };
+    t.id = 42;
+    Task.free(t);
+    Task.free(t);    // DOUBLE FREE
+    return 0;
+}

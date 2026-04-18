@@ -366,12 +366,12 @@ static void gen_safe_task_new(char *buf, int id) {
     char *p = buf;
     p += sprintf(p, "struct Tk%d { u32 id; u32 priority; }\n", id);
     p += sprintf(p, "u32 test_task_%d() {\n", id);
-    p += sprintf(p, "    ?*Tk%d mt = Tk%d.new_ptr();\n", id, id);
+    p += sprintf(p, "    ?*Tk%d mt = Tk%d.alloc_ptr();\n", id, id);
     p += sprintf(p, "    *Tk%d t = mt orelse return;\n", id);
     p += sprintf(p, "    t.id = %d;\n", id);
     p += sprintf(p, "    t.priority = %d;\n", id % 5);
     p += sprintf(p, "    if (t.id != %d) { return 1; }\n", id);
-    p += sprintf(p, "    Tk%d.delete_ptr(t);\n", id);
+    p += sprintf(p, "    Tk%d.free_ptr(t);\n", id);
     p += sprintf(p, "    return 0;\n");
     p += sprintf(p, "}\n");
 }

@@ -2,11 +2,14 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 -I.
 
 # Core source files for the compiler
-CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c
+# zercheck_ir.c is the CFG-based replacement for zercheck.c (per docs/cfg_migration_plan.md).
+# During migration both coexist: zercheck.c is primary, zercheck_ir.c grows to feature
+# parity, verified via dual-run in Phase E, then zercheck.c deleted at Phase F (v0.5.0).
+CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c
 CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 # Library sources (everything except zerc_main)
-LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c
+LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # ---- Compiler binary ----

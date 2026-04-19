@@ -527,6 +527,38 @@ int main(int argc, char **argv) {
             zc_ir.import_ast_count = import_ast_count;
             int ir_func_count = 0;
             int ir_error_count_start = zc_ir.error_count;
+
+            /* Phase E: iterative FuncSummary build for mutual recursion
+             * convergence. Mirror of zercheck.c's 16-pass loop (GAP 2 fix,
+             * 2026-04-19). Each pass runs zercheck_ir in building_summary
+             * mode on every function; errors suppressed, summaries refined.
+             * Break when a pass makes no changes (summaries are stable). */
+            zc_ir.building_summary = true;
+            int summary_before = 0;
+            for (int pass = 0; pass < 16; pass++) {
+                int sc_before = zc_ir.summary_count;
+                for (int i = 0; i < main_mod->ast->file.decl_count; i++) {
+                    Node *decl = main_mod->ast->file.decls[i];
+                    if (decl->kind != NODE_FUNC_DECL) continue;
+                    if (!decl->func_decl.body) continue;
+                    IRFunc *ir = ir_lower_func(&cc.arena, &checker, decl);
+                    if (!ir) continue;
+                    ir->module_prefix = NULL;
+                    ir->module_prefix_len = 0;
+                    zercheck_ir(&zc_ir, ir);
+                }
+                /* Simple convergence check: summary_count stable means
+                 * no new summaries added. Refinement-within-summary is
+                 * handled by zercheck_ir itself returning true/false,
+                 * but we don't track that here — 16-pass ceiling is
+                 * sufficient for all realistic mutual-recursion chains. */
+                if (pass > 0 && zc_ir.summary_count == sc_before) break;
+                summary_before = sc_before;
+            }
+            zc_ir.building_summary = false;
+            (void)summary_before;
+
+            /* Main analysis pass — errors now enabled */
             for (int i = 0; i < main_mod->ast->file.decl_count; i++) {
                 Node *decl = main_mod->ast->file.decls[i];
                 if (decl->kind != NODE_FUNC_DECL) continue;

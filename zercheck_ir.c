@@ -1127,6 +1127,19 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * IR_FIELD_READ produces one level of field access at a time. The full
      * compound expression lives on inst->expr (NODE_FIELD), from which we
      * can extract all prefixes. */
+    /* Phase E: Index reads (`arr[i]`, `ptr[0]`) — check base for UAF.
+     * For interior pointers (field_ptr = &b.c; free(b); field_ptr[0])
+     * the base local shares alloc_id with b; when b is freed, the base
+     * is FREED too and reading it should trigger UAF. */
+    case IR_INDEX_READ: {
+        if (inst->expr) {
+            UafReportSet rs = {0};
+            ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            free(rs.ids);
+        }
+        break;
+    }
+
     case IR_FIELD_READ: {
         if (inst->expr && inst->expr->kind == NODE_FIELD) {
             /* Walk from full expression up to root, checking each prefix. */
@@ -1212,6 +1225,37 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
                 break;
+            }
+
+            /* Phase E: interior pointer tracking. `*T field_ptr = &b.c`
+             * lowers to IR_ASSIGN with expr = NODE_UNARY(TOK_AMP, NODE_FIELD(b, c)).
+             * field_ptr should share alloc_id with b so when b is freed,
+             * field_ptr is also flagged. Walk &expr down to root ident. */
+            if (rhs && rhs->kind == NODE_UNARY && rhs->unary.op == TOK_AMP) {
+                Node *target = rhs->unary.operand;
+                /* Walk field/index chain to the root ident */
+                while (target) {
+                    if (target->kind == NODE_FIELD) target = target->field.object;
+                    else if (target->kind == NODE_INDEX) target = target->index_expr.object;
+                    else break;
+                }
+                if (target && target->kind == NODE_IDENT) {
+                    int base_local = ir_find_local(func,
+                        target->ident.name, (uint32_t)target->ident.name_len);
+                    if (base_local >= 0) {
+                        IRHandleInfo *base_h = ir_find_handle(ps, base_local);
+                        if (base_h && base_h->alloc_id != 0) {
+                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                            if (dst_h) {
+                                dst_h->state = base_h->state;
+                                dst_h->alloc_line = base_h->alloc_line;
+                                dst_h->alloc_id = base_h->alloc_id;
+                                dst_h->source_color = base_h->source_color;
+                            }
+                        }
+                    }
+                }
+                /* Don't break — continue alias path if RHS is just an ident too */
             }
 
             if (rhs && rhs->kind == NODE_CALL) {
@@ -1338,6 +1382,38 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             fallback = rexpr->orelse.fallback;
         }
 
+        /* Phase E: ir_lower sets src1_local for simple `return ident` and
+         * keeps expr NULL. Cover that case by treating src1_local as the
+         * returned local when expr is missing. */
+        int ret_local_direct = -1;
+        if (!rexpr && inst->src1_local >= 0 &&
+            inst->src1_local < func->local_count) {
+            ret_local_direct = inst->src1_local;
+            IRHandleInfo *h = ir_find_handle(ps, ret_local_direct);
+            Type *ret_type = func->locals[ret_local_direct].type;
+            if (ir_should_track_move(ret_type)) {
+                if (h && ir_is_invalid(h)) {
+                    ir_zc_error(zc, inst->source_line,
+                        "returning %s value (local %%%d)",
+                        ir_state_name(h->state), ret_local_direct);
+                }
+                if (!h) h = ir_add_handle(ps, ret_local_direct);
+                if (h) {
+                    h->state = IR_HS_TRANSFERRED;
+                    h->free_line = inst->source_line;
+                    h->escaped = true;
+                }
+            } else {
+                if (h && ir_is_invalid(h)) {
+                    ir_zc_error(zc, inst->source_line,
+                        "returning %s pointer (local %%%d, freed at line %d) — "
+                        "caller would receive dangling pointer",
+                        ir_state_name(h->state), ret_local_direct, h->free_line);
+                }
+                if (h) h->escaped = true;
+            }
+        }
+
         /* Case (a): direct ident return */
         if (primary && primary->kind == NODE_IDENT) {
             int ret_local = ir_find_local(func,
@@ -1409,6 +1485,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      *   - passthrough: inst->args[i] is an AST ident → find_local
      */
     case IR_CALL: {
+        /* Phase E: generic UAF walker on the call args. Catches
+         * use_ptr(freed_ident) / func(&freed.field) etc. */
+        if (inst->expr) {
+            UafReportSet rs = {0};
+            ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            free(rs.ids);
+        }
         /* Phase D3/E: ThreadHandle.join() — mark thread as joined.
          * ThreadHandles don't have IR locals (emitter owns their
          * pthread_t decl), so tracking is by name via IRThreadTrack. */

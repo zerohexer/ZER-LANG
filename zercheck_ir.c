@@ -1639,7 +1639,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 IRThreadTrack *t = ir_find_thread(ps,
                     fld->field.object->ident.name,
                     (uint32_t)fld->field.object->ident.name_len);
-                if (t) t->joined = true;
+                if (t) {
+                    if (t->joined) {
+                        ir_zc_error(zc, inst->source_line,
+                            "ThreadHandle '%.*s' already joined — "
+                            "join consumes the handle, cannot join twice",
+                            (int)t->name_len, t->name);
+                    }
+                    t->joined = true;
+                }
             }
         }
 

@@ -44,7 +44,15 @@ typedef enum {
 } IRHandleState;
 
 typedef struct {
-    int local_id;          /* which IRLocal this tracks */
+    int local_id;          /* root IRLocal this tracks (compound root) */
+    /* Phase B3: compound key support. For bare locals, path is NULL
+     * and path_len is 0. For compound entities (s.handle, arr[0],
+     * s.inner.next) path holds a string like ".handle" or "[0].inner"
+     * built by ir_build_key_path. Arena-allocated, shared OK across
+     * path states (copy-on-write semantics not needed — strings are
+     * immutable). */
+    const char *path;
+    uint32_t path_len;
     IRHandleState state;
     int alloc_line;        /* where allocated */
     int free_line;         /* where freed */
@@ -88,17 +96,34 @@ static void ir_ps_free(IRPathState *ps) {
     ps->handle_count = 0;
 }
 
+/* Bare-local lookup: matches only entries with path_len == 0.
+ * Phase B3: compound entries (path != NULL) with the same local_id are NOT
+ * returned here — they represent different entities (e.g. `s` vs `s.handle`). */
 static IRHandleInfo *ir_find_handle(IRPathState *ps, int local_id) {
     for (int i = 0; i < ps->handle_count; i++)
-        if (ps->handles[i].local_id == local_id)
+        if (ps->handles[i].local_id == local_id &&
+            ps->handles[i].path_len == 0)
             return &ps->handles[i];
     return NULL;
 }
 
-static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
-    IRHandleInfo *existing = ir_find_handle(ps, local_id);
-    if (existing) return existing;
+/* Compound-aware lookup: matches (local_id, path) exactly. path_len=0 with
+ * path=NULL is a bare local (equivalent to ir_find_handle). */
+static IRHandleInfo *ir_find_compound_handle(IRPathState *ps, int local_id,
+                                              const char *path, uint32_t path_len) {
+    for (int i = 0; i < ps->handle_count; i++) {
+        if (ps->handles[i].local_id != local_id) continue;
+        if (ps->handles[i].path_len != path_len) continue;
+        if (path_len == 0) return &ps->handles[i];
+        if (ps->handles[i].path && path &&
+            memcmp(ps->handles[i].path, path, path_len) == 0)
+            return &ps->handles[i];
+    }
+    return NULL;
+}
 
+/* Grow handles array by 1 slot, return pointer to new slot (zeroed). */
+static IRHandleInfo *ir_alloc_handle_slot(IRPathState *ps) {
     if (ps->handle_count >= ps->handle_capacity) {
         int nc = ps->handle_capacity < 8 ? 8 : ps->handle_capacity * 2;
         IRHandleInfo *nh = (IRHandleInfo *)realloc(ps->handles, nc * sizeof(IRHandleInfo));
@@ -108,8 +133,30 @@ static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
     }
     IRHandleInfo *h = &ps->handles[ps->handle_count++];
     memset(h, 0, sizeof(IRHandleInfo));
-    h->local_id = local_id;
     h->state = IR_HS_UNKNOWN;
+    return h;
+}
+
+static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
+    IRHandleInfo *existing = ir_find_handle(ps, local_id);
+    if (existing) return existing;
+    IRHandleInfo *h = ir_alloc_handle_slot(ps);
+    if (h) h->local_id = local_id;
+    return h;
+}
+
+/* Add a compound handle entry (or return existing). path must be arena-
+ * allocated by the caller — this struct just stores the pointer. */
+static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
+                                             const char *path, uint32_t path_len) {
+    IRHandleInfo *existing = ir_find_compound_handle(ps, local_id, path, path_len);
+    if (existing) return existing;
+    IRHandleInfo *h = ir_alloc_handle_slot(ps);
+    if (h) {
+        h->local_id = local_id;
+        h->path = path;
+        h->path_len = path_len;
+    }
     return h;
 }
 
@@ -316,6 +363,129 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
 }
 
 /* ================================================================
+ * Compound key extraction (Phase B3)
+ *
+ * Given an AST expression, produce a tracking key: (root_local_id, path).
+ * Mirrors zercheck.c:172-213 handle_key_from_expr but resolves identifiers
+ * to IR local IDs instead of producing name-based keys.
+ *
+ * Examples:
+ *   NODE_IDENT("h")              → local=h_id,  path=""     (bare local)
+ *   NODE_FIELD(s, "handle")      → local=s_id,  path=".handle"
+ *   NODE_INDEX(arr, IntLit(0))   → local=arr_id, path="[0]"
+ *   NODE_FIELD(NODE_FIELD(s,"a"), "b") → local=s_id, path=".a.b"
+ *
+ * Only constant integer indices are trackable (matches zercheck.c behavior).
+ * Variable indices return -1 (caller falls back to "ungrouped").
+ *
+ * Returns 0 on success, -1 if expression isn't trackable as a key.
+ * On success: *out_local = root local id; *out_path = arena string (NULL
+ * if bare local); *out_path_len = length of path (0 for bare local).
+ * ================================================================ */
+
+static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_len);
+
+/* Build the path component. Returns number of chars written (not including NUL),
+ * or -1 if expression can't be keyed. `out_base_len` receives the length of
+ * the root-ident portion (always 0 here; root ident is NOT part of path). */
+static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_len) {
+    if (!expr) return -1;
+    if (expr->kind == NODE_IDENT) {
+        if (out_base_len) *out_base_len = 0;
+        return 0;  /* bare ident — empty path */
+    }
+    if (expr->kind == NODE_FIELD) {
+        int parent_len = ir_build_key_path(expr->field.object, buf, bufsize, out_base_len);
+        if (parent_len < 0) return -1;
+        int fnlen = (int)expr->field.field_name_len;
+        if (parent_len + 1 + fnlen >= bufsize) return -1;
+        buf[parent_len] = '.';
+        memcpy(buf + parent_len + 1, expr->field.field_name, fnlen);
+        int total = parent_len + 1 + fnlen;
+        buf[total] = '\0';
+        return total;
+    }
+    if (expr->kind == NODE_INDEX) {
+        if (!expr->index_expr.index ||
+            expr->index_expr.index->kind != NODE_INT_LIT) return -1;
+        int parent_len = ir_build_key_path(expr->index_expr.object, buf, bufsize, out_base_len);
+        if (parent_len < 0) return -1;
+        uint64_t idx = expr->index_expr.index->int_lit.value;
+        int written = snprintf(buf + parent_len, bufsize - parent_len,
+                               "[%llu]", (unsigned long long)idx);
+        if (written <= 0 || parent_len + written >= bufsize) return -1;
+        return parent_len + written;
+    }
+    return -1;
+}
+
+/* Walk to the root IDENT of a field/index chain. Returns the NODE_IDENT,
+ * or NULL if the chain doesn't bottom out at an identifier. */
+static Node *ir_key_root_ident(Node *expr) {
+    Node *cur = expr;
+    while (cur) {
+        if (cur->kind == NODE_IDENT) return cur;
+        if (cur->kind == NODE_FIELD) cur = cur->field.object;
+        else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
+        else return NULL;
+    }
+    return NULL;
+}
+
+/* Extract a tracking key from an AST expression. Returns 0 on success,
+ * -1 if the expression isn't keyable. Caller gets (out_local, out_path,
+ * out_path_len). Bare local: path=NULL, path_len=0. Compound: path is
+ * arena-allocated string like ".handle" or "[0].val". */
+static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
+                                    int *out_local,
+                                    const char **out_path,
+                                    uint32_t *out_path_len) {
+    *out_local = -1;
+    *out_path = NULL;
+    *out_path_len = 0;
+    if (!expr) return -1;
+
+    Node *root = ir_key_root_ident(expr);
+    if (!root) return -1;
+    int local = ir_find_local(func,
+        root->ident.name, (uint32_t)root->ident.name_len);
+    if (local < 0) return -1;
+    *out_local = local;
+
+    /* Bare ident — no path */
+    if (expr->kind == NODE_IDENT) return 0;
+
+    /* Compound — build path into stack buffer then arena-copy */
+    char stack_buf[256];
+    int len = ir_build_key_path(expr, stack_buf, sizeof(stack_buf), NULL);
+    if (len <= 0) return -1;
+    char *path = (char *)arena_alloc(zc->arena, len + 1);
+    if (!path) return -1;
+    memcpy(path, stack_buf, len + 1);
+    *out_path = path;
+    *out_path_len = (uint32_t)len;
+    return 0;
+}
+
+/* Propagate state through aliases sharing alloc_id. When `target` is
+ * marked FREED or TRANSFERRED, other entities (bare or compound) with
+ * the same alloc_id represent the same underlying allocation and must
+ * also be marked. */
+static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
+                                      IRHandleState new_state, int line) {
+    int aid = target->alloc_id;
+    if (aid == 0) return; /* untracked — no aliasing info */
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        if (h == target) continue;
+        if (h->alloc_id == aid && !ir_is_invalid(h)) {
+            h->state = new_state;
+            h->free_line = line;
+        }
+    }
+}
+
+/* ================================================================
  * Instruction Analysis — process one IR instruction
  * ================================================================ */
 
@@ -350,34 +520,49 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_SLAB_FREE:
     case IR_SLAB_FREE_PTR: {
         int target = inst->handle_local;
-        if (target >= 0) {
-            IRHandleInfo *h = ir_find_handle(ps, target);
-            if (h) {
-                if (h->state == IR_HS_FREED) {
-                    ir_zc_error(zc, inst->source_line,
-                        "double free: %%%d already freed at line %d",
-                        target, h->free_line);
-                } else if (h->state == IR_HS_MAYBE_FREED) {
-                    ir_zc_error(zc, inst->source_line,
-                        "freeing %%%d which may already be freed",
-                        target);
-                } else if (h->state == IR_HS_TRANSFERRED) {
-                    ir_zc_error(zc, inst->source_line,
-                        "freeing %%%d which was already transferred",
-                        target);
-                }
-                h->state = IR_HS_FREED;
-                h->free_line = inst->source_line;
+        IRHandleInfo *h = NULL;
 
-                /* Mark aliases with same alloc_id as FREED */
-                for (int i = 0; i < ps->handle_count; i++) {
-                    if (ps->handles[i].local_id != target &&
-                        ps->handles[i].alloc_id == h->alloc_id) {
-                        ps->handles[i].state = IR_HS_FREED;
-                        ps->handles[i].free_line = inst->source_line;
-                    }
-                }
+        /* First try bare local (decomposed path) */
+        if (target >= 0) {
+            h = ir_find_handle(ps, target);
+        }
+
+        /* Phase B3: if bare lookup failed AND inst->expr is a free call
+         * with a compound argument (e.g. pool.free(s.handle)), extract
+         * the compound key and look it up. */
+        if (!h && inst->expr && inst->expr->kind == NODE_CALL &&
+            inst->expr->call.arg_count >= 1) {
+            Node *arg = inst->expr->call.args[0];
+            int root_local;
+            const char *path;
+            uint32_t path_len;
+            if (ir_extract_compound_key(zc, func, arg,
+                                         &root_local, &path, &path_len) == 0) {
+                h = ir_find_compound_handle(ps, root_local, path, path_len);
+                if (h) target = root_local;  /* for error messages */
             }
+        }
+
+        if (h) {
+            if (h->state == IR_HS_FREED) {
+                ir_zc_error(zc, inst->source_line,
+                    "double free: %%%d already freed at line %d",
+                    target, h->free_line);
+            } else if (h->state == IR_HS_MAYBE_FREED) {
+                ir_zc_error(zc, inst->source_line,
+                    "freeing %%%d which may already be freed",
+                    target);
+            } else if (h->state == IR_HS_TRANSFERRED) {
+                ir_zc_error(zc, inst->source_line,
+                    "freeing %%%d which was already transferred",
+                    target);
+            }
+            h->state = IR_HS_FREED;
+            h->free_line = inst->source_line;
+
+            /* Mark aliases (bare or compound) with same alloc_id as FREED —
+             * handled uniformly via ir_propagate_alias_state. */
+            ir_propagate_alias_state(ps, h, IR_HS_FREED, inst->source_line);
         }
         break;
     }
@@ -391,6 +576,53 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 ir_zc_error(zc, inst->source_line,
                     "use after free: %%%d is %s (freed at line %d)",
                     target, ir_state_name(h->state), h->free_line);
+            }
+        }
+        break;
+    }
+
+    /* Phase B3: FIELD_READ — check if the read expression (including any
+     * compound prefix) has been freed. Mirrors zercheck.c:1480 BUG-463 logic:
+     * for `s.handle.data`, check the full key first, then walk up to "s.handle",
+     * then "s" — any freed prefix means the subsequent read is UAF.
+     *
+     * IR_FIELD_READ produces one level of field access at a time. The full
+     * compound expression lives on inst->expr (NODE_FIELD), from which we
+     * can extract all prefixes. */
+    case IR_FIELD_READ: {
+        if (inst->expr && inst->expr->kind == NODE_FIELD) {
+            /* Walk from full expression up to root, checking each prefix. */
+            Node *cur = inst->expr;
+            while (cur) {
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, cur,
+                                             &root_local, &path, &path_len) == 0) {
+                    IRHandleInfo *h;
+                    if (path_len == 0) {
+                        h = ir_find_handle(ps, root_local);
+                    } else {
+                        h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    }
+                    if (h && ir_is_invalid(h)) {
+                        if (path_len == 0) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use after free: local %%%d is %s (freed at line %d)",
+                                root_local, ir_state_name(h->state), h->free_line);
+                        } else {
+                            ir_zc_error(zc, inst->source_line,
+                                "use after free: compound '%.*s' on local %%%d is %s (freed at line %d)",
+                                (int)path_len, path, root_local,
+                                ir_state_name(h->state), h->free_line);
+                        }
+                        break; /* found — don't report parent prefixes too */
+                    }
+                }
+                /* Step up one level in the chain */
+                if (cur->kind == NODE_FIELD) cur = cur->field.object;
+                else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
+                else break;
             }
         }
         break;
@@ -592,6 +824,31 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (target_expr && ir_target_root_escapes(zc, target_expr)) {
             ir_mark_local_escaped(ps, rhs_local);
         }
+
+        /* Phase B3: register compound handle for the field target.
+         * `s.handle = alloc_result` where alloc_result is an ALIVE local
+         * registers (local_of_s, ".handle") as tracked, sharing alloc_id
+         * with the bare local. When either is freed, the other's state
+         * propagates via ir_propagate_alias_state. */
+        if (target_expr && rhs_local >= 0) {
+            IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+            if (rh && rh->state == IR_HS_ALIVE) {
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, target_expr,
+                                             &root_local, &path, &path_len) == 0
+                    && path_len > 0) {
+                    IRHandleInfo *ch = ir_add_compound_handle(ps, root_local,
+                                                               path, path_len);
+                    if (ch) {
+                        ch->state = IR_HS_ALIVE;
+                        ch->alloc_line = rh->alloc_line;
+                        ch->alloc_id = rh->alloc_id;
+                    }
+                }
+            }
+        }
         break;
     }
 
@@ -631,6 +888,27 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         /* Escape */
         if (target_expr && ir_target_root_escapes(zc, target_expr)) {
             ir_mark_local_escaped(ps, rhs_local);
+        }
+        /* Phase B3: register compound handle for const array-index target.
+         * Variable indices aren't trackable (matches zercheck.c behavior). */
+        if (target_expr && rhs_local >= 0) {
+            IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+            if (rh && rh->state == IR_HS_ALIVE) {
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, target_expr,
+                                             &root_local, &path, &path_len) == 0
+                    && path_len > 0) {
+                    IRHandleInfo *ch = ir_add_compound_handle(ps, root_local,
+                                                               path, path_len);
+                    if (ch) {
+                        ch->state = IR_HS_ALIVE;
+                        ch->alloc_line = rh->alloc_line;
+                        ch->alloc_id = rh->alloc_id;
+                    }
+                }
+            }
         }
         break;
     }

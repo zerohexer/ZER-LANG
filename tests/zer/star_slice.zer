@@ -18,7 +18,7 @@ u32 sum_points([*]Point pts, u32 count) {
 
 u32 str_len(const [*]u8 s) {
     u32 len = 0;
-    for (u32 i = 0; i < 1000; i += 1) {
+    for (u32 i = 0; i < s.len; i += 1) {
         if (s[i] == 0) { return len; }
         len += 1;
     }

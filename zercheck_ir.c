@@ -1224,6 +1224,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * inside the assign's expression — these are collapsed into IR_ASSIGN
      * per ir_lower.c Phase 8d and must be recognized here to track state. */
     case IR_ASSIGN: {
+        /* Phase E: move struct field-write reset BEFORE UAF check.
+         * `m.code = 1` where m is a move struct currently TRANSFERRED
+         * resets m to ALIVE — writing to a field is re-initialization,
+         * not a use. Models CFG-loop semantics where each iteration
+         * declares a fresh local `Msg m;` (AST zercheck sees fresh scope).
+         * Must run BEFORE UAF walker so the target's use-as-read check
+         * doesn't flag a freshly reset variable. */
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+            inst->expr->assign.target &&
+            inst->expr->assign.target->kind == NODE_FIELD) {
+            Node *root = inst->expr->assign.target;
+            while (root && root->kind == NODE_FIELD) root = root->field.object;
+            while (root && root->kind == NODE_INDEX) root = root->index_expr.object;
+            if (root && root->kind == NODE_IDENT) {
+                int root_local = ir_find_local_exact_first(func,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (root_local >= 0 && root_local < func->local_count &&
+                    ir_should_track_move(func->locals[root_local].type)) {
+                    IRHandleInfo *rh = ir_find_handle(ps, root_local);
+                    if (rh && rh->state == IR_HS_TRANSFERRED) {
+                        rh->state = IR_HS_ALIVE;
+                        rh->alloc_line = inst->source_line;
+                    }
+                }
+            }
+        }
+
         /* Phase E: generic UAF walker for any use inside the expression.
          * Catches patterns like `pool.get(h).id = 5` where IR_ASSIGN's
          * expr is NODE_ASSIGN wrapping NODE_FIELD(NODE_CALL(pool.get, h), id).

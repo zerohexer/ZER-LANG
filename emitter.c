@@ -5257,15 +5257,28 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
 
     case NODE_INDEX: {
         /* Index: emit obj[idx] with .ptr for slices.
-         * Bounds checks were already inserted by the checker as auto-guard
-         * instructions — emitted before this expression via emit_auto_guards. */
+         * Phase 3 fix (Gap 0): emit _zer_bounds_check for slices.
+         * Auto-guard handles arrays (compile-time size). Slices have no
+         * separate auto-guard pass — must emit inline via comma operator
+         * (shape matches AST emit_expr TYPE_SLICE branch at 2060). */
         Type *idx_obj_type = checker_get_type(e->checker, node->index_expr.object);
         bool idx_slice = idx_obj_type && type_unwrap_distinct(idx_obj_type)->kind == TYPE_SLICE;
-        emit_rewritten_node(e, node->index_expr.object, func);
-        if (idx_slice) emit(e, ".ptr");
-        emit(e, "[");
-        emit_rewritten_node(e, node->index_expr.index, func);
-        emit(e, "]");
+        if (idx_slice) {
+            emit(e, "(_zer_bounds_check((size_t)(");
+            emit_rewritten_node(e, node->index_expr.index, func);
+            emit(e, "), ");
+            emit_rewritten_node(e, node->index_expr.object, func);
+            emit(e, ".len, __FILE__, __LINE__), ");
+            emit_rewritten_node(e, node->index_expr.object, func);
+            emit(e, ".ptr)[");
+            emit_rewritten_node(e, node->index_expr.index, func);
+            emit(e, "]");
+        } else {
+            emit_rewritten_node(e, node->index_expr.object, func);
+            emit(e, "[");
+            emit_rewritten_node(e, node->index_expr.index, func);
+            emit(e, "]");
+        }
         return;
     }
 
@@ -5784,15 +5797,48 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, ")");
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
-            /* @inttoptr(*T, addr) — integer to pointer */
+            /* @inttoptr(*T, addr) — integer to pointer.
+             * Phase 3 fix #6+#7: port mmio range + alignment check from
+             * AST emit_expr line 2631-2680. Constant addresses are
+             * validated at compile time by the checker. Variable addresses
+             * need runtime range check (must fall in declared mmio range)
+             * and runtime alignment check (must match target type). */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                emit(e, "((");
-                emit_type(e, t);
-                emit(e, ")(uintptr_t)(");
-                if (node->intrinsic.arg_count > 0)
+                bool need_runtime_check = e->checker->mmio_range_count > 0 &&
+                    node->intrinsic.arg_count > 0 &&
+                    node->intrinsic.args[0]->kind != NODE_INT_LIT;
+                if (need_runtime_check) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "))");
+                    emit(e, "); if (!(");
+                    for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
+                        if (ri > 0) emit(e, " || ");
+                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
+                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
+                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                    }
+                    emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
+                    /* Runtime alignment check for variable address */
+                    Type *inner = t ? type_unwrap_distinct(t) : NULL;
+                    if (inner && inner->kind == TYPE_POINTER) inner = inner->pointer.inner;
+                    int align = inner ? type_width(inner) / 8 : 0;
+                    if (align > 1) {
+                        emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
+                             tmp, align);
+                    }
+                    emit(e, "(");
+                    emit_type(e, t);
+                    emit(e, ")_zer_ma%d; })", tmp);
+                } else {
+                    emit(e, "((");
+                    emit_type(e, t);
+                    emit(e, ")(uintptr_t)(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "))");
+                }
             }
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → container_of */
@@ -6028,6 +6074,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->slice.end, func);
                 emit(e, "); ");
             }
+            /* Phase 3 fix: trap on start > end (would underflow size_t
+             * subtraction). Ported from AST emit_expr line 2258. */
+            if (node->slice.start && node->slice.end) {
+                emit(e, "if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); ",
+                     t, t);
+            }
             emit(e, "(");
             emit_type(e, obj_type);
             emit(e, "){ &(");
@@ -6062,6 +6114,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit(e, "size_t _zer_se%d = (size_t)(", t);
                     emit_rewritten_node(e, node->slice.end, func);
                     emit(e, "); ");
+                }
+                /* Phase 3 fix: trap on start > end (would underflow
+                 * size_t subtraction). Ported from AST emit_expr line 2258. */
+                if (node->slice.start && node->slice.end) {
+                    emit(e, "if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); ",
+                         t, t);
                 }
                 emit(e, "((");
                 emit_type(e, type_slice(e->arena, elem));
@@ -7389,14 +7447,53 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             IRLocal *s1 = &func->locals[inst->src1_local];
             IRLocal *s2 = &func->locals[inst->src2_local];
             const char *sp = func->is_async ? "self->" : "";
+
+            /* Phase 3 fix #5: shift safety. ZER spec: shift by >= width = 0.
+             * Use _zer_shl/_zer_shr macros (defined in preamble) instead of
+             * raw << / >>, which are C undefined behavior when n >= width. */
+            if (inst->op_token == TOK_LSHIFT || inst->op_token == TOK_RSHIFT) {
+                emit_indent(e);
+                emit(e, "%s%.*s = %s(%s%.*s, %s%.*s);\n",
+                     sp, (int)dst->name_len, dst->name,
+                     inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr",
+                     sp, (int)s1->name_len, s1->name,
+                     sp, (int)s2->name_len, s2->name);
+                break;
+            }
+
+            /* Phase 3 fix #4: signed division overflow (INT_MIN / -1).
+             * C says this is undefined. Trap explicitly when BOTH operands
+             * signed and dividend is at the signed min while divisor is -1.
+             * (zercheck already forces compile-time guard for divisor == 0.) */
+            if (inst->op_token == TOK_SLASH || inst->op_token == TOK_PERCENT) {
+                Type *lt = s1->type ? type_unwrap_distinct(s1->type) : NULL;
+                if (lt && type_is_signed(lt)) {
+                    int w = type_width(lt);
+                    const char *minlit = "(-9223372036854775807LL-1)";
+                    if (w == 8) minlit = "(-128)";
+                    else if (w == 16) minlit = "(-32768)";
+                    else if (w == 32) minlit = "(-2147483647-1)";
+                    emit_indent(e);
+                    emit(e, "if (%s%.*s == %s && %s%.*s == -1) "
+                            "_zer_trap(\"signed division overflow\", __FILE__, __LINE__);\n",
+                         sp, (int)s1->name_len, s1->name, minlit,
+                         sp, (int)s2->name_len, s2->name);
+                }
+                emit_indent(e);
+                emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
+                     sp, (int)dst->name_len, dst->name,
+                     sp, (int)s1->name_len, s1->name,
+                     inst->op_token == TOK_SLASH ? "/" : "%",
+                     sp, (int)s2->name_len, s2->name);
+                break;
+            }
+
             const char *op = "?";
             switch (inst->op_token) {
             case TOK_PLUS: op = "+"; break; case TOK_MINUS: op = "-"; break;
-            case TOK_STAR: op = "*"; break; case TOK_SLASH: op = "/"; break;
-            case TOK_PERCENT: op = "%"; break;
+            case TOK_STAR: op = "*"; break;
             case TOK_AMP: op = "&"; break; case TOK_PIPE: op = "|"; break;
             case TOK_CARET: op = "^"; break;
-            case TOK_LSHIFT: op = "<<"; break; case TOK_RSHIFT: op = ">>"; break;
             case TOK_EQEQ: op = "=="; break; case TOK_BANGEQ: op = "!="; break;
             case TOK_LT: op = "<"; break; case TOK_GT: op = ">"; break;
             case TOK_LTEQ: op = "<="; break; case TOK_GTEQ: op = ">="; break;
@@ -7497,19 +7594,37 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_INDEX_READ: {
         /* Emit: dest = src[idx] — from local IDs.
-         * Bounds checks are in the AST path (emit_expr via IR_ASSIGN passthrough). */
+         * Phase 3 fix (Gap 0): restore slice bounds check lost in
+         * commit 010ddea when this handler switched from
+         * emit_expr(inst->expr) to direct local-ID emission.
+         * Arrays: auto_guards separate pass handles them (if VRP
+         *   can't prove safety, an `if (i >= N) return;` is
+         *   inserted before the access). IR_INDEX_READ emits raw.
+         * Slices: no separate pass; bounds check must be emitted
+         *   inline here via comma operator form (same shape as
+         *   emit_expr TYPE_SLICE branch at emitter.c:2060). */
         if (inst->dest_local >= 0 && inst->src1_local >= 0 && inst->src2_local >= 0) {
             IRLocal *s1 = &func->locals[inst->src1_local];
-            /* Slice uses .ptr[] */
             Type *st = s1->type ? type_unwrap_distinct(s1->type) : NULL;
             emit_indent(e);
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
-            emit_local_name(e, func, inst->src1_local);
-            if (st && st->kind == TYPE_SLICE) emit(e, ".ptr");
-            emit(e, "[");
-            emit_local_name(e, func, inst->src2_local);
-            emit(e, "];\n");
+            if (st && st->kind == TYPE_SLICE) {
+                emit(e, "(_zer_bounds_check((size_t)(");
+                emit_local_name(e, func, inst->src2_local);
+                emit(e, "), ");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ".len, __FILE__, __LINE__), ");
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ".ptr)[");
+                emit_local_name(e, func, inst->src2_local);
+                emit(e, "];\n");
+            } else {
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, "[");
+                emit_local_name(e, func, inst->src2_local);
+                emit(e, "];\n");
+            }
         }
         break;
     }

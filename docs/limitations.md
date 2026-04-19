@@ -157,8 +157,25 @@ memory, exit 0.
 
 That claim is CURRENTLY FALSE for any slice indexing after IR migration.
 
+**WRITE path also broken.** Verified `s[i] = 99` emits `s.ptr[i] = 99`
+with no bounds check. `IR_INDEX_WRITE` handler at `emitter.c:7626` is
+a stub (`TODO` comment). Slice element assignment is currently an
+uncontained buffer overflow primitive.
+
+**Regression timeline (confirmed via git archaeology):**
+- Commit `010ddea` (2026-04-15, "Phase 8b: local-ID emission for
+  BINOP/UNOP/FIELD_READ/INDEX_READ") replaced `emit_expr(inst->expr)`
+  with direct local-ID emission. The AST emitter had the bounds
+  check at `emitter.c:2045-2067` TYPE_SLICE branch; direct emission
+  strips it.
+- Commit `82335c3` (2026-04-17, "flip use_ir default") made IR path
+  default. Regression became effective.
+- Tests didn't catch it because VRP proves most real-world slice
+  indexes safe, eliminating the need for runtime check.
+
 **Fix:** ~15-20 lines in `IR_INDEX_READ` emitter — port the TYPE_SLICE
-branch from AST `emit_expr`. Same needed for `IR_INDEX_WRITE`.
+branch from AST `emit_expr`. Same needed for `IR_INDEX_WRITE` (which
+is currently only a stub).
 **Priority 0.** Highest-impact safety gap in the codebase.
 
 ### Major — backward goto cross-block (Gap 1 root cause confirmed)

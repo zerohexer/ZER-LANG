@@ -5,6 +5,68 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-20 (CFG migration Phase E) — dual-run verification
+
+Not bug fixes. Architectural milestone: `zercheck_ir.c` wired into
+`zerc_main.c` alongside `zercheck.c` as a gated dual-run verifier.
+Activates via `ZER_DUAL_RUN=1` env var; runs both analyzers and logs
+diagnostic-count disagreements without affecting compile exit code.
+
+Phase E sweep progression:
+  Initial (after wiring in):   257 disagreements across 1110 tests
+  After Phase E improvements:  108 disagreements (~58% reduction)
+
+Improvements landed this session:
+
+- **Dual-run wrapper in zerc_main.c:~492** with iterative FuncSummary
+  build loop (16 passes max, mirror of zercheck.c GAP 2 fix)
+
+- **Critical IR architecture finding** — `IR_POOL_ALLOC` / `IR_SLAB_*`
+  / etc. specialized opcodes are DEAD PER ir_lower.c:84. Phase 8d
+  collapsed them into generic `IR_ASSIGN` / `IR_CALL`. Handlers for
+  the specialized ops in zercheck_ir.c were never firing on real IR.
+
+- **Method call classification** added — `ir_classify_method_call(Node*)`
+  returns `IRMC_ALLOC` / `IRMC_FREE` / `IRMC_GET` / etc. based on the
+  NODE_FIELD callee's method name. Hooked into IR_ASSIGN and IR_CALL
+  to detect pool/slab/Task/arena operations that the IR actually emits.
+
+- **alloc_id-grouped leak detection** (mirrors zercheck.c:2631+) —
+  compute coverage UNION across all return blocks, only flag alloc_ids
+  not covered anywhere. Previously per-block check produced false
+  positives on early-return-from-orelse-fallback patterns.
+
+- **IR_COPY handler added** (was missing) — propagate alias from
+  src1_local to dest_local on local-to-local copies. Critical for
+  the `_zer_t0 → mh → _zer_or2 → h` alias chain produced by
+  `?Handle mh = alloc(); Handle h = mh orelse return` lowering.
+
+- **IR_NOP / NODE_SPAWN detection** — spawn emits IR_NOP passthrough
+  (per emitter.c:6792 comment), not IR_SPAWN. Added NODE_SPAWN
+  handling in IR_NOP with D5 bans + D3 ThreadHandle tracking +
+  arg-transfer.
+
+- **IR_ASSIGN orelse-ident alias** — `h = mh orelse return` primary
+  is NODE_IDENT (pre-lowered). Added alias path copying src's
+  tracked state to dst.
+
+- **Leak detection filters** — skip ARENA-colored / move struct /
+  Optional-typed / temp locals / compound entities from leak flags.
+  Mirrors zercheck.c's type-based exclusions.
+
+Remaining 108 disagreements fall into categories requiring targeted
+investigation (complex alias chains, interior pointers, *opaque
+struct fields, spawn_no_join IR-lowering edge). See
+`docs/compiler-internals.md` "Phase E" section for full breakdown.
+
+Full make check remains green — dual-run is gated behind ZER_DUAL_RUN,
+production builds (zercheck.c primary) unaffected.
+
+Net commits: `a606a93` (Phase E wrapper), `4168bac` (method calls +
+IR_NOP), `6d7e62a` (alloc_id grouping + iterative build).
+
+---
+
 ## Session 2026-04-19 (CFG migration Phase D) — feature parity reached
 
 Not bug fixes. Architectural milestone: `zercheck_ir.c` reached 100%

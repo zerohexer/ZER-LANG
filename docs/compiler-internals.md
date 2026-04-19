@@ -5414,24 +5414,82 @@ if inst->expr is NODE_SPAWN:
 ps->critical_depth++/-- (preserved across ir_ps_copy)
 ```
 
-### Remaining 108 disagreements — categories
+### Phase E 2026-04-20 session — 257 → 8 disagreements (~97% reduction)
 
-**Positive (93)** — false positives in zercheck_ir that zercheck.c accepts:
-- Complex alias chains through multiple COPY+ASSIGN intermediates where
-  alloc_id propagation breaks
-- Slab indexed allocations (`heap[i] = alloc()`) — compound key registration
-- Handle stored to struct field then freed via field access
+Late-session sweep landed 11 targeted improvements dropping disagreements
+from 108 to 8. Each fix below cites the commit that landed it.
 
-**Negative (15)** — cases zercheck.c catches but zercheck_ir doesn't:
-- Goto-based UAF where the cycle is detected by zercheck.c's same-block
-  iteration but zercheck_ir's CFG fixed-point converges too quickly
-- Interior pointer `&s.field` — alloc_id propagation from parent struct
-- `*opaque` struct field UAF in multi-level indirection
-- `spawn_no_join` — ThreadHandle local dropped entirely by IR lowering
-  when not used in post-spawn code path
+**UAF detection (commit `a6ce3ce`):**
+- `ir_check_expr_uaf` generic walker for IR_ASSIGN — catches
+  `pool.get(h).id = 5` where expr is NODE_ASSIGN wrapping
+  NODE_FIELD(NODE_CALL(pool.get, h), id). Recursively visits every
+  identifier use inside any expression.
+- `IR_RETURN src1_local` path — ir_lower sets src1_local for simple
+  `return ident` keeping expr NULL. Previous handler only checked
+  inst->expr, missing `free(p); return p;`.
+- Interior pointer tracking in IR_ASSIGN — `*T field_ptr = &b.c`
+  shares alloc_id with b.
+- IR_INDEX_READ handler + IR_CALL UAF walker for general use-sites.
+
+**Shadow scoping (commit `51c6f7c`):**
+- `ir_find_local_exact_first` — zercheck-specific variant that prefers
+  exact C-emission name over orig_name. Regular `ir_find_local`
+  degrades to "last match" after full-function lowering (all locals
+  hidden), which picks the WRONG local for shadow scopes.
+- is_temp skip in 4th overwrite check site (IR_CALL alloc path).
+
+**Move struct propagation (commits `2e8d84c`, `cc4a87d`, `cb9cee4`, `5751a1d`):**
+- Function call transfer for move structs — `consume(f)` marks f TRANSFERRED.
+- `&movestruct` arg handling — conservatively transfers.
+- IR_COPY assignment — `Token b = a` transfers ownership correctly.
+- Field-write reset in CFG loops — `while { Msg m; m.code = i; send(m); }`
+  resets m to ALIVE on field write, avoiding false UAF from merge.
+- Param handle auto-register on pool.free(param) + extern free(param) —
+  enables FuncSummary.frees_param to observe FREED at return.
+
+**Alias / compound key (commits `646501e`, `ecfa6d6`, `8c6b442`):**
+- source_color + is_thread_handle propagation in IR_ASSIGN alias path.
+- Escape detection + compound key registration for NODE_ASSIGN
+  passthrough (IR_FIELD_WRITE is dead, moved logic to IR_ASSIGN).
+- @ptrcast alias tracking — `raw = @ptrcast(*opaque, s)` shares
+  alloc_id. NODE_INTRINSIC args[0] is source (type_arg has the type).
+
+**ThreadHandle (commits `0cf2534`, `2eb2baa`, `61e7e48`):**
+- ThreadHandle tracked by name (IRThreadTrack) — no IR local exists
+  because emitter owns pthread_t declaration.
+- Double-join detection — error if `th.join()` called twice.
+
+**Defer (commit `f2200e8`):**
+- `rewrite_defer_body_idents` during IR_DEFER_PUSH — defer bodies in
+  inner scopes must resolve shadow-suffixed locals correctly.
+- used_locals tracking walks inst->expr AST for passthrough usages.
+
+### Remaining 8 disagreements — categories (2026-04-20)
+
+**Positive (2)** — IR reports errors on valid code:
+- `rust_tests/ownership_chain.zer` — complex alias chain through
+  multi-function call pattern.
+- `rust_tests/rt_drop_struct_object.zer` — object-with-handle-field
+  destructor pattern where field-free escape isn't recognized.
+
+**Negative (6)** — AST catches, IR misses:
+- `tests/zer_fail/goto_maybe_freed_branch.zer` — goto-loop MAYBE_FREED
+  widening. zercheck.c's same-block iteration catches backward-goto
+  UAF via 2-pass re-walk; IR CFG fixed-point converges too quickly.
+- `tests/zer_fail/move_array_elem.zer` — move struct from array
+  element (`Token copy = arr[0]`). Array element isn't tracked as a
+  distinct compound entity per-index.
+- `rust_tests/gen_null_002.zer`, `gen_uaf_003.zer` — complex null /
+  UAF patterns requiring deeper CFG analysis.
+- `rust_tests/rt_move_struct_return_then_use.zer` — dead code after
+  return (documented limitation).
+- `rust_tests/rt_scope_escape_orelse.zer` — `return s` where s came
+  from `ms orelse return` — scope escape detection inside orelse
+  fallback with bare `return`.
 
 Each category needs targeted investigation. The framework is sound;
-the remaining gaps are edge cases in specific detection paths.
+remaining gaps are edge cases in CFG-specific detection paths that
+zercheck.c handles via linear-scan semantics.
 
 ### Convergence criterion for Phase F entry
 

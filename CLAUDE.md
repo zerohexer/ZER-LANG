@@ -1104,16 +1104,19 @@ Quick reminders for common IR work:
 - Phase C complete — FuncSummary, `*opaque` 9a/9b/9c, defer scanning
 - Phase D complete — alloc coloring, ThreadHandle join, ISR bans, ghost handle, arena chain.
   D2 (keep param) + D4 (deadlock) confirmed as checker.c domain, no zercheck_ir port needed.
-- **Phase E — dual-run IN PROGRESS**. Wrapper lives in `zerc_main.c:~492` gated behind
-  `ZER_DUAL_RUN=1` env var. Runs BOTH analyzers, diffs diagnostic counts,
-  logs disagreements to stderr. Does not fail compilation (zercheck.c is source
-  of truth for exit code). Current sweep: **108 disagreements across 1110 tests**
-  (93 positive + 15 negative). Down from 257 initial; targeting zero for Phase F.
+- **Phase E — dual-run NEAR CONVERGENCE**. Wrapper lives in `zerc_main.c:~492`
+  gated behind `ZER_DUAL_RUN=1` env var. Runs BOTH analyzers, diffs diagnostic
+  counts, logs disagreements to stderr. Does not fail compilation (zercheck.c
+  is source of truth for exit code). Current sweep: **8 disagreements across
+  1110 tests** (2 positive false positives + 6 negative misses). Down from 257
+  initial (**~97% reduction**). Remaining cases: CFG goto-loop MAYBE_FREED
+  widening, array-element move tracking, dead-code-after-return, `*opaque`
+  struct field UAF, complex alias chains via return-then-use patterns.
 - Phase F pending — cutover + delete zercheck.c + tag v0.5.0
 
-**zercheck_ir.c is ~2000 lines, ~90% behavior-parity with zercheck.c (2810 lines).**
+**zercheck_ir.c is ~2700 lines, ~99% behavior-parity with zercheck.c (2810 lines).**
 100% feature-parity at the opcode level (all instruction kinds handled); the
-~10% gap is subtle semantic edge cases that surface only under dual-run.
+~1% gap is subtle semantic edge cases (CFG loop conservatism, dead-code).
 
 **Run dual-run yourself:** `ZER_DUAL_RUN=1 ./zerc FILE.zer -o /dev/null`.
 Use `ZER_DUAL_RUN=2` to also log agreements (helpful when debugging).

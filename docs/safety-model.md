@@ -647,13 +647,13 @@ Branch merges update states correctly.
 **EDGE CASES**:
 - Indirect / virtual calls: no summary available.
 - Recursive functions: DFS with memoization breaks cycles.
-- **Mutual recursion where free happens on a recursion-return path**:
-  verified 2026-04-19 — FuncSummary does NOT reliably propagate
-  the free. Two observable symptoms: (1) false-positive "handle
-  never freed" error at the caller, AND (2) missed UAF on
-  subsequent use of the handle. Workaround: factor out the free
-  into a non-recursive helper, or pass an explicit handle-return
-  value so the caller knows the state. Test reproducer exists.
+- Mutual recursion: FIXED 2026-04-19. Previously, FuncSummary
+  pinned each summary after first build and never refined it —
+  so A's summary (computed without knowing B's free behavior)
+  stayed wrong. Fixed via fixed-point iteration: `zc_build_summary`
+  now refines existing summaries, returns `changed`, and the
+  outer loop iterates until values stabilize. Test:
+  `tests/zer_fail/mutual_recursion_uaf.zer`.
 
 **TESTS**: `cross_func_free_ptr.zer`,
 `opaque_cross_func_uaf.zer`, `opaque_return_freed.zer`.
@@ -1000,11 +1000,14 @@ Gaps found during writing, then empirically verified on 2026-04-19:
 
 **Confirmed real gaps** (fallback to runtime check):
 - System 7: cross-block backward `goto` across a free. Runtime
-  gen check traps (exit 133 / SIGTRAP). Compile accepts.
-- System 9: mutual recursion where the free happens on the
-  recursion-return path. Two observable symptoms — false-positive
-  "handle never freed" error + missed UAF on subsequent use.
-  Workaround: factor free into a non-recursive helper.
+  gen check traps (exit 133 / SIGTRAP). Compile accepts. Would
+  require CFG-based zercheck refactor (~200-400 lines). Runtime
+  check is good defense-in-depth; deferred.
+
+**Fixed during verification** (originally documented as gap, now resolved):
+- System 9: mutual recursion handle tracking. Fixed via iterative
+  summary refinement in `zc_build_summary`. Test:
+  `tests/zer_fail/mutual_recursion_uaf.zer`.
 
 **Refuted during verification** (the spec was over-pessimistic;
 updated the edge cases):

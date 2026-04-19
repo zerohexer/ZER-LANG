@@ -1,0 +1,39 @@
+// Regression test for GAP 2 fix (2026-04-19):
+// Mutual recursion where the free happens through the recursion cycle.
+// Previously: FuncSummary had a pin-after-first-build bug — A's
+// summary was computed without knowing B's free behavior, and
+// pass 2+ refused to re-build existing summaries. Result: false
+// "never freed" + missed UAF.
+//
+// Fix: zc_build_summary now refines existing summaries, and the
+// outer loop iterates until values stabilize.
+//
+// This test expects COMPILE ERROR — use after free via mutual
+// recursion must be detected, AND the double-free inside b()
+// (when recursion unwinds through a→b→a→...→heap.free) is also
+// now caught.
+//
+// EXPECTED: compile error (use after free, double free)
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+void a(Handle(Task) h, u32 depth);
+void b(Handle(Task) h, u32 depth);
+
+void a(Handle(Task) h, u32 depth) {
+    if (depth > 0) { b(h, depth - 1); }
+}
+
+void b(Handle(Task) h, u32 depth) {
+    if (depth > 0) { a(h, depth - 1); }
+    heap.free(h);  // double-freed when recursion unwinds
+}
+
+u32 main() {
+    ?Handle(Task) mh = heap.alloc();
+    Handle(Task) h = mh orelse return;
+    a(h, 3);                 // transitively frees h
+    u32 id = h.id;           // USE AFTER FREE — must be caught
+    return id;
+}

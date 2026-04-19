@@ -2512,19 +2512,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     /* ---- Spawn ---- */
     case NODE_SPAWN: {
         /* Spawn uses complex wrapper structs + pthread_create.
-         * Pass through as AST node for emit_stmt to handle. */
+         * Pass through as AST node for emit_stmt to handle.
+         *
+         * NOTE: For scoped spawn (ThreadHandle th = spawn ...), no IR local
+         * is created — the emitter's NODE_SPAWN passthrough emits the
+         * pthread_t declaration directly. zercheck_ir tracks ThreadHandle
+         * join status by name via IR_NOP(NODE_SPAWN) handler, not by IR
+         * local id. */
         IRInst sp = make_inst(IR_NOP, node->loc.line);
         sp.expr = node; /* emit_stmt handles NODE_SPAWN */
         emit_inst(ctx, sp);
-        /* For scoped spawn, assign ThreadHandle */
-        if (node->spawn_stmt.handle_name) {
-            int th_id = ir_find_local(ctx->func,
-                node->spawn_stmt.handle_name,
-                (uint32_t)node->spawn_stmt.handle_name_len);
-            if (th_id >= 0) {
-                /* emit_stmt already assigned the pthread_t */
-            }
-        }
         break;
     }
 

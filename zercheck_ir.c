@@ -1841,7 +1841,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
-            /* Extern free: mark first arg's local FREED */
+            /* Extern free: mark first arg's local FREED. If no handle is
+             * registered yet (param being freed directly, never saw alloc),
+             * auto-register so state is tracked across the function. */
             if (ir_is_extern_free_call(zc, call) && call->call.arg_count >= 1) {
                 Node *arg = call->call.args[0];
                 int root_local;
@@ -1852,6 +1854,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     IRHandleInfo *h;
                     if (path_len == 0) h = ir_find_handle(ps, root_local);
                     else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    if (!h && path_len == 0 && root_local >= 0 &&
+                        root_local < func->local_count &&
+                        func->locals[root_local].is_param) {
+                        h = ir_add_handle(ps, root_local);
+                        if (h) {
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->source_color = ZC_COLOR_UNKNOWN;
+                        }
+                    }
                     if (h) {
                         if (h->state == IR_HS_FREED) {
                             ir_zc_error(zc, inst->source_line,

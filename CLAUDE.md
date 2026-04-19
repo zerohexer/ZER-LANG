@@ -1102,9 +1102,14 @@ Quick reminders for common IR work:
 - Phase A complete — 3 checker gaps closed directly (Gaps 3, 7, spawn scan cap)
 - Phase B complete — move struct, escape detection, compound keys in zercheck_ir.c
 - Phase C complete — FuncSummary, `*opaque` 9a/9b/9c, defer scanning
-- Phase D pending — 7 specialized checks (alloc coloring, keep params, thread handle join, lock ordering, ISR bans, ghost handle, arena chain)
+- Phase D complete — alloc coloring, ThreadHandle join, ISR bans, ghost handle, arena chain.
+  D2 (keep param) + D4 (deadlock) confirmed as checker.c domain, no zercheck_ir port needed.
 - Phase E pending — dual-run verification (both analyzers run, diff diagnostics)
 - Phase F pending — cutover + delete zercheck.c + tag v0.5.0
+
+**zercheck_ir.c is ~1696 lines, 100% feature-parity with zercheck.c (2810 lines).**
+Still not wired into production pipeline — zercheck.c remains primary.
+Phase E activates dual-run; Phase F flips the default and deletes zercheck.c.
 
 **For fresh sessions:**
 - Do NOT "fix" Gaps 3/7/scan-depth — already closed (BUG-600/601/602).

@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-19 (CFG migration Phase D) — feature parity reached
+
+Not bug fixes. Architectural milestone: `zercheck_ir.c` reached 100%
+feature parity with `zercheck.c`. Phase D added the final five
+specialized checks in 2 commits (`3a35521` + `34415fd`):
+
+- D1 alloc coloring (Pool/Arena/Malloc tagging, ARENA-skip in leaks)
+- D3 ThreadHandle join tracking (unjoined = specific error)
+- D5 ISR bans (slab.alloc / spawn inside interrupt or @critical)
+- D6 ghost handle detection (bare alloc statement)
+- D7 arena wrapper chain inference (returns_color through FuncSummary)
+
+D2 (keep param) and D4 (deadlock/lock ordering) were scoped to Phase D
+initially, but on inspection confirmed as already implemented in
+checker.c — runs pre-zercheck so migration inherits both. No port
+needed. See `docs/compiler-internals.md` "What Phase D added" for
+line-by-line detail.
+
+zercheck_ir.c final state: 1696 lines, 100% feature parity. Still
+not invoked on production path — Phase E wires in dual-run, Phase F
+cuts over and deletes zercheck.c.
+
+Net commits: `3a35521` (D1+D3+D5+D6), `34415fd` (D7). All test
+suites green: 2963 tests / 0 failures throughout.
+
+---
+
 ## Session 2026-04-19 (CFG migration start) — Phase A gaps closed + Phase B/C architecture
 
 This session began executing the CFG migration plan (see

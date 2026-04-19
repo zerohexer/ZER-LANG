@@ -850,6 +850,14 @@ Handle leaks are **compile errors** — allocating without `defer free()` (or re
 
 `yield` and `await` are **banned** inside defer bodies — both directly and transitively (calling a function that yields is also rejected). Defer cleanup must be atomic; suspending mid-cleanup corrupts the coroutine state machine.
 
+`defer` inside another `defer` body is also **banned** — the inner defer would run at the outer defer's execution time (scope exit), which is confusing and rarely what the programmer intends.
+
+```zer
+defer {
+    defer { cleanup(); }   // COMPILE ERROR — 'defer' cannot be nested
+}
+```
+
 **SYNTAX**
 ```zer
 defer statement;
@@ -2359,6 +2367,17 @@ u32 main() {
 }
 ```
 Zero heap, zero runtime. Each task is a stack-allocated struct (~4-50 bytes).
+
+**`yield` / `await` outside `async` is a compile error** — they only
+make sense inside async functions. Using them in a regular function
+emits nothing useful (no state machine exists), so the compiler rejects
+at the use site rather than silently stripping.
+
+```zer
+void regular() {
+    yield;   // COMPILE ERROR — 'yield' only allowed inside async function
+}
+```
 
 ### Deadlock Detection (Compile-Time)
 

@@ -756,6 +756,72 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
+    /* Phase C1: IR_CALL — apply callee's FuncSummary at the call site.
+     * If the callee is known to free its i-th param, mark the argument
+     * local FREED. Same for MAYBE_FREED. Summary produced either by
+     * zercheck.c (during dual-run) or by this file (Phase C1 build path).
+     *
+     * Call site arg resolution tries two shapes:
+     *   - decomposed: inst->call_arg_locals[i] gives the local directly
+     *   - passthrough: inst->args[i] is an AST ident → find_local
+     *
+     * Per-arg escape (non-free) cases are handled by B2 already. */
+    case IR_CALL: {
+        /* Look up callee by name */
+        const char *fn_name = inst->func_name;
+        uint32_t fn_name_len = inst->func_name_len;
+        if (!fn_name || fn_name_len == 0) break;
+
+        FuncSummary *summary = NULL;
+        for (int si = 0; si < zc->summary_count; si++) {
+            if (zc->summaries[si].func_name_len == fn_name_len &&
+                memcmp(zc->summaries[si].func_name, fn_name, fn_name_len) == 0) {
+                summary = &zc->summaries[si]; break;
+            }
+        }
+        if (!summary) break;
+
+        /* For each param the summary affects, resolve arg local, apply state */
+        for (int pi = 0; pi < summary->param_count; pi++) {
+            if (!summary->frees_param[pi] && !summary->maybe_frees_param[pi])
+                continue;
+
+            int arg_local = -1;
+            /* Decomposed path */
+            if (inst->call_arg_locals && pi < inst->call_arg_local_count) {
+                arg_local = inst->call_arg_locals[pi];
+            }
+            /* Passthrough path */
+            if (arg_local < 0 && inst->args && pi < inst->arg_count &&
+                inst->args[pi] && inst->args[pi]->kind == NODE_IDENT) {
+                arg_local = ir_find_local(func,
+                    inst->args[pi]->ident.name,
+                    (uint32_t)inst->args[pi]->ident.name_len);
+            }
+            if (arg_local < 0) continue;
+
+            IRHandleInfo *h = ir_find_handle(ps, arg_local);
+            if (!h) continue;
+
+            /* Error on using an already-invalid handle */
+            if (ir_is_invalid(h)) {
+                ir_zc_error(zc, inst->source_line,
+                    "passing %s handle %%%d to function that frees it",
+                    ir_state_name(h->state), arg_local);
+            }
+
+            /* Apply summary: definite free → FREED; maybe → MAYBE_FREED */
+            IRHandleState new_state = summary->frees_param[pi]
+                ? IR_HS_FREED : IR_HS_MAYBE_FREED;
+            h->state = new_state;
+            h->free_line = inst->source_line;
+
+            /* Propagate to aliases */
+            ir_propagate_alias_state(ps, h, new_state, inst->source_line);
+        }
+        break;
+    }
+
     /* Spawn → mark args as transferred */
     case IR_SPAWN: {
         /* Arguments passed to spawn transfer ownership */
@@ -980,6 +1046,123 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             /* Update block state */
             ir_ps_free(&block_states[bi]);
             block_states[bi] = merged;
+        }
+    }
+
+    /* Phase C1: FuncSummary build / refine. When building a summary, examine
+     * final state of param locals at each return block. Union across blocks:
+     *   - FREED in every block with a return → frees_param[i] = true
+     *   - FREED or MAYBE_FREED in some returns → maybe_frees_param[i] = true
+     *   - never FREED/MAYBE_FREED → both false
+     * Summary is attached to ZerCheck via find_summary / allocation loop
+     * identical to zercheck.c so consumers (zc_apply_summary in both paths)
+     * see the same shape. */
+    if (zc->building_summary && func->ast_node && func->ast_node->kind == NODE_FUNC_DECL) {
+        Node *fn = func->ast_node;
+        int pc = fn->func_decl.param_count;
+        if (pc > 0) {
+            bool *frees = (bool *)calloc(pc, sizeof(bool));
+            bool *maybe_frees = (bool *)calloc(pc, sizeof(bool));
+            bool *any_return_saw_alive = (bool *)calloc(pc, sizeof(bool));
+            bool *all_return_blocks_freed = (bool *)malloc(pc * sizeof(bool));
+            for (int i = 0; i < pc; i++) all_return_blocks_freed[i] = true;
+            int return_blocks = 0;
+
+            for (int bi = 0; bi < func->block_count; bi++) {
+                IRBlock *bb = &func->blocks[bi];
+                if (bb->inst_count == 0) continue;
+                if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
+                return_blocks++;
+                IRPathState *ps = &block_states[bi];
+
+                for (int i = 0; i < pc; i++) {
+                    ParamDecl *p = &fn->func_decl.params[i];
+                    TypeNode *tnode = p->type;
+                    if (!tnode || (tnode->kind != TYNODE_HANDLE &&
+                        tnode->kind != TYNODE_POINTER)) {
+                        all_return_blocks_freed[i] = false;
+                        continue;
+                    }
+                    int plocal = ir_find_local(func, p->name, (uint32_t)p->name_len);
+                    if (plocal < 0) { all_return_blocks_freed[i] = false; continue; }
+                    IRHandleInfo *h = ir_find_handle(ps, plocal);
+                    if (!h) {
+                        all_return_blocks_freed[i] = false;
+                        continue;
+                    }
+                    if (h->state == IR_HS_FREED) {
+                        maybe_frees[i] = true;  /* definitely seen on this path */
+                    } else if (h->state == IR_HS_MAYBE_FREED) {
+                        maybe_frees[i] = true;
+                        all_return_blocks_freed[i] = false;
+                    } else {
+                        any_return_saw_alive[i] = true;
+                        all_return_blocks_freed[i] = false;
+                    }
+                }
+            }
+
+            /* frees_param[i] = true iff EVERY return block had this param FREED */
+            for (int i = 0; i < pc; i++) {
+                if (return_blocks > 0 && all_return_blocks_freed[i]
+                    && !any_return_saw_alive[i] && maybe_frees[i]) {
+                    frees[i] = true;
+                }
+            }
+            free(all_return_blocks_freed);
+            free(any_return_saw_alive);
+
+            /* Update or create summary — same logic as zercheck.c:2320+ */
+            FuncSummary *existing = NULL;
+            for (int si = 0; si < zc->summary_count; si++) {
+                if (zc->summaries[si].func_name_len == (uint32_t)fn->func_decl.name_len &&
+                    memcmp(zc->summaries[si].func_name, fn->func_decl.name,
+                           fn->func_decl.name_len) == 0) {
+                    existing = &zc->summaries[si]; break;
+                }
+            }
+            if (existing) {
+                bool changed = false;
+                if (existing->param_count == pc) {
+                    for (int i = 0; i < pc; i++) {
+                        if (existing->frees_param[i] != frees[i]) changed = true;
+                        if (existing->maybe_frees_param[i] != maybe_frees[i]) changed = true;
+                    }
+                } else {
+                    changed = true;
+                }
+                if (changed) {
+                    free(existing->frees_param);
+                    free(existing->maybe_frees_param);
+                    existing->param_count = pc;
+                    existing->frees_param = frees;
+                    existing->maybe_frees_param = maybe_frees;
+                } else {
+                    free(frees); free(maybe_frees);
+                }
+            } else {
+                if (zc->summary_count >= zc->summary_capacity) {
+                    int nc = zc->summary_capacity < 8 ? 8 : zc->summary_capacity * 2;
+                    FuncSummary *ns = (FuncSummary *)realloc(zc->summaries,
+                        nc * sizeof(FuncSummary));
+                    if (ns) {
+                        zc->summaries = ns;
+                        zc->summary_capacity = nc;
+                    }
+                }
+                if (zc->summary_count < zc->summary_capacity) {
+                    FuncSummary *s = &zc->summaries[zc->summary_count++];
+                    memset(s, 0, sizeof(FuncSummary));
+                    s->func_name = fn->func_decl.name;
+                    s->func_name_len = (uint32_t)fn->func_decl.name_len;
+                    s->param_count = pc;
+                    s->frees_param = frees;
+                    s->maybe_frees_param = maybe_frees;
+                    s->returns_param_color = -1;
+                } else {
+                    free(frees); free(maybe_frees);
+                }
+            }
         }
     }
 

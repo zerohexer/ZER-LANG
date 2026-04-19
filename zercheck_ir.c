@@ -135,6 +135,55 @@ static const char *ir_state_name(IRHandleState s) {
 }
 
 /* ================================================================
+ * Move struct type detection (Phase B1 — ported from zercheck.c:920-961)
+ *
+ * A `move struct` has is_move=true on its struct_type. Passing or
+ * assigning a move-struct-typed value transfers ownership: source
+ * becomes TRANSFERRED, destination takes over as ALIVE.
+ *
+ * contains_move_struct_field / should_track_move cover the case
+ * where a regular struct has a move struct field — the outer struct
+ * inherits transfer semantics.
+ * ================================================================ */
+
+static bool ir_is_move_struct_type(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
+}
+
+static bool ir_contains_move_struct_field(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    if (eff->kind == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
+            if (ir_is_move_struct_type(eff->struct_type.fields[i].type))
+                return true;
+        }
+    }
+    /* Union containing move struct variant */
+    if (eff->kind == TYPE_UNION) {
+        for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
+            if (ir_is_move_struct_type(eff->union_type.variants[i].type))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool ir_should_track_move(Type *t) {
+    return t && (ir_is_move_struct_type(t) || ir_contains_move_struct_field(t));
+}
+
+/* Allocation ID counter for move struct new-ownership chains.
+ * When ownership transfers (e.g., Token b = a), the destination
+ * gets a fresh alloc_id representing a new ownership identity —
+ * the source's alloc_id goes with its TRANSFERRED state. */
+static int _ir_next_alloc_id = 1000000;  /* high base so it doesn't
+                                            collide with local_id-based
+                                            ids set at allocation */
+
+/* ================================================================
  * CFG Merge — the key advantage over linear AST walk
  *
  * At basic block join points (multiple predecessors), merge handle
@@ -283,7 +332,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
-    /* Assign → alias tracking */
+    /* Assign → alias tracking or move transfer.
+     * Phase B1: move struct types get TRANSFER semantics (not alias).
+     * `Token b = a` transfers ownership: a → TRANSFERRED, b → ALIVE (new id). */
     case IR_ASSIGN: {
         if (inst->dest_local >= 0 && inst->expr) {
             /* If source is an ident that's a tracked handle, create alias */
@@ -293,19 +344,50 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     (uint32_t)inst->expr->ident.name_len);
                 if (src_local >= 0) {
                     IRHandleInfo *src_h = ir_find_handle(ps, src_local);
-                    if (src_h && src_h->state == IR_HS_ALIVE) {
+                    Type *src_type = (src_local < func->local_count)
+                        ? func->locals[src_local].type : NULL;
+                    bool is_move = ir_should_track_move(src_type);
+
+                    if (is_move) {
+                        /* Move transfer: source → TRANSFERRED, dest → new ALIVE */
+                        if (src_h && src_h->state == IR_HS_TRANSFERRED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use of transferred value (local %%%d) — ownership already moved",
+                                src_local);
+                        } else if (src_h && ir_is_invalid(src_h)) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use of %s handle %%%d",
+                                ir_state_name(src_h->state), src_local);
+                        }
+                        /* Ensure source exists as handle so we can mark it */
+                        if (!src_h) src_h = ir_add_handle(ps, src_local);
+                        if (src_h) {
+                            src_h->state = IR_HS_TRANSFERRED;
+                            src_h->free_line = inst->source_line;
+                        }
+                        /* Destination takes new ownership identity */
                         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                         if (dst_h) {
                             dst_h->state = IR_HS_ALIVE;
-                            dst_h->alloc_line = src_h->alloc_line;
-                            dst_h->alloc_id = src_h->alloc_id;
+                            dst_h->alloc_line = inst->source_line;
+                            dst_h->alloc_id = _ir_next_alloc_id++;
                         }
-                    }
-                    /* Check use of invalid handle */
-                    if (src_h && ir_is_invalid(src_h)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use of %s handle %%%d",
-                            ir_state_name(src_h->state), src_local);
+                    } else {
+                        /* Non-move: regular alias */
+                        if (src_h && src_h->state == IR_HS_ALIVE) {
+                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                            if (dst_h) {
+                                dst_h->state = IR_HS_ALIVE;
+                                dst_h->alloc_line = src_h->alloc_line;
+                                dst_h->alloc_id = src_h->alloc_id;
+                            }
+                        }
+                        /* Check use of invalid handle */
+                        if (src_h && ir_is_invalid(src_h)) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use of %s handle %%%d",
+                                ir_state_name(src_h->state), src_local);
+                        }
                     }
                 }
             }
@@ -313,16 +395,36 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
-    /* Return → check no handles leaked, mark terminated */
+    /* Return → check no handles leaked, mark terminated.
+     * Phase B1: returning a move struct value transfers ownership
+     * to caller. Source is marked TRANSFERRED (not merely escaped) —
+     * subsequent use in unreachable code still detectable. */
     case IR_RETURN: {
-        /* Check for escape (returned handle) */
         if (inst->expr && inst->expr->kind == NODE_IDENT) {
             int ret_local = ir_find_local(func,
                 inst->expr->ident.name,
                 (uint32_t)inst->expr->ident.name_len);
-            if (ret_local >= 0) {
+            if (ret_local >= 0 && ret_local < func->local_count) {
                 IRHandleInfo *h = ir_find_handle(ps, ret_local);
-                if (h) h->escaped = true;
+                Type *ret_type = func->locals[ret_local].type;
+                if (ir_should_track_move(ret_type)) {
+                    /* Check using transferred/freed value before return */
+                    if (h && ir_is_invalid(h)) {
+                        ir_zc_error(zc, inst->source_line,
+                            "returning %s value (local %%%d)",
+                            ir_state_name(h->state), ret_local);
+                    }
+                    /* Mark TRANSFERRED — caller owns it now */
+                    if (!h) h = ir_add_handle(ps, ret_local);
+                    if (h) {
+                        h->state = IR_HS_TRANSFERRED;
+                        h->free_line = inst->source_line;
+                        h->escaped = true;
+                    }
+                } else {
+                    /* Non-move: just mark escaped (existing behavior) */
+                    if (h) h->escaped = true;
+                }
             }
         }
         ps->terminated = true;
@@ -340,6 +442,46 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (arg_local >= 0) {
                     IRHandleInfo *h = ir_find_handle(ps, arg_local);
                     if (h) h->state = IR_HS_TRANSFERRED;
+                }
+            }
+        }
+        break;
+    }
+
+    /* Phase B1: FIELD_WRITE with move struct RHS transfers ownership.
+     * Closes Gap 5: `b.item = t` where Box(Tok) b — t transferred to
+     * the container field. Subsequent use of t = use-after-transfer.
+     * Handles two target shapes:
+     *   - src1_local = container local (decomposed path)
+     *   - inst->expr  = AST NODE_ASSIGN (passthrough path)
+     * Both route through the same logic: find source local, check its
+     * type for move-struct, mark TRANSFERRED if so. */
+    case IR_FIELD_WRITE: {
+        /* Resolve RHS local — could be src2_local (decomposed) or
+         * inst->expr's value side (passthrough). */
+        int rhs_local = -1;
+        if (inst->src2_local >= 0) {
+            rhs_local = inst->src2_local;
+        } else if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+                   inst->expr->assign.value &&
+                   inst->expr->assign.value->kind == NODE_IDENT) {
+            rhs_local = ir_find_local(func,
+                inst->expr->assign.value->ident.name,
+                (uint32_t)inst->expr->assign.value->ident.name_len);
+        }
+        if (rhs_local >= 0 && rhs_local < func->local_count) {
+            Type *rhs_type = func->locals[rhs_local].type;
+            if (ir_should_track_move(rhs_type)) {
+                IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+                if (rh && ir_is_invalid(rh)) {
+                    ir_zc_error(zc, inst->source_line,
+                        "use of %s value (local %%%d) in field write",
+                        ir_state_name(rh->state), rhs_local);
+                }
+                if (!rh) rh = ir_add_handle(ps, rhs_local);
+                if (rh) {
+                    rh->state = IR_HS_TRANSFERRED;
+                    rh->free_line = inst->source_line;
                 }
             }
         }

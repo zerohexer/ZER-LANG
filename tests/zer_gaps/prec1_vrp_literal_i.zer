@@ -1,0 +1,16 @@
+// PRECISION GAP #1 (2026-04-19 audit)
+// CLAIM: VRP doesn't propagate `u32 i = literal_value` through to
+//        the array index. Direct `arr[10]` on size-4 array errors
+//        at compile time; `u32 i = 10; arr[i]` only warns + adds
+//        auto-guard.
+// SAFETY: auto-guard inserts `if (i >= 4) { return 0; }` — program
+//         is safe at runtime. Just a precision/message difference.
+// FIX APPROACH: extend `derive_expr_range` to resolve NODE_IDENT
+//               to its init expr's range when the variable was
+//               assigned only once from a constant. VRP enhancement.
+
+u32 main() {
+    u32[4] arr;
+    u32 i = 10;             // range [10, 10] not propagated
+    return arr[i];          // warning, auto-guard, returns 0
+}

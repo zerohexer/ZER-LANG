@@ -1,0 +1,21 @@
+// Regression test for Phase 1 audit gap (2026-04-19):
+// Silent miscompilation — comptime loop silently truncated at
+// iter=10000 without error. The function returned the value at
+// truncation point (e.g. 10000 instead of 10000000), emitted
+// that as a compile-time constant. Programs got wrong results.
+//
+// Fix: detect iter-limit exit (not cond-exit, not body-return,
+// not budget-exhaustion) and mark CONST_EVAL_FAIL so the outer
+// "comptime function could not be evaluated at compile time"
+// error fires correctly.
+//
+// EXPECTED: compile error (loop doesn't terminate within
+// the comptime iteration budget)
+
+comptime u32 truncates() {
+    u32 x = 0;
+    while (x < 10000000) { x += 1; }
+    return x;
+}
+
+u32 main() { return truncates(); }

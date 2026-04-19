@@ -1,0 +1,24 @@
+// GAP #5 (2026-04-19 audit)
+// CLAIM: move struct transferred through a container field is not
+//        tracked — use after transfer via container field access
+//        compiles clean.
+// EFFECT: `b.item = t` transfers t's ownership to b.item. Later
+//         `consume(b.item)` transfers b.item. Then `b.item.k` is
+//         use-after-transfer. Move-tracking doesn't propagate
+//         through container monomorphized field writes.
+// FIX APPROACH: extend move tracking to detect transfers through
+//               container field assignments. Medium effort.
+
+move struct Tok { u32 k; }
+container Box(T) { T item; }
+
+u32 consume(Tok t) { return t.k; }
+
+u32 main() {
+    Tok t; t.k = 1;
+    Box(Tok) b;
+    b.item = t;                 // t transferred to b.item — OK
+    u32 x = consume(b.item);    // b.item transferred to consume
+    u32 y = b.item.k;           // USE AFTER TRANSFER — should error
+    return x + y;
+}

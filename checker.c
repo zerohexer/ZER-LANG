@@ -1920,11 +1920,25 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                     ct_ctx_set(ctx, stmt->for_stmt.init->var_decl.name,
                         (uint32_t)stmt->for_stmt.init->var_decl.name_len, val);
                 }
-                for (int iter = 0; iter < 10000; iter++) {
-                    if (++_comptime_ops > 1000000) { goto ct_done; }
+                {
+                /* GAP fix 2026-04-19: previously the 10k iter cap silently
+                 * exited the loop if the cond hadn't become false — leading
+                 * to the outer function returning whatever value the counter
+                 * had reached (10k instead of, say, 10M). Silent
+                 * miscompilation. Fix: when we exit via iter limit rather
+                 * than cond=false or body-return, mark the whole comptime
+                 * eval as failed so the caller reports "comptime function
+                 * could not be evaluated" instead of using a truncated value. */
+                bool exited_via_cond = false;
+                int iter;
+                for (iter = 0; iter < 10000; iter++) {
+                    if (++_comptime_ops > 1000000) { result = CONST_EVAL_FAIL; goto ct_done; }
                     if (stmt->for_stmt.cond) {
                         int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, ctx->locals, ctx->count);
-                        if (cond == CONST_EVAL_FAIL || !cond) break;
+                        if (cond == CONST_EVAL_FAIL || !cond) { exited_via_cond = true; break; }
+                    } else {
+                        /* no cond = infinite loop from the point of view of
+                         * comptime eval; guarantee iter-limit exit handling */
                     }
                     /* body — recursive call shares ctx (mutations persist) */
                     int64_t r = eval_comptime_block(stmt->for_stmt.body, ctx);
@@ -1935,24 +1949,38 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                             { goto ct_done; }
                     }
                 }
+                if (iter == 10000 && !exited_via_cond) {
+                    result = CONST_EVAL_FAIL;
+                    goto ct_done;
+                }
+                }
                 continue;
             }
 
             /* While loop */
             if (stmt->kind == NODE_WHILE || stmt->kind == NODE_DO_WHILE) {
-                for (int iter = 0; iter < 10000; iter++) {
-                    if (++_comptime_ops > 1000000) { goto ct_done; }
+                /* GAP fix 2026-04-19: same truncation bug as the for-loop
+                 * above. Exit via iter limit (rather than cond=false) =
+                 * silent miscompilation. Force CONST_EVAL_FAIL in that case. */
+                bool exited_via_cond = false;
+                int iter;
+                for (iter = 0; iter < 10000; iter++) {
+                    if (++_comptime_ops > 1000000) { result = CONST_EVAL_FAIL; goto ct_done; }
                     /* do-while: execute body before checking condition on first iteration */
                     if (stmt->kind == NODE_DO_WHILE && iter == 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
                         if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
                     }
                     int64_t cond = eval_const_expr_subst(stmt->while_stmt.cond, ctx->locals, ctx->count);
-                    if (cond == CONST_EVAL_FAIL || !cond) break;
+                    if (cond == CONST_EVAL_FAIL || !cond) { exited_via_cond = true; break; }
                     if (stmt->kind == NODE_WHILE || iter > 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
                         if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
                     }
+                }
+                if (iter == 10000 && !exited_via_cond) {
+                    result = CONST_EVAL_FAIL;
+                    goto ct_done;
                 }
                 continue;
             }

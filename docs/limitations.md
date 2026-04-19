@@ -55,12 +55,75 @@ the float path.
 
 ## Remaining known failures
 
-### 2 rust_tests skipped (hardware constraint, not a compiler bug)
+### No skipped tests
 
-- `rt_unsafe_mmio_multi_reg`, `rt_unsafe_mmio_volatile_rw` — access real
-  hardware addresses (`0x40020000...`). On a hosted Linux test runner
-  these cause SIGSEGV/SIGTRAP. Need a QEMU-like environment or mocked
-  MMIO to actually run. Not a compiler bug.
+All tests run. The 2 mmio hardware tests moved to `rust_tests/qemu/` and
+run under QEMU Cortex-M3 (see `docs/compiler-internals.md` "QEMU MMIO
+test infrastructure").
+
+---
+
+## Phase 1 audit findings (2026-04-19 — 52 adversarial tests, 24 safety systems)
+
+Full systematic audit of the 29-system framework. 52 adversarial `.zer`
+programs were written, one or more per system, each attempting to
+trigger a safety-system violation. Expected: every test compile-errors.
+Observed: 7 real gaps + 1 silent miscompilation (fixed) + 7 over-pessimistic
+spec claims (corrected — tests revealed the claims were weaker than
+the implementation actually guarantees).
+
+Reproducers live in `tests/zer_gaps/` (committed as documentation of
+current behavior — NOT in the `make check` run, since they pass when
+they should fail). When a gap is fixed, move the reproducer to
+`tests/zer_fail/` as a regression test.
+
+### Real safety/correctness gaps
+
+| # | Short name | Gap | Runtime fallback | Fix est. |
+|---|---|---|---|---|
+| 1 | **Cross-block backward goto UAF** | `free(h); goto LABEL; ... LABEL: ... use(h)` — zercheck linear-walk can't track cycles | Slab gen counter traps at runtime (exit 133 / SIGTRAP) | ~300 lines — CFG-based zercheck rewrite |
+| 2 | **Same-line UAF suppressed** | `h.free(p); u32 x = p.x;` on same line — `h->free_line < cur_line` check filters | Slab gen counter traps | ~30 lines — replace line-compare with statement-counter |
+| 3 | **`yield` outside async silently stripped** | `void go() { yield; }` compiles; emits no-op | None (silent behavior) | ~5 lines — check `!in_async` in NODE_YIELD |
+| 4 | **async + shared struct across yield** | `async { s.v = 1; yield; s.v = 2; }` on a `shared struct` — lock held across yield = deadlock per spec, not enforced | Potential deadlock at runtime | medium — AST walker for shared access in async fn |
+| 5 | **`container<move struct>` loses move semantics** | `Box(Tok) b; b.item = t; consume(b.item); b.item.k` — move-transfer through container field not tracked | None (use after transfer) | medium — move-tracking through field writes |
+| 6 | **`goto` into if-unwrap capture scope** | `goto inside; if (m) \|v\| { inside: return v; }` — captured `v` uninitialized at goto target | Auto-zero (returns 0 silently) | medium — label reachability analysis |
+| 7 | **`defer` nested in `defer` body** | `defer { defer { ... } }` accepted per spec says banned | Runs inner defer at outer defer fire time | ~5 lines — check `defer_depth > 0` in NODE_DEFER |
+
+### Precision issues (not safety)
+
+- **VRP doesn't propagate `u32 i = literal_value`** (`tests/zer_gaps/s12_range_oob.zer`) — direct `arr[10]` is rejected at compile time, but `u32 i = 10; arr[i];` only triggers auto-guard warning. Safe via auto-guard emission. VRP improvement opportunity.
+- **`*opaque` cast to wrong type inside same function** (`tests/zer_gaps/s5_param_prov.zer`) — param used as both `*A` and `*B`. Compile accepts; runtime type_id check traps on the wrong-type cast. Same class as Gap 1 — compile blind, runtime catches.
+
+### Fixed this session
+
+- **Comptime loop truncation** — silent miscompilation where 10k iter cap
+  stopped loops without error, returning truncated values. See BUG
+  entry above / `tests/zer_fail/comptime_loop_truncation.zer`.
+- **Mutual recursion handle tracking** (Gap 2 from earlier spec) —
+  fixed via iterative FuncSummary refinement. See
+  `tests/zer_fail/mutual_recursion_uaf.zer`.
+
+### Spec corrections (claims were stronger than needed)
+
+Systematic adversarial testing found several EDGE CASES in the safety
+spec that were pessimistic — the implementation actually handles them:
+
+- **Pass-by-value move transfer** is caught (spec said "not a transfer").
+- **Mutual recursion with `% N` return range** is propagated (spec said cleared).
+- **Simple 2D array UAF** is caught (spec said "not covered").
+- **Defer fires after return expression** — using handle in return expr before defer free is legal (test was wrong, not a gap).
+- **Semaphore release without acquire** is legal (initial-count pattern).
+- **Per-statement shared(rw) locking** is correct (test was wrong).
+- **goto skipping a `defer`** is correct (defer never pushed = no fire, semantically fine).
+
+### Empirical coverage
+
+- All 4 safety models covered.
+- All 24 safety-critical systems tested at least once.
+- Infrastructure systems 1 (Typemap) and 2 (Type ID) not adversarially
+  tested — they're self-validating (broken Typemap = no test compiles;
+  broken Type ID = cross-module cast mismatches). Existing 1400+
+  passing tests indirectly validate them.
 
 ---
 
@@ -70,3 +133,6 @@ All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,
 rust_tests/run_tests.sh, zig_tests/run_tests.sh) are back-referenced here.
 When fixing an entry, remove it from the relevant list to prevent
 regression-hiding.
+
+When a `tests/zer_gaps/` reproducer is fixed, move it to
+`tests/zer_fail/` so it becomes a permanent regression guard.

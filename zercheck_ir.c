@@ -1646,14 +1646,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         /* Phase E: move struct ownership transfer on function call args.
          * When `consume(f)` is called and f is a move struct (or contains
          * move struct fields), the argument transfers ownership and the
-         * caller's local becomes TRANSFERRED. Subsequent use = UAF. */
+         * caller's local becomes TRANSFERRED. Subsequent use = UAF.
+         *
+         * Also handles `process(&k)` — taking address of move struct and
+         * passing to function conservatively transfers ownership. */
         if (inst->expr && inst->expr->kind == NODE_CALL) {
             Node *call = inst->expr;
             for (int pi = 0; pi < call->call.arg_count; pi++) {
                 Node *arg = call->call.args[pi];
-                if (!arg || arg->kind != NODE_IDENT) continue;
+                if (!arg) continue;
+                /* Unwrap &expr to get root ident */
+                Node *root = arg;
+                if (root->kind == NODE_UNARY && root->unary.op == TOK_AMP)
+                    root = root->unary.operand;
+                if (!root || root->kind != NODE_IDENT) continue;
                 int arg_local = ir_find_local_exact_first(func,
-                    arg->ident.name, (uint32_t)arg->ident.name_len);
+                    root->ident.name, (uint32_t)root->ident.name_len);
                 if (arg_local < 0 || arg_local >= func->local_count) continue;
                 Type *arg_type = func->locals[arg_local].type;
                 if (!ir_should_track_move(arg_type)) continue;

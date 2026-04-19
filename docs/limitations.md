@@ -235,6 +235,58 @@ recursive call chains.
   via direct walk, or whether depth wasn't actually > 31. Requires
   instrumentation to confirm.
 
+### AST→IR emission audit — 6 more runtime-check regressions found
+
+After confirming the slice bounds check regression, I ran a systematic
+AST→IR diff audit: grep every `_zer_trap` / `_zer_bounds_check` /
+`_zer_shl` / `_zer_probe` call-site in `emit_expr` (AST path, now
+mostly dead for function bodies), then wrote one reproducer test per
+mechanism. Reproducers in `tests/zer_gaps/ast_*.zer`.
+
+**All regressions in same window** — commits `010ddea` (2026-04-15,
+Phase 8b local-ID emission) through `82335c3` (2026-04-17, IR default).
+
+| # | Mechanism | AST path | IR path | Reproducer |
+|---|---|---|---|---|
+| 1 | Slice bounds check (READ) | `_zer_bounds_check` emitter.c:2045 | raw `s.ptr[i]` emitter.c:7498 | `audit2_slice_oob.zer` |
+| 2 | Slice bounds check (WRITE) | same as READ | `IR_INDEX_WRITE` stub `/* TODO */` emitter.c:7626 | same |
+| 3 | Slice range `arr[a..b]` (a > b) | `_zer_trap("slice start > end")` emitter.c:2258 | raw `se - ss` (underflow) | `ast_slice_empty_range.zer` |
+| 4 | Signed division overflow (INT_MIN/-1) | `_zer_trap("signed division overflow")` emitter.c:1068 | raw `a / b` (C UB) | `ast_signed_div_overflow.zer` |
+| 5 | Shift over width (`x << n` where n ≥ width) | `_zer_shl` macro (clamps to 0) | raw `x << n` (C UB) | `ast_shift_over_width.zer` |
+| 6 | @inttoptr mmio range (variable address) | `_zer_trap("outside mmio range")` emitter.c:2650 | raw cast, no check | `ast_inttoptr_mmio.zer` |
+| 7 | @inttoptr alignment (variable address) | `_zer_trap("unaligned address")` emitter.c:2660 | raw cast, no check | `ast_inttoptr_align.zer` |
+
+**NOT regressions** (still protected):
+- Division by zero — checker forces compile-time guard (can't reach without explicit `if (b==0)`)
+- @ptrcast type mismatch — checker catches at compile time via provenance
+- Compile-time-provable array OOB (`arr[10]` on `u32[4]`) — checker error
+- Array runtime OOB with variable index — `emit_auto_guards` separate pass still works
+- @trap / @probe — emitted correctly through IR (verified)
+- Handle gen check — `_zer_slab_get` runtime always called, independent of emit path
+
+**Root cause for all 7:** commit `010ddea` replaced `emit_expr(inst->expr)`
+routing with direct local-ID emission in IR handlers. Every safety-emit
+that `emit_expr` wrapped around expressions was stripped. Arrays
+survived because `emit_auto_guards` runs as a separate pass before IR
+lowering. Slices and the other mechanisms have no separate-pass
+equivalent.
+
+**Impact:** Currently shipping v0.4.5 produces binaries with:
+- Unchecked buffer overflows on any `[*]T` indexing
+- Silent integer UB on shifts and signed division
+- No MMIO range or alignment safety on variable-address @inttoptr
+
+**Fix is localized:** port each safety-emit from `emit_expr` into the
+corresponding IR emitter handler. Estimated:
+- IR_INDEX_READ/WRITE: ~30 lines
+- IR_BINOP (shift, signed div): ~20 lines
+- IR_CAST / @inttoptr handling: ~30 lines
+- Slice `[a..b]` range check: ~10 lines
+
+Total ~90 lines in emitter.c. No checker or IR data structure changes.
+Would graduate the compiler from "unsafe in ways CLAUDE.md claims it
+isn't" back to its pre-IR-migration safety level.
+
 ### Doc accuracy issue
 
 CLAUDE.md states `alloc_ptr/free_ptr` is "100% compile-time safe for

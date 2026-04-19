@@ -1,0 +1,6 @@
+// runtime unknown divisor — checker requires guard
+u32 divide(u32 a, u32 b) {
+    if (b == 0) { return 0; }
+    return a / b;
+}
+u32 main() { return divide(10, 0); }

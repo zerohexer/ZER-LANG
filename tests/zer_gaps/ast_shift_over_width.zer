@@ -1,0 +1,7 @@
+// shift by >= width should be 0, not UB
+u32 main() {
+    u32 x = 5;
+    u32 n = 40;  // > 32, should be treated as 0
+    for (u32 i = 0; i < 1; i += 1) { n = 40; }
+    return x << n;
+}

@@ -468,6 +468,81 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
 }
 
 /* ================================================================
+ * *opaque / extern alloc-free recognition (Phase C2 — 9a/9b/9c)
+ *
+ * For cross-module C interop (cinclude), the compiler needs to recognize
+ * extern functions that allocate or free pointers even without an explicit
+ * FuncSummary built by zc_ir_build_summary. The rules mirror zercheck.c:
+ *
+ *  Alloc:  bodyless function returning *opaque / *T / ?*T / ?*opaque
+ *          e.g., malloc, sqlite3_open, fopen
+ *
+ *  Free:   bodyless void function whose first param is *opaque / *T
+ *          e.g., free, sqlite3_close, fclose, destroy
+ *          OR explicitly named "free"
+ *
+ * When we recognize these at IR_CALL sites, we update the tracked state
+ * accordingly. 9a (struct field *opaque UAF) is covered by the existing
+ * B3 compound keys + these alloc/free sites. 9b (cross-function free)
+ * is covered by C1 FuncSummary OR the signature heuristic here for extern
+ * functions that don't have summaries built. 9c (return freed pointer)
+ * is handled in the IR_RETURN handler above.
+ * ================================================================ */
+
+/* Check if a call is to an extern function that returns a pointer-like
+ * type (allocator heuristic). Returns true for malloc/fopen/create/etc. */
+static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    Symbol *sym = scope_lookup(zc->checker->global_scope,
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (!sym || !sym->is_function || !sym->func_node) return false;
+    /* must be bodyless (extern or cinclude) */
+    if (sym->func_node->func_decl.body) return false;
+    Type *ret = sym->type;
+    if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+    if (!ret) return false;
+    ret = type_unwrap_distinct(ret);
+    if (ret->kind == TYPE_POINTER || ret->kind == TYPE_OPAQUE) return true;
+    if (ret->kind == TYPE_OPTIONAL) {
+        Type *inner = type_unwrap_distinct(ret->optional.inner);
+        if (inner && (inner->kind == TYPE_POINTER || inner->kind == TYPE_OPAQUE))
+            return true;
+    }
+    return false;
+}
+
+/* Check if a call is to a function that frees its first argument.
+ * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
+ * param (signature heuristic — catches destroy/close/cleanup patterns). */
+static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    if (call->call.arg_count < 1) return false;
+    /* Explicit "free" */
+    if (callee->ident.name_len == 4 &&
+        memcmp(callee->ident.name, "free", 4) == 0) return true;
+    /* Signature heuristic: bodyless void fn(*opaque/*T ...) */
+    Symbol *sym = scope_lookup(zc->checker->global_scope,
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (!sym || !sym->is_function || !sym->func_node) return false;
+    if (sym->func_node->func_decl.body) return false;
+    Type *ret = sym->type;
+    if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+    if (!ret || type_unwrap_distinct(ret)->kind != TYPE_VOID) return false;
+    if (sym->func_node->func_decl.param_count < 1) return false;
+    Type *p0 = NULL;
+    if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
+        sym->type->func_ptr.param_count >= 1)
+        p0 = sym->type->func_ptr.params[0];
+    if (!p0) return false;
+    p0 = type_unwrap_distinct(p0);
+    return p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE;
+}
+
+/* ================================================================
  * Defer body scanning (Phase C3)
  *
  * Ported from zercheck.c:343-388 (defer_stmt_is_free + defer_scan_all_frees).
@@ -806,6 +881,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->escaped = true;
                     }
                 } else {
+                    /* Phase C2 (9c): returning a freed pointer. Any handle
+                     * in a FREED/MAYBE_FREED/TRANSFERRED state is unsafe to
+                     * hand to the caller. This catches `free(p); return p;`
+                     * and any alias of a freed allocation. */
+                    if (h && ir_is_invalid(h)) {
+                        ir_zc_error(zc, inst->source_line,
+                            "returning %s pointer (local %%%d, freed at line %d) — "
+                            "caller would receive dangling pointer",
+                            ir_state_name(h->state), ret_local, h->free_line);
+                    }
                     if (h) h->escaped = true;
                 }
             }
@@ -831,16 +916,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
-    /* Phase C1: IR_CALL — apply callee's FuncSummary at the call site.
-     * If the callee is known to free its i-th param, mark the argument
-     * local FREED. Same for MAYBE_FREED. Summary produced either by
-     * zercheck.c (during dual-run) or by this file (Phase C1 build path).
+    /* Phase C1 + C2: IR_CALL — apply callee's FuncSummary at the call
+     * site, or recognize extern alloc/free via signature heuristic.
+     *
+     * Resolution order:
+     *   1. FuncSummary built by zc_ir_build_summary / zercheck.c
+     *   2. Signature heuristic for extern alloc (returns pointer)
+     *      → register dest local as ALIVE
+     *   3. Signature heuristic for extern free (void fn with *opaque arg0)
+     *      → mark arg[0] local FREED
      *
      * Call site arg resolution tries two shapes:
      *   - decomposed: inst->call_arg_locals[i] gives the local directly
      *   - passthrough: inst->args[i] is an AST ident → find_local
-     *
-     * Per-arg escape (non-free) cases are handled by B2 already. */
+     */
     case IR_CALL: {
         /* Look up callee by name */
         const char *fn_name = inst->func_name;
@@ -854,6 +943,58 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 summary = &zc->summaries[si]; break;
             }
         }
+
+        /* Phase C2: if no summary, try signature heuristics on inst->expr
+         * (the AST NODE_CALL). Covers extern malloc/free/destroy patterns. */
+        if (!summary && inst->expr && inst->expr->kind == NODE_CALL) {
+            Node *call = inst->expr;
+
+            /* Extern alloc: register dest_local as ALIVE */
+            if (inst->dest_local >= 0 && ir_is_extern_alloc_call(zc, call)) {
+                IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                if (h) {
+                    if (h->state == IR_HS_ALIVE) {
+                        ir_zc_error(zc, inst->source_line,
+                            "handle %%%d overwritten while alive — previous allocation leaked",
+                            inst->dest_local);
+                    }
+                    h->state = IR_HS_ALIVE;
+                    h->alloc_line = inst->source_line;
+                    h->alloc_id = _ir_next_alloc_id++;
+                }
+            }
+
+            /* Extern free: mark first arg's local FREED */
+            if (ir_is_extern_free_call(zc, call) && call->call.arg_count >= 1) {
+                Node *arg = call->call.args[0];
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, arg,
+                                             &root_local, &path, &path_len) == 0) {
+                    IRHandleInfo *h;
+                    if (path_len == 0) h = ir_find_handle(ps, root_local);
+                    else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    if (h) {
+                        if (h->state == IR_HS_FREED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "double free: local %%%d already freed at line %d",
+                                root_local, h->free_line);
+                        } else if (h->state == IR_HS_MAYBE_FREED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "freeing local %%%d which may already be freed",
+                                root_local);
+                        }
+                        h->state = IR_HS_FREED;
+                        h->free_line = inst->source_line;
+                        ir_propagate_alias_state(ps, h, IR_HS_FREED,
+                                                  inst->source_line);
+                    }
+                }
+            }
+            break;
+        }
+
         if (!summary) break;
 
         /* For each param the summary affects, resolve arg local, apply state */

@@ -143,6 +143,34 @@ int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
     return (best >= 0) ? best : fallback;
 }
 
+/* Phase E: zercheck-specific lookup that prefers exact-name match over
+ * orig_name match. After full-function lowering all locals are hidden,
+ * so regular ir_find_local's "prefer non-hidden" degrades to "return
+ * last match", which picks the WRONG local for shadow-scope patterns.
+ *
+ * Example: outer `h` at %2 (name="h"), inner `h` at %7 (name="h_7",
+ * orig="h"). Query "h" with regular lookup returns %7 (last match by
+ * orig_name). Exact-first returns %2 (only match by exact name "h").
+ *
+ * Used only by zercheck_ir walkers after lowering. */
+int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len) {
+    int exact_match = -1;
+    int orig_match = -1;
+    for (int i = 0; i < func->local_count; i++) {
+        if (func->locals[i].name_len == name_len &&
+            func->locals[i].name &&
+            memcmp(func->locals[i].name, name, name_len) == 0) {
+            exact_match = func->locals[i].id;
+        } else if (func->locals[i].orig_name_len == name_len &&
+                   func->locals[i].orig_name &&
+                   memcmp(func->locals[i].orig_name, name, name_len) == 0) {
+            orig_match = func->locals[i].id;
+        }
+    }
+    if (exact_match >= 0) return exact_match;
+    return orig_match;
+}
+
 int ir_add_block(IRFunc *func, Arena *arena) {
     if (func->block_count >= func->block_capacity) {
         int new_cap = func->block_capacity * 2;

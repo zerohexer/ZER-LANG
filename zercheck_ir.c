@@ -365,7 +365,7 @@ static int ir_find_value_local(IRFunc *func, Node *val) {
     if (!val) return -1;
     if (val->kind == NODE_ORELSE) val = val->orelse.expr;
     if (val && val->kind == NODE_IDENT) {
-        return ir_find_local(func,
+        return ir_find_local_exact_first(func,
             val->ident.name, (uint32_t)val->ident.name_len);
     }
     return -1;
@@ -524,7 +524,7 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
 
     Node *root = ir_key_root_ident(expr);
     if (!root) return -1;
-    int local = ir_find_local(func,
+    int local = ir_find_local_exact_first(func,
         root->ident.name, (uint32_t)root->ident.name_len);
     if (local < 0) return -1;
     *out_local = local;
@@ -949,8 +949,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->dest_local >= 0) {
             IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
             if (h) {
-                /* Check for overwrite of alive handle (leak) */
-                if (h->state == IR_HS_ALIVE) {
+                /* Check for overwrite of alive handle (leak). Skip temp
+                 * locals — they represent intermediate values in loops
+                 * and control flow; their reassignment is expected and
+                 * the "real" allocation flow lives on user-visible
+                 * variables via alias chains. */
+                if (h->state == IR_HS_ALIVE &&
+                    inst->dest_local < func->local_count &&
+                    !func->locals[inst->dest_local].is_temp) {
                     ir_zc_error(zc, inst->source_line,
                         "handle %%%d overwritten while alive — previous allocation leaked",
                         inst->dest_local);
@@ -994,7 +1000,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         for (int i = 0; i < sp->spawn_stmt.arg_count; i++) {
             Node *arg = sp->spawn_stmt.args[i];
             if (!arg || arg->kind != NODE_IDENT) continue;
-            int arg_local = ir_find_local(func,
+            int arg_local = ir_find_local_exact_first(func,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
             if (arg_local < 0) continue;
             IRHandleInfo *h = ir_find_handle(ps, arg_local);
@@ -1209,7 +1215,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * is a NODE_IDENT referencing a tracked local. Alias the
              * destination to source, mirroring the bare-ident path below. */
             if (inst->expr->kind == NODE_ORELSE && rhs && rhs->kind == NODE_IDENT) {
-                int src_local = ir_find_local(func,
+                int src_local = ir_find_local_exact_first(func,
                     rhs->ident.name, (uint32_t)rhs->ident.name_len);
                 if (src_local >= 0) {
                     IRHandleInfo *src_h = ir_find_handle(ps, src_local);
@@ -1240,7 +1246,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     else break;
                 }
                 if (target && target->kind == NODE_IDENT) {
-                    int base_local = ir_find_local(func,
+                    int base_local = ir_find_local_exact_first(func,
                         target->ident.name, (uint32_t)target->ident.name_len);
                     if (base_local >= 0) {
                         IRHandleInfo *base_h = ir_find_handle(ps, base_local);
@@ -1263,7 +1269,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
                     IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                     if (h) {
-                        if (h->state == IR_HS_ALIVE) {
+                        if (h->state == IR_HS_ALIVE &&
+                            inst->dest_local < func->local_count &&
+                            !func->locals[inst->dest_local].is_temp) {
                             ir_zc_error(zc, inst->source_line,
                                 "handle %%%d overwritten while alive — previous leaked",
                                 inst->dest_local);
@@ -1307,7 +1315,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
             /* If source is an ident that's a tracked handle, create alias */
             if (inst->expr->kind == NODE_IDENT) {
-                int src_local = ir_find_local(func,
+                int src_local = ir_find_local_exact_first(func,
                     inst->expr->ident.name,
                     (uint32_t)inst->expr->ident.name_len);
                 if (src_local >= 0) {
@@ -1416,7 +1424,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
         /* Case (a): direct ident return */
         if (primary && primary->kind == NODE_IDENT) {
-            int ret_local = ir_find_local(func,
+            int ret_local = ir_find_local_exact_first(func,
                 primary->ident.name,
                 (uint32_t)primary->ident.name_len);
             if (ret_local >= 0 && ret_local < func->local_count) {
@@ -1519,7 +1527,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if ((mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) && inst->dest_local >= 0) {
                 IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                 if (h) {
-                    if (h->state == IR_HS_ALIVE) {
+                    if (h->state == IR_HS_ALIVE &&
+                        inst->dest_local < func->local_count &&
+                        !func->locals[inst->dest_local].is_temp) {
                         ir_zc_error(zc, inst->source_line,
                             "handle %%%d overwritten while alive — previous leaked",
                             inst->dest_local);
@@ -1621,7 +1631,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (inst->dest_local >= 0 && ir_is_extern_alloc_call(zc, call)) {
                 IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                 if (h) {
-                    if (h->state == IR_HS_ALIVE) {
+                    if (h->state == IR_HS_ALIVE &&
+                        inst->dest_local < func->local_count &&
+                        !func->locals[inst->dest_local].is_temp) {
                         ir_zc_error(zc, inst->source_line,
                             "handle %%%d overwritten while alive — previous allocation leaked",
                             inst->dest_local);
@@ -1703,7 +1715,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             /* Passthrough path */
             if (arg_local < 0 && inst->args && pi < inst->arg_count &&
                 inst->args[pi] && inst->args[pi]->kind == NODE_IDENT) {
-                arg_local = ir_find_local(func,
+                arg_local = ir_find_local_exact_first(func,
                     inst->args[pi]->ident.name,
                     (uint32_t)inst->args[pi]->ident.name_len);
             }
@@ -1750,7 +1762,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         /* Arguments passed to spawn transfer ownership */
         for (int i = 0; i < inst->arg_count; i++) {
             if (inst->args && inst->args[i] && inst->args[i]->kind == NODE_IDENT) {
-                int arg_local = ir_find_local(func,
+                int arg_local = ir_find_local_exact_first(func,
                     inst->args[i]->ident.name,
                     (uint32_t)inst->args[i]->ident.name_len);
                 if (arg_local >= 0) {
@@ -1763,7 +1775,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         /* Phase D3: scoped spawn produces a ThreadHandle. Register it so
          * leak detection can report "thread not joined" specifically. */
         if (inst->is_scoped_spawn && inst->handle_name && inst->handle_name_len > 0) {
-            int th_local = ir_find_local(func,
+            int th_local = ir_find_local_exact_first(func,
                 inst->handle_name, inst->handle_name_len);
             if (th_local >= 0) {
                 IRHandleInfo *h = ir_add_handle(ps, th_local);
@@ -2024,7 +2036,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         all_return_blocks_freed[i] = false;
                         continue;
                     }
-                    int plocal = ir_find_local(func, p->name, (uint32_t)p->name_len);
+                    int plocal = ir_find_local_exact_first(func, p->name, (uint32_t)p->name_len);
                     if (plocal < 0) { all_return_blocks_freed[i] = false; continue; }
                     IRHandleInfo *h = ir_find_handle(ps, plocal);
                     if (!h) {
@@ -2073,7 +2085,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 if (!ret_expr || ret_expr->kind != NODE_IDENT) {
                     inferred_color = -2; break;
                 }
-                int rlocal = ir_find_local(func,
+                int rlocal = ir_find_local_exact_first(func,
                     ret_expr->ident.name, (uint32_t)ret_expr->ident.name_len);
                 if (rlocal < 0) { inferred_color = -2; break; }
                 IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);

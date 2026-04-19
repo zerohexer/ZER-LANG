@@ -254,6 +254,7 @@ int ir_add_local(IRFunc *func, Arena *arena,
 
 /* Look up a local by name. Returns local ID or -1 if not found. */
 int ir_find_local(IRFunc *func, const char *name, uint32_t name_len);
+int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len);
 
 /* Create a new basic block. Returns the block ID. */
 int ir_add_block(IRFunc *func, Arena *arena);

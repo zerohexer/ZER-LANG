@@ -1329,6 +1329,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 break;
             }
 
+            /* Phase E: @ptrcast alias tracking. `*opaque raw = @ptrcast(*opaque, s)`
+             * creates an alias: raw should share alloc_id with s. When s is
+             * freed, raw becomes FREED via ir_propagate_alias_state. The
+             * type arg is stored in type_arg, not args — args[0] is the src. */
+            if (rhs && rhs->kind == NODE_INTRINSIC &&
+                rhs->intrinsic.name && rhs->intrinsic.name_len == 7 &&
+                memcmp(rhs->intrinsic.name, "ptrcast", 7) == 0 &&
+                rhs->intrinsic.arg_count >= 1) {
+                Node *src = rhs->intrinsic.args[0];
+                if (src && src->kind == NODE_IDENT) {
+                    int src_local = ir_find_local_exact_first(func,
+                        src->ident.name, (uint32_t)src->ident.name_len);
+                    if (src_local >= 0) {
+                        IRHandleInfo *src_h = ir_find_handle(ps, src_local);
+                        if (src_h) {
+                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                            if (dst_h) {
+                                dst_h->state = src_h->state;
+                                dst_h->alloc_line = src_h->alloc_line;
+                                dst_h->alloc_id = src_h->alloc_id;
+                                dst_h->source_color = src_h->source_color;
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Phase E: interior pointer tracking. `*T field_ptr = &b.c`
              * lowers to IR_ASSIGN with expr = NODE_UNARY(TOK_AMP, NODE_FIELD(b, c)).
              * field_ptr should share alloc_id with b so when b is freed,

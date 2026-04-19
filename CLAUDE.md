@@ -1098,18 +1098,37 @@ Quick reminders for common IR work:
 
 **In progress.** Long-term plan: delete `zercheck.c` (2810-line linear AST walker), replace with `zercheck_ir.c` (CFG-based, growing toward parity). Both coexist during migration — zercheck.c is PRIMARY in the pipeline, zercheck_ir.c is compiled but NOT invoked on production path yet.
 
-**Current state as of 2026-04-19:**
+**Current state as of 2026-04-20:**
 - Phase A complete — 3 checker gaps closed directly (Gaps 3, 7, spawn scan cap)
 - Phase B complete — move struct, escape detection, compound keys in zercheck_ir.c
 - Phase C complete — FuncSummary, `*opaque` 9a/9b/9c, defer scanning
 - Phase D complete — alloc coloring, ThreadHandle join, ISR bans, ghost handle, arena chain.
   D2 (keep param) + D4 (deadlock) confirmed as checker.c domain, no zercheck_ir port needed.
-- Phase E pending — dual-run verification (both analyzers run, diff diagnostics)
+- **Phase E — dual-run IN PROGRESS**. Wrapper lives in `zerc_main.c:~492` gated behind
+  `ZER_DUAL_RUN=1` env var. Runs BOTH analyzers, diffs diagnostic counts,
+  logs disagreements to stderr. Does not fail compilation (zercheck.c is source
+  of truth for exit code). Current sweep: **108 disagreements across 1110 tests**
+  (93 positive + 15 negative). Down from 257 initial; targeting zero for Phase F.
 - Phase F pending — cutover + delete zercheck.c + tag v0.5.0
 
-**zercheck_ir.c is ~1696 lines, 100% feature-parity with zercheck.c (2810 lines).**
-Still not wired into production pipeline — zercheck.c remains primary.
-Phase E activates dual-run; Phase F flips the default and deletes zercheck.c.
+**zercheck_ir.c is ~2000 lines, ~90% behavior-parity with zercheck.c (2810 lines).**
+100% feature-parity at the opcode level (all instruction kinds handled); the
+~10% gap is subtle semantic edge cases that surface only under dual-run.
+
+**Run dual-run yourself:** `ZER_DUAL_RUN=1 ./zerc FILE.zer -o /dev/null`.
+Use `ZER_DUAL_RUN=2` to also log agreements (helpful when debugging).
+
+**Critical IR lowering fact (Phase 8d, per ir_lower.c:84):**
+`IR_POOL_ALLOC` / `IR_SLAB_ALLOC` / `IR_POOL_FREE` / etc. enum values exist
+but are **NEVER emitted by ir_lower.c**. Pool/Slab/Task method calls flow
+through generic `IR_ASSIGN` (with NODE_ORELSE wrapping NODE_CALL, or direct
+NODE_CALL) and `IR_CALL` (with `inst->expr` holding the call). Specialized
+handlers for those opcodes in `zercheck_ir.c` are dead code. Method detection
+lives in `IR_ASSIGN` and `IR_CALL` via `ir_classify_method_call(Node*)`.
+
+**Do NOT try to "fix" the absence of IR_POOL_ALLOC emission** — this is
+intentional architecture. Add detection in IR_ASSIGN/IR_CALL method-call
+paths instead.
 
 **For fresh sessions:**
 - Do NOT "fix" Gaps 3/7/scan-depth — already closed (BUG-600/601/602).

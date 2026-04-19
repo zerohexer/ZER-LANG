@@ -5244,3 +5244,200 @@ calls zercheck_ir directly, and asserts expected errors.
 
 `test_zercheck.c` currently exercises the zercheck.c API. Creating
 `test_zercheck_ir.c` is future work (post-Phase D, pre-Phase E).
+
+---
+
+## Phase E — Dual-run verification (IN PROGRESS, 2026-04-20)
+
+The final step before Phase F cutover. Phase E wires `zercheck_ir.c`
+into `zerc_main.c` alongside `zercheck.c`, runs BOTH on every compile,
+and diffs diagnostic counts. Goal: converge to zero disagreements
+across the full test suite (~1110 tests). Current state: 108 remaining
+disagreements (down from 257 initial).
+
+### Dual-run wrapper location and contract
+
+**File:** `zerc_main.c`, in the zercheck block (~line 492+).
+
+**Activation:** `ZER_DUAL_RUN=1` env var. `ZER_DUAL_RUN=2` enables
+verbose "agree" logging for debugging.
+
+**Design:**
+
+```c
+zercheck_run(&zc, main_mod->ast);  // zercheck.c — primary, determines exit code
+bool ast_ok = zc.error_count == 0;
+
+if (getenv("ZER_DUAL_RUN")) {
+    ZerCheck zc_ir;
+    zercheck_init(&zc_ir, ...);
+
+    // Iterative FuncSummary build (16 passes max) — mutual recursion convergence
+    zc_ir.building_summary = true;
+    for (pass = 0..15) {
+        for each func: ir_lower + zercheck_ir(zc_ir, func);
+        if summaries stable: break;
+    }
+    zc_ir.building_summary = false;
+
+    // Main analysis pass
+    for each func: zercheck_ir(zc_ir, func);
+
+    // Loose parity: both 0 OR both > 0 agree. Only pure mismatches
+    // (0 vs >0 or vice versa) logged as disagreement.
+    if ((ast==0) != (ir==0)) log disagreement;
+}
+
+if (!ast_ok) exit 1;  // still driven by zercheck.c
+```
+
+**Loose parity semantics:** Negative tests may factor errors differently
+between analyzers (e.g., zercheck.c emits 3 errors for a goto-cycle,
+zercheck_ir emits 1). Both catching the bug counts as agreement. Only
+full misses (one catches, the other doesn't) are flagged.
+
+### Critical IR lowering fact — IR_POOL_* is dead
+
+Per `ir_lower.c:84`: "IR_POOL_ALLOC etc. — collapsed to IR_ASSIGN in
+Phase 8d". The specialized opcodes (`IR_POOL_ALLOC`, `IR_SLAB_ALLOC`,
+`IR_POOL_FREE`, `IR_SLAB_FREE`, `IR_POOL_GET`, `IR_SLAB_ALLOC_PTR`,
+`IR_SLAB_FREE_PTR`, `IR_ARENA_ALLOC`, `IR_ARENA_ALLOC_SLICE`) exist in
+the enum but are NEVER emitted by the lowering pass.
+
+**What's actually emitted:**
+
+| Source | IR shape |
+|---|---|
+| `pool.alloc()` / `heap.alloc()` / `Task.alloc()` | `IR_CALL` with dest_local set; `inst->expr` = NODE_CALL (method on struct/pool). OR `IR_ASSIGN` with NODE_CALL when part of `?Handle x = alloc()` |
+| `pool.alloc() orelse return` | `IR_ASSIGN` with `inst->expr` = NODE_ORELSE (pre-lowered to IDENT form in many cases) |
+| `pool.free(h)` | `IR_CALL` with dest_local = -1, `inst->expr` = NODE_CALL |
+| `pool.get(h).field` | `IR_ASSIGN` with NODE_CALL inside field access, or direct IR_CALL |
+| `arena.alloc(T)` | `IR_ASSIGN`/`IR_CALL` with `ir_classify_method_call` returning `IRMC_ARENA_ALLOC` |
+
+**Method classification** (`ir_classify_method_call(Node*)` in zercheck_ir.c):
+
+Returns `IRMC_ALLOC` / `IRMC_ALLOC_PTR` / `IRMC_GET` / `IRMC_FREE` /
+`IRMC_FREE_PTR` / `IRMC_ARENA_ALLOC` / `IRMC_NONE` based on the call's
+NODE_FIELD callee field name. arena.alloc distinguished from pool.alloc
+by arg count (arena takes a type arg, pool takes none).
+
+**Lesson for fresh sessions:** do NOT add cases to the specialized
+`IR_POOL_ALLOC` / `IR_SLAB_*` handlers in zercheck_ir.c expecting them
+to fire. Add detection in the `IR_ASSIGN` method-classification block
+or the `IR_CALL` method-classification block.
+
+### Leak detection — alloc_id grouping (mirrors zercheck.c:2631+)
+
+Naive per-block leak detection produces false positives on real-world
+patterns (early-return from orelse fallback, alias chains where only
+the user variable is freed). The correct approach:
+
+1. **Union coverage phase** — walk all return blocks. For each ALIVE
+   handle whose state becomes FREED / TRANSFERRED / escaped in SOME
+   return block, add its `alloc_id` to a covered set.
+
+2. **Flag phase** — walk all return blocks again. For each ALIVE handle
+   whose `alloc_id` is NOT in the covered set, emit a leak error.
+   Dedup across blocks via a reported-ids set (one error per alloc_id).
+
+**Why this works:**
+
+- `?Handle mh = alloc(); Handle h = mh orelse return;` — mh's temp
+  (%1, `?Handle`) is ALIVE at the fallback-return block, but the
+  success path assigns it to `h` via alias chain, and `free(h)`
+  marks alloc_id FREED on the success-return block. Coverage union
+  → alloc_id covered → no leak error on fallback block.
+
+- Multiple return paths where some free, some escape — any coverage
+  counts.
+
+**Filters applied per-handle before flagging:**
+
+- `h->source_color == ZC_COLOR_ARENA` — arena.reset() frees wholesale
+- `ir_should_track_move(lt)` — move struct stack values (exit scope)
+- `le->kind == TYPE_OPTIONAL` — nullable temps (fallback = null case)
+- `loc->is_temp` — compiler-generated intermediates (user alias tracks)
+- `h->path_len > 0` — compound entities (non-allocation)
+
+### Phase E mechanism additions by instruction
+
+**IR_ASSIGN:**
+
+```
+if expr is NODE_ORELSE and primary is NODE_IDENT:
+    alias dst to src's ident (covers `h = mh orelse return` pattern)
+    break
+
+if expr unwrapped is NODE_CALL:
+    classify method call → IRMC_ALLOC/ARENA_ALLOC/ALLOC_PTR/GET
+    if alloc: register dest ALIVE with POOL/ARENA color; break
+    if get: UAF check on arg
+
+(fall through to existing NODE_IDENT alias path)
+```
+
+**IR_CALL:**
+
+```
+if callee is NODE_FIELD(th, "join") + th is ThreadHandle:
+    mark th FREED
+
+if inst->expr is NODE_CALL:
+    classify method call → IRMC_*
+    if alloc: register dest ALIVE; break
+    if free: mark handle FREED, propagate aliases; break
+    if get: UAF check; break
+
+(fall through to FuncSummary apply + extern alloc/free heuristic)
+```
+
+**IR_COPY** (new handler — was missing):
+
+```
+if src has tracked handle:
+    alias dst inheriting state + alloc_id + source_color + is_thread_handle
+    error if src is invalid (UAF through copy)
+```
+
+**IR_NOP:**
+
+```
+if inst->expr is NODE_SPAWN:
+    D5 interrupt/@critical bans
+    transfer args (TRANSFERRED state)
+    if scoped + handle_name: register ThreadHandle
+```
+
+**IR_CRITICAL_BEGIN / IR_CRITICAL_END:**
+
+```
+ps->critical_depth++/-- (preserved across ir_ps_copy)
+```
+
+### Remaining 108 disagreements — categories
+
+**Positive (93)** — false positives in zercheck_ir that zercheck.c accepts:
+- Complex alias chains through multiple COPY+ASSIGN intermediates where
+  alloc_id propagation breaks
+- Slab indexed allocations (`heap[i] = alloc()`) — compound key registration
+- Handle stored to struct field then freed via field access
+
+**Negative (15)** — cases zercheck.c catches but zercheck_ir doesn't:
+- Goto-based UAF where the cycle is detected by zercheck.c's same-block
+  iteration but zercheck_ir's CFG fixed-point converges too quickly
+- Interior pointer `&s.field` — alloc_id propagation from parent struct
+- `*opaque` struct field UAF in multi-level indirection
+- `spawn_no_join` — ThreadHandle local dropped entirely by IR lowering
+  when not used in post-spawn code path
+
+Each category needs targeted investigation. The framework is sound;
+the remaining gaps are edge cases in specific detection paths.
+
+### Convergence criterion for Phase F entry
+
+- Zero disagreements across 1110 tests (full positive + negative sweep)
+- 3 successive runs produce identical output (stability)
+- test_modules/ cross-module parity verified
+
+Not yet met. Phase F (delete zercheck.c, tag v0.5.0) is blocked on
+reaching zero.

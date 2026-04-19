@@ -1023,6 +1023,38 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * a tracked alias of the source. */
     case IR_COPY: {
         if (inst->dest_local < 0 || inst->src1_local < 0) break;
+
+        /* Phase E: move struct assignment — `Token b = a` transfers
+         * ownership. src becomes TRANSFERRED, dest becomes ALIVE with
+         * a fresh alloc_id. Detected by the src type being a move
+         * struct (or containing move fields). */
+        if (inst->dest_local < func->local_count &&
+            inst->src1_local < func->local_count) {
+            Type *src_type = func->locals[inst->src1_local].type;
+            if (ir_should_track_move(src_type)) {
+                IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
+                if (src_h && src_h->state == IR_HS_TRANSFERRED) {
+                    ir_zc_error(zc, inst->source_line,
+                        "use after move: '%.*s' ownership transferred at line %d",
+                        (int)func->locals[inst->src1_local].name_len,
+                        func->locals[inst->src1_local].name,
+                        src_h->free_line);
+                }
+                if (!src_h) src_h = ir_add_handle(ps, inst->src1_local);
+                if (src_h) {
+                    src_h->state = IR_HS_TRANSFERRED;
+                    src_h->free_line = inst->source_line;
+                }
+                IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                if (dst_h) {
+                    dst_h->state = IR_HS_ALIVE;
+                    dst_h->alloc_line = inst->source_line;
+                    dst_h->alloc_id = _ir_next_alloc_id++;
+                }
+                break;
+            }
+        }
+
         IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
         if (!src_h) break;
         /* Error if source is invalid */

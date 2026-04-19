@@ -510,6 +510,53 @@ int main(int argc, char **argv) {
             arena_free(&cc.arena);
             return 1;
         }
+
+        /* Phase E: optional dual-run. When ZER_DUAL_RUN=1 is set,
+         * also run zercheck_ir.c (CFG-based) on each function and
+         * log any diagnostic-count disagreements to stderr.
+         * zercheck.c remains the source of truth for the compile's
+         * success/failure; zercheck_ir errors are accumulated into
+         * a separate counter for comparison only.
+         *
+         * First-pass goal: get both running end-to-end without crashes
+         * and observe the disagreement distribution. Precise per-message
+         * diffing is a follow-up refinement. */
+        extern bool zercheck_ir(ZerCheck *zc_ir, IRFunc *func);
+        const char *dual = getenv("ZER_DUAL_RUN");
+        if (dual && dual[0] != '\0' && dual[0] != '0') {
+            ZerCheck zc_ir;
+            zercheck_init(&zc_ir, &checker, &cc.arena, input_path);
+            zc_ir.import_asts = import_asts;
+            zc_ir.import_ast_count = import_ast_count;
+            int ir_func_count = 0;
+            int ir_error_count_start = zc_ir.error_count;
+            for (int i = 0; i < main_mod->ast->file.decl_count; i++) {
+                Node *decl = main_mod->ast->file.decls[i];
+                if (decl->kind != NODE_FUNC_DECL) continue;
+                if (!decl->func_decl.body) continue;
+                IRFunc *ir = ir_lower_func(&cc.arena, &checker, decl);
+                if (!ir) continue;
+                ir->module_prefix = NULL;
+                ir->module_prefix_len = 0;
+                zercheck_ir(&zc_ir, ir);
+                ir_func_count++;
+            }
+            int ast_err = zc.error_count;
+            int ir_err = zc_ir.error_count - ir_error_count_start;
+            if (ast_err != ir_err) {
+                fprintf(stderr,
+                    "zercheck DUAL-RUN disagreement in %s: ast=%d ir=%d "
+                    "(functions analyzed: %d)\n",
+                    input_path, ast_err, ir_err, ir_func_count);
+            } else if (dual[0] == '2') {
+                /* ZER_DUAL_RUN=2 for verbose agree confirmation */
+                fprintf(stderr,
+                    "zercheck DUAL-RUN agree in %s: %d error%s "
+                    "(functions analyzed: %d)\n",
+                    input_path, ast_err, ast_err == 1 ? "" : "s",
+                    ir_func_count);
+            }
+        }
     }
 
     /* emit C */

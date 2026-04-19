@@ -1641,6 +1641,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (h->escaped) continue;
             /* Phase D1: ARENA-colored allocs don't need individual free */
             if (h->source_color == ZC_COLOR_ARENA) continue;
+            /* Phase E: move struct stack values don't need free — they
+             * exit scope naturally. Mirrors zercheck.c pool_id == -3.
+             * Check the local's type, not state — a non-escaped ALIVE
+             * move struct at function exit is legitimate. */
+            if (h->local_id >= 0 && h->local_id < func->local_count) {
+                Type *lt = func->locals[h->local_id].type;
+                if (ir_should_track_move(lt)) continue;
+            }
             /* Compound entities aren't "allocated locals" — skip ghost check */
             if (h->path_len > 0) {
                 /* Still a leak candidate but never a ghost */

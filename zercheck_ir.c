@@ -1094,6 +1094,19 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
         if (!summary) break;
 
+        /* Phase D7: if callee returns an ARENA-colored pointer, tag the
+         * call's dest local so it's skipped in leak detection. Propagates
+         * arena coloring through wrapper chains (create_task → outer). */
+        if (inst->dest_local >= 0 && summary->returns_color == ZC_COLOR_ARENA) {
+            IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+            if (dh) {
+                dh->state = IR_HS_ALIVE;
+                dh->alloc_line = inst->source_line;
+                if (dh->alloc_id == 0) dh->alloc_id = inst->dest_local;
+                dh->source_color = ZC_COLOR_ARENA;
+            }
+        }
+
         /* For each param the summary affects, resolve arg local, apply state */
         for (int pi = 0; pi < summary->param_count; pi++) {
             if (!summary->frees_param[pi] && !summary->maybe_frees_param[pi])
@@ -1457,6 +1470,37 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             free(all_return_blocks_freed);
             free(any_return_saw_alive);
 
+            /* Phase D7: Arena wrapper chain inference.
+             * Determine returns_color by examining what each return block
+             * returns. If all returns yield ARENA-colored values, the
+             * function's returns_color is ARENA. This propagates arena
+             * coloring through wrapper chains like:
+             *   *T create(Arena *a) { return arena.alloc(T).ptr; }
+             *   *T wrap() { return create(&g_arena); }           // ARENA
+             *   *T outer() { return wrap(); }                     // ARENA */
+            int inferred_color = -1;  /* -1 = unset, -2 = mixed */
+            for (int bi = 0; bi < func->block_count; bi++) {
+                IRBlock *bb = &func->blocks[bi];
+                if (bb->inst_count == 0) continue;
+                IRInst *last = &bb->insts[bb->inst_count - 1];
+                if (last->op != IR_RETURN || !last->expr) continue;
+                /* Identify returned local (direct ident or primary of orelse) */
+                Node *ret_expr = last->expr;
+                if (ret_expr->kind == NODE_ORELSE) ret_expr = ret_expr->orelse.expr;
+                if (!ret_expr || ret_expr->kind != NODE_IDENT) {
+                    inferred_color = -2; break;
+                }
+                int rlocal = ir_find_local(func,
+                    ret_expr->ident.name, (uint32_t)ret_expr->ident.name_len);
+                if (rlocal < 0) { inferred_color = -2; break; }
+                IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
+                int color = rh ? rh->source_color : ZC_COLOR_UNKNOWN;
+                if (inferred_color == -1) inferred_color = color;
+                else if (inferred_color != color) { inferred_color = -2; break; }
+            }
+            int returns_color_final =
+                (inferred_color < 0) ? ZC_COLOR_UNKNOWN : inferred_color;
+
             /* Update or create summary — same logic as zercheck.c:2320+ */
             FuncSummary *existing = NULL;
             for (int si = 0; si < zc->summary_count; si++) {
@@ -1476,12 +1520,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 } else {
                     changed = true;
                 }
+                if (existing->returns_color != returns_color_final) changed = true;
                 if (changed) {
                     free(existing->frees_param);
                     free(existing->maybe_frees_param);
                     existing->param_count = pc;
                     existing->frees_param = frees;
                     existing->maybe_frees_param = maybe_frees;
+                    existing->returns_color = returns_color_final;
                 } else {
                     free(frees); free(maybe_frees);
                 }
@@ -1503,6 +1549,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     s->param_count = pc;
                     s->frees_param = frees;
                     s->maybe_frees_param = maybe_frees;
+                    s->returns_color = returns_color_final;
                     s->returns_param_color = -1;
                 } else {
                     free(frees); free(maybe_frees);

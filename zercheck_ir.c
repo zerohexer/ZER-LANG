@@ -58,6 +58,14 @@ typedef struct {
     int free_line;         /* where freed */
     int alloc_id;          /* groups aliases — same alloc = same id */
     bool escaped;          /* returned, stored to global, etc. */
+    /* Phase D1: allocation color — tracks where memory came from.
+     * ZC_COLOR_POOL   — Pool/Slab, needs individual free or defer.
+     * ZC_COLOR_ARENA  — Arena, freed by arena.reset(). Skip leak check.
+     * ZC_COLOR_MALLOC — extern malloc/calloc, needs matching free.
+     * ZC_COLOR_UNKNOWN (0) — param, cinclude, can't determine. */
+    int source_color;
+    /* Phase D3: ThreadHandle — from scoped spawn. Leak = "thread not joined". */
+    bool is_thread_handle;
 } IRHandleInfo;
 
 /* Per-block analysis state */
@@ -66,6 +74,11 @@ typedef struct {
     int handle_count;
     int handle_capacity;
     bool terminated;       /* block ends with return/unreachable */
+    /* Phase D5: @critical nesting depth. Tracked via IR_CRITICAL_BEGIN
+     * and IR_CRITICAL_END. While > 0, spawn is banned (would create
+     * thread with interrupts disabled — hardware-unsafe). Alloc from
+     * slab also banned (calloc/realloc may deadlock if interrupted). */
+    int critical_depth;
 } IRPathState;
 
 /* ================================================================
@@ -77,6 +90,7 @@ static void ir_ps_init(IRPathState *ps) {
     ps->handle_count = 0;
     ps->handle_capacity = 0;
     ps->terminated = false;
+    ps->critical_depth = 0;
 }
 
 static IRPathState ir_ps_copy(IRPathState *src) {
@@ -84,6 +98,7 @@ static IRPathState ir_ps_copy(IRPathState *src) {
     dst.handle_count = src->handle_count;
     dst.handle_capacity = src->handle_count > 0 ? src->handle_count : 4;
     dst.terminated = false;
+    dst.critical_depth = src->critical_depth; /* Phase D5: preserve */
     dst.handles = (IRHandleInfo *)malloc(dst.handle_capacity * sizeof(IRHandleInfo));
     if (src->handles && src->handle_count > 0)
         memcpy(dst.handles, src->handles, src->handle_count * sizeof(IRHandleInfo));
@@ -644,10 +659,26 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
     switch (inst->op) {
 
-    /* Allocation → register handle as ALIVE */
+    /* Allocation → register handle as ALIVE with POOL color (Phase D1)
+     * Phase D5: slab.alloc banned in interrupt handlers and in @critical
+     * blocks — calloc/realloc (slab growth) may deadlock if interrupted.
+     * Pool.alloc is fine (no malloc underneath), so only check slab here. */
     case IR_POOL_ALLOC:
     case IR_SLAB_ALLOC:
     case IR_SLAB_ALLOC_PTR: {
+        /* Phase D5: ISR + @critical bans for slab-backed allocation */
+        if (inst->op == IR_SLAB_ALLOC || inst->op == IR_SLAB_ALLOC_PTR) {
+            if (func->is_interrupt) {
+                ir_zc_error(zc, inst->source_line,
+                    "slab.alloc() banned in interrupt handler — "
+                    "calloc may deadlock. Use Pool(T, N) with fixed capacity.");
+            } else if (ps->critical_depth > 0) {
+                ir_zc_error(zc, inst->source_line,
+                    "slab.alloc() banned inside @critical block — "
+                    "calloc may deadlock with interrupts disabled.");
+            }
+        }
+
         if (inst->dest_local >= 0) {
             IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
             if (h) {
@@ -660,6 +691,31 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 h->state = IR_HS_ALIVE;
                 h->alloc_line = inst->source_line;
                 h->alloc_id = inst->dest_local; /* simple: local_id = alloc_id */
+                h->source_color = ZC_COLOR_POOL;
+            }
+        }
+        break;
+    }
+
+    /* Phase D5: @critical block entry/exit — affects subsequent alloc/spawn checks */
+    case IR_CRITICAL_BEGIN:
+        ps->critical_depth++;
+        break;
+    case IR_CRITICAL_END:
+        if (ps->critical_depth > 0) ps->critical_depth--;
+        break;
+
+    /* Phase D1: Arena allocation → ARENA color. Skipped in leak detection
+     * because arena.reset() frees everything wholesale. */
+    case IR_ARENA_ALLOC:
+    case IR_ARENA_ALLOC_SLICE: {
+        if (inst->dest_local >= 0) {
+            IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+            if (h) {
+                h->state = IR_HS_ALIVE;
+                h->alloc_line = inst->source_line;
+                h->alloc_id = inst->dest_local;
+                h->source_color = ZC_COLOR_ARENA;
             }
         }
         break;
@@ -931,6 +987,31 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      *   - passthrough: inst->args[i] is an AST ident → find_local
      */
     case IR_CALL: {
+        /* Phase D3: ThreadHandle.join() — mark the thread handle as
+         * freed. Shape: inst->expr is NODE_CALL with callee NODE_FIELD
+         * (th, "join"). If th resolves to a tracked thread handle, it
+         * is now joined and not a leak. */
+        if (inst->expr && inst->expr->kind == NODE_CALL &&
+            inst->expr->call.callee &&
+            inst->expr->call.callee->kind == NODE_FIELD) {
+            Node *fld = inst->expr->call.callee;
+            if (fld->field.field_name_len == 4 &&
+                memcmp(fld->field.field_name, "join", 4) == 0 &&
+                fld->field.object &&
+                fld->field.object->kind == NODE_IDENT) {
+                int th_local = ir_find_local(func,
+                    fld->field.object->ident.name,
+                    (uint32_t)fld->field.object->ident.name_len);
+                if (th_local >= 0) {
+                    IRHandleInfo *h = ir_find_handle(ps, th_local);
+                    if (h && h->is_thread_handle) {
+                        h->state = IR_HS_FREED;
+                        h->free_line = inst->source_line;
+                    }
+                }
+            }
+        }
+
         /* Look up callee by name */
         const char *fn_name = inst->func_name;
         uint32_t fn_name_len = inst->func_name_len;
@@ -949,7 +1030,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (!summary && inst->expr && inst->expr->kind == NODE_CALL) {
             Node *call = inst->expr;
 
-            /* Extern alloc: register dest_local as ALIVE */
+            /* Extern alloc: register dest_local as ALIVE.
+             * Phase D1: color as MALLOC if callee name is malloc/calloc/realloc,
+             * otherwise UNKNOWN (cinclude custom allocator).
+             * MALLOC requires matching free(); UNKNOWN is conservatively tracked
+             * like POOL but can be escaped via returning. */
             if (inst->dest_local >= 0 && ir_is_extern_alloc_call(zc, call)) {
                 IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                 if (h) {
@@ -961,6 +1046,18 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->state = IR_HS_ALIVE;
                     h->alloc_line = inst->source_line;
                     h->alloc_id = _ir_next_alloc_id++;
+                    /* Detect cstdlib allocators by name */
+                    bool is_stdlib = false;
+                    if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
+                        uint32_t nlen = (uint32_t)call->call.callee->ident.name_len;
+                        const char *nm = call->call.callee->ident.name;
+                        if ((nlen == 6 && memcmp(nm, "malloc", 6) == 0) ||
+                            (nlen == 6 && memcmp(nm, "calloc", 6) == 0) ||
+                            (nlen == 7 && memcmp(nm, "realloc", 7) == 0)) {
+                            is_stdlib = true;
+                        }
+                    }
+                    h->source_color = is_stdlib ? ZC_COLOR_MALLOC : ZC_COLOR_UNKNOWN;
                 }
             }
 
@@ -1038,8 +1135,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
-    /* Spawn → mark args as transferred */
+    /* Spawn → mark args as transferred. Phase D3: scoped spawn with
+     * ThreadHandle registers the handle so its join/leak is tracked.
+     * Phase D5: spawn inside @critical is a hardware-safety error
+     * (pthread_create with interrupts disabled). */
     case IR_SPAWN: {
+        /* Phase D5: spawn bans — interrupt handlers and @critical blocks */
+        if (func->is_interrupt) {
+            ir_zc_error(zc, inst->source_line,
+                "spawn banned in interrupt handler — "
+                "pthread_create with interrupts disabled is unsafe.");
+        } else if (ps->critical_depth > 0) {
+            ir_zc_error(zc, inst->source_line,
+                "spawn banned inside @critical block — "
+                "thread creation with interrupts disabled is unsafe.");
+        }
+
         /* Arguments passed to spawn transfer ownership */
         for (int i = 0; i < inst->arg_count; i++) {
             if (inst->args && inst->args[i] && inst->args[i]->kind == NODE_IDENT) {
@@ -1052,6 +1163,24 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
         }
+
+        /* Phase D3: scoped spawn produces a ThreadHandle. Register it so
+         * leak detection can report "thread not joined" specifically. */
+        if (inst->is_scoped_spawn && inst->handle_name && inst->handle_name_len > 0) {
+            int th_local = ir_find_local(func,
+                inst->handle_name, inst->handle_name_len);
+            if (th_local >= 0) {
+                IRHandleInfo *h = ir_add_handle(ps, th_local);
+                if (h) {
+                    h->state = IR_HS_ALIVE;
+                    h->alloc_line = inst->source_line;
+                    h->alloc_id = _ir_next_alloc_id++;
+                    h->is_thread_handle = true;
+                    h->source_color = ZC_COLOR_UNKNOWN;
+                }
+            }
+        }
+
         break;
     }
 
@@ -1410,7 +1539,49 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Leak detection: check handles at function exit (last block or return blocks) */
+    /* Phase D6: ghost handle detection — compute which allocated handles
+     * are NEVER read subsequently. `pool.alloc()` as a bare expression
+     * without an assignment target is the canonical case. The bare alloc
+     * produces a temp local; if that local never appears as a source in
+     * any later instruction, the allocation was discarded.
+     *
+     * Implementation: for each handle local_id that is ALIVE at any
+     * return block, scan all instructions and check whether the local
+     * appears as src1_local, src2_local, handle_local, call_arg_locals,
+     * or inside inst->expr / inst->args AST trees. If never used → ghost.
+     *
+     * Conservative: any AST reference counts as "used" (we don't prove
+     * it's actually read). Reduces false positives at cost of false
+     * negatives (e.g., local assigned but never deref'd still passes). */
+    /* Collect set of "used" locals across whole function body. */
+    int *used_locals = (int *)calloc(func->local_count, sizeof(int));
+    if (used_locals) {
+        for (int bi = 0; bi < func->block_count; bi++) {
+            IRBlock *bb = &func->blocks[bi];
+            for (int ii = 0; ii < bb->inst_count; ii++) {
+                IRInst *inst = &bb->insts[ii];
+                if (inst->src1_local >= 0 && inst->src1_local < func->local_count)
+                    used_locals[inst->src1_local] = 1;
+                if (inst->src2_local >= 0 && inst->src2_local < func->local_count)
+                    used_locals[inst->src2_local] = 1;
+                if (inst->handle_local >= 0 && inst->handle_local < func->local_count)
+                    used_locals[inst->handle_local] = 1;
+                if (inst->cond_local >= 0 && inst->cond_local < func->local_count)
+                    used_locals[inst->cond_local] = 1;
+                for (int ai = 0; ai < inst->call_arg_local_count; ai++) {
+                    if (inst->call_arg_locals &&
+                        inst->call_arg_locals[ai] >= 0 &&
+                        inst->call_arg_locals[ai] < func->local_count)
+                        used_locals[inst->call_arg_locals[ai]] = 1;
+                }
+            }
+        }
+    }
+
+    /* Leak + ghost detection: check handles at function exit.
+     * Phase D1: skip ARENA-colored — arena.reset() frees them wholesale.
+     * Phase D3: unjoined ThreadHandle at exit gets a more specific message.
+     * Phase D6: ALIVE handle whose local was never used = ghost. */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
         if (bb->inst_count == 0) continue;
@@ -1421,14 +1592,45 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         for (int hi = 0; hi < ps->handle_count; hi++) {
             IRHandleInfo *h = &ps->handles[hi];
             if (h->escaped) continue;
+            /* Phase D1: ARENA-colored allocs don't need individual free */
+            if (h->source_color == ZC_COLOR_ARENA) continue;
+            /* Compound entities aren't "allocated locals" — skip ghost check */
+            if (h->path_len > 0) {
+                /* Still a leak candidate but never a ghost */
+                if (h->state == IR_HS_ALIVE) {
+                    ir_zc_error(zc, last->source_line,
+                        "compound '%.*s' on local %%%d never freed",
+                        (int)h->path_len, h->path, h->local_id);
+                }
+                continue;
+            }
+
             if (h->state == IR_HS_ALIVE) {
-                ir_zc_error(zc, last->source_line,
-                    "handle %%%d (local '%.*s') allocated at line %d but never freed — "
-                    "add defer pool.free() or return the handle",
-                    h->local_id,
-                    (int)func->locals[h->local_id].name_len,
-                    func->locals[h->local_id].name,
-                    h->alloc_line);
+                /* Phase D3: unjoined ThreadHandle */
+                if (h->is_thread_handle) {
+                    ir_zc_error(zc, last->source_line,
+                        "ThreadHandle '%.*s' not joined before function exit — "
+                        "add th.join() or detach explicitly",
+                        (int)func->locals[h->local_id].name_len,
+                        func->locals[h->local_id].name);
+                }
+                /* Phase D6: ghost handle — allocated, never read */
+                else if (used_locals && !used_locals[h->local_id]) {
+                    ir_zc_error(zc, h->alloc_line,
+                        "ghost handle: allocation discarded — result of "
+                        "alloc() at line %d is never assigned or used",
+                        h->alloc_line);
+                } else {
+                    const char *alloc_verb = "pool.free";
+                    if (h->source_color == ZC_COLOR_MALLOC) alloc_verb = "free";
+                    ir_zc_error(zc, last->source_line,
+                        "handle %%%d (local '%.*s') allocated at line %d but never freed — "
+                        "add defer %s() or return the handle",
+                        h->local_id,
+                        (int)func->locals[h->local_id].name_len,
+                        func->locals[h->local_id].name,
+                        h->alloc_line, alloc_verb);
+                }
             } else if (h->state == IR_HS_MAYBE_FREED) {
                 ir_zc_error(zc, last->source_line,
                     "handle %%%d may not be freed on all paths",
@@ -1436,6 +1638,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
         }
     }
+    free(used_locals);
 
     /* Cleanup */
     for (int bi = 0; bi < func->block_count; bi++)

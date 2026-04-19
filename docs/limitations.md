@@ -134,6 +134,13 @@ looking for structural weaknesses (fixed buffers, depth caps, TODO
 markers) and wrote targeted tests for each candidate. Reproducers in
 `tests/zer_gaps/audit2_*.zer`.
 
+### ~~Severe — `[*]T` slice bounds check missing on IR path~~ (FIXED 2026-04-19, commit 3bdcf85)
+
+Fixed as part of the Phase 3 sweep — `IR_INDEX_READ` + `emit_rewritten_node`
+NODE_INDEX now emit `_zer_bounds_check` wrapper for slices. Both
+READ and WRITE covered (comma operator preserves lvalue).
+Retained below as audit history.
+
 ### Severe — `[*]T` slice bounds check missing on IR path (REGRESSION)
 
 **Reproducers:** `audit2_slice_oob.zer`, `audit2_slice_star_oob.zer`.
@@ -234,6 +241,14 @@ recursive call chains.
   `scan_stack[32]` overflow was hit and zercheck still found the defer
   via direct walk, or whether depth wasn't actually > 31. Requires
   instrumentation to confirm.
+
+### ~~AST→IR emission audit — 6 more runtime-check regressions~~ (FIXED 2026-04-19, commit 3bdcf85)
+
+**All 7 Phase 3 regressions FIXED.** Full details in `BUGS-FIXED.md`
+under BUG-595 through BUG-599. Test suite green: 290/290 ZER
+integration, 139/139 convert, 200/200 negative, all subsuites
+unchanged. The section below is retained as audit history and
+methodology reference.
 
 ### AST→IR emission audit — 6 more runtime-check regressions found
 

@@ -1,0 +1,21 @@
+// Regression guard for BUG-598 (shift safety).
+// ZER spec: shift by >= width returns 0 (not C's UB).
+// Verifies _zer_shl / _zer_shr macros are emitted (not raw << / >>).
+
+u32 main() {
+    u32 x = 5;
+    u32 n = 40;  // > 32, spec says result = 0
+    // Launder through loop to prevent comptime evaluation
+    for (u32 k = 0; k < 1; k += 1) { n = 40; }
+    u32 result = x << n;
+    if (result != 0) { return 1; }  // shift safety broken if hit
+
+    // Also test right shift
+    u32 y = 12345;
+    u32 m = 50;
+    for (u32 k = 0; k < 1; k += 1) { m = 50; }
+    u32 r2 = y >> m;
+    if (r2 != 0) { return 2; }
+
+    return 0;
+}

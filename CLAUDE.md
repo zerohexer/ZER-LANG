@@ -1938,3 +1938,99 @@ were in code paths the tests thought they were exercising but weren't.
 the same category: the validation story, not the code, was broken.
 
 When the next "everything passes" milestone happens, run this audit.
+
+## AST→IR Emission Diff Audit — MANDATORY after any IR lowering refactor
+
+**Read this before touching `IR_*` handlers in `emitter.c`.** Between
+2026-04-15 and 2026-04-19, the compiler shipped with 7 missing runtime
+safety checks in the IR emission path. Root cause: commit `010ddea`
+replaced `emit_expr(inst->expr)` (AST fallback) with direct local-ID
+emission in IR handlers, and silently stripped every safety wrapper
+`emit_expr` had been applying. Became effective at commit `82335c3`
+(IR default flip). All 7 restored at commit `3bdcf85` (BUG-595 through
+BUG-599 — see BUGS-FIXED.md). Do not recreate this class of bug.
+
+### The regression class
+
+`emit_expr` in the AST path wraps expressions with runtime safety:
+`_zer_bounds_check(idx, len, ...)`, `_zer_trap("signed div overflow")`,
+`_zer_shl(a, b)` (shift safety macro), `_zer_trap("outside mmio range")`,
+`_zer_trap("unaligned address")`, `_zer_trap("slice start > end")`.
+
+When an IR handler lowers an expression and emits C directly from
+local IDs, it bypasses `emit_expr` — and therefore bypasses every
+safety wrapper. Tests don't catch this because VRP proves most
+real-world indexes/values safe at compile time, eliminating the need
+for runtime checks. The bugs only manifest when you specifically
+test with *unprovable* values.
+
+### The audit protocol (run this before committing IR refactors)
+
+```bash
+# 1. Enumerate every runtime safety emission in emit_expr
+grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c \
+  | awk -F: '$2 < 4000'
+
+# 2. For each match, find the IR equivalent. If none exists, write
+#    a reproducer test that should trap and verify it does.
+```
+
+### Audit checklist — what emit_expr does, what IR must preserve
+
+| AST emit_expr safety | Line (approx) | IR equivalent |
+|---|---|---|
+| Slice bounds check | 2045-2067 | `IR_INDEX_READ` + `emit_rewritten_node` NODE_INDEX |
+| Array bounds (variable index) | 2020-2044 | Separate `emit_auto_guards` pass |
+| Signed div overflow (INT_MIN/-1) | 1068 | `IR_BINOP` TOK_SLASH/TOK_PERCENT |
+| Division by zero | 1055 | checker forces compile-time guard (no IR work) |
+| Shift safety (`_zer_shl`/`_zer_shr`) | 1078 | `IR_BINOP` TOK_LSHIFT/TOK_RSHIFT |
+| Slice `arr[a..b]` range check | 2258 | `emit_rewritten_node` NODE_SLICE |
+| @inttoptr MMIO range (variable addr) | 2650 | `emit_rewritten_node` @inttoptr intrinsic |
+| @inttoptr alignment | 2660 | Same site as above |
+| @ptrcast type mismatch | 2410, 2547 | checker catches via provenance |
+| @trap / @probe | 2694, 2696 | IR handlers present and working |
+| Handle gen check | inlined in `_zer_slab_get` | runtime-level, emit-path-independent |
+
+### Testing that catches this class
+
+Write one reproducer per safety mechanism. The reproducer must:
+
+1. Use values that VRP CANNOT prove safe — literal constants
+   propagated through a loop so they become "runtime-unknown" from
+   VRP's perspective. Example:
+   ```zer
+   u32 i = 10;
+   for (u32 k = 0; k < 1; k += 1) { i = 10; }  // defeat VRP
+   return arr[i];  // should trap, VRP has given up
+   ```
+
+2. Assert the correct runtime trap fires (check exit code 133 or
+   trap message).
+
+3. Live in `tests/zer_gaps/ast_*.zer` (audit artifact) or
+   `tests/zer_trap/*.zer` (promoted to regression tests).
+
+### The methodology that works — 3 audits in sequence
+
+Proven effective by the 2026-04-19 late session (9 bugs fixed,
+~0.15% defect density found in a subsystem that had green tests):
+
+1. **Behavioral audit (Phase 1)** — write adversarial `.zer` programs
+   that VIOLATE each safety system's claim. 50+ programs, 1-N per
+   system. Each that compiles clean is a gap.
+
+2. **Code-inspection audit (Phase 2)** — read the source (checker.c,
+   zercheck.c, emitter.c) looking for fixed-size buffers, depth
+   caps, TODO markers. Write targeted tests for each structural
+   weakness. Finds bugs the behavioral audit missed.
+
+3. **Diff audit (Phase 3)** — when a migration has happened
+   (AST→IR, linear→CFG, etc.), grep the ORIGIN path for every
+   runtime safety emission and verify the DESTINATION path has an
+   equivalent. Missing one is a regression. Use `git log -S"X"`
+   to find the commit that introduced the gap.
+
+Each audit finds DIFFERENT bug classes. Running just one is
+insufficient. The 2026-04-19 session: Phase 1 found 7 gaps,
+Phase 2 found 1 major regression (Gap 0), Phase 3 found 6 more
+regressions. No phase found what the others found.

@@ -5,6 +5,224 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-19 (late) — 3-phase audit + 9 bugs fixed
+
+Full systematic audit of the 29-system safety framework. Three
+sequential methodologies, each finding bugs the previous missed:
+
+- **Phase 1** (behavioral, 52 adversarial tests): 7 logical gaps + 1
+  silent miscompilation.
+- **Phase 2** (code-inspection, 12 tests targeting fixed buffers and
+  depth caps): exposed Gap 0 — `[*]T` slice bounds check regression.
+- **Phase 3** (AST→IR diff audit, 10 tests): grep every `_zer_trap`
+  / `_zer_bounds_check` / `_zer_shl` call-site in `emit_expr` (AST
+  path, now dead for function bodies) and verify each has an IR
+  equivalent. Found **6 more safety-check regressions**, all in same
+  commit window as Gap 0.
+
+All 7 Phase 3 regressions traced to commit `010ddea` (2026-04-15,
+"Phase 8b: local-ID emission") which replaced `emit_expr(inst->expr)`
+routing with direct local-ID emission in IR handlers. Every safety
+wrapper `emit_expr` was applying got stripped. Regression activated
+at commit `82335c3` (2026-04-17, IR default flip). ~4 days of
+shipping unsafe binaries before audit caught it.
+
+Methodology takeaway: future IR handler refactors must port any
+runtime safety emission that `emit_expr` was doing. Missing one is
+silent — no test failure unless you specifically test the
+unprovable-at-compile-time case (most tests use VRP-provable values
+that erase the need for runtime checks).
+
+### BUG — Comptime loop truncation (silent miscompilation, FIXED)
+
+`eval_comptime_block` in `checker.c` had a 10000-iteration outer cap
+on loops. When a comptime loop ran past 10000 iterations without the
+condition becoming false, it silently exited and continued with the
+counter's current value — returning truncated results instead of
+erroring.
+
+Example: `comptime u32 f() { u32 x = 0; while (x < 10000000) x += 1;
+return x; }` compiled clean but returned `10000` instead of
+`10000000`. Any caller that relied on the result got a wrong value
+silently baked into the binary.
+
+Fix: when iter cap is reached and cond has not become false, set
+`result = CONST_EVAL_FAIL` and `goto ct_done` so the outer "comptime
+function could not be evaluated at compile time" error fires.
+Applied to both NODE_FOR and NODE_WHILE/DO_WHILE paths.
+
+Regression test: `tests/zer_fail/comptime_loop_truncation.zer`.
+Commit: `dc22598`.
+
+### BUG — Mutual recursion FuncSummary pin (cross-function UAF missed, FIXED)
+
+`zc_build_summary` pre-scan loop in `zercheck.c` iterated ADD-ONLY —
+it created summaries for new functions but never REFINED existing
+summaries. For mutual recursion (A calls B calls A), A's summary
+was built on pass 1 without knowing B's free behavior (summary not
+yet created), and then stayed wrong for the rest of analysis —
+cross-function UAF via mutual recursion was not detected.
+
+Fix: `zc_build_summary` now returns bool indicating whether the
+summary changed (compares `frees_param` and `maybe_frees_param`
+arrays value-by-value, replaces if different). Outer `zercheck_run`
+loop iterates up to 16 passes, tracks a `changed` flag, breaks on
+convergence. States form a finite lattice so convergence is
+guaranteed.
+
+Regression test: `tests/zer_fail/mutual_recursion_uaf.zer`.
+Commit: `dc22598` (per pre-session log).
+
+### BUG-595 — Slice bounds check missing on IR path (Gap 0, FIXED)
+
+**Severity:** P0. Highest-impact safety hole in the codebase between
+2026-04-17 and 2026-04-19.
+
+`emitter.c:7498` `IR_INDEX_READ` handler emitted raw `src.ptr[idx]`
+for TYPE_SLICE sources with NO `_zer_bounds_check` call. Comment
+claimed "Bounds checks are in the AST path (emit_expr via IR_ASSIGN
+passthrough)" — but function bodies have been IR-only since
+2026-04-19, so the AST TYPE_SLICE branch at `emitter.c:2045-2067`
+was unreachable.
+
+Verified across three entry points:
+- stack array coerced via `arr[0..]`
+- arena-allocated slice from `ar.alloc_slice(T, n)`
+- function parameter `[*]T s`
+
+All emitted `s.ptr[idx]` unchecked. Runtime silently read stale/OOB
+memory, exit 0.
+
+**WRITE also broken** via same class: `s[i] = x` emitted
+`s.ptr[i] = x` without bounds check. `IR_INDEX_WRITE` handler was a
+stub (`/* TODO */`). Slice element assignment was an uncontained
+buffer overflow primitive.
+
+Fix (two sites):
+1. `IR_INDEX_READ` handler — emit `_zer_bounds_check` wrapper via
+   comma-operator form for TYPE_SLICE. Arrays continue through
+   `emit_auto_guards` separate pass (unchanged).
+2. `emit_rewritten_node` NODE_INDEX (line 5258) — same wrapper.
+   Covers both struct-field chains (`s[i].v`) and lvalue writes
+   (`s[i] = x`) because comma operator preserves lvalue.
+
+Regression tests: `tests/zer_gaps/audit2_slice_oob.zer`,
+`tests/zer_gaps/audit2_slice_star_oob.zer`,
+`tests/zer_gaps/audit2_cross_block_goto_handle.zer` (exercises via
+Handle gen check + slice).
+
+Additionally caught a latent OOB in `tests/zer/star_slice.zer` —
+`str_len` was iterating `for (i = 0; i < 1000; i += 1)` past the
+documented slice length, relying on reading past the slice to find
+the C string literal's null terminator. Fixed to use `i < s.len`.
+
+Commit: `3bdcf85`.
+
+### BUG-596 — Slice range check missing (`arr[a..b]` with a > b, FIXED)
+
+`NODE_SLICE` emission in `emit_rewritten_node` (both slice→slice at
+~6044 and array→slice at ~6079 paths) computed the slice length as
+`_zer_se - _zer_ss` without checking that start <= end. When start
+> end, `size_t` subtraction underflowed to a giant value, producing
+a fake slice that pointed to correct memory but claimed huge length
+— subsequent indexing silently ran past the real end of the array.
+
+AST path at `emitter.c:2258` had the check; IR didn't port it.
+
+Fix: emit `if (_zer_ss > _zer_se) _zer_trap("slice start > end",
+__FILE__, __LINE__);` before the subtraction in both NODE_SLICE
+branches (only when both start and end are present — other forms
+can't underflow).
+
+Regression test: `tests/zer_gaps/ast_slice_empty_range.zer`.
+Commit: `3bdcf85`.
+
+### BUG-597 — Signed division overflow check missing (INT_MIN / -1, FIXED)
+
+`IR_BINOP` `TOK_SLASH` / `TOK_PERCENT` path emitted raw `a / b`
+without checking for the signed overflow case (`INT_MIN / -1`, which
+is C undefined behavior on x86/ARM). AST path at `emitter.c:1068`
+had the check; IR path didn't.
+
+Fix: when left operand is signed, emit runtime check for
+`_zer_t1 == SIGNED_MIN && _zer_t2 == -1` before the division.
+`type_width` picks the correct min literal per width:
+`-128` / `-32768` / `-2147483648` / `INT64_MIN`. Divisor==0 is
+already forced to compile-time guard by the checker (no runtime
+check needed for that case).
+
+Regression test: `tests/zer_gaps/ast_signed_div_overflow.zer`.
+Commit: `3bdcf85`.
+
+### BUG-598 — Shift over width routed to raw `<<` / `>>` (C UB, FIXED)
+
+`IR_BINOP` `TOK_LSHIFT` / `TOK_RSHIFT` path emitted raw `x << n` /
+`x >> n`. ZER spec: shift by >= width returns 0. C behavior: any
+shift where count >= width is undefined. AST path used `_zer_shl`
+/ `_zer_shr` macros (ternary that returns 0 when count >= width);
+IR path didn't.
+
+Fix: route TOK_LSHIFT / TOK_RSHIFT through the existing preamble
+macros `_zer_shl(a, b)` / `_zer_shr(a, b)`. Macros already defined
+in the emitter preamble — no runtime helper changes needed, only
+call-site change in IR_BINOP.
+
+Regression test: `tests/zer_gaps/ast_shift_over_width.zer` (shift
+by 40 on u32 now correctly returns 0).
+Commit: `3bdcf85`.
+
+### BUG-599 — @inttoptr MMIO range + alignment checks missing (variable address, FIXED)
+
+`emit_rewritten_node` at line 5799 (IR path for `@inttoptr`) emitted
+plain `((T)(uintptr_t)(addr))` with no validation. AST path at
+`emitter.c:2631` had BOTH a range check (address must fall in a
+declared `mmio` range) AND an alignment check (address must match
+target type's alignment).
+
+Without these checks, variable-address `@inttoptr(*u32, runtime_addr)`
+silently produced arbitrary pointers — unsafe hardware access at
+runtime.
+
+Fix: port the full validation from AST. Constant addresses remain
+checker-validated at compile time (no runtime needed). Variable
+addresses now get:
+- Range check: `if (!(addr >= range.lo && addr <= range.hi || ...))
+  _zer_trap("outside mmio range")`
+- Alignment check: `if (addr % alignof(T) != 0) _zer_trap("unaligned
+  address")`
+
+Regression tests: `tests/zer_gaps/ast_inttoptr_mmio.zer` (address
+outside declared range), `tests/zer_gaps/ast_inttoptr_align.zer`
+(unaligned address).
+Commit: `3bdcf85`.
+
+### Methodology lessons from this session
+
+1. **Behavioral audit finds logic gaps.** Write 50+ adversarial
+   `.zer` programs that try to violate each safety system's
+   documented contract. Each compile-clean is a gap.
+
+2. **Code-inspection audit finds structural gaps.** Grep source for
+   fixed-size buffers, depth caps, TODO markers. Write targeted
+   tests for each. This found Gap 0 (slice bounds regression).
+
+3. **AST→IR diff audit finds regressions.** When migrating emission
+   paths, grep the ORIGIN path for every safety emission (`_zer_trap`,
+   `_zer_bounds_check`, etc.) and verify the DESTINATION path has an
+   equivalent. Commit archaeology (`git log -S"..."`) confirms
+   timeline and pinpoints culprit commit.
+
+4. **Real-code testing finds what unit tests miss.** VRP proves most
+   real-world slice indexes safe, so unit tests pass regardless of
+   whether bounds check is actually emitted. Audit tests must use
+   unprovable indexes specifically.
+
+5. **Fixed reproducers stay as documentation.** `tests/zer_gaps/`
+   reproducers committed in buggy state; move to `tests/zer_fail/`
+   or `tests/zer_trap/` when fixed to prevent regression.
+
+---
+
 ## Session 2026-04-19 — AST emission deletion, QEMU MMIO tests, V3 + Option A rename
 
 Not a bug-fix session per se — architectural consolidation + ergonomic

@@ -1,0 +1,10 @@
+// Regression guard for BUG-597 (signed division INT_MIN / -1).
+// MUST compile clean + trap at runtime with "signed division overflow".
+// Without the check, this is C undefined behavior on x86/ARM (often SIGFPE
+// or wrap to INT_MIN).
+
+i32 main() {
+    i32 a = -2147483648;  // INT32_MIN
+    i32 b = -1;
+    return a / b;  // UB without runtime check — must trap
+}

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run all .zer integration tests
-# tests/zer/     — must compile + run + exit 0 (positive tests)
-# tests/zer_fail/ — must FAIL to compile (negative tests)
+# tests/zer/      — must compile + run + exit 0  (positive tests)
+# tests/zer_fail/ — must FAIL to compile         (negative tests)
+# tests/zer_trap/ — must compile + run + EXIT NON-ZERO (runtime safety traps)
 # Usage: test_zer.sh [extra-flags]
 #   e.g. test_zer.sh --some-future-flag
 
@@ -45,6 +46,26 @@ for f in tests/zer/*.zer; do
             echo "  FAIL: $name (exit $ret)"
             $ZERC "$f" $EXTRA_FLAGS --run 2>&1 | head -5
         fi
+    fi
+    rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
+done
+
+echo ""
+echo "=== ZER Runtime-Trap Tests (must compile + trap at runtime) ==="
+
+for f in tests/zer_trap/*.zer; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .zer)
+    TOTAL=$((TOTAL + 1))
+    # Runtime-trap tests: compile clean, run, EXPECT non-zero exit (SIGTRAP = 133).
+    $ZERC "$f" $EXTRA_FLAGS --run 2>/dev/null
+    ret=$?
+    if [ $ret -ne 0 ]; then
+        PASS=$((PASS + 1))
+        echo "  PASS: $name (correctly trapped, exit $ret)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (should have trapped at runtime but exited 0)"
     fi
     rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
 done

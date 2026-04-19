@@ -558,6 +558,71 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
 }
 
 /* ================================================================
+ * Pool/Slab/Task method call classification (Phase E)
+ *
+ * Even though ir.h defines IR_POOL_ALLOC / IR_SLAB_ALLOC / IR_POOL_FREE
+ * etc. as distinct opcodes, the IR lowering (ir_lower.c) collapses them
+ * all to generic IR_ASSIGN (for alloc / get) and IR_CALL (for free).
+ * Per ir_lower.c:84: "IR_POOL_ALLOC etc. — collapsed to IR_ASSIGN in
+ * Phase 8d".
+ *
+ * This means the specialized IR_POOL_ALLOC / IR_SLAB_FREE / etc. cases
+ * in ir_check_inst are effectively dead code in practice. zercheck_ir
+ * must recognize these method calls by INSPECTING the AST expression
+ * inside IR_ASSIGN / IR_CALL instructions.
+ *
+ * Kind classification result:
+ *   IRMC_NONE       — not a recognized builtin method
+ *   IRMC_ALLOC      — pool/slab.alloc(), Task.alloc() → returns Handle
+ *   IRMC_ALLOC_PTR  — slab/Task.alloc_ptr()          → returns *T
+ *   IRMC_GET        — pool/slab.get(h)               → *T, UAF check only
+ *   IRMC_FREE       — pool/slab.free(h), Task.free() → FREED
+ *   IRMC_FREE_PTR   — slab/Task.free_ptr(p)          → FREED
+ *   IRMC_ARENA_ALLOC — arena.alloc(T)                → ARENA color
+ * ================================================================ */
+
+typedef enum {
+    IRMC_NONE = 0,
+    IRMC_ALLOC,
+    IRMC_ALLOC_PTR,
+    IRMC_GET,
+    IRMC_FREE,
+    IRMC_FREE_PTR,
+    IRMC_ARENA_ALLOC,
+} IRMethodKind;
+
+/* Classify a NODE_CALL expression as a builtin method call. Returns
+ * IRMC_* kind, or IRMC_NONE if not recognized. The callee must be
+ * NODE_FIELD with a method name matching one of the patterns. Arg
+ * count is also validated where relevant. */
+static IRMethodKind ir_classify_method_call(Node *call) {
+    if (!call || call->kind != NODE_CALL) return IRMC_NONE;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return IRMC_NONE;
+    const char *m = callee->field.field_name;
+    uint32_t ml = (uint32_t)callee->field.field_name_len;
+    /* alloc — Pool/Slab/Task with 0 args (arena.alloc has 1 arg — type) */
+    if (ml == 5 && memcmp(m, "alloc", 5) == 0) {
+        if (call->call.arg_count == 0) return IRMC_ALLOC;
+        return IRMC_ARENA_ALLOC;  /* arena.alloc(Type) takes type arg */
+    }
+    if (ml == 9 && memcmp(m, "alloc_ptr", 9) == 0) return IRMC_ALLOC_PTR;
+    if (ml == 3 && memcmp(m, "get", 3) == 0) return IRMC_GET;
+    if (ml == 4 && memcmp(m, "free", 4) == 0) return IRMC_FREE;
+    if (ml == 8 && memcmp(m, "free_ptr", 8) == 0) return IRMC_FREE_PTR;
+    return IRMC_NONE;
+}
+
+/* Unwrap orelse-wrapped alloc: `pool.alloc() orelse return` — the IR
+ * ASSIGN's expression is NODE_ORELSE(NODE_CALL, NODE_RETURN). We want
+ * the primary call for classification. */
+static Node *ir_unwrap_alloc_expr(Node *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == NODE_ORELSE) return expr->orelse.expr;
+    return expr;
+}
+
+/* ================================================================
  * Defer body scanning (Phase C3)
  *
  * Ported from zercheck.c:343-388 (defer_stmt_is_free + defer_scan_all_frees).
@@ -705,6 +770,32 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (ps->critical_depth > 0) ps->critical_depth--;
         break;
 
+    /* Phase E: IR_COPY is emitted for local-to-local copies (e.g., when
+     * unwrapping ?Handle to bare Handle via orelse). Propagate handle
+     * state and alloc_id from src1_local to dest_local so the dest is
+     * a tracked alias of the source. */
+    case IR_COPY: {
+        if (inst->dest_local < 0 || inst->src1_local < 0) break;
+        IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
+        if (!src_h) break;
+        /* Error if source is invalid */
+        if (ir_is_invalid(src_h)) {
+            ir_zc_error(zc, inst->source_line,
+                "use of %s handle %%%d",
+                ir_state_name(src_h->state), inst->src1_local);
+        }
+        /* Alias: dest inherits source's alloc_id and state */
+        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+        if (dst_h) {
+            dst_h->state = src_h->state;
+            dst_h->alloc_line = src_h->alloc_line;
+            dst_h->alloc_id = src_h->alloc_id;
+            dst_h->source_color = src_h->source_color;
+            dst_h->is_thread_handle = src_h->is_thread_handle;
+        }
+        break;
+    }
+
     /* Phase D1: Arena allocation → ARENA color. Skipped in leak detection
      * because arena.reset() frees everything wholesale. */
     case IR_ARENA_ALLOC:
@@ -836,9 +927,66 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
     /* Assign → alias tracking or move transfer.
      * Phase B1: move struct types get TRANSFER semantics (not alias).
-     * `Token b = a` transfers ownership: a → TRANSFERRED, b → ALIVE (new id). */
+     * `Token b = a` transfers ownership: a → TRANSFERRED, b → ALIVE (new id).
+     * Phase E: detect builtin method calls (pool.alloc, slab.alloc, get, etc.)
+     * inside the assign's expression — these are collapsed into IR_ASSIGN
+     * per ir_lower.c Phase 8d and must be recognized here to track state. */
     case IR_ASSIGN: {
+        /* Phase E: recognize pool/slab builtin method calls in the RHS.
+         * Two shapes handled:
+         *   h = pool.alloc()                      → unwrap to NODE_CALL
+         *   h = pool.alloc() orelse return         → unwrap NODE_ORELSE first
+         *   x = pool.get(h)                       → UAF check on h
+         *   (pool.free is a statement, not assign — handled in IR_CALL) */
         if (inst->dest_local >= 0 && inst->expr) {
+            Node *rhs = ir_unwrap_alloc_expr(inst->expr);
+            if (rhs && rhs->kind == NODE_CALL) {
+                IRMethodKind mc = ir_classify_method_call(rhs);
+                if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
+                    IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                    if (h) {
+                        if (h->state == IR_HS_ALIVE) {
+                            ir_zc_error(zc, inst->source_line,
+                                "handle %%%d overwritten while alive — previous leaked",
+                                inst->dest_local);
+                        }
+                        h->state = IR_HS_ALIVE;
+                        h->alloc_line = inst->source_line;
+                        h->alloc_id = inst->dest_local;
+                        h->source_color = ZC_COLOR_POOL;
+                    }
+                    break;
+                } else if (mc == IRMC_ARENA_ALLOC) {
+                    IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                    if (h) {
+                        h->state = IR_HS_ALIVE;
+                        h->alloc_line = inst->source_line;
+                        h->alloc_id = inst->dest_local;
+                        h->source_color = ZC_COLOR_ARENA;
+                    }
+                    break;
+                } else if (mc == IRMC_GET) {
+                    /* pool.get(h) — UAF check on h. Argument resolution. */
+                    if (rhs->call.arg_count >= 1) {
+                        Node *arg = rhs->call.args[0];
+                        int root_local;
+                        const char *path;
+                        uint32_t path_len;
+                        if (ir_extract_compound_key(zc, func, arg,
+                                                     &root_local, &path, &path_len) == 0) {
+                            IRHandleInfo *h;
+                            if (path_len == 0) h = ir_find_handle(ps, root_local);
+                            else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                            if (h && ir_is_invalid(h)) {
+                                ir_zc_error(zc, inst->source_line,
+                                    "use after free: local %%%d is %s (freed at line %d)",
+                                    root_local, ir_state_name(h->state), h->free_line);
+                            }
+                        }
+                    }
+                    /* Fall through — dest may still need tracking if get result is pointer */
+                }
+            }
             /* If source is an ident that's a tracked handle, create alias */
             if (inst->expr->kind == NODE_IDENT) {
                 int src_local = ir_find_local(func,
@@ -1009,6 +1157,66 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->free_line = inst->source_line;
                     }
                 }
+            }
+        }
+
+        /* Phase E: recognize pool.free / slab.free / slab.free_ptr /
+         * Task.free / Task.free_ptr as method calls. Per ir_lower.c
+         * Phase 8d, these flow through IR_CALL (expression statement)
+         * rather than specialized IR_POOL_FREE ops. */
+        if (inst->expr && inst->expr->kind == NODE_CALL) {
+            IRMethodKind mc = ir_classify_method_call(inst->expr);
+            if ((mc == IRMC_FREE || mc == IRMC_FREE_PTR) &&
+                inst->expr->call.arg_count >= 1) {
+                Node *arg = inst->expr->call.args[0];
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, arg,
+                                             &root_local, &path, &path_len) == 0) {
+                    IRHandleInfo *h;
+                    if (path_len == 0) h = ir_find_handle(ps, root_local);
+                    else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    if (h) {
+                        if (h->state == IR_HS_FREED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "double free: local %%%d already freed at line %d",
+                                root_local, h->free_line);
+                        } else if (h->state == IR_HS_MAYBE_FREED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "freeing local %%%d which may already be freed",
+                                root_local);
+                        } else if (h->state == IR_HS_TRANSFERRED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "freeing local %%%d which was already transferred",
+                                root_local);
+                        }
+                        h->state = IR_HS_FREED;
+                        h->free_line = inst->source_line;
+                        ir_propagate_alias_state(ps, h, IR_HS_FREED,
+                                                  inst->source_line);
+                    }
+                }
+                break;  /* Don't fall through to FuncSummary apply */
+            }
+            /* GET (as a statement, rare) — just UAF check */
+            if (mc == IRMC_GET && inst->expr->call.arg_count >= 1) {
+                Node *arg = inst->expr->call.args[0];
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, arg,
+                                             &root_local, &path, &path_len) == 0) {
+                    IRHandleInfo *h;
+                    if (path_len == 0) h = ir_find_handle(ps, root_local);
+                    else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    if (h && ir_is_invalid(h)) {
+                        ir_zc_error(zc, inst->source_line,
+                            "use after free: local %%%d is %s (freed at line %d)",
+                            root_local, ir_state_name(h->state), h->free_line);
+                    }
+                }
+                break;
             }
         }
 

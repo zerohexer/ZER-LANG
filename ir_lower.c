@@ -174,6 +174,7 @@ static void collect_labels(LowerCtx *ctx, Node *node) {
 /* Forward declarations */
 static void lower_stmt(LowerCtx *ctx, Node *node);
 static void rewrite_idents(LowerCtx *ctx, Node *expr);
+static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt);
 /* Targeted rewrite: walk AST and rewrite every NODE_IDENT matching
  * `from_name` to `to_name`. Used by switch arm lowering to scope captures —
  * arm captures get unique C names so they don't shadow same-named captures
@@ -906,6 +907,65 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
         break;
     default:
         /* Literals, null, etc. — no idents to rewrite */
+        break;
+    }
+}
+
+/* Walk a statement AST (defer body) and call rewrite_idents on every
+ * contained expression. Ensures identifiers inside defer bodies resolve
+ * to the correct (scope-suffixed) IR locals. Without this, a defer
+ * body declared in an inner scope that references a shadowed name
+ * (`defer pool.free(h);` where `h` shadows outer `h`) would lookup by
+ * the raw name and potentially resolve to the outer local, causing
+ * defer-free tracking to miss the inner handle. */
+static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt) {
+    if (!stmt) return;
+    switch (stmt->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < stmt->block.stmt_count; i++)
+            rewrite_defer_body_idents(ctx, stmt->block.stmts[i]);
+        break;
+    case NODE_EXPR_STMT:
+        rewrite_idents(ctx, stmt->expr_stmt.expr);
+        break;
+    case NODE_VAR_DECL:
+        rewrite_idents(ctx, stmt->var_decl.init);
+        break;
+    case NODE_RETURN:
+        rewrite_idents(ctx, stmt->ret.expr);
+        break;
+    case NODE_IF:
+        rewrite_idents(ctx, stmt->if_stmt.cond);
+        rewrite_defer_body_idents(ctx, stmt->if_stmt.then_body);
+        rewrite_defer_body_idents(ctx, stmt->if_stmt.else_body);
+        break;
+    case NODE_FOR:
+        rewrite_defer_body_idents(ctx, stmt->for_stmt.init);
+        rewrite_idents(ctx, stmt->for_stmt.cond);
+        rewrite_idents(ctx, stmt->for_stmt.step);
+        rewrite_defer_body_idents(ctx, stmt->for_stmt.body);
+        break;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        rewrite_idents(ctx, stmt->while_stmt.cond);
+        rewrite_defer_body_idents(ctx, stmt->while_stmt.body);
+        break;
+    case NODE_SWITCH:
+        rewrite_idents(ctx, stmt->switch_stmt.expr);
+        for (int i = 0; i < stmt->switch_stmt.arm_count; i++)
+            rewrite_defer_body_idents(ctx, stmt->switch_stmt.arms[i].body);
+        break;
+    case NODE_CRITICAL:
+        rewrite_defer_body_idents(ctx, stmt->critical.body);
+        break;
+    case NODE_ONCE:
+        rewrite_defer_body_idents(ctx, stmt->once.body);
+        break;
+    case NODE_DEFER:
+        /* nested defer — rare, handle transitively */
+        rewrite_defer_body_idents(ctx, stmt->defer.body);
+        break;
+    default:
         break;
     }
 }
@@ -2467,6 +2527,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Defer ---- */
     case NODE_DEFER: {
+        /* Rewrite idents in the defer body so references to scope-
+         * shadowed names (`h` → `h_17`) resolve correctly when the
+         * defer body is consumed later (emitter or zercheck_ir). */
+        rewrite_defer_body_idents(ctx, node->defer.body);
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
         emit_inst(ctx, push);

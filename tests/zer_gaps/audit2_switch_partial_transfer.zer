@@ -1,0 +1,23 @@
+// AUDIT2 #8 (2026-04-19 code-inspection audit)
+// CLAIM: zercheck switch/arm merge — 5-arm switch where some arms
+//        transfer, others don't. After switch, handle state should be
+//        MAYBE_FREED. Use after switch should error.
+// TEST: switch with 3 arms freeing and 2 not, then use handle after.
+// EXPECTED: compile error "handle maybe-freed" or similar.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    u32 mode = 2;
+    *Task t = Task.alloc_ptr() orelse return;
+    switch (mode) {
+        0 => { heap.free_ptr(t); }
+        1 => { heap.free_ptr(t); }
+        2 => { heap.free_ptr(t); }
+        3 => { u32 a = t.id; }
+        default => { u32 b = t.id; }
+    }
+    u32 x = t.id;
+    return x;
+}

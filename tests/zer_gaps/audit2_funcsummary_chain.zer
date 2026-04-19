@@ -1,0 +1,25 @@
+// AUDIT2 #7 (2026-04-19 code-inspection audit)
+// CLAIM: zercheck.c:2763 iterative FuncSummary refinement caps at
+//        16 passes. Chain A→B→C→D→E→... with cascading free-propagation
+//        could need more passes to converge. After 16, summaries
+//        may be stale and UAF not detected.
+// TEST: 6-function chain with tail-call free pattern.
+// EXPECTED: this likely converges in <16 passes (monotone lattice),
+//           but we test as the worst case. If it fails, gap confirmed.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+void f6(*Task t) { heap.free_ptr(t); }
+void f5(*Task t) { f6(t); }
+void f4(*Task t) { f5(t); }
+void f3(*Task t) { f4(t); }
+void f2(*Task t) { f3(t); }
+void f1(*Task t) { f2(t); }
+
+u32 main() {
+    *Task t = Task.alloc_ptr() orelse return;
+    f1(t);
+    u32 x = t.id;
+    return x;
+}

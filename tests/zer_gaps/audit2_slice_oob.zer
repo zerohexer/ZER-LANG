@@ -1,0 +1,17 @@
+// AUDIT2 #12 (verify [*]T bounds check)
+// CLAIM: [*]T bounds-checked on every access.
+// TEST: allocate slice of len 5, access index 10.
+// EXPECTED: runtime trap (or compile error if VRP proves).
+
+struct Cell { u32 v; }
+
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+    ?[]Cell ms = ar.alloc_slice(Cell, 5);
+    []Cell s = ms orelse return;
+
+    u32 idx = 10;  // out of bounds
+    u32 r = s[idx].v;
+    return r;
+}

@@ -1,0 +1,24 @@
+// AUDIT2 #10 (2026-04-19 code-inspection audit)
+// CLAIM: goto from inside an inner block to a label in outer
+//        scope that lies BEFORE the goto and AFTER a free in
+//        the outer block. This is cross-block AND backward —
+//        zercheck.c:1668 iteration only handles same-block case.
+// TEST: outer block has label followed by free; inner block
+//       does backward goto to outer label.
+// EXPECTED: if gap exists, compile accepts; UAF on cycle missed.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = Task.alloc_ptr() orelse return;
+    u32 i = 0;
+    top:
+    u32 x = t.id;
+    heap.free_ptr(t);
+    i += 1;
+    if (i < 3) {
+        goto top;
+    }
+    return x;
+}

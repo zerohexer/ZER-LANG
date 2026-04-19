@@ -1,0 +1,31 @@
+// AUDIT2 #1 (2026-04-19 code-inspection audit)
+// CLAIM: zercheck.c:1636 collects labels into fixed-size labels[32]
+//        array. Labels beyond index 32 are silently dropped.
+//        A BACKWARD goto to a label beyond index 32 would NOT
+//        trigger the fixed-point iteration since the label lookup
+//        in `labels[]` fails — UAF across the backward-goto loop
+//        body not caught.
+// TEST: backward goto to a label that is the 34th label in the
+//       block (index > 32). Body between label and goto frees
+//       handle then uses it on next iteration.
+// EXPECTED: if gap exists, compile accepts; runtime traps.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = Task.alloc_ptr() orelse return;
+    u32 i = 0;
+    L1: {}  L2: {}  L3: {}  L4: {}  L5: {}  L6: {}  L7: {}  L8: {}
+    L9: {}  L10: {} L11: {} L12: {} L13: {} L14: {} L15: {} L16: {}
+    L17: {} L18: {} L19: {} L20: {} L21: {} L22: {} L23: {} L24: {}
+    L25: {} L26: {} L27: {} L28: {} L29: {} L30: {} L31: {} L32: {}
+    L33: L34:
+    if (i >= 2) { goto done; }
+    u32 x = t.id;
+    heap.free_ptr(t);
+    i += 1;
+    goto L34;
+    done:
+    return 0;
+}

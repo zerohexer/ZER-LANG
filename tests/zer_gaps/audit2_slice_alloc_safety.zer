@@ -1,0 +1,32 @@
+// AUDIT2 #11 (verify [*]T / slice allocator safety)
+// CLAIM: CLAUDE.md says "[*]T = dynamic pointer to many, bounds
+//        checked". The only way to allocate one is via arena.alloc_slice(T, n)
+//        which returns ?[]T. Slab/Pool do NOT give out [*]T — only *T.
+// TEST: allocate a slice via arena, verify bounds check at runtime,
+//       then test UAF patterns (arena.reset + access = ?).
+
+struct Cell { u32 v; }
+
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+
+    // alloc 5 Cells as a slice
+    ?[]Cell ms = ar.alloc_slice(Cell, 5);
+    []Cell s = ms orelse return;
+
+    // in-bounds access
+    s[0].v = 100;
+    s[4].v = 500;
+
+    u32 r = s[0].v + s[4].v;
+
+    // arena.reset invalidates the slice data
+    ar.reset();
+
+    // post-reset: does zercheck catch?
+    // r2 reading s[0] is UAF — but arena + slice tracking?
+    u32 r2 = s[0].v;
+
+    return r + r2;
+}

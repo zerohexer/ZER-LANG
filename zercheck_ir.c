@@ -467,6 +467,81 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     return 0;
 }
 
+/* ================================================================
+ * Defer body scanning (Phase C3)
+ *
+ * Ported from zercheck.c:343-388 (defer_stmt_is_free + defer_scan_all_frees).
+ * Walks a defer body's AST to find free calls. When a handle is freed
+ * inside a defer, it is covered at function exit — not a leak.
+ *
+ * Conservative: scans EVERY defer body in the function, not just those
+ * on the specific exit path. Matches zercheck.c behavior. A handle
+ * freed in any defer is considered potentially covered.
+ * ================================================================ */
+
+/* Check if an AST statement is a free call. Returns the argument
+ * expression (the thing being freed) or NULL. Recognizes:
+ *   - pool.free(x)    (NODE_FIELD callee, method "free")
+ *   - slab.free(x)    (same — dispatches via builtin)
+ *   - pool.free_ptr(x) / slab.free_ptr(x)
+ *   - bare free(x)    (plain cstdlib from cinclude)
+ *   - Task.free(x) / Task.free_ptr(x)
+ */
+static Node *ir_defer_free_arg(Node *node) {
+    if (!node) return NULL;
+    if (node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return NULL;
+    Node *call = node->expr_stmt.expr;
+    if (call->kind != NODE_CALL || call->call.arg_count == 0) return NULL;
+
+    Node *callee = call->call.callee;
+    if (callee && callee->kind == NODE_FIELD) {
+        const char *m = callee->field.field_name;
+        uint32_t ml = (uint32_t)callee->field.field_name_len;
+        if ((ml == 4 && memcmp(m, "free", 4) == 0) ||
+            (ml == 8 && memcmp(m, "free_ptr", 8) == 0))
+            return call->call.args[0];
+    }
+    if (callee && callee->kind == NODE_IDENT &&
+        callee->ident.name_len == 4 &&
+        memcmp(callee->ident.name, "free", 4) == 0)
+        return call->call.args[0];
+    return NULL;
+}
+
+/* Walk a defer body. For each free found, resolve the argument to a
+ * tracked handle (bare or compound) and mark it FREED at defer_line.
+ * Recursively walks NODE_BLOCK so multi-statement defers are covered. */
+static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                 Node *body, int defer_line) {
+    if (!body) return;
+
+    /* Try this node as a free statement */
+    Node *farg = ir_defer_free_arg(body);
+    if (farg) {
+        int root_local;
+        const char *path;
+        uint32_t path_len;
+        if (ir_extract_compound_key(zc, func, farg,
+                                     &root_local, &path, &path_len) == 0) {
+            IRHandleInfo *h;
+            if (path_len == 0) h = ir_find_handle(ps, root_local);
+            else h = ir_find_compound_handle(ps, root_local, path, path_len);
+            if (h && (h->state == IR_HS_ALIVE ||
+                      h->state == IR_HS_MAYBE_FREED)) {
+                h->state = IR_HS_FREED;
+                h->free_line = defer_line;
+            }
+        }
+    }
+
+    /* Recurse into block statements */
+    if (body->kind == NODE_BLOCK) {
+        for (int i = 0; i < body->block.stmt_count; i++) {
+            ir_defer_scan_frees(zc, func, ps, body->block.stmts[i], defer_line);
+        }
+    }
+}
+
 /* Propagate state through aliases sharing alloc_id. When `target` is
  * marked FREED or TRANSFERRED, other entities (bare or compound) with
  * the same alloc_id represent the same underlying allocation and must
@@ -1162,6 +1237,34 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 } else {
                     free(frees); free(maybe_frees);
                 }
+            }
+        }
+    }
+
+    /* Phase C3: before leak detection, scan every IR_DEFER_PUSH body in the
+     * function and mark handles freed therein as FREED in the return-block
+     * path states. Conservative: every defer's frees apply to every return
+     * block. Matches zercheck.c defer_scan_all_frees at function exit.
+     *
+     * Without this, any handle freed only inside a `defer { pool.free(h); }`
+     * would appear ALIVE at function exit and trigger a false leak error.
+     *
+     * We walk all blocks to collect defers once, then apply to each return
+     * block's state. */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        if (bb->inst_count == 0) continue;
+        IRInst *last = &bb->insts[bb->inst_count - 1];
+        if (last->op != IR_RETURN) continue;
+
+        IRPathState *ret_ps = &block_states[bi];
+        for (int di = 0; di < func->block_count; di++) {
+            IRBlock *db = &func->blocks[di];
+            for (int dj = 0; dj < db->inst_count; dj++) {
+                IRInst *inst = &db->insts[dj];
+                if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
+                ir_defer_scan_frees(zc, func, ret_ps, inst->defer_body,
+                                     inst->source_line);
             }
         }
     }

@@ -1094,6 +1094,31 @@ Quick reminders for common IR work:
 - **`emit_rewritten_node` is NOT `emit_expr`** — zero emit_expr calls in IR function body emission
 - **AST→IR migration watchpoint**: any IR handler that replaces `emit_expr(inst->expr)` with direct emission MUST port every `_zer_trap` / `_zer_bounds_check` / `_zer_shl` safety wrapper. See "AST→IR Emission Diff Audit" section below.
 
+## CFG Migration (zercheck.c → zercheck_ir.c) — see docs/cfg_migration_plan.md
+
+**In progress.** Long-term plan: delete `zercheck.c` (2810-line linear AST walker), replace with `zercheck_ir.c` (CFG-based, growing toward parity). Both coexist during migration — zercheck.c is PRIMARY in the pipeline, zercheck_ir.c is compiled but NOT invoked on production path yet.
+
+**Current state as of 2026-04-19:**
+- Phase A complete — 3 checker gaps closed directly (Gaps 3, 7, spawn scan cap)
+- Phase B complete — move struct, escape detection, compound keys in zercheck_ir.c
+- Phase C complete — FuncSummary, `*opaque` 9a/9b/9c, defer scanning
+- Phase D pending — 7 specialized checks (alloc coloring, keep params, thread handle join, lock ordering, ISR bans, ghost handle, arena chain)
+- Phase E pending — dual-run verification (both analyzers run, diff diagnostics)
+- Phase F pending — cutover + delete zercheck.c + tag v0.5.0
+
+**For fresh sessions:**
+- Do NOT "fix" Gaps 3/7/scan-depth — already closed (BUG-600/601/602).
+- Do NOT invoke zercheck_ir from zerc_main.c yet — Phase E work.
+- Do NOT delete zercheck.c until Phase F criteria met (zero disagreement on ~2962 tests).
+- Plan progress checklist lives at bottom of `docs/cfg_migration_plan.md` — update it when landing a phase.
+- Feature port details: `docs/compiler-internals.md` section "zercheck_ir.c architecture".
+
+**Dependencies between phases** (concrete):
+- Phase D items mostly depend on Phase B handle tracking (already done)
+- D7 (arena chain) depends on C1 FuncSummary (already done)
+- Phase E needs D complete before dual-run will produce matching diagnostics
+- Phase F needs E green (zero disagreements)
+
 <!-- Sections moved to docs/compiler-internals.md 2026-04-19:
        - IR Path Validation (full history)
        - IR Path Architectural Invariants (22 items)

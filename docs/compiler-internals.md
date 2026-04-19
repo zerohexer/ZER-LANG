@@ -4951,3 +4951,225 @@ From analysis of Rust's test tree, these categories stress ZER's model the harde
 
 When adding new tests, prioritize these categories. Skip: closures, generics, traits, iterators, async runtime (Rust-specific features ZER doesn't have).
 
+---
+
+## zercheck_ir.c architecture (2026-04-19, CFG migration Phases B+C)
+
+**Context:** `zercheck_ir.c` is the CFG-based successor to `zercheck.c`.
+Both coexist during migration — zercheck.c is PRIMARY in zerc_main.c,
+zercheck_ir.c is compiled but not invoked on the production path.
+See `docs/cfg_migration_plan.md` for the full migration roadmap.
+This section documents the architecture built in zercheck_ir.c
+through Phase C (1446 lines).
+
+### File structure
+
+```
+zercheck_ir.c (1446 lines)
+|- Error helpers (ir_zc_error)
+|- IRHandleInfo / IRPathState structs (compound-key-aware)
+|- Path state helpers (init/copy/free/alloc_handle_slot)
+|- Bare + compound find/add variants
+|- CFG merge at basic block joins
+|- Move struct type helpers (Phase B1)
+|- _ir_next_alloc_id counter
+|- Escape detection helpers (Phase B2)
+|- Compound key extraction (Phase B3)
+|- Alias propagation helper
+|- Defer body scanning helpers (Phase C3)
+|- Extern alloc/free recognition (Phase C2)
+|- ir_check_inst (main per-instruction handler)
+|     |- IR_POOL_ALLOC / SLAB_ALLOC / SLAB_ALLOC_PTR
+|     |- IR_POOL_FREE / SLAB_FREE / SLAB_FREE_PTR (+ compound keys)
+|     |- IR_POOL_GET
+|     |- IR_FIELD_READ (+ prefix walking for UAF)
+|     |- IR_ASSIGN (+ move transfer)
+|     |- IR_RETURN (+ move + escape + struct init + 9c return-freed)
+|     |- IR_CALL (+ FuncSummary + extern alloc/free heuristic)
+|     |- IR_SPAWN
+|     |- IR_FIELD_WRITE (+ escape + compound register)
+|     |- IR_INDEX_WRITE (+ escape + compound register)
+|- zercheck_ir (main CFG analysis driver)
+|     |- Block state init
+|     |- Fixed-point iteration (ceiling 32)
+|     |- Per-block: merge preds -> process instructions -> update
+|     |- FuncSummary build at function exit (Phase C1)
+|     |- Defer body scan at return blocks (Phase C3)
+|     |- Leak detection
+```
+
+### Key design decisions
+
+**1. Per-local handle state (not string keys).**
+zercheck.c uses string keys ("s.h", "arr[0]") with a 128-byte stack
+buffer, O(n) comparisons, silent truncation risk. zercheck_ir.c uses
+integer local IDs (O(1) compare) with an optional `path` field for
+compound entities — arena-allocated strings, immutable, shared across
+path states via shallow copy.
+
+**2. CFG merge is natural, not a hack.**
+At basic block joins, `ir_merge_states` combines predecessor states.
+`terminated` flag on IRPathState tracks blocks that exit via
+return/unreachable — those paths are excluded from the merge. This
+replaces zercheck.c's `block_always_exits` 2-pass hack.
+
+**3. Compound entities: shared struct with path field.**
+
+```
+typedef struct {
+    int local_id;          /* root local */
+    const char *path;      /* NULL for bare, ".field" or "[0].inner" for compound */
+    uint32_t path_len;
+    IRHandleState state;
+    int alloc_line, free_line, alloc_id;
+    bool escaped;
+} IRHandleInfo;
+```
+
+`ir_find_handle(ps, id)` returns bare-only (path_len == 0).
+`ir_find_compound_handle(ps, id, path, path_len)` matches exact key.
+Both variants share a single storage array.
+
+**4. Alloc ID sharing = alias detection.**
+When `s.h = bare_h` (both tracked), compound inherits bare's alloc_id.
+When bare is freed, `ir_propagate_alias_state` marks compound FREED
+too. This is how `free(bare_h); access(s.h);` catches UAF on s.h.
+
+**5. Two allocation ID spaces:**
+- Local-ID-based (bare alloc sites) — alloc_id = local_id
+- Counter-based (`_ir_next_alloc_id++`, starts at 1,000,000) — for
+  move-struct new-ownership chains
+
+The 1,000,000 base ensures no collision with local-id-based IDs.
+
+### How each instruction handler works
+
+**IR_POOL_ALLOC / SLAB_ALLOC / SLAB_ALLOC_PTR:**
+Register dest_local as ALIVE with alloc_id = dest_local. Overwrite
+of ALIVE handle triggers leak error.
+
+**IR_POOL_FREE / SLAB_FREE / SLAB_FREE_PTR:**
+Lookup target (bare via handle_local, else compound via inst->expr).
+Mark FREED, propagate to aliases via alloc_id. Double-free and
+maybe-freed errors reported.
+
+**IR_POOL_GET:**
+Target is handle_local. Invalid state triggers UAF error.
+
+**IR_FIELD_READ (Phase B3):**
+Walk compound chain from full expression up to root, checking each
+prefix. `s.inner.data` checks (s, ".inner.data") then (s, ".inner")
+then bare s. First FREED prefix wins, error mentions exact prefix.
+
+**IR_ASSIGN (Phase B1):**
+- Move struct source type -> source TRANSFERRED, dest ALIVE w/ fresh id
+- Non-move -> regular alias (dest inherits src's alloc_id)
+- Invalid source -> error
+
+**IR_FIELD_WRITE (Phase B1+B2+B3):**
+Order: move transfer, then escape detection, then compound key
+registration. Target shape: src2_local (decomposed) OR inst->expr
+NODE_ASSIGN (passthrough).
+
+**IR_INDEX_WRITE (Phase B2+B3):**
+Mirror of FIELD_WRITE for `arr[i] = val`. Only constant indices
+register compounds (matches zercheck.c — variable indices untrackable).
+
+**IR_RETURN (Phase B1+B2+C2):**
+Three return shapes:
+- (a) Direct ident — move transfer OR escape
+- (b) Orelse fallback — walk fallback, mark escaped
+- (c) Struct init literal — walk fields, mark each embedded escaped
+
+Phase C2 (9c): non-move pointer return in FREED state = error
+"returning FREED pointer ... caller would receive dangling pointer".
+
+**IR_CALL (Phase C1+C2):**
+Resolution order:
+1. FuncSummary lookup by inst->func_name -> apply frees_param
+2. If no summary, try extern alloc (return *T / *opaque / ?*T ->
+   register dest ALIVE)
+3. If no summary, try extern free (bodyless void fn with *opaque/*T
+   first param -> mark arg FREED)
+
+Arg resolution: decomposed via call_arg_locals[i] OR passthrough via
+inst->args[i].
+
+**IR_SPAWN:**
+All args marked TRANSFERRED (ownership to thread).
+
+### Analysis driver (zercheck_ir function)
+
+```
+1. Allocate per-block IRPathState array
+2. Fixed-point iteration (ceiling 32):
+   for each block in order:
+     merge predecessor states -> initial block state
+     process each instruction via ir_check_inst
+     if state changed -> iterate again
+3. FuncSummary build (if zc->building_summary):
+   Walk return blocks, examine param local states
+   frees_param[i] = FREED in every return block
+   maybe_frees_param[i] = FREED/MAYBE in some
+   Refine existing summary or insert new
+4. Defer body scan (Phase C3):
+   For each return block R:
+     For each IR_DEFER_PUSH in function:
+       Walk defer body, mark freed handles
+5. Leak detection:
+   For each return block, check non-escaped handles
+   ALIVE -> leak error
+   MAYBE_FREED -> "may not be freed on all paths"
+```
+
+### Coordination with zercheck.c
+
+**Shared state:** `FuncSummary` struct in zercheck.h is identical
+between both analyzers. Summaries built by either are consumable by
+both. Essential for Phase E dual-run.
+
+**building_summary flag:** Both analyzers honor `zc->building_summary`
+to suppress errors during pre-scan phase. zercheck_ir checks it in
+`ir_zc_error` and in the summary-build block.
+
+**Summary refinement:** Both analyzers use in-place refine semantics —
+if an existing summary's values differ, update in place and return
+true. Iterative refinement loop (up to 16 passes) orchestrated by
+zercheck_run handles mutual recursion convergence.
+
+### What Phase D will add
+
+- D1 alloc coloring — source_color field on IRHandleInfo, set at
+  alloc sites, Arena-colored skipped in leak detection.
+- D2 keep param validation — check at IR_FIELD_WRITE targeting global.
+- D3 ThreadHandle join — is_thread_handle flag, unjoined at exit = error.
+- D4 lock ordering — per-statement shared-type tracking at IR_LOCK.
+- D5 ISR bans — per-block in_interrupt flag, error at IR_SLAB_ALLOC /
+  IR_SPAWN.
+- D6 ghost handle — check IR_POOL_ALLOC / SLAB_ALLOC dest used downstream.
+- D7 arena wrapper chain — FuncSummary returns_color propagation.
+
+### What NOT to do in zercheck_ir.c
+
+- Do NOT invoke zercheck_ir from zerc_main.c yet — that is Phase E.
+  Production pipeline is zercheck.c exclusively.
+- Do NOT port zercheck.c features out of order — C depends on B,
+  D depends on B, E depends on D.
+- Do NOT duplicate FuncProps (exists in checker.c:6093+). Reference
+  via Symbol->props if needed.
+- Do NOT add fixed buffers — use stack-first dynamic pattern
+  (CLAUDE.md rule #7). Compound keys use arena allocation specifically
+  to avoid this.
+
+### Testing strategy
+
+zercheck_ir.c is currently isolated — changes don't affect the 2962+
+test suite because zerc_main.c doesn't invoke it. Phase E wires it
+in alongside zercheck.c and diffs diagnostics.
+
+Sanity-check changes WITHOUT Phase E wire-up by adding a direct unit
+test that parses a .zer source, runs checker, runs ir_lower_func,
+calls zercheck_ir directly, and asserts expected errors.
+
+`test_zercheck.c` currently exercises the zercheck.c API. Creating
+`test_zercheck_ir.c` is future work (post-Phase D, pre-Phase E).

@@ -5,6 +5,99 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-19 (CFG migration start) — Phase A gaps closed + Phase B/C architecture
+
+This session began executing the CFG migration plan (see
+`docs/cfg_migration_plan.md`). Phase A closed three checker gaps
+directly. Phase B + C added 994 lines to `zercheck_ir.c` building out
+the CFG-based successor to `zercheck.c`. zercheck.c is still primary
+in the pipeline — zercheck_ir.c is compiled but not yet invoked. Phase
+E (dual-run verification) and Phase F (cutover) are future work.
+
+### BUG-600 — Gap 3: `yield`/`await` outside async silently stripped (FIXED)
+
+`void go() { yield; }` compiled silently, emitted as a no-op. The
+programmer wrote coroutine suspension, got dead code. Silent
+semantic change, not a safety issue but a confusing behavior change.
+
+Root cause: `check_stmt` NODE_YIELD at `checker.c:8414` had no
+`in_async` check. NODE_AWAIT had no check either.
+
+Fix: both handlers now emit `checker_error` when `c->in_async` is
+false. Error: "'yield' only allowed inside async function" / same
+for await.
+
+Regression test: `tests/zer_fail/yield_outside_async.zer`
+(promoted from `tests/zer_gaps/gap3_yield_outside_async.zer`).
+
+Commit: `31f7c5f`.
+
+### BUG-601 — Gap 7: `defer` nested in `defer` body accepted (FIXED)
+
+`defer { defer { ... } }` compiled. Inner defer ran at outer defer's
+execution time (outer scope exit), which is confusing semantics and
+probably not what the programmer intended.
+
+Root cause: `check_stmt` NODE_DEFER at `checker.c:8323` incremented
+`defer_depth` without checking if it was already > 0.
+
+Fix: check `if (c->defer_depth > 0)` BEFORE incrementing. Error:
+"'defer' cannot be nested inside another 'defer' body". Existing
+NODE_DEFER behaviors preserved (check_body_effects ban on yield
+in defer).
+
+Regression test: `tests/zer_fail/defer_in_defer.zer` (promoted
+from `tests/zer_gaps/gap7_defer_in_defer.zer`).
+
+Commit: `31f7c5f`.
+
+### BUG-602 — Spawn transitive data race cap too low (FIXED)
+
+`spawn entry() → f1 → f2 → ... → f10 → touches_global_g` was not
+detected because `scan_unsafe_global_access` capped transitive
+recursion at 8 levels. Real call graphs easily exceed 8 (handler
+→ validator → parser → helper → ...). Data race not flagged.
+
+Root cause: `checker.c:6466` had `if (_scan_depth < 8)`.
+
+Fix: raised to 32. Still prevents pathological infinite recursion
+(recursive call graphs) while catching legitimate transitive races.
+
+Regression test: `tests/zer_fail/spawn_transitive_chain.zer`
+(promoted from `tests/zer_gaps/audit2_spawn_transitive_depth.zer`).
+Test has a 10-level chain — was compile-clean before, now correctly
+errors: "spawn target 'entry' accesses non-shared global 'g' —
+data race".
+
+Commit: `31f7c5f`.
+
+### Architectural — Phase B + C zercheck_ir.c implementation
+
+Not bug fixes per se, but safety infrastructure laid down for Phase E
+cutover. All three in `zercheck_ir.c`, isolated from production path.
+
+Phase B — state tracking foundations:
+  B1 (commit `9cd4852`): move struct tracking (closes Gap 5 impl)
+  B2 (commit `5335c4f`): full escape detection (globals, param fields,
+      struct return, orelse fallback)
+  B3 (commit `787ce7b`): compound key tracking (struct field handles,
+      array element handles, chains, prefix walking)
+
+Phase C — cross-function analysis:
+  C1 (commit `ab0816e`): FuncSummary build + apply
+  C3 (commit `620dd76`): defer body scanning for leak coverage
+  C2 (commit `2613cba`): *opaque 9a/9b/9c (UAF via compound, extern
+      alloc/free recognition, return freed pointer)
+
+Net: zercheck_ir.c grew from 452 → 1446 lines. ~80% feature parity
+with zercheck.c. Phase D (7 specialized checks) + E (dual-run) + F
+(cutover/delete zercheck.c) remain for v0.5.0 milestone.
+
+See `docs/compiler-internals.md` "zercheck_ir.c architecture" for
+design details and `docs/cfg_migration_plan.md` for the full roadmap.
+
+---
+
 ## Session 2026-04-19 (late) — 3-phase audit + 9 bugs fixed
 
 Full systematic audit of the 29-system safety framework. Three

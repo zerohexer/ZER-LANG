@@ -1,0 +1,24 @@
+// PRECISION GAP #2 (2026-04-19 audit)
+// CLAIM: *opaque parameter cast to two different types inside the
+//        same function should be detectable as inconsistent use.
+// SAFETY: runtime _zer_opaque type_id check traps on the wrong
+//         cast. Safe but compile-time blind.
+// FIX APPROACH: refine Param Provenance (System 5) to detect
+//               conflicting casts of same opaque param — error
+//               at the second inconsistent cast. Edge case;
+//               low priority.
+
+struct A { u32 x; }
+struct B { u32 y; }
+
+void use_both(*opaque o) {
+    *A a = @ptrcast(*A, o);
+    *B b = @ptrcast(*B, o);    // conflicts with above — same *opaque
+    a.x = b.y;
+}
+
+u32 main() {
+    A v; v.x = 1;
+    use_both(@ptrcast(*opaque, &v));
+    return 0;
+}

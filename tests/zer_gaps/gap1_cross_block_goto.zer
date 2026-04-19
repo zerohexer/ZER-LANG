@@ -1,0 +1,25 @@
+// GAP #1 (2026-04-19 audit)
+// CLAIM: use-after-free via cross-block backward goto is not caught
+//        at compile time by zercheck (linear-walk analysis).
+// EFFECT: compile succeeds; runtime gen counter in _zer_slab_get traps
+//         with "slab: use-after-free or invalid handle" (exit 133).
+// FIX APPROACH: rewrite zercheck to use CFG-based worklist analysis
+//               instead of linear AST walk. ~300 lines.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    ?Handle(Task) mh = heap.alloc();
+    Handle(Task) h = mh orelse return;
+    u32 count = 0;
+retry:
+    if (count > 0) {
+        u32 id = h.id;      // USE-AFTER-FREE on 2nd iteration
+        return id;
+    }
+    heap.free(h);
+    count += 1;
+    if (count < 2) { goto retry; }
+    return 0;
+}

@@ -1,0 +1,27 @@
+// GAP #4 (2026-04-19 audit)
+// CLAIM: shared struct access inside async function across a yield
+//        boundary should error (spec claim: "Lock held across
+//        yield/await = deadlock"). Not enforced.
+// EFFECT: async function touches shared struct before and after
+//         yield. The statement-level lock is acquired at s.v = 1;
+//         (released at statement end), yield suspends, next poll
+//         re-acquires at s.v = 2;. This doesn't actually deadlock
+//         in the per-statement locking model — BUT more complex
+//         patterns (e.g., compound expression holding lock across
+//         yield) could. The spec was stricter than the
+//         implementation needs. May be a spec correction rather
+//         than a real compiler fix.
+// FIX APPROACH: if the spec intent holds, add AST walker checking
+//               that async function bodies don't access shared
+//               structs spanning yield boundaries. Medium effort.
+
+shared struct S { u32 v; }
+S s;
+
+async void task() {
+    s.v = 1;
+    yield;
+    s.v = 2;
+}
+
+u32 main() { return 0; }

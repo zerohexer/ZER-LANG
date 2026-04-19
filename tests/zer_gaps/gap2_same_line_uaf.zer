@@ -1,0 +1,20 @@
+// GAP #2 (2026-04-19 audit)
+// CLAIM: use-after-free with free + use on the SAME LINE is not caught.
+// EFFECT: zercheck suppresses the error because of the
+//         `h->free_line < cur_line` guard (designed to avoid
+//         false-positive on `pool.free(s.h)` re-visiting s.h on same
+//         line as the free call). Guard is too aggressive — it also
+//         suppresses inter-statement UAF when the two statements
+//         happen to be on the same source line.
+// FIX APPROACH: replace line-based comparison with a statement
+//               counter. Increment counter per statement; track
+//               `free_stmt_id` not `free_line`. ~30 lines.
+// RUNTIME CATCH: slab gen counter traps.
+
+struct T { u32 x; }
+Slab(T) h;
+
+u32 main() {
+    ?Handle(T) m = h.alloc(); Handle(T) p = m orelse return;
+    h.free(p); u32 x = p.x; return x;
+}

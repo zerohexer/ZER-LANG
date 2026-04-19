@@ -184,6 +184,70 @@ static int _ir_next_alloc_id = 1000000;  /* high base so it doesn't
                                             ids set at allocation */
 
 /* ================================================================
+ * Escape detection helpers (Phase B2)
+ *
+ * A handle "escapes" when it's stored somewhere outside the current
+ * function's tracking scope — a global, a pointer-param's field, a
+ * returned struct literal. The escape flag suppresses leak detection
+ * for that handle at function exit (the caller now owns it).
+ * ================================================================ */
+
+/* Walk a target chain (NODE_FIELD / NODE_INDEX / NODE_UNARY_deref)
+ * up to the root identifier. Returns the root NODE_IDENT or NULL. */
+static Node *ir_target_root(Node *target) {
+    Node *cur = target;
+    while (cur) {
+        if (cur->kind == NODE_FIELD) cur = cur->field.object;
+        else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
+        else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR)
+            cur = cur->unary.operand;
+        else break;
+    }
+    return cur;
+}
+
+/* Returns true if the target expression's root is a global variable OR
+ * a pointer parameter (in which case the field-write reaches callee-
+ * external memory). Either way, any handle written through it escapes. */
+static bool ir_target_root_escapes(ZerCheck *zc, Node *target) {
+    Node *root = ir_target_root(target);
+    if (!root || root->kind != NODE_IDENT) return false;
+    /* Global check */
+    if (scope_lookup(zc->checker->global_scope,
+        root->ident.name, (uint32_t)root->ident.name_len) != NULL)
+        return true;
+    /* Pointer param: s.top = h where s is *Stack. */
+    if (target && target->kind == NODE_FIELD) {
+        Type *root_type = checker_get_type(zc->checker, root);
+        if (root_type) {
+            Type *rt = type_unwrap_distinct(root_type);
+            if (rt && rt->kind == TYPE_POINTER) return true;
+        }
+    }
+    return false;
+}
+
+/* Mark a local's handle (if tracked) as escaped. */
+static void ir_mark_local_escaped(IRPathState *ps, int local_id) {
+    if (local_id < 0) return;
+    IRHandleInfo *h = ir_find_handle(ps, local_id);
+    if (h) h->escaped = true;
+}
+
+/* Given an AST value expression (RHS of assign or return), find the
+ * local it refers to (following through NODE_ORELSE to the primary
+ * expression). Returns local id or -1. */
+static int ir_find_value_local(IRFunc *func, Node *val) {
+    if (!val) return -1;
+    if (val->kind == NODE_ORELSE) val = val->orelse.expr;
+    if (val && val->kind == NODE_IDENT) {
+        return ir_find_local(func,
+            val->ident.name, (uint32_t)val->ident.name_len);
+    }
+    return -1;
+}
+
+/* ================================================================
  * CFG Merge — the key advantage over linear AST walk
  *
  * At basic block join points (multiple predecessors), merge handle
@@ -396,25 +460,38 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     }
 
     /* Return → check no handles leaked, mark terminated.
-     * Phase B1: returning a move struct value transfers ownership
-     * to caller. Source is marked TRANSFERRED (not merely escaped) —
-     * subsequent use in unreachable code still detectable. */
+     * Phase B1+B2: three shapes supported —
+     *   (a) `return h` ident — move transfer OR mark escaped
+     *   (b) `return opt orelse h` — walk into fallback, mark escaped
+     *   (c) `return { .field = h, ... }` struct init — walk fields,
+     *       mark each embedded handle escaped
+     */
     case IR_RETURN: {
-        if (inst->expr && inst->expr->kind == NODE_IDENT) {
+        Node *rexpr = inst->expr;
+        /* Unwrap orelse: `return opt orelse fallback_h` — check BOTH
+         * the primary (a tracked local reaches the return) and the
+         * fallback (a handle used on null path). */
+        Node *primary = rexpr;
+        Node *fallback = NULL;
+        if (rexpr && rexpr->kind == NODE_ORELSE) {
+            primary = rexpr->orelse.expr;
+            fallback = rexpr->orelse.fallback;
+        }
+
+        /* Case (a): direct ident return */
+        if (primary && primary->kind == NODE_IDENT) {
             int ret_local = ir_find_local(func,
-                inst->expr->ident.name,
-                (uint32_t)inst->expr->ident.name_len);
+                primary->ident.name,
+                (uint32_t)primary->ident.name_len);
             if (ret_local >= 0 && ret_local < func->local_count) {
                 IRHandleInfo *h = ir_find_handle(ps, ret_local);
                 Type *ret_type = func->locals[ret_local].type;
                 if (ir_should_track_move(ret_type)) {
-                    /* Check using transferred/freed value before return */
                     if (h && ir_is_invalid(h)) {
                         ir_zc_error(zc, inst->source_line,
                             "returning %s value (local %%%d)",
                             ir_state_name(h->state), ret_local);
                     }
-                    /* Mark TRANSFERRED — caller owns it now */
                     if (!h) h = ir_add_handle(ps, ret_local);
                     if (h) {
                         h->state = IR_HS_TRANSFERRED;
@@ -422,11 +499,27 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->escaped = true;
                     }
                 } else {
-                    /* Non-move: just mark escaped (existing behavior) */
                     if (h) h->escaped = true;
                 }
             }
         }
+
+        /* Case (b): orelse fallback that returns a handle —
+         * ident or further nested — mark escaped. */
+        if (fallback) {
+            int fb_local = ir_find_value_local(func, fallback);
+            if (fb_local >= 0) ir_mark_local_escaped(ps, fb_local);
+        }
+
+        /* Case (c): struct init — walk fields, mark embedded handles. */
+        if (primary && primary->kind == NODE_STRUCT_INIT) {
+            for (int fi = 0; fi < primary->struct_init.field_count; fi++) {
+                Node *fv = primary->struct_init.fields[fi].value;
+                int fv_local = ir_find_value_local(func, fv);
+                if (fv_local >= 0) ir_mark_local_escaped(ps, fv_local);
+            }
+        }
+
         ps->terminated = true;
         break;
     }
@@ -448,27 +541,35 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
-    /* Phase B1: FIELD_WRITE with move struct RHS transfers ownership.
-     * Closes Gap 5: `b.item = t` where Box(Tok) b — t transferred to
-     * the container field. Subsequent use of t = use-after-transfer.
+    /* Phase B1+B2: FIELD_WRITE — move transfer + escape detection.
+     *
+     * Move transfer (B1, closes Gap 5): `b.item = t` where Box(Tok) b —
+     * t transferred to the container field. Subsequent t use = error.
+     *
+     * Escape detection (B2): `global.field = h` or `s.field = h` where
+     * s is a pointer param — h escapes to external scope. Suppresses
+     * leak detection at function exit for h.
+     *
      * Handles two target shapes:
      *   - src1_local = container local (decomposed path)
      *   - inst->expr  = AST NODE_ASSIGN (passthrough path)
-     * Both route through the same logic: find source local, check its
-     * type for move-struct, mark TRANSFERRED if so. */
+     */
     case IR_FIELD_WRITE: {
-        /* Resolve RHS local — could be src2_local (decomposed) or
-         * inst->expr's value side (passthrough). */
         int rhs_local = -1;
+        Node *target_expr = NULL;
+        Node *value_expr = NULL;
         if (inst->src2_local >= 0) {
             rhs_local = inst->src2_local;
-        } else if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
-                   inst->expr->assign.value &&
-                   inst->expr->assign.value->kind == NODE_IDENT) {
-            rhs_local = ir_find_local(func,
-                inst->expr->assign.value->ident.name,
-                (uint32_t)inst->expr->assign.value->ident.name_len);
         }
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN) {
+            target_expr = inst->expr->assign.target;
+            value_expr = inst->expr->assign.value;
+            if (rhs_local < 0 && value_expr) {
+                rhs_local = ir_find_value_local(func, value_expr);
+            }
+        }
+
+        /* Move transfer (B1) */
         if (rhs_local >= 0 && rhs_local < func->local_count) {
             Type *rhs_type = func->locals[rhs_local].type;
             if (ir_should_track_move(rhs_type)) {
@@ -484,6 +585,52 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     rh->free_line = inst->source_line;
                 }
             }
+        }
+
+        /* Escape detection (B2): if target root is global or pointer param,
+         * any handle we write escapes external scope. */
+        if (target_expr && ir_target_root_escapes(zc, target_expr)) {
+            ir_mark_local_escaped(ps, rhs_local);
+        }
+        break;
+    }
+
+    /* Phase B2: INDEX_WRITE — array element assignment. Mirror of
+     * FIELD_WRITE. `arr[i] = h` where arr is global or arrives through
+     * pointer param → h escapes. Also marks RHS TRANSFERRED if move
+     * struct. Non-tracked RHS is ignored (common case). */
+    case IR_INDEX_WRITE: {
+        int rhs_local = -1;
+        Node *target_expr = NULL;
+        Node *value_expr = NULL;
+        if (inst->src2_local >= 0) rhs_local = inst->src2_local;
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN) {
+            target_expr = inst->expr->assign.target;
+            value_expr = inst->expr->assign.value;
+            if (rhs_local < 0 && value_expr) {
+                rhs_local = ir_find_value_local(func, value_expr);
+            }
+        }
+        /* Move transfer */
+        if (rhs_local >= 0 && rhs_local < func->local_count) {
+            Type *rhs_type = func->locals[rhs_local].type;
+            if (ir_should_track_move(rhs_type)) {
+                IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+                if (rh && ir_is_invalid(rh)) {
+                    ir_zc_error(zc, inst->source_line,
+                        "use of %s value (local %%%d) in array write",
+                        ir_state_name(rh->state), rhs_local);
+                }
+                if (!rh) rh = ir_add_handle(ps, rhs_local);
+                if (rh) {
+                    rh->state = IR_HS_TRANSFERRED;
+                    rh->free_line = inst->source_line;
+                }
+            }
+        }
+        /* Escape */
+        if (target_expr && ir_target_root_escapes(zc, target_expr)) {
+            ir_mark_local_escaped(ps, rhs_local);
         }
         break;
     }

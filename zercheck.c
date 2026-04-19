@@ -2255,9 +2255,13 @@ static FuncSummary *find_summary(ZerCheck *zc, const char *name, uint32_t name_l
 
 /* Build a summary for one function: what does it do to its Handle params?
  * Uses the existing zc_check_stmt walker with error suppression. */
-static void zc_build_summary(ZerCheck *zc, Node *func) {
-    if (!func->func_decl.body) return;
-    if (func->func_decl.param_count == 0) return;
+/* Build / refine a FuncSummary for `func`. Returns true if the summary
+ * values changed from the previous call (or if no summary existed yet).
+ * The outer driver iterates until `changed == false` — this is how
+ * mutual-recursion free-propagation converges (GAP 2 fix, 2026-04-19). */
+static bool zc_build_summary(ZerCheck *zc, Node *func) {
+    if (!func->func_decl.body) return false;
+    if (func->func_decl.param_count == 0) return false;
 
     /* check if any param is Handle(T) or *T (trackable) */
     bool has_handle_param = false;
@@ -2268,7 +2272,7 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
             break;
         }
     }
-    if (!has_handle_param) return;
+    if (!has_handle_param) return false;
 
     /* suppress errors during summary phase */
     zc->building_summary = true;
@@ -2310,12 +2314,45 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
         }
     }
 
-    /* store summary */
+    pathstate_free(&ps);
+    zc->building_summary = false;
+
+    /* GAP 2 fix: if summary already exists, UPDATE (not append) and
+     * report whether values changed. Enables fixed-point iteration for
+     * mutual recursion — earlier passes may have computed A's summary
+     * without yet knowing B's free behavior; a second pass with B's
+     * summary available can then refine A's summary. */
+    FuncSummary *existing = find_summary(zc, func->func_decl.name,
+        (uint32_t)func->func_decl.name_len);
+    if (existing) {
+        bool changed = false;
+        /* param_count shouldn't drift between rebuilds, but guard anyway */
+        if (existing->param_count == pc) {
+            for (int i = 0; i < pc; i++) {
+                if (existing->frees_param[i] != frees[i]) changed = true;
+                if (existing->maybe_frees_param[i] != maybe_frees[i]) changed = true;
+            }
+        } else {
+            changed = true;
+        }
+        if (!changed) {
+            free(frees); free(maybe_frees);
+            return false;
+        }
+        free(existing->frees_param);
+        free(existing->maybe_frees_param);
+        existing->param_count = pc;
+        existing->frees_param = frees;
+        existing->maybe_frees_param = maybe_frees;
+        return true;
+    }
+
+    /* store new summary */
     if (zc->summary_count >= zc->summary_capacity) {
         int new_cap = zc->summary_capacity * 2;
         if (new_cap < 8) new_cap = 8;
         FuncSummary *new_s = realloc(zc->summaries, new_cap * sizeof(FuncSummary));
-        if (!new_s) { free(frees); free(maybe_frees); pathstate_free(&ps); zc->building_summary = false; return; }
+        if (!new_s) { free(frees); free(maybe_frees); return false; }
         zc->summaries = new_s;
         zc->summary_capacity = new_cap;
     }
@@ -2325,9 +2362,7 @@ static void zc_build_summary(ZerCheck *zc, Node *func) {
     s->param_count = pc;
     s->frees_param = frees;
     s->maybe_frees_param = maybe_frees;
-
-    pathstate_free(&ps);
-    zc->building_summary = false;
+    return true;
 }
 
 /* Apply function summary at a call site: mark handle args as freed/maybe-freed
@@ -2715,11 +2750,18 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
         }
     }
 
-    /* pre-scan: build cross-function summaries for all functions.
+    /* Pre-scan: build cross-function summaries for all functions.
      * Scan imported modules first (dependencies before dependents),
-     * then main module. Multiple passes for wrapper chain propagation. */
-    for (int pass = 0; pass < 4; pass++) {
-        int prev_count = zc->summary_count;
+     * then main module.
+     *
+     * GAP 2 fix (2026-04-19): iterate rebuilding ALL summaries until
+     * values stabilize. Previously the loop only ADDED missing summaries;
+     * existing summaries were never refined. Mutual recursion (A calls B
+     * calls A) produced A's summary on pass 1 without knowing B's free
+     * behavior — and it stayed wrong. Now zc_build_summary returns true
+     * when it refines an existing summary, and we loop while any refined. */
+    for (int pass = 0; pass < 16; pass++) {
+        bool changed = false;
         /* imported modules first */
         for (int mi = 0; mi < zc->import_ast_count; mi++) {
             Node *mod = zc->import_asts[mi];
@@ -2727,20 +2769,18 @@ bool zercheck_run(ZerCheck *zc, Node *file_node) {
             for (int i = 0; i < mod->file.decl_count; i++) {
                 Node *decl = mod->file.decls[i];
                 if (decl->kind == NODE_FUNC_DECL &&
-                    !find_summary(zc, decl->func_decl.name,
-                        (uint32_t)decl->func_decl.name_len))
-                    zc_build_summary(zc, decl);
+                    zc_build_summary(zc, decl))
+                    changed = true;
             }
         }
         /* main module */
         for (int i = 0; i < file_node->file.decl_count; i++) {
             Node *decl = file_node->file.decls[i];
             if (decl->kind == NODE_FUNC_DECL &&
-                !find_summary(zc, decl->func_decl.name,
-                    (uint32_t)decl->func_decl.name_len))
-                zc_build_summary(zc, decl);
+                zc_build_summary(zc, decl))
+                changed = true;
         }
-        if (zc->summary_count == prev_count) break; /* converged */
+        if (!changed) break;
     }
 
     /* main analysis: check each function and interrupt body */

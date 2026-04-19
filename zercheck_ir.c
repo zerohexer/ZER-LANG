@@ -1518,6 +1518,35 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
+        /* Phase E: move struct ownership transfer on function call args.
+         * When `consume(f)` is called and f is a move struct (or contains
+         * move struct fields), the argument transfers ownership and the
+         * caller's local becomes TRANSFERRED. Subsequent use = UAF. */
+        if (inst->expr && inst->expr->kind == NODE_CALL) {
+            Node *call = inst->expr;
+            for (int pi = 0; pi < call->call.arg_count; pi++) {
+                Node *arg = call->call.args[pi];
+                if (!arg || arg->kind != NODE_IDENT) continue;
+                int arg_local = ir_find_local_exact_first(func,
+                    arg->ident.name, (uint32_t)arg->ident.name_len);
+                if (arg_local < 0 || arg_local >= func->local_count) continue;
+                Type *arg_type = func->locals[arg_local].type;
+                if (!ir_should_track_move(arg_type)) continue;
+                IRHandleInfo *h = ir_find_handle(ps, arg_local);
+                if (h && h->state == IR_HS_TRANSFERRED) {
+                    ir_zc_error(zc, inst->source_line,
+                        "use after move: '%.*s' ownership transferred at line %d",
+                        (int)func->locals[arg_local].name_len,
+                        func->locals[arg_local].name, h->free_line);
+                }
+                if (!h) h = ir_add_handle(ps, arg_local);
+                if (h) {
+                    h->state = IR_HS_TRANSFERRED;
+                    h->free_line = inst->source_line;
+                }
+            }
+        }
+
         /* Phase E: recognize pool/slab/Task builtin methods in IR_CALL.
          * alloc/alloc_ptr when dest_local is set → register dest ALIVE.
          * free/free_ptr → mark handle FREED. get → UAF check. */
@@ -1562,6 +1591,21 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     IRHandleInfo *h;
                     if (path_len == 0) h = ir_find_handle(ps, root_local);
                     else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    /* Phase E: if freeing a param that was never registered
+                     * as a handle, create one so FuncSummary can observe
+                     * FREED state at return. Enables cross-function
+                     * frees_param[i] inference. */
+                    if (!h && path_len == 0 && root_local >= 0 &&
+                        root_local < func->local_count &&
+                        func->locals[root_local].is_param) {
+                        h = ir_add_handle(ps, root_local);
+                        if (h) {
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->source_color = ZC_COLOR_UNKNOWN;
+                        }
+                    }
                     if (h) {
                         if (h->state == IR_HS_FREED) {
                             ir_zc_error(zc, inst->source_line,

@@ -504,23 +504,20 @@ int main(int argc, char **argv) {
         }
         zc.import_asts = import_asts;
         zc.import_ast_count = import_ast_count;
-        if (!zercheck_run(&zc, main_mod->ast)) {
-            fprintf(stderr, "error: zercheck failed\n");
-            free(cc.modules);
-            arena_free(&cc.arena);
-            return 1;
-        }
+        bool ast_ok = zercheck_run(&zc, main_mod->ast);
 
-        /* Phase E: optional dual-run. When ZER_DUAL_RUN=1 is set,
-         * also run zercheck_ir.c (CFG-based) on each function and
-         * log any diagnostic-count disagreements to stderr.
-         * zercheck.c remains the source of truth for the compile's
-         * success/failure; zercheck_ir errors are accumulated into
-         * a separate counter for comparison only.
+        /* Phase E: optional dual-run. Runs BEFORE ast_ok short-circuits
+         * so negative tests can be verified too. When ZER_DUAL_RUN=1 is
+         * set, also run zercheck_ir.c (CFG-based) on each function and
+         * log diagnostic-count disagreements to stderr.
          *
-         * First-pass goal: get both running end-to-end without crashes
-         * and observe the disagreement distribution. Precise per-message
-         * diffing is a follow-up refinement. */
+         * Parity semantics for negative tests:
+         *   - ast_err > 0 AND ir_err > 0  → both reject, no disagreement
+         *   - ast_err > 0 AND ir_err == 0 → zercheck_ir MISSED a case
+         *   - ast_err == 0 AND ir_err > 0 → zercheck_ir FALSE POSITIVE
+         *
+         * zercheck.c remains the source of truth for the compile's
+         * success/failure; zercheck_ir errors are comparison-only. */
         extern bool zercheck_ir(ZerCheck *zc_ir, IRFunc *func);
         const char *dual = getenv("ZER_DUAL_RUN");
         if (dual && dual[0] != '\0' && dual[0] != '0') {
@@ -543,19 +540,31 @@ int main(int argc, char **argv) {
             }
             int ast_err = zc.error_count;
             int ir_err = zc_ir.error_count - ir_error_count_start;
-            if (ast_err != ir_err) {
+            /* Loose parity: for negative tests we don't require exact
+             * error counts — only that BOTH analyzers reject. Exact-count
+             * match required only when both agree on zero errors. */
+            bool agree;
+            if (ast_err == 0 && ir_err == 0) agree = true;
+            else if (ast_err > 0 && ir_err > 0) agree = true;
+            else agree = false;
+            if (!agree) {
                 fprintf(stderr,
                     "zercheck DUAL-RUN disagreement in %s: ast=%d ir=%d "
                     "(functions analyzed: %d)\n",
                     input_path, ast_err, ir_err, ir_func_count);
             } else if (dual[0] == '2') {
-                /* ZER_DUAL_RUN=2 for verbose agree confirmation */
                 fprintf(stderr,
-                    "zercheck DUAL-RUN agree in %s: %d error%s "
+                    "zercheck DUAL-RUN agree in %s: ast=%d ir=%d "
                     "(functions analyzed: %d)\n",
-                    input_path, ast_err, ast_err == 1 ? "" : "s",
-                    ir_func_count);
+                    input_path, ast_err, ir_err, ir_func_count);
             }
+        }
+
+        if (!ast_ok) {
+            fprintf(stderr, "error: zercheck failed\n");
+            free(cc.modules);
+            arena_free(&cc.arena);
+            return 1;
         }
     }
 

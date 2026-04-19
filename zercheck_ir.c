@@ -2294,6 +2294,78 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         inst->call_arg_locals[ai] < func->local_count)
                         used_locals[inst->call_arg_locals[ai]] = 1;
                 }
+                /* Phase E: passthrough usage via AST inst->expr. Many IR
+                 * ops carry their original AST (IR_ASSIGN with NODE_ORELSE,
+                 * IR_RETURN with expr, IR_CALL args, etc.). Walk the AST
+                 * for NODE_IDENTs that reference tracked locals. Without
+                 * this, mh used in `h = mh orelse return` counts as unused. */
+                if (inst->expr) {
+                    /* Recursive walk limited to small depth — expressions
+                     * are typically shallow. Use a manual stack to avoid
+                     * runaway recursion on pathological ASTs. */
+                    Node *stack[64];
+                    int top = 0;
+                    stack[top++] = inst->expr;
+                    while (top > 0) {
+                        Node *n = stack[--top];
+                        if (!n) continue;
+                        switch (n->kind) {
+                        case NODE_IDENT: {
+                            int li = ir_find_local_exact_first(func,
+                                n->ident.name, (uint32_t)n->ident.name_len);
+                            if (li >= 0 && li < func->local_count)
+                                used_locals[li] = 1;
+                            break;
+                        }
+                        case NODE_FIELD:
+                            if (top < 63) stack[top++] = n->field.object; break;
+                        case NODE_INDEX:
+                            if (top < 62) {
+                                stack[top++] = n->index_expr.object;
+                                stack[top++] = n->index_expr.index;
+                            } break;
+                        case NODE_UNARY:
+                            if (top < 63) stack[top++] = n->unary.operand; break;
+                        case NODE_BINARY:
+                            if (top < 62) {
+                                stack[top++] = n->binary.left;
+                                stack[top++] = n->binary.right;
+                            } break;
+                        case NODE_CALL:
+                            if (top < 63) stack[top++] = n->call.callee;
+                            for (int ai = 0; ai < n->call.arg_count && top < 63; ai++)
+                                stack[top++] = n->call.args[ai];
+                            break;
+                        case NODE_ASSIGN:
+                            if (top < 62) {
+                                stack[top++] = n->assign.target;
+                                stack[top++] = n->assign.value;
+                            } break;
+                        case NODE_ORELSE:
+                            if (top < 62) {
+                                stack[top++] = n->orelse.expr;
+                                stack[top++] = n->orelse.fallback;
+                            } break;
+                        case NODE_TYPECAST:
+                            if (top < 63) stack[top++] = n->typecast.expr; break;
+                        case NODE_SLICE:
+                            if (top < 61) {
+                                stack[top++] = n->slice.object;
+                                stack[top++] = n->slice.start;
+                                stack[top++] = n->slice.end;
+                            } break;
+                        case NODE_INTRINSIC:
+                            for (int ai = 0; ai < n->intrinsic.arg_count && top < 63; ai++)
+                                stack[top++] = n->intrinsic.args[ai];
+                            break;
+                        case NODE_STRUCT_INIT:
+                            for (int fi = 0; fi < n->struct_init.field_count && top < 63; fi++)
+                                stack[top++] = n->struct_init.fields[fi].value;
+                            break;
+                        default: break;
+                        }
+                    }
+                }
             }
         }
     }

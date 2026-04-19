@@ -26,11 +26,14 @@ static int passed = 0, failed = 0, total = 0;
 static const char *zerc_path = NULL;
 
 static void find_zerc(void) {
-    /* Try common locations */
-    if (system("./zerc --help >/dev/null 2>&1") == 0) { zerc_path = "./zerc"; return; }
-    if (system("/tmp/zerc --help >/dev/null 2>&1") == 0) { zerc_path = "/tmp/zerc"; return; }
-    /* Build it if needed */
-    if (system("gcc -std=c99 -O2 -I. -o /tmp/zerc lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c 2>/dev/null") == 0) {
+    /* Try common locations. `test -x` is the existence + exec-bit check —
+     * `./zerc --help` is unreliable because zerc treats unknown flags as
+     * input filenames and exits non-zero. */
+    if (system("test -x ./zerc") == 0) { zerc_path = "./zerc"; return; }
+    if (system("test -x /tmp/zerc") == 0) { zerc_path = "/tmp/zerc"; return; }
+    /* Build it if needed. Must include zercheck_ir.c (CFG analyzer) — has
+     * been linked alongside zercheck.c since the CFG migration started. */
+    if (system("gcc -std=c99 -O2 -I. -o /tmp/zerc lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c 2>/dev/null") == 0) {
         zerc_path = "/tmp/zerc";
         return;
     }

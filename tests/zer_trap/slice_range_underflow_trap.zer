@@ -1,0 +1,16 @@
+// Regression guard for BUG-596 (slice range check `arr[a..b]` with a > b).
+// MUST compile clean + trap at runtime with "slice start > end".
+// Without the check, size_t subtraction underflows to a giant fake
+// slice length.
+
+void check(u32 lo, u32 hi) {
+    u32[10] arr;
+    [*]u32 s = arr[lo..hi];  // lo > hi — must trap
+    u32 x = 0;
+    if (s.len > 0) { x = 1; }
+}
+
+u32 main() {
+    check(5, 2);  // lo=5, hi=2 → start > end
+    return 0;
+}

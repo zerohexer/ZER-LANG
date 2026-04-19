@@ -1,0 +1,22 @@
+// Regression guard: verifies the slice bounds check DOES NOT falsely
+// trap on valid in-range indexes. Pairs with tests/zer_trap/
+// slice_bounds_oob_trap.zer (which verifies it DOES trap on OOB).
+
+struct Point { u32 x; u32 y; }
+
+u32 main() {
+    Point[5] arr;
+    arr[0].x = 10; arr[0].y = 20;
+    arr[4].x = 50; arr[4].y = 60;
+
+    [*]Point s = arr[0..];
+
+    // Valid access — must not trap
+    u32 i = 4;
+    // Launder through loop so VRP doesn't erase the runtime check
+    for (u32 k = 0; k < 1; k += 1) { i = 4; }
+    u32 r = s[i].x;
+    if (r != 50) { return 1; }
+
+    return 0;
+}

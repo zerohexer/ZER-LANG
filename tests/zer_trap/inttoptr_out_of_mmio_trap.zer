@@ -1,0 +1,14 @@
+// Regression guard for BUG-599 (@inttoptr MMIO range check, variable addr).
+// MUST compile clean + trap at runtime with "outside mmio range".
+// Pattern: declare a valid mmio range, then use @inttoptr with a
+// variable address that falls outside it.
+
+mmio 0x40000000..0x40000FFF;
+
+u32 main() {
+    u64 addr = 0x50000000;  // outside declared range
+    // Launder through loop so checker can't constant-fold
+    for (u32 i = 0; i < 1; i += 1) { addr = 0x50000000; }
+    volatile *u32 p = @inttoptr(*u32, addr);
+    return p[0];  // runtime range check must trap here
+}

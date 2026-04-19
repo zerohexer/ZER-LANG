@@ -1,0 +1,23 @@
+// Regression guard: signed division on normal values does not trap.
+// Pairs with tests/zer_trap/signed_div_overflow_trap.zer.
+
+i32 main() {
+    i32 a = -100;
+    i32 b = 7;
+    i32 q = a / b;        // -100 / 7 = -14 (truncates toward 0 — actually -15 on floor, -14 on truncate)
+    // ZER uses C semantics: truncation toward zero → -14
+    if (q != -14) { return 1; }
+
+    // Edge: negative / negative
+    i32 c = -50;
+    i32 d = -5;
+    i32 q2 = c / d;       // -50 / -5 = 10
+    if (q2 != 10) { return 2; }
+
+    // INT_MAX / 1 — not overflow
+    i32 e = 2147483647;
+    i32 q3 = e / 1;
+    if (q3 != 2147483647) { return 3; }
+
+    return 0;
+}

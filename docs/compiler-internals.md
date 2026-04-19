@@ -4573,3 +4573,106 @@ section.
 
 Result: ZERO skipped tests across the entire suite. Every test
 runs to a real outcome.
+
+---
+
+## 2026-04-19 late: AST→IR emission safety invariant (BUG-595 through BUG-599)
+
+**MANDATORY invariant for future IR handler changes.**
+
+### The class of bug this section prevents
+
+Commit `010ddea` (2026-04-15, "Phase 8b: local-ID emission") replaced
+`emit_expr(inst->expr)` routing with direct local-ID emission in several
+IR handlers. In doing so, it silently stripped every runtime safety
+wrapper `emit_expr` had been applying. Seven regressions shipped
+between IR-default-flip (`82335c3`, 2026-04-17) and audit (2026-04-19).
+
+The compiler was:
+- Reading past slice length (silent OOB)
+- Writing past slice length (silent buffer overflow)
+- Computing `se - ss` as size_t with no check (giant fake slice)
+- Dividing INT_MIN by -1 (C undefined behavior)
+- Shifting by >= width (C undefined behavior)
+- Using arbitrary variable addresses as pointers (no MMIO range check)
+- Using misaligned addresses for word-size loads (no alignment check)
+
+Tests stayed green because VRP proves most real-world values safe at
+compile time, removing the need for the runtime wrapper entirely for
+those cases. Audit tests specifically constructed unprovable values.
+
+### The rule
+
+**Any IR handler that emits C by reading local IDs (not by calling
+`emit_expr(inst->expr)`) is responsible for emitting every runtime
+safety wrapper that `emit_expr` would have emitted for the same
+expression.**
+
+Safety wrappers `emit_expr` applies (search emitter.c for these in
+the `< 4000` line range — that's the AST path):
+- `_zer_bounds_check(idx, len, ...)` — array/slice indexing
+- `_zer_trap("division by zero")` — compile-time guard forces this, still
+- `_zer_trap("signed division overflow")` — INT_MIN / -1
+- `_zer_shl(a, b)` / `_zer_shr(a, b)` macros — shift safety
+- `_zer_trap("slice start > end")` — underflow prevention
+- `_zer_trap("@inttoptr: address outside mmio range")`
+- `_zer_trap("@inttoptr: unaligned address")`
+- `_zer_trap("@ptrcast type mismatch")` — checker catches, backup
+- `_zer_trap("type mismatch in cast")` — @cast
+- `_zer_trap("explicit trap")` — @trap()
+- `_zer_probe((uintptr_t)...)` — @probe()
+
+### Where each safety wrapper currently lives (post-fix)
+
+| Safety check | IR emitter site | Fix commit |
+|---|---|---|
+| Slice bounds READ | `IR_INDEX_READ` handler + `emit_rewritten_node` NODE_INDEX | 3bdcf85 |
+| Slice bounds WRITE | `emit_rewritten_node` NODE_INDEX (comma preserves lvalue) | 3bdcf85 |
+| Signed div overflow | `IR_BINOP` TOK_SLASH / TOK_PERCENT path | 3bdcf85 |
+| Shift safety | `IR_BINOP` TOK_LSHIFT / TOK_RSHIFT path (routes to `_zer_shl`/`_zer_shr`) | 3bdcf85 |
+| Slice `arr[a..b]` range | `emit_rewritten_node` NODE_SLICE (both branches) | 3bdcf85 |
+| @inttoptr MMIO range | `emit_rewritten_node` @inttoptr intrinsic | 3bdcf85 |
+| @inttoptr alignment | Same site as above | 3bdcf85 |
+| Array bounds (unproven index) | `emit_auto_guards` separate pass | pre-IR |
+
+### Verification checklist before committing IR emitter changes
+
+1. **Grep the AST path** for every `_zer_trap` / `_zer_bounds_check` /
+   `_zer_shl` / `_zer_probe` call site in `emit_expr` (the `< 4000` line
+   range is AST; `> 5000` is mostly IR).
+
+2. **For each AST-path safety emit, find the IR equivalent.**
+   - If both exist → safe, no work needed.
+   - If AST has it, IR doesn't → **regression**. Port the wrapper.
+   - If IR has it, AST doesn't → probably OK (IR is primary now).
+
+3. **Write a test that uses an UNPROVABLE value** to exercise the
+   runtime check. Example pattern:
+   ```zer
+   u32 i = 10;
+   for (u32 k = 0; k < 1; k += 1) { i = 10; }  // VRP loses track
+   return arr[i];                              // runtime check must fire
+   ```
+   Without the loop, VRP proves `i = 10` statically and the test
+   won't exercise the runtime wrapper.
+
+4. **Compile with `--emit-c`** and grep the output for the expected
+   safety call. If missing, the test is PASSING FOR THE WRONG REASON.
+
+### Do not repeat this mistake
+
+When optimizing an IR handler, **if the old version had
+`emit_expr(inst->expr)` and the new version emits C directly**, stop
+and list every safety wrapper `emit_expr` would have applied. Port
+each explicitly. Do not assume the optimizer or the AST fallback
+will cover it — there is no fallback; `emit_stmt` was deleted in
+commit `449627b` and the AST path for function bodies is dead code.
+
+### Audit trail
+
+- Full methodology: CLAUDE.md "AST→IR Emission Diff Audit" section.
+- Individual BUGs: BUG-595 through BUG-599 in BUGS-FIXED.md.
+- Reproducer tests: `tests/zer_gaps/audit2_slice_*.zer`,
+  `tests/zer_gaps/ast_*.zer`. Verify each traps correctly by
+  running `./zerc <file> --emit-c -o /tmp/x.c && gcc ... && /tmp/x`
+  and checking for expected trap message.

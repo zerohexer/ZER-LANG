@@ -1233,6 +1233,43 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
             free(rs.ids);
         }
+
+        /* Phase E: NODE_ASSIGN(target, value) passthrough — field/index
+         * writes. If target root is a global or escape-detector positive,
+         * mark the RHS local escaped (suppresses leak detection).
+         * Also registers compound handle for `s.field = h` pattern so
+         * `s.field` and `h` share alloc_id for UAF tracking. */
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN) {
+            Node *target_expr = inst->expr->assign.target;
+            Node *value_expr = inst->expr->assign.value;
+            int rhs_local = ir_find_value_local(func, value_expr);
+            if (target_expr && rhs_local >= 0 &&
+                ir_target_root_escapes(zc, target_expr)) {
+                ir_mark_local_escaped(ps, rhs_local);
+            }
+            /* Compound key registration: `container.field = h` */
+            if (target_expr && rhs_local >= 0) {
+                IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+                if (rh && rh->state == IR_HS_ALIVE) {
+                    int root_local;
+                    const char *path;
+                    uint32_t path_len;
+                    if (ir_extract_compound_key(zc, func, target_expr,
+                                                 &root_local, &path,
+                                                 &path_len) == 0 &&
+                        path_len > 0) {
+                        IRHandleInfo *ch = ir_add_compound_handle(ps,
+                            root_local, path, path_len);
+                        if (ch) {
+                            ch->state = IR_HS_ALIVE;
+                            ch->alloc_line = rh->alloc_line;
+                            ch->alloc_id = rh->alloc_id;
+                            ch->source_color = rh->source_color;
+                        }
+                    }
+                }
+            }
+        }
         /* Phase E: recognize pool/slab builtin method calls in the RHS.
          * Handled shapes:
          *   h = pool.alloc()                      → unwrap to NODE_CALL

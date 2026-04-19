@@ -6461,9 +6461,13 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             if (csym && csym->is_function && csym->func_node &&
                 csym->func_node->kind == NODE_FUNC_DECL &&
                 csym->func_node->func_decl.body) {
-                /* Depth limit to prevent infinite recursion on recursive call chains */
+                /* Depth limit to prevent infinite recursion on recursive call chains.
+                 * Phase A3 fix: raised from 8 to 32. Real call graphs can easily
+                 * exceed 8 levels (handler → validator → parser → helper → ...).
+                 * 32 still prevents pathological infinite recursion while catching
+                 * legitimate transitive data races. */
                 static int _scan_depth = 0;
-                if (_scan_depth < 8) {
+                if (_scan_depth < 32) {
                     _scan_depth++;
                     bool found = scan_unsafe_global_access(c,
                         csym->func_node->func_decl.body, out_name, out_len);
@@ -8322,7 +8326,14 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_DEFER:
         /* Ban yield/await in defer body — corrupts Duff's device state machine.
-         * Function summaries catch both direct and transitive cases. */
+         * Function summaries catch both direct and transitive cases.
+         * Phase A2 fix (Gap 7): defer inside another defer is banned —
+         * inner defer would run at outer defer's execution time (scope exit),
+         * which is confusing and probably not what the programmer intends. */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "'defer' cannot be nested inside another 'defer' body");
+        }
         check_body_effects(c, node->defer.body, node->loc.line,
             true, "cannot yield inside defer block — corrupts coroutine state machine",
             false, NULL,
@@ -8413,15 +8424,26 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_YIELD:
         /* yield — suspend current async task.
+         * Phase A1 fix (Gap 3): yield outside async is nonsensical — it would
+         * silently emit as no-op. Error at compile time.
          * BUG-481: yield in orelse at var-decl level = safe (state struct temps).
          * BUG-495: yield in orelse at expression level = GCC error
          * ("switch jumps into statement expression"). This is a GCC limitation —
          * case labels can't be inside ({...}). The developer must extract to var-decl.
          * No checker ban needed — GCC catches it with a clear error message. */
+        if (!c->in_async) {
+            checker_error(c, node->loc.line,
+                "'yield' only allowed inside async function");
+        }
         break;
 
     case NODE_AWAIT: {
-        /* await expr — check the condition expression */
+        /* await expr — check the condition expression.
+         * Phase A1 fix (Gap 3): await outside async is nonsensical. */
+        if (!c->in_async) {
+            checker_error(c, node->loc.line,
+                "'await' only allowed inside async function");
+        }
         if (node->await_stmt.cond) {
             check_expr(c, node->await_stmt.cond);
         }

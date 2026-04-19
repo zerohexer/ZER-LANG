@@ -5137,17 +5137,88 @@ if an existing summary's values differ, update in place and return
 true. Iterative refinement loop (up to 16 passes) orchestrated by
 zercheck_run handles mutual recursion convergence.
 
-### What Phase D will add
+### What Phase D added (COMPLETE 2026-04-19, commit 34415fd)
 
-- D1 alloc coloring — source_color field on IRHandleInfo, set at
-  alloc sites, Arena-colored skipped in leak detection.
-- D2 keep param validation — check at IR_FIELD_WRITE targeting global.
-- D3 ThreadHandle join — is_thread_handle flag, unjoined at exit = error.
-- D4 lock ordering — per-statement shared-type tracking at IR_LOCK.
-- D5 ISR bans — per-block in_interrupt flag, error at IR_SLAB_ALLOC /
-  IR_SPAWN.
-- D6 ghost handle — check IR_POOL_ALLOC / SLAB_ALLOC dest used downstream.
-- D7 arena wrapper chain — FuncSummary returns_color propagation.
+zercheck_ir.c grew from 1446 to 1696 lines (+250). Five features
+ported from zercheck.c; two (D2, D4) confirmed as checker.c domain
+and NOT ported.
+
+**D1 — Alloc coloring:**
+- Added `source_color` field on IRHandleInfo (values from zercheck.h:
+  ZC_COLOR_POOL, ZC_COLOR_ARENA, ZC_COLOR_MALLOC, ZC_COLOR_UNKNOWN)
+- Tagged at alloc sites: POOL for IR_POOL_ALLOC / SLAB_ALLOC, ARENA
+  for IR_ARENA_ALLOC / ARENA_ALLOC_SLICE (new handlers), MALLOC for
+  extern malloc/calloc/realloc (detected by name)
+- Leak detection skips ARENA-colored handles — arena.reset() frees
+  them wholesale
+- Error message specialized per color (MALLOC → "defer free()",
+  POOL → "defer pool.free()")
+
+**D2 — Keep parameter validation:**
+- NOT ported. Already implemented in checker.c (pre-zercheck).
+- `tests/zer_fail/nonkeep_store_global.zer` errors via checker, not
+  via either analyzer. Migration inherits this for free.
+
+**D3 — ThreadHandle join tracking:**
+- Added `is_thread_handle` flag on IRHandleInfo
+- IR_SPAWN with `is_scoped_spawn=true` and non-null `handle_name`
+  registers the thread handle as ALIVE with is_thread_handle=true
+- `th.join()` detection: IR_CALL with NODE_FIELD callee having
+  field_name "join" on a tracked thread-handle local → marks FREED
+- Leak check specialization: unjoined → "ThreadHandle 'th' not
+  joined before function exit" (not generic "handle leaked")
+
+**D4 — Lock ordering / deadlock detection:**
+- NOT ported. checker.c has 13 matches for "deadlock/check_lock_order"
+  and handles this pre-zercheck. Migration inherits.
+
+**D5 — ISR bans:**
+- Added `critical_depth` field on IRPathState (preserved in ir_ps_copy)
+- IR_CRITICAL_BEGIN / IR_CRITICAL_END increment/decrement the depth
+- Error cases:
+  - IR_SLAB_ALLOC / SLAB_ALLOC_PTR when `func->is_interrupt` is true
+  - IR_SLAB_ALLOC / SLAB_ALLOC_PTR when `critical_depth > 0`
+  - IR_SPAWN when `func->is_interrupt` is true
+  - IR_SPAWN when `critical_depth > 0`
+- Pool.alloc NOT banned (fixed-capacity, no calloc underneath).
+
+**D6 — Ghost handle detection:**
+- Pre-leak pass builds `used_locals[]` array by scanning every
+  instruction and marking any local that appears as src1/src2/
+  handle/cond/call_arg
+- At leak detection: ALIVE handle whose local was never used
+  → "ghost handle: allocation discarded — result of alloc() never
+  assigned or used"
+- Canonical case: `pool.alloc();` as bare expression statement
+
+**D7 — Arena wrapper chain inference:**
+- Extended `zc_ir_build_summary` to compute `returns_color`
+- Scan return blocks' returned locals; if all yield ARENA-colored
+  values, summary's returns_color = ARENA
+- IR_CALL with FuncSummary: if returns_color == ARENA and dest_local
+  set, register dest as ALIVE with ARENA color
+- Propagates arena coloring through wrapper chains:
+  `create() → wrap() → outer()` — all three get ARENA color, leak
+  detection correctly skips them at each level
+
+### Phase D concrete files + lines
+
+All changes confined to `zercheck_ir.c`:
+- Struct extensions: IRHandleInfo {+source_color, +is_thread_handle},
+  IRPathState {+critical_depth}
+- New IR op cases: IR_ARENA_ALLOC, IR_ARENA_ALLOC_SLICE,
+  IR_CRITICAL_BEGIN, IR_CRITICAL_END
+- Extended IR op cases: IR_POOL_ALLOC (ban + color), IR_SPAWN (ban +
+  thread handle), IR_CALL (.join detection, returns_color propagation)
+- Extended summary builder: returns_color inference
+
+### Pending — Phase E + F
+
+- **Phase E** — wire zercheck_ir into zerc_main.c alongside zercheck.c,
+  run both on every compile, diff diagnostics per-function, fix
+  every disagreement. Expected 10-30 disagreements first pass.
+- **Phase F** — delete zercheck.c (Makefile, zerc_main, zercheck.h),
+  tag v0.5.0.
 
 ### What NOT to do in zercheck_ir.c
 

@@ -1,0 +1,12 @@
+// slice [a..b] where a > b at runtime should trap per AST:2258
+void check(u32 lo, u32 hi) {
+    u32[10] arr;
+    [*]u32 s = arr[lo..hi];
+    // don't return s; just use it
+    u32 x = 0;
+    if (s.len > 0) { x = 1; }
+}
+u32 main() {
+    check(5, 2);  // lo > hi
+    return 0;
+}

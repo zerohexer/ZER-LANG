@@ -1,0 +1,6 @@
+u32 main() {
+    u32 a = 100;
+    u32 b = 0;  // runtime, not provable at compile time in loop
+    for (u32 i = 0; i < 1; i += 1) { b = i; }  // make b unprovable
+    return a / b;
+}

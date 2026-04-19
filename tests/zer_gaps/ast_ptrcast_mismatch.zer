@@ -1,0 +1,8 @@
+struct A { u32 x; }
+struct B { u32 y; }
+u32 main() {
+    A a; a.x = 1;
+    *opaque o = @ptrcast(*opaque, &a);
+    *B b = @ptrcast(*B, o);  // wrong type — runtime should trap
+    return b.y;
+}

@@ -1356,6 +1356,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 dst_h->state = IR_HS_ALIVE;
                                 dst_h->alloc_line = src_h->alloc_line;
                                 dst_h->alloc_id = src_h->alloc_id;
+                                dst_h->source_color = src_h->source_color;
+                                dst_h->is_thread_handle = src_h->is_thread_handle;
                             }
                         }
                         /* Check use of invalid handle */

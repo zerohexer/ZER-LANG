@@ -822,3 +822,420 @@ Honest framing: no plan achieves zero bugs. This plan targets:
 
 Residual bugs will still occur. What the plan provides is faster
 detection, cleaner fixes, and fewer re-regressions.
+
+---
+
+# Part 2 — Implementation detail (deep dive)
+
+After the high-level plan, deeper inspection of actual code revealed
+concrete file:line anchors. This part provides implementation-level
+detail needed to execute each phase without further planning.
+
+## Current pipeline — exact wiring
+
+**File:** `zerc_main.c:494-507`
+
+```c
+ZerCheck zc;
+zercheck_init(&zc, &checker, &cc.arena, input_path);
+// ... imports ...
+if (!zercheck_run(&zc, main_mod->ast)) {
+    fprintf(stderr, "zercheck failed\n");
+    return 1;
+}
+```
+
+Current call site is the only hook. No other source file calls
+`zercheck_*`. The cutover at Phase F is ONE edit.
+
+**Current Makefile** (`Makefile:~5`):
+
+```
+CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c \
+            zercheck.c ir.c ir_lower.c zerc_main.c
+LIB_SRCS  = lexer.c parser.c ast.c types.c checker.c emitter.c \
+            zercheck.c ir.c ir_lower.c
+```
+
+Neither `zercheck_ir.c` nor `vrp_ir.c` are in Makefile. Adding them
+is step 1 of Phase B.
+
+**Current `zercheck_ir(zc, func)` signature:**
+
+```c
+bool zercheck_ir(ZerCheck *zc, IRFunc *func);
+```
+
+Takes an `IRFunc*`, not a `Node*` like `zercheck_run`. Migration
+wrapper needs to lower each function to IR, call `zercheck_ir` on
+each, then roll up results.
+
+---
+
+## zercheck.c function map — what ports to where
+
+| zercheck.c function | Lines | Destination | Phase |
+|---|---:|---|---|
+| zc_error / zc_warning | 15-34 | Already ported (ir_zc_error) | — |
+| pathstate_init/copy/free/equal | 38-105 | Already ported (ir_ps_*) | — |
+| find_handle / find_handle_local / add_handle | 78-128 | Already ported | — |
+| find_pool_id / register_pool | 129-170 | Not needed (IR uses local_id) | — |
+| handle_key_from_expr | 172-213 | Replaced by compound key struct | B3 |
+| handle_key_arena | 215-225 | Not needed | — |
+| is_move_struct_type / contains_move_struct_field / should_track_move | 920-962 | Port verbatim (type helpers) | B1 |
+| is_alloc_call / is_free_call | 237-310 | Replaced by IR op dispatch | — |
+| block_always_exits | 312-341 | Not needed (CFG terminated flag) | — |
+| defer_stmt_is_free / defer_scan_all_frees | 343-390 | Port for IR_DEFER_FIRE scanning | C3 |
+| zc_check_call | 397-536 | Split across IR op handlers | B/C/D |
+| func_returns_color_by_name | 540-633 | Port — arena wrapper chain | D7 |
+| zc_check_var_init | 647-918 | Fold into IR_ASSIGN handler | B |
+| is_handle_invalid / is_handle_consumed | 963-976 | Already ported | — |
+| zc_report_invalid_use | 978-1019 | Port as helper | B |
+| zc_check_expr | 1021-1617 | Decompose into per-IR-op handlers | B/C/D |
+| zc_check_stmt | 1619-2244 | Decompose into per-IR-op handlers | B/C/D |
+| find_summary / zc_build_summary / zc_apply_summary | 2246-2491 | Port as zc_ir_build_summary etc | C1 |
+| zc_check_function | 2493-2727 | Port as per-function IR orchestration | all |
+| zercheck_init / zercheck_run | 2729-2810 | Rewrite — drive IR lowering per func | E/F |
+
+Total phases consume all 2810 lines. Nothing uncategorized.
+
+---
+
+## zc_check_expr — 598 lines mapped to IR ops
+
+| AST NODE_ case | IR op that replaces it | Handler additions |
+|---|---|---|
+| NODE_IDENT | IR_ASSIGN (RHS) | existing — check handle validity |
+| NODE_CALL | IR_CALL + IR_POOL_* + IR_SPAWN | split by callee type |
+| NODE_ASSIGN | IR_ASSIGN / IR_FIELD_WRITE / IR_INDEX_WRITE | escape checks (B2) |
+| NODE_BINARY | IR_BINOP | no handle logic |
+| NODE_FIELD | IR_FIELD_READ | compound key tracking (B3) |
+| NODE_INDEX | IR_INDEX_READ | compound key for array elements (B3) |
+| NODE_UNARY (deref) | IR_DEREF_READ | handle UAF check via parent |
+| NODE_UNARY (&x) | IR_ADDR_OF | interior pointer alloc_id propagation (C2 prereq) |
+| NODE_INTRINSIC @ptrcast | IR_INTRINSIC / IR_CAST | *opaque provenance (C2) |
+| NODE_ORELSE | IR_ORELSE_DECOMP | orelse fallback escape (B2) |
+| NODE_TYPECAST | IR_CAST | same as ptrcast |
+| NODE_STRUCT_INIT | IR_STRUCT_INIT_DECOMP | struct return escape (B2) |
+| NODE_SLICE | IR_SLICE_READ | no handle logic |
+
+## zc_check_stmt — 627 lines mapped
+
+| AST NODE_ case | IR path replacement |
+|---|---|
+| NODE_BLOCK | CFG joins handle scope via terminated flag |
+| NODE_VAR_DECL | IR_ASSIGN with dest_local classification |
+| NODE_IF | IR_BRANCH + two successor blocks + join — CFG merge natural |
+| NODE_FOR/WHILE/DO_WHILE | Back-edge CFG loops — fixed-point exists |
+| NODE_RETURN | IR_RETURN — extend with leak/escape checks |
+| NODE_DEFER | IR_DEFER_PUSH — C3 scans body |
+| NODE_CRITICAL | IR_CRITICAL_BEGIN/END — context flag for ISR bans (D5) |
+| NODE_ONCE | AST passthrough — no handle logic |
+| NODE_SWITCH | Arm bodies each IR blocks, merged at exit |
+| NODE_SPAWN | IR_SPAWN — already handles TRANSFERRED |
+| NODE_GOTO/BREAK/CONTINUE | IR_GOTO — CFG edges |
+| NODE_YIELD/AWAIT | IR_YIELD/IR_AWAIT — existing |
+| NODE_LABEL | Block boundary — already handled |
+
+---
+
+## Phase B1 — worked example for session execution
+
+### Session agenda (3-4 hours)
+
+1. **Read** (15 min):
+   - zercheck.c:920-961 (move struct helpers)
+   - zercheck.c:1712-1849 (move transfer in var_decl)
+   - zercheck_ir.c:287-314 (current IR_ASSIGN handler)
+
+2. **Port helpers** (30 min):
+   - Copy `is_move_struct_type`, `contains_move_struct_field`,
+     `should_track_move` to zercheck_ir.c verbatim.
+   - No changes needed — they operate on `Type*`, same in both.
+
+3. **Extend IR_ASSIGN** (1 hour):
+   - After existing alias logic, check source local type.
+   - If `should_track_move(src_type)`:
+     - Mark src handle TRANSFERRED.
+     - Mark dst handle ALIVE (new ownership).
+     - Set dst.alloc_id = fresh id.
+
+4. **Add IR_RETURN move transfer** (30 min):
+   - Check if return value is move struct ident.
+   - If yes, mark source TRANSFERRED.
+
+5. **Add IR_FIELD_WRITE handler** (30 min):
+   - New case in switch.
+   - If target field type is move struct AND source is tracked:
+     - Mark source TRANSFERRED.
+
+6. **Wire up** (15 min):
+   - Add `#include "zercheck_ir.h"` where needed.
+   - Add call to `zercheck_ir` in parallel with `zercheck_run` (dual-run stub).
+   - `make zerc` — must compile.
+
+7. **Test** (1 hour):
+   - Run `rt_move_*.zer` — must still pass.
+   - Run `gap5_container_move.zer` → should now fail when zercheck_ir runs.
+   - Add unit test for move transfer through container field.
+
+8. **Commit:**
+
+```
+CFG migration Phase B1: full move struct tracking in zercheck_ir
+
+- is_move_struct_type / contains_move_struct_field helpers ported
+- IR_ASSIGN marks source TRANSFERRED, dest ALIVE on move
+- IR_RETURN marks returned move struct TRANSFERRED
+- IR_FIELD_WRITE handles container field transfer (closes Gap 5)
+- Dual-run infrastructure: both analyzers run, zercheck.c primary
+- gap5_container_move.zer promoted to tests/zer_fail/
+```
+
+**Net:** 150 lines added, 1 gap closed, phase B 33% complete.
+
+---
+
+## Compound keys — design decision for Phase B3
+
+Two approaches, pick ONE:
+
+**Approach A — Compound key struct (recommended):**
+
+```c
+typedef enum {
+    IRHK_LOCAL,         /* just a local */
+    IRHK_FIELD,         /* parent_local.field_name */
+    IRHK_INDEX,         /* parent_local[const_index] */
+    IRHK_FIELD_CHAIN,   /* a.b.c... */
+} IRHKKind;
+
+typedef struct IRCompoundKey {
+    IRHKKind kind;
+    int parent_local;
+    struct IRCompoundKey *parent_key;
+    const char *field_name;
+    uint32_t field_name_len;
+    int64_t const_index;
+} IRCompoundKey;
+```
+
+Handle tracking keyed on `IRCompoundKey*` instead of `int local_id`.
+
+**Approach B — Keep string keys (pragmatic):**
+
+Port `handle_key_from_expr` from zercheck.c:172-213. String comparison
+for handle match.
+
+**Recommendation:** Approach A. String comparison is O(n) per lookup;
+struct comparison is O(1). Over 1000+ tests the difference matters.
+A also avoids the 128-char buffer limit zercheck.c has.
+
+---
+
+## Dual-run verification architecture (Phase E)
+
+Add to zerc_main.c:
+
+```c
+#ifdef DUAL_RUN
+    ZerCheck zc_ast, zc_ir;
+    zercheck_init(&zc_ast, &checker, &cc.arena, input_path);
+    zercheck_init(&zc_ir, &checker, &cc.arena, input_path);
+
+    bool ast_ok = zercheck_run(&zc_ast, main_mod->ast);
+
+    bool ir_ok = true;
+    for each func_decl in main_mod->ast:
+        IRFunc *ir = ir_lower_func(&cc.arena, &checker, func_decl);
+        if (!zercheck_ir(&zc_ir, ir)) ir_ok = false;
+
+    if (zc_ast.error_count != zc_ir.error_count) {
+        fprintf(stderr, "ANALYZER DISAGREEMENT: ast=%d, ir=%d\n",
+                zc_ast.error_count, zc_ir.error_count);
+    }
+#endif
+```
+
+Build with `make DUAL_RUN=1`.
+
+**`tools/dual_run_audit.sh`:**
+
+1. Run `make DUAL_RUN=1 check` — logs both analyzer outputs.
+2. Diff per-file.
+3. Output disagreement report.
+
+**Convergence criteria:**
+
+- Zero disagreements across ~1800 programs
+- 3 successive runs agree
+- Real-code examples in `examples/` agree
+
+---
+
+## Phase F cutover sequence (single commit)
+
+Precondition: Phase E zero disagreements.
+
+1. `zerc_main.c:494-507` — replace `zercheck_run` with driver that
+   lowers each function, calls `zercheck_ir`, rolls up errors.
+
+2. `Makefile` — remove `zercheck.c` from `CORE_SRCS` + `LIB_SRCS`.
+   Add `zercheck_ir.c` to both.
+
+3. `git rm zercheck.c`
+
+4. `zercheck.h` — remove AST-walker-specific types (`PathState`,
+   internal helpers). Keep public API.
+
+5. `make check` — must stay green.
+
+6. Commit:
+   ```
+   Delete zercheck.c — CFG migration complete, v0.5.0
+   ```
+
+**Tag as v0.5.0.**
+
+---
+
+## VRP migration (parallel track)
+
+`vrp_ir.c` (349 lines) is Phase 7 foundation. Same pre-migration
+status as zercheck_ir. Migration independent of handle-tracking but
+shares infrastructure (fixed-point iteration, CFG walking).
+
+**Current state:**
+- `vrp_ir(IRFunc*)` function exists
+- Returns `IRVRPResult*` with proven-safe index entries
+- Not wired into emitter's `emit_auto_guards` pass
+
+**Integration point:** `emitter.c:254, 280` — `emit_auto_guards`.
+Currently uses checker's per-variable range state. Migration:
+
+1. Run `vrp_ir(func)` after `ir_lower_func` in emit_func_decl path.
+2. `emit_auto_guards` consults `IRVRPResult` instead of checker ranges.
+3. Delete checker's VarRange logic.
+
+**Estimated:** ~300 lines. Same phase pattern.
+
+---
+
+## FuncProps integration — do NOT duplicate
+
+**Existing system** (checker.c:6093+): FuncProps tracks `can_yield`,
+`can_spawn`, `can_alloc`, `has_sync` per function via lazy DFS
+propagation.
+
+This is SEPARATE from FuncSummary (handle free tracking). Keep both.
+FuncProps stays in checker.c (pre-IR); FuncSummary moves to
+zercheck_ir.c.
+
+**Integration point at IR_CALL:**
+
+```c
+Symbol *callee = scope_lookup(global_scope, name, len);
+if (callee && callee->props.can_alloc) { /* ... */ }
+```
+
+Same access works from zercheck_ir.c. Do not port FuncProps.
+Reference it instead.
+
+---
+
+## Context flag inheritance in IR
+
+Checker's context flags (`in_async`, `defer_depth`, `critical_depth`,
+`in_interrupt`) stored on `Checker*`. For zercheck_ir, available
+per-block.
+
+**Add per-block context to IRBlock:**
+
+```c
+typedef struct {
+    /* existing fields */
+
+    /* Inherited from control-flow context */
+    bool in_interrupt;   /* inside interrupt handler */
+    bool in_critical;    /* inside @critical {} */
+    bool in_async;       /* function is async */
+    bool in_defer;       /* inside defer body */
+} IRBlock;
+```
+
+**Set during IR lowering:**
+
+- `ir_lower_interrupt` → `in_interrupt=true` on all blocks it creates.
+- `IR_CRITICAL_BEGIN` → `in_critical=true` on subsequent blocks until IR_CRITICAL_END.
+- `func->is_async` → `in_async=true` on all blocks.
+- `IR_DEFER_PUSH` body traversal → `in_defer=true`.
+
+zercheck_ir reads these at check time. No checker context needed.
+
+---
+
+## Per-feature test mapping — what each phase unlocks
+
+| Gap | Reproducer | Closed by | Target when fixed |
+|---|---|---|---|
+| Gap 1 | gap1_cross_block_goto.zer | B + Phase F (CFG natural) | tests/zer_fail/ |
+| Gap 2 | gap2_same_line_uaf.zer | B + Phase F (statement IDs) | tests/zer_fail/ |
+| Gap 3 | gap3_yield_outside_async.zer | Phase A1 (pre-CFG) | tests/zer_fail/ |
+| Gap 4 | gap4_async_shared_across_yield.zer | NOT by CFG (spec review) | TBD |
+| Gap 5 | gap5_container_move.zer | B1 (move struct port) | tests/zer_fail/ |
+| Gap 6 | gap6_goto_into_capture.zer | C separate (reachability) | tests/zer_fail/ |
+| Gap 7 | gap7_defer_in_defer.zer | Phase A2 (pre-CFG) | tests/zer_fail/ |
+| Prec 1 | prec1_vrp_literal_i.zer | VRP migration | tests/zer/ (positive) |
+| Prec 2 | prec2_opaque_wrong_type.zer | C2 (opaque refinement) | tests/zer_fail/ |
+| audit2 slice bounds x3 | Already fixed | tests/zer_trap/ done |
+| audit2 cross-block goto x3 | B + CFG | tests/zer_fail/ |
+| audit2 defer scan nested | C3 | TBD |
+| audit2 funcsummary chain | Works today (positive) | keep as positive coverage |
+| audit2 nested if chain | Works today | keep |
+| audit2 switch partial | Works today | keep |
+| audit2 spawn transitive | Phase A3 (cap bump) | tests/zer_fail/ at depth >= 32 |
+| ast_slice_empty_range | Already fixed | tests/zer_trap/ done |
+| ast_signed_div_overflow | Already fixed | tests/zer_trap/ done |
+| ast_shift_over_width | Already fixed | tests/zer/ positive done |
+| ast_inttoptr_mmio | Already fixed | tests/zer_trap/ done |
+| ast_inttoptr_align | Already fixed | tests/zer_trap/ done |
+
+**31 reproducers total.** At end of Phase F, ~20 move to zer_fail/
+or zer_trap/, ~5 stay as positive coverage, ~5 may be re-classified.
+
+---
+
+## Out of scope (explicit)
+
+Keep scope bounded. NOT in this plan:
+
+- Rewrite checker.c (11077 lines) — unrelated. Stays AST-based.
+- Rewrite emitter.c (8037 lines) — unrelated. IR-native already.
+- Cross-module whole-program analysis — stays per-function.
+- Runtime information access (`*opaque` type IDs) — runtime-only.
+- New language features during migration — strict no-scope-creep.
+- Performance optimization — v0.6+.
+- Self-hosting (zer-src/) — v1.0 concern.
+
+---
+
+## Plan completeness self-audit
+
+Does this plan have what a fresh session needs to execute Phase B1
+without further planning? Checklist:
+
+- Exact source file:line references: yes
+- Exact destination hook points: yes
+- Expected code changes quantified: yes
+- Dependencies on other phases stated: yes
+- Tests unlocked identified: yes
+- Commit message template: yes
+- Estimated session time: yes
+- Verification criteria: yes
+
+Same checklist applies to B2, B3, C1, C2, C3, D1-D7, E, F.
+
+**This plan is executable as written.** No further planning required
+to start Phase A1. No further planning required to start Phase B1.
+Each subsequent phase can be planned in detail at execution time
+using this document as a reference.

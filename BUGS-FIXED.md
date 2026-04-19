@@ -65,6 +65,38 @@ production builds (zercheck.c primary) unaffected.
 Net commits: `a606a93` (Phase E wrapper), `4168bac` (method calls +
 IR_NOP), `6d7e62a` (alloc_id grouping + iterative build).
 
+**Late-session convergence (2026-04-20 continued): 108 → 8 disagreements.**
+
+Across 13 focused fixes, dual-run disagreements dropped from 108 down
+to 8 — ~97% total reduction from 257 initial. Remaining 8 cases are
+architectural edge cases (CFG-loop MAYBE_FREED widening, array-element
+move tracking, dead-code-after-return) documented in
+docs/compiler-internals.md "Phase E" section. Near-Phase-F-ready.
+
+Fix summary (commits in chronological order):
+- `0cf2534` — Generic UAF walker (IR_ASSIGN + IR_CALL) + ThreadHandle
+  tracked by name (no IR local; emitter owns pthread_t decl).
+- `a6ce3ce` — Interior pointer `&b.c` alloc_id propagation,
+  IR_INDEX_READ UAF handler, IR_RETURN src1_local path.
+- `51c6f7c` — ir_find_local_exact_first: lookup post-lowering prefers
+  exact C-emission name over orig_name (fixes shadow scopes).
+- `2e8d84c` — Move struct call-transfer + param handle auto-register
+  on pool.free(param).
+- `646501e` — source_color + is_thread_handle propagation in IR_ASSIGN
+  ident alias path.
+- `cc4a87d` — Move struct assignment via IR_COPY (`Token b = a`).
+- `f2200e8` — rewrite_defer_body_idents + used_locals walks inst->expr.
+- `ecfa6d6` — Escape detection + compound key registration in
+  IR_ASSIGN (IR_FIELD_WRITE is dead, logic moved).
+- `5751a1d` — Move struct field-write reset in CFG loops.
+- `8c6b442` — @ptrcast alias tracking (NODE_INTRINSIC args[0] is src).
+- `cb9cee4` — &move_struct args conservatively transfer ownership.
+- `2eb2baa` — Double-join detection on ThreadHandle.
+- `61e7e48` — Auto-register param handles on extern free (catches
+  free(data); @ptrcast(*T, data) UAF pattern).
+
+All of `make check` (3,200+ tests) remains green throughout.
+
 ---
 
 ## Session 2026-04-19 (CFG migration Phase D) — feature parity reached

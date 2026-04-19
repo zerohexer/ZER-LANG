@@ -1,0 +1,26 @@
+// AUDIT2 #2b (2026-04-19 code-inspection audit)
+// Same as audit2_cross_block_goto but using Handle instead of *T.
+// Handle has runtime gen check, so runtime trap proves the gap
+// is real (compile miss + runtime catches).
+// EXPECTED: compile accepts (zercheck gap), runtime traps on
+//           use-after-free via gen mismatch.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    ?Handle(Task) mh = heap.alloc();
+    Handle(Task) t = mh orelse return;
+    u32 i = 0;
+    top:
+    if (i >= 2) { goto done; }
+    u32 x = t.id;
+    heap.free(t);
+    i += 1;
+    {
+        u32 k = 1;
+        goto top;
+    }
+    done:
+    return 0;
+}

@@ -1,0 +1,29 @@
+// AUDIT2 #2 (2026-04-19 code-inspection audit)
+// CLAIM: zercheck.c:1668 backward-goto fixed-point iteration only
+//        fires when label and goto are in the SAME block. A backward
+//        goto inside an inner block to a label in the outer block
+//        is not recognized as loop-equivalent — iteration doesn't
+//        fire, UAF across the cycle not caught.
+// TEST: outer label, inner block contains goto that jumps backward
+//       to outer label. Free happens between label and goto, use
+//       happens after label.
+// EXPECTED: if gap exists, compile accepts; runtime traps.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = Task.alloc_ptr() orelse return;
+    u32 i = 0;
+    top:
+    if (i >= 2) { goto done; }
+    u32 x = t.id;
+    heap.free_ptr(t);
+    i += 1;
+    {
+        u32 k = 1;
+        goto top;
+    }
+    done:
+    return 0;
+}

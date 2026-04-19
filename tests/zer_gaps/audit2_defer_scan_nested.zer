@@ -1,0 +1,30 @@
+// AUDIT2 #3 (2026-04-19 code-inspection audit)
+// CLAIM: zercheck.c:2556 `scan_stack[32]` with `scan_depth < 31`
+//        limits recursive defer-body scanning to 31 levels.
+//        If a handle alloc is wrapped in nested if-then chains
+//        deeper than 31, the defer free inside won't be found
+//        by the leak pre-scan → false "handle leaked" error.
+// TEST: 32 levels of nested `if (cond) { ... }` with defer at
+//       the innermost. Handle should be considered freed via
+//       the defer, but scanner bails out at depth 31.
+// EXPECTED: if gap exists, compile error "handle leaked".
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = Task.alloc_ptr() orelse return;
+    bool c = true;
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+        defer heap.free_ptr(t);
+        u32 x = t.id;
+        return x;
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    return 0;
+}

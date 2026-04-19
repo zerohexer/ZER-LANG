@@ -127,6 +127,114 @@ spec that were pessimistic — the implementation actually handles them:
 
 ---
 
+## Phase 2 audit findings (2026-04-19 — code-inspection targeted tests)
+
+After the phase 1 behavioral audit, I read zercheck.c/checker.c/emitter.c
+looking for structural weaknesses (fixed buffers, depth caps, TODO
+markers) and wrote targeted tests for each candidate. Reproducers in
+`tests/zer_gaps/audit2_*.zer`.
+
+### Severe — `[*]T` slice bounds check missing on IR path (REGRESSION)
+
+**Reproducers:** `audit2_slice_oob.zer`, `audit2_slice_star_oob.zer`.
+
+`emitter.c:7498` `IR_INDEX_READ` handler emits raw `src.ptr[idx]` for
+TYPE_SLICE sources with NO `_zer_bounds_check` call. The comment claims
+"Bounds checks are in the AST path (emit_expr via IR_ASSIGN
+passthrough)" — but function bodies have been IR-only since 2026-04-19,
+so the AST TYPE_SLICE branch at `emitter.c:2045-2067` is never reached.
+
+**Verified across three entry points:**
+- stack array coerced to `[*]T` via `arr[0..]`
+- arena-allocated slice from `ar.alloc_slice(T, n)`
+- function parameter `[*]T s`
+
+All emit `s.ptr[idx]` unchecked. Runtime silently reads stale/OOB
+memory, exit 0.
+
+**CLAUDE.md currently claims:**
+> "[*]u8 data; dynamic pointer to many — {ptr, len}, bounds checked"
+
+That claim is CURRENTLY FALSE for any slice indexing after IR migration.
+
+**Fix:** ~15-20 lines in `IR_INDEX_READ` emitter — port the TYPE_SLICE
+branch from AST `emit_expr`. Same needed for `IR_INDEX_WRITE`.
+**Priority 0.** Highest-impact safety gap in the codebase.
+
+### Major — backward goto cross-block (Gap 1 root cause confirmed)
+
+**Reproducers:** `audit2_cross_block_goto.zer` (+ `_handle` variant
+that traps at runtime proving the class), `audit2_goto_across_scope.zer`,
+`audit2_labels_32_overflow.zer`.
+
+`zercheck.c:1636` collects labels into block-local `labels[32]`.
+`zercheck.c:1668` backward-goto iteration keyed on that array. Two
+failure modes:
+
+1. **Cross-block:** goto inside inner block targets label in outer
+   block. Inner block's `labels[]` doesn't contain the outer label, so
+   `label_idx = -1`, iteration doesn't fire, UAF across the cycle
+   missed.
+2. **Buffer overflow:** `labels[32]` is a fixed-size stack buffer.
+   A block with 33+ labels silently drops the rest (CLAUDE.md rule
+   #7 violation — stack-first dynamic pattern not applied here).
+   Backward goto to a label past index 32 = label not found =
+   no iteration.
+
+Same root cause fix subsumes all three: replace block-local label
+collection with CFG analysis, OR at minimum use stack-first dynamic
+array for labels[]. The full CFG fix is ~300 lines.
+
+### Moderate — `_scan_depth < 8` spawn transitive data race detection
+
+**Reproducer:** `audit2_spawn_transitive_depth.zer`.
+
+`checker.c:6466` caps transitive call-chain scanning at 8 levels. A
+10-level chain `spawn entry() → f1 → f2 → ... → f10 → g = g + 1` does
+not detect the non-shared global touched at the end of the chain.
+CLAUDE.md already documents "Transitive through callees (8 levels)"
+as the design limit, but 8 is low for real call graphs.
+
+**No runtime fallback** — data races silently occur.
+
+**Fix:** raise cap to 16-32, or memoize per-function scan result to
+avoid re-analysis. The cap exists to prevent infinite recursion on
+recursive call chains.
+
+### Confirmed NOT-gaps (positive coverage — keep as regression tests)
+
+- `audit2_funcsummary_chain.zer` — 6-level free chain propagates via
+  FuncSummary iterative refinement.
+- `audit2_nested_if_chain.zer` — 5-level else-if chain with handle
+  freed in 4/5 arms correctly flagged MAYBE_FREED.
+- `audit2_switch_partial_transfer.zer` — 5-arm switch with 3 freeing,
+  2 not → MAYBE_FREED correctly emitted.
+
+### Behavior to investigate further
+
+- `audit2_defer_scan_nested.zer` — 32 levels of nested `if (c) {...}`
+  with defer at innermost compiles clean. Unclear whether
+  `scan_stack[32]` overflow was hit and zercheck still found the defer
+  via direct walk, or whether depth wasn't actually > 31. Requires
+  instrumentation to confirm.
+
+### Doc accuracy issue
+
+CLAUDE.md states `alloc_ptr/free_ptr` is "100% compile-time safe for
+pure ZER code." That is aspirational — zercheck has known gaps, and
+**unlike Handle, `*T` from `alloc_ptr` has NO runtime generation
+check**. Post-free pointer deref reads stale slab memory silently
+(verified: Handle variant of `audit2_cross_block_goto` traps via gen
+check; `*T` variant returns 0). Update doc to state: "compile-time
+only for pure ZER; prefer Handle when runtime fallback is desired."
+
+Also: only `*T` has `alloc_ptr/free_ptr`. `[*]T` has no equivalent —
+it must come from `arena.alloc_slice` (whole-arena-reset semantics)
+or from `arr[0..]` coercion (stack). CLAUDE.md should make this
+explicit.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

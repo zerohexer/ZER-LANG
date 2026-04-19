@@ -1,0 +1,30 @@
+// AUDIT2 #9 (2026-04-19 code-inspection audit)
+// CLAIM: zercheck if/else-if chain — each else-if body transfers
+//        handle at a different level. After the chain, what state?
+//        Chain: if A: free; else if B: free; else if C: free; else
+//        (no free). Any path reaches post-chain without free → handle
+//        may still be ALIVE.
+// TEST: 5-deep if-else-if chain with 4 arms freeing, 1 not.
+// EXPECTED: use after chain should be MAYBE_FREED error. If merge
+//           logic doesn't track else-if depth, may miss.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    u32 mode = 4;
+    *Task t = Task.alloc_ptr() orelse return;
+    if (mode == 0) {
+        heap.free_ptr(t);
+    } else if (mode == 1) {
+        heap.free_ptr(t);
+    } else if (mode == 2) {
+        heap.free_ptr(t);
+    } else if (mode == 3) {
+        heap.free_ptr(t);
+    } else {
+        u32 a = t.id;
+    }
+    u32 x = t.id;
+    return x;
+}

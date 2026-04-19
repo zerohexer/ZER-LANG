@@ -68,6 +68,17 @@ typedef struct {
     bool is_thread_handle;
 } IRHandleInfo;
 
+/* Phase E: scoped spawn ThreadHandle tracking by name. Scoped spawn
+ * (ThreadHandle th = spawn ...) doesn't create an IR local (emitter
+ * emits its own pthread_t declaration). zercheck_ir tracks join status
+ * by the handle's source name so spawn_no_join detection works on CFG. */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    int spawn_line;
+    bool joined;
+} IRThreadTrack;
+
 /* Per-block analysis state */
 typedef struct {
     IRHandleInfo *handles;
@@ -79,6 +90,10 @@ typedef struct {
      * thread with interrupts disabled — hardware-unsafe). Alloc from
      * slab also banned (calloc/realloc may deadlock if interrupted). */
     int critical_depth;
+    /* Phase E: ThreadHandle tracking (name-based, not local-id) */
+    IRThreadTrack *threads;
+    int thread_count;
+    int thread_capacity;
 } IRPathState;
 
 /* ================================================================
@@ -91,6 +106,9 @@ static void ir_ps_init(IRPathState *ps) {
     ps->handle_capacity = 0;
     ps->terminated = false;
     ps->critical_depth = 0;
+    ps->threads = NULL;
+    ps->thread_count = 0;
+    ps->thread_capacity = 0;
 }
 
 static IRPathState ir_ps_copy(IRPathState *src) {
@@ -102,6 +120,12 @@ static IRPathState ir_ps_copy(IRPathState *src) {
     dst.handles = (IRHandleInfo *)malloc(dst.handle_capacity * sizeof(IRHandleInfo));
     if (src->handles && src->handle_count > 0)
         memcpy(dst.handles, src->handles, src->handle_count * sizeof(IRHandleInfo));
+    /* Phase E: copy ThreadHandle tracking */
+    dst.thread_count = src->thread_count;
+    dst.thread_capacity = src->thread_count > 0 ? src->thread_count : 2;
+    dst.threads = (IRThreadTrack *)malloc(dst.thread_capacity * sizeof(IRThreadTrack));
+    if (src->threads && src->thread_count > 0)
+        memcpy(dst.threads, src->threads, src->thread_count * sizeof(IRThreadTrack));
     return dst;
 }
 
@@ -109,6 +133,44 @@ static void ir_ps_free(IRPathState *ps) {
     free(ps->handles);
     ps->handles = NULL;
     ps->handle_count = 0;
+    free(ps->threads);
+    ps->threads = NULL;
+    ps->thread_count = 0;
+}
+
+/* ThreadHandle by-name lookup and registration (Phase E). */
+static IRThreadTrack *ir_find_thread(IRPathState *ps, const char *name,
+                                      uint32_t name_len) {
+    for (int i = 0; i < ps->thread_count; i++) {
+        if (ps->threads[i].name_len == name_len &&
+            memcmp(ps->threads[i].name, name, name_len) == 0)
+            return &ps->threads[i];
+    }
+    return NULL;
+}
+
+static IRThreadTrack *ir_add_thread(IRPathState *ps, const char *name,
+                                     uint32_t name_len, int line) {
+    IRThreadTrack *existing = ir_find_thread(ps, name, name_len);
+    if (existing) {
+        existing->spawn_line = line;
+        existing->joined = false;
+        return existing;
+    }
+    if (ps->thread_count >= ps->thread_capacity) {
+        int nc = ps->thread_capacity < 4 ? 4 : ps->thread_capacity * 2;
+        IRThreadTrack *nt = (IRThreadTrack *)realloc(ps->threads,
+            nc * sizeof(IRThreadTrack));
+        if (!nt) return NULL;
+        ps->threads = nt;
+        ps->thread_capacity = nc;
+    }
+    IRThreadTrack *t = &ps->threads[ps->thread_count++];
+    t->name = name;
+    t->name_len = name_len;
+    t->spawn_line = line;
+    t->joined = false;
+    return t;
 }
 
 /* Bare-local lookup: matches only entries with path_len == 0.
@@ -622,6 +684,146 @@ static Node *ir_unwrap_alloc_expr(Node *expr) {
     return expr;
 }
 
+/* Phase E: generic UAF walker for expressions embedded in IR_ASSIGN.
+ *
+ * When the IR emits `%3 = ASSIGN <expr>` where <expr> is a NODE_ASSIGN
+ * wrapping `pool.get(h).id = 5`, or any complex expression containing
+ * a use of a freed handle, we need to flag UAF. The walker:
+ *   - Recursively visits NODE_FIELD / NODE_INDEX / NODE_CALL / NODE_UNARY /
+ *     NODE_BINARY / NODE_ASSIGN / NODE_TYPECAST / NODE_SLICE / NODE_ORELSE
+ *   - For NODE_CALL args: check each arg's root ident against tracked handles
+ *   - For NODE_IDENT chains (field/index): check the root
+ *   - Reports at most once per root_local per expression via a small
+ *     reported-set passed by reference.
+ *
+ * Skips the callee expression itself to avoid double-flagging pool.get
+ * callee (we flag via args). Skips addr-of operand to avoid flagging
+ * `&freed.field` as a read (allowed in some patterns).
+ *
+ * Only flags if handle state is IR_HS_FREED / MAYBE_FREED / TRANSFERRED.
+ */
+
+typedef struct {
+    int *ids;
+    int count;
+    int cap;
+} UafReportSet;
+
+static bool urs_has(UafReportSet *s, int id) {
+    for (int i = 0; i < s->count; i++) if (s->ids[i] == id) return true;
+    return false;
+}
+
+static void urs_add(UafReportSet *s, int id) {
+    if (s->count >= s->cap) {
+        s->cap = s->cap < 8 ? 8 : s->cap * 2;
+        int *ni = (int *)realloc(s->ids, s->cap * sizeof(int));
+        if (ni) s->ids = ni; else return;
+    }
+    s->ids[s->count++] = id;
+}
+
+static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                               Node *expr, int line, UafReportSet *rs);
+
+static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                Node *expr, int line, UafReportSet *rs) {
+    if (!expr) return;
+    int root_local;
+    const char *path;
+    uint32_t path_len;
+    if (ir_extract_compound_key(zc, func, expr,
+                                 &root_local, &path, &path_len) != 0) return;
+    if (urs_has(rs, root_local)) return;
+    IRHandleInfo *h;
+    if (path_len == 0) h = ir_find_handle(ps, root_local);
+    else h = ir_find_compound_handle(ps, root_local, path, path_len);
+    if (!h) {
+        /* Try root-only when a compound key wasn't found */
+        if (path_len > 0) h = ir_find_handle(ps, root_local);
+    }
+    if (h && ir_is_invalid(h)) {
+        const char *name = (root_local >= 0 && root_local < func->local_count)
+            ? func->locals[root_local].name : "?";
+        int nlen = (root_local >= 0 && root_local < func->local_count)
+            ? (int)func->locals[root_local].name_len : 1;
+        ir_zc_error(zc, line,
+            "use after free: '%.*s' is %s (freed at line %d)",
+            nlen, name, ir_state_name(h->state), h->free_line);
+        urs_add(rs, root_local);
+    }
+}
+
+static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                               Node *expr, int line, UafReportSet *rs) {
+    if (!expr) return;
+    switch (expr->kind) {
+    case NODE_IDENT:
+        ir_check_ident_uaf(zc, func, ps, expr, line, rs);
+        break;
+    case NODE_FIELD:
+        /* Field access reads the root — check prefix */
+        ir_check_ident_uaf(zc, func, ps, expr, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->field.object, line, rs);
+        break;
+    case NODE_INDEX:
+        ir_check_ident_uaf(zc, func, ps, expr, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->index_expr.object, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->index_expr.index, line, rs);
+        break;
+    case NODE_CALL:
+        /* Don't check the callee (pool.get itself). Check args. */
+        for (int i = 0; i < expr->call.arg_count; i++)
+            ir_check_expr_uaf(zc, func, ps, expr->call.args[i], line, rs);
+        /* Still recurse into callee for nested calls e.g. (freed.method)() */
+        if (expr->call.callee && expr->call.callee->kind == NODE_FIELD) {
+            /* Check the callee's object (pool.get — "pool" isn't tracked;
+             * but `freed.some_method()` — check "freed"). Only walk object
+             * chain, not the field access itself. */
+            ir_check_expr_uaf(zc, func, ps, expr->call.callee->field.object,
+                              line, rs);
+        }
+        break;
+    case NODE_UNARY:
+        /* & operator is capture, not read — skip. Otherwise check operand. */
+        if (expr->unary.op == TOK_AMP) break;
+        ir_check_expr_uaf(zc, func, ps, expr->unary.operand, line, rs);
+        break;
+    case NODE_BINARY:
+        ir_check_expr_uaf(zc, func, ps, expr->binary.left, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->binary.right, line, rs);
+        break;
+    case NODE_ASSIGN:
+        /* Both target and value — target may contain pool.get(h). */
+        ir_check_expr_uaf(zc, func, ps, expr->assign.target, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->assign.value, line, rs);
+        break;
+    case NODE_TYPECAST:
+        ir_check_expr_uaf(zc, func, ps, expr->typecast.expr, line, rs);
+        break;
+    case NODE_SLICE:
+        ir_check_expr_uaf(zc, func, ps, expr->slice.object, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->slice.start, line, rs);
+        ir_check_expr_uaf(zc, func, ps, expr->slice.end, line, rs);
+        break;
+    case NODE_ORELSE:
+        ir_check_expr_uaf(zc, func, ps, expr->orelse.expr, line, rs);
+        /* Fallback is a separate branch — not part of success flow */
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < expr->intrinsic.arg_count; i++)
+            ir_check_expr_uaf(zc, func, ps, expr->intrinsic.args[i], line, rs);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            ir_check_expr_uaf(zc, func, ps, expr->struct_init.fields[i].value,
+                              line, rs);
+        break;
+    default:
+        break;
+    }
+}
+
 /* ================================================================
  * Defer body scanning (Phase C3)
  *
@@ -799,21 +1001,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (h) h->state = IR_HS_TRANSFERRED;
         }
 
-        /* Phase D3: scoped spawn with ThreadHandle — register as tracked */
+        /* Phase D3/E: scoped spawn with ThreadHandle — tracked by name.
+         * No IR local exists (emitter handles pthread_t emission directly),
+         * so track via name-based IRThreadTrack set on IRPathState. */
         if (sp->spawn_stmt.handle_name && sp->spawn_stmt.handle_name_len > 0) {
-            int th_local = ir_find_local(func,
-                sp->spawn_stmt.handle_name,
-                (uint32_t)sp->spawn_stmt.handle_name_len);
-            if (th_local >= 0) {
-                IRHandleInfo *h = ir_add_handle(ps, th_local);
-                if (h) {
-                    h->state = IR_HS_ALIVE;
-                    h->alloc_line = inst->source_line;
-                    h->alloc_id = _ir_next_alloc_id++;
-                    h->is_thread_handle = true;
-                    h->source_color = ZC_COLOR_UNKNOWN;
-                }
-            }
+            ir_add_thread(ps, sp->spawn_stmt.handle_name,
+                (uint32_t)sp->spawn_stmt.handle_name_len, inst->source_line);
         }
         break;
     }
@@ -980,6 +1173,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * inside the assign's expression — these are collapsed into IR_ASSIGN
      * per ir_lower.c Phase 8d and must be recognized here to track state. */
     case IR_ASSIGN: {
+        /* Phase E: generic UAF walker for any use inside the expression.
+         * Catches patterns like `pool.get(h).id = 5` where IR_ASSIGN's
+         * expr is NODE_ASSIGN wrapping NODE_FIELD(NODE_CALL(pool.get, h), id).
+         * Walks recursively and flags any use of a FREED/TRANSFERRED handle. */
+        if (inst->expr) {
+            UafReportSet rs = {0};
+            ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            free(rs.ids);
+        }
         /* Phase E: recognize pool/slab builtin method calls in the RHS.
          * Handled shapes:
          *   h = pool.alloc()                      → unwrap to NODE_CALL
@@ -1207,10 +1409,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      *   - passthrough: inst->args[i] is an AST ident → find_local
      */
     case IR_CALL: {
-        /* Phase D3: ThreadHandle.join() — mark the thread handle as
-         * freed. Shape: inst->expr is NODE_CALL with callee NODE_FIELD
-         * (th, "join"). If th resolves to a tracked thread handle, it
-         * is now joined and not a leak. */
+        /* Phase D3/E: ThreadHandle.join() — mark thread as joined.
+         * ThreadHandles don't have IR locals (emitter owns their
+         * pthread_t decl), so tracking is by name via IRThreadTrack. */
         if (inst->expr && inst->expr->kind == NODE_CALL &&
             inst->expr->call.callee &&
             inst->expr->call.callee->kind == NODE_FIELD) {
@@ -1219,16 +1420,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 memcmp(fld->field.field_name, "join", 4) == 0 &&
                 fld->field.object &&
                 fld->field.object->kind == NODE_IDENT) {
-                int th_local = ir_find_local(func,
+                IRThreadTrack *t = ir_find_thread(ps,
                     fld->field.object->ident.name,
                     (uint32_t)fld->field.object->ident.name_len);
-                if (th_local >= 0) {
-                    IRHandleInfo *h = ir_find_handle(ps, th_local);
-                    if (h && h->is_thread_handle) {
-                        h->state = IR_HS_FREED;
-                        h->free_line = inst->source_line;
-                    }
-                }
+                if (t) t->joined = true;
             }
         }
 
@@ -2048,6 +2243,51 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     free(covered_ids);
     free(reported_ids);
     free(used_locals);
+
+    /* Phase E: ThreadHandle join check. At each return block, any
+     * unjoined ThreadHandle is a leak. Track reported names to dedup. */
+    const char **reported_names = NULL;
+    uint32_t *reported_name_lens = NULL;
+    int rn_cap = 0, rn_count = 0;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        if (bb->inst_count == 0) continue;
+        IRInst *last = &bb->insts[bb->inst_count - 1];
+        if (last->op != IR_RETURN) continue;
+        IRPathState *ps = &block_states[bi];
+        for (int ti = 0; ti < ps->thread_count; ti++) {
+            IRThreadTrack *t = &ps->threads[ti];
+            if (t->joined) continue;
+            bool already = false;
+            for (int ri = 0; ri < rn_count; ri++) {
+                if (reported_name_lens[ri] == t->name_len &&
+                    memcmp(reported_names[ri], t->name, t->name_len) == 0) {
+                    already = true; break;
+                }
+            }
+            if (already) continue;
+            ir_zc_error(zc, last->source_line,
+                "ThreadHandle '%.*s' not joined before function exit — "
+                "add th.join() or detach explicitly",
+                (int)t->name_len, t->name);
+            if (rn_count >= rn_cap) {
+                rn_cap = rn_cap < 4 ? 4 : rn_cap * 2;
+                const char **nn = (const char **)realloc(reported_names,
+                    rn_cap * sizeof(char *));
+                uint32_t *nl = (uint32_t *)realloc(reported_name_lens,
+                    rn_cap * sizeof(uint32_t));
+                if (nn) reported_names = nn;
+                if (nl) reported_name_lens = nl;
+            }
+            if (rn_count < rn_cap) {
+                reported_names[rn_count] = t->name;
+                reported_name_lens[rn_count] = t->name_len;
+                rn_count++;
+            }
+        }
+    }
+    free(reported_names);
+    free(reported_name_lens);
 
     /* Cleanup */
     for (int bi = 0; bi < func->block_count; bi++)

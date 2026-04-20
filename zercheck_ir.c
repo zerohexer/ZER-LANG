@@ -2610,23 +2610,19 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
 
     /* Phase E: alloc_id-grouped leak detection. An alloc_id is "covered"
      * if any handle with that alloc_id is FREED/TRANSFERRED/escaped in
-     * ANY return block EXCEPT orelse-fallback blocks. Orelse-fallback
-     * blocks exit when an optional was null, so they shouldn't contribute
-     * coverage AND shouldn't be checked for leaks.
+     * ANY non-fallback return block.
      *
-     * Mirrors zercheck.c linear-scan final-state: linear scan continues
-     * past early returns (treating them as "happens on some path but the
-     * main flow continues"), so the state at the FINAL return represents
-     * the synthesized happy path. Using union captures this when happy
-     * path frees, but doesn't catch cases where one branch frees+returns
-     * early while happy-path doesn't free.
+     * Mirrors zercheck.c linear-scan final-state semantics: linear scan
+     * continues past early returns, so the state at function-end
+     * represents the union of "what happened on all paths".
      *
-     * Flag `checked_last_return_only` controls strictness:
-     *   - OFF (default): union across all non-fallback returns. Preserves
-     *     legacy positive tests where early-exit error returns don't
-     *     free intermediate allocations.
-     *   - ON (gen_uaf_003 semantic): only check the last source-order
-     *     non-fallback return. Stricter but catches mixed-path leaks. */
+     * Known limitation: doesn't catch mixed-path leaks where one
+     * early-exit frees and the fall-through path doesn't. Pattern:
+     *   if (cond) { free(h); return; }    // early exit frees
+     *   use(h); return val;               // fall-through leaks
+     * AST catches this via block_always_exits recognizing if-then as
+     * "take not-taken branch". CFG would need to distinguish early
+     * exits from canonical returns — heuristic was too aggressive. */
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {

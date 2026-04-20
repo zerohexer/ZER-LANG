@@ -5,6 +5,95 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-20 (ir_validate hardening) — phases 1+2
+
+**Defense-in-depth, not bug fixes.** No active bugs; `ir_validate`
+was structurally strong (range checks, duplicate IDs) but semantically
+weak. With `zercheck.c` being retired and `zercheck_ir.c` becoming
+the single safety analyzer, the IR validator is now the last line
+of defense against a malformed IR from `ir_lower.c`. Originated
+from an external design-critique exchange that listed 6 suspected
+gaps; I audited all 20 plausible invariants, implemented the safe
+ones, and documented why the rest are rejected / deferred.
+
+### Phase 1 (commit 130ddbd) — per-op field invariants + reachability diagnostic
+
+Added field invariants for 11 IR op kinds with 3AC-style operands:
+BINOP, UNOP, COPY, LITERAL, FIELD_READ/WRITE, INDEX_READ, ADDR_OF,
+DEREF_READ, CAST, CALL_DECOMP, plus BRANCH-needs-condition and
+CAST-needs-type. Catches "lowerer built an instruction with a
+forgotten operand field" before downstream code dereferences -1 as
+a local index.
+
+Added DFS reachability walk as opt-in diagnostic
+(`ZER_IR_WARN_UNREACHABLE=1`). Cannot be promoted to error: the
+`test_goto_defer_77` test tripped it because the source contains
+legitimate dead code (`goto done; x=0; done:`) that the lowerer
+correctly represents in IR. The validator cannot statically
+distinguish "lowerer forgot an edge" from "source had dead code
+between goto and label" — same IR shape. Staying diagnostic-only.
+
+### Phase 2 (commit 014f8c8) — defer balance + NULL-type-local
+
+**Defer balance** — for every `IR_DEFER_PUSH`, a CFG-reachable
+`IR_DEFER_FIRE` with `emit_bodies=true` (`src2_local != 2`) must
+exist. Otherwise the defer body is statically dead — user's
+`defer cleanup()` silently doesn't run, producing a runtime leak
+or unreleased lock. Uses `cfg_reaches_fire()` DFS helper
+(`ir.c:288`). Hard error — aborts compilation if the lowerer
+regresses this property.
+
+**NULL-type-local** — every `IRLocal.type` must be non-NULL.
+Missing type = lowerer forgot `resolve_type` at some path.
+Downstream emitter will deref NULL or emit wrong C. Hard error.
+
+### Items dropped from critic's list after audit
+
+- Missing terminator on non-last block: `ir_compute_preds` and
+  `dfs_reachable` already treat it as implicit fallthrough with
+  the correct predecessor edge. Not a gap.
+- Locals-used-outside-scope: `hidden` is a lookup-time flag for
+  `ir_find_local` during lowering, not a runtime-scope property.
+  Post-lowering, instructions legitimately reference hidden
+  locals. Not a validator concern.
+- Dead code after terminator: lowerer emits legitimate
+  `RETURN; DEFER_FIRE; GOTO bb_post` cleanup patterns. The
+  post-terminator instructions become dead C that GCC strips.
+  Redundant IR, not a safety hole.
+
+### Remaining real gaps (future work)
+
+- Call arg count matches callee signature (needs symbol-table)
+- `FIELD_READ` field name exists on src type (needs type walk)
+- `LITERAL` kind matches dest type
+- yield/await only in async function
+- Use-before-define (needs dominator analysis)
+
+None safety-critical; GCC catches most at C level.
+
+### Validation
+
+All ~3,200 tests pass. Zero false positives. The validator runs
+on every compile via the Phase F emitter hook, so the full test
+suite is the continuous regression test — "don't break the
+lowerer and the suite stays green."
+
+### Critical for fresh sessions
+
+- When adding a new `IR_*` op kind, add a case in `ir_validate`'s
+  per-op switch (around `ir.c:445`).
+- Don't enforce "dead code after terminator" — breaks legitimate
+  lowerer patterns.
+- Don't enforce reachability as error — breaks legitimate source
+  dead-code emissions.
+- Defer push without reachable fire **is** a hard error. If a
+  lowerer change trips it, investigate the push path.
+
+Full detail: `docs/compiler-internals.md` "ir_validate hardening"
+section.
+
+---
+
 ## Session 2026-04-20 (Phase F) — unconditional dual-run via emitter hook
 
 **Architectural milestone, not a classic bug fix.** zercheck_ir is now

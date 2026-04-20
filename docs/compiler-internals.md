@@ -5735,3 +5735,226 @@ If you're seeing `_zer_tN undeclared` GCC errors after adding a new
 analysis, it's almost certainly double-lowering. Check that your
 analysis doesn't call `ir_lower_func` on a function the emitter will
 later lower again.
+
+---
+
+## ir_validate hardening — phases 1+2 (2026-04-20, LANDED)
+
+Follow-on from Phase F: with `zercheck_ir.c` running on every compile
+and `zercheck.c` on its way out, `ir_validate` is the last line of
+defense against a malformed IR. Previously the validator was
+structural-only (block targets in range, local refs in range,
+duplicate local-ID check, ≥1 block). This session hardened it in two
+phases, adding semantic invariant checks.
+
+### Why this matters now
+
+Before Phase F, bugs in `ir_lower.c` that produced a malformed IR
+could be caught two ways: (a) by the AST analyzer running in parallel
+and flagging a disagreement, or (b) by a test exercising the exact
+broken path. With `zercheck.c` eventually deleted, (a) goes away.
+`ir_validate` has to be strong enough that "IR passed validation"
+is meaningful evidence the lowerer didn't emit garbage.
+
+### Origin — the design-critique exchange
+
+An external critique claimed `ir_validate` had 6 specific gaps:
+
+1. Missing terminators on non-last blocks
+2. Block reachability
+3. Use-before-define
+4. Defer frame ordering
+5. Locals-used-outside-scope
+6. IR-op invariants
+
+I read the source at `ir.c:281-391` against the existing CFG infra
+(`ir_compute_preds`, `dfs_reachable`) and the lowerer
+(`ir_lower.c`) before writing any code. Several items turned out
+to be already handled; one turned out to be conceptually wrong;
+others were valid. The net result after implementation:
+
+### Phase 1 — per-op field invariants (commit 130ddbd)
+
+Added field-invariant checks for 11 IR op kinds that have 3AC-style
+operand fields. Each check is ~5 lines; all live in a single
+`switch(inst->op)` in `ir_validate` at approximately `ir.c:445`.
+
+| IR op | Invariant checked |
+|---|---|
+| `IR_BRANCH` | `cond_local >= 0` OR `expr != NULL` (needs a condition) |
+| `IR_BINOP` | `dest_local >= 0 && src1_local >= 0 && src2_local >= 0` |
+| `IR_UNOP` | `dest_local >= 0 && src1_local >= 0` |
+| `IR_COPY` | `dest_local >= 0 && src1_local >= 0` |
+| `IR_LITERAL` | `dest_local >= 0` (literals must write somewhere) |
+| `IR_FIELD_READ` | `dest + src1 + field_name != NULL` |
+| `IR_FIELD_WRITE` | `src1 + src2 + field_name != NULL` |
+| `IR_INDEX_READ` | `dest + src1 + src2 all >= 0` |
+| `IR_ADDR_OF` / `IR_DEREF_READ` | `dest + src1 >= 0` |
+| `IR_CAST` | `dest + src1 >= 0 AND cast_type != NULL` |
+| `IR_CALL_DECOMP` | `call_arg_locals != NULL` if `arg_count > 0`, each arg in range |
+
+Also added: DFS reachability walk (`dfs_reachable` helper,
+`ir.c:283`) used by an **opt-in diagnostic** (not an error) gated
+on `ZER_IR_WARN_UNREACHABLE=1`. It can't be an error because of a
+real test that tripped it (see below).
+
+### Phase 2 — defer balance + NULL-type-local (commit 014f8c8)
+
+**Defer balance (the biggest win).** For every `IR_DEFER_PUSH`, at
+least one `IR_DEFER_FIRE` with `emit_bodies=true` (i.e.
+`src2_local != 2`) must be CFG-reachable from the push. Otherwise
+the pushed defer body is statically dead — the user's `defer`
+silently doesn't run, which is a leak or unreleased lock at
+runtime.
+
+The check uses the `cfg_reaches_fire()` helper (`ir.c:288`):
+
+```
+for each IR_DEFER_PUSH at (block bi, instr ii):
+    // same-block fire AFTER ii counts
+    if any IR_DEFER_FIRE (emit_bodies) in block[bi][ii+1..]: OK
+    // otherwise DFS successors of bi
+    if cfg_reaches_fire(successor, fire_in_block_set): OK
+    else: ERROR
+```
+
+This is a **hard error** — it aborts the compile. If a lowerer
+change trips it, the lowerer has a bug worth fixing.
+
+**NULL-type-local.** Every `func->locals[i].type` must be non-NULL.
+NULL type = lowerer forgot to call `resolve_type` or the path that
+created the local skipped type assignment. Downstream (emitter,
+analyzer) crashes or produces wrong C.
+
+### Items evaluated, dropped, deferred
+
+All 20 items from the audit, with rationale:
+
+| # | Item | Status | Reason |
+|---|---|---|---|
+| 1 | Missing terminator on non-last block | **Not a gap** | `ir_compute_preds` / `dfs_reachable` already treat non-terminator last-inst as implicit fallthrough with the predecessor edge attached. It's a legit lowerer optimization, not a bug. |
+| 2 | Block reachability as error | **Diagnostic only** | Real test (`test_goto_defer_77`) tripped it: source contains legitimate dead code (`goto done; x=0; done:`), lowerer correctly emits IR for it. Can't be distinguished from a forgotten-edge bug without lowerer-level annotations. Opt-in via `ZER_IR_WARN_UNREACHABLE=1`. |
+| 3 | Use-before-define | **Phase 3, deferred** | Non-SSA IR makes this soft. The honest version requires dominator analysis (`bi dominates bj` → any read in bj has a write in the dominator chain). Tractable but a bigger project. |
+| 4 | Defer frame ordering | **Landed (phase 2)** | The strongest check added. Real safety property — missing fire = leaked cleanup. |
+| 5 | Locals-used-outside-scope | **Not a gap** | `hidden` is a lookup-time flag for `ir_find_local` during lowering, NOT a runtime-scope property. Post-lowering, instructions legitimately reference hidden locals (they were visible when the instruction was lowered). |
+| 6 | Per-op IR invariants | **Landed (phase 1)** | 11 op kinds covered. |
+| 7 | NULL type on local | **Landed (phase 2)** | Not on the critic's list; found during audit. |
+| 8 | Dead code after terminator | **Considered, rejected** | Lowerer emits legitimate `RETURN; DEFER_FIRE; GOTO bb_post` for scope cleanup. The post-terminator instructions emit dead C that GCC strips. Not a safety hole; just redundant IR. |
+| 9 | `BRANCH` with same true/false target | **Trivial, skipped** | Should be GOTO. Minor style, not safety. |
+| 10 | Duplicate block IDs | **Skipped** | The existing local-ID uniqueness check is symmetric and could extend to blocks; low value since block indexes are array-based. |
+| 11 | Orphan non-entry block (no preds) | **Overlaps with #2** | Any block with zero preds is unreachable. Already covered. |
+| 12 | Parameter locals in expected order | **Not IR's concern** | Guaranteed by lowerer construction; violation would be catastrophic and caught by the checker. |
+| 13 | Call arg count matches signature | **Real gap, future work** | Needs symbol-table access in `ir_validate`; currently the validator has only `IRFunc *`. Medium effort, high value. |
+| 14 | Type correctness of BINOP/UNOP operands | **Real gap, phase 3+** | Deep type analysis. GCC catches most at the C level, so value is marginal. |
+| 15 | `FIELD_READ` field exists on src type | **Real gap, medium effort** | Needs type traversal. Tractable. |
+| 16 | CAST source/target compatibility | **Real gap, medium effort** | Like #15. |
+| 17 | `LITERAL` kind matches dest type | **Real gap, low effort** | Check `literal_kind` against `dest.type->kind`. Cheap to add later. |
+| 18 | `yield`/`await` only in async function | **Real gap, medium effort** | Needs `func->is_async` check. Simple but distinct. |
+| 19 | Scoped `IR_SPAWN` has `.join()` reachable | **Path-sensitive, verify** | Checker might already catch; needs a deliberate look at spawn lowering. |
+| 20 | Unreachable BRANCH edge (same-target) | **Not an invariant violation** | Lowerer may produce for simplicity; GCC DCEs. |
+
+**Summary: critic's 6 reduced to 2 real wins** (items 4, 6). **Plus
+1 audit addition** (item 7). **6 real gaps remain as future work**
+(13-18), none safety-critical at the `ir_validate` layer. Phase 3's
+use-before-define is the only remaining silent-safety-hole class;
+the others are correctness polish GCC mostly catches anyway.
+
+### Why reachability cannot be promoted to error
+
+This is the subtle lesson. When `test_goto_defer_77` was compiled
+with reachability-as-error, the lowerer correctly emitted IR for:
+
+```zer
+goto done77;
+gdpool77.get(h).v = 0;   // user-written dead code
+done77:
+    ...
+```
+
+The `gdpool77.get(h).v = 0` became a block with a non-trivial
+instruction that no CFG edge reached — because `goto done77` jumps
+past it. My validator flagged it as a lowerer bug. It wasn't — the
+lowerer is not supposed to do dead-code elimination (that's GCC's
+job), so it faithfully represents what the user wrote.
+
+**The invariant we cannot express**: is this unreachable block
+(a) a forgotten edge in the lowerer, or (b) source code that was
+syntactically reachable but semantically dead? The IR shape is
+identical in both cases. Promoting to error would require lowerer-
+level metadata ("this block represents source between goto and
+label") that the IR doesn't carry.
+
+### Emit-time defer_stack vs IR defer balance
+
+A common confusion: the emitter's `e->defer_stack.count` at
+function-end is **not zero** in production. The lowerer emits
+fire-all at `IR_RETURN` with `src2_local = -1` (fire no-pop), so
+the emit-time stack stays populated. This is correct — it lets
+multiple RETURN paths in the same function all see the same
+defers without removing them mid-emission.
+
+So `assert(defer_stack.count == 0)` at function emit-end is NOT a
+valid invariant. The defer balance check in `ir_validate` is
+instead static-CFG-based: "every PUSH has a reachable emit-bodies
+FIRE." This is necessary (else the defer body is unreachable) but
+not sufficient to prove every path balances exactly — that would
+require path-sensitive stack simulation which the varying fire-mode
+semantics make complex.
+
+### Testing strategy
+
+`ir_validate` runs on every compile via the emitter hook (since
+Phase F). The full test suite (3,200+ programs) exercises it
+continuously. No new tests added because constructing invalid IR
+would require patching the lowerer; the validator is designed to
+catch lowerer regressions, so the test is "don't regress the
+lowerer and the full test suite remains green."
+
+If a future `ir_lower.c` change trips any of these checks, it
+aborts compilation with a specific error message identifying the
+block and instruction. That's the test.
+
+### Files touched by ir_validate hardening
+
+- `ir.c:283-320` — `cfg_reaches_fire` helper for defer balance
+- `ir.c:322` — `dfs_reachable` helper for reachability diagnostic
+- `ir.c:445-594` — per-op field invariants (phase 1)
+- `ir.c:~623-708` — defer balance check (phase 2)
+- `ir.c:~502-540` — NULL-type-local check (phase 2)
+- Commits: `130ddbd` (phase 1), `014f8c8` (phase 2)
+
+### For fresh sessions / new IR ops
+
+When adding a new `IR_*` op kind:
+
+1. Add a case in `ir_validate`'s per-op switch (around `ir.c:445`)
+   with the field invariants that op requires. Example for a new
+   op with dest + two sources: copy the `IR_BINOP` case.
+2. If the op is a terminator-like (transfers control), update
+   `ir_block_is_terminated()`, `dfs_reachable()`, and
+   `cfg_reaches_fire()` to treat it as such.
+3. Run `make docker-check` — any existing test that exercises the
+   op will hit the validator. Clean green = invariants are right.
+
+When adding a new `IR_DEFER_*` variant:
+
+1. Update the "emit-bodies" test in the defer balance check:
+   currently `inst->op == IR_DEFER_FIRE && inst->src2_local != 2`.
+2. If semantics change, update the comment block in `ir.c:~623`.
+
+### Remaining phase 3 work (use-before-define, if ever)
+
+The hardest real gap. Needs:
+
+1. Dominator tree computation on the CFG (standard algorithm,
+   ~100 lines, one-pass Cooper-Harvey-Kennedy).
+2. For each local, find the set of blocks that write it.
+3. For each read of a local, verify the read's block is dominated
+   by at least one write's block.
+
+Catches: "lowerer forgot to initialize a compiler-generated temp."
+The class of bug isn't frequent but it's silent — the temp carries
+garbage from whatever previous use occupied the C stack slot.
+
+Not a priority given the 3,200 tests pass; flagged for future
+hardening if a related bug ever surfaces.

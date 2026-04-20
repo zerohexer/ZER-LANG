@@ -1094,6 +1094,47 @@ Quick reminders for common IR work:
 - **`emit_rewritten_node` is NOT `emit_expr`** — zero emit_expr calls in IR function body emission
 - **AST→IR migration watchpoint**: any IR handler that replaces `emit_expr(inst->expr)` with direct emission MUST port every `_zer_trap` / `_zer_bounds_check` / `_zer_shl` safety wrapper. See "AST→IR Emission Diff Audit" section below.
 
+### ir_validate hardening (phases 1+2, 2026-04-20)
+
+`ir_validate(IRFunc *)` (in `ir.c`) is the safety-net check that runs
+in the emitter hook on every lowered function. Previously structural-
+only (targets in range, no duplicate local IDs). Hardened with:
+
+- **Per-op field invariants** for 11 op kinds (BINOP, UNOP, COPY,
+  LITERAL, FIELD_READ/WRITE, INDEX_READ, ADDR_OF, DEREF_READ, CAST,
+  CALL_DECOMP) + BRANCH needs-condition + CAST needs-type. Catches
+  lowerer building a malformed instruction.
+- **Defer balance** — every `IR_DEFER_PUSH` must have a CFG-reachable
+  `IR_DEFER_FIRE` with emit_bodies=true (`src2_local != 2`). Without
+  it the `defer` body is statically dead (missed cleanup / latent
+  leak). Uses `cfg_reaches_fire()` DFS helper.
+- **NULL-type-local** — every `func->locals[i].type` must be non-NULL.
+  Lowerer forgot `resolve_type` → downstream crash.
+- **Reachability (opt-in diagnostic)** — `ZER_IR_WARN_UNREACHABLE=1`
+  logs unreachable blocks. **Cannot be promoted to error**: lowerer
+  correctly emits IR for source dead code (`goto done; x=0; done:`)
+  and there's no static way to distinguish that from a forgotten-edge
+  bug. Useful for lowerer-refactor sessions.
+
+**For fresh sessions / when editing `ir_lower.c`:**
+- If new IR op added, add a field-invariant case in `ir_validate`'s
+  `switch(inst->op)` (around `ir.c:445`).
+- Don't try to enforce "dead code after terminator" — lowerer emits
+  legitimate `RETURN; DEFER_FIRE; GOTO bb_post` cleanup patterns.
+- Don't try to enforce "reachability" as error — see above.
+- Defer push without reachable fire = **hard error**, aborts compile.
+  If a lowerer change trips this, investigate the push path.
+
+Remaining real gaps (future work, not safety-critical):
+- Call arg count matches callee signature (needs symbol-table access)
+- `FIELD_READ` field name exists on src type (needs type traversal)
+- `LITERAL` kind matches dest type
+- `yield`/`await` only in async function
+- Use-before-define (needs dominator analysis — hardest)
+
+Full gap audit (20 items evaluated): see
+`docs/compiler-internals.md` "ir_validate gap audit" section.
+
 ## CFG Migration (zercheck.c → zercheck_ir.c) — see docs/cfg_migration_plan.md
 
 **Phase F LANDED (2026-04-20).** zercheck_ir runs UNCONDITIONALLY on every

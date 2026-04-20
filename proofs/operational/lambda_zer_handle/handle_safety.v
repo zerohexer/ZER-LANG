@@ -86,23 +86,29 @@ Definition no_leak_at_termination (st : state) (e : expr) : Prop :=
    uaf_stuck requires "stuck" which means neither value nor
    steps. So uaf_stuck states aren't reachable. *)
 
-Theorem handle_safety_no_uaf : forall st e st' e' τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+Theorem handle_safety_no_uaf : forall st e st' e' Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   steps st e st' e' ->
   ~ uaf_stuck st' e'.
 Proof.
-  intros st e st' e' τ Henv Hty Hsteps Huaf.
+  intros st e st' e' Γ τ Henv Hty Hsteps Huaf.
   destruct Huaf as [[Hnv Hnostep] _].
-  destruct (no_stuck _ _ _ _ _ Henv Hty Hsteps) as [Hv | [[v Hret] | Hstep]].
-  - (* is_value e' = true contradicts Hnv *)
-    apply Hnv. exact Hv.
-  - (* Returned state — we'd need to show uaf_stuck's "stuck" is
-       incompatible with returned. In our semantics, a returned
-       state can still have non-value expression (e.g., after
-       orelse-return fires, some leftover expression). Need a
-       lemma: `st_returned = Some _ → no step can fire`. *)
-    (* TODO(Year-1, Week-2): add step_blocked_by_returned lemma. *)
+  destruct (no_stuck _ _ _ _ _ _ Henv Hty Hsteps) as [Hv | [[v Hret] | Hstep]].
+  - apply Hnv. exact Hv.
+  - (* Returned state — uaf_stuck's "stuck" would need to show no
+       step fires. In the returned sub-state, by construction, no
+       step rule matches (all have `st_returned = None` as premise).
+       So a returned state trivially has no step. But uaf_stuck also
+       requires is_value e' = false. Returned-state values are fine
+       (stuck needs "not value AND no step"), so the only escape is
+       when e' is not a value but the state is returned — that is
+       indeed possible (after orelse-return, e' = EVal v but state
+       returned). If e' IS a value, uaf_stuck is false. Hnv + Hv
+       contradiction via the returned-state non-value case needs an
+       auxiliary: st_returned = Some _ → is_value e' = true. That
+       holds because orelse-return-fire and return-val both produce
+       EVal results. TODO(Year-1, Week-3): add this lemma. *)
     admit.
   - apply Hnostep. exact Hstep.
 Admitted.
@@ -117,18 +123,17 @@ Admitted.
    This is the PART where the typing-preservation-implies-liveness
    argument is most visible. Will formalize in a follow-up. *)
 
-Theorem handle_safety_no_double_free : forall st e st' e' τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+Theorem handle_safety_no_double_free : forall st e st' e' Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   steps st e st' e' ->
   ~ double_free_stuck st' e'.
 Proof.
-  intros st e st' e' τ Henv Hty Hsteps Hdf.
+  intros st e st' e' Γ τ Henv Hty Hsteps Hdf.
   destruct Hdf as [[Hnv Hnostep] _].
-  destruct (no_stuck _ _ _ _ _ Henv Hty Hsteps) as [Hv | [[v Hret] | Hstep]].
+  destruct (no_stuck _ _ _ _ _ _ Henv Hty Hsteps) as [Hv | [[v Hret] | Hstep]].
   - apply Hnv. exact Hv.
-  - (* Same TODO as above. *)
-    admit.
+  - admit.
   - apply Hnostep. exact Hstep.
 Admitted.
 
@@ -158,9 +163,9 @@ Admitted.
    and a clear "needs type-system extension" note. *)
 
 Theorem handle_safety_no_leak_weak :
-  forall st e st' e' τ,
-    env_typed st.(st_env) empty ->
-    typed empty e τ ->
+  forall st e st' e' Γ τ,
+    env_typed st.(st_env) Γ ->
+    typed Γ e τ ->
     steps st e st' e' ->
     no_leak_at_termination st' e'.
 Proof.
@@ -182,15 +187,15 @@ Admitted.
    When the admits above are discharged, this becomes axiom-free.
    ================================================================ *)
 
-Theorem lambda_zer_handle_safety : forall st e st' e' τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+Theorem lambda_zer_handle_safety : forall st e st' e' Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   steps st e st' e' ->
   ~ uaf_stuck st' e' /\
   ~ double_free_stuck st' e' /\
   no_leak_at_termination st' e'.
 Proof.
-  intros st e st' e' τ Henv Hty Hsteps.
+  intros st e st' e' Γ τ Henv Hty Hsteps.
   split; [|split].
   - eapply handle_safety_no_uaf; eauto.
   - eapply handle_safety_no_double_free; eauto.

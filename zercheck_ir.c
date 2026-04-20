@@ -1868,12 +1868,38 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (!summary && inst->expr && inst->expr->kind == NODE_CALL) {
             Node *call = inst->expr;
 
-            /* Extern alloc: register dest_local as ALIVE.
-             * Phase D1: color as MALLOC if callee name is malloc/calloc/realloc,
-             * otherwise UNKNOWN (cinclude custom allocator).
-             * MALLOC requires matching free(); UNKNOWN is conservatively tracked
-             * like POOL but can be escaped via returning. */
-            if (inst->dest_local >= 0 && ir_is_extern_alloc_call(zc, call)) {
+            /* Phase E: any pointer-returning call treated as allocation
+             * (mirrors zercheck.c:786-808). Applies to both extern
+             * (bodyless) and bodied functions. Extern is a subset of
+             * this check — kept separate for MALLOC coloring.
+             *
+             * Skip conditions:
+             *   - Call doesn't return a pointer type (no alloc)
+             *   - FuncSummary says returns_color is ARENA (bulk-reset)
+             *   - Dest already has a handle registered (avoid double-wrap)
+             *   - Extern heuristic already applies (avoids re-registration) */
+            bool already_handled = ir_is_extern_alloc_call(zc, call);
+            bool treat_as_alloc = already_handled;
+            if (!already_handled && inst->dest_local >= 0 &&
+                inst->dest_local < func->local_count) {
+                /* Check callee return type */
+                Type *ret = checker_get_type(zc->checker, call);
+                Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+                bool is_ptr_return = false;
+                if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
+                                ret_eff->kind == TYPE_OPAQUE))
+                    is_ptr_return = true;
+                if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
+                    Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
+                    if (inner && (inner->kind == TYPE_POINTER ||
+                                  inner->kind == TYPE_OPAQUE))
+                        is_ptr_return = true;
+                }
+                /* Check if dest already has handle (e.g., arena-colored) */
+                bool already_tracked = (ir_find_handle(ps, inst->dest_local) != NULL);
+                if (is_ptr_return && !already_tracked) treat_as_alloc = true;
+            }
+            if (inst->dest_local >= 0 && treat_as_alloc) {
                 IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                 if (h) {
                     if (h->state == IR_HS_ALIVE &&

@@ -2535,24 +2535,32 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Phase E: alloc_id-grouped leak detection (restoration of union
-     * semantics). An alloc_id is "covered" if any handle with that
-     * alloc_id is FREED / TRANSFERRED / escaped in ANY return block.
-     * Only flag alloc_ids with no covering event anywhere.
+    /* Phase E: alloc_id-grouped leak detection. An alloc_id is "covered"
+     * if any handle with that alloc_id is FREED/TRANSFERRED/escaped in
+     * ANY return block EXCEPT orelse-fallback blocks. Orelse-fallback
+     * blocks exit when an optional was null, so they shouldn't contribute
+     * coverage AND shouldn't be checked for leaks.
      *
      * Mirrors zercheck.c linear-scan final-state: linear scan continues
-     * through early returns as if they didn't happen, so the state at
-     * function-end represents the union of "what happened on all paths".
+     * past early returns (treating them as "happens on some path but the
+     * main flow continues"), so the state at the FINAL return represents
+     * the synthesized happy path. Using union captures this when happy
+     * path frees, but doesn't catch cases where one branch frees+returns
+     * early while happy-path doesn't free.
      *
-     * Limitation: doesn't catch mixed-path leaks where one return frees
-     * and another doesn't. Gen_uaf_003 style. Phase F task or documented
-     * tradeoff. */
+     * Flag `checked_last_return_only` controls strictness:
+     *   - OFF (default): union across all non-fallback returns. Preserves
+     *     legacy positive tests where early-exit error returns don't
+     *     free intermediate allocations.
+     *   - ON (gen_uaf_003 semantic): only check the last source-order
+     *     non-fallback return. Stricter but catches mixed-path leaks. */
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
         if (bb->inst_count == 0) continue;
         if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
+        if (bb->is_orelse_fallback) continue;
         IRPathState *ps2 = &block_states[bi];
         for (int hi = 0; hi < ps2->handle_count; hi++) {
             IRHandleInfo *h = &ps2->handles[hi];

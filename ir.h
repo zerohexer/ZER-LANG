@@ -205,6 +205,23 @@ typedef struct {
      * alloc returned null). zercheck_ir leak detection skips these
      * blocks entirely — they can't leak what was never allocated. */
     bool is_orelse_fallback;
+
+    /* Phase E: set by ir_lower when this block is part of an if-then or
+     * switch-arm body whose always-exits terminator (return/break/
+     * continue/goto) represents an "early exit" — a conditional path
+     * that bypasses the fall-through canonical exit.
+     *
+     * Mirrors zercheck.c's `block_always_exits` semantic
+     * (zercheck.c:312): when an if-then always exits, the linear scan
+     * treats the post-if state as pre-if state — the early-exit
+     * branch's effects DON'T contribute to the final function-exit
+     * state. In CFG terms, early-exit blocks shouldn't count as
+     * leak-coverage providers — the fall-through return is the
+     * canonical exit and must independently show all allocs freed.
+     *
+     * Tagging is propagated transitively: if a block's terminator
+     * leads into an already-tagged block, it's also tagged. */
+    bool is_early_exit;
 } IRBlock;
 
 /* ================================================================

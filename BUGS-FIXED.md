@@ -5,6 +5,75 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-20 (Phase F) — unconditional dual-run via emitter hook
+
+**Architectural milestone, not a classic bug fix.** zercheck_ir is now
+invoked on EVERY compile (no env var gate) via a hook in the emitter.
+Both analyzers see every function; disagreements logged as regression
+signals. zercheck.c still drives exit code (AST primary).
+
+### Bug fixed while landing Phase F: double-lowering AST corruption
+
+**Symptom**: with Phase F dual-run, tests `orelse_stress.zer` and
+`single_eval_guarantees.zer` failed with GCC error
+`'_zer_t2' undeclared in function 'c17_call_in_fallback'`.
+
+**Root cause**: `ir_lower_func` (ir_lower.c:2775) is NOT idempotent.
+It calls `pre_lower_orelse` (ir_lower.c:1239) which destructively
+rewrites the AST — replacing `NODE_ORELSE` nodes with `NODE_IDENT`
+referencing a temp local created during THAT lowering pass.
+
+Before Phase F, `ZER_DUAL_RUN=1` happened to work because `make check`
+didn't set the env var. Making dual-run unconditional exposed this:
+functions with nested orelse (like `maybe_null() orelse helper(maybe_null() orelse 7)`)
+got double-lowered — once for zercheck_ir, once for emit. The second
+lowering couldn't find `NODE_ORELSE` (already replaced), so its temp
+didn't get created. The first lowering's NODE_IDENT referenced a
+dead temp name.
+
+**Fix**: `Emitter.ir_hook` callback. The emitter is the sole authority
+that calls `ir_lower_func`. Analyses piggyback via the hook:
+
+- `emitter.h`: added `ir_hook` + `ir_hook_ctx` fields.
+- `emitter.c:~3480`: invokes hook after `ir_lower_func` + `ir_validate`.
+- `zerc_main.c`: `zerc_ir_hook` collects IRFuncs; post-emit runs
+  iterative summary build + main analysis on collected IRFuncs
+  (same pointers, no re-lowering).
+
+Commit: `3d251b5`. Validated on 3143 programs, 0 disagreements.
+
+### Related zercheck_ir fixes delivered in Phase F
+
+- `cdc4bca` — Cross-function FuncSummary chain via param auto-register.
+- `651fbf3` — Untrackable-target escape (handles[i] = mh where i is variable).
+- `b7f52aa` — Move struct from array element compound-key tracking.
+- `eedae4f` — Dead-code-after-return state inheritance.
+- `2bf8619` — Treat all pointer-returning calls as allocations.
+- `572c701` — is_early_exit tag for if-without-capture always-exits.
+- `800aaf6` — Exhaustive enum switch elision + MAYBE_FREED at return.
+- `58b0ba0` — 5 stress tests combining 3+ features (permanent regression guards).
+
+### Validation surface
+
+| Category | Count | Disagreements |
+|---|---|---|
+| make check | 3200+ | 0 |
+| Standalone dual-run sweep | 1115 | 0 |
+| Multi-module | 28 | 0 |
+| Semantic fuzzer | 2000 | 0 |
+| **Total** | **~3143** | **0** |
+
+### Critical constraint for fresh sessions
+
+**Never call `ir_lower_func` outside the emitter.** `pre_lower_orelse`
+destructively rewrites AST. Second calls corrupt emission. If adding
+new IR analyses, register via `Emitter.ir_hook`.
+
+See `docs/compiler-internals.md` "Phase F — Unconditional dual-run"
+section for full architecture.
+
+---
+
 ## Session 2026-04-20 (CFG migration Phase E) — dual-run verification
 
 Not bug fixes. Architectural milestone: `zercheck_ir.c` wired into

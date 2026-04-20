@@ -1096,30 +1096,56 @@ Quick reminders for common IR work:
 
 ## CFG Migration (zercheck.c → zercheck_ir.c) — see docs/cfg_migration_plan.md
 
-**In progress.** Long-term plan: delete `zercheck.c` (2810-line linear AST walker), replace with `zercheck_ir.c` (CFG-based, growing toward parity). Both coexist during migration — zercheck.c is PRIMARY in the pipeline, zercheck_ir.c is compiled but NOT invoked on production path yet.
+**Phase F LANDED (2026-04-20).** zercheck_ir runs UNCONDITIONALLY on every
+compile via an `ir_hook` in the emitter. Both analyzers see every
+function; disagreements logged as regression signals. zercheck.c still
+drives exit code (AST primary) for conservatism — the CFG analyzer gets
+continuous real-world validation on every user compile without gatekeeping
+safety decisions.
 
-**Current state as of 2026-04-20:**
-- Phase A complete — 3 checker gaps closed directly (Gaps 3, 7, spawn scan cap)
-- Phase B complete — move struct, escape detection, compound keys in zercheck_ir.c
-- Phase C complete — FuncSummary, `*opaque` 9a/9b/9c, defer scanning
-- Phase D complete — alloc coloring, ThreadHandle join, ISR bans, ghost handle, arena chain.
-  D2 (keep param) + D4 (deadlock) confirmed as checker.c domain, no zercheck_ir port needed.
-- **Phase E — dual-run CONVERGED + VALIDATED (100% behavior parity)**.
-  Wrapper lives in `zerc_main.c:~492` gated behind `ZER_DUAL_RUN=1` env var.
-  Runs BOTH analyzers, diffs diagnostic counts, logs disagreements.
-  Validation surface (2026-04-20): **3143 programs, zero disagreements**:
-  - 1110 standalone tests (tests/zer + rust_tests + zig_tests + tests/zer_fail)
-  - 28 multi-module tests (test_modules/)
-  - 2000 semantic fuzzer programs (10 seeds × 200 random programs each)
-  - 5 new stress tests combining 3+ features (defer + orelse + move + etc.)
-- **Phase F READY** — cutover + delete zercheck.c + tag v0.5.0 unblocked.
+**Current state:**
+- Phases A-E complete (100% behavior parity on 3143 programs validated).
+- Phase F: unconditional dual-run via emitter hook, **0 disagreements**
+  across 1115 standalone + 28 module + 2000 fuzz = 3143 programs.
+- Phase G (future): flip primary to zercheck_ir, delete zercheck.c,
+  tag v0.5.0. Not blocked on technical issues — blocked on "accumulate
+  more real-world usage before deleting the battle-tested analyzer."
 
-**zercheck_ir.c is ~2900 lines, 100% behavior-parity with zercheck.c (2810 lines).**
-CFG infrastructure is the foundation for future analyses (dominator trees, VRP-on-SSA,
-borrow-checker-lite) that zercheck.c's linear-scan can't easily support.
+**zercheck_ir.c ≈ 2900 lines, 100% behavior-parity with zercheck.c (2810 lines).**
+CFG infrastructure is the foundation for future analyses (dominator trees,
+VRP-on-SSA, borrow-checker-lite) that linear-scan can't easily support.
 
-**Run dual-run yourself:** `ZER_DUAL_RUN=1 ./zerc FILE.zer -o /dev/null`.
-Use `ZER_DUAL_RUN=2` to also log agreements (helpful when debugging).
+**Control knobs:**
+- `ZER_DUAL_RUN=0` — disable zercheck_ir entirely (default: on)
+- `ZER_DUAL_RUN=2` — verbose: log agreements too (debug)
+- (unset or `=1`): run both, log disagreements only (default behavior)
+
+**THE critical architectural constraint (learned the hard way in Phase F):**
+
+`ir_lower_func` **mutates the AST** (`pre_lower_orelse` at ir_lower.c:1239
+replaces `NODE_ORELSE` with `NODE_IDENT` referencing a temp local). Calling
+`ir_lower_func` TWICE on the same function corrupts emission: nested-orelse
+temps reference locals that no longer exist in the freshly-created IRFunc.
+
+Before Phase F, `ZER_DUAL_RUN=1` worked by accident — make check didn't
+set the env var. Making dual-run unconditional exposed this: tests like
+`orelse_stress.zer` (nested orelse in function arg in outer orelse fallback)
+fail to emit valid C after double-lowering.
+
+**Solution**: single-lowering via emitter hook (`Emitter.ir_hook`).
+zerc_main registers `zerc_ir_hook` (in zerc_main.c) that collects each
+`IRFunc` as the emitter lowers it. After emit completes, zerc_main runs
+iterative FuncSummary build + main analysis on the collected IRFuncs —
+NOT re-lowering, just re-analyzing the same IR.
+
+**Do NOT call `ir_lower_func` outside the emitter.** The emitter is the
+sole lowering site. All IR analysis piggybacks via the hook.
+
+**For fresh sessions:**
+- Do NOT "fix" Phases A-E — converged. See BUGS-FIXED.md 2026-04-20.
+- Do NOT call `ir_lower_func` in zerc_main or a new callsite (AST mutation).
+- If adding new IR-based analyses, register via `Emitter.ir_hook`.
+- Disagreements from `VERIFY disagreement` log line = genuine regression.
 
 **Critical IR lowering fact (Phase 8d, per ir_lower.c:84):**
 `IR_POOL_ALLOC` / `IR_SLAB_ALLOC` / `IR_POOL_FREE` / etc. enum values exist
@@ -1132,19 +1158,6 @@ lives in `IR_ASSIGN` and `IR_CALL` via `ir_classify_method_call(Node*)`.
 **Do NOT try to "fix" the absence of IR_POOL_ALLOC emission** — this is
 intentional architecture. Add detection in IR_ASSIGN/IR_CALL method-call
 paths instead.
-
-**For fresh sessions:**
-- Do NOT "fix" Gaps 3/7/scan-depth — already closed (BUG-600/601/602).
-- Do NOT invoke zercheck_ir from zerc_main.c yet — Phase E work.
-- Do NOT delete zercheck.c until Phase F criteria met (zero disagreement on ~2962 tests).
-- Plan progress checklist lives at bottom of `docs/cfg_migration_plan.md` — update it when landing a phase.
-- Feature port details: `docs/compiler-internals.md` section "zercheck_ir.c architecture".
-
-**Dependencies between phases** (concrete):
-- Phase D items mostly depend on Phase B handle tracking (already done)
-- D7 (arena chain) depends on C1 FuncSummary (already done)
-- Phase E needs D complete before dual-run will produce matching diagnostics
-- Phase F needs E green (zero disagreements)
 
 <!-- Sections moved to docs/compiler-internals.md 2026-04-19:
        - IR Path Validation (full history)

@@ -278,6 +278,47 @@ bool ir_block_is_terminated(IRBlock *block) {
  * Validation
  * ================================================================ */
 
+/* Returns true if block `from` can reach any block in `target_set` via
+ * CFG edges. Used by phase 2 defer balance check.
+ *
+ * has_fire_in_block: for each block bi, true if bi contains an emit-bodies
+ *   IR_DEFER_FIRE anywhere (conservative — doesn't track instr position
+ *   within a block). Callers that need "fire AFTER instr position in the
+ *   same block as push" check that separately before calling this. */
+static bool cfg_reaches_fire(IRFunc *func, int from, const bool *has_fire_in_block,
+                             bool *visited) {
+    if (from < 0 || from >= func->block_count) return false;
+    if (visited[from]) return false;
+    visited[from] = true;
+    if (has_fire_in_block[from]) return true;
+    IRBlock *block = &func->blocks[from];
+    /* Successors via block terminator (same logic as dfs_reachable). */
+    if (block->inst_count == 0) {
+        if (from + 1 < func->block_count)
+            return cfg_reaches_fire(func, from + 1, has_fire_in_block, visited);
+        return false;
+    }
+    IRInst *last = &block->insts[block->inst_count - 1];
+    switch (last->op) {
+    case IR_BRANCH:
+        if (cfg_reaches_fire(func, last->true_block, has_fire_in_block, visited)) return true;
+        return cfg_reaches_fire(func, last->false_block, has_fire_in_block, visited);
+    case IR_GOTO:
+        return cfg_reaches_fire(func, last->goto_block, has_fire_in_block, visited);
+    case IR_RETURN:
+        return false;
+    case IR_YIELD:
+    case IR_AWAIT:
+        if (from + 1 < func->block_count)
+            return cfg_reaches_fire(func, from + 1, has_fire_in_block, visited);
+        return false;
+    default:
+        if (from + 1 < func->block_count)
+            return cfg_reaches_fire(func, from + 1, has_fire_in_block, visited);
+        return false;
+    }
+}
+
 /* Depth-first reachability walk from bb0. Fills reachable[] with true for
  * every block reachable via BRANCH/GOTO/implicit-fallthrough edges. */
 static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
@@ -449,6 +490,29 @@ bool ir_validate(IRFunc *func) {
      *   - Use-before-define (needs dominator analysis for non-SSA IR)
      * ================================================================ */
 
+    /* Audit addition (2026-04-20): NULL type on local.
+     *
+     * Considered but rejected: "dead code after terminator" as a validator
+     * check. The lowerer emits legitimate patterns like
+     *   RETURN; DEFER_FIRE; GOTO bb_post
+     * where the DEFER_FIRE and GOTO are bb_post scope-cleanup emissions
+     * that become dead C code which GCC strips. Not a safety hole, just
+     * redundant IR. Promoting to error would block a correct pattern. */
+
+    /* Every local must have a type. NULL type means the lowerer
+     * failed to call resolve_type or similar. Downstream (emitter,
+     * analyzer) will crash or emit wrong C. */
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (!l->type) {
+            fprintf(stderr, "IR VALIDATION ERROR: local %%%d (%.*s) has NULL type "
+                    "in '%.*s' (lowerer forgot resolve_type)\n",
+                    l->id, (int)l->name_len, l->name ? l->name : "?",
+                    (int)func->name_len, func->name);
+            valid = false;
+        }
+    }
+
     /* (a) Per-op field invariants — catches lowerer building a
      * malformed instruction (field forgotten, wrong local type, etc.).
      * Run after the range checks above so we know indices are sane. */
@@ -576,6 +640,93 @@ bool ir_validate(IRFunc *func) {
             default:
                 break;
             }
+        }
+    }
+
+    /* ================================================================
+     * Phase 2 hardening — defer balance.
+     *
+     * For every IR_DEFER_PUSH, at least one IR_DEFER_FIRE with
+     * emit_bodies=true (src2_local != 2) must be CFG-reachable from
+     * the push. Otherwise the pushed defer body never emits anywhere,
+     * silently dropping the user's `defer` statement.
+     *
+     * Note: emit-bodies fire can be within the same block (after the
+     * push) or in a downstream CFG-reachable block. We can't prove the
+     * exact stack-balancing (depth tracking requires path-sensitive
+     * simulation; stack mode varies), but "at least one fire reaches"
+     * is necessary: without it the defer body is statically dead.
+     *
+     * This is a true safety check — a missed defer is a leak or an
+     * unreleased lock at runtime. Logged as ERROR, aborts compilation. */
+    {
+        /* Pre-compute which blocks contain ≥1 emit-bodies FIRE. */
+        bool *fire_in_block = (bool *)calloc(func->block_count, sizeof(bool));
+        if (fire_in_block) {
+            for (int bi = 0; bi < func->block_count; bi++) {
+                IRBlock *block = &func->blocks[bi];
+                for (int ii = 0; ii < block->inst_count; ii++) {
+                    IRInst *inst = &block->insts[ii];
+                    if (inst->op == IR_DEFER_FIRE && inst->src2_local != 2) {
+                        fire_in_block[bi] = true;
+                        break;
+                    }
+                }
+            }
+            /* For every PUSH, verify a reachable FIRE exists. */
+            bool *visited = (bool *)calloc(func->block_count, sizeof(bool));
+            if (visited) {
+                for (int bi = 0; bi < func->block_count; bi++) {
+                    IRBlock *block = &func->blocks[bi];
+                    for (int ii = 0; ii < block->inst_count; ii++) {
+                        IRInst *inst = &block->insts[ii];
+                        if (inst->op != IR_DEFER_PUSH) continue;
+                        /* Same-block fire AFTER this push counts. */
+                        bool found = false;
+                        for (int jj = ii + 1; jj < block->inst_count; jj++) {
+                            IRInst *j = &block->insts[jj];
+                            if (j->op == IR_DEFER_FIRE && j->src2_local != 2) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) continue;
+                        /* Otherwise do CFG-reachability from successors. */
+                        memset(visited, 0, func->block_count * sizeof(bool));
+                        visited[bi] = true; /* don't revisit the push's block */
+                        bool reached = false;
+                        /* Compute successors of bi and DFS from them. */
+                        if (block->inst_count > 0) {
+                            IRInst *last = &block->insts[block->inst_count - 1];
+                            switch (last->op) {
+                            case IR_BRANCH:
+                                reached = cfg_reaches_fire(func, last->true_block, fire_in_block, visited)
+                                       || cfg_reaches_fire(func, last->false_block, fire_in_block, visited);
+                                break;
+                            case IR_GOTO:
+                                reached = cfg_reaches_fire(func, last->goto_block, fire_in_block, visited);
+                                break;
+                            case IR_RETURN:
+                                reached = false;
+                                break;
+                            default:
+                                if (bi + 1 < func->block_count)
+                                    reached = cfg_reaches_fire(func, bi + 1, fire_in_block, visited);
+                                break;
+                            }
+                        }
+                        if (!reached) {
+                            fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d IR_DEFER_PUSH "
+                                    "has no CFG-reachable IR_DEFER_FIRE in '%.*s' "
+                                    "(defer body would never execute)\n",
+                                    bi, ii, (int)func->name_len, func->name);
+                            valid = false;
+                        }
+                    }
+                }
+                free(visited);
+            }
+            free(fire_in_block);
         }
     }
 

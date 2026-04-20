@@ -197,6 +197,14 @@ typedef struct {
     int *preds;
     int pred_count;
     int pred_capacity;
+
+    /* Phase E: set by ir_lower when this block is the fail-target of an
+     * orelse branch whose fallback is a bare return/break/continue. The
+     * block is only reached when the preceding optional was null, so any
+     * handle statically ALIVE at block entry is dynamically invalid (the
+     * alloc returned null). zercheck_ir leak detection skips these
+     * blocks entirely — they can't leak what was never allocated. */
+    bool is_orelse_fallback;
 } IRBlock;
 
 /* ================================================================

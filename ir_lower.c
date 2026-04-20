@@ -1374,6 +1374,14 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
 
     /* === Fail block === */
     ctx->current_block = bb_fail;
+    /* Phase E: tag fallback-return/break/continue blocks so zercheck_ir
+     * leak detection can skip them. The fallback is only reached when
+     * the optional was null — nothing was allocated to leak. */
+    if (orelse_node->orelse.fallback_is_return ||
+        orelse_node->orelse.fallback_is_break ||
+        orelse_node->orelse.fallback_is_continue) {
+        ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+    }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
         IRInst ret = make_inst(IR_RETURN, line);
@@ -1418,6 +1426,21 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
                 IRInst go = make_inst(IR_GOTO, line);
                 go.goto_block = bb_join;
                 emit_inst(ctx, go);
+            }
+        } else if (fb_blk->inst_count > 0) {
+            /* Phase E: block fallback terminated with RETURN/BREAK/CONTINUE
+             * /GOTO. Tag the fail block so zercheck_ir skips leak/join
+             * checks — this path is the null-optional exit, allocation
+             * didn't succeed. Tag the ENDING block (might be different
+             * from bb_fail if the block lowered into multiple blocks). */
+            IRInst *fb_last = &fb_blk->insts[fb_blk->inst_count - 1];
+            if (fb_last->op == IR_RETURN || fb_last->op == IR_GOTO) {
+                ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+                /* Also tag the ending block if it's different from bb_fail
+                 * (block lowering may have split into sub-blocks) */
+                if (ctx->current_block != bb_fail) {
+                    ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+                }
             }
         }
     }

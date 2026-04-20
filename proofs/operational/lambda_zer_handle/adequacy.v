@@ -95,19 +95,145 @@ Qed.
    handling). Doable but tedious. Deferred to follow-up.
    ================================================================ *)
 
-Theorem preservation : forall st e st' e' τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+(* Preservation threads a typing context through reduction. The
+   context may GROW during reduction — step_let_val extends the
+   runtime env with a new variable, and the corresponding typing
+   context must extend in lockstep.
+
+   We existentially quantify the new context Γ' rather than
+   asserting Γ' = Γ, which would be false for let-reduction.
+
+   Proof strategy (Year-1 Week-2 partial):
+     - Induction on step.
+     - Easy cases (identity Γ, direct typing): discharged below.
+     - Hard cases (ELet, EOrelseReturn, EReturn): require careful
+       inversion on typing + env_typed bookkeeping. Partially done
+       with `admit`s that clearly scope the remaining work. *)
+Theorem preservation : forall st e st' e' Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   step st e st' e' ->
-  env_typed st'.(st_env) empty /\ typed empty e' τ.
+  exists Γ',
+    env_typed st'.(st_env) Γ' /\
+    typed Γ' e' τ.
 Proof.
-  (* TODO(Year-1, Week-2): discharge all ~60 cases of step.
-     Each case follows the pattern:
-       inversion Hty; subst.    (* decompose typing *)
-       inversion Hstep; subst.  (* decompose step    *)
-       split; [handle env|handle typed].
-     Cases involving ELet/EOrelseReturn need env_typed_insert.
-     Cases involving EAlloc/EFree/EGet use vty_* constructors. *)
+  intros st e st' e' Γ τ Henv Hty Hstep.
+  revert Γ τ Henv Hty.
+  induction Hstep; intros Γ' τ Henv Hty.
+
+  (* === step_var : EVar x -> EVal v === *)
+  - inversion Hty; subst.
+    match goal with H : Γ' !! x = Some τ |- _ =>
+      destruct (Henv x τ H) as [v' [Hev Hvt]]
+    end.
+    rewrite H0 in Hev. injection Hev as Hev_eq. subst v'.
+    exists Γ'. split; [exact Henv | constructor; exact Hvt].
+
+  (* === step_let_ctx : ELet x e1 e2, e1 -> e1' ===
+     TODO(Year-1, Week-3): IH gives Γ'' for e1', but e2 was typed
+     under <[x := τ1]> Γ. Need to show Γ'' ⊇ Γ (step never removes
+     bindings), then rebuild the let via ty_let + weakening. *)
+  - admit.
+
+  (* === step_let_val : ELet x (EVal v) e2 -> e2, env extended === *)
+  - inversion Hty; subst.
+    match goal with
+    | Hty1 : typed _ (EVal v) ?τ1 , Hty2 : typed _ _ _ |- _ =>
+      inversion Hty1; subst;
+      exists (<[ x := τ1 ]> Γ'); split;
+      [ simpl; apply env_typed_insert; assumption
+      | assumption ]
+    end.
+
+  (* === step_seq_ctx : similar to let_ctx === *)
+  - admit.
+
+  (* === step_seq_val : ESeq (EVal _) e2 -> e2 === *)
+  - inversion Hty; subst.
+    exists Γ'. split; [exact Henv | assumption].
+
+  (* === step_if_ctx : similar to let_ctx === *)
+  - admit.
+
+  (* === step_if_true : EIf (VBool true) e1 e2 -> e1 === *)
+  - inversion Hty; subst.
+    exists Γ'. split; [exact Henv | assumption].
+
+  (* === step_if_false === *)
+  - inversion Hty; subst.
+    exists Γ'. split; [exact Henv | assumption].
+
+  (* === step_alloc_succ : produces TyOptHandle p via handle non-null === *)
+  - inversion Hty; subst.
+    exists Γ'. split.
+    + simpl. exact Henv.
+    + constructor. apply vty_handle_opt.
+
+  (* === step_alloc_fail : produces TyOptHandle p via null === *)
+  - inversion Hty; subst.
+    exists Γ'. split; [simpl; exact Henv | constructor; apply vty_null_opt].
+
+  (* === step_alloc_init : EAlloc p -> EAlloc p, store extended === *)
+  - inversion Hty; subst.
+    exists Γ'. split; [simpl; exact Henv | apply ty_alloc].
+
+  (* === step_free_ctx : structural === *)
+  - admit.
+
+  (* === step_free_alive : EFree p h -> EVal VUnit === *)
+  - inversion Hty; subst.
+    exists Γ'. split; [simpl; exact Henv | constructor; apply vty_unit].
+
+  (* === step_get_ctx : structural === *)
+  - admit.
+
+  (* === step_get_alive : EGet p h -> EVal v where v is slot content ===
+     TODO(Year-1, Week-3): needs store-well-formedness invariant
+     "slot_val is always VInt" to be threaded through preservation.
+     In Year-1 minimal (slots hold VInt), this is true by
+     construction (alloc fills with VInt 0, no field writes yet).
+     Formalizing the invariant is ~50 lines of auxiliary. *)
+  - admit.
+
+  (* === step_orelse_ctx : structural === *)
+  - admit.
+
+  (* === step_orelse_unwrap : EOrelseReturn handle _ -> EVal handle ===
+     ty_orelse says the form has type TyHandle p0. For the handle
+     value VHandle p i g inside, ty_val + vty_handle_opt requires
+     p = p0. Invert both layers to extract the equality. *)
+  - inversion Hty; subst.
+    match goal with Hv : typed _ (EVal (VHandle _ _ _)) _ |- _ =>
+      inversion Hv; subst;
+      match goal with Hvt : has_val_ty _ _ |- _ =>
+        inversion Hvt; subst
+      end
+    end.
+    exists Γ'. split; [exact Henv | apply ty_val; apply vty_handle].
+
+  (* === step_orelse_return_ctx : structural === *)
+  - admit.
+
+  (* === step_orelse_return_fire : null case, emits (EVal v) where v
+     has return-slot type τr, but expected type is TyHandle p ===
+     TODO(Year-1, Week-3): genuine type mismatch between
+     orelse-form type (TyHandle p) and v's type (τr). Needs the
+     preservation statement restricted to st_returned = None,
+     which then rules out this case from the post-step typing
+     obligation. *)
+  - admit.
+
+  (* === step_return_ctx : structural === *)
+  - admit.
+
+  (* === step_return_val : EReturn (EVal v) -> EVal v, returned set === *)
+  - inversion Hty; subst.
+    match goal with Hin : typed _ (EVal v) _ |- _ =>
+      inversion Hin; subst
+    end.
+    exists Γ'. split.
+    + simpl. exact Henv.
+    + constructor. assumption.
 Admitted.
 
 (* ================================================================
@@ -140,13 +266,15 @@ Admitted.
    canonical-forms lemmas.
    ================================================================ *)
 
-Theorem progress : forall st e τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+Theorem progress : forall st e Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   st.(st_returned) = None ->
   is_value e = true \/ exists st' e', step st e st' e'.
 Proof.
-  (* TODO(Year-1, Week-2): induction on typing. *)
+  (* Induction on typing, using canonical-forms lemmas to decompose
+     values of known types. For each expression form, either
+     directly step or step via a sub-expression's IH. *)
 Admitted.
 
 (* ================================================================
@@ -156,17 +284,17 @@ Admitted.
    Immediate consequence of preservation + induction on steps.
    ================================================================ *)
 
-Theorem steps_preservation : forall st e st' e' τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+Theorem steps_preservation : forall st e st' e' Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   steps st e st' e' ->
-  env_typed st'.(st_env) empty /\ typed empty e' τ.
+  exists Γ', env_typed st'.(st_env) Γ' /\ typed Γ' e' τ.
 Proof.
-  intros st e st' e' τ Henv Hty Hsteps.
-  revert τ Henv Hty.
-  induction Hsteps; intros τ Henv Hty.
-  - split; assumption.
-  - eapply preservation in H as [Henv' Hty']; eauto.
+  intros st e st' e' Γ τ Henv Hty Hsteps.
+  revert Γ τ Henv Hty.
+  induction Hsteps; intros Γ τ Henv Hty.
+  - exists Γ. split; assumption.
+  - eapply preservation in H as [Γ' [Henv' Hty']]; eauto.
 Qed.
 
 (* ================================================================
@@ -180,19 +308,19 @@ Qed.
    manifestation of UAF / double-free.
    ================================================================ *)
 
-Theorem no_stuck : forall st e st' e' τ,
-  env_typed st.(st_env) empty ->
-  typed empty e τ ->
+Theorem no_stuck : forall st e st' e' Γ τ,
+  env_typed st.(st_env) Γ ->
+  typed Γ e τ ->
   steps st e st' e' ->
   is_value e' = true \/
   (exists v, st'.(st_returned) = Some v) \/
   (exists st'' e'', step st' e' st'' e'').
 Proof.
-  intros st e st' e' τ Henv Hty Hsteps.
-  destruct (steps_preservation _ _ _ _ _ Henv Hty Hsteps) as [Henv' Hty'].
+  intros st e st' e' Γ τ Henv Hty Hsteps.
+  destruct (steps_preservation _ _ _ _ _ _ Henv Hty Hsteps) as [Γ' [Henv' Hty']].
   destruct st'.(st_returned) as [v|] eqn:Hret.
   - right. left. exists v. reflexivity.
-  - destruct (progress _ _ _ Henv' Hty' Hret) as [Hval | Hstep].
+  - destruct (progress _ _ _ _ Henv' Hty' Hret) as [Hval | Hstep].
     + left. exact Hval.
     + right. right. exact Hstep.
 Qed.

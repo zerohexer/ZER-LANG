@@ -1274,6 +1274,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 ir_target_root_escapes(zc, target_expr)) {
                 ir_mark_local_escaped(ps, rhs_local);
             }
+            /* Phase E: target untrackable (variable-index array store,
+             * complex expression). Value escapes because we can't track
+             * through dynamic index. Mirrors zercheck.c:1460 pattern.
+             * Example: `handles[i] = mh` where i is a variable. */
+            if (target_expr && rhs_local >= 0 &&
+                target_expr->kind == NODE_INDEX &&
+                target_expr->index_expr.index &&
+                target_expr->index_expr.index->kind != NODE_INT_LIT) {
+                ir_mark_local_escaped(ps, rhs_local);
+            }
             /* Compound key registration: `container.field = h` */
             if (target_expr && rhs_local >= 0) {
                 IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
@@ -2572,6 +2582,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (bb->inst_count == 0) continue;
         IRInst *last = &bb->insts[bb->inst_count - 1];
         if (last->op != IR_RETURN) continue;
+        /* Phase E: skip orelse-fallback blocks — they're reached only
+         * when the optional was null, no allocation to leak. */
+        if (bb->is_orelse_fallback) continue;
 
         IRPathState *ps = &block_states[bi];
         for (int hi = 0; hi < ps->handle_count; hi++) {
@@ -2582,10 +2595,6 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 IRLocal *loc = &func->locals[h->local_id];
                 Type *lt = loc->type;
                 if (ir_should_track_move(lt)) continue;
-                if (lt) {
-                    Type *le = type_unwrap_distinct(lt);
-                    if (le && le->kind == TYPE_OPTIONAL) continue;
-                }
                 if (loc->is_temp) continue;
                 /* Phase E: params aren't "allocated" locals — auto-
                  * registration (via pool.free(param), @ptrcast(*T, param),

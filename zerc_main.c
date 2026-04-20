@@ -179,6 +179,32 @@ static bool parse_module(Compiler *cc, Module *m) {
     return true;
 }
 
+/* Phase F (2026-04-20): emitter IR hook COLLECTS each function's
+ * lowered IR for later zercheck_ir analysis. Single-pass hook can't
+ * build summaries for forward references (caller analyzed before
+ * callee). So we collect, then run iterative summary build + main
+ * analysis after emit completes, on the shared IRFuncs array.
+ *
+ * This avoids AST re-mutation: ir_lower_func is called once per
+ * function (by emitter). zercheck_ir reuses the SAME IRFunc pointer. */
+extern bool zercheck_ir(ZerCheck *zc_ir, void *ir_func);
+
+static void **zerc_ir_hook_funcs = NULL;
+static int zerc_ir_hook_count = 0;
+static int zerc_ir_hook_cap = 0;
+
+void zerc_ir_hook(void *ctx, void *ir_func) {
+    (void)ctx; /* Using static arrays since hook is called many times */
+    if (zerc_ir_hook_count >= zerc_ir_hook_cap) {
+        zerc_ir_hook_cap = zerc_ir_hook_cap < 16 ? 16 : zerc_ir_hook_cap * 2;
+        zerc_ir_hook_funcs = (void **)realloc(zerc_ir_hook_funcs,
+            zerc_ir_hook_cap * sizeof(void *));
+    }
+    if (zerc_ir_hook_funcs) {
+        zerc_ir_hook_funcs[zerc_ir_hook_count++] = ir_func;
+    }
+}
+
 /* ================================================================ */
 
 int main(int argc, char **argv) {
@@ -488,116 +514,42 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ZER-CHECK: path-sensitive handle + *opaque tracking */
-    {
-        ZerCheck zc;
-        zercheck_init(&zc, &checker, &cc.arena, input_path);
-        /* Feed imported module ASTs in topological order (dependencies first)
-         * for cross-module summary building. topo_order[0] is main module,
-         * rest are imports in dependency order. */
-        Node *import_asts[64];
-        int import_ast_count = 0;
-        for (int ti = 0; ti < topo_count && import_ast_count < 64; ti++) {
-            int mi = topo_order[ti];
-            if (mi != 0 && cc.modules[mi].ast)
-                import_asts[import_ast_count++] = cc.modules[mi].ast;
-        }
-        zc.import_asts = import_asts;
-        zc.import_ast_count = import_ast_count;
-        bool ast_ok = zercheck_run(&zc, main_mod->ast);
+    /* ZER-CHECK: path-sensitive handle + *opaque tracking (AST primary).
+     *
+     * Phase F (2026-04-20) architecture:
+     *   - zercheck.c (AST linear-scan) runs HERE, drives compile exit code.
+     *   - zercheck_ir.c (CFG) runs INSIDE the emitter via ir_hook — each
+     *     function's IR is analyzed RIGHT AFTER ir_lower_func, BEFORE
+     *     emit walks it. Single lowering per function (no AST re-mutation).
+     *   - Disagreements between the two logged as regression signals.
+     *
+     * Why the hook-based architecture: ir_lower_func destructively rewrites
+     * AST (pre_lower_orelse replaces NODE_ORELSE with NODE_IDENT). Calling
+     * ir_lower_func twice on the same AST corrupts emission (idents lose
+     * their mappings to re-generated locals). The hook ensures exactly one
+     * ir_lower_func call per function — emitter and zercheck_ir share IR.
+     *
+     * Opt-out: ZER_DUAL_RUN=0 disables zercheck_ir entirely. Otherwise
+     * runs unconditionally alongside every compile. */
+    Node *import_asts[64];
+    int import_ast_count = 0;
+    for (int ti = 0; ti < topo_count && import_ast_count < 64; ti++) {
+        int mi = topo_order[ti];
+        if (mi != 0 && cc.modules[mi].ast)
+            import_asts[import_ast_count++] = cc.modules[mi].ast;
+    }
 
-        /* Phase E: optional dual-run. Runs BEFORE ast_ok short-circuits
-         * so negative tests can be verified too. When ZER_DUAL_RUN=1 is
-         * set, also run zercheck_ir.c (CFG-based) on each function and
-         * log diagnostic-count disagreements to stderr.
-         *
-         * Parity semantics for negative tests:
-         *   - ast_err > 0 AND ir_err > 0  → both reject, no disagreement
-         *   - ast_err > 0 AND ir_err == 0 → zercheck_ir MISSED a case
-         *   - ast_err == 0 AND ir_err > 0 → zercheck_ir FALSE POSITIVE
-         *
-         * zercheck.c remains the source of truth for the compile's
-         * success/failure; zercheck_ir errors are comparison-only. */
-        extern bool zercheck_ir(ZerCheck *zc_ir, IRFunc *func);
-        const char *dual = getenv("ZER_DUAL_RUN");
-        if (dual && dual[0] != '\0' && dual[0] != '0') {
-            ZerCheck zc_ir;
-            zercheck_init(&zc_ir, &checker, &cc.arena, input_path);
-            zc_ir.import_asts = import_asts;
-            zc_ir.import_ast_count = import_ast_count;
-            int ir_func_count = 0;
-            int ir_error_count_start = zc_ir.error_count;
+    ZerCheck zc;
+    zercheck_init(&zc, &checker, &cc.arena, input_path);
+    zc.import_asts = import_asts;
+    zc.import_ast_count = import_ast_count;
+    bool ast_ok = zercheck_run(&zc, main_mod->ast);
 
-            /* Phase E: iterative FuncSummary build for mutual recursion
-             * convergence. Mirror of zercheck.c's 16-pass loop (GAP 2 fix,
-             * 2026-04-19). Each pass runs zercheck_ir in building_summary
-             * mode on every function; errors suppressed, summaries refined.
-             * Break when a pass makes no changes (summaries are stable). */
-            zc_ir.building_summary = true;
-            int summary_before = 0;
-            for (int pass = 0; pass < 16; pass++) {
-                int sc_before = zc_ir.summary_count;
-                for (int i = 0; i < main_mod->ast->file.decl_count; i++) {
-                    Node *decl = main_mod->ast->file.decls[i];
-                    if (decl->kind != NODE_FUNC_DECL) continue;
-                    if (!decl->func_decl.body) continue;
-                    IRFunc *ir = ir_lower_func(&cc.arena, &checker, decl);
-                    if (!ir) continue;
-                    ir->module_prefix = NULL;
-                    ir->module_prefix_len = 0;
-                    zercheck_ir(&zc_ir, ir);
-                }
-                /* Simple convergence check: summary_count stable means
-                 * no new summaries added. Refinement-within-summary is
-                 * handled by zercheck_ir itself returning true/false,
-                 * but we don't track that here — 16-pass ceiling is
-                 * sufficient for all realistic mutual-recursion chains. */
-                if (pass > 0 && zc_ir.summary_count == sc_before) break;
-                summary_before = sc_before;
-            }
-            zc_ir.building_summary = false;
-            (void)summary_before;
-
-            /* Main analysis pass — errors now enabled */
-            for (int i = 0; i < main_mod->ast->file.decl_count; i++) {
-                Node *decl = main_mod->ast->file.decls[i];
-                if (decl->kind != NODE_FUNC_DECL) continue;
-                if (!decl->func_decl.body) continue;
-                IRFunc *ir = ir_lower_func(&cc.arena, &checker, decl);
-                if (!ir) continue;
-                ir->module_prefix = NULL;
-                ir->module_prefix_len = 0;
-                zercheck_ir(&zc_ir, ir);
-                ir_func_count++;
-            }
-            int ast_err = zc.error_count;
-            int ir_err = zc_ir.error_count - ir_error_count_start;
-            /* Loose parity: for negative tests we don't require exact
-             * error counts — only that BOTH analyzers reject. Exact-count
-             * match required only when both agree on zero errors. */
-            bool agree;
-            if (ast_err == 0 && ir_err == 0) agree = true;
-            else if (ast_err > 0 && ir_err > 0) agree = true;
-            else agree = false;
-            if (!agree) {
-                fprintf(stderr,
-                    "zercheck DUAL-RUN disagreement in %s: ast=%d ir=%d "
-                    "(functions analyzed: %d)\n",
-                    input_path, ast_err, ir_err, ir_func_count);
-            } else if (dual[0] == '2') {
-                fprintf(stderr,
-                    "zercheck DUAL-RUN agree in %s: ast=%d ir=%d "
-                    "(functions analyzed: %d)\n",
-                    input_path, ast_err, ir_err, ir_func_count);
-            }
-        }
-
-        if (!ast_ok) {
-            fprintf(stderr, "error: zercheck failed\n");
-            free(cc.modules);
-            arena_free(&cc.arena);
-            return 1;
-        }
+    if (!ast_ok) {
+        fprintf(stderr, "error: zercheck failed\n");
+        free(cc.modules);
+        arena_free(&cc.arena);
+        return 1;
     }
 
     /* emit C */
@@ -616,6 +568,22 @@ int main(int argc, char **argv) {
      * Only disabled without explicit --track-cptrs when emitting C library (--lib). */
     emitter.track_cptrs = track_cptrs || do_run;
     emitter.source_file = input_path;
+
+    /* Phase F: zercheck_ir runs via ir_hook inside the emitter, on the
+     * SAME IR the emitter lowers. Single lowering per function — avoids
+     * AST re-mutation from pre_lower_orelse's destructive rewrite.
+     * See zerc_ir_hook() / zerc_ir_hook_state below. */
+    ZerCheck zc_ir;
+    zercheck_init(&zc_ir, &checker, &cc.arena, input_path);
+    zc_ir.import_asts = import_asts;
+    zc_ir.import_ast_count = import_ast_count;
+
+    const char *dual_env = getenv("ZER_DUAL_RUN");
+    bool dual_enabled = !(dual_env && dual_env[0] == '0');
+    if (dual_enabled) {
+        emitter.ir_hook_ctx = &zc_ir;
+        emitter.ir_hook = zerc_ir_hook;
+    }
 
     /* emit in topological order — dependencies first, main last.
      * When IR is active, emit ALL modules' structs+globals first,
@@ -640,6 +608,49 @@ int main(int argc, char **argv) {
     free(topo_order);
 
     fclose(out);
+
+    /* Phase F: now that emit has lowered all functions (single-pass,
+     * hook collected them), run iterative summary build + main analysis
+     * on the collected IRFuncs. Uses the SAME IR pointers — no re-
+     * lowering, no AST re-mutation. */
+    if (dual_enabled && zerc_ir_hook_count > 0) {
+        /* Iterative FuncSummary build for mutual recursion convergence. */
+        zc_ir.building_summary = true;
+        for (int pass = 0; pass < 16; pass++) {
+            int sc_before = zc_ir.summary_count;
+            for (int i = 0; i < zerc_ir_hook_count; i++) {
+                zercheck_ir(&zc_ir, zerc_ir_hook_funcs[i]);
+            }
+            if (pass > 0 && zc_ir.summary_count == sc_before) break;
+        }
+        zc_ir.building_summary = false;
+
+        /* Main analysis pass — errors now recorded */
+        for (int i = 0; i < zerc_ir_hook_count; i++) {
+            zercheck_ir(&zc_ir, zerc_ir_hook_funcs[i]);
+        }
+
+        /* Compare with AST analysis done at zercheck_run earlier. */
+        int ast_err = zc.error_count;
+        int ir_err = zc_ir.error_count;
+        bool agree = (ast_err == 0 && ir_err == 0) ||
+                     (ast_err > 0 && ir_err > 0);
+        if (!agree) {
+            fprintf(stderr,
+                "zercheck DUAL-RUN disagreement in %s: ast=%d ir=%d "
+                "(functions analyzed: %d)\n",
+                input_path, ast_err, ir_err, zerc_ir_hook_count);
+        } else if (dual_env && dual_env[0] == '2') {
+            fprintf(stderr,
+                "zercheck DUAL-RUN agree in %s: ast=%d ir=%d "
+                "(functions analyzed: %d)\n",
+                input_path, ast_err, ir_err, zerc_ir_hook_count);
+        }
+    }
+    free(zerc_ir_hook_funcs);
+    zerc_ir_hook_funcs = NULL;
+    zerc_ir_hook_count = 0;
+    zerc_ir_hook_cap = 0;
 
     if (emit_c) {
         printf("zerc: %s -> %s\n", input_path, output_path);

@@ -2239,7 +2239,23 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             /* Merge predecessor states */
             IRPathState merged;
             if (bb->pred_count == 0) {
-                ir_ps_init(&merged); /* entry block — empty state */
+                /* Phase E: dead-code-after-return blocks have no
+                 * predecessors (the preceding return terminated flow).
+                 * Inherit state from the previous block in IR order so
+                 * zercheck can catch use-after-move on statements that
+                 * come after a return. Matches AST linear-scan behavior.
+                 * Entry block (bi == 0) still gets empty state. */
+                if (bi > 0 && func->blocks[bi - 1].inst_count > 0) {
+                    IRInst *prev_last = &func->blocks[bi - 1].insts[
+                        func->blocks[bi - 1].inst_count - 1];
+                    if (prev_last->op == IR_RETURN) {
+                        merged = ir_ps_copy(&block_states[bi - 1]);
+                    } else {
+                        ir_ps_init(&merged);
+                    }
+                } else {
+                    ir_ps_init(&merged); /* entry block — empty state */
+                }
             } else {
                 IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));
                 for (int pi = 0; pi < bb->pred_count; pi++) {

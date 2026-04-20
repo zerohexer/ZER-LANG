@@ -1104,16 +1104,17 @@ Quick reminders for common IR work:
 - Phase C complete — FuncSummary, `*opaque` 9a/9b/9c, defer scanning
 - Phase D complete — alloc coloring, ThreadHandle join, ISR bans, ghost handle, arena chain.
   D2 (keep param) + D4 (deadlock) confirmed as checker.c domain, no zercheck_ir port needed.
-- **Phase E — dual-run CONVERGED (100% behavior parity achieved)**.
+- **Phase E — dual-run CONVERGED + VALIDATED (100% behavior parity)**.
   Wrapper lives in `zerc_main.c:~492` gated behind `ZER_DUAL_RUN=1` env var.
-  Runs BOTH analyzers, diffs diagnostic counts, logs disagreements to stderr.
-  Final sweep: **ZERO disagreements across 1110 tests** (down from 257 initial,
-  **100% reduction**). zercheck_ir.c output matches zercheck.c byte-for-byte
-  on every positive and negative test.
+  Runs BOTH analyzers, diffs diagnostic counts, logs disagreements.
+  Validation surface (2026-04-20): **3143 programs, zero disagreements**:
+  - 1110 standalone tests (tests/zer + rust_tests + zig_tests + tests/zer_fail)
+  - 28 multi-module tests (test_modules/)
+  - 2000 semantic fuzzer programs (10 seeds × 200 random programs each)
+  - 5 new stress tests combining 3+ features (defer + orelse + move + etc.)
 - **Phase F READY** — cutover + delete zercheck.c + tag v0.5.0 unblocked.
 
 **zercheck_ir.c is ~2900 lines, 100% behavior-parity with zercheck.c (2810 lines).**
-Both analyzers produce identical diagnostic counts on all 1110 dual-run tests.
 CFG infrastructure is the foundation for future analyses (dominator trees, VRP-on-SSA,
 borrow-checker-lite) that zercheck.c's linear-scan can't easily support.
 

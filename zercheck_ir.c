@@ -2609,15 +2609,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     }
 
     /* Phase E: alloc_id-grouped leak detection (union across return
-     * blocks). An alloc_id is "covered" if FREED/TRANSFERRED/escaped
-     * in ANY non-fallback return block. Mirrors zercheck.c linear-scan
-     * semantics.
-     *
-     * Limitation: doesn't catch mixed-path leaks (gen_uaf_003 style)
-     * where one branch frees+returns and the fall-through doesn't.
-     * Distinguishing "canonical" from "early-exit" returns requires
-     * dominator/postdominator analysis which is deferred to future
-     * Phase F work. */
+     * blocks). Mirrors zercheck.c linear-scan semantics. Documented
+     * limitation: doesn't catch gen_uaf_003 mixed-path leaks. */
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {

@@ -2490,16 +2490,18 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Phase E: alloc_id-grouped leak detection (mirrors zercheck.c 2631+).
-     * An alloc_id is "covered" if any handle with that alloc_id is
-     * FREED / TRANSFERRED / escaped in ANY return block. Only flag
-     * alloc_ids with no covering event anywhere. This correctly handles:
-     *   - Early-return from orelse fallback (other path frees properly)
-     *   - Alias chains where only the user-visible variable is freed
-     *   - Multiple return blocks with mixed free/escape behavior
+    /* Phase E: alloc_id-grouped leak detection (restoration of union
+     * semantics). An alloc_id is "covered" if any handle with that
+     * alloc_id is FREED / TRANSFERRED / escaped in ANY return block.
+     * Only flag alloc_ids with no covering event anywhere.
      *
-     * Per-block enumeration = zercheck.c final-state approach with a
-     * union across exit paths. */
+     * Mirrors zercheck.c linear-scan final-state: linear scan continues
+     * through early returns as if they didn't happen, so the state at
+     * function-end represents the union of "what happened on all paths".
+     *
+     * Limitation: doesn't catch mixed-path leaks where one return frees
+     * and another doesn't. Gen_uaf_003 style. Phase F task or documented
+     * tradeoff. */
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -2528,8 +2530,6 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Now flag uncovered ALIVE handles per return block, one error per
-     * alloc_id to avoid duplicates across multiple return blocks. */
     int *reported_ids = NULL;
     int reported_cap = 0, reported_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -2543,8 +2543,6 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             IRHandleInfo *h = &ps->handles[hi];
             if (h->escaped) continue;
             if (h->source_color == ZC_COLOR_ARENA) continue;
-            /* Filters: move struct stack values, Optional types, temps.
-             * See earlier comments for rationale. */
             if (h->local_id >= 0 && h->local_id < func->local_count) {
                 IRLocal *loc = &func->locals[h->local_id];
                 Type *lt = loc->type;
@@ -2557,7 +2555,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (h->path_len > 0) continue;  /* compound — skip */
 
-            /* Skip if alloc_id is covered somewhere */
+            /* Skip if alloc_id covered somewhere */
             bool covered = false;
             for (int ci = 0; ci < covered_n; ci++) {
                 if (covered_ids[ci] == h->alloc_id) { covered = true; break; }
@@ -2610,7 +2608,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     free(used_locals);
 
     /* Phase E: ThreadHandle join check. At each return block, any
-     * unjoined ThreadHandle is a leak. Track reported names to dedup. */
+     * unjoined ThreadHandle is a leak. Track reported names to dedup.
+     * Skip orelse-fallback blocks (thread wasn't spawned on null path). */
     const char **reported_names = NULL;
     uint32_t *reported_name_lens = NULL;
     int rn_cap = 0, rn_count = 0;
@@ -2619,6 +2618,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (bb->inst_count == 0) continue;
         IRInst *last = &bb->insts[bb->inst_count - 1];
         if (last->op != IR_RETURN) continue;
+        if (bb->is_orelse_fallback) continue;
         IRPathState *ps = &block_states[bi];
         for (int ti = 0; ti < ps->thread_count; ti++) {
             IRThreadTrack *t = &ps->threads[ti];

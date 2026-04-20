@@ -1107,16 +1107,19 @@ Quick reminders for common IR work:
 - **Phase E — dual-run NEAR CONVERGENCE**. Wrapper lives in `zerc_main.c:~492`
   gated behind `ZER_DUAL_RUN=1` env var. Runs BOTH analyzers, diffs diagnostic
   counts, logs disagreements to stderr. Does not fail compilation (zercheck.c
-  is source of truth for exit code). Current sweep: **5 disagreements across
-  1110 tests** (0 positive false positives + 5 negative misses). Down from 257
-  initial (**~98% reduction**). Remaining are all AST-only catches (IR misses):
-  CFG goto-loop MAYBE_FREED widening, array-element move tracking,
-  dead-code-after-return, mixed-path leak, scope escape via orelse fallback.
+  is source of truth for exit code). Current sweep: **2 disagreements across
+  1110 tests** (0 positive false positives + 2 negative misses). Down from 257
+  initial (**~99.2% reduction**). Remaining are both AST-only catches requiring
+  dominator-analysis infrastructure: CFG goto-loop MAYBE_FREED widening
+  (tests/zer_fail/goto_maybe_freed_branch.zer) and mixed-path leak
+  (rust_tests/gen_uaf_003.zer).
 - Phase F pending — cutover + delete zercheck.c + tag v0.5.0
 
-**zercheck_ir.c is ~2800 lines, ~99.5% behavior-parity with zercheck.c (2810 lines).**
+**zercheck_ir.c is ~2850 lines, ~99.8% behavior-parity with zercheck.c (2810 lines).**
 100% feature-parity at the opcode level (all instruction kinds handled); the
-~0.5% gap is subtle CFG vs linear-scan semantic edge cases.
+~0.2% gap is CFG vs linear-scan semantic edge cases that zercheck.c captures
+via final-state-at-function-exit but CFG sees as multiple independent
+return blocks. Fixing requires dominator/postdominator analysis — deferred.
 
 **Run dual-run yourself:** `ZER_DUAL_RUN=1 ./zerc FILE.zer -o /dev/null`.
 Use `ZER_DUAL_RUN=2` to also log agreements (helpful when debugging).

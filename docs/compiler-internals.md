@@ -5414,7 +5414,7 @@ if inst->expr is NODE_SPAWN:
 ps->critical_depth++/-- (preserved across ir_ps_copy)
 ```
 
-### Phase E 2026-04-20 session — 257 → 5 disagreements (~98% reduction)
+### Phase E 2026-04-20 session — 257 → 2 disagreements (~99.2% reduction)
 
 Late-session sweep landed 11 targeted improvements dropping disagreements
 from 108 to 8. Each fix below cites the commit that landed it.
@@ -5483,30 +5483,50 @@ from 108 to 8. Each fix below cites the commit that landed it.
      `handles[i] = mh` where i is variable → mh escaped (can't track
      through dynamic index). Fixes gen_null_002 + rt_handle_array_alloc.
 
-### Remaining 5 disagreements — categories (2026-04-20)
+### Additional late-session fixes (3 more disagreements closed, 5 → 2)
+
+- `b7f52aa` — Move struct from array element: `Token copy = arr[0]`
+  where Token is a move struct registers compound key `(arr, "[0]")`
+  as TRANSFERRED. Subsequent `arr[0].kind` access triggers UAF via
+  compound-key lookup in the UAF walker. Only handles literal indices.
+- `eedae4f` — Dead-code-after-return state inheritance: when a block
+  has no predecessors (unreachable) and the PREVIOUS block in IR
+  order ended with RETURN, inherit the previous block's state. This
+  matches AST linear-scan that processes all statements in order,
+  catching use-after-move on code written after a return.
+- `2bf8619` — Treat pointer-returning calls as allocations: any
+  function (not just extern) returning *T / ?*T / *opaque / ?*opaque
+  registers its dest as ALIVE. Mirrors zercheck.c:786-808 heuristic.
+  Skips if dest already tracked. Catches rt_scope_escape_orelse's
+  `*Sensor s = fallback_local()` scope-escape leak.
+
+### Remaining 2 disagreements — categories (2026-04-20)
 
 **Positive (0)** — zero false positives on valid code.
 
-**Negative (5)** — AST catches, IR misses:
-- `tests/zer_fail/goto_maybe_freed_branch.zer` — goto-loop MAYBE_FREED
-  widening. zercheck.c's same-block iteration catches backward-goto
-  UAF via 2-pass re-walk; IR CFG fixed-point converges too quickly.
-- `tests/zer_fail/move_array_elem.zer` — move struct from array
-  element (`Token copy = arr[0]`). Array element isn't tracked as a
-  distinct compound entity per-index.
-- `rust_tests/gen_uaf_003.zer` — mixed-path leak where IR's union
-  semantics (alloc_id covered by ANY return block) can't catch paths
-  that don't free. AST linear-scan catches via single final state.
-- `rust_tests/rt_move_struct_return_then_use.zer` — dead code after
-  return (documented limitation — zercheck_ir doesn't analyze
-  statements after a RETURN terminator, AST does linear scan).
-- `rust_tests/rt_scope_escape_orelse.zer` — `return s` where s came
-  from `ms orelse return` — scope escape detection inside orelse
-  fallback with bare `return`.
+**Negative (2)** — AST catches, IR misses (require dominator-analysis
+infrastructure beyond current scope):
+- `tests/zer_fail/goto_maybe_freed_branch.zer` — backward goto loop
+  with conditional free widens to MAYBE_FREED at function exit.
+  Flagging MAYBE_FREED is safe in isolation but produces false
+  positives on switch-all-arms-free patterns due to CFG lowering
+  emitting a "fallthrough" edge for non-default switches that
+  corresponds to an unreachable path. Fixing requires enum-
+  exhaustive switch recognition in IR lowering OR dominator-based
+  merge refinement to recognize unreachable predecessors.
+- `rust_tests/gen_uaf_003.zer` — mixed-path leak: `if (cond) { free;
+  return; }` early-exits after free, fall-through `use(h); return val`
+  leaks. Union leak semantics consider alloc_id "covered" when any
+  return block frees it. Detecting the fall-through-specific leak
+  requires distinguishing early-exit returns from canonical exits —
+  single-pred-BRANCH heuristic was too broad (50+ false positives).
+  Fixing requires post-dominator analysis.
 
-These are all CFG-analysis gaps where zercheck.c's linear-scan
-semantics naturally handle patterns that require additional CFG
-analysis infrastructure.
+Both are CFG-vs-linear-scan semantic differences. zercheck.c's linear
+scan uses a single PathState representing "synthesized happy path
+state at function exit". CFG sees multiple independent return blocks
+and cannot easily construct the synthesized state without postdominator
+analysis.
 
 ### Convergence criterion for Phase F entry
 

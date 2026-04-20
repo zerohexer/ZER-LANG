@@ -85,6 +85,16 @@ typedef struct {
     int condvar_type_count;
     int condvar_type_capacity;
 
+    /* Phase F (2026-04-20): IR analysis hook. When set, the emitter calls
+     * this function on every IRFunc it lowers, BEFORE emitting C. Used to
+     * run zercheck_ir on the lowered IR without double-lowering (which
+     * corrupts AST state via pre_lower_orelse's destructive rewrite).
+     *
+     * func argument is actually IRFunc* but typed as void* to avoid
+     * forcing ir.h into emitter.h's include chain. */
+    void (*ir_hook)(void *ctx, void *ir_func);
+    void *ir_hook_ctx;
+
 } Emitter;
 
 /* ---- API ---- */

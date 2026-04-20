@@ -3478,6 +3478,12 @@ static void emit_func_decl(Emitter *e, Node *node) {
                     node->loc.line);
             abort();
         }
+        /* Phase F: run IR analysis hook (zercheck_ir) on the lowered IR
+         * BEFORE emitting C. Single ir_lower_func call per function avoids
+         * AST re-mutation from pre_lower_orelse's destructive rewrite. */
+        if (e->ir_hook) {
+            e->ir_hook(e->ir_hook_ctx, ir);
+        }
         emit_func_from_ir(e, ir);
         return;
     }

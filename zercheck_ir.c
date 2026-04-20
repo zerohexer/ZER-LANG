@@ -1339,6 +1339,37 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 break;
             }
 
+            /* Phase E: move struct from array element — `Token copy = arr[0]`
+             * where arr is Token[N] and Token is a move struct transfers
+             * ownership from arr[0]. Register compound handle (arr, "[0]")
+             * as TRANSFERRED; subsequent access to arr[0] triggers UAF.
+             * Only handles literal-index (NODE_INT_LIT) compound keys. */
+            if (rhs && rhs->kind == NODE_INDEX &&
+                inst->dest_local >= 0 &&
+                inst->dest_local < func->local_count &&
+                ir_should_track_move(func->locals[inst->dest_local].type)) {
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, rhs,
+                                             &root_local, &path, &path_len) == 0 &&
+                    path_len > 0) {
+                    IRHandleInfo *ch = ir_find_compound_handle(ps, root_local,
+                                                                path, path_len);
+                    if (ch && ch->state == IR_HS_TRANSFERRED) {
+                        ir_zc_error(zc, inst->source_line,
+                            "use after move: '%.*s' ownership transferred at line %d",
+                            (int)path_len, path, ch->free_line);
+                    }
+                    if (!ch) ch = ir_add_compound_handle(ps, root_local,
+                                                          path, path_len);
+                    if (ch) {
+                        ch->state = IR_HS_TRANSFERRED;
+                        ch->free_line = inst->source_line;
+                    }
+                }
+            }
+
             /* Phase E: @ptrcast alias tracking. `*opaque raw = @ptrcast(*opaque, s)`
              * creates an alias: raw should share alloc_id with s. When s is
              * freed, raw becomes FREED via ir_propagate_alias_state. The

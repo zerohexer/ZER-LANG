@@ -5,6 +5,16 @@
 `BUGS-FIXED.md` and `docs/compiler-internals.md` "ir_validate hardening"
 section.
 
+> **Deviations from the original ultraplan** (preserved here for honesty):
+> 1. The status header block immediately above was added when saving this
+>    file; it was not in the original ultraplan output.
+> 2. In the "Context" section below, the original ultraplan referenced
+>    Phase 2 as commit `5f3fa0d`. That hash does not exist in our git
+>    history — the real Phase 2 commit is `014f8c8`. Corrected below.
+>
+> All other content is verbatim from the ultraplan approved at
+> https://claude.ai/code/session_01QsnuDVCPQGp1z4bGj52eAw.
+
 ## Context
 
 Phase 1 (per-op field invariants for 11 ops + reachability diagnostic) and Phase 2

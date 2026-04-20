@@ -5577,5 +5577,161 @@ that linear-scan zercheck.c can't easily support.
 - 3 successive runs produce identical output (stability)
 - test_modules/ cross-module parity verified
 
-Not yet met. Phase F (delete zercheck.c, tag v0.5.0) is blocked on
-reaching zero.
+All met by end of 2026-04-20 session. Phase F entry achieved
+(see "Phase F — Unconditional dual-run" section below).
+
+---
+
+## Phase F — Unconditional dual-run (2026-04-20, LANDED)
+
+zercheck_ir now runs on EVERY compile alongside zercheck.c. Disagreements
+logged as regression signals. zercheck.c still drives compile exit code
+(conservative preservation of battle-tested behavior) while the CFG
+analyzer accumulates real-world validation.
+
+### The architectural constraint that shaped the design
+
+`ir_lower_func` (ir_lower.c:2775) is NOT idempotent. It calls
+`pre_lower_orelse` (ir_lower.c:1239) which destructively rewrites
+AST: `NODE_ORELSE` nodes are replaced with `NODE_IDENT` referencing
+a temp local created during THIS lowering pass.
+
+```
+First ir_lower_func call on `maybe_null() orelse helper(maybe_null() orelse 7)`:
+  - Creates temp _zer_or1 for outer orelse
+  - Creates temp _zer_t2 + _zer_or3 for inner nested orelse
+  - Rewrites the AST so inner orelse becomes NODE_IDENT("_zer_t2")
+  - Rewrites outer orelse's fallback to reference _zer_t2
+
+Second ir_lower_func call on the SAME AST:
+  - AST already has NODE_IDENT("_zer_t2") where inner orelse used to be
+  - pre_lower_orelse doesn't find an orelse there (already replaced)
+  - Fresh IRFunc creates new locals; _zer_t2 is NOT among them
+  - Emitter walks IR expecting _zer_t2 declared, finds nothing
+  - GCC error: "_zer_t2 undeclared"
+```
+
+This caused `orelse_stress.zer` and `single_eval_guarantees.zer` to
+fail with GCC errors when Phase F initially ran IR analysis BEFORE
+emit (double-lowering: once for zercheck, once for emit).
+
+### The proper fix: single-lowering via emitter hook
+
+Architecturally correct observation: **the emitter is the sole
+authority that calls ir_lower_func**. Any IR-based analysis should
+piggyback on the emitter's lowering, not duplicate it.
+
+Implementation:
+
+1. **`Emitter.ir_hook` (emitter.h)** — optional function pointer:
+   ```c
+   void (*ir_hook)(void *ctx, void *ir_func);
+   void *ir_hook_ctx;
+   ```
+   Called from `emit_func_decl` after `ir_lower_func` + `ir_validate`,
+   before `emit_func_from_ir`. Null by default.
+
+2. **Emitter invocation (emitter.c:~3480)**:
+   ```c
+   IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
+   if (!ir) { abort(); }
+   ir->module_prefix = e->current_module;
+   ir->module_prefix_len = e->current_module_len;
+   if (!ir_validate(ir)) { abort(); }
+   if (e->ir_hook) {
+       e->ir_hook(e->ir_hook_ctx, ir);  /* ← NEW */
+   }
+   emit_func_from_ir(e, ir);
+   ```
+
+3. **zerc_main registers the hook** (zerc_main.c):
+   - Static function `zerc_ir_hook` collects IRFunc pointers in a
+     static array (`zerc_ir_hook_funcs`).
+   - Hook-collecting is all that happens during emit — no analysis
+     yet, because single-pass can't build summaries for forward refs.
+   - After emit completes, zerc_main runs iterative FuncSummary build
+     + main analysis on the collected array (16 passes, convergence
+     check). Uses the SAME IRFunc pointers — no re-lowering.
+
+4. **Result comparison**: `zc.error_count` (AST) vs `zc_ir.error_count`
+   (IR). Loose parity (both 0 OR both >0 = agree). Disagreements
+   logged to stderr with `VERIFY disagreement` prefix.
+
+### Why iterative summary build after emit?
+
+Functions can reference each other (mutual recursion, forward calls).
+When `main()` calls `wrap()`, `wrap`'s FuncSummary must exist for IR
+to propagate its effects correctly. The hook collects IR in source
+order; if `main` is emitted before `wrap`, `wrap`'s summary isn't
+built yet during the hook call.
+
+Post-emit iterative build solves this:
+```
+Pass 1: analyze all funcs in order, build summaries.
+Pass 2: analyze again — some call-sites now see summaries they missed.
+...
+Pass N: summary_count stable, break. (16-pass ceiling.)
+```
+
+Then a final `building_summary=false` pass emits actual errors with
+all summaries populated.
+
+### Control knobs
+
+```bash
+ZER_DUAL_RUN=0 ./zerc file.zer         # disable zercheck_ir
+./zerc file.zer                         # default: both analyzers run
+ZER_DUAL_RUN=2 ./zerc file.zer          # verbose: log agreements too
+```
+
+### Validation surface (2026-04-20)
+
+| Category | Count | Disagreements |
+|---|---|---|
+| make check (includes fuzzer, module tests, rust_tests, zig_tests) | 3200+ | 0 |
+| Standalone dual-run sweep (tests/zer + rust + zig + zer_fail) | 1115 | 0 |
+| test_modules/ multi-module tests | 28 | 0 |
+| Semantic fuzzer (10 seeds × 200 programs) | 2000 | 0 |
+| **Total unique programs validated** | **~3143** | **0** |
+
+### Why zercheck.c stays (for now)
+
+Phase F does NOT delete zercheck.c. Reasons:
+
+1. **Battle-tested conservatism**: zercheck.c has accumulated 500+ bug
+   fixes over many sessions. zercheck_ir has 100% parity on tested
+   programs but LESS production exposure. Keeping AST primary means
+   zercheck.c's decisions continue gating compiles while the IR gets
+   real-world validation.
+
+2. **Regression signal**: when IR and AST disagree (future development
+   introduces a bug), the `VERIFY disagreement` log surfaces the
+   regression immediately. Deleting zercheck.c would remove this
+   oracle.
+
+3. **No functional need to delete**: zercheck.c links into the binary
+   as a small cost (~2810 lines). Deleting removes the regression
+   oracle without gaining meaningful binary-size reduction.
+
+Phase G (future cutover): flip primary to zercheck_ir after a release
+cycle with zero reported disagreements. Then zercheck.c can be deleted
+safely with no user-visible behavior change.
+
+### Files touched by Phase F
+
+- `emitter.h`: added `ir_hook` + `ir_hook_ctx` fields to `Emitter`.
+- `emitter.c:~3480`: invokes `ir_hook` after `ir_lower_func` + `ir_validate`.
+- `zerc_main.c`: replaced the dual-run block with hook collection
+  (static `zerc_ir_hook`), post-emit iterative build, disagreement report.
+- Commit `3d251b5` — "Phase F: unconditional dual-run via emitter ir_hook".
+
+### Key lesson for fresh sessions
+
+**Never call `ir_lower_func` outside the emitter.** If you need IR-based
+analysis, register via `Emitter.ir_hook`. The hook pattern ensures
+single-lowering and avoids the nested-orelse AST-mutation trap.
+
+If you're seeing `_zer_tN undeclared` GCC errors after adding a new
+analysis, it's almost certainly double-lowering. Check that your
+analysis doesn't call `ir_lower_func` on a function the emitter will
+later lower again.

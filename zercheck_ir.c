@@ -2728,13 +2728,31 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
+            } else if (h->state == IR_HS_MAYBE_FREED) {
+                /* Phase E: MAYBE_FREED at non-fallback non-early-exit
+                 * return block. With exhaustive switch fix (elide
+                 * unreachable fallthrough) and is_early_exit tagging,
+                 * spurious MAYBE_FREED from CFG merge conservatism is
+                 * eliminated. Remaining MAYBE_FREED is genuine —
+                 * handle freed on some paths but not all, like:
+                 *   goto-loop with conditional free → MAYBE_FREED
+                 *   after fixed-point.
+                 * Matches zercheck.c:2700 "may not be freed on all paths". */
+                ir_zc_error(zc, last->source_line,
+                    "handle '%.*s' may not be freed on all paths — "
+                    "ensure all branches free the handle or add 'defer' "
+                    "for automatic cleanup",
+                    (int)func->locals[h->local_id].name_len,
+                    func->locals[h->local_id].name);
+                if (reported_n >= reported_cap) {
+                    reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                    int *nr = (int *)realloc(reported_ids,
+                        reported_cap * sizeof(int));
+                    if (nr) reported_ids = nr;
+                }
+                if (reported_n < reported_cap)
+                    reported_ids[reported_n++] = h->alloc_id;
             }
-            /* MAYBE_FREED not flagged at return blocks: CFG merge
-             * conservatism in switch/if produces MAYBE_FREED even when
-             * all arms free (e.g., switch all-arms-free). Matching
-             * zercheck.c's behavior here would require dominator-based
-             * merge refinement. Goto-loop MAYBE_FREED widening
-             * (goto_maybe_freed_branch) is documented limitation. */
         }
     }
     free(covered_ids);

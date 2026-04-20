@@ -2188,14 +2188,43 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         int bb_exit = ir_add_block(ctx->func, ctx->arena);
 
+        /* Phase E: detect enum-exhaustive switches (no default arm).
+         * The checker enforces all enum variants be covered when there's
+         * no default — so the last arm's "condition false" case is
+         * unreachable at runtime. If we emit it as BRANCH anyway, the
+         * CFG merge at bb_exit gets a spurious predecessor carrying
+         * pre-switch state, causing MAYBE_FREED false positives when
+         * arms free a handle (rt_borrowck_switch_all_free pattern).
+         *
+         * For enum-exhaustive switches, emit the last arm's entry as
+         * an unconditional GOTO bb_arm (no comparison). The condition
+         * is always true for the remaining variant, so skipping the
+         * check is semantically equivalent. */
+        bool has_default = false;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            if (node->switch_stmt.arms[i].is_default) {
+                has_default = true; break;
+            }
+        }
+        bool is_exhaustive_enum = is_enum && !has_default &&
+                                  node->switch_stmt.arm_count > 0;
+
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
             int bb_arm = ir_add_block(ctx->func, ctx->arena);
             int bb_next = (i + 1 < node->switch_stmt.arm_count) ?
                           ir_add_block(ctx->func, ctx->arena) : bb_exit;
+            bool is_last_arm = (i + 1 == node->switch_stmt.arm_count);
+            bool elide_compare = (is_exhaustive_enum && is_last_arm &&
+                                  !arm->is_default);
 
             if (arm->is_default) {
                 ensure_terminated(ctx, bb_arm);
+            } else if (elide_compare) {
+                /* Unconditional entry — last arm of exhaustive enum */
+                IRInst go = make_inst(IR_GOTO, node->loc.line);
+                go.goto_block = bb_arm;
+                emit_inst(ctx, go);
             } else {
                 /* Build per-arm comparison: OR of equality checks */
                 Node *cmp = NULL;

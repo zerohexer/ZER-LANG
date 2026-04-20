@@ -2608,21 +2608,16 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Phase E: alloc_id-grouped leak detection. An alloc_id is "covered"
-     * if any handle with that alloc_id is FREED/TRANSFERRED/escaped in
-     * ANY non-fallback return block.
+    /* Phase E: alloc_id-grouped leak detection (union across return
+     * blocks). An alloc_id is "covered" if FREED/TRANSFERRED/escaped
+     * in ANY non-fallback return block. Mirrors zercheck.c linear-scan
+     * semantics.
      *
-     * Mirrors zercheck.c linear-scan final-state semantics: linear scan
-     * continues past early returns, so the state at function-end
-     * represents the union of "what happened on all paths".
-     *
-     * Known limitation: doesn't catch mixed-path leaks where one
-     * early-exit frees and the fall-through path doesn't. Pattern:
-     *   if (cond) { free(h); return; }    // early exit frees
-     *   use(h); return val;               // fall-through leaks
-     * AST catches this via block_always_exits recognizing if-then as
-     * "take not-taken branch". CFG would need to distinguish early
-     * exits from canonical returns — heuristic was too aggressive. */
+     * Limitation: doesn't catch mixed-path leaks (gen_uaf_003 style)
+     * where one branch frees+returns and the fall-through doesn't.
+     * Distinguishing "canonical" from "early-exit" returns requires
+     * dominator/postdominator analysis which is deferred to future
+     * Phase F work. */
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -2659,8 +2654,6 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (bb->inst_count == 0) continue;
         IRInst *last = &bb->insts[bb->inst_count - 1];
         if (last->op != IR_RETURN) continue;
-        /* Phase E: skip orelse-fallback blocks — they're reached only
-         * when the optional was null, no allocation to leak. */
         if (bb->is_orelse_fallback) continue;
 
         IRPathState *ps = &block_states[bi];
@@ -2673,12 +2666,6 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 Type *lt = loc->type;
                 if (ir_should_track_move(lt)) continue;
                 if (loc->is_temp) continue;
-                /* Phase E: params aren't "allocated" locals — auto-
-                 * registration (via pool.free(param), @ptrcast(*T, param),
-                 * extern free(param)) creates handle entries used for
-                 * FuncSummary building, but the param itself isn't a
-                 * local allocation that leaks. Summary captures whether
-                 * the callee frees it; callers get the frees_param flag. */
                 if (loc->is_param) continue;
             }
             if (h->path_len > 0) continue;  /* compound — skip */

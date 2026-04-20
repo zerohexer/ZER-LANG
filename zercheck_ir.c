@@ -2716,6 +2716,12 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
             }
+            /* MAYBE_FREED not flagged at return blocks: CFG merge
+             * conservatism in switch/if produces MAYBE_FREED even when
+             * all arms free (e.g., switch all-arms-free). Matching
+             * zercheck.c's behavior here would require dominator-based
+             * merge refinement. Goto-loop MAYBE_FREED widening
+             * (goto_maybe_freed_branch) is documented limitation. */
         }
     }
     free(covered_ids);

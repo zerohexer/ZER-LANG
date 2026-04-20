@@ -1794,19 +1794,97 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Save defer count so if-scoped defers fire at block exit */
         int then_defer_base = ctx->defer_count;
         ctx->block_defers_managed++;  /* if-body block: we manage */
+        int then_start_bi = bb_then;
+        int then_start_block_count = ctx->func->block_count;
         lower_stmt(ctx, node->if_stmt.then_body);
         emit_defer_fire_scoped(ctx, then_defer_base, true, node->loc.line);
         ctx->defer_count = then_defer_base;
+
+        /* Phase E: detect if the then-body "always exits" — its final
+         * block ends with RETURN/BREAK/CONTINUE (not a normal fall-
+         * through to bb_join). If so, tag all blocks in the then-body
+         * range [then_start_bi, ctx->current_block] as is_early_exit.
+         * This mirrors zercheck.c's block_always_exits semantic: these
+         * blocks shouldn't provide leak-coverage to non-early-exit
+         * returns — they're conditional bypass paths that don't
+         * contribute to the canonical function-exit state.
+         *
+         * Check BEFORE ensure_terminated (which would add GOTO to
+         * bb_join for non-terminated blocks).
+         *
+         * Side note: we don't rely on was_terminated because the
+         * then-body may have created intermediate blocks via nested
+         * control flow; only the current block's terminator matters. */
+        bool then_always_exits = false;
+        {
+            IRBlock *cb = &ctx->func->blocks[ctx->current_block];
+            if (cb->inst_count > 0) {
+                IRInst *last = &cb->insts[cb->inst_count - 1];
+                /* RETURN always exits. GOTO to bb_join is NOT an exit
+                 * (that's normal fall-through). GOTO to loop_exit/
+                 * loop_continue/label is an exit. BREAK/CONTINUE via
+                 * GOTO have goto_block != bb_join. */
+                if (last->op == IR_RETURN) {
+                    then_always_exits = true;
+                } else if (last->op == IR_GOTO &&
+                           last->goto_block != bb_join) {
+                    then_always_exits = true;
+                }
+            }
+        }
+        /* Only tag if-without-capture (regular if). If-unwrap (with
+         * capture) has special alias semantics: when the capture is
+         * freed in the early-exit body, the original allocation's
+         * alloc_id should be considered "escaped" on the fall-through
+         * path too. Excluding the early-exit from coverage would
+         * incorrectly flag such patterns as leaks. Union coverage
+         * correctly handles if-unwrap early-exits via alias
+         * propagation to the canonical return's state. */
+        if (then_always_exits && !has_capture) {
+            /* Tag blocks created during then-body lowering plus bb_then.
+             * Skip bb_join — that's the canonical fall-through target. */
+            for (int bi = then_start_bi; bi < ctx->func->block_count; bi++) {
+                if (bi == bb_join) continue;
+                if (!ctx->func->blocks[bi].is_early_exit)
+                    ctx->func->blocks[bi].is_early_exit = true;
+            }
+            (void)then_start_block_count;
+        }
+
         ensure_terminated(ctx, bb_join);
 
         /* Else block */
+        int else_start_bi = -1;
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
+            else_start_bi = bb_else;
             int else_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* else-body block: we manage */
             lower_stmt(ctx, node->if_stmt.else_body);
             emit_defer_fire_scoped(ctx, else_defer_base, true, node->loc.line);
             ctx->defer_count = else_defer_base;
+
+            /* Phase E: same tagging for else-body if it always exits. */
+            bool else_always_exits = false;
+            IRBlock *cb = &ctx->func->blocks[ctx->current_block];
+            if (cb->inst_count > 0) {
+                IRInst *last = &cb->insts[cb->inst_count - 1];
+                if (last->op == IR_RETURN) {
+                    else_always_exits = true;
+                } else if (last->op == IR_GOTO &&
+                           last->goto_block != bb_join) {
+                    else_always_exits = true;
+                }
+            }
+            if (else_always_exits) {
+                for (int bi = else_start_bi; bi < ctx->func->block_count; bi++) {
+                    /* Don't tag bb_join if we accidentally reach it */
+                    if (bi == bb_join) continue;
+                    if (!ctx->func->blocks[bi].is_early_exit)
+                        ctx->func->blocks[bi].is_early_exit = true;
+                }
+            }
+
             ensure_terminated(ctx, bb_join);
         }
 

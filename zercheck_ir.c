@@ -173,6 +173,10 @@ static IRThreadTrack *ir_add_thread(IRPathState *ps, const char *name,
     return t;
 }
 
+/* Forward declarations for functions used out-of-order */
+static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
+                                      IRHandleState new_state, int line);
+
 /* Bare-local lookup: matches only entries with path_len == 0.
  * Phase B3: compound entries (path != NULL) with the same local_id are NOT
  * returned here — they represent different entities (e.g. `s` vs `s.handle`). */
@@ -887,6 +891,11 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                       h->state == IR_HS_MAYBE_FREED)) {
                 h->state = IR_HS_FREED;
                 h->free_line = defer_line;
+                /* Phase E: propagate to aliases sharing alloc_id.
+                 * Without this, `Handle h = mh orelse return; defer free(h);`
+                 * only marks h FREED, leaving mh (the ?Handle alias with
+                 * same alloc_id) as ALIVE at function exit → false leak. */
+                ir_propagate_alias_state(ps, h, IR_HS_FREED, defer_line);
             }
         }
     }
@@ -2608,9 +2617,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Phase E: alloc_id-grouped leak detection (union across return
-     * blocks). Mirrors zercheck.c linear-scan semantics. Documented
-     * limitation: doesn't catch gen_uaf_003 mixed-path leaks. */
+    /* Phase E: alloc_id-grouped leak detection with early-exit skip.
+     *
+     * Coverage collection: iterate all RETURN blocks, collect alloc_ids
+     * that are freed/transferred/escaped. Skip:
+     *   - orelse-fallback (optional was null, nothing to leak)
+     *   - early-exit (if-then-always-exits path, bypasses canonical flow)
+     *
+     * Mirrors zercheck.c's block_always_exits semantic. */
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -2618,6 +2632,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (bb->inst_count == 0) continue;
         if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
         if (bb->is_orelse_fallback) continue;
+        if (bb->is_early_exit) continue;
         IRPathState *ps2 = &block_states[bi];
         for (int hi = 0; hi < ps2->handle_count; hi++) {
             IRHandleInfo *h = &ps2->handles[hi];
@@ -2648,6 +2663,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         IRInst *last = &bb->insts[bb->inst_count - 1];
         if (last->op != IR_RETURN) continue;
         if (bb->is_orelse_fallback) continue;
+        /* Phase E: skip early-exit blocks for leak checking too —
+         * they represent conditional bypass paths whose state isn't
+         * canonical. The fall-through return holds the authoritative
+         * leak state. */
+        if (bb->is_early_exit) continue;
 
         IRPathState *ps = &block_states[bi];
         for (int hi = 0; hi < ps->handle_count; hi++) {

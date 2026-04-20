@@ -1332,7 +1332,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             /* Phase E: @ptrcast alias tracking. `*opaque raw = @ptrcast(*opaque, s)`
              * creates an alias: raw should share alloc_id with s. When s is
              * freed, raw becomes FREED via ir_propagate_alias_state. The
-             * type arg is stored in type_arg, not args — args[0] is the src. */
+             * type arg is stored in type_arg, not args — args[0] is the src.
+             *
+             * Auto-register param source (marked escaped=true so the handle
+             * entries don't flag as leaks, but FuncSummary observes FREED
+             * state if free_ptr is later called on an alias). Needed to
+             * propagate cross-function `destroy_cat(opaque)` patterns where
+             * the opaque param is ptrcast then freed. */
             if (rhs && rhs->kind == NODE_INTRINSIC &&
                 rhs->intrinsic.name && rhs->intrinsic.name_len == 7 &&
                 memcmp(rhs->intrinsic.name, "ptrcast", 7) == 0 &&
@@ -1343,6 +1349,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         src->ident.name, (uint32_t)src->ident.name_len);
                     if (src_local >= 0) {
                         IRHandleInfo *src_h = ir_find_handle(ps, src_local);
+                        if (!src_h && src_local < func->local_count &&
+                            func->locals[src_local].is_param) {
+                            src_h = ir_add_handle(ps, src_local);
+                            if (src_h) {
+                                src_h->state = IR_HS_ALIVE;
+                                src_h->alloc_line = inst->source_line;
+                                src_h->alloc_id = _ir_next_alloc_id++;
+                                src_h->source_color = ZC_COLOR_UNKNOWN;
+                                src_h->escaped = true;  /* external input */
+                            }
+                        }
                         if (src_h) {
                             IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                             if (dst_h) {
@@ -1350,6 +1367,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 dst_h->alloc_line = src_h->alloc_line;
                                 dst_h->alloc_id = src_h->alloc_id;
                                 dst_h->source_color = src_h->source_color;
+                                /* Propagate escaped so aliases don't leak */
+                                dst_h->escaped = src_h->escaped;
                             }
                         }
                     }
@@ -1920,6 +1939,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (arg_local < 0) continue;
 
             IRHandleInfo *h = ir_find_handle(ps, arg_local);
+            /* Phase E: Auto-register when caller's own arg is a param and
+             * the callee frees it. Enables FuncSummary chain propagation:
+             * step_c frees its param → step_b calls step_c(r) → step_b's
+             * r (also a param) gets marked FREED → step_b's summary
+             * frees_param[0]=true. Mark escaped to avoid leak flag. */
+            if (!h && arg_local < func->local_count &&
+                func->locals[arg_local].is_param) {
+                h = ir_add_handle(ps, arg_local);
+                if (h) {
+                    h->state = IR_HS_ALIVE;
+                    h->alloc_line = inst->source_line;
+                    h->alloc_id = _ir_next_alloc_id++;
+                    h->source_color = ZC_COLOR_UNKNOWN;
+                    h->escaped = true;  /* external input */
+                }
+            }
             if (!h) continue;
 
             /* Error on using an already-invalid handle */
@@ -2552,6 +2587,13 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (le && le->kind == TYPE_OPTIONAL) continue;
                 }
                 if (loc->is_temp) continue;
+                /* Phase E: params aren't "allocated" locals — auto-
+                 * registration (via pool.free(param), @ptrcast(*T, param),
+                 * extern free(param)) creates handle entries used for
+                 * FuncSummary building, but the param itself isn't a
+                 * local allocation that leaks. Summary captures whether
+                 * the callee frees it; callers get the frees_param flag. */
+                if (loc->is_param) continue;
             }
             if (h->path_len > 0) continue;  /* compound — skip */
 

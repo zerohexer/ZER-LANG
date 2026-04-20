@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// Stress test: combined pattern that ALL zercheck versions should catch.
+// Multiple features: pool allocation, if-branch with early-exit free,
+// fall-through use of freed handle.
+
+struct Block { u32 data; }
+Pool(Block, 4) pool;
+
+u32 main() {
+    Handle(Block) h = pool.alloc() orelse return;
+    pool.get(h).data = 1;
+
+    bool condition = true;
+
+    if (condition) {
+        pool.free(h);
+        return 0;
+    }
+
+    // Fall-through path uses freed handle (unreachable dynamically, but
+    // static analysis via union coverage + canonical return SHOULD flag
+    // as leak — h is ALIVE on this path, never freed).
+    u32 val = pool.get(h).data;
+    return val;
+}

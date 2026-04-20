@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// Combined: move struct + function call transfer + field use after move
+
+move struct FileHandle { i32 fd; u32 flags; }
+
+void consume(FileHandle f) {
+    u32 x = f.flags;
+    if (x == 0) { return; }
+}
+
+u32 main() {
+    FileHandle f;
+    f.fd = 42;
+    f.flags = 1;
+
+    if (f.flags > 0) {
+        consume(f);  // ownership transferred
+    }
+
+    // Use-after-move on at least one path (the if-true branch consumed f)
+    u32 val = (u32)f.fd;
+    return val;
+}

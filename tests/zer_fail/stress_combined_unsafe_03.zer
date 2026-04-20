@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// *opaque alias chain: type-erase, store, free through one view, use other
+
+struct Driver { u32 handle; u32 state; }
+Slab(Driver) drivers;
+
+u32 main() {
+    ?*Driver md1 = drivers.alloc_ptr();
+    *Driver d1 = md1 orelse return;
+    d1.handle = 1;
+    d1.state = 0;
+
+    // Type-erase to *opaque, then cast back through alias
+    *opaque erased = @ptrcast(*opaque, d1);
+    *opaque alias = erased;
+
+    // Free via d1
+    drivers.free_ptr(d1);
+
+    // alias is dangling — accessing via type-cast = UAF
+    *Driver via_alias = @ptrcast(*Driver, alias);
+    u32 state = via_alias.state;
+    return state;
+}

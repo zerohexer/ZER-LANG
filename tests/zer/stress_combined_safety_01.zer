@@ -1,0 +1,31 @@
+// Stress test: defer + orelse + if branches + move struct + function transfer
+
+struct Task { u32 id; u32 priority; }
+Pool(Task, 16) pool;
+
+move struct Token { u32 val; }
+
+u32 consume(Token t) {
+    return t.val;
+}
+
+u32 main() {
+    u32 total = 0;
+
+    Handle(Task) h = pool.alloc() orelse { return 1; };
+    defer pool.free(h);
+
+    pool.get(h).id = 5;
+    pool.get(h).priority = 3;
+
+    u32 accumulated = 0;
+    if (pool.get(h).priority == 3) {
+        Token t;
+        t.val = 42;
+        accumulated = consume(t);
+    }
+
+    total = accumulated + pool.get(h).id;
+    if (total != 47) { return 2; }
+    return 0;
+}

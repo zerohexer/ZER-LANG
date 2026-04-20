@@ -272,9 +272,109 @@ Theorem progress : forall st e Γ τ,
   st.(st_returned) = None ->
   is_value e = true \/ exists st' e', step st e st' e'.
 Proof.
-  (* Induction on typing, using canonical-forms lemmas to decompose
-     values of known types. For each expression form, either
-     directly step or step via a sub-expression's IH. *)
+  intros st e Γ τ Henv Hty Hret.
+  revert st Henv Hret.
+  induction Hty; intros st Henv Hret.
+
+  (* ty_val: e = EVal v → is_value = true *)
+  - left. reflexivity.
+
+  (* ty_var: lookup x via env_typed + step_var *)
+  - right.
+    destruct (Henv x τ H) as [v [Hv _]].
+    exists st, (EVal v). apply step_var; assumption.
+
+  (* ty_let: IH on e1 *)
+  - right.
+    destruct (IHHty1 st Henv Hret) as [Hv | [st' [e1' Hstep]]].
+    + (* e1 is a value → step_let_val *)
+      destruct e1; try discriminate Hv.
+      eexists. eexists. eapply step_let_val; assumption.
+    + (* e1 steps → step_let_ctx *)
+      eexists. eexists. eapply step_let_ctx; eassumption.
+
+  (* ty_seq *)
+  - right.
+    destruct (IHHty1 st Henv Hret) as [Hv | [st' [e1' Hstep]]].
+    + destruct e1; try discriminate Hv.
+      eexists. eexists. eapply step_seq_val; assumption.
+    + eexists. eexists. eapply step_seq_ctx; eassumption.
+
+  (* ty_if: condition is Bool *)
+  - right.
+    destruct (IHHty1 st Henv Hret) as [Hv | [st' [c' Hstep]]].
+    + (* c is a value of type Bool — use canonical_bool *)
+      destruct c; try discriminate Hv.
+      inversion Hty1; subst.
+      match goal with Hvt : has_val_ty _ TyBool |- _ =>
+        apply canonical_bool in Hvt as [b ->]
+      end.
+      destruct b.
+      * eexists. eexists. apply step_if_true. assumption.
+      * eexists. eexists. apply step_if_false. assumption.
+    + eexists. eexists. eapply step_if_ctx; eassumption.
+
+  (* ty_alloc: always steps. Either init (if pool not yet in store),
+     or succ/fail depending on pool fullness.
+     Three cases:
+       1. caps !! p = None: pool wasn't declared — this is a
+          well-formedness issue. TODO: add 'program well-formed'
+          precondition that ensures all pool IDs in the expression
+          appear in caps.
+       2. caps !! p = Some cap, store !! p = None: step_alloc_init.
+       3. caps !! p = Some cap, store !! p = Some ps: succ/fail
+          depending on find_free_slot. *)
+  - (* Progress for ty_alloc depends on program well-formedness.
+       Admitting with a scoped TODO. *)
+    admit.
+
+  (* ty_free: IH on e. If value, must be a VHandle; step_free_alive
+     fires iff the handle is alive.
+     CORE HANDLE SAFETY ARGUMENT — progress for well-typed EFree
+     requires 'the handle is alive.' This is the invariant
+     preservation must maintain. Without it, progress fails.
+     Deferred with clear TODO. *)
+  - admit.
+
+  (* ty_get: same handle-liveness issue as ty_free *)
+  - admit.
+
+  (* ty_field_read: no step rule in Year-1 semantics (Tier 2) *)
+  - admit.
+
+  (* ty_field_write: no step rule in Year-1 semantics (Tier 2) *)
+  - admit.
+
+  (* ty_orelse: IH on e. If handle, unwrap. If null, fire (after r
+     reduces to value).
+     Needs canonical_opt_handle to split into handle vs null cases. *)
+  - right.
+    destruct (IHHty1 st Henv Hret) as [Hv | [st' [e' Hstep]]].
+    + (* e is a value of type ?Handle(p) — canonical analysis *)
+      destruct e; try discriminate Hv.
+      inversion Hty1; subst.
+      match goal with Hvt : has_val_ty _ (TyOptHandle _) |- _ =>
+        apply canonical_opt_handle in Hvt as [[i [g ->]] | ->]
+      end.
+      * (* handle case: step_orelse_unwrap *)
+        eexists. eexists. apply step_orelse_unwrap. assumption.
+      * (* null case: need r to step or already be value *)
+        (* This is the tricky one — step_orelse_return_ctx requires
+           r to step, step_orelse_return_fire requires r to be a
+           value. We'd need to destruct on IH for r.
+           TODO(Year-1, Week-3): add IHHty2 analysis. *)
+        admit.
+    + eexists. eexists. eapply step_orelse_ctx; eassumption.
+
+  (* ty_while: no step rule (Tier 2) *)
+  - admit.
+
+  (* ty_return: IH on e *)
+  - right.
+    destruct (IHHty st Henv Hret) as [Hv | [st' [e' Hstep]]].
+    + destruct e; try discriminate Hv.
+      eexists. eexists. apply step_return_val. assumption.
+    + eexists. eexists. eapply step_return_ctx; eassumption.
 Admitted.
 
 (* ================================================================

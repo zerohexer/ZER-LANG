@@ -6,3 +6,5 @@
 lambda_zer_handle/syntax.v
 lambda_zer_handle/semantics.v
 lambda_zer_handle/typing.v
+lambda_zer_handle/adequacy.v
+lambda_zer_handle/handle_safety.v

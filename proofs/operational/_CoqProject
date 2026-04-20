@@ -1,0 +1,6 @@
+-Q lambda_zer_handle zer_handle
+
+-arg -w -arg -notation-overridden
+-arg -w -arg -redundant-canonical-projection
+
+lambda_zer_handle/syntax.v

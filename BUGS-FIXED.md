@@ -103,12 +103,23 @@ Fix summary (commits in chronological order):
 
 All of `make check` (3,200+ tests) remains green throughout.
 
-**Final Phase E state (2026-04-20):** 5 disagreements out of 1110 tests
-(~98% reduction from 257 initial, ~99.5% behavior parity with zercheck.c).
-Remaining are all AST-only catches: goto-loop MAYBE_FREED widening,
-array-element move, mixed-path leak, dead-code-after-return, scope
-escape via orelse fallback. Phase F entry criterion requires zero
-disagreement — remaining cases are CFG-analysis infrastructure work.
+**Final Phase E state (2026-04-20):** 2 disagreements out of 1110 tests
+(~99.2% reduction from 257 initial, ~99.8% behavior parity with
+zercheck.c). Both remaining require dominator-analysis infrastructure:
+- `goto_maybe_freed_branch` — CFG merge conservatism produces
+  MAYBE_FREED for loop pattern that AST detects directly.
+- `gen_uaf_003` — mixed-path leak where union semantics hide
+  fall-through leak that AST catches via final-state semantics.
+
+Additional late-session fixes: `b7f52aa` (move struct from array
+element), `eedae4f` (dead-code-after-return state inheritance),
+`2bf8619` (pointer-returning calls treated as allocations).
+
+Phase F entry criterion requires zero disagreement — remaining 2
+cases are CFG-vs-linear-scan infrastructure work (postdominator
+analysis needed). Alternative: continue shipping dual-run as a
+verification harness and only cut over when additional analyses
+close the gap.
 
 ---
 

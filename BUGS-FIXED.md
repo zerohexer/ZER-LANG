@@ -94,8 +94,21 @@ Fix summary (commits in chronological order):
 - `2eb2baa` — Double-join detection on ThreadHandle.
 - `61e7e48` — Auto-register param handles on extern free (catches
   free(data); @ptrcast(*T, data) UAF pattern).
+- `1fcd703` — is_orelse_fallback block tag infrastructure (IRBlock
+  field set by ir_lower for orelse-fail-targets).
+- `cdc4bca` — Cross-function FuncSummary chain via param auto-register
+  (destroy_cat, ownership_chain). 8 → 6.
+- `651fbf3` — Remove TYPE_OPTIONAL leak filter, use is_orelse_fallback
+  block skip + untrackable-target escape (handles[i]=mh). 6 → 5.
 
 All of `make check` (3,200+ tests) remains green throughout.
+
+**Final Phase E state (2026-04-20):** 5 disagreements out of 1110 tests
+(~98% reduction from 257 initial, ~99.5% behavior parity with zercheck.c).
+Remaining are all AST-only catches: goto-loop MAYBE_FREED widening,
+array-element move, mixed-path leak, dead-code-after-return, scope
+escape via orelse fallback. Phase F entry criterion requires zero
+disagreement — remaining cases are CFG-analysis infrastructure work.
 
 ---
 

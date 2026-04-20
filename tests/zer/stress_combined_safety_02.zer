@@ -1,0 +1,57 @@
+// Stress test: nested if-unwrap + switch + arena + *opaque + @ptrcast
+// Complex control flow with multiple escape paths.
+
+struct Sensor { u32 reading; u32 tag; }
+Slab(Sensor) heap;
+
+Arena scratch;
+u8[512] backing;
+
+enum Kind { temp, pressure, humidity }
+
+struct Reading {
+    *opaque data;
+    Kind k;
+    u32 sensor_id;
+}
+
+u32 process_reading(Reading r) {
+    switch (r.k) {
+        .temp, .pressure => {
+            *Sensor s = @ptrcast(*Sensor, r.data);
+            if (s.tag != r.sensor_id) { return 0; }
+            return s.reading;
+        }
+        .humidity => {
+            *Sensor s = @ptrcast(*Sensor, r.data);
+            return s.reading * 2;
+        }
+    }
+}
+
+u32 main() {
+    scratch.over(backing);
+
+    ?*Sensor ms1 = heap.alloc_ptr();
+    *Sensor s1 = ms1 orelse return;
+    s1.reading = 42;
+    s1.tag = 1;
+
+    ?*Sensor ms2 = heap.alloc_ptr();
+    *Sensor s2 = ms2 orelse { heap.free_ptr(s1); return 99; };
+    s2.reading = 100;
+    s2.tag = 2;
+
+    Reading r1 = { .data = @ptrcast(*opaque, s1), .k = Kind.temp, .sensor_id = 1 };
+    Reading r2 = { .data = @ptrcast(*opaque, s2), .k = Kind.humidity, .sensor_id = 2 };
+
+    u32 v1 = process_reading(r1);
+    u32 v2 = process_reading(r2);
+
+    heap.free_ptr(s1);
+    heap.free_ptr(s2);
+
+    if (v1 != 42) { return 1; }
+    if (v2 != 200) { return 2; }
+    return 0;
+}

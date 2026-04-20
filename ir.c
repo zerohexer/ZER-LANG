@@ -278,6 +278,43 @@ bool ir_block_is_terminated(IRBlock *block) {
  * Validation
  * ================================================================ */
 
+/* Depth-first reachability walk from bb0. Fills reachable[] with true for
+ * every block reachable via BRANCH/GOTO/implicit-fallthrough edges. */
+static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
+    if (bi < 0 || bi >= func->block_count) return;
+    if (reachable[bi]) return;
+    reachable[bi] = true;
+    IRBlock *block = &func->blocks[bi];
+    /* Determine successors. */
+    if (block->inst_count == 0) {
+        /* Empty block = implicit fallthrough to next block. */
+        if (bi + 1 < func->block_count) dfs_reachable(func, bi + 1, reachable);
+        return;
+    }
+    IRInst *last = &block->insts[block->inst_count - 1];
+    switch (last->op) {
+    case IR_BRANCH:
+        dfs_reachable(func, last->true_block, reachable);
+        dfs_reachable(func, last->false_block, reachable);
+        break;
+    case IR_GOTO:
+        dfs_reachable(func, last->goto_block, reachable);
+        break;
+    case IR_RETURN:
+        /* no successors */
+        break;
+    case IR_YIELD:
+    case IR_AWAIT:
+        /* async resume falls through to next block */
+        if (bi + 1 < func->block_count) dfs_reachable(func, bi + 1, reachable);
+        break;
+    default:
+        /* Non-terminator last instruction = implicit fallthrough. */
+        if (bi + 1 < func->block_count) dfs_reachable(func, bi + 1, reachable);
+        break;
+    }
+}
+
 bool ir_validate(IRFunc *func) {
     bool valid = true;
 
@@ -384,6 +421,193 @@ bool ir_validate(IRFunc *func) {
                         func->locals[i].id, (int)func->name_len, func->name);
                 valid = false;
             }
+        }
+    }
+
+    /* ================================================================
+     * Phase 1 hardening (2026-04-20):
+     *   (a) Per-op field invariants — malformed instruction detection
+     *   (b) Reachability (diagnostic only, opt-in via env var) — cannot
+     *       be promoted to error because lowerer correctly emits IR for
+     *       syntactically-reachable-but-semantically-dead source code
+     *       (e.g. `goto done; x=0; done:`); no static way to distinguish
+     *       that from a genuine forgotten-edge lowerer bug.
+     *
+     * Items dropped from the original plan after code inspection:
+     *   - Missing terminator on non-last block: already supported as
+     *     "implicit fallthrough" by ir_compute_preds / dfs_reachable.
+     *     Not a bug pattern.
+     *   - Missing terminator on last non-void block: caught by GCC's
+     *     -Wreturn-type (we already enable -Wall -Wextra). Redundant.
+     *   - Locals-used-while-hidden: `hidden` is a lookup-time flag for
+     *     name resolution during lowering, not a runtime-reachability
+     *     property. Post-lowering, hidden locals can legitimately be
+     *     referenced from earlier-emitted instructions. Not a check.
+     *
+     * Items deferred to phase 2:
+     *   - Defer push/fire balance (per-CFG-path depth tracking)
+     *   - Use-before-define (needs dominator analysis for non-SSA IR)
+     * ================================================================ */
+
+    /* (a) Per-op field invariants — catches lowerer building a
+     * malformed instruction (field forgotten, wrong local type, etc.).
+     * Run after the range checks above so we know indices are sane. */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *block = &func->blocks[bi];
+        for (int ii = 0; ii < block->inst_count; ii++) {
+            IRInst *inst = &block->insts[ii];
+            switch (inst->op) {
+            case IR_BRANCH:
+                /* Must have a condition: either cond_local OR an expr tree. */
+                if (inst->cond_local < 0 && !inst->expr) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d BRANCH has neither "
+                            "cond_local nor expr in '%.*s'\n",
+                            bi, (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_BINOP:
+                /* Binary op needs dest + two sources. */
+                if (inst->dest_local < 0 || inst->src1_local < 0 || inst->src2_local < 0) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d BINOP missing operand "
+                            "(dest=%d src1=%d src2=%d) in '%.*s'\n",
+                            bi, inst->dest_local, inst->src1_local, inst->src2_local,
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_UNOP:
+                if (inst->dest_local < 0 || inst->src1_local < 0) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d UNOP missing operand "
+                            "(dest=%d src1=%d) in '%.*s'\n",
+                            bi, inst->dest_local, inst->src1_local,
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_COPY:
+                if (inst->dest_local < 0 || inst->src1_local < 0) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d COPY missing operand "
+                            "(dest=%d src1=%d) in '%.*s'\n",
+                            bi, inst->dest_local, inst->src1_local,
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_LITERAL:
+                /* Literals must write somewhere. */
+                if (inst->dest_local < 0) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d LITERAL has no "
+                            "dest_local in '%.*s'\n",
+                            bi, (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_FIELD_READ:
+                if (inst->dest_local < 0 || inst->src1_local < 0 || !inst->field_name) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d FIELD_READ malformed "
+                            "(dest=%d src1=%d field=%s) in '%.*s'\n",
+                            bi, inst->dest_local, inst->src1_local,
+                            inst->field_name ? "set" : "NULL",
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_FIELD_WRITE:
+                if (inst->src1_local < 0 || inst->src2_local < 0 || !inst->field_name) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d FIELD_WRITE malformed "
+                            "(src1=%d src2=%d field=%s) in '%.*s'\n",
+                            bi, inst->src1_local, inst->src2_local,
+                            inst->field_name ? "set" : "NULL",
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_INDEX_READ:
+                if (inst->dest_local < 0 || inst->src1_local < 0 || inst->src2_local < 0) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d INDEX_READ missing operand "
+                            "(dest=%d src1=%d src2=%d) in '%.*s'\n",
+                            bi, inst->dest_local, inst->src1_local, inst->src2_local,
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_ADDR_OF:
+            case IR_DEREF_READ:
+                if (inst->dest_local < 0 || inst->src1_local < 0) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d %s missing operand "
+                            "(dest=%d src1=%d) in '%.*s'\n",
+                            bi, inst->op == IR_ADDR_OF ? "ADDR_OF" : "DEREF_READ",
+                            inst->dest_local, inst->src1_local,
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_CAST:
+                if (inst->dest_local < 0 || inst->src1_local < 0 || !inst->cast_type) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d CAST malformed "
+                            "(dest=%d src1=%d type=%s) in '%.*s'\n",
+                            bi, inst->dest_local, inst->src1_local,
+                            inst->cast_type ? "set" : "NULL",
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
+            case IR_CALL_DECOMP:
+                /* Decomposed call must have consistent arg array. */
+                if (inst->call_arg_local_count > 0 && !inst->call_arg_locals) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d CALL_DECOMP has "
+                            "arg_count=%d but call_arg_locals is NULL in '%.*s'\n",
+                            bi, inst->call_arg_local_count,
+                            (int)func->name_len, func->name);
+                    valid = false;
+                }
+                /* Each arg local must be in range. */
+                for (int ai = 0; ai < inst->call_arg_local_count; ai++) {
+                    int a = inst->call_arg_locals[ai];
+                    if (a < 0 || a >= func->local_count) {
+                        fprintf(stderr, "IR VALIDATION ERROR: bb%d CALL_DECOMP arg[%d]=%d "
+                                "out of range in '%.*s'\n",
+                                bi, ai, a, (int)func->name_len, func->name);
+                        valid = false;
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    /* (b) Block reachability — DFS from bb0.
+     *
+     * DIAGNOSTIC ONLY. Unreachable blocks have two sources we can't
+     * statically distinguish:
+     *   (1) Lowerer forgot an edge — real bug.
+     *   (2) Source code is syntactically reachable but semantically
+     *       dead — e.g. `goto done; x = 0; done:` where the assign
+     *       is unreachable but the lowerer correctly emits it (we
+     *       don't do DCE at IR level; GCC does).
+     * Both produce identical IR. Cannot be promoted to error without
+     * lowerer-level "this block was source code between goto/label"
+     * annotations. Stays warning-only even in strict mode.
+     *
+     * Enabled by ZER_IR_WARN_UNREACHABLE=1 (off by default — too noisy
+     * for normal builds, useful for lowerer refactor sessions). */
+    if (getenv("ZER_IR_WARN_UNREACHABLE")) {
+        bool *reachable = (bool *)calloc(func->block_count, sizeof(bool));
+        if (reachable) {
+            dfs_reachable(func, 0, reachable);
+            for (int bi = 0; bi < func->block_count; bi++) {
+                if (!reachable[bi]) {
+                    IRBlock *block = &func->blocks[bi];
+                    fprintf(stderr, "IR VALIDATION NOTE: bb%d unreachable from entry "
+                            "in '%.*s' (%d instructions — lowerer dead-code emission "
+                            "OR forgotten edge; GCC will DCE)\n",
+                            bi, (int)func->name_len, func->name, block->inst_count);
+                }
+            }
+            free(reachable);
         }
     }
 

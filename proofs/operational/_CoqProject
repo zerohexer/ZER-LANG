@@ -5,3 +5,4 @@
 
 lambda_zer_handle/syntax.v
 lambda_zer_handle/semantics.v
+lambda_zer_handle/typing.v

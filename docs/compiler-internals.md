@@ -5414,7 +5414,7 @@ if inst->expr is NODE_SPAWN:
 ps->critical_depth++/-- (preserved across ir_ps_copy)
 ```
 
-### Phase E 2026-04-20 session — 257 → 8 disagreements (~97% reduction)
+### Phase E 2026-04-20 session — 257 → 5 disagreements (~98% reduction)
 
 Late-session sweep landed 11 targeted improvements dropping disagreements
 from 108 to 8. Each fix below cites the commit that landed it.
@@ -5464,32 +5464,49 @@ from 108 to 8. Each fix below cites the commit that landed it.
   inner scopes must resolve shadow-suffixed locals correctly.
 - used_locals tracking walks inst->expr AST for passthrough usages.
 
-### Remaining 8 disagreements — categories (2026-04-20)
+### Additional late-session fixes (5 more disagreements closed, 8 → 5)
 
-**Positive (2)** — IR reports errors on valid code:
-- `rust_tests/ownership_chain.zer` — complex alias chain through
-  multi-function call pattern.
-- `rust_tests/rt_drop_struct_object.zer` — object-with-handle-field
-  destructor pattern where field-free escape isn't recognized.
+- `cdc4bca` — Cross-function FuncSummary chain via param auto-register:
+  destroy_cat(*opaque ctx) { c = @ptrcast; free_ptr(c); } wasn't
+  registering ctx as a handle, so alias-propagation to free didn't
+  observe ctx FREED at return. Same issue in multi-level chains:
+  step_b(r) { step_c(r); } — r is a param, step_c's summary says
+  frees_param[0] but the apply path skipped when r had no handle.
+  Fix: auto-register with escaped=true so aliases don't flag as leaks,
+  summary build still observes FREED state. Fixes ownership_chain.zer,
+  rt_drop_struct_object.zer.
+- `651fbf3` — Removed TYPE_OPTIONAL leak-detection filter: was masking
+  genuine leaks on ?Handle/?*T locals. Two replacement mechanisms:
+  1. is_orelse_fallback block skip in leak loop (the block is only
+     reached when optional was null, no alloc to leak).
+  2. Untrackable-target escape mirror (zercheck.c:1460 pattern):
+     `handles[i] = mh` where i is variable → mh escaped (can't track
+     through dynamic index). Fixes gen_null_002 + rt_handle_array_alloc.
 
-**Negative (6)** — AST catches, IR misses:
+### Remaining 5 disagreements — categories (2026-04-20)
+
+**Positive (0)** — zero false positives on valid code.
+
+**Negative (5)** — AST catches, IR misses:
 - `tests/zer_fail/goto_maybe_freed_branch.zer` — goto-loop MAYBE_FREED
   widening. zercheck.c's same-block iteration catches backward-goto
   UAF via 2-pass re-walk; IR CFG fixed-point converges too quickly.
 - `tests/zer_fail/move_array_elem.zer` — move struct from array
   element (`Token copy = arr[0]`). Array element isn't tracked as a
   distinct compound entity per-index.
-- `rust_tests/gen_null_002.zer`, `gen_uaf_003.zer` — complex null /
-  UAF patterns requiring deeper CFG analysis.
+- `rust_tests/gen_uaf_003.zer` — mixed-path leak where IR's union
+  semantics (alloc_id covered by ANY return block) can't catch paths
+  that don't free. AST linear-scan catches via single final state.
 - `rust_tests/rt_move_struct_return_then_use.zer` — dead code after
-  return (documented limitation).
+  return (documented limitation — zercheck_ir doesn't analyze
+  statements after a RETURN terminator, AST does linear scan).
 - `rust_tests/rt_scope_escape_orelse.zer` — `return s` where s came
   from `ms orelse return` — scope escape detection inside orelse
   fallback with bare `return`.
 
-Each category needs targeted investigation. The framework is sound;
-remaining gaps are edge cases in CFG-specific detection paths that
-zercheck.c handles via linear-scan semantics.
+These are all CFG-analysis gaps where zercheck.c's linear-scan
+semantics naturally handle patterns that require additional CFG
+analysis infrastructure.
 
 ### Convergence criterion for Phase F entry
 

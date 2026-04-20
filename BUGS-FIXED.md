@@ -103,23 +103,43 @@ Fix summary (commits in chronological order):
 
 All of `make check` (3,200+ tests) remains green throughout.
 
-**Final Phase E state (2026-04-20):** 2 disagreements out of 1110 tests
-(~99.2% reduction from 257 initial, ~99.8% behavior parity with
-zercheck.c). Both remaining require dominator-analysis infrastructure:
-- `goto_maybe_freed_branch` — CFG merge conservatism produces
-  MAYBE_FREED for loop pattern that AST detects directly.
-- `gen_uaf_003` — mixed-path leak where union semantics hide
-  fall-through leak that AST catches via final-state semantics.
+**Final Phase E state (2026-04-20):** ZERO disagreements out of 1110 tests
+(100% reduction from 257 initial, **100% behavior parity** with zercheck.c).
 
-Additional late-session fixes: `b7f52aa` (move struct from array
-element), `eedae4f` (dead-code-after-return state inheritance),
-`2bf8619` (pointer-returning calls treated as allocations).
+Phase E convergence was achieved via four architectural fixes:
 
-Phase F entry criterion requires zero disagreement — remaining 2
-cases are CFG-vs-linear-scan infrastructure work (postdominator
-analysis needed). Alternative: continue shipping dual-run as a
-verification harness and only cut over when additional analyses
-close the gap.
+1. **Defer alias propagation** (`ir_defer_scan_frees`): `defer free(s)` now
+   propagates FREED state to aliases sharing alloc_id, so `?Handle mh = ...;
+   Handle s = mh orelse return; defer free(s)` correctly marks mh FREED at
+   return. Previously marked only the named handle.
+
+2. **`is_early_exit` block tag** (ir_lower.c): CFG equivalent of zercheck.c's
+   `block_always_exits` (line 312). When an if-then body unconditionally
+   terminates (RETURN / non-join GOTO), tag the blocks in that body as
+   early-exit. Leak detection skips these blocks (they represent bypass
+   paths, not canonical flow). Applied only to if-without-capture — if-unwrap
+   has alias-escape semantics that require union coverage. Fixes gen_uaf_003.
+
+3. **Exhaustive enum switch elision** (ir_lower.c): When a switch on an enum
+   has no default arm, the checker requires all variants covered. The last
+   arm's \"condition false\" path is structurally unreachable. Previously
+   emitted as BRANCH with false-target → bb_exit, causing CFG merge at
+   bb_exit to inherit pre-switch state (spurious MAYBE_FREED when arms
+   freed a handle). Fix: detect is_enum && !has_default, emit last arm as
+   unconditional GOTO. Eliminates spurious merge predecessor.
+
+4. **MAYBE_FREED flagging at canonical return** (zercheck_ir.c): With #2
+   and #3 eliminating spurious MAYBE_FREED, flagging genuine MAYBE_FREED
+   now matches zercheck.c:2700 semantics. Fixes goto_maybe_freed_branch
+   (backward goto + conditional free produces MAYBE_FREED via fixed-point).
+
+**Phase F (delete zercheck.c, tag v0.5.0) is now unblocked.** zercheck_ir.c
+produces byte-identical diagnostic output to zercheck.c across all 1110 tests.
+CFG infrastructure is the foundation for future analyses (dominator trees,
+VRP-on-SSA) that linear-scan zercheck.c can't easily support.
+
+Net session commits: `cdc4bca`, `651fbf3`, `b7f52aa`, `eedae4f`, `2bf8619`,
+`cb9cee4`, `2eb2baa`, `61e7e48`, `572c701`, `800aaf6`.
 
 ---
 

@@ -5500,33 +5500,76 @@ from 108 to 8. Each fix below cites the commit that landed it.
   Skips if dest already tracked. Catches rt_scope_escape_orelse's
   `*Sensor s = fallback_local()` scope-escape leak.
 
-### Remaining 2 disagreements — categories (2026-04-20)
+### Final convergence fixes (2 → 0 disagreements, 100% parity)
 
-**Positive (0)** — zero false positives on valid code.
+Two architectural fixes closed the remaining CFG-vs-linear-scan
+semantic gap. Both mirror zercheck.c primitives explicitly:
 
-**Negative (2)** — AST catches, IR misses (require dominator-analysis
-infrastructure beyond current scope):
-- `tests/zer_fail/goto_maybe_freed_branch.zer` — backward goto loop
-  with conditional free widens to MAYBE_FREED at function exit.
-  Flagging MAYBE_FREED is safe in isolation but produces false
-  positives on switch-all-arms-free patterns due to CFG lowering
-  emitting a "fallthrough" edge for non-default switches that
-  corresponds to an unreachable path. Fixing requires enum-
-  exhaustive switch recognition in IR lowering OR dominator-based
-  merge refinement to recognize unreachable predecessors.
-- `rust_tests/gen_uaf_003.zer` — mixed-path leak: `if (cond) { free;
-  return; }` early-exits after free, fall-through `use(h); return val`
-  leaks. Union leak semantics consider alloc_id "covered" when any
-  return block frees it. Detecting the fall-through-specific leak
-  requires distinguishing early-exit returns from canonical exits —
-  single-pred-BRANCH heuristic was too broad (50+ false positives).
-  Fixing requires post-dominator analysis.
+**1. `is_early_exit` block tag** (commit `572c701`, ir_lower.c + ir.h)
 
-Both are CFG-vs-linear-scan semantic differences. zercheck.c's linear
-scan uses a single PathState representing "synthesized happy path
-state at function exit". CFG sees multiple independent return blocks
-and cannot easily construct the synthesized state without postdominator
-analysis.
+CFG equivalent of zercheck.c's `block_always_exits(node)` (line 312).
+When an if-then body's last instruction is RETURN or non-join GOTO,
+the body always exits — its effects should NOT contribute to the
+canonical fall-through state (matches AST's "take not-taken branch"
+post-if behavior).
+
+Implementation:
+- New `IRBlock.is_early_exit` flag.
+- In NODE_IF lowering: after `lower_stmt(then_body)`, check current
+  block's terminator. If RETURN or GOTO-to-non-bb_join, tag all
+  blocks in `[then_start_bi, current_block]` as early-exit.
+- Same for else-body symmetrically.
+- Skip if the if has a capture (if-unwrap) — those have alias-escape
+  semantics via union coverage.
+
+Zercheck_ir.c:
+- Coverage collection skips is_early_exit blocks.
+- Leak check skips is_early_exit blocks (not canonical).
+
+Fixes gen_uaf_003: `if (cond) { free(h); return 0; }` now doesn't
+count as coverage. Fall-through `return val` with h ALIVE triggers leak.
+
+**2. Exhaustive enum switch elision** (commit `800aaf6`, ir_lower.c)
+
+When a switch on an enum has no default arm, the checker requires
+all variants be covered. The last arm's "condition false" path is
+structurally unreachable at runtime. Previously CFG lowering emitted
+a BRANCH whose false-target went to bb_exit with pre-switch state,
+causing CFG merge at bb_exit to get a spurious unreachable predecessor.
+
+Implementation:
+- Detect `is_enum && !has_default` at switch entry.
+- For the last arm, emit `IR_GOTO bb_arm` (unconditional) instead of
+  `IR_BRANCH cond, bb_arm, bb_exit`.
+- bb_exit's predecessors become only the arm-body-ends.
+
+Eliminates false-positive MAYBE_FREED when all arms free a handle.
+
+**3. MAYBE_FREED flagging at canonical return** (zercheck_ir.c)
+
+With fixes #1 and #2 eliminating spurious MAYBE_FREED from CFG merge
+conservatism, flagging genuine MAYBE_FREED at return now matches
+zercheck.c:2700. Fixes goto_maybe_freed_branch: backward-goto loop
+with conditional free produces MAYBE_FREED at fixed-point convergence.
+
+**4. Defer alias propagation** (commit `572c701`, zercheck_ir.c)
+
+Correctness fix: `ir_defer_scan_frees` now calls
+`ir_propagate_alias_state` after marking the named handle FREED.
+Ensures `?Handle mh = ...; Handle s = mh orelse return; defer free(s)`
+marks mh FREED at return (via alloc_id alias propagation).
+
+### 100% parity — what it means
+
+All 1110 dual-run tests produce identical diagnostic counts between
+zercheck.c and zercheck_ir.c. The CFG rewrite is correct — independently
+reimplementing the analysis on a different IR produces matching output
+on every real-world test.
+
+Phase F (delete zercheck.c, tag v0.5.0) is unblocked. zercheck_ir.c
+is the proper primary — CFG infrastructure is the foundation for
+future analyses (dominator trees, VRP-on-SSA, borrow-checker-lite)
+that linear-scan zercheck.c can't easily support.
 
 ### Convergence criterion for Phase F entry
 

@@ -24,4 +24,5 @@ lambda_zer_handle/iris_container_validity.v
 lambda_zer_handle/iris_typing_rules.v
 lambda_zer_handle/iris_control_flow.v
 lambda_zer_handle/iris_misc_sections.v
+lambda_zer_handle/iris_mmio_cast_escape.v
 lambda_zer_handle/iris_demo.v

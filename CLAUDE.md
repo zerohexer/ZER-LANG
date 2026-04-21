@@ -513,7 +513,7 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Not safety-semantic:** U (35 rows — pure well-formedness, correctly marked `—`).
 
-**Level 3 — extract-and-link VST (2026-04-21, pattern established):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR. First real extraction: `zer_handle_state_is_invalid` (used by both zercheck.c:is_handle_invalid and zercheck_ir.c:ir_is_invalid).
+**Level 3 — extract-and-link VST (2026-04-21, 4 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR. Extracted: `zer_handle_state_is_invalid`, `zer_handle_state_is_alive`, `zer_handle_state_is_freed`, `zer_handle_state_is_transferred` — all in `src/safety/handle_state.c`. Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`. Inline state-equality checks remaining throughout zercheck*.c are candidates for further delegation.
 
 **Level 3 structure:**
 - `src/safety/handle_state.c` — extracted predicate, linked into zerc

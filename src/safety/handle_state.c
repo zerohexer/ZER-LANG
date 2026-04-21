@@ -26,3 +26,24 @@ int zer_handle_state_is_invalid(int state) {
     }
     return 0;
 }
+
+int zer_handle_state_is_alive(int state) {
+    if (state == ZER_HS_ALIVE) {
+        return 1;
+    }
+    return 0;
+}
+
+int zer_handle_state_is_freed(int state) {
+    if (state == ZER_HS_FREED) {
+        return 1;
+    }
+    return 0;
+}
+
+int zer_handle_state_is_transferred(int state) {
+    if (state == ZER_HS_TRANSFERRED) {
+        return 1;
+    }
+    return 0;
+}

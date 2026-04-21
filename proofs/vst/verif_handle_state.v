@@ -6,15 +6,24 @@
    handle_state.c in a way that breaks the spec, `make check-vst`
    fails — closing the correctness-oracle loop.
 
-   Function verified:
+   Functions verified (all in src/safety/handle_state.c):
      zer_handle_state_is_invalid(int state)
        returns 1 iff state ∈ {FREED (2), MAYBE_FREED (3), TRANSFERRED (4)}
+     zer_handle_state_is_alive(int state)
+       returns 1 iff state == ALIVE (1)
+     zer_handle_state_is_freed(int state)
+       returns 1 iff state == FREED (2)
+     zer_handle_state_is_transferred(int state)
+       returns 1 iff state == TRANSFERRED (4)
 
    Corresponds to:
-     - Predicate is_invalid_state in
-       proofs/operational/lambda_zer_typing/typing.v
-     - Callers: zercheck.c:is_handle_invalid,
-                zercheck_ir.c:ir_is_invalid
+     - Predicates in proofs/operational/lambda_zer_typing/typing.v
+     - Callers (invalid):      zercheck.c:is_handle_invalid,
+                                zercheck.c:is_handle_consumed,
+                                zercheck_ir.c:ir_is_invalid
+     - Callers (alive/freed/transferred): inline state-comparison sites
+                                           throughout zercheck.c,
+                                           zercheck_ir.c
 
    This file is clightgen'd from the SAME handle_state.c that
    Makefile CORE_SRCS compiles into zerc. The Clight AST is
@@ -43,7 +52,16 @@ Definition zer_handle_state_is_invalid_coq (state : Z) : Z :=
   else if Z.eq_dec state ZER_HS_TRANSFERRED then 1
   else 0.
 
-(* ---- VST funspec ---- *)
+Definition zer_handle_state_is_alive_coq (state : Z) : Z :=
+  if Z.eq_dec state ZER_HS_ALIVE then 1 else 0.
+
+Definition zer_handle_state_is_freed_coq (state : Z) : Z :=
+  if Z.eq_dec state ZER_HS_FREED then 1 else 0.
+
+Definition zer_handle_state_is_transferred_coq (state : Z) : Z :=
+  if Z.eq_dec state ZER_HS_TRANSFERRED then 1 else 0.
+
+(* ---- VST funspecs ---- *)
 
 Definition zer_handle_state_is_invalid_spec : ident * funspec :=
  DECLARE _zer_handle_state_is_invalid
@@ -57,7 +75,47 @@ Definition zer_handle_state_is_invalid_spec : ident * funspec :=
     RETURN (Vint (Int.repr (zer_handle_state_is_invalid_coq state)))
     SEP ().
 
-Definition Gprog : funspecs := [ zer_handle_state_is_invalid_spec ].
+Definition zer_handle_state_is_alive_spec : ident * funspec :=
+ DECLARE _zer_handle_state_is_alive
+  WITH state : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= state <= Int.max_signed)
+    PARAMS (Vint (Int.repr state))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_handle_state_is_alive_coq state)))
+    SEP ().
+
+Definition zer_handle_state_is_freed_spec : ident * funspec :=
+ DECLARE _zer_handle_state_is_freed
+  WITH state : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= state <= Int.max_signed)
+    PARAMS (Vint (Int.repr state))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_handle_state_is_freed_coq state)))
+    SEP ().
+
+Definition zer_handle_state_is_transferred_spec : ident * funspec :=
+ DECLARE _zer_handle_state_is_transferred
+  WITH state : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= state <= Int.max_signed)
+    PARAMS (Vint (Int.repr state))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_handle_state_is_transferred_coq state)))
+    SEP ().
+
+Definition Gprog : funspecs :=
+  [ zer_handle_state_is_invalid_spec;
+    zer_handle_state_is_alive_spec;
+    zer_handle_state_is_freed_spec;
+    zer_handle_state_is_transferred_spec ].
 
 (* ---- Proof ----
 
@@ -79,6 +137,39 @@ Proof.
   repeat forward_if;
     forward;
     unfold zer_handle_state_is_invalid_coq;
+    repeat (destruct (Z.eq_dec _ _); try lia); try entailer!.
+Qed.
+
+Lemma body_zer_handle_state_is_alive:
+  semax_body Vprog Gprog f_zer_handle_state_is_alive
+             zer_handle_state_is_alive_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_handle_state_is_alive_coq;
+    repeat (destruct (Z.eq_dec _ _); try lia); try entailer!.
+Qed.
+
+Lemma body_zer_handle_state_is_freed:
+  semax_body Vprog Gprog f_zer_handle_state_is_freed
+             zer_handle_state_is_freed_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_handle_state_is_freed_coq;
+    repeat (destruct (Z.eq_dec _ _); try lia); try entailer!.
+Qed.
+
+Lemma body_zer_handle_state_is_transferred:
+  semax_body Vprog Gprog f_zer_handle_state_is_transferred
+             zer_handle_state_is_transferred_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_handle_state_is_transferred_coq;
     repeat (destruct (Z.eq_dec _ _); try lia); try entailer!.
 Qed.
 

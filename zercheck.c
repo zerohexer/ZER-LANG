@@ -968,10 +968,12 @@ static bool is_handle_invalid(HandleInfo *h) {
 }
 
 /* Is this handle consumed (freed, maybe-freed, or transferred)?
- * Used for path merge decisions (if/else, switch, loop). */
+ * Used for path merge decisions (if/else, switch, loop).
+ * Same 3-state semantic as is_handle_invalid; delegates to the same
+ * VST-verified predicate. Kept as a distinct function for call-site
+ * readability. */
 static bool is_handle_consumed(HandleInfo *h) {
-    return h->state == HS_FREED || h->state == HS_MAYBE_FREED ||
-           h->state == HS_TRANSFERRED;
+    return zer_handle_state_is_invalid(h->state) != 0;
 }
 
 /* Report invalid use with correct message based on handle state.

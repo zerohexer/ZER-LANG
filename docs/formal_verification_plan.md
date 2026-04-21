@@ -232,16 +232,19 @@ This limits the first wave to ~15-25 functions from zercheck.c + zercheck_ir.c. 
 **Anti-overclaim.** Level 3 does NOT verify the whole compiler. It verifies that every extracted predicate matches its spec. Functions NOT extracted (i.e., still inline in `zercheck*.c`) are NOT Level-3-verified. The count of verified functions is the honest metric.
 
 **Progress tracking:**
-- `src/safety/handle_state.c` — `zer_handle_state_is_invalid(int)` extracted + verified (2026-04-21, first real extraction)
-- Plus 21 demonstrator proofs in `proofs/vst/` (standalone `.c` files, NOT extracted from compiler — pre-extraction scaffolding that established the VST pattern)
+- `src/safety/handle_state.c` — 4 predicates extracted + verified (2026-04-21):
+  - `zer_handle_state_is_invalid(int)` — {FREED, MAYBE_FREED, TRANSFERRED}
+  - `zer_handle_state_is_alive(int)` — == ALIVE
+  - `zer_handle_state_is_freed(int)` — == FREED
+  - `zer_handle_state_is_transferred(int)` — == TRANSFERRED
+- Delegation: zercheck.c `is_handle_invalid` + `is_handle_consumed` (consolidated, both now go through the same VST-verified predicate). zercheck_ir.c `ir_is_invalid`.
+- Plus 21 demonstrator proofs in `proofs/vst/` (standalone `.c` files, NOT extracted from compiler — pre-extraction scaffolding that established the VST pattern).
 
-**Next extractions** (by call-site count, smallest-first):
-1. `zer_handle_state_is_freed(int)` — used in zercheck.c:is_freed, zercheck_ir.c:ir_is_freed
-2. `zer_handle_state_is_alive(int)` — used in same places
-3. `zer_handle_state_is_transferred(int)` — move struct detection
-4. Type predicates: `zer_type_is_move_struct(...)` — requires exposing a minimal type-kind enum
-5. Range predicates: bounds check, variant in range, pool count valid
-6. ... (see checklist in `docs/compiler-internals.md` when authored)
+**Next extractions** (by estimated value + effort):
+1. Type predicates: `zer_type_is_move_struct(int kind, int is_move_flag)` — requires exposing a minimal type-kind enum (no Type* in extracted function signature — primitive args only)
+2. Range predicates: bounds check, variant in range, pool count valid
+3. Cascade the 3 single-value predicates (is_alive/is_freed/is_transferred) to replace inline `h->state == IR_HS_X` sites throughout zercheck_ir.c (~30+ sites)
+4. ... (see checklist in `docs/compiler-internals.md` when authored)
 
 Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zercheck_ir.c to call it, (3) add VST proof, (4) add to `make check-vst`, (5) commit. One predicate per commit.
 
@@ -256,7 +259,7 @@ Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zerche
 | **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
 | **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
 | **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
-| **Level 3 — VST on extracted predicates** | 1 real extraction (`zer_handle_state_is_invalid`) + 21 pre-extraction demonstrators. Pattern established. Continuing. |
+| **Level 3 — VST on extracted predicates** | 4 real extractions (all 4 handle-state predicates in `src/safety/handle_state.c`) + 21 pre-extraction demonstrators. Pattern established. Continuing. |
 | λZER-concurrency (Iris concurrency primitives) | Not started. |
 | λZER-async | Not started. |
 

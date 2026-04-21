@@ -89,6 +89,38 @@ Four-way failure story in place:
 Scope: 15-25 pure predicates total. Honest count for "Level-3-verified
 compiler functions" = 1 after this session.
 
+### Second batch (same day, same session)
+
+Extracted 3 more handle-state predicates to `src/safety/handle_state.c`:
+- `zer_handle_state_is_alive(int state)` → `state == ZER_HS_ALIVE`
+- `zer_handle_state_is_freed(int state)` → `state == ZER_HS_FREED`
+- `zer_handle_state_is_transferred(int state)` → `state == ZER_HS_TRANSFERRED`
+
+Also consolidated `zercheck.c:is_handle_consumed` (duplicate 3-state
+logic with `is_handle_invalid`) to delegate to the same VST-verified
+predicate. Both now call `zer_handle_state_is_invalid`.
+
+VST proof (`verif_handle_state.v`) extended to cover all 4 predicates.
+Same `repeat forward_if; ...; repeat destruct (Z.eq_dec _ _); try lia;
+try entailer!` pattern works for every single-value and multi-value
+state check. Zero admits across all 4 lemmas.
+
+`make check-vst` still green. `make docker-check` still 412/413 (same
+pre-existing A01_no_uaf failure).
+
+**Honest count for "Level-3-verified compiler functions" after 2nd batch: 4.**
+
+### Makefile: `check-all` target added
+
+For CI convenience, `make check-all` runs tests + Iris/Coq proofs +
+VST + safety coverage audit in one shot. Roughly 20 minutes total.
+
+Individual targets unchanged:
+- `make check` — C unit tests (~5 min)
+- `make check-proofs` — Iris/Coq, ~330 theorems, 0 admits (~10 min)
+- `make check-vst` — VST on extracted predicates + demonstrators (~3 min)
+- `make check-safety-coverage` — safety_list.md audit (<1 min)
+
 ---
 
 ## Session 2026-04-21 (Level 3 VST kickoff) — VST 3.0 Iris setup patterns

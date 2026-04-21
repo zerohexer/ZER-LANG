@@ -110,6 +110,22 @@ pre-existing A01_no_uaf failure).
 
 **Honest count for "Level-3-verified compiler functions" after 2nd batch: 4.**
 
+### Third batch — range predicates
+
+Extracted 3 range-validity predicates to `src/safety/range_checks.c`:
+- `zer_count_is_positive(int n)` → `n > 0`
+- `zer_index_in_bounds(int size, int idx)` → `0 <= idx < size`
+- `zer_variant_in_range(int n, int idx)` → `0 <= idx < n`
+
+Wired `zer_count_is_positive` into `checker.c` Pool + Ring count validation
+(2 call sites; Semaphore/array size still use inline check, future delegation).
+
+VST proof (`verif_range_checks.v`) with 3 lemmas, zero admits. All 5 VST
+verification files (handle_state + range_checks + 3 demonstrators) pass
+`make check-vst` with zero admits.
+
+**Honest count after 3rd batch: 7 Level-3-verified compiler functions.**
+
 ### Makefile: `check-all` target added
 
 For CI convenience, `make check-all` runs tests + Iris/Coq proofs +

@@ -1,4 +1,5 @@
 #include "checker.h"
+#include "src/safety/range_checks.h"   /* zer_count_is_positive — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1329,7 +1330,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
             /* BUG-423: resolve comptime calls before eval */
             check_expr(c, tn->pool.count_expr);
             int64_t val = eval_const_expr(tn->pool.count_expr);
-            if (val > 0) count = (uint32_t)val;
+            if (zer_count_is_positive((int)val)) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Pool count must be a positive compile-time constant");
         }
         return type_pool(c->arena, elem, count);
@@ -1342,7 +1343,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
             /* BUG-423: resolve comptime calls before eval */
             check_expr(c, tn->ring.count_expr);
             int64_t val = eval_const_expr(tn->ring.count_expr);
-            if (val > 0) count = (uint32_t)val;
+            if (zer_count_is_positive((int)val)) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Ring count must be a positive compile-time constant");
         }
         return type_ring(c->arena, elem, count);

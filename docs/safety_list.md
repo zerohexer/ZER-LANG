@@ -96,14 +96,14 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | E. Atomic / condvar / barrier / semaphore | 8 | ○ |
 | F. Async / coroutine context | 5 | ○ |
 | G. Control-flow context safety | 12 | ✓ (typing + context-flag enforced; `iris_control_flow.v`) |
-| H. MMIO / volatile / hardware | 9 | ○ |
+| H. MMIO / volatile / hardware | 9 | ✓ (range + alignment + runtime trap; `iris_mmio_cast_escape.v`) |
 | I. Qualifier preservation (const/volatile) | 11 | ✓ (all 11 rows, typing-enforced) |
-| J. Pointer cast & provenance | 10 | ○ |
+| J. Pointer cast & provenance | 14 | ✓ (typing + provenance ghost state; `iris_mmio_cast_escape.v`) |
 | K. `@container` / `@offset` / `@size` | 4 | ✓ (typing-enforced; `container_intrinsics_well_typed`) |
 | L. Bounds / indexing / slicing | 11 | ✓ (VRP + runtime trap; `iris_misc_sections.bounds_safety_compile_or_runtime`) |
 | M. Division / arithmetic safety | 10 | ✓ (VRP + typing; `division_safety_via_vrp_or_trap`) |
 | N. Null / optional safety | 8 | ✓ (3 N-specific + 5 already `—` typing) |
-| O. Escape analysis (dangling) | 12 | ○ |
+| O. Escape analysis (dangling) | 12 | ✓ (region invariants; `iris_mmio_cast_escape.escape_checks_all_paths`) |
 | P. Union / enum variant safety | 8 | ✓ (variant-tag + typing; `iris_misc_sections.variant_safety`) |
 | Q. Switch exhaustiveness | 5 | ✓ (all typing-enforced) |
 | R. Comptime / static_assert | 6 | ✓ (evaluator totality; `comptime_evaluator_sound`) |

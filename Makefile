@@ -255,7 +255,12 @@ check-vst-image:
 check-vst:
 	cd proofs/vst && MSYS_NO_PATHCONV=1 docker run --rm \
 	    -v "$$(pwd -W 2>/dev/null || pwd):/work" -w /work zer-vst \
-	    bash -c 'eval $$(opam env) && coqc -Q . zer_vst simple_check.v && coqc -Q . zer_vst verif_simple_check.v'
+	    bash -c 'eval $$(opam env) && \
+	        clightgen -normalize simple_check.c zer_checks.c && \
+	        coqc -Q . zer_vst simple_check.v && \
+	        coqc -Q . zer_vst verif_simple_check.v && \
+	        coqc -Q . zer_vst zer_checks.v && \
+	        coqc -Q . zer_vst verif_zer_checks.v'
 	@echo "=== VST proofs compile green ==="
 	@if grep -l 'Admitted\|admit\.' proofs/vst/verif_*.v 2>/dev/null | grep -q .; then \
 	    echo "FAIL: admits found in VST proofs"; exit 1; \

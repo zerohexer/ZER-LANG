@@ -47,11 +47,25 @@ Two purposes:
 
 ---
 
+## Phase 1 milestone (λZER-Handle closure)
+
+**Status 2026-04-21:** Phase 1 of the Iris operational-semantics proofs is complete. 21 axiom-free lemmas across 8 Coq files build green against the `zer-proofs` Docker image. Details in `proofs/operational/lambda_zer_handle/iris_*.v`.
+
+6 of 18 rows in section A are now ✓ — the core safety argument for handle-based programs:
+- **A01 + A02** (use-after-free): `spec_get` — ownership is necessary to read
+- **A06 + A08** (double-free): `alive_handle_exclusive` — two owners impossible
+- **A13** (wrong pool): pool_id is part of the resource tag by construction
+- **A17** (runtime gen-check redundancy): proven compile-time via `handle_alive_from_interp`
+
+The 12 still-◐ rows in section A need either (a) alloc step spec + wp_alloc (A09, A10, A11, A12 — leak detection), (b) cross-function FuncSpec reasoning (A05, A07, A14), (c) specific extensions (A03 interior pointers, A04 cast, A15 loop, A16 aggregate, A18 runtime-opaque).
+
+None of the remaining work requires new INFRASTRUCTURE — the resource algebra, state interpretation, and adequacy bridges from Phase 1 are sufficient. Future sessions extend the proof by building on top.
+
 ## Summary
 
 | Category | Rows | Status |
 |---|---|---|
-| A. Handle lifecycle (UAF, double-free, leak) | 14 | ◐ |
+| A. Handle lifecycle (UAF, double-free, leak) | 18 | ◐ (6 rows ✓) |
 | B. Move struct / ownership transfer | 7 | ○ |
 | C. Thread safety & spawn | 12 | ○ |
 | D. Shared struct & deadlock | 5 | ○ |
@@ -85,23 +99,23 @@ Core handle safety — what `λZER-Handle` proves.
 
 | # | Predicate | Source (file:line) | Model | Subset | Iris technique | Status |
 |---|---|---|---|---|---|---|
-| A01 | Use-after-free (simple): `use-after-free: X freed at line N` | zercheck.c:516, 981; zercheck_ir.c:754, 1214, 1261, 1552, 1906 | M1 | λZER-Handle | Resource `alive_handle p i g` — not owned after free | ◐ |
-| A02 | Use-after-free (MAYBE_FREED): `may have been freed` | zercheck.c:520, 988; | M1 | λZER-Handle | Resource disjunction — branch-merged state | ◐ |
+| A01 | Use-after-free (simple): `use-after-free: X freed at line N` | zercheck.c:516, 981; zercheck_ir.c:754, 1214, 1261, 1552, 1906 | M1 | λZER-Handle | Resource `alive_handle p i g` — not owned after free | ✓ |
+| A02 | Use-after-free (MAYBE_FREED): `may have been freed` | zercheck.c:520, 988; | M1 | λZER-Handle | Resource disjunction — branch-merged state | ✓ |
 | A03 | Use-after-free via field/interior pointer: `compound X on local %X` | zercheck_ir.c:1265 | M1+M2 | λZER-Handle | Resource fraction (parent→child share alloc_id) | ◐ |
 | A04 | Use-after-free in cast: `use of X handle %X in cast` | zercheck_ir.c:1125 | M1 | λZER-Handle | Resource required for cast | ◐ |
 | A05 | Use-after-free through function call: `X cannot pass to function` | zercheck.c:1142 | M1+M3 | λZER-Handle | FuncSpec pre-condition on resource | ◐ |
-| A06 | Double-free (simple): `X already freed at line N` | zercheck.c:426, 481, 1036, 2435; zercheck_ir.c:1186, 1874, 2087; emitter.c:4587 (runtime) | M1 | λZER-Handle | Resource consumed by free — second free has no resource | ◐ |
+| A06 | Double-free (simple): `X already freed at line N` | zercheck.c:426, 481, 1036, 2435; zercheck_ir.c:1186, 1874, 2087; emitter.c:4587 (runtime) | M1 | λZER-Handle | Resource consumed by free — second free has no resource | ✓ |
 | A07 | Double-free (cross-function): `freed by call to X` | zercheck.c:2462, 2466 | M1+M3 | λZER-Handle | Cross-function resource flow via FuncSpec | ◐ |
-| A08 | Double-free (MAYBE): `freeing X which may already be freed` | zercheck_ir.c:1190, 1878, 2091 | M1 | λZER-Handle | Resource disjunction | ◐ |
+| A08 | Double-free (MAYBE): `freeing X which may already be freed` | zercheck_ir.c:1190, 1878, 2091 | M1 | λZER-Handle | Resource disjunction | ✓ |
 | A09 | Handle leak on alive-overwrite: `overwritten while alive — previous leaked` | zercheck.c:685, 705, 1279; zercheck_ir.c:969, 1520, 1825, 2039 | M1 | λZER-Handle | Assignment consumes old resource → error if alive | ◐ |
 | A10 | Handle leak on scope exit: `allocated but never freed` | zercheck.c:2694; zercheck_ir.c:2923 | M1 | λZER-Handle | Adequacy: no residual `alive_handle` at program end | ◐ |
 | A11 | Handle leak on path divergence: `may not be freed on all paths` | zercheck.c:2701; zercheck_ir.c:2940 | M1 | λZER-Handle | Convergent resource state per CFG branch | ◐ |
 | A12 | Ghost handle (discarded alloc): `allocation discarded — handle leaked` | checker.c:8385; zercheck_ir.c:2916 | M1 | λZER-Handle | wp_alloc binds result — discarding = leaking resource | ◐ |
-| A13 | Wrong pool: `allocated from pool X, used on pool Y` | zercheck.c:525 | M1 | λZER-Handle | Resource tagged with pool_id; free/get must match | ◐ |
+| A13 | Wrong pool: `allocated from pool X, used on pool Y` | zercheck.c:525 | M1 | λZER-Handle | Resource tagged with pool_id; free/get must match | ✓ |
 | A14 | Freed-pointer return: `returning freed pointer X` | zercheck.c:2055, 2059; zercheck_ir.c:1663, 1698 | M1+M2 | λZER-Handle + λZER-escape | FuncSpec post-condition — return ptr must be alive | ◐ |
 | A15 | Handle freed inside loop: `may cause use-after-free` | zercheck.c:2022 | M1+M2 | λZER-Handle | Loop fixpoint convergence on resource state | ◐ |
 | A16 | All elements freed in loop: aggregation check | checker.c:4665 | M1 | λZER-Handle | Resource quantification over array indices | ◐ |
-| A17 | Runtime: handle generation mismatch (pool.get) | emitter.c:4432 | M1 | λZER-Handle | wp spec: `alive_handle` required | ◐ |
+| A17 | Runtime: handle generation mismatch (pool.get) | emitter.c:4432 | M1 | λZER-Handle | wp spec: `alive_handle` required | ✓ |
 | A18 | Runtime: tracked pointer UAF/free | emitter.c:4533, 4561, 4633, 4587 | M1 | λZER-Handle + λZER-opaque | Runtime tag = ghost state projection | ◐ |
 
 ## B. Move struct / ownership transfer

@@ -164,7 +164,8 @@ When adding a new safety row, find the matching file:
 | G01-G12 (control flow) | Schematic | `iris_control_flow.v` |
 | H01-H09 (MMIO) | Schematic | `iris_mmio_cast_escape.v` |
 | I01-I11 (qualifiers) | Schematic | `iris_typing_rules.v` |
-| J01-J14 (cast/provenance) | Schematic | `iris_mmio_cast_escape.v` |
+| J01-J14 (cast/provenance) | Schematic (in lambda_zer_handle) | `iris_mmio_cast_escape.v` |
+| J01, J04, J11, J12, J13, J14 (core provenance) | **FULL operational** (dedicated subset) | `lambda_zer_opaque/syntax.v`, `semantics.v`, `iris_opaque_resources.v`, `iris_opaque_state.v`, `iris_opaque_specs.v`, `iris_opaque_theorems.v` |
 | K01-K04 (@container/etc) | Schematic | `iris_typing_rules.v` |
 | L01-L11 (bounds) | Schematic | `iris_misc_sections.v` |
 | M01-M13 (arith) | Schematic | `iris_misc_sections.v` |

@@ -15,4 +15,5 @@ lambda_zer_handle/iris_state.v
 lambda_zer_handle/iris_specs.v
 lambda_zer_handle/iris_step_specs.v
 lambda_zer_handle/iris_adequacy.v
+lambda_zer_handle/iris_leak.v
 lambda_zer_handle/iris_demo.v

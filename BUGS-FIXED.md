@@ -5,6 +5,126 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (Iris Phase 1 build-out) — proof infrastructure fixes
+
+**Not traditional compiler bugs.** Bugs/pitfalls found while building the
+λZER-Handle Iris proofs. All in proof code (`proofs/operational/lambda_zer_handle/*.v`)
+or in `tools/safety_coverage.sh`. Recorded here so a fresh session doesn't
+waste hours re-discovering them. Full details in `docs/proof-internals.md`.
+
+### adequacy.v — malformed `destruct` intropatterns
+
+**Symptom:** `Syntax error: '|' or ']' expected` at 5 sites.
+
+**Root cause:** `destruct e as [v|||||||||||||]` with 13 pipes (= 14 branches)
+when `expr` has 13 constructors. N constructors need N-1 pipes.
+
+**Fix (cf1f585):** replaced with `destruct e; try discriminate Hv` — simpler,
+same effect. Regression guard: the baseline `make` in `proofs/operational/`
+must succeed.
+
+### adequacy.v — `inversion` auto-names break when tactic state shifts
+
+**Symptom:** `No such hypothesis: H0` / `No such hypothesis: H`.
+
+**Root cause:** `inversion Hty; subst` auto-generates `H`, `H0`, `H1`, etc.
+Numbering depends on goal state — fragile across tactic changes.
+
+**Fix:** use `match goal with Hvt : shape |- _ => ... end` to pin hypotheses
+by SHAPE. Robust to state changes.
+
+### iris_lang.v — name collision: `expr`/`val`/`state` shadowed
+
+**Symptom:** `Illegal application (Non-functional construction): expr` or
+`The term "val" has type "language → Type"`.
+
+**Root cause:** After `From iris.program_logic Require Import weakestpre`,
+Iris's `language` projections shadow our types.
+
+**Fix (feb4c3c):** qualify at lemma signatures (`syntax.val`, `syntax.expr`).
+Inside proof bodies, Canonical Structure unification handles it.
+
+### iris_lang.v — `{| ... |}` record syntax breaks on field-name collision
+
+**Symptom:** `Error: expr: Not a projection.`
+
+**Root cause:** Iris's `language` has an `expr` field. `{| expr := expr |}`
+confuses Coq about which `expr`.
+
+**Fix:** use positional constructor `Language λZH_mixin` and
+`Build_LanguageMixin _ _ _ ...`.
+
+### iris_lang.v — `wp_value` requires `IntoVal` instance
+
+**Symptom:** `iStartProof: not a BI assertion: (IntoVal (EVal v) ?Goal).`
+
+**Root cause:** `wp_value` has an `IntoVal e v` typeclass precondition.
+
+**Fix (a6e6711):** register `Global Instance into_val_EVal (v : val) : IntoVal
+(EVal v) v` in iris_lang.v. One instance per value-yielding constructor.
+
+### iris_resources.v — ghost_map insert-on-free violates state_interp agreement
+
+**Symptom:** 3 admits in `step_spec_free` — could not prove
+`gens_agree_store σ' gens'` after a free step.
+
+**Root cause:** `alive_handle_free` used `ghost_map_update` (insert new gen).
+After free, concrete slot has `slot_val = None` (NOT alive), but ghost map
+still had an entry → agreement violated.
+
+**Fix (baf36f7):** use `ghost_map_delete` instead. Ghost map tracks "currently
+alive," not "ever allocated." All 3 admits closed.
+
+**Lesson:** ghost state must track *currently true* facts, never *ever true*.
+
+### iris_step_specs.v — `injection ... as -> -> ->` clobbers metavariables
+
+**Symptom:** `Error: The variable i was not found in the current environment`.
+
+**Root cause:** `injection Heq as -> -> ->` with destruct pattern `(p',i',g') =
+(p,i,g)` can accidentally eliminate the target metavariable.
+
+**Fix:** use named patterns: `injection Heq as Hp_eq Hi_eq. subst p' i' g'.`
+
+### iris_step_specs.v — `apply step_rule with args` fails for computed `st'`
+
+**Symptom:** `Not the right number of missing arguments (expected 0).`
+
+**Root cause:** Step rules like `step_free_alive` have `let st' := ...` where
+`st'` is computed. `apply ... with ps s` can't infer `st'`.
+
+**Fix:** use `eapply step_free_alive; eauto`.
+
+### tools/safety_coverage.sh — multi-line call extraction missed 46 sites
+
+**Symptom:** Part 3 (zercheck_ir.c) showed 0 entries despite 46 `ir_zc_error`
+call sites.
+
+**Root cause:** Regex matched single-line only. zercheck_ir.c formats most
+calls as multi-line (function name on one line, message on next).
+
+**Fix (b360475):** added `join_lines` awk preprocessor that collapses
+continuation lines before regex matching.
+
+### tools/safety_coverage.sh — sed `|` delimiter breaks on messages containing `|`
+
+**Symptom:** `sed: unknown option to 's'`.
+
+**Root cause:** Using `s|.*|.*|` when messages contain `|` characters.
+
+**Fix:** switched to `#` as sed delimiter and `@@@` as awk field separator.
+
+### tools/safety_coverage.sh — `set -e` + empty grep = silent exit
+
+**Symptom:** Script exited 1 after Part 2 with no error output.
+
+**Root cause:** `grep -c ... || echo 0` works only if grep returns exactly 1.
+Other non-zero codes propagated through `||` under `set -e`.
+
+**Fix:** changed `set -eu` → `set -u`, added `|| true` after every grep pipeline.
+
+---
+
 ## Session 2026-04-20 (ir_validate hardening) — phases 1+2
 
 **Defense-in-depth, not bug fixes.** No active bugs; `ir_validate`

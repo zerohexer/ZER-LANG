@@ -128,7 +128,7 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | **Total curated rows** | **203** | |
 | **Total raw predicates covered** | **374** | |
 
-**Coverage denominator:** 374 unique predicates from `safety_coverage_raw.md`. This doc groups them into 203 rows (many predicates are format-string variants of the same semantic check).
+**Coverage denominator:** 419 unique predicates from `safety_coverage_raw.md` (expanded 2026-04-21 to also cover `checker_warning`, `checker_add_diag`, parser errors (`error`, `error_at`, `error_current`, `warn`), and lexer `error_token`). This doc groups them into 203 rows (many predicates are format-string variants of the same semantic check, and parser/lexer errors mostly map to section U/R).
 
 ---
 

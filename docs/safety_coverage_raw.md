@@ -27,10 +27,12 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 
 | Source | Call sites (joined) |
 |---|---|
-| checker.c (compile-time checker_error) | 344 |
+| checker.c (checker_error/warning/add_diag) | 362 |
 | zercheck.c (handle-tracking zc_error/warning) | 40 |
 | zercheck_ir.c (CFG-based ir_zc_error/warning) | 46 |
 | emitter.c (runtime _zer_trap / _zer_bounds_check) | 36 |
+| parser.c (syntactic error/warn) | 31 |
+| lexer.c (error_token) | 13 |
 
 ## Part 1 — Compile-time checks (checker.c)
 
@@ -62,12 +64,14 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 2500 | `'~' requires integer, got 'X'` |
 | 5968 | `@X first argument must be a shared struct variable` |
 | 5707 | `@X first argument must be pointer to integer` |
+| 5701 | `@X on 64-bit type may require libatomic on 32-bit targets ` |
 | 5729 | `@X on packed struct field — may be misaligned. ` |
 | 5951 | `@X requires 1 argument: @X(shared_var)` |
 | 5687 | `@X requires 2 arguments` |
 | 5697 | `@X target must be 1, 2, 4, or 8 bytes (got X-bit type)` |
 | 5682 | `@atomic_cas requires 3 arguments` |
 | 5672 | `@atomic_load argument must be pointer to integer` |
+| 5668 | `@atomic_load on 64-bit type may require libatomic on 32-bit targets` |
 | 5656 | `@atomic_load requires 1 argument` |
 | 5665 | `@atomic_load target must be 1, 2, 4, or 8 bytes (got X-bit type)` |
 | 5677 | `@atomic_store requires 2 arguments` |
@@ -105,6 +109,7 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 5420 | `@ptrcast source must be a pointer, got 'X'` |
 | 5410 | `@ptrcast target must be a pointer type, got 'X'` |
 | 5464 | `@ptrcast type mismatch: source has provenance 'X' ` |
+| 6727 | `@ptrtoint result stored in 'X' — use 'usize' for portability ` |
 | 5612 | `@ptrtoint source must be a pointer, got 'X'` |
 | 5529 | `@saturate requires numeric source, got 'X'` |
 | 5534 | `@saturate target must be an integer type, got 'X'` |
@@ -118,6 +123,7 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 3917 | `Arena.over() takes exactly 1 argument` |
 | 4717 | `Handle element type 'X' is not a struct — cannot auto-deref` |
 | 5010 | `MMIO index X is out of range (max X from mmio declaration)` |
+| 5019 | `MMIO index 'X' not proven in range (max X) — auto-guard inserted` |
 | 1333 | `Pool count must be a positive compile-time constant` |
 | 3760 | `Pool has no method 'X' (available: alloc, alloc_ptr, get, free, free_ptr)` |
 | 8702 | `Pool/Ring/Slab cannot be struct fields — must be global or static variables` |
@@ -133,6 +139,7 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 3939 | `arena.alloc: unknown type 'X'` |
 | 3967 | `arena.alloc_slice() takes exactly 2 arguments` |
 | 3978 | `arena.alloc_slice: unknown type 'X'` |
+| 3954 | `arena.reset() outside defer may cause dangling pointers — ` |
 | 3950 | `arena.reset() takes no arguments` |
 | 3992 | `arena.unsafe_reset() takes no arguments` |
 | 4320 | `argument X: arena-derived pointer 'X' cannot ` |
@@ -159,6 +166,7 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 1298 | `array size must be a compile-time constant` |
 | 1220 | `array size must be an integer` |
 | 8397 | `asm statements only allowed in naked functions — ` |
+| 4670 | `auto-guard inserted for 'X' — element may have been freed ` |
 | 5110 | `bit extraction high index (X) must be >= low index (X)` |
 | 5102 | `bit index X out of range for X-bit type 'X'` |
 | 3536 | `bitwise compound assignment requires integer types, got 'X'` |
@@ -284,6 +292,8 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 2263 | `expression nesting too deep (limit 1000) — simplify expression` |
 | 794 | `field '.X' expects 'X', got 'X'` |
 | 7518 | `for condition must be bool, got 'X'` |
+| 10096 | `function 'X' calls through function pointer with unknown target — ` |
+| 10048 | `function 'X' is recursive — unbounded stack growth on embedded` |
 | 10058 | `function 'X' local stack X bytes exceeds --stack-limit X` |
 | 8282 | `function must return 'X', not void` |
 | 6591 | `function pointer requires an initializer — ` |
@@ -294,6 +304,7 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 170 | `identifier 'X' uses reserved prefix '_zer_' — ` |
 | 7311 | `if condition must be bool or optional, got 'X'` |
 | 7222 | `if-unwrap requires optional type, got 'X'` |
+| 4932 | `index 'X' not proven in range for array of size X — ` |
 | 10523 | `integer literal X does not fit in 'X'` |
 | 3519 | `integer literal X does not fit in 'X'` |
 | 6738 | `integer literal X does not fit in 'X'` |
@@ -317,6 +328,7 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 9432 | `not all control flow paths return a value in function 'X'` |
 | 3208 | `orelse fallback stores local pointer in global — ` |
 | 5164 | `orelse fallback type 'X' doesn't match 'X'` |
+| 5030 | `pointer indexing has no bounds check — ` |
 | 3692 | `pool.alloc() takes no arguments` |
 | 3735 | `pool.alloc_ptr() takes no arguments` |
 | 3720 | `pool.free() expects Handle(X), got Handle(X)` |
@@ -324,6 +336,8 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 3751 | `pool.free_ptr() expects '*X', got 'X'` |
 | 3745 | `pool.free_ptr() takes exactly 1 argument` |
 | 3699 | `pool.get() takes exactly 1 argument` |
+| 3779 | `pushing pointer through Ring channel — ` |
+| 3798 | `pushing pointer through Ring channel — ` |
 | 193 | `redefinition of 'X'` |
 | 8272 | `return type 'X' doesn't match function return type 'X'` |
 | 3811 | `ring.pop() takes no arguments` |
@@ -345,9 +359,11 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 8500 | `spawn argument X: cannot pass string literal to mutable []u8 parameter — ` |
 | 8559 | `spawn argument X: cannot pass volatile pointer to non-volatile parameter` |
 | 8575 | `spawn argument X: expected 'X', got 'X'` |
+| 8609 | `spawn target 'X' accesses non-shared global 'X' — ` |
 | 8615 | `spawn target 'X' accesses non-shared global 'X' — ` |
 | 8459 | `spawn target 'X' is not a function` |
 | 8475 | `spawn target 'X' returns 'X' — resource would leak. ` |
+| 8481 | `spawn target 'X' returns 'X' — return value lost` |
 | 10481 | `static_assert condition must be a compile-time constant` |
 | 8351 | `static_assert condition must be a compile-time constant` |
 | 10489 | `static_assert failed` |
@@ -466,6 +482,51 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 | 2260 | `use of X value (local %%X) in field write` |
 | 1575 | `use of transferred value (local %%X) — ownership already moved` |
 
+## Part 3b — Parser syntactic/semantic errors (parser.c)
+
+| Line | Message |
+|---|---|
+| 481 | `[]T is deprecated, use [*]T instead` |
+| 2472 | `async can only be applied to functions` |
+| 2461 | `comptime can only be applied to functions` |
+| 495 | `expected ']' after '[*'` |
+| 498 | `expected ']' or '*]' for slice type` |
+| 1456 | `expected 'if' after 'comptime' in statement` |
+| 2268 | `expected 'rw' in shared(rw)` |
+| 1550 | `expected 'spawn' after 'ThreadHandle name ='` |
+| 838 | `expected expression` |
+| 1558 | `expected function name after 'spawn'` |
+| 1592 | `expected function name after 'spawn'` |
+| 784 | `expected intrinsic name after '@'` |
+| 1509 | `expected label name after 'goto'` |
+| 2073 | `expected name in function pointer declaration` |
+| 1937 | `expected name in function pointer field` |
+| 2131 | `expected name in function pointer parameter` |
+| 392 | `expected type` |
+| 1540 | `expected variable name after 'ThreadHandle'` |
+| 957 | `expression nesting too deep (limit 256)` |
+| 1242 | `for-in collection must be a variable or field — ` |
+| 661 | `invalid hex digit in \\x escape` |
+| 1038 | `nesting too deep (limit 64)` |
+| 705 | `too many designated initializer fields (max 128)` |
+
+## Part 3c — Lexer errors (lexer.c)
+
+| Line | Message |
+|---|---|
+| 405 | `empty character literal` |
+| 331 | `expected binary digit after '0b'` |
+| 321 | `expected hex digit after '0x'` |
+| 371 | `expected two hex digits after '\\x'` |
+| 399 | `expected two hex digits after '\\x'` |
+| 394 | `invalid escape sequence in character literal` |
+| 366 | `invalid escape sequence in string` |
+| 532 | `unexpected character` |
+| 392 | `unterminated character literal` |
+| 410 | `unterminated character literal` |
+| 364 | `unterminated string` |
+| 379 | `unterminated string` |
+
 ## Part 4 — Runtime trap emissions (emitter.c)
 
 Each row is a site where the emitter inserts a runtime safety
@@ -507,7 +568,7 @@ Distinct safety checks once format-string variation is stripped.
 This is the **coverage denominator**: every unique predicate
 must appear in `docs/safety_coverage.md`.
 
-**Unique predicates: 374**
+**Unique predicates: 419**
 
 <details><summary>Full list (click to expand)</summary>
 
@@ -523,14 +584,18 @@ must appear in `docs/safety_coverage.md`.
 'orelse' requires optional type, got 'X'
 'yield' only allowed inside async function
 '~' requires integer, got 'X'
+55:static void error(Parser *p, const char *msg) {
+59:static void warn(Parser *p, const char *msg) {
 @X first argument must be a shared struct variable
 @X first argument must be pointer to integer
+@X on 64-bit type may require libatomic on 32-bit targets 
 @X on packed struct field — may be misaligned. 
 @X requires 1 argument: @X(shared_var)
 @X requires 2 arguments
 @X target must be 1, 2, 4, or 8 bytes (got X-bit type)
 @atomic_cas requires 3 arguments
 @atomic_load argument must be pointer to integer
+@atomic_load on 64-bit type may require libatomic on 32-bit targets
 @atomic_load requires 1 argument
 @atomic_load target must be 1, 2, 4, or 8 bytes (got X-bit type)
 @atomic_store requires 2 arguments
@@ -568,6 +633,7 @@ must appear in `docs/safety_coverage.md`.
 @ptrcast source must be a pointer, got 'X'
 @ptrcast target must be a pointer type, got 'X'
 @ptrcast type mismatch: source has provenance 'X' 
+@ptrtoint result stored in 'X' — use 'usize' for portability 
 @ptrtoint source must be a pointer, got 'X'
 @saturate requires numeric source, got 'X'
 @saturate target must be an integer type, got 'X'
@@ -580,6 +646,7 @@ must appear in `docs/safety_coverage.md`.
 Arena has no method 'X' (available: over, alloc, alloc_slice, reset, unsafe_reset)
 Arena.over() takes exactly 1 argument
 Handle element type 'X' is not a struct — cannot auto-deref
+MMIO index 'X' not proven in range (max X) — auto-guard inserted
 MMIO index X is out of range (max X from mmio declaration)
 Pool count must be a positive compile-time constant
 Pool has no method 'X' (available: alloc, alloc_ptr, get, free, free_ptr)
@@ -604,11 +671,13 @@ X.alloc_ptr() takes no arguments
 X.free() takes exactly 1 argument
 X.free_ptr() expects '*X', got 'X'
 X.free_ptr() takes exactly 1 argument
+[]T is deprecated, use [*]T instead
 all elements of 'X' were freed in loop — 
 arena.alloc() takes exactly 1 argument
 arena.alloc: unknown type 'X'
 arena.alloc_slice() takes exactly 2 arguments
 arena.alloc_slice: unknown type 'X'
+arena.reset() outside defer may cause dangling pointers — 
 arena.reset() takes no arguments
 arena.unsafe_reset() takes no arguments
 argument X: arena-derived pointer 'X' cannot 
@@ -633,6 +702,8 @@ array size must be > 0
 array size must be a compile-time constant
 array size must be an integer
 asm statements only allowed in naked functions — 
+async can only be applied to functions
+auto-guard inserted for 'X' — element may have been freed 
 bit extraction high index (X) must be >= low index (X)
 bit index X out of range for X-bit type 'X'
 bitwise compound assignment requires integer types, got 'X'
@@ -733,6 +804,7 @@ cast cannot strip const qualifier — target must be const pointer
 cast type mismatch: source has provenance '*X' 
 compound assignment requires numeric types
 compound assignment would narrow 'X' (X-bit) into 'X' (X-bit) — use @truncate
+comptime can only be applied to functions
 comptime function 'X' body could not be evaluated at compile time
 comptime function 'X' requires all arguments to be compile-time constants
 comptime if condition must be a compile-time constant
@@ -754,15 +826,37 @@ duplicate field 'X' in struct 'X'
 duplicate label 'X' (first defined at line X)
 duplicate variant 'X' in enum 'X'
 duplicate variant 'X' in union 'X'
+empty character literal
 entry 'X' call chain contains function pointer call with 
+expected ']' after '[*'
+expected ']' or '*]' for slice type
+expected 'if' after 'comptime' in statement
+expected 'rw' in shared(rw)
+expected 'spawn' after 'ThreadHandle name ='
 expected X arguments, got X
+expected binary digit after '0b'
+expected expression
+expected function name after 'spawn'
+expected hex digit after '0x'
+expected intrinsic name after '@'
+expected label name after 'goto'
+expected name in function pointer declaration
+expected name in function pointer field
+expected name in function pointer parameter
+expected two hex digits after '\\x'
+expected type
+expected variable name after 'ThreadHandle'
 expression nesting too deep (limit 1000) — simplify expression
+expression nesting too deep (limit 256)
 field '.X' expects 'X', got 'X'
 for condition must be bool, got 'X'
+for-in collection must be a variable or field — 
 freeing %%X which may already be freed
 freeing %%X which was already transferred
 freeing local %%X which may already be freed
 freeing local %%X which was already transferred
+function 'X' calls through function pointer with unknown target — 
+function 'X' is recursive — unbounded stack growth on embedded
 function 'X' local stack X bytes exceeds --stack-limit X
 function must return 'X', not void
 function pointer requires an initializer — 
@@ -782,8 +876,12 @@ heterogeneous *opaque array: 'X' has provenance 'X' but element assigned 'X'
 identifier 'X' uses reserved prefix '_zer_' — 
 if condition must be bool or optional, got 'X'
 if-unwrap requires optional type, got 'X'
+index 'X' not proven in range for array of size X — 
 integer literal X does not fit in 'X'
 invalid cast from 'X' to 'X'
+invalid escape sequence in character literal
+invalid escape sequence in string
+invalid hex digit in \\x escape
 logical operators require bool, got 'X' and 'X'
 mmio range start (0xX) must be <= end (0xX)
 move struct 'X' cannot be a field of shared struct 'X' — 
@@ -791,6 +889,7 @@ move struct cannot be captured by value in switch —
 move struct cannot be captured by value — use |*X| for pointer capture
 naked function must only contain asm and return — 
 nested optional '??T' is not supported
+nesting too deep (limit 64)
 no Pool or Slab found for Handle(X) — cannot auto-deref. 
 no field 'X' on type 'X'
 no variant 'X' in enum 'X'
@@ -800,6 +899,7 @@ not all control flow paths return a value in function 'X'
 orelse fallback stores local pointer in global — 
 orelse fallback type 'X' doesn't match 'X'
 passing X handle %%X to function that frees it
+pointer indexing has no bounds check — 
 pointer leak: 'X' overwritten while alive (allocated at line X)
 pool.alloc() takes no arguments
 pool.alloc_ptr() takes no arguments
@@ -808,6 +908,7 @@ pool.free() takes exactly 1 argument
 pool.free_ptr() expects '*X', got 'X'
 pool.free_ptr() takes exactly 1 argument
 pool.get() takes exactly 1 argument
+pushing pointer through Ring channel — 
 redefinition of 'X'
 return type 'X' doesn't match function return type 'X'
 returning X pointer (local %%X, freed at line X) — 
@@ -840,6 +941,7 @@ spawn banned inside @critical block —
 spawn target 'X' accesses non-shared global 'X' — 
 spawn target 'X' is not a function
 spawn target 'X' returns 'X' — resource would leak. 
+spawn target 'X' returns 'X' — return value lost
 static_assert condition must be a compile-time constant
 static_assert failed
 static_assert failed: X
@@ -855,10 +957,12 @@ switch on union 'X' is not exhaustive —
 synchronization primitive 'X' cannot be inside packed struct — 
 thread already joined: 'X' joined at line X
 thread not joined: 'X' spawned but never joined — 
+too many designated initializer fields (max 128)
 unary '-' requires numeric type, got 'X'
 undefined container 'X'
 undefined identifier 'X'
 undefined type 'X'
+unexpected character
 union 'X' cannot contain itself by value — use '*X' (pointer) instead
 union variant 'X' cannot have type 'void'
 union variant overwrite leaks move struct: 'X' is alive 
@@ -866,6 +970,8 @@ unknown atomic intrinsic '@X'
 unknown barrier intrinsic '@X' — use @barrier_init or @barrier_wait
 unknown condvar intrinsic '@X' — use @cond_wait, @cond_timedwait, @cond_signal, or @cond_broadcast
 unknown intrinsic '@X'
+unterminated character literal
+unterminated string
 use after free: %%X is X (freed at line X)
 use after free: 'X' X at line X — cannot pass to function
 use after free: 'X' is X (freed at line X)

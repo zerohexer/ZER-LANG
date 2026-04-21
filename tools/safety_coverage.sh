@@ -26,8 +26,10 @@ CHECKER="$REPO/checker.c"
 ZCHECK="$REPO/zercheck.c"
 ZCHECK_IR="$REPO/zercheck_ir.c"
 EMITTER="$REPO/emitter.c"
+PARSER="$REPO/parser.c"
+LEXER="$REPO/lexer.c"
 
-for f in "$CHECKER" "$ZCHECK" "$ZCHECK_IR" "$EMITTER"; do
+for f in "$CHECKER" "$ZCHECK" "$ZCHECK_IR" "$EMITTER" "$PARSER" "$LEXER"; do
     if [ ! -f "$f" ]; then
         echo "ERROR: $f not found" >&2
         exit 1
@@ -127,28 +129,36 @@ EOF
 
 # ---- Summary counts (folded lines) ----
 
-CE_COUNT=$(join_lines "$CHECKER" | grep -cE '\bchecker_error\(' || true)
+CE_COUNT=$(join_lines "$CHECKER" | grep -cE '\b(checker_error|checker_warning|checker_add_diag)\(' || true)
 ZC_COUNT=$(join_lines "$ZCHECK" | grep -cE '\b(zc_error|zc_warning|zc_report_invalid_use)\(' || true)
 ZC_IR_COUNT=$(join_lines "$ZCHECK_IR" | grep -cE '\b(ir_zc_error|ir_zc_warning)\(' || true)
 TRAP_COUNT=$(grep -cE '_zer_trap\(|_zer_bounds_check\(' "$EMITTER" || true)
+PARSER_COUNT=$(join_lines "$PARSER" | grep -cE '\b(error|error_at|error_current|warn)\(' || true)
+LEXER_COUNT=$(join_lines "$LEXER" | grep -cE '\berror_token\(' || true)
 
 echo "## Summary"
 echo ""
 echo "| Source | Call sites (joined) |"
 echo "|---|---|"
-echo "| checker.c (compile-time checker_error) | $CE_COUNT |"
+echo "| checker.c (checker_error/warning/add_diag) | $CE_COUNT |"
 echo "| zercheck.c (handle-tracking zc_error/warning) | $ZC_COUNT |"
 echo "| zercheck_ir.c (CFG-based ir_zc_error/warning) | $ZC_IR_COUNT |"
 echo "| emitter.c (runtime _zer_trap / _zer_bounds_check) | $TRAP_COUNT |"
+echo "| parser.c (syntactic error/warn) | $PARSER_COUNT |"
+echo "| lexer.c (error_token) | $LEXER_COUNT |"
 echo ""
 
 # ---- Parts 1-3: compile-time error sites ----
 
-extract_table "$CHECKER" '(checker_error)' "## Part 1 — Compile-time checks (checker.c)"
+extract_table "$CHECKER" '(checker_error|checker_warning|checker_add_diag)' "## Part 1 — Compile-time checks (checker.c)"
 
 extract_table "$ZCHECK" '(zc_error|zc_warning)' "## Part 2 — Handle-tracking checks (zercheck.c)"
 
 extract_table "$ZCHECK_IR" '(ir_zc_error|ir_zc_warning)' "## Part 3 — CFG-based handle checks (zercheck_ir.c)"
+
+extract_table "$PARSER" '(error|error_at|error_current|warn)' "## Part 3b — Parser syntactic/semantic errors (parser.c)"
+
+extract_table "$LEXER" '(error_token)' "## Part 3c — Lexer errors (lexer.c)"
 
 # ---- Part 4: runtime trap emissions (single-line in emitter) ----
 
@@ -190,8 +200,8 @@ echo "must appear in \`docs/safety_coverage.md\`."
 echo ""
 
 {
-    join_lines "$CHECKER" | grep -E '\bchecker_error\(' \
-        | sed -E "s#.*\\bchecker_error\\([^\"]*\"([^\"]+)\".*#\\1#"
+    join_lines "$CHECKER" | grep -E '\b(checker_error|checker_warning|checker_add_diag)\(' \
+        | sed -E "s#.*\\b(checker_error|checker_warning|checker_add_diag)\\([^\"]*\"([^\"]+)\".*#\\2#"
     join_lines "$ZCHECK" | grep -E '\b(zc_error|zc_warning)\(' \
         | sed -E "s#.*\\b(zc_error|zc_warning)\\([^\"]*\"([^\"]+)\".*#\\2#"
     join_lines "$ZCHECK_IR" | grep -E '\b(ir_zc_error|ir_zc_warning)\(' \
@@ -199,9 +209,13 @@ echo ""
     grep -hoE '_zer_trap\("[^"]+"' "$EMITTER" \
         | sed -E 's#_zer_trap\("##' | sed 's#"$##'
     grep -c '_zer_bounds_check(' "$EMITTER" > /dev/null && echo "bounds check (_zer_bounds_check)"
+    join_lines "$PARSER" | grep -E '\b(error|error_at|error_current|warn)\(' \
+        | sed -E "s#.*\\b(error|error_at|error_current|warn)\\([^\"]*\"([^\"]+)\".*#\\2#"
+    join_lines "$LEXER" | grep -E '\berror_token\(' \
+        | sed -E "s#.*\\berror_token\\([^\"]*\"([^\"]+)\".*#\\1#"
 } | grep -v '^$' \
   | grep -vE '^[[:space:]]*(static |\*|#|/\*|\*/| )' \
-  | grep -vE '(checker_error|zc_error|ir_zc_error|zc_warning|ir_zc_warning)\(' \
+  | grep -vE '(checker_error|checker_warning|checker_add_diag|zc_error|ir_zc_error|zc_warning|ir_zc_warning|error_token|error_at|error_current)\(' \
   | sed -E 's#%\.?\*?[a-z]+#X#g' \
   | sed -E 's#%ll?[du]#N#g' \
   | sed -E 's#%[a-z]#_#g' \

@@ -90,7 +90,7 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | Category | Rows | Status |
 |---|---|---|
 | A. Handle lifecycle (UAF, double-free, leak) | 18 | ✓ (all 18 rows proven) |
-| B. Move struct / ownership transfer | 7 | ○ |
+| B. Move struct / ownership transfer | 8 | ✓ (all 8 rows proven) |
 | C. Thread safety & spawn | 12 | ○ |
 | D. Shared struct & deadlock | 5 | ○ |
 | E. Atomic / condvar / barrier / semaphore | 8 | ○ |
@@ -146,14 +146,14 @@ Core handle safety — what `λZER-Handle` proves.
 
 | # | Predicate | Source (file:line) | Model | Subset | Iris technique | Status |
 |---|---|---|---|---|---|---|
-| B01 | Use-after-move: `X may have been moved` / `ownership transferred` | zercheck.c:985, 993, 1157; zercheck_ir.c:1046, 1422, 1575, 1800 | M1 (HS_TRANSFERRED) | λZER-move | Linear resource — move transfers ownership | ○ |
-| B02 | Use-after-transfer-to-thread: `ownership transferred to thread` | zercheck.c:996 | M1+M3 | λZER-move + λZER-concurrency | Ownership moves through spawn | ○ |
-| B03 | Move inside loop: `ownership transferred — second iteration` | zercheck.c:2017 | M1 | λZER-move | Loop fixpoint on ownership | ○ |
-| B04 | Resource-type assign non-copyable: `cannot assign X — not copyable` | checker.c:2863 | M1 | λZER-move + λZER-typing | Linear type check at assignment | ○ |
-| B05 | Move struct capture by value in if-unwrap/switch: use `\|*X\|` | checker.c:7252, 7650, 7671 | M1 | λZER-move | Capture must be pointer (non-consuming) | ○ |
-| B06 | Move struct as shared struct field | checker.c:8723 | M1+M4 | λZER-move + λZER-concurrency | Shared access would violate linearity | ○ |
-| B07 | Union variant overwrite leaks move struct | zercheck.c:1244 | M1 | λZER-move | Variant change consumes old variant's resource | ○ |
-| B08 | Assign to variant of union containing move struct | checker.c:2624 | M1 | λZER-move | Variant mutation with live resource = leak | ○ |
+| B01 | Use-after-move: `X may have been moved` / `ownership transferred` | zercheck.c:985, 993, 1157; zercheck_ir.c:1046, 1422, 1575, 1800 | M1 (HS_TRANSFERRED) | λZER-move | `use_after_move_impossible` via `alive_move_exclusive` | ✓ |
+| B02 | Use-after-transfer-to-thread: `ownership transferred to thread` | zercheck.c:996 | M1+M3 | λZER-move + λZER-concurrency | `use_after_thread_transfer_impossible` — exclusivity | ✓ |
+| B03 | Move inside loop: `ownership transferred — second iteration` | zercheck.c:2017 | M1 | λZER-move | `move_inside_loop_cross_iteration` | ✓ |
+| B04 | Resource-type assign non-copyable: `cannot assign X — not copyable` | checker.c:2863 | M1 | λZER-move + λZER-typing | `resource_not_copyable` | ✓ |
+| B05 | Move struct capture by value in if-unwrap/switch: use `\|*X\|` | checker.c:7252, 7650, 7671 | M1 | λZER-move | `capture_by_value_consumes` | ✓ |
+| B06 | Move struct as shared struct field | checker.c:8723 | M1+M4 | λZER-move + λZER-concurrency | `no_shared_move` — shared access impossible | ✓ |
+| B07 | Union variant overwrite leaks move struct | zercheck.c:1244 | M1 | λZER-move | `variant_overwrite_consumes` | ✓ |
+| B08 | Assign to variant of union containing move struct | checker.c:2624 | M1 | λZER-move | `union_variant_assign_exclusive` | ✓ |
 
 ## C. Thread safety & spawn
 

@@ -1,0 +1,18 @@
+// Iris theorem: alive_handle_exclusive (iris_resources.v)
+// Covers row: A06 — double-free prevention
+// EXPECTED: compile error
+//
+// The Iris resource `alive_handle γ p i g` is exclusive: owning
+// two copies is False by ghost_map's DfracOwn 1 fraction. The
+// compiler's zercheck HS_FREED state must reject the second free.
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        tasks.free(h);
+        tasks.free(h);  // <-- double free: must be rejected
+    }
+}

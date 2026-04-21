@@ -1,0 +1,18 @@
+// Iris theorem: spec_get (iris_specs.v) — violation
+// Covers row: A01 — use-after-free detection
+// EXPECTED: compile error (use-after-free rejected)
+//
+// If the compiler accepts this program, zercheck regressed on UAF
+// detection. The violating theorem is `spec_get` which requires
+// `alive_handle γ p i g` ownership to read.
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        tasks.free(h);
+        u32 x = tasks.get(h).id;  // <-- UAF: must be rejected
+    }
+}

@@ -1,8 +1,11 @@
 #!/bin/bash
 # Run all .zer integration tests
-# tests/zer/      — must compile + run + exit 0  (positive tests)
-# tests/zer_fail/ — must FAIL to compile         (negative tests)
-# tests/zer_trap/ — must compile + run + EXIT NON-ZERO (runtime safety traps)
+# tests/zer/       — must compile + run + exit 0  (positive tests)
+# tests/zer_fail/  — must FAIL to compile         (negative tests)
+# tests/zer_trap/  — must compile + run + EXIT NON-ZERO (runtime safety traps)
+# tests/zer_proof/ — theorem-linked regression tests (see README)
+#                    — *_bad.zer must FAIL to compile
+#                    — other .zer files must compile + run + exit 0
 # Usage: test_zer.sh [extra-flags]
 #   e.g. test_zer.sh --some-future-flag
 
@@ -86,6 +89,42 @@ for f in tests/zer_fail/*.zer; do
     else
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (should have been rejected but compiled!)"
+    fi
+    rm -f "${f%.zer}.c" 2>/dev/null
+done
+
+echo ""
+echo "=== ZER Proof-linked tests (tests/zer_proof/) ==="
+# Each *.zer here exercises a proven Iris theorem.
+# *_bad.zer = violation program (must FAIL to compile).
+# Others = safe programs (must compile + run + exit 0).
+
+for f in tests/zer_proof/*.zer; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .zer)
+    TOTAL=$((TOTAL + 1))
+    if [[ "$name" == *_bad ]]; then
+        # Negative: must fail to compile.
+        $ZERC "$f" -o /dev/null 2>/dev/null
+        ret=$?
+        if [ $ret -ne 0 ]; then
+            PASS=$((PASS + 1))
+            echo "  PASS: $name (correctly rejected — theorem holds)"
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $name (PROOF VIOLATION — compiler accepted a program the Iris theorem rejects)"
+        fi
+    else
+        # Positive: must compile + run + exit 0.
+        $ZERC "$f" --run 2>/dev/null
+        ret=$?
+        if [ $ret -eq 0 ]; then
+            PASS=$((PASS + 1))
+            echo "  PASS: $name"
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $name (safe program should compile + run)"
+        fi
     fi
     rm -f "${f%.zer}.c" 2>/dev/null
 done

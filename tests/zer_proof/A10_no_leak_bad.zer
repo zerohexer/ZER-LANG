@@ -1,0 +1,18 @@
+// Iris theorem: no_leak_at_scope_exit (iris_leak.v)
+// Covers row: A10 — handle leak on scope exit
+// EXPECTED: compile error
+//
+// Allocating a handle and not freeing it before scope exit is a
+// leak. Iris: the `alive_handle γ p i g` resource persists to
+// program end, violating adequacy (no residual resources allowed).
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        u32 x = tasks.get(h).id;
+        // No free — leak at scope exit.
+    }
+}

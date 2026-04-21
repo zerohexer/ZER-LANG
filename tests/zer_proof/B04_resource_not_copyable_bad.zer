@@ -1,0 +1,18 @@
+// Iris theorem: B04_resource_not_copyable (lambda_zer_move/iris_move_theorems.v)
+// Covers row: B04 — resource types not copyable
+// EXPECTED: compile error
+//
+// Assigning a move struct = ownership transfer. "Copying" (i.e.,
+// trying to have both source and destination live) violates
+// exclusivity. Iris `alive_move γ id ∗ alive_move γ id ⊢ False`.
+
+move struct Token { u32 kind; }
+
+void consume(Token t) { }
+
+void main() {
+    Token a;
+    a.kind = 1;
+    consume(a);    // a's ownership transferred
+    consume(a);    // <-- second consume: no resource, must be rejected
+}

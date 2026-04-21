@@ -105,16 +105,21 @@ Section resources.
   Qed.
 
   (* Free primitive: consuming `alive_handle γ p i g` + authoritative
-     map lets us bump the generation at (p,i) from g to g+1. The
-     consumed resource is gone; re-alloc at (p,i) would produce a
-     NEW alive_handle with generation g+1, not the old g. This is
-     the generation-counter mechanism at the resource level. *)
+     map lets us DELETE the entry at (p,i) from the ghost map.
+     The ghost map tracks "currently alive" slots; after free, the
+     slot is no longer alive, so the entry goes away. Re-allocation
+     creates a NEW fragment via alive_handle_new (with whatever
+     generation the allocator picks — bumped by the concrete semantics).
+
+     This matches `gens_agree_store`: the iff says "gens has (p,i)↦g
+     iff slot is alive with gen g." After free, slot is NOT alive,
+     so gens must NOT have (p,i). *)
   Lemma alive_handle_free γ σ p i g :
     ghost_map_auth γ 1 σ -∗ alive_handle γ p i g ==∗
-      ghost_map_auth γ 1 (<[(p, i) := S g]> σ).
+      ghost_map_auth γ 1 (delete (p, i) σ).
   Proof.
     iIntros "Hauth Hfrag".
-    iMod (ghost_map_update (S g) with "Hauth Hfrag") as "[$ _]".
+    iMod (ghost_map_delete with "Hauth Hfrag") as "$".
     done.
   Qed.
 

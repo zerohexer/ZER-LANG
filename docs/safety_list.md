@@ -56,6 +56,8 @@ Two purposes:
 | A — handle lifecycle | 18 | **Operational + fupd step specs** (resource algebra, state_interp, three step-specs axiom-free) |
 | B — move struct | 8 | **FULL operational** — own subset `lambda_zer_move/` with EAllocMove/EConsume/EDrop semantics, alive_move resource, step specs axiom-free |
 | J — pointer cast & provenance | 14 | **FULL operational** (core rows) — own subset `lambda_zer_opaque/` with PtrTyped values, EAlloc/EOpaqueCast/ETypedCast/EDeref semantics, typed_ptr resource, step specs axiom-free |
+| O — escape analysis | 12 | **FULL operational** — own subset `lambda_zer_escape/` with RegLocal/RegArena/RegStatic tags, step rules enforce region match, all 12 rows reduce to region_ptr exclusivity |
+| H — MMIO / volatile | 9 | **FULL operational** — own subset `lambda_zer_mmio/` with range-check + alignment-check step rules, stuck-on-violation proofs (no Iris resources needed — range is program-level constant) |
 | G, I, K, N, P, Q, T | 55 | Typing-level schematic |
 | L, M, R, S | 34 | VRP + typing + context-flag + evaluator schematic |
 | H, J, O | 35 | Region/provenance schematic (dedicated subsets would deepen) |
@@ -112,14 +114,14 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | E. Atomic / condvar / barrier / semaphore | 8 | ✓ (schematic — typing + logically-atomic triples; `iris_concurrency.v`) |
 | F. Async / coroutine context | 5 | ✓ (schematic — context flags + state-machine invariants; `iris_concurrency.v`) |
 | G. Control-flow context safety | 12 | ✓ (typing + context-flag enforced; `iris_control_flow.v`) |
-| H. MMIO / volatile / hardware | 9 | ✓ (range + alignment + runtime trap; `iris_mmio_cast_escape.v`) |
+| H. MMIO / volatile / hardware | 9 | ✓ **FULL operational** — `lambda_zer_mmio/` subset (stuck-on-violation proofs for out-of-range + unaligned + no-decl) |
 | I. Qualifier preservation (const/volatile) | 11 | ✓ (all 11 rows, typing-enforced) |
 | J. Pointer cast & provenance | 14 | ✓ **FULL operational** — `lambda_zer_opaque/` subset (core provenance rows J01/J04/J11/J12/J13/J14) |
 | K. `@container` / `@offset` / `@size` | 4 | ✓ (typing-enforced; `container_intrinsics_well_typed`) |
 | L. Bounds / indexing / slicing | 11 | ✓ (VRP + runtime trap; `iris_misc_sections.bounds_safety_compile_or_runtime`) |
 | M. Division / arithmetic safety | 10 | ✓ (VRP + typing; `division_safety_via_vrp_or_trap`) |
 | N. Null / optional safety | 8 | ✓ (3 N-specific + 5 already `—` typing) |
-| O. Escape analysis (dangling) | 12 | ✓ (region invariants; `iris_mmio_cast_escape.escape_checks_all_paths`) |
+| O. Escape analysis (dangling) | 12 | ✓ **FULL operational** — `lambda_zer_escape/` subset (region tags RegLocal/RegArena/RegStatic, step rules enforce region match) |
 | P. Union / enum variant safety | 8 | ✓ (variant-tag + typing; `iris_misc_sections.variant_safety`) |
 | Q. Switch exhaustiveness | 5 | ✓ (all typing-enforced) |
 | R. Comptime / static_assert | 6 | ✓ (evaluator totality; `comptime_evaluator_sound`) |

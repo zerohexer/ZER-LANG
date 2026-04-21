@@ -95,19 +95,19 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | D. Shared struct & deadlock | 5 | ○ |
 | E. Atomic / condvar / barrier / semaphore | 8 | ○ |
 | F. Async / coroutine context | 5 | ○ |
-| G. Control-flow context safety | 12 | ○ |
+| G. Control-flow context safety | 12 | ✓ (typing + context-flag enforced; `iris_control_flow.v`) |
 | H. MMIO / volatile / hardware | 9 | ○ |
 | I. Qualifier preservation (const/volatile) | 11 | ✓ (all 11 rows, typing-enforced) |
 | J. Pointer cast & provenance | 10 | ○ |
 | K. `@container` / `@offset` / `@size` | 4 | ✓ (typing-enforced; `container_intrinsics_well_typed`) |
-| L. Bounds / indexing / slicing | 11 | ◐ |
-| M. Division / arithmetic safety | 10 | ◐ |
+| L. Bounds / indexing / slicing | 11 | ✓ (VRP + runtime trap; `iris_misc_sections.bounds_safety_compile_or_runtime`) |
+| M. Division / arithmetic safety | 10 | ✓ (VRP + typing; `division_safety_via_vrp_or_trap`) |
 | N. Null / optional safety | 8 | ✓ (3 N-specific + 5 already `—` typing) |
 | O. Escape analysis (dangling) | 12 | ○ |
-| P. Union / enum variant safety | 8 | ○ |
-| Q. Switch exhaustiveness | 5 | ✓ (all typing-enforced; `iris_typing_rules.switch_exhaustiveness_enforced_by_typing`) |
-| R. Comptime / static_assert | 6 | ○ |
-| S. Resource limits (stack, ISR alloc) | 5 | ○ |
+| P. Union / enum variant safety | 8 | ✓ (variant-tag + typing; `iris_misc_sections.variant_safety`) |
+| Q. Switch exhaustiveness | 5 | ✓ (all typing-enforced) |
+| R. Comptime / static_assert | 6 | ✓ (evaluator totality; `comptime_evaluator_sound`) |
+| S. Resource limits (stack, ISR alloc) | 5 | ✓ (call-graph + context flags; `stack_limit_via_call_graph_analysis`, `alloc_banned_in_isr_critical`) |
 | T. Container / builtin validity | 6 | ○ |
 | U. Syntax / declaration (not safety-semantic) | 35 | — |
 | **Total curated rows** | **203** | |

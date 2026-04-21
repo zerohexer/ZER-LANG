@@ -1,0 +1,11 @@
+// Iris theorem: critical_defer_banned (G02)
+// Covers row: G02 — break inside @critical
+// EXPECTED: compile error
+
+void main() {
+    for (u32 i = 0; i < 10; i += 1) {
+        @critical {
+            break;  // must be rejected
+        }
+    }
+}

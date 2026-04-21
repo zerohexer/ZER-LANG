@@ -1,0 +1,12 @@
+// Iris theorem: qualifier_monotone
+// Covers row: I01 — strip volatile
+// EXPECTED: compile error
+
+void take_nonvolatile(*u32 p) { p[0] = 1; }
+
+mmio 0x40000000..0x40001000;
+
+void main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+    take_nonvolatile(reg);  // strips volatile — must be rejected
+}

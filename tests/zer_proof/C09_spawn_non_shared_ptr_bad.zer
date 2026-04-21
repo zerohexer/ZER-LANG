@@ -1,0 +1,12 @@
+// Iris theorem: spawn_args_must_be_shared_or_value
+// Covers row: C09 — spawn passes non-shared pointer
+// EXPECTED: compile error
+
+struct Task { u32 id; }  // not shared
+Task g;
+
+void worker(*Task t) { t.id = 1; }
+
+void main() {
+    spawn worker(&g);  // non-shared ptr to spawn — must be rejected
+}

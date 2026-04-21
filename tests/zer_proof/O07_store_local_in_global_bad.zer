@@ -1,0 +1,12 @@
+// Iris theorem: escape_checks_all_paths
+// Covers row: O07 — store local in global
+// EXPECTED: compile error
+
+*u32 global_ptr;
+
+void leak() {
+    u32 local = 42;
+    global_ptr = &local;  // local escapes via global — must be rejected
+}
+
+void main() { }

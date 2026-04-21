@@ -1,0 +1,11 @@
+// Iris theorem: no_nested_defer (iris_control_flow.v)
+// Covers row: G04 — nested defer
+// EXPECTED: compile error
+
+void main() {
+    defer {
+        defer {  // nested defer — must be rejected
+            u32 x = 0;
+        }
+    }
+}

@@ -1,0 +1,18 @@
+// Iris theorem: cannot_overwrite_alive_handle (iris_leak.v)
+// Covers row: A09 — overwriting alive handle leaks it
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh1 = tasks.alloc();
+    if (mh1) |h1| {
+        // h1 is alive, not freed
+        ?Handle(Task) mh2 = tasks.alloc();
+        if (mh2) |h2| {
+            // Now reassign: overwrite h1 without freeing = leak
+            h1 = h2;  // must be rejected (old h1 leaked)
+        }
+    }
+}

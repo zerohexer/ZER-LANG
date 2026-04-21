@@ -1,0 +1,15 @@
+// Iris theorem: no_cross_iteration_duplication (iris_loop.v)
+// Covers row: A15 — handle freed inside loop
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        for (u32 i = 0; i < 3; i += 1) {
+            tasks.free(h);  // second iteration = double-free
+        }
+    }
+}

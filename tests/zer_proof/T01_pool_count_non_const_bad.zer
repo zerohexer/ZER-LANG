@@ -1,0 +1,8 @@
+// Iris theorem: pool_capacity_compile_time
+// Covers row: T01 — Pool count must be compile-time constant
+// EXPECTED: compile error
+
+u32 runtime_n = 10;
+Pool(u32, runtime_n) pool;  // non-const N — must be rejected
+
+void main() { }

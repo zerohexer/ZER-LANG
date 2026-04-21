@@ -1,0 +1,9 @@
+// Iris theorem: null_only_to_optional
+// Covers row: N02 — null only assignable to optional types
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+
+void main() {
+    *Task ptr = null;  // must be rejected — non-optional cannot hold null
+}

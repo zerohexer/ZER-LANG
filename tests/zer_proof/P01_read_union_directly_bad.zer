@@ -1,0 +1,10 @@
+// Iris theorem: read_union_requires_switch
+// Covers row: P01 — read union variant directly
+// EXPECTED: compile error
+
+union Msg { u32 ok; u32 err; }
+
+void main() {
+    Msg m;
+    u32 x = m.ok;  // direct read — must be rejected
+}

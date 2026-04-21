@@ -1,0 +1,14 @@
+// Iris theorem: spawn_banned_in_async
+// Covers row: C05 — spawn inside async function
+// EXPECTED: compile error
+
+shared struct S { u32 x; }
+S g;
+
+void worker(*S s) { s.x = 1; }
+
+async void my_task() {
+    spawn worker(&g);  // spawn in async — must be rejected
+}
+
+void main() { }

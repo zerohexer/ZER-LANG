@@ -1,0 +1,11 @@
+// Iris theorem: no_yield_in_defer
+// Covers row: F04 — yield in defer
+// EXPECTED: compile error
+
+async void my_task() {
+    defer {
+        yield;  // must be rejected
+    }
+}
+
+void main() { }

@@ -1,0 +1,14 @@
+// Iris theorem: switch_exhaustiveness_enforced_by_typing
+// Covers row: Q02 — switch on enum must be exhaustive
+// EXPECTED: compile error
+
+enum State { idle, running, done }
+
+void main() {
+    State s = State.idle;
+    switch (s) {
+        .idle => { return; }
+        .running => { return; }
+        // .done missing — must be rejected
+    }
+}

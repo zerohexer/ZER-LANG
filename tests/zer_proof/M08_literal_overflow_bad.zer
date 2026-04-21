@@ -1,0 +1,7 @@
+// Iris theorem: narrowing_requires_explicit_truncate
+// Covers row: M08 — integer literal doesn't fit
+// EXPECTED: compile error
+
+void main() {
+    u8 x = 300;  // 300 doesn't fit in u8 — must be rejected
+}

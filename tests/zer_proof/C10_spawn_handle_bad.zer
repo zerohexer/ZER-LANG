@@ -1,0 +1,16 @@
+// Iris theorem: spawn_cannot_take_handle
+// Covers row: C10 — spawn passes Handle
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void worker(Handle(Task) h) { }
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        spawn worker(h);  // Handle to spawn — must be rejected
+        tasks.free(h);
+    }
+}

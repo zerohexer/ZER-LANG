@@ -1,0 +1,8 @@
+// Iris theorem: arithmetic_typing_rules
+// Covers row: M12 — unary '-' requires numeric
+// EXPECTED: compile error
+
+void main() {
+    bool b = true;
+    bool c = -b;  // unary - on bool — must be rejected
+}

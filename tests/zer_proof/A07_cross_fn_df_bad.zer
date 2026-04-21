@@ -1,0 +1,18 @@
+// Iris theorem: cannot_call_freer_twice (iris_func_spec.v)
+// Covers row: A07 — cross-function double-free
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void free_it(Handle(Task) h) {
+    tasks.free(h);
+}
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        free_it(h);
+        tasks.free(h);  // cross-fn DF — must be rejected
+    }
+}

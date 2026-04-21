@@ -1,0 +1,10 @@
+// Iris theorem: escape_checks_all_paths
+// Covers row: O06 — return local array as slice
+// EXPECTED: compile error
+
+[*]u32 bad_slice() {
+    u32[4] arr;
+    return arr;  // local array as slice — escape, must be rejected
+}
+
+void main() { }

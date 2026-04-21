@@ -1,0 +1,9 @@
+// Iris theorem: qualifier_monotone
+// Covers row: I07 — write through const pointer
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 5;
+    const *u32 cp = &x;
+    cp[0] = 10;  // write through const — must be rejected
+}

@@ -1,0 +1,10 @@
+// Iris theorem: all_paths_must_return (iris_control_flow.v)
+// Covers row: G07 — not all paths return
+// EXPECTED: compile error
+
+u32 bad_fn(u32 x) {
+    if (x > 0) { return 1; }
+    // else branch missing return — must be rejected
+}
+
+void main() { }

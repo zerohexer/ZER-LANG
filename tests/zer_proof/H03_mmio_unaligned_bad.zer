@@ -1,0 +1,10 @@
+// Iris theorem: inttoptr_alignment_enforced
+// Covers row: H03 — @inttoptr unaligned
+// EXPECTED: compile error
+
+mmio 0x40000000..0x40001000;
+
+void main() {
+    // u32 needs 4-byte alignment; 0x40000001 is not 4-aligned
+    volatile *u32 reg = @inttoptr(*u32, 0x40000001);  // must be rejected
+}

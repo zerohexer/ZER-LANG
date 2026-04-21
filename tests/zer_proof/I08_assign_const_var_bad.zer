@@ -1,0 +1,8 @@
+// Iris theorem: qualifier_monotone
+// Covers row: I08 — assign to const variable
+// EXPECTED: compile error
+
+void main() {
+    const u32 x = 5;
+    x = 10;  // must be rejected
+}

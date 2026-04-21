@@ -1,0 +1,7 @@
+// Iris theorem: no_nested_optional
+// Covers row: N05 — nested optional ??T not supported
+// EXPECTED: compile error
+
+void main() {
+    ??u32 x;  // nested optional — must be rejected
+}

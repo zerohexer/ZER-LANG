@@ -1,0 +1,8 @@
+// Iris theorem: unwrap_requires_optional
+// Covers row: N04 — orelse requires optional
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 5;
+    u32 y = x orelse 0;  // x is u32, not optional — must be rejected
+}

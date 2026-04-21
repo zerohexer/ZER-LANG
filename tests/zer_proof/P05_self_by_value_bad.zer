@@ -1,0 +1,7 @@
+// Iris theorem: variant_well_formed
+// Covers row: P05 — struct cannot contain itself by value
+// EXPECTED: compile error
+
+struct Node { Node next; }  // infinite size — must be rejected
+
+void main() { }

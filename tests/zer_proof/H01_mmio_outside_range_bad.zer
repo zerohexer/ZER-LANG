@@ -1,0 +1,9 @@
+// Iris theorem: inttoptr_range_enforced
+// Covers row: H01 — @inttoptr addr outside declared range
+// EXPECTED: compile error
+
+mmio 0x40000000..0x40001000;
+
+void main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x80000000);  // outside — must be rejected
+}

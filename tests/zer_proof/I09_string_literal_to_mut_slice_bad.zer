@@ -1,0 +1,8 @@
+// Iris theorem: qualifier_monotone
+// Covers row: I09 — string literal as mutable []u8
+// EXPECTED: compile error
+
+void main() {
+    [*]u8 s = "hello";  // string literal is const, mut slice — must be rejected
+    s.ptr[0] = 'H';
+}

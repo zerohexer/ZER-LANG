@@ -1,0 +1,12 @@
+// Iris theorem: direct_ptr_cast_banned
+// Covers row: J01 — direct *A -> *B cast
+// EXPECTED: compile error
+
+struct A { u32 x; }
+struct B { u32 y; }
+
+void main() {
+    A a;
+    *A pa = &a;
+    *B pb = (*B)pa;  // direct cast — must be rejected
+}

@@ -1,0 +1,10 @@
+// Iris theorem: critical_defer_banned (iris_control_flow.v)
+// Covers row: G01 — return inside @critical
+// EXPECTED: compile error
+
+u32 main() {
+    @critical {
+        return 1;  // must be rejected — interrupts wouldn't re-enable
+    }
+    return 0;
+}

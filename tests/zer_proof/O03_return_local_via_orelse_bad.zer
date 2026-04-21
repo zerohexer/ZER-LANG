@@ -1,0 +1,11 @@
+// Iris theorem: escape_checks_all_paths
+// Covers row: O03 — return local via orelse fallback
+// EXPECTED: compile error
+
+*u32 bad_return() {
+    u32 x = 42;
+    ?*u32 mp = null;
+    return mp orelse &x;  // orelse fallback returns local — must be rejected
+}
+
+void main() { }

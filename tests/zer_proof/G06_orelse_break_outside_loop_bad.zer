@@ -1,0 +1,9 @@
+// Iris theorem: break_continue_in_loop_only
+// Covers row: G06 — orelse break outside loop
+// EXPECTED: compile error
+
+?u32 try_get() { return 5; }
+
+void main() {
+    u32 x = try_get() orelse break;  // no loop — must be rejected
+}

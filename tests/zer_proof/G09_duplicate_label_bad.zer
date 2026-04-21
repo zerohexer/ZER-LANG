@@ -1,0 +1,12 @@
+// Iris theorem: goto_labels_well_formed
+// Covers row: G09 — duplicate label
+// EXPECTED: compile error
+
+void main() {
+    u32 i = 0;
+loop:
+    i += 1;
+    if (i < 10) { goto loop; }
+loop:  // duplicate — must be rejected
+    return;
+}

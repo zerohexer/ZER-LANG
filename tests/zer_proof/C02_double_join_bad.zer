@@ -1,0 +1,14 @@
+// Iris theorem: no_double_join
+// Covers row: C02 — ThreadHandle already joined
+// EXPECTED: compile error
+
+shared struct Counter { u32 value; }
+Counter g;
+
+void worker(*Counter c) { c.value = 1; }
+
+void main() {
+    ThreadHandle th = spawn worker(&g);
+    th.join();
+    th.join();  // double join — must be rejected
+}

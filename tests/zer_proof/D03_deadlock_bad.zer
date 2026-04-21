@@ -1,0 +1,13 @@
+// Iris theorem: deadlock_detected_statically
+// Covers row: D03 — single statement access 2 shared types (deadlock)
+// EXPECTED: compile error
+
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+
+A a;
+B b;
+
+void main() {
+    a.x = b.y;  // two shared types in one statement — must be rejected
+}

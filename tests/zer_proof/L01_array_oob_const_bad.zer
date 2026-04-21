@@ -1,0 +1,8 @@
+// Iris theorem: bounds_safety_compile_or_runtime
+// Covers row: L01 — array index out of bounds (const)
+// EXPECTED: compile error
+
+void main() {
+    u32[4] arr;
+    u32 x = arr[5];  // const OOB — must be rejected
+}

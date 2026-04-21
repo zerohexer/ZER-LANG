@@ -1,0 +1,10 @@
+// Iris theorem: no_address_shared_field
+// Covers row: D01 — cannot take address of shared struct field
+// EXPECTED: compile error
+
+shared struct S { u32 x; }
+S g;
+
+void main() {
+    *u32 p = &g.x;  // escaping lock boundary — must be rejected
+}

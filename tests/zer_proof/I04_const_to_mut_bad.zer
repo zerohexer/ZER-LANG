@@ -1,0 +1,8 @@
+// Iris theorem: qualifier_monotone
+// Covers row: I04 — const ptr to mut
+// EXPECTED: compile error
+
+void main() {
+    const *u32 cp;
+    *u32 mp = cp;  // const → mut — must be rejected
+}

@@ -1,0 +1,12 @@
+// Iris theorem: alloc_banned_in_isr_critical
+// Covers row: S05 — slab.alloc() in @critical
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void main() {
+    @critical {
+        ?Handle(Task) mh = tasks.alloc();  // must be rejected
+    }
+}

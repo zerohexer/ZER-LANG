@@ -1,0 +1,12 @@
+// Iris theorem: capture_by_value_consumes
+// Covers row: B05 — move struct capture by value in if-unwrap
+// EXPECTED: compile error
+
+move struct Token { u32 kind; }
+
+void main() {
+    ?Token mt;
+    if (mt) |t| {  // by-value capture of move — must use |*t|
+        u32 x = t.kind;
+    }
+}

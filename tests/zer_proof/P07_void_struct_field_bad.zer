@@ -1,0 +1,9 @@
+// Iris theorem: variant_well_formed
+// Covers row: P07 — struct field of type void
+// EXPECTED: compile error
+
+struct Bad {
+    void v;  // void field — must be rejected
+}
+
+void main() { }

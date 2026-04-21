@@ -1,0 +1,16 @@
+// Iris theorem: handle_alive_from_interp (MAYBE_FREED case)
+// Covers row: A02 — may-have-been-freed use
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        u32 cond = 1;
+        if (cond > 0) { tasks.free(h); }
+        // Some paths freed, some not — MAYBE_FREED
+        u32 x = tasks.get(h).id;  // must be rejected
+    }
+}

@@ -1,0 +1,13 @@
+// Iris theorem: switch_exhaustiveness_enforced_by_typing
+// Covers row: Q04 — switch on union must be exhaustive
+// EXPECTED: compile error
+
+union Msg { u32 ok; u32 err; }
+
+void main() {
+    Msg m;
+    switch (m) {
+        .ok => |v| { return; }
+        // .err missing — must be rejected
+    }
+}

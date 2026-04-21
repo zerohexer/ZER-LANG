@@ -1,0 +1,9 @@
+// Iris theorem: qualifier_monotone
+// Covers row: I03 — @ptrcast strip const
+// EXPECTED: compile error
+
+void main() {
+    const u32 x = 5;
+    const *u32 cp = &x;
+    *u32 mp = @ptrcast(*u32, cp);  // strips const — must be rejected
+}

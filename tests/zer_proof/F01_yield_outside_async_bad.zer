@@ -1,0 +1,7 @@
+// Iris theorem: yield_requires_async
+// Covers row: F01 — yield only in async function
+// EXPECTED: compile error
+
+void main() {
+    yield;  // not in async function — must be rejected
+}

@@ -1,0 +1,13 @@
+// Iris theorem: thread_handle_must_be_joined
+// Covers row: C01 — ThreadHandle not joined
+// EXPECTED: compile error
+
+shared struct Counter { u32 value; }
+Counter g;
+
+void worker(*Counter c) { c.value = 1; }
+
+void main() {
+    ThreadHandle th = spawn worker(&g);
+    // missing th.join() — must be rejected (thread handle leaked)
+}

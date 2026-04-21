@@ -1,0 +1,7 @@
+// Iris theorem: break_continue_in_loop_only (iris_control_flow.v)
+// Covers row: G05 — break outside loop
+// EXPECTED: compile error
+
+void main() {
+    break;  // no surrounding loop — must be rejected
+}

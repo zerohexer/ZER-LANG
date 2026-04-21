@@ -1,0 +1,7 @@
+// Iris theorem: await_requires_async
+// Covers row: F02 — await only in async function
+// EXPECTED: compile error
+
+void main() {
+    await 1 == 1;  // not async — must be rejected
+}

@@ -1,0 +1,9 @@
+// Iris theorem: pool_is_always_global
+// Covers row: T02 — Pool cannot be struct field
+// EXPECTED: compile error
+
+struct Container {
+    Pool(u32, 4) p;  // Pool as field — must be rejected
+}
+
+void main() { }

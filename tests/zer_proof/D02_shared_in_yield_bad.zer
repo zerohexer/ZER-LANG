@@ -1,0 +1,12 @@
+// Iris theorem: no_shared_across_yield
+// Covers row: D02 — shared struct access in yield/await statement
+// EXPECTED: compile error
+
+shared struct S { u32 x; }
+S g;
+
+async void my_task() {
+    u32 v = g.x + yield;  // shared access + yield in same stmt — must be rejected
+}
+
+void main() { }

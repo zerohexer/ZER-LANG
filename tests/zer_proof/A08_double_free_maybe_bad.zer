@@ -1,0 +1,15 @@
+// Iris theorem: alive_handle_exclusive (via MAYBE_FREED)
+// Covers row: A08 — freeing MAYBE_FREED
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        u32 cond = 1;
+        if (cond > 0) { tasks.free(h); }
+        tasks.free(h);  // MAYBE already freed — must be rejected
+    }
+}

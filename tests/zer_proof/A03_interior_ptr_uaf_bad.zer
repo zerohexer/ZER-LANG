@@ -1,0 +1,13 @@
+// Iris theorem: interior_after_free_impossible (iris_derived.v)
+// Covers row: A03 — interior pointer UAF
+// EXPECTED: compile error
+
+struct Task { u32 id; u32 priority; }
+Slab(Task) tasks;
+
+void main() {
+    *Task t = tasks.alloc_ptr() orelse return;
+    *u32 p = &t.priority;  // interior pointer into t
+    tasks.free_ptr(t);
+    u32 x = p[0];  // interior-ptr UAF — must be rejected
+}

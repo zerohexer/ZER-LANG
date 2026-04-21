@@ -1,0 +1,14 @@
+// Iris theorem: escape_checks_all_paths
+// Covers row: O08 — store local via function call
+// EXPECTED: compile error
+
+*u32 slot;
+
+void stash(*u32 p) keep { slot = p; }
+
+void bad() {
+    u32 local = 42;
+    stash(&local);  // stash stores local in global — must be rejected
+}
+
+void main() { }

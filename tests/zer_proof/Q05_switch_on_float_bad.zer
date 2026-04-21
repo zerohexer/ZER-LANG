@@ -1,0 +1,10 @@
+// Iris theorem: switch_exhaustiveness_enforced_by_typing
+// Covers row: Q05 — switch on float banned
+// EXPECTED: compile error
+
+void main() {
+    f32 x = 1.0;
+    switch (x) {  // float switch banned — must be rejected
+        default => { return; }
+    }
+}

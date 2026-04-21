@@ -1,0 +1,14 @@
+// Iris theorem: spawn_banned_in_critical
+// Covers row: C04 — spawn inside @critical
+// EXPECTED: compile error
+
+shared struct S { u32 x; }
+S g;
+
+void worker(*S c) { c.x = 1; }
+
+void main() {
+    @critical {
+        spawn worker(&g);  // must be rejected
+    }
+}

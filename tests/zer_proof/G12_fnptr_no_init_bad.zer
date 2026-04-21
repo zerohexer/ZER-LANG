@@ -1,0 +1,7 @@
+// Iris theorem: function_pointer_init_required
+// Covers row: G12 — function pointer requires initializer
+// EXPECTED: compile error
+
+void main() {
+    void (*callback)(u32);  // uninitialized fn pointer — must be rejected
+}

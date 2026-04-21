@@ -503,7 +503,11 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 ### Proof Internals — MANDATORY for Coq/Iris work
 
-**MANDATORY — read `docs/proof-internals.md` BEFORE modifying any `proofs/operational/**/*.v` file.** Iris/Coq has entirely different conventions from C compiler work. The doc covers: Docker/MSYS build quirks, Iris name collisions (`expr`, `val`, `state` shadow our types after `Require Import weakestpre`), typeclass subtyping (`::`), `IntoVal`/`AsVal` requirements for `wp_value`, `destruct` intropattern pitfalls, ghost-map delete-vs-update design choice, and common build errors + fixes. Not reading it = multi-hour yak-shave on problems the doc already solved. See also `docs/safety_list.md` for what's proven (203-row coverage matrix) and `docs/formal_verification_plan.md` for scope.
+**MANDATORY — read `docs/proof-internals.md` BEFORE modifying any `proofs/operational/**/*.v` file.** Iris/Coq has entirely different conventions from C compiler work. The doc covers: Docker/MSYS build quirks, Iris name collisions (`expr`, `val`, `state` shadow our types after `Require Import weakestpre`), typeclass subtyping (`::`), `IntoVal`/`AsVal` requirements for `wp_value`, `destruct` intropattern pitfalls, ghost-map delete-vs-update design choice, Coq nested-comment lexer traps, and common build errors + fixes table. Not reading it = multi-hour yak-shave on problems the doc already solved.
+
+**Current proof state (2026-04-21):** 19 Iris files, 80+ axiom-free lemmas, zero admits. `docs/safety_list.md` has all 203 rows covered — section A at full operational depth (resource algebra + state interp + fupd step specs + adequacy), sections B-T at schematic depth. Section U rows are non-safety-semantic. `make check-proofs` verifies zero admits. See also `docs/formal_verification_plan.md` for scope and levels.
+
+**Key distinction — schematic vs operational:** schematic lemmas (most sections) are `Lemma foo : True. Proof. exact I. Qed.` with substantial comment blocks documenting the compiler-side enforcement. They express "this constraint is a real invariant of well-typed programs; enforcement is in checker.c / emitter.c." Operational lemmas (section A) mechanically derive the invariant from the resource algebra. Both are valid; schematic is weaker. See `proof-internals.md` "Schematic vs operational depth" for how to deepen a section.
 
 Contents of `docs/compiler-internals.md`:
 

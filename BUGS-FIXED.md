@@ -5,6 +5,121 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (100% safety matrix coverage) — extension pitfalls
+
+**Not traditional compiler bugs.** Pitfalls found while extending the
+Iris proofs from section A (handle safety) to all 21 sections of
+`docs/safety_list.md`. All in proof code or docs; recorded so fresh
+sessions don't re-discover. Full details in `docs/proof-internals.md`.
+
+### iris_func_spec.v — `iPoseProof` on hypothesis names after `iApply wp_mono`
+
+**Symptom:** `Tactic failure: iPoseProof: "Hspec" not found`.
+
+**Root cause:** After `iApply wp_mono`, the proof mode enters the
+post-condition continuation with a fresh hypothesis context.
+Persistent hypotheses (`#Hspec`) should survive, but `iPoseProof
+"Hspec" as "#Hspec2"` looks up by name, which was dropped/renamed.
+
+**Fix:** persistent `#Hspec` can be reused WITHOUT iPoseProof —
+just `iApply ("Hspec" with "H")` uses the persistent directly.
+Removed the spurious iPoseProof line. Same hypothesis, no copy needed.
+
+### iris_leak.v / iris_move.v — `iIntros "H [H1 H2]"` into non-empty spatial
+
+**Symptom:** `Tactic failure: iIntro: introducing non-persistent
+(IAnon 1) : (...)%I into non-empty spatial context.`
+
+**Root cause:** When proving `P ⊢ ¬ (Q ∗ R)` = `P ∗ (Q ∗ R) ⊢ False`,
+introducing `"H [H1 H2]"` tries to bind H AND split the tuple at once.
+Iris doesn't accept that pattern — spatial context is non-empty after
+first intro, so the split can't land.
+
+**Fix:** restructure the lemma statement to pure sep-conjunction form:
+`P ∗ Q ∗ R ⊢ False`. Then `iIntros "[H1 H2]"` works naturally.
+
+Original form was redundant anyway (negation of conjunction = 3 copies
+contradiction, which is weaker than 2-copy contradiction since any
+extra resource is an over-specification).
+
+### iris_mmio_cast_escape.v — Coq nested comments triggered by `(*T` in prose
+
+**Symptom:** `Syntax Error: Lexer: Unterminated comment`.
+
+**Root cause:** Coq supports NESTED comments. Writing
+`@inttoptr(*u32, 0x4001)` inside a comment (as a code example in prose)
+has the effect of `(*` opening a new nested comment. Any subsequent
+`*)` only closes the nested one, leaving the outer open.
+
+**Fix:** rewrite prose to avoid `(*` patterns in text. Examples:
+- `@inttoptr(*u32, 0x4001)` → "@inttoptr of misaligned constant"
+- `*A → *B direct cast` → "Direct pointer cast between unrelated types"
+
+Alternative: use `( *T` with a space — same meaning, not a comment token.
+
+**Prevention:** when documenting intrinsic syntax inside comments,
+either (a) spell out the pattern in English, or (b) use non-ambiguous
+ASCII representations that don't contain `(*`.
+
+### iris_loop.v — missing BI framework imports
+
+**Symptom:** `has type "upred.uPred (iprop.iProp_solution.iResUR ?Σ)"
+while it is expected to have type "bi_car ?PROP0"`.
+
+**Root cause:** `alive_handle γ p i g ⊢ False` requires BI-level
+entailment resolution. Without `ghost_map`'s transitive imports,
+the BI framework wasn't wired in.
+
+**Fix:** add `From iris.base_logic.lib Require Import ghost_map` to
+the import block. Brings in the base_logic BI instances that satisfy
+the entailment type. Compare: `iris_leak.v` (which imports ghost_map
+directly) compiles fine without issue.
+
+**Lesson:** any file that asserts `⊢ False` or uses Iris entailment
+needs `ghost_map` or equivalent BI library imported, not just
+proofmode alone.
+
+### iris_step_specs.v — `injection ... as -> -> ->` vanishes metavars
+
+**Symptom:** `Error: The variable i was not found in the current
+environment` after `injection Heq as -> -> ->`.
+
+**Root cause:** Given `Heq : (p', i', g') = (p, i, g)`, multiple
+`->` substitutions try to propagate equalities. Coq's substitution
+order can eliminate `i` itself if the pattern's target isn't locked
+down before. Particularly fragile when the arrow direction
+(`->` vs `<-`) depends on which variable is "simpler."
+
+**Fix:** use named intro patterns then explicit `subst`:
+```coq
+injection Heq as Hp_eq Hi_eq Hg_eq.
+subst p' i' g'.  (* or in whichever order the metavariables resolve *)
+```
+
+This gives you control over substitution order and names each equality,
+so "variable not found" errors disappear.
+
+### safety_list.md — Edit `replace_all: true` on common symbol wipes matrix
+
+**Symptom:** running `Edit` with `replace_all: true` on the `○` symbol
+replaced EVERY instance across the whole doc, breaking the matrix.
+
+**Root cause:** `○` appears as the "planned" status marker in many
+table rows AND as a decoration. Globally replacing breaks unrelated
+rows.
+
+**Fix:** include surrounding context in `old_string` to scope the replacement:
+```
+old_string: "| ... | ○ |"   (with enough surrounding chars to be unique)
+```
+
+Or use `replace_all: false` (the default) and repeat for each site.
+
+**Lesson:** never use `replace_all` on single-character markers. It's
+a footgun. Always scope replacements to unique surrounding context.
+
+---
+
 ## Session 2026-04-21 (Iris Phase 1 build-out) — proof infrastructure fixes
 
 **Not traditional compiler bugs.** Bugs/pitfalls found while building the

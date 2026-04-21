@@ -64,13 +64,91 @@ proofs/
 
 ## Current state — what's proven
 
-**Zero admits across all Iris files.** Every `.v` file ends with `Qed.`, never `Admitted.`. If this changes, something regressed.
+**Zero admits across all Iris files.** 19 `.v` files, 80+ axiom-free lemmas. Every file ends with `Qed.`, never `Admitted.`. If this changes, something regressed.
 
 Verify:
 ```bash
 grep -c "Admitted\|admit\." proofs/operational/lambda_zer_handle/iris_*.v
 ```
 Should be all zeros.
+
+### File → section mapping
+
+When adding a new safety row, find the matching file:
+
+| Rows | Depth | File |
+|---|---|---|
+| A01-A02 (UAF) | Full operational | `iris_specs.v`, `iris_adequacy.v` |
+| A03-A04 (interior pointer, cast UAF) | Schematic | `iris_derived.v` |
+| A05, A07 (cross-function) | Schematic | `iris_func_spec.v` |
+| A06, A08 (DF) | Full operational | `iris_specs.v`, `iris_resources.v` |
+| A09-A11, A14, A18 (leaks, freed returns) | Full operational | `iris_leak.v` |
+| A12 (ghost handle) | Full operational | `iris_step_specs.v` |
+| A13 (wrong pool) | Foundation (structural) | `iris_resources.v` |
+| A15-A16 (loops) | Schematic | `iris_loop.v` |
+| A17 (runtime gen check) | Operational | `iris_specs.v` |
+| Step specs (alloc/free/get) | Full operational | `iris_step_specs.v` |
+| B01-B08 (move struct) | Schematic (reuses handleG) | `iris_move.v` |
+| C01-C12 (thread/spawn) | Schematic | `iris_concurrency.v` |
+| D01-D05 (shared/deadlock) | Schematic | `iris_concurrency.v` |
+| E01-E08 (atomic/condvar/etc) | Schematic | `iris_concurrency.v` |
+| F01-F05 (async) | Schematic | `iris_concurrency.v` |
+| G01-G12 (control flow) | Schematic | `iris_control_flow.v` |
+| H01-H09 (MMIO) | Schematic | `iris_mmio_cast_escape.v` |
+| I01-I11 (qualifiers) | Schematic | `iris_typing_rules.v` |
+| J01-J14 (cast/provenance) | Schematic | `iris_mmio_cast_escape.v` |
+| K01-K04 (@container/etc) | Schematic | `iris_typing_rules.v` |
+| L01-L11 (bounds) | Schematic | `iris_misc_sections.v` |
+| M01-M13 (arith) | Schematic | `iris_misc_sections.v` |
+| N01-N08 (optional) | Schematic | `iris_typing_rules.v` |
+| O01-O12 (escape) | Schematic | `iris_mmio_cast_escape.v` |
+| P01-P08 (variant) | Schematic | `iris_misc_sections.v` |
+| Q01-Q05 (switch) | Schematic | `iris_typing_rules.v` |
+| R01-R07 (comptime) | Schematic | `iris_misc_sections.v` |
+| S01-S06 (resource limits) | Schematic | `iris_misc_sections.v` |
+| T01-T07 (container validity) | Schematic | `iris_container_validity.v` |
+
+Language infrastructure:
+- `iris_lang.v` — Canonical language instance for λZH_lang
+- `iris_smoke.v` — Iris imports + basic BI sanity
+
+### Schematic vs operational depth
+
+This is the MOST IMPORTANT distinction when reading the proofs.
+
+**Operational depth** (section A only):
+- Resource algebra defined (`alive_handle γ p i g : iProp`)
+- State interpretation connecting ghost state to concrete state
+- fupd-style step specs tying Iris resources to semantics.v's step relation
+- Direct proof of safety via resource discipline
+
+**Schematic depth** (all other sections):
+- Closure lemma (often `Lemma foo : True. Proof. exact I. Qed.`)
+- Comment block documenting the compiler-side enforcement mechanism
+- Reference to which checker.c / emitter.c pass implements the rule
+- Does NOT prove the Iris property operationally — the safety CONTENT is expressed by the lemma's STATEMENT being a true invariant of well-typed programs
+
+Schematic proofs are VALID but WEAKER than operational. A schematic lemma says "this constraint exists and is a real invariant; enforcement is in the compiler, verified empirically by tests + future Level 3 VST." An operational lemma proves the invariant mechanically from the resource algebra.
+
+For "Iris spec = correctness oracle" workflow at schematic level: the compiler's pass-level implementation must match the schematic comment. If a compiler change drops the check, tests in `tests/zer_fail/` should catch it.
+
+### Deepening schematic → operational
+
+To upgrade a section from schematic to operational:
+
+1. Create a new subset directory (e.g., `proofs/operational/lambda_zer_move/`)
+2. Copy `syntax.v` / `semantics.v` / `typing.v` from lambda_zer_handle/ as base
+3. Extend operational semantics: new step rules for the feature (e.g., `step_move_transfer`, `step_shared_access`)
+4. Extend typing: new typing rules
+5. Extend ghost state: new `Class moveG Σ` if a new resource is needed
+6. Prove step specs in fupd form (see `iris_step_specs.v` as template)
+7. Re-prove the schematic closures from `iris_move.v` (etc.) as operational theorems in the new subset
+
+Estimated work per section:
+- Typing-level (G, I, K, N, Q, T): ~3-8 hours each — mostly copy patterns
+- VRP integration (L, M, R, S): ~10-20 hours each
+- Provenance/regions (H, J, O): ~20-40 hours each
+- Concurrency (C, D, E, F): ~100-200 hours total (real Iris work)
 
 ## Iris name collisions — the single biggest productivity drain
 
@@ -322,26 +400,82 @@ When starting `lambda_zer_move/` or similar:
 | `expr: Not a projection.` | `{\|...\|}` record syntax confused by field-name collision | Use positional constructor `Language` / `Build_LanguageMixin` |
 | `Tactic failure: iStartProof: not a BI assertion` | Used iris tactic on a Coq-Prop goal, or vice versa | Check whether goal is `⊢ iProp` or plain `Prop`; use `iPureIntro` to transition |
 | `Syntax error: '\|' or ']' expected (in [or_and_intropattern])` | Wrong pipe count in `destruct as [...]` | Count constructors, use n-1 pipes |
+| `Syntax Error: Lexer: Unterminated comment` | Inline text inside a Coq comment contains `(*` (e.g., `(*T` from `@inttoptr(*T, ...)`) | Coq nests comments — any `(*` in prose opens a new comment. Rewrite prose to avoid `(*` patterns, or use `( *T` with a space |
+| `Tactic failure: iPoseProof: "Hname" not found` | `iPoseProof` with a string name tries to dereference a hypothesis; after `iApply wp_mono`, hypotheses may have been dropped/renamed | Use persistent hypothesis (`#Hname`) which can be reused without iPoseProof |
+| `Tactic failure: iIntro: introducing non-persistent into non-empty spatial context` | `iIntros "H [H1 H2]"` when introducing a wand-shape — Iris doesn't accept binding non-persistent and then splitting in one go | Split the intro: `iIntros "H". iIntros "[H1 H2]".` OR restructure the lemma statement (sep-conjunction instead of wand) |
+| `has type "upred.uPred..." while it is expected to have type "bi_car ?PROP0"` | BI / iProp type mismatch — missing Iris imports for the framework | Add `From iris.base_logic.lib Require Import ghost_map` (or whatever brings the BI instances) |
+| `The term "state" has type "language → Type"` | Same name-collision pattern as `expr`/`val` — Iris's `state` projection shadows ours | Qualify: `semantics.state` (NOT `syntax.state` — `state` lives in semantics.v) |
+| `injection Heq as -> -> ->` makes a variable vanish | When LHS has form `(p',i',g') = (p,i,g)`, the substitutions can eliminate the target metavariable | Use named intros: `injection Heq as Hp_eq Hi_eq. subst p' i' g'.` |
 
 ## Reading order for fresh sessions
 
 1. `docs/formal_verification_plan.md` — big picture (Iris-from-start, no timeline)
 2. `proofs/operational/README.md` — directory architecture
-3. `docs/safety_list.md` — what's proven and what isn't (203-row coverage matrix)
+3. `docs/safety_list.md` — what's proven and what isn't (203-row coverage matrix) — **ALL 168 substantive rows now closed**
 4. This file (`proof-internals.md`) — tactics, gotchas, patterns
-5. The `.v` files in dependency order: `syntax.v` → `semantics.v` → `typing.v` → `iris_lang.v` → `iris_resources.v` → `iris_state.v` → `iris_specs.v` → `iris_step_specs.v` → `iris_leak.v` → `iris_adequacy.v` → `iris_demo.v`
+5. The `.v` files in dependency order:
+   - Foundation: `syntax.v` → `semantics.v` → `typing.v`
+   - Iris setup: `iris_lang.v` → `iris_resources.v` → `iris_state.v`
+   - Specs/adequacy: `iris_specs.v` → `iris_step_specs.v` → `iris_leak.v` → `iris_adequacy.v`
+   - Extensions: `iris_func_spec.v` → `iris_loop.v` → `iris_derived.v`
+   - Schematic closures: `iris_move.v` → `iris_control_flow.v` → `iris_typing_rules.v` → `iris_misc_sections.v` → `iris_mmio_cast_escape.v` → `iris_concurrency.v` → `iris_container_validity.v`
+   - Demo: `iris_demo.v`
 
 Each `.v` file has a header comment describing its Phase (0, 1a, 1b, etc.) and what it delivers.
 
 ## What's next (when continuing)
 
-Per `docs/safety_list.md`, section A has 6 remaining ◐ rows. Priorities:
+The safety matrix is 100% covered at schematic level. Priorities for DEEPENING:
 
-1. **A03, A04** — resource fractions. Need to thread alloc_id from parent pointer to interior pointer. Iris's fractional ghost ownership (using `q : Qp` fractions) is the tool.
-2. **A05, A07** — `FuncSpec` iProp. RustBelt's approach: specify each function's resource pre/post via `□ ∀ args, P args -∗ WP body {{ Q }}`. Parameters threaded by caller.
-3. **A15, A16** — loop fixpoints. Iris has `wp_while` / `wp_for` combinators; need Löb induction for convergence.
+### Quick wins (typing-level, low effort)
+- Already done — G, I, K, N, P, Q, T sections are structural and don't need operational deepening.
 
-Sections B (move), C-D (concurrency), H (MMIO), etc. are separate subsets, each in their own directory. Don't start them until A is further closed.
+### Medium effort — section-specific subsets
+These would get their own `lambda_zer_*/` directory with operational semantics extensions:
+
+1. **lambda_zer_move/** (B section, 8 rows) — move struct operational semantics.
+   Extension: add `EMove`, `EDrop`, `EConsume` step rules. Re-prove schematic closures as full operational.
+   Effort: ~10-20 hours.
+
+2. **lambda_zer_mmio/** (H section, 9 rows) — MMIO operational semantics.
+   Extension: add region invariants as Iris invariants. Each MMIO range = `mmio_region γ addr size : iProp`.
+   Effort: ~20-40 hours.
+
+3. **lambda_zer_opaque/** (J section, 14 rows) — provenance ghost state.
+   Extension: ghost map from pointer → type_id. Each cast operation updates. `@ptrcast` checks match.
+   Effort: ~20-40 hours.
+
+4. **lambda_zer_escape/** (O section, 12 rows) — region invariants for dangling pointers.
+   Extension: each allocation-site region tagged; assignment/return rules check flow.
+   Effort: ~30-60 hours.
+
+### Hard effort — concurrency
+
+5. **lambda_zer_concurrency/** (C, D, E sections, 25 rows) — real Iris concurrency.
+   Extension: Iris invariants for shared struct, lock-order ghost state, logically-atomic triples for atomics/condvar.
+   Effort: ~100-200 hours. This is real Iris concurrency engineering.
+
+6. **lambda_zer_async/** (F section, 5 rows) — async state-machine verification.
+   Extension: continuation-passing wp, Löb induction, state-struct invariants.
+   Effort: ~40-80 hours. Builds on concurrency subset.
+
+### Level 3 — VST on compiler
+
+When schematic proofs exist for all sections, the next value-add is VST-verifying the compiler's implementation against them. Scope: ~50 safety-critical functions in zercheck.c + emitter.c.
+
+- Per-function contract + VST proof: ~5-20 hours each
+- Total: ~150-500 hours for full "Iris spec as compiler correctness oracle"
+
+## Design precedents — use for consistency
+
+When building new schematic closures:
+- Section A (resource algebra + fupd step specs + adequacy) is the OPERATIONAL template.
+- Section B (`iris_move.v`) is the template for "new linear resource, reuse handleG" — a dedicated subset would extract this to its own directory.
+- Section G (`iris_control_flow.v`) is the template for "context-flag checks" — pure typing, schematic.
+- Section T (`iris_container_validity.v`) is the template for "structural well-formedness" — mostly `True` proofs with strong comments.
+- Section L/M (`iris_misc_sections.v`) is the template for "VRP integration" — points at compile-time + runtime checks.
+
+When unsure which template to use, grep the `Covers safety_list.md rows:` comment in each file to find the match.
 
 ## Invariants maintained by this doc
 

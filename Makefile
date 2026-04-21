@@ -233,7 +233,8 @@ check-proofs:
 	          proofs/operational/lambda_zer_move/*.v \
 	          proofs/operational/lambda_zer_opaque/*.v \
 	          proofs/operational/lambda_zer_escape/*.v \
-	          proofs/operational/lambda_zer_mmio/*.v; do \
+	          proofs/operational/lambda_zer_mmio/*.v \
+	          proofs/operational/lambda_zer_typing/*.v; do \
 	    FILES="$$FILES $$f"; \
 	 done; \
 	 if grep -l 'Admitted\|admit\.' $$FILES 2>/dev/null | grep -q .; then \

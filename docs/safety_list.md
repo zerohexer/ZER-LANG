@@ -115,18 +115,18 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | F. Async / coroutine context | 5 | ✓ (schematic — context flags + state-machine invariants; `iris_concurrency.v`) |
 | G. Control-flow context safety | 12 | ✓ (typing + context-flag enforced; `iris_control_flow.v`) |
 | H. MMIO / volatile / hardware | 9 | ✓ **FULL operational** — `lambda_zer_mmio/` subset (stuck-on-violation proofs for out-of-range + unaligned + no-decl) |
-| I. Qualifier preservation (const/volatile) | 11 | ✓ (all 11 rows, typing-enforced) |
+| I. Qualifier preservation (const/volatile) | 11 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (I_strip_const_unsafe, I_strip_volatile_unsafe, I_add_const_safe, I_refl_safe, I_trans_safe) |
 | J. Pointer cast & provenance | 14 | ✓ **FULL operational** — `lambda_zer_opaque/` subset (core provenance rows J01/J04/J11/J12/J13/J14) |
 | K. `@container` / `@offset` / `@size` | 4 | ✓ (typing-enforced; `container_intrinsics_well_typed`) |
 | L. Bounds / indexing / slicing | 11 | ✓ (VRP + runtime trap; `iris_misc_sections.bounds_safety_compile_or_runtime`) |
 | M. Division / arithmetic safety | 10 | ✓ (VRP + typing; `division_safety_via_vrp_or_trap`) |
-| N. Null / optional safety | 8 | ✓ (3 N-specific + 5 already `—` typing) |
+| N. Null / optional safety | 8 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (N02_null_requires_optional, N03_unwrap_needs_optional, N05_no_nested_optional) |
 | O. Escape analysis (dangling) | 12 | ✓ **FULL operational** — `lambda_zer_escape/` subset (region tags RegLocal/RegArena/RegStatic, step rules enforce region match) |
-| P. Union / enum variant safety | 8 | ✓ (variant-tag + typing; `iris_misc_sections.variant_safety`) |
-| Q. Switch exhaustiveness | 5 | ✓ (all typing-enforced) |
+| P. Union / enum variant safety | 8 | ✓ P04 real Coq proof in `lambda_zer_typing/typing.v` (P04_variant_index_bounded, P04_out_of_range_rejected); other P-rows schematic |
+| Q. Switch exhaustiveness | 5 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (Q01_bool_exhaustive_covers_both, Q02_enum_exhaustive_covers_all, Q03_int_switch_requires_default) |
 | R. Comptime / static_assert | 6 | ✓ (evaluator totality; `comptime_evaluator_sound`) |
 | S. Resource limits (stack, ISR alloc) | 5 | ✓ (call-graph + context flags; `stack_limit_via_call_graph_analysis`, `alloc_banned_in_isr_critical`) |
-| T. Container / builtin validity | 6 | ○ |
+| T. Container / builtin validity | 7 | ✓ T01 real Coq proof in `lambda_zer_typing/typing.v` (T01_pool_count_positive, T01_pool_zero_rejected); other T-rows schematic in `iris_container_validity.v` |
 | U. Syntax / declaration (not safety-semantic) | 35 | — (all `—` by construction; compile-time well-formedness) |
 | **Total curated rows** | **203** | |
 | **Total raw predicates covered** | **374** | |

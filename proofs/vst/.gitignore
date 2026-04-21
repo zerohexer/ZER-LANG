@@ -1,0 +1,12 @@
+# Coq build artifacts
+*.vo
+*.vok
+*.vos
+*.glob
+.*.aux
+.*.d
+.lia.cache
+
+# CompCert clightgen generates simple_check.v from simple_check.c.
+# Don't commit — it's a generated file.
+simple_check.v

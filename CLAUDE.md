@@ -513,12 +513,14 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Not safety-semantic:** U (35 rows — pure well-formedness, correctly marked `—`).
 
-**Next priority — Level 3 VST on zercheck.c:** the remaining gap. Predicate-based proofs show the CHECK is correct, not that the C implementation of the check is correct. Level 3 verifies zercheck.c's C source matches each predicate via VST. Setup: `proofs/vst/` subdir. Scope: ~50 safety-critical functions × 5-20 hrs each = 150-500 hours total.
+**Level 3 in progress — VST on C:** `proofs/vst/` with coq-vst 3.0beta2 + CompCert clightgen. First proof landed (verif_simple_check.v). `make check-vst` builds + verifies. See `proof-internals.md` "Level 3" section for VST patterns — `VST.floyd.compat` required (precompiled in Docker), Iris-based funspec, one-liner proof pattern `forward_if; forward; destruct; entailer!`.
 
-**Key distinction — predicate vs operational vs VST:**
-- **Predicate-based** (typing.v): bool function + theorem. Proves the check semantics, not the implementation.
-- **Operational** (lambda_zer_*/ subsets): step relation + proofs. Proves safety holds during execution of the model.
-- **VST (Level 3, future)**: proves the C code in zercheck.c correctly implements the predicate. Closes the implementation-correctness gap.
+**Level 3 scope to close:** ~50 safety-critical zercheck.c + emitter.c functions. 150-500 hrs for complete coverage. Current: 1 verified (proof of concept).
+
+**Three levels distinction:**
+- **Level 1 (predicates)** — `typing.v` etc.: abstract safety spec is correct.
+- **Level 2 (tests)** — `tests/zer_proof/`: compiler empirically rejects known violations.
+- **Level 3 (VST)** — `proofs/vst/`: C source matches predicate for EVERY input. Catches implementation bugs 1+2 can miss (e.g., `if (x = 1)` assignment-typo — spec correct, tests may miss, VST fails immediately).
 
 Contents of `docs/compiler-internals.md`:
 

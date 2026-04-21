@@ -5,6 +5,136 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (Level 3 VST kickoff) — VST 3.0 Iris setup patterns
+
+Starting Level 3 (VST on C implementations) surfaced several patterns
+specific to VST 3.0beta2's Iris-based architecture. Recorded here
+so fresh sessions recognize them.
+
+### VST 3.0 needs Σ : gFunctors for funspec
+
+**Symptom:** `Cannot infer the implicit parameter Σ of funspec whose type is "gFunctors"`.
+
+**Root cause:** VST 3.0 migrated to Iris-based separation logic. `funspec`
+is now parametric over the resource algebra context `Σ`. The old pattern
+`Definition foo_spec : ident * funspec := DECLARE _foo ...` no longer
+resolves Σ automatically.
+
+**Fix:** Import `VST.floyd.compat` which provides `Notation funspec :=
+(@funspec (VSTΣ unit))` — specializes to no ghost state / no external
+calls. Good for simple verifications that don't need custom resources:
+
+```coq
+Require Import VST.floyd.proofauto.
+Require Import VST.floyd.compat.
+```
+
+### VST.floyd.compat is NOT precompiled by default
+
+**Symptom:** `Cannot find a physical path bound to logical path VST.floyd.compat`.
+
+**Root cause:** The opam `coq-vst` install doesn't compile `compat.v` by
+default — only the core VST modules. Source exists at
+`/home/coq/.opam/.../VST/floyd/compat.v` but no `.vo`.
+
+**Fix:** in Dockerfile, add a RUN step to compile it:
+```dockerfile
+RUN eval $(opam env) && \
+    cd /home/coq/.opam/.../VST/floyd/ && \
+    coqc -Q /home/coq/.opam/.../VST VST compat.v
+```
+
+Done in `proofs/vst/Dockerfile`. Rebuilding `zer-vst` image includes the
+.vo so subsequent imports work.
+
+### forward_if goal count is surprising
+
+**Symptom:** `Error: No such goal. Focus next goal with bullet -.`
+after `forward_if. - (then-branch).`.
+
+**Root cause:** `forward_if` sometimes produces ONE goal (when both
+branches of the if-else end with return, the "after-merge" is
+unreachable), sometimes produces TWO goals (normal if-then-else).
+Bullets assume a fixed count — they fail when VST chose the
+single-goal path.
+
+**Fix:** don't use bullets/braces for `forward_if` when you don't know
+the goal count. Use the combined one-liner pattern:
+
+```coq
+forward_if;
+  forward;
+  unfold foo_coq;
+  destruct (Z.eq_dec x N); try contradiction; try subst; try contradiction;
+  entailer!.
+```
+
+This handles 1 or 2 goals uniformly. Each goal is dispatched by the
+same tactic chain.
+
+### destruct case-split order matters for contradiction
+
+**Symptom:** `Error: No such contradiction` in a case branch that
+should be contradictory.
+
+**Root cause:** `destruct (Z.eq_dec x N); [|contradiction]` assumes
+the false branch has a direct contradiction. If the goal is still
+about a post-condition (not the hypothesis), `contradiction` fails
+because nothing in the context is `False` yet.
+
+**Fix:** rearrange to unfold/destruct first, then contradict:
+
+```coq
+unfold foo_coq;
+destruct (Z.eq_dec x N);
+  try contradiction;   (* case where destruct makes it False *)
+  try subst;           (* case where equality lets us substitute *)
+  try contradiction;
+  entailer!.           (* remaining goals close via VST *)
+```
+
+The `try` chain is defensive — applies wherever it can without failing.
+
+### clightgen -normalize required for VST
+
+**Symptom:** VST proofs fail / reason strangely about function body.
+
+**Root cause:** `clightgen` without `-normalize` produces Clight code
+that doesn't match VST's expected forms (e.g., assignments within
+complex expressions).
+
+**Fix:** always use `-normalize`:
+
+```bash
+clightgen -normalize simple_check.c
+```
+
+Produces `simple_check.v` suitable for VST. Documented in
+`proofs/vst/Makefile`.
+
+### CRLF warnings in git add on Windows (not a real bug)
+
+**Symptom:** `warning: in the working copy of '...', LF will be
+replaced by CRLF the next time Git touches it`.
+
+**Root cause:** Windows git auto-converts line endings for text files.
+Harmless — the actual file content is unchanged in the repo.
+
+**Fix:** ignore. Or configure `.gitattributes` with `* text=auto`.
+
+### VST Σ-abstraction confusion
+
+**Insight (not a bug):** the difference between `funspec` (needs Σ)
+and `(VSTΣ unit)-funspec` (no Σ) is invisible at proof time but
+matters for definition. Once you use `compat.v`'s notation, every
+subsequent `DECLARE` uses the specialized form and it "just works."
+
+For PROOFS that need custom ghost state (locks, invariants), you'd
+drop `compat.v` and work with explicit Σ. We're not there yet — all
+current VST targets are pure/stateless functions from zercheck.
+
+---
+
 ## Session 2026-04-21 (lambda_zer_typing + 135 real theorems) — upgrading schematic to predicate-based
 
 Replacing `True. Qed.` schematic closures across all non-operational

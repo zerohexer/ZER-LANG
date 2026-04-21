@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// Regression for Gemini audit Finding 3 (2026-04-21)
+// Escape analysis must reject returning a struct whose slice field
+// was assigned a local array. `l.data` would carry a dangling pointer
+// to `local_buf` after exploit() returns.
+
+struct Leak { [*]u8 data; }
+
+Leak exploit() {
+    u8[10] local_buf;
+    Leak l;
+    l.data = local_buf;
+    return l;  // ERROR: cannot return pointer to local 'l'
+}
+
+void main() {
+    Leak x = exploit();
+}

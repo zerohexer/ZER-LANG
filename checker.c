@@ -3012,6 +3012,26 @@ static Type *check_expr(Checker *c, Node *node) {
                             Symbol *src = scope_lookup(c->current_scope,
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src) propagate_escape_flags(tsym, src, tsym->type);
+                            /* BUG-fix (Gemini audit 2026-04-21): local array assigned
+                             * to a field that carries a pointer (slice). Array→slice
+                             * coercion makes the slice's .ptr point into the stack.
+                             * The source Symbol's is_local_derived is FALSE (it IS the
+                             * local, not derived from one), so propagate_escape_flags
+                             * misses this. Mark the root struct as local_derived
+                             * explicitly — return-escape check will then reject
+                             * `return l;` when `l.data = local_array` happened. */
+                            if (src && src->type &&
+                                (node->assign.target->kind == NODE_FIELD ||
+                                 node->assign.target->kind == NODE_INDEX)) {
+                                Type *src_eff = type_unwrap_distinct(src->type);
+                                bool src_is_global = scope_lookup_local(c->global_scope,
+                                    src->name, src->name_len) != NULL;
+                                if (src_eff && src_eff->kind == TYPE_ARRAY &&
+                                    !src->is_static && !src_is_global &&
+                                    type_can_carry_pointer(tsym->type)) {
+                                    tsym->is_local_derived = true;
+                                }
+                            }
                             /* provenance propagation through alias (compile-time belt) */
                             if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
                             if (src && src->container_struct) {
@@ -4428,6 +4448,22 @@ static Type *check_expr(Checker *c, Node *node) {
                             ct_ctx_free(&cctx);
                         }
                         if (val != CONST_EVAL_FAIL) {
+                            /* BUG-fix (Gemini audit 2026-04-21): comptime eval
+                             * runs in int64 host space. ZER semantics: integer
+                             * overflow WRAPS at the declared type's width, and
+                             * shift by >= width = 0. Mask the result to the
+                             * return type's width so `comptime u32 BIT(u32 n)
+                             * { return 1 << n; }` for n>=32 wraps correctly
+                             * (giving 0 for multiples of 2^32, etc.) instead
+                             * of leaking int64 values into the emitted C
+                             * where GCC would truncate with warnings. */
+                            if (ret_ty_check) {
+                                int w = type_width(ret_ty_check);
+                                if (w > 0 && w < 64) {
+                                    uint64_t mask = (1ULL << w) - 1ULL;
+                                    val = (int64_t)((uint64_t)val & mask);
+                                }
+                            }
                             node->call.comptime_value = val;
                             node->call.is_comptime_resolved = true;
                         } else {

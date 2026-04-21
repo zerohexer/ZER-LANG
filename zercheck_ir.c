@@ -2383,10 +2383,19 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         ir_ps_init(&block_states[bi]);
 
     /* Process blocks in order (topological for forward edges).
-     * For back edges (loops), use fixed-point iteration. */
+     * For back edges (loops), use fixed-point iteration.
+     *
+     * FAIL-CLOSED (BUG-fix from Gemini audit 2026-04-21): if the fixed
+     * point doesn't converge within the bound, emit a compile error
+     * rather than silently accepting a partial/incorrect safety state.
+     * The lattice is finite (5 states × N handles), so 32 iterations is
+     * plenty for any realistic program. Convergence failure means the
+     * program is pathologically complex; we refuse to compile it rather
+     * than miss a potential UAF. */
     bool changed = true;
     int iterations = 0;
-    while (changed && iterations < 32) {
+    const int MAX_ITERATIONS = 32;
+    while (changed && iterations < MAX_ITERATIONS) {
         changed = false;
         iterations++;
 
@@ -2447,6 +2456,18 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             ir_ps_free(&block_states[bi]);
             block_states[bi] = merged;
         }
+    }
+
+    /* FAIL-CLOSED: if the fixed point didn't converge, emit a compile
+     * error. Skip during summary-building (would add spurious errors
+     * for partial analysis). */
+    if (changed && iterations >= MAX_ITERATIONS && !zc->building_summary) {
+        int fail_line = func->ast_node ? func->ast_node->loc.line : 0;
+        ir_zc_error(zc, fail_line,
+            "safety analysis did not converge within %d iterations — program too complex "
+            "for path-sensitive analysis. Simplify control flow (fewer loops / "
+            "deeper nesting / backward gotos) or file a bug.",
+            MAX_ITERATIONS);
     }
 
     /* Phase C1: FuncSummary build / refine. When building a summary, examine

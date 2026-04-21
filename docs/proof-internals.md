@@ -162,7 +162,8 @@ When adding a new safety row, find the matching file:
 | E01-E08 (atomic/condvar/etc) | Schematic | `iris_concurrency.v` |
 | F01-F05 (async) | Schematic | `iris_concurrency.v` |
 | G01-G12 (control flow) | Schematic | `iris_control_flow.v` |
-| H01-H09 (MMIO) | Schematic | `iris_mmio_cast_escape.v` |
+| H01-H09 (MMIO) | Schematic (in lambda_zer_handle) | `iris_mmio_cast_escape.v` |
+| H01-H04, H06 (core MMIO) | **FULL operational** (dedicated subset) | `lambda_zer_mmio/syntax.v`, `semantics.v`, `iris_mmio_theorems.v` |
 | I01-I11 (qualifiers) | Schematic | `iris_typing_rules.v` |
 | J01-J14 (cast/provenance) | Schematic (in lambda_zer_handle) | `iris_mmio_cast_escape.v` |
 | J01, J04, J11, J12, J13, J14 (core provenance) | **FULL operational** (dedicated subset) | `lambda_zer_opaque/syntax.v`, `semantics.v`, `iris_opaque_resources.v`, `iris_opaque_state.v`, `iris_opaque_specs.v`, `iris_opaque_theorems.v` |
@@ -170,7 +171,8 @@ When adding a new safety row, find the matching file:
 | L01-L11 (bounds) | Schematic | `iris_misc_sections.v` |
 | M01-M13 (arith) | Schematic | `iris_misc_sections.v` |
 | N01-N08 (optional) | Schematic | `iris_typing_rules.v` |
-| O01-O12 (escape) | Schematic | `iris_mmio_cast_escape.v` |
+| O01-O12 (escape) | Schematic (in lambda_zer_handle) | `iris_mmio_cast_escape.v` |
+| O01-O12 (escape) | **FULL operational** (dedicated subset) | `lambda_zer_escape/syntax.v`, `semantics.v`, `iris_escape_resources.v`, `iris_escape_state.v`, `iris_escape_specs.v`, `iris_escape_theorems.v` |
 | P01-P08 (variant) | Schematic | `iris_misc_sections.v` |
 | Q01-Q05 (switch) | Schematic | `iris_typing_rules.v` |
 | R01-R07 (comptime) | Schematic | `iris_misc_sections.v` |
@@ -545,6 +547,122 @@ When building new schematic closures:
 - Section L/M (`iris_misc_sections.v`) is the template for "VRP integration" — points at compile-time + runtime checks.
 
 When unsure which template to use, grep the `Covers safety_list.md rows:` comment in each file to find the match.
+
+## Operational subset templates — which to follow
+
+Five operational subsets exist, each demonstrating a different template:
+
+### Template 1 — Pool + generation counter (lambda_zer_handle/)
+**For:** entity lifecycle with alloc/free/use state machine.
+- Ghost state: `gmap (pool_id * nat) nat` — keys are (pool, slot), value is generation.
+- State_interp: two-way agreement with concrete store's alive slots.
+- Use when: the thing being tracked has a generation counter or similar versioning.
+
+### Template 2 — Linear resource (lambda_zer_move/)
+**For:** "exclusive-ownership-then-consumed" patterns.
+- Ghost state: `gmap move_id unit` — presence = owned.
+- State_interp: ghost map matches st_live + counter invariant.
+- Use when: the thing has binary states (owned/consumed), no generation.
+
+### Template 3 — Type-tagged provenance (lambda_zer_opaque/)
+**For:** pointers carrying their original type through opaque round-trips.
+- Ghost state: `gmap nat type_id` — instance → type tag.
+- State_interp: ghost map = st_ptr_types, counter invariant.
+- Key theorems use `typed_ptr_agree` (same id can't own different tags).
+- Use when: values carry a pinned classification that's checked on operations.
+
+### Template 4 — Region tagging (lambda_zer_escape/)
+**For:** enum-valued tags (not integer types). Same structure as template 3 but with a finite sum type instead of nat.
+- Ghost state: `gmap nat region` where `region = RegLocal | RegArena | RegStatic`.
+- Key theorems: exclusivity + agreement → "wrong region" is contradictory.
+- Use when: you have a finite classification (region, color, kind) that restricts operations.
+
+### Template 5 — Static constraint (lambda_zer_mmio/)
+**For:** purely operational safety with NO ghost state needed.
+- State contains the constraint data (list of declared ranges).
+- Step rule premises enforce constraints directly.
+- Stuck-on-violation proofs via inversion on step rules.
+- Use when: the constraint data is program-level constant, no dynamic tracking needed.
+
+**Picking a template for a new subset:**
+1. Does the thing have dynamic state (created/destroyed/mutated)? → Template 1-4 (ghost state needed)
+2. Does it have a lifecycle with generations? → Template 1
+3. Is it a linear resource (owned then consumed)? → Template 2
+4. Does it carry a pinned tag checked on use? → Template 3 (nat tag) or 4 (enum tag)
+5. Is the constraint purely static/program-level? → Template 5 (no ghost state)
+
+## Cross-template patterns learned
+
+### Unit type in gmap values — use `tt` not `()`
+
+When ghost_map's value type is `unit`:
+```coq
+(* Right *)
+Definition alive_move γ id : iProp Σ := id ↪[γ] tt.
+Definition foo : gmap nat unit := <[ k := tt ]> ∅.
+
+(* Wrong — () parses as Set not unit value *)
+Definition alive_move γ id : iProp Σ := id ↪[γ] ().     (* fails *)
+Definition foo : gmap nat unit := <[ k := () ]> ∅.      (* fails *)
+```
+
+### Two-invariant state_interp pattern
+
+Minimal pattern (template 1/2/3):
+```coq
+Definition state_interp γ σ : iProp Σ :=
+  ∃ gs : gmap K V,
+    ghost_map_auth γ 1 gs ∗
+    ⌜gs = σ.(concrete_map)⌝ ∗                             (* invariant A *)
+    ⌜∀ id v, gs !! id = Some v → id < σ.(st_next)⌝.       (* invariant B *)
+```
+
+Invariant B (counter well-formedness) is NEEDED to discharge `step_spec_alloc` — without it you can't prove the fresh id isn't already in the ghost map.
+
+Destructure with:
+```coq
+iDestruct "Hinterp" as (gs) "(Hauth & %Heq & %Hlt)".
+```
+
+### Stuck-proof via inversion on step rules
+
+For subsets without ghost state (or as a fallback pattern):
+```coq
+Lemma foo_stuck st ... :
+  condition_fails →
+  ¬ (exists st' e', step st (EOp ...) st' e').
+Proof.
+  intros Hfail [st' [e' Hstep]].
+  inversion Hstep; subst.
+  - (* primary rule case: contradicts Hfail *)
+    match goal with H : precondition_pattern |- _ =>
+      rewrite H in Hfail; discriminate
+    end.
+  - (* ctx rule case: inner arg must step. EVal doesn't step. *)
+    match goal with H : step _ (EVal _) _ _ |- _ => inversion H end.
+Qed.
+```
+
+Use `match goal with H : shape |- _ => ... end` to bind hypotheses by shape — avoids fragile `H3 / H4` auto-names.
+
+### Rewrite direction in state_interp
+
+Given `Heq : gs = σ.(some_map)` and `Heqn : σ.(some_map) !! k = Some v`:
+- `rewrite <- Heq in Heqn` — rewrites Heqn from σ-form to gs-form (correct direction for using Heqn with lemmas that take gs)
+- `rewrite Heq in Hlt` — rewrites Hlt's gs → σ-form (reverse direction)
+
+The `<-` in `rewrite <- Heq` uses the equation from right-to-left. Mentally: "rewrite σ.(some_map) to gs" means we have gs = σ.some_map and want to replace σ.some_map with gs, so we need to go right-to-left.
+
+### `eapply` for step rules with computed arguments
+
+Step rules often have `let st' := ...` in their body. `apply step_X with args` tries to unify st' explicitly and fails:
+```coq
+(* WRONG: "Not the right number of missing arguments" *)
+apply step_deref with t. exact Hlook.
+
+(* RIGHT: use eapply which unifies incrementally *)
+eapply step_deref. exact Hlook.
+```
 
 ## Invariants maintained by this doc
 

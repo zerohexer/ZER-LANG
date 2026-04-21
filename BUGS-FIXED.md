@@ -5,6 +5,127 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (lambda_zer_opaque + escape + mmio subsets) — template patterns + recurring traps
+
+Three more subset directories (`lambda_zer_opaque/`, `lambda_zer_escape/`,
+`lambda_zer_mmio/`) revealed both NEW patterns and RECURRENCES of
+previously-documented bugs. Recording here so future sessions
+recognize the patterns AND know when they're running into the same
+trap we already fixed.
+
+### RECURRENCE: Coq nested `(*` in prose comments (third time)
+
+**Symptom (again):** `Syntax Error: Lexer: Unterminated comment`
+at line where a Coq file comment contains `(*T` from compiler-syntax
+examples like `@inttoptr(*T, addr)`.
+
+**Already documented** in 2026-04-21 session entry below. The trap
+recurred because I copy-pasted compiler-syntax examples into new
+subsets' comments. Added mitigation: when writing Iris file headers,
+**avoid quoting ZER/C syntax verbatim that starts with `(*`**. Use
+English description instead: "@inttoptr intrinsic" not
+"@inttoptr(*T, addr)".
+
+Fresh sessions: if you hit "Unterminated comment" in a `.v` file,
+first check for `(*` patterns in comment prose before looking for
+real issues. Most common cause.
+
+### RECURRENCE: `inversion H3` auto-naming fragility (second time)
+
+**Symptom:** `The variable H3 was not found in the current environment`
+after `inversion Hstep`.
+
+**Already documented** but recurred because I wrote new `.v` files
+with direct `H3` / `H4` references. Pattern: use `match goal with H
+: shape |- _ => ... end` INSTEAD of named hypothesis references.
+
+Template for stuck-proof inversion:
+```coq
+inversion Hstep; subst.
+- (* primary rule case *)
+  match goal with H : addr_in_ranges _ _ = true |- _ =>
+    rewrite H in Hne; discriminate
+  end.
+- (* ctx rule case *)
+  match goal with H : step _ (EVal _) _ _ |- _ => inversion H end.
+```
+
+### RECURRENCE: `apply with args` vs `eapply` (second time)
+
+**Symptom:** `Not the right number of missing arguments (expected 0)`
+when applying step rules with computed `let st' := ...`.
+
+**Already documented** but recurred in `iris_opaque_specs.v`:
+```coq
+(* WRONG *)
+apply step_deref with t. exact Hlook.
+(* RIGHT *)
+eapply step_deref. exact Hlook.
+```
+
+When step rule has a `let` in its body, ALWAYS use `eapply`.
+
+### NEW: `rewrite <- Heq in Heqn` direction tricky
+
+**Symptom:** `Found no subterm matching "st_ptr_types σ" in Hlt`.
+
+**Root cause:** Given `Heq : gs = σ.(some_map)` and `Heqn : σ.(some_map)
+!! k = Some v`, trying to use Heqn with a lemma that wants gs-form
+requires rewriting Heqn FIRST (not Hlt).
+
+**Fix:** rewrite direction matters. `rewrite <- Heq in Heqn` uses
+equation right-to-left in Heqn — turns `σ.(some_map) !! k` into
+`gs !! k`. That's the form the lookup lemmas want.
+
+Mental rule: if Heq is `A = B`, `rewrite Heq in X` replaces A with
+B in X, and `rewrite <- Heq in X` replaces B with A in X.
+
+### NEW: State_interp must include counter-well-formedness
+
+**Pattern (not a bug, but a required invariant):** any subset with
+a monotonic counter `st_next` for fresh-id allocation needs the
+invariant `∀ id ∈ dom gs, id < st_next` in its state_interp.
+Without it, `step_spec_alloc` can't prove the fresh id is absent
+from the ghost map.
+
+Canonical form:
+```coq
+Definition foo_state_interp γ σ : iProp Σ :=
+  ∃ gs : gmap K V,
+    ghost_map_auth γ 1 gs ∗
+    ⌜gs = σ.(concrete_map)⌝ ∗
+    ⌜∀ id v, gs !! id = Some v → id < σ.(st_next)⌝.
+```
+
+Documented in proof-internals.md "Two-invariant state_interp pattern".
+
+### NEW: MMIO subset doesn't need ghost state
+
+**Insight:** Some safety subsets don't need Iris ghost state at all.
+If the constraint data (e.g., declared MMIO ranges) is a
+program-level CONSTANT in the state, step-rule premises enforce it
+directly without dynamic tracking.
+
+λZER-MMIO has no resource algebra. Proofs are pure Coq inversion
+on step rules. Much simpler than subsets with dynamic tracking.
+Recorded as Template 5 in proof-internals.md.
+
+### DESIGN NOTE: Schematic vs operational depth clarified
+
+User pushback exposed that "schematic" (`Lemma foo : True. Proof.
+exact I. Qed.`) is NOT a real proof — it's a documentation stub.
+Real operational proofs (sections A, B, J-core, O, H) define
+step relations and prove safety invariants. Schematic "proofs"
+for typing-level sections (I, K, N, P, Q, R, S, T) are placeholders
+acknowledging "constraint enforced by checker.c."
+
+**For fresh sessions:** when the matrix says "schematic," it means
+"documented in a comment, not formally proven." Don't claim
+equivalent rigor to operational subsets. If truth-depth matters,
+either operationalize or clearly label as TODO.
+
+---
+
 ## Session 2026-04-21 (lambda_zer_move operational subset) — new-subset pitfalls
 
 Creating the FIRST subset directory beyond `lambda_zer_handle/` —

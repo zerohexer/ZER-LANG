@@ -223,12 +223,27 @@ check-proofs:
 	    -v "$$(pwd -W 2>/dev/null || pwd):/work" -w /work zer-proofs \
 	    bash -c 'eval $$(opam env) && make'
 	@echo "=== All proofs compile green ==="
-	@echo "Verify zero admits:"
-	@if grep -l 'Admitted\|admit\.' proofs/operational/lambda_zer_handle/iris_*.v 2>/dev/null | grep -q .; then \
-	    echo "FAIL: admits found in Iris proofs"; exit 1; \
-	else \
-	    echo "OK: zero admits across all iris_*.v files"; \
-	fi
+	@echo "Verify zero admits across Iris subsets:"
+	@# Exclude pre-Iris files (adequacy.v, handle_safety.v, syntax.v,
+	@# semantics.v, typing.v in lambda_zer_handle) — preserved as insurance.
+	@# Iris files always start with iris_*. Per-subset foundation files
+	@# (syntax.v, semantics.v) are included when in non-handle subsets.
+	@FILES=""; \
+	 for f in proofs/operational/lambda_zer_handle/iris_*.v \
+	          proofs/operational/lambda_zer_move/*.v \
+	          proofs/operational/lambda_zer_opaque/*.v \
+	          proofs/operational/lambda_zer_escape/*.v \
+	          proofs/operational/lambda_zer_mmio/*.v; do \
+	    FILES="$$FILES $$f"; \
+	 done; \
+	 if grep -l 'Admitted\|admit\.' $$FILES 2>/dev/null | grep -q .; then \
+	    echo "FAIL: admits found in:"; \
+	    grep -l 'Admitted\|admit\.' $$FILES; \
+	    exit 1; \
+	 else \
+	    file_count=$$(echo $$FILES | wc -w); \
+	    echo "OK: zero admits across $$file_count Iris/subset .v files"; \
+	 fi
 
 # ---- Safety-coverage audit: verify every compiler check has a curation entry ----
 # Regenerates docs/safety_coverage_raw.md and warns if any unique predicate

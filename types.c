@@ -1,5 +1,6 @@
 #include "types.h"
-#include "src/safety/type_kind.h"   /* zer_type_kind_is_* — VST-verified */
+#include "src/safety/type_kind.h"     /* zer_type_kind_is_* — VST-verified */
+#include "src/safety/coerce_rules.h"  /* zer_coerce_* — VST-verified */
 #include <stdio.h>
 #include <string.h>
 
@@ -325,27 +326,28 @@ bool type_equals(Type *a, Type *b) {
 bool can_implicit_coerce(Type *from, Type *to) {
     if (type_equals(from, to)) return true;
 
-    /* integer widening: same sign, from.width < to.width */
+    /* integer widening — delegates to VST-verified predicates */
     if (type_is_integer(from) && type_is_integer(to)) {
-        bool from_signed = type_is_signed(from);
-        bool to_signed = type_is_signed(to);
+        int from_signed = type_is_signed(from) ? 1 : 0;
+        int to_signed = type_is_signed(to) ? 1 : 0;
         int from_w = type_width(from);
         int to_w = type_width(to);
 
-        /* same sign, smaller → larger */
-        if (from_signed == to_signed && from_w < to_w) return true;
-        /* same sign, same width: allow u32 → usize on 32-bit targets */
-        if (from_signed == to_signed && from_w == to_w &&
-            (from->kind == TYPE_USIZE || to->kind == TYPE_USIZE)) return true;
-
-        /* unsigned to larger signed (u8 → i16, u16 → i32, etc.) */
-        if (!from_signed && to_signed && from_w < to_w) return true;
-
-        return false;
+        if (from_w == to_w) {
+            return zer_coerce_usize_same_width_allowed(
+                from->kind == TYPE_USIZE ? 1 : 0,
+                to->kind == TYPE_USIZE ? 1 : 0,
+                from_signed, to_signed) != 0;
+        }
+        return zer_coerce_int_widening_allowed(from_signed, to_signed,
+                                                 from_w, to_w) != 0;
     }
 
-    /* float widening: f32 → f64 */
-    if (from->kind == TYPE_F32 && to->kind == TYPE_F64) return true;
+    /* float widening — delegates to VST-verified predicate */
+    if (zer_coerce_float_widening_allowed(from->kind == TYPE_F32 ? 1 : 0,
+                                           to->kind == TYPE_F64 ? 1 : 0) != 0) {
+        return true;
+    }
 
     /* NOTE: f64 → f32 is NOT implicit. Must use explicit conversion.
      * But float LITERALS are handled specially in the checker (not here). */
@@ -365,14 +367,15 @@ bool can_implicit_coerce(Type *from, Type *to) {
         return type_equals(from->array.inner, to->slice.inner);
     }
 
-    /* slice qualifier widening: mutable→const, non-volatile→volatile */
+    /* slice qualifier widening — delegates to VST-verified predicates */
     if (from->kind == TYPE_SLICE && to->kind == TYPE_SLICE) {
-        /* cannot strip volatile or const */
-        if (from->slice.is_volatile && !to->slice.is_volatile) return false;
-        if (from->slice.is_const && !to->slice.is_const) return false;
-        /* allow widening (adding const or volatile) */
-        if ((to->slice.is_const >= from->slice.is_const) &&
-            (to->slice.is_volatile >= from->slice.is_volatile) &&
+        int v_ok = zer_coerce_preserves_volatile(
+            from->slice.is_volatile ? 1 : 0,
+            to->slice.is_volatile ? 1 : 0);
+        int c_ok = zer_coerce_preserves_const(
+            from->slice.is_const ? 1 : 0,
+            to->slice.is_const ? 1 : 0);
+        if (v_ok != 0 && c_ok != 0 &&
             type_equals(from->slice.inner, to->slice.inner)) {
             return true;
         }

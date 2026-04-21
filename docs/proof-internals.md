@@ -311,6 +311,59 @@ proofs/vst/
 
 Progress tracking: each verified real-code function counts once in `src/safety/*.c`. `make check-vst` should print the count.
 
+### Nested if-returns block `repeat forward_if`
+
+VST fails with "Use [forward_if Post]" when the C has nested ifs like:
+
+```c
+if (outer_cond) {
+    if (inner_cond) return 1;
+    return 0;
+}
+```
+
+The INNER forward_if can't infer its postcondition from the outer
+context. Fix: flatten to a single level of cascaded if-returns with
+no nesting, no compound conditions (`&&`/`||`):
+
+```c
+if (outer_cond && !inner_cond) return 0;  // BAD: compound
+if (outer_cond != 0 && inner_cond != 0) return 1;  // BAD
+
+// GOOD: fully flat cascade
+if (cond1) return val1;
+if (cond2) return val2;
+if (cond3) return val3;
+return default_val;
+```
+
+Sometimes the logic doesn't fit a single cascade. In that case, SPLIT
+into multiple smaller predicates and AND the results at the call site.
+Example: `zer_coerce_qualifier_widening_allowed(c, v)` → split into
+`zer_coerce_preserves_volatile` + `zer_coerce_preserves_const`.
+
+### `Z.eq_dec` vs `Z.eqb` — destruct alignment
+
+Coq spec uses `Z.eq_dec` (sumbool) OR `Z.eqb` (bool). If the proof
+tactic uses `destruct (Z.eq_dec _ _)` but the spec uses `Z.eqb`, the
+cases don't match and `entailer!` fails with "not decidable" or
+"Attempt to save an incomplete proof".
+
+**Rule:** align spec and proof. If the proof uses
+`destruct (Z.eq_dec _ _)`, the Coq spec MUST use `if Z.eq_dec _ _ then _ else _`.
+
+Example wrong (spec with Z.eqb, proof with Z.eq_dec):
+```coq
+Definition spec x : Z := if Z.eqb x 0 then 1 else 0.  (* bool *)
+...
+  destruct (Z.eq_dec x 0); try lia; entailer!.  (* fails — doesn't match *)
+```
+
+Fix:
+```coq
+Definition spec x : Z := if Z.eq_dec x 0 then 1 else 0.  (* sumbool *)
+```
+
 ### Composed predicates — inline vs forward_call
 
 When a predicate's C implementation calls OTHER verified predicates

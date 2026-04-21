@@ -513,7 +513,15 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Not safety-semantic:** U (35 rows — pure well-formedness, correctly marked `—`).
 
-**Level 3 — extract-and-link VST (2026-04-21, 4 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR. Extracted: `zer_handle_state_is_invalid`, `zer_handle_state_is_alive`, `zer_handle_state_is_freed`, `zer_handle_state_is_transferred` — all in `src/safety/handle_state.c`. Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`. Inline state-equality checks remaining throughout zercheck*.c are candidates for further delegation.
+**Level 3 — Architecture 1 extract-and-link VST (2026-04-21, 7 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c/checker.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR.
+
+Extracted so far:
+- `src/safety/handle_state.c` — 4 predicates: `zer_handle_state_is_invalid/alive/freed/transferred`
+- `src/safety/range_checks.c` — 3 predicates: `zer_count_is_positive`, `zer_index_in_bounds`, `zer_variant_in_range`
+
+Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`, checker.c Pool/Ring count validation. Inline state-equality and range checks remaining throughout the compiler are candidates for further delegation.
+
+**Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 6-phase roadmap.
 
 **Level 3 structure:**
 - `src/safety/handle_state.c` — extracted predicate, linked into zerc

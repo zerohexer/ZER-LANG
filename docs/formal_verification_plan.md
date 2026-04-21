@@ -231,20 +231,143 @@ This limits the first wave to ~15-25 functions from zercheck.c + zercheck_ir.c. 
 
 **Anti-overclaim.** Level 3 does NOT verify the whole compiler. It verifies that every extracted predicate matches its spec. Functions NOT extracted (i.e., still inline in `zercheck*.c`) are NOT Level-3-verified. The count of verified functions is the honest metric.
 
-**Progress tracking:**
-- `src/safety/handle_state.c` — 4 predicates extracted + verified (2026-04-21):
-  - `zer_handle_state_is_invalid(int)` — {FREED, MAYBE_FREED, TRANSFERRED}
-  - `zer_handle_state_is_alive(int)` — == ALIVE
-  - `zer_handle_state_is_freed(int)` — == FREED
-  - `zer_handle_state_is_transferred(int)` — == TRANSFERRED
-- Delegation: zercheck.c `is_handle_invalid` + `is_handle_consumed` (consolidated, both now go through the same VST-verified predicate). zercheck_ir.c `ir_is_invalid`.
-- Plus 21 demonstrator proofs in `proofs/vst/` (standalone `.c` files, NOT extracted from compiler — pre-extraction scaffolding that established the VST pattern).
+**Architecture 1 decision (2026-04-21):** chosen over Architecture 2 (Coq rewrite + extract). Reasons: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for future migration of stable subsystems (probably year 2+).
 
-**Next extractions** (by estimated value + effort):
-1. Type predicates: `zer_type_is_move_struct(int kind, int is_move_flag)` — requires exposing a minimal type-kind enum (no Type* in extracted function signature — primitive args only)
-2. Range predicates: bounds check, variant in range, pool count valid
-3. Cascade the 3 single-value predicates (is_alive/is_freed/is_transferred) to replace inline `h->state == IR_HS_X` sites throughout zercheck_ir.c (~30+ sites)
-4. ... (see checklist in `docs/compiler-internals.md` when authored)
+### Concrete 6-phase roadmap
+
+Each phase has a target, cost, and acceptance criterion. Stop at any phase and still ship real value.
+
+**Phase 0 — Infrastructure (DONE 2026-04-21, commit 4aaa1e7/5f98ed4)**
+- `src/safety/` directory, Makefile CORE_SRCS integration, Dockerfile COPY, `.gitignore`
+- `make check-vst` target with `-Q src/safety zer_safety` mapping
+- `make check-all` target (tests + Coq + VST + coverage audit)
+- VST pattern documented in `proof-internals.md` (subst gotcha, cascade pattern)
+- **Acceptance:** 1 real extraction (`zer_handle_state_is_invalid`) wired + verified
+
+**Phase 1 — Pure predicate extraction (~100 hrs, IN PROGRESS)**
+
+Target: 40 predicates extracted + VST-verified. Each file in `src/safety/`, one VST proof file in `proofs/vst/verif_*.v`.
+
+| Predicate batch | Location | Status |
+|---|---|---|
+| Handle state (4 fns) | `src/safety/handle_state.c` | **DONE** (`zer_handle_state_is_invalid/alive/freed/transferred`) |
+| Range checks (3 fns) | `src/safety/range_checks.c` | **DONE** (`zer_count_is_positive`, `zer_index_in_bounds`, `zer_variant_in_range`) |
+| Type kind predicates (6 fns) | `src/safety/type_kind.c` | TODO (`zer_type_kind_is_integer`, `is_pointer`, `is_struct`, `is_enum`, `is_move_struct`, `is_container`) |
+| Coercion rules (8 fns) | `src/safety/coerce_rules.c` | TODO (`zer_coerce_allowed_int_widen`, `is_sign_compatible`, `preserves_const`, `preserves_volatile`, ...) |
+| Context ban rules (6 fns) | `src/safety/context_bans.c` | TODO (`zer_return_allowed_in_context`, `yield_allowed`, `break_allowed`, `goto_allowed`, ...) |
+| Provenance rules (4 fns) | `src/safety/provenance.c` | TODO (`zer_provenance_compatible`, `is_propagated_by_cast`, ...) |
+| Optional unwrap rules (4 fns) | `src/safety/optional_rules.c` | TODO (`zer_optional_unwrap_allowed`, `is_void_optional`, ...) |
+| MMIO range rules (3 fns) | `src/safety/mmio_rules.c` | TODO (`zer_mmio_addr_valid`, `is_aligned`, `in_declared_range`) |
+| Move struct rules (3 fns) | `src/safety/move_rules.c` | TODO (`zer_move_transfer_allowed`, `should_track`, ...) |
+| Escape rules (3 fns) | `src/safety/escape_rules.c` | TODO (`zer_escape_to_global_allowed`, `escape_through_param`, ...) |
+
+**Total Phase 1:** ~44 predicates. Current: 7/44 (16%).
+
+**Acceptance:** 40+ predicates verified, each called from at least one site in `checker.c`, `zercheck.c`, or `zercheck_ir.c`.
+
+**Phase 2 — Decision extraction (~150 hrs)**
+
+Target: 60 decisions extracted using command-query separation. Covers state mutation sites.
+
+| Decision family | Extract to | Scope |
+|---|---|---|
+| Handle state transitions | `src/safety/handle_transitions.c` | 5-8 functions (alloc/free/use/transfer decisions) |
+| Path merge | `src/safety/path_merge.c` | 4 functions (if/else/switch/loop merge) |
+| Coercion dispatch | `src/safety/coerce_dispatch.c` | ~10 functions (which coercion to apply) |
+| Escape flag propagation | `src/safety/escape_propagate.c` | ~6 functions |
+| ISR ban decisions | `src/safety/isr_rules.c` | ~4 functions |
+| Control flow bans | `src/safety/control_flow.c` | ~8 functions (return in defer, etc.) |
+| VRP arithmetic | `src/safety/vrp_arith.c` | ~10 functions (range_after_op, range_merge) |
+| Move transfer | `src/safety/move_transitions.c` | ~5 functions |
+
+**Acceptance:** 60+ decisions extracted, original mutation sites reduced to trivial switch-dispatches.
+
+**Phase 3 — Generic AST walker (~60 hrs)**
+
+Target: 1 generic walker replaces ~3-4 hand-written recursions.
+
+```c
+// src/safety/ast_walk.c
+void zer_ast_walk(Node *n, Visitor v, void *ctx);
+// Spec: visitor called on n, then recursively on every child of n
+// Proof: structural induction on Node's inductive definition in Coq
+```
+
+Refactor targets: `check_expr`, `emit_expr`, `zc_check_stmt`, `zc_check_expr`. Each becomes a visitor function + call to `zer_ast_walk`.
+
+**Acceptance:** zero hand-written recursive AST walks remain in safety paths.
+
+**Phase 4 — Verified state APIs (~240 hrs)**
+
+Target: 4 small APIs, each VST-verified with invariant preservation.
+
+| API | Data structure | Invariant |
+|---|---|---|
+| `src/safety/typemap_api.c` | Typemap | All registered nodes have resolved non-NULL types |
+| `src/safety/scope_api.c` | Scope / symbol table | Lookups return most-recent binding at scope depth |
+| `src/safety/handle_pool_api.c` | Pool / Slab metadata | Alive handles have distinct alloc_ids |
+| `src/safety/handle_set_api.c` | Pool map (per-compile) | Every handle in set is registered |
+
+**Acceptance:** direct struct-field writes to these data structures banned (grep CI check). All mutations go through the API.
+
+**Phase 5 — Phase-typed checker (~30 hrs)**
+
+Target: C type system enforces pass ordering.
+
+```c
+typedef struct { Checker *c; } CheckerPhase0;
+typedef struct { Checker *c; } CheckerPhase1;
+typedef struct { Checker *c; } CheckerPhase2;
+typedef struct { Checker *c; } CheckerPhase3;
+
+CheckerPhase1 zer_register_symbols(CheckerPhase0 p);
+CheckerPhase2 zer_resolve_types(CheckerPhase1 p);
+CheckerPhase3 zer_check_bodies(CheckerPhase2 p);
+```
+
+**Acceptance:** checker.c main dispatch enforces phase order at compile time. Attempting to call out-of-order = C type error.
+
+**Phase 6 — CI discipline (~30 hrs)**
+
+Target: automated checks that enforce the verification discipline.
+
+- `make check-discipline`: grep-level audits
+  - Every safety function has `/* SAFETY: */` comment with proof link
+  - No direct `c->typemap[X] =`, `c->scopes[X]->...`, `pool->...` writes (bypassing API)
+  - No `Admitted.` or `admit.` anywhere in proofs
+  - Every safety_list.md row maps to at least one VST-verified predicate
+- Add `make check-discipline` to `check-all`
+- CI enforces: any PR that fails `check-all` is non-mergeable
+
+**Acceptance:** `make check-all` runs all gates. Every mergeable PR = mechanically verified safety.
+
+### Total Architecture 1 plan
+
+```
+Phase 0 — Infrastructure    ✅ DONE (2026-04-21)
+Phase 1 — 40+ predicates   🔄 7/44 (16%)    ~93 hrs remaining
+Phase 2 — 60 decisions      ⏳ TODO          ~150 hrs
+Phase 3 — Generic walker    ⏳ TODO          ~60 hrs
+Phase 4 — Verified APIs     ⏳ TODO          ~240 hrs
+Phase 5 — Phase types       ⏳ TODO          ~30 hrs
+Phase 6 — CI discipline     ⏳ TODO          ~30 hrs
+────────────────────────────────────────────────────
+Total remaining: ~603 hrs to effective 100%
+```
+
+At 3 hrs/day LLM-assisted pace: ~7 months focused. At 1 hr/day casual: ~2 years. Each phase stops-able with real value shipped.
+
+### When to migrate to Architecture 2
+
+Criteria for starting an Architecture 2 subsystem rewrite:
+1. The target subsystem has been stable for 6+ months (no major refactors)
+2. Every safety predicate in the subsystem is already Phase 1 / 2 verified
+3. The subsystem has a small, well-defined interface
+4. LLM/solo time budget allows ~1000 hrs for the rewrite
+
+First candidate (per these criteria): `zercheck.c` — safety logic is settling, Phase F dual-run validated it for 3143 programs without disagreement. Would become `proofs/extracted/zercheck.v` in year 2.
+
+**NOT Architecture 2 candidates:** `checker.c` (churns frequently), `emitter.c` (IR-dependent), `parser.c` (mostly not safety-critical).
 
 Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zercheck_ir.c to call it, (3) add VST proof, (4) add to `make check-vst`, (5) commit. One predicate per commit.
 
@@ -259,7 +382,7 @@ Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zerche
 | **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
 | **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
 | **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
-| **Level 3 — VST on extracted predicates** | 4 real extractions (all 4 handle-state predicates in `src/safety/handle_state.c`) + 21 pre-extraction demonstrators. Pattern established. Continuing. |
+| **Level 3 — VST on extracted predicates** | **7 real extractions** (4 handle-state + 3 range-check predicates). Infrastructure complete (Phase 0). Phase 1 at 16% (7/44). ~603 hrs remaining to effective 100%. |
 | λZER-concurrency (Iris concurrency primitives) | Not started. |
 | λZER-async | Not started. |
 

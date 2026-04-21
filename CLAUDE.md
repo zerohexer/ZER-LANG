@@ -521,7 +521,24 @@ Extracted so far:
 
 Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`, checker.c Pool/Ring count validation. Inline state-equality and range checks remaining throughout the compiler are candidates for further delegation.
 
-**Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 6-phase roadmap.
+**Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 8-phase roadmap.
+
+**Full verification commitment (2026-04-21):** target is seL4-level formal verification = every safety property proven at operational depth + every compiler check VST-verified + CI enforces the whole thing. Total effort: ~1,085 hrs (~1 year focused, ~3 years casual).
+
+**The 8 phases:**
+1. Phase 0 — Infrastructure ✅ DONE
+2. Phase 1 — 40 pure predicates (~100 hrs) — **7/44 done (16%)**
+3. Phase 2 — 60 decision extractions (~150 hrs)
+4. Phase 3 — Generic AST walker (~60 hrs)
+5. Phase 4 — Verified state APIs (~240 hrs)
+6. Phase 5 — Phase-typed checker (~30 hrs)
+7. Phase 6 — CI discipline (~30 hrs)
+8. Phase 7 — Deepen 82 schematic rows to operational (~425 hrs). Sub-phases: λZER-concurrency (~150), λZER-async (~80), λZER-control-flow (~30), λZER-mmio-rest (~20), λZER-opaque-rest (~30), λZER-escape-rest (~30), λZER-typing-extra (~15), λZER-vrp (~50), λZER-variant (~15), spec reviews (~25).
+9. Phase 8 — Release polish (~50 hrs)
+
+**End state claim:** "ZER is a formally verified compiler. For every program ZER accepts, the resulting C is provably free of 200+ specified safety properties — proven in Coq, verified in VST, tested empirically. Trust base: Coq kernel + GCC + hardware." Same strength as CompCert / seL4.
+
+**Each phase is stop-able with real value shipped.** Extractions commit one-at-a-time. Deepening subsets commit per-subset. No big-bang milestones.
 
 **Level 3 structure:**
 - `src/safety/handle_state.c` — extracted predicate, linked into zerc

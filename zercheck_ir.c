@@ -14,6 +14,7 @@
 #include "ir.h"
 #include "zercheck.h"
 #include "checker.h"
+#include "src/safety/handle_state.h"   /* zer_handle_state_is_invalid — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -245,10 +246,9 @@ static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
  * State Helpers (same as zercheck.c but on IRHandleState)
  * ================================================================ */
 
+/* Delegates to VST-verified predicate in src/safety/handle_state.c. */
 static bool ir_is_invalid(IRHandleInfo *h) {
-    return h->state == IR_HS_FREED ||
-           h->state == IR_HS_MAYBE_FREED ||
-           h->state == IR_HS_TRANSFERRED;
+    return zer_handle_state_is_invalid(h->state) != 0;
 }
 
 static const char *ir_state_name(IRHandleState s) {
@@ -1084,6 +1084,59 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
+    /* Phase F: IR_CAST (C-style pointer cast `(T*)ptr`). If source has
+     * a tracked handle, dest becomes an alias sharing alloc_id.
+     * Mirrors @ptrcast alias tracking. Enables param-color inference
+     * for wrapper functions like `*T unwrap(*opaque raw) { return (T*)raw; }`.
+     *
+     * If src is a param without a handle, auto-register it (as escaped
+     * so it doesn't flag as leak in the wrapper's own leak check) so
+     * param-color inference can match alloc_ids at summary building. */
+    case IR_CAST: {
+        if (inst->dest_local < 0 || inst->src1_local < 0) break;
+        /* Only propagate for pointer casts — check src local's type */
+        if (inst->src1_local < func->local_count) {
+            Type *src_type = func->locals[inst->src1_local].type;
+            Type *eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+            bool src_is_ptr = eff && (eff->kind == TYPE_POINTER ||
+                                       eff->kind == TYPE_OPAQUE);
+            if (eff && eff->kind == TYPE_OPTIONAL) {
+                Type *inner = type_unwrap_distinct(eff->optional.inner);
+                if (inner && (inner->kind == TYPE_POINTER ||
+                              inner->kind == TYPE_OPAQUE))
+                    src_is_ptr = true;
+            }
+            if (!src_is_ptr) break;
+        }
+        IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
+        if (!src_h && inst->src1_local < func->local_count &&
+            func->locals[inst->src1_local].is_param) {
+            src_h = ir_add_handle(ps, inst->src1_local);
+            if (src_h) {
+                src_h->state = IR_HS_ALIVE;
+                src_h->alloc_line = inst->source_line;
+                src_h->alloc_id = _ir_next_alloc_id++;
+                src_h->source_color = ZC_COLOR_UNKNOWN;
+                src_h->escaped = true;
+            }
+        }
+        if (!src_h) break;
+        if (ir_is_invalid(src_h)) {
+            ir_zc_error(zc, inst->source_line,
+                "use of %s handle %%%d in cast",
+                ir_state_name(src_h->state), inst->src1_local);
+        }
+        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+        if (dst_h) {
+            dst_h->state = src_h->state;
+            dst_h->alloc_line = src_h->alloc_line;
+            dst_h->alloc_id = src_h->alloc_id;
+            dst_h->source_color = src_h->source_color;
+            dst_h->escaped = src_h->escaped;
+        }
+        break;
+    }
+
     /* Phase D1: Arena allocation → ARENA color. Skipped in leak detection
      * because arena.reset() frees everything wholesale. */
     case IR_ARENA_ALLOC:
@@ -1872,8 +1925,77 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
-        /* Phase C2: if no summary, try signature heuristics on inst->expr
-         * (the AST NODE_CALL). Covers extern malloc/free/destroy patterns. */
+        /* Phase F: param-color inference application.
+         * If the callee's summary has returns_param_color > 0, the
+         * return value is an ALIAS of args[param_color-1]. Make dest
+         * share the arg's alloc_id/state/color.
+         * Covers `*T unwrap(*opaque raw) { return (*T)raw; }` pattern. */
+        bool dest_aliased_from_param = false;
+        if (summary && summary->returns_param_color > 0 &&
+            inst->dest_local >= 0 && inst->expr &&
+            inst->expr->kind == NODE_CALL) {
+            int param_idx = summary->returns_param_color - 1;
+            if (param_idx < inst->expr->call.arg_count) {
+                Node *arg = inst->expr->call.args[param_idx];
+                if (arg && arg->kind == NODE_IDENT) {
+                    int arg_local = ir_find_local_exact_first(func,
+                        arg->ident.name, (uint32_t)arg->ident.name_len);
+                    if (arg_local >= 0) {
+                        IRHandleInfo *arg_h = ir_find_handle(ps, arg_local);
+                        if (arg_h) {
+                            IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+                            if (dh) {
+                                dh->state = arg_h->state;
+                                dh->alloc_line = arg_h->alloc_line;
+                                dh->alloc_id = arg_h->alloc_id;
+                                dh->source_color = arg_h->source_color;
+                                dest_aliased_from_param = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Phase C2: signature heuristics on inst->expr (the AST NODE_CALL).
+         * Covers extern malloc/free/destroy patterns and pointer-returning
+         * function calls without a FuncSummary.
+         *
+         * Also: when summary exists but returns_color is POOL/UNKNOWN AND
+         * no param-color alias was set, register dest as ALIVE using the
+         * summary's color. Mirrors zercheck.c:786-808 unconditional
+         * pointer-return registration. ARENA summaries skip entirely. */
+        bool summary_non_arena = summary &&
+            summary->returns_color != ZC_COLOR_ARENA;
+        if (summary_non_arena && !dest_aliased_from_param &&
+            inst->dest_local >= 0 && inst->expr &&
+            inst->expr->kind == NODE_CALL) {
+            bool already_tracked = (ir_find_handle(ps, inst->dest_local) != NULL);
+            if (!already_tracked) {
+                Type *ret = checker_get_type(zc->checker, inst->expr);
+                Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+                bool is_ptr_return = false;
+                if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
+                                ret_eff->kind == TYPE_OPAQUE))
+                    is_ptr_return = true;
+                if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
+                    Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
+                    if (inner && (inner->kind == TYPE_POINTER ||
+                                  inner->kind == TYPE_OPAQUE))
+                        is_ptr_return = true;
+                }
+                if (is_ptr_return) {
+                    IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                    if (h) {
+                        h->state = IR_HS_ALIVE;
+                        h->alloc_line = inst->source_line;
+                        h->alloc_id = _ir_next_alloc_id++;
+                        h->source_color = summary->returns_color;
+                    }
+                }
+            }
+        }
+
         if (!summary && inst->expr && inst->expr->kind == NODE_CALL) {
             Node *call = inst->expr;
 
@@ -2335,12 +2457,35 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * Summary is attached to ZerCheck via find_summary / allocation loop
      * identical to zercheck.c so consumers (zc_apply_summary in both paths)
      * see the same shape. */
+    if (getenv("IR_SUMMARY_DEBUG") && func->ast_node &&
+        func->ast_node->kind == NODE_FUNC_DECL) {
+        fprintf(stderr, "ZCIR: building=%d fn='%.*s' pc=%d blocks=%d sumcount=%d\n",
+            zc->building_summary,
+            func->ast_node->func_decl.name_len,
+            func->ast_node->func_decl.name ? func->ast_node->func_decl.name : "?",
+            func->ast_node->func_decl.param_count, func->block_count,
+            zc->summary_count);
+        for (int si = 0; si < zc->summary_count; si++) {
+            fprintf(stderr, "  SUMM[%d]: %.*s pc=%d frees=%s rc=%d\n", si,
+                zc->summaries[si].func_name_len,
+                zc->summaries[si].func_name ? zc->summaries[si].func_name : "?",
+                zc->summaries[si].param_count,
+                (zc->summaries[si].param_count > 0 && zc->summaries[si].frees_param && zc->summaries[si].frees_param[0]) ? "y" : "n",
+                zc->summaries[si].returns_color);
+        }
+    }
     if (zc->building_summary && func->ast_node && func->ast_node->kind == NODE_FUNC_DECL) {
         Node *fn = func->ast_node;
         int pc = fn->func_decl.param_count;
+        /* Phase F (2026-04-20): moved returns_color inference OUT of the
+         * pc > 0 gate. Arena wrapper chain inference applies even to
+         * zero-param functions: `?*T wrap() { return arena.alloc(T); }`
+         * must have returns_color=ARENA to propagate through callers. */
+        bool *frees = NULL;
+        bool *maybe_frees = NULL;
         if (pc > 0) {
-            bool *frees = (bool *)calloc(pc, sizeof(bool));
-            bool *maybe_frees = (bool *)calloc(pc, sizeof(bool));
+            frees = (bool *)calloc(pc, sizeof(bool));
+            maybe_frees = (bool *)calloc(pc, sizeof(bool));
             bool *any_return_saw_alive = (bool *)calloc(pc, sizeof(bool));
             bool *all_return_blocks_freed = (bool *)malloc(pc * sizeof(bool));
             for (int i = 0; i < pc; i++) all_return_blocks_freed[i] = true;
@@ -2389,91 +2534,154 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             free(all_return_blocks_freed);
             free(any_return_saw_alive);
+        }
 
-            /* Phase D7: Arena wrapper chain inference.
-             * Determine returns_color by examining what each return block
-             * returns. If all returns yield ARENA-colored values, the
-             * function's returns_color is ARENA. This propagates arena
-             * coloring through wrapper chains like:
-             *   *T create(Arena *a) { return arena.alloc(T).ptr; }
-             *   *T wrap() { return create(&g_arena); }           // ARENA
-             *   *T outer() { return wrap(); }                     // ARENA */
-            int inferred_color = -1;  /* -1 = unset, -2 = mixed */
+        /* Phase D7: Arena wrapper chain inference.
+         * Determine returns_color by examining what each return block
+         * returns. If all returns yield ARENA-colored values, the
+         * function's returns_color is ARENA. This propagates arena
+         * coloring through wrapper chains like:
+         *   *T create(Arena *a) { return arena.alloc(T).ptr; }
+         *   *T wrap() { return create(&g_arena); }           // ARENA
+         *   *T outer() { return wrap(); }                     // ARENA */
+        int inferred_color = -1;  /* -1 = unset, -2 = mixed */
+        for (int bi = 0; bi < func->block_count; bi++) {
+            IRBlock *bb = &func->blocks[bi];
+            if (bb->inst_count == 0) continue;
+            IRInst *last = &bb->insts[bb->inst_count - 1];
+            if (last->op != IR_RETURN) continue;
+            if (bb->is_orelse_fallback) continue;
+            if (bb->is_early_exit) continue;
+            /* Phase F: return can have src1_local (simple `return ident`
+             * or `return call()` with result in local) OR expr (direct
+             * NODE_IDENT / NODE_ORELSE for complex shapes). Check both. */
+            int rlocal = -1;
+            if (last->src1_local >= 0) {
+                rlocal = last->src1_local;
+            } else if (last->expr) {
+                Node *ret_expr = last->expr;
+                if (ret_expr->kind == NODE_ORELSE) ret_expr = ret_expr->orelse.expr;
+                if (ret_expr && ret_expr->kind == NODE_IDENT) {
+                    rlocal = ir_find_local_exact_first(func,
+                        ret_expr->ident.name, (uint32_t)ret_expr->ident.name_len);
+                }
+            }
+            if (rlocal < 0) { inferred_color = -2; break; }
+            IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
+            int color = rh ? rh->source_color : ZC_COLOR_UNKNOWN;
+            if (inferred_color == -1) inferred_color = color;
+            else if (inferred_color != color) { inferred_color = -2; break; }
+        }
+        int returns_color_final =
+            (inferred_color < 0) ? ZC_COLOR_UNKNOWN : inferred_color;
+
+        /* Phase F: param-color inference. When the function returns a
+         * cast of a param (e.g., `*T unwrap(*opaque raw) { return (*T)raw; }`),
+         * the return is an ALIAS of the arg — callers should share the
+         * arg's alloc_id, not register a fresh one. Mirrors zercheck.c's
+         * returns_param_color + line 748-784 param-color inference.
+         *
+         * Detection: if returns_color_final is UNKNOWN AND every return
+         * block returns a local that traces to a param (via cast/ptrcast
+         * alias chain), set returns_param_color = param_index + 1. */
+        int returns_param_color_final = -1;
+        if (returns_color_final == ZC_COLOR_UNKNOWN && pc > 0) {
+            int inferred_param = -2;  /* -2 unset, -1 mixed, >=0 param idx */
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *bb = &func->blocks[bi];
                 if (bb->inst_count == 0) continue;
                 IRInst *last = &bb->insts[bb->inst_count - 1];
-                if (last->op != IR_RETURN || !last->expr) continue;
-                /* Identify returned local (direct ident or primary of orelse) */
-                Node *ret_expr = last->expr;
-                if (ret_expr->kind == NODE_ORELSE) ret_expr = ret_expr->orelse.expr;
-                if (!ret_expr || ret_expr->kind != NODE_IDENT) {
-                    inferred_color = -2; break;
-                }
-                int rlocal = ir_find_local_exact_first(func,
-                    ret_expr->ident.name, (uint32_t)ret_expr->ident.name_len);
-                if (rlocal < 0) { inferred_color = -2; break; }
-                IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
-                int color = rh ? rh->source_color : ZC_COLOR_UNKNOWN;
-                if (inferred_color == -1) inferred_color = color;
-                else if (inferred_color != color) { inferred_color = -2; break; }
-            }
-            int returns_color_final =
-                (inferred_color < 0) ? ZC_COLOR_UNKNOWN : inferred_color;
-
-            /* Update or create summary — same logic as zercheck.c:2320+ */
-            FuncSummary *existing = NULL;
-            for (int si = 0; si < zc->summary_count; si++) {
-                if (zc->summaries[si].func_name_len == (uint32_t)fn->func_decl.name_len &&
-                    memcmp(zc->summaries[si].func_name, fn->func_decl.name,
-                           fn->func_decl.name_len) == 0) {
-                    existing = &zc->summaries[si]; break;
-                }
-            }
-            if (existing) {
-                bool changed = false;
-                if (existing->param_count == pc) {
-                    for (int i = 0; i < pc; i++) {
-                        if (existing->frees_param[i] != frees[i]) changed = true;
-                        if (existing->maybe_frees_param[i] != maybe_frees[i]) changed = true;
+                if (last->op != IR_RETURN) continue;
+                if (bb->is_orelse_fallback) continue;
+                if (bb->is_early_exit) continue;
+                int rlocal = -1;
+                if (last->src1_local >= 0) rlocal = last->src1_local;
+                else if (last->expr) {
+                    Node *re = last->expr;
+                    if (re->kind == NODE_ORELSE) re = re->orelse.expr;
+                    if (re && re->kind == NODE_IDENT) {
+                        rlocal = ir_find_local_exact_first(func,
+                            re->ident.name, (uint32_t)re->ident.name_len);
                     }
-                } else {
-                    changed = true;
                 }
-                if (existing->returns_color != returns_color_final) changed = true;
-                if (changed) {
-                    free(existing->frees_param);
-                    free(existing->maybe_frees_param);
-                    existing->param_count = pc;
-                    existing->frees_param = frees;
-                    existing->maybe_frees_param = maybe_frees;
-                    existing->returns_color = returns_color_final;
-                } else {
-                    free(frees); free(maybe_frees);
+                if (rlocal < 0) { inferred_param = -1; break; }
+                /* Check if rlocal's handle shares alloc_id with any param.
+                 * This captures the "return cast of param" alias pattern. */
+                IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
+                if (!rh) { inferred_param = -1; break; }
+                int match_param = -1;
+                for (int pi = 0; pi < pc; pi++) {
+                    ParamDecl *p = &fn->func_decl.params[pi];
+                    int plocal = ir_find_local_exact_first(func,
+                        p->name, (uint32_t)p->name_len);
+                    if (plocal < 0) continue;
+                    IRHandleInfo *ph = ir_find_handle(&block_states[bi], plocal);
+                    if (!ph) continue;
+                    if (ph->alloc_id == rh->alloc_id && ph->alloc_id != 0) {
+                        match_param = pi; break;
+                    }
+                }
+                if (match_param < 0) { inferred_param = -1; break; }
+                if (inferred_param == -2) inferred_param = match_param;
+                else if (inferred_param != match_param) { inferred_param = -1; break; }
+            }
+            if (inferred_param >= 0) returns_param_color_final = inferred_param + 1;
+        }
+
+        /* Update or create summary — same logic as zercheck.c:2320+ */
+        FuncSummary *existing = NULL;
+        for (int si = 0; si < zc->summary_count; si++) {
+            if (zc->summaries[si].func_name_len == (uint32_t)fn->func_decl.name_len &&
+                memcmp(zc->summaries[si].func_name, fn->func_decl.name,
+                       fn->func_decl.name_len) == 0) {
+                existing = &zc->summaries[si]; break;
+            }
+        }
+        if (existing) {
+            bool changed = false;
+            if (existing->param_count == pc) {
+                for (int i = 0; i < pc; i++) {
+                    if (existing->frees_param[i] != (frees ? frees[i] : false)) changed = true;
+                    if (existing->maybe_frees_param[i] != (maybe_frees ? maybe_frees[i] : false)) changed = true;
                 }
             } else {
-                if (zc->summary_count >= zc->summary_capacity) {
-                    int nc = zc->summary_capacity < 8 ? 8 : zc->summary_capacity * 2;
-                    FuncSummary *ns = (FuncSummary *)realloc(zc->summaries,
-                        nc * sizeof(FuncSummary));
-                    if (ns) {
-                        zc->summaries = ns;
-                        zc->summary_capacity = nc;
-                    }
+                changed = true;
+            }
+            if (existing->returns_color != returns_color_final) changed = true;
+            if (existing->returns_param_color != returns_param_color_final) changed = true;
+            if (changed) {
+                free(existing->frees_param);
+                free(existing->maybe_frees_param);
+                existing->param_count = pc;
+                existing->frees_param = frees;
+                existing->maybe_frees_param = maybe_frees;
+                existing->returns_color = returns_color_final;
+                existing->returns_param_color = returns_param_color_final;
+            } else {
+                free(frees); free(maybe_frees);
+            }
+        } else {
+            if (zc->summary_count >= zc->summary_capacity) {
+                int nc = zc->summary_capacity < 8 ? 8 : zc->summary_capacity * 2;
+                FuncSummary *ns = (FuncSummary *)realloc(zc->summaries,
+                    nc * sizeof(FuncSummary));
+                if (ns) {
+                    zc->summaries = ns;
+                    zc->summary_capacity = nc;
                 }
-                if (zc->summary_count < zc->summary_capacity) {
-                    FuncSummary *s = &zc->summaries[zc->summary_count++];
-                    memset(s, 0, sizeof(FuncSummary));
-                    s->func_name = fn->func_decl.name;
-                    s->func_name_len = (uint32_t)fn->func_decl.name_len;
-                    s->param_count = pc;
-                    s->frees_param = frees;
-                    s->maybe_frees_param = maybe_frees;
-                    s->returns_color = returns_color_final;
-                    s->returns_param_color = -1;
-                } else {
-                    free(frees); free(maybe_frees);
-                }
+            }
+            if (zc->summary_count < zc->summary_capacity) {
+                FuncSummary *s = &zc->summaries[zc->summary_count++];
+                memset(s, 0, sizeof(FuncSummary));
+                s->func_name = fn->func_decl.name;
+                s->func_name_len = (uint32_t)fn->func_decl.name_len;
+                s->param_count = pc;
+                s->frees_param = frees;
+                s->maybe_frees_param = maybe_frees;
+                s->returns_color = returns_color_final;
+                s->returns_param_color = returns_param_color_final;
+            } else {
+                free(frees); free(maybe_frees);
             }
         }
     }

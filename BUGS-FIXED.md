@@ -5,6 +5,92 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (Level 3 extract-and-link) — first real compiler-code VST
+
+### Context
+
+Earlier in the same day, the session landed 22 VST proofs in `proofs/vst/`
+(`verif_simple_check.v`, `verif_zer_checks.v`, `verif_zer_checks2.v`). On
+review with the user: those are standalone `.c` files written for VST, NOT
+extracted from zercheck.c. They demonstrate the VST pattern but do not
+verify real compiler code. User pushed for the proper Level 3: extract
+real predicates from zercheck.c + zercheck_ir.c, link them into zerc, AND
+verify the same .c file with VST. Single source of truth.
+
+### What changed
+
+1. **New directory `src/safety/`** — pure predicate functions extracted
+   from zercheck.c and zercheck_ir.c.
+
+2. **First extraction: `zer_handle_state_is_invalid(int state)`** — checks
+   if state ∈ {FREED, MAYBE_FREED, TRANSFERRED}.
+   - `src/safety/handle_state.h` — declarations + ZER_HS_* constants
+   - `src/safety/handle_state.c` — pure implementation, self-contained
+   - Called from `zercheck.c:is_handle_invalid` and `zercheck_ir.c:ir_is_invalid`.
+     Both now delegate to the same VST-verified predicate — any divergence
+     caught by dual-run (Phase F).
+   - Makefile CORE_SRCS + LIB_SRCS include `src/safety/handle_state.c` —
+     it's linked into zerc.
+   - Dockerfile adds `COPY src/ src/` so docker builds see the new dir.
+
+3. **VST proof: `proofs/vst/verif_handle_state.v`** — uses
+   `repeat forward_if; ...; repeat (destruct (Z.eq_dec _ _); try lia); try entailer!`
+   cascade pattern. Zero admits.
+
+4. **`make check-vst` updated** to mount the whole repo and clightgen
+   `src/safety/handle_state.c` in place. The .v output
+   (`src/safety/handle_state.v`) is gitignored. Imported via
+   `-Q src/safety zer_safety`.
+
+### VST 3.0 subst gotcha (new finding)
+
+`forward_if` on `if (state == N)` (equality with constant) auto-`subst`s
+`state := N` in the then-branch. The Coq WITH-bound variable `state`
+disappears from scope. Attempting `destruct (Z.eq_dec state X)` in a
+later forward_if branch fails with "The variable state was not found
+in the current environment."
+
+Workaround: use `repeat forward_if; repeat (destruct (Z.eq_dec _ _); try lia); try entailer!`.
+The `_` pattern lets the tactic work on whatever `state` became after
+subst, and `try` skips branches where destruct isn't applicable.
+
+Differs from `<` / `>=` (relational comparisons) where VST does NOT subst —
+those can use `destruct (Z_ge_dec state N); try lia` naming the variable
+explicitly.
+
+Documented in `proof-internals.md` common-errors table.
+
+### Makefile CI integration
+
+Four-way failure story in place:
+- `make zerc` fails → code bug in extracted predicate
+- `make check-vst` fails → C implementation diverged from Coq spec
+- Tests fail → runtime regression
+- `tests/zer_proof/_bad` passes → safety rule stopped enforcing
+
+### State after session
+
+- `make docker-build` — PASS (zerc builds with extracted predicate linked in)
+- `make docker-check` — 412/413 pass. 1 pre-existing failure (`A01_no_uaf`)
+  confirmed unrelated to this change via git stash comparison.
+- `make check-vst` — 4/4 VST proofs compile, 0 admits across 4
+  verification files. `verif_handle_state.v` is the first to verify real
+  compiler code.
+
+### Next steps (not in this commit)
+
+- Extract `zer_handle_state_is_freed`, `zer_handle_state_is_alive`,
+  `zer_handle_state_is_transferred`. All are 1-line predicates in
+  zercheck.c / zercheck_ir.c today.
+- Type predicates (`zer_type_is_move_struct`) — needs exposing a minimal
+  type-kind enum.
+- Range predicates: bounds check, variant in range, pool count valid.
+
+Scope: 15-25 pure predicates total. Honest count for "Level-3-verified
+compiler functions" = 1 after this session.
+
+---
+
 ## Session 2026-04-21 (Level 3 VST kickoff) — VST 3.0 Iris setup patterns
 
 Starting Level 3 (VST on C implementations) surfaced several patterns

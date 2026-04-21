@@ -1,4 +1,5 @@
 #include "zercheck.h"
+#include "src/safety/handle_state.h"   /* zer_handle_state_is_invalid — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -959,11 +960,11 @@ static bool should_track_move(Type *t) {
 }
 
 /* Is this handle in any state where use is invalid?
- * Used for all use-after-free/move/transfer checks. */
+ * Used for all use-after-free/move/transfer checks.
+ * Delegates to the VST-verified predicate in src/safety/handle_state.c. */
 static bool is_handle_invalid(HandleInfo *h) {
     if (!h) return false;
-    return h->state == HS_FREED || h->state == HS_MAYBE_FREED ||
-           h->state == HS_TRANSFERRED;
+    return zer_handle_state_is_invalid(h->state) != 0;
 }
 
 /* Is this handle consumed (freed, maybe-freed, or transferred)?

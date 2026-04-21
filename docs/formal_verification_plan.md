@@ -30,11 +30,28 @@ Path 1 (full operational-semantics formal verification) was chosen over Path 2 (
 
 Plain Coq is sufficient for sequential work but creates a migration cliff when concurrency lands. For a solo+LLM project, that cliff is expensive — you're doing the hardest framework addition (concurrency semantics) simultaneously with porting (rewriting existing proofs into Iris style). Front-loading the Iris learning curve spreads the cost and avoids the cliff.
 
-### Why not VST / Lean / F*
+### Why not VST / Lean / F* *for Path 1*
 
-- **VST** (Coq + C verification) is for object-level C program verification, not language-level soundness. Wrong tool for Path 1.
+- **VST** (Coq + C verification) is for object-level C program verification, not language-level soundness. Wrong tool for Path 1 — but RIGHT tool for **Level 3 implementation verification** (see below).
 - **Lean 4** is capable but has less PL verification prior art than Coq. Existing `proofs/*.v` are in Coq — migrating costs everything.
 - **F*** has smaller community, narrower scope.
+
+### Why VST IS in scope for Level 3 (addendum, 2026-04-21)
+
+Levels 1 (abstract models) and 2 (tests) prove that the safety ARGUMENT is sound and that the compiler REJECTS known violations. Neither level proves that the actual C source of zercheck/zercheck_ir matches the safety predicates.
+
+**Gap:** A typo like `if (state = HS_ALIVE)` (assignment, not comparison) in zercheck.c would:
+- Leave Level 1's Coq spec unchanged (still correct mathematically)
+- Pass most Level 2 tests (wouldn't cover every state value)
+- Silently miscompile safety checks in production
+
+Level 3 closes this gap by mechanically verifying that the C implementation matches the Coq predicate for EVERY possible input. VST is the standard tool for this — it's what RefinedC, CertiKOS, and certified CompCert use to bridge Coq specs to C source.
+
+**Level 3 scope:** NOT a whole-program verification of zercheck.c (that's ~500+ hrs and would block language work). Instead, **extracted predicates**: pure, side-effect-free functions extracted from zercheck.c/zercheck_ir.c into `src/safety/*.c`, linked into `make zerc`, clightgen'd into Coq, VST-verified against the corresponding `typing.v` predicate.
+
+Level 3 complements — does not replace — Level 1. They answer different questions:
+- Level 1: is the predicate semantics correct?
+- Level 3: does the C implementation compute that predicate correctly?
 
 ## Structure
 
@@ -169,15 +186,78 @@ CI (not yet implemented — Phase 3 work) should:
 - Run `make` in `proofs/operational/`
 - Fail the PR if any `.v` file fails to compile
 
+## Level 3 — VST on extracted predicates (2026-04-21 — in progress)
+
+**Purpose:** close the implementation-correctness gap — prove that the actual C source of safety checks matches the Coq predicate for every input.
+
+**Mechanism: extract-and-link.** Pure predicate functions are extracted from `zercheck.c` and `zercheck_ir.c` into `src/safety/*.c`. That `.c` file is:
+
+1. **Linked into `zerc`** via Makefile `CORE_SRCS` — it's part of the real compiler, not a duplicate.
+2. **Called from zercheck.c AND zercheck_ir.c** — both analyzers delegate to the extracted function. If the extraction broke the logic, dual-run (Phase F, already landed) would disagree.
+3. **Verified by `make check-vst`** — CompCert's `clightgen` reads the SAME `.c` file, produces a Coq AST, VST proves the function matches the Coq spec in `lambda_zer_typing/typing.v`.
+
+```
+src/safety/handle_state.c          ← real code (linked into zerc)
+src/safety/handle_state.h          ← declarations
+proofs/vst/verif_handle_state.v    ← VST spec + proof
+```
+
+**CI integration:**
+- `make zerc` — compiles `src/safety/*.c` with the rest
+- `make check-vst` — clightgen + coqc on the SAME files
+
+**Four failure modes, each with a clear diagnosis:**
+
+| What fails | Meaning |
+|---|---|
+| `make zerc` | Code bug in extracted predicate |
+| `make check-vst` | Coq proof caught: C implementation diverged from spec |
+| `tests/zer/` | Runtime regression |
+| `tests/zer_proof/` `_bad` passes | Safety rule stopped enforcing |
+
+If someone optimizes `zer_handle_state_is_invalid` in a way that breaks it:
+- `make zerc` compiles clean
+- Unit tests may pass (didn't cover the broken case)
+- **`make check-vst` fails** — pointing at the exact line where C diverged
+
+That's the correctness-oracle loop closing at the implementation level.
+
+**Extraction rule.** A function is extractable when it is:
+1. **Pure** — no global state mutation, no side effects.
+2. **Self-contained** — no AST nodes, no `Checker*`/`ZerCheck*` parameters.
+3. **Primitive types only** — int, minimal structs. No callbacks, no allocations.
+
+This limits the first wave to ~15-25 functions from zercheck.c + zercheck_ir.c. Complex functions (call-graph DFS, scope walks) need per-function VST work with struct separation logic — 20+ hrs each, later phases.
+
+**Anti-overclaim.** Level 3 does NOT verify the whole compiler. It verifies that every extracted predicate matches its spec. Functions NOT extracted (i.e., still inline in `zercheck*.c`) are NOT Level-3-verified. The count of verified functions is the honest metric.
+
+**Progress tracking:**
+- `src/safety/handle_state.c` — `zer_handle_state_is_invalid(int)` extracted + verified (2026-04-21, first real extraction)
+- Plus 21 demonstrator proofs in `proofs/vst/` (standalone `.c` files, NOT extracted from compiler — pre-extraction scaffolding that established the VST pattern)
+
+**Next extractions** (by call-site count, smallest-first):
+1. `zer_handle_state_is_freed(int)` — used in zercheck.c:is_freed, zercheck_ir.c:ir_is_freed
+2. `zer_handle_state_is_alive(int)` — used in same places
+3. `zer_handle_state_is_transferred(int)` — move struct detection
+4. Type predicates: `zer_type_is_move_struct(...)` — requires exposing a minimal type-kind enum
+5. Range predicates: bounds check, variant in range, pool count valid
+6. ... (see checklist in `docs/compiler-internals.md` when authored)
+
+Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zercheck_ir.c to call it, (3) add VST proof, (4) add to `make check-vst`, (5) commit. One predicate per commit.
+
+**Scope estimate:** 15-25 pure predicates total. ~1-3 hours per extraction (not 5-20; the complex ones don't fit this pattern). Complex functions (loops, recursion, struct separation logic) are separate future work — not part of the predicate extraction wave.
+
 ## Current status
 
-| Subset | Status |
+| Subset / Level | Status |
 |---|---|
-| λZER-Handle (plain Coq) | Baseline compiles. 17 admits in adequacy.v + 3 in handle_safety.v. Preserved as insurance during Iris migration. |
-| λZER-Handle (Iris) | **Next: Phase 0** — minimal end-to-end Iris proof of alloc→free. |
-| λZER-defer / move / goto | Not started. Starts after λZER-Handle Iris version is axiom-free. |
-| λZER-mmio | Not started. |
-| λZER-concurrency | Not started. Iris concurrency primitives kick in here. |
+| **Level 1 — λZER-Handle (plain Coq)** | Baseline compiles. 17 admits in adequacy.v + 3 in handle_safety.v. Preserved as insurance during Iris migration. |
+| **Level 1 — λZER-Handle (Iris)** | Complete + axiom-free. |
+| **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
+| **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
+| **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
+| **Level 3 — VST on extracted predicates** | 1 real extraction (`zer_handle_state_is_invalid`) + 21 pre-extraction demonstrators. Pattern established. Continuing. |
+| λZER-concurrency (Iris concurrency primitives) | Not started. |
 | λZER-async | Not started. |
 
 ## For fresh sessions

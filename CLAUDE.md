@@ -513,14 +513,30 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Not safety-semantic:** U (35 rows — pure well-formedness, correctly marked `—`).
 
-**Level 3 in progress — VST on C:** `proofs/vst/` with coq-vst 3.0beta2 + CompCert clightgen. First proof landed (verif_simple_check.v). `make check-vst` builds + verifies. See `proof-internals.md` "Level 3" section for VST patterns — `VST.floyd.compat` required (precompiled in Docker), Iris-based funspec, one-liner proof pattern `forward_if; forward; destruct; entailer!`.
+**Level 3 — extract-and-link VST (2026-04-21, pattern established):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR. First real extraction: `zer_handle_state_is_invalid` (used by both zercheck.c:is_handle_invalid and zercheck_ir.c:ir_is_invalid).
 
-**Level 3 scope to close:** ~50 safety-critical zercheck.c + emitter.c functions. 150-500 hrs for complete coverage. Current: 1 verified (proof of concept).
+**Level 3 structure:**
+- `src/safety/handle_state.c` — extracted predicate, linked into zerc
+- `src/safety/handle_state.h` — declarations + state constants (ZER_HS_*)
+- `proofs/vst/verif_handle_state.v` — VST spec + proof (0 admits)
+- `make check-vst` clightgens the SAME `src/safety/*.c` — no duplicates, no divergence
+
+**Also in proofs/vst/:** 21 pre-extraction demonstrator proofs (verif_simple_check.v, verif_zer_checks.v, verif_zer_checks2.v). These are standalone `.c` files written for VST, NOT extracted from the compiler. They demonstrate the VST pattern but do NOT verify real compiler code — don't count them as compiler verification.
+
+**Level 3 scope (honest):** 15-25 pure predicates extractable from zercheck.c + zercheck_ir.c. Complex functions (call-graph DFS, scope walks) need struct separation logic — 20+ hrs each, separate future work.
 
 **Three levels distinction:**
 - **Level 1 (predicates)** — `typing.v` etc.: abstract safety spec is correct.
 - **Level 2 (tests)** — `tests/zer_proof/`: compiler empirically rejects known violations.
-- **Level 3 (VST)** — `proofs/vst/`: C source matches predicate for EVERY input. Catches implementation bugs 1+2 can miss (e.g., `if (x = 1)` assignment-typo — spec correct, tests may miss, VST fails immediately).
+- **Level 3 (VST on extracted predicates)** — `src/safety/*.c` linked + `proofs/vst/verif_*.v`: real compiler code matches spec for EVERY input. Catches implementation bugs 1+2 can miss (e.g., `if (x = 1)` assignment-typo — spec correct, tests may miss, VST fails immediately).
+
+**Adding a new Level 3 extraction (checklist):**
+1. Identify pure predicate in zercheck.c or zercheck_ir.c (no state mutation, primitive param types)
+2. Move logic to `src/safety/<name>.c` + `<name>.h`, call it from ORIGINAL sites (BOTH zercheck.c AND zercheck_ir.c if applicable)
+3. Verify `make docker-build` + `make docker-check` still pass (no regression)
+4. Write `proofs/vst/verif_<name>.v` with Coq spec + VST proof
+5. Add to `make check-vst` target
+6. Commit — CI now enforces the invariant
 
 Contents of `docs/compiler-internals.md`:
 

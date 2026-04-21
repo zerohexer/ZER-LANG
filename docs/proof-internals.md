@@ -264,6 +264,8 @@ The combined `forward_if; forward; ...; entailer!` closes both branches at once 
 | `No such contradiction` | `destruct` case where `contradiction` hypothesis isn't visible yet | Rearrange: `destruct first; try subst; try contradiction` |
 | `Custom entry dfrac has been overridden` | Harmless Iris warning on every file | Ignore |
 | `The following notations have been disabled: Notation 'True'` | Iris overrides Coq's `True`/`False` | Ignore — inside proofs use `True%I` / `False%I` for BI |
+| `The variable X was not found in the current environment` after nested `forward_if` with `if (x != 0) return 0;` pattern | VST auto-`subst`s the WITH-bound variable to 0 in the else-branch of a `!=0` early-return if. The variable literally disappears. | After first `forward_if`'s else-branch, don't reference the subst'd variable. Use `simpl` to evaluate `Z.eq_dec 0 0 = left`, then `destruct` only on the OTHER variables. `<` / `>=` comparisons don't trigger subst — only `==` / `!=` with a constant do. |
+| `No such goal` after nested `forward_if. { ... }` closes the then-branch | Second nested `forward_if` merges its post with the outer continuation → one goal left, not two | Use cascade pattern: `forward_if; [<then-tactic> \| ]. forward_if; <unified-tactic>;...` — the `[tac \| ]` discharges the then-branch and leaves ONE else-goal. The nested forward_if's post is already the final return. |
 
 ### What Level 3 proves (vs Level 1, Level 2)
 
@@ -275,15 +277,73 @@ The combined `forward_if; forward; ...; entailer!` closes both branches at once 
 
 A bug that Level 1 can't catch but Level 3 does: zercheck's C source has a typo `if (state = 1)` (assignment, not comparison). Level 1's spec is correct; Level 2 might miss this if tests don't cover the right pattern; Level 3 fails the proof because the C control flow doesn't match the predicate.
 
-### Verification strategy
+### Verification strategy — extract-and-link (2026-04-21)
 
-For "complete coverage" of zercheck.c / emitter.c safety code:
-- Extract each safety-critical C function into a standalone file (avoids the 6000+ line zercheck.c's interdependencies)
-- Pair with VST spec matching predicate in `lambda_zer_typing/typing.v`
-- Scale estimate: ~50 functions × 5-20 hrs/func = 150-500 hrs total
-- Process: batch simple pure functions first (extract + verify fast), handle complex (loops, malloc) case by case
+**The honest form of Level 3 is NOT writing standalone `.c` files for VST.** That's what `proofs/vst/zer_checks.c` / `zer_checks2.c` / `simple_check.c` do — they demonstrate the VST pattern but verify code that doesn't exist in zerc. It's a scaffolding step, not real verification.
 
-Progress tracking: each proved function adds a `verif_<func>.vo` to `proofs/vst/`. `make check-vst` counts and reports.
+**Real Level 3 is extract-and-link:**
+1. Identify a pure predicate in `zercheck.c` or `zercheck_ir.c` (primitive args, no mutation, no AST dependencies).
+2. Move it to `src/safety/<name>.c` + `<name>.h`.
+3. Call the extracted function from BOTH zercheck.c and zercheck_ir.c (dual-run still sees the same logic).
+4. Makefile `CORE_SRCS` and `LIB_SRCS` include `src/safety/*.c` — they're linked into `zerc`.
+5. `make check-vst` clightgens the SAME `src/safety/*.c` files and runs VST on them.
+6. If the C implementation diverges from the Coq spec, `make check-vst` fails → PR blocked.
+
+**File layout:**
+```
+src/safety/
+  <name>.c                          # Pure function, linked into zerc
+  <name>.h                          # Declarations + constants
+  .gitignore                        # Excludes handle_state.v (clightgen output)
+proofs/vst/
+  verif_<name>.v                    # VST spec + proof
+```
+
+**Makefile wiring:** `check-vst` mounts the WHOLE repo (not just proofs/vst/) so clightgen can see `src/safety/`. The `.v` output lands in `src/safety/`, imported by `verif_<name>.v` via `-Q src/safety zer_safety` and `From zer_safety Require Import <name>.`
+
+**First real extraction (2026-04-21):** `zer_handle_state_is_invalid(int state)` — checks if state ∈ {FREED, MAYBE_FREED, TRANSFERRED}. Replaces inline logic in zercheck.c:is_handle_invalid + zercheck_ir.c:ir_is_invalid. VST-verified in `proofs/vst/verif_handle_state.v`.
+
+**What counts as Level 3 verified:**
+- `src/safety/handle_state.c:zer_handle_state_is_invalid` — 1 function verified
+- The 21 proofs in `proofs/vst/verif_simple_check.v` / `verif_zer_checks*.v` are SCAFFOLDING — don't count them as compiler verification. The standalone .c files in proofs/vst/ can eventually be deleted (or kept as demonstrator examples).
+
+**Scope estimate (honest):** 15-25 pure predicates extractable. ~1-3 hrs per extraction (smaller than the earlier "5-20 hrs" estimate — simple predicates don't need struct separation logic). Complex functions (loops, recursion, scope walks) don't fit this pattern and are separate work.
+
+Progress tracking: each verified real-code function counts once in `src/safety/*.c`. `make check-vst` should print the count.
+
+### VST proof pattern for `==` chains — auto-subst gotcha
+
+When the C function has `if (x == N) return ...;` (equality with constant), VST 3.0's `forward_if` auto-`subst`s `x := N` in the then-branch. The Coq WITH-bound variable `x` literally disappears from scope.
+
+This differs from `<` / `>=` (relational) where no subst happens.
+
+**Pattern that works** (from `verif_handle_state.v`):
+
+```coq
+Lemma body_foo: semax_body Vprog Gprog f_foo foo_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold foo_coq;
+    repeat (destruct (Z.eq_dec _ _); try lia); try entailer!.
+Qed.
+```
+
+Why it works:
+- `repeat forward_if` — handles arbitrary cascade depth. After subst, some branches close automatically.
+- `repeat (destruct (Z.eq_dec _ _); try lia)` — destructs ANY remaining equality decisions, skipping already-substituted ones. `_` lets the tactic work on whatever `state` became.
+- `try entailer!` — discharges remaining postconditions.
+
+**Pattern that DOESN'T work** — referencing the WITH variable by name after the first `forward_if`:
+```coq
+forward_if.
+{ forward. destruct (Z.eq_dec state ZER_HS_FREED); ... entailer!. }  (* OK *)
+forward_if.  (* state has been subst'd away *)
+{ forward. destruct (Z.eq_dec state ZER_HS_FREED); ... }  (* FAIL: "state not found" *)
+```
+
+See `proof-internals.md` common-errors table for the full list of VST 3.0 gotchas.
 
 ### All typing-level sections now covered by real Coq proofs
 

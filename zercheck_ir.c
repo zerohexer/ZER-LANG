@@ -2261,7 +2261,16 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         ir_ps_init(&block_states[bi]);
 
     /* Process blocks in order (topological for forward edges).
-     * For back edges (loops), use fixed-point iteration. */
+     * For back edges (loops), use fixed-point iteration.
+     *
+     * Error-emission strategy: the fixed-point loop may visit each block
+     * up to 32 times. Without suppression, ir_check_inst would emit the
+     * same error on every iteration (30+ duplicates on adversarial tests).
+     * Fix: suppress via building_summary during convergence, then run one
+     * more pass on the converged state with errors enabled. */
+    bool saved_suppress = zc->building_summary;
+    zc->building_summary = true;
+
     bool changed = true;
     int iterations = 0;
     while (changed && iterations < 32) {
@@ -2325,6 +2334,45 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             ir_ps_free(&block_states[bi]);
             block_states[bi] = merged;
         }
+    }
+
+    /* Final pass on converged state with errors enabled.
+     * State is stable (no !changed for full pass), so re-running produces
+     * exactly the same final errors, each emitted once. */
+    zc->building_summary = saved_suppress;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+
+        IRPathState merged;
+        if (bb->pred_count == 0) {
+            if (bi > 0 && func->blocks[bi - 1].inst_count > 0) {
+                IRInst *prev_last = &func->blocks[bi - 1].insts[
+                    func->blocks[bi - 1].inst_count - 1];
+                if (prev_last->op == IR_RETURN) {
+                    merged = ir_ps_copy(&block_states[bi - 1]);
+                } else {
+                    ir_ps_init(&merged);
+                }
+            } else {
+                ir_ps_init(&merged);
+            }
+        } else {
+            IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));
+            for (int pi = 0; pi < bb->pred_count; pi++) {
+                pred_states[pi] = ir_ps_copy(&block_states[bb->preds[pi]]);
+            }
+            merged = ir_merge_states(pred_states, bb->pred_count);
+            for (int pi = 0; pi < bb->pred_count; pi++)
+                ir_ps_free(&pred_states[pi]);
+            free(pred_states);
+        }
+
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            ir_check_inst(zc, &merged, &bb->insts[ii], func);
+        }
+
+        ir_ps_free(&block_states[bi]);
+        block_states[bi] = merged;
     }
 
     /* Phase C1: FuncSummary build / refine. When building a summary, examine

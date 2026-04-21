@@ -1,0 +1,24 @@
+// AUDIT3 gap: move struct use-after-move via GLOBAL struct field
+// not detected by either AST or IR zercheck.
+// Found by 2026-04-21 audit.
+//
+// CLAIM: move struct transferred through a global struct field
+//        should trigger use-after-move at the next field read.
+// OBSERVED: compiles clean, exit=0 at compile, runtime uses stale value.
+// FIX APPROACH: extend move-struct tracking to cover global-field chain
+//               (same class as Gap 5 container<move struct>).
+//
+// Related: tests/zer_gaps/gap5_container_move.zer (local container field).
+// This variant uses GLOBAL struct field — even more blind in current tracker.
+
+move struct Tok { u32 k; }
+struct Holder { Tok t; }
+Holder g;
+
+void consume(Tok t) { u32 x = t.k; }
+
+u32 main() {
+    g.t = { .k = 1 };
+    consume(g.t);       // move transferred out of g.t
+    return g.t.k;        // use after move — SHOULD be compile error
+}

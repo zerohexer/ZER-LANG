@@ -1,0 +1,16 @@
+// Regression test: returning a SCALAR value read through a slice index
+// used to be falsely flagged as "pointer to local" escape (BUG-421 class).
+// Fixed in the 2026-04-21 audit. u32 is scalar, so the read copies by
+// value; no pointer escapes. This should compile and run.
+u32 compute() {
+    u32[4] buf;
+    buf[1] = 99;
+    [*]u32 s = buf[0..];
+    return s[1];     // scalar read — no escape
+}
+
+u32 main() {
+    u32 r = compute();
+    if (r != 99) { return 1; }
+    return 0;
+}

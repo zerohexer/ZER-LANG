@@ -1,0 +1,13 @@
+// Regression test: parser depth guard for pointer types.
+// Previously ****...*T with 10k stars would segfault the compiler.
+// Now bounded to 128 levels via parse_type depth counter.
+// Positive: a pointer depth within the limit parses/compiles.
+u32 main() {
+    u32 x = 5;
+    *u32 p = &x;
+    **u32 pp = &p;
+    ***u32 ppp = &pp;
+    u32 v = ppp[0][0][0];
+    if (v != 5) { return 1; }
+    return 0;
+}

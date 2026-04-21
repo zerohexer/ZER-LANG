@@ -1,0 +1,29 @@
+// AUDIT3 gap (BUG-421 regression): returning a SCALAR value via
+// slice-index is falsely flagged as "pointer to local" escape.
+// Found by 2026-04-21 audit.
+//
+// CLAIM: `u32 val = s[i]; return val;` where s is a slice of scalars
+//        returns a COPY of u32. No pointer escapes.
+// OBSERVED: false-positive escape error:
+//   "cannot return pointer to local 's' — stack memory is freed
+//    when function returns"
+// ROOT CAUSE: Gap 1 in docs/refactoring_gaps.md — 4 of 5 escape-flag
+// propagation sites in checker.c skip the `can_carry_ptr` type guard,
+// so scalar var `val` inherits is_local_derived from `s`.
+// FIX: add `can_carry_ptr` guard at all 4 missing sites
+// (checker.c:~1894, ~1919, ~5695, one more) matching the correct
+// reference site at ~5302.
+//
+// Workaround (works): return array index `buf[i]` — array path uses
+// a different code path and correctly doesn't propagate the flag.
+
+u32 compute() {
+    u32[4] buf;
+    buf[1] = 99;
+    []u32 s = buf[0..];
+    return s[1];           // SHOULD compile — u32 is scalar, no escape
+}
+
+u32 main() {
+    return compute();
+}

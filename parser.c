@@ -397,8 +397,25 @@ static TypeNode *parse_base_type(Parser *p) {
     }
 }
 
-/* parse full type with prefix modifiers: const, volatile, *, ?, [] */
+/* parse full type — depth-guarded wrapper around parse_type_impl */
+static TypeNode *parse_type_impl(Parser *p);
 static TypeNode *parse_type(Parser *p) {
+    /* Recursion depth guard — prevents stack exhaustion from ****...*T
+     * (and qualifier / optional / slice chains). 128 levels is far more
+     * than any reasonable program needs. */
+    if (++p->depth > 128) {
+        error(p, "type nesting too deep (limit 128)");
+        p->depth--;
+        TypeNode *t = new_type_node(p, TYNODE_NAMED);
+        t->named.name = "u32"; t->named.name_len = 3; /* dummy */
+        return t;
+    }
+    TypeNode *result = parse_type_impl(p);
+    p->depth--;
+    return result;
+}
+
+static TypeNode *parse_type_impl(Parser *p) {
     /* const T */
     if (match(p, TOK_CONST)) {
         TypeNode *t = new_type_node(p, TYNODE_CONST);

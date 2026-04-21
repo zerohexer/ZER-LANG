@@ -5,6 +5,150 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (compiler audit + tech debt) — 5 fixes, 0 regressions
+
+Full-codebase audit targeted at post-IR-default health. Parallel agents
+scanned zercheck_ir for error handling, IR emission for safety gaps,
+and checker/parser for edge cases. Combined with adversarial hand-
+testing, the audit surfaced 5 real defects. All fixed this session;
+test suite went from 412/413 (1 baseline failure) to 416/416 +
+784/784 rust + 36/36 zig + 200/200 negative = 1,236/1,236 green.
+
+Findings parked as reproducers in `tests/zer_gaps/audit3_*.zer`:
+- `audit3_move_global_field.zer` — move struct use-after-move via
+  global struct field NOT detected by either AST or IR zercheck.
+  Related to Gap 5 (container<move struct>), new variant.
+- `audit3_move_array_index.zer` — move via array element: IR catches,
+  AST misses, exit=0 (DUAL-RUN disagreement).
+- `audit3_slice_scalar_read_escape.zer` — FIXED below.
+
+### BUG-600 — zercheck_ir emitted each error 30× on convergence loops
+
+**Severity:** P2 (UX). Programs that triggered a handle-state error
+inside a loop printed the SAME error up to 32 times to stderr. Example:
+`gap1_cross_block_goto.zer` produced 90 lines of duplicate output.
+
+**Root cause:** `zercheck_ir` in `zercheck_ir.c:2253` runs a fixed-point
+convergence loop (`while (changed && iterations < 32)`). Inside the loop,
+`ir_check_inst()` calls `ir_zc_error()` on every violation. The
+`building_summary` guard in `ir_zc_error` was only set by the OUTER
+summary-build pass in `zerc_main.c`; the inner convergence loop ran with
+errors enabled, emitting each error on every iteration (1..N).
+
+**Fix:** Two-phase strategy in `zercheck_ir()`:
+1. Phase 1 — suppress errors via `building_summary = true` during the
+   convergence loop (state stabilizes without user-visible output).
+2. Phase 2 — one more pass over the converged `block_states` with errors
+   re-enabled. State is stable (by definition of convergence), so each
+   violation is emitted exactly once.
+
+Pattern mirrors the existing `building_summary` suppression in the
+summary-build phase. ~30 lines of re-merge logic duplicated in the
+final pass (acceptable — separate concern from convergence).
+
+Regression test: `tests/zer/zercheck_ir_no_spam.zer` (positive — clean
+program compiles with no stderr noise).
+
+### BUG-601 — dead `classify_builtin_call` in `ir_lower.c` (87 lines)
+
+**Severity:** P3 (tech debt). GCC warned `classify_builtin_call`
+defined but not used. Per CLAUDE.md, IR_POOL_ALLOC / IR_SLAB_ALLOC /
+IR_POOL_FREE / etc. are "NEVER emitted by ir_lower.c" — method calls
+flow through generic IR_ASSIGN + IR_CALL. The `classify_builtin_call`
+function (lines 711-797) was dead code that would map these method
+calls to specialized IR ops.
+
+**Fix:** Deleted the function entirely (87 lines). No call sites
+existed; CLAUDE.md documents the architectural decision to use the
+generic path. Zercheck_ir handlers for the never-emitted IR ops are
+also dead but left in place as defensive guards (documented in
+zercheck_ir.c comments).
+
+### BUG-602 — parser segfault on deeply nested pointer types (DoS)
+
+**Severity:** P2 (compiler DoS). A source file with 10,000 `*` prefixes
+on a type (e.g. `*****...*u32 x;`) crashed zerc with SIGSEGV via
+unbounded recursion in `parse_type()`. This is reachable by any
+adversarial input. LSP would also crash on the same input.
+
+**Root cause:** `parse_type()` recurses without a depth guard.
+Expression parsing (`parse_precedence`) and statement parsing already
+had `p->depth > 256` / `> 64` guards; types did not.
+
+**Fix:** Split `parse_type` into a wrapper with a depth guard (limit
+128) + `parse_type_impl` doing the actual work. On overflow, emits
+"type nesting too deep (limit 128)" error and returns a dummy
+`u32` TypeNode so parsing continues.
+
+Regression tests:
+- `tests/zer/parser_deep_ptr_depth.zer` — 3-level pointer type still
+  compiles.
+- `tests/zer_fail/parser_ptr_depth_exceeded.zer` — 200-star type
+  correctly rejected at parse time.
+
+### BUG-603 — `void main()` had undefined C exit code
+
+**Severity:** P2 (silent miscompile of safe program). ZER permits
+`void main()` but C requires `int main()` for a defined exit code.
+Emitter passed `void` through to C, so whatever the register held at
+function exit became the process exit code. `tests/zer_proof/A01_no_uaf.zer`
+(the ONLY positive ZER theorem-linked test with void main) returned
+exit=100 instead of 0, blocking `make check`.
+
+**Fix:** In `emit_regular_func_from_ir()` (emitter.c), detect
+`void main()` (no module prefix, name "main", return type void) and:
+1. Emit signature as `int main(void)` instead of `void main(void)`.
+2. Patch IR_RETURN void path to emit `return 0;` instead of `return;`
+   for this case (bare return + no expression + void return type).
+3. Patch IR_RETURN expr-void path similarly.
+
+Covers both implicit end-of-function return and explicit bare `return;`.
+
+Regression test: `tests/zer/void_main_exits_zero.zer`. Also moves
+`tests/zer_proof/A01_no_uaf.zer` from FAIL to PASS.
+
+### BUG-604 — BUG-421 class: scalar read via local slice falsely rejected
+
+**Severity:** P2 (blocks valid programs). `return s[i]` where `s` is
+a local-derived slice and the element type is scalar (u32, bool, etc.)
+emitted "cannot return pointer to local 's' — stack memory is freed
+when function returns." But `s[i]` on a scalar slice copies the value
+by reading through the pointer; no pointer escapes.
+
+**Root cause:** `checker.c` return-escape check (~line 8067) walks
+NODE_INDEX/NODE_FIELD chains to find a root ident and rejects when
+`sym->is_local_derived`. The walk didn't consider that the return type
+might be scalar — the flag applies to the CHAIN ROOT (e.g. `s`), but
+the VALUE extracted by the chain may be scalar.
+
+**Fix:** When the walker descended into an index/field chain (i.e.
+root changed), AND the return type is scalar (`!type_can_carry_pointer`),
+suppress the escape error. Direct `return local_ident` (no walk) still
+rejects — catches the `usize addr = @ptrtoint(&x); return addr;` case
+where the flag is set directly on `addr`.
+
+Regression tests:
+- `tests/zer/slice_scalar_return.zer` — positive, exercises fix
+- `rust_tests/reject_ptrtoint_local_indirect.zer` — still rejects
+  legitimate address leak (was at risk of regression on first attempt)
+
+### Methodology notes from this audit
+
+1. **Parallel agents for breadth, personal probing for depth.** Two
+   Explore agents covered emitter IR + checker/parser while I ran
+   adversarial `.zer` tests. Agent reports had one false positive
+   (P1 "IR_INDEX_WRITE incomplete" — actually dead op kind, slice
+   writes flow through IR_ASSIGN + emit_rewritten_node correctly).
+2. **The `exit=N` pipe-artifact trap.** `zerc file.zer | head; echo $?`
+   captures head's exit code, not zerc's. First pass mis-diagnosed
+   exit=0 as a bug; direct `zerc ...; echo $?` showed actual exit=1.
+3. **DUAL-RUN disagreement is a valuable audit signal.** IR analyzer
+   catching bugs AST analyzer misses (`audit3_move_array_index.zer`)
+   exposes where AST zercheck's linear walk is incomplete and where
+   IR's CFG gives better coverage. Both gaps logged.
+
+---
+
 ## Session 2026-04-21 (Level 3 VST kickoff) — VST 3.0 Iris setup patterns
 
 Starting Level 3 (VST on C implementations) surfaced several patterns

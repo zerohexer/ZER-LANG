@@ -1,0 +1,14 @@
+// Regression test: zercheck_ir used to emit each error 30+ times
+// due to fixed-point convergence loop. Now errors are emitted once after
+// convergence. This test has a clean program so no errors should be
+// emitted at all.
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    ?Handle(Task) mh = heap.alloc();
+    Handle(Task) h = mh orelse return;
+    u32 id = h.id;
+    heap.free(h);
+    return id;
+}

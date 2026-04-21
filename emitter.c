@@ -6596,11 +6596,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit_array_as_slice(e, inst->expr, expr_type, ret);
                     emit(e, ";\n");
                 } else {
-                    /* Void expression in return — emit side effect, then bare return */
+                    /* Void expression in return — emit side effect, then bare return.
+                     * For void main, emit `return 0;` so exit code is 0. */
                     emit_rewritten_node(e, inst->expr, func);
                     emit(e, ";\n");
                     emit_indent(e);
-                    emit(e, "return;\n");
+                    bool vm = !func->module_prefix && func->name_len == 4 &&
+                        memcmp(func->name, "main", 4) == 0 &&
+                        e->current_func_ret &&
+                        type_unwrap_distinct(e->current_func_ret)->kind == TYPE_VOID;
+                    emit(e, vm ? "return 0;\n" : "return;\n");
                 }
             } else {
                 /* Bare `return;` from `?void` function means SUCCESS: { has_value=1 }.
@@ -6618,6 +6623,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         emit_type(e, eff);
                         emit(e, "){ 0, 1 };\n");
                     }
+                } else if (eff && eff->kind == TYPE_VOID && !func->module_prefix &&
+                           func->name_len == 4 && memcmp(func->name, "main", 4) == 0) {
+                    /* void main → emit `return 0;` (C requires int main for defined exit code) */
+                    emit(e, "return 0;\n");
                 } else {
                     emit_return_null(e);
                     emit(e, "\n");
@@ -7789,8 +7798,19 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * Extract the actual return type from func_ptr.ret. */
         Type *ret = func->return_type;
         if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-        if (ret) emit_type(e, ret);
-        else emit(e, "void");
+        /* `void main()` in ZER should still exit with code 0. C leaves exit
+         * code undefined when main returns void. Emit as `int main(void)` and
+         * append `return 0;` at end (below). No module prefix (main is global). */
+        bool is_void_main = !func->module_prefix && func->name_len == 4 &&
+            memcmp(func->name, "main", 4) == 0 &&
+            ret && type_unwrap_distinct(ret)->kind == TYPE_VOID;
+        if (is_void_main) {
+            emit(e, "int");
+        } else if (ret) {
+            emit_type(e, ret);
+        } else {
+            emit(e, "void");
+        }
         emit(e, " ");
 
         /* Mangled name */
@@ -7909,6 +7929,20 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
             e->indent--;
             emit_indent(e);
             emit(e, "}\n");
+        }
+    }
+
+    /* `void main()` emitted as `int main(void)` — append `return 0;` so
+     * the process exits with code 0 rather than an undefined register value. */
+    if (!func->is_interrupt) {
+        Type *ret = func->return_type;
+        if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+        bool is_void_main = !func->module_prefix && func->name_len == 4 &&
+            memcmp(func->name, "main", 4) == 0 &&
+            ret && type_unwrap_distinct(ret)->kind == TYPE_VOID;
+        if (is_void_main) {
+            emit_indent(e);
+            emit(e, "return 0;\n");
         }
     }
 

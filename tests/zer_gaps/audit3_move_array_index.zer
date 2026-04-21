@@ -1,0 +1,21 @@
+// AUDIT3 gap: move struct use-after-move via array index element.
+// AST zercheck doesn't detect; IR zercheck does detect but reports as
+// "use after free" (wrong message: it's a move, not a free) AND with
+// the dual-run design AST is primary so exit=0 despite IR finding.
+// Found by 2026-04-21 audit.
+//
+// CLAIM: move struct transferred through an array element
+//        should trigger use-after-move at next element read.
+// OBSERVED: AST says clean, IR reports UAF spam, exit=0 (disagreement).
+// FIX: AST zercheck needs move tracking for NODE_INDEX chains; IR
+// message should distinguish move from free.
+
+move struct Tok { u32 k; }
+void consume(Tok t) { u32 x = t.k; }
+
+u32 main() {
+    Tok[4] arr;
+    arr[0] = { .k = 1 };
+    consume(arr[0]);       // move transferred out of arr[0]
+    return arr[0].k;        // use after move — SHOULD be compile error
+}

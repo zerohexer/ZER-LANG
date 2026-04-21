@@ -63,6 +63,46 @@ test infrastructure").
 
 ---
 
+## Phase 3 audit findings (2026-04-21 — post-IR-default health check)
+
+Three-agent parallel audit + hand-probing after the IR path became
+default. 5 real bugs fixed (BUG-600 through BUG-604, see BUGS-FIXED.md).
+2 open gaps recorded as reproducers for future sessions:
+
+### Open — Move struct transferred through global struct field (not detected)
+
+**Reproducer:** `tests/zer_gaps/audit3_move_global_field.zer`.
+
+`consume(g.t)` on a `move struct Tok g.t` (where `g` is a global
+`Holder` struct) is not detected as a transfer by either AST or IR
+zercheck. Subsequent `g.t.k` compiles clean. Same conceptual class as
+Gap 5 (`container<move struct>`) but using a global struct field as
+the carrier instead of a user-defined container. Fix needs move-struct
+tracking to cover `NODE_FIELD` chains rooted at globals.
+
+### Open — Move struct transferred through array index (AST/IR disagreement)
+
+**Reproducer:** `tests/zer_gaps/audit3_move_array_index.zer`.
+
+`consume(arr[0])` on `Tok[4] arr` correctly triggers the IR zercheck
+(`use after free: 'arr' is transferred`) but AST zercheck emits
+nothing. `ast=0 ir=2` DUAL-RUN disagreement; AST drives exit code so
+compile succeeds. Also: the IR error message is misleading — it says
+"use after free" when the actual violation is move-after-transfer.
+
+Fix: (1) extend AST zercheck move tracking to NODE_INDEX chains;
+(2) use a distinct message for transferred-state violations in
+`zercheck_ir.c`.
+
+### Related closed this session
+
+- `audit3_slice_scalar_read_escape.zer` — FIXED (BUG-604). Scalar
+  read via `s[i]` on local-derived slice no longer emits false
+  "pointer to local" escape error. Moved the gap file to permanent
+  `tests/zer_gaps/` as methodology documentation.
+
+---
+
 ## Phase 1 audit findings (2026-04-19 — 52 adversarial tests, 24 safety systems)
 
 Full systematic audit of the 29-system framework. 52 adversarial `.zer`

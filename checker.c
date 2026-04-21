@@ -8064,6 +8064,7 @@ static void check_stmt(Checker *c, Node *node) {
                             }
                         }
                     }
+                    Node *orig_root = root;
                     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                         if (root->kind == NODE_FIELD) root = root->field.object;
                         else root = root->index_expr.object;
@@ -8071,13 +8072,24 @@ static void check_stmt(Checker *c, Node *node) {
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *sym = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
-                        if (sym && sym->is_arena_derived) {
+                        /* BUG-421 fix: when the return expression reads through
+                         * an index or field (e.g. `return s[1]`), the result is
+                         * the VALUE at that location, not a pointer to it. If
+                         * the return type is scalar (can't carry a pointer), a
+                         * local-derived flag on the chain root doesn't escape.
+                         * Keep the check for direct `return local_ptr` — `addr`
+                         * from `@ptrtoint(&local)` has the flag set directly and
+                         * must still be rejected even though usize is scalar. */
+                        bool walked_chain = (orig_root != root);
+                        bool ret_can_carry_ptr = type_can_carry_pointer(ret_type);
+                        bool suppress_for_scalar = walked_chain && !ret_can_carry_ptr;
+                        if (sym && sym->is_arena_derived && !suppress_for_scalar) {
                             checker_error(c, node->loc.line,
                                 "cannot return arena-derived pointer '%.*s' — "
                                 "arena memory is freed when function returns",
                                 (int)sym->name_len, sym->name);
                         }
-                        if (sym && sym->is_local_derived) {
+                        if (sym && sym->is_local_derived && !suppress_for_scalar) {
                             checker_error(c, node->loc.line,
                                 "cannot return pointer to local '%.*s' — "
                                 "stack memory is freed when function returns",

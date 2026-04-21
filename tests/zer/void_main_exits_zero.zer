@@ -1,0 +1,7 @@
+// Regression test: `void main()` should emit `int main` with `return 0;`
+// so process exits with code 0. Previously void main left return register
+// undefined (A01_no_uaf baseline failure).
+void main() {
+    u32 x = 42;
+    u32 y = x + 1;
+}

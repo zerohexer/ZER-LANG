@@ -12,4 +12,5 @@ lambda_zer_handle/iris_smoke.v
 lambda_zer_handle/iris_lang.v
 lambda_zer_handle/iris_resources.v
 lambda_zer_handle/iris_state.v
+lambda_zer_handle/iris_specs.v
 lambda_zer_handle/iris_demo.v

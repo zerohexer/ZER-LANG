@@ -246,6 +246,24 @@ check-proofs:
 	    echo "OK: zero admits across $$file_count Iris/subset .v files"; \
 	 fi
 
+# ---- Level 3 VST: verify C source against Coq specs ----
+# proofs/vst/ with coq-vst + CompCert clightgen.
+
+check-vst-image:
+	docker build -t zer-vst -f proofs/vst/Dockerfile proofs/vst
+
+check-vst:
+	cd proofs/vst && MSYS_NO_PATHCONV=1 docker run --rm \
+	    -v "$$(pwd -W 2>/dev/null || pwd):/work" -w /work zer-vst \
+	    bash -c 'eval $$(opam env) && coqc -Q . zer_vst simple_check.v && coqc -Q . zer_vst verif_simple_check.v'
+	@echo "=== VST proofs compile green ==="
+	@if grep -l 'Admitted\|admit\.' proofs/vst/verif_*.v 2>/dev/null | grep -q .; then \
+	    echo "FAIL: admits found in VST proofs"; exit 1; \
+	else \
+	    count=$$(ls proofs/vst/verif_*.v 2>/dev/null | wc -l); \
+	    echo "OK: zero admits across $$count VST verification files"; \
+	fi
+
 # ---- Safety-coverage audit: verify every compiler check has a curation entry ----
 # Regenerates docs/safety_coverage_raw.md and warns if any unique predicate
 # is missing from docs/safety_list.md (the curated coverage matrix).
@@ -261,4 +279,4 @@ check-safety-coverage:
 	    echo "OK: safety_coverage_raw.md up to date"; \
 	fi
 
-.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix check-proofs-image check-proofs check-safety-coverage
+.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst

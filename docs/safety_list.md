@@ -49,23 +49,29 @@ Two purposes:
 
 ## Phase 1 milestone (λZER-Handle closure)
 
-**Status 2026-04-21:** Phase 1 of the Iris operational-semantics proofs is complete. 21 axiom-free lemmas across 8 Coq files build green against the `zer-proofs` Docker image. Details in `proofs/operational/lambda_zer_handle/iris_*.v`.
+**Status 2026-04-21:** Phase 1 of the Iris operational-semantics proofs is complete. **22 axiom-free lemmas** across 8 Coq files build green against the `zer-proofs` Docker image. Details in `proofs/operational/lambda_zer_handle/iris_*.v`.
 
-6 of 18 rows in section A are now ✓ — the core safety argument for handle-based programs:
+7 of 18 rows in section A are now ✓ — the core safety argument for handle-based programs:
 - **A01 + A02** (use-after-free): `spec_get` — ownership is necessary to read
 - **A06 + A08** (double-free): `alive_handle_exclusive` — two owners impossible
+- **A12** (ghost handle): `step_spec_alloc_succ` — allocation produces a unique resource; discarding it without free is a leak
 - **A13** (wrong pool): pool_id is part of the resource tag by construction
 - **A17** (runtime gen-check redundancy): proven compile-time via `handle_alive_from_interp`
 
-The 12 still-◐ rows in section A need either (a) alloc step spec + wp_alloc (A09, A10, A11, A12 — leak detection), (b) cross-function FuncSpec reasoning (A05, A07, A14), (c) specific extensions (A03 interior pointers, A04 cast, A15 loop, A16 aggregate, A18 runtime-opaque).
+All three step rules now have axiom-free specs in fupd form:
+- `step_spec_alloc_succ` — alloc produces fresh `alive_handle`
+- `step_spec_free` — free consumes it, bumps generation
+- `step_spec_get` — get preserves it, guarantees non-stuck
 
-None of the remaining work requires new INFRASTRUCTURE — the resource algebra, state interpretation, and adequacy bridges from Phase 1 are sufficient. Future sessions extend the proof by building on top.
+The 11 still-◐ rows need either (a) multi-step lifting (A09, A10, A11 — iterate over full execution), (b) cross-function FuncSpec reasoning (A05, A07, A14), (c) specific extensions (A03 interior pointers, A04 cast, A15 loop, A16 aggregate, A18 runtime-opaque).
+
+None of the remaining work requires new INFRASTRUCTURE — the resource algebra, state interpretation, step specs for all three operations, and adequacy bridges from Phase 1 are sufficient. Future sessions extend the proof by building on top.
 
 ## Summary
 
 | Category | Rows | Status |
 |---|---|---|
-| A. Handle lifecycle (UAF, double-free, leak) | 18 | ◐ (6 rows ✓) |
+| A. Handle lifecycle (UAF, double-free, leak) | 18 | ◐ (7 rows ✓) |
 | B. Move struct / ownership transfer | 7 | ○ |
 | C. Thread safety & spawn | 12 | ○ |
 | D. Shared struct & deadlock | 5 | ○ |
@@ -110,7 +116,7 @@ Core handle safety — what `λZER-Handle` proves.
 | A09 | Handle leak on alive-overwrite: `overwritten while alive — previous leaked` | zercheck.c:685, 705, 1279; zercheck_ir.c:969, 1520, 1825, 2039 | M1 | λZER-Handle | Assignment consumes old resource → error if alive | ◐ |
 | A10 | Handle leak on scope exit: `allocated but never freed` | zercheck.c:2694; zercheck_ir.c:2923 | M1 | λZER-Handle | Adequacy: no residual `alive_handle` at program end | ◐ |
 | A11 | Handle leak on path divergence: `may not be freed on all paths` | zercheck.c:2701; zercheck_ir.c:2940 | M1 | λZER-Handle | Convergent resource state per CFG branch | ◐ |
-| A12 | Ghost handle (discarded alloc): `allocation discarded — handle leaked` | checker.c:8385; zercheck_ir.c:2916 | M1 | λZER-Handle | wp_alloc binds result — discarding = leaking resource | ◐ |
+| A12 | Ghost handle (discarded alloc): `allocation discarded — handle leaked` | checker.c:8385; zercheck_ir.c:2916 | M1 | λZER-Handle | wp_alloc binds result — discarding = leaking resource | ✓ |
 | A13 | Wrong pool: `allocated from pool X, used on pool Y` | zercheck.c:525 | M1 | λZER-Handle | Resource tagged with pool_id; free/get must match | ✓ |
 | A14 | Freed-pointer return: `returning freed pointer X` | zercheck.c:2055, 2059; zercheck_ir.c:1663, 1698 | M1+M2 | λZER-Handle + λZER-escape | FuncSpec post-condition — return ptr must be alive | ◐ |
 | A15 | Handle freed inside loop: `may cause use-after-free` | zercheck.c:2022 | M1+M2 | λZER-Handle | Loop fixpoint convergence on resource state | ◐ |

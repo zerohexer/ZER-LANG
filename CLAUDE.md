@@ -501,6 +501,10 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
 
+### Proof Internals — MANDATORY for Coq/Iris work
+
+**MANDATORY — read `docs/proof-internals.md` BEFORE modifying any `proofs/operational/**/*.v` file.** Iris/Coq has entirely different conventions from C compiler work. The doc covers: Docker/MSYS build quirks, Iris name collisions (`expr`, `val`, `state` shadow our types after `Require Import weakestpre`), typeclass subtyping (`::`), `IntoVal`/`AsVal` requirements for `wp_value`, `destruct` intropattern pitfalls, ghost-map delete-vs-update design choice, and common build errors + fixes. Not reading it = multi-hour yak-shave on problems the doc already solved. See also `docs/safety_list.md` for what's proven (203-row coverage matrix) and `docs/formal_verification_plan.md` for scope.
+
 Contents of `docs/compiler-internals.md`:
 
 **Emitter Critical Patterns (causes of most bugs):**

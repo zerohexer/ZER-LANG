@@ -209,4 +209,40 @@ docker-vsix:
 	@echo "VS Code extension: release/zer-lang.vsix"
 	@echo "Install: code --install-extension release/zer-lang.vsix"
 
-.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix
+# ---- Formal-verification proofs (Coq + Iris) ----
+# Requires Docker image `zer-proofs` (build once: `make check-proofs-image`).
+# The proofs are the "tests" — compilation IS the correctness check.
+# A broken proof means a compiler invariant was violated.
+
+check-proofs-image:
+	docker build -t zer-proofs -f proofs/operational/Dockerfile proofs/operational
+
+check-proofs:
+	@cd proofs/operational && rm -f CoqMakefile CoqMakefile.conf
+	cd proofs/operational && MSYS_NO_PATHCONV=1 docker run --rm \
+	    -v "$$(pwd -W 2>/dev/null || pwd):/work" -w /work zer-proofs \
+	    bash -c 'eval $$(opam env) && make'
+	@echo "=== All proofs compile green ==="
+	@echo "Verify zero admits:"
+	@if grep -l 'Admitted\|admit\.' proofs/operational/lambda_zer_handle/iris_*.v 2>/dev/null | grep -q .; then \
+	    echo "FAIL: admits found in Iris proofs"; exit 1; \
+	else \
+	    echo "OK: zero admits across all iris_*.v files"; \
+	fi
+
+# ---- Safety-coverage audit: verify every compiler check has a curation entry ----
+# Regenerates docs/safety_coverage_raw.md and warns if any unique predicate
+# is missing from docs/safety_list.md (the curated coverage matrix).
+
+check-safety-coverage:
+	bash tools/safety_coverage.sh > docs/safety_coverage_raw.md.new
+	@if ! diff -q docs/safety_coverage_raw.md docs/safety_coverage_raw.md.new > /dev/null; then \
+	    echo "WARNING: safety_coverage_raw.md out of date. Review diff:"; \
+	    diff docs/safety_coverage_raw.md docs/safety_coverage_raw.md.new || true; \
+	    mv docs/safety_coverage_raw.md.new docs/safety_coverage_raw.md; \
+	else \
+	    rm docs/safety_coverage_raw.md.new; \
+	    echo "OK: safety_coverage_raw.md up to date"; \
+	fi
+
+.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix check-proofs-image check-proofs check-safety-coverage

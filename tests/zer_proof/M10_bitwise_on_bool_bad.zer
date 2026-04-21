@@ -1,0 +1,9 @@
+// Iris theorem: arithmetic_typing_rules
+// Covers row: M10 — bitwise operators require integers
+// EXPECTED: compile error
+
+void main() {
+    bool a = true;
+    bool b = false;
+    bool c = a & b;  // bitwise & on bool — must be rejected
+}

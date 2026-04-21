@@ -1,0 +1,10 @@
+// Iris theorem: comptime_evaluator_sound
+// Covers row: R02 — comptime fn requires const args
+// EXPECTED: compile error
+
+comptime u32 DOUBLE(u32 x) { return x * 2; }
+
+void main() {
+    u32 runtime_val = 5;
+    u32 y = DOUBLE(runtime_val);  // runtime val to comptime — must be rejected
+}

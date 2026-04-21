@@ -1,0 +1,7 @@
+// Iris theorem: mmio_intrinsic_well_typed
+// Covers row: H06 — mmio range start > end
+// EXPECTED: compile error
+
+mmio 0x50000000..0x40000000;  // start > end — must be rejected
+
+void main() { }

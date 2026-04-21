@@ -1,0 +1,8 @@
+// Iris theorem: bounds_safety_compile_or_runtime
+// Covers row: L02 — slice end exceeds array size
+// EXPECTED: compile error
+
+void main() {
+    u32[4] arr;
+    [*]u32 s = arr[0..10];  // end=10 > size=4 — must be rejected
+}

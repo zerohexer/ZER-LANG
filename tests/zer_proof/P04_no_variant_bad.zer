@@ -1,0 +1,9 @@
+// Iris theorem: variant_well_formed
+// Covers row: P04 — no such variant in enum
+// EXPECTED: compile error
+
+enum State { idle, running }
+
+void main() {
+    State s = State.nonexistent;  // must be rejected
+}

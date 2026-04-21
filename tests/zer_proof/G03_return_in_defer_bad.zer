@@ -1,0 +1,10 @@
+// Iris theorem: critical_defer_banned (G03)
+// Covers row: G03 — return inside defer
+// EXPECTED: compile error
+
+u32 main() {
+    defer {
+        return 1;  // must be rejected — corrupts cleanup flow
+    }
+    return 0;
+}

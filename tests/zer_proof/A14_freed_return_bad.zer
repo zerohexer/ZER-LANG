@@ -1,0 +1,18 @@
+// Iris theorem: cannot_return_freed (iris_leak.v)
+// Covers row: A14 — returning freed pointer
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+*Task get_freed() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        *Task p = tasks.alloc_ptr() orelse return null;
+        tasks.free_ptr(p);
+        return p;  // returning freed pointer — must be rejected
+    }
+    return null;
+}
+
+void main() { }

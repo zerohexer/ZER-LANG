@@ -1,0 +1,11 @@
+// Iris theorem: no_yield_in_critical
+// Covers row: F03 — yield in @critical
+// EXPECTED: compile error
+
+async void my_task() {
+    @critical {
+        yield;  // must be rejected
+    }
+}
+
+void main() { }

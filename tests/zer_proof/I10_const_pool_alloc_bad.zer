@@ -1,0 +1,11 @@
+// Iris theorem: const_container_cannot_mutate
+// Covers row: I10 — mutating method on const Pool
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+
+void use_pool(const *Pool(Task, 4) p) {
+    ?Handle(Task) mh = p.alloc();  // const Pool, cannot alloc — must be rejected
+}
+
+void main() { }

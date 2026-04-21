@@ -1,0 +1,9 @@
+// Iris theorem: arithmetic_typing_rules
+// Covers row: M11 — logical operators require bool
+// EXPECTED: compile error
+
+void main() {
+    u32 a = 1;
+    u32 b = 2;
+    bool c = a && b;  // && on int — must be rejected
+}

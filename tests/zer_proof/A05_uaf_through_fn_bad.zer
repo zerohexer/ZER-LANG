@@ -1,0 +1,18 @@
+// Iris theorem: cannot_get_after_freer (iris_func_spec.v)
+// Covers row: A05 — UAF through function call
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void free_and_go(Handle(Task) h) {
+    tasks.free(h);
+}
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        free_and_go(h);
+        u32 x = tasks.get(h).id;  // UAF through callee's free — must be rejected
+    }
+}

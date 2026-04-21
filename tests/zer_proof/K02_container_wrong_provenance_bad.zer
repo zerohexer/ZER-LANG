@@ -1,0 +1,12 @@
+// Iris theorem: container_intrinsics_well_typed
+// Covers row: K02 — @container pointer provenance mismatch
+// EXPECTED: compile error
+
+struct A { u32 x; u32 y; }
+struct B { u32 a; u32 b; }
+
+void main() {
+    A s;
+    *u32 p = &s.x;  // provenance = A.x
+    *B wrong = @container(*B, p, a);  // p has provenance A, not B — must be rejected
+}

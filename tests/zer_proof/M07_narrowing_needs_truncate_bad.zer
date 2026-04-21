@@ -1,0 +1,9 @@
+// Iris theorem: narrowing_requires_explicit_truncate
+// Covers row: M07 — compound narrowing requires @truncate
+// EXPECTED: compile error
+
+void main() {
+    u8 x = 0;
+    u32 y = 300;
+    x += y;  // narrowing u32 → u8 without @truncate — must be rejected
+}

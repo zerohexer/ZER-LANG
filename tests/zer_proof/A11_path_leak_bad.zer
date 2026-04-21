@@ -1,0 +1,15 @@
+// Iris theorem: path_merge_two_copies_contradicts (iris_leak.v)
+// Covers row: A11 — not freed on all paths
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        u32 cond = 1;
+        if (cond > 0) { tasks.free(h); }
+        // else: not freed — leak on that path
+    }
+}

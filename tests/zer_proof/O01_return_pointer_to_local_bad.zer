@@ -1,0 +1,10 @@
+// Iris theorem: no_return_local_pointer (iris_mmio_cast_escape.v)
+// Covers row: O01 — return pointer to local
+// EXPECTED: compile error
+
+*u32 dangling() {
+    u32 x = 42;
+    return &x;  // local addr escapes — must be rejected
+}
+
+void main() { }

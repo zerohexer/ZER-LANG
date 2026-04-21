@@ -63,7 +63,9 @@ tests/zer_proof/
 
 **Cost:** ~30 min per theorem × ~55 theorems = 20-30 hours total. High value.
 
-**Status:** not started. Should precede Level 3 VST.
+**Status (2026-04-21):** **106 tests landed**, one per major theorem. All 105 `_bad.zer` correctly rejected by the compiler; 1 `_no_uaf.zer` positive test verifies the safe pattern compiles. Coverage spans all sections A-T. See `tests/zer_proof/README.md` for the full list.
+
+The correctness-oracle loop is now CLOSED for all major theorems: any compiler regression that accepts a violating program fails the matching test, and the test name (e.g., `A06_no_double_free_bad`) tells you which Iris theorem was violated.
 
 ## The build
 

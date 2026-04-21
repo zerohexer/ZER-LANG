@@ -1,0 +1,8 @@
+// Iris theorem: cast_intrinsic_shapes_checked
+// Covers row: J05-J10 — @bitcast requires same width
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 42;
+    u8 y = @bitcast(u8, x);  // width mismatch 32→8 — must be rejected
+}

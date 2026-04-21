@@ -1,0 +1,10 @@
+// Iris theorem: no_sync_in_packed_struct
+// Covers row: E08 — sync primitive in packed struct
+// EXPECTED: compile error
+
+packed struct Bad {
+    Barrier b;  // pthread primitive in packed = alignment violation
+    u8 flag;
+}
+
+void main() { }

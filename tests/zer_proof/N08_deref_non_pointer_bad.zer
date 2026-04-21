@@ -1,0 +1,8 @@
+// Iris theorem: deref_requires_pointer
+// Covers row: N08 — cannot dereference non-pointer
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 5;
+    u32 y = x[0];  // u32 isn't indexable — must be rejected
+}

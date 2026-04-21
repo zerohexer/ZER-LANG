@@ -1,0 +1,9 @@
+// Iris theorem: container_intrinsics_well_typed
+// Covers row: K03 — @offset on nonexistent field
+// EXPECTED: compile error
+
+struct Point { u32 x; u32 y; }
+
+void main() {
+    u32 o = @offset(Point, z);  // no field 'z' — must be rejected
+}

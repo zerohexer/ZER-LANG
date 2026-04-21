@@ -1,0 +1,7 @@
+// Iris theorem: comptime_evaluator_sound
+// Covers row: R04/R05 — static_assert failed
+// EXPECTED: compile error
+
+static_assert(1 == 2, "this always fails");
+
+void main() { }

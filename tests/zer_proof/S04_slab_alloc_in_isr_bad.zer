@@ -1,0 +1,12 @@
+// Iris theorem: alloc_banned_in_isr_critical
+// Covers row: S04 — slab.alloc() in interrupt handler
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+interrupt USART1 {
+    ?Handle(Task) mh = tasks.alloc();  // must be rejected — malloc in ISR
+}
+
+void main() { }

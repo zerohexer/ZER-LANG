@@ -1,0 +1,12 @@
+// Iris theorem: cast_after_free_impossible (iris_derived.v)
+// Covers row: A04 — UAF in cast
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void main() {
+    *Task t = tasks.alloc_ptr() orelse return;
+    tasks.free_ptr(t);
+    *opaque o = @ptrcast(*opaque, t);  // cast after free — must be rejected
+}

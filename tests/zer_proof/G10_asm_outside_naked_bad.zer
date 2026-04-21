@@ -1,0 +1,7 @@
+// Iris theorem: naked_function_body_restricted
+// Covers row: G10 — asm only in naked functions
+// EXPECTED: compile error
+
+void main() {
+    asm { "nop" };  // not naked — must be rejected
+}

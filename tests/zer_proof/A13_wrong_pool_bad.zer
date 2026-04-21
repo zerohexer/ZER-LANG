@@ -1,0 +1,15 @@
+// Iris theorem: pool_id tag in alive_handle resource
+// Covers row: A13 — handle from pool A, used on pool B
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+struct Job  { u32 n; }
+Pool(Task, 4) tasks;
+Pool(Job, 4)  jobs;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        jobs.free(h);  // wrong pool — must be rejected
+    }
+}

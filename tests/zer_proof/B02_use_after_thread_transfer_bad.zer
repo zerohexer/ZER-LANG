@@ -1,0 +1,17 @@
+// Iris theorem: use_after_thread_transfer_impossible
+// Covers row: B02 — use after transfer to thread
+// EXPECTED: compile error
+
+move struct Token { u32 kind; }
+shared struct S { u32 flag; }
+S g;
+
+void worker(*S s, Token t) { s.flag = t.kind; }
+
+void main() {
+    Token tk;
+    tk.kind = 1;
+    ThreadHandle th = spawn worker(&g, tk);  // tk transferred to thread
+    u32 x = tk.kind;  // must be rejected — tk no longer owned
+    th.join();
+}

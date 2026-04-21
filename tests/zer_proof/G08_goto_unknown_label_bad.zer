@@ -1,0 +1,7 @@
+// Iris theorem: goto_labels_well_formed
+// Covers row: G08 — goto target not found
+// EXPECTED: compile error
+
+void main() {
+    goto nowhere;  // unknown label — must be rejected
+}

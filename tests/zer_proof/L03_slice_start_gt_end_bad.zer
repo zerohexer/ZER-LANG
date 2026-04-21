@@ -1,0 +1,8 @@
+// Iris theorem: bounds_safety_compile_or_runtime
+// Covers row: L03 — slice start > end
+// EXPECTED: compile error
+
+void main() {
+    u32[10] arr;
+    [*]u32 s = arr[5..2];  // start > end — must be rejected
+}

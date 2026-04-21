@@ -1,0 +1,8 @@
+// Iris theorem: int_ptr_conversions_require_intrinsic
+// Covers row: J02 — int→ptr without @inttoptr
+// EXPECTED: compile error
+
+void main() {
+    u32 addr = 0x1000;
+    *u32 p = (*u32)addr;  // C-style cast int → ptr — must be rejected
+}

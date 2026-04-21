@@ -1,0 +1,15 @@
+// Iris theorem: move_inside_loop_cross_iteration
+// Covers row: B03 — move inside loop across iterations
+// EXPECTED: compile error
+
+move struct Token { u32 kind; }
+
+void consume(Token t) { }
+
+void main() {
+    Token tk;
+    tk.kind = 1;
+    for (u32 i = 0; i < 3; i += 1) {
+        consume(tk);  // 2nd iteration = use after move
+    }
+}

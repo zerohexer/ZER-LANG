@@ -1,0 +1,9 @@
+// Iris theorem: non_null_requires_initializer (iris_typing_rules.v)
+// Covers row: N01 — non-null *T requires initializer
+// EXPECTED: compile error
+
+struct Task { u32 id; }
+
+*Task ptr;  // non-null *T without initializer — must be rejected
+
+void main() { }

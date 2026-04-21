@@ -1,0 +1,14 @@
+// Iris theorem: spawn_banned_in_isr
+// Covers row: C03 — spawn in interrupt handler
+// EXPECTED: compile error
+
+shared struct S { u32 x; }
+S g;
+
+void worker(*S c) { c.x = 1; }
+
+interrupt USART1 {
+    spawn worker(&g);  // spawn in ISR — must be rejected
+}
+
+void main() { }

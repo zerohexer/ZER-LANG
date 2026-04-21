@@ -1,0 +1,11 @@
+// Iris theorem: switch_exhaustiveness_enforced_by_typing
+// Covers row: Q01 — switch on bool must handle both
+// EXPECTED: compile error
+
+void main() {
+    bool b = true;
+    switch (b) {
+        true => { return; }
+        // false missing — must be rejected
+    }
+}

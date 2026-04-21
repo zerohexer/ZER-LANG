@@ -1,0 +1,8 @@
+// Iris theorem: no_shared_move
+// Covers row: B06 — move struct as shared struct field
+// EXPECTED: compile error
+
+move struct Token { u32 kind; }
+shared struct Bad { Token t; }  // move in shared = impossible
+
+void main() { }

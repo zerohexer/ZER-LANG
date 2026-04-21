@@ -1,0 +1,12 @@
+// Iris theorem: switch_exhaustiveness_enforced_by_typing
+// Covers row: Q03 — switch on integer must have default
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 5;
+    switch (x) {
+        0 => { return; }
+        1 => { return; }
+        // no default — must be rejected
+    }
+}

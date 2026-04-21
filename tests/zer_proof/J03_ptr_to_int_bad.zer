@@ -1,0 +1,9 @@
+// Iris theorem: int_ptr_conversions_require_intrinsic
+// Covers row: J03 — ptr→int without @ptrtoint
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 5;
+    *u32 p = &x;
+    u32 addr = (u32)p;  // C-style cast ptr → int — must be rejected
+}

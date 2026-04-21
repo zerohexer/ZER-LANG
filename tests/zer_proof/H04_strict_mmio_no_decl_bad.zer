@@ -1,0 +1,9 @@
+// Iris theorem: strict_mmio_requires_declarations
+// Covers row: H04 — @inttoptr requires mmio declarations
+// EXPECTED: compile error (strict mode, no mmio block)
+
+// NO mmio declaration block
+
+void main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40000000);  // must be rejected
+}

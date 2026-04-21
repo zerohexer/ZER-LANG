@@ -1,0 +1,9 @@
+// Iris theorem: division_safety_via_vrp_or_trap
+// Covers row: M02 — divisor not proven nonzero
+// EXPECTED: compile error
+
+u32 bad_div(u32 x, u32 d) {
+    return x / d;  // d not proven nonzero — must be rejected
+}
+
+void main() { }

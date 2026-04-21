@@ -1,0 +1,10 @@
+// Iris theorem: condition_must_be_bool
+// Covers row: N07 — if condition must be bool (or optional)
+// EXPECTED: compile error
+
+void main() {
+    u32 x = 5;
+    if (x) {  // u32, not bool and not optional — must be rejected
+        return;
+    }
+}

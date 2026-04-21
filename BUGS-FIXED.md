@@ -126,6 +126,44 @@ verification files (handle_state + range_checks + 3 demonstrators) pass
 
 **Honest count after 3rd batch: 7 Level-3-verified compiler functions.**
 
+### Fourth batch — type kind predicates (2026-04-21)
+
+Extracted 7 type-kind predicates to `src/safety/type_kind.c`:
+- `zer_type_kind_is_integer(int kind)` — U8..U64, USIZE, I8..I64, ENUM
+- `zer_type_kind_is_signed(int kind)` — I8..I64, ENUM
+- `zer_type_kind_is_unsigned(int kind)` — U8..U64, USIZE
+- `zer_type_kind_is_float(int kind)` — F32, F64
+- `zer_type_kind_is_numeric(int kind)` — integer OR float (inlined for VST simplicity)
+- `zer_type_kind_is_pointer(int kind)` — POINTER, OPAQUE
+- `zer_type_kind_has_fields(int kind)` — STRUCT, UNION
+
+Wired all 5 existing `type_is_*` functions in types.c (is_integer,
+is_signed, is_unsigned, is_float, is_numeric) to delegate to the
+VST-verified predicates. `type_is_numeric` implementation changed
+from calling `type_is_integer || type_is_float` to a single call to
+`zer_type_kind_is_numeric` — cleaner and verifiably correct.
+
+### VST proof design — numeric inlined instead of delegated
+
+Initial attempt had `zer_type_kind_is_numeric` call the other two
+predicates. VST required explicit postcondition for `forward_if`
+after each function call. Simplified by INLINING the integer+float
+cases in the C and matching in the Coq spec. Uniform proof pattern
+across all 7 predicates (`repeat forward_if; forward; unfold; destruct;
+try lia; try entailer!`).
+
+Lesson for future extractions: when a predicate composes multiple
+predicates, either:
+(a) inline the cases (clearer VST proof, trivial)
+(b) use `forward_call` + explicit `forward_if Post` (harder proof)
+
+Prefer (a) when cases are small (≤15 enum values). Use (b) when
+the composed predicate has many branches and inlining would
+duplicate significant code.
+
+**Honest count after 4th batch: 14 Level-3-verified compiler functions.**
+Phase 1 progress: 14/44 = 32%.
+
 ### Decision — commit to seL4-level full verification (2026-04-21)
 
 After architectural discussion covering:

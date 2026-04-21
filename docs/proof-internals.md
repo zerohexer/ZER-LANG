@@ -311,6 +311,34 @@ proofs/vst/
 
 Progress tracking: each verified real-code function counts once in `src/safety/*.c`. `make check-vst` should print the count.
 
+### Composed predicates — inline vs forward_call
+
+When a predicate's C implementation calls OTHER verified predicates
+(e.g., `zer_type_kind_is_numeric` calling `is_integer` then `is_float`),
+VST's `forward_if` after each `forward_call` requires an explicit
+postcondition:
+
+```
+Error: Tactic failure: Use [forward_if Post] to prove this if-statement,
+where Post is the postcondition of both branches
+```
+
+**Workarounds (prefer option A for small cases):**
+
+**(A) Inline the cases** — best for ≤15 enum values. Duplicate the
+    compared cases directly in the C, match the cascade in the Coq
+    spec. Uniform proof pattern `repeat forward_if; forward; unfold;
+    destruct; try lia; try entailer!` works.
+
+**(B) forward_call + explicit Post** — needed for large predicates
+    where inlining would duplicate 30+ lines. Write
+    `forward_call k; forward_if (PROP () LOCAL (...) SEP ())` with
+    the right postcondition. Much harder but scales.
+
+Example of (A): `zer_type_kind_is_numeric` in src/safety/type_kind.c
+inlines all 10 integer cases + 2 float cases rather than calling
+`is_integer` then `is_float`.
+
 ### VST proof pattern for `==` chains — auto-subst gotcha
 
 When the C function has `if (x == N) return ...;` (equality with constant), VST 3.0's `forward_if` auto-`subst`s `x := N` in the then-branch. The Coq WITH-bound variable `x` literally disappears from scope.

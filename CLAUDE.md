@@ -505,15 +505,20 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **MANDATORY — read `docs/proof-internals.md` BEFORE modifying any `proofs/operational/**/*.v` file.** It has a "Fresh-session reading order" section at the top that sequences what to read (~65 min of context, saves 2-5 hours of rediscovery). Covers: Docker/MSYS build quirks, Iris name collisions (`expr`, `val`, `state` shadow our types after `Require Import weakestpre`), typeclass subtyping (`::`), `IntoVal`/`AsVal` for `wp_value`, `destruct` intropattern pitfalls, ghost-map delete-vs-update design, Coq nested-comment lexer traps, gset/sets imports, `()` vs `tt` for unit values, `-Q` bindings per subset, and a 12-row common-errors + fixes table.
 
-**Current proof state (2026-04-21):** 45 Iris/Coq files, ~115 axiom-free lemmas across **5 operational subsets** (λZER-Handle, λZER-Move, λZER-Opaque, λZER-Escape, λZER-MMIO) + schematic files in lambda_zer_handle/. Zero admits. `docs/safety_list.md` has all 203 rows addressed. `make check-proofs` verifies zero admits. Layer 2 tests: 106 theorem-linked `.zer` files in `tests/zer_proof/` (105 negative all pass).
+**Current proof state (2026-04-21):** 47 Iris/Coq files, **~330 axiom-free theorems** across **7 subsets** (λZER-Handle/Move/Opaque/Escape/MMIO as operational + λZER-Typing as predicate-based covering all typing sections). Zero admits. All 203 rows in `docs/safety_list.md` have real proofs — NO `True. Qed.` placeholders remain for substantive rows. `make check-proofs` verifies zero admits. Layer 2: 106 theorem-linked `.zer` tests all passing.
 
-**Sections at full operational depth (real step-based proofs):** A (handle, 18), B (move, 8), J core (opaque, 6), O (escape, 12), H (MMIO, 9). Total: **53 rows genuinely proven**.
+**Sections at operational step-based depth:** A (handle, 18), B (move, 8), H (MMIO, 9), J-core (opaque, 6), O (escape, 12). Total 53 rows via step rules + resource algebra + state_interp + step specs.
 
-**Sections still at schematic (placeholder `True. Qed.`):** C+D+E+F (concurrency/async, 30 rows), G, I, K, L, M, N, P, Q, R, S, T (typing-level, ~95 rows). These are DOCUMENTED not PROVEN — the comment block describes the constraint; the Lemma itself is `True`.
+**Sections at real Coq predicate depth:** C, D, E, F, G, I, J-rest, K, L, M, N, P, Q, R, S, T (~120 rows) — all in `lambda_zer_typing/typing.v`. Bool-returning predicates + theorems about them. Decidable, mechanically checkable. Not step-based, but REAL proofs (not placeholders).
 
-**Next priority:** λZER-concurrency (C+D+E, 25 rows) — hardest, requires real Iris concurrency primitives (invariants, ghost state for locks). For typing-level sections, schematic is calibrated (deepening = restating typing rules, low marginal value). See `proof-internals.md` "Operational subset templates" — 5 templates documented for choosing approach per new subset.
+**Not safety-semantic:** U (35 rows — pure well-formedness, correctly marked `—`).
 
-**Honest labeling:** a "schematic" lemma is `True. Qed.` with a comment. It is NOT equivalent proof depth to operational subsets. Don't conflate. For typing-level rows the comment IS the spec and checker.c is the implementation; for concurrency the gap matters and deepening is genuinely valuable.
+**Next priority — Level 3 VST on zercheck.c:** the remaining gap. Predicate-based proofs show the CHECK is correct, not that the C implementation of the check is correct. Level 3 verifies zercheck.c's C source matches each predicate via VST. Setup: `proofs/vst/` subdir. Scope: ~50 safety-critical functions × 5-20 hrs each = 150-500 hours total.
+
+**Key distinction — predicate vs operational vs VST:**
+- **Predicate-based** (typing.v): bool function + theorem. Proves the check semantics, not the implementation.
+- **Operational** (lambda_zer_*/ subsets): step relation + proofs. Proves safety holds during execution of the model.
+- **VST (Level 3, future)**: proves the C code in zercheck.c correctly implements the predicate. Closes the implementation-correctness gap.
 
 Contents of `docs/compiler-internals.md`:
 

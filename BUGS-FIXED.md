@@ -5,6 +5,113 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (lambda_zer_typing + 135 real theorems) — upgrading schematic to predicate-based
+
+Replacing `True. Qed.` schematic closures across all non-operational
+typing-level sections (G, I, K, L, M, N, P, Q, R, S, T + C/D/E/F
++ J02-J10) with real Coq proofs using the predicate-based pattern.
+Created `lambda_zer_typing/typing.v` with 135 theorems. Found
+several small patterns worth recording.
+
+### `subst` direction — eliminates whichever variable is on the LHS
+
+**Symptom:** `Error: The variable i was not found in the current
+environment` after `apply Nat.eqb_eq in Heqp. subst.`
+
+**Root cause:** `Nat.eqb_eq : (a =? b) = true ↔ a = b`. After
+`apply Nat.eqb_eq in Heqp`, Heqp has the form `n0 = i` (or `i = n0`
+depending on which side was the Nat.eqb argument — it's `x = y`
+where the =? was `x =? y`). Then `subst` eliminates the variable on
+the LHS. If Heqp was `n0 = i`, `subst` replaces i with n0, and i
+is gone. If our later code needs `i`, it fails.
+
+**Fix:** be explicit about which variable to substitute:
+```coq
+apply Nat.eqb_eq in Heqp.
+(* Heqp : n0 = i OR i = n0 — check direction *)
+subst n0.   (* substitute n0 := i, keeping i *)
+(* or: subst i. — substitute i := n0, keeping n0 *)
+```
+
+Tip: use `symmetry in Heqp` first if the equation is in the wrong
+direction, then `subst <var-to-eliminate>`.
+
+### `solve_decision` fails on recursive-self inductives
+
+**Symptom:** `Error: No applicable tactic` when trying
+`#[global] Instance ty_eq_dec : EqDecision ty. Proof. solve_decision. Defined.`
+
+**Root cause:** Inductive types with `list Self` or similar
+recursive cases (e.g., `UnionT : list ty -> ty`) don't have
+auto-derivable EqDecision via stdpp's `solve_decision`. The tactic
+can't generate the induction scheme on the list-of-self.
+
+**Fix options:**
+1. **Skip the instance** if you don't need decidable equality (we did
+   this — `ty_eq_dec` wasn't used by any theorem).
+2. **Write it manually** via induction + list_eq_dec for the
+   recursive cases. ~20-30 lines for a moderately-sized type.
+3. **Use `dec_eq`** from stdpp if available for your specific case.
+
+Documented in typing.v: "No EqDecision for `ty` — the recursive
+UnionT case would need manual induction. The theorems below don't
+require decidable equality on types."
+
+### Unfold order for `rewrite` to find subterm
+
+**Symptom:** `Found no subterm matching "...&& false" in the current
+goal` after `rewrite Hdst. rewrite andb_false_r.`
+
+**Root cause:** The goal after rewriting Hdst has the form
+`implb true X && implb true false = false`, but `andb_false_r`
+expects `_ && false`. The order is wrong — or the expected form
+hasn't been simplified.
+
+**Fix:** add an explicit `simpl` step or use `unfold` before the
+rewrites to put the goal in the expected form:
+```coq
+unfold cast_safe, qual_le, qual_volatile. simpl.
+rewrite Hdst. simpl. reflexivity.
+```
+
+General rule: `rewrite` is sensitive to the exact syntactic form.
+Add `simpl` to normalize before rewriting if patterns don't match.
+
+### Helper lemma `in_seq_nat` needed for enum-exhaustiveness proof
+
+**Pattern (not a bug):** to prove every index < n appears in the
+list `seq_nat n = [0, 1, ..., n-1]`, you need a separate lemma
+`in_seq_nat n i : i < n → In i (seq_nat n)` by induction on n.
+
+```coq
+Lemma in_seq_nat n i : i < n → In i (seq_nat n).
+Proof.
+  revert i. induction n as [|n IH]; intros i Hlt; simpl; [lia|].
+  destruct (decide (i = 0)) as [->|Hne]; [left; reflexivity|].
+  right. apply in_map_iff. exists (i - 1). split; [lia|].
+  apply IH. lia.
+Qed.
+```
+
+General pattern: when proving `forall i < n, P i` over a list-derived
+predicate, first prove `forall i < n, In i list` as a helper.
+
+### Large nat literals trigger abstract-large-number warning
+
+**Symptom:** warning (not error) `Warning: To avoid stack overflow,
+large numbers in nat are interpreted as applications of
+Init.Nat.of_num_uint. [abstract-large-number,numbers,default]`
+
+**Root cause:** Coq's default nat representation is unary (S (S ...
+(S 0))), which stack-overflows for large values like 1000000.
+Coq auto-abstracts to an efficient binary form but warns.
+
+**Fix:** harmless warning, ignore. If you care about eliminating:
+use `Z` instead of `nat` for large constants, or keep `nat` and
+accept the warning.
+
+---
+
 ## Session 2026-04-21 (lambda_zer_opaque + escape + mmio subsets) — template patterns + recurring traps
 
 Three more subset directories (`lambda_zer_opaque/`, `lambda_zer_escape/`,

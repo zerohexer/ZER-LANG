@@ -183,6 +183,108 @@ Language infrastructure:
 - `iris_lang.v` — Canonical language instance for λZH_lang
 - `iris_smoke.v` — Iris imports + basic BI sanity
 
+## Level 3 — VST verification of C implementations
+
+**Location:** `proofs/vst/` — separate from `proofs/operational/`.
+
+**Docker image:** `zer-vst` — coqorg/coq:8.18 + coq-iris 4.2 + coq-stdpp 1.10 + **coq-vst 3.0beta2** + coq-vst-zlist + CompCert `clightgen` 3.13.
+
+**Build:**
+```bash
+make check-vst-image    # one-time, ~5 min
+make check-vst          # compile + verify all VST proofs
+```
+
+**File structure per function verified:**
+```
+proofs/vst/
+  <func>_src.c           # C source (extracted from zercheck/emitter or standalone)
+  <func>_src.v           # clightgen-generated Coq Clight AST (GENERATED — in .gitignore)
+  verif_<func>.v         # VST spec + proof
+```
+
+### VST 3.0 patterns
+
+**VST 3.0 is Iris-based.** `funspec` takes an implicit `Σ : gFunctors` argument. For simple proofs without custom ghost state, use the precompiled `VST.floyd.compat`:
+
+```coq
+Require Import VST.floyd.proofauto.
+Require Import VST.floyd.compat.    (* precompiled in zer-vst image *)
+Require Import zer_vst.simple_check.
+
+#[export] Instance CompSpecs : compspecs. make_compspecs prog. Defined.
+Definition Vprog : varspecs. mk_varspecs prog. Defined.
+```
+
+`VST.floyd.compat` provides `Notation funspec := (@funspec (VSTΣ unit))` — specializes to no ghost state or external calls. Not compiled by default in the opam install — the Docker `RUN coqc` step precompiles it.
+
+### Standard spec pattern
+
+```coq
+Definition foo_spec : ident * funspec :=
+ DECLARE _foo
+  WITH arg : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= arg <= Int.max_signed)   (* range check *)
+    PARAMS (Vint (Int.repr arg))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (foo_coq arg)))           (* matches Coq spec *)
+    SEP ().
+```
+
+`Int.min_signed <= arg <= Int.max_signed` is the C-int range (needed for VST's int-representation lemmas).
+
+### Standard proof pattern
+
+For simple if-else functions:
+```coq
+Lemma body_foo: semax_body Vprog Gprog f_foo foo_spec.
+Proof.
+  start_function.
+  forward_if;                                         (* handle if-branch *)
+    forward;                                           (* emit return *)
+    unfold foo_coq;                                    (* unfold Coq spec *)
+    destruct (Z.eq_dec arg VALUE); try contradiction;  (* case-split *)
+    try subst; try contradiction;
+    entailer!.                                         (* discharge goal *)
+Qed.
+```
+
+The combined `forward_if; forward; ...; entailer!` closes both branches at once — VST's goal structure for if-else is often confusing when handled separately.
+
+### Common VST errors and fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Cannot infer the implicit parameter Σ of funspec` | VST 3.0 Iris-based; `funspec` needs Σ | Import `VST.floyd.compat` for the `(VSTΣ unit)`-specialized version |
+| `Cannot find a physical path bound to logical path VST.floyd.compat` | compat.v not precompiled | Dockerfile precompiles it: `coqc -Q ... VST compat.v` |
+| `No such goal. Focus next goal with bullet -` | forward_if produced different goal count than expected | Don't use bullets/braces — use `forward_if; forward; ...` one-liner |
+| `No such contradiction` | `destruct` case where `contradiction` hypothesis isn't visible yet | Rearrange: `destruct first; try subst; try contradiction` |
+| `Custom entry dfrac has been overridden` | Harmless Iris warning on every file | Ignore |
+| `The following notations have been disabled: Notation 'True'` | Iris overrides Coq's `True`/`False` | Ignore — inside proofs use `True%I` / `False%I` for BI |
+
+### What Level 3 proves (vs Level 1, Level 2)
+
+**Level 1** (Coq/Iris predicates in `lambda_zer_*/` and `lambda_zer_typing/`): proves the safety ARGUMENT is sound. Abstract math.
+
+**Level 2** (tests in `tests/zer_proof/`): empirically verifies the compiler rejects specific known violations. Fast, covers known patterns.
+
+**Level 3** (VST in `proofs/vst/`): proves the C IMPLEMENTATION of a check matches its Coq predicate for EVERY input. Mechanical certainty over the entire input space.
+
+A bug that Level 1 can't catch but Level 3 does: zercheck's C source has a typo `if (state = 1)` (assignment, not comparison). Level 1's spec is correct; Level 2 might miss this if tests don't cover the right pattern; Level 3 fails the proof because the C control flow doesn't match the predicate.
+
+### Verification strategy
+
+For "complete coverage" of zercheck.c / emitter.c safety code:
+- Extract each safety-critical C function into a standalone file (avoids the 6000+ line zercheck.c's interdependencies)
+- Pair with VST spec matching predicate in `lambda_zer_typing/typing.v`
+- Scale estimate: ~50 functions × 5-20 hrs/func = 150-500 hrs total
+- Process: batch simple pure functions first (extract + verify fast), handle complex (loops, malloc) case by case
+
+Progress tracking: each proved function adds a `verif_<func>.vo` to `proofs/vst/`. `make check-vst` counts and reports.
+
 ### All typing-level sections now covered by real Coq proofs
 
 **lambda_zer_typing/typing.v is the home for non-operational typing-level proofs.** 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. Each section defines its predicate + proves theorems about it. No `True. Qed.` placeholders remain for substantive rows.

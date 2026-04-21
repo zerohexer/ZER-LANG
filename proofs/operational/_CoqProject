@@ -19,4 +19,6 @@ lambda_zer_handle/iris_leak.v
 lambda_zer_handle/iris_func_spec.v
 lambda_zer_handle/iris_loop.v
 lambda_zer_handle/iris_derived.v
+lambda_zer_handle/iris_move.v
+lambda_zer_handle/iris_container_validity.v
 lambda_zer_handle/iris_demo.v

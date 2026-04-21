@@ -183,19 +183,46 @@ Language infrastructure:
 - `iris_lang.v` — Canonical language instance for λZH_lang
 - `iris_smoke.v` — Iris imports + basic BI sanity
 
-### Schematic vs operational depth
+### All typing-level sections now covered by real Coq proofs
 
-This is the MOST IMPORTANT distinction when reading the proofs.
+**lambda_zer_typing/typing.v is the home for non-operational typing-level proofs.** 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. Each section defines its predicate + proves theorems about it. No `True. Qed.` placeholders remain for substantive rows.
 
-**Operational depth** (section A only):
-- Resource algebra defined (`alive_handle γ p i g : iProp`)
+Pattern used throughout typing.v:
+```coq
+Definition check_X_valid (inputs) : bool := ... .
+
+Theorem X_ok : check_X_valid valid_input = true.
+Proof. reflexivity. Qed.  (* or computation *)
+
+Theorem X_bad_rejected : condition → check_X_valid bad = false.
+Proof. ... . Qed.
+```
+
+Each theorem is decidable (bool predicate) and mechanically checkable — the compiler can implement the predicate.
+
+When adding a new typing-level row: follow the pattern in the closest section. Most are "define bool-returning predicate, prove ok-case + reject-case." Takes 5-15 minutes per row once you have the template.
+
+### Schematic vs operational vs predicate-based
+
+Three proof depths exist in the codebase:
+
+**Operational depth** (sections A, B, H, J-core, O):
+- Resource algebra defined (`alive_handle γ p i g : iProp`, etc.)
 - State interpretation connecting ghost state to concrete state
 - fupd-style step specs tying Iris resources to semantics.v's step relation
-- Direct proof of safety via resource discipline
+- Direct proof of safety via resource discipline on step rules
 
-**Schematic depth** (all other sections):
-- Closure lemma (often `Lemma foo : True. Proof. exact I. Qed.`)
-- Comment block documenting the compiler-side enforcement mechanism
+**Predicate-based depth** (most other sections — in `lambda_zer_typing/typing.v`):
+- bool-returning predicate defining the check
+- Real theorems proving the predicate accepts/rejects correctly
+- Decidability implicit (bool = computable)
+- NO step rules / no ghost state — pure typing content
+
+**Schematic depth** (deprecated — no rows remain here):
+- Used to be `Lemma foo : True. Proof. exact I. Qed.`
+- All replaced with predicate-based (typing.v) or operational (subset).
+- If you see a `True. Qed.` still, it's either historical OR a
+  section-summary lemma, not a safety theorem.
 - Reference to which checker.c / emitter.c pass implements the rule
 - Does NOT prove the Iris property operationally — the safety CONTENT is expressed by the lemma's STATEMENT being a true invariant of well-typed programs
 

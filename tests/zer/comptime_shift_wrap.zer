@@ -1,0 +1,26 @@
+// Regression for Gemini audit Finding 5 (2026-04-21)
+// ZER semantics: shift by >= width wraps to 0 (per type width).
+// BIT(40) for u32 should return 0, not 2^40.
+// Before fix: comptime evaluated in int64, emitted 1099511627776,
+// GCC truncated with warning. Now masked to target type width.
+
+comptime u32 BIT(u32 n) {
+    return 1 << n;
+}
+
+// Use static_assert for compile-time verification — no runtime needed.
+const u32 BIT40 = BIT(40);
+static_assert(BIT40 == 0, "BIT(40) for u32 must wrap to 0");
+
+// Also check mid-width cases wrap correctly
+const u32 BIT32 = BIT(32);
+static_assert(BIT32 == 0, "BIT(32) for u32 must wrap to 0");
+
+const u32 BIT31 = BIT(31);
+static_assert(BIT31 == 2147483648, "BIT(31) for u32 must be 0x80000000");
+
+u32 main() {
+    const u32 X = BIT(40);
+    if (X != 0) { return 1; }
+    return 0;
+}

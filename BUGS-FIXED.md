@@ -210,6 +210,95 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Gemini red-team audit — 4 real bugs fixed (2026-04-21)
+
+User ran a pre-Level-3-continuation Gemini audit. 7 findings; 4 were real
+bugs that existed in compiler source and would have been frozen into VST
+specs if we'd extracted without fixing first. Fixed all before continuing.
+
+**BUG (Gemini F5) — comptime shift wider than target type**
+- `comptime u32 BIT(u32 n) { return 1 << n; }` called with n=40 returned
+  int64 value 1099511627776 (2^40). Emitted as `_zer_t0 = 1099511627776`
+  assigned to `uint32_t`. GCC silently truncated; programmer's mental
+  model ("shift by >= width = 0") diverged from emitted code.
+- Root cause: `eval_const_expr_subst` in checker.c:1681 evaluates shifts
+  in int64 host space. Bound check was `r >= 63` (for int64), ignoring
+  the target type's declared width.
+- Fix: at comptime call resolution (checker.c ~line 4430), mask the
+  int64 result by `(1 << width) - 1` using the function's return type.
+  For u32 types, width=32, mask=0xFFFFFFFF. For multiples of 2^32
+  (like 2^40), this gives 0 — correct per ZER's wrap semantics.
+- Test: `tests/zer/comptime_shift_wrap.zer` — static_asserts on
+  BIT(40)==0, BIT(32)==0, BIT(31)==0x80000000.
+
+**BUG (Gemini F3) — escape via struct field (local array → slice field)**
+- Pattern:
+  ```
+  struct Leak { [*]u8 data; }
+  Leak exploit() {
+      u8[10] local_buf;
+      Leak l;
+      l.data = local_buf;   // array→slice coerce, .ptr to stack
+      return l;             // returned struct carries dangling ptr
+  }
+  ```
+- Root cause: `l.data = local_buf` assigned a LOCAL ARRAY to a slice
+  field. `local_buf` has `is_local_derived=false` (it IS the local, not
+  derived from one), so `propagate_escape_flags(tsym=l, src=local_buf)`
+  does nothing. The return-escape check at NODE_RETURN walks field
+  chains and checks `tsym->is_local_derived` — which was false. Result:
+  accepted with no error. Stack memory lifetime extends past return.
+- Fix: in checker.c NODE_ASSIGN (~line 3014), when target is
+  NODE_FIELD/INDEX and source is a LOCAL ARRAY (not global, not static,
+  type is TYPE_ARRAY), explicitly mark root symbol as is_local_derived.
+  The existing return-escape check then rejects `return l`.
+- Test: `tests/zer_fail/escape_via_struct_field.zer`.
+
+**BUG (Gemini F7) — fixed-point iteration fails-open**
+- `zercheck_ir.c:2389` had `while (changed && iterations < 32)` with NO
+  check afterward. If the lattice didn't converge within 32 iterations
+  (pathological program, deep nesting, 33+ backward gotos), the loop
+  exited with `changed=true` and the compiler proceeded with partial
+  state. A handle might end up ALIVE when correct analysis would say
+  MAYBE_FREED — silent UAF leak.
+- Fix: extract `MAX_ITERATIONS` constant; after the loop, if `changed
+  && iterations >= MAX_ITERATIONS`, emit `ir_zc_error` saying the
+  analysis didn't converge. Fail-closed. Refuse to compile rather than
+  miss a UAF.
+- No targeted test (hard to naturally construct a 33+ iteration
+  program); correctness via the fail-closed guarantee.
+
+**NOT-A-BUG findings**:
+- **F1 (inter-statement deadlock)** — BUG-464 design (emitter never
+  holds nested locks across statements). Documented in CLAUDE.md.
+- **F2 (opaque wash)** — Documented design: type_id=0 from cinclude is
+  accepted because "C code is outside ZER's safety boundary." Future
+  `--strict-interop` flag would close it.
+- **F4 (yield in defer via funcptr)** — Constrained by type system:
+  funcptrs have concrete signatures; async-returning funcptrs must be
+  in async context, which the yield-in-defer check still applies to.
+- **F6 (ghost handle via @size)** — NOT a safety bug. GCC's `sizeof`
+  doesn't evaluate its argument at runtime (stmt-expr inside sizeof is
+  compile-time-only). No alloc ever runs → no leak. The pattern is
+  MISLEADING (looks like it allocates) but not unsafe.
+
+### Coq/Iris proofs did not catch these — expected
+
+Our Level 1 Coq proofs say "the RULE is correct." They don't say "the
+compiler IMPLEMENTS the rule everywhere." These 4 bugs live in the
+implementation-spec gap that Level 3 (extract-and-link VST) targets.
+Specifically:
+
+| Bug | What would catch it in the future |
+|---|---|
+| F5 shift | Extracting `zer_shift_constant_eval(width, val, amount)` to `src/safety/shift_eval.c` + VST proof matching typing.v's shift rule |
+| F3 escape | Phase 2 decision extraction of escape-flag propagation — pure predicate applied uniformly instead of inline |
+| F7 iter limit | Phase 4 verified state API for zercheck_ir — invariant "converges in N iterations" becomes a VST-checked postcondition |
+| F6 (not a bug) | N/A — not a safety issue |
+
+Bugs fixed, regression tests added, verification green. Safe to continue
+Phase 1 extraction — the specs now match the fixed behavior.
+
 ### Decision — commit to seL4-level full verification (2026-04-21)
 
 After architectural discussion covering:

@@ -113,20 +113,20 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | D. Shared struct & deadlock | 5 | ✓ (schematic — Iris invariants + lock-order ghost state; `iris_concurrency.v`) |
 | E. Atomic / condvar / barrier / semaphore | 8 | ✓ (schematic — typing + logically-atomic triples; `iris_concurrency.v`) |
 | F. Async / coroutine context | 5 | ✓ (schematic — context flags + state-machine invariants; `iris_concurrency.v`) |
-| G. Control-flow context safety | 12 | ✓ (typing + context-flag enforced; `iris_control_flow.v`) |
+| G. Control-flow context safety | 12 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (G01_return_in_critical_rejected, G02-G05 break/continue, G04_nested_defer_rejected, G10_asm_outside_naked_rejected, G_empty_context_default) |
 | H. MMIO / volatile / hardware | 9 | ✓ **FULL operational** — `lambda_zer_mmio/` subset (stuck-on-violation proofs for out-of-range + unaligned + no-decl) |
 | I. Qualifier preservation (const/volatile) | 11 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (I_strip_const_unsafe, I_strip_volatile_unsafe, I_add_const_safe, I_refl_safe, I_trans_safe) |
 | J. Pointer cast & provenance | 14 | ✓ **FULL operational** — `lambda_zer_opaque/` subset (core provenance rows J01/J04/J11/J12/J13/J14) |
-| K. `@container` / `@offset` / `@size` | 4 | ✓ (typing-enforced; `container_intrinsics_well_typed`) |
-| L. Bounds / indexing / slicing | 11 | ✓ (VRP + runtime trap; `iris_misc_sections.bounds_safety_compile_or_runtime`) |
-| M. Division / arithmetic safety | 10 | ✓ (VRP + typing; `division_safety_via_vrp_or_trap`) |
+| K. `@container` / `@offset` / `@size` | 4 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (K01_container_ptr_ok/_nonptr_rejected, K03_existing_field_ok/_missing_rejected, K04_sized/_void) |
+| L. Bounds / indexing / slicing | 11 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (L01_const_in_bounds/_oob, L02_valid_slice/_end_exceeds, L03_slice_start_gt_end, L06_bit_in_range/_oob) |
+| M. Division / arithmetic safety | 10 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (M01_const_div_by_zero, M02_proven_nonzero, M07_narrowing_needs_truncate, M08_literal_fits) |
 | N. Null / optional safety | 8 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (N02_null_requires_optional, N03_unwrap_needs_optional, N05_no_nested_optional) |
 | O. Escape analysis (dangling) | 12 | ✓ **FULL operational** — `lambda_zer_escape/` subset (region tags RegLocal/RegArena/RegStatic, step rules enforce region match) |
-| P. Union / enum variant safety | 8 | ✓ P04 real Coq proof in `lambda_zer_typing/typing.v` (P04_variant_index_bounded, P04_out_of_range_rejected); other P-rows schematic |
+| P. Union / enum variant safety | 8 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (P01_direct_read_unsafe/_switch_read_safe, P02_no_self_mutation, P04_variant_index_bounded, P05_self_reference_rejected, P06_duplicate_rejected, P07_void_field_rejected, P08_depth_limits) |
 | Q. Switch exhaustiveness | 5 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (Q01_bool_exhaustive_covers_both, Q02_enum_exhaustive_covers_all, Q03_int_switch_requires_default) |
-| R. Comptime / static_assert | 6 | ✓ (evaluator totality; `comptime_evaluator_sound`) |
-| S. Resource limits (stack, ISR alloc) | 5 | ✓ (call-graph + context flags; `stack_limit_via_call_graph_analysis`, `alloc_banned_in_isr_critical`) |
-| T. Container / builtin validity | 7 | ✓ T01 real Coq proof in `lambda_zer_typing/typing.v` (T01_pool_count_positive, T01_pool_zero_rejected); other T-rows schematic in `iris_container_validity.v` |
+| R. Comptime / static_assert | 6 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (R02_const_arg_ok/_runtime_rejected, R04_true_const_ok/_false_rejected, R06_budget, R07_nesting_limit) |
+| S. Resource limits (stack, ISR alloc) | 5 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (S01_under_limit/_over_limit, S02_call_chain, S04_slab_in_isr, S05_slab_in_critical, S_slab_in_main_ok) |
+| T. Container / builtin validity | 7 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (T01_pool_count_positive/_zero_rejected, T02_field_position, T03_variant_position, T04_struct_element/_primitive_rejected) |
 | U. Syntax / declaration (not safety-semantic) | 35 | — (all `—` by construction; compile-time well-formedness) |
 | **Total curated rows** | **203** | |
 | **Total raw predicates covered** | **374** | |

@@ -505,11 +505,15 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **MANDATORY — read `docs/proof-internals.md` BEFORE modifying any `proofs/operational/**/*.v` file.** It has a "Fresh-session reading order" section at the top that sequences what to read (~65 min of context, saves 2-5 hours of rediscovery). Covers: Docker/MSYS build quirks, Iris name collisions (`expr`, `val`, `state` shadow our types after `Require Import weakestpre`), typeclass subtyping (`::`), `IntoVal`/`AsVal` for `wp_value`, `destruct` intropattern pitfalls, ghost-map delete-vs-update design, Coq nested-comment lexer traps, gset/sets imports, `()` vs `tt` for unit values, `-Q` bindings per subset, and a 12-row common-errors + fixes table.
 
-**Current proof state (2026-04-21):** 25 Iris files, 80+ axiom-free lemmas across 2 operational subsets (λZER-Handle, λZER-Move) + 11 schematic files in lambda_zer_handle/. Zero admits. `docs/safety_list.md` has all 203 rows covered — sections A + B at full operational depth, C-T at schematic depth, U non-safety-semantic. `make check-proofs` verifies zero admits.
+**Current proof state (2026-04-21):** 45 Iris/Coq files, ~115 axiom-free lemmas across **5 operational subsets** (λZER-Handle, λZER-Move, λZER-Opaque, λZER-Escape, λZER-MMIO) + schematic files in lambda_zer_handle/. Zero admits. `docs/safety_list.md` has all 203 rows addressed. `make check-proofs` verifies zero admits. Layer 2 tests: 106 theorem-linked `.zer` files in `tests/zer_proof/` (105 negative all pass).
 
-**Next work priority queue (in `proof-internals.md`):** (1) λZER-opaque (J section, provenance), (2) λZER-escape (O, regions), (3) λZER-mmio (H), (4) λZER-concurrency (C+D+E, hardest), (5) λZER-async (F). Also: Layer 2 tests (`tests/zer_proof/*.zer` per theorem) — not yet done, ~20-30 hours.
+**Sections at full operational depth (real step-based proofs):** A (handle, 18), B (move, 8), J core (opaque, 6), O (escape, 12), H (MMIO, 9). Total: **53 rows genuinely proven**.
 
-**Key distinction — schematic vs operational:** schematic lemmas (most sections) are `Lemma foo : True. Proof. exact I. Qed.` with comment blocks documenting compiler-side enforcement. They express "this constraint is a real invariant; enforcement lives in checker.c". Operational lemmas (sections A, B) mechanically derive the invariant from the resource algebra + step rules. Both valid; schematic weaker. See `proof-internals.md` "Schematic vs operational depth" and "Deepening schematic to operational" for upgrade procedure.
+**Sections still at schematic (placeholder `True. Qed.`):** C+D+E+F (concurrency/async, 30 rows), G, I, K, L, M, N, P, Q, R, S, T (typing-level, ~95 rows). These are DOCUMENTED not PROVEN — the comment block describes the constraint; the Lemma itself is `True`.
+
+**Next priority:** λZER-concurrency (C+D+E, 25 rows) — hardest, requires real Iris concurrency primitives (invariants, ghost state for locks). For typing-level sections, schematic is calibrated (deepening = restating typing rules, low marginal value). See `proof-internals.md` "Operational subset templates" — 5 templates documented for choosing approach per new subset.
+
+**Honest labeling:** a "schematic" lemma is `True. Qed.` with a comment. It is NOT equivalent proof depth to operational subsets. Don't conflate. For typing-level rows the comment IS the spec and checker.c is the implementation; for concurrency the gap matters and deepening is genuinely valuable.
 
 Contents of `docs/compiler-internals.md`:
 

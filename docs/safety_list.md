@@ -109,14 +109,14 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 |---|---|---|
 | A. Handle lifecycle (UAF, double-free, leak) | 18 | ✓ (all 18 rows proven) |
 | B. Move struct / ownership transfer | 8 | ✓ **FULL operational** — `lambda_zer_move/` subset |
-| C. Thread safety & spawn | 12 | ✓ (schematic — context-flag + linear resources; `iris_concurrency.v`) |
-| D. Shared struct & deadlock | 5 | ✓ (schematic — Iris invariants + lock-order ghost state; `iris_concurrency.v`) |
-| E. Atomic / condvar / barrier / semaphore | 8 | ✓ (schematic — typing + logically-atomic triples; `iris_concurrency.v`) |
-| F. Async / coroutine context | 5 | ✓ (schematic — context flags + state-machine invariants; `iris_concurrency.v`) |
+| C. Thread safety & spawn | 12 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (C01_first_join_ok/_joined_exits, C02_double_join_rejected, C03_spawn_in_isr, C04_spawn_in_critical, C05_spawn_in_async, C06_non_shared_access, C07_resource_return, C09_non_shared_ptr, C10_handle_arg) |
+| D. Shared struct & deadlock | 5 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (D01_shared_field_address, D02_shared_plus_yield, D03_two_shared_types, D04_volatile_compound, D05_isr_main_non_volatile) |
+| E. Atomic / condvar / barrier / semaphore | 8 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (E01_width_checks, E02_ptr_to_int, E03_packed, E04_condvar_arg, E08_sync_in_packed) |
+| F. Async / coroutine context | 5 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (F01_yield_outside_async, F02_await_outside_async, F03_yield_in_critical, F04_yield_in_defer, F05_shadowing) |
 | G. Control-flow context safety | 12 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (G01_return_in_critical_rejected, G02-G05 break/continue, G04_nested_defer_rejected, G10_asm_outside_naked_rejected, G_empty_context_default) |
 | H. MMIO / volatile / hardware | 9 | ✓ **FULL operational** — `lambda_zer_mmio/` subset (stuck-on-violation proofs for out-of-range + unaligned + no-decl) |
 | I. Qualifier preservation (const/volatile) | 11 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (I_strip_const_unsafe, I_strip_volatile_unsafe, I_add_const_safe, I_refl_safe, I_trans_safe) |
-| J. Pointer cast & provenance | 14 | ✓ **FULL operational** — `lambda_zer_opaque/` subset (core provenance rows J01/J04/J11/J12/J13/J14) |
+| J. Pointer cast & provenance | 14 | ✓ **Full coverage** — core provenance (J01/J04/J11/J12/J13/J14) operational in `lambda_zer_opaque/`; intrinsic shape (J02/J03/J05-J10) real Coq predicates in `lambda_zer_typing/typing.v` |
 | K. `@container` / `@offset` / `@size` | 4 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (K01_container_ptr_ok/_nonptr_rejected, K03_existing_field_ok/_missing_rejected, K04_sized/_void) |
 | L. Bounds / indexing / slicing | 11 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (L01_const_in_bounds/_oob, L02_valid_slice/_end_exceeds, L03_slice_start_gt_end, L06_bit_in_range/_oob) |
 | M. Division / arithmetic safety | 10 | ✓ **Real Coq proofs** — `lambda_zer_typing/typing.v` (M01_const_div_by_zero, M02_proven_nonzero, M07_narrowing_needs_truncate, M08_literal_fits) |

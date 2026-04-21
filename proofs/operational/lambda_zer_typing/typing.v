@@ -819,6 +819,452 @@ Section container_extra.
 End container_extra.
 
 (* =================================================================
+   Section J-extended — intrinsic shape checks (J02-J10)
+   ================================================================= *)
+
+Section intrinsic_shape_extended.
+
+  (* J02, J03 — int↔ptr conversion must go through intrinsic. *)
+  Inductive conversion_kind : Type :=
+    | ConvExplicitIntToPtr : conversion_kind    (* @inttoptr *)
+    | ConvExplicitPtrToInt : conversion_kind    (* @ptrtoint *)
+    | ConvCStyleCast       : conversion_kind.   (* (T)x — BANNED *)
+
+  Definition conversion_safe (c : conversion_kind) : bool :=
+    match c with
+    | ConvCStyleCast => false
+    | _ => true
+    end.
+
+  Theorem J02_intttoptr_intrinsic_ok :
+    conversion_safe ConvExplicitIntToPtr = true.
+  Proof. reflexivity. Qed.
+
+  Theorem J03_ptrtoint_intrinsic_ok :
+    conversion_safe ConvExplicitPtrToInt = true.
+  Proof. reflexivity. Qed.
+
+  Theorem J02_J03_c_cast_rejected :
+    conversion_safe ConvCStyleCast = false.
+  Proof. reflexivity. Qed.
+
+  (* J05 — @bitcast requires same width. *)
+  Definition bitcast_valid (src_width dst_width : nat) : bool :=
+    src_width =? dst_width.
+
+  Theorem J05_same_width_ok w :
+    bitcast_valid w w = true.
+  Proof. unfold bitcast_valid. apply Nat.eqb_refl. Qed.
+
+  Theorem J05_mismatched_width_rejected :
+    bitcast_valid 32 8 = false.
+  Proof. reflexivity. Qed.
+
+  (* J06 — @bitcast requires numeric/primitive types. *)
+  Definition bitcast_operand_valid (is_primitive : bool) : bool :=
+    is_primitive.
+
+  Theorem J06_primitive_ok :
+    bitcast_operand_valid true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem J06_nonprimitive_rejected :
+    bitcast_operand_valid false = false.
+  Proof. reflexivity. Qed.
+
+  (* J07 — @cast between distinct typedefs.
+     Source XOR target must be a distinct typedef; casting between
+     two distinct-related types requires specific rules. *)
+  Definition cast_distinct_valid (src_is_distinct dst_is_distinct : bool) : bool :=
+    orb src_is_distinct dst_is_distinct.
+
+  Theorem J07_at_least_one_distinct_ok :
+    cast_distinct_valid true false = true ∧
+    cast_distinct_valid false true = true ∧
+    cast_distinct_valid true true = true.
+  Proof. repeat split; reflexivity. Qed.
+
+  Theorem J07_neither_distinct_rejected :
+    cast_distinct_valid false false = false.
+  Proof. reflexivity. Qed.
+
+  (* J08 — @saturate/@truncate require numeric source. *)
+  Definition saturate_operand_valid (is_numeric : bool) : bool :=
+    is_numeric.
+
+  Theorem J08_numeric_source_ok :
+    saturate_operand_valid true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem J08_non_numeric_rejected :
+    saturate_operand_valid false = false.
+  Proof. reflexivity. Qed.
+
+  (* J09 — @ptrtoint source must be pointer. *)
+  Definition ptrtoint_source_valid (is_pointer : bool) : bool :=
+    is_pointer.
+
+  Theorem J09_pointer_source_ok :
+    ptrtoint_source_valid true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem J09_non_pointer_rejected :
+    ptrtoint_source_valid false = false.
+  Proof. reflexivity. Qed.
+
+  (* J10 — general "invalid cast" — catch-all for unrelated types. *)
+  Definition cast_types_compatible (src_tag dst_tag : nat) : bool :=
+    src_tag =? dst_tag.
+
+  Theorem J10_same_type_ok t :
+    cast_types_compatible t t = true.
+  Proof. unfold cast_types_compatible. apply Nat.eqb_refl. Qed.
+
+  Theorem J10_different_types_rejected :
+    cast_types_compatible 1 2 = false.
+  Proof. reflexivity. Qed.
+
+End intrinsic_shape_extended.
+
+(* =================================================================
+   Section C — thread safety & spawn
+   ================================================================= *)
+
+Section thread_spawn_safety.
+
+  (* C01/C02 — ThreadHandle lifecycle as a linear-resource counter.
+     Valid: never joined twice, always joined at scope exit. *)
+  Inductive thread_state : Type :=
+    | ThreadAlive   : thread_state    (* spawned, not yet joined *)
+    | ThreadJoined  : thread_state.   (* joined exactly once *)
+
+  Definition thread_op_valid (state : thread_state) (joining : bool) : bool :=
+    match state, joining with
+    | ThreadAlive, true => true       (* first join — ok *)
+    | ThreadJoined, true => false     (* second join — error *)
+    | _, false => true                (* no-op *)
+    end.
+
+  Theorem C01_first_join_ok :
+    thread_op_valid ThreadAlive true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem C02_double_join_rejected :
+    thread_op_valid ThreadJoined true = false.
+  Proof. reflexivity. Qed.
+
+  (* C01 — missing join at scope exit is a leak. *)
+  Definition thread_cleanup_valid (state : thread_state) : bool :=
+    match state with ThreadJoined => true | ThreadAlive => false end.
+
+  Theorem C01_joined_exits_ok :
+    thread_cleanup_valid ThreadJoined = true.
+  Proof. reflexivity. Qed.
+
+  Theorem C01_unjoined_exits_rejected :
+    thread_cleanup_valid ThreadAlive = false.
+  Proof. reflexivity. Qed.
+
+  (* C03, C04, C05 — spawn forbidden in ISR / @critical / async.
+     Reuse the ctx_state from Section G. *)
+  Definition spawn_context_valid (ctx : ctx_state) : bool :=
+    andb (andb (negb ctx.(in_interrupt))
+               (negb ctx.(in_critical)))
+         (negb ctx.(in_async)).
+
+  Theorem C03_spawn_in_isr_rejected ctx :
+    ctx.(in_interrupt) = true →
+    spawn_context_valid ctx = false.
+  Proof. intros H. unfold spawn_context_valid. rewrite H. reflexivity. Qed.
+
+  Theorem C04_spawn_in_critical_rejected ctx :
+    ctx.(in_critical) = true →
+    spawn_context_valid ctx = false.
+  Proof. intros H. unfold spawn_context_valid. rewrite H. rewrite Bool.andb_false_r. reflexivity. Qed.
+
+  Theorem C05_spawn_in_async_rejected ctx :
+    ctx.(in_async) = true →
+    spawn_context_valid ctx = false.
+  Proof. intros H. unfold spawn_context_valid. rewrite H. rewrite Bool.andb_false_r. reflexivity. Qed.
+
+  (* C06 — spawn target must only access shared globals.
+     Function summary: list of globals accessed, checked against
+     a "shared-ness" predicate. *)
+  Definition spawn_body_safe (globals_non_shared : list nat) : bool :=
+    match globals_non_shared with [] => true | _ => false end.
+
+  Theorem C06_no_non_shared_access_ok :
+    spawn_body_safe [] = true.
+  Proof. reflexivity. Qed.
+
+  Theorem C06_non_shared_access_rejected g :
+    spawn_body_safe [g] = false.
+  Proof. reflexivity. Qed.
+
+  (* C07 — spawn target return type must not be resource-carrying. *)
+  Definition spawn_return_safe (returns_resource : bool) : bool :=
+    negb returns_resource.
+
+  Theorem C07_void_return_ok :
+    spawn_return_safe false = true.
+  Proof. reflexivity. Qed.
+
+  Theorem C07_resource_return_rejected :
+    spawn_return_safe true = false.
+  Proof. reflexivity. Qed.
+
+  (* C09 — spawn args: non-shared pointer rejected. *)
+  Definition spawn_arg_valid (is_shared_ptr is_value : bool) : bool :=
+    orb is_shared_ptr is_value.
+
+  Theorem C09_shared_arg_ok :
+    spawn_arg_valid true false = true.
+  Proof. reflexivity. Qed.
+
+  Theorem C09_value_arg_ok :
+    spawn_arg_valid false true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem C09_non_shared_ptr_rejected :
+    spawn_arg_valid false false = false.
+  Proof. reflexivity. Qed.
+
+  (* C10 — spawn with Handle rejected. *)
+  Definition spawn_arg_is_handle (is_handle : bool) : bool :=
+    negb is_handle.
+
+  Theorem C10_handle_arg_rejected :
+    spawn_arg_is_handle true = false.
+  Proof. reflexivity. Qed.
+
+End thread_spawn_safety.
+
+(* =================================================================
+   Section D — shared struct & deadlock
+   ================================================================= *)
+
+Section shared_deadlock_safety.
+
+  (* D01 — cannot take address of shared struct field. *)
+  Definition address_of_shared_valid (is_shared_field : bool) : bool :=
+    negb is_shared_field.
+
+  Theorem D01_shared_field_address_rejected :
+    address_of_shared_valid true = false.
+  Proof. reflexivity. Qed.
+
+  Theorem D01_non_shared_field_address_ok :
+    address_of_shared_valid false = true.
+  Proof. reflexivity. Qed.
+
+  (* D02 — shared access in yield/await statement rejected. *)
+  Definition shared_in_suspend_valid (accesses_shared has_yield : bool) : bool :=
+    negb (andb accesses_shared has_yield).
+
+  Theorem D02_shared_plus_yield_rejected :
+    shared_in_suspend_valid true true = false.
+  Proof. reflexivity. Qed.
+
+  Theorem D02_shared_alone_ok :
+    shared_in_suspend_valid true false = true.
+  Proof. reflexivity. Qed.
+
+  Theorem D02_yield_alone_ok :
+    shared_in_suspend_valid false true = true.
+  Proof. reflexivity. Qed.
+
+  (* D03 — deadlock detection: single statement must not access
+     multiple distinct shared types. *)
+  Definition deadlock_safe (shared_types_accessed : list nat) : bool :=
+    match shared_types_accessed with
+    | [] => true
+    | [_] => true
+    | _ => false   (* two or more = deadlock potential *)
+    end.
+
+  Theorem D03_one_shared_type_ok t :
+    deadlock_safe [t] = true.
+  Proof. reflexivity. Qed.
+
+  Theorem D03_two_shared_types_rejected t1 t2 :
+    deadlock_safe [t1; t2] = false.
+  Proof. reflexivity. Qed.
+
+  (* D04 — volatile global with compound assignment rejected. *)
+  Definition volatile_compound_valid (is_volatile is_compound_op : bool) : bool :=
+    negb (andb is_volatile is_compound_op).
+
+  Theorem D04_volatile_compound_rejected :
+    volatile_compound_valid true true = false.
+  Proof. reflexivity. Qed.
+
+  Theorem D04_volatile_simple_assign_ok :
+    volatile_compound_valid true false = true.
+  Proof. reflexivity. Qed.
+
+  (* D05 — global accessed from ISR+main without volatile. *)
+  Definition isr_main_access_valid (accessed_in_isr accessed_in_main is_volatile : bool) : bool :=
+    orb is_volatile (negb (andb accessed_in_isr accessed_in_main)).
+
+  Theorem D05_isr_main_non_volatile_rejected :
+    isr_main_access_valid true true false = false.
+  Proof. reflexivity. Qed.
+
+  Theorem D05_isr_main_volatile_ok :
+    isr_main_access_valid true true true = true.
+  Proof. reflexivity. Qed.
+
+End shared_deadlock_safety.
+
+(* =================================================================
+   Section E — atomic / condvar / barrier / semaphore intrinsics
+   ================================================================= *)
+
+Section sync_intrinsics.
+
+  (* E01 — @atomic_* width must be 1, 2, 4, or 8 bytes. *)
+  Definition atomic_width_valid (bytes : nat) : bool :=
+    orb (orb (bytes =? 1) (bytes =? 2)) (orb (bytes =? 4) (bytes =? 8)).
+
+  Theorem E01_width_1_ok :
+    atomic_width_valid 1 = true.
+  Proof. reflexivity. Qed.
+
+  Theorem E01_width_4_ok :
+    atomic_width_valid 4 = true.
+  Proof. reflexivity. Qed.
+
+  Theorem E01_width_3_rejected :
+    atomic_width_valid 3 = false.
+  Proof. reflexivity. Qed.
+
+  Theorem E01_width_16_rejected :
+    atomic_width_valid 16 = false.
+  Proof. reflexivity. Qed.
+
+  (* E02 — @atomic_* first arg must be pointer-to-integer. *)
+  Definition atomic_arg_valid (is_ptr_to_int : bool) : bool :=
+    is_ptr_to_int.
+
+  Theorem E02_ptr_to_int_ok :
+    atomic_arg_valid true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem E02_wrong_arg_rejected :
+    atomic_arg_valid false = false.
+  Proof. reflexivity. Qed.
+
+  (* E03 — @atomic_* on packed struct field. *)
+  Definition atomic_on_packed_valid (is_packed_field : bool) : bool :=
+    negb is_packed_field.
+
+  Theorem E03_packed_rejected :
+    atomic_on_packed_valid true = false.
+  Proof. reflexivity. Qed.
+
+  (* E04 — @cond_wait/signal first arg must be shared struct. *)
+  Definition condvar_arg_valid (is_shared_struct : bool) : bool :=
+    is_shared_struct.
+
+  Theorem E04_shared_ok :
+    condvar_arg_valid true = true.
+  Proof. reflexivity. Qed.
+
+  Theorem E04_non_shared_rejected :
+    condvar_arg_valid false = false.
+  Proof. reflexivity. Qed.
+
+  (* E08 — sync primitive (Barrier/Semaphore/Mutex) inside packed struct. *)
+  Definition sync_in_packed_valid (is_packed_container : bool) : bool :=
+    negb is_packed_container.
+
+  Theorem E08_sync_in_packed_rejected :
+    sync_in_packed_valid true = false.
+  Proof. reflexivity. Qed.
+
+  Theorem E08_sync_in_normal_ok :
+    sync_in_packed_valid false = true.
+  Proof. reflexivity. Qed.
+
+End sync_intrinsics.
+
+(* =================================================================
+   Section F — async / coroutine context
+   ================================================================= *)
+
+Section async_context.
+
+  (* F01, F02 — yield/await only in async functions. *)
+  Definition yield_context_valid (ctx : ctx_state) : bool :=
+    andb ctx.(in_async) (andb (negb ctx.(in_critical)) (negb ctx.(in_defer))).
+
+  Theorem F01_yield_outside_async_rejected ctx :
+    ctx.(in_async) = false →
+    yield_context_valid ctx = false.
+  Proof. intros H. unfold yield_context_valid. rewrite H. reflexivity. Qed.
+
+  Theorem F02_await_outside_async_rejected ctx :
+    ctx.(in_async) = false →
+    yield_context_valid ctx = false.
+  Proof. apply F01_yield_outside_async_rejected. Qed.
+
+  (* F03 — yield in @critical rejected. *)
+  Theorem F03_yield_in_critical_rejected ctx :
+    ctx.(in_async) = true →
+    ctx.(in_critical) = true →
+    yield_context_valid ctx = false.
+  Proof.
+    intros Ha Hc.
+    unfold yield_context_valid.
+    rewrite Ha. simpl. rewrite Hc. reflexivity.
+  Qed.
+
+  (* F04 — yield in defer rejected. *)
+  Theorem F04_yield_in_defer_rejected ctx :
+    ctx.(in_async) = true →
+    ctx.(in_defer) = true →
+    yield_context_valid ctx = false.
+  Proof.
+    intros Ha Hd.
+    unfold yield_context_valid.
+    rewrite Ha. simpl. rewrite Hd. rewrite Bool.andb_false_r. reflexivity.
+  Qed.
+
+  (* Valid async context: in_async true, critical/defer false. *)
+  Theorem F_valid_async_context :
+    let ctx := mkCtx false false false true false false in
+    yield_context_valid ctx = true.
+  Proof. reflexivity. Qed.
+
+  (* F05 — variable shadows async parameter rejected.
+     Model: list of param names, new binding checked for conflict. *)
+  Definition shadow_check_valid (param_names : list nat) (new_name : nat) : bool :=
+    negb (existsb (Nat.eqb new_name) param_names).
+
+  Theorem F05_shadowing_rejected names n :
+    In n names →
+    shadow_check_valid names n = false.
+  Proof.
+    intros Hin. unfold shadow_check_valid.
+    assert (existsb (Nat.eqb n) names = true) as H.
+    { apply existsb_exists. exists n. split; [exact Hin | apply Nat.eqb_refl]. }
+    rewrite H. reflexivity.
+  Qed.
+
+  Theorem F05_no_shadow_ok names n :
+    ~ In n names →
+    shadow_check_valid names n = true.
+  Proof.
+    intros Hnin. unfold shadow_check_valid.
+    destruct (existsb (Nat.eqb n) names) eqn:Heq; [|reflexivity].
+    exfalso. apply Hnin.
+    apply existsb_exists in Heq as [x [Hin Heqx]].
+    apply Nat.eqb_eq in Heqx. subst. exact Hin.
+  Qed.
+
+End async_context.
+
+(* =================================================================
    Decidability — the compiler can mechanically check every rule.
    ================================================================= *)
 

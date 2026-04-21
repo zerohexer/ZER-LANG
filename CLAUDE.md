@@ -557,13 +557,22 @@ Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c
 - **Level 2 (tests)** — `tests/zer_proof/`: compiler empirically rejects known violations.
 - **Level 3 (VST on extracted predicates)** — `src/safety/*.c` linked + `proofs/vst/verif_*.v`: real compiler code matches spec for EVERY input. Catches implementation bugs 1+2 can miss (e.g., `if (x = 1)` assignment-typo — spec correct, tests may miss, VST fails immediately).
 
-**Adding a new Level 3 extraction (checklist):**
-1. Identify pure predicate in zercheck.c or zercheck_ir.c (no state mutation, primitive param types)
-2. Move logic to `src/safety/<name>.c` + `<name>.h`, call it from ORIGINAL sites (BOTH zercheck.c AND zercheck_ir.c if applicable)
-3. Verify `make docker-build` + `make docker-check` still pass (no regression)
-4. Write `proofs/vst/verif_<name>.v` with Coq spec + VST proof
-5. Add to `make check-vst` target
-6. Commit — CI now enforces the invariant
+**Adding a new Level 3 extraction (MANDATORY steps — details in `proof-internals.md` "Phase 1 extraction recipe"):**
+
+1. Identify pure predicate (primitive args, no state mutation, no AST/struct deps)
+2. Write `src/safety/<name>.c` + `.h` using VST-friendly C style: flat cascade of early-return ifs, NO nesting, NO compound conditions (`&&`/`||`). If logic wants compound, SPLIT into multiple predicates and AND at call site.
+3. Wire original C call sites to delegate: `zer_predicate_name(arg) != 0`
+4. Add to Makefile CORE_SRCS + LIB_SRCS + check-vst clightgen/coqc lines
+5. Add `<name>.v` to `src/safety/.gitignore`
+6. Write `proofs/vst/verif_<name>.v`: Coq spec uses `Z.eq_dec` (NOT `Z.eqb`) to align with proof's destruct. Standard proof: `repeat forward_if; forward; unfold <name>_coq; repeat (destruct (Z.eq_dec _ _); try lia); try entailer!`.
+7. Run `make docker-build` + `make check-vst` + `make docker-check`
+8. Commit (one predicate or tight batch per commit)
+
+**When VST check-vst fails (see common-errors table in `proof-internals.md`):**
+- `Use [forward_if Post]` → C has nested ifs or `&&`/`||`. Flatten to single cascade.
+- `variable X not found` → VST auto-substed on `==`; use `destruct (Z.eq_dec _ _)` not by name.
+- `Attempt to save an incomplete proof` → proof closed fewer goals than C has. Add more destructs.
+- `Cannot find physical path bound to ... zer_safety.<name>` → Makefile missing clightgen/coqc line for the new file.
 
 Contents of `docs/compiler-internals.md`:
 

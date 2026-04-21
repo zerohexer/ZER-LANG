@@ -126,6 +126,39 @@ verification files (handle_state + range_checks + 3 demonstrators) pass
 
 **Honest count after 3rd batch: 7 Level-3-verified compiler functions.**
 
+### Decision — commit to seL4-level full verification (2026-04-21)
+
+After architectural discussion covering:
+- Architecture 1 (C + VST extraction) vs Architecture 2 (Coq rewrite + extract)
+- Pure predicate extraction vs decision extraction vs full separation logic
+- Schematic vs operational depth for Coq proofs
+- Trust base analysis (software + hardware + spec correctness)
+
+User committed to full path: Architecture 1 + deepen all schematic
+rows to operational depth. Total ~1,085 hrs over ~1 year focused
+(~3 years casual). End state: same strength of verification as seL4
+and CompCert for their respective targets.
+
+Plan extended from 6 phases (Phase 0-6, extraction only) to 9 phases
+(Phase 0-8, adding Phase 7 deepening + Phase 8 release polish).
+
+Phase 7 sub-phases:
+- λZER-concurrency (C/D/E, 22 rows) — ~150 hrs
+- λZER-async (F, 5 rows) — ~80 hrs
+- λZER-control-flow (G, 10 rows) — ~30 hrs
+- λZER-mmio rest (H, 9 rows) — ~20 hrs
+- λZER-opaque rest (J, 11 rows) — ~30 hrs
+- λZER-escape rest (O, 11 rows) — ~30 hrs
+- λZER-typing-extra (K, T, 4 rows) — ~15 hrs
+- λZER-vrp (L, M, R, S, 17 rows) — ~50 hrs
+- λZER-variant (P, 5 rows) — ~15 hrs
+- Spec reviews + integration — ~25 hrs
+
+Every phase is stop-able. Extractions commit one-at-a-time. Deepening
+subsets commit per-subset. No big-bang milestones.
+
+Plan documented in docs/formal_verification_plan.md Level 3 section.
+
 ### Makefile: `check-all` target added
 
 For CI convenience, `make check-all` runs tests + Iris/Coq proofs +

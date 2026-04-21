@@ -341,22 +341,117 @@ Target: automated checks that enforce the verification discipline.
 
 **Acceptance:** `make check-all` runs all gates. Every mergeable PR = mechanically verified safety.
 
-### Total Architecture 1 plan
+**Phase 7 — Deepen schematic to operational (~425 hrs, commitment 2026-04-21)**
+
+Target: every safety row in `safety_list.md` reaches ✓ operational depth (currently 40 ✓ + 82 ○ schematic + 15 ◐ in-progress + 46 — not-safety-semantic).
+
+Schematic proofs are VALID but WEAKER than operational. Schematic proves "the checker's predicate is correct by its stated claim." Operational proves "well-typed programs cannot exhibit this bug at runtime" via step rules + resource algebra + Iris adequacy. seL4/CompCert/RustBelt all target operational depth.
+
+| Subset to create | Rows closed | Effort | Current depth |
+|---|---|---|---|
+| `lambda_zer_concurrency/` (C, D, E sections) | 22 | ~150 hrs | Schematic in `iris_concurrency.v` |
+| `lambda_zer_async/` (F section) | 5 | ~80 hrs | Schematic in `iris_concurrency.v` |
+| `lambda_zer_control_flow/` (G section) | 10 | ~30 hrs | Schematic in `iris_control_flow.v` |
+| Deepen `lambda_zer_mmio/` rest (H leftovers) | 9 | ~20 hrs | Core rows already ✓ |
+| Deepen `lambda_zer_opaque/` rest (J leftovers) | 11 | ~30 hrs | Core rows already ✓ |
+| Deepen `lambda_zer_escape/` rest (O leftovers) | 11 | ~30 hrs | Core rows already ✓ |
+| `lambda_zer_typing_extra/` (K, T sections) | 4 | ~15 hrs | Schematic in `iris_container_validity.v` |
+| `lambda_zer_vrp/` (L, M, R, S sections) | 17 | ~50 hrs | Schematic in `iris_misc_sections.v` |
+| `lambda_zer_variant/` (P section) | 5 | ~15 hrs | Schematic in `iris_misc_sections.v` |
+| Spec reviews + integration | — | ~25 hrs | N/A |
+
+**Per-subset pattern** (learned from λZER-handle/move/opaque/escape/mmio):
+1. Create `proofs/operational/lambda_zer_<name>/` directory
+2. `syntax.v` — AST constructs specific to this feature
+3. `semantics.v` — step rules enforcing safety invariants
+4. `typing.v` — typing rules matching compiler's actual checks
+5. `iris_<name>_resources.v` — resource algebra (if needed)
+6. `iris_<name>_state.v` — state interpretation
+7. `iris_<name>_specs.v` — wp specs + theorems axiom-free
+8. Add to `_CoqProject` with `-Q lambda_zer_<name> zer_<name>`
+9. Delete schematic theorems in `iris_*.v` once replaced
+
+**Acceptance:** safety_list.md shows 0 rows at ○ status. Only ✓ (operational) and — (not-safety-semantic) remain. `make check-proofs` green, zero admits across all subsets.
+
+### Total Architecture 1 plan (updated 2026-04-21)
 
 ```
-Phase 0 — Infrastructure    ✅ DONE (2026-04-21)
-Phase 1 — 40+ predicates   🔄 7/44 (16%)    ~93 hrs remaining
-Phase 2 — 60 decisions      ⏳ TODO          ~150 hrs
-Phase 3 — Generic walker    ⏳ TODO          ~60 hrs
-Phase 4 — Verified APIs     ⏳ TODO          ~240 hrs
-Phase 5 — Phase types       ⏳ TODO          ~30 hrs
-Phase 6 — CI discipline     ⏳ TODO          ~30 hrs
+Phase 0 — Infrastructure              ✅ DONE (2026-04-21)
+Phase 1 — 40+ predicates              🔄 7/44 (16%)    ~93 hrs
+Phase 2 — 60 decisions                 ⏳ TODO          ~150 hrs
+Phase 3 — Generic AST walker           ⏳ TODO          ~60 hrs
+Phase 4 — Verified APIs                ⏳ TODO          ~240 hrs
+Phase 5 — Phase types                  ⏳ TODO          ~30 hrs
+Phase 6 — CI discipline                ⏳ TODO          ~30 hrs
+Phase 7 — Deepen schematic→operational ⏳ TODO          ~425 hrs
+  ├─ λZER-concurrency                                    ~150 hrs
+  ├─ λZER-async                                           ~80 hrs
+  ├─ λZER-control-flow                                    ~30 hrs
+  ├─ λZER-mmio rest (H)                                   ~20 hrs
+  ├─ λZER-opaque rest (J)                                 ~30 hrs
+  ├─ λZER-escape rest (O)                                 ~30 hrs
+  ├─ λZER-typing-extra (K, T)                             ~15 hrs
+  ├─ λZER-vrp (L, M, R, S)                                ~50 hrs
+  ├─ λZER-variant (P)                                     ~15 hrs
+  └─ Spec reviews                                         ~25 hrs
+Phase 8 — Release verification polish  ⏳ TODO          ~50 hrs
 ────────────────────────────────────────────────────
-Total remaining: ~603 hrs to effective 100%
+Total remaining: ~1,078 hrs to seL4-level proof
 ```
 
-At 3 hrs/day LLM-assisted pace: ~7 months focused. At 1 hr/day casual: ~2 years. Each phase stops-able with real value shipped.
+At 3 hrs/day LLM-assisted: **~1 year focused work.**
+At 1 hr/day casual: **~3 years.**
 
+**Benchmark comparisons:**
+- CompCert: ~20,000 person-hours (decade, team of 10)
+- seL4: ~30,000 person-hours (decade, team of 20)
+- **ZER at ~1,085 hrs is 20-30x faster** because: smaller language, emit-to-C (no native backend), existing 42-file Iris infrastructure with 0 admits, LLM assistance, narrower target (safety properties, not full semantic preservation).
+
+### End state — what ZER gets after Phase 7
+
+**Every safety property in safety_list.md (all 203 rows) is mechanically proven at operational depth.** Every extracted predicate is VST-verified. Every `make check-all` is a proof of correctness at the trust-base boundary.
+
+Claim at completion:
+
+> "ZER is a formally verified compiler. For every program ZER accepts, the resulting C is provably free of use-after-free, double-free, bounds violations, data races, move-after-transfer, escape bugs, MMIO errors, handle leaks, and 200+ other specified safety properties — proven in Coq, verified in VST, tested empirically. The trust base is Coq kernel + GCC + hardware."
+
+Same strength of claim as CompCert and seL4 make for their respective targets.
+
+**Not in scope (would need Phase 9+):**
+- Semantic preservation (ZER → C meaning-preservation proof) — ~1500 hrs additional, CompCert-style
+- Compiler termination proof — ~200 hrs
+- Performance guarantees — not a safety concern
+
+### Phase-7 stopping points
+
+Each subset is self-contained. Stop at any sub-phase and still ship real value:
+
+- After λZER-concurrency (~150 hrs): all thread/spawn/condvar safety at operational depth. Biggest gain — concurrency is the riskiest area.
+- After λZER-async (~80 hrs more): stackless coroutines proven sound.
+- After control-flow (~30 hrs more): return/break/goto rules operational.
+- After MMIO/opaque/escape rest (~80 hrs more): complete provenance + region proofs.
+- After VRP/typing/variant rest (~80 hrs more): 100% operational coverage.
+
+### Progression diagram
+
+```
+CURRENT STATE (2026-04-21):
+┌─────────────────────────────────────────────────────────────┐
+│ Level 1:  40 ✓ operational + 82 ○ schematic + 46 — NSS      │
+│ Level 2:  106 Layer-2 tests linking programs to theorems    │
+│ Level 3:  7 real extractions + 21 demonstrators              │
+│ CI:       make check-all gates (partial)                     │
+└─────────────────────────────────────────────────────────────┘
+                         ↓ ~1,085 hrs
+END STATE (Phase 7+8 complete):
+┌─────────────────────────────────────────────────────────────┐
+│ Level 1:  ALL 157 substantive rows ✓ operational             │
+│ Level 2:  200+ Layer-2 tests                                 │
+│ Level 3:  100+ extracted predicates VST-verified             │
+│ CI:       make check-all blocks any mergeable safety bug     │
+│ Claim:    "seL4-level formally verified compiler"            │
+└─────────────────────────────────────────────────────────────┘
+```
 ### When to migrate to Architecture 2
 
 Criteria for starting an Architecture 2 subsystem rewrite:
@@ -382,7 +477,9 @@ Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zerche
 | **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
 | **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
 | **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
-| **Level 3 — VST on extracted predicates** | **7 real extractions** (4 handle-state + 3 range-check predicates). Infrastructure complete (Phase 0). Phase 1 at 16% (7/44). ~603 hrs remaining to effective 100%. |
+| **Level 3 — VST on extracted predicates** | **7 real extractions** (4 handle-state + 3 range-check predicates). Infrastructure complete (Phase 0). Phase 1 at 16% (7/44). |
+| **Phase 7 — Deepen schematic → operational** | 82 rows at schematic depth. Path to seL4-level proof. ~425 hrs. |
+| **Total path to seL4-level formal verification** | **~1,085 hrs** (~1 year focused, ~3 years casual). 20-30x faster than CompCert/seL4 thanks to existing 42-file Iris infrastructure + LLM assistance + narrower target (safety properties only, not semantic preservation). |
 | λZER-concurrency (Iris concurrency primitives) | Not started. |
 | λZER-async | Not started. |
 

@@ -164,6 +164,52 @@ duplicate significant code.
 **Honest count after 4th batch: 14 Level-3-verified compiler functions.**
 Phase 1 progress: 14/44 = 32%.
 
+### Fifth batch — coercion rules (2026-04-21)
+
+Extracted 5 coercion-rule predicates to `src/safety/coerce_rules.c`:
+- `zer_coerce_int_widening_allowed(from_signed, to_signed, from_w, to_w)`
+- `zer_coerce_usize_same_width_allowed(from_u, to_u, from_s, to_s)`
+- `zer_coerce_float_widening_allowed(from_f32, to_f64)` — only f32→f64
+- `zer_coerce_preserves_volatile(from_v, to_v)` — cannot strip volatile
+- `zer_coerce_preserves_const(from_c, to_c)` — cannot strip const
+
+Wired into `types.c:can_implicit_coerce`:
+- Integer widening path → delegates to both widening and usize-same-width predicates
+- Float f32→f64 → delegates to float predicate
+- Slice qualifier preservation → delegates to both preserves_{volatile,const}
+
+### VST gotchas this batch
+
+**Nested ifs block VST `repeat forward_if`**. The original C had:
+```c
+if (from_signed == to_signed) {
+    if (from_width < to_width) return 1;
+    return 0;
+}
+```
+VST fails with "Use [forward_if Post]" because the nested forward_if
+can't infer its post from the outer context. Fix: flatten to a single
+level of cascaded if-returns with no nesting.
+
+**Compound conditions (&&, ||) also block VST**. `if (x && y)` compiles
+to nested Clight, same problem. Fix: split into separate if statements.
+
+**Two-predicate split preferable to complex combinations.** Initially
+tried `zer_coerce_qualifier_widening_allowed(const, vol)` taking both
+qualifiers — too many branches. Split into `preserves_volatile` and
+`preserves_const` separately; call site ANDs the results. Both VST
+proofs trivial.
+
+**Coq spec must use `Z.eq_dec` (not `Z.eqb`) to align with VST's
+`destruct (Z.eq_dec _ _)` tactic.** Z.eqb returns bool; destruct needs
+sumbool. If the spec uses one and the proof destructs on the other, the
+case branches don't close.
+
+Documented in proof-internals.md under "Common VST errors".
+
+**Honest count after 5th batch: 19 Level-3-verified compiler functions.**
+Phase 1 progress: 19/44 = 43%.
+
 ### Decision — commit to seL4-level full verification (2026-04-21)
 
 After architectural discussion covering:

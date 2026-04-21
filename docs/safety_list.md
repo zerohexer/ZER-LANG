@@ -97,15 +97,15 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | F. Async / coroutine context | 5 | ○ |
 | G. Control-flow context safety | 12 | ○ |
 | H. MMIO / volatile / hardware | 9 | ○ |
-| I. Qualifier preservation (const/volatile) | 11 | ○ |
+| I. Qualifier preservation (const/volatile) | 11 | ✓ (all 11 rows, typing-enforced) |
 | J. Pointer cast & provenance | 10 | ○ |
-| K. `@container` / `@offset` / `@size` | 5 | ○ |
+| K. `@container` / `@offset` / `@size` | 4 | ✓ (typing-enforced; `container_intrinsics_well_typed`) |
 | L. Bounds / indexing / slicing | 11 | ◐ |
 | M. Division / arithmetic safety | 10 | ◐ |
-| N. Null / optional safety | 8 | ◐ |
+| N. Null / optional safety | 8 | ✓ (3 N-specific + 5 already `—` typing) |
 | O. Escape analysis (dangling) | 12 | ○ |
 | P. Union / enum variant safety | 8 | ○ |
-| Q. Switch exhaustiveness | 4 | ○ |
+| Q. Switch exhaustiveness | 5 | ✓ (all typing-enforced; `iris_typing_rules.switch_exhaustiveness_enforced_by_typing`) |
 | R. Comptime / static_assert | 6 | ○ |
 | S. Resource limits (stack, ISR alloc) | 5 | ○ |
 | T. Container / builtin validity | 6 | ○ |
@@ -240,17 +240,17 @@ Core handle safety — what `λZER-Handle` proves.
 
 | # | Predicate | Source (file:line) | Model | Subset | Iris technique | Status |
 |---|---|---|---|---|---|---|
-| I01 | Cannot strip volatile qualifier (generic) | checker.c:869 | M4 | λZER-mmio | Typing: qualifier monotone through casts | ○ |
-| I02 | `@cast`/`@ptrcast` strip const | checker.c:5428, 5913 | M4 | λZER-mmio | Same | ○ |
-| I03 | Generic cast strip const | checker.c:5204 | M4 | λZER-typing | Same | ○ |
-| I04 | Assign/init const → mutable (ptr, slice, array) | checker.c:3429, 3434, 3482, 3490, 3460, 6632, 6644, 6660, 6667, 6679 | M4 | λZER-typing | Typing | ○ |
-| I05 | Return const as mutable (ptr, slice) | checker.c:7944, 7949 | M4 | λZER-typing | Typing | ○ |
-| I06 | Return volatile as non-volatile | checker.c:7964 | M4 | λZER-mmio | Typing | ○ |
-| I07 | Write through const pointer | checker.c:2831 | M4 | λZER-typing | Typing | ○ |
-| I08 | Assign to const variable | checker.c:2838 | M4 | λZER-typing | Typing | ○ |
-| I09 | String literal used as mutable `[]u8` | checker.c:2874, 6621, 7935 | M4 | λZER-typing | String-literal type = `const []u8` | ○ |
-| I10 | Mutating method on `const Pool/Slab/Ring/Arena` | checker.c:3689, 3707, 3732, 3742, 3770, 3789, 3808, 3835, 3853, 3879, 3889, 3924, 3963, 3989 | M4 | λZER-Handle | Method typed on container qualifier | ◐ |
-| I11 | `@cstr` destination const | checker.c:5747, 5756 | M4 | λZER-typing | Typing | ○ |
+| I01 | Cannot strip volatile qualifier (generic) | checker.c:869 | M4 | λZER-mmio | Typing rule (`iris_typing_rules.qualifier_monotone`) | ✓ |
+| I02 | `@cast`/`@ptrcast` strip const | checker.c:5428, 5913 | M4 | λZER-mmio | Same — typing-enforced | ✓ |
+| I03 | Generic cast strip const | checker.c:5204 | M4 | λZER-typing | Same — typing-enforced | ✓ |
+| I04 | Assign/init const → mutable (ptr, slice, array) | checker.c:3429, 3434, 3482, 3490, 3460, 6632, 6644, 6660, 6667, 6679 | M4 | λZER-typing | Typing-enforced at 10 sites | ✓ |
+| I05 | Return const as mutable (ptr, slice) | checker.c:7944, 7949 | M4 | λZER-typing | Typing-enforced | ✓ |
+| I06 | Return volatile as non-volatile | checker.c:7964 | M4 | λZER-mmio | Typing-enforced | ✓ |
+| I07 | Write through const pointer | checker.c:2831 | M4 | λZER-typing | Typing-enforced | ✓ |
+| I08 | Assign to const variable | checker.c:2838 | M4 | λZER-typing | Typing-enforced | ✓ |
+| I09 | String literal used as mutable `[]u8` | checker.c:2874, 6621, 7935 | M4 | λZER-typing | String-literal type = `const []u8` | ✓ |
+| I10 | Mutating method on `const Pool/Slab/Ring/Arena` | checker.c:3689, 3707, 3732, 3742, 3770, 3789, 3808, 3835, 3853, 3879, 3889, 3924, 3963, 3989 | M4 | λZER-Handle | `const_container_cannot_mutate` — method receiver typing | ✓ |
+| I11 | `@cstr` destination const | checker.c:5747, 5756 | M4 | λZER-typing | Typing-enforced | ✓ |
 
 ## J. Pointer cast & provenance
 
@@ -317,11 +317,11 @@ Core handle safety — what `λZER-Handle` proves.
 
 | # | Predicate | Source (file:line) | Model | Subset | Iris technique | Status |
 |---|---|---|---|---|---|---|
-| N01 | Non-null `*T` requires initializer (var/global) | checker.c:6582, 9005 | M4 | λZER-Handle | Typing + auto-zero | ◐ |
-| N02 | `null` only assignable to optional types | checker.c:6700 | M4 | λZER-Handle | Typing | ◐ |
+| N01 | Non-null `*T` requires initializer (var/global) | checker.c:6582, 9005 | M4 | λZER-Handle | `non_null_requires_initializer` — typing + auto-zero | ✓ |
+| N02 | `null` only assignable to optional types | checker.c:6700 | M4 | λZER-Handle | `null_only_to_optional` — typing rule | ✓ |
 | N03 | `if-unwrap` requires optional | checker.c:7222 | — | λZER-typing | Typing | — |
 | N04 | `orelse` requires optional | checker.c:5130 | — | λZER-typing | Typing | — |
-| N05 | Nested optional `??T` not supported | checker.c:1197 | M4 | λZER-typing | Typing | ○ |
+| N05 | Nested optional `??T` not supported | checker.c:1197 | M4 | λZER-typing | `no_nested_optional` — typing rule | ✓ |
 | N06 | `orelse` fallback type mismatch | checker.c:5164 | — | λZER-typing | Typing | — |
 | N07 | `if`/`for` condition must be bool | checker.c:7311, 7518, 7572 | — | λZER-typing | Typing | — |
 | N08 | Cannot dereference non-pointer | checker.c:2511 | — | λZER-typing | Typing | — |

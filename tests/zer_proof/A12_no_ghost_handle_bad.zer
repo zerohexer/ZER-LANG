@@ -1,0 +1,15 @@
+// Iris theorem: step_spec_alloc_succ (iris_step_specs.v)
+// Covers row: A12 — ghost handle (discarded alloc result)
+// EXPECTED: compile error
+//
+// pool.alloc() produces a fresh `alive_handle γ p i g` resource
+// that MUST be bound to a variable. Discarding the result (bare
+// expression) leaks the resource at the statement boundary —
+// zercheck catches this as "discarded alloc result / handle leaked".
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    tasks.alloc();  // <-- ghost handle: result discarded, must be rejected
+}

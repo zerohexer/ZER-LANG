@@ -1,0 +1,18 @@
+// Iris theorem: spec_get (proofs/operational/lambda_zer_handle/iris_specs.v)
+// Covers row: A01 — use-after-free prevention
+// Expected: compiles + runs + exits 0 (safe program)
+//
+// This is the POSITIVE case: allocate, use, then free. No UAF.
+
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    if (mh) |h| {
+        // Use before free — safe.
+        u32 x = tasks.get(h).id;
+        tasks.free(h);
+        // No use after this point.
+    }
+}

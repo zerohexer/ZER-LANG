@@ -9,6 +9,62 @@
 - Adding a new subset (`lambda_zer_move`, `lambda_zer_mmio`, etc.)
 - Debugging a Coq build failure
 
+## Fresh-session reading order (do this first)
+
+If you're picking up proof work cold, read these in order. Total ~65 minutes. After this, you have enough context to safely modify any `.v` file.
+
+| # | File | Time | What you learn |
+|---|---|---|---|
+| 1 | `CLAUDE.md` | (auto-injected) | ZER language summary + pointer to this file |
+| 2 | `docs/formal_verification_plan.md` | 5 min | Big picture — Coq + Iris, no year timeline, subset-per-feature |
+| 3 | `docs/safety_list.md` | 15 min | **What's proven + at what depth** (203-row matrix) |
+| 4 | **This file** (`docs/proof-internals.md`) | 25 min | **MANDATORY** — patterns, gotchas, build quirks, tactic recipes |
+| 5 | `BUGS-FIXED.md` (search "Iris" / "Coq") | 10 min | Past session pitfalls |
+| 6 | `proofs/operational/README.md` | 3 min | Directory layout |
+| 7 | Your target `.v` file header | 5 min | Each file documents its phase/purpose |
+
+**After reading:** you know what's proven, how to extend the proofs, and what errors to expect. Without this reading, fresh sessions typically waste 2-5 hours on rediscovered pitfalls.
+
+## What's next — priority queue (2026-04-21)
+
+Next subsets to deepen from schematic to operational, ranked by ratio (rows closed / effort hours):
+
+| Priority | Subset | Rows | Est. hours | Reason |
+|---|---|---|---|---|
+| **1** | **λZER-opaque** (J) | 14 | 20-40 | Provenance ghost state — well-understood RustBelt pattern. 14 rows / 30 hrs ≈ high ratio. Unlocks `*opaque` C interop proofs. |
+| **2** | **λZER-escape** (O) | 12 | 30-60 | Region invariants (dangling pointers). Clean RustBelt-lifetime analog. Also unblocks cross-function escape reasoning. |
+| **3** | **λZER-mmio** (H) | 9 | 20-40 | MMIO region invariants. Hardware safety. Smaller scope, clean invariant. |
+| **4** | **λZER-concurrency** (C+D+E) | 25 | 100-200 | Real Iris concurrency. Hardest. Do after we have more easy subsets for confidence. |
+| **5** | **λZER-async** (F) | 5 | 40-80 | Builds on concurrency. Do after (4). |
+
+**Orthogonal priority: Layer 2 tests.** See "Layer 2 — wiring proofs to tests" section below. ~20-30 hours to add one `tests/zer_proof/*.zer` per proven theorem. Closes the "Iris spec = correctness oracle" loop.
+
+**Long-term: Level 3 VST on zercheck.c.** ~150-500 hours. Start after at least 3-4 subsets at operational depth.
+
+## Layer 2 — wiring proofs to tests (not yet done)
+
+The correctness-oracle workflow requires a test for each proven theorem. If the compiler silently regresses, these tests catch it.
+
+**Proposed structure:**
+```
+tests/zer_proof/
+  A01_no_uaf_simple.zer              — exercises spec_get
+  A01_no_uaf_simple_bad.zer          — violation (must FAIL to compile)
+  A06_no_double_free.zer             — alive_handle_exclusive
+  A06_no_double_free_bad.zer         — violation
+  A12_no_ghost_handle.zer            — step_spec_alloc_succ
+  A12_no_ghost_handle_bad.zer        — violation
+  B01_no_use_after_move.zer          — B01_use_after_move_operational
+  B01_no_use_after_move_bad.zer      — violation
+  ... one pair per proven theorem
+```
+
+**Mechanism:** `make check` already runs positive + negative `.zer` tests. Adding `tests/zer_proof/` means each theorem has a compile-time enforcement check. If zercheck changes and starts accepting the `*_bad.zer` program, the test fails — **pointing at which Iris theorem the compiler just violated**.
+
+**Cost:** ~30 min per theorem × ~55 theorems = 20-30 hours total. High value.
+
+**Status:** not started. Should precede Level 3 VST.
+
 ## The build
 
 ```bash

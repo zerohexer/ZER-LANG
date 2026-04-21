@@ -1,0 +1,16 @@
+// Iris theorem: B01_use_after_move_operational (lambda_zer_move/iris_move_theorems.v)
+// Covers row: B01 — use after move detection
+// EXPECTED: compile error
+//
+// move struct is linear. Assignment transfers ownership; the source
+// is HS_TRANSFERRED. Iris `alive_move γ id` is consumed; re-use has
+// no resource.
+
+move struct Token { u32 kind; }
+
+void main() {
+    Token a;
+    a.kind = 1;
+    Token b = a;   // ownership transferred to b
+    u32 x = a.kind; // <-- use after move: must be rejected
+}

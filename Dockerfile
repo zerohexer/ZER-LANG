@@ -12,6 +12,7 @@ WORKDIR /zer
 
 # Copy source files
 COPY *.c *.h Makefile ./
+COPY src/ src/
 COPY test_modules/ test_modules/
 COPY lib/ lib/
 COPY tools/ tools/

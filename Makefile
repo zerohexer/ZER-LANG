@@ -5,11 +5,14 @@ CFLAGS = -Wall -Wextra -std=c99 -O2 -I.
 # zercheck_ir.c is the CFG-based replacement for zercheck.c (per docs/cfg_migration_plan.md).
 # During migration both coexist: zercheck.c is primary, zercheck_ir.c grows to feature
 # parity, verified via dual-run in Phase E, then zercheck.c deleted at Phase F (v0.5.0).
-CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c
+CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c src/safety/handle_state.c
 CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 # Library sources (everything except zerc_main)
-LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c
+# src/safety/*.c files are VST-verified predicates also linked into zerc.
+# See docs/formal_verification_plan.md Level 3 — same .c verified by
+# `make check-vst` and built into zerc. Any divergence breaks CI.
+LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c src/safety/handle_state.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # ---- Compiler binary ----
@@ -253,14 +256,26 @@ check-vst-image:
 	docker build -t zer-vst -f proofs/vst/Dockerfile proofs/vst
 
 check-vst:
-	cd proofs/vst && MSYS_NO_PATHCONV=1 docker run --rm \
-	    -v "$$(pwd -W 2>/dev/null || pwd):/work" -w /work zer-vst \
+	# Mount the WHOLE repo so VST sees both src/safety/ (the real
+	# predicates linked into zerc) and proofs/vst/ (the VST specs).
+	# Extracted predicates are clightgen'd from the SAME .c file that
+	# `make zerc` compiles — single source of truth. If someone edits
+	# src/safety/*.c in a way that breaks the Coq spec, this target
+	# fails and blocks the PR. That's the correctness-oracle loop.
+	MSYS_NO_PATHCONV=1 docker run --rm \
+	    -v "$$(pwd -W 2>/dev/null || pwd):/repo" -w /repo zer-vst \
 	    bash -c 'eval $$(opam env) && \
-	        clightgen -normalize simple_check.c zer_checks.c && \
+	        clightgen -normalize src/safety/handle_state.c && \
+	        cd proofs/vst && \
+	        clightgen -normalize simple_check.c zer_checks.c zer_checks2.c && \
 	        coqc -Q . zer_vst simple_check.v && \
 	        coqc -Q . zer_vst verif_simple_check.v && \
 	        coqc -Q . zer_vst zer_checks.v && \
-	        coqc -Q . zer_vst verif_zer_checks.v'
+	        coqc -Q . zer_vst verif_zer_checks.v && \
+	        coqc -Q . zer_vst zer_checks2.v && \
+	        coqc -Q . zer_vst verif_zer_checks2.v && \
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/handle_state.v && \
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_handle_state.v'
 	@echo "=== VST proofs compile green ==="
 	@if grep -l 'Admitted\|admit\.' proofs/vst/verif_*.v 2>/dev/null | grep -q .; then \
 	    echo "FAIL: admits found in VST proofs"; exit 1; \

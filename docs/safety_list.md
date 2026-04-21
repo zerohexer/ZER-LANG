@@ -54,7 +54,7 @@ Two purposes:
 | Sections | Rows | Depth |
 |---|---|---|
 | A — handle lifecycle | 18 | **Operational + fupd step specs** (resource algebra, state_interp, three step-specs axiom-free) |
-| B — move struct | 8 | Operational resource (reuses alive_handle) |
+| B — move struct | 8 | **FULL operational** — own subset `lambda_zer_move/` with EAllocMove/EConsume/EDrop semantics, alive_move resource, step specs axiom-free |
 | G, I, K, N, P, Q, T | 55 | Typing-level schematic |
 | L, M, R, S | 34 | VRP + typing + context-flag + evaluator schematic |
 | H, J, O | 35 | Region/provenance schematic (dedicated subsets would deepen) |
@@ -105,7 +105,7 @@ None of this adds new SAFETY CONTENT — the safety argument is mechanized. It's
 | Category | Rows | Status |
 |---|---|---|
 | A. Handle lifecycle (UAF, double-free, leak) | 18 | ✓ (all 18 rows proven) |
-| B. Move struct / ownership transfer | 8 | ✓ (all 8 rows proven) |
+| B. Move struct / ownership transfer | 8 | ✓ **FULL operational** — `lambda_zer_move/` subset |
 | C. Thread safety & spawn | 12 | ✓ (schematic — context-flag + linear resources; `iris_concurrency.v`) |
 | D. Shared struct & deadlock | 5 | ✓ (schematic — Iris invariants + lock-order ghost state; `iris_concurrency.v`) |
 | E. Atomic / condvar / barrier / semaphore | 8 | ✓ (schematic — typing + logically-atomic triples; `iris_concurrency.v`) |

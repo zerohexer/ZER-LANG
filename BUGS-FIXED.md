@@ -5,6 +5,104 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-21 (lambda_zer_move operational subset) — new-subset pitfalls
+
+Creating the FIRST subset directory beyond `lambda_zer_handle/` —
+`lambda_zer_move/` with full operational depth for section B —
+surfaced several new patterns worth recording.
+
+### gset requires sets import, not gset itself
+
+**Symptom:** `Cannot find a physical path bound to logical path gset`.
+
+**Root cause:** In recent stdpp, `gset` types are re-exported via
+`From stdpp Require Import sets.` (NOT `gset`). The submodule was
+renamed / removed as a direct import target.
+
+**Fix:** use `From stdpp Require Import gmap sets.` when the file
+needs gset operations (elem_of, union, singleton, etc.).
+
+### `()` vs `tt` — unit value syntax in gmap value types
+
+**Symptom:** `Could not find an instance for "Lookup move_id Set
+(gmap move_id ())"`.
+
+**Root cause:** `()` in Coq value position is ambiguous. When the
+type annotation is missing, Coq can parse `()` as `Set` (sort) or
+as `unit` constructor. For gmap values, we need the TYPE `unit`,
+not the sort.
+
+**Fix:** always use `tt` (the explicit unit constructor) and
+`unit` (the explicit type name):
+```coq
+Definition m : gmap nat unit := ∅.    (* type *)
+Definition v : unit := tt.            (* value *)
+m !! 0 = Some tt.                     (* lookup pattern *)
+```
+
+Never rely on `()` context-disambiguation; be explicit.
+
+### `-Q` binding per subset in _CoqProject
+
+**Symptom:** `Warning: in orphan_zer_handle_zer_move` after adding
+a new subset directory.
+
+**Root cause:** A new subset directory needs its own `-Q <dir> <namespace>`
+binding in `_CoqProject`. Without it, the files compile but aren't
+addressable via `From <namespace> Require Import ...`.
+
+**Fix:** add the binding:
+```
+-Q lambda_zer_handle zer_handle
+-Q lambda_zer_move   zer_move
+
+lambda_zer_handle/syntax.v
+...
+lambda_zer_move/syntax.v
+...
+```
+
+Each subset gets its own namespace. Within-subset imports use that
+namespace (`From zer_move Require Import syntax`), cross-subset
+imports use the other subset's namespace.
+
+### step_spec_alloc requires counter-well-formedness invariant
+
+**Symptom:** needed 2 admits in `step_spec_alloc` — couldn't prove
+the fresh ghost-map entry because nothing guaranteed `st_next`
+wasn't already in the ghost map's domain.
+
+**Root cause:** `move_state_interp` initially only said "ghost-map
+dom = st_live." Nothing connected `st_next` (the monotonic allocation
+counter) to the live set. A freshly-picked `new_id = st_next` could
+collide with a stale-live id.
+
+**Fix:** strengthen the invariant with
+`∀ id ∈ st_live, id < st_next`. Every step rule preserves this:
+- step_alloc_move: adds new_id = st_next, bumps to S st_next. New
+  id is S-1 < S of new next.
+- step_consume / drop: shrinks st_live, doesn't change st_next.
+  Set-difference preserves the `< st_next` bound.
+
+With the strengthened invariant, `step_spec_alloc` closes fully —
+the fresh-id obligation `gs !! new_id = None` follows from
+new_id = st_next being strictly greater than every live id.
+
+**Lesson:** state interpretation must include EVERY invariant needed
+to prove step specs. Common oversight: counter-vs-domain constraints.
+
+### Lia needs explicit import
+
+**Symptom:** `Unknown tactic lia` in a file using integer comparison.
+
+**Root cause:** `lia` is in `Coq.micromega.Lia`, not auto-imported.
+
+**Fix:** `From Coq Require Import Lia.` at the top of any file
+needing Presburger arithmetic. stdpp imports don't transitively
+expose lia.
+
+---
+
 ## Session 2026-04-21 (100% safety matrix coverage) — extension pitfalls
 
 **Not traditional compiler bugs.** Pitfalls found while extending the

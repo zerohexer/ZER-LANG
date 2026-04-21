@@ -21,6 +21,15 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/work" -w /work zer-proofs \
     bash -c 'eval $(opam env) && make'
 ```
 
+`make check-proofs` from the repo root is the shortcut.
+
+**Subset directories and bindings:** The `_CoqProject` file declares both subsets:
+```
+-Q lambda_zer_handle zer_handle
+-Q lambda_zer_move   zer_move
+```
+Use `From zer_handle Require Import ...` for lambda_zer_handle/ files; `From zer_move Require Import ...` for lambda_zer_move/. Each subset has its own namespace.
+
 **Why `MSYS_NO_PATHCONV=1`**: Git Bash on Windows auto-converts `:` in volume mounts, breaking Docker. Must disable for mount to work.
 
 **Why `$(pwd -W)`**: Git Bash's POSIX path (`/c/...`) isn't what Docker wants; `pwd -W` gives the Windows-style path (`C:/...`) that Docker accepts. Linux hosts can use plain `$(pwd)`.
@@ -88,7 +97,8 @@ When adding a new safety row, find the matching file:
 | A15-A16 (loops) | Schematic | `iris_loop.v` |
 | A17 (runtime gen check) | Operational | `iris_specs.v` |
 | Step specs (alloc/free/get) | Full operational | `iris_step_specs.v` |
-| B01-B08 (move struct) | Schematic (reuses handleG) | `iris_move.v` |
+| B01-B08 (move struct) | Schematic (in lambda_zer_handle, reuses handleG) | `iris_move.v` |
+| B01-B08 (move struct) | **FULL operational** (dedicated subset) | `lambda_zer_move/syntax.v`, `semantics.v`, `iris_move_resources.v`, `iris_move_state.v`, `iris_move_specs.v`, `iris_move_theorems.v` |
 | C01-C12 (thread/spawn) | Schematic | `iris_concurrency.v` |
 | D01-D05 (shared/deadlock) | Schematic | `iris_concurrency.v` |
 | E01-E08 (atomic/condvar/etc) | Schematic | `iris_concurrency.v` |

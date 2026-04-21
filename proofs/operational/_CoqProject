@@ -1,4 +1,5 @@
 -Q lambda_zer_handle zer_handle
+-Q lambda_zer_move   zer_move
 
 -arg -w -arg -notation-overridden
 -arg -w -arg -redundant-canonical-projection
@@ -27,3 +28,10 @@ lambda_zer_handle/iris_misc_sections.v
 lambda_zer_handle/iris_mmio_cast_escape.v
 lambda_zer_handle/iris_concurrency.v
 lambda_zer_handle/iris_demo.v
+
+lambda_zer_move/syntax.v
+lambda_zer_move/semantics.v
+lambda_zer_move/iris_move_resources.v
+lambda_zer_move/iris_move_state.v
+lambda_zer_move/iris_move_specs.v
+lambda_zer_move/iris_move_theorems.v

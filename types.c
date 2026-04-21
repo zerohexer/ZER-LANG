@@ -1,4 +1,5 @@
 #include "types.h"
+#include "src/safety/type_kind.h"   /* zer_type_kind_is_* — VST-verified */
 #include <stdio.h>
 #include <string.h>
 
@@ -160,47 +161,34 @@ Type *type_func_ptr(Arena *a, Type **params, uint32_t param_count, Type *ret) {
  * Type queries
  * ================================================================ */
 
+/* Type queries — all delegate to VST-verified predicates in src/safety/
+ * after type_unwrap_distinct. The safety logic lives in src/safety/type_kind.c. */
+
 bool type_is_integer(Type *a) {
     a = type_unwrap_distinct(a);
-    switch (a->kind) {
-    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64:
-    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
-    case TYPE_USIZE:
-    case TYPE_ENUM: /* enums are i32 internally */
-        return true;
-    default:
-        return false;
-    }
+    return zer_type_kind_is_integer(a->kind) != 0;
 }
 
 bool type_is_signed(Type *a) {
     a = type_unwrap_distinct(a);
-    switch (a->kind) {
-    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
-    case TYPE_ENUM: /* enums are i32 */
-        return true;
-    default:
-        return false;
-    }
+    return zer_type_kind_is_signed(a->kind) != 0;
 }
 
 bool type_is_unsigned(Type *a) {
     a = type_unwrap_distinct(a);
-    switch (a->kind) {
-    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
-        return true;
-    default:
-        return false;
-    }
+    return zer_type_kind_is_unsigned(a->kind) != 0;
 }
 
 bool type_is_float(Type *a) {
     a = type_unwrap_distinct(a);
-    return a->kind == TYPE_F32 || a->kind == TYPE_F64;
+    return zer_type_kind_is_float(a->kind) != 0;
 }
 
 bool type_is_numeric(Type *a) {
-    return type_is_integer(a) || type_is_float(a);
+    /* Direct delegation — zer_type_kind_is_numeric calls both inner
+     * predicates internally. One type_unwrap_distinct here covers both. */
+    a = type_unwrap_distinct(a);
+    return zer_type_kind_is_numeric(a->kind) != 0;
 }
 
 int type_width(Type *a) {

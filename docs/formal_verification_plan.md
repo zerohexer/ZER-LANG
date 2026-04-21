@@ -252,7 +252,7 @@ Target: 40 predicates extracted + VST-verified. Each file in `src/safety/`, one 
 |---|---|---|
 | Handle state (4 fns) | `src/safety/handle_state.c` | **DONE** (`zer_handle_state_is_invalid/alive/freed/transferred`) |
 | Range checks (3 fns) | `src/safety/range_checks.c` | **DONE** (`zer_count_is_positive`, `zer_index_in_bounds`, `zer_variant_in_range`) |
-| Type kind predicates (6 fns) | `src/safety/type_kind.c` | TODO (`zer_type_kind_is_integer`, `is_pointer`, `is_struct`, `is_enum`, `is_move_struct`, `is_container`) |
+| Type kind predicates (7 fns) | `src/safety/type_kind.c` | **DONE** (`zer_type_kind_is_integer`, `is_signed`, `is_unsigned`, `is_float`, `is_numeric`, `is_pointer`, `has_fields`) |
 | Coercion rules (8 fns) | `src/safety/coerce_rules.c` | TODO (`zer_coerce_allowed_int_widen`, `is_sign_compatible`, `preserves_const`, `preserves_volatile`, ...) |
 | Context ban rules (6 fns) | `src/safety/context_bans.c` | TODO (`zer_return_allowed_in_context`, `yield_allowed`, `break_allowed`, `goto_allowed`, ...) |
 | Provenance rules (4 fns) | `src/safety/provenance.c` | TODO (`zer_provenance_compatible`, `is_propagated_by_cast`, ...) |
@@ -477,7 +477,7 @@ Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zerche
 | **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
 | **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
 | **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
-| **Level 3 — VST on extracted predicates** | **7 real extractions** (4 handle-state + 3 range-check predicates). Infrastructure complete (Phase 0). Phase 1 at 16% (7/44). |
+| **Level 3 — VST on extracted predicates** | **14 real extractions** (4 handle-state + 3 range-check + 7 type-kind). Infrastructure complete (Phase 0). Phase 1 at 32% (14/44). |
 | **Phase 7 — Deepen schematic → operational** | 82 rows at schematic depth. Path to seL4-level proof. ~425 hrs. |
 | **Total path to seL4-level formal verification** | **~1,085 hrs** (~1 year focused, ~3 years casual). 20-30x faster than CompCert/seL4 thanks to existing 42-file Iris infrastructure + LLM assistance + narrower target (safety properties only, not semantic preservation). |
 | λZER-concurrency (Iris concurrency primitives) | Not started. |

@@ -719,12 +719,37 @@ These would get their own `lambda_zer_*/` directory with operational semantics e
    Extension: continuation-passing wp, Löb induction, state-struct invariants.
    Effort: ~40-80 hours. Builds on concurrency subset.
 
-### Level 3 — VST on compiler
+### Level 3 — VST on compiler (extract-and-link, IN PROGRESS)
 
-When schematic proofs exist for all sections, the next value-add is VST-verifying the compiler's implementation against them. Scope: ~50 safety-critical functions in zercheck.c + emitter.c.
+See "Verification strategy — extract-and-link" above for the full pattern.
 
-- Per-function contract + VST proof: ~5-20 hours each
-- Total: ~150-500 hours for full "Iris spec as compiler correctness oracle"
+**Status (2026-04-21):** 1 real extraction landed (`zer_handle_state_is_invalid`). Next batch: `is_freed`, `is_alive`, `is_transferred`, pool/variant range predicates.
+
+**Scope (honest, smaller than earlier estimates):**
+- 15-25 pure predicates extractable from zercheck.c + zercheck_ir.c
+- ~1-3 hrs per extraction (smaller than earlier "5-20 hrs" — these are 1-line predicates)
+- Complex functions (struct separation logic, loops, recursion) are SEPARATE work — maybe 5-10 functions, 20+ hrs each. Not in current wave.
+
+**Decision tree for fresh sessions:**
+
+```
+Editing a safety check?
+├─ Is it a pure predicate (primitive args, no mutation)?
+│  ├─ YES → extract it. Place in src/safety/<name>.c.
+│  │        Wire both zercheck.c AND zercheck_ir.c.
+│  │        Add VST proof. Add to check-vst target.
+│  └─ NO → leave it inline in zercheck_ir.c / zercheck.c.
+│          Document why it can't be extracted (needs AST,
+│          recursive, mutates state, etc.).
+└─ Editing src/safety/*.c directly?
+   └─ Run `make check-vst` before committing. If VST fails,
+      either fix the C or update the Coq spec to match.
+```
+
+**When `make check-vst` fails:**
+- Proof error at Qed → C diverged from spec. Either fix C to match spec, or update spec.
+- Compile error in handle_state.v → clightgen output changed. Inspect differences.
+- Import error → Makefile -Q mapping wrong.
 
 ## Design precedents — use for consistency
 

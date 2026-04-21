@@ -35,10 +35,24 @@
  *
  * Callers:
  *   - zercheck.c:is_handle_invalid (dispatches to this)
+ *   - zercheck.c:is_handle_consumed (dispatches to this — same 3-state logic,
+ *                                     different semantic label)
  *   - zercheck_ir.c:ir_is_invalid  (dispatches to this)
  *
  * Corresponds to predicate is_invalid_state in
  * proofs/operational/lambda_zer_typing/typing.v. */
 int zer_handle_state_is_invalid(int state);
+
+/* Returns 1 iff state == ZER_HS_ALIVE. Locks the semantic: "ALIVE"
+ * means integer value 1. If someone reorders the HS_* enum without
+ * updating this constant, VST catches the divergence. */
+int zer_handle_state_is_alive(int state);
+
+/* Returns 1 iff state == ZER_HS_FREED. */
+int zer_handle_state_is_freed(int state);
+
+/* Returns 1 iff state == ZER_HS_TRANSFERRED. Used by move struct
+ * ownership tracking and scoped-spawn join checks. */
+int zer_handle_state_is_transferred(int state);
 
 #endif

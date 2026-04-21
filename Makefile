@@ -217,6 +217,18 @@ docker-vsix:
 # The proofs are the "tests" — compilation IS the correctness check.
 # A broken proof means a compiler invariant was violated.
 
+# ---- Full correctness-oracle pipeline ----
+# Runs ALL verification layers: tests, Level 1 (Iris/Coq), Level 3 (VST on
+# extracted predicates), and safety-coverage audit. Use this in CI.
+#
+# Individual targets:
+#   check                    -> tests only (~5 min)
+#   check-proofs             -> Iris/Coq proofs, ~330 theorems, 0 admits (~10 min)
+#   check-vst                -> VST on extracted predicates (~3 min)
+#   check-safety-coverage    -> safety_list.md coverage audit (<1 min)
+check-all: check check-proofs check-vst check-safety-coverage
+	@echo "=== ALL VERIFICATION LAYERS GREEN ==="
+
 check-proofs-image:
 	docker build -t zer-proofs -f proofs/operational/Dockerfile proofs/operational
 
@@ -299,4 +311,4 @@ check-safety-coverage:
 	    echo "OK: safety_coverage_raw.md up to date"; \
 	fi
 
-.PHONY: check clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst
+.PHONY: check check-all clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst

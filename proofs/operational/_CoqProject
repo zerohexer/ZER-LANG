@@ -1,5 +1,6 @@
 -Q lambda_zer_handle zer_handle
 -Q lambda_zer_move   zer_move
+-Q lambda_zer_opaque zer_opaque
 
 -arg -w -arg -notation-overridden
 -arg -w -arg -redundant-canonical-projection
@@ -35,3 +36,10 @@ lambda_zer_move/iris_move_resources.v
 lambda_zer_move/iris_move_state.v
 lambda_zer_move/iris_move_specs.v
 lambda_zer_move/iris_move_theorems.v
+
+lambda_zer_opaque/syntax.v
+lambda_zer_opaque/semantics.v
+lambda_zer_opaque/iris_opaque_resources.v
+lambda_zer_opaque/iris_opaque_state.v
+lambda_zer_opaque/iris_opaque_specs.v
+lambda_zer_opaque/iris_opaque_theorems.v

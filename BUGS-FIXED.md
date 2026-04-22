@@ -210,6 +210,54 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Seventh batch — escape rules, oracle-driven (2026-04-22)
+
+First batch extracted with **oracle-driven specs** instead of code-driven.
+
+The λZER-escape operational proof (`lambda_zer_escape/iris_escape_specs.v`)
+already states the rule: only `RegStatic` pointers can escape scope.
+`RegLocal` and `RegArena` make the operational semantics get stuck.
+
+Extracted 3 predicates to `src/safety/escape_rules.c`:
+- `zer_region_can_escape(region)` — 1 iff region == STATIC (matches oracle)
+- `zer_region_is_local(region)` — helper for error message distinction
+- `zer_region_is_arena(region)` — helper for error message distinction
+
+Plus a static helper `zer_sym_region_tag(is_local_derived, is_arena_derived)`
+in checker.c that converts the existing bool flags to a region tag.
+
+Wired checker.c NODE_RETURN escape-check path (~line 8088). The pattern
+changed from separate `if (is_arena_derived)` / `if (is_local_derived)`
+to `zer_region_can_escape(region) == 0` then distinct error messages
+based on `zer_region_is_arena(region)`.
+
+VST proof (`verif_escape_rules.v`): 3 lemmas, zero admits. Spec matches
+oracle: `region == STATIC → 1, else → 0`.
+
+### Discipline shift: oracle-driven > audit-first
+
+User's insight (2026-04-22): "we can proof that directly right? or why
+do you want fresh red-team audit, when we gonna proof it?"
+
+Correct. If the Coq spec is written against a Level 1 ORACLE (not
+against the C), VST exposes implementation-vs-rule divergence. The
+audit-before-extraction discipline (from 2026-04-21) was over-defensive
+for cases where a Level 1 oracle exists.
+
+Updated discipline in CLAUDE.md and `proof-internals.md`:
+- If Level 1 oracle exists (operational or predicate proof) →
+  write spec from the oracle, let VST catch bugs
+- If no oracle (schematic rows, un-extractable code) →
+  audit-first is still valuable
+
+All 3 real bugs from the 2026-04-21 Gemini audit (F5 shift, F3 escape,
+F7 iter limit) were catchable by oracle-driven extraction. The audit
+was a secondary defense that would have been unnecessary with
+disciplined spec-writing.
+
+**Honest count after 7th batch: 28 Level-3-verified compiler functions.**
+Phase 1 progress: 28/44 = 64%.
+
 ### Sixth batch — context ban rules (2026-04-22)
 
 Extracted 6 context-ban predicates to `src/safety/context_bans.c`:

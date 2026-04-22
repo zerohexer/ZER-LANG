@@ -515,14 +515,15 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Level 3 — Architecture 1 extract-and-link VST (2026-04-21, 7 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c/checker.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR.
 
-Extracted so far (25 total):
+Extracted so far (28 total):
 - `src/safety/handle_state.c` — 4 predicates: `zer_handle_state_is_invalid/alive/freed/transferred`
 - `src/safety/range_checks.c` — 3 predicates: `zer_count_is_positive`, `zer_index_in_bounds`, `zer_variant_in_range`
 - `src/safety/type_kind.c` — 7 predicates: `zer_type_kind_is_integer/signed/unsigned/float/numeric/pointer/has_fields`
 - `src/safety/coerce_rules.c` — 5 predicates: `zer_coerce_int_widening_allowed`, `_usize_same_width_allowed`, `_float_widening_allowed`, `_preserves_volatile`, `_preserves_const`
 - `src/safety/context_bans.c` — 6 predicates: `zer_return/break/continue/goto/defer/asm_allowed_in_context`
+- `src/safety/escape_rules.c` — 3 predicates: `zer_region_can_escape`, `_is_local`, `_is_arena` (oracle: λZER-escape)
 
-Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`, checker.c Pool/Ring count validation + NODE_RETURN/BREAK/CONTINUE/GOTO/DEFER/ASM handlers, types.c `type_is_integer/signed/unsigned/float/numeric` + `can_implicit_coerce` (all delegate).
+Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`, checker.c Pool/Ring count + control-flow statement handlers + return-escape check, types.c `type_is_integer/signed/unsigned/float/numeric` + `can_implicit_coerce` (all delegate).
 
 **Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 8-phase roadmap.
 
@@ -530,7 +531,7 @@ Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 40 pure predicates (~100 hrs) — **25/44 done (57%)**
+2. Phase 1 — 40 pure predicates (~100 hrs) — **28/44 done (64%)**
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)
 5. Phase 4 — Verified state APIs (~240 hrs)
@@ -574,22 +575,39 @@ Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c
 - `variable X not found` → VST auto-substed on `==`; use `destruct (Z.eq_dec _ _)` not by name.
 - `Attempt to save an incomplete proof` → proof closed fewer goals than C has. Add more destructs.
 
-**Audit-before-extraction discipline (MANDATORY before every batch):**
+**Spec discipline (CORRECTED 2026-04-22, was "audit-before-extraction"):**
 
-Level 3 VST extraction LOCKS IN the C implementation's behavior as the Coq spec. If a bug exists when you extract, the bug gets frozen into the spec and CI will enforce the BUG as "correct" forever (until the spec is manually updated).
+The original rule ("audit before extract") was defensive but often REDUNDANT. Correct discipline:
 
-**Rule:** run an adversarial audit (Gemini, manual red-team, or fuzz) BEFORE each Phase 1 extraction batch targeting a NEW subsystem. Fix the bugs found. Only THEN extract.
+**Write the Coq spec against the Level 1 ORACLE (typing.v / operational subset / safety_list.md), NOT against the current C behavior.**
 
-**Why:** our Coq/Iris Level 1 proofs verify that the RULE is correct. They DO NOT verify that the compiler applies the rule everywhere. Level 3 extraction closes that gap — but only for the behavior it captures at extraction time. Buggy behavior at extraction time = buggy spec = buggy CI.
+When the spec is oracle-driven:
+- VST FAILS if the C diverges from the rule → bugs exposed by proof failure
+- VST PASSES if the C matches → correctness guarantee
 
-**Examples of bugs the 2026-04-21 Gemini audit caught** (documented fully in `BUGS-FIXED.md` "Gemini red-team audit"):
-- Comptime shift evaluator used int64 width bound, not target type width — `1 << 40` for u32 emitted 2^40 instead of ZER's "shift >= width = 0" semantics
-- Escape analysis missed local-array → slice-field coercion in struct returns — dangling pointers
-- Zercheck_ir fixed-point iteration limit failed-open instead of fail-closed — silent UAF on complex programs
+When the spec is code-driven:
+- VST trivially passes (tautology) → bugs are frozen into the spec and CI enforces them forever
 
-All 4 real bugs would have been frozen into VST specs if extracted without fixing first. Regression tests added to `tests/zer/` and `tests/zer_fail/`.
+**Why this matters:** Level 3 VST proves "C matches spec I wrote." It does NOT prove the spec is correct. A code-matching spec just formalizes whatever the code does, bugs included. An oracle-matching spec exposes bugs because C must match the oracle.
 
-**Cadence:** do a red-team audit every ~50 extractions OR every ~500 lines of new delegation code OR when starting a new subsystem (e.g., before extracting escape rules, audit escape analysis).
+**Retroactive check of 2026-04-21 Gemini findings:** all 3 real bugs (F5 shift, F3 escape, F7 iter-limit) were catchable by Level 3 VST with disciplined spec-writing. If we'd extracted `zer_shift_eval` with a spec matching typing.v's shift rule (not matching the current int64 eval), VST would have failed — exposing the bug.
+
+**Audit-before-extraction IS still valuable when:**
+- No Level 1 oracle exists for the subsystem (schematic rows in safety_list.md)
+- Extracting won't cover the code (complex recursive functions we can't extract)
+- Testing multi-subsystem interactions (concurrency + async)
+
+**Audit-before-extraction is REDUNDANT when:**
+- Level 1 has operational/predicate proof (gold oracle)
+- The extracted predicate maps 1:1 to a Level 1 theorem
+- We write the Coq spec from the Level 1 theorem, not from the C code
+
+**Examples of bugs the 2026-04-21 Gemini audit caught** (documented fully in `BUGS-FIXED.md` "Gemini red-team audit"): comptime shift width, escape via struct field, fail-open iteration limit. All would have been caught by disciplined Level 3 extraction against Level 1 oracles. Regression tests in `tests/zer/` and `tests/zer_fail/`.
+
+**Per-batch checklist before extracting:**
+1. Does a Level 1 oracle exist for this subsystem? (Check safety_list.md and operational subsets.)
+2. If YES → extract directly. Write specs from the oracle. VST exposes any code-vs-rule divergence.
+3. If NO (schematic only, or new code) → audit first. Can't write oracle-driven specs without an oracle.
 - `Cannot find physical path bound to ... zer_safety.<name>` → Makefile missing clightgen/coqc line for the new file.
 
 Contents of `docs/compiler-internals.md`:

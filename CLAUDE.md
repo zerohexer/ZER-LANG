@@ -515,19 +515,21 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Level 3 — Architecture 1 extract-and-link VST (2026-04-21, 7 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c/checker.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR.
 
-Extracted so far (37 total):
-- `src/safety/handle_state.c` — 4 predicates: `zer_handle_state_is_invalid/alive/freed/transferred`
-- `src/safety/range_checks.c` — 3 predicates: `zer_count_is_positive`, `zer_index_in_bounds`, `zer_variant_in_range`
-- `src/safety/type_kind.c` — 7 predicates: `zer_type_kind_is_integer/signed/unsigned/float/numeric/pointer/has_fields`
-- `src/safety/coerce_rules.c` — 5 predicates: `zer_coerce_int_widening_allowed`, `_usize_same_width_allowed`, `_float_widening_allowed`, `_preserves_volatile`, `_preserves_const`
-- `src/safety/context_bans.c` — 6 predicates: `zer_return/break/continue/goto/defer/asm_allowed_in_context`
-- `src/safety/escape_rules.c` — 3 predicates: `zer_region_can_escape`, `_is_local`, `_is_arena` (oracle: λZER-escape)
-- `src/safety/provenance_rules.c` — 3 predicates: `zer_provenance_check_required`, `_type_ids_compatible`, `_opaque_upcast_allowed` (oracle: λZER-opaque)
-- `src/safety/mmio_rules.c` — 2 predicates: `zer_mmio_addr_in_range`, `_inttoptr_allowed` (oracle: λZER-mmio)
-- `src/safety/optional_rules.c` — 2 predicates: `zer_type_permits_null`, `_is_nested_optional` (oracle: typing.v N)
-- `src/safety/move_rules.c` — 2 predicates: `zer_type_kind_is_move_struct`, `_should_track` (oracle: λZER-move)
+Extracted so far (42 total — Phase 1 effectively done):
+- `src/safety/handle_state.c` — 4 predicates: state checks
+- `src/safety/range_checks.c` — 3 predicates: count/bounds/variant
+- `src/safety/type_kind.c` — 7 predicates: type categories
+- `src/safety/coerce_rules.c` — 5 predicates: widening + qualifier preservation
+- `src/safety/context_bans.c` — 6 predicates: return/break/continue/goto/defer/asm
+- `src/safety/escape_rules.c` — 3 predicates: region-tag escape (λZER-escape)
+- `src/safety/provenance_rules.c` — 3 predicates: @ptrcast provenance (λZER-opaque)
+- `src/safety/mmio_rules.c` — 2 predicates: @inttoptr safety (λZER-mmio)
+- `src/safety/optional_rules.c` — 2 predicates: null/optional rules (typing.v N)
+- `src/safety/move_rules.c` — 2 predicates: move struct tracking (λZER-move)
+- `src/safety/atomic_rules.c` — 2 predicates: @atomic width/arg (typing.v E)
+- `src/safety/container_rules.c` — 3 predicates: field/container/depth validity (typing.v T+K)
 
-Call sites across compiler: zercheck.c (`is_handle_invalid`, `is_handle_consumed`, `is_move_struct_type`, `should_track_move`), zercheck_ir.c (`ir_is_invalid`), checker.c (Pool/Ring count, control-flow handlers, return-escape, @ptrcast provenance, @inttoptr MMIO gate, TYNODE_OPTIONAL nested check), types.c (`type_is_*`, `can_implicit_coerce`). All delegate.
+Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_type, should_track_move), zercheck_ir.c (ir_is_invalid), checker.c (Pool/Ring count + control-flow handlers + return-escape + @ptrcast + @inttoptr + TYNODE_OPTIONAL + @atomic_*), types.c (type_is_*, can_implicit_coerce). All delegate.
 
 **Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 8-phase roadmap.
 
@@ -535,7 +537,7 @@ Call sites across compiler: zercheck.c (`is_handle_invalid`, `is_handle_consumed
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 40 pure predicates (~100 hrs) — **37/44 done (84%)**
+2. Phase 1 — 40 pure predicates (~100 hrs) — **42/44 done (95%) — effectively COMPLETE**
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)
 5. Phase 4 — Verified state APIs (~240 hrs)

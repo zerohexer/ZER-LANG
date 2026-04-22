@@ -477,7 +477,7 @@ Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zerche
 | **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
 | **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
 | **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
-| **Level 3 — VST on extracted predicates** | **37 real extractions** across 10 `src/safety/*.c` files. Phase 1 at 84% (37/44). Oracle-driven batches: escape (λZER-escape), provenance (λZER-opaque), mmio (λZER-mmio), optional (typing.v N), move (λZER-move). |
+| **Level 3 — VST on extracted predicates** | **42 real extractions** across 12 `src/safety/*.c` files. Phase 1 at 95% (42/44) — effectively COMPLETE. Oracle-driven batches: escape (λZER-escape), provenance (λZER-opaque), mmio (λZER-mmio), optional (typing.v N), move (λZER-move), atomic (typing.v E), container (typing.v T+K). |
 | **Phase 7 — Deepen schematic → operational** | 82 rows at schematic depth. Path to seL4-level proof. ~425 hrs. |
 | **Total path to seL4-level formal verification** | **~1,085 hrs** (~1 year focused, ~3 years casual). 20-30x faster than CompCert/seL4 thanks to existing 42-file Iris infrastructure + LLM assistance + narrower target (safety properties only, not semantic preservation). |
 | λZER-concurrency (Iris concurrency primitives) | Not started. |

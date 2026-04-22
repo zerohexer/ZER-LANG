@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-23 — `unsafe asm` keyword (feature, not bug)
+
+**Change:** Added `unsafe asm(...)` as preferred form for inline assembly. Bare `asm(...)` still accepted for backward compatibility.
+
+**Rationale:** Aligns with Rust's `unsafe { asm!() }` pattern — explicit marking of escape hatch. Makes the intent clear at call site. Signals the non-preferred path; when verified intrinsics ship (Phase D, post-Phase-7), users can grep for `unsafe asm` to find migration targets.
+
+**Implementation:**
+- `lexer.h`: Added `TOK_UNSAFE` to TokenType enum
+- `lexer.c`: Added `unsafe` keyword match (word_len==6, memcmp "safe" at +2); added case for debug token name
+- `parser.c`: Added `TOK_UNSAFE` branch before `TOK_ASM` check. Requires `asm` to follow `unsafe`. Both forms reach the same asm body parsing logic.
+- `test_lexer.c`: Added `expect_single("unsafe", TOK_UNSAFE, "unsafe")` test
+- New tests: `tests/zer/unsafe_asm_syntax.zer` (positive: both forms work), `tests/zer_fail/unsafe_without_asm.zer` (negative: unsafe without asm rejected)
+- Existing tests migrated: `rust_tests/rt_naked_asm_only.zer`, `reject_naked_array.zer`, `reject_naked_var_decl.zer` updated to use `unsafe asm`
+- `tests/zer_fail/asm_not_naked.zer` kept with bare `asm` as backward-compat regression test
+
+**Phase 1 verified rule unchanged:** `zer_asm_allowed_in_context(in_naked)` in `src/safety/context_bans.c` checks structural context, not keyword spelling. VST proof in `verif_context_bans.v` holds. Phase 1 remains at 85/85 predicates, zero admits.
+
+**Tests:** 417/417 (was 415, +2 new). check-vst: green, zero admits.
+
+**Migration policy:** Both forms work. No urgency to migrate. When intrinsics ship (Phase D), bare `asm` will emit deprecation warning when an equivalent intrinsic exists.
+
+**Docs updated:** `docs/asm_plan.md`, `docs/reference.md`, `docs/ASM_ZER-LANG.md`, `CLAUDE.md`.
+
+---
+
 ## Session 2026-04-22 (Phase 1 Batch 1) — M section arithmetic predicates
 
 ### Context

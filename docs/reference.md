@@ -1764,19 +1764,30 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
 
 ---
 
-### asm
+### unsafe asm
 
 **DESCRIPTION**
-Inline assembly. GCC operand syntax. Raw pass-through.
+Inline assembly. Escape hatch for operations not covered by verified intrinsics.
+Preferred form is `unsafe asm(...)` (Rust-style explicit marker, 2026-04-23).
+Bare `asm(...)` still works for backward compatibility.
+Only allowed inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context`).
 
 **SYNTAX**
 ```zer
-asm("cpsid i");              // disable interrupts
-asm("wfi");                  // wait for interrupt
+unsafe asm("cpsid i");       // disable interrupts (preferred)
+unsafe asm("wfi");            // wait for interrupt
 
 // With operands (GCC extended syntax):
-asm("mov %0, %1" : "=r"(out) : "r"(in));
+unsafe asm("mov %0, %1" : "=r"(out) : "r"(in));
+
+// Bare `asm` still works (backward compatible):
+asm("nop");
 ```
+
+**WHEN TO USE**
+- Prefer `@intrinsic()` calls — verified, safe, portable across archs.
+- Use `unsafe asm` only for operations not yet covered by intrinsics (new vendor extensions, experimental hardware, niche use cases).
+- For external asm code, use `cinclude "foo.S"` instead (explicit `UNSAFE-EXTERN` warning).
 
 ---
 
@@ -1784,13 +1795,13 @@ asm("mov %0, %1" : "=r"(out) : "r"(in));
 
 **DESCRIPTION**
 Function with no compiler-generated prologue/epilogue.
-Body must be pure assembly.
+Body must be pure assembly (`unsafe asm` or bare `asm`) plus `return`.
 
 **SYNTAX**
 ```zer
 naked void reset_handler() {
-    asm("ldr sp, =_stack_top");
-    asm("b main");
+    unsafe asm("ldr sp, =_stack_top");
+    unsafe asm("b main");
 }
 ```
 

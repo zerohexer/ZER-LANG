@@ -1,5 +1,7 @@
 # ASM & Low-Level Safety in ZER-LANG — Full Context Dump
 
+> **Syntax update (2026-04-23):** `asm(...)` keyword was renamed to `unsafe asm(...)` as the preferred form (Rust-style explicit escape hatch marker). Bare `asm(...)` still works for backward compatibility. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — only naked-function restriction still applies. See `docs/asm_plan.md` for full context.
+
 ## Decision History (2026-04-01)
 
 This document captures the full research and design discussion for adding safe low-level primitives to ZER-LANG. The goal: enable writing a pure ZER OS kernel (no C files, no cinclude) with full safety on all non-asm code.

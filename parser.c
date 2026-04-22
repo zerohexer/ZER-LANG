@@ -1717,9 +1717,18 @@ static Node *parse_statement(Parser *p) {
         p->previous = saved_p2;
     }
 
-    /* asm — simple: asm("nop"); or extended: asm("..." : "=r"(out) : "r"(in) : "memory");
+    /* `unsafe asm` — preferred form (Rust-style explicit escape hatch marker).
+     * Bare `asm` — accepted for backward compatibility (pre-2026-04-23 design).
+     * Both forms: simple `asm("nop");` or extended `asm("..." : "=r"(out) : "r"(in) : "memory");`
      * Bypass lexer — scan raw source for matching ) because ':' is not a ZER token. */
-    if (match(p, TOK_ASM)) {
+    bool is_asm_stmt = false;
+    if (match(p, TOK_UNSAFE)) {
+        consume(p, TOK_ASM, "expected 'asm' after 'unsafe' (unsafe is only used as `unsafe asm(...)`)");
+        is_asm_stmt = true;
+    } else if (match(p, TOK_ASM)) {
+        is_asm_stmt = true;
+    }
+    if (is_asm_stmt) {
         consume(p, TOK_LPAREN, "expected '(' after 'asm'");
         /* scan raw source from current position to find matching ) */
         const char *start = p->current.start;

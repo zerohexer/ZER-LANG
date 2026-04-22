@@ -5,6 +5,7 @@
 #include "src/safety/provenance_rules.h"   /* zer_provenance_* — VST-verified */
 #include "src/safety/mmio_rules.h"         /* zer_mmio_* — VST-verified */
 #include "src/safety/optional_rules.h"     /* zer_type_permits_null, _is_nested_optional */
+#include "src/safety/atomic_rules.h"       /* zer_atomic_width_valid — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5759,9 +5760,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     Type *at = typemap_get(c, node->intrinsic.args[0]);
                     if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
                         result = at->pointer.inner;
-                        /* validate atomic width: must be 1, 2, 4, or 8 bytes */
+                        /* validate atomic width: must be 1, 2, 4, or 8 bytes
+                         * SAFETY: zer_atomic_width_valid in src/safety/atomic_rules.c
+                         * Oracle: typing.v Section E (E01). */
                         int aw = type_width(at->pointer.inner);
-                        if (aw != 8 && aw != 16 && aw != 32 && aw != 64) {
+                        int aw_bytes = aw / 8;
+                        if (zer_atomic_width_valid(aw_bytes) == 0) {
                             checker_error(c, node->loc.line,
                                 "@%.*s target must be 1, 2, 4, or 8 bytes (got %d-bit type)",
                                 (int)nlen, name, aw);

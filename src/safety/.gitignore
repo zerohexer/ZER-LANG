@@ -10,6 +10,8 @@ provenance_rules.v
 mmio_rules.v
 optional_rules.v
 move_rules.v
+atomic_rules.v
+container_rules.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

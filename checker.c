@@ -10,6 +10,7 @@
 #include "src/safety/arith_rules.h"        /* zer_div_valid/narrowing_valid/literal_fits — M */
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
+#include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -10211,15 +10212,18 @@ static void check_stack_depth(Checker *c, Node *file_node) {
              * --stack-limit N → error when any function's frame OR
              * entry point's total call chain exceeds N bytes. */
             if (c->stack_limit > 0) {
-                /* Per-function frame size check (catches big local arrays) */
-                if (f->frame_size > c->stack_limit) {
+                /* Per-function frame size check (catches big local arrays).
+                 * SAFETY: zer_stack_frame_valid in src/safety/stack_rules.c (S01) */
+                if (zer_stack_frame_valid((int)c->stack_limit, (int)f->frame_size) == 0) {
                     checker_error(c, 0,
                         "function '%.*s' local stack %u bytes exceeds --stack-limit %u",
                         (int)f->name_len, f->name,
                         (unsigned)f->frame_size, (unsigned)c->stack_limit);
                 }
-                /* Entry point total depth check (catches deep call chains) */
-                if (!f->is_recursive && max_depth > c->stack_limit) {
+                /* Entry point total depth check (catches deep call chains).
+                 * SAFETY: zer_stack_frame_valid in src/safety/stack_rules.c (S02) */
+                if (!f->is_recursive &&
+                    zer_stack_frame_valid((int)c->stack_limit, (int)max_depth) == 0) {
                     bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
                     bool is_isr = false;
                     for (int d = 0; d < file_node->file.decl_count; d++) {

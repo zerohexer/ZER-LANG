@@ -541,7 +541,7 @@ Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_ty
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 85 pure predicates (~180 hrs) — **🔄 59/85 (69%) — FULL TARGET** (see docs/phase1_catalog.md for definitive enumeration)
+2. Phase 1 — 85 pure predicates (~180 hrs) — **🔄 60/85 (71%) — FULL TARGET** (see docs/phase1_catalog.md for definitive enumeration)
    - 71 = strict milestone (operational + typing.v real theorems, excluding concurrency schematic)
    - 85 = full target (includes 14 concurrency schematic — real theorems, weaker oracle until Phase 7 upgrades)
    - Decision 2026-04-22: extract full 85. Phase 6 `check-no-inline-safety` requires it; Phase 7 upgrades Coq spec only (C unchanged, ~20 min per predicate).

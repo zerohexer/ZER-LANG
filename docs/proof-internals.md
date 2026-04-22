@@ -387,6 +387,67 @@ This risk is mitigated by:
 
 Use Tier 2 minimum before every batch. Tier 3 every 2-3 batches. Tier 4 periodically.
 
+### Oracle catalog — which Level 1 proof covers which subsystem
+
+When extracting a predicate, the Coq spec MUST be written against a Level 1
+oracle, not against the current C. This table lets a fresh session find
+the oracle quickly.
+
+| Subsystem | Oracle file | Key Iris lemma | Phase 1 batch |
+|---|---|---|---|
+| Handle states (A) | `proofs/operational/lambda_zer_handle/iris_specs.v` | `alive_handle_exclusive`, `spec_get` | handle_state.c |
+| Move struct (B) | `proofs/operational/lambda_zer_move/iris_move_specs.v` | `step_spec_consume`, `alive_move_exclusive` | TODO move_rules.c |
+| Opaque cast / provenance (J) | `proofs/operational/lambda_zer_opaque/iris_opaque_specs.v` | `step_spec_typed_cast`, `typed_ptr_agree` | provenance_rules.c |
+| Escape analysis (O) | `proofs/operational/lambda_zer_escape/iris_escape_specs.v` | `step_spec_store_global_static` | escape_rules.c |
+| MMIO / volatile (H) | `proofs/operational/lambda_zer_mmio/iris_mmio_theorems.v` | `H01_H02_out_of_range_stuck`, `H03_unaligned_stuck` | mmio_rules.c |
+| Typing-level rules (G, I, K, N, Q, T) | `proofs/operational/lambda_zer_typing/typing.v` | predicate definitions + `X_ok` / `X_bad_rejected` theorems | context_bans.c (partial), TODO optional_rules.c |
+| VRP / arith (L, M, R, S) | `proofs/operational/lambda_zer_typing/typing.v` | same pattern | range_checks.c (partial), TODO more |
+| Concurrency (C, D, E) | Schematic only — no operational oracle yet | — | Audit-first required |
+| Async (F) | Schematic only | — | Audit-first required |
+
+**How to read an oracle:**
+1. Open the file in the table
+2. Search for the lemma name (column 3)
+3. The lemma's STATEMENT is the safety claim
+4. Translate the statement into a C predicate + Coq spec
+5. VST proves C matches the translation — if C diverges from the Iris lemma, proof fails
+
+**When no oracle exists (concurrency, async, or schematic rows):**
+- Don't extract yet — no way to write oracle-driven specs
+- Either: (a) upgrade the Iris proof to operational depth first, or (b) audit the C
+  implementation, document current behavior as the spec, and extract defensively
+
+### VST cheat sheet — types
+
+When writing VST specs for extracted C, the parameter types in C → Coq mapping:
+
+| C type | VST C type | Coq value | Works for `repeat forward_if; destruct (Z.eq_dec _ _)` |
+|---|---|---|---|
+| `int` | `tint` | `Z` in range `[Int.min_signed, Int.max_signed]` | ✓ (primary target — all current extractions use this) |
+| `unsigned int` | `tuint` | `Z` in `[0, Int.max_unsigned]` | ✓, but use `Z_ge_dec/Z_lt_dec` not `Z.eq_dec` for comparisons |
+| `long` | `tlong` | `Z` in `[Int64.min_signed, Int64.max_signed]` | Needs `Int64.repr` in spec |
+| `unsigned long` | `tulong` | `Z` in `[0, Int64.max_unsigned]` | Same |
+| `char` (signed) | `tschar` | small range; tricky sign extension | Avoid — use int |
+| `void` return | `tvoid` | N/A | Avoid — extract predicates always return int |
+
+**Rule:** prefer `int` parameters for extracted predicates. If the caller has
+wider types (like `uint64_t` addresses in MMIO), either:
+1. Narrow at call site (accept truncation for very-large values)
+2. Split extraction: inline the wide-type logic in checker, delegate only the
+   final int-to-int gate combination (what we did for MMIO)
+3. Widen the predicate to `long`/`tlong` (more VST setup)
+
+### VST gotcha — modulus / division deferred
+
+`forward` on `addr % align` needs additional lemma setup in VST 3.0 for the
+`Int.repr / Z.mod` interaction. Not blocking but adds ~30 min per proof.
+
+**Workaround:** extract the combination predicate (which takes an already-
+computed bool), keep the modulus inline in the caller. Example:
+`zer_mmio_addr_aligned(addr, align)` was deferred; `zer_mmio_inttoptr_allowed(
+in_range, aligned)` was verified instead, with the alignment-bool computed
+inline in checker.c using `(uint64_t)addr % (uint64_t)align`.
+
 ### Phase 1 extraction recipe (end-to-end)
 
 **Read this before extracting a new predicate.** Covers every step from identifying the target to commit.

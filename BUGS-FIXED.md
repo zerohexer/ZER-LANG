@@ -160,6 +160,60 @@ Never use tlong in extracted predicates unless absolutely unavoidable.
 - `zer_container_source_valid` (K01) — extend container_rules.c
 - Target after Batch 3: 57/85
 
+### BUG-603: void main() emits undefined exit code (2026-04-22)
+
+**Symptom:** `tests/zer_proof/A01_no_uaf` — positive test for handle-safety
+theorem — was exiting with code 2 instead of 0. Failing consistently
+since commit a940f2a, carried as "pre-existing A01_no_uaf failure"
+across multiple sessions (documented in 388f034, 60b2d48).
+
+**Root cause:** The ZER emitter copied `void main()` verbatim into C.
+In C99 §5.1.2.2, `main` must return int; `void main()` leaves exit
+code undefined (on this system, whatever was in EAX from the last
+pool-allocator helper = 2).
+
+Diagnosed by:
+1. Running `./zerc --run tests/zer_proof/A01_no_uaf.zer` inside the
+   Docker container → `exit=2`
+2. Inspecting generated C → `void main(void) { ... return; }`
+3. Grepping emitter.c for "main" → zero special-case handling
+
+**Why it was missed:** all other `tests/zer_proof/*.zer` tests use
+`void main()` but are `_bad` tests that must FAIL to compile — they
+never run, so never exposed the exit-code bug. A01_no_uaf was the
+ONLY positive test in the directory.
+
+**Fix:** auto-promote `void main()` to `int main(void) { ... return 0; }`
+at emission time.
+
+Changes:
+- `emitter.h`: added `bool current_main_promoted` flag to Emitter struct.
+- `emitter.c emit_regular_func_from_ir`: detects main + void return + no
+  module prefix → emits `int` signature, sets flag to true. Resets flag
+  on function exit.
+- `emitter.c emit_return_null`: if `current_main_promoted` is true and
+  we're emitting a bare return, emit `return 0;` instead of `return;`.
+- C99 §5.1.2.2.3 handles fall-through naturally (int main fall-through
+  = return 0), so no explicit end-of-body return 0 needed.
+
+**Why Option A (emitter fix) over Option B (test fix):** this is a
+real compiler bug affecting any user writing `void main()`. Fixing
+the test would only paper over the actual issue. Option A gives
+defined semantics program-wide.
+
+**Test:** `tests/zer_proof/A01_no_uaf.zer` now exits 0.
+`make docker-check` reports 415/415 (previously 414/415).
+
+**Lesson:** this is exactly why Level 2 integration tests + Level 3
+VST proofs are BOTH needed. Level 3 proves per-predicate correctness
+at the input space level — it would never catch an emitter bug in
+main function signature emission (that's codegen, not predicate
+evaluation). Level 2 runs the actual compiled program and catches
+the end-to-end result. Complementary, not redundant.
+
+Regression test: already exists as tests/zer_proof/A01_no_uaf.zer;
+it's the very test that caught this bug.
+
 ---
 
 ## Session 2026-04-21 (Level 3 extract-and-link) — first real compiler-code VST

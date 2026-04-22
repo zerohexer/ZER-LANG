@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Regression: yield used outside an async function must be rejected,
+// not silently emitted as a no-op. Fixes Phase-1 audit gap #3.
+
+void go() {
+    yield;
+}
+
+u32 main() {
+    go();
+    return 0;
+}

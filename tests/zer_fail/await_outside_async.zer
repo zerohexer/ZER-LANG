@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Regression: await outside async must be rejected. Same class as yield.
+
+void wait_thing() {
+    await true;
+}
+
+u32 main() {
+    wait_thing();
+    return 0;
+}

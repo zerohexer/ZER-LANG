@@ -83,11 +83,11 @@ they should fail). When a gap is fixed, move the reproducer to
 |---|---|---|---|---|
 | 1 | **Cross-block backward goto UAF** | `free(h); goto LABEL; ... LABEL: ... use(h)` — zercheck linear-walk can't track cycles | Slab gen counter traps at runtime (exit 133 / SIGTRAP) | ~300 lines — CFG-based zercheck rewrite |
 | 2 | **Same-line UAF suppressed** | `h.free(p); u32 x = p.x;` on same line — `h->free_line < cur_line` check filters | Slab gen counter traps | ~30 lines — replace line-compare with statement-counter |
-| 3 | **`yield` outside async silently stripped** | `void go() { yield; }` compiles; emits no-op | None (silent behavior) | ~5 lines — check `!in_async` in NODE_YIELD |
+| ~~3~~ | ~~**`yield` outside async silently stripped**~~ | FIXED 2026-04-22 — `check_stmt` rejects `yield`/`await` when `!c->in_async`. Regression: `tests/zer_fail/{yield,await}_outside_async.zer` | — | — |
 | 4 | **async + shared struct across yield** | `async { s.v = 1; yield; s.v = 2; }` on a `shared struct` — lock held across yield = deadlock per spec, not enforced | Potential deadlock at runtime | medium — AST walker for shared access in async fn |
 | 5 | **`container<move struct>` loses move semantics** | `Box(Tok) b; b.item = t; consume(b.item); b.item.k` — move-transfer through container field not tracked | None (use after transfer) | medium — move-tracking through field writes |
 | 6 | **`goto` into if-unwrap capture scope** | `goto inside; if (m) \|v\| { inside: return v; }` — captured `v` uninitialized at goto target | Auto-zero (returns 0 silently) | medium — label reachability analysis |
-| 7 | **`defer` nested in `defer` body** | `defer { defer { ... } }` accepted per spec says banned | Runs inner defer at outer defer fire time | ~5 lines — check `defer_depth > 0` in NODE_DEFER |
+| ~~7~~ | ~~**`defer` nested in `defer` body**~~ | FIXED 2026-04-22 — `check_stmt` rejects `defer` when `c->defer_depth > 0`. Regression: `tests/zer_fail/defer_nested_in_defer.zer` | — | — |
 
 ### Precision issues (not safety)
 

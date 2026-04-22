@@ -392,88 +392,8 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     }
 }
 
-static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
-
-/* Find shared struct variable accessed in a statement or expression.
- * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
- * Used to auto-insert lock/unlock around statements. */
-static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_root(e, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
-    case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Node *r = find_shared_root(e, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
-    default: return NULL;
-    }
-}
-
-static Node *find_shared_root(Emitter *e, Node *expr) {
-    if (!expr) return NULL;
-    if (expr->kind == NODE_FIELD) {
-        /* Walk to root of field chain */
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
-            Type *t = checker_get_type(e->checker, root);
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
-                /* Direct shared struct */
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
-                /* Pointer to shared struct */
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        return root;
-                }
-            }
-        }
-    }
-    /* Recurse into sub-expressions */
-    Node *found = NULL;
-    if (expr->kind == NODE_BINARY) {
-        found = find_shared_root(e, expr->binary.left);
-        if (!found) found = find_shared_root(e, expr->binary.right);
-    } else if (expr->kind == NODE_ASSIGN) {
-        found = find_shared_root(e, expr->assign.target);
-        if (!found) found = find_shared_root(e, expr->assign.value);
-    } else if (expr->kind == NODE_CALL) {
-        for (int i = 0; i < expr->call.arg_count && !found; i++)
-            found = find_shared_root(e, expr->call.args[i]);
-    } else if (expr->kind == NODE_UNARY) {
-        found = find_shared_root(e, expr->unary.operand);
-    } else if (expr->kind == NODE_INDEX) {
-        found = find_shared_root(e, expr->index_expr.object);
-    } else if (expr->kind == NODE_ORELSE) {
-        found = find_shared_root(e, expr->orelse.expr);
-    } else if (expr->kind == NODE_TYPECAST) {
-        found = find_shared_root(e, expr->typecast.expr);
-    }
-    return found;
-}
-
 static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
 static bool is_async_local(Emitter *e, const char *name, size_t len); /* forward decl */
-
-/* Check if a shared struct type uses condvar (needs mutex instead of spinlock) */
-static bool shared_needs_condvar(Emitter *e, Type *t) {
-    if (!t) return false;
-    Type *eff = type_unwrap_distinct(t);
-    if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
-    if (eff && eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
-        return is_condvar_type(e, eff->struct_type.type_id);
-    return false;
-}
 
 /* Check if a shared struct type uses reader-writer lock */
 static bool shared_is_rw(Type *t) {
@@ -482,29 +402,6 @@ static bool shared_is_rw(Type *t) {
     if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
     if (eff && eff->kind == TYPE_STRUCT) return eff->struct_type.is_shared_rw;
     return false;
-}
-
-/* Check if a statement WRITES to a shared struct (vs read-only).
- * Write = assignment target, compound assign, mutating method call.
- * Used to determine rdlock vs wrlock for shared(rw) structs. */
-static bool stmt_writes_shared(Node *stmt) {
-    if (!stmt) return false;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT:
-        /* x.field = ...; or x.field += ...; */
-        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_ASSIGN)
-            return true;
-        /* Method calls that mutate (push, free, etc.) */
-        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_CALL)
-            return true; /* conservative: any call might mutate */
-        return false;
-    case NODE_VAR_DECL:
-        return false; /* reading into a variable is read-only */
-    case NODE_RETURN:
-        return false; /* reading for return */
-    default:
-        return false;
-    }
 }
 
 /* Emit lock acquire for shared struct variable.
@@ -531,10 +428,6 @@ static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
         emit_expr(e, root);
         emit(e, "%s_zer_mtx);\n", arrow);
     }
-}
-
-static void emit_shared_lock(Emitter *e, Node *root) {
-    emit_shared_lock_mode(e, root, true); /* default: write lock (conservative) */
 }
 
 /* Emit lock release for shared struct variable */
@@ -3397,47 +3290,6 @@ static void add_async_local(Emitter *e, const char *name, size_t name_len) {
     e->async_local_count++;
 }
 
-/* BUG-490: collect local variable declarations RECURSIVELY from all blocks.
- * Sub-block locals must be promoted to state struct — they live on the C stack
- * which is destroyed on yield. Same fix as Rust's MIR generator transform. */
-static void collect_async_locals(Emitter *e, Node *node) {
-    if (!node) return;
-    if (node->kind == NODE_VAR_DECL && !node->var_decl.is_static) {
-        add_async_local(e, node->var_decl.name, node->var_decl.name_len);
-    }
-    if (node->kind == NODE_BLOCK) {
-        for (int i = 0; i < node->block.stmt_count; i++)
-            collect_async_locals(e, node->block.stmts[i]);
-    }
-    if (node->kind == NODE_IF) {
-        /* Async capture promotion: if (opt) |val| introduces implicit local 'val'.
-         * Must be promoted to state struct — lives on C stack, invalid after yield. */
-        if (node->if_stmt.capture_name) {
-            add_async_local(e, node->if_stmt.capture_name,
-                            node->if_stmt.capture_name_len);
-        }
-        collect_async_locals(e, node->if_stmt.then_body);
-        collect_async_locals(e, node->if_stmt.else_body);
-    }
-    if (node->kind == NODE_FOR) {
-        collect_async_locals(e, node->for_stmt.init);
-        collect_async_locals(e, node->for_stmt.body);
-    }
-    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE)
-        collect_async_locals(e, node->while_stmt.body);
-    if (node->kind == NODE_SWITCH) {
-        /* Switch arm captures in async deferred to v0.4 (type resolution complex) */
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            collect_async_locals(e, node->switch_stmt.arms[i].body);
-    }
-    if (node->kind == NODE_DEFER)
-        collect_async_locals(e, node->defer.body);
-    if (node->kind == NODE_CRITICAL)
-        collect_async_locals(e, node->critical.body);
-    if (node->kind == NODE_ONCE)
-        collect_async_locals(e, node->once.body);
-}
-
 /* Check if an ident name is an async-promoted local */
 static bool is_async_local(Emitter *e, const char *name, size_t len) {
     if (!e->in_async) return false;
@@ -4082,7 +3934,8 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
 
     /* Non-top-level nodes — emit_top_level_decl only handles declarations */
     case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
-    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
     case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
     case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:

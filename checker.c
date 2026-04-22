@@ -293,7 +293,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
- * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+ * Returns true and sets out_min, out_max if a bounded range was derived. */
 /* Refactor 1: unified VRP range invalidation for assignments.
  * Handles both simple ident keys and compound keys (s.x).
  * For TOK_EQ: tries literal, derive_expr_range, call return range.
@@ -2962,6 +2962,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->assign.target->kind == NODE_IDENT) {
                         tsym->is_local_derived = false;
                         tsym->is_arena_derived = false;
+                        tsym->is_from_arena = false;
                         tsym->provenance_type = NULL;
                         tsym->container_struct = NULL;
                         tsym->container_field = NULL;
@@ -6314,69 +6315,6 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    default: return false;
-    }
-}
-
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
  * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -6747,7 +6685,7 @@ static void check_stmt(Checker *c, Node *node) {
             /* Walk parent scope chain to check if name matches a param */
             Symbol *existing = scope_lookup(c->current_scope,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len);
-            if (existing && existing->line != node->loc.line) {
+            if (existing && existing->line != (uint32_t)node->loc.line) {
                 checker_error(c, node->loc.line,
                     "variable '%.*s' shadows function parameter in async function — "
                     "async locals share state struct with params, shadowing overwrites param value. "
@@ -8321,6 +8259,12 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_DEFER:
+        /* Ban defer nested in defer — per spec, and the inner defer would
+         * fire at outer-defer execution time which is confusing. */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "'defer' cannot be nested inside another 'defer' body");
+        }
         /* Ban yield/await in defer body — corrupts Duff's device state machine.
          * Function summaries catch both direct and transitive cases. */
         check_body_effects(c, node->defer.body, node->loc.line,
@@ -8416,12 +8360,19 @@ static void check_stmt(Checker *c, Node *node) {
          * BUG-481: yield in orelse at var-decl level = safe (state struct temps).
          * BUG-495: yield in orelse at expression level = GCC error
          * ("switch jumps into statement expression"). This is a GCC limitation —
-         * case labels can't be inside ({...}). The developer must extract to var-decl.
-         * No checker ban needed — GCC catches it with a clear error message. */
+         * case labels can't be inside ({...}). The developer must extract to var-decl. */
+        if (!c->in_async) {
+            checker_error(c, node->loc.line,
+                "'yield' can only be used inside an async function");
+        }
         break;
 
     case NODE_AWAIT: {
         /* await expr — check the condition expression */
+        if (!c->in_async) {
+            checker_error(c, node->loc.line,
+                "'await' can only be used inside an async function");
+        }
         if (node->await_stmt.cond) {
             check_expr(c, node->await_stmt.cond);
         }
@@ -10122,7 +10073,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 }
 
 /* Scan a function body for return expressions with derivable range.
- * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+ * If ALL return expressions have the same derivable range, set out_min, out_max. */
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found) {
     if (!node) return true;
     if (node->kind == NODE_RETURN && node->ret.expr) {
@@ -10605,8 +10556,9 @@ bool checker_check(Checker *c, Node *file_node) {
         register_decl(c, file_node->file.decls[i]);
     }
 
-    /* Pass 2: type-check all function bodies and global initializers */
-    bool ok = checker_check_bodies(c, file_node);
+    /* Pass 2: type-check all function bodies and global initializers.
+     * Return value unused here — final error count checked at end. */
+    (void)checker_check_bodies(c, file_node);
 
     /* Pass 3: whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {
@@ -10624,69 +10576,6 @@ bool checker_check(Checker *c, Node *file_node) {
     check_stack_depth(c, file_node);
 
     return c->error_count == 0;
-}
-
-/* Find the shared struct type accessed in an expression (for lock ordering) */
-static Type *find_shared_type_in_expr(Checker *c, Node *expr) {
-    if (!expr) return NULL;
-    if (expr->kind == NODE_FIELD) {
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        if (root->kind == NODE_IDENT) {
-            Type *t = typemap_get(c, root);
-            if (!t) {
-                Symbol *sym = scope_lookup(c->current_scope,
-                    root->ident.name, (uint32_t)root->ident.name_len);
-                if (sym) t = sym->type;
-            }
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return eff;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        return inner;
-                }
-            }
-        }
-    }
-    /* Recurse */
-    if (expr->kind == NODE_BINARY) {
-        Type *l = find_shared_type_in_expr(c, expr->binary.left);
-        return l ? l : find_shared_type_in_expr(c, expr->binary.right);
-    }
-    if (expr->kind == NODE_ASSIGN) {
-        Type *l = find_shared_type_in_expr(c, expr->assign.target);
-        return l ? l : find_shared_type_in_expr(c, expr->assign.value);
-    }
-    if (expr->kind == NODE_UNARY) return find_shared_type_in_expr(c, expr->unary.operand);
-    if (expr->kind == NODE_CALL) {
-        for (int i = 0; i < expr->call.arg_count; i++) {
-            Type *r = find_shared_type_in_expr(c, expr->call.args[i]);
-            if (r) return r;
-        }
-    }
-    return NULL;
-}
-
-/* Find shared type in a statement */
-static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_type_in_expr(c, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_type_in_expr(c, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_type_in_expr(c, stmt->ret.expr);
-    case NODE_IF: return find_shared_type_in_expr(c, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_type_in_expr(c, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Type *r = find_shared_type_in_expr(c, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_type_in_expr(c, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_type_in_expr(c, stmt->switch_stmt.expr);
-    default: return NULL;
-    }
 }
 
 /* ---- Per-function shared type cache for deadlock detection (BUG-474 proper fix) ----

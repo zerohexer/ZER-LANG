@@ -1,0 +1,24 @@
+// Regression: after reassigning an arena-derived pointer to a non-arena source,
+// the is_from_arena escape flag must be cleared so subsequent arena-escape
+// checks don't produce false positives. (Tech-debt audit 2026-04-22.)
+
+struct Cell { u32 val; }
+
+Cell global_cell;
+
+u32 main() {
+    u8[1024] buf;
+    Arena ar = Arena.over(buf);
+
+    *Cell p = ar.alloc(Cell) orelse return;
+    p.val = 5;
+
+    // reassign p to a non-arena source — flag should be cleared.
+    // Without BUG-595 fix, the stale is_from_arena flag on p would
+    // incorrectly taint the subsequent use.
+    p = &global_cell;
+    p.val = 7;
+
+    if (global_cell.val != 7) { return 1; }
+    return 0;
+}

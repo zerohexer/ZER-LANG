@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Regression: defer nested inside defer body must be rejected.
+// Inner defer would fire at outer defer execution time (confusing semantics).
+// Fixes Phase-1 audit gap #7.
+
+u32 main() {
+    defer {
+        defer { u32 x = 1; }
+    }
+    return 0;
+}

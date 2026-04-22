@@ -5,6 +5,124 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-22 — full-codebase audit: 4 parallel agents, known-gap fixes, warning purge
+
+Context: user requested complete audit across checker/emitter/parser/IR
++ tech-debt hunt, with tests for any confirmed bugs and refactors.
+Spawned 4 parallel Explore agents (emitter, checker/zercheck, parser,
+tech-debt); combined with direct investigation of `docs/limitations.md`
+Phase-1 audit entries that had small estimated fixes.
+
+All 1,900+ C unit tests, 786 Rust, 36 Zig, 28 module, 139 conversion
+tests green before and after changes.
+
+### BUG-595 — `yield` / `await` outside async function silently accepted
+
+File: `checker.c` NODE_YIELD / NODE_AWAIT handlers (~line 8414).
+Symptom: `void go() { yield; }` compiled to `void go(void) { return; }`
+silently — no coroutine scaffolding, no error, no warning. Programmer
+writing `yield` in a non-async function saw nothing happen.
+Root cause: handlers broke out of the switch without checking
+`c->in_async`. Listed as gap #3 in `docs/limitations.md` (Phase-1 audit).
+Fix: `if (!c->in_async) checker_error(c, ..., "'yield'/'await' can only
+be used inside an async function")`.
+Tests: `tests/zer_fail/yield_outside_async.zer`,
+       `tests/zer_fail/await_outside_async.zer`.
+
+### BUG-596 — `defer` nested inside another `defer` body accepted
+
+File: `checker.c` NODE_DEFER handler.
+Symptom: `defer { defer { ... } }` compiled; inner defer fired at outer
+defer execution time (which is scope-exit of the OUTER defer), not when
+a reader would expect.
+Root cause: no `c->defer_depth` check on entry into NODE_DEFER (only
+checked for `yield`/`goto`/etc. INSIDE defer bodies).
+Fix: `if (c->defer_depth > 0) checker_error(c, ..., "'defer' cannot be
+nested inside another 'defer' body")` before recursing.
+Tests: `tests/zer_fail/defer_nested_in_defer.zer`.
+
+### BUG-597 — escape flag `is_from_arena` not cleared on pointer reassignment
+
+File: `checker.c` NODE_ASSIGN handler, ~line 2962 (the clear-on-ident-
+assign block).
+Symptom: `*Cell p = arena.alloc(Cell) orelse return; p = &global_cell;`
+— after the reassignment, `p` still carried `is_from_arena=true` from
+the earlier `arena.alloc`. Subsequent escape-detection code consulting
+this flag would produce false-positive errors or wrong propagation.
+Root cause: when assigning to a whole ident, the handler cleared
+`is_local_derived`, `is_arena_derived`, `provenance_type`, and
+container-field bookkeeping — but missed `is_from_arena`.
+Fix: add `tsym->is_from_arena = false;` to the same clear block.
+Test: `tests/zer/arena_flag_reset.zer` (positive: reassigning p from
+arena → global pointer works correctly).
+
+### BUG-598 — zercheck backward-goto labels fixed-buffer silently dropped beyond 32
+
+File: `zercheck.c` NODE_BLOCK handler (~line 1591).
+Symptom: a block with >32 labels silently dropped label entries 33+,
+meaning a `goto label_40; ... label_40: ... use(freed_handle);` pattern
+in such a block could fall off zercheck's detection entirely. CLAUDE.md
+rule #7 violation (same class as BUG-492, BUG-575).
+Root cause: `struct {...} labels[32];` with `label_count < 32` guard in
+the collection loop.
+Fix: stack-first dynamic pattern — start with `stack_labels[32]`,
+realloc to heap when overflowing, free at scope exit.
+Test: `tests/zer/many_labels_backward_goto.zer` (36 labels with one
+backward goto — exercises the realloc path on every run).
+
+### Tech-debt purge — 36 → 0 compile warnings
+
+Dead functions deleted (~250 lines total):
+- `parser.c`: `peek()`, `arena_array()`, `tok_str()` (unused helpers)
+- `checker.c`: `has_atomic_or_barrier()` (LEGACY wrapper per its own
+  comment; superseded by FuncProps), `find_shared_type_in_stmt()`,
+  `find_shared_type_in_expr()` (both dead after the IR-only
+  shared-lock path).
+- `emitter.c`: `find_shared_root_in_stmt()`, `find_shared_root()`,
+  `shared_needs_condvar()`, `stmt_writes_shared()`,
+  `emit_shared_lock()` wrapper (delegated to `emit_shared_lock_mode`),
+  `collect_async_locals()` (no external caller).
+- `zercheck.c`: `zc_warning()` (never called), `block_always_exits()`
+  (superseded by `PathState.terminated`).
+- `ir_lower.c`: `classify_builtin_call()` (~90 lines, dead since
+  Phase 8d collapsed all builtin ops to IR_ASSIGN per its own comment).
+
+Unused variables deleted:
+- `parser.c:1192 ident_tok` (token captured but never consulted)
+- `checker.c:10622 ok` (return value of `checker_check_bodies`, now
+  `(void)` with explanatory comment)
+- `zercheck.c:1584 saved_handle_count` (was for an earlier
+  scope-management algorithm)
+- `zerc_main.c:198 release_mode`, `298 temp_c_path`, `299 exe_from_input`
+
+Exhaustive switch additions (`ast.c`):
+- `node_kind_name()`: add NODE_MMIO, NODE_GOTO, NODE_LABEL,
+  NODE_STATIC_ASSERT.
+- `print_type()`: add TYNODE_BARRIER, TYNODE_SLAB, TYNODE_SEMAPHORE.
+- `ast_print()`: add NODE_MMIO, NODE_GOTO, NODE_LABEL, NODE_CRITICAL,
+  NODE_ONCE, NODE_STATIC_ASSERT.
+- `emit_top_level_decl()`: add NODE_DO_WHILE to the non-top-level list.
+
+Comment / style:
+- Removed three `/* */` inside `/* */` block-comment glitches
+  (`*out_min/*out_max` and `*opaque/*T` tokens that triggered
+  `-Wcomment`). Rephrased without pointer-like intra-comment tokens.
+- Cast `node->loc.line` to `uint32_t` for compare against
+  `Symbol.line` (sign-compare warning).
+
+Result: `make clean && make zerc` produces zero warnings (from 36).
+
+### Also migrated (gap reproducers → permanent regression tests)
+
+- `tests/zer_gaps/gap3_yield_outside_async.zer` → deleted after
+  `tests/zer_fail/yield_outside_async.zer` became a proper regression test.
+- `tests/zer_gaps/gap7_defer_in_defer.zer` → deleted after
+  `tests/zer_fail/defer_nested_in_defer.zer` became a regression test.
+- `docs/limitations.md`: gaps 3 and 7 struck-through with FIXED note
+  and back-reference to regression test paths.
+
+---
+
 ## Session 2026-04-19 — AST emission deletion, QEMU MMIO tests, V3 + Option A rename
 
 Not a bug-fix session per se — architectural consolidation + ergonomic

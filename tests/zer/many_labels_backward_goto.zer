@@ -1,0 +1,53 @@
+// Regression: zercheck's backward-goto UAF tracker previously used a fixed
+// labels[32] stack buffer and silently dropped labels beyond 32 (CLAUDE.md
+// rule #7 violation). With >32 labels, a genuine UAF could go undetected.
+// Fix (2026-04-22): stack-first dynamic pattern with realloc overflow.
+//
+// This test exercises a function with many forward labels + one backward
+// goto at the end. Compiles + runs normally under both old and new code —
+// but with the fix, zercheck sees every label. No silent label drops.
+
+u32 main() {
+    u32 n = 0;
+
+    goto l0;
+l1:  n += 1; goto l2;
+l2:  n += 1; goto l3;
+l3:  n += 1; goto l4;
+l4:  n += 1; goto l5;
+l5:  n += 1; goto l6;
+l6:  n += 1; goto l7;
+l7:  n += 1; goto l8;
+l8:  n += 1; goto l9;
+l9:  n += 1; goto l10;
+l10: n += 1; goto l11;
+l11: n += 1; goto l12;
+l12: n += 1; goto l13;
+l13: n += 1; goto l14;
+l14: n += 1; goto l15;
+l15: n += 1; goto l16;
+l16: n += 1; goto l17;
+l17: n += 1; goto l18;
+l18: n += 1; goto l19;
+l19: n += 1; goto l20;
+l20: n += 1; goto l21;
+l21: n += 1; goto l22;
+l22: n += 1; goto l23;
+l23: n += 1; goto l24;
+l24: n += 1; goto l25;
+l25: n += 1; goto l26;
+l26: n += 1; goto l27;
+l27: n += 1; goto l28;
+l28: n += 1; goto l29;
+l29: n += 1; goto l30;
+l30: n += 1; goto l31;
+l31: n += 1; goto l32;
+l32: n += 1; goto l33;
+l33: n += 1; goto l34;
+l34: n += 1; goto done;
+l0:  n += 1; goto l1;
+
+done:
+    if (n != 35) { return 1; }
+    return 0;
+}

@@ -195,7 +195,6 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -216,7 +215,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
-            release_mode = true;
+            /* --release accepted but has no effect (reserved for future use) */
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             zer_target_ptr_bits = atoi(argv[++i]);
             target_bits_explicit = true;
@@ -294,9 +293,7 @@ int main(int argc, char **argv) {
         use_temp_c = true;
     }
 
-    /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    /* for temp .c mode, set up intermediate .c path */
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

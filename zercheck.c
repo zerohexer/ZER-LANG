@@ -23,16 +23,6 @@ static void zc_error(ZerCheck *zc, int line, const char *fmt, ...) {
     fprintf(stderr, "\n");
 }
 
-static void zc_warning(ZerCheck *zc, int line, const char *fmt, ...) {
-    if (zc->building_summary) return;
-    fprintf(stderr, "%s:%d: zercheck warning: ", zc->file_name, line);
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
-    fprintf(stderr, "\n");
-}
-
 /* ---- Path state helpers ---- */
 
 static void pathstate_init(PathState *ps) {
@@ -305,40 +295,6 @@ static bool is_free_call(ZerCheck *zc, Node *call, char *arg_key, int *arg_key_l
 
 /* ---- Helpers ---- */
 
-/* Check if a block always exits (return/break/continue on all paths).
- * Used by if-without-else: if the then-branch always exits, handles
- * freed inside it are NOT MAYBE_FREED after the if — we only reach
- * post-if if the branch was NOT taken. */
-static bool block_always_exits(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_RETURN || node->kind == NODE_BREAK ||
-        node->kind == NODE_CONTINUE) return true;
-    if (node->kind == NODE_GOTO) return true;
-    if (node->kind == NODE_BLOCK) {
-        /* last statement in block determines exit */
-        for (int i = node->block.stmt_count - 1; i >= 0; i--) {
-            if (block_always_exits(node->block.stmts[i])) return true;
-            /* skip non-control-flow statements */
-            if (node->block.stmts[i]->kind != NODE_VAR_DECL &&
-                node->block.stmts[i]->kind != NODE_EXPR_STMT &&
-                node->block.stmts[i]->kind != NODE_DEFER)
-                break;
-        }
-    }
-    if (node->kind == NODE_IF && node->if_stmt.then_body && node->if_stmt.else_body) {
-        return block_always_exits(node->if_stmt.then_body) &&
-               block_always_exits(node->if_stmt.else_body);
-    }
-    if (node->kind == NODE_CRITICAL) {
-        return block_always_exits(node->critical.body);
-    }
-    if (node->kind == NODE_ONCE) {
-        return false; /* @once body may not execute — can't assume it always exits */
-    }
-    return false;
-}
-
-/* Scan a defer body for free/delete calls. Returns handle key if found. */
 /* Scan a single statement for a free/delete call. Returns handle key length if found. */
 static int defer_stmt_is_free(Node *node, char *key_buf, int key_bufsize) {
     if (!node) return 0;
@@ -1625,18 +1581,39 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
          * Increment depth on entry, decrement on exit. Handles added
          * during this block get the new depth. On exit, remove handles
          * with depth > parent (inner scope variables out of scope). */
-        int saved_handle_count = ps->handle_count;
         ps->scope_depth++;
 
         /* Backward goto UAF: scan block for labels, detect backward jumps.
          * A backward goto (label before goto) is like a loop body from
          * label to goto. Apply same 2-pass + widen-to-MAYBE_FREED pattern. */
 
-        /* Phase 1: collect label positions in this block */
-        struct { const char *name; uint32_t len; int idx; } labels[32];
+        /* Phase 1: collect label positions in this block.
+         * Stack-first dynamic pattern (CLAUDE.md rule #7): fixed buffer for
+         * common case, realloc for blocks with >32 labels. Never silently
+         * truncate — a silently-dropped label means backward-goto UAF
+         * detection could miss real bugs. */
+        struct LabelRef { const char *name; uint32_t len; int idx; };
+        struct LabelRef stack_labels[32];
+        struct LabelRef *labels = stack_labels;
         int label_count = 0;
-        for (int i = 0; i < node->block.stmt_count && label_count < 32; i++) {
+        int label_cap = 32;
+        bool labels_heap = false;
+        for (int i = 0; i < node->block.stmt_count; i++) {
             if (node->block.stmts[i]->kind == NODE_LABEL) {
+                if (label_count >= label_cap) {
+                    int new_cap = label_cap * 2;
+                    struct LabelRef *new_labels = (struct LabelRef *)realloc(
+                        labels_heap ? labels : NULL,
+                        new_cap * sizeof(struct LabelRef));
+                    if (!new_labels) break; /* OOM: stop collecting */
+                    if (!labels_heap) {
+                        memcpy(new_labels, stack_labels,
+                               label_count * sizeof(struct LabelRef));
+                    }
+                    labels = new_labels;
+                    label_cap = new_cap;
+                    labels_heap = true;
+                }
                 labels[label_count].name = node->block.stmts[i]->label_stmt.name;
                 labels[label_count].len = (uint32_t)node->block.stmts[i]->label_stmt.name_len;
                 labels[label_count].idx = i;
@@ -1706,6 +1683,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             }
         }
 
+        if (labels_heap) free(labels);
         break;
     }
 
@@ -2387,7 +2365,7 @@ static void zc_apply_summary(ZerCheck *zc, PathState *ps, Node *call_node) {
 
     FuncSummary *s = find_summary(zc, func_name, func_name_len);
     /* Signature heuristic fallback: if no summary exists but the function
-     * takes *opaque/*T as param and returns void, treat as @frees(0).
+     * takes *opaque or *T as param and returns void, treat as @frees(0).
      * Covers wrapper chains: app_stop → service_shutdown → resource_destroy.
      * Works for both bodyless (cinclude) and ZER functions in other modules. */
     bool heuristic_free = false;

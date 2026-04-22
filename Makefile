@@ -5,14 +5,14 @@ CFLAGS = -Wall -Wextra -std=c99 -O2 -I.
 # zercheck_ir.c is the CFG-based replacement for zercheck.c (per docs/cfg_migration_plan.md).
 # During migration both coexist: zercheck.c is primary, zercheck_ir.c grows to feature
 # parity, verified via dual-run in Phase E, then zercheck.c deleted at Phase F (v0.5.0).
-CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c
+CORE_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c
 CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 # Library sources (everything except zerc_main)
 # src/safety/*.c files are VST-verified predicates also linked into zerc.
 # See docs/formal_verification_plan.md Level 3 — same .c verified by
 # `make check-vst` and built into zerc. Any divergence breaks CI.
-LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c
+LIB_SRCS = lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # ---- Compiler binary ----
@@ -277,7 +277,7 @@ check-vst:
 	MSYS_NO_PATHCONV=1 docker run --rm \
 	    -v "$$(pwd -W 2>/dev/null || pwd):/repo" -w /repo zer-vst \
 	    bash -c 'eval $$(opam env) && \
-	        clightgen -normalize src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c && \
+	        clightgen -normalize src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c && \
 	        cd proofs/vst && \
 	        clightgen -normalize simple_check.c zer_checks.c zer_checks2.c && \
 	        coqc -Q . zer_vst simple_check.v && \
@@ -293,7 +293,9 @@ check-vst:
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/type_kind.v && \
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_type_kind.v && \
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/coerce_rules.v && \
-	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_coerce_rules.v'
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_coerce_rules.v && \
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/context_bans.v && \
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_context_bans.v'
 	@echo "=== VST proofs compile green ==="
 	@if grep -l 'Admitted\|admit\.' proofs/vst/verif_*.v 2>/dev/null | grep -q .; then \
 	    echo "FAIL: admits found in VST proofs"; exit 1; \

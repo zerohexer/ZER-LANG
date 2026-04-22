@@ -1,5 +1,6 @@
 #include "checker.h"
 #include "src/safety/range_checks.h"   /* zer_count_is_positive — VST-verified */
+#include "src/safety/context_bans.h"   /* zer_*_allowed_in_context — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -7943,16 +7944,16 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
-        /* return inside defer is illegal — would corrupt control flow */
-        if (c->defer_depth > 0) {
-            checker_error(c, node->loc.line,
-                "cannot use 'return' inside defer block");
-            break;
-        }
-        /* return inside @critical skips interrupt re-enable */
-        if (c->critical_depth > 0) {
-            checker_error(c, node->loc.line,
-                "cannot use 'return' inside @critical block — interrupts would not be re-enabled");
+        /* Context-ban check delegates to VST-verified predicate.
+         * SAFETY: zer_return_allowed_in_context in src/safety/context_bans.c */
+        if (zer_return_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'return' inside defer block");
+            } else {
+                checker_error(c, node->loc.line,
+                    "cannot use 'return' inside @critical block — interrupts would not be re-enabled");
+            }
             break;
         }
 
@@ -8326,23 +8327,30 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_BREAK:
-        if (c->defer_depth > 0) {
-            checker_error(c, node->loc.line, "cannot use 'break' inside defer block");
-        } else if (c->critical_depth > 0) {
-            checker_error(c, node->loc.line,
-                "cannot use 'break' inside @critical block — interrupts would not be re-enabled");
-        } else if (!c->in_loop) {
-            checker_error(c, node->loc.line, "'break' outside of loop");
+        /* SAFETY: zer_break_allowed_in_context in src/safety/context_bans.c */
+        if (zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
+                                           c->in_loop ? 1 : 0) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line, "cannot use 'break' inside defer block");
+            } else if (c->critical_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'break' inside @critical block — interrupts would not be re-enabled");
+            } else {
+                checker_error(c, node->loc.line, "'break' outside of loop");
+            }
         }
         break;
 
     case NODE_GOTO:
-        /* goto target label validation done in check_function_body (post-pass) */
-        if (c->defer_depth > 0) {
-            checker_error(c, node->loc.line, "cannot use 'goto' inside defer block");
-        } else if (c->critical_depth > 0) {
-            checker_error(c, node->loc.line,
-                "cannot use 'goto' inside @critical block — interrupts would not be re-enabled");
+        /* goto target label validation done in check_function_body (post-pass)
+         * SAFETY: zer_goto_allowed_in_context in src/safety/context_bans.c */
+        if (zer_goto_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line, "cannot use 'goto' inside defer block");
+            } else {
+                checker_error(c, node->loc.line,
+                    "cannot use 'goto' inside @critical block — interrupts would not be re-enabled");
+            }
         }
         break;
 
@@ -8351,13 +8359,17 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_CONTINUE:
-        if (c->defer_depth > 0) {
-            checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
-        } else if (c->critical_depth > 0) {
-            checker_error(c, node->loc.line,
-                "cannot use 'continue' inside @critical block — interrupts would not be re-enabled");
-        } else if (!c->in_loop) {
-            checker_error(c, node->loc.line, "'continue' outside of loop");
+        /* SAFETY: zer_continue_allowed_in_context in src/safety/context_bans.c */
+        if (zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
+                                              c->in_loop ? 1 : 0) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
+            } else if (c->critical_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'continue' inside @critical block — interrupts would not be re-enabled");
+            } else {
+                checker_error(c, node->loc.line, "'continue' outside of loop");
+            }
         }
         break;
 
@@ -8366,8 +8378,9 @@ static void check_stmt(Checker *c, Node *node) {
          * Function summaries catch both direct and transitive cases.
          * Phase A2 fix (Gap 7): defer inside another defer is banned —
          * inner defer would run at outer defer's execution time (scope exit),
-         * which is confusing and probably not what the programmer intends. */
-        if (c->defer_depth > 0) {
+         * which is confusing and probably not what the programmer intends.
+         * SAFETY: zer_defer_allowed_in_context in src/safety/context_bans.c */
+        if (zer_defer_allowed_in_context(c->defer_depth) == 0) {
             checker_error(c, node->loc.line,
                 "'defer' cannot be nested inside another 'defer' body");
         }
@@ -8429,8 +8442,9 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_ASM:
-        /* MISRA Dir 4.3: asm must be encapsulated in naked functions */
-        if (!c->in_naked) {
+        /* MISRA Dir 4.3: asm must be encapsulated in naked functions
+         * SAFETY: zer_asm_allowed_in_context in src/safety/context_bans.c */
+        if (zer_asm_allowed_in_context(c->in_naked ? 1 : 0) == 0) {
             checker_error(c, node->loc.line,
                 "asm statements only allowed in naked functions — "
                 "use @critical or @atomic_* for safe alternatives (MISRA Dir 4.3)");

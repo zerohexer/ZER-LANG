@@ -210,6 +210,40 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Eighth batch — provenance rules, oracle-driven (2026-04-22)
+
+Second oracle-driven batch (following escape_rules pattern).
+
+Oracle: `lambda_zer_opaque/iris_opaque_specs.v`:
+- `step_spec_opaque_cast`: *T → *opaque is identity on tag (always OK)
+- `step_spec_typed_cast`: *opaque → *T' requires typed_ptr γ id T'
+  (the ghost-map state tracks original allocation type)
+- `typed_ptr_agree`: owning typed_ptr γ id T and typed_ptr γ id T'
+  forces T = T' (no type id can have two values)
+
+Extracted 3 predicates to `src/safety/provenance_rules.c`:
+- `zer_provenance_check_required(src_unknown, dst_opaque)` — returns 1
+  iff structural match is needed (both ends known + concrete)
+- `zer_provenance_type_ids_compatible(actual, expected)` — returns 1
+  iff actual == 0 (unknown / C interop) OR actual == expected
+- `zer_provenance_opaque_upcast_allowed()` — always 1, documents the
+  `step_spec_opaque_cast` rule
+
+Wired checker.c @ptrcast handler to delegate the check-required decision.
+Existing `Type *` equality comparison remains; the delegate just decides
+whether to perform that comparison at all.
+
+VST proof (verif_provenance_rules.v): 3 lemmas, zero admits.
+
+**Z.eq_dec vs Z.eqb lesson (re-confirmed):** first attempt used
+`if negb (Z.eqb x 0)` pattern — VST proof failed with "incomplete proof"
+because the `destruct (Z.eq_dec _ _)` didn't match the `Z.eqb` spec.
+Fix: align spec with proof's destruct by using `if Z.eq_dec x 0 then ...`.
+Already documented in proof-internals.md; this was a reminder.
+
+**Honest count after 8th batch: 31 Level-3-verified compiler functions.**
+Phase 1 progress: 31/44 = 70%.
+
 ### Seventh batch — escape rules, oracle-driven (2026-04-22)
 
 First batch extracted with **oracle-driven specs** instead of code-driven.

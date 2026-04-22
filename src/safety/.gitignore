@@ -6,6 +6,7 @@ type_kind.v
 coerce_rules.v
 context_bans.v
 escape_rules.v
+provenance_rules.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

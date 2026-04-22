@@ -29,4 +29,17 @@ int zer_atomic_width_valid(int bytes);
  * documents the rule. */
 int zer_atomic_arg_is_ptr_to_int(int is_ptr_to_int);
 
+/* E03 — @atomic_* on packed struct field rejected (misalignment hazard).
+ * Oracle: typing.v:1158 atomic_on_packed_valid.
+ * Caller: checker.c NODE_INTRINSIC @atomic_* on &packed_field. */
+int zer_atomic_on_packed_valid(int is_packed_field);
+
+/* E04 — @cond_wait/signal/broadcast first arg must be shared struct.
+ * Oracle: typing.v:1166 condvar_arg_valid. */
+int zer_condvar_arg_valid(int is_shared_struct);
+
+/* E08 — Sync primitives (Semaphore/Barrier/Mutex) inside packed struct rejected.
+ * Oracle: typing.v:1178 sync_in_packed_valid. */
+int zer_sync_in_packed_valid(int is_packed_container);
+
 #endif

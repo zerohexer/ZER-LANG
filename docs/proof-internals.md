@@ -602,6 +602,151 @@ widths uniformly. VST failed. Inline check kept in `is_literal_compatible`
 - Mix `Vint` and `Vlong` params in one predicate (the range constraints become tangled).
 - Assume `repeat forward_if; ...; destruct (Z_lt_dec _ _)` works for 64-bit the same as 32-bit. It doesn't.
 
+### Standard proof patterns that WORK (Batch 1-6 findings, 2026-04-22)
+
+After extracting 16 predicates in batches 1-6, these patterns are proven to work:
+
+**Pattern A — single-branch predicate:**
+```c
+int zer_X(int arg) {
+    if (arg == 0) return 0;
+    return 1;
+}
+```
+```coq
+Lemma body_zer_X:
+  semax_body Vprog Gprog f_zer_X zer_X_spec.
+Proof.
+  start_function.
+  forward_if;
+    forward;
+    unfold zer_X_coq;
+    destruct (Z.eq_dec arg 0); try lia;
+    try entailer!.
+Qed.
+```
+
+**Pattern B — N-branch sequential cascade (2-5 branches):**
+```c
+int zer_Y(int a, int b) {
+    if (a < 0) return 0;
+    if (a >= b) return 0;
+    return 1;
+}
+```
+```coq
+Proof.
+  start_function.
+  forward_if.
+  { forward. unfold zer_Y_coq.
+    destruct (Z_ge_dec a 0); try lia. simpl. entailer!. }
+  forward_if.
+  { forward. unfold zer_Y_coq.
+    destruct (Z_ge_dec a 0); try lia.
+    simpl. destruct (Z_lt_dec a b); try lia. entailer!. }
+  forward. unfold zer_Y_coq.
+  destruct (Z_ge_dec a 0); try lia.
+  simpl. destruct (Z_lt_dec a b); try lia. entailer!.
+Qed.
+```
+
+**Pattern C — all-equality cascade (2-3 branches with `==` comparisons):**
+```c
+int zer_Z(int a, int b) {
+    if (a == 0) return 0;
+    if (b == 0) return 0;
+    return 1;
+}
+```
+```coq
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_Z_coq;
+    repeat (destruct (Z.eq_dec _ _); try lia);
+    try entailer!.
+Qed.
+```
+
+Pattern C is the shortest. Use it when the cascade is pure-equality.
+Pattern B when comparisons mix `<`/`>=`/`==`.
+Pattern A for single branches.
+
+**Common failure with brackets `{ ... }` on cascade:** if you write
+Pattern B-style brackets for a Pattern-C-style cascade, VST produces
+"No such goal. Try unfocusing with '}'" because `repeat forward_if`
+unified multiple subgoals into one. Solution: use Pattern C when the
+C has no complex branch-specific state.
+
+### Makefile + .gitignore checklist for new src/safety/*.c file
+
+When adding a brand-new file (not extending an existing one), these MUST be updated:
+
+1. **`Makefile` CORE_SRCS line** — append `src/safety/<name>.c` (preserves link into zerc)
+2. **`Makefile` LIB_SRCS line** — append same (for test_* builds)
+3. **`Makefile` check-vst target** — add TWO lines (clightgen + coqc pairs):
+   ```
+   coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/<name>.v && \
+   coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_<name>.v && \
+   ```
+   Also append `<name>.c` to the `clightgen -normalize src/safety/...` line.
+4. **`src/safety/.gitignore`** — append `<name>.v` (clightgen auto-generates, don't commit)
+
+**Skip if extending existing file** (Batches 2 + 3 extended range_checks.c and container_rules.c — no Makefile changes needed, just added Lemmas to the existing verif_*.v).
+
+### Delegation pattern checklist for Phase 6 readiness
+
+Every call-site delegation must include:
+
+1. **`/* SAFETY: zer_X in src/safety/<file>.c (ruleID) */` comment** — Phase 6 `check-no-inline-safety` will grep for this pattern. Put on the line IMMEDIATELY BEFORE the predicate call or condition.
+2. **Actual predicate call in condition** — `if (zer_X(args) == 0)` or `if (zer_X(args) != 0)`. NOT just the comment — the predicate must execute.
+3. **The condition semantic must match** — replace the ENTIRE condition, not just annotate. E.g., replace `if (val == 0)` with `if (zer_div_valid(val == 0 ? 0 : 1) == 0)`.
+
+**Bad delegation (Phase 6 will reject):**
+```c
+/* SAFETY: zer_div_valid */
+if (val == 0) checker_error(...);  // predicate not called
+```
+
+**Good delegation:**
+```c
+/* SAFETY: zer_div_valid in src/safety/arith_rules.c (M01) */
+int div_nz = (val == 0) ? 0 : 1;
+if (zer_div_valid(div_nz) == 0) checker_error(...);
+```
+
+### int64 → int32 narrowing pattern (when caller has uint64 but predicate takes int)
+
+When the caller has a `uint64_t` / `int64_t` value but the predicate takes `int` (preferred):
+
+```c
+/* Pre-filter to int32 range before narrowing cast */
+if (val < 0 || val > 0x7FFFFFFFLL) {
+    /* value exceeds int range — caller-specific handling
+     * (error, default, or split path) */
+} else {
+    if (zer_X((int)val, ...) == 0) error(...);
+}
+```
+
+Alternative: split predicate into size-specific forms (`zer_X_u32`, `zer_X_i32`) —
+each using tint/tuint. Works for simple comparisons. See M08 literal_fits
+redesign for example (Batch 1 + 1b).
+
+### Codegen bug class — void main() → BUG-603 (2026-04-22)
+
+Level 3 VST proves per-predicate correctness over the input space. It does NOT catch bugs in:
+- Function signature emission (e.g., `void main()` copied verbatim from ZER to C)
+- Source-to-C translation of standard library patterns
+- Runtime-only behaviors (trap messages, malloc wrapping)
+
+Level 2 integration tests (`tests/zer_proof/`, `tests/zer/`, regression) catch these.
+
+BUG-603 example: `void main()` in ZER was emitted as `void main(void)` in C. C99 §5.1.2.2.3 requires `main` to return int; `void main()` leaves exit code undefined. Fixed by auto-promoting to `int main(void) { ... return 0; }` in emitter.
+
+**Lesson for proof work:** when a test exits with unexpected code despite compiling cleanly, check the generated C's signature and return handling — not the Coq predicates. Predicates verify computation; codegen verifies structure.
+
 ### Phase 1 extraction recipe (end-to-end)
 
 **Read this before extracting a new predicate.** Covers every step from identifying the target to commit.

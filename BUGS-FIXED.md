@@ -210,6 +210,36 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### 🎯 Fourteenth batch — switch rules (PHASE 1 COMPLETE 44/44, 2026-04-22)
+
+Final batch: 2 switch-exhaustiveness predicates from typing.v Section Q.
+
+Extracted to `src/safety/misc_rules.c`:
+- `zer_int_switch_has_default(flag)` — Q03: int switch needs default
+- `zer_bool_switch_covers_both(has_default, has_true, has_false)`
+  — Q01: bool switch needs default OR both true+false arms
+
+Initial attempt: extract `zer_cast_qualifier_safe(fc, tc, fv, tv)` —
+the unified version of preserves_const + preserves_volatile per
+typing.v cast_safe oracle. VST failed with "Use [forward_if Post]"
+even after trying nested if, goto, etc. The 4-arg conjunction has
+too many branches for the standard cascade pattern.
+
+Pivoted to bool_switch_covers_both instead — simpler 3-arg OR/AND
+structure, flat cascade works cleanly.
+
+Lesson: when an oracle is a conjunction of existing predicates, it's
+cheaper to call the existing predicates at the call site than try to
+fold them into a single extracted predicate. The split preserves_*
+predicates already give the correct VST behavior; a combined wrapper
+adds VST pain without proof strength gain.
+
+**Honest count after 14th batch: 44 Level-3-verified compiler functions.**
+**🎯 PHASE 1 COMPLETE: 44/44 = 100%.**
+
+16 VST .v files, zero admits across all. All major safety subsystems
+have at least one oracle-driven predicate. Phase 1 goal achieved.
+
 ### Twelfth + Thirteenth batch — atomic + container rules (2026-04-22)
 
 Two more oracle-driven batches, bringing Phase 1 to 42/44 (95%).

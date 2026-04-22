@@ -5878,7 +5878,9 @@ static Type *check_expr(Checker *c, Node *node) {
                             root->ident.name, (uint32_t)root->ident.name_len);
                         if (sym && sym->type) {
                             Type *st = type_unwrap_distinct(sym->type);
-                            if (st->kind == TYPE_STRUCT && st->struct_type.is_packed) {
+                            /* SAFETY: zer_atomic_on_packed_valid in src/safety/atomic_rules.c (E03) */
+                            int is_packed = (st->kind == TYPE_STRUCT && st->struct_type.is_packed) ? 1 : 0;
+                            if (zer_atomic_on_packed_valid(is_packed) == 0) {
                                 checker_error(c, node->loc.line,
                                     "@%.*s on packed struct field — may be misaligned. "
                                     "Atomic operations require natural alignment. "
@@ -6123,7 +6125,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         Type *inner = type_unwrap_distinct(seff->pointer.inner);
                         if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) ok = true;
                     }
-                    if (!ok) {
+                    /* SAFETY: zer_condvar_arg_valid in src/safety/atomic_rules.c (E04) */
+                    if (zer_condvar_arg_valid(ok ? 1 : 0) == 0) {
                         checker_error(c, node->loc.line,
                             "@%.*s first argument must be a shared struct variable",
                             (int)nlen, name);
@@ -8889,11 +8892,14 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-498: synchronization primitives in packed struct → misaligned.
                  * pthread_mutex_t requires natural alignment. Packed structs can place
-                 * fields at unaligned offsets → hard fault on ARM/RISC-V. */
-                if (node->struct_decl.is_packed && sf->type) {
+                 * fields at unaligned offsets → hard fault on ARM/RISC-V.
+                 * SAFETY: zer_sync_in_packed_valid in src/safety/atomic_rules.c (E08) */
+                if (sf->type) {
                     Type *ft = type_unwrap_distinct(sf->type);
-                    if (ft->kind == TYPE_SEMAPHORE || ft->kind == TYPE_BARRIER ||
-                        (ft->kind == TYPE_STRUCT && ft->struct_type.is_shared)) {
+                    int sync_in_pack = (node->struct_decl.is_packed &&
+                        (ft->kind == TYPE_SEMAPHORE || ft->kind == TYPE_BARRIER ||
+                         (ft->kind == TYPE_STRUCT && ft->struct_type.is_shared))) ? 1 : 0;
+                    if (zer_sync_in_packed_valid(sync_in_pack) == 0) {
                         checker_error(c, node->loc.line,
                             "synchronization primitive '%.*s' cannot be inside packed struct — "
                             "pthread_mutex_t requires natural alignment",

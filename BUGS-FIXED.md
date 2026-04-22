@@ -154,11 +154,48 @@ Never use tlong in extracted predicates unless absolutely unavoidable.
 - make check-vst: PASS, zero admits
 - make docker-check: 414/415 (same pre-existing A01_no_uaf baseline)
 
-**Next: Batch 3 — T + K extras (3 predicates):**
-- `zer_container_position_valid` (T02/T03) — extend container_rules.c
-- `zer_handle_element_valid` (T04) — extend container_rules.c
-- `zer_container_source_valid` (K01) — extend container_rules.c
-- Target after Batch 3: 57/85
+**Later batches landed same session (2026-04-22):**
+
+- **Batch 3 — T + K extras (3 predicates)**, extended container_rules.c
+  - `zer_container_position_valid(decl_position)` T02/T03
+  - `zer_handle_element_valid(element_kind)` T04
+  - `zer_container_source_valid(type_category)` K01
+  - Commit: 6c26b6f. State: 57/85.
+
+- **Batch 4 — P variant safety (2 predicates)**, new variant_rules.c
+  - `zer_union_read_mode_safe(mode)` P01
+  - `zer_union_arm_op_safe(self_access)` P02
+  - Commit: ea164c9. State: 59/85.
+
+- **Batch 5 — S stack-limit (1 predicate)**, new stack_rules.c
+  - `zer_stack_frame_valid(limit, frame)` S01/S02
+  - Commit: e8e992b. State: 60/85.
+
+- **Batch 6 — R comptime soundness (4 predicates)**, new comptime_rules.c
+  - `zer_comptime_arg_valid(is_constant)` R02
+  - `zer_static_assert_holds(is_constant, value)` R04
+  - `zer_comptime_ops_valid(ops_count)` R06
+  - `zer_expr_nesting_valid(depth)` R07
+  - State: 64/85.
+
+**Finding during Batch 6 VST proof:** R2 `zer_static_assert_holds` initially
+used bullet-based proof (`forward_if. { ... } forward_if. { ... }`) from
+Pattern B. Failed with `Error: No such goal. Try unfocusing with "}"`.
+Root cause: `repeat forward_if` unified multiple subgoals into one, but
+bullets assumed N distinct subgoals. Fixed by switching to Pattern C
+(flat cascade: `repeat forward_if; forward; unfold; repeat destruct; entailer!.`).
+
+Documented 3 canonical proof patterns (A/B/C) in docs/proof-internals.md
+for fresh sessions to avoid the same trap.
+
+**State after 6 batches on 2026-04-22:** 64/85 (75%)
+- 48 prior + 3 M-arith + 2 L-bounds + 1 M08 + 3 T+K + 2 P + 1 S + 4 R = 64
+- VST files: 21
+- src/safety files: 18 (14 prior + arith + variant + stack + comptime)
+- make check-vst: PASS, zero admits
+- make docker-check: 415/415
+
+**Next:** Batch 7 — J-extended (7 cast predicates). Target 71/85 (strict Phase 1 complete).
 
 ### BUG-603: void main() emits undefined exit code (2026-04-22)
 

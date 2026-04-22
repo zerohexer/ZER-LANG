@@ -11,6 +11,7 @@
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
+#include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1982,7 +1983,9 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 bool exited_via_cond = false;
                 int iter;
                 for (iter = 0; iter < 10000; iter++) {
-                    if (++_comptime_ops > 1000000) { result = CONST_EVAL_FAIL; goto ct_done; }
+                    /* SAFETY: zer_comptime_ops_valid in src/safety/comptime_rules.c (R06) */
+                    ++_comptime_ops;
+                    if (zer_comptime_ops_valid((int)_comptime_ops) == 0) { result = CONST_EVAL_FAIL; goto ct_done; }
                     if (stmt->for_stmt.cond) {
                         int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, ctx->locals, ctx->count);
                         if (cond == CONST_EVAL_FAIL || !cond) { exited_via_cond = true; break; }
@@ -2015,7 +2018,9 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 bool exited_via_cond = false;
                 int iter;
                 for (iter = 0; iter < 10000; iter++) {
-                    if (++_comptime_ops > 1000000) { result = CONST_EVAL_FAIL; goto ct_done; }
+                    /* SAFETY: zer_comptime_ops_valid in src/safety/comptime_rules.c (R06) */
+                    ++_comptime_ops;
+                    if (zer_comptime_ops_valid((int)_comptime_ops) == 0) { result = CONST_EVAL_FAIL; goto ct_done; }
                     /* do-while: execute body before checking condition on first iteration */
                     if (stmt->kind == NODE_DO_WHILE && iter == 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
@@ -2308,8 +2313,10 @@ static void route_free_to_ptr_if_needed(Checker *c, Node *call) {
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
-    /* recursion depth guard — prevents stack overflow on pathological input */
-    if (++c->expr_depth > 1000) {
+    /* recursion depth guard — prevents stack overflow on pathological input.
+     * SAFETY: zer_expr_nesting_valid in src/safety/comptime_rules.c (R07) */
+    ++c->expr_depth;
+    if (zer_expr_nesting_valid(c->expr_depth) == 0) {
         checker_error(c, node->loc.line,
             "expression nesting too deep (limit 1000) — simplify expression");
         c->expr_depth--;
@@ -4477,7 +4484,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
                         cparams[ci].value = v;
                     }
-                    if (!all_const) {
+                    /* SAFETY: zer_comptime_arg_valid in src/safety/comptime_rules.c (R02) */
+                    int arg_const_flag = all_const ? 1 : 0;
+                    if (zer_comptime_arg_valid(arg_const_flag) == 0) {
                         /* BUG-425: inside comptime function body, args may be
                          * params not yet substituted — skip error here, the real
                          * evaluation happens at the call site with concrete values */
@@ -8501,11 +8510,14 @@ static void check_stmt(Checker *c, Node *node) {
         /* Type-check the condition first — resolves comptime calls */
         check_expr(c, node->static_assert_stmt.cond);
         int64_t val = eval_const_expr_scoped(c, node->static_assert_stmt.cond);
-        if (val == CONST_EVAL_FAIL) {
-            checker_error(c, node->loc.line,
-                "static_assert condition must be a compile-time constant");
-        } else if (!val) {
-            if (node->static_assert_stmt.message) {
+        /* SAFETY: zer_static_assert_holds in src/safety/comptime_rules.c (R04) */
+        int sa_const = (val == CONST_EVAL_FAIL) ? 0 : 1;
+        int sa_value = (val == 0) ? 0 : 1;
+        if (zer_static_assert_holds(sa_const, sa_value) == 0) {
+            if (sa_const == 0) {
+                checker_error(c, node->loc.line,
+                    "static_assert condition must be a compile-time constant");
+            } else if (node->static_assert_stmt.message) {
                 checker_error(c, node->loc.line,
                     "static_assert failed: %.*s",
                     (int)node->static_assert_stmt.message_len,
@@ -10639,11 +10651,14 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
         if (decl->kind == NODE_STATIC_ASSERT) {
             check_expr(c, decl->static_assert_stmt.cond);
             int64_t val = eval_const_expr_scoped(c, decl->static_assert_stmt.cond);
-            if (val == CONST_EVAL_FAIL) {
-                checker_error(c, decl->loc.line,
-                    "static_assert condition must be a compile-time constant");
-            } else if (!val) {
-                if (decl->static_assert_stmt.message) {
+            /* SAFETY: zer_static_assert_holds in src/safety/comptime_rules.c (R04) */
+            int sa_const = (val == CONST_EVAL_FAIL) ? 0 : 1;
+            int sa_value = (val == 0) ? 0 : 1;
+            if (zer_static_assert_holds(sa_const, sa_value) == 0) {
+                if (sa_const == 0) {
+                    checker_error(c, decl->loc.line,
+                        "static_assert condition must be a compile-time constant");
+                } else if (decl->static_assert_stmt.message) {
                     checker_error(c, decl->loc.line, "static_assert failed: %.*s",
                         (int)decl->static_assert_stmt.message_len,
                         decl->static_assert_stmt.message);

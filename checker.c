@@ -9,6 +9,7 @@
 #include "src/safety/isr_rules.h"          /* zer_alloc/spawn_allowed_in_* — Phase 2 */
 #include "src/safety/arith_rules.h"        /* zer_div_valid/narrowing_valid/literal_fits — M */
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
+#include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -547,7 +548,9 @@ static bool check_union_switch_mutation(Checker *c, Node *field_object) {
              memcmp(tgt_key.str, c->union_switch_key, tgt_key.len) != 0))
             blocked = false;
     }
-    if (blocked) {
+    /* SAFETY: zer_union_arm_op_safe in src/safety/variant_rules.c (P02) */
+    int self_access = blocked ? 1 : 0;
+    if (zer_union_arm_op_safe(self_access) == 0) {
         checker_error(c, field_object->loc.line,
             "cannot mutate union '%.*s' inside its own switch arm — "
             "active capture would become invalid",
@@ -4944,7 +4947,11 @@ static Type *check_expr(Checker *c, Node *node) {
         /* union: writing (assignment LHS) is allowed — sets the active variant.
          * Reading (any other context) requires switch. */
         if (obj->kind == TYPE_UNION) {
-            if (!c->in_assign_target) {
+            /* SAFETY: zer_union_read_mode_safe in src/safety/variant_rules.c (P01).
+             * In assignment target = writing (sets active tag, not reading) = SWITCH mode.
+             * Otherwise = reading outside switch = DIRECT (rejected). */
+            int urm = c->in_assign_target ? ZER_URM_SWITCH : ZER_URM_DIRECT;
+            if (zer_union_read_mode_safe(urm) == 0) {
                 checker_error(c, node->loc.line,
                     "cannot read union variant '%.*s' directly — must use switch",
                     (int)flen, fname);

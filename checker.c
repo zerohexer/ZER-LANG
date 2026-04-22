@@ -1,7 +1,8 @@
 #include "checker.h"
-#include "src/safety/range_checks.h"   /* zer_count_is_positive — VST-verified */
-#include "src/safety/context_bans.h"   /* zer_*_allowed_in_context — VST-verified */
-#include "src/safety/escape_rules.h"   /* zer_region_can_escape — VST-verified */
+#include "src/safety/range_checks.h"       /* zer_count_is_positive — VST-verified */
+#include "src/safety/context_bans.h"       /* zer_*_allowed_in_context — VST-verified */
+#include "src/safety/escape_rules.h"       /* zer_region_can_escape — VST-verified */
+#include "src/safety/provenance_rules.h"   /* zer_provenance_* — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5480,7 +5481,9 @@ static Type *check_expr(Checker *c, Node *node) {
                                              node->loc.line, "@ptrcast");
                         /* provenance check: compile-time belt.
                          * Simple idents: check Symbol. Compound paths (h.p, arr[0]):
-                         * check prov_map. BUG-393 runtime type_id is the suspenders. */
+                         * check prov_map. BUG-393 runtime type_id is the suspenders.
+                         * SAFETY: zer_provenance_check_required in src/safety/provenance_rules.c
+                         * Oracle: lambda_zer_opaque/iris_opaque_specs.v typed_ptr_agree. */
                         if (eff->kind == TYPE_POINTER &&
                             eff->pointer.inner->kind == TYPE_OPAQUE) {
                             Type *prov_type = NULL;
@@ -5497,15 +5500,19 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (skey.len > 0)
                                     prov_type = prov_map_get(c, skey.str, (uint32_t)skey.len);
                             }
-                            if (prov_type) {
+                            /* VST-verified decision: check required iff both ends known+concrete */
+                            Type *tgt = type_unwrap_distinct(result);
+                            int dst_is_opaque = (tgt && tgt->kind == TYPE_POINTER &&
+                                type_unwrap_distinct(tgt->pointer.inner) &&
+                                type_unwrap_distinct(tgt->pointer.inner)->kind == TYPE_OPAQUE) ? 1 : 0;
+                            int src_unknown = (prov_type == NULL) ? 1 : 0;
+                            if (zer_provenance_check_required(src_unknown, dst_is_opaque) != 0) {
                                 Type *prov = type_unwrap_distinct(prov_type);
-                                Type *tgt = type_unwrap_distinct(result);
                                 if (tgt && tgt->kind == TYPE_POINTER && prov &&
                                     prov->kind == TYPE_POINTER) {
                                     Type *prov_inner = type_unwrap_distinct(prov->pointer.inner);
                                     Type *tgt_inner = type_unwrap_distinct(tgt->pointer.inner);
                                     if (prov_inner && tgt_inner &&
-                                        tgt_inner->kind != TYPE_OPAQUE &&
                                         !type_equals(prov_inner, tgt_inner)) {
                                         checker_error(c, node->loc.line,
                                             "@ptrcast type mismatch: source has provenance '%s' "

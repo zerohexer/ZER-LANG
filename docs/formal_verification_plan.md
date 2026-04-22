@@ -255,7 +255,7 @@ Target: 40 predicates extracted + VST-verified. Each file in `src/safety/`, one 
 | Type kind predicates (7 fns) | `src/safety/type_kind.c` | **DONE** (`zer_type_kind_is_integer`, `is_signed`, `is_unsigned`, `is_float`, `is_numeric`, `is_pointer`, `has_fields`) |
 | Coercion rules (5 fns) | `src/safety/coerce_rules.c` | **DONE** (`zer_coerce_int_widening_allowed`, `_usize_same_width_allowed`, `_float_widening_allowed`, `_preserves_volatile`, `_preserves_const`) |
 | Context ban rules (6 fns) | `src/safety/context_bans.c` | **DONE** (`zer_return/break/continue/goto/defer/asm_allowed_in_context`) |
-| Provenance rules (4 fns) | `src/safety/provenance.c` | TODO (`zer_provenance_compatible`, `is_propagated_by_cast`, ...) |
+| Provenance rules (3 fns) | `src/safety/provenance_rules.c` | **DONE** (`zer_provenance_check_required`, `_type_ids_compatible`, `_opaque_upcast_allowed`; oracle-driven from λZER-opaque) |
 | Optional unwrap rules (4 fns) | `src/safety/optional_rules.c` | TODO (`zer_optional_unwrap_allowed`, `is_void_optional`, ...) |
 | MMIO range rules (3 fns) | `src/safety/mmio_rules.c` | TODO (`zer_mmio_addr_valid`, `is_aligned`, `in_declared_range`) |
 | Move struct rules (3 fns) | `src/safety/move_rules.c` | TODO (`zer_move_transfer_allowed`, `should_track`, ...) |
@@ -477,7 +477,7 @@ Each extraction: (1) extract to `src/safety/*.c`, (2) wire zercheck.c AND zerche
 | **Level 1 — other operational subsets** | λZER-move, λZER-opaque, λZER-escape, λZER-mmio — all at operational depth. |
 | **Level 1 — λZER-typing (predicate-based)** | 135 real theorems covering sections G, C, D, E, F, I, J-extended, K, L, M, N, P, Q, R, S, T. |
 | **Level 2 — tests/zer_proof/** | 106 theorem-linked tests. Correctness-oracle loop closed empirically. |
-| **Level 3 — VST on extracted predicates** | **28 real extractions** (4 handle-state + 3 range-check + 7 type-kind + 5 coerce-rules + 6 context-bans + 3 escape-rules). Infrastructure complete (Phase 0). Phase 1 at 64% (28/44). First oracle-driven batch (escape_rules specs written against λZER-escape Iris proof). |
+| **Level 3 — VST on extracted predicates** | **31 real extractions** (4 handle-state + 3 range-check + 7 type-kind + 5 coerce-rules + 6 context-bans + 3 escape-rules + 3 provenance-rules). Infrastructure complete (Phase 0). Phase 1 at 70% (31/44). Oracle-driven batches: escape (λZER-escape), provenance (λZER-opaque). |
 | **Phase 7 — Deepen schematic → operational** | 82 rows at schematic depth. Path to seL4-level proof. ~425 hrs. |
 | **Total path to seL4-level formal verification** | **~1,085 hrs** (~1 year focused, ~3 years casual). 20-30x faster than CompCert/seL4 thanks to existing 42-file Iris infrastructure + LLM assistance + narrower target (safety properties only, not semantic preservation). |
 | λZER-concurrency (Iris concurrency primitives) | Not started. |

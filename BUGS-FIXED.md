@@ -210,6 +210,37 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Ninth batch — MMIO rules, oracle-driven (2026-04-22)
+
+Third oracle-driven batch.
+
+Oracle: `lambda_zer_mmio/iris_mmio_theorems.v`:
+- H01/H02: step_inttoptr_ok requires addr_in_ranges = true
+- H03: step_inttoptr_ok requires addr_aligned = true
+- "BOTH required for the rule to fire; missing either = stuck"
+
+Extracted 2 predicates to `src/safety/mmio_rules.c`:
+- `zer_mmio_addr_in_range(addr, start, end)` — inclusive range check
+- `zer_mmio_inttoptr_allowed(in_any_range, aligned)` — gate combination
+
+Wired checker.c @inttoptr handler to delegate the gate combination.
+The per-range loop and alignment-check stay inline (they use uint64_t;
+predicate takes int — trivial to expand to `long` later for wider
+address spaces).
+
+VST proof (verif_mmio_rules.v): 2 lemmas, zero admits.
+
+### Extraction limitation: modulus in VST
+
+Also attempted to extract `zer_mmio_addr_aligned(addr, align)` which
+uses `addr % align`. VST 3.0's `forward` on modulus needs additional
+lemma setup (Z.div/Z.mod interaction with Int.repr). Deferred to a
+follow-up. The checker continues to do alignment check inline with
+uint64_t for now. Documented in CLAUDE.md and BUGS-FIXED.md.
+
+**Honest count after 9th batch: 33 Level-3-verified compiler functions.**
+Phase 1 progress: 33/44 = 75%.
+
 ### Eighth batch — provenance rules, oracle-driven (2026-04-22)
 
 Second oracle-driven batch (following escape_rules pattern).

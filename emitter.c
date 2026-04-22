@@ -138,7 +138,13 @@ static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
 static void emit_return_null(Emitter *e) {
     Type *ret = e->current_func_ret;
     if (!ret || ret->kind == TYPE_VOID) {
-        emit(e, "return; ");
+        /* BUG fix: for void main() auto-promoted to int main(), emit
+         * `return 0;` so the promoted signature is consistent. */
+        if (e->current_main_promoted) {
+            emit(e, "return 0; ");
+        } else {
+            emit(e, "return; ");
+        }
         return;
     }
     Type *eff = type_unwrap_distinct(ret);
@@ -7789,9 +7795,23 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * Extract the actual return type from func_ptr.ret. */
         Type *ret = func->return_type;
         if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-        if (ret) emit_type(e, ret);
+
+        /* BUG fix (2026-04-22): ZER `void main()` auto-promoted to C
+         * `int main(void) { ... return 0; }`. Rationale: C99 requires
+         * main to return int; `void main()` leaves exit code undefined
+         * (whatever's in EAX). Caught by tests/zer_proof/A01_no_uaf —
+         * safe program was exiting with code 2 instead of 0.
+         * Only applies to the top-level main (no module prefix). */
+        bool main_promote = (!func->module_prefix &&
+                              func->name_len == 4 &&
+                              memcmp(func->name, "main", 4) == 0 &&
+                              (!ret || ret->kind == TYPE_VOID));
+
+        if (main_promote) emit(e, "int");
+        else if (ret) emit_type(e, ret);
         else emit(e, "void");
         emit(e, " ");
+        e->current_main_promoted = main_promote;
 
         /* Mangled name */
         if (func->module_prefix) {
@@ -7912,8 +7932,14 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    /* Note: for void main() promoted to int main(), the IR-emitted return
+     * (via emit_return_null) handles the bare return as `return 0;` when
+     * current_main_promoted is true. C99 §5.1.2.2.3 also guarantees
+     * fall-through from int main = return 0 implicitly. */
+
     e->source_file = saved_source;
     e->current_func_ret = NULL;
+    e->current_main_promoted = false;
     e->indent--;
     emit(e, "}\n\n");
 }

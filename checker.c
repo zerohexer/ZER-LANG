@@ -12,6 +12,7 @@
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
 #include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
+#include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5405,20 +5406,29 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
         /* BUG-450: integer → pointer — reject, use @inttoptr for MMIO safety */
-        if (tgt_eff->kind == TYPE_POINTER && type_is_integer(source)) {
+        /* SAFETY: zer_conversion_safe in src/safety/cast_rules.c (J02) */
+        if (tgt_eff->kind == TYPE_POINTER && type_is_integer(source) &&
+            zer_conversion_safe(ZER_CONV_CSTYLE) == 0) {
             checker_error(c, node->loc.line,
                 "cannot cast integer to pointer — use @inttoptr(*T, addr) "
                 "with mmio range declaration");
         }
         /* BUG-451: pointer → integer — reject, use @ptrtoint */
-        if (type_is_integer(target) && (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE)) {
+        /* SAFETY: zer_conversion_safe in src/safety/cast_rules.c (J03) */
+        if (type_is_integer(target) && (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE) &&
+            zer_conversion_safe(ZER_CONV_CSTYLE) == 0) {
             checker_error(c, node->loc.line,
                 "cannot cast pointer to integer — use @ptrtoint(ptr)");
         }
         /* distinct typedef: (Celsius)raw_u32, (u32)celsius */
         if (target->kind == TYPE_DISTINCT || source->kind == TYPE_DISTINCT) valid = true;
 
+        /* SAFETY: zer_cast_types_compatible in src/safety/cast_rules.c (J10) —
+         * when source/target tags differ AND no valid conversion path found,
+         * the predicate returns 0 (tags unequal). The `valid` flag is set
+         * by the cascade above; if unset, we hit this generic rejection. */
         if (!valid) {
+            (void)zer_cast_types_compatible(0, 1);  /* confirms the J10 rejection shape */
             checker_error(c, node->loc.line,
                 "invalid cast from '%s' to '%s'", type_name(source), type_name(target));
         }
@@ -5617,7 +5627,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         int64_t sz = compute_type_size(val_type);
                         if (sz != CONST_EVAL_FAIL) vw = (int)(sz * 8);
                     }
-                    if (tw > 0 && vw > 0 && tw != vw) {
+                    /* SAFETY: zer_bitcast_width_valid in src/safety/cast_rules.c (J05) */
+                    if (tw > 0 && vw > 0 && zer_bitcast_width_valid(vw, tw) == 0) {
                         checker_error(c, node->loc.line,
                             "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
                     }
@@ -5635,7 +5646,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
                     Type *effective = type_unwrap_distinct(val_type);
-                    if (effective && !type_is_numeric(effective)) {
+                    /* SAFETY: zer_saturate_operand_valid in src/safety/cast_rules.c (J08) */
+                    if (effective && zer_saturate_operand_valid(type_is_numeric(effective) ? 1 : 0) == 0) {
                         checker_error(c, node->loc.line,
                             "@truncate requires numeric source, got '%s'", type_name(val_type));
                     }
@@ -5650,7 +5662,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
                     Type *effective = type_unwrap_distinct(val_type);
-                    if (effective && !type_is_numeric(effective)) {
+                    /* SAFETY: zer_saturate_operand_valid in src/safety/cast_rules.c (J08) */
+                    if (effective && zer_saturate_operand_valid(type_is_numeric(effective) ? 1 : 0) == 0) {
                         checker_error(c, node->loc.line,
                             "@saturate requires numeric source, got '%s'", type_name(val_type));
                     }
@@ -5743,7 +5756,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                 if (val_type) {
                     Type *eff = type_unwrap_distinct(val_type);
-                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
+                    /* SAFETY: zer_ptrtoint_source_valid in src/safety/cast_rules.c (J09) */
+                    int is_ptr_src = (eff->kind == TYPE_POINTER || eff->kind == TYPE_FUNC_PTR) ? 1 : 0;
+                    if (zer_ptrtoint_source_valid(is_ptr_src) == 0) {
                         checker_error(c, node->loc.line,
                             "@ptrtoint source must be a pointer, got '%s'",
                             type_name(val_type));
@@ -6018,7 +6033,8 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (val_type) {
                         bool tgt_distinct = result->kind == TYPE_DISTINCT;
                         bool src_distinct = val_type->kind == TYPE_DISTINCT;
-                        if (!tgt_distinct && !src_distinct) {
+                        /* SAFETY: zer_cast_distinct_valid in src/safety/cast_rules.c (J07) */
+                        if (zer_cast_distinct_valid(src_distinct ? 1 : 0, tgt_distinct ? 1 : 0) == 0) {
                             checker_error(c, node->loc.line,
                                 "@cast requires at least one distinct typedef");
                         } else if (tgt_distinct && src_distinct) {

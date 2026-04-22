@@ -18,6 +18,7 @@ arith_rules.v
 variant_rules.v
 stack_rules.v
 comptime_rules.v
+cast_rules.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

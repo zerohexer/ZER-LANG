@@ -515,7 +515,7 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Level 3 — Architecture 1 extract-and-link VST (2026-04-21, 7 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c/checker.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR.
 
-Extracted so far (42 total — Phase 1 effectively done):
+Extracted so far (44 total — **PHASE 1 COMPLETE 2026-04-22**):
 - `src/safety/handle_state.c` — 4 predicates: state checks
 - `src/safety/range_checks.c` — 3 predicates: count/bounds/variant
 - `src/safety/type_kind.c` — 7 predicates: type categories
@@ -528,6 +528,7 @@ Extracted so far (42 total — Phase 1 effectively done):
 - `src/safety/move_rules.c` — 2 predicates: move struct tracking (λZER-move)
 - `src/safety/atomic_rules.c` — 2 predicates: @atomic width/arg (typing.v E)
 - `src/safety/container_rules.c` — 3 predicates: field/container/depth validity (typing.v T+K)
+- `src/safety/misc_rules.c` — 2 predicates: int-switch default, bool-switch exhaustive (typing.v Q)
 
 Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_type, should_track_move), zercheck_ir.c (ir_is_invalid), checker.c (Pool/Ring count + control-flow handlers + return-escape + @ptrcast + @inttoptr + TYNODE_OPTIONAL + @atomic_*), types.c (type_is_*, can_implicit_coerce). All delegate.
 
@@ -537,7 +538,7 @@ Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_ty
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 40 pure predicates (~100 hrs) — **42/44 done (95%) — effectively COMPLETE**
+2. Phase 1 — 40 pure predicates (~100 hrs) — **✅ 44/44 DONE (100%) — COMPLETE 2026-04-22**
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)
 5. Phase 4 — Verified state APIs (~240 hrs)

@@ -1,0 +1,15 @@
+// `unsafe asm` is the preferred form (Rust-style explicit escape hatch marker, 2026-04-23).
+// Bare `asm` still works for backward compatibility.
+// Both forms require naked function context (Phase 1 verified: zer_asm_allowed_in_context).
+
+naked void isr_unsafe() {
+    unsafe asm("nop");
+}
+
+naked void isr_legacy() {
+    asm("nop");  // backward compat — still valid
+}
+
+i32 main() {
+    return 0;
+}

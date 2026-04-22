@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// `unsafe` must be followed by `asm`. It's not a general unsafe-block keyword.
+
+naked void handler() {
+    unsafe { }  // error: expected 'asm' after 'unsafe'
+}
+
+i32 main() { return 0; }

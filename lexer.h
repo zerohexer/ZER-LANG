@@ -41,6 +41,7 @@ typedef enum {
     TOK_CONTAINER,
     TOK_DO,
     TOK_SEMAPHORE,
+    TOK_UNSAFE,  /* `unsafe asm` — explicit escape hatch marker (Rust-style) */
 
     /* === Literals === */
     TOK_IDENT,          /* user identifier */

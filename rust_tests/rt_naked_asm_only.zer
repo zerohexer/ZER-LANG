@@ -1,5 +1,5 @@
-// Naked function with only asm — valid
+// Naked function with only unsafe asm — valid (new preferred syntax 2026-04-23)
 naked void nop_handler() {
-    asm("nop");
+    unsafe asm("nop");
 }
 i32 main() { return 0; }

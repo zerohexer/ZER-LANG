@@ -280,6 +280,7 @@ static TokenType check_keyword(const char *word, size_t word_len) {
                 break;
             case 'n':
                 if (word_len == 5 && memcmp(word+2, "ion", 3) == 0) return TOK_UNION;
+                if (word_len == 6 && memcmp(word+2, "safe", 4) == 0) return TOK_UNSAFE;
                 break;
             case 's':
                 if (word_len == 5 && memcmp(word+2, "ize", 3) == 0) return TOK_USIZE;
@@ -587,6 +588,7 @@ const char *token_type_name(TokenType type) {
     case TOK_VOLATILE: return "volatile";
     case TOK_INTERRUPT: return "interrupt";
     case TOK_ASM: return "asm";
+    case TOK_UNSAFE: return "unsafe";
     case TOK_STATIC: return "static";
     case TOK_STATIC_ASSERT: return "static_assert";
     case TOK_CONTAINER: return "container";

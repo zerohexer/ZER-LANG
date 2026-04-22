@@ -210,6 +210,30 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Phase 2 Batch 1 — ISR / @critical bans (2026-04-22)
+
+First Phase 2 (decision extraction) batch. 4 hardware-context ban
+predicates extracted to `src/safety/isr_rules.c`:
+- `zer_alloc_allowed_in_isr(in_interrupt)` — malloc banned in ISR
+  (deadlock risk on heap mutex)
+- `zer_alloc_allowed_in_critical(critical_depth)` — malloc banned in
+  @critical block (interrupts disabled → OS deadlock)
+- `zer_spawn_allowed_in_isr(in_interrupt)` — pthread_create banned in ISR
+- `zer_spawn_allowed_in_critical(critical_depth)` — pthread_create banned
+  in @critical
+
+Oracle: CLAUDE.md "Ban Decision Framework" + typing.v C03/C04/S04/S05
+(schematic).
+
+Wired checker.c `check_isr_ban` to delegate to `zer_alloc_allowed_in_isr`.
+The 4 existing ISR check sites (slab.alloc, slab.alloc_ptr, Task.alloc,
+Task.alloc_ptr) now route through the VST-verified predicate.
+
+VST proof (verif_isr_rules.v): 4 lemmas, zero admits.
+
+Total Level-3 verified compiler functions: **48**
+(Phase 1: 44 + Phase 2: 4).
+
 ### 🎯 Fourteenth batch — switch rules (PHASE 1 COMPLETE 44/44, 2026-04-22)
 
 Final batch: 2 switch-exhaustiveness predicates from typing.v Section Q.

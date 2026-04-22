@@ -530,6 +530,9 @@ Extracted so far (44 total — **PHASE 1 COMPLETE 2026-04-22**):
 - `src/safety/container_rules.c` — 3 predicates: field/container/depth validity (typing.v T+K)
 - `src/safety/misc_rules.c` — 2 predicates: int-switch default, bool-switch exhaustive (typing.v Q)
 
+**Phase 2 batches (decision extraction):**
+- `src/safety/isr_rules.c` — 4 predicates: `zer_alloc/spawn_allowed_in_isr/critical` (hardware ban decisions, oracle: CLAUDE.md Ban Framework + typing.v C03/C04/S04/S05)
+
 Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_type, should_track_move), zercheck_ir.c (ir_is_invalid), checker.c (Pool/Ring count + control-flow handlers + return-escape + @ptrcast + @inttoptr + TYNODE_OPTIONAL + @atomic_*), types.c (type_is_*, can_implicit_coerce). All delegate.
 
 **Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 8-phase roadmap.
@@ -539,6 +542,7 @@ Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_ty
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
 2. Phase 1 — 40 pure predicates (~100 hrs) — **✅ 44/44 DONE (100%) — COMPLETE 2026-04-22**
+3. Phase 2 — 60 decision extractions (~150 hrs) — **🔄 4/60 (7%)** — ISR/@critical bans batch 1
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)
 5. Phase 4 — Verified state APIs (~240 hrs)

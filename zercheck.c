@@ -1,5 +1,6 @@
 #include "zercheck.h"
 #include "src/safety/handle_state.h"   /* zer_handle_state_is_invalid — VST-verified */
+#include "src/safety/move_rules.h"     /* zer_type_kind_is_move_struct, _should_track */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -921,7 +922,9 @@ static void zc_check_var_init(ZerCheck *zc, PathState *ps, Node *var_node) {
 static bool is_move_struct_type(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
-    return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
+    /* SAFETY: zer_type_kind_is_move_struct in src/safety/move_rules.c */
+    int is_move_flag = (eff->kind == TYPE_STRUCT && eff->struct_type.is_move) ? 1 : 0;
+    return zer_type_kind_is_move_struct(eff->kind, is_move_flag) != 0;
 }
 
 /* Check if a type contains a move struct field (one level deep).
@@ -956,7 +959,11 @@ static bool contains_move_struct_field(Type *t) {
 /* Should this type be tracked for move/transfer semantics?
  * Covers: move struct directly, or regular struct containing move struct field. */
 static bool should_track_move(Type *t) {
-    return t && (is_move_struct_type(t) || contains_move_struct_field(t));
+    if (!t) return false;
+    /* SAFETY: zer_move_should_track in src/safety/move_rules.c */
+    int is_move = is_move_struct_type(t) ? 1 : 0;
+    int has_field = contains_move_struct_field(t) ? 1 : 0;
+    return zer_move_should_track(is_move, has_field) != 0;
 }
 
 /* Is this handle in any state where use is invalid?

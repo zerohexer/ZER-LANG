@@ -8,6 +8,8 @@ context_bans.v
 escape_rules.v
 provenance_rules.v
 mmio_rules.v
+optional_rules.v
+move_rules.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

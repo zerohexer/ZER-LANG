@@ -4,6 +4,7 @@
 #include "src/safety/escape_rules.h"       /* zer_region_can_escape — VST-verified */
 #include "src/safety/provenance_rules.h"   /* zer_provenance_* — VST-verified */
 #include "src/safety/mmio_rules.h"         /* zer_mmio_* — VST-verified */
+#include "src/safety/optional_rules.h"     /* zer_type_permits_null, _is_nested_optional */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1204,8 +1205,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
 
     case TYNODE_OPTIONAL: {
         Type *inner = resolve_type(c, tn->optional.inner);
-        /* BUG-506: unwrap distinct — ?distinct(?T) is still nested optional */
-        if (type_unwrap_distinct(inner)->kind == TYPE_OPTIONAL) {
+        /* BUG-506: unwrap distinct — ?distinct(?T) is still nested optional
+         * SAFETY: zer_type_is_nested_optional in src/safety/optional_rules.c
+         * Oracle: typing.v N05 has_nested_optional. */
+        int inner_unwrapped_kind = type_unwrap_distinct(inner)->kind;
+        if (zer_type_is_nested_optional(ZER_TK_OPTIONAL, inner_unwrapped_kind) != 0) {
             checker_error(c, tn->loc.line,
                 "nested optional '??T' is not supported");
             return inner; /* return the inner ?T, not ??T */

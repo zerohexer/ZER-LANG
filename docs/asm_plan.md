@@ -4,7 +4,7 @@
 
 **Key revisions (2026-04-23 late-day):**
 - Scope reduced from 4 archs → 3 archs (x86-64, ARM64, RISC-V). Cortex-M deferred to v1.1.
-- `asm` keyword kept as `unsafe asm` escape hatch (not banned). Matches Rust's `unsafe { asm!() }` pattern. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — applies to new naming too.
+- `asm` keyword renamed to `unsafe asm` — the `unsafe` marker is now **required** (Rust-style explicit escape hatch). Bare `asm(...)` is rejected with compile error. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — structural rule applies to new naming.
 - Sail cannot generate asm code (web search confirmed). Removed "Sail codegen" as a shortcut.
 - Islaris covers ARM64 + RISC-V only, single-threaded. x86 verification requires custom framework build-out.
 
@@ -93,10 +93,10 @@ The conversation explored 4 options before landing here:
 
 ## Pivotal Design Decisions
 
-### Decision 1: Discourage user-written asm via explicit marking
-**Reason:** Open-ended verification is infeasible. Fixed intrinsic surface is tractable. But permanent escape hatch is valuable for edge cases (new vendor extensions, niche hardware, rare use cases).
-**Implication:** `unsafe asm { ... }` exists as explicit escape hatch (still restricted to `naked` functions per Phase 1 verified rule). Users prefer `@intrinsic()` calls. The `unsafe` keyword is required — bare `asm` is deprecated.
-**Trust model:** Matches Rust's `unsafe { asm!() }` — marked, auditable, intentional.
+### Decision 1: Require explicit `unsafe` marker for all inline assembly
+**Reason:** Open-ended verification is infeasible. Fixed intrinsic surface is tractable. But permanent escape hatch is valuable for edge cases (new vendor extensions, niche hardware, rare use cases). The `unsafe` marker enforces explicit intent.
+**Implication:** `unsafe asm(...)` is the only accepted form. Bare `asm(...)` gives compile error with helpful message. Still restricted to `naked` functions per Phase 1 verified rule. Users prefer `@intrinsic()` calls; `unsafe asm` for edge cases.
+**Trust model:** Matches Rust's `unsafe { asm!() }` — marked, auditable, intentional. `grep -rn "unsafe asm"` finds every escape hatch in a codebase.
 
 ### Decision 2: GCC as backend, no new assembler
 **Reason:** Writing a verified assembler is a separate 10-person-year project. GCC's GAS is 40 years old and production-quality.
@@ -330,10 +330,12 @@ Each arch is independently usable. Don't need to wait for all 4 to ship.
 
 ## The 7 Shortcuts (all stacked in final plan)
 
-### Shortcut 1: Discourage user asm via explicit `unsafe asm` marker
-- `unsafe asm { ... }` exists as explicit escape hatch; still restricted to `naked` functions (Phase 1 verified)
-- Users prefer `@intrinsic()` calls for safety; `unsafe asm` is opt-in
-- Same pattern as Rust's `unsafe { asm!(...) }`
+### Shortcut 1: Require explicit `unsafe asm` marker (bare `asm` rejected)
+- `unsafe asm(...)` is the ONLY accepted form; bare `asm(...)` gives compile error
+- Still restricted to `naked` functions (Phase 1 verified)
+- Users prefer `@intrinsic()` calls for safety; `unsafe asm` is the explicit escape hatch
+- Same pattern as Rust's `unsafe { asm!(...) }` — no implicit-unsafe allowed
+- Grep-auditable: `grep -rn "unsafe asm"` finds every escape hatch
 - No DSL parser needed (simple keyword prefix)
 - Saves 150-200 hrs vs building full Vale-style DSL
 
@@ -462,9 +464,9 @@ Full-time (2,000 hrs/year) halves the calendar to 2.5 years.
 
 ---
 
-## Escape Hatch: `unsafe asm` (decided 2026-04-23)
+## Escape Hatch: `unsafe asm` (decided 2026-04-23, strict mode)
 
-ZER keeps the `asm` keyword as a permanent escape hatch, but requires explicit `unsafe` marking. This matches Rust's pattern (`unsafe { asm!(...) }`) and acknowledges that intrinsics cannot cover 100% of every edge case (new vendor extensions, experimental hardware, undocumented quirks).
+ZER keeps inline asm as a permanent escape hatch but **requires** explicit `unsafe` marking. Bare `asm(...)` is rejected at compile time. This matches Rust's pattern (`unsafe { asm!(...) }`) — no implicit unsafe allowed — and acknowledges that intrinsics cannot cover 100% of every edge case (new vendor extensions, experimental hardware, undocumented quirks).
 
 ### The three trust tiers
 
@@ -528,9 +530,9 @@ These rules are enforced by the compiler. They are the "100% coverage" mechanism
 
 | # | Rule | Enforcement |
 |---|---|---|
-| 1 | `unsafe asm` requires explicit `unsafe` keyword; default path is intrinsics | Parser rejects bare `asm`, warns when `unsafe asm` used instead of available intrinsic |
-| 2 | `naked` + `unsafe asm` only allowed together; naked body = asm + return only | Phase 1 verified (`zer_asm_allowed_in_context`) |
-| 3 | All low-level operations preferred through `@intrinsic()` calls | Deprecation warning when `unsafe asm` has an intrinsic equivalent |
+| 1 | `unsafe` keyword is required before `asm`; bare `asm(...)` is a compile error | Parser rejects bare `asm` with message "use 'unsafe asm(...)' as explicit escape hatch marker" |
+| 2 | `naked` + `unsafe asm` only allowed together; naked body = `unsafe asm(...)` + return only | Phase 1 verified (`zer_asm_allowed_in_context`) |
+| 3 | All low-level operations preferred through `@intrinsic()` calls | Future: deprecation warning when `unsafe asm` has an intrinsic equivalent |
 | 4 | `cinclude "foo.S"` allowed; every call site emits `[UNSAFE-EXTERN]` warning | Emitter + compile-time warning |
 | 5 | Intrinsics are target-gated (e.g., `@cpu_msr_read` only on x86) | Checker rejects cross-target use |
 | 6 | Privileged intrinsics require `privileged fn` context | Scope-based rule |
@@ -596,7 +598,7 @@ After 3,750 hrs complete (Phase 0 prereq + Phase A-E, 3-arch scope):
 > **"ZER covers 100% of its target market (memory-safe OS kernels, RTOSes, embedded firmware, drivers, crypto libraries, hypervisors, networking stacks, and any ahead-of-time-compiled systems code) through:
 >
 > - ~96 formally verified intrinsics per architecture (x86-64, ARM64, RISC-V)
-> - User-written asm requires explicit `unsafe asm` marker and is restricted to `naked` functions (Phase 1 verified); users prefer intrinsics for safety
+> - User-written asm REQUIRES explicit `unsafe asm` marker and is restricted to `naked` functions (Phase 1 verified); bare `asm(...)` is rejected at compile time. Users prefer intrinsics for safety.
 > - GCC as the trusted assembler (standard trust base used by Linux, BSD, etc.)
 > - Type-system-level prevention of runtime code generation
 >
@@ -741,10 +743,10 @@ If you are a fresh session picking up this work, do these in order:
 A: Vale requires F*/Z3/OCaml (~2 GB toolchain). Covers only ~10% of ZER's needs (crypto). Can't handle context switch, MMU, interrupts. Maintenance burden too high. See "Option 1 rejected" above.
 
 **Q: Can we write the asm in ZER itself?**
-A: Yes, via `unsafe asm { ... }` in a `naked` function (Phase 1 verified). But users prefer `@intrinsic()` calls. Bare `asm` is deprecated; the `unsafe` keyword is required to make the escape hatch explicit (matches Rust's `unsafe { asm!() }` pattern).
+A: Yes, via `unsafe asm(...)` inside a `naked` function (Phase 1 verified). Users prefer `@intrinsic()` calls. Bare `asm(...)` is rejected at compile time — the `unsafe` keyword is required to make the escape hatch explicit (matches Rust's `unsafe { asm!() }` pattern).
 
 **Q: What if a user needs something outside the 96 intrinsics?**
-A: Three escape routes in order of preference: (1) file issue for new intrinsic to be added + verified; (2) write `unsafe asm { ... }` inline (in a `naked` function); (3) use `cinclude "foo.S"` with explicit `UNSAFE-EXTERN` warning; (4) fork ZER and add their own verified intrinsic.
+A: Three escape routes in order of preference: (1) file issue for new intrinsic to be added + verified; (2) write `unsafe asm(...)` inline (in a `naked` function); (3) use `cinclude "foo.S"` with explicit `UNSAFE-EXTERN` warning; (4) fork ZER and add their own verified intrinsic.
 
 **Q: Can we write a JIT compiler in pure ZER?**
 A: No. ZER's type system prevents casting `*u8` → function pointer. This blocks JIT by design. Projects that need JIT (V8, JVM, etc.) are outside ZER's target market.
@@ -818,7 +820,7 @@ Summary of the conversation that led to this plan:
 | Question | Answer |
 |---|---|
 | Do we write a new assembler? | No. GCC is the assembler. Always was. |
-| Do we ban user asm? | No — kept as explicit escape hatch. `unsafe asm { ... }` (restricted to `naked` fns) for edge cases. Users prefer intrinsics. |
+| Do we ban user asm? | No — kept as explicit escape hatch. `unsafe asm(...)` REQUIRED (bare `asm` rejected). Restricted to `naked` fns. Users prefer intrinsics. |
 | How do users write low-level code? | Via 96 verified intrinsics (same API surface on every arch). |
 | Does this cover 100% of asm? | Yes, for ahead-of-time-compiled code in target domain. |
 | Which archs initially? | **x86-64, ARM64, RISC-V** (3 archs for v1.0). |

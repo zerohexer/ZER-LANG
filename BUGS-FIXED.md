@@ -5,26 +5,36 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-04-23 — `unsafe asm` keyword (feature, not bug)
+## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)
 
-**Change:** Added `unsafe asm(...)` as preferred form for inline assembly. Bare `asm(...)` still accepted for backward compatibility.
+**Change:** Added `unsafe asm(...)` as the REQUIRED form for inline assembly. Bare `asm(...)` is rejected at compile time with a helpful error message pointing to `unsafe asm`.
 
-**Rationale:** Aligns with Rust's `unsafe { asm!() }` pattern — explicit marking of escape hatch. Makes the intent clear at call site. Signals the non-preferred path; when verified intrinsics ship (Phase D, post-Phase-7), users can grep for `unsafe asm` to find migration targets.
+**Initial commit (f09492c):** Added `unsafe asm` as preferred form with backward compat for bare `asm`.
+
+**Followup (Option B, strict mode):** Removed backward compat — bare `asm(...)` now rejected. Rationale: silent backward compat defeats the "explicit escape hatch marker" intent. Pre-1.0, breaking change cost is zero (only 4 test files needed updating).
+
+**Rationale:** Aligns with Rust's `unsafe { asm!() }` pattern — no implicit unsafe allowed. Makes escape hatch explicit and greppable at every call site. When verified intrinsics ship (Phase D, post-Phase-7), users run `grep -rn "unsafe asm"` to find migration targets. Silent `asm` would miss them.
 
 **Implementation:**
 - `lexer.h`: Added `TOK_UNSAFE` to TokenType enum
 - `lexer.c`: Added `unsafe` keyword match (word_len==6, memcmp "safe" at +2); added case for debug token name
-- `parser.c`: Added `TOK_UNSAFE` branch before `TOK_ASM` check. Requires `asm` to follow `unsafe`. Both forms reach the same asm body parsing logic.
+- `parser.c`: Accepts `unsafe asm(...)` as the only valid form. Bare `asm(...)` triggers `error_at("bare 'asm' is not allowed — use 'unsafe asm(...)' as explicit escape hatch marker")`. Still parses the block for graceful error recovery.
 - `test_lexer.c`: Added `expect_single("unsafe", TOK_UNSAFE, "unsafe")` test
-- New tests: `tests/zer/unsafe_asm_syntax.zer` (positive: both forms work), `tests/zer_fail/unsafe_without_asm.zer` (negative: unsafe without asm rejected)
-- Existing tests migrated: `rust_tests/rt_naked_asm_only.zer`, `reject_naked_array.zer`, `reject_naked_var_decl.zer` updated to use `unsafe asm`
-- `tests/zer_fail/asm_not_naked.zer` kept with bare `asm` as backward-compat regression test
+- New tests:
+  - `tests/zer/unsafe_asm_syntax.zer` (positive: `unsafe asm` compiles)
+  - `tests/zer_fail/unsafe_without_asm.zer` (negative: `unsafe` without `asm` rejected)
+  - `tests/zer_fail/bare_asm_rejected.zer` (negative: bare `asm` rejected)
+- All existing tests migrated to `unsafe asm`:
+  - `rust_tests/rt_naked_asm_only.zer`
+  - `rust_tests/reject_naked_array.zer`
+  - `rust_tests/reject_naked_var_decl.zer`
+  - `tests/zer_fail/asm_not_naked.zer`
 
 **Phase 1 verified rule unchanged:** `zer_asm_allowed_in_context(in_naked)` in `src/safety/context_bans.c` checks structural context, not keyword spelling. VST proof in `verif_context_bans.v` holds. Phase 1 remains at 85/85 predicates, zero admits.
 
-**Tests:** 417/417 (was 415, +2 new). check-vst: green, zero admits.
+**Tests:** 418/418 (was 415, +3 new: unsafe_asm_syntax positive + 2 negative). check-vst: green, zero admits.
 
-**Migration policy:** Both forms work. No urgency to migrate. When intrinsics ship (Phase D), bare `asm` will emit deprecation warning when an equivalent intrinsic exists.
+**Audit pattern:** `grep -rn "unsafe asm" src/` finds every inline-asm escape hatch in a codebase. No silent bare-asm sites possible.
 
 **Docs updated:** `docs/asm_plan.md`, `docs/reference.md`, `docs/ASM_ZER-LANG.md`, `CLAUDE.md`.
 

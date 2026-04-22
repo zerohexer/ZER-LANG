@@ -305,10 +305,11 @@ static void test_defer(void) {
 static void test_asm(void) {
     printf("[asm]\n");
     expect_parse_ok(
-        "void main() {\n"
-        "    asm(\"nop\");\n"
-        "}\n",
-        "asm statement");
+        "naked void reset() {\n"
+        "    unsafe asm(\"nop\");\n"
+        "}\n"
+        "i32 main() { return 0; }\n",
+        "unsafe asm statement");
 }
 
 static void test_intrinsics(void) {

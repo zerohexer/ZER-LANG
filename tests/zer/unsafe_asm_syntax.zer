@@ -1,13 +1,14 @@
-// `unsafe asm` is the preferred form (Rust-style explicit escape hatch marker, 2026-04-23).
-// Bare `asm` still works for backward compatibility.
-// Both forms require naked function context (Phase 1 verified: zer_asm_allowed_in_context).
+// `unsafe asm` is the required form for inline assembly (2026-04-23).
+// Bare `asm(...)` is rejected — users must explicitly mark the escape hatch.
+// Phase 1 verified: zer_asm_allowed_in_context enforces naked-function restriction.
 
-naked void isr_unsafe() {
+naked void isr_one() {
     unsafe asm("nop");
 }
 
-naked void isr_legacy() {
-    asm("nop");  // backward compat — still valid
+naked void isr_two() {
+    unsafe asm("nop");
+    unsafe asm("nop");
 }
 
 i32 main() {

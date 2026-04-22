@@ -173,11 +173,11 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
         return 1;
     ```
 
-16. **`unsafe asm` is the preferred inline-asm form (2026-04-23).** Bare `asm(...)` still works for backward compatibility. Both restricted to `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context`). Users prefer `@intrinsic()` calls; `unsafe asm` is an escape hatch for edge cases. See `docs/asm_plan.md`.
+16. **`unsafe asm` is REQUIRED for inline asm (2026-04-23).** Bare `asm(...)` is rejected at compile time with message "use 'unsafe asm(...)' as explicit escape hatch marker". Only allowed inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context`). Users prefer `@intrinsic()` calls; `unsafe asm` is an escape hatch for edge cases. See `docs/asm_plan.md`.
     ```
     naked void handler() {
-        unsafe asm("cli");        // preferred — Rust-style explicit marker
-        asm("nop");                 // legacy — still compiles
+        unsafe asm("cli");        // OK — Rust-style explicit marker required
+        // asm("nop");             // COMPILE ERROR: bare 'asm' not allowed
     }
     ```
 
@@ -868,7 +868,7 @@ ZER SYNTAX RULES (not C — these differ):
 - Optional: ?*T (null sentinel), ?T (struct with .value/.has_value), ?void (has_value ONLY, no .value)
 - Unwrap: if (opt) |val| { use(val); }  or  val = opt orelse default;
 - goto label; and label: are supported (forward + backward). Banned inside defer and @critical blocks.
-- Inline asm: `unsafe asm("...")` preferred (Rust-style), bare `asm("...")` accepted for backward compat. Only in `naked` functions.
+- Inline asm: `unsafe asm("...")` REQUIRED (Rust-style); bare `asm("...")` is a compile error. Only in `naked` functions.
 - shared struct = auto-locked mutex. shared(rw) struct = reader-writer lock.
 - spawn func(args) = fire-and-forget thread (shared ptr or value args only)
 - ThreadHandle th = spawn func(args); th.join(); = scoped spawn (allows *T)

@@ -387,6 +387,79 @@ This risk is mitigated by:
 
 Use Tier 2 minimum before every batch. Tier 3 every 2-3 batches. Tier 4 periodically.
 
+### Phase 1 COMPLETE (2026-04-22, 44/44 predicates)
+
+13 `src/safety/*.c` files, 44 VST-verified predicates, 16 VST `.v` files,
+zero admits. Every major safety subsystem in `safety_list.md` has at
+least one oracle-driven predicate. `make check-vst` enforces the whole
+thing.
+
+Subsystem roll-call: handle_state, range_checks, type_kind, coerce_rules,
+context_bans, escape_rules, provenance_rules, mmio_rules, optional_rules,
+move_rules, atomic_rules, container_rules, misc_rules.
+
+Next milestone: **Phase 2 — decision extraction** (~150 hrs, ~60 decisions).
+
+### Phase 2 pattern — decision extraction (different from Phase 1)
+
+Phase 1 predicates answered "is X valid?" — one bool output per check.
+
+Phase 2 decisions answer "given X, what should happen?" — at mutation sites.
+Two options for extraction:
+
+**Option 2a: Multiple bool predicates per mutation site.**
+Keep each predicate a pure bool-returning check. Mutation site calls
+several predicates and branches on results.
+
+```c
+// BEFORE (mutation tangled with decision)
+if (h->state == HS_ALIVE) {
+    h->state = HS_FREED;
+    h->free_line = line;
+} else if (h->state == HS_FREED) {
+    error("double free");
+}
+
+// AFTER (Phase 1 predicates already cover most cases)
+if (zer_handle_state_is_alive(h->state) != 0) {
+    h->state = HS_FREED;   // trivial assignment, not verifiable
+    h->free_line = line;
+} else if (zer_handle_state_is_freed(h->state) != 0) {
+    error("double free");
+}
+```
+
+Much of Phase 2 is actually **sweeping inline state checks to delegate
+to Phase 1 predicates** — no new extractions needed, just wider
+coverage of the existing VST guarantees.
+
+**Option 2b: Single decision function returning action code.**
+
+```c
+// Extracted pure function
+int zer_handle_merge_states(int state_a, int state_b);
+// Returns: merged state per if/else path-merge rules
+
+// Mutation site becomes a dispatch
+h->state = zer_handle_merge_states(then_state, else_state);
+```
+
+Works when the decision itself is complex enough to be worth extracting
+(state merge rules, coercion dispatch, etc.) but the action at the
+call site is trivial assignment.
+
+**Phase 2 priorities (in order of value per hour):**
+1. **Sweep inline checks** to delegate to existing Phase 1 predicates
+   — cheap, big coverage gains, no new VST proofs
+2. **State merge decisions** (path-merge at if/else/switch/loop)
+   — 4 pure functions
+3. **Coercion dispatch** (which coercion to apply given source/dest
+   type kinds) — ~10 functions, builds on Phase 1 coerce_rules
+4. **Escape flag propagation** (when is a flag set/cleared?)
+   — ~6 functions
+
+See `docs/formal_verification_plan.md` Phase 2 section for full target list.
+
 ### Oracle catalog — which Level 1 proof covers which subsystem
 
 When extracting a predicate, the Coq spec MUST be written against a Level 1

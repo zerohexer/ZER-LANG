@@ -197,6 +197,57 @@ for fresh sessions to avoid the same trap.
 
 **Next:** Batch 7 — J-extended (7 cast predicates). Target 71/85 (strict Phase 1 complete).
 
+### Batch 7 — J-extended cast intrinsics LANDED (2026-04-22)
+
+**STRICT PHASE 1 MILESTONE COMPLETE — 71/85 (83%).**
+
+Seven new predicates in src/safety/cast_rules.c (new file):
+- zer_conversion_safe(kind) — J02/J03
+- zer_bitcast_width_valid(src, dst) — J05
+- zer_bitcast_operand_valid(is_primitive) — J06
+- zer_cast_distinct_valid(src_d, dst_d) — J07
+- zer_saturate_operand_valid(is_numeric) — J08
+- zer_ptrtoint_source_valid(is_pointer) — J09
+- zer_cast_types_compatible(src_tag, dst_tag) — J10
+
+All 7 used Pattern C (flat cascade with Z.eq_dec) — proofs pass trivially.
+
+Call sites wired in checker.c:
+- C-style int→ptr cast rejection (J02)
+- C-style ptr→int cast rejection (J03)
+- @bitcast width mismatch (J05)
+- @truncate/@saturate numeric check (J08)
+- @ptrtoint pointer source check (J09)
+- @cast distinct typedef check (J07)
+- invalid cast catch-all (J10 via void confirm)
+
+J06 bitcast_operand_valid has no direct inline call site (implicit in
+width check — non-primitives have width=0 via compute_type_size fallback).
+Predicate defined + VST-verified for completeness of typing.v mapping;
+Phase 6 check-no-inline-safety won't flag it (no inline safety code
+corresponds to it).
+
+State after all 7 batches (2026-04-22): **71/85 (83%) — strict milestone**
+- 48 prior + 23 new = 71
+- VST files: 22
+- src/safety files: 19
+- make check-vst: PASS, zero admits
+- make docker-check: 415/415 (BUG-603 fix holds)
+
+**What strict milestone means:**
+Every predicate from typing.v (Sections Q, I, N, T, P, G, K, L, M, R, S +
+J non-concurrency, plus operational-subset-derived handle/move/escape/
+opaque/mmio/type_kind) with operational-tier or real-Coq-theorem oracle
+is now VST-verified and linked into zerc.
+
+Remaining 14 for full 85: concurrency sections C, D, E-extras, F —
+typing.v has real theorems for all 14, but no operational Iris subset
+yet (schematic backing only). Phase 7 upgrades the Coq specs to
+operational; the C code stays the same.
+
+**Next:** Batch 8 — E atomic extras (3 predicates). Simplest concurrency.
+Target 74/85.
+
 ### BUG-603: void main() emits undefined exit code (2026-04-22)
 
 **Symptom:** `tests/zer_proof/A01_no_uaf` — positive test for handle-safety

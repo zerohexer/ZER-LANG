@@ -15,6 +15,7 @@ container_rules.v
 misc_rules.v
 isr_rules.v
 arith_rules.v
+variant_rules.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

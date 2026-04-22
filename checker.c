@@ -1,10 +1,18 @@
 #include "checker.h"
 #include "src/safety/range_checks.h"   /* zer_count_is_positive — VST-verified */
 #include "src/safety/context_bans.h"   /* zer_*_allowed_in_context — VST-verified */
+#include "src/safety/escape_rules.h"   /* zer_region_can_escape — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+
+/* Convert checker's per-Symbol flags to a region tag. */
+static int zer_sym_region_tag(bool is_local_derived, bool is_arena_derived) {
+    if (is_local_derived) return ZER_REGION_LOCAL;
+    if (is_arena_derived) return ZER_REGION_ARENA;
+    return ZER_REGION_STATIC;
+}
 #include <math.h>
 
 /* ================================================================
@@ -8109,17 +8117,25 @@ static void check_stmt(Checker *c, Node *node) {
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *sym = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
-                        if (sym && sym->is_arena_derived) {
-                            checker_error(c, node->loc.line,
-                                "cannot return arena-derived pointer '%.*s' — "
-                                "arena memory is freed when function returns",
-                                (int)sym->name_len, sym->name);
-                        }
-                        if (sym && sym->is_local_derived) {
-                            checker_error(c, node->loc.line,
-                                "cannot return pointer to local '%.*s' — "
-                                "stack memory is freed when function returns",
-                                (int)sym->name_len, sym->name);
+                        if (sym) {
+                            /* SAFETY: zer_region_can_escape in src/safety/escape_rules.c
+                             * Oracle: lambda_zer_escape/iris_escape_specs.v
+                             * Only RegStatic pointers can escape the current scope. */
+                            int region = zer_sym_region_tag(sym->is_local_derived,
+                                                              sym->is_arena_derived);
+                            if (zer_region_can_escape(region) == 0) {
+                                if (zer_region_is_arena(region) != 0) {
+                                    checker_error(c, node->loc.line,
+                                        "cannot return arena-derived pointer '%.*s' — "
+                                        "arena memory is freed when function returns",
+                                        (int)sym->name_len, sym->name);
+                                } else {
+                                    checker_error(c, node->loc.line,
+                                        "cannot return pointer to local '%.*s' — "
+                                        "stack memory is freed when function returns",
+                                        (int)sym->name_len, sym->name);
+                                }
+                            }
                         }
                     }
                 }

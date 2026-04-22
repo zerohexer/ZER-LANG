@@ -311,11 +311,52 @@ proofs/vst/
 
 Progress tracking: each verified real-code function counts once in `src/safety/*.c`. `make check-vst` should print the count.
 
-### Audit-before-extraction (spec-implementation gap)
+### Spec-writing discipline (the single most important Level 3 habit)
+
+**Write Coq specs against the Level 1 ORACLE, not against the current C behavior.**
+
+This is THE critical habit. VST proves "C matches the spec I wrote." It does NOT prove the spec is correct. The spec is human-authored and can be wrong.
+
+**Two ways to write an extraction spec:**
+
+1. **Code-driven (AVOID):** "What does this C function do? Let me write Coq to match."
+   - VST passes trivially (tautology: C matches its own transliteration)
+   - Bugs in C are frozen into the spec
+   - Future maintainers think "the spec says X, so X is correct"
+
+2. **Oracle-driven (USE):** "What should this predicate compute per the safety rule in typing.v / λZER-subset?"
+   - VST may FAIL on first run, because the C doesn't match the rule — bug exposed
+   - When VST passes, the guarantee is STRONG (C implements the rule correctly)
+   - The proof answers "is the implementation correct?" not "does it self-match?"
+
+**Oracles in increasing precedence:**
+- Operational proof (e.g., `λZER-escape/iris_escape_specs.v`) — gold standard
+- Predicate proof (e.g., `typing.v` section G predicates) — decidable, reliable
+- Schematic claim in `safety_list.md` with code comment — weak, but usable
+- English text in `ZER-LANG.md` / `CLAUDE.md` — weakest, translate to math carefully
+
+**Retroactive check of 2026-04-21 Gemini findings:** all 3 real bugs (F5 shift, F3 escape, F7 iter-limit) were catchable by oracle-driven Level 3 VST. The audit was a SECOND-BEST defense that would have been unnecessary with disciplined spec-writing. Keep audits as a safety net, not a blocking prerequisite.
+
+### When the audit IS still valuable
+
+- **No oracle exists:** the subsystem's Level 1 proof is schematic/missing (e.g., some concurrency rows). No precise spec to write against.
+- **Extraction won't happen:** the function is too complex to extract as a pure predicate (e.g., recursive AST walkers). Level 3 can't help; only tests + audits can.
+- **Multi-subsystem interactions:** bugs that cross subsystem boundaries (e.g., move + async + shared) can't be captured in a single predicate's spec.
+
+For extractable predicates WITH Level 1 oracles, skip the audit step — write oracle-driven specs and let VST do the work.
+
+### Audit-before-extraction (spec-implementation gap) — SECONDARY
+
+The previous section's rule ("always audit before extract") was over-defensive. Keep it as a fallback for un-oraclable subsystems. For oracle-backed predicates, oracle-driven specs are the primary defense.
 
 **THE dominant risk in Level 3 is freezing existing bugs into specs.**
 
-Level 3 extract-and-link VST pins the C behavior to the Coq spec. If the C has a bug at extraction time, the spec captures the bug. CI then enforces the bug as "correct." Future sessions may even write Coq proofs about code that mathematically describes wrong behavior.
+Level 3 extract-and-link VST pins the C behavior to the Coq spec. If the C has a bug at extraction time AND the spec is code-driven, the spec captures the bug. CI then enforces the bug as "correct." Future sessions may even write Coq proofs about code that mathematically describes wrong behavior.
+
+This risk is mitigated by:
+1. **Primary defense: oracle-driven spec writing** (cross-check against Level 1)
+2. **Secondary defense: audit-before-extraction** (when no oracle exists)
+3. **Tertiary defense: regression tests in tests/zer/ and tests/zer_fail/**
 
 **The 2026-04-21 Gemini audit proved this risk concrete.** 4 real bugs in compiler source, present before audit:
 

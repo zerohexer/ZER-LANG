@@ -13,6 +13,7 @@
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
 #include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
 #include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
+#include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

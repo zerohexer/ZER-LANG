@@ -248,6 +248,77 @@ operational; the C code stays the same.
 **Next:** Batch 8 — E atomic extras (3 predicates). Simplest concurrency.
 Target 74/85.
 
+### Batch 8 + 9+10+11 — concurrency (E+F+D+C) LANDED — FULL PHASE 1 COMPLETE 2026-04-22
+
+**FULL PHASE 1 MILESTONE: 85/85 (100%).**
+
+Batch 8 extended `src/safety/atomic_rules.c` with 3 predicates (E03/E04/E08).
+
+Batches 9+10+11 combined into new `src/safety/concurrency_rules.c` with 11
+concurrency predicates (F + D + C sections). Combined because they share
+schematic oracle tier and can use the same VST pattern — reduces Makefile
+churn (one new file vs three) and still hits the catalog target per typing.v.
+
+Predicates added in concurrency_rules.c:
+- F1 zer_yield_context_valid — F01-F04
+- D1 zer_address_of_shared_valid — D01
+- D2 zer_shared_in_suspend_valid — D02
+- D3 zer_volatile_compound_valid — D04
+- D4 zer_isr_main_access_valid — D05
+- C1 zer_thread_op_valid — C01/C02
+- C2 zer_thread_cleanup_valid — C01 (scope exit)
+- C3 zer_spawn_context_valid — C03/C04/C05 (full 3-arg form)
+- C4 zer_spawn_return_safe — C07
+- C5 zer_spawn_arg_valid — C09
+- C6 zer_spawn_arg_is_handle_rejected — C10
+
+**VST pattern finding:** initial D2/D3 implementation used nested if
+(`if (a != 0) { if (b != 0) return 0; }`) — VST refused with
+`Tactic failure: Use [forward_if Post] to prove this if-statement`.
+Root cause: nested if with early return defeats `forward_if`'s
+postcondition inference.
+
+**Fix:** refactored to flat cascade per the catalog rule:
+```c
+int foo(int a, int b) {
+    if (a == 0) return 1;  /* early exit → condition false */
+    if (b == 0) return 1;  /* early exit → other condition false */
+    return 0;              /* both conditions true → reject */
+}
+```
+Equivalent to `!(a && b)` but VST-friendly.
+
+Documented as Pattern C refinement in docs/proof-internals.md "Standard
+proof patterns that WORK". Nested if is Pattern D (avoid) — always
+decompose to sequential cascade.
+
+**State after FULL Phase 1 (2026-04-22):** 85/85 (100%)
+- 48 prior + 37 new = 85 total VST-verified predicates
+- VST files: 23
+- src/safety files: 21 (14 prior + arith + variant + stack + comptime + cast + concurrency)
+- make check-vst: PASS, zero admits
+- make docker-check: 415/415 + 200/200 + 139/139
+
+**Trust model:**
+- 71 predicates (83%) — strong oracle (typing.v real theorems OR operational λZER-* subsets)
+- 14 predicates (17%) — schematic oracle (typing.v real theorems but no operational subset yet)
+
+Phase 7 will add λZER-concurrency + λZER-async operational subsets,
+upgrading the 14 schematic predicates to strong. C code stays unchanged —
+only Coq specs swap typing.v theorem references for operational step_spec.
+
+**Next phases:**
+- Phase 2: decision extraction (~60 items, mutation-site command/query split)
+- Phase 3: generic AST walker (~60 hrs)
+- Phase 4: verified state APIs (~240 hrs)
+- Phase 5: phase-typed checker (~30 hrs)
+- Phase 6: CI discipline (~30 hrs) — includes check-no-inline-safety
+- Phase 7: operational subset deepening (~425 hrs)
+- Phase 8: release polish (~50 hrs)
+
+Phase 1 at 85/85 is the foundation — every downstream phase orchestrates
+these predicates.
+
 ### BUG-603: void main() emits undefined exit code (2026-04-22)
 
 **Symptom:** `tests/zer_proof/A01_no_uaf` — positive test for handle-safety

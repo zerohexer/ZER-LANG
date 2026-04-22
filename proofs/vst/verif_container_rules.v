@@ -37,6 +37,20 @@ Definition zer_field_type_valid_coq (is_void : Z) : Z :=
 Definition zer_type_has_size_coq (is_void : Z) : Z :=
   if Z.eq_dec is_void 0 then 1 else 0.
 
+(* Constants matching container_rules.h *)
+Definition ZER_DP_GLOBAL : Z := 0.
+Definition ZER_HE_STRUCT : Z := 0.
+Definition ZER_TCAT_PTR  : Z := 1.
+
+Definition zer_container_position_valid_coq (decl_position : Z) : Z :=
+  if Z.eq_dec decl_position ZER_DP_GLOBAL then 1 else 0.
+
+Definition zer_handle_element_valid_coq (element_kind : Z) : Z :=
+  if Z.eq_dec element_kind ZER_HE_STRUCT then 1 else 0.
+
+Definition zer_container_source_valid_coq (type_category : Z) : Z :=
+  if Z.eq_dec type_category ZER_TCAT_PTR then 1 else 0.
+
 (* ---- VST funspecs ---- *)
 
 Definition zer_container_depth_valid_spec : ident * funspec :=
@@ -75,10 +89,49 @@ Definition zer_type_has_size_spec : ident * funspec :=
     RETURN (Vint (Int.repr (zer_type_has_size_coq is_void)))
     SEP ().
 
+Definition zer_container_position_valid_spec : ident * funspec :=
+ DECLARE _zer_container_position_valid
+  WITH decl_position : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= decl_position <= Int.max_signed)
+    PARAMS (Vint (Int.repr decl_position))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_container_position_valid_coq decl_position)))
+    SEP ().
+
+Definition zer_handle_element_valid_spec : ident * funspec :=
+ DECLARE _zer_handle_element_valid
+  WITH element_kind : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= element_kind <= Int.max_signed)
+    PARAMS (Vint (Int.repr element_kind))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_handle_element_valid_coq element_kind)))
+    SEP ().
+
+Definition zer_container_source_valid_spec : ident * funspec :=
+ DECLARE _zer_container_source_valid
+  WITH type_category : Z
+  PRE [ tint ]
+    PROP (Int.min_signed <= type_category <= Int.max_signed)
+    PARAMS (Vint (Int.repr type_category))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_container_source_valid_coq type_category)))
+    SEP ().
+
 Definition Gprog : funspecs :=
   [ zer_container_depth_valid_spec;
     zer_field_type_valid_spec;
-    zer_type_has_size_spec ].
+    zer_type_has_size_spec;
+    zer_container_position_valid_spec;
+    zer_handle_element_valid_spec;
+    zer_container_source_valid_spec ].
 
 (* ---- Proofs ---- *)
 
@@ -119,8 +172,44 @@ Proof.
     try entailer!.
 Qed.
 
+Lemma body_zer_container_position_valid:
+  semax_body Vprog Gprog f_zer_container_position_valid
+             zer_container_position_valid_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_container_position_valid_coq, ZER_DP_GLOBAL;
+    repeat (destruct (Z.eq_dec _ _); try lia);
+    try entailer!.
+Qed.
+
+Lemma body_zer_handle_element_valid:
+  semax_body Vprog Gprog f_zer_handle_element_valid
+             zer_handle_element_valid_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_handle_element_valid_coq, ZER_HE_STRUCT;
+    repeat (destruct (Z.eq_dec _ _); try lia);
+    try entailer!.
+Qed.
+
+Lemma body_zer_container_source_valid:
+  semax_body Vprog Gprog f_zer_container_source_valid
+             zer_container_source_valid_spec.
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_container_source_valid_coq, ZER_TCAT_PTR;
+    repeat (destruct (Z.eq_dec _ _); try lia);
+    try entailer!.
+Qed.
+
 (* ================================================================
-   3 container-rule predicates VST-verified against typing.v T/K.
-   Total Level-3 verified compiler functions: 42
-   (prev 39 + 3 container).
+   6 container-rule predicates VST-verified against typing.v T/K.
+   Total Level-3 verified compiler functions: 57
+   (Phase 1: 54 prior + Batch 3: 3 container position/element/source).
    ================================================================ *)

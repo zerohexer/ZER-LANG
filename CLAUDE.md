@@ -541,8 +541,10 @@ Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_ty
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 40 pure predicates (~100 hrs) — **✅ 44/44 DONE (100%) — COMPLETE 2026-04-22**
-3. Phase 2 — 60 decision extractions (~150 hrs) — **🔄 4/60 (7%)** — ISR/@critical bans batch 1
+2. Phase 1 — 77 pure predicates (~150 hrs) — **🔄 48/77 (62%) — REVISED TARGET (was 44 — undercount)**
+   - 77 = all strong-oracle predicates from typing.v (non-concurrency) + operational-subset derived
+   - 88 = target after Phase 7 upgrades concurrency to operational depth
+3. Phase 2 — 60 decision extractions (~150 hrs) — **🔄 4/60 (7%)** — ISR/@critical bans batch 1 (counts toward Phase 1 pure predicates too)
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)
 5. Phase 4 — Verified state APIs (~240 hrs)
@@ -569,6 +571,29 @@ Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_ty
 - **Level 1 (predicates)** — `typing.v` etc.: abstract safety spec is correct.
 - **Level 2 (tests)** — `tests/zer_proof/`: compiler empirically rejects known violations.
 - **Level 3 (VST on extracted predicates)** — `src/safety/*.c` linked + `proofs/vst/verif_*.v`: real compiler code matches spec for EVERY input. Catches implementation bugs 1+2 can miss (e.g., `if (x = 1)` assignment-typo — spec correct, tests may miss, VST fails immediately).
+
+**Theory ↔ implementation guarantee (what CI proves):**
+
+The correctness chain:
+```
+Coq theory (typing.v / operational subsets) — HUMAN-WRITTEN, TRUSTED
+    ↓  REQUIRED: must have matching extraction
+src/safety/<name>.c — pure predicate
+    ↓  make check-vst PROVES match
+Coq spec in proofs/vst/verif_<name>.v (must match oracle, not code)
+    ↓  REQUIRED: checker.c must delegate
+Call sites in checker.c / zercheck.c (with /* SAFETY: ... */ link)
+    ↓  compiled with GCC
+Compiled zerc binary
+```
+
+Each `↓` is enforced by a CI gate:
+- `check-vst` — src/safety/ matches Coq spec (exists today)
+- `check-theory-extracted` — typing.v has extraction (Phase 6, not yet)
+- `check-no-inline-safety` — checker.c delegates (Phase 6, not yet)
+- `check-api-bypass` — no direct mutation (Phase 6, not yet)
+
+Phase 6 is what MAKES the guarantee mechanical. Until Phase 6, the theory→implementation link depends on HUMAN DISCIPLINE.
 
 **Adding a new Level 3 extraction (MANDATORY steps — details in `proof-internals.md` "Phase 1 extraction recipe"):**
 

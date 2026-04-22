@@ -37,4 +37,17 @@ int zer_index_in_bounds(int size, int idx);
  *   - checker.c union variant dispatch (where applicable) */
 int zer_variant_in_range(int n_variants, int variant_idx);
 
+/* Returns 1 iff start <= end_ AND end_ <= size. Slice bounds check.
+ * Uses end_ (not end) because `end` is a Coq vernacular keyword.
+ * Oracle: typing.v:554 slice_bounds_valid (L02, L03).
+ * Callers: checker.c slice expression bounds check. */
+int zer_slice_bounds_valid(int size, int start, int end_);
+
+/* Returns 1 iff 0 <= idx < width. Bit index in range for N-bit type.
+ * Same shape as zer_index_in_bounds but separate predicate for typing.v
+ * L06 mapping (distinct from array bounds L01).
+ * Oracle: typing.v:584 bit_index_valid.
+ * Callers: checker.c bit-extract slice on integer type. */
+int zer_bit_index_valid(int width, int idx);
+
 #endif

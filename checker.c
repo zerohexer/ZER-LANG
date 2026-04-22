@@ -359,20 +359,41 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     Type *effective = type_unwrap_distinct(target);
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
         /* range check: literal must fit in target type.
-         * NOTE: zer_literal_fits (M08) deferred to Batch 1b — tlong VST
-         * proof needs split-predicate redesign. Inline check remains. */
+         * SAFETY: zer_literal_fits_u in src/safety/arith_rules.c (M08).
+         * Oracle: typing.v M08_fitting_literal_ok.
+         * Pre-filter val to uint32 range, then delegate to predicate.
+         * Types where max > UINT32_MAX (U64, I64, USIZE on 64-bit target)
+         * skip the predicate — any positive uint64 literal fits trivially. */
         uint64_t val = expr->int_lit.value;
         switch (effective->kind) {
-        case TYPE_U8:    return val <= 255;
-        case TYPE_U16:   return val <= 65535;
-        case TYPE_U32:   return val <= 0xFFFFFFFFULL;
-        case TYPE_U64:   return true;
-        case TYPE_USIZE: return val <= (zer_target_ptr_bits == 64 ? UINT64_MAX : 0xFFFFFFFFULL);
-        case TYPE_I8:    return val <= 127;
-        case TYPE_I16:   return val <= 32767;
-        case TYPE_I32:   return val <= 2147483647ULL;
-        case TYPE_I64:   return true;
-        default:         return true;
+        case TYPE_U8:
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(255U, (unsigned int)val) != 0;
+        case TYPE_U16:
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(65535U, (unsigned int)val) != 0;
+        case TYPE_U32:
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(0xFFFFFFFFU, (unsigned int)val) != 0;
+        case TYPE_U64:
+            return true;  /* all positive uint64 literals fit */
+        case TYPE_USIZE:
+            if (zer_target_ptr_bits == 64) return true;
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(0xFFFFFFFFU, (unsigned int)val) != 0;
+        case TYPE_I8:
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(127U, (unsigned int)val) != 0;
+        case TYPE_I16:
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(32767U, (unsigned int)val) != 0;
+        case TYPE_I32:
+            if (val > 0xFFFFFFFFULL) return false;
+            return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
+        case TYPE_I64:
+            return true;  /* val is uint64, positive literal fits in i64 */
+        default:
+            return true;
         }
     }
     /* bool is NOT an integer — no int→bool coercion (spec rule) */
@@ -5128,12 +5149,18 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* compile-time check: start must be <= end (for array/slice sub-slicing only,
-         * NOT for bit extraction which uses [high..low] where high > low is valid) */
+         * NOT for bit extraction which uses [high..low] where high > low is valid).
+         * SAFETY: zer_slice_bounds_valid in src/safety/range_checks.c (L03).
+         * Passing size=end_val makes end<=size trivially true → predicate returns
+         * 0 iff start > end. Start/end must fit in int32 for safe cast. */
         if (node->slice.start && node->slice.end &&
             !type_is_integer(obj)) {
             int64_t start_val = eval_const_expr(node->slice.start);
             int64_t end_val = eval_const_expr(node->slice.end);
-            if (start_val != CONST_EVAL_FAIL && end_val != CONST_EVAL_FAIL && start_val > end_val) {
+            if (start_val != CONST_EVAL_FAIL && end_val != CONST_EVAL_FAIL &&
+                start_val >= 0 && start_val <= 0x7FFFFFFF &&
+                end_val >= 0 && end_val <= 0x7FFFFFFF &&
+                zer_slice_bounds_valid((int)end_val, (int)start_val, (int)end_val) == 0) {
                 checker_error(c, node->loc.line,
                     "slice start (%lld) is greater than end (%lld)",
                     (long long)start_val, (long long)end_val);
@@ -5163,10 +5190,12 @@ static Type *check_expr(Checker *c, Node *node) {
             result = obj; /* slice of slice = same slice type */
         } else if (type_is_integer(obj)) {
             /* bit extraction: reg[high..low] → integer result */
-            /* validate constant indices are within type width */
+            /* validate constant indices are within type width.
+             * SAFETY: zer_bit_index_valid in src/safety/range_checks.c (L06) */
             if (node->slice.start) {
                 int64_t hi = eval_const_expr(node->slice.start);
-                if (hi != CONST_EVAL_FAIL && hi >= 0 && hi >= type_width(obj)) {
+                if (hi != CONST_EVAL_FAIL && hi >= 0 && hi <= 0x7FFFFFFF &&
+                    zer_bit_index_valid(type_width(obj), (int)hi) == 0) {
                     checker_error(c, node->loc.line,
                         "bit index %lld out of range for %d-bit type '%s'",
                         (long long)hi, type_width(obj), type_name(obj));

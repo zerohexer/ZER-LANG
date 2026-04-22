@@ -34,9 +34,20 @@ int zer_divisor_proven_nonzero(int has_proof);
  * Callers: checker.c compound assignment narrowing check. */
 int zer_narrowing_valid(int src_width, int dst_width, int has_truncate);
 
-/* NOTE: zer_literal_fits (M08) deferred to Batch 1b — tlong VST proof
- * pattern needs different tactic than int-based predicates. Revisit
- * with split u32/i32/u64 design. Call site in is_literal_compatible
- * stays inline for now. */
+/* M08 — unsigned literal fit. Returns 1 iff lit <= max_val.
+ *
+ * Caller must first verify the literal value fits in uint32 range.
+ * For types with max > UINT32_MAX (U64, I64, USIZE on 64-bit target),
+ * no check is needed — any positive uint64 literal fits.
+ *
+ * Single-predicate design (tuint) instead of the originally-attempted
+ * tlong 3-arg form — see docs/proof-internals.md "tlong VST gotcha".
+ *
+ * Oracle: typing.v:650 literal_fits (M08). The lit < 2^width formulation
+ * specializes to lit <= (2^width - 1) = max_val. Caller computes max
+ * per type (U8=255, U16=65535, U32=0xFFFFFFFF, I8=127, I16=32767, I32=0x7FFFFFFF).
+ *
+ * Callers: checker.c is_literal_compatible at all value-flow sites. */
+int zer_literal_fits_u(unsigned int max_val, unsigned int lit);
 
 #endif

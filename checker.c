@@ -7,6 +7,7 @@
 #include "src/safety/optional_rules.h"     /* zer_type_permits_null, _is_nested_optional */
 #include "src/safety/atomic_rules.h"       /* zer_atomic_width_valid — VST-verified */
 #include "src/safety/isr_rules.h"          /* zer_alloc/spawn_allowed_in_* — Phase 2 */
+#include "src/safety/arith_rules.h"        /* zer_div_valid/narrowing_valid/literal_fits — M */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -357,7 +358,9 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     /* unwrap distinct for literal compatibility */
     Type *effective = type_unwrap_distinct(target);
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
-        /* range check: literal must fit in target type */
+        /* range check: literal must fit in target type.
+         * NOTE: zer_literal_fits (M08) deferred to Batch 1b — tlong VST
+         * proof needs split-predicate redesign. Inline check remains. */
         uint64_t val = expr->int_lit.value;
         switch (effective->kind) {
         case TYPE_U8:    return val <= 255;
@@ -2365,7 +2368,11 @@ static Type *check_expr(Checker *c, Node *node) {
                  * BUG-269: use eval_const_expr to catch expressions like (2-2) */
                 if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
                     int64_t div_val = eval_const_expr(node->binary.right);
-                    if (div_val == 0) {
+                    /* SAFETY: zer_div_valid in src/safety/arith_rules.c (M01).
+                     * Oracle: typing.v M01_const_div_by_zero_rejected. Convert
+                     * int64 to "is-zero flag" to preserve zeroness across cast. */
+                    int div_nz = (div_val == 0) ? 0 : 1;
+                    if (zer_div_valid(div_nz) == 0) {
                         checker_error(c, node->loc.line, "division by zero");
                     }
                     /* range propagation: mark proven if divisor is nonzero.
@@ -2404,8 +2411,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* Forced division guard: if divisor is ident, struct field, or
                      * function call and not proven nonzero → compile error.
-                     * Covers all cases: variables, struct fields, function returns. */
-                    if (div_val != 0 && !checker_is_proven(c, node)) {
+                     * Covers all cases: variables, struct fields, function returns.
+                     * SAFETY: zer_divisor_proven_nonzero in src/safety/arith_rules.c (M02) */
+                    int div_has_proof = checker_is_proven(c, node) ? 1 : 0;
+                    if (div_val != 0 && zer_divisor_proven_nonzero(div_has_proof) == 0) {
                         if (node->binary.right->kind == NODE_IDENT ||
                             node->binary.right->kind == NODE_FIELD) {
                             ExprKey dname = build_expr_key_a(c, node->binary.right);
@@ -3612,12 +3621,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         (int)divisor->ident.name_len, divisor->ident.name);
                 }
             }
-            /* reject narrowing: value wider than target (unless value is a literal) */
+            /* reject narrowing: value wider than target (unless value is a literal)
+             * SAFETY: zer_narrowing_valid in src/safety/arith_rules.c (M07) */
             if (type_is_numeric(target) && type_is_numeric(value) &&
                 !is_literal_compatible(node->assign.value, target)) {
                 int tw = type_width(target);
                 int vw = type_width(value);
-                if (tw > 0 && vw > 0 && vw > tw) {
+                /* compound assignment has no @truncate wrapping, so has_truncate=0 */
+                if (tw > 0 && vw > 0 && zer_narrowing_valid(vw, tw, 0) == 0) {
                     checker_error(c, node->loc.line,
                         "compound assignment would narrow '%s' (%d-bit) into '%s' (%d-bit) — use @truncate",
                         type_name(value), vw, type_name(target), tw);

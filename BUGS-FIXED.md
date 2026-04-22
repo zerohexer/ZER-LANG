@@ -5,6 +5,106 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-22 (Phase 1 Batch 1) — M section arithmetic predicates
+
+### Context
+
+Following 2026-04-21 Phase 1 completion (44 predicates) and Phase 2 Batch 1
+(ISR bans, 4 predicates, total 48), the 2026-04-22 session performed an
+exhaustive audit against typing.v and produced `docs/phase1_catalog.md`
+enumerating the definitive 85-predicate target (71 strict + 14 concurrency
+schematic). The catalog locks in the target numbers and per-predicate
+extraction templates.
+
+The user committed to the FULL 85 target (not stopping at 71). Rationale:
+all 14 concurrency predicates have REAL Coq theorems in typing.v; Phase 6
+`check-no-inline-safety` will require extraction anyway; Phase 7 upgrades
+the Coq spec only (C unchanged).
+
+### Batch 1 landed — M section arithmetic (3 predicates)
+
+New file: `src/safety/arith_rules.c` + `.h` with 3 extracted predicates:
+- `zer_div_valid(int divisor)` — M01, rejects compile-time div-by-zero
+- `zer_divisor_proven_nonzero(int has_proof)` — M02, VRP proof gate
+- `zer_narrowing_valid(int src_width, int dst_width, int has_truncate)` — M07
+
+All 3 VST-verified in `proofs/vst/verif_arith_rules.v` with zero admits.
+
+Call sites wired in `checker.c`:
+- `checker.c` NODE_BINARY SLASH/PERCENT → `zer_div_valid`
+- `checker.c` forced division guard → `zer_divisor_proven_nonzero`
+- `checker.c` compound assign narrow → `zer_narrowing_valid`
+
+Each with `/* SAFETY: zer_X in src/safety/arith_rules.c (MXX) */` comment.
+
+### Finding — tlong VST gotcha (M08 zer_literal_fits deferred)
+
+**Attempted:** extract `int zer_literal_fits(long long min, long long max,
+long long lit)` as the 4th M-section predicate — unified signed/unsigned
+literal range check.
+
+**VST failed:** the standard proof pattern
+
+```coq
+repeat forward_if;
+  forward;
+  unfold zer_literal_fits_coq;
+  repeat (destruct (Z_lt_dec _ _); try lia);
+  try entailer!.
+```
+
+did NOT close all goals. Error: `Attempt to save an incomplete proof`
+at `Qed`. Bullet-based variants (`{ ... }`) produced
+`This proof is focused, but cannot be unfocused this way`.
+
+**Root cause (hypothesis):** VST's `forward_if` on `tlong` (int64)
+comparisons produces goals with different structure than `tint` —
+the standard `destruct (Z_lt_dec _ _)` cascade doesn't align with
+the tlong subgoal form. Confirmed same cascade works on tint (M03
+narrowing_valid has 2 branches with tint args, passes trivially).
+
+**Applied workaround:** deferred M08 to Batch 1b. Removed the function
+body, header declaration, VST spec, VST proof. Reverted checker.c
+`is_literal_compatible` to keep inline check. Marked with NOTE
+comments in `.c`, `.h`, `.v`, and documented in `docs/phase1_catalog.md`.
+
+**Batch 1b plan (future):** split `zer_literal_fits` into width-specific
+predicates — `zer_literal_fits_u32(unsigned int max, unsigned int lit)`
++ `zer_literal_fits_i32(int min, int max, int lit)` + `zer_literal_fits_u64`.
+Each uses tuint/tint/tulong with proofs matching their VST pattern.
+Caller dispatches by type at the call site. Documented in
+`docs/proof-internals.md` "tlong VST gotcha" section.
+
+### Learnings captured in docs
+
+- `docs/phase1_catalog.md` — 972-line definitive catalog. Every Phase 1
+  predicate (extracted + to-extract + deferred + code-driven) enumerated
+  with typing.v line refs, theorem names, signatures, call sites, C
+  templates, VST spec patterns, oracle tiers, 4-model mapping,
+  dependency graph, test fixtures, cross-references.
+- `docs/proof-internals.md` — added "tlong forward_if goal structure"
+  section with 3 workarounds and error signature table.
+- `CLAUDE.md` — progress counter updated 48/85 → 51/85, Batch 1 noted.
+
+### State after Batch 1
+
+- **Phase 1: 51/85 (60%)** — 48 prior + 3 new (M01, M02, M07)
+- **VST files:** 18 (17 prior + verif_arith_rules.v)
+- **src/safety files:** 15 (14 prior + arith_rules.c)
+- **make check-vst:** PASS, zero admits
+- **make docker-check:** 414/415 — same pre-existing `A01_no_uaf` failure
+  from commits 388f034 (Phase 2 Batch 1) and 60b2d48. NOT a regression.
+
+### Next batches (from docs/phase1_catalog.md §8)
+
+- Batch 1b: M08 `zer_literal_fits` split into u32/i32/u64 (+1)
+- Batch 2: L extras — `slice_bounds_valid`, `bit_index_valid` (+2)
+- Batch 3: T + K extras (+3)
+- ... through Batch 11: C thread lifecycle (+6)
+- Target: 85 by end of Batch 11
+
+---
+
 ## Session 2026-04-21 (Level 3 extract-and-link) — first real compiler-code VST
 
 ### Context

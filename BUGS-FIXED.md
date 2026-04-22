@@ -210,6 +210,28 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Tenth + Eleventh batch — optional + move rules, oracle-driven (2026-04-22)
+
+**Optional rules (typing.v N oracle).** Extracted 2 predicates:
+- `zer_type_permits_null(type_kind)` — covers N01/N02/N03 (kind == OPTIONAL)
+- `zer_type_is_nested_optional(outer, inner)` — covers N05 (reject ??T)
+
+Wired checker.c TYNODE_OPTIONAL handler (the `?distinct(?T)` rejection
+at ~line 1208) to delegate via `zer_type_is_nested_optional`.
+
+**Move rules (λZER-move oracle).** Extracted 2 predicates:
+- `zer_type_kind_is_move_struct(kind, is_move_flag)` — STRUCT + flag set
+- `zer_move_should_track(direct, has_field)` — OR combiner
+
+Wired zercheck.c `is_move_struct_type` and `should_track_move` to
+delegate. Both preserve existing error messages and call graph.
+
+Both batches: straight oracle-driven extractions. No bugs found;
+behavior preserved; VST proofs each: 2 lemmas, zero admits.
+
+**Honest count after 11th batch: 37 Level-3-verified compiler functions.**
+Phase 1 progress: 37/44 = 84%.
+
 ### Ninth batch — MMIO rules, oracle-driven (2026-04-22)
 
 Third oracle-driven batch.

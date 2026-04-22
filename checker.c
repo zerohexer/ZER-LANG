@@ -6,6 +6,7 @@
 #include "src/safety/mmio_rules.h"         /* zer_mmio_* — VST-verified */
 #include "src/safety/optional_rules.h"     /* zer_type_permits_null, _is_nested_optional */
 #include "src/safety/atomic_rules.h"       /* zer_atomic_width_valid — VST-verified */
+#include "src/safety/isr_rules.h"          /* zer_alloc/spawn_allowed_in_* — Phase 2 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -772,9 +773,12 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
 /* ---- ISR ban helper ---- */
 
 /* Check if we're inside an interrupt handler and reject heap allocation.
- * Returns true if banned (error emitted). Centralizes the 4 ISR check sites. */
+ * Returns true if banned (error emitted). Centralizes the 4 ISR check sites.
+ * SAFETY: zer_alloc_allowed_in_isr in src/safety/isr_rules.c */
 static bool check_isr_ban(Checker *c, int line, const char *method) {
-    if (!c->in_interrupt) return false;
+    if (zer_alloc_allowed_in_isr(c->in_interrupt ? 1 : 0) != 0) {
+        return false;  /* allowed */
+    }
     checker_error(c, line,
         "%s not allowed in interrupt handler — "
         "malloc/calloc may deadlock. Use Pool(T, N) instead", method);

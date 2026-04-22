@@ -521,6 +521,87 @@ computed bool), keep the modulus inline in the caller. Example:
 in_range, aligned)` was verified instead, with the alignment-bool computed
 inline in checker.c using `(uint64_t)addr % (uint64_t)align`.
 
+### VST gotcha — tlong (int64) forward_if goal structure (Batch 1 finding, 2026-04-22)
+
+**Pattern that works for tint but FAILS for tlong:**
+
+```c
+/* tint version — proof passes with standard cascade */
+int zer_X(int a, int b, int c) {
+    if (a == 0) return 0;
+    if (b == 0) return 0;
+    return 1;
+}
+```
+
+```coq
+Proof.
+  start_function.
+  repeat forward_if;
+    forward;
+    unfold zer_X_coq;
+    repeat (destruct (Z.eq_dec _ _); try lia);
+    try entailer!.
+Qed.
+```
+
+**tlong version of the same cascade FAILS:**
+
+```c
+/* tlong version — "Attempt to save an incomplete proof" */
+int zer_Y(long long a, long long b, long long c) {
+    if (a < b) return 0;
+    if (a > c) return 0;
+    return 1;
+}
+```
+
+Standard pattern with `destruct (Z_lt_dec _ _)` does NOT close all goals.
+Bullet/brace variants (`{ ... }`) produce `This proof is focused, but
+cannot be unfocused this way`.
+
+**Root cause (hypothesis):** VST's `forward_if` on Int64 comparisons
+produces goals with different structure than Int32 — likely due to
+`Int64.lt` / `Int64.ltu` resolution vs `Int.eq_dec` / `Int.lt` used
+in tint. The `repeat destruct` tactics don't align with the tlong
+goal form.
+
+**Workarounds (in order of preference):**
+
+1. **Split into width-specific predicates** (preferred). Instead of
+   one `int zer_literal_fits(long long min, long long max, long long lit)`,
+   use `int zer_literal_fits_u32(unsigned int max, unsigned int lit)` +
+   `int zer_literal_fits_i32(int min, int max, int lit)` +
+   `int zer_literal_fits_u64(unsigned long long max, unsigned long long lit)`.
+   Each uses tint/tuint/tulong with proofs matching their VST pattern.
+   Caller dispatches by type at the call site.
+
+2. **Extract via combination pattern** (same as MMIO modulus workaround).
+   Caller precomputes `int is_in_range = (lit >= min && lit <= max) ? 1 : 0;`
+   and passes the bool to `int zer_range_check(int is_in_range)`. Trivial
+   VST proof; range arithmetic stays inline in checker.c.
+
+3. **Defer the predicate** to a follow-up batch. Mark with clear NOTE
+   in the header file; leave inline check in checker.c. Document in
+   `docs/phase1_catalog.md` as "deferred — needs split redesign."
+
+**Applied (Batch 1, M08):** Option 3 (deferred). `zer_literal_fits`
+was originally designed with `long long` args covering all ZER literal
+widths uniformly. VST failed. Inline check kept in `is_literal_compatible`
+(checker.c). Batch 1b will apply Option 1 (split into u32/i32/u64).
+
+**Error signatures:**
+
+| Error | Interpretation |
+|---|---|
+| `Attempt to save an incomplete proof` at `Qed` | `repeat forward_if; ... entailer!` pattern produced goals that the destruct cascade didn't close. tlong's `forward_if` likely has subgoals requiring `Int64.signed_repr` rewriting before `entailer!`. |
+| `This proof is focused, but cannot be unfocused this way` | Using `{ ... }` brackets to focus sub-goals, but the inner block closed the wrong goal count. Happens when you assume 2 sub-goals but VST produced 1 (for a return statement) or 3 (for nested control flow). |
+
+**Do NOT:**
+- Use `tlong` in extraction signatures unless there's no alternative.
+- Mix `Vint` and `Vlong` params in one predicate (the range constraints become tangled).
+- Assume `repeat forward_if; ...; destruct (Z_lt_dec _ _)` works for 64-bit the same as 32-bit. It doesn't.
+
 ### Phase 1 extraction recipe (end-to-end)
 
 **Read this before extracting a new predicate.** Covers every step from identifying the target to commit.

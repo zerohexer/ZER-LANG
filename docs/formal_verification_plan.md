@@ -233,6 +233,52 @@ This limits the first wave to ~15-25 functions from zercheck.c + zercheck_ir.c. 
 
 **Architecture 1 decision (2026-04-21):** chosen over Architecture 2 (Coq rewrite + extract). Reasons: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for future migration of stable subsystems (probably year 2+).
 
+### Phase 1 target — rigorous count (2026-04-22)
+
+**Phase 1 target: 77 predicates (strong-oracle completion)**, rising to 88 after Phase 7 adds λZER-concurrency operational subset.
+
+Derived as follows:
+
+| Source | Count | Rationale |
+|---|---|---|
+| typing.v total bool predicates | 66 | Counted from `Definition X_valid : bool :=` patterns |
+| − List-iterating (defer to Phase 4) | 7 | `fields_unique`, `offset_field_exists`, `spawn_body_safe`, `deadlock_safe`, `shadow_check_valid`, `has_self_reference_by_value`, `enum_switch_exhaustive` — need separation logic |
+| = Phase 1 eligible from typing.v | **59** | Primitive-typed, oracle-backed |
+| + Operational-subset derived | ~29 | Phase 1 predicates not duplicating typing.v (handle_state flavors, type_kind categorization, derived coerce rules, λZER-escape/opaque/mmio/move specifics) |
+| **Phase 1 total members** | **~88** | **≈ 59 typing.v + 29 operational-derived** |
+| − Concurrency (C/D/E/F, schematic oracle only — strong backing needs Phase 7) | 11 | Extract after Phase 7 for solid guarantee, OR accept schematic backing now |
+| = Phase 1 strong-oracle target | **77** | **Hit this first; revisit concurrency with Phase 7** |
+
+**What "strong-oracle" vs "schematic-oracle" means:**
+- Strong: typing.v has `Theorem X_ok`, `Theorem X_rejected` with real proofs, OR an operational subset (λZER-*) has step rules proving the safety claim.
+- Schematic: typing.v has the predicate + theorem, but NO operational grounding. The claim "predicate matches reality" is weaker.
+- Concurrency (C/D/E/F) is schematic-only today. Phase 7 adds λZER-concurrency Iris subset → upgrades these to strong.
+
+### CI gates (Phases 1-6 combined)
+
+```
+On every PR:
+  make check                    — C unit tests
+  make check-proofs             — Coq/Iris: theory is internally consistent
+  make check-vst                — VST: C in src/safety/ matches theory
+  make check-safety-coverage    — every typing.v predicate has extraction
+  make check-no-inline-safety   — no new safety code without /* SAFETY: */ link
+  make check-api-bypass         — no direct mutation bypassing verified APIs
+  make check-admits             — zero admits across all proofs
+```
+
+**What each catches (the theory ↔ implementation gap):**
+
+| Gap | Detected by |
+|---|---|
+| C diverges from Coq spec (extracted code buggy) | `check-vst` |
+| Theory has predicate but no extraction | `check-safety-coverage` (Phase 6 enhancement) |
+| New safety check added inline in checker.c | `check-no-inline-safety` (Phase 6) |
+| Extracted predicate exists but checker bypasses it | `check-api-bypass` (Phase 6) |
+| Admit snuck into a proof | `check-admits` |
+
+Phase 6 discipline scripts are **REQUIRED** for the full theory↔implementation guarantee. Without them, gaps B and C (above) go undetected.
+
 ### Concrete 6-phase roadmap
 
 Each phase has a target, cost, and acceptance criterion. Stop at any phase and still ship real value.
@@ -244,9 +290,13 @@ Each phase has a target, cost, and acceptance criterion. Stop at any phase and s
 - VST pattern documented in `proof-internals.md` (subst gotcha, cascade pattern)
 - **Acceptance:** 1 real extraction (`zer_handle_state_is_invalid`) wired + verified
 
-**Phase 1 — Pure predicate extraction (~100 hrs, IN PROGRESS)**
+**Phase 1 — Pure predicate extraction (~150 hrs, IN PROGRESS)**
 
-Target: 40 predicates extracted + VST-verified. Each file in `src/safety/`, one VST proof file in `proofs/vst/verif_*.v`.
+Target: **77 predicates** extracted + VST-verified (all strong-oracle typing.v + operational-subset derived). After Phase 7 upgrades concurrency, grows to 88.
+
+Each file in `src/safety/`, one VST proof file in `proofs/vst/verif_*.v`.
+
+**Current: 48/77 = 62% (missing 29 non-concurrency extractions).**
 
 | Predicate batch | Location | Status |
 |---|---|---|
@@ -261,9 +311,41 @@ Target: 40 predicates extracted + VST-verified. Each file in `src/safety/`, one 
 | Move struct rules (2 fns) | `src/safety/move_rules.c` | **DONE** (`zer_type_kind_is_move_struct`, `_should_track`; oracle-driven from λZER-move) |
 | Escape rules (3 fns) | `src/safety/escape_rules.c` | **DONE** (`zer_region_can_escape`, `_is_local`, `_is_arena`; oracle-driven from λZER-escape) |
 
-**Total Phase 1:** ~44 predicates. Current: 7/44 (16%).
+**Additional batches completed after the initial plan:**
 
-**Acceptance:** 40+ predicates verified, each called from at least one site in `checker.c`, `zercheck.c`, or `zercheck_ir.c`.
+| Predicate batch | Location | Status |
+|---|---|---|
+| Atomic rules (2 fns) | `src/safety/atomic_rules.c` | **DONE** (oracle: typing.v Section E) |
+| Container rules (3 fns) | `src/safety/container_rules.c` | **DONE** (oracle: typing.v Section T + K) |
+| Misc rules (2 fns) | `src/safety/misc_rules.c` | **DONE** (oracle: typing.v Section Q) |
+| ISR rules (4 fns) | `src/safety/isr_rules.c` | **DONE** (oracle: CLAUDE.md Ban Framework + typing.v S/C) |
+
+**Remaining to reach 77 (29 predicates in 7-9 batches):**
+
+| Predicate batch | Oracle section | Predicates | Target file |
+|---|---|---|---|
+| Comptime rules | typing.v R | `comptime_arg_valid`, `static_assert_holds`, `comptime_ops_valid`, `expr_nesting_valid` (4) | `src/safety/comptime_rules.c` |
+| Stack rules | typing.v S | `stack_frame_valid` (1) | `src/safety/stack_rules.c` |
+| Arith rules | typing.v M | `div_valid`, `divisor_proven_nonzero`, `narrowing_valid`, `literal_fits`, `saturate_operand_valid`, `conversion_safe` (6) | `src/safety/arith_rules.c` |
+| Cast rules (extra) | typing.v I | `bitcast_valid`, `bitcast_operand_valid`, `cast_distinct_valid`, `cast_types_compatible` (4) | extend `coerce_rules.c` |
+| Bounds extras | typing.v L | `slice_bounds_valid`, `bit_index_valid` (2) | extend `range_checks.c` |
+| Variant safety | typing.v P | `read_mode_safe`, `arm_safe_op` (2) | `src/safety/variant_rules.c` |
+| Container extras | typing.v T | `handle_element_valid`, `container_source_valid`, `container_position_valid` (3) | extend `container_rules.c` |
+| Provenance extras | typing.v J | `ptrtoint_source_valid` (1) | extend `provenance_rules.c` |
+| Various structural | typing.v various | `shadow_check_valid` (would need list — defer), `volatile_compound_valid`, `atomic_on_packed_valid`, `sync_in_packed_valid` (3 + 1 deferred) | `src/safety/struct_rules.c` |
+
+**Concurrency block (11 predicates — waiting for Phase 7 operational backing):**
+
+| Predicate | Section | Status |
+|---|---|---|
+| `thread_op_valid`, `thread_cleanup_valid`, `spawn_context_valid`, `spawn_return_safe`, `spawn_arg_valid`, `spawn_arg_is_handle` (6) | typing.v C | schematic oracle only |
+| `address_of_shared_valid`, `isr_main_access_valid` (2) | typing.v D | schematic oracle only |
+| `condvar_arg_valid` (1) | typing.v E | schematic oracle only |
+| `shared_in_suspend_valid`, `yield_context_valid` (2) | typing.v F | schematic oracle only |
+
+These reach "strong oracle" after Phase 7 adds the λZER-concurrency operational subset. Extract now (schematic backing) or wait for Phase 7 (strong backing) — user choice.
+
+**Acceptance:** all 77 non-concurrency + operational-derived predicates verified. Each called from at least one site in `checker.c`, `zercheck.c`, `zercheck_ir.c`, or `types.c`. Makes check-safety-coverage confirm every typing.v non-concurrency predicate has a matching `src/safety/` extraction.
 
 **Phase 2 — Decision extraction (~150 hrs)**
 
@@ -327,19 +409,48 @@ CheckerPhase3 zer_check_bodies(CheckerPhase2 p);
 
 **Acceptance:** checker.c main dispatch enforces phase order at compile time. Attempting to call out-of-order = C type error.
 
-**Phase 6 — CI discipline (~30 hrs)**
+**Phase 6 — CI discipline (~30 hrs) — CRITICAL**
 
-Target: automated checks that enforce the verification discipline.
+This phase closes the theory↔implementation gap. Without Phase 6, new safety code can bypass the verification chain silently.
 
-- `make check-discipline`: grep-level audits
-  - Every safety function has `/* SAFETY: */` comment with proof link
-  - No direct `c->typemap[X] =`, `c->scopes[X]->...`, `pool->...` writes (bypassing API)
-  - No `Admitted.` or `admit.` anywhere in proofs
-  - Every safety_list.md row maps to at least one VST-verified predicate
-- Add `make check-discipline` to `check-all`
-- CI enforces: any PR that fails `check-all` is non-mergeable
+Target: automated checks that make the theory-implementation link MECHANICAL.
 
-**Acceptance:** `make check-all` runs all gates. Every mergeable PR = mechanically verified safety.
+**New Makefile targets:**
+
+| Target | What it catches | Script |
+|---|---|---|
+| `make check-theory-extracted` | Theory predicate in typing.v has no `src/safety/` extraction | `tools/check_theory_extraction_mapping.sh` |
+| `make check-no-inline-safety` | New `checker_error` call in `checker.c` / `zercheck*.c` without `/* SAFETY: */` link to extracted predicate | `tools/check_no_inline_safety.sh` |
+| `make check-api-bypass` | Direct `c->typemap[X] =`, `pool->slots[i] =`, handle-state mutation bypassing verified APIs | `tools/check_api_bypass.sh` |
+| `make check-admits` | Any `Admitted.` / `admit.` in any `.v` file | Already simple grep |
+| `make check-safety-coverage` (enhanced) | Every safety_list.md row has a corresponding predicate OR is correctly tagged as `—` (not-safety-semantic) | Extend existing script |
+
+**Discipline invariants enforced:**
+
+1. **Theory → Implementation:** every typing.v `Definition X_valid : bool` must have a matching `src/safety/*.c` `int zer_X_valid(...)` extraction
+2. **Implementation → Verification:** every `src/safety/*.c` function must have a VST proof in `proofs/vst/verif_*.v` (already enforced by `check-vst`)
+3. **Call site → Extraction:** every safety check in `checker.c` / `zercheck*.c` must delegate to an extracted predicate (`/* SAFETY: zer_... */` comment)
+4. **No bypass:** no direct struct-field writes to verified state (typemap, scope, handle pool)
+5. **No admits:** zero admits across all Coq/Iris files
+
+**Bug scenarios Phase 6 catches (previously undetected):**
+
+```
+Scenario B: theory added, no implementation
+  Before Phase 6: CI silently passes. Compiler doesn't enforce the rule.
+  After Phase 6: check-theory-extracted fails. PR blocked.
+
+Scenario C: extracted predicate exists, but checker.c uses inline check
+  Before Phase 6: CI silently passes if extraction itself is correct.
+  After Phase 6: check-no-inline-safety or check-api-bypass fails.
+```
+
+**Acceptance:**
+- `make check-all` runs all 7 gates (check + check-proofs + check-vst + check-theory-extracted + check-no-inline-safety + check-api-bypass + check-admits)
+- Any PR that fails any gate = non-mergeable
+- **Mechanical guarantee:** theory + extraction + VST chain cannot be broken by human error in a commit
+
+This phase is the LOAD-BEARING ONE for the "guaranteed correctness" claim. Without it, correctness depends on human discipline; with it, correctness is machine-checked.
 
 **Phase 7 — Deepen schematic to operational (~425 hrs, commitment 2026-04-21)**
 

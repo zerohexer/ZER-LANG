@@ -8,6 +8,7 @@
 #include "src/safety/atomic_rules.h"       /* zer_atomic_width_valid — VST-verified */
 #include "src/safety/isr_rules.h"          /* zer_alloc/spawn_allowed_in_* — Phase 2 */
 #include "src/safety/arith_rules.h"        /* zer_div_valid/narrowing_valid/literal_fits — M */
+#include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -4803,9 +4804,13 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 break;
             }
-            checker_error(c, node->loc.line,
-                "Handle element type '%s' is not a struct — cannot auto-deref",
-                type_name(elem));
+            /* SAFETY: zer_handle_element_valid in src/safety/container_rules.c (T04) */
+            int he_kind = (elem->kind == TYPE_VOID) ? ZER_HE_VOID : ZER_HE_PRIM;
+            if (zer_handle_element_valid(he_kind) == 0) {
+                checker_error(c, node->loc.line,
+                    "Handle element type '%s' is not a struct — cannot auto-deref",
+                    type_name(elem));
+            }
             result = ty_void;
             break;
         }
@@ -5892,12 +5897,17 @@ static Type *check_expr(Checker *c, Node *node) {
             /* @container(*T, ptr, field) — reverse of &struct.field */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
-                /* BUG-375: first arg (ptr) must be a pointer */
+                /* BUG-375: first arg (ptr) must be a pointer.
+                 * SAFETY: zer_container_source_valid in src/safety/container_rules.c (K01) */
                 if (node->intrinsic.arg_count > 0) {
                     Type *ptr_type = typemap_get(c, node->intrinsic.args[0]);
                     if (ptr_type) {
                         Type *ptr_eff = type_unwrap_distinct(ptr_type);
-                        if (ptr_eff->kind != TYPE_POINTER) {
+                        int tcat = ZER_TCAT_PRIM;
+                        if (ptr_eff->kind == TYPE_POINTER) tcat = ZER_TCAT_PTR;
+                        else if (ptr_eff->kind == TYPE_SLICE) tcat = ZER_TCAT_SLICE;
+                        else if (ptr_eff->kind == TYPE_STRUCT) tcat = ZER_TCAT_STRUCT;
+                        if (zer_container_source_valid(tcat) == 0) {
                             checker_error(c, node->loc.line,
                                 "@container source must be a pointer, got '%s'",
                                 type_name(ptr_type));
@@ -8835,7 +8845,9 @@ static void register_decl(Checker *c, Node *node) {
                         (int)fd->name_len, fd->name);
                 }
                 /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
-                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB)) {
+                /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T02) */
+                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB) &&
+                    zer_container_position_valid(ZER_DP_FIELD) == 0) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
                 }
@@ -8978,7 +8990,9 @@ static void register_decl(Checker *c, Node *node) {
                         (int)uv->name_len, uv->name);
                 }
                 /* BUG-386: Pool/Ring/Slab in union not supported (same as BUG-287 for structs) */
-                if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB)) {
+                /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T03) */
+                if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB) &&
+                    zer_container_position_valid(ZER_DP_VARIANT) == 0) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be union variants — must be global or static variables");
                 }

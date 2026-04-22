@@ -541,11 +541,11 @@ Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_ty
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 85 pure predicates (~180 hrs) — **🔄 54/85 (64%) — FULL TARGET** (see docs/phase1_catalog.md for definitive enumeration)
+2. Phase 1 — 85 pure predicates (~180 hrs) — **🔄 57/85 (67%) — FULL TARGET** (see docs/phase1_catalog.md for definitive enumeration)
    - 71 = strict milestone (operational + typing.v real theorems, excluding concurrency schematic)
    - 85 = full target (includes 14 concurrency schematic — real theorems, weaker oracle until Phase 7 upgrades)
    - Decision 2026-04-22: extract full 85. Phase 6 `check-no-inline-safety` requires it; Phase 7 upgrades Coq spec only (C unchanged, ~20 min per predicate).
-   - Batches landed 2026-04-22: B1 M-section (M01/M02/M07), B2 L-extras (L02/L03/L06), B1b M08 redone (tuint single-predicate). Next: Batch 3 (T+K extras).
+   - Batches landed 2026-04-22: B1 M-section, B2 L-extras, B1b M08 redone, BUG-603 void-main fix (415/415), B3 T+K container extras. Next: Batch 4 (P variant).
 3. Phase 2 — 60 decision extractions (~150 hrs) — **🔄 4/60 (7%)** — ISR/@critical bans batch 1 (counts toward Phase 1 pure predicates too)
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)

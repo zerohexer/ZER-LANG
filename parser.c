@@ -1717,15 +1717,20 @@ static Node *parse_statement(Parser *p) {
         p->previous = saved_p2;
     }
 
-    /* `unsafe asm` — preferred form (Rust-style explicit escape hatch marker).
-     * Bare `asm` — accepted for backward compatibility (pre-2026-04-23 design).
-     * Both forms: simple `asm("nop");` or extended `asm("..." : "=r"(out) : "r"(in) : "memory");`
+    /* `unsafe asm` — the only accepted form for inline assembly (2026-04-23).
+     * Explicit `unsafe` marker makes escape hatch intent clear at call site (Rust-style).
+     * Bare `asm(...)` is REJECTED with a helpful error — use `unsafe asm(...)`.
+     * Syntax: simple `unsafe asm("nop");` or extended `unsafe asm("..." : "=r"(out) : "r"(in) : "memory");`
      * Bypass lexer — scan raw source for matching ) because ':' is not a ZER token. */
     bool is_asm_stmt = false;
     if (match(p, TOK_UNSAFE)) {
-        consume(p, TOK_ASM, "expected 'asm' after 'unsafe' (unsafe is only used as `unsafe asm(...)`)");
+        consume(p, TOK_ASM, "expected 'asm' after 'unsafe' (unsafe is only valid as `unsafe asm(...)`)");
         is_asm_stmt = true;
-    } else if (match(p, TOK_ASM)) {
+    } else if (check(p, TOK_ASM)) {
+        /* Bare `asm` rejected. Still parse the block for error recovery. */
+        error_at(p, &p->current,
+            "bare 'asm' is not allowed — use 'unsafe asm(...)' as explicit escape hatch marker");
+        advance(p);  /* consume the bad asm token */
         is_asm_stmt = true;
     }
     if (is_asm_stmt) {

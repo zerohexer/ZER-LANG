@@ -556,12 +556,19 @@ static void test_full_programs(void) {
         "}\n",
         "intrinsics");
 
-    /* Asm */
+    /* Asm — requires `unsafe` keyword (2026-04-23) */
     expect_ok(
-        "void disable_irq() {\n"
+        "naked void disable_irq() {\n"
+        "    unsafe asm(\"cpsid i\");\n"
+        "}\n",
+        "unsafe asm");
+
+    /* Bare `asm` must parse-fail */
+    expect_fail(
+        "naked void disable_irq() {\n"
         "    asm(\"cpsid i\");\n"
         "}\n",
-        "asm");
+        "bare asm rejected");
 
     /* Static function */
     expect_ok(

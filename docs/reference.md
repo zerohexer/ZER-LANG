@@ -1768,20 +1768,22 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
 
 **DESCRIPTION**
 Inline assembly. Escape hatch for operations not covered by verified intrinsics.
-Preferred form is `unsafe asm(...)` (Rust-style explicit marker, 2026-04-23).
-Bare `asm(...)` still works for backward compatibility.
+The `unsafe` keyword is **required** (Rust-style explicit marker, 2026-04-23).
+Bare `asm(...)` is rejected with a helpful compile error.
 Only allowed inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context`).
 
 **SYNTAX**
 ```zer
-unsafe asm("cpsid i");       // disable interrupts (preferred)
+unsafe asm("cpsid i");       // disable interrupts
 unsafe asm("wfi");            // wait for interrupt
 
 // With operands (GCC extended syntax):
 unsafe asm("mov %0, %1" : "=r"(out) : "r"(in));
+```
 
-// Bare `asm` still works (backward compatible):
-asm("nop");
+**REJECTED**
+```zer
+asm("nop");     // COMPILE ERROR: bare 'asm' is not allowed — use 'unsafe asm(...)'
 ```
 
 **WHEN TO USE**
@@ -1789,13 +1791,19 @@ asm("nop");
 - Use `unsafe asm` only for operations not yet covered by intrinsics (new vendor extensions, experimental hardware, niche use cases).
 - For external asm code, use `cinclude "foo.S"` instead (explicit `UNSAFE-EXTERN` warning).
 
+**AUDIT**
+Users can grep for all escape hatches in a codebase:
+```bash
+grep -rn "unsafe asm" src/
+```
+
 ---
 
 ### naked functions
 
 **DESCRIPTION**
 Function with no compiler-generated prologue/epilogue.
-Body must be pure assembly (`unsafe asm` or bare `asm`) plus `return`.
+Body must be pure `unsafe asm(...)` statements plus `return`.
 
 **SYNTAX**
 ```zer

@@ -1,5 +1,6 @@
-// asm outside naked function must be rejected (MISRA Dir 4.3)
+// unsafe asm outside naked function must be rejected (MISRA Dir 4.3)
+// Phase 1 verified: zer_asm_allowed_in_context(in_naked) = 0 → reject
 u32 main() {
-    asm("nop");
+    unsafe asm("nop");
     return 0;
 }

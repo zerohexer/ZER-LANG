@@ -1,20 +1,23 @@
 (* ================================================================
-   Level-3 Phase 1 Batch 1 — verif_arith_rules.v
+   Level-3 Phase 1 Batch 1 + 1b — verif_arith_rules.v
 
    Arithmetic safety predicates verified against typing.v Section M.
 
    Functions verified:
-     zer_div_valid(divisor)
+     zer_div_valid(divisor)                          — M01
        → 1 iff divisor != 0
-     zer_divisor_proven_nonzero(has_proof)
+     zer_divisor_proven_nonzero(has_proof)           — M02
        → 1 iff has_proof != 0
-     zer_narrowing_valid(src_width, dst_width, has_truncate)
+     zer_narrowing_valid(src_width, dst_width, trunc) — M07
        → 1 iff src_width <= dst_width OR has_truncate != 0
+     zer_literal_fits_u(max_val, lit)                 — M08
+       → 1 iff lit <= max_val (tuint args)
 
-   NOTE: zer_literal_fits (M08) deferred to Batch 1b due to tlong
-   forward_if goal structure differences — needs split predicate design.
+   Note on M08: original 3-arg tlong design failed VST; redesigned as
+   single-arg tuint predicate. Caller pre-filters to uint32 range.
 
-   Callers: checker.c NODE_BINARY SLASH/PERCENT, compound assign.
+   Callers: checker.c NODE_BINARY SLASH/PERCENT, compound assign,
+   is_literal_compatible.
    ================================================================ *)
 
 Require Import VST.floyd.proofauto.
@@ -36,6 +39,9 @@ Definition zer_narrowing_valid_coq (src_width dst_width has_truncate : Z) : Z :=
   if Z_le_dec src_width dst_width then 1
   else if Z.eq_dec has_truncate 0 then 0
   else 1.
+
+Definition zer_literal_fits_u_coq (max_val lit : Z) : Z :=
+  if Z_lt_dec max_val lit then 0 else 1.
 
 (* ---- VST funspecs ---- *)
 
@@ -80,10 +86,24 @@ Definition zer_narrowing_valid_spec : ident * funspec :=
               (zer_narrowing_valid_coq src_width dst_width has_truncate)))
     SEP ().
 
+Definition zer_literal_fits_u_spec : ident * funspec :=
+ DECLARE _zer_literal_fits_u
+  WITH max_val : Z, lit : Z
+  PRE [ tuint, tuint ]
+    PROP (0 <= max_val <= Int.max_unsigned;
+          0 <= lit <= Int.max_unsigned)
+    PARAMS (Vint (Int.repr max_val); Vint (Int.repr lit))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_literal_fits_u_coq max_val lit)))
+    SEP ().
+
 Definition Gprog : funspecs :=
   [ zer_div_valid_spec;
     zer_divisor_proven_nonzero_spec;
-    zer_narrowing_valid_spec ].
+    zer_narrowing_valid_spec;
+    zer_literal_fits_u_spec ].
 
 (* ---- Proofs ---- *)
 
@@ -122,10 +142,19 @@ Proof.
     try entailer!.
 Qed.
 
-(* ================================================================
-   3 arithmetic predicates VST-verified. Phase 1 Batch 1.
-   Total Level-3 verified compiler functions: 51
-   (Phase 1: 48 + Batch 1: 3).
+Lemma body_zer_literal_fits_u:
+  semax_body Vprog Gprog f_zer_literal_fits_u zer_literal_fits_u_spec.
+Proof.
+  start_function.
+  forward_if;
+    forward;
+    unfold zer_literal_fits_u_coq;
+    destruct (Z_lt_dec max_val lit); try lia;
+    try entailer!.
+Qed.
 
-   M08 zer_literal_fits deferred to Batch 1b.
+(* ================================================================
+   4 arithmetic predicates VST-verified (Batch 1 + 1b).
+   Total Level-3 verified compiler functions: 54
+   (Phase 1: 48 + Batch 1: 3 + Batch 2 range: 2 + Batch 1b M08: 1).
    ================================================================ *)

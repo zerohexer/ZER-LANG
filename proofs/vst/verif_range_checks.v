@@ -40,6 +40,12 @@ Definition zer_index_in_bounds_coq (size idx : Z) : Z :=
 Definition zer_variant_in_range_coq (n idx : Z) : Z :=
   if andb (Z_ge_dec idx 0) (Z_lt_dec idx n) then 1 else 0.
 
+Definition zer_slice_bounds_valid_coq (size s e : Z) : Z :=
+  if andb (Z_le_dec s e) (Z_le_dec e size) then 1 else 0.
+
+Definition zer_bit_index_valid_coq (width idx : Z) : Z :=
+  if andb (Z_ge_dec idx 0) (Z_lt_dec idx width) then 1 else 0.
+
 (* ---- VST funspecs ---- *)
 
 Definition zer_count_is_positive_spec : ident * funspec :=
@@ -80,10 +86,39 @@ Definition zer_variant_in_range_spec : ident * funspec :=
     RETURN (Vint (Int.repr (zer_variant_in_range_coq n idx)))
     SEP ().
 
+Definition zer_slice_bounds_valid_spec : ident * funspec :=
+ DECLARE _zer_slice_bounds_valid
+  WITH size : Z, s : Z, e : Z
+  PRE [ tint, tint, tint ]
+    PROP (Int.min_signed <= size <= Int.max_signed;
+          Int.min_signed <= s <= Int.max_signed;
+          Int.min_signed <= e <= Int.max_signed)
+    PARAMS (Vint (Int.repr size); Vint (Int.repr s); Vint (Int.repr e))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_slice_bounds_valid_coq size s e)))
+    SEP ().
+
+Definition zer_bit_index_valid_spec : ident * funspec :=
+ DECLARE _zer_bit_index_valid
+  WITH width : Z, idx : Z
+  PRE [ tint, tint ]
+    PROP (Int.min_signed <= width <= Int.max_signed;
+          Int.min_signed <= idx <= Int.max_signed)
+    PARAMS (Vint (Int.repr width); Vint (Int.repr idx))
+    SEP ()
+  POST [ tint ]
+    PROP ()
+    RETURN (Vint (Int.repr (zer_bit_index_valid_coq width idx)))
+    SEP ().
+
 Definition Gprog : funspecs :=
   [ zer_count_is_positive_spec;
     zer_index_in_bounds_spec;
-    zer_variant_in_range_spec ].
+    zer_variant_in_range_spec;
+    zer_slice_bounds_valid_spec;
+    zer_bit_index_valid_spec ].
 
 (* ---- Proofs ---- *)
 
@@ -136,8 +171,46 @@ Proof.
   simpl. destruct (Z_lt_dec idx n); try lia. entailer!.
 Qed.
 
+Lemma body_zer_slice_bounds_valid:
+  semax_body Vprog Gprog f_zer_slice_bounds_valid
+             zer_slice_bounds_valid_spec.
+Proof.
+  start_function.
+  forward_if.
+  { (* s > e — return 0 *)
+    forward. unfold zer_slice_bounds_valid_coq.
+    destruct (Z_le_dec s e); try lia. simpl. entailer!. }
+  forward_if.
+  { (* e > size — return 0 *)
+    forward. unfold zer_slice_bounds_valid_coq.
+    destruct (Z_le_dec s e); try lia.
+    simpl. destruct (Z_le_dec e size); try lia. entailer!. }
+  (* in range — return 1 *)
+  forward. unfold zer_slice_bounds_valid_coq.
+  destruct (Z_le_dec s e); try lia.
+  simpl. destruct (Z_le_dec e size); try lia. entailer!.
+Qed.
+
+Lemma body_zer_bit_index_valid:
+  semax_body Vprog Gprog f_zer_bit_index_valid
+             zer_bit_index_valid_spec.
+Proof.
+  start_function.
+  forward_if.
+  { forward. unfold zer_bit_index_valid_coq.
+    destruct (Z_ge_dec idx 0); try lia. simpl. entailer!. }
+  forward_if.
+  { forward. unfold zer_bit_index_valid_coq.
+    destruct (Z_ge_dec idx 0); try lia.
+    simpl. destruct (Z_lt_dec idx width); try lia. entailer!. }
+  forward. unfold zer_bit_index_valid_coq.
+  destruct (Z_ge_dec idx 0); try lia.
+  simpl. destruct (Z_lt_dec idx width); try lia. entailer!.
+Qed.
+
 (* ================================================================
-   QED — 3 range predicates mechanically verified against src/safety/
+   QED — 5 range predicates mechanically verified against src/safety/
    range_checks.c. Same .c file linked into zerc via Makefile CORE_SRCS.
-   Total Level-3 verified compiler functions: 7 (4 handle state + 3 range).
+   Total Level-3 verified compiler functions: 53
+   (Phase 1: 51 + Batch 2: 2 new slice/bit range predicates).
    ================================================================ *)

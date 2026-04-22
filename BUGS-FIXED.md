@@ -103,6 +103,63 @@ Caller dispatches by type at the call site. Documented in
 - ... through Batch 11: C thread lifecycle (+6)
 - Target: 85 by end of Batch 11
 
+### Batches 2 + 1b landed (same 2026-04-22 session, after Batch 1 commit 66f6253)
+
+**Batch 2 — L section extras (2 predicates):**
+
+Extended `src/safety/range_checks.c` + `.h` + `proofs/vst/verif_range_checks.v`:
+- `zer_slice_bounds_valid(int size, int start, int end_)` — L02/L03
+  Returns 1 iff `start <= end_ && end_ <= size`. Uses `end_` (trailing
+  underscore) because `end` is a Coq vernacular keyword.
+- `zer_bit_index_valid(int width, int idx)` — L06
+  Returns 1 iff `0 <= idx < width`. Same shape as `zer_index_in_bounds`
+  but separate predicate for distinct typing.v L06 mapping.
+
+Call sites wired in checker.c:
+- Slice `start > end` check — delegates to `zer_slice_bounds_valid` with
+  size=end_val trick (makes end<=size trivially true, predicate returns
+  0 iff start>end). int32 range guards added for safe cast.
+- Bit-extract `hi >= width` check — delegates to `zer_bit_index_valid`.
+
+Both use standard VST cascade pattern (tint args, not tlong) — proofs
+pass with `forward_if; forward; unfold; destruct; entailer!` cascade.
+
+**Batch 1b — M08 redone as single tuint predicate:**
+
+Original 3-arg tlong design (deferred in Batch 1) replaced with
+single-arg tuint design:
+- `zer_literal_fits_u(unsigned int max_val, unsigned int lit)` — M08
+  Returns 1 iff `lit <= max_val`. Uses tuint — VST handles Int
+  (32-bit) comparisons cleanly, unlike Int64.
+
+Caller at `is_literal_compatible` in checker.c pre-filters uint64 `val`
+to fit in uint32 range, then calls predicate with per-type max:
+- U8: max=255, U16: max=65535, U32: max=0xFFFFFFFF
+- I8: max=127, I16: max=32767, I32: max=0x7FFFFFFF
+- USIZE (32-bit target): max=0xFFFFFFFF
+- U64 / I64 / USIZE(64-bit): no predicate call needed — any positive
+  uint64 literal fits trivially.
+
+VST proof matches the standard 1-branch cascade pattern — passes cleanly.
+
+**Lesson documented in docs/proof-internals.md "tlong VST gotcha":**
+prefer tuint/tint (32-bit) predicates. If caller has 64-bit value, do
+a range pre-check in the caller, then narrow to 32-bit for the predicate.
+Never use tlong in extracted predicates unless absolutely unavoidable.
+
+**State after Batches 1 + 2 + 1b:**
+- Phase 1: **54/85 (64%)** — 48 prior + 6 new (M01, M02, M07, L02/L03, L06, M08)
+- VST files: 18 (no new files — extended existing)
+- src/safety files: 15
+- make check-vst: PASS, zero admits
+- make docker-check: 414/415 (same pre-existing A01_no_uaf baseline)
+
+**Next: Batch 3 — T + K extras (3 predicates):**
+- `zer_container_position_valid` (T02/T03) — extend container_rules.c
+- `zer_handle_element_valid` (T04) — extend container_rules.c
+- `zer_container_source_valid` (K01) — extend container_rules.c
+- Target after Batch 3: 57/85
+
 ---
 
 ## Session 2026-04-21 (Level 3 extract-and-link) — first real compiler-code VST

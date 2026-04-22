@@ -32,3 +32,23 @@ int zer_variant_in_range(int n_variants, int variant_idx) {
     }
     return 1;
 }
+
+int zer_slice_bounds_valid(int size, int start, int end_) {
+    if (start > end_) {
+        return 0;
+    }
+    if (end_ > size) {
+        return 0;
+    }
+    return 1;
+}
+
+int zer_bit_index_valid(int width, int idx) {
+    if (idx < 0) {
+        return 0;
+    }
+    if (idx >= width) {
+        return 0;
+    }
+    return 1;
+}

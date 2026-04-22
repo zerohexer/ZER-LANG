@@ -30,8 +30,19 @@ int zer_narrowing_valid(int src_width, int dst_width, int has_truncate) {
     return 0;
 }
 
-/* NOTE: zer_literal_fits (M08) deferred to Batch 1b.
- * VST proof for tlong (int64) compare goals requires different tactic
- * than the int-based predicates above. Revisit with a split design
- * (separate u32 / i32 / u64 predicates using tuint/tint/tulong) to
- * avoid the tlong forward_if complexity. */
+/* M08 — integer literal fits in target type.
+ * Single-predicate design using tuint (unsigned int) args — avoids the
+ * tlong forward_if goal structure issue observed in Batch 1 initial
+ * attempt (see docs/proof-internals.md "tlong VST gotcha").
+ *
+ * Caller range-checks that the 64-bit literal value fits in uint32
+ * FIRST, then calls this predicate with the per-type max. Works for
+ * U8/U16/U32/USIZE(32-bit)/I8/I16/I32 — since ZER positive literals
+ * are passed as uint64, and all these type maxes fit in uint32.
+ *
+ * U64 / I64 / USIZE(64-bit) skip this check (positive literal always
+ * fits). Signed negative literals are handled separately via NODE_UNARY. */
+int zer_literal_fits_u(unsigned int max_val, unsigned int lit) {
+    if (lit > max_val) return 0;
+    return 1;
+}

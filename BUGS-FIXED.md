@@ -210,6 +210,33 @@ Documented in proof-internals.md under "Common VST errors".
 **Honest count after 5th batch: 19 Level-3-verified compiler functions.**
 Phase 1 progress: 19/44 = 43%.
 
+### Sixth batch — context ban rules (2026-04-22)
+
+Extracted 6 context-ban predicates to `src/safety/context_bans.c`:
+- `zer_return_allowed_in_context(dd, cd)` — return banned in defer/@critical
+- `zer_break_allowed_in_context(dd, cd, il)` — break needs loop + not in defer/@critical
+- `zer_continue_allowed_in_context(dd, cd, il)` — continue same as break
+- `zer_goto_allowed_in_context(dd, cd)` — goto banned in defer/@critical
+- `zer_defer_allowed_in_context(dd)` — nested defer banned
+- `zer_asm_allowed_in_context(in_naked)` — asm only in naked functions
+
+Wired checker.c NODE_RETURN / NODE_BREAK / NODE_CONTINUE / NODE_GOTO /
+NODE_DEFER / NODE_ASM handlers to delegate to the VST-verified predicates.
+Error messages unchanged; predicate returns 0/1, checker decides which
+specific message.
+
+VST proof (verif_context_bans.v): 6 lemmas, zero admits. Uses same
+cascade pattern + `repeat (first [destruct Z_gt_dec | destruct Z.eq_dec]; try lia)`
+for mixed comparison types.
+
+**Audit-before-extraction discipline applied:** no red-team bugs found
+in the control-flow ban subsystem before extraction. Existing tests in
+tests/zer_fail/ cover the ban patterns (return_in_defer, break_outside_loop,
+etc.) with 0 regressions.
+
+**Honest count after 6th batch: 25 Level-3-verified compiler functions.**
+Phase 1 progress: 25/44 = 57%.
+
 ### Gemini red-team audit — 4 real bugs fixed (2026-04-21)
 
 User ran a pre-Level-3-continuation Gemini audit. 7 findings; 4 were real

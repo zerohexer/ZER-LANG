@@ -4,6 +4,7 @@ handle_state.v
 range_checks.v
 type_kind.v
 coerce_rules.v
+context_bans.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

@@ -515,13 +515,14 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 **Level 3 — Architecture 1 extract-and-link VST (2026-04-21, 7 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c/checker.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR.
 
-Extracted so far (19 total):
+Extracted so far (25 total):
 - `src/safety/handle_state.c` — 4 predicates: `zer_handle_state_is_invalid/alive/freed/transferred`
 - `src/safety/range_checks.c` — 3 predicates: `zer_count_is_positive`, `zer_index_in_bounds`, `zer_variant_in_range`
 - `src/safety/type_kind.c` — 7 predicates: `zer_type_kind_is_integer/signed/unsigned/float/numeric/pointer/has_fields`
 - `src/safety/coerce_rules.c` — 5 predicates: `zer_coerce_int_widening_allowed`, `_usize_same_width_allowed`, `_float_widening_allowed`, `_preserves_volatile`, `_preserves_const`
+- `src/safety/context_bans.c` — 6 predicates: `zer_return/break/continue/goto/defer/asm_allowed_in_context`
 
-Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`, checker.c Pool/Ring count validation, types.c `type_is_integer/signed/unsigned/float/numeric` + `can_implicit_coerce` (all delegate).
+Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c `ir_is_invalid`, checker.c Pool/Ring count validation + NODE_RETURN/BREAK/CONTINUE/GOTO/DEFER/ASM handlers, types.c `type_is_integer/signed/unsigned/float/numeric` + `can_implicit_coerce` (all delegate).
 
 **Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 8-phase roadmap.
 
@@ -529,7 +530,7 @@ Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c
 
 **The 8 phases:**
 1. Phase 0 — Infrastructure ✅ DONE
-2. Phase 1 — 40 pure predicates (~100 hrs) — **19/44 done (43%)**
+2. Phase 1 — 40 pure predicates (~100 hrs) — **25/44 done (57%)**
 3. Phase 2 — 60 decision extractions (~150 hrs)
 4. Phase 3 — Generic AST walker (~60 hrs)
 5. Phase 4 — Verified state APIs (~240 hrs)

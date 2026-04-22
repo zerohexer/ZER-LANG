@@ -572,6 +572,23 @@ Call sites: zercheck.c `is_handle_invalid` + `is_handle_consumed`, zercheck_ir.c
 - `Use [forward_if Post]` → C has nested ifs or `&&`/`||`. Flatten to single cascade.
 - `variable X not found` → VST auto-substed on `==`; use `destruct (Z.eq_dec _ _)` not by name.
 - `Attempt to save an incomplete proof` → proof closed fewer goals than C has. Add more destructs.
+
+**Audit-before-extraction discipline (MANDATORY before every batch):**
+
+Level 3 VST extraction LOCKS IN the C implementation's behavior as the Coq spec. If a bug exists when you extract, the bug gets frozen into the spec and CI will enforce the BUG as "correct" forever (until the spec is manually updated).
+
+**Rule:** run an adversarial audit (Gemini, manual red-team, or fuzz) BEFORE each Phase 1 extraction batch targeting a NEW subsystem. Fix the bugs found. Only THEN extract.
+
+**Why:** our Coq/Iris Level 1 proofs verify that the RULE is correct. They DO NOT verify that the compiler applies the rule everywhere. Level 3 extraction closes that gap — but only for the behavior it captures at extraction time. Buggy behavior at extraction time = buggy spec = buggy CI.
+
+**Examples of bugs the 2026-04-21 Gemini audit caught** (documented fully in `BUGS-FIXED.md` "Gemini red-team audit"):
+- Comptime shift evaluator used int64 width bound, not target type width — `1 << 40` for u32 emitted 2^40 instead of ZER's "shift >= width = 0" semantics
+- Escape analysis missed local-array → slice-field coercion in struct returns — dangling pointers
+- Zercheck_ir fixed-point iteration limit failed-open instead of fail-closed — silent UAF on complex programs
+
+All 4 real bugs would have been frozen into VST specs if extracted without fixing first. Regression tests added to `tests/zer/` and `tests/zer_fail/`.
+
+**Cadence:** do a red-team audit every ~50 extractions OR every ~500 lines of new delegation code OR when starting a new subsystem (e.g., before extracting escape rules, audit escape analysis).
 - `Cannot find physical path bound to ... zer_safety.<name>` → Makefile missing clightgen/coqc line for the new file.
 
 Contents of `docs/compiler-internals.md`:

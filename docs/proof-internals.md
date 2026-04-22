@@ -311,6 +311,41 @@ proofs/vst/
 
 Progress tracking: each verified real-code function counts once in `src/safety/*.c`. `make check-vst` should print the count.
 
+### Audit-before-extraction (spec-implementation gap)
+
+**THE dominant risk in Level 3 is freezing existing bugs into specs.**
+
+Level 3 extract-and-link VST pins the C behavior to the Coq spec. If the C has a bug at extraction time, the spec captures the bug. CI then enforces the bug as "correct." Future sessions may even write Coq proofs about code that mathematically describes wrong behavior.
+
+**The 2026-04-21 Gemini audit proved this risk concrete.** 4 real bugs in compiler source, present before audit:
+
+| Bug | Rule it violated | What Level 1 Coq proved |
+|---|---|---|
+| F5: `1 << 40` for u32 → 2^40 | "Shift by >= width = 0" | `typing.v` proves the rule (not its application) |
+| F3: struct field escape | "No local refs in returned struct fields" | `λZER-escape` operational proof covers returned pointers; schematic for struct-field case |
+| F7: iteration limit fails-open | Lattice converges → UAF detected | Coq induction proved convergence mathematically; C had arbitrary limit |
+| F1-2-4-6: NOT bugs | Design decisions | Already documented |
+
+**Pattern:** Level 1 proves "the rule is correct" in Coq. Level 3 proves "the C implementation applies the rule" via VST. The 4 bugs lived in the GAP between these layers — the rule was fine, the compiler's implementation of the rule was wrong.
+
+**Implication:** before extracting any predicate, the current C behavior must MATCH the intended spec. If not, either (a) fix the C first, or (b) write the spec to match the current (buggy) behavior and document it as intentional.
+
+**Audit cadence — required before each Phase 1 batch:**
+1. Identify the subsystem about to be extracted (e.g., "escape rules")
+2. Red-team the implementation: write adversarial programs that probe edge cases
+3. Fix bugs found, add regression tests to `tests/zer/` or `tests/zer_fail/`
+4. THEN extract — the spec now matches verified-correct behavior
+
+**Why this matters more than it seems:** without audits, you're doing "Level 3 VST" but accidentally encoding bugs as truth. The math is valid; the claim ("this compiler is correct") becomes false. A future audit finds the bug, now documented as a spec — you have to update spec, proof, implementation, AND tests. Much more expensive than auditing first.
+
+**Audit quick-reference ladder:**
+- Tier 1: run existing `make docker-check` (baseline)
+- Tier 2: write 5-10 adversarial `.zer` files probing the subsystem's claims
+- Tier 3: Gemini/Claude red-team audit with the subsystem's source as context
+- Tier 4: full fuzzer run on a known-small space
+
+Use Tier 2 minimum before every batch. Tier 3 every 2-3 batches. Tier 4 periodically.
+
 ### Phase 1 extraction recipe (end-to-end)
 
 **Read this before extracting a new predicate.** Covers every step from identifying the target to commit.

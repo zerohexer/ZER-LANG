@@ -36,6 +36,70 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 **Audit pattern:** `grep -rn "unsafe asm" src/` finds every inline-asm escape hatch in a codebase. No silent bare-asm sites possible.
 
+---
+
+## Session 2026-04-23 — Phase D-Alpha-1: 7 new atomic intrinsics (feature)
+
+**Change:** Extended atomic intrinsic surface from 8 to 15 intrinsics. Commit 2e152f3.
+
+**New intrinsics:**
+- `@atomic_xchg(*T, val) -> T` — swap, returns old (`__atomic_exchange_n`)
+- `@atomic_nand(*T, val) -> T` — fetch-nand (`__atomic_fetch_nand`)
+- `@atomic_{add,sub,or,and,xor}_fetch(*T, val) -> T` — 5 variants that return NEW value (after operation), unlike existing fetch-old versions
+
+**Rationale:** Complete atomic operation set for lock-free data structures. `*_fetch` variants cover pre-increment semantics (return new value) alongside existing post-increment (return old value). All use GCC `__atomic_*` builtins — auto-port to x86-64/ARM64/RISC-V without per-arch emitter work.
+
+**Implementation:**
+- `checker.c`: Extended `is_arith` in `@atomic_*` handler to recognize 7 new names. Same type validation as existing ops (shared pointer to integer, 1/2/4/8 byte width, not on packed struct — BUG-493 rule). Phase 1 predicate `zer_atomic_width_valid` still applies.
+- `emitter.c` (IR path only, line ~5898): Extended `gcc_op` string mapping to cover 7 new names → corresponding GCC builtin. AST path (line ~2706) is dead code since 2026-04-19 — NOT modified.
+- No parser changes — intrinsics use existing `@ident` dispatch.
+
+**Ordering:** All 15 atomics use `__ATOMIC_SEQ_CST`. Explicit Ordering enum (relaxed/acquire/release/acq_rel/seq_cst) deferred to later batch.
+
+**Tests added:**
+- `tests/zer/atomic_dalpha1.zer` — positive test exercising all 7 new intrinsics
+- `tests/zer_fail/atomic_dalpha1_wrong_type.zer` — pointer-to-struct rejected
+- `tests/zer_fail/atomic_xchg_arg_count.zer` — missing arg rejected
+- `tests/zer_fail/atomic_unknown_op.zer` — `@atomic_foo` rejected
+
+**Tests:** 422/422 (was 418, +4). check-vst: green, zero admits.
+
+---
+
+## Session 2026-04-23 — Phase D-Alpha-2: 10 barrier + bit query intrinsics (feature)
+
+**Change:** Added 10 new intrinsics covering barriers, control-flow hints, byte swap, and bit queries. Commit a14d3c0.
+
+**New intrinsics:**
+- `@barrier_acq_rel()` — acquire+release fence (`__atomic_thread_fence(__ATOMIC_ACQ_REL)`)
+- `@unreachable()` — GCC unreachable hint (`__builtin_unreachable()`)
+- `@expect(val, exp) -> T` — branch prediction hint (`__builtin_expect`)
+- `@bswap16/32/64(x) -> T` — byte swap (3 intrinsics)
+- `@popcount(x) -> u32` — count 1-bits (`__builtin_popcount{,ll}`)
+- `@ctz(x) -> u32` — count trailing zeros
+- `@clz(x) -> u32` — count leading zeros
+- `@parity(x) -> u32` — 0=even / 1=odd parity
+- `@ffs(x) -> u32` — find first set bit, 1-indexed
+
+**Rationale:** Provide portable GCC-builtin-backed intrinsics for common low-level operations. All portable to all GCC-supported archs (no per-arch work).
+
+**Width dispatch pattern:** Bit query intrinsics (`popcount`, `ctz`, `clz`, `parity`, `ffs`) use `type_width()` of the argument to pick `__builtin_X` (for ≤32-bit inputs) vs `__builtin_Xll` (for 64-bit inputs). Single ZER intrinsic, two GCC builtin dispatches based on input type.
+
+**Lesson: `__builtin_readcyclecounter` is NOT portable in GCC 13.** Originally planned as `@cpu_read_cycles()` in this batch. GCC 13 on gcc:13 Docker image emits "implicit declaration" warning + link error ("undefined reference to __builtin_readcyclecounter"). Documentation says it's available on certain targets but x86-64 Linux gcc:13 is not among them. Deferred to D-Alpha-7 with per-arch dispatch (rdtsc / mrs cntvct_el0 / rdcycle). Replaced with `@parity` + `@ffs` to keep batch count at 10.
+
+**Recorded in docs/compiler-internals.md** "Phase D-Alpha" section: full list of which GCC builtins are confirmed portable vs target-specific. Use this before adding a new intrinsic.
+
+**Tests added:**
+- `tests/zer/dalpha2_bits_bswap.zer` — positive test for all bit queries + byte swap + round-trip
+- `tests/zer/dalpha2_barrier_expect.zer` — barrier + expect + unreachable in realistic branch pattern
+- `tests/zer_fail/dalpha2_popcount_wrong_type.zer` — struct arg rejected
+- `tests/zer_fail/dalpha2_unreachable_args.zer` — @unreachable with args rejected
+- `tests/zer_fail/dalpha2_expect_arg_count.zer` — @expect with wrong arg count rejected
+
+**Tests:** 427/427 (was 422, +5). check-vst: green, zero admits.
+
+**D-Alpha progress: 25 of 96 intrinsics shipped (26%).** Remaining: D-Alpha-3 (interrupts, needs per-arch asm) through D-Alpha-7 (MSR/inspection/power).
+
 **Docs updated:** `docs/asm_plan.md`, `docs/reference.md`, `docs/ASM_ZER-LANG.md`, `CLAUDE.md`.
 
 ---

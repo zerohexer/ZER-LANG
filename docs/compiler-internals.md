@@ -5958,3 +5958,198 @@ garbage from whatever previous use occupied the C stack slot.
 
 Not a priority given the 3,200 tests pass; flagged for future
 hardening if a related bug ever surfaces.
+
+---
+
+## Phase D-Alpha: adding new intrinsics (2026-04-23)
+
+ZER-Asm verified intrinsics ship in two layers: D-Alpha (implementation,
+no formal proofs) and D-Beta (formal proofs added later). D-Alpha-1
+(atomics) and D-Alpha-2 (barriers + bit queries) shipped 2026-04-23.
+
+This section documents the pattern for adding new intrinsics so fresh
+sessions can extend the set without rediscovering the mechanics.
+
+### The two emitter paths (critical for fresh sessions)
+
+`emitter.c` has two intrinsic dispatch blocks. Only ONE is live:
+
+| Path | Location | Status | Used for |
+|---|---|---|---|
+| AST path | `emit_expr` around line 2706 | **DEAD CODE** since 2026-04-19 | Nothing — function bodies are IR-only |
+| IR path | `emit_rewritten_node` around line 5898 | **LIVE** | All function bodies |
+
+**Only add new intrinsics to the IR path.** The AST path is legacy —
+`emit_stmt` was deleted 2026-04-19. If you touch the AST path you
+waste effort; your changes never run.
+
+Way to verify: the AST path's line number (~2706) is inside
+`emit_expr` which is only called for top-level things, not function
+bodies. Grep for the path's containing function and confirm.
+
+### Standard intrinsic workflow
+
+For every new @intrinsic:
+
+1. **Checker validation (`checker.c` around line 5470+ handles intrinsics)**
+   - Match the name + arg count
+   - Validate arg types
+   - Set `result` type
+   - Use existing Phase 1 predicates where applicable (e.g., `zer_atomic_width_valid` for atomics)
+
+2. **Emitter IR path (`emitter.c` around line 5710+ for `emit_rewritten_node`)**
+   - Match on `nlen + memcmp(name, "intrinsic_name", N)`
+   - Emit C (GCC builtin OR inline asm)
+   - Use `emit_rewritten_node(e, arg, func)` to recurse into args
+
+3. **No parser work needed** — intrinsics use existing `@ident` dispatch
+   (NODE_INTRINSIC kind is already there).
+
+4. **Tests**: `tests/zer/intrinsic_name.zer` (positive) +
+   `tests/zer_fail/intrinsic_name_*.zer` (negative).
+
+### GCC builtin dispatch pattern (D-Alpha-1, D-Alpha-2)
+
+Intrinsics that map to GCC builtins get ZERO per-arch work — GCC
+handles x86-64/ARM64/RISC-V/etc. automatically. Pattern used by 40
+of 96 intrinsics.
+
+Example from `emit_rewritten_node` (D-Alpha-1 atomics):
+
+```c
+} else if (nlen >= 7 && memcmp(name, "atomic_", 7) == 0) {
+    const char *aop = name + 7;
+    uint32_t aolen = nlen - 7;
+    if (aolen == 4 && !memcmp(aop, "load", 4)) {
+        emit(e, "__atomic_load_n(");
+        emit_rewritten_node(e, node->intrinsic.args[0], func);
+        emit(e, ", __ATOMIC_SEQ_CST)");
+    }
+    /* ... more variants ... */
+    const char *gcc_op = NULL;
+    if (aolen == 4 && !memcmp(aop, "xchg", 4)) gcc_op = "__atomic_exchange_n";
+    else if (aolen == 9 && !memcmp(aop, "add_fetch", 9)) gcc_op = "__atomic_add_fetch";
+    /* Same call shape for all these:
+     *   builtin(ptr, val, ordering) -> T */
+    if (gcc_op) {
+        emit(e, "%s(", gcc_op);
+        emit_rewritten_node(e, node->intrinsic.args[0], func);
+        emit(e, ", "); emit_rewritten_node(e, node->intrinsic.args[1], func);
+        emit(e, ", __ATOMIC_SEQ_CST)");
+    }
+}
+```
+
+Pattern:
+1. Match intrinsic name (prefix + operation)
+2. Map to GCC builtin name via table
+3. Emit builtin call with same arg shape
+
+### Width dispatch pattern (D-Alpha-2 bit queries)
+
+Some GCC builtins have different names for different widths
+(`__builtin_popcount` for 32-bit, `__builtin_popcountll` for 64-bit).
+Solution: use `type_width()` to pick the suffix at emit time.
+
+```c
+} else if ((nlen == 8 && memcmp(name, "popcount", 8) == 0) || /* ... */ ) {
+    Type *arg_t = checker_get_type(e->checker, node->intrinsic.args[0]);
+    int w = arg_t ? type_width(type_unwrap_distinct(arg_t)) : 32;
+    const char *suffix = (w > 32) ? "ll" : "";
+    emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+    emit_rewritten_node(e, node->intrinsic.args[0], func);
+    emit(e, ")");
+}
+```
+
+Key helper: `checker_get_type(e->checker, expr_node)` returns the
+resolved Type for any expression node. `type_unwrap_distinct(t)`
+strips `TYPE_DISTINCT` to get primitive. `type_width(t)` returns
+bit width (32, 64, etc.).
+
+### GCC builtin pitfalls found during D-Alpha-2
+
+Not every GCC "portable" builtin is actually available on every
+target. These failed in gcc:13 Docker and were deferred:
+
+| Builtin | Issue | Workaround |
+|---|---|---|
+| `__builtin_readcyclecounter()` | Link error in gcc:13 x86 — "undefined reference" | Deferred to D-Alpha-7 with per-arch dispatch (rdtsc on x86, mrs cntvct_el0 on ARM64, rdcycle on RISC-V) |
+
+**Rule:** before relying on a GCC builtin, test it in the Docker
+build. Advertised portability isn't the same as available-everywhere.
+Specifically, many `__builtin_*` are in GCC docs but marked "available
+on some targets." Check before adding.
+
+Safe portable builtins (confirmed in gcc:13):
+- `__atomic_*` family (all)
+- `__atomic_thread_fence`
+- `__builtin_prefetch`
+- `__builtin_trap`
+- `__builtin_unreachable`
+- `__builtin_expect`
+- `__builtin_bswap16/32/64`
+- `__builtin_popcount{,ll}`, `__builtin_ctz{,ll}`, `__builtin_clz{,ll}`,
+  `__builtin_parity{,ll}`, `__builtin_ffs{,ll}`
+- `__builtin___clear_cache`
+
+Unsafe / target-specific:
+- `__builtin_readcyclecounter` (not always available)
+- `__builtin_ia32_*` (x86 only)
+- `__builtin_aarch64_*` (ARM64 only)
+
+### Atomic intrinsic restrictions (Phase 1 predicate: `zer_atomic_width_valid`)
+
+All `@atomic_*` intrinsics except `load/store/cas` go through the
+`is_arith` path in checker which enforces:
+
+1. First arg must be pointer-to-integer
+2. Integer width must be 1, 2, 4, or 8 bytes
+3. Cannot be on packed struct field (BUG-493: packed alignment mismatch
+   causes hard fault on ARM/RISC-V with GCC __atomic builtins)
+4. Warning emitted for 64-bit width on 32-bit targets (libatomic
+   dependency)
+
+When adding new atomic variants, reuse the existing `is_arith` flag
+by adding the new name to its check — this automatically inherits
+all four validations. See D-Alpha-1 addition pattern in `checker.c`.
+
+### Testing intrinsics — platform-independence rule
+
+Tests for intrinsics must not depend on platform-specific values.
+Bad test:
+```zer
+u64 cycles_before = @cpu_read_cycles();
+do_work();
+u64 cycles_after = @cpu_read_cycles();
+if (cycles_after < cycles_before) return 1;   // fails if both return 0
+```
+
+Platforms without a cycle counter may return 0; the test fails even
+though the intrinsic compiled fine. Better:
+```zer
+u64 t = @cpu_read_cycles();
+u64 next = t + 1;  // just confirm the value is usable
+return 0;          // always pass if we got here
+```
+
+Or test only the structural property (compiles + runs) and defer
+semantic validation to an integration test that runs on a specific
+target.
+
+### D-Alpha batch progress (running state)
+
+| Batch | Status | Intrinsics added | Commit |
+|---|---|---|---|
+| D-Alpha-1 | DONE | 7 new atomics (xchg, nand, *_fetch × 5) | 2e152f3 |
+| D-Alpha-2 | DONE | 10 (barrier_acq_rel, unreachable, expect, bswap16/32/64, popcount, ctz, clz, parity, ffs) | a14d3c0 |
+| D-Alpha-3 | Pending | 8 interrupt control (needs per-arch asm) | — |
+| D-Alpha-4 | Pending | 4 context switch | — |
+| D-Alpha-5 | Pending | 10 MMU | — |
+| D-Alpha-6 | Pending | 11 TLB + cache | — |
+| D-Alpha-7 | Pending | 38 MSR + inspection + power (incl. deferred cycle counter) | — |
+
+25 of 96 intrinsics implemented. Remaining batches need per-arch inline
+asm (no universal GCC builtin exists for MSR/MMU/context switch/etc).
+
+See `docs/asm_plan.md` for full D-Alpha plan + shipping roadmap.

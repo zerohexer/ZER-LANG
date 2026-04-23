@@ -6340,3 +6340,148 @@ from `->`. If you see this, you wrote Rust-style.
 
 30 of 96 intrinsics implemented. Per-arch asm pattern proven — future
 batches reuse it.
+
+### D-Alpha-4 findings: emit() escaping rule (CRITICAL)
+
+When emitting GCC inline asm via `emit(e, fmt, ...)`, remember that `emit`
+internally calls `vfprintf(fmt, ...)`. Format specifiers in `fmt` are
+INTERPRETED. This bites when emitting GCC inline asm's `%` syntax.
+
+**Rule:** In an `emit()` fmt string, every literal `%` needs to be
+doubled.
+
+| GCC inline asm literal | Emit() fmt string | Mistake |
+|---|---|---|
+| `%0` (operand ref) | `%%0` | Writing `%0` → fprintf eats the `%` |
+| `%1`, `%2`, ... | `%%1`, `%%2`, ... | Same |
+| `%%rbx` (literal register) | `%%%%rbx` | Writing `%%rbx` → fprintf outputs `%rbx` → GCC errors "operand number missing" |
+| `%=` (unique label) | `%%=` | Same |
+
+**Typical error when you get this wrong:**
+```
+error: invalid 'asm': operand number missing after %-letter
+```
+
+The fprintf eats the `%`, output to GCC asm parser is garbled. Diagnose by
+inspecting the emitted `.c` file.
+
+**Working example (from D-Alpha-4):**
+
+```c
+/* Source: what's in emitter.c */
+emit(e, "__asm__ __volatile__ (\n"
+    "    \"movq %%%%rbx, 0(%%0)\\n\\t\"\n"
+    "    : : \"r\"(_zer_ctx) : \"memory\");\n");
+
+/* After fprintf processing (what lands in the emitted .c file): */
+__asm__ __volatile__ (
+    "movq %%rbx, 0(%0)\n\t"
+    : : "r"(_zer_ctx) : "memory");
+
+/* What GCC inline asm parser sees: */
+movq %rbx, 0(%rdi)   /* with _zer_ctx allocated to %rdi */
+```
+
+Four `%` in C source → two `%` in emitted C → one `%` in final asm.
+
+**For parameterless asm (no operand refs, no register literals),
+escaping isn't needed:**
+
+```c
+/* Fine — no % in the asm string */
+emit(e, "__asm__ __volatile__ (\"cli\" ::: \"memory\");\n");
+```
+
+D-Alpha-3 happened to work because it used `%0` (one `%`), and glibc
+fprintf on `%0` followed by non-numeric content passes through as
+literal `%0`. Unreliable — should ALWAYS double per the rule.
+
+### D-Alpha-4 findings: Type field name gotcha
+
+Array type's element-type field is named `.inner`, NOT `.element`:
+
+```c
+/* types.h:94 — actual field names */
+/* TYPE_ARRAY */
+struct { Type *inner; uint64_t size; Type *sizeof_type; } array;
+
+/* CORRECT */
+Type *elem = type_unwrap_distinct(eff->array.inner);
+
+/* WRONG — compile error: 'struct <anonymous>' has no member named 'element' */
+Type *elem = type_unwrap_distinct(eff->array.element);
+```
+
+Common mistake if you're used to "element" as a natural name. Always
+check `types.h` for actual field names before writing type-unwrapping
+code.
+
+### D-Alpha-4 scope limitation: callee-saved only
+
+`@cpu_save_context` / `@cpu_restore_context` save/restore ONLY the
+callee-saved registers (the ones the function body normally preserves):
+
+| Arch | Callee-saved GPRs saved | Bytes |
+|---|---|---|
+| x86-64 | rbx, r12, r13, r14, r15 | 40 |
+| ARM64 | x19, x20, x21, x22, x23, x24, x25, x26, x27, x28 | 80 |
+| ARMv7 | r4, r5, r6, r7, r8, r9, r10, r11 | 32 |
+| RISC-V | s0 through s11 | 96 |
+
+Caller-saved registers (rax, rcx, rdx, r8-r11, etc.) are NOT saved.
+These are already saved by the compiler-emitted prologue around the
+intrinsic call, per the ABI. The intrinsic doesn't need to duplicate
+that work.
+
+**NOT saved by these intrinsics (would need naked function):**
+- Stack pointer (RSP / SP) — context switch needs to change stacks
+  in a larger atomic step that inline asm can't reliably do
+- Instruction pointer (RIP / PC) — handled by `call/ret` in normal
+  functions; manipulation requires naked asm
+- Segment registers (x86), system registers (ARM/RISC-V) — need
+  separate intrinsics
+
+**Rationale for the scope limit:**
+A real kernel scheduler wraps these intrinsics in a naked function or
+careful asm stub that handles RSP/RIP. The intrinsics cover the
+BULK (callee-saved GPRs + FPU), which is 80%+ of the bytes, leaving
+only stack+return-address manipulation for the kernel-specific code.
+
+### D-Alpha-4 FPU alignment requirement
+
+`fxsave` (x86-64) requires the target buffer to be 16-byte aligned.
+ZER's `u8[512] buf;` is typically aligned by malloc / stack
+alignment (16-byte on x86-64 by default), but if the user declares
+`u8[N] buf` as a struct field, alignment depends on the struct's
+layout.
+
+**Recommended pattern:**
+
+```zer
+/* stack-allocated — 16-byte aligned on x86-64 per ABI */
+u8[512] fpu_buf;
+@cpu_save_fpu(&fpu_buf[0]);
+
+/* For global/struct embedding, use @ptr_align if needed
+ * (not yet implemented — deferred to D-Alpha-7) */
+```
+
+If the buffer is misaligned, `fxsave` faults with #GP (general
+protection fault) on x86-64. Test failures that say "Segmentation
+fault" near FPU intrinsics are usually alignment issues.
+
+### D-Alpha batch progress (2026-04-23, end of day)
+
+| Batch | Status | Intrinsics | Commit |
+|---|---|---|---|
+| D-Alpha-1 | DONE | 7 atomics | 2e152f3 |
+| D-Alpha-2 | DONE | 10 barriers+bits | a14d3c0 |
+| D-Alpha-3 | DONE | 5 interrupts | 3e6e2f2 |
+| D-Alpha-4 | DONE | 4 context switch | e2f45af |
+| D-Alpha-5 | Pending | 10 MMU | — |
+| D-Alpha-6 | Pending | 11 TLB + cache | — |
+| D-Alpha-7 | Pending | 38 MSR + inspection + power | — |
+
+34 of 96 intrinsics implemented. Patterns established for remaining
+62: GCC builtin dispatch (for portable ops), per-arch `#if defined`
+dispatch (for arch-specific), dead-branch testing (for privileged).

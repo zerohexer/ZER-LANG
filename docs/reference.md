@@ -1668,6 +1668,31 @@ u64 saved = @cpu_save_int_state();
 
 ---
 
+### @cpu_save_context(buf), @cpu_restore_context(buf), @cpu_save_fpu(buf), @cpu_restore_fpu(buf)
+
+**DESCRIPTION**
+Scheduler primitives. Save/restore callee-saved GPRs and SIMD/FP state
+to/from a user-provided u8 buffer. Per-arch inline asm.
+
+**EXAMPLE**
+```zer
+u8[128] ctx;
+u8[512] fpu;
+@cpu_save_context(&ctx[0]);
+@cpu_save_fpu(&fpu[0]);
+// switch stacks here (naked function, kernel-specific)
+@cpu_restore_fpu(&fpu[0]);
+@cpu_restore_context(&ctx[0]);
+```
+
+**NOTES**
+- Buffer size: 128+ bytes for context, 512+ (16-byte aligned) for FPU.
+- Callee-saved only (rbx/r12-r15 x86; x19-x28 ARM64; s0-s11 RISC-V).
+- Full RSP/RIP save-restore needs a naked function — kernel-integration scope.
+- `fxsave` on x86-64 requires 16-byte aligned buffer.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**

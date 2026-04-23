@@ -5773,9 +5773,32 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if ((nlen == 7 && memcmp(name, "barrier", 7) == 0) ||
                    (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||
                    (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) ||
-                   (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0)) {
-            /* D-Alpha-2: + @barrier_acq_rel (acquire + release fence) */
+                   (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) ||
+                   (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0)) {
+            /* D-Alpha-2/7: fences. barrier_dma is DMA-coherence barrier for driver code. */
             result = ty_void;
+        } else if ((nlen == 9 && memcmp(name, "cpu_pause", 9) == 0) ||
+                   (nlen == 7 && memcmp(name, "cpu_wfe", 7) == 0) ||
+                   (nlen == 7 && memcmp(name, "cpu_sev", 7) == 0) ||
+                   (nlen == 14 && memcmp(name, "cpu_breakpoint", 14) == 0)) {
+            /* D-Alpha-7: 0-arg, void-return intrinsics for spin-wait + debug */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if (nlen == 6 && memcmp(name, "cpu_id", 6) == 0) {
+            /* D-Alpha-7: @cpu_id() -> u32 (current core number) */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@cpu_id takes no arguments");
+            }
+            result = ty_u32;
+        } else if ((nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) ||
+                   (nlen == 10 && memcmp(name, "cpu_rdseed", 10) == 0)) {
+            /* D-Alpha-7: hardware RNG — returns ?u64 because the instruction can fail */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = type_optional(c->arena, ty_u64);
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             result = ty_void;
         } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {

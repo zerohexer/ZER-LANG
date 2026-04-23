@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_id takes no arguments
+
+i32 main() {
+    u32 n = @cpu_id(0);  // error: takes no args
+    return 0;
+}

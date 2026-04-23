@@ -5880,6 +5880,105 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         } else if (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) {
             /* D-Alpha-2: acquire + release fence */
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQ_REL)");
+        } else if (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0) {
+            /* D-Alpha-7: DMA-coherence barrier — stronger than release fence.
+             * Required for correct DMA on weakly-ordered archs (ARM, RISC-V). */
+            emit(e, "({\n"
+                "#if defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"mfence\" ::: \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dsb ishst\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"dmb st\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"fence iorw, iorw\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 9 && memcmp(name, "cpu_pause", 9) == 0) {
+            /* D-Alpha-7: spin-wait hint (relaxes CPU, saves power, avoids starving other hyperthread) */
+            emit(e, "({\n"
+                "#if defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"pause\");\n"
+                "#elif defined(__aarch64__) || defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"yield\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\".insn i 0x0F, 0, x0, x0, 0x010\");  /* Zihintpause pause hint */\n"
+                "#else\n"
+                "    __asm__ __volatile__ (\"\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 6 && memcmp(name, "cpu_id", 6) == 0) {
+            /* D-Alpha-7: current CPU/core number. Returns u32.
+             * Note: on most archs this requires reading a privileged system register
+             * (mpidr_el1 on ARM, mhartid on RISC-V). On x86 user-mode we approximate via
+             * a sched_getcpu-like fallback. For kernel mode, replace with proper syscall. */
+            emit(e, "({ uint32_t _zer_cpu = 0;\n"
+                "#if defined(__aarch64__)\n"
+                "    { uint64_t _zer_mpidr; __asm__ __volatile__ (\"mrs %%0, mpidr_el1\" : \"=r\"(_zer_mpidr)); _zer_cpu = (uint32_t)(_zer_mpidr & 0xFF); }\n"
+                "#elif defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen >= 64\n"
+                "    { unsigned long _zer_hart; __asm__ __volatile__ (\"csrr %%0, mhartid\" : \"=r\"(_zer_hart)); _zer_cpu = (uint32_t)_zer_hart; }\n"
+                "#elif defined(__x86_64__) || defined(__i386__)\n"
+                "    { uint32_t _zer_a, _zer_b; __asm__ __volatile__ (\"rdtscp\" : \"=a\"(_zer_a), \"=c\"(_zer_b) :: \"rdx\"); _zer_cpu = _zer_b & 0xFFF; }\n"
+                "#endif\n"
+                "_zer_cpu; })");
+        } else if (nlen == 7 && memcmp(name, "cpu_wfe", 7) == 0) {
+            /* D-Alpha-7: wait-for-event (paired with sev). On x86 falls back to pause. */
+            emit(e, "({\n"
+                "#if defined(__aarch64__) || defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"wfe\" ::: \"memory\");\n"
+                "#elif defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"pause\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\".insn i 0x0F, 0, x0, x0, 0x010\");\n"
+                "#else\n"
+                "    __asm__ __volatile__ (\"\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 7 && memcmp(name, "cpu_sev", 7) == 0) {
+            /* D-Alpha-7: send-event (wakes WFE waiters). On non-ARM: memory fence as fallback. */
+            emit(e, "({\n"
+                "#if defined(__aarch64__) || defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"sev\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "cpu_breakpoint", 14) == 0) {
+            /* D-Alpha-7: debug trap for attach-debugger workflows */
+            emit(e, "({\n"
+                "#if defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"int3\");\n"
+                "#elif defined(__aarch64__) || defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"brk #0\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"ebreak\");\n"
+                "#else\n"
+                "    __builtin_trap();\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
+            /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
+             * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */
+            emit(e, "({ _zer_opt_u64 _zer_rr = {0};\n"
+                "#if defined(__x86_64__) && defined(__RDRND__)\n"
+                "    uint64_t _zer_v; uint8_t _zer_ok;\n"
+                "    __asm__ __volatile__ (\"rdrand %%0; setc %%1\" : \"=r\"(_zer_v), \"=r\"(_zer_ok) :: \"cc\");\n"
+                "    if (_zer_ok) { _zer_rr.has_value = 1; _zer_rr.value = _zer_v; }\n"
+                "#else\n"
+                "    /* Not available on this target — returns null optional */\n"
+                "#endif\n"
+                "_zer_rr; })");
+        } else if (nlen == 10 && memcmp(name, "cpu_rdseed", 10) == 0) {
+            /* D-Alpha-7: hardware entropy source (stronger than rdrand). Intel/AMD only. */
+            emit(e, "({ _zer_opt_u64 _zer_rs = {0};\n"
+                "#if defined(__x86_64__) && defined(__RDSEED__)\n"
+                "    uint64_t _zer_v; uint8_t _zer_ok;\n"
+                "    __asm__ __volatile__ (\"rdseed %%0; setc %%1\" : \"=r\"(_zer_v), \"=r\"(_zer_ok) :: \"cc\");\n"
+                "    if (_zer_ok) { _zer_rs.has_value = 1; _zer_rs.value = _zer_v; }\n"
+                "#endif\n"
+                "_zer_rs; })");
         } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {
             /* D-Alpha-2: GCC unreachable hint (undefined behavior if reached) */
             emit(e, "__builtin_unreachable()");

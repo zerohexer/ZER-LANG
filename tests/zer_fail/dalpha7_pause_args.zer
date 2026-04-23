@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_pause takes no arguments
+
+i32 main() {
+    @cpu_pause(1);  // error: takes no args
+    return 0;
+}

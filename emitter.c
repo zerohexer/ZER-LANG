@@ -5896,7 +5896,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")");
         } else if (nlen >= 7 && memcmp(name, "atomic_", 7) == 0) {
-            /* @atomic_add/sub/or/and/xor/load/store/cas */
+            /* @atomic_* intrinsics — Phase D-Alpha-1 (2026-04-23).
+             * Extended from 8 to 15 intrinsics. All SEQ_CST ordering for now (Ordering param deferred).
+             * Existing: load, store, cas, add, sub, or, and, xor
+             * D-Alpha-1 new: xchg, nand, add_fetch, sub_fetch, or_fetch, and_fetch, xor_fetch */
             const char *aop = name + 7;
             uint32_t aolen = nlen - 7;
             if (aolen == 4 && !memcmp(aop, "load", 4) && node->intrinsic.arg_count > 0) {
@@ -5914,16 +5917,30 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, ", &_zer_cas_exp%d, ", t); emit_rewritten_node(e, node->intrinsic.args[2], func);
                 emit(e, ", 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); })");
             } else if (node->intrinsic.arg_count > 1) {
-                /* add/sub/or/and/xor */
-                const char *gcc_op = "__atomic_fetch_add";
+                /* 2-arg ops that take (ptr, val) and return T.
+                 * All emit GCC builtin with signature: builtin(ptr, val, ordering). */
+                const char *gcc_op = NULL;
+                /* existing fetch-old variants */
                 if (aolen == 3 && !memcmp(aop, "add", 3)) gcc_op = "__atomic_fetch_add";
                 else if (aolen == 3 && !memcmp(aop, "sub", 3)) gcc_op = "__atomic_fetch_sub";
                 else if (aolen == 2 && !memcmp(aop, "or", 2)) gcc_op = "__atomic_fetch_or";
                 else if (aolen == 3 && !memcmp(aop, "and", 3)) gcc_op = "__atomic_fetch_and";
                 else if (aolen == 3 && !memcmp(aop, "xor", 3)) gcc_op = "__atomic_fetch_xor";
-                emit(e, "%s(", gcc_op); emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, ", "); emit_rewritten_node(e, node->intrinsic.args[1], func);
-                emit(e, ", __ATOMIC_SEQ_CST)");
+                /* D-Alpha-1: xchg + nand (return old value) */
+                else if (aolen == 4 && !memcmp(aop, "xchg", 4)) gcc_op = "__atomic_exchange_n";
+                else if (aolen == 4 && !memcmp(aop, "nand", 4)) gcc_op = "__atomic_fetch_nand";
+                /* D-Alpha-1: *_fetch variants (return new value — operation applied first) */
+                else if (aolen == 9 && !memcmp(aop, "add_fetch", 9)) gcc_op = "__atomic_add_fetch";
+                else if (aolen == 9 && !memcmp(aop, "sub_fetch", 9)) gcc_op = "__atomic_sub_fetch";
+                else if (aolen == 8 && !memcmp(aop, "or_fetch", 8)) gcc_op = "__atomic_or_fetch";
+                else if (aolen == 9 && !memcmp(aop, "and_fetch", 9)) gcc_op = "__atomic_and_fetch";
+                else if (aolen == 9 && !memcmp(aop, "xor_fetch", 9)) gcc_op = "__atomic_xor_fetch";
+
+                if (gcc_op) {
+                    emit(e, "%s(", gcc_op); emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, ", "); emit_rewritten_node(e, node->intrinsic.args[1], func);
+                    emit(e, ", __ATOMIC_SEQ_CST)");
+                }
             }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0 && node->intrinsic.arg_count > 1) {
             /* @cstr(buf, str) — copy string to buffer with null terminator.

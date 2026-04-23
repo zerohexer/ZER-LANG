@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// @atomic_foo is not a valid atomic intrinsic
+
+u32 global;
+
+i32 main() {
+    u32 v = @atomic_foo(&global, 1);  // error: unknown atomic intrinsic
+    return 0;
+}

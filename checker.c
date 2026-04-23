@@ -5790,16 +5790,29 @@ static Type *check_expr(Checker *c, Node *node) {
             result = type_optional(c->arena, ty_u32);
         } else if (nlen >= 9 && memcmp(name, "atomic_", 7) == 0) {
             /* BUG-427: was >= 10, but @atomic_or is 9 chars */
-            /* @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor,
-             * @atomic_load, @atomic_store, @atomic_cas */
+            /* Phase D-Alpha-1 (2026-04-23): Extended to 15 atomic intrinsics.
+             * Existing: @atomic_load/store/cas + @atomic_add/sub/or/and/xor (fetch-old)
+             * New: @atomic_xchg, @atomic_nand, @atomic_{add,sub,or,and,xor}_fetch (return new) */
             const char *op = name + 7;
             int oplen = nlen - 7;
             bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
             bool is_store = (oplen == 5 && memcmp(op, "store", 5) == 0);
             bool is_cas = (oplen == 3 && memcmp(op, "cas", 3) == 0);
-            bool is_arith = (oplen == 3 && (memcmp(op, "add", 3) == 0 || memcmp(op, "sub", 3) == 0 ||
-                             memcmp(op, "and", 3) == 0 || memcmp(op, "xor", 3) == 0)) ||
-                            (oplen == 2 && memcmp(op, "or", 2) == 0);
+            /* 2-arg ops that return T: fetch-old variants (existing) + new xchg/nand + *_fetch */
+            bool is_arith =
+                /* existing fetch-old variants */
+                (oplen == 3 && (memcmp(op, "add", 3) == 0 || memcmp(op, "sub", 3) == 0 ||
+                                memcmp(op, "and", 3) == 0 || memcmp(op, "xor", 3) == 0)) ||
+                (oplen == 2 && memcmp(op, "or", 2) == 0) ||
+                /* new: xchg, nand (both return old value, like existing fetch_* family) */
+                (oplen == 4 && memcmp(op, "xchg", 4) == 0) ||
+                (oplen == 4 && memcmp(op, "nand", 4) == 0) ||
+                /* new: *_fetch variants (return new value) */
+                (oplen == 9 && memcmp(op, "add_fetch", 9) == 0) ||
+                (oplen == 9 && memcmp(op, "sub_fetch", 9) == 0) ||
+                (oplen == 8 && memcmp(op, "or_fetch", 8) == 0) ||
+                (oplen == 9 && memcmp(op, "and_fetch", 9) == 0) ||
+                (oplen == 9 && memcmp(op, "xor_fetch", 9) == 0);
             if (!is_load && !is_store && !is_cas && !is_arith) {
                 checker_error(c, node->loc.line, "unknown atomic intrinsic '@%.*s'", (int)nlen, name);
             }

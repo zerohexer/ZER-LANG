@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// @atomic_xchg requires 2 arguments (ptr, val)
+
+u32 global;
+
+i32 main() {
+    u32 v = @atomic_xchg(&global);  // error: only 1 argument
+    return 0;
+}

@@ -5794,6 +5794,34 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
             }
             result = ty_void;
+        } else if ((nlen == 16 && memcmp(name, "cpu_save_context", 16) == 0) ||
+                   (nlen == 19 && memcmp(name, "cpu_restore_context", 19) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_save_fpu", 12) == 0) ||
+                   (nlen == 15 && memcmp(name, "cpu_restore_fpu", 15) == 0)) {
+            /* D-Alpha-4: context switch state save/restore (1-arg: buffer pointer).
+             * Buffer must be u8[N] of sufficient size (128+ for CPU, 512+ aligned for FPU). */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (buffer pointer)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt) {
+                    Type *eff = type_unwrap_distinct(vt);
+                    bool is_ptr_to_u8 = false;
+                    if (eff->kind == TYPE_POINTER) {
+                        Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                        if (inner == ty_u8) is_ptr_to_u8 = true;
+                    } else if (eff->kind == TYPE_ARRAY) {
+                        Type *elem = type_unwrap_distinct(eff->array.inner);
+                        if (elem == ty_u8) is_ptr_to_u8 = true;
+                    }
+                    if (!is_ptr_to_u8) {
+                        checker_error(c, node->loc.line,
+                            "@%.*s argument must be a u8 buffer (e.g., u8[128] buf; @%.*s(&buf[0]))",
+                            (int)nlen, name, (int)nlen, name);
+                    }
+                }
+            }
+            result = ty_void;
         } else if (nlen == 18 && memcmp(name, "cpu_save_int_state", 18) == 0) {
             /* D-Alpha-3: @cpu_save_int_state() -> u64 (read flags register) */
             if (node->intrinsic.arg_count != 0) {

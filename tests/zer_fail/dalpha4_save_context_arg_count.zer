@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_save_context requires exactly 1 argument
+
+i32 main() {
+    @cpu_save_context();  // error: needs 1 argument
+    return 0;
+}

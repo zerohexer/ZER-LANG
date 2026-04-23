@@ -5937,6 +5937,148 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    _zer_istate = 0;\n"
                 "#endif\n"
                 "_zer_istate; })");
+        } else if (nlen == 16 && memcmp(name, "cpu_save_context", 16) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-4: save callee-saved GPRs to buffer.
+             * Note: in emit() fmt string, % must be doubled for fprintf.
+             * %%%%rbx in fmt -> %%rbx in output -> %rbx in GCC inline asm (literal register).
+             * %%0 in fmt -> %0 in output (operand ref 0 for GCC asm). */
+            emit(e, "({ void *_zer_ctx = (void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"movq %%%%rbx, 0(%%0)\\n\\t\"\n"
+                "        \"movq %%%%r12, 8(%%0)\\n\\t\"\n"
+                "        \"movq %%%%r13, 16(%%0)\\n\\t\"\n"
+                "        \"movq %%%%r14, 24(%%0)\\n\\t\"\n"
+                "        \"movq %%%%r15, 32(%%0)\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"stp x19, x20, [%%0, #0]\\n\\t\"\n"
+                "        \"stp x21, x22, [%%0, #16]\\n\\t\"\n"
+                "        \"stp x23, x24, [%%0, #32]\\n\\t\"\n"
+                "        \"stp x25, x26, [%%0, #48]\\n\\t\"\n"
+                "        \"stp x27, x28, [%%0, #64]\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"stm %%0, {r4-r11}\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"sd s0, 0(%%0)\\n\\t\"\n"
+                "        \"sd s1, 8(%%0)\\n\\t\"\n"
+                "        \"sd s2, 16(%%0)\\n\\t\"\n"
+                "        \"sd s3, 24(%%0)\\n\\t\"\n"
+                "        \"sd s4, 32(%%0)\\n\\t\"\n"
+                "        \"sd s5, 40(%%0)\\n\\t\"\n"
+                "        \"sd s6, 48(%%0)\\n\\t\"\n"
+                "        \"sd s7, 56(%%0)\\n\\t\"\n"
+                "        \"sd s8, 64(%%0)\\n\\t\"\n"
+                "        \"sd s9, 72(%%0)\\n\\t\"\n"
+                "        \"sd s10, 80(%%0)\\n\\t\"\n"
+                "        \"sd s11, 88(%%0)\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_ctx;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 19 && memcmp(name, "cpu_restore_context", 19) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-4: restore callee-saved GPRs from buffer. */
+            emit(e, "({ const void *_zer_ctx = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"movq 0(%%0), %%%%rbx\\n\\t\"\n"
+                "        \"movq 8(%%0), %%%%r12\\n\\t\"\n"
+                "        \"movq 16(%%0), %%%%r13\\n\\t\"\n"
+                "        \"movq 24(%%0), %%%%r14\\n\\t\"\n"
+                "        \"movq 32(%%0), %%%%r15\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"rbx\", \"r12\", \"r13\", \"r14\", \"r15\", \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"ldp x19, x20, [%%0, #0]\\n\\t\"\n"
+                "        \"ldp x21, x22, [%%0, #16]\\n\\t\"\n"
+                "        \"ldp x23, x24, [%%0, #32]\\n\\t\"\n"
+                "        \"ldp x25, x26, [%%0, #48]\\n\\t\"\n"
+                "        \"ldp x27, x28, [%%0, #64]\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"x19\", \"x20\", \"x21\", \"x22\", \"x23\", \"x24\", \"x25\", \"x26\", \"x27\", \"x28\", \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"ldm %%0, {r4-r11}\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"r4\", \"r5\", \"r6\", \"r7\", \"r8\", \"r9\", \"r10\", \"r11\", \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"ld s0, 0(%%0)\\n\\t\"\n"
+                "        \"ld s1, 8(%%0)\\n\\t\"\n"
+                "        \"ld s2, 16(%%0)\\n\\t\"\n"
+                "        \"ld s3, 24(%%0)\\n\\t\"\n"
+                "        \"ld s4, 32(%%0)\\n\\t\"\n"
+                "        \"ld s5, 40(%%0)\\n\\t\"\n"
+                "        \"ld s6, 48(%%0)\\n\\t\"\n"
+                "        \"ld s7, 56(%%0)\\n\\t\"\n"
+                "        \"ld s8, 64(%%0)\\n\\t\"\n"
+                "        \"ld s9, 72(%%0)\\n\\t\"\n"
+                "        \"ld s10, 80(%%0)\\n\\t\"\n"
+                "        \"ld s11, 88(%%0)\\n\\t\"\n"
+                "        : : \"r\"(_zer_ctx) : \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\", \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_ctx;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_save_fpu", 12) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-4: save FPU/SIMD state to buffer.
+             * x86-64: fxsave (512 bytes, 16-byte aligned)
+             * ARM64: stp q0-q31 in pairs (512 bytes) */
+            emit(e, "({ void *_zer_fpu = (void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"fxsave (%%0)\" : : \"r\"(_zer_fpu) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"stp q0, q1, [%%0, #0]\\n\\t\"\n"
+                "        \"stp q2, q3, [%%0, #32]\\n\\t\"\n"
+                "        \"stp q4, q5, [%%0, #64]\\n\\t\"\n"
+                "        \"stp q6, q7, [%%0, #96]\\n\\t\"\n"
+                "        \"stp q8, q9, [%%0, #128]\\n\\t\"\n"
+                "        \"stp q10, q11, [%%0, #160]\\n\\t\"\n"
+                "        \"stp q12, q13, [%%0, #192]\\n\\t\"\n"
+                "        \"stp q14, q15, [%%0, #224]\\n\\t\"\n"
+                "        : : \"r\"(_zer_fpu) : \"memory\");\n"
+                "#else\n"
+                "    /* Generic fallback: no FPU state tracked */\n"
+                "    (void)_zer_fpu;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 15 && memcmp(name, "cpu_restore_fpu", 15) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-4: restore FPU/SIMD state from buffer. */
+            emit(e, "({ const void *_zer_fpu = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"fxrstor (%%0)\" : : \"r\"(_zer_fpu) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"ldp q0, q1, [%%0, #0]\\n\\t\"\n"
+                "        \"ldp q2, q3, [%%0, #32]\\n\\t\"\n"
+                "        \"ldp q4, q5, [%%0, #64]\\n\\t\"\n"
+                "        \"ldp q6, q7, [%%0, #96]\\n\\t\"\n"
+                "        \"ldp q8, q9, [%%0, #128]\\n\\t\"\n"
+                "        \"ldp q10, q11, [%%0, #160]\\n\\t\"\n"
+                "        \"ldp q12, q13, [%%0, #192]\\n\\t\"\n"
+                "        \"ldp q14, q15, [%%0, #224]\\n\\t\"\n"
+                "        : : \"r\"(_zer_fpu) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_fpu;\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 21 && memcmp(name, "cpu_restore_int_state", 21) == 0 &&
                    node->intrinsic.arg_count >= 1) {
             /* D-Alpha-3: restore interrupt flag state from saved value. */

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// @cpu_save_context requires a u8 buffer
+
+u32 not_a_buffer;
+
+i32 main() {
+    @cpu_save_context(&not_a_buffer);  // error: pointer to u32, not u8
+    return 0;
+}

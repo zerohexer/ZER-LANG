@@ -100,6 +100,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 **D-Alpha progress: 25 of 96 intrinsics shipped (26%).** Remaining: D-Alpha-3 (interrupts, needs per-arch asm) through D-Alpha-7 (MSR/inspection/power).
 
+---
+
+## Session 2026-04-23 — Phase D-Alpha-3: 5 interrupt control intrinsics (feature)
+
+**Change:** Added 5 privileged interrupt control intrinsics. Commit 3e6e2f2. First D-Alpha batch that required real per-arch inline assembly (no GCC builtin exists for cli/sti/hlt).
+
+**New intrinsics:**
+- `@cpu_disable_int()` — disable interrupts globally
+- `@cpu_enable_int()` — enable interrupts globally
+- `@cpu_wait_int()` — halt/wait-for-interrupt
+- `@cpu_save_int_state() -> u64` — read current flag state
+- `@cpu_restore_int_state(u64)` — restore saved flag state
+
+**Per-arch implementation:**
+- x86-64: `cli` / `sti` / `hlt` / `pushfq;popq` / `pushq;popfq`
+- x86-32: same with 32-bit operand suffixes (pushfl/popfl/pushl/popl)
+- ARMv8-A (aarch64): `cpsid i` / `cpsie i` / `wfi` / `mrs daif` / `msr daif`
+- ARMv7-M: `cpsid i` / `cpsie i` / `wfi` / `mrs primask` / `msr primask`
+- RISC-V: `csrci mstatus,8` / `csrsi mstatus,8` / `wfi` / `csrr mstatus` / `csrw mstatus`
+- Unknown fallback: `__atomic_thread_fence(SEQ_CST)` — safe ordering preservation, no privileged fault
+
+**Dispatch pattern: `#if defined(__x86_64__) ... #elif ... #endif` inside GCC statement expression `({ ... })`.** Same pattern already used by `@critical` at NODE_CRITICAL lowering in `ir_lower.c`. Documented in `docs/compiler-internals.md` D-Alpha-3 section as reusable template for D-Alpha-4+.
+
+**CRITICAL formatting rule:** `#if` directives MUST appear at column 0 within the emitted string. Begin statement expressions with `\n` after `({` so subsequent `#if` starts a fresh line. One-liner `({ #if ... })` form breaks — preprocessor expects `#` at start of logical line.
+
+**Lessons captured for fresh sessions:**
+
+1. **ZER uses C-style function syntax, not Rust.** First attempt at test file used `fn kernel_mode_code() -> u64 { ... }` — parser errored with "expected '{' at '-'" (the `-` is from `->`). Correct: `u64 kernel_mode_code() { ... }`. Recorded in `docs/compiler-internals.md`.
+
+2. **memcmp length MUST match string length.** Wrote `nlen == 19 && memcmp(name, "cpu_save_int_state", 18)` — the string is 18 chars so `nlen == 19` never matches (dead code). Fixed to `nlen == 18`. Rule: count length manually or use `echo -n "name" | wc -c` before committing. Recorded in compiler-internals.md.
+
+3. **Privileged intrinsics can't be RUNTIME tested in user mode.** cli/sti/hlt fault with SIGSEGV under Linux user-mode execution. Test pattern: `volatile u32 never_true; if (never_true == 42) { @cpu_disable_int(); ... }`. Compiler emits the asm (verifies compilation + link), volatile read prevents dead-code elimination, branch is never taken at runtime (SIGSEGV avoided). Full kernel testing happens during kernel integration, not D-Alpha unit tests.
+
+**Tests added:**
+- `tests/zer/dalpha3_interrupt_control.zer` — positive test with dead-branch pattern exercising all 5 intrinsics
+- `tests/zer_fail/dalpha3_disable_int_args.zer` — wrong arg count rejected
+- `tests/zer_fail/dalpha3_restore_wrong_type.zer` — non-integer arg rejected
+
+**Tests:** 430/430 integration (was 427, +3). check-vst: green, zero admits across 23 VST files. Phase 1: 85/85.
+
+**D-Alpha progress: 30 of 96 intrinsics shipped (31%).** Remaining: D-Alpha-4 context switch (hardest — full register state save/restore per arch with different register sets), D-Alpha-5 MMU, D-Alpha-6 TLB+cache, D-Alpha-7 MSR+inspection+power.
+
+**Per-arch asm pattern now proven** — D-Alpha-4 through D-Alpha-7 can reuse the same `#if defined` dispatch template documented in compiler-internals.md.
+
 **Docs updated:** `docs/asm_plan.md`, `docs/reference.md`, `docs/ASM_ZER-LANG.md`, `CLAUDE.md`.
 
 ---

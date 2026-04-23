@@ -242,6 +242,19 @@ Ordering parameter (relaxed/acquire/release/acq_rel/seq_cst) deferred to later b
 ```
 All use GCC builtins — auto-port to x86-64/ARM64/RISC-V without per-arch work.
 
+### Interrupt Control Intrinsics (D-Alpha-3, privileged — kernel mode only)
+```
+@cpu_disable_int()              disable interrupts globally
+@cpu_enable_int()               enable interrupts globally
+@cpu_wait_int()                 halt until next interrupt (hlt/wfi)
+@cpu_save_int_state() -> u64    read current interrupt flag state
+@cpu_restore_int_state(u64)     restore saved flag state
+```
+Per-arch inline asm emission (x86 cli/sti/hlt, ARM cpsid/cpsie/wfi, RISC-V csrci/csrsi/wfi).
+SIGSEGV in user mode — use for kernel code only. Test pattern: place in dead branch with
+`volatile u32 never_true = 0; if (never_true == 42) { ... }` to verify compilation without
+executing privileged asm.
+
 ### mmio Declaration (MANDATORY for @inttoptr)
 ```
 mmio 0x40020000..0x40020FFF;   // declare valid MMIO address range
@@ -926,6 +939,7 @@ ZER SYNTAX RULES (not C — these differ):
 - Ring(T, N) = circular buffer channel (T must be struct name, push/pop)
 - @atomic_load/store/cas + @atomic_{add,sub,or,and,xor,nand,xchg} (fetch-old) + @atomic_{add,sub,or,and,xor}_fetch (fetch-new). All SEQ_CST.
 - Bit queries: @popcount, @ctz, @clz, @parity, @ffs (return u32). Byte swap: @bswap16/32/64. Control-flow hints: @unreachable(), @expect(val, exp). Full barrier: @barrier_acq_rel().
+- Interrupt control (privileged, kernel-mode only): @cpu_disable_int/@cpu_enable_int/@cpu_wait_int/@cpu_save_int_state/@cpu_restore_int_state. Tests use dead-branch pattern (volatile + if(never_true)) to verify compile without executing privileged asm.
 - No malloc/free — use Pool(T, N), Slab(T), Arena
 - move struct Name { } = ownership transfer on pass/assign, use after move = error
 - container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)

@@ -1599,88 +1599,72 @@ if (val) |v| {
 ### @barrier(), @barrier_store(), @barrier_load(), @barrier_acq_rel()
 
 **DESCRIPTION**
-Memory barriers. Full (seq_cst), store-only (release), load-only (acquire), or
-combined (acquire+release). Emits GCC `__atomic_thread_fence()` with
-appropriate ordering. Portable across x86-64, ARM64, RISC-V via GCC.
-
-**SYNTAX**
-```zer
-@barrier();         // __ATOMIC_SEQ_CST — full fence
-@barrier_store();   // __ATOMIC_RELEASE — release semantics
-@barrier_load();    // __ATOMIC_ACQUIRE — acquire semantics
-@barrier_acq_rel(); // __ATOMIC_ACQ_REL — acquire + release (D-Alpha-2, 2026-04-23)
-```
+Memory barriers. Full (seq_cst), store-only (release), load-only (acquire),
+or combined (acquire+release).
+Emits GCC `__atomic_thread_fence()`.
 
 ---
 
 ### @unreachable(), @expect(val, expected)
 
-**DESCRIPTION** (D-Alpha-2, 2026-04-23)
-Control-flow hints for optimization. `@unreachable()` tells the compiler a
-code path cannot execute (undefined behavior if reached). `@expect(val, exp)`
-tells the compiler which value to expect for branch prediction.
+**DESCRIPTION**
+Control-flow hints. `@unreachable()` marks a path that cannot execute (UB if reached).
+`@expect(val, expected)` is a branch prediction hint; returns `val` unchanged.
 
-**SYNTAX**
+**EXAMPLE**
 ```zer
-if (@expect(valid, 1)) {
-    // fast path — compiler optimizes for this
-} else {
-    @unreachable();  // invalid case — never reached at runtime
-}
+if (@expect(valid, 1)) { }
+else { @unreachable(); }
 ```
-
-**NOTES**
-- `@unreachable()` emits `__builtin_unreachable()`. UB if reached.
-- `@expect(v, exp)` emits `__builtin_expect((long)v, (long)exp)`. Returns v.
-- Both are compile-time hints; no runtime overhead.
 
 ---
 
 ### @bswap16(x), @bswap32(x), @bswap64(x)
 
-**DESCRIPTION** (D-Alpha-2, 2026-04-23)
-Byte swap — reverse byte order. Useful for network/host byte order conversion.
+**DESCRIPTION**
+Byte swap — reverse byte order. For host/network byte order conversion.
+Emits GCC `__builtin_bswap*()`.
 
-**SYNTAX**
+**EXAMPLE**
 ```zer
-u16 net16 = @bswap16(host16);
-u32 net32 = @bswap32(host32);
-u64 net64 = @bswap64(host64);
+u32 net = @bswap32(host);
 ```
-
-**NOTES**
-- Emits GCC `__builtin_bswap{16,32,64}()`.
-- Width suffix in name matches input/output type width.
-- Portable — GCC handles per-arch implementation.
 
 ---
 
 ### @popcount(x), @ctz(x), @clz(x), @parity(x), @ffs(x)
 
-**DESCRIPTION** (D-Alpha-2, 2026-04-23)
+**DESCRIPTION**
 Bit query operations. All return `u32`.
+- `@popcount(x)` — count 1-bits
+- `@ctz(x)` — count trailing zeros (UB if x=0)
+- `@clz(x)` — count leading zeros (UB if x=0)
+- `@parity(x)` — 0=even / 1=odd
+- `@ffs(x)` — position of lowest 1-bit, 1-indexed (0 if x=0)
 
-| Intrinsic | Returns |
-|---|---|
-| `@popcount(x)` | Count of 1-bits |
-| `@ctz(x)` | Count trailing zeros (UB if x=0) |
-| `@clz(x)` | Count leading zeros (UB if x=0) |
-| `@parity(x)` | XOR of all bits (0 = even parity, 1 = odd) |
-| `@ffs(x)` | Position of lowest 1-bit, 1-indexed (0 if x=0) |
+Input must be integer. Width-dispatched (ll suffix for 64-bit inputs).
+Emits GCC `__builtin_*` / `__builtin_*ll`.
 
-**SYNTAX**
+---
+
+### @cpu_disable_int(), @cpu_enable_int(), @cpu_wait_int(), @cpu_save_int_state(), @cpu_restore_int_state(state)
+
+**DESCRIPTION**
+Privileged interrupt control. Per-arch inline asm (x86: cli/sti/hlt,
+ARM: cpsid/cpsie/wfi, RISC-V: csrci/csrsi/wfi).
+Faults with SIGSEGV in user mode — kernel code only.
+
+**EXAMPLE**
 ```zer
-u32 bits = @popcount(mask);    // bits set in mask
-u32 lowest = @ffs(bits);        // 1-indexed position
-u32 leading = @clz(value);       // leading zeros
-u32 trailing = @ctz(value);      // trailing zeros
-u32 par = @parity(value);        // even/odd
+u64 saved = @cpu_save_int_state();
+@cpu_disable_int();
+// critical section
+@cpu_restore_int_state(saved);
 ```
 
 **NOTES**
-- Width-dispatched: `__builtin_X` for u8/u16/u32 inputs, `__builtin_Xll` for u64.
-- Return type always u32 regardless of input width.
-- Input must be integer type.
+- For scope-bounded application code, prefer `@critical { body }`.
+- These intrinsics are for fine-grained kernel control.
 
 ---
 
@@ -1730,68 +1714,52 @@ f32 ratio = (f32)big;          // int → float value convert
 
 ---
 
-### Atomic Intrinsics (15 total, all SEQ_CST ordering)
+### @atomic_load, @atomic_store, @atomic_cas
 
 **DESCRIPTION**
-Atomic read-modify-write operations. Uses GCC `__atomic_*` builtins —
-portable across x86-64, ARM64, RISC-V without per-arch implementation.
-Value must be pointer to integer of 1, 2, 4, or 8 byte width.
+Atomic load, store, compare-and-swap. Sequential consistency.
+Uses GCC `__atomic_load_n` / `__atomic_store_n` / `__atomic_compare_exchange_n`.
 
-**Load / Store / CAS**
-
+**EXAMPLE**
 ```zer
-u32 val = @atomic_load(&shared);              // returns T
-@atomic_store(&shared, 42);                   // returns void
-bool swapped = @atomic_cas(&lock, 0, 1);      // returns bool (true if swap occurred)
+u32 val = @atomic_load(&shared);
+@atomic_store(&shared, 42);
+bool swapped = @atomic_cas(&lock, 0, 1);
 ```
 
-**Fetch-Old Variants (return value BEFORE operation)**
+---
 
+### @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor, @atomic_nand, @atomic_xchg
+
+**DESCRIPTION**
+Atomic read-modify-write. Returns value BEFORE the operation.
+`@atomic_xchg` swaps the value. All sequential consistency.
+
+**EXAMPLE**
 ```zer
-u32 old = @atomic_add(&counter, 1);           // old = counter (before add)
-u32 old = @atomic_sub(&counter, 1);
-u32 old = @atomic_or(&flags, 0x8);
-u32 old = @atomic_and(&flags, mask);
-u32 old = @atomic_xor(&flags, 0x2);
-u32 old = @atomic_nand(&flags, mask);         // D-Alpha-1, 2026-04-23
-u32 old = @atomic_xchg(&value, new_value);    // D-Alpha-1 — swap, returns old
+u32 old = @atomic_add(&counter, 1);
+u32 old_lock = @atomic_xchg(&lock, 1);
 ```
 
-**Fetch-New Variants (return value AFTER operation)** (D-Alpha-1, 2026-04-23)
+---
 
+### @atomic_add_fetch, @atomic_sub_fetch, @atomic_or_fetch, @atomic_and_fetch, @atomic_xor_fetch
+
+**DESCRIPTION**
+Atomic read-modify-write. Returns value AFTER the operation (new value).
+
+**EXAMPLE**
 ```zer
-u32 new_val = @atomic_add_fetch(&counter, 1);  // new_val = counter + 1
-u32 new_val = @atomic_sub_fetch(&counter, 1);
-u32 new_val = @atomic_or_fetch(&flags, 0x8);
-u32 new_val = @atomic_and_fetch(&flags, mask);
-u32 new_val = @atomic_xor_fetch(&flags, 0x2);
+u32 new_count = @atomic_add_fetch(&counter, 1);  // returns counter + 1
 ```
 
-**Restrictions (enforced by checker)**
+---
 
-- First argument must be `*shared T` where `T` is integer
-- Integer width must be 1, 2, 4, or 8 bytes (other widths rejected)
-- Cannot be on packed struct field (alignment mismatch — hard fault on ARM/RISC-V)
-- 64-bit atomics on 32-bit targets emit warning (libatomic dependency)
-
-**Ordering**
-
-Currently all atomics use `__ATOMIC_SEQ_CST` (sequential consistency).
-Explicit ordering parameter (relaxed/acquire/release/acq_rel/seq_cst) is
-a planned future enhancement — not yet available.
-
-**Use Cases**
-
-```zer
-// Lock-free counter (pre-increment):
-u32 new_count = @atomic_add_fetch(&counter, 1);
-
-// Spinlock acquire:
-while (@atomic_xchg(&lock, 1) != 0) { /* spin */ }
-
-// Bit clear via nand:
-@atomic_nand(&flags, ~KEEP_MASK);
-```
+**Atomic restrictions (all `@atomic_*` intrinsics):**
+- First argument must be `*shared T` where T is integer
+- Width must be 1, 2, 4, or 8 bytes
+- Not allowed on packed struct fields (alignment)
+- 64-bit atomics on 32-bit targets warn about libatomic dependency
 
 ---
 

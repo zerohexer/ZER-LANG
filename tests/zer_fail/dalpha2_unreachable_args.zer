@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @unreachable takes zero arguments
+
+i32 main() {
+    @unreachable(42);  // error: unreachable takes no args
+    return 0;
+}

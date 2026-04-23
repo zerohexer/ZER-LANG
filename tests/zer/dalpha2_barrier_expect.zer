@@ -1,0 +1,30 @@
+// Phase D-Alpha-2: barriers + branch hint + unreachable
+// @barrier_acq_rel, @expect, @unreachable
+// Note: @cpu_read_cycles tested separately — it's platform-sensitive.
+
+shared struct Data { u32 value; }
+
+Data shared_data;
+
+i32 main() {
+    shared_data.value = 42;
+
+    // barrier_acq_rel — full barrier; just verify it compiles and runs
+    @barrier_acq_rel();
+
+    u32 v = shared_data.value;
+
+    // expect — branch prediction hint (returns first arg unchanged)
+    if (@expect(v == 42, 1)) {
+        // expected path
+    } else {
+        @unreachable();  // compiler hint: unreachable
+    }
+
+    // expect with non-matching value (still works, just slower branch)
+    if (@expect(v == 99, 0)) {
+        return 1;
+    }
+
+    return 0;
+}

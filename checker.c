@@ -5772,10 +5772,62 @@ static Type *check_expr(Checker *c, Node *node) {
              * Checked at NODE_VAR_DECL init below — flag the node here. */
         } else if ((nlen == 7 && memcmp(name, "barrier", 7) == 0) ||
                    (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||
-                   (nlen == 12 && memcmp(name, "barrier_load", 12) == 0)) {
+                   (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) ||
+                   (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0)) {
+            /* D-Alpha-2: + @barrier_acq_rel (acquire + release fence) */
             result = ty_void;
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             result = ty_void;
+        } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {
+            /* D-Alpha-2: @unreachable() — GCC's __builtin_unreachable hint */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@unreachable takes no arguments");
+            }
+            result = ty_void;
+        } else if (nlen == 6 && memcmp(name, "expect", 6) == 0) {
+            /* D-Alpha-2: @expect(cond, expected) — branch prediction hint */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@expect requires 2 arguments (value, expected)");
+                result = ty_i64;
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt) && vt->kind != TYPE_BOOL) {
+                    checker_error(c, node->loc.line, "@expect first argument must be integer or bool");
+                }
+                result = vt ? vt : ty_i64;
+            }
+        } else if ((nlen == 7 && memcmp(name, "bswap16", 7) == 0) ||
+                   (nlen == 7 && memcmp(name, "bswap32", 7) == 0) ||
+                   (nlen == 7 && memcmp(name, "bswap64", 7) == 0)) {
+            /* D-Alpha-2: @bswap{16,32,64}(x) — byte swap */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                }
+            }
+            /* Return type matches width suffix */
+            if (name[5] == '1' && name[6] == '6') result = ty_u16;
+            else if (name[5] == '3' && name[6] == '2') result = ty_u32;
+            else result = ty_u64;
+        } else if ((nlen == 8 && memcmp(name, "popcount", 8) == 0) ||
+                   (nlen == 3 && memcmp(name, "ctz", 3) == 0) ||
+                   (nlen == 3 && memcmp(name, "clz", 3) == 0) ||
+                   (nlen == 6 && memcmp(name, "parity", 6) == 0) ||
+                   (nlen == 3 && memcmp(name, "ffs", 3) == 0)) {
+            /* D-Alpha-2: @popcount/@ctz/@clz/@parity/@ffs(x) — bit queries */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument", (int)nlen, name);
+                result = ty_u32;
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                }
+                result = ty_u32;
+            }
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             /* @probe(addr) → ?u32: try reading MMIO address, null if faults */
             if (node->intrinsic.arg_count != 1) {

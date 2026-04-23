@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// @cpu_restore_int_state argument must be integer
+
+struct S { u32 x; }
+
+i32 main() {
+    S s = { .x = 1 };
+    @cpu_restore_int_state(s);  // error: struct, not integer
+    return 0;
+}

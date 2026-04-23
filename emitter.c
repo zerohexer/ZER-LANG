@@ -5883,6 +5883,80 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {
             /* D-Alpha-2: GCC unreachable hint (undefined behavior if reached) */
             emit(e, "__builtin_unreachable()");
+        } else if (nlen == 15 && memcmp(name, "cpu_disable_int", 15) == 0) {
+            /* D-Alpha-3: disable interrupts. Per-arch via preprocessor. Privileged op. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"cli\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH) || defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"cpsid i\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrci mstatus, 8\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "cpu_enable_int", 14) == 0) {
+            /* D-Alpha-3: enable interrupts. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"sti\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH) || defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"cpsie i\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrsi mstatus, 8\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_wait_int", 12) == 0) {
+            /* D-Alpha-3: halt/wait until next interrupt. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__) || defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"hlt\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH) || defined(__aarch64__) || defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"wfi\" ::: \"memory\");\n"
+                "#else\n"
+                "    /* no-op fallback */\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 18 && memcmp(name, "cpu_save_int_state", 18) == 0) {
+            /* D-Alpha-3: save current interrupt flag state. Returns u64. */
+            emit(e, "({ uint64_t _zer_istate = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"pushfq; popq %0\" : \"=r\"(_zer_istate) :: \"memory\");\n"
+                "#elif defined(__i386__)\n"
+                "    __asm__ __volatile__ (\"pushfl; popl %0\" : \"=r\"(_zer_istate) :: \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %0, daif\" : \"=r\"(_zer_istate) :: \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    { uint32_t _zer_p; __asm__ __volatile__ (\"mrs %0, primask\" : \"=r\"(_zer_p) :: \"memory\"); _zer_istate = _zer_p; }\n"
+                "#elif defined(__riscv)\n"
+                "    { unsigned long _zer_m; __asm__ __volatile__ (\"csrr %0, mstatus\" : \"=r\"(_zer_m) :: \"memory\"); _zer_istate = _zer_m; }\n"
+                "#else\n"
+                "    _zer_istate = 0;\n"
+                "#endif\n"
+                "_zer_istate; })");
+        } else if (nlen == 21 && memcmp(name, "cpu_restore_int_state", 21) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-3: restore interrupt flag state from saved value. */
+            emit(e, "({ uint64_t _zer_rstate = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"pushq %0; popfq\" :: \"r\"(_zer_rstate) : \"memory\", \"cc\");\n"
+                "#elif defined(__i386__)\n"
+                "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"pushl %0; popfl\" :: \"r\"(_zer_r32) : \"memory\", \"cc\"); }\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr daif, %0\" :: \"r\"(_zer_rstate) : \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr primask, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
+                "#elif defined(__riscv)\n"
+                "    { unsigned long _zer_m = (unsigned long)_zer_rstate; __asm__ __volatile__ (\"csrw mstatus, %0\" :: \"r\"(_zer_m) : \"memory\"); }\n"
+                "#else\n"
+                "    (void)_zer_rstate;\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 6 && memcmp(name, "expect", 6) == 0 && node->intrinsic.arg_count >= 2) {
             /* D-Alpha-2: branch prediction hint */
             emit(e, "__builtin_expect((long)(");

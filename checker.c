@@ -5784,6 +5784,33 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@unreachable takes no arguments");
             }
             result = ty_void;
+        } else if ((nlen == 15 && memcmp(name, "cpu_disable_int", 15) == 0) ||
+                   (nlen == 14 && memcmp(name, "cpu_enable_int", 14) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_wait_int", 12) == 0)) {
+            /* D-Alpha-3: interrupt control (0-arg intrinsics, return void).
+             * Privileged instructions — compile fine but cause SIGSEGV in user mode.
+             * Per-arch asm in emitter with #if defined dispatch (same pattern as @critical). */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if (nlen == 18 && memcmp(name, "cpu_save_int_state", 18) == 0) {
+            /* D-Alpha-3: @cpu_save_int_state() -> u64 (read flags register) */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@cpu_save_int_state takes no arguments");
+            }
+            result = ty_u64;
+        } else if (nlen == 21 && memcmp(name, "cpu_restore_int_state", 21) == 0) {
+            /* D-Alpha-3: @cpu_restore_int_state(state) — restore flags register */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@cpu_restore_int_state requires 1 argument (state value)");
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@cpu_restore_int_state argument must be integer");
+                }
+            }
+            result = ty_void;
         } else if (nlen == 6 && memcmp(name, "expect", 6) == 0) {
             /* D-Alpha-2: @expect(cond, expected) — branch prediction hint */
             if (node->intrinsic.arg_count != 2) {

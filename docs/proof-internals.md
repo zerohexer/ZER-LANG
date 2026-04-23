@@ -1634,3 +1634,132 @@ eapply step_deref. exact Hlook.
 - **Every `.v` file has a header comment** explaining Phase + what it delivers.
 - **Section A row count in `safety_list.md` matches proven lemmas** — update when closing rows.
 - **No modification to `model*.v`** — design-level proofs are frozen at commit `000064d`.
+
+---
+
+## Keyword-agnostic structural predicates (2026-04-23 lesson)
+
+**When renaming a parser keyword, Phase 1 predicates do NOT need re-verification** if the predicate checks a structural context flag (e.g., `in_naked`, `in_loop`, `in_critical`, `defer_depth`) rather than the keyword's spelling.
+
+### Example: `unsafe asm` rename (2026-04-23)
+
+The `asm(...)` keyword was renamed to `unsafe asm(...)` to match Rust's explicit-unsafe pattern. Phase 1 predicate:
+
+```c
+/* src/safety/context_bans.c */
+int zer_asm_allowed_in_context(int in_naked) {
+    if (in_naked != 0) { return 1; }
+    return 0;
+}
+```
+
+VST spec in `proofs/vst/verif_context_bans.v` defines the Coq semantics of this function. It checks the context flag, not the keyword.
+
+Result: renaming `asm` → `unsafe asm` at the parser level required ZERO changes to `context_bans.c` or `verif_context_bans.v`. Phase 1 stayed at 85/85 predicates, zero admits. VST proof holds unchanged.
+
+### When does a predicate need re-verification?
+
+A predicate needs re-verification if ANY of:
+
+1. **The predicate's function signature changes** (new param, changed return)
+2. **The predicate's behavior changes** (different answer for the same inputs)
+3. **The predicate's Coq spec changes** (different semantic claim)
+4. **A caller adds/removes a call site that the predicate's assumptions depend on**
+
+A predicate does NOT need re-verification if:
+
+1. **The call site syntax changes** but the predicate inputs stay the same
+2. **A new keyword aliases an old one** (e.g., `unsafe asm` → same `TOK_ASM` path → same `in_naked` check)
+3. **The error message changes** (pure cosmetic)
+
+### How to verify a predicate is keyword-agnostic
+
+Before a parser-level rename, grep the predicate's implementation for the old keyword:
+
+```bash
+grep "asm\|ASM" src/safety/context_bans.c
+```
+
+If the keyword appears only in COMMENTS (not in logic), the predicate is keyword-agnostic. If it appears in conditions or state lookups, re-verify.
+
+### Parser-level changes that are always safe
+
+These never require Phase 1 re-verification:
+
+- Renaming a keyword (e.g., `asm` → `unsafe asm`)
+- Adding a new keyword alias (e.g., both `asm` and `unsafe asm` accept)
+- Changing error messages
+- Changing parser-internal state names
+
+These MAY require re-verification:
+
+- Adding a new context flag (e.g., `in_vale_block`) that predicates should check
+- Removing a context flag that predicates depend on
+- Changing how a flag is set (e.g., `in_naked` set at different AST nodes)
+
+### Test: after a rename, predicate tests must still pass
+
+The test suite for a predicate is the VST spec + `.v` file. Running
+`make check-vst` must complete without changes. If it fails, the
+rename accidentally broke the predicate's assumption and you need to
+understand why.
+
+For `unsafe asm` rename 2026-04-23: `make check-vst` passed unchanged.
+Confirmed keyword-agnostic.
+
+---
+
+## Phase D-Alpha and future proof integration (D-Beta, post-Phase-7)
+
+D-Alpha is implementation-first (2026-04-23 decision). Intrinsics ship
+without formal proofs — tests validate behavior. D-Beta adds proofs
+later once Phase 7 (operational deepening) is complete.
+
+### What proofs will be added in D-Beta
+
+For each of the 96 intrinsics:
+
+1. **Coq specification** (`src/safety/intrinsics_*.v`): defines the
+   semantic contract of the intrinsic (what it computes, memory
+   effects, error conditions).
+
+2. **VST proof** (`proofs/vst/verif_intrinsics_*.v`): proves the
+   emitter's inline asm or GCC builtin call satisfies the spec.
+
+3. **Iris Hoare logic** (for async-context-sensitive intrinsics):
+   proves compositional safety when intrinsics are used inside
+   complex control flow.
+
+### Design constraint for D-Alpha implementation (forward-looking)
+
+When implementing D-Alpha intrinsics, the emitted C should be
+**proof-friendly** for D-Beta:
+
+1. **One intrinsic = one GCC builtin OR one inline asm block** (no
+   macro expansions that confuse Sail parsing).
+
+2. **Operands go through `emit_rewritten_node`** (preserves type
+   tracking for Coq spec generation).
+
+3. **Error conditions caught in checker, not emitter** (checker errors
+   leave a clear compile-time trail; emitter-level errors are harder
+   to prove about).
+
+4. **No hidden state** (no emitter-private variables that the Coq spec
+   would need to model).
+
+D-Alpha-1 and D-Alpha-2 both follow these constraints. Future
+batches (D-Alpha-3 through D-Alpha-7) should continue the pattern.
+
+### Proof tiers for intrinsics (D-Beta plan)
+
+Not all intrinsics need full Hoare logic:
+
+| Tier | Method | Intrinsics covered |
+|---|---|---|
+| Tier 1 (full Hoare logic) | Iris + VST | Context switch, MMU, interrupts (~30%) |
+| Tier 2 (structural + tests) | VST + unit tests | Atomics, barriers, cache ops (~50%) |
+| Tier 3 (inspection) | Code review + tests | cpuid, rdtsc, pure reads (~20%) |
+
+Weighted cost: ~52% of full-formal. This is captured in the budget
+breakdown in `docs/asm_plan.md`.

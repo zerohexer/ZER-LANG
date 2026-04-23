@@ -191,14 +191,56 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 @inttoptr(*T, addr)      integer to pointer (mmio-range-validated if ranges declared)
 @ptrtoint(ptr)           pointer to integer (usize)
 @ptrcast(*T, ptr)        pointer type cast (provenance-tracked, qualifier-checked)
-@barrier()               full memory barrier
-@barrier_store()         store barrier
-@barrier_load()          load barrier
+@barrier()               full memory barrier (seq_cst)
+@barrier_store()         store barrier (release)
+@barrier_load()          load barrier (acquire)
+@barrier_acq_rel()       acquire+release fence            [D-Alpha-2]
 @offset(T, field)        offsetof
 @container(*T, ptr, f)   container_of (field-validated, provenance-tracked)
 @trap()                  crash intentionally
 @probe(addr)             safe MMIO read — returns ?u32, null if address faults
+@unreachable()           GCC unreachable hint (UB if reached)  [D-Alpha-2]
+@expect(val, expected)   branch prediction hint                [D-Alpha-2]
 ```
+
+### Atomic Intrinsics (15, all SEQ_CST ordering)
+```
+# Load / store / cas:
+@atomic_load(*T) -> T
+@atomic_store(*T, val)
+@atomic_cas(*T, expected, desired) -> bool
+
+# Fetch-old (returns value BEFORE op):
+@atomic_add(*T, val) -> T          # existing
+@atomic_sub(*T, val) -> T
+@atomic_or(*T, val) -> T
+@atomic_and(*T, val) -> T
+@atomic_xor(*T, val) -> T
+@atomic_nand(*T, val) -> T         [D-Alpha-1]
+@atomic_xchg(*T, val) -> T         [D-Alpha-1] swap, returns old
+
+# Fetch-new (returns value AFTER op):
+@atomic_add_fetch(*T, val) -> T    [D-Alpha-1]
+@atomic_sub_fetch(*T, val) -> T    [D-Alpha-1]
+@atomic_or_fetch(*T, val) -> T     [D-Alpha-1]
+@atomic_and_fetch(*T, val) -> T    [D-Alpha-1]
+@atomic_xor_fetch(*T, val) -> T    [D-Alpha-1]
+```
+All atomics: first arg must be `*shared T` where T is integer of width 1/2/4/8 bytes.
+Ordering parameter (relaxed/acquire/release/acq_rel/seq_cst) deferred to later batch.
+
+### Bit Query / Byte Swap Intrinsics (D-Alpha-2)
+```
+@bswap16(u16) -> u16     byte swap
+@bswap32(u32) -> u32
+@bswap64(u64) -> u64
+@popcount(x) -> u32      count 1 bits  (dispatches on u32 vs u64 width)
+@ctz(x) -> u32           count trailing zeros
+@clz(x) -> u32           count leading zeros
+@parity(x) -> u32        0=even / 1=odd parity
+@ffs(x) -> u32           find first set bit, 1-indexed (0 if input is 0)
+```
+All use GCC builtins — auto-port to x86-64/ARM64/RISC-V without per-arch work.
 
 ### mmio Declaration (MANDATORY for @inttoptr)
 ```
@@ -882,7 +924,8 @@ ZER SYNTAX RULES (not C — these differ):
 - async void func() { yield; await cond; } = stackless coroutine
 - _zer_async_NAME type, _zer_async_NAME_init(&task), _zer_async_NAME_poll(&task)
 - Ring(T, N) = circular buffer channel (T must be struct name, push/pop)
-- @atomic_load/store/add/sub/or/and/xor/cas for atomics
+- @atomic_load/store/cas + @atomic_{add,sub,or,and,xor,nand,xchg} (fetch-old) + @atomic_{add,sub,or,and,xor}_fetch (fetch-new). All SEQ_CST.
+- Bit queries: @popcount, @ctz, @clz, @parity, @ffs (return u32). Byte swap: @bswap16/32/64. Control-flow hints: @unreachable(), @expect(val, exp). Full barrier: @barrier_acq_rel().
 - No malloc/free — use Pool(T, N), Slab(T), Arena
 - move struct Name { } = ownership transfer on pass/assign, use after move = error
 - container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)

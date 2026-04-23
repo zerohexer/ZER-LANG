@@ -8,6 +8,8 @@
 - Sail cannot generate asm code (web search confirmed). Removed "Sail codegen" as a shortcut.
 - Islaris covers ARM64 + RISC-V only, single-threaded. x86 verification requires custom framework build-out.
 - **IMPLEMENTATION-FIRST DECISION (2026-04-23 evening):** Intrinsic IMPLEMENTATION is decoupled from Phase 2-7 prereq. Phase D split into D-Alpha (implementation, no formal proofs) and D-Beta (verification layer added later). This matches how seL4/CompCert/Vale were actually built — code first, proofs iteratively. Users can ship pure-ZER kernels ~1-2 years earlier. See "Implementation-First Plan (Phase D-Alpha)" section below.
+- **LINUX-SCALE EXPANSION (2026-04-23 late evening):** Target scope upgraded from 96 → **130 intrinsics** covering what Linux kernel arch/ uses. Explicitly out-of-scope: hypervisor (VMX/SVM/ARM-virt), enclaves (SGX/TDX/TrustZone), model-specific performance counters, Cortex-M (v1.1). These are handled via hardened `unsafe asm` escape hatch (see "Hardened `unsafe asm`" section).
+- **HARDENED `unsafe asm` (planned D-Alpha-7.5):** Upgrade from raw GCC inline asm pass-through to Rust-tier typed operands + clobber validation + mandatory safety docs + audit emission. Makes "vendor-specific via unsafe asm" actually safe, unlocking all modern CPU features (TDX, MTE, PAC, CET, future extensions) without needing dedicated intrinsics per feature.
 
 **Related docs:**
 - `docs/ASM_ZER-LANG.md` — earlier (2026-04-01) asm research (context switch, boot, atomics design). That was the foundation; this is the formal verification plan built on top.
@@ -19,13 +21,13 @@
 
 ## Executive Summary
 
-**Goal:** Achieve 100% formally verified asm coverage across x86-64, ARM64, and RISC-V for ZER's target domain (OS kernels, RTOSes, application-class embedded firmware).
+**Goal:** Achieve 100% formally verified asm coverage at Linux-kernel scale across x86-64, ARM64, and RISC-V for ZER's target domain (OS kernels, RTOSes, application-class embedded firmware). Vendor-specific code (SGX, TDX, TrustZone, etc.) uses hardened `unsafe asm`.
 
 **Budget:** ~5,000 hours total, committed by the user.
 
-**Approach:** Discourage user-written asm via explicit `unsafe asm` marker; users prefer verified intrinsics. Provide 96 intrinsics (API surface); ~180 proofs across 3 architectures. Use GCC as the assembler (no new toolchain). Runtime code generation (JIT, live patching) is blocked by ZER's existing type system, not by asm rules.
+**Approach:** Provide **130 intrinsics** for Linux-scale kernel features; hardened `unsafe asm` as typed escape hatch for vendor-specific code. Use GCC as the assembler (no new toolchain). Runtime code generation (JIT, live patching) is blocked by ZER's existing type system, not by asm rules.
 
-**Revised effort with 3-arch scope + 7 shortcuts:** ~2,850 hours for asm verification + 900 hrs prerequisite (Phases 2-7) = **3,750 hours**. Leaves **~1,250 hours surplus** for crypto/certification/Cortex-M-later.
+**Revised effort with 3-arch scope + 7 shortcuts + hardened unsafe asm:** ~3,100 hours for asm verification + 900 hrs prerequisite (Phases 2-7) = **4,000 hours**. Leaves **~1,000 hours surplus** for crypto/certification/Cortex-M-later.
 
 **Architectures (priority order):**
 1. x86-64 — servers, desktops, laptops (Intel/AMD)
@@ -694,6 +696,146 @@ Estimated savings from prior-art reuse: **400-600 hrs** over the 4-arch project.
 
 ---
 
+## Linux-Scale Expansion (2026-04-23 late evening)
+
+**User goal restated:** ship at Linux-kernel scale (~130 intrinsics covering what Linux arch/ uses). Vendor-specific features (SGX, TDX, TrustZone, MTE, PAC, future extensions) handled via hardened `unsafe asm` — not dedicated intrinsics.
+
+### From 96 → 130 intrinsics
+
+Earlier sections of this doc describe the "96 intrinsics" plan. That was the MVP scope. The Linux-scale plan expands to **130** by adding:
+
+| Group | Added | What it unlocks |
+|---|---|---|
+| Critical multi-core (8) | pause, cpu_id, wfe, sev, breakpoint, rdrand, rdseed, barrier_dma | Spinlocks, per-CPU data, ARM event signaling, hardware RNG |
+| Nice-to-have (6) | time_ns, cache_zero_line, get_pc, wait_on_addr, supports_feature, flush_pipeline | Monotonic time, cache ops, CPU feature detection |
+| Linux-scale x86 (20) | fsbase/gsbase R/W (4), port I/O (6), xsave/xrstor (2), dr R/W (2), syscall entry/return (2), sbi_call, smc_call, hvc_call, clflushopt/clwb (2), nt_store | Thread-local storage, legacy devices, AVX-512 FPU, hardware breakpoints, syscall optimization, ARM/RISC-V platform firmware calls |
+| **Total additions** | **34** | Linux-scale kernel parity |
+
+New total surface: **96 + 34 = 130 intrinsics.**
+
+### Out-of-scope (explicit, handled via hardened `unsafe asm`)
+
+These are intentionally NOT dedicated intrinsics:
+
+| Category | Why excluded | How users access |
+|---|---|---|
+| Hypervisor (VMX/SVM/ARM-virt, ~15-20 ops) | Distinct subsystem; each instruction has complex state dependencies | Hardened `unsafe asm` or separate D-Beta-hypervisor batch |
+| Intel SGX / TDX / AMD SEV (~10-15 each) | Enclave-specific, rare, rapidly evolving | Hardened `unsafe asm` (typed operands + clobber tracking) |
+| ARM TrustZone SMC details | Vendor-specific ABIs | `@cpu_smc_call` intrinsic + hardened `unsafe asm` for unusual ABIs |
+| Debug registers (DR0-DR7, DBGBCR) beyond basic R/W | Per-model configuration | Hardened `unsafe asm` |
+| Performance counters (PMC/PMU) | Model-specific identifiers | OS perf subsystem via MSR reads |
+| 128-bit atomic CAS (cmpxchg16b) | Rarely needed | Two 64-bit CAS + retry loop |
+| FPU control/status registers | Niche for numeric kernels | Hardened `unsafe asm` |
+| Cortex-M specific (MPU, NVIC) | Post-v1.0 per scope plan | Add in v1.1 |
+| SIMD / vector operations | Compiler-generated via GCC vector types | Use `gcc_extension_ok` equivalent, separate from intrinsics |
+
+Rationale: dedicated intrinsics for every vendor feature = long tail that never converges. Hardened `unsafe asm` handles this elegantly with Rust-tier safety (typed operands, explicit clobbers, mandatory docs).
+
+### Hardened `unsafe asm` (the escape hatch)
+
+**Current state (from earlier section):** `unsafe asm` is a raw pass-through to GCC inline asm. No operand typing, no clobber validation, restricted to `naked` functions, mandatory `unsafe` keyword per Phase 1 rule.
+
+**Target state (D-Alpha-7.5 — NEW BATCH):** upgrade to Rust-tier typed escape hatch.
+
+**Seven hardening features (H1-H7):**
+
+| # | Feature | Example | Value |
+|---|---|---|---|
+| H1 | Structured operand syntax (inputs/outputs/clobbers blocks) | See below | Compiler knows what's read/written |
+| H2 | Typed operands (ZER type at each register binding) | `"rax" = u64` | Boundary type safety |
+| H3 | Required `safety:` string literal | `safety: "TDX call per Intel §3.2.1"` | Forces documentation |
+| H4 | Explicit clobber list with validation | `clobbers: ["rbx", "memory"]` | Register names validated per arch |
+| H5 | Allowed inside `unsafe fn` (not just naked) | `unsafe fn foo() { unsafe asm { ... } }` | Opens non-naked contexts |
+| H6 | `@asm_register_valid(arch, name)` checker predicate | Phase 1 verifiable | "rbx is valid x86-64 register" |
+| H7 | Audit emission: compiler writes `build/asm_audit.log` | `grep "unsafe asm" src/` + audit log | Full auditability |
+
+**Example — Intel TDX guest call (currently impossible to write safely):**
+
+Current (raw, unsafe):
+```zer
+naked fn tdg_vp_info() {
+    unsafe asm("movq $1, %rax; tdcall");
+    /* How does caller get RAX return? Can't safely. */
+}
+```
+
+After H1-H7 (Rust-tier safe):
+```zer
+fn tdg_vp_info(u64 subfunc) -> u64 {
+    u64 result;
+    unsafe asm {
+        instructions: "tdcall"
+        inputs: { "rax" = 1, "rcx" = subfunc }
+        outputs: { "rax" = result }
+        clobbers: ["rdx", "r8", "r9", "r10", "memory"]
+        safety: "Intel TDX vp_info per TDX Module Spec v1.0 §7.2.2"
+    };
+    return result;
+}
+```
+
+Compiler checks:
+- `"rax"` is a valid x86-64 register (per arch register table)
+- `subfunc` is u64 (matches rcx binding width)
+- `result` is mutable lvalue (valid output target)
+- Memory clobber present → compiler won't reorder loads/stores around
+- Safety comment present → audit log entry emitted
+
+This unlocks **all modern CPU features** (TDX, SGX, MTE, PAC, CET, CHERI, future extensions) with real safety without needing a dedicated intrinsic per feature.
+
+### Revised batch roadmap (14 batches for 130 intrinsics)
+
+Progress: 44 of 130 shipped (34%).
+
+| Batch | Count | Scope | Status |
+|---|---|---|---|
+| D-Alpha-1 | 15 | Atomics | **DONE** (2e152f3) |
+| D-Alpha-2 | 10 | Barriers + bit queries | **DONE** (a14d3c0) |
+| D-Alpha-3 | 5 | Interrupt control | **DONE** (3e6e2f2) |
+| D-Alpha-4 | 4 | Context switch | **DONE** (e2f45af) |
+| D-Alpha-5 | 10 | MMU control | **DONE** (94f958b) |
+| D-Alpha-6 | 11 | TLB + cache (incl. cache_zero_line) | Pending |
+| D-Alpha-7 | 8 | Critical multi-core (pause, cpu_id, wfe, sev, breakpoint, rdrand, rdseed, barrier_dma) | Pending |
+| **D-Alpha-7.5** | **—** | **Hardened `unsafe asm` (H1-H7 infrastructure, not intrinsics count)** | **Pending — NEW** |
+| D-Alpha-8 | 6 | Nice-to-have (time_ns, get_pc, wait_on_addr, supports_feature, flush_pipeline, cpu_yield) | Pending |
+| D-Alpha-9 | 10 | MSR/CSR access (includes per-arch R/W pair) | Pending |
+| D-Alpha-10 | 10 | Inspection + cycle counter | Pending |
+| D-Alpha-11 | 5 | Power management | Pending |
+| D-Alpha-12 | 6 | Privileged transitions (syscall entry/return, mode switch) | Pending |
+| D-Alpha-13 | 20 | Linux-scale x86 essentials (fsbase/gsbase, port I/O, xsave, dr regs, clflushopt/clwb, nt_store, sbi_call, smc_call, hvc_call) | Pending |
+| D-Alpha-14 | 10 | Misc (remaining helpers, final polish) | Pending |
+| **Total** | **130** | | **44 / 130 (34%)** |
+
+**v1.1 additions (post-v1.0):**
+- D-Alpha-15: 6 security intrinsics (PAC, MTE, CET) → 136
+- D-Alpha-16: 10 Cortex-M (MPU, NVIC) → 146
+- D-Alpha-Hyp: ~20 hypervisor (VMX/SVM/ARM-virt) → ~166
+
+### Effort impact on 5K budget
+
+| Phase | Old budget | New budget |
+|---|---|---|
+| Phase 0: Prereq (Phases 2-7) | 900 | 900 |
+| Phase A: Core infra | 500 | 500 |
+| Phase B: ISA coverage | 400 | 400 |
+| Phase C: Advanced semantics | 350 | 400 (+50 for register-set modeling) |
+| Phase D-Alpha: Implement 130 intrinsics | — | 1,700 (was 1,400 for 96) |
+| **Hardened `unsafe asm` (D-Alpha-7.5)** | — | **120** |
+| Phase D-Beta: Formal proofs | 1,400 | 1,500 (for 130 intrinsics) |
+| Phase E: Polish + cert | 200 | 200 |
+| **Total** | 3,750 | **4,720** |
+| Surplus (of 5K) | 1,250 | **280** |
+
+Budget tighter but fits. Surplus reserved for Cortex-M (v1.1, ~300 hrs) which would push total over 5K — explicit v1.1 scope decision.
+
+### Updated v1.0 claim
+
+> "ZER ships 130 formally verified intrinsics per architecture (x86-64, ARM64, RISC-V) covering what the Linux kernel arch/ subsystem needs. Vendor-specific and specialized-extension code (hypervisor, enclaves, memory tagging, pointer authentication, CHERI, future extensions) is handled via hardened `unsafe asm` with Rust-tier typed operands, explicit clobber lists, and mandatory safety documentation. Full formal verification in D-Beta phase."
+
+Strongest claim of any memory-safe systems language targeting Linux-scale work.
+
+---
+
 ## Implementation-First Plan (Phase D-Alpha) — REVISED 2026-04-23 evening
 
 **Previous recommendation (verify-first) was overridden.** Implementation of intrinsics is decoupled from Phase 2-7 prereq. Working intrinsics ship first; formal proofs added later (Phase D-Beta).
@@ -883,23 +1025,35 @@ After D-Alpha x86-64 complete:
 
 ---
 
-## Immediate Next Step (IMPORTANT — REVISED 2026-04-23 evening)
+## Immediate Next Step (IMPORTANT — REVISED 2026-04-23 late evening)
 
-**Start Phase D-Alpha Batch 1: 15 atomic intrinsics for x86-64.**
+**Current progress:** 44 of 130 intrinsics shipped (34%).
 
-Concrete work items for first session:
-1. Design `Ordering` enum (5 values: relaxed/acquire/release/acq_rel/seq_cst)
-2. Add `TOK_AT_ATOMIC_*` recognition to lexer (or generic intrinsic dispatch)
-3. Parser: recognize `@atomic_*(ptr, val, ordering)` call syntax
-4. Checker: validate `*shared T` pointer, integer width, ordering constant
-5. Emitter: emit `__atomic_*(...)` GCC builtin with correct `__ATOMIC_*` ordering constant
-6. First 3 intrinsics: `@atomic_load`, `@atomic_store`, `@atomic_fetch_add` (enough to validate pattern)
-7. Tests: 3 positive + 3 negative per intrinsic
-8. Extend to all 15 atomics once pattern works
+**Recommended next action:** D-Alpha-7 (Critical multi-core, 8 intrinsics) BEFORE D-Alpha-6 (TLB+cache).
 
-Estimated time: 50-80 hours (split across multiple sessions).
+Rationale: `@cpu_pause`, `@cpu_id`, `@cpu_wfe`, `@cpu_sev`, `@cpu_breakpoint`, `@cpu_rdrand`, `@cpu_rdseed`, `@barrier_dma` are foundational for multi-core kernels. Any real kernel needs spinlock support (`pause` + `wait_on_addr`) before it needs cache maintenance. Swap batch order.
+
+Suggested sequence:
+1. **D-Alpha-7** — critical multi-core (8 intrinsics, ~50 hrs)
+2. **D-Alpha-7.5** — hardened `unsafe asm` (H1-H7 infrastructure, ~120 hrs) ← STRATEGIC
+3. **D-Alpha-6** — TLB + cache (11 intrinsics, ~80 hrs)
+4. **D-Alpha-8** — nice-to-have (6 intrinsics, ~40 hrs)
+5. **D-Alpha-9 through D-Alpha-14** — MSR/CSR, inspection, power, privileged, Linux-scale, misc
 
 **Phase 2 work continues independently** when user has appetite. The two tracks don't gate each other.
+
+### Why D-Alpha-7.5 (hardened `unsafe asm`) is strategic
+
+Once H1-H7 land, users can write ANY vendor-specific code safely:
+- Intel TDX/SGX (enclaves)
+- AMD SEV (memory encryption)
+- ARM TrustZone SMC (secure monitor)
+- ARM MTE (memory tagging)
+- ARM PAC (pointer authentication)
+- RISC-V CHERI (capability machine)
+- Future extensions (whatever ships next)
+
+Without H1-H7, every new CPU feature requires a dedicated intrinsic in the compiler. With H1-H7, users write typed `unsafe asm` once. Same safety as Rust, same flexibility.
 
 ### What was the old plan (kept for historical context)
 
@@ -1037,20 +1191,23 @@ Summary of the conversation that led to this plan:
 |---|---|
 | Do we write a new assembler? | No. GCC is the assembler. Always was. |
 | Do we ban user asm? | No — kept as explicit escape hatch. `unsafe asm(...)` REQUIRED (bare `asm` rejected). Restricted to `naked` fns. Users prefer intrinsics. |
-| How do users write low-level code? | Via 96 verified intrinsics (same API surface on every arch). |
-| Does this cover 100% of asm? | Yes, for ahead-of-time-compiled code in target domain. |
+| How do users write low-level code? | Via **130 verified intrinsics** + hardened `unsafe asm` for vendor-specific. |
+| Does this cover Linux-scale? | **Yes.** 130 intrinsics cover Linux kernel arch/ needs. Vendor-specific (SGX, TDX, TrustZone, MTE, PAC, CHERI) via hardened `unsafe asm`. |
 | Which archs initially? | **x86-64, ARM64, RISC-V** (3 archs for v1.0). |
-| Do we manually port ZER to each arch? | No. GCC auto-ports pure ZER code + 28 GCC-builtin intrinsics. Rest need per-arch asm strings. |
-| How many intrinsics total? | **96 unique intrinsics** (API surface). |
-| How many specs + proofs? | **96 specs + 180 proofs** (28 shared GCC + 126 cross-arch × 3 + 26 mono-arch). |
-| Can we ship one arch at a time? | Yes. x86-64 first (~650 hrs), then ARM64 (~450), then RISC-V (~350). |
-| What about Cortex-M? | **Not in v1.0.** Added as v1.1 (~300 hrs from surplus). |
+| Do we manually port ZER to each arch? | No. GCC auto-ports pure ZER code + ~40 GCC-builtin intrinsics. Rest need per-arch asm strings. |
+| How many intrinsics total? | **130** for v1.0 (was 96 MVP plan). |
+| How many specs + proofs? | **130 specs + ~240 proofs** (scaled from 96 baseline). |
+| What's hardened `unsafe asm`? | Typed operands (inputs/outputs/clobbers blocks), explicit register validation, mandatory safety docs, audit emission. Rust-tier safety without per-feature intrinsic bloat. |
+| Can we ship one arch at a time? | Yes. x86-64 first, then ARM64, then RISC-V. |
+| What about Cortex-M? | **Not in v1.0.** Added as v1.1 (~300 hrs, +10 intrinsics → 140 total). |
+| What about hypervisor/SGX/TDX? | v1.1+ scope OR handled via hardened `unsafe asm`. Not dedicated intrinsics. |
 | What about JIT compilers? | Blocked by type system (not asm rules). `cinclude` for users who need JIT. |
-| What's the budget? | **~3,750 hrs committed (out of 5K). 1,250 hr surplus.** |
-| What's the surplus for? | Cortex-M v1.1 + crypto Vale-tier + DO-178C cert artifacts. |
+| What's the budget? | **~4,720 hrs committed (out of 5K). 280 hr surplus.** |
+| What's the surplus for? | Risk buffer + future crypto Vale-tier + cert artifacts. Cortex-M deferred to explicit v1.1. |
 | What's the calendar? | 5 years half-time, 2.5 years full-time. |
-| What's the first step? | **Phase D-Alpha Batch 1: 15 atomic intrinsics for x86-64.** Phase 2 continues in parallel when desired. |
-| When does asm implementation start? | **NOW.** Decoupled from Phase 2-7 (2026-04-23 decision). Implementation-first. |
+| What's the first step? | **Next batch: D-Alpha-7 (8 critical multi-core intrinsics).** After that: D-Alpha-7.5 (hardened unsafe asm, strategic). |
+| Current progress? | **44 of 130 intrinsics shipped (34%).** D-Alpha-1 through D-Alpha-5 done. |
+| When does asm implementation start? | **STARTED 2026-04-23.** 5 batches shipped in one day. Implementation-first working. |
 | When does asm verification (D-Beta) start? | After Phase 7 infrastructure ready (~12-18 months). Formal proofs added on top of working intrinsics. |
 | What's the final claim? | "100% verified asm for ZER's target domain across 3+ archs. JIT/live-patch outside scope." |
 

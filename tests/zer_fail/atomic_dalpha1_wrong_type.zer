@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// @atomic_add_fetch first arg must be pointer to integer — not a struct
+
+struct Point { u32 x; u32 y; }
+
+i32 main() {
+    Point p = { .x = 1, .y = 2 };
+    u32 v = @atomic_add_fetch(&p, 1);  // error: pointer to struct, not integer
+    return 0;
+}

@@ -1,0 +1,57 @@
+// Phase D-Alpha-1: 7 new atomic intrinsics
+// @atomic_xchg, @atomic_nand
+// @atomic_add_fetch, @atomic_sub_fetch, @atomic_or_fetch, @atomic_and_fetch, @atomic_xor_fetch
+// All return T (new value for *_fetch variants, old value for xchg/nand).
+// SEQ_CST ordering (Ordering param deferred to later batch).
+
+u32 counter;
+u32 bits;
+u32 token;
+
+i32 main() {
+    // Initialize via atomic_store (existing)
+    @atomic_store(&counter, 0);
+    @atomic_store(&bits, 0);
+    @atomic_store(&token, 42);
+
+    // add_fetch: returns NEW value
+    // counter: 0 -> 5, returns 5
+    u32 new1 = @atomic_add_fetch(&counter, 5);
+    if (new1 != 5) { return 1; }
+
+    // add_fetch again: 5 -> 7, returns 7
+    u32 new2 = @atomic_add_fetch(&counter, 2);
+    if (new2 != 7) { return 2; }
+
+    // sub_fetch: 7 -> 4, returns 4
+    u32 new3 = @atomic_sub_fetch(&counter, 3);
+    if (new3 != 4) { return 3; }
+
+    // or_fetch: 0 | 0b1010 = 10, returns 10
+    u32 bits1 = @atomic_or_fetch(&bits, 10);
+    if (bits1 != 10) { return 4; }
+
+    // and_fetch: 10 & 0b1100 = 8, returns 8
+    u32 bits2 = @atomic_and_fetch(&bits, 12);
+    if (bits2 != 8) { return 5; }
+
+    // xor_fetch: 8 ^ 0b1111 = 7, returns 7
+    u32 bits3 = @atomic_xor_fetch(&bits, 15);
+    if (bits3 != 7) { return 6; }
+
+    // xchg: replaces value, returns OLD
+    // token was 42, set to 100, returns 42
+    u32 old1 = @atomic_xchg(&token, 100);
+    if (old1 != 42) { return 7; }
+
+    // verify token is now 100
+    u32 t = @atomic_load(&token);
+    if (t != 100) { return 8; }
+
+    // nand: NAND = ~(a & b). counter was 4 (0b0100), nand with 15 (0b1111)
+    // ~(4 & 15) = ~4 = 0xFFFFFFFB. But returns OLD value (4).
+    u32 old2 = @atomic_nand(&counter, 15);
+    if (old2 != 4) { return 9; }
+
+    return 0;
+}

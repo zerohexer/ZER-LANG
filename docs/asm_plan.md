@@ -7,6 +7,7 @@
 - `asm` keyword renamed to `unsafe asm` — the `unsafe` marker is now **required** (Rust-style explicit escape hatch). Bare `asm(...)` is rejected with compile error. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — structural rule applies to new naming.
 - Sail cannot generate asm code (web search confirmed). Removed "Sail codegen" as a shortcut.
 - Islaris covers ARM64 + RISC-V only, single-threaded. x86 verification requires custom framework build-out.
+- **IMPLEMENTATION-FIRST DECISION (2026-04-23 evening):** Intrinsic IMPLEMENTATION is decoupled from Phase 2-7 prereq. Phase D split into D-Alpha (implementation, no formal proofs) and D-Beta (verification layer added later). This matches how seL4/CompCert/Vale were actually built — code first, proofs iteratively. Users can ship pure-ZER kernels ~1-2 years earlier. See "Implementation-First Plan (Phase D-Alpha)" section below.
 
 **Related docs:**
 - `docs/ASM_ZER-LANG.md` — earlier (2026-04-01) asm research (context switch, boot, atomics design). That was the foundation; this is the formal verification plan built on top.
@@ -446,21 +447,34 @@ This allocation delivers **4 archs + verified crypto + certification artifacts**
 
 ---
 
-## Calendar Timeline (5-year plan, half-time = 1,000 hrs/year, 3-arch scope)
+## Calendar Timeline (REVISED 2026-04-23 evening — implementation-first)
 
-| Year | Hours cumulative | Milestones |
+Two tracks run in parallel:
+
+**Track 1: Intrinsic implementation (D-Alpha) — ships user value fast**
+
+| Year | Cumulative hrs on Track 1 | Milestones |
 |---|---|---|
-| Year 1 | 1,000 | Phases 2-7 done (~900 hrs). Phase A started. ZER type system fully verified. |
-| Year 2 | 2,000 | Phase A complete. Phase B x86-64 done. Phase D x86-64 intrinsics started. First verified OS primitives shippable. |
-| Year 3 | 3,000 | Phase B complete (all 3 archs). Phase C advanced semantics done. Phase D x86-64 complete. ARM64 started. |
-| Year 4 | 3,750 | Phase D ARM64 + RISC-V complete. Phase E polish + cert. **All 3 archs shipping.** |
-| Year 5 | 5,000 | Use 1,250-hr surplus: Cortex-M (v1.1), crypto Vale-tier, DO-178C artifacts. **All 4 archs + certification + crypto.** |
+| Year 0.5 | 100 | D-Alpha-1 atomics + D-Alpha-2 barriers shipped. Lock-free data structures viable. |
+| Year 1 | 300 | D-Alpha-3 interrupts + D-Alpha-4 context switch. ISRs + scheduler viable. |
+| Year 1.5 | 700 | D-Alpha-5 MMU + D-Alpha-6 cache/TLB. Virtual memory viable. |
+| Year 2 | 800 | D-Alpha-7 complete. **Pure-ZER kernels on x86-64 shipping.** |
+| Year 2.5 | 1,300 | D-Gamma ARM64 port. Apple Silicon + mobile viable. |
+| Year 3 | 1,700 | D-Gamma RISC-V port. 3-arch kernel dev shipping. |
 
-Full-time (2,000 hrs/year) halves the calendar to 2.5 years.
+**Track 2: Formal verification (Phases 2-7 + D-Beta) — strengthens safety claim**
 
-**Year 4 is the "ship" milestone.** 3 archs shipping with full verified intrinsics + kernel development viable.
+| Year | Cumulative hrs on Track 2 | Milestones |
+|---|---|---|
+| Year 1 | 500 | Phase 2-4 done. Decision extraction + walker + state APIs verified. |
+| Year 2 | 900 | Phases 5-7 done. Operational subsets deep. Type system fully verified. |
+| Year 2.5 | 1,300 | D-Beta x86-64 intrinsics verified. Formal proofs layered on working code. |
+| Year 3 | 1,800 | D-Beta ARM64 + RISC-V verified. All intrinsics formally proven. |
+| Year 4 | 2,000 | Phase E polish + cert artifacts. **Fully verified + shipping.** |
 
-**Year 5 is the "polish" milestone.** Cortex-M added, crypto verified to Vale-tier, certification-ready.
+**Total across both tracks: ~3,700 hrs. Still within 5K budget with ~1,300 hr surplus** for Cortex-M / crypto Vale-tier / DO-178C.
+
+**Key shift from original plan:** Working intrinsics in Year 2 instead of Year 4. Users benefit 2 years earlier. Formal verification layer added on top of working code without blocking shipping.
 
 ---
 
@@ -680,20 +694,220 @@ Estimated savings from prior-art reuse: **400-600 hrs** over the 4-arch project.
 
 ---
 
-## Immediate Next Step (IMPORTANT)
+## Implementation-First Plan (Phase D-Alpha) — REVISED 2026-04-23 evening
 
-**DO NOT start asm work yet.**
+**Previous recommendation (verify-first) was overridden.** Implementation of intrinsics is decoupled from Phase 2-7 prereq. Working intrinsics ship first; formal proofs added later (Phase D-Beta).
 
-The prerequisite is Phase 2 through Phase 7 of the formal verification plan (900 hrs). Current status:
-- Phase 1: 100% complete (85/85 predicates)
-- Phase 2: 7% complete (4/60 decisions)
-- Phases 3-7: not started
+### Why implementation-first
 
-**The immediate next concrete step is Phase 2 Batch 2 — handle state transitions.** Extract 6 decisions from zercheck.c/zercheck_ir.c state machine as verified decision functions.
+1. **Matches real verified systems.** seL4 kernel existed → then verified. CompCert implemented → proofs refined. Vale primitives first → verification layer added.
+2. **Ships value ~2 years earlier.** Users can write pure-ZER kernels on x86-64 after ~500-800 hrs instead of waiting for ~1,900 hrs (prereq + Phase A-D).
+3. **No observable behavior change across Phase 2-7.** Phase 2-7 refactors internals but doesn't change type system behavior. Intrinsics built now don't need rework.
+4. **Iteration on API design.** Real kernel code catches intrinsic design mistakes faster than proofs do.
 
-Reason: asm verification builds on the type system. Without Phases 2-7, verified asm attaches to an unverified surrounding language — the safety claim would be weak. Finish the foundation first.
+### Phase D splits into three sub-phases
 
-**After Phase 7 completes** (~12-18 months of part-time work from now), begin Phase A (core infrastructure for ZER-Asm).
+| Sub-phase | What | Hours (x86-64) | Formal proofs? |
+|---|---|---|---|
+| **D-Alpha** | Implement 96 intrinsics with tests | 500-800 | No — tests validate behavior |
+| **D-Beta** | Add Coq specs + VST proofs on top | 400-600 | Yes — Phase 7 infra required |
+| **D-Gamma** | Port to ARM64 + RISC-V | 600-800 | Yes — inherits D-Beta proof structure |
+
+Total still ~2,000-2,400 hrs — but value ships progressively as each batch lands.
+
+### Phase D-Alpha — 7 Batches for x86-64
+
+Each batch is independently shippable. Users benefit after each lands.
+
+| Batch | Intrinsics | Count | Hours | Unlocks |
+|---|---|---|---|---|
+| D-Alpha-1 | Atomics (GCC builtins) | 15 | 50-80 | Lock-free data structures in pure ZER |
+| D-Alpha-2 | Barriers + misc GCC builtins | 10 | 30-50 | Memory ordering, prefetch, bit manip |
+| D-Alpha-3 | Interrupt control | 8 | 80-120 | Can write ISRs in pure ZER |
+| D-Alpha-4 | Context switch | 4 | 100-150 | Can write a scheduler |
+| D-Alpha-5 | MMU control | 10 | 150-200 | Can write virtual memory manager |
+| D-Alpha-6 | TLB + cache maintenance | 11 | 80-120 | Complete memory subsystem |
+| D-Alpha-7 | MSR + inspection + power mgmt | 38 | 80-100 | Full kernel capability |
+| **TOTAL** | | **96** | **570-820** | **Pure-ZER kernels on x86-64** |
+
+### Per-batch deliverables (what each batch includes)
+
+For every intrinsic in a batch:
+
+1. **Parser support** — `@cpu_save_context`, `@atomic_cas`, etc. recognized as builtin calls
+2. **Checker rules** — type validation, context validation (uses existing Phase 1 rules like `zer_asm_allowed_in_context`)
+3. **Emitter output** — emits correct GCC inline asm or GCC builtin per `--target`
+4. **Integration tests** — real ZER code that uses the intrinsic, compiles, runs, produces expected behavior
+5. **Regression tests** — added to `tests/zer/` for positive cases, `tests/zer_fail/` for negative cases
+6. **Documentation** — `docs/reference.md` entry with syntax + example
+
+NOT included in D-Alpha (deferred to D-Beta):
+- Coq formal specification
+- VST verification proof
+- Iris Hoare logic integration
+- Sail model integration
+
+### Testing strategy without formal proofs
+
+Each intrinsic gets multi-layer validation:
+
+| Layer | What | Effort |
+|---|---|---|
+| **Unit tests** | Parser/checker/emitter test fixtures | ~10 lines per intrinsic |
+| **Integration tests** | Real ZER code exercising the intrinsic | ~20 lines per intrinsic |
+| **Differential testing** | Compare against hand-written C equivalent | Where applicable |
+| **Hardware validation** | Run on real CPU, compare output | CI — QEMU at minimum |
+| **Negative tests** | Misuse cases rejected at compile time | 5-10 per batch |
+
+This gives ~95% confidence in correctness without formal proofs. The remaining ~5% is captured by D-Beta proofs later.
+
+### D-Alpha-1 detail: Atomics (first batch)
+
+**15 intrinsics, ~50-80 hours, highest-priority first batch.**
+
+All map to GCC `__atomic_*` builtins — GCC handles per-arch encoding automatically. ZER compiler just needs to recognize the syntax and emit the builtin.
+
+| Intrinsic | GCC builtin emitted | ZER type signature |
+|---|---|---|
+| `@atomic_load(*T, ordering)` | `__atomic_load_n(ptr, ordering)` | `fn(*shared T, Ordering) -> T` |
+| `@atomic_store(*T, T, ordering)` | `__atomic_store_n(ptr, val, ordering)` | `fn(*shared T, T, Ordering) -> void` |
+| `@atomic_cas(*T, T, T, ord, ord)` | `__atomic_compare_exchange_n(...)` | `fn(*shared T, T, T, Ordering, Ordering) -> bool` |
+| `@atomic_xchg(*T, T, ordering)` | `__atomic_exchange_n(ptr, val, ord)` | `fn(*shared T, T, Ordering) -> T` |
+| `@atomic_fetch_add(*T, T, ord)` | `__atomic_fetch_add` | `fn(*shared T, T, Ordering) -> T` |
+| `@atomic_fetch_sub(*T, T, ord)` | `__atomic_fetch_sub` | Same |
+| `@atomic_fetch_or(*T, T, ord)` | `__atomic_fetch_or` | Same |
+| `@atomic_fetch_and(*T, T, ord)` | `__atomic_fetch_and` | Same |
+| `@atomic_fetch_xor(*T, T, ord)` | `__atomic_fetch_xor` | Same |
+| `@atomic_fetch_nand(*T, T, ord)` | `__atomic_fetch_nand` | Same |
+| `@atomic_add_fetch(*T, T, ord)` | `__atomic_add_fetch` | Same |
+| `@atomic_sub_fetch(*T, T, ord)` | `__atomic_sub_fetch` | Same |
+| `@atomic_or_fetch(*T, T, ord)` | `__atomic_or_fetch` | Same |
+| `@atomic_and_fetch(*T, T, ord)` | `__atomic_and_fetch` | Same |
+| `@atomic_xor_fetch(*T, T, ord)` | `__atomic_xor_fetch` | Same |
+
+**Ordering enum (5 values):**
+```zer
+enum Ordering {
+    .relaxed,        // → __ATOMIC_RELAXED
+    .acquire,        // → __ATOMIC_ACQUIRE
+    .release,        // → __ATOMIC_RELEASE
+    .acq_rel,        // → __ATOMIC_ACQ_REL
+    .seq_cst,        // → __ATOMIC_SEQ_CST
+}
+```
+
+**Restrictions enforced by checker:**
+- First arg must be `*shared T` pointer (non-shared pointers rejected — existing BUG fix pattern)
+- `T` must be integer type of width 1/2/4/8 bytes
+- Ordering argument must be a compile-time constant (Ordering enum value)
+
+**Example user code after D-Alpha-1:**
+```zer
+shared struct Counter {
+    u32 value;
+}
+
+Counter global_counter;
+
+fn safe_increment() -> u32 {
+    // Returns old value. Seq-cst for simplicity.
+    return @atomic_fetch_add(&global_counter.value, 1, .seq_cst);
+}
+
+fn compare_and_swap(u32 expected, u32 new) -> bool {
+    return @atomic_cas(&global_counter.value, expected, new, .seq_cst, .seq_cst);
+}
+```
+
+**Testing for this batch:**
+- `tests/zer/atomic_fetch_add.zer` — increment counter, verify exit code
+- `tests/zer/atomic_cas_retry.zer` — CAS retry loop
+- `tests/zer/atomic_multi_thread.zer` — spawn + atomic_fetch_add, verify total
+- `tests/zer_fail/atomic_nonshared.zer` — non-shared pointer rejected
+- `tests/zer_fail/atomic_wrong_width.zer` — 3-byte type rejected
+- `tests/zer_fail/atomic_nonconst_ordering.zer` — runtime ordering rejected
+
+### Phase D-Alpha — Batch Dependencies
+
+```
+D-Alpha-1 (Atomics) ─┬─→ D-Alpha-3 (Interrupts) ──→ D-Alpha-4 (Context Switch)
+                     │                                        │
+                     │                                        ↓
+                     └─→ D-Alpha-2 (Barriers) ←──────────── D-Alpha-5 (MMU)
+                                                             │
+                                                             ↓
+                                                         D-Alpha-6 (TLB + Cache)
+                                                             │
+                                                             ↓
+                                                         D-Alpha-7 (MSR + rest)
+```
+
+Batches 1 and 2 can be done in parallel or either order. After that, linear dependency.
+
+### Integration with existing ZER compiler
+
+Each batch touches these files:
+
+| File | Changes |
+|---|---|
+| `parser.c` | Add `@intrinsic_name` recognition (~5 lines per intrinsic) |
+| `checker.c` | Type/context validation (~10-30 lines per intrinsic) |
+| `emitter.c` | GCC asm / builtin emission (~10-30 lines per intrinsic) |
+| `ir_lower.c` | Lower to IR instruction (if using IR path) |
+| `ast.h` | New NODE_INTRINSIC_* kind or generic NODE_INTRINSIC with tag |
+| `tests/zer/*.zer` | Positive tests (~20 lines each) |
+| `tests/zer_fail/*.zer` | Negative tests (~10 lines each) |
+| `docs/reference.md` | User-facing documentation |
+| `BUGS-FIXED.md` | Session entry per batch |
+
+Estimated LoC per batch: ~1,500-3,000 depending on batch complexity.
+
+### Phase D-Beta — verification layer (LATER)
+
+After Phase 7 completes (~12-18 months), add formal proofs to the intrinsics:
+
+1. Write Coq specs (arch-agnostic) — ~7,700 lines total
+2. Write VST proofs per arch — ~180 proofs total
+3. Integrate Sail model references where applicable
+4. Link into `make check-vst` CI gate
+
+**No intrinsic code changes needed.** Only adds `src/safety/intrinsics/*.c` + `proofs/vst/verif_intrinsics/*.v`.
+
+### Phase D-Gamma — multi-arch port (LATER)
+
+After D-Alpha x86-64 complete:
+
+1. Port 56 arch-specific intrinsics to ARM64 (~500 hrs)
+2. Port 56 arch-specific intrinsics to RISC-V (~400 hrs)
+3. The 40 GCC-builtin intrinsics work automatically (no port needed)
+
+---
+
+## Immediate Next Step (IMPORTANT — REVISED 2026-04-23 evening)
+
+**Start Phase D-Alpha Batch 1: 15 atomic intrinsics for x86-64.**
+
+Concrete work items for first session:
+1. Design `Ordering` enum (5 values: relaxed/acquire/release/acq_rel/seq_cst)
+2. Add `TOK_AT_ATOMIC_*` recognition to lexer (or generic intrinsic dispatch)
+3. Parser: recognize `@atomic_*(ptr, val, ordering)` call syntax
+4. Checker: validate `*shared T` pointer, integer width, ordering constant
+5. Emitter: emit `__atomic_*(...)` GCC builtin with correct `__ATOMIC_*` ordering constant
+6. First 3 intrinsics: `@atomic_load`, `@atomic_store`, `@atomic_fetch_add` (enough to validate pattern)
+7. Tests: 3 positive + 3 negative per intrinsic
+8. Extend to all 15 atomics once pattern works
+
+Estimated time: 50-80 hours (split across multiple sessions).
+
+**Phase 2 work continues independently** when user has appetite. The two tracks don't gate each other.
+
+### What was the old plan (kept for historical context)
+
+Previous recommendation was "finish Phase 2-7 first (~900 hrs) before starting Phase A (~500 hrs infrastructure) before Phase D (~1,400 hrs implementation + proofs)."
+
+Problem: Users had to wait ~2 years to ship any pure-ZER kernel code. No real-world feedback on intrinsic API design. Proof-first locked in constraints before validation.
+
+Revised plan ships working intrinsics in ~6-12 months. Formal proofs added in D-Beta after Phase 7 completes. Total effort similar, value ships years earlier.
 
 ---
 
@@ -707,11 +921,13 @@ If you are a fresh session picking up this work, do these in order:
 4. Read `docs/phase1_catalog.md` for Phase 1 completion state
 5. Read `docs/proof-internals.md` for VST/Coq proof patterns
 6. Check current status: `grep "Phase [0-9]:" CLAUDE.md` for phase progress
-7. If Phase 2-7 not done: resume that work first (see `docs/formal_verification_plan.md`)
-8. If Phase 2-7 done: begin Phase A (this document's Phase A section)
+7. **For intrinsic implementation (D-Alpha):** proceed independently of Phase 2-7. See "Implementation-First Plan" section above.
+8. **For intrinsic verification (D-Beta):** requires Phase 7 infrastructure. Wait.
+9. **For Phase 2-7 prereq work:** see `docs/formal_verification_plan.md`. Two tracks can progress in parallel.
 
 **Do NOT:**
-- Start Phase A before Phases 2-7 complete (builds on sand)
+- Gate D-Alpha (intrinsic implementation) on Phase 2-7 completion — decoupled per 2026-04-23 decision
+- Try to write formal Coq proofs for intrinsics in D-Alpha — deferred to D-Beta
 - Clone Vale verbatim (rejected — toolchain bloat, scope mismatch)
 - Remove the existing `asm` keyword (kept as `unsafe asm` escape hatch — Rust-style marking)
 - Attempt to verify the emitter end-to-end (CompCert-scale, out of scope)
@@ -833,8 +1049,9 @@ Summary of the conversation that led to this plan:
 | What's the budget? | **~3,750 hrs committed (out of 5K). 1,250 hr surplus.** |
 | What's the surplus for? | Cortex-M v1.1 + crypto Vale-tier + DO-178C cert artifacts. |
 | What's the calendar? | 5 years half-time, 2.5 years full-time. |
-| What's the first step? | Phase 2 Batch 2 (handle state transitions). NOT asm work yet. |
-| When does asm work start? | After Phases 2-7 complete (~12-18 months from now). |
+| What's the first step? | **Phase D-Alpha Batch 1: 15 atomic intrinsics for x86-64.** Phase 2 continues in parallel when desired. |
+| When does asm implementation start? | **NOW.** Decoupled from Phase 2-7 (2026-04-23 decision). Implementation-first. |
+| When does asm verification (D-Beta) start? | After Phase 7 infrastructure ready (~12-18 months). Formal proofs added on top of working intrinsics. |
 | What's the final claim? | "100% verified asm for ZER's target domain across 3+ archs. JIT/live-patch outside scope." |
 
 ---

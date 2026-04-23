@@ -5877,6 +5877,39 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "__atomic_thread_fence(__ATOMIC_RELEASE)");
         } else if (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
+        } else if (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) {
+            /* D-Alpha-2: acquire + release fence */
+            emit(e, "__atomic_thread_fence(__ATOMIC_ACQ_REL)");
+        } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {
+            /* D-Alpha-2: GCC unreachable hint (undefined behavior if reached) */
+            emit(e, "__builtin_unreachable()");
+        } else if (nlen == 6 && memcmp(name, "expect", 6) == 0 && node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-2: branch prediction hint */
+            emit(e, "__builtin_expect((long)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "), (long)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, "))");
+        } else if (nlen == 7 && (memcmp(name, "bswap16", 7) == 0 ||
+                                 memcmp(name, "bswap32", 7) == 0 ||
+                                 memcmp(name, "bswap64", 7) == 0) && node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-2: byte swap — GCC builtin */
+            emit(e, "__builtin_%.*s(", (int)nlen, name);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")");
+        } else if (((nlen == 8 && memcmp(name, "popcount", 8) == 0) ||
+                    (nlen == 3 && memcmp(name, "ctz", 3) == 0) ||
+                    (nlen == 3 && memcmp(name, "clz", 3) == 0) ||
+                    (nlen == 6 && memcmp(name, "parity", 6) == 0) ||
+                    (nlen == 3 && memcmp(name, "ffs", 3) == 0)) &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-2: bit queries (dispatch on width) */
+            Type *arg_t = checker_get_type(e->checker, node->intrinsic.args[0]);
+            int w = arg_t ? type_width(type_unwrap_distinct(arg_t)) : 32;
+            const char *suffix = (w > 32) ? "ll" : "";
+            emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ")");
         } else if (nlen == 12 && memcmp(name, "barrier_init", 12) == 0 && node->intrinsic.arg_count >= 2) {
             /* BUG-574: thread barrier init on IR path — same shape as AST emit_expr */
             Type *bt = checker_get_type(e->checker, node->intrinsic.args[0]);

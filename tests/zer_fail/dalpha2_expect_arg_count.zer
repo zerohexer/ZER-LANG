@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @expect requires 2 arguments
+
+i32 main() {
+    u32 v = 42;
+    i64 r = @expect(v);  // error: only 1 argument
+    return 0;
+}

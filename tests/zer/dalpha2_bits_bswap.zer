@@ -1,0 +1,44 @@
+// Phase D-Alpha-2: bit manipulation + byte swap intrinsics
+// @popcount, @ctz, @clz — bit counting
+// @bswap16, @bswap32, @bswap64 — byte swap
+
+i32 main() {
+    // popcount: number of 1 bits in 0b10110101 = 5
+    u32 bits = 181;   // 0b10110101
+    u32 pop = @popcount(bits);
+    if (pop != 5) { return 1; }
+
+    // ctz: count trailing zeros in 16 = 4
+    u32 tz = @ctz(16);
+    if (tz != 4) { return 2; }
+
+    // clz: count leading zeros in 1 (32-bit) = 31
+    u32 lz = @clz(1);
+    if (lz != 31) { return 3; }
+
+    // bswap32: 0x12345678 -> 0x78563412
+    u32 swapped32 = @bswap32(305419896);   // 0x12345678
+    if (swapped32 != 2018915346) { return 4; }   // 0x78563412
+
+    // bswap16: 0x1234 -> 0x3412
+    u16 swapped16 = @bswap16(4660);   // 0x1234
+    if (swapped16 != 13330) { return 5; }   // 0x3412
+
+    // bswap: round-trip always restores original
+    u32 original = 0xDEADBEEF;
+    u32 swapped = @bswap32(original);
+    u32 restored = @bswap32(swapped);
+    if (restored != original) { return 6; }
+
+    // parity: xor of all bits (0 = even, 1 = odd)
+    // 0b10110101 = 5 ones = odd parity = 1
+    u32 par = @parity(181);
+    if (par != 1) { return 7; }
+
+    // ffs: find first set (1-indexed position of lowest 1-bit; 0 if input is 0)
+    // 0b10000 = bit 4 (0-indexed) = position 5 (1-indexed)
+    u32 f = @ffs(16);
+    if (f != 5) { return 8; }
+
+    return 0;
+}

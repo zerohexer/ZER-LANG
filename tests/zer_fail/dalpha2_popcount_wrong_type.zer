@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// @popcount requires integer argument
+
+struct Point { u32 x; }
+
+i32 main() {
+    Point p = { .x = 1 };
+    u32 n = @popcount(p);  // error: struct, not integer
+    return 0;
+}

@@ -1,0 +1,30 @@
+// Phase D-Alpha-3: interrupt control intrinsics
+// @cpu_disable_int, @cpu_enable_int, @cpu_wait_int, @cpu_save_int_state, @cpu_restore_int_state
+//
+// These are PRIVILEGED operations (cli/sti on x86, cpsid/cpsie on ARM, csrci/csrsi on RISC-V).
+// They fault with SIGSEGV in user-mode execution. This test verifies COMPILATION only.
+// The intrinsics are placed in an unreachable branch so the asm is emitted but never runs.
+
+volatile u32 never_true;
+
+u64 kernel_mode_code() {
+    // Dead code — never executes because never_true is 0 at startup.
+    // Compiler still emits the asm; link confirms it's valid.
+    if (never_true == 42) {
+        u64 state = @cpu_save_int_state();
+        @cpu_disable_int();
+        // critical section would go here
+        @cpu_restore_int_state(state);
+        @cpu_enable_int();
+        @cpu_wait_int();
+        return state;
+    }
+    return 0;
+}
+
+i32 main() {
+    // Call but never-true branch is skipped at runtime.
+    u64 x = kernel_mode_code();
+    if (x != 0) { return 1; }   // never_true == 0, so kernel_mode_code returns 0
+    return 0;
+}

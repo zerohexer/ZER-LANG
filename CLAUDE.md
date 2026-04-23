@@ -255,6 +255,17 @@ SIGSEGV in user mode — use for kernel code only. Test pattern: place in dead b
 `volatile u32 never_true = 0; if (never_true == 42) { ... }` to verify compilation without
 executing privileged asm.
 
+### Context Switch Intrinsics (D-Alpha-4, scheduler primitives)
+```
+@cpu_save_context(*u8 buf)       save callee-saved GPRs     (128+ byte buffer)
+@cpu_restore_context(*u8 buf)    restore callee-saved GPRs
+@cpu_save_fpu(*u8 buf)           save SIMD/FP state         (512+ byte buffer, 16-byte aligned)
+@cpu_restore_fpu(*u8 buf)        restore SIMD/FP state
+```
+Callee-saved only (rbx/r12-r15 on x86, x19-x28 on ARM64, s0-s11 on RISC-V).
+Full RSP/RIP save requires naked functions — kernel-integration scope.
+Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branch pattern.
+
 ### mmio Declaration (MANDATORY for @inttoptr)
 ```
 mmio 0x40020000..0x40020FFF;   // declare valid MMIO address range
@@ -940,6 +951,7 @@ ZER SYNTAX RULES (not C — these differ):
 - @atomic_load/store/cas + @atomic_{add,sub,or,and,xor,nand,xchg} (fetch-old) + @atomic_{add,sub,or,and,xor}_fetch (fetch-new). All SEQ_CST.
 - Bit queries: @popcount, @ctz, @clz, @parity, @ffs (return u32). Byte swap: @bswap16/32/64. Control-flow hints: @unreachable(), @expect(val, exp). Full barrier: @barrier_acq_rel().
 - Interrupt control (privileged, kernel-mode only): @cpu_disable_int/@cpu_enable_int/@cpu_wait_int/@cpu_save_int_state/@cpu_restore_int_state. Tests use dead-branch pattern (volatile + if(never_true)) to verify compile without executing privileged asm.
+- Context switch (callee-saved subset): @cpu_save_context/@cpu_restore_context/@cpu_save_fpu/@cpu_restore_fpu. Take *u8 buffer arg. Dead-branch tested.
 - No malloc/free — use Pool(T, N), Slab(T), Arena
 - move struct Name { } = ownership transfer on pass/assign, use after move = error
 - container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)

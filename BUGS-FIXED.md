@@ -144,6 +144,73 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 **Per-arch asm pattern now proven** — D-Alpha-4 through D-Alpha-7 can reuse the same `#if defined` dispatch template documented in compiler-internals.md.
 
+---
+
+## Session 2026-04-23 — Phase D-Alpha-4: 4 context switch intrinsics (feature)
+
+**Change:** Added 4 scheduler-primitive intrinsics for saving and restoring CPU/FPU state to a user-provided buffer. Commit e2f45af.
+
+**New intrinsics:**
+- `@cpu_save_context(*u8 buf)` — save callee-saved GPRs
+- `@cpu_restore_context(*u8 buf)` — restore callee-saved GPRs
+- `@cpu_save_fpu(*u8 buf)` — save SIMD/FP state (512 bytes, 16-byte aligned)
+- `@cpu_restore_fpu(*u8 buf)` — restore SIMD/FP state
+
+**Per-arch implementation:**
+- x86-64: `movq %rbx, 0(%0)` etc.; `fxsave (%0)` for FPU
+- ARM64: `stp x19, x20, [%0, #0]` etc.; `stp q0, q1, [%0, #0]` for FPU
+- ARMv7-A: `stm %0, {r4-r11}`
+- RISC-V: `sd s0, 0(%0)` etc.
+
+**Scope limit (intentional):** callee-saved GPRs only. Caller-saved regs are already preserved by compiler prologue around the intrinsic call per ABI. RSP/RIP manipulation requires a naked function for atomic stack switching — kernel-integration scope, beyond D-Alpha.
+
+**CRITICAL lesson: emit() escaping for GCC inline asm**
+
+During implementation, encountered this GCC error:
+```
+error: invalid 'asm': operand number missing after %-letter
+error: invalid 'asm': operand number out of range
+```
+
+Root cause: `emit(e, fmt, ...)` internally calls `vfprintf(fmt, ...)`. Format specifiers in `fmt` are INTERPRETED before output. Every literal `%` in GCC inline asm needs to be DOUBLED in the emit format string.
+
+| GCC asm literal | emit() fmt needed | What it does |
+|---|---|---|
+| `%0` (operand ref) | `%%0` | `%%` → `%` in fprintf; `%0` in output |
+| `%%rbx` (literal register) | `%%%%rbx` | `%%%%` → `%%` in fprintf; `%%rbx` in output |
+
+Example of correct emission:
+```c
+/* C source in emitter.c */
+emit(e, "\"movq %%%%rbx, 0(%%0)\\n\\t\"");
+
+/* Output in emitted .c: */
+"movq %%rbx, 0(%0)\n\t"
+
+/* GCC asm parser sees: */
+movq %rbx, 0(%rdi)   /* with operand 0 allocated to %rdi */
+```
+
+D-Alpha-3 code used unescaped `%0` (e.g., `popq %0`) and worked BY LUCK — glibc fprintf on `%0` followed by non-format content passes through as literal `%0`, but this is unreliable. All new emit calls should double-escape per the rule. Recorded in `docs/compiler-internals.md` D-Alpha-4 section.
+
+**Minor lesson: Type field name is `.inner`, not `.element`**
+
+First implementation used `eff->array.element` for the array element type, got compile error:
+```
+error: 'struct <anonymous>' has no member named 'element'
+```
+
+`types.h:94` defines the array field as `.inner` (consistent with pointer/slice/optional types which also use `.inner`). Fix: `eff->array.inner`. Documented in `docs/compiler-internals.md`.
+
+**Tests added:**
+- `tests/zer/dalpha4_context_switch.zer` — positive roundtrip in dead-branch pattern
+- `tests/zer_fail/dalpha4_save_context_wrong_type.zer` — pointer to non-u8 rejected
+- `tests/zer_fail/dalpha4_save_context_arg_count.zer` — missing argument rejected
+
+**Tests:** 433/433 integration (was 430, +3). check-vst: green, zero admits across 23 VST files. Phase 1: 85/85.
+
+**D-Alpha progress: 34 of 96 intrinsics shipped (35%).** Remaining: D-Alpha-5 (10 MMU), D-Alpha-6 (11 TLB + cache), D-Alpha-7 (38 MSR + inspection + power).
+
 **Docs updated:** `docs/asm_plan.md`, `docs/reference.md`, `docs/ASM_ZER-LANG.md`, `CLAUDE.md`.
 
 ---

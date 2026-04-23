@@ -5,6 +5,17 @@ Entries removed once fixed.
 
 ---
 
+## ~~BUG-604~~ (FIXED 2026-04-23)
+
+`emit_rewritten_node` NODE_BINARY missed shift-safety macros
+(`_zer_shl`/`_zer_shr`) and signed-division-overflow trap on the
+preserved-expression path. Caused silent miscompile of ZER spec
+(shift >= width = 0) and SIGFPE on `INT_MIN / -1` when the expression
+lived in an IR_ASSIGN lvalue/await/void-return slot instead of being
+decomposed into IR_BINOP. See BUGS-FIXED.md "BUG-604" for full
+reproducer and audit methodology (AST→IR diff audit resurfacing the
+BUG-595–599 class in the preserved-expression path).
+
 ## ~~BUG-579~~ (FIXED 2026-04-18, v0.4.9)
 
 Switch arm body gaps — enum/union/optional switches now fully lower to IR.

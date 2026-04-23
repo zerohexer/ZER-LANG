@@ -1,0 +1,13 @@
+// Signed INT_MIN / -1 in array index must trap (C UB -> SIGFPE otherwise).
+// Regression for BUG-604 emit_rewritten_node missing signed overflow check.
+
+i32[8] arr;
+
+i32 main() {
+    i32 a = -2147483647;
+    a -= 1;  // INT_MIN (avoid parser rejection of raw literal)
+    i32 b = -1;
+    if (b == 0) { return 0; }
+    arr[a / b] = 99;  // INT_MIN / -1 -> must trap before raw C division
+    return arr[0];
+}

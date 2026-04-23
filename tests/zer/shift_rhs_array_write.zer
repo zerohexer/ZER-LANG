@@ -1,0 +1,17 @@
+// Shift on RHS of array/field write must honor ZER spec (>= width = 0).
+// emit_rewritten_node previously emitted raw `<<` here (BUG-604).
+
+u32[4] arr;
+
+struct Box { u32 val; }
+
+i32 main() {
+    u32 a = 1;
+    u32 n = 40;  // >= width (32)
+    arr[0] = a << n;  // per spec: 0
+    Box b;
+    b.val = a << n;   // per spec: 0
+    if (arr[0] != 0) { return 1; }
+    if (b.val != 0) { return 2; }
+    return 0;
+}

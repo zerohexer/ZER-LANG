@@ -5,6 +5,92 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## BUG-604 (2026-04-23) — `emit_rewritten_node` missing shift/signed-div safety wrappers
+
+**Symptom:** ZER programs containing `<<`, `>>`, or signed `/`/`%` inside
+complex lvalue positions silently emit raw C operators, producing
+undefined behavior and spec violations.
+
+Observed cases (all CONFIRMED on current compiler, miscompile or trap):
+
+| Pattern | Emitted C (wrong) | Impact |
+|---|---|---|
+| `arr[a << n] = 5` | `arr[(a << n)] = 5` | C UB when `n >= width`; may SIGTRAP (index out of bounds), silently wrap, or return wrong value per optimization level |
+| `arr[0] = a << n` | `arr[0] = (a << n)` | Miscompile: `-O0` exits 1, `-O2` exits 0 (non-deterministic) |
+| `s.field = a << n` | `s.field = (a << n)` | Same miscompile as above |
+| `arr[a / b] = 5` (INT_MIN/-1) | `arr[(a / b)] = 5` | SIGFPE (exit 136), never trapped with "signed division overflow" |
+| `await (x << n > 0)` (async) | `if (!((x << n > 0)))` | Silent UB in await condition |
+
+**Root cause:** `emit_rewritten_node` (emitter.c:4909) is the expression
+emitter used by IR handlers that preserve AST expressions in
+`inst->expr` (IR_ASSIGN with non-local dest, IR_CALL builtins, IR_RETURN
+passthrough, IR_AWAIT cond, etc. — 8 call sites). Its NODE_BINARY case
+handled optional/struct/*opaque special comparisons but dropped through
+to a generic `"(" lhs op rhs ")"` emission for everything else. This
+silently stripped the shift safety macros (`_zer_shl` / `_zer_shr`) and
+signed division overflow trap that `emit_expr` emits (lines 1082 / 1052)
+and that `IR_BINOP` emits (lines 7466 / 7480).
+
+Same class as BUG-595–599 (AST→IR emission audit 2026-04-19 which fixed
+IR_BINOP/IR_INDEX_READ/IR_CAST). That audit missed the preserved-
+expression path: expressions that `ir_lower` keeps as a single
+`IR_ASSIGN <expr>` instruction (e.g., array/field write LHS, await cond)
+never decompose into `IR_BINOP`, so the IR_BINOP fix doesn't protect
+them.
+
+**Proof of miscompile (with fix not yet applied):**
+```zer
+u32[4] arr;
+i32 main() {
+    u32 a = 1;
+    u32 n = 40;
+    arr[0] = a << n;
+    if (arr[0] == 0) { return 0; }  // ZER spec: shift >= width = 0
+    return 1;
+}
+```
+Before fix: `-O0 exits 1`, `-O2 exits 0`. After fix: both exit 0.
+
+**Fix:** emitter.c emit_rewritten_node NODE_BINARY — added shift and
+signed-div guards mirroring `emit_expr`:
+- `TOK_LSHIFT` / `TOK_RSHIFT` → emit `_zer_shl(lhs, rhs)` /
+  `_zer_shr(lhs, rhs)`.
+- `TOK_SLASH` / `TOK_PERCENT` with signed operand → emit statement
+  expression with INT_MIN/-1 check (checker already rejects
+  divisor-not-proven-nonzero at compile time, so no runtime zero check
+  needed). Unsigned `/ %` passes through unchanged (no overflow concern).
+
+The fix sits BEFORE the generic fallback so existing special cases
+(optional compare, *opaque compare) are unchanged.
+
+**Tests (regression guards):**
+- `tests/zer/shift_in_array_index_spec.zer` — `arr[a << n] = 5` where
+  `n >= width`; verifies `arr[0] == 5` (shift clamped to 0, not garbage
+  index).
+- `tests/zer/shift_rhs_array_write.zer` — `arr[0] = a << n` and
+  `s.field = a << n`; verifies both equal 0 per spec.
+- `tests/zer_trap/signed_div_in_index_trap.zer` — `arr[a / b] = 99`
+  with `a = INT_MIN, b = -1`; verifies trap fires with "signed division
+  overflow" message (exit 133).
+
+**Parallel change:** `zercheck_ir.c` now `#include`s `move_rules.h` and
+delegates `ir_is_move_struct_type` / `ir_should_track_move` to the
+VST-verified `zer_type_kind_is_move_struct` / `zer_move_should_track`
+predicates (matches `zercheck.c`'s parity invariant). Was previously
+ad-hoc inline logic — same behavior, but the extracted Level 3 oracle
+now covers BOTH analyzers, closing a silent parity-drift window where
+future spec updates to the verified predicate would not propagate to
+the IR path.
+
+**Audit methodology:** Phase 3 (AST→IR diff audit, per CLAUDE.md
+"AST→IR Emission Diff Audit"). Re-ran the grep `_zer_trap |
+_zer_bounds_check | _zer_shl` on emitter.c, then wrote targeted
+reproducers for each safety mechanism in each preserved-expression
+context (array index, array RHS, field RHS, await cond). Array-index-
+write case revealed the miscompile; others followed by construction.
+
+---
+
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)
 
 **Change:** Added `unsafe asm(...)` as the REQUIRED form for inline assembly. Bare `asm(...)` is rejected at compile time with a helpful error message pointing to `unsafe asm`.

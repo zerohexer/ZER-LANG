@@ -1,0 +1,17 @@
+// Shift inside array index expression must clamp to 0 per ZER spec
+// (shift by >= width = 0). The IR emit_rewritten_node previously emitted
+// raw `<<` / `>>` here, producing C UB that violated the spec.
+// Regression for BUG-604: emit_rewritten_node missing _zer_shl/_zer_shr.
+
+u32[4] arr;
+
+i32 main() {
+    u32 a = 1;
+    u32 n = 40;  // >= width (32) -> shift must be 0
+    // Per spec: (a << n) == 0, so arr[0] = 5 (valid)
+    arr[a << n] = 5;
+    // If spec is honored, arr[0] == 5 -> return 0 (pass)
+    // If raw `<<` leaks, arr[(1<<40)%?] is invalid or arr[0] != 5 -> fail
+    if (arr[0] == 5) { return 0; }
+    return 1;
+}

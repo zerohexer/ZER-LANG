@@ -15,6 +15,7 @@
 #include "zercheck.h"
 #include "checker.h"
 #include "src/safety/handle_state.h"   /* zer_handle_state_is_invalid — VST-verified */
+#include "src/safety/move_rules.h"     /* zer_type_kind_is_move_struct, _should_track — VST-verified */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -277,7 +278,10 @@ static const char *ir_state_name(IRHandleState s) {
 static bool ir_is_move_struct_type(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
-    return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
+    /* SAFETY: zer_type_kind_is_move_struct in src/safety/move_rules.c — VST-verified.
+     * Mirrors zercheck.c is_move_struct_type (parity invariant). */
+    int is_move_flag = (eff->kind == TYPE_STRUCT && eff->struct_type.is_move) ? 1 : 0;
+    return zer_type_kind_is_move_struct(eff->kind, is_move_flag) != 0;
 }
 
 static bool ir_contains_move_struct_field(Type *t) {
@@ -300,7 +304,12 @@ static bool ir_contains_move_struct_field(Type *t) {
 }
 
 static bool ir_should_track_move(Type *t) {
-    return t && (ir_is_move_struct_type(t) || ir_contains_move_struct_field(t));
+    if (!t) return false;
+    /* SAFETY: zer_move_should_track in src/safety/move_rules.c — VST-verified.
+     * Mirrors zercheck.c should_track_move (parity invariant). */
+    int is_move = ir_is_move_struct_type(t) ? 1 : 0;
+    int has_field = ir_contains_move_struct_field(t) ? 1 : 0;
+    return zer_move_should_track(is_move, has_field) != 0;
 }
 
 /* Allocation ID counter for move struct new-ownership chains.

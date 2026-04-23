@@ -1,0 +1,51 @@
+// Phase D-Alpha-7: critical multi-core intrinsics
+// @cpu_pause, @cpu_id, @cpu_wfe, @cpu_sev, @cpu_breakpoint, @cpu_rdrand, @cpu_rdseed, @barrier_dma
+//
+// Most of these are safe to execute in user mode (pause, yield, pause on RISC-V).
+// @cpu_breakpoint causes SIGTRAP — always gated in dead branch.
+// @cpu_wfe on ARM requires EL1+ — dead branch.
+// @cpu_rdrand/rdseed may return null on unsupported targets.
+
+volatile u32 never_execute;
+
+u64 test_spin_primitives() {
+    // @cpu_pause is safe in user mode on x86/ARM/RISC-V (pause/yield/pause)
+    @cpu_pause();
+
+    // @cpu_id is safe in user mode on x86 (rdtscp) and ARM64 (mpidr_el1 is readable in EL0)
+    u32 cpu_num = @cpu_id();
+
+    // @barrier_dma: memory fence only — safe in user mode
+    @barrier_dma();
+
+    // Dead branch for privileged / specialized ops
+    if (never_execute == 42) {
+        @cpu_wfe();           // ARM-only privileged on some configs
+        @cpu_sev();            // ARM-only
+        @cpu_breakpoint();     // SIGTRAP
+    }
+
+    // Hardware RNG — may return null on unsupported platforms
+    if (@cpu_rdrand()) |rand_val| {
+        // Got a random value
+        if (rand_val == rand_val) {
+            return (u64)cpu_num;
+        }
+    }
+
+    if (@cpu_rdseed()) |seed_val| {
+        if (seed_val == seed_val) {
+            return (u64)cpu_num;
+        }
+    }
+
+    return (u64)cpu_num;
+}
+
+i32 main() {
+    u64 n = test_spin_primitives();
+    // cpu_id returns 0 on single-CPU or user-mode read
+    // Just ensure the function ran without crashing
+    if (n > 4096) { return 1; }  // sanity: cpu_id < 4096 is very permissive
+    return 0;
+}

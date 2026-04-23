@@ -6153,3 +6153,190 @@ target.
 asm (no universal GCC builtin exists for MSR/MMU/context switch/etc).
 
 See `docs/asm_plan.md` for full D-Alpha plan + shipping roadmap.
+
+### D-Alpha-3: per-arch inline asm dispatch pattern (2026-04-23)
+
+D-Alpha-3 was the FIRST batch to require real per-arch inline assembly
+(5 interrupt control intrinsics). No GCC builtin exists for `cli`/`sti`/
+`hlt` — each arch has its own privileged instruction. Pattern proven
+working for future D-Alpha-4 through D-Alpha-7 batches.
+
+**Pattern: `#if defined` dispatch inside statement expression**
+
+```c
+/* emitted C */
+({
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__ ("cli" ::: "memory");
+#elif defined(__ARM_ARCH) || defined(__aarch64__)
+    __asm__ __volatile__ ("cpsid i" ::: "memory");
+#elif defined(__riscv)
+    __asm__ __volatile__ ("csrci mstatus, 8" ::: "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* safe fallback */
+#endif
+})
+```
+
+**CRITICAL formatting rules:**
+
+1. **`#if` directives MUST be at column 0.** GCC's preprocessor requires
+   this. Putting `#if` inside a one-liner `({ #if ... })` breaks —
+   "unexpected #if" or silent misparsing.
+
+2. **Begin the statement expression with `\n` after `({`.** This puts
+   the subsequent `#if` at column 0:
+   ```
+   emit(e, "({\n#if defined(__x86_64__)\n    ...\n#endif\n})");
+   ```
+
+3. **Always include a fallback `#else` branch.** Choose safe semantics
+   for unknown targets (e.g., `__atomic_thread_fence` for interrupt
+   ops — preserves ordering without privileged instructions).
+
+**Template for new per-arch intrinsics (copy-adapt for D-Alpha-4+):**
+
+```c
+} else if (nlen == N && memcmp(name, "intrinsic_name", N) == 0) {
+    /* D-Alpha-X: description. */
+    emit(e, "({\n"
+        "#if defined(__x86_64__)\n"
+        "    __asm__ __volatile__ (\"x86-specific asm\" : ... : ... : \"memory\");\n"
+        "#elif defined(__aarch64__)\n"
+        "    __asm__ __volatile__ (\"arm64-specific asm\" : ... : ... : \"memory\");\n"
+        "#elif defined(__ARM_ARCH)\n"
+        "    __asm__ __volatile__ (\"armv7-specific asm\" : ... : ... : \"memory\");\n"
+        "#elif defined(__riscv)\n"
+        "    __asm__ __volatile__ (\"risc-v-specific asm\" : ... : ... : \"memory\");\n"
+        "#else\n"
+        "    /* safe fallback for unknown targets */\n"
+        "#endif\n"
+        "})");
+}
+```
+
+**Reading the emitted value:** If the intrinsic returns a value (like
+`@cpu_save_int_state()`), declare a temp inside `({ ... })` and end with
+the temp as the expression value:
+
+```c
+emit(e, "({ uint64_t _zer_tmp = 0;\n"
+    "#if defined(__x86_64__)\n"
+    "    __asm__ __volatile__ (\"pushfq; popq %0\" : \"=r\"(_zer_tmp) :: \"memory\");\n"
+    /* ... */
+    "#endif\n"
+    "_zer_tmp; })");   /* last expression = value of statement expr */
+```
+
+**Inner blocks for temps (scoping):** When a per-arch branch needs its
+own local variable (different width, etc.), wrap in a `{ }` block:
+
+```c
+"#elif defined(__ARM_ARCH)\n"
+"    { uint32_t _zer_p; __asm__ __volatile__ (\"mrs %0, primask\" : \"=r\"(_zer_p)); _zer_istate = _zer_p; }\n"
+```
+
+This prevents the temp from polluting other branches' scope.
+
+### Privileged intrinsics: testing without executing
+
+D-Alpha-3 intrinsics (cli, sti, hlt) fault with SIGSEGV in user mode.
+You can compile them but cannot RUN them in a Linux user-mode test.
+Solution: dead-branch pattern.
+
+```zer
+volatile u32 never_true;   /* global, initialized to 0 at load */
+
+u64 kernel_mode_code() {
+    /* Dead branch — compiler emits the asm but never_true is always 0 */
+    if (never_true == 42) {
+        @cpu_disable_int();       /* compiles, never executes */
+        @cpu_wait_int();
+        @cpu_enable_int();
+        return 1;
+    }
+    return 0;
+}
+
+i32 main() {
+    u64 x = kernel_mode_code();
+    if (x != 0) { return 1; }     /* always 0 since branch dead */
+    return 0;
+}
+```
+
+**Why this works:**
+- `volatile` prevents the compiler from assuming `never_true == 0`
+- Asm IS emitted (verifies compilation + link)
+- Branch never taken at runtime (no SIGSEGV)
+- Optimizer keeps the dead branch due to volatile read
+
+**Use this pattern for:**
+- All privileged intrinsics (D-Alpha-3 interrupts, D-Alpha-5 MMU,
+  D-Alpha-7 MSR access)
+- Runtime-untestable intrinsics (boot init, mode transitions)
+
+**Real kernel code calls these from ring 0 / EL1+ / M-mode** where
+they work correctly. D-Alpha tests validate compilation only; runtime
+validation happens during kernel integration.
+
+### memcmp-length footgun (real bug caught during D-Alpha-3)
+
+When matching intrinsic names, always verify `strlen(name) == nlen`
+explicitly. Getting this wrong creates DEAD CODE that silently never
+executes:
+
+```c
+/* WRONG — string "cpu_save_int_state" is 18 chars, not 19 */
+} else if (nlen == 19 && memcmp(name, "cpu_save_int_state", 18) == 0) {
+    /* This branch NEVER matches any input — dead code */
+}
+
+/* CORRECT */
+} else if (nlen == 18 && memcmp(name, "cpu_save_int_state", 18) == 0) {
+    /* works */
+}
+```
+
+Symptom: intrinsic recognized by checker but emitter has no matching
+branch, or vice versa. Result: emit of plain identifier instead of
+the intended asm.
+
+**Rule:** before committing, count the string length manually or run
+`echo -n "name" | wc -c`. Don't eyeball it.
+
+### ZER function syntax gotcha for fresh sessions
+
+ZER uses C-STYLE function declaration: `ReturnType name(params) { ... }`.
+NOT Rust-style `fn name(params) -> ReturnType { ... }`.
+
+```zer
+/* CORRECT ZER syntax */
+u64 my_function(u32 x) {
+    return (u64)x;
+}
+
+/* WRONG — Rust style, parse error "expected '{' at '-'" */
+fn my_function(x: u32) -> u64 {
+    return x as u64;
+}
+```
+
+Common mistake in fresh sessions (happened during D-Alpha-3 test
+writing). Error message: `error: expected '{' at '-'` — the `-` is
+from `->`. If you see this, you wrote Rust-style.
+
+### D-Alpha batch progress update (2026-04-23 late)
+
+| Batch | Status | Intrinsics added | Commit |
+|---|---|---|---|
+| D-Alpha-1 | DONE | 7 new atomics | 2e152f3 |
+| D-Alpha-2 | DONE | 10 barriers+bits | a14d3c0 |
+| D-Alpha-3 | DONE | 5 interrupt control | 3e6e2f2 |
+| D-Alpha-4 | Pending | 4 context switch (hardest — full register state save/restore per arch) | — |
+| D-Alpha-5 | Pending | 10 MMU | — |
+| D-Alpha-6 | Pending | 11 TLB + cache | — |
+| D-Alpha-7 | Pending | 38 MSR + inspection + power | — |
+
+30 of 96 intrinsics implemented. Per-arch asm pattern proven — future
+batches reuse it.

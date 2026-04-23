@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @mmu_enable takes no arguments
+
+i32 main() {
+    @mmu_enable(1);  // error: takes no args
+    return 0;
+}

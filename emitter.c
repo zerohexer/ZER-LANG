@@ -5937,6 +5937,144 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    _zer_istate = 0;\n"
                 "#endif\n"
                 "_zer_istate; })");
+        } else if (nlen == 10 && memcmp(name, "mmu_set_pt", 10) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-5: set user/active page table base. Privileged. */
+            emit(e, "({ uint64_t _zer_pt = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mov %%0, %%%%cr3\" : : \"r\"(_zer_pt) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr ttbr0_el1, %%0\\n\\tisb\" : : \"r\"(_zer_pt) : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrw satp, %%0\\n\\tsfence.vma\" : : \"r\"(_zer_pt) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_pt;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "mmu_get_pt", 10) == 0) {
+            /* D-Alpha-5: read active page table base. Returns u64. Privileged. */
+            emit(e, "({ uint64_t _zer_pt = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mov %%%%cr3, %%0\" : \"=r\"(_zer_pt));\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, ttbr0_el1\" : \"=r\"(_zer_pt));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrr %%0, satp\" : \"=r\"(_zer_pt));\n"
+                "#endif\n"
+                "_zer_pt; })");
+        } else if (nlen == 17 && memcmp(name, "mmu_set_kernel_pt", 17) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-5: set kernel page table (ARM TTBR1; aliased to TTBR0 on x86/RISC-V). */
+            emit(e, "({ uint64_t _zer_kpt = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr ttbr1_el1, %%0\\n\\tisb\" : : \"r\"(_zer_kpt) : \"memory\");\n"
+                "#elif defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mov %%0, %%%%cr3\" : : \"r\"(_zer_kpt) : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrw satp, %%0\\n\\tsfence.vma\" : : \"r\"(_zer_kpt) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_kpt;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 17 && memcmp(name, "mmu_get_kernel_pt", 17) == 0) {
+            /* D-Alpha-5: read kernel page table. */
+            emit(e, "({ uint64_t _zer_kpt = 0;\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, ttbr1_el1\" : \"=r\"(_zer_kpt));\n"
+                "#elif defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mov %%%%cr3, %%0\" : \"=r\"(_zer_kpt));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrr %%0, satp\" : \"=r\"(_zer_kpt));\n"
+                "#endif\n"
+                "_zer_kpt; })");
+        } else if (nlen == 10 && memcmp(name, "mmu_enable", 10) == 0) {
+            /* D-Alpha-5: turn on paging. Privileged.
+             * x86-64 uses btsq (bit test and set) to set CR0.PG (bit 31) —
+             * simpler than building a 64-bit imm with `or`. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"mov %%%%cr0, %%%%rax\\n\\t\"\n"
+                "        \"btsq $31, %%%%rax\\n\\t\"\n"
+                "        \"mov %%%%rax, %%%%cr0\" : : : \"rax\", \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"mrs x0, sctlr_el1\\n\\t\"\n"
+                "        \"orr x0, x0, #1\\n\\t\"\n"
+                "        \"msr sctlr_el1, x0\\n\\tisb\" : : : \"x0\", \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 11 && memcmp(name, "mmu_disable", 11) == 0) {
+            /* D-Alpha-5: turn off paging. Privileged. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"mov %%%%cr0, %%%%rax\\n\\t\"\n"
+                "        \"btrq $31, %%%%rax\\n\\t\"\n"
+                "        \"mov %%%%rax, %%%%cr0\" : : : \"rax\", \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"mrs x0, sctlr_el1\\n\\t\"\n"
+                "        \"bic x0, x0, #1\\n\\t\"\n"
+                "        \"msr sctlr_el1, x0\\n\\tisb\" : : : \"x0\", \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "mmu_is_enabled", 14) == 0) {
+            /* D-Alpha-5: read paging enable bit. Returns bool. */
+            emit(e, "({ uint64_t _zer_cr = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mov %%%%cr0, %%0\" : \"=r\"(_zer_cr));\n"
+                "    _zer_cr = (_zer_cr >> 31) & 1;\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, sctlr_el1\" : \"=r\"(_zer_cr));\n"
+                "    _zer_cr = _zer_cr & 1;\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrr %%0, satp\" : \"=r\"(_zer_cr));\n"
+                "    _zer_cr = (_zer_cr >> 60) != 0;  /* Sv39/48/57 set MODE != 0 when enabled */\n"
+                "#endif\n"
+                "(_zer_cr != 0); })");
+        } else if (nlen == 18 && memcmp(name, "mmu_get_fault_addr", 18) == 0) {
+            /* D-Alpha-5: read fault address after page fault. Privileged. */
+            emit(e, "({ uint64_t _zer_fa = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mov %%%%cr2, %%0\" : \"=r\"(_zer_fa));\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, far_el1\" : \"=r\"(_zer_fa));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrr %%0, stval\" : \"=r\"(_zer_fa));\n"
+                "#endif\n"
+                "_zer_fa; })");
+        } else if (nlen == 20 && memcmp(name, "mmu_get_fault_status", 20) == 0) {
+            /* D-Alpha-5: read fault status/syndrome. Privileged. */
+            emit(e, "({ uint64_t _zer_fs = 0;\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, esr_el1\" : \"=r\"(_zer_fs));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrr %%0, scause\" : \"=r\"(_zer_fs));\n"
+                "#endif\n"
+                "/* x86 fault status comes from interrupt frame, not a register */\n"
+                "_zer_fs; })");
+        } else if (nlen == 8 && memcmp(name, "mmu_sync", 8) == 0) {
+            /* D-Alpha-5: synchronize pending page-table updates. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"\" : : : \"memory\");  /* implicit via cr3 write */\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dsb ishst\\n\\tisb\" : : : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"sfence.vma\\n\\tfence.i\" : : : \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 16 && memcmp(name, "cpu_save_context", 16) == 0 &&
                    node->intrinsic.arg_count >= 1) {
             /* D-Alpha-4: save callee-saved GPRs to buffer.

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// @mmu_set_pt argument must be integer
+
+struct Page { u32 id; }
+
+i32 main() {
+    Page p = { .id = 1 };
+    @mmu_set_pt(p);  // error: struct, not integer
+    return 0;
+}

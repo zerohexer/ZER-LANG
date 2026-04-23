@@ -5794,6 +5794,41 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
             }
             result = ty_void;
+        } else if ((nlen == 10 && memcmp(name, "mmu_enable", 10) == 0) ||
+                   (nlen == 11 && memcmp(name, "mmu_disable", 11) == 0) ||
+                   (nlen == 8 && memcmp(name, "mmu_sync", 8) == 0)) {
+            /* D-Alpha-5: MMU enable/disable/sync — 0-arg, void return. Privileged. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if (nlen == 14 && memcmp(name, "mmu_is_enabled", 14) == 0) {
+            /* D-Alpha-5: @mmu_is_enabled() -> bool */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@mmu_is_enabled takes no arguments");
+            }
+            result = ty_bool;
+        } else if ((nlen == 10 && memcmp(name, "mmu_set_pt", 10) == 0) ||
+                   (nlen == 17 && memcmp(name, "mmu_set_kernel_pt", 17) == 0)) {
+            /* D-Alpha-5: set page table base address (1 u64 arg). Privileged. */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (physical address)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 10 && memcmp(name, "mmu_get_pt", 10) == 0) ||
+                   (nlen == 17 && memcmp(name, "mmu_get_kernel_pt", 17) == 0) ||
+                   (nlen == 18 && memcmp(name, "mmu_get_fault_addr", 18) == 0) ||
+                   (nlen == 20 && memcmp(name, "mmu_get_fault_status", 20) == 0)) {
+            /* D-Alpha-5: MMU state read (0-arg, return u64). Privileged. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_u64;
         } else if ((nlen == 16 && memcmp(name, "cpu_save_context", 16) == 0) ||
                    (nlen == 19 && memcmp(name, "cpu_restore_context", 19) == 0) ||
                    (nlen == 12 && memcmp(name, "cpu_save_fpu", 12) == 0) ||

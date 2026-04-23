@@ -1,0 +1,38 @@
+// Phase D-Alpha-5: MMU control intrinsics
+// All 10 MMU ops — all privileged, use dead-branch pattern.
+
+volatile u32 never_execute;
+
+u64 kernel_mmu_setup() {
+    if (never_execute == 42) {
+        // set / get page table
+        @mmu_set_pt(0x1000);
+        u64 pt = @mmu_get_pt();
+
+        // kernel page table (ARM TTBR1)
+        @mmu_set_kernel_pt(0x2000);
+        u64 kpt = @mmu_get_kernel_pt();
+
+        // enable / disable / query
+        @mmu_enable();
+        bool on = @mmu_is_enabled();
+        @mmu_disable();
+
+        // fault info
+        u64 addr = @mmu_get_fault_addr();
+        u64 status = @mmu_get_fault_status();
+
+        // sync after page table update
+        @mmu_sync();
+
+        if (on) { return pt + kpt + addr + status; }
+        return 1;
+    }
+    return 0;
+}
+
+i32 main() {
+    u64 x = kernel_mmu_setup();
+    if (x != 0) { return 1; }
+    return 0;
+}

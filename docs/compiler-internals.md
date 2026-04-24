@@ -6485,3 +6485,229 @@ fault" near FPU intrinsics are usually alignment issues.
 34 of 96 intrinsics implemented. Patterns established for remaining
 62: GCC builtin dispatch (for portable ops), per-arch `#if defined`
 dispatch (for arch-specific), dead-branch testing (for privileged).
+
+---
+
+## Z-Rules: extending ZER's 29 safety systems through unsafe asm (2026-04-23)
+
+**KEY ARCHITECTURAL DECISION.** Read this before touching strict mode
+implementation in the checker.
+
+### The core insight
+
+ZER's 29 safety tracking systems (see `docs/safety-model.md` and
+CLAUDE.md "Safety Architecture") exist for NORMAL ZER code. They
+track state at program points, function summaries, type-level
+annotations, and state machines.
+
+**`unsafe asm` blocks have TYPED operand bindings.** Each input and
+output operand is a ZER value with a ZER type. That value already
+carries all 29 systems' tracking state.
+
+**Therefore: extending the 29 systems through asm is NOT new
+infrastructure. It's wiring up existing infrastructure to asm
+operand bindings.**
+
+This is ZER's permanent philosophy: **tracking beats banning**. Most
+real-world asm bugs are state-tracking issues (UAF, leak, escape,
+provenance, move-after-transfer), not abstract semantic correctness.
+Z-rules catch these at language-safety level; Vale-tier catches
+semantic correctness orthogonally.
+
+### The 13 Z-rules (strict mode upgrade)
+
+Added to the 18 structural rules (S/O/I/E) documented in
+`docs/asm_plan.md`. Total strict mode = 31 rules, 99% language-safe.
+
+| Z-rule | Check | ZER system leveraged | File to modify |
+|---|---|---|---|
+| Z1 | Handle operand must be ALIVE (not FREED/TRANSFERRED) | System #7 Handle States | `zercheck.c` — existing `find_handle()` check at asm input binding |
+| Z2 | `move struct` consumed by asm → HS_TRANSFERRED | System #10 Move Tracking | `zercheck.c` — existing move-struct path, extend to asm consumption |
+| Z3 | VRP ranges propagate through asm outputs | System #12 Range Propagation | `checker.c` — VRP `derive_expr_range()` wired to asm outputs |
+| Z4 | Provenance tracked on `*opaque` asm operands | System #3 Provenance | `checker.c` — existing provenance check at asm output binding |
+| Z5 | `memory` clobber propagates escape flags | System #11 Escape Flags | `checker.c` — existing `scan_escape()` path, trigger on memory clobber |
+| Z6 | Context flags enforced (defer/critical/async) | System #24 Context Flags | `checker.c` — existing `c->in_defer`, `c->critical_depth`, etc. |
+| Z7 | MMIO range check on memory operands | System #19 MMIO Ranges | `checker.c` — existing mmio range check applied to asm memory op |
+| Z8 | Qualifier preservation through asm | System #20 Qualifier Tracking | `checker.c` — existing qualifier strip check at asm binding |
+| Z9 | Asm inside ISR respects tracking | System #17 ISR Tracking | `checker.c` — existing ISR ban list applied to asm body |
+| Z10 | Non-storable asm outputs | System #16 Non-Storable | `checker.c` — existing non-storable check on asm output lvalue |
+| Z11 | Keep-parameter requirements | System #21 Keep Parameters | `checker.c` — existing keep check on asm input |
+| Z12 | Stack frame accounting through asm | System #18 Stack Frames | `checker.c` — `scan_frame()` walker must handle NODE_ASM |
+| Z13 | Return-range declaration respected | System #13 Return Range | `checker.c` — existing return range check at asm output |
+
+### Where to wire up each Z-rule
+
+For fresh sessions implementing Z-rules: the checker has ONE main
+dispatch site for asm — `check_asm_stmt()` or equivalent. Each
+Z-rule hooks a specific existing tracking function:
+
+```c
+static void check_unsafe_asm(Checker *c, Node *asm_node) {
+    /* Existing Phase 1 verified check — keep */
+    if (!zer_asm_allowed_in_context(c->in_naked)) { ... }
+
+    /* Z6: context flags (already covered by existing checks) */
+    if (c->in_defer || c->critical_depth > 0 || c->in_async) { ... }
+
+    /* Z9: ISR context (already covered) */
+    if (c->in_interrupt) { check_isr_ban_list(c, asm_node); }
+
+    /* Z12: stack frame accounting — scan_frame() must visit NODE_ASM */
+
+    /* For each input operand: */
+    for (each input in asm_node->inputs) {
+        Type *t = check_expr(c, input.expr);
+
+        /* Z1: Handle state check (delegate to zercheck) */
+        zc_check_expr(zc, input.expr);
+
+        /* Z2: move struct consumption */
+        if (type_is_move_struct(t)) {
+            mark_transferred(c, input.expr);
+        }
+
+        /* Z3: VRP range propagate */
+        VarRange r = derive_expr_range(c, input.expr);
+
+        /* Z4: provenance check */
+        if (input.binding.is_opaque_ptr) {
+            check_provenance_match(c, t, input.binding.declared_type);
+        }
+
+        /* Z7: MMIO range check */
+        if (input.binding.is_memory) {
+            check_mmio_range(c, input.expr);
+        }
+
+        /* Z8: qualifier preservation */
+        check_qualifier_preservation(c, t, input.binding.type);
+
+        /* Z11: keep parameter check */
+        if (needs_keep(c, input.expr)) { ... }
+    }
+
+    /* For each output operand: same pattern for output side */
+    /* Z5: escape flags from memory clobber */
+    if (has_memory_clobber(asm_node)) {
+        propagate_escape_from_memory_clobber(c, asm_node);
+    }
+}
+```
+
+**The functions called above ALREADY EXIST for normal ZER code.**
+Z-rules just invoke them at asm operand boundaries.
+
+### Language-safe vs logic-safe (scope distinction)
+
+ZER is a **language-safe** language, not a **logic-safe** language.
+This is the SAME scope every safe language draws:
+
+| In scope (ZER guarantees) | Out of scope (developer's responsibility) |
+|---|---|
+| Memory safety (UAF, bounds, null) | Algorithm choice |
+| Type safety | Business logic |
+| Data race safety (shared struct) | Requirements fit |
+| Handle lifecycle (no leaks, no double-free) | Off-by-one in dev's own variable |
+| Resource safety (move struct) | Wrong condition code (`jz` vs `jnz`) |
+| Provenance | Wrong immediate value |
+| ABI compliance | What inputs the user provides |
+| MMIO range validation | Error recovery strategy |
+
+**ZER does NOT claim to prevent logic bugs. Neither does Rust, Ada,
+Haskell, Swift, Zig, or any other safe language.**
+
+With strict mode + Z-rules: ZER+ASM is **100% language-safe**.
+Logic safety is Vale-tier's domain (formal proof of algorithm
+correctness against a spec).
+
+### Unique ZER advantage (vs Rust / Zig)
+
+Rust's `unsafe { asm!() }` DISABLES the borrow checker inside the
+block. Same for Rust's `unsafe fn`. The 29 tracking systems... don't
+exist in Rust as such (they have borrow checker + some type rules),
+but the PRINCIPLE holds: Rust's unsafe is a hole in the safety net.
+
+ZER's strict mode + Z-rules KEEPS all 29 systems active at asm
+operand boundaries. The asm block is a black box to semantic
+verification but NOT to tracking: state flows through inputs, and
+side effects (memory clobber, move consumption, etc.) propagate.
+
+**This is ZER's genuine innovation.** Nobody else does this at the
+language level for inline assembly.
+
+### Anti-patterns when implementing Z-rules
+
+| Tempting | Don't | Why |
+|---|---|---|
+| Add a `#pragma disable_zercheck` inside unsafe asm | Never | Defeats the point |
+| Only check types at asm boundary, skip state tracking | Never | Z-rules are the whole point |
+| Invent new tracking systems for asm-specific bugs | No | Reuse existing 29 — cheaper, consistent |
+| Make @verified_spec mandatory to "subsume" Z-rules | No | Vale-tier is orthogonal dimension; keep both |
+| Skip Z-rules in v1.0 strict mode | No | Plan calls for 31 rules = 18 structural + 13 Z; all in v1.0.1 flag |
+
+### Testing Z-rules
+
+Test pattern: write an `unsafe asm` block that would violate the
+Z-rule; verify checker rejects it with the right error message.
+
+Template (each Z-rule needs at least one negative test):
+
+```zer
+/* tests/zer_fail/dalpha_zrule_Z1_uaf.zer */
+/* EXPECTED: compile error */
+
+Handle(Task) h = Task.alloc() orelse return;
+Task.free(h);
+
+unsafe asm {
+    instructions: "nop"
+    inputs: { "r" = h.index }  /* error: use-after-free on freed handle */
+    safety: "Debug inspection of handle"
+}
+
+i32 main() { return 0; }
+```
+
+Put negative tests in `tests/zer_fail/dalpha_zrule_ZN_*.zer` — one
+per Z-rule. Positive tests in `tests/zer/dalpha_zrule_ZN_*.zer`.
+
+### Effort estimate (roughly confirmed)
+
+**~240 hrs total for Z-rules implementation.** Breakdown:
+
+| Work | Hours |
+|---|---|
+| Z1 (Handle state) — wire `zc_check_expr` at asm input | 15 |
+| Z2 (move tracking) — extend transfer-on-consume path | 15 |
+| Z3 (VRP) — propagate through asm outputs | 30 |
+| Z4 (provenance) — existing check at asm binding | 15 |
+| Z5 (escape) — memory clobber triggers escape scan | 25 |
+| Z6 (context flags) — mostly existing (~10 lines) | 10 |
+| Z7 (MMIO range) — extend existing range check | 20 |
+| Z8 (qualifier) — asm binding qualifier validation | 15 |
+| Z9 (ISR) — extend existing ISR ban | 10 |
+| Z10 (non-storable) — existing check | 10 |
+| Z11 (keep) — existing check | 10 |
+| Z12 (stack frame) — `scan_frame` must visit NODE_ASM | 15 |
+| Z13 (return range) — existing check | 10 |
+| Test suite (13 negative + 13 positive) | 40 |
+| **Total** | **~240 hrs** |
+
+Most of the 240 hrs is extending existing infrastructure to handle
+NODE_ASM (or similar) as an input/output binding site. None of the
+individual checks are new — just invocation sites.
+
+### Plan integration
+
+Strict mode (Tier A, v1.0) now includes:
+- H1-H7 baseline (120 hrs)
+- 18 structural rules (S/O/I/E, ~100 hrs)
+- 13 Z-rules (~240 hrs) ← **this section**
+- Tests + docs (~40 hrs)
+- **Total: ~500 hrs for Tier A**
+
+Tier B (v1.0.1): add selective Vale-tier on 20 critical intrinsics.
+Tier C (v1.1+): full Vale-tier + `@verified_spec` for user asm.
+
+See `docs/asm_plan.md` for complete tier breakdown + user
+preferences + decision log.

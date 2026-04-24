@@ -266,6 +266,24 @@ Callee-saved only (rbx/r12-r15 on x86, x19-x28 on ARM64, s0-s11 on RISC-V).
 Full RSP/RIP save requires naked functions — kernel-integration scope.
 Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branch pattern.
 
+### `unsafe asm` safety (strict mode + Z-rules, planned D-Alpha-7.5)
+
+ZER's 29 safety tracking systems extend THROUGH `unsafe asm` operand boundaries via 13 Z-rules. Unlike Rust (which disables borrow checker inside `unsafe { asm!() }`), ZER keeps all tracking active at asm bindings.
+
+**Strict mode = 18 structural rules + 13 Z-rules = 31 rules, ~99% language-safe.**
+
+Z-rules catch through-asm bugs that Rust can't:
+- Z1: UAF through asm operand (Handle must be ALIVE per System #7)
+- Z2: move struct consumed by asm → HS_TRANSFERRED (System #10)
+- Z5: memory clobber = escape marker (stack pointer escape rejected, System #11)
+- Z7: asm memory operand must be in declared mmio range (System #19)
+- Z8: qualifier preservation (can't strip const/volatile via asm, System #20)
+- Plus Z3/Z4/Z6/Z9-Z13 leveraging VRP, provenance, context flags, ISR tracking, etc.
+
+**Scope is language-safe, NOT logic-safe.** ZER catches memory/type/handle/move/concurrency/provenance/MMIO bugs. Algorithm correctness + business logic = developer's responsibility (same scope as every safe language). Vale-tier (v1.1+) adds orthogonal semantic correctness via `@verified_spec`.
+
+See `docs/compiler-internals.md` Z-rules section for implementation details; `docs/asm_plan.md` for roadmap.
+
 ### mmio Declaration (MANDATORY for @inttoptr)
 ```
 mmio 0x40020000..0x40020FFF;   // declare valid MMIO address range

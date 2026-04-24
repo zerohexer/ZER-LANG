@@ -78,9 +78,11 @@ Until that migration, these files are NOT in the active test suite.
 | C7 Provenance/aliasing | **COMPLETE (2026-04-24)** | 5 | **0 POCs (rare in base ISAs). Surprising finding: base ISAs silent on aliasing (MOVS, LDP/STP). Maps to existing System #3 + #11 without extension.** |
 | C8 Memory ordering | **COMPLETE (2026-04-24)** | 6 | **5 .zer POCs + ISA citations across 3 archs (MFENCE/SFENCE/LFENCE/CLWB x86, DMB/DSB/ISB/LDAR/STLR ARM64, FENCE/FENCE.I/AMO-aq-rl RISC-V). NEW System #30 (Atomic Ordering) designed. Est. 80 hrs implementation — only new system added by Option C.** |
 | ~~C9 Exclusive pairing~~ | **MERGED INTO C3 (2026-04-24)** | — | — |
-| C10 Register dependency | Pending (may defer entirely) | — | — |
+| ~~C10 Register dependency~~ | **DELETED (2026-04-24 Session 7)** | 7 | **No unique cases. All candidates collapse into structural rules O1/O2/E1/I4. Final category count: 8.** |
 
-**Category count:** 9 (was 10; C9 merged into C3 in Session 3).
+**Category count: 8 (FINAL).** Original taxonomy was 10; C9 merged into C3 (Session 3) and C10 deleted (Session 7). All 8 surviving categories verified across 5 architectures.
+
+**Research Phase COMPLETE (2026-04-24).** 8 categories, 18 structural rules, 13 Z-rules, 1 new ZER safety system (#30), 5-arch universal verification. Implementation work begins when D-Alpha-7.5 Phase 2 starts.
 
 ### Universality verification (spot-checks)
 

@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_cpuid requires 2 arguments (leaf, subleaf)
+
+i32 main() {
+    u64 v = @cpu_cpuid(1);  // error: missing subleaf arg
+    if (v == 0 || v != 0) { return 0; }
+    return 0;
+}

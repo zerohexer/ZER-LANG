@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_fxsave argument must be pointer or array
+
+i32 main() {
+    u64 scalar = 0;
+    @cpu_fxsave(scalar);  // error: scalar, not pointer
+    return 0;
+}

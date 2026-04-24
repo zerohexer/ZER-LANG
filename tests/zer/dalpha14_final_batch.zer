@@ -1,0 +1,72 @@
+// D-Alpha-14: final 12 intrinsics — reaches 130 total
+// Categories: CPUID, EOI, CR2, cache enable/disable, FXSAVE/FXRSTOR,
+//             FPU init, UMWAIT/UMONITOR, ENDBR (CET-IBT)
+//
+// Most privileged or x86-specific — dead-branch pattern.
+
+volatile u32 never_true;
+
+void dead_branch_cpuid_test() {
+    u64 cpuid_ab = 0;
+    u64 cpuid_cd = 0;
+    if (never_true == 42) {
+        cpuid_ab = @cpu_cpuid(1, 0);       // leaf 1: family/model/stepping
+        cpuid_cd = @cpu_cpuid_ecx(1, 0);   // leaf 1: feature bits
+    }
+    if (cpuid_ab == 0 || cpuid_ab != 0) { return; }
+    if (cpuid_cd == 0 || cpuid_cd != 0) { return; }
+}
+
+void dead_branch_eoi_test() {
+    if (never_true == 42) {
+        @cpu_eoi();
+    }
+}
+
+void dead_branch_cr2_test() {
+    u64 fault_addr = 0;
+    if (never_true == 42) {
+        fault_addr = @cpu_read_cr2();
+    }
+    if (fault_addr == 0 || fault_addr != 0) { return; }
+}
+
+void dead_branch_cache_control_test() {
+    if (never_true == 42) {
+        @cpu_cache_disable();
+        @cpu_cache_enable();
+    }
+}
+
+void dead_branch_fxsave_test() {
+    u8[512] fp_buf;
+    if (never_true == 42) {
+        @cpu_fxsave(&fp_buf[0]);
+        @cpu_fxrstor(&fp_buf[0]);
+        @cpu_fpu_init();
+    }
+}
+
+void dead_branch_umwait_test() {
+    u32 target = 0;
+    if (never_true == 42) {
+        @cpu_umonitor(&target);
+        @cpu_umwait(0, 1000);
+    }
+}
+
+void safe_endbr_test() {
+    // ENDBR64 is a NOP on CPUs without CET-IBT — safe to execute.
+    @cpu_endbr();
+}
+
+i32 main() {
+    dead_branch_cpuid_test();
+    dead_branch_eoi_test();
+    dead_branch_cr2_test();
+    dead_branch_cache_control_test();
+    dead_branch_fxsave_test();
+    dead_branch_umwait_test();
+    safe_endbr_test();
+    return 0;
+}

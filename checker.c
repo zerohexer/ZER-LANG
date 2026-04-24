@@ -3027,6 +3027,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->assign.target->kind == NODE_IDENT) {
                         tsym->is_local_derived = false;
                         tsym->is_arena_derived = false;
+                        tsym->is_from_arena = false;  /* BUG-597: must clear on reassign */
                         tsym->provenance_type = NULL;
                         tsym->container_struct = NULL;
                         tsym->container_field = NULL;
@@ -9892,10 +9893,64 @@ static void register_decl(Checker *c, Node *node) {
  * GOTO / LABEL VALIDATION
  * ================================================================ */
 
-/* Collect all labels in a function body, then validate all gotos have targets */
-typedef struct { const char *name; size_t len; int line; } LabelInfo;
+/* Collect all labels in a function body, then validate all gotos have targets.
+ *
+ * BUG-609: labels and gotos also record their capture-arm path — the chain of
+ * if-unwrap bodies / switch-capture arms that enclose them. Each arm is
+ * uniquely identified by the containing Node* pointer. A goto that targets
+ * a label whose path contains an arm the goto is NOT inside = invalid
+ * (the goto skips capture binding, leaving it auto-zero'd). */
+typedef struct {
+    const char *name; size_t len; int line;
+    /* Capture-arm path: array of Node* pointers (stable IDs) for each
+     * if-unwrap/switch-capture arm enclosing this label/goto, outermost first. */
+    void **arm_path;
+    int arm_depth;
+} LabelInfo;
 
-static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
+static void *copy_arm_path_local(Checker *c, void **stack, int depth) {
+    if (depth == 0) return NULL;
+    void **out = (void **)arena_alloc(c->arena, depth * sizeof(void *));
+    for (int i = 0; i < depth; i++) out[i] = stack[i];
+    return out;
+}
+
+/* Helpers to grow a stack of arm IDs (Node*). Stack-first dynamic. */
+typedef struct {
+    void **stack;       /* arena-allocated once capacity >= inline cap */
+    int depth;
+    int capacity;
+    void *inline_buf[32];
+} ArmStack;
+
+static void arm_stack_push(Checker *c, ArmStack *s, void *id) {
+    if (s->depth == 0 && s->capacity == 0) {
+        s->stack = s->inline_buf;
+        s->capacity = 32;
+    }
+    if (s->depth >= s->capacity) {
+        int nc = s->capacity * 2;
+        void **nb = (void **)arena_alloc(c->arena, nc * sizeof(void *));
+        for (int i = 0; i < s->depth; i++) nb[i] = s->stack[i];
+        s->stack = nb;
+        s->capacity = nc;
+    }
+    s->stack[s->depth++] = id;
+}
+
+static void arm_stack_pop(ArmStack *s) { if (s->depth > 0) s->depth--; }
+
+/* Does the if-unwrap bind a capture? */
+static bool if_has_capture_local(Node *if_node) {
+    return if_node && if_node->if_stmt.capture_name != NULL;
+}
+/* Does the switch arm bind a capture? */
+static bool switch_arm_has_capture_local(SwitchArm *arm) {
+    return arm && arm->capture_name != NULL;
+}
+
+static void collect_labels(Checker *c, Node *node, LabelInfo *labels,
+                           int *count, int max, ArmStack *arms) {
     if (!node) return;
     switch (node->kind) {
     case NODE_LABEL:
@@ -9903,35 +9958,47 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
             labels[*count].name = node->label_stmt.name;
             labels[*count].len = node->label_stmt.name_len;
             labels[*count].line = node->loc.line;
+            labels[*count].arm_path = (void **)copy_arm_path_local(c, arms->stack, arms->depth);
+            labels[*count].arm_depth = arms->depth;
             (*count)++;
         }
         break;
     case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
-            collect_labels(node->block.stmts[i], labels, count, max);
+            collect_labels(c, node->block.stmts[i], labels, count, max, arms);
         break;
-    case NODE_IF:
-        collect_labels(node->if_stmt.then_body, labels, count, max);
-        collect_labels(node->if_stmt.else_body, labels, count, max);
+    case NODE_IF: {
+        bool has_cap = if_has_capture_local(node);
+        if (has_cap) arm_stack_push(c, arms, node);
+        collect_labels(c, node->if_stmt.then_body, labels, count, max, arms);
+        if (has_cap) arm_stack_pop(arms);
+        /* else body does NOT share the capture; treat as outside the arm */
+        collect_labels(c, node->if_stmt.else_body, labels, count, max, arms);
         break;
+    }
     case NODE_FOR:
-        collect_labels(node->for_stmt.body, labels, count, max);
+        collect_labels(c, node->for_stmt.body, labels, count, max, arms);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
-        collect_labels(node->while_stmt.body, labels, count, max);
+        collect_labels(c, node->while_stmt.body, labels, count, max, arms);
         break;
     case NODE_SWITCH:
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            collect_labels(node->switch_stmt.arms[i].body, labels, count, max);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            SwitchArm *arm = &node->switch_stmt.arms[i];
+            bool has_cap = switch_arm_has_capture_local(arm);
+            if (has_cap) arm_stack_push(c, arms, arm);
+            collect_labels(c, arm->body, labels, count, max, arms);
+            if (has_cap) arm_stack_pop(arms);
+        }
         break;
     case NODE_DEFER:
-        collect_labels(node->defer.body, labels, count, max);
+        collect_labels(c, node->defer.body, labels, count, max, arms);
         break;
     case NODE_CRITICAL:
-        collect_labels(node->critical.body, labels, count, max);
+        collect_labels(c, node->critical.body, labels, count, max, arms);
         break;
     case NODE_ONCE:
-        collect_labels(node->once.body, labels, count, max);
+        collect_labels(c, node->once.body, labels, count, max, arms);
         break;
     /* Nodes that cannot contain labels */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
@@ -9949,15 +10016,31 @@ static void collect_labels(Node *node, LabelInfo *labels, int *count, int max) {
     }
 }
 
-static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_count) {
+/* For a goto with path `goto_arms` targeting label with path `label_arms`,
+ * the goto is VALID iff every arm in `label_arms` also appears in `goto_arms`
+ * at the same position (goto is nested within all capture arms containing
+ * the label). Otherwise the goto "enters" a capture arm without binding. */
+static bool goto_path_covers_label(void **goto_arms, int goto_depth,
+                                   void **label_arms, int label_depth) {
+    if (label_depth > goto_depth) return false;
+    for (int i = 0; i < label_depth; i++) {
+        if (goto_arms[i] != label_arms[i]) return false;
+    }
+    return true;
+}
+
+static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
+                           int label_count, ArmStack *arms) {
     if (!node) return;
     switch (node->kind) {
     case NODE_GOTO: {
         bool found = false;
+        LabelInfo *tgt = NULL;
         for (int i = 0; i < label_count; i++) {
             if (labels[i].len == node->goto_stmt.label_len &&
                 memcmp(labels[i].name, node->goto_stmt.label, labels[i].len) == 0) {
                 found = true;
+                tgt = &labels[i];
                 break;
             }
         }
@@ -9965,35 +10048,50 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels, int label_
             checker_error(c, node->loc.line,
                 "goto target '%.*s' not found in this function",
                 (int)node->goto_stmt.label_len, node->goto_stmt.label);
+        } else if (!goto_path_covers_label(arms->stack, arms->depth,
+                                           tgt->arm_path, tgt->arm_depth)) {
+            checker_error(c, node->loc.line,
+                "goto '%.*s' jumps into if-unwrap/switch-capture arm without "
+                "binding the capture — capture variable would be uninitialized",
+                (int)node->goto_stmt.label_len, node->goto_stmt.label);
         }
         break;
     }
     case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
-            validate_gotos(c, node->block.stmts[i], labels, label_count);
+            validate_gotos(c, node->block.stmts[i], labels, label_count, arms);
         break;
-    case NODE_IF:
-        validate_gotos(c, node->if_stmt.then_body, labels, label_count);
-        validate_gotos(c, node->if_stmt.else_body, labels, label_count);
+    case NODE_IF: {
+        bool has_cap = if_has_capture_local(node);
+        if (has_cap) arm_stack_push(c, arms, node);
+        validate_gotos(c, node->if_stmt.then_body, labels, label_count, arms);
+        if (has_cap) arm_stack_pop(arms);
+        validate_gotos(c, node->if_stmt.else_body, labels, label_count, arms);
         break;
+    }
     case NODE_FOR:
-        validate_gotos(c, node->for_stmt.body, labels, label_count);
+        validate_gotos(c, node->for_stmt.body, labels, label_count, arms);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
-        validate_gotos(c, node->while_stmt.body, labels, label_count);
+        validate_gotos(c, node->while_stmt.body, labels, label_count, arms);
         break;
     case NODE_SWITCH:
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            validate_gotos(c, node->switch_stmt.arms[i].body, labels, label_count);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            SwitchArm *arm = &node->switch_stmt.arms[i];
+            bool has_cap = switch_arm_has_capture_local(arm);
+            if (has_cap) arm_stack_push(c, arms, arm);
+            validate_gotos(c, arm->body, labels, label_count, arms);
+            if (has_cap) arm_stack_pop(arms);
+        }
         break;
     case NODE_DEFER:
-        validate_gotos(c, node->defer.body, labels, label_count);
+        validate_gotos(c, node->defer.body, labels, label_count, arms);
         break;
     case NODE_CRITICAL:
-        validate_gotos(c, node->critical.body, labels, label_count);
+        validate_gotos(c, node->critical.body, labels, label_count, arms);
         break;
     case NODE_ONCE:
-        validate_gotos(c, node->once.body, labels, label_count);
+        validate_gotos(c, node->once.body, labels, label_count, arms);
         break;
     /* Nodes that cannot contain goto */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
@@ -10017,13 +10115,15 @@ static void check_goto_labels(Checker *c, Node *func_body) {
     LabelInfo *labels = stack_labels;
     int label_count = 0;
     int label_cap = 128;
-    collect_labels(func_body, labels, &label_count, label_cap);
+    ArmStack arms = { .stack = NULL, .depth = 0, .capacity = 0 };
+    collect_labels(c, func_body, labels, &label_count, label_cap, &arms);
     /* If we hit the limit, grow and re-collect */
     if (label_count >= label_cap) {
         label_cap = label_count * 2;
         labels = (LabelInfo *)arena_alloc(c->arena, label_cap * sizeof(LabelInfo));
         label_count = 0;
-        collect_labels(func_body, labels, &label_count, label_cap);
+        arms.depth = 0;
+        collect_labels(c, func_body, labels, &label_count, label_cap, &arms);
     }
 
     /* Check for duplicate labels */
@@ -10038,8 +10138,9 @@ static void check_goto_labels(Checker *c, Node *func_body) {
         }
     }
 
-    /* Validate all gotos have matching labels */
-    validate_gotos(c, func_body, labels, label_count);
+    /* Validate all gotos have matching labels AND don't enter capture arms */
+    arms.depth = 0;
+    validate_gotos(c, func_body, labels, label_count, &arms);
 }
 
 /* ================================================================

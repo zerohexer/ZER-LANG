@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// BUG-595b: await outside async function
+void not_async() {
+    u32 x = 0;
+    await (x == 1);
+}
+i32 main() { return 0; }

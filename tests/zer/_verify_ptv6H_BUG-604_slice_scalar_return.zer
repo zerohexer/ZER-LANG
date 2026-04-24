@@ -1,0 +1,15 @@
+// Tests ptv6H's BUG-604: scalar read via local slice index falsely rejected.
+// If bug present: "pointer to local" escape error — compile FAILS.
+// If fixed: compile succeeds.
+
+i32 main() {
+    u32[4] arr;
+    arr[0] = 1;
+    arr[1] = 2;
+    arr[2] = 3;
+    arr[3] = 4;
+    []u32 s = arr[0..4];  // slice of local
+    u32 v = s[2];  // returning scalar read — should NOT be flagged as escape
+    if (v == 3) { return 0; }
+    return 1;
+}

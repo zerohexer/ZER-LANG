@@ -1,0 +1,19 @@
+// Tests BUG-608: defer body with nested if/else, free inside each branch.
+// If bug PRESENT: "handle never freed" error — compile FAILS.
+// If FIXED: both defer scanners recognize free in if/else — compile PASSES.
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+i32 main() {
+    Handle(Task) h = tasks.alloc() orelse { return 0; };
+    u32 err = 0;
+    defer {
+        if (err == 0) {
+            tasks.free(h);
+        } else {
+            tasks.free(h);
+        }
+    }
+    return 0;
+}

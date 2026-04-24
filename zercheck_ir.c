@@ -900,11 +900,37 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         }
     }
 
-    /* Recurse into block statements */
-    if (body->kind == NODE_BLOCK) {
-        for (int i = 0; i < body->block.stmt_count; i++) {
+    /* Recurse into block AND nested control-flow bodies (BUG-608).
+     * Conservative: any reachable free inside defer marks handle FREED.
+     * Misses some conditional-free double-detect but prevents false
+     * leak on `defer { if (err) { free(h); } else { free(h); } }`. */
+    switch (body->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < body->block.stmt_count; i++)
             ir_defer_scan_frees(zc, func, ps, body->block.stmts[i], defer_line);
-        }
+        break;
+    case NODE_IF:
+        ir_defer_scan_frees(zc, func, ps, body->if_stmt.then_body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line);
+        break;
+    case NODE_FOR:
+        ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line);
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        ir_defer_scan_frees(zc, func, ps, body->while_stmt.body, defer_line);
+        break;
+    case NODE_SWITCH:
+        for (int i = 0; i < body->switch_stmt.arm_count; i++)
+            ir_defer_scan_frees(zc, func, ps, body->switch_stmt.arms[i].body, defer_line);
+        break;
+    case NODE_CRITICAL:
+        ir_defer_scan_frees(zc, func, ps, body->critical.body, defer_line);
+        break;
+    case NODE_ONCE:
+        ir_defer_scan_frees(zc, func, ps, body->once.body, defer_line);
+        break;
+    default:
+        break;
     }
 }
 
@@ -2391,7 +2417,16 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * The lattice is finite (5 states × N handles), so 32 iterations is
      * plenty for any realistic program. Convergence failure means the
      * program is pathologically complex; we refuse to compile it rather
-     * than miss a potential UAF. */
+     * than miss a potential UAF.
+     *
+     * BUG-600 error-spam fix: fixed-point loop can visit each block up
+     * to 32 times. Without suppression, ir_check_inst emits the same
+     * error on every iteration (30+ duplicates on adversarial tests).
+     * Fix: suppress via building_summary during convergence, then run
+     * one more pass on the converged state with errors enabled. */
+    bool saved_suppress = zc->building_summary;
+    zc->building_summary = true;
+
     bool changed = true;
     int iterations = 0;
     const int MAX_ITERATIONS = 32;
@@ -2458,10 +2493,50 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
+    /* BUG-600: restore suppression state and run ONE final pass on the
+     * converged state with errors enabled. State is stable (no !changed
+     * for full pass), so re-running produces exactly the same final
+     * errors, each emitted once instead of once per iteration. */
+    zc->building_summary = saved_suppress;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+
+        IRPathState merged;
+        if (bb->pred_count == 0) {
+            if (bi > 0 && func->blocks[bi - 1].inst_count > 0) {
+                IRInst *prev_last = &func->blocks[bi - 1].insts[
+                    func->blocks[bi - 1].inst_count - 1];
+                if (prev_last->op == IR_RETURN) {
+                    merged = ir_ps_copy(&block_states[bi - 1]);
+                } else {
+                    ir_ps_init(&merged);
+                }
+            } else {
+                ir_ps_init(&merged);
+            }
+        } else {
+            IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));
+            for (int pi = 0; pi < bb->pred_count; pi++) {
+                pred_states[pi] = ir_ps_copy(&block_states[bb->preds[pi]]);
+            }
+            merged = ir_merge_states(pred_states, bb->pred_count);
+            for (int pi = 0; pi < bb->pred_count; pi++)
+                ir_ps_free(&pred_states[pi]);
+            free(pred_states);
+        }
+
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            ir_check_inst(zc, &merged, &bb->insts[ii], func);
+        }
+
+        ir_ps_free(&block_states[bi]);
+        block_states[bi] = merged;
+    }
+
     /* FAIL-CLOSED: if the fixed point didn't converge, emit a compile
      * error. Skip during summary-building (would add spurious errors
      * for partial analysis). */
-    if (changed && iterations >= MAX_ITERATIONS && !zc->building_summary) {
+    if (changed && iterations >= MAX_ITERATIONS && !saved_suppress) {
         int fail_line = func->ast_node ? func->ast_node->loc.line : 0;
         ir_zc_error(zc, fail_line,
             "safety analysis did not converge within %d iterations — program too complex "

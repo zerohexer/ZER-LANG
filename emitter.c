@@ -5081,6 +5081,52 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 return;
             }
         }
+        /* BUG-604: shift safety (ZER spec: shift >= width = 0).
+         * emit_rewritten_node is called for expressions preserved in
+         * IR_ASSIGN/IR_CALL/IR_AWAIT/IR_RETURN inst->expr (e.g. array
+         * index writes `arr[i] = x`, field writes `s.f = x`, await
+         * conditions). Without this, raw C `<<`/`>>` leaks through,
+         * producing UB on n >= width. Mirrors emit_expr NODE_BINARY
+         * shift handling. */
+        if (node->binary.op == TOK_LSHIFT || node->binary.op == TOK_RSHIFT) {
+            emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+            emit_rewritten_node(e, node->binary.left, func);
+            emit(e, ", ");
+            emit_rewritten_node(e, node->binary.right, func);
+            emit(e, ")");
+            return;
+        }
+        /* BUG-604: signed division overflow (INT_MIN / -1 is C UB).
+         * Checker already rejects divisor-not-proven-nonzero at compile
+         * time (see checker.c forced division guard), so we only need
+         * the signed overflow trap. */
+        if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
+            Type *div_type = lt ? type_unwrap_distinct(lt) : NULL;
+            bool is_signed_div = div_type && type_is_signed(div_type);
+            if (is_signed_div) {
+                int tmp = e->temp_count++;
+                emit(e, "({ __typeof__(");
+                emit_rewritten_node(e, node->binary.right, func);
+                emit(e, ") _zer_dv%d = ", tmp);
+                emit_rewritten_node(e, node->binary.right, func);
+                emit(e, "; if (_zer_dv%d == -1) { __typeof__(", tmp);
+                emit_rewritten_node(e, node->binary.left, func);
+                emit(e, ") _zer_dd%d = ", tmp);
+                emit_rewritten_node(e, node->binary.left, func);
+                int w = type_width(div_type);
+                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
+                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
+                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
+                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
+                emit(e, "(");
+                emit_rewritten_node(e, node->binary.left, func);
+                emit(e, " %s _zer_dv%d); })",
+                     node->binary.op == TOK_SLASH ? "/" : "%", tmp);
+                return;
+            }
+            /* Unsigned / or %: no overflow concern. Fall through to raw emit. */
+        }
         emit(e, "(");
         emit_rewritten_node(e, node->binary.left, func);
         emit(e, " %s ", op);

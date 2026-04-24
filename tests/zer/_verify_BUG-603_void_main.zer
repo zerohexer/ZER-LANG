@@ -1,0 +1,7 @@
+// Tests BUG-603: void main() had undefined exit code.
+// After fix: emitted C should be `int main(void)` + return 0;
+// Test passes only if binary exits with code 0.
+
+void main() {
+    // no explicit return
+}

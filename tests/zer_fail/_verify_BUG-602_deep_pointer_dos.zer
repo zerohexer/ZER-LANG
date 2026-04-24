@@ -1,0 +1,8 @@
+// EXPECTED: compile error (BUG-602 parser DoS with depth guard)
+// Before fix: parser recurses forever on **********T (deeply nested), segfault.
+// After fix: parser rejects at depth 128 with clear error.
+
+// Attempting ~200 levels of pointer depth
+********************************************************************************************************************************************************************************************************u32 ptr;
+
+i32 main() { return 0; }

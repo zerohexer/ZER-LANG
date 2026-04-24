@@ -1,0 +1,35 @@
+// EXPECTED: compile warning (not hard error — INVLPG is unique)
+//
+// Category C6b (Canonical address form) — x86-64 INVLPG
+// Source: Intel SDM INVLPG —
+// "It also operates the same in 64-bit mode, except if the memory address
+// is in non-canonical form. In this case, INVLPG is the same as a NOP."
+//
+// Unique case: most memory-referencing instructions raise #GP(0) on
+// non-canonical addresses. INVLPG is SILENT NO-OP.
+//
+// ZER checker should WARN (not hard error) when INVLPG is called with
+// potentially-non-canonical address — user probably didn't intend no-op.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C6+C7 session 5
+
+void unsafe_invlpg(u64 addr) {
+    // `addr` is user-controlled; VRP can't prove canonical form.
+    // For canonical on x86-64 (48-bit VA), bits 48-63 must match bit 47.
+    //
+    // Category C6b check should WARN.
+    //
+    // Expected warning: "INVLPG with potentially non-canonical address is
+    //                    silently NOP'd by hardware (C6b). Did you intend
+    //                    a no-op? Add canonical-address guard if not."
+    unsafe asm {
+        instructions: "invlpg (%0)"
+        inputs:  { "r" = addr }
+        clobbers: ["memory"]
+        safety: "Invalidate TLB entry for address"
+    }
+}
+
+i32 main() {
+    return 0;
+}

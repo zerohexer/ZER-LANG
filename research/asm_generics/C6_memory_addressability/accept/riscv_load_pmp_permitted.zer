@@ -1,0 +1,47 @@
+// EXPECTED: compiles + runs
+//
+// Category C6d (PMP-protected region) — RISC-V load within permitted region.
+// POSITIVE TEST: load from an address range declared as readable.
+//
+// RISC-V PMP raises load access-fault if address is in a PMP region without
+// read permission. When address is in a region that HAS read permission
+// (e.g., declared via mmio attributes in ZER), the check passes.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C6+C7 session 5
+
+// Declare a valid read region (ZER syntax mimicking PMP permitted region):
+mmio 0x10000000..0x10001000;
+
+u32 safe_read_from_pmp_region(u64 offset) {
+    u32 value;
+
+    // When strict mode lands, this should compile:
+    //
+    //     u64 addr = 0x10000000 + offset;
+    //     if (addr < 0x10001000) {  // VRP proves addr in mmio range
+    //         unsafe asm {
+    //             instructions: "lw %0, 0(%1)"
+    //             inputs:  { "r" = addr }
+    //             outputs: { "=r" = value }
+    //             clobbers: []
+    //             safety: "Load word from PMP-permitted MMIO region"
+    //         }
+    //     }
+    //
+    // Category C6d check PASSES:
+    //   - addr VRP range: [0x10000000, 0x10000FFF]
+    //   - PMP read-permitted range (ZER mmio): [0x10000000, 0x10001000)
+    //   - range ⊆ permitted → OK
+
+    // Placeholder implementation: read from ZER primitive pointer
+    *u32 reg = @inttoptr(*u32, 0x10000000);
+    value = 42;  // simulate — real MMIO would read reg
+
+    return value;
+}
+
+i32 main() {
+    u32 v = safe_read_from_pmp_region(0);
+    if (v == 42) { return 0; }
+    return 1;
+}

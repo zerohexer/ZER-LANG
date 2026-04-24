@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cache_flush_range first argument must be pointer or array
+
+i32 main() {
+    u32 scalar = 0;
+    @cache_flush_range(scalar, 64);  // error: scalar, not pointer/array
+    return 0;
+}

@@ -1,0 +1,41 @@
+// Phase D-Alpha-6: TLB + cache intrinsics
+// 5 TLB flushes + 6 cache maintenance ops
+//
+// Most ops are privileged (TLB flush, MMU cache ops) and will SIGSEGV in user mode.
+// Use dead-branch pattern for privileged ops. Portable ones (icache invalidate) can
+// execute directly.
+
+volatile u32 never_execute;
+
+u64 kernel_memory_ops() {
+    u8[4096] page_buf;
+
+    if (never_execute == 42) {
+        // TLB flushes — all privileged
+        @tlb_flush_all();
+        @tlb_flush_global();
+        @tlb_flush_asid(1);
+        @tlb_flush_addr(0x1000);
+        @tlb_flush_range(0x1000, 0x5000);
+
+        // Cache maintenance — mostly privileged for data cache, but range-based
+        @cache_flush_range(&page_buf[0], 4096);
+        @cache_clean_range(&page_buf[0], 4096);
+        @cache_invalidate_range(&page_buf[0], 4096);
+        @cache_flush_line(&page_buf[0]);
+        @cache_zero_line(&page_buf[0]);
+
+        return 1;
+    }
+
+    // Instruction cache invalidate — portable GCC builtin, safe in user mode
+    @cache_invalidate_icache(&page_buf[0], 4096);
+
+    return 0;
+}
+
+i32 main() {
+    u64 x = kernel_memory_ops();
+    if (x != 0) { return 1; }
+    return 0;
+}

@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @tlb_flush_all takes no arguments
+
+i32 main() {
+    @tlb_flush_all(1);  // error: takes no args
+    return 0;
+}

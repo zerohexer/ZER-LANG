@@ -5792,6 +5792,74 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@cpu_id takes no arguments");
             }
             result = ty_u32;
+        } else if ((nlen == 13 && memcmp(name, "tlb_flush_all", 13) == 0) ||
+                   (nlen == 16 && memcmp(name, "tlb_flush_global", 16) == 0)) {
+            /* D-Alpha-6: TLB flush (0-arg, void). Privileged. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if ((nlen == 14 && memcmp(name, "tlb_flush_asid", 14) == 0) ||
+                   (nlen == 14 && memcmp(name, "tlb_flush_addr", 14) == 0)) {
+            /* D-Alpha-6: TLB flush (1-arg integer, void). Privileged. */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                }
+            }
+            result = ty_void;
+        } else if (nlen == 15 && memcmp(name, "tlb_flush_range", 15) == 0) {
+            /* D-Alpha-6: @tlb_flush_range(u64 start, u64 end_exclusive) */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@tlb_flush_range requires 2 arguments (start, end)");
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
+                    checker_error(c, node->loc.line, "@tlb_flush_range arguments must be integers");
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 17 && memcmp(name, "cache_flush_range", 17) == 0) ||
+                   (nlen == 17 && memcmp(name, "cache_clean_range", 17) == 0) ||
+                   (nlen == 22 && memcmp(name, "cache_invalidate_range", 22) == 0) ||
+                   (nlen == 23 && memcmp(name, "cache_invalidate_icache", 23) == 0)) {
+            /* D-Alpha-6: cache range ops (2 args: *u8 buf, usize len) */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@%.*s requires 2 arguments (addr, size)", (int)nlen, name);
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if (vt1) {
+                    Type *eff = type_unwrap_distinct(vt1);
+                    bool is_ptr_or_array = (eff->kind == TYPE_POINTER) || (eff->kind == TYPE_ARRAY);
+                    if (!is_ptr_or_array) {
+                        checker_error(c, node->loc.line, "@%.*s first argument must be pointer or array", (int)nlen, name);
+                    }
+                }
+                if (vt2 && !type_is_integer(vt2)) {
+                    checker_error(c, node->loc.line, "@%.*s size argument must be integer", (int)nlen, name);
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 16 && memcmp(name, "cache_flush_line", 16) == 0) ||
+                   (nlen == 15 && memcmp(name, "cache_zero_line", 15) == 0)) {
+            /* D-Alpha-6: single-line cache ops (1 arg: *u8 addr) */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (addr)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt) {
+                    Type *eff = type_unwrap_distinct(vt);
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+                        checker_error(c, node->loc.line, "@%.*s argument must be pointer or array", (int)nlen, name);
+                    }
+                }
+            }
+            result = ty_void;
         } else if ((nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) ||
                    (nlen == 10 && memcmp(name, "cpu_rdseed", 10) == 0)) {
             /* D-Alpha-7: hardware RNG — returns ?u64 because the instruction can fail */

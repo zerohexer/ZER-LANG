@@ -5,6 +5,131 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-24 — full-codebase audit (3 real bugs + 1 tool fix)
+
+Multi-phase audit run: Phase 1 behavioral (adversarial `.zer` programs),
+Phase 2 code-inspection (fixed buffers + depth caps), Phase 3 diff audit of
+D-Alpha-8 through D-Alpha-13 (41 new intrinsics). Three real bugs found, all
+fixed; audit tooling improved.
+
+### BUG-507: escape detection bypass via deep nested calls (fail-open depth cap)
+
+**Symptom**: 9+ levels of nested `identity()` calls let stack-escape detection
+silently miss a local-derived pointer being returned:
+
+```zer
+*u32 id(*u32 p) { return p; }
+*u32 escape() {
+    u32 local = 42;
+    return id(id(id(id(id(id(id(id(id(id(&local))))))))));  // compiles silently
+}
+```
+
+Shallow version (depth 1) correctly errors "cannot return result of call with
+local-derived pointer argument". Depth 10 bypasses the check.
+
+**Root cause**: `call_has_local_derived_arg` in `checker.c:647` had
+`if (!call || call->kind != NODE_CALL || depth > 8) return false;` — a
+fail-open depth cap. Returning false means "no escape detected", which lets
+pathological deep chains compile when they shouldn't.
+
+**Fix**: Made the depth cap fail-closed — `if (depth > 64) return true;`
+(assume escape when analysis is truncated). Raised cap from 8 to 64 — real
+call chains rarely exceed 16 levels, so false positives are negligible.
+Unknown = assume unsafe is the correct stance for a safety check.
+
+**Matches Fix Methodology (CLAUDE.md)**: Declaration-site fix (recursion
+guard), fail-closed instead of fail-open — same class as F7 iter-limit bug
+from the 2026-04-21 Gemini audit.
+
+**Test**: `tests/zer_fail/escape_via_deep_nested_call.zer` — 10-level
+nested identity() chain must fail compilation.
+
+### BUG-508: D-Alpha-13 port I/O intrinsics silent truncation
+
+**Symptom**: `@port_out8`, `@port_out16`, `@port_out32`, `@port_in8/16/32`
+accepted arguments wider than their declared signature and silently
+truncated via C cast in emitted asm wrapper:
+
+```zer
+u64 big = 0xDEADBEEFCAFEBABE;
+@port_out8(0x80, big);       // big → (uint8_t)(big) = 0xBE silently
+u64 evil = 0x100000000;
+u8 v = @port_in8(evil);      // evil → (uint16_t)(evil) = 0 silently
+```
+
+**Root cause**: Checker at `checker.c:5840-5877` only validated that the
+arguments were integers (`type_is_integer`). Width was not enforced. The
+emitter at `emitter.c:6572+` emits `(uint16_t)(...)` / `(uint8_t)(...)`
+casts which silently truncate. This violates ZER's "no silent truncation"
+rule (must use `@truncate`/`@saturate` explicitly).
+
+**Fix**: Added type_width() checks in the checker. Wider non-constant values
+are rejected with guidance: `use @truncate(uN, val) for wider integers`.
+Compile-time constants that fit are accepted (so literals like
+`@port_out8(0x80, 0x42)` still work).
+
+Values accepted:
+- `port_in*` port arg: type fits in u16 OR constant 0..0xFFFF.
+- `port_out*` port arg: same u16 rule.
+- `port_out8` value arg: type fits in u8 OR constant 0..0xFF.
+- `port_out16` value arg: u16 OR 0..0xFFFF.
+- `port_out32` value arg: u32 OR 0..0xFFFFFFFF.
+
+**Tests**:
+- `tests/zer_fail/port_out8_wider_value.zer` — u64 var to u8 port rejected
+- `tests/zer_fail/port_in_wider_port.zer` — u64 var to u16 port rejected
+
+### BUG-509 (tooling): `audit_matrix.sh` false positives
+
+**Symptom**: `bash tools/audit_matrix.sh checker.c` reported 8 "bugs" —
+return/yield/await/spawn missing defer/critical/interrupt checks. All were
+false positives: the `case NODE_X:` patterns were found in `scan_func_props`
+(FuncProps summary scanner at `checker.c:6847+`) rather than `check_stmt`
+(the real safety check dispatch at `checker.c:7265+`).
+
+**Root cause 1**: The tool hard-coded line range 6700-8200 for the search
+window. As the codebase grew, `scan_func_props` expanded into that range
+and its `case NODE_X:` cases took precedence over the `check_stmt` cases.
+
+**Root cause 2**: The tool expected each control-flow node's check to live
+in that node's handler. ZER uses a valid alternate pattern — scope-scan at
+the defer/critical handler via `check_body_effects` walks the body looking
+for yield/await. Without understanding this pattern, the tool flagged
+yield/await as missing defer_depth/critical_depth checks even though the
+enforcement was correct.
+
+**Fix**:
+- `tools/audit_matrix.sh`: Auto-locate the `check_stmt` function by grepping
+  its signature, then bound the search to the next top-level function. No
+  more hard-coded line range.
+- Add secondary check for scope-scan pattern (yield/await in defer/critical
+  enforced at the defer/critical handler via `check_body_effects`).
+- Add tertiary check for FuncProps pattern (spawn in critical/ISR enforced
+  via `can_spawn` summary, not per-node flag).
+
+After fix: `Total gaps: 0 — CLEAN — all safety contracts satisfied.`
+Verified by positive/negative tests that spawn/yield/await ARE actually
+banned in defer/critical/ISR.
+
+### Audit methodology notes (for fresh sessions)
+
+1. `call_has_local_derived_arg` used a fail-open depth cap — same anti-pattern
+   as F7 iter-limit (Gemini audit, 2026-04-21). **All depth caps in safety
+   analysis should be fail-closed** — returning "safe" when analysis is
+   truncated creates silent bypass vectors.
+
+2. When adding intrinsics that take narrower integer arguments (port_out8,
+   cache-line ops, u16 flags), the checker MUST enforce width explicitly.
+   The emitter's C cast will silently truncate, and ZER's "no silent
+   truncation" rule requires the checker to catch it.
+
+3. `audit_matrix.sh` is best-effort — it understands per-node check patterns
+   but can miss scope-scan and FuncProps patterns. When adding new checkers,
+   document the pattern in the tool's RULES table so it stops flagging.
+
+---
+
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)
 
 **Change:** Added `unsafe asm(...)` as the REQUIRED form for inline assembly. Bare `asm(...)` is rejected at compile time with a helpful error message pointing to `unsafe asm`.

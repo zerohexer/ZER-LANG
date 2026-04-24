@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// BUG-508 (audit-2026-04-24): @port_out8/16/32 and @port_in8/16/32 previously
+// accepted wider integer types and silently truncated via C cast in the
+// emitter, violating ZER's no-silent-truncation rule. Now rejected unless the
+// argument is a compile-time constant that fits.
+
+u32 main() {
+    u64 big = 0xDEADBEEFCAFEBABE;
+    @port_out8(0x80, big);  // u64 value to u8 port — silent truncation
+    return 0;
+}

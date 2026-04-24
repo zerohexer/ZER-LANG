@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// BUG-508: @port_in* with non-constant wider port number silently truncated.
+
+u32 main() {
+    u64 evil_port = 0x1_0000_0080;  // doesn't fit in u16
+    u8 v = @port_in8(evil_port);
+    if (v == 0 || v != 0) { return 0; }
+    return 0;
+}

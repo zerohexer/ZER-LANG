@@ -641,10 +641,19 @@ static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len) {
 
 /* BUG-374: recursively check if a call expression has any local-derived pointer
  * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
- * which itself has &x. We recurse into nested calls (max depth 8 to prevent
- * pathological input). Returns true if any arg is &local or local-derived. */
+ * which itself has &x. We recurse into nested calls.
+ *
+ * Depth limit is FAIL-CLOSED (returns true, i.e. "assume local-derived")
+ * instead of fail-open. Previously returned false at depth > 8, which let
+ * pathological deep-nested identity() chains bypass stack-escape detection:
+ *
+ *     *u32 f() { u32 x; return id(id(id(...id(id(&x))...))); }
+ *
+ * With 9+ levels, this compiled silently. Raised cap to 64 (real call chains
+ * rarely exceed 16) and made the cap conservative — unknown = escape risk. */
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
-    if (!call || call->kind != NODE_CALL || depth > 8) return false;
+    if (!call || call->kind != NODE_CALL) return false;
+    if (depth > 64) return true;  /* fail-closed: unknown = assume escape */
     for (int i = 0; i < call->call.arg_count; i++) {
         Node *arg = call->call.args[i];
         /* direct &local */
@@ -5840,13 +5849,24 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if ((nlen == 8 && memcmp(name, "port_in8", 8) == 0) ||
                    (nlen == 9 && memcmp(name, "port_in16", 9) == 0) ||
                    (nlen == 9 && memcmp(name, "port_in32", 9) == 0)) {
-            /* D-Alpha-13: port I/O input — 1-arg (u16 port), u8/u16/u32 return */
+            /* D-Alpha-13: port I/O input — 1-arg (u16 port), u8/u16/u32 return.
+             * Port is u16 on x86 — wider non-constant types would be silently
+             * truncated by the emitter's (uint16_t)(...) cast. Require that
+             * either (a) the type fits in u16, or (b) the value is a compile-
+             * time constant that fits in u16. */
             if (node->intrinsic.arg_count != 1) {
                 checker_error(c, node->loc.line, "@%.*s requires 1 argument (port number)", (int)nlen, name);
             } else {
                 Type *vt = typemap_get(c, node->intrinsic.args[0]);
                 if (vt && !type_is_integer(vt)) {
                     checker_error(c, node->loc.line, "@%.*s port argument must be integer", (int)nlen, name);
+                } else if (vt && type_width(vt) > 16) {
+                    int64_t cv = eval_const_expr(node->intrinsic.args[0]);
+                    if (cv == CONST_EVAL_FAIL || cv < 0 || cv > 0xFFFF) {
+                        checker_error(c, node->loc.line,
+                            "@%.*s port argument must fit in u16 — use @truncate(u16, val) for wider integers",
+                            (int)nlen, name);
+                    }
                 }
             }
             if (nlen == 8) { result = ty_u8; }
@@ -5855,7 +5875,11 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if ((nlen == 9 && memcmp(name, "port_out8", 9) == 0) ||
                    (nlen == 10 && memcmp(name, "port_out16", 10) == 0) ||
                    (nlen == 10 && memcmp(name, "port_out32", 10) == 0)) {
-            /* D-Alpha-13: port I/O output — 2-arg (u16 port, value), void */
+            /* D-Alpha-13: port I/O output — 2-arg (u16 port, value), void.
+             * Value width MUST match the intrinsic variant — emitter casts via
+             * (uint8_t) / (uint16_t) / (uint32_t) which silently truncates wider
+             * non-constant types. Constants that fit are accepted to allow
+             * literal use (e.g. @port_out8(0x80, 0x42)). */
             if (node->intrinsic.arg_count != 2) {
                 checker_error(c, node->loc.line, "@%.*s requires 2 arguments (port, value)", (int)nlen, name);
             } else {
@@ -5863,6 +5887,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
                 if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
                     checker_error(c, node->loc.line, "@%.*s arguments must be integers", (int)nlen, name);
+                } else {
+                    if (vt1 && type_width(vt1) > 16) {
+                        int64_t cv = eval_const_expr(node->intrinsic.args[0]);
+                        if (cv == CONST_EVAL_FAIL || cv < 0 || cv > 0xFFFF) {
+                            checker_error(c, node->loc.line,
+                                "@%.*s port argument must fit in u16 — use @truncate(u16, val) for wider integers",
+                                (int)nlen, name);
+                        }
+                    }
+                    if (vt2) {
+                        int max_w = (nlen == 9) ? 8 : (memcmp(name + 8, "16", 2) == 0 ? 16 : 32);
+                        if (type_width(vt2) > max_w) {
+                            int64_t cv = eval_const_expr(node->intrinsic.args[1]);
+                            int64_t limit = (max_w == 8) ? 0xFFLL : (max_w == 16 ? 0xFFFFLL : 0xFFFFFFFFLL);
+                            if (cv == CONST_EVAL_FAIL || cv < 0 || cv > limit) {
+                                checker_error(c, node->loc.line,
+                                    "@%.*s value argument must fit in u%d — use @truncate(u%d, val) for wider integers",
+                                    (int)nlen, name, max_w, max_w);
+                            }
+                        }
+                    }
                 }
             }
             result = ty_void;

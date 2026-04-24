@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// BUG-507 (audit-2026-04-24): `call_has_local_derived_arg` used a fail-open
+// depth cap of 8 — deeper nested identity() chains silently bypassed the
+// stack-escape detection. Fail-closed now: depth > 64 returns true.
+
+*u32 identity(*u32 p) { return p; }
+
+*u32 escape() {
+    u32 local = 42;
+    // 10 levels of nesting — previously bypassed escape check, now caught.
+    return identity(identity(identity(identity(identity(identity(identity(identity(identity(identity(&local))))))))));
+}
+
+u32 main() {
+    return 0;
+}

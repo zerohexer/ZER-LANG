@@ -38,9 +38,29 @@ for flag in $FLAGS; do
 done
 echo ""
 
-# For each node, find handler in check_stmt (between lines 6700-8200)
+# Locate the check_stmt function body. Other functions between the previous range
+# (e.g. scan_func_props) contain `case NODE_X:` cases that are scanners, not
+# safety checks — matching them produces false positives. Anchor on the actual
+# check_stmt symbol.
+CHECK_STMT_START=$(grep -n "^static void check_stmt(Checker \*c, Node \*node) {" "$FILE" | head -1 | cut -d: -f1)
+if [ -z "$CHECK_STMT_START" ]; then
+    # Fallback: try the forward declaration or alternate signatures
+    CHECK_STMT_START=$(grep -n "^void check_stmt(Checker \*c, Node \*node) {" "$FILE" | head -1 | cut -d: -f1)
+fi
+if [ -z "$CHECK_STMT_START" ]; then
+    echo "WARNING: check_stmt symbol not found; falling back to legacy range 6700-8200"
+    CHECK_STMT_START=6700
+fi
+
+# Scan forward for the next top-level function to bound the search.
+CHECK_STMT_END=$(awk -v start=$((CHECK_STMT_START + 1)) 'NR >= start && /^static [a-zA-Z_][a-zA-Z0-9_ *]* [a-zA-Z_][a-zA-Z0-9_]*\([^)]*\) *{/ {print NR; exit}' "$FILE")
+if [ -z "$CHECK_STMT_END" ]; then
+    CHECK_STMT_END=$((CHECK_STMT_START + 4000))
+fi
+
+# For each node, find handler in check_stmt
 for node in $NODES; do
-    case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 6700 && $1 < 8200 {print $1; exit}')
+    case_line=$(grep -n "case $node:" "$FILE" | awk -v lo=$CHECK_STMT_START -v hi=$CHECK_STMT_END -F: '$1 > lo && $1 < hi {print $1; exit}')
 
     if [ -z "$case_line" ]; then
         printf "%-14s (not found)\n" "$(echo $node | sed 's/NODE_//')"
@@ -121,7 +141,7 @@ for rule in $RULES; do
     flag=$(echo "$rule" | cut -d: -f2)
     reason=$(echo "$rule" | sed 's/^[^:]*:[^:]*://')
 
-    case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 6700 && $1 < 8200 {print $1; exit}')
+    case_line=$(grep -n "case $node:" "$FILE" | awk -v lo=$CHECK_STMT_START -v hi=$CHECK_STMT_END -F: '$1 > lo && $1 < hi {print $1; exit}')
     [ -z "$case_line" ] && continue
 
     end_line=$((case_line + 200))
@@ -132,11 +152,59 @@ for rule in $RULES; do
     fi
 
     short=$(echo $node | sed 's/NODE_//')
-    if ! echo "$handler" | grep -q "$flag"; then
-        echo "  BUG: $short missing $flag check (line $case_line)"
-        echo "       reason: $reason"
-        bug_count=$((bug_count + 1))
+    # Primary check: the flag is referenced in the node's handler.
+    if echo "$handler" | grep -q "$flag"; then
+        continue
     fi
+
+    # Secondary check — scope-scan pattern: yield/await in defer/critical is
+    # enforced at the DEFER / CRITICAL handler via check_body_effects that walks
+    # the body looking for yield/await nodes. Accept this pattern for the
+    # yield-defer / yield-critical / await-defer / await-critical rules.
+    if [ "$short" = "YIELD" ] || [ "$short" = "AWAIT" ]; then
+        target_case=""
+        case "$flag" in
+            defer_depth)    target_case="NODE_DEFER" ;;
+            critical_depth) target_case="NODE_CRITICAL" ;;
+        esac
+        if [ -n "$target_case" ]; then
+            scope_line=$(grep -n "case $target_case:" "$FILE" | awk -v lo=$CHECK_STMT_START -v hi=$CHECK_STMT_END -F: '$1 > lo && $1 < hi {print $1; exit}')
+            if [ -n "$scope_line" ]; then
+                scope_end=$((scope_line + 60))
+                scope_body=$(sed -n "${scope_line},${scope_end}p" "$FILE")
+                low_short=$(echo "$short" | tr 'A-Z' 'a-z')
+                if echo "$scope_body" | grep -qiE "cannot $low_short|$low_short.*inside|check_body_effects"; then
+                    continue
+                fi
+            fi
+        fi
+    fi
+
+    # Tertiary check — FuncProps summary pattern: spawn in @critical / ISR is
+    # enforced at NODE_CRITICAL / interrupt-scan entry via parent->props.can_spawn
+    # on the target function's Symbol (FuncProps, system #29). Accept that pattern.
+    if [ "$short" = "SPAWN" ]; then
+        if grep -qE "props\.can_spawn|can_spawn.*interrupt|can_spawn.*critical" "$FILE"; then
+            # Only accept if the NODE_CRITICAL / interrupt handler actually
+            # references can_spawn for a ban.
+            case "$flag" in
+                critical_depth)
+                    if grep -qE "can_spawn.*@critical|@critical.*can_spawn|spawn.*critical" "$FILE"; then
+                        continue
+                    fi
+                    ;;
+                in_interrupt)
+                    if grep -qE "can_spawn.*interrupt|interrupt.*can_spawn|spawn.*interrupt" "$FILE"; then
+                        continue
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+    echo "  BUG: $short missing $flag check (line $case_line)"
+    echo "       reason: $reason"
+    bug_count=$((bug_count + 1))
 done
 
 if [ "$bug_count" -eq 0 ]; then

@@ -10,7 +10,7 @@
 - **IMPLEMENTATION-FIRST DECISION (2026-04-23 evening):** Intrinsic IMPLEMENTATION is decoupled from Phase 2-7 prereq. Phase D split into D-Alpha (implementation, no formal proofs) and D-Beta (verification layer added later). This matches how seL4/CompCert/Vale were actually built — code first, proofs iteratively. Users can ship pure-ZER kernels ~1-2 years earlier. See "Implementation-First Plan (Phase D-Alpha)" section below.
 - **LINUX-SCALE EXPANSION (2026-04-23 late evening):** Target scope upgraded from 96 → **130 intrinsics** covering what Linux kernel arch/ uses. Explicitly out-of-scope: hypervisor (VMX/SVM/ARM-virt), enclaves (SGX/TDX/TrustZone), model-specific performance counters, Cortex-M (v1.1). These are handled via hardened `unsafe asm` escape hatch (see "Hardened `unsafe asm`" section).
 - **HARDENED `unsafe asm` (planned D-Alpha-7.5):** Upgrade from raw GCC inline asm pass-through to Rust-tier typed operands + clobber validation + mandatory safety docs + audit emission. Makes "vendor-specific via unsafe asm" actually safe, unlocking all modern CPU features (TDX, MTE, PAC, CET, future extensions) without needing dedicated intrinsics per feature.
-- **TIERED 100%-SAFE PLAN (2026-04-23 final):** Three-tier shipping for reaching 100% safe asm. **Tier A (v1.0):** strict mode with 18 compile-time rules (SPARK Ada tier) — 95% of asm bug classes structurally impossible. **Tier B (v1.0.1):** selective Vale-tier formal verification of 20 critical intrinsics — 99%. **Tier C (v1.1+):** full Vale-tier + `@verified_spec` attribute for any `unsafe asm` block — **100% safe asm** for every block. Hardware behavior (CPU execution of the verified instructions) is the silicon vendor's domain — not ZER's scope, not any language's scope.
+- **TWO-DIMENSION SAFETY PLAN (2026-04-24 revision):** Two ORTHOGONAL dimensions, not a continuum. **Language safety** (Tier A v1.0): strict mode = 18 structural rules + 13 Z-rules extending ZER's 29 safety systems through asm boundaries + per-instruction preconditions via existing VRP = **100% language-safe**. **Algorithm correctness** (Tier B v1.0.1 selective / Tier C v1.1+ per-block): `@verified_spec` Vale-tier for opt-in formal proof of what each asm block computes. Both dimensions compose — neither subsumes the other. Hardware behavior is the silicon vendor's domain — not ZER's scope, not any language's scope.
 
 **Related docs:**
 - `docs/ASM_ZER-LANG.md` — earlier (2026-04-01) asm research (context switch, boot, atomics design). That was the foundation; this is the formal verification plan built on top.
@@ -59,7 +59,7 @@ These are permanent guardrails from the user. They shape every choice below.
 | **100% usability for legitimate patterns** | Never reject a valid use case. Strict mode + Vale-tier both must support every pattern users legitimately need. No "you can't write X" rules where X is reasonable. |
 | **Linux-scale, not MVP-scale** | Target = Linux kernel arch/ subsystem. 130 intrinsics, not 96. Vendor-specific stuff (TDX, SGX, MTE, PAC) via hardened `unsafe asm`, not dedicated intrinsics. |
 | **`unsafe asm` for vendor-specific; intrinsics for everything else** | Clean separation. Intrinsics = compiler-provided and verified. `unsafe asm` = escape hatch for what intrinsics don't cover. `cinclude` = explicit external trust boundary. |
-| **Strict mode AND Vale-tier are COMPLEMENTARY** | Not alternatives. Strict mode (31 rules = 18 structural + 13 Z-rules) = 99% language-safety floor (universal). Vale-tier = 100% semantic ceiling (per-block opt-in). They compose. Don't propose simplifying to one. |
+| **Strict mode AND Vale-tier are COMPLEMENTARY** | Not alternatives. Strict mode (31 rules = 18 structural + 13 Z-rules + per-instruction preconditions) = 100% language-safety (universal). Vale-tier = algorithm correctness (per-block opt-in). Two DIFFERENT dimensions — not a continuum. Don't propose simplifying to one. |
 | **ZER's 29 safety systems extend through asm boundaries** | Unique ZER advantage over Rust. Rust's unsafe DISABLES borrow checker inside blocks. ZER keeps all 29 tracking systems ACTIVE at asm operand bindings. UAF, escape, move, provenance — all caught through asm. See Z-rules. |
 | **Language-safe scope, not logic-safe** | ZER guarantees memory/type/handle/move/concurrency/provenance/MMIO/qualifier safety. Logic bugs (wrong algorithm, off-by-one in developer's own variable) are OUT of scope — same as every safe language. Don't try to solve logic bugs. |
 | **Don't simplify away features** | User pushed back on "make it one thing" — explicit preference for layered depth. Keep the tiers. |
@@ -93,7 +93,7 @@ Fresh Claude sessions will be tempted. Resist. Each has a reason.
 
 | Tempting thing to do | Why it's wrong | What to do instead |
 |---|---|---|
-| **Simplify strict mode + Vale-tier to one model** | They're complementary. Strict mode (18 structural + 13 Z-rules) is universal floor (99% language-safe), Vale-tier is per-block ceiling (100% + semantic). Removing strict mode leaves 80% of blocks at 60% coverage. | Keep both. They compose. |
+| **Simplify strict mode + Vale-tier to one model** | They're DIFFERENT dimensions. Strict mode = language safety (100% via 29 systems + Z-rules + per-instruction preconditions). Vale-tier = algorithm correctness (opt-in formal proof). Removing strict mode leaves blocks without language safety. Removing Vale-tier loses algorithm proof for crypto/safety-critical code. | Keep both. They're orthogonal. |
 | **Try to make ZER prevent logic bugs** | No safe language does. Rust doesn't prevent wrong algorithms. Neither does Ada/SPARK, Haskell, Swift. Scope is language-safety, not logic-safety. | Acknowledge logic is dev responsibility. Focus ZER on language-level bugs. |
 | **Disable ZER safety checks inside unsafe asm** | Rust does this. ZER explicitly chose NOT to — 29 systems stay active through asm operand bindings. Unique ZER advantage. | Keep Z-rules. The 29 systems extend through asm, catching UAF/leak/escape/provenance via asm. |
 | **Add Z-rule code to `zercheck.c`** | `zercheck.c` is being DELETED (Phase G of CFG migration, v0.5.0). Only `zercheck_ir.c` survives. | Z1/Z2 go in `zercheck_ir.c` IR_ASM handler. Z3-Z13 go in `checker.c` NODE_ASM handler. Never touch `zercheck.c` — it's legacy. |
@@ -910,26 +910,28 @@ This unlocks **all modern CPU features** (TDX, SGX, MTE, PAC, CET, CHERI, future
 
 ### Three tiers of "safe asm"
 
-| Tier | Coverage of asm bug classes | How achieved | Achievable? |
-|---|---|---|---|
-| **Rust-tier** (H1-H7 baseline) | ~60% (typed operands + explicit clobbers + audit log) | D-Alpha-7.5 Phase 1 | YES (+120 hrs) |
-| **Structural 100%** (strict mode 18 rules) | 100% of structural bug classes (~95% of typical instances) | D-Alpha-7.5 Phase 2 (below) | YES (+240 hrs beyond H1-H7) |
-| **100% safe** (structural + formal verification) | **100%** — every covered block proven correct | Full Vale-tier (D-Beta) | YES (+1,500-2,500 hrs) |
+| Tier | Language safety | Algorithm correctness | How achieved | Effort |
+|---|---|---|---|---|
+| **Rust-tier** (H1-H7 baseline) | ~60% (typed operands + explicit clobbers + audit log) | none | D-Alpha-7.5 Phase 1 | +120 hrs |
+| **Strict mode** (H1-H7 + 18 structural + 13 Z-rules + per-instruction preconditions) | **100%** — all 29 ZER safety systems extended through asm, plus instruction-level UB | none (developer's job) | D-Alpha-7.5 Phase 2 | +500 hrs beyond H1-H7 |
+| **Vale-tier** (strict mode + `@verified_spec`) | 100% (Tier A holds) | **100% per annotated block** | Full Vale-tier (D-Beta) | +1,500-2,500 hrs |
 
-**"100% safe asm"** means: every intrinsic is formally verified, every `unsafe asm` block with `@verified_spec` is proven correct. That's the ceiling ZER reaches — same tier as seL4 / CompCert / Vale. CPU hardware execution is outside the language's scope (silicon vendor's domain).
+**"100% language-safe"** = no UAF, no bounds violation, no handle misuse, no move-after-transfer, no escape, no provenance confusion, no MMIO violation, no qualifier stripping, no instruction-level UB through asm. The 29 safety systems work THROUGH asm operand bindings via Z-rules + extended VRP through instruction preconditions.
+
+**Algorithm correctness** is an ORTHOGONAL dimension. Tier C `@verified_spec` proves the asm computes what the developer declared in pre/post-conditions. CPU hardware execution is outside the language's scope (silicon vendor's domain).
 
 ### Strict mode: 18 rules that close the structural gap
 
-After H1-H7 baseline, optional `--strict-asm` flag adds 18 rules. **Within structural bug classes, strict mode is 100% effective — every instance is a compile error.** Across ALL asm bug types, this covers ~95% of typical bug instances; the remaining ~5% are semantic bugs (wrong algorithm, off-by-one, wrong condition code) that Vale-tier addresses. No runtime overhead; all compile-time.
+After H1-H7 baseline, `--strict-asm` flag adds 18 structural rules + 13 Z-rules + per-instruction preconditions. **Strict mode is 100% language-safe** — every language-level bug class is a compile error. No runtime overhead; all compile-time.
 
-**Two dimensions of the claim (important distinction):**
+**Two orthogonal dimensions (important distinction):**
 
-| Dimension | Claim |
-|---|---|
-| Within the structural bug classes (missing clobbers, wrong arch, register typos, ABI violations, etc.) | **100% catch rate** — rules are deterministic compile errors |
-| Across ALL possible asm bugs (structural + semantic) | **~95% caught** — the 5% are semantic bugs requiring Vale-tier |
+| Dimension | Covered by | Coverage |
+|---|---|---|
+| **Language safety** — memory, types, handles, moves, escape, provenance, MMIO, qualifier, ABI, per-instruction UB | Tier A strict mode (31 rules + preconditions) | **100%** |
+| **Algorithm correctness** — does this crypto/syscall/memcpy actually compute what you claim? | Tier C Vale-tier `@verified_spec` (opt-in) | **100% per annotated block** |
 
-This is NOT "95% safe with 5% random failures." It's "100% safe for the bug classes covered, 0% safe for semantic bugs, and the mix happens to be ~95/5 in typical code."
+These are DIFFERENT dimensions, not a continuum. "100% language-safe" does NOT mean "algorithm is correct." Wrong algorithm = developer's bug, same scope as every safe language.
 
 **Structural rules (5):**
 
@@ -1014,15 +1016,19 @@ AST: NODE_ASM → checker.c (11 Z-rules at AST level) → annotated AST
   → emit_rewritten_node() → GCC inline asm
 ```
 
-**Total strict mode: 18 structural + 13 Z-rules = 31 rules. Coverage: ~99% of language-level bug classes.**
+**Total strict mode: 18 structural + 13 Z-rules + per-instruction preconditions = 100% language-safe.**
 
-Implementation effort: ~280 hrs (slight revision from earlier 240):
+The 13 Z-rules cover the 29 safety systems at the operand boundary. The 18 structural rules cover asm-specific operand/register/clobber validation. **Per-instruction precondition checking** extends the same VRP infrastructure (System #12) INSIDE the asm block — catches things like `bsr` on zero, shift count ≥ width, instruction-level UB that ZER already catches in normal code (div-zero, shift UB). Same safety class, same existing tracking system, just applied deeper.
+
+Implementation effort: ~500 hrs total for Tier A:
 - checker.c additions (11 Z-rules wiring): ~170 hrs
 - zercheck_ir.c additions (2 Z-rules in IR_ASM handler): ~30 hrs
 - ir_lower.c (NODE_ASM → IR_ASM with operand bindings): ~40 hrs
+- 18 structural rules (S/O/I/E): ~100 hrs
+- Per-instruction precondition checking (instruction database + asm parser + VRP hookup): ~130 hrs
 - Tests + docs: ~40 hrs
 
-Most of the infrastructure (29 tracking systems) is ALREADY implemented for normal ZER code. Z-rules just wire up asm operand bindings to flow through it. `zercheck.c` is being deleted — don't add code there.
+Most of the infrastructure (29 tracking systems) is ALREADY implemented for normal ZER code. Z-rules + per-instruction checks just wire up asm operand/instruction bindings to flow through it. `zercheck.c` is being deleted — don't add code there.
 
 ### Example: Z-rules catch real-world asm bugs
 
@@ -1139,46 +1145,54 @@ With rule E1: compiler re-parses `crc32q`, knows it clobbers rcx → compile err
 
 ### Language-safety scope (what ZER guarantees vs what it doesn't)
 
-**ZER's safety scope is language-level, not logic-level.** Same scope every safe language draws (Rust, Ada/SPARK, Haskell, Swift, Zig):
+**ZER's safety scope is language-level, not algorithm-level.** Same scope every safe language draws (Rust, Ada/SPARK, Haskell, Swift, Zig):
 
-| In scope (ZER catches) | Out of scope (developer's responsibility) |
+| In scope (ZER catches, 100%) | Out of scope (developer's responsibility) |
 |---|---|
 | Memory safety (UAF, bounds, null) | Algorithm choice (which algorithm to implement) |
 | Type safety (no confusion) | Requirements fit (does the code match what was asked) |
 | Data race safety (concurrency correctness) | Business rules (is the logic right) |
 | Handle lifecycle (leaks, double-free) | Off-by-one in YOUR loop variable |
 | Resource safety (move struct) | Wrong condition code (`jz` vs `jnz` in YOUR asm) |
-| Provenance (pointer tracking) | What inputs the user provides |
-| ABI compliance | Error recovery strategy |
-| MMIO range validation | Performance (which optimization to apply) |
+| Provenance (pointer tracking) | Wrong immediate value |
+| ABI compliance | What inputs the user provides |
+| MMIO range validation | Error recovery strategy |
+| Per-instruction UB (BSR on zero, shift UB, etc.) | Performance (which optimization to apply) |
 
-**ZER does NOT claim to prevent logic bugs.** No safe language does. Strict mode + Z-rules makes ASM+ZER **100% language-safe** — same meaning as "Rust is memory-safe," with broader scope (Rust's unsafe asm DISABLES safety; ZER's keeps the 29 systems active).
+**ZER does NOT claim to prevent algorithm bugs.** No safe language does. Strict mode (31 rules + per-instruction preconditions) makes ASM+ZER **100% language-safe** — same meaning as "Rust is memory-safe," with broader scope (Rust's unsafe asm DISABLES safety; ZER's keeps the 29 systems active).
 
-**Final claim: ZER+ASM with strict mode (18 structural + 13 Z-rules) = 100% language-safe.**
+**Final claim: ZER+ASM with strict mode (18 structural + 13 Z-rules + per-instruction preconditions) = 100% language-safe. Algorithm correctness is a SEPARATE orthogonal dimension, covered optionally by Tier C Vale-tier `@verified_spec` per block.**
 
-### What Vale-tier adds (orthogonal dimension)
+### What Vale-tier adds (orthogonal dimension — algorithm correctness)
 
-Vale-tier proves the asm computes its declared SPEC. That's a different dimension — semantic correctness of the algorithm.
+Vale-tier proves the asm computes its declared SPEC. Completely different dimension from language safety.
 
-| Dimension | Strict mode + Z-rules | Vale-tier |
+| Dimension | Strict mode (Tier A) | Vale-tier `@verified_spec` (Tier C) |
 |---|---|---|
-| Language safety (memory, types, handles, moves) | YES (100%) | YES (100%, subsumed by spec) |
-| Semantic correctness of algorithm | NO (developer writes correct algorithm) | YES (prove the algorithm does what spec says) |
-| Spec correctness (is the spec right?) | N/A | NO (spec is human-written — wrong spec = wrong proof) |
+| Language safety (memory, types, handles, moves, escape, provenance, MMIO, qualifier, instruction UB) | **YES (100%)** | YES (100%, inherited from Tier A — strict mode still applies inside Vale-tier blocks) |
+| Algorithm correctness (does this compute what you claim?) | NO (developer's responsibility) | **YES per annotated block** (prove the algorithm does what spec says) |
+| Spec correctness (is the spec itself right?) | N/A | NO (spec is human-written — wrong spec = wrong proof; fundamental limit of ALL formal methods) |
 
-**For 99% of ZER users:** strict mode + Z-rules = "fully safe" at the language level. Vale-tier is orthogonal; adds semantic correctness where it matters (crypto, safety-critical).
+**Key point:** Vale-tier does NOT replace strict mode. Strict mode still runs inside Vale-tier blocks — both dimensions compose. You get language safety AND algorithm correctness. Neither subsumes the other.
 
-For these semantic bugs, use Tier B (selective Vale-tier) or Tier C (full verification per block).
+**Two separate dimensions, not a continuum:**
 
-### Tiered plan: from 95% → 99.5% → 100%
+| Dimension | Tier | Coverage |
+|---|---|---|
+| **Language safety** (memory, types, handles, moves, concurrency, provenance, MMIO, qualifier, instruction UB) | Tier A (v1.0) | **100%** — strict mode + Z-rules + per-instruction preconditions |
+| **Algorithm correctness** (does this crypto/syscall/memcpy actually compute what you claim?) | Tier C (v1.1+, opt-in) | Per-block via `@verified_spec` Vale-tier |
 
-Three-tier shipping plan to reach 100% safe asm incrementally:
+For language safety: Tier A is complete. No gap. For algorithm correctness: developer chooses per block whether to add `@verified_spec`.
 
-| Tier | Version | Coverage | Approach | Budget impact |
-|---|---|---|---|---|
-| **A** | **v1.0** | ~99% language-safe | H1-H7 baseline + strict mode (18 structural + 13 Z-rules = 31 rules total) | +240 hrs above H1-H7 (total ~360 hrs) |
-| **B** | **v1.0.1** (3-6 mo after v1.0) | ~99% language-safe + critical-path semantic | +Selective Vale-tier on 20 critical intrinsics (context switch, MMU, atomics) using Iris Hoare logic over Sail | +400 hrs (reallocated from v1.1 Cortex-M fund) |
-| **C** | **v1.1+** (12+ mo after v1.0) | **100% language-safe + 100% semantic for annotated blocks** | +Full Vale-tier for covered subset. Every unsafe asm block with `@verified_spec` proven correct | +800-1,000 hrs (uses D-Beta budget) |
+### Tiered plan: language safety (Tier A) + algorithm correctness (Tier B/C)
+
+Two dimensions. Tier A delivers 100% language safety. Tier B/C add orthogonal algorithm-correctness proofs.
+
+| Tier | Version | Language safety | Algorithm correctness | Approach | Budget impact |
+|---|---|---|---|---|---|
+| **A** | **v1.0** | **100%** | none (dev's responsibility) | H1-H7 baseline + strict mode (18 structural + 13 Z-rules + per-instruction preconditions) | +500 hrs above H1-H7 (total ~620 hrs) |
+| **B** | **v1.0.1** (3-6 mo after v1.0) | 100% (Tier A holds) | selective (20 critical intrinsics) | +Selective Vale-tier on context switch, MMU, atomics using Iris Hoare logic over Sail | +400 hrs (reallocated from v1.1 Cortex-M fund) |
+| **C** | **v1.1+** (12+ mo after v1.0) | 100% (Tier A holds) | **per-block opt-in via `@verified_spec`** | +Full Vale-tier for any `unsafe asm` block with `@verified_spec` attribute | +800-1,000 hrs (uses D-Beta budget) |
 
 ### Example: `@verified_spec` for Tier C (v1.1+ feature)
 
@@ -1208,15 +1222,15 @@ This reaches **100% safe** for covered blocks.
 
 **After Tier A (v1.0):**
 
-> "ZER's `unsafe asm` enforces 18 compile-time rules (MISRA Directive 4.3 + SPARK Ada Machine_Code level). 95% of asm bugs are structurally impossible. Vendor-specific code (TDX, SGX, MTE, PAC, CET) handled via same hardened escape hatch. Semantic correctness relies on tests."
+> "ZER's `unsafe asm` is **100% language-safe**. Strict mode enforces 31 rules (18 structural + 13 Z-rules extending 29 safety systems through asm operand bindings) plus per-instruction precondition checking (BSR-on-zero, shift UB, etc.). All memory/type/handle/move/concurrency/provenance/MMIO/qualifier bugs caught at compile time. Vendor-specific code (TDX, SGX, MTE, PAC, CET) handled via same hardened escape hatch. Algorithm correctness is the developer's responsibility (same scope as every safe language)."
 
 **After Tier B (v1.0.1):**
 
-> "ZER's critical asm intrinsics (context switch, MMU, atomics, barriers) are formally verified in Iris/Coq over Sail ISA models. Non-critical `unsafe asm` enforces 18 structural rules. 99% of asm bugs are mechanically prevented. Remaining 1% is semantic correctness in uncommon code paths."
+> "ZER's critical asm intrinsics (context switch, MMU, atomics, barriers) have **algorithm-correctness proofs** in Iris/Coq over Sail ISA models — in addition to Tier A's 100% language-safety floor. For critical paths, wrong-algorithm bugs are caught too."
 
 **After Tier C (v1.1+):**
 
-> "ZER achieves **100% safe asm** for OS/kernel/firmware primitives. Every covered intrinsic has a mechanized proof of correctness. Every `unsafe asm` block with `@verified_spec` has a proof that it satisfies the declared pre/postconditions. External unverified code is explicitly marked `UNSAFE-EXTERN` via `cinclude`."
+> "ZER's language-safety floor (Tier A) is 100%. Any `unsafe asm` block where the developer adds `@verified_spec` gets **algorithm-correctness proof** compiled in. External unverified code is explicitly marked `UNSAFE-EXTERN` via `cinclude`."
 
 ### Out of scope (not ZER's concern)
 
@@ -1242,7 +1256,7 @@ Progress: 44 of 130 shipped (34%).
 | D-Alpha-6 | 11 | TLB + cache (incl. cache_zero_line) | Pending |
 | D-Alpha-7 | 8 | Critical multi-core (pause, cpu_id, wfe, sev, breakpoint, rdrand, rdseed, barrier_dma) | Pending |
 | **D-Alpha-7.5 Phase 1** | **—** | **Hardened `unsafe asm` H1-H7 (Rust-tier baseline)** | **Pending — NEW** |
-| **D-Alpha-7.5 Phase 2** | **—** | **Strict mode 18 rules (S1-E4) → 95% structural safety, opt-in via `--strict-asm`** | **Pending — NEW** |
+| **D-Alpha-7.5 Phase 2** | **—** | **Strict mode: 18 structural rules (S1-E4) + 13 Z-rules (Z1-Z13) + per-instruction preconditions → 100% language-safe, opt-in via `--strict-asm`** | **Pending — NEW** |
 | D-Alpha-8 | 6 | Nice-to-have (time_ns, get_pc, wait_on_addr, supports_feature, flush_pipeline, cpu_yield) | Pending |
 | D-Alpha-9 | 10 | MSR/CSR access (includes per-arch R/W pair) | Pending |
 | D-Alpha-10 | 10 | Inspection + cycle counter | Pending |
@@ -1285,19 +1299,19 @@ Progress: 44 of 130 shipped (34%).
 
 ### Version-specific claims (tiered)
 
-**v1.0 (Tier A — 95% structural safety):**
+**v1.0 (Tier A — 100% language-safe):**
 
-> "ZER ships 130 intrinsics per arch (x86-64, ARM64, RISC-V) covering Linux kernel arch/ needs. `unsafe asm` enforces 18 compile-time rules (MISRA Directive 4.3 + SPARK Ada Machine_Code level) — 95% of asm bugs are structurally impossible. Vendor-specific code (SGX, TDX, TrustZone, MTE, PAC, CHERI) handled via same hardened escape hatch."
+> "ZER ships 130 intrinsics per arch (x86-64, ARM64, RISC-V) covering Linux kernel arch/ needs. `unsafe asm` enforces 31 compile-time rules (18 structural + 13 Z-rules extending ZER's 29 safety systems through asm boundaries) plus per-instruction precondition checking. 100% language-safe — UAF/bounds/type/handle/move/escape/provenance/MMIO/qualifier/instruction-UB all caught. Vendor-specific code (SGX, TDX, TrustZone, MTE, PAC, CHERI) covered by same mechanism. Algorithm correctness remains developer's responsibility (same scope as Rust/Ada/Zig)."
 
-**v1.0.1 (Tier B — 99% verified critical paths):**
+**v1.0.1 (Tier B — +selective algorithm proofs):**
 
-> "ZER's critical asm intrinsics (context switch, MMU, atomics, barriers) are formally verified in Iris/Coq over Sail ISA models. Non-critical `unsafe asm` enforces 18 structural rules. 99% of asm bugs are mechanically prevented."
+> "Language safety is 100% (from Tier A). Critical asm intrinsics (context switch, MMU, atomics, barriers) additionally have **algorithm-correctness proofs** in Iris/Coq over Sail."
 
-**v1.1+ (Tier C — 100% safe asm):**
+**v1.1+ (Tier C — +per-block algorithm proofs):**
 
-> "ZER achieves **100% safe asm**. Every covered intrinsic has a mechanized proof of correctness. Every `unsafe asm` block with `@verified_spec` is verified at compile time. External code uses `cinclude` with explicit `UNSAFE-EXTERN` markers."
+> "Language safety is 100% (from Tier A). Any `unsafe asm` block with `@verified_spec` additionally has **algorithm-correctness proof** at compile time. External code uses `cinclude` with explicit `UNSAFE-EXTERN` markers."
 
-Strongest claim of any memory-safe systems language targeting Linux-scale work.
+Strongest claim of any memory-safe systems language targeting Linux-scale work — and the only one where language safety extends THROUGH asm operand boundaries.
 
 ---
 
@@ -1658,8 +1672,9 @@ Summary of the conversation that led to this plan:
 | Do we ban user asm? | No — kept as explicit escape hatch. `unsafe asm(...)` REQUIRED (bare `asm` rejected). Restricted to `naked` fns. Users prefer intrinsics. |
 | How do users write low-level code? | Via **130 verified intrinsics** + hardened `unsafe asm` for vendor-specific. |
 | Does this cover Linux-scale? | **Yes.** 130 intrinsics cover Linux kernel arch/ needs. Vendor-specific (SGX, TDX, TrustZone, MTE, PAC, CHERI) via hardened `unsafe asm`. |
-| How safe is `unsafe asm`? | **Tiered: v1.0 = 99% language-safe (strict mode: 18 structural + 13 Z-rules extend 29 ZER safety systems through asm). v1.0.1 = + critical-path semantic. v1.1+ = 100% semantic for annotated blocks via Vale-tier.** |
-| Can we reach 100% safe? | **YES for language-safety at v1.0** (strict mode + Z-rules). **100% semantic for annotated blocks at v1.1+** (Vale-tier `@verified_spec`). |
+| How safe is `unsafe asm`? | **Tiered: v1.0 = 100% language-safe (strict mode: 18 structural + 13 Z-rules extend 29 ZER safety systems through asm + per-instruction preconditions via VRP). v1.0.1 = +selective algorithm-correctness proofs on 20 critical intrinsics. v1.1+ = per-block algorithm-correctness proof via `@verified_spec`.** |
+| Can we reach 100% safe? | **100% language-safe at v1.0** (no UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/instruction-UB). **100% algorithm-correct per annotated block at v1.1+** (Vale-tier `@verified_spec`). Two dimensions — both reachable. |
+| What's the difference between language safety and algorithm correctness? | **Language safety** = memory/type/handle/move/concurrency/provenance/MMIO/qualifier/instruction-UB — ZER's compiler catches all of these 100% in Tier A. **Algorithm correctness** = "does this code compute what the developer claims" (crypto formula right, sort order correct, etc.) — developer's responsibility, optionally proven per-block via `@verified_spec` in Tier C. Same scope as Rust/Ada/Zig. |
 | Does ZER prevent logic bugs? | **No — same scope as every safe language.** ZER guarantees language-safety (memory, types, handles, moves, concurrency). Algorithm choice and business logic remain developer responsibility. |
 | Is ZER+ASM safer than Rust+asm? | **Yes — strictly more.** Rust's unsafe disables borrow checker inside blocks. ZER's strict mode keeps all 29 safety systems active through asm boundaries via Z-rules. UAF/escape/move/provenance caught through asm — Rust can't do this. |
 | Which archs initially? | **x86-64, ARM64, RISC-V** (3 archs for v1.0). |

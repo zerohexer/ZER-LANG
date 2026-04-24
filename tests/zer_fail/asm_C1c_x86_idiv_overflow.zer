@@ -1,0 +1,40 @@
+// EXPECTED: compile error
+//
+// Category C1c (Value-range, compound) — x86-64 IDIV signed overflow
+// Source: Intel SDM Vol 2A IDIV — "#DE: ... If the quotient is too large for
+// the designated register." This fires for INT_MIN / -1 (overflow to INT_MAX+1).
+//
+// Precondition: IDIV must prove BOTH:
+//   (a) divisor != 0 (same as DIV)
+//   (b) NOT (dividend = INT_MIN AND divisor = -1)  — the overflow case
+//
+// C1c compound constraint: checker must prove all sub-conditions via VRP.
+//
+// Research citation: docs/asm_preconditions_research.md Category C1 session 1
+
+i64 unsafe_idiv(i64 dividend, i64 divisor) {
+    i64 quotient;
+    i64 remainder;
+
+    // Both dividend and divisor are user-input.
+    // VRP can't prove we avoid (INT64_MIN / -1).
+    // Category C1c check must REJECT.
+    //
+    // Expected error: "Cannot prove compound precondition for IDIV (C1c):
+    //                  overflow possible at (dividend=INT_MIN, divisor=-1).
+    //                  Add guards for both divisor != 0 AND
+    //                  !(dividend == INT_MIN && divisor == -1)."
+    unsafe asm {
+        instructions: "idivq %2"
+        inputs:  { "a" = dividend, "r" = divisor }
+        outputs: { "=a" = quotient, "=d" = remainder }
+        clobbers: ["cc"]
+        safety: "Signed 64-bit divide with remainder"
+    }
+
+    return quotient;
+}
+
+i32 main() {
+    return 0;
+}

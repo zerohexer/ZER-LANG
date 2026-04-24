@@ -1,0 +1,39 @@
+// EXPECTED: compile error
+//
+// Category C1a (Value-range, nonzero required) — x86-64 BSR instruction
+// Source: Intel SDM Vol 2A BSR — "If the content of the source operand is 0,
+// the content of the destination operand is undefined."
+//
+// This test specifies BEHAVIOR the Category C1 checker MUST implement when
+// strict mode lands (D-Alpha-7.5 Phase 2). Until then, this test serves as
+// a design document for expected rejection.
+//
+// Precondition: BSR source operand must be proven nonzero via VRP (System #12).
+// Violation: unproven-nonzero operand passed to BSR → compile error.
+//
+// Research citation: docs/asm_preconditions_research.md Category C1 session 1
+
+u32 unsafe_bit_scan(u32 input) {
+    u32 position;
+
+    // User passes potentially-zero input directly to BSR.
+    // VRP range of `input` is [0, UINT32_MAX] — includes 0 — cannot prove nonzero.
+    // Category C1a check must REJECT at compile time.
+    //
+    // Expected error: "Cannot prove operand nonzero for BSR (Category C1a).
+    //                  Add `if (input != 0)` guard, or narrow input range,
+    //                  or use LZCNT (BMI1) which is defined for zero."
+    unsafe asm {
+        instructions: "bsrl %1, %0"
+        inputs:  { "r" = input }
+        outputs: { "=r" = position }
+        clobbers: ["cc"]
+        safety: "Bit scan reverse — find highest set bit position"
+    }
+
+    return position;
+}
+
+i32 main() {
+    return 0;
+}

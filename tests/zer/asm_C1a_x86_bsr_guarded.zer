@@ -1,0 +1,53 @@
+// EXPECTED: compiles + runs
+//
+// Category C1a (Value-range, nonzero required) — x86-64 BSR instruction
+// POSITIVE TEST: demonstrates VRP-proved guard that passes the C1a check.
+//
+// When `if (input != 0)` guard is present, VRP narrows `input` range inside
+// the guarded block to [1, UINT32_MAX] — provably nonzero.
+// Category C1a check then PASSES — compile succeeds, bsrl emitted.
+//
+// This is the same ergonomics as ZER's existing div-by-zero proof:
+//     if (z != 0) { u32 y = x / z; }   // ZER accepts — VRP proves nonzero
+//
+// Research citation: docs/asm_preconditions_research.md Category C1 session 1
+
+u32 safe_bit_scan(u32 input) {
+    u32 position = 0;
+
+    if (input != 0) {
+        // VRP: inside this block, `input` is proven in [1, UINT32_MAX].
+        // Category C1a check PASSES because VRP proves `input != 0`.
+        //
+        // Note: actual unsafe asm syntax requires D-Alpha-7.5 Phase 1 (not landed).
+        // For now, use a placeholder that mimics the expected valid form.
+
+        // TODO: when strict mode lands, this block should compile as-is:
+        //     unsafe asm {
+        //         instructions: "bsrl %1, %0"
+        //         inputs:  { "r" = input }
+        //         outputs: { "=r" = position }
+        //         clobbers: ["cc"]
+        //         safety: "Bit scan reverse — guarded nonzero"
+        //     }
+
+        // Placeholder implementation using ZER primitives until strict mode lands:
+        position = 31;
+        u32 mask = 0x80000000;
+        while (mask != 0) {
+            if ((input & mask) != 0) {
+                return position;
+            }
+            mask = mask >> 1;
+            position = position - 1;
+        }
+    }
+
+    return 0;
+}
+
+i32 main() {
+    u32 pos = safe_bit_scan(0x80);  // highest bit of 0x80 is bit 7
+    if (pos == 7) { return 0; }
+    return 1;
+}

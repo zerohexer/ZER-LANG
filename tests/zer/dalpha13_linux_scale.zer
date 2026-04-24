@@ -1,0 +1,90 @@
+// D-Alpha-13: Linux-scale x86 essentials
+// 20 intrinsics: fsbase/gsbase R/W (4), port I/O (6), xsave/xrstor (2),
+//                debug regs R/W (2), SBI/SMC calls (2), clflushopt/clwb (2),
+//                nt_store (1), RDPMC (1)
+//
+// Most are privileged or x86-only — dead-branch pattern.
+
+volatile u32 never_true;
+
+void dead_branch_fsbase_test() {
+    u64 fs = 0;
+    if (never_true == 42) {
+        fs = @cpu_read_fsbase();
+        @cpu_write_fsbase(fs);
+        u64 gs = @cpu_read_gsbase();
+        @cpu_write_gsbase(gs);
+    }
+    if (fs == 0 || fs != 0) { return; }
+}
+
+void dead_branch_port_io_test() {
+    if (never_true == 42) {
+        u8 b = @port_in8(0x60);     // PS/2 keyboard data port
+        u16 w = @port_in16(0x64);
+        u32 d = @port_in32(0x80);
+        @port_out8(0x80, b);         // POST code port
+        @port_out16(0x80, w);
+        @port_out32(0x80, d);
+    }
+}
+
+void dead_branch_xsave_test() {
+    u8[4096] buf;
+    if (never_true == 42) {
+        @cpu_xsave(&buf[0], 0x7);   // save XSTATE_LEGACY
+        @cpu_xrstor(&buf[0], 0x7);
+    }
+}
+
+void dead_branch_debug_reg_test() {
+    u64 dr = 0;
+    if (never_true == 42) {
+        dr = @cpu_read_dr(0);       // DR0
+        @cpu_write_dr(0, dr);
+    }
+    if (dr == 0 || dr != 0) { return; }
+}
+
+void dead_branch_firmware_test() {
+    if (never_true == 42) {
+        @cpu_sbi_call();            // RISC-V SBI
+        @cpu_smc_call();            // ARM TrustZone SMC
+    }
+}
+
+void dead_branch_cache_test() {
+    u8 data = 0;
+    if (never_true == 42) {
+        @cache_flushopt(&data);
+        @cache_writeback(&data);
+    }
+}
+
+void dead_branch_nt_store_test() {
+    u64 target = 0;
+    if (never_true == 42) {
+        @nt_store(&target, 0xDEADBEEF);
+    }
+    if (target == 0 || target != 0) { return; }
+}
+
+void dead_branch_pmc_test() {
+    u64 pmc = 0;
+    if (never_true == 42) {
+        pmc = @cpu_read_pmc(0);
+    }
+    if (pmc == 0 || pmc != 0) { return; }
+}
+
+i32 main() {
+    dead_branch_fsbase_test();
+    dead_branch_port_io_test();
+    dead_branch_xsave_test();
+    dead_branch_debug_reg_test();
+    dead_branch_firmware_test();
+    dead_branch_cache_test();
+    dead_branch_nt_store_test();
+    dead_branch_pmc_test();
+    return 0;
+}

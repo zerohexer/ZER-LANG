@@ -1,0 +1,41 @@
+// EXPECTED: compile error
+//
+// Category C2a (Alignment, fixed 16-byte) — x86-64 CMPXCHG16B instruction
+// Source: Intel SDM Vol 2A CMPXCHG16B —
+// "CMPXCHG16B requires that the destination (memory) operand be 16-byte
+// aligned." 64-Bit Mode Exceptions: "If memory operand for CMPXCHG16B is
+// not aligned on a 16-byte boundary." → #GP(0)
+//
+// Precondition: CMPXCHG16B memory operand must be proven 16-byte aligned.
+// Violation: passing unaligned pointer causes #GP(0) fault.
+//
+// Research citation: docs/asm_preconditions_research.md Category C2 session 2
+
+i32 unsafe_cas128(*u8 ptr) {
+    u64 expected_low = 0;
+    u64 expected_high = 0;
+    u64 new_low = 42;
+    u64 new_high = 43;
+    u8 success = 0;
+
+    // `ptr` alignment is unknown. CMPXCHG16B requires 16-byte alignment.
+    // Category C2a check must REJECT.
+    //
+    // Expected error: "Cannot prove CMPXCHG16B memory operand is 16-byte
+    //                  aligned (Category C2a). CMPXCHG16B always requires
+    //                  16-byte alignment (not affected by AC flag)."
+    unsafe asm {
+        instructions: "lock cmpxchg16b (%5)\n\tsetz %0"
+        inputs:  { "a" = expected_low, "d" = expected_high,
+                   "b" = new_low, "c" = new_high, "r" = ptr }
+        outputs: { "=q" = success }
+        clobbers: ["memory", "cc"]
+        safety: "Atomic 128-bit compare-and-swap"
+    }
+
+    return (i32)success;
+}
+
+i32 main() {
+    return 0;
+}

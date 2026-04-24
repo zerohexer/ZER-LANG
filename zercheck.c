@@ -369,7 +369,13 @@ static int defer_stmt_is_free(Node *node, char *key_buf, int key_bufsize) {
 }
 
 /* Scan a defer body for ALL free/delete calls. Marks each found handle as FREED.
- * Handles both single-statement defers and block defers with multiple frees. */
+ * Handles single-statement defers, block defers, AND nested control flow
+ * (if/else/for/while/switch bodies — conservative: any reachable free counts).
+ *
+ * Conservative simplification: treat ANY free inside nested control flow as
+ * "handle freed on scope exit." This may miss some double-free detection for
+ * conditional frees, but defers run at scope exit so the handle goes out of
+ * scope regardless. Avoids false-positive leak warnings (BUG-608). */
 static void defer_scan_all_frees(Node *node, PathState *ps, int defer_line) {
     if (!node) return;
     char key_buf[128];
@@ -381,11 +387,33 @@ static void defer_scan_all_frees(Node *node, PathState *ps, int defer_line) {
             h->free_line = defer_line;
         }
     }
-    /* defer { block } — scan ALL statements, not just first match */
-    if (node->kind == NODE_BLOCK) {
-        for (int i = 0; i < node->block.stmt_count; i++) {
+    switch (node->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
             defer_scan_all_frees(node->block.stmts[i], ps, defer_line);
-        }
+        break;
+    case NODE_IF:
+        defer_scan_all_frees(node->if_stmt.then_body, ps, defer_line);
+        defer_scan_all_frees(node->if_stmt.else_body, ps, defer_line);
+        break;
+    case NODE_FOR:
+        defer_scan_all_frees(node->for_stmt.body, ps, defer_line);
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        defer_scan_all_frees(node->while_stmt.body, ps, defer_line);
+        break;
+    case NODE_SWITCH:
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            defer_scan_all_frees(node->switch_stmt.arms[i].body, ps, defer_line);
+        break;
+    case NODE_CRITICAL:
+        defer_scan_all_frees(node->critical.body, ps, defer_line);
+        break;
+    case NODE_ONCE:
+        defer_scan_all_frees(node->once.body, ps, defer_line);
+        break;
+    default:
+        break;
     }
 }
 
@@ -1642,11 +1670,33 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
          * A backward goto (label before goto) is like a loop body from
          * label to goto. Apply same 2-pass + widen-to-MAYBE_FREED pattern. */
 
-        /* Phase 1: collect label positions in this block */
-        struct { const char *name; uint32_t len; int idx; } labels[32];
+        /* Phase 1: collect label positions in this block.
+         * BUG-598: Stack-first dynamic pattern (CLAUDE.md rule #7): fixed
+         * buffer for common case, realloc for blocks with >32 labels. Never
+         * silently truncate — a dropped label means backward-goto UAF
+         * detection could miss real bugs. */
+        struct LabelRef { const char *name; uint32_t len; int idx; };
+        struct LabelRef stack_labels[32];
+        struct LabelRef *labels = stack_labels;
         int label_count = 0;
-        for (int i = 0; i < node->block.stmt_count && label_count < 32; i++) {
+        int label_cap = 32;
+        bool labels_heap = false;
+        for (int i = 0; i < node->block.stmt_count; i++) {
             if (node->block.stmts[i]->kind == NODE_LABEL) {
+                if (label_count >= label_cap) {
+                    int new_cap = label_cap * 2;
+                    struct LabelRef *new_labels = (struct LabelRef *)realloc(
+                        labels_heap ? labels : NULL,
+                        new_cap * sizeof(struct LabelRef));
+                    if (!new_labels) break; /* OOM: stop collecting */
+                    if (!labels_heap) {
+                        memcpy(new_labels, stack_labels,
+                               label_count * sizeof(struct LabelRef));
+                    }
+                    labels = new_labels;
+                    label_cap = new_cap;
+                    labels_heap = true;
+                }
                 labels[label_count].name = node->block.stmts[i]->label_stmt.name;
                 labels[label_count].len = (uint32_t)node->block.stmts[i]->label_stmt.name_len;
                 labels[label_count].idx = i;
@@ -1716,6 +1766,7 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
             }
         }
 
+        if (labels_heap) free(labels);
         break;
     }
 

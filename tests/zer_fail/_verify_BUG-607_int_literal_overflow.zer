@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// BUG-607: integer literal > u64 silently wraps
+i32 main() {
+    u64 huge = 0x10000000000000000;
+    if (huge == 0) { return 0; }
+    return 1;
+}

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// BUG-595: yield outside async function
+void not_async() {
+    yield;
+}
+i32 main() { return 0; }

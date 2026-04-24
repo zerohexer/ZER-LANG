@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// BUG-596: defer nested inside another defer body
+i32 main() {
+    defer {
+        defer { }
+    }
+    return 0;
+}

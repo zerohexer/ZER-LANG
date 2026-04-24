@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// BUG-609: goto into if-unwrap arm from outside
+// Before fix: goto L from outside the arm lands inside with v auto-zeroed.
+// After fix: compiler rejects because goto path doesn't cover label's arm-path.
+
+i32 main() {
+    ?u32 maybe = 42;
+    goto L;
+    if (maybe) |v| {
+        L: return (i32)v;
+    }
+    return 0;
+}

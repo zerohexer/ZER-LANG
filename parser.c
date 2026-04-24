@@ -1,6 +1,7 @@
 #include "parser.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 /* ================================================================
@@ -593,29 +594,39 @@ static Node *parse_primary(Parser *p) {
     /* integer literal */
     if (match(p, TOK_NUMBER_INT)) {
         Node *n = new_node(p, NODE_INT_LIT);
-        /* parse the number value from token text */
+        /* parse the number value from token text
+         * Overflow-checked: any literal exceeding uint64_t range is a compile error
+         * (BUG-607: previously wrapped silently). */
         const char *text = p->previous.start;
         size_t len = p->previous.length;
         uint64_t val = 0;
+        bool overflow = false;
         if (len > 2 && text[0] == '0' && text[1] == 'x') {
             for (size_t i = 2; i < len; i++) {
                 if (text[i] == '_') continue;
-                val *= 16;
-                if (text[i] >= '0' && text[i] <= '9') val += text[i] - '0';
-                else if (text[i] >= 'a' && text[i] <= 'f') val += text[i] - 'a' + 10;
-                else if (text[i] >= 'A' && text[i] <= 'F') val += text[i] - 'A' + 10;
+                if (val > (UINT64_MAX >> 4)) overflow = true;
+                uint64_t digit = 0;
+                if (text[i] >= '0' && text[i] <= '9') digit = text[i] - '0';
+                else if (text[i] >= 'a' && text[i] <= 'f') digit = text[i] - 'a' + 10;
+                else if (text[i] >= 'A' && text[i] <= 'F') digit = text[i] - 'A' + 10;
+                val = (val << 4) | digit;
             }
         } else if (len > 2 && text[0] == '0' && text[1] == 'b') {
             for (size_t i = 2; i < len; i++) {
                 if (text[i] == '_') continue;
-                val = val * 2 + (text[i] - '0');
+                if (val > (UINT64_MAX >> 1)) overflow = true;
+                val = (val << 1) | (uint64_t)(text[i] - '0');
             }
         } else {
             for (size_t i = 0; i < len; i++) {
                 if (text[i] == '_') continue;
-                val = val * 10 + (text[i] - '0');
+                uint64_t digit = (uint64_t)(text[i] - '0');
+                if (val > UINT64_MAX / 10) { overflow = true; }
+                else if (val == UINT64_MAX / 10 && digit > UINT64_MAX % 10) { overflow = true; }
+                val = val * 10 + digit;
             }
         }
+        if (overflow) error(p, "integer literal exceeds u64 range (max 0xFFFFFFFFFFFFFFFF)");
         n->int_lit.value = val;
         return n;
     }

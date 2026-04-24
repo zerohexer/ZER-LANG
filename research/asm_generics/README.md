@@ -76,7 +76,7 @@ Until that migration, these files are NOT in the active test suite.
 | C5 Privilege | **COMPLETE (2026-04-24)** | 4 | **3 .zer files + representative samples. ~200+ privileged instructions total. Maps to System #24 with privilege_level hierarchy. Kept separate from C4 (different semantics: set-membership vs hierarchy).** |
 | C6 Memory addressability | **COMPLETE (2026-04-24)** | 5 | **2 .zer files + ISA citations. C6b canonical (x86/ARM64), C6d PMP (RISC-V), existing ZER MMIO handles C6a. Maps to System #19 with minor canonical-addr extension.** |
 | C7 Provenance/aliasing | **COMPLETE (2026-04-24)** | 5 | **0 POCs (rare in base ISAs). Surprising finding: base ISAs silent on aliasing (MOVS, LDP/STP). Maps to existing System #3 + #11 without extension.** |
-| C8 Memory ordering | Pending (needs System #30 design) | 8 | — |
+| C8 Memory ordering | **COMPLETE (2026-04-24)** | 6 | **5 .zer POCs + ISA citations across 3 archs (MFENCE/SFENCE/LFENCE/CLWB x86, DMB/DSB/ISB/LDAR/STLR ARM64, FENCE/FENCE.I/AMO-aq-rl RISC-V). NEW System #30 (Atomic Ordering) designed. Est. 80 hrs implementation — only new system added by Option C.** |
 | ~~C9 Exclusive pairing~~ | **MERGED INTO C3 (2026-04-24)** | — | — |
 | C10 Register dependency | Pending (may defer entirely) | — | — |
 

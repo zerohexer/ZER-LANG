@@ -1,0 +1,50 @@
+// EXPECTED: compile error (C8 — insufficient fence for operation)
+//
+// Category C8 (Ordering, insufficient barrier) — RISC-V FENCE with wrong
+// predecessor/successor set.
+//
+// Source: RISC-V ISA Manual Vol I —
+// "No other RISC-V hart or external device can observe any operation in
+// the successor set following a FENCE before any operation in the
+// predecessor set preceding the FENCE."
+//
+// Example bug: `fence r,r` only orders LOAD-LOAD. But code intends to
+// order a STORE before subsequent LOADS (classic "publish data, then
+// signal ready" pattern).
+//
+// System #30 must track declared ordering intent and verify fence
+// sets match.
+//
+// Research citation: docs/asm_preconditions_research.md Category C8 session 6
+
+void unsafe_weak_fence(*u32 data_ptr, *u32 ready_flag) {
+    // Store data first
+    *data_ptr = 42;
+
+    // Intended: ensure store to data_ptr is visible before store to
+    // ready_flag (standard publish-ready pattern, needs `fence w,w`
+    // or stronger).
+    //
+    // BUG: `fence r,r` only orders READS. Doesn't help here.
+    unsafe asm {
+        instructions: "fence r, r"   // <-- WRONG: should be "w, w" or stronger
+        inputs: {}
+        outputs: {}
+        clobbers: ["memory"]
+        safety: "Fence — intent: publish data before ready"
+    }
+
+    // Store the ready flag.
+    // But prior fence didn't actually order the prior w-w.
+    // Reader may see ready_flag=1 but data_ptr=old value.
+    //
+    // System #30 check must ERROR:
+    //   "RISC-V fence at line N has predecessor set {r} but prior
+    //    stores were not ordered (C8). For publish-ready pattern, use
+    //    'fence w, w' or 'fence rw, rw'."
+    *ready_flag = 1;
+}
+
+i32 main() {
+    return 0;
+}

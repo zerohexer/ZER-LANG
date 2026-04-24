@@ -1,0 +1,44 @@
+// EXPECTED: compile warning (C8a — requires prior barrier)
+//
+// Category C8a (Ordering, requires prior barrier) — x86-64 CLWB
+// Source: Intel SDM CLWB —
+// "CLWB is NOT ordered with respect to other CLWB executions,
+// CLFLUSH/CLFLUSHOPT executions, or younger writes to the same cache line."
+// "Software can use the SFENCE instruction to order an execution of CLWB
+// relative to one of those operations."
+//
+// Precondition: after CLWB, need SFENCE before subsequent write to the
+// same cache line (for guaranteed write-back + ordering with younger writes).
+//
+// System #30 (Atomic Ordering) must track:
+//   1. CLWB establishes pending_requirement = BARRIER_STORE_STORE_NEEDED
+//   2. If another store to same line appears before SFENCE → WARN
+//
+// Research citation: docs/asm_preconditions_research.md Category C8 session 6
+
+void unsafe_clwb_pattern(*u8 persistent_buf) {
+    // Write to persistent memory buffer
+    persistent_buf[0] = 42;
+
+    // CLWB to write back to persistent store
+    unsafe asm {
+        instructions: "clwb (%0)"
+        inputs:  { "r" = persistent_buf }
+        clobbers: ["memory"]
+        safety: "Write-back cache line to persistent memory"
+    }
+
+    // BUG: another write without intervening SFENCE.
+    // CLWB's ordering with this write is NOT guaranteed.
+    //
+    // System #30 check should WARN:
+    //   "CLWB at line N issued; subsequent write at line N+M without
+    //    intervening SFENCE. CLWB does not order with younger writes
+    //    (C8a). Add 'sfence' between CLWB and next write for
+    //    guaranteed ordering."
+    persistent_buf[0] = 43;  // <-- warning here
+}
+
+i32 main() {
+    return 0;
+}

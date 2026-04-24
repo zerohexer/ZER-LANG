@@ -6517,18 +6517,23 @@ semantic correctness orthogonally.
 ### The 13 Z-rules (strict mode upgrade)
 
 Added to the 18 structural rules (S/O/I/E) documented in
-`docs/asm_plan.md`. Total strict mode = 31 rules + per-instruction preconditions = **100% language-safe**.
+`docs/asm_plan.md`. Total strict mode = 31 rules (18 structural + 13 Z-rules) = **99% language-safe at operand boundary. DEFAULT ON from v1.0 (no `--strict-asm` opt-in flag).**
 
 **Two-dimension model (not a continuum):**
 
 | Dimension | Coverage | How |
 |---|---|---|
-| **Language safety** (Tier A, v1.0) | 100% | Strict mode: 18 structural + 13 Z-rules + per-instruction precondition checking via existing VRP (System #12). Catches UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI/instruction-UB through asm. |
+| **Language safety at operand boundary** (Tier A, v1.0, default on) | 99% | Strict mode: 18 structural + 13 Z-rules. Catches UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI at ZER operand bindings to asm. |
+| **Instruction-level UB inside asm body** | Covered by Tier C when user opts in | `@verified_spec` `requires:` clauses naturally express preconditions (e.g., `requires: operand != 0` for BSR). One mechanism, covers instruction UB + algorithm correctness together. |
 | **Algorithm correctness** (Tier C, v1.1+, opt-in per block) | 100% per annotated block | `@verified_spec` Vale-tier formal proof. Proves what the asm COMPUTES matches declared pre/post-conditions. |
 
 These are DIFFERENT dimensions. Neither subsumes the other. Strict mode still applies inside Vale-tier blocks — both compose.
 
-**Per-instruction preconditions are NOT a separate tier.** They're part of Tier A strict mode, using existing VRP. Examples: `bsr` on zero (VRP proves operand ≠ 0), `shl` count ≥ width (VRP proves count < width), `div` by zero in asm (VRP proves divisor ≠ 0). Same pattern as ZER's existing integer-div-zero and shift-UB checks in normal code, just extended to asm instructions inside `unsafe asm` blocks.
+**Per-instruction preconditions were evaluated 2026-04-24 and DEFERRED from Tier A.** The concept: extend VRP (System #12) INSIDE the asm block to check instruction operand preconditions automatically (e.g., reject `bsr` when VRP can't prove operand != 0). Examples: `bsr` on zero, `shl` count ≥ width, `div` with zero divisor. Same pattern as ZER's existing integer-div-zero and shift-UB checks in normal code, just extended to asm instructions.
+
+**Why deferred:** Requires a hardcoded per-arch instruction database (~65 instructions × 3 archs + ~25 hrs per new arch forever). Conflicts with ZER's generic-tracking philosophy — the 29 systems are generic, but per-instruction tables are static lookups keyed by mnemonic string. Narrow gap (~1%). Users who care can opt into Tier C `@verified_spec` where `requires:` clauses cover both instruction preconditions AND algorithm correctness in one mechanism. See `docs/asm_plan.md` "Per-Instruction Preconditions — Evaluated and Deferred" section for full rationale + possible future paths (pattern-based, full database, or keep deferred).
+
+**Strict mode is DEFAULT ON** from v1.0 — not opt-in via `--strict-asm` flag. Reversing earlier "default in v1.1" anti-pattern. Strict mode IS ZER's safety model applied to asm (not an add-on tier). Opt-out path: `--relax-asm` flag or per-block `@relax_check(ZN)` annotation for legitimate edge cases.
 
 **CRITICAL: `zercheck.c` is being DELETED (Phase G of CFG migration, v0.5.0). Only `zercheck_ir.c` will remain.** Z-rules that need state-machine tracking go in `zercheck_ir.c` (which handles IR_ASM instruction case), NOT `zercheck.c`. See CLAUDE.md "CFG Migration" section.
 
@@ -6682,7 +6687,7 @@ This is the SAME scope every safe language draws:
 **ZER does NOT claim to prevent logic bugs. Neither does Rust, Ada,
 Haskell, Swift, Zig, or any other safe language.**
 
-With strict mode + Z-rules: ZER+ASM is **100% language-safe**.
+With strict mode + Z-rules (default on): ZER+ASM is **99% language-safe at operand boundary**. Tier C `@verified_spec` closes the last 1% (instruction-level UB) for blocks users opt into formal proof.
 Logic safety is Vale-tier's domain (formal proof of algorithm
 correctness against a spec).
 

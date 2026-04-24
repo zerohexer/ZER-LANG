@@ -270,7 +270,7 @@ Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branc
 
 ZER's 29 safety tracking systems extend THROUGH `unsafe asm` operand boundaries via 13 Z-rules. Unlike Rust (which disables borrow checker inside `unsafe { asm!() }`), ZER keeps all tracking active at asm bindings.
 
-**Strict mode = 18 structural + 13 Z-rules + per-instruction preconditions = 100% language-safe.**
+**Strict mode = 18 structural + 13 Z-rules = 99% language-safe at operand boundary. DEFAULT ON from v1.0 (no opt-in flag).**
 
 Z-rules catch through-asm bugs that Rust can't:
 - Z1: UAF through asm operand (Handle must be ALIVE per System #7)
@@ -280,17 +280,19 @@ Z-rules catch through-asm bugs that Rust can't:
 - Z8: qualifier preservation (can't strip const/volatile via asm, System #20)
 - Plus Z3/Z4/Z6/Z9-Z13 leveraging VRP, provenance, context flags, ISR tracking, etc.
 
-**Per-instruction preconditions** extend existing VRP (System #12) INSIDE asm: `bsr` on zero rejected, `shl` with count ≥ width rejected, etc. Same pattern as ZER's normal div-zero / shift-UB checks. Part of Tier A strict mode, not a separate tier.
+**Per-instruction preconditions** (catching instruction-level UB like `bsr` on zero, shift UB) were evaluated 2026-04-24 and DEFERRED from Tier A. Would require hardcoded per-arch instruction database conflicting with generic-tracking philosophy. Covered by Tier C `@verified_spec` `requires:` clauses when user opts in — same mechanism as algorithm correctness. See `docs/asm_plan.md` "Per-Instruction Preconditions — Evaluated and Deferred" section.
 
-**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 + per-instruction preconditions live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
+**Strict mode is DEFAULT ON** from v1.0 — not opt-in via flag. `--relax-asm` is the opt-out; per-block `@relax_check(ZN)` for legitimate edge cases. Same philosophy as Rust's borrow checker.
+
+**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
 
 **Two orthogonal dimensions (NOT a continuum):**
-- **Language safety** (Tier A, v1.0): 100% via strict mode — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI/instruction-UB all caught
-- **Algorithm correctness** (Tier C, v1.1+, opt-in per block): `@verified_spec` Vale-tier proves the asm computes what developer declared
+- **Language safety at operand boundary** (Tier A, v1.0, default on): 99% via strict mode — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI all caught
+- **Algorithm correctness + instruction UB** (Tier C, v1.1+, opt-in per block): `@verified_spec` Vale-tier — `requires:` clauses cover both instruction preconditions AND algorithm claims
 
 These compose — neither subsumes the other. Strict mode still runs inside Vale-tier blocks.
 
-**Scope is language-safe, NOT algorithm-safe.** Same scope as every safe language. Algorithm choice + business logic = developer's responsibility unless they opt into `@verified_spec`.
+**Scope is language-safe at operand boundary, NOT algorithm-safe.** Same scope as every safe language. Algorithm choice + business logic + instruction-level UB = developer's responsibility unless they opt into `@verified_spec`.
 
 See `docs/compiler-internals.md` Z-rules section for implementation details; `docs/asm_plan.md` for roadmap.
 

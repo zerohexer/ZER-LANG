@@ -43,6 +43,127 @@
 
 ---
 
+## Design Rationale & Direction for Fresh Sessions (MANDATORY READING)
+
+**Read this BEFORE making any design decision on this plan.** A fresh Claude session reading only the "Executive Summary" has the facts but not the direction. These principles, decisions, and anti-patterns prevent re-litigating settled choices.
+
+### 1. User preferences that drive all decisions
+
+These are permanent guardrails from the user. They shape every choice below.
+
+| Principle | What it means in practice |
+|---|---|
+| **Implementation first, proof later** | Matches how seL4/CompCert/Vale were actually built. Don't gate shipping on Phase 2-7 proof infrastructure. Ship working code now; add formal proofs later (D-Beta). Rejected purist "verify-before-implement" stance. |
+| **Hardware is NOT ZER's scope** | CPU silicon behavior (Spectre, Meltdown, cosmic rays, power analysis) is the silicon vendor's problem — not the language's. Don't caveat ZER claims with hardware disclaimers. Rust doesn't say "memory safe except for cosmic rays"; neither should ZER. |
+| **Time is unlimited, aim for best** | User committed 5K hours. Don't propose shortcuts that compromise quality. Don't skip features to ship faster — optimal is the target. |
+| **100% usability for legitimate patterns** | Never reject a valid use case. Strict mode + Vale-tier both must support every pattern users legitimately need. No "you can't write X" rules where X is reasonable. |
+| **Linux-scale, not MVP-scale** | Target = Linux kernel arch/ subsystem. 130 intrinsics, not 96. Vendor-specific stuff (TDX, SGX, MTE, PAC) via hardened `unsafe asm`, not dedicated intrinsics. |
+| **`unsafe asm` for vendor-specific; intrinsics for everything else** | Clean separation. Intrinsics = compiler-provided and verified. `unsafe asm` = escape hatch for what intrinsics don't cover. `cinclude` = explicit external trust boundary. |
+| **Strict mode AND Vale-tier are COMPLEMENTARY** | Not alternatives. Strict mode = 95% structural floor (universal). Vale-tier = 100% semantic ceiling (per-block opt-in). They compose. Don't propose simplifying to one. |
+| **Don't simplify away features** | User pushed back on "make it one thing" — explicit preference for layered depth. Keep the tiers. |
+| **No emojis in commits or code** | Permanent user preference. |
+| **Context/docs every session** | User wants fresh-session context captured in compiler-internals.md, proof-internals.md, CLAUDE.md after every significant change. |
+
+### 2. Decision log (chronological, session 2026-04-23)
+
+Each row records a decision the user and assistant reached. Don't re-litigate these.
+
+| Time | Decision | Why |
+|---|---|---|
+| Morning | Rename `asm` → `unsafe asm` (keyword required) | Rust-style explicit marking, grep-auditable escape hatch |
+| Morning | Strict mode (require `unsafe asm`, no bare asm) | Pre-1.0, breaking change cost is zero; user pushed for stricter enforcement |
+| Morning | Phase 1 predicate keyword-agnostic | Rename didn't require re-verification — structural rule unchanged |
+| Mid | 3 archs, not 4 (drop ARMv7 Cortex-M for v1.0) | Covers 95% of modern systems; Cortex-M deferred to v1.1 (~300 hrs saved) |
+| Mid | Implementation-first, not verify-first | User pointed out "verify first then implement = pain when constraints known later" — pragmatic engineering match with seL4/CompCert |
+| Mid | 96 → 130 intrinsics (Linux-scale) | Research showed Linux kernel uses ~200 per arch; 130 covers core with vendor tail via `unsafe asm` |
+| Late | Hardened `unsafe asm` with H1-H7 | Rust-tier baseline — typed operands, clobbers, safety docs |
+| Late | Strict mode 18 rules (Tier A) | Achieves 95% structural safety; SPARK Ada-level; cheap (~240 hrs) |
+| Late | Vale-tier per-block (Tier C) | Software-level 100% for opted-in blocks; D-Beta phase |
+| Late | Remove hardware caveats from claims | User: "hardware is semiconductor stuff, not relevant to compiler" — ZER's scope is the software layer |
+| Late | Keep strict mode AND Vale-tier | User: "option Z looks redundant" → explored, confirmed complementary not competing; kept both |
+| Late | `@verified_spec` per-block opt-in | Not mandatory on every block — users who can't write specs use `cinclude`. Steep barrier avoided. |
+| Late | D-Alpha-7 reordered ahead of D-Alpha-6 | Spinlock support more foundational than cache maintenance |
+| Late | D-Alpha-7.5 is STRATEGIC (not just a batch) | Unlocks all vendor-specific code without per-feature intrinsics. More leverage than individual batches. |
+
+### 3. Anti-patterns — DO NOT do these (permanent rules)
+
+Fresh Claude sessions will be tempted. Resist. Each has a reason.
+
+| Tempting thing to do | Why it's wrong | What to do instead |
+|---|---|---|
+| **Simplify strict mode + Vale-tier to one model** | They're complementary. Strict mode is universal floor (95%), Vale-tier is per-block ceiling (100%). Removing strict mode leaves 80% of blocks at 60% coverage. | Keep both. They compose. |
+| **Make `@verified_spec` mandatory on all blocks** | Users without formal methods training can't write specs. Creates steep barrier. Defeats "100% usability." | Keep opt-in. Users pick per-block. Unverifiable → `cinclude`. |
+| **Add hardware caveats back** (Spectre, cosmic rays, etc.) | Not ZER's scope. Silicon vendor's concern. Undermines claim for no benefit. | Just say "100% safe" — match Rust/seL4/CompCert framing. |
+| **Gate asm implementation on Phase 2-7 completion** | Decoupled this session. Implementation ships now; D-Beta formal proofs layer later. | Ship intrinsics as D-Alpha batches. Proofs follow in D-Beta. |
+| **Propose cloning Vale wholesale** | 2 GB toolchain (F*/Z3/OCaml), covers only ~10% of ZER needs (crypto). Rejected this session. | Build ZER-native Vale-tier via Iris over Sail (D-Beta). |
+| **Verify the emitter end-to-end** | CompCert-scale effort (~1,500 hrs). Not in scope for ZER v1.0. | Trust emitter + GCC + hardware. Same trust as seL4. |
+| **Make hypervisor / SGX / TDX first-class intrinsics** | 15-20+ intrinsics per extension, long tail, rapidly evolving. | Use hardened `unsafe asm` with `@verified_spec` for these. |
+| **Cut intrinsics below 130 to "fit" budget** | 130 is Linux-scale target. Cutting = ceasing to be a real kernel language. | Find budget via other tradeoffs (defer Cortex-M, etc.). |
+| **Ban `cinclude`** | Honest escape hatch for truly unverifiable code. Users need it for vendor blobs, legacy asm. Banning → users hide in C anyway. | Keep `cinclude` with explicit UNSAFE-EXTERN warning at every call site. |
+| **Ship strict mode as default (before v1.0.1)** | Not every block needs 18 rules. H1-H7 baseline ships in v1.0 as default. | Strict mode via `--strict-asm` flag in v1.0.1; default in v1.1. |
+| **Propose a different arch for v1.0** | 3 archs (x86-64, ARM64, RISC-V) is the settled scope. | Explicit v1.1 scope: Cortex-M. Explicit v1.2+: PowerPC, MIPS if demand. |
+| **Rewrite the plan to a different structure** | Plan accumulated decisions across a long session. Structure is load-bearing. | Add sections for new decisions, don't restructure existing. |
+| **Add emojis to commits or code** | Permanent user preference. | No emojis anywhere. |
+
+### 4. Direction indicators — what to do next
+
+If a fresh session picks up work, here's the priority order:
+
+**Completed (2026-04-23):**
+- D-Alpha-1: 15 atomics (2e152f3)
+- D-Alpha-2: 10 barriers + bit queries (a14d3c0)
+- D-Alpha-3: 5 interrupt control (3e6e2f2)
+- D-Alpha-4: 4 context switch (e2f45af)
+- D-Alpha-5: 10 MMU control (94f958b)
+- D-Alpha-7: 8 critical multi-core (ca7e144)
+- Various doc updates and scope expansions
+
+**Current status: 52 of 130 intrinsics shipped (40%).**
+
+**Next priority order (what to tackle when user says "continue"):**
+
+1. **D-Alpha-6** (11 TLB + cache) — needed for DMA coherence, was deprioritized vs D-Alpha-7 but is the next logical batch
+2. **D-Alpha-7.5 Phase 1** (Hardened `unsafe asm` H1-H7) — STRATEGIC; unlocks all vendor-specific code
+3. **D-Alpha-8** (6 nice-to-have: time_ns, wait_on_addr, etc.) — completes multi-core story
+4. **D-Alpha-7.5 Phase 2** (Strict mode 18 rules) — `--strict-asm` flag
+5. **D-Alpha-9** (10 MSR/CSR access)
+6. **D-Alpha-10** (10 inspection — includes deferred `@cpu_read_cycles` with per-arch dispatch)
+7. **D-Alpha-11** (5 power management)
+8. **D-Alpha-12** (6 privileged mode transitions)
+9. **D-Alpha-13** (20 Linux-scale x86 essentials)
+10. **D-Alpha-14** (10 misc — remaining intrinsics to hit 130)
+
+**Then D-Beta (post-Phase-7, ~12-18 months):**
+- Formal proofs on top of implemented intrinsics
+- Selective Vale-tier on 20 critical intrinsics (context switch, MMU, atomics)
+- `@verified_spec` tooling for user `unsafe asm` blocks
+
+**Then v1.1+:**
+- Cortex-M (10 intrinsics → 140 total)
+- Full Vale-tier for broader coverage (Tier C)
+- Hypervisor batch if demand materializes (~20 intrinsics)
+
+### 5. How to think about new proposals
+
+When a future session wants to add something new, evaluate against:
+
+1. **Does it match the target domain?** (OS/kernel/firmware/driver — yes. JIT runtimes/web apps — no.)
+2. **Does it match user preferences?** (Implementation-first, 100% usability, no hardware caveats, etc.)
+3. **Does it avoid anti-patterns?** (Check the anti-pattern list.)
+4. **Does it fit the direction?** (Batches in priority order; strategic infrastructure in D-Alpha-7.5.)
+5. **Does it respect decision log?** (Don't re-litigate settled calls.)
+
+If all 5 check, propose it. If any fails, either skip or explain the rationale for overriding the session decision.
+
+### 6. When in doubt
+
+- User sees "100%" claims — interpret as "100% within scope" (ZER source code, intrinsics, verified unsafe asm). External/hardware concerns are out of scope.
+- User says "simplify" — check if they mean remove redundancy OR genuinely fold features. Usually the former.
+- User says "continue" — check this section for priority order.
+- User pushes back — they're usually right about domain intent. Re-read their previous messages for nuance.
+
+---
+
 ## The Central Insight (result of this session's discussion)
 
 The original framing was: "verify any asm a user writes." That's open-ended and requires Vale-tier formal verification per instruction — ~5K hours per arch.

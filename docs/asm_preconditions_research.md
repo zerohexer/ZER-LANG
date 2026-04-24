@@ -417,18 +417,24 @@ consequence = "#DE exception"
 
 ARM64 and RISC-V data files have **no C1 entries**.
 
-### Tests (written this session — see tests/zer_fail/asm_C1_*.zer and tests/zer/asm_C1_*.zer)
+### POC specifications (NOT in tests/ — see `research/asm_generics/C1_value_range/`)
 
-Per-session deliverable: write negative test per instruction demonstrating checker rejection, and positive test demonstrating VRP-proved guard.
+Per-session deliverable: write expected-reject POC per instruction demonstrating checker rejection, and expected-accept POC demonstrating VRP-proved guard.
 
-- `tests/zer_fail/asm_C1a_x86_bsr_zero.zer` — BSR with unproven-nonzero operand → compile error
-- `tests/zer_fail/asm_C1a_x86_div_zero.zer` — DIV with unproven-nonzero divisor → compile error
-- `tests/zer_fail/asm_C1c_x86_idiv_overflow.zer` — IDIV with potential MIN/-1 overflow → compile error
-- `tests/zer_fail/asm_C1b_x86_shld16.zer` — 16-bit SHLD with count potentially > 16 → compile error
-- `tests/zer/asm_C1a_x86_bsr_guarded.zer` — BSR with `if (x != 0)` guard → compiles, VRP proves nonzero
-- `tests/zer/asm_C1c_x86_div_guarded.zer` — DIV with explicit divisor guard → compiles
+**Location: `research/asm_generics/C1_value_range/`** — kept OUT of `tests/` because these files exercise `unsafe asm` structured syntax that isn't implemented yet. Running them as tests would pass vacuously (for parse-error reasons, not safety-category reasons). They are research artifacts / executable specifications, not regression tests.
 
-**Note: tests require hardened `unsafe asm` syntax (structured operands) which is planned in D-Alpha-7.5 Phase 1. Tests are written as specifications of expected behavior; they will activate when strict mode lands.**
+- `research/asm_generics/C1_value_range/reject/x86_bsr_unguarded.zer` — BSR with unproven-nonzero operand → checker should compile-error
+- `research/asm_generics/C1_value_range/reject/x86_div_unguarded.zer` — DIV with unproven-nonzero divisor → checker should compile-error
+- `research/asm_generics/C1_value_range/reject/x86_idiv_overflow.zer` — IDIV with potential MIN/-1 overflow → checker should compile-error
+- `research/asm_generics/C1_value_range/accept/x86_bsr_guarded.zer` — BSR with `if (x != 0)` guard → checker should accept (VRP proves nonzero)
+
+Pending for future sessions:
+- `research/asm_generics/C1_value_range/reject/x86_shld16.zer` — 16-bit SHLD count potentially > 16
+- `research/asm_generics/C1_value_range/accept/x86_div_guarded.zer` — DIV with explicit divisor guard
+
+**Migration path:** When D-Alpha-7.5 Phase 2 lands, these files will move to `tests/zer_fail/` and `tests/zer/` as real regression tests. Until then, they are research-only artifacts in `research/asm_generics/`.
+
+See `research/asm_generics/README.md` for complete folder structure + naming convention.
 
 ### Open questions / follow-ups for C1
 

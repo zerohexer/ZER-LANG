@@ -96,6 +96,8 @@ Fresh Claude sessions will be tempted. Resist. Each has a reason.
 | **Simplify strict mode + Vale-tier to one model** | They're complementary. Strict mode (18 structural + 13 Z-rules) is universal floor (99% language-safe), Vale-tier is per-block ceiling (100% + semantic). Removing strict mode leaves 80% of blocks at 60% coverage. | Keep both. They compose. |
 | **Try to make ZER prevent logic bugs** | No safe language does. Rust doesn't prevent wrong algorithms. Neither does Ada/SPARK, Haskell, Swift. Scope is language-safety, not logic-safety. | Acknowledge logic is dev responsibility. Focus ZER on language-level bugs. |
 | **Disable ZER safety checks inside unsafe asm** | Rust does this. ZER explicitly chose NOT to — 29 systems stay active through asm operand bindings. Unique ZER advantage. | Keep Z-rules. The 29 systems extend through asm, catching UAF/leak/escape/provenance via asm. |
+| **Add Z-rule code to `zercheck.c`** | `zercheck.c` is being DELETED (Phase G of CFG migration, v0.5.0). Only `zercheck_ir.c` survives. | Z1/Z2 go in `zercheck_ir.c` IR_ASM handler. Z3-Z13 go in `checker.c` NODE_ASM handler. Never touch `zercheck.c` — it's legacy. |
+| **Put all Z-rules in one file** | Z-rules split naturally: state-machine tracking (Z1/Z2) in `zercheck_ir.c` (CFG analysis on IR); AST-level tracking (Z3-Z13) in `checker.c`. | Respect the split. Matches existing compiler architecture (CFG for state machines, AST for everything else). |
 | **Make `@verified_spec` mandatory on all blocks** | Users without formal methods training can't write specs. Creates steep barrier. Defeats "100% usability." | Keep opt-in. Users pick per-block. Unverifiable → `cinclude`. |
 | **Add hardware caveats back** (Spectre, cosmic rays, etc.) | Not ZER's scope. Silicon vendor's concern. Undermines claim for no benefit. | Just say "100% safe" — match Rust/seL4/CompCert framing. |
 | **Gate asm implementation on Phase 2-7 completion** | Decoupled this session. Implementation ships now; D-Beta formal proofs layer later. | Ship intrinsics as D-Alpha batches. Proofs follow in D-Beta. |
@@ -975,27 +977,52 @@ This is NOT "95% safe with 5% random failures." It's "100% safe for the bug clas
 
 This is ZER's philosophy: **tracking beats banning**. The 29 systems track state across normal code; extending them through asm operand boundaries is natural and gives Linux-scale semantic safety without requiring Vale-tier formal proofs.
 
-**13 Z-rules extending strict mode:**
+**13 Z-rules extending strict mode (split across checker.c and zercheck_ir.c):**
 
-| # | Rule | ZER safety system used |
+**IMPORTANT:** `zercheck.c` is being DELETED (Phase G of CFG migration, v0.5.0). Only `zercheck_ir.c` survives. Z-rules for state-machine tracking (Z1, Z2) go in `zercheck_ir.c` — NOT `zercheck.c`.
+
+**zercheck_ir.c handles (2 rules — state machines, IR-level):**
+
+| # | Rule | ZER safety system |
 |---|---|---|
 | Z1 | Handle operand must be ALIVE (not FREED/TRANSFERRED) — using a freed Handle in asm is UAF | #7 Handle States |
 | Z2 | `move struct` consumed by asm → marked HS_TRANSFERRED (use after = compile error) | #10 Move Tracking |
-| Z3 | VRP ranges propagate through asm outputs (declared output range → known VRP) | #12 Range Propagation |
-| Z4 | Provenance tracked on `*opaque` asm operands (wrong type cast rejected) | #3 Provenance |
-| Z5 | `memory` clobber propagates escape flags (stack pointers can't escape via asm) | #11 Escape Flags |
-| Z6 | Context flags respected (asm inside `defer`/`@critical`/`in_async` validated) | #24 Context Flags |
-| Z7 | Asm memory operand in declared `mmio` range (variable addr → runtime range check) | #19 MMIO Ranges |
-| Z8 | Qualifier preservation through asm (`volatile`/`const` cannot be stripped via asm binding) | #20 Qualifier Tracking |
-| Z9 | Asm inside ISR respects ISR tracking (no alloc, no spawn, no non-volatile shared access) | #17 ISR Tracking |
-| Z10 | Non-storable asm outputs (e.g., Handle from certain ops can't be stored in certain places) | #16 Non-Storable |
-| Z11 | Keep-parameter requirements (asm input marked `keep` can be stored in global) | #21 Keep Parameters |
-| Z12 | Stack frame accounting through asm (asm contributes to `--stack-limit` budget) | #18 Stack Frames |
-| Z13 | Return-range declaration respected (asm declaring output range must match VRP) | #13 Return Range |
+
+**checker.c handles (11 rules — AST-level point/summary properties):**
+
+| # | Rule | ZER safety system |
+|---|---|---|
+| Z3 | VRP ranges propagate through asm outputs | #12 Range Propagation |
+| Z4 | Provenance tracked on `*opaque` asm operands | #3 Provenance |
+| Z5 | `memory` clobber propagates escape flags | #11 Escape Flags |
+| Z6 | Context flags respected (asm in `defer`/`@critical`/`async`) | #24 Context Flags |
+| Z7 | Asm memory operand in declared `mmio` range | #19 MMIO Ranges |
+| Z8 | Qualifier preservation through asm (`volatile`/`const`) | #20 Qualifier Tracking |
+| Z9 | Asm inside ISR respects ISR tracking | #17 ISR Tracking |
+| Z10 | Non-storable asm outputs | #16 Non-Storable |
+| Z11 | Keep-parameter requirements | #21 Keep Parameters |
+| Z12 | Stack frame accounting through asm | #18 Stack Frames |
+| Z13 | Return-range declaration respected | #13 Return Range |
+
+**Why this split:** `zercheck_ir.c` is CFG-based state-machine analysis on IR. Handle state + move tracking are state machines that CFG analysis handles naturally — when IR_ASM references an operand local, zercheck_ir sees it and checks state flow. Everything else (VRP, provenance, escape, context, MMIO, etc.) is AST-level point properties handled in `checker.c`.
+
+**Pipeline:**
+```
+AST: NODE_ASM → checker.c (11 Z-rules at AST level) → annotated AST
+  → ir_lower.c (NODE_ASM → IR_ASM with operand locals)
+  → IR → zercheck_ir.c (2 Z-rules on IR_ASM operand locals)
+  → emit_rewritten_node() → GCC inline asm
+```
 
 **Total strict mode: 18 structural + 13 Z-rules = 31 rules. Coverage: ~99% of language-level bug classes.**
 
-Implementation effort: ~240 hrs (same as baseline strict mode). Most of the infrastructure (29 tracking systems) is ALREADY implemented for normal ZER code — just wire up asm operand bindings to flow through it.
+Implementation effort: ~280 hrs (slight revision from earlier 240):
+- checker.c additions (11 Z-rules wiring): ~170 hrs
+- zercheck_ir.c additions (2 Z-rules in IR_ASM handler): ~30 hrs
+- ir_lower.c (NODE_ASM → IR_ASM with operand bindings): ~40 hrs
+- Tests + docs: ~40 hrs
+
+Most of the infrastructure (29 tracking systems) is ALREADY implemented for normal ZER code. Z-rules just wire up asm operand bindings to flow through it. `zercheck.c` is being deleted — don't add code there.
 
 ### Example: Z-rules catch real-world asm bugs
 

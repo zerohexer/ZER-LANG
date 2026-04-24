@@ -280,6 +280,8 @@ Z-rules catch through-asm bugs that Rust can't:
 - Z8: qualifier preservation (can't strip const/volatile via asm, System #20)
 - Plus Z3/Z4/Z6/Z9-Z13 leveraging VRP, provenance, context flags, ISR tracking, etc.
 
+**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
+
 **Scope is language-safe, NOT logic-safe.** ZER catches memory/type/handle/move/concurrency/provenance/MMIO bugs. Algorithm correctness + business logic = developer's responsibility (same scope as every safe language). Vale-tier (v1.1+) adds orthogonal semantic correctness via `@verified_spec`.
 
 See `docs/compiler-internals.md` Z-rules section for implementation details; `docs/asm_plan.md` for roadmap.

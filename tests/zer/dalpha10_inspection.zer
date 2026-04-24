@@ -1,0 +1,48 @@
+// D-Alpha-10: CPU inspection intrinsics
+// 10 intrinsics: read_sp, read_tp, read_flags, vendor_id, feature_bits,
+//                model_id, core_id, current_mode, cache_line_size, num_cores
+//
+// Most are non-privileged CPU state reads — safe to execute in user mode.
+// Some (vendor_id, feature_bits, model_id) use CPUID which is also
+// non-privileged on x86.
+
+i32 main() {
+    // 0-arg u64-return group
+    u64 sp = @cpu_read_sp();
+    u64 tp = @cpu_read_tp();
+    u64 flags = @cpu_read_flags();
+    u64 vendor = @cpu_vendor_id();
+    u64 features = @cpu_feature_bits();
+
+    // 0-arg u32-return group
+    u32 model = @cpu_model_id();
+    u32 core = @cpu_core_id();
+    u32 mode = @cpu_current_mode();
+    u32 cls = @cpu_cache_line_size();
+    u32 ncores = @cpu_num_cores();
+
+    // Verify the inspection calls compile and don't crash.
+    // Specific values are platform-dependent; sp should be nonzero
+    // (stack exists), cls should be >= 16 (sane cache line).
+    if (sp != 0 && cls >= 16) {
+        // Prevent unused-var warnings via comparison
+        if (tp == 0 || tp != 0) {
+            if (flags == 0 || flags != 0) {
+                if (vendor == 0 || vendor != 0) {
+                    if (features == 0 || features != 0) {
+                        if (model == 0 || model != 0) {
+                            if (core == 0 || core != 0) {
+                                if (mode == 0 || mode != 0) {
+                                    if (ncores >= 1) {
+                                        return 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}

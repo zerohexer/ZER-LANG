@@ -5818,6 +5818,26 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@cpu_id takes no arguments");
             }
             result = ty_u32;
+        } else if ((nlen == 11 && memcmp(name, "cpu_read_sp", 11) == 0) ||
+                   (nlen == 11 && memcmp(name, "cpu_read_tp", 11) == 0) ||
+                   (nlen == 14 && memcmp(name, "cpu_read_flags", 14) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_vendor_id", 13) == 0) ||
+                   (nlen == 16 && memcmp(name, "cpu_feature_bits", 16) == 0)) {
+            /* D-Alpha-10: inspection — 0-arg, u64-return */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_u64;
+        } else if ((nlen == 12 && memcmp(name, "cpu_model_id", 12) == 0) ||
+                   (nlen == 11 && memcmp(name, "cpu_core_id", 11) == 0) ||
+                   (nlen == 16 && memcmp(name, "cpu_current_mode", 16) == 0) ||
+                   (nlen == 19 && memcmp(name, "cpu_cache_line_size", 19) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_num_cores", 13) == 0)) {
+            /* D-Alpha-10: inspection — 0-arg, u32-return */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_u32;
         } else if (nlen == 12 && memcmp(name, "cpu_read_msr", 12) == 0) {
             /* D-Alpha-9: @cpu_read_msr(u32 msr) -> u64. Privileged (CPL=0). */
             if (node->intrinsic.arg_count != 1) {

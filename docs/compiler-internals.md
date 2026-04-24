@@ -6517,7 +6517,18 @@ semantic correctness orthogonally.
 ### The 13 Z-rules (strict mode upgrade)
 
 Added to the 18 structural rules (S/O/I/E) documented in
-`docs/asm_plan.md`. Total strict mode = 31 rules, 99% language-safe.
+`docs/asm_plan.md`. Total strict mode = 31 rules + per-instruction preconditions = **100% language-safe**.
+
+**Two-dimension model (not a continuum):**
+
+| Dimension | Coverage | How |
+|---|---|---|
+| **Language safety** (Tier A, v1.0) | 100% | Strict mode: 18 structural + 13 Z-rules + per-instruction precondition checking via existing VRP (System #12). Catches UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI/instruction-UB through asm. |
+| **Algorithm correctness** (Tier C, v1.1+, opt-in per block) | 100% per annotated block | `@verified_spec` Vale-tier formal proof. Proves what the asm COMPUTES matches declared pre/post-conditions. |
+
+These are DIFFERENT dimensions. Neither subsumes the other. Strict mode still applies inside Vale-tier blocks — both compose.
+
+**Per-instruction preconditions are NOT a separate tier.** They're part of Tier A strict mode, using existing VRP. Examples: `bsr` on zero (VRP proves operand ≠ 0), `shl` count ≥ width (VRP proves count < width), `div` by zero in asm (VRP proves divisor ≠ 0). Same pattern as ZER's existing integer-div-zero and shift-UB checks in normal code, just extended to asm instructions inside `unsafe asm` blocks.
 
 **CRITICAL: `zercheck.c` is being DELETED (Phase G of CFG migration, v0.5.0). Only `zercheck_ir.c` will remain.** Z-rules that need state-machine tracking go in `zercheck_ir.c` (which handles IR_ASM instruction case), NOT `zercheck.c`. See CLAUDE.md "CFG Migration" section.
 

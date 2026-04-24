@@ -270,7 +270,7 @@ Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branc
 
 ZER's 29 safety tracking systems extend THROUGH `unsafe asm` operand boundaries via 13 Z-rules. Unlike Rust (which disables borrow checker inside `unsafe { asm!() }`), ZER keeps all tracking active at asm bindings.
 
-**Strict mode = 18 structural rules + 13 Z-rules = 31 rules, ~99% language-safe.**
+**Strict mode = 18 structural + 13 Z-rules + per-instruction preconditions = 100% language-safe.**
 
 Z-rules catch through-asm bugs that Rust can't:
 - Z1: UAF through asm operand (Handle must be ALIVE per System #7)
@@ -280,9 +280,17 @@ Z-rules catch through-asm bugs that Rust can't:
 - Z8: qualifier preservation (can't strip const/volatile via asm, System #20)
 - Plus Z3/Z4/Z6/Z9-Z13 leveraging VRP, provenance, context flags, ISR tracking, etc.
 
-**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
+**Per-instruction preconditions** extend existing VRP (System #12) INSIDE asm: `bsr` on zero rejected, `shl` with count ≥ width rejected, etc. Same pattern as ZER's normal div-zero / shift-UB checks. Part of Tier A strict mode, not a separate tier.
 
-**Scope is language-safe, NOT logic-safe.** ZER catches memory/type/handle/move/concurrency/provenance/MMIO bugs. Algorithm correctness + business logic = developer's responsibility (same scope as every safe language). Vale-tier (v1.1+) adds orthogonal semantic correctness via `@verified_spec`.
+**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 + per-instruction preconditions live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
+
+**Two orthogonal dimensions (NOT a continuum):**
+- **Language safety** (Tier A, v1.0): 100% via strict mode — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI/instruction-UB all caught
+- **Algorithm correctness** (Tier C, v1.1+, opt-in per block): `@verified_spec` Vale-tier proves the asm computes what developer declared
+
+These compose — neither subsumes the other. Strict mode still runs inside Vale-tier blocks.
+
+**Scope is language-safe, NOT algorithm-safe.** Same scope as every safe language. Algorithm choice + business logic = developer's responsibility unless they opt into `@verified_spec`.
 
 See `docs/compiler-internals.md` Z-rules section for implementation details; `docs/asm_plan.md` for roadmap.
 

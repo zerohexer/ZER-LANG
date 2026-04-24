@@ -1516,6 +1516,197 @@ Not a full research session — data-file work deferred to v1.x.
 
 ---
 
+## Categories C6 + C7 — VERIFIED RESEARCH SESSION 5 (2026-04-24)
+
+**Status: Phase 1 survey COMPLETE for C6 and C7. ✓**
+
+**C6 kept as standalone category.** C7 found to be minimal in base ISAs; considering but not merging (separate semantics: address region vs operand aliasing).
+
+### Methodology
+
+Option 1+2: WebFetch for x86 (INVLPG, MOVS) + WebSearch for ARM64 + RISC-V (PMP, address spaces).
+
+### Category C6 — Memory Addressability
+
+**Pattern:** Instruction's memory operand must point to a valid, addressable region. Violations: exception, trap, or silent no-op depending on instruction.
+
+#### C6 subcategories
+
+| Subcat | Meaning | Examples |
+|---|---|---|
+| C6a | MMIO range (declared valid hardware registers) | Memory-mapped I/O accesses |
+| C6b | Canonical address form (arch-specific sign-extension rules) | x86-64 48-bit or 57-bit canonical; ARM64 48-bit with optional 52-bit via LVA |
+| C6c | Physical vs virtual address mode | `INVLPG` takes VA; some cache-maintenance takes PA |
+| C6d | PMP-protected regions (RISC-V) or MMU-controlled (ARM64/x86) | Access rights (R/W/X) per region |
+
+#### x86-64 C6 Findings
+
+| Instruction | Precondition | Consequence | Source |
+|---|---|---|---|
+| Most memory-referencing | C6b canonical address (48-bit sign-extend from bit 47, or 57-bit from bit 56 with LA57) | `#GP(0)` typically | [x86-64 canonical form](https://en.wikipedia.org/wiki/X86-64) |
+| `INVLPG` | C6b canonical; C6a typically mapped | **Silent no-op** if non-canonical (unique behavior) | [Intel SDM INVLPG](https://www.felixcloutier.com/x86/invlpg) |
+| MMIO access (any memory instruction) | C6a — address in declared MMIO range | Implementation-defined; ZER checks via `mmio 0xADDR..0xADDR` declaration | ZER System #19 existing |
+
+**Key quote (canonical address):**
+> "In the AMD specification, the most significant 16 bits of any virtual address (bits 48 through 63) must be copies of bit 47 (in a manner akin to sign extension). If this requirement is not met, the processor will raise an exception."
+
+**Key quote (INVLPG exception):**
+> "It also operates the same in 64-bit mode, except if the memory address is in non-canonical form. In this case, INVLPG is the same as a NOP."
+
+This is interesting — INVLPG has DIFFERENT non-canonical behavior than most memory-referencing instructions (silent NOP vs #GP). Still fits C6b category; consequence metadata captures the difference.
+
+#### ARM64 C6 Findings
+
+| Pattern | Precondition | Consequence | Source |
+|---|---|---|---|
+| Memory access in 48-bit VA mode | C6b canonical (bits 63:48 = bit 47) | Synchronous exception | [ARM 64 address spaces](https://developer.arm.com/documentation/101811/latest/Address-spaces/Size-of-virtual-addresses) |
+| Memory access in 52-bit LVA mode | C6b canonical per LVA rules | Same | Same |
+| Top Byte Ignore (TBI) | Bits 63:56 ignored when TBI enabled — MTE tags can live there | No exception on upper-byte difference when TBI set | [TBI docs](https://www.linaro.org/blog/top-byte-ignore-for-fun-and-memory-savings/) |
+| MMU region violation | C6d — access rights per page table entry | Synchronous exception (data abort) | ARM ARM MMU |
+
+**Key quote:**
+> "User addresses have bits 63:48 set to 0, while the kernel addresses have the same bits set to 1. Most AArch64 systems use 48 bit virtual addresses."
+> "Any other bits between the virtual address width and top byte must be set to all 0s or all 1s, as before."
+
+#### RISC-V C6 Findings
+
+| Pattern | Precondition | Consequence | Source |
+|---|---|---|---|
+| Load/store/fetch within PMP-protected region | C6d — R/W/X permission matches access type | access-fault exception (distinct from alignment fault) | [RISC-V PMP spec](https://ibex-core.readthedocs.io/en/latest/03_reference/pmp.html) |
+| Virtual address in Sv39/Sv48/Sv57 modes | C6b canonical sign-extension | page-fault exception | RISC-V Priv Architecture §4.3-4.5 |
+
+**Key quote:**
+> "Attempting to execute a load or load-reserved instruction which accesses a physical address within a PMP region without read permissions raises a load access-fault exception."
+> "Attempting to execute a store, store-conditional, or AMO instruction which accesses a physical address within a PMP region without write permissions raises a store access-fault exception."
+
+### C6 Mapping to ZER Safety Systems
+
+Maps to **existing System #19 (MMIO Ranges)** for C6a and extends slightly for canonical-address checking (C6b).
+
+- **C6a MMIO:** already works via `mmio 0xADDR..0xADDR;` declarations — no extension needed.
+- **C6b canonical:** minor extension — checker recognizes arch-specific canonical rules; ~5 hrs work.
+- **C6c virtual/physical:** declaration-based via `@physical_addr` or `@virtual_addr` attribute on pointer; ~5 hrs.
+- **C6d PMP/MMU regions:** runtime check; compile-time reject if address provably outside permitted range (from linker script or BSP config).
+
+**Total C6 implementation: ~10-15 hrs.** Leverages existing #19 heavily.
+
+### Category C7 — Provenance / Aliasing (minimal category — findings below)
+
+**Pattern:** Multi-operand constraints about pointer relationships (operands must not alias, must alias, or must share provenance).
+
+#### C7 subcategories (original taxonomy)
+
+- C7a Disjoint operands — e.g., pointers to different memory regions
+- C7b Same-provenance required
+- C7c Write-once through specific operand
+
+#### Surprising finding: C7 is nearly empty at the ISA level
+
+Research found **base ISAs rarely encode aliasing constraints**. When checked:
+
+| Instruction | Expected aliasing constraint | Actual finding | Source |
+|---|---|---|---|
+| x86 `MOVS`/`CMPS`/`REP MOVSB` | Expected: source/dest must not overlap | ISA spec **silent** on overlap — behavior defined even with overlap (though semantics may vary with REP prefix) | [Intel SDM MOVS](https://www.felixcloutier.com/x86/movs:movsb:movsw:movsd:movsq) |
+| ARM64 `LDP`/`STP` (pair load/store) | Expected: pair registers must not overlap base | ISA spec doesn't restrict register overlap explicitly | ARM ARM LDP/STP |
+| RISC-V AMO instructions | Expected: aliasing rules | No explicit constraints | RISC-V A-ext |
+
+**Why C7 is rare in base ISAs:** Aliasing constraints are typically a LANGUAGE-LEVEL concern (e.g., C's `restrict` keyword), not an ISA-level one. Hardware defines behavior for any aliasing; compilers and languages layer aliasing-based optimization on top.
+
+#### Where C7 DOES appear
+
+| Context | Constraint | ZER handling |
+|---|---|---|
+| Vendor-specific SIMD ops with special overlap rules (e.g., some AVX-512 gather-scatter variants) | May have UB if base and indices alias | C7 data-file entries per instruction |
+| MMIO-to-MMIO direct copies | Undefined in most ISAs | Language-level check via System #19 |
+| DMA controller setup | Source and dest buffers must be disjoint | Compile-time check via provenance (System #3) |
+| String operations with overlapping buffers | Not UB but may be inefficient | Warning, not error |
+
+### C7 Mapping to ZER Safety Systems
+
+**Maps to existing System #3 (Provenance) + System #11 (Escape Flags).** No extension needed.
+
+For any C7 instruction identified:
+- Checker verifies operand pointers have distinct provenance OR same provenance as required
+- Leverages existing `@ptrcast` + `@container` provenance tracking
+
+**Total C7 implementation: ~0 hrs additional.** ZER already has the machinery for the few actual cases that arise.
+
+### Decision: C7 kept as standalone category (not merged into C3)
+
+Despite being small, C7 has distinct semantics (aliasing is "operand relationship" not "state machine"). Better to keep separate — low cost (data entries per rare instruction), clean framework.
+
+### Data file format (C6 + C7)
+
+```
+# arch_data/x86_64.zerdata — Category C6
+
+[INVLPG]
+category = C6b
+operand = 1       # memory address
+constraint = CANONICAL_ADDR
+consequence = "silent NOP if non-canonical (unique behavior)"
+source = "Intel SDM INVLPG"
+
+[MOV_to_memory]
+category = C6b
+operand = memory  # any memory operand
+constraint = CANONICAL_ADDR
+consequence = "#GP(0) if non-canonical"
+source = "Intel SDM memory addressing"
+# Note: this is implicit on ALL memory-referencing instructions — handled
+# as a default rule rather than per-instruction entries
+
+# arch_data/x86_64.zerdata — Category C7 (may be empty or near-empty)
+
+# (No x86 instructions with hard aliasing constraints identified in
+# this survey. MOVS/CMPS allow overlap. If future AVX-512 research
+# reveals constraints, add here.)
+
+# arch_data/rv64.zerdata — Category C6
+
+[LOAD]
+category = C6d
+operand = 1       # effective address
+constraint = PMP_READ
+consequence = "load access-fault exception"
+source = "RISC-V Priv Architecture §3.7 PMP"
+# Applies implicitly to all load instructions
+
+[STORE]
+category = C6d
+operand = 1
+constraint = PMP_WRITE
+consequence = "store access-fault exception"
+source = "RISC-V Priv Architecture §3.7 PMP"
+```
+
+### POC specifications (see `research/asm_generics/C6_memory_addressability/` and `C7_provenance/`)
+
+Tests written this session:
+- `research/asm_generics/C6_memory_addressability/reject/x86_invlpg_noncanonical.zer` — INVLPG with non-canonical address → silent no-op (unique behavior; checker should warn)
+- `research/asm_generics/C6_memory_addressability/accept/riscv_load_pmp_permitted.zer` — load in PMP-permitted region
+- (C7 tests deferred — minimal real cases to POC)
+
+### Open questions / follow-ups for C6+C7
+
+1. **Silent NOP warnings:** INVLPG's silent-NOP on non-canonical is unusual. Should checker warn ("did you really want a no-op here?") or silently allow? Suggest warning.
+2. **C7 completeness:** we found minimal C7 in base ISAs. Vendor extensions (AVX-512 gather-scatter with index registers) may have C7 cases. Flag for Session 8+ follow-up.
+3. **Default vs per-instruction canonical addr:** canonical-address rule applies to nearly every memory-referencing instruction. Should the framework treat this as a "default rule for all memory ops" rather than per-instruction data entries? Design decision — probably YES for performance + cleanness.
+
+### Session 5 completion marker
+
+**Categories C6 (Memory addressability) + C7 (Provenance/aliasing) research: COMPLETE ✓ 2026-04-24 [this commit]**
+- C6: 4 subcategories × 3 archs classified. Maps to existing System #19 with minor canonical-addr extension.
+- C7: surprisingly minimal — base ISAs rarely encode aliasing. Maps to existing System #3 + #11 without extension.
+- C6 implementation estimate: ~10-15 hrs
+- C7 implementation estimate: ~0-5 hrs
+- POC `.zer` files in research/asm_generics/C6_memory_addressability/ (C7 POCs deferred — rare cases)
+- **Key finding:** C7 near-empty — language-level aliasing handled better at language layer (C `restrict`, ZER's System #3) than ISA layer
+
+**Next session: Category C8 (Memory ordering) — most complex remaining category. Requires NEW System #30 (Atomic Ordering) design. Largest implementation effort estimated (~80 hrs).**
+
+---
+
 ### Legacy first-pass survey (FOR REFERENCE — superseded by verified research above)
 
 **Note: This section preserved from first-pass memory-based survey before WebFetch verification. Retained for historical context; use VERIFIED sections above for all classification decisions.**

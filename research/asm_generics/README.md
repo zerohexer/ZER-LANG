@@ -74,8 +74,8 @@ Until that migration, these files are NOT in the active test suite.
 | C3 State machine | **COMPLETE (2026-04-24)** | 3 | **6 .zer files + ISA citations + 3 x86 (TSX) + 7 ARM64 (exclusive) + 2 RISC-V (LR/SC) classified. C9 MERGED INTO C3.** |
 | C4 CPU feature | **COMPLETE (2026-04-24)** | 4 | **2 .zer files + representative instruction samples across 3 archs. ~450+ feature-gated instructions total. Maps to System #24 with cpu_features extension.** |
 | C5 Privilege | **COMPLETE (2026-04-24)** | 4 | **3 .zer files + representative samples. ~200+ privileged instructions total. Maps to System #24 with privilege_level hierarchy. Kept separate from C4 (different semantics: set-membership vs hierarchy).** |
-| C6 Memory addressability | Pending | 6 | — |
-| C7 Provenance/aliasing | Pending | 7 | — |
+| C6 Memory addressability | **COMPLETE (2026-04-24)** | 5 | **2 .zer files + ISA citations. C6b canonical (x86/ARM64), C6d PMP (RISC-V), existing ZER MMIO handles C6a. Maps to System #19 with minor canonical-addr extension.** |
+| C7 Provenance/aliasing | **COMPLETE (2026-04-24)** | 5 | **0 POCs (rare in base ISAs). Surprising finding: base ISAs silent on aliasing (MOVS, LDP/STP). Maps to existing System #3 + #11 without extension.** |
 | C8 Memory ordering | Pending (needs System #30 design) | 8 | — |
 | ~~C9 Exclusive pairing~~ | **MERGED INTO C3 (2026-04-24)** | — | — |
 | C10 Register dependency | Pending (may defer entirely) | — | — |

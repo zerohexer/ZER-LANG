@@ -1,0 +1,61 @@
+// D-Alpha-12: privileged mode transitions
+// 6 intrinsics: syscall, sysret, iret, set_priv_stack, get_priv_level, hypercall
+//
+// ALL privileged or mode-transitioning — dead-branch pattern required.
+// Executing these in user-mode tests would cause SIGSEGV or context destruction.
+
+volatile u32 never_true;
+
+void dead_branch_syscall_test() {
+    if (never_true == 42) {
+        @cpu_syscall();     // user-side trap to kernel
+    }
+}
+
+void dead_branch_sysret_test() {
+    if (never_true == 42) {
+        @cpu_sysret();      // kernel-side return to user
+    }
+}
+
+void dead_branch_iret_test() {
+    if (never_true == 42) {
+        @cpu_iret();        // interrupt handler return
+    }
+}
+
+void dead_branch_priv_stack_test() {
+    u64 stack_top = 0;
+    if (never_true == 42) {
+        @cpu_set_priv_stack(stack_top);
+    }
+}
+
+u32 dead_branch_priv_level_test() {
+    u32 lvl = 0;
+    if (never_true == 42) {
+        // get_priv_level CAN run in user mode — returns 3 on x86 (ring 3)
+        // but we still dead-branch for consistency with other privileged intrinsics
+        lvl = @cpu_get_priv_level();
+    }
+    return lvl;
+}
+
+void dead_branch_hypercall_test() {
+    if (never_true == 42) {
+        @cpu_hypercall();
+    }
+}
+
+i32 main() {
+    dead_branch_syscall_test();
+    dead_branch_sysret_test();
+    dead_branch_iret_test();
+    dead_branch_priv_stack_test();
+    u32 lvl = dead_branch_priv_level_test();
+    dead_branch_hypercall_test();
+
+    // Prevent unused-var warning
+    if (lvl == 0 || lvl != 0) { return 0; }
+    return 0;
+}

@@ -5828,6 +5828,34 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
             }
             result = ty_void;
+        } else if ((nlen == 11 && memcmp(name, "cpu_syscall", 11) == 0) ||
+                   (nlen == 10 && memcmp(name, "cpu_sysret", 10) == 0) ||
+                   (nlen == 8 && memcmp(name, "cpu_iret", 8) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_hypercall", 13) == 0)) {
+            /* D-Alpha-12: privileged mode transitions — 0-arg, void-return. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if (nlen == 18 && memcmp(name, "cpu_set_priv_stack", 18) == 0) {
+            /* D-Alpha-12: @cpu_set_priv_stack(u64 sp) — set kernel/supervisor stack. Privileged. */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@cpu_set_priv_stack requires 1 argument (stack pointer)");
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@cpu_set_priv_stack argument must be integer (stack address)");
+                }
+            }
+            result = ty_void;
+        } else if (nlen == 18 && memcmp(name, "cpu_get_priv_level", 18) == 0) {
+            /* D-Alpha-12: @cpu_get_priv_level() -> u32 — query current privilege level.
+             * Returns 0=user, 1=supervisor, 2=hypervisor, 3=monitor on ARM / M-mode on RISC-V.
+             * x86: CS.RPL value (0-3). */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@cpu_get_priv_level takes no arguments");
+            }
+            result = ty_u32;
         } else if (nlen == 16 && memcmp(name, "cpu_monitor_addr", 16) == 0) {
             /* D-Alpha-11: @cpu_monitor_addr(*u8 addr) — x86 MONITOR. Privileged. */
             if (node->intrinsic.arg_count != 1) {

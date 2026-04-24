@@ -1,0 +1,52 @@
+// D-Alpha-9: MSR/CSR access intrinsics (privileged, x86-focused)
+// 10 intrinsics: read_msr/write_msr, read_cr0/3/4, write_cr0/3/4,
+//                read_xcr0, write_xcr0
+//
+// ALL privileged (CPL=0 / kernel mode) — SIGSEGV in user mode.
+// Uses dead-branch pattern to verify compilation without executing.
+
+volatile u32 never_true;
+
+u64 dead_branch_msr_test() {
+    u64 val = 0;
+    if (never_true == 42) {
+        // IA32_APIC_BASE = 0x1B
+        val = @cpu_read_msr(0x1B);
+        @cpu_write_msr(0x1B, 0xFEE00900);
+    }
+    return val;
+}
+
+u64 dead_branch_cr_test() {
+    u64 cr0 = 0;
+    u64 cr3 = 0;
+    u64 cr4 = 0;
+    if (never_true == 42) {
+        cr0 = @cpu_read_cr0();
+        cr3 = @cpu_read_cr3();
+        cr4 = @cpu_read_cr4();
+
+        @cpu_write_cr0(cr0);
+        @cpu_write_cr3(cr3);
+        @cpu_write_cr4(cr4);
+    }
+    return cr0 + cr3 + cr4;
+}
+
+u64 dead_branch_xcr0_test() {
+    u64 xcr0 = 0;
+    if (never_true == 42) {
+        xcr0 = @cpu_read_xcr0();
+        @cpu_write_xcr0(xcr0);
+    }
+    return xcr0;
+}
+
+i32 main() {
+    u64 msr = dead_branch_msr_test();
+    u64 cr = dead_branch_cr_test();
+    u64 xcr = dead_branch_xcr0_test();
+
+    if (msr == 0 && cr == 0 && xcr == 0) { return 0; }
+    return 0;
+}

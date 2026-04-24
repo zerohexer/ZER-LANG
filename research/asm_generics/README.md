@@ -71,13 +71,15 @@ Until that migration, these files are NOT in the active test suite.
 |---|---|---|---|
 | C1 Value-range | COMPLETE (2026-04-24) | 1 | 4 .zer files + ISA citations + 7 x86 instructions classified |
 | C2 Alignment | COMPLETE (2026-04-24) | 2 | 6 .zer files + ISA citations + 12 x86 + 8 ARM64 + 2 RISC-V instruction families classified |
-| C3 State machine | Pending | 3 | — |
+| C3 State machine | **COMPLETE (2026-04-24)** | 3 | **6 .zer files + ISA citations + 3 x86 (TSX) + 7 ARM64 (exclusive) + 2 RISC-V (LR/SC) classified. C9 MERGED INTO C3.** |
 | C4 CPU feature | Pending | 4 | — |
-| C5 Privilege | Pending | 5 | — |
+| C5 Privilege | Pending | 4-5 | — (may combine with C4) |
 | C6 Memory addressability | Pending | 6 | — |
 | C7 Provenance/aliasing | Pending | 7 | — |
 | C8 Memory ordering | Pending (needs System #30 design) | 8 | — |
-| C9 Exclusive pairing | Pending (may merge into C3) | — | — |
+| ~~C9 Exclusive pairing~~ | **MERGED INTO C3 (2026-04-24)** | — | — |
 | C10 Register dependency | Pending (may defer entirely) | — | — |
+
+**Category count:** 9 (was 10; C9 merged into C3 in Session 3).
 
 Session methodology: `docs/asm_preconditions_research.md` "Session Methodology" section.

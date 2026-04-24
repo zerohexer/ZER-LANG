@@ -1,0 +1,37 @@
+// EXPECTED: compile error
+//
+// Category C3b (State machine, exit without enter) — RISC-V SC.W
+// Source: RISC-V ISA Manual Vol I Unpriv A-extension §14 —
+// "The SC must be to the same effective address and of the same data size
+// as the latest LR executed by the same hart."
+// Implicit: SC without prior LR = no reservation → always fails.
+//
+// Precondition: SC requires prior matching LR in CFG.
+// Violation: SC without paired LR → no reservation set, store always fails.
+//
+// Research citation: docs/asm_preconditions_research.md Category C3 session 3
+
+i32 unsafe_sc_alone(*u32 ptr, u32 value) {
+    u32 result;
+
+    // No LR.W before this → exclusive_state = NOT_IN_TRANSACTION.
+    // SC.W without reservation set = always fails.
+    // Category C3b check must REJECT.
+    //
+    // Expected error: "SC.W without matching LR.W (C3b).
+    //                  No prior LR.W reached this point in CFG.
+    //                  SC requires paired LR to establish reservation set."
+    unsafe asm {
+        instructions: "sc.w %0, %2, (%1)"
+        inputs:  { "r" = ptr, "r" = value }
+        outputs: { "=r" = result }
+        clobbers: []
+        safety: "Store-conditional word"
+    }
+
+    return (i32)result;
+}
+
+i32 main() {
+    return 0;
+}

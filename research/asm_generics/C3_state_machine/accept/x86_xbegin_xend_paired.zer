@@ -1,0 +1,57 @@
+// EXPECTED: compiles + runs
+//
+// Category C3a/C3b (State machine, matched enter+exit) — x86-64 XBEGIN/XEND
+// POSITIVE TEST: demonstrates matched Intel TSX transaction passes check.
+//
+// Pattern: XBEGIN enters transactional state, XEND commits.
+// CFG analysis proves:
+//   - XEND reached only via path through XBEGIN (state established)
+//   - No mismatched abort paths
+//
+// Category C3 check PASSES.
+//
+// Research citation: docs/asm_preconditions_research.md Category C3 session 3
+
+i32 safe_transaction() {
+    // Placeholder using ZER primitives until hardened unsafe asm lands.
+    //
+    // When strict mode implements C3 check, the following should compile:
+    //
+    //     /* C3a: enter transactional state */
+    //     unsafe asm {
+    //         instructions: "xbegin 1f\n\t"
+    //                       "nop\n"        /* transaction body */
+    //                       "1:"
+    //         inputs:  {}
+    //         outputs: {}
+    //         clobbers: ["memory", "cc"]
+    //         safety: "Enter Intel TSX transaction; fallback on abort"
+    //     }
+    //
+    //     /* transaction body: critical section operations */
+    //     /* [register-only or same-transaction memory — safe] */
+    //
+    //     /* C3b: exit transactional state */
+    //     unsafe asm {
+    //         instructions: "xend"
+    //         inputs: {}
+    //         outputs: {}
+    //         clobbers: []
+    //         safety: "Commit Intel TSX transaction"
+    //     }
+    //
+    // Category C3a + C3b check PASSES:
+    //   - XEND reached only via path that executed XBEGIN
+    //   - XEND's RTM_ACTIVE check satisfied at runtime (transaction active)
+
+    // Placeholder: simulate transactional sequence
+    i32 x = 0;
+    x = x + 1;  // would be inside TSX transaction
+    x = x * 2;
+    if (x == 2) { return 0; }
+    return 1;
+}
+
+i32 main() {
+    return safe_transaction();
+}

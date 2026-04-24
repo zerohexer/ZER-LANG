@@ -1,0 +1,48 @@
+// EXPECTED: compile error
+//
+// Category C3b (State machine, match mismatch) — ARM64 LDXR→STXR size mismatch
+// Source: ARM ARM DDI 0487 —
+// "The STX must match the LDX both in address and operand sizes; you cannot
+// perform an LDX for one address and follow up with a STX to a different
+// address."
+//
+// Precondition: STXR operand size MUST match LDXR operand size.
+// Violation: LDXR.W (32-bit) followed by STXR.X (64-bit) = size mismatch.
+// Silent failure (STXR always fails) or undefined behavior.
+//
+// Research citation: docs/asm_preconditions_research.md Category C3 session 3
+
+i32 unsafe_size_mismatch(*u64 ptr, u64 value) {
+    u32 loaded;
+    u32 result;
+
+    // Enter exclusive state with 4-byte width.
+    unsafe asm {
+        instructions: "ldxr %w0, [%1]"
+        inputs:  { "r" = ptr }
+        outputs: { "=r" = loaded }
+        clobbers: []
+        safety: "Exclusive 32-bit load (enters exclusive state with size=4)"
+    }
+
+    // Try to exit with 8-byte width → SIZE MISMATCH.
+    // exclusive_state = IN_TRANSACTION(address=ptr, size=4, enter=LDXR_W)
+    // STXR.X has size=8 which doesn't match size=4.
+    // Category C3b check must REJECT.
+    //
+    // Expected error: "STXR.X doesn't match paired LDXR.W (C3b):
+    //                  size mismatch (4 vs 8 bytes)."
+    unsafe asm {
+        instructions: "stxr %w0, %2, [%1]"
+        inputs:  { "r" = ptr, "r" = value }
+        outputs: { "=r" = result }
+        clobbers: []
+        safety: "Exclusive 64-bit store"
+    }
+
+    return (i32)result;
+}
+
+i32 main() {
+    return 0;
+}

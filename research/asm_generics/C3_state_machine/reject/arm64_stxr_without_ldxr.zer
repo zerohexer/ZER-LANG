@@ -1,0 +1,38 @@
+// EXPECTED: compile error
+//
+// Category C3b (State machine, exit without enter) — ARM64 STXR
+// Source: ARM ARM DDI 0487 STXR —
+// "The store-exclusive succeeds only if there has been no intervening
+// access to the monitored memory since the load-exclusive."
+// Implicit: STXR without prior LDXR = no reservation → always fails.
+//
+// Precondition: STXR requires prior matching LDXR in CFG.
+// Violation: STXR without paired LDXR → no reservation, store always fails.
+// Silent failure (not a trap) but definitionally a bug.
+//
+// Research citation: docs/asm_preconditions_research.md Category C3 session 3
+
+i32 unsafe_stxr_alone(*u32 ptr, u32 value) {
+    u32 result;
+
+    // No LDXR before this → exclusive_state = NOT_IN_TRANSACTION.
+    // STXR without reservation = always fails (result=1).
+    // Category C3b check must REJECT.
+    //
+    // Expected error: "STXR without matching LDXR (C3b).
+    //                  No prior LDXR reached this point in CFG.
+    //                  STXR requires paired LDXR to establish reservation."
+    unsafe asm {
+        instructions: "stxr %w0, %w2, [%1]"
+        inputs:  { "r" = ptr, "r" = value }
+        outputs: { "=r" = result }
+        clobbers: []
+        safety: "Exclusive store"
+    }
+
+    return (i32)result;
+}
+
+i32 main() {
+    return 0;
+}

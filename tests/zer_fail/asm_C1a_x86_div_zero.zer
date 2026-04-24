@@ -1,0 +1,37 @@
+// EXPECTED: compile error
+//
+// Category C1a (Value-range, nonzero required) — x86-64 DIV instruction
+// Source: Intel SDM Vol 2A DIV — "#DE: If the source operand (divisor) is 0."
+//
+// Precondition: DIV divisor must be proven nonzero via VRP (System #12).
+// Violation: unproven-nonzero divisor passed to DIV → compile error.
+//
+// This is the same safety class as ZER's existing normal-code division check:
+//     u32 y = x / z;   // ZER rejects if z not proven nonzero
+// Extended to asm: same rule, applied to the DIV instruction's divisor operand.
+//
+// Research citation: docs/asm_preconditions_research.md Category C1 session 1
+
+u64 unsafe_div(u64 dividend, u64 divisor) {
+    u64 quotient;
+    u64 remainder;
+
+    // Divisor is user-input, VRP range [0, UINT64_MAX] — includes 0.
+    // Category C1c check must REJECT at compile time.
+    //
+    // Expected error: "Cannot prove divisor nonzero for DIV (Category C1c).
+    //                  Add `if (divisor != 0)` guard."
+    unsafe asm {
+        instructions: "divq %2"
+        inputs:  { "a" = dividend, "r" = divisor }
+        outputs: { "=a" = quotient, "=d" = remainder }
+        clobbers: ["cc"]
+        safety: "Unsigned 64-bit divide"
+    }
+
+    return quotient;
+}
+
+i32 main() {
+    return 0;
+}

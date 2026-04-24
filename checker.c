@@ -5818,6 +5818,30 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@cpu_id takes no arguments");
             }
             result = ty_u32;
+        } else if ((nlen == 9 && memcmp(name, "cpu_reset", 9) == 0) ||
+                   (nlen == 14 && memcmp(name, "cpu_deep_sleep", 14) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_idle_hint", 13) == 0) ||
+                   (nlen == 9 && memcmp(name, "cpu_mwait", 9) == 0)) {
+            /* D-Alpha-11: power management — 0-arg, void-return.
+             * Privileged on most archs — tested via dead-branch pattern. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if (nlen == 16 && memcmp(name, "cpu_monitor_addr", 16) == 0) {
+            /* D-Alpha-11: @cpu_monitor_addr(*u8 addr) — x86 MONITOR. Privileged. */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@cpu_monitor_addr requires 1 argument (addr)");
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt) {
+                    Type *eff = type_unwrap_distinct(vt);
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+                        checker_error(c, node->loc.line, "@cpu_monitor_addr argument must be pointer or array");
+                    }
+                }
+            }
+            result = ty_void;
         } else if ((nlen == 11 && memcmp(name, "cpu_read_sp", 11) == 0) ||
                    (nlen == 11 && memcmp(name, "cpu_read_tp", 11) == 0) ||
                    (nlen == 14 && memcmp(name, "cpu_read_flags", 14) == 0) ||

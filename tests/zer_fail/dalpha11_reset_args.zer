@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_reset takes no arguments
+
+i32 main() {
+    @cpu_reset(1);  // error: takes no args
+    return 0;
+}

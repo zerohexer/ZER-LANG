@@ -1,0 +1,44 @@
+// D-Alpha-11: power management intrinsics
+// 5 intrinsics: cpu_reset, cpu_deep_sleep, cpu_idle_hint,
+//               cpu_monitor_addr, cpu_mwait
+//
+// cpu_reset and cpu_deep_sleep halt forever — dead-branch only.
+// cpu_idle_hint is non-blocking (safe to execute).
+// cpu_monitor_addr + cpu_mwait are privileged on some CPUs — dead-branch.
+
+volatile u32 never_true;
+
+void dead_branch_reset_test() {
+    if (never_true == 42) {
+        // Would halt system forever — dead-branch verifies compilation.
+        @cpu_reset();
+    }
+}
+
+void dead_branch_deep_sleep_test() {
+    if (never_true == 42) {
+        // Would halt until interrupt — dead-branch.
+        @cpu_deep_sleep();
+    }
+}
+
+void safe_idle_hint_test() {
+    // cpu_idle_hint is just a PAUSE/YIELD — non-blocking, safe.
+    @cpu_idle_hint();
+}
+
+void dead_branch_monitor_mwait_test() {
+    u32 watch_addr = 0;
+    if (never_true == 42) {
+        @cpu_monitor_addr(&watch_addr);
+        @cpu_mwait();
+    }
+}
+
+i32 main() {
+    dead_branch_reset_test();
+    dead_branch_deep_sleep_test();
+    safe_idle_hint_test();
+    dead_branch_monitor_mwait_test();
+    return 0;
+}

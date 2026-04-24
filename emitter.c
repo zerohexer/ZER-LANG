@@ -6372,6 +6372,74 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * Users needing runtime value should call POSIX sysconf(_SC_NPROCESSORS_ONLN)
              * or std::thread::hardware_concurrency equivalent directly. */
             emit(e, "((uint32_t)1)");
+        } else if (nlen == 9 && memcmp(name, "cpu_reset", 9) == 0) {
+            /* D-Alpha-11: trigger reset. Real reset is platform-specific (PSCI/SBI/
+             * keyboard controller port); safe portable fallback = infinite halt loop.
+             * Users on specific platforms override with platform-specific code. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"cli\\n\\t1: hlt\\n\\tjmp 1b\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"1: wfi\\n\\tb 1b\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"1: wfi\\n\\tj 1b\");\n"
+                "#else\n"
+                "    while (1) { __builtin_trap(); }\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "cpu_deep_sleep", 14) == 0) {
+            /* D-Alpha-11: enter deepest idle. Real C-state entry requires
+             * platform-specific firmware calls (PSCI_CPU_SUSPEND etc.);
+             * simplest safe fallback is WFI (wait-for-interrupt). Privileged. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"hlt\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"wfi\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"wfi\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 13 && memcmp(name, "cpu_idle_hint", 13) == 0) {
+            /* D-Alpha-11: softer idle hint — tells CPU we have nothing
+             * urgent to do. On x86 uses PAUSE (short delay, power save).
+             * Non-blocking (unlike cpu_wait_int/cpu_deep_sleep). */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"pause\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"yield\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\".insn i 0x0F, 0, x0, x0, 0x010\");  /* Zihintpause */\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 16 && memcmp(name, "cpu_monitor_addr", 16) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-11: x86 MONITOR — set up address watch for MWAIT.
+             * Privileged on some CPUs. ARM64/RISC-V: no direct equivalent (LDXR
+             * sets exclusive monitor implicitly). */
+            emit(e, "({ const void *_zer_maddr = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"monitor\" :: \"a\"(_zer_maddr), \"c\"(0), \"d\"(0));\n"
+                "#else\n"
+                "    (void)_zer_maddr;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 9 && memcmp(name, "cpu_mwait", 9) == 0) {
+            /* D-Alpha-11: x86 MWAIT — wait until monitored address modified
+             * OR interrupt arrives. Must be preceded by MONITOR setup.
+             * Privileged on some CPUs. ARM64: WFE substitutes. RISC-V: WFI. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mwait\" :: \"a\"(0), \"c\"(0));\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"wfe\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"wfi\");\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
             /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
              * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */

@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_monitor_addr requires pointer, not scalar
+
+i32 main() {
+    u32 scalar = 42;
+    @cpu_monitor_addr(scalar);  // error: scalar, not pointer
+    return 0;
+}

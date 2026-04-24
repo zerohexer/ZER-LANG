@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_read_counter takes no arguments
+
+i32 main() {
+    u64 t = @cpu_read_counter(42);  // error: takes no args
+    (void)t;
+    return 0;
+}

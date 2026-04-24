@@ -6135,6 +6135,65 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __builtin_trap();\n"
                 "#endif\n"
                 "})");
+        } else if (nlen == 16 && memcmp(name, "cpu_read_counter", 16) == 0) {
+            /* D-Alpha-8: read cycle/time counter (u64). Non-privileged where available. */
+            emit(e, "({ uint64_t _zer_cc = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_lo, _zer_hi;\n"
+                "    __asm__ __volatile__ (\"rdtsc\" : \"=a\"(_zer_lo), \"=d\"(_zer_hi));\n"
+                "    _zer_cc = ((uint64_t)_zer_hi << 32) | _zer_lo;\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, cntvct_el0\" : \"=r\"(_zer_cc));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"rdtime %%0\" : \"=r\"(_zer_cc));\n"
+                "#else\n"
+                "    /* Fallback: zero counter */\n"
+                "#endif\n"
+                "_zer_cc; })");
+        } else if (nlen == 10 && memcmp(name, "cpu_get_pc", 10) == 0) {
+            /* D-Alpha-8: read current instruction pointer (u64). Useful for profiling. */
+            emit(e, "({ uint64_t _zer_pc = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"leaq 0(%%%%rip), %%0\" : \"=r\"(_zer_pc));\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"adr %%0, .\" : \"=r\"(_zer_pc));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"auipc %%0, 0\" : \"=r\"(_zer_pc));\n"
+                "#endif\n"
+                "_zer_pc; })");
+        } else if (nlen == 15 && memcmp(name, "wait_on_address", 15) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-8: efficient polling — spin with pause hint until *addr != expected.
+             * Not a true wait (no futex-style blocking); just avoids hammering bus. */
+            emit(e, "({ volatile uint32_t *_zer_wa = (volatile uint32_t*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint32_t _zer_we = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "    while (__atomic_load_n(_zer_wa, __ATOMIC_ACQUIRE) == _zer_we) {\n"
+                "#if defined(__x86_64__)\n"
+                "        __asm__ __volatile__ (\"pause\");\n"
+                "#elif defined(__aarch64__)\n"
+                "        __asm__ __volatile__ (\"yield\");\n"
+                "#elif defined(__riscv)\n"
+                "        __asm__ __volatile__ (\".insn i 0x0F, 0, x0, x0, 0x010\");  /* pause hint (Zihintpause) */\n"
+                "#endif\n"
+                "    }\n"
+                "})");
+        } else if (nlen == 18 && memcmp(name, "cpu_flush_pipeline", 18) == 0) {
+            /* D-Alpha-8: flush instruction pipeline. Required after modifying executable code,
+             * updating system registers that affect subsequent fetches, etc. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"mfence\\n\\tlfence\" ::: \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"isb\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"fence.i\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
             /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
              * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */

@@ -1869,3 +1869,35 @@ If a fresh proof session starts on asm safety verification:
 5. For Level 3 extraction: follow existing `handle_state.c` / `mmio_rules.c` pattern
 
 **Oracle source for asm safety proofs:** the ISA manuals cited in `docs/asm_preconditions_research.md`. Direct quotes from Intel SDM, ARM ARM, RISC-V Manual establish the semantics being proved correct.
+
+### 130/130 intrinsic shipping milestone (2026-04-24)
+
+All 14 D-Alpha intrinsic batches complete. 130 verified intrinsics shipped per
+`docs/asm_plan.md` target. Implementation covers atomics, barriers, interrupt
+control, context switch, MMU, cache maintenance, TLB, multi-core primitives,
+MSR/CR access, inspection, power management, privileged transitions, Linux-scale
+x86 essentials, and final polish.
+
+**No Level 3 VST proofs extracted from intrinsic emitters.** That would require:
+1. Extracting the *checker validation* predicates (not the asm emission code itself)
+2. For each category (C1-C8) that gates an intrinsic, extract the predicate to
+   `src/safety/<category>_rules.c`
+3. Write VST spec matching the category's Level 1 Coq oracle in
+   `docs/asm_preconditions_research.md`
+
+This is future Level 3 work for when strict mode (D-Alpha-7.5 Phase 2) implements
+the 8-category dispatcher and the checker gains structural rules S1-S5, O1-O5, I1-I4,
+E1-E4 (18 total) plus 13 Z-rules wiring ZER's 29 safety systems through asm
+operand bindings.
+
+**Phase 2 readiness:**
+- 130 intrinsics shipped: done
+- Research phase: done (8 universal categories verified across 5 archs)
+- System #30 design spec: done (pseudocode + file placement decided)
+- Hardened unsafe asm (H1-H7 typed operand syntax): NOT STARTED — prereq for Phase 2
+- Strict mode implementation: NOT STARTED
+
+Proof-session implication: when strict mode lands, the 31 rules (18 structural +
+13 Z-rules) and System #30 (atomic ordering) will each want Level 3 VST extraction.
+Plan target ~500 hrs of proof work spanning ~30-50 extracted predicates. See
+`docs/asm_preconditions_research.md` C1-C8 sections for per-category oracles.

@@ -319,6 +319,76 @@ Most privileged — dead-branch pattern. cpu_idle_hint is non-blocking (safe to 
 All require correctly-set system register context (CS/RIP/RFLAGS on x86; ELR/SPSR on
 ARM; sepc/sstatus on RISC-V) before the transition instruction. Dead-branch pattern.
 
+### Linux-Scale x86 Essentials (D-Alpha-13, 20 intrinsics)
+```
+/* FS/GS segment bases — requires FSGSBASE feature (CR4.FSGSBASE=1) */
+@cpu_read_fsbase() -> u64
+@cpu_read_gsbase() -> u64
+@cpu_write_fsbase(u64 val)
+@cpu_write_gsbase(u64 val)
+
+/* Port I/O — x86 privileged (CPL <= IOPL) */
+@port_in8(u16 port) -> u8
+@port_in16(u16 port) -> u16
+@port_in32(u16 port) -> u32
+@port_out8(u16 port, u8 val)
+@port_out16(u16 port, u16 val)
+@port_out32(u16 port, u32 val)
+
+/* XSAVE/XRSTOR — extended processor state (AVX/AVX-512) */
+@cpu_xsave(*u8 buf, u64 mask)
+@cpu_xrstor(*u8 buf, u64 mask)
+
+/* Debug registers — DR0-DR3, DR6, DR7 via runtime switch */
+@cpu_read_dr(u32 idx) -> u64
+@cpu_write_dr(u32 idx, u64 val)
+
+/* Firmware calls */
+@cpu_sbi_call()                   RISC-V ecall to M-mode firmware
+@cpu_smc_call()                   ARM TrustZone smc #0
+
+/* Persistent memory cache ops */
+@cache_flushopt(*u8 addr)         CLFLUSHOPT (ordered alternative to CLFLUSH)
+@cache_writeback(*u8 addr)        CLWB (writeback without invalidate — NVDIMM)
+
+/* Non-temporal store — bypass cache */
+@nt_store(*u8 addr, u64 val)      MOVNTI
+
+/* Performance counter — requires CR4.PCE=1 for user access */
+@cpu_read_pmc(u32 idx) -> u64     RDPMC
+```
+
+### Final Misc Intrinsics (D-Alpha-14, 12 intrinsics — reaches 130/130)
+```
+/* CPUID — combined pair returns all 4 registers */
+@cpu_cpuid(u32 leaf, u32 subleaf) -> u64       (EBX << 32) | EAX
+@cpu_cpuid_ecx(u32 leaf, u32 subleaf) -> u64   (EDX << 32) | ECX
+
+/* Interrupt lifecycle + fault info */
+@cpu_eoi()                        end-of-interrupt to LAPIC/GICv3
+@cpu_read_cr2() -> u64            page fault address (x86)
+
+/* Cache control — uses BTR/BTS to avoid 32-bit-imm-with-64-bit-reg bug */
+@cpu_cache_disable()              CR0.CD=1 + WBINVD (privileged)
+@cpu_cache_enable()               CR0.CD=0 (privileged)
+
+/* Legacy FPU (pre-XSAVE) */
+@cpu_fxsave(*u8 buf)              512-byte buffer, 16-byte aligned
+@cpu_fxrstor(*u8 buf)
+@cpu_fpu_init()                   FNINIT
+
+/* User-mode wait — requires WAITPKG feature */
+@cpu_umwait(u32 hint, u64 deadline)  hint: 0=C0.2 (optimized), 1=C0.1 (fast)
+@cpu_umonitor(*u8 addr)              pair with UMWAIT (non-privileged)
+
+/* Control-flow integrity — CET-IBT */
+@cpu_endbr()                      ENDBR64 — multi-byte NOP if CET-IBT absent
+```
+
+**All 14 D-Alpha intrinsic batches complete (130/130).** Next work: D-Alpha-7.5 Phase 1
+(hardened unsafe asm) then Phase 2 (strict mode implementation with 8 categories +
+13 Z-rules + new System #30).
+
 ### `unsafe asm` safety (strict mode + Z-rules + 8 Categories, planned D-Alpha-7.5)
 
 **Research phase COMPLETE (2026-04-24) — 7 sessions, 8 final universal precondition categories.**

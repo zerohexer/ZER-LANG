@@ -6522,10 +6522,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "#endif\n"
                 "_zer_pl; })");
         } else if (nlen == 13 && memcmp(name, "cpu_hypercall", 13) == 0) {
-            /* D-Alpha-12: invoke hypervisor (for code running as a guest).
-             * x86: vmcall (Intel VMX) — AMD uses vmmcall but both VM exits to hypervisor
-             * ARM64: hvc #0 — hypervisor call to EL2
-             * RISC-V: ecall (from S-mode to HS-mode hypervisor) */
+            /* D-Alpha-12: invoke hypervisor (for code running as a guest). */
             emit(e, "({\n"
                 "#if defined(__x86_64__)\n"
                 "    __asm__ __volatile__ (\"vmcall\" ::: \"memory\");\n"
@@ -6535,6 +6532,245 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
                 "#endif\n"
                 "})");
+        } else if (nlen == 15 && memcmp(name, "cpu_read_fsbase", 15) == 0) {
+            emit(e, "({ uint64_t _zer_fs = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"rdfsbase %%0\" : \"=r\"(_zer_fs));\n"
+                "#endif\n"
+                "_zer_fs; })");
+        } else if (nlen == 15 && memcmp(name, "cpu_read_gsbase", 15) == 0) {
+            emit(e, "({ uint64_t _zer_gs = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"rdgsbase %%0\" : \"=r\"(_zer_gs));\n"
+                "#endif\n"
+                "_zer_gs; })");
+        } else if (nlen == 16 && memcmp(name, "cpu_write_fsbase", 16) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            emit(e, "({ uint64_t _zer_fv = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"wrfsbase %%0\" :: \"r\"(_zer_fv));\n"
+                "#else\n"
+                "    (void)_zer_fv;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 16 && memcmp(name, "cpu_write_gsbase", 16) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            emit(e, "({ uint64_t _zer_gv = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"wrgsbase %%0\" :: \"r\"(_zer_gv));\n"
+                "#else\n"
+                "    (void)_zer_gv;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 8 && memcmp(name, "port_in8", 8) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: x86 inb — read byte from I/O port */
+            emit(e, "({ uint16_t _zer_pp = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint8_t _zer_pv = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"inb %%1, %%0\" : \"=a\"(_zer_pv) : \"Nd\"(_zer_pp));\n"
+                "#endif\n"
+                "_zer_pv; })");
+        } else if (nlen == 9 && memcmp(name, "port_in16", 9) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: x86 inw — read word from I/O port */
+            emit(e, "({ uint16_t _zer_pp = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint16_t _zer_pv = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"inw %%1, %%0\" : \"=a\"(_zer_pv) : \"Nd\"(_zer_pp));\n"
+                "#endif\n"
+                "_zer_pv; })");
+        } else if (nlen == 9 && memcmp(name, "port_in32", 9) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: x86 inl — read dword from I/O port */
+            emit(e, "({ uint16_t _zer_pp = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint32_t _zer_pv = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"inl %%1, %%0\" : \"=a\"(_zer_pv) : \"Nd\"(_zer_pp));\n"
+                "#endif\n"
+                "_zer_pv; })");
+        } else if (nlen == 9 && memcmp(name, "port_out8", 9) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-13: x86 outb — write byte to I/O port */
+            emit(e, "({ uint16_t _zer_pp = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint8_t _zer_pv = (uint8_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"outb %%0, %%1\" :: \"a\"(_zer_pv), \"Nd\"(_zer_pp));\n"
+                "#else\n"
+                "    (void)_zer_pp; (void)_zer_pv;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "port_out16", 10) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            emit(e, "({ uint16_t _zer_pp = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint16_t _zer_pv = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"outw %%0, %%1\" :: \"a\"(_zer_pv), \"Nd\"(_zer_pp));\n"
+                "#else\n"
+                "    (void)_zer_pp; (void)_zer_pv;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "port_out32", 10) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            emit(e, "({ uint16_t _zer_pp = (uint16_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint32_t _zer_pv = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"outl %%0, %%1\" :: \"a\"(_zer_pv), \"Nd\"(_zer_pp));\n"
+                "#else\n"
+                "    (void)_zer_pp; (void)_zer_pv;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 9 && memcmp(name, "cpu_xsave", 9) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-13: XSAVE — save extended processor state (AVX/AVX-512 regs). */
+            emit(e, "({ void *_zer_xb = (void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_xm = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_lo = (uint32_t)_zer_xm, _zer_hi = (uint32_t)(_zer_xm >> 32);\n"
+                "    __asm__ __volatile__ (\"xsave (%%0)\" :: \"r\"(_zer_xb), \"a\"(_zer_lo), \"d\"(_zer_hi) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_xb; (void)_zer_xm;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "cpu_xrstor", 10) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-13: XRSTOR — restore extended processor state. */
+            emit(e, "({ const void *_zer_xb = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_xm = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_lo = (uint32_t)_zer_xm, _zer_hi = (uint32_t)(_zer_xm >> 32);\n"
+                "    __asm__ __volatile__ (\"xrstor (%%0)\" :: \"r\"(_zer_xb), \"a\"(_zer_lo), \"d\"(_zer_hi) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_xb; (void)_zer_xm;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 11 && memcmp(name, "cpu_read_dr", 11) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: read debug register (DR0-DR7 on x86). Switch on idx. */
+            emit(e, "({ uint32_t _zer_di = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_dv = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    switch (_zer_di) {\n"
+                "    case 0: __asm__ __volatile__ (\"movq %%%%dr0, %%0\" : \"=r\"(_zer_dv)); break;\n"
+                "    case 1: __asm__ __volatile__ (\"movq %%%%dr1, %%0\" : \"=r\"(_zer_dv)); break;\n"
+                "    case 2: __asm__ __volatile__ (\"movq %%%%dr2, %%0\" : \"=r\"(_zer_dv)); break;\n"
+                "    case 3: __asm__ __volatile__ (\"movq %%%%dr3, %%0\" : \"=r\"(_zer_dv)); break;\n"
+                "    case 6: __asm__ __volatile__ (\"movq %%%%dr6, %%0\" : \"=r\"(_zer_dv)); break;\n"
+                "    case 7: __asm__ __volatile__ (\"movq %%%%dr7, %%0\" : \"=r\"(_zer_dv)); break;\n"
+                "    default: break;\n"
+                "    }\n"
+                "#endif\n"
+                "_zer_dv; })");
+        } else if (nlen == 12 && memcmp(name, "cpu_write_dr", 12) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-13: write debug register. */
+            emit(e, "({ uint32_t _zer_di = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_dv = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    switch (_zer_di) {\n"
+                "    case 0: __asm__ __volatile__ (\"movq %%0, %%%%dr0\" :: \"r\"(_zer_dv)); break;\n"
+                "    case 1: __asm__ __volatile__ (\"movq %%0, %%%%dr1\" :: \"r\"(_zer_dv)); break;\n"
+                "    case 2: __asm__ __volatile__ (\"movq %%0, %%%%dr2\" :: \"r\"(_zer_dv)); break;\n"
+                "    case 3: __asm__ __volatile__ (\"movq %%0, %%%%dr3\" :: \"r\"(_zer_dv)); break;\n"
+                "    case 6: __asm__ __volatile__ (\"movq %%0, %%%%dr6\" :: \"r\"(_zer_dv)); break;\n"
+                "    case 7: __asm__ __volatile__ (\"movq %%0, %%%%dr7\" :: \"r\"(_zer_dv)); break;\n"
+                "    default: break;\n"
+                "    }\n"
+                "#else\n"
+                "    (void)_zer_di; (void)_zer_dv;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_sbi_call", 12) == 0) {
+            /* D-Alpha-13: RISC-V SBI call (ecall from S-mode to M-mode firmware). */
+            emit(e, "({\n"
+                "#if defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_smc_call", 12) == 0) {
+            /* D-Alpha-13: ARM TrustZone SMC (secure monitor call). */
+            emit(e, "({\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"smc #0\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "cache_flushopt", 14) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: CLFLUSHOPT (ordered alternative to CLFLUSH; needs feature bit). */
+            emit(e, "({ const void *_zer_cf = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"clflushopt (%%0)\" :: \"r\"(_zer_cf) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_cf;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 15 && memcmp(name, "cache_writeback", 15) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: CLWB (writeback without invalidate — for persistent memory). */
+            emit(e, "({ const void *_zer_cw = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"clwb (%%0)\" :: \"r\"(_zer_cw) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_cw;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 8 && memcmp(name, "nt_store", 8) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-13: non-temporal store (MOVNTI) — bypasses cache. */
+            emit(e, "({ void *_zer_na = (void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_nv = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"movnti %%1, (%%0)\" :: \"r\"(_zer_na), \"r\"(_zer_nv) : \"memory\");\n"
+                "#else\n"
+                "    *(uint64_t*)_zer_na = _zer_nv;  /* fallback: regular store */\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_read_pmc", 12) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-13: RDPMC — read performance monitoring counter.
+             * Requires CR4.PCE=1 for user-mode access (privileged otherwise). */
+            emit(e, "({ uint32_t _zer_pmi = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_pmv = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_plo, _zer_phi;\n"
+                "    __asm__ __volatile__ (\"rdpmc\" : \"=a\"(_zer_plo), \"=d\"(_zer_phi) : \"c\"(_zer_pmi));\n"
+                "    _zer_pmv = ((uint64_t)_zer_phi << 32) | _zer_plo;\n"
+                "#endif\n"
+                "_zer_pmv; })");
         } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
             /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
              * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */

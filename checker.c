@@ -5818,6 +5818,148 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@cpu_id takes no arguments");
             }
             result = ty_u32;
+        } else if ((nlen == 15 && memcmp(name, "cpu_read_fsbase", 15) == 0) ||
+                   (nlen == 15 && memcmp(name, "cpu_read_gsbase", 15) == 0)) {
+            /* D-Alpha-13: @cpu_read_fsbase/gsbase() -> u64 */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_u64;
+        } else if ((nlen == 16 && memcmp(name, "cpu_write_fsbase", 16) == 0) ||
+                   (nlen == 16 && memcmp(name, "cpu_write_gsbase", 16) == 0)) {
+            /* D-Alpha-13: @cpu_write_fsbase/gsbase(u64) — privileged */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (base value)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 8 && memcmp(name, "port_in8", 8) == 0) ||
+                   (nlen == 9 && memcmp(name, "port_in16", 9) == 0) ||
+                   (nlen == 9 && memcmp(name, "port_in32", 9) == 0)) {
+            /* D-Alpha-13: port I/O input — 1-arg (u16 port), u8/u16/u32 return */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (port number)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s port argument must be integer", (int)nlen, name);
+                }
+            }
+            if (nlen == 8) { result = ty_u8; }
+            else if (memcmp(name + 7, "16", 2) == 0) { result = ty_u16; }
+            else { result = ty_u32; }
+        } else if ((nlen == 9 && memcmp(name, "port_out8", 9) == 0) ||
+                   (nlen == 10 && memcmp(name, "port_out16", 10) == 0) ||
+                   (nlen == 10 && memcmp(name, "port_out32", 10) == 0)) {
+            /* D-Alpha-13: port I/O output — 2-arg (u16 port, value), void */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@%.*s requires 2 arguments (port, value)", (int)nlen, name);
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
+                    checker_error(c, node->loc.line, "@%.*s arguments must be integers", (int)nlen, name);
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 9 && memcmp(name, "cpu_xsave", 9) == 0) ||
+                   (nlen == 10 && memcmp(name, "cpu_xrstor", 10) == 0)) {
+            /* D-Alpha-13: XSAVE/XRSTOR — (*u8 buf, u64 mask), void */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@%.*s requires 2 arguments (buffer, mask)", (int)nlen, name);
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if (vt1) {
+                    Type *eff = type_unwrap_distinct(vt1);
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+                        checker_error(c, node->loc.line, "@%.*s buffer argument must be pointer or array", (int)nlen, name);
+                    }
+                }
+                if (vt2 && !type_is_integer(vt2)) {
+                    checker_error(c, node->loc.line, "@%.*s mask argument must be integer", (int)nlen, name);
+                }
+            }
+            result = ty_void;
+        } else if (nlen == 11 && memcmp(name, "cpu_read_dr", 11) == 0) {
+            /* D-Alpha-13: @cpu_read_dr(u32 idx) -> u64 — read debug register 0-7 */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@cpu_read_dr requires 1 argument (debug register index)");
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@cpu_read_dr argument must be integer");
+                }
+            }
+            result = ty_u64;
+        } else if (nlen == 12 && memcmp(name, "cpu_write_dr", 12) == 0) {
+            /* D-Alpha-13: @cpu_write_dr(u32 idx, u64 val) — write debug register */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@cpu_write_dr requires 2 arguments (idx, value)");
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
+                    checker_error(c, node->loc.line, "@cpu_write_dr arguments must be integers");
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 12 && memcmp(name, "cpu_sbi_call", 12) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_smc_call", 12) == 0)) {
+            /* D-Alpha-13: platform firmware calls — 0-arg, void. Users set registers via
+             * regular variables; intrinsic just emits the trap. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments (set registers via inline asm if needed)", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if ((nlen == 14 && memcmp(name, "cache_flushopt", 14) == 0) ||
+                   (nlen == 15 && memcmp(name, "cache_writeback", 15) == 0)) {
+            /* D-Alpha-13: CLFLUSHOPT / CLWB — (*u8 addr), void */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (addr)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt) {
+                    Type *eff = type_unwrap_distinct(vt);
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+                        checker_error(c, node->loc.line, "@%.*s argument must be pointer or array", (int)nlen, name);
+                    }
+                }
+            }
+            result = ty_void;
+        } else if (nlen == 8 && memcmp(name, "nt_store", 8) == 0) {
+            /* D-Alpha-13: @nt_store(*u8 addr, u64 val) — non-temporal store (bypass cache) */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@nt_store requires 2 arguments (addr, value)");
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if (vt1) {
+                    Type *eff = type_unwrap_distinct(vt1);
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+                        checker_error(c, node->loc.line, "@nt_store first argument must be pointer or array");
+                    }
+                }
+                if (vt2 && !type_is_integer(vt2)) {
+                    checker_error(c, node->loc.line, "@nt_store value argument must be integer");
+                }
+            }
+            result = ty_void;
+        } else if (nlen == 12 && memcmp(name, "cpu_read_pmc", 12) == 0) {
+            /* D-Alpha-13: @cpu_read_pmc(u32 idx) -> u64 — performance monitoring counter */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@cpu_read_pmc requires 1 argument (PMC index)");
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@cpu_read_pmc argument must be integer");
+                }
+            }
+            result = ty_u64;
         } else if ((nlen == 9 && memcmp(name, "cpu_reset", 9) == 0) ||
                    (nlen == 14 && memcmp(name, "cpu_deep_sleep", 14) == 0) ||
                    (nlen == 13 && memcmp(name, "cpu_idle_hint", 13) == 0) ||

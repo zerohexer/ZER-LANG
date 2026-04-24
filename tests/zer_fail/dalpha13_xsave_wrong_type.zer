@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_xsave first argument must be pointer or array
+
+i32 main() {
+    u32 scalar = 0;
+    @cpu_xsave(scalar, 0x7);  // error: scalar, not pointer
+    return 0;
+}

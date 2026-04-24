@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @port_in8 requires 1 argument (port number)
+
+i32 main() {
+    u8 v = @port_in8();  // error: missing arg
+    if (v == 0 || v != 0) { return 0; }
+    return 0;
+}

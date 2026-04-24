@@ -72,8 +72,8 @@ Until that migration, these files are NOT in the active test suite.
 | C1 Value-range | COMPLETE (2026-04-24) | 1 | 4 .zer files + ISA citations + 7 x86 instructions classified |
 | C2 Alignment | COMPLETE (2026-04-24) | 2 | 6 .zer files + ISA citations + 12 x86 + 8 ARM64 + 2 RISC-V instruction families classified |
 | C3 State machine | **COMPLETE (2026-04-24)** | 3 | **6 .zer files + ISA citations + 3 x86 (TSX) + 7 ARM64 (exclusive) + 2 RISC-V (LR/SC) classified. C9 MERGED INTO C3.** |
-| C4 CPU feature | Pending | 4 | — |
-| C5 Privilege | Pending | 4-5 | — (may combine with C4) |
+| C4 CPU feature | **COMPLETE (2026-04-24)** | 4 | **2 .zer files + representative instruction samples across 3 archs. ~450+ feature-gated instructions total. Maps to System #24 with cpu_features extension.** |
+| C5 Privilege | **COMPLETE (2026-04-24)** | 4 | **3 .zer files + representative samples. ~200+ privileged instructions total. Maps to System #24 with privilege_level hierarchy. Kept separate from C4 (different semantics: set-membership vs hierarchy).** |
 | C6 Memory addressability | Pending | 6 | — |
 | C7 Provenance/aliasing | Pending | 7 | — |
 | C8 Memory ordering | Pending (needs System #30 design) | 8 | — |

@@ -1,0 +1,38 @@
+// EXPECTED: compile error
+//
+// Category C5a (Privilege, kernel-only) — ARM64 MSR SCTLR_EL1
+// Source: ARM ARM system register access rules —
+// "When a system register name ends in _EL1, it is accessible only at EL1
+// (kernel mode). ... A higher EL has access to all the registers of the
+// lower levels while the opposite is not true."
+//
+// Precondition: MSR to SCTLR_EL1 requires EL1+ (kernel mode).
+// Violation: accessing from function declared @privilege(user) → UNDEFINED
+// synchronous exception at runtime.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C4+C5 session 4
+
+// When strict mode lands, declaration would be:
+//     @privilege(user)
+//     void bad_msr_write(u64 value) { ... }
+// For now, default (no annotation) = PL_USER.
+void unsafe_write_sctlr(u64 value) {
+    // current_pl = PL_USER (default; or explicit @privilege(user)).
+    // MSR SCTLR_EL1 required_pl = PL_KERNEL (EL1+) → violation.
+    //
+    // Category C5a check must REJECT.
+    //
+    // Expected error: "MSR SCTLR_EL1 requires EL1+ (kernel privilege, C5a).
+    //                  Annotate function @privilege(kernel). At runtime from
+    //                  EL0, this raises UNDEFINED exception."
+    unsafe asm {
+        instructions: "msr sctlr_el1, %0"
+        inputs:  { "r" = value }
+        clobbers: []
+        safety: "Set system control register (EL1+ only)"
+    }
+}
+
+i32 main() {
+    return 0;
+}

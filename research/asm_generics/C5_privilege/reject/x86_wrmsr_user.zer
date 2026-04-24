@@ -1,0 +1,40 @@
+// EXPECTED: compile error
+//
+// Category C5a (Privilege, kernel-only) — x86-64 WRMSR
+// Source: Intel SDM WRMSR —
+// "This instruction must be executed at privilege level 0 or in real-address
+// mode; otherwise, a general protection exception #GP(0) is generated."
+//
+// Precondition: WRMSR requires CPL=0 (kernel mode).
+// Violation: calling WRMSR from user-privilege function → #GP(0) at runtime.
+//
+// ZER checker (System #24, extended with privilege_level) must reject
+// when function's declared privilege < required privilege.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C4+C5 session 4
+
+// Default function privilege = PL_USER.
+// No @privilege(kernel) attribute.
+void unsafe_write_msr(u32 msr, u64 value) {
+    // current_pl = PL_USER (default).
+    // WRMSR required_pl = PL_KERNEL → violation.
+    //
+    // Category C5a check must REJECT.
+    //
+    // Expected error: "WRMSR requires kernel privilege (C5a).
+    //                  Annotate enclosing function with @privilege(kernel).
+    //                  At runtime this triggers #GP(0) if executed from user mode."
+    u32 lo = (u32)value;
+    u32 hi = (u32)(value >> 32);
+
+    unsafe asm {
+        instructions: "wrmsr"
+        inputs:  { "c" = msr, "a" = lo, "d" = hi }
+        clobbers: []
+        safety: "Write MSR — kernel-only operation"
+    }
+}
+
+i32 main() {
+    return 0;
+}

@@ -266,6 +266,59 @@ Callee-saved only (rbx/r12-r15 on x86, x19-x28 on ARM64, s0-s11 on RISC-V).
 Full RSP/RIP save requires naked functions — kernel-integration scope.
 Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branch pattern.
 
+### MSR/CR/XCR0 Access Intrinsics (D-Alpha-9, x86 privileged — kernel mode only)
+```
+@cpu_read_msr(u32 msr) -> u64       RDMSR — Model-Specific Register read
+@cpu_write_msr(u32 msr, u64 val)    WRMSR — Model-Specific Register write
+@cpu_read_cr0() -> u64              CR0 (paging, WP, etc.)
+@cpu_write_cr0(u64)
+@cpu_read_cr3() -> u64              Page directory base
+@cpu_write_cr3(u64)                 Switches address space (flushes non-global TLB)
+@cpu_read_cr4() -> u64              Feature enable bits (SSE, PAE, SMEP, etc.)
+@cpu_write_cr4(u64)
+@cpu_read_xcr0() -> u64             XSAVE feature mask
+@cpu_write_xcr0(u64)                XSETBV — XSAVE feature mask write
+```
+All privileged (CPL=0). SIGSEGV in user mode. Non-x86 archs get no-op fallback.
+Test via dead-branch pattern.
+
+### Inspection Intrinsics (D-Alpha-10, non-privileged CPU state reads)
+```
+@cpu_read_sp() -> u64               stack pointer
+@cpu_read_tp() -> u64               thread pointer / TLS base (via __builtin_thread_pointer)
+@cpu_read_flags() -> u64            RFLAGS / NZCV
+@cpu_vendor_id() -> u64             CPUID leaf 0 EBX (first 4 chars of vendor)
+@cpu_feature_bits() -> u64          CPUID leaf 1 ECX:EDX packed
+@cpu_model_id() -> u32              CPUID leaf 1 EAX (family/model/stepping)
+@cpu_core_id() -> u32               physical core ID (stub 0)
+@cpu_current_mode() -> u32          privilege mode (stub 0 = user)
+@cpu_cache_line_size() -> u32       L1 cache line bytes (stub 64 = common default)
+@cpu_num_cores() -> u32             logical core count (stub 1)
+```
+All non-privileged — run in user mode directly (no dead-branch needed).
+
+### Power Management Intrinsics (D-Alpha-11)
+```
+@cpu_reset()              safe halt-forever fallback (real reset = platform-specific)
+@cpu_deep_sleep()         enter deepest idle state (WFI / HLT)
+@cpu_idle_hint()          non-blocking low-power hint (distinct from cpu_pause)
+@cpu_monitor_addr(*u8)    x86 MONITOR — setup address watch (pairs with mwait)
+@cpu_mwait()              x86 MWAIT — wait for monitored write or interrupt
+```
+Most privileged — dead-branch pattern. cpu_idle_hint is non-blocking (safe to call).
+
+### Privileged Mode Transitions (D-Alpha-12, ALL privileged)
+```
+@cpu_syscall()                    user→kernel trap (syscall / svc #0 / ecall)
+@cpu_sysret()                     kernel→user return (sysretq / eret / sret)
+@cpu_iret()                       interrupt return (iretq / eret / mret)
+@cpu_set_priv_stack(u64 sp)       set kernel stack for syscall entry
+@cpu_get_priv_level() -> u32      query privilege (0=user, higher=privileged)
+@cpu_hypercall()                  guest→hypervisor (vmcall / hvc #0 / ecall)
+```
+All require correctly-set system register context (CS/RIP/RFLAGS on x86; ELR/SPSR on
+ARM; sepc/sstatus on RISC-V) before the transition instruction. Dead-branch pattern.
+
 ### `unsafe asm` safety (strict mode + Z-rules + 8 Categories, planned D-Alpha-7.5)
 
 **Research phase COMPLETE (2026-04-24) — 7 sessions, 8 final universal precondition categories.**

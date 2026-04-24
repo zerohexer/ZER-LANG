@@ -6890,15 +6890,15 @@ Per-new-arch cost with this architecture:
 | D-Alpha-7 | DONE | 8 critical multi-core | ca7e144 |
 | D-Alpha-8 | DONE | 4 nice-to-have (read_counter, get_pc, wait_on_address, flush_pipeline) | 4ca14b2 |
 | D-Alpha-9 | DONE | 10 MSR/CR/XCR0 (x86 privileged) | a0fe701 |
-| D-Alpha-10 | Pending | 10 inspection | — |
-| D-Alpha-11 | Pending | 5 power management | — |
-| D-Alpha-12 | Pending | 6 privileged transitions | — |
+| D-Alpha-10 | DONE | 10 inspection (read_sp/tp/flags, vendor_id, feature_bits, model_id, core_id, current_mode, cache_line_size, num_cores) | 54e2324 |
+| D-Alpha-11 | DONE | 5 power management (reset, deep_sleep, idle_hint, monitor_addr, mwait) | aa3d3fd |
+| D-Alpha-12 | DONE | 6 privileged transitions (syscall, sysret, iret, set_priv_stack, get_priv_level, hypercall) | 7de2c36 |
 | D-Alpha-13 | Pending | 20 Linux-scale x86 | — |
 | D-Alpha-14 | Pending | 10 misc | — |
 | D-Alpha-7.5 Phase 1 | Pending | Hardened unsafe asm (H1-H7) | — |
 | D-Alpha-7.5 Phase 2 | Pending | Strict mode implementation | — |
 
-**77 of 130 intrinsics shipped (59%).** Halfway mark + crossed.
+**98 of 130 intrinsics shipped (75%).** Three-quarters shipped.
 
 ### D-Alpha-8/9 patterns discovered
 
@@ -6952,3 +6952,69 @@ Non-x86 archs get the 0-initialized value (no emission inside `#if`). This lets 
 **Emit() escape rule reminder** (from D-Alpha-4 gotcha, still applies):
 - `%0` (GCC operand ref) → write `%%0` in C fmt string (one layer of escape for `emit()`'s vfprintf)
 - `%%rbx` (literal register) → write `%%%%rbx` (two layers — vfprintf then asm parser)
+
+### D-Alpha-10/11/12 patterns (2026-04-24 end-of-day)
+
+**`__builtin_thread_pointer()` for portable thread pointer** (D-Alpha-10):
+
+Rather than per-arch inline asm to read FS:0 (x86) / tpidr_el0 (ARM64) / tp (RISC-V), use GCC's portable builtin. Works on GCC 11+ and Clang. Example in `cpu_read_tp`:
+```c
+emit(e, "((uint64_t)(uintptr_t)__builtin_thread_pointer())");
+```
+Single line, cross-arch. Much cleaner than 9 lines of per-arch asm.
+
+**Avoid `sysconf` in emitted preamble** (D-Alpha-10 finding):
+
+`sysconf(_SC_LEVEL1_DCACHE_LINESIZE)` requires `<unistd.h>`. Adding headers to ZER's emitted preamble is avoided — causes cross-platform pain on Windows/bare-metal. Instead, emit compile-time stub:
+```c
+emit(e, "((uint32_t)64)");  // x86/ARM/RISC-V default cache line
+```
+Users needing runtime values call POSIX APIs directly.
+
+**Length-matching gotcha in batched checker branches** (D-Alpha-11 bug):
+
+When writing batched same-signature intrinsic validation, the `nlen == N` check AND the `memcmp(..., string, N)` length MUST match the actual string length. Example of the bug I hit:
+```c
+/* BUG: impossible condition (14 && ... == 13) */
+(nlen == 14 && memcmp(name, "cpu_idle_hint", 13) == 0 && nlen == 13)
+```
+Both must be 13 for "cpu_idle_hint" (13 characters). Always double-check with `wc -c`.
+
+**Mode transition instruction mapping** (D-Alpha-12):
+
+For per-arch asm emission of mode transitions, the pattern is consistent:
+
+| Function | x86-64 | ARM64 | RISC-V |
+|---|---|---|---|
+| User→kernel trap | `syscall` | `svc #0` | `ecall` |
+| Kernel→user return | `sysretq` | `eret` | `sret` |
+| Interrupt return | `iretq` | `eret` | `mret` |
+| Guest→hypervisor | `vmcall` | `hvc #0` | `ecall` |
+
+Note: ARM64 uses `eret` for BOTH sysret and iret (unified return-from-exception). x86 uses separate `sysretq` vs `iretq`. RISC-V differentiates via `sret` (S-mode) vs `mret` (M-mode).
+
+**Pointer-argument validation pattern** (D-Alpha-11 `cpu_monitor_addr`):
+
+For intrinsics taking pointer arguments, validate via `type_unwrap_distinct` + check `TYPE_POINTER` or `TYPE_ARRAY`:
+```c
+Type *vt = typemap_get(c, node->intrinsic.args[0]);
+if (vt) {
+    Type *eff = type_unwrap_distinct(vt);
+    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+        checker_error(c, node->loc.line, "@%.*s argument must be pointer or array", ...);
+    }
+}
+```
+Accepting both `*T` and `T[N]` is idiomatic ZER — arrays auto-coerce to pointers at call sites.
+
+**MSR write pattern for mode-transition setup** (D-Alpha-12 `cpu_set_priv_stack`):
+
+Setting kernel stack pointer uses `wrmsr` with MSR_KERNEL_GS_BASE (0xC0000102) on x86 — target for `swapgs; mov %gs:0, %rsp` convention. On ARM64 uses `msr sp_el0`. On RISC-V `csrw mscratch`. All take u64 argument.
+
+**Unused-var suppression** (ZER doesn't support `(void)cast`):
+
+Instead of `(void)unused_var;` (not valid ZER), use a comparison that's always true:
+```zer
+if (unused == 0 || unused != 0) { return 0; }
+```
+Ugly but works. Repeatedly used in D-Alpha-8/9/10/12 tests. If you see this pattern, it's just suppressing unused-var warnings.

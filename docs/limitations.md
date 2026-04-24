@@ -43,6 +43,35 @@ emitting the operator. Without this, `signed_local < 0ULL` evaluated to
 IR_LITERAL now emits `(CType)N` cast to match the local's type instead
 of always-ULL suffix.
 
+## ~~BUG-607 (lexer integer literal overflow silent wrap)~~ (FIXED 2026-04-24)
+
+Integer literals exceeding `UINT64_MAX` silently wrapped due to unchecked
+`val *= base` in `parser.c:parse_primary`. Now emit `error: integer
+literal exceeds u64 range`. Covers hex (`0x10000000000000000`), decimal
+(`18446744073709551616`), and long hex (`0xFFFFFFFFFFFFFFFF_FFFF`).
+Regression tests: `tests/zer_fail/int_literal_overflow_{hex,dec}.zer`.
+
+## ~~BUG-608 (defer body nested control-flow scan)~~ (FIXED 2026-04-24)
+
+`defer_scan_all_frees` (zercheck.c) and `ir_defer_scan_frees`
+(zercheck_ir.c) only recursed into `NODE_BLOCK`. `defer { if (err) {
+free(h); } else { free(h); } }` was not detected as freeing the handle
+→ false leak error. Both scanners now recurse into
+if/for/while/do-while/switch/critical/once bodies. Regression test:
+`tests/zer/defer_nested_if_free.zer`.
+
+## ~~BUG-609 / Gap 6 — goto into if-unwrap/switch-capture arm~~ (FIXED 2026-04-24)
+
+`goto` targeting a label inside a capture arm from outside the arm
+compiled clean. Capture variable was auto-zero'd → silent wrong return.
+`collect_labels` / `validate_gotos` in `checker.c` now carry an
+`ArmStack` (stack-first dynamic array of capture-arm Node IDs).
+Goto-vs-label arm paths must share a prefix. Error:
+`goto 'X' jumps into if-unwrap/switch-capture arm without binding
+the capture`. Moved reproducer from `tests/zer_gaps/` to
+`tests/zer_fail/goto_into_capture_arm.zer` (+ switch variant).
+Positive test in `tests/zer/goto_inside_capture_arm_ok.zer`.
+
 ## ~~BUG-593~~ (FIXED 2026-04-18)
 
 Comptime float functions now dispatch to `eval_comptime_float_expr`
@@ -86,7 +115,7 @@ they should fail). When a gap is fixed, move the reproducer to
 | 3 | **`yield` outside async silently stripped** | `void go() { yield; }` compiles; emits no-op | None (silent behavior) | ~5 lines — check `!in_async` in NODE_YIELD |
 | 4 | **async + shared struct across yield** | `async { s.v = 1; yield; s.v = 2; }` on a `shared struct` — lock held across yield = deadlock per spec, not enforced | Potential deadlock at runtime | medium — AST walker for shared access in async fn |
 | 5 | **`container<move struct>` loses move semantics** | `Box(Tok) b; b.item = t; consume(b.item); b.item.k` — move-transfer through container field not tracked | None (use after transfer) | medium — move-tracking through field writes |
-| 6 | **`goto` into if-unwrap capture scope** | `goto inside; if (m) \|v\| { inside: return v; }` — captured `v` uninitialized at goto target | Auto-zero (returns 0 silently) | medium — label reachability analysis |
+| 6 | ~~**`goto` into if-unwrap capture scope**~~ | FIXED 2026-04-24 (BUG-609) — see above | — | — |
 | 7 | **`defer` nested in `defer` body** | `defer { defer { ... } }` accepted per spec says banned | Runs inner defer at outer defer fire time | ~5 lines — check `defer_depth > 0` in NODE_DEFER |
 
 ### Precision issues (not safety)

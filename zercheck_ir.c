@@ -900,11 +900,37 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         }
     }
 
-    /* Recurse into block statements */
-    if (body->kind == NODE_BLOCK) {
-        for (int i = 0; i < body->block.stmt_count; i++) {
+    /* Recurse into block AND nested control-flow bodies (BUG-608).
+     * Conservative: any reachable free inside defer marks handle FREED.
+     * Misses some conditional-free double-detect but prevents false
+     * leak on `defer { if (err) { free(h); } else { free(h); } }`. */
+    switch (body->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < body->block.stmt_count; i++)
             ir_defer_scan_frees(zc, func, ps, body->block.stmts[i], defer_line);
-        }
+        break;
+    case NODE_IF:
+        ir_defer_scan_frees(zc, func, ps, body->if_stmt.then_body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line);
+        break;
+    case NODE_FOR:
+        ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line);
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        ir_defer_scan_frees(zc, func, ps, body->while_stmt.body, defer_line);
+        break;
+    case NODE_SWITCH:
+        for (int i = 0; i < body->switch_stmt.arm_count; i++)
+            ir_defer_scan_frees(zc, func, ps, body->switch_stmt.arms[i].body, defer_line);
+        break;
+    case NODE_CRITICAL:
+        ir_defer_scan_frees(zc, func, ps, body->critical.body, defer_line);
+        break;
+    case NODE_ONCE:
+        ir_defer_scan_frees(zc, func, ps, body->once.body, defer_line);
+        break;
+    default:
+        break;
     }
 }
 

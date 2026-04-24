@@ -1,0 +1,17 @@
+// BUG-608: defer body with nested if/else containing free calls must
+// be recognized by zercheck (previously defer_scan only recursed into
+// NODE_BLOCK, missing if/for/while/switch bodies → false "leak" warning).
+struct Task { u32 id; }
+
+u32 main() {
+    Handle(Task) h = Task.alloc() orelse return;
+    bool err = true;
+    defer {
+        if (err) {
+            Task.free(h);
+        } else {
+            Task.free(h);
+        }
+    }
+    return 0;
+}

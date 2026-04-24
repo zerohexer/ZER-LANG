@@ -1,0 +1,6 @@
+// Integer literal larger than u64 (> 0xFFFFFFFFFFFFFFFF) must be a compile error.
+// Previously wrapped silently → garbage compile-time value.
+u64 main() {
+    u64 x = 0x10000000000000000;  // 1 more than u64 max
+    return x;
+}

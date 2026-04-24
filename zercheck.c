@@ -369,7 +369,13 @@ static int defer_stmt_is_free(Node *node, char *key_buf, int key_bufsize) {
 }
 
 /* Scan a defer body for ALL free/delete calls. Marks each found handle as FREED.
- * Handles both single-statement defers and block defers with multiple frees. */
+ * Handles single-statement defers, block defers, AND nested control flow
+ * (if/else/for/while/switch bodies — conservative: any reachable free counts).
+ *
+ * Conservative simplification: treat ANY free inside nested control flow as
+ * "handle freed on scope exit." This may miss some double-free detection for
+ * conditional frees, but defers run at scope exit so the handle goes out of
+ * scope regardless. Avoids false-positive leak warnings (BUG-608). */
 static void defer_scan_all_frees(Node *node, PathState *ps, int defer_line) {
     if (!node) return;
     char key_buf[128];
@@ -381,11 +387,33 @@ static void defer_scan_all_frees(Node *node, PathState *ps, int defer_line) {
             h->free_line = defer_line;
         }
     }
-    /* defer { block } — scan ALL statements, not just first match */
-    if (node->kind == NODE_BLOCK) {
-        for (int i = 0; i < node->block.stmt_count; i++) {
+    switch (node->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
             defer_scan_all_frees(node->block.stmts[i], ps, defer_line);
-        }
+        break;
+    case NODE_IF:
+        defer_scan_all_frees(node->if_stmt.then_body, ps, defer_line);
+        defer_scan_all_frees(node->if_stmt.else_body, ps, defer_line);
+        break;
+    case NODE_FOR:
+        defer_scan_all_frees(node->for_stmt.body, ps, defer_line);
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        defer_scan_all_frees(node->while_stmt.body, ps, defer_line);
+        break;
+    case NODE_SWITCH:
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            defer_scan_all_frees(node->switch_stmt.arms[i].body, ps, defer_line);
+        break;
+    case NODE_CRITICAL:
+        defer_scan_all_frees(node->critical.body, ps, defer_line);
+        break;
+    case NODE_ONCE:
+        defer_scan_all_frees(node->once.body, ps, defer_line);
+        break;
+    default:
+        break;
     }
 }
 

@@ -1,0 +1,16 @@
+// BUG-609 regression guard: goto within the same if-unwrap capture arm
+// is legal (capture is already bound). Only crossing INTO a capture arm
+// from outside is rejected.
+u32 main() {
+    ?u32 maybe = 42;
+    if (maybe) |v| {
+        u32 x = 0;
+        if (v == 0) { return 1; }  // defensive
+        goto retry;
+retry:
+        x = v;  // v is bound (same arm)
+        if (x != 42) { return 2; }
+        return 0;  // success
+    }
+    return 3;
+}

@@ -1,0 +1,12 @@
+// BUG-609: goto jumping into an if-unwrap capture arm from outside must
+// error — otherwise the capture variable is auto-zero'd (silent wrong
+// return). Previously gap6 in tests/zer_gaps/.
+u32 main() {
+    ?u32 maybe = 42;
+    goto inside;
+    if (maybe) |v| {
+inside:
+        return v;  // v uninit when reached via goto
+    }
+    return 0;
+}

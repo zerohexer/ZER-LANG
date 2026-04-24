@@ -1,0 +1,19 @@
+// BUG-609: goto into a switch-capture arm from outside the arm must error
+// (same class as if-unwrap capture — capture variable uninitialized).
+union Event { u32 click; u32 key; }
+
+u32 main() {
+    Event e;
+    e.click = 99;
+    goto inside;
+    switch (e) {
+        .click => |c| {
+inside:
+            return c;
+        }
+        .key => |k| {
+            return k;
+        }
+    }
+    return 0;
+}

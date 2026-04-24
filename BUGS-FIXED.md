@@ -5,6 +5,71 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-24 — Audit sweep: 3 bugs fixed (BUG-607 / BUG-608 / BUG-609)
+
+Systematic audit of the codebase (4 parallel Explore agents covering checker / emitter / IR / parser-types-zercheck) plus cross-check against `docs/limitations.md` gap reproducers. Three confirmed compile-time bugs found + fixed.
+
+### BUG-607: Integer literal > u64 silently wraps (parser.c)
+
+**Symptom:** `u64 x = 0x10000000000000000;` (one past u64 max) compiled clean, value silently wrapped to `0`. Similarly decimal literals > 18446744073709551615 and over-wide hex like `0xFFFFFFFFFFFFFFFF_FFFF`.
+
+**Root cause:** `parse_primary` at `parser.c:594-619` accumulated `val *= 10` (or 16/2) with no overflow tracking. Each multiply past u64 max simply wrapped silently; final `n->int_lit.value = val` stored the wrapped value with no diagnostic.
+
+**Fix:** Added pre-multiplication overflow check against `UINT64_MAX >> 4` (hex), `UINT64_MAX >> 1` (binary), and `UINT64_MAX / 10` with remainder check (decimal). `bool overflow` flag set on any detected overflow; `error(p, "integer literal exceeds u64 range ...")` at the end of the parse. Also `#include <stdint.h>` added.
+
+**Tests:**
+- `tests/zer_fail/int_literal_overflow_hex.zer` — `0x10000000000000000` rejected
+- `tests/zer_fail/int_literal_overflow_dec.zer` — `18446744073709551616` rejected
+
+### BUG-608: `defer` body nested control flow not scanned (zercheck.c + zercheck_ir.c)
+
+**Symptom:** `defer { if (err) { pool.free(h); } else { pool.free(h); } }` triggered false `handle 'h' allocated but never freed` error, even though every path frees.
+
+**Root cause:** `defer_scan_all_frees` (AST zercheck) and `ir_defer_scan_frees` (IR zercheck) only recursed into `NODE_BLOCK`. `NODE_IF`/`NODE_FOR`/`NODE_WHILE`/`NODE_DO_WHILE`/`NODE_SWITCH`/`NODE_CRITICAL`/`NODE_ONCE` bodies inside a defer were never visited — so the free calls were never discovered. Handle state remained `HS_ALIVE` at scope exit → leak error.
+
+**Fix:** Extended both scanners to recurse into all block-like control-flow bodies. Conservative: any reachable free inside a defer body marks the handle `HS_FREED` — may miss some conditional-free double-detect but defers fire at scope exit so the handle is out of scope anyway.
+
+- `zercheck.c:373-415` — AST defer_scan_all_frees
+- `zercheck_ir.c:903-932` — IR ir_defer_scan_frees
+
+**Tests:**
+- `tests/zer/defer_nested_if_free.zer` — `defer { if (err) { free(h); } else { free(h); } }` compiles clean (also validates dual-run agreement)
+
+### BUG-609: `goto` into if-unwrap / switch-capture arm skips binding (checker.c)
+
+**Symptom:** Reproducer `tests/zer_gaps/gap6_goto_into_capture.zer`:
+```
+if (maybe) |v| {
+inside:
+    return v;
+}
+goto inside;  // outside the arm
+```
+Compiled clean; `v` was auto-zero'd at declaration so `return v` silently returned 0 instead of the expected 42.
+
+**Root cause:** `collect_labels` / `validate_gotos` in `checker.c` only checked that label names existed — no tracking of whether the goto and label sat inside compatible capture-arm scopes. Control-flow bypassed the `|v| = unwrap(maybe)` binding entirely.
+
+**Fix:** Added `ArmStack` (stack-first-dynamic array of `Node*` IDs) carried through both walks.
+- `collect_labels` now records the `arm_path` (array of if-unwrap / switch-capture arm Node pointers) for each label as it descends.
+- `validate_gotos` walks with its own `ArmStack` and for each goto, checks `label.arm_path` is a prefix of the goto's arm_path. Mismatch = error.
+- Pushed on entering `NODE_IF` with `capture_name != NULL`, popped on exit. Same for `SwitchArm` with capture. The `else` branch shares no capture so doesn't push.
+
+Goto inside the same arm as label → valid (arm_path equal). Goto outside the arm containing the label → error. Goto out of an arm (label's arm_path is shorter prefix of goto's) → valid (jumping out is OK; the capture was bound inside).
+
+**Tests:**
+- `tests/zer_fail/goto_into_capture_arm.zer` — rejected (gap6 reproducer)
+- `tests/zer_fail/goto_into_switch_capture.zer` — rejected (union variant arm)
+- `tests/zer/goto_inside_capture_arm_ok.zer` — in-arm goto compiles + runs correctly
+
+Gap reproducer removed from `tests/zer_gaps/gap6_goto_into_capture.zer`; README updated.
+
+### Test counts
+
+Before: 442 integration + 784 rust + 36 zig + 139 convert.
+After: 448 integration (+6 new) + 784 rust + 36 zig + 139 convert. No regressions.
+
+---
+
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)
 
 **Change:** Added `unsafe asm(...)` as the REQUIRED form for inline assembly. Bare `asm(...)` is rejected at compile time with a helpful error message pointing to `unsafe asm`.

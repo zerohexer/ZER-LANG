@@ -1,0 +1,5 @@
+// Decimal integer literal > u64 max must be a compile error.
+u64 main() {
+    u64 x = 18446744073709551616;  // u64 max + 1
+    return x;
+}

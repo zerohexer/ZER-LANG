@@ -397,6 +397,93 @@ Known at memory/confident level:
 
 ---
 
+## Session Methodology (MANDATORY for fresh sessions continuing this work)
+
+**The research is structured as ONE CATEGORY PER SESSION, following Option 1+2 methodology (agreed 2026-04-24):**
+
+**Option 1:** Incremental deep-dive — one category at a time, all 3 archs completed in the same session.
+**Option 2:** WebFetch verification — use Intel SDM / ARM ARM / RISC-V Manual online references to verify each classification.
+**Option 1+2 combined:** deep-dive per category WITH real ISA citations per instruction.
+
+### Per-session deliverables (REQUIRED before marking a category COMPLETE)
+
+Each research session tackles ONE category (C1, C2, ..., C10 in order). For that category, the session must produce:
+
+1. **Exhaustive enumeration** of all instructions in that category across x86-64, ARM64, RISC-V
+2. **ISA citation per instruction** — direct link/quote from Intel SDM, ARM ARM (DDI 0487), or RISC-V Manual
+3. **Subcategory classification** — assign to the correct subcat (e.g., C1a nonzero, C1b bounded, C1c compound, C1d exact-set)
+4. **Operand index** — which operand (0, 1, 2, ...) carries the precondition
+5. **Source system mapping** — which ZER safety system (e.g., #12 VRP) will check this
+6. **Negative test case** — write `tests/zer_fail/asm_Cat_<subcat>_<arch>_<instr>.zer` demonstrating what the checker would reject
+7. **Positive test case** — write `tests/zer/asm_Cat_<subcat>_<arch>_<instr>.zer` demonstrating VRP-proved guard that passes
+
+### Methodology for using WebFetch during research
+
+For each instruction in a session:
+1. Identify authoritative source URL (recommended below)
+2. WebFetch the page with prompt: "Extract the UB/UNDEFINED preconditions for operand values of instruction XYZ. Quote the exact text."
+3. Classify against our 10 categories
+4. If no fit: flag as candidate for new category C11+, requires separate discussion
+
+**Recommended authoritative sources (verified accessible):**
+
+| Arch | URL pattern | Notes |
+|---|---|---|
+| x86-64 | `https://www.felixcloutier.com/x86/<instruction>` | Mirror of Intel SDM Vol 2, comprehensive, citable per instruction |
+| x86-64 fallback | `https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html` | Official Intel SDM PDFs (harder to WebFetch) |
+| ARM64 | `https://developer.arm.com/documentation/ddi0596/<version>/Base-Instructions/<INSTR>` | Official ARM ARM instruction pages |
+| ARM64 fallback | `https://developer.arm.com/documentation/ddi0487/` | Full ARM ARM PDF reference |
+| RISC-V | `https://github.com/riscv/riscv-isa-manual/blob/main/src/<chapter>.adoc` | Official spec source, per chapter |
+| RISC-V mirror | `https://msyksphinz-self.github.io/riscv-isadoc/html/<instr>.html` | HTML rendering of official spec |
+
+### Category order (priority-driven)
+
+Recommended order based on frequency + difficulty:
+
+1. **C1 Value-range** — most common precondition type; good starting point; proves the methodology
+2. **C2 Alignment** — pointer alignment tracking; extends System #20
+3. **C3 State machine / C9 Exclusive pairing** — combined; ARM LDXR/STXR, RISC-V LR/SC
+4. **C5 Privilege / C4 CPU feature** — both route to System #24 Context Flags
+5. **C6 Memory addressability** — extends System #19 MMIO Ranges
+6. **C7 Provenance/aliasing** — uses existing System #3 + #11
+7. **C8 Memory ordering** — requires NEW System #30 design; biggest work
+8. **C10 Register dependency** — rare; decide keep-or-defer based on findings
+
+### Session-complete criteria
+
+A category is marked COMPLETE in this document (change "Status" from "In Progress" or "Pending" to "COMPLETE ✓ [date] [commit hash]") when:
+
+- [ ] Every known UB-bearing instruction across x86-64 + ARM64 + RISC-V classified
+- [ ] Each has verified ISA citation (WebFetch result quoted or URL documented)
+- [ ] Negative + positive test written per arch-instruction combination
+- [ ] Zero unclassified instructions (all fit the 10 categories, or new category justified)
+- [ ] Commit includes both research doc update AND test files
+
+### Commit pattern per session
+
+```
+docs+tests: C<N> research COMPLETE — <Category Name>
+
+Phase 1 research for Category C<N>. All known UB-bearing instructions
+across x86-64, ARM64, RISC-V classified with ISA citations.
+
+Findings:
+- x86-64: <count> instructions (e.g., BSR, BSF, DIV, IDIV, ...)
+- ARM64: <count> instructions (e.g., some equivalents absent — ARM
+  designed defined semantics for UDIV/SDIV zero-divisor, CLZ on zero)
+- RISC-V: <count> instructions (e.g., DIV returns -1 for /0, defined)
+
+Tests added:
+- tests/zer_fail/asm_<cat>_*.zer (negative tests)
+- tests/zer/asm_<cat>_*.zer (positive tests with VRP guards)
+
+Maps to ZER system #<M>. Extensions required: <yes/no/details>.
+
+Next session: Category C<N+1> (<next category name>).
+```
+
+---
+
 ## Research Methodology (for future session phases)
 
 ### Phase 1 (this session): Framework + x86-64 first pass — **IN PROGRESS**

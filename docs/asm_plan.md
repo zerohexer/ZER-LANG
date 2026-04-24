@@ -1160,6 +1160,12 @@ With rule E1: compiler re-parses `crc32q`, knows it clobbers rcx → compile err
 
 **Committed to v1.0 Tier A.** Full research document: `docs/asm_preconditions_research.md`.
 
+**Research session methodology** (see "Session Methodology" in research doc):
+- ONE category per session (Option 1+2: deep-dive + WebFetch ISA citations)
+- Per session: enumerate instructions, verify with SDM/ARM-ARM/RISC-V references, write negative + positive `.zer` tests, update research doc with COMPLETE marker
+- Order: C1 → C2 → C3/C9 → C4/C5 → C6 → C7 → C8 (needs System #30) → C10 (decide keep-or-defer)
+- Fresh sessions: read `docs/asm_preconditions_research.md` "Session Methodology" section for full protocol
+
 **History of this decision:**
 1. First considered as "per-instruction preconditions" — hardcoded per-arch database. Rejected as conflicting with generic-tracking philosophy.
 2. Then considered as "deferred to Tier C" — user opts into `@verified_spec` for instruction UB. Workable but leaves Tier A at 99% language-safe.

@@ -1,0 +1,59 @@
+// EXPECTED: compiles + runs
+//
+// Category C2c (Alignment, dynamic-by-width) — x86-64 MOVDQA on
+// compiler-guaranteed aligned storage.
+// POSITIVE TEST: demonstrates that aligned stack storage satisfies C2c check.
+//
+// When a stack array is declared with @align(16) u8[16], System #20
+// (extended with alignment facts) proves the pointer is 16-byte aligned.
+// MOVDQA's C2c check then PASSES — compile succeeds.
+//
+// Research citation: docs/asm_preconditions_research.md Category C2 session 2
+
+i32 safe_movdqa_copy() {
+    // Placeholder implementation using regular ZER primitives until
+    // hardened unsafe asm syntax (D-Alpha-7.5 Phase 1) lands.
+    //
+    // When strict mode implements C2c check, the following should compile:
+    //
+    //     @align(16) u8[16] src_buf;
+    //     @align(16) u8[16] dst_buf;
+    //     /* initialize src_buf ... */
+    //
+    //     unsafe asm {
+    //         instructions: "movdqa (%0), %%xmm0\n\t"
+    //                       "movdqa %%xmm0, (%1)"
+    //         inputs:  { "r" = &src_buf, "r" = &dst_buf }
+    //         clobbers: ["xmm0", "memory"]
+    //         safety: "Copy 16 bytes via aligned SSE move — aligned storage proven"
+    //     }
+    //
+    // System #20 derives:
+    //   - &src_buf → align(16) from @align attribute
+    //   - &dst_buf → align(16) from @align attribute
+    //   - MOVDQA C2c check: required align(16) ≤ proven align(16) → OK
+    //
+    // Category C2c check PASSES.
+
+    // Placeholder: memcpy-style copy using ZER primitives
+    u8[16] src;
+    u8[16] dst;
+    u32 i = 0;
+    while (i < 16) {
+        src[i] = (u8)(i + 1);
+        i += 1;
+    }
+    i = 0;
+    while (i < 16) {
+        dst[i] = src[i];
+        i += 1;
+    }
+
+    // Verify copy worked
+    if (dst[0] == 1 && dst[15] == 16) { return 0; }
+    return 1;
+}
+
+i32 main() {
+    return safe_movdqa_copy();
+}

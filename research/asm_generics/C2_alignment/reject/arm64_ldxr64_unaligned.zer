@@ -1,0 +1,45 @@
+// EXPECTED: compile error
+//
+// Category C2a (Alignment, natural) — ARM64 LDXR (64-bit exclusive load)
+// Source: ARM ARM DDI 0487 LDXR —
+// "For exclusive load and store instructions, the address must be a
+// multiple of the number of bytes being loaded. If not, then the
+// behavior is undefined: There is no requirement that an exception
+// be raised."
+//
+// Also: "Load/store exclusive and load-acquire/store-release instructions
+// have an alignment check regardless of the value of the A bit."
+// (SCTLR_EL1.A bit)
+//
+// Precondition: LDXR 64-bit variant must be proven 8-byte aligned.
+// Violation: undefined behavior (may or may not trap — worst case silent).
+//
+// Research citation: docs/asm_preconditions_research.md Category C2 session 2
+
+u64 unsafe_ldxr_64(*u8 ptr) {
+    u64 value;
+
+    // `ptr` alignment unknown. LDXR (64-bit) requires 8-byte alignment.
+    // Alignment check happens regardless of SCTLR_EL1.A — instruction
+    // inherently requires natural alignment.
+    //
+    // Category C2a check must REJECT.
+    //
+    // Expected error: "Cannot prove LDXR (64-bit) memory operand is 8-byte
+    //                  aligned (Category C2a). ARM64 exclusive load/store
+    //                  always require natural alignment regardless of
+    //                  SCTLR_EL1.A bit. Misaligned access = undefined behavior."
+    unsafe asm {
+        instructions: "ldxr %0, [%1]"
+        inputs:  { "r" = ptr }
+        outputs: { "=r" = value }
+        clobbers: []
+        safety: "Exclusive 64-bit load (requires natural 8-byte alignment)"
+    }
+
+    return value;
+}
+
+i32 main() {
+    return 0;
+}

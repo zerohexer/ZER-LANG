@@ -1,0 +1,37 @@
+// EXPECTED: compile error
+//
+// Category C2c (Alignment, dynamic-by-width) — x86-64 MOVDQA instruction (128-bit)
+// Source: Intel SDM Vol 2B MOVDQA —
+// "When the source or destination operand is a memory operand, the operand
+// must be aligned on a 16-byte (128-bit version) ... boundary or a
+// general-protection exception (#GP) will be generated."
+//
+// Precondition: MOVDQA memory operand must be proven 16-byte aligned.
+// Violation: user passes byte-pointer with unknown alignment to MOVDQA.
+//
+// System #20 (Qualifier Tracking — extended with alignment) should reject.
+// Recommended alternative: use MOVDQU (unaligned variant) if alignment
+// cannot be proven.
+//
+// Research citation: docs/asm_preconditions_research.md Category C2 session 2
+
+void unsafe_aligned_load(*u8 src, *u8 dst) {
+    // `src` and `dst` are raw *u8 pointers — alignment UNKNOWN.
+    // VRP + Qualifier tracking can't prove 16-byte alignment.
+    // Category C2c check must REJECT at compile time.
+    //
+    // Expected error: "Cannot prove MOVDQA memory operand is 16-byte aligned
+    //                  (Category C2c). Required: align(16). Known: align(1).
+    //                  Recommended alternative: use MOVDQU for unaligned access."
+    unsafe asm {
+        instructions: "movdqa (%0), %%xmm0\n\t"
+                      "movdqa %%xmm0, (%1)"
+        inputs:  { "r" = src, "r" = dst }
+        clobbers: ["xmm0", "memory"]
+        safety: "Copy 16 bytes via aligned SSE move"
+    }
+}
+
+i32 main() {
+    return 0;
+}

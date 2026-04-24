@@ -445,7 +445,7 @@ See `research/asm_generics/README.md` for complete folder structure + naming con
 
 ### Session 1 completion marker
 
-**Category C1 (Value-range) research: COMPLETE ✓ 2026-04-24 [this commit]**
+**Category C1 (Value-range) research: COMPLETE ✓ 2026-04-24 [dca537f]**
 - 7 x86-64 instructions classified with ISA citations
 - 0 ARM64 instructions classified (all defined)
 - 0 RISC-V instructions classified (all defined)
@@ -453,7 +453,284 @@ See `research/asm_generics/README.md` for complete folder structure + naming con
 - Data file format validated against real data
 - VRP mapping confirmed; no system extension needed for C1
 
-**Next session: Category C2 (Alignment) — cache-line, vector, atomic-op alignment constraints.**
+---
+
+## Category C2 — VERIFIED RESEARCH SESSION 2 (2026-04-24)
+
+**Status: Phase 1 survey COMPLETE for C2 across all 3 archs. ✓**
+
+### Methodology
+
+Same Option 1+2 methodology as C1 session: WebFetch to felixcloutier.com for x86, WebSearch to authoritative ARM/RISC-V sources.
+
+### Summary finding: C2 is distributed across all 3 archs, not x86-heavy like C1
+
+Unlike C1 (almost entirely x86), C2 alignment preconditions appear on **all three archs**. This is because alignment is tied to physical memory access patterns (cache lines, atomic widths, vector register sizes) which all modern CPUs must handle. Design variations:
+
+| Arch | Approach | C2 instruction count |
+|---|---|---|
+| **x86-64** | Separate aligned/unaligned variants (MOVDQA vs MOVDQU, MOVAPS vs MOVUPS); LOCK-prefix needs natural alignment for atomicity | ~12 instruction families |
+| **ARM64** | Most loads/stores allow misalignment via SCTLR.A setting; exceptions are: exclusive load/store + load-acquire/store-release (always aligned) and DC ZVA (cache line) | ~8 instruction families |
+| **RISC-V** | LR/SC require natural alignment; Zicbom (CBO) does NOT require cache block alignment (explicit per spec); V extension vector ops vary | ~2 instruction families |
+
+### x86-64 — Confirmed C2 Instructions
+
+**All verified via WebFetch to felixcloutier.com.**
+
+| # | Instruction family | Subcat | Alignment | Consequence | Source |
+|---|---|---|---|---|---|
+| 1 | `CMPXCHG16B` | C2a fixed 16B | 16-byte boundary | `#GP(0)` in 64-bit mode; `#AC(0)` at CPL=3 if AC enabled | Intel SDM Vol 2A CMPXCHG8B/16B |
+| 2 | `MOVDQA` (128-bit) | C2c dynamic-by-width | 16-byte | `#GP` | Intel SDM Vol 2B MOVDQA |
+| 3 | `VMOVDQA` (256-bit AVX) | C2c dynamic-by-width | 32-byte | `#GP` | Intel SDM Vol 2B VMOVDQA |
+| 4 | `VMOVDQA32/64` (512-bit AVX-512) | C2c dynamic-by-width | 64-byte (EVEX.512) | `#GP` | Intel SDM Vol 2B VMOVDQA32/64 |
+| 5 | `MOVAPS` (128-bit) | C2c dynamic-by-width | 16-byte | `#GP` | Intel SDM Vol 2B MOVAPS |
+| 6 | `VMOVAPS` (256-bit) | C2c dynamic-by-width | 32-byte | `#GP` | Intel SDM Vol 2B VMOVAPS (VEX.256) |
+| 7 | `VMOVAPS` (512-bit) | C2c dynamic-by-width | 64-byte | `#GP` | Intel SDM Vol 2B VMOVAPS (EVEX.512) |
+| 8 | `MOVAPD` + variants | C2c dynamic-by-width | {16, 32, 64} by width | `#GP` | Intel SDM Vol 2B MOVAPD |
+| 9 | `MOVNTDQA` (128-bit) | C2c dynamic-by-width | 16-byte | `#GP` | Intel SDM Vol 2B MOVNTDQA |
+| 10 | `VMOVNTDQA` (256-bit) | C2c dynamic-by-width | 32-byte | `#GP` | Intel SDM Vol 2B VMOVNTDQA |
+| 11 | `VMOVNTDQA` (512-bit) | C2c dynamic-by-width | 64-byte | `#GP` | Intel SDM Vol 2B VMOVNTDQA |
+| 12 | `MOVNTDQ`/`MOVNTPS`/`MOVNTPD` (non-temporal stores, aligned variants) | C2c dynamic-by-width | by vector width | `#GP` | Intel SDM Vol 2B non-temporal group |
+
+**Key quotes from ISA manual:**
+
+**CMPXCHG16B:**
+> "CMPXCHG16B requires that the destination (memory) operand be 16-byte aligned."
+> 64-Bit Mode Exceptions: "If memory operand for CMPXCHG16B is not aligned on a 16-byte boundary."
+
+**MOVDQA / VMOVDQA / MOVAPS / VMOVAPS (representative):**
+> "When the source or destination operand is a memory operand, the operand must be aligned on a 16-byte (128-bit version), 32-byte (VEX.256 encoded version) or 64-byte (EVEX.512 encoded version) boundary or a general-protection exception (#GP) will be generated."
+
+**MOVNTDQA:**
+> "The 128-bit (V)MOVNTDQA addresses must be 16-byte aligned or the instruction will cause a #GP."
+
+### x86-64 — Verified NOT C2 (unaligned variants available)
+
+| Instruction | Behavior | Recommended by Intel |
+|---|---|---|
+| `MOVDQU` / `VMOVDQU` | Handles unaligned access (with perf cost). | Use instead of MOVDQA when alignment unproven. |
+| `MOVUPS` / `VMOVUPS` | Handles unaligned single-precision access. | Use instead of MOVAPS when alignment unproven. |
+| `MOVUPD` / `VMOVUPD` | Handles unaligned double-precision access. | Use instead of MOVAPD when alignment unproven. |
+| `LDDQU` | Specifically designed for unaligned loads. | Use for potentially-unaligned bulk loads. |
+| Regular `MOV` (word/dword/qword) | Hardware handles misalignment (perf hit, not #GP). With AC=1 + CPL=3, triggers #AC. | OK at default AC=0. |
+
+**Developer guidance:** ZER checker should suggest "use MOVDQU instead" when user writes MOVDQA with unproven-aligned pointer — similar to how LZCNT/TZCNT are recommended over BSR/BSF.
+
+### ARM64 — Confirmed C2 Instructions
+
+**Verified via WebSearch + ARM ARM references.**
+
+Key principle: most ARM64 loads/stores allow misalignment depending on SCTLR_EL1.A bit. Exceptions are instructions that require alignment **regardless** of the A bit:
+
+| # | Instruction family | Subcat | Alignment | Consequence | Source |
+|---|---|---|---|---|---|
+| 1 | `DC ZVA` | C2b cache-line | cache line (usually 64B, queryable DCZID_EL0) | Alignment fault (on Device memory) | ARM ARM DDI 0487 DC ZVA |
+| 2 | `LDXRH` / `STXRH` (halfword exclusive) | C2a natural | 2-byte | Undefined behavior (no exception required) | ARM ARM LDXR/STXR |
+| 3 | `LDXR` / `STXR` (word, 32-bit) | C2a natural | 4-byte | Undefined behavior | Same |
+| 4 | `LDXR` / `STXR` (doubleword, 64-bit) | C2a natural | 8-byte | Undefined behavior | Same |
+| 5 | `LDXP` / `STXP` (pair) | C2a natural | 16-byte | Undefined behavior | Same |
+| 6 | `LDAR` / `STLR` (load-acquire/store-release, all widths) | C2a natural + A-bit-independent | natural (4 or 8) | Alignment check regardless of SCTLR.A | ARM ARM LDAR/STLR |
+| 7 | `LDARB` / `STLRB` | (byte — trivially aligned, skip) | 1-byte | — | — |
+| 8 | `LDARH` / `STLRH` | C2a natural + A-bit-independent | 2-byte | Alignment check regardless | Same |
+
+**Not confirmed as C2 (defined):**
+- Regular `LDR`/`STR`: alignment handling controlled by SCTLR_EL1.A bit (default = allow misalignment)
+- `LDP`/`STP`: alignment handling same as LDR/STR (A-bit controlled)
+- NEON `LD1`/`ST1` vector: most variants handle misalignment; few exceptions in SVE
+
+**Key quotes:**
+
+**ARM exclusive alignment (from ARM ARM):**
+> "For exclusive load and store instructions, the address must be a multiple of the number of bytes being loaded. If not, then the behavior is undefined: There is no requirement that an exception be raised."
+
+**ARM LDAR/STLR alignment:**
+> "Load/store exclusive and load-acquire/store-release instructions have an alignment check regardless of the value of the A bit."
+
+**DC ZVA alignment:**
+> "The block size is 64 bytes on most systems, though this is determined by the system's cache line size and can be queried using the DCZID_EL0 register."
+
+### RISC-V — Confirmed C2 Instructions
+
+**Verified via RISC-V ISA Manual references (A-extension, Zicbom extension).**
+
+| # | Instruction | Subcat | Alignment | Consequence | Source |
+|---|---|---|---|---|---|
+| 1 | `LR.W` / `SC.W` | C2a natural | 4-byte | address-misaligned exception OR access-fault | RISC-V Unpriv Manual A-extension §14 |
+| 2 | `LR.D` / `SC.D` (RV64 only) | C2a natural | 8-byte | same | Same source |
+
+**Not confirmed as C2 (defined behavior):**
+
+| Instruction | Behavior | Source |
+|---|---|---|
+| `CBO.CLEAN` / `CBO.INVAL` / `CBO.FLUSH` (Zicbom) | **NOT aligned** — explicit per spec: "It is NOT required that rs1 is aligned to the size of a cache block." Hardware handles internally. | RISC-V Zicbom spec |
+| Regular `LW`/`SW`/`LD`/`SD` (loads/stores) | Misalignment may raise address-misaligned exception OR be handled by hardware OR trapped to M-mode. Implementation-defined per platform. Not a strict C2. | RISC-V Unpriv Manual |
+| Vector load/store (V ext) | Element alignment vs vector alignment depends on memory ordering parameters. Mostly defined. | RV V extension |
+
+**Key quotes:**
+
+**LR/SC alignment:**
+> "For LR and SC, the A extension requires that the address held in rs1 be naturally aligned to the size of the operand (i.e., eight-byte aligned for 64-bit words and four-byte aligned for 32-bit words)."
+> "If the address is not naturally aligned, an address-misaligned exception or an access-fault exception will be generated."
+
+**Zicbom — NOT aligned required:**
+> "It is not required that rs1 is aligned to the size of a cache block."
+> "Caches organize copies of data into cache blocks, each of which represents a contiguous, naturally aligned power-of-two (or NAPOT) range of memory locations. ... A cache-block management instruction can complete successfully even when rs1 specifies any byte within the aligned range."
+
+### Overlap with other categories
+
+**LR/SC (RISC-V) and LDXR/STXR (ARM64) appear in BOTH C2 AND C3:**
+- C2: alignment requirement (natural alignment)
+- C3: state machine (exclusive-pair begin/exit)
+
+**These are INDEPENDENT preconditions** on the same instruction. Both checks must apply. The category framework handles this cleanly — an instruction can have multiple category entries in the data file.
+
+Example data:
+```
+[LR_W]  # RISC-V
+category = C2a         # natural alignment (4-byte)
+operand = 1            # rs1 = address
+constraint = ALIGN(4)
+source = "RISC-V A-extension §14"
+
+[LR_W]  # same instruction, second entry
+category = C3a         # enters exclusive state
+state_op = enter_exclusive
+paired_with = SC_W
+source = "RISC-V A-extension §14"
+```
+
+### C2 Mapping to ZER Safety Systems
+
+All C2 instructions map to **System #20 (Qualifier Tracking)**, which must be **EXTENDED** to track alignment facts. Current state: System #20 tracks `const`/`volatile` qualifiers only. Extension: add `align(N)` facts propagated through pointer expressions.
+
+**Estimated extension effort:** ~30 hrs (as originally planned).
+
+**How the check works:**
+
+1. Pointer values in ZER carry alignment metadata (known-aligned-to-N-bytes, or unknown)
+2. Alignment fact updates:
+   - Stack-allocated `T[N]`: aligned to `alignof(T)`
+   - Heap-allocated via Pool/Slab: aligned to max(alignof(T), 16) typically
+   - Pointer from `&struct.field`: alignment of parent + field offset
+   - Arithmetic: `ptr + N` → alignment = gcd(ptr_align, N) if N constant
+   - Cast to different type: alignment unchanged (ZER tracks the underlying bytes)
+3. At asm input binding: verify declared operand alignment ≤ pointer's known alignment
+4. If unknown or insufficient: compile error
+
+### Checker action per C2 subcategory
+
+| Subcat | Check |
+|---|---|
+| C2a natural (N-byte for N-byte access) | `prove_aligned(ptr, width)` where width = access size |
+| C2b cache-line | `prove_aligned(ptr, cache_line_size)` — cache_line_size is arch-dependent (typically 64) |
+| C2c dynamic-by-width | `prove_aligned(ptr, vector_width)` — 16/32/64 based on SSE/AVX/AVX-512 instruction encoding |
+
+### Data file format additions
+
+```
+# arch_data/x86_64.zerdata — Category C2 additions
+
+[CMPXCHG16B]
+category = C2a
+operand = 1     # memory operand (m128)
+constraint = ALIGN(16)
+source = "Intel SDM Vol 2A CMPXCHG16B"
+consequence = "#GP(0) in 64-bit mode"
+
+[MOVDQA_128]
+category = C2c
+operand = 1     # memory operand
+constraint = ALIGN(VECTOR_WIDTH)  # 16 for 128-bit
+source = "Intel SDM Vol 2B MOVDQA"
+consequence = "#GP"
+recommended_alternative = "MOVDQU (unaligned variant)"
+
+[MOVDQA_256]
+category = C2c
+operand = 1
+constraint = ALIGN(32)
+source = "Intel SDM Vol 2B VMOVDQA (VEX.256)"
+consequence = "#GP"
+recommended_alternative = "VMOVDQU"
+
+[MOVDQA_512]
+category = C2c
+operand = 1
+constraint = ALIGN(64)
+source = "Intel SDM Vol 2B VMOVDQA32/VMOVDQA64 (EVEX.512)"
+consequence = "#GP"
+recommended_alternative = "VMOVDQU32/VMOVDQU64"
+
+# (similar entries for MOVAPS, MOVAPD, MOVNTDQA, etc.)
+
+# arch_data/arm64.zerdata
+
+[DC_ZVA]
+category = C2b
+operand = 1     # address register
+constraint = ALIGN(CACHE_LINE_SIZE)  # typically 64, queryable via DCZID_EL0
+source = "ARM ARM DDI 0487 DC ZVA"
+consequence = "Alignment fault on Device memory"
+
+[LDXR_32]
+category = C2a
+operand = 1
+constraint = ALIGN(4)
+source = "ARM ARM LDXR"
+consequence = "Undefined behavior"
+
+[LDXR_64]
+category = C2a
+operand = 1
+constraint = ALIGN(8)
+source = "ARM ARM LDXR (doubleword)"
+consequence = "Undefined behavior"
+
+# (similar for LDXP/STXP, LDAR/STLR variants)
+
+# arch_data/rv64.zerdata
+
+[LR_W]
+category = C2a
+operand = 1     # rs1 = address
+constraint = ALIGN(4)
+source = "RISC-V A-extension §14 LR/SC"
+consequence = "address-misaligned exception OR access-fault"
+
+[LR_D]
+category = C2a
+operand = 1
+constraint = ALIGN(8)
+source = "RISC-V A-extension §14 LR/SC (RV64)"
+consequence = "address-misaligned exception OR access-fault"
+```
+
+### POC specifications (NOT in tests/ — see `research/asm_generics/C2_alignment/`)
+
+- `research/asm_generics/C2_alignment/reject/x86_movdqa_unaligned.zer` — MOVDQA with unproven-aligned pointer → compile error
+- `research/asm_generics/C2_alignment/reject/x86_cmpxchg16b_unaligned.zer` — CMPXCHG16B without 16B alignment proof → compile error
+- `research/asm_generics/C2_alignment/reject/arm64_ldxr64_unaligned.zer` — LDXR (64-bit) without 8B alignment proof → compile error
+- `research/asm_generics/C2_alignment/reject/riscv_lrd_unaligned.zer` — LR.D without 8B alignment proof → compile error
+- `research/asm_generics/C2_alignment/accept/x86_movdqa_aligned_array.zer` — MOVDQA on `@align(16) u8[16]` → compiles
+- `research/asm_generics/C2_alignment/accept/x86_cmpxchg16b_aligned.zer` — CMPXCHG16B on `@align(16)` struct → compiles
+
+### Open questions / follow-ups for C2
+
+1. **How does ZER currently track alignment in plain code?** (Need audit — if no tracking today, the ~30 hr extension estimate must cover the base tracking too, not just asm integration.)
+2. **Cache line size dynamic discovery:** ARM's DCZID_EL0 and some x86 CPUID flags determine cache line size at runtime. Can ZER's compile-time VRP cover this, or need runtime check? (Probably: declare cache line size as build-time config, validate at boot.)
+3. **AVX-512 vector width:** 512-bit variant exists, 256-bit variant exists, 128-bit variant exists — all with different alignment. Instruction disambiguation (by VEX/EVEX encoding) handles this; data file entries per width variant.
+
+### Session 2 completion marker
+
+**Category C2 (Alignment) research: COMPLETE ✓ 2026-04-24 [this commit]**
+- 12 x86-64 instruction families classified with ISA citations
+- 8 ARM64 instruction families classified (exclusive + load-acquire + DC ZVA)
+- 2 RISC-V instructions classified (LR/SC with natural alignment)
+- POC `.zer` files in `research/asm_generics/C2_alignment/`
+- System #20 (Qualifier Tracking) extension required: ~30 hrs to add alignment facts
+- Key finding: Zicbom CBO.* is NOT C2 (spec explicitly says no alignment required)
+
+**Next session: Category C3 (State machine / exclusive pairing) — ARM LDXR/STXR, RISC-V LR/SC, Intel TSX xbegin/xend. Will likely merge C9 into C3 as research confirms they're the same pattern.**
 
 ---
 

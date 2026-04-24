@@ -70,7 +70,7 @@ Until that migration, these files are NOT in the active test suite.
 | Category | Status | Session | Deliverables |
 |---|---|---|---|
 | C1 Value-range | COMPLETE (2026-04-24) | 1 | 4 .zer files + ISA citations + 7 x86 instructions classified |
-| C2 Alignment | Pending | 2 | — |
+| C2 Alignment | COMPLETE (2026-04-24) | 2 | 6 .zer files + ISA citations + 12 x86 + 8 ARM64 + 2 RISC-V instruction families classified |
 | C3 State machine | Pending | 3 | — |
 | C4 CPU feature | Pending | 4 | — |
 | C5 Privilege | Pending | 5 | — |

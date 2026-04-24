@@ -1,0 +1,39 @@
+// EXPECTED: compile error
+//
+// Category C2a (Alignment, natural) — RISC-V LR.D (load-reserved doubleword)
+// Source: RISC-V ISA Manual Volume I Unpriv A-extension §14 —
+// "For LR and SC, the A extension requires that the address held in rs1
+// be naturally aligned to the size of the operand (i.e., eight-byte
+// aligned for 64-bit words and four-byte aligned for 32-bit words).
+// If the address is not naturally aligned, an address-misaligned
+// exception or an access-fault exception will be generated."
+//
+// Precondition: LR.D must be proven 8-byte aligned.
+// Violation: address-misaligned exception or access-fault.
+//
+// Research citation: docs/asm_preconditions_research.md Category C2 session 2
+
+u64 unsafe_lrd(*u8 ptr) {
+    u64 value;
+
+    // `ptr` alignment unknown. LR.D requires 8-byte alignment.
+    // Category C2a check must REJECT.
+    //
+    // Expected error: "Cannot prove LR.D memory operand is 8-byte aligned
+    //                  (Category C2a). RISC-V LR/SC require natural alignment;
+    //                  misalignment raises address-misaligned exception or
+    //                  access-fault."
+    unsafe asm {
+        instructions: "lr.d %0, (%1)"
+        inputs:  { "r" = ptr }
+        outputs: { "=r" = value }
+        clobbers: []
+        safety: "Load-reserved doubleword (requires 8-byte alignment)"
+    }
+
+    return value;
+}
+
+i32 main() {
+    return 0;
+}

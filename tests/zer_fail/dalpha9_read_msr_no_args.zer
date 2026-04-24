@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_read_msr requires 1 argument (msr number)
+
+i32 main() {
+    u64 v = @cpu_read_msr();  // error: missing arg
+    if (v == 0) { return 0; }
+    return 0;
+}

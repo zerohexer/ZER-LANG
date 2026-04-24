@@ -5818,6 +5818,52 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@cpu_id takes no arguments");
             }
             result = ty_u32;
+        } else if (nlen == 12 && memcmp(name, "cpu_read_msr", 12) == 0) {
+            /* D-Alpha-9: @cpu_read_msr(u32 msr) -> u64. Privileged (CPL=0). */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@cpu_read_msr requires 1 argument (msr number)");
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@cpu_read_msr argument must be integer");
+                }
+            }
+            result = ty_u64;
+        } else if (nlen == 13 && memcmp(name, "cpu_write_msr", 13) == 0) {
+            /* D-Alpha-9: @cpu_write_msr(u32 msr, u64 value). Privileged. */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@cpu_write_msr requires 2 arguments (msr number, value)");
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
+                    checker_error(c, node->loc.line, "@cpu_write_msr arguments must be integers");
+                }
+            }
+            result = ty_void;
+        } else if ((nlen == 12 && memcmp(name, "cpu_read_cr0", 12) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_read_cr3", 12) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_read_cr4", 12) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_read_xcr0", 13) == 0)) {
+            /* D-Alpha-9: @cpu_read_cr0/3/4/xcr0() -> u64. Privileged. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_u64;
+        } else if ((nlen == 13 && memcmp(name, "cpu_write_cr0", 13) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_write_cr3", 13) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_write_cr4", 13) == 0) ||
+                   (nlen == 14 && memcmp(name, "cpu_write_xcr0", 14) == 0)) {
+            /* D-Alpha-9: @cpu_write_cr0/3/4/xcr0(u64). Privileged. */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (value)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt && !type_is_integer(vt)) {
+                    checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                }
+            }
+            result = ty_void;
         } else if ((nlen == 13 && memcmp(name, "tlb_flush_all", 13) == 0) ||
                    (nlen == 16 && memcmp(name, "tlb_flush_global", 16) == 0)) {
             /* D-Alpha-6: TLB flush (0-arg, void). Privileged. */

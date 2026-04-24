@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_write_cr0 requires 1 argument (value)
+
+i32 main() {
+    @cpu_write_cr0();  // error: missing arg
+    return 0;
+}

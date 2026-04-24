@@ -1763,3 +1763,109 @@ Not all intrinsics need full Hoare logic:
 
 Weighted cost: ~52% of full-formal. This is captured in the budget
 breakdown in `docs/asm_plan.md`.
+
+---
+
+## Asm category research phase COMPLETE (2026-04-24) — implications for future proofs
+
+**Fresh proof sessions: READ THIS when asm safety verification work starts.**
+
+### What the research produced (proof perspective)
+
+7-session research phase (docs/asm_preconditions_research.md) classified
+every UB-bearing instruction across x86-64 / ARM64 / RISC-V + PowerPC +
+Cortex-M spot-checks into **8 universal precondition categories**:
+
+| Category | Maps to ZER system | Level 3 VST target |
+|---|---|---|
+| C1 Value-range | #12 VRP | `src/safety/value_range_rules.c` (future) |
+| C2 Alignment | #20 Qualifier (ext) | `src/safety/alignment_rules.c` (future) |
+| C3 State machine | Model 1 (ext) | Extend existing `src/safety/handle_state.c` pattern |
+| C4 CPU feature | #24 Context Flags (ext) | `src/safety/feature_gate_rules.c` (future) |
+| C5 Privilege | #24 Context Flags (ext) | `src/safety/privilege_rules.c` (future) |
+| C6 Memory addressability | #19 MMIO (minor ext) | Extend existing `src/safety/mmio_rules.c` |
+| C7 Provenance/aliasing | #3 + #11 | Already-extracted `src/safety/provenance_rules.c` |
+| C8 Memory ordering | **NEW System #30** | `src/safety/ordering_rules.c` (NEW, Phase 3) |
+
+Category C9 was MERGED into C3 during Session 3 research. C10 was DELETED in Session 7 after verification found it collapsed into existing structural rules (O1/O2/E1/I4).
+
+### Current state (2026-04-24)
+
+- Research: **DESIGN COMPLETE.** 8 categories formally defined with ISA citations.
+- Implementation: **NOT STARTED.** Zero compiler code changes during research phase.
+- Framework verified universal across **5 architectures** (3 full + 2 spot-checks).
+
+### When someone starts asm safety implementation
+
+Implementation order (per plan roadmap):
+1. Complete D-Alpha intrinsic batches (D-Alpha-10 through D-Alpha-14)
+2. D-Alpha-7.5 Phase 1: Hardened unsafe asm infrastructure (H1-H7)
+3. D-Alpha-7.5 Phase 2: Strict mode implementation
+   - 18 structural rules (S/O/I/E)
+   - 13 Z-rules (extend existing ZER safety systems through asm boundaries)
+   - 8-category framework + per-arch data files
+   - **New System #30 (Atomic Ordering)** — the only new ZER safety system added by research
+
+Level 3 VST extraction for these checks comes AFTER the implementation ships. Standard extract-and-link pattern applies (see "Verification strategy — extract-and-link" section earlier in this doc).
+
+### System #30 (NEW — Atomic Ordering) — spec for future proof work
+
+**Design spec in `docs/asm_preconditions_research.md` C8 section.**
+
+Tracks happens-before edges between memory operations via CFG traversal.
+Similar pattern to existing Model 1 state-machine tracking (Handle states)
+but tracks program-point state rather than per-entity state.
+
+**State representation:**
+```
+OrderingState {
+    barriers_encountered: Bitmap<BarrierKind>,
+    pending_requirements: Set<(MemOpID, RequiredBarrierKind)>
+}
+
+BarrierKind ∈ {FullMemory, StoreStore, LoadLoad, LoadStore, StoreLoad,
+               Release, Acquire, AcquireRelease, InstructionSync,
+               IoMemory, DMASync}
+```
+
+**File placement when implemented:**
+- Primary: `zercheck_ir.c` (CFG-based tracking, ~400-600 lines)
+- AST-level hooks: `checker.c` (recognize barrier intrinsics, ~50-100 lines)
+- Level 3 VST: `src/safety/ordering_rules.c` + `proofs/vst/verif_ordering_rules.v`
+- **NOT in:** `zercheck.c` (being deleted, CFG migration Phase G)
+
+### Scope distinction (important for proof oracles)
+
+**System #30 proves language-level ordering facts:**
+- "Each acquire has a matching release" — structural
+- "CLWB followed by SFENCE before next write to same cache line" — pattern-based
+- "FENCE.I before self-modifying code execution" — ordering constraint
+
+**System #30 does NOT prove:**
+- Full memory-model consistency across hart interleavings (Iris/RelaxedMem territory)
+- Persistence atomicity on power failure (hardware concern)
+- Weak memory model reorderings allowed by hardware
+
+These deeper proofs remain in Tier C `@verified_spec` territory for users who opt in per-block.
+
+### Research artifacts (reference locations)
+
+- `docs/asm_preconditions_research.md` — master research doc (session-by-session)
+- `research/asm_generics/C1..C8/` — 24 POC `.zer` files specifying expected check behavior
+- `research/asm_generics/README.md` — structure + POC → test migration path
+
+**POCs are NOT in tests/ directory.** They use `unsafe asm` structured syntax
+not yet implemented. When D-Alpha-7.5 Phase 2 lands, POCs get promoted to
+`tests/zer_fail/` (reject) and `tests/zer/` (accept) as real regression tests.
+
+### Proof-session onboarding for asm work
+
+If a fresh proof session starts on asm safety verification:
+
+1. Read `docs/asm_preconditions_research.md` fully — 8 categories + System #30 design + ISA citations
+2. Read this section + "Verification strategy — extract-and-link" earlier in this doc
+3. Decide scope: Level 1 (Coq predicate spec) OR Level 3 (VST on extracted predicates)
+4. For Level 1 category specs: follow typing.v pattern — bool-returning predicates with theorems
+5. For Level 3 extraction: follow existing `handle_state.c` / `mmio_rules.c` pattern
+
+**Oracle source for asm safety proofs:** the ISA manuals cited in `docs/asm_preconditions_research.md`. Direct quotes from Intel SDM, ARM ARM, RISC-V Manual establish the semantics being proved correct.

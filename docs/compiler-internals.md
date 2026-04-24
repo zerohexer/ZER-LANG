@@ -6802,3 +6802,153 @@ Tier C (v1.1+): full Vale-tier + `@verified_spec` for user asm.
 
 See `docs/asm_plan.md` for complete tier breakdown + user
 preferences + decision log.
+
+---
+
+## Research Phase COMPLETE (2026-04-24) — 8 universal precondition categories
+
+**Fresh sessions: READ THIS before implementing strict mode (D-Alpha-7.5 Phase 2).**
+
+### What was produced
+
+Over 7 research sessions (2026-04-24), classified every UB-bearing instruction across x86-64 + ARM64 + RISC-V + PowerPC + Cortex-M spot-checks into **8 universal precondition categories**:
+
+| # | Name | Maps to ZER system | Extension required? |
+|---|---|---|---|
+| C1 | Value-range | #12 VRP | None |
+| C2 | Alignment | #20 Qualifier | Add alignment facts (~30 hrs) |
+| C3 | State machine (C9 merged) | Model 1 | Add exclusive-tx state type (~20 hrs) |
+| C4 | CPU feature gate | #24 Context Flags | Add `cpu_features` set (~10 hrs) |
+| C5 | Privilege / execution mode | #24 Context Flags | Add `privilege_level` hierarchy (~10 hrs) |
+| C6 | Memory addressability | #19 MMIO + minor | Canonical-addr check (~10 hrs) |
+| C7 | Provenance / aliasing | #3 Provenance + #11 Escape | None — near-empty in base ISAs |
+| C8 | Memory ordering | **NEW System #30** | New system (~80 hrs) |
+| ~~C9~~ | ~~Exclusive pairing~~ | MERGED into C3 (Session 3) | — |
+| ~~C10~~ | ~~Register dependency~~ | DELETED (Session 7) — collapses to O1/O2/E1/I4 | — |
+
+**Key finding:** framework is universal across 5 different ISA design philosophies. Zero instructions observed that don't fit C1-C8.
+
+### Research artifacts (DO NOT delete / reorganize without reason)
+
+- `docs/asm_preconditions_research.md` — master research doc with per-category findings, ISA citations, System #30 design spec
+- `research/asm_generics/C1..C8/` — 24 POC `.zer` files (reject + accept per category), NOT in tests/ (POCs, not regression tests)
+- `research/asm_generics/README.md` — structure + migration path
+
+**POCs are intentionally outside tests/** because they use `unsafe asm` structured syntax not yet parsed. Running as tests = vacuous pass (parse error). Migration: when strict mode lands, promote POCs to `tests/zer_fail/` and `tests/zer/`.
+
+### Research phase scope boundary
+
+The research produced DESIGN ONLY — zero compiler code was changed during the 7 research sessions. Test suite stayed 442/442 throughout. Commits visible via:
+
+```
+git log --oneline --grep="research:" | head -20
+```
+
+### What comes NEXT (for implementation sessions)
+
+Implementation NOT started. Order:
+
+1. **Continue D-Alpha intrinsics** (D-Alpha-10 through D-Alpha-14) — ~52 intrinsics remain
+2. **D-Alpha-7.5 Phase 1** — Hardened unsafe asm infrastructure (H1-H7 typed operand syntax) — ~120 hrs
+3. **D-Alpha-7.5 Phase 2** — Strict mode implementation (18 structural + 13 Z-rules + 8 categories + new System #30 + per-arch data files) — ~430 hrs
+4. **Ship v1.0 Tier A** — 100% language-safe
+
+### System #30 (NEW — Atomic Ordering) — design ONLY
+
+**Only new safety system added by Option C. DO NOT implement until D-Alpha-7.5 Phase 2.**
+
+File placement (decided 2026-04-24):
+- **Primary:** `zercheck_ir.c` — CFG-based tracking, extends Model 1 state-machine pattern
+- **Supporting:** `checker.c` for AST-level barrier/fence recognition
+- **IR ops:** mostly exist from D-Alpha-1/2; may add metadata fields
+- **Level 3 VST:** `src/safety/ordering_rules.c` + `proofs/vst/verif_ordering_rules.v` (Phase 3 later)
+- **NOT in:** `zercheck.c` (being deleted, CFG migration Phase G)
+
+Design spec + pseudocode: `docs/asm_preconditions_research.md` C8 section.
+
+### Per-arch data file pattern (future .zerdata files)
+
+Final design: per-arch data file maps instruction → category + metadata. Generic checker dispatches to existing ZER safety systems based on category. Example entries in research doc.
+
+Per-new-arch cost with this architecture:
+- **Level 1 (manual)** — ~20-25 hrs reading ISA manual + writing `.zerdata` rows
+- **Level 2 (LLM-assisted)** — ~1-4 hrs feeding ISA manual PDF to LLM with category prompt, human spot-check
+- **Level 3 (Sail extraction)** — NOT pursued for v1.0/v1.x (overkill)
+
+---
+
+## D-Alpha batch progress (2026-04-24 end-of-day)
+
+| Batch | Status | Intrinsics | Commit |
+|---|---|---|---|
+| D-Alpha-1 | DONE | 7 atomics | 2e152f3 |
+| D-Alpha-2 | DONE | 10 barriers + bits | a14d3c0 |
+| D-Alpha-3 | DONE | 5 interrupt control | 3e6e2f2 |
+| D-Alpha-4 | DONE | 4 context switch | e2f45af |
+| D-Alpha-5 | DONE | 10 MMU control | 94f958b |
+| D-Alpha-6 | DONE | 11 TLB + cache | 6e7521a |
+| D-Alpha-7 | DONE | 8 critical multi-core | ca7e144 |
+| D-Alpha-8 | DONE | 4 nice-to-have (read_counter, get_pc, wait_on_address, flush_pipeline) | 4ca14b2 |
+| D-Alpha-9 | DONE | 10 MSR/CR/XCR0 (x86 privileged) | a0fe701 |
+| D-Alpha-10 | Pending | 10 inspection | — |
+| D-Alpha-11 | Pending | 5 power management | — |
+| D-Alpha-12 | Pending | 6 privileged transitions | — |
+| D-Alpha-13 | Pending | 20 Linux-scale x86 | — |
+| D-Alpha-14 | Pending | 10 misc | — |
+| D-Alpha-7.5 Phase 1 | Pending | Hardened unsafe asm (H1-H7) | — |
+| D-Alpha-7.5 Phase 2 | Pending | Strict mode implementation | — |
+
+**77 of 130 intrinsics shipped (59%).** Halfway mark + crossed.
+
+### D-Alpha-8/9 patterns discovered
+
+**Test pattern (dead-branch for privileged instructions):**
+```zer
+volatile u32 never_true;
+
+u64 dead_branch_test() {
+    u64 val = 0;
+    if (never_true == 42) {
+        // privileged instruction here — compiles, never runs in user-mode test
+        val = @cpu_read_msr(0x1B);
+    }
+    return val;
+}
+```
+
+This pattern was established in D-Alpha-3 (interrupt control) and continues to work for D-Alpha-9 (MSR/CR access). Fresh sessions: use this pattern for any privileged intrinsic.
+
+**ZER does NOT support `(void)` cast syntax.** Don't use `(void)unused_var;` to suppress "unused variable" — use meaningful usage instead (e.g., comparison check that's never true).
+
+**Checker batched validation pattern** (for intrinsics with same signature):
+```c
+} else if ((nlen == 12 && memcmp(name, "cpu_read_cr0", 12) == 0) ||
+           (nlen == 12 && memcmp(name, "cpu_read_cr3", 12) == 0) ||
+           (nlen == 12 && memcmp(name, "cpu_read_cr4", 12) == 0) ||
+           (nlen == 13 && memcmp(name, "cpu_read_xcr0", 13) == 0)) {
+    /* batched 0-arg u64-return validation */
+    if (node->intrinsic.arg_count != 0) {
+        checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+    }
+    result = ty_u64;
+}
+```
+
+Each mnemonic needs its own `memcmp` + length check — cheaper than generic solution since we have ~10 instructions per batch typically.
+
+**Emitter pattern for x86-specific ops with no cross-arch equivalent:**
+```c
+} else if (nlen == 12 && memcmp(name, "cpu_read_cr0", 12) == 0) {
+    emit(e, "({ uint64_t _zer_cr = 0;\n"
+        "#if defined(__x86_64__)\n"
+        "    __asm__ __volatile__ (\"movq %%%%cr0, %%0\" : \"=r\"(_zer_cr));\n"
+        "#endif\n"
+        "_zer_cr; })");
+}
+```
+
+Non-x86 archs get the 0-initialized value (no emission inside `#if`). This lets cross-arch kernel code use `comptime if` arch gates without needing per-arch conditional at intrinsic call sites.
+
+**Emit() escape rule reminder** (from D-Alpha-4 gotcha, still applies):
+- `%0` (GCC operand ref) → write `%%0` in C fmt string (one layer of escape for `emit()`'s vfprintf)
+- `%%rbx` (literal register) → write `%%%%rbx` (two layers — vfprintf then asm parser)

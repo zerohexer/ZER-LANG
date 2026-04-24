@@ -266,11 +266,22 @@ Callee-saved only (rbx/r12-r15 on x86, x19-x28 on ARM64, s0-s11 on RISC-V).
 Full RSP/RIP save requires naked functions — kernel-integration scope.
 Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branch pattern.
 
-### `unsafe asm` safety (strict mode + Z-rules, planned D-Alpha-7.5)
+### `unsafe asm` safety (strict mode + Z-rules + 8 Categories, planned D-Alpha-7.5)
 
-ZER's 29 safety tracking systems extend THROUGH `unsafe asm` operand boundaries via 13 Z-rules. Unlike Rust (which disables borrow checker inside `unsafe { asm!() }`), ZER keeps all tracking active at asm bindings.
+**Research phase COMPLETE (2026-04-24) — 7 sessions, 8 final universal precondition categories.**
 
-**Strict mode = 18 structural + 13 Z-rules = 99% language-safe at operand boundary. DEFAULT ON from v1.0 (no opt-in flag).**
+Fresh-session entry points:
+- `docs/asm_preconditions_research.md` — 8 categories (C1-C8), ISA citations per-arch, System #30 design spec
+- `research/asm_generics/C1..C8/` — 24 POC `.zer` files (reject+accept per category) — NOT in tests/, research artifacts only
+- `research/asm_generics/README.md` — folder structure + migration path (POCs → tests/ when strict mode lands)
+
+Final category count: **8** (was 10; C9 merged into C3 in Session 3, C10 deleted in Session 7 after found to collapse into existing structural rules). Framework verified universal across **5 architectures** (x86-64, ARM64, RISC-V full; PowerPC + Cortex-M spot-checks with 12/12 and 10/10 fit).
+
+ZER's 29 safety tracking systems extend THROUGH `unsafe asm` operand boundaries via 13 Z-rules + 8 categories. Unlike Rust (which disables borrow checker inside `unsafe { asm!() }`), ZER keeps all tracking active at asm bindings.
+
+**Strict mode = 18 structural + 13 Z-rules + 8 universal categories + 1 new System #30 = 100% language-safe. DEFAULT ON from v1.0 (no opt-in flag).**
+
+**System #30 (Atomic Ordering) — DESIGNED BUT NOT IMPLEMENTED.** Only new safety system added by Option C. Tracks happens-before edges via CFG traversal in `zercheck_ir.c` (extends Model 1 state-machine pattern). Spec + pseudocode in `docs/asm_preconditions_research.md` C8 section. ~80 hrs implementation. **DO NOT implement yet** — wait until D-Alpha-7.5 Phase 2. Current research phase produced DESIGN + POCs only, no compiler code changes.
 
 Z-rules catch through-asm bugs that Rust can't:
 - Z1: UAF through asm operand (Handle must be ALIVE per System #7)
@@ -287,7 +298,7 @@ Z-rules catch through-asm bugs that Rust can't:
 **Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
 
 **Two orthogonal dimensions (NOT a continuum):**
-- **Language safety at operand boundary** (Tier A, v1.0, default on): 99% via strict mode — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI all caught
+- **Language safety** (Tier A, v1.0, default on): **100%** via strict mode (18 structural + 13 Z-rules + 8 categories + System #30) — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI/instruction-UB all caught
 - **Algorithm correctness + instruction UB** (Tier C, v1.1+, opt-in per block): `@verified_spec` Vale-tier — `requires:` clauses cover both instruction preconditions AND algorithm claims
 
 These compose — neither subsumes the other. Strict mode still runs inside Vale-tier blocks.

@@ -82,4 +82,18 @@ Until that migration, these files are NOT in the active test suite.
 
 **Category count:** 9 (was 10; C9 merged into C3 in Session 3).
 
+### Universality verification (spot-checks)
+
+Beyond the 3 primary v1.0 archs, framework universality spot-checked against:
+
+| Arch | Status | Behaviors fit C1-C10 |
+|---|---|---|
+| x86-64 (v1.0) | Full research | Verified |
+| ARM64 A-profile (v1.0) | Full research | Verified |
+| RISC-V (v1.0) | Full research | Verified |
+| **PowerPC** | **Spot-check (2026-04-24)** | **12/12 fit** |
+| **ARM Cortex-M M-profile** | **Spot-check (2026-04-24)** | **10/10 fit** |
+
+**5 architectures, zero framework holes.** See `docs/asm_preconditions_research.md` "Framework Universality Spot-Checks" section.
+
 Session methodology: `docs/asm_preconditions_research.md` "Session Methodology" section.

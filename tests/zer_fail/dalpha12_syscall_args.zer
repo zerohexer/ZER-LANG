@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_syscall takes no arguments
+
+i32 main() {
+    @cpu_syscall(1);  // error: takes no args
+    return 0;
+}

@@ -6440,6 +6440,101 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"wfi\");\n"
                 "#endif\n"
                 "})");
+        } else if (nlen == 11 && memcmp(name, "cpu_syscall", 11) == 0) {
+            /* D-Alpha-12: issue syscall (user-side trap to kernel).
+             * x86: syscall — fast syscall via MSR_LSTAR target
+             * ARM64: svc #0 — supervisor call
+             * RISC-V: ecall — environment call from U-mode to S/M */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"syscall\" ::: \"rcx\", \"r11\", \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"svc #0\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "cpu_sysret", 10) == 0) {
+            /* D-Alpha-12: return from syscall (kernel->user transition).
+             * Requires correctly-set return context (CS/RIP/RFLAGS/RSP/SS on x86).
+             * x86: sysretq — fast return counterpart to syscall
+             * ARM64: eret — return from exception using ELR/SPSR
+             * RISC-V: sret — return from supervisor mode */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"sysretq\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"eret\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"sret\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 8 && memcmp(name, "cpu_iret", 8) == 0) {
+            /* D-Alpha-12: return from interrupt handler.
+             * x86: iretq — restores CS/RIP/RFLAGS/RSP/SS from interrupt stack
+             * ARM64: eret — same instruction as sysret (arch-unified)
+             * RISC-V: mret — return from machine mode */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"iretq\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"eret\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"mret\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 18 && memcmp(name, "cpu_set_priv_stack", 18) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-12: set privileged-mode stack pointer for syscall entry.
+             * x86: writes MSR_KERNEL_GS_BASE as target for swapgs+load convention.
+             * ARM64: sets SP_EL1 for kernel stack.
+             * RISC-V: writes mscratch (machine mode) or sscratch (supervisor). */
+            emit(e, "({ uint64_t _zer_sp = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_lo = (uint32_t)_zer_sp, _zer_hi = (uint32_t)(_zer_sp >> 32);\n"
+                "    /* MSR_KERNEL_GS_BASE = 0xC0000102 */\n"
+                "    __asm__ __volatile__ (\"wrmsr\" :: \"a\"(_zer_lo), \"d\"(_zer_hi), \"c\"(0xC0000102));\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr sp_el0, %%0\" :: \"r\"(_zer_sp));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"csrw mscratch, %%0\" :: \"r\"(_zer_sp));\n"
+                "#else\n"
+                "    (void)_zer_sp;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 18 && memcmp(name, "cpu_get_priv_level", 18) == 0) {
+            /* D-Alpha-12: query current privilege level.
+             * Returns 0=user, higher=more privileged.
+             * x86: CS.RPL (low 2 bits of CS segment)
+             * ARM64: CurrentEL >> 2
+             * RISC-V: no direct user-mode query — returns 0 (privileged needs mstatus) */
+            emit(e, "({ uint32_t _zer_pl = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint16_t _zer_cs;\n"
+                "    __asm__ __volatile__ (\"movw %%%%cs, %%0\" : \"=r\"(_zer_cs));\n"
+                "    _zer_pl = (uint32_t)(_zer_cs & 0x3);\n"
+                "#elif defined(__aarch64__)\n"
+                "    uint64_t _zer_el;\n"
+                "    __asm__ __volatile__ (\"mrs %%0, CurrentEL\" : \"=r\"(_zer_el));\n"
+                "    _zer_pl = (uint32_t)(_zer_el >> 2);\n"
+                "#endif\n"
+                "_zer_pl; })");
+        } else if (nlen == 13 && memcmp(name, "cpu_hypercall", 13) == 0) {
+            /* D-Alpha-12: invoke hypervisor (for code running as a guest).
+             * x86: vmcall (Intel VMX) — AMD uses vmmcall but both VM exits to hypervisor
+             * ARM64: hvc #0 — hypervisor call to EL2
+             * RISC-V: ecall (from S-mode to HS-mode hypervisor) */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"vmcall\" ::: \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"hvc #0\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
             /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
              * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */

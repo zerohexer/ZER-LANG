@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// @cpu_set_priv_stack requires 1 argument
+
+i32 main() {
+    @cpu_set_priv_stack();  // error: missing arg
+    return 0;
+}

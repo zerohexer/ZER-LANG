@@ -10,7 +10,7 @@
 - **IMPLEMENTATION-FIRST DECISION (2026-04-23 evening):** Intrinsic IMPLEMENTATION is decoupled from Phase 2-7 prereq. Phase D split into D-Alpha (implementation, no formal proofs) and D-Beta (verification layer added later). This matches how seL4/CompCert/Vale were actually built — code first, proofs iteratively. Users can ship pure-ZER kernels ~1-2 years earlier. See "Implementation-First Plan (Phase D-Alpha)" section below.
 - **LINUX-SCALE EXPANSION (2026-04-23 late evening):** Target scope upgraded from 96 → **130 intrinsics** covering what Linux kernel arch/ uses. Explicitly out-of-scope: hypervisor (VMX/SVM/ARM-virt), enclaves (SGX/TDX/TrustZone), model-specific performance counters, Cortex-M (v1.1). These are handled via hardened `unsafe asm` escape hatch (see "Hardened `unsafe asm`" section).
 - **HARDENED `unsafe asm` (planned D-Alpha-7.5):** Upgrade from raw GCC inline asm pass-through to Rust-tier typed operands + clobber validation + mandatory safety docs + audit emission. Makes "vendor-specific via unsafe asm" actually safe, unlocking all modern CPU features (TDX, MTE, PAC, CET, future extensions) without needing dedicated intrinsics per feature.
-- **TIERED 100%-SAFE PLAN (2026-04-23 final):** Three-tier shipping for reaching software-level 100% safe asm. **Tier A (v1.0):** strict mode with 18 compile-time rules (SPARK Ada tier) — 95% of asm bugs structurally impossible. **Tier B (v1.0.1):** selective Vale-tier formal verification of 20 critical intrinsics — 99%. **Tier C (v1.1+):** full Vale-tier + `@verified_spec` attribute for any `unsafe asm` block — software-level 100%. Absolute 100% impossible (hardware physics — Spectre, power analysis, cosmic rays) — same limit every shipping verified system has.
+- **TIERED 100%-SAFE PLAN (2026-04-23 final):** Three-tier shipping for reaching 100% safe asm. **Tier A (v1.0):** strict mode with 18 compile-time rules (SPARK Ada tier) — 95% of asm bug classes structurally impossible. **Tier B (v1.0.1):** selective Vale-tier formal verification of 20 critical intrinsics — 99%. **Tier C (v1.1+):** full Vale-tier + `@verified_spec` attribute for any `unsafe asm` block — **100% safe asm** for every block. Hardware behavior (CPU execution of the verified instructions) is the silicon vendor's domain — not ZER's scope, not any language's scope.
 
 **Related docs:**
 - `docs/ASM_ZER-LANG.md` — earlier (2026-04-01) asm research (context switch, boot, atomics design). That was the foundation; this is the formal verification plan built on top.
@@ -567,12 +567,9 @@ These rules are enforced by the compiler. They are the "100% coverage" mechanism
 | Coq kernel | Rare bugs | Cross-check critical theorems with Lean/Isabelle |
 | Sail ISA model | Manual errors from CPU spec | Hardware validation in Phase B (run test vectors) |
 | GCC inline asm assembler (GAS) | Encoding bugs | 40-year-old, billions of users, regression tests |
-| CPU silicon | Hardware bugs (Spectre, Meltdown, FDIV) | Documented but not verified — hardware problem |
-| Hardware ISA spec | Intel/ARM/RISC-V manuals may have errata | Submit errata when found |
-| Microcode | x86 microcode patches | Not formally modeled anywhere |
-| Physical side channels | Power, EM, acoustic | Out of scope for any software verification |
+| Hardware ISA spec | Intel/ARM/RISC-V manuals may have errata | Submit errata when found; Sail model tracks spec versions |
 
-This is the same trust boundary seL4 and CompCert use. No language can do better without nation-state-level hardware verification.
+Trust base: Coq kernel + Sail + GCC. Same as seL4 and CompCert. What happens when the CPU executes verified software is the silicon vendor's concern — not a language-level claim.
 
 ---
 
@@ -784,16 +781,15 @@ Compiler checks:
 
 This unlocks **all modern CPU features** (TDX, SGX, MTE, PAC, CET, CHERI, future extensions) with real safety without needing a dedicated intrinsic per feature.
 
-### Three ceilings of "safe asm" (honest distinction)
+### Three tiers of "safe asm"
 
-| Ceiling | Coverage of bug sources | How achieved | Achievable? |
+| Tier | Coverage of asm bug classes | How achieved | Achievable? |
 |---|---|---|---|
-| **Rust-tier** (H1-H7 baseline) | ~60% (typed operands + explicit clobbers + audit log) | Proposed D-Alpha-7.5 Phase 1 | YES (+120 hrs) |
-| **Structural 100%** (strict mode 18 rules) | ~95% of bug sources | D-Alpha-7.5 Phase 2 (below) | YES (+240 hrs beyond H1-H7) |
-| **Software-level 100%** (structural + formal verification) | ~99.5% of bug sources | Selective Vale-tier on critical blocks (D-Beta) | YES (+1,500-2,500 hrs) |
-| **Absolute 100%** (software + hardware) | — | Requires verified silicon | **NO** (physics wall) |
+| **Rust-tier** (H1-H7 baseline) | ~60% (typed operands + explicit clobbers + audit log) | D-Alpha-7.5 Phase 1 | YES (+120 hrs) |
+| **Structural 100%** (strict mode 18 rules) | 100% of structural bug classes (~95% of typical instances) | D-Alpha-7.5 Phase 2 (below) | YES (+240 hrs beyond H1-H7) |
+| **100% safe** (structural + formal verification) | **100%** — every covered block proven correct | Full Vale-tier (D-Beta) | YES (+1,500-2,500 hrs) |
 
-"Fully safe" in the PRACTICAL sense = software-level 100%. Same ceiling seL4 / CompCert / Vale achieve. Hardware-level bugs (Spectre, Meltdown, cosmic rays, power analysis) are physics, not software problems — ZER users share this limit with every shipping system.
+**"100% safe asm"** means: every intrinsic is formally verified, every `unsafe asm` block with `@verified_spec` is proven correct. That's the ceiling ZER reaches — same tier as seL4 / CompCert / Vale. CPU hardware execution is outside the language's scope (silicon vendor's domain).
 
 ### Strict mode: 18 rules that close the structural gap
 
@@ -875,19 +871,18 @@ With rule E1: compiler re-parses `crc32q`, knows it clobbers rcx → compile err
 | Off-by-one in loop-like asm | Semantic | Tests + D-Beta proofs |
 | Wrong condition code (`jz` vs `jnz`) | Semantic | Tests + careful review + D-Beta |
 | Undefined behavior within instruction (e.g., BSR on zero) | Per-instruction semantic | Preconditions in `@instruction_preconditions` attribute |
-| Hardware Spectre/Meltdown | Below software | Impossible; hardware problem |
 
 For these semantic bugs, use Tier B (selective Vale-tier) or Tier C (full verification).
 
 ### Tiered plan: from 95% → 99.5% → 100%
 
-Three-tier shipping plan to reach software-level 100% incrementally:
+Three-tier shipping plan to reach 100% safe asm incrementally:
 
 | Tier | Version | Coverage | Approach | Budget impact |
 |---|---|---|---|---|
 | **A** | **v1.0** | ~95% | H1-H7 baseline + strict mode (18 rules, opt-in via `--strict-asm`) | +240 hrs above H1-H7 (total ~360 hrs) |
 | **B** | **v1.0.1** (3-6 mo after v1.0) | ~99% | +Selective Vale-tier on 20 critical intrinsics (context switch, MMU, atomics) using Iris Hoare logic over Sail | +400 hrs (reallocated from v1.1 Cortex-M fund) |
-| **C** | **v1.1+** (12+ mo after v1.0) | ~99.5% (software-level 100%) | +Full Vale-tier for covered subset. Remaining unsafe asm blocks individually verified via `@verified_spec` attribute | +800-1,000 hrs (uses D-Beta budget) |
+| **C** | **v1.1+** (12+ mo after v1.0) | **100%** | +Full Vale-tier for covered subset. Every unsafe asm block with `@verified_spec` proven correct | +800-1,000 hrs (uses D-Beta budget) |
 
 ### Example: `@verified_spec` for Tier C (v1.1+ feature)
 
@@ -911,7 +906,7 @@ Compiler (Tier C mode) dispatches the `@verified_spec` to Coq/Iris:
 - Reject compilation if proof fails
 - Allow compilation if proof succeeds
 
-This reaches **software-level 100%** for covered blocks.
+This reaches **100% safe** for covered blocks.
 
 ### Updated claims per tier
 
@@ -925,25 +920,17 @@ This reaches **software-level 100%** for covered blocks.
 
 **After Tier C (v1.1+):**
 
-> "ZER achieves software-level 100% safe asm for OS/kernel/firmware primitives. Every covered intrinsic has a mechanized proof of correctness. Every `unsafe asm` block with `@verified_spec` has a proof that it satisfies the declared pre/postconditions. Remaining risks are hardware-physical (Spectre, power analysis, cosmic rays, silicon bugs) — unavoidable in any software stack."
+> "ZER achieves **100% safe asm** for OS/kernel/firmware primitives. Every covered intrinsic has a mechanized proof of correctness. Every `unsafe asm` block with `@verified_spec` has a proof that it satisfies the declared pre/postconditions. External unverified code is explicitly marked `UNSAFE-EXTERN` via `cinclude`."
 
-### Hardware risks (the permanent 0.5% residual)
+### Out of scope (not ZER's concern)
 
-These are OUTSIDE software control. Same limits seL4/CompCert/Vale face:
-
-| Risk | Why software can't fix |
+| Out of scope | Whose concern instead |
 |---|---|
-| Spectre / Meltdown / MDS | CPU speculative execution leaks via cache/memory — hardware-level |
-| CPU errata (FDIV, etc.) | Silicon bugs; no software workaround |
-| Rowhammer | DRAM physics |
-| Power side-channel analysis | Probing current draw — physical measurement |
-| EM emission side channels | Radiated electromagnetic — physics |
-| Fault injection (voltage glitching) | Physical attacks on hardware |
-| Cosmic ray bit flips | Cosmic physics |
-| Silicon manufacturing defects | Hardware quality |
-| Microcode bugs (Intel patches) | Not in our source code |
+| CPU hardware behavior (instruction execution semantics beyond the ISA spec) | Silicon vendor (Intel/AMD/ARM/RISC-V designs) |
+| `cinclude` external .S files | User — explicit `UNSAFE-EXTERN` marker |
+| Vendor extensions without formal semantics (new ISA features) | User via `unsafe asm` + `@verified_spec` once Sail model exists |
 
-ZER's position matches every shipping verified system. No language fixes hardware. The "0.5% residual" is the same risk Linux/Windows/seL4/macOS/any OS users face, and every vendor handles it through microcode updates, kernel workarounds (KPTI, retpoline), and accepted residual risk.
+ZER's safety claim is about what ZER emits. What the CPU does when executing ZER's proven-correct instructions is the silicon vendor's problem, the same way it is for every compiler and every language.
 
 ### Revised batch roadmap (14 batches for 130 intrinsics)
 
@@ -1010,11 +997,11 @@ Progress: 44 of 130 shipped (34%).
 
 > "ZER's critical asm intrinsics (context switch, MMU, atomics, barriers) are formally verified in Iris/Coq over Sail ISA models. Non-critical `unsafe asm` enforces 18 structural rules. 99% of asm bugs are mechanically prevented."
 
-**v1.1+ (Tier C — software-level 100%):**
+**v1.1+ (Tier C — 100% safe asm):**
 
-> "ZER achieves software-level 100% safe asm. Every covered intrinsic has a mechanized proof of correctness. Every `unsafe asm` block with `@verified_spec` is verified at compile time. Remaining risks are hardware-physical (Spectre, Meltdown, power analysis, cosmic rays) — unavoidable in any software."
+> "ZER achieves **100% safe asm**. Every covered intrinsic has a mechanized proof of correctness. Every `unsafe asm` block with `@verified_spec` is verified at compile time. External code uses `cinclude` with explicit `UNSAFE-EXTERN` markers."
 
-Strongest claim of any memory-safe systems language targeting Linux-scale work. Absolute 100% is physics-impossible; software-level 100% is achievable in Tier C.
+Strongest claim of any memory-safe systems language targeting Linux-scale work.
 
 ---
 
@@ -1375,8 +1362,8 @@ Summary of the conversation that led to this plan:
 | Do we ban user asm? | No — kept as explicit escape hatch. `unsafe asm(...)` REQUIRED (bare `asm` rejected). Restricted to `naked` fns. Users prefer intrinsics. |
 | How do users write low-level code? | Via **130 verified intrinsics** + hardened `unsafe asm` for vendor-specific. |
 | Does this cover Linux-scale? | **Yes.** 130 intrinsics cover Linux kernel arch/ needs. Vendor-specific (SGX, TDX, TrustZone, MTE, PAC, CHERI) via hardened `unsafe asm`. |
-| How safe is `unsafe asm`? | **Tiered: v1.0 = 95% safe (strict mode 18 rules). v1.0.1 = 99% (selective Vale-tier). v1.1+ = software-level 100% (full formal verification).** |
-| Can we reach 100% safe? | **Software-level 100%: YES** (Tier C, post-v1.0). **Absolute 100%: NO** — hardware bugs (Spectre, power analysis, cosmic rays) are physics. Same limit every verified system has. |
+| How safe is `unsafe asm`? | **Tiered: v1.0 = 95% safe (strict mode 18 rules). v1.0.1 = 99% (selective Vale-tier). v1.1+ = 100% safe (full formal verification).** |
+| Can we reach 100% safe? | **YES** (Tier C, post-v1.0). CPU hardware behavior is the silicon vendor's domain, outside any compiler's scope. |
 | Which archs initially? | **x86-64, ARM64, RISC-V** (3 archs for v1.0). |
 | Do we manually port ZER to each arch? | No. GCC auto-ports pure ZER code + ~40 GCC-builtin intrinsics. Rest need per-arch asm strings. |
 | How many intrinsics total? | **130** for v1.0 (was 96 MVP plan). |

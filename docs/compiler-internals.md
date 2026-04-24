@@ -6893,12 +6893,12 @@ Per-new-arch cost with this architecture:
 | D-Alpha-10 | DONE | 10 inspection (read_sp/tp/flags, vendor_id, feature_bits, model_id, core_id, current_mode, cache_line_size, num_cores) | 54e2324 |
 | D-Alpha-11 | DONE | 5 power management (reset, deep_sleep, idle_hint, monitor_addr, mwait) | aa3d3fd |
 | D-Alpha-12 | DONE | 6 privileged transitions (syscall, sysret, iret, set_priv_stack, get_priv_level, hypercall) | 7de2c36 |
-| D-Alpha-13 | Pending | 20 Linux-scale x86 | — |
-| D-Alpha-14 | Pending | 10 misc | — |
+| D-Alpha-13 | DONE | 20 Linux-scale x86 (fsbase/gsbase, port I/O, xsave, debug regs, firmware, persistent memory, nt_store, pmc) | 25e52dd |
+| D-Alpha-14 | DONE | 12 final (cpuid, eoi, cr2, cache enable/disable, fxsave/fxrstor, fpu_init, umwait/umonitor, endbr) | 8bc0e9a |
 | D-Alpha-7.5 Phase 1 | Pending | Hardened unsafe asm (H1-H7) | — |
 | D-Alpha-7.5 Phase 2 | Pending | Strict mode implementation | — |
 
-**98 of 130 intrinsics shipped (75%).** Three-quarters shipped.
+**130 of 130 intrinsics shipped (100% — ALL 14 D-ALPHA BATCHES COMPLETE).**
 
 ### D-Alpha-8/9 patterns discovered
 
@@ -7018,3 +7018,69 @@ Instead of `(void)unused_var;` (not valid ZER), use a comparison that's always t
 if (unused == 0 || unused != 0) { return 0; }
 ```
 Ugly but works. Repeatedly used in D-Alpha-8/9/10/12 tests. If you see this pattern, it's just suppressing unused-var warnings.
+
+### D-Alpha-13/14 patterns (2026-04-24 end-of-day, 130/130 milestone)
+
+**BUG: x86 `and` / `or` with 32-bit imm + 64-bit reg sign-extension** (D-Alpha-14 cpu_cache_enable):
+
+Writing `andq $0xBFFFFFFF, %rax` fails to assemble with "operand type mismatch for `and`". x86-64 AND/OR with 64-bit register requires either:
+- 64-bit register source
+- Sign-extended 32-bit immediate (so 0xBFFFFFFF sign-extends to 0xFFFFFFFFBFFFFFFF)
+
+The sign-extension behavior is usually NOT what you want when clearing or setting a single bit in a wider register.
+
+**Fix: use BTR (bit test+reset) or BTS (bit test+set) for single-bit CR register modifications.** These take `imm8` bit position:
+```c
+/* CORRECT — clear CR0.CD (bit 30) */
+"btrq $30, %%0\n\t"    /* cleanly clears bit 30 regardless of register width */
+
+/* CORRECT — set CR0.CD */
+"btsq $30, %%0\n\t"
+
+/* WRONG — sign-extension issue */
+"andq $0xBFFFFFFF, %%0\n\t"   /* clears bits 32-63 too! */
+"orq  $0x40000000, %%0\n\t"   /* actually OK but BTS is clearer */
+```
+
+Applies to any CR / DR / system register bit manipulation. Remember this when touching emitter asm with immediate values.
+
+**Packed u64 return for multi-register results** (D-Alpha-14 cpu_cpuid pair):
+
+CPUID returns 4 registers (EAX/EBX/ECX/EDX) but our intrinsic return types are single values. Solution: provide TWO intrinsics, each returning a u64 with 2 registers packed:
+```c
+@cpu_cpuid(leaf, subleaf)      → (EBX << 32) | EAX
+@cpu_cpuid_ecx(leaf, subleaf)  → (EDX << 32) | ECX
+```
+
+User calls both for full 4-register result. Avoids returning structs (which ZER intrinsics can't do cleanly yet). Same pattern works for any multi-register instruction (RDTSC+TSC_AUX, XGETBV EDX:EAX pairs).
+
+**Runtime-switch dispatch for indexed register access** (D-Alpha-13 cpu_read_dr):
+
+Some x86 instructions encode the target register in the opcode (e.g., `movq %dr0, %rax` vs `movq %dr1, %rax`). Can't use runtime variable. Solution: switch in emitted C:
+```c
+switch (idx) {
+case 0: __asm__ __volatile__ ("movq %%dr0, %0" : "=r"(result)); break;
+case 1: __asm__ __volatile__ ("movq %%dr1, %0" : "=r"(result)); break;
+/* ... */
+case 7: __asm__ __volatile__ ("movq %%dr7, %0" : "=r"(result)); break;
+default: break;
+}
+```
+
+GCC compiles compile-time-constant idx to the single right instruction. Runtime idx gets the full switch. Same pattern works for ARM sysreg access if we ever do a generic `cpu_read_sysreg(u32 encoding)`.
+
+**Port I/O "Nd" constraint** (D-Alpha-13 port_in/out family):
+
+GCC's asm constraint `"Nd"` accepts constant 0-255 OR register DX. Used for x86 port number:
+```c
+__asm__ __volatile__ ("inb %1, %0" : "=a"(val) : "Nd"(port));
+```
+
+Compile-time port: encoded directly in instruction (`inb $0x60, %al`).
+Runtime port: placed in DX register automatically (`inb %dx, %al`).
+
+Pattern applies to any x86 instruction with imm8-or-DX operand (outb, inb, outw, inw, outl, inl).
+
+**Final intrinsic count: 130 across all 14 batches.**
+
+Per-batch shipping cost was consistently ~1-3 hours each for 4-20 intrinsics. Total checker.c additions: ~500 lines. Total emitter.c additions: ~2000 lines. All using the proven per-arch `#if defined` dispatch pattern established in D-Alpha-1.

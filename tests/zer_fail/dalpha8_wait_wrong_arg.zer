@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @wait_on_address first argument must be pointer
+
+i32 main() {
+    u32 scalar = 0;
+    @wait_on_address(scalar, 0);  // error: scalar, not pointer
+    return 0;
+}

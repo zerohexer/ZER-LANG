@@ -1,0 +1,53 @@
+// D-Alpha-8: nice-to-have multi-core primitives
+// 4 intrinsics: cpu_read_counter, cpu_get_pc, wait_on_address, cpu_flush_pipeline
+//
+// Uses dead-branch pattern for operations that may be privileged or architecture-
+// specific. Tests compile-time acceptance of correct signatures.
+
+volatile u32 never_true;
+
+u64 dead_branch_counter_test() {
+    u64 t = 0;
+    if (never_true == 42) {
+        // cpu_read_counter: reads cycle/time counter (u64). Non-privileged on x86 rdtsc.
+        // Dead-branch because behavior varies; just verify it compiles.
+        t = @cpu_read_counter();
+    }
+    return t;
+}
+
+u64 dead_branch_pc_test() {
+    u64 pc = 0;
+    if (never_true == 42) {
+        // cpu_get_pc: current RIP/PC for profiling.
+        pc = @cpu_get_pc();
+    }
+    return pc;
+}
+
+void dead_branch_wait_test() {
+    u32 flag = 0;
+    if (never_true == 42) {
+        // wait_on_address: spin with pause-hint until *addr != expected.
+        // Dead-branch because it would spin forever here.
+        @wait_on_address(&flag, 0);
+    }
+}
+
+void dead_branch_flush_pipeline_test() {
+    if (never_true == 42) {
+        // cpu_flush_pipeline: mfence+lfence / isb / fence.i
+        @cpu_flush_pipeline();
+    }
+}
+
+i32 main() {
+    u64 t = dead_branch_counter_test();
+    u64 pc = dead_branch_pc_test();
+    dead_branch_wait_test();
+    dead_branch_flush_pipeline_test();
+
+    // Sum values to prevent unused-var warnings; always 0 since dead branch never taken
+    if (t == 0 && pc == 0) { return 0; }
+    return 0;
+}

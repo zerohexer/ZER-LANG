@@ -5780,10 +5780,36 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if ((nlen == 9 && memcmp(name, "cpu_pause", 9) == 0) ||
                    (nlen == 7 && memcmp(name, "cpu_wfe", 7) == 0) ||
                    (nlen == 7 && memcmp(name, "cpu_sev", 7) == 0) ||
-                   (nlen == 14 && memcmp(name, "cpu_breakpoint", 14) == 0)) {
-            /* D-Alpha-7: 0-arg, void-return intrinsics for spin-wait + debug */
+                   (nlen == 14 && memcmp(name, "cpu_breakpoint", 14) == 0) ||
+                   (nlen == 18 && memcmp(name, "cpu_flush_pipeline", 18) == 0)) {
+            /* D-Alpha-7/8: 0-arg, void-return intrinsics for spin-wait + debug + pipeline */
             if (node->intrinsic.arg_count != 0) {
                 checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if ((nlen == 16 && memcmp(name, "cpu_read_counter", 16) == 0) ||
+                   (nlen == 10 && memcmp(name, "cpu_get_pc", 10) == 0)) {
+            /* D-Alpha-8: 0-arg intrinsics returning u64 (counter or instruction pointer) */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_u64;
+        } else if (nlen == 15 && memcmp(name, "wait_on_address", 15) == 0) {
+            /* D-Alpha-8: @wait_on_address(*u32 addr, u32 expected) — efficient polling */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@wait_on_address requires 2 arguments (addr, expected)");
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if (vt1) {
+                    Type *eff = type_unwrap_distinct(vt1);
+                    if (eff->kind != TYPE_POINTER) {
+                        checker_error(c, node->loc.line, "@wait_on_address first argument must be a pointer");
+                    }
+                }
+                if (vt2 && !type_is_integer(vt2)) {
+                    checker_error(c, node->loc.line, "@wait_on_address second argument must be integer");
+                }
             }
             result = ty_void;
         } else if (nlen == 6 && memcmp(name, "cpu_id", 6) == 0) {

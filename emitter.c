@@ -5880,6 +5880,183 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         } else if (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) {
             /* D-Alpha-2: acquire + release fence */
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQ_REL)");
+        } else if (nlen == 13 && memcmp(name, "tlb_flush_all", 13) == 0) {
+            /* D-Alpha-6: flush all TLB entries. Privileged. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    { uint64_t _zer_cr3; __asm__ __volatile__ (\"mov %%%%cr3, %%0; mov %%0, %%%%cr3\" : \"=r\"(_zer_cr3) :: \"memory\"); }\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"tlbi vmalle1\\n\\tdsb ish\\n\\tisb\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"sfence.vma x0, x0\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 16 && memcmp(name, "tlb_flush_global", 16) == 0) {
+            /* D-Alpha-6: flush global (non-ASID) TLB entries. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    { uint64_t _zer_cr4; __asm__ __volatile__ (\n"
+                "        \"mov %%%%cr4, %%0\\n\\t\"\n"
+                "        \"btr $7, %%0\\n\\tmov %%0, %%%%cr4\\n\\t\"\n"
+                "        \"bts $7, %%0\\n\\tmov %%0, %%%%cr4\"\n"
+                "        : \"=r\"(_zer_cr4) :: \"memory\"); }\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"tlbi vmalle1is\\n\\tdsb ish\\n\\tisb\" ::: \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"sfence.vma x0, x0\" ::: \"memory\");\n"
+                "#else\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "tlb_flush_asid", 14) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-6: flush TLB entries matching ASID. */
+            emit(e, "({ uint64_t _zer_asid = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    { uint64_t _zer_cr3; __asm__ __volatile__ (\"mov %%%%cr3, %%0; mov %%0, %%%%cr3\" : \"=r\"(_zer_cr3) :: \"memory\"); (void)_zer_asid; }\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"tlbi aside1, %%0\\n\\tdsb ish\\n\\tisb\" : : \"r\"(_zer_asid << 48) : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"sfence.vma x0, %%0\" : : \"r\"(_zer_asid) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_asid; __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 14 && memcmp(name, "tlb_flush_addr", 14) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-6: flush single-page TLB entry for given virtual address. */
+            emit(e, "({ uint64_t _zer_va = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"invlpg (%%0)\" : : \"r\"(_zer_va) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"tlbi vaae1, %%0\\n\\tdsb ish\\n\\tisb\" : : \"r\"(_zer_va >> 12) : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"sfence.vma %%0, x0\" : : \"r\"(_zer_va) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_va; __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 15 && memcmp(name, "tlb_flush_range", 15) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-6: flush TLB entries over [start, end) — loops page-by-page. */
+            emit(e, "({ uint64_t _zer_start = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_end = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "    for (uint64_t _zer_p = _zer_start & ~0xFFFULL; _zer_p < _zer_end; _zer_p += 0x1000ULL) {\n"
+                "#if defined(__x86_64__)\n"
+                "        __asm__ __volatile__ (\"invlpg (%%0)\" : : \"r\"(_zer_p) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "        __asm__ __volatile__ (\"tlbi vaae1, %%0\" : : \"r\"(_zer_p >> 12) : \"memory\");\n"
+                "#elif defined(__riscv)\n"
+                "        __asm__ __volatile__ (\"sfence.vma %%0, x0\" : : \"r\"(_zer_p) : \"memory\");\n"
+                "#endif\n"
+                "    }\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dsb ish\\n\\tisb\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if ((nlen == 17 && memcmp(name, "cache_flush_range", 17) == 0) &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-6: write-back + invalidate data cache range. */
+            emit(e, "({ const uint8_t *_zer_ca = (const uint8_t*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uintptr_t _zer_cl = (uintptr_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "    for (uintptr_t _zer_i = 0; _zer_i < _zer_cl; _zer_i += 64) {\n"
+                "#if defined(__x86_64__)\n"
+                "        __asm__ __volatile__ (\"clflush (%%0)\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "        __asm__ __volatile__ (\"dc civac, %%0\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
+                "#endif\n"
+                "    }\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if ((nlen == 17 && memcmp(name, "cache_clean_range", 17) == 0) &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-6: write-back without invalidate. */
+            emit(e, "({ const uint8_t *_zer_ca = (const uint8_t*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uintptr_t _zer_cl = (uintptr_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "    for (uintptr_t _zer_i = 0; _zer_i < _zer_cl; _zer_i += 64) {\n"
+                "#if defined(__x86_64__)\n"
+                "        __asm__ __volatile__ (\"clwb (%%0)\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "        __asm__ __volatile__ (\"dc cvac, %%0\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
+                "#endif\n"
+                "    }\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if ((nlen == 22 && memcmp(name, "cache_invalidate_range", 22) == 0) &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-6: invalidate data cache range (ARM: dc ivac; x86 uses clflush since no pure invalidate). */
+            emit(e, "({ const uint8_t *_zer_ca = (const uint8_t*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uintptr_t _zer_cl = (uintptr_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "    for (uintptr_t _zer_i = 0; _zer_i < _zer_cl; _zer_i += 64) {\n"
+                "#if defined(__x86_64__)\n"
+                "        __asm__ __volatile__ (\"clflush (%%0)\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "        __asm__ __volatile__ (\"dc ivac, %%0\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
+                "#endif\n"
+                "    }\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if ((nlen == 23 && memcmp(name, "cache_invalidate_icache", 23) == 0) &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-6: instruction cache invalidate — uses portable GCC builtin. */
+            emit(e, "({ char *_zer_ib = (char*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uintptr_t _zer_il = (uintptr_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "    __builtin___clear_cache(_zer_ib, _zer_ib + _zer_il);\n"
+                "})");
+        } else if ((nlen == 16 && memcmp(name, "cache_flush_line", 16) == 0) &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-6: single cache line write-back + invalidate. */
+            emit(e, "({ const void *_zer_cp = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"clflush (%%0)\" : : \"r\"(_zer_cp) : \"memory\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dc civac, %%0\\n\\tdsb ish\" : : \"r\"(_zer_cp) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_cp; __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#endif\n"
+                "})");
+        } else if ((nlen == 15 && memcmp(name, "cache_zero_line", 15) == 0) &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-6: zero a cache line without read-modify-write. Big perf win for memset. */
+            emit(e, "({ void *_zer_zp = (void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"dc zva, %%0\" : : \"r\"(_zer_zp) : \"memory\");\n"
+                "#else\n"
+                "    /* Fallback: plain memset for one cache line (assume 64 bytes) */\n"
+                "    for (int _zer_zi = 0; _zer_zi < 64; _zer_zi++) { ((uint8_t*)_zer_zp)[_zer_zi] = 0; }\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0) {
             /* D-Alpha-7: DMA-coherence barrier — stronger than release fence.
              * Required for correct DMA on weakly-ordered archs (ARM, RISC-V). */

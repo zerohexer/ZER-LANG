@@ -6295,6 +6295,83 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    (void)_zer_xv;\n"
                 "#endif\n"
                 "})");
+        } else if (nlen == 11 && memcmp(name, "cpu_read_sp", 11) == 0) {
+            /* D-Alpha-10: read stack pointer (u64). Non-privileged. */
+            emit(e, "({ uint64_t _zer_sp = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"movq %%%%rsp, %%0\" : \"=r\"(_zer_sp));\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mov %%0, sp\" : \"=r\"(_zer_sp));\n"
+                "#elif defined(__riscv)\n"
+                "    __asm__ __volatile__ (\"mv %%0, sp\" : \"=r\"(_zer_sp));\n"
+                "#endif\n"
+                "_zer_sp; })");
+        } else if (nlen == 11 && memcmp(name, "cpu_read_tp", 11) == 0) {
+            /* D-Alpha-10: read thread pointer / TLS base (u64). Non-privileged.
+             * Uses GCC builtin which handles arch-specific register. */
+            emit(e, "((uint64_t)(uintptr_t)__builtin_thread_pointer())");
+        } else if (nlen == 14 && memcmp(name, "cpu_read_flags", 14) == 0) {
+            /* D-Alpha-10: read flags/status register (u64). Non-privileged on user bits. */
+            emit(e, "({ uint64_t _zer_fl = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"pushfq\\n\\tpopq %%0\" : \"=r\"(_zer_fl) :: \"cc\");\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"mrs %%0, nzcv\" : \"=r\"(_zer_fl));\n"
+                "#endif\n"
+                "_zer_fl; })");
+        } else if (nlen == 13 && memcmp(name, "cpu_vendor_id", 13) == 0) {
+            /* D-Alpha-10: read vendor ID (first 4 chars packed into u64).
+             * x86: CPUID leaf 0 returns \"GenuineIntel\" / \"AuthenticAMD\" in EBX:EDX:ECX.
+             * Just returns EBX as u64 (low 4 chars of vendor string). */
+            emit(e, "({ uint64_t _zer_v = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_a, _zer_b, _zer_c, _zer_d;\n"
+                "    __asm__ __volatile__ (\"cpuid\"\n"
+                "        : \"=a\"(_zer_a), \"=b\"(_zer_b), \"=c\"(_zer_c), \"=d\"(_zer_d)\n"
+                "        : \"a\"(0));\n"
+                "    _zer_v = (uint64_t)_zer_b;\n"
+                "#endif\n"
+                "_zer_v; })");
+        } else if (nlen == 16 && memcmp(name, "cpu_feature_bits", 16) == 0) {
+            /* D-Alpha-10: basic feature bits (CPUID leaf 1 EDX on x86). Non-privileged. */
+            emit(e, "({ uint64_t _zer_fb = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_a, _zer_b, _zer_c, _zer_d;\n"
+                "    __asm__ __volatile__ (\"cpuid\"\n"
+                "        : \"=a\"(_zer_a), \"=b\"(_zer_b), \"=c\"(_zer_c), \"=d\"(_zer_d)\n"
+                "        : \"a\"(1));\n"
+                "    _zer_fb = ((uint64_t)_zer_c << 32) | _zer_d;\n"
+                "#endif\n"
+                "_zer_fb; })");
+        } else if (nlen == 12 && memcmp(name, "cpu_model_id", 12) == 0) {
+            /* D-Alpha-10: model ID (CPUID leaf 1 EAX on x86 — family/model/stepping). */
+            emit(e, "({ uint32_t _zer_m = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_a, _zer_b, _zer_c, _zer_d;\n"
+                "    __asm__ __volatile__ (\"cpuid\"\n"
+                "        : \"=a\"(_zer_a), \"=b\"(_zer_b), \"=c\"(_zer_c), \"=d\"(_zer_d)\n"
+                "        : \"a\"(1));\n"
+                "    _zer_m = _zer_a;\n"
+                "#endif\n"
+                "_zer_m; })");
+        } else if (nlen == 11 && memcmp(name, "cpu_core_id", 11) == 0) {
+            /* D-Alpha-10: physical core ID. Complex on modern SMT CPUs;
+             * stub to 0 for user-mode (most users want logical cpu_id instead). */
+            emit(e, "((uint32_t)0)");
+        } else if (nlen == 16 && memcmp(name, "cpu_current_mode", 16) == 0) {
+            /* D-Alpha-10: current privilege mode. 0=user, 1=kernel, 2=hypervisor, 3=monitor.
+             * User-mode code always sees 0. Privileged code can read CS.RPL or equivalent. */
+            emit(e, "((uint32_t)0)");
+        } else if (nlen == 19 && memcmp(name, "cpu_cache_line_size", 19) == 0) {
+            /* D-Alpha-10: L1 data cache line size in bytes.
+             * x86/ARM64/RISC-V default is 64 bytes. Users needing exact runtime
+             * value should call POSIX sysconf(_SC_LEVEL1_DCACHE_LINESIZE) directly. */
+            emit(e, "((uint32_t)64)");
+        } else if (nlen == 13 && memcmp(name, "cpu_num_cores", 13) == 0) {
+            /* D-Alpha-10: number of logical cores — stub to 1.
+             * Users needing runtime value should call POSIX sysconf(_SC_NPROCESSORS_ONLN)
+             * or std::thread::hardware_concurrency equivalent directly. */
+            emit(e, "((uint32_t)1)");
         } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
             /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
              * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */

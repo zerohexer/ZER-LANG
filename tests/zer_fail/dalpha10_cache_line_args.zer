@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_cache_line_size takes no arguments
+
+i32 main() {
+    u32 cls = @cpu_cache_line_size(64);  // error: takes no args
+    if (cls == 0 || cls != 0) { return 0; }
+    return 0;
+}

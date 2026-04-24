@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// @cpu_read_sp takes no arguments
+
+i32 main() {
+    u64 sp = @cpu_read_sp(42);  // error: takes no args
+    if (sp == 0 || sp != 0) { return 0; }
+    return 0;
+}

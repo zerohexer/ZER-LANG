@@ -1,0 +1,57 @@
+// EXPECTED: compile error (C8c — requires specific prior barrier)
+//
+// Category C8c (Ordering, instruction-cache sync) — ARM64 self-modifying code
+// without ISB.
+//
+// Source: ARM ARM —
+// After stores to executable memory, need:
+//   1. DSB ISH (data sync) to ensure stores visible
+//   2. IC IVAU (invalidate I-cache lines)
+//   3. DSB ISH (wait for I-cache invalidation)
+//   4. ISB (Instruction Synchronization Barrier — pipeline flush)
+// BEFORE executing the modified code.
+//
+// Without the ISB, the pipeline may have prefetched OLD instructions.
+// Result: old instructions execute, not new — silent data corruption.
+//
+// System #30 must track:
+//   1. Store to address A (pending: requires I-cache flush + ISB)
+//   2. Jump/call/branch to A without ISB → ERROR
+//
+// Research citation: docs/asm_preconditions_research.md Category C8 session 6
+
+void unsafe_selfmod_without_isb(*u32 code_slot, u32 new_instr) {
+    // Write new instruction to executable memory
+    *code_slot = new_instr;
+
+    // DSB + IC IVAU to push data to instruction cache
+    unsafe asm {
+        instructions: "dsb ish\n\t"
+                      "ic ivau, %0\n\t"
+                      "dsb ish"
+        inputs:  { "r" = code_slot }
+        clobbers: ["memory"]
+        safety: "Data sync + I-cache invalidate"
+    }
+
+    // BUG: missing ISB here!
+    // System #30 should track: pending_requirement = BARRIER_INSTRUCTION_SYNC
+    // not yet discharged.
+
+    // Execute the modified code (via branch to it).
+    // This reaches ISB-pending code without encountering ISB.
+    //
+    // System #30 check must ERROR:
+    //   "Self-modifying code execution at line N requires ISB after
+    //    IC IVAU (C8c). Add 'isb' before branching to modified code."
+    unsafe asm {
+        instructions: "blr %0"    // branch and link — execute the modified code!
+        inputs:  { "r" = code_slot }
+        clobbers: ["memory", "lr"]
+        safety: "Jump to self-modified code — UB without prior ISB"
+    }
+}
+
+i32 main() {
+    return 0;
+}

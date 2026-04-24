@@ -1707,6 +1707,328 @@ Tests written this session:
 
 ---
 
+## Category C8 — VERIFIED RESEARCH SESSION 6 (2026-04-24)
+
+**Status: Phase 1 survey COMPLETE for C8 across all 3 archs. ✓ + System #30 design spec included.**
+
+**THIS IS THE LARGEST CATEGORY** — memory ordering is fundamentally relational (happens-before between operations), not per-entity state. Requires the only NEW safety system in the plan: **System #30 (Atomic Ordering)**. Estimated implementation: ~80 hrs. **This session produces DESIGN only — no code touched.**
+
+### Methodology
+
+Option 1+2: WebFetch for x86 (MFENCE, CLWB) + WebSearch for ARM64 barrier hierarchy (DMB/DSB/ISB + shareability scopes) + RISC-V FENCE format.
+
+### Summary finding: All 3 archs have rich memory ordering primitives, but VERY different models
+
+| Arch | Ordering model | Primary primitives |
+|---|---|---|
+| **x86-64** | Total Store Order (TSO) base + explicit fences | MFENCE / SFENCE / LFENCE / LOCK prefix / CLWB-ordering |
+| **ARM64** | Weakly ordered + explicit barriers | DMB (options: SY/ISH/OSH × LD/ST/SY) / DSB / ISB / Acquire/Release semantics on atomics |
+| **RISC-V** | Weakly ordered (RVWMO) + explicit fences | FENCE with explicit predecessor + successor sets (r/w/i/o) |
+
+Key insight: C8 cannot be captured by simple per-instruction data entries like C1-C7. Ordering involves RELATIONSHIPS between multiple operations, which demands graph-level tracking.
+
+### C8 subcategories (final)
+
+| Subcat | Meaning | Examples |
+|---|---|---|
+| C8a | Instruction requires PRIOR barrier for correct ordering | x86 CLWB requires SFENCE before younger write for guaranteed ordering; x86 CLFLUSHOPT similar |
+| C8b | Instruction IS a barrier (establishes ordering) | MFENCE / SFENCE / LFENCE / DMB / DSB / ISB / FENCE / FENCE.I |
+| C8c | Instruction requires specific-kind barrier before execution | FENCE.I before executing self-modified code (instruction-cache coherence) |
+| C8d | Atomic operation with declared ordering (acquire/release/seq_cst) | @atomic_load(ptr, .acquire); @atomic_store(ptr, v, .release); LDAXR/STLXR (ARM64); amoadd.w.aq.rl (RISC-V) |
+
+### x86-64 C8 Instructions
+
+**Verified via WebFetch to felixcloutier.com.**
+
+| # | Instruction | Subcat | Ordering effect | Preconditions | Source |
+|---|---|---|---|---|---|
+| 1 | `MFENCE` | C8b establishes | All prior loads/stores globally visible before subsequent ones | SSE2 feature (C4b overlap) | Intel SDM MFENCE |
+| 2 | `SFENCE` | C8b establishes | All prior stores visible before subsequent stores (NOT loads) | SSE (C4a) | Intel SDM SFENCE |
+| 3 | `LFENCE` | C8b establishes | All prior loads complete before subsequent loads (serializing on modern CPUs) | SSE2 (C4b) | Intel SDM LFENCE |
+| 4 | `LOCK` prefix (on CMPXCHG, XADD, etc.) | C8b establishes + atomic | RMW atomic + full barrier | Aligned address for atomicity | Intel SDM LOCK prefix |
+| 5 | `CLFLUSH` | C8a requires | Ordered by MFENCE (needs MFENCE before to synchronize with prior stores) | None for CLFLUSH itself | Intel SDM CLFLUSH |
+| 6 | `CLFLUSHOPT` | C8a requires | NOT ordered with prior writes automatically; needs SFENCE before for write-back semantics | CLFLUSHOPT feature | Intel SDM CLFLUSHOPT |
+| 7 | `CLWB` | C8a requires | NOT ordered with other CLWBs or younger writes; needs SFENCE | CLWB feature | Intel SDM CLWB |
+
+**Key quotes:**
+
+**MFENCE:**
+> "Serializes load and store operations... all preceding loads and stores must complete and be globally visible before any subsequent loads or stores can proceed."
+
+**CLWB (C8a):**
+> "CLWB is NOT ordered with respect to other CLWB executions, CLFLUSH/CLFLUSHOPT executions, or younger writes to the same cache line."
+> "Software can use the SFENCE instruction to order an execution of CLWB relative to one of those operations."
+
+This is CRITICAL for persistent-memory (NVDIMM/Optane) code — naive use of CLWB without SFENCE gives no ordering guarantee.
+
+### ARM64 C8 Instructions
+
+**DMB (Data Memory Barrier)** — 15 variants based on scope × type:
+
+| Scope | Type | Mnemonic | Meaning |
+|---|---|---|---|
+| SY (System / full system) | Full | `DMB SY` | All memory access types, full system-visible ordering |
+| ISH (Inner Shareable) | Full | `DMB ISH` | Inner-shareable domain ordering |
+| OSH (Outer Shareable) | Full | `DMB OSH` | Outer-shareable domain ordering |
+| NSH (Non-shareable) | Full | `DMB NSH` | Non-shareable domain |
+| SY | LD (Load) | `DMB LD` / `DMB SYLD` | Load-Load and Load-Store ordering |
+| SY | ST (Store) | `DMB SYST` | Store-Store ordering |
+| ISH | LD | `DMB ISHLD` | Inner-shareable Load ordering |
+| ISH | ST | `DMB ISHST` | Inner-shareable Store ordering |
+
+**DSB (Data Synchronization Barrier):** Stronger than DMB — waits for outstanding writes to complete. Used before MMU/TLB changes, context switches.
+
+**ISB (Instruction Synchronization Barrier):** Pipeline flush. Required after enabling new features or changing system registers that affect subsequent fetches.
+
+**Acquire/Release atomic instructions:**
+
+| Instruction | Subcat | Semantics |
+|---|---|---|
+| `LDAR` / `LDAXR` | C8d acquire | Load with acquire ordering — subsequent memops cannot reorder before |
+| `STLR` / `STLXR` | C8d release | Store with release ordering — prior memops cannot reorder after |
+| `LDAXP` / `STLXP` | C8d + C3 | Exclusive pair with acquire/release |
+
+**Key quote:**
+> "DMB ensures that all explicit memory accesses before the DMB instruction complete before any explicit memory accesses after the DMB instruction start."
+> "DSB is a data memory barrier, but with the additional behavior of stalling until all outstanding writes have completed."
+> "ISB flushes the pipeline in the processor, so that all instructions following the ISB are fetched from cache or memory, after the ISB has been completed."
+
+### RISC-V C8 Instructions
+
+**Verified via RISC-V ISA Manual Vol I and the memory model tutorial.**
+
+RISC-V FENCE is the most fine-grained of the 3 archs:
+
+```
+FENCE pred, succ
+
+where pred = [i][o][r][w] and succ = [i][o][r][w]
+  i = device input (MMIO read)
+  o = device output (MMIO write)
+  r = memory read
+  w = memory write
+```
+
+| Common fence patterns | Meaning |
+|---|---|
+| `FENCE rw, rw` | Full memory fence (most common) |
+| `FENCE w, w` | Store-store |
+| `FENCE r, r` | Load-load |
+| `FENCE iorw, iorw` | Full I/O + memory fence |
+| `FENCE rw, w` | All prior memops before subsequent stores |
+
+**Additional RISC-V C8 instructions:**
+
+| Instruction | Subcat | Semantics |
+|---|---|---|
+| `FENCE.I` | C8c requires-prior | Synchronize instruction cache with prior stores (self-modifying code correctness) |
+| `FENCE.TSO` | C8b establishes | TSO-semantics fence (stronger than default weak model) |
+| AMO instructions with `.aq` `.rl` suffixes | C8d acquire/release | e.g., `amoadd.w.aq.rl` — acquire + release on atomic add |
+| LR.W.AQ, SC.W.RL | C8d + C2 + C3 | Load-reserved with acquire, store-conditional with release |
+
+**Key quote from RISC-V manual:**
+> "No other RISC-V hart or external device can observe any operation in the successor set following a FENCE before any operation in the predecessor set preceding the FENCE."
+
+### NEW ZER Safety System #30 — Atomic Ordering
+
+This is the design spec for the new tracking system. **DESIGN ONLY — no code changes in this session.**
+
+#### What System #30 tracks
+
+For every MEMORY OPERATION in the program (load, store, atomic, fence, asm-with-memory-clobber), track its ORDERING CONTEXT: what happens-before relationships are established at this program point.
+
+**Conceptual model:** each memory operation is a NODE. Barriers/fences create EDGES in a partial order graph (happens-before DAG). Ordering-sensitive operations can declare required edges; checker proves edges exist.
+
+#### State representation
+
+At each program point, System #30 maintains:
+
+```
+OrderingState {
+    // The set of ordering levels established up to this point
+    barriers_encountered: Set<BarrierKind>
+
+    // Pending ordering-sensitive operations whose requirements
+    // haven't yet been satisfied by a suitable barrier
+    pending_requirements: Set<(MemOpID, RequiredBarrierKind)>
+}
+
+BarrierKind {
+    FullMemory,           // MFENCE, DMB SY, FENCE rw,rw
+    StoreStore,           // SFENCE, DMB ST, FENCE w,w
+    LoadLoad,             // LFENCE, DMB LD, FENCE r,r
+    LoadStore,            // DMB LD variants, FENCE r,w
+    StoreLoad,            // MFENCE essentially
+    Release,              // Paired with acquire — one-way
+    Acquire,              // Paired with release
+    AcquireRelease,       // Strong combined
+    InstructionSync,      // ISB, FENCE.I
+    IoMemory,             // FENCE iorw,iorw (RISC-V specific)
+    DMASync,              // barrier_dma intrinsic
+}
+```
+
+#### Tracking events
+
+| IR instruction | Effect on OrderingState |
+|---|---|
+| `IR_BARRIER(kind)` | Add `kind` to `barriers_encountered`; discharge any pending requirements it satisfies |
+| `IR_ATOMIC_LOAD(ptr, .acquire)` | Acquire barrier established at this point |
+| `IR_ATOMIC_STORE(ptr, v, .release)` | Release barrier established |
+| `IR_ATOMIC_*(.seq_cst)` | FullMemory barrier established |
+| `IR_ASM(clobbers={memory})` | FullMemory barrier (pessimistic — asm could do anything) |
+| `IR_LOAD` / `IR_STORE` (no ordering) | No state change, but op is "pending" if a later instruction requires its ordering |
+| **CFG merge** (join node) | `OrderingState = intersect(pred_states)` (most conservative) |
+
+#### Checking events
+
+| IR instruction with precondition | Check |
+|---|---|
+| `IR_CLWB(addr)` (x86) | No hard check; WARN if no SFENCE has been seen since last write to this cache line |
+| `IR_CLFLUSHOPT(addr)` (x86) | Same |
+| `IR_FENCE_I` (RISC-V) | Check: all prior stores happen-before this instruction-sync fence (for self-mod code) |
+| `IR_ATOMIC_LOAD(ptr, .acquire)` | Downstream memops cannot move up across this; enforced by emitter |
+| User `@verified_spec` declaring `requires: happens_before(store_x, load_y)` | Check: edge exists in graph |
+
+#### Relationship to existing Model 1 state machines
+
+System #30 is similar to Model 1 (state machines) in that it tracks CFG-propagated state. **KEY DIFFERENCE**: Model 1 tracks state of ONE entity at a time (Handle A is ALIVE; Handle B is FREED). System #30 tracks state of THE WHOLE PROGRAM POINT (what barriers have run).
+
+Implementation-wise: extends `zercheck_ir.c` with a new CFG traversal pass. State = `OrderingState` (not per-entity). Joins use set-intersection (most-conservative).
+
+#### Scope: language-safe vs full-consistency proof
+
+ZER's System #30 proves language-level ordering facts: "each acquire has a matching release somewhere," "CLWB got a subsequent SFENCE before next write to that cache line."
+
+It does NOT prove full memory-model consistency (that's CompCert-level work). Specifically:
+
+| In scope (System #30 catches) | Out of scope |
+|---|---|
+| Missing fence between dependent memops | Prove consistency across all hart interleavings |
+| Acquire/release mismatch | Prove no data races under all possible orderings |
+| CLWB without SFENCE before younger write | Prove persistence atomicity on power failure |
+| `memory` clobber treated as full fence | Prove weak memory model's allowed reorderings |
+
+Full memory model verification would require Iris/RelaxedMem frameworks — Tier C `@verified_spec` territory.
+
+#### Implementation sketch (pseudocode, ~80 hrs estimate)
+
+```c
+/* zercheck_ir.c — extension for System #30 */
+
+typedef struct {
+    uint32_t barriers_seen;   /* bitmap of BarrierKind */
+    PendingReqList *pending;  /* ops needing future barrier */
+} OrderingState;
+
+static void zc_ir_track_ordering(OrderingState *st, IRInst *inst) {
+    switch (inst->op) {
+    case IR_BARRIER:
+        st->barriers_seen |= barrier_bitmap(inst->barrier_kind);
+        discharge_pending(st, inst->barrier_kind);
+        break;
+
+    case IR_ATOMIC_LOAD:
+        if (inst->ordering == ORD_ACQUIRE || inst->ordering == ORD_SEQ_CST)
+            st->barriers_seen |= BARRIER_ACQUIRE;
+        break;
+
+    case IR_ATOMIC_STORE:
+        if (inst->ordering == ORD_RELEASE || inst->ordering == ORD_SEQ_CST)
+            st->barriers_seen |= BARRIER_RELEASE;
+        break;
+
+    case IR_ASM:
+        if (has_memory_clobber(inst))
+            st->barriers_seen |= BARRIER_FULL_MEMORY;
+        /* Check C8a: CLWB-without-SFENCE pattern */
+        if (contains_clwb(inst) && !(st->barriers_seen & BARRIER_STORE_STORE))
+            add_pending(st, inst, BARRIER_STORE_STORE);
+        break;
+
+    /* ... */
+    }
+}
+
+static OrderingState zc_ir_join_states(OrderingState *a, OrderingState *b) {
+    OrderingState result;
+    result.barriers_seen = a->barriers_seen & b->barriers_seen;  /* intersect */
+    result.pending = merge_pending(a->pending, b->pending);
+    return result;
+}
+```
+
+This is ~400-600 lines of CFG-traversal logic in `zercheck_ir.c`. Matches existing Handle state tracking patterns.
+
+#### Level 3 VST extraction (Phase 3, post-v1.0)
+
+Extract pure predicate:
+
+```c
+/* src/safety/ordering_rules.c */
+
+/* Does barrier of `prior_kind` satisfy required `needed_kind`? */
+int zer_barrier_satisfies(int prior_kind, int needed_kind) {
+    if (prior_kind == BARRIER_FULL_MEMORY) return 1;  /* satisfies anything */
+    if (needed_kind == BARRIER_ACQUIRE
+        && (prior_kind == BARRIER_ACQUIRE || prior_kind == BARRIER_ACQUIRE_RELEASE))
+        return 1;
+    /* ... */
+    return 0;
+}
+```
+
+Plus VST proof in `proofs/vst/verif_ordering_rules.v`.
+
+### C8 Mapping Summary
+
+**Maps to NEW System #30 (Atomic Ordering).** Only truly new safety system added by Option C.
+
+| Subcat | What System #30 does |
+|---|---|
+| C8a (requires prior barrier) | WARN/REJECT if check_pending fails at op site |
+| C8b (establishes barrier) | Update OrderingState.barriers_seen |
+| C8c (requires specific prior) | Same as C8a but with specific BarrierKind |
+| C8d (acquire/release atomic) | Update barriers_seen with acquire-or-release flag |
+
+**Total C8 implementation effort: ~80 hrs** (includes new System #30 + CFG tracking + data file wiring + per-arch barrier dispatch).
+
+### POC specifications (see `research/asm_generics/C8_memory_ordering/`)
+
+- `research/asm_generics/C8_memory_ordering/reject/x86_clwb_no_sfence.zer` — CLWB without subsequent SFENCE before next write → warning
+- `research/asm_generics/C8_memory_ordering/reject/riscv_insufficient_fence.zer` — `fence r,r` where `fence rw,rw` is needed → error
+- `research/asm_generics/C8_memory_ordering/reject/arm64_selfmod_no_isb.zer` — self-modifying code without ISB → error
+- `research/asm_generics/C8_memory_ordering/accept/x86_mfence_ordered_access.zer` — MFENCE properly between dependent ops → compiles
+- `research/asm_generics/C8_memory_ordering/accept/riscv_fence_full_memory.zer` — `fence rw,rw` used correctly → compiles
+
+### Open questions / follow-ups for C8
+
+1. **Cross-thread ordering:** happens-before across threads requires additional hart-ID tracking. Current design tracks SINGLE-HART ordering. Thread-to-thread ordering proofs deferred to Tier C `@verified_spec` with explicit hart predicates.
+
+2. **Persistent memory (NVDIMM):** CLWB+SFENCE is the persistence pattern. ZER's System #30 can warn if pattern is broken, but can't PROVE data lands in NVDIMM on power loss. That's hardware/firmware territory.
+
+3. **`memory` clobber as full fence — pessimistic:** Treating every `unsafe asm` with memory-clobber as full fence is correct but conservative. Advanced users may want finer-grained declarations (e.g., `@asm_memory_clobber(LoadStore)`). Future extension.
+
+4. **Acquire-without-release: valid pattern or bug?** C++/Rust allow `.acquire` load without `.release` store pairing in some patterns (e.g., reading from initialized data). Checker should warn rather than error.
+
+5. **Integration with Thread Safety (shared struct):** ZER's `shared struct` already provides lock-based ordering. System #30 naturally complements — detects bypass via raw unsafe asm + atomics.
+
+### Session 6 completion marker
+
+**Category C8 (Memory ordering) research: COMPLETE ✓ 2026-04-24 [this commit]**
+- x86-64: 7 instruction families classified (MFENCE/SFENCE/LFENCE + CLWB/CLFLUSHOPT + LOCK + CLFLUSH)
+- ARM64: DMB (15 variants), DSB, ISB, LDAR/STLR family classified
+- RISC-V: FENCE (with pred/succ bitmap) + FENCE.I + FENCE.TSO + AMO ordering suffixes classified
+- **NEW System #30 (Atomic Ordering) designed** — spec + pseudocode sketch
+- Maps to new System #30 exclusively (not reuse of existing systems)
+- Estimated implementation: ~80 hrs
+- POC `.zer` files in research/asm_generics/C8_memory_ordering/
+- **This is the only category that adds a NEW ZER safety system**
+
+**Next and LAST session: Category C10 (Register dependency) — decide keep or defer entirely. Per research so far, C10 patterns are rare enough to defer to Tier C. Quick verification session expected.**
+
+---
+
 ### Legacy first-pass survey (FOR REFERENCE — superseded by verified research above)
 
 **Note: This section preserved from first-pass memory-based survey before WebFetch verification. Retained for historical context; use VERIFIED sections above for all classification decisions.**

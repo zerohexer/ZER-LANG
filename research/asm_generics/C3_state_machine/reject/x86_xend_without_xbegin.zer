@@ -1,0 +1,35 @@
+// EXPECTED: compile error
+//
+// Category C3b (State machine, exit without enter) — x86-64 XEND
+// Source: Intel SDM Vol 2C XEND —
+// "Execution of XEND outside a transactional region causes a general-
+// protection exception (#GP)."
+// "#GP(0): If RTM_ACTIVE = 0."
+//
+// Precondition: XEND requires prior XBEGIN to have entered transactional state.
+// Violation: XEND without matching XBEGIN → #GP(0) at runtime.
+//
+// ZER checker must track exclusive_state through CFG and reject XEND
+// when exclusive_state == NOT_IN_TRANSACTION.
+//
+// Research citation: docs/asm_preconditions_research.md Category C3 session 3
+
+void unsafe_xend_alone() {
+    // No XBEGIN before this → exclusive_state = NOT_IN_TRANSACTION.
+    // Category C3b check must REJECT.
+    //
+    // Expected error: "XEND outside exclusive transaction (C3b).
+    //                  No prior XBEGIN in CFG reached this point.
+    //                  At runtime this would trigger #GP(0)."
+    unsafe asm {
+        instructions: "xend"
+        inputs: {}
+        outputs: {}
+        clobbers: []
+        safety: "End transactional region"
+    }
+}
+
+i32 main() {
+    return 0;
+}

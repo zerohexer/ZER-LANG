@@ -734,6 +734,314 @@ consequence = "address-misaligned exception OR access-fault"
 
 ---
 
+## Category C3 (+ C9 merged) — VERIFIED RESEARCH SESSION 3 (2026-04-24)
+
+**Status: Phase 1 survey COMPLETE for C3 across all 3 archs. ✓**
+
+**C9 MERGED INTO C3:** Research confirms exclusive pairing (was C9) is a subcategory of state machine tracking (C3). Same Model 1 state transitions, same no-intervening-ops rule. Categories unified: 9 total (C1-C8, C10), not 10.
+
+### Methodology
+
+Same Option 1+2 as previous sessions. WebFetch for x86 (felixcloutier.com TSX), WebSearch for ARM64 exclusive monitor and RISC-V LR/SC reservation set rules.
+
+### Summary finding: All 3 archs have state machines, but different purposes
+
+Unlike C1 (x86 legacy UB) or C2 (physical alignment), C3 exists **by design** on all 3 archs as the primary atomic-RMW mechanism. Different architectures use different models:
+
+| Arch | Mechanism | Instructions |
+|---|---|---|
+| **x86-64** | TSX (Transactional Memory Extension) | XBEGIN / XEND / XABORT / XTEST (for state query) |
+| **ARM64** | Exclusive Monitors | LDXR / STXR (+ width variants) + CLREX + LDAXR/STLXR (acquire/release exclusive) |
+| **RISC-V** | Reservation Sets (LR/SC) | LR.W / SC.W / LR.D / SC.D |
+
+All follow Model 1 state machine pattern: **enter state → matched exit OR abort**. Plus state-clearing events (exceptions, cache evictions, etc.).
+
+### x86-64 — Confirmed C3 Instructions (Intel TSX)
+
+**Verified via WebFetch to felixcloutier.com.**
+
+| # | Instruction | Subcat | State operation | Consequence on violation | Source |
+|---|---|---|---|---|---|
+| 1 | `XBEGIN rel` | C3a enter | Enters transactional state; nests via `RTM_NEST_COUNT` counter | Abort (not UB) if nest overflow or SUSLDTRK active | Intel SDM Vol 2C XBEGIN |
+| 2 | `XEND` | C3b exit | Exits transactional state (decrements nest counter) | `#GP(0)` if RTM_ACTIVE=0 | Intel SDM Vol 2C XEND |
+| 3 | `XABORT imm8` | C3c abort | Aborts active transaction; outside transaction = NOP | No-op if RTM_ACTIVE=0 (defined, not UB); `#UD` if RTM not supported (CPUID check) | Intel SDM Vol 2C XABORT |
+
+**Key quotes:**
+
+**XBEGIN preconditions:**
+> "Nesting limit: `RTM_NEST_COUNT < MAX_RTM_NEST_COUNT`. Not in suspend region: `SUSLDTRK_ACTIVE = 0`. If either condition fails, the processor initiates abort processing instead of entering transactional mode."
+> "The instruction that first enters this mode is called the 'outermost XBEGIN.' ... The fallback address following an abort is computed from the outermost XBEGIN instruction."
+
+**XEND precondition:**
+> "Execution of XEND outside a transactional region causes a general-protection exception (#GP)."
+> "#GP(0): If RTM_ACTIVE = 0."
+
+**XABORT behavior:**
+> "IF RTM_ACTIVE = 0 THEN Treat as NOP."
+> "#UD: If CPUID.(EAX=7, ECX=0):EBX.RTM[bit 11] = 0" (RTM feature absent)
+
+### ARM64 — Confirmed C3 Instructions (Exclusive Monitors)
+
+**Verified via WebSearch + ARM ARM references.**
+
+| # | Instruction | Subcat | State operation | Rules | Source |
+|---|---|---|---|---|---|
+| 1 | `LDXRB` / `LDXRH` / `LDXR` / `LDXR` (64-bit) | C3a enter | Sets reservation at address with monitored size | Natural alignment required (C2 overlap) | ARM ARM LDXR family |
+| 2 | `LDXP` (pair) | C3a enter | Reservation on paired address | 16-byte aligned (C2 overlap) | ARM ARM LDXP |
+| 3 | `STXRB` / `STXRH` / `STXR` / `STXR` (64-bit) | C3b exit | Conditional store; succeeds only if reservation valid | Must match LDXR address AND size | ARM ARM STXR family |
+| 4 | `STXP` | C3b exit | Pair conditional store | Must match LDXP | ARM ARM STXP |
+| 5 | `LDAXR` / `LDAXRB` / `LDAXRH` / `LDAXP` | C3a enter + acquire semantics | Exclusive load + acquire barrier | Combined C3a + C8 (ordering) | ARM ARM LDAXR |
+| 6 | `STLXR` / `STLXRB` / `STLXRH` / `STLXP` | C3b exit + release semantics | Exclusive store + release barrier | Combined C3b + C8 | ARM ARM STLXR |
+| 7 | `CLREX` | C3c clear | Explicitly clears any pending reservation | Always defined (no-op if no reservation) | ARM ARM CLREX |
+
+**Key rules (from ARM ARM DDI 0487):**
+
+**STXR success rules:**
+> "The store-exclusive succeeds only if there has been no intervening access to the monitored memory since the load-exclusive."
+> "Software must avoid having any explicit memory accesses, system control register updates, or cache maintenance instructions between paired LDXR and STXR instructions."
+
+**Size/address matching:**
+> "The STX must match the LDX both in address and operand sizes; you cannot perform an LDX for one address and follow up with a STX to a different address."
+
+**Monitor-clearing events:**
+> "The exclusive monitor is cleared not only with an intervening access by another thread, but will also be cleared by cache evictions, TLB maintenance, or other events."
+
+### RISC-V — Confirmed C3 Instructions (LR/SC)
+
+**Verified via RISC-V ISA Manual Vol 1 A-extension §14.**
+
+| # | Instruction | Subcat | State operation | Rules | Source |
+|---|---|---|---|---|---|
+| 1 | `LR.W` / `LR.D` | C3a enter | Creates reservation on word/doubleword | 4/8-byte natural alignment required (C2 overlap) | RISC-V Unpriv A-ext §14 |
+| 2 | `SC.W` / `SC.D` | C3b exit | Conditional store; succeeds only if reservation valid | Must match LR address AND size | Same source |
+
+**Key rules (from RISC-V ISA Manual):**
+
+**SC matching requirement:**
+> "The SC must be to the same effective address and of the same data size as the latest LR executed by the same hart. However, if the size changes, the SC is not required to succeed, although it may if the LR creates a reservation set large enough."
+
+**Constrained LR/SC loop (for forward-progress guarantee):**
+> "The standard A extension defines constrained LR/SC loops, which have the following properties: The loop comprises only an LR/SC sequence and code to retry the sequence in the case of failure, and must comprise at most 16 instructions placed sequentially in memory."
+> "The length of LR/SC sequences is restricted to fit within 64 contiguous instruction bytes in the base ISA to avoid undue restrictions on instruction cache and TLB size and associativity."
+
+**Unconstrained LR/SC:**
+> "LR/SC sequences that do not lie within constrained LR/SC loops are unconstrained. Unconstrained LR/SC sequences might succeed on some attempts on some implementations, but might never succeed on other implementations."
+
+Note: RISC-V has NO explicit clear instruction like ARM's CLREX. Reservations are cleared implicitly by events (memory writes, cache evictions, context switches).
+
+### C9 Merged Into C3 — Justification
+
+Original taxonomy had C3 (state machine) and C9 (exclusive pairing) as separate categories. Research confirms they are **the same concept**:
+
+| Original C9 subcategory | Now C3 subcategory |
+|---|---|
+| C9a Load-linked / store-conditional pair | C3a (LR/LDXR) + C3b (SC/STXR) |
+| C9b Begin/end critical section pair | C3a (XBEGIN) + C3b (XEND) |
+| C9c Transaction begin/commit | C3a (XBEGIN) + C3b (XEND) — same as C9b |
+
+All of these are instances of **one generic pattern**: enter state → matched exit (or abort/clear). Model 1 state machine in ZER's safety model handles all of them uniformly.
+
+**Decision:** C9 is DELETED. Final category count: 9 (C1-C8, C10).
+
+### Generalized C3 subcategories (final)
+
+| Subcat | Operation | ZER checker action |
+|---|---|---|
+| C3a | Enter exclusive/transactional state | Push state frame; record (address, size, paired_exit_instr) |
+| C3b | Exit exclusive/transactional state | Pop state frame; verify matches entry (address, size, instruction pair); fail if not in state |
+| C3c | Clear/abort state | Pop frame unconditionally (or mark cleared); never fails |
+| C3d | No intervening memory ops between C3a and C3b | CFG analysis: prove no NODE_INDEX / NODE_DEREF / asm memory ops between paired instructions on same path |
+
+### C3 Mapping to ZER Safety Systems
+
+Maps to **Model 1 (State Machines)** with a **new state type**: `ExclusiveTransactionState`.
+
+Model 1 currently tracks:
+- Handle states (ALIVE / FREED / MAYBE_FREED / TRANSFERRED)
+- Move tracking (uses HS_TRANSFERRED)
+- Alloc coloring (POOL / ARENA / MALLOC)
+- Alloc IDs (grouping)
+
+Extension: add `ExclusiveTransactionState` with states:
+- `NOT_IN_TRANSACTION` (default)
+- `IN_TRANSACTION(address, size, enter_instr)` — entered via C3a
+- Transition `IN_TRANSACTION → NOT_IN_TRANSACTION` via matching C3b, any C3c, exception, or control-flow exit
+
+**Estimated implementation effort:** ~20 hrs to add new state type + transition tracking. Reuses existing Model 1 machinery (same pattern as Handle state tracking in zercheck_ir.c on CFG).
+
+### Checker implementation sketch (CFG-based)
+
+```c
+/* Pseudocode for C3 checker, in zercheck_ir.c */
+
+case IR_ASM: {
+    /* Get C3 metadata from per-arch data file */
+    C3Info *c3 = lookup_c3_info(inst->asm_mnemonic);
+    if (!c3) break;  /* not a C3 instruction */
+
+    switch (c3->subcat) {
+        case C3a_ENTER:
+            if (current_exclusive_state != NOT_IN_TRANSACTION) {
+                /* Nested LDXR on ARM64 = UB; XBEGIN on x86 = defined (nests) */
+                if (c3->allows_nesting) {
+                    exclusive_nest_count++;
+                } else {
+                    zc_ir_error(inst, "Cannot enter exclusive state: "
+                                       "already in exclusive transaction");
+                }
+            }
+            exclusive_state = IN_TRANSACTION(
+                .address = extract_operand_value(inst, c3->address_op),
+                .size = c3->size,
+                .enter_instr = c3->mnemonic
+            );
+            break;
+
+        case C3b_EXIT:
+            if (exclusive_state == NOT_IN_TRANSACTION) {
+                zc_ir_error(inst, "%s outside exclusive transaction (C3b)",
+                            c3->mnemonic);
+            }
+            /* Verify match */
+            if (extract_operand_value(inst, c3->address_op) != exclusive_state.address ||
+                c3->size != exclusive_state.size ||
+                !paired_with(c3->mnemonic, exclusive_state.enter_instr)) {
+                zc_ir_error(inst, "%s doesn't match paired %s: "
+                                  "address/size/pair mismatch",
+                            c3->mnemonic, exclusive_state.enter_instr);
+            }
+            exclusive_state = NOT_IN_TRANSACTION;
+            break;
+
+        case C3c_CLEAR:
+            exclusive_state = NOT_IN_TRANSACTION;
+            break;
+    }
+    break;
+}
+
+case IR_STORE: case IR_LOAD: case IR_INDEX_READ: ... : {
+    /* C3d: intervening memory op check */
+    if (exclusive_state != NOT_IN_TRANSACTION) {
+        zc_ir_warn(inst, "Memory operation between exclusive load and store "
+                          "may clear exclusive monitor/reservation. Consider "
+                          "moving this outside the exclusive sequence.");
+    }
+    break;
+}
+```
+
+Note: C3d is a WARNING not an ERROR, because some platforms allow some intervening ops. Strict mode may promote to error per-arch per-platform config.
+
+### Data file format additions
+
+```
+# arch_data/x86_64.zerdata — Category C3 additions
+
+[XBEGIN]
+category = C3a
+subcat = ENTER
+state_type = transactional
+allows_nesting = true
+paired_exit = XEND
+source = "Intel SDM Vol 2C XBEGIN"
+consequence = "Abort if nest overflow or SUSLDTRK active"
+
+[XEND]
+category = C3b
+subcat = EXIT
+state_type = transactional
+paired_enter = XBEGIN
+source = "Intel SDM Vol 2C XEND"
+consequence = "#GP(0) if RTM_ACTIVE = 0"
+
+[XABORT]
+category = C3c
+subcat = CLEAR
+state_type = transactional
+source = "Intel SDM Vol 2C XABORT"
+consequence = "No-op if RTM_ACTIVE = 0 (defined)"
+
+# arch_data/arm64.zerdata
+
+[LDXR_W]
+category = C3a
+subcat = ENTER
+state_type = exclusive_monitor
+allows_nesting = false
+paired_exit = STXR_W
+operand_address = 1
+operand_size = 4
+intervening_ops_clear_state = true
+source = "ARM ARM DDI 0487 LDXR (word)"
+
+[STXR_W]
+category = C3b
+subcat = EXIT
+state_type = exclusive_monitor
+paired_enter = LDXR_W
+match_required = [address, size]
+operand_address = 1
+source = "ARM ARM DDI 0487 STXR (word)"
+
+[CLREX]
+category = C3c
+subcat = CLEAR
+state_type = exclusive_monitor
+source = "ARM ARM DDI 0487 CLREX"
+
+# arch_data/rv64.zerdata
+
+[LR_W]
+category = C3a
+subcat = ENTER
+state_type = reservation_set
+paired_exit = SC_W
+operand_address = 1
+operand_size = 4
+source = "RISC-V A-extension §14 LR/SC"
+
+[SC_W]
+category = C3b
+subcat = EXIT
+state_type = reservation_set
+paired_enter = LR_W
+match_required = [address, size]
+source = "RISC-V A-extension §14 LR/SC"
+```
+
+### POC specifications (see `research/asm_generics/C3_state_machine/`)
+
+Tests written this session:
+- `reject/x86_xend_without_xbegin.zer` — XEND outside transaction → #GP(0)
+- `reject/arm64_stxr_without_ldxr.zer` — STXR without prior LDXR → state mismatch
+- `reject/riscv_sc_without_lr.zer` — SC.W without LR.W → reservation never set
+- `reject/arm64_ldxr_stxr_size_mismatch.zer` — LDXR.W then STXR.D → size mismatch
+- `accept/arm64_ldxr_stxr_paired.zer` — matched LDXR/STXR pair → compiles
+- `accept/x86_xbegin_xend_paired.zer` — matched XBEGIN/XEND pair → compiles
+
+### Open questions / follow-ups for C3
+
+1. **Cross-function pairing:** should ZER require enter and exit in same function? (Likely yes — analyzing cross-function state is hard.)
+2. **Loop-safety:** what if exclusive state is entered in a loop iteration but not exited in same iteration? (Defensive: require exit before loop back-edge.)
+3. **Exception handling:** C3 state must be cleared on any unwinding path. ZER's defer + exception model needs to interact with C3 state.
+4. **x86 XTEST status query:** `XTEST` instruction returns whether currently in transaction. Likely not a C3 entry — it's a state query, not state transition. Classify as "no-precondition" (similar to XLEN read) or leave unclassified.
+5. **`Za64rs` / `Za128rs` RISC-V reservation set profiles:** affects minimum reservation set size, may need architecture-variant data file entries.
+
+### Session 3 completion marker
+
+**Category C3 (State machine / exclusive pairing — C9 MERGED IN) research: COMPLETE ✓ 2026-04-24 [this commit]**
+- 3 x86-64 instructions (XBEGIN / XEND / XABORT)
+- 7 ARM64 instruction families (LDXR/STXR + exclusive/pair variants + CLREX + LDAXR/STLXR)
+- 2 RISC-V instructions (LR / SC)
+- C9 MERGED INTO C3 — category count drops from 10 to 9
+- POC `.zer` files in `research/asm_generics/C3_state_machine/`
+- Model 1 extension required: ~20 hrs (new `ExclusiveTransactionState` state type)
+
+**Next session: Category C4 (CPU feature gate) + C5 (Privilege / execution mode) — both map to System #24 (Context Flags) with different context types. Will combine if research shows overlap is natural.**
+
+---
+
 ### Legacy first-pass survey (FOR REFERENCE — superseded by verified research above)
 
 **Note: This section preserved from first-pass memory-based survey before WebFetch verification. Retained for historical context; use VERIFIED sections above for all classification decisions.**

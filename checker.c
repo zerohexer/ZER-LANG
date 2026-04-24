@@ -5818,6 +5818,63 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line, "@cpu_id takes no arguments");
             }
             result = ty_u32;
+        } else if ((nlen == 9 && memcmp(name, "cpu_cpuid", 9) == 0) ||
+                   (nlen == 13 && memcmp(name, "cpu_cpuid_ecx", 13) == 0)) {
+            /* D-Alpha-14: CPUID — 2-arg (leaf, subleaf), u64 return. */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@%.*s requires 2 arguments (leaf, subleaf)", (int)nlen, name);
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
+                    checker_error(c, node->loc.line, "@%.*s arguments must be integers", (int)nlen, name);
+                }
+            }
+            result = ty_u64;
+        } else if ((nlen == 7 && memcmp(name, "cpu_eoi", 7) == 0) ||
+                   (nlen == 17 && memcmp(name, "cpu_cache_disable", 17) == 0) ||
+                   (nlen == 16 && memcmp(name, "cpu_cache_enable", 16) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_fpu_init", 12) == 0) ||
+                   (nlen == 9 && memcmp(name, "cpu_endbr", 9) == 0)) {
+            /* D-Alpha-14: 0-arg, void — eoi, cache_enable/disable, fpu_init, endbr */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
+            result = ty_void;
+        } else if (nlen == 12 && memcmp(name, "cpu_read_cr2", 12) == 0) {
+            /* D-Alpha-14: read CR2 (page fault address). 0-arg, u64. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@cpu_read_cr2 takes no arguments");
+            }
+            result = ty_u64;
+        } else if ((nlen == 10 && memcmp(name, "cpu_fxsave", 10) == 0) ||
+                   (nlen == 11 && memcmp(name, "cpu_fxrstor", 11) == 0) ||
+                   (nlen == 12 && memcmp(name, "cpu_umonitor", 12) == 0)) {
+            /* D-Alpha-14: 1-arg (pointer), void — fxsave/fxrstor/umonitor */
+            if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line, "@%.*s requires 1 argument (pointer)", (int)nlen, name);
+            } else {
+                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                if (vt) {
+                    Type *eff = type_unwrap_distinct(vt);
+                    if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+                        checker_error(c, node->loc.line, "@%.*s argument must be pointer or array", (int)nlen, name);
+                    }
+                }
+            }
+            result = ty_void;
+        } else if (nlen == 10 && memcmp(name, "cpu_umwait", 10) == 0) {
+            /* D-Alpha-14: UMWAIT — 2-arg (hint, deadline), void */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@cpu_umwait requires 2 arguments (hint, deadline)");
+            } else {
+                Type *vt1 = typemap_get(c, node->intrinsic.args[0]);
+                Type *vt2 = typemap_get(c, node->intrinsic.args[1]);
+                if ((vt1 && !type_is_integer(vt1)) || (vt2 && !type_is_integer(vt2))) {
+                    checker_error(c, node->loc.line, "@cpu_umwait arguments must be integers");
+                }
+            }
+            result = ty_void;
         } else if ((nlen == 15 && memcmp(name, "cpu_read_fsbase", 15) == 0) ||
                    (nlen == 15 && memcmp(name, "cpu_read_gsbase", 15) == 0)) {
             /* D-Alpha-13: @cpu_read_fsbase/gsbase() -> u64 */

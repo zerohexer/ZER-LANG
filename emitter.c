@@ -6760,8 +6760,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "})");
         } else if (nlen == 12 && memcmp(name, "cpu_read_pmc", 12) == 0 &&
                    node->intrinsic.arg_count >= 1) {
-            /* D-Alpha-13: RDPMC — read performance monitoring counter.
-             * Requires CR4.PCE=1 for user-mode access (privileged otherwise). */
+            /* D-Alpha-13: RDPMC — read performance monitoring counter. */
             emit(e, "({ uint32_t _zer_pmi = (uint32_t)(");
             emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, "); uint64_t _zer_pmv = 0;\n"
@@ -6771,6 +6770,159 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    _zer_pmv = ((uint64_t)_zer_phi << 32) | _zer_plo;\n"
                 "#endif\n"
                 "_zer_pmv; })");
+        } else if (nlen == 9 && memcmp(name, "cpu_cpuid", 9) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-14: CPUID — returns (EBX << 32) | EAX packed into u64. */
+            emit(e, "({ uint32_t _zer_cl = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint32_t _zer_cs = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, "); uint64_t _zer_cq = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_ea, _zer_eb, _zer_ec, _zer_ed;\n"
+                "    __asm__ __volatile__ (\"cpuid\"\n"
+                "        : \"=a\"(_zer_ea), \"=b\"(_zer_eb), \"=c\"(_zer_ec), \"=d\"(_zer_ed)\n"
+                "        : \"a\"(_zer_cl), \"c\"(_zer_cs));\n"
+                "    _zer_cq = ((uint64_t)_zer_eb << 32) | _zer_ea;\n"
+                "#endif\n"
+                "_zer_cq; })");
+        } else if (nlen == 13 && memcmp(name, "cpu_cpuid_ecx", 13) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-14: CPUID returning ECX/EDX packed into u64. */
+            emit(e, "({ uint32_t _zer_cl = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint32_t _zer_cs = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, "); uint64_t _zer_cq = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_ea, _zer_eb, _zer_ec, _zer_ed;\n"
+                "    __asm__ __volatile__ (\"cpuid\"\n"
+                "        : \"=a\"(_zer_ea), \"=b\"(_zer_eb), \"=c\"(_zer_ec), \"=d\"(_zer_ed)\n"
+                "        : \"a\"(_zer_cl), \"c\"(_zer_cs));\n"
+                "    _zer_cq = ((uint64_t)_zer_ed << 32) | _zer_ec;\n"
+                "#endif\n"
+                "_zer_cq; })");
+        } else if (nlen == 7 && memcmp(name, "cpu_eoi", 7) == 0) {
+            /* D-Alpha-14: End-of-interrupt signal to the interrupt controller.
+             * x86: write 0 to LAPIC EOI register (MMIO, 0xFEE000B0 by default) —
+             *      but that needs the LAPIC base known. Simplest form: WRMSR to
+             *      IA32_X2APIC_EOI (0x80B) which works in x2APIC mode.
+             * ARM64: write to ICC_EOIR1_EL1 system register (GICv3).
+             * RISC-V: platform-specific (SiFive CLINT or PLIC).
+             * This is a best-effort emission; users on bespoke platforms override. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    /* x2APIC EOI (MSR 0x80B) — writes 0 */\n"
+                "    __asm__ __volatile__ (\"wrmsr\" :: \"a\"(0), \"d\"(0), \"c\"(0x80B));\n"
+                "#elif defined(__aarch64__)\n"
+                "    /* GICv3 EOI (ICC_EOIR1_EL1, op0=3 op1=0 CRn=12 CRm=12 op2=1) */\n"
+                "    __asm__ __volatile__ (\"msr s3_0_c12_c12_1, xzr\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_read_cr2", 12) == 0) {
+            /* D-Alpha-14: read CR2 — contains faulting address after #PF. Privileged. */
+            emit(e, "({ uint64_t _zer_cr = 0;\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"movq %%%%cr2, %%0\" : \"=r\"(_zer_cr));\n"
+                "#endif\n"
+                "_zer_cr; })");
+        } else if (nlen == 17 && memcmp(name, "cpu_cache_disable", 17) == 0) {
+            /* D-Alpha-14: disable all caches — set CR0.CD (bit 30). Privileged.
+             * Uses BTS (bit test+set) to avoid 32-bit-imm-with-64-bit-reg issues. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    uint64_t _zer_c0;\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"movq %%%%cr0, %%0\\n\\t\"\n"
+                "        \"btsq $30, %%0\\n\\t\"\n"
+                "        \"movq %%0, %%%%cr0\\n\\t\"\n"
+                "        \"wbinvd\"\n"
+                "        : \"=&r\"(_zer_c0) :: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 16 && memcmp(name, "cpu_cache_enable", 16) == 0) {
+            /* D-Alpha-14: enable all caches — clear CR0.CD (bit 30). Privileged.
+             * Uses BTR (bit test+reset) to avoid 32-bit-imm-with-64-bit-reg issues. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    uint64_t _zer_c0;\n"
+                "    __asm__ __volatile__ (\n"
+                "        \"movq %%%%cr0, %%0\\n\\t\"\n"
+                "        \"btrq $30, %%0\\n\\t\"\n"
+                "        \"movq %%0, %%%%cr0\"\n"
+                "        : \"=&r\"(_zer_c0) :: \"memory\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "cpu_fxsave", 10) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-14: FXSAVE — legacy FP/SSE state save (512 bytes, 16-byte aligned). */
+            emit(e, "({ void *_zer_fb = (void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"fxsave (%%0)\" :: \"r\"(_zer_fb) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_fb;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 11 && memcmp(name, "cpu_fxrstor", 11) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-14: FXRSTOR — legacy FP/SSE state restore. */
+            emit(e, "({ const void *_zer_fb = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"fxrstor (%%0)\" :: \"r\"(_zer_fb) : \"memory\");\n"
+                "#else\n"
+                "    (void)_zer_fb;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_fpu_init", 12) == 0) {
+            /* D-Alpha-14: FINIT — initialize x87 FPU to defaults. */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"fninit\");\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 10 && memcmp(name, "cpu_umwait", 10) == 0 &&
+                   node->intrinsic.arg_count >= 2) {
+            /* D-Alpha-14: UMWAIT — user-mode wait until monitored write or deadline.
+             * hint: 0 = C0.2 (optimized), 1 = C0.1 (faster wakeup).
+             * Requires WAITPKG feature. */
+            emit(e, "({ uint32_t _zer_uh = (uint32_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, "); uint64_t _zer_ud = (uint64_t)(");
+            emit_rewritten_node(e, node->intrinsic.args[1], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    uint32_t _zer_ulo = (uint32_t)_zer_ud, _zer_uhi = (uint32_t)(_zer_ud >> 32);\n"
+                "    /* UMWAIT encoded as: F2 0F AE /6 */\n"
+                "    __asm__ __volatile__ (\"umwait %%0\" :: \"r\"(_zer_uh), \"a\"(_zer_ulo), \"d\"(_zer_uhi));\n"
+                "#else\n"
+                "    (void)_zer_uh; (void)_zer_ud;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 12 && memcmp(name, "cpu_umonitor", 12) == 0 &&
+                   node->intrinsic.arg_count >= 1) {
+            /* D-Alpha-14: UMONITOR — set up user-mode address watch (pairs with UMWAIT). */
+            emit(e, "({ const void *_zer_ua = (const void*)(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func);
+            emit(e, ");\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"umonitor %%0\" :: \"r\"(_zer_ua));\n"
+                "#else\n"
+                "    (void)_zer_ua;\n"
+                "#endif\n"
+                "})");
+        } else if (nlen == 9 && memcmp(name, "cpu_endbr", 9) == 0) {
+            /* D-Alpha-14: ENDBR64 — CET-IBT indirect-branch landing pad.
+             * Emitted at start of functions that may be called via indirect branch.
+             * No-op on CPUs without CET-IBT (encoded as multi-byte NOP). */
+            emit(e, "({\n"
+                "#if defined(__x86_64__)\n"
+                "    __asm__ __volatile__ (\"endbr64\");\n"
+                "#endif\n"
+                "})");
         } else if (nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) {
             /* D-Alpha-7: hardware RNG — returns ?u64 (optional because instruction can fail).
              * x86-64: RDRAND sets CF on success. Not universally available on ARM/RISC-V base. */

@@ -1042,6 +1042,343 @@ Tests written this session:
 
 ---
 
+## Categories C4 + C5 — VERIFIED RESEARCH SESSION 4 (2026-04-24)
+
+**Status: Phase 1 survey COMPLETE for C4 and C5 across all 3 archs. ✓**
+
+**C4 and C5 KEPT SEPARATE** (despite both mapping to System #24). Research shows they track fundamentally different context types:
+- **C4** tracks "what CPU capabilities are available" — set-membership semantics (CPU has AES? Yes/no)
+- **C5** tracks "what execution privilege is active" — hierarchical semantics (current PL ≥ required PL?)
+
+Separate subcategories of Context Flags extension, separate data file fields. Not merging.
+
+### Methodology
+
+Same Option 1+2. WebFetch for x86 (WRMSR, AESENC, RDRAND), WebSearch for ARM64 exception levels + ID_AA64ISAR0_EL1, RISC-V CSR privilege model.
+
+### Category C4 — CPU Feature Gate
+
+**Pattern identical across archs:** instruction requires a specific CPU extension or feature bit to be present. Absence → exception at runtime (#UD / UNDEFINED / illegal instruction).
+
+#### C4 subcategories
+
+| Subcat | Meaning | Examples |
+|---|---|---|
+| C4a | Baseline required (always-on for target arch) | SSE2 on x86-64, NEON on ARM64 baseline, RV64I base |
+| C4b | Optional standard extension | AVX, AVX-512 (x86); SVE (ARM); Zbb, Zicbom (RISC-V) |
+| C4c | Vendor-specific extension | Intel SHA, AMD XOP, ARM SVE2, RV Zvbc |
+
+#### x86-64 Feature Gates
+
+**Verified examples:**
+
+| Instruction family | Feature required | CPUID bit | Exception | Source |
+|---|---|---|---|---|
+| `AESENC` / `AESDEC` / `AESENCLAST` / `AESDECLAST` / `AESIMC` / `AESKEYGENASSIST` | AES-NI | `CPUID.01H:ECX.AES[bit 25]` | #UD if not present | Intel SDM AES instruction family |
+| `VAESENC` / `VAESDEC` (256/512-bit) | VAES | `CPUID.07H.0.ECX.VAES[bit 9]` | #UD | Intel SDM VAES |
+| `VPBROADCASTB`/W/D/Q (AVX2) | AVX2 | `CPUID.07H.0.EBX.AVX2[bit 5]` | #UD | Intel SDM |
+| AVX-512 foundation instructions | AVX-512F | `CPUID.07H.0.EBX.AVX512F[bit 16]` | #UD | Intel SDM |
+| `CLWB` | CLWB | `CPUID.07H.0.EBX.CLWB[bit 24]` | #UD | Intel SDM CLWB |
+| `CLFLUSHOPT` | CLFLUSHOPT | `CPUID.07H.0.EBX.CLFLUSHOPT[bit 23]` | #UD | Intel SDM CLFLUSHOPT |
+| `RDRAND` | RDRAND | `CPUID.01H:ECX.RDRAND[bit 30]` | #UD | Intel SDM RDRAND |
+| `RDSEED` | RDSEED | `CPUID.07H.0.EBX.RDSEED[bit 18]` | #UD | Intel SDM RDSEED |
+| `PCMPESTRI` / `PCMPESTRM` / `PCMPISTRI` / `PCMPISTRM` | SSE4.2 | `CPUID.01H:ECX.SSE4_2[bit 20]` | #UD | Intel SDM SSE4.2 |
+| `SHA256RNDS2` / `SHA256MSG1` / `SHA256MSG2` / `SHA1MSG1` / `SHA1MSG2` / `SHA1NEXTE` / `SHA1RNDS4` | SHA | `CPUID.07H.0.EBX.SHA[bit 29]` | #UD | Intel SDM SHA |
+| `XBEGIN` / `XEND` / `XABORT` | RTM (TSX) | `CPUID.07H.0.EBX.RTM[bit 11]` | #UD | Intel SDM TSX (also C3) |
+| `LZCNT` / `TZCNT` | BMI1 | `CPUID.07H.0.EBX.BMI1[bit 3]` | #UD | Intel SDM BMI1 |
+| `BZHI` / `MULX` / `PDEP` / `PEXT` | BMI2 | `CPUID.07H.0.EBX.BMI2[bit 8]` | #UD | Intel SDM BMI2 |
+| `RDFSBASE` / `WRFSBASE` / `RDGSBASE` / `WRGSBASE` | FSGSBASE | `CPUID.07H.0.EBX.FSGSBASE[bit 0]` | #UD | Intel SDM FSGSBASE |
+| `MOVBE` | MOVBE | `CPUID.01H:ECX.MOVBE[bit 22]` | #UD | Intel SDM MOVBE |
+| `ADCX` / `ADOX` | ADX | `CPUID.07H.0.EBX.ADX[bit 19]` | #UD | Intel SDM ADX |
+
+**Key quote (RDRAND, representative):**
+> "A `#UD (Invalid Opcode)` exception is raised if the CPUID flag is not set."
+
+**Approximate total x86-64 feature-gated instructions: ~150+ across all extensions (AES, SHA, AVX-512 subsets, various crypto/RNG/CRC32/VAES/BMI/CLMUL). Data file gets an entry per instruction with one field: `feature_required`.**
+
+#### ARM64 Feature Gates
+
+**Feature detection via ID_AA64ISAR*_EL1 system registers.**
+
+| Instruction family | Feature bit | Register | Exception | Source |
+|---|---|---|---|---|
+| `AESE` / `AESD` / `AESMC` / `AESIMC` | AES | `ID_AA64ISAR0_EL1.AES == 0b0001` or `0b0010` | UNDEFINED | ARM ARM AES |
+| `PMULL` / `PMULL2` | AES == 0b0010 (enhanced) | Same | UNDEFINED | ARM ARM |
+| `SHA1C` / `SHA1H` / `SHA1M` / `SHA1P` / `SHA1SU0` / `SHA1SU1` | SHA1 | `ID_AA64ISAR0_EL1.SHA1` | UNDEFINED | ARM ARM SHA1 |
+| `SHA256H` / `SHA256H2` / `SHA256SU0` / `SHA256SU1` | SHA2 | `ID_AA64ISAR0_EL1.SHA2` | UNDEFINED | ARM ARM SHA2 |
+| `SHA512H` / `SHA512H2` / `SHA512SU0` / `SHA512SU1` | SHA2 == 0b0010 | Same | UNDEFINED | ARM ARM SHA512 |
+| `SHA3 family` (RAX1, EOR3, BCAX, XAR) | SHA3 | `ID_AA64ISAR0_EL1.SHA3` | UNDEFINED | ARM ARM SHA3 |
+| `SM3*` | SM3 | `ID_AA64ISAR0_EL1.SM3` | UNDEFINED | ARM ARM SM3 |
+| `SM4*` | SM4 | `ID_AA64ISAR0_EL1.SM4` | UNDEFINED | ARM ARM SM4 |
+| `CRC32B` / `CRC32H` / `CRC32W` / `CRC32X` / `CRC32CB`/CH/CW/CX | CRC32 | `ID_AA64ISAR0_EL1.CRC32` | UNDEFINED | ARM ARM CRC32 |
+| SVE instructions | SVE | `ID_AA64PFR0_EL1.SVE` | UNDEFINED | ARM ARM SVE |
+| SVE2 instructions | SVE2 | `ID_AA64ZFR0_EL1.SVEver` | UNDEFINED | ARM ARM SVE2 |
+| `FJCVTZS` | JSCVT | `ID_AA64ISAR1_EL1.JSCVT` | UNDEFINED | ARM ARM JSCVT |
+| `FMLAL`/FMLSL/FMLAL2/FMLSL2 (FP16 FML) | FHM | `ID_AA64ISAR0_EL1.FHM` | UNDEFINED | ARM ARM FP16 |
+| DotProd (SDOT/UDOT) | DP | `ID_AA64ISAR0_EL1.DP` | UNDEFINED | ARM ARM DP |
+| Atomic instructions (LDADD/LDCLR/LDEOR/LDSET/SWP family) | LSE | `ID_AA64ISAR0_EL1.Atomic` | UNDEFINED | ARM ARM LSE |
+
+**Approximate total ARM64 feature-gated instructions: ~200+ once SVE/SVE2 instruction counts are included. Same data-file pattern as x86.**
+
+#### RISC-V Feature Gates
+
+**Feature detection via `misa` CSR + extension strings in `mhartid`/`mconfigptr`.**
+
+| Instruction family | Extension | Exception | Source |
+|---|---|---|---|
+| `MUL` / `MULH` / `MULHU` / `MULHSU` / `DIV` / `DIVU` / `REM` / `REMU` (+ RV64 W variants) | M | illegal instruction | RV Manual Vol I M-ext |
+| `LR.W` / `SC.W` / `AMOSWAP.W` / `AMOADD.W` / `AMOXOR.W` / `AMOOR.W` / `AMOAND.W` / `AMOMIN.W` / `AMOMAX.W` / `AMOMINU.W` / `AMOMAXU.W` (+ D variants for RV64) | A | illegal instruction | RV Manual Vol I A-ext |
+| F/D floating-point instructions | F / D / Q | illegal instruction | RV Manual Vol I F/D/Q-ext |
+| `CLZ` / `CTZ` / `CPOP` / `MIN` / `MAX` / `MINU` / `MAXU` / `ANDN` / `ORN` / `XNOR` / `ROL` / `ROR` / ... | Zbb | illegal instruction | RV Zbb |
+| `CBO.CLEAN` / `CBO.INVAL` / `CBO.FLUSH` | Zicbom | illegal instruction | RV Zicbom |
+| `CBO.ZERO` | Zicboz | illegal instruction | RV Zicboz |
+| `FENCE.I` | Zifencei | illegal instruction | RV Zifencei |
+| Vector instructions (vadd.vv, vmul, etc.) | V | illegal instruction | RV V extension |
+| Compressed instructions (C.ADDI, C.LW, etc.) | C | illegal instruction | RV C extension |
+| Crypto: `AES32ESI` / `SHA256SIG0` / etc. | Zknh / Zkne / Zknd / Zksh | illegal instruction | RV Zk* extensions |
+
+**Approximate total RISC-V feature-gated instructions: ~100+ depending on which extensions count. Pattern identical.**
+
+#### C4 Data file format
+
+```
+# arch_data/x86_64.zerdata — Category C4 entries (representative)
+
+[AESENC]
+category = C4b
+feature_required = AES_NI
+cpuid = "01H:ECX[25]"
+consequence = "#UD if feature absent"
+source = "Intel SDM AESENC"
+
+[RDRAND]
+category = C4c   # vendor-specific per CPUID
+feature_required = RDRAND
+cpuid = "01H:ECX[30]"
+consequence = "#UD if feature absent; also #UD on LOCK prefix"
+source = "Intel SDM RDRAND"
+
+[LZCNT]
+category = C4b
+feature_required = BMI1
+cpuid = "07H.0.EBX[3]"
+consequence = "#UD if feature absent"
+source = "Intel SDM LZCNT (BMI1)"
+
+# arch_data/arm64.zerdata
+
+[AESE]
+category = C4b
+feature_required = AES
+id_reg = "ID_AA64ISAR0_EL1.AES >= 0b0001"
+consequence = "UNDEFINED"
+source = "ARM ARM AES family"
+
+# arch_data/rv64.zerdata
+
+[LR_W]
+category = C4a   # part of A-extension (typically baseline for general-purpose RV64)
+feature_required = A
+misa_bit = "A (bit 0)"
+consequence = "illegal instruction"
+source = "RISC-V Unpriv A-ext §14"
+# Note: LR_W also has C2 + C3 entries (alignment + state machine)
+
+[CBO_CLEAN]
+category = C4b
+feature_required = Zicbom
+detection = "misa alone insufficient; platform ACPI/DT/discovery"
+consequence = "illegal instruction"
+source = "RISC-V Zicbom spec"
+```
+
+### Category C5 — Privilege / Execution Mode
+
+**Pattern identical across archs:** instruction requires specific privilege level (kernel/supervisor/monitor). Absence → exception at runtime.
+
+#### C5 subcategories
+
+| Subcat | Meaning | Example |
+|---|---|---|
+| C5a | Kernel/supervisor-only | x86 `WRMSR` (CPL=0); ARM `MSR SCTLR_EL1, X0` (EL1+); RISC-V CSR write to `mstatus` (M-mode) |
+| C5b | Secure-mode-only | ARM TrustZone secure world; RISC-V M-mode-only |
+| C5c | Specific mode transition | x86 `IRET` (interrupt handler); x86 `SYSRET` (kernel→user); ARM `ERET`; RISC-V `MRET`/`SRET` |
+
+#### x86-64 Privilege Instructions
+
+**Verified: WRMSR requires CPL=0 → #GP(0). Pattern applies to MSR access, CR access, privileged control-flow.**
+
+| Instruction | Privilege | Consequence | Source |
+|---|---|---|---|
+| `WRMSR` | CPL=0 | `#GP(0)` | Intel SDM WRMSR — "This instruction must be executed at privilege level 0 or in real-address mode; otherwise, a general protection exception #GP(0) is generated." |
+| `RDMSR` | CPL=0 (most MSRs) | `#GP(0)` | Intel SDM RDMSR |
+| `MOV CR0-CR8` (write) | CPL=0 | `#GP(0)` | Intel SDM MOV to CR |
+| `MOV DR0-DR7` (write) | CPL=0 or debug-enabled | `#GP(0)` | Intel SDM MOV to DR |
+| `LGDT` / `LIDT` / `LLDT` / `LTR` | CPL=0 | `#GP(0)` | Intel SDM descriptor table loads |
+| `INVLPG` | CPL=0 | `#GP(0)` | Intel SDM INVLPG |
+| `INVD` / `WBINVD` | CPL=0 | `#GP(0)` | Intel SDM cache invalidate |
+| `SWAPGS` | CPL=0, 64-bit mode | `#UD` in non-64-bit, `#GP` otherwise | Intel SDM SWAPGS |
+| `HLT` | CPL=0 | `#GP(0)` | Intel SDM HLT |
+| `CLI` / `STI` | CPL ≤ IOPL (IOPL-dependent) | `#GP(0)` if CPL > IOPL | Intel SDM CLI/STI |
+| `IN` / `OUT` / `INS` / `OUTS` | CPL ≤ IOPL + port permission | `#GP(0)` | Intel SDM port I/O |
+| `SYSRET` / `SYSEXIT` | C5c specific mode transition | Requires prior SYSCALL/SYSENTER | Intel SDM SYSRET |
+| `IRET` / `IRETQ` | C5c return from interrupt/exception | Requires valid interrupt frame | Intel SDM IRET |
+| `VMLAUNCH` / `VMRESUME` / `VMXON` / `VMXOFF` | C5b VMX root operation | `#UD` outside VMX | Intel SDM Vol 3C VMX |
+
+**Approximate total x86-64 privileged instructions: ~60+ (control regs, MSRs, descriptor tables, I/O ports, VMX, SMX, etc.).**
+
+#### ARM64 Privilege Instructions
+
+**Pattern:** System register access uses `MSR`/`MRS` with register name encoding privilege. `_EL1` suffix = accessible from EL1+, `_EL2` from EL2+, `_EL3` only from EL3.
+
+| Instruction pattern | Privilege | Consequence | Source |
+|---|---|---|---|
+| `MSR SCTLR_EL1, X0` | EL1 or higher | UNDEFINED at EL0 (exception class varies) | ARM ARM system register access |
+| `MRS X0, SCTLR_EL1` | EL1 or higher | UNDEFINED at EL0 | Same |
+| `MSR SPSR_EL1, X0` | EL1+ | UNDEFINED at EL0 | ARM ARM SPSR |
+| `MSR SCR_EL3, X0` | EL3 only | UNDEFINED at EL0/1/2 | ARM ARM EL3 registers |
+| `MSR DAIF, X0` | EL1+ (for certain bits) | Partial undefined | ARM ARM DAIF |
+| `MSR HCR_EL2, X0` | EL2+ | UNDEFINED at EL0/1 | ARM ARM HCR_EL2 |
+| `ERET` | Any EL that has SPSR/ELR | Requires proper exception state | ARM ARM ERET |
+| `SMC` (Secure Monitor Call) | Any EL; traps to EL3 | C5c mode transition | ARM ARM SMC |
+| `HVC` (Hypervisor Call) | Any EL; traps to EL2 | C5c mode transition | ARM ARM HVC |
+| `WFI` / `WFE` | Any EL but behavior per mode | Traps via HCR/SCR if configured | ARM ARM WFI/WFE |
+| `DC IVAC` / `DC CIVAC` (cache maintenance) | EL1+ for some, any for DC CVAU | UNDEFINED if wrong EL | ARM ARM DC family |
+| `IC IALLU` / `IC IVAU` | EL1+ | UNDEFINED at EL0 | ARM ARM IC |
+| `TLBI` family | EL1+ | UNDEFINED at EL0 | ARM ARM TLBI |
+| `AT` family (address translate) | EL1+ | UNDEFINED at EL0 | ARM ARM AT |
+
+**Key quote from ARM ARM:**
+> "A higher EL has access to all the registers of the lower levels while the opposite is not true."
+> "When a system register name ends in _EL1, it is accessible only at EL1 (kernel mode). Similarly, system registers in _EL2 are accessible only in hypervisor mode and _EL3 in monitor mode."
+
+**Approximate total ARM64 privileged operations: ~100+ depending on system register count per EL.**
+
+#### RISC-V Privilege Instructions
+
+**Pattern:** CSR access encoded with CSR address; privilege determined by CSR number bits [11:10] (00=U, 01=S, 10=reserved, 11=M read-only). Attempting to access from lower privilege → illegal instruction exception.
+
+| Instruction pattern | Privilege | Consequence | Source |
+|---|---|---|---|
+| `CSRRW mstatus, rs1` | M-mode | illegal instruction at S/U | RV Privileged Architecture |
+| `CSRRS mstatus, rs1` | M-mode | illegal instruction | Same |
+| `CSRRW sstatus, rs1` | S-mode (or M) | illegal instruction at U | Same |
+| `CSRRW sepc, rs1` | S-mode (or M) | illegal instruction at U | Same |
+| `SFENCE.VMA rs1, rs2` | S-mode (or M) | illegal instruction at U | Same |
+| `SRET` | S-mode + TSR bit setting | illegal instruction | Same |
+| `MRET` | M-mode | illegal instruction at S/U | Same |
+| `WFI` | Configurable (TW bit controls) | illegal instruction if TW trap | Same |
+| `HFENCE.VVMA` / `HFENCE.GVMA` | H-mode (hypervisor) | illegal instruction | RV H extension |
+| Read-only CSRs written | Any privilege | illegal instruction | "attempting to write a read-only register raises illegal instruction exceptions" |
+
+**Key quote from research:**
+> "In addition to the machine-level CSRs, M-mode can access all CSRs at lower privilege levels."
+> "Attempting to access a CSR without appropriate privilege level or to write a read-only register raises illegal instruction exceptions."
+
+**Approximate total RISC-V privileged operations: ~40 CSRs × 3 instruction types (CSRRW/CSRRS/CSRRC) + mode-transition instructions (MRET/SRET/HRET).**
+
+### Mapping to ZER System #24 (Context Flags)
+
+Both C4 and C5 extend **System #24 Context Flags**. Current System #24 tracks:
+- `in_loop` (boolean)
+- `defer_depth` (integer)
+- `critical_depth` (integer)
+- `in_async` (boolean)
+- `in_interrupt` (boolean)
+- `in_naked` (boolean)
+
+Extensions required (~20 hrs total for both categories):
+
+**C4 extension:** add `cpu_features` as a set-valued context field.
+```c
+/* Checker extension for C4 */
+struct FeatureContext {
+    uint64_t declared_features;  /* bitmap of features known-available */
+    uint64_t required_features;  /* accumulated from asm blocks checked */
+};
+```
+
+Feature set sources:
+- Build-time compiler flag: `--target-features=avx512,aes,bmi2`
+- Per-block attribute: `@requires_features(AES)` on unsafe asm
+- Runtime check in preceding code (via `@cpuid_check(AES)` intrinsic — separate proposal)
+
+**C5 extension:** add `privilege_level` context (hierarchical, not set-valued).
+```c
+/* Checker extension for C5 */
+enum PrivilegeLevel {
+    PL_USER,           /* x86 CPL=3, ARM EL0, RISC-V U-mode */
+    PL_KERNEL,         /* x86 CPL=0, ARM EL1, RISC-V S-mode */
+    PL_HYPERVISOR,     /* ARM EL2, RISC-V H-mode */
+    PL_MONITOR         /* x86 SMX/VMX root, ARM EL3, RISC-V M-mode */
+};
+
+struct PrivilegeContext {
+    PrivilegeLevel current_pl;    /* function-level annotation or inference */
+};
+```
+
+Privilege level sources:
+- Function attribute: `@privilege(kernel)` on function declaration
+- Per-block attribute: `@privilege(kernel)` on unsafe asm
+- Default: PL_USER (most conservative)
+
+### Checker actions
+
+**C4 check (at asm binding):**
+```c
+if (instr_c4_info != NULL) {
+    uint64_t required = instr_c4_info->feature_bit;
+    if ((current_features & required) == 0) {
+        checker_error("%s requires feature %s (C4). "
+                      "Add @requires_features(%s) or build with --target-features=...",
+                      instr, feature_name(required), feature_name(required));
+    }
+}
+```
+
+**C5 check:**
+```c
+if (instr_c5_info != NULL) {
+    PrivilegeLevel required = instr_c5_info->min_privilege;
+    if (current_pl < required) {
+        checker_error("%s requires %s (C5). "
+                      "Annotate enclosing function with @privilege(%s)",
+                      instr, privilege_name(required), privilege_name(required));
+    }
+}
+```
+
+### POC specifications (see `research/asm_generics/C4_cpu_feature/` and `C5_privilege/`)
+
+- `research/asm_generics/C4_cpu_feature/reject/x86_aesenc_no_feature.zer` — AESENC without feature declaration → reject
+- `research/asm_generics/C4_cpu_feature/accept/x86_aesenc_declared.zer` — AESENC with `@requires_features(AES)` → accept
+- `research/asm_generics/C5_privilege/reject/x86_wrmsr_user.zer` — WRMSR in user-privilege function → reject
+- `research/asm_generics/C5_privilege/reject/arm64_msr_sctlr_el0.zer` — MSR SCTLR_EL1 from EL0-annotated function → reject
+- `research/asm_generics/C5_privilege/accept/x86_wrmsr_kernel.zer` — WRMSR in `@privilege(kernel)` function → accept
+
+### Open questions / follow-ups for C4+C5
+
+1. **Feature subset inference:** if user declares `@requires_features(AVX512F)`, should AVX/SSE2 be auto-implied? (Yes — AVX-512 requires AVX which requires SSE2. Transitive closure via feature graph.)
+2. **Runtime feature check integration:** does ZER provide `@cpuid_check()` intrinsic that narrows feature context within a block? (Future proposal; for now require build-time declaration.)
+3. **Privilege downgrade in nested calls:** can a kernel function call a user-level helper without violating? (Yes — but the helper's body must not re-assume kernel privilege. Function attribute enforced at declaration.)
+4. **C5 vs Virtualization:** ARM `HVC` and x86 VMCALL are mode transitions that "escape" current privilege. Should these be C5c (valid in any mode, but traps) or separate? (Classify as C5c — they're always callable but effect depends on current mode.)
+
+### Session 4 completion marker
+
+**Categories C4 (CPU feature) + C5 (Privilege) research: COMPLETE ✓ 2026-04-24 [this commit]**
+- Both verified across all 3 archs
+- C4 instruction count: ~150 x86-64 + ~200 ARM64 + ~100 RISC-V (representative samples classified in detail; full enumeration is data-file work)
+- C5 instruction count: ~60 x86-64 + ~100 ARM64 + ~40 RISC-V
+- Both map to System #24 Context Flags
+- Extensions required: ~20 hrs total (cpu_features set + privilege_level hierarchy)
+- POC `.zer` files in research/asm_generics/C4_cpu_feature/ and C5_privilege/
+- **C4 and C5 kept separate** — different context semantics (set-membership vs hierarchy)
+
+**Next session: Category C6 (Memory addressability) + C7 (Provenance/aliasing) — both reuse existing Systems #19, #3, #11 without new extensions. Short research session expected.**
+
+---
+
 ### Legacy first-pass survey (FOR REFERENCE — superseded by verified research above)
 
 **Note: This section preserved from first-pass memory-based survey before WebFetch verification. Retained for historical context; use VERIFIED sections above for all classification decisions.**

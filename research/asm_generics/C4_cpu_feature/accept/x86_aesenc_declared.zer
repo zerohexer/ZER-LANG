@@ -1,0 +1,52 @@
+// EXPECTED: compiles + runs (on CPU with AES-NI)
+//
+// Category C4b (CPU feature gate) — x86-64 AESENC with proper feature declaration.
+// POSITIVE TEST: function explicitly declares AES feature requirement.
+//
+// Pattern: @requires_features(AES) on function tells checker that any
+// caller must ensure AES is available before invoking this function.
+// Within the function, AESENC passes C4 check.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C4+C5 session 4
+
+// When strict mode implements C4 check, the following attribute-style
+// declaration should satisfy the requirement:
+//
+//     @requires_features(AES)
+//     void aes_encrypt_round(*u8 block, *u8 key) {
+//         unsafe asm {
+//             instructions: "aesenc (%1), %%xmm0\n\t"
+//                           "movdqu %%xmm0, (%0)"
+//             inputs:  { "r" = block, "r" = key }
+//             clobbers: ["xmm0", "memory"]
+//             safety: "AES encryption round (requires AES-NI)"
+//         }
+//     }
+//
+// Category C4b check PASSES:
+//   - current_features = {AES} (from @requires_features)
+//   - AESENC required_feature = AES_NI ∈ {AES} → OK
+
+// Placeholder: simulate AES-like operation with basic XOR until
+// hardened unsafe asm + @requires_features attribute land.
+void fake_aes_encrypt(*u8 block, *u8 key) {
+    u32 i = 0;
+    while (i < 16) {
+        block[i] = block[i] ^ key[i];
+        i += 1;
+    }
+}
+
+i32 main() {
+    u8[16] block;
+    u8[16] key;
+    u32 j = 0;
+    while (j < 16) {
+        block[j] = (u8)j;
+        key[j] = 0xFF;
+        j += 1;
+    }
+    fake_aes_encrypt(&block[0], &key[0]);
+    if (block[0] == 0xFF && block[15] == (0xFF ^ 15)) { return 0; }
+    return 1;
+}

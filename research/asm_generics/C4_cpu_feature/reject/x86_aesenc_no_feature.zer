@@ -1,0 +1,38 @@
+// EXPECTED: compile error
+//
+// Category C4b (CPU feature gate, optional extension) — x86-64 AESENC
+// Source: Intel SDM AESENC — requires `CPUID.01H:ECX.AES[bit 25]` to be set.
+// Exception: #UD (Invalid Opcode) if feature absent.
+//
+// Precondition: AESENC requires AES-NI feature to be declared as available.
+// Violation: using AESENC in a function without @requires_features(AES) and
+// no build-time --target-features=aes.
+//
+// ZER checker (System #24 Context Flags, extended with cpu_features) must
+// reject when required feature not in context's declared_features set.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C4+C5 session 4
+
+void unsafe_aes_encrypt(*u8 block, *u8 key) {
+    // No @requires_features(AES) attribute on this function.
+    // No build-time feature declaration assumed.
+    // current_features = {}.
+    // AESENC required_feature = AES_NI → not in current_features.
+    //
+    // Category C4b check must REJECT.
+    //
+    // Expected error: "AESENC requires feature AES-NI (C4).
+    //                  Add @requires_features(AES) to function, or
+    //                  compile with --target-features=aes."
+    unsafe asm {
+        instructions: "aesenc (%1), %%xmm0\n\t"
+                      "movdqu %%xmm0, (%0)"
+        inputs:  { "r" = block, "r" = key }
+        clobbers: ["xmm0", "memory"]
+        safety: "AES encryption round"
+    }
+}
+
+i32 main() {
+    return 0;
+}

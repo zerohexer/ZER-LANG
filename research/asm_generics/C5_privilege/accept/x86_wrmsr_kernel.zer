@@ -1,0 +1,43 @@
+// EXPECTED: compiles (kernel-context function)
+//
+// Category C5a (Privilege, kernel-only) — x86-64 WRMSR with proper annotation.
+// POSITIVE TEST: function declares @privilege(kernel), WRMSR passes check.
+//
+// Research citation: docs/asm_preconditions_research.md Categories C4+C5 session 4
+
+// When strict mode lands, declaration would be:
+//
+//     @privilege(kernel)
+//     void write_msr_safe(u32 msr, u64 value) {
+//         u32 lo = (u32)value;
+//         u32 hi = (u32)(value >> 32);
+//
+//         unsafe asm {
+//             instructions: "wrmsr"
+//             inputs:  { "c" = msr, "a" = lo, "d" = hi }
+//             clobbers: []
+//             safety: "Write MSR — kernel privilege asserted via @privilege"
+//         }
+//     }
+//
+// Category C5a check PASSES:
+//   - current_pl = PL_KERNEL (from @privilege(kernel))
+//   - WRMSR required_pl = PL_KERNEL → PL_KERNEL >= PL_KERNEL → OK
+//
+// Callers of this function must themselves be in kernel context, or
+// transition via a trap/syscall handler. ZER's checker enforces this
+// recursively up the call graph.
+
+// Placeholder implementation for current compiler state:
+void write_msr_sim(u32 msr, u64 value) {
+    // In real kernel code, this would be:
+    //     unsafe asm { "wrmsr" ... }
+    // For now, simulate the state update
+    (void)msr;
+    (void)value;
+}
+
+i32 main() {
+    write_msr_sim(0x1B, 0xFEE00900);  // example: IA32_APIC_BASE
+    return 0;
+}

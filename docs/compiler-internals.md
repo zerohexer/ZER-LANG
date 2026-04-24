@@ -6519,54 +6519,61 @@ semantic correctness orthogonally.
 Added to the 18 structural rules (S/O/I/E) documented in
 `docs/asm_plan.md`. Total strict mode = 31 rules, 99% language-safe.
 
-| Z-rule | Check | ZER system leveraged | File to modify |
+**CRITICAL: `zercheck.c` is being DELETED (Phase G of CFG migration, v0.5.0). Only `zercheck_ir.c` will remain.** Z-rules that need state-machine tracking go in `zercheck_ir.c` (which handles IR_ASM instruction case), NOT `zercheck.c`. See CLAUDE.md "CFG Migration" section.
+
+**Z-rules are split across TWO layers:**
+
+**zercheck_ir.c (2 rules — operate on IR_ASM instruction locals):**
+
+| Z-rule | Check | System | When checked |
 |---|---|---|---|
-| Z1 | Handle operand must be ALIVE (not FREED/TRANSFERRED) | System #7 Handle States | `zercheck.c` — existing `find_handle()` check at asm input binding |
-| Z2 | `move struct` consumed by asm → HS_TRANSFERRED | System #10 Move Tracking | `zercheck.c` — existing move-struct path, extend to asm consumption |
-| Z3 | VRP ranges propagate through asm outputs | System #12 Range Propagation | `checker.c` — VRP `derive_expr_range()` wired to asm outputs |
-| Z4 | Provenance tracked on `*opaque` asm operands | System #3 Provenance | `checker.c` — existing provenance check at asm output binding |
-| Z5 | `memory` clobber propagates escape flags | System #11 Escape Flags | `checker.c` — existing `scan_escape()` path, trigger on memory clobber |
-| Z6 | Context flags enforced (defer/critical/async) | System #24 Context Flags | `checker.c` — existing `c->in_defer`, `c->critical_depth`, etc. |
-| Z7 | MMIO range check on memory operands | System #19 MMIO Ranges | `checker.c` — existing mmio range check applied to asm memory op |
-| Z8 | Qualifier preservation through asm | System #20 Qualifier Tracking | `checker.c` — existing qualifier strip check at asm binding |
-| Z9 | Asm inside ISR respects tracking | System #17 ISR Tracking | `checker.c` — existing ISR ban list applied to asm body |
-| Z10 | Non-storable asm outputs | System #16 Non-Storable | `checker.c` — existing non-storable check on asm output lvalue |
-| Z11 | Keep-parameter requirements | System #21 Keep Parameters | `checker.c` — existing keep check on asm input |
-| Z12 | Stack frame accounting through asm | System #18 Stack Frames | `checker.c` — `scan_frame()` walker must handle NODE_ASM |
-| Z13 | Return-range declaration respected | System #13 Return Range | `checker.c` — existing return range check at asm output |
+| Z1 | Handle operand must be ALIVE (not FREED/TRANSFERRED) | #7 Handle States | IR_ASM input local has handle state checked |
+| Z2 | `move struct` consumed by asm → HS_TRANSFERRED | #10 Move Tracking | IR_ASM input local marked transferred |
 
-### Where to wire up each Z-rule
+**checker.c (11 rules — operate on NODE_ASM AST operands):**
 
-For fresh sessions implementing Z-rules: the checker has ONE main
-dispatch site for asm — `check_asm_stmt()` or equivalent. Each
-Z-rule hooks a specific existing tracking function:
+| Z-rule | Check | ZER system | File/function to invoke |
+|---|---|---|---|
+| Z3 | VRP ranges propagate through asm outputs | #12 Range Propagation | `checker.c` `derive_expr_range()` on output |
+| Z4 | Provenance tracked on `*opaque` asm operands | #3 Provenance | `checker.c` existing provenance check |
+| Z5 | `memory` clobber propagates escape flags | #11 Escape Flags | `checker.c` `scan_escape()` trigger |
+| Z6 | Context flags enforced (defer/critical/async) | #24 Context Flags | `checker.c` existing `c->in_defer`, etc. |
+| Z7 | MMIO range check on memory operands | #19 MMIO Ranges | `checker.c` existing mmio range check |
+| Z8 | Qualifier preservation through asm | #20 Qualifier Tracking | `checker.c` existing qualifier strip check |
+| Z9 | Asm inside ISR respects tracking | #17 ISR Tracking | `checker.c` existing ISR ban list |
+| Z10 | Non-storable asm outputs | #16 Non-Storable | `checker.c` existing non-storable check |
+| Z11 | Keep-parameter requirements | #21 Keep Parameters | `checker.c` existing keep check |
+| Z12 | Stack frame accounting through asm | #18 Stack Frames | `checker.c` `scan_frame()` walker, NODE_ASM case |
+| Z13 | Return-range declaration respected | #13 Return Range | `checker.c` existing return range check |
+
+**Why this split:** `zercheck_ir.c` is CFG-based state-machine analysis on IR. It naturally sees IR locals flowing into IR_ASM instructions — Handle state + move tracking are state machines that CFG analysis handles. Everything else (VRP, provenance, escape, context, MMIO, etc.) is AST-level point properties handled in `checker.c`.
+
+### Where to wire up each Z-rule (TWO layers)
+
+Z-rules split across two compilation stages:
+
+#### Stage 1 — checker.c (AST level, runs first)
+
+ONE main dispatch site for asm at AST level — `check_unsafe_asm()`.
+11 of 13 Z-rules live here. All invoke EXISTING checker.c tracking
+functions:
 
 ```c
 static void check_unsafe_asm(Checker *c, Node *asm_node) {
     /* Existing Phase 1 verified check — keep */
     if (!zer_asm_allowed_in_context(c->in_naked)) { ... }
 
-    /* Z6: context flags (already covered by existing checks) */
+    /* Z6: context flags (uses existing Checker fields) */
     if (c->in_defer || c->critical_depth > 0 || c->in_async) { ... }
 
-    /* Z9: ISR context (already covered) */
+    /* Z9: ISR context (uses existing ISR ban list) */
     if (c->in_interrupt) { check_isr_ban_list(c, asm_node); }
-
-    /* Z12: stack frame accounting — scan_frame() must visit NODE_ASM */
 
     /* For each input operand: */
     for (each input in asm_node->inputs) {
         Type *t = check_expr(c, input.expr);
 
-        /* Z1: Handle state check (delegate to zercheck) */
-        zc_check_expr(zc, input.expr);
-
-        /* Z2: move struct consumption */
-        if (type_is_move_struct(t)) {
-            mark_transferred(c, input.expr);
-        }
-
-        /* Z3: VRP range propagate */
+        /* Z3: VRP range propagate (checker.c range tracking) */
         VarRange r = derive_expr_range(c, input.expr);
 
         /* Z4: provenance check */
@@ -6586,16 +6593,64 @@ static void check_unsafe_asm(Checker *c, Node *asm_node) {
         if (needs_keep(c, input.expr)) { ... }
     }
 
-    /* For each output operand: same pattern for output side */
+    /* For each output operand: similar pattern + Z10 non-storable + Z13 return range */
+
     /* Z5: escape flags from memory clobber */
     if (has_memory_clobber(asm_node)) {
         propagate_escape_from_memory_clobber(c, asm_node);
     }
+
+    /* Z12 is handled by scan_frame() walker visiting NODE_ASM — not here */
 }
 ```
 
-**The functions called above ALREADY EXIST for normal ZER code.**
-Z-rules just invoke them at asm operand boundaries.
+#### Stage 2 — zercheck_ir.c (IR level, runs via emitter hook)
+
+After IR lowering, zercheck_ir.c sees the IR_ASM instruction with
+operand locals. 2 Z-rules live here (state-machine tracking on IR):
+
+```c
+/* In zc_check_ir_inst() — the main per-instruction dispatch */
+case IR_ASM: {
+    /* Z1: Handle state UAF check via asm operand */
+    for (uint32_t i = 0; i < inst->asm_input_count; i++) {
+        IRLocal *l = &func->locals[inst->asm_inputs[i].local_id];
+
+        if (is_handle_type(l->type)) {
+            HandleState s = zc_ir_handle_state(zc, l);
+            if (s == HS_FREED || s == HS_MAYBE_FREED) {
+                zc_ir_error(zc, inst,
+                    "use-after-free: asm operand uses freed handle");
+            } else if (s == HS_TRANSFERRED) {
+                zc_ir_error(zc, inst,
+                    "use-after-move: asm operand uses transferred handle");
+            }
+        }
+
+        /* Z2: move struct consumed by asm */
+        if (is_move_struct_type(l->type)) {
+            zc_ir_mark_transferred(zc, l);
+        }
+    }
+
+    /* Outputs: normal fresh-state handling (existing pattern) */
+    for (uint32_t i = 0; i < inst->asm_output_count; i++) {
+        IRLocal *l = &func->locals[inst->asm_outputs[i].local_id];
+        zc_ir_mark_assigned(zc, l);
+    }
+    break;
+}
+```
+
+**DO NOT PUT Z1/Z2 IN `zercheck.c` — that file is being DELETED** per
+CFG migration Phase G. All state-machine tracking moves to
+`zercheck_ir.c`. See CLAUDE.md "CFG Migration" section.
+
+**All helper functions above (`zc_ir_handle_state`, `zc_ir_mark_transferred`,
+`zc_ir_mark_assigned`, `derive_expr_range`, `check_provenance_match`,
+`check_mmio_range`, `check_qualifier_preservation`, `propagate_escape_from_memory_clobber`)
+ALREADY EXIST** for normal ZER code paths. Z-rules just add IR_ASM and
+NODE_ASM as new call sites.
 
 ### Language-safe vs logic-safe (scope distinction)
 
@@ -6671,14 +6726,14 @@ i32 main() { return 0; }
 Put negative tests in `tests/zer_fail/dalpha_zrule_ZN_*.zer` — one
 per Z-rule. Positive tests in `tests/zer/dalpha_zrule_ZN_*.zer`.
 
-### Effort estimate (roughly confirmed)
+### Effort estimate (2-layer split)
 
 **~240 hrs total for Z-rules implementation.** Breakdown:
 
+**checker.c additions (~170 hrs, 11 rules):**
+
 | Work | Hours |
 |---|---|
-| Z1 (Handle state) — wire `zc_check_expr` at asm input | 15 |
-| Z2 (move tracking) — extend transfer-on-consume path | 15 |
 | Z3 (VRP) — propagate through asm outputs | 30 |
 | Z4 (provenance) — existing check at asm binding | 15 |
 | Z5 (escape) — memory clobber triggers escape scan | 25 |
@@ -6688,14 +6743,34 @@ per Z-rule. Positive tests in `tests/zer/dalpha_zrule_ZN_*.zer`.
 | Z9 (ISR) — extend existing ISR ban | 10 |
 | Z10 (non-storable) — existing check | 10 |
 | Z11 (keep) — existing check | 10 |
-| Z12 (stack frame) — `scan_frame` must visit NODE_ASM | 15 |
+| Z12 (stack frame) — `scan_frame()` must visit NODE_ASM | 15 |
 | Z13 (return range) — existing check | 10 |
-| Test suite (13 negative + 13 positive) | 40 |
-| **Total** | **~240 hrs** |
 
-Most of the 240 hrs is extending existing infrastructure to handle
-NODE_ASM (or similar) as an input/output binding site. None of the
-individual checks are new — just invocation sites.
+**zercheck_ir.c additions (~30 hrs, 2 rules):**
+
+| Work | Hours |
+|---|---|
+| Z1 (Handle state) — IR_ASM handler invokes `zc_ir_handle_state` on operand locals | 15 |
+| Z2 (move tracking) — IR_ASM handler marks input move-struct locals as TRANSFERRED | 15 |
+
+**ir_lower.c additions (~40 hrs):**
+
+| Work | Hours |
+|---|---|
+| NODE_ASM → IR_ASM lowering with operand bindings preserved | 40 |
+
+**Tests (~40 hrs):**
+
+| Work | Hours |
+|---|---|
+| 13 negative + 13 positive test files + CI wiring | 40 |
+
+**Total: ~280 hrs** (slight revision from 240 earlier — extra 40 hrs for
+IR_ASM lowering work that was implicit before).
+
+Most of the effort is extending existing infrastructure to handle
+NODE_ASM/IR_ASM as new operand-binding sites. None of the individual
+checks are new — just invocation sites at the asm boundary.
 
 ### Plan integration
 

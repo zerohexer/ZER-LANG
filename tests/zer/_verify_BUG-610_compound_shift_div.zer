@@ -1,0 +1,41 @@
+// BUG-610: emit_rewritten_node missed compound shift/div safety.
+// BUG-604 fixed binary `<<`/`>>`/`/`/`%` but compound forms (`<<=`,
+// `>>=`, `/=`, `%=`) still emitted as raw C — UB on shift>=width
+// and missing div-by-zero / INT_MIN/-1 trap on compound assigns.
+// Per ZER spec: shift by >= width returns 0 (not C's UB).
+
+struct S { u32 v; }
+
+i32 main() {
+    // 1. Compound left-shift by >= width — must clamp to 0
+    u32 x = 1;
+    u32 n = 35;  // >= 32
+    for (u32 k = 0; k < 1; k += 1) { n = 35; }
+    x <<= n;
+    if (x != 0) { return 1; }
+
+    // 2. Compound right-shift by >= width — must clamp to 0
+    u32 y = 0xffffffff;
+    u32 m = 64;  // >= 32
+    for (u32 k = 0; k < 1; k += 1) { m = 64; }
+    y >>= m;
+    if (y != 0) { return 2; }
+
+    // 3. Compound shift on struct field — same rule must apply
+    S s;
+    s.v = 1;
+    u32 fn = 33;
+    for (u32 k = 0; k < 1; k += 1) { fn = 33; }
+    s.v <<= fn;
+    if (s.v != 0) { return 3; }
+
+    // 4. Compound shift on array element — same rule must apply
+    u32[4] arr;
+    arr[0] = 1;
+    u32 an = 33;
+    for (u32 k = 0; k < 1; k += 1) { an = 33; }
+    arr[0] <<= an;
+    if (arr[0] != 0) { return 4; }
+
+    return 0;
+}

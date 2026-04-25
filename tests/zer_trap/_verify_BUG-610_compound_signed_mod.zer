@@ -1,0 +1,14 @@
+// BUG-610: compound `%=` in IR path also missed signed INT_MIN/-1 trap.
+// Same fix as compound `/=` (statement-expression with INT_MIN check).
+// Must compile clean and trap with "signed division overflow".
+
+i32 returns_neg_one() { return -1; }
+
+i32 main() {
+    i32 x = -2147483647;
+    x -= 1;  // INT_MIN
+    i32 d = returns_neg_one();
+    if (d == 0) { return 0; }
+    x %= d;  // INT_MIN % -1 -> must trap (same as /)
+    return x;
+}

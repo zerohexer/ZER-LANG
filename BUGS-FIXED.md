@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-25 — BUG-610: compound `<<=`/`>>=`/`/=`/`%=` missed safety wrappers in IR path
+
+**Symptom:** `x <<= n` for `n >= width` emitted as raw C `x <<= n;` — invokes
+C undefined behavior. Same for `>>=` and signed `/=`/`%=` (INT_MIN/-1 case).
+Also: compound div/mod missed the division-by-zero defense-in-depth trap
+that the AST path emits.
+
+**Root cause:** BUG-604 (commit 537c03a) extended `emit_rewritten_node`
+(IR expression-preserved path) to wrap binary `<<`, `>>`, `/`, `%` with
+`_zer_shl`/`_zer_shr` and signed-overflow traps. The compound-assign forms
+`<<=`, `>>=`, `/=`, `%=` were missed — they fell through to the bare
+`target op= value` emission at lines 5563-5566. The AST `emit_expr` had
+handled these compound forms at lines 1361-1407 since the BUG-368 era, but
+those wrappers never made it into the IR path during the BUG-604 fix.
+
+**Fix:** Add explicit handlers BEFORE the bare emit, mirroring `emit_expr`:
+- `TOK_LSHIFTEQ` / `TOK_RSHIFTEQ` → emit `target = _zer_shl(target, value)`
+  (or `_zer_shr`). Side-effect detection on target (NODE_CALL/NODE_ASSIGN
+  in field/index chain) hoists via pointer to avoid double evaluation.
+- `TOK_SLASHEQ` / `TOK_PERCENTEQ` → emit statement expression with
+  div-by-zero trap; for signed types, also INT_MIN/-1 trap.
+
+Single 73-line block added in `emit_rewritten_node` NODE_ASSIGN handler.
+
+**Tests:**
+- `tests/zer/_verify_BUG-610_compound_shift_div.zer` — positive test
+  covering compound `<<=`/`>>=` on local var, struct field, array element,
+  all returning 0 (per ZER spec, shift by >= width = 0).
+- `tests/zer_trap/_verify_BUG-610_compound_signed_div.zer` — runtime trap
+  for compound signed `/=` on INT_MIN/-1.
+- `tests/zer_trap/_verify_BUG-610_compound_signed_mod.zer` — runtime trap
+  for compound signed `%=` on INT_MIN/-1.
+
+**Found by:** Principle-first audit of every safety wrapper in the AST path
+(`grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr"` filtered to
+emit_expr range) cross-referenced against the IR equivalents. The BUG-604
+commit message showed the binary fix; checking the same operators in
+compound form exposed the gap.
+
+**Lesson:** When fixing a class of bug at one operator, ALSO check the
+compound-assign forms of that operator. `<<` and `<<=` are not the same
+code path — they hit different switch cases with different fallthrough
+behavior. Same for `/`/`/=` and `%`/`%=`. Future "extend safety wrapper"
+tickets must audit both forms.
+
+**Audit-tool gap (deferred):** `tools/audit_matrix.sh` does not yet
+cross-check binary-vs-compound operator parity. Would have caught this.
+Adding such a check is non-trivial (requires per-operator wrapper tables) —
+left for future work.
+
+---
+
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)
 
 **Change:** Added `unsafe asm(...)` as the REQUIRED form for inline assembly. Bare `asm(...)` is rejected at compile time with a helpful error message pointing to `unsafe asm`.

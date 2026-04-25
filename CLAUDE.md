@@ -457,7 +457,9 @@ mmio 0x40011000..0x4001103F;   // multiple ranges allowed
 // Propagates through aliases and clears+re-derives on assignment
 ```
 
-### Function Pointers
+### Function Pointers — Two Syntaxes (both supported, same TYNODE_FUNC_PTR)
+
+**Variant 2A — C-style (compatible with kernel C, requires typedef for some forms):**
 ```
 u32 (*fn)(u32, u32) = add;              // local variable
 void (*callback)(u32 event);             // global variable
@@ -468,10 +470,45 @@ typedef u32 (*BinOp)(u32, u32);          // function pointer typedef
 typedef ?u32 (*OptHandler)(u32);         // typedef with optional return
 BinOp[4] ops;                            // array of function pointers (via typedef)
 ```
+
+**Variant 2C — ZER-native (typedef-free everywhere, follows `*T name` convention, 2026-04-25):**
+```
+*(u32, u32) -> u32 fn = add;             // local variable — name LAST, type first
+*(u32 event) callback;                    // void return = no arrow
+struct Ops { *(u32) -> u32 compute; }     // struct field
+u32 apply(*(u32, u32) -> u32 op, x, y);  // parameter
+?*(u32) -> u32 on_event = null;           // nullable funcptr
+*(u32) -> ?u32 lookup;                    // funcptr returning optional
+*(u32, u32) -> u32 [4] ops;               // array — INLINE, no typedef!
+*(u32, u32) -> u32 select_op(u32 kind);   // return type — INLINE, no typedef!
+*(keep *Handler) register_fn;              // keep on individual params
+```
+
+Discriminator: `*` BEFORE `(` = 2C, `*` INSIDE `(` = 2A. Parser branches on this. Both produce identical `TYPE_FUNC_PTR` so checker/IR/emitter/zercheck_ir/all 29 safety systems are operator-agnostic.
+
 **`?` on funcptr — context-dependent (BUG-420):**
-- At var/param/field/global: `?RetType (*name)(params)` → **nullable funcptr** (? wraps the pointer)
-- At typedef: `typedef ?RetType (*Name)(params)` → **funcptr returning optional** (? is part of return type)
-- For nullable typedef'd funcptr: `?TypedefName var = null;`
+- 2A: `?RetType (*name)(params)` (var/param/field/global) → **nullable funcptr**
+- 2A: `typedef ?RetType (*Name)(params)` → **funcptr returning optional**
+- 2C: `?*(args) -> R` → nullable funcptr, `*(args) -> ?R` → funcptr returning optional. Position is unambiguous, no special typedef rule.
+
+### Field access: `.` everywhere (no `->` for indirection)
+
+ZER uses `.` for ALL field access — values, pointers, Handles. No `->` operator in expression context. Modeled on Rust/Zig (both modern systems langs use `.` everywhere).
+
+```
+Task v;          v.field;       // value — direct
+*Task ptr;       ptr.field;     // pointer — auto-deref
+Handle(T) h;    h.field;        // Handle — auto-lookup via slab.get + gen check
+```
+
+The `->` thin arrow is **type-level only** — appears solely as the return-type separator in 2C funcptr syntax. Never in expression context. No collision.
+
+Why `.` everywhere (decided 2026-04-25 after deep design discussion):
+- Refactor safety: change `*Task next` to `Handle(Task) next` and call sites unchanged
+- Chain ergonomics: `bob.list.next.prev` reads uniformly (no `bob->list.next->prev` alternation)
+- Modern systems-lang convention: Rust, Zig both use `.` everywhere — proven in kernel/embedded
+- 29 safety systems all run at IR/Symbol/Type level — operator is parser-only, no semantic loss
+- Mental model still taught by VISIBLE TYPES (`*T`, `?*T`, `Handle(T)`), not by deref operator
 
 ### Defer
 ```

@@ -592,9 +592,12 @@ void greet([*]u8 name) {
 ### Function Pointer
 
 **DESCRIPTION**
-Same syntax as C. Optional function pointers use null sentinel.
+ZER supports two function pointer syntaxes — both produce the same type, both work everywhere, choose by style:
 
-**SYNTAX**
+- **Variant 2A** — C-style, identical to kernel C. Requires typedef for arrays and inline-return-of-funcptr.
+- **Variant 2C** — ZER-native (`*(args) -> ret name`), follows the `*T name` type-first convention, typedef-free in every position.
+
+**SYNTAX — Variant 2A (C-style)**
 ```zer
 u32 (*fn)(u32, u32) = add;                 // local variable
 void (*callback)(u32 event);               // global variable
@@ -605,6 +608,35 @@ typedef u32 (*BinOp)(u32, u32);            // typedef
 typedef ?u32 (*OptHandler)(u32);           // typedef — returns ?u32
 BinOp[4] ops;                              // array of function pointers (via typedef)
 ```
+
+**SYNTAX — Variant 2C (ZER-native, typedef-free)**
+```zer
+*(u32, u32) -> u32 fn = add;               // local variable
+*(u32 event) callback;                      // global; void return = no arrow
+struct Ops { *(u32) -> u32 compute; }       // struct field
+u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y);  // parameter
+?*(u32) -> u32 on_event = null;             // nullable funcptr
+*(u32) -> ?u32 lookup;                      // funcptr returning optional
+*(keep *Handler) register;                   // keep modifier on a param
+
+// Cases that REQUIRED typedef in 2A — now inline in 2C:
+*(u32, u32) -> u32 [4] ops;                  // array of funcptrs — INLINE
+*(u32, u32) -> u32 select_op(u32 kind);      // return-of-funcptr — INLINE
+```
+
+Discriminator: `*` BEFORE `(` is 2C; `*` INSIDE `(` is 2A. Both produce identical AST/types, so all downstream behavior (checker, IR, emitter, all 29 safety systems) is operator-agnostic — pick by readability.
+
+**FIELD ACCESS RULE**
+
+ZER uses `.` for ALL field access — values, pointers, Handles. No `->` operator in expressions. The `->` thin arrow is reserved for the 2C return-type separator (type-level only).
+
+```zer
+Task v;            v.field;       // value — direct access
+*Task ptr;         ptr.field;     // pointer — compiler auto-derefs
+Handle(T) h;       h.field;       // Handle — compiler auto-looks-up via slab.get
+```
+
+Mental model is taught by visible types (`*T`, `?*T`, `Handle(T)`), not by the deref operator. Modeled on Rust/Zig — both modern systems languages use `.` everywhere.
 
 **OPTIONAL FUNCTION POINTERS VS OPTIONAL RETURN**
 ```zer

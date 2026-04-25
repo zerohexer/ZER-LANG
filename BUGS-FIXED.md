@@ -5,6 +5,101 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-25 — Variant 2C funcptr syntax + return-of-funcptr emit fix + 7 fervent-curie bugs
+
+Big session. Two distinct workstreams landed: (1) verification & fixes for 7 bugs from parallel `claude/fervent-curie-*` audit branches (committed earlier as 537c03a, doc back-filled now), (2) Variant 2C funcptr syntax + a previously-undetected emitter limitation it surfaced.
+
+### Variant 2C function pointer syntax — feature (commit c02100b)
+
+**Change:** Added ZER-native funcptr syntax `*(args) -> ret name` alongside the existing C-style `T (*name)(args)`. Both produce identical `TYNODE_FUNC_PTR` AST nodes — choice is purely stylistic, downstream code (checker, IR, emitter, zercheck_ir, all 29 safety systems) is operator-agnostic.
+
+**Why:** 2A C-style requires typedef for arrays-of-funcptrs and inline-return-of-funcptr. 2C is typedef-free in every position. Follows ZER's `*T name` type-first convention (which 2A breaks by burying the name in `(*name)` middle-of-line).
+
+**Implementation:**
+- `lexer.h`: New `TOK_THIN_ARROW` token (`->`). Distinct from `TOK_ARROW` (`=>`, switch arms).
+- `lexer.c`: `case '-':` now peeks for `>` to emit TOK_THIN_ARROW. Strictly additive — verified zero pre-existing `.zer` source uses `->` as an operator (12 files contain it, all in comments).
+- `parser.c`: New `parse_func_ptr_2c` (~80 lines). In `parse_type`, peek-and-dispatch when `*` is followed by `(`. The `*` BEFORE `(` is the 2C discriminator; `*` INSIDE `(` (as in 2A) stays unambiguous.
+- `emitter.c`: No 2C-specific changes — the existing `emit_type_and_name` already handled TYPE_FUNC_PTR variables/fields/params correctly.
+
+**Field access decision (also locked in this session):** Stay with `.` everywhere for field access. Do NOT add `->` for indirection. The `->` thin arrow appears ONLY in TYPE position (2C return separator), never in expression context. Reasoning, evaluated against Rust + Zig + C precedent:
+- Refactor safety: changing `*Task next` to `Handle(Task) next` doesn't ripple through call sites
+- Chain ergonomics: `bob.list.next.prev` reads uniformly (no `bob->list.next->prev` alternation noise)
+- Modern systems-lang convention: Rust + Zig both `.` everywhere, proven in kernel/embedded
+- 29 safety systems all run at IR/Symbol/Type level — operator is parser-level only, no semantic loss
+- Mental model still taught by VISIBLE TYPES (`*T`, `?*T`, `Handle(T)`)
+
+**Test:** `tests/zer/_verify_funcptr_2c.zer` — exercises every 2C position (variable, parameter, struct field, void return, no-arg, with args, return-of-funcptr inline, array of funcptrs).
+
+**Tests:** 477/477 ZER integration (was 476, +1), 3,649 total across `make docker-check`. VST: zero admits across 23 files.
+
+### BUG-604 — function returning funcptr emitted invalid C (pre-existing, surfaced by 2C work)
+
+**Symptom:** `BinOp pick(u32 k) { ... }` (typedef'd 2A) AND `*(u32, u32) -> u32 select(u32 k) { ... }` (inline 2C) both emitted:
+```c
+uint32_t (*)(uint32_t, uint32_t) select(uint32_t k) { ... }   // INVALID C
+```
+GCC error: `expected identifier or '(' before ')' token`. Affected ALL functions returning a function pointer.
+
+**Root cause:** `emit_regular_func_from_ir` (emitter.c:9288) emitted return type via plain `emit_type(e, ret)` followed by name. When `ret->kind == TYPE_FUNC_PTR`, this produces `RET (*)(args) NAME(params)`. The correct C form for "function returning funcptr" is the nested-paren form `RET (*NAME(params))(args)`. NO existing test in 3,649 exercised this case (neither inline 2A nor typedef'd 2A) — bug had been latent since the IR emitter landed.
+
+**Why nobody noticed:** 2A always required typedef for inline-return-of-funcptr (which only handful of niche tests would ever use), so the broken emit path was never reached. 2C made return-of-funcptr inline-natural, which exposed the gap immediately on the first 2C test.
+
+**Fix:** In `emit_regular_func_from_ir`, detect `ret_is_funcptr` and emit the nested-paren form:
+1. `RET_OF_RET (*` — open
+2. `NAME(func_params)` — function name + own params
+3. `)(funcptr_arg_types) {` — close nested-paren, then funcptr's args, then body
+
+**Pattern:** Function-level emission must mirror `emit_type_and_name`. Variable/field case was correct since BUG-412 (2026-04-05). Function-declaration case had silent symmetry-break. **Future:** any emitter site emitting `type+name` in declaration position should use the existing `emit_type_and_name` machinery, never `emit_type(...)` + bare name.
+
+**Test:** `tests/zer/_verify_funcptr_2c.zer` covers both inline 2C and typedef 2A return-of-funcptr.
+
+### Cross-branch fervent-curie bug fixes (commit 537c03a, doc back-filled)
+
+7 bugs identified by parallel `claude/fervent-curie-*` audit branches. Each was reproduced on main BEFORE applying fix; reproducer tests kept as permanent regressions in `tests/zer/_verify_BUG-*.zer` and `tests/zer_fail/_verify_BUG-*.zer`.
+
+**BUG-605 — `is_from_arena` flag stale after pointer reassign (checker.c)**
+After `p = arena.alloc(Cell) orelse return; p = &global_cell;`, the stale `is_from_arena` taint on `p` triggered false "arena pointer escape" errors on subsequent uses. Fix: clear `is_from_arena` in NODE_ASSIGN's clear-on-ident-assign block (1 line).
+Test: `tests/zer/_verify_BUG-597_arena_flag_reset.zer`.
+
+**BUG-606 — backward-goto label fixed buffer (zercheck.c only — IR analyzer untouched)**
+Same-block backward goto UAF detection used `labels[32]` fixed buffer in zercheck.c — silently dropped labels past index 32 in pathological programs. Fix: stack-first dynamic pattern with realloc (CLAUDE.md rule #7). zercheck_ir.c verified clean — no equivalent pattern exists; IR analyzer uses CFG, not linear label scan.
+Regression test pre-existed.
+
+**BUG-607 — zercheck_ir error spam (30+ duplicate errors per program)**
+Fixed-point convergence loop visited each block up to 32 times. Without suppression, `ir_check_inst` emitted the same error on every iteration — adversarial tests showed 30+ duplicates of one logical error. Fix: suppress errors during convergence via `building_summary = true`, then run ONE final pass on the converged state with errors enabled. Errors emitted exactly once.
+Test: `tests/zer/_verify_BUG-600_no_error_spam.zer` (clean program — must compile with zero errors and zero spam).
+
+**BUG-608 — `5HwfE` shift/signed-div in `emit_rewritten_node` (emitter.c)**
+The IR emitter's `emit_rewritten_node` (used for the IR path's expression replay) emitted RAW `<<` / `>>` and RAW signed `/` `%` — bypassing `_zer_shl` / `_zer_shr` (shift safety) and the INT_MIN/-1 trap. Programs using shift-in-array-index or signed-div-in-array-index missed runtime safety wrapping.
+Fix: detect TOK_LSHIFT/RSHIFT in `emit_rewritten_node` → emit `_zer_shl(a, b)` / `_zer_shr(a, b)`. Detect signed TOK_SLASH/PERCENT → emit statement-expression with INT_MIN/-1 check.
+Tests: `tests/zer/_verify_5HwfE_BUG-604_shift_in_index.zer` (shift-by-40-in-index, must clamp to 0), `tests/zer_trap/_verify_5HwfE_BUG-604_signed_div_in_index.zer` (INT_MIN/-1 in array index, must trap).
+Pattern lesson: per CLAUDE.md "AST→IR Emission Diff Audit" section — any IR handler replacing `emit_expr(inst->expr)` with direct emission MUST port every safety wrapper. This bug class costs silent miscompilation if missed.
+
+**BUG-609 — int literal overflow silently wraps (parser.c)**
+`0x10000000000000000` (2^64) and `18446744073709551616` parsed clean with value silently wrapped to 0. Fix: pre-multiply overflow check in all three integer-literal parse paths (hex, binary, decimal). Emit `error: integer literal exceeds u64 range (max 0xFFFFFFFFFFFFFFFF)`.
+Test: `tests/zer_fail/_verify_BUG-607_int_literal_overflow.zer`.
+
+**BUG-610 — defer body nested control flow not scanned (zercheck.c + zercheck_ir.c)**
+`defer { if (err) { free(h); } else { free(h); } }` triggered false "never freed" error. Both defer scanners only recursed into NODE_BLOCK, missing NODE_IF/FOR/WHILE/DO_WHILE/SWITCH/CRITICAL/ONCE bodies. Fix: switch on node->kind in `defer_scan_all_frees` (zercheck.c) AND `ir_defer_scan_frees` (zercheck_ir.c — keeps IR analyzer correct after Phase G zercheck.c deletion).
+Test: `tests/zer/_verify_BUG-608_defer_nested_cf.zer`.
+
+**BUG-611 — goto into capture arm (checker.c)**
+`if (opt) |val| { goto end; } end:` — jumping INTO the body of an if-with-capture or switch-arm-with-capture left `val` undefined at the label. No diagnostic. Fix: extend `collect_labels` / `validate_gotos` with `ArmStack` tracking — push when entering capture-bearing arms, pop when leaving, reject goto-into-arm transitions where source path doesn't cover the label's arm path.
+Test: `tests/zer_fail/_verify_BUG-609_goto_into_arm.zer`.
+
+**Verification methodology applied per bug:**
+1. Reproduce on main via specific `.zer` test file (DO NOT trust commit messages)
+2. Confirm bug still present, OR verify already fixed
+3. Apply fix — directly from branch or adapted
+4. Re-run test to confirm fix works
+5. Leave regression test in `tests/zer_*` with `_verify_` prefix
+
+**IR-path-only future:** zercheck.c is being deleted in Phase G. Bugs that touched zercheck.c (BUG-606, BUG-610) had equivalent fixes applied to zercheck_ir.c so the IR-only world remains fully patched.
+
+**Tests after this session:** 477 ZER integration (positive+negative+trap+warn+no-warn) + 3,649 total across full `make docker-check`. VST proofs: zero admits across 23 verification files.
+
+---
+
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)
 
 **Change:** Added `unsafe asm(...)` as the REQUIRED form for inline assembly. Bare `asm(...)` is rejected at compile time with a helpful error message pointing to `unsafe asm`.

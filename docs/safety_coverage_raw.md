@@ -38,399 +38,399 @@ Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
 
 | Line | Message |
 |---|---|
-| 4014 | `X.alloc() takes no arguments` |
-| 4024 | `X.alloc_ptr() takes no arguments` |
-| 4033 | `X.free() takes exactly 1 argument` |
-| 4050 | `X.free_ptr() expects '*X', got 'X'` |
-| 4042 | `X.free_ptr() takes exactly 1 argument` |
-| 6308 | `X` |
-| 6311 | `X` |
-| 6313 | `X` |
-| 10075 | `X 'X' max call chain stack X bytes exceeds --stack-limit X` |
-| 869 | `X cannot strip volatile qualifier — ` |
-| 7572 | `X condition must be bool, got 'X'` |
-| 6559 | `X must be declared as global or static — ` |
-| 764 | `X not allowed in interrupt handler — ` |
-| 2492 | `'!' requires bool or integer, got 'X'` |
-| 8444 | `'await' only allowed inside async function` |
-| 8298 | `'break' outside of loop` |
-| 8323 | `'continue' outside of loop` |
-| 8334 | `'defer' cannot be nested inside another 'defer' body` |
-| 6700 | `'null' can only be assigned to optional types (?*T, ?T) — ` |
-| 5139 | `'orelse break' outside of loop` |
-| 5142 | `'orelse continue' outside of loop` |
-| 5130 | `'orelse' requires optional type, got 'X'` |
-| 8435 | `'yield' only allowed inside async function` |
-| 2500 | `'~' requires integer, got 'X'` |
-| 5968 | `@X first argument must be a shared struct variable` |
-| 5707 | `@X first argument must be pointer to integer` |
-| 5701 | `@X on 64-bit type may require libatomic on 32-bit targets ` |
-| 5729 | `@X on packed struct field — may be misaligned. ` |
-| 5951 | `@X requires 1 argument: @X(shared_var)` |
-| 5687 | `@X requires 2 arguments` |
-| 5697 | `@X target must be 1, 2, 4, or 8 bytes (got X-bit type)` |
-| 5682 | `@atomic_cas requires 3 arguments` |
-| 5672 | `@atomic_load argument must be pointer to integer` |
-| 5668 | `@atomic_load on 64-bit type may require libatomic on 32-bit targets` |
-| 5656 | `@atomic_load requires 1 argument` |
-| 5665 | `@atomic_load target must be 1, 2, 4, or 8 bytes (got X-bit type)` |
-| 5677 | `@atomic_store requires 2 arguments` |
-| 6017 | `@barrier_init count must be an integer` |
-| 6012 | `@barrier_init first argument must be Barrier type, got 'X'` |
-| 6003 | `@barrier_init requires 2 arguments: @barrier_init(barrier_var, thread_count)` |
-| 6030 | `@barrier_wait argument must be Barrier type, got 'X'` |
-| 6022 | `@barrier_wait requires 1 argument: @barrier_wait(barrier_var)` |
-| 5496 | `@bitcast requires same-width types (target X bits, source X bits)` |
-| 5885 | `@cast between unrelated distinct types` |
-| 5913 | `@cast cannot strip const qualifier — ` |
-| 5879 | `@cast requires at least one distinct typedef` |
-| 5891 | `@cast source type does not match distinct's underlying type` |
-| 5897 | `@cast target type does not match distinct's underlying type` |
-| 5940 | `@cond_timedwait requires 3 arguments: @cond_timedwait(shared_var, condition, timeout_ms)` |
-| 5946 | `@cond_timedwait timeout must be an integer (milliseconds)` |
-| 5985 | `@cond_wait condition must be bool or integer expression` |
-| 5936 | `@cond_wait requires 2 arguments: @cond_wait(shared_var, condition)` |
-| 5785 | `@container source must be a pointer, got 'X'` |
-| 5825 | `@container: pointer provenance is struct 'X' ` |
-| 5839 | `@container: pointer was derived from field 'X' ` |
-| 5808 | `@container: struct 'X' has no field 'X'` |
-| 5768 | `@cstr buffer overflow: string length X + null terminator exceeds buffer size X` |
-| 5747 | `@cstr destination 'X' is const — cannot write to read-only buffer` |
-| 5756 | `@cstr destination is a const pointer — cannot write to read-only memory` |
-| 5594 | `@inttoptr address 0xX is not aligned to X bytes (required for X)` |
-| 5583 | `@inttoptr address 0xX is outside all declared mmio ranges` |
-| 5558 | `@inttoptr address must be an integer, got 'X'` |
-| 5566 | `@inttoptr requires mmio range declarations — ` |
-| 5548 | `@inttoptr target must be a pointer type, got 'X'` |
-| 5394 | `@offset: struct 'X' has no field 'X'` |
-| 5635 | `@probe argument must be integer address, got 'X'` |
-| 5631 | `@probe requires exactly 1 argument (address)` |
-| 5428 | `@ptrcast cannot strip const qualifier — ` |
-| 5420 | `@ptrcast source must be a pointer, got 'X'` |
-| 5410 | `@ptrcast target must be a pointer type, got 'X'` |
-| 5464 | `@ptrcast type mismatch: source has provenance 'X' ` |
-| 6727 | `@ptrtoint result stored in 'X' — use 'usize' for portability ` |
-| 5612 | `@ptrtoint source must be a pointer, got 'X'` |
-| 5529 | `@saturate requires numeric source, got 'X'` |
-| 5534 | `@saturate target must be an integer type, got 'X'` |
-| 6047 | `@sem_acquire argument must be Semaphore type, got 'X'` |
-| 6038 | `@sem_acquire requires 1 argument` |
-| 6063 | `@sem_release argument must be Semaphore type, got 'X'` |
-| 6054 | `@sem_release requires 1 argument` |
-| 5353 | `@size(X) is invalid — type has no defined size` |
-| 5514 | `@truncate requires numeric source, got 'X'` |
-| 3998 | `Arena has no method 'X' (available: over, alloc, alloc_slice, reset, unsafe_reset)` |
-| 3917 | `Arena.over() takes exactly 1 argument` |
-| 4717 | `Handle element type 'X' is not a struct — cannot auto-deref` |
-| 5010 | `MMIO index X is out of range (max X from mmio declaration)` |
-| 5019 | `MMIO index 'X' not proven in range (max X) — auto-guard inserted` |
-| 1333 | `Pool count must be a positive compile-time constant` |
-| 3760 | `Pool has no method 'X' (available: alloc, alloc_ptr, get, free, free_ptr)` |
-| 8702 | `Pool/Ring/Slab cannot be struct fields — must be global or static variables` |
-| 8845 | `Pool/Ring/Slab cannot be union variants — must be global or static variables` |
-| 1346 | `Ring count must be a positive compile-time constant` |
-| 3817 | `Ring has no method 'X' (available: push, push_checked, pop)` |
-| 1177 | `Semaphore count must be a non-negative compile-time constant` |
-| 3907 | `Slab has no method 'X' (available: alloc, alloc_ptr, get, free, free_ptr)` |
-| 3678 | `ThreadHandle has no method 'X' (available: join)` |
-| 3672 | `ThreadHandle.join() takes no arguments` |
-| 4665 | `all elements of 'X' were freed in loop — ` |
-| 3928 | `arena.alloc() takes exactly 1 argument` |
-| 3939 | `arena.alloc: unknown type 'X'` |
-| 3967 | `arena.alloc_slice() takes exactly 2 arguments` |
-| 3978 | `arena.alloc_slice: unknown type 'X'` |
-| 3954 | `arena.reset() outside defer may cause dangling pointers — ` |
-| 3950 | `arena.reset() takes no arguments` |
-| 3992 | `arena.unsafe_reset() takes no arguments` |
-| 4320 | `argument X: arena-derived pointer 'X' cannot ` |
-| 4340 | `argument X: arena-derived pointer 'X' cannot ` |
-| 8523 | `argument X: cannot pass Handle to spawn — ` |
-| 4171 | `argument X: cannot pass const []X to non-const '*X' — use 'const *X'` |
-| 4137 | `argument X: cannot pass const array 'X' to mutable slice parameter` |
-| 4106 | `argument X: cannot pass const pointer to mutable parameter` |
-| 4100 | `argument X: cannot pass const slice to mutable parameter` |
-| 8514 | `argument X: cannot pass non-shared pointer to spawn — ` |
-| 4090 | `argument X: cannot pass string literal to mutable []u8 parameter — ` |
-| 4152 | `argument X: cannot pass volatile array 'X' to non-volatile slice parameter — ` |
-| 4122 | `argument X: cannot pass volatile pointer to non-volatile parameter` |
-| 4352 | `argument X: local array 'X' cannot ` |
-| 4282 | `argument X: local variable 'X' cannot ` |
-| 4314 | `argument X: local-derived pointer 'X' cannot ` |
-| 4332 | `argument X: local-derived pointer 'X' cannot ` |
-| 4200 | `argument X: expected 'X', got 'X'` |
-| 2338 | `arithmetic requires numeric types, got 'X' and 'X'` |
-| 4909 | `array index X is out of bounds for array of size X` |
-| 4900 | `array index must be integer, got 'X'` |
-| 1304 | `array size X exceeds maximum (4GB)` |
-| 1300 | `array size must be > 0` |
-| 1298 | `array size must be a compile-time constant` |
-| 1220 | `array size must be an integer` |
-| 8397 | `asm statements only allowed in naked functions — ` |
-| 4670 | `auto-guard inserted for 'X' — element may have been freed ` |
-| 5110 | `bit extraction high index (X) must be >= low index (X)` |
-| 5102 | `bit index X out of range for X-bit type 'X'` |
-| 3536 | `bitwise compound assignment requires integer types, got 'X'` |
-| 2458 | `bitwise operators require integers, got 'X' and 'X'` |
-| 4883 | `cannot access field 'X' on type 'X'` |
-| 4735 | `cannot access shared struct in statement containing yield/await — ` |
-| 2863 | `cannot assign X — resource types are not copyable` |
-| 3511 | `cannot assign 'X' to 'X'` |
-| 3482 | `cannot assign const array to mutable slice — ` |
-| 3429 | `cannot assign const pointer to mutable — would allow writing to read-only memory` |
-| 3434 | `cannot assign const slice to mutable — would allow writing to read-only memory` |
-| 2838 | `cannot assign to const variable 'X'` |
-| 2720 | `cannot assign to expression — not an lvalue` |
-| 2727 | `cannot assign to expression — not an lvalue` |
-| 2624 | `cannot assign to variant of union containing move struct — ` |
-| 3490 | `cannot assign volatile array to non-volatile slice — ` |
-| 3460 | `cannot assign volatile pointer to non-volatile — ` |
-| 3924 | `cannot call mutating method 'alloc' on const Arena` |
-| 3689 | `cannot call mutating method 'alloc' on const Pool` |
-| 3835 | `cannot call mutating method 'alloc' on const Slab` |
-| 3732 | `cannot call mutating method 'alloc_ptr' on const Pool` |
-| 3879 | `cannot call mutating method 'alloc_ptr' on const Slab` |
-| 3963 | `cannot call mutating method 'alloc_slice' on const Arena` |
-| 3707 | `cannot call mutating method 'free' on const Pool` |
-| 3853 | `cannot call mutating method 'free' on const Slab` |
-| 3742 | `cannot call mutating method 'free_ptr' on const Pool` |
-| 3889 | `cannot call mutating method 'free_ptr' on const Slab` |
-| 3808 | `cannot call mutating method 'pop' on const Ring` |
-| 3770 | `cannot call mutating method 'push' on const Ring` |
-| 3789 | `cannot call mutating method 'push_checked' on const Ring` |
-| 3989 | `cannot call mutating method 'unsafe_reset' on const Arena` |
-| 4474 | `cannot call non-function type 'X'` |
-| 5254 | `cannot cast '*X' to '*X' — use *opaque round-trip ` |
-| 5290 | `cannot cast integer to pointer — use @inttoptr(*T, addr) ` |
-| 5296 | `cannot cast pointer to integer — use @ptrtoint(ptr)` |
-| 2437 | `cannot compare 'X' and 'X'` |
-| 2429 | `cannot compare 'X' with == — use element-wise comparison` |
-| 1187 | `cannot create pointer to void — use '*opaque' for type-erased pointers` |
-| 1209 | `cannot create slice of void — void has no size` |
-| 6552 | `cannot declare variable of type 'void'` |
-| 2511 | `cannot dereference non-pointer type 'X'` |
-| 5037 | `cannot index type 'X'` |
-| 10514 | `cannot initialize 'X' of type 'X' with 'X'` |
-| 6713 | `cannot initialize 'X' of type 'X' with 'X'` |
-| 6706 | `cannot initialize 'X' of type 'X' with 'X' — ` |
-| 10506 | `cannot initialize global array 'X' from variable — ` |
-| 6632 | `cannot initialize mutable 'X' from const variable 'X'` |
-| 6644 | `cannot initialize mutable pointer from const — ` |
-| 6667 | `cannot initialize mutable slice from const — ` |
-| 6660 | `cannot initialize non-volatile pointer from volatile — ` |
-| 6679 | `cannot initialize non-volatile slice from volatile array — ` |
-| 1540 | `cannot mix 'X' and 'X' — explicit conversion required` |
-| 1550 | `cannot mix integer 'X' and float 'X'` |
-| 2787 | `cannot mutate union 'X' inside its own switch arm — ` |
-| 511 | `cannot mutate union 'X' inside its own switch arm — ` |
-| 4854 | `cannot read union variant 'X' directly — must use switch` |
-| 8195 | `cannot return @cstr of local buffer 'X' — ` |
-| 7989 | `cannot return @ptrtoint of local 'X' — ` |
-| 8165 | `cannot return arena-derived pointer 'X' via @X — ` |
-| 8075 | `cannot return arena-derived pointer 'X' — ` |
-| 9386 | `cannot return array type — use a struct wrapper or slice instead` |
-| 7944 | `cannot return const pointer as mutable — would allow writing to read-only memory` |
-| 7949 | `cannot return const slice as mutable — would allow writing to read-only memory` |
-| 8013 | `cannot return local array as slice — ` |
-| 8158 | `cannot return local-derived pointer 'X' via @X — ` |
-| 8229 | `cannot return pointer extracted from call with local-derived ` |
-| 8138 | `cannot return pointer to local 'X' via @X — ` |
-| 8060 | `cannot return pointer to local 'X' — ` |
-| 8081 | `cannot return pointer to local 'X' — ` |
-| 8105 | `cannot return pointer to local variable 'X'` |
-| 8252 | `cannot return pointer to local variable 'X' via orelse fallback` |
-| 8211 | `cannot return result of call with local-derived pointer argument — ` |
-| 7935 | `cannot return string literal as mutable slice — data is read-only` |
-| 7964 | `cannot return volatile pointer as non-volatile — ` |
-| 5118 | `cannot slice type 'X'` |
-| 3376 | `cannot store arena-derived pointer 'X' in ` |
-| 2676 | `cannot store local Arena value in global/static — ` |
-| 3416 | `cannot store local array 'X' in global/static slice — ` |
-| 3311 | `cannot store local array as slice in global/static — ` |
-| 3119 | `cannot store local-derived pointer 'X' in ` |
-| 3257 | `cannot store local-derived pointer 'X' through function call — ` |
-| 3165 | `cannot store non-keep pointer parameter 'X' in ` |
-| 3245 | `cannot store pointer to local 'X' through function call — ` |
-| 2917 | `cannot store pointer to local 'X' through pointer parameter 'X' — ` |
-| 2853 | `cannot store result of get() — use inline` |
-| 6612 | `cannot store result of get() — use inline` |
-| 7591 | `cannot switch on float type 'X' — use if/else for float comparisons` |
-| 2577 | `cannot take address of shared struct field — ` |
-| 2567 | `cannot take address of union 'X' inside its switch arm — ` |
-| 8295 | `cannot use 'break' inside @critical block — interrupts would not be re-enabled` |
-| 8293 | `cannot use 'break' inside defer block` |
-| 8320 | `cannot use 'continue' inside @critical block — interrupts would not be re-enabled` |
-| 8318 | `cannot use 'continue' inside defer block` |
-| 8307 | `cannot use 'goto' inside @critical block — interrupts would not be re-enabled` |
-| 8305 | `cannot use 'goto' inside defer block` |
-| 7917 | `cannot use 'return' inside @critical block — interrupts would not be re-enabled` |
-| 7911 | `cannot use 'return' inside defer block` |
-| 8626 | `cannot use 'spawn' inside @critical block — ` |
-| 8632 | `cannot use 'spawn' inside async function — ` |
-| 2831 | `cannot write through const pointer — data is read-only` |
-| 5204 | `cast cannot strip const qualifier — target must be const pointer` |
-| 5237 | `cast type mismatch: source has provenance '*X' ` |
-| 3528 | `compound assignment requires numeric types` |
-| 3580 | `compound assignment would narrow 'X' (X-bit) into 'X' (X-bit) — use @truncate` |
-| 4445 | `comptime function 'X' body could not be evaluated at compile time` |
-| 4464 | `comptime function 'X' body could not be evaluated at compile time` |
-| 4407 | `comptime function 'X' requires all arguments to be compile-time constants` |
-| 7201 | `comptime if condition must be a compile-time constant` |
-| 1367 | `container instantiation depth exceeded (max 32) — ` |
-| 11046 | `deadlock: single statement accesses both 'X' (order X) and 'X' (order X) — ` |
-| 777 | `designated initializer requires struct type, got 'X'` |
-| 8385 | `discarded alloc result — handle leaked. Assign to a variable: ` |
-| 2348 | `division by zero` |
-| 3567 | `divisor 'X' not proven nonzero — ` |
-| 2392 | `divisor 'X' not proven nonzero — add 'if (X == 0) { return; }' before division` |
-| 2408 | `divisor from function call not proven nonzero — ` |
-| 8682 | `duplicate field 'X' in struct 'X'` |
-| 9251 | `duplicate label 'X' (first defined at line X)` |
-| 8769 | `duplicate variant 'X' in enum 'X'` |
-| 8827 | `duplicate variant 'X' in union 'X'` |
-| 10087 | `entry 'X' call chain contains function pointer call with ` |
-| 4075 | `expected X arguments, got X` |
-| 2263 | `expression nesting too deep (limit 1000) — simplify expression` |
-| 794 | `field '.X' expects 'X', got 'X'` |
-| 7518 | `for condition must be bool, got 'X'` |
-| 10096 | `function 'X' calls through function pointer with unknown target — ` |
-| 10048 | `function 'X' is recursive — unbounded stack growth on embedded` |
-| 10058 | `function 'X' local stack X bytes exceeds --stack-limit X` |
-| 8282 | `function must return 'X', not void` |
-| 6591 | `function pointer requires an initializer — ` |
-| 9737 | `global 'X' is accessed from both interrupt and main code — ` |
-| 10499 | `global variable 'X' initializer must be a constant expression — ` |
-| 9182 | `goto target 'X' not found in this function` |
-| 572 | `heterogeneous *opaque array: 'X' has provenance 'X' but element assigned 'X'` |
-| 170 | `identifier 'X' uses reserved prefix '_zer_' — ` |
-| 7311 | `if condition must be bool or optional, got 'X'` |
-| 7222 | `if-unwrap requires optional type, got 'X'` |
-| 4932 | `index 'X' not proven in range for array of size X — ` |
-| 10523 | `integer literal X does not fit in 'X'` |
-| 3519 | `integer literal X does not fit in 'X'` |
-| 6738 | `integer literal X does not fit in 'X'` |
-| 5303 | `invalid cast from 'X' to 'X'` |
-| 2447 | `logical operators require bool, got 'X' and 'X'` |
-| 9074 | `mmio range start (0xX) must be <= end (0xX)` |
-| 8723 | `move struct 'X' cannot be a field of shared struct 'X' — ` |
-| 7650 | `move struct cannot be captured by value in switch — ` |
-| 7671 | `move struct cannot be captured by value in switch — ` |
-| 7252 | `move struct cannot be captured by value — use \|*X\| for pointer capture` |
-| 9412 | `naked function must only contain asm and return — ` |
-| 1197 | `nested optional '??T' is not supported` |
-| 4646 | `no Pool or Slab found for Handle(X) — cannot auto-deref. ` |
-| 4792 | `no field 'X' on type 'X'` |
-| 4841 | `no variant 'X' in enum 'X'` |
-| 4821 | `no variant 'X' in union 'X'` |
-| 4875 | `no variant 'X' in union 'X'` |
-| 7882 | `no variant 'X' in union 'X'` |
-| 6582 | `non-null pointer '*X' requires an initializer — ` |
-| 9005 | `non-null pointer '*X' requires an initializer — ` |
-| 9432 | `not all control flow paths return a value in function 'X'` |
-| 3208 | `orelse fallback stores local pointer in global — ` |
-| 5164 | `orelse fallback type 'X' doesn't match 'X'` |
-| 5030 | `pointer indexing has no bounds check — ` |
-| 3692 | `pool.alloc() takes no arguments` |
-| 3735 | `pool.alloc_ptr() takes no arguments` |
-| 3720 | `pool.free() expects Handle(X), got Handle(X)` |
-| 3710 | `pool.free() takes exactly 1 argument` |
-| 3751 | `pool.free_ptr() expects '*X', got 'X'` |
-| 3745 | `pool.free_ptr() takes exactly 1 argument` |
-| 3699 | `pool.get() takes exactly 1 argument` |
-| 3779 | `pushing pointer through Ring channel — ` |
-| 3798 | `pushing pointer through Ring channel — ` |
-| 193 | `redefinition of 'X'` |
-| 8272 | `return type 'X' doesn't match function return type 'X'` |
-| 3811 | `ring.pop() takes no arguments` |
-| 3773 | `ring.push() takes exactly 1 argument` |
-| 3792 | `ring.push_checked() takes exactly 1 argument` |
-| 3838 | `slab.alloc() takes no arguments` |
-| 3882 | `slab.alloc_ptr() takes no arguments` |
-| 3866 | `slab.free() expects Handle(X), got Handle(X)` |
-| 3856 | `slab.free() takes exactly 1 argument` |
-| 3898 | `slab.free_ptr() expects '*X', got 'X'` |
-| 3892 | `slab.free_ptr() takes exactly 1 argument` |
-| 3845 | `slab.get() takes exactly 1 argument` |
-| 5080 | `slice end X exceeds array size X` |
-| 5058 | `slice end must be integer` |
-| 5088 | `slice start X exceeds array size X` |
-| 5069 | `slice start (X) is greater than end (X)` |
-| 5052 | `slice start must be integer` |
-| 8542 | `spawn argument X: cannot pass const pointer to mutable parameter` |
-| 8500 | `spawn argument X: cannot pass string literal to mutable []u8 parameter — ` |
-| 8559 | `spawn argument X: cannot pass volatile pointer to non-volatile parameter` |
-| 8575 | `spawn argument X: expected 'X', got 'X'` |
-| 8609 | `spawn target 'X' accesses non-shared global 'X' — ` |
-| 8615 | `spawn target 'X' accesses non-shared global 'X' — ` |
-| 8459 | `spawn target 'X' is not a function` |
-| 8475 | `spawn target 'X' returns 'X' — resource would leak. ` |
-| 8481 | `spawn target 'X' returns 'X' — return value lost` |
-| 10481 | `static_assert condition must be a compile-time constant` |
-| 8351 | `static_assert condition must be a compile-time constant` |
-| 10489 | `static_assert failed` |
-| 8360 | `static_assert failed` |
-| 10485 | `static_assert failed: X` |
-| 8355 | `static_assert failed: X` |
-| 2874 | `string literal is read-only — use 'const []u8' for string storage` |
-| 6621 | `string literal is read-only — use 'const []u8' instead of '[]u8'` |
-| 8737 | `struct 'X' cannot contain itself by value — use '*X' (pointer) instead` |
-| 4709 | `struct 'X' has no field 'X'` |
-| 4751 | `struct 'X' has no field 'X'` |
-| 803 | `struct 'X' has no field 'X'` |
-| 8696 | `struct field 'X' cannot have type 'void'` |
-| 7838 | `switch on bool must handle both true and false` |
-| 7816 | `switch on enum 'X' is not exhaustive — ` |
-| 7845 | `switch on integer must have a default arm` |
-| 7896 | `switch on union 'X' is not exhaustive — ` |
-| 8712 | `synchronization primitive 'X' cannot be inside packed struct — ` |
-| 2481 | `unary '-' requires numeric type, got 'X'` |
-| 1395 | `undefined container 'X'` |
-| 201 | `undefined identifier 'X'` |
-| 1318 | `undefined type 'X'` |
-| 8854 | `union 'X' cannot contain itself by value — use '*X' (pointer) instead` |
-| 8839 | `union variant 'X' cannot have type 'void'` |
-| 5653 | `unknown atomic intrinsic '@X'` |
-| 5998 | `unknown barrier intrinsic '@X' — use @barrier_init or @barrier_wait` |
-| 5931 | `unknown condvar intrinsic '@X' — use @cond_wait, @cond_timedwait, @cond_signal, or @cond_broadcast` |
-| 6070 | `unknown intrinsic '@X'` |
-| 6755 | `variable 'X' shadows function parameter in async function — ` |
-| 9742 | `volatile global 'X' has compound assignment (+=, \|=, etc.) ` |
-| 10582 | `wrong *opaque type: function 'X' expects 'X' for parameter X, ` |
+| 4015 | `X.alloc() takes no arguments` |
+| 4025 | `X.alloc_ptr() takes no arguments` |
+| 4034 | `X.free() takes exactly 1 argument` |
+| 4051 | `X.free_ptr() expects '*X', got 'X'` |
+| 4043 | `X.free_ptr() takes exactly 1 argument` |
+| 6309 | `X` |
+| 6312 | `X` |
+| 6314 | `X` |
+| 10076 | `X 'X' max call chain stack X bytes exceeds --stack-limit X` |
+| 870 | `X cannot strip volatile qualifier — ` |
+| 7573 | `X condition must be bool, got 'X'` |
+| 6560 | `X must be declared as global or static — ` |
+| 765 | `X not allowed in interrupt handler — ` |
+| 2493 | `'!' requires bool or integer, got 'X'` |
+| 8445 | `'await' only allowed inside async function` |
+| 8299 | `'break' outside of loop` |
+| 8324 | `'continue' outside of loop` |
+| 8335 | `'defer' cannot be nested inside another 'defer' body` |
+| 6701 | `'null' can only be assigned to optional types (?*T, ?T) — ` |
+| 5140 | `'orelse break' outside of loop` |
+| 5143 | `'orelse continue' outside of loop` |
+| 5131 | `'orelse' requires optional type, got 'X'` |
+| 8436 | `'yield' only allowed inside async function` |
+| 2501 | `'~' requires integer, got 'X'` |
+| 5969 | `@X first argument must be a shared struct variable` |
+| 5708 | `@X first argument must be pointer to integer` |
+| 5702 | `@X on 64-bit type may require libatomic on 32-bit targets ` |
+| 5730 | `@X on packed struct field — may be misaligned. ` |
+| 5952 | `@X requires 1 argument: @X(shared_var)` |
+| 5688 | `@X requires 2 arguments` |
+| 5698 | `@X target must be 1, 2, 4, or 8 bytes (got X-bit type)` |
+| 5683 | `@atomic_cas requires 3 arguments` |
+| 5673 | `@atomic_load argument must be pointer to integer` |
+| 5669 | `@atomic_load on 64-bit type may require libatomic on 32-bit targets` |
+| 5657 | `@atomic_load requires 1 argument` |
+| 5666 | `@atomic_load target must be 1, 2, 4, or 8 bytes (got X-bit type)` |
+| 5678 | `@atomic_store requires 2 arguments` |
+| 6018 | `@barrier_init count must be an integer` |
+| 6013 | `@barrier_init first argument must be Barrier type, got 'X'` |
+| 6004 | `@barrier_init requires 2 arguments: @barrier_init(barrier_var, thread_count)` |
+| 6031 | `@barrier_wait argument must be Barrier type, got 'X'` |
+| 6023 | `@barrier_wait requires 1 argument: @barrier_wait(barrier_var)` |
+| 5497 | `@bitcast requires same-width types (target X bits, source X bits)` |
+| 5886 | `@cast between unrelated distinct types` |
+| 5914 | `@cast cannot strip const qualifier — ` |
+| 5880 | `@cast requires at least one distinct typedef` |
+| 5892 | `@cast source type does not match distinct's underlying type` |
+| 5898 | `@cast target type does not match distinct's underlying type` |
+| 5941 | `@cond_timedwait requires 3 arguments: @cond_timedwait(shared_var, condition, timeout_ms)` |
+| 5947 | `@cond_timedwait timeout must be an integer (milliseconds)` |
+| 5986 | `@cond_wait condition must be bool or integer expression` |
+| 5937 | `@cond_wait requires 2 arguments: @cond_wait(shared_var, condition)` |
+| 5786 | `@container source must be a pointer, got 'X'` |
+| 5826 | `@container: pointer provenance is struct 'X' ` |
+| 5840 | `@container: pointer was derived from field 'X' ` |
+| 5809 | `@container: struct 'X' has no field 'X'` |
+| 5769 | `@cstr buffer overflow: string length X + null terminator exceeds buffer size X` |
+| 5748 | `@cstr destination 'X' is const — cannot write to read-only buffer` |
+| 5757 | `@cstr destination is a const pointer — cannot write to read-only memory` |
+| 5595 | `@inttoptr address 0xX is not aligned to X bytes (required for X)` |
+| 5584 | `@inttoptr address 0xX is outside all declared mmio ranges` |
+| 5559 | `@inttoptr address must be an integer, got 'X'` |
+| 5567 | `@inttoptr requires mmio range declarations — ` |
+| 5549 | `@inttoptr target must be a pointer type, got 'X'` |
+| 5395 | `@offset: struct 'X' has no field 'X'` |
+| 5636 | `@probe argument must be integer address, got 'X'` |
+| 5632 | `@probe requires exactly 1 argument (address)` |
+| 5429 | `@ptrcast cannot strip const qualifier — ` |
+| 5421 | `@ptrcast source must be a pointer, got 'X'` |
+| 5411 | `@ptrcast target must be a pointer type, got 'X'` |
+| 5465 | `@ptrcast type mismatch: source has provenance 'X' ` |
+| 6728 | `@ptrtoint result stored in 'X' — use 'usize' for portability ` |
+| 5613 | `@ptrtoint source must be a pointer, got 'X'` |
+| 5530 | `@saturate requires numeric source, got 'X'` |
+| 5535 | `@saturate target must be an integer type, got 'X'` |
+| 6048 | `@sem_acquire argument must be Semaphore type, got 'X'` |
+| 6039 | `@sem_acquire requires 1 argument` |
+| 6064 | `@sem_release argument must be Semaphore type, got 'X'` |
+| 6055 | `@sem_release requires 1 argument` |
+| 5354 | `@size(X) is invalid — type has no defined size` |
+| 5515 | `@truncate requires numeric source, got 'X'` |
+| 3999 | `Arena has no method 'X' (available: over, alloc, alloc_slice, reset, unsafe_reset)` |
+| 3918 | `Arena.over() takes exactly 1 argument` |
+| 4718 | `Handle element type 'X' is not a struct — cannot auto-deref` |
+| 5011 | `MMIO index X is out of range (max X from mmio declaration)` |
+| 5020 | `MMIO index 'X' not proven in range (max X) — auto-guard inserted` |
+| 1334 | `Pool count must be a positive compile-time constant` |
+| 3761 | `Pool has no method 'X' (available: alloc, alloc_ptr, get, free, free_ptr)` |
+| 8703 | `Pool/Ring/Slab cannot be struct fields — must be global or static variables` |
+| 8846 | `Pool/Ring/Slab cannot be union variants — must be global or static variables` |
+| 1347 | `Ring count must be a positive compile-time constant` |
+| 3818 | `Ring has no method 'X' (available: push, push_checked, pop)` |
+| 1178 | `Semaphore count must be a non-negative compile-time constant` |
+| 3908 | `Slab has no method 'X' (available: alloc, alloc_ptr, get, free, free_ptr)` |
+| 3679 | `ThreadHandle has no method 'X' (available: join)` |
+| 3673 | `ThreadHandle.join() takes no arguments` |
+| 4666 | `all elements of 'X' were freed in loop — ` |
+| 3929 | `arena.alloc() takes exactly 1 argument` |
+| 3940 | `arena.alloc: unknown type 'X'` |
+| 3968 | `arena.alloc_slice() takes exactly 2 arguments` |
+| 3979 | `arena.alloc_slice: unknown type 'X'` |
+| 3955 | `arena.reset() outside defer may cause dangling pointers — ` |
+| 3951 | `arena.reset() takes no arguments` |
+| 3993 | `arena.unsafe_reset() takes no arguments` |
+| 4321 | `argument X: arena-derived pointer 'X' cannot ` |
+| 4341 | `argument X: arena-derived pointer 'X' cannot ` |
+| 8524 | `argument X: cannot pass Handle to spawn — ` |
+| 4172 | `argument X: cannot pass const []X to non-const '*X' — use 'const *X'` |
+| 4138 | `argument X: cannot pass const array 'X' to mutable slice parameter` |
+| 4107 | `argument X: cannot pass const pointer to mutable parameter` |
+| 4101 | `argument X: cannot pass const slice to mutable parameter` |
+| 8515 | `argument X: cannot pass non-shared pointer to spawn — ` |
+| 4091 | `argument X: cannot pass string literal to mutable []u8 parameter — ` |
+| 4153 | `argument X: cannot pass volatile array 'X' to non-volatile slice parameter — ` |
+| 4123 | `argument X: cannot pass volatile pointer to non-volatile parameter` |
+| 4353 | `argument X: local array 'X' cannot ` |
+| 4283 | `argument X: local variable 'X' cannot ` |
+| 4315 | `argument X: local-derived pointer 'X' cannot ` |
+| 4333 | `argument X: local-derived pointer 'X' cannot ` |
+| 4201 | `argument X: expected 'X', got 'X'` |
+| 2339 | `arithmetic requires numeric types, got 'X' and 'X'` |
+| 4910 | `array index X is out of bounds for array of size X` |
+| 4901 | `array index must be integer, got 'X'` |
+| 1305 | `array size X exceeds maximum (4GB)` |
+| 1301 | `array size must be > 0` |
+| 1299 | `array size must be a compile-time constant` |
+| 1221 | `array size must be an integer` |
+| 8398 | `asm statements only allowed in naked functions — ` |
+| 4671 | `auto-guard inserted for 'X' — element may have been freed ` |
+| 5111 | `bit extraction high index (X) must be >= low index (X)` |
+| 5103 | `bit index X out of range for X-bit type 'X'` |
+| 3537 | `bitwise compound assignment requires integer types, got 'X'` |
+| 2459 | `bitwise operators require integers, got 'X' and 'X'` |
+| 4884 | `cannot access field 'X' on type 'X'` |
+| 4736 | `cannot access shared struct in statement containing yield/await — ` |
+| 2864 | `cannot assign X — resource types are not copyable` |
+| 3512 | `cannot assign 'X' to 'X'` |
+| 3483 | `cannot assign const array to mutable slice — ` |
+| 3430 | `cannot assign const pointer to mutable — would allow writing to read-only memory` |
+| 3435 | `cannot assign const slice to mutable — would allow writing to read-only memory` |
+| 2839 | `cannot assign to const variable 'X'` |
+| 2721 | `cannot assign to expression — not an lvalue` |
+| 2728 | `cannot assign to expression — not an lvalue` |
+| 2625 | `cannot assign to variant of union containing move struct — ` |
+| 3491 | `cannot assign volatile array to non-volatile slice — ` |
+| 3461 | `cannot assign volatile pointer to non-volatile — ` |
+| 3925 | `cannot call mutating method 'alloc' on const Arena` |
+| 3690 | `cannot call mutating method 'alloc' on const Pool` |
+| 3836 | `cannot call mutating method 'alloc' on const Slab` |
+| 3733 | `cannot call mutating method 'alloc_ptr' on const Pool` |
+| 3880 | `cannot call mutating method 'alloc_ptr' on const Slab` |
+| 3964 | `cannot call mutating method 'alloc_slice' on const Arena` |
+| 3708 | `cannot call mutating method 'free' on const Pool` |
+| 3854 | `cannot call mutating method 'free' on const Slab` |
+| 3743 | `cannot call mutating method 'free_ptr' on const Pool` |
+| 3890 | `cannot call mutating method 'free_ptr' on const Slab` |
+| 3809 | `cannot call mutating method 'pop' on const Ring` |
+| 3771 | `cannot call mutating method 'push' on const Ring` |
+| 3790 | `cannot call mutating method 'push_checked' on const Ring` |
+| 3990 | `cannot call mutating method 'unsafe_reset' on const Arena` |
+| 4475 | `cannot call non-function type 'X'` |
+| 5255 | `cannot cast '*X' to '*X' — use *opaque round-trip ` |
+| 5291 | `cannot cast integer to pointer — use @inttoptr(*T, addr) ` |
+| 5297 | `cannot cast pointer to integer — use @ptrtoint(ptr)` |
+| 2438 | `cannot compare 'X' and 'X'` |
+| 2430 | `cannot compare 'X' with == — use element-wise comparison` |
+| 1188 | `cannot create pointer to void — use '*opaque' for type-erased pointers` |
+| 1210 | `cannot create slice of void — void has no size` |
+| 6553 | `cannot declare variable of type 'void'` |
+| 2512 | `cannot dereference non-pointer type 'X'` |
+| 5038 | `cannot index type 'X'` |
+| 10515 | `cannot initialize 'X' of type 'X' with 'X'` |
+| 6714 | `cannot initialize 'X' of type 'X' with 'X'` |
+| 6707 | `cannot initialize 'X' of type 'X' with 'X' — ` |
+| 10507 | `cannot initialize global array 'X' from variable — ` |
+| 6633 | `cannot initialize mutable 'X' from const variable 'X'` |
+| 6645 | `cannot initialize mutable pointer from const — ` |
+| 6668 | `cannot initialize mutable slice from const — ` |
+| 6661 | `cannot initialize non-volatile pointer from volatile — ` |
+| 6680 | `cannot initialize non-volatile slice from volatile array — ` |
+| 1541 | `cannot mix 'X' and 'X' — explicit conversion required` |
+| 1551 | `cannot mix integer 'X' and float 'X'` |
+| 2788 | `cannot mutate union 'X' inside its own switch arm — ` |
+| 512 | `cannot mutate union 'X' inside its own switch arm — ` |
+| 4855 | `cannot read union variant 'X' directly — must use switch` |
+| 8196 | `cannot return @cstr of local buffer 'X' — ` |
+| 7990 | `cannot return @ptrtoint of local 'X' — ` |
+| 8166 | `cannot return arena-derived pointer 'X' via @X — ` |
+| 8076 | `cannot return arena-derived pointer 'X' — ` |
+| 9387 | `cannot return array type — use a struct wrapper or slice instead` |
+| 7945 | `cannot return const pointer as mutable — would allow writing to read-only memory` |
+| 7950 | `cannot return const slice as mutable — would allow writing to read-only memory` |
+| 8014 | `cannot return local array as slice — ` |
+| 8159 | `cannot return local-derived pointer 'X' via @X — ` |
+| 8230 | `cannot return pointer extracted from call with local-derived ` |
+| 8139 | `cannot return pointer to local 'X' via @X — ` |
+| 8061 | `cannot return pointer to local 'X' — ` |
+| 8082 | `cannot return pointer to local 'X' — ` |
+| 8106 | `cannot return pointer to local variable 'X'` |
+| 8253 | `cannot return pointer to local variable 'X' via orelse fallback` |
+| 8212 | `cannot return result of call with local-derived pointer argument — ` |
+| 7936 | `cannot return string literal as mutable slice — data is read-only` |
+| 7965 | `cannot return volatile pointer as non-volatile — ` |
+| 5119 | `cannot slice type 'X'` |
+| 3377 | `cannot store arena-derived pointer 'X' in ` |
+| 2677 | `cannot store local Arena value in global/static — ` |
+| 3417 | `cannot store local array 'X' in global/static slice — ` |
+| 3312 | `cannot store local array as slice in global/static — ` |
+| 3120 | `cannot store local-derived pointer 'X' in ` |
+| 3258 | `cannot store local-derived pointer 'X' through function call — ` |
+| 3166 | `cannot store non-keep pointer parameter 'X' in ` |
+| 3246 | `cannot store pointer to local 'X' through function call — ` |
+| 2918 | `cannot store pointer to local 'X' through pointer parameter 'X' — ` |
+| 2854 | `cannot store result of get() — use inline` |
+| 6613 | `cannot store result of get() — use inline` |
+| 7592 | `cannot switch on float type 'X' — use if/else for float comparisons` |
+| 2578 | `cannot take address of shared struct field — ` |
+| 2568 | `cannot take address of union 'X' inside its switch arm — ` |
+| 8296 | `cannot use 'break' inside @critical block — interrupts would not be re-enabled` |
+| 8294 | `cannot use 'break' inside defer block` |
+| 8321 | `cannot use 'continue' inside @critical block — interrupts would not be re-enabled` |
+| 8319 | `cannot use 'continue' inside defer block` |
+| 8308 | `cannot use 'goto' inside @critical block — interrupts would not be re-enabled` |
+| 8306 | `cannot use 'goto' inside defer block` |
+| 7918 | `cannot use 'return' inside @critical block — interrupts would not be re-enabled` |
+| 7912 | `cannot use 'return' inside defer block` |
+| 8627 | `cannot use 'spawn' inside @critical block — ` |
+| 8633 | `cannot use 'spawn' inside async function — ` |
+| 2832 | `cannot write through const pointer — data is read-only` |
+| 5205 | `cast cannot strip const qualifier — target must be const pointer` |
+| 5238 | `cast type mismatch: source has provenance '*X' ` |
+| 3529 | `compound assignment requires numeric types` |
+| 3581 | `compound assignment would narrow 'X' (X-bit) into 'X' (X-bit) — use @truncate` |
+| 4446 | `comptime function 'X' body could not be evaluated at compile time` |
+| 4465 | `comptime function 'X' body could not be evaluated at compile time` |
+| 4408 | `comptime function 'X' requires all arguments to be compile-time constants` |
+| 7202 | `comptime if condition must be a compile-time constant` |
+| 1368 | `container instantiation depth exceeded (max 32) — ` |
+| 11047 | `deadlock: single statement accesses both 'X' (order X) and 'X' (order X) — ` |
+| 778 | `designated initializer requires struct type, got 'X'` |
+| 8386 | `discarded alloc result — handle leaked. Assign to a variable: ` |
+| 2349 | `division by zero` |
+| 3568 | `divisor 'X' not proven nonzero — ` |
+| 2393 | `divisor 'X' not proven nonzero — add 'if (X == 0) { return; }' before division` |
+| 2409 | `divisor from function call not proven nonzero — ` |
+| 8683 | `duplicate field 'X' in struct 'X'` |
+| 9252 | `duplicate label 'X' (first defined at line X)` |
+| 8770 | `duplicate variant 'X' in enum 'X'` |
+| 8828 | `duplicate variant 'X' in union 'X'` |
+| 10088 | `entry 'X' call chain contains function pointer call with ` |
+| 4076 | `expected X arguments, got X` |
+| 2264 | `expression nesting too deep (limit 1000) — simplify expression` |
+| 795 | `field '.X' expects 'X', got 'X'` |
+| 7519 | `for condition must be bool, got 'X'` |
+| 10097 | `function 'X' calls through function pointer with unknown target — ` |
+| 10049 | `function 'X' is recursive — unbounded stack growth on embedded` |
+| 10059 | `function 'X' local stack X bytes exceeds --stack-limit X` |
+| 8283 | `function must return 'X', not void` |
+| 6592 | `function pointer requires an initializer — ` |
+| 9738 | `global 'X' is accessed from both interrupt and main code — ` |
+| 10500 | `global variable 'X' initializer must be a constant expression — ` |
+| 9183 | `goto target 'X' not found in this function` |
+| 573 | `heterogeneous *opaque array: 'X' has provenance 'X' but element assigned 'X'` |
+| 171 | `identifier 'X' uses reserved prefix '_zer_' — ` |
+| 7312 | `if condition must be bool or optional, got 'X'` |
+| 7223 | `if-unwrap requires optional type, got 'X'` |
+| 4933 | `index 'X' not proven in range for array of size X — ` |
+| 10524 | `integer literal X does not fit in 'X'` |
+| 3520 | `integer literal X does not fit in 'X'` |
+| 6739 | `integer literal X does not fit in 'X'` |
+| 5304 | `invalid cast from 'X' to 'X'` |
+| 2448 | `logical operators require bool, got 'X' and 'X'` |
+| 9075 | `mmio range start (0xX) must be <= end (0xX)` |
+| 8724 | `move struct 'X' cannot be a field of shared struct 'X' — ` |
+| 7651 | `move struct cannot be captured by value in switch — ` |
+| 7672 | `move struct cannot be captured by value in switch — ` |
+| 7253 | `move struct cannot be captured by value — use \|*X\| for pointer capture` |
+| 9413 | `naked function must only contain asm and return — ` |
+| 1198 | `nested optional '??T' is not supported` |
+| 4647 | `no Pool or Slab found for Handle(X) — cannot auto-deref. ` |
+| 4793 | `no field 'X' on type 'X'` |
+| 4842 | `no variant 'X' in enum 'X'` |
+| 4822 | `no variant 'X' in union 'X'` |
+| 4876 | `no variant 'X' in union 'X'` |
+| 7883 | `no variant 'X' in union 'X'` |
+| 6583 | `non-null pointer '*X' requires an initializer — ` |
+| 9006 | `non-null pointer '*X' requires an initializer — ` |
+| 9433 | `not all control flow paths return a value in function 'X'` |
+| 3209 | `orelse fallback stores local pointer in global — ` |
+| 5165 | `orelse fallback type 'X' doesn't match 'X'` |
+| 5031 | `pointer indexing has no bounds check — ` |
+| 3693 | `pool.alloc() takes no arguments` |
+| 3736 | `pool.alloc_ptr() takes no arguments` |
+| 3721 | `pool.free() expects Handle(X), got Handle(X)` |
+| 3711 | `pool.free() takes exactly 1 argument` |
+| 3752 | `pool.free_ptr() expects '*X', got 'X'` |
+| 3746 | `pool.free_ptr() takes exactly 1 argument` |
+| 3700 | `pool.get() takes exactly 1 argument` |
+| 3780 | `pushing pointer through Ring channel — ` |
+| 3799 | `pushing pointer through Ring channel — ` |
+| 194 | `redefinition of 'X'` |
+| 8273 | `return type 'X' doesn't match function return type 'X'` |
+| 3812 | `ring.pop() takes no arguments` |
+| 3774 | `ring.push() takes exactly 1 argument` |
+| 3793 | `ring.push_checked() takes exactly 1 argument` |
+| 3839 | `slab.alloc() takes no arguments` |
+| 3883 | `slab.alloc_ptr() takes no arguments` |
+| 3867 | `slab.free() expects Handle(X), got Handle(X)` |
+| 3857 | `slab.free() takes exactly 1 argument` |
+| 3899 | `slab.free_ptr() expects '*X', got 'X'` |
+| 3893 | `slab.free_ptr() takes exactly 1 argument` |
+| 3846 | `slab.get() takes exactly 1 argument` |
+| 5081 | `slice end X exceeds array size X` |
+| 5059 | `slice end must be integer` |
+| 5089 | `slice start X exceeds array size X` |
+| 5070 | `slice start (X) is greater than end (X)` |
+| 5053 | `slice start must be integer` |
+| 8543 | `spawn argument X: cannot pass const pointer to mutable parameter` |
+| 8501 | `spawn argument X: cannot pass string literal to mutable []u8 parameter — ` |
+| 8560 | `spawn argument X: cannot pass volatile pointer to non-volatile parameter` |
+| 8576 | `spawn argument X: expected 'X', got 'X'` |
+| 8610 | `spawn target 'X' accesses non-shared global 'X' — ` |
+| 8616 | `spawn target 'X' accesses non-shared global 'X' — ` |
+| 8460 | `spawn target 'X' is not a function` |
+| 8476 | `spawn target 'X' returns 'X' — resource would leak. ` |
+| 8482 | `spawn target 'X' returns 'X' — return value lost` |
+| 10482 | `static_assert condition must be a compile-time constant` |
+| 8352 | `static_assert condition must be a compile-time constant` |
+| 10490 | `static_assert failed` |
+| 8361 | `static_assert failed` |
+| 10486 | `static_assert failed: X` |
+| 8356 | `static_assert failed: X` |
+| 2875 | `string literal is read-only — use 'const []u8' for string storage` |
+| 6622 | `string literal is read-only — use 'const []u8' instead of '[]u8'` |
+| 8738 | `struct 'X' cannot contain itself by value — use '*X' (pointer) instead` |
+| 4710 | `struct 'X' has no field 'X'` |
+| 4752 | `struct 'X' has no field 'X'` |
+| 804 | `struct 'X' has no field 'X'` |
+| 8697 | `struct field 'X' cannot have type 'void'` |
+| 7839 | `switch on bool must handle both true and false` |
+| 7817 | `switch on enum 'X' is not exhaustive — ` |
+| 7846 | `switch on integer must have a default arm` |
+| 7897 | `switch on union 'X' is not exhaustive — ` |
+| 8713 | `synchronization primitive 'X' cannot be inside packed struct — ` |
+| 2482 | `unary '-' requires numeric type, got 'X'` |
+| 1396 | `undefined container 'X'` |
+| 202 | `undefined identifier 'X'` |
+| 1319 | `undefined type 'X'` |
+| 8855 | `union 'X' cannot contain itself by value — use '*X' (pointer) instead` |
+| 8840 | `union variant 'X' cannot have type 'void'` |
+| 5654 | `unknown atomic intrinsic '@X'` |
+| 5999 | `unknown barrier intrinsic '@X' — use @barrier_init or @barrier_wait` |
+| 5932 | `unknown condvar intrinsic '@X' — use @cond_wait, @cond_timedwait, @cond_signal, or @cond_broadcast` |
+| 6071 | `unknown intrinsic '@X'` |
+| 6756 | `variable 'X' shadows function parameter in async function — ` |
+| 9743 | `volatile global 'X' has compound assignment (+=, \|=, etc.) ` |
+| 10583 | `wrong *opaque type: function 'X' expects 'X' for parameter X, ` |
 
 ## Part 2 — Handle-tracking checks (zercheck.c)
 
 | Line | Message |
 |---|---|
-| 1036 | `double free: 'X' already freed at line X` |
-| 2435 | `double free: 'X' already freed at line X` |
-| 426 | `double free: 'X' already freed at line X` |
-| 481 | `double free: 'X' already freed at line X` |
-| 2462 | `double free: 'X' freed by call to 'X' (already freed at line X)` |
-| 2466 | `double free: 'X' freed by call to 'X' (may have been freed at line X)` |
-| 1040 | `double free: 'X' may have been freed at line X` |
-| 430 | `double free: 'X' may have been freed at line X` |
-| 485 | `double free: 'X' may have been freed at line X` |
-| 2694 | `handle 'X' allocated but never freed — add 'defer pool.free(X)' ` |
-| 2022 | `handle 'X' freed inside loop — may cause use-after-free ` |
-| 2701 | `handle 'X' may not be freed on all paths — ensure all branches ` |
-| 1279 | `handle leak: 'X' overwritten while alive (allocated at line X) — previous handle leaked` |
-| 685 | `handle leak: 'X' overwritten while alive (allocated at line X) — previous handle leaked` |
-| 705 | `pointer leak: 'X' overwritten while alive (allocated at line X)` |
-| 2055 | `returning freed pointer 'X' (freed at line X)` |
-| 2059 | `returning potentially freed pointer 'X' (freed at line X)` |
-| 1084 | `thread already joined: 'X' joined at line X` |
-| 2688 | `thread not joined: 'X' spawned but never joined — ` |
-| 1244 | `union variant overwrite leaks move struct: 'X' is alive ` |
-| 1142 | `use after free: 'X' X at line X — cannot pass to function` |
-| 985 | `use after move: 'X' may have been moved on a previous path` |
-| 2017 | `use after move: 'X' moved inside loop — ownership ` |
-| 1157 | `use after move: 'X' ownership transferred at line X` |
-| 993 | `use after move: 'X' ownership transferred at line X` |
-| 996 | `use after transfer: 'X' ownership transferred to thread at line X` |
-| 516 | `use-after-free: 'X' freed at line X` |
-| 981 | `use-after-free: 'X' freed at line X` |
-| 520 | `use-after-free: 'X' may have been freed at line X` |
-| 988 | `use-after-free: 'X' may have been freed at line X` |
-| 525 | `wrong pool: 'X' allocated from pool X, used on pool X` |
+| 1039 | `double free: 'X' already freed at line X` |
+| 2438 | `double free: 'X' already freed at line X` |
+| 427 | `double free: 'X' already freed at line X` |
+| 482 | `double free: 'X' already freed at line X` |
+| 2465 | `double free: 'X' freed by call to 'X' (already freed at line X)` |
+| 2469 | `double free: 'X' freed by call to 'X' (may have been freed at line X)` |
+| 1043 | `double free: 'X' may have been freed at line X` |
+| 431 | `double free: 'X' may have been freed at line X` |
+| 486 | `double free: 'X' may have been freed at line X` |
+| 2697 | `handle 'X' allocated but never freed — add 'defer pool.free(X)' ` |
+| 2025 | `handle 'X' freed inside loop — may cause use-after-free ` |
+| 2704 | `handle 'X' may not be freed on all paths — ensure all branches ` |
+| 1282 | `handle leak: 'X' overwritten while alive (allocated at line X) — previous handle leaked` |
+| 686 | `handle leak: 'X' overwritten while alive (allocated at line X) — previous handle leaked` |
+| 706 | `pointer leak: 'X' overwritten while alive (allocated at line X)` |
+| 2058 | `returning freed pointer 'X' (freed at line X)` |
+| 2062 | `returning potentially freed pointer 'X' (freed at line X)` |
+| 1087 | `thread already joined: 'X' joined at line X` |
+| 2691 | `thread not joined: 'X' spawned but never joined — ` |
+| 1247 | `union variant overwrite leaks move struct: 'X' is alive ` |
+| 1145 | `use after free: 'X' X at line X — cannot pass to function` |
+| 988 | `use after move: 'X' may have been moved on a previous path` |
+| 2020 | `use after move: 'X' moved inside loop — ownership ` |
+| 1160 | `use after move: 'X' ownership transferred at line X` |
+| 996 | `use after move: 'X' ownership transferred at line X` |
+| 999 | `use after transfer: 'X' ownership transferred to thread at line X` |
+| 517 | `use-after-free: 'X' freed at line X` |
+| 984 | `use-after-free: 'X' freed at line X` |
+| 521 | `use-after-free: 'X' may have been freed at line X` |
+| 991 | `use-after-free: 'X' may have been freed at line X` |
+| 526 | `wrong pool: 'X' allocated from pool X, used on pool X` |
 
 ## Part 3 — CFG-based handle checks (zercheck_ir.c)
 

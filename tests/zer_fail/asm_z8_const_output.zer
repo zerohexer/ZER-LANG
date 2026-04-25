@@ -1,0 +1,15 @@
+// EXPECTED: compile error — Z8 rule: asm output writes to const variable.
+// Tests qualifier preservation through asm operand boundaries (System #20).
+// Writing to const via asm bypasses ZER's qualifier tracking.
+
+const u64 G_READONLY = 42;
+
+naked void const_overwrite() {
+    asm {
+        instructions: "movq $1, %0"
+        outputs: { "rax" = G_READONLY }
+        safety: "Z8 test — writing to const variable should be rejected"
+    }
+}
+
+i32 main() { return 0; }

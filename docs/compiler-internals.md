@@ -6738,6 +6738,39 @@ Doing 4 rules now + 9 in Session F (with the data) is cleaner than half-implemen
 - Session C adds register tables → unlocks O3 register name validation
 - Session G adds System #30 — only NEW safety system across the whole framework
 
+## D-Alpha-7.5 Session E1 — First 3 Z-rules at NODE_ASM (2026-04-26)
+
+**Status:** 3 of 13 Z-rules wired in `checker.c` NODE_ASM block (after Session D's structural rules). Each Z-rule reuses an EXISTING tracking system / extracted predicate at a NEW call site. **Zero new Phase 1 extractions** — call-site wiring only.
+
+**Architecture (matches `Z-Rules: extending ZER's 29 safety systems through asm` section above):**
+- Z3-Z13 (11 rules): live in `checker.c` NODE_ASM (AST-level point properties)
+- Z1-Z2 (2 rules): live in `zercheck_ir.c` IR_ASM handler (CFG state machines) — Session E3
+
+**Rules in E1 (3 of 11 checker.c Z-rules):**
+
+| Z# | What | Existing infra reused | Reachable today? |
+|---|---|---|---|
+| Z6 | Ban asm in `defer` / `async` body | Existing `c->defer_depth`, `c->in_async` checker fields | No (forward-compat — asm is naked-only currently) |
+| Z8 | Reject const lvalue as asm output target | Existing `Symbol.is_const`, root-walk pattern matches checker.c:2587 | Yes |
+| Z11 | Reject non-keep ptr param input + memory clobber | Existing `Symbol.is_keep` + checker.c:2970 param heuristic | Yes |
+
+**Z6 design note:** asm in `@critical` is INTENTIONALLY allowed — that's the natural use case for asm (manipulating hardware state with interrupts disabled). Banning asm in `defer` and `async` matches yield/await context bans (CLAUDE.md "Ban Decision Framework"). Forward-compatible: when in_naked is relaxed for non-naked asm contexts, Z6 starts firing on actual user code.
+
+**Z8 implementation:** walks output expression to root ident through NODE_FIELD/NODE_INDEX/NODE_UNARY(STAR), looks up Symbol, checks `is_const`. Same root-walk pattern as TOK_AMP volatile/const propagation (checker.c:2587).
+
+**Z11 implementation:** detects `clobbers: ["memory"]` (one of the registers is the literal string "memory"), then for each input: (a) must be NODE_IDENT, (b) symbol must exist, (c) type must be pointer (after distinct unwrap), (d) symbol must NOT have is_keep, (e) symbol must NOT be static, NOT global, NOT local-derived, NOT arena-derived (param heuristic). All conditions matched = error.
+
+**Session B type-check relaxation (companion change):** Input and output type checks extended from `type_is_integer(t)` to `type_is_integer(t) || (type_unwrap_distinct(t)->kind == TYPE_POINTER)`. Reason: pointer-as-asm-operand is the common case (MMIO addresses, struct base pointers) but Session B was rejecting it. SIMD/FPU still deferred. Both Z11 negative AND positive tests need pointer operand support, so relaxation lands with E1.
+
+**Tests added (auto-discovered):**
+- `tests/zer/asm_z11_keep_passes.zer` (positive: `keep *u64` flows through memory clobber, asserts post-asm value)
+- `tests/zer_fail/asm_z11_keep_memory_clobber.zer` (Z11: non-keep ptr + memory clobber rejected)
+- `tests/zer_fail/asm_z8_const_output.zer` (Z8: const output rejected)
+
+**Future-session extension points:**
+- Session E2 adds Z3 (VRP), Z4 (provenance), Z5 (escape from memory clobber), Z7 (MMIO range), Z12 (stack frame walker visits NODE_ASM), plus forward-compat Z9/Z10/Z13.
+- Session E3 adds Z1 (Handle UAF) and Z2 (move tracking) in `zercheck_ir.c` IR_ASM handler — different file (CFG state-machine layer).
+
 ## D-Alpha-7.5 Sessions C + F architecture — build-time generation (2026-04-25)
 
 **Pattern:** per-arch data tables (registers in C, instruction → category in F) use build-time generation with vendored output. Industry precedent: LLVM TableGen, ICU Unicode tables, Linux kernel autoconf, libc++ locale data.

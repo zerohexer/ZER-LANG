@@ -1,0 +1,19 @@
+// D-Alpha-7.5 Session E1: Z11 positive — `keep` annotation lets pointer
+// param flow through asm with memory clobber.
+
+u64 g_dest = 0;
+
+naked void store_ptr_via_asm(keep *u64 ptr, u64 val) {
+    asm {
+        instructions: "movq %1, (%0)"
+        inputs: { "rdi" = ptr, "rsi" = val }
+        clobbers: [ "memory" ]
+        safety: "Z11 positive — keep param allows memory clobber + ptr binding"
+    }
+}
+
+i32 main() {
+    store_ptr_via_asm(&g_dest, 99);
+    if (g_dest != 99) { return 1; }
+    return 0;
+}

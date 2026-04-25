@@ -51,12 +51,41 @@ When `parse_statement` sees a token that could begin a type (`is_type_token`), i
 
 **Known fragility:** `is_type_token` returns true for `TOK_IDENT`, so ALL identifier-starting statements go through speculative parse. Works but wasteful.
 
-### Function Pointer Detection Pattern
+### Function Pointer Detection Pattern (Variant 2A — C-style, legacy)
 At 4 sites (global, local, struct field, func param):
 1. After parsing return type, check for `(`
 2. Save state, advance, check for `*`
 3. If `*` found → parse func ptr with `parse_func_ptr_after_ret()`
 4. If not → restore state, continue normal parsing
+
+### Variant 2C funcptr (`*(args) -> ret name`, added 2026-04-25)
+Lives in `parse_type` (parser.c) before the existing `*T` pointer branch. When `*` is followed by `(`, it's a 2C funcptr type. When `*` is followed by anything else, it's a normal `*T` data pointer.
+
+```c
+if (check(p, TOK_STAR)) {
+    /* peek: '*' then '(' = 2C funcptr */
+    Scanner saved_scan = *p->scanner;
+    Token saved_cur = p->current;
+    Token saved_prev = p->previous;
+    advance(p);                    /* consume '*' */
+    if (check(p, TOK_LPAREN)) {
+        return parse_func_ptr_2c(p);   /* dispatch */
+    }
+    /* not 2C — restore state, fall through to normal *T */
+    *p->scanner = saved_scan;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+}
+/* normal *T pointer parsing follows */
+```
+
+`parse_func_ptr_2c` parses `(args) -> ret` and builds a regular `TYNODE_FUNC_PTR`. **The AST node is identical to 2A's output** — no syntax marker, no flag. Downstream code (checker, IR lowering, emitter, zercheck_ir, all 29 safety systems) cannot tell which source syntax produced the type. This is intentional — adding 2C touched ONLY parser/lexer/emitter; everything else is operator-agnostic.
+
+**Key tokens:** Added `TOK_THIN_ARROW` (`->`) for the return-type separator. Distinct from `TOK_ARROW` (`=>`, switch arms). Verified earlier: zero pre-existing `.zer` code uses `->` as an operator (12 files contain `->` but all in comments only) — adding the token is strictly additive.
+
+**Discriminator:** `*` BEFORE `(` = 2C; `*` INSIDE `(` (as in `T (*name)(args)`) = 2A. No other ZER type starts with `(`, so no parse ambiguity.
+
+**Decision: keep `.` for field access, no `->` for indirection.** Field access (`.`) is unchanged. The `->` thin arrow appears ONLY in TYPE position (2C return-type separator). Reasoning: refactor safety, chain ergonomics (`bob.list.next.prev` reads uniformly), modern systems-lang convention (Rust + Zig both `.` everywhere). Decision documented in CLAUDE.md and docs/reference.md.
 
 ### Parser Limits (stack arrays)
 - 1024 statements per block, 1024 declarations per file
@@ -488,6 +517,35 @@ Auto-guard `if (idx >= size) { return 0; }` in a function returning struct/union
 ### Function Pointer Array Emission (BUG-412, 2026-04-05)
 
 `Op[3] ops` where `Op` is `typedef u32 (*Op)(u32)` emitted `uint32_t (*)(uint32_t) ops[3]` — name outside the `(*)` instead of inside `(*ops[3])`. Fix: in `emit_type_and_name` for TYPE_ARRAY, when base type (after unwrapping array chain) is TYPE_FUNC_PTR (or distinct wrapping it), use function pointer emission pattern: `ret (*name[dims])(params)`. Works with distinct typedef func ptrs too.
+
+### Function Returning Function Pointer (2026-04-25, related to 2C funcptr work)
+
+**Symptom:** `*(u32, u32) -> u32 select_op(u32 k) { ... }` (inline 2C return-of-funcptr) AND `BinOp pick(u32 k) { ... }` (typedef'd) BOTH emitted invalid C: `uint32_t (*)(uint32_t, uint32_t) select_op(...) { ... }` — name placed AFTER the funcptr type instead of nested inside the funcptr's parens. GCC error: "expected identifier or '(' before ')' token".
+
+**Root cause:** Pre-existing emitter limitation. `emit_regular_func_from_ir` emitted return type via plain `emit_type(e, ret)` then ` ` then function name. When `ret->kind == TYPE_FUNC_PTR`, this produces `RET (*)(args) NAME(params)` — invalid C. The correct C form for "function returning funcptr" is the nested-paren form: `RET (*NAME(params))(args)`. NO existing test exercised return-of-funcptr (neither inline nor typedef), so the bug slipped through the entire test suite (3,649 tests pre-fix).
+
+**Fix:** In `emit_regular_func_from_ir` (emitter.c:9288), when the unwrapped return type is `TYPE_FUNC_PTR`:
+1. Emit `RET_OF_RET (*` (open the nested-paren form)
+2. Emit the function name + `(` + function's own params + `)`
+3. Close with `)(` + funcptr's inner arg types + `) {`
+
+```c
+bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+if (ret_is_funcptr) {
+    emit_type(e, ret->func_ptr.ret);
+    emit(e, " (*");           // open nested-paren
+    /* emit name + function params */
+    ...
+    emit(e, ")(");            // close nested-paren, open funcptr arg list
+    /* emit funcptr arg types */
+    emit(e, ")");
+}
+emit(e, " {\n");
+```
+
+**Pattern:** Function-level emission must mirror what `emit_type_and_name` does for variables. The variable case had been correct since BUG-412 (2026-04-05). The function-declaration case had silent symmetry-break — fixed alongside the 2C work. **Future emitter work emitting types in declaration positions should always use `emit_type_and_name`-style nested-paren form for funcptr types.**
+
+**Test:** `tests/zer/_verify_funcptr_2c.zer` exercises both inline 2C and typedef 2A return-of-funcptr.
 
 ### Comprehensive Distinct Typedef Audit (BUG-409/410, 2026-04-05)
 

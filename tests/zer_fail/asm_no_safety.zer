@@ -1,0 +1,11 @@
+// EXPECTED: compile error — structured asm requires `safety:` string (S4 rule).
+// D-Alpha-7.5 H1+H3 enforces audit-trail documentation at every escape-hatch site.
+
+naked void handler() {
+    asm {
+        instructions: "nop"
+        // missing safety: — must reject
+    }
+}
+
+i32 main() { return 0; }

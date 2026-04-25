@@ -9474,6 +9474,53 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* D-Alpha-7.5 Session E2b — Z4, Z5 wiring. */
+
+            /* Z4 (provenance preservation, System #3): asm writes opaque
+             * value to each output target — the asm body could store any
+             * pointer with any type. Clear `provenance_type` on output
+             * symbols so subsequent `@ptrcast` doesn't trust stale type info.
+             * Same pattern as NODE_ASSIGN clears at checker.c:3031. */
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                AsmOperand *op = &node->asm_stmt.outputs[i];
+                if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                Symbol *tsym = scope_lookup(c->current_scope,
+                    op->expr->ident.name,
+                    (uint32_t)op->expr->ident.name_len);
+                if (!tsym) continue;
+                tsym->provenance_type = NULL;
+                tsym->is_local_derived = false;
+                tsym->is_arena_derived = false;
+                tsym->is_from_arena = false;
+            }
+
+            /* Z5 (escape from memory clobber, System #11): if asm declares
+             * a memory clobber, any `is_local_derived` pointer input could
+             * be stored to global state by the asm body. The asm is
+             * opaque — we can't verify it doesn't escape. Conservative
+             * rejection forces user to either remove memory clobber (asm
+             * doesn't store) or move the variable to global/static scope.
+             * `is_local_derived` is set by TOK_AMP propagation
+             * (BUG-197/254 / checker.c:2602) when *p = &local. */
+            if (has_memory_clobber) {
+                for (int i = 0; i < node->asm_stmt.input_count; i++) {
+                    AsmOperand *op = &node->asm_stmt.inputs[i];
+                    if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        op->expr->ident.name,
+                        (uint32_t)op->expr->ident.name_len);
+                    if (!sym) continue;
+                    if (!sym->is_local_derived) continue;
+                    checker_error(c, op->loc.line,
+                        "asm input '%.*s' binds local-derived pointer '%.*s' "
+                        "with memory clobber (Z5 rule) — asm body may store "
+                        "the local address externally; move target to global "
+                        "or remove memory clobber",
+                        (int)op->reg_name_len, op->reg_name,
+                        (int)op->expr->ident.name_len, op->expr->ident.name);
+                }
+            }
+
             /* D-Alpha-7.5 Session E2 — Z3, Z7, Z12 wiring.
              *
              * Z3 (VRP propagate through asm outputs): asm writes an opaque

@@ -6908,6 +6908,64 @@ Why it matters: when S1 relaxation lands and asm appears in regular functions, o
 **Tests added:**
 - `tests/zer/asm_z3_vrp_invalidate.zer` — positive: global with prior compile-time-known value (5), asm writes 99 via output, post-asm comparison succeeds. Demonstrates VRP correctly drops the "5" narrowing.
 
+## D-Alpha-7.5 Session E2b — Z4 + Z5 forward-compat (2026-04-26)
+
+**Status:** 2 forward-compat Z-rules wired. Both no-ops today (input conditions unreachable under naked-only S1), activate when S1 relaxes.
+
+**Z4 (Provenance clearing on asm outputs, System #3):**
+
+Decision: when asm writes to a `*opaque` (or any) output target, CLEAR the symbol's `provenance_type`. Asm body is opaque to the compiler — could write any pointer with any underlying type. Subsequent `@ptrcast` must not trust stale provenance.
+
+Implementation matches NODE_ASSIGN's clearing block (checker.c:3027-3035):
+
+```c
+for (int i = 0; i < node->asm_stmt.output_count; i++) {
+    AsmOperand *op = &node->asm_stmt.outputs[i];
+    if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+    Symbol *tsym = scope_lookup(...);
+    if (!tsym) continue;
+    tsym->provenance_type = NULL;
+    tsym->is_local_derived = false;
+    tsym->is_arena_derived = false;
+    tsym->is_from_arena = false;
+}
+```
+
+Why no test today: observability requires multi-function flow with `@ptrcast` after the asm output. naked function can't have `@ptrcast` (or any non-asm code), so the clearing is correct but unobservable. When S1 relaxes, the test pattern becomes:
+
+```zer
+*opaque ctx = @ptrcast(*opaque, &sensor);   // provenance = *Sensor
+asm { outputs: { "rax" = ctx } ... }        // ctx provenance now CLEARED
+*Sensor s = @ptrcast(*Sensor, ctx);         // would-be COMPILE ERROR (no provenance)
+```
+
+**Z5 (Memory clobber → escape from local-derived input, System #11):**
+
+When asm declares `clobbers: ["memory"]`, the body could store any input pointer externally. If an input is a `is_local_derived` Symbol (set by TOK_AMP propagation when `*p = &local`), the local's address could escape. Reject this combination.
+
+Today this is unreachable because naked functions can't have local var-decls or `*p = &local` patterns. When S1 relaxes:
+
+```zer
+fn leaky() {
+    u32 stack_var = 42;
+    *u32 local_ptr = &stack_var;  // local_ptr.is_local_derived = true (existing TOK_AMP)
+    asm {
+        instructions: "mov %0, (%%rax)"
+        inputs: { "rdi" = local_ptr }
+        clobbers: [ "memory" ]   // COMPILE ERROR: Z5 rule fires
+    }
+}
+```
+
+**Why ship now (forward-compat rationale):**
+- ~30 lines of correct, documented code
+- Activates instantly when S1 relaxes — no retrofit churn
+- Same pattern as Z6 (defer/async ban) and Z11 (keep + memory clobber)
+- Documents the policy in code, not just docs
+
+**Cumulative Z-rule progress:** 8 of 13 wired (Z3, Z4, Z5, Z6, Z7, Z8, Z11, Z12).
+Remaining: Z9, Z10, Z13 (forward-compat pending S1 relaxation), Z1, Z2 (zercheck_ir.c — Session E3).
+
 ## D-Alpha-7.5 Sessions C + F architecture — build-time generation (2026-04-25)
 
 **Pattern:** per-arch data tables (registers in C, instruction → category in F) use build-time generation with vendored output. Industry precedent: LLVM TableGen, ICU Unicode tables, Linux kernel autoconf, libc++ locale data.

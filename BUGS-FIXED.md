@@ -307,6 +307,42 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 - Z5 (memory clobber → escape flag propagation) — partially covered by existing `is_local_derived` propagation through `&local`. Need to design how asm interacts with this for non-naked contexts.
 
 **Tests after this commit:** 3,659 PASS / 0 FAIL via `make docker-check` (was 3,658, +1). VST proofs: zero admits across 23 verification files.
+
+### D-Alpha-7.5 Session E2b: Z4 (provenance clearing) + Z5 (memory clobber escape) — forward-compat
+
+**Change:** Wires Z4 (System #3 Provenance) and Z5 (System #11 Escape Flags) at NODE_ASM. Both are FORWARD-COMPATIBLE no-ops today — input conditions are unreachable under naked-only restriction (naked excludes local var-decls, `@ptrcast` calls, and pointer-to-local patterns). Activates when S1 relaxes alongside Z6/Z9/Z10/Z13.
+
+**Rules implemented:**
+
+1. **Z4 — Provenance clearing on asm outputs.** Decision: CLEAR (option A from the three considered). asm body is opaque — could write any pointer with any type, so subsequent `@ptrcast` must NOT trust prior provenance. For each NODE_IDENT output, clears `Symbol.provenance_type`, `is_local_derived`, `is_arena_derived`, `is_from_arena`. Same pattern as NODE_ASSIGN's clearing block at checker.c:3027-3035. Today no-op because naked functions can't have `*opaque` flowing through `@ptrcast`.
+
+2. **Z5 — Local-derived pointer + memory clobber rejection.** When asm declares `clobbers: ["memory"]`, the body could store any input pointer to global state. If an input is a `is_local_derived` Symbol, the local's address could escape externally. Rejects this combination. Today no-op because naked functions can't construct `is_local_derived` pointers (no var-decls, no &local). Activates when S1 relaxes.
+
+**Why no negative test for Z5:** the violation requires a local var-decl + `*p = &local` pattern, which is impossible in naked functions (V4 audit rule: naked body = asm + return only). When S1 relaxes, a regular function with `u64 var; *u64 p = &var; asm{ inputs:{...=p}, clobbers:["memory"] }` will fire Z5. The check code is in place and ready.
+
+**Why no test for Z4:** observability requires a multi-function flow with `@ptrcast` after the asm output, which similarly needs S1 relaxation. The clearing happens silently; sanity check is build success + nothing else broken.
+
+**Same pattern as Z6 (E1):** ship now, document as forward-compat, activate when S1 relaxes. Cost is ~30 lines of correct code + documentation. Avoids retrofit churn when the framework ships.
+
+**Cumulative Z-rule status (8 of 13 wired in checker.c):**
+
+| Z# | Status | Reachable today? |
+|---|---|---|
+| Z3 (VRP invalidate on outputs) | ✓ E2 | Yes |
+| Z4 (provenance clearing on outputs) | ✓ E2b | No — forward-compat |
+| Z5 (escape from memory clobber + local) | ✓ E2b | No — forward-compat |
+| Z6 (defer/async ban) | ✓ E1 | No — forward-compat |
+| Z7 (MMIO range — automatic via @inttoptr) | ✓ E2 | Yes |
+| Z8 (const output) | ✓ E1 | Yes |
+| Z9 (ISR ban) | deferred | needs Session F instruction db |
+| Z10 (non-storable outputs) | deferred | forward-compat (S1 relaxation) |
+| Z11 (keep + memory clobber) | ✓ E1 | Yes |
+| Z12 (scan_frame visits operands) | ✓ E2 | Yes (frame walker only) |
+| Z13 (return range) | deferred | forward-compat (S1 relaxation) |
+| Z1 (Handle UAF) | deferred | Session E3 — zercheck_ir.c |
+| Z2 (move tracking) | deferred | Session E3 — zercheck_ir.c |
+
+**Tests after this commit:** 3,659 PASS / 0 FAIL via `make docker-check` (unchanged, no new tests needed for forward-compat-only batch). VST proofs: zero admits across 23 verification files.
 - Session F: 8 universal categories (C1-C8) framework — instruction-class → category mapping per-arch
 - Session G: System #30 (Atomic Ordering) — universal CFG-based tracker, ~80 hrs
 - Session C: H4 — per-arch register validation tables (post-framework polish, build-time-gen pattern)

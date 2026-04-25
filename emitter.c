@@ -9321,10 +9321,24 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                               memcmp(func->name, "main", 4) == 0 &&
                               (!ret || ret->kind == TYPE_VOID));
 
-        if (main_promote) emit(e, "int");
-        else if (ret) emit_type(e, ret);
-        else emit(e, "void");
-        emit(e, " ");
+        /* If `ret` is itself a funcptr, the function RETURNS a funcptr —
+         * C requires nested-paren syntax: RET (*name(params))(fp_args).
+         * Without this branch, emitter would produce invalid C like
+         * `RET (*)(fp_args) name(params)` which gcc rejects. */
+        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+
+        if (main_promote) {
+            emit(e, "int ");
+        } else if (ret_is_funcptr) {
+            /* Open: RET_OF_RET (* */
+            emit_type(e, ret->func_ptr.ret);
+            emit(e, " (*");
+        } else if (ret) {
+            emit_type(e, ret);
+            emit(e, " ");
+        } else {
+            emit(e, "void ");
+        }
         e->current_main_promoted = main_promote;
 
         /* Mangled name */
@@ -9351,7 +9365,18 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                 emit_type_and_name(e, ptype, p->name, p->name_len);
             }
         }
-        emit(e, ") {\n");
+        emit(e, ")");
+
+        /* Close funcptr-return form: )(fp_args) */
+        if (ret_is_funcptr) {
+            emit(e, ")(");
+            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_type(e, ret->func_ptr.params[i]);
+            }
+            emit(e, ")");
+        }
+        emit(e, " {\n");
         e->indent++;
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
     }

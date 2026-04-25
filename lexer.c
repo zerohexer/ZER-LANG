@@ -464,9 +464,10 @@ Token next_token(Scanner *s) {
         if (match(s, '=')) return make_token(s, TOK_PLUSEQ, start);
         return make_token(s, TOK_PLUS, start);
 
-    /* minus or minus-eq */
+    /* minus or minus-eq or thin-arrow (funcptr 2C return type) */
     case '-':
         if (match(s, '=')) return make_token(s, TOK_MINUSEQ, start);
+        if (match(s, '>')) return make_token(s, TOK_THIN_ARROW, start);
         return make_token(s, TOK_MINUS, start);
 
     /* star or star-eq */
@@ -650,6 +651,7 @@ const char *token_type_name(TokenType type) {
     case TOK_LSHIFTEQ: return "<<=";
     case TOK_RSHIFTEQ: return ">>=";
     case TOK_ARROW: return "=>";
+    case TOK_THIN_ARROW: return "->";
     case TOK_ERROR: return "ERROR";
     case TOK_EOF: return "EOF";
     }

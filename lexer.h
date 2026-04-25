@@ -104,6 +104,7 @@ typedef enum {
 
     /* === Arrow === */
     TOK_ARROW,           /* => (switch arm) */
+    TOK_THIN_ARROW,      /* -> (funcptr return type, Variant 2C) */
 
     /* === Special === */
     TOK_ERROR,           /* lexer error */

@@ -1,0 +1,16 @@
+// EXPECTED: compile error — operand reference consistency: %N must be < operand count.
+// Tests Session D rule. Catches typos like %2 when only 2 operands declared.
+
+u64 g_x = 0;
+u64 g_y = 0;
+
+naked void bad_ref() {
+    asm {
+        instructions: "movq %2, %0"
+        outputs: { "rax" = g_x }
+        inputs:  { "rcx" = g_y }
+        safety: "Test bad operand ref — %2 referenced but only 2 operands (0,1) declared"
+    }
+}
+
+i32 main() { return 0; }

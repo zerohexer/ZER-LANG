@@ -9238,6 +9238,135 @@ static void check_stmt(Checker *c, Node *node) {
                         "asm clobber entry must be non-empty register name string");
                 }
             }
+
+            /* D-Alpha-7.5 Session D — universal structural rules.
+             * Rules requiring per-arch instruction database (I1-4, E1-4, O3,
+             * S5 enforcement) deferred to Sessions C/F. */
+
+            /* S2: Max 16 instructions per asm block. Counts newlines + ';'.
+             * Forces small auditable blocks (audit-trail + maintenance friendly). */
+            {
+                int instr_count = 1; /* at least 1 instruction if string non-empty */
+                if (node->asm_stmt.instructions_len == 0) {
+                    instr_count = 0;
+                } else {
+                    for (size_t i = 0; i < node->asm_stmt.instructions_len; i++) {
+                        char ch = node->asm_stmt.instructions[i];
+                        if (ch == '\n' || ch == ';') instr_count++;
+                    }
+                }
+                if (instr_count > 16) {
+                    checker_error(c, node->loc.line,
+                        "asm block has %d instructions; max is 16 (S2 rule). "
+                        "Split into multiple asm blocks or use a helper function.",
+                        instr_count);
+                }
+            }
+
+            /* S3 (universal): forbid labels in asm. Pattern: word followed by
+             * ':' at the start of line / after ';' / after newline. Labels
+             * enable jumps that escape the block — control flow must stay
+             * inside ZER's control flow analysis. Per-arch jump mnemonic
+             * detection (full S3) deferred to Session F (instruction db). */
+            {
+                const char *s = node->asm_stmt.instructions;
+                size_t len = node->asm_stmt.instructions_len;
+                bool at_line_start = true;
+                for (size_t i = 0; i < len; i++) {
+                    char ch = s[i];
+                    if (ch == '\n' || ch == ';') {
+                        at_line_start = true;
+                        continue;
+                    }
+                    if (ch == ' ' || ch == '\t') continue;
+                    if (at_line_start) {
+                        /* Scan word, then check next non-word for ':'. */
+                        size_t j = i;
+                        while (j < len && (s[j] == '_' ||
+                               (s[j] >= 'a' && s[j] <= 'z') ||
+                               (s[j] >= 'A' && s[j] <= 'Z') ||
+                               (s[j] >= '0' && s[j] <= '9'))) j++;
+                        /* skip whitespace between word and possible ':' */
+                        size_t k = j;
+                        while (k < len && (s[k] == ' ' || s[k] == '\t')) k++;
+                        if (j > i && k < len && s[k] == ':') {
+                            /* But '%0:', '%1:', etc. are NOT labels — they're
+                             * GCC operand references in some asm dialects. Skip
+                             * if word starts with '%' (impossible per scan above
+                             * since we only matched [a-zA-Z0-9_]) so we're safe. */
+                            checker_error(c, node->loc.line,
+                                "asm block contains a label (S3 rule) — "
+                                "labels enable jumps that escape ZER's control "
+                                "flow analysis. Use multiple asm blocks if you "
+                                "need branching, or restructure as ZER if/while.");
+                            break;
+                        }
+                        at_line_start = false;
+                    }
+                }
+            }
+
+            /* Operand reference consistency: %0, %1, ..., %N references in the
+             * instructions string must be < (output_count + input_count).
+             * Catches typos and mismatched bindings. */
+            {
+                int total_operands = node->asm_stmt.output_count + node->asm_stmt.input_count;
+                const char *s = node->asm_stmt.instructions;
+                size_t len = node->asm_stmt.instructions_len;
+                for (size_t i = 0; i + 1 < len; i++) {
+                    if (s[i] != '%') continue;
+                    if (s[i+1] == '%') { i++; continue; } /* %% = literal % */
+                    if (s[i+1] >= '0' && s[i+1] <= '9') {
+                        int n = 0;
+                        size_t j = i + 1;
+                        while (j < len && s[j] >= '0' && s[j] <= '9') {
+                            n = n * 10 + (s[j] - '0');
+                            j++;
+                            if (n > 999) break; /* sanity */
+                        }
+                        if (n >= total_operands) {
+                            checker_error(c, node->loc.line,
+                                "asm references %%%d but only %d operands "
+                                "declared (outputs: %d, inputs: %d)",
+                                n, total_operands,
+                                node->asm_stmt.output_count,
+                                node->asm_stmt.input_count);
+                            break;
+                        }
+                        i = j - 1;
+                    }
+                }
+            }
+
+            /* Duplicate register binding rejection: within inputs{} or
+             * outputs{}, two operands cannot share the same register name.
+             * Cross input-output is allowed (read-write operands use this). */
+            for (int i = 0; i < node->asm_stmt.input_count; i++) {
+                AsmOperand *a = &node->asm_stmt.inputs[i];
+                for (int j = i + 1; j < node->asm_stmt.input_count; j++) {
+                    AsmOperand *b = &node->asm_stmt.inputs[j];
+                    if (a->reg_name_len == b->reg_name_len &&
+                        memcmp(a->reg_name, b->reg_name, a->reg_name_len) == 0) {
+                        checker_error(c, b->loc.line,
+                            "asm input register '%.*s' bound twice — each "
+                            "register can only be bound once per inputs{} block",
+                            (int)b->reg_name_len, b->reg_name);
+                    }
+                }
+            }
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                AsmOperand *a = &node->asm_stmt.outputs[i];
+                for (int j = i + 1; j < node->asm_stmt.output_count; j++) {
+                    AsmOperand *b = &node->asm_stmt.outputs[j];
+                    if (a->reg_name_len == b->reg_name_len &&
+                        memcmp(a->reg_name, b->reg_name, a->reg_name_len) == 0) {
+                        checker_error(c, b->loc.line,
+                            "asm output register '%.*s' bound twice — each "
+                            "register can only be bound once per outputs{} block",
+                            (int)b->reg_name_len, b->reg_name);
+                    }
+                }
+            }
         }
         break;
 

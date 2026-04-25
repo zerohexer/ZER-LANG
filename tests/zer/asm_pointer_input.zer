@@ -1,0 +1,23 @@
+// D-Alpha-7.5 Session B (extended in E1): pointer types accepted as asm
+// operands (was integer-only). Common case: MMIO addresses, struct base
+// pointers passed through asm without @ptrtoint workarounds.
+
+u64 g_storage = 0;
+u64 g_val = 7;
+
+// Local pointer through asm — uses globals for both ptr and val so types
+// match GCC's register-width inference (movq needs 64-bit operands).
+naked void store_via_global_ptr() {
+    asm {
+        instructions: "movq %1, (%0)"
+        inputs: { "rdi" = &g_storage, "rsi" = g_val }
+        clobbers: [ "memory" ]
+        safety: "Write g_val to g_storage via &g_storage in asm — pointer input accepted"
+    }
+}
+
+i32 main() {
+    store_via_global_ptr();
+    if (g_storage != 7) { return 1; }
+    return 0;
+}

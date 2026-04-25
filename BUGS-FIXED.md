@@ -257,6 +257,7 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 
 **Tests added (auto-discovered):**
 - `tests/zer/asm_z11_keep_passes.zer` — positive: `keep *u64 ptr` param flows through asm with memory clobber. Verifies semantics (`g_dest = 99` after asm).
+- `tests/zer/asm_pointer_input.zer` — positive: pointer-to-global as asm input via `&g_storage` + memory clobber. Verifies Session B's pointer-relaxation works in the simple case (no parameter binding, no Z11 concern).
 - `tests/zer_fail/asm_z11_keep_memory_clobber.zer` — non-keep `*u64 ptr` param + memory clobber rejected.
 - `tests/zer_fail/asm_z8_const_output.zer` — `outputs: { "rax" = G_READONLY }` where G_READONLY is `const u64` rejected.
 
@@ -267,7 +268,15 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 - Z1, Z2 (handle UAF, move tracking) — go in `zercheck_ir.c` IR_ASM handler (Session E2 — different file, different layer).
 - Z3, Z4, Z5, Z7, Z12 — Session E2 (point properties + provenance + escape + MMIO + stack).
 
-**Tests after this commit:** 3,657 PASS / 0 FAIL via `make docker-check` (was 3,654, +3). VST proofs: zero admits across 23 verification files.
+**Tests after this commit:** 3,658 PASS / 0 FAIL via `make docker-check` (was 3,654, +4). VST proofs: zero admits across 23 verification files.
+
+### Mental model documented (2026-04-26 follow-up): naked interim guard vs strict mode
+
+**Key insight clarified for fresh sessions:** S1 ("asm requires naked") is the INTERIM guard. naked is restrictive enough on its own (body = asm + return only, no defer/async/critical possible). Once Phase 2 strict mode lands (Z-rules + 18 structural + 8 categories + System #30), S1 RELAXES — asm becomes allowed in regular functions, and the framework becomes the safety guard. `naked` itself stays forever as a hardware-attribute keyword (no prologue/epilogue, required for ISRs and boot code).
+
+**Forward-compatible Z-rules:** Several Z-rules (Z6 defer/async, Z9 ISR, Z10 non-storable, Z13 return range) are written into checker.c TODAY but no-op because their input conditions are unreachable under naked-only restriction. They're correct, just dormant — when S1 relaxes, they activate on real code. Don't try to "fix" them by deleting.
+
+**Documented in:** `CLAUDE.md` rule #16 (one-paragraph summary, on-demand context) and `docs/compiler-internals.md` "naked interim guard vs strict mode" section (full mental model + ASCII diagrams + flag table for one-time fresh-session reading).
 
 **Roadmap (D-Alpha-7.5) — REVISED 2026-04-25 (build-time-generation pattern for per-arch data):**
 - Session A: H1+H3 baseline ✓

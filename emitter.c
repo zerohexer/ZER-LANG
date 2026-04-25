@@ -5513,6 +5513,81 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
             return;
         }
+        /* Compound shift: target <<= n / target >>= n.
+         * BUG-608 (5HwfE) fixed binary `<<`/`>>` in this function; the
+         * compound-assign forms were missed (BUG-612). Without _zer_shl/
+         * _zer_shr, raw C `<<=`/`>>=` with n >= width is undefined behavior
+         * (GCC -O0 produces hardware-masked result; -O2 sometimes folds
+         * accidentally to spec-correct, but it's not guaranteed). Mirrors
+         * emit_expr line 1375+: emit `target = _zer_shl(target, n)` with
+         * pointer-hoist for side-effectful targets. (IR lowering already
+         * extracts call/orelse out of targets, so the simple form is
+         * normally safe — pointer-hoist is defense in depth.) */
+        if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
+            bool shift_side_effect = false;
+            {
+                Node *n = node->assign.target;
+                while (n) {
+                    if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
+                        shift_side_effect = true; break;
+                    }
+                    if (n->kind == NODE_FIELD) n = n->field.object;
+                    else if (n->kind == NODE_INDEX) n = n->index_expr.object;
+                    else break;
+                }
+            }
+            const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
+            if (shift_side_effect) {
+                int tmp = e->temp_count++;
+                emit(e, "({ __auto_type _zer_sp%d = &(", tmp);
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, "); *_zer_sp%d = %s(*_zer_sp%d, ", tmp, macro, tmp);
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, "); })");
+            } else {
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, " = %s(", macro);
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, ", ");
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ")");
+            }
+            return;
+        }
+        /* Compound div/mod: target /= n / target %= n.
+         * BUG-608 covered binary `/`/`%`; compound versions were missed
+         * (BUG-612). Two safety properties enforced:
+         *   (1) divisor != 0 (defense in depth — checker forces compile-time
+         *       guard, but emit_expr line 1361 still adds runtime trap)
+         *   (2) on signed types, INT_MIN/-1 is C UB → trap. Mirrors
+         *       emit_expr binary path at 5099-5127. */
+        if (node->assign.op == TOK_SLASHEQ || node->assign.op == TOK_PERCENTEQ) {
+            Type *div_type = tgt_eff;
+            bool is_signed_div = div_type && type_is_signed(div_type);
+            const char *cop = node->assign.op == TOK_SLASHEQ ? "/" : "%";
+            int tmp = e->temp_count++;
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, node->assign.value, func);
+            emit(e, ") _zer_dv%d = ", tmp);
+            emit_rewritten_node(e, node->assign.value, func);
+            emit(e, "; if (_zer_dv%d == 0) ", tmp);
+            emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); ");
+            if (is_signed_div) {
+                emit(e, "if (_zer_dv%d == -1) { __typeof__(", tmp);
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, ") _zer_dd%d = ", tmp);
+                emit_rewritten_node(e, node->assign.target, func);
+                int w = type_width(div_type);
+                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
+                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
+                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
+                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
+            }
+            emit_rewritten_node(e, node->assign.target, func);
+            emit(e, " %s= _zer_dv%d; })", cop, tmp);
+            return;
+        }
         /* Simple assignment: target op= value */
         const char *aop = "=";
         switch (node->assign.op) {

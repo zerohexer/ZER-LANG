@@ -6586,7 +6586,25 @@ dispatch (for arch-specific), dead-branch testing (for privileged).
 
 ---
 
-## Z-Rules: extending ZER's 29 safety systems through unsafe asm (2026-04-23)
+## Z-Rules: extending ZER's 29 safety systems through asm (2026-04-23)
+
+> **⚠ KEYWORD RENAME 2026-04-25 — applies to entire Z-rules / asm section below**
+>
+> All `unsafe asm` and `unsafe fn` references below are **OBSOLETE NAMING**
+> kept for context. Read them as:
+> - `unsafe asm("...")` → `asm("...")`
+> - `unsafe asm { ... }` (planned H1-H7 structured form) → `asm { ... }`
+> - `unsafe fn` (planned H5) → never introduced; any function can contain
+>   `asm` (strict mode enforces safety per-block); `naked fn` stays for
+>   hardware constraint
+>
+> Audit confirmed `unsafe` keyword was cosmetic — every safety property
+> keys on the structural `in_naked` flag (`zer_asm_allowed_in_context`,
+> Phase 1 verified). Keyword never reached AST/IR/checker/emitter.
+>
+> **All H1-H7 features, all 13 Z-rules, all 8 categories, all 18 structural
+> rules, System #30 — UNCHANGED.** Only the keyword. The architectural
+> reasoning below is fully valid for the renamed `asm`.
 
 **KEY ARCHITECTURAL DECISION.** Read this before touching strict mode
 implementation in the checker.

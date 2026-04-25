@@ -547,6 +547,46 @@ emit(e, " {\n");
 
 **Test:** `tests/zer/_verify_funcptr_2c.zer` exercises both inline 2C and typedef 2A return-of-funcptr.
 
+### `emit_rewritten_node` Safety Wrapper Asymmetry — Binary vs Compound (BUG-608 + BUG-612, 2026-04-25)
+
+**Pattern**: `emit_rewritten_node` in the IR path has TWO separate switch cases for the same operators, and each must include its own safety wrapper. Missing one half produces silent UB at the C level.
+
+**The four-cell matrix that MUST stay in sync:**
+
+| | Binary form (e.g., `a << b`) | Compound form (e.g., `a <<= b`) |
+|---|---|---|
+| AST emit_expr (lines ~1078, 1361-1407) | wraps in `_zer_shl` ✓ | wraps in `_zer_shl` ✓ |
+| IR emit_rewritten_node (lines ~5092, ~5516) | NODE_BINARY handler — wraps (BUG-608 fix) | NODE_ASSIGN handler — was missing (BUG-612 fix) |
+
+**BUG-608 (5HwfE, fixed earlier):** binary `<<` `>>` `/` `%` in `emit_rewritten_node`'s NODE_BINARY case (line ~5092) emitted raw operators — no `_zer_shl`/`_zer_shr` wrap, no INT_MIN/-1 trap. Fixed by detecting these tokens and emitting wrapped forms.
+
+**BUG-612 (sibling, fixed 2026-04-25):** compound `<<=` `>>=` `/=` `%=` in `emit_rewritten_node`'s NODE_ASSIGN case (line ~5516) fell through to the bare `target op= value` emission via the `aop` switch at line 5518-5526 — same gap as BUG-608 but in a different switch case. Fixed by detecting these tokens BEFORE the generic `aop` switch and emitting wrapped forms (mirroring emit_expr lines 1361-1407 exactly).
+
+**Why this happens architecturally:**
+- `emit_rewritten_node` is the IR-replay path; it accepts decomposed AST nodes that came back from IR lowering
+- Binary expressions land in NODE_BINARY (handler at ~5092)
+- Compound assignments land in NODE_ASSIGN (handler at ~5347, with assignment dispatch at ~5516)
+- The two handlers were written by different additions over time — when BUG-608 fixed shifts/div in NODE_BINARY, the symmetric NODE_ASSIGN site was forgotten
+- `emit_expr` (AST path) had this symmetry from BUG-127/BUG-368 days; the gap was IR-only
+
+**Audit recipe (use this for any new safety wrapper):**
+```bash
+# Identify every safety wrapper used by emit_expr
+grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c | head -30
+
+# For each, locate corresponding emit_rewritten_node cell
+# Check BOTH binary and compound cases — they're SEPARATE switch arms
+```
+
+**The 4-cell rule:** every operator that has both a binary and a compound form (`<< / <<=`, `>> / >>=`, `/ /= `, `% / %=`) needs the same safety wrapper in BOTH the AST and IR paths. Missing one cell = silent UB. The CLAUDE.md "AST→IR Emission Diff Audit" table now lists these row-by-row to prevent the next regression.
+
+**Why -O2 sometimes hides the bug:** GCC's constant-propagation can fold `for (k=0; k<1; k++) n=35; x <<= n;` into `x = 0` (spec-correct) by accident — making bug repros pass at -O2 but fail at -O0 (where hardware shift masking gives non-zero `x`). When writing trap/safety reproducers, ALWAYS test at -O0 too, or use `void noopt(*T p)` patterns that block constant-prop.
+
+**Tests:**
+- `tests/zer/_verify_BUG-612_compound_shift_div.zer` — positive: shift >= width must clamp to 0 across var, struct field, array element targets
+- `tests/zer_trap/_verify_BUG-612_compound_signed_div.zer` — `INT_MIN /= -1` must trap (exit 133 SIGTRAP)
+- `tests/zer_trap/_verify_BUG-612_compound_signed_mod.zer` — `INT_MIN %= -1` must trap
+
 ### Comprehensive Distinct Typedef Audit (BUG-409/410, 2026-04-05)
 
 **The #1 bug class in ZER:** Every `->kind == TYPE_X` check on a type from `checker_get_type()` or `check_expr()` must call `type_unwrap_distinct()` first. This session found 35+ sites across checker.c, emitter.c, and types.c. The systematic audit used `grep "->kind == TYPE_X"` for each type kind and verified each site.

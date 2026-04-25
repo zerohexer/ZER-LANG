@@ -6588,7 +6588,7 @@ dispatch (for arch-specific), dead-branch testing (for privileged).
 
 ## Z-Rules: extending ZER's 29 safety systems through asm (2026-04-23)
 
-> **⚠ KEYWORD RENAME 2026-04-25 — applies to entire Z-rules / asm section below**
+> **KEYWORD RENAME 2026-04-25 — applies to entire Z-rules / asm section below**
 >
 > All `unsafe asm` and `unsafe fn` references below are **OBSOLETE NAMING**
 > kept for context. Read them as:

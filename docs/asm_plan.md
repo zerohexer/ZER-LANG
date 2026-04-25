@@ -2,7 +2,7 @@
 
 **Purpose:** This document captures the complete context from the Vale-tier verified asm design discussion so any fresh session can pick up exactly where we left off. Read this top-to-bottom if you are starting fresh on the asm verification work.
 
-> ## ⚠ KEYWORD RENAME 2026-04-25 — applies throughout this document
+> ## KEYWORD RENAME 2026-04-25 — applies throughout this document
 >
 > **`unsafe asm` was renamed to bare `asm`. The planned `unsafe fn` was dropped entirely.**
 >

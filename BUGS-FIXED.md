@@ -200,10 +200,61 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 
 **Tests after this commit:** 1,305 PASS / 0 FAIL via `make docker-check` (was 1,303, +2). VST proofs: zero admits across 23 verification files.
 
-**Roadmap (D-Alpha-7.5):**
+**Roadmap (D-Alpha-7.5) — REVISED 2026-04-25 (build-time-generation pattern for per-arch data):**
 - Session A: H1+H3 baseline ✓
-- Session B: H1 full + H2 ✓ (typed operand bindings, this commit)
-- Session C: H4 — per-arch register validation tables
+- Session B: H1 full + H2 ✓ (typed operand bindings)
+- **Session D (next): 18 structural rules (S/O/I/E)** — universal, no per-arch data entry
+- Session E: 13 Z-rules wiring 29 safety systems through asm operand boundaries — universal
+- Session F: 8 universal categories (C1-C8) framework — instruction-class → category mapping per-arch
+- Session G: System #30 (Atomic Ordering) — universal CFG-based tracker, ~80 hrs
+- Session C: H4 — per-arch register validation tables (post-framework polish, build-time-gen pattern)
+- Session H: H6 (`@asm_register_valid` Phase 1 predicate) — extracted from Session C tables
+- Session I: H7 (audit log emission `build/asm_audit.log`) — universal
+
+**Architectural pattern for Sessions C + F (decided 2026-04-25):** **build-time generation with vendored output.**
+
+Both per-arch data tables (registers in C, instruction classifications in F) use the same pattern:
+
+```
+zerc BUILD TIME:
+  scripts/gen_register_tables.sh:
+    for arch in x86_64 aarch64 riscv64; do
+        for reg in $(cat candidates_${arch}.txt); do
+            if echo "void f(){__asm__(\"\"::\"r\"(0):\"$reg\");}" \
+               | $arch-gcc -x c - -o /dev/null 2>/dev/null; then
+                emit "valid: $reg" → registers_${arch}.tbl
+            fi
+        done
+    done
+    # Convert .tbl to src/safety/asm_register_tables_*.c, vendor in git
+
+  scripts/gen_category_tables.sh:
+    Extract instruction list from Capstone/XED/ARM-XML/RISC-V-opcodes
+    Apply ~100 lines of class → category rules (e.g., "shift_ops → C1")
+    Plus exceptions list (~50 instructions need explicit classification)
+    Output to src/safety/asm_categories_*.c, vendor in git
+
+zerc RUNTIME (compiling user .zer):
+  Hash lookup against linked vendored tables → ns
+  No GCC shell-out, no probe overhead
+  LSP stays responsive
+```
+
+**Why this pattern wins (matches LLVM TableGen, ICU, Linux autoconf precedent):**
+- ✓ Reproducible builds (tables vendored in git)
+- ✓ Fast user-compile time (linked static data, hash lookup)
+- ✓ Phase 1 verifiable (deterministic against vendored data)
+- ✓ Cross-compile clean (target arch known at runtime)
+- ✓ Audit-friendly (grep finds anything in src/safety/*.c)
+- ✓ Drift prevention (regeneration script catches ISA-extension changes)
+- ✓ Solo-dev maintenance (per-ISA-extension updates: ~30 seconds — rerun script)
+- ✓ Unified pattern across Sessions C and F (single mental model)
+
+Initial setup investment: ~80 hours one-time across both sessions. Per-ISA-extension update cost: ~30 seconds. Trade is favorable for ZER's solo-dev + verified-compiler ambitions.
+
+**OBSOLETE NAMING (kept for context):** original roadmap had Session C as standalone "manual per-arch register validation tables" task with hand-typed entries. Earlier discussion considered "GCC delegation at user-compile time" (rejected — too slow for LSP, breaks Phase 1 verifiability). Final decision: build-time generation + vendored output pattern. The deliverable looks identical to manual tables (vendored .c files in src/safety/) but generation is automated. Best of both worlds.
+
+**Architectural principle:** ZER's safety is structurally universal (29 trackers + Z-rules + 18 structural rules). Per-arch DATA is minimized via build-time generation + vendoring. Maintenance burden bounded by ISA-extension cadence (rare events).
 - Session D: 18 structural rules (S/O/I/E)
 - Session E: 13 Z-rules wiring 29 safety systems through asm operand boundaries
 - Session F: 8 universal categories (C1-C8) framework + dispatch

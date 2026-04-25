@@ -17,6 +17,113 @@
 >
 > **All H1-H7 features, all 8 categories, all 13 Z-rules, all 18 structural rules, all System #30 design — UNCHANGED.** Only the keyword.
 
+> ## SESSIONS C + F ARCHITECTURE 2026-04-25 — build-time generation, vendored output
+>
+> Per-arch data tables (Session C: registers, Session F: instruction → category) use a unified pattern.
+>
+> ### Pipeline overview
+>
+> ```
+> zerc BUILD TIME (one-shot when developer regenerates):
+>     scripts/gen_register_tables.sh:
+>         for arch in x86_64 aarch64 riscv64; do
+>             for reg in $(cat candidates_${arch}.txt); do
+>                 if echo "void f(){__asm__(\"\"::\"r\"(0):\"$reg\");}" \
+>                    | $arch-gcc -x c - -o /dev/null 2>/dev/null; then
+>                     emit "valid: $reg" → registers_${arch}.tbl
+>                 fi
+>             done
+>         done
+>         # Convert .tbl → src/safety/asm_register_tables_*.c (vendored in git)
+>
+>     scripts/gen_category_tables.sh:
+>         Extract instruction list from Capstone/XED/ARM-XML/RISC-V-opcodes
+>         Apply ~100 lines of class → category rules (e.g., "shift_ops → C1")
+>         Plus exceptions list (~50 instructions need explicit classification)
+>         Output to src/safety/asm_categories_*.c (vendored in git)
+>
+>     Single Make target: `make gen-asm-tables` runs both scripts
+>
+> zerc COMPILE TIME (developers building zerc):
+>     Existing Makefile already links src/safety/*.c into zerc
+>     No special build steps — vendored tables compile like any other .c
+>
+> zerc RUNTIME (users compiling .zer files):
+>     zer_asm_register_valid(arch, name, len) → hash lookup against linked table
+>     zer_asm_category(arch, instr_name, len)  → hash lookup against linked table
+>     Nanoseconds, no shell-out, LSP-responsive
+> ```
+>
+> ### Why this pattern wins for ZER
+>
+> Industry precedent at similar scale: LLVM TableGen (instruction selection), ICU Unicode tables, Linux kernel autoconf, libc++ locale data. All use generate-then-vendor.
+>
+> | Property | Build-time gen + vendored | Manual hand-typed | GCC delegation at user-compile |
+> |---|---|---|---|
+> | Reproducible builds | YES (vendored) | YES | NO |
+> | Fast user-compile | YES (linked tables) | YES | NO (shell-out per check) |
+> | LSP responsive | YES | YES | NO |
+> | Phase 1 verifiable | YES (deterministic) | YES | NO |
+> | Cross-compile clean | YES | YES | NO (host vs target gcc) |
+> | Audit-friendly | YES (grep src/safety/) | YES | NO |
+> | Drift prevention | YES (regen canonical) | NO (manual sync) | YES (always GCC-current) |
+> | Per-ISA-extension update | ~30 seconds (rerun script) | hours-to-days manually | none needed |
+> | Solo-dev maintenance | LOW | HIGH (over years) | NONE |
+>
+> ### Cadence
+>
+> - **Per chip rollout** (Meteor Lake → Arrow Lake → Lunar Lake, etc.): ZERO updates needed. Chips don't add new register names within an ISA.
+> - **Per ISA extension** (AVX → AVX-512, ARM v8 → v9 SVE, RISC-V V extension): rerun `make gen-asm-tables`, review diff, commit. ~30 seconds.
+> - **Per GCC version bump**: ZERO updates needed (we pin a known-good GCC for regeneration; users don't see GCC at validation time).
+>
+> ### Predicates extracted to src/safety/ (Phase 1 compatible)
+>
+> - `zer_asm_register_valid(arch_id, name, len) -> bool`
+> - `zer_asm_category(arch_id, name, len) -> int` (returns category bitmap)
+>
+> Both deterministic against vendored data. Coq specs in `proofs/vst/` mirror the same enumerations. VST proves "C function returns 1 iff name is in vendored table" — verifies the lookup machinery against the linked data.
+>
+> ### Files (planned)
+>
+> ```
+> scripts/
+> ├── gen_register_tables.sh           # probe GCC per arch
+> ├── gen_category_tables.sh           # extract from Capstone/XED/etc.
+> ├── candidates_x86_64.txt            # rare-update candidate register lists
+> ├── candidates_aarch64.txt
+> ├── candidates_riscv64.txt
+> ├── classification_rules.txt         # ~100 lines: class → category mapping
+> ├── exceptions_x86_64.txt            # rare manual exceptions
+> └── ...
+>
+> src/safety/
+> ├── asm_register_tables_x86_64.c     # AUTO-GENERATED, vendored
+> ├── asm_register_tables_aarch64.c    # AUTO-GENERATED, vendored
+> ├── asm_register_tables_riscv64.c    # AUTO-GENERATED, vendored
+> ├── asm_categories_x86_64.c          # AUTO-GENERATED, vendored
+> ├── asm_categories_aarch64.c         # AUTO-GENERATED, vendored
+> ├── asm_categories_riscv64.c         # AUTO-GENERATED, vendored
+> └── asm_register_valid.c             # Phase 1 predicate (Session H, hash lookup wrapper)
+> ```
+>
+> ### Initial setup cost vs ongoing cost
+>
+> - **Initial pipeline setup (one-time)**: ~80 hours total across both sessions. Includes: build scripts, candidate lists for 3 archs, classification rules, exceptions lists, Makefile integration, regression testing.
+> - **Per-ISA-extension update**: ~30 seconds (rerun script, review diff, commit).
+> - **Per chip rollout**: zero work.
+>
+> Trade is favorable for ZER's solo-dev + verified-compiler ambitions: pay the setup cost once, get automatic correctness for the next 10+ years.
+>
+> ### Replaces earlier guidance
+>
+> - **OBSOLETE:** "manually hand-type per-arch register tables" (Session C as previously framed)
+> - **OBSOLETE:** "manually classify every instruction" (Session F as previously framed)
+> - **OBSOLETE:** "GCC delegation at user-compile time" (rejected — slow + breaks LSP + breaks Phase 1 + breaks cross-compile)
+>
+> Final answer: build-time-gen + vendoring is best of both worlds. The H1-H7 spec sections below describe the SAFETY semantics (unchanged) — only the data pipeline pivots.
+>
+> **Implementation reference:** `docs/compiler-internals.md` "D-Alpha-7.5 Sessions C + F architecture" section has the file-by-file implementation detail when these sessions are ready to start.
+
 **Key revisions (2026-04-23 late-day):**
 - Scope reduced from 4 archs → 3 archs (x86-64, ARM64, RISC-V). Cortex-M deferred to v1.1.
 - `asm` keyword renamed to `unsafe asm` — the `unsafe` marker is now **required** (Rust-style explicit escape hatch). Bare `asm(...)` is rejected with compile error. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — structural rule applies to new naming.

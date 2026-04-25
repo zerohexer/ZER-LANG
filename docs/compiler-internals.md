@@ -6692,6 +6692,80 @@ Width is determined by the bound expression's TYPE (GCC handles u64→`%rax`, u3
 - `tests/zer/asm_typed_operands.zer` (Session B: load immediate + leaq doubling + memory clobber)
 - `tests/zer_fail/asm_wrong_operand_type.zer` (Session B: float and struct operands rejected)
 
+## D-Alpha-7.5 Sessions C + F architecture — build-time generation (2026-04-25)
+
+**Pattern:** per-arch data tables (registers in C, instruction → category in F) use build-time generation with vendored output. Industry precedent: LLVM TableGen, ICU Unicode tables, Linux kernel autoconf, libc++ locale data.
+
+**Pipeline (applies to both Session C and F):**
+
+```
+zerc BUILD TIME (one-shot when developer regenerates):
+    scripts/gen_register_tables.sh
+        Per arch: probe GCC for register name validity
+        Output: src/safety/asm_register_tables_<arch>.c (vendored in git)
+    scripts/gen_category_tables.sh
+        Per arch: extract instruction list from Capstone/XED/ARM-XML/RISC-V-opcodes
+        Apply ~100 lines of class → category rules
+        Plus exceptions list (~50 instructions need explicit classification)
+        Output: src/safety/asm_categories_<arch>.c (vendored in git)
+    Makefile target: `make gen-asm-tables` runs both scripts
+
+zerc COMPILE TIME (developers building zerc):
+    Existing Makefile already links src/safety/*.c into zerc
+    No special build steps — vendored tables compile like any other .c
+
+zerc RUNTIME (users compiling .zer files):
+    zer_asm_register_valid(arch, name, len) → hash lookup against linked table
+    zer_asm_category(arch, instr_name, len) → hash lookup against linked table
+    Nanoseconds, no shell-out, LSP-responsive
+```
+
+**Why vendored output instead of generate-on-build:**
+1. **Reproducible builds**: tables are deterministic from git
+2. **No GCC dependency for users**: only the dev regenerating tables needs GCC + databases
+3. **Audit-friendly**: grep finds entries in checked-in `.c` files
+4. **Phase 1 verification**: predicates lookup against KNOWN linked data (Coq spec is the same data)
+5. **Cross-compile clean**: target arch known statically at runtime
+
+**Maintenance cadence:**
+- Per ISA extension (rare event, ~once per 2-5 years per arch): rerun `make gen-asm-tables`, review diff, commit
+- Per chip rollout: ZERO updates needed (chips don't add new register names within an ISA)
+- Per GCC version bump: ZERO updates needed (we pin a known-good GCC for regeneration)
+
+**Files (planned):**
+```
+scripts/
+├── gen_register_tables.sh           # probe GCC per arch
+├── gen_category_tables.sh           # extract from Capstone/XED/etc.
+├── candidates_x86_64.txt            # rare-update candidate register lists
+├── candidates_aarch64.txt
+├── candidates_riscv64.txt
+├── classification_rules.txt         # ~100 lines: class → category mapping
+└── exceptions_x86_64.txt            # rare manual exceptions
+└── ...
+
+src/safety/
+├── asm_register_tables_x86_64.c     # AUTO-GENERATED, vendored
+├── asm_register_tables_aarch64.c    # AUTO-GENERATED, vendored
+├── asm_register_tables_riscv64.c    # AUTO-GENERATED, vendored
+├── asm_categories_x86_64.c          # AUTO-GENERATED, vendored
+├── asm_categories_aarch64.c         # AUTO-GENERATED, vendored
+├── asm_categories_riscv64.c         # AUTO-GENERATED, vendored
+└── asm_register_valid.c             # Phase 1 predicate (Session H, hash lookup wrapper)
+```
+
+**Predicates extracted to src/safety/ (Phase 1 compatible):**
+- `zer_asm_register_valid(arch_id, name, len) -> bool`
+- `zer_asm_category(arch_id, name, len) -> int` (returns category bitmap)
+
+Both deterministic against vendored data — Coq specs in `proofs/vst/` mirror the same enumerations.
+
+**OBSOLETE NAMING (kept for context):** earlier discussion considered:
+- "Manual hand-typed tables" — rejected, too much per-update labor over years
+- "GCC delegation at user-compile time" — rejected, slow + breaks LSP responsiveness + breaks Phase 1 verification + breaks cross-compile
+
+Final answer chose build-time-gen + vendoring as best of both worlds.
+
 ---
 
 ## Z-Rules: extending ZER's 29 safety systems through asm (2026-04-23)

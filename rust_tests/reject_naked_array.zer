@@ -2,6 +2,6 @@
 // Naked function with local array
 naked void isr() {
     u8[16] buf;
-    unsafe asm("nop");
+    asm("nop");
 }
 i32 main() { return 0; }

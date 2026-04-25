@@ -173,13 +173,14 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
         return 1;
     ```
 
-16. **`unsafe asm` is REQUIRED for inline asm (2026-04-23).** Bare `asm(...)` is rejected at compile time with message "use 'unsafe asm(...)' as explicit escape hatch marker". Only allowed inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context`). Users prefer `@intrinsic()` calls; `unsafe asm` is an escape hatch for edge cases. See `docs/asm_plan.md`.
+16. **Inline asm uses bare `asm(...)` (renamed from `unsafe asm` 2026-04-25).** Allowed only inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context(in_naked)`). Users prefer `@intrinsic()` calls (130 verified intrinsics shipping); `asm` is an escape hatch for edge cases. After D-Alpha-7.5 Phase 2 lands, asm becomes 100% language-safe via 13 Z-rules + 8 universal precondition categories + System #30 (auto-detection framework dispatching to existing 29 safety systems). See `docs/asm_plan.md`.
     ```
     naked void handler() {
-        unsafe asm("cli");        // OK — Rust-style explicit marker required
-        // asm("nop");             // COMPILE ERROR: bare 'asm' not allowed
+        asm("cli");               // OK in naked fn
+        // asm("nop");             // outside naked fn = COMPILE ERROR (MISRA Dir 4.3)
     }
     ```
+    **OBSOLETE (kept for context):** previously required `unsafe asm("...")` form (2026-04-23 to 2026-04-25). Audit confirmed the `unsafe` keyword was cosmetic — every safety check keys on the structural `in_naked` flag, not the keyword. Rename aligns with C/Zig/C++ convention (only Rust/Carbon use `unsafe asm`); ZER's auto-everything brand fits bare `asm`. The planned `unsafe fn` (H5 of D-Alpha-7.5) was also dropped — function-level marker is redundant once strict mode is per-block. `naked fn` stays (hardware constraint for interrupt handlers, no prologue/epilogue).
 
 ### Intrinsics (@ builtins)
 ```
@@ -386,10 +387,13 @@ ARM; sepc/sstatus on RISC-V) before the transition instruction. Dead-branch patt
 ```
 
 **All 14 D-Alpha intrinsic batches complete (130/130).** Next work: D-Alpha-7.5 Phase 1
-(hardened unsafe asm) then Phase 2 (strict mode implementation with 8 categories +
+(hardened `asm`) then Phase 2 (strict mode implementation with 8 categories +
 13 Z-rules + new System #30).
 
-### `unsafe asm` safety (strict mode + Z-rules + 8 Categories, planned D-Alpha-7.5)
+### `asm` safety (strict mode + Z-rules + 8 Categories, planned D-Alpha-7.5)
+
+**NAMING NOTE (2026-04-25):** Throughout this section and the asm_plan.md doc, references to `unsafe asm` and `unsafe fn` are OBSOLETE — renamed to bare `asm` (and `unsafe fn` was dropped entirely). The keyword was cosmetic; safety enforced structurally via `zer_asm_allowed_in_context(in_naked)`. The plan, the H1-H7 features, all Z-rules, all 8 categories, System #30 — **unchanged**. Only the keyword.
+
 
 **Research phase COMPLETE (2026-04-24) — 7 sessions, 8 final universal precondition categories.**
 
@@ -1135,7 +1139,7 @@ ZER SYNTAX RULES (not C — these differ):
 - Optional: ?*T (null sentinel), ?T (struct with .value/.has_value), ?void (has_value ONLY, no .value)
 - Unwrap: if (opt) |val| { use(val); }  or  val = opt orelse default;
 - goto label; and label: are supported (forward + backward). Banned inside defer and @critical blocks.
-- Inline asm: `unsafe asm("...")` REQUIRED (Rust-style); bare `asm("...")` is a compile error. Only in `naked` functions.
+- Inline asm: bare `asm("...")` (renamed from `unsafe asm` 2026-04-25). Only in `naked` functions. After D-Alpha-7.5 Phase 2: 100% language-safe via Z-rules + 8 categories + System #30.
 - shared struct = auto-locked mutex. shared(rw) struct = reader-writer lock.
 - spawn func(args) = fire-and-forget thread (shared ptr or value args only)
 - ThreadHandle th = spawn func(args); th.join(); = scoped spawn (allows *T)

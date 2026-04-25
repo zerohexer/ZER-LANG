@@ -2878,21 +2878,22 @@ int main(void) {
         "}\n",
         "partial struct mutation: h.val=42 doesn't clear h.p local-derived");
 
-    /* ---- MISRA Dir 4.3: unsafe asm isolation ---- */
-    printf("\n--- MISRA Dir 4.3 unsafe asm isolation ---\n");
+    /* ---- MISRA Dir 4.3: asm isolation ---- */
+    /* Renamed `unsafe asm` → `asm` 2026-04-25. The keyword was cosmetic
+     * (no safety property keyed on it). Phase 1 verified rule
+     * `zer_asm_allowed_in_context(in_naked)` enforces naked-only
+     * structurally regardless of keyword. */
+    printf("\n--- MISRA Dir 4.3 asm isolation ---\n");
 
-    printf("[unsafe asm in regular function → error]\n");
-    err("void f() { unsafe asm(\"nop\"); }\n",
-        "MISRA: unsafe asm in regular function rejected");
+    printf("[asm in regular function → error]\n");
+    err("void f() { asm(\"nop\"); }\n",
+        "MISRA: asm in regular function rejected");
 
-    printf("[unsafe asm in naked function → ok]\n");
-    ok("naked void f() { unsafe asm(\"nop\"); }\n"
+    printf("[asm in naked function → ok]\n");
+    ok("naked void f() { asm(\"nop\"); }\n"
        "u32 main() { return 0; }\n",
-       "MISRA: unsafe asm in naked function OK");
-
-    printf("[bare asm rejected — must use 'unsafe asm']\n");
-    err("naked void f() { asm(\"nop\"); }\n",
-        "bare asm rejected in favor of unsafe asm");
+       "MISRA: asm in naked function OK");
+    /* `bare asm rejected` test removed — bare `asm` is now the standard form */
 
     /* ---- Cross-platform portability ---- */
     printf("\n--- cross-platform portability ---\n");

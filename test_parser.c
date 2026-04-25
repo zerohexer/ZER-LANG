@@ -306,10 +306,10 @@ static void test_asm(void) {
     printf("[asm]\n");
     expect_parse_ok(
         "naked void reset() {\n"
-        "    unsafe asm(\"nop\");\n"
+        "    asm(\"nop\");\n"
         "}\n"
         "i32 main() { return 0; }\n",
-        "unsafe asm statement");
+        "asm statement (renamed from unsafe asm 2026-04-25)");
 }
 
 static void test_intrinsics(void) {

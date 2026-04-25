@@ -9473,6 +9473,37 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)op->expr->ident.name_len, op->expr->ident.name);
                 }
             }
+
+            /* D-Alpha-7.5 Session E2 — Z3, Z7, Z12 wiring.
+             *
+             * Z3 (VRP propagate through asm outputs): asm writes an opaque
+             * value to each output target. VRP must invalidate the prior
+             * range so subsequent reads don't assume stale narrowing.
+             * Reuses existing `vrp_invalidate_for_assign` helper (called
+             * for every regular = / += / etc. assignment). */
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                AsmOperand *op = &node->asm_stmt.outputs[i];
+                if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                vrp_invalidate_for_assign(c,
+                    op->expr->ident.name,
+                    (uint32_t)op->expr->ident.name_len,
+                    TOK_EQ, NULL);
+            }
+
+            /* Z7 (MMIO range): if any operand expression is `@inttoptr`,
+             * the existing @inttoptr handler at NODE_INTRINSIC has already
+             * validated the address against declared mmio ranges via
+             * `c->mmio_ranges` (see checker.c:5106). The check fires when
+             * `check_expr` runs on the operand at lines 9202/9223 above.
+             * No additional NODE_ASM-specific check needed today.
+             * Sessions F+ will add memory-operand detection from the
+             * instruction database to extend this to operand `(addr)`
+             * patterns inside the asm string itself. */
+
+            /* Z12 (stack frame walker visits asm operands): handled in
+             * `scan_frame` (NODE_ASM case) — operand expressions could
+             * call functions or take address of locals, both relevant
+             * to stack accounting. */
         }
         break;
 
@@ -11130,9 +11161,28 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     case NODE_CONTINUE:
     case NODE_GOTO:
     case NODE_LABEL:
-    case NODE_ASM:
     case NODE_CAST:
     case NODE_SIZEOF:
+        break;
+    case NODE_ASM:
+        /* Z12 (stack frame walker visits asm operands): inline form has no
+         * operand expressions to recurse into. Structured form has typed
+         * inputs/outputs/clobbers — operand expressions could be calls
+         * (rare but possible: `inputs: { "rdi" = compute() }`) or
+         * `&local` patterns (counts toward frame_size via the operand's
+         * underlying ident). Recurse so stack accounting stays accurate
+         * when asm-via-non-naked relaxation lands. */
+        if (node->asm_stmt.is_structured) {
+            for (int i = 0; i < node->asm_stmt.input_count; i++) {
+                if (node->asm_stmt.inputs[i].expr)
+                    scan_frame(c, frame, node->asm_stmt.inputs[i].expr);
+            }
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                if (node->asm_stmt.outputs[i].expr)
+                    scan_frame(c, frame, node->asm_stmt.outputs[i].expr);
+            }
+            /* clobbers have no expr — just register name strings */
+        }
         break;
     case NODE_YIELD:
         break; /* leaf — no children */

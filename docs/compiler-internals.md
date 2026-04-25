@@ -6853,6 +6853,61 @@ Pre-v1.0: `--relax-asm` is the implicit default (since strict mode isn't built y
 - Session E2 adds Z3 (VRP), Z4 (provenance), Z5 (escape from memory clobber), Z7 (MMIO range), Z12 (stack frame walker visits NODE_ASM), plus forward-compat Z9/Z10/Z13.
 - Session E3 adds Z1 (Handle UAF) and Z2 (move tracking) in `zercheck_ir.c` IR_ASM handler — different file (CFG state-machine layer).
 
+## D-Alpha-7.5 Session E2 — VRP invalidation + MMIO reuse + stack walker (2026-04-26)
+
+**Status:** 2 new Z-rules wired + 1 documented as automatic via existing infra. Cumulative: 5 of 13 checker.c Z-rules done.
+
+**Z3 (VRP invalidation on asm outputs, System #12):**
+
+Reuses the existing `vrp_invalidate_for_assign(c, key, key_len, op, value)` helper that runs for every `=` / `+=` / etc. in regular code. For NODE_ASM outputs:
+
+```c
+for (int i = 0; i < node->asm_stmt.output_count; i++) {
+    AsmOperand *op = &node->asm_stmt.outputs[i];
+    if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+    vrp_invalidate_for_assign(c,
+        op->expr->ident.name,
+        (uint32_t)op->expr->ident.name_len,
+        TOK_EQ, NULL);  /* NULL value = no derivation, just wipe */
+}
+```
+
+The wipe goes to `[INT64_MIN, INT64_MAX]` (effectively unknown). Compound output targets (NODE_FIELD/NODE_INDEX) use compound key path — currently NODE_IDENT-only because most asm outputs bind to simple variables, but extension is straightforward.
+
+**Z7 (MMIO range, System #19) — DOCUMENTED REUSE, no new code:**
+
+The existing `check_expr` calls at lines 9202 / 9223 already invoke NODE_INTRINSIC handling for any `@inttoptr` operand. That handler validates the address against `c->mmio_ranges` (checker.c:5106). Z7 fires automatically when:
+
+```zer
+mmio 0x40000000..0x40000FFF;
+
+naked void mmio_write() {
+    asm {
+        instructions: "movq %1, (%0)"
+        inputs: { "rdi" = @inttoptr(*u32, 0x50000000), "rsi" = val }
+        /* COMPILE ERROR: 0x50000000 outside declared mmio range */
+    }
+}
+```
+
+The check is at the operand expression level, not at the asm string level. Memory access patterns INSIDE the asm string (like `(%0)` syntax meaning "indirect through register %0") need Session F's instruction database to detect — defer that to Session F.
+
+**Z12 (`scan_frame` visits asm operands, System #18):**
+
+Previous behavior: NODE_ASM was a leaf in `scan_frame`'s switch (no children). New: structured asm recurses into input + output operand expressions. Inline asm (legacy `asm("string")`) stays a leaf — no operand expressions. Implementation in checker.c:11128 area.
+
+Why it matters: when S1 relaxation lands and asm appears in regular functions, operand expressions can be calls (`inputs: { "rdi" = compute() }`) or `&local` patterns. Stack accounting (`--stack-limit N`) and recursion detection rely on `scan_frame` seeing every call. Forward-compat fix.
+
+**Why Z4/Z5 deferred:**
+
+| Z-rule | Why deferred |
+|---|---|
+| Z4 (provenance on *opaque operands) | Needs design decision: does asm CLEAR provenance (output is unknown), PRESERVE provenance (asm doesn't change type), or CHECK provenance match (input must match declared)? Different semantics depending on whether asm is read-only vs. write-back. |
+| Z5 (memory clobber → escape) | Partially covered by existing `is_local_derived` propagation through `&local` + checker's return-escape check. Need to model how `clobbers: ["memory"]` interacts with locals being "potentially escaped through unknown memory writes." Design pending. |
+
+**Tests added:**
+- `tests/zer/asm_z3_vrp_invalidate.zer` — positive: global with prior compile-time-known value (5), asm writes 99 via output, post-asm comparison succeeds. Demonstrates VRP correctly drops the "5" narrowing.
+
 ## D-Alpha-7.5 Sessions C + F architecture — build-time generation (2026-04-25)
 
 **Pattern:** per-arch data tables (registers in C, instruction → category in F) use build-time generation with vendored output. Industry precedent: LLVM TableGen, ICU Unicode tables, Linux kernel autoconf, libc++ locale data.

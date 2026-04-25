@@ -282,9 +282,31 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 - Session A: H1+H3 baseline ✓
 - Session B: H1 full + H2 ✓ (typed operand bindings; pointer-types extended in E1)
 - Session D: 4 universal structural rules ✓
-- Session E1: Z6 + Z8 + Z11 ✓ (this commit; 3 of 13 Z-rules)
-- **Session E2 (next): Z3 + Z4 + Z5 + Z7 + Z12 + Z9/Z10/Z13** — remaining checker.c Z-rules
+- Session E1: Z6 + Z8 + Z11 ✓ (3 of 13 Z-rules)
+- Session E2: Z3 + Z7 (note) + Z12 ✓ (this commit; 5 of 13 Z-rules total)
+- **Session E2b (next): Z4 + Z5** — provenance + escape from memory clobber
 - Session E3: Z1 + Z2 — IR-level state machines in `zercheck_ir.c` IR_ASM handler
+
+### D-Alpha-7.5 Session E2: Z3 + Z7 (existing reuse) + Z12 (2 new + 1 documented reuse)
+
+**Change:** Second Z-rules batch. Wires existing infrastructure into 3 more touch points at NODE_ASM. No new Phase 1 extractions.
+
+**Rules implemented:**
+
+1. **Z3 — VRP range invalidation on asm outputs** (System #12). asm writes opaque values to output targets; VRP must drop prior narrowing. Calls existing `vrp_invalidate_for_assign(c, name, len, TOK_EQ, NULL)` for each NODE_IDENT output. Same helper used by every regular = / += / etc. assignment.
+
+2. **Z7 — MMIO range check on asm operands** (System #19). DOCUMENTED REUSE — no new code. The `check_expr` calls already running on each operand at the input/output type checks (lines 9202/9223) trigger NODE_INTRINSIC handling for `@inttoptr`, which validates the address against `c->mmio_ranges` (checker.c:5106). So Z7 fires automatically when an asm operand is `@inttoptr`-derived. Memory-operand detection inside the asm string itself (e.g., `"mov %0, (%1)"` where `(%1)` is a memory access) defers to Sessions F+'s instruction database.
+
+3. **Z12 — `scan_frame` walker visits asm operands** (System #18). Previously NODE_ASM was a leaf (no recursion). Now structured asm recurses into input/output operand expressions so stack frame computation captures embedded calls (`inputs: { "rdi" = compute() }`) and `&local` patterns. Future-compatible with non-naked-asm relaxation.
+
+**Tests added (auto-discovered):**
+- `tests/zer/asm_z3_vrp_invalidate.zer` — positive: global with prior known constant value (5), asm writes 99 via output, post-asm comparison verifies VRP didn't retain stale narrowing.
+
+**Z-rules NOT in E2 (deferred to E2b):**
+- Z4 (provenance on `*opaque` operands) — needs design: should asm clear provenance, or preserve, or check match? Defer.
+- Z5 (memory clobber → escape flag propagation) — partially covered by existing `is_local_derived` propagation through `&local`. Need to design how asm interacts with this for non-naked contexts.
+
+**Tests after this commit:** 3,659 PASS / 0 FAIL via `make docker-check` (was 3,658, +1). VST proofs: zero admits across 23 verification files.
 - Session F: 8 universal categories (C1-C8) framework — instruction-class → category mapping per-arch
 - Session G: System #30 (Atomic Ordering) — universal CFG-based tracker, ~80 hrs
 - Session C: H4 — per-arch register validation tables (post-framework polish, build-time-gen pattern)

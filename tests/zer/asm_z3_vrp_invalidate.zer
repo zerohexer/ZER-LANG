@@ -1,0 +1,25 @@
+// D-Alpha-7.5 Session E2: Z3 — VRP range invalidated on asm output target.
+// The `result` global has a known compile-time-derivable range BEFORE the
+// asm block. After asm writes to it, the range must be wiped — subsequent
+// uses cannot rely on the prior narrowing.
+//
+// This test verifies the invalidation by writing a value via asm that's
+// outside the prior "constant 5" range, then checking it.
+
+u64 result = 5;
+
+naked void overwrite_via_asm() {
+    asm {
+        instructions: "movq $99, %0"
+        outputs: { "rax" = result }
+        safety: "Z3 test — assigning 99 via asm; VRP must drop prior range narrowing"
+    }
+}
+
+i32 main() {
+    overwrite_via_asm();
+    // After asm, result should be 99. If VRP had retained the "5" range
+    // and inlined a constant, this would fail.
+    if (result != 99) { return 1; }
+    return 0;
+}

@@ -6738,6 +6738,88 @@ Doing 4 rules now + 9 in Session F (with the data) is cleaner than half-implemen
 - Session C adds register tables → unlocks O3 register name validation
 - Session G adds System #30 — only NEW safety system across the whole framework
 
+## D-Alpha-7.5 — `naked` interim guard vs strict mode (2026-04-26)
+
+**Mental model fresh sessions need.** Without this clarity, sessions waste turns trying to "fix" Z-rules that appear to be no-ops or asking why asm is naked-only forever.
+
+### Two phases of the safety story
+
+```
+Phase 1 (today): naked-only — interim guard
+    ┌────────────────────────────────────────────────┐
+    │ S1 rule: asm only in naked functions           │
+    │ Justification: naked is restrictive enough     │
+    │   - naked body = asm + return only (V4 rule)   │
+    │   - no defer, no async, no @critical (excluded │
+    │     by structural rule that naked excludes ALL │
+    │     non-asm/non-return statements)             │
+    │ Other Z-rules (Z6 defer/async ban) are no-op   │
+    │   because their input conditions are unreachable│
+    └────────────────────────────────────────────────┘
+
+Phase 2 (after v1.0 strict mode lands): naked + regular — framework guard
+    ┌────────────────────────────────────────────────┐
+    │ S1 relaxed: asm allowed in any function        │
+    │ Safety in regular fn provided by full framework│
+    │   - 18 structural rules (S/O/I/E)              │
+    │   - 13 Z-rules (Z1-Z13)                        │
+    │   - 8 universal precondition categories (C1-C8)│
+    │   - System #30 (Atomic Ordering)               │
+    │   - Per-arch register + instruction tables     │
+    │ Z6 etc. start firing on real code paths        │
+    │ naked stays — hardware constraint for ISR/boot │
+    └────────────────────────────────────────────────┘
+```
+
+### What this means for forward-compatible Z-rules
+
+Some Z-rules (Z6 defer/async, Z9 ISR ban, Z10 non-storable outputs, Z13 return range) are written into checker.c TODAY but are no-ops because S1 makes their input conditions unreachable. Examples:
+
+- **Z6** bans asm in defer body. defer body is in a regular function (naked can't have defer). So today, asm in defer is unreachable — but the check exists.
+- **Z9** bans privileged instructions in ISR-handler asm. ISR handler IS naked, so asm is allowed, but the instruction-class check needs Session F's instruction db. Currently the broader S3 (no labels/jumps inside asm block) covers most issues.
+- **Z10** rejects non-storable lvalue (e.g., `pool.get(h)`) as asm output. naked function can't call `pool.get` — so today unreachable.
+- **Z13** ensures asm outputs respect declared return ranges. naked has no return-range tracking — today unreachable.
+
+When S1 relaxes, all four start firing on real user code. **Don't try to "fix" them by deleting** — they're correct, just dormant.
+
+### Why ship dormant Z-rules
+
+1. Forward compatibility — when S1 relaxes, no scramble to add them
+2. Cost is trivial (5-15 lines per rule)
+3. Documents the policy in code, not just docs
+4. Tests for them are negative-only today (they pass because the input is unreachable, not because the check fires) — they convert to active tests when S1 relaxes
+5. Same pattern as `zer_break_allowed_in_context(defer_depth, critical_depth, in_loop)` — multi-flag check that doesn't depend on which contexts can actually nest today
+
+### What unblocks S1 relaxation
+
+S1 relaxes ONLY when ALL of:
+- All 13 Z-rules wired (E1 done; E2 + E3 pending)
+- 18 structural rules complete (need Session F instruction db for I1-4, E1-4, O3, O4-5, S5)
+- 8 universal precondition categories framework (Session F)
+- System #30 (Atomic Ordering — Session G, ~80 hrs)
+- Per-arch register tables (Session C, build-time-gen)
+
+This is the v1.0 strict mode milestone. Until then, asm stays naked-only.
+
+### Don't confuse "naked" with "asm-required"
+
+`naked` is a function attribute that:
+- Tells GCC: skip prologue/epilogue (no stack frame)
+- Required for: interrupt handlers, boot code, context-switch primitives
+- Restricts body to: asm + return statements only (V4 rule)
+
+`naked` STAYS forever as a hardware-attribute keyword. What changes is the S1 rule that says "asm requires naked context." That rule relaxes; naked doesn't.
+
+### Flags controlling the timeline
+
+| Flag | Behavior |
+|---|---|
+| (default, post-v1.0) | strict mode on; asm allowed in any function passing strict checks |
+| `--relax-asm` | strict mode off; asm allowed only in naked (current behavior) |
+| Per-block `@relax_check(ZN)` | disable specific Z-rule for legitimate edge cases |
+
+Pre-v1.0: `--relax-asm` is the implicit default (since strict mode isn't built yet). Post-v1.0: strict mode default.
+
 ## D-Alpha-7.5 Session E1 — First 3 Z-rules at NODE_ASM (2026-04-26)
 
 **Status:** 3 of 13 Z-rules wired in `checker.c` NODE_ASM block (after Session D's structural rules). Each Z-rule reuses an EXISTING tracking system / extracted predicate at a NEW call site. **Zero new Phase 1 extractions** — call-site wiring only.

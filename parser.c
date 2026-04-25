@@ -255,6 +255,90 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
     return t;
 }
 
+/* ----------------------------------------------------------------
+ * Variant 2C funcptr: *(args) -> ret  (typedef-free, ZER-native)
+ *
+ * Parses the type after the leading '*' has already been consumed.
+ * Caller has verified next token is '('.
+ *
+ * Forms:
+ *   *(args) -> ret    pointer to function returning ret
+ *   *(args)           pointer to function returning void
+ *   *()               pointer to no-arg void-returning function
+ *   *(keep *T, U)     keep modifier on individual params
+ *
+ * Produces same TYNODE_FUNC_PTR shape as 2A — downstream code
+ * (checker, IR lowering, emitter, zercheck_ir) is operator-agnostic.
+ * ---------------------------------------------------------------- */
+static TypeNode *parse_func_ptr_2c(Parser *p) {
+    /* '*' already consumed. Consume '(' for parameter list. */
+    consume(p, TOK_LPAREN, "expected '(' after '*' in funcptr type");
+
+    TypeNode *stack_pt[8];
+    const char *stack_pn[8];
+    bool stack_pk[8];
+    TypeNode **param_types = stack_pt;
+    const char **param_names = stack_pn;
+    bool *param_keeps = stack_pk;
+    int fpp_cap = 8;
+    int param_count = 0;
+    bool any_keep = false;
+
+    if (!check(p, TOK_RPAREN)) {
+        do {
+            if (param_count >= fpp_cap) {
+                int new_cap = fpp_cap * 2;
+                TypeNode **new_types = (TypeNode **)parser_alloc(p, new_cap * sizeof(TypeNode *));
+                const char **new_names = (const char **)parser_alloc(p, new_cap * sizeof(const char *));
+                bool *new_keeps = (bool *)parser_alloc(p, new_cap * sizeof(bool));
+                if (!new_types || !new_names || !new_keeps) break;
+                memcpy(new_types, param_types, param_count * sizeof(TypeNode *));
+                memcpy(new_names, param_names, param_count * sizeof(const char *));
+                memcpy(new_keeps, param_keeps, param_count * sizeof(bool));
+                param_types = new_types;
+                param_names = new_names;
+                param_keeps = new_keeps;
+                fpp_cap = new_cap;
+            }
+            param_keeps[param_count] = match(p, TOK_KEEP);
+            if (param_keeps[param_count]) any_keep = true;
+            param_types[param_count] = parse_type(p);
+            /* optional param name */
+            if (check(p, TOK_IDENT)) {
+                advance(p);
+                param_names[param_count] = tok_text(&p->previous);
+            } else {
+                param_names[param_count] = NULL;
+            }
+            param_count++;
+        } while (match(p, TOK_COMMA));
+    }
+    consume(p, TOK_RPAREN, "expected ')' after funcptr parameters");
+
+    /* Optional return type via '-> RET'. Default = void. */
+    TypeNode *ret_type;
+    if (match(p, TOK_THIN_ARROW)) {
+        ret_type = parse_type(p);
+    } else {
+        ret_type = new_type_node(p, TYNODE_VOID);
+    }
+
+    TypeNode *t = new_type_node(p, TYNODE_FUNC_PTR);
+    t->func_ptr.return_type = ret_type;
+    t->func_ptr.param_count = param_count;
+    if (param_count > 0) {
+        t->func_ptr.param_types = (TypeNode **)arena_alloc(p->arena, param_count * sizeof(TypeNode *));
+        memcpy(t->func_ptr.param_types, param_types, param_count * sizeof(TypeNode *));
+        t->func_ptr.param_names = (const char **)arena_alloc(p->arena, param_count * sizeof(const char *));
+        memcpy(t->func_ptr.param_names, param_names, param_count * sizeof(const char *));
+        if (any_keep) {
+            t->func_ptr.param_keeps = (bool *)arena_alloc(p->arena, param_count * sizeof(bool));
+            memcpy(t->func_ptr.param_keeps, param_keeps, param_count * sizeof(bool));
+        }
+    }
+    return t;
+}
+
 /* ================================================================
  * TYPE PARSING
  *
@@ -412,6 +496,26 @@ static TypeNode *parse_type(Parser *p) {
         TypeNode *t = new_type_node(p, TYNODE_VOLATILE);
         t->qualified.inner = parse_type(p);
         return t;
+    }
+
+    /* *T — pointer type, OR *(args) -> ret (Variant 2C funcptr) */
+    if (check(p, TOK_STAR)) {
+        /* Peek: if '*' is followed by '(', it's a 2C funcptr type.
+         * Otherwise it's a normal pointer type. The '*' BEFORE the '('
+         * is the discriminator — no other ZER type starts with '('. */
+        Scanner saved_scan = *p->scanner;
+        Token saved_cur = p->current;
+        Token saved_prev = p->previous;
+        advance(p); /* consume '*' */
+        bool is_2c = check(p, TOK_LPAREN);
+        if (is_2c) {
+            return parse_func_ptr_2c(p);
+        }
+        /* Not 2C — restore and fall through to normal *T handling.
+         * Restoring lets the existing match(TOK_STAR) below re-consume. */
+        *p->scanner = saved_scan;
+        p->current = saved_cur;
+        p->previous = saved_prev;
     }
 
     /* *T — pointer type */

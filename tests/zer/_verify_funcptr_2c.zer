@@ -1,0 +1,70 @@
+// Verifies Variant 2C funcptr syntax: *(args) -> ret name
+//
+// Both 2A (current C-style) and 2C (ZER-native) MUST produce identical
+// behavior because they lower to the same TYNODE_FUNC_PTR. This test
+// exercises every realistic 2C position to confirm the parser change
+// doesn't break anything downstream (checker, IR, emitter, zercheck_ir).
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+u32 sub(u32 a, u32 b) { return a - b; }
+u32 xor_op(u32 a, u32 b) { return a ^ b; }
+
+u32 square(u32 x) { return x * x; }
+
+void noop() { return; }
+
+u64 timer_now() { return 12345; }
+
+// 2C in struct field — vtable pattern
+struct Ops {
+    *(u32, u32) -> u32 binop;
+    *(u32) -> u32 unary;
+    *() void_no_args;
+}
+
+// 2C in function parameter
+u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y) {
+    return op(x, y);
+}
+
+// 2C as return type (inline, no typedef!)
+*(u32, u32) -> u32 select_op(u32 kind) {
+    if (kind == 0) { return add; }
+    if (kind == 1) { return mul; }
+    if (kind == 2) { return sub; }
+    return xor_op;
+}
+
+u32 main() {
+    // 2C as variable
+    *(u32, u32) -> u32 op = add;
+    u32 r1 = op(5, 7);
+    if (r1 != 12) { return 1; }
+
+    // 2C void return — no arrow
+    *() noop_fn = noop;
+    noop_fn();
+
+    // 2C no-arg with return
+    *() -> u64 timer = timer_now;
+    if (timer() != 12345) { return 2; }
+
+    // 2C funcptr through param
+    if (apply(mul, 3, 4) != 12) { return 3; }
+
+    // 2C funcptr returned from function (was pre-existing emitter bug, now fixed)
+    *(u32, u32) -> u32 chosen = select_op(1);
+    if (chosen(6, 7) != 42) { return 4; }
+
+    // 2C funcptr in struct field
+    Ops ops;
+    ops.binop = add;
+    ops.unary = square;
+    ops.void_no_args = noop;
+    if (ops.binop(10, 5) != 15) { return 5; }
+    if (ops.unary(6) != 36) { return 6; }
+    ops.void_no_args();
+
+    return 0;
+}

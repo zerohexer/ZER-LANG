@@ -173,13 +173,23 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
         return 1;
     ```
 
-16. **Inline asm uses bare `asm(...)` (renamed from `unsafe asm` 2026-04-25).** Allowed only inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context(in_naked)`). Users prefer `@intrinsic()` calls (130 verified intrinsics shipping); `asm` is an escape hatch for edge cases. After D-Alpha-7.5 Phase 2 lands, asm becomes 100% language-safe via 13 Z-rules + 8 universal precondition categories + System #30 (auto-detection framework dispatching to existing 29 safety systems). See `docs/asm_plan.md`.
+16. **Inline asm uses bare `asm(...)` (renamed from `unsafe asm` 2026-04-25).** Two forms:
+    - **Inline** (legacy): `asm("nop");` or extended `asm("..." : outputs : inputs : clobbers);`
+    - **Structured** (D-Alpha-7.5 H1+H3, added 2026-04-25): `asm { instructions: "..."  safety: "..." }` — mandatory `safety:` string ≥ 30 chars (S4 audit-trail rule).
+
+    Allowed only inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context(in_naked)`). Users prefer `@intrinsic()` calls (130 verified intrinsics shipping); `asm` is an escape hatch for edge cases. After D-Alpha-7.5 Phase 2 lands, asm becomes 100% language-safe via 13 Z-rules + 8 universal precondition categories + System #30 (auto-detection framework dispatching to existing 29 safety systems). See `docs/asm_plan.md`.
     ```
     naked void handler() {
-        asm("cli");               // OK in naked fn
-        // asm("nop");             // outside naked fn = COMPILE ERROR (MISRA Dir 4.3)
+        asm("nop");                              // inline form, OK in naked fn
+        asm {                                    // structured form (Session A scope)
+            instructions: "nop"
+            safety: "Single-cycle no-op for timing alignment in critical path"
+        }
+        // asm("nop");                            // outside naked fn = COMPILE ERROR
+        // asm { instructions: "nop" }            // missing safety: = COMPILE ERROR
     }
     ```
+    Session B+ will add `inputs:`, `outputs:`, `clobbers:` blocks for typed operand binding (H2/H4) — currently rejected by parser with explanatory error.
     **OBSOLETE (kept for context):** previously required `unsafe asm("...")` form (2026-04-23 to 2026-04-25). Audit confirmed the `unsafe` keyword was cosmetic — every safety check keys on the structural `in_naked` flag, not the keyword. Rename aligns with C/Zig/C++ convention (only Rust/Carbon use `unsafe asm`); ZER's auto-everything brand fits bare `asm`. The planned `unsafe fn` (H5 of D-Alpha-7.5) was also dropped — function-level marker is redundant once strict mode is per-block. `naked fn` stays (hardware constraint for interrupt handlers, no prologue/epilogue).
 
 ### Intrinsics (@ builtins)

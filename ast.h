@@ -437,10 +437,38 @@ struct Node {
         /* NODE_EXPR_STMT: expression used as statement */
         struct { Node *expr; } expr_stmt;
 
-        /* NODE_ASM: asm("nop"); or extended asm("..." : outputs : inputs : clobbers); */
+        /* NODE_ASM: TWO forms supported.
+         *
+         * Inline form (legacy, also Phase 1 verified):
+         *   asm("nop");
+         *   asm("mov %0, %%rax" : "=r"(out) : "r"(in) : "memory");
+         *   → is_structured=false, code/code_len capture full content between ( and )
+         *
+         * Structured form (D-Alpha-7.5 H1+H3, added 2026-04-25):
+         *   asm {
+         *       instructions: "tdcall"
+         *       inputs:  { "rax" = subfunc, "rcx" = 1 }     // (planned, B+H2)
+         *       outputs: { "rax" = result }                  // (planned, B+H2)
+         *       clobbers: ["rdx", "memory"]                  // (planned, B+H4)
+         *       safety: "Intel TDX vp_info per TDX Spec v1.0 §7.2.2"
+         *   }
+         *   → is_structured=true; instructions/safety required, others optional
+         *
+         * Session A scope: parse instructions: + safety: only.
+         * Session B+ adds inputs/outputs/clobbers parsing.
+         * After Phase 2: 13 Z-rules + 8 categories work on these typed fields. */
         struct {
-            const char *code;       /* full asm content between ( and ) */
+            /* Inline form fields (legacy + still primary path) */
+            const char *code;          /* asm content between ( and ) — inline form only */
             size_t code_len;
+
+            /* Structured form fields (H1+H3 baseline) */
+            uint8_t is_structured;     /* 0 = inline `asm("...")`, 1 = structured `asm { ... }` */
+            const char *instructions;  /* required for structured form — the asm template */
+            size_t instructions_len;
+            const char *safety;        /* required for structured form — min 30 chars (S4 rule) */
+            size_t safety_len;
+            /* Future (Session B+): inputs[], outputs[], clobbers[] arrays */
         } asm_stmt;
 
         /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */

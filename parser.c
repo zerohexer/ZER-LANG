@@ -1832,19 +1832,101 @@ static Node *parse_statement(Parser *p) {
         p->previous = saved_p2;
     }
 
-    /* `asm(...)` — inline assembly. Renamed from `unsafe asm` 2026-04-25
-     * after audit confirmed `unsafe` keyword was cosmetic. Safety enforced
-     * by structural rule (`zer_asm_allowed_in_context(in_naked)`, Phase 1
-     * verified) — asm only inside `naked fn`. Post-D-Alpha-7.5 Phase 2,
-     * asm becomes 100% language-safe via 13 Z-rules + 8 categories + System
-     * #30 (auto-detection framework dispatching to existing 29 safety
-     * systems). Rationale: every modern systems lang except Rust/Carbon
-     * uses bare `asm` (C, C++, Zig); ZER's auto-everything brand fits.
-     * Syntax: simple `asm("nop");` or extended `asm("..." : "=r"(out) : "r"(in) : "memory");`
-     * Bypass lexer — scan raw source for matching ) because ':' is not a ZER token. */
+    /* `asm(...)` or `asm { ... }` — inline assembly. Two forms:
+     *
+     * INLINE (legacy, default since 2026-04-25 rename from `unsafe asm`):
+     *   asm("nop");
+     *   asm("..." : "=r"(out) : "r"(in) : "memory");
+     *   Safety: structural via `zer_asm_allowed_in_context(in_naked)` (Phase 1).
+     *   Bypass lexer — scan raw source for matching ) because ':' is not ZER token.
+     *
+     * STRUCTURED (D-Alpha-7.5 H1+H3, added 2026-04-25, Session A scope):
+     *   asm {
+     *       instructions: "tdcall"
+     *       safety: "Intel TDX vp_info per TDX Spec v1.0 §7.2.2"
+     *   }
+     *   Safety: same structural rule + mandatory safety: string >= 30 chars (S4).
+     *   Future (B+): inputs/outputs/clobbers blocks for typed operand binding.
+     *   Both forms produce same NODE_ASM, distinguished by `is_structured` flag.
+     *
+     * Discriminator: after consuming `asm`, peek next: `(` = inline, `{` = structured. */
     if (check(p, TOK_ASM)) {
         advance(p); /* consume `asm` */
-        consume(p, TOK_LPAREN, "expected '(' after 'asm'");
+
+        /* STRUCTURED form: asm { ... } */
+        if (check(p, TOK_LBRACE)) {
+            advance(p); /* consume `{` */
+            Node *n = new_node(p, NODE_ASM);
+            n->asm_stmt.is_structured = 1;
+            n->asm_stmt.instructions = NULL;
+            n->asm_stmt.instructions_len = 0;
+            n->asm_stmt.safety = NULL;
+            n->asm_stmt.safety_len = 0;
+
+            /* Parse key: value pairs until `}`. Session A handles instructions: + safety:. */
+            while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+                if (!check(p, TOK_IDENT)) {
+                    error_at(p, &p->current,
+                        "expected key (instructions:/safety:) inside asm block");
+                    advance(p);
+                    continue;
+                }
+                Token key = p->current;
+                advance(p);
+                consume(p, TOK_COLON, "expected ':' after asm block key");
+
+                if (key.length == 12 && memcmp(key.start, "instructions", 12) == 0) {
+                    if (!check(p, TOK_STRING)) {
+                        error_at(p, &p->current,
+                            "expected string literal after 'instructions:'");
+                    } else {
+                        n->asm_stmt.instructions = p->current.start + 1;     /* skip leading " */
+                        n->asm_stmt.instructions_len = p->current.length - 2;/* strip both " */
+                        advance(p);
+                    }
+                } else if (key.length == 6 && memcmp(key.start, "safety", 6) == 0) {
+                    if (!check(p, TOK_STRING)) {
+                        error_at(p, &p->current,
+                            "expected string literal after 'safety:'");
+                    } else {
+                        n->asm_stmt.safety = p->current.start + 1;
+                        n->asm_stmt.safety_len = p->current.length - 2;
+                        advance(p);
+                    }
+                } else if ((key.length == 6 && memcmp(key.start, "inputs", 6) == 0) ||
+                           (key.length == 7 && memcmp(key.start, "outputs", 7) == 0) ||
+                           (key.length == 8 && memcmp(key.start, "clobbers", 8) == 0)) {
+                    error_at(p, &key,
+                        "asm block keys 'inputs:', 'outputs:', 'clobbers:' "
+                        "are reserved for D-Alpha-7.5 Session B+ (typed operands). "
+                        "Session A supports only 'instructions:' and 'safety:'.");
+                    /* skip the value (tolerate { } [ ] grouping) */
+                    int paren = 0, brace = 0, bracket = 0;
+                    while (!check(p, TOK_EOF) &&
+                           !(paren == 0 && brace == 0 && bracket == 0 &&
+                             (check(p, TOK_RBRACE) || check(p, TOK_IDENT)))) {
+                        if (check(p, TOK_LPAREN)) paren++;
+                        else if (check(p, TOK_RPAREN)) paren--;
+                        else if (check(p, TOK_LBRACE)) brace++;
+                        else if (check(p, TOK_RBRACE) && brace > 0) brace--;
+                        else if (check(p, TOK_LBRACKET)) bracket++;
+                        else if (check(p, TOK_RBRACKET)) bracket--;
+                        advance(p);
+                    }
+                } else {
+                    error_at(p, &key,
+                        "unknown asm block key — expected 'instructions:' or 'safety:'");
+                    /* skip until next ident or } */
+                    while (!check(p, TOK_RBRACE) && !check(p, TOK_IDENT) && !check(p, TOK_EOF))
+                        advance(p);
+                }
+            }
+            consume(p, TOK_RBRACE, "expected '}' to close asm block");
+            return n;
+        }
+
+        /* INLINE form: asm("...") */
+        consume(p, TOK_LPAREN, "expected '(' or '{' after 'asm'");
         /* scan raw source from current position to find matching ) */
         const char *start = p->current.start;
         const char *src = start;
@@ -1857,8 +1939,13 @@ static Node *parse_statement(Parser *p) {
             src++;
         }
         Node *n = new_node(p, NODE_ASM);
+        n->asm_stmt.is_structured = 0;
         n->asm_stmt.code = start;
         n->asm_stmt.code_len = (size_t)(src - start);
+        n->asm_stmt.instructions = NULL;
+        n->asm_stmt.instructions_len = 0;
+        n->asm_stmt.safety = NULL;
+        n->asm_stmt.safety_len = 0;
         /* advance scanner past the raw content + closing ) */
         p->scanner->pos = (size_t)(src + 1 - p->scanner->source); /* past ) */
         /* re-lex current token to sync parser state */

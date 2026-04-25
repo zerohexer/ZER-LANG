@@ -8416,8 +8416,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         emit(e, ";\n");
                     } else if (s->kind == NODE_ASM) {
                         emit_indent(e);
-                        emit(e, "__asm__ __volatile__(%.*s);\n",
-                             (int)s->asm_stmt.code_len, s->asm_stmt.code);
+                        if (s->asm_stmt.is_structured) {
+                            /* H1+H3 structured form: emit safety comment + instructions.
+                             * Session B+ will add operand binding emission. */
+                            emit(e, "/* asm safety: %.*s */\n",
+                                 (int)s->asm_stmt.safety_len, s->asm_stmt.safety);
+                            emit_indent(e);
+                            emit(e, "__asm__ __volatile__(\"%.*s\");\n",
+                                 (int)s->asm_stmt.instructions_len, s->asm_stmt.instructions);
+                        } else {
+                            emit(e, "__asm__ __volatile__(%.*s);\n",
+                                 (int)s->asm_stmt.code_len, s->asm_stmt.code);
+                        }
                     } else {
                         /* Unhandled statement in defer — emit as expression */
                         emit_indent(e);
@@ -8453,10 +8463,21 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->expr) {
             if (inst->expr->kind == NODE_ASM) {
                 /* Inline assembly — emit directly */
-                emit_indent(e);
-                emit(e, "__asm__ __volatile__(%.*s);\n",
-                     (int)inst->expr->asm_stmt.code_len,
-                     inst->expr->asm_stmt.code);
+                Node *a = inst->expr;
+                if (a->asm_stmt.is_structured) {
+                    /* H1+H3 structured form: emit safety comment then instructions.
+                     * Session B+ adds operand binding emission. */
+                    emit_indent(e);
+                    emit(e, "/* asm safety: %.*s */\n",
+                         (int)a->asm_stmt.safety_len, a->asm_stmt.safety);
+                    emit_indent(e);
+                    emit(e, "__asm__ __volatile__(\"%.*s\");\n",
+                         (int)a->asm_stmt.instructions_len, a->asm_stmt.instructions);
+                } else {
+                    emit_indent(e);
+                    emit(e, "__asm__ __volatile__(%.*s);\n",
+                         (int)a->asm_stmt.code_len, a->asm_stmt.code);
+                }
             } else if (inst->expr->kind == NODE_SPAWN) {
                 /* Spawn — emit pthread_create with wrapper struct.
                  * Find pre-scanned spawn wrapper by node pointer. */

@@ -1,0 +1,30 @@
+// D-Alpha-7.5 Session A: structured `asm { ... }` block with mandatory safety string.
+// Sibling of asm_syntax.zer (inline form). Both forms produce same NODE_ASM.
+// Session A scope: instructions: + safety: only.
+// Session B+ will add inputs/outputs/clobbers blocks for typed operand binding.
+//
+// Tests use `nop` (universal across x86/ARM/RISC-V) so the assembler is happy
+// on whatever GCC host we run on. Real arch-specific instructions go in
+// per-arch tests once @arch_guard / target: attributes ship in Session D.
+
+naked void no_op_one() {
+    asm {
+        instructions: "nop"
+        safety: "Single-cycle no-op for timing alignment in critical path"
+    }
+}
+
+naked void no_op_two() {
+    asm {
+        instructions: "nop"
+        safety: "First slot of a paired no-op fence per timing-sensitive ABI"
+    }
+    asm {
+        instructions: "nop"
+        safety: "Second slot of a paired no-op fence per timing-sensitive ABI"
+    }
+}
+
+i32 main() {
+    return 0;
+}

@@ -138,6 +138,45 @@ Mirrors `emit_expr` lines 1361-1407 exactly — same machinery, different switch
 
 **Tests after this commit:** 480 ZER integration (was 477, +3 BUG-612 tests). 1,302 total visible PASS lines across `make docker-check`.
 
+### D-Alpha-7.5 Session A: structured `asm { ... }` block + mandatory safety string (H1+H3 baseline)
+
+**Change:** First slice of D-Alpha-7.5 Phase 1 lands. Added structured `asm { instructions: "..."  safety: "..." }` block syntax alongside the existing inline `asm("...")` form. Mandatory `safety:` string ≥ 30 chars (S4 rule preview from strict-mode planning). Both forms produce the same `NODE_ASM`, distinguished by `is_structured` flag.
+
+**What's in Session A:**
+- AST: `NODE_ASM` extended with `is_structured`, `instructions`/`instructions_len`, `safety`/`safety_len` fields. Legacy `code`/`code_len` kept for inline form.
+- Parser: branch on token after `asm` — `(` → inline path (existing), `{` → structured path (new ~70 lines). Parses `instructions:` and `safety:` keys. Rejects `inputs:`/`outputs:`/`clobbers:` keys with explanatory error pointing to Session B+.
+- Checker: structured form requires non-empty `instructions:` and `safety:` ≥ 30 chars. Empty/short safety = compile error.
+- Emitter: lowers structured form to `/* asm safety: ... */\n__asm__ __volatile__("instructions");`. Both AST defer-body path and IR `IR_NOP`/NODE_ASM passthrough handle is_structured.
+- ir_lower: NO changes — passthrough was already opaque to asm content.
+
+**What's NOT in Session A (Session B+):**
+- Typed operand bindings (`inputs: { "rax" = subfunc, ... }`)
+- Typed output captures (`outputs: { "rax" = result }`)
+- Clobber list with per-arch register validation
+- 13 Z-rules wiring through operand boundaries
+- 8 universal precondition categories
+- System #30 (Atomic Ordering) — Phase 2 work, ~80 hrs
+
+**S4 rule preview enforcement:** the mandatory ≥ 30 char `safety:` string forces real documentation at every escape-hatch site. Audit pattern: `grep -rn "safety:" src/` reveals every asm escape; minimum length means descriptions are meaningful (no `safety: "yes"`).
+
+**Tests added (auto-discovered):**
+- `tests/zer/asm_structured.zer` — positive: 3 structured asm blocks with proper safety strings (uses `nop` for cross-arch portability)
+- `tests/zer_fail/asm_no_safety.zer` — missing `safety:` rejected
+- `tests/zer_fail/asm_short_safety.zer` — `safety: "too short"` (< 30 chars) rejected
+
+**Tests after this commit:** 1,303 PASS / 0 FAIL via `make docker-check` (was 1,300, +3). VST proofs: zero admits across 23 verification files.
+
+**Roadmap (D-Alpha-7.5):**
+- Session A: H1+H3 baseline ✓ (this commit)
+- Session B: H1 full + H2 — operand binding parsing + typed operands + width validation
+- Session C: H4 — per-arch register validation tables
+- Session D: 18 structural rules (S/O/I/E)
+- Session E: 13 Z-rules wiring 29 safety systems through asm operand boundaries
+- Session F: 8 universal categories (C1-C8) framework + dispatch
+- Session G: System #30 (Atomic Ordering) — happens-before tracking via CFG (~80 hrs)
+- Session H: H6 (`@asm_register_valid` predicate, Phase 1 extractable)
+- Session I: H7 (audit log emission `build/asm_audit.log`)
+
 ### Keyword rename: `unsafe asm` → `asm`, planned `unsafe fn` dropped (feature)
 
 **Change:** Removed the `unsafe` keyword. Inline assembly is now plain `asm(...)`. The planned `unsafe fn` (H5 of D-Alpha-7.5) was dropped before implementation.

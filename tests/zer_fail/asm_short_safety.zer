@@ -1,0 +1,11 @@
+// EXPECTED: compile error — `safety:` string must be at least 30 chars (S4 rule).
+// Short docs aren't real docs. The minimum length forces meaningful description.
+
+naked void handler() {
+    asm {
+        instructions: "nop"
+        safety: "too short"
+    }
+}
+
+i32 main() { return 0; }

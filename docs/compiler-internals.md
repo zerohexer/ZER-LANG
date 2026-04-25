@@ -6586,6 +6586,62 @@ dispatch (for arch-specific), dead-branch testing (for privileged).
 
 ---
 
+## D-Alpha-7.5 Session A — Structured `asm { }` baseline (2026-04-25)
+
+**Status:** H1+H3 shipped. Inline `asm("...")` form unchanged; structured `asm { instructions: "..."  safety: "..." }` form added alongside.
+
+**AST extension** (`ast.h` `asm_stmt` struct):
+```c
+struct {
+    /* Inline form (legacy) */
+    const char *code;          /* asm content between ( and ) */
+    size_t code_len;
+    /* Structured form (H1+H3) */
+    uint8_t is_structured;
+    const char *instructions;
+    size_t instructions_len;
+    const char *safety;
+    size_t safety_len;
+    /* Future: inputs[], outputs[], clobbers[] (Session B+) */
+} asm_stmt;
+```
+
+**Parser** (`parser.c:1845`): after consuming `asm` token, peek next:
+- `(` → inline path (existing raw-source scan)
+- `{` → structured path (new ~70 lines): parse `instructions:` and `safety:` key-value pairs. Reject `inputs:`/`outputs:`/`clobbers:` with explanatory error pointing to Session B+. Reject unknown keys.
+
+**Checker** (`checker.c:9170 NODE_ASM`): in addition to existing `zer_asm_allowed_in_context(in_naked)` check, structured form requires:
+- non-empty `instructions:`
+- non-empty `safety:`
+- safety length ≥ 30 characters (S4 rule preview)
+
+**Emitter** (`emitter.c` two sites — defer body path + `IR_NOP`/NODE_ASM passthrough):
+```c
+if (a->asm_stmt.is_structured) {
+    emit(e, "/* asm safety: %.*s */\n", ...);
+    emit(e, "__asm__ __volatile__(\"%.*s\");\n", instructions);
+} else {
+    emit(e, "__asm__ __volatile__(%.*s);\n", code);  /* legacy */
+}
+```
+
+**ir_lower:** NO changes. NODE_ASM was already opaque IR_NOP passthrough; same goes for structured form.
+
+**Future-session extension points:**
+- Session B will add `Node *inputs[]`, `Node *outputs[]`, `Node *clobbers[]` arrays to asm_stmt
+- Session B will extend parser to parse those blocks
+- Session B will extend checker to type-check operand bindings (H2)
+- Session C will add per-arch register tables for clobber validation (H4)
+- Sessions D-F add 18 structural rules + 13 Z-rules + 8 categories framework
+- Session G adds System #30 (Atomic Ordering) — only NEW safety system
+
+**Tests added:**
+- `tests/zer/asm_structured.zer` (positive)
+- `tests/zer_fail/asm_no_safety.zer` (S4 rejection: missing safety)
+- `tests/zer_fail/asm_short_safety.zer` (S4 rejection: < 30 chars)
+
+---
+
 ## Z-Rules: extending ZER's 29 safety systems through asm (2026-04-23)
 
 > **KEYWORD RENAME 2026-04-25 — applies to entire Z-rules / asm section below**

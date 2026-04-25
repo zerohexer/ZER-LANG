@@ -9175,6 +9175,25 @@ static void check_stmt(Checker *c, Node *node) {
                 "asm statements only allowed in naked functions — "
                 "use @critical or @atomic_* for safe alternatives (MISRA Dir 4.3)");
         }
+        /* D-Alpha-7.5 H1+H3: structured asm form requires `instructions:` and
+         * `safety:` keys; safety string must be >= 30 chars (S4 rule preview).
+         * Forces auditable documentation at every escape-hatch site. */
+        if (node->asm_stmt.is_structured) {
+            if (!node->asm_stmt.instructions || node->asm_stmt.instructions_len == 0) {
+                checker_error(c, node->loc.line,
+                    "structured asm block requires non-empty `instructions:` string");
+            }
+            if (!node->asm_stmt.safety) {
+                checker_error(c, node->loc.line,
+                    "structured asm block requires `safety:` string explaining "
+                    "the escape hatch (D-Alpha-7.5 S4 rule)");
+            } else if (node->asm_stmt.safety_len < 30) {
+                checker_error(c, node->loc.line,
+                    "asm `safety:` string must be at least 30 characters — "
+                    "describe what the asm does and cite hardware spec/manual "
+                    "(D-Alpha-7.5 S4 rule, audit-trail requirement)");
+            }
+        }
         break;
 
     case NODE_CRITICAL:

@@ -9200,10 +9200,17 @@ static void check_stmt(Checker *c, Node *node) {
                 AsmOperand *op = &node->asm_stmt.inputs[i];
                 if (!op->expr) continue;
                 Type *t = check_expr(c, op->expr);
-                if (t && !type_is_integer(t)) {
+                /* Accept integers AND pointers — both fit in GP registers.
+                 * Pointer-as-asm-input is the common case (MMIO addresses,
+                 * struct base pointers). SIMD/FPU operands deferred. */
+                Type *tu = t ? type_unwrap_distinct(t) : NULL;
+                bool ok_input = t && (type_is_integer(t) ||
+                    (tu && tu->kind == TYPE_POINTER));
+                if (t && !ok_input) {
                     checker_error(c, op->loc.line,
-                        "asm input '%.*s' must be integer-typed (Session B scope: "
-                        "scalars only; SIMD/FPU operands deferred to later sessions)",
+                        "asm input '%.*s' must be integer or pointer typed "
+                        "(Session B scope: scalars only; SIMD/FPU operands "
+                        "deferred to later sessions)",
                         (int)op->reg_name_len, op->reg_name);
                 }
             }
@@ -9221,10 +9228,13 @@ static void check_stmt(Checker *c, Node *node) {
                     continue;
                 }
                 Type *t = check_expr(c, op->expr);
-                if (t && !type_is_integer(t)) {
+                Type *tu = t ? type_unwrap_distinct(t) : NULL;
+                bool ok_out = t && (type_is_integer(t) ||
+                    (tu && tu->kind == TYPE_POINTER));
+                if (t && !ok_out) {
                     checker_error(c, op->loc.line,
-                        "asm output '%.*s' must be integer-typed (Session B scope: "
-                        "scalars only)",
+                        "asm output '%.*s' must be integer or pointer typed "
+                        "(Session B scope: scalars only)",
                         (int)op->reg_name_len, op->reg_name);
                 }
             }
@@ -9365,6 +9375,102 @@ static void check_stmt(Checker *c, Node *node) {
                             "register can only be bound once per outputs{} block",
                             (int)b->reg_name_len, b->reg_name);
                     }
+                }
+            }
+
+            /* D-Alpha-7.5 Session E1 — Z-rules wiring 29 safety systems
+             * through asm operand boundaries. Each Z-rule reuses an EXISTING
+             * tracking system / extracted predicate at a NEW call site
+             * (NODE_ASM). No new Phase 1 extractions required.
+             *
+             * Z6 (context flags): asm currently bans-via-naked-only check
+             * already covers defer/async/critical (naked excludes them all).
+             * Forward-compatible check kept here to fire when in_naked is
+             * relaxed for non-naked asm contexts in the future.
+             * SAFETY: zer_asm_allowed_in_context in src/safety/context_bans.c
+             * (used at top of NODE_ASM); defer/async via existing checker fields. */
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "asm not allowed inside defer body (Z6 rule) — "
+                    "defer cleanup must remain in pure ZER for predictable "
+                    "execution at every exit path");
+            }
+            if (c->in_async) {
+                checker_error(c, node->loc.line,
+                    "asm not allowed inside async function (Z6 rule) — "
+                    "register state would not survive yield/await suspend");
+            }
+
+            /* Z8 (qualifier preservation): asm output target must not be
+             * `const`. Writing to const via asm bypasses ZER's qualifier
+             * tracking (#20). Walk output expression to root ident, check
+             * Symbol.is_const.
+             * SAFETY: matches root-walk pattern at checker.c:2587 (TOK_AMP). */
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                AsmOperand *op = &node->asm_stmt.outputs[i];
+                if (!op->expr) continue;
+                Node *root = op->expr;
+                while (root) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                    else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+                        root = root->unary.operand;
+                    else break;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    if (sym && sym->is_const) {
+                        checker_error(c, op->loc.line,
+                            "asm output '%.*s' writes to const variable '%.*s' "
+                            "(Z8 rule) — qualifier stripping via asm not allowed",
+                            (int)op->reg_name_len, op->reg_name,
+                            (int)root->ident.name_len, root->ident.name);
+                    }
+                }
+            }
+
+            /* Z11 (keep + memory clobber): if asm declares a memory clobber,
+             * any pointer-typed input that's a non-keep parameter could be
+             * stored to global state by the asm body. Existing System #21
+             * Keep Parameters covers this for normal calls; same rule extends
+             * through asm operand bindings. */
+            bool has_memory_clobber = false;
+            for (int i = 0; i < node->asm_stmt.clobber_count; i++) {
+                AsmOperand *cb = &node->asm_stmt.clobbers[i];
+                if (cb->reg_name_len == 6 &&
+                    memcmp(cb->reg_name, "memory", 6) == 0) {
+                    has_memory_clobber = true;
+                    break;
+                }
+            }
+            if (has_memory_clobber) {
+                for (int i = 0; i < node->asm_stmt.input_count; i++) {
+                    AsmOperand *op = &node->asm_stmt.inputs[i];
+                    if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                    Symbol *sym = scope_lookup(c->current_scope,
+                        op->expr->ident.name,
+                        (uint32_t)op->expr->ident.name_len);
+                    if (!sym) continue;
+                    Type *t = sym->type;
+                    if (!t) continue;
+                    Type *u = type_unwrap_distinct(t);
+                    if (!u || u->kind != TYPE_POINTER) continue;
+                    if (sym->is_keep) continue;
+                    /* Param heuristic: pointer var that is neither global nor
+                     * static. Same pattern as checker.c:2970 (target_is_param_ptr).
+                     * Naked-fn-only restriction means non-keep ptr params are
+                     * the typical case here. */
+                    if (sym->is_static) continue;
+                    if (scope_lookup_local(c->global_scope, sym->name, sym->name_len)) continue;
+                    if (sym->is_local_derived || sym->is_arena_derived) continue;
+                    checker_error(c, op->loc.line,
+                        "asm input '%.*s' binds non-keep pointer parameter "
+                        "'%.*s' with memory clobber (Z11 rule) — "
+                        "asm may store the pointer to memory; mark parameter "
+                        "as `keep` if storage to globals is intended",
+                        (int)op->reg_name_len, op->reg_name,
+                        (int)op->expr->ident.name_len, op->expr->ident.name);
                 }
             }
         }

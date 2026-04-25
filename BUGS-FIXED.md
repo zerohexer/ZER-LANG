@@ -241,11 +241,41 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 - Deferred to E (Z-rules): operand-flow safety properties
 - Deferred to F (categories+data): O3, O4, O5, I1-4, E1-4 — 9 of 18 needing instruction db
 
+### D-Alpha-7.5 Session E1: 3 Z-rules wiring through asm operand boundaries (Z6 + Z8 + Z11)
+
+**Change:** First batch of the 13 Z-rules. Each Z-rule wires an EXISTING ZER safety system to a NEW call site at NODE_ASM. No new Phase 1 extractions — all checks delegate to existing extracted predicates or read existing Checker fields. Matches the architecture documented in `docs/compiler-internals.md` "Z-Rules" section.
+
+**Rules implemented (`checker.c` NODE_ASM, after Session D's structural rules):**
+
+1. **Z6 — context flags (forward-compatible no-op).** Bans asm in `defer` body and `async` function. Currently no-op because asm is restricted to `naked` functions (which can't contain defer/async), but kept as forward-compat for when in_naked restriction relaxes. @critical context NOT banned — asm in @critical is the natural use case (manipulating hardware with interrupts disabled).
+
+2. **Z8 — qualifier preservation through asm output (System #20).** Walks asm output expression to root ident (NODE_FIELD/INDEX/UNARY chains), checks `Symbol.is_const`. Reject if true. Catches `outputs: { "rax" = G_CONST_VAR }` — prevents writing to const via asm bypass.
+
+3. **Z11 — keep parameter + memory clobber (System #21).** If asm declares `clobbers: ["memory"]` AND any input is a non-keep pointer parameter, reject. Pointer might be stored to global state by asm body. `keep` annotation on the param is the user's explicit intent that storage is allowed. Param heuristic: pointer var that is not global, not static, not local-derived, not arena-derived (mirrors checker.c:2970 `target_is_param_ptr`).
+
+**Session B input/output type check extended:** Pointer types now accepted alongside integers. Was overly strict — `inputs: { "rdi" = ptr }` for an MMIO address was the common case but rejected. Both `type_is_integer(t)` OR `type_unwrap_distinct(t)->kind == TYPE_POINTER` now accepted. SIMD/FPU/struct/slice still rejected.
+
+**Tests added (auto-discovered):**
+- `tests/zer/asm_z11_keep_passes.zer` — positive: `keep *u64 ptr` param flows through asm with memory clobber. Verifies semantics (`g_dest = 99` after asm).
+- `tests/zer_fail/asm_z11_keep_memory_clobber.zer` — non-keep `*u64 ptr` param + memory clobber rejected.
+- `tests/zer_fail/asm_z8_const_output.zer` — `outputs: { "rax" = G_READONLY }` where G_READONLY is `const u64` rejected.
+
+**Z-rules NOT in E1 (deferred):**
+- Z9 (ISR ban for asm) — currently subsumed by S3 (no jumps/calls inside asm). Will activate when in_naked is relaxed.
+- Z10 (non-storable outputs) — naked function can't call pool.get/etc., so no non-storable values reachable as asm operand. Activates with relaxation.
+- Z13 (return range through asm) — niche, asm rarely affects function return range derivation.
+- Z1, Z2 (handle UAF, move tracking) — go in `zercheck_ir.c` IR_ASM handler (Session E2 — different file, different layer).
+- Z3, Z4, Z5, Z7, Z12 — Session E2 (point properties + provenance + escape + MMIO + stack).
+
+**Tests after this commit:** 3,657 PASS / 0 FAIL via `make docker-check` (was 3,654, +3). VST proofs: zero admits across 23 verification files.
+
 **Roadmap (D-Alpha-7.5) — REVISED 2026-04-25 (build-time-generation pattern for per-arch data):**
 - Session A: H1+H3 baseline ✓
-- Session B: H1 full + H2 ✓ (typed operand bindings)
-- Session D: 4 universal structural rules ✓ (this commit; S2/S3/operand-ref/dup-register)
-- **Session E (next): 13 Z-rules wiring 29 safety systems through asm operand boundaries** — universal
+- Session B: H1 full + H2 ✓ (typed operand bindings; pointer-types extended in E1)
+- Session D: 4 universal structural rules ✓
+- Session E1: Z6 + Z8 + Z11 ✓ (this commit; 3 of 13 Z-rules)
+- **Session E2 (next): Z3 + Z4 + Z5 + Z7 + Z12 + Z9/Z10/Z13** — remaining checker.c Z-rules
+- Session E3: Z1 + Z2 — IR-level state machines in `zercheck_ir.c` IR_ASM handler
 - Session F: 8 universal categories (C1-C8) framework — instruction-class → category mapping per-arch
 - Session G: System #30 (Atomic Ordering) — universal CFG-based tracker, ~80 hrs
 - Session C: H4 — per-arch register validation tables (post-framework polish, build-time-gen pattern)

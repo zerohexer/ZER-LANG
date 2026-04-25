@@ -1,0 +1,14 @@
+// EXPECTED: compile error — Z11 rule: non-keep pointer param + memory clobber.
+// Tests Keep Parameters (System #21) extended through asm operand boundaries.
+// asm with memory clobber may store the pointer; non-keep param escape risk.
+
+naked void store_ptr_via_asm(*u64 ptr, u64 val) {
+    asm {
+        instructions: "movq %1, (%0)"
+        inputs: { "rdi" = ptr, "rsi" = val }
+        clobbers: [ "memory" ]
+        safety: "Z11 test — non-keep ptr param with memory clobber should be rejected"
+    }
+}
+
+i32 main() { return 0; }

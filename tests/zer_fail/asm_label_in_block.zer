@@ -1,0 +1,12 @@
+// EXPECTED: compile error — S3 rule: no labels inside asm block.
+// Tests S3 universal structural rule (D-Alpha-7.5 Session D).
+// Labels enable jumps that escape ZER's control flow analysis.
+
+naked void uses_label() {
+    asm {
+        instructions: "loop: nop\njmp loop"
+        safety: "Test S3 — label inside asm should be rejected to prevent jumps"
+    }
+}
+
+i32 main() { return 0; }

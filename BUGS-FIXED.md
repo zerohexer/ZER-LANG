@@ -200,11 +200,52 @@ Per-arch register validation tables deferred to Session C/H4. The `r` fallback c
 
 **Tests after this commit:** 1,305 PASS / 0 FAIL via `make docker-check` (was 1,303, +2). VST proofs: zero admits across 23 verification files.
 
+### D-Alpha-7.5 Session D: 4 universal structural rules (S2 + S3 universal + operand-ref + dup-register)
+
+**Change:** Implements the universal-only subset of the 18 structural rules. Rules requiring per-arch instruction database (I1-4, E1-4) or per-arch register tables (O3, S5 enforcement) deferred to Sessions C/F where the build-time-gen tables provide the data.
+
+**Rules implemented (all in `checker.c` NODE_ASM):**
+
+1. **S2 — Max 16 instructions per block.** Counts `\n` + `;` separators in `instructions:` string. Forces small auditable blocks. Use multiple asm blocks or helper functions if more needed. Universal — no arch dependency.
+
+2. **S3 (universal portion) — No labels in asm.** Rejects `loop:`, `done:`, etc. patterns. Labels enable jumps that escape ZER's control flow analysis. Per-arch jump-mnemonic detection (full S3) deferred to Session F when instruction database lands.
+
+3. **Operand reference consistency.** Scans instructions string for `%0`, `%1`, ..., `%N` placeholders. Each must be `< (output_count + input_count)`. Catches typos like `%2` when only 2 operands declared. Handles `%%` escape (literal `%`).
+
+4. **Duplicate register binding rejection.** Within `inputs{}` block, two operands cannot share a register name. Same for `outputs{}` block. Cross input-output is allowed (read-write operand pattern). Catches typos and ambiguous bindings.
+
+**Already done in earlier sessions:**
+- S1 (asm only in naked fn) — Phase 1 verified `zer_asm_allowed_in_context`
+- S4 (mandatory safety: ≥30 chars) — Session A
+- O1 partial (input integer-typed) — Session B
+- O2 partial (output mutable lvalue) — Session B
+
+**Deferred to later sessions (need per-arch data):**
+- O3 (register name validation) — Session C tables
+- I1-4 (instruction-class checks) — Session F instruction database
+- E1-4 (clobber correctness, memory clobber, flag clobber, callee-saved) — Session F instruction database
+- O4-5 (memory operand details) — Session F instruction database
+- S5 (`@arch_guard` enforcement) — Session F (after arch knowledge available)
+
+**Tests added (auto-discovered):**
+- `tests/zer/asm_session_d_passes.zer` — positive: realistic 3-instruction block with valid operand refs, unique register bindings, no labels. Verifies semantically (`(5+1)<<1 = 12`).
+- `tests/zer_fail/asm_too_many_instructions.zer` — S2: 20 nops rejected.
+- `tests/zer_fail/asm_label_in_block.zer` — S3: `loop:` label rejected.
+- `tests/zer_fail/asm_bad_operand_ref.zer` — `%2` referenced but only 2 operands declared.
+- `tests/zer_fail/asm_dup_register.zer` — `inputs:{ "rax"=a, "rax"=b }` rejected.
+
+**Tests after this commit:** 1,310 PASS / 0 FAIL via `make docker-check` (was 1,305, +5). VST proofs: zero admits across 23 verification files.
+
+**Coverage status (18 structural rules):**
+- Done: S1, S2, S3 universal, S4, O1 partial, O2 partial, plus operand-ref + dup-register (extra) — 6 of 18 fully + 2 partial
+- Deferred to E (Z-rules): operand-flow safety properties
+- Deferred to F (categories+data): O3, O4, O5, I1-4, E1-4 — 9 of 18 needing instruction db
+
 **Roadmap (D-Alpha-7.5) — REVISED 2026-04-25 (build-time-generation pattern for per-arch data):**
 - Session A: H1+H3 baseline ✓
 - Session B: H1 full + H2 ✓ (typed operand bindings)
-- **Session D (next): 18 structural rules (S/O/I/E)** — universal, no per-arch data entry
-- Session E: 13 Z-rules wiring 29 safety systems through asm operand boundaries — universal
+- Session D: 4 universal structural rules ✓ (this commit; S2/S3/operand-ref/dup-register)
+- **Session E (next): 13 Z-rules wiring 29 safety systems through asm operand boundaries** — universal
 - Session F: 8 universal categories (C1-C8) framework — instruction-class → category mapping per-arch
 - Session G: System #30 (Atomic Ordering) — universal CFG-based tracker, ~80 hrs
 - Session C: H4 — per-arch register validation tables (post-framework polish, build-time-gen pattern)

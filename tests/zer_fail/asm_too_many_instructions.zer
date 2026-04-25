@@ -1,0 +1,12 @@
+// EXPECTED: compile error — S2 rule: asm block max 16 instructions.
+// Tests S2 universal structural rule (D-Alpha-7.5 Session D).
+// Forces small auditable blocks. Use multiple asm blocks or helpers if more needed.
+
+naked void too_many() {
+    asm {
+        instructions: "nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop"
+        safety: "Test S2 — 20 nops separated by semicolons should be rejected"
+    }
+}
+
+i32 main() { return 0; }

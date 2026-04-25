@@ -6685,12 +6685,58 @@ Width is determined by the bound expression's TYPE (GCC handles u64→`%rax`, u3
 - Session H adds `@asm_register_valid` Phase 1 predicate (extracted to src/safety/)
 - Session I adds audit log emission (build/asm_audit.log)
 
-**Tests added (Session A + Session B, all auto-discovered):**
+**Tests added (Session A + Session B + Session D, all auto-discovered):**
 - `tests/zer/asm_structured.zer` (Session A: structured form positive)
 - `tests/zer_fail/asm_no_safety.zer` (Session A: S4 missing safety)
 - `tests/zer_fail/asm_short_safety.zer` (Session A: S4 short safety)
 - `tests/zer/asm_typed_operands.zer` (Session B: load immediate + leaq doubling + memory clobber)
 - `tests/zer_fail/asm_wrong_operand_type.zer` (Session B: float and struct operands rejected)
+- `tests/zer/asm_session_d_passes.zer` (Session D: realistic asm passing all 4 rules)
+- `tests/zer_fail/asm_too_many_instructions.zer` (Session D: S2 — > 16 instructions)
+- `tests/zer_fail/asm_label_in_block.zer` (Session D: S3 universal — labels)
+- `tests/zer_fail/asm_bad_operand_ref.zer` (Session D: %N out of range)
+- `tests/zer_fail/asm_dup_register.zer` (Session D: duplicate register in inputs)
+
+## D-Alpha-7.5 Session D — Universal structural rules (2026-04-25)
+
+**Status:** 4 universal-only subset of the 18 planned structural rules implemented in `checker.c` NODE_ASM (extending Session A+B blocks). Rules requiring per-arch data deferred to Session F (instruction db) and Session C (register tables).
+
+**Implementation pattern** — all 4 rules are pure-string analysis on `node->asm_stmt.instructions` plus arrays-of-AsmOperand structural checks:
+
+```c
+case NODE_ASM:
+    /* ... existing Session A/B checks ... */
+    if (node->asm_stmt.is_structured) {
+        /* S2: count newlines + ';' in instructions string, reject if > 16 */
+        /* S3 universal: scan for `\w+:` patterns at line starts, reject as label */
+        /* Operand ref consistency: scan for %N, reject if N >= total_operands */
+        /* Duplicate register: O(n²) scan within inputs[] and outputs[] arrays */
+    }
+    break;
+```
+
+**Why universal-only this session:**
+- I1-4 (instruction-class checks) need Session F's instruction → category database
+- E1-4 (clobber completeness, memory clobber required, flag clobber, callee-saved) need Session F to know which registers each instruction modifies
+- O3 (register name validation) needs Session C's per-arch register tables
+- S5 (`@arch_guard` enforcement) needs Session F's per-arch context
+
+Doing 4 rules now + 9 in Session F (with the data) is cleaner than half-implementing now and revisiting later.
+
+**Rule details:**
+
+| Rule | Detection | Why universal | Edge cases |
+|---|---|---|---|
+| S2 | count `\n` + `;` in instructions, reject if > 16 | Pure character counting | Empty instructions = 0 (not 1) |
+| S3 universal | scan for `\w+\s*:` patterns at line starts | Label syntax is universal | `%%` escape preserved (no false positives) |
+| Operand ref | scan for `%N`, parse digits, reject if N >= total | GCC convention universal | `%%` = literal `%`, skip |
+| Dup register | O(n²) within inputs[]/outputs[] arrays | Pure structural check | Cross input-output allowed (read-write pattern) |
+
+**Future-session extension points:**
+- Session E adds 13 Z-rules wiring existing 29 trackers through asm operand expressions (not structural — semantic)
+- Session F adds instruction → category mapping → unlocks I1-4, E1-4, O4-5, S5 (rest of structural rules)
+- Session C adds register tables → unlocks O3 register name validation
+- Session G adds System #30 — only NEW safety system across the whole framework
 
 ## D-Alpha-7.5 Sessions C + F architecture — build-time generation (2026-04-25)
 

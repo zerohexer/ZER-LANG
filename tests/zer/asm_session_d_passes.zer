@@ -1,0 +1,25 @@
+// D-Alpha-7.5 Session D: realistic asm passing all 4 universal structural rules.
+// - S2: instruction count <= 16
+// - S3 universal: no labels
+// - Operand reference consistency: %N references match operand count
+// - No duplicate register bindings
+
+u64 g_x = 5;
+u64 g_y = 0;
+
+// Multi-instruction block (within S2 limit), no labels, valid %N refs, unique regs
+naked void multi_instruction() {
+    asm {
+        instructions: "movq %1, %0\naddq $1, %0\nshlq $1, %0"
+        outputs: { "rax" = g_y }
+        inputs:  { "rcx" = g_x }
+        safety: "Multi-instruction block: read g_x to rax, increment, shift left by 1"
+    }
+}
+
+i32 main() {
+    multi_instruction();
+    // (5 + 1) << 1 = 12
+    if (g_y != 12) { return 1; }
+    return 0;
+}

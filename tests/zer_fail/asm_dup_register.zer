@@ -1,0 +1,15 @@
+// EXPECTED: compile error — same register bound twice in inputs{} block.
+// Tests Session D duplicate register binding rejection.
+
+u64 g_a = 1;
+u64 g_b = 2;
+
+naked void dup_reg() {
+    asm {
+        instructions: "nop"
+        inputs: { "rax" = g_a, "rax" = g_b }
+        safety: "Test dup register — rax cannot be bound twice in inputs{} block"
+    }
+}
+
+i32 main() { return 0; }

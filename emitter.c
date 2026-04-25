@@ -3456,6 +3456,91 @@ static bool is_async_local(Emitter *e, const char *name, size_t len) {
 }
 
 
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward decl for emit_structured_asm */
+
+/* D-Alpha-7.5 Session B — Map x86_64 register name to GCC inline-asm constraint
+ * letter. Returns NULL if unknown (Session C will add full per-arch tables).
+ *
+ * GCC machine constraints (x86 family):
+ *   "a" = rax/eax/ax/al    "b" = rbx/ebx/bx/bl
+ *   "c" = rcx/ecx/cx/cl    "d" = rdx/edx/dx/dl
+ *   "S" = rsi/esi/si       "D" = rdi/edi/di
+ *   "r" = any general-purpose register (fallback)
+ *
+ * The width (64/32/16/8) is determined by the bound expression's TYPE in GCC,
+ * not by which register name we picked. So writing "rax" with a u32 bound
+ * variable still works — GCC uses eax. */
+static const char *asm_register_to_gcc_constraint(const char *name, size_t len) {
+    if (len == 0) return NULL;
+    /* Common x86 GP registers */
+    if ((len == 3 && (memcmp(name, "rax", 3) == 0 || memcmp(name, "eax", 3) == 0))
+        || (len == 2 && memcmp(name, "ax", 2) == 0)) return "a";
+    if ((len == 3 && (memcmp(name, "rbx", 3) == 0 || memcmp(name, "ebx", 3) == 0))
+        || (len == 2 && memcmp(name, "bx", 2) == 0)) return "b";
+    if ((len == 3 && (memcmp(name, "rcx", 3) == 0 || memcmp(name, "ecx", 3) == 0))
+        || (len == 2 && memcmp(name, "cx", 2) == 0)) return "c";
+    if ((len == 3 && (memcmp(name, "rdx", 3) == 0 || memcmp(name, "edx", 3) == 0))
+        || (len == 2 && memcmp(name, "dx", 2) == 0)) return "d";
+    if ((len == 3 && (memcmp(name, "rsi", 3) == 0 || memcmp(name, "esi", 3) == 0))
+        || (len == 2 && memcmp(name, "si", 2) == 0)) return "S";
+    if ((len == 3 && (memcmp(name, "rdi", 3) == 0 || memcmp(name, "edi", 3) == 0))
+        || (len == 2 && memcmp(name, "di", 2) == 0)) return "D";
+    /* Generic fallback: "r" = any GPR. Used for register names we don't have
+     * a specific letter for (r8-r15, etc.). Session C will replace this with
+     * proper per-arch validation tables. */
+    return "r";
+}
+
+/* D-Alpha-7.5 Session B — Emit a structured asm block as GCC inline asm.
+ * Format: __asm__ __volatile__ ("instructions" : outputs : inputs : clobbers)
+ * Each operand: "=CONSTRAINT"(expr) for outputs, "CONSTRAINT"(expr) for inputs.
+ * Clobbers are quoted strings.
+ * Safety string emitted as a preceding comment for audit-trail visibility. */
+static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
+    /* Audit-trail comment: every escape hatch documents itself in emitted C. */
+    emit(e, "/* asm safety: %.*s */\n",
+         (int)a->asm_stmt.safety_len, a->asm_stmt.safety);
+    emit_indent(e);
+    emit(e, "__asm__ __volatile__ (\"%.*s\"",
+         (int)a->asm_stmt.instructions_len, a->asm_stmt.instructions);
+
+    /* Outputs */
+    if (a->asm_stmt.output_count > 0 || a->asm_stmt.input_count > 0
+        || a->asm_stmt.clobber_count > 0) {
+        emit(e, " : ");
+        for (int i = 0; i < a->asm_stmt.output_count; i++) {
+            if (i > 0) emit(e, ", ");
+            AsmOperand *op = &a->asm_stmt.outputs[i];
+            const char *cstr = asm_register_to_gcc_constraint(op->reg_name, op->reg_name_len);
+            emit(e, "\"=%s\"(", cstr ? cstr : "r");
+            emit_rewritten_node(e, op->expr, func);
+            emit(e, ")");
+        }
+    }
+    /* Inputs */
+    if (a->asm_stmt.input_count > 0 || a->asm_stmt.clobber_count > 0) {
+        emit(e, " : ");
+        for (int i = 0; i < a->asm_stmt.input_count; i++) {
+            if (i > 0) emit(e, ", ");
+            AsmOperand *op = &a->asm_stmt.inputs[i];
+            const char *cstr = asm_register_to_gcc_constraint(op->reg_name, op->reg_name_len);
+            emit(e, "\"%s\"(", cstr ? cstr : "r");
+            emit_rewritten_node(e, op->expr, func);
+            emit(e, ")");
+        }
+    }
+    /* Clobbers */
+    if (a->asm_stmt.clobber_count > 0) {
+        emit(e, " : ");
+        for (int i = 0; i < a->asm_stmt.clobber_count; i++) {
+            if (i > 0) emit(e, ", ");
+            AsmOperand *op = &a->asm_stmt.clobbers[i];
+            emit(e, "\"%.*s\"", (int)op->reg_name_len, op->reg_name);
+        }
+    }
+    emit(e, ");\n");
+}
+
 static void emit_func_decl(Emitter *e, Node *node) {
 
     /* Function bodies are IR-only (no AST fallback). The AST emission
@@ -8417,13 +8502,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     } else if (s->kind == NODE_ASM) {
                         emit_indent(e);
                         if (s->asm_stmt.is_structured) {
-                            /* H1+H3 structured form: emit safety comment + instructions.
-                             * Session B+ will add operand binding emission. */
-                            emit(e, "/* asm safety: %.*s */\n",
-                                 (int)s->asm_stmt.safety_len, s->asm_stmt.safety);
-                            emit_indent(e);
-                            emit(e, "__asm__ __volatile__(\"%.*s\");\n",
-                                 (int)s->asm_stmt.instructions_len, s->asm_stmt.instructions);
+                            emit_structured_asm(e, s, func);
                         } else {
                             emit(e, "__asm__ __volatile__(%.*s);\n",
                                  (int)s->asm_stmt.code_len, s->asm_stmt.code);
@@ -8465,14 +8544,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 /* Inline assembly — emit directly */
                 Node *a = inst->expr;
                 if (a->asm_stmt.is_structured) {
-                    /* H1+H3 structured form: emit safety comment then instructions.
-                     * Session B+ adds operand binding emission. */
                     emit_indent(e);
-                    emit(e, "/* asm safety: %.*s */\n",
-                         (int)a->asm_stmt.safety_len, a->asm_stmt.safety);
-                    emit_indent(e);
-                    emit(e, "__asm__ __volatile__(\"%.*s\");\n",
-                         (int)a->asm_stmt.instructions_len, a->asm_stmt.instructions);
+                    emit_structured_asm(e, a, func);
                 } else {
                     emit_indent(e);
                     emit(e, "__asm__ __volatile__(%.*s);\n",

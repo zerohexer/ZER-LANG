@@ -6627,18 +6627,70 @@ if (a->asm_stmt.is_structured) {
 
 **ir_lower:** NO changes. NODE_ASM was already opaque IR_NOP passthrough; same goes for structured form.
 
+## D-Alpha-7.5 Session B — Typed operand bindings (H1 full + H2, 2026-04-25)
+
+**Status:** shipped on top of Session A. `inputs:`, `outputs:`, `clobbers:` blocks now parse, type-check, and emit valid GCC inline asm.
+
+**AST extension** (`ast.h`):
+```c
+typedef struct {
+    const char *reg_name;
+    size_t reg_name_len;
+    Node *expr;             /* NULL for clobbers */
+    SrcLoc loc;
+} AsmOperand;
+
+/* asm_stmt extended with: */
+AsmOperand *inputs;     int input_count;
+AsmOperand *outputs;    int output_count;
+AsmOperand *clobbers;   int clobber_count;
+```
+
+**Parser** (`parser.c` ~line 1900):
+- `inputs:` and `outputs:` use `{ "reg" = expr, ... }` form
+- `clobbers:` uses `[ "name", "name", ... ]` form
+- Stack-first dynamic arrays (cap 8, grow via `parser_alloc`)
+- Trailing comma allowed in all three blocks
+
+**Checker** (`checker.c` NODE_ASM, extended Session A block):
+- Inputs: each expression must be integer-typed (`type_is_integer()`)
+- Outputs: must be NODE_IDENT/NODE_FIELD/NODE_INDEX/NODE_UNARY (mutable lvalue) AND integer-typed
+- Clobbers: non-empty register name string
+- Float/struct/slice operands rejected with message pointing to future SIMD support
+
+**Emitter** (`emitter.c` two helpers added near `emit_func_decl`):
+- `asm_register_to_gcc_constraint(name, len)` — maps register name → GCC constraint letter
+- `emit_structured_asm(e, node, func)` — generates `__asm__ __volatile__ ("inst" : outputs : inputs : clobbers)`
+- Both AST defer-body emit site and IR `IR_NOP`/NODE_ASM passthrough use this helper
+- Forward decl `emit_rewritten_node` moved near top of file (was at line 4846, now also at 3457 for `emit_structured_asm` to call)
+
+**GCC constraint mapping** (Session B baseline, Session C will replace with per-arch tables):
+| Register | GCC constraint |
+|---|---|
+| rax/eax/ax | `a` |
+| rbx/ebx/bx | `b` |
+| rcx/ecx/cx | `c` |
+| rdx/edx/dx | `d` |
+| rsi/esi/si | `S` |
+| rdi/edi/di | `D` |
+| anything else | `r` (any GPR — fallback) |
+
+Width is determined by the bound expression's TYPE (GCC handles u64→`%rax`, u32→`%eax`, etc. from the C type system).
+
 **Future-session extension points:**
-- Session B will add `Node *inputs[]`, `Node *outputs[]`, `Node *clobbers[]` arrays to asm_stmt
-- Session B will extend parser to parse those blocks
-- Session B will extend checker to type-check operand bindings (H2)
-- Session C will add per-arch register tables for clobber validation (H4)
+- Session C adds per-arch register tables for proper validation (H4) — replaces "r" fallback
+- Session C adds width matching (e.g., reject `"al"` with u32 type)
 - Sessions D-F add 18 structural rules + 13 Z-rules + 8 categories framework
 - Session G adds System #30 (Atomic Ordering) — only NEW safety system
+- Session H adds `@asm_register_valid` Phase 1 predicate (extracted to src/safety/)
+- Session I adds audit log emission (build/asm_audit.log)
 
-**Tests added:**
-- `tests/zer/asm_structured.zer` (positive)
-- `tests/zer_fail/asm_no_safety.zer` (S4 rejection: missing safety)
-- `tests/zer_fail/asm_short_safety.zer` (S4 rejection: < 30 chars)
+**Tests added (Session A + Session B, all auto-discovered):**
+- `tests/zer/asm_structured.zer` (Session A: structured form positive)
+- `tests/zer_fail/asm_no_safety.zer` (Session A: S4 missing safety)
+- `tests/zer_fail/asm_short_safety.zer` (Session A: S4 short safety)
+- `tests/zer/asm_typed_operands.zer` (Session B: load immediate + leaq doubling + memory clobber)
+- `tests/zer_fail/asm_wrong_operand_type.zer` (Session B: float and struct operands rejected)
 
 ---
 

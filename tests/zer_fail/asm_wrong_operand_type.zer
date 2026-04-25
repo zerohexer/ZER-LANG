@@ -1,0 +1,25 @@
+// EXPECTED: compile error — asm operands must be integer-typed in Session B.
+// Float operands aren't supported until SIMD/FPU register support lands later.
+
+struct Point { u32 x; u32 y; }
+
+f32 g_float = 3.14;
+Point g_point;
+
+naked void use_float_input() {
+    asm {
+        instructions: "nop"
+        inputs: { "rax" = g_float }   // ERROR: float not allowed
+        safety: "Attempt float input — should be rejected by Session B checker"
+    }
+}
+
+naked void use_struct_output() {
+    asm {
+        instructions: "nop"
+        outputs: { "rax" = g_point }   // ERROR: struct not allowed
+        safety: "Attempt struct output — should be rejected by Session B checker"
+    }
+}
+
+i32 main() { return 0; }

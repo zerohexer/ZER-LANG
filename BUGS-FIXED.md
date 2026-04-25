@@ -166,9 +166,43 @@ Mirrors `emit_expr` lines 1361-1407 exactly — same machinery, different switch
 
 **Tests after this commit:** 1,303 PASS / 0 FAIL via `make docker-check` (was 1,300, +3). VST proofs: zero admits across 23 verification files.
 
+### D-Alpha-7.5 Session B: typed operand bindings (H1 full + H2)
+
+**Change:** Extends Session A's structured `asm { ... }` block with typed operand bindings — `inputs: { "reg" = expr, ... }`, `outputs: { "reg" = lvalue, ... }`, `clobbers: ["reg", ...]`. Each operand is type-checked (integer scalars only in Session B).
+
+**Implementation:**
+- `ast.h`: new `AsmOperand` struct (reg_name + Node *expr); added `inputs[]/outputs[]/clobbers[]` arrays + counts to `asm_stmt`.
+- `parser.c`: replaced Session A's "Session B+ reserved" rejection with actual parsing. Stack-first dynamic arrays (cap 8, grow via parser_alloc). Trailing comma allowed.
+- `checker.c`: type-checks each input expression (integer required), each output (mutable lvalue + integer), clobbers (non-empty register name string). Rejects float/struct/slice operands with explanatory message pointing to future SIMD/FPU support.
+- `emitter.c`: new `emit_structured_asm()` helper + `asm_register_to_gcc_constraint()` mapping. Emits `__asm__ __volatile__ ("inst" : "=a"(out) : "c"(in) : "memory")` form. Forward decl of `emit_rewritten_node` added near top of file.
+
+**Register name → GCC constraint mapping (Session B):**
+- `rax`/`eax`/`ax` → `a`
+- `rbx`/`ebx`/`bx` → `b`
+- `rcx`/`ecx`/`cx` → `c`
+- `rdx`/`edx`/`dx` → `d`
+- `rsi`/`esi`/`si` → `S`
+- `rdi`/`edi`/`di` → `D`
+- All other names → `r` (any GPR fallback)
+- Width determined by ZER expression's TYPE (GCC handles 64/32/16/8 from type)
+
+Per-arch register validation tables deferred to Session C/H4. The `r` fallback covers `r8`-`r15` and similar named registers without a single-letter GCC constraint.
+
+**Tests added:**
+- `tests/zer/asm_typed_operands.zer` — positive: load immediate (output), input+output via leaq doubling, output with memory clobber. Verifies operands flow correctly between ZER and asm.
+- `tests/zer_fail/asm_wrong_operand_type.zer` — float and struct operands rejected by checker.
+
+**What's NOT in Session B (deferred):**
+- Per-arch register validation tables (Session C/H4) — currently `"r"` fallback for unknown registers
+- Width matching (ensure `"al"` only used with u8 type, etc.) — Session C
+- SIMD/FPU operand support (xmm/ymm/zmm registers) — later session
+- @arch_guard attribute for arch-specific tests — Session D
+
+**Tests after this commit:** 1,305 PASS / 0 FAIL via `make docker-check` (was 1,303, +2). VST proofs: zero admits across 23 verification files.
+
 **Roadmap (D-Alpha-7.5):**
-- Session A: H1+H3 baseline ✓ (this commit)
-- Session B: H1 full + H2 — operand binding parsing + typed operands + width validation
+- Session A: H1+H3 baseline ✓
+- Session B: H1 full + H2 ✓ (typed operand bindings, this commit)
 - Session C: H4 — per-arch register validation tables
 - Session D: 18 structural rules (S/O/I/E)
 - Session E: 13 Z-rules wiring 29 safety systems through asm operand boundaries

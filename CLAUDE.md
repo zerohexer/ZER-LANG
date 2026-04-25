@@ -189,7 +189,17 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
         // asm { instructions: "nop" }            // missing safety: = COMPILE ERROR
     }
     ```
-    Session B+ will add `inputs:`, `outputs:`, `clobbers:` blocks for typed operand binding (H2/H4) — currently rejected by parser with explanatory error.
+    **Session B (added 2026-04-25)**: typed operand bindings via `inputs:`, `outputs:`, `clobbers:` blocks. Each operand binds a register name to a ZER expression; checker enforces integer-typed scalars. Emitter lowers to GCC inline asm with constraint letters (`a`/`b`/`c`/`d`/`S`/`D` for rax/rbx/rcx/rdx/rsi/rdi).
+    ```
+    naked void load_const() {
+        asm {
+            instructions: "movq $42, %0"
+            outputs: { "rax" = g_result }
+            safety: "Test asm output binding by loading immediate 42 into rax"
+        }
+    }
+    ```
+    Per-arch register validation tables (Session C/H4) will replace the GP-register-letter mapping. Session B accepts unknown registers via `"r"` (any GPR) fallback.
     **OBSOLETE (kept for context):** previously required `unsafe asm("...")` form (2026-04-23 to 2026-04-25). Audit confirmed the `unsafe` keyword was cosmetic — every safety check keys on the structural `in_naked` flag, not the keyword. Rename aligns with C/Zig/C++ convention (only Rust/Carbon use `unsafe asm`); ZER's auto-everything brand fits bare `asm`. The planned `unsafe fn` (H5 of D-Alpha-7.5) was also dropped — function-level marker is redundant once strict mode is per-block. `naked fn` stays (hardware constraint for interrupt handlers, no prologue/epilogue).
 
 ### Intrinsics (@ builtins)

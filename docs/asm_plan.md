@@ -2,6 +2,21 @@
 
 **Purpose:** This document captures the complete context from the Vale-tier verified asm design discussion so any fresh session can pick up exactly where we left off. Read this top-to-bottom if you are starting fresh on the asm verification work.
 
+> ## ⚠ KEYWORD RENAME 2026-04-25 — applies throughout this document
+>
+> **`unsafe asm` was renamed to bare `asm`. The planned `unsafe fn` was dropped entirely.**
+>
+> All occurrences of `unsafe asm` and `unsafe fn` below are **OBSOLETE NAMING** kept for context. Read them as:
+> - `unsafe asm("...")` → `asm("...")`
+> - `unsafe asm { ... }` (planned H1-H7 structured form) → `asm { ... }`
+> - `unsafe fn` (planned H5) → never introduced; any function can contain `asm` (strict mode enforces safety per-block); `naked fn` stays for hardware constraint
+>
+> **Why renamed:** Audit confirmed `unsafe` keyword was cosmetic. Every safety property keys on the structural `in_naked` flag (`zer_asm_allowed_in_context(in_naked)`, Phase 1 verified). The keyword never reached AST/IR/checker/emitter — it was parser-only. Removing it: simplifies compiler (~30 lines), aligns with C/Zig/C++ convention (4 of 5 modern systems langs use bare `asm`), fits ZER's auto-everything brand. After D-Alpha-7.5 Phase 2 lands, asm becomes 100% language-safe in the SAME sense as regular ZER code via the 13 Z-rules + 8 categories + System #30 framework already designed below — **rename does NOT change any plan, just naming**.
+>
+> **What stays:** `naked fn` (hardware: no prologue/epilogue, required for interrupt handlers). `--relax-asm` flag and `@relax_check(ZN)` per-block escape (renamed mentally: `--unchecked-asm` would be more honest but not yet renamed).
+>
+> **All H1-H7 features, all 8 categories, all 13 Z-rules, all 18 structural rules, all System #30 design — UNCHANGED.** Only the keyword.
+
 **Key revisions (2026-04-23 late-day):**
 - Scope reduced from 4 archs → 3 archs (x86-64, ARM64, RISC-V). Cortex-M deferred to v1.1.
 - `asm` keyword renamed to `unsafe asm` — the `unsafe` marker is now **required** (Rust-style explicit escape hatch). Bare `asm(...)` is rejected with compile error. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — structural rule applies to new naming.

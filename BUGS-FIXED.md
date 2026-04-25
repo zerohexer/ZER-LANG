@@ -138,6 +138,54 @@ Mirrors `emit_expr` lines 1361-1407 exactly — same machinery, different switch
 
 **Tests after this commit:** 480 ZER integration (was 477, +3 BUG-612 tests). 1,302 total visible PASS lines across `make docker-check`.
 
+### Keyword rename: `unsafe asm` → `asm`, planned `unsafe fn` dropped (feature)
+
+**Change:** Removed the `unsafe` keyword. Inline assembly is now plain `asm(...)`. The planned `unsafe fn` (H5 of D-Alpha-7.5) was dropped before implementation.
+
+**Audit performed before commit:**
+- TOK_UNSAFE used in 3 sites total: `lexer.h`, `lexer.c` scan + name printer, `parser.c` asm branch
+- AST `NODE_ASM` has no `is_unsafe` field — keyword never propagated past parser
+- IR has no `IR_ASM` opcode — asm lowered as `IR_NOP` passthrough
+- Checker, emitter, zercheck_ir all unsafe-agnostic
+- Phase 1 verified predicate `zer_asm_allowed_in_context(int in_naked)` keys on STRUCTURAL `in_naked` flag, not the keyword
+- 13 Z-rules + 8 categories (D-Alpha-7.5 plan) all dispatch to existing 29 safety systems by operand structure, not by keyword
+
+**Conclusion:** The `unsafe` keyword was purely cosmetic. Removing it changes zero safety properties. Aligns with C/Zig/C++ convention (4 of 5 modern systems langs use bare `asm`; only Rust/Carbon use `unsafe asm`). Fits ZER's auto-everything brand (same philosophy that gives us `.` everywhere instead of `->`, auto-zero, auto-bounds-check).
+
+**`unsafe fn` was redundant:** H5 was designed to expand asm permission beyond `naked fn`. But strict mode (D-Alpha-7.5 Phase 2) enforces safety per-block via Z-rules + categories. Function-level marker is a coarse permission gate that adds nothing the block-level checks already provide. Dropped — H5 simplifies to "asm allowed in any function context, strict mode enforces safety per-block, naked fn remains for hardware constraint (interrupt handlers)."
+
+**What stays:**
+- `naked fn` — hardware constraint (no prologue/epilogue), required for interrupt handlers
+- `zer_asm_allowed_in_context(in_naked)` Phase 1 verified predicate
+- All 29 safety systems
+- All planned D-Alpha-7.5 features (H1-H7, 18 structural rules, 13 Z-rules, 8 categories, System #30) — only the keyword changed, plan unchanged
+- `--relax-asm` flag and `@relax_check(ZN)` per-block escape
+
+**Implementation:**
+- `lexer.h`: TOK_UNSAFE removed (kept comment marking the removal)
+- `lexer.c`: `unsafe` keyword scan removed, name printer entry removed
+- `parser.c`: `if (match(TOK_UNSAFE))` branch + `bare 'asm' rejected` error removed (~20 lines deleted, simplified to single `if (check(TOK_ASM))` path)
+- `test_lexer.c`: TOK_UNSAFE expectation removed
+- `test_parser.c`, `test_parser_edge.c`, `test_checker_full.c`: `unsafe asm` → `asm`, removed bare-asm-rejected test cases (no longer applies)
+
+**Test changes:**
+- `tests/zer/unsafe_asm_syntax.zer` → `tests/zer/asm_syntax.zer` (rename + content update)
+- `tests/zer_fail/asm_not_naked.zer`: `unsafe asm` → `asm`
+- `rust_tests/rt_naked_asm_only.zer`: same
+- `rust_tests/reject_naked_array.zer`: same
+- `rust_tests/reject_naked_var_decl.zer`: same
+- DELETED `tests/zer_fail/bare_asm_rejected.zer` (bare `asm` is now the standard form)
+- DELETED `tests/zer_fail/unsafe_without_asm.zer` (`unsafe` no longer a token)
+
+**Doc updates:**
+- `CLAUDE.md`: rule #16 rewritten, item 1142 syntax-rules block updated
+- `docs/asm_plan.md`: top-level rename notice (existing `unsafe asm` references kept as obsolete-context per request — preserves architectural reasoning for fresh sessions)
+- `docs/reference.md` + `editors/vscode/REFERENCE.md`: cleaned to current state only (user-facing, no history clutter)
+
+**Tests after this commit:** 1,300 PASS / 0 FAIL via `make docker-check`. VST: zero admits across 23 verification files.
+
+**VSIX bumped to 0.4.8** to ship the keyword rename to extension users.
+
 ---
 
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)

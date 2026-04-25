@@ -1,0 +1,16 @@
+// `asm(...)` is the form for inline assembly (renamed from `unsafe asm` 2026-04-25).
+// Phase 1 verified: zer_asm_allowed_in_context enforces naked-function restriction.
+// After D-Alpha-7.5 Phase 2: 100% language-safe via Z-rules + 8 categories + System #30.
+
+naked void isr_one() {
+    asm("nop");
+}
+
+naked void isr_two() {
+    asm("nop");
+    asm("nop");
+}
+
+i32 main() {
+    return 0;
+}

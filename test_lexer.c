@@ -136,7 +136,7 @@ static void test_all_keywords(void) {
     expect_single("volatile", TOK_VOLATILE, "volatile");
     expect_single("interrupt", TOK_INTERRUPT, "interrupt");
     expect_single("asm", TOK_ASM, "asm");
-    expect_single("unsafe", TOK_UNSAFE, "unsafe");
+    /* `unsafe` keyword removed 2026-04-25 — `unsafe asm` renamed to bare `asm` */
     expect_single("static", TOK_STATIC, "static");
     expect_single("keep", TOK_KEEP, "keep");
     expect_single("as", TOK_AS, "as");

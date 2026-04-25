@@ -1832,23 +1832,18 @@ static Node *parse_statement(Parser *p) {
         p->previous = saved_p2;
     }
 
-    /* `unsafe asm` — the only accepted form for inline assembly (2026-04-23).
-     * Explicit `unsafe` marker makes escape hatch intent clear at call site (Rust-style).
-     * Bare `asm(...)` is REJECTED with a helpful error — use `unsafe asm(...)`.
-     * Syntax: simple `unsafe asm("nop");` or extended `unsafe asm("..." : "=r"(out) : "r"(in) : "memory");`
+    /* `asm(...)` — inline assembly. Renamed from `unsafe asm` 2026-04-25
+     * after audit confirmed `unsafe` keyword was cosmetic. Safety enforced
+     * by structural rule (`zer_asm_allowed_in_context(in_naked)`, Phase 1
+     * verified) — asm only inside `naked fn`. Post-D-Alpha-7.5 Phase 2,
+     * asm becomes 100% language-safe via 13 Z-rules + 8 categories + System
+     * #30 (auto-detection framework dispatching to existing 29 safety
+     * systems). Rationale: every modern systems lang except Rust/Carbon
+     * uses bare `asm` (C, C++, Zig); ZER's auto-everything brand fits.
+     * Syntax: simple `asm("nop");` or extended `asm("..." : "=r"(out) : "r"(in) : "memory");`
      * Bypass lexer — scan raw source for matching ) because ':' is not a ZER token. */
-    bool is_asm_stmt = false;
-    if (match(p, TOK_UNSAFE)) {
-        consume(p, TOK_ASM, "expected 'asm' after 'unsafe' (unsafe is only valid as `unsafe asm(...)`)");
-        is_asm_stmt = true;
-    } else if (check(p, TOK_ASM)) {
-        /* Bare `asm` rejected. Still parse the block for error recovery. */
-        error_at(p, &p->current,
-            "bare 'asm' is not allowed — use 'unsafe asm(...)' as explicit escape hatch marker");
-        advance(p);  /* consume the bad asm token */
-        is_asm_stmt = true;
-    }
-    if (is_asm_stmt) {
+    if (check(p, TOK_ASM)) {
+        advance(p); /* consume `asm` */
         consume(p, TOK_LPAREN, "expected '(' after 'asm'");
         /* scan raw source from current position to find matching ) */
         const char *start = p->current.start;

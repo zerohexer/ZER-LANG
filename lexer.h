@@ -41,7 +41,11 @@ typedef enum {
     TOK_CONTAINER,
     TOK_DO,
     TOK_SEMAPHORE,
-    TOK_UNSAFE,  /* `unsafe asm` — explicit escape hatch marker (Rust-style) */
+    /* TOK_UNSAFE removed 2026-04-25 — `unsafe asm` renamed to bare `asm`
+     * after audit confirmed the keyword was cosmetic (no safety property
+     * keyed on it; naked-fn structural gate is what enforces safety).
+     * After D-Alpha-7.5 Phase 2 lands, asm becomes 100% language-safe via
+     * 13 Z-rules + 8 universal precondition categories + System #30. */
 
     /* === Literals === */
     TOK_IDENT,          /* user identifier */

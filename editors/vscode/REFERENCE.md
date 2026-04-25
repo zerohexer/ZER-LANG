@@ -1,8 +1,7 @@
 # ZER(C) Language Reference
 
 **Zero Error Risk C Extension**
-**Version:** 0.2.1 | **Compiler:** `zerc` | **Target:** Any platform GCC supports
-**1700+ tests, all passing**
+**Compiler:** `zerc` | **Target:** Any platform GCC supports
 
 ---
 
@@ -154,6 +153,15 @@ scores[4] = 300;          // COMPILE ERROR — index 4 >= 4
 
 u32 i = get_index();
 scores[i] = 50;           // runtime bounds check — traps if i >= 4
+
+// Range propagation: proven-safe indices have ZERO overhead
+for (u32 j = 0; j < 4; j += 1) {
+    scores[j] = j;        // proven j in [0,3] — no bounds check emitted
+}
+
+// Inline call range: function return range proves index safe
+u32 hash(u32 key) { return key % 4; }
+scores[hash(42)] = 10;    // hash returns [0,3] — no bounds check, zero overhead
 ```
 
 **FIELDS**
@@ -430,7 +438,45 @@ packed struct SensorPacket {
 ```
 
 **SEE ALSO**
-struct
+struct, move struct
+
+---
+
+### move struct
+
+**DESCRIPTION**
+Struct with ownership transfer semantics. Passing to a function or assigning to another variable transfers ownership — the original variable becomes invalid. Use after transfer is a compile error.
+
+Used for types representing unique resources: file descriptors, hardware handles, DMA buffers, one-shot tokens. Prevents double-close, double-use, and accidental aliasing of unique resources.
+
+ZER is copy-by-default (opposite of Rust). `move struct` opts IN to ownership tracking for the ~5% of types that need it.
+
+**SYNTAX**
+```zer
+move struct FileHandle { i32 fd; }
+
+FileHandle f;
+f.fd = 42;
+
+// Pass to function — ownership transferred
+consume(f);
+f.fd;                // COMPILE ERROR — use after move
+
+// Assignment — ownership transferred
+move struct Token { u32 kind; }
+Token a;
+a.kind = 1;
+Token b = a;         // a transferred to b
+a.kind;              // COMPILE ERROR — use after move
+```
+
+**SAFETY**
+- Use after move → compile error (zercheck HS_TRANSFERRED)
+- Double move (pass twice) → compile error
+- No interaction with other features — independent zercheck flag
+
+**SEE ALSO**
+struct, shared struct
 
 ---
 
@@ -546,9 +592,12 @@ void greet([*]u8 name) {
 ### Function Pointer
 
 **DESCRIPTION**
-Same syntax as C. Optional function pointers use null sentinel.
+ZER supports two function pointer syntaxes — both produce the same type, both work everywhere, choose by style:
 
-**SYNTAX**
+- **Variant 2A** — C-style, identical to kernel C. Requires typedef for arrays and inline-return-of-funcptr.
+- **Variant 2C** — ZER-native (`*(args) -> ret name`), follows the `*T name` type-first convention, typedef-free in every position.
+
+**SYNTAX — Variant 2A (C-style)**
 ```zer
 u32 (*fn)(u32, u32) = add;                 // local variable
 void (*callback)(u32 event);               // global variable
@@ -559,6 +608,35 @@ typedef u32 (*BinOp)(u32, u32);            // typedef
 typedef ?u32 (*OptHandler)(u32);           // typedef — returns ?u32
 BinOp[4] ops;                              // array of function pointers (via typedef)
 ```
+
+**SYNTAX — Variant 2C (ZER-native, typedef-free)**
+```zer
+*(u32, u32) -> u32 fn = add;               // local variable
+*(u32 event) callback;                      // global; void return = no arrow
+struct Ops { *(u32) -> u32 compute; }       // struct field
+u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y);  // parameter
+?*(u32) -> u32 on_event = null;             // nullable funcptr
+*(u32) -> ?u32 lookup;                      // funcptr returning optional
+*(keep *Handler) register;                   // keep modifier on a param
+
+// Cases that REQUIRED typedef in 2A — now inline in 2C:
+*(u32, u32) -> u32 [4] ops;                  // array of funcptrs — INLINE
+*(u32, u32) -> u32 select_op(u32 kind);      // return-of-funcptr — INLINE
+```
+
+Discriminator: `*` BEFORE `(` is 2C; `*` INSIDE `(` is 2A. Both produce identical AST/types, so all downstream behavior (checker, IR, emitter, all 29 safety systems) is operator-agnostic — pick by readability.
+
+**FIELD ACCESS RULE**
+
+ZER uses `.` for ALL field access — values, pointers, Handles. No `->` operator in expressions. The `->` thin arrow is reserved for the 2C return-type separator (type-level only).
+
+```zer
+Task v;            v.field;       // value — direct access
+*Task ptr;         ptr.field;     // pointer — compiler auto-derefs
+Handle(T) h;       h.field;       // Handle — compiler auto-looks-up via slab.get
+```
+
+Mental model is taught by visible types (`*T`, `?*T`, `Handle(T)`), not by the deref operator. Modeled on Rust/Zig — both modern systems languages use `.` everywhere.
 
 **OPTIONAL FUNCTION POINTERS VS OPTIONAL RETURN**
 ```zer
@@ -719,6 +797,42 @@ while (running) {
 
 ---
 
+### do-while
+
+**DESCRIPTION**
+Execute body at least once, then check condition. C-style `do { } while (cond);`.
+
+**SYNTAX**
+```zer
+do {
+    val = read_register();
+} while (val & BUSY_FLAG);
+```
+
+**NOTES**
+- Braces required around body.
+- `break` and `continue` work as expected.
+
+---
+
+### for (range-based)
+
+**DESCRIPTION**
+Iterate over slice elements. `in` is a contextual keyword (not reserved).
+
+**SYNTAX**
+```zer
+for (u32 item in data_slice) {
+    process(item);
+}
+```
+
+**NOTES**
+- Collection must be a variable or field access — function calls rejected at parse time.
+- Desugars to indexed for loop with bounds-checked access.
+
+---
+
 ### switch
 
 **DESCRIPTION**
@@ -763,6 +877,18 @@ enum, union
 **DESCRIPTION**
 Runs a statement at scope exit, in reverse order of declaration.
 Fires on ALL exit paths (return, break, continue, end of block).
+
+Handle leaks are **compile errors** — allocating without `defer free()` (or returning/storing the handle) is rejected. The compiler error tells you exactly what to add.
+
+`yield` and `await` are **banned** inside defer bodies — both directly and transitively (calling a function that yields is also rejected). Defer cleanup must be atomic; suspending mid-cleanup corrupts the coroutine state machine.
+
+`defer` inside another `defer` body is also **banned** — the inner defer would run at the outer defer's execution time (scope exit), which is confusing and rarely what the programmer intends.
+
+```zer
+defer {
+    defer { cleanup(); }   // COMPILE ERROR — 'defer' cannot be nested
+}
+```
 
 **SYNTAX**
 ```zer
@@ -985,11 +1111,16 @@ Slab(Task) heap;           // global only
 ```
 
 **METHODS**
-- `.alloc()` → `?Handle(T)` — Allocate a slot (Handle). Returns null if OOM.
-- `.alloc_ptr()` → `?*T` — Allocate a slot (pointer). Returns null if OOM.
+- `.alloc()` → `?Handle(T)` or `?*T` — target type picks the variant (see note below).
+- `.alloc_ptr()` → `?*T` — explicit pointer form.
 - `.get(h)` → `*T` — Access by handle. Traps if gen mismatch.
-- `.free(h)` → `void` — Free slot by handle, increment generation.
-- `.free_ptr(p)` → `void` — Free slot by pointer.
+- `.free(x)` → `void` — Handle or `*T` — arg type picks the variant.
+- `.free_ptr(p)` → `void` — explicit pointer form.
+
+**Target-type routing:** `slab.alloc()` returns a Handle when the target
+variable is `Handle(T)` / `?Handle(T)`, and a pointer when the target is
+`*T` / `?*T`. `slab.free(x)` dispatches on the argument type. Explicit
+`_ptr` forms remain supported.
 
 **EXAMPLE**
 ```zer
@@ -1123,6 +1254,7 @@ t.id = 1;             // COMPILE ERROR — zercheck FuncSummary knows destroy fr
 **NOTES**
 - `alloc_ptr()` returns `?*T` (null sentinel). Use `orelse` to unwrap.
 - `free_ptr(*T)` finds the slot by pointer address and frees it. Argument type must match pool/slab element type — `*Motor` to `Task` pool is a compile error.
+- Interior pointers tracked: `*u32 p = &t.id; free_ptr(t); p[0]` → compile error. Field-derived pointers share alloc_id with parent allocation.
 - Can mix Handle and alloc_ptr on the same Slab/Pool.
 - `const Handle(Task)` prevents mutation through auto-deref — `h.id = 42` on const Handle is a compile error.
 - For `*opaque` (C interop), Level 2+3+5 runtime checks (~1ns) cover the remaining cases zercheck can't track.
@@ -1132,30 +1264,36 @@ Handle(T), Pool(T,N), Slab(T)
 
 ---
 
-### Task.new() / Task.delete() — Auto-Slab Allocation
+### Task.alloc() / Task.free() — Auto-Slab Allocation
 
 **DESCRIPTION**
 Allocate a struct without declaring a Slab. The compiler auto-creates a global
-Slab per struct type behind the scenes. Same safety as explicit Slab.
+Slab per struct type behind the scenes. Same safety as explicit Slab. The
+target type (or argument type for `free`) picks between Handle and `*T`
+automatically — you write the same method name in both cases.
 
 **SYNOPSIS**
 ```zer
-// Handle path:
-Handle(Task) t = Task.new() orelse { return 1; };
+// Handle path — target is Handle(T), routes to auto-Slab alloc:
+Handle(Task) t = Task.alloc() orelse { return 1; };
 t.id = 42;           // auto-deref
-Task.delete(t);
+Task.free(t);        // arg is Handle → free
 
-// Pointer path:
-*Task t = Task.new_ptr() orelse { return 1; };
+// Pointer path — target is *T, routes to auto-Slab alloc_ptr:
+*Task t = Task.alloc() orelse { return 1; };
 t.id = 42;           // direct deref
-Task.delete_ptr(t);
+Task.free(t);        // arg is *T → free_ptr
+
+// Explicit forms still work (same result as target-type routing):
+*Task t = Task.alloc_ptr() orelse { return 1; };
+Task.free_ptr(t);
 ```
 
 **METHODS**
-- `T.new()` → `?Handle(T)` — allocate via auto-Slab, returns Handle
-- `T.new_ptr()` → `?*T` — allocate via auto-Slab, returns pointer
-- `T.delete(h)` → `void` — free Handle
-- `T.delete_ptr(p)` → `void` — free pointer (type-checked)
+- `T.alloc()` → `?Handle(T)` or `?*T` — variant picked from target type
+- `T.free(x)` → `void` — Handle or `*T` — variant picked from arg type
+- `T.alloc_ptr()` → `?*T` — explicit pointer form (same as `T.alloc()` with `*T` target)
+- `T.free_ptr(p)` → `void` — explicit pointer form (same as `T.free(p)` when p is `*T`)
 
 **EXAMPLE**
 ```zer
@@ -1163,15 +1301,16 @@ struct Task { u32 id; u32 priority; }
 struct Node { u32 value; }
 
 u32 main() {
-    // No Slab declaration needed — auto-created per struct type
-    Handle(Task) t = Task.new() orelse { return 1; };
+    // No Slab declaration needed — auto-created per struct type.
+    // One method name for both forms; target type picks the variant.
+    Handle(Task) t = Task.alloc() orelse { return 1; };
     t.id = 42;
 
-    *Node n = Node.new_ptr() orelse { return 2; };
+    *Node n = Node.alloc() orelse { return 2; };
     n.value = 99;
 
-    Task.delete(t);
-    Node.delete_ptr(n);
+    Task.free(t);   // Handle arg
+    Node.free(n);   // *T arg
     return 0;
 }
 ```
@@ -1179,8 +1318,9 @@ u32 main() {
 **NOTES**
 - One auto-Slab per struct type, program-wide (shared across modules like C's malloc heap).
 - Uses `calloc` internally — same ISR restriction as Slab.
-- `delete_ptr()` type-checks argument — `*Motor` to `Task.delete_ptr()` is a compile error.
+- `T.free()` type-checks argument — `*Motor` passed to `Task.free()` is a compile error.
 - Can mix with explicit Slab/Pool in the same program.
+- Uniform allocator vocabulary across ZER: Pool / Slab / Arena / Task sugar all use `alloc` / `free` (no `new` / `delete`).
 
 **SEE ALSO**
 Slab(T), Pool(T,N), Handle(T), alloc_ptr
@@ -1488,11 +1628,100 @@ if (val) |v| {
 
 ---
 
-### @barrier(), @barrier_store(), @barrier_load()
+### @barrier(), @barrier_store(), @barrier_load(), @barrier_acq_rel()
 
 **DESCRIPTION**
-Memory barriers. Full, store-only, or load-only.
+Memory barriers. Full (seq_cst), store-only (release), load-only (acquire),
+or combined (acquire+release).
 Emits GCC `__atomic_thread_fence()`.
+
+---
+
+### @unreachable(), @expect(val, expected)
+
+**DESCRIPTION**
+Control-flow hints. `@unreachable()` marks a path that cannot execute (UB if reached).
+`@expect(val, expected)` is a branch prediction hint; returns `val` unchanged.
+
+**EXAMPLE**
+```zer
+if (@expect(valid, 1)) { }
+else { @unreachable(); }
+```
+
+---
+
+### @bswap16(x), @bswap32(x), @bswap64(x)
+
+**DESCRIPTION**
+Byte swap — reverse byte order. For host/network byte order conversion.
+Emits GCC `__builtin_bswap*()`.
+
+**EXAMPLE**
+```zer
+u32 net = @bswap32(host);
+```
+
+---
+
+### @popcount(x), @ctz(x), @clz(x), @parity(x), @ffs(x)
+
+**DESCRIPTION**
+Bit query operations. All return `u32`.
+- `@popcount(x)` — count 1-bits
+- `@ctz(x)` — count trailing zeros (UB if x=0)
+- `@clz(x)` — count leading zeros (UB if x=0)
+- `@parity(x)` — 0=even / 1=odd
+- `@ffs(x)` — position of lowest 1-bit, 1-indexed (0 if x=0)
+
+Input must be integer. Width-dispatched (ll suffix for 64-bit inputs).
+Emits GCC `__builtin_*` / `__builtin_*ll`.
+
+---
+
+### @cpu_disable_int(), @cpu_enable_int(), @cpu_wait_int(), @cpu_save_int_state(), @cpu_restore_int_state(state)
+
+**DESCRIPTION**
+Privileged interrupt control. Per-arch inline asm (x86: cli/sti/hlt,
+ARM: cpsid/cpsie/wfi, RISC-V: csrci/csrsi/wfi).
+Faults with SIGSEGV in user mode — kernel code only.
+
+**EXAMPLE**
+```zer
+u64 saved = @cpu_save_int_state();
+@cpu_disable_int();
+// critical section
+@cpu_restore_int_state(saved);
+```
+
+**NOTES**
+- For scope-bounded application code, prefer `@critical { body }`.
+- These intrinsics are for fine-grained kernel control.
+
+---
+
+### @cpu_save_context(buf), @cpu_restore_context(buf), @cpu_save_fpu(buf), @cpu_restore_fpu(buf)
+
+**DESCRIPTION**
+Scheduler primitives. Save/restore callee-saved GPRs and SIMD/FP state
+to/from a user-provided u8 buffer. Per-arch inline asm.
+
+**EXAMPLE**
+```zer
+u8[128] ctx;
+u8[512] fpu;
+@cpu_save_context(&ctx[0]);
+@cpu_save_fpu(&fpu[0]);
+// switch stacks here (naked function, kernel-specific)
+@cpu_restore_fpu(&fpu[0]);
+@cpu_restore_context(&ctx[0]);
+```
+
+**NOTES**
+- Buffer size: 128+ bytes for context, 512+ (16-byte aligned) for FPU.
+- Callee-saved only (rbx/r12-r15 x86; x19-x28 ARM64; s0-s11 RISC-V).
+- Full RSP/RIP save-restore needs a naked function — kernel-integration scope.
+- `fxsave` on x86-64 requires 16-byte aligned buffer.
 
 ---
 
@@ -1514,42 +1743,82 @@ const [*]u8 name = "hello";
 
 ---
 
-### @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor
+### (Type)expr — C-Style Cast
 
 **DESCRIPTION**
-Atomic read-modify-write operations. Uses GCC `__atomic_*` builtins.
-Value must be 1, 2, 4, or 8 bytes wide.
+Explicit type conversion using C-style syntax. Narrowing truncates by default.
+
+**SYNTAX**
+```zer
+(TargetType)expression
+```
 
 **EXAMPLE**
 ```zer
-u32 counter;
-@atomic_add(&counter, 1);
+u8 small = 42;
+u32 big = (u32)small;          // widening
+u16 trunc = (u16)big;          // narrowing (truncate)
+f32 ratio = (f32)big;          // int → float value convert
+(*Motor)opaque_ctx             // pointer cast (provenance checked)
+(*opaque)sensor_ptr            // type erase
 ```
+
+**NOTES**
+- Widening: always safe, no data loss.
+- Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
+- `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
+- `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
 
 ---
 
-### @atomic_load, @atomic_store
+### @atomic_load, @atomic_store, @atomic_cas
 
 **DESCRIPTION**
-Atomic load and store with sequential consistency.
+Atomic load, store, compare-and-swap. Sequential consistency.
+Uses GCC `__atomic_load_n` / `__atomic_store_n` / `__atomic_compare_exchange_n`.
 
 **EXAMPLE**
 ```zer
 u32 val = @atomic_load(&shared);
 @atomic_store(&shared, 42);
+bool swapped = @atomic_cas(&lock, 0, 1);
 ```
 
 ---
 
-### @atomic_cas(ptr, expected, desired)
+### @atomic_add, @atomic_sub, @atomic_or, @atomic_and, @atomic_xor, @atomic_nand, @atomic_xchg
 
 **DESCRIPTION**
-Compare-and-swap. Returns bool (true if swapped).
+Atomic read-modify-write. Returns value BEFORE the operation.
+`@atomic_xchg` swaps the value. All sequential consistency.
 
 **EXAMPLE**
 ```zer
-bool swapped = @atomic_cas(&lock, 0, 1);
+u32 old = @atomic_add(&counter, 1);
+u32 old_lock = @atomic_xchg(&lock, 1);
 ```
+
+---
+
+### @atomic_add_fetch, @atomic_sub_fetch, @atomic_or_fetch, @atomic_and_fetch, @atomic_xor_fetch
+
+**DESCRIPTION**
+Atomic read-modify-write. Returns value AFTER the operation (new value).
+
+**EXAMPLE**
+```zer
+u32 new_count = @atomic_add_fetch(&counter, 1);  // returns counter + 1
+```
+
+---
+
+**Atomic restrictions (all `@atomic_*` intrinsics):**
+- First argument must be `*shared T` where T is integer
+- Width must be 1, 2, 4, or 8 bytes
+- Not allowed on packed struct fields (alignment)
+- 64-bit atomics on 32-bit targets warn about libatomic dependency
+
+---
 
 ---
 
@@ -1558,6 +1827,10 @@ bool swapped = @atomic_cas(&lock, 0, 1);
 **DESCRIPTION**
 Interrupt-disabled block. Disables interrupts on entry, re-enables on exit.
 Per-architecture interrupt disable/enable.
+
+`return`, `break`, `continue`, and `goto` are **banned** inside `@critical` blocks — jumping out would skip the interrupt re-enable, leaving the system with interrupts permanently disabled.
+
+`yield`, `await`, and `spawn` are also **banned** inside `@critical` — both directly and transitively (calling a function that yields/spawns is also rejected). Yield/await would suspend with interrupts disabled (system hang). Spawn would create a thread with interrupts disabled (hardware-unsafe).
 
 **EXAMPLE**
 ```zer
@@ -1624,18 +1897,37 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
 
 ---
 
-### asm
+### unsafe asm
 
 **DESCRIPTION**
-Inline assembly. GCC operand syntax. Raw pass-through.
+Inline assembly. Escape hatch for operations not covered by verified intrinsics.
+The `unsafe` keyword is **required** (Rust-style explicit marker, 2026-04-23).
+Bare `asm(...)` is rejected with a helpful compile error.
+Only allowed inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context`).
 
 **SYNTAX**
 ```zer
-asm("cpsid i");              // disable interrupts
-asm("wfi");                  // wait for interrupt
+unsafe asm("cpsid i");       // disable interrupts
+unsafe asm("wfi");            // wait for interrupt
 
 // With operands (GCC extended syntax):
-asm("mov %0, %1" : "=r"(out) : "r"(in));
+unsafe asm("mov %0, %1" : "=r"(out) : "r"(in));
+```
+
+**REJECTED**
+```zer
+asm("nop");     // COMPILE ERROR: bare 'asm' is not allowed — use 'unsafe asm(...)'
+```
+
+**WHEN TO USE**
+- Prefer `@intrinsic()` calls — verified, safe, portable across archs.
+- Use `unsafe asm` only for operations not yet covered by intrinsics (new vendor extensions, experimental hardware, niche use cases).
+- For external asm code, use `cinclude "foo.S"` instead (explicit `UNSAFE-EXTERN` warning).
+
+**AUDIT**
+Users can grep for all escape hatches in a codebase:
+```bash
+grep -rn "unsafe asm" src/
 ```
 
 ---
@@ -1644,13 +1936,13 @@ asm("mov %0, %1" : "=r"(out) : "r"(in));
 
 **DESCRIPTION**
 Function with no compiler-generated prologue/epilogue.
-Body must be pure assembly.
+Body must be pure `unsafe asm(...)` statements plus `return`.
 
 **SYNTAX**
 ```zer
 naked void reset_handler() {
-    asm("ldr sp, =_stack_top");
-    asm("b main");
+    unsafe asm("ldr sp, =_stack_top");
+    unsafe asm("b main");
 }
 ```
 
@@ -1742,6 +2034,57 @@ u32 main() {
 - C macros (stderr, stdout, etc.) are NOT accessible. Wrap in a C helper function.
 - `_zer_` prefix is reserved — name helpers `zer_get_stderr`, not `_zer_stderr`.
 
+### Safe C Library Interop — `cinclude` + `*opaque` + `shared struct`
+
+Two keywords make ANY C library fully safe from ZER:
+
+**Memory safety** — wrap C pointers in `*opaque`:
+```zer
+cinclude "sensor.h";
+*opaque sensor_open([*]u8 path);
+void sensor_close(*opaque dev);
+u32 sensor_read(*opaque dev);
+
+u32 main() {
+    *opaque dev = sensor_open("/dev/spi0");
+    defer sensor_close(dev);          // zercheck: leak prevented
+    u32 val = sensor_read(dev);       // zercheck: dev is ALIVE
+    return 0;
+}
+// sensor_close(dev) fires via defer
+// sensor_read(dev) after close = COMPILE ERROR (use after free)
+```
+
+**Concurrency safety** — wrap shared data in `shared struct`:
+```zer
+cinclude "event_lib.h";
+void event_register(void (*cb)());
+
+shared struct State { u32 counter; *opaque handle; }
+State g;
+
+void on_event() {
+    g.counter += 1;    // auto-locked — safe from ANY thread
+}
+
+u32 main() {
+    g.counter = 0;
+    event_register(on_event);    // C library calls on_event from its own thread
+    return 0;
+}
+```
+
+The auto-lock fires regardless of which thread calls the function — ZER `spawn`, C `pthread_create`, OS callback, interrupt handler. The lock is on the DATA (the `shared struct`'s mutex), not on the thread creation mechanism.
+
+**The complete safety model:**
+| Tool | Protects | Mechanism |
+|---|---|---|
+| `*opaque` | Pointer lifecycle (UAF, double-free, leak) | zercheck compile-time + runtime type_id |
+| `shared struct` | Data race prevention | Auto-lock (recursive pthread_mutex) |
+| `spawn` checker | Thread creation safety | Compile-time arg validation |
+
+**What ZER cannot protect:** C library internal bugs. If the C library itself has data races or UAF in its own code, ZER can't fix that — same boundary as Rust's `unsafe extern`.
+
 **SEE ALSO**
 import, *opaque
 
@@ -1811,6 +2154,109 @@ comptime if (DEBUG) {
     void log([*]u8 msg) { }    // no-op in release
 }
 ```
+
+---
+
+### static_assert
+
+**DESCRIPTION**
+Compile-time assertion. Condition must evaluate to a compile-time constant. False → compile error with optional message.
+
+**SYNTAX**
+```zer
+static_assert(SIZE > 0, "size must be positive");
+static_assert(Color.red == 0);
+```
+
+---
+
+### Comptime Advanced Features
+
+**DESCRIPTION**
+Comptime functions support: local variables, loops (for/while), switch, arrays, struct return, float arithmetic, and enum values.
+
+**SYNTAX**
+```zer
+// Locals and loops
+comptime u32 SUM(u32 n) {
+    u32 total = 0;
+    for (u32 i = 0; i <= n; i += 1) { total += i; }
+    return total;
+}
+
+// Array indexing
+comptime u32 LUT(u32 i) {
+    u32[4] t;
+    t[0] = 10; t[1] = 20; t[2] = 30; t[3] = 40;
+    return t[i];
+}
+
+// Struct return
+comptime Point ORIGIN() { return { .x = 0, .y = 0 }; }
+
+// Float arithmetic
+comptime f64 DEG_TO_RAD(f64 deg) { return deg * 3.14159 / 180.0; }
+
+// Enum values (compile-time evaluable)
+static_assert(Color.red == 0, "red is 0");
+```
+
+---
+
+### Designated Initializers
+
+**DESCRIPTION**
+Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, and return.
+
+**SYNTAX**
+```zer
+Point p = { .x = 10, .y = 20 };
+p = { .x = 100, .y = 200 };
+func({ .x = 1, .y = 2 });
+Point make() { return { .x = 0, .y = 0 }; }
+```
+
+---
+
+### container — Parameterized Struct
+
+**DESCRIPTION**
+User-defined parameterized struct template. Stamps concrete struct per type argument (monomorphization). No methods — use free functions.
+
+**SYNTAX**
+```zer
+container Stack(T) {
+    T[64] data;
+    u32 top;
+}
+
+Stack(u32) s;
+void stack_push(*Stack(u32) s, u32 val) {
+    s.data[s.top] = val;
+    s.top += 1;
+}
+```
+
+**NOTES**
+- T substitution works in: T, *T, ?T, []T, T[N] field types.
+- Instances cached — same `Stack(u32)` reuses cached stamp.
+- NOT generics — no type constraints, no SFINAE.
+
+---
+
+### --stack-limit N
+
+**DESCRIPTION**
+Compile error when estimated stack usage exceeds N bytes. Checks per-function frame size and entry-point call chain depth.
+
+**SYNTAX**
+```
+zerc main.zer --run --stack-limit 2048
+```
+
+**NOTES**
+- Recursive functions get warning (can't compute max depth).
+- Function pointer calls with unknown target → error with --stack-limit (can't verify depth).
 
 ---
 
@@ -1919,6 +2365,10 @@ reg[7..4] = 0x0F;          // Set bits 7:4
 | Division by zero | Forced guard — compile error if divisor not proven nonzero |
 | Invalid MMIO address | mmio range declarations + alignment check + boot probe |
 | ISR data race | Shared globals without volatile → compile error |
+| Thread data race | Spawn target body scanned for non-shared global access → error/warning |
+| Dangling @ptrtoint | `return @ptrtoint(&local)` → compile error (direct + indirect via struct fields) |
+| Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
+| Division by zero (call) | `x / func()` where func() return range unknown → compile error |
 | Wrong pointer cast | Provenance tracking through *opaque round-trips |
 
 ---
@@ -1952,6 +2402,149 @@ make docker-check      # build + test in Docker (preferred)
 make check             # build + test natively
 make docker-install    # build Windows binaries, install to PATH
 ```
+
+---
+
+## CONCURRENCY
+
+### shared struct — Auto-Locked Thread-Safe Data
+```zer
+shared struct Counter { u32 value; u32 total; }
+Counter g;
+g.value = 42;              // auto: lock → write → unlock
+g.total = g.value + 1;     // same lock scope (consecutive access grouped)
+```
+
+### shared(rw) struct — Reader-Writer Lock
+```zer
+shared(rw) struct Config { u32 threshold; u32 retries; }
+Config cfg;
+cfg.threshold = 100;       // auto write lock (exclusive)
+u32 t = cfg.threshold;     // auto read lock (multiple readers OK)
+```
+
+### spawn — Thread Creation
+```zer
+// Fire-and-forget (only shared ptr or value args):
+spawn worker(&shared_state);    // OK — shared struct auto-locked
+spawn handler(42, true);        // OK — value args copied
+
+// Scoped spawn (allows *T — thread joined before scope exit):
+ThreadHandle th = spawn compute(&local_data);
+th.join();                      // MUST join — zercheck error if not
+```
+
+**SAFETY CHECKS**
+- Non-shared `*T` to fire-and-forget spawn → compile error
+- Handle to spawn → compile error (pool.get not thread-safe)
+- Spawn target body scanned for non-shared global access:
+  - No atomic/barrier in function → compile **error**
+  - Has atomic/barrier → compile **warning** (lock-free pattern possible)
+  - Transitive: follows callees 8 levels deep
+- Escape hatches: `volatile` global, `shared struct`, `threadlocal`, `@atomic_*`, `const`
+- spawn inside `@critical` → compile error (direct + transitive via function summaries)
+- spawn inside `async` function → compile error (thread may outlive coroutine)
+- spawn inside interrupt handler → compile error (direct + transitive)
+
+### Condvar — Thread Synchronization
+```zer
+@cond_wait(shared_var, shared_var.count > 0);  // wait for condition
+@cond_signal(shared_var);                       // wake one waiter
+@cond_broadcast(shared_var);                    // wake all waiters
+@cond_timedwait(shared_var, condition, 1000);   // timeout in ms → ?void
+```
+
+### threadlocal — Per-Thread Storage
+```zer
+threadlocal u32 counter;    // each thread has its own copy
+```
+
+### @once — Thread-Safe Init
+```zer
+@once {
+    global_config = load_defaults();
+}
+```
+
+### Barrier — Thread Sync Point
+```zer
+Barrier bar;                // keyword type (like Arena, Pool)
+@barrier_init(bar, 3);     // 3 threads must arrive
+@barrier_wait(bar);         // blocks until all 3 call wait
+```
+- `Barrier` is a builtin type — checker validates `@barrier_init`/`@barrier_wait` args are `Barrier` type.
+- Using wrong type (e.g., `u32`) → compile error.
+
+### Semaphore — Counting Semaphore
+```zer
+Semaphore(3) dma_channels;    // 3 resources available
+@sem_acquire(dma_channels);   // blocks until count > 0, decrements
+@sem_release(dma_channels);   // increments, wakes one waiter
+
+// Pointer param support:
+void use_resource(*Semaphore s) {
+    @sem_acquire(s);
+    @sem_release(s);
+}
+```
+- `Semaphore(0)` valid — producer-consumer pattern (start empty, producer releases).
+- Thread-safe: has own mutex + condvar internally.
+- Type-checked: `@sem_acquire` only accepts `Semaphore` or `*Semaphore`.
+
+### Atomics
+```zer
+@atomic_store(&flag, 1);
+u32 val = @atomic_load(&flag);
+@atomic_add(&counter, 1);
+bool swapped = @atomic_cas(&lock, 0, 1);
+```
+
+### async/await — Stackless Coroutines
+```zer
+async void blink() {
+    while (true) {
+        led_on();
+        yield;              // pause, resume on next poll
+        led_off();
+        yield;
+    }
+}
+
+u32 main() {
+    _zer_async_blink task;
+    _zer_async_blink_init(&task);
+    while (true) {
+        _zer_async_blink_poll(&task);   // advance one step
+    }
+}
+```
+Zero heap, zero runtime. Each task is a stack-allocated struct (~4-50 bytes).
+
+**`yield` / `await` outside `async` is a compile error** — they only
+make sense inside async functions. Using them in a regular function
+emits nothing useful (no state machine exists), so the compiler rejects
+at the use site rather than silently stripping.
+
+```zer
+void regular() {
+    yield;   // COMPILE ERROR — 'yield' only allowed inside async function
+}
+```
+
+### Deadlock Detection (Compile-Time)
+
+ZER detects when a single statement accesses TWO different shared types — the emitter can only lock one per statement, leaving the other unprotected.
+
+```zer
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+a.x = 1; b.y = 2;          // OK — separate statements, independent locks
+b.y = 2; a.x = 1;          // OK — each statement locks/unlocks independently
+a.x = b.y;                 // COMPILE ERROR — one statement accesses both A and B
+```
+
+Cross-statement ordering is safe because the emitter does lock→op→unlock per statement group — no two different shared types are ever locked simultaneously.
 
 ---
 

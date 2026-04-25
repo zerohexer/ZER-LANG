@@ -22,6 +22,7 @@ WORKDIR /zer
 
 # Copy compiler sources
 COPY *.c *.h Makefile ./
+COPY src/ src/
 COPY test_modules/ test_modules/
 
 # Copy extension sources
@@ -30,11 +31,14 @@ COPY editors/vscode/ /ext/
 # Create platform bin directories
 RUN mkdir -p /ext/bin/win32-x64 /ext/bin/linux-x64 /ext/bin/darwin-x64 /ext/bin/darwin-arm64
 
+# Phase 1 verified-predicate sources (extracted to src/safety/, linked into zerc)
+ENV SAFETY_SRCS="src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c src/safety/escape_rules.c src/safety/provenance_rules.c src/safety/mmio_rules.c src/safety/optional_rules.c src/safety/move_rules.c src/safety/atomic_rules.c src/safety/container_rules.c src/safety/misc_rules.c src/safety/isr_rules.c src/safety/arith_rules.c src/safety/variant_rules.c src/safety/stack_rules.c src/safety/comptime_rules.c src/safety/cast_rules.c src/safety/concurrency_rules.c"
+
 # ---- Windows x64 ----
 RUN x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zerc.exe \
-    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c && \
+    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c $SAFETY_SRCS && \
     x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zer-lsp.exe \
-    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c
+    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS
 
 # Bundle portable GCC for Windows
 RUN cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
@@ -42,22 +46,25 @@ RUN cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
 
 # ---- Linux x64 (native gcc:13) ----
 RUN gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zerc \
-    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c && \
+    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c $SAFETY_SRCS && \
     gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zer-lsp \
-    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c
+    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS
 # Linux users have gcc installed — no need to bundle
 
 # ---- macOS x64 + arm64 ----
 # macOS cross-compilation requires osxcross + macOS SDK (legal gray area).
 # Instead: build as C source bundle — macOS users compile on first run.
-RUN cp lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c ir.c ir_lower.c zerc_main.c zer_lsp.c \
+RUN cp lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c zer_lsp.c \
        lexer.h parser.h ast.h types.h checker.h emitter.h zercheck.h ir.h \
        /ext/bin/darwin-x64/ && \
-    cp /ext/bin/darwin-x64/* /ext/bin/darwin-arm64/ 2>/dev/null; true && \
+    mkdir -p /ext/bin/darwin-x64/src/safety && \
+    cp src/safety/*.c src/safety/*.h /ext/bin/darwin-x64/src/safety/ && \
+    cp -r /ext/bin/darwin-x64/. /ext/bin/darwin-arm64/ 2>/dev/null; true && \
     echo '#!/bin/bash' > /ext/bin/darwin-x64/build.sh && \
     echo 'DIR="$(cd "$(dirname "$0")" && pwd)"' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zerc" "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/ir.c "$DIR"/ir_lower.c "$DIR"/zerc_main.c' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zer-lsp" "$DIR"/zer_lsp.c "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/ir.c "$DIR"/ir_lower.c' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'SAFE="$DIR/src/safety/handle_state.c $DIR/src/safety/range_checks.c $DIR/src/safety/type_kind.c $DIR/src/safety/coerce_rules.c $DIR/src/safety/context_bans.c $DIR/src/safety/escape_rules.c $DIR/src/safety/provenance_rules.c $DIR/src/safety/mmio_rules.c $DIR/src/safety/optional_rules.c $DIR/src/safety/move_rules.c $DIR/src/safety/atomic_rules.c $DIR/src/safety/container_rules.c $DIR/src/safety/misc_rules.c $DIR/src/safety/isr_rules.c $DIR/src/safety/arith_rules.c $DIR/src/safety/variant_rules.c $DIR/src/safety/stack_rules.c $DIR/src/safety/comptime_rules.c $DIR/src/safety/cast_rules.c $DIR/src/safety/concurrency_rules.c"' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zerc" "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/zercheck_ir.c "$DIR"/ir.c "$DIR"/ir_lower.c "$DIR"/zerc_main.c $SAFE' >> /ext/bin/darwin-x64/build.sh && \
+    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zer-lsp" "$DIR"/zer_lsp.c "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/zercheck_ir.c "$DIR"/ir.c "$DIR"/ir_lower.c $SAFE' >> /ext/bin/darwin-x64/build.sh && \
     echo 'echo "ZER: compiled zerc and zer-lsp for macOS"' >> /ext/bin/darwin-x64/build.sh && \
     chmod +x /ext/bin/darwin-x64/build.sh && \
     cp /ext/bin/darwin-x64/build.sh /ext/bin/darwin-arm64/build.sh

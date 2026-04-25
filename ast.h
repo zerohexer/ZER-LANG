@@ -257,6 +257,18 @@ typedef struct {
     SrcLoc loc;
 } EnumVariant;
 
+/* ---- AsmOperand: typed operand binding for structured asm blocks (D-Alpha-7.5 H1+H2) ----
+ * Used by NODE_ASM's inputs[]/outputs[]/clobbers[] arrays.
+ *   Input:    "rcx" = msr_id      → reg_name="rcx", expr=<msr_id>
+ *   Output:   "rax" = result      → reg_name="rax", expr=<result>
+ *   Clobber:  "memory"            → reg_name="memory", expr=NULL */
+typedef struct {
+    const char *reg_name;       /* "rax", "rcx", "memory", etc. — string contents only (no quotes) */
+    size_t reg_name_len;
+    Node *expr;                 /* ZER expression (input rvalue or output lvalue), NULL for clobbers */
+    SrcLoc loc;
+} AsmOperand;
+
 /* ---- Union variant ---- */
 typedef struct {
     const char *name;
@@ -444,31 +456,40 @@ struct Node {
          *   asm("mov %0, %%rax" : "=r"(out) : "r"(in) : "memory");
          *   → is_structured=false, code/code_len capture full content between ( and )
          *
-         * Structured form (D-Alpha-7.5 H1+H3, added 2026-04-25):
+         * Structured form (D-Alpha-7.5 H1+H3 + B/H2, added 2026-04-25):
          *   asm {
-         *       instructions: "tdcall"
-         *       inputs:  { "rax" = subfunc, "rcx" = 1 }     // (planned, B+H2)
-         *       outputs: { "rax" = result }                  // (planned, B+H2)
-         *       clobbers: ["rdx", "memory"]                  // (planned, B+H4)
-         *       safety: "Intel TDX vp_info per TDX Spec v1.0 §7.2.2"
+         *       instructions: "rdmsr"
+         *       inputs:  { "rcx" = msr_id }
+         *       outputs: { "rax" = low, "rdx" = high }
+         *       clobbers: ["memory"]
+         *       safety: "RDMSR — Intel SDM Vol 3 §35.1, requires CPL=0"
          *   }
          *   → is_structured=true; instructions/safety required, others optional
          *
          * Session A scope: parse instructions: + safety: only.
-         * Session B+ adds inputs/outputs/clobbers parsing.
+         * Session B scope (this commit): inputs/outputs/clobbers + type checking.
+         * Session C+: per-arch register table validation (H4).
          * After Phase 2: 13 Z-rules + 8 categories work on these typed fields. */
         struct {
             /* Inline form fields (legacy + still primary path) */
             const char *code;          /* asm content between ( and ) — inline form only */
             size_t code_len;
 
-            /* Structured form fields (H1+H3 baseline) */
+            /* Structured form fields */
             uint8_t is_structured;     /* 0 = inline `asm("...")`, 1 = structured `asm { ... }` */
             const char *instructions;  /* required for structured form — the asm template */
             size_t instructions_len;
             const char *safety;        /* required for structured form — min 30 chars (S4 rule) */
             size_t safety_len;
-            /* Future (Session B+): inputs[], outputs[], clobbers[] arrays */
+
+            /* Typed operand bindings (Session B / H2).
+             * Each AsmOperand: register name string + ZER expression (NULL for clobbers). */
+            AsmOperand *inputs;
+            int input_count;
+            AsmOperand *outputs;
+            int output_count;
+            AsmOperand *clobbers;       /* expr is NULL — register-name-only entries */
+            int clobber_count;
         } asm_stmt;
 
         /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */

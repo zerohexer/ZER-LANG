@@ -1,0 +1,56 @@
+// D-Alpha-7.5 Session B: typed operand bindings (inputs/outputs/clobbers).
+// Tests use real x86_64 instructions because Docker runs on x86_64 host.
+//
+// Output binding: asm writes to register, value flows to ZER variable.
+// Input binding: ZER expression evaluated, value placed in register before asm.
+// Clobber: tells GCC which registers/memory the asm modifies (so it doesn't
+//          assume they're preserved across the asm).
+
+// Naked fns can't have local vars — bind asm operands to globals.
+u64 g_result = 0;
+u64 g_input = 7;
+u64 g_doubled = 0;
+
+// Output: load immediate 42 into rax, then bind rax → g_result.
+naked void load_constant() {
+    asm {
+        instructions: "movq $42, %0"
+        outputs: { "rax" = g_result }
+        safety: "Test asm output binding by loading immediate 42 into rax register"
+    }
+}
+
+// Input + Output: read g_input into rax, double it, write back to g_doubled.
+// Uses lea (load effective address) for the doubling — fast on x86_64.
+naked void double_input() {
+    asm {
+        instructions: "leaq (%1, %1), %0"
+        outputs: { "rax" = g_doubled }
+        inputs:  { "rcx" = g_input }
+        safety: "Double g_input via leaq — used as a portable shift-by-1 idiom"
+    }
+}
+
+// Clobber example: xchg modifies the destination register.
+// "memory" clobber tells GCC the asm may touch memory not visible in operands.
+naked void use_clobbers() {
+    asm {
+        instructions: "movq $99, %0"
+        outputs: { "rax" = g_result }
+        clobbers: ["memory"]
+        safety: "Set g_result to 99 with explicit memory clobber for ordering"
+    }
+}
+
+i32 main() {
+    load_constant();
+    if (g_result != 42) { return 1; }
+
+    double_input();
+    if (g_doubled != 14) { return 2; }   // g_input=7, doubled=14
+
+    use_clobbers();
+    if (g_result != 99) { return 3; }
+
+    return 0;
+}

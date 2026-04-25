@@ -9193,6 +9193,51 @@ static void check_stmt(Checker *c, Node *node) {
                     "describe what the asm does and cite hardware spec/manual "
                     "(D-Alpha-7.5 S4 rule, audit-trail requirement)");
             }
+            /* D-Alpha-7.5 Session B / H2: type-check operand bindings.
+             * Each input/output must be integer-typed (Session B scope = scalars).
+             * Per-arch register name validation deferred to Session C (H4). */
+            for (int i = 0; i < node->asm_stmt.input_count; i++) {
+                AsmOperand *op = &node->asm_stmt.inputs[i];
+                if (!op->expr) continue;
+                Type *t = check_expr(c, op->expr);
+                if (t && !type_is_integer(t)) {
+                    checker_error(c, op->loc.line,
+                        "asm input '%.*s' must be integer-typed (Session B scope: "
+                        "scalars only; SIMD/FPU operands deferred to later sessions)",
+                        (int)op->reg_name_len, op->reg_name);
+                }
+            }
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                AsmOperand *op = &node->asm_stmt.outputs[i];
+                if (!op->expr) continue;
+                /* Output must be a mutable lvalue. Accept NODE_IDENT (variable),
+                 * NODE_FIELD, NODE_INDEX. Reject literals/calls/expressions. */
+                if (op->expr->kind != NODE_IDENT && op->expr->kind != NODE_FIELD
+                    && op->expr->kind != NODE_INDEX && op->expr->kind != NODE_UNARY) {
+                    checker_error(c, op->loc.line,
+                        "asm output '%.*s' must be a writable lvalue "
+                        "(variable, struct field, array element, or *ptr)",
+                        (int)op->reg_name_len, op->reg_name);
+                    continue;
+                }
+                Type *t = check_expr(c, op->expr);
+                if (t && !type_is_integer(t)) {
+                    checker_error(c, op->loc.line,
+                        "asm output '%.*s' must be integer-typed (Session B scope: "
+                        "scalars only)",
+                        (int)op->reg_name_len, op->reg_name);
+                }
+            }
+            /* Clobbers: just register name strings — no expression to check.
+             * Per-arch validity deferred to Session C. Session B accepts any
+             * non-empty string. */
+            for (int i = 0; i < node->asm_stmt.clobber_count; i++) {
+                AsmOperand *op = &node->asm_stmt.clobbers[i];
+                if (op->reg_name_len == 0) {
+                    checker_error(c, op->loc.line,
+                        "asm clobber entry must be non-empty register name string");
+                }
+            }
         }
         break;
 

@@ -1862,12 +1862,27 @@ static Node *parse_statement(Parser *p) {
             n->asm_stmt.instructions_len = 0;
             n->asm_stmt.safety = NULL;
             n->asm_stmt.safety_len = 0;
+            n->asm_stmt.inputs = NULL;
+            n->asm_stmt.input_count = 0;
+            n->asm_stmt.outputs = NULL;
+            n->asm_stmt.output_count = 0;
+            n->asm_stmt.clobbers = NULL;
+            n->asm_stmt.clobber_count = 0;
 
-            /* Parse key: value pairs until `}`. Session A handles instructions: + safety:. */
+            /* Stack-first dynamic buffers for operand arrays (CLAUDE.md rule #7). */
+            AsmOperand stk_inputs[8], stk_outputs[8], stk_clobbers[8];
+            AsmOperand *inputs = stk_inputs;
+            AsmOperand *outputs = stk_outputs;
+            AsmOperand *clobbers = stk_clobbers;
+            int in_cap = 8, out_cap = 8, cl_cap = 8;
+            int in_n = 0, out_n = 0, cl_n = 0;
+            bool inputs_heap = false, outputs_heap = false, clobbers_heap = false;
+
+            /* Parse key: value pairs until `}`. */
             while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
                 if (!check(p, TOK_IDENT)) {
                     error_at(p, &p->current,
-                        "expected key (instructions:/safety:) inside asm block");
+                        "expected key (instructions:/safety:/inputs:/outputs:/clobbers:) inside asm block");
                     advance(p);
                     continue;
                 }
@@ -1877,51 +1892,120 @@ static Node *parse_statement(Parser *p) {
 
                 if (key.length == 12 && memcmp(key.start, "instructions", 12) == 0) {
                     if (!check(p, TOK_STRING)) {
-                        error_at(p, &p->current,
-                            "expected string literal after 'instructions:'");
+                        error_at(p, &p->current, "expected string literal after 'instructions:'");
                     } else {
-                        n->asm_stmt.instructions = p->current.start + 1;     /* skip leading " */
-                        n->asm_stmt.instructions_len = p->current.length - 2;/* strip both " */
+                        n->asm_stmt.instructions = p->current.start + 1;
+                        n->asm_stmt.instructions_len = p->current.length - 2;
                         advance(p);
                     }
                 } else if (key.length == 6 && memcmp(key.start, "safety", 6) == 0) {
                     if (!check(p, TOK_STRING)) {
-                        error_at(p, &p->current,
-                            "expected string literal after 'safety:'");
+                        error_at(p, &p->current, "expected string literal after 'safety:'");
                     } else {
                         n->asm_stmt.safety = p->current.start + 1;
                         n->asm_stmt.safety_len = p->current.length - 2;
                         advance(p);
                     }
                 } else if ((key.length == 6 && memcmp(key.start, "inputs", 6) == 0) ||
-                           (key.length == 7 && memcmp(key.start, "outputs", 7) == 0) ||
-                           (key.length == 8 && memcmp(key.start, "clobbers", 8) == 0)) {
-                    error_at(p, &key,
-                        "asm block keys 'inputs:', 'outputs:', 'clobbers:' "
-                        "are reserved for D-Alpha-7.5 Session B+ (typed operands). "
-                        "Session A supports only 'instructions:' and 'safety:'.");
-                    /* skip the value (tolerate { } [ ] grouping) */
-                    int paren = 0, brace = 0, bracket = 0;
-                    while (!check(p, TOK_EOF) &&
-                           !(paren == 0 && brace == 0 && bracket == 0 &&
-                             (check(p, TOK_RBRACE) || check(p, TOK_IDENT)))) {
-                        if (check(p, TOK_LPAREN)) paren++;
-                        else if (check(p, TOK_RPAREN)) paren--;
-                        else if (check(p, TOK_LBRACE)) brace++;
-                        else if (check(p, TOK_RBRACE) && brace > 0) brace--;
-                        else if (check(p, TOK_LBRACKET)) bracket++;
-                        else if (check(p, TOK_RBRACKET)) bracket--;
-                        advance(p);
+                           (key.length == 7 && memcmp(key.start, "outputs", 7) == 0)) {
+                    /* inputs:  { "reg" = expr, "reg" = expr, ... }
+                     * outputs: { "reg" = lvalue, ... }    — same parser, semantics differ in checker */
+                    bool is_outputs = (key.length == 7);
+                    consume(p, TOK_LBRACE, is_outputs
+                        ? "expected '{' to open outputs block"
+                        : "expected '{' to open inputs block");
+                    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+                        if (!check(p, TOK_STRING)) {
+                            error_at(p, &p->current,
+                                "expected register name string (e.g., \"rax\") in operand binding");
+                            advance(p);
+                            continue;
+                        }
+                        AsmOperand op;
+                        op.reg_name = p->current.start + 1;
+                        op.reg_name_len = p->current.length - 2;
+                        op.loc.line = p->current.line;
+                        advance(p); /* consume register name string */
+                        consume(p, TOK_EQ, "expected '=' between register and operand value");
+                        op.expr = parse_expression(p);
+
+                        /* Add to appropriate array — grow if needed. */
+                        AsmOperand **arr = is_outputs ? &outputs : &inputs;
+                        int *cap = is_outputs ? &out_cap : &in_cap;
+                        int *cnt = is_outputs ? &out_n : &in_n;
+                        bool *heap = is_outputs ? &outputs_heap : &inputs_heap;
+                        AsmOperand *stk = is_outputs ? stk_outputs : stk_inputs;
+                        if (*cnt >= *cap) {
+                            int new_cap = *cap * 2;
+                            AsmOperand *new_arr = (AsmOperand *)parser_alloc(p, new_cap * sizeof(AsmOperand));
+                            if (!new_arr) break;
+                            memcpy(new_arr, *arr, *cnt * sizeof(AsmOperand));
+                            *arr = new_arr;
+                            *cap = new_cap;
+                            *heap = true;
+                            (void)stk;
+                        }
+                        (*arr)[(*cnt)++] = op;
+                        if (!match(p, TOK_COMMA)) break;
                     }
+                    consume(p, TOK_RBRACE, is_outputs
+                        ? "expected '}' to close outputs block"
+                        : "expected '}' to close inputs block");
+                } else if (key.length == 8 && memcmp(key.start, "clobbers", 8) == 0) {
+                    /* clobbers: ["rdx", "memory", "cc"] */
+                    consume(p, TOK_LBRACKET, "expected '[' to open clobbers list");
+                    while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
+                        if (!check(p, TOK_STRING)) {
+                            error_at(p, &p->current,
+                                "expected register name string in clobbers list (e.g., \"memory\")");
+                            advance(p);
+                            continue;
+                        }
+                        AsmOperand op;
+                        op.reg_name = p->current.start + 1;
+                        op.reg_name_len = p->current.length - 2;
+                        op.expr = NULL;
+                        op.loc.line = p->current.line;
+                        advance(p); /* consume name */
+                        if (cl_n >= cl_cap) {
+                            int new_cap = cl_cap * 2;
+                            AsmOperand *new_arr = (AsmOperand *)parser_alloc(p, new_cap * sizeof(AsmOperand));
+                            if (!new_arr) break;
+                            memcpy(new_arr, clobbers, cl_n * sizeof(AsmOperand));
+                            clobbers = new_arr;
+                            cl_cap = new_cap;
+                            clobbers_heap = true;
+                        }
+                        clobbers[cl_n++] = op;
+                        if (!match(p, TOK_COMMA)) break;
+                    }
+                    consume(p, TOK_RBRACKET, "expected ']' to close clobbers list");
                 } else {
                     error_at(p, &key,
-                        "unknown asm block key — expected 'instructions:' or 'safety:'");
-                    /* skip until next ident or } */
+                        "unknown asm block key — expected 'instructions:', 'safety:', 'inputs:', 'outputs:', or 'clobbers:'");
                     while (!check(p, TOK_RBRACE) && !check(p, TOK_IDENT) && !check(p, TOK_EOF))
                         advance(p);
                 }
             }
             consume(p, TOK_RBRACE, "expected '}' to close asm block");
+
+            /* Move final arrays to permanent arena storage. */
+            if (in_n > 0) {
+                n->asm_stmt.inputs = (AsmOperand *)arena_alloc(p->arena, in_n * sizeof(AsmOperand));
+                memcpy(n->asm_stmt.inputs, inputs, in_n * sizeof(AsmOperand));
+                n->asm_stmt.input_count = in_n;
+            }
+            if (out_n > 0) {
+                n->asm_stmt.outputs = (AsmOperand *)arena_alloc(p->arena, out_n * sizeof(AsmOperand));
+                memcpy(n->asm_stmt.outputs, outputs, out_n * sizeof(AsmOperand));
+                n->asm_stmt.output_count = out_n;
+            }
+            if (cl_n > 0) {
+                n->asm_stmt.clobbers = (AsmOperand *)arena_alloc(p->arena, cl_n * sizeof(AsmOperand));
+                memcpy(n->asm_stmt.clobbers, clobbers, cl_n * sizeof(AsmOperand));
+                n->asm_stmt.clobber_count = cl_n;
+            }
+            (void)inputs_heap; (void)outputs_heap; (void)clobbers_heap;
             return n;
         }
 

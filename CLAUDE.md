@@ -2150,15 +2150,25 @@ grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c \
 |---|---|---|
 | Slice bounds check | 2045-2067 | `IR_INDEX_READ` + `emit_rewritten_node` NODE_INDEX |
 | Array bounds (variable index) | 2020-2044 | Separate `emit_auto_guards` pass |
-| Signed div overflow (INT_MIN/-1) | 1068 | `IR_BINOP` TOK_SLASH/TOK_PERCENT |
-| Division by zero | 1055 | checker forces compile-time guard (no IR work) |
-| Shift safety (`_zer_shl`/`_zer_shr`) | 1078 | `IR_BINOP` TOK_LSHIFT/TOK_RSHIFT |
+| Signed div overflow (INT_MIN/-1) — binary | 1068 | `IR_BINOP` TOK_SLASH/TOK_PERCENT (BUG-608) |
+| Signed compound div/mod (INT_MIN/-1) | 1361-1373 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612) |
+| Division by zero — binary | 1055 | checker forces compile-time guard (no IR work) |
+| Division by zero — compound | 1361-1372 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612, defense in depth) |
+| Shift safety (binary `<<`/`>>`) | 1078 | `IR_BINOP` TOK_LSHIFT/TOK_RSHIFT (BUG-608) |
+| Compound shift (`<<=`/`>>=`) | 1375-1407 | `emit_rewritten_node` NODE_ASSIGN TOK_LSHIFTEQ/TOK_RSHIFTEQ (BUG-612) |
 | Slice `arr[a..b]` range check | 2258 | `emit_rewritten_node` NODE_SLICE |
 | @inttoptr MMIO range (variable addr) | 2650 | `emit_rewritten_node` @inttoptr intrinsic |
 | @inttoptr alignment | 2660 | Same site as above |
 | @ptrcast type mismatch | 2410, 2547 | checker catches via provenance |
 | @trap / @probe | 2694, 2696 | IR handlers present and working |
 | Handle gen check | inlined in `_zer_slab_get` | runtime-level, emit-path-independent |
+
+**Lesson (BUG-612):** When auditing safety wrappers between AST and IR
+paths, ALWAYS check both binary AND compound-assign forms of each operator.
+`<<` and `<<=` are different switch cases in `emit_rewritten_node` (NODE_BINARY
+vs NODE_ASSIGN handlers) and one fix often misses the other. BUG-608 fixed
+binary forms in May; BUG-612 fixed the compound siblings the principle-first
+audit caught afterwards.
 
 ### Testing that catches this class
 

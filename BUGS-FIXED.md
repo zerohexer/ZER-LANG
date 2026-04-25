@@ -98,6 +98,46 @@ Test: `tests/zer_fail/_verify_BUG-609_goto_into_arm.zer`.
 
 **Tests after this session:** 477 ZER integration (positive+negative+trap+warn+no-warn) + 3,649 total across full `make docker-check`. VST proofs: zero admits across 23 verification files.
 
+### BUG-612 — compound `<<= >>= /= %=` missed safety wrappers in IR path (sibling of BUG-608)
+
+**Symptom:** `x <<= 35;` for u32 emitted as raw `x <<= n;` C — UB per C standard. At GCC -O0 hardware shift masking gives x = 8 (non-zero, spec violation). At -O2 GCC sometimes accidentally constant-folds to spec-correct, but it's not guaranteed across compilers / GCC versions / archs. Same class for `>>=`, `/=`, `%=`.
+
+**Found by:** Parallel `claude/quirky-hypatia-Gq04A` session running the principle-first audit pattern documented in CLAUDE.md "AST→IR Emission Diff Audit". BUG-608 (5HwfE) had been framed around binary operators only — `<<`, `>>`, `/`, `%` in `emit_rewritten_node`. The compound-assign forms (`<<=`, `>>=`, `/=`, `%=`) hit a different switch case (NODE_ASSIGN handler at line 5516+, not the NODE_BINARY handler at line 5092+), so the BUG-608 fix didn't apply.
+
+**Reproducer (tests/zer/_verify_BUG-612_compound_shift_div.zer):**
+```zer
+i32 main() {
+    u32 x = 1;
+    u32 n = 35;
+    for (u32 k = 0; k < 1; k += 1) { n = 35; }   // defeat constant-prop
+    x <<= n;
+    if (x != 0) { return 1; }                     // spec: shift>=width = 0
+    return 0;
+}
+```
+Pre-fix: passes at -O2 (GCC folds), fails at -O0 (hardware mask → x=8). Post-fix: passes at every -O level because `_zer_shl` enforces the spec.
+
+**Fix (emitter.c, ~80 lines):**
+- TOK_LSHIFTEQ/TOK_RSHIFTEQ: emit `target = _zer_shl(target, value)` (or `_zer_shr`). Pointer-hoist for side-effectful targets (defense in depth — IR lowering normally extracts call/orelse, but this guards against future regression).
+- TOK_SLASHEQ/TOK_PERCENTEQ: emit statement expression with div-by-zero trap. For signed types, hoist target via `__typeof__`, check INT_MIN per width (8/16/32/64), trap with "signed division overflow".
+
+Mirrors `emit_expr` lines 1361-1407 exactly — same machinery, different switch case.
+
+**Tests added:**
+- `tests/zer/_verify_BUG-612_compound_shift_div.zer` — positive: shift >= width returns 0 across var, struct field, array element targets
+- `tests/zer_trap/_verify_BUG-612_compound_signed_div.zer` — `INT_MIN /= -1` must trap (exit 133 SIGTRAP)
+- `tests/zer_trap/_verify_BUG-612_compound_signed_mod.zer` — `INT_MIN %= -1` must trap
+
+**Doc updates:**
+- CLAUDE.md "AST→IR Emission Diff Audit" table extended with separate rows for binary vs compound forms (BUG-608 vs BUG-612 marked)
+- New lesson at table bottom: "ALWAYS check both binary AND compound-assign forms of each operator. `<<` and `<<=` are different switch cases."
+
+**Verification:** Reproduced bug on main pre-fix at -O0 (exit 1, hardware mask). Applied fix from parallel session (verified proper, not hacky — pointer-hoist defense in depth, mirrors emit_expr exactly). All 3 tests pass post-fix at every -O level. Full `make docker-check` exits 0 with 1,302 PASS / 0 FAIL (was 1,299, +3).
+
+**Pattern lesson:** Same class as BUG-608 — IR emit_rewritten_node misses safety wrappers when it short-circuits emit_expr. Future audit should grep for ALL safety wrappers in emit_expr and confirm IR-equivalent emission has them. CLAUDE.md table now lists these row-by-row to prevent the next regression.
+
+**Tests after this commit:** 480 ZER integration (was 477, +3 BUG-612 tests). 1,302 total visible PASS lines across `make docker-check`.
+
 ---
 
 ## Session 2026-04-23 — `unsafe asm` keyword required (feature, not bug)

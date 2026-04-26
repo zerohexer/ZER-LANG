@@ -421,40 +421,88 @@
 >
 > Strict mode means **strict on what's wrong, permissive on what's right**.
 
-> ## `@verified_spec` DEPRIORITIZED 2026-04-26 — read this before reading any Tier B/C section
+> ## `@verified_spec` / Tier B / Tier C — DROPPED FROM PLAN 2026-04-27 (audience mismatch)
 >
-> **`@verified_spec` is NOT load-bearing for ZER's safety claim.** It was originally scoped as Tier B/C (v1.0.1 / v1.1+) in this document. After the question "why do we need it if 29+1 systems + Phase 7 + System #30 already cover everything?" — answer: we don't, for safety. `@verified_spec` covers a separate orthogonal dimension (algorithm correctness — does the code compute what its name claims), which is NOT what 29+1 systems prove (they prove safety — no UAF, no race, no UB).
+> **Final decision: `@verified_spec` is NOT shipping. Not deferred — DROPPED.**
 >
-> **What 29+1 + Phase 7 + System #30 actually deliver (no `@verified_spec` needed):**
-> - All language safety: memory, type, handle, move, escape, provenance, MMIO, qualifier, ABI compliance
-> - All concurrency safety: races, deadlock, atomic ordering (with System #30)
-> - All hardware-correctness rules for asm: 18 structural + 13 Z-rules + 8 categories
-> - Operationally proven at seL4/RustBelt depth (Phase 7)
+> Earlier (2026-04-26) deprioritization moved `@verified_spec` from v1.0/v1.1 to v2.x+ specialty. Further analysis (2026-04-27) shows the right call is to drop it entirely from the roadmap.
 >
-> **What `@verified_spec` adds on top (orthogonal):**
-> - Algorithm correctness — "this asm IS aes-128", "this binary_search actually finds the target"
-> - Constant-time guarantees — needed for crypto side-channel resistance
-> - Niche, ~1-2% of asm uses
+> ### Reasoning
 >
-> **Revised priority:** `@verified_spec` is a v2.x+ specialty feature, NOT v1.0/v1.1 critical-path. The 99% of users (kernel/firmware/embedded) get all the safety they need from 29+1 + Phase 7 + System #30. The 1% (crypto, safety-critical avionics) can opt into `@verified_spec` when v2.x ships, OR use `cinclude` to link Vale-verified C code in v1.x.
+> ZER's audience is C developers writing kernel/firmware/embedded/application code. They are systems engineers, not formal-methods specialists. `@verified_spec` would require them to write Coq/F*/Vale-tier specifications:
 >
-> **What ZER claims after Phase 7 + System #30 land (no `@verified_spec`):**
+> ```zer
+> @verified_spec {
+>     requires: arr is sorted ascending
+>     ensures: result == Some i ⟹ arr[i] == target
+>     ensures: result == null ⟹ ∀j ∈ [0, arr.len): arr[j] != target
+> }
+> fn search(const []u32 arr, u32 target) -> ?u32 { ... }
+> ```
+>
+> C developers don't write `∀j ∈ [0, arr.len)` style logic. Even with AI assistance, the conceptual model (proof-as-value, decidable propositions, refinement types) is foreign to systems engineering training. Real-world data point: dependent-type and theorem-prover languages (Idris, Agda, Coq, ATS) have ~10s of users each despite decades of effort. SPARK Ada (refinement types, less burden) has thousands but still niche.
+>
+> ### What this means for the safety claim
+>
+> ZER's claim STAYS at:
 >
 > > "ZER provides 100% language safety through 30 compile-time tracking systems, all operationally proven in Coq + Iris. Memory, type, resource, concurrency, MMIO, atomic ordering, and ABI safety are all enforced at compile time. Algorithm correctness (does the code compute what its name claims) is the developer's responsibility — same scope as Rust, Ada, Zig, and all other safe languages."
 >
-> This is a strictly stronger claim than Rust makes today. No `@verified_spec` required for it.
+> **This is already STRICTLY STRONGER than Rust** because Rust's safety claim doesn't include MMIO, atomic ordering, qualifier preservation, ABI compliance, or instruction-level UB. ZER without `@verified_spec` is at the seL4 safety tier, the gold standard for systems-language safety claims.
 >
-> **All Tier B / Tier C / `@verified_spec` references below are KEPT FOR CONTEXT** — they describe how the feature would work IF/WHEN it ships. But they are NOT critical-path for the v1.0/v1.1 safety claim. Treat them as "v2.x+ feature spec" not "v1.x must-build."
+> Algorithm correctness — the dimension `@verified_spec` would have addressed — is the same scope every safe language draws. Rust doesn't promise correctness either. Neither does Ada/SPARK without specific opt-in. Same as Zig. C devs are familiar with this boundary.
 >
-> **Rationale for the change:** the 29+1 + Phase 7 cover the user's actual bug list (kernel/firmware/embedded). Algorithm correctness is a SPECIALTY concern. Conflating safety with algorithm proof was an over-claim. The reframe makes ZER's actual capabilities clearer to fresh sessions and external readers.
+> ### Tier C use cases that are now NOT in scope
 >
-> **What stays critical-path:**
-> - 18 structural asm rules (Sessions A/B/D/E shipped in part; rest pending Sessions F+)
-> - 13 Z-rules wiring 29 systems through asm operand boundaries (8 of 13 done in E1+E2+E2b)
-> - 8 universal precondition categories (Session F)
-> - System #30 Atomic Ordering (Session G)
-> - Per-arch register tables (Session C)
-> - Phase 7 deepening to operational depth
+> | Use case | What ZER says |
+> |---|---|
+> | Crypto correctness proofs (AES, ChaCha) | Use Vale or F* externally, link via `cinclude` |
+> | Constant-time crypto guarantees | Same — external proof framework + `cinclude` |
+> | DO-178C / IEC 62304 functional correctness | Same — external proof tool of choice |
+> | Distributed consensus invariants | Same |
+> | Compiler optimization correctness | Same |
+>
+> **The 1-2% of users who need this can use Vale/F*/Coq externally.** Their output is verified C/asm; ZER's `cinclude` brings that into a ZER program with explicit `UNSAFE-EXTERN` markers. Architectural separation: ZER does language safety; specialist tools do algorithm correctness.
+>
+> ### What stays in the roadmap
+>
+> | Item | Status |
+> |---|---|
+> | 18 structural asm rules | Shipping in Sessions D/F |
+> | 13 Z-rules wiring 29 safety systems through asm | 10/13 wired (E1-E3); 3 forward-compat |
+> | 8 universal precondition categories | Framework F1a done; data F4 pending |
+> | System #30 Atomic Ordering | Session G (~80 hrs) |
+> | Per-arch register tables (3 archs) | x86_64 ✓; aarch64 base ✓; RISC-V pending F6 |
+> | Phase 7 operational depth | Ongoing |
+> | C4 universal feature/arch framework | ✓ proven 2026-04-27 |
+>
+> **Tier B / Tier C / `@verified_spec`: not on the roadmap. Period.**
+>
+> ### Tier C reference context (for fresh sessions)
+>
+> If a fresh session asks "what was Tier C?", here's the historical record:
+>
+> Tier C was the proposed `@verified_spec` per-block opt-in for algorithm correctness verification. Originally Tier B (v1.0.1, selective on ~20 critical intrinsics) and Tier C (v1.1+, per-block opt-in on user code). Both dropped 2026-04-27 due to audience mismatch.
+>
+> Equivalent existing systems C devs can use externally:
+> - **Vale** (Microsoft Research): F* + Z3 + OCaml stack for verified asm crypto
+> - **F\*** (Microsoft Research): used for Project Everest TLS stack
+> - **Dafny** (Microsoft Research): refinement types + automatic proof, used for AWS Encryption SDK
+> - **SPARK Ada**: refinement types + flow analysis, used for Boeing 777 / NASA Mars rovers
+> - **Coq / Isabelle** (theorem provers): used for seL4 / CompCert
+>
+> All of these require formal-methods training to use. ZER intentionally does NOT make C developers learn theorem-proving languages to ship safe code. ZER's strict mode (Tier A) catches the bugs that matter without proof construction.
+>
+> ### Rationale anchor (so this decision doesn't drift back)
+>
+> The dependent-types / refinement-types / theorem-prover discussion happened across multiple turns in 2026-04-26/27 sessions. Conclusion logged here for future sessions:
+>
+> 1. **Refinement types (SPARK style)** — closer to C dev mental model than dependent types. Could fit ZER if pursued. ~200 hrs investment. **NOT planned today** but architecturally compatible if demand emerges.
+> 2. **Dependent types (Idris/Agda style)** — locks out C devs. Even AI-assisted, the proof construction burden is high. **REJECTED.**
+> 3. **`@verified_spec`** (Vale-tier per-block) — same audience problem as dependent types. **DROPPED.**
+> 4. **Tier A (current plan) + external Vale/F* for the 1-2% who need correctness proofs** — clean separation of concerns. **CHOSEN.**
+>
+> ZER ships at Rust + Ada + Zig safety scope (already stricter than any of them via 30 tracking systems). Algorithm correctness is the developer's responsibility, augmentable via external tools when truly needed.
 >
 > Everything in this document still describes those critical-path items. The `@verified_spec` references are now optional v2.x+ context.
 

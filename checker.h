@@ -183,6 +183,13 @@ typedef struct {
     int container_inst_capacity;
 
     uint32_t stack_limit;   /* --stack-limit N: error when estimated stack > N bytes (0 = disabled) */
+    uint32_t target_features; /* C4-minimum: ZerCpuFeature bitmap from --target-features=... CLI flag.
+                               * Affects asm register validation (F7 looks up against AVX-512 table when
+                               * ZER_FEAT_AVX512F is set, etc.) AND emitter target attribute generation.
+                               * 0 = base arch only (default). */
+    int target_arch;          /* Universality proof: ZerArchId from --target-arch=... CLI flag.
+                               * 0/1=x86_64 (default), 2=aarch64, 3=riscv64. F7 register validation
+                               * dispatches by this. Cross-arch emit uses arch-specific gcc binary. */
 
     /* Deadlock analysis: per-function shared type cache (BUG-474 proper fix).
      * Pre-computed set of shared struct type_ids each function transitively touches.

@@ -225,6 +225,10 @@ int main(int argc, char **argv) {
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
+    uint32_t zer_target_features = 0;  /* C4-minimum: --target-features bitmap */
+    char zer_extra_gcc_flags[256] = "";  /* C4-minimum: extra -m flags for GCC at emit time */
+    int zer_target_arch_id = 1;  /* ZER_ARCH_X86_64 = 1 default; 2=aarch64, 3=riscv64 */
+    const char *zer_target_arch_gcc = NULL;  /* override gcc binary for cross-arch */
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -250,6 +254,29 @@ int main(int argc, char **argv) {
             gcc_override = argv[++i];
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
             zer_stack_limit = (uint32_t)atoi(argv[++i]);
+        } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
+            /* C4-minimum proof: comma-separated CPU features. Today
+             * supports only "avx512f". Future: avx512vl, avx512bw, sve,
+             * sve2, rvv, sha, aes, etc. */
+            const char *fl = argv[i] + 18;
+            if (strstr(fl, "avx512f")) {
+                zer_target_features |= (1u << 0);  /* ZER_FEAT_AVX512F */
+                strncat(zer_extra_gcc_flags, " -mavx512f", sizeof(zer_extra_gcc_flags) - strlen(zer_extra_gcc_flags) - 1);
+            }
+        } else if (strncmp(argv[i], "--target-arch=", 14) == 0) {
+            /* Universality proof: per-arch dispatch. Maps the user's
+             * arch choice to ZerArchId for the checker AND to the
+             * appropriate cross-gcc binary for emit-time compilation. */
+            const char *a = argv[i] + 14;
+            if (strcmp(a, "x86_64") == 0) {
+                zer_target_arch_id = 1;  /* ZER_ARCH_X86_64 */
+            } else if (strcmp(a, "aarch64") == 0) {
+                zer_target_arch_id = 2;  /* ZER_ARCH_AARCH64 */
+                zer_target_arch_gcc = "aarch64-linux-gnu-gcc";
+            } else if (strcmp(a, "riscv64") == 0) {
+                zer_target_arch_id = 3;
+                zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
+            }
         }
     }
 
@@ -430,6 +457,8 @@ int main(int argc, char **argv) {
     checker.source = main_mod->source;
     checker.no_strict_mmio = no_strict_mmio;
     checker.stack_limit = zer_stack_limit;
+    checker.target_features = zer_target_features;
+    checker.target_arch = zer_target_arch_id;
 
     /* register in topo order: dependencies first, main last */
     for (int ti = 0; ti < topo_count; ti++) {
@@ -708,6 +737,16 @@ int main(int argc, char **argv) {
         if (!found_bundled) {
             strcpy(gcc_path, "gcc"); /* fall back to system PATH */
         }
+        /* Universality proof: per-arch GCC override via --target-arch
+         * CLI flag. Maps aarch64 -> aarch64-linux-gnu-gcc, riscv64 ->
+         * riscv64-linux-gnu-gcc. Falls back to host gcc otherwise. */
+        if (zer_target_arch_gcc) {
+            strncpy(gcc_path, zer_target_arch_gcc, sizeof(gcc_path) - 1);
+            gcc_path[sizeof(gcc_path) - 1] = '\0';
+            /* Cross-arch: don't pass x86-only feature flags. F5/F6 will
+             * map per-feature flags to the right -m option per arch. */
+            zer_extra_gcc_flags[0] = '\0';
+        }
 
         char gcc_cmd[2048];
         /* Only quote gcc path if it contains spaces (bundled path).
@@ -721,9 +760,9 @@ int main(int argc, char **argv) {
         const char *platform_flags = "";
 #endif
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing%s%s -o \"%s\" \"%s\""
-                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing%s%s -o \"%s\" \"%s\"",
-                 gcc_path, wrap_flags, platform_flags, exe_path, output_path);
+                 need_quote ? "\"%s\" -std=c99 -O2 -fwrapv -fno-strict-aliasing%s%s%s -o \"%s\" \"%s\""
+                            : "%s -std=c99 -O2 -fwrapv -fno-strict-aliasing%s%s%s -o \"%s\" \"%s\"",
+                 gcc_path, wrap_flags, platform_flags, zer_extra_gcc_flags, exe_path, output_path);
         printf("zerc: %s\n", gcc_cmd);
         int gcc_ret = system(gcc_cmd);
 

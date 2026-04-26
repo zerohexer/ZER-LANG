@@ -13,24 +13,11 @@
 #include <string.h>
 #include "asm_register_tables.h"
 
-int zer_asm_register_valid(ZerArchId arch, const char *name, size_t name_len) {
-    if (name == 0) {
-        return 0;
-    }
-    if (name_len == 0) {
-        return 0;
-    }
-
-    const ZerRegisterEntry *table = 0;
-    if (arch == ZER_ARCH_X86_64) {
-        table = zer_x86_64_registers;
-    }
-    /* F5/F6 will add aarch64 / riscv64 dispatch here. */
-
+/* Internal: scan a single table. Linear scan suffices for current N. */
+static int scan_table(const ZerRegisterEntry *table, const char *name, size_t name_len) {
     if (table == 0) {
         return 0;
     }
-
     for (size_t i = 0; table[i].name != 0; i++) {
         if (table[i].name_len != name_len) {
             continue;
@@ -39,5 +26,51 @@ int zer_asm_register_valid(ZerArchId arch, const char *name, size_t name_len) {
             return 1;
         }
     }
+    return 0;
+}
+
+int zer_asm_register_valid(ZerArchId arch, const char *name, size_t name_len) {
+    return zer_asm_register_valid_with_features(arch, ZER_FEAT_NONE, name, name_len);
+}
+
+int zer_asm_register_valid_with_features(
+    ZerArchId arch,
+    uint32_t features,
+    const char *name,
+    size_t name_len)
+{
+    if (name == 0) {
+        return 0;
+    }
+    if (name_len == 0) {
+        return 0;
+    }
+
+    if (arch == ZER_ARCH_X86_64) {
+        /* C4-minimum: feature-aware dispatch. AVX-512F unlocks the
+         * extended table (160 entries vs base 104). Other features
+         * (SHA-NI, AES-NI etc.) added the same way as F4 progresses. */
+        if (features & ZER_FEAT_AVX512F) {
+            if (scan_table(zer_x86_64_avx512f_registers, name, name_len)) {
+                return 1;
+            }
+        }
+        /* Always check base table — AVX-512 table is a superset, but
+         * checking base is defense in depth and keeps base regs
+         * verifiable even if features are incorrectly set. */
+        return scan_table(zer_x86_64_registers, name, name_len);
+    }
+
+    /* aarch64 dispatch — universality proof. Same lookup framework
+     * extends across ISAs. Future SVE/SVE2/SME features added here as
+     * separate per-feature tables (when GCC strictly gates them, like
+     * AVX-512). For now: aarch64 GCC backend accepts SVE register
+     * names without a strict +sve flag, so base table includes them. */
+    if (arch == ZER_ARCH_AARCH64) {
+        return scan_table(zer_aarch64_registers, name, name_len);
+    }
+
+    /* F6 will add riscv64 dispatch — same pattern. */
+
     return 0;
 }

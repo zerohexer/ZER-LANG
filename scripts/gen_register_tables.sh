@@ -23,10 +23,33 @@ CANDIDATES="$ROOT/scripts/candidates_${ARCH}.txt"
 OUTPUT="$ROOT/src/safety/asm_register_tables_${ARCH}.c"
 
 case "$ARCH" in
-    x86_64)   CC="${CC:-gcc}" ;;
-    aarch64)  CC="${CC:-aarch64-linux-gnu-gcc}" ;;
-    riscv64)  CC="${CC:-riscv64-linux-gnu-gcc}" ;;
-    *)        echo "Unknown arch: $ARCH" >&2; exit 1 ;;
+    x86_64)
+        CC="${CC:-gcc}"
+        # EXTRA_CFLAGS plumbing for future feature-enable probes.
+        # Set empty by default — adding `-mavx512f -mavx512vl -mavx512bw`
+        # would unlock 56 more registers (xmm/ymm/zmm 16-31 + k0-7) BUT
+        # zerc's emit-time GCC invocation doesn't pass these flags, so
+        # using those regs in asm would still fail to compile. Honest
+        # AVX-512 support requires per-function CPU feature attributes
+        # (a separate ~6-8 hr feature). Until then, simpler is correct:
+        # validate only what the default GCC backend accepts.
+        # Override with: EXTRA_CFLAGS="-mavx512f" make gen-asm-tables
+        # if the user has manually arranged for AVX-512 emit support.
+        EXTRA_CFLAGS="${EXTRA_CFLAGS:-}"
+        ;;
+    aarch64)
+        CC="${CC:-aarch64-linux-gnu-gcc}"
+        # SVE / SME require -march=armv8-a+sve / +sve2 etc.; defer until
+        # ARM64 candidates list ships in F5.
+        EXTRA_CFLAGS="${EXTRA_CFLAGS:-}"
+        ;;
+    riscv64)
+        CC="${CC:-riscv64-linux-gnu-gcc}"
+        # Vector extension via -march=rv64gcv; defer until F6.
+        EXTRA_CFLAGS="${EXTRA_CFLAGS:-}"
+        ;;
+    *)
+        echo "Unknown arch: $ARCH" >&2; exit 1 ;;
 esac
 
 if ! command -v "$CC" >/dev/null 2>&1; then
@@ -43,11 +66,13 @@ fi
 
 # Probe a single register: compile a tiny C program with the register in
 # the clobber list. Returns 0 if GCC accepts (valid), 1 otherwise.
+# Uses EXTRA_CFLAGS (set per-arch above) so AVX-512 / SVE / RVV regs
+# are recognized when those features are enabled at probe time.
 probe_register() {
     local reg="$1"
     local rc
     echo "void f(void) { __asm__ __volatile__(\"\" ::: \"$reg\"); }" \
-        | "$CC" -x c - -c -o /dev/null 2>/dev/null
+        | "$CC" $EXTRA_CFLAGS -x c - -c -o /dev/null 2>/dev/null
     rc=$?
     return $rc
 }

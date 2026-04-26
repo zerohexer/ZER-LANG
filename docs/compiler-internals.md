@@ -6966,6 +6966,68 @@ fn leaky() {
 **Cumulative Z-rule progress:** 8 of 13 wired (Z3, Z4, Z5, Z6, Z7, Z8, Z11, Z12).
 Remaining: Z9, Z10, Z13 (forward-compat pending S1 relaxation), Z1, Z2 (zercheck_ir.c — Session E3).
 
+## D-Alpha-7.5 Session E3 — Z1 + Z2 IR-layer Z-rules (2026-04-26)
+
+**Status:** 2 IR-layer Z-rules wired in `zercheck_ir.c`. Cumulative: 10 of 13 Z-rules done. Remaining 3 (Z9/Z10/Z13) are forward-compat pending S1 relaxation.
+
+**Why these live in zercheck_ir.c (not checker.c):**
+
+Z1 (Handle UAF) and Z2 (move tracking) are state-machine extensions of Model 1 systems (#7 Handle States, #10 Move Tracking). These systems operate on IR LOCALS via CFG state-machine analysis. zercheck_ir.c is the natural home — it already tracks `IRHandleInfo` per local through the CFG with path-merge logic.
+
+Other Z-rules (Z3-Z13) operate on AST-level point properties (VRP, provenance, escape, context flags, MMIO, qualifier). These live in checker.c.
+
+**The split is documented in CLAUDE.md "Z-Rules" section:**
+- checker.c (11 Z-rules): AST-level
+- zercheck_ir.c (2 Z-rules): IR/CFG state machines
+
+**Implementation pattern:**
+
+NODE_ASM lowers to `IR_NOP{expr=asm_node}` per ir_lower.c (no dedicated IR op — asm body is opaque to IR analysis). zercheck_ir.c's IR_NOP handler was already extending to NODE_SPAWN. Added NODE_ASM branch BEFORE the existing NODE_SPAWN code:
+
+```c
+case IR_NOP: {
+    if (!inst->expr) break;
+    /* Z1+Z2: NODE_ASM passthrough */
+    if (inst->expr->kind == NODE_ASM && inst->expr->asm_stmt.is_structured) {
+        for (each input operand):
+            walk root through field/index/&-of chains
+            find IR local for root NODE_IDENT
+            handle = ir_find_handle(ps, local)
+            /* Z1 */ if (ir_is_invalid(handle)) ir_zc_error("UAF");
+            /* Z2 */ if (move_struct_type AND ALIVE) handle->state = TRANSFERRED;
+        break;
+    }
+    if (inst->expr->kind != NODE_SPAWN) break;
+    /* ... existing NODE_SPAWN passthrough ... */
+}
+```
+
+**Forward-compat status:**
+
+Both Z1 and Z2 are unreachable today because asm is restricted to `naked` functions, which forbid local var-decls and Pool/Slab allocations (V4 audit rule: naked body = asm + return only). Therefore:
+- Handle locals don't exist in naked context (no `pool.alloc()` to create them)
+- Move struct locals don't exist in naked context (no var-decls)
+
+Operands are typed in Session B as integers OR pointers. Handles fit (u64), but in practice no Handle is in scope to pass to the asm. Same for move structs (no struct locals).
+
+When S1 relaxes (asm allowed in regular functions, post Session F+G):
+- `Handle(Task) h = pool.alloc().value; asm{ inputs:{ "rax"=h }, ... }; pool.free(h); asm{ inputs:{ "rax"=h }, ... }` → Z1 fires on the second asm
+- `move struct Token t = ...; asm{ inputs:{ "rax"=t.v }, ... }; t.v;` → Z2 marks `t` TRANSFERRED, subsequent use errors
+
+**Why no test:** test pattern is unconstructable today. Tests will be added with the rest of the forward-compat Z-rules (Z6, Z9, Z10, Z13, Z4, Z5) when S1 relaxes.
+
+**Why ship now (same rationale as Z6, Z4, Z5):**
+- ~50 lines of correct, documented code
+- Activates instantly when S1 relaxes — no retrofit churn
+- Reuses existing helpers (`ir_is_invalid`, `ir_should_track_move`) operationally proven via λZER-handle and λZER-move subsets
+- Same architectural pattern as rest of Z-rule batch — completes the wiring story
+
+**Future-session extension points after E3:**
+- Session F adds 8 universal precondition categories framework + per-arch instruction tables (~150 hrs) — unlocks I1-4, E1-4, O3, O4-5, S5 + Z9 ISR instruction-level checks
+- Session G adds System #30 (Atomic Ordering, ~80 hrs) — closes relaxed-atomic-ordering gap
+- Sessions C, H, I add per-arch register tables + Phase 1 predicate extraction + audit log (~50 hrs)
+- After all of these, S1 relaxes → asm allowed in regular functions → all forward-compat Z-rules activate
+
 ## *opaque safety architecture — wrap pattern + cross-language lifetime tracking (2026-04-26)
 
 **Mental model fresh sessions need:** ZER's `*opaque` story is more nuanced than "98% compile-time, 2% runtime." Two ORTHOGONAL axes that fresh sessions often conflate:

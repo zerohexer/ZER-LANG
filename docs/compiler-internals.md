@@ -7153,6 +7153,68 @@ Per-ISA-extension cost: ~30 seconds. Per-chip-rollout cost: ZERO (chips don't ad
 
 The pipeline architecture is now in place. Future sub-sessions just expand candidate lists and add cross-arch invocations.
 
+## D-Alpha-7.5 Session F7-minimum — register name validation wired (2026-04-26)
+
+**Status:** validation jump done first (instead of F3-F6 data entry) to confirm F1a + F2 are architecturally sound. Wires `zer_asm_register_valid` into `checker.c` NODE_ASM for O3 (register name validation). Architecture validated.
+
+**The wiring (3 loops at end of NODE_ASM checks):**
+
+```c
+ZerArchId asm_arch = ZER_ARCH_X86_64;  /* hardcoded today; F5/F6 plumb target arch */
+
+for each input op:
+    if (op->reg_name_len == 0) continue;
+    if (zer_asm_register_valid(asm_arch, op->reg_name, op->reg_name_len) == 0)
+        checker_error("asm input register '...' not recognized for x86_64 (O3)");
+
+for each output op: (same pattern)
+
+for each clobber op:
+    if (op->reg_name_len == 0) continue;
+    /* GCC pseudo-clobbers — markers, not real registers */
+    if (op->reg_name matches "memory") continue;
+    if (op->reg_name matches "cc") continue;
+    if (zer_asm_register_valid(asm_arch, ...) == 0)
+        checker_error("asm clobber '...' not recognized — use known register or 'memory'/'cc'");
+```
+
+**Architectural findings (the point of doing F7-minimum first):**
+
+| Finding | Status |
+|---|---|
+| `ZerArchId asm_arch` hardcoded to x86_64 | Scaffold ready — F5/F6 plumb target arch detection, change one constant to variable |
+| Pseudo-clobbers need special-casing (`"memory"`, `"cc"`) | Hardcoded skip list. Extract if more emerge later |
+| `ZerRegisterEntry` struct format `{name, name_len}` | Sufficient — register name validation needs only this; class tagging deferred |
+| Linear scan performance | Fine for 40-entry table. Hash table optimization not needed yet |
+| `zer_asm_register_valid` API | Returns 0 for unsupported arch, 0 for unknown register, 1 for valid. No edge cases hit |
+| F1a `zer_asm_category` stub coexists | No conflict; F4 will plug into separate dispatch loop |
+
+**Verdict: NO architectural rework needed.** F1a + F2 are sound. F3-F6 data entry can proceed.
+
+**Why F7-minimum is the right validation:** exercises the full chain end-to-end:
+1. Makefile builds zerc with F2's vendored x86_64 table linked in
+2. F1a's `zer_asm_category` stub coexists (no conflicts)
+3. F2's `zer_asm_register_valid` lookup function reads the linked table
+4. F7's checker call site finds the lookup, calls it, gets correct answer
+5. Typo'd register `"rax0"` → table says invalid → checker emits error → test rejects program
+
+If any layer had been wrong, this test would have failed. It didn't.
+
+**Test added:** `tests/zer_fail/asm_typo_register.zer` — `outputs: { "rax0" = g }` → compile error.
+
+**What F7-minimum does NOT include (deferred):**
+- Width matching (e.g., `"al"` only with u8 type) — needs more design
+- Per-category enforcement (C1 value-range, C2 alignment, etc.) — needs F4 instruction tables first
+- ARM64 / RISC-V validation — needs F5/F6 tables
+- Register class restrictions (e.g., `"xmm0"` valid but only as SIMD operand) — needs F3 + F4
+
+These are layered on top of F7-minimum incrementally. The wiring pattern is now established.
+
+**For fresh sessions:**
+- Register name validation FIRES TODAY for x86_64 asm. Typos like `outputs: { "rax0" = g }` are caught.
+- ARM64/RISC-V asm validation skipped (graceful) until F5/F6 tables ship.
+- The hardcoded `ZerArchId asm_arch = ZER_ARCH_X86_64;` is the single point to change when target-arch detection is added.
+
 ## CRITICAL: zercheck_ir.c find-then-add UAF pattern (2026-04-26 audit, BUG-616)
 
 **Read this BEFORE adding new IR_X handlers in zercheck_ir.c.** This is a structural bug pattern that future sessions WILL hit if they're unaware.

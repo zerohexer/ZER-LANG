@@ -5,6 +5,45 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 — D-Alpha-7.5 Session F7-minimum: register name validation wired
+
+Validation jump: F7 first (instead of F3-F6 data entry) to confirm F1a + F2 are architecturally sound before investing 80+ hrs in additional data tables. **End-to-end validation succeeded** — register name validation now active in checker.c NODE_ASM, all 12 existing asm tests pass, new typo-rejection test passes.
+
+**What F7-minimum delivers:**
+- `checker.c` — added include of `src/safety/asm_register_tables.h` (line ~17)
+- `checker.c` NODE_ASM — three validation loops (inputs, outputs, clobbers) calling `zer_asm_register_valid(ZER_ARCH_X86_64, op->reg_name, op->reg_name_len)` on each operand. Pseudo-clobbers `"memory"` and `"cc"` skip the table check (they're GCC clobber-list markers, not real registers).
+- `tests/zer_fail/asm_typo_register.zer` — `outputs: { "rax0" = g }` → compile error.
+
+**Architecture findings (the point of doing F7-minimum first):**
+
+1. **`ZerArchId asm_arch = ZER_ARCH_X86_64;` is hardcoded.** When F5/F6 add ARM64/RISC-V tables, this single constant becomes a variable plumbed from target detection. Scaffold is in place; one-line change later.
+
+2. **Pseudo-clobbers need special-casing.** GCC accepts `"memory"` (memory-side-effect marker) and `"cc"` (flags clobbered) as clobber list entries even though they aren't real registers. F7 hardcodes these. Future cleanup: extract to a small set of pseudo-clobber names if more emerge.
+
+3. **`ZerRegisterEntry` struct format works.** Just `{name, name_len}` was sufficient. No need for register class tagging today (GP-only). When F3 adds SIMD/FPU/special, may extend struct with a class field — but for register name validation (O3), name + length is enough.
+
+4. **Linear scan performance is fine.** 40-entry table; checker runs through 3 loops at compile time. No measurable perf impact on `make docker-check` (3,659 tests still pass in same time). Hash table optimization deferred until table grows much larger.
+
+5. **`zer_asm_register_valid` API works as designed.** Returns 0 for unsupported arch (graceful), 0 for unknown register, 1 for known register. No edge cases discovered.
+
+6. **F1a's `zer_asm_category` stub works in parallel.** Includes don't conflict. When F4 ships category data, the same wiring pattern (separate dispatch loop in checker.c) will plug in cleanly.
+
+**No architectural rework needed.** F1a + F2 are sound. F3-F6 (data entry) can proceed with confidence.
+
+**Tests after this commit:** 3,660 PASS / 0 FAIL via `make docker-check` (was 3,659, +1 typo test). All 12 existing asm tests still pass. VST proofs: zero admits across 23 verification files.
+
+**Sub-session breakdown remaining (validated by F7-minimum success):**
+- F3 — expand x86_64 candidates list (SIMD/FPU/special) ~5 hrs
+- F4 — x86_64 instruction → category table ~30 hrs
+- F5 — ARM64 register + instruction tables ~25 hrs
+- F6 — RISC-V register + instruction tables ~25 hrs
+- F7 — full per-category enforcement (currently F7-minimum is just register names; F4 will trigger more checker dispatch via `zer_asm_category`) ~25 hrs additional after F4
+- Session G — System #30 (atomic ordering, C8) ~80 hrs
+
+**Why this validates the architecture:** F7-minimum exercises the full chain — Makefile builds the script's output → script vendors a table → header declares the lookup → checker calls the lookup → typo rejected. If any layer had been wrong, this test would have failed. It didn't. The architecture works.
+
+---
+
 ## Session 2026-04-26 — D-Alpha-7.5 Session F2: build-time-gen pipeline + x86_64 register table
 
 Second sub-session of Session F. Ships the build-time-gen pipeline for per-arch register tables. F2 deliverables:

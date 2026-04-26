@@ -7067,6 +7067,92 @@ When S1 relaxes (asm allowed in regular functions, post Session F+G):
 
 **Architectural decision (recapped from asm_plan.md SESSIONS C+F notice):** per-arch tables are AUTO-GENERATED at zerc build time via probe scripts and VENDORED into `src/safety/asm_*_tables_<arch>.c`. zerc binary contains the linked tables; runtime is fast hash lookup. Pattern matches LLVM TableGen, ICU Unicode tables, Linux autoconf, libc++ locale data.
 
+## D-Alpha-7.5 Session F2 — build-time-gen pipeline + x86_64 register table (2026-04-26)
+
+**Status:** pipeline shipped, x86_64 register table populated (40 valid registers vendored). ARM64/RISC-V tables come in F5/F6.
+
+**Files added:**
+
+```
+scripts/
+├── gen_register_tables.sh       # GCC-probe-based generator
+└── candidates_x86_64.txt        # 53 candidate names (GP regs)
+
+src/safety/
+├── asm_register_tables.h        # struct ZerRegisterEntry + extern decls + lookup signature
+├── asm_register_tables_x86_64.c # AUTO-GENERATED, vendored (40 entries)
+└── asm_register_lookup.c        # zer_asm_register_valid linear-scan lookup
+
+Makefile target: make gen-asm-tables
+```
+
+**The probe pattern (the architectural key):**
+
+```bash
+echo "void f(void) { __asm__ __volatile__(\"\" ::: \"$reg\"); }" \
+    | gcc -x c - -c -o /dev/null
+```
+
+GCC's clobber acceptance IS the authoritative oracle. This eliminates the need to maintain per-arch register lists in ZER's source — GCC's backend already knows. We probe at build time, vendor the result.
+
+**Output structure (vendored .c file):**
+
+```c
+#include "asm_register_tables.h"
+
+const ZerRegisterEntry zer_x86_64_registers[] = {
+    {"rax", 3},
+    {"rbx", 3},
+    /* ... 38 more ... */
+    {0, 0}  /* sentinel */
+};
+const size_t zer_x86_64_register_count = 40;
+```
+
+**Lookup function (src/safety/asm_register_lookup.c):**
+
+Linear scan, VST-friendly C style (flat cascade, early returns):
+
+```c
+int zer_asm_register_valid(ZerArchId arch, const char *name, size_t name_len) {
+    if (name == 0) return 0;
+    if (name_len == 0) return 0;
+    const ZerRegisterEntry *table = 0;
+    if (arch == ZER_ARCH_X86_64) table = zer_x86_64_registers;
+    /* F5/F6 will add aarch64 / riscv64 dispatch here. */
+    if (table == 0) return 0;
+    for (size_t i = 0; table[i].name != 0; i++) {
+        if (table[i].name_len != name_len) continue;
+        if (memcmp(table[i].name, name, name_len) == 0) return 1;
+    }
+    return 0;
+}
+```
+
+**Regeneration workflow (when ISA extends):**
+
+```bash
+make gen-asm-tables       # rebuilds tables in Docker
+git diff src/safety/      # review changes
+git commit                # ship
+```
+
+Per-ISA-extension cost: ~30 seconds. Per-chip-rollout cost: ZERO (chips don't add new register names within an ISA).
+
+**For fresh sessions:**
+- Tables are AUTO-GENERATED, **DO NOT EDIT BY HAND**. Modify `scripts/candidates_<arch>.txt` and regenerate.
+- ARM64 needs `aarch64-linux-gnu-gcc` cross-compiler; RISC-V needs `riscv64-linux-gnu-gcc`. Available in Docker images that have these installed.
+- The lookup function is currently linear scan. If table grows large (post-F3 with SIMD/FPU/special), replace with hash table — same interface, better complexity.
+- Phase 1 extraction (Session H) wraps `zer_asm_register_valid` for VST verification against the linked vendored data. Tables are deterministic = lookups are decidable = VST proof tractable.
+
+**What F2 does NOT do:**
+- Wire `zer_asm_register_valid` into checker.c NODE_ASM (deferred to F7)
+- Add ARM64 / RISC-V tables (deferred to F5 / F6)
+- Add SIMD / FPU / special registers to x86_64 (deferred to F3 — expand candidates list)
+- Generate instruction → category tables (deferred to F4 — needs Capstone/XED integration)
+
+The pipeline architecture is now in place. Future sub-sessions just expand candidate lists and add cross-arch invocations.
+
 ## CRITICAL: zercheck_ir.c find-then-add UAF pattern (2026-04-26 audit, BUG-616)
 
 **Read this BEFORE adding new IR_X handlers in zercheck_ir.c.** This is a structural bug pattern that future sessions WILL hit if they're unaware.

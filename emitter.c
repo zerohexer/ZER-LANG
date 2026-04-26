@@ -8354,12 +8354,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_SPAWN: {
-        /* Spawn uses the existing AST-based spawn emission (complex wrapper structs).
-         * For now, fall through to AST emission via the expression. */
-        emit_indent(e);
-        emit(e, "/* IR_SPAWN %.*s — TODO: emit from IR */\n",
-             (int)inst->func_name_len, inst->func_name);
-        break;
+        /* DEAD CODE: ir_lower.c lowers NODE_SPAWN to IR_NOP{expr=spawn_node}
+         * (see ir_lower.c:2716), not IR_SPAWN. The IR_NOP handler does the
+         * real pthread_create emission via emit_rewritten_node on the
+         * carried NODE_SPAWN. This branch is unreachable today; we keep
+         * it as a hard error so any future regression that creates an
+         * IR_SPAWN node fails LOUDLY rather than emitting a TODO comment
+         * that compiles cleanly (silent miscompile). */
+        fprintf(stderr,
+                "INTERNAL ERROR: emit_ir_inst hit IR_SPAWN — ir_lower lowers "
+                "spawn to IR_NOP{expr=NODE_SPAWN}; please report as a bug.\n");
+        abort();
     }
 
     case IR_LOCK: {

@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// slab.alloc() inside @critical block — calloc may deadlock when
+// interrupts are disabled. Wires up zer_alloc_allowed_in_critical
+// predicate (src/safety/isr_rules.c).
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void main() {
+    @critical {
+        ?Handle(Task) mh = tasks.alloc();  // banned: heap alloc with IRQs off
+        if (mh) |h| {
+            tasks.free(h);
+        }
+    }
+}

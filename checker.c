@@ -802,19 +802,38 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_from_arena) dst->is_from_arena = true;
 }
 
-/* ---- ISR ban helper ---- */
+/* ---- ISR / @critical alloc ban helper ---- */
 
-/* Check if we're inside an interrupt handler and reject heap allocation.
- * Returns true if banned (error emitted). Centralizes the 4 ISR check sites.
- * SAFETY: zer_alloc_allowed_in_isr in src/safety/isr_rules.c */
+/* Check if we're inside an interrupt handler OR a @critical block and
+ * reject heap allocation. Wires up TWO Phase-1-extracted predicates:
+ *   - zer_alloc_allowed_in_isr      (in_interrupt context)
+ *   - zer_alloc_allowed_in_critical (critical_depth > 0)
+ * Both predicates live in src/safety/isr_rules.c and are VST-verified.
+ *
+ * Without this, alloc-in-critical was only caught incidentally by the
+ * leak detector — typing.v rule S05 was never enforced at the right
+ * level. Per-site error fires at the actual alloc statement; transitive
+ * cases are still caught by check_body_effects on @critical via
+ * FuncProps callee summaries.
+ *
+ * Returns true if banned (error emitted). Centralizes the 4 alloc sites:
+ * slab.alloc, slab.alloc_ptr, Task.alloc, Task.alloc_ptr. */
 static bool check_isr_ban(Checker *c, int line, const char *method) {
-    if (zer_alloc_allowed_in_isr(c->in_interrupt ? 1 : 0) != 0) {
-        return false;  /* allowed */
+    if (zer_alloc_allowed_in_isr(c->in_interrupt ? 1 : 0) == 0) {
+        checker_error(c, line,
+            "%s not allowed in interrupt handler — "
+            "malloc/calloc may deadlock. Use Pool(T, N) instead", method);
+        return true;
     }
-    checker_error(c, line,
-        "%s not allowed in interrupt handler — "
-        "malloc/calloc may deadlock. Use Pool(T, N) instead", method);
-    return true;
+    if (zer_alloc_allowed_in_critical((int)c->critical_depth) == 0) {
+        checker_error(c, line,
+            "%s not allowed inside @critical block — "
+            "malloc/calloc may deadlock when interrupts are disabled. "
+            "Use Pool(T, N) instead, or move the allocation outside "
+            "@critical", method);
+        return true;
+    }
+    return false;
 }
 
 /* ---- Designated init field validation ---- */
@@ -6869,10 +6888,12 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     case NODE_YIELD:
     case NODE_AWAIT:
         parent_sym->props.can_yield = true;
+        parent_sym->props.has_direct_yield = true;
         return;
 
     case NODE_SPAWN:
         parent_sym->props.can_spawn = true;
+        parent_sym->props.has_direct_spawn = true;
         /* Also scan spawn args for effects */
         for (int i = 0; i < node->spawn_stmt.arg_count; i++)
             scan_func_props(c, node->spawn_stmt.args[i], parent_sym);
@@ -6905,8 +6926,10 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
             const char *mn = node->call.callee->field.field_name;
             uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
             if ((ml == 5 && memcmp(mn, "alloc", 5) == 0) ||
-                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0))
+                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0)) {
                 parent_sym->props.can_alloc = true;
+                parent_sym->props.has_direct_alloc = true;
+            }
         }
 
         /* Transitive: follow direct function calls */
@@ -7059,11 +7082,20 @@ static void check_body_effects(Checker *c, Node *body, int line,
     tmp.props.in_progress = true; /* prevent re-entry into this temp */
     scan_func_props(c, body, &tmp);
 
+    /* yield / await: per-site NODE_YIELD only checks `in_async`, not
+     * defer / @critical context. Direct yield inside @critical only fires
+     * here. Keep firing for both direct and transitive. */
     if (ban_yield && tmp.props.can_yield)
         checker_error(c, line, "%s", yield_msg);
-    if (ban_spawn && tmp.props.can_spawn)
+    /* spawn: per-site NODE_SPAWN now uses zer_spawn_allowed_in_critical
+     * and zer_spawn_allowed_in_isr predicates which fire for direct
+     * spawns. Suppress body-level error if direct — fire only for
+     * transitive (callee-only) cases to avoid duplicate diagnostics. */
+    if (ban_spawn && tmp.props.can_spawn && !tmp.props.has_direct_spawn)
         checker_error(c, line, "%s", spawn_msg);
-    if (ban_alloc && tmp.props.can_alloc)
+    /* alloc: per-site check_isr_ban now uses zer_alloc_allowed_in_isr
+     * and zer_alloc_allowed_in_critical. Same direct-case suppression. */
+    if (ban_alloc && tmp.props.can_alloc && !tmp.props.has_direct_alloc)
         checker_error(c, line, "%s", alloc_msg);
 }
 
@@ -9774,12 +9806,23 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
         }
-        /* Ban spawn inside @critical (now also covered by check_body_effects on @critical,
-         * but keep direct check for clear error message at the spawn site) */
-        if (c->critical_depth > 0) {
+        /* Ban spawn inside @critical / interrupt — per-site predicate
+         * checks. Wires up two previously-dead extracted predicates:
+         *   - zer_spawn_allowed_in_critical (typing.v rule C04)
+         *   - zer_spawn_allowed_in_isr      (typing.v rule C03)
+         * Per-site error gives clear location at the spawn statement.
+         * Outer body-level check_body_effects still catches transitive
+         * cases (@critical { call_helper_that_spawns(); }) via callee
+         * summaries; this direct check produces a single clean error. */
+        if (zer_spawn_allowed_in_critical((int)c->critical_depth) == 0) {
             checker_error(c, node->loc.line,
                 "cannot use 'spawn' inside @critical block — "
                 "thread creation with interrupts disabled is unsafe");
+        }
+        if (zer_spawn_allowed_in_isr(c->in_interrupt ? 1 : 0) == 0) {
+            checker_error(c, node->loc.line,
+                "cannot use 'spawn' inside interrupt handler — "
+                "pthread_create in ISR is unsafe");
         }
         /* Ban spawn inside async function — spawned thread outlives coroutine */
         if (c->in_async) {

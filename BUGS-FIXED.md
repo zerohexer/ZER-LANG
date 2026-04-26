@@ -5,6 +5,95 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 — Codebase audit: dead predicates wired + latent zercheck_ir UAF (4 bugs)
+
+Verified and ported fixes from `claude/quirky-hypatia-EDt9D` audit branch (DO NOT MERGE — applied changes manually after independent verification). Four real issues, each small but combined effect closes Phase-1 wiring gaps and removes a class of silent miscompiles.
+
+### BUG-613: `zer_alloc_allowed_in_critical` predicate dead
+
+**Symptom:** alloc-in-@critical only got rejected incidentally by the leak detector — wrong error message, wrong path, no per-site error at the actual alloc statement.
+
+**Root cause:** `zer_alloc_allowed_in_critical(critical_depth)` was VST-verified in `proofs/vst/verif_isr_rules.v` and present in `src/safety/isr_rules.c` (Phase 1 extraction), but never called from any checker call site. Only `zer_alloc_allowed_in_isr` was wired.
+
+**Fix:** Extended `check_isr_ban` (checker.c) to chain both predicates. Per-site error fires at the actual alloc statement with the correct message ("malloc/calloc may deadlock when interrupts are disabled"). Body-level `check_body_effects` still catches transitive cases (callee allocates) via FuncProps summaries.
+
+**Test:** `tests/zer_fail/alloc_in_critical.zer` — `@critical { tasks.alloc(); }` now rejected with the right error.
+
+### BUG-614: `zer_spawn_allowed_in_isr` / `_in_critical` predicates dead
+
+**Symptom:** spawn-in-@critical and spawn-in-ISR generated DUPLICATE errors — once at the spawn site (inline check `c->critical_depth > 0`), once at the body level (via `check_body_effects`). Confusing diagnostics. Two extracted Phase-1 predicates were dead.
+
+**Root cause:** `zer_spawn_allowed_in_isr(in_interrupt)` and `zer_spawn_allowed_in_critical(critical_depth)` exist in `src/safety/isr_rules.c` and are VST-verified, but NODE_SPAWN used inline `c->critical_depth > 0` checks instead. Plus `check_body_effects` had no way to suppress duplicate errors when per-site checks already fired.
+
+**Fix:** Two parts:
+1. NODE_SPAWN now calls `zer_spawn_allowed_in_critical` and `zer_spawn_allowed_in_isr` — typing.v rules C04 / C03 wired at the per-site level.
+2. Added `has_direct_spawn`, `has_direct_alloc`, `has_direct_yield` flags to `Symbol.props`. Set in `scan_func_props` when the effect appears LITERALLY in the immediate body (not via callee). `check_body_effects` skips body-level error for direct cases — only fires for transitive (callee-only) cases. Single clean error per root cause.
+
+**Test:** `tests/zer_fail/spawn_in_critical_per_site.zer` — `@critical { spawn worker(&g); }` now produces one per-site error, not two.
+
+### BUG-615: `IR_SPAWN` emitted `/* TODO */` comment that compiles cleanly (silent miscompile risk)
+
+**Symptom:** None today (`IR_SPAWN` is unreachable). But any future regression that produced `IR_SPAWN` would have miscompiled silently — emit a comment, no actual `pthread_create` call, program runs without spawning the thread.
+
+**Root cause:** `ir_lower.c` lowers `NODE_SPAWN` to `IR_NOP{expr=spawn_node}` (see ir_lower.c:2716), not `IR_SPAWN`. The `IR_NOP` handler does the real `pthread_create` emission via `emit_rewritten_node` on the carried `NODE_SPAWN`. So `case IR_SPAWN:` in `emit_ir_inst` is dead code — but it emitted a TODO comment instead of failing loudly.
+
+**Fix:** Replaced TODO comment with `fprintf(stderr, ...) + abort()`. Future regression that creates `IR_SPAWN` fails immediately rather than producing a binary that silently doesn't spawn.
+
+**Test:** None needed (unreachable today). Defensive change.
+
+### BUG-616: zercheck_ir.c heap-use-after-free in 5 hot paths (latent ASan bug)
+
+**Symptom:** Random crashes / wrong analysis on programs that exercised handle aliasing AFTER the path state's handle array hit its growth threshold. Caught by ASan in fuzz testing once Symbol layout shifted (FuncProps `has_direct_*` flags pushed allocations over realloc threshold).
+
+**Root cause:** Pattern in `ir_check_inst` IR_COPY / IR_CAST / interior-pointer / regular-alias / provenance-propagation handlers:
+
+```c
+IRHandleInfo *src_h = ir_find_handle(ps, src_local);   // ptr into ps->handles
+// ... use src_h ...
+IRHandleInfo *dst_h = ir_add_handle(ps, dst_local);    // may realloc ps->handles!
+if (dst_h) {
+    dst_h->state = src_h->state;  // UAF — src_h dangling if realloc fired
+    ...
+}
+```
+
+`ir_alloc_handle_slot` (zercheck_ir.c:208) calls `realloc(ps->handles, ...)` when capacity is exceeded. This invalidates ALL pointers into `ps->handles` — including the `src_h` pointer obtained earlier from `ir_find_handle`.
+
+**Fix:** Snapshot the source fields BEFORE the realloc-capable `ir_add_handle` call at all 5 sites:
+- IR_COPY (line ~1101)
+- IR_CAST (line ~1165)
+- Provenance propagation (line ~1509)
+- Interior pointer tracking (line ~1547)
+- Regular alias (line ~1652)
+
+Pattern:
+```c
+IRHandleState src_state = src_h->state;
+int src_alloc_line = src_h->alloc_line;
+int src_alloc_id = src_h->alloc_id;
+/* ... snapshot all needed fields ... */
+IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);  // may realloc
+if (dst_h) {
+    dst_h->state = src_state;
+    dst_h->alloc_line = src_alloc_line;
+    /* ... use snapshots, never src_h after this point ... */
+}
+```
+
+**Test:** Validated against full test suite (3,659 tests pass post-fix). Original branch reported validation against 8 seeds × 200 = 1,600 fuzz programs.
+
+**Lesson:** Whenever a realloc-capable function is called between a `find` and a use of the found pointer, snapshot the data first. Same pattern likely exists at other find-then-add sites — followup audit warranted.
+
+### Summary
+
+All 4 fixes verified independently before applying. No code merged from the audit branch — fixes ported manually with comments matching the architectural patterns. Tests after: 3,659 PASS / 0 FAIL via `make docker-check`. VST proofs: zero admits across 23 verification files. Branch `claude/quirky-hypatia-EDt9D` is the audit source — DO NOT MERGE.
+
+**Future work mentioned by audit (deferred):**
+- 11 dead predicates in `src/safety/concurrency_rules.c` (zer_yield_context_valid, etc.) — wire-up pending
+- More candidate UAF sites with the same find-then-add pattern in zercheck_ir.c
+
+---
+
 ## Session 2026-04-25 — Variant 2C funcptr syntax + return-of-funcptr emit fix + 7 fervent-curie bugs
 
 Big session. Two distinct workstreams landed: (1) verification & fixes for 7 bugs from parallel `claude/fervent-curie-*` audit branches (committed earlier as 537c03a, doc back-filled now), (2) Variant 2C funcptr syntax + a previously-undetected emitter limitation it surfaced.

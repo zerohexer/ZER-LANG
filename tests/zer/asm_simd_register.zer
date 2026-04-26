@@ -1,0 +1,20 @@
+// D-Alpha-7.5 Session F3: x86_64 candidates expanded to SIMD/FPU/MMX.
+// Tests that asm with SIMD register operands compiles cleanly under
+// the expanded register table (104 entries vs F2's 40).
+//
+// xmm0 is one of the 48 SIMD regs that GCC accepts as clobber.
+// Naked + clobber-only asm: no operands, just verify the register
+// name passes F7 validation (which uses the F3 table).
+
+naked void simd_clobber() {
+    asm {
+        instructions: "pxor %%xmm0, %%xmm0"
+        clobbers: [ "xmm0" ]
+        safety: "F3 test — xmm0 in clobber list confirms SIMD reg recognized"
+    }
+}
+
+i32 main() {
+    simd_clobber();
+    return 0;
+}

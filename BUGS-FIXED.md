@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 — D-Alpha-7.5 Session F3: x86_64 candidates expanded to full coverage
+
+**Validates F3.** Expanded `scripts/candidates_x86_64.txt` from 53 candidates (F2's GP-only) to 213 candidates covering full register set: GP (64/32/16/8-bit including r8-r15 sub-forms), SIMD (xmm/ymm/zmm 0-31), x87 FP (st, st(0)-(7)), MMX (mm0-7), AVX-512 mask (k0-7), segment regs, control regs (cr0-15), debug regs (dr0-7), rip.
+
+GCC probe accepted **104 of 213** candidates (up from 40). The other 109 are rejected by GCC's clobber convention, not by ZER:
+
+**Accepted (104):**
+- 40 GP regs — same as F2 (rax-r15, eax-r15d, ax-sp, al-spl, ah-dh)
+- 8 x87 FP — `st`, `st(1)` through `st(7)`
+- 8 MMX — `mm0`-`mm7`
+- 48 SIMD — `xmm0-15`, `ymm0-15`, `zmm0-15`
+
+**Rejected by GCC (109):**
+- AVX-512 high regs (xmm16-31, ymm16-31, zmm16-31) — need `-mavx512f` flag at probe time
+- AVX-512 mask regs (k0-7) — same
+- 16/8-bit r8-r15 sub-forms (r8w-r15w, r8b-r15b) — GCC clobbers `r8` covers all sub-portions
+- Segment regs (cs, ds, es, fs, gs, ss) — privileged, not clobberable
+- Control regs (cr0-cr8) — privileged, kernel mode only
+- Debug regs (dr0-dr7) — privileged, kernel mode only
+- `rip` — instruction pointer, read-only
+
+These rejections are GCC's call, not ZER's. AVX-512 support can be added later by probing with `-mavx512f` flag. Privileged regs (cr/dr/segment) are intentionally not clobberable from user-mode asm — kernel code accessing them uses different inline asm patterns (read/write, not clobber).
+
+**Files changed:**
+- `scripts/candidates_x86_64.txt` — expanded to 213 candidates with category headers
+- `Dockerfile` — added `COPY scripts/ scripts/` so `make gen-asm-tables` works in Docker
+- `src/safety/asm_register_tables_x86_64.c` — REGENERATED, 104 entries (was 40)
+- `tests/zer/asm_simd_register.zer` — positive test using `xmm0` clobber to verify F3 expansion
+
+**The probe pattern remains pure:** GCC is the authoritative oracle. F3 didn't change the script; just gave it more candidates to ask about. The mechanism scales — adding SIMD/FPU registers was a 1-file edit + regenerate.
+
+**`.txt` vs `.zerdata` decision:** the candidates file stays `.txt` because the data is trivial (one identifier per line, comments). `.zerdata` is reserved for structured per-arch data files like F4's instruction → category mappings (multiple fields per row). Principle: **structured data → dedicated extension; trivial data → universal extension.**
+
+**Tests after this commit:** 3,661 PASS / 0 FAIL via `make docker-check` (was 3,660, +1 SIMD positive test). All 13 existing asm tests still pass. VST proofs: zero admits across 23 verification files.
+
+**Sub-session breakdown remaining:**
+- F4 — x86_64 instruction → category table (Capstone/XED extraction) ~30 hrs
+- F5 — ARM64 register + instruction tables ~25 hrs
+- F6 — RISC-V register + instruction tables ~25 hrs
+- F7-full — per-category enforcement after F4 ~25 hrs
+- Session G — System #30 (atomic ordering, C8) ~80 hrs
+
+---
+
 ## Session 2026-04-26 — D-Alpha-7.5 Session F7-minimum: register name validation wired
 
 Validation jump: F7 first (instead of F3-F6 data entry) to confirm F1a + F2 are architecturally sound before investing 80+ hrs in additional data tables. **End-to-end validation succeeded** — register name validation now active in checker.c NODE_ASM, all 12 existing asm tests pass, new typo-rejection test passes.

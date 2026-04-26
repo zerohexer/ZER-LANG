@@ -2,8 +2,8 @@
  * Regenerate via: make gen-asm-tables
  *
  * Source: GCC probe of register clobber acceptance for arch=x86_64.
- * Compiler: gcc (Docker image: gcc:13)
- * Generated: 2026-04-26
+ * Compiler: gcc
+ * Generated: 2026-04-26T13:29:05Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F2 (build-time-gen pipeline).
@@ -51,7 +51,71 @@ const ZerRegisterEntry zer_x86_64_registers[] = {
     {"bh", 2},
     {"ch", 2},
     {"dh", 2},
+    {"st", 2},
+    {"st(1)", 5},
+    {"st(2)", 5},
+    {"st(3)", 5},
+    {"st(4)", 5},
+    {"st(5)", 5},
+    {"st(6)", 5},
+    {"st(7)", 5},
+    {"mm0", 3},
+    {"mm1", 3},
+    {"mm2", 3},
+    {"mm3", 3},
+    {"mm4", 3},
+    {"mm5", 3},
+    {"mm6", 3},
+    {"mm7", 3},
+    {"xmm0", 4},
+    {"xmm1", 4},
+    {"xmm2", 4},
+    {"xmm3", 4},
+    {"xmm4", 4},
+    {"xmm5", 4},
+    {"xmm6", 4},
+    {"xmm7", 4},
+    {"xmm8", 4},
+    {"xmm9", 4},
+    {"xmm10", 5},
+    {"xmm11", 5},
+    {"xmm12", 5},
+    {"xmm13", 5},
+    {"xmm14", 5},
+    {"xmm15", 5},
+    {"ymm0", 4},
+    {"ymm1", 4},
+    {"ymm2", 4},
+    {"ymm3", 4},
+    {"ymm4", 4},
+    {"ymm5", 4},
+    {"ymm6", 4},
+    {"ymm7", 4},
+    {"ymm8", 4},
+    {"ymm9", 4},
+    {"ymm10", 5},
+    {"ymm11", 5},
+    {"ymm12", 5},
+    {"ymm13", 5},
+    {"ymm14", 5},
+    {"ymm15", 5},
+    {"zmm0", 4},
+    {"zmm1", 4},
+    {"zmm2", 4},
+    {"zmm3", 4},
+    {"zmm4", 4},
+    {"zmm5", 4},
+    {"zmm6", 4},
+    {"zmm7", 4},
+    {"zmm8", 4},
+    {"zmm9", 4},
+    {"zmm10", 5},
+    {"zmm11", 5},
+    {"zmm12", 5},
+    {"zmm13", 5},
+    {"zmm14", 5},
+    {"zmm15", 5},
     {0, 0}  /* sentinel */
 };
 
-const size_t zer_x86_64_register_count = 40;
+const size_t zer_x86_64_register_count = 104;

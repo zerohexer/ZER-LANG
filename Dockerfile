@@ -19,6 +19,7 @@ COPY tools/ tools/
 COPY tests/ tests/
 COPY rust_tests/ rust_tests/
 COPY zig_tests/ zig_tests/
+COPY scripts/ scripts/
 
 # Fix CRLF line endings from Windows git checkout
 RUN find . -name "*.sh" -exec sed -i 's/\r$//' {} + && \

@@ -14,6 +14,7 @@
 #include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
 #include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
+#include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -9583,6 +9584,68 @@ static void check_stmt(Checker *c, Node *node) {
              * `scan_frame` (NODE_ASM case) — operand expressions could
              * call functions or take address of locals, both relevant
              * to stack accounting. */
+
+            /* D-Alpha-7.5 Session F7-minimum — register name validation
+             * (O3 rule). Wires up the F2 vendored register table. Catches
+             * typos like "rax0" or wrong-arch registers like "x0" used
+             * on x86_64.
+             *
+             * Pseudo-clobbers "memory" and "cc" are special-cased — they
+             * aren't real registers but GCC accepts them as clobber list
+             * markers (memory side-effect / flags-clobbered). Skip the
+             * register table check for these.
+             *
+             * Today's arch detection is hardcoded to x86_64. F5/F6 will
+             * extend ZerArchId based on target detection. The scaffold
+             * is in place — when target-arch is plumbed, change the
+             * single ZER_ARCH_X86_64 constant to a variable. */
+            ZerArchId asm_arch = ZER_ARCH_X86_64;
+
+            for (int i = 0; i < node->asm_stmt.input_count; i++) {
+                AsmOperand *op = &node->asm_stmt.inputs[i];
+                if (op->reg_name_len == 0) continue;
+                if (zer_asm_register_valid(asm_arch,
+                        op->reg_name, op->reg_name_len) == 0) {
+                    checker_error(c, op->loc.line,
+                        "asm input register '%.*s' not recognized for "
+                        "x86_64 (O3 rule). Check spelling — known "
+                        "registers are GP regs (rax-r15, eax-r15d, "
+                        "ax-sp, al-spl, ah-dh)",
+                        (int)op->reg_name_len, op->reg_name);
+                }
+            }
+
+            for (int i = 0; i < node->asm_stmt.output_count; i++) {
+                AsmOperand *op = &node->asm_stmt.outputs[i];
+                if (op->reg_name_len == 0) continue;
+                if (zer_asm_register_valid(asm_arch,
+                        op->reg_name, op->reg_name_len) == 0) {
+                    checker_error(c, op->loc.line,
+                        "asm output register '%.*s' not recognized for "
+                        "x86_64 (O3 rule). Check spelling — known "
+                        "registers are GP regs (rax-r15, eax-r15d, "
+                        "ax-sp, al-spl, ah-dh)",
+                        (int)op->reg_name_len, op->reg_name);
+                }
+            }
+
+            for (int i = 0; i < node->asm_stmt.clobber_count; i++) {
+                AsmOperand *op = &node->asm_stmt.clobbers[i];
+                if (op->reg_name_len == 0) continue;
+                /* Pseudo-clobbers — GCC accepts as markers, not real regs */
+                if (op->reg_name_len == 6 &&
+                    memcmp(op->reg_name, "memory", 6) == 0) continue;
+                if (op->reg_name_len == 2 &&
+                    memcmp(op->reg_name, "cc", 2) == 0) continue;
+                if (zer_asm_register_valid(asm_arch,
+                        op->reg_name, op->reg_name_len) == 0) {
+                    checker_error(c, op->loc.line,
+                        "asm clobber '%.*s' not recognized for x86_64 "
+                        "(O3 rule). Use a known register name, or "
+                        "'memory' / 'cc' for side-effect markers",
+                        (int)op->reg_name_len, op->reg_name);
+                }
+            }
         }
         break;
 

@@ -5,6 +5,149 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 (late) — Audit: 5 more zercheck_ir.c find-then-add UAFs + MMIO alignment relaxed-mode bypass
+
+Followup audit after BUG-616. Commit 5b76965 explicitly listed
+"More candidate UAF sites with the same find-then-add pattern in
+zercheck_ir.c" as future work; this session enumerates and fixes
+them. ASan-validated against existing fuzz programs.
+
+### BUG-617: zercheck_ir.c IR_ASSIGN compound-key registration UAF (line ~1458)
+
+**Symptom:** Same heap-use-after-free class as BUG-616, fired during
+field-write compound-key registration in IR_ASSIGN. ASan detection
+requires fuzz programs that grow ps->handles past the realloc
+threshold (initial cap 8, doubles).
+
+**Root cause:** `rh = ir_find_handle(ps, rhs_local)` returns a pointer
+into ps->handles. The subsequent `ir_add_compound_handle(ps, root_local,
+path, path_len)` may realloc the array, invalidating rh. The post-add
+dereferences `rh->alloc_line`, `rh->alloc_id`, `rh->source_color`
+read freed memory.
+
+**Fix:** Snapshot rh fields BEFORE `ir_add_compound_handle`, then use
+snapshots when initialising ch. Same BUG-616 pattern.
+
+### BUG-618: zercheck_ir.c IR_ASSIGN orelse-ident alias UAF (line ~1496)
+
+**Symptom:** Same UAF class. Fires on the common idiom
+`Handle h = mh orelse return;` where dest_local is freshly added
+to ps->handles, growing the array.
+
+**Root cause:** `src_h = ir_find_handle(ps, src_local)` then
+`dst_h = ir_add_handle(ps, dest_local)` then dereferences src_h's
+fields to seed dst_h. The add reallocs.
+
+**Reproducer (regression test):**
+- `tests/zer/zercheck_ir_uaf_orelse_alias.zer` — 12 paired
+  `?Handle` + `Handle = ... orelse return` declarations growing
+  ps->handles past initial cap 8.
+
+**Fix:** Snapshot src_h fields BEFORE ir_add_handle. Same pattern.
+
+### BUG-619: zercheck_ir.c IR_CALL param-color summary alias UAF (line ~2067)
+
+**Symptom:** Same UAF class. Fires when callee FuncSummary has
+`returns_param_color` set (callee returns its own param) and
+caller's call site grows ps->handles when adding dest_local.
+
+**Root cause:** `arg_h = ir_find_handle(ps, arg_local)` then
+`dh = ir_add_handle(ps, dest_local)` then dereferences arg_h
+fields. The add reallocs.
+
+**Fix:** Snapshot arg_h fields BEFORE ir_add_handle.
+
+### BUG-620: zercheck_ir.c IR_FIELD_WRITE compound-handle alloc_id propagation UAF (line ~2407)
+
+**Symptom:** Same UAF class. Fires on `s.field = h_alive` field-write
+with rh ALIVE — registers compound handle (root, ".field") sharing
+alloc_id. The add_compound_handle may realloc, invalidating rh
+before its alloc_id propagates.
+
+**Fix:** Snapshot rh->alloc_line and rh->alloc_id BEFORE
+ir_add_compound_handle.
+
+### BUG-621: zercheck_ir.c IR_INDEX_WRITE compound-handle alloc_id propagation UAF (line ~2476)
+
+**Symptom:** Same UAF class as BUG-620 but for array-index target
+(`arr[const] = h_alive`). Mirror handler.
+
+**Fix:** Same snapshot pattern.
+
+### BUG-622: zercheck_ir.c non-move regular-alias second invalid-check read-after-free (line ~1731)
+
+**Symptom:** Same family but read-only — the secondary `if (src_h
+&& ir_is_invalid(src_h))` check reads src_h->state AFTER the
+ir_add_handle in the first branch may have invalidated it. Lower
+severity (read-after-free, can fire spurious error messages
+referencing freed-memory state value).
+
+**Root cause:** Two-stage check pattern: first branch handles
+ALIVE (and may realloc), second branch reports invalid state.
+The second branch reads src_h->state after potential realloc.
+
+**Fix:** Snapshot src_h's state-derived facts (was_invalid,
+state_for_err) BEFORE any realloc-capable add. Use snapshot for
+the secondary diagnostic.
+
+**Method:** Audit done via regex pass on every find-then-add
+sequence in zercheck_ir.c (~70 candidate sites), verifying each
+for the dereference-after-realloc pattern. 5 dereference-after-free
+sites + 1 read-after-free site found and fixed. The remaining ~60
+candidate sites all use the conditional-reassignment pattern
+(`if (!h) h = ir_add_handle(...)`) which is safe because the
+post-add use is on the fresh pointer.
+
+**Tests after:** make check passes, 499 ZER tests, all rust_tests.
+The orelse_alias regression test confirms array-growth path
+exercises the previously-faulting code.
+
+### BUG-623: @inttoptr alignment check bypassed under --no-strict-mmio
+
+**Symptom:** A constant misaligned address such as
+`@inttoptr(volatile *u32, 0x40000001)` was accepted under
+`--no-strict-mmio` (or simply when no mmio ranges were declared)
+even though it would SIGBUS on ARM/RISC-V at runtime.
+
+**Root cause:** checker.c:5733 wrapped the alignment check inside
+`if (c->mmio_range_count > 0 && ...)`. The relaxed flag
+`--no-strict-mmio` is intended to opt out of *range* checking, not
+of *alignment* checking. Conflating the two left a silent gap on
+baremetal: the program compiles clean and faults at first MMIO
+access on alignment-strict hardware.
+
+**Fix:** Hoist alignment validation out of the range gate.
+- Constant address path runs unconditionally on every @inttoptr
+  with a constant arg.
+- Range check is preserved when `mmio_range_count > 0`.
+- Alignment fires whether or not ranges are declared.
+
+**Reproducer:** `tests/zer_fail/inttoptr_unaligned_relaxed.zer` —
+declares an mmio range that includes the unaligned address so the
+range check passes; the alignment check then catches it. The fix
+also applies to `--no-strict-mmio` mode (alignment fires without
+ranges declared).
+
+**Lesson:** "Two orthogonal axes" (range vs alignment) coupled in
+a single conditional is an architectural smell. When a flag opts
+out of one axis it must not silently bypass the other.
+
+### Audit summary
+
+Six bugs fixed. All same fix-pattern (snapshot before realloc, or
+hoist independent check out of unrelated gate). Audit method is
+the same diff-based approach documented in CLAUDE.md "Diff-Based
+Post-Release Audit": grep for the structural anti-pattern, verify
+each candidate by reading the surrounding flow, fix uniformly.
+
+Tests after this commit:
+- ZER integration: 499 pass (was 497, +2: orelse_alias regression
+  + inttoptr_unaligned_relaxed negative test)
+- All other test categories unchanged: rust_tests 784, modules,
+  C unit tests, semantic fuzz, walker audit, emit audit.
+
+---
+
 ## Session 2026-04-26 — D-Alpha-7.5 Session F3: x86_64 candidates expanded to full coverage
 
 **Validates F3.** Expanded `scripts/candidates_x86_64.txt` from 53 candidates (F2's GP-only) to 213 candidates covering full register set: GP (64/32/16/8-bit including r8-r15 sub-forms), SIMD (xmm/ymm/zmm 0-31), x87 FP (st, st(0)-(7)), MMX (mm0-7), AVX-512 mask (k0-7), segment regs, control regs (cr0-15), debug regs (dr0-7), rip.

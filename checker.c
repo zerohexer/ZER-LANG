@@ -5729,16 +5729,26 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* BUG-371: also validate constant expressions, not just literals
                      * SAFETY: zer_mmio_inttoptr_allowed in src/safety/mmio_rules.c
-                     * Oracle: lambda_zer_mmio step_inttoptr_ok requires BOTH gates. */
-                    if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0) {
+                     * Oracle: lambda_zer_mmio step_inttoptr_ok requires BOTH gates.
+                     *
+                     * Audit 2026-04-26: alignment check now runs on every
+                     * @inttoptr with a constant address, even when
+                     * --no-strict-mmio is set or no ranges are declared.
+                     * Misaligned addresses cause SIGBUS on ARM/RISC-V; the
+                     * range opt-out should not silently bypass alignment.
+                     * Range check still gated on mmio_range_count > 0. */
+                    if (node->intrinsic.arg_count > 0) {
                         int64_t cval = eval_const_expr(node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
-                        int in_range = 0;
-                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
-                            if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
-                                in_range = 1;
-                                break;
+                        int in_range = 1; /* assume in-range when ranges aren't declared */
+                        if (c->mmio_range_count > 0) {
+                            in_range = 0;
+                            for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                                if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
+                                    in_range = 1;
+                                    break;
+                                }
                             }
                         }
                         /* alignment check: constant address must be aligned to target type */
@@ -5754,8 +5764,10 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
-                        /* Delegate the combined decision; split messages for clarity. */
-                        if (zer_mmio_inttoptr_allowed(in_range, aligned) == 0) {
+                        /* Delegate the combined decision; split messages for clarity.
+                         * Range gate is only meaningful when ranges are declared. */
+                        bool range_check_active = (c->mmio_range_count > 0);
+                        if (range_check_active && zer_mmio_inttoptr_allowed(in_range, aligned) == 0) {
                             if (in_range == 0) {
                                 checker_error(c, node->loc.line,
                                     "@inttoptr address 0x%llx is outside all declared mmio ranges",
@@ -5766,6 +5778,15 @@ static Type *check_expr(Checker *c, Node *node) {
                                     (unsigned long long)addr, align,
                                     result ? type_name(type_unwrap_distinct(result)->pointer.inner) : "target");
                             }
+                        } else if (!range_check_active && !aligned) {
+                            /* Under --no-strict-mmio (or no ranges declared)
+                             * the range gate is off, but a constant misaligned
+                             * address is still a hardware fault risk
+                             * (SIGBUS on ARM/RISC-V). Independently flag it. */
+                            checker_error(c, node->loc.line,
+                                "@inttoptr address 0x%llx is not aligned to %d bytes (required for %s)",
+                                (unsigned long long)addr, align,
+                                result ? type_name(type_unwrap_distinct(result)->pointer.inner) : "target");
                         }
                     } }
                 }

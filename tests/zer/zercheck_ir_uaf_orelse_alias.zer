@@ -1,0 +1,51 @@
+/* Regression for find-then-add UAF in zercheck_ir.c IR_ASSIGN orelse-ident
+ * alias path (line ~1496). Many ?Handle locals + orelse aliasing forces
+ * ps->handles array to grow past initial capacity (8), exercising the
+ * realloc path that previously invalidated src_h before its fields were
+ * propagated to dst_h.
+ *
+ * Before fix: ASan heap-use-after-free in ir_check_inst IR_ASSIGN.
+ * After fix:  snapshot src_h fields BEFORE ir_add_handle. */
+
+struct Task { u32 id; }
+Slab(Task) g_pool;
+
+void run() {
+    /* Twelve allocations. zercheck_ir's handle array initial cap is 8;
+     * with twelve aliasing pairs (?Handle + Handle), capacity must grow
+     * at least once, exercising the realloc path. */
+    ?Handle(Task) m1  = Task.alloc();
+    ?Handle(Task) m2  = Task.alloc();
+    ?Handle(Task) m3  = Task.alloc();
+    ?Handle(Task) m4  = Task.alloc();
+    ?Handle(Task) m5  = Task.alloc();
+    ?Handle(Task) m6  = Task.alloc();
+    ?Handle(Task) m7  = Task.alloc();
+    ?Handle(Task) m8  = Task.alloc();
+    ?Handle(Task) m9  = Task.alloc();
+    ?Handle(Task) m10 = Task.alloc();
+    ?Handle(Task) m11 = Task.alloc();
+    ?Handle(Task) m12 = Task.alloc();
+
+    /* `Handle h = m orelse return;` — exact trigger pattern at
+     * zercheck_ir.c IR_ASSIGN orelse-NODE_IDENT alias path. */
+    Handle(Task) h1  = m1  orelse return;
+    Handle(Task) h2  = m2  orelse return;
+    Handle(Task) h3  = m3  orelse return;
+    Handle(Task) h4  = m4  orelse return;
+    Handle(Task) h5  = m5  orelse return;
+    Handle(Task) h6  = m6  orelse return;
+    Handle(Task) h7  = m7  orelse return;
+    Handle(Task) h8  = m8  orelse return;
+    Handle(Task) h9  = m9  orelse return;
+    Handle(Task) h10 = m10 orelse return;
+    Handle(Task) h11 = m11 orelse return;
+    Handle(Task) h12 = m12 orelse return;
+
+    /* Free all to avoid leak warnings. */
+    Task.free(h1);  Task.free(h2);  Task.free(h3);  Task.free(h4);
+    Task.free(h5);  Task.free(h6);  Task.free(h7);  Task.free(h8);
+    Task.free(h9);  Task.free(h10); Task.free(h11); Task.free(h12);
+}
+
+i32 main() { run(); return 0; }

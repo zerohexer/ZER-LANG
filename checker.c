@@ -9595,16 +9595,19 @@ static void check_stmt(Checker *c, Node *node) {
              * markers (memory side-effect / flags-clobbered). Skip the
              * register table check for these.
              *
-             * Today's arch detection is hardcoded to x86_64. F5/F6 will
-             * extend ZerArchId based on target detection. The scaffold
-             * is in place — when target-arch is plumbed, change the
-             * single ZER_ARCH_X86_64 constant to a variable. */
-            ZerArchId asm_arch = ZER_ARCH_X86_64;
+             * Universality proof: arch is plumbed from --target-arch CLI
+             * flag through Checker.target_arch. Defaults to x86_64.
+             * aarch64 / riscv64 dispatch in zer_asm_register_valid_with_features. */
+            ZerArchId asm_arch =
+                (c->target_arch == 2) ? ZER_ARCH_AARCH64 :
+                (c->target_arch == 3) ? ZER_ARCH_RISCV64 :
+                ZER_ARCH_X86_64;
 
             for (int i = 0; i < node->asm_stmt.input_count; i++) {
                 AsmOperand *op = &node->asm_stmt.inputs[i];
                 if (op->reg_name_len == 0) continue;
-                if (zer_asm_register_valid(asm_arch,
+                if (zer_asm_register_valid_with_features(asm_arch,
+                        c->target_features,
                         op->reg_name, op->reg_name_len) == 0) {
                     checker_error(c, op->loc.line,
                         "asm input register '%.*s' not recognized for "
@@ -9618,7 +9621,8 @@ static void check_stmt(Checker *c, Node *node) {
             for (int i = 0; i < node->asm_stmt.output_count; i++) {
                 AsmOperand *op = &node->asm_stmt.outputs[i];
                 if (op->reg_name_len == 0) continue;
-                if (zer_asm_register_valid(asm_arch,
+                if (zer_asm_register_valid_with_features(asm_arch,
+                        c->target_features,
                         op->reg_name, op->reg_name_len) == 0) {
                     checker_error(c, op->loc.line,
                         "asm output register '%.*s' not recognized for "
@@ -9637,7 +9641,8 @@ static void check_stmt(Checker *c, Node *node) {
                     memcmp(op->reg_name, "memory", 6) == 0) continue;
                 if (op->reg_name_len == 2 &&
                     memcmp(op->reg_name, "cc", 2) == 0) continue;
-                if (zer_asm_register_valid(asm_arch,
+                if (zer_asm_register_valid_with_features(asm_arch,
+                        c->target_features,
                         op->reg_name, op->reg_name_len) == 0) {
                     checker_error(c, op->loc.line,
                         "asm clobber '%.*s' not recognized for x86_64 "

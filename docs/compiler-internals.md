@@ -7028,6 +7028,110 @@ When S1 relaxes (asm allowed in regular functions, post Session F+G):
 - Sessions C, H, I add per-arch register tables + Phase 1 predicate extraction + audit log (~50 hrs)
 - After all of these, S1 relaxes → asm allowed in regular functions → all forward-compat Z-rules activate
 
+## CRITICAL: zercheck_ir.c find-then-add UAF pattern (2026-04-26 audit, BUG-616)
+
+**Read this BEFORE adding new IR_X handlers in zercheck_ir.c.** This is a structural bug pattern that future sessions WILL hit if they're unaware.
+
+### The bug pattern
+
+```c
+case IR_SOMETHING: {
+    IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);  // ptr into ps->handles
+    if (!src_h) break;
+    /* ... use src_h fields ... */
+
+    IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);   // MAY REALLOC ps->handles
+    if (dst_h) {
+        dst_h->state = src_h->state;       // ← UAF if realloc fired
+        dst_h->alloc_id = src_h->alloc_id; // ← UAF
+        /* ... etc ... */
+    }
+    break;
+}
+```
+
+### Why it's a UAF
+
+`ir_alloc_handle_slot` (zercheck_ir.c:208) calls `realloc(ps->handles, ...)` when capacity is exceeded:
+
+```c
+static IRHandleInfo *ir_alloc_handle_slot(IRPathState *ps) {
+    if (ps->handle_count >= ps->handle_capacity) {
+        int nc = ps->handle_capacity < 8 ? 8 : ps->handle_capacity * 2;
+        IRHandleInfo *nh = (IRHandleInfo *)realloc(ps->handles, nc * sizeof(IRHandleInfo));
+        if (!nh) return NULL;
+        ps->handles = nh;          // ← old buffer freed, all pointers invalidated
+        ps->handle_capacity = nc;
+    }
+    /* ... */
+}
+```
+
+Any pointer obtained from `ir_find_handle` BEFORE the realloc points into the freed buffer.
+
+### The fix pattern (mandatory for ALL find-then-add sites)
+
+```c
+case IR_SOMETHING: {
+    IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
+    if (!src_h) break;
+    /* ... validations using src_h ... */
+
+    /* SNAPSHOT FIELDS BEFORE REALLOC-CAPABLE ADD. */
+    IRHandleState src_state = src_h->state;
+    int src_alloc_line = src_h->alloc_line;
+    int src_alloc_id = src_h->alloc_id;
+    int src_color = src_h->source_color;
+    bool src_is_th = src_h->is_thread_handle;
+    /* ... snapshot every field you'll need below ... */
+
+    IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);  // may realloc; src_h now invalid
+    if (dst_h) {
+        dst_h->state = src_state;        // use snapshot, not src_h
+        dst_h->alloc_id = src_alloc_id;
+        /* ... etc ... */
+    }
+    break;
+}
+```
+
+**Rule: never dereference a handle pointer obtained before any function call that adds a new handle.**
+
+### Functions that may realloc handles (DO NOT use a previously-found pointer after these)
+
+- `ir_add_handle(ps, local_id)` — primary culprit
+- `ir_add_compound_handle(ps, local_id, path, path_len)` — same family
+- Any function that internally calls `ir_alloc_handle_slot`
+
+### Sites fixed by BUG-616
+
+5 sites in zercheck_ir.c:
+- IR_COPY (~line 1093): src_h findbox → ir_add_handle
+- IR_CAST (~line 1149): same pattern in cast handling
+- Provenance propagation (~line 1499): cross-function alias
+- Interior pointer (~line 1547): &b.field tracking
+- Regular alias (~line 1623): non-move assignment
+
+### Detection
+
+ASan catches this only when realloc actually fires (handle count crosses capacity threshold). Empirical testing won't always trigger it — the bug is silent until allocation patterns reach the threshold. Audit by GREP rather than testing:
+
+```bash
+# Find candidate sites: ir_find_handle followed by ir_add_handle
+grep -n "ir_find_handle\|ir_add_handle\|ir_alloc_handle_slot" zercheck_ir.c
+
+# For each find-then-add pair, verify the snapshot pattern is in place.
+```
+
+### Same family of bugs
+
+The find-then-add pattern is the most common variant, but ANY function that may realloc the underlying array creates the same risk. Audit candidates beyond zercheck_ir.c:
+- Parser arena growth — but parser arena uses bump allocation, not realloc, so safe
+- Checker typemap — uses chained hash, not realloc, so safe
+- VRP `var_ranges` array — currently bounded, no realloc; if changed, audit
+
+When in doubt: snapshot the fields before the call.
+
 ## *opaque safety architecture — wrap pattern + cross-language lifetime tracking (2026-04-26)
 
 **Mental model fresh sessions need:** ZER's `*opaque` story is more nuanced than "98% compile-time, 2% runtime." Two ORTHOGONAL axes that fresh sessions often conflate:

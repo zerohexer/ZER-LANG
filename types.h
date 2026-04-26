@@ -218,6 +218,16 @@ struct Symbol {
         bool can_spawn;      /* body contains spawn (directly or transitively) */
         bool can_alloc;      /* body contains slab.alloc/Task.new (directly or transitively) */
         bool has_sync;       /* body contains @atomic_* or @barrier (absorbs has_atomic_or_barrier) */
+        /* Direct-only effect flags — set when the effect appears literally
+         * in this function's immediate body (NOT through a callee). Used by
+         * check_body_effects to suppress duplicate body-level errors when
+         * per-site checks (NODE_SPAWN, slab.alloc, NODE_YIELD inside
+         * @critical via the matching context flag) already fired. Without
+         * this split, a direct `interrupt USART1 { slab.alloc(); }`
+         * produces TWO errors for the same root cause. */
+        bool has_direct_yield;
+        bool has_direct_spawn;
+        bool has_direct_alloc;
     } props;
     bool returns_color_cached;  /* zercheck: return color already computed */
     int returns_color_value;    /* zercheck: cached ZC_COLOR_* for return value */

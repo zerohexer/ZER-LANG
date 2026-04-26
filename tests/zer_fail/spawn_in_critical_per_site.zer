@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// spawn directly inside @critical — per-site predicate check
+// (zer_spawn_allowed_in_critical) replaces the inline check at the
+// spawn site. Eliminates the previously-duplicate body-level error.
+
+shared struct State { u32 x; }
+State g;
+
+void worker(*State s) {
+    s.x = 1;
+}
+
+void main() {
+    @critical {
+        spawn worker(&g);  // banned: pthread_create with IRQs off
+    }
+}

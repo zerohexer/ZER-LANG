@@ -7215,6 +7215,82 @@ These are layered on top of F7-minimum incrementally. The wiring pattern is now 
 - ARM64/RISC-V asm validation skipped (graceful) until F5/F6 tables ship.
 - The hardcoded `ZerArchId asm_arch = ZER_ARCH_X86_64;` is the single point to change when target-arch detection is added.
 
+## Methodology: validation-jump for layered work (2026-04-26)
+
+**When facing a sequence of expensive sub-sessions (e.g., F3-F6 = ~80 hrs of data entry), DO THE END-USER VALIDATION FIRST.**
+
+Concrete example from this session: F1a + F2 shipped framework + pipeline. The natural next step was F3-F6 (data entry across 4 archs, ~85 hrs). Instead, **F7-minimum (~5 hrs)** was done first: wire the existing F2 x86_64 table into checker.c NODE_ASM and confirm it works end-to-end.
+
+### The risk pattern this avoids
+
+```
+Without validation jump:
+  F3 (5 hrs) + F4 (30 hrs) + F5 (25 hrs) + F6 (25 hrs) = 85 hrs of data entry
+                              ↓
+                          F7 wires it in
+                              ↓
+              "Oh, the lookup signature was wrong"
+              "Oh, the table format doesn't fit checker's needs"
+              → 85 hrs of data needs rework
+```
+
+```
+With validation jump (what we did):
+  F7-minimum (~5 hrs) wires F1a + F2 into checker.c
+       ↓
+  Test against real asm code
+       ↓
+  Architecture validated NOW (cheap to fix if wrong)
+       ↓
+  Then confidently invest F3-F6
+```
+
+### When to apply this
+
+| Layered work pattern | Apply validation jump? |
+|---|---|
+| Build infrastructure + N units of bulk data | YES — wire one consumer first |
+| Build N predicates, then wire N call sites | YES — wire one predicate first |
+| Build framework for N archs | YES — wire one arch first |
+| Single self-contained feature | NO — just build it |
+| Refactor existing code | NO — refactor IS the validation |
+
+### Concrete checklist
+
+1. **Identify the bulk-data work.** What's the largest chunk? (F3-F6 = 85 hrs)
+2. **Identify the smallest end-user.** What CONSUMES the data? (F7 wires it)
+3. **Build minimum end-user FIRST.** With one data point, prove the pipeline works.
+4. **Then bulk-fill.** Architecture is now confirmed.
+
+### Why this matters for ZER
+
+ZER's compiler architecture has many layered patterns:
+- Phase 1 extractions (85 predicates) → Phase 2 decision call sites (~60)
+- Z-rules (13 wirings) → underlying safety systems (29+1)
+- Asm framework (F1a) → per-arch tables (F3-F6) → enforcement (F7)
+- Compile-time promotion (Tier 1) → tier 2/3 deepenings
+
+For each, the validation-jump is the right starting point. Build the rails, lay one tie, then mass-produce.
+
+### Concrete F7-minimum results
+
+End-to-end chain validated:
+```
+Makefile builds zerc with F2's vendored x86_64 table
+    ↓
+F1a's zer_asm_category stub coexists (no conflicts)
+    ↓
+F2's zer_asm_register_valid lookup reads linked table
+    ↓
+F7's checker call site invokes lookup
+    ↓
+typo "rax0" → table says invalid → checker errors → test rejects program
+```
+
+If any layer had been wrong, the test would have failed. It didn't. **No architectural rework needed for F3-F6.**
+
+This is the value: ~5 hrs of validation jump SAVED 80 hrs of potential rework.
+
 ## CRITICAL: zercheck_ir.c find-then-add UAF pattern (2026-04-26 audit, BUG-616)
 
 **Read this BEFORE adding new IR_X handlers in zercheck_ir.c.** This is a structural bug pattern that future sessions WILL hit if they're unaware.

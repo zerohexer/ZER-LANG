@@ -5,6 +5,39 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 — D-Alpha-7.5 Session F1a: 8-category framework skeleton
+
+First sub-session of Session F (the largest remaining asm Tier A piece, ~150 hrs total). F1a is the framework skeleton — declares the 8 universal precondition categories and the dispatch function signature, but ships with EMPTY tables. F4-F6 (per-arch instruction data) and F7 (per-category enforcement wiring) come in subsequent sub-sessions.
+
+**What F1a delivers:**
+- `src/safety/asm_categories.h` — `ZerArchId` enum (x86_64, aarch64, riscv64, future), `ZerAsmCategory` bitmap enum (C1-C8), function declarations for `zer_asm_category` and `zer_asm_category_name`
+- `src/safety/asm_categories.c` — stub implementation. `zer_asm_category` always returns 0 (no category) until F4-F6 ship vendored data tables. `zer_asm_category_name` translates bitmaps to human-readable strings for future error messages.
+- `Makefile` — added `src/safety/asm_categories.c` to `CORE_SRCS`, `LIB_SRCS`, and `clightgen` list
+
+**What F1a does NOT deliver:**
+- Per-arch instruction tables (F4 x86_64, F5 ARM64, F6 RISC-V) — empty today
+- Build-time generation pipeline (F2) — manual extraction or autogen comes later
+- Per-category enforcement wiring in checker.c NODE_ASM (F7) — dispatch is in place but lookup returns 0
+- VST proof — trivial today (always returns 0); gains content when tables land
+
+**Why ship the skeleton now:** sets up the architecture so future sub-sessions just add data tables. No checker.c changes needed today — the framework is invisible to compilation until F7 wires it in. Treats data and dispatch as separable concerns.
+
+**Sub-session breakdown (Session F total ~150 hrs):**
+- F1a (this commit) — framework skeleton, ~2 hrs
+- F2 — build-time-gen pipeline (gen_register_tables.sh, gen_category_tables.sh, Makefile target), ~25 hrs
+- F3 — x86_64 register table (probe GCC), ~5 hrs
+- F4 — x86_64 instruction → category table (extract from Capstone/XED, classify ~200 instructions), ~30 hrs
+- F5 — ARM64 register + instruction tables, ~25 hrs
+- F6 — RISC-V register + instruction tables, ~25 hrs
+- F7 — per-category enforcement wiring in checker.c NODE_ASM (C1-C7), ~30 hrs
+- C8 (memory ordering) → Session G separate (System #30, ~80 hrs)
+
+**Tests after this commit:** 3,659 PASS / 0 FAIL via `make docker-check` (unchanged — F1a is dead code today, no behavior change). VST proofs: zero admits across 23 verification files.
+
+**Next:** Session F2 (build-time-gen pipeline) OR pause and think about whether to manually populate F4 first to validate the framework end-to-end before investing in F2's automation infrastructure.
+
+---
+
 ## Session 2026-04-26 — D-Alpha-7.5 Session E3: Z1+Z2 IR-layer Z-rules (zercheck_ir.c IR_NOP)
 
 Final batch of the 13 Z-rules. Z1 (Handle UAF through asm) and Z2 (move struct → HS_TRANSFERRED through asm) are IR-layer state-machine rules — they live in `zercheck_ir.c` rather than `checker.c` because they extend Model 1 state machines (handle states, move tracking) that operate on IR locals via CFG analysis.

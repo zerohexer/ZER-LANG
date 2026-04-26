@@ -7028,6 +7028,45 @@ When S1 relaxes (asm allowed in regular functions, post Session F+G):
 - Sessions C, H, I add per-arch register tables + Phase 1 predicate extraction + audit log (~50 hrs)
 - After all of these, S1 relaxes → asm allowed in regular functions → all forward-compat Z-rules activate
 
+## D-Alpha-7.5 Session F1a — 8-category framework skeleton (2026-04-26)
+
+**Status:** framework declared, dispatch function stub returns 0 for everything. Future F4-F6 ship vendored per-arch tables; F7 wires per-category enforcement in checker.c.
+
+**Files:**
+- `src/safety/asm_categories.h` — declares `ZerArchId` (x86_64, aarch64, riscv64, future) and `ZerAsmCategory` bitmap (C1-C8). Function declarations: `zer_asm_category(arch, insn, len) -> uint32_t` and `zer_asm_category_name(bitmap) -> const char*`.
+- `src/safety/asm_categories.c` — stub. Returns 0 always. `zer_asm_category_name` translates bitmap to human-readable string for future error messages.
+- `Makefile` — added to `CORE_SRCS`, `LIB_SRCS`, `clightgen` list.
+
+**The 8 categories (mapping to existing ZER systems):**
+
+| Cat | What | Maps to |
+|---|---|---|
+| C1 value-range | bsr on zero, shift count overflow | #12 VRP |
+| C2 alignment | misaligned load/store | #20 Qualifier (extended) |
+| C3 state-machine | LL/SC pairing, monitor/mwait | Model 1 (extended) |
+| C4 cpu-feature | AVX-512 etc. | #24 Context Flags (extended) |
+| C5 privilege | kernel-only insn | #24 (extended) |
+| C6 memory-addr | canonical address, segment | #19 MMIO |
+| C7 provenance | type-erased aliasing | #3 + #11 |
+| C8 memory-order | barrier/atomic ordering | **System #30** (Session G) |
+
+**Why ship F1a as skeleton without data:**
+- Sets up architecture for F2-F7 incremental work
+- Zero behavior change today (lookup always returns 0)
+- Future sub-sessions just add data files / wire enforcement
+- VST proof becomes meaningful when data lands
+
+**Future sub-session order:**
+- F2: build-time-gen pipeline (probe GCC for register valid, extract instruction tables from Capstone/XED/ARM-XML/RISC-V-opcodes)
+- F3: x86_64 register table
+- F4: x86_64 instruction → category table (~200 safety-critical instructions)
+- F5: ARM64 register + instruction tables
+- F6: RISC-V register + instruction tables
+- F7: per-category enforcement wiring in checker.c NODE_ASM
+- Session G separately: System #30 (Atomic Ordering, ~80 hrs) — closes C8
+
+**Architectural decision (recapped from asm_plan.md SESSIONS C+F notice):** per-arch tables are AUTO-GENERATED at zerc build time via probe scripts and VENDORED into `src/safety/asm_*_tables_<arch>.c`. zerc binary contains the linked tables; runtime is fast hash lookup. Pattern matches LLVM TableGen, ICU Unicode tables, Linux autoconf, libc++ locale data.
+
 ## CRITICAL: zercheck_ir.c find-then-add UAF pattern (2026-04-26 audit, BUG-616)
 
 **Read this BEFORE adding new IR_X handlers in zercheck_ir.c.** This is a structural bug pattern that future sessions WILL hit if they're unaware.

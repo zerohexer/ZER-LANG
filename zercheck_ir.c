@@ -1098,14 +1098,26 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "use of %s handle %%%d",
                 ir_state_name(src_h->state), inst->src1_local);
         }
-        /* Alias: dest inherits source's alloc_id and state */
+        /* Alias: dest inherits source's alloc_id and state.
+         *
+         * BUG (audit 2026-04-26): src_h points into ps->handles which can
+         * be realloc'd by ir_add_handle below — using src_h after the add
+         * is a heap-use-after-free (caught by ASan in fuzz test
+         * safe_nested_7 with seed 42 once Symbol layout shifted).
+         *
+         * Fix: snapshot the source fields BEFORE the realloc-capable add. */
+        IRHandleState src_state = src_h->state;
+        int src_alloc_line = src_h->alloc_line;
+        int src_alloc_id = src_h->alloc_id;
+        int src_color = src_h->source_color;
+        bool src_is_th = src_h->is_thread_handle;
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
-            dst_h->state = src_h->state;
-            dst_h->alloc_line = src_h->alloc_line;
-            dst_h->alloc_id = src_h->alloc_id;
-            dst_h->source_color = src_h->source_color;
-            dst_h->is_thread_handle = src_h->is_thread_handle;
+            dst_h->state = src_state;
+            dst_h->alloc_line = src_alloc_line;
+            dst_h->alloc_id = src_alloc_id;
+            dst_h->source_color = src_color;
+            dst_h->is_thread_handle = src_is_th;
         }
         break;
     }
@@ -1152,13 +1164,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "use of %s handle %%%d in cast",
                 ir_state_name(src_h->state), inst->src1_local);
         }
+        /* Snapshot fields before realloc-capable add (UAF guard, mirror of
+         * IR_COPY fix above). */
+        IRHandleState src_state = src_h->state;
+        int src_alloc_line = src_h->alloc_line;
+        int src_alloc_id = src_h->alloc_id;
+        int src_color = src_h->source_color;
+        bool src_escaped = src_h->escaped;
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
-            dst_h->state = src_h->state;
-            dst_h->alloc_line = src_h->alloc_line;
-            dst_h->alloc_id = src_h->alloc_id;
-            dst_h->source_color = src_h->source_color;
-            dst_h->escaped = src_h->escaped;
+            dst_h->state = src_state;
+            dst_h->alloc_line = src_alloc_line;
+            dst_h->alloc_id = src_alloc_id;
+            dst_h->source_color = src_color;
+            dst_h->escaped = src_escaped;
         }
         break;
     }
@@ -1490,14 +1509,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             }
                         }
                         if (src_h) {
+                            /* UAF guard: snapshot fields before realloc-capable add. */
+                            IRHandleState s_state = src_h->state;
+                            int s_alloc_line = src_h->alloc_line;
+                            int s_alloc_id = src_h->alloc_id;
+                            int s_color = src_h->source_color;
+                            bool s_escaped = src_h->escaped;
                             IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                             if (dst_h) {
-                                dst_h->state = src_h->state;
-                                dst_h->alloc_line = src_h->alloc_line;
-                                dst_h->alloc_id = src_h->alloc_id;
-                                dst_h->source_color = src_h->source_color;
+                                dst_h->state = s_state;
+                                dst_h->alloc_line = s_alloc_line;
+                                dst_h->alloc_id = s_alloc_id;
+                                dst_h->source_color = s_color;
                                 /* Propagate escaped so aliases don't leak */
-                                dst_h->escaped = src_h->escaped;
+                                dst_h->escaped = s_escaped;
                             }
                         }
                     }
@@ -1522,12 +1547,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (base_local >= 0) {
                         IRHandleInfo *base_h = ir_find_handle(ps, base_local);
                         if (base_h && base_h->alloc_id != 0) {
+                            /* UAF guard: snapshot before realloc-capable add. */
+                            IRHandleState b_state = base_h->state;
+                            int b_alloc_line = base_h->alloc_line;
+                            int b_alloc_id = base_h->alloc_id;
+                            int b_color = base_h->source_color;
                             IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                             if (dst_h) {
-                                dst_h->state = base_h->state;
-                                dst_h->alloc_line = base_h->alloc_line;
-                                dst_h->alloc_id = base_h->alloc_id;
-                                dst_h->source_color = base_h->source_color;
+                                dst_h->state = b_state;
+                                dst_h->alloc_line = b_alloc_line;
+                                dst_h->alloc_id = b_alloc_id;
+                                dst_h->source_color = b_color;
                             }
                         }
                     }
@@ -1622,13 +1652,18 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     } else {
                         /* Non-move: regular alias */
                         if (src_h && src_h->state == IR_HS_ALIVE) {
+                            /* UAF guard: snapshot before realloc-capable add. */
+                            int s_alloc_line = src_h->alloc_line;
+                            int s_alloc_id = src_h->alloc_id;
+                            int s_color = src_h->source_color;
+                            bool s_is_th = src_h->is_thread_handle;
                             IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                             if (dst_h) {
                                 dst_h->state = IR_HS_ALIVE;
-                                dst_h->alloc_line = src_h->alloc_line;
-                                dst_h->alloc_id = src_h->alloc_id;
-                                dst_h->source_color = src_h->source_color;
-                                dst_h->is_thread_handle = src_h->is_thread_handle;
+                                dst_h->alloc_line = s_alloc_line;
+                                dst_h->alloc_id = s_alloc_id;
+                                dst_h->source_color = s_color;
+                                dst_h->is_thread_handle = s_is_th;
                             }
                         }
                         /* Check use of invalid handle */

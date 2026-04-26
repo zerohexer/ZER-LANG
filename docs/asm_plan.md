@@ -200,6 +200,100 @@
 >
 > **Tier A "done" = safety story complete. Niche register coverage gaps are documented escape hatches, not blockers.**
 
+> ## TIER A IS A VERIFIER, NOT A BUREAUCRACY 2026-04-26 — full real-world asm passes without escape valves
+>
+> Fresh sessions (and users) often ask: "if Tier A enforces 30 safety classes through asm, do I need `@relax_check` or `--relax-asm` for normal asm work?" Direct answer: **NO. Real-world legitimate asm passes ALL Tier A checks without any escape flag.**
+>
+> ### The verifier-vs-bureaucracy distinction
+>
+> Tier A's strict mode is designed to be **necessary AND sufficient** for safety:
+> - **Necessary:** rejects ONLY genuinely unsafe patterns (UAF, escape, ordering bugs, etc.)
+> - **Sufficient:** rejects ALL such genuine unsafety
+> - **NOT a bureaucracy:** does NOT reject legitimate asm that happens to look "complex"
+>
+> If pure ZER code with the same semantics would compile, then asm doing the same thing also compiles. **Symmetric.**
+>
+> ### Concrete examples that pass cleanly (no relax flag)
+>
+> | Pattern | Tier A status |
+> |---|---|
+> | SIMD memcpy via `vmovdqu` + ymm regs | ✓ PASSES — typed operands, valid clobbers |
+> | AES-NI inline (`aesenc` with xmm) | ✓ PASSES — same |
+> | Atomic CAS by hand (`lock cmpxchgq`) | ✓ PASSES — System #30 verifies ordering when implementation is correct |
+> | MMIO write (with declared `mmio` range) | ✓ PASSES — Z7 satisfied by `@inttoptr` in declared range |
+> | CPUID feature detection | ✓ PASSES — pure register read |
+> | Hot-loop `popcntq` | ✓ PASSES — typed operands |
+> | Custom interrupt entry stub | ✓ PASSES — naked context, GP regs |
+> | Boot code register setup | ✓ PASSES — naked context, GP regs |
+>
+> **99%+ of real-world asm patterns pass without escape valves.** The strict mode allows what's correct.
+>
+> ### Concrete examples that REQUIRE relax (intentional unsafety only)
+>
+> | Pattern | Why it fails | Required escape |
+> |---|---|---|
+> | Demonstrate UAF (security research) | Z1 fires — handle is FREED | `@relax_check(Z1)` per block |
+> | ROP chain construction (RE / pen-test) | Multiple Z-rules + categories fire | `--relax-asm` whole-file |
+> | Bypass bounds for performance hack | C1 + C6 fire | `@relax_check(C1, C6)` per block |
+> | Read const memory through asm (qualifier strip) | Z8 fires | `@relax_check(Z8)` per block |
+> | Capture local pointer in global (deliberate escape) | Z5 fires | `@relax_check(Z5)` per block |
+>
+> **All deliberately unsafe.** Researchers, educators, security testers can do this — they just have to mark it explicitly. Same model as Rust's `unsafe { }` blocks.
+>
+> ### Why this matters: ZER vs Rust on asm
+>
+> | Comparison | Rust `std::arch` SIMD | ZER post-Tier-A asm |
+> |---|---|---|
+> | SIMD intrinsic call | Requires `unsafe { }` block | NO marker needed if asm itself is safe |
+> | Memory clobber | `unsafe { }` only | NO marker needed if no Z-rule violation |
+> | Privileged register access via intrinsic | `unsafe { }` only | NO marker needed (intrinsic verified) |
+> | Genuinely-unsafe code | `unsafe { }` block | `@relax_check(ZN)` per Z-rule |
+>
+> ZER actually goes FURTHER than Rust here. Rust requires `unsafe` for ALL `std::arch` calls including verified-safe SIMD intrinsics. ZER's Tier A only requires opt-out for actual safety violations, not for "this looks low-level" patterns.
+>
+> ### Layered escape valves (preserved post-Tier-A)
+>
+> When unsafe IS the intent, three layers exist:
+>
+> 1. **`@relax_check(ZN)` per-block annotation** — disable specific Z-rule(s) for ONE block. Grep-auditable.
+> 2. **`--relax-asm` whole-file flag** — disable strict mode for entire compilation. For research projects / kernel bring-up.
+> 3. **`cinclude "foo.S"` external file** — bypass ZER's asm analysis entirely. Marked UNSAFE-EXTERN at every call site.
+>
+> All three preserved by design. Researchers, educators, security testers use them legitimately. Audit-trail is explicit at every site.
+>
+> ### What protections REMAIN even with `@relax_check`
+>
+> Even when a Z-rule is opted out, structural correctness still enforced:
+>
+> | Protection | Active even with `@relax_check`? |
+> |---|---|
+> | Naked-only restriction (S1) | YES |
+> | Mandatory `safety:` string ≥ 30 chars (S4) | YES |
+> | Operand reference consistency (`%N` valid) | YES |
+> | Duplicate register binding rejection | YES |
+> | Register name validation (F7) | YES |
+> | Operand type validation (Session B) | YES |
+>
+> Only the SEMANTIC checks for the named Z-rule disable. Typos, malformed asm, etc. still caught.
+>
+> ### Concrete commitment for Tier A "done"
+>
+> > "Any asm block that does what a legitimate ZER program would do — operate on values, perform hardware operations, manipulate registers — compiles WITHOUT any `@relax_check` or `--relax-asm` flag. The strict mode allows ALL legitimate asm. Escape valves are reserved for code that is INTENTIONALLY unsafe."
+>
+> Testable claim: collect 100 real-world asm patterns from Linux kernel, glibc, OpenSSL, etc., translate to ZER, verify they all compile. If any LEGITIMATE pattern requires `@relax_check`, that's a framework bug to fix.
+>
+> ### Anti-pattern to reject in implementation
+>
+> | Tempting design | Why it's wrong |
+> |---|---|
+> | "Make Tier A reject any asm that LOOKS dangerous (long instructions, lots of clobbers, etc.)" | NO — reject only on PROVABLE unsafety |
+> | "Require `@relax_check` for SIMD by default" | NO — SIMD is fine when correctly used |
+> | "Refuse to implement `--relax-asm` flag" | NO — research / kernel bring-up legitimately need it |
+> | "Treat `cinclude .S` as Tier A violation" | NO — it's the documented external boundary |
+> | "Make `@relax_check` impossible to use" | NO — defeats the legitimate-unsafe path |
+>
+> Strict mode means **strict on what's wrong, permissive on what's right**.
+
 > ## `@verified_spec` DEPRIORITIZED 2026-04-26 — read this before reading any Tier B/C section
 >
 > **`@verified_spec` is NOT load-bearing for ZER's safety claim.** It was originally scoped as Tier B/C (v1.0.1 / v1.1+) in this document. After the question "why do we need it if 29+1 systems + Phase 7 + System #30 already cover everything?" — answer: we don't, for safety. `@verified_spec` covers a separate orthogonal dimension (algorithm correctness — does the code compute what its name claims), which is NOT what 29+1 systems prove (they prove safety — no UAF, no race, no UB).

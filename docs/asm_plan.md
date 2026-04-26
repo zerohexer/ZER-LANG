@@ -173,17 +173,26 @@
 > - AVX-512 high regs deferred to demand — fixable with one-line script change when needed
 > - Tier A claim doesn't require register-count completeness; it requires safety-bug-class completeness
 >
-> ### Future probe enhancement for AVX-512
+> ### Future probe enhancement for AVX-512 (NOT trivial — requires per-fn attrs)
 >
-> One-line change in `scripts/gen_register_tables.sh`:
+> **Honest update 2026-04-27:** initial estimate of "30-min fix" was wrong. Adding `-mavx512f` to the probe DOES unlock 56 more registers in the table (verified — got to 160 valid). BUT `zerc`'s emit-time GCC invocation does NOT pass `-mavx512f`, so user code that puts `zmm16` in a clobber list compiles at the ZER stage (table accepts) and then FAILS at GCC stage (`zerc --run` errors with "the register 'zmm16' cannot be clobbered in 'asm' for the current target").
 >
-> ```bash
-> # Change probe to:
-> echo "void f(void) { __asm__ __volatile__(\"\" ::: \"$reg\"); }" \
->     | $CC -mavx512f -x c - -c -o /dev/null
+> **Real fix:** add per-function CPU feature attribute support so user writes:
+> ```zer
+> @cpu_feature_required(AVX512F)
+> naked void use_avx512_high() {
+>     asm { clobbers: ["zmm16"] ... }
+> }
 > ```
+> Checker validates `zmm16` against an AVX-512-enabled register table. Emitter passes `__attribute__((target("avx512f")))` to the generated C function. GCC then accepts the clobber.
 >
-> Re-run `make gen-asm-tables`. Adds 56 more registers automatically. No code changes elsewhere. Defer until AVX-512 asm shows up in user code.
+> **Effort:** ~6-8 hrs (parser + checker plumbing + emitter target attribute + per-function table dispatch + tests). Defer until AVX-512 demand surfaces.
+>
+> **For now:** scaffolding is in place — `EXTRA_CFLAGS` env var in `scripts/gen_register_tables.sh` allows manual override:
+> ```bash
+> EXTRA_CFLAGS="-mavx512f -mavx512vl -mavx512bw" make gen-asm-tables
+> ```
+> But ONLY useful for users who've also separately arranged for AVX-512 emit (e.g., via `zerc --extra-cflags="-mavx512f"` flag — also not yet implemented). The honest takeaway: AVX-512 is a v1.x feature, not a v1.0 30-min fix.
 >
 > ### What "Tier A done" means concretely
 >

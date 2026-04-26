@@ -3,7 +3,7 @@
  *
  * Source: GCC probe of register clobber acceptance for arch=x86_64.
  * Compiler: gcc
- * Generated: 2026-04-26T13:29:05Z
+ * Generated: 2026-04-26T15:54:39Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F2 (build-time-gen pipeline).

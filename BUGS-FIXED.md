@@ -5,6 +5,79 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 — D-Alpha-7.5 Session E3: Z1+Z2 IR-layer Z-rules (zercheck_ir.c IR_NOP)
+
+Final batch of the 13 Z-rules. Z1 (Handle UAF through asm) and Z2 (move struct → HS_TRANSFERRED through asm) are IR-layer state-machine rules — they live in `zercheck_ir.c` rather than `checker.c` because they extend Model 1 state machines (handle states, move tracking) that operate on IR locals via CFG analysis.
+
+**Architecture (matches `Z-Rules` section in compiler-internals.md):**
+- Z3-Z13 (11 rules): live in `checker.c` NODE_ASM (AST-level point properties) — done in E1+E2+E2b
+- Z1-Z2 (2 rules): live in `zercheck_ir.c` IR_NOP handler (CFG state machines on IR locals) — this commit
+
+**Implementation:**
+
+NODE_ASM lowers to `IR_NOP{expr=asm_node}` (passthrough — see ir_lower.c). The existing IR_NOP handler in zercheck_ir.c was already extending to NODE_SPAWN. Added NODE_ASM branch BEFORE the NODE_SPAWN check:
+
+```c
+case IR_NOP: {
+    if (!inst->expr) break;
+    if (inst->expr->kind == NODE_ASM && inst->expr->asm_stmt.is_structured) {
+        for each input operand:
+            walk root through NODE_FIELD/NODE_INDEX/NODE_UNARY(TOK_AMP)
+            find IR local for root NODE_IDENT
+            check handle state via ir_find_handle
+            Z1: if invalid (FREED/MAYBE_FREED/TRANSFERRED) → error
+            Z2: if type is move struct AND state is ALIVE → mark TRANSFERRED
+        break;
+    }
+    if (inst->expr->kind != NODE_SPAWN) break;
+    /* ... existing NODE_SPAWN handling ... */
+}
+```
+
+**Forward-compat status:** asm is currently restricted to `naked` functions, which can't contain Pool/Slab allocations (V4 audit rule: naked body = asm + return only) or move struct local declarations. So Handle and move struct operands are unreachable today. Z1+Z2 are correct but dormant — activate when S1 relaxes alongside Z6/Z9/Z10/Z13/Z4/Z5.
+
+**Why ship now (forward-compat rationale, same as Z6/Z4/Z5):**
+- ~50 lines of correct, documented code
+- Activates instantly when S1 relaxes — no retrofit churn
+- Same architectural pattern as the rest of the Z-rule batch
+- Reuses existing `ir_is_invalid` + `ir_should_track_move` helpers (operationally proven via lambda_zer_handle and lambda_zer_move subsets)
+
+**Cumulative Z-rule status: 10 of 13 wired**
+- ✓ Z1 (handle UAF) — E3, zercheck_ir.c
+- ✓ Z2 (move tracking) — E3, zercheck_ir.c
+- ✓ Z3 (VRP) — E2, checker.c
+- ✓ Z4 (provenance clearing) — E2b, checker.c
+- ✓ Z5 (escape from memory clobber) — E2b, checker.c
+- ✓ Z6 (defer/async ban) — E1, checker.c
+- ✓ Z7 (MMIO range — automatic) — E2, checker.c
+- ✓ Z8 (const output) — E1, checker.c
+- ✓ Z11 (keep + memory clobber) — E1, checker.c
+- ✓ Z12 (scan_frame visits operands) — E2, checker.c
+- ⏳ Z9 (ISR ban list — needs Session F instruction db)
+- ⏳ Z10 (non-storable outputs — forward-compat pending S1 relaxation)
+- ⏳ Z13 (return range — forward-compat pending S1 relaxation)
+
+**Tests:** No new tests for E3 (Z1+Z2 unconstructable in naked-only context). Activates with S1 relaxation when test pattern becomes:
+```zer
+fn process() {
+    Handle(Task) h = pool.alloc().value;
+    asm { instructions: "..."  inputs: { "rax" = h } ...  }
+    pool.free(h);
+    asm { instructions: "..."  inputs: { "rax" = h } ...  }   // Z1 fires
+}
+```
+
+**Tests after this commit:** 3,659 PASS / 0 FAIL via `make docker-check` (unchanged — forward-compat-only batch, no new tests needed). VST proofs: zero admits across 23 verification files.
+
+**Roadmap progress:**
+- Sessions A, B, D, E1, E2, E2b, E3 ✓ (Z-rule wiring 10/13 complete; remaining 3 are forward-compat pending S1 relaxation)
+- **Next: Session F (8 universal precondition categories + per-arch instruction tables)** — 150 hrs, biggest remaining asm Tier A item
+- After F: Session G (System #30 atomic ordering, ~80 hrs)
+- After G: Sessions C, H, I (per-arch register tables, Phase 1 predicate, audit log — ~50 hrs)
+- **Asm Tier A complete = v1.0 ship gate**
+
+---
+
 ## Session 2026-04-26 — Codebase audit: dead predicates wired + latent zercheck_ir UAF (4 bugs)
 
 Verified and ported fixes from `claude/quirky-hypatia-EDt9D` audit branch (DO NOT MERGE — applied changes manually after independent verification). Four real issues, each small but combined effect closes Phase-1 wiring gaps and removes a class of silent miscompiles.

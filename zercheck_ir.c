@@ -1013,11 +1013,75 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (ps->critical_depth > 0) ps->critical_depth--;
         break;
 
-    /* Phase E: IR_NOP wrapping NODE_SPAWN. Per emitter.c, spawn emits
-     * IR_NOP with inst->expr = NODE_SPAWN (passthrough path). Reroute
-     * to IR_SPAWN's logic so D3 ThreadHandle tracking fires. */
+    /* Phase E: IR_NOP wrapping NODE_SPAWN or NODE_ASM. Per emitter.c,
+     * spawn and asm emit IR_NOP with inst->expr = the AST node
+     * (passthrough path). Reroute to per-kind logic. */
     case IR_NOP: {
-        if (!inst->expr || inst->expr->kind != NODE_SPAWN) break;
+        if (!inst->expr) break;
+
+        /* D-Alpha-7.5 Session E3: Z1 (Handle UAF through asm) + Z2
+         * (move struct → HS_TRANSFERRED through asm). Forward-compat
+         * today: asm is naked-only restricted, naked excludes Pool/Slab
+         * allocations (V4 audit rule), so Handle/move-struct operands
+         * are unreachable. Activates when S1 relaxes alongside Z6/Z9/
+         * Z10/Z13. The check is correct, just dormant.
+         *
+         * SAFETY: Z1 reuses #7 Handle States (operationally proven in
+         * lambda_zer_handle subset). Z2 reuses #10 Move Tracking
+         * (operationally proven in lambda_zer_move subset). */
+        if (inst->expr->kind == NODE_ASM &&
+            inst->expr->asm_stmt.is_structured) {
+            Node *asm_node = inst->expr;
+
+            /* Z1: each input operand that resolves to a Handle local
+             * must be ALIVE. Walk through NODE_FIELD (e.g., h.index) or
+             * direct NODE_IDENT to find the root local. */
+            for (int i = 0; i < asm_node->asm_stmt.input_count; i++) {
+                AsmOperand *op = &asm_node->asm_stmt.inputs[i];
+                if (!op->expr) continue;
+                Node *root = op->expr;
+                while (root) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                    else if (root->kind == NODE_UNARY && root->unary.op == TOK_AMP)
+                        root = root->unary.operand;
+                    else break;
+                }
+                if (!root || root->kind != NODE_IDENT) continue;
+                int op_local = ir_find_local_exact_first(func,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (op_local < 0) continue;
+                IRHandleInfo *h = ir_find_handle(ps, op_local);
+                if (!h) continue;
+                /* Z1: invalid handle (FREED/MAYBE_FREED/TRANSFERRED)
+                 * used as asm operand → UAF / use-after-move. */
+                if (ir_is_invalid(h)) {
+                    ir_zc_error(zc, inst->source_line,
+                        "asm input '%.*s' uses %s handle %%%d "
+                        "(Z1 rule — handle must be ALIVE at asm operand)",
+                        (int)op->reg_name_len, op->reg_name,
+                        ir_state_name(h->state), op_local);
+                }
+                /* Z2: if local's type is a move struct, asm consumes
+                 * the value — mark TRANSFERRED so subsequent uses
+                 * trigger the existing use-after-move check. */
+                if (op_local >= 0 && op_local < func->local_count) {
+                    Type *lt = (Type *)func->locals[op_local].type;
+                    if (ir_should_track_move(lt) && h->state == IR_HS_ALIVE) {
+                        h->state = IR_HS_TRANSFERRED;
+                        h->free_line = inst->source_line;
+                    }
+                }
+            }
+
+            /* Output operands: asm writes opaque value. Existing checker.c
+             * Z3 (VRP invalidation) + Z4 (provenance clearing) cover the
+             * AST-level state; IR-level handle state is unaffected
+             * (asm output isn't an alloc / free / transfer event). */
+            break;
+        }
+
+        if (inst->expr->kind != NODE_SPAWN) break;
         Node *sp = inst->expr;
 
         /* Phase D5: spawn bans */

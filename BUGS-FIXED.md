@@ -5,6 +5,57 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-26 — D-Alpha-7.5 Session F2: build-time-gen pipeline + x86_64 register table
+
+Second sub-session of Session F. Ships the build-time-gen pipeline for per-arch register tables. F2 deliverables:
+
+**Build pipeline:**
+- `scripts/gen_register_tables.sh` — probes GCC for register validity by trying each candidate name in an inline asm clobber. Valid registers vendor to `src/safety/asm_register_tables_<arch>.c`. Generic across archs (x86_64 today, ARM64/RISC-V via cross-gcc in F5/F6).
+- `scripts/candidates_x86_64.txt` — 53 candidate names (64/32/16/8-bit GP, rip). 40 accepted by GCC. Future expansion: SIMD (xmm/ymm/zmm), x87 FP, segment regs, CR/DR.
+- `Makefile` target `make gen-asm-tables` — runs the script in a Docker container. Output is vendored, reviewed, committed.
+
+**Vendored output (committed to git):**
+- `src/safety/asm_register_tables_x86_64.c` — AUTO-GENERATED, 40 valid x86_64 registers as `ZerRegisterEntry` array.
+
+**New compiler files:**
+- `src/safety/asm_register_tables.h` — declares `ZerRegisterEntry` struct, extern arrays per arch, `zer_asm_register_valid(arch, name, len) -> int` lookup.
+- `src/safety/asm_register_lookup.c` — implements the lookup as linear scan over the per-arch table. Returns 0 for unsupported archs (graceful for ARM64/RISC-V tables not yet generated).
+
+**Architecture:** matches `docs/asm_plan.md` "SESSIONS C + F ARCHITECTURE" notice. Build-time-gen + vendored output. Same pattern as LLVM TableGen, ICU Unicode, Linux autoconf, libc++ locale data. Reproducible builds, fast runtime lookup, regen via single Make target when ISA extends.
+
+**Probe pattern (the trick that makes this work):**
+```bash
+echo "void f(void) { __asm__ __volatile__(\"\" ::: \"$reg\"); }" \
+    | gcc -x c - -c -o /dev/null
+```
+GCC accepts iff register is valid. Per-arch documentation duplicated → per-arch GCC backend is the authoritative oracle.
+
+**Why GCC of 40 not 53:**
+- `r8`/`r9` (2-letter shorthand) accepted; `r10`-`r15` need full numeric form (also accepted)
+- `rbp` rejected as clobber (frame pointer, GCC reserves)
+- `bpl` rejected (no 8-bit clobber for it in GCC convention)
+- `rip` rejected (read-only architectural)
+- `r8d`/`r9d` etc. (32-bit form) rejected as clobber (only 64-bit form recognized)
+
+These rejections are GCC's call — they're not architectural errors, they're GCC's clobber convention. ZER follows GCC's lead.
+
+**F2 does NOT yet:**
+- Add ARM64 / RISC-V tables (F5 / F6 — need cross-gcc + arch-specific candidate lists)
+- Wire `zer_asm_register_valid` into checker.c NODE_ASM (F7 — per-category enforcement)
+- Add VST proof for the lookup (deferred to Session H — Phase 1 predicate extraction wraps it)
+
+**Tests after this commit:** 3,659 PASS / 0 FAIL via `make docker-check` (unchanged — F2 adds compile-time data + lookup function not yet called from any check site). VST proofs: zero admits across 23 verification files.
+
+**Sub-session breakdown remaining:**
+- F3 — expand x86_64 candidates to full coverage (SIMD, FPU, special) ~5 hrs
+- F4 — x86_64 instruction → category table (Capstone/XED extraction) ~30 hrs
+- F5 — ARM64 register + instruction tables ~25 hrs
+- F6 — RISC-V register + instruction tables ~25 hrs
+- F7 — wire per-category enforcement in checker.c NODE_ASM ~30 hrs
+- Session G — System #30 (C8 = atomic ordering) ~80 hrs
+
+---
+
 ## Session 2026-04-26 — D-Alpha-7.5 Session F1a: 8-category framework skeleton
 
 First sub-session of Session F (the largest remaining asm Tier A piece, ~150 hrs total). F1a is the framework skeleton — declares the 8 universal precondition categories and the dispatch function signature, but ships with EMPTY tables. F4-F6 (per-arch instruction data) and F7 (per-category enforcement wiring) come in subsequent sub-sessions.

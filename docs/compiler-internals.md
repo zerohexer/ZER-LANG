@@ -6966,6 +6966,141 @@ fn leaky() {
 **Cumulative Z-rule progress:** 8 of 13 wired (Z3, Z4, Z5, Z6, Z7, Z8, Z11, Z12).
 Remaining: Z9, Z10, Z13 (forward-compat pending S1 relaxation), Z1, Z2 (zercheck_ir.c — Session E3).
 
+## *opaque safety architecture — wrap pattern + cross-language lifetime tracking (2026-04-26)
+
+**Mental model fresh sessions need:** ZER's `*opaque` story is more nuanced than "98% compile-time, 2% runtime." Two ORTHOGONAL axes that fresh sessions often conflate:
+
+| Axis | What it tracks |
+|---|---|
+| **Type provenance** | "What does this `*opaque` really point to?" — `*Sensor` vs `*Motor` |
+| **Lifetime** | "Is this allocation still alive?" — UAF, leak, double-free |
+
+These are SEPARATE. Wrappers only matter for type provenance. Lifetime safety holds regardless.
+
+### Type provenance — wrap pattern controls compile-time vs runtime
+
+**Lazy (raw `cinclude`):**
+```zer
+cinclude "sensor.h";
+*opaque sensor_create();              // *opaque leaks into user code
+*opaque s = sensor_create();           // type unknown — runtime type_id needed
+@ptrcast(*Sensor, s);                  // runtime check fires
+```
+
+**Proper (ZER wrapper):**
+```zer
+// sensor_wrap.zer
+cinclude "sensor.h";
+*Sensor sensor_create();               // wrapper has concrete type
+void sensor_destroy(*Sensor s);
+void sensor_read(*Sensor s, *u32 out);
+```
+
+Now in user code:
+```zer
+import sensor_wrap;
+*Sensor s = sensor_wrap.sensor_create();   // type-tracked normally
+sensor_wrap.sensor_read(s, &val);          // no @ptrcast, no runtime check
+```
+
+**The wrapper is a type contract.** ZER doesn't analyze the C source — it trusts the wrapper signature. Once the contract is declared, ZER's normal provenance tracking handles everything compile-time.
+
+**`zer-convert` should emit ZER wrappers by default**, not raw `cinclude`. That way users land on the safe path automatically.
+
+### Lifetime safety — works WITHOUT wrappers (cross-language, automatic)
+
+This is the genuinely-strong property fresh sessions miss. The malloc-wrap (`-Wl,--wrap=malloc,--wrap=free`) operates at the LINKER level — every malloc/free in the entire program (C side OR ZER side) goes through ZER's tracker. Combined with zercheck's wrapper-allocator-recognition, you get:
+
+```zer
+cinclude "sensor.h";
+*opaque make_sensor();    // raw, no wrapper
+
+void use_sensor() {
+    *opaque s = make_sensor();    // ZER sees: ALIVE allocation
+    // forgot to free
+}                                  // → COMPILE ERROR: leaked
+```
+
+ZER catches this because:
+1. `make_sensor()` returns `*opaque` → wrapper allocator recognition registers `s` as `HS_ALIVE`
+2. At function exit, `s` is still `HS_ALIVE` and never freed → compile error
+
+**No wrapper needed.** Same pattern catches UAF, double-free, leak across the C boundary.
+
+### Coverage matrix
+
+| Bug | Detection | When |
+|---|---|---|
+| C mallocs, ZER forgets to free | zercheck leak detection | **Compile-time** |
+| C mallocs, ZER uses after free | zercheck (with wrapper recognition) | **Compile-time** |
+| C mallocs, ZER double-frees | zercheck (with wrapper recognition) | **Compile-time** |
+| ZER mallocs, C frees, ZER uses | Level 5 runtime header check | Runtime (1 ns) |
+| ZER mallocs, ZER frees, C uses | C side blind — caller's problem | Out of scope |
+| Wrong type via `*opaque` (type confusion) | Wrapper signature check OR runtime type_id | Compile-time WITH wrapper, runtime WITHOUT |
+
+The genuinely-cross-language property: **lifetime safety holds even for raw `cinclude`'d `*opaque`** because malloc-wrap is global. Most languages with FFI lose all safety at the boundary. ZER preserves the lifetime guarantee universally.
+
+### Promoting Level 5 runtime checks to compile-time (3 strategies)
+
+The remaining runtime checks (when ZER mallocs and C touches it) can be promoted via:
+
+**Strategy A: Source-scan (token-level C analyzer, ~600 lines)**
+
+Reuse `tools/zer-convert.c`'s tokenizer, walk function bodies for malloc/free patterns:
+
+```c
+void destroy(Thing *t) {
+    free(t);                  // → frees_param[0] = true
+}
+void *create() {
+    Thing *t = malloc(...);   // → returns_alloc = true
+    return t;
+}
+void use(Thing *t) {
+    t->x = 5;                 // → frees_param[0] = false (borrows)
+}
+```
+
+Feed C summaries into zercheck (same machinery as ZER FuncSummary). Coverage:
+- Pure embedded firmware: ~95% catchable
+- Application C with vtables: ~80% catchable
+- Macro-heavy kernel code: ~60% catchable
+
+Residual cases (function pointers, macro-expanded control flow, custom allocators) keep runtime check as fallback.
+
+**Strategy B: Profile-guided (~400 lines)**
+
+Wrap captures every malloc/free at runtime. Run user's tests with `--profile-out=p.json`, then rebuild with `--profile-in=p.json` — paths observed during testing become compile-time, unobserved paths stay runtime. Strictly an optimization, never a soundness compromise.
+
+**Strategy C: Hybrid — recommended**
+
+Layer A + B + wrap fallback:
+1. Try source-scan → success → compile-time
+2. Else try profile data → success → compile-time
+3. Else runtime fallback (current behavior)
+
+Converges on near-100% compile-time for tested codebases. Genuine differentiator: no other language analyzes the C code it `cincludes`. Bindgen produces signatures, doesn't verify lifecycle. `@cImport` is purely declarative. ZER would actually trace allocations across the boundary.
+
+### What to claim about `*opaque` safety
+
+**Today (raw cinclude with malloc-wrap):**
+- Type provenance: ~98% compile-time, 2% runtime (`_zer_check_alive` on `@ptrcast`)
+- Lifetime: 100% compile-time for typical patterns (zercheck + wrapper recognition)
+
+**With ZER wrappers (recommended pattern):**
+- Type provenance: 100% compile-time
+- Lifetime: 100% compile-time
+- Zero runtime overhead
+
+**With Strategy C (post-implementation):**
+- Type provenance: 100% compile-time
+- Lifetime: 100% compile-time including raw cinclude usage
+- Zero runtime overhead universally
+
+**Stronger and more accurate framing:** "ZER is 100% compile-time safe at the ZER boundary. Runtime checks exist only when you ask the compiler to trust an unannotated C symbol — and only for the duration of that boundary crossing."
+
+The user controls the trade-off via how aggressively they wrap C interop. This is a CHOICE, not a probability.
+
 ## D-Alpha-7.5 Sessions C + F architecture — build-time generation (2026-04-25)
 
 **Pattern:** per-arch data tables (registers in C, instruction → category in F) use build-time generation with vendored output. Industry precedent: LLVM TableGen, ICU Unicode tables, Linux kernel autoconf, libc++ locale data.

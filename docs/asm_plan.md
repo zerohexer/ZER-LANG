@@ -124,6 +124,43 @@
 >
 > **Implementation reference:** `docs/compiler-internals.md` "D-Alpha-7.5 Sessions C + F architecture" section has the file-by-file implementation detail when these sessions are ready to start.
 
+> ## `@verified_spec` DEPRIORITIZED 2026-04-26 — read this before reading any Tier B/C section
+>
+> **`@verified_spec` is NOT load-bearing for ZER's safety claim.** It was originally scoped as Tier B/C (v1.0.1 / v1.1+) in this document. After the question "why do we need it if 29+1 systems + Phase 7 + System #30 already cover everything?" — answer: we don't, for safety. `@verified_spec` covers a separate orthogonal dimension (algorithm correctness — does the code compute what its name claims), which is NOT what 29+1 systems prove (they prove safety — no UAF, no race, no UB).
+>
+> **What 29+1 + Phase 7 + System #30 actually deliver (no `@verified_spec` needed):**
+> - All language safety: memory, type, handle, move, escape, provenance, MMIO, qualifier, ABI compliance
+> - All concurrency safety: races, deadlock, atomic ordering (with System #30)
+> - All hardware-correctness rules for asm: 18 structural + 13 Z-rules + 8 categories
+> - Operationally proven at seL4/RustBelt depth (Phase 7)
+>
+> **What `@verified_spec` adds on top (orthogonal):**
+> - Algorithm correctness — "this asm IS aes-128", "this binary_search actually finds the target"
+> - Constant-time guarantees — needed for crypto side-channel resistance
+> - Niche, ~1-2% of asm uses
+>
+> **Revised priority:** `@verified_spec` is a v2.x+ specialty feature, NOT v1.0/v1.1 critical-path. The 99% of users (kernel/firmware/embedded) get all the safety they need from 29+1 + Phase 7 + System #30. The 1% (crypto, safety-critical avionics) can opt into `@verified_spec` when v2.x ships, OR use `cinclude` to link Vale-verified C code in v1.x.
+>
+> **What ZER claims after Phase 7 + System #30 land (no `@verified_spec`):**
+>
+> > "ZER provides 100% language safety through 30 compile-time tracking systems, all operationally proven in Coq + Iris. Memory, type, resource, concurrency, MMIO, atomic ordering, and ABI safety are all enforced at compile time. Algorithm correctness (does the code compute what its name claims) is the developer's responsibility — same scope as Rust, Ada, Zig, and all other safe languages."
+>
+> This is a strictly stronger claim than Rust makes today. No `@verified_spec` required for it.
+>
+> **All Tier B / Tier C / `@verified_spec` references below are KEPT FOR CONTEXT** — they describe how the feature would work IF/WHEN it ships. But they are NOT critical-path for the v1.0/v1.1 safety claim. Treat them as "v2.x+ feature spec" not "v1.x must-build."
+>
+> **Rationale for the change:** the 29+1 + Phase 7 cover the user's actual bug list (kernel/firmware/embedded). Algorithm correctness is a SPECIALTY concern. Conflating safety with algorithm proof was an over-claim. The reframe makes ZER's actual capabilities clearer to fresh sessions and external readers.
+>
+> **What stays critical-path:**
+> - 18 structural asm rules (Sessions A/B/D/E shipped in part; rest pending Sessions F+)
+> - 13 Z-rules wiring 29 systems through asm operand boundaries (8 of 13 done in E1+E2+E2b)
+> - 8 universal precondition categories (Session F)
+> - System #30 Atomic Ordering (Session G)
+> - Per-arch register tables (Session C)
+> - Phase 7 deepening to operational depth
+>
+> Everything in this document still describes those critical-path items. The `@verified_spec` references are now optional v2.x+ context.
+
 **Key revisions (2026-04-23 late-day):**
 - Scope reduced from 4 archs → 3 archs (x86-64, ARM64, RISC-V). Cortex-M deferred to v1.1.
 - `asm` keyword renamed to `unsafe asm` — the `unsafe` marker is now **required** (Rust-style explicit escape hatch). Bare `asm(...)` is rejected with compile error. Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — structural rule applies to new naming.

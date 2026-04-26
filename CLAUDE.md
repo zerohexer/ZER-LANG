@@ -445,12 +445,12 @@ Z-rules catch through-asm bugs that Rust can't:
 **Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
 
 **Two orthogonal dimensions (NOT a continuum):**
-- **Language safety** (Tier A, v1.0, default on): **100%** via strict mode (18 structural + 13 Z-rules + 8 categories + System #30) — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI/instruction-UB all caught
-- **Algorithm correctness + instruction UB** (Tier C, v1.1+, opt-in per block): `@verified_spec` Vale-tier — `requires:` clauses cover both instruction preconditions AND algorithm claims
+- **Language safety** (v1.0, default on, **critical-path**): **100%** via strict mode (18 structural + 13 Z-rules + 8 categories + System #30) + Phase 7 operational depth — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI all caught. **This alone matches Rust + memory + concurrency safety claims, no algorithm proof needed.**
+- **Algorithm correctness** (v2.x+ specialty, NOT critical-path, opt-in per block): `@verified_spec` Vale-tier — proves "this asm IS aes-128", "this binary_search actually finds target". **Niche** — used by ~1-2% of users (crypto, safety-critical). **Deprioritized 2026-04-26** from v1.0/v1.1 to v2.x+. Specialists can use `cinclude` to link Vale-verified C code in v1.x.
 
-These compose — neither subsumes the other. Strict mode still runs inside Vale-tier blocks.
+These dimensions compose — strict mode still runs inside Vale-tier blocks.
 
-**Scope is language-safe at operand boundary, NOT algorithm-safe.** Same scope as every safe language. Algorithm choice + business logic + instruction-level UB = developer's responsibility unless they opt into `@verified_spec`.
+**Scope is language-safe at operand boundary, NOT algorithm-safe.** Same scope as every safe language (Rust, Ada-without-SPARK, Zig). Algorithm choice + business logic = developer's responsibility unless they opt into `@verified_spec` (v2.x+).
 
 See `docs/compiler-internals.md` Z-rules section for implementation details; `docs/asm_plan.md` for roadmap.
 

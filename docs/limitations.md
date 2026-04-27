@@ -319,6 +319,100 @@ explicit.
 
 ---
 
+## Bare-metal: `.bss` zeroing requirement (Gap 13, 2026-04-27)
+
+ZER's "everything auto-zeroed" guarantee depends on the C runtime startup
+zeroing the `.bss` section before `main()` runs. On hosted targets
+(Linux/Win/macOS), the C runtime (`crt0`/`crt1`) handles this automatically.
+
+**On bare-metal targets (Cortex-M, RISC-V, custom kernels), the user-supplied
+linker script + startup assembly MUST zero `.bss` before calling main.**
+
+Without this, uninitialized globals hold whatever random values were in RAM
+at boot — silently breaking ZER's auto-zero guarantee.
+
+Standard pattern in startup `.S` files:
+```asm
+ldr r0, =__bss_start
+ldr r1, =__bss_end
+mov r2, #0
+bss_zero:
+    cmp r0, r1
+    beq bss_done
+    str r2, [r0], #4
+    b bss_zero
+bss_done:
+```
+
+See ARM Cortex-M reference startup code, ESP-IDF's `cpu_start.c`, or
+Linux kernel's `head.S`. ZER cannot enforce this from inside its emitted
+code — it's a build-system / startup contract.
+
+If your target's startup does NOT zero `.bss`, ZER's safety guarantees
+on global variable initial state are void. Verify your linker script
+includes the `.bss` zeroing loop before claiming bare-metal correctness.
+
+---
+
+## *opaque ghost handle wrap pattern (Gap 4, 2026-04-27)
+
+`*opaque` pointers crossing the C-interop boundary (via `cinclude`-declared
+functions returning/taking `*opaque`) have heuristic-only lifetime tracking
+in zercheck. Coverage is ~98% for typical patterns but the residual ~2%
+requires the **wrap pattern** + `--track-cptrs` flag for full safety.
+
+### When the heuristic suffices
+
+zercheck recognizes the following patterns automatically:
+- `void destroy(*opaque)` — bodyless void → assumed-free heuristic
+- `int xyz_close(*opaque)` — bodyless non-void with destructor-name in
+  the function name (free, destroy, close, release, delete, dispose,
+  drop, cleanup, deinit, fini, shutdown, term) → assumed-free
+  heuristic (Gap 17 fix, 2026-04-27)
+- ZER wrapper functions where the body is visible — full FuncSummary
+  tracking applies
+
+### When the wrap pattern is required
+
+If the C library has an idiosyncratic destructor name (no recognized
+substring) AND the function body is invisible (cinclude only), the
+heuristic doesn't fire. Solution: write a thin ZER wrapper.
+
+```zer
+// thin wrapper makes intent explicit and gives zercheck a body to scan
+void mylib_dispose(*opaque h) {
+    @ptrcast(*MyType, h);  /* validate type via provenance */
+    mylib_xyz_terminate_session(h);  /* obscure C name */
+}
+```
+
+### `--track-cptrs` runtime backup
+
+For the residual 2% (anonymous casts, dynamic dispatch through C function
+pointers), enable `--track-cptrs`. This compiles in:
+- `__wrap_malloc`/`__wrap_free` linker wrap
+- Inline allocation header on every `*opaque` pointer
+- Runtime UAF detection at every `@ptrcast` deref
+
+Cost: ~1ns per `@ptrcast` deref + extra header bytes per allocation. NOT
+applicable to bare-metal (requires libc malloc).
+
+### Coverage summary
+
+| Pattern | Compile-time | Runtime backup | Total |
+|---|---|---|---|
+| Pure ZER (no `*opaque`) | 100% via Handle states | not needed | 100% |
+| `*opaque` with wrap functions | ~99% | not needed | ~99% |
+| `*opaque` raw cinclude + dtor-name fn | ~98% (heuristic) | not needed | ~98% |
+| `*opaque` raw cinclude + opaque-name fn | ~80% (alias only) | `--track-cptrs` | ~99% |
+| `*opaque` through dynamic funcptrs | ~50% (no track) | `--track-cptrs` | ~95% |
+
+Recommendation: write ZER wrappers around C libraries. The wrap pattern
+is documented architecture and pays back as runtime overhead saved +
+clearer code intent.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

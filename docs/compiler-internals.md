@@ -8220,3 +8220,216 @@ Pattern applies to any x86 instruction with imm8-or-DX operand (outb, inb, outw,
 **Final intrinsic count: 130 across all 14 batches.**
 
 Per-batch shipping cost was consistently ~1-3 hours each for 4-20 intrinsics. Total checker.c additions: ~500 lines. Total emitter.c additions: ~2000 lines. All using the proven per-arch `#if defined` dispatch pattern established in D-Alpha-1.
+
+---
+
+# Stage 1 of `docs/4-27-2026-gaps.md` Roadmap — COMPLETE 2026-04-27
+
+Detailed implementation notes for the 12 silent-gap fixes landed as
+Stage 1. Each section: WHAT was wrong, WHERE the fix is, HOW the
+pattern can be reused, WHY the design choice was made.
+
+## The synthetic var-decl pattern (Gap 30 + general)
+
+**Problem:** Parser emits desugared variables (range-for index, future
+auto-injected vars) with names that should be `_zer_` reserved. But
+checker's BUG-276 reserved-prefix check would reject the compiler's own
+synthesized symbols.
+
+**Solution:** Two-channel design.
+1. Add `bool is_synthetic` to NODE_VAR_DECL var_decl struct (`ast.h:396`).
+2. Parser sets it to `true` when emitting desugared decls.
+3. Checker has two parallel APIs:
+   - `add_symbol(c, name, len, type, line)` — public, enforces reserved-prefix.
+   - `add_symbol_synth(...)` — for compiler-synthesized symbols, bypasses.
+4. NODE_VAR_DECL handler dispatches: `is_synthetic ? add_symbol_synth : add_symbol`.
+
+**Where to use:** Whenever the parser emits a synthetic var-decl. Currently
+only range-for desugaring at `parser.c:1382`. If future desugaring (e.g.,
+implicit await result locals, monomorphization helper vars) needs the
+pattern, set `is_synthetic = true` at the parser site.
+
+**Why this design and not alternatives:**
+- `scope_add` (lower-level) skips ALL checks — would also lose error
+  messaging on legitimate redefinition. `add_symbol_synth` shares all
+  other checks with `add_symbol`.
+- A boolean checker mode flag (`c->in_synthetic = true; ... add_symbol(...)`)
+  is footgun-prone (what if forgotten to clear?). Per-call dispatch via
+  flag on the NODE itself is locally explicit.
+
+## Reserved prefix enforcement (BUG-276 hardened)
+
+**Active rule:** `_zer_` prefix (5 chars) is reserved for compiler
+internals. User code CANNOT declare `_zer_anything`.
+
+**Test for new violations:** `tests/zer_fail/range_for_zer_ri_reserved.zer`
+demonstrates the rejection. Add similar tests when introducing other
+synthetic-prefix patterns.
+
+## name_looks_like_destructor heuristic (Gap 17)
+
+**Problem:** Bodyless cinclude functions returning non-void status codes
+(common C idiom: `int destroy(*Resource)`) bypassed zercheck's free
+heuristic. The check at `zercheck.c:280-300` required `TYPE_VOID`
+return; non-void was rejected.
+
+**Solution:** Substring match on function name against 12 keyword list:
+- free, destroy, close, release, delete, dispose
+- drop, cleanup, deinit, fini, shutdown, term
+
+**Implementation:** `zercheck.c` static helper does case-insensitive
+ASCII substring match per keyword (sliding window across name).
+
+`is_free_call` decision logic:
+- void return + bodyless + *opaque/*T param → ALWAYS heuristic-free
+- non-void return + bodyless + *opaque/*T param + dtor name → heuristic-free
+- non-void return + bodyless + non-dtor name → NOT heuristic-free (avoid
+  false positives like `int strlen(*const u8)`)
+
+**Reuse the helper** for any future cleanup-detection logic. The keyword
+list is the canonical destructor-name dictionary for ZER.
+
+## ir_classify_method_call receiver-type validation (Gap 32)
+
+**Problem:** `zercheck_ir.c:664` matched method names without checking
+receiver type. Forward-compat: any future cinclude-extended struct method
+named `alloc`/`free`/etc. would falsely register handles.
+
+**Solution:** Two-tier API.
+1. `ir_receiver_is_builtin_target(c, callee)` — walks receiver type,
+   returns true only for Pool/Slab/Ring/Arena/Struct (TYPE_POINTER inner
+   also unwrapped). NULL receiver type permitted (don't drop legitimate
+   classification when typemap is incomplete).
+2. `ir_classify_method_call_ex(c, call)` — public, validates receiver.
+3. `ir_classify_method_call(call)` — backward-compat wrapper (NULL
+   checker = skip validation). Migrate call sites to `_ex` as you go.
+
+**Use `_ex` at all new call sites.** Both existing call sites (IR_ASSIGN
+at line ~1687 and IR_CALL at line ~1996) are already migrated.
+
+## IRMC_ARENA_RESET + alloc_id propagation pattern (Gap 39 partial)
+
+**Problem:** `arena.reset()` / `arena.unsafe_reset()` weren't classified.
+`defer ar.reset()` bypassed the bare-reset warning AND zercheck_ir didn't
+flag subsequent ARENA-allocated handle access as UAF.
+
+**Solution:** Add new method classification + a two-pass alias-marking
+pattern in IR_CALL handler.
+
+**Classification** (zercheck_ir.c `ir_classify_method_call_ex`):
+- "reset" (5 chars) → IRMC_ARENA_RESET
+- "unsafe_reset" (12 chars) → IRMC_ARENA_RESET
+
+**Two-pass alias propagation** (IR_CALL handler):
+- Pass 1: snapshot alloc_ids of currently-alive ARENA handles
+- Pass 2: mark every handle whose alloc_id matches one collected as FREED
+
+**Why two-pass:** Adding to `ps->handles` (in unrelated code paths) can
+realloc the array — see BUG-617-622 family. Snapshotting alloc_ids first
+makes the second pass safe even if the array is reallocated between
+ARENA-handle observations.
+
+**Reuse this pattern** for any "single op invalidates all aliases of a
+class" semantics — pool reset, slab clear, etc.
+
+**Status caveat:** This catches DIRECT ARENA-tracked handles. Slice
+locals derived from `?[*]T = ar.alloc_slice(...) orelse ...` are
+unwrapped via NODE_ORELSE and don't currently inherit ARENA color in
+zercheck_ir's tracking. Full slice-alias propagation deferred to
+Stage 6 (cross-model interface refactor).
+
+## emit_auto_guards trigger list — IR_INDEX_READ (Gap 34, HIGH)
+
+**Lesson:** When a new IR opcode is added that produces values via
+indexing (or any operation that needs auto-guards in checker analysis),
+**add it to the trigger list at `emitter.c:9633`**. Forgetting silently
+emits raw access without the guard.
+
+The full trigger list as of 2026-04-27 includes IR_ASSIGN, IR_CALL,
+IR_RETURN, IR_INTRINSIC, IR_CALL_DECOMP, IR_INDEX_READ.
+
+**Why this was missed historically:** The IR_INDEX_READ handler comment
+claimed "auto_guards separate pass handles them" — true for IR_ASSIGN
+(arrays), false for IR_INDEX_READ (pointer indexing). This is exactly
+the kind of false-comment + missing-case bug Stage 2 walker exhaustiveness
+will mechanically prevent.
+
+## Comptime depth-16 latched diagnostic (Gap 33)
+
+**Pattern:** Internal cap → silent CONST_EVAL_FAIL → confused user.
+**Fix:** Latched static booleans + outer-caller error emission.
+
+`checker.c` forward-declares `_comptime_depth_exceeded` and
+`_comptime_diag_line` near the top so resolve_type_inner can reset
+them. `eval_comptime_call_subst` sets the latch when depth >16. Both
+outer eval entry points (resolve_type_inner array-size case + NODE_CALL
+site) reset the latch before each chain and emit a clear "comptime
+call chain exceeded recursion depth (16)" error if it was set after eval.
+
+**Reuse:** Any deep-recursive eval with a depth cap should use this
+latched pattern, NOT silent CONST_EVAL_FAIL. The latch is reset before
+each top-level eval chain to prevent stale diagnostics across calls.
+
+## #pragma GCC optimize("wrapv") in preamble (Gap 14)
+
+`emitter.c` preamble emits the pragma gated on `__GNUC__ && !__clang__`.
+Guarantees signed-overflow-wraps semantics inside the .c file itself,
+regardless of caller flags. Clang ignores unknown pragmas, so gating
+prevents a warning.
+
+**Use this pattern for any future arch-independent semantic guarantee
+that GCC has a pragma for.**
+
+## switch on optional with dot-prefix arms (Gap 40)
+
+**Rejected:** `switch (v) { .has_value => {} }` where `v: ?u32` (or
+any `?T` where T has no enum/union variants).
+
+**Allowed:**
+- `switch (v) { .red => {} .green => {} }` where `v: ?Color` (enum inner)
+- `switch (v) { default => |*x| { *x = 5; } }` (capture pattern)
+- `switch (v) { default => {} ... }` (any non-dot-prefix arm)
+
+**Implementation:** `checker.c` NODE_SWITCH handler — at the start of
+the typing pass, check if scrutinee is TYPE_OPTIONAL with non-variant
+inner; iterate arms; reject any `is_enum_dot` arm.
+
+**Why this design:** Couldn't ban switch-on-optional outright (the
+existing `default => |*v|` capture is a legitimate ZER feature, see
+BUG-326 test in `test_checker_full.c`). Couldn't allow all dot-prefix
+arms (the `.has_value` pattern is the silent gap). Middle ground:
+allow when inner has variants, reject otherwise.
+
+## threadlocal + shared mutual exclusion (Gap 43)
+
+**Rejected:** `threadlocal` + `shared struct` on same global.
+
+`threadlocal` puts each thread on its own copy + own mutex. Cross-thread
+sync is impossible because threads never see each other's data. The
+combination is silent useless — declared mutex never contends.
+
+**Implementation:** `checker.c` NODE_GLOBAL_VAR handler.
+
+## Negative shift count guard (Gap 26)
+
+**Macro updated** in `emitter.c` preamble: `_zer_shl`/`_zer_shr` now
+guard `(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)`.
+
+The cast to `int64_t` ensures unsigned-typed `_b` (e.g., u32 = 0xFFFFFFFF)
+compares as a positive int64 against width, while signed-negative `_b`
+correctly hits the `< 0` branch.
+
+## Test additions and discoverability
+
+7 new regression tests in `tests/zer/` and `tests/zer_fail/`:
+- range_for_no_shadow.zer
+- range_for_zer_ri_reserved.zer
+- shift_negative_safe.zer
+- threadlocal_shared_reject.zer
+- switch_on_optional_reject.zer
+- comptime_depth_exceeded.zer
+- bodyless_destroy_status_uaf.zer
+- mmio_var_idx_guard.zer
+
+All auto-discovered by `tests/test_zer.sh` via directory scan. Total ZER
+integration test count: 505 (up from 497).

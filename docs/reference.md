@@ -866,6 +866,10 @@ switch (ready) {
 **NOTES**
 - Union switch uses capture syntax: `.variant => |val| { ... }`
 - Mutable capture: `.variant => |*val| { val.field = 5; }`
+- Optional `?T` switch (2026-04-27): `default => |*v| { ... }` capture
+  pattern works. `switch (v) { .red => ... }` works when inner is enum
+  or union. Dot-prefix arms on `?u32` / `?bool` (non-variant inner) are
+  rejected — use `if (x) |v| { ... } else { ... }` instead.
 
 **SEE ALSO**
 enum, union
@@ -2108,6 +2112,13 @@ u32 x = 5;
 u32 y = BIT(x);            // COMPILE ERROR — x is not compile-time constant
 ```
 
+**LIMITS**
+- Recursive comptime call chains have a depth cap of 16. Exceeding it
+  produces a clear compile error: `comptime call chain exceeded
+  recursion depth (16) — split the computation, hoist constants, or
+  reduce recursion depth`. Restructure to use iteration or split into
+  multiple smaller comptime functions.
+
 ---
 
 ### comptime if
@@ -2313,7 +2324,10 @@ cinclude
 `+  -  *  /  %` — All integer overflow wraps (never UB).
 
 ### Bitwise
-`&  |  ^  ~  <<  >>` — Shift by >= width returns 0 (defined).
+`&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
+The 2026-04-27 fix added negative-shift handling: signed shift counts
+that are negative (e.g., `i32 n = -1; x << n`) now return 0 instead
+of falling into C undefined behavior.
 
 ### Comparison
 `==  !=  <  >  <=  >=` — Returns bool.
@@ -2450,6 +2464,11 @@ th.join();                      // MUST join — zercheck error if not
 ```zer
 threadlocal u32 counter;    // each thread has its own copy
 ```
+- 2026-04-27: `threadlocal shared struct X g;` is rejected. The two
+  annotations are mutually exclusive — `threadlocal` gives each thread
+  its own copy + own mutex, so cross-thread synchronization is
+  impossible. Use either `threadlocal` (per-thread isolation) OR
+  `shared` (cross-thread synchronization), not both.
 
 ### @once — Thread-Safe Init
 ```zer

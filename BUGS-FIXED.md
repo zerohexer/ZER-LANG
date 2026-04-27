@@ -5,6 +5,275 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-27 — Stage 1 of `docs/4-27-2026-gaps.md` roadmap: 12 silent gaps closed
+
+Stage 1 (Quick wins, ~25 hrs estimated) of the implementation roadmap in
+`docs/4-27-2026-gaps.md` is complete. Twelve silent-gap fixes verified
+against full `make check` test suite (505 ZER integration tests + module
++ Rust + Zig translations + C unit tests, all passing).
+
+Branch: main. Commit: see git log.
+
+### BUG-624: Range-for desugaring used unreserved `__ri` identifier (Gap 30)
+
+**Symptom:** User code declaring `u32 __ri = 999;` was silently shadowed
+by the range-for desugaring's index variable. After the loop, the user's
+`__ri` held the loop's last value, not 999.
+
+**Root cause:** `parser.c:1372` desugaring used `"__ri"` (4 chars) — the
+checker's reserved-prefix check (`checker.c:191`) only enforces `_zer_`
+(5 chars), so `__ri` was a valid user name AND the desugaring's name.
+
+**Fix:** Renamed to `_zer_ri` (reserved). Added `is_synthetic` flag on
+NODE_VAR_DECL + `add_symbol_synth` checker variant that bypasses the
+reserved-prefix check for compiler-emitted desugaring. User declarations
+of `_zer_ri` now error correctly; compiler-emitted vars sail through.
+
+**Test:** `tests/zer/range_for_no_shadow.zer` (positive: `__ri = 999`
+preserved across range-for) + `tests/zer_fail/range_for_zer_ri_reserved.zer`
+(negative: user-declared `_zer_ri` rejected with reserved-prefix error).
+
+### BUG-625: `_zer_shl/_zer_shr` macros undefined behavior on negative shift count (Gap 26)
+
+**Symptom:** `i32 n = -1; value << n` compiled cleanly via the `_zer_shl`
+macro and fell through to `(a) << -1` = C undefined behavior. ZER's spec
+guarantees "shift by >= width OR < 0 returns 0," but the macro guard only
+checked `b >= width`.
+
+**Root cause:** `emitter.c:4505-4510` macros only guarded `_b >= width`.
+Signed shift count with negative value satisfied this check (since `-1 <
+width`) and proceeded to UB in C.
+
+**Fix:** Cast `_b` to `int64_t` and guard both `< 0` AND `>= width`. The
+cast ensures unsigned-typed `_b` (e.g., u32 = 0xFFFFFFFF) compares as a
+positive int64 against width, while signed negative `_b` correctly
+triggers the `< 0` branch.
+
+**Test:** `tests/zer/shift_negative_safe.zer` exercises both `<<` and
+`>>` with negative shift count, asserts result is 0.
+
+### BUG-626: `ir_classify_method_call` matched method name without receiver-type validation (Gap 32)
+
+**Symptom:** Forward-compat: any method call whose name was `alloc`/`free`/
+etc. could trigger handle tracking, regardless of receiver type. Future
+cinclude-extended structs with method-call syntax could falsely register
+handles.
+
+**Root cause:** `zercheck_ir.c:664` classified by method name only.
+
+**Fix:** Added `ir_receiver_is_builtin_target(c, callee)` helper that
+walks receiver type and accepts only Pool/Slab/Ring/Arena/Struct (Task
+auto-slab). Public wrapper `ir_classify_method_call_ex(c, call)` validates
+receiver before matching method name. Backward-compat `ir_classify_method_call(call)`
+delegates with NULL checker (skip validation, current behavior). Both
+existing call sites in zercheck_ir.c migrated to `_ex` variant.
+
+**Test:** No regression (existing tests verify behavior unchanged for
+real Pool/Slab/Arena receivers); forward-compat fix prevents future
+silent gaps when cinclude-extended types land.
+
+### BUG-627: `threadlocal shared struct` accepted with useless per-thread mutex (Gap 43)
+
+**Symptom:** `threadlocal Counter g;` where `Counter` is `shared struct`
+was accepted. Each thread got its own copy of the struct AND its own
+mutex; cross-thread synchronization was impossible. User believed they
+had a shared global.
+
+**Root cause:** `threadlocal` (per-thread storage, `__thread`) and
+`shared` (cross-thread synchronization, mutex) are orthogonal concepts
+that don't compose meaningfully. No check rejected the combination.
+
+**Fix:** Added rejection at `checker.c` NODE_GLOBAL_VAR handler — if
+`is_threadlocal && (is_shared || is_shared_rw)`, emit error.
+
+**Test:** `tests/zer_fail/threadlocal_shared_reject.zer`.
+
+### BUG-628: Switch on `?T` accepted dot-prefix variant arms on non-variant inner (Gap 40)
+
+**Symptom:** `?u32 v; switch (v) { .has_value => {} default => {} }`
+compiled in ZER and escaped to GCC as `'has_value' undeclared`. User
+got confused error from generated C.
+
+**Root cause:** `checker.c:8540`+ NODE_SWITCH typing didn't validate
+arm patterns against scrutinee type when scrutinee is `?T` and inner is
+not enum/union.
+
+**Fix:** Added check at the start of NODE_SWITCH typing: if scrutinee
+is `?T` AND inner is not `TYPE_ENUM`/`TYPE_UNION`, reject any
+`is_enum_dot` arm with an explicit error directing the user to
+`if (x) |v|` unwrap or `default => |*v|` capture.
+
+Preserved as legitimate: `?Enum` / `?Union` switch with dot-prefix
+variants (existing feature, see `tests/zer/optional_enum_switch.zer`).
+Preserved: `default => |*v| { ... }` capture pattern.
+
+**Test:** `tests/zer_fail/switch_on_optional_reject.zer`.
+
+### BUG-629: Comptime depth-16 cap silently propagated CONST_EVAL_FAIL (Gap 33)
+
+**Symptom:** Recursive comptime calls exceeding depth 16 returned
+CONST_EVAL_FAIL silently. Caller saw "comptime arg not constant" or
+"could not be evaluated" — confusing because the function and args were
+fine; it was the recursion depth.
+
+**Root cause:** `checker.c:1727` `_comptime_call_depth > 16` returned
+CONST_EVAL_FAIL with no diagnostic. Outer eval-entry sites just emitted
+generic "could not be evaluated" fallback.
+
+**Fix:** Added latched static booleans `_comptime_depth_exceeded` +
+`_comptime_diag_line` (forward-declared at line ~1172 so resolve_type_inner
+can reset them). Set inside `eval_comptime_call_subst` when depth >16
+hit. Both outer eval entry points (resolve_type_inner array-size case +
+NODE_CALL site) reset the latch before each chain and emit a clear
+"comptime call chain exceeded recursion depth (16)" error if it was
+set after eval.
+
+**Test:** `tests/zer_fail/comptime_depth_exceeded.zer` (recursive
+`deep(n)` with n=20 — first error is the new explicit message).
+
+### BUG-630: Bodyless non-void destructor function not recognized as free (Gap 17)
+
+**Symptom:** `i32 destroy(*Resource p);` (bodyless declaration with
+non-void return + destructor name) didn't trigger zercheck's free
+heuristic. Use after `destroy(res)` was silent UAF; instead, zercheck
+reported `r` as "leaked" since no recognized free was seen.
+
+**Root cause:** `zercheck.c:280-300` `is_free_call` heuristic required
+return type to be void. Non-void return (common for status codes)
+silently bypassed.
+
+**Fix:** Added `name_looks_like_destructor` helper recognizing 12
+substrings (case-insensitive ASCII): free, destroy, close, release,
+delete, dispose, drop, cleanup, deinit, fini, shutdown, term. Heuristic
+now widens to non-void return when name matches a destructor pattern.
+Void return path unchanged (catches `void destroy(...)` regardless of name).
+
+**Test:** `tests/zer_fail/bodyless_destroy_status_uaf.zer` (uses
+`i32 destroy_with_status(*Resource)` — UAF caught at use site).
+
+### BUG-631: IR_INDEX_READ silent miscompile — MMIO variable index missing auto-guard (Gap 34) — HIGH
+
+**Symptom:** `volatile *u32 reg = @inttoptr(...); reg[i]` with variable
+index emitted compiler warning "MMIO index 'i' not proven in range —
+auto-guard inserted" but the emitted C had raw `_zer_t1 = reg[i];` with
+NO bounds check. Hosted: SIGSEGV catches if address unmapped. Baremetal:
+silent corruption (entire address space valid).
+
+**Root cause:** `emitter.c:9633` `emit_auto_guards` pre-pass trigger list
+included IR_ASSIGN/IR_CALL/IR_RETURN/IR_INTRINSIC/IR_CALL_DECOMP but not
+IR_INDEX_READ. Array indexing `arr[i]` lowers as IR_ASSIGN (trigger
+fires), but pointer indexing `reg[i]` lowers as IR_INDEX_READ (trigger
+NOT in list). Comment in IR_INDEX_READ handler claimed pre-pass handled
+it — true for IR_ASSIGN, was false for IR_INDEX_READ.
+
+**Fix:** Added `IR_INDEX_READ` to the trigger list. Emitted C now
+contains `if ((size_t)(i) >= 8u) { return 0; }` before `_zer_t1 = reg[i];`.
+
+**Test:** `tests/zer/mmio_var_idx_guard.zer` (positive — read with
+OOB index returns 0 via auto-guard, exit 0).
+
+### BUG-632: Arena.reset() not classified in zercheck_ir.c (Gap 39 — partial)
+
+**Symptom:** `arena.reset()` in defer (`defer ar.reset()`) bypassed
+the bare-reset warning AND zercheck_ir didn't track ARENA-colored
+handles through reset. Subsequent slice access was silent runtime UAF.
+
+**Root cause:** `zercheck_ir.c:664` `ir_classify_method_call` had no
+case for `reset`/`unsafe_reset` — they classified as IRMC_NONE.
+
+**Fix:** Added `IRMC_ARENA_RESET` enum + classifier branches for
+"reset" (5 chars) and "unsafe_reset" (12 chars). IR_CALL handler now
+walks all handles where source_color == ZC_COLOR_ARENA and marks them
+FREED, with alloc_id propagation to catch aliases (two-pass: collect
+alloc_ids first to avoid realloc-invalidation per BUG-617 family).
+
+**Status:** PARTIAL. Direct ARENA-tracked handles are now flagged.
+Full slice-alias propagation through `?[*]T orelse` unwrap requires
+slice-local handle tracking, deferred to Stage 6 (cross-model interface
+refactor) per `docs/4-27-2026-gaps.md`.
+
+**Test:** No new regression test added (the basic case requires slice
+tracking that's still pending). The `tests/zer_gaps/audit3_arena_scoped_defer_uaf.zer`
+reproducer (from `claude/cool-johnson-RO2mv` branch) documents the
+remaining slice-alias case.
+
+### BUG-633: -fwrapv not enforced when user invokes own gcc on emitted C (Gap 14)
+
+**Symptom:** Emitted C compiled with user's own gcc command (without
+`-fwrapv`) had signed-overflow UB at any optimization level. ZER's
+"signed overflow wraps" guarantee silently broken.
+
+**Fix:** Emitted `#pragma GCC optimize("wrapv")` in preamble, gated on
+`__GNUC__ && !__clang__` (clang ignores unknown pragmas). Forces wrapv
+inside the .c file regardless of caller flags.
+
+**Test:** Verified by inspecting emitted C preamble; full suite passes.
+
+### Documentation: Gap 13 (.bss zeroing on bare-metal) + Gap 4 (*opaque wrap pattern)
+
+Added two new sections to `docs/limitations.md`:
+1. Bare-metal `.bss` zeroing requirement — explicit documentation of
+   the linker/startup contract ZER's "auto-zero" guarantee depends on,
+   with standard Cortex-M startup pattern reference.
+2. `*opaque` ghost handle wrap pattern — explicit recommendation to
+   wrap C library functions in ZER, plus coverage table showing
+   compile-time vs runtime safety percentages for each interop pattern.
+
+### New patterns introduced in Stage 1 (load-bearing for future work)
+
+1. **`is_synthetic` flag on NODE_VAR_DECL** — distinguishes parser-emitted
+   desugaring from user source. Use when introducing future desugaring
+   that must use `_zer_` reserved-prefix names.
+2. **`add_symbol_synth(c, name, len, type, line)`** — checker primitive
+   bypassing reserved-prefix check. ONLY for parser-synthesized vars.
+3. **`name_looks_like_destructor(name, len)`** in zercheck.c — destructor
+   name substring matcher. Reusable for any future cleanup-detection
+   heuristic.
+4. **`ir_classify_method_call_ex(c, call)`** — pattern: pass Checker
+   through to receiver-type-validating classifier. Use when future
+   methods are added.
+5. **`IRMC_ARENA_RESET` + alloc_id propagation pattern** — reference
+   implementation for "single op invalidates all aliases of a class."
+   Reusable when other "reset/clear/free-all" semantics are added.
+6. **`#pragma GCC optimize("wrapv")` in preamble** — defensive emission
+   pattern. Applies to any future arch-independent semantic guarantee
+   that GCC has a pragma for.
+
+### Test additions
+
+7 new regression tests added (auto-discovered by `tests/test_zer.sh`):
+- `tests/zer/range_for_no_shadow.zer` (positive)
+- `tests/zer/shift_negative_safe.zer` (positive)
+- `tests/zer/mmio_var_idx_guard.zer` (positive)
+- `tests/zer_fail/range_for_zer_ri_reserved.zer` (negative)
+- `tests/zer_fail/threadlocal_shared_reject.zer` (negative)
+- `tests/zer_fail/switch_on_optional_reject.zer` (negative)
+- `tests/zer_fail/comptime_depth_exceeded.zer` (negative)
+- `tests/zer_fail/bodyless_destroy_status_uaf.zer` (negative)
+
+Total ZER integration test count: 505 (up from 497).
+
+### Files modified
+
+- `ast.h` — added `is_synthetic` field to var_decl
+- `parser.c` — range-for desugaring uses `_zer_ri` + `is_synthetic`
+- `checker.c` — added `add_symbol_synth`, gated reserved-prefix check;
+  threadlocal+shared reject; switch on optional dot-prefix reject;
+  comptime depth-16 explicit error; latched depth-exceeded statics
+- `emitter.c` — `_zer_shl/_zer_shr` negative-shift guard; IR_INDEX_READ
+  in `emit_auto_guards` trigger; `#pragma GCC optimize("wrapv")` in preamble
+- `zercheck.c` — added `name_looks_like_destructor`; widened `is_free_call`
+  heuristic to non-void return on destructor-name match
+- `zercheck_ir.c` — `IRMC_ARENA_RESET` enum + classifier; `ir_receiver_is_builtin_target`
+  helper; `ir_classify_method_call_ex` with receiver validation; IR_CALL
+  handler walks ARENA handles + alloc_id aliases on reset
+- `docs/limitations.md` — Gap 13 + Gap 4 sections
+- `docs/4-27-2026-gaps.md` — Stage 1 marked COMPLETE; cumulative count
+  17 of 47 closed (12 main + 5 branch)
+- `BUGS-FIXED.md` — this entry
+
+---
+
 ## Session 2026-04-26 — D-Alpha-7.5 Session F3: x86_64 candidates expanded to full coverage
 
 **Validates F3.** Expanded `scripts/candidates_x86_64.txt` from 53 candidates (F2's GP-only) to 213 candidates covering full register set: GP (64/32/16/8-bit including r8-r15 sub-forms), SIMD (xmm/ymm/zmm 0-31), x87 FP (st, st(0)-(7)), MMX (mm0-7), AVX-512 mask (k0-7), segment regs, control regs (cr0-15), debug regs (dr0-7), rip.

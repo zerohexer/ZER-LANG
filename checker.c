@@ -186,10 +186,13 @@ static Symbol *add_symbol_internal(Checker *c, const char *name, uint32_t name_l
     return sym;
 }
 
-static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
-                          Type *type, int line) {
+/* Internal: add_symbol implementation parameterized by reserved-prefix
+ * enforcement. Public wrapper add_symbol() always enforces; the synthetic
+ * variant add_symbol_synth() bypasses for parser-emitted desugaring (Gap 30). */
+static Symbol *add_symbol_impl(Checker *c, const char *name, uint32_t name_len,
+                               Type *type, int line, bool enforce_reserved) {
     /* BUG-276: warn on _zer_ prefixed names — reserved for compiler internals */
-    if (name_len >= 5 && memcmp(name, "_zer_", 5) == 0) {
+    if (enforce_reserved && name_len >= 5 && memcmp(name, "_zer_", 5) == 0) {
         checker_error(c, line,
             "identifier '%.*s' uses reserved prefix '_zer_' — "
             "may collide with compiler-generated names",
@@ -216,6 +219,20 @@ static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
         checker_error(c, line, "redefinition of '%.*s'", (int)name_len, name);
     }
     return sym;
+}
+
+/* Public: enforces reserved prefix (rejects user-declared _zer_*). */
+static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
+                          Type *type, int line) {
+    return add_symbol_impl(c, name, name_len, type, line, true);
+}
+
+/* Public: bypasses reserved-prefix check — used by parser-synthesized
+ * desugaring (e.g., range-for _zer_ri). User-source code should always
+ * use add_symbol(). */
+static Symbol *add_symbol_synth(Checker *c, const char *name, uint32_t name_len,
+                                Type *type, int line) {
+    return add_symbol_impl(c, name, name_len, type, line, false);
 }
 
 static Symbol *find_symbol(Checker *c, const char *name, uint32_t name_len, int line) {
@@ -1151,6 +1168,12 @@ static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, in
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx);
 static Scope *_comptime_global_scope; /* set before eval for nested comptime calls */
 
+/* Gap 33 (2026-04-27): hoisted up so resolve_type_inner can reset the
+ * latch before its eval chain. Set inside eval_comptime_call_subst when
+ * depth >16 hit; surfaced as explicit checker_error by outermost caller. */
+static bool _comptime_depth_exceeded = false;
+static int _comptime_diag_line = 0;
+
 /* Recursive TypeNode substitution: clone the TypeNode tree with type param T replaced.
  * Used by container monomorphization to handle arbitrarily nested T references:
  * ?*Container(T), *T, []T, T[N], etc. */
@@ -1350,10 +1373,22 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                     }
                     if (all_const && fn->func_decl.body) {
                         _comptime_global_scope = c->global_scope;
+                        /* Gap 33: clear depth latch before this eval chain. */
+                        _comptime_depth_exceeded = false;
+                        _comptime_diag_line = 0;
                         ComptimeCtx cctx;
                         ct_ctx_init(&cctx, cparams, pc);
                         val = eval_comptime_block(fn->func_decl.body, &cctx);
                         ct_ctx_free(&cctx);
+                        /* Gap 33: surface explicit error if depth limit hit. */
+                        if (val == CONST_EVAL_FAIL && _comptime_depth_exceeded) {
+                            checker_error(c,
+                                _comptime_diag_line ? _comptime_diag_line : tn->loc.line,
+                                "comptime call chain exceeded recursion depth (16) — "
+                                "split the computation, hoist constants, or reduce "
+                                "recursion depth");
+                            _comptime_depth_exceeded = false;
+                        }
                     }
                 }
             }
@@ -1642,11 +1677,21 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
  * Looks up the callee as a comptime function and recursively evaluates.
  * Uses _comptime_global_scope (declared above, line ~1082) and _comptime_call_depth. */
 static int _comptime_call_depth = 0;  /* recursion guard for nested comptime calls */
+/* _comptime_depth_exceeded / _comptime_diag_line declared at line ~1172
+ * (forward-hoisted for resolve_type_inner — Gap 33). */
 static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params, int outer_count) {
     if (!call || call->kind != NODE_CALL || !call->call.callee ||
         call->call.callee->kind != NODE_IDENT || !_comptime_global_scope)
         return CONST_EVAL_FAIL;
-    if (_comptime_call_depth > 16) return CONST_EVAL_FAIL; /* prevent infinite recursion */
+    if (_comptime_call_depth > 16) {
+        /* Gap 33: latch the condition so the outermost caller can emit
+         * a single clear error. Don't emit here — recursive callers would
+         * each emit, producing a noisy stack trace of the same problem. */
+        _comptime_depth_exceeded = true;
+        if (call->loc.line > _comptime_diag_line)
+            _comptime_diag_line = call->loc.line;
+        return CONST_EVAL_FAIL;
+    }
     _comptime_call_depth++;
     Symbol *sym = scope_lookup(_comptime_global_scope,
         call->call.callee->ident.name, (uint32_t)call->call.callee->ident.name_len);
@@ -4520,6 +4565,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     } else if (fn->func_decl.body) {
                         _comptime_global_scope = c->global_scope;
+                        /* Gap 33: clear depth latch before this eval chain. */
+                        _comptime_depth_exceeded = false;
+                        _comptime_diag_line = 0;
                         /* BUG-593: for float-returning comptime functions, skip
                          * the integer eval_comptime_block path entirely. Float
                          * args are stored as int64 bit-patterns in cparams;
@@ -4535,6 +4583,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             ct_ctx_init(&cctx, cparams, pc);
                             val = eval_comptime_block(fn->func_decl.body, &cctx);
                             ct_ctx_free(&cctx);
+                        }
+                        /* Gap 33: surface explicit error if depth limit hit. */
+                        if (val == CONST_EVAL_FAIL && _comptime_depth_exceeded) {
+                            checker_error(c,
+                                _comptime_diag_line ? _comptime_diag_line : node->loc.line,
+                                "comptime call chain exceeded recursion depth (16) — "
+                                "split the computation, hoist constants, or reduce "
+                                "recursion depth");
+                            _comptime_depth_exceeded = false;
                         }
                         if (val != CONST_EVAL_FAIL) {
                             /* BUG-fix (Gemini audit 2026-04-21): comptime eval
@@ -7546,9 +7603,13 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
-        Symbol *sym = add_symbol(c, node->var_decl.name,
-                                 (uint32_t)node->var_decl.name_len,
-                                 type, node->loc.line);
+        Symbol *sym = node->var_decl.is_synthetic
+            ? add_symbol_synth(c, node->var_decl.name,
+                               (uint32_t)node->var_decl.name_len,
+                               type, node->loc.line)
+            : add_symbol(c, node->var_decl.name,
+                         (uint32_t)node->var_decl.name_len,
+                         type, node->loc.line);
         if (sym) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;
@@ -8377,6 +8438,46 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "cannot switch on float type '%s' — use if/else for float comparisons",
                 type_name(expr));
+        }
+
+        /* Gap 40 (2026-04-27): switch on optional (?T) is permitted with:
+         *   - `default => |*v| { ... }` capture pattern, OR
+         *   - dot-prefix arms matching variants of the inner type
+         *     (e.g., `?Color` switches on enum Color's variants)
+         * Reject dot-prefix arms when inner type has no variants — catches
+         * user error of treating `.has_value`/`.value` as variants on
+         * `?u32`/`?bool`/etc., which previously escaped to GCC as
+         * undeclared field. */
+        if (expr_eff && expr_eff->kind == TYPE_OPTIONAL) {
+            Type *inner = type_unwrap_distinct(expr_eff->optional.inner);
+            bool inner_has_variants = inner && (inner->kind == TYPE_ENUM ||
+                                                inner->kind == TYPE_UNION);
+            if (!inner_has_variants) {
+                for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+                    SwitchArm *arm = &node->switch_stmt.arms[i];
+                    if (arm->is_enum_dot && arm->value_count > 0) {
+                        Node *val = arm->values[0];
+                        const char *vname = NULL;
+                        int vlen = 0;
+                        if (val->kind == NODE_IDENT) {
+                            vname = val->ident.name;
+                            vlen = (int)val->ident.name_len;
+                        } else if (val->kind == NODE_FIELD) {
+                            vname = val->field.field_name;
+                            vlen = (int)val->field.field_name_len;
+                        }
+                        checker_error(c, val->loc.line,
+                            "cannot match variant '.%.*s' on optional type "
+                            "'%s' — inner type has no enum/union variants. "
+                            "Use 'if (x) |v| { ... } else { ... }' to unwrap, "
+                            "or 'switch (x) { default => |*v| { ... } }' "
+                            "for capture",
+                            vlen ? vlen : 0, vname ? vname : "",
+                            type_name(expr));
+                        break;
+                    }
+                }
+            }
         }
 
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
@@ -10272,6 +10373,23 @@ static void register_decl(Checker *c, Node *node) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
         }
+        /* Gap 43 (2026-04-27): reject threadlocal shared struct combination.
+         * `threadlocal` puts each thread on its own copy with its own mutex;
+         * cross-thread synchronization is impossible because threads never
+         * see each other's data. The two annotations are orthogonal —
+         * combining them produces silent useless-mutex emission. */
+        if (node->var_decl.is_threadlocal && type) {
+            Type *eff = type_unwrap_distinct(type);
+            if (eff && eff->kind == TYPE_STRUCT &&
+                (eff->struct_type.is_shared || eff->struct_type.is_shared_rw)) {
+                checker_error(c, node->loc.line,
+                    "'threadlocal' and 'shared' on '%.*s' are mutually exclusive — "
+                    "threadlocal gives each thread its own copy + mutex, so cross-thread "
+                    "synchronization is impossible. Use either threadlocal (per-thread) "
+                    "OR shared (cross-thread), not both",
+                    (int)node->var_decl.name_len, node->var_decl.name);
+            }
+        }
         /* BUG-253: non-null pointer (*T) requires initializer at global scope too */
         if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
             checker_error(c, node->loc.line,
@@ -10279,9 +10397,13 @@ static void register_decl(Checker *c, Node *node) {
                 "use '?*%s' for nullable pointers",
                 type_name(type->pointer.inner), type_name(type->pointer.inner));
         }
-        Symbol *sym = add_symbol(c, node->var_decl.name,
-                                 (uint32_t)node->var_decl.name_len,
-                                 type, node->loc.line);
+        Symbol *sym = node->var_decl.is_synthetic
+            ? add_symbol_synth(c, node->var_decl.name,
+                               (uint32_t)node->var_decl.name_len,
+                               type, node->loc.line)
+            : add_symbol(c, node->var_decl.name,
+                         (uint32_t)node->var_decl.name_len,
+                         type, node->loc.line);
         if (sym) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;

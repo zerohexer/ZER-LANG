@@ -645,6 +645,7 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
  *   IRMC_FREE       — pool/slab.free(h), Task.free() → FREED
  *   IRMC_FREE_PTR   — slab/Task.free_ptr(p)          → FREED
  *   IRMC_ARENA_ALLOC — arena.alloc(T)                → ARENA color
+ *   IRMC_ARENA_RESET — arena.reset() / unsafe_reset() → mark all ARENA handles FREED
  * ================================================================ */
 
 typedef enum {
@@ -655,16 +656,66 @@ typedef enum {
     IRMC_FREE,
     IRMC_FREE_PTR,
     IRMC_ARENA_ALLOC,
+    IRMC_ARENA_RESET,   /* Gap 39 (2026-04-27): arena.reset()/unsafe_reset() */
 } IRMethodKind;
+
+/* Validate that the receiver of a method call is a builtin allocator
+ * type (Pool/Slab/Ring/Arena), a TYPE_STRUCT (for Task.alloc auto-slab),
+ * or unknown (NULL). Returns true if the receiver could legitimately
+ * have one of the recognized builtin methods.
+ *
+ * Gap 32 fix (2026-04-27): name-only matching previously fired for any
+ * method called `alloc`/`free`/etc., regardless of receiver type. With
+ * future cinclude-extended struct types or user-method-style sugar, a
+ * non-builtin .alloc() could trigger wrong handle tracking. Receiver
+ * validation prevents that.
+ *
+ * NULL receiver type is permitted: ZER's checker doesn't always populate
+ * the typemap for the receiver of method calls (especially after
+ * desugaring). Returning false on NULL would silently drop legitimate
+ * builtin classification. */
+static bool ir_receiver_is_builtin_target(Checker *c, Node *callee) {
+    if (!callee || callee->kind != NODE_FIELD) return false;
+    Node *recv = callee->field.object;
+    if (!recv) return false;
+    Type *rt = checker_get_type(c, recv);
+    if (!rt) {
+        /* Fall back to symbol lookup for bare ident receivers. */
+        if (recv->kind == NODE_IDENT && c) {
+            Symbol *sym = scope_lookup(c->current_scope,
+                recv->ident.name, (uint32_t)recv->ident.name_len);
+            if (sym) rt = sym->type;
+        }
+    }
+    if (!rt) return true;  /* unknown — don't drop classification */
+    Type *eff = type_unwrap_distinct(rt);
+    if (!eff) return true;
+    /* Pointer to a known target counts (e.g., *Pool, *Slab via param). */
+    if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+    if (!eff) return true;
+    switch (eff->kind) {
+        case TYPE_POOL:
+        case TYPE_SLAB:
+        case TYPE_RING:
+        case TYPE_ARENA:
+        case TYPE_STRUCT:   /* Task.alloc auto-slab sugar */
+            return true;
+        default:
+            return false;
+    }
+}
 
 /* Classify a NODE_CALL expression as a builtin method call. Returns
  * IRMC_* kind, or IRMC_NONE if not recognized. The callee must be
- * NODE_FIELD with a method name matching one of the patterns. Arg
- * count is also validated where relevant. */
-static IRMethodKind ir_classify_method_call(Node *call) {
+ * NODE_FIELD with a method name matching one of the patterns AND the
+ * receiver type must be a recognized builtin target. Arg count is
+ * also validated where relevant. */
+static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     if (!call || call->kind != NODE_CALL) return IRMC_NONE;
     Node *callee = call->call.callee;
     if (!callee || callee->kind != NODE_FIELD) return IRMC_NONE;
+    /* Gap 32: receiver must be a builtin target type. */
+    if (!ir_receiver_is_builtin_target(c, callee)) return IRMC_NONE;
     const char *m = callee->field.field_name;
     uint32_t ml = (uint32_t)callee->field.field_name_len;
     /* alloc — Pool/Slab/Task with 0 args (arena.alloc has 1 arg — type) */
@@ -676,7 +727,20 @@ static IRMethodKind ir_classify_method_call(Node *call) {
     if (ml == 3 && memcmp(m, "get", 3) == 0) return IRMC_GET;
     if (ml == 4 && memcmp(m, "free", 4) == 0) return IRMC_FREE;
     if (ml == 8 && memcmp(m, "free_ptr", 8) == 0) return IRMC_FREE_PTR;
+    /* Gap 39: arena.reset() / arena.unsafe_reset() invalidates ALL handles
+     * allocated from this arena. Both bare-call and defer-wrapped invoke
+     * this classification — defer body emits the call at scope exit, but
+     * the user's intent is identical. */
+    if (ml == 5 && memcmp(m, "reset", 5) == 0) return IRMC_ARENA_RESET;
+    if (ml == 12 && memcmp(m, "unsafe_reset", 12) == 0) return IRMC_ARENA_RESET;
     return IRMC_NONE;
+}
+
+/* Backward-compat wrapper for callsites that don't have Checker handy.
+ * Without checker, receiver-type validation is skipped (current behavior).
+ * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
+static IRMethodKind ir_classify_method_call(Node *call) {
+    return ir_classify_method_call_ex(NULL, call);
 }
 
 /* Unwrap orelse-wrapped alloc: `pool.alloc() orelse return` — the IR
@@ -1628,7 +1692,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
 
             if (rhs && rhs->kind == NODE_CALL) {
-                IRMethodKind mc = ir_classify_method_call(rhs);
+                IRMethodKind mc = ir_classify_method_call_ex(zc->checker, rhs);
                 if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
                     IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                     if (h) {
@@ -1937,7 +2001,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * alloc/alloc_ptr when dest_local is set → register dest ALIVE.
          * free/free_ptr → mark handle FREED. get → UAF check. */
         if (inst->expr && inst->expr->kind == NODE_CALL) {
-            IRMethodKind mc = ir_classify_method_call(inst->expr);
+            IRMethodKind mc = ir_classify_method_call_ex(zc->checker, inst->expr);
             /* Alloc via IR_CALL path (e.g., %1 = heap.alloc()) */
             if ((mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) && inst->dest_local >= 0) {
                 IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
@@ -1963,6 +2027,45 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->alloc_line = inst->source_line;
                     h->alloc_id = inst->dest_local;
                     h->source_color = ZC_COLOR_ARENA;
+                }
+                break;
+            }
+            /* Gap 39 (2026-04-27): arena.reset() / unsafe_reset() invalidates
+             * all handles whose source_color is ZC_COLOR_ARENA, AND any
+             * aliases sharing alloc_id (so unwrapped pointers from
+             * `?[*]T s = ar.alloc_slice(...) orelse ...` are also flagged).
+             * Two-pass: collect ARENA alloc_ids first (since reallocs from
+             * adding may invalidate pointers — Gap 20-25 family), then
+             * walk and mark any handle in the set FREED. */
+            if (mc == IRMC_ARENA_RESET) {
+                /* Pass 1: snapshot alloc_ids of currently-alive ARENA handles. */
+                int aid_cap = ps->handle_count > 0 ? ps->handle_count : 1;
+                int *aids = (int *)malloc((size_t)aid_cap * sizeof(int));
+                int aid_count = 0;
+                if (aids) {
+                    for (int hi = 0; hi < ps->handle_count; hi++) {
+                        IRHandleInfo *h = &ps->handles[hi];
+                        if (h->source_color == ZC_COLOR_ARENA &&
+                            h->state == IR_HS_ALIVE) {
+                            aids[aid_count++] = h->alloc_id;
+                        }
+                    }
+                    /* Pass 2: mark every handle whose alloc_id matches one
+                     * collected. Catches aliases (e.g., `s` from `?[*]T ms = ...
+                     * orelse return; [*]T s = ms orelse return;` which inherits
+                     * alloc_id but may have ZC_COLOR_UNKNOWN). */
+                    for (int hi = 0; hi < ps->handle_count; hi++) {
+                        IRHandleInfo *h = &ps->handles[hi];
+                        if (h->state != IR_HS_ALIVE) continue;
+                        for (int ai = 0; ai < aid_count; ai++) {
+                            if (h->alloc_id == aids[ai]) {
+                                h->state = IR_HS_FREED;
+                                h->free_line = inst->source_line;
+                                break;
+                            }
+                        }
+                    }
+                    free(aids);
                 }
                 break;
             }

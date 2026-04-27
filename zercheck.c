@@ -261,12 +261,50 @@ static bool is_alloc_call(ZerCheck *zc, Node *call) {
     return false;
 }
 
+/* Gap 17 (2026-04-27): name-substring check for cleanup-style functions.
+ * When a bodyless function has a non-void return (e.g. int status), the
+ * signature alone is ambiguous (could be a getter, hash, etc.). The name
+ * substring is the deciding heuristic — destructor names follow well-
+ * established conventions across C ecosystems (free/destroy/close/release/
+ * delete/dispose/drop/cleanup/deinit/fini/shutdown/term). Match is
+ * substring (case-insensitive on ASCII) so prefixes like `db_close`,
+ * `slab_destroy`, `mtx_drop`, `arena_release` all qualify. */
+static bool name_looks_like_destructor(const char *name, uint32_t name_len) {
+    static const char *KEYWORDS[] = {
+        "free", "destroy", "close", "release", "delete", "dispose",
+        "drop", "cleanup", "deinit", "fini", "shutdown", "term", NULL
+    };
+    if (!name || name_len == 0) return false;
+    for (int k = 0; KEYWORDS[k]; k++) {
+        size_t klen = strlen(KEYWORDS[k]);
+        if (klen > name_len) continue;
+        for (uint32_t off = 0; off + klen <= name_len; off++) {
+            /* case-insensitive ASCII compare */
+            bool match = true;
+            for (size_t j = 0; j < klen; j++) {
+                char a = name[off + j];
+                char b = KEYWORDS[k][j];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (a != b) { match = false; break; }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
 /* Check if a function call is a free/close/destroy — detected by:
  * 1. Named "free" (original check)
- * 2. Any bodyless (extern/cinclude) function taking *opaque as first param
- *    and returning void — signature heuristic for compile-time tracking.
+ * 2. Any bodyless (extern/cinclude) function taking *opaque or *T as first
+ *    param and returning void — signature heuristic for compile-time tracking.
  *    Covers: db_close(*opaque), sqlite3_close(*opaque), destroy(*opaque), etc.
- *    The function is bodyless so we can't see inside — the signature tells us. */
+ *    The function is bodyless so we can't see inside — the signature tells us.
+ * 3. Gap 17: bodyless function with non-void return, *opaque/*T first param,
+ *    AND name substring matches destructor convention (free/destroy/close/
+ *    release/delete/dispose/drop/cleanup/deinit/fini/shutdown/term). Catches
+ *    common C status-returning destructors: int destroy(*Resource), int
+ *    db_close(*opaque), etc. Without this, returning an error code silently
+ *    bypassed UAF tracking. */
 static bool is_free_call(ZerCheck *zc, Node *call, char *arg_key, int *arg_key_len, int key_bufsize) {
     if (!call || call->kind != NODE_CALL) return false;
     Node *callee = call->call.callee;
@@ -279,15 +317,21 @@ static bool is_free_call(ZerCheck *zc, Node *call, char *arg_key, int *arg_key_l
         *arg_key_len = handle_key_from_expr(call->call.args[0], arg_key, key_bufsize);
         return *arg_key_len > 0;
     }
-    /* Check 2: signature heuristic — bodyless void func(*opaque param) */
+    /* Checks 2/3: signature heuristic — bodyless function */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
         callee->ident.name, (uint32_t)callee->ident.name_len);
     if (sym && sym->is_function && sym->func_node &&
         !sym->func_node->func_decl.body) {
-        /* must return void */
         Type *ret = sym->type;
         if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-        if (ret && type_unwrap_distinct(ret)->kind == TYPE_VOID) {
+        Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+        bool ret_is_void = ret_eff && ret_eff->kind == TYPE_VOID;
+        bool name_is_dtor = name_looks_like_destructor(
+            callee->ident.name, (uint32_t)callee->ident.name_len);
+        /* Check 2: void return → always heuristic-free.
+         * Check 3: non-void return → only if name suggests destructor. */
+        bool sig_match = ret_is_void || (ret_eff && name_is_dtor);
+        if (sig_match) {
             /* first param must be *opaque or *T (pointer) */
             if (sym->func_node->func_decl.param_count >= 1) {
                 Type *p0 = NULL;

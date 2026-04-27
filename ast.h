@@ -393,6 +393,7 @@ struct Node {
             bool is_volatile;
             const char *section;    /* section(".rodata") or NULL */
             size_t section_len;
+            bool is_synthetic;      /* parser-emitted (desugaring); bypasses reserved-prefix check */
         } var_decl;
 
         /* NODE_BLOCK: { stmts... } */

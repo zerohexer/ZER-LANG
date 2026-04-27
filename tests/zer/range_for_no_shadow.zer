@@ -1,0 +1,18 @@
+// Gap 30 regression test (2026-04-27): range-for desugaring uses _zer_ri,
+// not __ri. User code using __ri as variable name is now safe.
+
+i32 main() {
+    u32[3] data;
+    data[0] = 100;
+    data[1] = 200;
+    data[2] = 300;
+    u32 __ri = 999;  // user variable, no longer shadowed
+    u32 sum = 0;
+    for (u32 v in data) {
+        sum += v;
+    }
+    // sum should be 600, __ri should still be 999
+    if (sum != 600) { return 1; }
+    if (__ri != 999) { return 2; }
+    return 0;
+}

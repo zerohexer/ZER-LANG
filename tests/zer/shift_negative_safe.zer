@@ -1,0 +1,24 @@
+// Gap 26 regression test (2026-04-27): _zer_shl/_zer_shr must handle
+// negative shift count by returning 0 (per ZER spec), not falling
+// through to C UB.
+
+i32 compute_shift() {
+    return -1;
+}
+
+i32 main() {
+    i32 value = 1;
+    i32 n = compute_shift();
+    i32 result_l = value << n;  // expect 0 (negative shift = 0 per spec)
+    i32 result_r = value >> n;  // expect 0
+
+    if (result_l != 0) { return 1; }
+    if (result_r != 0) { return 2; }
+
+    // Sanity: positive in-range shift still works
+    i32 m = 4;
+    i32 ok = value << m;  // 1 << 4 = 16
+    if (ok != 16) { return 3; }
+
+    return 0;
+}

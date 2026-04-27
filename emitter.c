@@ -4249,6 +4249,16 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#define _POSIX_C_SOURCE 200112L\n");
     emit(e, "#define _XOPEN_SOURCE 500\n"); /* BUG-473: PTHREAD_MUTEX_RECURSIVE */
     emit(e, "#endif\n");
+    /* Gap 14 (2026-04-27): force signed-overflow-wraps semantics regardless
+     * of caller flags. ZER spec defines signed overflow as wrapping (not C
+     * UB). When `zerc --run` invokes gcc, -fwrapv is added; but when a user
+     * compiles the emitted .c file directly with their own gcc command, the
+     * flag may be missing — silent UB at any optimization level. The pragma
+     * enforces wrapv inside the .c file itself. Compilers without pragma
+     * support (e.g., clang older than 18) ignore unknown pragmas silently. */
+    emit(e, "#if defined(__GNUC__) && !defined(__clang__)\n");
+    emit(e, "#pragma GCC optimize(\"wrapv\")\n");
+    emit(e, "#endif\n");
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
     emit(e, "#include <string.h>\n");
@@ -4502,12 +4512,20 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "}\n");
     emit(e, "#endif /* __STDC_HOSTED__ */\n\n");
 
-    /* safe shift — ZER spec: shift by >= width returns 0 (not UB like C).
-     * Uses GCC statement expression to evaluate b exactly once. */
+    /* safe shift — ZER spec: shift by >= width OR < 0 returns 0 (not UB like C).
+     * Uses GCC statement expression to evaluate b exactly once.
+     *
+     * Gap 26 fix (2026-04-27): added (_b < 0) check. Previously, signed
+     * shift count with negative value (e.g., i32 n = -1; x << n) bypassed
+     * the >= width guard and fell through to (a) << -1 = C undefined
+     * behavior. Cast to int64_t for the comparison so unsigned operands
+     * compare correctly without wrap-to-negative. */
     emit(e, "#define _zer_shl(a, b) ({ __typeof__(b) _b = (b); "
-            "(_b >= (int)(sizeof(a) * 8)) ? (__typeof__(a))0 : (a) << _b; })\n");
+            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
+            "? (__typeof__(a))0 : (a) << _b; })\n");
     emit(e, "#define _zer_shr(a, b) ({ __typeof__(b) _b = (b); "
-            "(_b >= (int)(sizeof(a) * 8)) ? (__typeof__(a))0 : (a) >> _b; })\n\n");
+            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
+            "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
     emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "
@@ -9626,12 +9644,23 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         for (int ii = 0; ii < bb->inst_count; ii++) {
             /* Emit auto-guards before statement-producing IR ops (bounds + UAF).
              * Checker marks NODE_INDEX with auto_guard_size when VRP can't prove
-             * index in bounds; the guard returns zero before the OOB access. */
+             * index in bounds; the guard returns zero before the OOB access.
+             *
+             * Gap 34 fix (2026-04-27): added IR_INDEX_READ. Pointer indexing
+             * `reg[i]` on `volatile *u32 reg = @inttoptr(...)` lowers as
+             * IR_INDEX_READ (not IR_ASSIGN like array indexing), and was
+             * silently missing the auto-guard pass. Compiler emitted the
+             * "auto-guard inserted" warning while emitting raw `reg[i]` with
+             * NO guard — silent miscompile. Hosted: SIGSEGV catches if address
+             * unmapped; baremetal: silent corruption (entire address space
+             * valid). The handler comment claimed the pre-pass handles arrays
+             * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
             IRInst *ins = &bb->insts[ii];
             if (ins->expr) {
                 IROpKind k = ins->op;
                 if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP) {
+                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
+                    k == IR_INDEX_READ) {
                     emit_auto_guards(e, ins->expr);
                 }
             }

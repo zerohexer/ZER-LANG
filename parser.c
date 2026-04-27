@@ -1347,10 +1347,15 @@ static Node *parse_for_stmt(Parser *p) {
             consume(p, TOK_RPAREN, "expected ')' after for-in expression");
             Node *user_body = parse_block(p);
 
-            /* Desugar: for (usize __ri = 0; __ri < collection.len; __ri += 1) { T item = collection[__ri]; body }
+            /* Desugar: for (usize _zer_ri = 0; _zer_ri < collection.len; _zer_ri += 1) { T item = collection[_zer_ri]; body }
              * Each use of collection creates a SEPARATE ident node (no shared pointers).
              * For simple idents: zero overhead. For function calls: checker rejects
-             * non-ident/non-field collection expressions (enforced below). */
+             * non-ident/non-field collection expressions (enforced below).
+             *
+             * Gap 30 fix (2026-04-27): use _zer_ prefix (reserved by checker.c:191
+             * via add_symbol). Previous "__ri" was unreserved — user variable named
+             * __ri was silently shadowed. Reserved prefix makes it a compile error
+             * for the user to declare a colliding name. */
 
             /* Reject non-trivial collection expressions — must be ident or field access */
             if (collection->kind != NODE_IDENT && collection->kind != NODE_FIELD) {
@@ -1369,19 +1374,20 @@ static Node *parse_for_stmt(Parser *p) {
                     _c->field.field_name = collection->field.field_name; \
                     _c->field.field_name_len = collection->field.field_name_len; \
                 } _c; })
-            #define MKREF_RI() ({ Node *_r = new_node(p, NODE_IDENT); _r->ident.name = "__ri"; _r->ident.name_len = 4; _r; })
+            #define MKREF_RI() ({ Node *_r = new_node(p, NODE_IDENT); _r->ident.name = "_zer_ri"; _r->ident.name_len = 7; _r; })
 
-            /* for init: usize __ri = 0 */
+            /* for init: usize _zer_ri = 0 */
             Node *idx_init = new_node(p, NODE_VAR_DECL);
             idx_init->var_decl.type = new_type_node(p, TYNODE_USIZE);
-            idx_init->var_decl.name = "__ri";
-            idx_init->var_decl.name_len = 4;
+            idx_init->var_decl.name = "_zer_ri";
+            idx_init->var_decl.name_len = 7;
+            idx_init->var_decl.is_synthetic = true;  /* Gap 30: bypass reserved-prefix check */
             Node *zero = new_node(p, NODE_INT_LIT);
             zero->int_lit.value = 0;
             idx_init->var_decl.init = zero;
             n->for_stmt.init = idx_init;
 
-            /* cond: __ri < collection.len */
+            /* cond: _zer_ri < collection.len */
             Node *len_access = new_node(p, NODE_FIELD);
             len_access->field.object = CLONE_COLLECTION();
             len_access->field.field_name = "len";
@@ -1392,7 +1398,7 @@ static Node *parse_for_stmt(Parser *p) {
             cond->binary.right = len_access;
             n->for_stmt.cond = cond;
 
-            /* step: __ri += 1 */
+            /* step: _zer_ri += 1 */
             Node *one = new_node(p, NODE_INT_LIT);
             one->int_lit.value = 1;
             Node *step = new_node(p, NODE_ASSIGN);
@@ -1401,7 +1407,7 @@ static Node *parse_for_stmt(Parser *p) {
             step->assign.value = one;
             n->for_stmt.step = step;
 
-            /* body item decl: T item = collection[__ri] (bounds-checked) */
+            /* body item decl: T item = collection[_zer_ri] (bounds-checked) */
             Node *item_decl = new_node(p, NODE_VAR_DECL);
             item_decl->var_decl.type = elem_type;
             item_decl->var_decl.name = item_name.start;

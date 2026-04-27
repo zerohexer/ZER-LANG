@@ -1,0 +1,17 @@
+// Gap 17 negative test (2026-04-27): bodyless function with non-void return
+// AND destructor-convention name (destroy/close/etc.) must trigger free
+// heuristic and catch use-after-free.
+// EXPECTED: zercheck use-after-free error
+struct Resource { u32 id; }
+
+Slab(Resource) slab;
+
+// Bodyless declaration — non-void return, destructor name
+i32 destroy_with_status(*Resource p);
+
+void main() {
+    ?*Resource r = slab.alloc_ptr();
+    *Resource res = r orelse return;
+    i32 status = destroy_with_status(res);
+    u32 leak = res.id;  // use-after-free — must be caught
+}

@@ -1,0 +1,18 @@
+// Gap 34 regression test (2026-04-27): MMIO pointer indexing with variable
+// index must emit auto-guard. Previously the warning "auto-guard inserted"
+// fired but no guard was emitted (IR_INDEX_READ missing from trigger list).
+// Test checks the EMITTED C contains _zer_bounds_check or auto-guard.
+
+mmio 0x4000_0000..0x4000_001F;
+
+u32 read_at(u32 i) {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x4000_0000);
+    return reg[i];
+}
+
+i32 main() {
+    // OOB index — auto-guard should return 0, not access garbage
+    u32 v = read_at(100);
+    if (v == 0) { return 0; }   // expected: guard fired, returned 0
+    return 1;                    // unexpected: read past mmio bound
+}

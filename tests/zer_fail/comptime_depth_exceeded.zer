@@ -1,0 +1,13 @@
+// Gap 33 negative test (2026-04-27): comptime call chain exceeding depth 16
+// must emit a clear "exceeded recursion depth" error, not silently propagate
+// CONST_EVAL_FAIL as a confusing "comptime arg not constant" error.
+// EXPECTED: explicit recursion-depth error
+
+comptime u32 deep(u32 n) {
+    if (n == 0) { return 0; }
+    return deep(n - 1) + 1;  // recursive — depth 20 exceeds 16
+}
+
+const u32 RESULT = deep(20);
+
+i32 main() { return (i32)RESULT; }

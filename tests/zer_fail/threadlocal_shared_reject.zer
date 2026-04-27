@@ -1,0 +1,10 @@
+// Gap 43 negative test (2026-04-27): threadlocal + shared struct must be
+// rejected as mutually exclusive. Per-thread storage means each thread has
+// its own struct + mutex, making cross-thread sync impossible.
+// EXPECTED: compile error
+
+shared struct Counter { u32 value; }
+
+threadlocal Counter g;
+
+i32 main() { return 0; }

@@ -1,0 +1,7 @@
+// Gap 30 negative test: declaring _zer_ri must fail with reserved-prefix error.
+// EXPECTED: compile error (reserved prefix _zer_)
+
+i32 main() {
+    u32 _zer_ri = 1;  // reserved prefix — should error
+    return (i32)_zer_ri;
+}

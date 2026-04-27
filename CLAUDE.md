@@ -1137,6 +1137,71 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 10. **`bool` return via `orelse` needs restructuring.** Can't do `*opaque f = mf orelse return false;`. Instead: `?*opaque mf = io_open(...); *opaque f = mf orelse return;` for void, or use an if-unwrap pattern for bool returns.
 
+## Stage 1 of Gaps Roadmap COMPLETE 2026-04-27 — Patterns Established
+
+12 silent gaps closed in Stage 1 of `docs/4-27-2026-gaps.md` roadmap.
+**Six new compiler patterns established that future work must respect:**
+
+1. **`is_synthetic` flag on NODE_VAR_DECL** (ast.h) — set by parser
+   when desugaring emits a synthetic var-decl (e.g., range-for `_zer_ri`).
+   Checker dispatches to `add_symbol_synth` to bypass the reserved-prefix
+   check. **Use this pattern for any future desugaring that emits `_zer_`
+   prefixed names** — DO NOT special-case names in `add_symbol`.
+
+2. **`add_symbol_synth(c, name, len, type, line)`** vs `add_symbol(...)`
+   in checker.c — synth bypasses BUG-276 reserved-prefix check. ONLY
+   call from synthetic AST nodes; user source must always go through
+   `add_symbol` so users still can't declare `_zer_*` identifiers.
+
+3. **`name_looks_like_destructor(name, len)`** in zercheck.c — substring
+   match against 12 destructor-convention keywords (free, destroy,
+   close, release, delete, dispose, drop, cleanup, deinit, fini,
+   shutdown, term). Used by `is_free_call` to widen the bodyless
+   heuristic to non-void return when the name suggests a destructor
+   (Gap 17). Reuse this helper for any future cleanup-detection.
+
+4. **`ir_classify_method_call_ex(c, call)`** vs `ir_classify_method_call(call)`
+   in zercheck_ir.c — the `_ex` variant validates receiver type
+   (Pool/Slab/Ring/Arena/Struct) before matching method names. **Use
+   `_ex` at all new call sites.** Backward-compat wrapper exists for
+   migration but deprecate as you go (Gap 32).
+
+5. **`IRMC_ARENA_RESET` + alloc_id propagation pattern** — reference
+   implementation in zercheck_ir.c IR_CALL handler for "single op
+   invalidates all aliases of a class." Two-pass: snapshot alloc_ids
+   first (Gap 617-family realloc safety), then mark all matching
+   handles FREED. Reuse for any future "reset/clear/destroy-all" ops.
+
+6. **`#pragma GCC optimize("wrapv")` in emitter preamble** — defensive
+   pragma emission gated on `__GNUC__ && !__clang__` ensures signed-
+   overflow-wraps semantics even when user invokes own gcc without
+   `-fwrapv`. Pattern for any future arch-independent semantic guarantee
+   GCC supports via pragma.
+
+**New compile-error rules a fresh session must know about:**
+
+- `threadlocal shared struct` is rejected at NODE_GLOBAL_VAR (Gap 43)
+- `switch (?T)` with `.has_value` / dot-prefix arms on non-enum/union
+  inner is rejected at NODE_SWITCH typing (Gap 40)
+  - `?Enum` with `.variant` arms still works
+  - `default => |*v| { ... }` capture still works
+- Comptime call chain >16 deep emits explicit
+  "exceeded recursion depth (16)" error instead of silent
+  CONST_EVAL_FAIL propagation (Gap 33)
+- `_zer_shl(a, n)` / `_zer_shr(a, n)` returns 0 for `n < 0` (was UB
+  fall-through). Spec was already "0 for out-of-range"; macro now matches (Gap 26)
+- Bodyless `int destroy(*Resource)` (or any destructor-named function with non-void return) triggers free heuristic (Gap 17)
+- Range-for desugaring uses `_zer_ri`, not `__ri`. User vars named `__ri` no longer shadowed (Gap 30)
+- `volatile *u32 reg; reg[i]` with variable index now actually emits
+  the auto-guard the warning promised (Gap 34) — was silent miscompile
+
+See `docs/4-27-2026-gaps.md` for the full 47-gap audit + 10-stage roadmap,
+and `BUGS-FIXED.md` Session 2026-04-27 entry for per-bug detail.
+
+**Stage 1 status:** 12 of 47 silent gaps closed in main + 5 already
+fixed in `claude/cool-johnson-tNGWB` branch = 17/47 cumulative. 30
+remain across Stages 2-10.
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

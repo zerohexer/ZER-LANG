@@ -1,0 +1,12 @@
+// Gap 40 negative test (2026-04-27): switch on ?T must error with a clean
+// ZER message, not escape to GCC as 'has_value' undeclared.
+// EXPECTED: compile error directing user to if-unwrap
+
+i32 main() {
+    ?u32 v = 5;
+    switch (v) {
+        .has_value => { return 1; }
+        default => { return 2; }
+    }
+    return 0;
+}

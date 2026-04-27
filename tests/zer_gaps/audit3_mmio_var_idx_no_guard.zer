@@ -1,0 +1,24 @@
+// AUDIT 2026-04-27: warning lies — `auto-guard inserted` for MMIO variable
+// index, but the emitter never inserts one because the IR lowering picks
+// IR_INDEX_READ for *T pointers (vs IR_ASSIGN for arrays) and
+// `emit_auto_guards` (emitter.c:9633) only triggers on
+// IR_ASSIGN/IR_CALL/IR_RETURN/IR_INTRINSIC/IR_CALL_DECOMP.
+//
+// On hosted: SIGSEGV catches because address unmapped.
+// On baremetal: NO MMU — silent corruption (address valid).
+//
+// Root: emitter.c:9295 IR_INDEX_READ handler comment claims auto_guards
+// pre-pass handles arrays — true for IR_ASSIGN, FALSE for IR_INDEX_READ.
+// Fix: include IR_INDEX_READ in trigger list at emitter.c:9633, OR call
+// emit_auto_guards inline within IR_INDEX_READ handler before the access.
+
+mmio 0x4000_0000..0x4000_001F;
+
+u32 read_at(u32 i) {
+    volatile *u32 reg = @inttoptr(*u32, 0x4000_0000);
+    return reg[i];   // No guard emitted. Verify with: grep "_zer_t.* = reg\\[" output.c
+}
+
+u32 main() {
+    return read_at(100);   // OOB: 100 * 4 = 400 bytes past 0x40000000
+}

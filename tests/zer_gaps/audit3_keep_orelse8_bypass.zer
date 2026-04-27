@@ -1,0 +1,27 @@
+// AUDIT 2026-04-27: keep_checks[8] (checker.c:4347) and ld_nodes[8]
+// (checker.c:4404) overflow on 8-deep orelse chain. Local-derived pointer
+// (`&t`) escapes via 'keep' parameter despite the documented safety check.
+//
+// Boundary verified: n=2..7 reject, n=8 accepts (silent bypass).
+// Same anti-pattern as BUG-492 (covered_ids[64]).
+// Fix: stack-first dynamic with arena overflow (parser.c:2908 pattern).
+
+struct Tok { u32 v; }
+?*Tok g_p = null;
+void take_keep(keep ?*Tok p) { g_p = p; }
+
+void leak() {
+    Tok t; t.v = 42;
+    ?*Tok o0 = null;
+    ?*Tok o1 = null;
+    ?*Tok o2 = null;
+    ?*Tok o3 = null;
+    ?*Tok o4 = null;
+    ?*Tok o5 = null;
+    ?*Tok o6 = null;
+    ?*Tok o7 = null;
+    take_keep(o0 orelse o1 orelse o2 orelse o3 orelse o4 orelse o5 orelse o6 orelse o7 orelse &t);
+    // Local pointer to `t` now stored in g_p. UAF after function returns.
+}
+
+u32 main() { leak(); if (g_p) |p| { return p.v; } return 0; }

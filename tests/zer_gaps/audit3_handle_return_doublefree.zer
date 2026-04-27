@@ -1,0 +1,24 @@
+// AUDIT 2026-04-27: Function-return Handle bypasses zercheck_ir tracking.
+// Same-function double-free → caught (zercheck error).
+// Function-return double-free → silent (compiles clean, runtime trap fires
+// only because slab gen-counter happens to mismatch — but if Handle came
+// from a fresh allocator, second free is silent UB).
+//
+// Root: zercheck_ir.c:685 ir_unwrap_alloc_expr only registers handles when
+// RHS is a known alloc method. CALL returning Handle → not registered.
+// Fix: in IR_ASSIGN/IR_CALL when callee return type is Handle/?Handle,
+// register dest_local as ALIVE with fresh alloc_id (color UNKNOWN), or use
+// FuncSummary returns_alloc[ret] flag.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+?Handle(Task) get_handle() { return heap.alloc(); }
+
+u32 main() {
+    ?Handle(Task) mh = get_handle();
+    Handle(Task) a = mh orelse return;
+    heap.free(a);
+    heap.free(a);   // double-free, NOT detected at compile time
+    return 0;
+}

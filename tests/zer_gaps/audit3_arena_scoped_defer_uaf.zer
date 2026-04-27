@@ -1,0 +1,34 @@
+// AUDIT 2026-04-27: `arena.reset()` warning is a soft heuristic only —
+// wrapping reset in a scoped `defer` block bypasses the warning AND
+// produces silent UAF at runtime on both hosted and baremetal.
+//
+// Demonstrates: warning fires for bare ar.reset(), suppressed by defer
+// (the warning's own suggested workaround). zercheck_ir does not actually
+// track arena-colored handles through reset.
+//
+// Root: zercheck_ir.c:664 ir_classify_method_call — no IRMC_ARENA_RESET.
+// Fix: classify Arena.reset() as a free-all op for ZC_COLOR_ARENA handles
+// in the same arena.
+
+struct Cell { u32 v; u32 marker; }
+
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+
+    ?[*]Cell ms = ar.alloc_slice(Cell, 4);
+    [*]Cell s = ms orelse return;
+    s[0].marker = 0xDEAD;
+
+    {
+        defer ar.reset();   // bypasses the bare-reset() warning
+    }
+
+    // Re-alloc into the same buffer — overwrites s's old data
+    ?[*]Cell ms2 = ar.alloc_slice(Cell, 8);
+    [*]Cell t = ms2 orelse return;
+    t[0].marker = 0xCAFE;
+
+    if (s[0].marker == 0xCAFE) { return 1; }   // 1 = silent UAF observed
+    return 0;
+}

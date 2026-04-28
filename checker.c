@@ -4466,7 +4466,8 @@ static Type *check_expr(Checker *c, Node *node) {
                          * BUG-370: nested orelse chains: a orelse b orelse &x
                          * Stage 3 (2026-04-28): stack-first dynamic — fixed
                          * Node *keep_checks[8] silently truncated chains >7
-                         * deep. Stack 8, overflow to arena (doubling). */
+                         * deep. Stack 8, overflow to arena (doubling).
+                         * Gap 35 / CLAUDE.md Rule #7. */
                         Node *kc_stack[8] = { arg_node };
                         Node **keep_checks = kc_stack;
                         int keep_check_count = 1;
@@ -4535,9 +4536,9 @@ static Type *check_expr(Checker *c, Node *node) {
                          * BUG-387: orelse fallback may be a local-derived ident. */
                         {
                             /* collect all terminal idents from orelse chain
-                             * Stage 3 (2026-04-28): stack-first dynamic — same
-                             * fix as keep_checks. Fixed Node *ld_nodes[8] would
-                             * silently miss chains >7 deep. */
+                             * Stage 3 (2026-04-28): stack-first dynamic — fixed
+                             * Node *ld_nodes[8] would silently miss chains >7 deep.
+                             * Gap 35 / CLAUDE.md Rule #7. */
                             Node *ld_stack[8];
                             Node **ld_nodes = ld_stack;
                             int ld_count = 0;
@@ -6705,6 +6706,28 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (dst_type && dst_type->kind == TYPE_POINTER && dst_type->pointer.is_const) {
                     checker_error(c, node->loc.line,
                         "@cstr destination is a const pointer — cannot write to read-only memory");
+                }
+            }
+            /* Gap 27: reject raw `*u8` destination — no bounds check is possible
+             * when the destination has no carried length. Force user to pass an
+             * array (`u8[N]`) or slice (`[]u8`/`[*]u8`) so the emitter can bounds-check
+             * src.len + 1 against the destination capacity. Without this rejection
+             * the IR emits raw `memcpy(ptr, src.ptr, src.len)` with no length check —
+             * silent buffer overflow on too-long source. */
+            if (node->intrinsic.arg_count >= 1) {
+                Type *dst_type = typemap_get(c, node->intrinsic.args[0]);
+                Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
+                if (dst_eff && dst_eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(dst_eff->pointer.inner);
+                    /* permit *opaque (used by some C-interop wrappers) — they have
+                     * their own length contracts. Reject only typed pointers like
+                     * *u8 / *T where the destination has no carried length. */
+                    if (inner && inner->kind != TYPE_OPAQUE) {
+                        checker_error(c, node->loc.line,
+                            "@cstr destination is a raw pointer — no bounds check is possible. "
+                            "Pass an array (`u8[N] buf`) or slice (`[*]u8 buf`) so the destination "
+                            "size is known at the call site");
+                    }
                 }
             }
             /* BUG-234: compile-time overflow check when dest is array and src is string literal */

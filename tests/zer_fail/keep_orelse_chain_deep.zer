@@ -1,0 +1,29 @@
+// Gap 35: An 8+-deep `orelse` chain ending in `&local` previously
+// silently bypassed the keep-parameter escape check (the chain walker
+// used a fixed `[8]` buffer with bound `idx < 7`, dropping further
+// alternatives). After the stack-first dynamic conversion every chain
+// length must catch `&local`.
+u32 g_count = 0;
+
+void take_keep(keep ?*u32 p) {
+    if (p) |pp| { g_count = *pp; }
+}
+
+void leak_via_orelse() {
+    u32 t = 42;
+    ?*u32 o0 = null;
+    ?*u32 o1 = null;
+    ?*u32 o2 = null;
+    ?*u32 o3 = null;
+    ?*u32 o4 = null;
+    ?*u32 o5 = null;
+    ?*u32 o6 = null;
+    ?*u32 o7 = null;
+    // 8-deep chain with &local at the tail — must FAIL keep check.
+    take_keep(o0 orelse o1 orelse o2 orelse o3 orelse o4 orelse o5 orelse o6 orelse o7 orelse &t);
+}
+
+u32 main() {
+    leak_via_orelse();
+    return g_count;
+}

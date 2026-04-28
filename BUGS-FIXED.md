@@ -5,6 +5,178 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-28 — Stage 2 Part A of `docs/4-27-2026-gaps.md`: 7 walker gaps closed
+
+Stage 2 Part A (semantic walker fixes) of the implementation roadmap is
+complete. Seven walkers in `zercheck.c`, `zercheck_ir.c`, `ir_lower.c`,
+`parser.c`, and `checker.c` were extended to handle node shapes they
+previously skipped. Verified against full `make check` (all green).
+Stage 2 Part B (mechanical `-Wswitch` enforcement) is tracked separately
+via `tools/walker_default_audit.sh` (42 sites cataloged).
+
+### BUG-634: contains_move_struct_field one-level deep (Gap 28)
+
+**Symptom:** `struct Outer { Wrapper w; }` where `Wrapper { File (move) f; }`
+was not recognized as containing a move field. `consume(o); use(o.w.f.fd);`
+silently allowed (use-after-move missed).
+
+**Root cause:** `zercheck.c:1005` `contains_move_struct_field` only iterated
+direct fields, didn't recurse into nested struct/union types.
+
+**Fix:** Added `contains_move_struct_field_depth(t, depth)` recursive
+helper with cycle protection (depth limit 32). Public `contains_move_struct_field`
+now delegates with depth=0. Walks through nested STRUCT and UNION fields.
+
+**Test:** `tests/zer_fail/nested_move_struct_uaf.zer`.
+
+### BUG-635: BUG-385 struct param Handle scan one-level deep (Gap 29)
+
+**Symptom:** Function param of type `struct Outer { Inner i; }` where
+`Inner { Handle(T) h; }` did not register `param.i.h` as a tracked
+handle. UAF on the nested handle was silently missed.
+
+**Root cause:** `zercheck.c:2654` BUG-385 scan iterated only direct fields
+of the param's struct type.
+
+**Fix:** Replaced single-level iteration with explicit-stack DFS using
+`StructFrame { type, key, key_len, depth }` records. Walks through nested
+structs and unions, building dotted compound keys ("param.i.h",
+"param.outer.inner.h"). Cycle protection via depth limit 32.
+
+**Test:** `tests/zer_fail/nested_struct_handle_uaf.zer`.
+
+### BUG-636: Move walker only handled bare NODE_IDENT roots (Gap 42)
+
+**Symptom:** `consume(b.item)` where `b.item` is a move struct field
+silently bypassed move-on-call-arg tracking. Use after `consume`:
+silent use-after-move.
+
+**Root cause:** Both AST (`zercheck.c:1249`) and IR (`zercheck_ir.c:1979`)
+move walkers required `arg->kind == NODE_IDENT`. NODE_FIELD/NODE_INDEX
+roots silently skipped.
+
+**Fix:** Two-tier check:
+1. If target type itself is move (e.g., `b.item` typed as Tok-move),
+   walk through NODE_FIELD/NODE_INDEX to root ident, transfer the
+   root's tracked handle.
+2. Existing path: if target is bare ident with move-containing type,
+   transfer directly.
+
+**Test:** `tests/zer_fail/container_field_move_uaf.zer`.
+
+### BUG-637: Pointer-deref-aliased free not propagated (Gap 41)
+
+**Symptom:** `void sneak_free(*Handle p) { Handle k = *p; free(k); }` —
+caller's `h` after `sneak_free(&h)` was wrongly seen as still alive.
+zercheck reported "leaked" instead of catching subsequent UAF.
+
+**Root cause:** Two issues:
+1. `Handle k = *p;` did not register `k` as an alias of `p` (no shared
+   alloc_id). `free(k)` propagated to k's alloc_id group, not to p's.
+2. `handle_key_from_expr` returned 0 for NODE_UNARY/AMP, so
+   `sneak_free(&h)` couldn't apply the callee's frees_param at the
+   call site.
+
+**Fix:**
+1. NODE_VAR_DECL with init `*p` (where p is tracked Handle pointer):
+   register the new var as alias of p (inherit alloc_id, pool_id, state,
+   source_color). Subsequent `free(k)` now propagates to p via the
+   existing alias_state mechanism. Summary builder sees p as FREED →
+   `frees_param[i]=true`.
+2. `handle_key_from_expr`: added NODE_UNARY/AMP case that recursively
+   computes the operand's key. `&h` now returns "h", letting
+   `zc_apply_summary` find the caller's handle and mark it FREED.
+
+**Test:** `tests/zer_fail/sneak_free_via_deref.zer`.
+
+### BUG-638: Shared struct read in if/while/for/switch cond unlocked (Gap 36)
+
+**Symptom:** `if (g.value > 0) { ... }` on a shared struct g read g.value
+without acquiring its mutex. Real cross-thread data race; inside async,
+torn read possible before yield.
+
+**Root cause:** `ir_lower.c:1050` `find_shared_root_in_stmt_ir` only
+inspected NODE_EXPR_STMT/VAR_DECL/RETURN. NODE_IF/WHILE/FOR/SWITCH
+conditions lowered via `lower_expr` with no IR_LOCK wrapper.
+
+**Fix:** Added helper pair `emit_shared_lock_around_cond` /
+`emit_shared_unlock_after_cond`. Wired into each control-flow lowering
+site (NODE_IF, NODE_WHILE, NODE_DO_WHILE, NODE_FOR with cond,
+NODE_SWITCH expression). Lock scope is just the cond evaluation +
+hoist (for switch); released BEFORE entering arm/body to avoid
+deadlock on nested shared access.
+
+**Test:** `tests/zer/shared_in_cond_locked.zer` (verified emitted C
+contains `pthread_mutex_lock(&g._zer_mtx); ... = g.value; pthread_mutex_unlock(&g._zer_mtx);`).
+
+### BUG-639: Stack-depth analyzer walked comptime if(0) bodies (Gap 44)
+
+**Symptom:** `comptime if (0) { call_funcptr(); }` triggered "calls
+through function pointer with unknown target" warning even though the
+body was correctly stripped from emission. Broke CLAUDE.md guarantee:
+"Only the taken branch is type-checked — dead branch ignored."
+
+**Root cause:** `checker.c:11366` `scan_frame` (NODE_IF case) walked
+both branches unconditionally, ignoring the comptime flag.
+
+**Fix:** Added comptime check: if `node->if_stmt.is_comptime` AND
+condition evaluates to a known constant, walk only the taken branch
+(or skip entirely on FAIL fallback to existing behavior).
+
+**Test:** `tests/zer/stack_depth_skip_dead_branch.zer`.
+
+### BUG-640: Range-for collection.len re-evaluated each iteration (Gap 31)
+
+**Symptom:** `for (T item in slice) { slice.len = 10; ... }` mutating
+slice.len mid-loop changed the bound on subsequent iterations. User
+intent of "iterate this snapshot" silently violated.
+
+**Root cause:** `parser.c:1391` desugaring used `CLONE_COLLECTION().len`
+in the for-cond, re-reading each iteration.
+
+**Fix:** Snapshot `<collection>.len` into synthetic local `_zer_rlen`
+BEFORE the for loop. Wrap [`_zer_rlen` decl, original NODE_FOR] in a
+NODE_BLOCK so they share scope. Cond's RHS now references `_zer_rlen`
+ident instead of re-cloning collection. Same `is_synthetic` flag
+pattern as `_zer_ri` (Gap 30) bypasses reserved-prefix check.
+
+**Test:** `tests/zer/range_for_len_snapshot.zer` (mutate slice.len at
+iter 2; loop still runs exactly 5 times — snapshot held).
+
+### Stage 2 Part B (mechanical -Wswitch enforcement) status
+
+`tools/walker_default_audit.sh` (NEW, 2026-04-28) catalogs every
+`default:` clause inside switches on `->kind` or `->op` across the
+safety-critical compiler files. Current count: 42 sites. Each needs
+classification (SAFE/UNSAFE/CRITICAL) and conversion to enumerated
+cases. Tracked as ongoing Stage 2 Part B work.
+
+### Files modified
+
+- `parser.c` — range-for `_zer_rlen` snapshot wrap
+- `checker.c` — scan_frame comptime if filter
+- `zercheck.c` — recursive contains_move_struct_field, recursive struct
+  param Handle scan, NODE_FIELD/NODE_INDEX move walker, NODE_UNARY/AMP
+  handle_key, deref alias var-decl
+- `zercheck_ir.c` — NODE_FIELD/NODE_INDEX move walker (IR side)
+- `ir_lower.c` — emit_shared_lock_around_cond + per-control-flow wiring
+- `tools/walker_default_audit.sh` — NEW audit script
+- `BUGS-FIXED.md` — this entry
+- `docs/4-27-2026-gaps.md` — Stage 2 Part A marked DONE; Part B status
+
+### Test additions
+
+7 new regression tests:
+- `tests/zer/range_for_len_snapshot.zer`
+- `tests/zer/shared_in_cond_locked.zer`
+- `tests/zer/stack_depth_skip_dead_branch.zer`
+- `tests/zer_fail/nested_move_struct_uaf.zer`
+- `tests/zer_fail/nested_struct_handle_uaf.zer`
+- `tests/zer_fail/container_field_move_uaf.zer`
+- `tests/zer_fail/sneak_free_via_deref.zer`
+
+---
+
 ## Session 2026-04-27 — Stage 1 of `docs/4-27-2026-gaps.md` roadmap: 12 silent gaps closed
 
 Stage 1 (Quick wins, ~25 hrs estimated) of the implementation roadmap in

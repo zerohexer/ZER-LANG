@@ -208,6 +208,18 @@ static int handle_key_from_expr(Node *expr, char *buf, int bufsize) {
         return base + written;
     }
 
+    /* Gap 41 fix (2026-04-27, Stage 2): &x produces the same handle key
+     * as x — taking address shouldn't break tracking. This lets
+     * `sneak_free(&h)` (where sneak_free signature has frees_param[0]=true
+     * because the body does Handle k = *p; free(k);) propagate the FREED
+     * state to caller's `h`. Without this, handle_key_from_expr returned
+     * 0 for NODE_UNARY/AMP and frees_param was silently skipped at the
+     * call site. */
+    if (expr->kind == NODE_UNARY && expr->unary.op == TOK_AMP &&
+        expr->unary.operand) {
+        return handle_key_from_expr(expr->unary.operand, buf, bufsize);
+    }
+
     return 0;
 }
 
@@ -999,26 +1011,59 @@ static bool is_move_struct_type(Type *t) {
     return zer_type_kind_is_move_struct(eff->kind, is_move_flag) != 0;
 }
 
-/* Check if a type contains a move struct field (one level deep).
- * A regular struct with a move struct field should propagate transfer
- * when the outer struct is passed to a function or assigned. */
-static bool contains_move_struct_field(Type *t) {
+/* Check if a type contains a move struct field at ANY nesting level.
+ * A regular struct with a move struct field (direct or transitive)
+ * should propagate transfer when the outer struct is passed to a
+ * function or assigned.
+ *
+ * Gap 28 fix (2026-04-27): was previously only one-level deep —
+ * `struct Outer { Wrapper w; }` where `Wrapper { File f; }` (move)
+ * was silently NOT tracked. Now recurses through nested structs and
+ * unions. Cycle protection via depth limit (32, same as container
+ * recursion cap).
+ *
+ * The recursion shape:
+ *   struct → field types (recurse if struct/union)
+ *   union  → variant types (recurse if struct/union)
+ *   anything → check directly via is_move_struct_type
+ */
+static bool contains_move_struct_field_depth(Type *t, int depth) {
     if (!t) return false;
+    if (depth > 32) return false;  /* prevent infinite recursion on
+                                     * malformed/recursive types */
     Type *eff = type_unwrap_distinct(t);
     if (eff->kind == TYPE_STRUCT) {
         for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
-            if (is_move_struct_type(eff->struct_type.fields[i].type))
-                return true;
+            Type *ft = eff->struct_type.fields[i].type;
+            /* Direct move struct field */
+            if (is_move_struct_type(ft)) return true;
+            /* Or a nested struct/union that contains one — recurse */
+            Type *ft_eff = ft ? type_unwrap_distinct(ft) : NULL;
+            if (ft_eff && (ft_eff->kind == TYPE_STRUCT ||
+                           ft_eff->kind == TYPE_UNION)) {
+                if (contains_move_struct_field_depth(ft, depth + 1))
+                    return true;
+            }
         }
     }
-    /* Red Team V22: union containing move struct variant */
+    /* Red Team V22: union containing move struct variant — recurse same way */
     if (eff->kind == TYPE_UNION) {
         for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
-            if (is_move_struct_type(eff->union_type.variants[i].type))
-                return true;
+            Type *vt = eff->union_type.variants[i].type;
+            if (is_move_struct_type(vt)) return true;
+            Type *vt_eff = vt ? type_unwrap_distinct(vt) : NULL;
+            if (vt_eff && (vt_eff->kind == TYPE_STRUCT ||
+                           vt_eff->kind == TYPE_UNION)) {
+                if (contains_move_struct_field_depth(vt, depth + 1))
+                    return true;
+            }
         }
     }
     return false;
+}
+
+static bool contains_move_struct_field(Type *t) {
+    return contains_move_struct_field_depth(t, 0);
 }
 
 /* ---- Unified helpers (Option A refactor) ----
@@ -1285,6 +1330,35 @@ static void zc_check_expr(ZerCheck *zc, PathState *ps, Node *node) {
                             if (mh && mh->state == HS_ALIVE) {
                                 mh->state = HS_TRANSFERRED;
                                 mh->transfer_line = node->loc.line;
+                            }
+                        }
+                    }
+                    /* Gap 42 fix (2026-04-27, Stage 2): NODE_FIELD/NODE_INDEX
+                     * arg with move type — walk to root ident and transfer.
+                     * Catches `consume(b.item)` where b.item is a move
+                     * struct field. The arg's TYPE is move; the root ident
+                     * `b` is the handle owner, so its tracking state is
+                     * what we update. Use-after-move check at the use site
+                     * (`b.item.k` after consume) reads root state via the
+                     * existing UAF walker. */
+                    if (arg && (arg->kind == NODE_FIELD || arg->kind == NODE_INDEX)) {
+                        Type *arg_type = checker_get_type(zc->checker, arg);
+                        if (should_track_move(arg_type)) {
+                            /* Walk to root ident */
+                            Node *root = arg;
+                            while (root && (root->kind == NODE_FIELD ||
+                                            root->kind == NODE_INDEX)) {
+                                if (root->kind == NODE_FIELD) root = root->field.object;
+                                else root = root->index_expr.object;
+                            }
+                            if (root && root->kind == NODE_IDENT) {
+                                HandleInfo *mh = zc_ensure_move_registered(zc, ps,
+                                    root->ident.name, (uint32_t)root->ident.name_len,
+                                    node->loc.line);
+                                if (mh && mh->state == HS_ALIVE) {
+                                    mh->state = HS_TRANSFERRED;
+                                    mh->transfer_line = node->loc.line;
+                                }
                             }
                         }
                     }
@@ -1836,6 +1910,47 @@ static void zc_check_stmt(ZerCheck *zc, PathState *ps, Node *node) {
                         eh->pool_id = -3;
                         eh->alloc_line = node->loc.line;
                         eh->alloc_id = zc->next_alloc_id++;
+                    }
+                }
+            }
+        }
+        /* Gap 41 fix (2026-04-27, Stage 2): `Handle k = *p;` where p is
+         * a tracked pointer param creates an ALIAS — k shares alloc_id
+         * with whatever p points to. When k is later freed, the alias
+         * propagation in zc_check_expr's free path will mark p as FREED
+         * too, and the summary builder will set frees_param[i]=true.
+         *
+         * Without this, `void sneak_free(*Handle p) { Handle k = *p;
+         * heap.free(k); }` left p ALIVE in summary; caller's `h` after
+         * `sneak_free(&h)` was wrongly seen as still alive — silent UAF. */
+        if (node->var_decl.init &&
+            node->var_decl.init->kind == NODE_UNARY &&
+            node->var_decl.init->unary.op == TOK_STAR &&
+            node->var_decl.init->unary.operand &&
+            node->var_decl.init->unary.operand->kind == NODE_IDENT) {
+            Type *vt = checker_get_type(zc->checker, node);
+            Type *vt_eff = vt ? type_unwrap_distinct(vt) : NULL;
+            if (vt_eff && vt_eff->kind == TYPE_HANDLE) {
+                Node *src = node->var_decl.init->unary.operand;
+                /* Look up source pointer's tracked handle (registered
+                 * for params + locals via add_handle by name). */
+                HandleInfo *src_h = find_handle(ps,
+                    src->ident.name, (uint32_t)src->ident.name_len);
+                if (src_h) {
+                    /* Alias: new var inherits alloc_id, pool_id, state.
+                     * Subsequent `free(k)` propagates via alias_state. */
+                    HandleInfo *alias = find_handle_local(ps,
+                        node->var_decl.name, (uint32_t)node->var_decl.name_len);
+                    if (!alias) {
+                        alias = add_handle(ps, node->var_decl.name,
+                            (uint32_t)node->var_decl.name_len);
+                    }
+                    if (alias) {
+                        alias->state = src_h->state;
+                        alias->pool_id = src_h->pool_id;
+                        alias->alloc_line = src_h->alloc_line;
+                        alias->alloc_id = src_h->alloc_id;
+                        alias->source_color = src_h->source_color;
                     }
                 }
             }
@@ -2616,32 +2731,104 @@ static void zc_check_function(ZerCheck *zc, Node *func) {
                 h->alloc_line = func->loc.line;
             }
         }
-        /* BUG-385: if param is a struct, scan for Handle fields.
-         * Build compound keys like "s.h" for each Handle field. */
+        /* BUG-385: if param is a struct, scan for Handle fields recursively.
+         * Build compound keys like "s.h", "s.inner.h" for each Handle field
+         * at any nesting depth.
+         *
+         * Gap 29 fix (2026-04-27, Stage 2): was previously one-level deep
+         * only — `struct Outer { Inner i; }` where `Inner { Handle h; }`
+         * was silently NOT registered. Now recurses through nested
+         * structs and unions, building dotted compound keys. Cycle
+         * protection via depth limit (32). */
         if (tnode && tnode->kind == TYNODE_NAMED) {
             Symbol *type_sym = scope_lookup(zc->checker->global_scope,
                 tnode->named.name, (uint32_t)tnode->named.name_len);
             if (type_sym && type_sym->type) {
                 Type *st = type_unwrap_distinct(type_sym->type);
-                if (st && st->kind == TYPE_STRUCT) {
-                    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
-                        Type *ft = type_unwrap_distinct(st->struct_type.fields[fi].type);
-                        if (ft && ft->kind == TYPE_HANDLE) {
-                            /* build "param.field" key */
-                            uint32_t flen = st->struct_type.fields[fi].name_len;
-                            int klen = (int)(plen + 1 + flen);
-                            char *key = (char *)arena_alloc(zc->arena, klen + 1);
-                            if (key) {
-                                memcpy(key, pname, plen);
-                                key[plen] = '.';
-                                memcpy(key + plen + 1,
-                                       st->struct_type.fields[fi].name, flen);
-                                key[klen] = '\0';
-                                HandleInfo *h = add_handle(&ps, key, (uint32_t)klen);
-                                if (h) {
-                                    h->state = HS_ALIVE;
-                                    h->pool_id = -1;
-                                    h->alloc_line = func->loc.line;
+                if (st && (st->kind == TYPE_STRUCT || st->kind == TYPE_UNION)) {
+                    /* Inline recursive walker — uses an explicit stack of
+                     * (Type*, accumulated-key, key_len, depth). Same pattern
+                     * as Gap 28's contains_move_struct_field_depth. */
+                    struct StructFrame {
+                        Type *type;
+                        const char *key;
+                        uint32_t key_len;
+                        int depth;
+                    };
+                    struct StructFrame stack[32];
+                    int sp = 0;
+                    stack[sp].type = st;
+                    stack[sp].key = pname;
+                    stack[sp].key_len = plen;
+                    stack[sp].depth = 0;
+                    sp++;
+                    while (sp > 0) {
+                        sp--;
+                        struct StructFrame frame = stack[sp];
+                        if (frame.depth > 32 || !frame.type) continue;
+                        Type *eff = type_unwrap_distinct(frame.type);
+                        if (!eff) continue;
+                        uint32_t fcount = 0;
+                        SField *fields = NULL;
+                        if (eff->kind == TYPE_STRUCT) {
+                            fcount = eff->struct_type.field_count;
+                            fields = eff->struct_type.fields;
+                        } else if (eff->kind == TYPE_UNION) {
+                            /* Union variants share the SUVariant shape; only
+                             * variant.type matters for Handle detection. */
+                            for (uint32_t vi = 0; vi < eff->union_type.variant_count; vi++) {
+                                Type *vt = type_unwrap_distinct(eff->union_type.variants[vi].type);
+                                if (vt && (vt->kind == TYPE_STRUCT || vt->kind == TYPE_UNION) &&
+                                    sp < 32) {
+                                    /* push variant for recursion (key unchanged
+                                     * — variants don't add path component) */
+                                    stack[sp].type = vt;
+                                    stack[sp].key = frame.key;
+                                    stack[sp].key_len = frame.key_len;
+                                    stack[sp].depth = frame.depth + 1;
+                                    sp++;
+                                }
+                            }
+                            continue;
+                        } else {
+                            continue;
+                        }
+                        for (uint32_t fi = 0; fi < fcount; fi++) {
+                            Type *ft = type_unwrap_distinct(fields[fi].type);
+                            if (!ft) continue;
+                            uint32_t fnl = fields[fi].name_len;
+                            const char *fname = fields[fi].name;
+                            if (ft->kind == TYPE_HANDLE) {
+                                /* build "<key>.<field>" compound key */
+                                int new_klen = (int)(frame.key_len + 1 + fnl);
+                                char *key = (char *)arena_alloc(zc->arena, new_klen + 1);
+                                if (key) {
+                                    memcpy(key, frame.key, frame.key_len);
+                                    key[frame.key_len] = '.';
+                                    memcpy(key + frame.key_len + 1, fname, fnl);
+                                    key[new_klen] = '\0';
+                                    HandleInfo *h = add_handle(&ps, key, (uint32_t)new_klen);
+                                    if (h) {
+                                        h->state = HS_ALIVE;
+                                        h->pool_id = -1;
+                                        h->alloc_line = func->loc.line;
+                                    }
+                                }
+                            } else if ((ft->kind == TYPE_STRUCT ||
+                                        ft->kind == TYPE_UNION) && sp < 32) {
+                                /* nested struct/union — push with extended key */
+                                int new_klen = (int)(frame.key_len + 1 + fnl);
+                                char *new_key = (char *)arena_alloc(zc->arena, new_klen + 1);
+                                if (new_key) {
+                                    memcpy(new_key, frame.key, frame.key_len);
+                                    new_key[frame.key_len] = '.';
+                                    memcpy(new_key + frame.key_len + 1, fname, fnl);
+                                    new_key[new_klen] = '\0';
+                                    stack[sp].type = ft;
+                                    stack[sp].key = new_key;
+                                    stack[sp].key_len = (uint32_t)new_klen;
+                                    stack[sp].depth = frame.depth + 1;
+                                    sp++;
                                 }
                             }
                         }

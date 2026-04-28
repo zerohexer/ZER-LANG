@@ -1,0 +1,20 @@
+// Gap 31 regression test (2026-04-27, Stage 2): range-for must snapshot
+// collection.len BEFORE the loop. Mutating slice.len inside the body
+// must NOT change the bound mid-iteration.
+
+i32 main() {
+    u8[10] data;
+    data[0] = 1; data[1] = 2; data[2] = 3; data[3] = 4; data[4] = 5;
+    [*]u8 slice;
+    slice.ptr = &data[0];
+    slice.len = 5;
+    u32 count = 0;
+    for (u8 b in slice) {
+        count += 1;
+        if (count == 2) {
+            slice.len = 10;  // mutate mid-loop — must NOT affect snapshot
+        }
+    }
+    if (count != 5) { return 1; }   // snapshot held; loop ran exactly 5 times
+    return 0;
+}

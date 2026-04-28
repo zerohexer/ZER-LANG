@@ -1972,16 +1972,39 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             for (int pi = 0; pi < call->call.arg_count; pi++) {
                 Node *arg = call->call.args[pi];
                 if (!arg) continue;
-                /* Unwrap &expr to get root ident */
-                Node *root = arg;
-                if (root->kind == NODE_UNARY && root->unary.op == TOK_AMP)
-                    root = root->unary.operand;
+                /* Unwrap &expr to get target */
+                Node *target = arg;
+                if (target->kind == NODE_UNARY && target->unary.op == TOK_AMP)
+                    target = target->unary.operand;
+
+                /* Gap 42 fix (2026-04-27, Stage 2): walk through
+                 * NODE_FIELD/NODE_INDEX to the root ident. Previously
+                 * only bare-NODE_IDENT roots were handled, so
+                 * `consume(b.item)` where b.item is a move struct field
+                 * was silently skipped. Now `b.item` walks through to
+                 * `b` (root ident); the walker checks if the FIELD/INDEX
+                 * type itself is a move struct (or contains one) — if so,
+                 * the consume transfers ownership of the inner part. */
+                Type *target_type = checker_get_type(zc->checker, target);
+                Node *root = target;
+                while (root && (root->kind == NODE_FIELD ||
+                                root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
                 if (!root || root->kind != NODE_IDENT) continue;
                 int arg_local = ir_find_local_exact_first(func,
                     root->ident.name, (uint32_t)root->ident.name_len);
                 if (arg_local < 0 || arg_local >= func->local_count) continue;
                 Type *arg_type = func->locals[arg_local].type;
-                if (!ir_should_track_move(arg_type)) continue;
+                /* Either the target field-type itself is a move struct
+                 * (e.g. `consume(b.item)` with item: File(move)), OR the
+                 * root container's type contains a move field (covered
+                 * by direct pass `consume(b)` where b: struct{File f}). */
+                bool target_is_move = target_type &&
+                    ir_should_track_move(target_type);
+                bool root_is_move = ir_should_track_move(arg_type);
+                if (!target_is_move && !root_is_move) continue;
                 IRHandleInfo *h = ir_find_handle(ps, arg_local);
                 if (h && h->state == IR_HS_TRANSFERRED) {
                     ir_zc_error(zc, inst->source_line,

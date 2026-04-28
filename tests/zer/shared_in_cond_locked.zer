@@ -1,0 +1,21 @@
+// Gap 36 regression test (2026-04-27, Stage 2): shared struct read in
+// if/while/for/switch condition must acquire the lock for the cond
+// evaluation. Verified by inspecting emitted C — pthread_mutex_lock
+// should appear before the cond, _unlock after.
+
+shared struct Counter { u32 value; }
+
+Counter g;
+
+void main() {
+    // if condition reads g.value — must lock
+    if (g.value > 0) {
+        return;
+    }
+    // while condition reads g.value — must lock
+    u32 i = 0;
+    while (g.value < 10) {
+        i = i + 1;
+        if (i > 5) { return; }
+    }
+}

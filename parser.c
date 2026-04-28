@@ -1432,10 +1432,50 @@ static Node *parse_for_stmt(Parser *p) {
             for_body->block.stmt_count = body_count;
             n->for_stmt.body = for_body;
 
+            /* Gap 31 fix (2026-04-27, Stage 2): snapshot collection.len into
+             * a synthetic local BEFORE the loop, then use that local in the
+             * cond instead of re-reading collection.len every iteration.
+             * Without this, mutating collection.len/.ptr inside the loop
+             * body silently changes the bound or pointer mid-iteration.
+             *
+             * Desugars to:
+             *   {
+             *       usize _zer_rlen = <collection>.len;
+             *       for (usize _zer_ri = 0; _zer_ri < _zer_rlen;
+             *            _zer_ri += 1) {
+             *           T item = <collection>[_zer_ri];
+             *           ... body ...
+             *       }
+             *   }
+             */
+            Node *len_snapshot = new_node(p, NODE_VAR_DECL);
+            len_snapshot->var_decl.type = new_type_node(p, TYNODE_USIZE);
+            len_snapshot->var_decl.name = "_zer_rlen";
+            len_snapshot->var_decl.name_len = 9;
+            len_snapshot->var_decl.is_synthetic = true;
+            /* init = collection.len — fresh CLONE_COLLECTION + .len */
+            Node *snap_len = new_node(p, NODE_FIELD);
+            snap_len->field.object = CLONE_COLLECTION();
+            snap_len->field.field_name = "len";
+            snap_len->field.field_name_len = 3;
+            len_snapshot->var_decl.init = snap_len;
+            /* Replace cond's RHS — was `<collection>.len`, now `_zer_rlen` */
+            Node *rlen_ref = new_node(p, NODE_IDENT);
+            rlen_ref->ident.name = "_zer_rlen";
+            rlen_ref->ident.name_len = 9;
+            cond->binary.right = rlen_ref;
+            /* Wrap [len_snapshot, n] in a BLOCK so they share scope */
+            Node **wrap_stmts = (Node **)arena_alloc(p->arena, 2 * sizeof(Node *));
+            wrap_stmts[0] = len_snapshot;
+            wrap_stmts[1] = n;
+            Node *wrap_block = new_node(p, NODE_BLOCK);
+            wrap_block->block.stmts = wrap_stmts;
+            wrap_block->block.stmt_count = 2;
+
             #undef CLONE_COLLECTION
             #undef MKREF_RI
 
-            return n;
+            return wrap_block;
         }
 
         if (init_is_var_decl) {

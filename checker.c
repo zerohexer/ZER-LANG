@@ -11364,6 +11364,23 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
             scan_frame(c, frame, node->block.stmts[i]);
         break;
     case NODE_IF:
+        /* Gap 44 fix (2026-04-27, Stage 2): comptime if branches that
+         * are stripped from emission must NOT be walked. Walking dead
+         * branches breaks the "only the taken branch is type-checked"
+         * invariant and produces spurious diagnostics like "calls
+         * through funcptr" pointing at code that's not in the binary. */
+        if (node->if_stmt.is_comptime) {
+            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            if (cval == CONST_EVAL_FAIL) {
+                /* fall through to normal walk if cond can't be evaluated */
+            } else if (cval) {
+                scan_frame(c, frame, node->if_stmt.then_body);
+                break;
+            } else {
+                scan_frame(c, frame, node->if_stmt.else_body);
+                break;
+            }
+        }
         scan_frame(c, frame, node->if_stmt.cond);
         scan_frame(c, frame, node->if_stmt.then_body);
         scan_frame(c, frame, node->if_stmt.else_body);

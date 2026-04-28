@@ -4189,6 +4189,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
     case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
     case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_CONTAINER_DECL: case NODE_FILE:
+    case NODE_DO_WHILE:  /* Stage 2 Part B (2026-04-28): missing kind */
         break;
     }
 }

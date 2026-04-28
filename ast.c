@@ -114,6 +114,11 @@ const char *node_kind_name(NodeKind kind) {
     case NODE_CONTAINER_DECL:  return "CONTAINER_DECL";
     case NODE_DO_WHILE:        return "DO_WHILE";
     case NODE_CINCLUDE:     return "CINCLUDE";
+    /* Stage 2 Part B (2026-04-28): exhaustive — added missing kinds. */
+    case NODE_MMIO:         return "MMIO";
+    case NODE_GOTO:         return "GOTO";
+    case NODE_LABEL:        return "LABEL";
+    case NODE_STATIC_ASSERT: return "STATIC_ASSERT";
     }
     return "UNKNOWN";
 }
@@ -198,6 +203,18 @@ static void print_type(TypeNode *t, int depth) {
     case TYNODE_VOLATILE:
         printf("volatile ");
         print_type(t->qualified.inner, depth);
+        break;
+    /* Stage 2 Part B (2026-04-28): exhaustive — added missing TYNODE kinds. */
+    case TYNODE_BARRIER:
+        printf("Barrier");
+        break;
+    case TYNODE_SLAB:
+        printf("Slab(");
+        print_type(t->slab.elem, depth);
+        printf(")");
+        break;
+    case TYNODE_SEMAPHORE:
+        printf("Semaphore(...)");
         break;
     }
 }
@@ -494,6 +511,35 @@ void ast_print(Node *node, int depth) {
         indent(depth + 1);
         printf("COND: ");
         ast_print(node->while_stmt.cond, depth + 2);
+        break;
+    /* Stage 2 Part B (2026-04-28): exhaustive — debug-printer no-ops for
+     * leaf node kinds + recently-added kinds. Adding a new NODE_ to ast.h
+     * now forces a deliberate decision here. */
+    case NODE_MMIO:
+        indent(depth);
+        printf("MMIO\n");
+        break;
+    case NODE_GOTO:
+        indent(depth);
+        printf("GOTO %.*s\n", (int)node->goto_stmt.label_len, node->goto_stmt.label);
+        break;
+    case NODE_LABEL:
+        indent(depth);
+        printf("LABEL %.*s:\n", (int)node->label_stmt.name_len, node->label_stmt.name);
+        break;
+    case NODE_STATIC_ASSERT:
+        indent(depth);
+        printf("STATIC_ASSERT\n");
+        break;
+    case NODE_CRITICAL:
+        indent(depth);
+        printf("CRITICAL\n");
+        ast_print(node->critical.body, depth + 1);
+        break;
+    case NODE_ONCE:
+        indent(depth);
+        printf("ONCE\n");
+        ast_print(node->once.body, depth + 1);
         break;
     }
 }

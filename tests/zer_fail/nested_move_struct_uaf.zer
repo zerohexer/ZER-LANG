@@ -1,0 +1,15 @@
+// Gap 28 negative test (2026-04-27, Stage 2): move struct nested 2 levels
+// deep must trigger move tracking. Use after consume = compile error.
+// EXPECTED: zercheck "use after move" error
+move struct File { i32 fd; }
+struct Wrapper { File f; }
+struct Outer { Wrapper w; }
+
+void consume(Outer o) { }
+
+void main() {
+    Outer o;
+    o.w.f.fd = 42;
+    consume(o);            // ownership transferred (2 levels deep)
+    i32 leak = o.w.f.fd;   // use after move — must be caught
+}

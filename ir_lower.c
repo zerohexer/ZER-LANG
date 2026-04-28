@@ -1053,12 +1053,40 @@ static Node *find_shared_root_in_stmt_ir(Checker *c, Node *stmt) {
     case NODE_EXPR_STMT: return find_shared_root_expr(c, stmt->expr_stmt.expr);
     case NODE_VAR_DECL:  return find_shared_root_expr(c, stmt->var_decl.init);
     case NODE_RETURN:    return find_shared_root_expr(c, stmt->ret.expr);
-    /* IF / WHILE / FOR / SWITCH conditions: don't wrap here — the
-     * lowering of those constructs decomposes the cond separately.
-     * Only wrap the simple statement shapes where the whole stmt is
-     * covered by one lock scope. */
+    /* IF / WHILE / FOR / SWITCH conditions: handled separately — see
+     * emit_shared_lock_around_cond, called inline at each control-flow
+     * lowering site. Returning NULL here keeps the per-statement lock
+     * pass focused on simple statement shapes. */
     default: return NULL;
     }
+}
+
+/* Gap 36 fix (2026-04-27, Stage 2): emit IR_LOCK around evaluation of a
+ * shared-struct-reading cond/expr in NODE_IF / NODE_WHILE / NODE_FOR /
+ * NODE_SWITCH. Returns the shared root if a lock was emitted (caller
+ * must emit IR_UNLOCK after the cond's lower_expr is complete). NULL
+ * means no lock was needed.
+ *
+ * Why scoped to cond evaluation only: holding the lock across the
+ * entire if-body would cause deadlock with any nested shared access
+ * inside the body. The cond lock is acquired briefly, the snapshot
+ * captured by `lower_expr`, then released — same shape as
+ * emit_shared_lock_if_needed for simple statements. */
+static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
+    if (!cond) return NULL;
+    Node *root = find_shared_root_expr(ctx->checker, cond);
+    if (!root) return NULL;
+    IRInst lock = make_inst(IR_LOCK, line);
+    lock.expr = root;
+    emit_inst(ctx, lock);
+    return root;
+}
+
+static void emit_shared_unlock_after_cond(LowerCtx *ctx, Node *root, int line) {
+    if (!root) return;
+    IRInst unlock = make_inst(IR_UNLOCK, line);
+    unlock.expr = root;
+    emit_inst(ctx, unlock);
 }
 
 /* Does this source statement WRITE to a shared field? */
@@ -1763,8 +1791,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* ALWAYS rewrite idents (captures may reference the condition expr).
          * Then decompose if safe. */
         rewrite_idents(ctx, node->if_stmt.cond);
+        /* Gap 36: lock shared struct read in cond (deadlock-safe scope) */
+        Node *if_cond_lock = emit_shared_lock_around_cond(ctx, node->if_stmt.cond,
+                                                           node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.cond_local = lower_expr(ctx, node->if_stmt.cond);
+        emit_shared_unlock_after_cond(ctx, if_cond_lock, node->loc.line);
         br.true_block = bb_then;
         br.false_block = bb_else >= 0 ? bb_else : bb_join;
         emit_inst(ctx, br);
@@ -1918,8 +1950,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->current_block = bb_cond;
         if (node->for_stmt.cond) {
             rewrite_idents(ctx, node->for_stmt.cond);
+            /* Gap 36: lock shared struct read in cond */
+            Node *for_cond_lock = emit_shared_lock_around_cond(ctx, node->for_stmt.cond,
+                                                                node->loc.line);
             IRInst br = make_inst(IR_BRANCH, node->loc.line);
             br.cond_local = lower_expr(ctx, node->for_stmt.cond);
+            emit_shared_unlock_after_cond(ctx, for_cond_lock, node->loc.line);
             br.true_block = bb_body;
             br.false_block = bb_exit;
             emit_inst(ctx, br);
@@ -1997,8 +2033,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->current_block = bb_cond;
         {
         rewrite_idents(ctx, node->while_stmt.cond);
+        /* Gap 36: lock shared struct read in cond */
+        Node *while_cond_lock = emit_shared_lock_around_cond(ctx, node->while_stmt.cond,
+                                                              node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.cond_local = lower_expr(ctx, node->while_stmt.cond);
+        emit_shared_unlock_after_cond(ctx, while_cond_lock, node->loc.line);
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
@@ -2059,8 +2099,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->current_block = bb_cond;
         {
         rewrite_idents(ctx, node->while_stmt.cond);
+        /* Gap 36: lock shared struct read in cond */
+        Node *while_cond_lock = emit_shared_lock_around_cond(ctx, node->while_stmt.cond,
+                                                              node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.cond_local = lower_expr(ctx, node->while_stmt.cond);
+        emit_shared_unlock_after_cond(ctx, while_cond_lock, node->loc.line);
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
@@ -2117,6 +2161,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                            type_unwrap_distinct(sw_eff->optional.inner)->kind == TYPE_VOID;
 
         rewrite_idents(ctx, node->switch_stmt.expr);
+
+        /* Gap 36: lock shared struct read in switch expression. The lock
+         * scopes the entire switch-expression evaluation/hoist; arm bodies
+         * may reach back through captures or sw_ref but those are fully
+         * resolved at hoist time. */
+        Node *switch_expr_lock = emit_shared_lock_around_cond(ctx, node->switch_stmt.expr,
+                                                               node->loc.line);
 
         /* Hoist switch expression.
          *   sw_ref = AST reference used in comparisons/captures.
@@ -2185,6 +2236,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             sw_ref->ident.name = vl->name;
             sw_ref->ident.name_len = (size_t)vl->name_len;
         }
+
+        /* Gap 36: hoist complete — release the switch-expr lock before
+         * arm bodies run. Holding it across arm bodies would deadlock
+         * any nested shared access. */
+        emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
 
         int bb_exit = ir_add_block(ctx->func, ctx->arena);
 

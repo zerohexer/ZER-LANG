@@ -1202,6 +1202,71 @@ and `BUGS-FIXED.md` Session 2026-04-27 entry for per-bug detail.
 fixed in `claude/cool-johnson-tNGWB` branch = 17/47 cumulative. 30
 remain across Stages 2-10.
 
+## Stage 2 Part A of Gaps Roadmap COMPLETE 2026-04-28 — Walker Semantic Fixes
+
+7 silent gaps closed by per-walker recursion / root-walk / propagation
+fixes (BUG-634 to BUG-640). Cumulative 26/47 closed.
+
+**Walker patterns established that future code must respect:**
+
+1. **`contains_move_struct_field_depth(t, depth)`** in zercheck.c —
+   recursive predicate with depth limit (32). Reuse the depth-limited
+   recursion pattern for any future "type contains X at any nesting".
+
+2. **Explicit-stack DFS for compound-key building** in zercheck.c
+   BUG-385 scan — `StructFrame { type, key, key_len, depth }` records
+   walked iteratively. Pattern for any nested-struct-with-tracked-field
+   registration.
+
+3. **NODE_FIELD/NODE_INDEX root-walk in move arg tracking** —
+   `consume(b.item)` walks through field/index to root ident, then
+   transfers root's tracked handle when target type is move-containing.
+   Both AST (zercheck.c) and IR (zercheck_ir.c) sides updated.
+
+4. **Pointer-deref alias on var-decl** — `Handle k = *p;` registers k
+   as alias of p (same alloc_id). Subsequent `free(k)` propagates to p
+   via existing alias_state mechanism. Pattern for any alias-creating
+   var-decl.
+
+5. **NODE_UNARY/AMP handle_key transparency** — `&h` produces same key
+   as `h`. Address-taking shouldn't break tracking. Pattern: when
+   computing identity-keys, unwrap `&` and `*` operators.
+
+6. **`emit_shared_lock_around_cond` / `emit_shared_unlock_after_cond`**
+   in ir_lower.c — per-control-flow lock scope around cond evaluation
+   (NOT body), to avoid deadlock on nested shared access. Reuse for any
+   future construct evaluating an expression that may read shared.
+
+**New compile-time behaviors to know about:**
+- Nested move struct (`Outer { Wrapper { File(move) } }`) tracks
+  through 2+ levels (Gap 28)
+- Function param `struct { Inner { Handle } }` registers nested handles
+  via dotted compound keys (Gap 29)
+- `consume(b.item)` where b.item is move-typed is properly tracked (Gap 42)
+- `void f(*Handle p) { Handle k = *p; free(k); }` correctly propagates
+  to caller's `&h` arg (Gap 41)
+- Shared struct reads in if/while/for/switch conditions are locked (Gap 36)
+- Stack-depth analyzer skips `comptime if(0)` bodies (Gap 44)
+- Range-for snapshots collection.len before loop (Gap 31) — mutation
+  during iteration no longer changes bound
+
+## Stage 2 Part B IN PROGRESS — Walker Exhaustiveness via -Wswitch
+
+`tools/walker_default_audit.sh` (NEW 2026-04-28) catalogs every
+`default:` clause inside `switch (...->kind)` / `switch (...->op)`
+across safety-critical compiler files. Initial count: 42 sites. Each
+needs classification + enumeration of explicit cases so GCC `-Wswitch`
+catches future missing kinds.
+
+**Run before adding new walkers:** `bash tools/walker_default_audit.sh`.
+If your new walker introduces a default clause, add it to the audit's
+ignore list ONLY if it's verifiably SAFE (e.g., expression visitor
+that only looks at one node kind), and document why.
+
+Stage 2 Part B is the foundation for Stages 4-5 — F4-F6 instruction-
+table walkers and Session G atomic-ordering CFG walker MUST be added
+under -Wswitch discipline so they don't reintroduce the gap class.
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

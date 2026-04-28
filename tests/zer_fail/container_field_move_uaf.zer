@@ -1,0 +1,15 @@
+// Gap 42 negative test (2026-04-27, Stage 2): consuming a struct field
+// that holds a move struct must transfer ownership. Subsequent use of
+// the field = compile-time use-after-move error.
+// EXPECTED: zercheck use-after-move error
+move struct Tok { u32 k; }
+struct Box { Tok item; }
+
+void consume(Tok t) { }
+
+void main() {
+    Box b;
+    b.item.k = 1;
+    consume(b.item);   // NODE_FIELD root — must transfer
+    u32 leak = b.item.k;  // use after move
+}

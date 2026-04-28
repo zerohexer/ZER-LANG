@@ -1,0 +1,20 @@
+// Gap 41 negative test (2026-04-27, Stage 2): function that frees a
+// handle via pointer-deref alias (Handle k = *p; free(k);) must propagate
+// to the param's frees_param summary. Caller using h after sneak_free(&h)
+// is then a use-after-free.
+// EXPECTED: zercheck use-after-free error
+struct Task { u32 id; }
+
+Pool(Task, 4) tasks;
+
+void sneak_free(*Handle(Task) p) {
+    Handle(Task) k = *p;
+    tasks.free(k);
+}
+
+void main() {
+    ?Handle(Task) mh = tasks.alloc();
+    Handle(Task) h = mh orelse return;
+    sneak_free(&h);
+    u32 leak = tasks.get(h).id;  // UAF — h was freed via deref alias
+}

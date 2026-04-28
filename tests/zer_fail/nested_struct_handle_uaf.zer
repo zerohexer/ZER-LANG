@@ -1,0 +1,19 @@
+// Gap 29 negative test (2026-04-27, Stage 2): function param with
+// 2-level-deep struct containing Handle must register the nested handle.
+// Free + use = compile-time UAF.
+// EXPECTED: zercheck use-after-free error
+struct Task { u32 id; }
+
+Pool(Task, 4) tasks;
+
+struct Inner { Handle(Task) h; }
+struct Outer { Inner inner; }
+
+void check(Outer o) {
+    tasks.free(o.inner.h);   // free nested handle
+    u32 leak = tasks.get(o.inner.h).id;  // UAF
+}
+
+void main() {
+    return;
+}

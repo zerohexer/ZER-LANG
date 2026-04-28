@@ -1,0 +1,17 @@
+// Gap 44 regression test (2026-04-27, Stage 2): stack-depth analyzer
+// must skip comptime if(0) bodies. Previously, dead-branch funcptr calls
+// triggered "stack depth not verifiable" warnings even though the code
+// was correctly stripped from emission.
+
+// Function pointer call inside comptime if(0) — must NOT trigger warning
+void fn_a() { }
+void fn_b() { }
+
+void main() {
+    *() callback = fn_a;
+    comptime if (0) {
+        callback();   // dead branch — analyzer must skip
+    } else {
+        fn_b();       // taken branch — normal call, no funcptr
+    }
+}

@@ -1081,16 +1081,36 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
 
 static Node *find_shared_root_in_stmt_ir(Checker *c, Node *stmt) {
     if (!stmt) return NULL;
+    /* Stage 2 Part B (2026-04-28): exhaustive — only EXPR_STMT,
+     * VAR_DECL, RETURN need lock-wrapping at the statement level.
+     * IF/WHILE/FOR/SWITCH conds are wrapped separately by
+     * emit_shared_lock_around_cond at each lowering site. Other kinds
+     * either have no shared-read expr or are wrapped elsewhere. */
     switch (stmt->kind) {
     case NODE_EXPR_STMT: return find_shared_root_expr(c, stmt->expr_stmt.expr);
     case NODE_VAR_DECL:  return find_shared_root_expr(c, stmt->var_decl.init);
     case NODE_RETURN:    return find_shared_root_expr(c, stmt->ret.expr);
-    /* IF / WHILE / FOR / SWITCH conditions: handled separately — see
-     * emit_shared_lock_around_cond, called inline at each control-flow
-     * lowering site. Returning NULL here keeps the per-statement lock
-     * pass focused on simple statement shapes. */
-    default: return NULL;
+    case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
+    case NODE_SWITCH: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_DEFER: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_BLOCK:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    /* Expression nodes shouldn't appear as statements directly */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return NULL;
     }
+    return NULL;
 }
 
 /* Gap 36 fix (2026-04-27, Stage 2): emit IR_LOCK around evaluation of a
@@ -1290,8 +1310,22 @@ static void rewrite_capture_name(Node *node, const char *from_name, uint32_t fro
     case NODE_STATIC_ASSERT:
         rewrite_capture_name(node->static_assert_stmt.cond, from_name, from_len, to_name, to_len);
         break;
-    /* Leaf / no-expr-children nodes — nothing to rewrite */
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — only the kinds NOT
+     * already handled above. This walker handles both statement and
+     * expression kinds (capture rewrite descends through ASTs). The
+     * remaining fall-through kinds have no children referencing the
+     * captured name. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD:
+    /* Leaf literals — no children to walk */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
         break;
     }
 }

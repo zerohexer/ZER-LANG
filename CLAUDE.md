@@ -1254,14 +1254,27 @@ fixes (BUG-634 to BUG-640). Cumulative 26/47 closed.
 
 `tools/walker_default_audit.sh` (NEW 2026-04-28) catalogs every
 `default:` clause inside `switch (...->kind)` / `switch (...->op)`
-across safety-critical compiler files. Initial count: 42 sites. Each
-needs classification + enumeration of explicit cases so GCC `-Wswitch`
-catches future missing kinds.
+across safety-critical compiler files.
+
+**Progress as of 2026-04-28 (latest):** Initial 42 → 34 remaining
+(~19% closed). All -Wswitch warnings now resolved (8 → 0). The
+high-priority NODE_KIND / TYNODE_KIND walkers in safety-critical files
+are exhaustive: zercheck.c (defer_scan_all_frees), zercheck_ir.c
+(ir_check_expr_uaf, ir_defer_scan_frees, used-locals walker), ir_lower.c
+(rewrite_idents, rewrite_defer_body_idents, rewrite_capture_name,
+find_shared_root_in_stmt_ir), ast.c (node_kind_name, print_type,
+ast_print), emitter.c (emit_top_level_decl).
 
 **Run before adding new walkers:** `bash tools/walker_default_audit.sh`.
 If your new walker introduces a default clause, add it to the audit's
 ignore list ONLY if it's verifiably SAFE (e.g., expression visitor
 that only looks at one node kind), and document why.
+
+**Remaining 34 sites** are mostly TYPE_KIND switches (intentional
+defaults), IR_OP_KIND forward-compat fallbacks, or intrinsic-name
+string dispatches (different from NODE_KIND — don't benefit from
+-Wswitch). Review each case-by-case. The safety-critical NODE_KIND
+walkers are already done — remaining work is mechanical cleanup.
 
 Stage 2 Part B is the foundation for Stages 4-5 — F4-F6 instruction-
 table walkers and Session G atomic-ordering CFG walker MUST be added

@@ -58,6 +58,19 @@ for f in $FILES; do
         # values; intentional defaults are legitimate)
         is_tok=$(awk -v t="$sw_text" 'BEGIN { if (t ~ /binary\.op|unary\.op|assign\.op|op_token/) print "1"; else print "0" }')
         [ "$is_tok" = "1" ] && continue
+        # Exclude emit_expr's `default:` — kept intentionally. Listing
+        # statement/decl kinds as explicit cases would create false
+        # positives in `tools/walker_audit.sh` (which compares emit_expr
+        # case list vs emit_rewritten_node — a different audit gate).
+        # emit_expr is the legacy AST diagnostic path, unreachable for
+        # well-formed ASTs in the IR pipeline.
+        if [ "$f" = "emitter.c" ]; then
+            in_emit_expr=$(awk -v n=$sw_line '
+                NR<=n && /^static void emit_expr\(Emitter[^;]*\{/ { last=NR }
+                NR<=n && /^static void emit_defers_from\(Emitter[^;]*\{/ { last=0 }
+                END { print (last>0 ? "1" : "0") }' "$f")
+            [ "$in_emit_expr" = "1" ] && continue
+        fi
         findings+=("$f:$d_line (switch at line $sw_line)")
         found_count=$((found_count + 1))
     done < <(grep -nE '^[[:space:]]*default:' "$f")

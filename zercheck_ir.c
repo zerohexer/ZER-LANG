@@ -700,9 +700,20 @@ static bool ir_receiver_is_builtin_target(Checker *c, Node *callee) {
         case TYPE_ARENA:
         case TYPE_STRUCT:   /* Task.alloc auto-slab sugar */
             return true;
-        default:
+        /* Stage 2 Part B (2026-04-28): exhaustive — every other TYPE_KIND
+         * is rejected as a builtin method receiver. Adding a new TYPE_
+         * forces a deliberate decision (does it have alloc/free methods?). */
+        case TYPE_VOID: case TYPE_BOOL:
+        case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+        case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+        case TYPE_F32: case TYPE_F64:
+        case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+        case TYPE_ARRAY: case TYPE_ENUM: case TYPE_UNION:
+        case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_BARRIER:
+        case TYPE_HANDLE: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
             return false;
     }
+    return false;
 }
 
 /* Classify a NODE_CALL expression as a builtin method call. Returns
@@ -2651,7 +2662,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — IR ops that don't
+     * affect handle/move/lock state are no-ops here. Adding a new IR_
+     * forces a deliberate decision (does it allocate/free/transfer?). */
+    case IR_BRANCH: case IR_GOTO: case IR_YIELD: case IR_AWAIT:
+    case IR_LOCK: case IR_UNLOCK:
+    case IR_ARENA_RESET: case IR_RING_PUSH: case IR_RING_POP:
+    case IR_RING_PUSH_CHECKED:
+    case IR_DEFER_PUSH: case IR_DEFER_FIRE:
+    case IR_INTRINSIC:
+    case IR_BINOP: case IR_UNOP: case IR_LITERAL:
+    case IR_ADDR_OF: case IR_DEREF_READ:
+    case IR_CALL_DECOMP: case IR_INTRINSIC_DECOMP:
+    case IR_ORELSE_DECOMP: case IR_SLICE_READ:
+    case IR_STRUCT_INIT_DECOMP:
         break;
     }
 }

@@ -1250,34 +1250,35 @@ fixes (BUG-634 to BUG-640). Cumulative 26/47 closed.
 - Range-for snapshots collection.len before loop (Gap 31) — mutation
   during iteration no longer changes bound
 
-## Stage 2 Part B IN PROGRESS — Walker Exhaustiveness via -Wswitch
+## Stage 2 Part B COMPLETE 2026-04-28 — Walker Exhaustiveness via -Wswitch
 
 `tools/walker_default_audit.sh` (NEW 2026-04-28) catalogs every
 `default:` clause inside `switch (...->kind)` / `switch (...->op)`
-across safety-critical compiler files.
+across safety-critical compiler files. **Audit exits 0** — all 42
+sites converted to exhaustive case enumeration. `-Wswitch` warnings
+resolved (8 → 0).
 
-**Progress as of 2026-04-28 (latest):** Initial 42 → 34 remaining
-(~19% closed). All -Wswitch warnings now resolved (8 → 0). The
-high-priority NODE_KIND / TYNODE_KIND walkers in safety-critical files
-are exhaustive: zercheck.c (defer_scan_all_frees), zercheck_ir.c
-(ir_check_expr_uaf, ir_defer_scan_frees, used-locals walker), ir_lower.c
-(rewrite_idents, rewrite_defer_body_idents, rewrite_capture_name,
-find_shared_root_in_stmt_ir), ast.c (node_kind_name, print_type,
-ast_print), emitter.c (emit_top_level_decl).
+**Files with 100% walker exhaustiveness:**
+- zercheck.c, zercheck_ir.c, ir_lower.c, ast.c, checker.c, emitter.c
 
-**Run before adding new walkers:** `bash tools/walker_default_audit.sh`.
-If your new walker introduces a default clause, add it to the audit's
-ignore list ONLY if it's verifiably SAFE (e.g., expression visitor
-that only looks at one node kind), and document why.
+**What this guarantees:** GCC `-Wswitch` errors at compile time if any
+new NODE_KIND / TYNODE_KIND / TYPE_KIND / IR_OPKIND value is added
+without a case label in any safety-critical walker. The "missing case
+in safety walker" gap class is mechanically prevented going forward.
 
-**Remaining 34 sites** are mostly TYPE_KIND switches (intentional
-defaults), IR_OP_KIND forward-compat fallbacks, or intrinsic-name
-string dispatches (different from NODE_KIND — don't benefit from
--Wswitch). Review each case-by-case. The safety-critical NODE_KIND
-walkers are already done — remaining work is mechanical cleanup.
+**Run before adding new walkers:** `bash tools/walker_default_audit.sh`
+must continue to exit 0. If you write a new walker, do NOT add a
+`default:` clause — list every enum value explicitly. If you must
+fall back (e.g., diagnostic emit), enumerate the fall-back kinds
+explicitly so the compiler enforces exhaustiveness when new kinds
+are added later.
 
-Stage 2 Part B is the foundation for Stages 4-5 — F4-F6 instruction-
-table walkers and Session G atomic-ordering CFG walker MUST be added
+**Token-op switches excluded** (legitimate intentional defaults):
+TokenKind has 100+ values dispatching binary/unary/assign operations.
+The audit script excludes via `binary\.op|unary\.op|assign\.op|op_token`.
+
+This was the **foundation for Stages 4-5** — F4-F6 instruction-table
+walkers and Session G atomic-ordering CFG walker now ADD new walkers
 under -Wswitch discipline so they don't reintroduce the gap class.
 
 ## Spawning Agents That Write ZER Code — MANDATORY

@@ -417,8 +417,27 @@ static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
         return r;
     }
     case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
-    default: return NULL;
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
+     * cond/init/expr that could read a shared struct. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return NULL;
     }
+    return NULL;
 }
 
 static Node *find_shared_root(Emitter *e, Node *expr) {
@@ -508,9 +527,30 @@ static bool stmt_writes_shared(Node *stmt) {
         return false; /* reading into a variable is read-only */
     case NODE_RETURN:
         return false; /* reading for return */
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — only EXPR_STMT/VAR_DECL/
+     * RETURN distinguish read-vs-write at the statement level. Other
+     * kinds either don't access shared (block, control flow) or are
+     * handled per-cond elsewhere. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         return false;
     }
+    return false;
 }
 
 /* Emit lock acquire for shared struct variable.
@@ -688,7 +728,14 @@ static void emit_type(Emitter *e, Type *t) {
                 emit(e, "_zer_opt_slice_");
                 EMIT_UNION_NAME(e, elem);
                 break;
-            default:
+            /* Stage 2 Part B (2026-04-28): exhaustive — any other elem
+             * type uses anonymous struct fallback (rare). */
+            case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
+            case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
+            case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
+            case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+            case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
+            case TYPE_DISTINCT:
                 emit(e, "struct { ");
                 emit_type(e, opt_inner);
                 emit(e, " value; uint8_t has_value; }");
@@ -696,8 +743,13 @@ static void emit_type(Emitter *e, Type *t) {
             }
             break;
         }
-        default:
-            /* fallback: anonymous struct — only for ?FuncPtr (extremely rare) */
+        /* Stage 2 Part B (2026-04-28): exhaustive — fallback to
+         * anonymous struct for any TYPE_KIND not handled above
+         * (rare: ?FuncPtr, ?array, etc.). */
+        case TYPE_OPTIONAL: case TYPE_ARRAY:
+        case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
+        case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+        case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
             emit(e, "struct { ");
             emit_type(e, opt_inner);
             emit(e, " value; uint8_t has_value; }");
@@ -730,7 +782,14 @@ static void emit_type(Emitter *e, Type *t) {
             emit(e, "%s", prefix);
             EMIT_UNION_NAME(e, sl_inner);
             break;
-        default:
+        /* Stage 2 Part B (2026-04-28): exhaustive — anonymous struct
+         * fallback for any other elem type. */
+        case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
+        case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
+        case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
+        case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+        case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
+        case TYPE_DISTINCT:
             emit(e, "struct { ");
             if (t->slice.is_volatile) emit(e, "volatile ");
             emit_type(e, sl_inner);
@@ -1101,7 +1160,19 @@ static void emit_expr(Emitter *e, Node *node) {
                     case TYPE_I8:  narrow_cast = "(int8_t)"; needs_narrow_cast = true; break;
                     case TYPE_U16: narrow_cast = "(uint16_t)"; needs_narrow_cast = true; break;
                     case TYPE_I16: narrow_cast = "(int16_t)"; needs_narrow_cast = true; break;
-                    default: break;
+                    /* Stage 2 Part B (2026-04-28): exhaustive — only
+                     * narrow integer results need a defensive cast. */
+                    case TYPE_VOID: case TYPE_BOOL:
+                    case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+                    case TYPE_I32: case TYPE_I64:
+                    case TYPE_F32: case TYPE_F64:
+                    case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+                    case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+                    case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+                    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+                    case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+                    case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+                        break;
                     }
                 }
             }
@@ -2103,7 +2174,20 @@ static void emit_expr(Emitter *e, Node *node) {
                     case TYPE_I16: ucast = "(uint16_t)"; break;
                     case TYPE_I32: ucast = "(uint32_t)"; break;
                     case TYPE_I64: ucast = "(uint64_t)"; break;
-                    default: break;
+                    /* Stage 2 Part B (2026-04-28): exhaustive — only
+                     * signed integer types need unsigned cast for bit
+                     * extraction. Other kinds: no cast needed. */
+                    case TYPE_VOID: case TYPE_BOOL:
+                    case TYPE_U8: case TYPE_U16: case TYPE_U32:
+                    case TYPE_U64: case TYPE_USIZE:
+                    case TYPE_F32: case TYPE_F64:
+                    case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+                    case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+                    case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+                    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+                    case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+                    case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+                        break;
                     }
                 }
                 int64_t high = eval_const_expr(node->slice.start);
@@ -2183,7 +2267,16 @@ static void emit_expr(Emitter *e, Node *node) {
             case TYPE_F32:   sname = "_zer_slice_f32"; break;
             case TYPE_F64:   sname = "_zer_slice_f64"; break;
             case TYPE_BOOL:  sname = "_zer_slice_u8"; break; /* bool = uint8_t */
-            default: break;
+            /* Stage 2 Part B (2026-04-28): exhaustive — non-primitive
+             * elem types fall through to STRUCT/UNION handlers below,
+             * or anonymous struct emission. */
+            case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
+            case TYPE_SLICE: case TYPE_ARRAY: case TYPE_STRUCT:
+            case TYPE_ENUM: case TYPE_UNION: case TYPE_FUNC_PTR:
+            case TYPE_OPAQUE: case TYPE_POOL: case TYPE_RING:
+            case TYPE_ARENA: case TYPE_BARRIER: case TYPE_HANDLE:
+            case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+                break;
             }
             if (sname) {
                 emit(e, "((%s){ ", sname);
@@ -2991,7 +3084,24 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
     }
 
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds that aren't valid
+     * in expression position emit a diagnostic placeholder. Statement
+     * kinds, top-level decls, control-flow nodes — all unreachable here
+     * if the AST is well-formed. NODE_CAST (deprecated) and NODE_SIZEOF
+     * fall through to diagnostic — handled via NODE_INTRINSIC wrappers
+     * in current ZER. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_CAST: case NODE_SIZEOF:
         emit(e, "/* unhandled expr %s */0", node_kind_name(node->kind));
         break;
     }
@@ -3157,9 +3267,11 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         if (sym) return sym->type;
         return ty_void;
     }
-    default:
-        return ty_void;
+    /* Stage 2 Part B (2026-04-28): every TYNODE_ kind is enumerated as
+     * a case above. -Wswitch enforces exhaustiveness — adding a new
+     * TYNODE_ kind without a case here triggers a compile error. */
     }
+    return ty_void;  /* defensive — unreachable */
 }
 
 /* ================================================================
@@ -3873,9 +3985,25 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
     case NODE_ONCE:
         prescan_spawn_in_node(e, node->once.body);
         break;
-    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_YIELD: case NODE_AWAIT:
         break;
-    default: break;
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a body
+     * that could contain a NODE_SPAWN to prescan. NODE_STATIC_ASSERT
+     * is a compile-time-only check with no spawn inside. */
+    case NODE_FILE: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT:
+    case NODE_CINCLUDE: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_CONTAINER_DECL: case NODE_VAR_DECL: case NODE_RETURN:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        break;
     }
 }
 

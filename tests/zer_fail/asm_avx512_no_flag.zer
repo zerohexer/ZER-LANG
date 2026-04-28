@@ -1,0 +1,20 @@
+// Sub-extension proof: AVX-512F register without feature flag = rejected.
+//
+// xmm16 is in the AVX-512F-extended table (160 entries) but NOT in the
+// base x86_64 table. Without --target-features=avx512f, the checker must
+// fall back to base table → "register not recognized" error.
+//
+// EXPECTED: compile error — "asm clobber 'xmm16' not recognized for x86_64"
+
+naked void avx512_clobber_no_flag() {
+    asm {
+        instructions: "vpxorq %%xmm16, %%xmm16, %%xmm16"
+        clobbers: [ "xmm16" ]
+        safety: "Should fail: xmm16 needs --target-features=avx512f"
+    }
+}
+
+i32 main() {
+    avx512_clobber_no_flag();
+    return 0;
+}

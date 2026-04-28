@@ -1,0 +1,11 @@
+// Gap 27: @cstr to a raw `*u8` destination has no carried length —
+// the IR emits `memcpy(ptr, src.ptr, src.len)` with NO bounds check,
+// silently overflowing too-long sources. The checker now rejects this
+// shape; users must pass an array or slice so the destination size is
+// known at the call site.
+u32 main() {
+    u8[4] buf;
+    *u8 ptr = &buf[0];
+    @cstr(ptr, "TOOLONG_SRC");  // expected: rejected — raw pointer dest
+    return (u32)buf[0];
+}

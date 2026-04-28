@@ -4417,13 +4417,29 @@ static Type *check_expr(Checker *c, Node *node) {
                          * BUG-338: walk into intrinsics for &local. */
                         Node *arg_node = node->call.args[i];
                         /* unwrap orelse — check all branches recursively
-                         * BUG-370: nested orelse chains: a orelse b orelse &x */
-                        Node *keep_checks[8] = { arg_node, NULL };
+                         * BUG-370: nested orelse chains: a orelse b orelse &x
+                         * Gap 35 / CLAUDE.md Rule #7: stack-first dynamic, never
+                         * a fixed `[8]` cap (silently dropped chain alternatives
+                         * past index 7 — `&local` at the tail of a 9+-deep orelse
+                         * silently bypassed both keep-check and local-derived check). */
+                        Node *kc_stack[8];
+                        Node **keep_checks = kc_stack;
+                        int keep_check_cap = 8;
+                        keep_checks[0] = arg_node;
                         int keep_check_count = 1;
                         {
                             Node *ow = arg_node;
                             int idx = 0;
-                            while (ow && ow->kind == NODE_ORELSE && idx < 7) {
+                            while (ow && ow->kind == NODE_ORELSE) {
+                                /* may push 1 or 2 entries this iteration */
+                                if (idx + 2 > keep_check_cap) {
+                                    int new_cap = keep_check_cap * 2;
+                                    Node **new_arr = (Node **)arena_alloc(c->arena,
+                                        (size_t)new_cap * sizeof(Node *));
+                                    memcpy(new_arr, keep_checks, (size_t)idx * sizeof(Node *));
+                                    keep_checks = new_arr;
+                                    keep_check_cap = new_cap;
+                                }
                                 keep_checks[idx++] = ow->orelse.expr;
                                 if (ow->orelse.fallback && ow->orelse.fallback->kind != NODE_ORELSE) {
                                     keep_checks[idx++] = ow->orelse.fallback;
@@ -4474,11 +4490,23 @@ static Type *check_expr(Checker *c, Node *node) {
                          * Walk through orelse chain to check BOTH expr and fallback sides.
                          * BUG-387: orelse fallback may be a local-derived ident. */
                         {
-                            /* collect all terminal idents from orelse chain */
-                            Node *ld_nodes[8];
+                            /* collect all terminal idents from orelse chain.
+                             * Gap 35 / CLAUDE.md Rule #7: stack-first dynamic, never
+                             * a fixed `[8]` cap (silent drop past index 7 = bypass). */
+                            Node *ld_stack[8];
+                            Node **ld_nodes = ld_stack;
+                            int ld_cap = 8;
                             int ld_count = 0;
                             Node *ld_walk = arg_node;
-                            while (ld_walk && ld_walk->kind == NODE_ORELSE && ld_count < 7) {
+                            while (ld_walk && ld_walk->kind == NODE_ORELSE) {
+                                if (ld_count + 1 > ld_cap) {
+                                    int new_cap = ld_cap * 2;
+                                    Node **new_arr = (Node **)arena_alloc(c->arena,
+                                        (size_t)new_cap * sizeof(Node *));
+                                    memcpy(new_arr, ld_nodes, (size_t)ld_count * sizeof(Node *));
+                                    ld_nodes = new_arr;
+                                    ld_cap = new_cap;
+                                }
                                 /* check fallback side */
                                 if (ld_walk->orelse.fallback &&
                                     ld_walk->orelse.fallback->kind != NODE_ORELSE) {
@@ -4486,7 +4514,17 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                                 ld_walk = ld_walk->orelse.expr;
                             }
-                            if (ld_walk) ld_nodes[ld_count++] = ld_walk;
+                            if (ld_walk) {
+                                if (ld_count + 1 > ld_cap) {
+                                    int new_cap = ld_cap * 2;
+                                    Node **new_arr = (Node **)arena_alloc(c->arena,
+                                        (size_t)new_cap * sizeof(Node *));
+                                    memcpy(new_arr, ld_nodes, (size_t)ld_count * sizeof(Node *));
+                                    ld_nodes = new_arr;
+                                    ld_cap = new_cap;
+                                }
+                                ld_nodes[ld_count++] = ld_walk;
+                            }
                             for (int ldi = 0; ldi < ld_count; ldi++) {
                                 if (ld_nodes[ldi]->kind != NODE_IDENT) continue;
                                 Symbol *arg_sym = scope_lookup(c->current_scope,
@@ -6607,6 +6645,28 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (dst_type && dst_type->kind == TYPE_POINTER && dst_type->pointer.is_const) {
                     checker_error(c, node->loc.line,
                         "@cstr destination is a const pointer — cannot write to read-only memory");
+                }
+            }
+            /* Gap 27: reject raw `*u8` destination — no bounds check is possible
+             * when the destination has no carried length. Force user to pass an
+             * array (`u8[N]`) or slice (`[]u8`/`[*]u8`) so the emitter can bounds-check
+             * src.len + 1 against the destination capacity. Without this rejection
+             * the IR emits raw `memcpy(ptr, src.ptr, src.len)` with no length check —
+             * silent buffer overflow on too-long source. */
+            if (node->intrinsic.arg_count >= 1) {
+                Type *dst_type = typemap_get(c, node->intrinsic.args[0]);
+                Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
+                if (dst_eff && dst_eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(dst_eff->pointer.inner);
+                    /* permit *opaque (used by some C-interop wrappers) — they have
+                     * their own length contracts. Reject only typed pointers like
+                     * *u8 / *T where the destination has no carried length. */
+                    if (inner && inner->kind != TYPE_OPAQUE) {
+                        checker_error(c, node->loc.line,
+                            "@cstr destination is a raw pointer — no bounds check is possible. "
+                            "Pass an array (`u8[N] buf`) or slice (`[*]u8 buf`) so the destination "
+                            "size is known at the call site");
+                    }
                 }
             }
             /* BUG-234: compile-time overflow check when dest is array and src is string literal */

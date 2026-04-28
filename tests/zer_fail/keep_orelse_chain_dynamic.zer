@@ -1,0 +1,18 @@
+// Gap 35 stress: 20-deep orelse chain forces the dynamic-grow path of
+// the keep-check walker (initial stack cap = 8). Must still catch `&t`.
+u32 g = 0;
+void take_keep(keep ?*u32 p) { if (p) |pp| { g = *pp; } }
+
+void leak() {
+    u32 t = 7;
+    ?*u32 a = null; ?*u32 b = null; ?*u32 c = null; ?*u32 d = null;
+    ?*u32 e = null; ?*u32 f = null; ?*u32 g0 = null; ?*u32 h = null;
+    ?*u32 i = null; ?*u32 j = null; ?*u32 k = null; ?*u32 l = null;
+    ?*u32 m = null; ?*u32 n = null; ?*u32 o = null; ?*u32 p = null;
+    ?*u32 q = null; ?*u32 r = null; ?*u32 s = null;
+    take_keep(a orelse b orelse c orelse d orelse e orelse f orelse g0 orelse h
+        orelse i orelse j orelse k orelse l orelse m orelse n orelse o orelse p
+        orelse q orelse r orelse s orelse &t);
+}
+
+u32 main() { leak(); return g; }

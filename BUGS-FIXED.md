@@ -5,6 +5,145 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-28 (audit branch `claude/cool-johnson-A0IVI`) — 2 silent gaps closed
+
+Two confirmed silent gaps from `docs/4-27-2026-gaps.md` closed during a
+read-heavy audit pass: Gap 27 (`@cstr` to raw `*u8` destination) and
+Gap 35 (`keep_checks[8]` / `ld_nodes[8]` fixed buffer drops orelse
+alternatives past index 7). Both reproduced empirically before fix and
+exercise the new compile-time rejection paths via the regression tests
+listed below.
+
+### BUG-679: @cstr to raw `*u8` destination silently overflows (Gap 27)
+
+**Symptom:** `u8[4] buf; *u8 ptr = &buf[0]; @cstr(ptr, "TOOLONG_SRC");`
+compiled cleanly. Emitted IR was `memcpy(ptr, src.ptr, src.len);
+((uint8_t*)ptr)[src.len] = 0;` — no bounds check. Source longer than the
+backing buffer wrote past it (8-byte stack-smash on the reproducer);
+exit code 2 with stack-protector active, silent corruption otherwise.
+
+**Root cause:** The `@cstr` checker (`checker.c:6591`) accepted three
+destination shapes:
+
+| Dest shape | Compile-time | Runtime |
+|---|---|---|
+| `u8[N]` array | bounds check via `array.size` | yes (`_zer_cs.len + 1 > array.size`) |
+| `[]u8` / `[*]u8` slice | none | yes (`_zer_cs.len + 1 > slice.len`) |
+| Raw `*u8` pointer | **none** | **none** — silent overflow |
+
+The raw-pointer path had no carried length, so neither AST nor IR
+emitter could insert a bounds check. The IR emitter at
+`emitter.c:7749-7761` had a "Simplified: memcpy + null. Full version
+has bounds check + auto-return" comment that confirmed the divergence
+was known but unfixed.
+
+**Fix:** Reject the raw-pointer shape at the checker. After the existing
+const-pointer rejection (BUG-241), `check_intrinsic` now rejects any
+non-`*opaque` typed pointer destination with:
+
+> `@cstr destination is a raw pointer — no bounds check is possible. Pass an array (\`u8[N] buf\`) or slice (\`[*]u8 buf\`) so the destination size is known at the call site`
+
+`*opaque` is permitted because C-interop wrappers carry their own
+length contracts at that boundary. With the rejection in place, the IR
+emission path becomes unreachable for the unsafe shape — the array and
+slice paths retain their runtime bounds checks unchanged.
+
+**Test:** `tests/zer_fail/cstr_raw_pointer_dest.zer`.
+
+### BUG-680: keep-check / local-derived-check orelse walkers silently drop tail past 8 (Gap 35)
+
+**Symptom:** An 8-deep `orelse` chain ending in `&local` passed to a
+`keep` parameter compiled cleanly:
+
+```zer
+take_keep(o0 orelse o1 orelse ... orelse o7 orelse &t);
+```
+
+The 2-deep control case (`o0 orelse &t`) correctly errored:
+`"local 't' cannot satisfy 'keep' parameter — must be static or
+global"`. Beyond the 7-iteration cap, both the keep-parameter check
+**and** the local-derived/arena-derived secondary check silently
+ignored the tail of the chain — so `&t` slipped through, returning a
+dangling stack pointer to the keep target after the function exited.
+
+**Root cause:** Two `Node *[8]` arrays drove the orelse-chain walks:
+
+- `checker.c:4421` `Node *keep_checks[8]` — keep-target collection
+- `checker.c:4478` `Node *ld_nodes[8]` — local-derived collection
+
+Both walkers gated their `while` on `idx < 7` / `ld_count < 7`. Once
+the cap was hit the loop stopped without any error, dropping every
+remaining alternative including the trailing `&local`. Direct
+violation of CLAUDE.md Rule #7 ("Never use fixed-size buffers for
+dynamic data — use stack-first dynamic with arena overflow doubling").
+
+**Fix:** Replaced both fixed buffers with the stack-first dynamic
+pattern proven by `parser.c:2908`:
+
+```c
+Node *kc_stack[8];
+Node **keep_checks = kc_stack;
+int keep_check_cap = 8;
+/* ... */
+if (idx + 2 > keep_check_cap) {
+    int new_cap = keep_check_cap * 2;
+    Node **new_arr = (Node **)arena_alloc(c->arena, new_cap * sizeof(Node *));
+    memcpy(new_arr, keep_checks, idx * sizeof(Node *));
+    keep_checks = new_arr;
+    keep_check_cap = new_cap;
+}
+```
+
+Same conversion applied to `ld_nodes`. The `idx < 7` / `ld_count < 7`
+gates are removed entirely — chains of any depth are walked, with the
+arena absorbing growth past 8 alternatives.
+
+**Tests:**
+
+- `tests/zer_fail/keep_orelse_chain_deep.zer` — 8-deep chain (the original gap)
+- `tests/zer_fail/keep_orelse_chain_dynamic.zer` — 20-deep chain forces ≥1 arena resize
+
+Both rejected with the standard keep-parameter error.
+
+**Verification methodology:** wrote both reproducers and observed
+compile success (`exit=0`) before the fix. After the fix, both
+correctly fail with the keep-parameter error. The 2-deep control
+case continued to fail in both runs, confirming the existing path
+was unaffected. Full `make check` confirms no regressions across all
+suites (218/218 + 70/70 + 98/98 + 72/72 + 584/584 + 18/18 + 4/4 +
+238/238 + 54/54 + 39/39 + 41/41 + 22/22 + 14/14 + 17/17 + 28 module
++ 515 ZER integration + 784 Rust + 36 Zig + 139 conversion). The
+pre-existing `walker_audit.sh` non-zero exit (NODE_FOR / NODE_WHILE
+/ etc. statement-kinds reported as missing IR cases) is unchanged
+baseline behavior — verified via `git stash` round-trip.
+
+### Audits without fixes (deferred to roadmap stages)
+
+The same audit pass confirmed two more silent gaps that are NOT
+addressed here because they require cross-model interface work
+already scheduled for `docs/4-27-2026-gaps.md` Stage 6:
+
+- **Gap 38** (function-return Handle) — `zercheck_ir.c` IR_ASSIGN
+  / IR_CALL register `dest_local` only when the callee return is
+  `TYPE_POINTER` or `TYPE_OPAQUE` (zercheck_ir.c:2277-2285), not
+  `TYPE_HANDLE`. A user function returning `?Handle(T)` produces a
+  silent UAF on double-free at the caller. Closing this requires
+  adding a `FuncSummary.returns_alloc[ret_idx]` flag and registering
+  Handle/?Handle returns at IR_ASSIGN/IR_CALL — Stage 6 (~15 hrs).
+
+- **Gap 41** (pointer-deref-aliased free) — `zercheck_ir.c:505`
+  `ir_key_root_ident` walks NODE_FIELD/NODE_INDEX to the root ident
+  but explicitly returns NULL on NODE_UNARY (the `*p` dereference
+  operator). `void f(*Handle p) { Handle k = *p; heap.free(k); }`
+  silently leaks the source param's tracking. Closing this requires
+  extending `ir_extract_compound_key` to follow `*p` to source param
+  — Stage 6 (~10 hrs).
+
+Both are documented as confirmed-still-open in `docs/4-27-2026-gaps.md`
+to preserve audit trail until the cross-model interface refactor.
+
+---
+
 ## Session 2026-04-28 — Stage 2 Part A of `docs/4-27-2026-gaps.md`: 7 walker gaps closed
 
 Stage 2 Part A (semantic walker fixes) of the implementation roadmap is

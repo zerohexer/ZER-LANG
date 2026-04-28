@@ -11408,8 +11408,31 @@ static uint32_t estimate_type_size(Type *t) {
             total += estimate_type_size(t->struct_type.fields[i].type);
         return total;
     }
-    default: return 4;
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds with no fixed
+     * size for stack frame estimation. Conservative 4 bytes for
+     * pointer-shaped types, 0 for VOID, otherwise return ptr-size. */
+    case TYPE_VOID: return 0;
+    case TYPE_FUNC_PTR: return 4;  /* pointer */
+    case TYPE_ENUM: return 4;       /* int variant tag */
+    case TYPE_UNION: {
+        /* Tagged union: max variant size + tag byte */
+        uint32_t maxv = 0;
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
+            uint32_t s = estimate_type_size(t->union_type.variants[i].type);
+            if (s > maxv) maxv = s;
+        }
+        return maxv + 1;
     }
+    case TYPE_POOL: case TYPE_RING: case TYPE_SLAB:
+    case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SEMAPHORE:
+        /* Builtin allocator/sync types — variable, conservatively 4 */
+        return 4;
+    case TYPE_DISTINCT:
+        /* Should be unwrapped above by type_unwrap_distinct, but
+         * defensive fallback. */
+        return estimate_type_size(t->distinct.underlying);
+    }
+    return 4;
 }
 
 /* scan function body for local variable sizes and callee names */

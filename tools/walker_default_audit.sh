@@ -58,7 +58,18 @@ if [ "$found_count" -eq 0 ]; then
     exit 0
 fi
 
+# Progress tracking: Stage 2 Part B started 2026-04-28 with 42 findings.
+# Update INITIAL_COUNT when re-baselining.
+INITIAL_COUNT=42
+closed=$((INITIAL_COUNT - found_count))
+pct=0
+if [ "$INITIAL_COUNT" -gt 0 ]; then
+    pct=$((closed * 100 / INITIAL_COUNT))
+fi
+
 echo "=== Walker default: audit ($found_count finding(s)) ==="
+echo ""
+echo "Stage 2 Part B progress: $closed of $INITIAL_COUNT closed (~${pct}%)."
 echo ""
 echo "Each entry below is a switch on ->kind or ->op that has a default:"
 echo "clause. Review whether the default is SAFE (explicit no-op for leaf"
@@ -71,4 +82,6 @@ for f in "${findings[@]}"; do
 done
 echo ""
 echo "Stage 2 Part B (mechanical -Wswitch enforcement) tracks fixing each."
+echo "Some sites are TYPE_KIND or IR_OP switches with intentional default —"
+echo "review case-by-case before conversion."
 exit 1

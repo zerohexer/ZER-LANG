@@ -887,7 +887,28 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             ir_check_expr_uaf(zc, func, ps, expr->struct_init.fields[i].value,
                               line, rs);
         break;
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf/non-expr kinds.
+     * Literals carry no handle reference; CAST/SIZEOF wrap the cast/sized
+     * value but those don't propagate UAF state through this walker
+     * (existing tests cover those paths via the recursive cases above
+     * for inner exprs). Statement / declaration kinds shouldn't appear
+     * as expressions; listed here so adding a new NODE_ kind to ast.h
+     * forces a deliberate decision. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    /* Statement / decl kinds — defensive, shouldn't reach here */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
         break;
     }
 }
@@ -993,7 +1014,25 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     case NODE_ONCE:
         ir_defer_scan_frees(zc, func, ps, body->once.body, defer_line);
         break;
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf/non-control-flow
+     * kinds have no scannable body for free detection. The defer scanner
+     * only descends into block-shaped statements. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         break;
     }
 }
@@ -3136,7 +3175,31 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             for (int fi = 0; fi < n->struct_init.field_count && top < 63; fi++)
                                 stack[top++] = n->struct_init.fields[fi].value;
                             break;
-                        default: break;
+                        /* Stage 2 Part B (2026-04-28): exhaustive — leaf
+                         * literals + non-expression kinds. Used-locals
+                         * tracking only cares about NODE_IDENT references;
+                         * leaves carry no ident, statement/decl kinds
+                         * shouldn't appear in inst->expr. */
+                        case NODE_INT_LIT: case NODE_FLOAT_LIT:
+                        case NODE_STRING_LIT: case NODE_CHAR_LIT:
+                        case NODE_BOOL_LIT: case NODE_NULL_LIT:
+                        case NODE_CAST: case NODE_SIZEOF:
+                        case NODE_FILE: case NODE_FUNC_DECL:
+                        case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+                        case NODE_UNION_DECL: case NODE_TYPEDEF:
+                        case NODE_IMPORT: case NODE_CINCLUDE:
+                        case NODE_INTERRUPT: case NODE_MMIO:
+                        case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+                        case NODE_VAR_DECL: case NODE_BLOCK:
+                        case NODE_IF: case NODE_FOR: case NODE_WHILE:
+                        case NODE_SWITCH: case NODE_RETURN:
+                        case NODE_BREAK: case NODE_CONTINUE:
+                        case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+                        case NODE_EXPR_STMT: case NODE_ASM:
+                        case NODE_CRITICAL: case NODE_ONCE:
+                        case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+                        case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+                            break;
                         }
                     }
                 }

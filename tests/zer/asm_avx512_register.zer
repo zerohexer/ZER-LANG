@@ -1,0 +1,32 @@
+// zerc-flags: --target-features=avx512f
+// Sub-extension proof: C4-minimum AVX-512F end-to-end test.
+//
+// xmm16 is in the AVX-512F register table (160 entries) but NOT in the
+// base x86_64 table (105 entries). Compiling with --target-features=avx512f
+// must:
+//   1. Make checker accept "xmm16" as a valid clobber (uses avx512f table)
+//   2. Pass -mavx512f to GCC so it generates correct code
+//
+// Dead-branch pattern: the AVX-512 code COMPILES (proving framework works)
+// but never EXECUTES at runtime (test machine may lack AVX-512 hardware,
+// which would SIGILL on actual instruction execution). Same pattern used
+// by privileged-intrinsic tests (D-Alpha-3+).
+//
+// Build: zerc tests/zer/asm_avx512_register.zer --target-features=avx512f --run
+
+naked void avx512_clobber() {
+    asm {
+        instructions: "vpxorq %%xmm16, %%xmm16, %%xmm16"
+        clobbers: [ "xmm16" ]
+        safety: "AVX-512F register xmm16 — proves feature-flag dispatch works"
+    }
+}
+
+i32 main() {
+    // Dead branch: compiled but never run on non-AVX-512 hosts.
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        avx512_clobber();
+    }
+    return 0;
+}

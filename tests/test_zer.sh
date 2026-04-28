@@ -35,7 +35,11 @@ for f in tests/zer/*.zer; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .zer)
     TOTAL=$((TOTAL + 1))
-    $ZERC "$f" $EXTRA_FLAGS --run 2>/dev/null
+    # Per-file flags: first line `// zerc-flags: --foo --bar=baz` is parsed
+    # and appended to ZERC invocation. Used for tests that need specific
+    # target features (e.g., --target-features=avx512f).
+    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
     ret=$?
     if [ $ret -eq 0 ]; then
         PASS=$((PASS + 1))
@@ -47,7 +51,7 @@ for f in tests/zer/*.zer; do
         else
             FAIL=$((FAIL + 1))
             echo "  FAIL: $name (exit $ret)"
-            $ZERC "$f" $EXTRA_FLAGS --run 2>&1 | head -5
+            $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>&1 | head -5
         fi
     fi
     rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null

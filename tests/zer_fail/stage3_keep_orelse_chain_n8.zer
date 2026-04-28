@@ -1,0 +1,24 @@
+// Stage 3 Gap 35: keep_checks[8] previously silently accepted 8-deep orelse
+// chains with &local at the end. After the conversion to stack-first dynamic
+// + arena overflow, all chain depths must be rejected (the local-derived
+// pointer leaks through any orelse depth).
+//
+// EXPECTED: compile error — "cannot satisfy 'keep' parameter"
+
+?*u32 g_keep_target = null;
+
+void take_keep(keep *u32 p) {
+    g_keep_target = p;
+}
+
+void leaker(?*u32 a, ?*u32 b, ?*u32 c, ?*u32 d,
+            ?*u32 e, ?*u32 f, ?*u32 g, ?*u32 h) {
+    u32 local = 42;
+    // 8-deep chain — last fallback is &local, which escapes via keep
+    take_keep(a orelse b orelse c orelse d orelse e orelse f orelse g orelse h orelse &local);
+}
+
+u32 main() {
+    leaker(null, null, null, null, null, null, null, null);
+    return 0;
+}

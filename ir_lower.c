@@ -905,8 +905,23 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
         for (int i = 0; i < expr->struct_init.field_count; i++)
             rewrite_idents(ctx, expr->struct_init.fields[i].value);
         break;
-    default:
-        /* Literals, null, etc. — no idents to rewrite */
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaves and non-expression
+     * kinds have no idents to rewrite. Statement kinds shouldn't appear
+     * as expressions but listed for -Wswitch enforcement. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
         break;
     }
 }
@@ -965,7 +980,24 @@ static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt) {
         /* nested defer — rare, handle transitively */
         rewrite_defer_body_idents(ctx, stmt->defer.body);
         break;
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without an init
+     * expression or scannable body for ident rewriting. Top-level decls
+     * shouldn't appear in defer bodies; expression nodes shouldn't be
+     * direct children of defer body (they appear via NODE_EXPR_STMT). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         break;
     }
 }

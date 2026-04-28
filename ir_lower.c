@@ -1409,7 +1409,24 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
         for (int i = 0; i < n->struct_init.field_count; i++)
             pre_lower_orelse(ctx, &n->struct_init.fields[i].value, line);
         break;
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — pre_lower_orelse only
+     * descends into expression nodes that may contain a NODE_ORELSE.
+     * Leaves and statement/declaration kinds have no ORELSE inside. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_ORELSE:  /* ORELSE handled at top of fn */
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
         break;
     }
 }

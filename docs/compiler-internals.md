@@ -8433,3 +8433,149 @@ correctly hits the `< 0` branch.
 
 All auto-discovered by `tests/test_zer.sh` via directory scan. Total ZER
 integration test count: 505 (up from 497).
+
+---
+
+# Stage 2 of `docs/4-27-2026-gaps.md` Roadmap — Part A COMPLETE 2026-04-28, Part B IN PROGRESS
+
+Stage 2 splits into two distinct deliverables:
+
+## Part A — Per-walker semantic gap fixes (DONE)
+
+7 walkers in `zercheck.c`, `zercheck_ir.c`, `ir_lower.c`, `parser.c`,
+and `checker.c` were extended to handle node shapes they previously
+skipped. Each fix is a targeted recursion / root-walk / propagation
+addition, not a mechanical sweep.
+
+### contains_move_struct_field — recursive (Gap 28)
+
+**Pattern:** depth-limited recursion (cap 32) through nested struct/union
+fields. `zercheck.c:contains_move_struct_field_depth(t, depth)`. Reuse
+this pattern for any future "type contains X at any nesting" check.
+
+### BUG-385 struct param Handle scan — explicit-stack DFS (Gap 29)
+
+**Pattern:** instead of recursion, iterative DFS using explicit stack of
+`StructFrame { type, key, key_len, depth }`. Avoids C-stack overflow on
+deeply-nested types and gives O(1) cycle detection via depth limit.
+Reusable for any nested-struct-with-tracked-field registration.
+
+### Move walker NODE_FIELD/NODE_INDEX root walk (Gap 42)
+
+**Pattern:** when an arg's TYPE is move (e.g., `b.item` typed as Tok-move),
+walk through NODE_FIELD/NODE_INDEX to root ident, transfer the root's
+tracked handle. Both AST (`zercheck.c`) and IR (`zercheck_ir.c`) sides
+must apply the same logic to keep tracking consistent.
+
+### Pointer-deref alias on var-decl + NODE_UNARY/AMP key transparency (Gap 41)
+
+**Two-part pattern:**
+1. `Handle k = *p;` registers k as alias of p (same alloc_id). Future
+   `free(k)` propagates to p via existing alias_state mechanism.
+2. `handle_key_from_expr(NODE_UNARY/AMP, ...)` returns the operand's
+   key. `&h` is transparent for handle-tracking purposes.
+
+Together these make `sneak_free(&h)` (where the body does
+`Handle k = *p; free(k);`) propagate FREED state to caller.
+
+### emit_shared_lock_around_cond / unlock helper (Gap 36)
+
+**Pattern:** at each control-flow lowering site (NODE_IF, NODE_WHILE,
+NODE_DO_WHILE, NODE_FOR, NODE_SWITCH), wrap the cond/expr evaluation
+with `IR_LOCK` / `IR_UNLOCK` if it reads shared state. Lock scope is
+JUST the cond evaluation (not the body) to avoid deadlock on nested
+shared access in arms.
+
+### Stack-depth analyzer skip comptime-stripped branches (Gap 44)
+
+**Pattern:** in walkers that traverse all branches of an `if`, check
+`is_comptime` flag first. If true, evaluate cond at compile time and
+walk only the taken branch. Maintains "only the taken branch is
+type-checked" invariant.
+
+### Range-for collection.len snapshot (Gap 31)
+
+**Pattern:** parser desugaring wraps the NODE_FOR in a NODE_BLOCK
+that includes a synthetic `_zer_rlen` var-decl initialized from
+`<collection>.len`. Cond compares against this synthetic local
+instead of re-cloning collection.len each iteration. Uses the same
+`is_synthetic` flag that bypasses reserved-prefix check.
+
+## Part B — Mechanical -Wswitch enforcement (IN PROGRESS)
+
+`tools/walker_default_audit.sh` — initial baseline 42 sites, currently
+34 remaining (8 closed). All -Wswitch warnings resolved (8 → 0).
+
+### Approach
+
+For each walker that has `switch (...->kind)` / `switch (...->op)` with
+a `default:` clause, replace `default: break;` with an explicit list of
+every NODE_KIND / TYNODE_KIND / IR_OP_KIND. GCC's -Wswitch then errors
+on any new kind added to the enum without updating the walker.
+
+**Pattern for explicit-no-op cases:**
+```c
+case NODE_BLOCK:
+    /* recurse into children */
+    break;
+case NODE_IF:
+    /* recurse into branches */
+    break;
+/* ... explicit case for every NODE_ kind ... */
+case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    /* leaf — explicit no-op */
+    break;
+```
+
+The full enum list is in `ast.h`. When adding a new NODE_/TYNODE_/IR_OP_,
+build will fail with -Wswitch errors at every walker; each error site
+needs a deliberate handling decision.
+
+### Walkers converted in Stage 2 Part B
+
+- `zercheck.c:defer_scan_all_frees`
+- `zercheck_ir.c:ir_check_expr_uaf`
+- `zercheck_ir.c:ir_defer_scan_frees`
+- `zercheck_ir.c:used-locals AST walker`
+- `ir_lower.c:rewrite_idents`
+- `ir_lower.c:rewrite_defer_body_idents`
+- `ir_lower.c:rewrite_capture_name`
+- `ir_lower.c:find_shared_root_in_stmt_ir`
+- `ast.c:node_kind_name`
+- `ast.c:print_type` (TYNODE_KIND)
+- `ast.c:ast_print`
+- `emitter.c:emit_top_level_decl` (added NODE_DO_WHILE)
+
+### Walkers remaining (34 sites)
+
+Many are TYPE_KIND switches (intentional defaults for non-builtin types),
+IR_OP_KIND switches (forward-compat for new IR ops), or intrinsic-name
+string dispatches (different from NODE_KIND). Review each case-by-case:
+- SAFE: explicit reject decision for any future kind not in the targeted
+  set (e.g., `ir_receiver_is_builtin_target` rejects all non-Pool/Slab/
+  Ring/Arena/Struct types — adding a new TYPE_KIND should require manual
+  consideration).
+- UNSAFE: silent skip of new NODE_KIND. Convert to enumerated cases.
+- NEEDS REWRITE: switch on a string (e.g., intrinsic name) — different
+  problem, doesn't benefit from -Wswitch.
+
+Continuation strategy for fresh sessions:
+1. Run `bash tools/walker_default_audit.sh` to see current punch list
+2. Pick the next site, view it with the surrounding switch
+3. Classify (SAFE/UNSAFE/NEEDS_REWRITE) and either convert or annotate
+4. Run `make check` after each conversion (regression-test)
+5. Update this doc + audit script's INITIAL_COUNT if rebaselining
+
+## Test additions for Stage 2
+
+7 new regression tests:
+- `tests/zer/range_for_len_snapshot.zer`
+- `tests/zer/shared_in_cond_locked.zer`
+- `tests/zer/stack_depth_skip_dead_branch.zer`
+- `tests/zer_fail/nested_move_struct_uaf.zer`
+- `tests/zer_fail/nested_struct_handle_uaf.zer`
+- `tests/zer_fail/container_field_move_uaf.zer`
+- `tests/zer_fail/sneak_free_via_deref.zer`
+
+Total ZER integration count after Stage 2 Part A: 512 (up from 505).

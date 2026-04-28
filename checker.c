@@ -7095,7 +7095,18 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     case NODE_ONCE:
         scan_func_props(c, node->once.body, parent_sym);
         return;
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf/no-body kinds
+     * have no children to scan for FuncProps tracking. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
         return;
     }
 }
@@ -7216,8 +7227,25 @@ static bool has_atomic_or_barrier(Node *node) {
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
         return false;
-    default: return false;
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
+     * kinds without an expression body that could contain @atomic_*
+     * or @barrier intrinsics. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
+    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
     }
+    return false;
 }
 
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
@@ -7341,9 +7369,25 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             if (scan_unsafe_global_access(c, node->switch_stmt.arms[i].body, out_name, out_len)) return true;
         return false;
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
+     * kinds without expressions/bodies that could contain a global
+     * access. NODE_IDENT handled above (returns true with out_name set
+     * if it's an unsafe global). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
         return false;
     }
+    return false;
 }
 
 /* Check if an expression tree contains yield or await */
@@ -7361,8 +7405,29 @@ static bool expr_contains_yield(Node *n) {
     case NODE_FIELD: return expr_contains_yield(n->field.object);
     case NODE_INDEX: return expr_contains_yield(n->index_expr.object) || expr_contains_yield(n->index_expr.index);
     case NODE_ORELSE: return expr_contains_yield(n->orelse.expr);
-    default: return false;
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf / non-yield-bearing
+     * expression kinds. NODE_YIELD/AWAIT handled at the top via early
+     * return. Other kinds can't contain a yield. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_SLICE: case NODE_INTRINSIC:
+    case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT: case NODE_YIELD: case NODE_AWAIT:
+    /* Statement / decl kinds shouldn't appear in expression position */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_DO_WHILE:
+    case NODE_STATIC_ASSERT:
+        return false;
     }
+    return false;
 }
 
 static void check_stmt(Checker *c, Node *node) {
@@ -10795,7 +10860,23 @@ static bool contains_break(Node *node) {
         return false; /* yield is a leaf, cannot contain break */
     case NODE_AWAIT:
         return node->await_stmt.cond ? contains_break(node->await_stmt.cond) : false;
-    default: return false;
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds that can't
+     * contain a break for the current (outer) loop. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_RETURN: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_INTRINSIC:
+    case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT:
+        return false;
     }
 }
 
@@ -10864,9 +10945,28 @@ static bool all_paths_return(Node *node) {
         return all_paths_return(node->critical.body);
     case NODE_ONCE:
         return all_paths_return(node->once.body);
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds that cannot
+     * guarantee a return (or aren't statements where this analysis
+     * applies). NODE_BREAK/CONTINUE/GOTO are control-flow exits but
+     * not RETURNS so they don't satisfy all_paths_return. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         return false;
     }
+    return false;
 }
 
 static void check_func_body(Checker *c, Node *node) {
@@ -11830,7 +11930,26 @@ static Type *find_param_cast_type(Checker *c, Node *node,
             if (t) return t;
         }
         break;
-    default: break;
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf / no-children
+     * kinds. find_param_cast_type only descends into nodes that may
+     * contain a @ptrcast(*T, param) intrinsic call. Listed kinds have
+     * no scannable expr children for this lookup. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
+    case NODE_GOTO: case NODE_LABEL: case NODE_ASM:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        break;
     }
     return NULL;
 }
@@ -12151,7 +12270,25 @@ static void check_call_provenance(Checker *c, Node *node) {
     case NODE_RETURN:
         check_call_provenance(c, node->ret.expr);
         break;
-    default: break;
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without
+     * scannable bodies/exprs for provenance check recursion. */
+    case NODE_FILE: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT:
+    case NODE_CINCLUDE: case NODE_INTERRUPT: case NODE_MMIO:
+    case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_SWITCH: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        break;
     }
 }
 
@@ -12243,8 +12380,29 @@ static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
         return r;
     }
     case NODE_SWITCH: return find_shared_type_in_expr(c, stmt->switch_stmt.expr);
-    default: return NULL;
+    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
+     * cond/init/expr that could read a shared struct. find_shared_type
+     * is per-statement to detect deadlock-risky multi-shared accesses
+     * within one statement; nothing to scan for these. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return NULL;
     }
+    return NULL;
 }
 
 /* ---- Per-function shared type cache for deadlock detection (BUG-474 proper fix) ----
@@ -12535,8 +12693,28 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
         return n;
     }
     case NODE_SWITCH: return collect_shared_types_in_expr(c, stmt->switch_stmt.expr, types, max_types, 0);
-    default: return 0;
+    /* Stage 2 Part B (2026-04-28): exhaustive — same shape as
+     * find_shared_type_in_stmt above. Statement kinds without a
+     * cond/init/expr that could read a shared struct return 0. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return 0;
     }
+    return 0;
 }
 
 static void check_block_lock_ordering(Checker *c, Node *block) {

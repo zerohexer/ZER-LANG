@@ -3084,24 +3084,15 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
     }
 
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds that aren't valid
-     * in expression position emit a diagnostic placeholder. Statement
-     * kinds, top-level decls, control-flow nodes — all unreachable here
-     * if the AST is well-formed. NODE_CAST (deprecated) and NODE_SIZEOF
-     * fall through to diagnostic — handled via NODE_INTRINSIC wrappers
-     * in current ZER. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
-    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
-    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
-    case NODE_AWAIT: case NODE_STATIC_ASSERT:
-    case NODE_CAST: case NODE_SIZEOF:
+    /* Stage 2 Part B note (2026-04-28): emit_expr's `default:` is KEPT
+     * intentionally. Exhaustive case enumeration here would create false
+     * positives in `tools/walker_audit.sh`, which compares emit_expr's
+     * case list against emit_rewritten_node — listing NODE_FILE etc. as
+     * cases would falsely flag them as IR-path gaps. emit_expr is the
+     * legacy AST diagnostic path (unreachable for well-formed ASTs in
+     * the IR pipeline); the diagnostic fallback is the right behavior
+     * for any kind not legitimately reachable here. */
+    default:
         emit(e, "/* unhandled expr %s */0", node_kind_name(node->kind));
         break;
     }

@@ -1,0 +1,53 @@
+# Fixed-buffer baseline — Stage 3 (2026-04-28)
+#
+# This file lists every fixed-size buffer declaration in compiler internals
+# that has been REVIEWED and accepted. The audit script
+# `tools/audit_fixed_buffers.sh` greps for fixed-size buffer patterns and
+# diffs against this baseline. Anything new = lint failure.
+#
+# Format: file:line:source-line (verbatim from the .c file)
+# Comments and blank lines are ignored.
+#
+# To add a new acceptable pattern, append the line + a justification comment
+# above it explaining why the fixed size is safe (bounded by AST structure,
+# short-lived scratch, etc.).
+#
+# To convert a pattern to dynamic, remove its line from here and use
+# stack-first dynamic (see parser.c stack_iargs / zercheck_ir.c fast_stack).
+
+# Bounded sets of "candidates to check" — count is fixed by AST structure
+# (var-decl init OR fallback = 2; addr_exprs has 4 specific check kinds).
+checker.c:3496:            Node *arr_checks[2] = { NULL, NULL };
+checker.c:7843:                    Node *checks[2] = { node->var_decl.init, NULL };
+checker.c:7885:                    Node *addr_exprs[4] = { NULL, NULL, NULL, NULL };
+checker.c:7957:                Node *arr_roots[2] = { node->var_decl.init, NULL };
+checker.c:9090:                Node *roots[2] = { node->ret.expr, NULL };
+checker.c:12891:        Type *found[4];
+
+# Stack-first dynamic — these have arena overflow (parser RF9 pattern).
+# The [N] is the FAST PATH, growth happens via realloc-in-arena.
+parser.c:927:        Node *stack_iargs[8];
+parser.c:985:            Node *stack_args[16];
+parser.c:1166:    Node *stack_stmts[32];
+parser.c:1546:            Node *stack_vals[16];
+parser.c:2954:    Node *stack_decls[64];
+zercheck_ir.c:3177:                    Node *fast_stack[64];
+
+# Stage 3 conversions — stack-first 8 with arena overflow doubling
+# (see Stage 3 docs/4-27-2026-gaps.md).
+checker.c:4469:                        Node *kc_stack[8] = { arg_node };
+checker.c:4540:                            Node *ld_stack[8];
+
+# Bitmaps for "covered alloc IDs" — 256 bits = 256 distinct alloc-id slots
+# per function, growing dynamically beyond that via covered_stack/dynamic
+# Pair pattern. Reviewed during Stage 3.
+checker.c:8842:                    uint8_t covered_stack[256] = {0};
+checker.c:8916:                uint8_t ucov_stack[256] = {0};
+zercheck.c:2962:    int covered_stack[64];
+
+# zerc_main.c import limit — 64 imported modules per compilation unit.
+# Hard-coded by design: no real codebase imports >64 modules per file,
+# and import depth is capped earlier by parser. Graceful degradation
+# (silent skip beyond 64) confirmed acceptable in CLAUDE.md "Confirmed
+# NOT Bugs" section.
+zerc_main.c:563:    Node *import_asts[64];

@@ -468,21 +468,27 @@ static bool is_literal_compatible(Node *expr, Type *target) {
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
 
 /* BUG-392: Build a string key from an expression for union switch locking.
- * Same pattern as zercheck's handle_key_from_expr. Returns key length or 0. */
+ * Same pattern as zercheck's handle_key_from_expr.
+ *
+ * Stage 3 (2026-04-28): three-state return:
+ *   >0  : key length on success
+ *    0  : expression has no key (unsupported kind — not an error)
+ *   -1  : buffer too small (caller should retry with larger buffer) */
 static int build_expr_key(Node *expr, char *buf, int bufsize) {
-    if (!expr || bufsize < 2) return 0;
+    if (!expr) return 0;
+    if (bufsize < 2) return -1;
     if (expr->kind == NODE_IDENT) {
         int len = (int)expr->ident.name_len;
-        if (len >= bufsize) return 0;
+        if (len >= bufsize) return -1;
         memcpy(buf, expr->ident.name, len);
         buf[len] = '\0';
         return len;
     }
     if (expr->kind == NODE_FIELD) {
         int base = build_expr_key(expr->field.object, buf, bufsize);
-        if (base <= 0) return 0;
+        if (base <= 0) return base;  /* propagate 0 (no key) or -1 (overflow) */
         int flen = (int)expr->field.field_name_len;
-        if (base + 1 + flen >= bufsize) return 0;
+        if (base + 1 + flen >= bufsize) return -1;
         buf[base] = '.';
         memcpy(buf + base + 1, expr->field.field_name, flen);
         int total = base + 1 + flen;
@@ -492,36 +498,75 @@ static int build_expr_key(Node *expr, char *buf, int bufsize) {
     if (expr->kind == NODE_INDEX && expr->index_expr.index &&
         expr->index_expr.index->kind == NODE_INT_LIT) {
         int base = build_expr_key(expr->index_expr.object, buf, bufsize);
-        if (base <= 0) return 0;
+        if (base <= 0) return base;
         int written = snprintf(buf + base, bufsize - base, "[%llu]",
                                (unsigned long long)expr->index_expr.index->int_lit.value);
-        if (written <= 0 || base + written >= bufsize) return 0;
+        if (written <= 0 || base + written >= bufsize) return -1;
         return base + written;
     }
     if (expr->kind == NODE_UNARY && expr->unary.op == TOK_STAR) {
         int base = build_expr_key(expr->unary.operand, buf, bufsize);
-        if (base <= 0) return 0;
+        if (base <= 0) return base;
         /* prepend * — shift right and insert */
-        if (base + 1 >= bufsize) return 0;
+        if (base + 1 >= bufsize) return -1;
         memmove(buf + 1, buf, base + 1);
         buf[0] = '*';
         return base + 1;
     }
-    return 0;
+    return 0;  /* unsupported expression kind — no key */
 }
 
-/* Arena-allocated expr key — no fixed buffer limit.
- * Uses a generous stack buffer, arena-copies the result.
- * Returns {key, len} or {NULL, 0} on failure. */
+/* Stage 3 (2026-04-28): exact-size key allocation via measure-then-fill.
+ *
+ * Walks the expression tree to compute the precise key length, then
+ * allocates exactly that much arena space and fills it in. No fixed-
+ * size buffer, no retry-doubling, no arbitrary cap.
+ *
+ * Returns -1 if the expression isn't keyable (unsupported kind),
+ * or the exact char count needed (excluding trailing NUL). */
+static int measure_expr_key(Node *expr) {
+    if (!expr) return -1;
+    if (expr->kind == NODE_IDENT) return (int)expr->ident.name_len;
+    if (expr->kind == NODE_FIELD) {
+        int base = measure_expr_key(expr->field.object);
+        if (base < 0) return -1;
+        return base + 1 + (int)expr->field.field_name_len;
+    }
+    if (expr->kind == NODE_INDEX && expr->index_expr.index &&
+        expr->index_expr.index->kind == NODE_INT_LIT) {
+        int base = measure_expr_key(expr->index_expr.object);
+        if (base < 0) return -1;
+        char tmp[32];
+        int idx_chars = snprintf(tmp, sizeof(tmp), "[%llu]",
+            (unsigned long long)expr->index_expr.index->int_lit.value);
+        if (idx_chars <= 0) return -1;
+        return base + idx_chars;
+    }
+    if (expr->kind == NODE_UNARY && expr->unary.op == TOK_STAR) {
+        int base = measure_expr_key(expr->unary.operand);
+        if (base < 0) return -1;
+        return base + 1;
+    }
+    return -1;
+}
+
+/* Arena-allocated expr key — no fixed buffer, no cap.
+ * Stage 3 (2026-04-28): two-pass measure-then-fill.
+ *   pass 1: measure_expr_key computes exact length
+ *   pass 2: build_expr_key fills the precisely-sized arena buffer
+ * Mathematically correct: works for any expression depth bounded
+ * only by available memory. Replaces the previous 512-byte fixed
+ * buffer that silently disabled handle aliasing on overflow.
+ * Returns {key, len} or {NULL, 0} on "no key" or arena failure. */
 typedef struct { const char *str; int len; } ExprKey;
 static ExprKey build_expr_key_a(Checker *c, Node *expr) {
-    char stack_buf[512];
-    int len = build_expr_key(expr, stack_buf, sizeof(stack_buf));
-    if (len <= 0) return (ExprKey){ NULL, 0 };
-    char *key = (char *)arena_alloc(c->arena, len + 1);
+    int need = measure_expr_key(expr);
+    if (need < 0) return (ExprKey){ NULL, 0 };  /* unkeyable */
+    char *key = (char *)arena_alloc(c->arena, need + 1);
     if (!key) return (ExprKey){ NULL, 0 };
-    memcpy(key, stack_buf, len + 1);
-    return (ExprKey){ key, len };
+    int wrote = build_expr_key(expr, key, need + 1);
+    if (wrote != need) return (ExprKey){ NULL, 0 };  /* invariant violation */
+    return (ExprKey){ key, wrote };
 }
 
 /* Track dynamic-index free for auto-guard (B1 refactor: unified helper).
@@ -4417,13 +4462,27 @@ static Type *check_expr(Checker *c, Node *node) {
                          * BUG-338: walk into intrinsics for &local. */
                         Node *arg_node = node->call.args[i];
                         /* unwrap orelse — check all branches recursively
-                         * BUG-370: nested orelse chains: a orelse b orelse &x */
-                        Node *keep_checks[8] = { arg_node, NULL };
+                         * BUG-370: nested orelse chains: a orelse b orelse &x
+                         * Stage 3 (2026-04-28): stack-first dynamic — fixed
+                         * Node *keep_checks[8] silently truncated chains >7
+                         * deep. Stack 8, overflow to arena (doubling). */
+                        Node *kc_stack[8] = { arg_node };
+                        Node **keep_checks = kc_stack;
                         int keep_check_count = 1;
+                        int kc_cap = 8;
                         {
                             Node *ow = arg_node;
                             int idx = 0;
-                            while (ow && ow->kind == NODE_ORELSE && idx < 7) {
+                            while (ow && ow->kind == NODE_ORELSE) {
+                                /* grow if needed: may write up to 2 entries this iter */
+                                if (idx + 2 > kc_cap) {
+                                    int ncap = kc_cap * 2;
+                                    Node **nbuf = (Node **)arena_alloc(c->arena, ncap * sizeof(Node*));
+                                    if (!nbuf) break;
+                                    memcpy(nbuf, keep_checks, idx * sizeof(Node*));
+                                    keep_checks = nbuf;
+                                    kc_cap = ncap;
+                                }
                                 keep_checks[idx++] = ow->orelse.expr;
                                 if (ow->orelse.fallback && ow->orelse.fallback->kind != NODE_ORELSE) {
                                     keep_checks[idx++] = ow->orelse.fallback;
@@ -4474,11 +4533,25 @@ static Type *check_expr(Checker *c, Node *node) {
                          * Walk through orelse chain to check BOTH expr and fallback sides.
                          * BUG-387: orelse fallback may be a local-derived ident. */
                         {
-                            /* collect all terminal idents from orelse chain */
-                            Node *ld_nodes[8];
+                            /* collect all terminal idents from orelse chain
+                             * Stage 3 (2026-04-28): stack-first dynamic — same
+                             * fix as keep_checks. Fixed Node *ld_nodes[8] would
+                             * silently miss chains >7 deep. */
+                            Node *ld_stack[8];
+                            Node **ld_nodes = ld_stack;
                             int ld_count = 0;
+                            int ld_cap = 8;
                             Node *ld_walk = arg_node;
-                            while (ld_walk && ld_walk->kind == NODE_ORELSE && ld_count < 7) {
+                            while (ld_walk && ld_walk->kind == NODE_ORELSE) {
+                                /* may write 1 entry this iter, +1 for terminal */
+                                if (ld_count + 2 > ld_cap) {
+                                    int ncap = ld_cap * 2;
+                                    Node **nbuf = (Node **)arena_alloc(c->arena, ncap * sizeof(Node*));
+                                    if (!nbuf) break;
+                                    memcpy(nbuf, ld_nodes, ld_count * sizeof(Node*));
+                                    ld_nodes = nbuf;
+                                    ld_cap = ncap;
+                                }
                                 /* check fallback side */
                                 if (ld_walk->orelse.fallback &&
                                     ld_walk->orelse.fallback->kind != NODE_ORELSE) {
@@ -4486,7 +4559,18 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                                 ld_walk = ld_walk->orelse.expr;
                             }
-                            if (ld_walk) ld_nodes[ld_count++] = ld_walk;
+                            if (ld_walk) {
+                                if (ld_count + 1 > ld_cap) {
+                                    int ncap = ld_cap * 2;
+                                    Node **nbuf = (Node **)arena_alloc(c->arena, ncap * sizeof(Node*));
+                                    if (nbuf) {
+                                        memcpy(nbuf, ld_nodes, ld_count * sizeof(Node*));
+                                        ld_nodes = nbuf;
+                                        ld_cap = ncap;
+                                    }
+                                }
+                                if (ld_count < ld_cap) ld_nodes[ld_count++] = ld_walk;
+                            }
                             for (int ldi = 0; ldi < ld_count; ldi++) {
                                 if (ld_nodes[ldi]->kind != NODE_IDENT) continue;
                                 Symbol *arg_sym = scope_lookup(c->current_scope,

@@ -466,6 +466,32 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
 
 static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_len);
 
+/* Stage 3 (2026-04-28): measure pass for ir_extract_compound_key.
+ * Walks the same shapes as ir_build_key_path but only counts chars,
+ * needs no buffer. Caller allocates exactly this many + 1 bytes.
+ * Returns -1 if the expression isn't keyable. */
+static int ir_measure_key_path(Node *expr) {
+    if (!expr) return -1;
+    if (expr->kind == NODE_IDENT) return 0;  /* bare ident — empty path */
+    if (expr->kind == NODE_FIELD) {
+        int base = ir_measure_key_path(expr->field.object);
+        if (base < 0) return -1;
+        return base + 1 + (int)expr->field.field_name_len;
+    }
+    if (expr->kind == NODE_INDEX) {
+        if (!expr->index_expr.index ||
+            expr->index_expr.index->kind != NODE_INT_LIT) return -1;
+        int base = ir_measure_key_path(expr->index_expr.object);
+        if (base < 0) return -1;
+        char tmp[32];
+        int idx_chars = snprintf(tmp, sizeof(tmp), "[%llu]",
+            (unsigned long long)expr->index_expr.index->int_lit.value);
+        if (idx_chars <= 0) return -1;
+        return base + idx_chars;
+    }
+    return -1;
+}
+
 /* Build the path component. Returns number of chars written (not including NUL),
  * or -1 if expression can't be keyed. `out_base_len` receives the length of
  * the root-ident portion (always 0 here; root ident is NOT part of path). */
@@ -536,15 +562,19 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     /* Bare ident — no path */
     if (expr->kind == NODE_IDENT) return 0;
 
-    /* Compound — build path into stack buffer then arena-copy */
-    char stack_buf[256];
-    int len = ir_build_key_path(expr, stack_buf, sizeof(stack_buf), NULL);
-    if (len <= 0) return -1;
-    char *path = (char *)arena_alloc(zc->arena, len + 1);
+    /* Compound — measure-then-fill. Stage 3 (2026-04-28): exact-size
+     * arena allocation. Walk once to compute the precise path length,
+     * then allocate exactly that and fill. No fixed buffer, no retry,
+     * no arbitrary cap — bounded only by available memory.
+     * Replaces the previous 256-byte fixed buffer. */
+    int need = ir_measure_key_path(expr);
+    if (need < 0) return -1;  /* unkeyable */
+    char *path = (char *)arena_alloc(zc->arena, need + 1);
     if (!path) return -1;
-    memcpy(path, stack_buf, len + 1);
+    int wrote = ir_build_key_path(expr, path, need + 1, NULL);
+    if (wrote != need) return -1;  /* invariant violation */
     *out_path = path;
-    *out_path_len = (uint32_t)len;
+    *out_path_len = (uint32_t)need;
     return 0;
 }
 
@@ -3137,11 +3167,30 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                  * for NODE_IDENTs that reference tracked locals. Without
                  * this, mh used in `h = mh orelse return` counts as unused. */
                 if (inst->expr) {
-                    /* Recursive walk limited to small depth — expressions
-                     * are typically shallow. Use a manual stack to avoid
-                     * runaway recursion on pathological ASTs. */
-                    Node *stack[64];
+                    /* Recursive walk — manual stack to avoid runaway recursion
+                     * on pathological ASTs.
+                     * Stage 3 (2026-04-28): stack-first dynamic. Fixed 64-slot
+                     * stack silently truncated walks for ASTs deeper than 64
+                     * nodes; missed NODE_IDENTs in the truncated tail caused
+                     * false-positive "unused local" leak reports. Stack 64,
+                     * overflow to arena (doubling). */
+                    Node *fast_stack[64];
+                    Node **stack = fast_stack;
                     int top = 0;
+                    int stk_cap = 64;
+                    /* Helper: ensure room for `need` more slots before pushes */
+                    #define ZER_STK_RESERVE(need_) do { \
+                        int need__ = (need_); \
+                        if (top + need__ > stk_cap) { \
+                            int ncap = stk_cap * 2; \
+                            while (ncap < top + need__) ncap *= 2; \
+                            Node **nbuf = (Node **)arena_alloc(zc->arena, ncap * sizeof(Node *)); \
+                            if (!nbuf) goto stk_overflow; \
+                            memcpy(nbuf, stack, top * sizeof(Node *)); \
+                            stack = nbuf; \
+                            stk_cap = ncap; \
+                        } \
+                    } while (0)
                     stack[top++] = inst->expr;
                     while (top > 0) {
                         Node *n = stack[--top];
@@ -3155,48 +3204,54 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             break;
                         }
                         case NODE_FIELD:
-                            if (top < 63) stack[top++] = n->field.object; break;
+                            ZER_STK_RESERVE(1);
+                            stack[top++] = n->field.object; break;
                         case NODE_INDEX:
-                            if (top < 62) {
-                                stack[top++] = n->index_expr.object;
-                                stack[top++] = n->index_expr.index;
-                            } break;
+                            ZER_STK_RESERVE(2);
+                            stack[top++] = n->index_expr.object;
+                            stack[top++] = n->index_expr.index;
+                            break;
                         case NODE_UNARY:
-                            if (top < 63) stack[top++] = n->unary.operand; break;
+                            ZER_STK_RESERVE(1);
+                            stack[top++] = n->unary.operand; break;
                         case NODE_BINARY:
-                            if (top < 62) {
-                                stack[top++] = n->binary.left;
-                                stack[top++] = n->binary.right;
-                            } break;
+                            ZER_STK_RESERVE(2);
+                            stack[top++] = n->binary.left;
+                            stack[top++] = n->binary.right;
+                            break;
                         case NODE_CALL:
-                            if (top < 63) stack[top++] = n->call.callee;
-                            for (int ai = 0; ai < n->call.arg_count && top < 63; ai++)
+                            ZER_STK_RESERVE(1 + n->call.arg_count);
+                            stack[top++] = n->call.callee;
+                            for (int ai = 0; ai < n->call.arg_count; ai++)
                                 stack[top++] = n->call.args[ai];
                             break;
                         case NODE_ASSIGN:
-                            if (top < 62) {
-                                stack[top++] = n->assign.target;
-                                stack[top++] = n->assign.value;
-                            } break;
+                            ZER_STK_RESERVE(2);
+                            stack[top++] = n->assign.target;
+                            stack[top++] = n->assign.value;
+                            break;
                         case NODE_ORELSE:
-                            if (top < 62) {
-                                stack[top++] = n->orelse.expr;
-                                stack[top++] = n->orelse.fallback;
-                            } break;
+                            ZER_STK_RESERVE(2);
+                            stack[top++] = n->orelse.expr;
+                            stack[top++] = n->orelse.fallback;
+                            break;
                         case NODE_TYPECAST:
-                            if (top < 63) stack[top++] = n->typecast.expr; break;
+                            ZER_STK_RESERVE(1);
+                            stack[top++] = n->typecast.expr; break;
                         case NODE_SLICE:
-                            if (top < 61) {
-                                stack[top++] = n->slice.object;
-                                stack[top++] = n->slice.start;
-                                stack[top++] = n->slice.end;
-                            } break;
+                            ZER_STK_RESERVE(3);
+                            stack[top++] = n->slice.object;
+                            stack[top++] = n->slice.start;
+                            stack[top++] = n->slice.end;
+                            break;
                         case NODE_INTRINSIC:
-                            for (int ai = 0; ai < n->intrinsic.arg_count && top < 63; ai++)
+                            ZER_STK_RESERVE(n->intrinsic.arg_count);
+                            for (int ai = 0; ai < n->intrinsic.arg_count; ai++)
                                 stack[top++] = n->intrinsic.args[ai];
                             break;
                         case NODE_STRUCT_INIT:
-                            for (int fi = 0; fi < n->struct_init.field_count && top < 63; fi++)
+                            ZER_STK_RESERVE(n->struct_init.field_count);
+                            for (int fi = 0; fi < n->struct_init.field_count; fi++)
                                 stack[top++] = n->struct_init.fields[fi].value;
                             break;
                         /* Stage 2 Part B (2026-04-28): exhaustive — leaf
@@ -3226,6 +3281,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             break;
                         }
                     }
+                    stk_overflow: ;  /* arena_alloc failure: stop walk early */
+                    #undef ZER_STK_RESERVE
                 }
             }
         }

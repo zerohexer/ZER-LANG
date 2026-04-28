@@ -416,7 +416,16 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
         case TYPE_I64:
             return true;  /* val is uint64, positive literal fits in i64 */
-        default:
+        /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
+         * trivially "fit" (the literal is being coerced to a non-int
+         * target via other rules, so this predicate doesn't apply). */
+        case TYPE_VOID: case TYPE_BOOL: case TYPE_F32: case TYPE_F64:
+        case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+        case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+        case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+        case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+        case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+        case TYPE_SEMAPHORE: case TYPE_DISTINCT:
             return true;
         }
     }
@@ -437,7 +446,17 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             /* unsigned types: negative literals never fit */
             case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
                 return false;
-            default:         return true;
+            /* Stage 2 Part B (2026-04-28): exhaustive — non-integer
+             * targets trivially "fit" (negative-literal coercion to
+             * non-int handled elsewhere). */
+            case TYPE_VOID: case TYPE_BOOL: case TYPE_F32: case TYPE_F64:
+            case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+            case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+            case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+            case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+            case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+            case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+                return true;
             }
         }
         if (expr->unary.operand->kind == NODE_FLOAT_LIT && type_is_float(effective))
@@ -1225,9 +1244,19 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->container.type_arg = subst_typenode(a, tn->container.type_arg, param_name, param_len, replacement);
         return r;
     }
-    default:
-        return tn; /* no substitution needed (primitives, named non-param types) */
+    /* Stage 2 Part B (2026-04-28): exhaustive — primitives and other
+     * leaf TypeNode kinds need no substitution (they have no inner type
+     * param). NAMED is handled at the top via leaf check. */
+    case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
+    case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
+    case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
+    case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
+    case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
+    case TYNODE_ARENA: case TYNODE_HANDLE: case TYNODE_BARRIER:
+    case TYNODE_SLAB: case TYNODE_SEMAPHORE:
+        return tn;
     }
+    return tn;  /* defensive — unreachable with all cases enumerated */
 }
 
 /* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
@@ -10559,7 +10588,22 @@ static void register_decl(Checker *c, Node *node) {
         break;
     }
 
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — non-top-level kinds
+     * have nothing to register as a top-level declaration. */
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_FILE:
         break;
     }
 }

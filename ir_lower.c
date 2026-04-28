@@ -660,7 +660,23 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     case NODE_INTRINSIC:
     case NODE_SLICE:
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — listing every NODE_
+     * kind that should fall through to passthrough. The passthrough
+     * label below handles via emit_rewritten_node. Statement kinds
+     * shouldn't appear in expression position (caller would have
+     * dispatched via lower_stmt) but listed for -Wswitch. */
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
     passthrough: {
         /* Create temp, emit IR_ASSIGN with expr (passthrough to emit_expr).
          * This is the migration bridge — allows incremental transition. */
@@ -2902,7 +2918,22 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_STATIC_ASSERT:
         break;
 
-    default:
+    /* Stage 2 Part B (2026-04-28): exhaustive — declaration-level and
+     * expression-level NODE_ kinds aren't statements. Top-level decls
+     * are handled by emit_top_level_decl, not lower_stmt. Bare
+     * expressions in statement position are wrapped in NODE_EXPR_STMT
+     * by the parser, so they never appear here directly. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         break;
     }
 }
@@ -2962,10 +2993,16 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
             case TYNODE_F64: pt = ty_f64; break;
             case TYNODE_BOOL: pt = ty_bool; break;
             case TYNODE_VOID: pt = ty_void; break;
-            default: {
-                /* Complex type — use checker's func_type for accurate param types.
-                 * The TypeNode switch above only handles primitives.
-                 * Pointer, struct, optional, etc. need checker resolution. */
+            /* Stage 2 Part B (2026-04-28): exhaustive — complex types
+             * use checker's func_type for accurate resolution. The
+             * primitive switch above is the fast path; everything else
+             * goes through the checker. */
+            case TYNODE_POINTER: case TYNODE_OPTIONAL: case TYNODE_SLICE:
+            case TYNODE_ARRAY: case TYNODE_NAMED: case TYNODE_FUNC_PTR:
+            case TYNODE_POOL: case TYNODE_RING: case TYNODE_ARENA:
+            case TYNODE_HANDLE: case TYNODE_CONST: case TYNODE_VOLATILE:
+            case TYNODE_CONTAINER: case TYNODE_OPAQUE: case TYNODE_BARRIER:
+            case TYNODE_SLAB: case TYNODE_SEMAPHORE: {
                 Type *func_type = checker_get_type(checker, func_decl);
                 if (func_type && func_type->kind == TYPE_FUNC_PTR &&
                     (uint32_t)i < func_type->func_ptr.param_count) {

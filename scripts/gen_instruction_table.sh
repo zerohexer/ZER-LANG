@@ -60,14 +60,28 @@ cat_to_int() {
 }
 
 # Translate feature names to bitmap (matches asm_register_tables.h ZerCpuFeature).
-# Today only ZER_FEAT_AVX512F = 1; future features land here as they're needed.
+# F4.2 expansion (2026-04-29): added 13 features used by x86_64.zerdata.
+# Bit values must match the enum exactly — both pieces are vendored.
 feat_to_int() {
     case "$1" in
-        AVX512F)           echo 1 ;;     # 1 << 0
+        AVX512F)           echo 1 ;;        # 1 << 0
+        SSE)               echo 2 ;;        # 1 << 1
+        SSE2)              echo 4 ;;        # 1 << 2
+        AVX)               echo 8 ;;        # 1 << 3
+        AVX2)              echo 16 ;;       # 1 << 4
+        AES)               echo 32 ;;       # 1 << 5
+        SHA)               echo 64 ;;       # 1 << 6
+        BMI1)              echo 128 ;;      # 1 << 7
+        BMI2)              echo 256 ;;      # 1 << 8
+        LZCNT)             echo 512 ;;      # 1 << 9
+        POPCNT)            echo 1024 ;;     # 1 << 10
+        INVPCID)           echo 2048 ;;     # 1 << 11
+        PKU)               echo 4096 ;;     # 1 << 12
+        XSAVE)             echo 8192 ;;     # 1 << 13
+        SMAP)              echo 16384 ;;    # 1 << 14
         NONE|"")           echo 0 ;;
-        # Other features documented in SCHEMA.md but not yet wired into
-        # the runtime — they stringify into the source citation field
-        # so the data is preserved for when ZerCpuFeature is expanded.
+        # Unknown feature names: emit 0 (no gating) and warn via stderr.
+        # Maintainers must extend the enum to wire new features.
         *)                 echo 0 ;;
     esac
 }

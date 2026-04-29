@@ -1,0 +1,17 @@
+// zerc-flags: --target-features=aes
+// F4.2 positive: AESENC with --target-features=aes compiles cleanly
+// (C4 gate satisfied, -maes forwarded to GCC).
+
+naked void aes_round() {
+    asm {
+        instructions: "aesenc %%xmm0, %%xmm1"
+        clobbers: ["xmm1"]
+        safety: "AES-NI round with feature flag set — F4.2 C4 dispatch positive test"
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { aes_round(); }
+    return 0;
+}

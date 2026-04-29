@@ -8579,3 +8579,315 @@ Continuation strategy for fresh sessions:
 - `tests/zer_fail/sneak_free_via_deref.zer`
 
 Total ZER integration count after Stage 2 Part A: 512 (up from 505).
+
+---
+
+## Stage 3 — Fixed-buffer cleanup + CI linter (2026-04-28)
+
+Stage 3 closed Gap 35 (HIGH severity, VERIFIED) — `keep_checks[8]` /
+`ld_nodes[8]` silently truncated 8-deep orelse chains, bypassing
+keep-parameter local-pointer escape check. Plus 3 Tier-4 buffer sites
+converted, plus a new CI gate.
+
+### Conversions
+
+| Site | File | Before | After |
+|---|---|---|---|
+| `keep_checks[8]` | checker.c orelse-chain walker (param check) | Fixed `Node *keep_checks[8]` | Stack-first 8 + arena overflow doubling (parser RF9 pattern) |
+| `ld_nodes[8]` | checker.c orelse-chain walker (local-derived check) | Fixed `Node *ld_nodes[8]` | Same as above |
+| `build_expr_key stack_buf[512]` | checker.c (compound key path) | Fixed 512-byte buffer, silent truncation | **Two-pass measure-then-fill**: walk once to compute exact length, allocate exactly, fill. No buffer, no retries. |
+| `ir_extract_compound_key stack_buf[256]` | zercheck_ir.c | Same as above for IR-side keys | Same two-pass approach (with `ir_measure_key_path` helper) |
+| `Node *stack[64]` AST walker | zercheck_ir.c (used-locals tracking) | Fixed 64-slot stack | Stack-first 64 + `ZER_STK_RESERVE(N)` macro that doubles into arena on overflow |
+
+### `tools/audit_fixed_buffers.sh` (NEW)
+
+CI gate that flags new fixed-size buffers in compiler internals.
+Compares current declarations against `tools/fixed_buffer_baseline.txt`
+(18 known-accepted patterns).
+
+**Critical fix (2026-04-29)**: originally matched on `file:line:content`,
+which broke on EVERY edit that shifted lines. Re-architected to match
+on `file:content` (line-number-agnostic). Survives any source edit
+that doesn't change the buffer declaration itself.
+
+If you add a new fixed buffer:
+- Either convert to stack-first dynamic (parser RF9 pattern)
+- Or add `file:content` line + justification comment to baseline
+
+The audit runs in `make check`. Fails CI on any new pattern.
+
+### Stage 3 test additions
+
+- `tests/zer_fail/stage3_keep_orelse_chain_n8.zer` — 8-deep orelse
+  chain with terminal `&local` must reject (was silently accepted)
+
+Total ZER tests after Stage 3: 513 (up from 512).
+
+---
+
+## Sub-Extension Architecture — Validated 2026-04-29
+
+This section captures architectural decisions reached after extensive
+discussion + empirical proof. Companion to the
+"Sub-Extension Architecture — Validated 2026-04-29" section in
+`docs/asm_plan.md` which has full journey + rejected alternatives.
+
+### Empirical 3-arch end-to-end proof
+
+`tests/test_cross_arch.sh` (NEW 2026-04-29) generates test ZER source
+per arch, runs zerc with `--target-arch=<arch>`, cross-gcc compiles,
+verifies the output ELF matches expected arch via `file`. 3 archs,
+3 toolchains, 3 ELF formats — all green. Runs in `make check`.
+
+| Arch | Toolchain | Valid registers | ELF format produced |
+|---|---|---|---|
+| x86_64 | gcc 13.4 native | 105 | x86-64 ELF |
+| x86_64 + AVX-512F | gcc 13.4 + `-mavx512f -mavx512vl -mavx512bw` | 161 (+56) | same |
+| aarch64 | aarch64-linux-gnu-gcc 12.2 | 58 | ARM aarch64 ELF |
+| riscv64 | riscv64-linux-gnu-gcc 12.2 | 126 (3 rejected: x8/s0/fp = frame pointer) | UCB RISC-V ELF |
+
+### F6-minimum (RISC-V register table)
+
+`scripts/candidates_riscv64.txt` — 130 candidate names probed.
+`src/safety/asm_register_tables_riscv64.c` — 126 valid (auto-generated).
+`src/safety/asm_register_lookup.c` — RISCV64 dispatch branch added.
+Mirrors F2/F3 pattern exactly.
+
+### What's GCC-bound vs ZER-side
+
+| Layer | GCC-dependent? | Why |
+|---|---|---|
+| Register validity in clobber lists | **YES** — GCC is oracle | Inline asm clobbers are a GCC concept; "what name is valid" = whatever GCC accepts |
+| Instruction enumeration | NO | Capstone/XED/ARM XML/riscv-opcodes vendor specs |
+| Category classification (C1-C8) | NO | ZER's safety semantics — manual `.zerdata` |
+| Z-rules (10 wired) | NO | ZER's existing 29 safety systems |
+| Structural rules (S1-S4) | NO | ZER syntax/AST |
+| 130 intrinsics | Partially | Each emits specific GCC inline asm or `__builtin_*`; portable to Clang with mechanical port |
+| Final ELF production | YES (universal) | Same dependency every C/Rust/Zig program has |
+
+### Architectural decisions (DON'T re-litigate)
+
+These were considered and **rejected** — see `docs/asm_plan.md` for
+journey:
+
+- User-extensible `.zerdata` runtime registry → REJECTED (overengineering, niche, industry precedent: Rust/Zig/Go keep intrinsics compiler-owned)
+- Multi-backend probe pipeline (GCC + Clang) → DEFERRED (single-backend sufficient for v1.0)
+- Hardcoded manual register tables → REJECTED (drifts from GCC reality, lies to users)
+- Replace GCC entirely with LLVM → OUT OF SCOPE (project decision: emit-C permanently)
+- `.byte` syntax extension in ZER → UNNECESSARY (existing asm-block string path works)
+
+These are **kept**:
+
+- GCC probe as oracle for register clobbers (auto-tracks GCC updates)
+- Manual intrinsics with raw `.byte` for clobber-gated extensions before GCC catches up
+- `.zerdata` for instruction-level metadata (compiler-internal, vendored, NOT user-extensible)
+
+### Cross-arch test additions (sub-extension session)
+
+- `tests/zer/asm_avx512_register.zer` — xmm16 with `--target-features=avx512f`
+- `tests/zer_fail/asm_avx512_no_flag.zer` — xmm16 without flag rejected
+- `tests/zer_fail/asm_aarch64_x86_reg.zer` — rax rejected on aarch64 target
+- `tests/zer_fail/asm_riscv64_x86_reg.zer` — rax rejected on riscv64 target
+
+### Test runner enhancement: `// zerc-flags:` directive
+
+`tests/test_zer.sh` parses a `// zerc-flags: --foo --bar=baz` directive
+on the first line of each test file and appends those flags to the
+ZERC invocation. Used by AVX-512 / AES / cross-arch tests that need
+specific compiler flags. Generally useful for any future test needing
+specific flags.
+
+---
+
+## F4.1 — Instruction-table pipeline (2026-04-29)
+
+Closes the F1a stub: `zer_asm_category()` was returning 0 for everything
+since F1a landed. F4.1 wires real lookup against vendored per-arch
+instruction tables generated from `arch_data/<arch>.zerdata` files.
+
+### Pipeline
+
+```
+arch_data/x86_64.zerdata        ← MANUAL classification by ZER team
+       ↓
+scripts/gen_instruction_table.sh  ← bash/awk parser+generator
+       ↓
+src/safety/asm_instruction_table_x86_64.c  ← VENDORED (committed to git)
+       ↓
+linked into zerc binary at build time
+       ↓
+zer_asm_instruction_info(arch, mnemonic, &out_info)
+       ↓
+checker.c NODE_ASM dispatch on category bitmap
+       ↓
+Per-category enforcement (today: C4 wired; C1/C2/C3/C5/C8 informational)
+```
+
+### Files
+
+- `arch_data/SCHEMA.md` — schema spec (~270 lines)
+- `arch_data/x86_64.zerdata` — manually classified instructions
+- `scripts/gen_instruction_table.sh` — parser+generator (~210 lines)
+- `src/safety/asm_instruction_table.h` — `ZerInstructionEntry` struct
+- `src/safety/asm_instruction_table_x86_64.c` — AUTO-GENERATED, vendored
+- `src/safety/asm_categories.c` — real lookup (was F1a stub)
+- `checker.c` NODE_ASM — F4 dispatch loop with mnemonic parser
+- `Makefile` CORE_SRCS / LIB_SRCS — link new vendored .c
+
+### Schema (`arch_data/SCHEMA.md` summary)
+
+Each instruction: INI-style section. Required fields: `category`,
+`source`. Optional: `operand_count`, `operand[N].type`,
+`operand[N].constraint`, `required_features`, `consequence`, `notes`.
+
+Categories: bitmap (C1-C8), combined with `+` (e.g.,
+`category = C2_ALIGNMENT + C5_PRIVILEGE`).
+
+Constraints: `NONZERO`, `ALIGNED(N)`, `BOUNDED(min, max)`,
+`COMPOUND(c1, c2, ...)`.
+
+### F4 dispatch behavior
+
+`checker.c` NODE_ASM handler walks the instructions string token-by-token,
+extracts mnemonics (alphanumeric + underscore), looks up in
+`zer_asm_instruction_info()`, fires per-category check:
+
+- **C4 (CPU feature)** — checks `c->target_features` bitmap against
+  `info.feature_bits`. If feature not enabled: error citing Intel SDM +
+  consequence.
+- **C5 (privilege)** — informational; naked-only restriction (S1) is the
+  v1.0 guard. F7-full will add explicit kernel-context modeling.
+- **C1/C2/C3/C8** — classification recorded; enforcement deferred to
+  F7-full / Stage 5 (operand-binding to existing safety systems).
+
+### F4.1 test additions
+
+- `tests/zer/asm_f4_avx512_with_flag.zer` — VPXORQ + `--target-features=avx512f` compiles
+- `tests/zer/asm_f4_bsr_works.zer` — BSR known instruction passes pipeline
+- `tests/zer/asm_f4_unknown_insn_passes.zer` — ADD not in table, graceful fall-through
+- `tests/zer_fail/asm_f4_avx512_no_flag.zer` — VPXORQ without flag rejected with vendor citation
+
+Sample F4 dispatch error (real output, **production-grade**):
+
+```
+asm instruction 'vpxorq' requires CPU feature not enabled in
+--target-features (Intel SDM Vol 2C VPXORQ) — consequence:
+#UD fault if AVX-512F not enabled at runtime
+```
+
+---
+
+## F4.2 — Mass classification (51 entries) + 14 CPU feature flags (2026-04-29)
+
+Expanded `arch_data/x86_64.zerdata` from 13 (gold set) to 51
+safety-relevant entries covering all 6 wired categories
+(C1, C2, C3, C4, C5, C8).
+
+### Classified instructions (51 total)
+
+- C1 (value range, 4): bsr, bsf, div, idiv
+- C2 (alignment-required SIMD, 11): movaps, movapd, movdqa, movntps, movntpd, movntdq, vmovaps, vmovapd, vmovdqa, vmovdqa32, vmovdqa64
+- C3 + C5 (state machine + privilege, 2): monitor, mwait
+- C4 (CPU feature samples, 10): vpxorq, vpaddq, aesenc, aesdec, aeskeygenassist, sha1rnds4, sha256msg1, tzcnt, lzcnt, popcnt
+- C5 (privileged kernel-only, 20): wrmsr, rdmsr, invlpg, invd, wbinvd, invpcid, hlt, swapgs, iretq, sysret, sysretq, lidt, lgdt, lldt, ltr, wrpkru, rdpkru, xsetbv, clac, stac
+- C8 (memory ordering, 4): mfence, lfence, sfence, pause (classification only; enforcement is Stage 5 / System #30)
+
+### CPU feature flags wired (`ZerCpuFeature` enum)
+
+Was 1 (AVX512F only). Now 14:
+
+```c
+ZER_FEAT_AVX512F  = 1u << 0,
+ZER_FEAT_SSE      = 1u << 1,
+ZER_FEAT_SSE2     = 1u << 2,
+ZER_FEAT_AVX      = 1u << 3,
+ZER_FEAT_AVX2     = 1u << 4,
+ZER_FEAT_AES      = 1u << 5,
+ZER_FEAT_SHA      = 1u << 6,
+ZER_FEAT_BMI1     = 1u << 7,
+ZER_FEAT_BMI2     = 1u << 8,
+ZER_FEAT_LZCNT    = 1u << 9,
+ZER_FEAT_POPCNT   = 1u << 10,
+ZER_FEAT_INVPCID  = 1u << 11,
+ZER_FEAT_PKU      = 1u << 12,
+ZER_FEAT_XSAVE    = 1u << 13,
+ZER_FEAT_SMAP     = 1u << 14,
+```
+
+**Bit values are stable** — once assigned, never renumber. Vendored
+.c tables encode them. `scripts/gen_instruction_table.sh::feat_to_int()`
+maps feature names → bit values; both must match the enum exactly.
+
+### CLI parser extended (`zerc_main.c`)
+
+`--target-features=` now accepts comma-separated list (`strstr`-based
+matching). Each match sets the corresponding bitmap flag AND appends
+`-m<feature>` to GCC at emit time.
+
+```bash
+zerc --target-features=avx512f,aes,sha,bmi1 main.zer
+```
+
+**Baseline default (F4.2)**: x86_64 target defaults to `SSE | SSE2`.
+Both are guaranteed by the x86_64 ABI. Without this default, MFENCE
+(which requires SSE2 per Intel SDM) would falsely fail the C4 feature
+gate. Non-x86 targets reset baseline to 0 in the `--target-arch=`
+handler.
+
+### F4.2 test additions
+
+- `tests/zer/asm_f4_aes_with_flag.zer` — AESENC + `--target-features=aes`
+- `tests/zer/asm_f4_mfence_compiles.zer` — MFENCE C8 classified, baseline SSE2 satisfies the C4 gate
+- `tests/zer/asm_f4_privileged_compiles.zer` — HLT C5 classified, naked-only restriction is the v1.0 guard
+- `tests/zer_fail/asm_f4_aes_no_flag.zer` — AESENC rejected without flag, cites Intel SDM Vol 2A
+
+Total ZER tests after F4.2: 525 (up from 521).
+
+### What's NOT yet wired (F7-full / Stage 5 work)
+
+- C1 value-range constraint operand-binding (operand→VRP dispatch)
+- C2 alignment constraint operand-binding (operand→qualifier system)
+- C3 state-machine LL/SC pairing tracking
+- C8 memory-ordering enforcement (System #30 / Session G)
+
+These categories CLASSIFY today (the data is correct and recorded);
+they ENFORCE in F7-full and Stage 5.
+
+### Critical "DO NOT do this" warnings for fresh sessions
+
+1. **`.zerdata` is NOT user-extensible at runtime.** It's vendored at
+   zerc build time. Adding new instructions = D-Alpha PR batch by ZER
+   team, not user-loaded files. The user-extensible runtime registry
+   was designed in detail and **rejected** as overengineering — see
+   `docs/asm_plan.md` for the rejection rationale.
+
+2. **Don't add a register name to the clobber table to support
+   pre-GCC extensions.** That would lie to users (ZER says valid,
+   GCC rejects). Instead, **add a compiler-team intrinsic that emits
+   raw `.byte` sequences with `"memory"` clobber**. See `docs/asm_plan.md`
+   "Adding clobber-gated extensions before GCC catches up" for the
+   recipe (~5 hrs per intrinsic).
+
+3. **Don't bump fixed-buffer constants when the audit complains.** Use
+   stack-first dynamic with arena overflow (parser RF9 pattern) OR
+   use two-pass measure-then-fill (no buffer at all). Bumping constants
+   is the wrong fix.
+
+4. **Don't pass `-mavx512f` to non-x86 GCC.** The `--target-arch=`
+   handler resets `target_features = 0` when arch is aarch64/riscv64
+   to prevent x86 feature flags from being passed to ARM/RISC-V GCC.
+
+5. **Don't build the multi-backend (GCC + Clang) probe pipeline.** It
+   was considered (~14 hrs effort) for marginal coverage gain. Defer
+   until concrete need; single-backend GCC probe is sufficient for v1.0.
+
+### Final session tally (2026-04-29)
+
+- 525/525 ZER tests pass (was 505 at session start, +20 across all stages)
+- 28/28 module tests
+- 784/784 Rust translations
+- 36/36 Zig translations
+- 139/139 conversion tests
+- 3/3 cross-arch end-to-end
+- All 4 audit gates green: walker IR parity, walker default, fixed-buffer, emit
+- Cumulative gaps closed: 27 of 47 (was 19 at session start)

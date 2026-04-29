@@ -5,6 +5,286 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-29 — Stages 2B + 3 + Sub-extension Validation + F4.1 + F4.2
+
+**Massive multi-stage session.** Closed Stage 2 Part B (walker exhaustiveness
+discipline), closed Stage 3 (fixed-buffer cleanup + Gap 35), validated the
+sub-extension architecture empirically across 3 archs (added F6-minimum
+RISC-V register table), then implemented F4.1 (instruction-table pipeline
+with 13 gold-set entries) and F4.2 (51 safety-relevant entries with 14 CPU
+feature flags). All gates green, 525/525 ZER tests passing.
+
+This single session was the result of extensive architectural discussion
+which validated existing design through empirical proofs and rejected
+overengineering paths (user-extensible `.zerdata` runtime registry,
+multi-backend probe pipeline, raw-byte syntax extension). See
+`docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29"
+for the full validation context — fresh sessions reading that section
+get the journey + decisions, not just conclusions.
+
+### BUG-641: Stage 2 Part B — 42 walker default-clauses converted to exhaustive
+
+**Symptom:** Walkers across `checker.c`, `zercheck.c`, `zercheck_ir.c`,
+`ir_lower.c`, `ast.c`, `emitter.c` had `default:` fall-through clauses
+on switches over `->kind` and `->op`. New NODE_/TYNODE_/TYPE_/IR_OP
+values would silently fall through instead of compile-erroring at the
+walker site. This caused the entire "missing case in safety walker"
+gap class (BUG-573, BUG-577, etc.).
+
+**Root cause:** `default:` clauses combined with discriminated-union
+enums make new variants invisible to the type system. GCC `-Wswitch`
+won't fire if a `default:` exists.
+
+**Fix:** Mechanical conversion of all 42 sites to enumerated case
+labels. `default:` removed; every NODE_/TYNODE_/TYPE_/IR_OP variant
+becomes an explicit case. GCC `-Wswitch` now errors at compile time
+when a new variant is added without a corresponding case.
+
+**Audit script:** `tools/walker_default_audit.sh` (added 2026-04-28)
+catalogs every remaining `default:` in `->kind`/`->op` switches.
+Returns exit 0 (no findings) after F4.2 close-out. Token-op switches
+(binary.op, unary.op, assign.op, op_token) excluded since TokenKind
+has 100+ values and intentional fallback is the canonical pattern.
+
+**Test:** Wired into `make check` so any new walker added without
+exhaustive enumeration fails CI.
+
+**Scope of conversions:**
+- zercheck.c: defer_scan_all_frees
+- zercheck_ir.c: ir_check_expr_uaf, ir_defer_scan_frees, used-locals walker, ir_receiver_is_builtin_target, ir_check_inst (47 IR ops)
+- ir_lower.c: rewrite_idents, rewrite_defer_body_idents, rewrite_capture_name, find_shared_root_in_stmt_ir, pre_lower_orelse, lower_expr passthrough, lower_stmt, primitive type dispatcher
+- checker.c: 11 walkers (find_param_cast_type, check_call_provenance, find_shared_type_in_stmt, etc.)
+- ast.c: node_kind_name, print_type, ast_print
+- emitter.c: emit_top_level_decl, find_shared_root, stmt_writes_shared, prescan_spawn_in_node, emit_expr legacy AST emitter, optional inner type emission, slice typedef emission, narrow-cast helper, resolve_tynode
+
+### BUG-642: Stage 3 / Gap 35 — keep_checks[8] silent overflow at depth 8 (HIGH)
+
+**Symptom:** `take_keep(o0 orelse o1 orelse ... orelse o7 orelse &local)` —
+the 8-deep orelse chain with `&local` at the terminal silently bypassed
+the `keep` parameter local-pointer escape check. `n=2..7` rejected; `n=8`
+silently accepted.
+
+**Root cause:** `checker.c:4421` `Node *keep_checks[8]` and similar
+`ld_nodes[8]` had hard-coded 8-element fixed buffers in the orelse-chain
+walker. Loop bounded by `idx < 7` overflowed at `idx == 7` when both
+expr AND fallback were written in the same iteration.
+
+**Fix:** Stack-first dynamic with arena overflow doubling (parser RF9
+pattern). `Node *kc_stack[8]` for fast path; on overflow, arena_alloc
+new buffer at 2× capacity. Same conversion applied to `ld_nodes[8]`.
+
+Plus 3 other fixed-buffer sites converted as part of Stage 3:
+- `build_expr_key stack_buf[512]` → two-pass measure-then-fill (no buffer)
+- `ir_extract_compound_key stack_buf[256]` → two-pass measure-then-fill
+- `Node *stack[64]` AST traversal stack → ZER_STK_RESERVE macro pattern
+
+**CI gate:** `tools/audit_fixed_buffers.sh` (NEW) diffs against
+`tools/fixed_buffer_baseline.txt` (18 known-accepted patterns). Any new
+fixed-size buffer fails CI. Wired into `make check` as
+`make check-fixed-buffers`.
+
+**Test:** `tests/zer_fail/stage3_keep_orelse_chain_n8.zer` — 8-deep
+orelse chain with terminal `&local` must reject. Previously silently
+accepted; now correctly rejected with "local-derived pointer 'local'
+cannot satisfy 'keep' parameter".
+
+### BUG-643: Fixed-buffer audit baseline broke on any source-file edit
+
+**Symptom:** After F4 commit (added 79 lines to checker.c), the
+fixed-buffer audit reported 13 "new" entries — they were the same
+known patterns at shifted line numbers. CI would fail on every commit
+that touched a baselined file.
+
+**Root cause:** `tools/audit_fixed_buffers.sh` and
+`tools/fixed_buffer_baseline.txt` matched on `file:line:content`.
+Any line-shift broke the match.
+
+**Fix:** Strip line numbers from both CURRENT (script grep -E vs -nE)
+and BASELINE (sed strip the legacy `file:NNN:content` form). Match on
+`file:content` only. Same content at any line is a known-accepted
+pattern.
+
+**Test:** Audit re-runs cleanly after F4 line shifts.
+
+### F4.1: Instruction-table pipeline + 13 gold-set entries
+
+**Not a bug fix — feature.** Closes the F1a stub layer of the asm
+safety framework. `zer_asm_category()` now does real lookup against
+vendored per-arch instruction tables instead of returning 0 for
+everything.
+
+**What landed:**
+- `arch_data/SCHEMA.md` — schema spec for `.zerdata` files
+- `arch_data/x86_64.zerdata` — hand-classified instructions with
+  Intel SDM citations
+- `scripts/gen_instruction_table.sh` — bash/awk parser+generator
+- `src/safety/asm_instruction_table.h` — `ZerInstructionEntry` struct
+- `src/safety/asm_instruction_table_x86_64.c` — vendored output
+  (AUTO-GENERATED, committed to git per build-time-gen architecture)
+- `src/safety/asm_categories.c` — real lookup (was F1a stub)
+- `checker.c` NODE_ASM — F4 dispatch parses mnemonics, looks up
+  category bitmap, fires C4 (CPU feature) gate
+
+**Tests:** 4 added (asm_f4_avx512_with_flag, asm_f4_avx512_no_flag,
+asm_f4_bsr_works, asm_f4_unknown_insn_passes).
+
+**Sample F4 dispatch error (real output):**
+
+```
+asm instruction 'vpxorq' requires CPU feature not enabled in
+--target-features (Intel SDM Vol 2C VPXORQ) — consequence:
+#UD fault if AVX-512F not enabled at runtime
+```
+
+Cites Intel SDM, explains the consequence, identifies the missing flag.
+
+### F4.2: Expanded x86_64.zerdata to 51 entries + 14 CPU feature flags
+
+**Not a bug fix — feature.** Comprehensive classification of
+safety-relevant x86_64 instructions across C1-C5 + C8 categories.
+
+**Categories covered:**
+- C1 (value-range): bsr, bsf, div, idiv (4 entries)
+- C2 (alignment): movaps, movapd, movdqa, movntps/pd/dq, vmovaps/apd/dqa/dqa32/dqa64 (11 entries)
+- C3+C5 (state-machine + privilege): monitor, mwait (2 entries)
+- C4 (CPU feature): vpxorq, vpaddq, aesenc, aesdec, aeskeygenassist, sha1rnds4, sha256msg1, tzcnt, lzcnt, popcnt (10 entries)
+- C5 (privilege): wrmsr, rdmsr, invlpg, invd, wbinvd, invpcid, hlt, swapgs, iretq, sysret, sysretq, lidt, lgdt, lldt, ltr, wrpkru, rdpkru, xsetbv, clac, stac (20 entries)
+- C8 (memory ordering): mfence, lfence, sfence, pause (4 entries; classification only — enforcement is Stage 5)
+
+**CPU feature flags expanded (`ZerCpuFeature` enum):**
+AVX512F + 13 added: SSE, SSE2, AVX, AVX2, AES, SHA, BMI1, BMI2, LZCNT,
+POPCNT, INVPCID, PKU, XSAVE, SMAP. Bit values stable; vendored .c
+tables encode them — never renumber.
+
+**CLI parser** (`zerc_main.c`):
+`--target-features=avx512f,aes,sha,bmi1,...` — composable. Each match
+sets a bitmap flag AND appends `-m<feature>` to GCC at emit time.
+
+**Baseline default change:** x86_64 target defaults to `SSE | SSE2`
+(both guaranteed by x86_64 ABI). Without this, MFENCE etc. would
+falsely fail the C4 feature gate. Non-x86 targets reset to 0.
+
+**Tests:** 4 added (asm_f4_aes_with_flag, asm_f4_aes_no_flag,
+asm_f4_mfence_compiles, asm_f4_privileged_compiles).
+
+**What's NOT yet enforced (deferred to F7-full / Stage 5):**
+- C1 value-range constraint operand-binding (operand→VRP dispatch)
+- C2 alignment constraint operand-binding (operand→qualifier system)
+- C3 state-machine LL/SC pairing tracking
+- C8 memory-ordering enforcement (System #30, Session G)
+
+These categories CLASSIFY today; they ENFORCE in F7-full and Stage 5.
+
+### Sub-extension Architecture — Validated 2026-04-29
+
+**Not a bug fix — architectural validation.** Empirical end-to-end proof
+of the framework's universality across 3 archs.
+
+**Empirical results:**
+- x86_64 base: 105 valid registers (probed gcc 13.4)
+- x86_64 + AVX-512F: 161 valid registers (+56 over base)
+- aarch64: 58 valid registers (probed aarch64-linux-gnu-gcc 12.2)
+- riscv64 (NEW, F6-minimum): 126 valid registers (probed riscv64-linux-gnu-gcc 12.2; 3 rejected: x8/s0/fp = frame pointer)
+
+**Cross-arch end-to-end gate:** `tests/test_cross_arch.sh` runs in
+`make check`. Generates ZER source per arch, runs zerc with
+`--target-arch=<arch>`, cross-gcc compiles, verifies ELF arch via `file`.
+3/3 pass.
+
+**Honest finding:** AVX-512F is the only register-clobber-gated CPU
+feature in GCC 13.4. Probed AMX (rejected, intrinsic-only by Intel
+design), SVE (rejected, intrinsic-only by ARM design), APX (requires
+GCC 14+). Other extensions reach safety through intrinsics path
+(130 already shipping).
+
+**Architectural decisions documented in `docs/asm_plan.md`
+"Sub-Extension Architecture — Validated 2026-04-29" section** —
+fresh sessions get the full journey, not just decisions:
+
+- REJECTED: user-extensible `.zerdata` runtime registry
+  (overengineering, niche users, industry precedent: Rust/Zig/Go all
+  keep intrinsics compiler-owned)
+- REJECTED: multi-backend probe (GCC + Clang union, marginal coverage gain)
+- REJECTED: hardcoded manual register tables (would drift from GCC reality, lie to users)
+- REJECTED: replace GCC entirely (LLVM dependency just trades one C-compiler for another)
+- KEPT: GCC probe as oracle for register clobbers (auto-tracks GCC updates)
+- KEPT: manual intrinsics with raw `.byte` for clobber-gated extensions before GCC catches up
+- KEPT: `.zerdata` for instruction-level metadata (compiler-internal, vendored, NOT user-extensible)
+
+### Test runner enhancement: `// zerc-flags:` directive
+
+**Feature, not bug fix.** `tests/test_zer.sh` now parses a
+`// zerc-flags: --foo --bar=baz` directive on the first line of each
+test file and appends those flags to the ZERC invocation. Used by
+AVX-512 / AES / cross-arch tests that need specific compiler flags.
+Generally useful — any future test needing specific flags can opt in.
+
+### Files modified
+
+- `arch_data/SCHEMA.md` — NEW: schema spec
+- `arch_data/x86_64.zerdata` — NEW: 51 classified instructions
+- `scripts/gen_instruction_table.sh` — NEW: parser+generator
+- `scripts/candidates_riscv64.txt` — NEW: F6-min register candidates
+- `src/safety/asm_categories.c` — F1a stub → real lookup
+- `src/safety/asm_instruction_table.h` — NEW
+- `src/safety/asm_instruction_table_x86_64.c` — AUTO-GENERATED
+- `src/safety/asm_register_tables_riscv64.c` — NEW (F6-min, 126 entries)
+- `src/safety/asm_register_tables.h` — extern decls + 14 feature flags
+- `src/safety/asm_register_lookup.c` — RISCV64 dispatch branch
+- `checker.c` — F4 NODE_ASM dispatch + Stage 3 fixed-buffer fixes
+- `zercheck_ir.c` — Stage 3 fixed-buffer fixes (key-path two-pass + AST stack)
+- `ir_lower.c` — Stage 2 Part B exhaustive walker conversions
+- `emitter.c` — Stage 2 Part B exhaustive walker conversions
+- `ast.c` — Stage 2 Part B exhaustive walker conversions
+- `zerc_main.c` — `--target-features=` extended to 14 flags + baseline default
+- `Makefile` — link new vendored files + run cross-arch gate
+- `tools/walker_default_audit.sh` — NEW (Stage 2 Part B audit)
+- `tools/audit_fixed_buffers.sh` — NEW (Stage 3 audit)
+- `tools/fixed_buffer_baseline.txt` — NEW (Stage 3 baseline)
+- `tests/test_zer.sh` — `// zerc-flags:` directive parser
+- `tests/test_cross_arch.sh` — NEW (3-arch end-to-end gate)
+- `docs/asm_plan.md` — Sub-Extension Architecture validation section
+- `docs/4-27-2026-gaps.md` — Stage 2/3 marked DONE; cumulative count updated
+- `BUGS-FIXED.md` — this entry
+
+### Test additions (across all stages this session)
+
+Stage 3:
+- `tests/zer_fail/stage3_keep_orelse_chain_n8.zer`
+
+Sub-extension validation:
+- `tests/zer/asm_avx512_register.zer`
+- `tests/zer_fail/asm_avx512_no_flag.zer`
+- `tests/zer_fail/asm_aarch64_x86_reg.zer`
+- `tests/zer_fail/asm_riscv64_x86_reg.zer`
+
+F4.1 + F4.2 (8 tests):
+- `tests/zer/asm_f4_avx512_with_flag.zer`
+- `tests/zer/asm_f4_bsr_works.zer`
+- `tests/zer/asm_f4_unknown_insn_passes.zer`
+- `tests/zer/asm_f4_aes_with_flag.zer`
+- `tests/zer/asm_f4_mfence_compiles.zer`
+- `tests/zer/asm_f4_privileged_compiles.zer`
+- `tests/zer_fail/asm_f4_avx512_no_flag.zer`
+- `tests/zer_fail/asm_f4_aes_no_flag.zer`
+
+### Final tally for the session
+
+- **525 / 525 ZER tests** pass (was 505 before session, +20)
+- **28 / 28 module tests** pass
+- **784 / 784 Rust translation tests** pass
+- **36 / 36 Zig translation tests** pass
+- **139 / 139 conversion tool tests** pass
+- **3 / 3 cross-arch end-to-end** pass
+- **All 4 audit gates** pass: walker IR parity, walker default-clause,
+  fixed-buffer, dead-stub emit
+- **Cumulative gaps closed: 27 of 47** (was 19 at session start —
+  Stage 2 Part A had 7, Stage 3 closed Gap 35, Stage 2 Part B is
+  gap-class-prevention not gap-closure but locks in walker discipline
+  for all future work)
+
+---
+
 ## Session 2026-04-28 — Stage 2 Part A of `docs/4-27-2026-gaps.md`: 7 walker gaps closed
 
 Stage 2 Part A (semantic walker fixes) of the implementation roadmap is

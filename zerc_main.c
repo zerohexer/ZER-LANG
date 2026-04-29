@@ -225,7 +225,14 @@ int main(int argc, char **argv) {
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
-    uint32_t zer_target_features = 0;  /* C4-minimum: --target-features bitmap */
+    /* F4.2 (2026-04-29): default to x86_64 baseline features (SSE | SSE2).
+     * Both are guaranteed by the x86_64 ABI — every x86_64 CPU has them.
+     * Without this default, F4-classified instructions like MFENCE (which
+     * requires SSE2 per Intel SDM) would falsely fail the C4 gate at
+     * compile time. CLI flag --target-features can ADD more (AVX-512,
+     * AES, etc.) but never needs to add the baseline.
+     * If --target-arch changes to non-x86, baseline gets reset below. */
+    uint32_t zer_target_features = (1u << 1) | (1u << 2);  /* SSE | SSE2 */
     char zer_extra_gcc_flags[256] = "";  /* C4-minimum: extra -m flags for GCC at emit time */
     int zer_target_arch_id = 1;  /* ZER_ARCH_X86_64 = 1 default; 2=aarch64, 3=riscv64 */
     const char *zer_target_arch_gcc = NULL;  /* override gcc binary for cross-arch */
@@ -255,27 +262,55 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
             zer_stack_limit = (uint32_t)atoi(argv[++i]);
         } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
-            /* C4-minimum proof: comma-separated CPU features. Today
-             * supports only "avx512f". Future: avx512vl, avx512bw, sve,
-             * sve2, rvv, sha, aes, etc. */
+            /* F4.2 (2026-04-29): comma-separated CPU features. Each match
+             * sets a bit in zer_target_features (matches ZerCpuFeature
+             * enum) and forwards the equivalent -m flag to GCC.
+             * Bit values are stable; once assigned never renumber. */
             const char *fl = argv[i] + 18;
+            #define ZER_ADD_GCC_FLAG(s) \
+                strncat(zer_extra_gcc_flags, " " s, \
+                        sizeof(zer_extra_gcc_flags) - strlen(zer_extra_gcc_flags) - 1)
             if (strstr(fl, "avx512f")) {
-                zer_target_features |= (1u << 0);  /* ZER_FEAT_AVX512F */
-                strncat(zer_extra_gcc_flags, " -mavx512f", sizeof(zer_extra_gcc_flags) - strlen(zer_extra_gcc_flags) - 1);
+                zer_target_features |= (1u << 0);   /* AVX512F */
+                ZER_ADD_GCC_FLAG("-mavx512f");
             }
+            if (strstr(fl, "sse2"))  { zer_target_features |= (1u << 2); ZER_ADD_GCC_FLAG("-msse2"); }
+            else if (strstr(fl, "sse")) { zer_target_features |= (1u << 1); ZER_ADD_GCC_FLAG("-msse"); }
+            if (strstr(fl, "avx2"))  { zer_target_features |= (1u << 4); ZER_ADD_GCC_FLAG("-mavx2"); }
+            else if (strstr(fl, "avx") && !strstr(fl, "avx512")) {
+                zer_target_features |= (1u << 3); ZER_ADD_GCC_FLAG("-mavx");
+            }
+            if (strstr(fl, "aes"))     { zer_target_features |= (1u << 5);  ZER_ADD_GCC_FLAG("-maes"); }
+            if (strstr(fl, "sha"))     { zer_target_features |= (1u << 6);  ZER_ADD_GCC_FLAG("-msha"); }
+            if (strstr(fl, "bmi2"))    { zer_target_features |= (1u << 8);  ZER_ADD_GCC_FLAG("-mbmi2"); }
+            else if (strstr(fl, "bmi1") || strstr(fl, "bmi")) {
+                zer_target_features |= (1u << 7); ZER_ADD_GCC_FLAG("-mbmi");
+            }
+            if (strstr(fl, "lzcnt"))   { zer_target_features |= (1u << 9);  ZER_ADD_GCC_FLAG("-mlzcnt"); }
+            if (strstr(fl, "popcnt"))  { zer_target_features |= (1u << 10); ZER_ADD_GCC_FLAG("-mpopcnt"); }
+            if (strstr(fl, "invpcid")) { zer_target_features |= (1u << 11); ZER_ADD_GCC_FLAG("-minvpcid"); }
+            if (strstr(fl, "pku"))     { zer_target_features |= (1u << 12); ZER_ADD_GCC_FLAG("-mpku"); }
+            if (strstr(fl, "xsave"))   { zer_target_features |= (1u << 13); ZER_ADD_GCC_FLAG("-mxsave"); }
+            if (strstr(fl, "smap"))    { zer_target_features |= (1u << 14); /* GCC has no -msmap; kernel-only */ }
+            #undef ZER_ADD_GCC_FLAG
         } else if (strncmp(argv[i], "--target-arch=", 14) == 0) {
             /* Universality proof: per-arch dispatch. Maps the user's
              * arch choice to ZerArchId for the checker AND to the
-             * appropriate cross-gcc binary for emit-time compilation. */
+             * appropriate cross-gcc binary for emit-time compilation.
+             * F4.2: also resets target_features baseline — non-x86
+             * archs have different baseline (NEON on aarch64 etc.) */
             const char *a = argv[i] + 14;
             if (strcmp(a, "x86_64") == 0) {
                 zer_target_arch_id = 1;  /* ZER_ARCH_X86_64 */
+                /* Keep SSE | SSE2 baseline default. */
             } else if (strcmp(a, "aarch64") == 0) {
                 zer_target_arch_id = 2;  /* ZER_ARCH_AARCH64 */
                 zer_target_arch_gcc = "aarch64-linux-gnu-gcc";
+                zer_target_features = 0;  /* clear x86 baseline; ARM has its own */
             } else if (strcmp(a, "riscv64") == 0) {
                 zer_target_arch_id = 3;
                 zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
+                zer_target_features = 0;  /* clear x86 baseline */
             }
         }
     }

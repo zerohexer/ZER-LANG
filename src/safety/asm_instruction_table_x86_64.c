@@ -2,7 +2,7 @@
  * Regenerate via: make gen-asm-tables (or scripts/gen_instruction_table.sh x86_64)
  *
  * Source: arch_data/x86_64.zerdata (per-instruction safety classification)
- * Generated: 2026-04-29T07:43:08Z
+ * Generated: 2026-04-29T08:23:21Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F4 (instruction-level safety classification).
@@ -18,16 +18,54 @@ const ZerInstructionEntry zer_x86_64_instructions[] = {
     {"bsf", 3, 1u, 0u, "Intel SDM Vol 2A BSF", "silent UB: destination undefined when source is zero"},
     {"div", 3, 1u, 0u, "Intel SDM Vol 2A DIV", "#DE divide-by-zero exception"},
     {"idiv", 4, 1u, 0u, "Intel SDM Vol 2A IDIV", "#DE on divide-by-zero OR INT_MIN/-1 overflow"},
-    {"movaps", 6, 2u, 0u, "Intel SDM Vol 2B MOVAPS", "#GP fault on misaligned memory operand"},
-    {"movdqa", 6, 2u, 0u, "Intel SDM Vol 2B MOVDQA", "#GP fault on misaligned memory operand"},
+    {"movaps", 6, 2u, 2u, "Intel SDM Vol 2B MOVAPS", "#GP fault on misaligned memory operand"},
+    {"movapd", 6, 2u, 4u, "Intel SDM Vol 2B MOVAPD", "#GP fault on misaligned memory operand"},
+    {"movdqa", 6, 2u, 4u, "Intel SDM Vol 2B MOVDQA", "#GP fault on misaligned memory operand"},
+    {"movntps", 7, 2u, 2u, "Intel SDM Vol 2B MOVNTPS", "#GP fault on misaligned memory operand"},
+    {"movntpd", 7, 2u, 4u, "Intel SDM Vol 2B MOVNTPD", "#GP fault on misaligned memory operand"},
+    {"movntdq", 7, 2u, 4u, "Intel SDM Vol 2B MOVNTDQ", "#GP fault on misaligned memory operand"},
+    {"vmovaps", 7, 10u, 8u, "Intel SDM Vol 2C VMOVAPS", "#GP fault on misaligned memory operand; #UD if AVX absent"},
+    {"vmovapd", 7, 10u, 8u, "Intel SDM Vol 2C VMOVAPD", "#GP fault on misaligned memory operand; #UD if AVX absent"},
+    {"vmovdqa", 7, 10u, 8u, "Intel SDM Vol 2C VMOVDQA", "#GP fault on misaligned memory operand"},
+    {"vmovdqa32", 9, 10u, 1u, "Intel SDM Vol 2C VMOVDQA32", "#GP fault on misaligned memory operand; #UD if AVX-512F absent"},
+    {"vmovdqa64", 9, 10u, 1u, "Intel SDM Vol 2C VMOVDQA64", "#GP fault on misaligned memory operand"},
     {"monitor", 7, 20u, 0u, "Intel SDM Vol 2B MONITOR", "#GP fault if executed at CPL > 0; subsequent MWAIT must pair within state machine"},
     {"mwait", 5, 20u, 0u, "Intel SDM Vol 2B MWAIT", "#GP fault if executed at CPL > 0; #UD if MONITOR not preceding"},
     {"vpxorq", 6, 8u, 1u, "Intel SDM Vol 2C VPXORQ", "#UD fault if AVX-512F not enabled at runtime"},
+    {"vpaddq", 6, 8u, 1u, "Intel SDM Vol 2C VPADDQ", "#UD fault if AVX-512F not enabled at runtime"},
+    {"aesenc", 6, 8u, 32u, "Intel SDM Vol 2A AESENC", "#UD fault if AES-NI not enabled"},
+    {"aesdec", 6, 8u, 32u, "Intel SDM Vol 2A AESDEC", "#UD fault if AES-NI not enabled"},
+    {"aeskeygenassist", 15, 8u, 32u, "Intel SDM Vol 2A AESKEYGENASSIST", "#UD fault if AES-NI not enabled"},
+    {"sha1rnds4", 9, 8u, 64u, "Intel SDM Vol 2B SHA1RNDS4", "#UD fault if SHA-NI not enabled"},
+    {"sha256msg1", 10, 8u, 64u, "Intel SDM Vol 2B SHA256MSG1", "#UD fault if SHA-NI not enabled"},
+    {"tzcnt", 5, 8u, 128u, "Intel SDM Vol 2B TZCNT", "#UD fault if BMI1 not enabled"},
+    {"lzcnt", 5, 8u, 512u, "Intel SDM Vol 2A LZCNT", "#UD fault if LZCNT not enabled"},
+    {"popcnt", 6, 8u, 1024u, "Intel SDM Vol 2B POPCNT", "#UD fault if POPCNT not enabled"},
     {"wrmsr", 5, 16u, 0u, "Intel SDM Vol 2B WRMSR", "#GP fault if executed at CPL > 0"},
     {"rdmsr", 5, 16u, 0u, "Intel SDM Vol 2B RDMSR", "#GP fault if executed at CPL > 0"},
     {"invlpg", 6, 16u, 0u, "Intel SDM Vol 2A INVLPG", "#GP fault if executed at CPL > 0"},
+    {"invd", 4, 16u, 0u, "Intel SDM Vol 2A INVD", "#GP fault if executed at CPL > 0; cache invalidation without writeback (data loss risk)"},
+    {"wbinvd", 6, 16u, 0u, "Intel SDM Vol 2C WBINVD", "#GP fault if executed at CPL > 0"},
+    {"invpcid", 7, 16u, 2048u, "Intel SDM Vol 2A INVPCID", "#GP fault if executed at CPL > 0; #UD if INVPCID not enabled"},
     {"hlt", 3, 16u, 0u, "Intel SDM Vol 2A HLT", "#GP fault if executed at CPL > 0"},
+    {"swapgs", 6, 16u, 0u, "Intel SDM Vol 2C SWAPGS", "#UD fault if executed at CPL > 0"},
+    {"iretq", 5, 16u, 0u, "Intel SDM Vol 2A IRETQ", "#GP fault if stack frame malformed"},
+    {"sysret", 6, 16u, 0u, "Intel SDM Vol 2C SYSRET", "#GP fault if executed at CPL > 0; #UD if not in 64-bit mode"},
+    {"sysretq", 7, 16u, 0u, "Intel SDM Vol 2C SYSRETQ", "#GP fault if executed at CPL > 0"},
+    {"lidt", 4, 16u, 0u, "Intel SDM Vol 2A LIDT", "#GP fault if executed at CPL > 0"},
+    {"lgdt", 4, 16u, 0u, "Intel SDM Vol 2A LGDT", "#GP fault if executed at CPL > 0"},
+    {"lldt", 4, 16u, 0u, "Intel SDM Vol 2A LLDT", "#GP fault if executed at CPL > 0"},
+    {"ltr", 3, 16u, 0u, "Intel SDM Vol 2B LTR", "#GP fault if executed at CPL > 0"},
+    {"wrpkru", 6, 16u, 4096u, "Intel SDM Vol 2C WRPKRU", "#GP fault if executed at CPL > 0; #UD if PKU not enabled"},
+    {"rdpkru", 6, 16u, 4096u, "Intel SDM Vol 2B RDPKRU", "#GP fault if executed at CPL > 0; #UD if PKU not enabled"},
+    {"xsetbv", 6, 16u, 8192u, "Intel SDM Vol 2C XSETBV", "#GP fault if executed at CPL > 0"},
+    {"clac", 4, 16u, 16384u, "Intel SDM Vol 2A CLAC", "#GP fault if executed at CPL > 0; #UD if SMAP not enabled"},
+    {"stac", 4, 16u, 16384u, "Intel SDM Vol 2C STAC", "#GP fault if executed at CPL > 0"},
+    {"mfence", 6, 128u, 4u, "Intel SDM Vol 2A MFENCE", "no enforcement today (Stage 5 / System #30); semantics: full memory barrier (acq+rel)"},
+    {"lfence", 6, 128u, 4u, "Intel SDM Vol 2A LFENCE", "load barrier; orders prior loads before subsequent loads"},
+    {"sfence", 6, 128u, 2u, "Intel SDM Vol 2B SFENCE", "store barrier; orders prior stores before subsequent stores"},
+    {"pause", 5, 128u, 0u, "Intel SDM Vol 2B PAUSE", "spin-loop hint; reduces power and improves spin-wait performance"},
     {0, 0, 0u, 0u, 0, 0}  /* sentinel */
 };
 
-const size_t zer_x86_64_instruction_count = 13;
+const size_t zer_x86_64_instruction_count = 51;

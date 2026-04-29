@@ -1,0 +1,18 @@
+// F4.2 negative: AESENC requires AES-NI feature flag.
+// Without --target-features=aes, the C4 (cpu-feature) gate must reject.
+// Intel SDM Vol 2A AESENC: "#UD fault if AES-NI not enabled"
+//
+// EXPECTED: compile error mentioning AES feature.
+
+naked void aes_no_flag() {
+    asm {
+        instructions: "aesenc %%xmm0, %%xmm1"
+        clobbers: ["xmm1"]
+        safety: "AESENC without --target-features=aes — must reject (F4.2 C4 gate test)"
+    }
+}
+
+i32 main() {
+    aes_no_flag();
+    return 0;
+}

@@ -72,7 +72,24 @@ extern const size_t zer_riscv64_register_count;
 typedef enum {
     ZER_FEAT_NONE     = 0,
     ZER_FEAT_AVX512F  = 1u << 0,  /* x86: AVX-512 Foundation */
-    /* Future: ZER_FEAT_AVX512VL, _AVX512BW, _SVE, _SVE2, _RVV, etc. */
+    /* F4.2 expansion (2026-04-29): features referenced by x86_64.zerdata
+     * for instruction-level safety classification. Bit values are stable;
+     * once assigned, never renumber (vendored .c tables encode them). */
+    ZER_FEAT_SSE      = 1u << 1,  /* x86: SSE (baseline on x86_64) */
+    ZER_FEAT_SSE2     = 1u << 2,  /* x86: SSE2 (baseline on x86_64) */
+    ZER_FEAT_AVX      = 1u << 3,  /* x86: AVX (256-bit SIMD) */
+    ZER_FEAT_AVX2     = 1u << 4,  /* x86: AVX2 */
+    ZER_FEAT_AES      = 1u << 5,  /* x86: AES-NI */
+    ZER_FEAT_SHA      = 1u << 6,  /* x86: SHA-NI */
+    ZER_FEAT_BMI1     = 1u << 7,  /* x86: BMI1 (TZCNT, ANDN, etc.) */
+    ZER_FEAT_BMI2     = 1u << 8,  /* x86: BMI2 (PEXT, PDEP, etc.) */
+    ZER_FEAT_LZCNT    = 1u << 9,  /* x86: LZCNT (separate from BMI1 historically) */
+    ZER_FEAT_POPCNT   = 1u << 10, /* x86: POPCNT */
+    ZER_FEAT_INVPCID  = 1u << 11, /* x86: INVPCID instruction */
+    ZER_FEAT_PKU      = 1u << 12, /* x86: Protection Keys for User-mode */
+    ZER_FEAT_XSAVE    = 1u << 13, /* x86: XSAVE/XRSTOR family */
+    ZER_FEAT_SMAP     = 1u << 14, /* x86: Supervisor Mode Access Prevention */
+    /* Future: ARM SVE, SVE2, SME, NEON; RISC-V V, Zfh, etc. */
 } ZerCpuFeature;
 
 /* Look up whether a register name is valid for the given arch.

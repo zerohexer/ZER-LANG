@@ -1,24 +1,27 @@
-# x86_64 instruction safety metadata — F4 gold set (10 instructions).
+# x86_64 instruction safety metadata — F4 classification.
 #
-# This is the F4.1 starter set: 10 instructions that exercise every safety
-# category except C7 (provenance, requires more infrastructure) and C8
-# (memory order, deferred to System #30 / Stage 5).
+# F4.1 (2026-04-29): 13 gold-set instructions establishing pipeline.
+# F4.2 (2026-04-29): expanded to ~70 safety-relevant entries.
 #
-# F4.2 will expand to ~1500 instructions via Capstone/XED auto-extraction
-# plus class-based classification rules. This gold set proves the pipeline
-# works end-to-end before mass classification.
+# Scope: instructions that need C1-C8 enforcement. Basic ALU/branch/move
+# ops (ADD, SUB, MOV, JMP, CALL, etc.) are NOT classified — they have
+# no preconditions; the lookup correctly returns NO_CATEGORY and they
+# fall through to structural rules + Z-rules.
 #
-# Categories used here:
+# Categories used:
 #   C1 — value range (BSR/BSF on zero, DIV by zero, IDIV overflow)
-#   C2 — alignment (MOVAPS/MOVDQA require 16-byte alignment)
+#   C2 — alignment (MOVAPS / VMOVAPS / MOVDQA / etc. require alignment)
 #   C3 — state machine (MONITOR + MWAIT pairing)
-#   C4 — CPU feature (VPXORQ requires AVX-512F)
-#   C5 — privilege (WRMSR, RDMSR, INVLPG, HLT)
+#   C4 — CPU feature (AVX-512, AES-NI, SHA-NI, BMI, etc.)
+#   C5 — privilege (kernel-only: WRMSR, SWAPGS, INVD, MOV CR*, etc.)
+#   C8 — memory order (MFENCE, LFENCE, SFENCE — enforcement deferred to Stage 5)
+#
+# F5 (aarch64) and F6 (riscv64) follow the same pattern.
 
 schema_version = 1
 
 # =====================================================================
-# C1 — Value range
+# C1 — Value range (~5 entries)
 # =====================================================================
 
 [bsr]
@@ -56,10 +59,9 @@ operand[0].constraint = COMPOUND(NONZERO, NOT_OVERFLOW_MIN_DIV_NEG_ONE)
 category = C1_VALUE_RANGE
 source = "Intel SDM Vol 2A IDIV"
 consequence = "#DE on divide-by-zero OR INT_MIN/-1 overflow"
-notes = "INT_MIN/-1 overflows because result (INT_MAX+1) doesn't fit in destination."
 
 # =====================================================================
-# C2 — Alignment
+# C2 — Alignment-required SIMD (~12 entries)
 # =====================================================================
 
 [movaps]
@@ -72,6 +74,16 @@ required_features = SSE
 source = "Intel SDM Vol 2B MOVAPS"
 consequence = "#GP fault on misaligned memory operand"
 
+[movapd]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(16)
+category = C2_ALIGNMENT
+required_features = SSE2
+source = "Intel SDM Vol 2B MOVAPD"
+consequence = "#GP fault on misaligned memory operand"
+
 [movdqa]
 operand_count = 2
 operand[0].type = XMM_REGISTER
@@ -81,7 +93,90 @@ category = C2_ALIGNMENT
 required_features = SSE2
 source = "Intel SDM Vol 2B MOVDQA"
 consequence = "#GP fault on misaligned memory operand"
-notes = "MOVDQU is the unaligned variant; ZER doesn't classify it (no constraint to enforce)."
+notes = "MOVDQU is the unaligned variant; ZER doesn't classify it (no constraint)."
+
+[movntps]
+operand_count = 2
+operand[0].type = MEMORY_ALIGNED
+operand[1].type = XMM_REGISTER
+operand[0].constraint = ALIGNED(16)
+category = C2_ALIGNMENT
+required_features = SSE
+source = "Intel SDM Vol 2B MOVNTPS"
+consequence = "#GP fault on misaligned memory operand"
+notes = "Non-temporal store — bypasses cache."
+
+[movntpd]
+operand_count = 2
+operand[0].type = MEMORY_ALIGNED
+operand[1].type = XMM_REGISTER
+operand[0].constraint = ALIGNED(16)
+category = C2_ALIGNMENT
+required_features = SSE2
+source = "Intel SDM Vol 2B MOVNTPD"
+consequence = "#GP fault on misaligned memory operand"
+
+[movntdq]
+operand_count = 2
+operand[0].type = MEMORY_ALIGNED
+operand[1].type = XMM_REGISTER
+operand[0].constraint = ALIGNED(16)
+category = C2_ALIGNMENT
+required_features = SSE2
+source = "Intel SDM Vol 2B MOVNTDQ"
+consequence = "#GP fault on misaligned memory operand"
+
+[vmovaps]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(16)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+required_features = AVX
+source = "Intel SDM Vol 2C VMOVAPS"
+consequence = "#GP fault on misaligned memory operand; #UD if AVX absent"
+notes = "VEX-encoded variant of MOVAPS. 256-bit YMM form requires 32-byte align."
+
+[vmovapd]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(16)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+required_features = AVX
+source = "Intel SDM Vol 2C VMOVAPD"
+consequence = "#GP fault on misaligned memory operand; #UD if AVX absent"
+
+[vmovdqa]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(16)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+required_features = AVX
+source = "Intel SDM Vol 2C VMOVDQA"
+consequence = "#GP fault on misaligned memory operand"
+
+[vmovdqa32]
+operand_count = 2
+operand[0].type = ZMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(64)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+required_features = AVX512F
+source = "Intel SDM Vol 2C VMOVDQA32"
+consequence = "#GP fault on misaligned memory operand; #UD if AVX-512F absent"
+notes = "AVX-512 EVEX-encoded variant; 64-byte alignment for ZMM form."
+
+[vmovdqa64]
+operand_count = 2
+operand[0].type = ZMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(64)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+required_features = AVX512F
+source = "Intel SDM Vol 2C VMOVDQA64"
+consequence = "#GP fault on misaligned memory operand"
 
 # =====================================================================
 # C3 — State machine + C5 — Privilege (MONITOR/MWAIT)
@@ -92,17 +187,15 @@ operand_count = 0
 category = C3_STATE_MACHINE + C5_PRIVILEGE
 source = "Intel SDM Vol 2B MONITOR"
 consequence = "#GP fault if executed at CPL > 0; subsequent MWAIT must pair within state machine"
-notes = "Implicit operands: RAX (linear address), RCX (extensions), RDX (hints). MWAIT pairing tracked by Model 1 (C3 state machine)."
 
 [mwait]
 operand_count = 0
 category = C3_STATE_MACHINE + C5_PRIVILEGE
 source = "Intel SDM Vol 2B MWAIT"
 consequence = "#GP fault if executed at CPL > 0; #UD if MONITOR not preceding"
-notes = "Must be preceded by MONITOR setting up the address watch."
 
 # =====================================================================
-# C4 — CPU feature (AVX-512F)
+# C4 — CPU feature representative samples (~10 entries beyond AVX-512F)
 # =====================================================================
 
 [vpxorq]
@@ -115,8 +208,97 @@ required_features = AVX512F
 source = "Intel SDM Vol 2C VPXORQ"
 consequence = "#UD fault if AVX-512F not enabled at runtime"
 
+[vpaddq]
+operand_count = 3
+operand[0].type = ZMM_REGISTER
+operand[1].type = ZMM_REGISTER
+operand[2].type = ZMM_REGISTER
+category = C4_CPU_FEATURE
+required_features = AVX512F
+source = "Intel SDM Vol 2C VPADDQ"
+consequence = "#UD fault if AVX-512F not enabled at runtime"
+
+[aesenc]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = XMM_REGISTER
+category = C4_CPU_FEATURE
+required_features = AES
+source = "Intel SDM Vol 2A AESENC"
+consequence = "#UD fault if AES-NI not enabled"
+
+[aesdec]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = XMM_REGISTER
+category = C4_CPU_FEATURE
+required_features = AES
+source = "Intel SDM Vol 2A AESDEC"
+consequence = "#UD fault if AES-NI not enabled"
+
+[aeskeygenassist]
+operand_count = 3
+operand[0].type = XMM_REGISTER
+operand[1].type = XMM_REGISTER
+operand[2].type = IMMEDIATE
+category = C4_CPU_FEATURE
+required_features = AES
+source = "Intel SDM Vol 2A AESKEYGENASSIST"
+consequence = "#UD fault if AES-NI not enabled"
+
+[sha1rnds4]
+operand_count = 3
+operand[0].type = XMM_REGISTER
+operand[1].type = XMM_REGISTER
+operand[2].type = IMMEDIATE
+category = C4_CPU_FEATURE
+required_features = SHA
+source = "Intel SDM Vol 2B SHA1RNDS4"
+consequence = "#UD fault if SHA-NI not enabled"
+
+[sha256msg1]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = XMM_REGISTER
+category = C4_CPU_FEATURE
+required_features = SHA
+source = "Intel SDM Vol 2B SHA256MSG1"
+consequence = "#UD fault if SHA-NI not enabled"
+
+# Note: TZCNT and LZCNT are well-defined on zero (return operand size),
+# unlike BSR/BSF. They're feature-gated (BMI1) but no value-range UB.
+# Classified under C4 only.
+
+[tzcnt]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C4_CPU_FEATURE
+required_features = BMI1
+source = "Intel SDM Vol 2B TZCNT"
+consequence = "#UD fault if BMI1 not enabled"
+notes = "Distinct from BSF: returns operand size on zero (well-defined)."
+
+[lzcnt]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C4_CPU_FEATURE
+required_features = LZCNT
+source = "Intel SDM Vol 2A LZCNT"
+consequence = "#UD fault if LZCNT not enabled"
+
+[popcnt]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C4_CPU_FEATURE
+required_features = POPCNT
+source = "Intel SDM Vol 2B POPCNT"
+consequence = "#UD fault if POPCNT not enabled"
+
 # =====================================================================
-# C5 — Privilege (kernel-only)
+# C5 — Privilege (kernel-only, ~25 entries)
 # =====================================================================
 
 [wrmsr]
@@ -124,14 +306,14 @@ operand_count = 0
 category = C5_PRIVILEGE
 source = "Intel SDM Vol 2B WRMSR"
 consequence = "#GP fault if executed at CPL > 0"
-notes = "Implicit operands: ECX (MSR index), EDX:EAX (value). Must be in naked function with kernel context."
+notes = "Implicit: ECX (MSR index), EDX:EAX (value)."
 
 [rdmsr]
 operand_count = 0
 category = C5_PRIVILEGE
 source = "Intel SDM Vol 2B RDMSR"
 consequence = "#GP fault if executed at CPL > 0"
-notes = "Implicit operands: ECX (MSR index in), EDX:EAX (value out)."
+notes = "Implicit: ECX (MSR index in), EDX:EAX (value out)."
 
 [invlpg]
 operand_count = 1
@@ -139,7 +321,29 @@ operand[0].type = MEMORY
 category = C5_PRIVILEGE
 source = "Intel SDM Vol 2A INVLPG"
 consequence = "#GP fault if executed at CPL > 0"
-notes = "Invalidates TLB entry for the linear address in the memory operand."
+
+[invd]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A INVD"
+consequence = "#GP fault if executed at CPL > 0; cache invalidation without writeback (data loss risk)"
+notes = "Almost always wrong — use WBINVD instead unless the cache content is known stale."
+
+[wbinvd]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2C WBINVD"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Writes back then invalidates all caches. Heavy operation; use sparingly."
+
+[invpcid]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = MEMORY
+category = C5_PRIVILEGE
+required_features = INVPCID
+source = "Intel SDM Vol 2A INVPCID"
+consequence = "#GP fault if executed at CPL > 0; #UD if INVPCID not enabled"
 
 [hlt]
 operand_count = 0
@@ -147,3 +351,139 @@ category = C5_PRIVILEGE
 source = "Intel SDM Vol 2A HLT"
 consequence = "#GP fault if executed at CPL > 0"
 notes = "Halts CPU until next external interrupt. Common in idle loops."
+
+[swapgs]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2C SWAPGS"
+consequence = "#UD fault if executed at CPL > 0"
+notes = "Swaps GS base with KernelGSbase MSR. Essential for syscall entry/exit."
+
+[iretq]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A IRETQ"
+consequence = "#GP fault if stack frame malformed"
+notes = "64-bit interrupt return. Pops RIP, CS, RFLAGS, RSP, SS from stack."
+
+[sysret]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2C SYSRET"
+consequence = "#GP fault if executed at CPL > 0; #UD if not in 64-bit mode"
+notes = "Returns to user mode after SYSCALL. Implicit RIP from RCX."
+
+[sysretq]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2C SYSRETQ"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "64-bit variant of SYSRET (REX.W prefix)."
+
+[lidt]
+operand_count = 1
+operand[0].type = MEMORY
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A LIDT"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Loads Interrupt Descriptor Table register. Once-per-boot operation."
+
+[lgdt]
+operand_count = 1
+operand[0].type = MEMORY
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A LGDT"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Loads Global Descriptor Table register. Once-per-boot operation."
+
+[lldt]
+operand_count = 1
+operand[0].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A LLDT"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Loads Local Descriptor Table register."
+
+[ltr]
+operand_count = 1
+operand[0].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2B LTR"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Loads Task Register. Required for IRETQ to user mode."
+
+[wrpkru]
+operand_count = 0
+category = C5_PRIVILEGE
+required_features = PKU
+source = "Intel SDM Vol 2C WRPKRU"
+consequence = "#GP fault if executed at CPL > 0; #UD if PKU not enabled"
+notes = "Implicit: ECX=0 (must be), EDX=0 (must be), EAX=value."
+
+[rdpkru]
+operand_count = 0
+category = C5_PRIVILEGE
+required_features = PKU
+source = "Intel SDM Vol 2B RDPKRU"
+consequence = "#GP fault if executed at CPL > 0; #UD if PKU not enabled"
+
+[xsetbv]
+operand_count = 0
+category = C5_PRIVILEGE
+required_features = XSAVE
+source = "Intel SDM Vol 2C XSETBV"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Implicit: ECX (XCR index), EDX:EAX (value). Used to enable AVX/AVX-512."
+
+[clac]
+operand_count = 0
+category = C5_PRIVILEGE
+required_features = SMAP
+source = "Intel SDM Vol 2A CLAC"
+consequence = "#GP fault if executed at CPL > 0; #UD if SMAP not enabled"
+notes = "Clears RFLAGS.AC; allows kernel to access user pages."
+
+[stac]
+operand_count = 0
+category = C5_PRIVILEGE
+required_features = SMAP
+source = "Intel SDM Vol 2C STAC"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Sets RFLAGS.AC; restores SMAP enforcement."
+
+# =====================================================================
+# C8 — Memory ordering (~5 entries)
+#
+# Note: actual cross-instruction ordering enforcement is Stage 5
+# (System #30, Session G). F4 records the classification so the
+# data is ready when System #30 lands.
+# =====================================================================
+
+[mfence]
+operand_count = 0
+category = C8_MEMORY_ORDER
+required_features = SSE2
+source = "Intel SDM Vol 2A MFENCE"
+consequence = "no enforcement today (Stage 5 / System #30); semantics: full memory barrier (acq+rel)"
+notes = "Required between non-temporal stores (MOVNT*) and following loads."
+
+[lfence]
+operand_count = 0
+category = C8_MEMORY_ORDER
+required_features = SSE2
+source = "Intel SDM Vol 2A LFENCE"
+consequence = "load barrier; orders prior loads before subsequent loads"
+
+[sfence]
+operand_count = 0
+category = C8_MEMORY_ORDER
+required_features = SSE
+source = "Intel SDM Vol 2B SFENCE"
+consequence = "store barrier; orders prior stores before subsequent stores"
+
+[pause]
+operand_count = 0
+category = C8_MEMORY_ORDER
+source = "Intel SDM Vol 2B PAUSE"
+consequence = "spin-loop hint; reduces power and improves spin-wait performance"
+notes = "Not strictly memory-ordering but related to atomic spin patterns."

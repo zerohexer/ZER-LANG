@@ -1,0 +1,21 @@
+// F4.2 positive: privileged instructions (C5) compile through F4 dispatch
+// without false rejection. C5 enforcement today is via the existing
+// naked-only restriction (S1) — F7-full will add explicit kernel-context
+// modeling. For F4.2: just verify the C5-classified instructions don't
+// trigger spurious errors.
+//
+// HLT, WBINVD, SWAPGS — all kernel-only, all in F4.2 .zerdata gold set.
+
+naked void priv_ops() {
+    asm {
+        instructions: "hlt"
+        clobbers: ["memory"]
+        safety: "HLT — kernel-only halt instruction (C5). Verify F4.2 lookup doesn't false-reject."
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { priv_ops(); }
+    return 0;
+}

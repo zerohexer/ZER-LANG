@@ -1,0 +1,18 @@
+// F4 negative: VPXORQ requires AVX-512F. Without --target-features=avx512f,
+// the C4 (cpu-feature) gate triggers and rejects the asm at compile time.
+// Intel SDM Vol 2C VPXORQ: "#UD fault if AVX-512F not enabled at runtime"
+//
+// EXPECTED: compile error mentioning AVX-512F feature.
+
+naked void avx512_xor_no_flag() {
+    asm {
+        instructions: "vpxorq %%xmm0, %%xmm0, %%xmm0"
+        clobbers: [ "xmm0" ]
+        safety: "VPXORQ without --target-features=avx512f — F4 C4 dispatch test, must reject"
+    }
+}
+
+i32 main() {
+    avx512_xor_no_flag();
+    return 0;
+}

@@ -2384,25 +2384,19 @@ reg[7..4] = 0x0F;          // Set bits 7:4
 ### Usage
 
 ```bash
-zerc source.zer                   # compile to source.exe (default — no .c visible)
-zerc source.zer --run              # compile + execute (no .c visible)
-zerc source.zer --emit-c           # emit C to source.c (kept)
-zerc source.zer -o output.c        # emit C to specific file (kept)
-zerc source.zer -o output           # compile to specific exe (no .c visible)
-zerc source.zer --lib              # library mode (no preamble/main)
-zerc source.zer --no-strict-mmio   # allow @inttoptr without mmio ranges
-zerc source.zer --target-bits 64   # set usize width
-zerc source.zer --gcc arm-none-eabi-gcc   # cross-compile
-
-# Sub-arch + sub-extension support (D-Alpha-7.5):
-zerc source.zer --target-arch=aarch64    # cross-compile to aarch64 (uses aarch64-linux-gnu-gcc)
+zerc source.zer                          # compile to source.exe (default — no .c visible)
+zerc source.zer --run                    # compile + execute (no .c visible)
+zerc source.zer --emit-c                 # emit C to source.c (kept)
+zerc source.zer -o output.c              # emit C to specific file (kept)
+zerc source.zer -o output                # compile to specific exe (no .c visible)
+zerc source.zer --lib                    # library mode (no preamble/main)
+zerc source.zer --no-strict-mmio         # allow @inttoptr without mmio ranges
+zerc source.zer --target-bits 64         # set usize width
+zerc source.zer --gcc arm-none-eabi-gcc  # cross-compile
+zerc source.zer --target-arch=aarch64    # cross-compile to aarch64
 zerc source.zer --target-arch=riscv64    # cross-compile to riscv64
-zerc source.zer --target-features=avx512f      # enable AVX-512F (xmm16-31, zmm regs, vpxorq, etc.)
-zerc source.zer --target-features=aes,sha,bmi1 # enable multiple x86 ISA extensions
-# Available x86_64 features: avx512f, sse, sse2, avx, avx2, aes, sha,
-#   bmi1, bmi2, lzcnt, popcnt, invpcid, pku, xsave, smap
-# Each match sets a checker-side feature bit AND forwards `-m<feature>` to GCC.
-# Baseline x86_64: SSE | SSE2 (always on; ABI-guaranteed).
+zerc source.zer --target-features=avx512f         # enable AVX-512F SIMD
+zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (comma-separated)
 ```
 
 ### Pipeline

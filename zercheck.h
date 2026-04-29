@@ -113,4 +113,11 @@ typedef struct {
 void zercheck_init(ZerCheck *zc, Checker *checker, Arena *arena, const char *file);
 bool zercheck_run(ZerCheck *zc, Node *file_node);
 
+/* Heuristic: does a function name look like a destructor? Used by both
+ * zercheck.c (AST path) and zercheck_ir.c (IR path) to recognise non-void
+ * cleanup functions like `int destroy(*Resource)` whose return is a status
+ * code. Substring match against {free,destroy,close,release,delete,dispose,
+ * drop,cleanup,deinit,fini,shutdown,term} (case-insensitive ASCII). */
+bool zer_name_looks_like_destructor(const char *name, uint32_t name_len);
+
 #endif /* ZER_CHECK_H */

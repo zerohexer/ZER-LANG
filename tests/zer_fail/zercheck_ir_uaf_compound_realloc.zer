@@ -1,0 +1,28 @@
+// Tests zercheck_ir.c BUG-617 family — realloc-after-find UAF in
+// IR_ASSIGN compound key registration (line ~1602). Each `s.h = mh
+// orelse return;` registers TWO handles (the bare local + the
+// compound key). Over 5+ such pairs, ps->handles realloc'd from cap=8.
+// Without the snapshot fix, the analyzer reads freed memory; with the
+// fix, the double-free below is still caught.
+// EXPECTED: zercheck use-after-free or double-free error.
+struct Task { u32 id; }
+struct Holder { Handle(Task) h; }
+Slab(Task) heap;
+
+void main() {
+    Holder s1; Holder s2; Holder s3; Holder s4;
+    Holder s5; Holder s6; Holder s7; Holder s8;
+    Holder s9; Holder s10;
+    ?Handle(Task) m1 = heap.alloc(); s1.h = m1 orelse return;
+    ?Handle(Task) m2 = heap.alloc(); s2.h = m2 orelse return;
+    ?Handle(Task) m3 = heap.alloc(); s3.h = m3 orelse return;
+    ?Handle(Task) m4 = heap.alloc(); s4.h = m4 orelse return;
+    ?Handle(Task) m5 = heap.alloc(); s5.h = m5 orelse return;
+    ?Handle(Task) m6 = heap.alloc(); s6.h = m6 orelse return;
+    ?Handle(Task) m7 = heap.alloc(); s7.h = m7 orelse return;
+    ?Handle(Task) m8 = heap.alloc(); s8.h = m8 orelse return;
+    ?Handle(Task) m9 = heap.alloc(); s9.h = m9 orelse return;
+    ?Handle(Task) m10 = heap.alloc(); s10.h = m10 orelse return;
+    heap.free(s1.h);
+    heap.free(s1.h);  // double-free — must be caught after realloc
+}

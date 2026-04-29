@@ -625,8 +625,13 @@ static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
 }
 
 /* Check if a call is to a function that frees its first argument.
- * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
- * param (signature heuristic — catches destroy/close/cleanup patterns). */
+ * 1. Explicitly named "free"
+ * 2. Bodyless void fn(*opaque/*T ...)        (signature heuristic)
+ * 3. Bodyless non-void fn(*opaque/*T ...) AND name suggests destructor
+ *    (Gap 17 mirror — restored 2026-04-29). Mirrors zercheck.c is_free_call
+ *    so the IR-side analyzer matches the AST-side once Phase G flips
+ *    primary. Without this, `int destroy(*Resource)` was a silent UAF
+ *    in the IR analyzer. */
 static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     if (!call || call->kind != NODE_CALL) return false;
     Node *callee = call->call.callee;
@@ -635,14 +640,19 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     /* Explicit "free" */
     if (callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0) return true;
-    /* Signature heuristic: bodyless void fn(*opaque/*T ...) */
+    /* Signature heuristic: bodyless function with *opaque/*T first param */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
         callee->ident.name, (uint32_t)callee->ident.name_len);
     if (!sym || !sym->is_function || !sym->func_node) return false;
     if (sym->func_node->func_decl.body) return false;
     Type *ret = sym->type;
     if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-    if (!ret || type_unwrap_distinct(ret)->kind != TYPE_VOID) return false;
+    Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
+    bool ret_is_void = ret_eff && ret_eff->kind == TYPE_VOID;
+    bool name_is_dtor = zer_name_looks_like_destructor(
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    /* Void return → always heuristic-free. Non-void → only if destructor name. */
+    if (!ret_is_void && !(ret_eff && name_is_dtor)) return false;
     if (sym->func_node->func_decl.param_count < 1) return false;
     Type *p0 = NULL;
     if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
@@ -1608,13 +1618,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                                  &root_local, &path,
                                                  &path_len) == 0 &&
                         path_len > 0) {
+                        /* UAF GUARD (BUG-617 family, restored in audit
+                         * 2026-04-29): rh points into ps->handles which
+                         * ir_add_compound_handle below can realloc.
+                         * Snapshot fields BEFORE the add. */
+                        int s_alloc_line = rh->alloc_line;
+                        int s_alloc_id = rh->alloc_id;
+                        int s_color = rh->source_color;
                         IRHandleInfo *ch = ir_add_compound_handle(ps,
                             root_local, path, path_len);
                         if (ch) {
                             ch->state = IR_HS_ALIVE;
-                            ch->alloc_line = rh->alloc_line;
-                            ch->alloc_id = rh->alloc_id;
-                            ch->source_color = rh->source_color;
+                            ch->alloc_line = s_alloc_line;
+                            ch->alloc_id = s_alloc_id;
+                            ch->source_color = s_color;
                         }
                     }
                 }
@@ -1639,13 +1656,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (src_local >= 0) {
                     IRHandleInfo *src_h = ir_find_handle(ps, src_local);
                     if (src_h) {
+                        /* UAF GUARD (BUG-618 restored 2026-04-29):
+                         * src_h points into ps->handles which can be
+                         * realloc'd by ir_add_handle below. Snapshot
+                         * BEFORE the add. */
+                        IRHandleState s_state = src_h->state;
+                        int s_alloc_line = src_h->alloc_line;
+                        int s_alloc_id = src_h->alloc_id;
+                        int s_color = src_h->source_color;
+                        bool s_is_th = src_h->is_thread_handle;
                         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                         if (dst_h) {
-                            dst_h->state = src_h->state;
-                            dst_h->alloc_line = src_h->alloc_line;
-                            dst_h->alloc_id = src_h->alloc_id;
-                            dst_h->source_color = src_h->source_color;
-                            dst_h->is_thread_handle = src_h->is_thread_handle;
+                            dst_h->state = s_state;
+                            dst_h->alloc_line = s_alloc_line;
+                            dst_h->alloc_id = s_alloc_id;
+                            dst_h->source_color = s_color;
+                            dst_h->is_thread_handle = s_is_th;
                         }
                     }
                 }
@@ -1856,9 +1882,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             dst_h->alloc_id = _ir_next_alloc_id++;
                         }
                     } else {
-                        /* Non-move: regular alias */
+                        /* Non-move: regular alias.
+                         * UAF GUARD (BUG-622 restored 2026-04-29): snapshot
+                         * src_h state BEFORE the alias-add path may realloc
+                         * ps->handles. The secondary ir_is_invalid check
+                         * after the if-block must read the snapshot, not
+                         * the (possibly stale) pointer. */
+                        IRHandleState src_state_snap =
+                            src_h ? src_h->state : IR_HS_UNKNOWN;
                         if (src_h && src_h->state == IR_HS_ALIVE) {
-                            /* UAF GUARD: snapshot before realloc-capable add. */
                             int alias_alloc_line = src_h->alloc_line;
                             int alias_alloc_id = src_h->alloc_id;
                             int alias_color = src_h->source_color;
@@ -1872,11 +1904,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 dst_h->is_thread_handle = alias_is_th;
                             }
                         }
-                        /* Check use of invalid handle */
-                        if (src_h && ir_is_invalid(src_h)) {
+                        /* Check use of invalid handle (use snapshot — src_h
+                         * may dangle after the add above realloc'd). */
+                        if (src_h && zer_handle_state_is_invalid(src_state_snap) != 0) {
                             ir_zc_error(zc, inst->source_line,
                                 "use of %s handle %%%d",
-                                ir_state_name(src_h->state), src_local);
+                                ir_state_name(src_state_snap), src_local);
                         }
                     }
                 }
@@ -2272,12 +2305,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (arg_local >= 0) {
                         IRHandleInfo *arg_h = ir_find_handle(ps, arg_local);
                         if (arg_h) {
+                            /* UAF GUARD (BUG-619 restored 2026-04-29):
+                             * arg_h points into ps->handles which can be
+                             * realloc'd by ir_add_handle below. Snapshot
+                             * BEFORE the add. */
+                            IRHandleState a_state = arg_h->state;
+                            int a_alloc_line = arg_h->alloc_line;
+                            int a_alloc_id = arg_h->alloc_id;
+                            int a_color = arg_h->source_color;
                             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                             if (dh) {
-                                dh->state = arg_h->state;
-                                dh->alloc_line = arg_h->alloc_line;
-                                dh->alloc_id = arg_h->alloc_id;
-                                dh->source_color = arg_h->source_color;
+                                dh->state = a_state;
+                                dh->alloc_line = a_alloc_line;
+                                dh->alloc_id = a_alloc_id;
+                                dh->source_color = a_color;
                                 dest_aliased_from_param = true;
                             }
                         }
@@ -2618,12 +2659,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (ir_extract_compound_key(zc, func, target_expr,
                                              &root_local, &path, &path_len) == 0
                     && path_len > 0) {
+                    /* UAF GUARD (BUG-620 restored 2026-04-29): rh points
+                     * into ps->handles which ir_add_compound_handle below
+                     * can realloc. Snapshot fields BEFORE the add. */
+                    int s_alloc_line = rh->alloc_line;
+                    int s_alloc_id = rh->alloc_id;
                     IRHandleInfo *ch = ir_add_compound_handle(ps, root_local,
                                                                path, path_len);
                     if (ch) {
                         ch->state = IR_HS_ALIVE;
-                        ch->alloc_line = rh->alloc_line;
-                        ch->alloc_id = rh->alloc_id;
+                        ch->alloc_line = s_alloc_line;
+                        ch->alloc_id = s_alloc_id;
                     }
                 }
             }
@@ -2679,12 +2725,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (ir_extract_compound_key(zc, func, target_expr,
                                              &root_local, &path, &path_len) == 0
                     && path_len > 0) {
+                    /* UAF GUARD (BUG-621 restored 2026-04-29): rh points
+                     * into ps->handles which ir_add_compound_handle below
+                     * can realloc. Snapshot fields BEFORE the add. */
+                    int s_alloc_line = rh->alloc_line;
+                    int s_alloc_id = rh->alloc_id;
                     IRHandleInfo *ch = ir_add_compound_handle(ps, root_local,
                                                                path, path_len);
                     if (ch) {
                         ch->state = IR_HS_ALIVE;
-                        ch->alloc_line = rh->alloc_line;
-                        ch->alloc_id = rh->alloc_id;
+                        ch->alloc_line = s_alloc_line;
+                        ch->alloc_id = s_alloc_id;
                     }
                 }
             }

@@ -281,7 +281,7 @@ static bool is_alloc_call(ZerCheck *zc, Node *call) {
  * delete/dispose/drop/cleanup/deinit/fini/shutdown/term). Match is
  * substring (case-insensitive on ASCII) so prefixes like `db_close`,
  * `slab_destroy`, `mtx_drop`, `arena_release` all qualify. */
-static bool name_looks_like_destructor(const char *name, uint32_t name_len) {
+bool zer_name_looks_like_destructor(const char *name, uint32_t name_len) {
     static const char *KEYWORDS[] = {
         "free", "destroy", "close", "release", "delete", "dispose",
         "drop", "cleanup", "deinit", "fini", "shutdown", "term", NULL
@@ -338,7 +338,7 @@ static bool is_free_call(ZerCheck *zc, Node *call, char *arg_key, int *arg_key_l
         if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
         Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
         bool ret_is_void = ret_eff && ret_eff->kind == TYPE_VOID;
-        bool name_is_dtor = name_looks_like_destructor(
+        bool name_is_dtor = zer_name_looks_like_destructor(
             callee->ident.name, (uint32_t)callee->ident.name_len);
         /* Check 2: void return → always heuristic-free.
          * Check 3: non-void return → only if name suggests destructor. */

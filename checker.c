@@ -5900,17 +5900,32 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* BUG-371: also validate constant expressions, not just literals
                      * SAFETY: zer_mmio_inttoptr_allowed in src/safety/mmio_rules.c
-                     * Oracle: lambda_zer_mmio step_inttoptr_ok requires BOTH gates. */
-                    if (c->mmio_range_count > 0 && node->intrinsic.arg_count > 0) {
+                     * Oracle: lambda_zer_mmio step_inttoptr_ok requires BOTH gates.
+                     *
+                     * Gap 19 fix (audit 2026-04-29, restored from tNGWB):
+                     * range and alignment are ORTHOGONAL safety axes. Range
+                     * check is gated on `mmio_range_count > 0` (only enforces
+                     * if user declared ranges). Alignment check must run
+                     * UNCONDITIONALLY when address is constant — even under
+                     * --no-strict-mmio, a misaligned MMIO address is SIGBUS
+                     * on ARM/RISC-V or silent corruption on Cortex-M0+. */
+                    if (node->intrinsic.arg_count > 0) {
                         int64_t cval = eval_const_expr(node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
                         int in_range = 0;
-                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
-                            if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
-                                in_range = 1;
-                                break;
+                        if (c->mmio_range_count > 0) {
+                            for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                                if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
+                                    in_range = 1;
+                                    break;
+                                }
                             }
+                        } else {
+                            /* No ranges declared: range gate not enforced
+                             * (--no-strict-mmio path). Pretend in-range so
+                             * zer_mmio_inttoptr_allowed only checks alignment. */
+                            in_range = 1;
                         }
                         /* alignment check: constant address must be aligned to target type */
                         int aligned = 1;   /* assume aligned until checked */

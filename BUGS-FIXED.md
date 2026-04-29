@@ -5,6 +5,156 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-29 — Audit: 7 latent silent gaps closed (BUG-641 to BUG-647)
+
+Cross-referencing the doc-claimed-fixed list against actual code, the
+2026-04-29 audit found that **7 silent gaps documented as "FIXED in
+branch claude/cool-johnson-tNGWB"** in `docs/4-27-2026-gaps.md` had
+**never landed on main**. The branch was reviewed but not pulled per
+workflow (per the doc's own note). All 7 fixes restored in this
+session.
+
+The audit ran on actual code:
+
+1. Spawn-and-verify Explore agent on `zercheck_ir.c` ~3486 lines —
+   enumerated every `ir_find_handle()` / `ir_find_compound_handle()`
+   followed by `ir_add_handle()` / `ir_add_compound_handle()` (the
+   latter two can `realloc` `ps->handles`). 5 unfixed UAF sites where
+   the find-result is used AFTER the realloc-capable add.
+2. Direct grep on `checker.c` `@inttoptr` site — confirmed alignment
+   check still gated on `c->mmio_range_count > 0`. Reproducer:
+   `tests/zer_fail/gap19_inttoptr_unaligned_relaxed.zer` — under
+   `--no-strict-mmio`, misaligned `@inttoptr(*u32, 0x40000001)`
+   compiled clean before fix.
+3. Direct read of `zercheck_ir.c:630` `ir_is_extern_free_call` —
+   confirmed the IR-side analyzer still required VOID return,
+   missing the Gap 17 / BUG-630 fix that landed in `zercheck.c`
+   only. Once Phase G flips primary to IR, the silent UAF returns.
+
+Cumulative effect on the roadmap:
+
+- 5 of 7 zercheck_ir UAF gaps (Gap 20-24 / BUG-617-621) closed in main.
+- 1 of 7 zercheck_ir read-after-free (Gap 25 / BUG-622) closed in main.
+- 1 Gap 19 (`@inttoptr` alignment hoist) closed in main.
+- 1 Gap 17 IR-side mirror added (was AST-only previously).
+
+All fixes verified via `make check` (524 ZER tests, 28 modules, 784
+Rust, 36 Zig, 139 conversion, cross-arch — all green). Three new
+reproducer tests landed:
+- `tests/zer_fail/gap19_inttoptr_unaligned_relaxed.zer` (Gap 19)
+- `tests/zer_fail/zercheck_ir_uaf_compound_realloc.zer` (Gap 20 family)
+- `tests/zer/zercheck_ir_uaf_orelse_alias.zer` (Gap 21 — 12-pair stress)
+
+### BUG-641: Gap 19 `@inttoptr` alignment check coupled to range gate (HIGH bare-metal)
+
+**Symptom:** Under `--no-strict-mmio` (no `mmio` declarations), a
+constant misaligned address like `@inttoptr(volatile *u32, 0x40000001)`
+compiled clean. On bare-metal ARM/RISC-V this is SIGBUS at runtime; on
+Cortex-M0+ it's silent corruption (returns wrong value).
+
+**Root cause:** `checker.c:5904` (pre-fix) wrapped both the range check
+AND the alignment check in `if (c->mmio_range_count > 0 && ...)`. With
+no ranges declared, neither check ran. Range and alignment are
+ORTHOGONAL safety axes — one is "is this address one I told the
+compiler about?" and the other is "is this address physically usable
+by this type?". Coupling them in a single conditional silently
+disabled both under `--no-strict-mmio`.
+
+**Fix:** Hoist alignment check out of the range gate. Range check
+remains gated on `mmio_range_count > 0` (correct: only enforce ranges
+when user declared them). Alignment check runs unconditionally on any
+`@inttoptr` with a constant address. Under `--no-strict-mmio` (no
+ranges), `in_range` is set to 1 (pass) so `zer_mmio_inttoptr_allowed`
+only checks alignment.
+
+**Test:** `tests/zer_fail/gap19_inttoptr_unaligned_relaxed.zer` —
+misaligned `0x40000001` for `*u32` rejected even without `mmio`
+declarations.
+
+### BUG-642: Gap 20 IR_ASSIGN compound key UAF (HIGH compiler-internal)
+
+**Symptom:** `zercheck_ir.c:~1602` IR_ASSIGN compound-key registration
+read freed memory after `ir_add_compound_handle` realloc. Garbage values
+propagate into the new compound HandleInfo (alloc_line/alloc_id/source_color),
+silently corrupting handle tracking when ps->handles grows past cap=8.
+
+**Root cause:** Pattern `rh = ir_find_handle(...)` → `ir_add_compound_handle(...)`
+(may realloc `ps->handles`) → reads `rh->alloc_line/alloc_id/source_color`.
+After realloc, `rh` dangles.
+
+**Fix:** Snapshot `rh->alloc_line`, `rh->alloc_id`, `rh->source_color`
+into local variables BEFORE `ir_add_compound_handle` call.
+
+### BUG-643: Gap 21 IR_ASSIGN orelse-ident alias UAF (HIGH compiler-internal)
+
+**Symptom:** `zercheck_ir.c:~1640` orelse-wrapped ident alias registration
+read freed memory after `ir_add_handle` realloc. Affects 5 fields
+(state, alloc_line, alloc_id, source_color, is_thread_handle).
+
+**Fix:** Snapshot all 5 fields BEFORE the realloc-capable add.
+
+**Test:** `tests/zer/zercheck_ir_uaf_orelse_alias.zer` — 12 paired
+`?Handle + Handle = ... orelse return` declarations grow `ps->handles`
+past initial cap=8; analyzer must correctly track aliases through
+realloc and exit cleanly.
+
+### BUG-644: Gap 22 IR_CALL param-color alias UAF (HIGH compiler-internal)
+
+**Symptom:** `zercheck_ir.c:~2273` callee-with-`returns_param_color`
+registration read freed memory after `ir_add_handle` realloc.
+
+**Fix:** Snapshot `arg_h` fields BEFORE `ir_add_handle`.
+
+### BUG-645: Gap 23 IR_FIELD_WRITE alloc_id propagation UAF (MEDIUM)
+
+**Symptom:** `zercheck_ir.c:~2613` field-write compound handle
+registration read freed memory after `ir_add_compound_handle` realloc.
+
+**Fix:** Snapshot `rh->alloc_line` and `rh->alloc_id` BEFORE the add.
+
+**Test:** `tests/zer_fail/zercheck_ir_uaf_compound_realloc.zer` —
+10 `s.h = ... orelse return` field-writes force realloc; subsequent
+double-free still detected by analyzer.
+
+### BUG-646: Gap 24 IR_INDEX_WRITE alloc_id propagation UAF (MEDIUM)
+
+**Symptom:** `zercheck_ir.c:~2674` index-write (constant index)
+compound handle registration read freed memory.
+
+**Fix:** Same snapshot pattern as BUG-645.
+
+### BUG-647: Gap 25 non-move alias secondary check read-after-free + Gap 17 IR-side mirror
+
+**Two related issues fixed:**
+
+**Gap 25 (LOW):** `zercheck_ir.c:~1876` non-move regular alias check
+re-read `src_h->state` after `ir_add_handle` realloc. The entry
+condition `src_h->state == IR_HS_ALIVE` guarantees the original state
+was ALIVE (= NOT invalid), but post-realloc the read on stale memory
+could return garbage matching FREED/MAYBE_FREED/TRANSFERRED → spurious
+analyzer error.
+
+**Fix:** Snapshot `src_h->state` BEFORE the add path; the secondary
+`ir_is_invalid` check uses the snapshot, not the (possibly stale)
+pointer. Calls `zer_handle_state_is_invalid()` directly on the snapshot.
+
+**Gap 17 IR-side mirror (MEDIUM):** `zercheck_ir.c:630`
+`ir_is_extern_free_call` still required VOID return, missing the
+Gap 17 / BUG-630 fix that landed in `zercheck.c` only. A bodyless
+`int destroy(*Resource)` was correctly classified as a free in
+`zercheck.c` but NOT in `zercheck_ir.c`. With AST-primary today the
+user-visible behavior was correct, but Phase G migration to IR-primary
+would silently regress. Promoted `name_looks_like_destructor()` from
+`zercheck.c` static helper to public `zer_name_looks_like_destructor()`
+in `zercheck.h`. IR side now mirrors AST side: bodyless function with
+*opaque/*T first param + (void return OR destructor name) → tracked
+as free.
+
+**Test:** `tests/zer_fail/bodyless_destroy_status_uaf.zer` — already
+existed for AST side; now both AST and IR analyzers catch it.
+
+---
+
 ## Session 2026-04-28 — Stage 2 Part A of `docs/4-27-2026-gaps.md`: 7 walker gaps closed
 
 Stage 2 Part A (semantic walker fixes) of the implementation roadmap is

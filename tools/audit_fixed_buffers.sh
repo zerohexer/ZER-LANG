@@ -39,17 +39,21 @@ trap "rm -f $CURRENT" EXIT
 # (mangled[256], aname[64]) are conventional and have controlled lifetime.
 for f in $FILES; do
     [ -f "$f" ] || continue
-    # AST/Symbol/Type pointer arrays of any size
-    grep -nE '^\s*(Node|Symbol|Type|IRBlock|IRInst|IRFunc)\s*\*\s*\w+\[[0-9]+\]' "$f" | \
+    # AST/Symbol/Type pointer arrays of any size.
+    # Output format: file:CONTENT (no line number — line numbers drift
+    # whenever the file is edited, which would break the baseline diff).
+    grep -E '^\s*(Node|Symbol|Type|IRBlock|IRInst|IRFunc)\s*\*\s*\w+\[[0-9]+\]' "$f" | \
         sed "s|^|$f:|"
     # uint8_t/uint32_t arrays whose name suggests collection
-    grep -nE '^\s*(uint8_t|uint16_t|uint32_t|uint64_t|int)\s+\w*(stack|nodes|items|args|ids|covered|reported|checks|list|set|stmts|decls|arr)\w*\[[0-9]+\]' "$f" | \
+    grep -E '^\s*(uint8_t|uint16_t|uint32_t|uint64_t|int)\s+\w*(stack|nodes|items|args|ids|covered|reported|checks|list|set|stmts|decls|arr)\w*\[[0-9]+\]' "$f" | \
         sed "s|^|$f:|"
 done | tr -d '\r' | sort -u > "$CURRENT"
 
 # Compare against baseline. Lines in CURRENT but not BASELINE = new.
-# Both inputs CR-stripped to handle Windows checkouts that preserve CRLF.
-NEW=$(comm -23 "$CURRENT" <(tr -d '\r' < "$BASELINE" | sort -u) || true)
+# Strip line numbers from baseline entries (legacy "file:NNN:content" form)
+# so a baseline written before this change still matches CURRENT (which
+# is now "file:content"). Also CR-strip both inputs for Windows checkouts.
+NEW=$(comm -23 "$CURRENT" <(tr -d '\r' < "$BASELINE" | sed -E 's|^([^:]+):[0-9]+:|\1:|' | sort -u) || true)
 
 if [ -z "$NEW" ]; then
     total=$(wc -l < "$CURRENT")

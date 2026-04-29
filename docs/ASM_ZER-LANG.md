@@ -1,6 +1,10 @@
 # ASM & Low-Level Safety in ZER-LANG — Full Context Dump
 
 > **Syntax update (2026-04-23):** `asm(...)` keyword renamed to `unsafe asm(...)`. The `unsafe` marker is **required** — bare `asm(...)` is rejected with a compile error (Rust-style explicit escape hatch marker). Phase 1 verified rule (`zer_asm_allowed_in_context`) unchanged — naked-function restriction still applies. See `docs/asm_plan.md` for full context.
+>
+> **Naming update (2026-04-25):** `unsafe asm` was renamed to bare `asm`. The `unsafe` keyword was cosmetic — every safety check keys on the structural `in_naked` flag, not the keyword. Bare `asm` matches C/Zig convention. All H1-H7 features and 13 Z-rules are unchanged.
+>
+> **Sub-extension architecture validated (2026-04-29):** Framework proven end-to-end across 3 archs (x86_64 + aarch64 + riscv64) with cross-toolchain ELF verification. AVX-512F is the canonical register-clobber-gated feature; AMX/SVE/SME are intrinsic-only by vendor design. User-extensible runtime intrinsic registry was designed and rejected as overengineering. See `docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29" section for the full validation context, alternatives considered and rejected, and the locked-in architecture.
 
 ## Decision History (2026-04-01)
 

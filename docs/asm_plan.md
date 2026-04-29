@@ -2355,4 +2355,341 @@ Summary of the conversation that led to this plan:
 
 ---
 
-*End of document. Last updated 2026-04-23.*
+## Sub-Extension Architecture — Validated 2026-04-29
+
+This section captures the architectural validation discussion that ran end-to-end
+empirical tests across all 3 archs and resolved the major design questions for how
+sub-extensions / ISA features fit into ZER's asm safety framework. Don't remove —
+the journey to each decision matters as much as the decision itself.
+
+### The questions that drove this session
+
+A fresh review of the asm framework triggered five sharp questions:
+
+1. **Is the framework universal across archs and extensions, or AVX-512-specific?**
+   What's been proven beyond AVX-512F? Can other extensions plug into the same
+   pipeline?
+
+2. **Is everything dependent on GCC?** If GCC is the oracle for register clobber
+   acceptance, are we permanently bound to GCC's choices? What happens when GCC
+   doesn't support what we need?
+
+3. **Should we make intrinsics user-extensible?** Could users add their own
+   intrinsics via a `.zerdata` registry without rebuilding zerc? Where does
+   safety classification live?
+
+4. **What about raw bytes?** When GCC won't even accept an instruction mnemonic,
+   how does the user proceed? Two-language (cinclude C) or pure ZER?
+
+5. **Should we go fully manual (drop GCC probing)?** If GCC limits us, can we
+   escape by hardcoding tables ourselves?
+
+The session worked through each empirically (testing real toolchains in Docker,
+not just doc claims). The answers shape Stage 4 work and clarify scope decisions.
+
+### Empirical proof: 3-arch end-to-end (2026-04-29)
+
+The framework's universality was tested by actually running the pipeline against
+every supported architecture, with GCC probes producing real ELF output:
+
+| Arch | Toolchain | Registers Probed | Status |
+|---|---|---|---|
+| x86_64 (base) | gcc 13.4 native | 105 valid (213 candidates) | DONE since F2/F3 |
+| x86_64 + AVX-512F | gcc 13.4 + `-mavx512f -mavx512vl -mavx512bw` | 161 valid (+56 over base) | DONE since C4-min |
+| aarch64 (base) | aarch64-linux-gnu-gcc 12.2 | 58 valid | DONE earlier session |
+| riscv64 (base) | riscv64-linux-gnu-gcc 12.2 | 126 valid (3 rejected: x8/s0/fp = frame ptr) | DONE this session (F6-min) |
+
+Each tested through the full chain:
+1. ZER source → checker validates register names against vendored table
+2. Checker emits C with correct inline asm
+3. Cross-gcc compiles to native ELF for that arch
+4. `file` confirms produced ELF matches expected arch
+
+Results: **all 3 produce correct architecture-specific ELF objects.** The pipeline
+is universal across ISAs, not x86_64-specific.
+
+`tests/test_cross_arch.sh` runs this full chain on `make check`. Skips gracefully
+if cross-toolchains aren't installed.
+
+### Honest finding: AVX-512F is the only register-clobber-gated feature in GCC 13.4
+
+Probed every plausible candidate:
+
+| Feature | Probe result | Reason |
+|---|---|---|
+| AVX-512F | xmm16-31, ymm16-31, zmm16-31, k0-7 — 56 regs | EVEX encoding gated by `-mavx512f` |
+| AVX-512 sub-flags (VL/BW/DQ/CD) | Same 161 regs as F | All unlock EVEX register space |
+| AMX (`-mamx-tile`) | tmm0-7 REJECTED | Intel chose intrinsic-only via `<amxtileintrin.h>` |
+| SVE (`-march=armv8-a+sve`) | z0-31, p0-15 REJECTED | ARM chose intrinsic-only |
+| APX (`-mapxf`) | Flag unrecognized in GCC 13.4 | Requires GCC 14+ |
+| SHA, AES | No new register names | Add instructions, reuse xmm regs |
+
+**Conclusion**: register-clobber-gating is a rare GCC mechanism. AVX-512F is the
+canonical case today. Other extensions reach safety through intrinsics
+(130 already shipping). This isn't a framework gap — it's a vendor-and-toolchain
+design choice that ZER inherits and the intrinsic path correctly handles.
+
+### The two-axis architecture (locked in)
+
+The framework dispatches across two orthogonal axes:
+
+```
+ARCH AXIS                    FEATURE AXIS (clobber-gated)
+─────────                    ────────────────────────────
+x86_64 (105 regs)            base x86_64       (105 regs, no flag)
+aarch64 (58 regs)            x86_64 + AVX-512F (161 regs, -mavx512f)
+riscv64 (126 regs)           aarch64 base      (58 regs, no flag)
+                             riscv64 base      (126 regs, no flag)
+                             (no other GCC-gated feature exists today)
+```
+
+Both axes use identical pipeline: `scripts/gen_register_tables.sh` probes the
+appropriate GCC, vendors the output to `src/safety/asm_register_tables_*.c`,
+the dispatcher in `asm_register_lookup.c` selects the right table at call time.
+
+Adding a new arch (e.g., RV32GC, MIPS): one new candidates file + script run.
+Adding a new feature (e.g., GCC 14 APX): one new EXTRA_CFLAGS regen.
+
+### GCC dependency — bounded and managed
+
+A direct concern: "if GCC is the oracle, are we permanently bound to GCC's
+choices?" The dependency was mapped layer by layer:
+
+| Layer | GCC-dependent? | Why |
+|---|---|---|
+| Register validity in clobber lists | YES — GCC is oracle | Inline asm clobbers ARE a GCC concept. No spec for "what's a valid clobber name" — it's whatever GCC's backend accepts. |
+| Instruction enumeration (F4-F6) | NO | Capstone/XED/ARM XML/riscv-opcodes (vendor specs). |
+| Category classification (C1-C8) | NO | Manual rules in `.zerdata` files. ZER's safety semantics. |
+| Z-rules (10 wired) | NO | Hook into ZER's existing 29 safety systems. Pure compiler-side. |
+| Structural rules (S1-S4) | NO | naked-required, 16-instr limit, etc. — ZER syntax/AST. |
+| Strict mode framework | NO | All ZER-side. |
+| 130 intrinsics | Partially | Each emits specific GCC inline asm or `__builtin_*`. Could re-target to LLVM with mechanical port. Most builtins are stable across GCC and Clang since they follow Intel/ARM intrinsic naming conventions. |
+| Final ELF production | YES (but universal) | GCC compiles emitted C → ELF. Same dependency as ALL ZER code, not just asm. Every C/Rust/Zig program has this. Not a ZER-specific risk. |
+
+**Key insight**: the GCC dependency is concentrated in ONE specific layer (register
+clobber validation) plus the universal back-end (compiling C → ELF). Not "everything
+depends on GCC". Other layers are entirely ZER-side.
+
+### Why probing GCC is the RIGHT design (rejected: manual hardcoded tables)
+
+Considered alternatives and ruled them out:
+
+**Alternative A — Hardcode tables manually, abandon GCC probe.**
+- Pro: Independent of probe pipeline.
+- Con: We'd LIE to users when GCC rejects a "valid" register. Cryptic gcc errors.
+  Manual sync burden every GCC release. The actual limit (GCC compiles the output)
+  doesn't go away.
+- VERDICT: Strictly worse. Probe guarantees alignment with reality; manual tables drift.
+
+**Alternative B — Replace GCC entirely (use LLVM, write custom backend).**
+- Pro: Different compiler.
+- Con: Same kind of dependency — LLVM-bound instead. ~1500+ hrs work. Project
+  explicitly decided "emit-C permanently" (CLAUDE.md).
+- VERDICT: Out of scope and doesn't actually solve anything.
+
+**Alternative C — Multi-backend probe (GCC + Clang union).**
+- Pro: Wider coverage; some clobbers Clang accepts that GCC doesn't.
+- Con: ~14 hrs implementation + ongoing maintenance for marginal coverage gain.
+  Still doesn't unlock AMX/SVE (intrinsic-only on both compilers).
+- VERDICT: Defer until proven necessary. Single-backend GCC probe is sufficient
+  for v1.0.
+
+**Chosen: single-backend GCC probe.** The "GCC limit" is actually a feature, not
+a bug:
+
+```
+What ZER promises:  "If we say a register is valid, GCC will accept it."
+GCC-probe oracle:    Guarantees this is TRUE (probed against actual gcc).
+Manual hardcoded:    Risks promising registers GCC rejects → user gets cryptic
+                     gcc error after passing ZER's check.
+```
+
+GCC's clobber list IS updated per major release (~yearly): GCC 4.9 added AVX-512
+(2014), GCC 11 added AMX as intrinsic-only (2021), GCC 14 will add APX (~2024).
+**Our probe picks up updates automatically when users regenerate after a GCC
+upgrade. Zero compiler-team work to track GCC releases.**
+
+### User-extensible intrinsic registry — REJECTED (overengineering)
+
+A `.zerdata` system for runtime-loaded user-defined intrinsics was designed in
+detail (schema, loader, override flags, diagnostic tooling, test harness
+conventions) and then **rejected** as overengineering:
+
+| Cost of building it | ~50 hrs implementation + ongoing maintenance + misclassification trust burden |
+| Real users it serves | Niche: pre-release silicon engineers, custom SoC vendors, hobbyist research targets |
+| Existing path for these users | Patches to ZER (D-Alpha PR batches), `cinclude` for binary linking, asm block escape hatch |
+| Industry precedent | Rust, Zig, Go all keep intrinsics compiler-owned (not user-extensible). Reason: misclassification risk + maintenance burden outweigh niche-extensibility win. |
+
+**Decision**: intrinsics stay manual, hardcoded in checker.c, added via D-Alpha
+batches. New extensions reach users via compiler patch + release, same as every
+other safe systems language. The user-extensible runtime registry was a feature
+looking for a problem — designed in good faith, recognized as overengineering on
+review.
+
+What stays kept for `.zerdata` use: **instruction-level metadata for F4-F6 work**
+(per-instruction category bitmaps, operand constraints, vendor citations). That
+data is compiler-internal, vendored, NOT user-extensible. Same `.zerdata` format
+as designed in `docs/asm_preconditions_research.md`. Different scope.
+
+### Raw bytes / `.byte` — already handled, no new feature needed
+
+Initial concern: "what if GCC doesn't support an instruction we need?" Worked
+through the cases:
+
+| Scenario | Frequency | Solution today |
+|---|---|---|
+| Pre-release ISA extension (e.g., APX before GCC 14) | Rare (kernel mainline only) | `.byte` sequence in asm block. Works through existing strict mode. |
+| CPU erratum workaround | ~1-2 per arch per decade | Same as above. |
+| Custom SoC instruction | Vendor-niche | Same as above OR external assembler + cinclude binary linking. |
+| Brand-new arch (no GCC backend) | Out of scope | Same answer Rust/Zig give: contribute backend OR use different language for that target. |
+
+ZER's existing asm strict mode already provides:
+- Structural safety (naked, 16-instr limit, no labels, mandatory `safety:` field)
+- Z-rules through operand boundaries (when operands declared)
+- Surrounding code's safety unaffected
+- Audit trail (citation in safety field)
+
+What it correctly does NOT provide for raw bytes:
+- Operand-level safety (no operands typed if pure `.byte`)
+- Per-instruction category dispatch (instruction unknown to ZER)
+
+**Decision**: no new feature. The `instructions: ".byte 0x..., 0x..."` path
+through asm blocks is sufficient. The `raw_bytes:` field as syntactic sugar was
+considered (~3 hrs work) and deemed unnecessary — the existing string path is
+3 keystrokes longer, not a meaningful ergonomic win.
+
+### Intrinsic-byte vs asm-block-byte — intrinsic wins
+
+When raw bytes ARE genuinely needed (rare cases per above), comparison:
+
+| Property | `.byte` in asm block (user-side) | `.byte` in intrinsic (compiler-side, future D-Alpha) |
+|---|---|---|
+| Safety level | Structural only (naked, limit, audit) | Full: VRP + alignment + category + feature gating |
+| Operand checking | None — opaque bytes | YES — typed parameters validated |
+| Reusable across users | NO — each user reimplements | YES — defined once, called by name |
+| Auditable | Scattered across codebase | Centralized in compiler |
+| Upgradeable when GCC catches up | Each user must edit code | Compiler swap, zero user-code change |
+
+**Mental rule**: if two users might use this byte sequence, it goes in an
+intrinsic. If only one ever will, asm block is fine. The intrinsic path matches
+how Linux kernel handles it (`arch/x86/include/asm/special_insns.h` wraps raw
+asm in helper functions; kernel code calls the helpers, never writes raw asm
+directly).
+
+**Decision**: intrinsic-byte is the correct path for anything reusable; asm-block
+is the escape hatch for genuinely one-off code. Both are pure ZER (no cinclude
+required for raw bytes).
+
+### Final architecture (validated, locked in 2026-04-29)
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  AUTOMATED (probe + vendor)                                      │
+│  ───────────────────────                                         │
+│  - Per-arch register tables (3 archs proven: x86_64+aarch64+riscv64) │
+│  - Per-(arch,feature) tables (1 feature proven: AVX-512F)        │
+│  - Pipeline: scripts/gen_register_tables.sh                      │
+│  - Limited by: what GCC accepts as clobbers (auto-tracks updates)│
+│                                                                  │
+│  HYBRID (auto list + manual classification)                      │
+│  ──────────────────────────────────────────                      │
+│  - Per-arch instruction tables (Stage 4 / F4-F6 work, NOT YET)   │
+│  - List from: Capstone/XED/ARM-XML/riscv-opcodes                 │
+│  - Categories from: manual .zerdata classification               │
+│  - Limited by: vendor specs (what's in their databases)          │
+│                                                                  │
+│  MANUAL (compiler team)                                          │
+│  ─────────────────────                                           │
+│  - 130 intrinsics shipped, more via D-Alpha PR batches           │
+│  - Categories + constraints + emission per intrinsic             │
+│  - Limited by: ZER team capacity + GCC builtin support           │
+│                                                                  │
+│  USER ESCAPE HATCH (no compiler change needed)                   │
+│  ───────────────────────────────────────────                     │
+│  - asm { instructions: "..." } block — strict mode               │
+│  - .byte raw encodings inside asm block — structural safety only │
+│  - cinclude — link external compiled .o, binary boundary         │
+│  - Limited by: structural rules + user discipline                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### What this means for Stage 4 (next concrete work)
+
+The remaining D-Alpha-7.5 work, in priority order:
+
+1. **F4 — x86_64 instruction tables** (~30 hrs)
+   - Auto-extract from Capstone or XED database
+   - Manual `.zerdata` for category classification
+   - Vendor `src/safety/asm_instruction_table_x86_64.c`
+
+2. **F5 — ARM64 instruction tables** (~25 hrs)
+   - ARM XML database extract
+   - Manual `.zerdata` per arch
+   - Vendor `src/safety/asm_instruction_table_aarch64.c`
+
+3. **F6-extensions (later)** — RISC-V V vector extension if demand emerges
+   - F6-minimum (base ISA) DONE 2026-04-29
+   - V/Zfh/Zba/Zbb extensions deferred until needed
+
+4. **F7-full — Per-category enforcement** (~25 hrs)
+   - Wire C1 → VRP, C2 → alignment check, C5 → privilege context, etc.
+   - Each category fires its corresponding existing safety system at NODE_ASM check time
+
+5. **3 remaining Z-rules** (Z9, Z10, Z13) — forward-compat, blocked on S1 relaxation
+
+**Total Stage 4 remaining**: ~80 hrs. Closes 0 silent gaps directly (it's
+infrastructure for instruction-level safety) but unlocks Stage 5's System #30
+(atomic ordering, +1 gap closed).
+
+### Optional UX polish (deferred)
+
+A "spec-known, clobber-rejected" error message could guide users when they
+attempt to use AMX tile registers or SVE z-regs in asm blocks:
+
+```
+asm clobber 'tmm0' is an AMX register but GCC does not expose it for clobber
+lists (intrinsic-only). Use @cpu_amx_* intrinsics instead.
+```
+
+Cost: ~5 hrs to maintain a small "intrinsic-only" register list (~50 entries:
+AMX tiles, SVE z/p, SME za, etc.). Pure UX win — defer until users actually
+hit the cryptic "register not recognized" message and ask.
+
+### Why this architecture holds up
+
+The session validated the framework through repeated adversarial questioning.
+Every "what about X?" found that X was already handled or correctly out of scope:
+
+| Concern raised | Resolution |
+|---|---|
+| Framework only proven for AVX-512? | Proved across 3 archs end-to-end. AVX-512 is the only register-gated feature today by GCC's design. |
+| GCC-bound is fragile? | Probe auto-tracks GCC updates. Manual would be worse (drift). |
+| What if GCC doesn't support X? | `.byte` in asm block (existing path). Intrinsic wrapper for reusable cases. |
+| Need user-extensible intrinsics? | No — niche, overengineering, industry precedent (Rust/Zig/Go) keeps compiler-owned. |
+| Two-language risk (need cinclude)? | False alarm. Raw bytes via asm block stay pure ZER. cinclude only for binary linking. |
+| Should we go fully manual? | No. Manual drifts from reality; probe stays in sync. |
+| Sub-extensions unreachable? | Intrinsic path handles AMX/SVE/SME/RVV. Same as Linux kernel. |
+| Multi-backend (GCC + Clang)? | Defer. Single-backend probe is sufficient for v1.0. |
+
+**The architecture is correct. The empirical proof holds. Stop questioning the
+asm framework and move to F4 — that's where the real Stage 4 leverage lives.**
+
+### Files / tests added during this validation
+
+- `src/safety/asm_register_tables_riscv64.c` (vendored, 126 entries)
+- `src/safety/asm_register_lookup.c` (RISC-V dispatch added)
+- `src/safety/asm_register_tables.h` (riscv64 extern decl)
+- `scripts/candidates_riscv64.txt` (130 candidates)
+- `tests/test_cross_arch.sh` (3-arch end-to-end gate, runs in `make check`)
+- `tests/zer_fail/asm_aarch64_x86_reg.zer` (rax rejected on aarch64)
+- `tests/zer_fail/asm_riscv64_x86_reg.zer` (rax rejected on riscv64)
+- `tests/zer/asm_avx512_register.zer` (xmm16 with --target-features=avx512f)
+- `tests/zer_fail/asm_avx512_no_flag.zer` (xmm16 without flag rejected)
+- `tests/test_zer.sh` extended with `// zerc-flags:` directive parsing
+
+Plus this section in `docs/asm_plan.md`. Total session: ~6 hrs across architectural
+discussion + empirical proofs + commits to main.
+
+---
+
+*End of document. Last updated 2026-04-29 — Sub-Extension Architecture Validated.*

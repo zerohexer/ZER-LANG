@@ -2580,6 +2580,84 @@ directly).
 is the escape hatch for genuinely one-off code. Both are pure ZER (no cinclude
 required for raw bytes).
 
+### Adding clobber-gated extensions before GCC catches up
+
+A concrete pattern question came up: "what if we want to use a register
+that GCC doesn't yet accept in clobber lists?" — e.g., APX `r16`-`r31`
+before GCC 14 ships, or AMX `tmm0`-`tmm7` (intrinsic-only by Intel design).
+
+**Don't try to add the clobber name to ZER's table.** That would lie to
+users — ZER would say "valid", GCC would reject at compile time, user
+gets a cryptic gcc error after passing ZER's check.
+
+**Right answer: wrap raw bytes in a compiler-team intrinsic.**
+
+```c
+/* In emitter.c intrinsic dispatcher (D-Alpha batch). */
+case INTRIN_CPU_APX_INC: {
+    /* APX inc r16, REX2-encoded. GCC 13 doesn't accept "r16" clobber.
+     * Use "memory" clobber + raw bytes — both universally accepted.
+     * When GCC 14 ships, swap to mnemonic + "r16" clobber: user code
+     * unchanged, GCC gets better optimization info. */
+    emit(e, "__asm__ __volatile__(\".byte 0x62, 0xd4, 0xfc, 0x18, 0xff, 0xc0\\n\\t\"");
+    emit(e, " : \"+m\"(*("); emit_expr(e, args[0]); emit(e, "))");
+    emit(e, " : : \"memory\")");
+    break;
+}
+```
+
+User writes pure ZER:
+
+```zer
+@cpu_apx_inc(&counter);
+//   ↑ Full safety: VRP on operand, category dispatch, feature gating.
+//     User never sees the byte sequence. Compiles on GCC 13 today;
+//     gets better codegen on GCC 14 with zero source change.
+```
+
+**Why this works:**
+
+| Component | GCC's view |
+|---|---|
+| `"memory"` clobber | Universally accepted across all GCC versions |
+| `.byte 0x..., 0x...` directive | Encoded literally; GCC doesn't need to know the mnemonic |
+| `"+m"(*ptr)` operand | Standard memory constraint — works on every GCC |
+| `"r16"` (NOT used here) | Would be rejected by GCC 13; we don't claim it |
+
+ZER never claims to clobber a register name GCC rejects. The actual `r16`
+write is encoded in the byte sequence; GCC's assembler handles bytes
+without needing to recognize them as `r16`.
+
+**Compiler-team workflow** for adding clobber-gated extensions:
+
+1. Identify intrinsic surface (e.g., 10 intrinsics for APX GP-reg ops)
+2. Get byte encodings from vendor spec (Intel APX whitepaper, ARM ARM, etc.)
+3. Decide categories per intrinsic (C1 if value-range constrained, etc.)
+4. Implement in checker.c (validation) + emitter.c (raw byte emission)
+5. Add ZER_FEAT_<NAME> + CLI flag mapping to GCC's `-m<flag>` (when GCC ships)
+6. Negative test: `asm_<feat>_no_flag.zer` rejects without feature flag
+7. Positive test: `asm_<feat>_register.zer` with dead-branch pattern (compile, don't execute)
+8. Ship as next D-Alpha batch — typical effort ~5 hrs/intrinsic
+
+**Upgrade path** when GCC eventually adds the clobber: one-line swap in
+the intrinsic emit code, replacing `.byte` with the actual mnemonic and
+adding the proper register to the clobber list. User code unchanged. GCC
+gets accurate clobber info → better optimization. Pure win on next ZER
+release.
+
+**Same pattern Linux kernel uses** for new instructions before mainline
+GCC support — see `arch/x86/include/asm/special_insns.h` and similar
+helper files. Kernel code calls the helper functions; the raw `.byte` is
+isolated inside the helper. ZER's intrinsic mechanism is the equivalent
+for ZER source code.
+
+**For users (not compiler team) who need it now and can't wait:**
+1. Use asm block with `.byte` directly — gets structural safety only
+2. Submit PR to ZER for a proper intrinsic in next D-Alpha batch
+
+No `cinclude`-to-C required for raw bytes. The asm block is the user-side
+escape hatch; the intrinsic is the productionized version.
+
 ### Final architecture (validated, locked in 2026-04-29)
 
 ```

@@ -1,0 +1,13 @@
+// zerc-flags: --target-arch=riscv64
+// Negative: x86 register name MUST be rejected when targeting riscv64.
+// EXPECTED: compile error — register not recognized for riscv64.
+
+naked void wrong_arch() {
+    asm {
+        instructions: "li a0, 0"
+        clobbers: [ "rax" ]
+        safety: "rax is x86 — must fail under --target-arch=riscv64"
+    }
+}
+
+i32 main() { return 0; }

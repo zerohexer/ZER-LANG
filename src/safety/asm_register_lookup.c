@@ -70,7 +70,12 @@ int zer_asm_register_valid_with_features(
         return scan_table(zer_aarch64_registers, name, name_len);
     }
 
-    /* F6 will add riscv64 dispatch — same pattern. */
+    /* F6-minimum (2026-04-29): RISC-V base ISA. Vector and other
+     * sub-extensions added later via the same per-feature table pattern
+     * (mirrors x86_64 + AVX-512F). */
+    if (arch == ZER_ARCH_RISCV64) {
+        return scan_table(zer_riscv64_registers, name, name_len);
+    }
 
     return 0;
 }

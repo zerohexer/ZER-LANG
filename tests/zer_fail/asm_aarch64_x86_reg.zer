@@ -1,0 +1,13 @@
+// zerc-flags: --target-arch=aarch64
+// Negative: x86 register name MUST be rejected when targeting aarch64.
+// EXPECTED: compile error — register not recognized for aarch64.
+
+naked void wrong_arch() {
+    asm {
+        instructions: "mov x0, #0"
+        clobbers: [ "rax" ]
+        safety: "rax is x86 — must fail under --target-arch=aarch64"
+    }
+}
+
+i32 main() { return 0; }

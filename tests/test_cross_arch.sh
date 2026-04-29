@@ -31,7 +31,8 @@ run_cross_arch_test() {
     local clobber_list="$3"
     local instr="$4"
     local expected_elf="$5"
-    local name="cross_${arch}"
+    local label="${6:-}"   # optional 6th param: extra suffix on test name
+    local name="cross_${arch}${label:+_$label}"
 
     local src=$(mktemp --suffix=.zer)
     local emitted=$(mktemp --suffix=.c)
@@ -95,6 +96,16 @@ run_cross_arch_test \
     '[ "x0", "x1" ]' \
     "mov x0, #42" \
     "ARM aarch64"
+
+# aarch64 — F5 classified instruction (DMB barrier — C8 category)
+# Verifies the instruction-level dispatch on aarch64 picks up DMB and
+# doesn't false-reject. Cross-compiles to ARM ELF.
+run_cross_arch_test \
+    "aarch64" "aarch64-linux-gnu-gcc" \
+    '[ "memory" ]' \
+    "dmb sy" \
+    "ARM aarch64" \
+    "dmb_f5"
 
 # riscv64 — cross-gcc
 run_cross_arch_test \

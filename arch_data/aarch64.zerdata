@@ -1,0 +1,290 @@
+# ARM64 (aarch64) instruction safety metadata — F5 classification.
+#
+# F5 (2026-04-29): per-instruction safety classification for ARM64.
+# Same schema as F4 (x86_64); see arch_data/SCHEMA.md.
+#
+# ARM64 safety semantics differ from x86_64:
+#   - UDIV/SDIV do NOT trap on divide-by-zero (return 0). No C1 needed
+#     for these (unlike x86 DIV/IDIV which raise #DE).
+#   - LDXR/STXR (load-linked / store-conditional) pairs require C3
+#     state machine tracking — they're explicit LL/SC.
+#   - Most privileged operations go through MSR/MRS with system
+#     registers; specific system registers determine privilege level
+#     (EL0-EL3). For F5 we classify the obvious privileged forms.
+#   - Memory barriers DMB/DSB/ISB are C8 (memory ordering).
+#   - SVE registers (z0-z31, p0-p15, ffr) are intrinsic-only in current
+#     GCC clobber lists — instruction classification covers SVE ops too
+#     even though their registers can't be clobber-listed.
+#
+# Categories used:
+#   C3 — state machine (LDXR/STXR pairing)
+#   C4 — CPU feature (NEON, SVE, crypto, CRC32)
+#   C5 — privilege (kernel-only: MSR with system regs, ERET, HVC, SMC, etc.)
+#   C8 — memory order (DMB, DSB, ISB)
+
+schema_version = 1
+
+# =====================================================================
+# C3 — State machine (LL/SC exclusive monitor pairs, ~6 entries)
+# =====================================================================
+
+[ldxr]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = MEMORY
+category = C3_STATE_MACHINE
+source = "ARM ARM A64 LDXR"
+consequence = "LL portion of LL/SC; subsequent STXR must pair within state machine, otherwise the exclusive monitor is left set and other threads can spurious-fail their STXR"
+notes = "Followed by code that may modify the value, then STXR to commit atomically."
+
+[ldaxr]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = MEMORY
+category = C3_STATE_MACHINE
+source = "ARM ARM A64 LDAXR"
+consequence = "LL with acquire ordering; same pairing requirement as LDXR"
+
+[stxr]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY
+category = C3_STATE_MACHINE
+source = "ARM ARM A64 STXR"
+consequence = "SC portion of LL/SC; #UD-equivalent if no LDXR preceded; result in operand 0 indicates success/failure"
+
+[stlxr]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY
+category = C3_STATE_MACHINE
+source = "ARM ARM A64 STLXR"
+consequence = "SC with release ordering; must follow LDAXR"
+
+# =====================================================================
+# C4 — CPU feature samples (~10 entries)
+# =====================================================================
+
+[fadd]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 FADD"
+consequence = "requires FP or SIMD support (always present on aarch64 base profile)"
+notes = "Float add. ARMv8 base profile guarantees FP+SIMD; classification is informational."
+
+[fmul]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 FMUL"
+consequence = "requires FP/SIMD support"
+
+[aese]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 AESE"
+consequence = "#UD-equivalent if AES extension not enabled"
+notes = "AES single round encryption (FEAT_AES). Optional in older ARMv8."
+
+[aesd]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 AESD"
+consequence = "#UD-equivalent if AES extension not enabled"
+notes = "AES single round decryption."
+
+[sha256h]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 SHA256H"
+consequence = "#UD-equivalent if SHA2 extension not enabled"
+
+[crc32x]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = GP_REGISTER
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 CRC32X"
+consequence = "#UD-equivalent if CRC32 extension not enabled (FEAT_CRC32)"
+
+[ld1]
+operand_count = 2
+operand[0].type = SVE_VECTOR_REGISTER
+operand[1].type = MEMORY
+category = C4_CPU_FEATURE
+source = "ARM ARM A64 LD1 (vector)"
+consequence = "NEON load; requires Advanced SIMD (always on ARMv8 base)"
+notes = "Vector load. Distinct from SVE LD1 which is Z-register form."
+
+# =====================================================================
+# C5 — Privilege (kernel-only / EL1+, ~15 entries)
+# =====================================================================
+
+[eret]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "ARM ARM A64 ERET"
+consequence = "exception level demotion; UNDEFINED at EL0"
+notes = "Returns from exception. Restores PC from ELR_ELx, PSTATE from SPSR_ELx."
+
+[eretaa]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "ARM ARM A64 ERETAA"
+consequence = "ERET with pointer authentication (key A); UNDEFINED at EL0"
+
+[eretab]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "ARM ARM A64 ERETAB"
+consequence = "ERET with pointer authentication (key B); UNDEFINED at EL0"
+
+[hvc]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "ARM ARM A64 HVC"
+consequence = "hypervisor call; UNDEFINED at EL0/EL1 (requires HCR_EL2.HVC=1)"
+notes = "Traps to EL2 hypervisor."
+
+[smc]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "ARM ARM A64 SMC"
+consequence = "secure monitor call; UNDEFINED at EL0 (configurable at EL1)"
+notes = "Traps to EL3 secure monitor (TrustZone)."
+
+[brk]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "ARM ARM A64 BRK"
+consequence = "debug breakpoint; takes exception to EL1+"
+notes = "Software breakpoint instruction. Used by debuggers."
+
+[hlt]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "ARM ARM A64 HLT"
+consequence = "halt instruction; takes Halting Debug exception (DCPS)"
+
+[wfi]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "ARM ARM A64 WFI"
+consequence = "wait for interrupt; behaviour depends on EL and trap configuration"
+notes = "May trap to EL1 or EL2 if SCTLR_ELx.nTWI / HCR_EL2.TWI is set."
+
+[wfe]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "ARM ARM A64 WFE"
+consequence = "wait for event; same trap considerations as WFI"
+
+[at]
+operand_count = 2
+operand[0].type = IMMEDIATE
+operand[1].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "ARM ARM A64 AT"
+consequence = "address translation; UNDEFINED at EL0"
+notes = "Performs MMU table walk for an address. Used by kernel/hypervisor for VA→PA translation."
+
+[tlbi]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "ARM ARM A64 TLBI"
+consequence = "TLB invalidate; UNDEFINED at EL0 (FEAT_TLBIOS may relax)"
+notes = "Various TLB invalidation operations. Required after page table updates."
+
+[ic]
+operand_count = 2
+operand[0].type = IMMEDIATE
+operand[1].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "ARM ARM A64 IC"
+consequence = "instruction-cache maintenance; some forms allowed at EL0 (configurable)"
+
+[dc]
+operand_count = 2
+operand[0].type = IMMEDIATE
+operand[1].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "ARM ARM A64 DC"
+consequence = "data-cache maintenance; some forms (CIVAC, CVAC) configurable for EL0"
+notes = "Used by kernel for cache coherency around DMA, JIT, etc."
+
+[msr]
+operand_count = 2
+operand[0].type = IMMEDIATE
+operand[1].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "ARM ARM A64 MSR (register)"
+consequence = "writes system register; UNDEFINED at EL0 for EL1+ system registers"
+notes = "Wide instruction — only some system registers are privileged. ZER conservatively flags as C5."
+
+[mrs]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "ARM ARM A64 MRS"
+consequence = "reads system register; some sysregs accessible at EL0"
+notes = "Conservatively classified as C5 — most useful sysregs are privileged."
+
+# =====================================================================
+# C8 — Memory ordering (~5 entries)
+# =====================================================================
+
+[dmb]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 DMB"
+consequence = "no enforcement today (Stage 5 / System #30); semantics: data memory barrier scoped by option"
+notes = "Options: SY (full), LD, ST, ISH (inner shareable), OSH (outer), NSH (non-shareable)."
+
+[dsb]
+operand_count = 1
+operand[0].type = IMMEDIATE
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 DSB"
+consequence = "data synchronization barrier; stricter than DMB (waits for completion)"
+
+[isb]
+operand_count = 0
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 ISB"
+consequence = "instruction synchronization barrier; flushes pipeline"
+notes = "Required after self-modifying code or system register writes that affect execution."
+
+[sev]
+operand_count = 0
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 SEV"
+consequence = "send event hint; wakes WFE-waiting cores"
+notes = "Used in spinlock release patterns paired with WFE."
+
+[sevl]
+operand_count = 0
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 SEVL"
+consequence = "send event local; sets event register on this core only"

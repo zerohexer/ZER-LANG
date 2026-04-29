@@ -69,11 +69,12 @@ uint32_t zer_asm_category(ZerArchId arch, const char *insn, size_t insn_len) {
     const ZerInstructionEntry *entry = 0;
     if (arch == ZER_ARCH_X86_64) {
         entry = scan_table(zer_x86_64_instructions, insn, insn_len);
+    } else if (arch == ZER_ARCH_AARCH64) {
+        entry = scan_table(zer_aarch64_instructions, insn, insn_len);
     }
-    /* aarch64 / riscv64 instruction tables are F5 / F6 work — currently
-     * empty. Lookup falls through to "no category" (return 0), which
-     * means no per-instruction safety dispatch fires. Structural rules
-     * + Z-rules still apply. */
+    /* riscv64 instruction table is F6 work (registers DONE F6-min,
+     * instructions pending). Lookup falls through to "no category" —
+     * structural rules + Z-rules still apply. */
     if (entry == 0) {
         return 0;
     }
@@ -106,6 +107,8 @@ int zer_asm_instruction_info(
     const ZerInstructionEntry *entry = 0;
     if (arch == ZER_ARCH_X86_64) {
         entry = scan_table(zer_x86_64_instructions, mnemonic, mnemonic_len);
+    } else if (arch == ZER_ARCH_AARCH64) {
+        entry = scan_table(zer_aarch64_instructions, mnemonic, mnemonic_len);
     }
     if (entry == 0) {
         return 0;

@@ -45,6 +45,13 @@ typedef struct {
 extern const ZerInstructionEntry zer_x86_64_instructions[];
 extern const size_t zer_x86_64_instruction_count;
 
+/* F5 (2026-04-29): aarch64 instruction table — 31 safety-relevant
+ * entries spanning C3 (LL/SC pairs), C4 (NEON/AES/SHA/CRC features),
+ * C5 (privileged: ERET, HVC, SMC, MSR, AT, TLBI, etc.), and C8 (DMB,
+ * DSB, ISB barriers). Generated from arch_data/aarch64.zerdata. */
+extern const ZerInstructionEntry zer_aarch64_instructions[];
+extern const size_t zer_aarch64_instruction_count;
+
 /* Diagnostic info for a matched instruction. Populated by extended lookup
  * variant when caller wants the citation/consequence for error messages. */
 typedef struct {

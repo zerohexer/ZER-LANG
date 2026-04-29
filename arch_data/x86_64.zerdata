@@ -1,0 +1,149 @@
+# x86_64 instruction safety metadata — F4 gold set (10 instructions).
+#
+# This is the F4.1 starter set: 10 instructions that exercise every safety
+# category except C7 (provenance, requires more infrastructure) and C8
+# (memory order, deferred to System #30 / Stage 5).
+#
+# F4.2 will expand to ~1500 instructions via Capstone/XED auto-extraction
+# plus class-based classification rules. This gold set proves the pipeline
+# works end-to-end before mass classification.
+#
+# Categories used here:
+#   C1 — value range (BSR/BSF on zero, DIV by zero, IDIV overflow)
+#   C2 — alignment (MOVAPS/MOVDQA require 16-byte alignment)
+#   C3 — state machine (MONITOR + MWAIT pairing)
+#   C4 — CPU feature (VPXORQ requires AVX-512F)
+#   C5 — privilege (WRMSR, RDMSR, INVLPG, HLT)
+
+schema_version = 1
+
+# =====================================================================
+# C1 — Value range
+# =====================================================================
+
+[bsr]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[1].constraint = NONZERO
+category = C1_VALUE_RANGE
+source = "Intel SDM Vol 2A BSR"
+consequence = "silent UB: destination undefined when source is zero"
+notes = "BSF has identical safety contract."
+
+[bsf]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[1].constraint = NONZERO
+category = C1_VALUE_RANGE
+source = "Intel SDM Vol 2A BSF"
+consequence = "silent UB: destination undefined when source is zero"
+
+[div]
+operand_count = 1
+operand[0].type = GP_REGISTER
+operand[0].constraint = NONZERO
+category = C1_VALUE_RANGE
+source = "Intel SDM Vol 2A DIV"
+consequence = "#DE divide-by-zero exception"
+notes = "Implicit operands: AX/DX:AX/EDX:EAX/RDX:RAX as dividend (size-dependent)."
+
+[idiv]
+operand_count = 1
+operand[0].type = GP_REGISTER
+operand[0].constraint = COMPOUND(NONZERO, NOT_OVERFLOW_MIN_DIV_NEG_ONE)
+category = C1_VALUE_RANGE
+source = "Intel SDM Vol 2A IDIV"
+consequence = "#DE on divide-by-zero OR INT_MIN/-1 overflow"
+notes = "INT_MIN/-1 overflows because result (INT_MAX+1) doesn't fit in destination."
+
+# =====================================================================
+# C2 — Alignment
+# =====================================================================
+
+[movaps]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(16)
+category = C2_ALIGNMENT
+required_features = SSE
+source = "Intel SDM Vol 2B MOVAPS"
+consequence = "#GP fault on misaligned memory operand"
+
+[movdqa]
+operand_count = 2
+operand[0].type = XMM_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(16)
+category = C2_ALIGNMENT
+required_features = SSE2
+source = "Intel SDM Vol 2B MOVDQA"
+consequence = "#GP fault on misaligned memory operand"
+notes = "MOVDQU is the unaligned variant; ZER doesn't classify it (no constraint to enforce)."
+
+# =====================================================================
+# C3 — State machine + C5 — Privilege (MONITOR/MWAIT)
+# =====================================================================
+
+[monitor]
+operand_count = 0
+category = C3_STATE_MACHINE + C5_PRIVILEGE
+source = "Intel SDM Vol 2B MONITOR"
+consequence = "#GP fault if executed at CPL > 0; subsequent MWAIT must pair within state machine"
+notes = "Implicit operands: RAX (linear address), RCX (extensions), RDX (hints). MWAIT pairing tracked by Model 1 (C3 state machine)."
+
+[mwait]
+operand_count = 0
+category = C3_STATE_MACHINE + C5_PRIVILEGE
+source = "Intel SDM Vol 2B MWAIT"
+consequence = "#GP fault if executed at CPL > 0; #UD if MONITOR not preceding"
+notes = "Must be preceded by MONITOR setting up the address watch."
+
+# =====================================================================
+# C4 — CPU feature (AVX-512F)
+# =====================================================================
+
+[vpxorq]
+operand_count = 3
+operand[0].type = ZMM_REGISTER
+operand[1].type = ZMM_REGISTER
+operand[2].type = ZMM_REGISTER
+category = C4_CPU_FEATURE
+required_features = AVX512F
+source = "Intel SDM Vol 2C VPXORQ"
+consequence = "#UD fault if AVX-512F not enabled at runtime"
+
+# =====================================================================
+# C5 — Privilege (kernel-only)
+# =====================================================================
+
+[wrmsr]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2B WRMSR"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Implicit operands: ECX (MSR index), EDX:EAX (value). Must be in naked function with kernel context."
+
+[rdmsr]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2B RDMSR"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Implicit operands: ECX (MSR index in), EDX:EAX (value out)."
+
+[invlpg]
+operand_count = 1
+operand[0].type = MEMORY
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A INVLPG"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Invalidates TLB entry for the linear address in the memory operand."
+
+[hlt]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "Intel SDM Vol 2A HLT"
+consequence = "#GP fault if executed at CPL > 0"
+notes = "Halts CPU until next external interrupt. Common in idle loops."

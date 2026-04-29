@@ -1,0 +1,21 @@
+// F4 positive: BSR is a C1 (value-range) instruction. The category
+// is dispatched via the instruction table but C1 (value-range)
+// checking against operands is deferred to F4.2 / F7-full.
+// For now: just verify BSR compiles cleanly through the dispatch
+// pipeline (no false-positive errors from the new lookup).
+//
+// Intel SDM Vol 2A BSR: "silent UB: destination undefined when source is zero"
+
+naked void bsr_test() {
+    asm {
+        instructions: "bsr %%rax, %%rbx"
+        clobbers: [ "rbx" ]
+        safety: "BSR through F4 dispatch — verifies pipeline doesn't reject known instructions"
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { bsr_test(); }
+    return 0;
+}

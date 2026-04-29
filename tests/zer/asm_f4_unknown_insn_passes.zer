@@ -1,0 +1,21 @@
+// F4 positive: instructions not in the gold set table fall through
+// gracefully (no category dispatch fires). Verifies the F4 lookup
+// doesn't cause false positives for the ~1500 instructions not yet
+// classified.
+//
+// `add` is a basic instruction not in the F4.1 gold set.
+// F4.2 will add it (C0/uncategorized — basic ops have no preconditions).
+
+naked void basic_add() {
+    asm {
+        instructions: "addq $1, %%rax"
+        clobbers: [ "rax" ]
+        safety: "ADD instruction not in F4.1 gold set — graceful fall-through expected"
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { basic_add(); }
+    return 0;
+}

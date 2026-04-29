@@ -1281,6 +1281,64 @@ This was the **foundation for Stages 4-5** — F4-F6 instruction-table
 walkers and Session G atomic-ordering CFG walker now ADD new walkers
 under -Wswitch discipline so they don't reintroduce the gap class.
 
+## Stage 3 COMPLETE 2026-04-28 — Fixed-buffer cleanup + CI linter (Gap 35)
+
+`tools/audit_fixed_buffers.sh` (NEW 2026-04-28) flags new fixed-size
+buffer declarations in compiler internals against
+`tools/fixed_buffer_baseline.txt`. CI gate runs in `make check`.
+**Audit matches on file:content** (line-number-agnostic, since 2026-04-29
+fix) — survives any source edit that doesn't change the buffer
+declaration itself.
+
+Stage 3 conversions (4 sites + 1 audit fix):
+- `keep_checks[8]` / `ld_nodes[8]` (Gap 35) — stack-first 8 + arena overflow doubling
+- `build_expr_key stack_buf[512]` — replaced with two-pass measure-then-fill (no buffer)
+- `ir_extract_compound_key stack_buf[256]` — same two-pass approach
+- `Node *stack[64]` AST walker — stack-first 64 + ZER_STK_RESERVE macro
+
+If you add a new fixed-size buffer and the audit complains: either
+convert to stack-first dynamic OR add a one-line justification + the
+content line to `tools/fixed_buffer_baseline.txt`. Don't increase
+constants in fixed buffers — the rule is "stack fast path, arena overflow".
+
+## Stage 4 IN PROGRESS — D-Alpha-7.5 asm safety completion
+
+**As of 2026-04-29:**
+
+| Sub-stage | Status | What was done |
+|---|---|---|
+| Sub-extension architecture | VALIDATED 2026-04-29 | 3-arch end-to-end empirical proof (x86_64 + aarch64 + riscv64). F6-minimum (riscv64 register table, 126 entries). All 4 design alternatives evaluated and rejected. |
+| F4.1 Pipeline | DONE 2026-04-29 | `arch_data/SCHEMA.md` + `arch_data/x86_64.zerdata` + `scripts/gen_instruction_table.sh` + vendored `src/safety/asm_instruction_table_x86_64.c` + checker NODE_ASM dispatch (C4 gate firing) |
+| F4.2 Mass classification | DONE 2026-04-29 | 51 safety-relevant x86_64 instructions classified across C1-C5 + C8. 14 CPU feature flags wired (was 1: AVX512F only). |
+| F4.3 (full ALU/branch coverage) | DEFERRED | Basic ops have no preconditions; lookup correctly falls through. ~1500 entries with category=NONE = no safety value. Skip until concrete need. |
+| F5 aarch64 instruction tables | NEXT | Same recipe (Capstone/ARM XML extract + manual `.zerdata` classification + vendored `.c` + checker dispatch). ~25 hrs. |
+| F6-instructions riscv64 | PENDING | Registers DONE (F6-min). Instruction tables ~15 hrs. |
+| F7-full per-category enforcement | PENDING | Wire C1→VRP, C2→alignment check, C3→state machine. ~25 hrs. |
+| Z9/Z10/Z13 forward-compat | PENDING | Blocked on S1 relaxation. Included in F7-full estimate. |
+
+**Current F4 dispatch fires:**
+- C4 (CPU feature) — checked against `--target-features=` bitmap
+- C5 (privilege) — informational only today; naked-only restriction (S1) provides v1.0 guard
+
+**C1/C2/C3/C8 are CLASSIFIED but NOT YET ENFORCED** — operand-binding
+infrastructure for VRP/alignment/state-machine dispatch ships in F7-full.
+Today these categories are recorded for future use; the data is correct.
+
+**`.zerdata` is compiler-internal, vendored, NOT user-extensible** —
+this design decision was made 2026-04-29 after evaluating and rejecting
+the user-extensible runtime registry approach. See `docs/asm_plan.md`
+"Sub-Extension Architecture — Validated 2026-04-29" for full rationale.
+
+**CLI flags added in F4.2:** `--target-features=` accepts comma-separated
+list including: avx512f, sse, sse2, avx, avx2, aes, sha, bmi1, bmi2,
+lzcnt, popcnt, invpcid, pku, xsave, smap. Each match sets a bitmap flag
+AND appends `-m<flag>` to GCC. Baseline x86_64 default: SSE | SSE2.
+
+**For fresh sessions touching asm safety:**
+- Read `docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29" section
+- The architecture decisions there are LOCKED IN — don't re-litigate
+- F4.2 + F5 + F6 are mechanical data entry from vendor specs, not design work
+
 ## Spawning Agents That Write ZER Code — MANDATORY
 
 When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:

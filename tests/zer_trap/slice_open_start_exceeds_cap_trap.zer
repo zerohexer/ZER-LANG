@@ -1,0 +1,15 @@
+// Regression guard for arr[start..] silent underflow.
+// MUST compile clean + trap at runtime with "slice start > len".
+// Open-ended form arr[start..] computed `obj.len - start` directly. If
+// `start > obj.len`, the result wrapped in size_t arithmetic to a huge
+// value, so the resulting slice claimed it spanned the whole address
+// space. Without the start <= len check this is silent OOB.
+
+i32 main() {
+    u8[10] arr;
+    u32 start = 50;
+    for (u32 k = 0; k < 1; k += 1) { start = 50; }
+    [*]u8 sub = arr[start..];  // start > arr.len (10) — must trap
+    if (sub.len > 0) { return 1; }
+    return 0;
+}

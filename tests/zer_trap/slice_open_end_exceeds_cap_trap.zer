@@ -1,0 +1,14 @@
+// Regression guard for arr[..end] silent overrun.
+// MUST compile clean + trap at runtime with "slice end > len".
+// Open-ended form arr[..end] used `end` directly as the slice length
+// without any check that `end <= obj.len`. A user-controlled end value
+// produced an oversized slice header.
+
+i32 main() {
+    u8[10] arr;
+    u32 end = 50;
+    for (u32 k = 0; k < 1; k += 1) { end = 50; }
+    [*]u8 sub = arr[..end];  // end > arr.len (10) — must trap
+    if (sub.len > 0) { return 1; }
+    return 0;
+}

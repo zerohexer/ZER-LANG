@@ -1,0 +1,33 @@
+// Regression: string literal `.len` must reflect emitted byte count
+// after escape resolution, not the raw source-char count.
+//
+// Before fix: parser stored `length = source_chars - 2 (quotes)`. A
+// literal like "\n" is 2 source chars but 1 emitted byte; "\xFF" is
+// 4 source chars but 1 emitted byte. The bounds check trusted
+// `slice.len`, so reading s[1] for "\n" or s[3] for "\xFF" appeared
+// safe yet read past the actual string bytes — silent OOB.
+//
+// Fix: emit `sizeof("...") - 1` so the C compiler resolves escapes
+// at compile time and the slice carries the true byte count.
+
+i32 main() {
+    const [*]u8 a = "\n";
+    if (a.len != 1) { return 1; }     // 1 emitted byte
+
+    const [*]u8 b = "\xFF";
+    if (b.len != 1) { return 2; }     // 1 emitted byte
+
+    const [*]u8 c = "\t\n";
+    if (c.len != 2) { return 3; }     // 2 emitted bytes
+
+    const [*]u8 d = "ab";
+    if (d.len != 2) { return 4; }     // unchanged
+
+    const [*]u8 e = "";
+    if (e.len != 0) { return 5; }     // empty unchanged
+
+    const [*]u8 f = "ab\n";
+    if (f.len != 3) { return 6; }     // 3 emitted bytes
+
+    return 0;
+}

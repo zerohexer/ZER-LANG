@@ -1027,10 +1027,14 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_STRING_LIT:
-        /* emit as _zer_slice_u8 compound literal */
-        emit(e, "((_zer_slice_u8){ (uint8_t*)\"%.*s\", %zu })",
+        /* emit as _zer_slice_u8 compound literal.
+         * length = sizeof("...") - 1 so the C compiler resolves escape
+         * sequences at compile time. Source-char count overcounted ("\n"
+         * is 2 source chars / 1 emitted byte), letting bounds checks
+         * approve OOB reads on escape-bearing literals. */
+        emit(e, "((_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 })",
              (int)node->string_lit.length, node->string_lit.value,
-             node->string_lit.length);
+             (int)node->string_lit.length, node->string_lit.value);
         break;
 
     case NODE_CHAR_LIT:
@@ -2240,12 +2244,36 @@ static void emit_expr(Emitter *e, Node *node) {
                 else break;
             }
         }
-        /* runtime check: start <= end for variable indices */
+        /* Runtime check: start <= end <= cap for variable bounds.
+         *
+         * Silent-gap fix (audit 2026-04-30): the trigger formerly required BOTH
+         * `start` and `end` to be present and at least one non-constant. That
+         * missed three silent OOB shapes:
+         *   - `arr[start..]` with var `start > arr.len` → `len = cap - start`
+         *     underflowed in `size_t`, producing a slice claiming the whole
+         *     address space.
+         *   - `arr[..end]` with var `end > arr.len` → `len = end` exceeded
+         *     capacity with no check.
+         *   - `arr[a..b]` with `b > arr.len` → only `a > b` was checked.
+         * For slices (TYPE_SLICE) the capacity is dynamic, so even constant
+         * bounds need a runtime check; the checker only catches the array
+         * case at compile time. */
+        bool obj_is_slice_early = obj_type && obj_type->kind == TYPE_SLICE;
         bool slice_needs_runtime_check = false;
-        if (node->slice.start && node->slice.end && !type_is_integer(obj_type)) {
-            int64_t sv = eval_const_expr(node->slice.start);
-            int64_t ev = eval_const_expr(node->slice.end);
-            if (sv == CONST_EVAL_FAIL || ev == CONST_EVAL_FAIL) slice_needs_runtime_check = true;
+        if (!type_is_integer(obj_type)) {
+            if (node->slice.start) {
+                int64_t v = eval_const_expr(node->slice.start);
+                if (v == CONST_EVAL_FAIL) slice_needs_runtime_check = true;
+            }
+            if (node->slice.end) {
+                int64_t v = eval_const_expr(node->slice.end);
+                if (v == CONST_EVAL_FAIL) slice_needs_runtime_check = true;
+            }
+            /* Slices (dynamic cap): any specified bound needs runtime cap
+             * verification even if literal-constant. */
+            if (obj_is_slice_early && (node->slice.start || node->slice.end)) {
+                slice_needs_runtime_check = true;
+            }
         }
 
         /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
@@ -2348,19 +2376,61 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             emit(e, " }; })");
         } else if (slice_needs_runtime_check) {
-            /* BUG-262: hoist start/end into temps for single evaluation */
+            /* BUG-262: hoist start/end into temps for single evaluation.
+             * Silent-gap fix (audit 2026-04-30): handle open-ended forms
+             * (`arr[start..]`, `arr[..end]`) and verify `end <= cap` and
+             * `start <= cap`, not just `start <= end`. Hoist the object
+             * into a temp so cap (`obj.len` for slices) is read once. */
             int sl_tmp = e->temp_count++;
-            emit(e, "({ size_t _zer_ss%d = (size_t)(", sl_tmp);
-            emit_expr(e, node->slice.start);
-            emit(e, "); size_t _zer_se%d = (size_t)(", sl_tmp);
-            emit_expr(e, node->slice.end);
-            emit(e, "); if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); (", sl_tmp, sl_tmp);
+            bool is_array = obj_type && obj_type->kind == TYPE_ARRAY;
+            emit(e, "({ ");
+            if (obj_is_slice) {
+                /* Hoist slice object so .len is single-evaluation. */
+                emit(e, "__typeof__(");
+                emit_expr(e, node->slice.object);
+                emit(e, ") _zer_so%d = ", sl_tmp);
+                emit_expr(e, node->slice.object);
+                emit(e, "; size_t _zer_cap%d = _zer_so%d.len; ", sl_tmp, sl_tmp);
+            } else if (is_array) {
+                emit(e, "size_t _zer_cap%d = %llu; ", sl_tmp,
+                     (unsigned long long)obj_type->array.size);
+            } else {
+                /* Defensive fallback (e.g., unusual obj). Use 0 cap so any
+                 * non-zero bound traps. */
+                emit(e, "size_t _zer_cap%d = 0; ", sl_tmp);
+            }
+            emit(e, "size_t _zer_ss%d = ", sl_tmp);
+            if (node->slice.start) {
+                emit(e, "(size_t)(");
+                emit_expr(e, node->slice.start);
+                emit(e, ")");
+            } else {
+                emit(e, "0");
+            }
+            emit(e, "; size_t _zer_se%d = ", sl_tmp);
+            if (node->slice.end) {
+                emit(e, "(size_t)(");
+                emit_expr(e, node->slice.end);
+                emit(e, ")");
+            } else {
+                emit(e, "_zer_cap%d", sl_tmp);
+            }
+            emit(e, "; ");
+            emit(e, "if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); ",
+                 sl_tmp, sl_tmp);
+            emit(e, "if (_zer_se%d > _zer_cap%d) _zer_trap(\"slice end > len\", __FILE__, __LINE__); ",
+                 sl_tmp, sl_tmp);
+            emit(e, "(");
             emit_type(e, type_slice(e->arena, obj_type->kind == TYPE_ARRAY ?
                 obj_type->array.inner : obj_type->slice.inner));
             emit(e, "){ &(");
-            emit_expr(e, node->slice.object);
-            if (obj_is_slice) emit(e, ".ptr");
-            emit(e, ")[_zer_ss%d], _zer_se%d - _zer_ss%d }; })", sl_tmp, sl_tmp, sl_tmp);
+            if (obj_is_slice) {
+                emit(e, "_zer_so%d.ptr", sl_tmp);
+            } else {
+                emit_expr(e, node->slice.object);
+            }
+            emit(e, ")[_zer_ss%d], _zer_se%d - _zer_ss%d }; })",
+                 sl_tmp, sl_tmp, sl_tmp);
         } else {
             /* normal path — no side effects in object */
             emit(e, "&(");
@@ -5227,9 +5297,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         emit(e, "0");
         return;
     case NODE_STRING_LIT:
-        emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", %u }",
+        /* sizeof("...") - 1 so C resolves escapes; source-char count
+         * was off-by-many for any escape sequence, silently inflating
+         * .len past actual byte count. */
+        emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 }",
              (int)node->string_lit.length, node->string_lit.value,
-             (unsigned)node->string_lit.length);
+             (int)node->string_lit.length, node->string_lit.value);
         return;
 
     case NODE_BINARY: {
@@ -7884,10 +7957,31 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         }
         bool obj_slice = obj_eff && obj_eff->kind == TYPE_SLICE;
         /* Single-eval via GCC statement expression: hoist start/end to temps
-         * so subtraction (end - start) reuses the temps, not re-evaluates exprs. */
+         * so subtraction (end - start) reuses the temps, not re-evaluates exprs.
+         *
+         * Silent-gap fix (audit 2026-04-30): also verify `start <= cap` and
+         * `end <= cap` to catch:
+         *   - arr[start..]   with start > cap → underflow in `cap - start`
+         *   - arr[..end]     with end > cap   → no check
+         *   - arr[a..b]      with b > cap     → only `a > b` was checked
+         * Cap = `obj.len` for slices, `array.size` for arrays. Hoist obj for
+         * slices so .len is read once.
+         *
+         * `bounds_present` decides whether to emit traps. When neither start
+         * nor end is given (full slice `arr[..]`), no bounds work to do. */
+        bool bounds_present = node->slice.start || node->slice.end;
         if (obj_slice) {
             int t = e->temp_count++;
             emit(e, "({ ");
+            /* Hoist obj so .len is single-evaluation (its type matches the
+             * slice we're producing — same .ptr / .len shape). */
+            if (bounds_present) {
+                emit(e, "__typeof__(");
+                emit_rewritten_node(e, node->slice.object, func);
+                emit(e, ") _zer_so%d = ", t);
+                emit_rewritten_node(e, node->slice.object, func);
+                emit(e, "; size_t _zer_cap%d = _zer_so%d.len; ", t, t);
+            }
             if (node->slice.start) {
                 emit(e, "size_t _zer_ss%d = (size_t)(", t);
                 emit_rewritten_node(e, node->slice.start, func);
@@ -7898,16 +7992,27 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->slice.end, func);
                 emit(e, "); ");
             }
-            /* Phase 3 fix: trap on start > end (would underflow size_t
-             * subtraction). Ported from AST emit_expr line 2258. */
+            /* Trap conditions:
+             *   - explicit start && end: start > end (would underflow)
+             *   - any explicit end: end > cap
+             *   - explicit start (and no end → end := cap): start > cap (= start > end)
+             */
             if (node->slice.start && node->slice.end) {
                 emit(e, "if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); ",
+                     t, t);
+            }
+            if (node->slice.end) {
+                emit(e, "if (_zer_se%d > _zer_cap%d) _zer_trap(\"slice end > len\", __FILE__, __LINE__); ",
+                     t, t);
+            } else if (node->slice.start) {
+                emit(e, "if (_zer_ss%d > _zer_cap%d) _zer_trap(\"slice start > len\", __FILE__, __LINE__); ",
                      t, t);
             }
             emit(e, "(");
             emit_type(e, obj_type);
             emit(e, "){ &(");
-            emit_rewritten_node(e, node->slice.object, func);
+            if (bounds_present) emit(e, "_zer_so%d", t);
+            else emit_rewritten_node(e, node->slice.object, func);
             emit(e, ".ptr)[");
             if (node->slice.start) emit(e, "_zer_ss%d", t);
             else emit(e, "0");
@@ -7916,10 +8021,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, "_zer_se%d - _zer_ss%d", t, t);
             } else if (node->slice.end) {
                 emit(e, "_zer_se%d", t);
+            } else if (node->slice.start) {
+                emit(e, "_zer_cap%d - _zer_ss%d", t, t);
             } else {
                 emit_rewritten_node(e, node->slice.object, func);
                 emit(e, ".len");
-                if (node->slice.start) emit(e, " - _zer_ss%d", t);
             }
             emit(e, " }; })");
         } else {
@@ -7928,6 +8034,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Type *elem = arr_type && arr_type->kind == TYPE_ARRAY ? arr_type->array.inner : NULL;
             if (elem) {
                 int t = e->temp_count++;
+                unsigned arr_cap = (unsigned)arr_type->array.size;
                 emit(e, "({ ");
                 if (node->slice.start) {
                     emit(e, "size_t _zer_ss%d = (size_t)(", t);
@@ -7939,11 +8046,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, node->slice.end, func);
                     emit(e, "); ");
                 }
-                /* Phase 3 fix: trap on start > end (would underflow
-                 * size_t subtraction). Ported from AST emit_expr line 2258. */
                 if (node->slice.start && node->slice.end) {
                     emit(e, "if (_zer_ss%d > _zer_se%d) _zer_trap(\"slice start > end\", __FILE__, __LINE__); ",
                          t, t);
+                }
+                if (node->slice.end) {
+                    emit(e, "if (_zer_se%d > %uu) _zer_trap(\"slice end > len\", __FILE__, __LINE__); ",
+                         t, arr_cap);
+                } else if (node->slice.start) {
+                    emit(e, "if (_zer_ss%d > %uu) _zer_trap(\"slice start > len\", __FILE__, __LINE__); ",
+                         t, arr_cap);
                 }
                 emit(e, "((");
                 emit_type(e, type_slice(e->arena, elem));
@@ -7957,9 +8069,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit(e, "_zer_se%d - _zer_ss%d", t, t);
                 } else if (node->slice.end) {
                     emit(e, "_zer_se%d", t);
+                } else if (node->slice.start) {
+                    emit(e, "%uu - _zer_ss%d", arr_cap, t);
                 } else {
-                    emit(e, "%u", arr_type->kind == TYPE_ARRAY ? (unsigned)arr_type->array.size : 0);
-                    if (node->slice.start) emit(e, " - _zer_ss%d", t);
+                    emit(e, "%uu", arr_cap);
                 }
                 emit(e, " }); })");
             } else {
@@ -9252,9 +9365,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "%.17g", inst->literal_float);
                 break;
             case 2: /* string */
-                emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", %u }",
+                /* sizeof("...") - 1 so C resolves escapes; source-char
+                 * count overcounted (silent OOB on bounds-checked
+                 * reads of escape-bearing literals). */
+                emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 }",
                      (int)inst->literal_str_len, inst->literal_str,
-                     inst->literal_str_len);
+                     (int)inst->literal_str_len, inst->literal_str);
                 break;
             case 3: /* bool */
                 emit(e, "%s", inst->literal_int ? "1" : "0");

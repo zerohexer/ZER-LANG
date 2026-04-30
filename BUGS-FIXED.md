@@ -5,6 +5,153 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-04-30 — Multi-agent silent-gap audit (slice bounds + string literal len)
+
+Four parallel audit agents reviewed the IR pipeline, emitter, checker, and
+technical debt across ~700K of compiler context. After verifying every
+finding against actual emission, four real silent gaps were closed and
+many false positives discarded. The agent reports (modulo divisor not
+proven nonzero, optional funcptr null call, IR_INDEX_WRITE TODO, etc.)
+were either already fixed in the audited code or covered by a different
+mechanism. The four real findings shared one root pattern: silent
+trust of a length value the runtime never bounded against actual
+storage, so the existing bounds checks rubber-stamped OOB reads.
+
+### BUG-647: Slice subrange `arr[a..b]` only checked `a > b`, never `b > cap` (HIGH silent)
+
+**Symptom:** `arr[a..b]` with `b > arr.len` (or `start > cap` in the
+open-ended forms) silently constructed a slice claiming to span more
+memory than the backing storage. Subsequent indexed reads (`sub[i]`)
+passed the inline `_zer_bounds_check` because the slice's reported
+`.len` was huge — yet the underlying bytes did not exist. On hosted,
+SIGSEGV typically eventually fired; on bare-metal this is silent
+corruption from adjacent memory regions.
+
+Three concrete shapes produced this gap:
+1. `arr[start..]` — `len` was computed as `cap - start` directly and
+   underflowed in `size_t` arithmetic when `start > cap`.
+2. `arr[..end]` — `len` was just `end`, with no comparison against `cap`.
+3. `arr[a..b]` — the existing runtime check only validated `a <= b`.
+
+**Root cause:** `slice_needs_runtime_check` in both `emit_expr` (AST
+path, `emitter.c:2244`) and `emit_rewritten_node` (IR path,
+`emitter.c:7942`) only fired when **both** `start` and `end` were
+present and at least one was non-constant. Open-ended forms
+(`arr[start..]`, `arr[..end]`) silently took the no-check "normal"
+path. And even when the runtime path did fire, it only emitted
+`if (start > end) trap` — never `if (end > cap) trap` or
+`if (start > cap) trap`.
+
+For slices (`TYPE_SLICE`) the capacity is dynamic (`obj.len`), so
+the checker's compile-time array-size check (`checker.c:5390`) cannot
+catch even constant out-of-range bounds — every specified bound on a
+slice needs a runtime cap verification.
+
+**Fix:**
+- Expanded the trigger so any non-constant bound, OR any specified
+  bound on a slice (dynamic cap), enables runtime checking.
+- Rewrote both NODE_SLICE handlers to compute `cap` (`obj.len` for
+  slices, `array.size` for arrays), hoist the slice object into a
+  local for single-evaluation, and emit:
+    - `if (start > end) trap("slice start > end")`
+    - `if (end > cap) trap("slice end > len")` when `end` is given
+    - `if (start > cap) trap("slice start > len")` when `start` is
+      given but `end` is omitted (covers `arr[start..]`)
+- Open-ended forms now consistently flow through the same single
+  evaluation + bounds-check block as closed forms.
+
+**Tests:** `tests/zer_trap/slice_open_start_exceeds_cap_trap.zer`,
+`slice_open_end_exceeds_cap_trap.zer`,
+`slice_end_exceeds_cap_trap.zer` — each compiles clean and traps at
+runtime with the appropriate message.
+
+**Files:** `emitter.c` (two NODE_SLICE handlers — emit_expr ~2247
+and emit_rewritten_node ~7958), three new trap-test files.
+
+### BUG-648: String literal `.len` reflected source-char count, not emitted bytes (HIGH silent)
+
+**Symptom:** A string literal containing escapes (`"\n"`, `"\xFF"`,
+`"\t\n"`, etc.) emitted a slice with `.len` set to the number of
+SOURCE characters between the quotes, not the actual byte count after
+GCC resolved the escapes. `"\n"` got `.len=2` but is 1 byte;
+`"\xFF"` got `.len=4` but is 1 byte; `"\t\n"` got `.len=4` but is 2
+bytes. Reading `s[i]` for `i ∈ [actual_bytes, .len)` passed the
+inline `_zer_bounds_check` (since `.len` claimed it was in range) and
+read past the actual string bytes — silent OOB, often catching the
+null terminator on hosted but reading adjacent `.rodata` bytes on
+bare-metal.
+
+**Root cause:** The lexer counted source characters and stored the
+quote-stripped length on `string_lit.length`. The emitter (three
+sites: `emit_expr` ~1029, the legacy AST emitter at ~5299, and the
+IR LITERAL handler at ~9368) used that field directly as the slice
+length. Escape sequences ranged from 2 to 6 source chars but emit
+1-3 bytes each — the field overcounted in every case except plain
+ASCII strings.
+
+**Fix:** Emit `sizeof("...") - 1` instead of the integer source
+count at all three sites. The C compiler resolves escapes at compile
+time, so `sizeof` returns the actual byte count + 1 (null
+terminator); subtracting 1 yields the real string length. GCC
+constant-folds this so there is zero runtime cost. The emitted
+string itself is unchanged — only the length expression differs.
+
+**Test:** `tests/zer/string_literal_escape_len.zer` — verifies
+`.len` matches actual byte count for `"\n"`, `"\xFF"`, `"\t\n"`,
+`"ab"`, `""`, and `"ab\n"`.
+
+**Files:** `emitter.c` lines 1029, 5299, 9368.
+
+### Why these gaps existed
+
+Both bugs share a meta-pattern documented in `docs/4-27-2026-gaps.md`:
+"silent trust of a length value the runtime never validated against
+actual storage." The bounds-check infrastructure was sound; the
+weakness was upstream — at slice construction (BUG-647) and string
+literal lowering (BUG-648). Future audits should always sanity-check
+that any value used as a length/size is verified against actual
+storage at the moment it crosses a trust boundary, not just at the
+moment it is read.
+
+The slice gap also illustrates the "symmetric pair drift" debt class:
+`emit_expr` and `emit_rewritten_node` are symmetric paths that lower
+the same AST node. The original `start > end` runtime trap (BUG-262)
+landed only in one path; the silent-gap fix here updates both
+together. A unified helper for slice emission would prevent future
+drift — left as deferred technical debt.
+
+### Verified-but-not-bugs (agent false positives)
+
+For future-session reference, several agent claims were investigated
+and found to be **non-issues** in the current code:
+
+- **Modulo `%=` skips var-divisor proof check.** False — `checker.c:3768`
+  covers BOTH `TOK_SLASHEQ` and `TOK_PERCENTEQ` in one branch with the
+  same range/`known_nonzero` lookup. Bug not present.
+- **`%` (binary) does not register `mark_proven` for variable divisor.**
+  False — `checker.c:2544` handles both `TOK_SLASH` and `TOK_PERCENT`
+  identically including the VRP `known_nonzero`/`min_val > 0` lookup
+  and the explicit `divisor not proven nonzero` error path.
+- **`IR_INDEX_WRITE` / `IR_DEREF_READ` emit `/* 3AC op N — TODO */`.**
+  Confirmed those handler stubs exist in `emitter.c:9579-9590`, but
+  `ir_lower.c` never emits those opcodes — Phase 8d collapsed
+  `IR_POOL_ALLOC` etc. to `IR_ASSIGN` and the same applies to the
+  read/write/decomp opcodes. The TODO branch is dead code that exists
+  only as forward-compat for future ops; current code paths route
+  through `IR_ASSIGN` / `IR_INDEX_READ` (which are implemented).
+- **Optional function-pointer null call silently dereferences.** False —
+  the checker rejects calls on `?*(args) -> R` typed expressions
+  outright; the user must `orelse default_fn` (or unwrap with `if`)
+  before calling.
+- **Arena allocation overflow in `off + size`.** Unreachable in practice:
+  `arena.alloc_slice(T, n)` requires `sizeof(T) * n` to fit in `size_t`
+  AND for the multiplication wrap result to be `<= a->capacity` AND
+  for the user to have created an arena with capacity near `SIZE_MAX`.
+  No realistic deployment hits all three. Filed as a future
+  hardening item, not a current silent gap.
+
+---
+
 ## Session 2026-04-29 — Stages 2B + 3 + Sub-extension Validation + F4.1 + F4.2
 
 **Massive multi-stage session.** Closed Stage 2 Part B (walker exhaustiveness

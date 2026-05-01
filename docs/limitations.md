@@ -29,23 +29,44 @@ or add a target-specific fault handler hook.
 
 (See also `docs/4-27-2026-gaps.md` Gap 9 for related discussion.)
 
-## OPEN — `@critical` indirect return via callee
+## ~~`@critical` indirect return via callee~~ (INVESTIGATED 2026-05-02 — not a bug)
 
-**Discovered:** 2026-05-01 audit. checker.c around lines 8983 and 10016.
+**Status:** Audit claim re-verified against actual emission and found
+to be incorrect. No fix needed.
 
-Direct `return`/`break`/`continue`/`goto` inside `@critical` is rejected.
-Calling a function whose body returns from the caller's perspective
-escapes `@critical` without re-enabling interrupts:
+**Original claim (from claude/cool-johnson-apebs branch audit):**
+calling a function from `@critical` lets the function's `return`
+"escape" the `@critical` block without re-enabling interrupts:
 
 ```zer
-void unlock() { return; }   // legal
-@critical { unlock(); }     // interrupts NOT re-enabled
+void unlock() { return; }
+@critical { unlock(); }   // claimed: interrupts NOT re-enabled
 ```
 
-Catching this requires call-graph analysis or function summaries
-(`can_escape` predicate), similar to the existing transitive deadlock
-detection. Tracked in the audit roadmap; defer until concurrency
-work resumes.
+**Why the claim is wrong:** A normal function call returns to its
+caller. The caller is `@critical { ... }`. Execution returns to the
+@critical body, continues to the closing brace, and the closing brace
+emits the interrupt-restore code. Verified empirically by inspecting
+emitted C: `cpsid i` at @critical entry, `msr primask, ...` at
+@critical exit, function calls in between emit standard call/ret —
+control flow returns to the @critical body, not to the function that
+contains @critical.
+
+A `can_escape` predicate (transitive return/break/continue/goto)
+would have to reject EVERY function call from @critical (every
+non-trivial function returns), making `@critical` essentially
+unusable.
+
+**What IS actually checked today** (sufficient):
+1. Direct `return`/`break`/`continue`/`goto` inside `@critical` body —
+   per-site rejected (NODE-level checks)
+2. `yield`/`await` directly or transitively — `can_yield` propagation
+3. `spawn` directly or transitively — `can_spawn` propagation
+4. Heap alloc directly or transitively — `can_alloc` propagation
+5. Inline asm directly or transitively — `can_*` via FuncSummary
+
+The branch's audit was correct in spirit (transitive checks are good)
+but misanalyzed control-flow semantics for plain function returns.
 
 ## OPEN — AST `emit_expr` compound `/=` and `%=` lack signed-overflow trap
 

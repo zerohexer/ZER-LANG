@@ -5,6 +5,77 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `@once` lacks `__STDC_HOSTED__` guard
+
+**Discovered:** 2026-05-01 audit.
+
+Emitter unconditionally produces `__atomic_exchange_n(&_zer_once_N, 1,
+__ATOMIC_ACQ_REL)` for `@once` blocks (emitter.c:8313). GCC implements
+`__atomic_*` via libatomic on targets without lock-free CAS for the
+relevant width — freestanding/baremetal builds without libatomic
+linkage will fail to link or fall back to a non-atomic implementation
+that's racy across cores. Should guard with `__STDC_HOSTED__` or emit
+a target-specific intrinsic where available.
+
+## OPEN — `@probe` silently succeeds on freestanding
+
+**Discovered:** 2026-05-01 audit.
+
+`@probe(addr)` returns `?u32`. Hosted builds catch SIGSEGV and return
+null on fault. Freestanding builds (no signal handler) return
+`{ .has_value = 1, .value = <whatever the load returned> }` — silent
+garbage on bad MMIO addresses. Either disable `@probe` on freestanding
+or add a target-specific fault handler hook.
+
+(See also `docs/4-27-2026-gaps.md` Gap 9 for related discussion.)
+
+## OPEN — `@critical` indirect return via callee
+
+**Discovered:** 2026-05-01 audit. checker.c around lines 8983 and 10016.
+
+Direct `return`/`break`/`continue`/`goto` inside `@critical` is rejected.
+Calling a function whose body returns from the caller's perspective
+escapes `@critical` without re-enabling interrupts:
+
+```zer
+void unlock() { return; }   // legal
+@critical { unlock(); }     // interrupts NOT re-enabled
+```
+
+Catching this requires call-graph analysis or function summaries
+(`can_escape` predicate), similar to the existing transitive deadlock
+detection. Tracked in the audit roadmap; defer until concurrency
+work resumes.
+
+## OPEN — AST `emit_expr` compound `/=` and `%=` lack signed-overflow trap
+
+**Discovered:** 2026-05-01 audit. emitter.c:1433–1444.
+
+BUG-612 fixed `INT_MIN / -1` trap emission for the IR path
+(`emit_rewritten_node` at emitter.c:5787–5808). The AST sibling at
+1433–1444 only emits the divzero trap. Reachability through user
+function bodies is limited (function bodies are IR-only since
+2026-04-19), but other emission contexts (some statement-expression
+fallbacks) still go through `emit_expr`. Apply the same `INT_MIN`
+guard pattern as the IR path.
+
+## OPEN — u64 atomic warning fires on 64-bit targets
+
+**Discovered:** 2026-05-01 audit. checker.c around lines 6601, 6637.
+
+The "may require libatomic on 32-bit" warning is emitted for every
+`@atomic_*` on a u64 operand, regardless of `--target-bits`. False
+positive on 64-bit hosts. Gate the warning on `target_bits < 64`.
+
+## OPEN — `naked` attribute silently dropped on IR path
+
+See full entry near the bottom of this file ("`naked` attribute
+silently dropped on IR path (deferred 2026-05-02)") — kept in original
+location to preserve the more detailed analysis added in the
+2026-05-02 fix session.
+
+---
+
 ## ~~BUG-579~~ (FIXED 2026-04-18, v0.4.9)
 
 Switch arm body gaps — enum/union/optional switches now fully lower to IR.

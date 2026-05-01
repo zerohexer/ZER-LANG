@@ -1,0 +1,18 @@
+// Fix #4 (2026-05-02): @probe with default --probe-mode (hosted).
+//
+// Verifies the existing hosted-mode @probe behavior: signal handler
+// installed at startup, fault returns null. This test exercises the
+// safe path on a known-good address (the program's own .data section).
+
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+u32 g = 42;
+
+i32 main() {
+    // probe a known-valid address (g's address). Must succeed.
+    usize addr = @ptrtoint(&g);
+    ?u32 v = @probe(addr);
+    if (v) |x| {
+        if (x == 42) { return 0; }
+    }
+    return 1;
+}

@@ -78,6 +78,11 @@ typedef struct {
     int auto_slab_count;
     int auto_slab_capacity;
     int target_ptr_bits;  /* target pointer width in bits (default 32 for embedded) */
+    /* Fix #4 (2026-05-02): @probe behavior selector via --probe-mode flag.
+     *   0 = HOSTED (default) — install signal handler, return null on fault
+     *   1 = RAW              — direct read, no fault recovery (freestanding ok)
+     *   2 = DISABLED         — compile error on any @probe usage */
+    int probe_mode;
     uint32_t next_type_id; /* BUG-393: counter for runtime provenance type IDs */
 
     /* BUG-393: compile-time provenance map for compound paths (h.p, arr[0]) */

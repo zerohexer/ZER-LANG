@@ -1,0 +1,12 @@
+// zerc-flags: --probe-mode=disabled
+// Fix #4 (2026-05-02): --probe-mode=disabled rejects @probe at compile time.
+//
+// EXPECTED: compile error citing the disabled mode.
+
+mmio 0x40000000..0x40000FFF;
+
+i32 main() {
+    ?u32 v = @probe(0x40000000);
+    if (v) |x| { return (i32)x; }
+    return 0;
+}

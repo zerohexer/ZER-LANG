@@ -6545,7 +6545,16 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_u32;
             }
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
-            /* @probe(addr) → ?u32: try reading MMIO address, null if faults */
+            /* @probe(addr) → ?u32: try reading MMIO address, null if faults.
+             *
+             * Fix #4 (2026-05-02): --probe-mode=disabled rejects @probe at
+             * compile time. Used for safety-critical builds where any
+             * MMIO faulting behavior must be explicitly designed out. */
+            if (c->probe_mode == 2) {
+                checker_error(c, node->loc.line,
+                    "@probe is disabled by --probe-mode=disabled — "
+                    "use platform-specific MMIO probe with explicit fault handler instead");
+            }
             if (node->intrinsic.arg_count != 1) {
                 checker_error(c, node->loc.line, "@probe requires exactly 1 argument (address)");
             } else {

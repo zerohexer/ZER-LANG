@@ -1,0 +1,15 @@
+// zerc-flags: --target-arch=aarch64
+// F7-light (2026-05-02): C3 state machine — STXR without preceding
+// LDXR/LDAXR is the aarch64 form of "SC without LR".
+//
+// EXPECTED: compile error.
+
+naked void bad_stxr() {
+    asm {
+        instructions: "stxr w0, w1, [x2]"
+        clobbers: ["memory"]
+        safety: "F7-light test: STXR without LDXR must be rejected"
+    }
+}
+
+i32 main() { return 0; }

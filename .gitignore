@@ -43,3 +43,4 @@ editors/vscode/node_modules/
 hello.c
 hello.exe
 tags
+test_ir_validate

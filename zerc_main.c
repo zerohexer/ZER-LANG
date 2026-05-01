@@ -225,6 +225,11 @@ int main(int argc, char **argv) {
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
+    /* Fix #4 (2026-05-02): @probe mode selector via --probe-mode flag.
+     *   0 = HOSTED (default)  — install signal handler, return null on fault
+     *   1 = RAW                — direct read, no fault recovery (user accepts garbage)
+     *   2 = DISABLED          — compile error on any @probe usage */
+    int zer_probe_mode = 0;
     /* F4.2 (2026-04-29): default to x86_64 baseline features (SSE | SSE2).
      * Both are guaranteed by the x86_64 ABI — every x86_64 CPU has them.
      * Without this default, F4-classified instructions like MFENCE (which
@@ -259,6 +264,16 @@ int main(int argc, char **argv) {
             target_bits_explicit = true;
         } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
             gcc_override = argv[++i];
+        } else if (strncmp(argv[i], "--probe-mode=", 13) == 0) {
+            /* Fix #4 (2026-05-02): --probe-mode={hosted,raw,disabled} */
+            const char *m = argv[i] + 13;
+            if (strcmp(m, "hosted") == 0) zer_probe_mode = 0;
+            else if (strcmp(m, "raw") == 0) zer_probe_mode = 1;
+            else if (strcmp(m, "disabled") == 0) zer_probe_mode = 2;
+            else {
+                fprintf(stderr, "error: unknown --probe-mode '%s' (use hosted, raw, or disabled)\n", m);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
             zer_stack_limit = (uint32_t)atoi(argv[++i]);
         } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
@@ -494,6 +509,7 @@ int main(int argc, char **argv) {
     checker.stack_limit = zer_stack_limit;
     checker.target_features = zer_target_features;
     checker.target_arch = zer_target_arch_id;
+    checker.probe_mode = zer_probe_mode;  /* Fix #4: hosted/raw/disabled */
 
     /* register in topo order: dependencies first, main last */
     for (int ti = 0; ti < topo_count; ti++) {
@@ -631,6 +647,7 @@ int main(int argc, char **argv) {
      * Always on for --run (including --release) — compiled-in safety, not debug.
      * Only disabled without explicit --track-cptrs when emitting C library (--lib). */
     emitter.track_cptrs = track_cptrs || do_run;
+    emitter.probe_mode = zer_probe_mode;  /* Fix #4: hosted/raw/disabled */
     emitter.source_file = input_path;
 
     /* Phase F: zercheck_ir runs via ir_hook inside the emitter, on the

@@ -84,8 +84,12 @@ for f in tests/zer_fail/*.zer; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .zer)
     TOTAL=$((TOTAL + 1))
+    # Per-file flags directive (same as positive branch). Some negatives
+    # only fail under specific compiler configurations (e.g.,
+    # --probe-mode=disabled rejecting @probe usage).
+    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     # Compile only (not --run), expect failure
-    $ZERC "$f" -o /dev/null 2>/dev/null
+    $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>/dev/null
     ret=$?
     if [ $ret -ne 0 ]; then
         PASS=$((PASS + 1))

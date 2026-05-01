@@ -8337,9 +8337,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             int oid = once_id_counter++;
             emit_indent(e);
             emit(e, "{ static uint32_t _zer_once_%d = 0;\n", oid);
+            /* Fix #2 (2026-05-02): guard atomic emission by __STDC_HOSTED__.
+             * Hosted: full atomic exchange (lock-free on targets with native
+             * CAS, otherwise libatomic). Freestanding (bare-metal without
+             * libatomic linkage): non-atomic single-core init. Multi-core
+             * bare-metal users must provide their own synchronization
+             * around @once or use atomic intrinsics directly. */
+            emit_indent(e);
+            emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
             emit_indent(e);
             emit(e, "if (!__atomic_exchange_n(&_zer_once_%d, 1, __ATOMIC_ACQ_REL)) goto _zer_bb%d; else goto _zer_bb%d;\n",
                  oid, inst->true_block, inst->false_block);
+            emit_indent(e);
+            emit(e, "#else /* freestanding: non-atomic, single-core safe only */\n");
+            emit_indent(e);
+            emit(e, "if (_zer_once_%d == 0) { _zer_once_%d = 1; goto _zer_bb%d; } else goto _zer_bb%d;\n",
+                 oid, oid, inst->true_block, inst->false_block);
+            emit_indent(e);
+            emit(e, "#endif\n");
             emit_indent(e);
             emit(e, "}\n");
             break;

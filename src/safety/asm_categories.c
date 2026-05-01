@@ -71,10 +71,12 @@ uint32_t zer_asm_category(ZerArchId arch, const char *insn, size_t insn_len) {
         entry = scan_table(zer_x86_64_instructions, insn, insn_len);
     } else if (arch == ZER_ARCH_AARCH64) {
         entry = scan_table(zer_aarch64_instructions, insn, insn_len);
+    } else if (arch == ZER_ARCH_RISCV64) {
+        /* F6 (2026-05-02): riscv64 instruction-level safety classification.
+         * 30 entries covering LR/SC pairs, AMO atomics, F/D/V/C/Zbb
+         * features, M/S privileged ops, and FENCE family. */
+        entry = scan_table(zer_riscv64_instructions, insn, insn_len);
     }
-    /* riscv64 instruction table is F6 work (registers DONE F6-min,
-     * instructions pending). Lookup falls through to "no category" —
-     * structural rules + Z-rules still apply. */
     if (entry == 0) {
         return 0;
     }
@@ -109,6 +111,8 @@ int zer_asm_instruction_info(
         entry = scan_table(zer_x86_64_instructions, mnemonic, mnemonic_len);
     } else if (arch == ZER_ARCH_AARCH64) {
         entry = scan_table(zer_aarch64_instructions, mnemonic, mnemonic_len);
+    } else if (arch == ZER_ARCH_RISCV64) {
+        entry = scan_table(zer_riscv64_instructions, mnemonic, mnemonic_len);
     }
     if (entry == 0) {
         return 0;

@@ -9979,13 +9979,21 @@ static void check_stmt(Checker *c, Node *node) {
                         while (i < len && s[i] != '\n' && s[i] != ';') i++;
                         continue;
                     }
-                    /* Read mnemonic token: alphanumeric + underscore */
+                    /* Read mnemonic token: alphanumeric + underscore + dot.
+                     * F6 (2026-05-02): dot included so RISC-V mnemonics
+                     * like `lr.w`, `fence.i`, `amoadd.w`, `c.add` match the
+                     * vendored table. ARM `dmb sy` etc. use space-separated
+                     * suffixes (operands), not dots in the mnemonic.
+                     * Trailing dots get trimmed below to avoid matching
+                     * `add.` (period at end of sentence in pseudo-comment). */
                     size_t mn_start = i;
-                    while (i < len && (s[i] == '_' ||
+                    while (i < len && (s[i] == '_' || s[i] == '.' ||
                            (s[i] >= 'a' && s[i] <= 'z') ||
                            (s[i] >= 'A' && s[i] <= 'Z') ||
                            (s[i] >= '0' && s[i] <= '9'))) i++;
                     size_t mn_len = i - mn_start;
+                    /* Trim trailing dot (rare, defensive): `add.` → `add` */
+                    while (mn_len > 0 && s[mn_start + mn_len - 1] == '.') mn_len--;
                     if (mn_len > 0 && mn_len < 32) {
                         /* Look up safety classification for this mnemonic. */
                         ZerInstructionInfo info;

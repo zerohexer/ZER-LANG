@@ -121,7 +121,10 @@ awk '
     }
 
     # Section header: [mnemonic]
-    /^\[[a-zA-Z][a-zA-Z0-9_]*\]/ {
+    # Section header: [mnemonic]. Allow dots in mnemonics (e.g., RISC-V
+    # `lr.w`, `fence.i`, `c.add`, ARM `dmb sy`). Dots are valid asm
+    # mnemonic separators on RISC-V; the generator must preserve them.
+    /^\[[a-zA-Z][a-zA-Z0-9_.]*\]/ {
         # Flush previous entry
         if (in_entry && mnemonic != "") {
             printf "%s|%s|%s|%s|%s\n", mnemonic, category, features, source, consequence

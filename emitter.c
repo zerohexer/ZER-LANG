@@ -3644,6 +3644,42 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
     emit(e, ");\n");
 }
 
+/* BUG-651 fix (2026-05-02): single source of truth for function-level
+ * GCC attributes. Called from BOTH the AST proto-only path
+ * (emit_func_decl) AND the IR body-emitting path
+ * (emit_regular_func_from_ir).
+ *
+ * Why a helper, not duplicated code: when the IR migration moved
+ * function-body emission off the AST path, the early-return at
+ * emit_func_decl line ~3681 happened BEFORE the inline attribute
+ * emission. This silently dropped section/static attributes for any
+ * function with a body. The first IR-side fix duplicated the inline
+ * code into the IR path — but that just doubled the surface for the
+ * NEXT attribute regression. One helper, two callers, future
+ * `noreturn` / `weak` / `visibility` additions land in ONE place.
+ *
+ * `naked` is intentionally NOT emitted here. The IR migration
+ * silently dropped it; existing tests/zer/asm_*.zer rely on the
+ * implicit prologue/epilogue (their asm bodies omit explicit `ret`).
+ * Restoring real naked semantics is a separate user-visible breaking
+ * change tracked in docs/limitations.md.
+ *
+ * Caller passes the AST function-decl node (NODE_FUNC_DECL or
+ * NODE_INTERRUPT). For interrupts, the GCC `interrupt` attribute is
+ * emitted by the IR path's existing inline code — this helper covers
+ * regular function attributes. */
+static void emit_func_attributes(Emitter *e, Node *fn) {
+    if (!fn || fn->kind != NODE_FUNC_DECL) return;
+    if (fn->func_decl.section) {
+        emit(e, "__attribute__((section(\"%.*s\"))) ",
+             (int)fn->func_decl.section_len, fn->func_decl.section);
+    }
+    /* naked: see comment above. Intentionally disabled. */
+    if (fn->func_decl.is_static) {
+        emit(e, "static ");
+    }
+}
+
 static void emit_func_decl(Emitter *e, Node *node) {
 
     /* Function bodies are IR-only (no AST fallback). The AST emission
@@ -3686,17 +3722,9 @@ static void emit_func_decl(Emitter *e, Node *node) {
     Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
         func_type->func_ptr.ret : NULL;
 
-    /* section attribute */
-    if (node->func_decl.section) {
-        emit(e, "__attribute__((section(\"%.*s\"))) ",
-             (int)node->func_decl.section_len, node->func_decl.section);
-    }
-    /* naked attribute */
-    if (node->func_decl.is_naked) {
-        emit(e, "__attribute__((naked)) ");
-    }
-    /* static functions */
-    if (node->func_decl.is_static) emit(e, "static ");
+    /* Function-level GCC attributes (section/static/naked).
+     * Single source of truth via helper — see emit_func_attributes(). */
+    emit_func_attributes(e, node);
 
     emit_type(e, ret);
     emit(e, " ");
@@ -9616,6 +9644,12 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         e->indent++;
         e->current_func_ret = NULL;
     } else {
+        /* BUG-651 fix (2026-05-02): function-level GCC attributes
+         * (section/static) propagate from AST to emitted C. Pre-fix,
+         * the IR migration silently dropped these — they only existed
+         * on the AST proto-only path. Now both paths share one helper. */
+        emit_func_attributes(e, fn);
+
         /* Return type + name.
          * func->return_type may be the function TYPE (func_ptr) from typemap.
          * Extract the actual return type from func_ptr.ret. */

@@ -1,0 +1,38 @@
+// BUG-650 (2026-05-02): compound (struct.field) handle merge across CFG join.
+//
+// Pre-fix, `ir_merge_states` used bare-only handle lookups
+// (`ir_find_handle`), so a compound handle freed in one branch did NOT
+// widen to MAYBE_FREED at the join point. Second loop's bare-keyed
+// dedup also re-added pred's compound entries, producing duplicate rows
+// where a stale ALIVE entry could hide the FREED state from later
+// use-site lookups (non-deterministic — sometimes ALIVE was returned
+// first, allowing silent UAF through the IR analyzer).
+//
+// On main today, the AST `zercheck.c` legacy analyzer ALSO sees this
+// case via different logic and reports the error. After Phase G deletes
+// `zercheck.c`, the IR analyzer becomes the sole exit-code driver, and
+// without this fix the compound case becomes a silent UAF gap.
+//
+// Fix: both lookups in `ir_merge_states` now use
+// `ir_find_compound_handle` keyed on (local_id, path, path_len). Add
+// uses `ir_alloc_handle_slot` directly (bypassing bare-only
+// `ir_add_handle`).
+//
+// EXPECTED: zercheck use-after-free / maybe-freed error on the use of
+// `b.h` after the conditional free.
+
+struct Task { u32 id; }
+struct Box { Handle(Task) h; }
+Pool(Task, 4) pool;
+
+u32 main(u32 cond) {
+    Box b;
+    Handle(Task) tmp = pool.alloc() orelse return;
+    b.h = tmp;                  // compound (b, ".h") tracked ALIVE
+    if (cond > 0) {
+        pool.free(b.h);         // compound = FREED in this branch
+        // Falls through to merge — no early return.
+    }
+    // After merge: compound state must be MAYBE_FREED.
+    return pool.get(b.h).id;
+}

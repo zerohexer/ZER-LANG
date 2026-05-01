@@ -52,6 +52,16 @@ extern const size_t zer_x86_64_instruction_count;
 extern const ZerInstructionEntry zer_aarch64_instructions[];
 extern const size_t zer_aarch64_instruction_count;
 
+/* F6 (2026-05-02): riscv64 instruction table — 30 safety-relevant
+ * entries spanning C2+C3 (LR/SC + AMO atomic ops), C4 (F/D/V/C/Zbb
+ * extensions), C5 (privileged: MRET/SRET/WFI/CSR ops/SFENCE), and
+ * C8 (FENCE/FENCE.I/FENCE.TSO barriers). RISC-V semantics differ
+ * from x86/aarch64: DIV doesn't trap on zero (no C1), AMO requires
+ * natural alignment (C2+C4), CSRs gate privilege.
+ * Generated from arch_data/riscv64.zerdata. */
+extern const ZerInstructionEntry zer_riscv64_instructions[];
+extern const size_t zer_riscv64_instruction_count;
+
 /* Diagnostic info for a matched instruction. Populated by extended lookup
  * variant when caller wants the citation/consequence for error messages. */
 typedef struct {

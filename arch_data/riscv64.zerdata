@@ -1,0 +1,319 @@
+# RISC-V (riscv64) instruction safety metadata — F6 classification.
+#
+# F6 (2026-05-02): per-instruction safety classification for RISC-V.
+# Same schema as F4 (x86_64) and F5 (aarch64); see arch_data/SCHEMA.md.
+#
+# RISC-V safety semantics differ from x86_64 AND aarch64:
+#   - DIV/DIVU/REM/REMU do NOT trap on divide-by-zero (return all-ones
+#     for division, dividend for remainder). NO C1 needed for divide
+#     (similar to aarch64, distinct from x86 which raises #DE).
+#   - LR/SC pairs (load-reserved / store-conditional) are explicit
+#     atomic primitives — C3 state machine.
+#   - AMO* (atomic memory operations) require natural alignment to
+#     succeed without fault — C2 alignment.
+#   - Privileged instructions split by mode (M/S/U). MRET, SRET, WFI,
+#     SFENCE.VMA all require >=S mode. CSR access depends on the CSR.
+#   - FENCE / FENCE.I / FENCE.TSO are C8 memory ordering.
+#   - Vector (V) and Zfh/Zba/Zbb/etc extensions are C4 CPU feature.
+#
+# Categories used:
+#   C2 — alignment (AMO instructions require natural alignment)
+#   C3 — state machine (LR/SC exclusive monitor pairs)
+#   C4 — CPU feature (FP, vector, atomic, compressed, bitmanip)
+#   C5 — privilege (kernel-only: MRET, SRET, WFI, CSR access on M-mode CSRs, SFENCE)
+#   C8 — memory order (FENCE, FENCE.I, FENCE.TSO)
+
+schema_version = 1
+
+# =====================================================================
+# C3 — State machine (LL/SC exclusive monitor pairs, ~6 entries)
+# =====================================================================
+
+[lr.w]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(4)
+category = C3_STATE_MACHINE + C2_ALIGNMENT
+source = "RISC-V Unprivileged ISA — A extension LR.W"
+consequence = "LL of 32-bit word; subsequent SC.W must pair within state machine. Misaligned address takes load-address-misaligned exception."
+notes = "Followed by ALU ops, then SC.W to commit atomically. Natural alignment required."
+
+[lr.d]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = MEMORY_ALIGNED
+operand[1].constraint = ALIGNED(8)
+category = C3_STATE_MACHINE + C2_ALIGNMENT
+source = "RISC-V Unprivileged ISA — A extension LR.D"
+consequence = "LL of 64-bit doubleword; pair with SC.D. Misaligned = load-address-misaligned exception."
+
+[sc.w]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(4)
+category = C3_STATE_MACHINE + C2_ALIGNMENT
+source = "RISC-V Unprivileged ISA — A extension SC.W"
+consequence = "SC of 32-bit word; result in operand 0 indicates success/failure. Must follow LR.W. Misaligned = store-address-misaligned exception."
+
+[sc.d]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(8)
+category = C3_STATE_MACHINE + C2_ALIGNMENT
+source = "RISC-V Unprivileged ISA — A extension SC.D"
+consequence = "SC of 64-bit doubleword; pair with LR.D."
+
+# =====================================================================
+# C2 + C4 — AMO atomic memory operations (~6 entries)
+# =====================================================================
+#
+# AMO* instructions perform atomic read-modify-write. They require:
+#   - Natural alignment of the memory operand (C2)
+#   - The 'A' (atomic) extension to be enabled (C4)
+
+[amoadd.w]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(4)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — A extension AMOADD.W"
+consequence = "Atomic add on 32-bit word in memory. Misaligned = exception. Requires A extension."
+notes = "Returns old value in operand 0."
+
+[amoadd.d]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(8)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — A extension AMOADD.D"
+consequence = "Atomic add on 64-bit doubleword."
+
+[amoswap.w]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(4)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — A extension AMOSWAP.W"
+consequence = "Atomic swap. Returns old value, stores new value."
+
+[amoxor.w]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(4)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — A extension AMOXOR.W"
+consequence = "Atomic XOR with memory."
+
+[amoand.w]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(4)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — A extension AMOAND.W"
+consequence = "Atomic AND with memory."
+
+[amoor.w]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = MEMORY_ALIGNED
+operand[2].constraint = ALIGNED(4)
+category = C2_ALIGNMENT + C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — A extension AMOOR.W"
+consequence = "Atomic OR with memory."
+
+# =====================================================================
+# C4 — CPU feature: F (single FP), D (double FP), V (vector) (~7 entries)
+# =====================================================================
+
+[fadd.s]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — F extension FADD.S"
+consequence = "Single-precision FP add. Requires F extension. Illegal-instruction exception otherwise."
+
+[fadd.d]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — D extension FADD.D"
+consequence = "Double-precision FP add. Requires D extension."
+
+[fmul.s]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — F extension FMUL.S"
+consequence = "Single-precision FP multiply. Requires F extension."
+
+# Compressed (C extension) — distinct mnemonics with c. prefix
+[c.add]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — C extension C.ADD"
+consequence = "Compressed 16-bit ADD. Requires C extension."
+
+# Vector (V extension) — examples
+[vadd.vv]
+operand_count = 3
+operand[0].type = REGISTER
+operand[1].type = REGISTER
+operand[2].type = REGISTER
+category = C4_CPU_FEATURE
+source = "RISC-V Vector ISA — V extension VADD.VV"
+consequence = "Vector add (vector + vector). Requires V extension."
+
+[vsetvli]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = IMMEDIATE
+category = C4_CPU_FEATURE
+source = "RISC-V Vector ISA — V extension VSETVLI"
+consequence = "Set vector length (immediate VTYPE). Requires V extension. Predecessor for V instructions."
+
+# Bit-manip (Zba/Zbb)
+[clz]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C4_CPU_FEATURE
+source = "RISC-V Unprivileged ISA — Zbb extension CLZ"
+consequence = "Count leading zeros. Requires Zbb (basic bit manipulation) extension."
+
+# =====================================================================
+# C5 — Privilege (kernel-only / >=S mode, ~10 entries)
+# =====================================================================
+
+[mret]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "RISC-V Privileged ISA — MRET"
+consequence = "Return from M-mode trap. Illegal-instruction exception if executed at <M mode."
+notes = "Restores PC from MEPC, mode from MSTATUS.MPP."
+
+[sret]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "RISC-V Privileged ISA — SRET"
+consequence = "Return from S-mode trap. Illegal-instruction exception if at U mode."
+notes = "Restores PC from SEPC, mode from SSTATUS.SPP. Trapped to M-mode if MSTATUS.TSR=1."
+
+[wfi]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "RISC-V Privileged ISA — WFI"
+consequence = "Wait for interrupt. Behavior depends on mstatus.TW: trapped to M-mode if TW=1 and not in M-mode."
+notes = "Privileged hint instruction; implementations may treat as NOP."
+
+[ecall]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "RISC-V Unprivileged ISA — ECALL"
+consequence = "Environment call (system call). Takes appropriate trap based on current mode (U-call from U, S-call from S, M-call from M)."
+notes = "Available at all modes — privilege effect is the trap target."
+
+[ebreak]
+operand_count = 0
+category = C5_PRIVILEGE
+source = "RISC-V Unprivileged ISA — EBREAK"
+consequence = "Software breakpoint. Takes breakpoint trap to higher mode."
+notes = "Used by debuggers. Available at all modes."
+
+[sfence.vma]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "RISC-V Privileged ISA — SFENCE.VMA"
+consequence = "Supervisor-mode TLB flush. Illegal-instruction exception at U mode (or trapped to M if MSTATUS.TVM=1)."
+notes = "Required after page-table updates."
+
+[hfence.vvma]
+operand_count = 2
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+category = C5_PRIVILEGE
+source = "RISC-V Privileged ISA — H extension HFENCE.VVMA"
+consequence = "Hypervisor-mode VS-stage TLB flush. Requires H extension + HS mode."
+
+[csrrw]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "RISC-V Unprivileged ISA — CSRRW"
+consequence = "Read CSR and write new value. Many CSRs are M/S privileged — illegal-instruction exception if accessed below required mode."
+notes = "Conservatively classified as C5 — most CSRs require >=S mode. User CSRs (cycle, time, instret) are U-accessible."
+
+[csrrs]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "RISC-V Unprivileged ISA — CSRRS"
+consequence = "Read CSR and set bits. Same privilege model as CSRRW."
+
+[csrrc]
+operand_count = 3
+operand[0].type = GP_REGISTER
+operand[1].type = GP_REGISTER
+operand[2].type = IMMEDIATE
+category = C5_PRIVILEGE
+source = "RISC-V Unprivileged ISA — CSRRC"
+consequence = "Read CSR and clear bits. Same privilege model as CSRRW."
+
+# =====================================================================
+# C8 — Memory ordering (~3 entries)
+#
+# RISC-V memory model is RVWMO (weak memory ordering). FENCE instructions
+# are required for cross-thread visibility. Actual cross-instruction
+# ordering enforcement is Stage 5 (System #30).
+# =====================================================================
+
+[fence]
+operand_count = 2
+operand[0].type = IMMEDIATE
+operand[1].type = IMMEDIATE
+category = C8_MEMORY_ORDER
+source = "RISC-V Unprivileged ISA — FENCE"
+consequence = "Memory ordering barrier with predecessor/successor sets (PI/PO/PR/PW for input I/O, output, read, write). Stage 5 / System #30 will enforce correct usage."
+notes = "Operands are 4-bit predecessor and successor masks."
+
+[fence.i]
+operand_count = 0
+category = C8_MEMORY_ORDER
+source = "RISC-V Unprivileged ISA — Zifencei extension FENCE.I"
+consequence = "Instruction-fetch fence. Required after self-modifying code or page-table updates affecting executable pages."
+
+[fence.tso]
+operand_count = 0
+category = C8_MEMORY_ORDER
+source = "RISC-V Unprivileged ISA — Ztso extension FENCE.TSO"
+consequence = "Total Store Order fence. Equivalent to fence rw,rw with Ztso semantics. Optional extension."

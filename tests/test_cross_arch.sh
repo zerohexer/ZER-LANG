@@ -107,6 +107,18 @@ run_cross_arch_test \
     "ARM aarch64" \
     "dmb_f5"
 
+# riscv64 — F6 classified instruction (FENCE.I — C8 category)
+# Verifies the instruction-level dispatch on riscv64 picks up FENCE.I
+# (dot in mnemonic — exercises the dot-aware mnemonic parser fix in
+# checker.c NODE_ASM and the dot-aware section-header regex in
+# scripts/gen_instruction_table.sh).
+run_cross_arch_test \
+    "riscv64" "riscv64-linux-gnu-gcc" \
+    '[ "memory" ]' \
+    "fence.i" \
+    "RISC-V" \
+    "fence_i_f6"
+
 # riscv64 — cross-gcc
 run_cross_arch_test \
     "riscv64" "riscv64-linux-gnu-gcc" \

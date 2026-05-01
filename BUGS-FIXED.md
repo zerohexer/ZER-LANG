@@ -5,6 +5,143 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-05-02 — IR analyzer + emitter regressions caught by branch audit
+
+A separate audit on `claude/cool-johnson-apebs` (do-not-merge branch)
+found two confirmed silent gaps in the IR pipeline. After verifying
+both bugs against main and reviewing the proposed fixes, applied the
+correct fixes here on main directly:
+- BUG-650 fix taken as-is (architectural correctness, no improvement
+  available without broader refactor of the 13 `ir_find_handle` call
+  sites)
+- BUG-651 fix RESTRUCTURED — branch duplicated 4 lines into the IR
+  path; we instead extracted `emit_func_attributes` helper called by
+  both AST and IR paths. Eliminates the dup-and-drift trap that
+  produced this bug class in the first place.
+
+### BUG-650: ir_merge_states used bare-only handle lookups (silent UAF post-Phase-G)
+
+**Symptom:** Compound (struct.field) handles registered via
+`ir_add_compound_handle` were never combined across CFG predecessors
+in `ir_merge_states`. A FREED-in-one-branch compound stayed at
+result's pre-merge state instead of widening to MAYBE_FREED.
+
+The bug manifested in two ways:
+
+1. **First merge loop** (state-combining): `ir_find_handle` (bare-only,
+   filters `path_len == 0`) silently missed compound entries. Result's
+   compound handle kept its pre-merge state when pred had a different
+   state. Silent UAF on subsequent use of the compound expression.
+
+2. **Second merge loop** (add-if-missing): bare-keyed dedup let pred's
+   compound entries get re-added as duplicates. Use-site
+   `ir_find_compound_handle` returned whichever duplicate came first —
+   non-deterministic state. Sometimes ALIVE leaked through, sometimes
+   FREED was caught.
+
+**Why this matters now:** Today (Phase F dual-run) the legacy AST
+`zercheck.c` analyzer still runs and catches this case via different
+logic (string-based key tracking). After Phase G deletes `zercheck.c`,
+the IR analyzer becomes the sole exit-code driver and the gap becomes
+a real silent UAF.
+
+**Root cause:** Two parallel lookup functions exist by design:
+```c
+ir_find_handle(ps, local_id)              /* bare-only */
+ir_find_compound_handle(ps, local_id, path, path_len)  /* compound-aware */
+```
+Their signatures barely differ. Nothing prevents calling the
+bare-only variant in code that needs to handle compound entries.
+The merge function called the bare-only variant.
+
+**Fix:** Both call sites in `ir_merge_states` now use
+`ir_find_compound_handle` keyed on (local_id, path, path_len). For
+the second loop's add-if-missing, use `ir_alloc_handle_slot` directly
+(bypassing `ir_add_handle` which goes through bare-only
+`ir_find_handle`).
+
+Plus added two missing merge cases:
+- `result=FREED, pred=MAYBE_FREED` → widen to MAYBE_FREED
+- `result=MAYBE_FREED, pred=FREED` → keep MAYBE_FREED (already conservative)
+
+**Test:** `tests/zer_fail/compound_field_maybe_freed.zer` — `b.h`
+freed in one branch of an `if`, used after the merge. Currently fails
+to compile via both analyzers (intentional — proves the case is
+caught). After Phase G this test guards against regression.
+
+**Structural note (not fixed in this commit):** The same trap can
+re-emerge anywhere `ir_find_handle` is called in state-merging or
+dedup contexts. There are 13 call sites in `zercheck_ir.c`. A future
+refactor should either (a) rename `ir_find_handle` →
+`ir_find_bare_handle` to make bare-only intent explicit, or (b) merge
+the two functions into one with a clear key type combining
+`(local_id, path, path_len)`. Tracked for Stage 6/7 cleanup.
+
+### BUG-651: section/static attributes silently dropped from IR-path functions
+
+**Symptom:** `__attribute__((section(".init")))` and `static`
+modifiers on a ZER function with a body got silently dropped from the
+emitted C. The attribute emission only existed inline in
+`emit_func_decl` AFTER the early-return-to-IR at line 3681 — meaning
+only prototype-only / forward-decl shapes reached the attribute
+emission.
+
+**Root cause:** Classic IR-migration regression. When function-body
+emission moved off the AST path, the inline attribute emission stayed
+on the AST path (it was BEFORE the body emission, but the early
+return jumped to IR before reaching it for body-bearing functions).
+
+**Fix (helper extraction, NOT duplication):** Extracted
+`emit_func_attributes(e, fn)` helper. Called from BOTH the AST proto
+path (`emit_func_decl`) AND the IR body-emitting path
+(`emit_regular_func_from_ir`). Single source of truth — future
+attribute additions (e.g., `__attribute__((noreturn))`,
+`visibility`) land in ONE place instead of needing manual sync
+across two paths.
+
+The branch's original fix duplicated the inline attribute code into
+the IR path. We rejected that approach: it preserves the dup-and-drift
+trap that caused this bug class. Helper extraction is the correct
+shape.
+
+**`naked` attribute deliberately disabled in helper:** restoring true
+naked semantics requires migrating every `tests/zer/asm_*.zer` test
+to include explicit `ret` / `iret` / `eret`. Tracked in
+`docs/limitations.md`. Helper has a comment citing it.
+
+**Tests:** No new test added — the fix is silent (attribute now
+emitted; previously dropped). Existing tests verify nothing broke.
+A targeted test for section attribute would require linking with
+custom linker script, which is bare-metal-specific test infra.
+
+### Files modified
+
+- `zercheck_ir.c` — `ir_merge_states` compound-aware lookups + 2 new merge cases
+- `emitter.c` — extracted `emit_func_attributes` helper; AST + IR paths both call it
+- `tests/zer_fail/compound_field_maybe_freed.zer` — NEW BUG-650 regression test
+- `docs/limitations.md` — note for deferred `naked` attribute restoration
+- `BUGS-FIXED.md` — this entry
+
+### Verification
+
+- 526/526 ZER tests (was 525, +1 BUG-650 regression test)
+- 28/28 module tests
+- 784/784 Rust translations
+- 36/36 Zig translations
+- 4/4 cross-arch end-to-end
+- All audit gates green (walker IR, walker default, fixed-buffer, emit)
+
+### Branch audit credit
+
+`claude/cool-johnson-apebs` (commit `a432b3f`) found both bugs through
+parallel-agent codebase exploration + reproducer testing. Verified
+each finding against main, applied fixes here directly per "do not
+merge or pull" instruction. Branch's structural insight (compound vs
+bare lookup) was the key — the immediate fix is straightforward once
+the trap is named.
+
+---
+
 ## Session 2026-04-29 — Stages 2B + 3 + Sub-extension Validation + F4.1 + F4.2
 
 **Massive multi-stage session.** Closed Stage 2 Part B (walker exhaustiveness

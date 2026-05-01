@@ -413,6 +413,59 @@ clearer code intent.
 
 ---
 
+## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+
+**Status:** known regression from IR migration; not fixed because fixing
+breaks every existing `tests/zer/asm_*.zer` test.
+
+**Symptom:** ZER source declaring `naked void f() { asm { ... } }`
+emits C without `__attribute__((naked))`. GCC therefore generates a
+normal prologue + epilogue around the asm body. The asm appears to
+"work" because the implicit prologue/epilogue saves/restores callee-
+saved registers and ensures `ret` happens via the epilogue.
+
+**Why this is a real loss of safety semantics:**
+
+A genuinely naked function has no compiler-generated prologue/epilogue
+— the user controls every byte. This matters for:
+
+- Interrupt handlers using `iret` directly (no implicit `ret`)
+- Boot/reset handlers that haven't set up the stack yet
+- Context switch primitives that save callee-saved registers themselves
+- Code that needs exact frame layout (no surprise spills)
+
+With the implicit prologue, these scenarios silently malfunction (or
+leak/corrupt registers) but the asm "compiles".
+
+**Why it's deferred:**
+
+Existing tests/zer/asm_*.zer (10+ files) all rely on the implicit
+prologue/epilogue. Their asm bodies omit explicit `ret` instructions.
+Re-enabling `__attribute__((naked))` would SIGILL each of them at
+runtime (function falls off the end without `ret`).
+
+Restoring true naked semantics requires:
+1. Updating every existing asm test to include explicit `ret` /
+   `iret` / `eret` per architecture
+2. Adding a checker rule that bans `return expr;` inside naked
+   functions (only `return;` or no return at all permitted)
+3. Auditing user-facing docs and bumping any "naked" examples
+4. A user-visible breaking change announcement
+
+That's a separate migration effort, not in scope for the bug-fix
+sessions. The current state (silent attribute drop) is documented
+here so fresh sessions know it's INTENTIONAL deferral rather than
+oversight.
+
+**Workaround for users TODAY:** if you actually need true naked
+semantics, write the function in C and link via `cinclude`. This is
+the pattern used in real projects shipping production firmware.
+
+**Tracking:** when the asm-test migration lands, re-enable the
+attribute in `emit_func_attributes` (emitter.c) and remove this entry.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

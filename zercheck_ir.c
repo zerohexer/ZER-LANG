@@ -406,14 +406,39 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
 
     IRPathState result = ir_ps_copy(&states[first_live]);
 
-    /* Merge each subsequent non-terminated predecessor */
+    /* Merge each subsequent non-terminated predecessor.
+     *
+     * BUG-650 (2026-05-02): both lookups MUST be compound-aware. Using
+     * `ir_find_handle` (bare-only — filters by path_len == 0) silently
+     * missed compound (struct.field) entries registered via
+     * `ir_add_compound_handle`. Two failure modes resulted:
+     *   1) First loop: a compound `b.h` FREED in one branch and ALIVE
+     *      in another did not widen to MAYBE_FREED — the bare lookup
+     *      returned NULL, the merge skipped this entry, result kept its
+     *      pre-merge state. Silent UAF on subsequent use of `b.h`.
+     *   2) Second loop's bare-keyed dedup re-added pred's compound rows
+     *      as duplicates (the bare key didn't see the existing compound
+     *      entry). Use-site lookup found whichever duplicate came first
+     *      — non-deterministic state, sometimes ALIVE leaked through.
+     *
+     * Both call sites now use `ir_find_compound_handle` keyed on
+     * (local_id, path, path_len). For the second loop's add-if-missing,
+     * we use `ir_alloc_handle_slot` directly because `ir_add_handle`
+     * goes through bare-only `ir_find_handle` and can't add a compound
+     * entry.
+     *
+     * On main today this bug is masked by AST `zercheck.c` running in
+     * parallel and catching it via different logic; the IR analyzer
+     * will be the sole exit-code driver after Phase G deletes
+     * zercheck.c, so the fix lands here pre-emptively. */
     for (int si = first_live + 1; si < state_count; si++) {
         if (states[si].terminated) continue; /* dead path, skip */
 
         /* For each handle in result, check if same handle exists in this pred */
         for (int hi = 0; hi < result.handle_count; hi++) {
             IRHandleInfo *rh = &result.handles[hi];
-            IRHandleInfo *ph = ir_find_handle(&states[si], rh->local_id);
+            IRHandleInfo *ph = ir_find_compound_handle(&states[si],
+                rh->local_id, rh->path, rh->path_len);
 
             if (!ph) continue; /* handle not in this pred — keep result's state */
 
@@ -427,15 +452,25 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                 rh->state = IR_HS_MAYBE_FREED; /* conservative */
             } else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_ALIVE) {
                 rh->state = IR_HS_MAYBE_FREED;
+            } else if (rh->state == IR_HS_FREED && ph->state == IR_HS_MAYBE_FREED) {
+                rh->state = IR_HS_MAYBE_FREED; /* widen — pred saw maybe-free */
             }
-            /* Both same state → keep. Both freed → keep freed. */
+            /* MAYBE_FREED ↔ FREED: keep MAYBE_FREED (already conservative).
+             * Both same state → keep. Both freed → keep freed. */
         }
 
-        /* Add handles from pred that aren't in result yet */
+        /* Add handles from pred that aren't in result yet (compound-aware
+         * dedup; bypass ir_add_handle which uses bare-only ir_find_handle). */
         for (int pi = 0; pi < states[si].handle_count; pi++) {
-            if (!ir_find_handle(&result, states[si].handles[pi].local_id)) {
-                IRHandleInfo *nh = ir_add_handle(&result, states[si].handles[pi].local_id);
-                if (nh) *nh = states[si].handles[pi];
+            IRHandleInfo *src = &states[si].handles[pi];
+            if (!ir_find_compound_handle(&result, src->local_id,
+                                         src->path, src->path_len)) {
+                IRHandleInfo *nh = ir_alloc_handle_slot(&result);
+                if (nh) *nh = *src;
+                /* Note: path is arena-allocated by ir_extract_compound_key.
+                 * Sharing the pointer across path states is safe for the
+                 * lifetime of zercheck_ir analysis (single-arena, single
+                 * compile). */
             }
         }
     }

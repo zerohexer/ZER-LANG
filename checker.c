@@ -6596,7 +6596,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (aw != 8 && aw != 16 && aw != 32 && aw != 64) {
                             checker_error(c, node->loc.line,
                                 "@atomic_load target must be 1, 2, 4, or 8 bytes (got %d-bit type)", aw);
-                        } else if (aw == 64) {
+                        } else if (aw == 64 && c->target_ptr_bits < 64) {
+                            /* Only warn on 32-bit targets — 64-bit hosts have
+                             * native lock-free 64-bit atomics. */
                             checker_warning(c, node->loc.line,
                                 "@atomic_load on 64-bit type may require libatomic on 32-bit targets");
                         }
@@ -6632,7 +6634,9 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_error(c, node->loc.line,
                                 "@%.*s target must be 1, 2, 4, or 8 bytes (got %d-bit type)",
                                 (int)nlen, name, aw);
-                        } else if (aw == 64) {
+                        } else if (aw == 64 && c->target_ptr_bits < 64) {
+                            /* Only warn on 32-bit targets — 64-bit hosts have
+                             * native lock-free 64-bit atomics. */
                             checker_warning(c, node->loc.line,
                                 "@%.*s on 64-bit type may require libatomic on 32-bit targets "
                                 "(AVR, Cortex-M0, RISC-V without A extension)",
@@ -11330,6 +11334,12 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     c->global_scope = scope_new(arena, NULL);
     c->current_scope = c->global_scope;
     c->next_type_id = 1; /* 0 = unknown provenance (BUG-393) */
+
+    /* Sync target pointer width from global. Without this the field
+     * stays 0 (memset-zeroed), and any check `c->target_ptr_bits < N`
+     * always evaluates true regardless of CLI flags. Fix #1
+     * (2026-05-02) — gate u64 atomic warning by target arch. */
+    c->target_ptr_bits = zer_target_ptr_bits;
 
     /* init dynamic type map */
     typemap_init(c);

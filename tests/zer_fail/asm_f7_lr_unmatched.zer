@@ -1,0 +1,16 @@
+// zerc-flags: --target-arch=riscv64
+// F7-light (2026-05-02): C3 state machine — LR without matching SC
+// leaks the reservation. The next SC in any context may spuriously
+// fail or unexpectedly succeed.
+//
+// EXPECTED: compile error citing the unmatched LR.
+
+naked void bad_lr_alone() {
+    asm {
+        instructions: "lr.w x1, (x2)"
+        clobbers: ["memory"]
+        safety: "F7-light test: LR.W without matching SC.W must be rejected"
+    }
+}
+
+i32 main() { return 0; }

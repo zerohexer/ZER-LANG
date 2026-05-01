@@ -1,0 +1,16 @@
+// zerc-flags: --target-arch=riscv64
+// F7-light (2026-05-02): C3 state machine — SC without preceding LR
+// is UB per RISC-V spec. SC's success/failure result is undefined
+// when no reservation is active.
+//
+// EXPECTED: compile error citing the missing LR.
+
+naked void bad_sc_alone() {
+    asm {
+        instructions: "sc.w x1, x2, (x3)"
+        clobbers: ["memory"]
+        safety: "F7-light test: SC.W without preceding LR.W must be rejected"
+    }
+}
+
+i32 main() { return 0; }

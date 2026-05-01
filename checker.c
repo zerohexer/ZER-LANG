@@ -9958,7 +9958,43 @@ static void check_stmt(Checker *c, Node *node) {
              * Lines split by '\n' or ';'. Whitespace trimmed.
              *
              * Schema: arch_data/x86_64.zerdata
-             * Lookup: src/safety/asm_categories.c zer_asm_instruction_info */
+             * Lookup: src/safety/asm_categories.c zer_asm_instruction_info
+             *
+             * F7-light (2026-05-02): C3 state machine for LR/SC pairing
+             * within each asm block. Catches a real UB class:
+             *   - SC without preceding LR → SC behavior undefined
+             *   - LR without matching SC → reservation leaks, may cause
+             *     spurious SC failures elsewhere
+             *
+             * Hardcoded LL/SC mnemonic classification per arch — small
+             * fixed set per ISA, easier than encoding sub-categories
+             * in .zerdata. C3-classified instructions in the .zerdata
+             * tables are the universe; this function partitions them
+             * into LL vs SC. Mnemonics not in either list are C3 but
+             * not LL/SC pair-style (none today, but future MONITOR-X
+             * variants etc. would land here). */
+            #define ZER_ASM_IS_LL(arch, mn, len) ( \
+                ((arch) == ZER_ARCH_X86_64 && (len) == 7 && memcmp((mn), "monitor", 7) == 0) || \
+                ((arch) == ZER_ARCH_AARCH64 && \
+                    (((len) == 4 && memcmp((mn), "ldxr", 4) == 0) || \
+                     ((len) == 5 && memcmp((mn), "ldaxr", 5) == 0))) || \
+                ((arch) == ZER_ARCH_RISCV64 && \
+                    (((len) == 4 && memcmp((mn), "lr.w", 4) == 0) || \
+                     ((len) == 4 && memcmp((mn), "lr.d", 4) == 0))))
+
+            #define ZER_ASM_IS_SC(arch, mn, len) ( \
+                ((arch) == ZER_ARCH_X86_64 && (len) == 5 && memcmp((mn), "mwait", 5) == 0) || \
+                ((arch) == ZER_ARCH_AARCH64 && \
+                    (((len) == 4 && memcmp((mn), "stxr", 4) == 0) || \
+                     ((len) == 5 && memcmp((mn), "stlxr", 5) == 0))) || \
+                ((arch) == ZER_ARCH_RISCV64 && \
+                    (((len) == 4 && memcmp((mn), "sc.w", 4) == 0) || \
+                     ((len) == 4 && memcmp((mn), "sc.d", 4) == 0))))
+
+            bool ll_pending = false;
+            const char *ll_mn_start = NULL;
+            size_t ll_mn_len = 0;
+
             if (node->asm_stmt.instructions && node->asm_stmt.instructions_len > 0) {
                 const char *s = node->asm_stmt.instructions;
                 size_t len = node->asm_stmt.instructions_len;
@@ -10024,12 +10060,71 @@ static void check_stmt(Checker *c, Node *node) {
                             /* (No additional error — the naked check above
                              * is sufficient for v1.0. F7-full will add
                              * the kernel-context model.) */
+
+                            /* F7-light: C3 state machine — LR/SC pairing.
+                             * If this instruction is C3-classified, check
+                             * whether it's an LL (load-linked) or SC
+                             * (store-conditional) and update / verify
+                             * the per-block state. */
+                            if (info.category_bits & 4u /* C3_STATE_MACHINE */) {
+                                if (ZER_ASM_IS_LL(asm_arch, s + mn_start, mn_len)) {
+                                    if (ll_pending) {
+                                        /* Nested LL — second LL without
+                                         * intervening SC. Either a typo or
+                                         * the user is trying to track
+                                         * multiple reservations (most
+                                         * archs only support one at a time). */
+                                        checker_error(c, node->loc.line,
+                                            "asm instruction '%.*s' begins a new LL "
+                                            "(load-linked) reservation while a previous "
+                                            "LL '%.*s' is still pending — most architectures "
+                                            "support only one outstanding reservation; "
+                                            "intervening SC required between LLs",
+                                            (int)mn_len, s + mn_start,
+                                            (int)ll_mn_len, ll_mn_start);
+                                    }
+                                    ll_pending = true;
+                                    ll_mn_start = s + mn_start;
+                                    ll_mn_len = mn_len;
+                                } else if (ZER_ASM_IS_SC(asm_arch, s + mn_start, mn_len)) {
+                                    if (!ll_pending) {
+                                        /* SC without LL — undefined behavior;
+                                         * the SC's success/failure is meaningless. */
+                                        checker_error(c, node->loc.line,
+                                            "asm instruction '%.*s' is a store-conditional "
+                                            "without a preceding load-linked (LR/LDXR/MONITOR) "
+                                            "in the same asm block — UB per ISA spec; "
+                                            "consequence: %s",
+                                            (int)mn_len, s + mn_start,
+                                            info.consequence ? info.consequence : "SC result undefined");
+                                    }
+                                    ll_pending = false;
+                                    ll_mn_start = NULL;
+                                    ll_mn_len = 0;
+                                }
+                                /* Other C3-classified mnemonics (none today)
+                                 * fall through without state machine effect. */
+                            }
                         }
                     }
                     /* Skip rest of this instruction (operands) up to delimiter */
                     while (i < len && s[i] != '\n' && s[i] != ';') i++;
                 }
             }
+            /* End-of-block check: LL must be paired with SC within the same
+             * asm block. Cross-block LL/SC pairing is not supported (the
+             * 16-instruction limit + structural rules ensure each asm block
+             * is self-contained). */
+            if (ll_pending) {
+                checker_error(c, node->loc.line,
+                    "asm block ends with unmatched LL (load-linked) '%.*s' — "
+                    "missing store-conditional (SC) leaves the reservation "
+                    "leaked; subsequent SC in another context may fail "
+                    "spuriously or succeed unexpectedly",
+                    (int)ll_mn_len, ll_mn_start);
+            }
+            #undef ZER_ASM_IS_LL
+            #undef ZER_ASM_IS_SC
         }
         break;
 

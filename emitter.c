@@ -1429,8 +1429,26 @@ static void emit_expr(Emitter *e, Node *node) {
                 goto assign_done;
             }
         }
-        /* compound div/mod: target /= n → check n != 0 first */
+        /* compound div/mod: target /= n / target %= n.
+         *
+         * Fix #3 (2026-05-02): mirror the IR path's complete guard set
+         * (emitter.c:5815-5841). Two safety properties:
+         *   (1) divisor != 0 (defense in depth — checker forces compile-
+         *       time guard, but emitter still adds runtime trap)
+         *   (2) on signed types, INT_MIN/-1 is C UB → trap.
+         *
+         * Pre-fix this AST path only checked (1). Function bodies are
+         * IR-only since 2026-04-19, so user code reaches the IR path
+         * with both guards. But other emission contexts (some
+         * statement-expression fallbacks, top-level initializers,
+         * comptime emission, future AST callers) still go through
+         * emit_expr. Defense in depth: every emission site enforces
+         * both invariants. */
         if (node->assign.op == TOK_SLASHEQ || node->assign.op == TOK_PERCENTEQ) {
+            Type *tgt_type = checker_get_type(e->checker, node->assign.target);
+            Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+            bool is_signed_div = tgt_eff && type_is_signed(tgt_eff);
+            const char *cop = node->assign.op == TOK_SLASHEQ ? "/" : "%";
             int tmp = e->temp_count++;
             emit(e, "({ __typeof__(");
             emit_expr(e, node->assign.value);
@@ -1438,9 +1456,20 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->assign.value);
             emit(e, "; if (_zer_dv%d == 0) ", tmp);
             emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); ");
+            if (is_signed_div) {
+                emit(e, "if (_zer_dv%d == -1) { __typeof__(", tmp);
+                emit_expr(e, node->assign.target);
+                emit(e, ") _zer_dd%d = ", tmp);
+                emit_expr(e, node->assign.target);
+                int w = type_width(tgt_eff);
+                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
+                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
+                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
+                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
+            }
             emit_expr(e, node->assign.target);
-            emit(e, " %s= _zer_dv%d; })",
-                 node->assign.op == TOK_SLASHEQ ? "/" : "%", tmp);
+            emit(e, " %s= _zer_dv%d; })", cop, tmp);
             goto assign_done;
         }
         /* compound shift: target <<= n → target = _zer_shl(target, n)

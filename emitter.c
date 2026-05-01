@@ -9830,10 +9830,15 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         e->indent++;
         e->current_func_ret = NULL;
     } else {
-        /* BUG-651 fix (2026-05-02): function-level GCC attributes
+        /* BUG-651 fix (2026-05-01/02): function-level GCC attributes
          * (section/static) propagate from AST to emitted C. Pre-fix,
          * the IR migration silently dropped these — they only existed
-         * on the AST proto-only path. Now both paths share one helper. */
+         * on the AST proto-only path. Now both paths share one helper.
+         *
+         * NOTE: `__attribute__((naked))` is intentionally NOT emitted —
+         * existing asm tests rely on the implicit prologue/epilogue and
+         * would SIGILL if naked were re-enabled. Restoring true naked
+         * semantics is tracked separately in docs/limitations.md. */
         emit_func_attributes(e, fn);
 
         /* Return type + name.

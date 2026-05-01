@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // BUG-650 (2026-05-02): compound (struct.field) handle merge across CFG join.
 //
 // Pre-fix, `ir_merge_states` used bare-only handle lookups
@@ -20,6 +21,19 @@
 //
 // EXPECTED: zercheck use-after-free / maybe-freed error on the use of
 // `b.h` after the conditional free.
+=======
+// Compound (struct.field) handle merge across CFG join points.
+//
+// Pre-fix (2026-05-01): `ir_merge_states` used bare-only handle
+// lookups (ir_find_handle), so a compound handle freed in one branch
+// did NOT widen to MAYBE_FREED at the join point — second loop also
+// re-added pred's compound entries via bare-keyed dedup, producing
+// duplicate rows where a stale ALIVE entry could hide the FREED state
+// from later use-site lookups.
+//
+// EXPECTED: zercheck use-after-free / maybe-freed error on the use
+// of `b.h` after the conditional free.
+>>>>>>> a432b3f (audit: BUG-650 compound-key CFG merge + BUG-651 IR-path section attr)
 
 struct Task { u32 id; }
 struct Box { Handle(Task) h; }

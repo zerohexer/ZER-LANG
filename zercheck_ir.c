@@ -462,12 +462,7 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
      * (local_id, path, path_len). For the second loop's add-if-missing,
      * we use `ir_alloc_handle_slot` directly because `ir_add_handle`
      * goes through bare-only `ir_find_handle` and can't add a compound
-     * entry.
-     *
-     * On main today this bug is masked by AST `zercheck.c` running in
-     * parallel and catching it via different logic; the IR analyzer
-     * will be the sole exit-code driver after Phase G deletes
-     * zercheck.c, so the fix lands here pre-emptively. */
+     * entry. */
     for (int si = first_live + 1; si < state_count; si++) {
         if (states[si].terminated) continue; /* dead path, skip */
 

@@ -1,0 +1,23 @@
+// Fix #1 (2026-05-02): u64 @atomic_* must NOT warn about libatomic on 64-bit targets.
+//
+// Pre-fix, checker.c emitted "may require libatomic on 32-bit targets"
+// for every u64 atomic regardless of target_ptr_bits. False positive
+// noise on x86_64 / aarch64 / riscv64 hosts where 64-bit atomics are
+// natively lock-free.
+//
+// Fix gates the warning by `c->target_ptr_bits < 64`. Plus the deeper
+// bug: `c->target_ptr_bits` was never initialized — checker_init now
+// syncs it from the global `zer_target_ptr_bits`.
+//
+// This file is in the no-warning list; any regression of the false
+// positive on the default x86_64 target fails CI.
+
+u64 g_counter;
+
+i32 main() {
+    @atomic_store(&g_counter, 0);
+    u64 v = @atomic_load(&g_counter);
+    @atomic_add(&g_counter, 0);
+    @atomic_or(&g_counter, 0);
+    return (i32)v;
+}

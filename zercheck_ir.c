@@ -406,14 +406,27 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
 
     IRPathState result = ir_ps_copy(&states[first_live]);
 
-    /* Merge each subsequent non-terminated predecessor */
+    /* Merge each subsequent non-terminated predecessor.
+     *
+     * Phase B3 correctness: lookups MUST be compound-aware. Using
+     * ir_find_handle (bare-only) caused two failure modes for compound
+     * (struct.field) handles registered via ir_add_compound_handle:
+     *   1) First loop missed pred's compound state, so a FREED-in-one-
+     *      branch compound stayed at result's pre-merge state instead
+     *      of widening to MAYBE_FREED.
+     *   2) Second loop's bare-keyed dedup let pred's compound get
+     *      re-added even when result already had a same-key entry,
+     *      producing duplicate compound rows whose first match might
+     *      hide a later FREED/MAYBE_FREED state.
+     * Both paths are now compound-aware via ir_find_compound_handle. */
     for (int si = first_live + 1; si < state_count; si++) {
         if (states[si].terminated) continue; /* dead path, skip */
 
         /* For each handle in result, check if same handle exists in this pred */
         for (int hi = 0; hi < result.handle_count; hi++) {
             IRHandleInfo *rh = &result.handles[hi];
-            IRHandleInfo *ph = ir_find_handle(&states[si], rh->local_id);
+            IRHandleInfo *ph = ir_find_compound_handle(&states[si], rh->local_id,
+                                                       rh->path, rh->path_len);
 
             if (!ph) continue; /* handle not in this pred — keep result's state */
 
@@ -427,15 +440,24 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                 rh->state = IR_HS_MAYBE_FREED; /* conservative */
             } else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_ALIVE) {
                 rh->state = IR_HS_MAYBE_FREED;
+            } else if (rh->state == IR_HS_MAYBE_FREED && ph->state == IR_HS_FREED) {
+                /* keep MAYBE_FREED — conservative */
+            } else if (rh->state == IR_HS_FREED && ph->state == IR_HS_MAYBE_FREED) {
+                rh->state = IR_HS_MAYBE_FREED;
             }
             /* Both same state → keep. Both freed → keep freed. */
         }
 
-        /* Add handles from pred that aren't in result yet */
+        /* Add handles from pred that aren't in result yet (compound-aware). */
         for (int pi = 0; pi < states[si].handle_count; pi++) {
-            if (!ir_find_handle(&result, states[si].handles[pi].local_id)) {
-                IRHandleInfo *nh = ir_add_handle(&result, states[si].handles[pi].local_id);
-                if (nh) *nh = states[si].handles[pi];
+            IRHandleInfo *src = &states[si].handles[pi];
+            if (!ir_find_compound_handle(&result, src->local_id,
+                                         src->path, src->path_len)) {
+                IRHandleInfo *nh = ir_alloc_handle_slot(&result);
+                if (nh) *nh = *src;
+                /* path is arena-allocated by ir_extract_compound_key —
+                 * sharing the pointer across path states is safe for the
+                 * lifetime of zercheck_ir analysis. */
             }
         }
     }

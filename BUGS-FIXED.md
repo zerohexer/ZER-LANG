@@ -5,6 +5,125 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-05-01 — Audit: compound-key CFG merge + IR-path attribute forwarding
+
+Spawned five parallel audit agents over IR/checker/zercheck_ir/emitter/
+baremetal-vs-hosted to hunt silent miscompiles. Verified each finding
+by reading the cited code and running reproducers; fixed two confirmed
+silent gaps and documented several more for follow-up.
+
+### BUG-650: zercheck_ir compound-key merge silently widens to ALIVE at CFG join points
+
+**Symptom:** A struct-field handle (e.g. `b.h` registered as compound
+`(b_local, ".h")` via `ir_add_compound_handle`) freed in one branch
+of an if/else can survive merging without becoming MAYBE_FREED.
+zercheck.c (legacy AST analyzer) currently masks this in dual-run by
+catching the same scenario, but the CFG analyzer is the v0.5+ primary
+and the gap is real per code inspection.
+
+**Root cause:** `ir_merge_states` (zercheck_ir.c:386–444) iterated over
+result entries with `ir_find_handle(states[si], rh->local_id)` — the
+**bare-only** lookup. For compound entries `path_len > 0`, this
+consistently returned NULL, so the if-branch's FREED state was never
+combined with the else-branch's ALIVE state — result kept its
+pre-merge state. The second loop, which adds pred handles missing
+from result, also keyed off the bare-only lookup, so a compound row
+in pred would be re-added even when result already held the same
+`(local_id, path)` key — producing duplicate compound rows whose
+first match (often the original, stale state) hid the divergent
+state from later use-site lookups via `ir_find_compound_handle`.
+
+**Fix:** Both lookups now use `ir_find_compound_handle(ps, local_id,
+path, path_len)`, which keys on `(local_id, path, path_len)` and
+returns NULL only when the exact compound key is absent. New rows
+added via `ir_alloc_handle_slot` after a compound-aware miss; arena-
+allocated path strings are safely shared across path-state copies.
+Also added the missing transitions for MAYBE_FREED ↔ FREED to keep
+the merge monotonic toward MAYBE_FREED.
+
+**Test:** `tests/zer_fail/compound_field_maybe_freed.zer` exercises
+the canonical pattern (assign compound, conditionally free, fall
+through, use post-merge) and now correctly reports
+`use-after-free: 'b.h' may have been freed`.
+
+### BUG-651: `__attribute__((section))` silently dropped by IR emission path
+
+**Symptom:** A function declared with `section "..."` (e.g. firmware
+table placement, ISR vector linker section) compiled clean but the
+emitted C lacked the section attribute, causing the linker to place
+the function in `.text` instead of the named section.
+
+**Root cause:** `emit_func_decl` at emitter.c:3690 emitted
+`__attribute__((section("..."))) ` only on the **bodyless** code
+path (forward declarations / extern bindings). The function-with-
+body path returned early after `emit_func_from_ir`, never reaching
+the attribute emission. The IR-side emitter `emit_regular_func_from_ir`
+had no equivalent. Section attributes for user-defined functions were
+silently lost.
+
+**Fix:** `emit_regular_func_from_ir` now reads `fn->func_decl.section`
+from the AST node and emits the attribute before the return type +
+name. `is_static` was also forwarded for parity with the bodyless
+branch.
+
+**Note:** `__attribute__((naked))` was DELIBERATELY left disabled in
+the IR path despite the same regression. Existing user code and
+tests rely on the implicit prologue/epilogue (their asm bodies omit
+explicit `ret`). Re-emitting `naked` would SIGILL those programs at
+runtime. Restoring true naked semantics is a separate breaking
+change tracked under "Silent gaps deferred" below.
+
+### Silent gaps deferred (audit findings, NOT fixed this session)
+
+1. **Naked function silently has prologue/epilogue.** `naked void f()`
+   compiles as if naked were a no-op marker. `__attribute__((naked))`
+   never lands on the function. Existing `tests/zer/asm_*.zer`
+   suite depends on this (no explicit `ret` in their asm). Real fix:
+   emit naked + update every asm test to include `ret`. Document in
+   docs/limitations.md.
+
+2. **Naked function with `return expr;`.** When real naked semantics
+   land, `return value` is ABI-broken (no return-register setup).
+   Add checker error at the same time as enabling the attribute.
+
+3. **AST `emit_expr` compound `/=` `%=` missing signed-overflow trap
+   (emitter.c:1433–1444).** BUG-612 fixed the IR path
+   (emit_rewritten_node:5787–5808) but the AST sibling still only
+   guards divzero. Reachability through user function bodies is
+   limited (function bodies are IR-only post-2026-04-19); reachable
+   from non-function-body emission and rare expression contexts.
+
+4. **`@once` unconditionally emits `__atomic_exchange_n` without
+   `__STDC_HOSTED__` guard** (emitter.c:8313). Freestanding targets
+   without libatomic linkage may fail to link or run racy.
+
+5. **`@probe` returns "has_value=1" silently on freestanding targets**
+   (emitter.c:4626–4632). The user-mode signal handler intercepting
+   SIGSEGV is the only path that produces null; no MMU/no signal =
+   silent garbage.
+
+6. **`@critical` body's transitive escape via callee return**
+   (checker.c:8983, 10016). Direct `return` inside `@critical` is
+   rejected; calling a function whose body returns leaves the
+   critical scope without re-enabling interrupts. Requires function-
+   summary or call-graph analysis to catch.
+
+7. **u64 atomic warning fires on 64-bit targets** (checker.c:6601,
+   6637) — false positive. `--target-bits` is honored elsewhere but
+   this warning ignores it.
+
+8. **Pool/Slab `alloc()` non-atomic ISR vs main race** (Gap 5 in
+   docs/4-27-2026-gaps.md, already documented as open).
+
+9. **`@cstr` to raw `*u8` destination has no bounds check**
+   (Gap 27 in docs/4-27-2026-gaps.md, already documented as open).
+
+These remain in the audit roadmap. Stage 4+ of the gaps roadmap
+(post-D-Alpha-7.5 Phase 2) has the bandwidth for the bigger ones
+(naked semantics migration, transitive @critical analysis).
+
+---
+
 ## Session 2026-04-29 — Stages 2B + 3 + Sub-extension Validation + F4.1 + F4.2
 
 **Massive multi-stage session.** Closed Stage 2 Part B (walker exhaustiveness

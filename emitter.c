@@ -9616,6 +9616,29 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         e->indent++;
         e->current_func_ret = NULL;
     } else {
+        /* Function attributes that propagate from AST → IR emission.
+         *
+         * NOTE 2026-05-01: `__attribute__((naked))` is intentionally NOT
+         * emitted here. The IR migration silently dropped it from the
+         * regular function path (it lived only on the now-dead bodyless
+         * branch in emit_func_decl). Existing user code and tests rely
+         * on the implicit prologue/epilogue: their asm bodies don't
+         * include explicit `ret` instructions. Re-enabling the attribute
+         * now would SIGILL these programs at runtime. Restoring true
+         * naked semantics (no prologue, user-controlled `ret`, banned
+         * `return expr;`) is a separate user-visible breaking change
+         * tracked in docs/limitations.md and requires per-test asm
+         * updates. Keeping the attribute off here is the conservative
+         * default until that migration runs.
+         *
+         * `section` IS forwarded — the regression silently lost it as
+         * well, but no test depends on its absence. */
+        if (fn->func_decl.section) {
+            emit(e, "__attribute__((section(\"%.*s\"))) ",
+                 (int)fn->func_decl.section_len, fn->func_decl.section);
+        }
+        if (fn->func_decl.is_static) emit(e, "static ");
+
         /* Return type + name.
          * func->return_type may be the function TYPE (func_ptr) from typemap.
          * Extract the actual return type from func_ptr.ret. */

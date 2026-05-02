@@ -1318,9 +1318,12 @@ constants in fixed buffers — the rule is "stack fast path, arena overflow".
 | F7-full Step 2c (ALIGNED via heuristic Pass B) | DONE 2026-05-02 | MOVAPS misaligned constants rejected. Heuristic walks all bindings (positional binding fails when register operands are clobbers). |
 | F7-full Step 2d (BOUNDED via VRP) | DONE 2026-05-02 | Wiring active; no .zerdata entries use BOUNDED yet. |
 | C8 instruction classification | DONE 2026-05-02 | x86 CLWB/CLFLUSHOPT (53 entries), ARM LDAR/STLR/LDARB/LDARH/STLRB/STLRH (37 entries). Persistent-memory + acquire/release primitives ready for Session G enforcement. |
+| Session G Phase 1 (ordering plumbing) | DONE 2026-05-02 | `ZerBarrierKind` + `ZerOrderingRole` enums; ordering field on instruction entry; generator + 3 vendored tables. |
+| Session G Phase 2 (per-instruction classification) | DONE 2026-05-02 | x86/ARM/RISC-V C8 entries declare ordering.barrier_kind + role (MFENCE→PRODUCES FullMemory; CLWB→REQUIRES_AFTER StoreStore; LDAR→PRODUCES Acquire; etc.). |
+| Session G Phase 3 (in-block enforcement) | ABANDONED 2026-05-02 | Same-block check rejected canonical multi-block libpmem idiom; reverted. See docs/asm_preconditions_research.md "Design gaps identified during failed G3 attempt" for the 5 reasons why intermediate phases were dropped. |
+| Session G IR-level enforcement | NEXT (~30-40 hrs) | Smallest design that doesn't false-positive: full CFG-aware OrderingState in `zercheck_ir.c`. Tracks barriers from BOTH asm blocks AND `@atomic_*` intrinsics. Joins use set-intersection. See docs/asm_preconditions_research.md "Implementation sketch". |
 | C5 (privilege) | Covered by S1 | Naked-only restriction is the v1.0 stand-in. F7-full would add explicit kernel-context model. |
 | C6 (memory addr) | Covered by @inttoptr | Existing MMIO range check fires at every address derivation. |
-| C8 (memory order) ENFORCEMENT | Stage 5 work | System #30 / Session G (~80 hrs). Classification done; pairing/ordering tracking pending. |
 | Z9/Z10/Z13 forward-compat | Blocked on S1 relaxation | Included in F7-full estimate. |
 | naked attribute migration | DEFERRED | Requires asm-test rewrite (~20 hrs after S1 relaxation). See docs/limitations.md. |
 
@@ -1365,9 +1368,19 @@ silently always-true. See BUG-652 on 2026-05-02.
 - @critical "transitive escape via callee" was investigated 2026-05-02
   and found to be NOT a bug — don't re-implement `can_escape`. See
   docs/limitations.md.
-- Session G (System #30 / atomic ordering) is the next major piece.
-  Design spec in `docs/asm_preconditions_research.md` Category C8 section.
-  ~80 hrs implementation. Adds OrderingState CFG traversal in zercheck_ir.c.
+- **Session G (System #30 / atomic ordering) is the next major piece.**
+  Phase 1 (data plumbing) + Phase 2 (per-instruction classification)
+  DONE 2026-05-02. Phase 3 (in-block enforcement) was attempted and
+  ABANDONED — same-block check creates false positives on canonical
+  multi-block CLWB+SFENCE idiom. The honest path is IR-level
+  enforcement (Phase 5 of original plan, now the next phase) —
+  see `docs/asm_preconditions_research.md` "Design gaps identified
+  during failed G3 attempt" for why intermediate phases are
+  bypassed. Implementation: ~30-40 hrs CFG-aware OrderingState in
+  `zercheck_ir.c` that tracks barriers from BOTH asm blocks AND
+  `@atomic_*` intrinsics. Lesson: don't ship enforcement that
+  rejects valid code patterns; either skip the check or wait until
+  the analysis is correct.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

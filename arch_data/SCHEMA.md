@@ -58,6 +58,8 @@ Every entry MUST have:
 | `required_features` | NONE | Bitmap of required CPU features (e.g., AVX512F, AMX_TILE). Combined with `+`. |
 | `consequence` | "" | One-line description of what goes wrong if the constraint is violated. Used in error messages. |
 | `notes` | "" | Free-form notes for the human reader. Not parsed. |
+| `ordering.barrier_kind` | NONE | What kind of memory ordering this instruction participates in. See "Ordering kinds" below. |
+| `ordering.role` | NONE | How the instruction relates to its barrier_kind: PRODUCES, REQUIRES_BEFORE, or REQUIRES_AFTER. See "Ordering roles" below. |
 
 ## Category values (bitmap)
 
@@ -106,6 +108,69 @@ BOUNDED(min, max)            # value must be in [min, max] inclusive
 COMPOUND(c1, c2, ...)        # all constraints must hold (logical AND)
 NOT_OVERFLOW_MIN_DIV_NEG_ONE # IDIV-specific: operand can't be MIN/-1 (overflow)
 ```
+
+## Ordering kinds (Session G Phase 1, 2026-05-02)
+
+Atomic ordering classification — read by Stage 5 (System #30) for happens-before tracking.
+
+```
+NONE              # not ordering-relevant (default)
+FULL_MEMORY       # MFENCE, DMB SY, FENCE rw,rw — orders all memops
+STORE_STORE       # SFENCE, DMB ST, FENCE w,w — orders prior stores before subsequent stores
+LOAD_LOAD         # LFENCE, DMB LD, FENCE r,r — orders prior loads before subsequent loads
+LOAD_STORE        # FENCE r,w — orders prior loads before subsequent stores
+STORE_LOAD        # MFENCE essentially — strongest pairing
+RELEASE           # paired with acquire — one-way (STLR establishes release)
+ACQUIRE           # paired with release — one-way (LDAR establishes acquire)
+ACQUIRE_RELEASE   # strong combined (some atomics have both)
+INSTRUCTION_SYNC  # ISB, FENCE.I — synchronizes instruction cache
+IO_MEMORY         # FENCE iorw,iorw — RISC-V I/O ordering
+DMA_SYNC          # @barrier_dma — pairs with DMA engines
+```
+
+## Ordering roles
+
+```
+NONE             # not ordering-relevant (default)
+PRODUCES         # THIS instruction establishes the barrier (e.g., MFENCE produces FullMemory)
+REQUIRES_BEFORE  # requires a barrier of barrier_kind to have run earlier (rare)
+REQUIRES_AFTER   # requires a barrier of barrier_kind to run subsequently
+                 # (e.g., CLWB requires SFENCE before next dependent store for visibility)
+```
+
+### Examples
+
+```
+[mfence]
+ordering.barrier_kind = FULL_MEMORY
+ordering.role = PRODUCES
+
+[sfence]
+ordering.barrier_kind = STORE_STORE
+ordering.role = PRODUCES
+
+[clwb]
+ordering.barrier_kind = STORE_STORE
+ordering.role = REQUIRES_AFTER     # needs SFENCE before next dependent store
+
+[ldar]
+ordering.barrier_kind = ACQUIRE
+ordering.role = PRODUCES
+
+[stlr]
+ordering.barrier_kind = RELEASE
+ordering.role = PRODUCES
+
+[fence.i]
+ordering.barrier_kind = INSTRUCTION_SYNC
+ordering.role = PRODUCES
+```
+
+Today (Session G Phase 1) these fields are CAPTURED but NOT yet ENFORCED.
+Phase 3 (CLWB→SFENCE check) is the first enforcement. Phase 5 lights up
+full CFG-aware OrderingState pass in zercheck_ir.c.
+
+## Constraint mapping
 
 Constraints map to existing ZER safety systems at check time:
 - `NONZERO`, `BOUNDED` → VRP (System #12)

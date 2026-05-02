@@ -304,13 +304,17 @@ operand[1].type = IMMEDIATE
 category = C8_MEMORY_ORDER
 source = "RISC-V Unprivileged ISA — FENCE"
 consequence = "Memory ordering barrier with predecessor/successor sets (PI/PO/PR/PW for input I/O, output, read, write). Stage 5 / System #30 will enforce correct usage."
-notes = "Operands are 4-bit predecessor and successor masks."
+notes = "Operands are 4-bit predecessor and successor masks. Phase 1 classifies as FULL_MEMORY conservatively; Phase 5 will inspect predecessor/successor masks for finer-grained ordering."
+ordering.barrier_kind = FULL_MEMORY
+ordering.role = PRODUCES
 
 [fence.i]
 operand_count = 0
 category = C8_MEMORY_ORDER
 source = "RISC-V Unprivileged ISA — Zifencei extension FENCE.I"
 consequence = "Instruction-fetch fence. Required after self-modifying code or page-table updates affecting executable pages."
+ordering.barrier_kind = INSTRUCTION_SYNC
+ordering.role = PRODUCES
 
 [fence.tso]
 operand_count = 0

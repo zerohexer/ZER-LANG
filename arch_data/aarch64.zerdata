@@ -260,7 +260,9 @@ operand[0].type = IMMEDIATE
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 DMB"
 consequence = "no enforcement today (Stage 5 / System #30); semantics: data memory barrier scoped by option"
-notes = "Options: SY (full), LD, ST, ISH (inner shareable), OSH (outer), NSH (non-shareable)."
+notes = "Options: SY (full), LD, ST, ISH (inner shareable), OSH (outer), NSH (non-shareable). Phase 1 classifies as FULL_MEMORY conservatively; finer-grained variants tracked in Phase 5."
+ordering.barrier_kind = FULL_MEMORY
+ordering.role = PRODUCES
 
 [dsb]
 operand_count = 1
@@ -268,6 +270,8 @@ operand[0].type = IMMEDIATE
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 DSB"
 consequence = "data synchronization barrier; stricter than DMB (waits for completion)"
+ordering.barrier_kind = FULL_MEMORY
+ordering.role = PRODUCES
 
 [isb]
 operand_count = 0
@@ -275,6 +279,8 @@ category = C8_MEMORY_ORDER
 source = "ARM ARM A64 ISB"
 consequence = "instruction synchronization barrier; flushes pipeline"
 notes = "Required after self-modifying code or system register writes that affect execution."
+ordering.barrier_kind = INSTRUCTION_SYNC
+ordering.role = PRODUCES
 
 [sev]
 operand_count = 0
@@ -302,6 +308,8 @@ category = C8_MEMORY_ORDER
 source = "ARM ARM A64 LDAR"
 consequence = "load with acquire ordering; subsequent memops cannot reorder before"
 notes = "One-way ordering — pairs with STLR for release/acquire patterns."
+ordering.barrier_kind = ACQUIRE
+ordering.role = PRODUCES
 
 [stlr]
 operand_count = 2
@@ -311,6 +319,8 @@ category = C8_MEMORY_ORDER
 source = "ARM ARM A64 STLR"
 consequence = "store with release ordering; prior memops cannot reorder after"
 notes = "One-way ordering — pairs with LDAR for release/acquire patterns."
+ordering.barrier_kind = RELEASE
+ordering.role = PRODUCES
 
 [ldarb]
 operand_count = 2
@@ -319,6 +329,8 @@ operand[1].type = MEMORY
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 LDARB"
 consequence = "byte load with acquire ordering"
+ordering.barrier_kind = ACQUIRE
+ordering.role = PRODUCES
 
 [ldarh]
 operand_count = 2
@@ -327,6 +339,8 @@ operand[1].type = MEMORY
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 LDARH"
 consequence = "halfword load with acquire ordering"
+ordering.barrier_kind = ACQUIRE
+ordering.role = PRODUCES
 
 [stlrb]
 operand_count = 2
@@ -335,6 +349,8 @@ operand[1].type = MEMORY
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 STLRB"
 consequence = "byte store with release ordering"
+ordering.barrier_kind = RELEASE
+ordering.role = PRODUCES
 
 [stlrh]
 operand_count = 2
@@ -343,3 +359,5 @@ operand[1].type = MEMORY
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 STLRH"
 consequence = "halfword store with release ordering"
+ordering.barrier_kind = RELEASE
+ordering.role = PRODUCES

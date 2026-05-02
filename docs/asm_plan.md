@@ -2707,17 +2707,27 @@ All concrete F-track work for Stage 4 is **DONE**:
 | F7-full Step 2c ALIGNED via heuristic Pass B (MOVAPS) | ✅ DONE 2026-05-02 |
 | F7-full Step 2d BOUNDED via VRP | ✅ DONE 2026-05-02 |
 | C8 instruction classification (CLWB/CLFLUSHOPT/LDAR/STLR) | ✅ DONE 2026-05-02 |
+| Session G Phase 1 (ordering data plumbing) | ✅ DONE 2026-05-02 |
+| Session G Phase 2 (per-instruction ordering classification) | ✅ DONE 2026-05-02 |
+| Session G Phase 3 (in-block enforcement) | ❌ ABANDONED 2026-05-02 — false-positive on multi-block CLWB+SFENCE idiom; see docs/asm_preconditions_research.md |
+| Session G Phase 5 (IR-level CFG OrderingState) | ⏳ NEXT — ~30-40 hrs (revised down from 80 after Phase 1+2 plumbing landed) |
 
 What's left in the asm-safety milestone:
 
 1. **3 remaining Z-rules** (Z9, Z10, Z13) — forward-compat, blocked on S1 relaxation
-2. **Session G / System #30** (Stage 5) — atomic ordering analysis (~80 hrs)
+2. **Session G Phase 5 (IR-level CFG OrderingState)** (Stage 5) — atomic ordering enforcement (~30-40 hrs). Walks IR per-function, tracks barriers from BOTH asm blocks AND `@atomic_*` intrinsics, joins use set-intersection. Phase 1+2 already shipped the data plumbing.
 3. **F6-extensions (later)** — RISC-V V vector extension if demand emerges
 
 **Stage 4 closed real silent gaps** today: BSR with unprovable nonzero,
 IDIV divisor, MOVAPS misaligned constants — all rejected at compile time
 with vendor citations. The C8 instructions are classified and waiting for
-Session G's OrderingState tracking to enforce pairing.
+Stage 5's IR-level OrderingState pass to enforce pairing.
+
+**Lesson from G3 abandonment:** don't ship enforcement that rejects
+valid code patterns. Same-block CLWB→SFENCE check would false-positive
+on the canonical multi-block libpmem idiom. The honest path is
+CFG-aware tracking that integrates ZER's `@atomic_*` intrinsics
+alongside asm barriers — that's the IR-level pass.
 
 ### Optional UX polish (deferred)
 

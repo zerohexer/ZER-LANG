@@ -1504,9 +1504,60 @@ defer @barrier_store();      // fires FIRST (LIFO)
 ```
 CLWB fires AFTER SFENCE → CLWB has no subsequent barrier → UB. Plan misses it.
 
-**Resolution**: ban REQUIRES_AFTER intrinsics inside defer bodies. Compile error: `"@cache_writeback in defer body — barrier must come AFTER the writeback, but defer fires at function exit (no 'after')."`
+**Resolution (corrected — was originally "ban", revised to TRACK per CLAUDE.md design philosophy)**:
 
-**Action**: add to Step 5.6.5. ~10 LOC. Closes the false-negative.
+CLAUDE.md's ban-decision framework: safety = tracking, not banning. Apply to defer-REQUIRES_AFTER:
+1. Hardware/OS constraint? No
+2. Emission impossibility? No
+3. Needs runtime? No
+4. Needs type system? No
+5. → TRACK, don't ban.
+
+**Proper TRACK solution: simulate defer LIFO at function exit.**
+
+Algorithm in Step 5.6.5:
+1. Collect all `IR_DEFER_PUSH` in function (document order)
+2. For each IR_RETURN block:
+   - Walk defers in REVERSE order (LIFO simulation)
+   - For each defer body, scan AST for ordering events:
+     - PRODUCES → add to `barriers_seen`
+     - REQUIRES_AFTER → add to `pending`
+   - After all defers simulated, check pending against barriers_seen
+
+This correctly handles:
+
+```zer
+// Correct: SFENCE fires after CLWB in execution (LIFO)
+defer @barrier_store();      // fires LAST
+defer @cache_writeback(p);   // fires FIRST
+// LIFO sim: CLWB pending → SFENCE discharge → PASS
+```
+
+```zer
+// Wrong: SFENCE fires BEFORE CLWB (LIFO)
+defer @cache_writeback(p);   // fires LAST
+defer @barrier_store();      // fires FIRST
+// LIFO sim: SFENCE → CLWB pending → ERROR
+```
+
+```zer
+// Wrong: bare CLWB in defer
+defer @cache_writeback(p);
+// LIFO sim: CLWB pending → ERROR
+```
+
+```zer
+// Correct: main-body CLWB, defer SFENCE
+asm { instructions: "clwb (%0)" ... }  // main body: pending+=
+defer @barrier_store();
+// Main body pending → defer SFENCE discharges → PASS
+```
+
+All cases correct, no false positives.
+
+**Effort**: ~30 LOC (vs ~10 for the ban approach). Worth it for correctness + no false positives + alignment with CLAUDE.md philosophy.
+
+**Action**: Step 5.6.5 implements LIFO simulation. Walks defers in reverse, applies both PRODUCES and REQUIRES_AFTER events.
 
 **Other correctness checks**:
 - Mutual recursion in barriers_produced: pessimistic-and-stable. Correct (no false positive; possible false negative for symmetric patterns — acceptable).
@@ -1667,7 +1718,7 @@ DEFER Phase 5 IF:
 | Audit rounds | 6 |
 | Distinct findings | 74 (added 1 in round 6: defer-REQUIRES_AFTER) |
 | Critical findings | 6 |
-| Final estimate | ~67 hrs (was 66; +1 hr for defer ban) |
+| Final estimate | ~68 hrs (was 66; +2 hrs for defer LIFO simulation, was +1 for ban) |
 | Architectural soundness | ✓ confirmed across 6 rounds |
 | Implementation readiness | ✓ ready when go-ahead given |
 | Real-world user surface | 1 test file (dalpha13) |

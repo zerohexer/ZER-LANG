@@ -20,14 +20,47 @@
 #include <stdint.h>
 #include "asm_categories.h"
 
+/* F7-full Step 1 (2026-05-02): per-operand constraint encoding.
+ *
+ * Each instruction may impose constraints on individual operands at the
+ * time of asm-block dispatch. Constraints are derived from vendor specs
+ * (Intel SDM, ARM ARM, RISC-V ISA) and encoded in arch_data/<arch>.zerdata
+ * via `operand[N].constraint = ...` syntax.
+ *
+ * Step 1 (this entry): the data plumbing — generator now emits these,
+ * struct now stores them, vendored tables now contain them.
+ *
+ * Step 2 (future session): the dispatch — at NODE_ASM check, when a
+ * C1/C2-classified instruction matches, look up which operand index
+ * has the constraint, find the matching asm operand binding, query
+ * VRP (for C1) or qualifier system (for C2), error if unprovable. */
+
+typedef enum {
+    ZER_OPC_NONE                          = 0,  /* no constraint on this operand */
+    ZER_OPC_NONZERO                       = 1,  /* operand must be provably non-zero — VRP check */
+    ZER_OPC_ALIGNED                       = 2,  /* memory operand must be N-byte aligned (param1 = N) */
+    ZER_OPC_BOUNDED                       = 3,  /* operand value in [param1, param2] */
+    ZER_OPC_COMPOUND_NONZERO_NOT_INTMIN   = 4,  /* IDIV-style: non-zero AND not INT_MIN/-1 overflow */
+} ZerOperandConstraintKind;
+
+typedef struct {
+    uint8_t kind;       /* ZerOperandConstraintKind */
+    uint32_t param1;    /* alignment N, or BOUNDED min */
+    int32_t param2;     /* BOUNDED max (signed for negative ranges) */
+} ZerOperandConstraint;
+
+#define ZER_OPC_MAX_OPERANDS 4
+
 /* Per-instruction entry. Fields:
- *   mnemonic       — null-terminated string, e.g., "bsr"
- *   mnemonic_len   — strlen, cached for fast scan
- *   category_bits  — ZerAsmCategory bitmap (C1-C8)
- *   feature_bits   — ZerCpuFeature bitmap (e.g., AVX512F)
- *   source         — vendor citation, e.g., "Intel SDM Vol 2A BSR"
- *   consequence    — what goes wrong if precondition violated, used in
- *                    error messages */
+ *   mnemonic            — null-terminated string, e.g., "bsr"
+ *   mnemonic_len        — strlen, cached for fast scan
+ *   category_bits       — ZerAsmCategory bitmap (C1-C8)
+ *   feature_bits        — ZerCpuFeature bitmap (e.g., AVX512F)
+ *   source              — vendor citation, e.g., "Intel SDM Vol 2A BSR"
+ *   consequence         — what goes wrong if precondition violated
+ *   operand_count       — declared operand count (0 if not classified)
+ *   operand_constraints — per-operand constraint (indexed by operand position;
+ *                         positions ≥ operand_count are ZER_OPC_NONE) */
 typedef struct {
     const char *mnemonic;
     size_t mnemonic_len;
@@ -35,6 +68,8 @@ typedef struct {
     uint32_t feature_bits;
     const char *source;
     const char *consequence;
+    uint8_t operand_count;
+    ZerOperandConstraint operand_constraints[ZER_OPC_MAX_OPERANDS];
 } ZerInstructionEntry;
 
 /* Per-arch tables. extern declarations; definitions in arch-specific

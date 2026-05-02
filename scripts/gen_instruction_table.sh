@@ -107,9 +107,21 @@ bitmap_combine() {
     echo "$total"
 }
 
-# Awk-based parser: emits CSV (mnemonic|cat|features|source|consequence) per
-# entry. Tracks the current section's accumulated fields, flushes at next
-# section header or EOF.
+# Awk-based parser: emits CSV per entry.
+# Format (8 fields):
+#   mnemonic|category|features|source|consequence|opcount|opc0|opc1|opc2|opc3
+# operand_count `opcount` is the explicit declared count; opc0..opc3 are the
+# constraint strings (or empty for ANY/no constraint).
+#
+# F7-full Step 1b (2026-05-02): adds operand_count + per-operand
+# constraint capture. Anything matching `operand[N].constraint = ...`
+# (where N in 0..3) is recorded for the current entry. F7-full Step 2
+# (future) wires the dispatcher to read these.
+#
+# Field key forms recognized:
+#   operand_count             — integer
+#   operand[N].constraint     — constraint expression (NONZERO, ALIGNED(16), etc.)
+#   operand[N].type           — currently ignored (informational only in v1)
 awk '
     BEGIN {
         mnemonic = ""
@@ -117,25 +129,32 @@ awk '
         features = "NONE"
         source = ""
         consequence = ""
+        opcount = 0
+        opc0 = ""; opc1 = ""; opc2 = ""; opc3 = ""
         in_entry = 0
     }
 
-    # Section header: [mnemonic]
+    function flush_entry() {
+        if (in_entry && mnemonic != "") {
+            printf "%s|%s|%s|%s|%s|%d|%s|%s|%s|%s\n",
+                mnemonic, category, features, source, consequence,
+                opcount, opc0, opc1, opc2, opc3
+        }
+    }
+
     # Section header: [mnemonic]. Allow dots in mnemonics (e.g., RISC-V
     # `lr.w`, `fence.i`, `c.add`, ARM `dmb sy`). Dots are valid asm
     # mnemonic separators on RISC-V; the generator must preserve them.
     /^\[[a-zA-Z][a-zA-Z0-9_.]*\]/ {
-        # Flush previous entry
-        if (in_entry && mnemonic != "") {
-            printf "%s|%s|%s|%s|%s\n", mnemonic, category, features, source, consequence
-        }
-        # Start new entry
+        flush_entry()
         gsub(/[\[\]]/, "", $0)
         mnemonic = $0
         category = ""
         features = "NONE"
         source = ""
         consequence = ""
+        opcount = 0
+        opc0 = ""; opc1 = ""; opc2 = ""; opc3 = ""
         in_entry = 1
         next
     }
@@ -145,8 +164,8 @@ awk '
     /^[[:space:]]*$/ { next }
 
     # Field: name = value
-    /^[[:space:]]*[a-zA-Z_]+[[:space:]]*=/ {
-        # Split key = value
+    # Allow [N].suffix in field names for operand subscripts.
+    /^[[:space:]]*[a-zA-Z_][a-zA-Z_0-9.\[\]]*[[:space:]]*=/ {
         idx = index($0, "=")
         key = substr($0, 1, idx - 1)
         val = substr($0, idx + 1)
@@ -157,23 +176,87 @@ awk '
             val = substr(val, 2, length(val) - 2)
         }
 
-        if (key == "category")          category = val
+        if (key == "category")               category = val
         else if (key == "required_features") features = val
-        else if (key == "source")       source = val
-        else if (key == "consequence")  consequence = val
-        # Other fields (operand[N].*, operand_count, notes, schema_version)
-        # are preserved in the .zerdata file for human readers but not
-        # currently used by the F4 minimum lookup. F7-full will read
-        # constraint expressions when wiring per-category enforcement.
+        else if (key == "source")            source = val
+        else if (key == "consequence")       consequence = val
+        else if (key == "operand_count")     opcount = val + 0
+        else if (key == "operand[0].constraint") opc0 = val
+        else if (key == "operand[1].constraint") opc1 = val
+        else if (key == "operand[2].constraint") opc2 = val
+        else if (key == "operand[3].constraint") opc3 = val
+        # Other fields (operand[N].type, notes, schema_version) are
+        # informational — preserved in .zerdata for readers but not
+        # part of the runtime safety surface.
     }
 
     END {
-        # Flush last entry
-        if (in_entry && mnemonic != "") {
-            printf "%s|%s|%s|%s|%s\n", mnemonic, category, features, source, consequence
-        }
+        flush_entry()
     }
 ' "$INPUT" > "$TMP"
+
+# ============================================================================
+# Constraint expression → ZerOperandConstraint encoding
+# ============================================================================
+# F7-full Step 1b (2026-05-02): translate constraint strings from .zerdata
+# into the C struct initializer form.
+#
+# Recognized constraint syntax:
+#   ""                                                  → NONE   (kind=0)
+#   ANY                                                 → NONE   (kind=0)
+#   NONZERO                                             → NONZERO (kind=1)
+#   ALIGNED(N)                                          → ALIGNED (kind=2, param1=N)
+#   BOUNDED(min, max)                                   → BOUNDED (kind=3, param1=min, param2=max)
+#   COMPOUND(NONZERO, NOT_OVERFLOW_MIN_DIV_NEG_ONE)     → COMPOUND_NONZERO_NOT_INTMIN (kind=4)
+#
+# Output: a brace-enclosed initializer like `{2, 16, 0}` ready to drop
+# into the operand_constraints array.
+constraint_to_initializer() {
+    local cstr="$1"
+    # Strip whitespace
+    cstr=$(echo "$cstr" | tr -d ' ')
+    case "$cstr" in
+        ""|ANY)
+            echo "{0, 0, 0}"
+            ;;
+        NONZERO)
+            echo "{1, 0, 0}"
+            ;;
+        ALIGNED\(*\))
+            local n="${cstr#ALIGNED(}"
+            n="${n%)}"
+            echo "{2, ${n}u, 0}"
+            ;;
+        BOUNDED\(*\))
+            local args="${cstr#BOUNDED(}"
+            args="${args%)}"
+            local mn="${args%%,*}"
+            local mx="${args##*,}"
+            echo "{3, ${mn}, ${mx}}"
+            ;;
+        COMPOUND\(NONZERO,NOT_OVERFLOW_MIN_DIV_NEG_ONE\)|\
+        COMPOUND\(NOT_OVERFLOW_MIN_DIV_NEG_ONE,NONZERO\))
+            echo "{4, 0, 0}"
+            ;;
+        *)
+            # Unrecognized constraint — emit NONE + warn
+            echo "WARN: unrecognized constraint '$cstr' for instruction" >&2
+            echo "{0, 0, 0}"
+            ;;
+    esac
+}
+
+# Build the operand_constraints array initializer for an instruction.
+# Output is exactly 4 brace groups (ZER_OPC_MAX_OPERANDS = 4).
+build_operand_constraints() {
+    local opc0="$1" opc1="$2" opc2="$3" opc3="$4"
+    local i0 i1 i2 i3
+    i0=$(constraint_to_initializer "$opc0")
+    i1=$(constraint_to_initializer "$opc1")
+    i2=$(constraint_to_initializer "$opc2")
+    i3=$(constraint_to_initializer "$opc3")
+    echo "{${i0}, ${i1}, ${i2}, ${i3}}"
+}
 
 # ============================================================================
 # Emit the vendored .c file
@@ -189,6 +272,7 @@ ENTRY_COUNT=0
     echo " *"
     echo " * Vendored for reproducible builds + LSP-responsive runtime lookup."
     echo " * D-Alpha-7.5 Session F4 (instruction-level safety classification)."
+    echo " * F7-full Step 1 (2026-05-02): per-operand constraint encoding added."
     echo " *"
     echo " * Schema: arch_data/SCHEMA.md"
     echo " * Lookup: zer_asm_category(arch, mnemonic, len)"
@@ -198,7 +282,7 @@ ENTRY_COUNT=0
     echo ""
     echo "const ZerInstructionEntry zer_${ARCH}_instructions[] = {"
 
-    while IFS='|' read -r mnemonic cat_expr feat_expr source consequence; do
+    while IFS='|' read -r mnemonic cat_expr feat_expr source consequence opcount opc0 opc1 opc2 opc3; do
         [ -z "$mnemonic" ] && continue
         local_cat=$(bitmap_combine "$cat_expr" cat_to_int)
         local_feat=$(bitmap_combine "$feat_expr" feat_to_int)
@@ -206,11 +290,14 @@ ENTRY_COUNT=0
         esc_source=$(echo "$source" | sed 's/\\/\\\\/g; s/"/\\"/g')
         esc_consequence=$(echo "$consequence" | sed 's/\\/\\\\/g; s/"/\\"/g')
         len=${#mnemonic}
-        echo "    {\"$mnemonic\", $len, ${local_cat}u, ${local_feat}u, \"$esc_source\", \"$esc_consequence\"},"
+        # Default opcount if missing or zero
+        [ -z "$opcount" ] && opcount=0
+        op_init=$(build_operand_constraints "$opc0" "$opc1" "$opc2" "$opc3")
+        echo "    {\"$mnemonic\", $len, ${local_cat}u, ${local_feat}u, \"$esc_source\", \"$esc_consequence\", $opcount, ${op_init}},"
         ENTRY_COUNT=$((ENTRY_COUNT + 1))
     done < "$TMP"
 
-    echo "    {0, 0, 0u, 0u, 0, 0}  /* sentinel */"
+    echo "    {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}  /* sentinel */"
     echo "};"
     echo ""
     echo "const size_t zer_${ARCH}_instruction_count = ${ENTRY_COUNT};"

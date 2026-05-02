@@ -98,12 +98,18 @@ extern const ZerInstructionEntry zer_riscv64_instructions[];
 extern const size_t zer_riscv64_instruction_count;
 
 /* Diagnostic info for a matched instruction. Populated by extended lookup
- * variant when caller wants the citation/consequence for error messages. */
+ * variant when caller wants the citation/consequence for error messages.
+ *
+ * F7-full Step 2 (2026-05-02): includes operand_count + operand_constraints
+ * so the dispatcher can enforce per-operand NONZERO/ALIGNED/BOUNDED checks
+ * via existing VRP / qualifier safety systems. */
 typedef struct {
     uint32_t category_bits;
     uint32_t feature_bits;
     const char *source;       /* vendor citation; NULL if unknown instruction */
     const char *consequence;  /* effect of violation; NULL if unknown */
+    uint8_t operand_count;
+    ZerOperandConstraint operand_constraints[ZER_OPC_MAX_OPERANDS];
 } ZerInstructionInfo;
 
 /* Look up full instruction info (including source citation + consequence

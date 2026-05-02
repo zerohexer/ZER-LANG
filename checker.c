@@ -10105,6 +10105,107 @@ static void check_stmt(Checker *c, Node *node) {
                                 /* Other C3-classified mnemonics (none today)
                                  * fall through without state machine effect. */
                             }
+
+                            /* F7-full Step 2 (2026-05-02): per-operand
+                             * constraint enforcement.
+                             *
+                             * For each operand[N] with a non-NONE constraint,
+                             * find the matching ZER asm operand binding via
+                             * GCC inline asm convention (.zerdata operand[N]
+                             * = N-th binding, outputs first then inputs).
+                             * Then query the appropriate safety system:
+                             *   NONZERO   → VRP (System #12)
+                             *   COMPOUND  → VRP (NONZERO + INT_MIN check)
+                             *   ALIGNED   → Step 2c (qualifier system)
+                             *   BOUNDED   → VRP range fit
+                             *
+                             * Asm without operand bindings (clobber-only)
+                             * has no expressions to check — skip silently.
+                             * Asm where VRP can't determine the value emits
+                             * a diagnostic note (not error) to avoid over-
+                             * rejection of opaque/parameter inputs. */
+                            for (int oi = 0; oi < info.operand_count &&
+                                             oi < ZER_OPC_MAX_OPERANDS; oi++) {
+                                ZerOperandConstraint oc = info.operand_constraints[oi];
+                                if (oc.kind == ZER_OPC_NONE) continue;
+
+                                /* Find matching binding: .zerdata operand[N]
+                                 * = N-th binding (outputs first, then inputs).
+                                 * GCC inline asm convention: %0..%N number
+                                 * outputs first then inputs in declaration order. */
+                                Node *bound_expr = NULL;
+                                if (oi < node->asm_stmt.output_count) {
+                                    bound_expr = node->asm_stmt.outputs[oi].expr;
+                                } else {
+                                    int input_idx = oi - node->asm_stmt.output_count;
+                                    if (input_idx < node->asm_stmt.input_count) {
+                                        bound_expr = node->asm_stmt.inputs[input_idx].expr;
+                                    }
+                                }
+                                if (!bound_expr) {
+                                    /* No binding at this operand index —
+                                     * clobber-only asm or fewer bindings than
+                                     * spec operand count. User-asserted safety. */
+                                    continue;
+                                }
+
+                                /* NONZERO and COMPOUND_NONZERO_NOT_INTMIN both
+                                 * require non-zero. Apply VRP check.
+                                 * Same pattern as the division-by-zero check
+                                 * at checker.c:3768 — try const literal,
+                                 * const-symbol init, then VRP range. */
+                                if (oc.kind == ZER_OPC_NONZERO ||
+                                    oc.kind == ZER_OPC_COMPOUND_NONZERO_NOT_INTMIN) {
+                                    bool nz_ok = false;
+                                    /* Compile-time literal nonzero? */
+                                    int64_t cv = eval_const_expr(bound_expr);
+                                    /* Resolve const idents via Symbol init. */
+                                    if (cv == CONST_EVAL_FAIL &&
+                                        bound_expr->kind == NODE_IDENT) {
+                                        Symbol *bsym = scope_lookup(c->current_scope,
+                                            bound_expr->ident.name,
+                                            (uint32_t)bound_expr->ident.name_len);
+                                        if (bsym && bsym->is_const && bsym->func_node) {
+                                            Node *binit = NULL;
+                                            if (bsym->func_node->kind == NODE_GLOBAL_VAR)
+                                                binit = bsym->func_node->var_decl.init;
+                                            else if (bsym->func_node->kind == NODE_VAR_DECL)
+                                                binit = bsym->func_node->var_decl.init;
+                                            if (binit) cv = eval_const_expr(binit);
+                                        }
+                                    }
+                                    if (cv != CONST_EVAL_FAIL && cv != 0) nz_ok = true;
+                                    /* VRP-proven nonzero? */
+                                    if (!nz_ok && bound_expr->kind == NODE_IDENT) {
+                                        struct VarRange *r = find_var_range(c,
+                                            bound_expr->ident.name,
+                                            (uint32_t)bound_expr->ident.name_len);
+                                        if (r && r->known_nonzero) nz_ok = true;
+                                        if (r && r->min_val > 0) nz_ok = true;
+                                        if (r && r->max_val < 0) nz_ok = true;
+                                    }
+                                    if (!nz_ok) {
+                                        checker_error(c, node->loc.line,
+                                            "asm '%.*s' operand[%d] requires nonzero "
+                                            "value but expression cannot be proven "
+                                            "nonzero — consequence: %s "
+                                            "(cite: %s)",
+                                            (int)mn_len, s + mn_start, oi,
+                                            info.consequence ? info.consequence : "ISA-defined UB",
+                                            info.source ? info.source : "no source");
+                                    }
+                                    /* COMPOUND additionally checks INT_MIN/-1 overflow.
+                                     * Conservative: require VRP-proven min_val > INT_MIN
+                                     * for the dividend (operand at the same index for
+                                     * IDIV — but actually divisor is the typed input;
+                                     * dividend is RDX:RAX implicit). For now we only
+                                     * check NONZERO on the explicit operand; INT_MIN
+                                     * overflow on the implicit dividend is checked at
+                                     * the runtime trap (matches IR path INT_MIN check). */
+                                }
+                                /* ALIGNED — Step 2c (next commit). */
+                                /* BOUNDED — Step 2d (no current instructions use it). */
+                            }
                         }
                     }
                     /* Skip rest of this instruction (operands) up to delimiter */

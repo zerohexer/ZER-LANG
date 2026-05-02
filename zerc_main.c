@@ -625,7 +625,13 @@ int main(int argc, char **argv) {
     zc.import_ast_count = import_ast_count;
     bool ast_ok = zercheck_run(&zc, main_mod->ast);
 
-    if (!ast_ok) {
+    /* F0.1 audit mode (2026-05-03): when ZER_AGREEMENT_AUDIT=1, do NOT
+     * bail on AST failure — let IR analysis run too so we can compare
+     * per-test. Otherwise (default) bail as before. */
+    const char *audit_env = getenv("ZER_AGREEMENT_AUDIT");
+    bool audit_mode = (audit_env && audit_env[0] == '1');
+
+    if (!ast_ok && !audit_mode) {
         fprintf(stderr, "error: zercheck failed\n");
         free(cc.modules);
         arena_free(&cc.arena);
@@ -711,20 +717,35 @@ int main(int argc, char **argv) {
             zercheck_ir(&zc_ir, zerc_ir_hook_funcs[i]);
         }
 
-        /* Compare with AST analysis done at zercheck_run earlier. */
+        /* Compare with AST analysis done at zercheck_run earlier.
+         *
+         * Phase F0.1 (2026-05-03): tightened from coarse "both-zero/
+         * both-nonzero" to STRICT count match. The coarse check missed
+         * real per-test disagreements (e.g., AST=0/IR=2 = false-positive
+         * in IR; AST=2/IR=0 = false-negative in IR). Strict count match
+         * surfaces all of these.
+         *
+         * Output is machine-parseable for the F0.2 disagreement reporter:
+         *   AGREEMENT_FAIL <file>: ast=N ir=M kind=<class>
+         *
+         * Where kind classifies the disagreement:
+         *   ir_false_positive  — AST=0, IR>0 (IR rejects valid program)
+         *   ir_false_negative  — AST>0, IR=0 (IR misses real bug)
+         *   ir_count_diff      — both nonzero but different counts
+         */
         int ast_err = zc.error_count;
         int ir_err = zc_ir.error_count;
-        bool agree = (ast_err == 0 && ir_err == 0) ||
-                     (ast_err > 0 && ir_err > 0);
-        if (!agree) {
+        if (ast_err != ir_err) {
+            const char *kind;
+            if (ast_err == 0 && ir_err > 0)      kind = "ir_false_positive";
+            else if (ast_err > 0 && ir_err == 0) kind = "ir_false_negative";
+            else                                  kind = "ir_count_diff";
             fprintf(stderr,
-                "zercheck DUAL-RUN disagreement in %s: ast=%d ir=%d "
-                "(functions analyzed: %d)\n",
-                input_path, ast_err, ir_err, zerc_ir_hook_count);
+                "AGREEMENT_FAIL %s: ast=%d ir=%d kind=%s funcs=%d\n",
+                input_path, ast_err, ir_err, kind, zerc_ir_hook_count);
         } else if (dual_env && dual_env[0] == '2') {
             fprintf(stderr,
-                "zercheck DUAL-RUN agree in %s: ast=%d ir=%d "
-                "(functions analyzed: %d)\n",
+                "AGREEMENT_OK %s: ast=%d ir=%d funcs=%d\n",
                 input_path, ast_err, ir_err, zerc_ir_hook_count);
         }
     }

@@ -96,6 +96,12 @@ int zer_asm_instruction_info(
     out_info->feature_bits = 0;
     out_info->source = 0;
     out_info->consequence = 0;
+    out_info->operand_count = 0;
+    for (int i = 0; i < ZER_OPC_MAX_OPERANDS; i++) {
+        out_info->operand_constraints[i].kind = 0;
+        out_info->operand_constraints[i].param1 = 0;
+        out_info->operand_constraints[i].param2 = 0;
+    }
 
     if (arch == ZER_ARCH_UNKNOWN) {
         return 0;
@@ -121,6 +127,14 @@ int zer_asm_instruction_info(
     out_info->feature_bits = entry->feature_bits;
     out_info->source = entry->source;
     out_info->consequence = entry->consequence;
+    /* F7-full Step 2: copy per-operand constraints into the lookup result
+     * so the checker's NODE_ASM dispatch can enforce them via existing
+     * safety systems (VRP for NONZERO/BOUNDED/COMPOUND, qualifier for
+     * ALIGNED). */
+    out_info->operand_count = entry->operand_count;
+    for (int i = 0; i < ZER_OPC_MAX_OPERANDS; i++) {
+        out_info->operand_constraints[i] = entry->operand_constraints[i];
+    }
     return 1;
 }
 

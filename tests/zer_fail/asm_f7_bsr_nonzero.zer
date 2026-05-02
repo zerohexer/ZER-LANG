@@ -1,0 +1,24 @@
+// F7-full Step 2 (2026-05-02): BSR's source operand must be provably nonzero.
+// Intel SDM Vol 2A BSR: "silent UB: destination undefined when source is zero".
+//
+// .zerdata classification: bsr operand[1] = NONZERO (constraint kind=1).
+// The dispatcher maps operand[1] to the binding at GCC index %1 (= first
+// input after outputs), which is `user_input`. VRP can't prove this u64
+// global is nonzero — must fire compile error citing Intel SDM.
+//
+// EXPECTED: compile error mentioning operand[1] requires nonzero, with
+// vendor citation.
+
+u64 unused_out;
+u64 user_input;
+
+naked void unsafe_bsr() {
+    asm {
+        instructions: "bsr %1, %0"
+        outputs: { "rax" = unused_out }
+        inputs:  { "rdi" = user_input }
+        safety: "BSR with unprovable nonzero source operand — must reject"
+    }
+}
+
+i32 main() { return 0; }

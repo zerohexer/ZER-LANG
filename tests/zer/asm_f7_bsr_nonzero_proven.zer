@@ -1,0 +1,23 @@
+// F7-full Step 2 (2026-05-02): BSR with const-literal-nonzero source compiles.
+// Companion to tests/zer_fail/asm_f7_bsr_nonzero.zer (negative).
+//
+// `always_42` is `const u64 = 42`. F7-full check resolves const idents
+// via Symbol init, sees the literal 42, accepts as provably nonzero.
+
+u64 unused_out;
+const u64 always_42 = 42;
+
+naked void safe_bsr() {
+    asm {
+        instructions: "bsr %1, %0"
+        outputs: { "rax" = unused_out }
+        inputs:  { "rdi" = always_42 }
+        safety: "BSR with literal nonzero const — F7-full must accept"
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { safe_bsr(); }
+    return 0;
+}

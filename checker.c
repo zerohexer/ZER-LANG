@@ -10213,6 +10213,68 @@ static void check_stmt(Checker *c, Node *node) {
                                      * overflow on the implicit dividend is checked at
                                      * the runtime trap (matches IR path INT_MIN check). */
                                 }
+                                /* F7-full Step 2d (2026-05-02): BOUNDED(min, max)
+                                 * constraint enforcement.
+                                 *
+                                 * Operand value must be in [param1, param2].
+                                 * Checks compile-time literal first, then resolves
+                                 * const idents via Symbol init, then queries VRP
+                                 * range. Same pattern as NONZERO. Today no
+                                 * .zerdata entries use BOUNDED, but wiring is
+                                 * cheap and ready for future immediate-operand
+                                 * instructions (e.g., shift count bounds, BMI
+                                 * mask widths, RISC-V CSR encodings). */
+                                if (oc.kind == ZER_OPC_BOUNDED) {
+                                    int64_t bmin = (int64_t)oc.param1;
+                                    int64_t bmax = (int64_t)oc.param2;
+                                    bool in_bounds = false;
+                                    bool determined = false;
+                                    /* Compile-time literal? */
+                                    int64_t bv = eval_const_expr(bound_expr);
+                                    /* Resolve const idents via Symbol init. */
+                                    if (bv == CONST_EVAL_FAIL &&
+                                        bound_expr->kind == NODE_IDENT) {
+                                        Symbol *bsym = scope_lookup(c->current_scope,
+                                            bound_expr->ident.name,
+                                            (uint32_t)bound_expr->ident.name_len);
+                                        if (bsym && bsym->is_const && bsym->func_node) {
+                                            Node *binit = NULL;
+                                            if (bsym->func_node->kind == NODE_GLOBAL_VAR)
+                                                binit = bsym->func_node->var_decl.init;
+                                            else if (bsym->func_node->kind == NODE_VAR_DECL)
+                                                binit = bsym->func_node->var_decl.init;
+                                            if (binit) bv = eval_const_expr(binit);
+                                        }
+                                    }
+                                    if (bv != CONST_EVAL_FAIL) {
+                                        determined = true;
+                                        in_bounds = (bv >= bmin && bv <= bmax);
+                                    }
+                                    /* VRP-proven range fits? */
+                                    if (!determined && bound_expr->kind == NODE_IDENT) {
+                                        struct VarRange *r = find_var_range(c,
+                                            bound_expr->ident.name,
+                                            (uint32_t)bound_expr->ident.name_len);
+                                        if (r && r->min_val >= bmin && r->max_val <= bmax) {
+                                            determined = true;
+                                            in_bounds = true;
+                                        }
+                                    }
+                                    if (determined && !in_bounds) {
+                                        checker_error(c, node->loc.line,
+                                            "asm '%.*s' operand[%d] value 0x%llx "
+                                            "outside required bounds [%lld, %lld] "
+                                            "— consequence: %s (cite: %s)",
+                                            (int)mn_len, s + mn_start, oi,
+                                            (unsigned long long)(uint64_t)bv,
+                                            (long long)bmin, (long long)bmax,
+                                            info.consequence ? info.consequence : "ISA-defined UB",
+                                            info.source ? info.source : "no source");
+                                    }
+                                    /* Non-determined values fall through:
+                                     * user-asserted safety, same convention
+                                     * as NONZERO when VRP can't determine. */
+                                }
                                 /* (ALIGNED handled in Pass B below — outside
                                  * this per-operand loop so it doesn't depend
                                  * on positional binding lookup.) */

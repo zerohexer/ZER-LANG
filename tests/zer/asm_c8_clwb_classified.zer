@@ -1,0 +1,39 @@
+// 2026-05-02: smoke test that x86_64 CLWB/CLFLUSHOPT classification
+// is wired through the F4 dispatcher without breaking compile.
+//
+// These instructions are C8 (memory ordering) — Stage 5 / System #30
+// will enforce CLWB→SFENCE pairing for persistent memory. Today they
+// must at least parse, register-validate, and not crash.
+//
+// Both CLWB and CLFLUSHOPT take a memory operand (cache line address).
+// The naked dead-branch pattern verifies they emit valid GCC inline asm
+// without actually executing privileged ops.
+
+mmio 0x40000000..0x40000FFF;
+const usize cache_addr = 0x40000040;  // 64-byte aligned for cache line
+
+naked void persistence_demo() {
+    asm {
+        instructions: "clwb (%0)"
+        inputs:  { "rdi" = cache_addr }
+        clobbers: ["memory"]
+        safety: "CLWB writeback for persistent memory — Stage 5 will enforce SFENCE pairing"
+    }
+    asm {
+        instructions: "sfence"
+        clobbers: ["memory"]
+        safety: "SFENCE after CLWB to make writeback globally visible"
+    }
+    asm {
+        instructions: "clflushopt (%0)"
+        inputs:  { "rdi" = cache_addr }
+        clobbers: ["memory"]
+        safety: "CLFLUSHOPT eviction for persistent memory cache line"
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { persistence_demo(); }
+    return 0;
+}

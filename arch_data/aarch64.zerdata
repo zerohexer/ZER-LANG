@@ -288,3 +288,58 @@ operand_count = 0
 category = C8_MEMORY_ORDER
 source = "ARM ARM A64 SEVL"
 consequence = "send event local; sets event register on this core only"
+
+# Acquire/Release atomic loads and stores (Armv8 LSE alternatives to LDXR/STXR
+# pairs). Distinct from exclusive monitor pairing — these are one-way ordering
+# primitives. Subcategory C8d (atomic ordering semantics). Stage 5 will track
+# acquire/release pairing; today classification ensures data is ready.
+
+[ldar]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = MEMORY
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 LDAR"
+consequence = "load with acquire ordering; subsequent memops cannot reorder before"
+notes = "One-way ordering — pairs with STLR for release/acquire patterns."
+
+[stlr]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = MEMORY
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 STLR"
+consequence = "store with release ordering; prior memops cannot reorder after"
+notes = "One-way ordering — pairs with LDAR for release/acquire patterns."
+
+[ldarb]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = MEMORY
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 LDARB"
+consequence = "byte load with acquire ordering"
+
+[ldarh]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = MEMORY
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 LDARH"
+consequence = "halfword load with acquire ordering"
+
+[stlrb]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = MEMORY
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 STLRB"
+consequence = "byte store with release ordering"
+
+[stlrh]
+operand_count = 2
+operand[0].type = REGISTER
+operand[1].type = MEMORY
+category = C8_MEMORY_ORDER
+source = "ARM ARM A64 STLRH"
+consequence = "halfword store with release ordering"

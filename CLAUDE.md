@@ -1312,24 +1312,28 @@ constants in fixed buffers — the rule is "stack fast path, arena overflow".
 | F5 (aarch64 instructions) | DONE 2026-04-29 | 31 entries across C3-C5 + C8. ARM-specific semantics captured. |
 | F6 (riscv64 instructions) | DONE 2026-05-02 | 30 entries across C2-C5 + C8. RISC-V LR/SC, AMO, FENCE families. **3-arch instruction-table parity COMPLETE.** |
 | F7-light C3 (LR/SC pairing) | DONE 2026-05-02 | Per-block state machine catches SC-without-LR + LR-without-matching-SC across all 3 archs. Real UB caught. |
-| F7-full C1 (value range)  | DEFERRED | Needs schema/generator extension for per-operand constraints + operand-binding analysis. ~30 hrs. |
-| F7-full C2 (alignment) | DEFERRED | Same as C1 — operand-binding required. |
+| F7-full Step 1 (constraint plumbing) | DONE 2026-05-02 | Schema/generator/struct extended; all 3 arch tables vendored with per-operand constraints. |
+| F7-full Step 2a (NONZERO via VRP) | DONE 2026-05-02 | BSR/IDIV/etc. unprovable nonzero rejected with vendor citation. |
+| F7-full Step 2b (COMPOUND via VRP) | DONE 2026-05-02 | NONZERO check on divisor; INT_MIN/-1 backstopped at runtime. |
+| F7-full Step 2c (ALIGNED via heuristic Pass B) | DONE 2026-05-02 | MOVAPS misaligned constants rejected. Heuristic walks all bindings (positional binding fails when register operands are clobbers). |
+| F7-full Step 2d (BOUNDED via VRP) | DONE 2026-05-02 | Wiring active; no .zerdata entries use BOUNDED yet. |
+| C8 instruction classification | DONE 2026-05-02 | x86 CLWB/CLFLUSHOPT (53 entries), ARM LDAR/STLR/LDARB/LDARH/STLRB/STLRH (37 entries). Persistent-memory + acquire/release primitives ready for Session G enforcement. |
 | C5 (privilege) | Covered by S1 | Naked-only restriction is the v1.0 stand-in. F7-full would add explicit kernel-context model. |
 | C6 (memory addr) | Covered by @inttoptr | Existing MMIO range check fires at every address derivation. |
-| C8 (memory order) | Stage 5 work | System #30 / Session G (~80 hrs). |
+| C8 (memory order) ENFORCEMENT | Stage 5 work | System #30 / Session G (~80 hrs). Classification done; pairing/ordering tracking pending. |
 | Z9/Z10/Z13 forward-compat | Blocked on S1 relaxation | Included in F7-full estimate. |
 | naked attribute migration | DEFERRED | Requires asm-test rewrite (~20 hrs after S1 relaxation). See docs/limitations.md. |
 
-**Current F4 dispatch fires (in checker.c NODE_ASM):**
+**Current F4/F7 dispatch fires (in checker.c NODE_ASM):**
+- C1 (value range) — Step 2a/2b NONZERO/COMPOUND via VRP
+- C2 (alignment) — Step 2c ALIGNED via heuristic Pass B
+- C3 (state machine) — F7-light LR/SC pairing across same asm block
 - C4 (CPU feature) — checked against `--target-features=` bitmap
-- **C3 (state machine)** — LR/SC pairing across same asm block (NEW 2026-05-02)
 - C5 (privilege) — covered by S1 naked-only restriction
+- BOUNDED — Step 2d wiring ready (no instructions use it yet)
 
-**C1/C2 are CLASSIFIED but NOT YET ENFORCED** — operand-binding
-infrastructure required for VRP/alignment dispatch. Schema needs
-extension (per-operand constraint encoding); generator needs to emit
-constraints in vendored `.c`; dispatch needs to pair operand index
-to constraint type.
+**C8 enforcement (acquire/release pairing, CLWB→SFENCE) deferred to Session G.**
+Classification is in vendored tables; OrderingState tracking pending Stage 5.
 
 **`.zerdata` is compiler-internal, vendored, NOT user-extensible.**
 Design locked 2026-04-29.
@@ -1352,13 +1356,18 @@ silently always-true. See BUG-652 on 2026-05-02.
 **For fresh sessions touching asm safety:**
 - Read `docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29" section
 - The architecture decisions there are LOCKED IN — don't re-litigate
-- F7-full C1/C2 needs schema/generator extension first
+- F7-full Step 2 is COMPLETE — all 4 constraint kinds (NONZERO/COMPOUND/ALIGNED/BOUNDED)
+  enforced. Pass A (positional, GCC %N convention) handles NONZERO/COMPOUND/BOUNDED.
+  Pass B (heuristic walk all bindings) handles ALIGNED.
 - F7-light LL/SC pairing implementation pattern (hardcoded LL/SC
   mnemonic macros per arch) is the template for future state-machine
   enforcement — see `checker.c` NODE_ASM dispatch
 - @critical "transitive escape via callee" was investigated 2026-05-02
   and found to be NOT a bug — don't re-implement `can_escape`. See
   docs/limitations.md.
+- Session G (System #30 / atomic ordering) is the next major piece.
+  Design spec in `docs/asm_preconditions_research.md` Category C8 section.
+  ~80 hrs implementation. Adds OrderingState CFG traversal in zercheck_ir.c.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

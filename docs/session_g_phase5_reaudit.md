@@ -1469,6 +1469,216 @@ But honestly, after 5 rounds with 73 distinct findings, **the audit is comprehen
 
 ---
 
+## Round 6 — Critical evaluation: is the plan SOUND ENOUGH?
+
+User asked the meta-question: "is our plan sound enough or strong enough?"
+
+This isn't another finding-hunting round. It's an honest stress-test of the plan's quality. Five categories:
+
+### 6.1 Is the plan CORRECT?
+
+**Architecture (CFG-aware OrderingState in zercheck_ir)**: ✓ correct.
+- Reuses existing fixed-point loop; same shape as handle state.
+- Set-intersection at joins is semantically right (most-conservative).
+- Union of pending at joins is right (carry forward).
+- Discharge-after-merge correctness: hand-traced; works.
+
+**One real correctness gap found in round 6**:
+
+```zer
+void persist() {
+    defer @cache_writeback(p);    // CLWB at function exit
+    // no SFENCE possible after defer fires
+    return;
+}
+```
+
+The plan's defer body scanning (Step 5.6.5) walks defer bodies for **PRODUCES** barriers (Step 5.6.5 adds them to barriers_seen at exit). It does NOT model **REQUIRES_AFTER** inside defer bodies.
+
+Result: CLWB inside defer with no further defer producing SFENCE → Phase 5 would NOT catch this bug. **False negative.**
+
+Worse, LIFO-ordered defers can have correct-looking but actually-broken patterns:
+```zer
+defer @cache_writeback(p);   // fires SECOND (LIFO)
+defer @barrier_store();      // fires FIRST (LIFO)
+```
+CLWB fires AFTER SFENCE → CLWB has no subsequent barrier → UB. Plan misses it.
+
+**Resolution**: ban REQUIRES_AFTER intrinsics inside defer bodies. Compile error: `"@cache_writeback in defer body — barrier must come AFTER the writeback, but defer fires at function exit (no 'after')."`
+
+**Action**: add to Step 5.6.5. ~10 LOC. Closes the false-negative.
+
+**Other correctness checks**:
+- Mutual recursion in barriers_produced: pessimistic-and-stable. Correct (no false positive; possible false negative for symmetric patterns — acceptable).
+- Goto convergence: lattice is finite, so converges. Same machinery as handle state.
+- Indirect calls: pessimistic, no help. Correct.
+- Async/yield: state preserved across stackless suspend. Correct.
+
+**Verdict**: 1 correctness gap found in round 6. ~10 LOC fix. Otherwise, plan is correct.
+
+### 6.2 Is the plan COMPLETE?
+
+5 rounds × ~73 findings is comprehensive. But let me try to find what's NOT in the plan:
+
+- **Phase 5 errors during fuzzing**: fuzzer doesn't use barriers, so no fuzz coverage. Risk: Phase 5 has a code path that only executes on real ZER programs. Mitigation: add fuzzer generators for `@cache_writeback`/`@nt_store`/asm CLWB patterns. ~2 hrs. Not in plan.
+- **Phase 5 errors during semantic fuzz**: same, semantic fuzzer doesn't generate barriers. Same mitigation.
+- **Multi-line `instructions:` strings with multiple C8 mnemonics**: e.g., `"clwb (%0)\nclwb (%1)\nsfence"`. Plan walks each mnemonic; both CLWBs register pending; SFENCE clears both. Should work but untested. Need explicit test.
+- **Same-asm-block multi-CLWB with no SFENCE**: `"clwb (%0)\nclwb (%1)"`. Both pending; function exits without barrier. Phase 5 errors. Should work; need test.
+- **Rust-style async with stackful coroutines**: ZER doesn't have these. N/A.
+- **Multi-thread happens-before across threads**: out of scope per System #30 design (single-hart only).
+
+**One small completeness gap**: defer-with-REQUIRES_AFTER ban. Already covered above.
+
+**One test-coverage gap**: Phase 5 has no fuzzer coverage. Add 1-2 generator functions in `tests/test_semantic_fuzz.c`. ~2 hrs.
+
+**Verdict**: plan is mostly complete. Adding fuzzer coverage + defer-REQUIRES_AFTER ban makes it tight.
+
+### 6.3 Is the plan IMPLEMENTABLE?
+
+**LOC estimates** (round 5 final):
+- Step 5.5: ~150 LOC for ~55 intrinsic classifications. Realistic — looking at existing emitter.c emission chains, ~3 LOC per entry.
+- Step 5.3: ~80 LOC for IROrderingState + ops. Realistic — handle state ops are ~120 LOC; OrderingState is simpler.
+- Step 5.4 + 5.4b: ~100 LOC for asm/intrinsic event dispatch. Realistic.
+- Step 5.7: ~60 LOC for CFG join discharge. Realistic — existing handle merge is ~80 LOC.
+
+**Time estimates**:
+- Each step has clear deliverables and tests.
+- Integration points all in zercheck_ir.c (one file). No cross-cutting concerns beyond FuncSummary extension.
+- VST proof template established (~50-100 LOC).
+- Each sub-step independently shippable.
+
+**Risk**: Step 5.5 is the largest at 15 hrs. If real implementation is >20 hrs, that's a 25% over-estimate. Acceptable.
+
+**Verdict**: implementable. Realistic estimates. Each sub-step de-risks the next.
+
+### 6.4 Is the plan WORTH IMPLEMENTING NOW?
+
+This is the hardest question.
+
+**Cost**:
+- 66 hrs of dev time
+- ~5-20s added per 1000-function compile (perf overhead)
+- ~150 LOC of intrinsic classification table to maintain
+- LSP integration deferred (will need fixing later)
+- 1 existing test breaks (dalpha13, ~5 LOC fix)
+- Future maintenance burden when ZER adds more intrinsics
+
+**Value**:
+
+Today's user surface = 1 test file (`dalpha13_linux_scale.zer`). Zero real-world ZER programs use `@cache_writeback`/`@cache_flushopt`/`@nt_store` for actual persistent memory. ZER doesn't ship a libpmem equivalent.
+
+Future value: when someone writes ZER persistent-memory code, Phase 5 prevents a class of subtle bugs that would otherwise cause silent data loss on power failure (NVDIMM persistence violations).
+
+**The honest assessment**:
+
+Phase 5 is HIGH cost (66 hrs) for LOW immediate value (~0 real users today). It's an investment in:
+- **Safety completeness**: closes the last major gap in System #30.
+- **Future-proofing**: when ZER gets persistent-memory libraries, they'll be safe by construction.
+- **Architectural cleanliness**: completes the 30-system safety roster ZER claims.
+- **Demonstrating the model**: proves @atomic_*/cache_*/etc. integrate cleanly.
+
+**Alternative options** (also valid):
+
+**Option A — Ship full Phase 5 (66 hrs)**:
+- Maximum safety guarantee
+- Justifies "100% language-safe" claim from CLAUDE.md
+- Investment in v1.0 readiness
+
+**Option B — Ship minimum viable Phase 5 (10-15 hrs)**:
+- Just classify intrinsics in `.zerdata` (Phase 1+2 already done)
+- Skip enforcement entirely
+- Document System #30 as "implementation pending"
+- Phase 5 becomes 1-paragraph note instead of 66 hrs
+
+**Option C — Defer Phase 5 entirely (0 hrs)**:
+- Keep current state: data plumbing exists, enforcement deferred
+- Add to "future work" with the design plan
+- Revisit when first persistent-memory ZER library is being written
+
+**Option D — Phase 5 lite (20-30 hrs)**:
+- Only handle the asm path (skip @cache_*/@nt_*/@cond_*/@sem_*/@once classifications)
+- Single-block CLWB→SFENCE check (rejected in round 3 audit, but very narrow scope)
+- 80% of safety value, 30% of dev time
+- Doesn't cover @cache_writeback (the most likely use)
+
+**My recommendation**: Option C (defer). Reasons:
+1. ZER currently has 0 persistent-memory users. Phase 5 catches bugs in code that doesn't exist yet.
+2. The plan is well-documented; future implementer has a clear roadmap.
+3. 66 hrs is significant; ZER has more impactful work.
+4. When real users emerge, the plan is ready to implement.
+5. The Phase 1+2 data plumbing (already shipped) provides the foundation.
+
+**Counter-argument (for shipping now)**:
+- Once you have users, breaking changes (new compile errors) are harder.
+- "100% language-safe" claim needs Phase 5 to be technically true.
+- Implementation knowledge is freshest now.
+
+**This decision is YOURS to make.** Plan is sound; implementation is ready when you say go.
+
+### 6.5 What if the plan FAILS?
+
+Failure modes ranked by likelihood:
+
+| Likelihood | Failure mode | Recovery |
+|---|---|---|
+| HIGH | Step 5.5 (intrinsic classification) takes 25% longer than estimated | Acceptable; ship over multiple sessions |
+| MED | Iteration cap (32) hit on real programs | Raise to 64; fail-closed if exceeded |
+| MED | Defer body REQUIRES_AFTER bug (round 6 finding) ships and gets reported | Add ban + fix in patch release |
+| MED | LSP shows no Phase 5 errors (not wired) | Phase 6 work; document as known |
+| LOW | Cross-module FuncSummary mismatch | Existing bug already, not new |
+| LOW | Phase F migration (delete zercheck.c) regresses some test | Roll back; debug; re-attempt |
+| LOW | Performance overhead causes user complaints | Add `--no-ordering-check` flag |
+
+All failure modes have clear recovery paths. **No catastrophic failure mode identified.**
+
+### 6.6 Round 6 verdict
+
+**Plan is sound. Plan is strong.**
+
+- Architecture is correct (1 small fix for defer-REQUIRES_AFTER, 10 LOC).
+- Plan is implementable (15 sub-steps, ~66 hrs, each independently shippable).
+- Test coverage is solid (~14 tests + 2 fuzzer generators recommended).
+- Failure modes are bounded (all recoverable).
+
+**But the value question is real**: 66 hrs for 1 current user (test file) is a big investment.
+
+**My honest recommendation**: 
+
+Ship Phase 5 as planned IF:
+- You want to claim "100% language-safe" rigorously (System #30 must exist)
+- You believe persistent-memory ZER libraries will emerge soon
+- You have 66 hrs of implementer time and prefer paying it now over later
+- You're optimizing for v1.0 readiness
+
+DEFER Phase 5 IF:
+- ZER has more impactful work (e.g., LSP, more intrinsics, better tooling)
+- You're optimizing for current users (who don't use these patterns)
+- You're OK with "Phase 5 is future work" for now
+- You want to ship the data plumbing (already done) and document the rest
+
+**Either choice is defensible. The plan stands either way.**
+
+---
+
+## Final cumulative state (across all 6 rounds)
+
+| Metric | Value |
+|---|---|
+| Audit rounds | 6 |
+| Distinct findings | 74 (added 1 in round 6: defer-REQUIRES_AFTER) |
+| Critical findings | 6 |
+| Final estimate | ~67 hrs (was 66; +1 hr for defer ban) |
+| Architectural soundness | ✓ confirmed across 6 rounds |
+| Implementation readiness | ✓ ready when go-ahead given |
+| Real-world user surface | 1 test file (dalpha13) |
+| Future user surface | TBD (when persistent-memory libraries emerge) |
+
+**Plan: SOUND. STRONG. READY.**
+
+Decision: ship now (66 hrs) vs defer (0 hrs, plan stays). User's call.
+
+---
+
 ## What I did NOT find (sanity check)
 
 Things I checked but found no issue with:

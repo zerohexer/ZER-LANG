@@ -454,16 +454,228 @@ Re-audit additions: +5 hrs (Steps 5.0, 5.0b, 5.4b, plus extra verification).
 
 ---
 
-## Bottom-line verdict
+## Round 2 — Deep-Read Findings (2026-05-02)
+
+User asked for a deeper audit, "read more codebase to find more findings if uncertain." Read additional sections; found significant gaps.
+
+### Finding #24 [CRITICAL — most important new finding]: ZER intrinsics emit barriers via `__asm__ __volatile__`, bypassing `asm{}` syntax
+
+Verified at `emitter.c:7150-7187` and elsewhere:
+
+- `@cache_flushopt(addr)` emits `__asm__ __volatile__ ("clflushopt (%0)" ... : "memory")` directly in C output.
+- `@cache_writeback(addr)` emits `__asm__ __volatile__ ("clwb (%0)" ... : "memory")`.
+- `@nt_store(addr, val)` emits `__asm__ __volatile__ ("movnti %1, (%0)" ... : "memory")`.
+- `@cache_clean_range`, `@cache_writeback_range`, `@cache_flush_range`, `@cache_flush_line` — emit a loop of clflush/clwb followed by `dsb ish` / `sfence`.
+- `@cpu_write_cr3`, `@cpu_write_cr4`, etc. — emit privileged inline asm with `: "memory"` clobber.
+
+**These are AST `NODE_INTRINSIC` nodes, NOT `NODE_ASM`.** My Phase 5 plan walks `node->asm_stmt.instructions` strings — that misses all of these.
+
+**Consequence**: silent miscompile — Phase 5 wouldn't enforce CLWB→SFENCE for the canonical `@cache_writeback(p); ...; @barrier_store();` pattern.
+
+**Resolution — extend Phase 5 step 5.5 (intrinsic event tracking)**:
+
+Classification table (intrinsic name → barrier kind + role):
+
+| Intrinsic | Barrier kind | Role | Reason |
+|---|---|---|---|
+| `@atomic_*` (load/store/cas/add/sub/or/and/xor/...) | FULL_MEMORY | PRODUCES | SEQ_CST per emitter.c:2828-2870 |
+| `@barrier()` | FULL_MEMORY | PRODUCES | __atomic_thread_fence(SEQ_CST) |
+| `@barrier_store()` | STORE_STORE | PRODUCES | __atomic_thread_fence(RELEASE) |
+| `@barrier_load()` | LOAD_LOAD | PRODUCES | __atomic_thread_fence(ACQUIRE) |
+| `@barrier_acq_rel()` | ACQUIRE_RELEASE | PRODUCES | __atomic_thread_fence(ACQ_REL) |
+| **`@cache_writeback`** (CLWB) | **STORE_STORE** | **REQUIRES_AFTER** | **NEW — Intel SDM CLWB rule** |
+| **`@cache_flushopt`** (CLFLUSHOPT) | **STORE_STORE** | **REQUIRES_AFTER** | **NEW — Intel SDM CLFLUSHOPT rule** |
+| **`@nt_store`** (MOVNTI) | **STORE_STORE** | **REQUIRES_AFTER** | **NEW — Intel SDM MOVNTI rule (weakly-ordered)** |
+| `@cache_clean_range`, `@cache_writeback_range`, `@cache_flush_range`, `@cache_flush_line` | (none — self-satisfying) | NONE | Emit own dsb/sfence at end |
+| All privileged write-CR/MSR intrinsics with `:"memory"` clobber | FULL_MEMORY | PRODUCES | Memory clobber = full barrier (compiler-level) |
+
+This is **the most consequential finding of the audit.** The plan didn't classify `@cache_*`/`@nt_store` at all because I was thinking in terms of `asm{}` blocks. They're a parallel barrier surface.
+
+**Action**: rewrite step 5.5 of the plan to use the table above. ~30 lines of `if (name_matches(...))` chains in zercheck_ir.
+
+### Finding #25 [coverage gap]: NO C unit tests for zercheck_ir
+
+Verified: `test_zercheck.c` calls `zercheck_run` (AST analyzer). No `test_zercheck_ir.c` file. `test_ir_validate.c` tests only structural IR validation, not analysis.
+
+**Consequence**: Phase 5 is tested only at the .zer integration level. No C-level unit tests for OrderingState transitions, satisfies-relation, etc.
+
+**Resolution options**:
+- **Option A**: build `test_zercheck_ir.c` as part of Phase 5 (C unit tests for OrderingState).
+- **Option B**: skip; rely on .zer integration tests + VST proof of `zer_barrier_satisfies`.
+
+**Recommendation**: Option B for v1. The .zer tests + VST cover the primary semantics. C unit tests are nice-to-have, defer.
+
+### Finding #26 [confirmed]: vrp_ir.c is dead WIP, no Phase 5 conflict
+
+Verified `vrp_ir.c` (349 lines) is NOT in Makefile CORE_SRCS or LIB_SRCS. The file declares its own `IRRangeState` etc. but isn't called from anywhere.
+
+**Action**: noted; doesn't affect Phase 5. Remove from `vrp_ir.c` confusion later.
+
+### Finding #27 [test infra]: stderr suppressed in tests
+
+Verified `tests/test_zer.sh:42` runs tests with `2>/dev/null`. The dual-run "DUAL-RUN disagreement" stderr message doesn't break tests.
+
+**Action**: nothing. Phase 5 stderr is silently ignored in test runs. Errors gating compile via Issue #1 fix is what matters.
+
+### Finding #28 [test infra]: nowarn_check greps for "warning"
+
+Verified `tests/test_zer.sh:171-184`: `nowarn_check` greps stderr for the literal word "warning". Phase 5 errors must NOT use the word "warning" (would false-positive these regression checks if the test happens to use atomics/barriers).
+
+**Action**: error message uses "error" wording, not "warning."
+
+### Finding #29 [test infra]: per-file flag directive supports cross-arch
+
+Verified `tests/test_zer.sh:41`: `// zerc-flags: --target-arch=aarch64` works as first-line directive.
+
+**Action**: Phase 5 ARM/RISC-V tests can stay in `tests/zer/` with the directive instead of moving to cross-arch suite. Simpler than originally planned.
+
+### Finding #30 [resolved]: Iterative summary loop content stability
+
+I previously flagged Issue #19 about summary loop content stability. After re-reading `zercheck_ir.c:3079-3109`:
+
+```c
+if (existing) {
+    bool changed = false;
+    if (existing->param_count == pc) { ... }
+    if (existing->returns_color != returns_color_final) changed = true;
+    if (existing->returns_param_color != returns_param_color_final) changed = true;
+    if (changed) { /* update */ }
+}
+```
+
+The summary update DOES detect content changes. But the loop in zerc_main.c:705 only checks `summary_count == sc_before` for early exit — it doesn't propagate the per-summary `changed` flag.
+
+For Phase 5: when adding `barriers_produced`, I need to propagate the `changed` flag back to zerc_main loop. Options:
+- Add `summaries_changed` flag to `ZerCheck`. Set when any summary's barriers_produced changes. Loop checks both count AND changed flag.
+- Or: just run all 16 passes regardless. Wasteful but correct.
+
+**Action**: add `summaries_changed` boolean to ZerCheck. Set in zercheck_ir summary update. Loop in zerc_main checks both. ~5 LOC.
+
+### Finding #31 [coverage]: 45 existing tests use atomic/barrier intrinsics
+
+Found 45 .zer files using `@atomic_*`/`@barrier_*`/`mfence`/etc. Some risky for Phase 5:
+
+- `tests/zer/asm_c8_clwb_classified.zer` — has CLWB (in asm) + SFENCE in next block. Phase 5 must accept this multi-block pattern. ✓ tested already.
+- `tests/zer/dalpha13_linux_scale.zer` — uses `@cache_flushopt` and `@cache_writeback` intrinsics. Phase 5 with new intrinsic classification would flag pending CLWB without subsequent SFENCE. **Risk: existing test would fail under Phase 5 classification!**
+
+Let me re-check `dalpha13_linux_scale.zer`:
+
+```zer
+void dead_branch_cache_test() {
+    u8 data = 0;
+    if (never_true == 42) {
+        @cache_flushopt(&data);
+        @cache_writeback(&data);
+    }
+}
+```
+
+There's NO subsequent SFENCE/MFENCE/@barrier_store. Phase 5 would error on this test.
+
+**This means Phase 5 enforcement would break an existing passing test.**
+
+Options:
+- Add `@barrier_store()` to the test (simple fix, makes test correct).
+- Make Phase 5 not enforce on dead-branch (but that's complex).
+- Add `// zerc-flags: --no-strict-asm-ordering` to opt out per-file.
+
+**Recommendation**: add `@barrier_store()` to the test. The test is "smoke compile of cache intrinsics" — adding a barrier doesn't change its purpose, makes it a valid persistent-memory pattern. ~5-line update.
+
+**Action**: as part of Phase 5 step 5.6 (function-exit check), update `dalpha13_linux_scale.zer` to include barrier or document as known false-positive case.
+
+### Finding #32 [resolved]: ir_hook collection ordering
+
+Verified `emitter.c:3743-3745` and `zerc_main.c:196-205`. Each function's IR is appended to a global array as the emitter encounters it. Order is "topological order in which emitter sees functions" (decided by zerc_main:673-688).
+
+For cross-function barriers_produced lookup: the iterative summary loop (zerc_main.c:697-706) handles dependency ordering. After 16 passes, all summaries (including barriers_produced) should be stable.
+
+**Action**: nothing — existing infrastructure handles ordering.
+
+### Finding #33 [scope clarification]: Phase 5 effort vs delete-zercheck.c
+
+User said "we fully use zercheck_ir." If they want zercheck.c DELETED as part of Phase 5, that's an additional ~3 hrs (per cfg_migration_plan.md Phase F).
+
+**Recommendation**: do Phase F deletion BEFORE Phase 5 implementation. Reasons:
+- Cleaner architecture going into Phase 5 work.
+- Removes dual-run reporter noise during Phase 5 testing.
+- Aligns with user's "fully use" framing.
+- Per cfg_migration_plan.md, Phase F is ready to ship — 0 disagreements over 3143 programs.
+
+If preferred to keep zercheck.c as belt-and-suspenders, just do Issue #1's Option B (gate IR errors).
+
+**Open question for user**: do Phase F (delete zercheck.c) or just gate IR errors?
+
+---
+
+## Updated implementation order (final, post-round-2)
+
+| Step | Action | Effort | Tests added |
+|---|---|---|---|
+| **5.0a** | Phase F migration: delete zercheck.c, make zercheck_ir primary (per cfg_migration_plan.md). Validates 0-disagreement claim. | 3 hrs | 0 |
+| **5.0b** | Add `phase5_error_count` (or just gate `error_count` directly per Option B); add `summaries_changed` flag for loop convergence | 1.5 hrs | 0 |
+| 5.1 | Extract `asm_mnemonic_walk` helper; refactor checker.c | 4 hrs | 0 |
+| 5.2 | Add `ordering_rules.c` + VST proof | 4 hrs | 0 |
+| 5.3 | Add `IROrderingState` plumbing to `IRPathState` | 4 hrs | 0 |
+| 5.4 | Wire asm event tracking | 6 hrs | 0 |
+| **5.4b** | Add IR_LOCK, IR_UNLOCK, IR_SPAWN handlers | 1 hr | 1 (positive: lock+CLWB) |
+| **5.5** | Wire intrinsic event tracking — **EXPANDED** to include cache_*, nt_store, plus existing atomic_* and barrier_* | 6 hrs | 0 |
+| 5.6 | Function-exit pending check + update `dalpha13_linux_scale.zer` | 6 hrs | 3 |
+| 5.7 | CFG join discharge | 4 hrs | 2 |
+| 5.8 | FuncSummary `barriers_produced` extension | 6 hrs | 2 |
+| 5.9 | Cross-arch tests (use per-file flag directive) | 2 hrs | 2 |
+| 5.10 | Documentation + final make check | 2 hrs | — |
+
+**Updated total: ~50 hrs.**
+
+Total estimate evolution:
+- Original plan: ~43 hrs
+- After re-audit round 1: ~47 hrs
+- After re-audit round 2: ~50 hrs
+
+The increase reflects the missed intrinsic surface and the upfront Phase F migration recommendation.
+
+---
+
+## Bottom-line verdict (round 2)
 
 The original plan had:
-- **One critical architectural issue (#1)**: resolved by user clarification + Step 5.0 (5 LOC change).
-- **One newly-found bug (#19)**: convergence loop early-exit. Fixed by Step 5.0b (~10 LOC).
-- **Several smaller issues (#2-#23)**: each documented and resolved or scheduled.
+- **One critical architectural issue (#1)**: resolved by user clarification + Step 5.0 (gate compile on IR errors).
+- **One newly-found loop bug (#19)**: convergence early-exit. Fixed by `summaries_changed` flag.
+- **One MASSIVE missed surface (#24)**: ZER intrinsics emit barriers via `__asm__ __volatile__` directly, NOT through `asm{}` syntax. Phase 5's intrinsic detection step needs to handle `@cache_writeback`, `@cache_flushopt`, `@nt_store` as REQUIRES_AFTER + many privileged write-* intrinsics as PRODUCES FULL_MEMORY.
+- **One existing test breakage (#31)**: `dalpha13_linux_scale.zer` would fail under Phase 5 enforcement — needs minor update.
+- **Several smaller issues (#2-#33)**: each documented and resolved or scheduled.
 
 The architecture itself (CFG-aware OrderingState in zercheck_ir, set-intersection at joins, FuncSummary integration with `barriers_produced`) is correct and matches existing patterns.
 
-**Plan is solid after re-audit. Step 5.0 + 5.0b are prerequisites; rest can proceed in original order.**
+**Round 2 increases the estimate to ~50 hrs and adds upfront Phase F migration as recommended Step 5.0a.**
+
+The most consequential finding: **intrinsic-name classification table** (Finding #24) is the right way to handle ZER's `@cache_*`/`@nt_*`/etc. intrinsics that emit barriers without going through `asm{}` blocks. Without this, Phase 5 has a major coverage hole for the canonical persistent-memory pattern that ZER actually exposes today.
+
+**Plan is solid after both audit rounds. Step 5.0a (Phase F) + 5.0b (gating + loop) are prerequisites; rest can proceed in original order with expanded Step 5.5 (intrinsic classification table).**
+
+---
+
+## Round 3 — what would still need verification
+
+Things I'd verify if doing more rounds:
+
+1. **Existing zercheck_ir behaviors that might interact with new ordering state** — specifically the `IRHandleInfo.path` compound-key logic (path strings shared across path states per arena). OrderingState doesn't have compound keys (whole-program-point state), so should be fine, but worth re-checking.
+
+2. **Memory clobber detection** — verifying my approach (`for op in clobbers: if memcmp(op.name, "memory", 6) == 0`) is right for ZER's `clobbers:["memory"]` syntax.
+
+3. **Module-level FuncSummary lookup with mangled names** — Issue #21 was deferred. If Phase 5 cross-module breaks due to name collisions, would need pre-fix.
+
+4. **Symbol table lookup performance with N functions × M ordering bits** — for very large ZER programs, the iterative loop may take many passes. 16-pass cap may bite.
+
+5. **`@once` macro implementation** — uses `__atomic_load_n(inited, __ATOMIC_ACQUIRE)` pattern. Phase 5 should treat the `@once` block as PRODUCES FULL_MEMORY on the first call.
+
+6. **`@barrier_init` / `@barrier_wait` / `@cond_wait` / `@cond_signal`** — thread sync primitives. They're full barriers via pthreads. Need explicit classification.
+
+7. **`spawn` vs `spawn` with ThreadHandle vs `th.join()`** — all are full barriers. ThreadHandle.join is in particular a synchronization point.
+
+8. **`@once`, semaphore primitives** — same.
+
+If user wants round 3, I'll dig into these. But they're all secondary to the round-1+2 findings already documented.
 
 ---
 

@@ -1206,6 +1206,267 @@ But honestly, 4 rounds is comprehensive. Round 4 found 1 CRITICAL (interrupt han
 
 **Confirmed safe**: rust_tests (207 files), fuzzer, IR_RING, container methods, static/threadlocal globals. None false-positive under Phase 5.
 
+## Round 5 — Final extreme-thoroughness sweep (2026-05-02)
+
+User asked for round 5. Investigated remaining surfaces. Found one major intrinsic-classification gap and several finer-grained findings.
+
+### Finding #61 [CRITICAL — 40+ MORE intrinsics need classification]
+
+Comprehensive grep across all 145 intrinsics in emitter.c. Found **218 inline `__asm__ __volatile__` emission sites** — far more than the ~10 I'd already classified.
+
+Categorized:
+
+**Already in plan (round 2-3) — keep**:
+- `@cache_writeback`, `@cache_flushopt`, `@nt_store` — REQUIRES_AFTER STORE_STORE
+- `@atomic_*`, `@barrier_*` — PRODUCES (specific kinds per round 1-2)
+- `@cache_*_range`, `@cache_*_line` — self-satisfying
+
+**NEW — need classification (Round 5)**:
+
+| Intrinsic family | Count | Phase 5 classification | Reason |
+|---|---|---|---|
+| `@tlb_flush_*` (all/global/asid/addr/range) | 5 | PRODUCES FULL_MEMORY | Emit DSB ISH / SFENCE.VMA — strong barrier |
+| `@mmu_*` (sync, enable, disable, set_pt, get_pt, etc.) | ~9 | PRODUCES FULL_MEMORY | DSB+ISB combined; CR3 writes are full barriers |
+| `@cpu_write_cr0/cr3/cr4/xcr0` | 4 | PRODUCES FULL_MEMORY | CR3 write flushes TLB; CR4 changes paging — serializing |
+| `@cpu_save_context/restore_context/save_fpu/restore_fpu/xsave/xrstor/fxsave/fxrstor` | 8 | PRODUCES FULL_MEMORY | All have `: "memory"` clobber |
+| `@cpu_iret/syscall/sysret/hypercall/sbi_call/smc_call` | 6 | PRODUCES FULL_MEMORY | Privileged transitions serialize |
+| `@cpu_cache_disable/cache_enable/flush_pipeline` | 3 | PRODUCES FULL_MEMORY | CR0 write + WBINVD |
+| `@barrier_dma` | 1 | PRODUCES FULL_MEMORY (or DMA_SYNC) | MFENCE / DMB SY / FENCE rw,rw |
+| `@cpu_write_msr` | 1 | PRODUCES FULL_MEMORY (conservative) | Some MSRs serialize, some don't |
+| `@port_in/out 8/16/32` | 6 | NEUTRAL (or PRODUCES STORE_LOAD) | I/O instructions serialize on x86 |
+| `@cpu_disable_int/enable_int` | 2 | NEUTRAL | CLI/STI disable interrupts, not memory order |
+| `@cpu_pause/wfe/sev/idle_hint/wait_int/deep_sleep/mwait/monitor_addr/umwait/umonitor` | ~10 | NEUTRAL | Spin/sleep hints, not barriers |
+| `@cpu_read_*` (cr0/cr2/cr3/cr4/dr/msr/sp/tp/flags/fsbase/gsbase/etc.) | ~15 | NEUTRAL | Read-only, no barrier |
+| `@cpu_id/cpuid/vendor_id/feature_bits/model_id/get_priv_level` | 6 | NEUTRAL | CPUID serializes execution but not memory ordering for our purposes |
+| `@cpu_rdrand/rdseed` | 2 | NEUTRAL | Random read, no barrier |
+| `@cpu_eoi/breakpoint/endbr/get_pc/sev` | 5 | NEUTRAL | No memory ordering |
+
+**~40 new intrinsics to classify in Phase 5 step 5.5** (plus the ~15 already in plan, total ~55 intrinsics to handle).
+
+**Action**: extend Phase 5 step 5.5 classification table to cover all of these. The PRODUCES FULL_MEMORY group is the largest concrete addition (~30 entries). NEUTRAL entries don't need code (default = no event).
+
+This is a **major plan update**. The classification table grows from ~15 entries to ~55 entries. ~150 LOC of `if (memcmp(name, ...) == 0)` chains in zercheck_ir.
+
+**Total additional effort: +6 hrs.** Still doable in Phase 5 step 5.5 estimate (was 9 hrs, now 15 hrs).
+
+### Finding #62 [optimization opportunity]: FuncProps `has_sync` as fast-path
+
+Verified `types.h:217-220`:
+```c
+struct {
+    bool computed;
+    bool in_progress;
+    bool can_yield;
+    bool can_spawn;
+    bool can_alloc;
+    bool has_sync;  /* body contains @atomic_* or @barrier */
+    /* ... */
+} props;
+```
+
+`has_sync` already tracks "function body has @atomic/@barrier somewhere" via lazy DFS. Wrong semantic for Phase 5 (it's "any path", not "all paths"), so **can't replace FuncSummary.barriers_produced**.
+
+But it's a **fast-path optimization**: if `callee->props.has_sync == false`, callee CERTAINLY produces no barriers. Skip FuncSummary lookup. ~3 LOC, saves time.
+
+**Action**: optimization in step 5.8. Defer.
+
+### Finding #63 [confirmed limitation]: Indirect calls can't resolve barriers_produced
+
+Function pointers (`*(u32) -> u32`) don't have `func_name` at IR_CALL site. FuncSummary lookup fails. Phase 5 conservatively assumes indirect calls produce no barriers.
+
+Real impact: callback-based persistence APIs (passing `pmem_drain` as function pointer) won't have their barrier tracked.
+
+**Resolution**: documented limitation. Same as recursion / extern functions. Future Phase 6+ work.
+
+### Finding #64 [confirmed safe]: --release flag is no-op
+
+Verified `zerc_main.c:224-261`. `release_mode` is parsed but never checked downstream. `--release` doesn't disable Phase 5 (or anything else). Currently a no-op flag.
+
+**Action**: nothing. Future plans for release mode would need explicit Phase 5 opt-out.
+
+### Finding #65 [confirmed]: ZER doesn't support user variadic functions
+
+Only emitter uses `va_list` internally for printf-style formatting. ZER source-level variadic functions don't exist.
+
+**Action**: no Phase 5 handling needed.
+
+### Finding #66 [confirmed]: goto_spaghetti_safe.zer doesn't stress Phase 5
+
+The existing 57-line stress test has no barriers/atomics. Won't exercise the OrderingState lattice.
+
+**Action**: Phase 5 step 5.10 should add a stress test with many barriers + many blocks (e.g., 200-block function with CLWB+SFENCE patterns) to exercise iteration cap.
+
+### Finding #67 [confirmed]: Predicate file template
+
+Verified `src/safety/handle_state.c` template:
+- Self-contained (no includes beyond own header)
+- Pure (no globals, no side effects)
+- Primitive types only
+- Early-return cascade pattern
+- ~25 LOC for similar complexity
+
+Phase 5's `ordering_rules.c` follows exactly. ~30 LOC for `zer_barrier_satisfies` + `zer_barriers_seen_satisfies`.
+
+**Action**: confirmed feasible. Step 5.2 estimate (~4 hrs) is right.
+
+### Finding #68 [confirmed]: VST proof effort
+
+Verified `proofs/vst/verif_handle_state.v` (188 lines) and `verif_atomic_rules.v` (167 lines) as templates. Phase 5's `verif_ordering_rules.v` ~70-100 lines.
+
+**Action**: confirmed feasible. Step 5.2 includes VST proof in the ~4 hrs.
+
+### Finding #69 [comprehensive safe surface]
+
+Final tally of test files that won't false-positive under Phase 5:
+- 538 .zer integration tests, only `dalpha13_linux_scale.zer` breaks (1 file, ~5 LOC fix)
+- 200 fuzzer-generated programs — no barriers, safe
+- 139 conversion tests — no barriers, safe
+- 5 cross-arch tests — no barriers, safe
+- 66 module tests — no barriers, safe
+- 207 rust_tests using barriers — all PRODUCE-only, safe
+- 36 zig_tests — none use barriers, safe
+- 8 firmware examples, 1 (concurrency_demo) uses pthread (PRODUCES), no CLWB, safe
+
+**Total: ~1,200 tests, only 1 needs updating.** Excellent blast-radius bounding.
+
+### Finding #70 [comprehensive]: 218 __asm__ sites in emitter.c
+
+Counted: 218 distinct `__asm__ __volatile__` emission sites across 145 intrinsics + asm{} fallback. The ~55 needing Phase 5 classification cover all barrier-relevant cases. The other ~163 are for non-barrier-related ops (read CRn, port I/O, breakpoint, etc.).
+
+**Action**: comprehensive enumeration in Phase 5 step 5.5 table. Ensure walker_audit catches missing cases via discipline.
+
+### Finding #71 [pre-existing infrastructure]: Existing src/safety/ predicate files for inspiration
+
+Verified existing predicate files:
+- `arith_rules.c`, `asm_categories.c`, `atomic_rules.c`, `cast_rules.c`, `coerce_rules.c`, `comptime_rules.c`, `concurrency_rules.c`, `container_rules.c`, `context_bans.c`, `escape_rules.c`, `handle_state.c`, `isr_rules.c`, `mmio_rules.c`, `misc_rules.c`, `move_rules.c`, `optional_rules.c`, `provenance_rules.c`, `range_checks.c`, `stack_rules.c`, `type_kind.c`, `variant_rules.c`
+
+20 existing pure-predicate files. Phase 5's `ordering_rules.c` is #21. Architecture is well-established; just follow patterns.
+
+**Action**: no new infrastructure. Slot in alongside existing files.
+
+### Finding #72 [pattern]: zercheck_ir + checker.c BOTH need Phase 5 changes for AST integration
+
+zercheck_ir handles IR-level state machine. But the asm mnemonic walker is currently in checker.c (NODE_ASM dispatch). To use it from zercheck_ir, refactor to shared helper (Phase 5 step 5.1).
+
+For intrinsic detection: the `props.has_sync` AST scanner already exists in checker.c:7088. Phase 5's intrinsic classification could either:
+- (A) Add another similar AST scanner in zercheck_ir (duplicates logic)
+- (B) Extend checker's existing scan_func_props to compute barriers_produced too
+- (C) Walk AST inside zercheck_ir's IR_ASSIGN handler when expr is NODE_INTRINSIC
+
+Option C is cleanest for Phase 5 — zercheck_ir already inspects `inst.expr` for various reasons. Adding intrinsic-name detection there is local to zercheck_ir.
+
+**Action**: confirm Option C in step 5.5. Extension via local detection.
+
+### Finding #73 [confirmed]: Module-mangled names in FuncSummary lookup
+
+Verified `checker.c:7136-7149`: module-qualified calls (`config.func()`) are resolved to mangled names (`module__func`) for FuncProps lookup. Same pattern would work for FuncSummary's barriers_produced.
+
+For Phase 5: when looking up `barriers_produced` of a callee in zercheck_ir IR_CALL handler, use existing module-mangling logic.
+
+**Action**: no special handling needed. Existing infrastructure handles cross-module name resolution.
+
+---
+
+## Summary of round 5 findings
+
+| # | Severity | Issue | Resolution |
+|---|---|---|---|
+| **61** | **CRITICAL** | **40+ MORE intrinsics need classification** | **+6 hrs in step 5.5** |
+| 62 | Optimization | FuncProps has_sync as fast-path | Defer |
+| 63 | Limitation | Indirect calls don't resolve barriers | Documented |
+| 64 | Confirmed | --release no-op | OK |
+| 65 | Confirmed | No user variadics | OK |
+| 66 | Test addition | goto_spaghetti doesn't stress Phase 5 | Add real stress test in step 5.10 |
+| 67 | Template | handle_state.c template confirmed | OK |
+| 68 | Template | VST proof effort confirmed | OK |
+| 69 | Comprehensive | Safe surface mapped (~1,200 tests, 1 break) | Excellent |
+| 70 | Comprehensive | 218 __asm__ sites; ~55 need Phase 5 | Covered by #61 |
+| 71 | Existing | 20 predicate files; ordering_rules is #21 | Pattern established |
+| 72 | Architecture | zercheck_ir AST inspection for intrinsics | Option C (local) |
+| 73 | Confirmed | Module-mangling already handled | OK |
+
+---
+
+## Cumulative effort estimate
+
+| Round | Estimate |
+|---|---|
+| Original | ~43 hrs |
+| Round 1 | ~47 hrs |
+| Round 2 | ~50 hrs |
+| Round 3 | ~58 hrs |
+| Round 4 | ~60 hrs |
+| **Round 5** | **~66 hrs** |
+
+Round 5 added:
+- +6 hrs for ~40 additional intrinsic classifications
+
+**Final estimate: ~66 hrs.**
+
+---
+
+## Final implementation order (post round 5)
+
+| Step | Action | Effort |
+|---|---|---|
+| 5.0a | Phase F migration: delete zercheck.c | 3 hrs |
+| 5.0b | Add `phase5_error_count` + `summaries_changed` flag | 1.5 hrs |
+| 5.0c | Add ir_hook call to interrupt emission path | 0.5 hrs |
+| 5.1 | Extract `asm_mnemonic_walk` helper | 4 hrs |
+| 5.2 | Add `ordering_rules.c` + VST proof | 4 hrs |
+| 5.3 | Add `IROrderingState` plumbing | 4 hrs |
+| 5.4 | Wire asm event tracking + memory clobber | 6 hrs |
+| 5.4b | IR_LOCK/UNLOCK/SPAWN/ThreadHandle.join handlers | 2 hrs |
+| **5.5** | **Wire intrinsic event tracking — ~55 intrinsic classifications (atomics, barriers, cache, nt_store, cond_*, sem_*, barrier_init/wait, @once, TLB, MMU, write_CR/MSR, context switch, privileged transitions, cache control, barrier_dma)** | **15 hrs** |
+| 5.6 | Function-exit pending check + update dalpha13 test | 6 hrs |
+| 5.6.5 | Defer body barrier scanning | 5 hrs |
+| 5.7 | CFG join discharge | 4 hrs |
+| 5.8 | FuncSummary `barriers_produced` extension + cross-module tests | 7 hrs |
+| 5.9 | Cross-arch tests | 2 hrs |
+| 5.10 | Documentation + final make check + stress test (200-block barrier program) | 3 hrs |
+
+**Total: 15 sub-steps. ~66 hrs. ~14+ tests.**
+
+---
+
+## What's left after round 5?
+
+Items I might verify in round 6:
+- Each individual intrinsic in the new ~40-entry classification — manually verify ARM/RISC-V semantics differ from x86
+- Specific iteration-cap behavior on a 200-block barrier program (write the stress test, run it)
+- Check if Phase 5 needs to interact with zercheck_ir's `urs` (UAF Report Set) for de-duplication
+
+But honestly, after 5 rounds with 73 distinct findings, **the audit is comprehensive**. All architectural blockers found, all major test risks bounded, all classifications enumerated.
+
+**Diminishing returns from here. Implementation should begin.**
+
+---
+
+## What round 5 changed in the plan
+
+**One critical finding**: ~40 more intrinsics need classification beyond what previous rounds identified. The largest single addition to Phase 5 step 5.5 (was ~15 entries, now ~55). +6 hrs.
+
+**Several confirmations**: predicate file templates, VST proof effort, existing infrastructure for module-mangling, safe surface across all 1,200 tests.
+
+**Testing insights**: goto_spaghetti_safe.zer is too small to stress Phase 5; a real 200-block stress test is needed (added to step 5.10).
+
+**Optimization noted**: FuncProps `has_sync` as fast-path before FuncSummary lookup. Defer to post-Phase-5.
+
+---
+
+## Five-round audit cumulative findings
+
+73 distinct findings across 5 rounds:
+- **6 CRITICAL** (compile gating, summary loop, intrinsic surface, defer scanning, interrupts, full intrinsic classification)
+- **~12 medium** (LSP, multi-module tests, ARM tests, cross-module errors, stress test, etc.)
+- **~30 confirmed/resolved** (compound keys, source lines, walker discipline, module mangling, indirect calls, etc.)
+- **~15 deferred limitations** (extern atomics, function pointers, infinite loops, recursion pessimism, etc.)
+- **~10 risks acknowledged** (iteration cap, performance, false-positive surfaces)
+
+**Architecture remains sound across all 5 rounds.** No findings invalidated the IR-level CFG OrderingState approach. All findings refined the classification table, added missing handlers, or documented limitations.
+
+**The plan is ready to implement.** Total estimate: ~66 hrs across 15 sub-steps, each independently shippable.
+
 ---
 
 ## What I did NOT find (sanity check)

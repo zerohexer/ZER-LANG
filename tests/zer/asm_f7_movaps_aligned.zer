@@ -1,0 +1,23 @@
+// F7-full Step 2c (2026-05-02): MOVAPS with 16-byte-aligned constant address compiles.
+// Companion to tests/zer_fail/asm_f7_movaps_misaligned.zer (negative).
+//
+// `aligned_addr = 0x40000010` is 16-byte aligned (16 mod 16 == 0).
+// The Pass B heuristic verifies via const-eval and accepts.
+
+mmio 0x40000000..0x40000FFF;
+const usize aligned_addr = 0x40000010;
+
+naked void safe_movaps() {
+    asm {
+        instructions: "movaps (%0), %%xmm0"
+        clobbers: ["xmm0"]
+        inputs:  { "rdi" = aligned_addr }
+        safety: "MOVAPS with 16-byte aligned constant — F7-full Pass B must accept"
+    }
+}
+
+i32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { safe_movaps(); }
+    return 0;
+}

@@ -1,0 +1,24 @@
+// F7-full Step 2c (2026-05-02): MOVAPS memory operand requires 16-byte alignment.
+// Intel SDM Vol 2B MOVAPS: "#GP fault on misaligned memory operand".
+//
+// .zerdata classification: movaps operand[1] = ALIGNED(16).
+// The dispatcher's Pass B (heuristic) walks all bindings and checks
+// const-evaluable values against the alignment constraint. The const
+// usize misaligned_addr = 0x40000001 fails (1 mod 16 != 0).
+//
+// EXPECTED: compile error citing 16-byte alignment requirement,
+// the actual misaligned address, and Intel SDM source.
+
+mmio 0x40000000..0x40000FFF;
+const usize misaligned_addr = 0x40000001;
+
+naked void unsafe_movaps() {
+    asm {
+        instructions: "movaps (%0), %%xmm0"
+        clobbers: ["xmm0"]
+        inputs:  { "rdi" = misaligned_addr }
+        safety: "MOVAPS with constant misaligned source — must reject"
+    }
+}
+
+i32 main() { return 0; }

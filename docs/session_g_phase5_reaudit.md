@@ -653,29 +653,311 @@ The most consequential finding: **intrinsic-name classification table** (Finding
 
 **Plan is solid after both audit rounds. Step 5.0a (Phase F) + 5.0b (gating + loop) are prerequisites; rest can proceed in original order with expanded Step 5.5 (intrinsic classification table).**
 
+**Round 3 added two more critical pieces (Findings #36 + #37) — full concurrency intrinsic classification AND defer body scanning for barriers. Both are non-optional for Phase 5 to work on real ZER programs. Updated total: ~58 hrs.**
+
 ---
 
-## Round 3 — what would still need verification
+## Round 3 — Deep verification (2026-05-02)
 
-Things I'd verify if doing more rounds:
+User asked for round 3. Investigated all 8 deferred items.
 
-1. **Existing zercheck_ir behaviors that might interact with new ordering state** — specifically the `IRHandleInfo.path` compound-key logic (path strings shared across path states per arena). OrderingState doesn't have compound keys (whole-program-point state), so should be fine, but worth re-checking.
+### Finding #34 [resolved]: Compound keys don't apply to OrderingState
 
-2. **Memory clobber detection** — verifying my approach (`for op in clobbers: if memcmp(op.name, "memory", 6) == 0`) is right for ZER's `clobbers:["memory"]` syntax.
+Verified: `IRHandleInfo` uses compound keys (path strings shared across path states per arena, line 50-56 of zercheck_ir.c). OrderingState (per Phase 5 design) is whole-program-point state — no per-entity keys, no compound paths.
 
-3. **Module-level FuncSummary lookup with mangled names** — Issue #21 was deferred. If Phase 5 cross-module breaks due to name collisions, would need pre-fix.
+**Action**: nothing to change. OrderingState lives alongside handles in `IRPathState` without sharing any key infrastructure.
 
-4. **Symbol table lookup performance with N functions × M ordering bits** — for very large ZER programs, the iterative loop may take many passes. 16-pass cap may bite.
+### Finding #35 [resolved]: Memory clobber detection pattern
 
-5. **`@once` macro implementation** — uses `__atomic_load_n(inited, __ATOMIC_ACQUIRE)` pattern. Phase 5 should treat the `@once` block as PRODUCES FULL_MEMORY on the first call.
+Verified at `checker.c:9764-9772`. Existing pattern:
+```c
+bool has_memory_clobber = false;
+for (int i = 0; i < node->asm_stmt.clobber_count; i++) {
+    AsmOperand *cb = &node->asm_stmt.clobbers[i];
+    if (cb->reg_name_len == 6 && memcmp(cb->reg_name, "memory", 6) == 0) {
+        has_memory_clobber = true;
+        break;
+    }
+}
+```
 
-6. **`@barrier_init` / `@barrier_wait` / `@cond_wait` / `@cond_signal`** — thread sync primitives. They're full barriers via pthreads. Need explicit classification.
+`AsmOperand` defined at `ast.h:265-270`. Phase 5 reuses this pattern verbatim.
 
-7. **`spawn` vs `spawn` with ThreadHandle vs `th.join()`** — all are full barriers. ThreadHandle.join is in particular a synchronization point.
+**Action**: copy this pattern into Phase 5's asm event tracking. ~10 LOC.
 
-8. **`@once`, semaphore primitives** — same.
+### Finding #36 [CRITICAL — second-most consequential]: Concurrency intrinsics produce full barriers
 
-If user wants round 3, I'll dig into these. But they're all secondary to the round-1+2 findings already documented.
+Verified emissions:
+
+| Intrinsic | Emits | Phase 5 classification |
+|---|---|---|
+| `@cond_wait(var, cond)` | `pthread_cond_wait` (which unlocks+waits+relocks the mutex) | PRODUCES FULL_MEMORY |
+| `@cond_signal(var)` | `pthread_cond_signal` (with surrounding mutex lock/unlock) | PRODUCES FULL_MEMORY |
+| `@cond_broadcast(var)` | `pthread_cond_broadcast` | PRODUCES FULL_MEMORY |
+| `@cond_timedwait(var, cond, ms)` | Same as cond_wait but with timeout | PRODUCES FULL_MEMORY |
+| `@sem_acquire(s)` | `pthread_mutex_lock + cond_wait + unlock` | PRODUCES FULL_MEMORY |
+| `@sem_release(s)` | `pthread_mutex_lock + cond_signal + unlock` | PRODUCES FULL_MEMORY |
+| `@barrier_init(var, count)` | `_zer_barrier_init` (pthread_mutex + pthread_cond) | PRODUCES FULL_MEMORY |
+| `@barrier_wait(var)` | `_zer_barrier_wait` (lock + cond_wait + unlock) | PRODUCES FULL_MEMORY |
+| `@once { body }` | `__atomic_load_n(_, ACQUIRE)` + `__atomic_store_n(_, RELEASE)` | PRODUCES ACQUIRE_RELEASE |
+| `ThreadHandle.join()` | `pthread_join(th, NULL)` | PRODUCES FULL_MEMORY |
+| `IR_LOCK` (shared struct field write/read) | `pthread_mutex_lock` | PRODUCES FULL_MEMORY |
+| `IR_UNLOCK` | `pthread_mutex_unlock` | PRODUCES FULL_MEMORY |
+| `IR_SPAWN` | `pthread_create` | PRODUCES FULL_MEMORY |
+
+This is a MASSIVE list. Every one of these operations in real ZER programs would discharge any pending CLWB-style requirement.
+
+**Consequence for Phase 5 tests**: a typical concurrent ZER program has so many full-memory barriers that pending CLWB rarely survives to function exit. Phase 5 mostly fires on:
+- Pure single-threaded code with raw asm (no concurrency primitives)
+- Concurrent code where CLWB is in a critical section but persistence-relevant store is OUTSIDE the lock
+
+Both are real but narrow. Document.
+
+**Action**: extend Phase 5 classification table with all rows above. ~50 LOC of name matching.
+
+### Finding #37 [CRITICAL — defer body scanning required]
+
+Verified at `zercheck_ir.c:3136-3162` — there's an existing `ir_defer_scan_frees` pattern that walks defer bodies and applies free events to return-block states. **Phase 5 needs the exact parallel for barriers.**
+
+```zer
+defer @barrier_store();      // SFENCE runs at exit
+asm { instructions: "clwb (%0)" ... }
+return;                       // CLWB pending — but defer's SFENCE satisfies it
+```
+
+Without defer scanning, Phase 5 would error on this canonical defer-barrier pattern.
+
+**Resolution**: implement `ir_defer_scan_barriers(zc, func, ret_ps, body)` parallel to `ir_defer_scan_frees`. Walks defer body AST for barrier-emitting nodes (NODE_INTRINSIC, NODE_ASM with C8 mnemonics) and updates return-block `barriers_seen`.
+
+**~80-100 LOC.** Significant new code. Add to plan as Step 5.6.5.
+
+### Finding #38 [confirmed]: --lib mode does NOT disable IR analysis
+
+Verified at `zerc_main.c:643-667`. `lib_mode` only affects emitter preamble/runtime. `dual_enabled` is checked separately and only ZER_DUAL_RUN=0 disables IR analysis.
+
+**Action**: Phase 5 fires uniformly across --run, --emit-c, --lib. No mode-specific handling.
+
+### Finding #39 [resolved]: building_summary suppression via ir_zc_error
+
+Verified: `ir_zc_error` at `zercheck_ir.c:25` checks `zc->building_summary` and returns early. Phase 5 errors using the same helper get free suppression during fixed-point iteration.
+
+**Action**: Phase 5 errors call `ir_zc_error` (or a sibling that also increments phase5_error_count). Existing pattern handles suppression.
+
+### Finding #40 [risk]: Iteration cap with ordering state
+
+Lattice size grows from "N handles × 5 states" to "N handles × 5 states + 12 barriers × 32 pending" per block.
+
+Worst case: each iteration changes 1 handle state + 1 barrier bit + 1 pending entry per block = 3 changes per block per iteration. With B blocks, total possible changes = B × (N×5 + 12 + 32). For large B (say 500 blocks), that's potentially 500 × (50 + 44) = 47,000 monotonic state transitions. Well below the 32-iteration cap × 500 blocks = 16,000 iterations × passes.
+
+Wait, that math doesn't quite work — let me redo. Each fixed-point pass updates ALL blocks. The number of passes = max independent state changes along any chain. With finite lattice height per block:
+- Handles: 5 states × N handles = 5N transitions
+- Barriers: 12 monotonic bits = 12 transitions max per block
+- Pending: 32 entries × 12 bits = 384 transitions max per block
+
+Total per-block: 5N + 12 + 384 = 5N + 396 transitions before saturation.
+
+For N=10 handles: 446 transitions per block. With back-edges, 32 passes might be tight but workable.
+
+**Risk**: large programs with many handles AND many barriers might exceed 32 passes.
+
+**Resolution**: monitor in practice. If hit, raise to 64 or 128. Same fail-closed pattern as today.
+
+**Action**: leave at 32. Add Phase 5 stress test (large CFG with many barriers + handles) as part of step 5.10.
+
+### Finding #41 [resolved]: ThreadHandle.join detection
+
+Verified at `emitter.c:1915-1934` — `.join()` on a ThreadHandle is detected by matching against `e->spawn_wrappers` (emitter-local list).
+
+In zercheck_ir, ThreadHandle is tracked as `IRThreadTrack` (line 76). Detection: NODE_CALL with NODE_FIELD callee where field_name="join" AND object name matches a tracked IRThreadTrack.
+
+**Action**: Phase 5 detects `.join()` calls and treats them as PRODUCES FULL_MEMORY. ~15 LOC.
+
+### Finding #42 [resolved]: Async/await/yield are neutral
+
+Verified at `ir_lower.c:2830-2851`. IR_YIELD and IR_AWAIT carry the cond AST but are stackless suspend/resume. State struct preserves locals; CPU/cache state preserves naturally (no kernel context switch).
+
+**Phase 5 decision**: IR_YIELD and IR_AWAIT are NEUTRAL — pending barriers carry forward across suspend.
+
+**Caveat**: real persistent-memory code probably never spans yield boundaries (NVDIMM operations are short critical sections). Document.
+
+**Action**: skip IR_YIELD and IR_AWAIT in OrderingState transitions. Document in plan.
+
+### Finding #43 [risk]: Cyclic call graphs and barriers_produced
+
+Iterative summary loop (zerc_main.c:697-706) currently breaks on `summary_count` stability. If function f1 calls f2 calls f1 (cycle):
+- Pass 1: f1 analyzed first, queries f2.summary (doesn't exist). Pessimistic: barriers from f2 = 0. f1's barriers_produced computed.
+- Pass 1: f2 analyzed, queries f1.summary (now exists). Gets f1's barriers. f2's barriers_produced computed.
+- Pass 1 ends. summary_count stable (both functions have summaries).
+
+If pass 2 would refine f1's barriers (because f2's summary is now better), it doesn't run because count is stable.
+
+**Pre-existing limitation**: same issue exists for handle-related fields (frees_param, returns_color). Phase 5 inherits the same pessimism.
+
+**Action**: pre-existing; documented in Issue #19. Cumulative resolution: `summaries_changed` flag forces additional passes when content changes.
+
+### Finding #44 [confirmed]: Comptime intrinsic calls don't reach IR
+
+Verified: comptime functions are evaluated at compile time and substituted in AST before IR lowering. Comptime calls don't appear as IR_CALL or IR_INTRINSIC.
+
+**Action**: Phase 5 doesn't need to handle comptime specially. They just don't show up.
+
+### Finding #45 [verify]: Top-level `@once { body }` semantics
+
+`@once { body }` with body containing `clwb` and no subsequent SFENCE — is the @once block treated correctly?
+
+Looking at emitter for @once:
+```c
+emit(e, "    if (__atomic_load_n(inited, __ATOMIC_ACQUIRE) == 1) return;\n");
+/* ... CAS to claim init ... */
+/* ... body emitted here ... */
+emit(e, "        __atomic_store_n(inited, 1, __ATOMIC_RELEASE);\n");
+```
+
+The body runs ONCE per program. After body, RELEASE store is emitted. RELEASE is a kind of store-store barrier in C++ semantics.
+
+For Phase 5: `@once { ... clwb (%0) ... }` body — the trailing RELEASE store satisfies STORE_STORE? Per C++ memory model, RELEASE before next dependent store does provide the right semantics. Recommend treating `@once` block as PRODUCES ACQUIRE_RELEASE on entry+exit.
+
+**Action**: classify `@once` block boundaries as PRODUCES ACQUIRE_RELEASE. The body's content is analyzed normally; pending CLWB inside @once would need handling within the block too.
+
+### Finding #46 [test plan]: Phase 5 should exercise concurrency primitives
+
+Add tests:
+
+| Test | Pattern | Phase 5 expectation |
+|---|---|---|
+| `asm_g5_clwb_then_lock.zer` | CLWB, then access shared struct (IR_LOCK) | LOCK satisfies CLWB |
+| `asm_g5_clwb_then_atomic.zer` | CLWB, then @atomic_store | atomic satisfies CLWB |
+| `asm_g5_clwb_then_join.zer` | CLWB, then th.join() | join satisfies CLWB |
+| `asm_g5_clwb_then_cond_signal.zer` | CLWB, then @cond_signal | signal satisfies CLWB |
+| `asm_g5_clwb_in_defer.zer` | `defer @barrier_store(); ... CLWB ...; return` | defer scan finds barrier |
+| `asm_g5_async_clwb.zer` | async fn with CLWB, then yield, then SFENCE | pending carries across yield |
+
+### Finding #47 [resolved]: cinclude'd C atomic call NOT treated as barrier
+
+Verified: `cinclude` declarations don't get FuncSummary. `__atomic_thread_fence(...)` called from cinclude'd `<stdatomic.h>` won't be recognized.
+
+**Action**: documented in Finding #7. Users should use ZER intrinsics. Phase 6 can add `@barrier_extern` annotation.
+
+### Finding #48 [edge case]: Function with NO return statement (infinite loops, abort, trap)
+
+What happens to pending if function never returns?
+
+Examples:
+```zer
+void worker() {
+    while (true) {
+        asm { instructions: "clwb (%0)" ... }
+        @barrier_store();
+    }
+}
+```
+
+The function has no IR_RETURN. Phase 5's exit-block scan looks for IR_RETURN — and finds none. Pending never checked. Function silently passes.
+
+Is that right? Probably. Infinite-loop functions don't return; the runtime never sees the "after" state.
+
+But what about:
+```zer
+void main_loop() {
+    asm { instructions: "clwb (%0)" ... }
+    while (true) { ... }  // infinite loop
+}
+```
+
+The CLWB happens BEFORE the infinite loop. Pending exists. Function never returns → never checked.
+
+In real semantics, this code is fine (the cache line writeback happens, but never observed by anyone external). For ZER's safety claim ("no UB"), we should still error: the writeback's ordering is undefined w.r.t. the loop's stores.
+
+But: detecting this requires distinguishing "function exits" (IR_RETURN) from "control reaches infinite loop." Hard.
+
+**Pragmatic resolution**: scan ALL terminating blocks (not just IR_RETURN). For non-return terminators (IR_GOTO to entry, etc.), check pending too.
+
+Actually simpler: if no IR_RETURN exists and pending was registered somewhere, flag as suspicious.
+
+Even simpler: skip — document as known limitation. Real persistent-memory code does exit functions normally.
+
+**Action**: document. Phase 5 only checks IR_RETURN blocks. Infinite loops are user's responsibility.
+
+---
+
+## Summary of round 3 findings
+
+| # | Severity | Issue | Resolution |
+|---|---|---|---|
+| 34 | Resolved | Compound keys vs OrderingState | No interaction; OK |
+| 35 | Resolved | Memory clobber detection | Pattern verified, ~10 LOC |
+| **36** | **CRITICAL** | **All concurrency intrinsics produce barriers** | **+50 LOC classification table** |
+| **37** | **CRITICAL** | **Defer body scanning required** | **+80-100 LOC, parallel to ir_defer_scan_frees** |
+| 38 | Confirmed | --lib doesn't disable IR analysis | OK |
+| 39 | Resolved | building_summary error suppression | Existing helper |
+| 40 | Risk | Iteration cap with ordering state | Monitor; raise if hit |
+| 41 | Resolved | ThreadHandle.join() detection | ~15 LOC |
+| 42 | Resolved | Async/await neutral | Skip in tracking |
+| 43 | Confirmed | Cyclic FuncSummary pessimism | Pre-existing |
+| 44 | Confirmed | Comptime doesn't reach IR | OK |
+| 45 | Verify | @once block boundaries | PRODUCES ACQUIRE_RELEASE |
+| 46 | Test plan | New concurrency tests | +6 tests |
+| 47 | Resolved | cinclude'd atomics | Documented limitation |
+| 48 | Edge | Infinite-loop functions | Documented limitation |
+
+---
+
+## Updated estimate (round 3)
+
+| Stage | Estimate |
+|---|---|
+| Original plan | ~43 hrs |
+| After round 1 | ~47 hrs |
+| After round 2 | ~50 hrs |
+| **After round 3** | **~58 hrs** |
+
+Round 3 added:
+- Step 5.5 expansion: ~50 LOC for full concurrency intrinsic classification (+3 hrs)
+- Step 5.6.5 NEW: defer body barrier scanning (+5 hrs)
+
+**Updated total: ~58 hrs.**
+
+---
+
+## Final implementation order (post round 3)
+
+| Step | Action | Effort | Tests added |
+|---|---|---|---|
+| **5.0a** | Phase F migration: delete zercheck.c, make zercheck_ir primary | 3 hrs | 0 |
+| **5.0b** | Add `phase5_error_count` + `summaries_changed` flag | 1.5 hrs | 0 |
+| 5.1 | Extract `asm_mnemonic_walk` helper | 4 hrs | 0 |
+| 5.2 | Add `ordering_rules.c` + VST proof | 4 hrs | 0 |
+| 5.3 | Add `IROrderingState` plumbing | 4 hrs | 0 |
+| 5.4 | Wire asm event tracking + memory clobber | 6 hrs | 0 |
+| 5.4b | Add IR_LOCK, IR_UNLOCK, IR_SPAWN, ThreadHandle.join handlers | 2 hrs | 1 |
+| **5.5** | Wire intrinsic event tracking (FULL classification table — atomics, barriers, cache, nt_store, cond_*, sem_*, barrier_init/wait, @once) | 9 hrs | 0 |
+| 5.6 | Function-exit pending check + update dalpha13 test | 6 hrs | 3 |
+| **5.6.5** | NEW: Defer body barrier scanning (parallel to ir_defer_scan_frees) | 5 hrs | 1 |
+| 5.7 | CFG join discharge | 4 hrs | 2 |
+| 5.8 | FuncSummary `barriers_produced` extension | 6 hrs | 2 |
+| 5.9 | Cross-arch tests (per-file flag directive) | 2 hrs | 2 |
+| 5.10 | Documentation + final make check + stress test for iteration cap | 3 hrs | 1 |
+
+**Total: ~58 hrs. 14 sub-steps. 12+ tests.**
+
+---
+
+## Round 3 — Open questions still unanswered
+
+1. **Should Phase 5 fire on functions that never return?** (Finding #48) — deferred as limitation.
+
+2. **Should @once block boundary be ACQUIRE_RELEASE or just FULL_MEMORY?** — recommend ACQUIRE_RELEASE per emitter pattern. Verify under load.
+
+3. **Should `IR_LOCK` be PRODUCES ACQUIRE rather than FULL_MEMORY?** Pthread_mutex_lock IS strictly acquire; pthread_mutex_unlock IS release. More precise but Phase 6 work; Phase 5 uses FULL_MEMORY for simplicity.
+
+4. **Should the iteration cap auto-raise based on barriers_produced complexity?** — Defer until real programs hit it.
+
+5. **What about @verified_spec ordering claims?** — out of scope per original plan; user-asserted at Tier C.
+
+If user wants round 4 (extreme thoroughness), I'd dig into:
+- Module-level test interactions (does dual-run module test runner have anything different?)
+- Error message localization (multi-file with cross-module barriers)
+- Performance profiling estimate for Phase 5 added overhead
 
 ---
 

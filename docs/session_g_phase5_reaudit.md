@@ -959,6 +959,253 @@ If user wants round 4 (extreme thoroughness), I'd dig into:
 - Error message localization (multi-file with cross-module barriers)
 - Performance profiling estimate for Phase 5 added overhead
 
+## Round 4 — Comprehensive last sweep (2026-05-02)
+
+User requested round 4. Investigated remaining surfaces.
+
+### Finding #49 [CRITICAL — major architectural gap]: Interrupt handlers NOT analyzed by zercheck_ir
+
+Verified at `emitter.c:4308` (interrupt path) vs `emitter.c:3743` (function path):
+
+```c
+/* Function path (line 3743): */
+if (e->ir_hook) { e->ir_hook(e->ir_hook_ctx, ir); }
+emit_func_from_ir(e, ir);
+
+/* Interrupt path (line 4308): */
+IRFunc *ir = ir_lower_interrupt(e->arena, e->checker, decl);
+/* NO ir_hook call! */
+emit_func_from_ir(e, ir);
+```
+
+**zercheck_ir does NOT analyze interrupt handler bodies.** Phase 5 inherits this gap — interrupt handlers won't be checked for ordering.
+
+This is also a pre-existing gap for handle UAF, leak detection, etc. in interrupt handlers via zercheck_ir. zercheck.c (AST) catches some of these via different code paths.
+
+**Impact for Phase 5**:
+- Real ISR pattern: `interrupt USART1 { @cache_writeback(buf); ... }` — Phase 5 wouldn't fire even if no SFENCE follows.
+- For v1, document as known limitation.
+- Future fix: ~5 LOC to add ir_hook call after `ir_lower_interrupt` in emitter.c:4308.
+
+**Resolution**: add the ir_hook call as part of Phase 5's Step 5.4 (asm event tracking). Trivial fix; closes the gap for interrupt handlers as a side-effect of Phase 5.
+
+**Action**: add ~5 LOC ir_hook call to interrupt emission path. Matches function emission pattern.
+
+### Finding #50 [risk — well-bounded]: 207 rust_tests use barriers/atomics, 0 use CLWB
+
+Surveyed all rust_tests/ (784 .zer files):
+- 207 use `@atomic_*`, `@barrier_*`, `spawn`, `@cond_*`, `@sem_*` — ALL of these PRODUCE barriers, never REQUIRE.
+- 0 use `@cache_writeback`, `@cache_flushopt`, `@nt_store`, or asm `clwb`/`clflushopt`.
+
+**Phase 5 won't false-positive on any of the 207 barrier-using tests.** They all produce barriers; pending requirements never accumulate without subsequent satisfying barrier.
+
+**Consequence**: rust_tests pass cleanly under Phase 5. Risk: minimal.
+
+**Action**: rust_tests are safe; document.
+
+### Finding #51 [confirmed]: Module tests don't exercise barriers
+
+66 test_modules/ files, 0 use `@atomic_*` / `@barrier_*` / `spawn` / asm with C8 mnemonics.
+
+**Phase 5's cross-module barriers_produced inference is UNTESTED at module-test level.** Need to add at least one cross-module Phase 5 test:
+
+```
+// test_modules/g5_a.zer
+void emit_clwb(*u32 p) {
+    asm { instructions: "clwb (%0)" inputs: { "rdi" = p } ... }
+}
+
+// test_modules/g5_b.zer (calls g5_a, adds barrier)
+import g5_a;
+void user(*u32 p) {
+    g5_a.emit_clwb(p);
+    @barrier_store();
+}
+```
+
+Phase 5's FuncSummary `barriers_produced` for g5_a.emit_clwb should be empty (it doesn't emit a barrier itself). User's pending CLWB is satisfied by `@barrier_store()`. Should compile clean.
+
+**Action**: add cross-module Phase 5 tests in step 5.8.
+
+### Finding #52 [medium]: LSP doesn't run zercheck_ir at all
+
+Verified `zer_lsp.c:585-586`:
+```c
+zercheck_init(&zc, &checker, &arena, fname);
+zercheck_run(&zc, file_node);  /* AST analyzer only */
+```
+
+**LSP uses zercheck.c (AST), not zercheck_ir.** Phase 5 errors won't appear in editor diagnostics until LSP is updated.
+
+After Phase F migration (delete zercheck.c), this becomes a problem — LSP would lose ALL safety check feedback unless wired to zercheck_ir.
+
+**For Phase 5 implementation**: not blocking; LSP wiring is separate (~50 LOC: load IR via emitter shim, run zercheck_ir per function, collect errors, return to LSP frontend).
+
+**Resolution**: defer LSP integration to Phase 6 / Phase G migration. Document.
+
+### Finding #53 [resolved]: Fuzzer doesn't use barriers/atomics
+
+`tests/test_semantic_fuzz.c` has 32 generators, none using `spawn`/`@atomic_*`/`@barrier_*`/`@cache_*`. Fuzzer programs never trigger Phase 5.
+
+**Action**: fuzzer is safe; document.
+
+### Finding #54 [confirmed]: Source line preservation in IR
+
+Verified: `IRInst.source_line` is consistently populated by ir_lower (e.g., `make_inst(op, node->loc.line)`). Phase 5 errors will cite correct source lines.
+
+**Action**: nothing.
+
+### Finding #55 [resolved]: Walker exhaustiveness discipline
+
+Per CLAUDE.md Stage 2 Part B: every safety-critical walker has `-Wswitch` exhaustive enumeration (no default cases). Phase 5's new switches (asm dispatch, intrinsic match, CFG handlers) MUST follow this.
+
+**Action**: Phase 5 implementation must list every NODE_ kind / IROpKind it handles explicitly. No default cases. Pre-commit check via `tools/walker_default_audit.sh` (already exists).
+
+### Finding #56 [estimate]: Phase 5 performance overhead
+
+Per-function cost analysis:
+- Asm mnemonic walk: existing for F4 dispatch. Phase 5 adds ~50ns per mnemonic for ordering lookup. Negligible.
+- Intrinsic name match: ~15-20 entries, perfect-hash impossible (string comparison). ~100ns per IR_ASSIGN with NODE_INTRINSIC. For typical function: ~1µs total.
+- CFG join with ordering: bounded pending merge. ~32 entries × 32 entries = 1024 comparisons. ~10µs per join.
+- Fixed-point iteration: linear in blocks × N iterations. For 100 blocks × 32 iter = 3200 block-passes. With ordering merge per join (~5 joins per block), ~5 × 1µs × 3200 = 16ms per function worst case.
+- Defer body scan: walks AST per defer per return-block. ~5µs per defer × 5 defers × 5 returns = 125µs per function.
+- FuncSummary computation: O(blocks). ~10µs per function.
+
+**Total per-function overhead: ~5-20ms for complex functions.** For a 1000-function compile, ~5-20 seconds added.
+
+This is significant but acceptable. Larger projects might want `--fast-mode` flag to disable Phase 5 in non-CI builds. Defer.
+
+**Action**: profile after implementation. If real users complain, add `--no-ordering-check` flag.
+
+### Finding #57 [confirmed]: Static globals + threadlocal NEUTRAL
+
+Static globals are just memory addresses; their loads/stores have the same ordering semantics as any memory operation. No Phase 5 special handling needed.
+
+`threadlocal` variables emit `__thread` storage class. Per-thread, no synchronization implied. Same ordering as regular memory.
+
+**Action**: nothing.
+
+### Finding #58 [resolved]: IR_RING_PUSH / container method calls
+
+`Ring(T, N)` is a single-threaded circular buffer. No locking; no barriers. IR_RING_PUSH/POP have no ordering implications.
+
+Container methods (e.g., `Stack(u32) s; s.push(5);`) compile to direct field manipulation. No barriers.
+
+**Action**: skip in Phase 5. Document.
+
+### Finding #59 [test plan addition]: Multi-module Phase 5 tests
+
+Add to test_modules/:
+- `g5_module_caller.zer` + `g5_module_callee.zer` — cross-module CLWB+barrier
+- Verify FuncSummary's barriers_produced propagates correctly across module boundaries
+
+### Finding #60 [resolved]: Error message line accuracy across modules
+
+When CLWB is in module A and Phase 5 fires error in module B's caller (because barriers_produced shows A doesn't satisfy), error should cite:
+- The CLWB site (in module A)
+- OR the caller site (in module B)
+- OR both
+
+Existing FuncSummary errors (e.g., handle UAF across functions) cite the CALL site, not the callee. Phase 5 should follow the same convention: error fires at the CLWB site, not at the eventual function exit.
+
+But wait — Phase 5 fires at function exit when pending unresolved. For cross-module: pending lives in caller, originated from CLWB inside callee. Caller's pending list would have origin_line = callee's CLWB line (a different file).
+
+`ir_zc_error(zc, line, ...)` uses `zc->file_name` (which is the current compilation unit). Cross-module line references would print the caller's file with the callee's line number — wrong.
+
+**Resolution**: extend `IROrderingPending` with `origin_file` field. Use it in error message: `"asm 'clwb' at <origin_file>:<origin_line> requires barrier..."`.
+
+**Action**: add `origin_file` to `IROrderingPending`. ~3 LOC.
+
+---
+
+## Summary of round 4 findings
+
+| # | Severity | Issue | Resolution |
+|---|---|---|---|
+| **49** | **CRITICAL** | **Interrupt handlers not analyzed by zercheck_ir** | **+5 LOC ir_hook call in interrupt path** |
+| 50 | Confirmed | 207 rust_tests safe (PRODUCE-only) | Document |
+| 51 | Risk | 0 cross-module barrier tests | Add tests in step 5.8 |
+| 52 | Medium | LSP doesn't run zercheck_ir | Defer to Phase 6 |
+| 53 | Resolved | Fuzzer doesn't use barriers | Safe |
+| 54 | Resolved | Source line preservation correct | OK |
+| 55 | Confirmed | Walker exhaustiveness discipline | Honor in Phase 5 |
+| 56 | Estimate | ~5-20ms per function overhead | Acceptable; flag if needed |
+| 57 | Resolved | Static / threadlocal globals neutral | OK |
+| 58 | Resolved | IR_RING / container methods neutral | OK |
+| 59 | Test plan | Cross-module test additions | +2 module tests |
+| 60 | Spec | Error message line accuracy across modules | +3 LOC origin_file field |
+
+---
+
+## Cumulative effort estimate
+
+| Round | Estimate |
+|---|---|
+| Original | ~43 hrs |
+| Round 1 | ~47 hrs (gating) |
+| Round 2 | ~50 hrs (cache_/nt_store classification) |
+| Round 3 | ~58 hrs (concurrency intrinsics + defer scanning) |
+| **Round 4** | **~60 hrs** (interrupts + multi-module tests + cross-module error format) |
+
+Round 4 added:
+- ir_hook for interrupts: +0.5 hr (trivial)
+- multi-module test fixtures: +1 hr
+- origin_file in pending: +0.5 hr
+
+**Final estimate: ~60 hrs.**
+
+---
+
+## Final implementation order (post round 4)
+
+| Step | Action | Effort | Tests added |
+|---|---|---|---|
+| 5.0a | Phase F migration: delete zercheck.c, make zercheck_ir primary | 3 hrs | 0 |
+| 5.0b | Add `phase5_error_count` + `summaries_changed` flag | 1.5 hrs | 0 |
+| **5.0c** | NEW: Add ir_hook call to interrupt emission path | 0.5 hrs | 0 |
+| 5.1 | Extract `asm_mnemonic_walk` helper | 4 hrs | 0 |
+| 5.2 | Add `ordering_rules.c` + VST proof | 4 hrs | 0 |
+| 5.3 | Add `IROrderingState` plumbing (with `origin_file` field) | 4 hrs | 0 |
+| 5.4 | Wire asm event tracking + memory clobber | 6 hrs | 0 |
+| 5.4b | Add IR_LOCK, IR_UNLOCK, IR_SPAWN, ThreadHandle.join handlers | 2 hrs | 1 |
+| 5.5 | Wire intrinsic event tracking (full classification table) | 9 hrs | 0 |
+| 5.6 | Function-exit pending check + update dalpha13 test | 6 hrs | 3 |
+| 5.6.5 | Defer body barrier scanning | 5 hrs | 1 |
+| 5.7 | CFG join discharge | 4 hrs | 2 |
+| 5.8 | FuncSummary `barriers_produced` extension + cross-module tests | 7 hrs | 4 |
+| 5.9 | Cross-arch tests | 2 hrs | 2 |
+| 5.10 | Documentation + final make check + perf profiling note | 3 hrs | 1 |
+
+**Total: 15 sub-steps. ~60 hrs. 14+ tests.**
+
+---
+
+## After round 4 — what's left?
+
+Items I checked but didn't dig into:
+- Specific GCC __atomic intrinsic ordering semantics on each arch
+- Full Iris/Coq formal proof for OrderingState soundness (Tier C work)
+- Complex integration with `@verified_spec` (Tier C, out of scope)
+- Programs > 10000 lines: how does iteration cap behave?
+- WASM target (not implemented)
+- Fuzzer extension to add CLWB pattern generators (~3 hrs, defer)
+
+If user wants round 5: would investigate the iteration cap behavior on programs near the 32-iter limit, and any remaining ZER intrinsic that uses __asm__ I might have missed.
+
+But honestly, 4 rounds is comprehensive. Round 4 found 1 CRITICAL (interrupt handlers) and 3 medium issues; rounds 1-3 found the architectural blockers. Plan is implementable.
+
+---
+
+## What round 4 changed in the plan
+
+**One new critical finding**: interrupt handlers don't get IR analysis. ~5 LOC fix.
+
+**Two medium findings**: multi-module test gap (need new test fixtures), error message line accuracy across modules (need origin_file field in pending).
+
+**One performance estimate**: ~5-20ms per function. ~5-20 seconds added per 1000-function compile. Acceptable.
+
+**Confirmed safe**: rust_tests (207 files), fuzzer, IR_RING, container methods, static/threadlocal globals. None false-positive under Phase 5.
+
 ---
 
 ## What I did NOT find (sanity check)

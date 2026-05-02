@@ -46,7 +46,7 @@ immediate-operand instructions.
 Cleanup (commit `ea4a78f`): removed 89 lines of dead-coded ALIGNED
 block from Step 2c (#if 0 wrapped during refactor).
 
-### C8 instruction classification (commit pending)
+### C8 instruction classification (commit `9d930ab`)
 
 Added persistent-memory + acquire/release atomic classifications to
 vendored .zerdata files:
@@ -61,13 +61,80 @@ aarch64 (31 → 37 entries):
 - LDARH / STLRH — halfword variants
 
 These are CLASSIFIED but NOT yet ENFORCED — Stage 5's System #30 (Session
-G, ~80 hrs) will track happens-before edges and error on missing SFENCE
-or unmatched acquire/release. Today the data is ready; activation requires
+G) will track happens-before edges and error on missing SFENCE or
+unmatched acquire/release. Today the data is ready; activation requires
 only the OrderingState CFG traversal in zercheck_ir.c.
 
 Real production code that breaks silently today:
 - CLWB without subsequent SFENCE → no ordering guarantee for NVDIMM
 - LDAR without paired STLR somewhere → potential reordering anomaly
+
+### Session G Phase 1 + Phase 2 — atomic ordering data plumbing
+
+Phase 1: infrastructure for atomic ordering tracking. Adds:
+- `ZerBarrierKind` enum (12 kinds: FullMemory, StoreStore, LoadLoad,
+  Release, Acquire, AcquireRelease, InstructionSync, IoMemory, etc.)
+- `ZerOrderingRole` enum (PRODUCES, REQUIRES_BEFORE, REQUIRES_AFTER, NONE)
+- `ZerOrderingEffect` struct (kind + role)
+- `ordering` field on `ZerInstructionEntry` and `ZerInstructionInfo`
+- Generator parses `ordering.barrier_kind` / `ordering.role` from
+  `.zerdata` and emits as struct initializer
+- All 3 vendored arch tables regenerated with new field
+- `arch_data/SCHEMA.md` documents the syntax
+
+Phase 2: per-instruction classification of existing C8 entries.
+- x86_64: MFENCE/SFENCE/LFENCE PRODUCES; CLWB/CLFLUSHOPT REQUIRES_AFTER
+- aarch64: DMB/DSB PRODUCES FullMemory; ISB PRODUCES InstructionSync;
+  LDAR/LDARB/LDARH PRODUCES Acquire; STLR/STLRB/STLRH PRODUCES Release
+- riscv64: FENCE PRODUCES FullMemory; FENCE.I PRODUCES InstructionSync
+
+No behavior change today — the dispatcher doesn't yet read these
+fields. Phase 3 (enforcement) was attempted, see below.
+
+### Session G Phase 3 — ABANDONED (lesson learned)
+
+Implementation of same-asm-block CLWB→SFENCE check started, then
+reverted before commit. Reasons documented in
+`docs/asm_preconditions_research.md` "Design gaps identified during
+failed G3 attempt":
+
+1. **Same-block check is too narrow.** Real persistent-memory code
+   (libpmem, kernel pmem path) splits CLWB and SFENCE across
+   separate asm blocks:
+   ```
+   asm { instructions: "clwb (%0)" ... }   // block A
+   asm { instructions: "sfence" ... }      // block B
+   ```
+   In-block enforcement would false-positive on this canonical idiom.
+
+2. **The naive "any subsequent barrier" check is weaker than the
+   real ISA rule.** Intel SDM CLWB rule: SFENCE must come before
+   *dependent* subsequent stores. Without dataflow analysis, an
+   enforcement either false-positives (CLWB with no dependent stores)
+   or false-negatives (SFENCE present but after dependent store).
+
+3. **System #30 must integrate with `@atomic_*` intrinsics, not
+   only asm.** ZER's `@atomic_load(.acquire)` etc. ALSO produce
+   ordering. Same-block scan ignores them.
+
+4. **Crude "satisfies" relation.** Phase 1's classifications flatten
+   ARM DMB variants (SY/ISH/OSH) to FULL_MEMORY conservatively;
+   needs operand-immediate inspection for finer-grained tracking.
+
+5. **No empirical validation.** ZER doesn't ship persistent-memory
+   code yet, so classifications are theoretical. Risk: enforcement
+   designed against theory may miss real patterns.
+
+**Decision: skip same-block / function-scope intermediates and
+implement IR-level CFG-aware OrderingState directly in
+`zercheck_ir.c`.** That's ~30-40 hrs of work: track barriers from
+BOTH asm blocks AND `@atomic_*` intrinsics; joins use set-intersection;
+enforcement fires only when CFG can prove a happens-before edge is
+missing.
+
+**Lesson for fresh sessions: don't ship enforcement that rejects
+valid code patterns.** Better to ship data plumbing without
+enforcement than ship enforcement with false positives.
 
 ### BUG-652: Checker.target_ptr_bits never initialized from global (HIGH defense in depth)
 

@@ -2,11 +2,12 @@
  * Regenerate via: make gen-asm-tables (or scripts/gen_instruction_table.sh riscv64)
  *
  * Source: arch_data/riscv64.zerdata (per-instruction safety classification)
- * Generated: 2026-05-02T05:58:37Z
+ * Generated: 2026-05-02T11:14:10Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F4 (instruction-level safety classification).
  * F7-full Step 1 (2026-05-02): per-operand constraint encoding added.
+ * Session G Phase 1 (2026-05-02): atomic ordering effect added.
  *
  * Schema: arch_data/SCHEMA.md
  * Lookup: zer_asm_category(arch, mnemonic, len)
@@ -15,37 +16,37 @@
 #include "asm_instruction_table.h"
 
 const ZerInstructionEntry zer_riscv64_instructions[] = {
-    {"lr.w", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension LR.W", "LL of 32-bit word; subsequent SC.W must pair within state machine. Misaligned address takes load-address-misaligned exception.", 2, {{0, 0, 0}, {2, 4u, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"lr.d", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension LR.D", "LL of 64-bit doubleword; pair with SC.D. Misaligned = load-address-misaligned exception.", 2, {{0, 0, 0}, {2, 8u, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"sc.w", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension SC.W", "SC of 32-bit word; result in operand 0 indicates success/failure. Must follow LR.W. Misaligned = store-address-misaligned exception.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}},
-    {"sc.d", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension SC.D", "SC of 64-bit doubleword; pair with LR.D.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 8u, 0}, {0, 0, 0}}},
-    {"amoadd.w", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOADD.W", "Atomic add on 32-bit word in memory. Misaligned = exception. Requires A extension.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}},
-    {"amoadd.d", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOADD.D", "Atomic add on 64-bit doubleword.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 8u, 0}, {0, 0, 0}}},
-    {"amoswap.w", 9, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOSWAP.W", "Atomic swap. Returns old value, stores new value.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}},
-    {"amoxor.w", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOXOR.W", "Atomic XOR with memory.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}},
-    {"amoand.w", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOAND.W", "Atomic AND with memory.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}},
-    {"amoor.w", 7, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOOR.W", "Atomic OR with memory.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}},
-    {"fadd.s", 6, 8u, 0u, "RISC-V Unprivileged ISA — F extension FADD.S", "Single-precision FP add. Requires F extension. Illegal-instruction exception otherwise.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"fadd.d", 6, 8u, 0u, "RISC-V Unprivileged ISA — D extension FADD.D", "Double-precision FP add. Requires D extension.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"fmul.s", 6, 8u, 0u, "RISC-V Unprivileged ISA — F extension FMUL.S", "Single-precision FP multiply. Requires F extension.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"c.add", 5, 8u, 0u, "RISC-V Unprivileged ISA — C extension C.ADD", "Compressed 16-bit ADD. Requires C extension.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"vadd.vv", 7, 8u, 0u, "RISC-V Vector ISA — V extension VADD.VV", "Vector add (vector + vector). Requires V extension.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"vsetvli", 7, 8u, 0u, "RISC-V Vector ISA — V extension VSETVLI", "Set vector length (immediate VTYPE). Requires V extension. Predecessor for V instructions.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"clz", 3, 8u, 0u, "RISC-V Unprivileged ISA — Zbb extension CLZ", "Count leading zeros. Requires Zbb (basic bit manipulation) extension.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"mret", 4, 16u, 0u, "RISC-V Privileged ISA — MRET", "Return from M-mode trap. Illegal-instruction exception if executed at <M mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"sret", 4, 16u, 0u, "RISC-V Privileged ISA — SRET", "Return from S-mode trap. Illegal-instruction exception if at U mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"wfi", 3, 16u, 0u, "RISC-V Privileged ISA — WFI", "Wait for interrupt. Behavior depends on mstatus.TW: trapped to M-mode if TW=1 and not in M-mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"ecall", 5, 16u, 0u, "RISC-V Unprivileged ISA — ECALL", "Environment call (system call). Takes appropriate trap based on current mode (U-call from U, S-call from S, M-call from M).", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"ebreak", 6, 16u, 0u, "RISC-V Unprivileged ISA — EBREAK", "Software breakpoint. Takes breakpoint trap to higher mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"sfence.vma", 10, 16u, 0u, "RISC-V Privileged ISA — SFENCE.VMA", "Supervisor-mode TLB flush. Illegal-instruction exception at U mode (or trapped to M if MSTATUS.TVM=1).", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"hfence.vvma", 11, 16u, 0u, "RISC-V Privileged ISA — H extension HFENCE.VVMA", "Hypervisor-mode VS-stage TLB flush. Requires H extension + HS mode.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"csrrw", 5, 16u, 0u, "RISC-V Unprivileged ISA — CSRRW", "Read CSR and write new value. Many CSRs are M/S privileged — illegal-instruction exception if accessed below required mode.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"csrrs", 5, 16u, 0u, "RISC-V Unprivileged ISA — CSRRS", "Read CSR and set bits. Same privilege model as CSRRW.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"csrrc", 5, 16u, 0u, "RISC-V Unprivileged ISA — CSRRC", "Read CSR and clear bits. Same privilege model as CSRRW.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"fence", 5, 128u, 0u, "RISC-V Unprivileged ISA — FENCE", "Memory ordering barrier with predecessor/successor sets (PI/PO/PR/PW for input I/O, output, read, write). Stage 5 / System #30 will enforce correct usage.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"fence.i", 7, 128u, 0u, "RISC-V Unprivileged ISA — Zifencei extension FENCE.I", "Instruction-fetch fence. Required after self-modifying code or page-table updates affecting executable pages.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {"fence.tso", 9, 128u, 0u, "RISC-V Unprivileged ISA — Ztso extension FENCE.TSO", "Total Store Order fence. Equivalent to fence rw,rw with Ztso semantics. Optional extension.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
-    {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}  /* sentinel */
+    {"lr.w", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension LR.W", "LL of 32-bit word; subsequent SC.W must pair within state machine. Misaligned address takes load-address-misaligned exception.", 2, {{0, 0, 0}, {2, 4u, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"lr.d", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension LR.D", "LL of 64-bit doubleword; pair with SC.D. Misaligned = load-address-misaligned exception.", 2, {{0, 0, 0}, {2, 8u, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"sc.w", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension SC.W", "SC of 32-bit word; result in operand 0 indicates success/failure. Must follow LR.W. Misaligned = store-address-misaligned exception.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}, {0, 0}},
+    {"sc.d", 4, 6u, 0u, "RISC-V Unprivileged ISA — A extension SC.D", "SC of 64-bit doubleword; pair with LR.D.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 8u, 0}, {0, 0, 0}}, {0, 0}},
+    {"amoadd.w", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOADD.W", "Atomic add on 32-bit word in memory. Misaligned = exception. Requires A extension.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}, {0, 0}},
+    {"amoadd.d", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOADD.D", "Atomic add on 64-bit doubleword.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 8u, 0}, {0, 0, 0}}, {0, 0}},
+    {"amoswap.w", 9, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOSWAP.W", "Atomic swap. Returns old value, stores new value.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}, {0, 0}},
+    {"amoxor.w", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOXOR.W", "Atomic XOR with memory.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}, {0, 0}},
+    {"amoand.w", 8, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOAND.W", "Atomic AND with memory.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}, {0, 0}},
+    {"amoor.w", 7, 10u, 0u, "RISC-V Unprivileged ISA — A extension AMOOR.W", "Atomic OR with memory.", 3, {{0, 0, 0}, {0, 0, 0}, {2, 4u, 0}, {0, 0, 0}}, {0, 0}},
+    {"fadd.s", 6, 8u, 0u, "RISC-V Unprivileged ISA — F extension FADD.S", "Single-precision FP add. Requires F extension. Illegal-instruction exception otherwise.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"fadd.d", 6, 8u, 0u, "RISC-V Unprivileged ISA — D extension FADD.D", "Double-precision FP add. Requires D extension.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"fmul.s", 6, 8u, 0u, "RISC-V Unprivileged ISA — F extension FMUL.S", "Single-precision FP multiply. Requires F extension.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"c.add", 5, 8u, 0u, "RISC-V Unprivileged ISA — C extension C.ADD", "Compressed 16-bit ADD. Requires C extension.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"vadd.vv", 7, 8u, 0u, "RISC-V Vector ISA — V extension VADD.VV", "Vector add (vector + vector). Requires V extension.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"vsetvli", 7, 8u, 0u, "RISC-V Vector ISA — V extension VSETVLI", "Set vector length (immediate VTYPE). Requires V extension. Predecessor for V instructions.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"clz", 3, 8u, 0u, "RISC-V Unprivileged ISA — Zbb extension CLZ", "Count leading zeros. Requires Zbb (basic bit manipulation) extension.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"mret", 4, 16u, 0u, "RISC-V Privileged ISA — MRET", "Return from M-mode trap. Illegal-instruction exception if executed at <M mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"sret", 4, 16u, 0u, "RISC-V Privileged ISA — SRET", "Return from S-mode trap. Illegal-instruction exception if at U mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"wfi", 3, 16u, 0u, "RISC-V Privileged ISA — WFI", "Wait for interrupt. Behavior depends on mstatus.TW: trapped to M-mode if TW=1 and not in M-mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"ecall", 5, 16u, 0u, "RISC-V Unprivileged ISA — ECALL", "Environment call (system call). Takes appropriate trap based on current mode (U-call from U, S-call from S, M-call from M).", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"ebreak", 6, 16u, 0u, "RISC-V Unprivileged ISA — EBREAK", "Software breakpoint. Takes breakpoint trap to higher mode.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"sfence.vma", 10, 16u, 0u, "RISC-V Privileged ISA — SFENCE.VMA", "Supervisor-mode TLB flush. Illegal-instruction exception at U mode (or trapped to M if MSTATUS.TVM=1).", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"hfence.vvma", 11, 16u, 0u, "RISC-V Privileged ISA — H extension HFENCE.VVMA", "Hypervisor-mode VS-stage TLB flush. Requires H extension + HS mode.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"csrrw", 5, 16u, 0u, "RISC-V Unprivileged ISA — CSRRW", "Read CSR and write new value. Many CSRs are M/S privileged — illegal-instruction exception if accessed below required mode.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"csrrs", 5, 16u, 0u, "RISC-V Unprivileged ISA — CSRRS", "Read CSR and set bits. Same privilege model as CSRRW.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"csrrc", 5, 16u, 0u, "RISC-V Unprivileged ISA — CSRRC", "Read CSR and clear bits. Same privilege model as CSRRW.", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {"fence", 5, 128u, 0u, "RISC-V Unprivileged ISA — FENCE", "Memory ordering barrier with predecessor/successor sets (PI/PO/PR/PW for input I/O, output, read, write). Stage 5 / System #30 will enforce correct usage.", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {1, 1}},
+    {"fence.i", 7, 128u, 0u, "RISC-V Unprivileged ISA — Zifencei extension FENCE.I", "Instruction-fetch fence. Required after self-modifying code or page-table updates affecting executable pages.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {9, 1}},
+    {"fence.tso", 9, 128u, 0u, "RISC-V Unprivileged ISA — Ztso extension FENCE.TSO", "Total Store Order fence. Equivalent to fence rw,rw with Ztso semantics. Optional extension.", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, {0, 0}},
+    {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}, {0,0}}  /* sentinel */
 };
 
 const size_t zer_riscv64_instruction_count = 30;

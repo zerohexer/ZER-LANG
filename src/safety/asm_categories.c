@@ -102,6 +102,10 @@ int zer_asm_instruction_info(
         out_info->operand_constraints[i].param1 = 0;
         out_info->operand_constraints[i].param2 = 0;
     }
+    /* Session G Phase 1: zero-initialize the ordering effect. Default
+     * (NONE/NONE) is correct for all non-C8 instructions. */
+    out_info->ordering.kind = 0;
+    out_info->ordering.role = 0;
 
     if (arch == ZER_ARCH_UNKNOWN) {
         return 0;
@@ -135,6 +139,10 @@ int zer_asm_instruction_info(
     for (int i = 0; i < ZER_OPC_MAX_OPERANDS; i++) {
         out_info->operand_constraints[i] = entry->operand_constraints[i];
     }
+    /* Session G Phase 1: copy ordering effect for Stage 5 System #30
+     * dispatch. ZER_BARRIER_NONE / ZER_ORDERING_ROLE_NONE for non-C8
+     * entries (no behavior change today). */
+    out_info->ordering = entry->ordering;
     return 1;
 }
 

@@ -51,6 +51,62 @@ typedef struct {
 
 #define ZER_OPC_MAX_OPERANDS 4
 
+/* Session G Phase 1 (2026-05-02): atomic ordering / barrier classification.
+ *
+ * For System #30 (Atomic Ordering, Stage 5), each C8-classified instruction
+ * declares ITS effect on the ordering state. Two orthogonal axes:
+ *
+ *   barrier_kind — what kind of ordering relationship this instruction
+ *                  participates in (FullMemory, StoreStore, LoadLoad, etc.)
+ *   ordering_role — does the instruction PRODUCE this barrier (establishes
+ *                   ordering for memops around it) or REQUIRE one before/
+ *                   after it (signals an ordering need that another instruction
+ *                   must satisfy)
+ *
+ * Examples:
+ *   MFENCE   — ordering_role=PRODUCES, barrier_kind=FullMemory
+ *   SFENCE   — ordering_role=PRODUCES, barrier_kind=StoreStore
+ *   LFENCE   — ordering_role=PRODUCES, barrier_kind=LoadLoad
+ *   CLWB     — ordering_role=REQUIRES_AFTER, barrier_kind=StoreStore
+ *              (requires SFENCE before next dependent store for visibility)
+ *   CLFLUSHOPT — same as CLWB
+ *   LDAR     — ordering_role=PRODUCES, barrier_kind=Acquire
+ *   STLR     — ordering_role=PRODUCES, barrier_kind=Release
+ *   FENCE.I  — ordering_role=PRODUCES, barrier_kind=InstructionSync
+ *   DMB SY   — ordering_role=PRODUCES, barrier_kind=FullMemory
+ *
+ * Phase 3 (CLWB→SFENCE check) reads these fields. Phase 5 (full
+ * OrderingState CFG pass) extends to cross-block + acquire/release
+ * pairing. */
+
+typedef enum {
+    ZER_BARRIER_NONE              = 0,  /* not a barrier instruction */
+    ZER_BARRIER_FULL_MEMORY       = 1,  /* MFENCE, DMB SY, FENCE rw,rw */
+    ZER_BARRIER_STORE_STORE       = 2,  /* SFENCE, DMB ST, FENCE w,w */
+    ZER_BARRIER_LOAD_LOAD         = 3,  /* LFENCE, DMB LD, FENCE r,r */
+    ZER_BARRIER_LOAD_STORE        = 4,  /* DMB LD variants, FENCE r,w */
+    ZER_BARRIER_STORE_LOAD        = 5,  /* MFENCE essentially */
+    ZER_BARRIER_RELEASE           = 6,  /* paired with acquire — one-way */
+    ZER_BARRIER_ACQUIRE           = 7,  /* paired with release */
+    ZER_BARRIER_ACQUIRE_RELEASE   = 8,  /* strong combined */
+    ZER_BARRIER_INSTRUCTION_SYNC  = 9,  /* ISB, FENCE.I */
+    ZER_BARRIER_IO_MEMORY         = 10, /* FENCE iorw,iorw */
+    ZER_BARRIER_DMA_SYNC          = 11, /* barrier_dma intrinsic */
+} ZerBarrierKind;
+
+typedef enum {
+    ZER_ORDERING_ROLE_NONE       = 0,  /* not ordering-relevant */
+    ZER_ORDERING_PRODUCES        = 1,  /* THIS instruction establishes the barrier */
+    ZER_ORDERING_REQUIRES_BEFORE = 2,  /* requires a barrier of barrier_kind to have run earlier */
+    ZER_ORDERING_REQUIRES_AFTER  = 3,  /* requires a barrier of barrier_kind to run subsequently
+                                        * (e.g., CLWB requires SFENCE before next dependent store) */
+} ZerOrderingRole;
+
+typedef struct {
+    uint8_t kind;   /* ZerBarrierKind */
+    uint8_t role;   /* ZerOrderingRole */
+} ZerOrderingEffect;
+
 /* Per-instruction entry. Fields:
  *   mnemonic            — null-terminated string, e.g., "bsr"
  *   mnemonic_len        — strlen, cached for fast scan
@@ -60,7 +116,11 @@ typedef struct {
  *   consequence         — what goes wrong if precondition violated
  *   operand_count       — declared operand count (0 if not classified)
  *   operand_constraints — per-operand constraint (indexed by operand position;
- *                         positions ≥ operand_count are ZER_OPC_NONE) */
+ *                         positions ≥ operand_count are ZER_OPC_NONE)
+ *   ordering            — barrier kind + role (Session G Phase 1, 2026-05-02).
+ *                         For C8-classified instructions; ZER_BARRIER_NONE +
+ *                         ZER_ORDERING_ROLE_NONE for non-C8. Read by Stage 5
+ *                         System #30 (atomic ordering) checks. */
 typedef struct {
     const char *mnemonic;
     size_t mnemonic_len;
@@ -70,6 +130,7 @@ typedef struct {
     const char *consequence;
     uint8_t operand_count;
     ZerOperandConstraint operand_constraints[ZER_OPC_MAX_OPERANDS];
+    ZerOrderingEffect ordering;
 } ZerInstructionEntry;
 
 /* Per-arch tables. extern declarations; definitions in arch-specific
@@ -110,6 +171,7 @@ typedef struct {
     const char *consequence;  /* effect of violation; NULL if unknown */
     uint8_t operand_count;
     ZerOperandConstraint operand_constraints[ZER_OPC_MAX_OPERANDS];
+    ZerOrderingEffect ordering;  /* Session G Phase 1: barrier kind + role */
 } ZerInstructionInfo;
 
 /* Look up full instruction info (including source citation + consequence

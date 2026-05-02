@@ -108,20 +108,19 @@ bitmap_combine() {
 }
 
 # Awk-based parser: emits CSV per entry.
-# Format (8 fields):
-#   mnemonic|category|features|source|consequence|opcount|opc0|opc1|opc2|opc3
-# operand_count `opcount` is the explicit declared count; opc0..opc3 are the
-# constraint strings (or empty for ANY/no constraint).
+# Format (12 fields):
+#   mnemonic|cat|feat|source|consequence|opcount|opc0|opc1|opc2|opc3|barrier_kind|ordering_role
 #
-# F7-full Step 1b (2026-05-02): adds operand_count + per-operand
-# constraint capture. Anything matching `operand[N].constraint = ...`
-# (where N in 0..3) is recorded for the current entry. F7-full Step 2
-# (future) wires the dispatcher to read these.
+# F7-full Step 1b (2026-05-02): adds operand_count + per-operand constraint capture.
+# Session G Phase 1 (2026-05-02): adds barrier_kind + ordering_role for atomic
+# ordering classification (read by Stage 5 System #30 enforcement).
 #
 # Field key forms recognized:
-#   operand_count             — integer
-#   operand[N].constraint     — constraint expression (NONZERO, ALIGNED(16), etc.)
-#   operand[N].type           — currently ignored (informational only in v1)
+#   operand_count                — integer
+#   operand[N].constraint        — constraint expression (NONZERO, ALIGNED(16), etc.)
+#   operand[N].type              — currently ignored (informational only in v1)
+#   ordering.barrier_kind        — barrier kind name (FULL_MEMORY, STORE_STORE, etc.)
+#   ordering.role                — PRODUCES | REQUIRES_BEFORE | REQUIRES_AFTER
 awk '
     BEGIN {
         mnemonic = ""
@@ -131,14 +130,17 @@ awk '
         consequence = ""
         opcount = 0
         opc0 = ""; opc1 = ""; opc2 = ""; opc3 = ""
+        barrier_kind = "NONE"
+        ordering_role = "NONE"
         in_entry = 0
     }
 
     function flush_entry() {
         if (in_entry && mnemonic != "") {
-            printf "%s|%s|%s|%s|%s|%d|%s|%s|%s|%s\n",
+            printf "%s|%s|%s|%s|%s|%d|%s|%s|%s|%s|%s|%s\n",
                 mnemonic, category, features, source, consequence,
-                opcount, opc0, opc1, opc2, opc3
+                opcount, opc0, opc1, opc2, opc3,
+                barrier_kind, ordering_role
         }
     }
 
@@ -155,6 +157,8 @@ awk '
         consequence = ""
         opcount = 0
         opc0 = ""; opc1 = ""; opc2 = ""; opc3 = ""
+        barrier_kind = "NONE"
+        ordering_role = "NONE"
         in_entry = 1
         next
     }
@@ -185,6 +189,8 @@ awk '
         else if (key == "operand[1].constraint") opc1 = val
         else if (key == "operand[2].constraint") opc2 = val
         else if (key == "operand[3].constraint") opc3 = val
+        else if (key == "ordering.barrier_kind") barrier_kind = val
+        else if (key == "ordering.role")         ordering_role = val
         # Other fields (operand[N].type, notes, schema_version) are
         # informational — preserved in .zerdata for readers but not
         # part of the runtime safety surface.
@@ -259,6 +265,57 @@ build_operand_constraints() {
 }
 
 # ============================================================================
+# Session G Phase 1 (2026-05-02): ordering effect → ZerOrderingEffect
+# ============================================================================
+# Recognized barrier_kind values:
+#   NONE, FULL_MEMORY, STORE_STORE, LOAD_LOAD, LOAD_STORE, STORE_LOAD,
+#   RELEASE, ACQUIRE, ACQUIRE_RELEASE, INSTRUCTION_SYNC, IO_MEMORY, DMA_SYNC
+# Recognized role values:
+#   NONE, PRODUCES, REQUIRES_BEFORE, REQUIRES_AFTER
+barrier_kind_to_int() {
+    case "$1" in
+        ""|NONE)              echo 0;;
+        FULL_MEMORY)          echo 1;;
+        STORE_STORE)          echo 2;;
+        LOAD_LOAD)            echo 3;;
+        LOAD_STORE)           echo 4;;
+        STORE_LOAD)           echo 5;;
+        RELEASE)              echo 6;;
+        ACQUIRE)              echo 7;;
+        ACQUIRE_RELEASE)      echo 8;;
+        INSTRUCTION_SYNC)     echo 9;;
+        IO_MEMORY)            echo 10;;
+        DMA_SYNC)             echo 11;;
+        *)
+            echo "WARN: unrecognized barrier_kind '$1'" >&2
+            echo 0
+            ;;
+    esac
+}
+
+ordering_role_to_int() {
+    case "$1" in
+        ""|NONE)              echo 0;;
+        PRODUCES)             echo 1;;
+        REQUIRES_BEFORE)      echo 2;;
+        REQUIRES_AFTER)       echo 3;;
+        *)
+            echo "WARN: unrecognized ordering_role '$1'" >&2
+            echo 0
+            ;;
+    esac
+}
+
+# Build the ordering effect initializer: {kind, role}
+build_ordering() {
+    local bk="$1" role="$2"
+    local k r
+    k=$(barrier_kind_to_int "$bk")
+    r=$(ordering_role_to_int "$role")
+    echo "{${k}, ${r}}"
+}
+
+# ============================================================================
 # Emit the vendored .c file
 # ============================================================================
 ENTRY_COUNT=0
@@ -273,6 +330,7 @@ ENTRY_COUNT=0
     echo " * Vendored for reproducible builds + LSP-responsive runtime lookup."
     echo " * D-Alpha-7.5 Session F4 (instruction-level safety classification)."
     echo " * F7-full Step 1 (2026-05-02): per-operand constraint encoding added."
+    echo " * Session G Phase 1 (2026-05-02): atomic ordering effect added."
     echo " *"
     echo " * Schema: arch_data/SCHEMA.md"
     echo " * Lookup: zer_asm_category(arch, mnemonic, len)"
@@ -282,7 +340,7 @@ ENTRY_COUNT=0
     echo ""
     echo "const ZerInstructionEntry zer_${ARCH}_instructions[] = {"
 
-    while IFS='|' read -r mnemonic cat_expr feat_expr source consequence opcount opc0 opc1 opc2 opc3; do
+    while IFS='|' read -r mnemonic cat_expr feat_expr source consequence opcount opc0 opc1 opc2 opc3 barrier_kind ordering_role; do
         [ -z "$mnemonic" ] && continue
         local_cat=$(bitmap_combine "$cat_expr" cat_to_int)
         local_feat=$(bitmap_combine "$feat_expr" feat_to_int)
@@ -293,11 +351,12 @@ ENTRY_COUNT=0
         # Default opcount if missing or zero
         [ -z "$opcount" ] && opcount=0
         op_init=$(build_operand_constraints "$opc0" "$opc1" "$opc2" "$opc3")
-        echo "    {\"$mnemonic\", $len, ${local_cat}u, ${local_feat}u, \"$esc_source\", \"$esc_consequence\", $opcount, ${op_init}},"
+        ord_init=$(build_ordering "$barrier_kind" "$ordering_role")
+        echo "    {\"$mnemonic\", $len, ${local_cat}u, ${local_feat}u, \"$esc_source\", \"$esc_consequence\", $opcount, ${op_init}, ${ord_init}},"
         ENTRY_COUNT=$((ENTRY_COUNT + 1))
     done < "$TMP"
 
-    echo "    {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}  /* sentinel */"
+    echo "    {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}, {0,0}}  /* sentinel */"
     echo "};"
     echo ""
     echo "const size_t zer_${ARCH}_instruction_count = ${ENTRY_COUNT};"

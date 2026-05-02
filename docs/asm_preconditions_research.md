@@ -1831,7 +1831,65 @@ where pred = [i][o][r][w] and succ = [i][o][r][w]
 
 ### NEW ZER Safety System #30 — Atomic Ordering
 
-This is the design spec for the new tracking system. **DESIGN ONLY — no code changes in this session.**
+This is the design spec for the new tracking system.
+
+**Implementation status (2026-05-02):**
+- **Phase G1 (data plumbing) — DONE.** `ZerBarrierKind` + `ZerOrderingRole`
+  enums + `ordering` field on `ZerInstructionEntry`/`ZerInstructionInfo`.
+  Generator parses `ordering.barrier_kind` / `ordering.role` from
+  `.zerdata`. All 3 arch tables vendored with new field (defaults to
+  `{NONE, NONE}` for non-C8 entries).
+- **Phase G2 (per-instruction classification) — DONE.** All existing
+  C8 entries now declare their barrier role:
+  - x86: MFENCE/SFENCE/LFENCE → PRODUCES; CLWB/CLFLUSHOPT → REQUIRES_AFTER
+  - ARM: DMB/DSB → PRODUCES FullMemory; ISB → PRODUCES InstructionSync;
+    LDAR/LDARB/LDARH → PRODUCES Acquire; STLR/STLRB/STLRH → PRODUCES Release
+  - RISC-V: FENCE → PRODUCES FullMemory; FENCE.I → PRODUCES InstructionSync
+- **Phase G3 (in-block enforcement) — ABANDONED.** First attempt
+  was a same-asm-block scan: if a block contains CLWB, verify a
+  subsequent SFENCE in the same `instructions` string. Discovered
+  this rejects the canonical multi-block idiom that real persistent-
+  memory code (libpmem, kernel pmem path) uses:
+  ```
+  asm { instructions: "clwb (%0)" ... }   // block A
+  asm { instructions: "sfence" ... }      // block B
+  ```
+  Same-block enforcement creates false positives on standard code.
+  Reverted before commit. The honest path forward is IR-level CFG
+  tracking (below) — it's the smallest design that catches real
+  bugs without false positives.
+
+**Design gaps identified during the failed G3 attempt:**
+
+1. **Same-block check is too narrow.** Real CLWB+SFENCE pairs span
+   multiple asm blocks separated by C statements.
+2. **The naive "any subsequent barrier" check is weaker than the ISA
+   rule.** Intel SDM CLWB rule: SFENCE must come before *dependent*
+   subsequent stores. Without dataflow analysis, an enforcement
+   either false-positives (CLWB with no dependent stores) or
+   false-negatives (SFENCE present but after the dependent store).
+3. **System #30 must integrate with `@atomic_*` intrinsics, not
+   only asm.** ZER's `@atomic_load(.acquire)`, `@atomic_store(.release)`,
+   etc. ALSO produce ordering. A real System #30 tracks barriers
+   from BOTH asm blocks AND atomic intrinsics — anything else
+   misses cases where the user mixes them.
+4. **Crude "satisfies" relation.** ARM `DMB ISHST` (inner-shareable
+   store-store) doesn't satisfy a system-wide `STORE_STORE`
+   requirement. Phase 1 currently classifies all DMB variants as
+   FULL_MEMORY conservatively; Phase 5 needs to inspect the operand
+   immediate (DMB SY vs DMB ISH vs DMB OSH) for finer-grained
+   tracking.
+5. **No empirical validation.** ZER doesn't ship persistent-memory
+   code yet, so the classifications were derived from Intel SDM
+   theory, not from "this real ZER program would now compile-error
+   under enforcement." Risk: enforcement designed against theory
+   may miss patterns users actually write.
+
+**Decision: skip same-block / function-scope intermediates and
+implement IR-level CFG-aware OrderingState directly.** That's the
+~30-40 hr piece below; intermediate stops produce false positives
+that ship enforcement that user code has to work around — worse
+than no enforcement.
 
 #### What System #30 tracks
 
@@ -1992,6 +2050,75 @@ Plus VST proof in `proofs/vst/verif_ordering_rules.v`.
 | C8d (acquire/release atomic) | Update barriers_seen with acquire-or-release flag |
 
 **Total C8 implementation effort: ~80 hrs** (includes new System #30 + CFG tracking + data file wiring + per-arch barrier dispatch).
+
+### Updated effort breakdown (post-2026-05-02)
+
+After landing Phase 1 (data plumbing) + Phase 2 (per-instruction
+classification), the original ~80 hr estimate is REVISED DOWN:
+
+| Phase | Status | Effort | Notes |
+|---|---|---|---|
+| Phase 1 — `ZerBarrierKind` + ordering field | DONE | (4 hrs) | Data plumbing + generator + struct extension |
+| Phase 2 — classify existing C8 entries | DONE | (1 hr) | x86 MFENCE/SFENCE/CLWB/etc., ARM DMB/ISB/LDAR/STLR, RISC-V FENCE family |
+| Phase 3 — same-block enforcement | ABANDONED | — | False-positives on multi-block CLWB+SFENCE patterns; reverted |
+| Phase 4 — function-scope tracking | SKIPPED | — | Same false-positive class as Phase 3 across the function rather than block; doesn't fix the root issue |
+| Phase 5 — IR-level CFG OrderingState | NEXT | ~30-40 hrs | The honest path: walk IR CFG, track barriers from BOTH asm and `@atomic_*`, joins use set-intersection, fire only when CFG can prove a happens-before edge is missing |
+| Phase 6 — Acquire/release pairing | INCLUDED IN PHASE 5 | — | Same OrderingState pass; LDAR adds barrier, STLR clears matching pending |
+| Phase 7 — FENCE.I before self-modifying code | DEFERRED | — | ZER doesn't expose self-modifying code today; check has nothing to fire on |
+
+**Revised total: ~35-45 hrs.** Phase 5 is the load-bearing piece;
+everything else either fits inside Phase 5 (pairing) or doesn't apply
+to ZER today (self-modifying code).
+
+### Phase 5 implementation roadmap (for fresh sessions)
+
+The smallest correct implementation. Walk IR per function:
+
+```
+1. Initialize OrderingState at function entry: barriers_seen={}, pending={}
+2. For each IRInst in CFG order (DFS from entry, joining at branch points):
+   a. Classify the instruction:
+      - IR_ASM with single C8 mnemonic   → query .zerdata table for ordering effect
+      - IR_ATOMIC_LOAD(.acquire)         → equivalent to PRODUCES Acquire
+      - IR_ATOMIC_STORE(.release)        → equivalent to PRODUCES Release
+      - IR_ATOMIC_*(.seq_cst)            → equivalent to PRODUCES FullMemory
+      - IR_ASM with memory clobber       → conservatively PRODUCES FullMemory
+      - All other IRInsts                → no ordering effect
+   b. If PRODUCES barrier B:
+      - Add B to barriers_seen
+      - For each pending requirement R: if barrier_satisfies(B, R): clear R
+   c. If REQUIRES_AFTER barrier B:
+      - Add (this_inst, B) to pending
+3. At join points (CFG merges):
+   - barriers_seen = INTERSECT(pred barriers_seen)  // most-conservative
+   - pending = UNION(pred pending)                  // pessimistic carry-forward
+4. At function exit:
+   - For each pending requirement (inst, B):
+     - Error: "asm 'X' requires barrier B subsequently but no
+       satisfying barrier reaches function exit"
+```
+
+**Key safety system integrations:**
+- `IR_ATOMIC_*` instructions need an `ordering` field (currently atomics
+  are SEQ_CST by default — extend or read from intrinsic args)
+- `IR_ASM` instructions need to identify single-mnemonic asm blocks and
+  look up via `zer_asm_instruction_info(arch, mnemonic, len, &info)`
+- `barrier_satisfies(produced, required)` needs to be a small predicate
+  function suitable for Level 3 VST extraction
+
+**Files touched (estimate):**
+- `zercheck_ir.c` — main pass (~250-400 lines)
+- `ir.h` — add ordering field to IR_ATOMIC_* (or read from existing)
+- `src/safety/ordering_rules.c` — pure predicate `barrier_satisfies`
+  (~30 lines, Level 3 extractable)
+- `proofs/vst/verif_ordering_rules.v` — VST proof of barrier_satisfies
+  (~40 lines)
+- Test suite: positive (CLWB+SFENCE in any order across blocks
+  compiles), negative (CLWB at end of function with no SFENCE errors)
+
+**Critical: NO same-block / function-scope / AST-level checks.**
+Phase 3's failure showed those create false positives. Either CFG-aware
+or skip the check.
 
 ### POC specifications (see `research/asm_generics/C8_memory_ordering/`)
 

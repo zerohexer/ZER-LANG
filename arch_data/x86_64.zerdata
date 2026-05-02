@@ -466,6 +466,8 @@ required_features = SSE2
 source = "Intel SDM Vol 2A MFENCE"
 consequence = "no enforcement today (Stage 5 / System #30); semantics: full memory barrier (acq+rel)"
 notes = "Required between non-temporal stores (MOVNT*) and following loads."
+ordering.barrier_kind = FULL_MEMORY
+ordering.role = PRODUCES
 
 [lfence]
 operand_count = 0
@@ -473,6 +475,8 @@ category = C8_MEMORY_ORDER
 required_features = SSE2
 source = "Intel SDM Vol 2A LFENCE"
 consequence = "load barrier; orders prior loads before subsequent loads"
+ordering.barrier_kind = LOAD_LOAD
+ordering.role = PRODUCES
 
 [sfence]
 operand_count = 0
@@ -480,6 +484,8 @@ category = C8_MEMORY_ORDER
 required_features = SSE
 source = "Intel SDM Vol 2B SFENCE"
 consequence = "store barrier; orders prior stores before subsequent stores"
+ordering.barrier_kind = STORE_STORE
+ordering.role = PRODUCES
 
 [pause]
 operand_count = 0
@@ -487,6 +493,7 @@ category = C8_MEMORY_ORDER
 source = "Intel SDM Vol 2B PAUSE"
 consequence = "spin-loop hint; reduces power and improves spin-wait performance"
 notes = "Not strictly memory-ordering but related to atomic spin patterns."
+# PAUSE is not an ordering primitive — leave ordering NONE
 
 # CLFLUSHOPT and CLWB — persistent memory cache control. CRITICAL: these
 # are NOT ordered with respect to other CLFLUSHOPT/CLWB or younger writes
@@ -504,6 +511,8 @@ required_features = NONE
 source = "Intel SDM Vol 2A CLFLUSHOPT"
 consequence = "NOT ordered w.r.t. other CLFLUSHOPT/CLWB or younger stores; needs SFENCE for ordering"
 notes = "Persistent-memory ordering — SFENCE required for NVDIMM correctness."
+ordering.barrier_kind = STORE_STORE
+ordering.role = REQUIRES_AFTER
 
 [clwb]
 operand_count = 1
@@ -513,3 +522,5 @@ required_features = NONE
 source = "Intel SDM Vol 2A CLWB"
 consequence = "NOT ordered w.r.t. other CLWB/CLFLUSH or younger writes; needs SFENCE for global visibility"
 notes = "Persistent-memory writeback — without SFENCE, ordering is undefined."
+ordering.barrier_kind = STORE_STORE
+ordering.role = REQUIRES_AFTER

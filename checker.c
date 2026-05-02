@@ -10124,15 +10124,25 @@ static void check_stmt(Checker *c, Node *node) {
                              * Asm where VRP can't determine the value emits
                              * a diagnostic note (not error) to avoid over-
                              * rejection of opaque/parameter inputs. */
+                            /* Two enforcement passes:
+                             *
+                             * Pass A (positional): for NONZERO/COMPOUND/BOUNDED
+                             * — these constraints care about a specific operand
+                             * (e.g., divisor of IDIV). Use the GCC `%N`
+                             * convention: operand[N] = N-th binding.
+                             *
+                             * Pass B (heuristic): for ALIGNED — there's only
+                             * one alignment constraint per instruction and
+                             * register operands are commonly declared as
+                             * clobbers (breaking positional mapping). Walk
+                             * all bindings, check each const-evaluable one. */
                             for (int oi = 0; oi < info.operand_count &&
                                              oi < ZER_OPC_MAX_OPERANDS; oi++) {
                                 ZerOperandConstraint oc = info.operand_constraints[oi];
                                 if (oc.kind == ZER_OPC_NONE) continue;
+                                if (oc.kind == ZER_OPC_ALIGNED) continue; /* Pass B handles this */
 
-                                /* Find matching binding: .zerdata operand[N]
-                                 * = N-th binding (outputs first, then inputs).
-                                 * GCC inline asm convention: %0..%N number
-                                 * outputs first then inputs in declaration order. */
+                                /* Pass A: positional binding lookup. */
                                 Node *bound_expr = NULL;
                                 if (oi < node->asm_stmt.output_count) {
                                     bound_expr = node->asm_stmt.outputs[oi].expr;
@@ -10203,8 +10213,160 @@ static void check_stmt(Checker *c, Node *node) {
                                      * overflow on the implicit dividend is checked at
                                      * the runtime trap (matches IR path INT_MIN check). */
                                 }
-                                /* ALIGNED — Step 2c (next commit). */
+                                /* (ALIGNED handled in Pass B below — outside
+                                 * this per-operand loop so it doesn't depend
+                                 * on positional binding lookup.) */
+                                (void)0;
+                                #if 0
+                                /* F7-full Step 2c (2026-05-02): ALIGNED(N)
+                                 * constraint enforcement (DEAD-CODED;
+                                 * moved outside loop to Pass B).
+                                 *
+                                 * Memory operands of MOVAPS, LR.W, AMO ops
+                                 * require N-byte alignment per ISA spec.
+                                 *
+                                 * Note vs Step 2a/2b: the strict positional
+                                 * convention (operand[N] ↔ N-th binding)
+                                 * only works when EVERY .zerdata operand
+                                 * has a corresponding inputs/outputs
+                                 * binding. For asm with register operands
+                                 * declared as clobbers (e.g., MOVAPS where
+                                 * the XMM operand is `clobbers:["xmm0"]`,
+                                 * not bound to a ZER expression), the
+                                 * positional mapping breaks: .zerdata
+                                 * operand[0]=XMM_REGISTER has no binding,
+                                 * but operand[1]=MEMORY's positional match
+                                 * would land on the input[0] expression.
+                                 *
+                                 * For ALIGNED specifically — there's only
+                                 * one alignment constraint per instruction
+                                 * (the memory operand) — use a simpler
+                                 * heuristic: walk ALL bindings (outputs +
+                                 * inputs), for each one whose value can be
+                                 * const-evaluated, verify alignment.
+                                 * Catches the common MMIO constant-address
+                                 * pattern without requiring exact operand
+                                 * mapping. Non-const expressions skip
+                                 * (user-asserted; @inttoptr runtime
+                                 * alignment check at emitter.c:2779
+                                 * backstops for variable addresses). */
+                                if (oc.kind == ZER_OPC_ALIGNED) {
+                                    uint32_t required = oc.param1;
+                                    if (required > 0) {
+                                        /* Walk outputs first, then inputs;
+                                         * check each const-evaluable binding. */
+                                        int total_bindings = node->asm_stmt.output_count +
+                                                             node->asm_stmt.input_count;
+                                        for (int bi = 0; bi < total_bindings; bi++) {
+                                            Node *bex;
+                                            if (bi < node->asm_stmt.output_count) {
+                                                bex = node->asm_stmt.outputs[bi].expr;
+                                            } else {
+                                                bex = node->asm_stmt.inputs[bi - node->asm_stmt.output_count].expr;
+                                            }
+                                            if (!bex) continue;
+                                            int64_t av = eval_const_expr(bex);
+                                            /* Resolve const idents via Symbol init. */
+                                            if (av == CONST_EVAL_FAIL &&
+                                                bex->kind == NODE_IDENT) {
+                                                Symbol *bsym = scope_lookup(c->current_scope,
+                                                    bex->ident.name,
+                                                    (uint32_t)bex->ident.name_len);
+                                                if (bsym && bsym->is_const && bsym->func_node) {
+                                                    Node *binit = NULL;
+                                                    if (bsym->func_node->kind == NODE_GLOBAL_VAR)
+                                                        binit = bsym->func_node->var_decl.init;
+                                                    else if (bsym->func_node->kind == NODE_VAR_DECL)
+                                                        binit = bsym->func_node->var_decl.init;
+                                                    if (binit) av = eval_const_expr(binit);
+                                                }
+                                            }
+                                            if (av != CONST_EVAL_FAIL &&
+                                                (uint64_t)av % required != 0) {
+                                                checker_error(c, node->loc.line,
+                                                    "asm '%.*s' requires %u-byte alignment "
+                                                    "but binding has constant value "
+                                                    "0x%llx (not aligned) — consequence: %s "
+                                                    "(cite: %s)",
+                                                    (int)mn_len, s + mn_start,
+                                                    required,
+                                                    (unsigned long long)(uint64_t)av,
+                                                    info.consequence ? info.consequence : "ISA-defined fault",
+                                                    info.source ? info.source : "no source");
+                                                /* one error per asm block per
+                                                 * misaligned binding is enough */
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    /* Once we've handled the (single) ALIGNED
+                                     * constraint, no need to re-check on later
+                                     * operand indices — break out of operand loop. */
+                                    break;
+                                }
+                                #endif
                                 /* BOUNDED — Step 2d (no current instructions use it). */
+                            }
+
+                            /* Pass B: ALIGNED — heuristic across all bindings.
+                             * If ANY operand_constraints[oi] has ALIGNED(K),
+                             * walk all input/output bindings and check each
+                             * const-evaluable one against K. Catches the
+                             * common MMIO constant-address pattern (BMW-style
+                             * volatile pointer to literal address) without
+                             * requiring exact operand-index mapping. Register
+                             * operands declared as clobbers don't have
+                             * bindings, so they're naturally skipped. */
+                            uint32_t aligned_required = 0;
+                            for (int oi = 0; oi < info.operand_count &&
+                                             oi < ZER_OPC_MAX_OPERANDS; oi++) {
+                                if (info.operand_constraints[oi].kind == ZER_OPC_ALIGNED) {
+                                    aligned_required = info.operand_constraints[oi].param1;
+                                    break;
+                                }
+                            }
+                            if (aligned_required > 0) {
+                                int total_bindings = node->asm_stmt.output_count +
+                                                     node->asm_stmt.input_count;
+                                bool reported = false;
+                                for (int bi = 0; bi < total_bindings && !reported; bi++) {
+                                    Node *bex;
+                                    if (bi < node->asm_stmt.output_count) {
+                                        bex = node->asm_stmt.outputs[bi].expr;
+                                    } else {
+                                        bex = node->asm_stmt.inputs[bi - node->asm_stmt.output_count].expr;
+                                    }
+                                    if (!bex) continue;
+                                    int64_t av = eval_const_expr(bex);
+                                    if (av == CONST_EVAL_FAIL &&
+                                        bex->kind == NODE_IDENT) {
+                                        Symbol *bsym = scope_lookup(c->current_scope,
+                                            bex->ident.name,
+                                            (uint32_t)bex->ident.name_len);
+                                        if (bsym && bsym->is_const && bsym->func_node) {
+                                            Node *binit = NULL;
+                                            if (bsym->func_node->kind == NODE_GLOBAL_VAR)
+                                                binit = bsym->func_node->var_decl.init;
+                                            else if (bsym->func_node->kind == NODE_VAR_DECL)
+                                                binit = bsym->func_node->var_decl.init;
+                                            if (binit) av = eval_const_expr(binit);
+                                        }
+                                    }
+                                    if (av != CONST_EVAL_FAIL &&
+                                        (uint64_t)av % aligned_required != 0) {
+                                        checker_error(c, node->loc.line,
+                                            "asm '%.*s' requires %u-byte alignment "
+                                            "but binding has constant value 0x%llx "
+                                            "(not aligned) — consequence: %s "
+                                            "(cite: %s)",
+                                            (int)mn_len, s + mn_start,
+                                            aligned_required,
+                                            (unsigned long long)(uint64_t)av,
+                                            info.consequence ? info.consequence : "ISA-defined fault",
+                                            info.source ? info.source : "no source");
+                                        reported = true;
+                                    }
+                                }
                             }
                         }
                     }

@@ -2,7 +2,7 @@
  * Regenerate via: make gen-asm-tables (or scripts/gen_instruction_table.sh x86_64)
  *
  * Source: arch_data/x86_64.zerdata (per-instruction safety classification)
- * Generated: 2026-05-02T05:57:09Z
+ * Generated: 2026-05-02T07:23:57Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F4 (instruction-level safety classification).
@@ -66,7 +66,9 @@ const ZerInstructionEntry zer_x86_64_instructions[] = {
     {"lfence", 6, 128u, 4u, "Intel SDM Vol 2A LFENCE", "load barrier; orders prior loads before subsequent loads", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
     {"sfence", 6, 128u, 2u, "Intel SDM Vol 2B SFENCE", "store barrier; orders prior stores before subsequent stores", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
     {"pause", 5, 128u, 0u, "Intel SDM Vol 2B PAUSE", "spin-loop hint; reduces power and improves spin-wait performance", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"clflushopt", 10, 128u, 0u, "Intel SDM Vol 2A CLFLUSHOPT", "NOT ordered w.r.t. other CLFLUSHOPT/CLWB or younger stores; needs SFENCE for ordering", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"clwb", 4, 128u, 0u, "Intel SDM Vol 2A CLWB", "NOT ordered w.r.t. other CLWB/CLFLUSH or younger writes; needs SFENCE for global visibility", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
     {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}  /* sentinel */
 };
 
-const size_t zer_x86_64_instruction_count = 51;
+const size_t zer_x86_64_instruction_count = 53;

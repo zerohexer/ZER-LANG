@@ -5,12 +5,69 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-05-02 (extended) — F6 + F7-light + 4 limitation fixes + 1 investigation
+## Session 2026-05-02 (extended) — F6 + F7-light + F7-full + C8 classification
 
 Continuation of the same 2026-05-02 session that started with the branch
 audit ingestion (BUG-650/651). Closed 5 of 6 OPEN limitations from
-docs/limitations.md, completed F6 (riscv64 instruction tables), and
-landed F7-light C3 LL/SC pairing enforcement. Single calendar day.
+docs/limitations.md, completed F6 (riscv64 instruction tables), landed
+F7-light C3 LR/SC pairing enforcement, completed all 4 F7-full constraint
+kinds (Step 2a-2d), and added C8 classification for persistent-memory
+and acquire/release atomic instructions. Single calendar day.
+
+### F7-full Step 2 — per-operand constraint enforcement (4 commits)
+
+Step 1 (commit `b02ed0d`): schema/generator extended to encode per-operand
+constraints. Vendored .c tables now contain ZerOperandConstraint entries
+for each instruction's operand[N].constraint. No behavior change yet.
+
+Step 2a (commit `0cb9f36`): NONZERO + COMPOUND enforcement via VRP
+(System #12). For each operand[N] with NONZERO constraint, dispatcher
+finds the matching binding via GCC inline asm convention (operand[N] =
+N-th binding, outputs first then inputs), evaluates const-eval and
+const-symbol init, queries VRP range. Errors with vendor citation.
+
+Real production-grade error fires for:
+- BSR/BSF with unprovable nonzero source (Intel SDM Vol 2A)
+- IDIV/DIV with unprovable nonzero divisor
+
+Step 2c (commit `b9349bf`): ALIGNED enforcement via heuristic Pass B.
+Strict positional binding breaks when register operands are declared
+as clobbers (e.g., MOVAPS XMM clobber). For ALIGNED specifically (only
+one alignment constraint per instruction), Pass B walks ALL bindings
+and checks each const-evaluable one against the alignment requirement.
+
+Real fire: `movaps (%0), %%xmm0` with `inputs: { "rdi" = 0x40000001 }`
+correctly rejected (1 mod 16 != 0) with Intel SDM citation.
+
+Step 2d (commit `b64cd54`): BOUNDED wiring parallel to NONZERO. No
+.zerdata entries use BOUNDED yet — wiring sits ready for future
+immediate-operand instructions.
+
+Cleanup (commit `ea4a78f`): removed 89 lines of dead-coded ALIGNED
+block from Step 2c (#if 0 wrapped during refactor).
+
+### C8 instruction classification (commit pending)
+
+Added persistent-memory + acquire/release atomic classifications to
+vendored .zerdata files:
+
+x86_64 (51 → 53 entries):
+- CLFLUSHOPT — NOT ordered w.r.t. younger stores; needs SFENCE for ordering
+- CLWB — NOT ordered w.r.t. CLFLUSH/younger writes; needs SFENCE
+
+aarch64 (31 → 37 entries):
+- LDAR / STLR — acquire/release loads and stores (one-way ordering)
+- LDARB / STLRB — byte variants
+- LDARH / STLRH — halfword variants
+
+These are CLASSIFIED but NOT yet ENFORCED — Stage 5's System #30 (Session
+G, ~80 hrs) will track happens-before edges and error on missing SFENCE
+or unmatched acquire/release. Today the data is ready; activation requires
+only the OrderingState CFG traversal in zercheck_ir.c.
+
+Real production code that breaks silently today:
+- CLWB without subsequent SFENCE → no ordering guarantee for NVDIMM
+- LDAR without paired STLR somewhere → potential reordering anomaly
 
 ### BUG-652: Checker.target_ptr_bits never initialized from global (HIGH defense in depth)
 

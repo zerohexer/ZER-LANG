@@ -2,7 +2,7 @@
  * Regenerate via: make gen-asm-tables (or scripts/gen_instruction_table.sh aarch64)
  *
  * Source: arch_data/aarch64.zerdata (per-instruction safety classification)
- * Generated: 2026-05-02T05:58:04Z
+ * Generated: 2026-05-02T07:24:55Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F4 (instruction-level safety classification).
@@ -46,7 +46,13 @@ const ZerInstructionEntry zer_aarch64_instructions[] = {
     {"isb", 3, 128u, 0u, "ARM ARM A64 ISB", "instruction synchronization barrier; flushes pipeline", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
     {"sev", 3, 128u, 0u, "ARM ARM A64 SEV", "send event hint; wakes WFE-waiting cores", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
     {"sevl", 4, 128u, 0u, "ARM ARM A64 SEVL", "send event local; sets event register on this core only", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"ldar", 4, 128u, 0u, "ARM ARM A64 LDAR", "load with acquire ordering; subsequent memops cannot reorder before", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"stlr", 4, 128u, 0u, "ARM ARM A64 STLR", "store with release ordering; prior memops cannot reorder after", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"ldarb", 5, 128u, 0u, "ARM ARM A64 LDARB", "byte load with acquire ordering", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"ldarh", 5, 128u, 0u, "ARM ARM A64 LDARH", "halfword load with acquire ordering", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"stlrb", 5, 128u, 0u, "ARM ARM A64 STLRB", "byte store with release ordering", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"stlrh", 5, 128u, 0u, "ARM ARM A64 STLRH", "halfword store with release ordering", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
     {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}  /* sentinel */
 };
 
-const size_t zer_aarch64_instruction_count = 31;
+const size_t zer_aarch64_instruction_count = 37;

@@ -2691,33 +2691,33 @@ escape hatch; the intrinsic is the productionized version.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### What this means for Stage 4 (next concrete work)
+### Stage 4 status (updated 2026-05-02)
 
-The remaining D-Alpha-7.5 work, in priority order:
+All concrete F-track work for Stage 4 is **DONE**:
 
-1. **F4 — x86_64 instruction tables** (~30 hrs)
-   - Auto-extract from Capstone or XED database
-   - Manual `.zerdata` for category classification
-   - Vendor `src/safety/asm_instruction_table_x86_64.c`
+| Component | Status |
+|---|---|
+| F4 — x86_64 instruction tables (53 entries) | ✅ DONE |
+| F5 — ARM64 instruction tables (37 entries) | ✅ DONE |
+| F6 — RISC-V instruction tables (30 entries) | ✅ DONE 2026-05-02 |
+| F7-light C3 LR/SC pairing (CFG-local state machine) | ✅ DONE 2026-05-02 |
+| F7-full Step 1 (per-operand constraint plumbing) | ✅ DONE 2026-05-02 |
+| F7-full Step 2a NONZERO via VRP (BSR/IDIV/etc.) | ✅ DONE 2026-05-02 |
+| F7-full Step 2b COMPOUND via VRP | ✅ DONE 2026-05-02 |
+| F7-full Step 2c ALIGNED via heuristic Pass B (MOVAPS) | ✅ DONE 2026-05-02 |
+| F7-full Step 2d BOUNDED via VRP | ✅ DONE 2026-05-02 |
+| C8 instruction classification (CLWB/CLFLUSHOPT/LDAR/STLR) | ✅ DONE 2026-05-02 |
 
-2. **F5 — ARM64 instruction tables** (~25 hrs)
-   - ARM XML database extract
-   - Manual `.zerdata` per arch
-   - Vendor `src/safety/asm_instruction_table_aarch64.c`
+What's left in the asm-safety milestone:
 
+1. **3 remaining Z-rules** (Z9, Z10, Z13) — forward-compat, blocked on S1 relaxation
+2. **Session G / System #30** (Stage 5) — atomic ordering analysis (~80 hrs)
 3. **F6-extensions (later)** — RISC-V V vector extension if demand emerges
-   - F6-minimum (base ISA) DONE 2026-04-29
-   - V/Zfh/Zba/Zbb extensions deferred until needed
 
-4. **F7-full — Per-category enforcement** (~25 hrs)
-   - Wire C1 → VRP, C2 → alignment check, C5 → privilege context, etc.
-   - Each category fires its corresponding existing safety system at NODE_ASM check time
-
-5. **3 remaining Z-rules** (Z9, Z10, Z13) — forward-compat, blocked on S1 relaxation
-
-**Total Stage 4 remaining**: ~80 hrs. Closes 0 silent gaps directly (it's
-infrastructure for instruction-level safety) but unlocks Stage 5's System #30
-(atomic ordering, +1 gap closed).
+**Stage 4 closed real silent gaps** today: BSR with unprovable nonzero,
+IDIV divisor, MOVAPS misaligned constants — all rejected at compile time
+with vendor citations. The C8 instructions are classified and waiting for
+Session G's OrderingState tracking to enforce pairing.
 
 ### Optional UX polish (deferred)
 

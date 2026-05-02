@@ -2,10 +2,11 @@
  * Regenerate via: make gen-asm-tables (or scripts/gen_instruction_table.sh aarch64)
  *
  * Source: arch_data/aarch64.zerdata (per-instruction safety classification)
- * Generated: 2026-04-29T10:36:18Z
+ * Generated: 2026-05-02T05:58:04Z
  *
  * Vendored for reproducible builds + LSP-responsive runtime lookup.
  * D-Alpha-7.5 Session F4 (instruction-level safety classification).
+ * F7-full Step 1 (2026-05-02): per-operand constraint encoding added.
  *
  * Schema: arch_data/SCHEMA.md
  * Lookup: zer_asm_category(arch, mnemonic, len)
@@ -14,38 +15,38 @@
 #include "asm_instruction_table.h"
 
 const ZerInstructionEntry zer_aarch64_instructions[] = {
-    {"ldxr", 4, 4u, 0u, "ARM ARM A64 LDXR", "LL portion of LL/SC; subsequent STXR must pair within state machine, otherwise the exclusive monitor is left set and other threads can spurious-fail their STXR"},
-    {"ldaxr", 5, 4u, 0u, "ARM ARM A64 LDAXR", "LL with acquire ordering; same pairing requirement as LDXR"},
-    {"stxr", 4, 4u, 0u, "ARM ARM A64 STXR", "SC portion of LL/SC; #UD-equivalent if no LDXR preceded; result in operand 0 indicates success/failure"},
-    {"stlxr", 5, 4u, 0u, "ARM ARM A64 STLXR", "SC with release ordering; must follow LDAXR"},
-    {"fadd", 4, 8u, 0u, "ARM ARM A64 FADD", "requires FP or SIMD support (always present on aarch64 base profile)"},
-    {"fmul", 4, 8u, 0u, "ARM ARM A64 FMUL", "requires FP/SIMD support"},
-    {"aese", 4, 8u, 0u, "ARM ARM A64 AESE", "#UD-equivalent if AES extension not enabled"},
-    {"aesd", 4, 8u, 0u, "ARM ARM A64 AESD", "#UD-equivalent if AES extension not enabled"},
-    {"sha256h", 7, 8u, 0u, "ARM ARM A64 SHA256H", "#UD-equivalent if SHA2 extension not enabled"},
-    {"crc32x", 6, 8u, 0u, "ARM ARM A64 CRC32X", "#UD-equivalent if CRC32 extension not enabled (FEAT_CRC32)"},
-    {"ld1", 3, 8u, 0u, "ARM ARM A64 LD1 (vector)", "NEON load; requires Advanced SIMD (always on ARMv8 base)"},
-    {"eret", 4, 16u, 0u, "ARM ARM A64 ERET", "exception level demotion; UNDEFINED at EL0"},
-    {"eretaa", 6, 16u, 0u, "ARM ARM A64 ERETAA", "ERET with pointer authentication (key A); UNDEFINED at EL0"},
-    {"eretab", 6, 16u, 0u, "ARM ARM A64 ERETAB", "ERET with pointer authentication (key B); UNDEFINED at EL0"},
-    {"hvc", 3, 16u, 0u, "ARM ARM A64 HVC", "hypervisor call; UNDEFINED at EL0/EL1 (requires HCR_EL2.HVC=1)"},
-    {"smc", 3, 16u, 0u, "ARM ARM A64 SMC", "secure monitor call; UNDEFINED at EL0 (configurable at EL1)"},
-    {"brk", 3, 16u, 0u, "ARM ARM A64 BRK", "debug breakpoint; takes exception to EL1+"},
-    {"hlt", 3, 16u, 0u, "ARM ARM A64 HLT", "halt instruction; takes Halting Debug exception (DCPS)"},
-    {"wfi", 3, 16u, 0u, "ARM ARM A64 WFI", "wait for interrupt; behaviour depends on EL and trap configuration"},
-    {"wfe", 3, 16u, 0u, "ARM ARM A64 WFE", "wait for event; same trap considerations as WFI"},
-    {"at", 2, 16u, 0u, "ARM ARM A64 AT", "address translation; UNDEFINED at EL0"},
-    {"tlbi", 4, 16u, 0u, "ARM ARM A64 TLBI", "TLB invalidate; UNDEFINED at EL0 (FEAT_TLBIOS may relax)"},
-    {"ic", 2, 16u, 0u, "ARM ARM A64 IC", "instruction-cache maintenance; some forms allowed at EL0 (configurable)"},
-    {"dc", 2, 16u, 0u, "ARM ARM A64 DC", "data-cache maintenance; some forms (CIVAC, CVAC) configurable for EL0"},
-    {"msr", 3, 16u, 0u, "ARM ARM A64 MSR (register)", "writes system register; UNDEFINED at EL0 for EL1+ system registers"},
-    {"mrs", 3, 16u, 0u, "ARM ARM A64 MRS", "reads system register; some sysregs accessible at EL0"},
-    {"dmb", 3, 128u, 0u, "ARM ARM A64 DMB", "no enforcement today (Stage 5 / System #30); semantics: data memory barrier scoped by option"},
-    {"dsb", 3, 128u, 0u, "ARM ARM A64 DSB", "data synchronization barrier; stricter than DMB (waits for completion)"},
-    {"isb", 3, 128u, 0u, "ARM ARM A64 ISB", "instruction synchronization barrier; flushes pipeline"},
-    {"sev", 3, 128u, 0u, "ARM ARM A64 SEV", "send event hint; wakes WFE-waiting cores"},
-    {"sevl", 4, 128u, 0u, "ARM ARM A64 SEVL", "send event local; sets event register on this core only"},
-    {0, 0, 0u, 0u, 0, 0}  /* sentinel */
+    {"ldxr", 4, 4u, 0u, "ARM ARM A64 LDXR", "LL portion of LL/SC; subsequent STXR must pair within state machine, otherwise the exclusive monitor is left set and other threads can spurious-fail their STXR", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"ldaxr", 5, 4u, 0u, "ARM ARM A64 LDAXR", "LL with acquire ordering; same pairing requirement as LDXR", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"stxr", 4, 4u, 0u, "ARM ARM A64 STXR", "SC portion of LL/SC; #UD-equivalent if no LDXR preceded; result in operand 0 indicates success/failure", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"stlxr", 5, 4u, 0u, "ARM ARM A64 STLXR", "SC with release ordering; must follow LDAXR", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"fadd", 4, 8u, 0u, "ARM ARM A64 FADD", "requires FP or SIMD support (always present on aarch64 base profile)", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"fmul", 4, 8u, 0u, "ARM ARM A64 FMUL", "requires FP/SIMD support", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"aese", 4, 8u, 0u, "ARM ARM A64 AESE", "#UD-equivalent if AES extension not enabled", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"aesd", 4, 8u, 0u, "ARM ARM A64 AESD", "#UD-equivalent if AES extension not enabled", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"sha256h", 7, 8u, 0u, "ARM ARM A64 SHA256H", "#UD-equivalent if SHA2 extension not enabled", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"crc32x", 6, 8u, 0u, "ARM ARM A64 CRC32X", "#UD-equivalent if CRC32 extension not enabled (FEAT_CRC32)", 3, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"ld1", 3, 8u, 0u, "ARM ARM A64 LD1 (vector)", "NEON load; requires Advanced SIMD (always on ARMv8 base)", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"eret", 4, 16u, 0u, "ARM ARM A64 ERET", "exception level demotion; UNDEFINED at EL0", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"eretaa", 6, 16u, 0u, "ARM ARM A64 ERETAA", "ERET with pointer authentication (key A); UNDEFINED at EL0", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"eretab", 6, 16u, 0u, "ARM ARM A64 ERETAB", "ERET with pointer authentication (key B); UNDEFINED at EL0", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"hvc", 3, 16u, 0u, "ARM ARM A64 HVC", "hypervisor call; UNDEFINED at EL0/EL1 (requires HCR_EL2.HVC=1)", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"smc", 3, 16u, 0u, "ARM ARM A64 SMC", "secure monitor call; UNDEFINED at EL0 (configurable at EL1)", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"brk", 3, 16u, 0u, "ARM ARM A64 BRK", "debug breakpoint; takes exception to EL1+", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"hlt", 3, 16u, 0u, "ARM ARM A64 HLT", "halt instruction; takes Halting Debug exception (DCPS)", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"wfi", 3, 16u, 0u, "ARM ARM A64 WFI", "wait for interrupt; behaviour depends on EL and trap configuration", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"wfe", 3, 16u, 0u, "ARM ARM A64 WFE", "wait for event; same trap considerations as WFI", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"at", 2, 16u, 0u, "ARM ARM A64 AT", "address translation; UNDEFINED at EL0", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"tlbi", 4, 16u, 0u, "ARM ARM A64 TLBI", "TLB invalidate; UNDEFINED at EL0 (FEAT_TLBIOS may relax)", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"ic", 2, 16u, 0u, "ARM ARM A64 IC", "instruction-cache maintenance; some forms allowed at EL0 (configurable)", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"dc", 2, 16u, 0u, "ARM ARM A64 DC", "data-cache maintenance; some forms (CIVAC, CVAC) configurable for EL0", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"msr", 3, 16u, 0u, "ARM ARM A64 MSR (register)", "writes system register; UNDEFINED at EL0 for EL1+ system registers", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"mrs", 3, 16u, 0u, "ARM ARM A64 MRS", "reads system register; some sysregs accessible at EL0", 2, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"dmb", 3, 128u, 0u, "ARM ARM A64 DMB", "no enforcement today (Stage 5 / System #30); semantics: data memory barrier scoped by option", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"dsb", 3, 128u, 0u, "ARM ARM A64 DSB", "data synchronization barrier; stricter than DMB (waits for completion)", 1, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"isb", 3, 128u, 0u, "ARM ARM A64 ISB", "instruction synchronization barrier; flushes pipeline", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"sev", 3, 128u, 0u, "ARM ARM A64 SEV", "send event hint; wakes WFE-waiting cores", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {"sevl", 4, 128u, 0u, "ARM ARM A64 SEVL", "send event local; sets event register on this core only", 0, {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+    {0, 0, 0u, 0u, 0, 0, 0, {{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}  /* sentinel */
 };
 
 const size_t zer_aarch64_instruction_count = 31;

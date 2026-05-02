@@ -2397,6 +2397,9 @@ zerc source.zer --target-arch=aarch64    # cross-compile to aarch64
 zerc source.zer --target-arch=riscv64    # cross-compile to riscv64
 zerc source.zer --target-features=avx512f         # enable AVX-512F SIMD
 zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (comma-separated)
+zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
+zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
+zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
 ```
 
 ### Pipeline

@@ -1303,41 +1303,62 @@ constants in fixed buffers — the rule is "stack fast path, arena overflow".
 
 ## Stage 4 IN PROGRESS — D-Alpha-7.5 asm safety completion
 
-**As of 2026-04-29:**
+**As of 2026-05-02:**
 
 | Sub-stage | Status | What was done |
 |---|---|---|
-| Sub-extension architecture | VALIDATED 2026-04-29 | 3-arch end-to-end empirical proof (x86_64 + aarch64 + riscv64). F6-minimum (riscv64 register table, 126 entries). All 4 design alternatives evaluated and rejected. |
-| F4.1 Pipeline | DONE 2026-04-29 | `arch_data/SCHEMA.md` + `arch_data/x86_64.zerdata` + `scripts/gen_instruction_table.sh` + vendored `src/safety/asm_instruction_table_x86_64.c` + checker NODE_ASM dispatch (C4 gate firing) |
-| F4.2 Mass classification | DONE 2026-04-29 | 51 safety-relevant x86_64 instructions classified across C1-C5 + C8. 14 CPU feature flags wired (was 1: AVX512F only). |
-| F4.3 (full ALU/branch coverage) | DEFERRED | Basic ops have no preconditions; lookup correctly falls through. ~1500 entries with category=NONE = no safety value. Skip until concrete need. |
-| F5 aarch64 instruction tables | NEXT | Same recipe (Capstone/ARM XML extract + manual `.zerdata` classification + vendored `.c` + checker dispatch). ~25 hrs. |
-| F6-instructions riscv64 | PENDING | Registers DONE (F6-min). Instruction tables ~15 hrs. |
-| F7-full per-category enforcement | PENDING | Wire C1→VRP, C2→alignment check, C3→state machine. ~25 hrs. |
-| Z9/Z10/Z13 forward-compat | PENDING | Blocked on S1 relaxation. Included in F7-full estimate. |
+| Sub-extension architecture | VALIDATED 2026-04-29 | 3-arch end-to-end empirical proof (x86_64 + aarch64 + riscv64). All 4 design alternatives evaluated and rejected. |
+| F4.1 + F4.2 (x86_64 instructions) | DONE 2026-04-29 | 51 entries across C1-C5 + C8. 14 CPU feature flags wired. Pipeline + dispatch + tests. |
+| F5 (aarch64 instructions) | DONE 2026-04-29 | 31 entries across C3-C5 + C8. ARM-specific semantics captured. |
+| F6 (riscv64 instructions) | DONE 2026-05-02 | 30 entries across C2-C5 + C8. RISC-V LR/SC, AMO, FENCE families. **3-arch instruction-table parity COMPLETE.** |
+| F7-light C3 (LR/SC pairing) | DONE 2026-05-02 | Per-block state machine catches SC-without-LR + LR-without-matching-SC across all 3 archs. Real UB caught. |
+| F7-full C1 (value range)  | DEFERRED | Needs schema/generator extension for per-operand constraints + operand-binding analysis. ~30 hrs. |
+| F7-full C2 (alignment) | DEFERRED | Same as C1 — operand-binding required. |
+| C5 (privilege) | Covered by S1 | Naked-only restriction is the v1.0 stand-in. F7-full would add explicit kernel-context model. |
+| C6 (memory addr) | Covered by @inttoptr | Existing MMIO range check fires at every address derivation. |
+| C8 (memory order) | Stage 5 work | System #30 / Session G (~80 hrs). |
+| Z9/Z10/Z13 forward-compat | Blocked on S1 relaxation | Included in F7-full estimate. |
+| naked attribute migration | DEFERRED | Requires asm-test rewrite (~20 hrs after S1 relaxation). See docs/limitations.md. |
 
-**Current F4 dispatch fires:**
+**Current F4 dispatch fires (in checker.c NODE_ASM):**
 - C4 (CPU feature) — checked against `--target-features=` bitmap
-- C5 (privilege) — informational only today; naked-only restriction (S1) provides v1.0 guard
+- **C3 (state machine)** — LR/SC pairing across same asm block (NEW 2026-05-02)
+- C5 (privilege) — covered by S1 naked-only restriction
 
-**C1/C2/C3/C8 are CLASSIFIED but NOT YET ENFORCED** — operand-binding
-infrastructure for VRP/alignment/state-machine dispatch ships in F7-full.
-Today these categories are recorded for future use; the data is correct.
+**C1/C2 are CLASSIFIED but NOT YET ENFORCED** — operand-binding
+infrastructure required for VRP/alignment dispatch. Schema needs
+extension (per-operand constraint encoding); generator needs to emit
+constraints in vendored `.c`; dispatch needs to pair operand index
+to constraint type.
 
-**`.zerdata` is compiler-internal, vendored, NOT user-extensible** —
-this design decision was made 2026-04-29 after evaluating and rejecting
-the user-extensible runtime registry approach. See `docs/asm_plan.md`
-"Sub-Extension Architecture — Validated 2026-04-29" for full rationale.
+**`.zerdata` is compiler-internal, vendored, NOT user-extensible.**
+Design locked 2026-04-29.
 
-**CLI flags added in F4.2:** `--target-features=` accepts comma-separated
-list including: avx512f, sse, sse2, avx, avx2, aes, sha, bmi1, bmi2,
-lzcnt, popcnt, invpcid, pku, xsave, smap. Each match sets a bitmap flag
-AND appends `-m<flag>` to GCC. Baseline x86_64 default: SSE | SSE2.
+**CLI flags (Stage 4-related):**
+- `--target-arch={x86_64,aarch64,riscv64}` — picks register/instruction tables + cross-gcc
+- `--target-features=avx512f,sse,sse2,avx,avx2,aes,sha,bmi1,bmi2,lzcnt,popcnt,invpcid,pku,xsave,smap` — comma-separated; sets ZerCpuFeature bitmap + appends `-m<flag>` to GCC. Baseline x86_64: SSE | SSE2.
+- `--probe-mode={hosted,raw,disabled}` — `@probe` behavior (Fix #4 2026-05-02)
+
+**Mnemonic parser accepts dots** (RISC-V `lr.w`, `fence.i`, etc.) —
+both `scripts/gen_instruction_table.sh` section-header regex and
+`checker.c` NODE_ASM token reader. Don't drop this — RISC-V tables
+won't parse without it. Fixed BUG-653 + BUG-654 on 2026-05-02.
+
+**`Checker.target_ptr_bits` MUST be initialized in `checker_init`**
+from the global `zer_target_ptr_bits`. Pre-fix the field was
+memset-zeroed and never synced — any check `c->target_ptr_bits < N`
+silently always-true. See BUG-652 on 2026-05-02.
 
 **For fresh sessions touching asm safety:**
 - Read `docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29" section
 - The architecture decisions there are LOCKED IN — don't re-litigate
-- F4.2 + F5 + F6 are mechanical data entry from vendor specs, not design work
+- F7-full C1/C2 needs schema/generator extension first
+- F7-light LL/SC pairing implementation pattern (hardcoded LL/SC
+  mnemonic macros per arch) is the template for future state-machine
+  enforcement — see `checker.c` NODE_ASM dispatch
+- @critical "transitive escape via callee" was investigated 2026-05-02
+  and found to be NOT a bug — don't re-implement `can_escape`. See
+  docs/limitations.md.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 

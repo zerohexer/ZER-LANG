@@ -5,6 +5,323 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-05-02 (extended) — F6 + F7-light + 4 limitation fixes + 1 investigation
+
+Continuation of the same 2026-05-02 session that started with the branch
+audit ingestion (BUG-650/651). Closed 5 of 6 OPEN limitations from
+docs/limitations.md, completed F6 (riscv64 instruction tables), and
+landed F7-light C3 LL/SC pairing enforcement. Single calendar day.
+
+### BUG-652: Checker.target_ptr_bits never initialized from global (HIGH defense in depth)
+
+**Symptom:** Any check using `c->target_ptr_bits` was effectively
+checking against 0. The field was `memset`-zeroed in `checker_init`
+and never synced from the actual `zer_target_ptr_bits` global. This
+made guard expressions like `c->target_ptr_bits < 64` always evaluate
+true regardless of the user's `--target-bits` flag.
+
+**Discovered while fixing:** the u64 atomic libatomic warning false
+positive (Fix #1). My initial fix added a gate on `c->target_ptr_bits`
+but the warning still fired — the field was 0, so 0<64 was always
+true.
+
+**Root cause:** Two sources of truth for target pointer width:
+- `zer_target_ptr_bits` (global in `types.c`, set by CLI parser)
+- `c->target_ptr_bits` (field on Checker struct)
+Without sync at init, the field never tracked the global. Pre-fix,
+no Checker code path actually used the field productively — the
+field was added but its initialization was missed.
+
+**Fix:** Sync at `checker_init` entry:
+```c
+c->target_ptr_bits = zer_target_ptr_bits;
+```
+Now any `c->target_ptr_bits` check sees the value the user actually
+selected.
+
+**Tests:** Indirectly tested by `tests/zer/no_warn_u64_atomic_64bit.zer`
+which would silently regress to spurious warnings if the init drifts.
+
+### Fix #1: u64 atomic libatomic warning false positive on 64-bit (closes one of 6 OPEN)
+
+**Symptom:** `@atomic_load(&u64_var)` on x86_64/aarch64/riscv64 hosts
+emitted "may require libatomic on 32-bit targets" warning. False
+positive — 64-bit atomics are natively lock-free on these hosts.
+
+**Fix:** Two layered:
+1. Gate the warning on `c->target_ptr_bits < 64` at checker.c:6601 + 6637
+2. The deeper fix (BUG-652 above) — initialize `c->target_ptr_bits`
+
+Without #2, #1 alone wouldn't have worked. Discovered in the fix
+verification.
+
+**Test:** `tests/zer/no_warn_u64_atomic_64bit.zer` — added to no-warning
+list in `tests/test_zer.sh`. Default x86_64 compiles cleanly; with
+`--target-bits 32` the warning correctly fires.
+
+### Fix #2: @once __STDC_HOSTED__ guard (closes one of 6 OPEN)
+
+**Symptom:** `@once { ... }` blocks emitted unconditional
+`__atomic_exchange_n(&_zer_once_N, 1, __ATOMIC_ACQ_REL)`. On
+freestanding/baremetal builds without libatomic linkage, this could
+fail to link OR fall back to a non-atomic implementation that's racy
+across cores.
+
+**Fix:** Wrap atomic emission in `#if __STDC_HOSTED__`:
+- Hosted: full `__atomic_exchange_n` (lock-free on x86_64/aarch64/riscv64)
+- Freestanding: non-atomic flag check (single-core safe; multi-core
+  bare-metal users provide their own synchronization)
+
+emitter.c:8327 IR_BRANCH NODE_ONCE handler.
+
+**Test:** Existing `tests/zer/once_init.zer` continues to pass.
+Generated C now contains both #if/#else paths — verified via grep on
+emitted output.
+
+### Fix #3: AST emit_expr compound /= and %= INT_MIN/-1 trap (closes one of 6 OPEN)
+
+**Symptom:** AST path's compound div/mod (`target /= n`, `target %= n`)
+emitted only the divzero trap. The IR path's `emit_rewritten_node` at
+emitter.c:5815-5841 had the full guard set (divzero + INT_MIN/-1
+signed overflow), but the AST sibling at emitter.c:1432-1444 was
+missing the INT_MIN check.
+
+**Reachability:** Limited today — function bodies are IR-only since
+2026-04-19. But other emission contexts (statement-expression
+fallbacks, top-level initializers, comptime emission) still use
+emit_expr. Defense in depth: every emission site enforces both
+invariants.
+
+**Fix:** Ported the IR path's complete guard pattern to the AST path.
+Same generated C structure: divzero trap → if signed AND divisor==-1
+then INT_MIN trap → execute the operation. Per-width INT_MIN literal
+selection.
+
+**Test:** No new test (current emission paths produce both guards;
+defense in depth means no behavior change for current code).
+
+### Fix #4: @probe with --probe-mode= flag (closes one of 6 OPEN)
+
+**Symptom:** `@probe(addr)` had a single hardcoded behavior — hosted
+used signal handler + setjmp recovery, freestanding did direct read
+with garbage on fault. Silent gap on bare-metal: programs relying on
+@probe returning null on bad MMIO got an apparent success with
+garbage data instead.
+
+**Fix (Option C from limitations.md):** Three modes via
+`--probe-mode=` CLI flag:
+
+| Mode | Behavior |
+|---|---|
+| `hosted` (default) | Current behavior preserved — `#if __STDC_HOSTED__` dispatches signal-handler vs direct-read |
+| `raw` | Always direct read, no signal handler emitted. For embedded users who probe known-safe addresses |
+| `disabled` | Compile error on any `@probe` usage. For safety-critical builds |
+
+Plumbing:
+- `zerc_main.c`: parse `--probe-mode={hosted,raw,disabled}`
+- `checker.h`/`checker.c`: `probe_mode` field; reject @probe at compile
+  time when ==2 (disabled)
+- `emitter.h`/`emitter.c`: `probe_mode` field; route emission based
+  on mode (raw skips signal handler entirely)
+- `tests/test_zer.sh`: extended `// zerc-flags:` directive parser to
+  the negative branch (was positive-only) — required for the
+  disabled-mode regression test
+
+**Tests:**
+- `tests/zer/probe_mode_default.zer` — default mode probes valid addr
+- `tests/zer_fail/probe_disabled_mode.zer` — `--probe-mode=disabled`
+  rejects @probe usage at compile time
+
+### Fix #5: @critical transitive escape — INVESTIGATED, NOT A BUG
+
+**Original audit claim** (from claude/cool-johnson-apebs branch):
+calling a function from `@critical` lets the function's `return`
+"escape" the @critical block without re-enabling interrupts:
+```zer
+void unlock() { return; }
+@critical { unlock(); }   // claimed: interrupts NOT re-enabled
+```
+
+**Verification:** Empirically inspected emitted C for the test
+program. The @critical block correctly emits:
+- Entry: `cpsid i` (ARM) / `cli` (AVR) / `csrrci` (RISC-V) — disables
+  interrupts, saves state
+- Body: `unlock()` called via standard C call/ret — returns to
+  @critical body
+- Exit: `msr primask, _zer_primask` (ARM) etc. — restores state
+
+A normal function call returns to its caller. The caller IS
+`@critical { ... }`. Execution returns to the @critical body,
+continues to closing brace, closing brace re-enables interrupts.
+**No escape.**
+
+**Why the claim was wrong:** Misanalyzed control-flow semantics. A
+`can_escape` predicate as proposed would reject EVERY function call
+from @critical (every non-trivial function returns). Over-restriction
+masquerading as safety.
+
+**Action:** Reverted partial implementation, documented the
+investigation in docs/limitations.md so future sessions don't
+re-implement. The branch's audit found 2 real bugs + 1 misframed
+claim — 67% accuracy. Worth knowing.
+
+### F6: riscv64 instruction-level safety classification (30 entries)
+
+Extends F4/F5 instruction-table pipeline to RISC-V — same recipe,
+third ISA. 3-arch instruction-table parity now complete.
+
+**Files:**
+- `arch_data/riscv64.zerdata` — 30 hand-classified entries
+- `src/safety/asm_instruction_table_riscv64.c` — vendored AUTO-GENERATED
+- `src/safety/asm_instruction_table.h` — extern decl
+- `src/safety/asm_categories.c` — riscv64 dispatch branch
+- `Makefile` — link new vendored .c
+- `tests/test_cross_arch.sh` — F6 fence.i cross-arch test
+
+**Two regex fixes during F6 implementation:**
+
+#### BUG-653: gen_instruction_table.sh section header regex missed dot-mnemonics
+
+Initial F6 generation produced only 11 of 30 expected entries. Cause:
+`scripts/gen_instruction_table.sh` line 124 section-header regex was
+`/^\[[a-zA-Z][a-zA-Z0-9_]*\]/` — no dot. RISC-V mnemonics like
+`[lr.w]`, `[fence.i]`, `[amoadd.w]`, `[c.add]` were silently skipped
+(awk treated them as non-section text and the previous-section data
+got mangled into them, producing misclassified entries).
+
+Fix: extend regex to `[a-zA-Z0-9_.]*`. Re-running generator yielded
+correct 30 entries.
+
+#### BUG-654: checker NODE_ASM mnemonic parser stopped at dots
+
+After F6 generation, the F4 dispatch couldn't find any RISC-V
+dot-mnemonic in the table because the parser at checker.c:9989-9993
+only matched `[_a-zA-Z0-9]`. `fence.i` was tokenized as `fence`
+(category=128 only) — the `.i`-specific entry was never queried.
+
+Fix: extend parser regex to include dot. Add defensive trailing-dot
+trim to avoid matching `add.` (period at end of pseudo-comment).
+
+**RISC-V semantic specifics captured in zerdata:**
+- DIV/DIVU/REM/REMU don't trap on zero (return -1/dividend) — no C1
+  entries (similar to aarch64; distinct from x86)
+- LR/SC pairs are explicit C2+C3 (alignment + state machine)
+- AMO* require natural alignment + A extension (C2+C4)
+- Privileged: MRET, SRET, WFI, ECALL, EBREAK, SFENCE.VMA, CSRRW/RS/RC (C5)
+- Memory ordering: FENCE, FENCE.I, FENCE.TSO (C8)
+
+### F7-light: C3 state machine — LR/SC pairing enforcement
+
+First piece of F7 enforcement landing. Today F4 dispatch only fired
+for C4 (CPU feature). F7-light adds C3 LL/SC pairing tracking
+across all 3 archs.
+
+**Catches a real UB class:**
+- SC without preceding LL → SC's success/failure result is undefined
+- LL without matching SC → reservation leaks; subsequent SC may
+  spuriously fail or unexpectedly succeed
+- Nested LL → most archs only support one outstanding reservation
+
+**Implementation** (checker.c NODE_ASM dispatch):
+- Hardcoded LL/SC mnemonic classification per arch via macros:
+  - x86_64: monitor (LL) ↔ mwait (SC)
+  - aarch64: ldxr/ldaxr (LL) ↔ stxr/stlxr (SC)
+  - riscv64: lr.w/lr.d (LL) ↔ sc.w/sc.d (SC)
+- Per-block state machine (`ll_pending` flag) tracked through the
+  mnemonic-iteration loop
+- End-of-block check fires if `ll_pending` is still true
+- Errors cite the offending instruction + the consequence from the
+  instruction table when available
+
+**What F7-light covers vs the full F7 plan:**
+- C1 (value range) — operand-binding analysis required, deferred
+- C2 (alignment) — operand-binding analysis required, deferred
+- **C3 (state machine)** — F7-light THIS COMMIT
+- C4 (CPU feature) — already wired in F4.1
+- C5 (privilege) — covered by S1 naked-only restriction (v1.0 stand-in)
+- C6 (memory addr) — covered by existing @inttoptr range check
+- C8 (memory order) — Stage 5 / System #30 territory
+
+**Tests added (3 negative):**
+- `tests/zer_fail/asm_f7_sc_without_lr.zer` — RISC-V sc.w alone rejected
+- `tests/zer_fail/asm_f7_lr_unmatched.zer` — RISC-V lr.w alone rejected
+- `tests/zer_fail/asm_f7_aarch64_stxr_alone.zer` — aarch64 stxr alone rejected
+
+Verified: paired LR+SC patterns (compare-swap, atomic increment,
+compare-exchange, etc.) still compile cleanly.
+
+### Stage 4 progress after this session
+
+  F4-F6 (instruction tables, 3 archs):    DONE (51+31+30 = 112 entries)
+  Per-(arch,feature) register tables:     1 case (x86_64 + AVX-512F = 161 regs)
+  F7-light C3 (LL/SC pairing):             DONE
+  F7-full C1+C2 (operand binding):         deferred — needs schema/generator extension
+  Z-rules wired:                           10 of 13 (Z9/Z10/Z13 forward-compat)
+  Session G / System #30 (atomic ordering): Stage 5 (~80 hrs)
+  naked migration:                          deferred (after S1 relaxation)
+
+Remaining for "asm safety complete": ~130 hrs.
+
+### Final session tally
+
+| Suite | Count | Status |
+|---|---|---|
+| ZER tests | 533/533 | ✅ (was 525 at session start, +8) |
+| Module tests | 28/28 | ✅ |
+| Rust translations | 784/784 | ✅ |
+| Zig translations | 36/36 | ✅ |
+| Cross-arch end-to-end | 5/5 | ✅ (was 3 at start, +2: aarch64 dmb, riscv64 fence.i) |
+| Walker IR audit | clean | ✅ |
+| Walker default audit | clean | ✅ |
+| Fixed-buffer audit | clean | ✅ |
+| Emit dead-stub audit | clean | ✅ |
+
+OPEN limitations: 6 → **1** (just `naked` deferred to post-S1-relaxation).
+
+### Files modified across the session
+
+Code:
+- `zercheck_ir.c` — ir_merge_states compound-aware lookups (BUG-650)
+- `emitter.c` — emit_func_attributes helper (BUG-651), @once guard
+  (Fix #2), AST /=/%= overflow (Fix #3), @probe modes (Fix #4)
+- `emitter.h` — `probe_mode` field
+- `checker.c` — target_ptr_bits init (BUG-652), atomic warning gate
+  (Fix #1), @probe disabled mode (Fix #4), F4 dispatch dot-mnemonic
+  parser (BUG-654), F7-light LL/SC tracking
+- `checker.h` — `probe_mode` field
+- `zerc_main.c` — `--probe-mode` CLI flag
+- `types.h` — momentary can_escape field added then reverted (Fix #5)
+- `scripts/gen_instruction_table.sh` — dot-mnemonic regex (BUG-653)
+- `src/safety/asm_categories.c` — riscv64 dispatch branch
+- `src/safety/asm_instruction_table.h` — riscv64 extern decls
+- `src/safety/asm_instruction_table_riscv64.c` — NEW (vendored AUTO-GEN)
+- `arch_data/riscv64.zerdata` — NEW (30 entries)
+- `Makefile` — link new vendored .c
+
+Tests (8 new):
+- `tests/zer/no_warn_u64_atomic_64bit.zer`
+- `tests/zer/probe_mode_default.zer`
+- `tests/zer_fail/compound_field_maybe_freed.zer` (BUG-650 reproducer)
+- `tests/zer_fail/probe_disabled_mode.zer`
+- `tests/zer_fail/asm_f7_sc_without_lr.zer`
+- `tests/zer_fail/asm_f7_lr_unmatched.zer`
+- `tests/zer_fail/asm_f7_aarch64_stxr_alone.zer`
+- (cross-arch: tests/test_cross_arch.sh extended with riscv64 fence.i)
+
+Test runner:
+- `tests/test_zer.sh` — added `nowarn_check` for u64 atomic test;
+  extended `// zerc-flags:` directive parser to negative branch
+
+Docs:
+- `docs/limitations.md` — closed 5 of 6 OPEN entries; documented Fix #5
+  investigation result; added `naked` deferred note
+- `BUGS-FIXED.md` — this entry
+- `CLAUDE.md` — Stage 4 status update
+- `docs/compiler-internals.md` — extended F7 architecture section
+- `docs/reference.md` — added `--probe-mode=` flag
+
+---
+
 ## Session 2026-05-02 — IR analyzer + emitter regressions caught by branch audit
 
 A separate audit on `claude/cool-johnson-apebs` (do-not-merge branch)

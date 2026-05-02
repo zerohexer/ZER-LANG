@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Confirmed silent gap (audit 2026-05-02): @atomic_cas accepts struct as first arg
+// (only argc check exists). GCC catches the obviously-wrong case but not subtle
+// narrow/widen mismatches between expected/desired and target.
+// File:line: checker.c:6624-6628 (NODE_INTRINSIC @atomic_cas path)
+// Fix: validate first arg is pointer-to-integer; expected/desired widths match.
+volatile u32 counter = 0;
+
+i32 main() {
+    bool e = true;
+    bool d = false;
+    bool ok = @atomic_cas(&counter, e, d);
+    return 0;
+}

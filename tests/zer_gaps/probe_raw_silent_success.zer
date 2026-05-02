@@ -1,0 +1,18 @@
+// EXPECTED: compile error  (or design clarification: see notes)
+// Confirmed silent gap (audit 2026-05-02, Roadmap Gap 9): with --probe-mode=raw,
+// @probe(addr) ALWAYS returns (_zer_opt_u32){val, 1} regardless of address validity.
+// The optional unwrap pattern `if (probe(addr)) |v|` ALWAYS takes the success branch.
+// On baremetal this defeats @probe's contract as the SAFE MMIO read.
+// Compile this with: zerc <file> --probe-mode=raw -o foo.c
+// Recommendation: either (a) reject @probe under --probe-mode=raw entirely (require
+// explicit @inttoptr instead), or (b) emit a hardware-trap probe (DR/MMU/AVX-FAULT)
+// per arch instead of always-success.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+i32 main() {
+    ?u32 maybe = @probe(0xDEADBEEF);
+    if (maybe) |v| {
+        return (i32)v;
+    }
+    return 0;
+}

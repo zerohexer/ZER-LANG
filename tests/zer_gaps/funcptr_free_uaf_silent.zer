@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Confirmed silent gap (audit 2026-05-02, Roadmap Gap 15): function-pointer call to a
+// free function is invisible to zercheck_ir. fn(h) followed by tasks.free(h) is a
+// real runtime double-free that compiles cleanly. zercheck_ir.c:643 rejects callees
+// that aren't NODE_IDENT, so funcptr calls bypass alloc/free tracking entirely.
+// Fix: when funcptr target is statically determinable (assigned from named function),
+// resolve it for free-tracking. Or warn on funcptr-call-to-Handle-arg.
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void cleanup(Handle(Task) h) {
+    tasks.free(h);
+}
+
+i32 main() {
+    Handle(Task) h = tasks.alloc() orelse return;
+    *(Handle(Task)) -> void fn = cleanup;
+    fn(h);
+    tasks.free(h);
+    return 0;
+}

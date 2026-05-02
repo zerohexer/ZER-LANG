@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Confirmed silent gap (audit 2026-05-02): @atomic_store narrow store of u64 into u32 target
+// is silently accepted by both ZER checker AND GCC. ZER should reject this at type-check.
+// File:line: checker.c:6619-6623 (NODE_INTRINSIC @atomic_store path)
+// Fix: validate value-arg type matches *first arg pointer-inner type, like @atomic_add does.
+volatile u32 x = 5;
+
+i32 main() {
+    u64 huge = 0xFFFFFFFFFFFFFFFF;
+    @atomic_store(&x, huge);
+    return 0;
+}

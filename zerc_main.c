@@ -623,13 +623,22 @@ int main(int argc, char **argv) {
     zercheck_init(&zc, &checker, &cc.arena, input_path);
     zc.import_asts = import_asts;
     zc.import_ast_count = import_ast_count;
-    bool ast_ok = zercheck_run(&zc, main_mod->ast);
-
-    /* F0.1 audit mode (2026-05-03): when ZER_AGREEMENT_AUDIT=1, do NOT
-     * bail on AST failure — let IR analysis run too so we can compare
-     * per-test. Otherwise (default) bail as before. */
+    /* F0 modes (2026-05-03):
+     *
+     * ZER_IR_ONLY=1     — Phase F end-state: skip zercheck.c entirely.
+     *                     IR analyzer becomes sole driver. Use this to
+     *                     verify which tests pass/fail under target
+     *                     architecture before doing actual Phase F.
+     *
+     * ZER_AGREEMENT_AUDIT=1 — F0.1 measurement mode: run BOTH analyzers
+     *                     even when AST fails, so we can compare per-test
+     *                     in tools/agreement_audit.sh. */
+    const char *ir_only_env = getenv("ZER_IR_ONLY");
+    bool ir_only = (ir_only_env && ir_only_env[0] == '1');
     const char *audit_env = getenv("ZER_AGREEMENT_AUDIT");
     bool audit_mode = (audit_env && audit_env[0] == '1');
+
+    bool ast_ok = ir_only ? true : zercheck_run(&zc, main_mod->ast);
 
     if (!ast_ok && !audit_mode) {
         fprintf(stderr, "error: zercheck failed\n");
@@ -753,6 +762,17 @@ int main(int argc, char **argv) {
     zerc_ir_hook_funcs = NULL;
     zerc_ir_hook_count = 0;
     zerc_ir_hook_cap = 0;
+
+    /* ZER_IR_ONLY mode: IR analyzer is sole driver, gate compile on
+     * its error_count. Phase F end-state simulation. */
+    if (ir_only && zc_ir.error_count > 0) {
+        fprintf(stderr, "error: zercheck_ir failed (%d errors)\n",
+                zc_ir.error_count);
+        remove(output_path);
+        free(cc.modules);
+        arena_free(&cc.arena);
+        return 1;
+    }
 
     if (emit_c) {
         printf("zerc: %s -> %s\n", input_path, output_path);

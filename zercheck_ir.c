@@ -280,23 +280,49 @@ static bool ir_is_move_struct_type(Type *t) {
     return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
 }
 
-static bool ir_contains_move_struct_field(Type *t) {
+/* F0.4 (2026-05-03): recursive depth-limited check ported from
+ * zercheck.c:1056. Original ir_contains_move_struct_field only
+ * checked ONE level deep, missing nested patterns like:
+ *   move struct File { i32 fd; }
+ *   struct Wrapper { File f; }
+ *   struct Outer { Wrapper w; }   // contains_move at 2 levels deep
+ * Audit found nested_move_struct_uaf.zer compiled clean under IR-only
+ * because Outer wasn't recognized as move-tracking. Depth-limited
+ * recursion (32 max) prevents infinite recursion on malformed types
+ * while catching nested cases. */
+static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
     if (!t) return false;
+    if (depth > 32) return false;
     Type *eff = type_unwrap_distinct(t);
     if (eff->kind == TYPE_STRUCT) {
         for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
-            if (ir_is_move_struct_type(eff->struct_type.fields[i].type))
-                return true;
+            Type *ft = eff->struct_type.fields[i].type;
+            if (ir_is_move_struct_type(ft)) return true;
+            Type *ft_eff = ft ? type_unwrap_distinct(ft) : NULL;
+            if (ft_eff && (ft_eff->kind == TYPE_STRUCT ||
+                           ft_eff->kind == TYPE_UNION)) {
+                if (ir_contains_move_struct_field_depth(ft, depth + 1))
+                    return true;
+            }
         }
     }
-    /* Union containing move struct variant */
     if (eff->kind == TYPE_UNION) {
         for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
-            if (ir_is_move_struct_type(eff->union_type.variants[i].type))
-                return true;
+            Type *vt = eff->union_type.variants[i].type;
+            if (ir_is_move_struct_type(vt)) return true;
+            Type *vt_eff = vt ? type_unwrap_distinct(vt) : NULL;
+            if (vt_eff && (vt_eff->kind == TYPE_STRUCT ||
+                           vt_eff->kind == TYPE_UNION)) {
+                if (ir_contains_move_struct_field_depth(vt, depth + 1))
+                    return true;
+            }
         }
     }
     return false;
+}
+
+static bool ir_contains_move_struct_field(Type *t) {
+    return ir_contains_move_struct_field_depth(t, 0);
 }
 
 static bool ir_should_track_move(Type *t) {

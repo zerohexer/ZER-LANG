@@ -873,7 +873,88 @@ Both functions now call `emit_top_level_decl(e, decl, file_node, i)`. Adding a n
 - `_Alignof(T)` — type alignment (C11, supported by GCC/Clang)
 - These make the emitted C NOT portable to MSVC
 
-## ZER-CHECK (zercheck.c) — ~900 lines
+## ZER-CHECK Architecture (Post-Phase-F-Migration, 2026-05-03)
+
+**As of 2026-05-03 (Phase F1+F2+F3 complete), the production safety
+analyzer is `zercheck_ir.c` (CFG-based, ~3800 lines). `zercheck.c` is
+now a 150-line backward-compat shim.**
+
+| File | Role | Lines |
+|---|---|---|
+| `zercheck_ir.c` | Production safety analyzer (CFG-based) | ~3800 |
+| `zercheck.c` | Compat shim — `zercheck_run` → lower to IR → `zercheck_ir` | ~150 |
+| `zercheck.h` | Shared `ZerCheck` struct + API | unchanged |
+
+**Who uses what:**
+
+- `zerc` binary — uses `zercheck_ir` directly via emitter `ir_hook`.
+  Skips `zercheck.c` shim entirely. Errors gate compile via
+  `zc_ir.error_count > 0`.
+- `zer_lsp.c`, `test_firmware_patterns.c` (1, 2, 3), `test_production.c` —
+  call `zercheck_run` which routes through the shim. Same end behavior.
+- `test_zercheck.c` — DELETED. Was unit tests for the original 3128-line
+  AST analyzer; 4 of 54 narrow patterns failed under IR; not
+  production-relevant.
+
+**The shim's flow** (zercheck.c, ~100 LOC):
+
+```
+bool zercheck_run(ZerCheck *zc, Node *file_node) {
+    /* 1. Lower each function/interrupt in file_node + imports to IR */
+    for each decl: ir_lower_func/ir_lower_interrupt → IRFunc;
+    /* 2. Iterative summary build (16-pass max) */
+    zc->building_summary = true;
+    for pass: for each IRFunc: zercheck_ir(zc, func);
+    /* 3. Main analysis pass with errors enabled */
+    zc->building_summary = false;
+    for each IRFunc: zercheck_ir(zc, func);
+    return zc->error_count == 0;
+}
+```
+
+**AST mutation constraint** (still applies): `ir_lower_func` mutates
+the AST. Calling `zercheck_run` twice on the same `file_node` corrupts.
+Callers (LSP, test harnesses) re-parse to get fresh AST per call.
+
+**Phase F0 closed 11 IR parity gaps:**
+
+- F0.3: compound-aware fixed-point convergence (was using bare-only
+  `ir_find_handle`; compound handles caused infinite loops)
+- F0.4: depth-recursive `ir_contains_move_struct_field` (was 1-level)
+- F0.5: register nested handle fields of struct/union params via
+  `ir_register_nested_handles` (compound key path matches
+  `ir_extract_compound_key` format: `".field1.field2..."` no root)
+- F0.6: auto-register move-struct args at spawn site (was only
+  marking TRANSFERRED if already registered as ALIVE)
+
+See `BUGS-FIXED.md` Session 2026-05-03 for full details.
+
+**Tools added:**
+- `tools/agreement_audit.sh` — runs all test suites with
+  `ZER_AGREEMENT_AUDIT=1`, classifies any per-test disagreements
+  between AST shim and direct IR analysis as
+  `ir_false_positive`/`ir_false_negative`/`ir_count_diff`. After F3 both
+  paths run zercheck_ir, so should always show 0 disagreements.
+- `ZER_AGREEMENT_AUDIT=1` env var — debug-only; production `zerc`
+  ignores it.
+
+**For fresh sessions touching the analyzer:**
+- ALL new safety code goes in `zercheck_ir.c`.
+- DON'T add to the shim (`zercheck.c`) unless you're modifying the
+  shim's lowering logic itself.
+- The 4 narrow patterns that were in deleted `test_zercheck.c` (pool
+  alias confusion, direct overwrite leak, free-then-realloc loop,
+  struct copy alias UAF) are NOT in zercheck_ir today. They were
+  unit-test-only and don't appear in real ZER programs.
+
+The rest of this section describes the SAFETY SEMANTICS (handle
+states, path merging, leak detection, alloc_id grouping, etc.) which
+are unchanged — `zercheck_ir` implements the same semantics, just on
+CFG instead of linear AST scan.
+
+---
+
+## ZER-CHECK Semantics (implemented in zercheck_ir.c)
 
 ### What It Checks
 Path-sensitive handle tracking after type checker, before emitter:

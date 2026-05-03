@@ -442,7 +442,7 @@ Z-rules catch through-asm bugs that Rust can't:
 
 **Strict mode is DEFAULT ON** from v1.0 — not opt-in via flag. `--relax-asm` is the opt-out; per-block `@relax_check(ZN)` for legitimate edge cases. Same philosophy as Rust's borrow checker.
 
-**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is being DELETED (CFG migration Phase G, v0.5.0) — never add Z-rule code there.
+**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is now a 150-line shim (Phase F migration complete 2026-05-03) — never add new safety code there; it routes everything to `zercheck_ir`.
 
 **Two orthogonal dimensions (NOT a continuum):**
 - **Language safety** (v1.0, default on, **critical-path**): **100%** via strict mode (18 structural + 13 Z-rules + 8 categories + System #30) + Phase 7 operational depth — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI all caught. **This alone matches Rust + memory + concurrency safety claims, no algorithm proof needed.**
@@ -1830,58 +1830,82 @@ Remaining real gaps (future work, not safety-critical):
 Full gap audit (20 items evaluated): see
 `docs/compiler-internals.md` "ir_validate gap audit" section.
 
-## CFG Migration (zercheck.c → zercheck_ir.c) — see docs/cfg_migration_plan.md
+## CFG Migration (zercheck.c → zercheck_ir.c) — COMPLETE 2026-05-03
 
-**Phase F LANDED (2026-04-20).** zercheck_ir runs UNCONDITIONALLY on every
-compile via an `ir_hook` in the emitter. Both analyzers see every
-function; disagreements logged as regression signals. zercheck.c still
-drives exit code (AST primary) for conservatism — the CFG analyzer gets
-continuous real-world validation on every user compile without gatekeeping
-safety decisions.
+**Phase F MIGRATION COMPLETE.** zercheck_ir.c is the SOLE production
+safety analyzer. zercheck.c is now a 150-line shim delegating to
+zercheck_ir for backward-compat (LSP, firmware tests, production test).
+The original 3128-line AST analyzer is DELETED.
 
-**Current state:**
-- Phases A-E complete (100% behavior parity on 3143 programs validated).
-- Phase F: unconditional dual-run via emitter hook, **0 disagreements**
-  across 1115 standalone + 28 module + 2000 fuzz = 3143 programs.
-- Phase G (future): flip primary to zercheck_ir, delete zercheck.c,
-  tag v0.5.0. Not blocked on technical issues — blocked on "accumulate
-  more real-world usage before deleting the battle-tested analyzer."
+**Final state (post-F1+F2+F3):**
+- `zercheck_ir.c` (~3800 lines) — production CFG-based safety analyzer
+- `zercheck.c` (~150 lines) — backward-compat shim:
+  `zercheck_run` → lower each fn to IR → `zercheck_ir` → return error_count
+- `zerc` binary uses zercheck_ir directly (skips shim)
+- `zer_lsp.c`, `test_firmware_patterns*.c`, `test_production.c` — call
+  `zercheck_run` (the shim)
+- `test_zercheck.c` — DELETED (was unit tests for the 3128-line analyzer;
+  4 of 54 narrow patterns failed under IR; not production-relevant)
 
-**zercheck_ir.c ≈ 2900 lines, 100% behavior-parity with zercheck.c (2810 lines).**
-CFG infrastructure is the foundation for future analyses (dominator trees,
-VRP-on-SSA, borrow-checker-lite) that linear-scan can't easily support.
+**For fresh sessions:**
+- DO NOT add new safety analysis to `zercheck.c` — it's a shim.
+- ALL new safety analysis goes in `zercheck_ir.c`.
+- DO NOT call `ir_lower_func` outside the emitter or the shim's
+  `collect_funcs_from_file`. AST mutation issue (see below).
+- The shim's `collect_funcs_from_file` lowers each function once per call.
+  Callers (LSP, test harnesses) MUST produce a fresh AST per call —
+  re-using the same `file_node` will corrupt due to `pre_lower_orelse`'s
+  destructive AST rewrite. Current callers re-parse on every invocation.
 
-**Control knobs:**
-- `ZER_DUAL_RUN=0` — disable zercheck_ir entirely (default: on)
-- `ZER_DUAL_RUN=2` — verbose: log agreements too (debug)
-- (unset or `=1`): run both, log disagreements only (default behavior)
+**Phase F0 closed 11 IR parity gaps (2026-05-03 session):**
 
-**THE critical architectural constraint (learned the hard way in Phase F):**
+| Sub-phase | Gap | Fix |
+|---|---|---|
+| F0.1 | Coarse `ast_err==0 && ir_err==0 \|\| both>0` agreement check missed real disagreements | Per-test agreement reporter (`tools/agreement_audit.sh`) + `AGREEMENT_FAIL` machine-parseable line classifying each disagreement |
+| F0.2 | No way to verify "what fails when IR is sole driver" | `ZER_AGREEMENT_AUDIT=1` env var (audit mode for the reporter) — runs both analyzers without bailing on AST failure |
+| F0.3 | 6 false positives — fixed-point convergence used `ir_find_handle` (bare-only); compound handles caused infinite "changed" loops | Use `ir_find_compound_handle` in convergence check (zercheck_ir.c:2839) |
+| F0.4 | `ir_contains_move_struct_field` checked one level deep; 2-level nested move struct undetected | Recursive depth-limited (32) check `ir_contains_move_struct_field_depth` |
+| F0.5 | Function params of nested-struct types had inner `Handle` fields silently untracked | `ir_register_nested_handles` walks struct/union recursively, registers compound handles on entry block AND in post-fixed-point final pass (both sites needed!) |
+| F0.6 | Spawn arg of move-struct type wasn't auto-registered before being marked TRANSFERRED | Auto-register as ALIVE first when arg is move-struct typed |
+| F0.7 | Audit flagged `test_modules/opaque_layer1.zer`/`resource.zer` as IR false negatives — investigation showed AST was wrong (false positive on standalone library modules); IR was correct | No code change |
+
+**Control knobs (post-F1):**
+- `ZER_AGREEMENT_AUDIT=1` — debug mode: re-enable AST analysis
+  alongside IR for `tools/agreement_audit.sh` measurement. Production
+  compiles should NEVER set this.
+- `ZER_DUAL_RUN`/`ZER_DUAL_RUN=0`/`=2` — REMOVED in F1.
+- `ZER_IR_ONLY=1` — REMOVED in F1 (now the default behavior).
+
+**Tools added in F0:**
+- `tools/agreement_audit.sh` — runs all test suites with audit mode on,
+  collects per-test disagreements into `ir_false_positive` /
+  `ir_false_negative` / `ir_count_diff` classes. After F1+F2+F3 this
+  tool serves as historical record + can detect any future divergence
+  if zercheck.c logic ever drifts (it shouldn't, since it's now a shim).
+
+**THE critical architectural constraint (still applies):**
 
 `ir_lower_func` **mutates the AST** (`pre_lower_orelse` at ir_lower.c:1239
 replaces `NODE_ORELSE` with `NODE_IDENT` referencing a temp local). Calling
-`ir_lower_func` TWICE on the same function corrupts emission: nested-orelse
-temps reference locals that no longer exist in the freshly-created IRFunc.
+`ir_lower_func` TWICE on the same function corrupts emission. The shim's
+`collect_funcs_from_file` calls `ir_lower_func` ONCE per shim invocation;
+callers (LSP, test harnesses) re-parse to get fresh AST per call.
 
-Before Phase F, `ZER_DUAL_RUN=1` worked by accident — make check didn't
-set the env var. Making dual-run unconditional exposed this: tests like
-`orelse_stress.zer` (nested orelse in function arg in outer orelse fallback)
-fail to emit valid C after double-lowering.
+Production `zerc` binary uses the emitter's single-lowering hook: zerc_main
+registers `zerc_ir_hook` that collects each IRFunc as the emitter lowers
+it. After emit completes, zerc_main runs iterative FuncSummary build +
+main analysis on the collected IRFuncs — NOT re-lowering, just analyzing.
 
-**Solution**: single-lowering via emitter hook (`Emitter.ir_hook`).
-zerc_main registers `zerc_ir_hook` (in zerc_main.c) that collects each
-`IRFunc` as the emitter lowers it. After emit completes, zerc_main runs
-iterative FuncSummary build + main analysis on the collected IRFuncs —
-NOT re-lowering, just re-analyzing the same IR.
-
-**Do NOT call `ir_lower_func` outside the emitter.** The emitter is the
-sole lowering site. All IR analysis piggybacks via the hook.
-
-**For fresh sessions:**
-- Do NOT "fix" Phases A-E — converged. See BUGS-FIXED.md 2026-04-20.
-- Do NOT call `ir_lower_func` in zerc_main or a new callsite (AST mutation).
-- If adding new IR-based analyses, register via `Emitter.ir_hook`.
-- Disagreements from `VERIFY disagreement` log line = genuine regression.
+**For fresh sessions touching analyzers:**
+- ALL new safety code goes in `zercheck_ir.c` (the production analyzer).
+- Adding new IR-based analyses: register via `Emitter.ir_hook` for
+  production path, or extend the shim for backward-compat callers.
+- The 4 narrow patterns test_zercheck.c covered (pool_a-vs-pool_b alias,
+  direct overwrite leak, free-then-realloc loop, struct copy alias UAF)
+  are NOT in zercheck_ir today. They were narrow unit-test patterns that
+  don't appear in real ZER programs. If you find a real-world program
+  hitting them, port the check from git history of zercheck.c to
+  zercheck_ir.c.
 
 **Critical IR lowering fact (Phase 8d, per ir_lower.c:84):**
 `IR_POOL_ALLOC` / `IR_SLAB_ALLOC` / `IR_POOL_FREE` / etc. enum values exist

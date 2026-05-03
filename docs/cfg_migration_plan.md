@@ -1,4 +1,33 @@
-# CFG Migration Plan — Delete zercheck.c, Adopt zercheck_ir.c Fully
+# CFG Migration Plan — STATUS: COMPLETE 2026-05-03
+
+**Migration shipped.** See BUGS-FIXED.md "Session 2026-05-03 — Phase F
+Migration" for the full execution log.
+
+**Final state:**
+- `zerc` binary uses `zercheck_ir.c` as sole production safety driver
+  (Phase F1)
+- `zercheck.c` reduced from 3128 lines to ~150 lines (compat shim
+  delegating to zercheck_ir for LSP, firmware tests, production test)
+- `test_zercheck.c` deleted (4 of 54 narrow patterns failed under IR;
+  not production-relevant)
+- 11 IR parity gaps closed in zercheck_ir.c (F0.3 compound-aware
+  convergence + F0.4 nested move-struct depth + F0.5 nested handle
+  param registration + F0.6 thread-transfer auto-register)
+- Net: -3808 lines deleted, +124 added
+
+**Tools delivered:**
+- `tools/agreement_audit.sh` — per-test agreement reporter
+- `ZER_AGREEMENT_AUDIT=1` env var — debug mode
+
+**~2,089 tests passing across all suites.**
+
+The original plan below is preserved as a historical record. The
+sub-phases A through F described here were collapsed into the simpler
+F0+F1+F2+F3 sequence that actually shipped.
+
+---
+
+## Original Plan (historical, 2026-04-19)
 
 Long-horizon plan to:
 

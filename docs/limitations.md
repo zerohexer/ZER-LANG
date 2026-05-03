@@ -5,29 +5,16 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — `@once` lacks `__STDC_HOSTED__` guard
+## ~~`@once` lacks `__STDC_HOSTED__` guard~~ (FIXED 2026-05-02, commit `664b211`)
 
-**Discovered:** 2026-05-01 audit.
+Wrapped atomic emission in `#if __STDC_HOSTED__` with a non-atomic
+fallback for freestanding builds. See BUGS-FIXED.md "Fix #2".
 
-Emitter unconditionally produces `__atomic_exchange_n(&_zer_once_N, 1,
-__ATOMIC_ACQ_REL)` for `@once` blocks (emitter.c:8313). GCC implements
-`__atomic_*` via libatomic on targets without lock-free CAS for the
-relevant width — freestanding/baremetal builds without libatomic
-linkage will fail to link or fall back to a non-atomic implementation
-that's racy across cores. Should guard with `__STDC_HOSTED__` or emit
-a target-specific intrinsic where available.
+## ~~`@probe` silently succeeds on freestanding~~ (FIXED 2026-05-02, commit `edce2a3`)
 
-## OPEN — `@probe` silently succeeds on freestanding
-
-**Discovered:** 2026-05-01 audit.
-
-`@probe(addr)` returns `?u32`. Hosted builds catch SIGSEGV and return
-null on fault. Freestanding builds (no signal handler) return
-`{ .has_value = 1, .value = <whatever the load returned> }` — silent
-garbage on bad MMIO addresses. Either disable `@probe` on freestanding
-or add a target-specific fault handler hook.
-
-(See also `docs/4-27-2026-gaps.md` Gap 9 for related discussion.)
+Added `--probe-mode={hosted,raw,disabled}` CLI flag with three modes:
+hosted (signal-handler default), raw (direct read, no fault recovery),
+disabled (compile-error if `@probe` used). See BUGS-FIXED.md "Fix #4".
 
 ## ~~`@critical` indirect return via callee~~ (INVESTIGATED 2026-05-02 — not a bug)
 
@@ -68,25 +55,20 @@ unusable.
 The branch's audit was correct in spirit (transitive checks are good)
 but misanalyzed control-flow semantics for plain function returns.
 
-## OPEN — AST `emit_expr` compound `/=` and `%=` lack signed-overflow trap
+## ~~AST `emit_expr` compound `/=` and `%=` lack signed-overflow trap~~ (FIXED 2026-05-02, commit `b4d10ed`)
 
-**Discovered:** 2026-05-01 audit. emitter.c:1433–1444.
+Ported the same `INT_MIN/-1` overflow trap pattern from the IR path
+to the AST `emit_expr` sibling at emitter.c:1433–1444. Defense in
+depth even though function bodies are IR-only since 2026-04-19. See
+BUGS-FIXED.md "Fix #3".
 
-BUG-612 fixed `INT_MIN / -1` trap emission for the IR path
-(`emit_rewritten_node` at emitter.c:5787–5808). The AST sibling at
-1433–1444 only emits the divzero trap. Reachability through user
-function bodies is limited (function bodies are IR-only since
-2026-04-19), but other emission contexts (some statement-expression
-fallbacks) still go through `emit_expr`. Apply the same `INT_MIN`
-guard pattern as the IR path.
+## ~~u64 atomic warning fires on 64-bit targets~~ (FIXED 2026-05-02, commit `c4bbbe0`)
 
-## OPEN — u64 atomic warning fires on 64-bit targets
-
-**Discovered:** 2026-05-01 audit. checker.c around lines 6601, 6637.
-
-The "may require libatomic on 32-bit" warning is emitted for every
-`@atomic_*` on a u64 operand, regardless of `--target-bits`. False
-positive on 64-bit hosts. Gate the warning on `target_bits < 64`.
+Gated the "may require libatomic on 32-bit" warning on
+`target_ptr_bits < 64`. The fix uncovered a deeper bug — BUG-652:
+`Checker.target_ptr_bits` was never initialized from the global, so
+the field was memset-zeroed and any `target_ptr_bits < N` check
+silently always-true. See BUGS-FIXED.md "Fix #1".
 
 ## OPEN — `naked` attribute silently dropped on IR path
 
@@ -94,6 +76,49 @@ See full entry near the bottom of this file ("`naked` attribute
 silently dropped on IR path (deferred 2026-05-02)") — kept in original
 location to preserve the more detailed analysis added in the
 2026-05-02 fix session.
+
+## OPEN — 4 narrow zercheck patterns not in zercheck_ir (Phase F3 leftover)
+
+**Discovered:** 2026-05-03 Phase F3 audit. Documented when
+`test_zercheck.c` was deleted.
+
+When test_zercheck.c was migrated to use zercheck_ir (via shim), 4 of
+54 narrow unit-test patterns failed. Each represents a real safety
+issue zercheck.c caught that zercheck_ir doesn't:
+
+1. **Wrong pool detection** — `pool_a.alloc()` then `pool_b.get(h)`.
+   IR doesn't track which pool a handle came from. zercheck.c had
+   `pool_id` per HandleInfo. Niche pattern (most ZER programs use one
+   pool per type via `Task.alloc()` auto-slabs).
+
+2. **Direct overwrite leak** — `Handle h = pool.alloc(); h = pool.alloc();`
+   without freeing first. IR's IRMC_ALLOC overwrite check fires only
+   at the call site (TMP local), not at the assign-back (`h = ...`).
+   `orelse return` decomposition in particular makes the alloc dest
+   a temp; the assign to `h` later isn't checked for overwrite.
+
+3. **Free-then-realloc in loop (FALSE POSITIVE)** — convergence loop
+   doesn't stabilize on `for { pool.free(h); h = pool.alloc(); }`.
+   Errors with "did not converge within 32 iterations." Real bug —
+   would affect any user writing this idiom.
+
+4. **Struct copy alias UAF** — `State s2 = s1; tasks.free(s1.h);
+   tasks.get(s2.h);`. IR doesn't propagate `alloc_id` through struct
+   value copies, so `s2.h` and `s1.h` aren't aliased and freeing one
+   doesn't mark the other.
+
+**Status:** None of these patterns appear in current real-code tests
+(verified via grep across tests/zer/, rust_tests/, test_modules/,
+zig_tests/). They were narrow unit tests of zercheck.c-specific
+algorithms.
+
+**Estimated fix effort:** ~8-15 hrs combined (each is 30-100 LOC port
+from zercheck.c history).
+
+**When to fix:** if a real user program triggers any of these. The
+patterns are catalogued here so the failure is recognized as a known
+gap rather than a fresh bug. Port from git history of zercheck.c
+(commit `7ffbd9d^` and earlier).
 
 ---
 

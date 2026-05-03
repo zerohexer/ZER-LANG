@@ -48,22 +48,17 @@ test_gaps: test_gaps.c $(LIB_SRCS)
 test_emit: test_emit.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-# Phase F2 (2026-05-03): test_zercheck.c is no longer in `make check`.
-# It tests zercheck.c (AST analyzer) directly — narrow unit-test
-# patterns that don't reflect production. Production safety analysis
-# went to zercheck_ir in Phase F1 and is verified by:
-#   - 538 ZER integration tests (tests/zer/ + tests/zer_fail/)
-#   - 200 fuzz tests
-#   - 139 conversion tests
-#   - 28 module tests
-#   - 5 cross-arch tests
-# These cover all production-relevant safety patterns.
+# Phase F3 (2026-05-03): test_zercheck.c was deleted along with the
+# original 3128-line zercheck.c. It tested narrow patterns specific to
+# the AST analyzer. Production safety analysis runs through
+# zercheck_ir; zercheck.c is now a thin compat shim (~150 lines)
+# delegating to zercheck_ir for the few remaining callers (LSP,
+# firmware tests, production test).
 #
-# The build target is kept (for manual `make test_zercheck` if
-# someone wants to test zercheck.c specifically), but it's not
-# wired into `make check`.
-test_zercheck: test_zercheck.c $(LIB_SRCS)
-	$(CC) $(CFLAGS) -o $@ $^
+# Production parity verified across ~2,089 tests. Narrow-pattern
+# coverage that test_zercheck.c provided was either redundant with
+# integration tests (50 of 54) or tested zercheck.c-specific behavior
+# IR doesn't replicate (4 of 54).
 
 test_firmware: test_firmware_patterns.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -156,7 +151,6 @@ clean:
 	      test_extra test_extra.exe \
 	      test_gaps test_gaps.exe \
 	      test_emit test_emit.exe \
-	      test_zercheck test_zercheck.exe \
 	      test_firmware test_firmware.exe \
 	      test_firmware2 test_firmware2.exe \
 	      test_firmware3 test_firmware3.exe \

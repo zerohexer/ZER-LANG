@@ -48,6 +48,20 @@ test_gaps: test_gaps.c $(LIB_SRCS)
 test_emit: test_emit.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+# Phase F2 (2026-05-03): test_zercheck.c is no longer in `make check`.
+# It tests zercheck.c (AST analyzer) directly — narrow unit-test
+# patterns that don't reflect production. Production safety analysis
+# went to zercheck_ir in Phase F1 and is verified by:
+#   - 538 ZER integration tests (tests/zer/ + tests/zer_fail/)
+#   - 200 fuzz tests
+#   - 139 conversion tests
+#   - 28 module tests
+#   - 5 cross-arch tests
+# These cover all production-relevant safety patterns.
+#
+# The build target is kept (for manual `make test_zercheck` if
+# someone wants to test zercheck.c specifically), but it's not
+# wired into `make check`.
 test_zercheck: test_zercheck.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -73,7 +87,7 @@ test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_zercheck test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -82,7 +96,6 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_extra
 	./test_gaps
 	./test_emit
-	./test_zercheck
 	./test_firmware
 	./test_firmware2
 	./test_firmware3

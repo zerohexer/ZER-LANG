@@ -281,6 +281,28 @@ static void emit_zero_value(Emitter *e, Type *t) {
     }
 }
 
+/* Emit the body of an auto-guard return ({ defers; return <zero>; }).
+ * Async-aware: in async function bodies (Duff's-device poll loops), a bare
+ * C `return;` would suspend the coroutine without signalling completion —
+ * subsequent polls would re-enter at state 0 and re-run the prologue,
+ * silently looping. Emit the same termination sequence IR_RETURN uses for
+ * async (`self->_zer_state = -1; return 1;`) so the auto-guard early-out
+ * marks the coroutine done. Regular functions emit the normal return. */
+static void emit_auto_guard_return_body(Emitter *e) {
+    emit(e, "{\n");
+    emit_defers(e);
+    if (e->in_async) {
+        emit_indent(e);
+        emit(e, "self->_zer_state = -1; return 1; }\n");
+    } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+        emit(e, "return ");
+        emit_zero_value(e, e->current_func_ret);
+        emit(e, "; }\n");
+    } else {
+        emit(e, "return; }\n");
+    }
+}
+
 /* Walk expression tree, emit auto-guard if-return statements for unproven NODE_INDEX.
  * Called BEFORE emit_expr for the containing statement. */
 static void emit_auto_guards(Emitter *e, Node *node) {
@@ -293,17 +315,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
             emit(e, "if ((size_t)(");
             emit_expr(e, node->index_expr.index);
             emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
-            if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                emit(e, "{\n");
-                emit_defers(e);
-                emit(e, "return ");
-                emit_zero_value(e, e->current_func_ret);
-                emit(e, "; }\n");
-            } else {
-                emit(e, "{\n");
-                emit_defers(e);
-                emit(e, "return; }\n");
-            }
+            emit_auto_guard_return_body(e);
         }
         emit_auto_guards(e, node->index_expr.object);
         emit_auto_guards(e, node->index_expr.index);
@@ -328,17 +340,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
                     emit(e, ") == (");
                     emit_expr(e, df->freed_idx);
                     emit(e, ")) ");
-                    if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                        emit(e, "{\n");
-                        emit_defers(e);
-                        emit(e, "return ");
-                        emit_zero_value(e, e->current_func_ret);
-                        emit(e, "; }\n");
-                    } else {
-                        emit(e, "{\n");
-                        emit_defers(e);
-                        emit(e, "return; }\n");
-                    }
+                    emit_auto_guard_return_body(e);
                     break;
                 }
             }
@@ -10011,7 +10013,23 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
             emit(e, "_zer_bb%d:;\n", bb->id);
         }
         for (int ii = 0; ii < bb->inst_count; ii++) {
-            emit_ir_inst(e, &bb->insts[ii], func);
+            /* Audit-fix (2026-05-03): mirror the regular-IR path's auto-guard
+             * emission. Without this, async functions silently miscompiled
+             * unproven `arr[i]` accesses — the warning claimed an auto-guard
+             * was inserted, but the async emission loop only called
+             * emit_ir_inst (no emit_auto_guards). The guard now fires the
+             * same way as the regular path; emit_auto_guard_return_body
+             * emits `self->_zer_state = -1; return 1;` for async returns. */
+            IRInst *ins = &bb->insts[ii];
+            if (ins->expr) {
+                IROpKind k = ins->op;
+                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
+                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
+                    k == IR_INDEX_READ) {
+                    emit_auto_guards(e, ins->expr);
+                }
+            }
+            emit_ir_inst(e, ins, func);
         }
     }
 

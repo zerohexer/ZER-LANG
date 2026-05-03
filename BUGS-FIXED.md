@@ -5,6 +5,108 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-05-03 — IR audit, async auto-guard regression
+
+Audit of IR pipeline (ir.c, ir_lower.c, zercheck_ir.c, emitter.c IR_*
+handlers) hunting for AST→IR safety drift in the spirit of BUG-595/612.
+One real silent miscompile found and fixed (BUG-655).
+
+### BUG-655: async function emit_auto_guards gap (HIGH silent miscompile)
+
+**Symptom:** Async functions silently emitted unchecked `arr[i]` /
+`s.fielded[k]` accesses when the index/handle was VRP-unprovable. The
+checker emitted the standard warning *"index 'i' not proven in range
+for array of size N — auto-guard inserted"* but the emitted C
+contained NO guard. Hosted: read adjacent state-struct memory, return
+silent garbage (often exit 0). Bare-metal: silent corruption of any
+memory mapped past the array (no MMU = no fault).
+
+**Reproducer:** declare `async void worker() { u32[4] arr; ...; yield;
+result = arr[i]; }` with `i` runtime-unknown but actually 5. The
+emitted poll function does `self->_zer_t10 = result = self->arr[self->i];`
+with no `if (i >= 4)` guard.
+
+**Root cause:** `emit_async_func_from_ir` (emitter.c:9914) iterates
+basic blocks and calls `emit_ir_inst` directly. The sister
+`emit_regular_func_from_ir` calls `emit_auto_guards` BEFORE each
+statement-producing IR op (emitter.c:9888). The async path was
+missing this loop.
+
+Same regression class as the AST→IR drift documented in BUG-595
+(slice bounds), BUG-608 (binary shift/div), BUG-612 (compound shift/div):
+when an emission path forks for a new context, every safety wrapper the
+parent path applied has to be re-applied or it silently goes missing.
+
+**Fix:** Two-part.
+
+1. New helper `emit_auto_guard_return_body` (emitter.c:285) factors out
+   the common `{ defers; return <zero>; }` block. Async-aware: when
+   `e->in_async` is true, emits `self->_zer_state = -1; return 1;`
+   (mark coroutine done) instead of a bare C `return;`. Without the
+   async-aware return, the auto-guard would execute `return;` from the
+   middle of the Duff's-device switch; next poll would re-enter at
+   state 0 and re-run the prologue — silent infinite re-execution.
+
+2. `emit_async_func_from_ir` block emission now mirrors the regular
+   path's `emit_auto_guards` call list (`IR_ASSIGN`, `IR_CALL`,
+   `IR_RETURN`, `IR_INTRINSIC`, `IR_CALL_DECOMP`, `IR_INDEX_READ`).
+
+**Test:** `tests/zer/async_auto_guard.zer` — async coroutine writes
+`finished_steps = 2` then triggers OOB on `u32[4]`. Caller polls until
+done. Before fix: `finished_steps = 3` (OOB read overwrote nothing
+visible, prologue re-ran on later polls) and `result` set to garbage.
+After fix: `finished_steps == 2` (auto-guard fires, coroutine exits
+cleanly), `result == 9999` (sentinel preserved — write never
+happened). Test exits 0 only when guard fires correctly.
+
+### Audit method that found this
+
+Re-applied the AST→IR diff audit protocol from `docs/4-27-2026-gaps.md`
+"Phase 3 audit" methodology. For every safety emission helper that
+runs in `emit_regular_func_from_ir`, verified the corresponding async
+path has equivalent coverage. Three differences were found in async
+vs regular:
+
+1. **`emit_auto_guards` not called** — fixed (this bug).
+2. **Capture-scope wrapping (`{ ... }` for type conflicts) not
+   applied** — verified harmless: async dedups captures by
+   name+type into separate state-struct fields (`v` vs `v_7`); the
+   regular path's capture-scope wrapping is for in-scope C variable
+   redeclaration, which doesn't apply to struct fields.
+3. **Source-line `#line` directives suppressed** — intentional,
+   matches comment at emitter.c:9817.
+
+### Files changed
+
+- `emitter.c`:
+  - `emit_auto_guard_return_body` helper added (lines ~283-300)
+  - `emit_auto_guards` NODE_INDEX + NODE_FIELD branches updated to
+    use the helper (lines ~290-306, ~324-330)
+  - `emit_async_func_from_ir` block-emission loop now calls
+    `emit_auto_guards` (lines ~10018-10028)
+- `tests/zer/async_auto_guard.zer` — NEW regression test
+- `BUGS-FIXED.md` — this entry
+- `docs/limitations.md` — section "OPEN — async function emit_auto_guards"
+  added then closed; left as historical context
+
+### Side-finding: zercheck_ir doesn't have Gap-17 destructor heuristic
+
+While auditing, also confirmed that `ir_is_extern_free_call`
+(zercheck_ir.c:691) does NOT have the destructor-name substring
+heuristic that `is_free_call` (zercheck.c:308 — Gap 17 fix) does.
+Effect: in `ZER_IR_ONLY=1` mode (Phase G simulation), bodyless
+`int destroy(*Resource)` is not recognized as a free, producing leak
+warnings instead of UAF detection on subsequent uses.
+
+This is technical debt for the Phase G migration (when zercheck.c is
+deleted). Not user-visible today (AST gates exit code in Phase F dual-
+run), but flagged for the Phase G implementation. The fix is to port
+`name_looks_like_destructor` into zercheck_ir.c. Deferred — outside
+this audit's scope; documented here so the Phase G implementor sees
+it.
+
+---
+
 ## Session 2026-05-02 (extended) — F6 + F7-light + F7-full + C8 classification
 
 Continuation of the same 2026-05-02 session that started with the branch

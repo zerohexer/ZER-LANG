@@ -2775,6 +2775,71 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
  * Main Analysis — walk CFG in topological order
  * ================================================================ */
 
+/* F0.5 (2026-05-03): walk a struct/union type recursively, registering
+ * each Handle field as a compound handle on the path state.
+ *
+ * Path format matches ir_extract_compound_key: ".field1.field2..." —
+ * dot-prefixed, NO root identifier name. The local_id is the param's
+ * IR local; the path is just the dotted field chain.
+ *
+ * Mirrors zercheck.c:2769-2862 (Gap 29 fix) but uses IR's path scheme.
+ * Without this, function params of nested-struct types never have
+ * their inner handles tracked → use-after-free goes undetected.
+ *
+ * Depth-limited at 32 to prevent infinite recursion on malformed
+ * recursive types. */
+static void ir_register_nested_handles(IRPathState *ps, void *arena_ptr,
+    int local_id, Type *t, const char *path, uint32_t path_len, int depth)
+{
+    if (depth > 32 || !t) return;
+    Type *eff = type_unwrap_distinct(t);
+    if (!eff) return;
+    Arena *arena = (Arena *)arena_ptr;
+
+    if (eff->kind == TYPE_UNION) {
+        /* Variants share the path (variant doesn't add path component). */
+        for (uint32_t vi = 0; vi < eff->union_type.variant_count; vi++) {
+            Type *vt = type_unwrap_distinct(eff->union_type.variants[vi].type);
+            if (vt && (vt->kind == TYPE_STRUCT || vt->kind == TYPE_UNION)) {
+                ir_register_nested_handles(ps, arena, local_id, vt,
+                    path, path_len, depth + 1);
+            }
+        }
+        return;
+    }
+    if (eff->kind != TYPE_STRUCT) return;
+
+    for (uint32_t fi = 0; fi < eff->struct_type.field_count; fi++) {
+        Type *ft = type_unwrap_distinct(eff->struct_type.fields[fi].type);
+        if (!ft) continue;
+        const char *fname = eff->struct_type.fields[fi].name;
+        uint32_t fnl = eff->struct_type.fields[fi].name_len;
+
+        /* Build "<path>.<field>" — extends the existing dotted path */
+        uint32_t new_plen = path_len + 1 + fnl;
+        char *new_path = (char *)arena_alloc(arena, new_plen + 1);
+        if (!new_path) continue;
+        memcpy(new_path, path, path_len);
+        new_path[path_len] = '.';
+        memcpy(new_path + path_len + 1, fname, fnl);
+        new_path[new_plen] = '\0';
+
+        if (ft->kind == TYPE_HANDLE) {
+            IRHandleInfo *h = ir_add_compound_handle(ps, local_id,
+                new_path, new_plen);
+            if (h) {
+                h->state = IR_HS_ALIVE;
+                h->alloc_line = 0;  /* param — no specific alloc site */
+                h->alloc_id = local_id;
+                h->source_color = 0;
+            }
+        } else if (ft->kind == TYPE_STRUCT || ft->kind == TYPE_UNION) {
+            ir_register_nested_handles(ps, arena, local_id, ft,
+                new_path, new_plen, depth + 1);
+        }
+    }
+}
+
 bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     if (!func || func->block_count == 0) return true;
 
@@ -2784,6 +2849,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
 
     for (int bi = 0; bi < func->block_count; bi++)
         ir_ps_init(&block_states[bi]);
+
+    /* F0.5 (2026-05-03): nested-handle param registration is done
+     * INSIDE the fixed-point loop on the merged state for the entry
+     * block — pre-loop registration on block_states[0] would be
+     * overwritten when the loop reinitializes merged for entry. */
 
     /* Process blocks in order (topological for forward edges).
      * For back edges (loops), use fixed-point iteration.
@@ -2833,6 +2903,31 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     }
                 } else {
                     ir_ps_init(&merged); /* entry block — empty state */
+                    /* F0.5 (2026-05-03): register param nested-handle
+                     * fields on the entry block's merged state. Done
+                     * here (not on block_states[0] before the loop)
+                     * because the merged state replaces block_states[0]
+                     * each iteration. */
+                    if (bi == 0 && func->ast_node &&
+                        func->ast_node->kind == NODE_FUNC_DECL) {
+                        Node *fn = func->ast_node;
+                        for (int pi = 0; pi < fn->func_decl.param_count; pi++) {
+                            ParamDecl *pp = &fn->func_decl.params[pi];
+                            if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+                            Symbol *type_sym = scope_lookup(zc->checker->global_scope,
+                                pp->type->named.name,
+                                (uint32_t)pp->type->named.name_len);
+                            if (!type_sym || !type_sym->type) continue;
+                            Type *st = type_unwrap_distinct(type_sym->type);
+                            if (!st || (st->kind != TYPE_STRUCT &&
+                                        st->kind != TYPE_UNION)) continue;
+                            int plocal = ir_find_local_exact_first(func,
+                                pp->name, (uint32_t)pp->name_len);
+                            if (plocal < 0) continue;
+                            ir_register_nested_handles(&merged, zc->arena,
+                                plocal, st, "", 0, 0);
+                        }
+                    }
                 }
             } else {
                 IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));
@@ -2906,6 +3001,32 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
             } else {
                 ir_ps_init(&merged);
+                /* F0.5 (2026-05-03): final pass also needs param
+                 * nested-handle registration on entry block. Without
+                 * this, the post-fixed-point pass sees empty state for
+                 * entry block and fails to detect UAF on nested
+                 * handles. Same logic as the fixed-point loop's entry
+                 * init above. */
+                if (bi == 0 && func->ast_node &&
+                    func->ast_node->kind == NODE_FUNC_DECL) {
+                    Node *fn = func->ast_node;
+                    for (int pi = 0; pi < fn->func_decl.param_count; pi++) {
+                        ParamDecl *pp = &fn->func_decl.params[pi];
+                        if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+                        Symbol *type_sym = scope_lookup(zc->checker->global_scope,
+                            pp->type->named.name,
+                            (uint32_t)pp->type->named.name_len);
+                        if (!type_sym || !type_sym->type) continue;
+                        Type *st = type_unwrap_distinct(type_sym->type);
+                        if (!st || (st->kind != TYPE_STRUCT &&
+                                    st->kind != TYPE_UNION)) continue;
+                        int plocal = ir_find_local_exact_first(func,
+                            pp->name, (uint32_t)pp->name_len);
+                        if (plocal < 0) continue;
+                        ir_register_nested_handles(&merged, zc->arena,
+                            plocal, st, "", 0, 0);
+                    }
+                }
             }
         } else {
             IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));

@@ -1,0 +1,55 @@
+// Regression test (2026-05-03): async function auto-guard.
+//
+// Pre-fix: emit_async_func_from_ir did NOT call emit_auto_guards before
+// IR instructions. The compiler warned "auto-guard inserted" but the
+// emitted async coroutine performed unchecked OOB reads / dynamic-freed
+// reads. Hosted: silent (read adjacent state struct memory, exit 0).
+// Bare-metal: silent corruption (entire address space valid).
+//
+// Fix: async path now mirrors the regular IR path's emit_auto_guards
+// loop. emit_auto_guard_return_body is async-aware — emits
+// `self->_zer_state = -1; return 1;` (mark coroutine done) instead of
+// a bare C `return;` which would re-enter the prologue on next poll.
+//
+// This test verifies the coroutine TERMINATES instead of looping
+// forever or returning silent garbage when an auto-guard fires.
+
+u32 result;
+u32 finished_steps;
+
+async void worker() {
+    u32[4] arr;
+    arr[0] = 100;
+    arr[1] = 200;
+    arr[2] = 300;
+    arr[3] = 400;
+    finished_steps = 1;
+    u32 i = 5;
+    u32 j = 0;
+    while (j < 1) { i = 5; j = j + 1; } // defeat VRP
+    yield;
+    finished_steps = 2;
+    // OOB on u32[4] arr — auto-guard must fire and exit the coroutine.
+    result = arr[i];
+    // Code below MUST be unreachable (auto-guard returns above).
+    finished_steps = 3;
+}
+
+u32 main() {
+    finished_steps = 0;
+    result = 9999;
+    _zer_async_worker task;
+    _zer_async_worker_init(&task);
+    // Bounded poll — auto-guard returns 1 on the second poll, stop there.
+    u32 polls = 0;
+    while (polls < 5) {
+        i32 done = _zer_async_worker_poll(&task);
+        if (done == 1) { polls = 100; }
+        polls = polls + 1;
+    }
+    // Validate: prologue ran (steps==1), yielded once (resume runs auto-guard
+    // before reaching steps=3), result was NOT overwritten (auto-guard fired).
+    if (finished_steps != 2) { return 1; }
+    if (result != 9999) { return 2; }
+    return 0;
+}

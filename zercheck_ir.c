@@ -2824,13 +2824,29 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 ir_check_inst(zc, &merged, &bb->insts[ii], func);
             }
 
-            /* Check if state changed (for fixed-point convergence) */
+            /* Check if state changed (for fixed-point convergence).
+             *
+             * F0.3 (2026-05-03): use ir_find_compound_handle (compound-
+             * aware), not ir_find_handle (bare-only). When merged
+             * contains compound handles (e.g., s.top from struct field
+             * tracking), bare-only lookup returns the wrong entry or
+             * NULL — comparison spuriously says "changed" and the
+             * fixed-point never converges.
+             *
+             * This was causing 4 false positives in audit:
+             *   data_structures.zer (Pool with linked Handle field)
+             *   move_array_safe.zer (move-tracked array elements)
+             *   orelse_block_ptr.zer (orelse block creating compound state)
+             *   super_sensor_logger.zer (Slab with nested Handle fields)
+             * All hit the iteration cap not because they need many
+             * iterations, but because the convergence check was broken. */
             if (merged.handle_count != block_states[bi].handle_count) {
                 changed = true;
             } else {
                 for (int hi = 0; hi < merged.handle_count; hi++) {
                     IRHandleInfo *mh = &merged.handles[hi];
-                    IRHandleInfo *oh = ir_find_handle(&block_states[bi], mh->local_id);
+                    IRHandleInfo *oh = ir_find_compound_handle(
+                        &block_states[bi], mh->local_id, mh->path, mh->path_len);
                     if (!oh || oh->state != mh->state) {
                         changed = true;
                         break;

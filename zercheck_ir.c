@@ -1380,6 +1380,62 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
+        /* F3.1 (2026-05-03): struct value copy alias propagation.
+         * `State s2 = s1;` where State contains a Handle field — copy
+         * all COMPOUND handles registered under src local into equivalent
+         * compound handles under dest local with same alloc_id/state.
+         * Without this, freeing `s1.h` doesn't propagate to `s2.h` and
+         * UAF via `s2.h` goes undetected.
+         *
+         * Approach: scan ps->handles for entries with local_id = src and
+         * non-empty path. For each, ir_add_compound_handle on dst with
+         * same path/state/alloc_id. Propagating alloc_id makes free of
+         * s1.h naturally mark s2.h's alias-group via existing
+         * ir_propagate_alias_state mechanism.
+         *
+         * Snapshot handle indices before mutation since ir_add_compound_handle
+         * may realloc ps->handles. Two-pass: collect source compounds,
+         * then replicate. */
+        if (inst->dest_local >= 0 && inst->src1_local >= 0 &&
+            inst->dest_local != inst->src1_local) {
+            int src_local = inst->src1_local;
+            int dst_local = inst->dest_local;
+            int n = ps->handle_count;
+            int cap = n > 0 ? n : 1;
+            struct { const char *path; uint32_t plen; IRHandleState state;
+                     int alloc_line; int alloc_id; int source_color;
+                     bool is_thread_handle; } *srcs;
+            srcs = malloc((size_t)cap * sizeof(*srcs));
+            int sn = 0;
+            if (srcs) {
+                for (int hi = 0; hi < n; hi++) {
+                    IRHandleInfo *sh = &ps->handles[hi];
+                    if (sh->local_id == src_local && sh->path_len > 0) {
+                        srcs[sn].path = sh->path;
+                        srcs[sn].plen = sh->path_len;
+                        srcs[sn].state = sh->state;
+                        srcs[sn].alloc_line = sh->alloc_line;
+                        srcs[sn].alloc_id = sh->alloc_id;
+                        srcs[sn].source_color = sh->source_color;
+                        srcs[sn].is_thread_handle = sh->is_thread_handle;
+                        sn++;
+                    }
+                }
+                for (int si = 0; si < sn; si++) {
+                    IRHandleInfo *dh = ir_add_compound_handle(ps, dst_local,
+                        srcs[si].path, srcs[si].plen);
+                    if (dh) {
+                        dh->state = srcs[si].state;
+                        dh->alloc_line = srcs[si].alloc_line;
+                        dh->alloc_id = srcs[si].alloc_id;
+                        dh->source_color = srcs[si].source_color;
+                        dh->is_thread_handle = srcs[si].is_thread_handle;
+                    }
+                }
+                free(srcs);
+            }
+        }
+
         IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
         if (!src_h) break;
         /* Error if source is invalid */
@@ -1399,6 +1455,31 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         int src_alloc_id = src_h->alloc_id;
         int src_color = src_h->source_color;
         bool src_is_th = src_h->is_thread_handle;
+
+        /* F3.1 (2026-05-03): overwrite-alive detection. If the dest local
+         * already has a tracked handle in ALIVE state and the source's
+         * alloc_id differs (i.e., the dest is being overwritten by a
+         * DIFFERENT allocation), the previous allocation is leaked.
+         *
+         * Skip temp locals (e.g., _zer_or temps) — those are expected
+         * to be overwritten in orelse-decomposed code. Skip when src
+         * shares the same alloc_id (true alias propagation, not an
+         * overwrite). Skip when source isn't ALIVE (already-freed
+         * handle being reassigned isn't a leak). */
+        if (inst->dest_local < func->local_count &&
+            !func->locals[inst->dest_local].is_temp &&
+            src_state == IR_HS_ALIVE) {
+            IRHandleInfo *existing_dst = ir_find_handle(ps, inst->dest_local);
+            if (existing_dst &&
+                existing_dst->state == IR_HS_ALIVE &&
+                existing_dst->alloc_id != src_alloc_id) {
+                ir_zc_error(zc, inst->source_line,
+                    "handle %%%d overwritten while alive — previous "
+                    "allocation (line %d) leaked",
+                    inst->dest_local, existing_dst->alloc_line);
+            }
+        }
+
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
             dst_h->state = src_state;

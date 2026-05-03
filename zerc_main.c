@@ -619,32 +619,26 @@ int main(int argc, char **argv) {
             import_asts[import_ast_count++] = cc.modules[mi].ast;
     }
 
-    ZerCheck zc;
-    zercheck_init(&zc, &checker, &cc.arena, input_path);
-    zc.import_asts = import_asts;
-    zc.import_ast_count = import_ast_count;
-    /* F0 modes (2026-05-03):
+    /* Phase F1 (2026-05-03): zercheck_ir is the SOLE safety driver.
+     * zercheck.c (AST analyzer) is no longer called in the compile path.
+     * Achieved full parity via Phase F0 sub-phases (F0.3-F0.6 closed
+     * 6 false positives + 5 false negatives + 95 cosmetic count diffs).
      *
-     * ZER_IR_ONLY=1     — Phase F end-state: skip zercheck.c entirely.
-     *                     IR analyzer becomes sole driver. Use this to
-     *                     verify which tests pass/fail under target
-     *                     architecture before doing actual Phase F.
-     *
-     * ZER_AGREEMENT_AUDIT=1 — F0.1 measurement mode: run BOTH analyzers
-     *                     even when AST fails, so we can compare per-test
-     *                     in tools/agreement_audit.sh. */
-    const char *ir_only_env = getenv("ZER_IR_ONLY");
-    bool ir_only = (ir_only_env && ir_only_env[0] == '1');
+     * ZER_AGREEMENT_AUDIT=1 (debug-only) re-enables AST analysis for
+     * the agreement audit reporter (tools/agreement_audit.sh). Not
+     * intended for production compile. */
     const char *audit_env = getenv("ZER_AGREEMENT_AUDIT");
     bool audit_mode = (audit_env && audit_env[0] == '1');
 
-    bool ast_ok = ir_only ? true : zercheck_run(&zc, main_mod->ast);
-
-    if (!ast_ok && !audit_mode) {
-        fprintf(stderr, "error: zercheck failed\n");
-        free(cc.modules);
-        arena_free(&cc.arena);
-        return 1;
+    ZerCheck zc;
+    if (audit_mode) {
+        /* Audit mode: run AST analysis for measurement, don't bail
+         * on its result. Used by tools/agreement_audit.sh to compare
+         * AST vs IR error counts per file. */
+        zercheck_init(&zc, &checker, &cc.arena, input_path);
+        zc.import_asts = import_asts;
+        zc.import_ast_count = import_ast_count;
+        zercheck_run(&zc, main_mod->ast);
     }
 
     /* emit C */
@@ -665,21 +659,17 @@ int main(int argc, char **argv) {
     emitter.probe_mode = zer_probe_mode;  /* Fix #4: hosted/raw/disabled */
     emitter.source_file = input_path;
 
-    /* Phase F: zercheck_ir runs via ir_hook inside the emitter, on the
-     * SAME IR the emitter lowers. Single lowering per function — avoids
-     * AST re-mutation from pre_lower_orelse's destructive rewrite.
+    /* zercheck_ir runs via ir_hook inside the emitter, on the SAME IR
+     * the emitter lowers. Single lowering per function — avoids AST
+     * re-mutation from pre_lower_orelse's destructive rewrite.
      * See zerc_ir_hook() / zerc_ir_hook_state below. */
     ZerCheck zc_ir;
     zercheck_init(&zc_ir, &checker, &cc.arena, input_path);
     zc_ir.import_asts = import_asts;
     zc_ir.import_ast_count = import_ast_count;
 
-    const char *dual_env = getenv("ZER_DUAL_RUN");
-    bool dual_enabled = !(dual_env && dual_env[0] == '0');
-    if (dual_enabled) {
-        emitter.ir_hook_ctx = &zc_ir;
-        emitter.ir_hook = zerc_ir_hook;
-    }
+    emitter.ir_hook_ctx = &zc_ir;
+    emitter.ir_hook = zerc_ir_hook;
 
     /* emit in topological order — dependencies first, main last.
      * When IR is active, emit ALL modules' structs+globals first,
@@ -705,11 +695,11 @@ int main(int argc, char **argv) {
 
     fclose(out);
 
-    /* Phase F: now that emit has lowered all functions (single-pass,
-     * hook collected them), run iterative summary build + main analysis
-     * on the collected IRFuncs. Uses the SAME IR pointers — no re-
+    /* Phase F1 (2026-05-03): emit has lowered all functions (single-pass,
+     * hook collected them). Now run iterative summary build + main
+     * analysis on the collected IRFuncs. Same IR pointers — no re-
      * lowering, no AST re-mutation. */
-    if (dual_enabled && zerc_ir_hook_count > 0) {
+    if (zerc_ir_hook_count > 0) {
         /* Iterative FuncSummary build for mutual recursion convergence. */
         zc_ir.building_summary = true;
         for (int pass = 0; pass < 16; pass++) {
@@ -726,36 +716,20 @@ int main(int argc, char **argv) {
             zercheck_ir(&zc_ir, zerc_ir_hook_funcs[i]);
         }
 
-        /* Compare with AST analysis done at zercheck_run earlier.
-         *
-         * Phase F0.1 (2026-05-03): tightened from coarse "both-zero/
-         * both-nonzero" to STRICT count match. The coarse check missed
-         * real per-test disagreements (e.g., AST=0/IR=2 = false-positive
-         * in IR; AST=2/IR=0 = false-negative in IR). Strict count match
-         * surfaces all of these.
-         *
-         * Output is machine-parseable for the F0.2 disagreement reporter:
-         *   AGREEMENT_FAIL <file>: ast=N ir=M kind=<class>
-         *
-         * Where kind classifies the disagreement:
-         *   ir_false_positive  — AST=0, IR>0 (IR rejects valid program)
-         *   ir_false_negative  — AST>0, IR=0 (IR misses real bug)
-         *   ir_count_diff      — both nonzero but different counts
-         */
-        int ast_err = zc.error_count;
-        int ir_err = zc_ir.error_count;
-        if (ast_err != ir_err) {
-            const char *kind;
-            if (ast_err == 0 && ir_err > 0)      kind = "ir_false_positive";
-            else if (ast_err > 0 && ir_err == 0) kind = "ir_false_negative";
-            else                                  kind = "ir_count_diff";
-            fprintf(stderr,
-                "AGREEMENT_FAIL %s: ast=%d ir=%d kind=%s funcs=%d\n",
-                input_path, ast_err, ir_err, kind, zerc_ir_hook_count);
-        } else if (dual_env && dual_env[0] == '2') {
-            fprintf(stderr,
-                "AGREEMENT_OK %s: ast=%d ir=%d funcs=%d\n",
-                input_path, ast_err, ir_err, zerc_ir_hook_count);
+        /* Audit-mode disagreement reporting (used by tools/agreement_audit.sh).
+         * Format: AGREEMENT_FAIL <file>: ast=N ir=M kind=<class> funcs=K */
+        if (audit_mode) {
+            int ast_err = zc.error_count;
+            int ir_err = zc_ir.error_count;
+            if (ast_err != ir_err) {
+                const char *kind;
+                if (ast_err == 0 && ir_err > 0)      kind = "ir_false_positive";
+                else if (ast_err > 0 && ir_err == 0) kind = "ir_false_negative";
+                else                                  kind = "ir_count_diff";
+                fprintf(stderr,
+                    "AGREEMENT_FAIL %s: ast=%d ir=%d kind=%s funcs=%d\n",
+                    input_path, ast_err, ir_err, kind, zerc_ir_hook_count);
+            }
         }
     }
     free(zerc_ir_hook_funcs);
@@ -763,10 +737,9 @@ int main(int argc, char **argv) {
     zerc_ir_hook_count = 0;
     zerc_ir_hook_cap = 0;
 
-    /* ZER_IR_ONLY mode: IR analyzer is sole driver, gate compile on
-     * its error_count. Phase F end-state simulation. */
-    if (ir_only && zc_ir.error_count > 0) {
-        fprintf(stderr, "error: zercheck_ir failed (%d errors)\n",
+    /* IR analyzer is sole driver; gate compile on its error_count. */
+    if (zc_ir.error_count > 0) {
+        fprintf(stderr, "error: zercheck failed (%d errors)\n",
                 zc_ir.error_count);
         remove(output_path);
         free(cc.modules);

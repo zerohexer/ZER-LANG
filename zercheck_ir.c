@@ -1300,7 +1300,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "thread creation with interrupts disabled is unsafe.");
         }
 
-        /* Transfer args (ownership to spawned thread) */
+        /* Transfer args (ownership to spawned thread).
+         *
+         * F0.6 (2026-05-03): for move-struct args, auto-register as
+         * ALIVE before marking TRANSFERRED. Move struct locals aren't
+         * tracked until they're transferred — without auto-registration,
+         * spawn(move_struct) was a no-op and use-after-thread-transfer
+         * went undetected (B02_use_after_thread_transfer_bad). */
         for (int i = 0; i < sp->spawn_stmt.arg_count; i++) {
             Node *arg = sp->spawn_stmt.args[i];
             if (!arg || arg->kind != NODE_IDENT) continue;
@@ -1308,7 +1314,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 arg->ident.name, (uint32_t)arg->ident.name_len);
             if (arg_local < 0) continue;
             IRHandleInfo *h = ir_find_handle(ps, arg_local);
-            if (h) h->state = IR_HS_TRANSFERRED;
+            if (!h && arg_local < func->local_count) {
+                Type *lt = (Type *)func->locals[arg_local].type;
+                if (ir_should_track_move(lt)) {
+                    /* Auto-register as ALIVE so we can mark TRANSFERRED. */
+                    h = ir_add_handle(ps, arg_local);
+                    if (h) {
+                        h->state = IR_HS_ALIVE;
+                        h->alloc_line = inst->source_line;
+                        h->alloc_id = arg_local;
+                    }
+                }
+            }
+            if (h) {
+                h->state = IR_HS_TRANSFERRED;
+                h->free_line = inst->source_line;
+            }
         }
 
         /* Phase D3/E: scoped spawn with ThreadHandle — tracked by name.

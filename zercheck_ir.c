@@ -67,6 +67,17 @@ typedef struct {
     int source_color;
     /* Phase D3: ThreadHandle — from scoped spawn. Leak = "thread not joined". */
     bool is_thread_handle;
+    /* F3.2 (2026-05-04): name of the Pool/Slab variable this handle was
+     * allocated from (e.g., "pool_a"). NULL/0 if not from a Pool/Slab
+     * method (params, malloc, arena, etc.). Used by IRMC_GET/IRMC_FREE
+     * sites to detect cross-pool misuse: pool_a.alloc() then pool_b.get(h)
+     * is undefined behavior at runtime (different slot arrays).
+     *
+     * String pointer is into the source AST (NODE_IDENT name); valid
+     * for the duration of compilation, which outlives zercheck_ir
+     * analysis. */
+    const char *pool_name;
+    uint32_t pool_name_len;
 } IRHandleInfo;
 
 /* Phase E: scoped spawn ThreadHandle tracking by name. Scoped spawn
@@ -468,7 +479,21 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
 
             if (!ph) continue; /* handle not in this pred — keep result's state */
 
-            /* Merge states: both freed → freed, one freed → maybe_freed, etc. */
+            /* Merge states: both freed → freed, one freed → maybe_freed, etc.
+             *
+             * F3.2 (2026-05-04): the lattice MUST be monotonic — once a
+             * handle is widened to MAYBE_FREED on any path, it cannot
+             * narrow back to ALIVE/FREED on a subsequent merge with a
+             * pred that has ALIVE. Pre-fix: `ALIVE + MAYBE_FREED` (when
+             * first_live's pred was ALIVE and a later pred is MAYBE_FREED)
+             * fell through and kept ALIVE. Result: state oscillated
+             * ALIVE↔MAYBE_FREED across loop iterations and convergence
+             * never reached.
+             *
+             * Closes Pattern 3 of F3 limitations.md (free-then-realloc
+             * loop FALSE POSITIVE). MAYBE_FREED is the join of ALIVE
+             * and FREED in the safety lattice, so any pair containing
+             * MAYBE_FREED widens to MAYBE_FREED. */
             if (rh->state == IR_HS_ALIVE && ph->state == IR_HS_FREED) {
                 rh->state = IR_HS_MAYBE_FREED;
                 rh->free_line = ph->free_line;
@@ -478,11 +503,17 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                 rh->state = IR_HS_MAYBE_FREED; /* conservative */
             } else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_ALIVE) {
                 rh->state = IR_HS_MAYBE_FREED;
+            } else if (rh->state == IR_HS_ALIVE && ph->state == IR_HS_MAYBE_FREED) {
+                rh->state = IR_HS_MAYBE_FREED;
+                rh->free_line = ph->free_line;
             } else if (rh->state == IR_HS_FREED && ph->state == IR_HS_MAYBE_FREED) {
                 rh->state = IR_HS_MAYBE_FREED; /* widen — pred saw maybe-free */
+            } else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_MAYBE_FREED) {
+                rh->state = IR_HS_MAYBE_FREED;
             }
-            /* MAYBE_FREED ↔ FREED: keep MAYBE_FREED (already conservative).
-             * Both same state → keep. Both freed → keep freed. */
+            /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
+             * MAYBE_FREED, keep it. Both same state → keep.
+             * Both freed → keep freed. */
         }
 
         /* Add handles from pred that aren't in result yet (compound-aware
@@ -845,6 +876,28 @@ static IRMethodKind ir_classify_method_call(Node *call) {
     return ir_classify_method_call_ex(NULL, call);
 }
 
+/* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
+ * name) from a builtin method call. Returns the source-level identifier
+ * for `pool.alloc()` style calls (returns "pool"). Returns {NULL, 0}
+ * if the receiver isn't a bare ident (e.g., `*p.alloc()` where p is a
+ * pointer param — no source-level name to track).
+ *
+ * Used to populate IRHandleInfo.pool_name at alloc sites and to compare
+ * against the receiver at IRMC_GET / IRMC_FREE sites for wrong-pool
+ * detection. */
+static void ir_extract_pool_name(Node *call, const char **out_name,
+                                 uint32_t *out_len) {
+    *out_name = NULL;
+    *out_len = 0;
+    if (!call || call->kind != NODE_CALL) return;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return;
+    Node *recv = callee->field.object;
+    if (!recv || recv->kind != NODE_IDENT) return;
+    *out_name = recv->ident.name;
+    *out_len = (uint32_t)recv->ident.name_len;
+}
+
 /* Unwrap orelse-wrapped alloc: `pool.alloc() orelse return` — the IR
  * ASSIGN's expression is NODE_ORELSE(NODE_CALL, NODE_RETURN). We want
  * the primary call for classification. */
@@ -1000,6 +1053,125 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_CAST: case NODE_SIZEOF:
     /* Statement / decl kinds — defensive, shouldn't reach here */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        break;
+    }
+}
+
+/* F3.2 (2026-05-04): wrong-pool walker. Recurses into expressions
+ * looking for embedded `pool.get(h)` / `pool.free(h)` calls and flags
+ * if h was allocated from a different pool. Mirrors ir_check_expr_uaf's
+ * recursion shape so it handles `pool_b.get(h).id` (NODE_FIELD wrapping
+ * NODE_CALL), `arr[pool_b.get(h).idx]` (NODE_INDEX wrapping), etc.
+ *
+ * Reuses UafReportSet — once a wrong-pool error is reported for a root
+ * local, suppress further reports for the same local in the same expr.
+ *
+ * Pattern 1 of F3 limitations.md (wrong pool detection). */
+static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
+                                     IRPathState *ps, Node *expr,
+                                     int line, UafReportSet *rs);
+
+static void ir_check_call_wrong_pool(ZerCheck *zc, IRFunc *func,
+                                     IRPathState *ps, Node *call,
+                                     int line, UafReportSet *rs) {
+    if (!call || call->kind != NODE_CALL) return;
+    IRMethodKind mc = ir_classify_method_call_ex(zc->checker, call);
+    if (mc != IRMC_GET && mc != IRMC_FREE && mc != IRMC_FREE_PTR) return;
+    if (call->call.arg_count < 1) return;
+    Node *arg = call->call.args[0];
+    int root_local;
+    const char *path;
+    uint32_t path_len;
+    if (ir_extract_compound_key(zc, func, arg,
+                                 &root_local, &path, &path_len) != 0) return;
+    if (urs_has(rs, root_local)) return;
+    IRHandleInfo *h;
+    if (path_len == 0) h = ir_find_handle(ps, root_local);
+    else h = ir_find_compound_handle(ps, root_local, path, path_len);
+    if (!h && path_len > 0) h = ir_find_handle(ps, root_local);
+    if (!h || !h->pool_name || h->pool_name_len == 0) return;
+    const char *cur_n; uint32_t cur_l;
+    ir_extract_pool_name(call, &cur_n, &cur_l);
+    if (!cur_n || cur_l == 0) return;
+    if (cur_l == h->pool_name_len &&
+        memcmp(cur_n, h->pool_name, cur_l) == 0) return;
+    const char *verb = (mc == IRMC_GET) ? "used on" : "freed on";
+    ir_zc_error(zc, line,
+        "wrong pool: handle was allocated from '%.*s' but %s '%.*s'",
+        (int)h->pool_name_len, h->pool_name, verb, (int)cur_l, cur_n);
+    urs_add(rs, root_local);
+}
+
+static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
+                                     IRPathState *ps, Node *expr,
+                                     int line, UafReportSet *rs) {
+    if (!expr) return;
+    switch (expr->kind) {
+    case NODE_CALL:
+        ir_check_call_wrong_pool(zc, func, ps, expr, line, rs);
+        for (int i = 0; i < expr->call.arg_count; i++)
+            ir_check_expr_wrong_pool(zc, func, ps, expr->call.args[i],
+                                     line, rs);
+        break;
+    case NODE_FIELD:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->field.object, line, rs);
+        break;
+    case NODE_INDEX:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->index_expr.object,
+                                 line, rs);
+        ir_check_expr_wrong_pool(zc, func, ps, expr->index_expr.index,
+                                 line, rs);
+        break;
+    case NODE_UNARY:
+        if (expr->unary.op == TOK_AMP) break;
+        ir_check_expr_wrong_pool(zc, func, ps, expr->unary.operand, line, rs);
+        break;
+    case NODE_BINARY:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->binary.left, line, rs);
+        ir_check_expr_wrong_pool(zc, func, ps, expr->binary.right, line, rs);
+        break;
+    case NODE_ASSIGN:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->assign.target, line, rs);
+        ir_check_expr_wrong_pool(zc, func, ps, expr->assign.value, line, rs);
+        break;
+    case NODE_TYPECAST:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->typecast.expr, line, rs);
+        break;
+    case NODE_SLICE:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->slice.object, line, rs);
+        ir_check_expr_wrong_pool(zc, func, ps, expr->slice.start, line, rs);
+        ir_check_expr_wrong_pool(zc, func, ps, expr->slice.end, line, rs);
+        break;
+    case NODE_ORELSE:
+        ir_check_expr_wrong_pool(zc, func, ps, expr->orelse.expr, line, rs);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < expr->intrinsic.arg_count; i++)
+            ir_check_expr_wrong_pool(zc, func, ps, expr->intrinsic.args[i],
+                                     line, rs);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            ir_check_expr_wrong_pool(zc, func, ps,
+                                     expr->struct_init.fields[i].value,
+                                     line, rs);
+        break;
+    /* Leaf / non-expr kinds — exhaustive enumeration mirrors UAF walker. */
+    case NODE_IDENT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
@@ -1380,62 +1552,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
-        /* F3.1 (2026-05-03): struct value copy alias propagation.
-         * `State s2 = s1;` where State contains a Handle field — copy
-         * all COMPOUND handles registered under src local into equivalent
-         * compound handles under dest local with same alloc_id/state.
-         * Without this, freeing `s1.h` doesn't propagate to `s2.h` and
-         * UAF via `s2.h` goes undetected.
-         *
-         * Approach: scan ps->handles for entries with local_id = src and
-         * non-empty path. For each, ir_add_compound_handle on dst with
-         * same path/state/alloc_id. Propagating alloc_id makes free of
-         * s1.h naturally mark s2.h's alias-group via existing
-         * ir_propagate_alias_state mechanism.
-         *
-         * Snapshot handle indices before mutation since ir_add_compound_handle
-         * may realloc ps->handles. Two-pass: collect source compounds,
-         * then replicate. */
-        if (inst->dest_local >= 0 && inst->src1_local >= 0 &&
-            inst->dest_local != inst->src1_local) {
-            int src_local = inst->src1_local;
-            int dst_local = inst->dest_local;
-            int n = ps->handle_count;
-            int cap = n > 0 ? n : 1;
-            struct { const char *path; uint32_t plen; IRHandleState state;
-                     int alloc_line; int alloc_id; int source_color;
-                     bool is_thread_handle; } *srcs;
-            srcs = malloc((size_t)cap * sizeof(*srcs));
-            int sn = 0;
-            if (srcs) {
-                for (int hi = 0; hi < n; hi++) {
-                    IRHandleInfo *sh = &ps->handles[hi];
-                    if (sh->local_id == src_local && sh->path_len > 0) {
-                        srcs[sn].path = sh->path;
-                        srcs[sn].plen = sh->path_len;
-                        srcs[sn].state = sh->state;
-                        srcs[sn].alloc_line = sh->alloc_line;
-                        srcs[sn].alloc_id = sh->alloc_id;
-                        srcs[sn].source_color = sh->source_color;
-                        srcs[sn].is_thread_handle = sh->is_thread_handle;
-                        sn++;
-                    }
-                }
-                for (int si = 0; si < sn; si++) {
-                    IRHandleInfo *dh = ir_add_compound_handle(ps, dst_local,
-                        srcs[si].path, srcs[si].plen);
-                    if (dh) {
-                        dh->state = srcs[si].state;
-                        dh->alloc_line = srcs[si].alloc_line;
-                        dh->alloc_id = srcs[si].alloc_id;
-                        dh->source_color = srcs[si].source_color;
-                        dh->is_thread_handle = srcs[si].is_thread_handle;
-                    }
-                }
-                free(srcs);
-            }
-        }
-
         IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
         if (!src_h) break;
         /* Error if source is invalid */
@@ -1455,31 +1571,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         int src_alloc_id = src_h->alloc_id;
         int src_color = src_h->source_color;
         bool src_is_th = src_h->is_thread_handle;
-
-        /* F3.1 (2026-05-03): overwrite-alive detection. If the dest local
-         * already has a tracked handle in ALIVE state and the source's
-         * alloc_id differs (i.e., the dest is being overwritten by a
-         * DIFFERENT allocation), the previous allocation is leaked.
-         *
-         * Skip temp locals (e.g., _zer_or temps) — those are expected
-         * to be overwritten in orelse-decomposed code. Skip when src
-         * shares the same alloc_id (true alias propagation, not an
-         * overwrite). Skip when source isn't ALIVE (already-freed
-         * handle being reassigned isn't a leak). */
-        if (inst->dest_local < func->local_count &&
-            !func->locals[inst->dest_local].is_temp &&
-            src_state == IR_HS_ALIVE) {
-            IRHandleInfo *existing_dst = ir_find_handle(ps, inst->dest_local);
-            if (existing_dst &&
-                existing_dst->state == IR_HS_ALIVE &&
-                existing_dst->alloc_id != src_alloc_id) {
-                ir_zc_error(zc, inst->source_line,
-                    "handle %%%d overwritten while alive — previous "
-                    "allocation (line %d) leaked",
-                    inst->dest_local, existing_dst->alloc_line);
-            }
-        }
-
+        /* F3.2: propagate pool_name through alias copies so cross-pool
+         * detection works after orelse-decomposition (the orelse temp
+         * holds the alloc, then COPY transfers ownership to the named
+         * variable). */
+        const char *src_pool = src_h->pool_name;
+        uint32_t src_pool_len = src_h->pool_name_len;
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
             dst_h->state = src_state;
@@ -1487,6 +1584,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             dst_h->alloc_id = src_alloc_id;
             dst_h->source_color = src_color;
             dst_h->is_thread_handle = src_is_th;
+            dst_h->pool_name = src_pool;
+            dst_h->pool_name_len = src_pool_len;
         }
         break;
     }
@@ -1649,6 +1748,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->expr) {
             UafReportSet rs = {0};
             ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            UafReportSet pool_rs = {0};
+            ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
+                                     inst->source_line, &pool_rs);
+            free(pool_rs.ids);
             free(rs.ids);
         }
         break;
@@ -1734,6 +1837,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->expr) {
             UafReportSet rs = {0};
             ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            UafReportSet pool_rs = {0};
+            ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
+                                     inst->source_line, &pool_rs);
+            free(pool_rs.ids);
             free(rs.ids);
         }
 
@@ -1802,6 +1909,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (src_local >= 0) {
                     IRHandleInfo *src_h = ir_find_handle(ps, src_local);
                     if (src_h) {
+                        /* F3.2: snapshot pool_name before realloc-capable
+                         * ir_add_handle. */
+                        const char *s_pool = src_h->pool_name;
+                        uint32_t s_pool_len = src_h->pool_name_len;
                         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                         if (dst_h) {
                             dst_h->state = src_h->state;
@@ -1809,6 +1920,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             dst_h->alloc_id = src_h->alloc_id;
                             dst_h->source_color = src_h->source_color;
                             dst_h->is_thread_handle = src_h->is_thread_handle;
+                            dst_h->pool_name = s_pool;
+                            dst_h->pool_name_len = s_pool_len;
                         }
                     }
                 }
@@ -1950,6 +2063,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->alloc_line = inst->source_line;
                         h->alloc_id = inst->dest_local;
                         h->source_color = ZC_COLOR_POOL;
+                        /* F3.2: record source-level pool name for
+                         * cross-pool misuse detection at GET/FREE sites
+                         * (handled by ir_check_expr_wrong_pool walker). */
+                        ir_extract_pool_name(rhs, &h->pool_name,
+                                             &h->pool_name_len);
                     }
                     break;
                 } else if (mc == IRMC_ARENA_ALLOC) {
@@ -1978,6 +2096,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                     "use after free: local %%%d is %s (freed at line %d)",
                                     root_local, ir_state_name(h->state), h->free_line);
                             }
+                            /* F3.2: cross-pool misuse — handle came from
+                             * a different Pool/Slab than the receiver. */
+                            /* F3.2 wrong-pool check is centralized in
+                             * ir_check_expr_wrong_pool walker invoked
+                             * via the IR_ASSIGN entry. */
                         }
                     }
                     /* Fall through — dest may still need tracking if get result is pointer */
@@ -2175,6 +2298,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->expr) {
             UafReportSet rs = {0};
             ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            UafReportSet pool_rs = {0};
+            ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
+                                     inst->source_line, &pool_rs);
+            free(pool_rs.ids);
             free(rs.ids);
         }
         /* Phase D3/E: ThreadHandle.join() — mark thread as joined.
@@ -2283,6 +2410,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->alloc_line = inst->source_line;
                     h->alloc_id = inst->dest_local;
                     h->source_color = ZC_COLOR_POOL;
+                    /* F3.2: record source-level pool name for
+                     * cross-pool misuse detection at GET/FREE sites. */
+                    ir_extract_pool_name(inst->expr, &h->pool_name,
+                                         &h->pool_name_len);
                 }
                 break;
             }
@@ -2375,6 +2506,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 "freeing local %%%d which was already transferred",
                                 root_local);
                         }
+                        /* F3.2 wrong-pool check is centralized in
+                         * ir_check_expr_wrong_pool walker invoked at
+                         * the IR_CALL entry point below. */
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
@@ -2399,6 +2533,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             "use after free: local %%%d is %s (freed at line %d)",
                             root_local, ir_state_name(h->state), h->free_line);
                     }
+                    /* F3.2 wrong-pool check centralized in walker. */
                 }
                 break;
             }

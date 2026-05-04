@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// F3.2 Pattern 1: handle from pool_a used on pool_b — wrong-pool detection.
+// Different Pool(T,N) globals with the same T have separate slot arrays;
+// looking up a handle from pool_a in pool_b indexes into the wrong array.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void use_wrong() {
+    Handle(Task) h = pool_a.alloc() orelse return;
+    u32 v = pool_b.get(h).id;
+    pool_a.free(h);
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// F3.2 Pattern 1: handle from pool_a freed via pool_b — wrong-pool detection.
+// Calling pool_b.free(h) where h was allocated from pool_a corrupts pool_b's
+// free-list since the handle's index doesn't refer to a valid slot in pool_b.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void free_wrong() {
+    Handle(Task) h = pool_a.alloc() orelse return;
+    pool_b.free(h);
+}

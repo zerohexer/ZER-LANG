@@ -5,6 +5,116 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
+
+Closed Patterns 1 and 3 from the F3 leftovers documented in
+`docs/limitations.md`. With F3.1 (commit `ce1d82a`) having closed
+Patterns 2 and 4, all 4 narrow gaps from the deleted `test_zercheck.c`
+are now caught by zercheck_ir.
+
+### Pattern 1: wrong-pool detection (BUG-659)
+
+**Symptom**: `pool_a.alloc()` then `pool_b.get(h)` (or `pool_b.free(h)`)
+compiled clean. Two distinct `Pool(T,N)` globals have separate slot
+arrays — looking up a handle from one in the other indexes into the
+wrong array. zercheck.c had `pool_id` per HandleInfo + receiver-name
+comparison; zercheck_ir tracked nothing.
+
+**Fix**:
+1. Added `pool_name` / `pool_name_len` fields to `IRHandleInfo` (string
+   pointer into AST, valid for analysis lifetime).
+2. New `ir_extract_pool_name(call, &name, &len)` helper extracts the
+   bare-ident receiver from `pool.method()` calls.
+3. At `IRMC_ALLOC` / `IRMC_ALLOC_PTR` sites in IR_ASSIGN and IR_CALL
+   handlers, populate `pool_name` from the call's receiver.
+4. Propagated through alias paths: IR_COPY, the orelse-ident shortcut
+   in IR_ASSIGN. (Other alias propagators — @ptrcast, &-of, IR_CAST —
+   intentionally skip pool_name since those break the pool-handle
+   abstraction.)
+5. New walker `ir_check_expr_wrong_pool` mirrors `ir_check_expr_uaf`
+   recursion shape (NODE_FIELD/INDEX/CALL/etc.) and flags any embedded
+   `pool.get(h)` / `pool.free(h)` whose receiver name doesn't match
+   `h->pool_name`. Reuses `UafReportSet` for once-per-root dedup.
+6. Walker invoked at the same 3 IR sites as the UAF walker
+   (IR_INDEX_READ, IR_FIELD_READ-equivalent, IR_CALL).
+
+**Tests**:
+- `tests/zer_fail/wrong_pool_get.zer` — pool_a.alloc → pool_b.get(h).id
+- `tests/zer_fail/wrong_pool_free.zer` — pool_a.alloc → pool_b.free(h)
+
+Catches both the `NODE_FIELD` wrap (`pool_b.get(h).id`) and bare-
+statement form (`pool_b.free(h)`).
+
+### Pattern 3: free-then-realloc loop FALSE POSITIVE (BUG-660)
+
+**Symptom**: 
+```
+for (u32 i = 0; i < 10; i += 1) {
+    pool.free(h);
+    h = pool.alloc() orelse return;
+}
+```
+errored with "safety analysis did not converge within 32 iterations."
+This is a valid cycling pattern (release previous handle, acquire new
+one each iteration) and zercheck.c handled it fine.
+
+**Root cause**: `ir_merge_states` lattice was non-monotonic. Specifically,
+the case `rh->state == ALIVE && ph->state == MAYBE_FREED` fell through
+all the explicit cases and kept rh = ALIVE. Since merges start from
+`first_live` and join later predecessors in:
+- bb1 (entry, %1=ALIVE) joined with bb5 (back-edge, %1=MAYBE_FREED)
+  → result %1=ALIVE (wrong — should widen to MAYBE_FREED)
+- next iteration: %1 starts ALIVE, body re-runs, eventually some path
+  flips it to MAYBE_FREED again
+
+State oscillated ALIVE↔MAYBE_FREED across iterations and the fixed
+point never converged. Diagnosed by adding per-iteration trace to the
+convergence check and observing %1 / %2 alternating values across
+ITER 4/5/6/7/8.
+
+**Fix**: added the missing monotonic merge cases in `ir_merge_states`:
+```c
+} else if (rh->state == IR_HS_ALIVE && ph->state == IR_HS_MAYBE_FREED) {
+    rh->state = IR_HS_MAYBE_FREED;
+    rh->free_line = ph->free_line;
+} else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_MAYBE_FREED) {
+    rh->state = IR_HS_MAYBE_FREED;
+}
+```
+The lattice is now monotonic: any pair containing MAYBE_FREED widens
+to MAYBE_FREED. Pre-existing `FREED + MAYBE_FREED` already widened
+correctly; only the ALIVE/TRANSFERRED + MAYBE_FREED cases were missing.
+
+**Test**: `tests/zer/free_realloc_loop.zer` — must compile + run.
+
+### Why this took longer than expected
+
+Initial diagnosis assumed a single-line "missing case" but it took
+adding diagnostic output to the convergence loop to identify which
+specific lattice pair was wrong. The instrumentation showed:
+```
+ITER 4 bb3: %1 state=3 (MAYBE_FREED)
+ITER 5 bb3: %1 state=1 (ALIVE)        ← non-monotonic!
+ITER 6 bb3: %1 state=1 (ALIVE)
+ITER 7 bb3: %1 state=3 (MAYBE_FREED)  ← oscillation
+```
+
+The `ALIVE+MAYBE_FREED` case was the only gap; `MAYBE_FREED+ALIVE`
+was already handled correctly because `first_live`'s MAYBE_FREED stays
+when joining with anything (no fall-through case overrides it).
+
+### Net change
+
+- `zercheck_ir.c`: +156 LOC (struct field + helper + walker + 3
+  invocations + 2 alias-propagation hooks + 2 lattice cases)
+- `tests/zer_fail/`: +2 files
+- `tests/zer/`: +1 file
+- Tests: 538 → 541 (+3)
+
+All ~2,089 tests still passing.
+
+---
+
 ## Session 2026-05-03 — Phase F Migration: zercheck.c → zercheck_ir.c COMPLETE
 
 Massive session: brought zercheck_ir.c to full production parity with

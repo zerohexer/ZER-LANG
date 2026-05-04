@@ -1,0 +1,22 @@
+// F3.2 Pattern 3: free-then-realloc inside a loop is a valid cycling
+// pattern (e.g., processing items where each iteration releases the
+// previous handle and acquires a new one). zercheck_ir's fixed-point
+// must converge — pre-fix this triggered a false-positive
+// "did not converge within 32 iterations" error.
+
+struct Task { u32 id; }
+Pool(Task, 8) pool;
+
+void cycle() {
+    Handle(Task) h = pool.alloc() orelse return;
+    for (u32 i = 0; i < 10; i += 1) {
+        pool.free(h);
+        h = pool.alloc() orelse return;
+    }
+    pool.free(h);
+}
+
+i32 main() {
+    cycle();
+    return 0;
+}

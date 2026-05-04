@@ -77,48 +77,39 @@ silently dropped on IR path (deferred 2026-05-02)") — kept in original
 location to preserve the more detailed analysis added in the
 2026-05-02 fix session.
 
-## OPEN — 4 narrow zercheck patterns not in zercheck_ir (Phase F3 leftover)
+## ~~4 narrow zercheck patterns not in zercheck_ir~~ (FIXED 2026-05-04, Phase F3.2)
 
-**Discovered:** 2026-05-03 Phase F3 audit. Documented when
-`test_zercheck.c` was deleted.
+**Originally discovered:** 2026-05-03 Phase F3 audit when `test_zercheck.c`
+was deleted. **All four patterns now caught by zercheck_ir.**
 
-When test_zercheck.c was migrated to use zercheck_ir (via shim), 4 of
-54 narrow unit-test patterns failed. Each represents a real safety
-issue zercheck.c caught that zercheck_ir doesn't:
+Pattern 2 (direct overwrite leak) and Pattern 4 (struct copy alias UAF)
+were fixed in commit `ce1d82a` (Phase F3.1, 2026-05-03):
+- IR_COPY handler detects overwrite-while-alive on non-temp dest
+- Compound handles propagate through struct value copies (two-pass
+  collect + replicate, survives ir_add_compound_handle realloc)
 
-1. **Wrong pool detection** — `pool_a.alloc()` then `pool_b.get(h)`.
-   IR doesn't track which pool a handle came from. zercheck.c had
-   `pool_id` per HandleInfo. Niche pattern (most ZER programs use one
-   pool per type via `Task.alloc()` auto-slabs).
+Pattern 1 (wrong pool detection) and Pattern 3 (free-then-realloc loop
+FALSE POSITIVE) were fixed in this session (2026-05-04):
 
-2. **Direct overwrite leak** — `Handle h = pool.alloc(); h = pool.alloc();`
-   without freeing first. IR's IRMC_ALLOC overwrite check fires only
-   at the call site (TMP local), not at the assign-back (`h = ...`).
-   `orelse return` decomposition in particular makes the alloc dest
-   a temp; the assign to `h` later isn't checked for overwrite.
+**Pattern 1**: added `pool_name`/`pool_name_len` fields to `IRHandleInfo`,
+captured at alloc sites via `ir_extract_pool_name`, propagated through
+COPY and orelse-ident alias paths. New `ir_check_expr_wrong_pool` walker
+mirrors `ir_check_expr_uaf` recursion shape and flags GET/FREE calls
+where receiver name differs from the handle's recorded pool. Catches
+both `pool_b.get(h).id` (NODE_FIELD wrapping) and bare-statement
+`pool_b.free(h)`. ~120 LOC.
 
-3. **Free-then-realloc in loop (FALSE POSITIVE)** — convergence loop
-   doesn't stabilize on `for { pool.free(h); h = pool.alloc(); }`.
-   Errors with "did not converge within 32 iterations." Real bug —
-   would affect any user writing this idiom.
+**Pattern 3 root cause**: `ir_merge_states` was missing the
+`ALIVE + MAYBE_FREED → MAYBE_FREED` case. The lattice was non-monotonic:
+when `first_live` had ALIVE and a later pred had MAYBE_FREED, the join
+fell through and kept ALIVE. Result: state oscillated ALIVE↔MAYBE_FREED
+across loop iterations and the fixed point never converged. Fix added
+the missing case (and the symmetric TRANSFERRED + MAYBE_FREED). ~6 LOC.
 
-4. **Struct copy alias UAF** — `State s2 = s1; tasks.free(s1.h);
-   tasks.get(s2.h);`. IR doesn't propagate `alloc_id` through struct
-   value copies, so `s2.h` and `s1.h` aren't aliased and freeing one
-   doesn't mark the other.
-
-**Status:** None of these patterns appear in current real-code tests
-(verified via grep across tests/zer/, rust_tests/, test_modules/,
-zig_tests/). They were narrow unit tests of zercheck.c-specific
-algorithms.
-
-**Estimated fix effort:** ~8-15 hrs combined (each is 30-100 LOC port
-from zercheck.c history).
-
-**When to fix:** if a real user program triggers any of these. The
-patterns are catalogued here so the failure is recognized as a known
-gap rather than a fresh bug. Port from git history of zercheck.c
-(commit `7ffbd9d^` and earlier).
+**Tests** (added 2026-05-04):
+- `tests/zer_fail/wrong_pool_get.zer` — must reject pool_b.get(h)
+- `tests/zer_fail/wrong_pool_free.zer` — must reject pool_b.free(h)
+- `tests/zer/free_realloc_loop.zer` — must compile + run cleanly
 
 ---
 

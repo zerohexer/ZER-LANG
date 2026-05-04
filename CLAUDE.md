@@ -1845,7 +1845,8 @@ The original 3128-line AST analyzer is DELETED.
 - `zer_lsp.c`, `test_firmware_patterns*.c`, `test_production.c` — call
   `zercheck_run` (the shim)
 - `test_zercheck.c` — DELETED (was unit tests for the 3128-line analyzer;
-  4 of 54 narrow patterns failed under IR; not production-relevant)
+  4 of 54 narrow patterns originally failed under IR — all 4 closed in
+  Phase F3.1 + F3.2, see BUGS-FIXED.md 2026-05-03 / 2026-05-04)
 
 **For fresh sessions:**
 - DO NOT add new safety analysis to `zercheck.c` — it's a shim.
@@ -1902,10 +1903,12 @@ main analysis on the collected IRFuncs — NOT re-lowering, just analyzing.
   production path, or extend the shim for backward-compat callers.
 - The 4 narrow patterns test_zercheck.c covered (pool_a-vs-pool_b alias,
   direct overwrite leak, free-then-realloc loop, struct copy alias UAF)
-  are NOT in zercheck_ir today. They were narrow unit-test patterns that
-  don't appear in real ZER programs. If you find a real-world program
-  hitting them, port the check from git history of zercheck.c to
-  zercheck_ir.c.
+  ARE NOW IN zercheck_ir as of Phase F3.1 + F3.2 (2026-05-03/04). The
+  fixes added: IR_COPY overwrite detection, struct-copy alloc_id
+  propagation, `pool_name` field on `IRHandleInfo` + wrong-pool walker,
+  and `ALIVE+MAYBE_FREED → MAYBE_FREED` merge case for monotonic lattice
+  convergence. Tests in `tests/zer_fail/wrong_pool_*.zer` and
+  `tests/zer/free_realloc_loop.zer`.
 
 **Critical IR lowering fact (Phase 8d, per ir_lower.c:84):**
 `IR_POOL_ALLOC` / `IR_SLAB_ALLOC` / `IR_POOL_FREE` / etc. enum values exist

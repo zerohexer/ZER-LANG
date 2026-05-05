@@ -5,6 +5,120 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-05-05 — Gap 38 closure + baremetal preamble portability
+
+Two distinct findings landed in this session: a UAF/double-free silent
+gap in zercheck_ir (Gap 38 from the 4-27-2026 roadmap) and two
+freestanding-target regressions in the runtime preamble surfaced by a
+parallel baremetal audit.
+
+### BUG-661 (Gap 38): function-return Handle bypassed zercheck_ir
+
+**Symptom:** A handle obtained via a wrapper function (any `?Handle(T)`
+or `Handle(T)` return type, not just direct `pool.alloc()`) was not
+registered as ALIVE in the caller. Subsequent `heap.free(a); heap.free(a);`
+compiled silently — no UAF, no double-free, both checks bypassed.
+Reproducer:
+```zer
+?Handle(Task) get_handle() { return heap.alloc(); }
+void main() {
+    ?Handle(Task) mh = get_handle();
+    Handle(Task) a = mh orelse return;
+    heap.free(a);
+    heap.free(a);   // SILENT — should error
+}
+```
+
+**Root cause:** `zercheck_ir.c:2604-2613` (summary path of IR_CALL)
+checked `is_ptr_return` only for `TYPE_POINTER` and `TYPE_OPAQUE` (and
+optional inner of those). `TYPE_HANDLE` and `?TYPE_HANDLE` returns were
+ignored, so `dest_local` had no `IRHandleInfo` and the orelse-ident
+shortcut at `IR_ASSIGN` couldn't alias `a` either.
+
+**Fix:** added `TYPE_HANDLE` to `is_ptr_return` in the summary path,
+GATED on `summary->returns_color == ZC_COLOR_POOL || == ZC_COLOR_MALLOC`
+(known allocators). `ZC_COLOR_UNKNOWN` Handle returns are NOT
+registered — those are accessor/transfer wrappers (e.g., `pop_free()`
+from a global queue) where the optional may legitimately be null and
+the caller can't be assumed to own the result. The no-summary fallback
+path (line 2647-2655) leaves Handle alone for the same reason.
+
+**Follow-on regression:** registering `mh` ALIVE caused
+`tests/zer/super_freelist.zer` AND `test_modules/handle_user.zer` to
+fail with false-positive leak errors. The first was correct (the user
+relied on the bug). The second exposed a missing capability:
+`defer device_destroy(h)` where `device_destroy` is a user wrapper
+around `pool.free(h)` was not detected as freeing the handle — the
+defer-body scanner (`ir_defer_free_arg`) only recognized direct
+builtin/cstdlib free names.
+
+**Defer scanner extension:** added FuncSummary consultation in
+`ir_defer_scan_frees`. When the defer body is `NODE_EXPR_STMT` wrapping
+`NODE_CALL`, look up the callee's `FuncSummary->frees_param[i]`. For
+each `i` where `frees_param[i]` is set, mark `args[i]` FREED via the
+same compound-key + alias-propagation path as the direct-free case.
+Mirrors the existing IR_CALL FuncSummary apply path.
+
+**Tests added:**
+- `tests/zer_fail/gap38_func_return_handle_dfree.zer` (must reject)
+- `tests/zer/gap38_func_return_handle_ok.zer` (must compile + run)
+
+**Files:** zercheck_ir.c (~80 LOC: 2 sites in IR_CALL summary path,
+1 new block in `ir_defer_scan_frees`).
+
+### BUG-662: runtime preamble unguarded pthread types broke freestanding
+
+**Symptom:** Compiling any ZER program for true freestanding (cross
+toolchain like `arm-none-eabi-gcc -ffreestanding`, or `gcc
+-D__STDC_HOSTED__=0`) failed with errors like
+`'pthread_mutex_t' undeclared` and `'PTHREAD_MUTEX_RECURSIVE'
+undeclared`. The `#include <pthread.h>` was correctly gated on
+`__STDC_HOSTED__` (emitter.c:4444-4447) but the helpers
+`_zer_mtx_ensure_init_cv` and `_zer_mtx_ensure_init` (defined right
+below at lines 4564-4583) referenced `pthread_mutex_t *`,
+`pthread_cond_t *`, `pthread_mutexattr_*` and `PTHREAD_MUTEX_RECURSIVE`
+in their parameter types and bodies — emitted unconditionally.
+
+**Root cause:** the helpers landed before the `#if __STDC_HOSTED__`
+block that wraps the rest of the threading primitives (barrier,
+semaphore). Pre-existing tests exercised them only in hosted mode
+where `pthread.h` is always included.
+
+**Fix:** wrapped the two helper definitions in
+`#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ ... #endif`. Shared
+struct call sites are already hosted-only by virtue of containing
+`pthread_mutex_t` fields, so the helpers are only ever needed when
+hosted anyway.
+
+### BUG-663: `_zer_trap` assumed hosted-x86 or libc-abort fallback
+
+**Symptom:** the `_zer_trap` runtime helper had per-arch traps for ARM,
+RISC-V, AVR, and x86 — but on x86 it always emitted
+`fprintf(stderr, ...)` followed by `int3`, and the `#else` fallback
+for any other arch emitted `fprintf(stderr, ...)` followed by `abort()`.
+Both `fprintf`/`stderr` and `abort()` need libc, so any freestanding
+build that hit the trap function would fail at link time.
+
+**Root cause:** the trap was originally written assuming hosted Linux
+or hosted Windows. Cross-compiled freestanding x86 (kernel mode, EFI
+applications) or any non-{ARM,RISC-V,AVR,x86} freestanding target
+(MIPS, PowerPC, SPARC, custom ISA) was silently broken.
+
+**Fix:** restructured the helper to:
+- emit the diagnostic `fprintf` only inside
+  `#if __STDC_HOSTED__` (skipped on freestanding via `(void)msg; ...`).
+- emit a per-arch trap instruction unconditionally (bkpt/ebreak/break/int3).
+- replace the `#else` libc fallback with `abort()` on hosted /
+  `__builtin_trap()` on freestanding so the program halts on any
+  target.
+
+**Verification:** `gcc -ffreestanding -D__STDC_HOSTED__=0 -c bm.c`
+on the trivial `void main(){ return 42; }` program now compiles cleanly
+where it previously failed with pthread type errors. Existing 543
+hosted ZER integration tests + 784 Rust + 36 Zig tests still pass.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

@@ -1,0 +1,31 @@
+// Gap 38 follow-on: defer through user wrapper around pool.free now
+// recognized via FuncSummary frees_param. Handle obtained via wrapper
+// function and freed via wrapper-defer must not flag as leak.
+// See zercheck_ir.c:ir_defer_scan_frees FuncSummary apply.
+
+struct Device { u32 id; }
+Pool(Device, 4) device_pool;
+
+?Handle(Device) device_create(u32 id) {
+    ?Handle(Device) mh = device_pool.alloc();
+    Handle(Device) h = mh orelse return;
+    device_pool.get(h).id = id;
+    return mh;
+}
+
+void device_destroy(Handle(Device) h) {
+    device_pool.free(h);
+}
+
+u32 device_get_id(Handle(Device) h) {
+    return h.id;
+}
+
+u32 main() {
+    ?Handle(Device) mh = device_create(42);
+    Handle(Device) h = mh orelse return;
+    defer device_destroy(h);   // free through wrapper — leak detection must follow
+    u32 id = device_get_id(h);
+    if (id != 42) { return 2; }
+    return 0;
+}

@@ -4606,31 +4606,55 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    return 0;\n");
     emit(e, "}\n\n");
 
-    /* ZER trap — called on safety violations (use-after-free, bounds, etc.) */
+    /* ZER trap — called on safety violations (use-after-free, bounds, etc.).
+     *
+     * Baremetal audit (2026-05-05): two paths needed runtime portability —
+     *   (a) x86 trap printed via fprintf + int3 — fprintf is hosted-only
+     *       so a freestanding x86 build (kernel, EFI app) failed to link.
+     *   (b) The "unknown architecture" fallback used fprintf + abort()
+     *       unconditionally. On any non-{ARM,RISC-V,AVR,x86} freestanding
+     *       target (PowerPC, MIPS, SPARC, custom ISA) link fails.
+     * Resolution: per-arch instruction is emitted unconditionally;
+     * fprintf+abort is only emitted on hosted targets via __STDC_HOSTED__.
+     * Generic freestanding fallback uses __builtin_trap() so user code
+     * still halts on a violation. */
     emit(e, "static void _zer_trap(const char *msg, const char *file, int line) {\n");
-    emit(e, "#if defined(__arm__) || defined(__thumb__)\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
+    emit(e, "#else\n");
     emit(e, "    (void)msg; (void)file; (void)line;\n");
+    emit(e, "#endif\n");
+    emit(e, "#if defined(__arm__) || defined(__thumb__)\n");
     emit(e, "    __asm__ volatile(\"bkpt #0\"); for(;;) {}\n");
     emit(e, "#elif defined(__riscv)\n");
-    emit(e, "    (void)msg; (void)file; (void)line;\n");
     emit(e, "    __asm__ volatile(\"ebreak\"); for(;;) {}\n");
     emit(e, "#elif defined(__AVR__)\n");
-    emit(e, "    (void)msg; (void)file; (void)line;\n");
     emit(e, "    __asm__ volatile(\"break\"); for(;;) {}\n");
     emit(e, "#elif defined(__x86_64__) || defined(__i386__)\n");
-    emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
     emit(e, "    __asm__ volatile(\"int3\");\n");
-    emit(e, "#else\n");
-    emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
+    emit(e, "#elif defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
     emit(e, "    abort();\n");
+    emit(e, "#else\n");
+    emit(e, "    __builtin_trap();\n");
     emit(e, "#endif\n");
     emit(e, "}\n\n");
 
     /* ZER shared struct auto-locking — BUG-473: use recursive mutex.
      * Recursive mutex handles re-entrant locking when function A calls
      * function B that also auto-locks the same shared struct.
-     * Lazy init: first lock call initializes with PTHREAD_MUTEX_RECURSIVE. */
+     * Lazy init: first lock call initializes with PTHREAD_MUTEX_RECURSIVE.
+     *
+     * Baremetal audit (2026-05-05): pthread_mutex_t / pthread_cond_t are
+     * only available when the pthread.h include above (gated on
+     * __STDC_HOSTED__) brings them in. On true freestanding (-nostdinc
+     * or a cross toolchain without pthread headers) the helper bodies
+     * fail to parse. shared struct itself already contains pthread_*
+     * fields and so is hosted-only by design — but the helper
+     * declarations were emitted unconditionally and broke any program
+     * compiled freestanding. Gate them on __STDC_HOSTED__ to match the
+     * include + thread barrier blocks. */
     emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
     /* BUG-483: accept optional condvar pointer — init alongside mutex in CAS winner.
      * Fixes race where condvar init after ensure_init was always false. */
     emit(e, "static inline void _zer_mtx_ensure_init_cv(pthread_mutex_t *mtx, uint8_t *inited, pthread_cond_t *cond) {\n");
@@ -4652,7 +4676,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "}\n");
     emit(e, "static inline void _zer_mtx_ensure_init(pthread_mutex_t *mtx, uint8_t *inited) {\n");
     emit(e, "    _zer_mtx_ensure_init_cv(mtx, inited, NULL);\n");
-    emit(e, "}\n\n");
+    emit(e, "}\n");
+    emit(e, "#endif /* __STDC_HOSTED__ */\n\n");
 
     /* ZER thread barrier — portable (mutex + condvar, like Rust) */
     emit(e, "/* ZER thread barrier */\n");

@@ -1,0 +1,17 @@
+// Gap 38 (2026-05-05): function-return Handle/?Handle was bypassing
+// zercheck_ir tracking. Double-free of a handle obtained via a wrapper
+// function compiled silently. Fixed by registering dest as ALIVE in
+// IR_CALL when summary->returns_color is POOL/MALLOC.
+// See zercheck_ir.c:summary_non_arena handler.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+?Handle(Task) get_handle() { return heap.alloc(); }
+
+void main() {
+    ?Handle(Task) mh = get_handle();
+    Handle(Task) a = mh orelse return;
+    heap.free(a);
+    heap.free(a);   // EXPECTED: double-free error
+}

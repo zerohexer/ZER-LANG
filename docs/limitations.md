@@ -5,6 +5,44 @@ Entries removed once fixed.
 
 ---
 
+## ~~Gap 38 — function-return Handle bypassed zercheck_ir~~ (FIXED 2026-05-05)
+
+`zercheck_ir.c` IR_CALL summary path didn't include `TYPE_HANDLE` /
+`?TYPE_HANDLE` in its `is_ptr_return` check, so any wrapper function
+returning a handle (`?Handle(T) get_handle() { return heap.alloc(); }`)
+left the caller's local untracked. Subsequent double-free was silent.
+
+Fixed by extending the check, gated on `summary->returns_color` being
+a known allocator (`POOL`/`MALLOC`) so accessor/transfer wrappers like
+`pop_free()` from a global queue don't misfire as leaks. The
+defer-body scanner was simultaneously extended to consult FuncSummary
+`frees_param[i]` so user free-wrappers (`defer device_destroy(h)` →
+`pool.free(h)`) propagate FREED through the alias-id chain.
+
+Tests: `tests/zer_fail/gap38_func_return_handle_dfree.zer`,
+`tests/zer/gap38_func_return_handle_ok.zer`. See BUGS-FIXED.md
+"BUG-661" for the full session entry.
+
+## ~~Runtime preamble unguarded pthread types broke freestanding~~ (FIXED 2026-05-05)
+
+`emitter.c:4564-4583` defined `_zer_mtx_ensure_init_cv` and
+`_zer_mtx_ensure_init` referencing `pthread_mutex_t *`,
+`pthread_cond_t *`, and `PTHREAD_MUTEX_RECURSIVE` outside any
+`__STDC_HOSTED__` guard. `gcc -ffreestanding -D__STDC_HOSTED__=0`
+failed with `'pthread_mutex_t' undeclared`. Wrapped the helper
+definitions in the same hosted guard already used for the include and
+the thread barrier block. See BUGS-FIXED.md "BUG-662".
+
+## ~~`_zer_trap` libc-abort fallback broke freestanding~~ (FIXED 2026-05-05)
+
+`_zer_trap` always emitted `fprintf(stderr,...)` and used `abort()` in
+the unknown-arch fallback. Both need libc, so freestanding x86 (kernel
+mode, EFI apps) or freestanding non-{ARM,RISC-V,AVR,x86} (MIPS,
+PowerPC, SPARC, custom) failed to link. Restructured: the diagnostic
+print is gated on `__STDC_HOSTED__`, per-arch trap instructions emit
+unconditionally, and the `#else` fallback uses `__builtin_trap()` on
+freestanding. See BUGS-FIXED.md "BUG-663".
+
 ## ~~`@once` lacks `__STDC_HOSTED__` guard~~ (FIXED 2026-05-02, commit `664b211`)
 
 Wrapped atomic emission in `#if __STDC_HOSTED__` with a non-atomic

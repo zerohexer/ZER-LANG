@@ -1264,6 +1264,57 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         }
     }
 
+    /* Gap 38 follow-on (2026-05-05): `defer device_destroy(h)` where
+     * device_destroy is a user wrapper around `pool.free(h)`. Without
+     * this, registering a function-return Handle as ALIVE (Gap 38 fix
+     * above) caused false-positive leaks because the defer scanner
+     * didn't recognize the user wrapper as a free. Consult FuncSummary's
+     * frees_param[i] to mark args[i] FREED through user free-wrappers.
+     * Mirrors the IR_CALL FuncSummary apply path. */
+    if (zc && body && body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
+        body->expr_stmt.expr->kind == NODE_CALL) {
+        Node *call = body->expr_stmt.expr;
+        const char *fn_name = NULL;
+        uint32_t fn_name_len = 0;
+        if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
+            fn_name = call->call.callee->ident.name;
+            fn_name_len = (uint32_t)call->call.callee->ident.name_len;
+        }
+        if (fn_name && fn_name_len > 0) {
+            FuncSummary *summary = NULL;
+            for (int si = 0; si < zc->summary_count; si++) {
+                if (zc->summaries[si].func_name_len == fn_name_len &&
+                    memcmp(zc->summaries[si].func_name, fn_name,
+                           fn_name_len) == 0) {
+                    summary = &zc->summaries[si]; break;
+                }
+            }
+            if (summary && summary->frees_param) {
+                int npar = summary->param_count;
+                if (npar > call->call.arg_count) npar = call->call.arg_count;
+                for (int pi = 0; pi < npar; pi++) {
+                    if (!summary->frees_param[pi]) continue;
+                    Node *arg = call->call.args[pi];
+                    int root_local;
+                    const char *path;
+                    uint32_t path_len;
+                    if (ir_extract_compound_key(zc, func, arg,
+                                                 &root_local, &path, &path_len) != 0)
+                        continue;
+                    IRHandleInfo *h;
+                    if (path_len == 0) h = ir_find_handle(ps, root_local);
+                    else h = ir_find_compound_handle(ps, root_local, path, path_len);
+                    if (h && (h->state == IR_HS_ALIVE ||
+                              h->state == IR_HS_MAYBE_FREED)) {
+                        h->state = IR_HS_FREED;
+                        h->free_line = defer_line;
+                        ir_propagate_alias_state(ps, h, IR_HS_FREED, defer_line);
+                    }
+                }
+            }
+        }
+    }
+
     /* Recurse into block AND nested control-flow bodies (BUG-608).
      * Conservative: any reachable free inside defer marks handle FREED.
      * Misses some conditional-free double-detect but prevents false
@@ -2636,13 +2687,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret = checker_get_type(zc->checker, inst->expr);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
+                /* Gap 38 (2026-05-05): TYPE_HANDLE returns must register the
+                 * dest as ALIVE so subsequent free()/double-free are tracked.
+                 * Without this, `?Handle(Task) mh = wrapper();` followed by
+                 * two `heap.free(h)` calls compiled silently.
+                 *
+                 * Restriction: only when summary->returns_color is a
+                 * KNOWN allocator (POOL/MALLOC). UNKNOWN-color funcs are
+                 * accessor/transfer wrappers (e.g., `pop_free()` from a
+                 * global queue) where the optional may legitimately be
+                 * null and the caller can't be assumed to own the result.
+                 * Pointer returns (TYPE_POINTER/OPAQUE) keep their
+                 * pre-existing conservative registration regardless of
+                 * color, mirroring zercheck.c:786-808. */
+                bool color_is_allocator = summary &&
+                    (summary->returns_color == ZC_COLOR_POOL ||
+                     summary->returns_color == ZC_COLOR_MALLOC);
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
                                 ret_eff->kind == TYPE_OPAQUE))
+                    is_ptr_return = true;
+                if (ret_eff && ret_eff->kind == TYPE_HANDLE && color_is_allocator)
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
                                   inner->kind == TYPE_OPAQUE))
+                        is_ptr_return = true;
+                    if (inner && inner->kind == TYPE_HANDLE && color_is_allocator)
                         is_ptr_return = true;
                 }
                 if (is_ptr_return) {
@@ -2678,6 +2749,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret = checker_get_type(zc->checker, call);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
+                /* No-summary path: only register POINTER/OPAQUE returns as
+                 * ALIVE. Handle/?Handle without a summary means we can't
+                 * tell if the function allocates (vs. forwards an existing
+                 * handle from a global queue). The summary path above
+                 * gates on returns_color == POOL/MALLOC; without a summary
+                 * we have no signal at all, so register nothing. */
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
                                 ret_eff->kind == TYPE_OPAQUE))
                     is_ptr_return = true;

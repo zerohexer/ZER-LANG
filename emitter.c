@@ -10159,7 +10159,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
             emit(e, "_zer_bb%d:;\n", bb->id);
         }
         for (int ii = 0; ii < bb->inst_count; ii++) {
-            /* Audit-fix (2026-05-03): mirror the regular-IR path's auto-guard
+            /* Audit-fix (2026-05-03/06): mirror the regular-IR path's auto-guard
              * emission. Without this, async functions silently miscompiled
              * unproven `arr[i]` accesses — the warning claimed an auto-guard
              * was inserted, but the async emission loop only called

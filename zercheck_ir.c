@@ -1689,12 +1689,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 ir_state_name(src_h->state), inst->src1_local);
         }
         /* UAF GUARD: snapshot fields before realloc-capable add (mirror of
-         * IR_COPY fix above). */
+         * IR_COPY fix above).
+         *
+         * Gap A4 (2026-05-06): also propagate pool_name through IR_CAST so
+         * F3.2 wrong-pool detection works after C-style cast aliases (e.g.,
+         * `*Task t = (*Task)opaque_handle`). Pre-fix: IR_COPY propagated
+         * pool_name (F3.2) but IR_CAST didn't, leaving a silent gap where
+         * cross-pool misuse through cast alias was missed. */
         IRHandleState cast_state = src_h->state;
         int cast_alloc_line = src_h->alloc_line;
         int cast_alloc_id = src_h->alloc_id;
         int cast_color = src_h->source_color;
         bool cast_escaped = src_h->escaped;
+        const char *cast_pool = src_h->pool_name;
+        uint32_t cast_pool_len = src_h->pool_name_len;
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
             dst_h->state = cast_state;
@@ -1702,6 +1710,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             dst_h->alloc_id = cast_alloc_id;
             dst_h->source_color = cast_color;
             dst_h->escaped = cast_escaped;
+            dst_h->pool_name = cast_pool;
+            dst_h->pool_name_len = cast_pool_len;
         }
         break;
     }
@@ -1848,6 +1858,53 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
                 else break;
             }
+
+            /* Gap A3 (2026-05-06): move-struct field-read transfers ownership.
+             *
+             * `Tok t = b.inner` where b.inner is a move struct:
+             * - lowers to IR_FIELD_READ %t1 = b.inner; IR_COPY first = %t1
+             * - the source compound (b, ".inner") MUST be marked TRANSFERRED
+             *   so subsequent &b.inner / b.inner reads = use-after-move.
+             *
+             * Pre-fix: only NODE_INDEX move-from-array-element was handled
+             * (in IR_ASSIGN's NODE_INDEX branch). Field-read move-transfer
+             * was silently dropped → `Tok t = b.inner; use(&b.inner)`
+             * compiled clean → silent UAM.
+             *
+             * Hosted + baremetal: silent UAM (struct copy in C makes b.inner
+             * still readable but logically invalid).
+             *
+             * Conditions: dest local exists and has move-tracking type, and
+             * the read is from a compound (path_len > 0) location. */
+            if (inst->dest_local >= 0 &&
+                inst->dest_local < func->local_count) {
+                Type *dest_type = func->locals[inst->dest_local].type;
+                if (ir_should_track_move(dest_type)) {
+                    int root_local;
+                    const char *path;
+                    uint32_t path_len;
+                    if (ir_extract_compound_key(zc, func, inst->expr,
+                                                 &root_local, &path,
+                                                 &path_len) == 0 &&
+                        path_len > 0) {
+                        IRHandleInfo *ch = ir_find_compound_handle(ps,
+                            root_local, path, path_len);
+                        if (ch && ch->state == IR_HS_TRANSFERRED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use after move: '%.*s' on local %%%d "
+                                "ownership transferred at line %d",
+                                (int)path_len, path, root_local,
+                                ch->free_line);
+                        }
+                        if (!ch) ch = ir_add_compound_handle(ps, root_local,
+                                                              path, path_len);
+                        if (ch) {
+                            ch->state = IR_HS_TRANSFERRED;
+                            ch->free_line = inst->source_line;
+                        }
+                    }
+                }
+            }
         }
         break;
     }
@@ -1952,6 +2009,37 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
             }
+
+            /* Gap A2 (2026-05-06): move-struct field-write transfers ownership.
+             *
+             * `b.field = t` where t is a move struct (or contains move fields)
+             * must mark t as TRANSFERRED. Subsequent use of t = use-after-move.
+             *
+             * Pre-fix the dead IR_FIELD_WRITE handler at line ~2882 had this
+             * logic, but ir_lower.c never emits IR_FIELD_WRITE — `obj.field=val`
+             * lowers to IR_ASSIGN with inst->expr=NODE_ASSIGN (passthrough).
+             * The actual safety logic must live here, not in the dead handler.
+             *
+             * Hosted + baremetal: silent UAM (the C `b.field = t` does a struct
+             * copy; t's bytes are still readable but represent stale state). */
+            if (target_expr && rhs_local >= 0 && rhs_local < func->local_count &&
+                (target_expr->kind == NODE_FIELD ||
+                 target_expr->kind == NODE_INDEX)) {
+                Type *rhs_type = func->locals[rhs_local].type;
+                if (ir_should_track_move(rhs_type)) {
+                    IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+                    if (rh && ir_is_invalid(rh)) {
+                        ir_zc_error(zc, inst->source_line,
+                            "use of %s value (local %%%d) in field/index write",
+                            ir_state_name(rh->state), rhs_local);
+                    }
+                    if (!rh) rh = ir_add_handle(ps, rhs_local);
+                    if (rh) {
+                        rh->state = IR_HS_TRANSFERRED;
+                        rh->free_line = inst->source_line;
+                    }
+                }
+            }
         }
         /* Phase E: recognize pool/slab builtin method calls in the RHS.
          * Handled shapes:
@@ -2002,8 +2090,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * where arr is Token[N] and Token is a move struct transfers
              * ownership from arr[0]. Register compound handle (arr, "[0]")
              * as TRANSFERRED; subsequent access to arr[0] triggers UAF.
-             * Only handles literal-index (NODE_INT_LIT) compound keys. */
-            if (rhs && rhs->kind == NODE_INDEX &&
+             * Only handles literal-index (NODE_INT_LIT) compound keys.
+             *
+             * Gap A3 (2026-05-06): also covers NODE_FIELD — `Tok t = b.inner`
+             * where b.inner is a move struct field. Pre-fix: only NODE_INDEX
+             * was handled; field-read move-transfer was silently dropped, so
+             * `Tok t = b.inner; use(&b.inner)` compiled clean → silent UAM
+             * (struct copy in C makes b.inner still readable but logically
+             * invalid). Hosted + baremetal both miss the violation. */
+            if (rhs && (rhs->kind == NODE_INDEX || rhs->kind == NODE_FIELD) &&
                 inst->dest_local >= 0 &&
                 inst->dest_local < func->local_count &&
                 ir_should_track_move(func->locals[inst->dest_local].type)) {
@@ -2452,6 +2547,39 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     ir_should_track_move(target_type);
                 bool root_is_move = ir_should_track_move(arg_type);
                 if (!target_is_move && !root_is_move) continue;
+
+                /* Gap A3 follow-up (2026-05-06): when target is a compound
+                 * (b.inner, arr[0].field), check the compound handle FIRST
+                 * — if it was already marked TRANSFERRED by an earlier
+                 * field-read move (`Tok t = b.inner`), passing &b.inner to
+                 * a function is use-after-move. Pre-fix: only bare handle
+                 * for root b was checked, so compound TRANSFERRED state
+                 * was silently ignored. */
+                IRHandleInfo *compound_h = NULL;
+                if (target_is_move &&
+                    (target->kind == NODE_FIELD ||
+                     target->kind == NODE_INDEX)) {
+                    int croot;
+                    const char *cpath;
+                    uint32_t cpath_len;
+                    if (ir_extract_compound_key(zc, func, target,
+                                                 &croot, &cpath,
+                                                 &cpath_len) == 0 &&
+                        cpath_len > 0) {
+                        compound_h = ir_find_compound_handle(ps, croot,
+                                                              cpath, cpath_len);
+                        if (compound_h && compound_h->state == IR_HS_TRANSFERRED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use after move: compound '%.*s' on local "
+                                "'%.*s' transferred at line %d",
+                                (int)cpath_len, cpath,
+                                (int)func->locals[arg_local].name_len,
+                                func->locals[arg_local].name,
+                                compound_h->free_line);
+                        }
+                    }
+                }
+
                 IRHandleInfo *h = ir_find_handle(ps, arg_local);
                 if (h && h->state == IR_HS_TRANSFERRED) {
                     ir_zc_error(zc, inst->source_line,

@@ -1,0 +1,19 @@
+// Gap A3 (2026-05-06): reading a move-struct field transfers ownership of
+// that field. Subsequent read or pass = use-after-move.
+//
+// Pre-fix: only NODE_INDEX move-from-array-element was tracked (in
+// IR_ASSIGN's NODE_INDEX branch). Field-read transfer was silently dropped:
+// `Tok t = b.inner; use_tok(&b.inner)` compiled clean → silent UAM.
+// Both hosted and baremetal silently miss the violation.
+
+move struct Tok { i32 x; }
+struct Box { Tok inner; }
+
+i32 use_tok(*Tok p) { return p.x; }
+
+i32 main() {
+    Box b;
+    b.inner.x = 42;
+    Tok first = b.inner;       // ownership of b.inner transferred to first
+    return use_tok(&b.inner);  // ERROR: use after move
+}

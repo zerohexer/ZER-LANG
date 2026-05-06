@@ -1,0 +1,23 @@
+// Gap A2 (2026-05-06): assigning a move struct to a container's field
+// transfers ownership; subsequent use of the source = use-after-move.
+//
+// Pre-fix: zercheck_ir's IR_FIELD_WRITE handler had this logic, but
+// ir_lower.c never emits IR_FIELD_WRITE — `obj.field = val` lowers to
+// IR_ASSIGN with inst->expr=NODE_ASSIGN (passthrough). The actual
+// handler ran only via dead path → silent compile success → memory
+// corruption (stale t bytes still readable but logically invalid).
+//
+// Hosted + baremetal: silent UAM. EXPECTED: compile error.
+
+move struct Tok { i32 x; }
+struct Box { Tok inner; }
+
+i32 use_tok(*Tok p) { return p.x; }
+
+i32 main() {
+    Box b;
+    Tok t;
+    t.x = 42;
+    b.inner = t;        // ownership transferred
+    return use_tok(&t); // ERROR: use after move
+}

@@ -2575,7 +2575,8 @@ grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c \
 | AST emit_expr safety | Line (approx) | IR equivalent |
 |---|---|---|
 | Slice bounds check | 2045-2067 | `IR_INDEX_READ` + `emit_rewritten_node` NODE_INDEX |
-| Array bounds (variable index) | 2020-2044 | Separate `emit_auto_guards` pass |
+| Array bounds (variable index) — sync | 2020-2044 | `emit_auto_guards` pre-pass in `emit_regular_func_from_ir` (line ~9888) |
+| Array bounds (variable index) — async | 2020-2044 | `emit_auto_guards` pre-pass in `emit_async_func_from_ir` (line ~10013, Gap A1 fix 2026-05-06). Trap-on-failure since poll returns int — soft `return ZERO_OF(user_type)` would type-mismatch. |
 | Signed div overflow (INT_MIN/-1) — binary | 1068 | `IR_BINOP` TOK_SLASH/TOK_PERCENT (BUG-608) |
 | Signed compound div/mod (INT_MIN/-1) | 1361-1373 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612) |
 | Division by zero — binary | 1055 | checker forces compile-time guard (no IR work) |

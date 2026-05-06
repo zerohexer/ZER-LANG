@@ -1,0 +1,22 @@
+// Regression: async function with array index VRP can't prove must trap at
+// runtime on OOB. Before fix: emit_async_func_from_ir skipped emit_auto_guards
+// entirely → `arr[i]` emitted with NO bounds check. Hosted: silent memory
+// corruption (adjacent globals overwritten). Baremetal: silent.
+//
+// After fix: emit_auto_guards runs in async path with _zer_trap fallback
+// (poll function returns int, can't return user-typed zero).
+
+u32[8] arr;
+
+async void worker(u32 in) {
+    u32 i = in;
+    arr[i] = 42;
+    yield;
+}
+
+i32 main() {
+    _zer_async_worker s;
+    _zer_async_worker_init(&s, 99);
+    _zer_async_worker_poll(&s);
+    return 0;
+}

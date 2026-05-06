@@ -119,6 +119,160 @@ hosted ZER integration tests + 784 Rust + 36 Zig tests still pass.
 
 ---
 
+## Session 2026-05-06 — Codebase audit: 4 silent gaps closed (A1–A4)
+
+Multi-hour audit pass over `zercheck_ir.c`, `ir_lower.c`, and the IR
+emission paths in `emitter.c` after Phase F migration. Found and fixed
+**four silent gaps** where the compiler produced unsafe binaries —
+either compiling clean despite a real safety violation, or emitting
+warnings without the matching runtime guard. All four held under both
+hosted and baremetal: no crash, no error message, just wrong behavior.
+
+The audit followed CLAUDE.md "Diff-Based Post-Release Audit" + AST→IR
+emission diff protocol. Each gap was confirmed with a reproducer
+program (compiled with `--emit-c`, examined output, ran binary), then
+fixed at the IR layer and locked behind a regression test in
+`tests/zer_fail/` or `tests/zer_trap/`.
+
+### Gap A1 (BUG-661) — async + auto-guard silently dropped
+
+**Symptom**: Compiler emitted "auto-guard inserted" warning for an
+unprovable array index inside an `async` function, but the generated
+C had NO bounds check. `arr[i] = 42` with `i = 99` and `u32[8] arr`
+silently wrote past the array on hosted (corrupted adjacent globals)
+and baremetal.
+
+**Root cause**: `emit_regular_func_from_ir` at `emitter.c:9888` calls
+`emit_auto_guards` before each `emit_ir_inst` for ops that touch array
+indices (IR_ASSIGN, IR_CALL, IR_RETURN, IR_INTRINSIC, IR_CALL_DECOMP,
+IR_INDEX_READ). `emit_async_func_from_ir` at `emitter.c:10013` did
+NOT — it called `emit_ir_inst` directly. The "auto-guard inserted"
+warning lied for any `async` function. The asymmetry was introduced
+when the IR-from-AST emit path was forked into regular vs async (long
+before this session).
+
+**Fix**:
+1. Mirror the auto-guard pre-pass into `emit_async_func_from_ir`.
+2. Make `emit_auto_guards` async-aware: when `e->in_async`, emit a
+   `_zer_trap("array index out of bounds (auto-guard)", …)` instead
+   of the soft `return ZERO_OF(user_ret_type)` pattern. The soft path
+   is impossible in async — the poll function returns int, but the
+   user function may declare any return type, so emitting
+   `return ZERO_OF(user_type)` is a type mismatch. Trap is consistent
+   with `_zer_bounds_check` for slices.
+3. Same async-aware branch added to the NODE_FIELD UAF auto-guard
+   path (`checker_auto_guard_size == UINT64_MAX` for handle-array
+   dynamic-index UAF).
+
+**Tests**:
+- `tests/zer_trap/async_auto_guard_oob_trap.zer` — async with OOB
+  index must trap (was: silent corruption, exit 0).
+- `tests/zer/async_auto_guard_inbounds.zer` — async with in-bounds
+  index runs to completion, no trap.
+
+### Gap A2 (BUG-662) — move struct field-write transfer not tracked
+
+**Symptom**: `b.inner = t` where `t` is a `move struct` and `b.inner`
+is a field of that type compiled clean. Subsequent `use_tok(&t)` was
+NOT detected as use-after-move. Both hosted and baremetal silently
+read stale (logically invalid) bytes from `t`.
+
+**Root cause**: `ir_lower.c` never emits `IR_FIELD_WRITE` /
+`IR_INDEX_WRITE` — `obj.field = val` lowers to `IR_ASSIGN` with
+`inst->expr = NODE_ASSIGN(target=NODE_FIELD, value=…)` (passthrough).
+The dead `IR_FIELD_WRITE` handler in `zercheck_ir.c:2866` had the
+move-transfer logic but never ran. The actual `IR_ASSIGN`
+NODE_ASSIGN branch handled escape detection + compound key
+registration but missed the move-transfer-on-RHS.
+
+**Fix**: in the `IR_ASSIGN` handler, when `inst->expr->kind ==
+NODE_ASSIGN` AND target is NODE_FIELD/NODE_INDEX AND rhs is a
+move-struct local, mark the rhs local TRANSFERRED. Mirrors the dead
+handler's logic but in the live code path.
+
+**Test**: `tests/zer_fail/move_field_write_uaf.zer` — must compile-error.
+
+### Gap A3 (BUG-663) — move struct field-READ transfer not tracked
+
+**Symptom**: `Tok t = b.inner` where `b.inner` is a move struct field
+compiled clean. The compound `(b, ".inner")` was NOT marked
+TRANSFERRED, so `use_tok(&b.inner)` immediately afterwards compiled
+clean. Hosted + baremetal: silent UAM (struct copy in C makes
+`b.inner` still readable, but logically invalid).
+
+**Root cause**: `IR_ASSIGN` at line 1936 only handled NODE_INDEX
+move-from-array-element pattern (`Tok t = arr[0]`). The parallel case
+for NODE_FIELD (`Tok t = b.inner`) was missing. Worse, the actual IR
+lowering for `Tok t = b.inner` produces `IR_FIELD_READ %tmp = b.inner;
+IR_COPY first = %tmp` — so the IR_ASSIGN move-from-NODE_INDEX branch
+never fired. The transfer must happen at the IR_FIELD_READ instruction.
+
+**Fix**: in `IR_FIELD_READ` handler, after the existing UAF chain
+walk, when `inst->dest_local` is move-typed AND
+`ir_extract_compound_key(inst->expr)` yields a compound (path_len>0),
+mark the source compound TRANSFERRED. Subsequent `&b.inner` /
+`b.inner` triggers UAM via the existing `ir_check_expr_uaf` walker
+(which finds the compound TRANSFERRED state).
+
+**Followup**: extended the IR_CALL move-arg handler to also check
+compound handles (not just bare). Pre-fix, after `Tok t = b.inner`
+marked compound (b, ".inner") TRANSFERRED, calling `use_tok(&b.inner)`
+walked to root `b` and only checked the bare handle for `b` (which was
+ALIVE). Now compound handles are checked first when the target is
+NODE_FIELD/NODE_INDEX.
+
+**Test**: `tests/zer_fail/move_field_read_uam.zer` — must compile-error.
+
+### Gap A4 (BUG-664) — IR_CAST didn't propagate `pool_name`
+
+**Symptom**: F3.2 wrong-pool detection (BUG-659) propagates `pool_name`
+through alias chains via IR_COPY. Casting an alloc-result through a
+C-style cast (`*Task t = (*Task)opaque_handle`) lowers as IR_CAST,
+which strips `pool_name`. Cross-pool misuse through cast alias was
+silently missed.
+
+**Root cause**: F3.2 added `pool_name` propagation to IR_COPY but not
+to IR_CAST. The two share the same alias-snapshot pattern.
+
+**Fix**: 1-line addition — snapshot `src_h->pool_name` /
+`pool_name_len` before `ir_add_handle` (which can realloc and
+invalidate `src_h`), assign to dst_h after.
+
+### Net change
+
+- `emitter.c`: +25 LOC (async auto-guard pre-pass + async-aware
+  trap fallback × 2 sites).
+- `zercheck_ir.c`: +56 LOC (Gap A2 move-on-field-write + Gap A3
+  move-on-field-read + IR_CALL compound check + Gap A4 pool_name
+  propagation).
+- `tests/zer_fail/`: +2 files.
+- `tests/zer/`: +1 file.
+- `tests/zer_trap/`: +1 file.
+
+All ~2,089 tests still passing.
+
+### Methodology note (lessons for future fresh sessions)
+
+The four gaps were found by walking the AST→IR diff protocol from
+CLAUDE.md "Diff-Based Post-Release Audit" — focus on emit paths where
+AST and IR forked, find runtime safety wrappers in the AST path, check
+parity in the IR path. Gap A1 was found this way (slice path inlines
+`_zer_bounds_check` in IR_INDEX_READ; array path relies on
+`emit_auto_guards` pre-pass; pre-pass missing in async). Gaps A2–A4
+were found by inspecting `ir_lower.c` for never-emitted IR ops, then
+asking "does the safety logic from the dead handler exist in the live
+IR_ASSIGN path?" For A2 it didn't; for A3 the live path had only
+half the cases (NODE_INDEX, no NODE_FIELD); for A4 it was a
+copy-paste oversight in F3.2.
+
+Pattern to remember: **when an IR op is documented as "collapsed to
+IR_ASSIGN" or similar, audit the live handler against the dead one.
+Dead handlers are invariant snapshots of "what we wanted to do" but
+the live handler is "what we actually do" — drift between them is the
+silent gap.**
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

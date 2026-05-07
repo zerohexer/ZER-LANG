@@ -115,6 +115,43 @@ silently dropped on IR path (deferred 2026-05-02)") — kept in original
 location to preserve the more detailed analysis added in the
 2026-05-02 fix session.
 
+## ~~Codebase audit 2026-05-07 — 5 silent gaps closed~~ (FIXED 2026-05-07)
+
+Full bug-hunt session. See BUGS-FIXED.md "Session 2026-05-07" for
+per-bug detail.
+
+- BUG-661 — `return s.len` (scalar field of local-derived slice)
+  rejected as a pointer escape. Fixed: gate the field-walk escape
+  check on `type_can_carry_pointer(ret_type)`.
+- BUG-662 — `@critical { wrapper(); }` where wrapper transitively
+  calls slab.alloc(): silently allowed. Fixed: enable ban_alloc=true
+  on @critical's check_body_effects.
+- BUG-663 — `slab.free()` / `slab.free_ptr()` / `Task.free()` /
+  `Task.free_ptr()` inside @critical or interrupt handlers:
+  silently allowed. Fixed: per-site check_isr_ban at the four free
+  handlers.
+- BUG-664 — Pool/Ring/Arena `.alloc()` flagged as heap by
+  scan_func_props (false positive on transitive path through a
+  pool wrapper). Fixed: gate can_alloc on receiver TYPE_SLAB or
+  TYPE_STRUCT (Task auto-slab); Pool/Ring/Arena types excluded.
+  Same change extends detection to free/free_ptr methods, closing
+  the transitive variant of BUG-663.
+- BUG-665 — `return g.v;` where `g` is `shared struct` leaked the
+  auto-mutex past return. Multi-threaded programs deadlock on the
+  next acquire. Fixed: ir_lower NODE_RETURN / NODE_BREAK /
+  NODE_CONTINUE / NODE_GOTO emit IR_UNLOCK before the exit when an
+  enclosing block holds a shared lock.
+
+Cumulative fix size ~70 LOC across checker.c + ir_lower.c. Seven
+regression tests added (3 positive + 4 negative). Full test suite
+green (1,400+ tests across tests/zer, test_modules, rust_tests,
+zig_tests).
+
+Single-level tracking on the BUG-665 fix — nested cases where an
+ancestor block holds a different shared root still leak the
+outer lock. Tracked as a follow-up; the simple `return
+shared.field;` form is now safe.
+
 ## ~~4 narrow zercheck patterns not in zercheck_ir~~ (FIXED 2026-05-04, Phase F3.2)
 
 **Originally discovered:** 2026-05-03 Phase F3 audit when `test_zercheck.c`

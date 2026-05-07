@@ -273,6 +273,196 @@ silent gap.**
 
 ---
 
+## Session 2026-05-07 — Codebase audit: 5 silent gaps closed (BUG-661 through BUG-665)
+
+Full codebase audit (CLAUDE.md, docs/limitations.md, all tests/zer_gaps/
+reproducers, escape analysis paths, ISR/critical heap-op rules, shared
+struct lock emission). Spot-checked all 9 documented "open" gaps from
+the 2026-04-19 Phase 1+2 audit — 7 are now caught (gap1/2/5/6, plus the
+audit2 reproducers); only prec1/prec2 (precision-not-safety issues)
+remain documented as before. Then probed for new gaps via adversarial
+.zer programs targeting context-flag matrices, heap-op transitive
+checks, and shared-mutex emission. Found 5 NEW silent gaps + bonus
+false positive — all fixed.
+
+### BUG-661: return scalar field of local-derived slice/struct false positive
+
+**Symptom**: `usize get_len() { u8[10] arr; [*]u8 s = arr[0..5]; return s.len; }`
+errored with `cannot return pointer to local 's' — stack memory is freed
+when function returns`. `.len` is a `usize` scalar — it cannot leak a
+stack reference, so the rejection was a false positive.
+
+**Root cause**: checker.c return-escape walker (around line 9146) walks
+field/index chains down to the root identifier and errors when the
+root's symbol has `is_local_derived = true`. For `s.len`, root is `s`
+(a slice with `is_local_derived` because its `.ptr` points at the
+local array), and the check fired regardless of which field was
+projected. The check needed a gate on the RETURN TYPE — projection
+through a scalar field can't carry a pointer reference, so the symbol's
+local-derived flag is irrelevant.
+
+**Fix**: track whether the field/index walk actually traversed at
+least one projection (`projected = (root != orig_root)` after the
+walk). Skip the escape error when projected AND `type_can_carry_pointer
+(ret_type)` is false (helper already exists in checker.c at line 870).
+Direct returns of the local-derived ident itself (no projection) still
+fire — that's the genuine escape case.
+
+**Test**: `tests/zer/return_slice_scalar_field.zer` — must compile +
+exit 0 (returns 5 and 42). The pointer-leak negative path is still
+covered by every existing escape-rejection test.
+
+### BUG-662 + BUG-663: @critical { } missed transitive heap operations
+
+**Symptom**: `@critical { wrapper(); }` where `wrapper()` calls
+`slab.alloc()` compiled clean, even though the per-site check rejects
+direct `slab.alloc()` inside `@critical`. Same pattern for `slab.free()`
+inside `@critical` was silently accepted regardless.
+
+**Root cause**: two interacting omissions.
+
+1. `check_body_effects(c, node->critical.body, ...)` at NODE_CRITICAL
+   passed `false, NULL` for the alloc-ban arguments. The function-summary
+   path that catches transitive yield/spawn was disabled for alloc on
+   `@critical` blocks. ISR handlers had `true, "..."` here — the asym-
+   metry was silent.
+2. `slab.free()` / `slab.free_ptr()` / `Task.free()` / `Task.free_ptr()`
+   never called `check_isr_ban`. Only the four alloc methods did. But
+   `free()` acquires the same libc heap lock as `malloc/calloc/realloc`,
+   so a free during interrupt handling or while interrupts are disabled
+   risks the same deadlock.
+
+**Fix**:
+
+- `NODE_CRITICAL` in `check_stmt` now passes
+  `true, "cannot heap-allocate or free inside @critical block — ..."`
+  for the alloc-ban argument, matching the ISR site.
+- Added `check_isr_ban(c, line, "slab.free()")` (and for
+  slab.free_ptr / Task.free / Task.free_ptr) at every per-site
+  handler. Pool/Ring/Arena methods continue to skip the ban — they
+  are bitset/circular/bump and do not touch libc heap.
+
+**Tests**:
+- `tests/zer_fail/critical_transitive_alloc.zer`
+- `tests/zer_fail/critical_slab_free.zer`
+- `tests/zer_fail/isr_slab_free.zer`
+- `tests/zer_fail/critical_transitive_free.zer`
+
+### BUG-664: scan_func_props falsely flagged Pool.alloc as a heap operation
+
+**Symptom**: `interrupt USART1 { wrapper(); }` where `wrapper()` only
+uses `pool.alloc()` (a bitset-based allocator that NEVER hits libc heap)
+errored "cannot allocate inside interrupt handler — heap allocation may
+deadlock". Pool is documented as ISR-safe; the rejection contradicted
+the language reference.
+
+**Root cause**: `scan_func_props` in checker.c set `props.can_alloc =
+true` for ANY method call named `alloc` or `alloc_ptr`, regardless of
+the receiver's type. Direct `pool.alloc()` calls were correctly
+exempted at the per-site check (no `check_isr_ban`), but the body-level
+transitive check fired on the function-summary flag — pool was a false
+positive there.
+
+The fix opportunity also addressed a gap: scan_func_props did NOT
+detect `free` / `free_ptr` at all, so transitive `slab.free()` from
+ISR/critical was likewise missed.
+
+**Fix**: in `scan_func_props`'s NODE_CALL handler, look up the
+receiver's symbol and check its type. Only set `can_alloc` when the
+receiver is `TYPE_SLAB` (explicit Slab(T)) or `TYPE_STRUCT` (Task-style
+auto-slab via struct typedef). Pool/Ring/Arena types are excluded.
+Detection extended to the four heap method names (`alloc`,
+`alloc_ptr`, `free`, `free_ptr`) so transitive bans now fire on free
+operations as well.
+
+**Tests**: `tests/zer/critical_pool_transitive.zer` (must compile +
+exit 0), plus the four BUG-662/663 negative tests above all exercise
+the transitive path.
+
+### BUG-665: shared-struct mutex leaked past `return` / `break` / `continue` / `goto`
+
+**Symptom**: any function that returns a value derived from a `shared
+struct` field held the auto-mutex past the return statement. Single-
+threaded programs masked it (recursive mutex re-entered on the next
+call), but a writer thread hit deadlock waiting on a mutex that no
+unlock would ever release.
+
+Reproducer (`tests/zer/shared_return_unlocks.zer`): a `read_v()` that
+returns `g.v` and a `writer()` thread that writes `g.v` in a loop.
+Without the fix, the program's main loop hangs after the first call to
+`read_v()` because the mutex remains acquired with count >= 1 and the
+spawned writer cannot acquire it.
+
+Emitted-C diagnostic (pre-fix):
+```
+pthread_mutex_lock(&g._zer_mtx);
+_zer_t0 = g.v;
+return _zer_t0;
+pthread_mutex_unlock(&g._zer_mtx);  /* unreachable — DEAD CODE */
+```
+
+**Root cause**: `ir_lower.c` block iterator wraps every `block.stmts[i]`
+that touches a shared struct with `IR_LOCK` (before lowering) and
+`IR_UNLOCK` (after). When `lower_stmt` for `NODE_RETURN` (or the
+control-flow exits NODE_BREAK / NODE_CONTINUE / NODE_GOTO) emits an
+exit instruction, the IR_UNLOCK that the iterator emits afterwards is
+unreachable. The lock stays held — for a recursive mutex, count keeps
+climbing across calls.
+
+**Fix**: track `current_stmt_shared_root` on `LowerCtx`, set+restored
+by the block iterator around each statement's `lower_stmt`. When
+NODE_RETURN / NODE_BREAK / NODE_CONTINUE / NODE_GOTO emits its exit
+instruction, it now first emits `IR_UNLOCK` for the active root.
+Block-iterator's after-stmt IR_UNLOCK becomes dead code on the
+control-flow-exit path (harmless — GCC drops it under -O2). For
+non-exit statements, behavior is unchanged.
+
+Single-level tracking only — nested-block exits where an outer
+ancestor holds a different shared root still leak the outer lock.
+That requires a lock STACK and is a larger refactor; the simple
+`return shared.field;` case (the most common form) is fixed now.
+
+**Test**: `tests/zer/shared_return_unlocks.zer` — main spawns a writer
+that mutates `g.v` 50 times in a loop, while main calls `read_v() →
+return g.v` repeatedly until it sees the final value. Both threads
+must make progress; without the fix the writer's first lock acquire
+blocks forever and `th.join()` never returns.
+
+### Net change
+
+- `checker.c`: BUG-661 (4 LOC + 8-line comment) + BUG-662/663
+  (per-site check_isr_ban at 4 sites, message extended at @critical
+  site) + BUG-664 (scan_func_props receiver-type gate, ~30 LOC)
+- `ir_lower.c`: BUG-665 (LowerCtx field + 4 hooks in
+  return/break/continue/goto handlers + block-iterator save/restore,
+  ~30 LOC)
+- `tests/zer/`: +3 files (return_slice_scalar_field,
+  critical_pool_transitive, shared_return_unlocks)
+- `tests/zer_fail/`: +4 files (critical_transitive_alloc,
+  critical_slab_free, isr_slab_free, critical_transitive_free)
+- Total: 548 → 551 ZER positive tests, 74 → 78 ZER negative tests.
+  All ~2,089 tests still pass (tests/zer, test_modules, rust_tests,
+  zig_tests).
+
+### Audit methodology used (reusable for future audits)
+
+1. Verify documented "open" gaps (`tests/zer_gaps/*.zer` and
+   `docs/limitations.md`) — most are now caught silently. Skip those.
+2. Probe per-context bans for asymmetry: ISR vs @critical vs defer for
+   yield / spawn / alloc / free. The audit_matrix.sh tool spotted the
+   alloc gap once its line ranges were updated.
+3. Probe runtime behavior of multi-thread programs that hit shared
+   struct accessors. Single-threaded test runs hide lock leaks; only a
+   second thread waiting on the same mutex reveals them.
+4. Check FuncProps detection rules vs the per-site check rules — the
+   transitive path frequently has a wider blast radius than the
+   per-site ban (false positives) or a narrower one (silent gaps).
+5. Diff the AST-emit safety wrappers against the IR handler — the
+   2026-04-18 audit caught the original AST→IR migration regressions;
+   the same diff still finds new gaps when new wrappers are added.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

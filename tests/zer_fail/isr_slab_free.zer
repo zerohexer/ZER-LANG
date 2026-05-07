@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// BUG-AUDIT-C: slab.free() inside an interrupt handler was silently
+// allowed. Same libc-lock deadlock as alloc.
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+interrupt USART1 {
+    Handle(Task) h = tasks.alloc() orelse return;
+    h.id = 1;
+    tasks.free(h);      // libc free in ISR — must be caught
+}
+
+u32 main() { return 0; }

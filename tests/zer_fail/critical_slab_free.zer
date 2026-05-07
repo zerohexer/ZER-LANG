@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// BUG-AUDIT-C: slab.free() inside @critical was silently allowed. free()
+// holds the libc heap lock — same deadlock concern as alloc.
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+u32 main() {
+    Handle(Task) h = tasks.alloc() orelse { return 1; };
+    h.id = 1;
+    @critical {
+        tasks.free(h);  // libc free — must be caught
+    }
+    return 0;
+}

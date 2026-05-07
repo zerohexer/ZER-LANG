@@ -61,6 +61,15 @@ typedef struct {
 
     /* Temp counter for generated names */
     int temp_count;
+
+    /* Active shared-lock root for the currently-being-lowered statement.
+     * NODE_BLOCK sets this before lower_stmt and clears afterward, so
+     * exit statements (NODE_RETURN) can emit IR_UNLOCK BEFORE the exit
+     * — without this, the unlock emitted by the block iterator after
+     * lower_stmt is dead code, and the shared mutex stays held forever.
+     * Single-level tracking — nested shared blocks accumulate locks
+     * (recursive mutex), and only the outermost unlock fires here. */
+    Node *current_stmt_shared_root;
 } LowerCtx;
 
 /* ---- Helpers ---- */
@@ -1638,7 +1647,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         for (int i = 0; i < node->block.stmt_count; i++) {
             Node *shared_root;
             emit_shared_lock_if_needed(ctx, node->block.stmts[i], &shared_root);
+            /* Expose the active root to lower_stmt so exit statements
+             * (NODE_RETURN) can release the lock before exiting — the
+             * IR_UNLOCK emitted after this lower_stmt is unreachable
+             * past a return / goto / break / continue. */
+            Node *prev_shared = ctx->current_stmt_shared_root;
+            ctx->current_stmt_shared_root = shared_root;
             lower_stmt(ctx, node->block.stmts[i]);
+            ctx->current_stmt_shared_root = prev_shared;
             emit_shared_unlock_if_needed(ctx, node->block.stmts[i], shared_root);
         }
         /* Fire defers pushed inside THIS block at block exit.
@@ -2762,6 +2778,17 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             if (ret.src1_local < 0) ret.expr = ret_expr;
         }
         emit_defer_fire(ctx, node->loc.line);
+        /* Release the active shared-struct lock for THIS statement before
+         * the return — otherwise the IR_UNLOCK that the block iterator
+         * emits AFTER lower_stmt is unreachable and the mutex leaks.
+         * Multi-threaded programs that have any function which returns a
+         * value derived from a shared struct would deadlock the next
+         * time the same lock is acquired by another thread. */
+        if (ctx->current_stmt_shared_root) {
+            IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
+            unlock.expr = ctx->current_stmt_shared_root;
+            emit_inst(ctx, unlock);
+        }
         emit_inst(ctx, ret);
         break;
     }
@@ -2771,6 +2798,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (ctx->loop_exit_block >= 0) {
             /* Fire loop-scoped defers (emit bodies, DO NOT pop — other paths may need them) */
             emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
+            /* Release any active shared lock before exiting (same as
+             * NODE_RETURN — see current_stmt_shared_root comment). */
+            if (ctx->current_stmt_shared_root) {
+                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
+                unlock.expr = ctx->current_stmt_shared_root;
+                emit_inst(ctx, unlock);
+            }
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_exit_block;
             emit_inst(ctx, go);
@@ -2782,6 +2816,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_CONTINUE: {
         if (ctx->loop_continue_block >= 0) {
             emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
+            if (ctx->current_stmt_shared_root) {
+                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
+                unlock.expr = ctx->current_stmt_shared_root;
+                emit_inst(ctx, unlock);
+            }
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_continue_block;
             emit_inst(ctx, go);
@@ -2792,6 +2831,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     /* ---- Goto ---- */
     case NODE_GOTO: {
         emit_defer_fire(ctx, node->loc.line);
+        if (ctx->current_stmt_shared_root) {
+            IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
+            unlock.expr = ctx->current_stmt_shared_root;
+            emit_inst(ctx, unlock);
+        }
         int target = find_label_block(ctx,
             node->goto_stmt.label, (uint32_t)node->goto_stmt.label_len);
         IRInst go = make_inst(IR_GOTO, node->loc.line);

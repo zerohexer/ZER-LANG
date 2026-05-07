@@ -4078,6 +4078,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
+                    /* slab.free() calls libc free() which acquires the
+                     * same heap lock as malloc/calloc — banned in ISR
+                     * and @critical for the same reason as alloc. */
+                    check_isr_ban(c, node->loc.line, "slab.free()");
                     if (obj_is_const)
                         checker_error(c, node->loc.line,
                             "cannot call mutating method 'free' on const Slab");
@@ -4114,6 +4118,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
+                    check_isr_ban(c, node->loc.line, "slab.free_ptr()");
                     if (obj_is_const)
                         checker_error(c, node->loc.line,
                             "cannot call mutating method 'free_ptr' on const Slab");
@@ -4259,6 +4264,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
                     /* Task.free(h) → void — same as slab.free(h) */
+                    check_isr_ban(c, node->loc.line, "Task.free()");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "%.*s.free() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -4268,6 +4274,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
                     /* Task.free_ptr(p) → void — same as slab.free_ptr(p) */
+                    check_isr_ban(c, node->loc.line, "Task.free_ptr()");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "%.*s.free_ptr() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -7144,14 +7151,46 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         for (int i = 0; i < node->call.arg_count; i++)
             scan_func_props(c, node->call.args[i], parent_sym);
 
-        /* Detect alloc: slab.alloc(), slab.alloc_ptr(), Task.alloc(), Task.alloc_ptr() */
+        /* Detect heap operation: slab.alloc/alloc_ptr/free/free_ptr,
+         * Task.alloc/alloc_ptr/free/free_ptr (Task is auto-slab struct).
+         *
+         * Only Slab/Task hit libc malloc/calloc/free and may deadlock
+         * inside an ISR or @critical block. Pool/Ring/Arena are bitset /
+         * circular / bump-allocator and are ISR-safe. Without the
+         * receiver-type gate, transitive `pool.alloc()` from an ISR or
+         * @critical was falsely flagged as a heap escape.
+         *
+         * `free`/`free_ptr` were previously omitted entirely; now tracked
+         * so transitive `slab.free()` from an ISR or @critical is caught
+         * (free() acquires the same libc heap lock as malloc()). */
         if (node->call.callee && node->call.callee->kind == NODE_FIELD) {
             const char *mn = node->call.callee->field.field_name;
             uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
-            if ((ml == 5 && memcmp(mn, "alloc", 5) == 0) ||
-                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0)) {
-                parent_sym->props.can_alloc = true;
-                parent_sym->props.has_direct_alloc = true;
+            bool is_heap_method =
+                (ml == 5 && memcmp(mn, "alloc", 5) == 0) ||
+                (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) ||
+                (ml == 4 && memcmp(mn, "free", 4) == 0) ||
+                (ml == 8 && memcmp(mn, "free_ptr", 8) == 0);
+            if (is_heap_method) {
+                bool heap_backed = false;
+                Node *recv = node->call.callee->field.object;
+                if (recv && recv->kind == NODE_IDENT) {
+                    Symbol *rs = scope_lookup(c->global_scope,
+                        recv->ident.name, (uint32_t)recv->ident.name_len);
+                    if (rs && rs->type) {
+                        Type *rt = type_unwrap_distinct(rs->type);
+                        /* TYPE_SLAB = explicit Slab(T) global.
+                         * TYPE_STRUCT = Task-style auto-slab via struct
+                         *   name (the bound symbol is the struct typedef). */
+                        if (rt->kind == TYPE_SLAB || rt->kind == TYPE_STRUCT) {
+                            heap_backed = true;
+                        }
+                    }
+                }
+                if (heap_backed) {
+                    parent_sym->props.can_alloc = true;
+                    parent_sym->props.has_direct_alloc = true;
+                }
             }
         }
 
@@ -9181,14 +9220,25 @@ static void check_stmt(Checker *c, Node *node) {
                             }
                         }
                     }
+                    /* Field/index chain skips through projections like
+                     * `s.len` or `arr[i]`. The ROOT ident's symbol may be
+                     * `is_local_derived` (e.g., `[*]u8 s = arr[0..]`), but
+                     * the projected VALUE could be a scalar (`.len`,
+                     * `.field` of integer type). Returning a scalar by
+                     * value cannot leak a stack reference, so gate this
+                     * escape check on whether the return TYPE could carry
+                     * a pointer. Without this gate, `return s.len` (usize)
+                     * is rejected as a false positive. */
+                    Node *orig_root = root;
                     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                         if (root->kind == NODE_FIELD) root = root->field.object;
                         else root = root->index_expr.object;
                     }
+                    bool projected = (root != orig_root);
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *sym = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
-                        if (sym) {
+                        if (sym && (!projected || type_can_carry_pointer(ret_type))) {
                             /* SAFETY: zer_region_can_escape in src/safety/escape_rules.c
                              * Oracle: lambda_zer_escape/iris_escape_specs.v
                              * Only RegStatic pointers can escape the current scope. */
@@ -10406,11 +10456,22 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_CRITICAL:
         /* @critical { body } — check body, ban return/break/continue/goto
          * (jumping out skips interrupt re-enable — leaves system broken).
-         * Also ban yield/spawn via function summaries (direct + transitive). */
+         * Also ban yield/spawn via function summaries (direct + transitive).
+         *
+         * Heap operations (slab/Task alloc/free) inside @critical are
+         * caught at the per-site method call (check_isr_ban). Transitive
+         * cases — `@critical { wrapper(); }` where wrapper() does
+         * slab.alloc() — were silently allowed pre-fix. The per-site ban
+         * is for the same reason as ISR: malloc/calloc/free hold the
+         * libc heap lock and may deadlock when interrupts are disabled.
+         * Pool/Ring/Arena methods are bitset/circular/bump and excluded
+         * by the receiver-type gate in scan_func_props. */
         check_body_effects(c, node->critical.body, node->loc.line,
             true, "cannot yield inside @critical block — interrupts stay disabled across suspend",
             true, "cannot spawn inside @critical block — thread creation with interrupts disabled",
-            false, NULL);
+            true, "cannot heap-allocate or free inside @critical block — "
+                  "malloc/calloc/free may deadlock when interrupts are disabled. "
+                  "Use Pool(T, N) instead, or move the call outside @critical");
         c->critical_depth++;
         if (node->critical.body) {
             check_stmt(c, node->critical.body);

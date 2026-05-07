@@ -1,0 +1,19 @@
+// BUG-AUDIT-D: Pool.alloc/free transitively through a wrapper from
+// @critical was previously rejected as a false positive. scan_func_props
+// now gates the heap flag on receiver type — Pool/Ring/Arena are not
+// heap-backed and must NOT trigger the ban.
+struct Task { u32 id; }
+Pool(Task, 8) tasks;
+
+void use_one() {
+    Handle(Task) h = tasks.alloc() orelse return;
+    h.id = 42;
+    tasks.free(h);
+}
+
+u32 main() {
+    @critical {
+        use_one();      // pool ops are bitset-based — safe in @critical
+    }
+    return 0;
+}

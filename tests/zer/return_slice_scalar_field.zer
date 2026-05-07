@@ -1,0 +1,22 @@
+// BUG-AUDIT-A: returning a scalar (.len) of a local-derived slice was
+// rejected by the escape check as if it were a pointer leak.
+// Fix: gate the field-walk escape check on type_can_carry_pointer(ret_type).
+// Scalar returns can never escape a stack reference.
+
+usize get_len() {
+    u8[10] arr;
+    [*]u8 s = arr[0..5];
+    return s.len;        // .len is usize (scalar) — safe
+}
+
+usize get_idx_value() {
+    u8[10] arr;
+    arr[3] = 42;
+    return arr[3];       // u8[3] of local array — safe
+}
+
+u32 main() {
+    if (get_len() != 5) { return 1; }
+    if (get_idx_value() != 42) { return 2; }
+    return 0;
+}

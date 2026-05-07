@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// BUG-AUDIT-D: transitive slab.free() through a wrapper from @critical
+// was missed. scan_func_props now flags free/free_ptr (in addition to
+// alloc/alloc_ptr) so the body-level transitive ban fires.
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void release(Handle(Task) h) {
+    tasks.free(h);
+}
+
+u32 main() {
+    Handle(Task) h = tasks.alloc() orelse { return 1; };
+    h.id = 1;
+    @critical {
+        release(h);     // transitive free — must be caught
+    }
+    return 0;
+}

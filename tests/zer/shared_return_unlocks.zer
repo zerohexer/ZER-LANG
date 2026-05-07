@@ -1,0 +1,31 @@
+// BUG-AUDIT-E: returning a value derived from a shared struct held the
+// auto-mutex past `return`, leaving the lock permanently acquired with
+// the recursive-mutex count >= 1. Single-threaded programs masked the
+// bug (recursive lock could re-enter), but a writer thread on the same
+// shared struct deadlocks waiting for the unlock.
+// Fix: ir_lower NODE_RETURN emits IR_UNLOCK before IR_RETURN when the
+// enclosing block holds a shared lock.
+
+shared struct Counter { u32 v; }
+Counter g;
+
+u32 read_v() {
+    return g.v;
+}
+
+void writer() {
+    for (u32 i = 0; i < 50; i += 1) {
+        g.v = i;
+    }
+}
+
+u32 main() {
+    g.v = 0;
+    ThreadHandle th = spawn writer();
+    for (u32 k = 0; k < 50; k += 1) {
+        u32 v = read_v();
+        if (v == 49) { break; }
+    }
+    th.join();
+    return 0;
+}

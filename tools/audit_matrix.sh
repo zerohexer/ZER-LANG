@@ -40,7 +40,7 @@ echo ""
 
 # For each node, find handler in check_stmt (between lines 6700-8200)
 for node in $NODES; do
-    case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 6700 && $1 < 8200 {print $1; exit}')
+    case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 8500 && $1 < 11000 {print $1; exit}')
 
     if [ -z "$case_line" ]; then
         printf "%-14s (not found)\n" "$(echo $node | sed 's/NODE_//')"
@@ -121,7 +121,7 @@ for rule in $RULES; do
     flag=$(echo "$rule" | cut -d: -f2)
     reason=$(echo "$rule" | sed 's/^[^:]*:[^:]*://')
 
-    case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 6700 && $1 < 8200 {print $1; exit}')
+    case_line=$(grep -n "case $node:" "$FILE" | awk -F: '$1 > 8500 && $1 < 11000 {print $1; exit}')
     [ -z "$case_line" ] && continue
 
     end_line=$((case_line + 200))

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// BUG-AUDIT-B: @critical { wrapper(); } where wrapper() does slab.alloc()
+// was previously silently accepted. The body-level check_body_effects had
+// ban_alloc=false. Per-site check_isr_ban catches direct slab.alloc inside
+// @critical, but transitive cases were missed.
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+void inner() {
+    Handle(Task) h = tasks.alloc() orelse return;
+    h.id = 1;
+    tasks.free(h);
+}
+
+u32 main() {
+    @critical {
+        inner();        // transitive heap alloc — must be caught
+    }
+    return 0;
+}
